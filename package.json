@@ -60,5 +60,14 @@
     "typescript-eslint": "^8.58.1",
     "vite": "^8.0.0"
   },
-  "packageManager": "pnpm@11.0.8+sha256.7d73b1a9e413cde021551917fa25995b59011c3ca628ed0ad09e1e117001a7aa"
+  "packageManager": "pnpm@11.0.8+sha256.7d73b1a9e413cde021551917fa25995b59011c3ca628ed0ad09e1e117001a7aa",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "unrs-resolver"
+    ],
+    "overrides": {
+      "es-abstract": "1.24.1"
+    }
+  }
 }
