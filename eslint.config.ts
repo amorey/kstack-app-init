@@ -29,9 +29,7 @@ const typescriptConfig = [
     name: 'typescript/project-service',
     languageOptions: {
       parserOptions: {
-        projectService: {
-          allowDefaultProject: ['eslint.config.ts'],
-        },
+        projectService: true,
       },
     },
   },

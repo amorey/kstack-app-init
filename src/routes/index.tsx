@@ -1,14 +1,23 @@
 import { useState } from 'react';
+import { createRoute } from '@tanstack/react-router';
 import { invoke } from '@tauri-apps/api/core';
-import reactLogo from './assets/react.svg';
-import './App.css';
 
-function App() {
+import reactLogo from '@/assets/react.svg';
+import { Route as rootRoute } from '@/routes/__root';
+
+import '@/App.css';
+
+export const Route = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/',
+  component: Main,
+});
+
+function Main() {
   const [greetMsg, setGreetMsg] = useState('');
   const [name, setName] = useState('');
 
   async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
     setGreetMsg(await invoke('greet', { name }));
   }
 
@@ -43,5 +52,3 @@ function App() {
     </main>
   );
 }
-
-export default App;

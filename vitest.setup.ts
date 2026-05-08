@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom/vitest';
 
 // jsdom doesn't implement window.scrollTo (used by router/UI components during navigation)
-window.scrollTo = (() => {}) as any;
+window.scrollTo = () => {};
 
 // jsdom doesn't implement matchMedia — stub it for components that check media queries
 Object.defineProperty(window, 'matchMedia', {

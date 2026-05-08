@@ -1,9 +1,19 @@
-import React from 'react';
-import ReactDOM from 'react-dom/client';
-import App from './App';
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { RouterProvider, createRouter } from '@tanstack/react-router';
 
-ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
+import { routeTree } from '@/routeTree';
+
+const router = createRouter({ routeTree });
+
+declare module '@tanstack/react-router' {
+  interface Register {
+    router: typeof router;
+  }
+}
+
+createRoot(document.getElementById('root') as HTMLElement).render(
+  <StrictMode>
+    <RouterProvider router={router} />
+  </StrictMode>,
 );
