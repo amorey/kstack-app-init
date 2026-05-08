@@ -1,5 +1,6 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
+import Unfonts from 'unplugin-fonts/vite';
 import { defineConfig, mergeConfig } from 'vite';
 import { defineConfig as defineVitestConfig } from 'vitest/config';
 
@@ -10,7 +11,15 @@ const viteConfig = defineConfig({
   resolve: {
     tsconfigPaths: true,
   },
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    Unfonts({
+      fontsource: {
+        families: ['Roboto Flex Variable'],
+      },
+    }),
+  ],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

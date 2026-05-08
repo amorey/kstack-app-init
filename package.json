@@ -12,6 +12,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@fontsource-variable/roboto-flex": "^5.2.8",
     "@kubetail/ui": "^2.5.0",
     "@radix-ui/react-label": "^2.1.8",
     "@radix-ui/react-separator": "^1.1.7",
@@ -53,6 +54,7 @@
     "jsdom": "^29.0.2",
     "prettier": "^3.8.2",
     "tailwindcss": "^4.2.2",
+    "unplugin-fonts": "^2.0.0",
     "vitest": "^4.1.4",
     "typescript": "^6.0.2",
     "typescript-eslint": "^8.58.1",
