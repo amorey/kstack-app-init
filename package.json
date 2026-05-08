@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "lint": "eslint .",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -16,13 +17,30 @@
     "@tauri-apps/plugin-opener": "^2"
   },
   "devDependencies": {
+    "@eslint/compat": "^2.0.5",
+    "@eslint/js": "^9.39.1",
+    "@stylistic/eslint-plugin": "^5.9.0",
+    "@tauri-apps/cli": "^2",
+    "@types/node": "^24.0.0",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
-    "@types/node": "^24.0.0",
     "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^9.39.1",
+    "jiti": "^2.6.1",
+    "eslint-config-airbnb-extended": "^3.1.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-import-resolver-typescript": "^4.4.4",
+    "eslint-plugin-import-x": "^4.16.1",
+    "eslint-plugin-jsx-a11y": "^6.10.2",
+    "eslint-plugin-prettier": "^5.5.5",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.5.0",
+    "prettier": "^3.8.2",
     "typescript": "^6.0.2",
-    "vite": "^8.0.0",
-    "@tauri-apps/cli": "^2"
+    "typescript-eslint": "^8.58.1",
+    "vite": "^8.0.0"
   },
   "packageManager": "pnpm@11.0.8+sha256.7d73b1a9e413cde021551917fa25995b59011c3ca628ed0ad09e1e117001a7aa"
 }

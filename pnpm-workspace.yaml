@@ -1,4 +1,7 @@
-allowBuilds:
-  esbuild: true
+packages:
+  - .
 onlyBuiltDependencies:
   - esbuild
+  - unrs-resolver
+overrides:
+  es-abstract: 1.24.1
