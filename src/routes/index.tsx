@@ -49,6 +49,13 @@ function Main() {
         <button type="submit">Greet</button>
       </form>
       <p>{greetMsg}</p>
+
+      <section className="mt-12 mx-auto max-w-md rounded-xl border border-slate-200 bg-white/60 p-6 shadow-sm dark:border-slate-700 dark:bg-slate-800/60">
+        <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Tailwind v4 is wired up</h2>
+        <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+          This card is styled entirely with utility classes — no custom CSS.
+        </p>
+      </section>
     </main>
   );
 }
