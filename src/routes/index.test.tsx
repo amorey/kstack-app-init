@@ -7,6 +7,6 @@ import { renderWithRouter } from '@/test-utils';
 describe('index route', () => {
   it('renders the home page', async () => {
     await renderWithRouter(routeTree, '/');
-    expect(screen.getByRole('heading', { name: /Tauri/i })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /kstack/i })).toBeInTheDocument();
   });
 });
