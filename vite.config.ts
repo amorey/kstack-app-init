@@ -1,10 +1,18 @@
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
+import path from 'path';
 
-const host = process.env.TAURI_DEV_HOST;
+import react from '@vitejs/plugin-react';
+import { defineConfig, mergeConfig } from 'vite';
+import { defineConfig as defineVitestConfig } from 'vitest/config';
 
 // https://vite.dev/config/
-export default defineConfig(async () => ({
+const host = process.env.TAURI_DEV_HOST;
+
+const viteConfig = defineConfig({
+  resolve: {
+    alias: {
+      '@': path.resolve(import.meta.dirname, 'src'),
+    },
+  },
   plugins: [react()],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
@@ -28,4 +36,14 @@ export default defineConfig(async () => ({
       ignored: ['**/src-tauri/**'],
     },
   },
-}));
+});
+
+const vitestConfig = defineVitestConfig({
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./vitest.setup.ts'],
+  },
+});
+
+export default mergeConfig(viteConfig, vitestConfig);
