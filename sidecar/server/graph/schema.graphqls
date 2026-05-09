@@ -2,3 +2,8 @@ type Query {
   "Health-check field. Always returns 'pong'."
   ping: String!
 }
+
+type Subscription {
+  "Emits an incrementing integer (starting at 1) every second. Cancelled when the client unsubscribes."
+  tick: Int!
+}

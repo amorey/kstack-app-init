@@ -7,14 +7,58 @@ package graph
 
 import (
 	"context"
+	"os"
+	"strconv"
+	"time"
 )
+
+// tickInterval is the cadence of the `tick` subscription. Overridable via
+// SIDECAR_TICK_INTERVAL_MS so the server_test suite can use a sub-second
+// cadence without dragging the whole test run.
+func tickInterval() time.Duration {
+	if v := os.Getenv("SIDECAR_TICK_INTERVAL_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return time.Second
+}
 
 // Ping is the resolver for the ping field.
 func (r *queryResolver) Ping(ctx context.Context) (string, error) {
 	return "pong", nil
 }
 
+// Tick is the resolver for the tick field. Streams 1, 2, 3, … on the
+// configured interval. Cancellation comes from the gqlgen runtime when the
+// client unsubscribes (or the WebSocket closes).
+func (r *subscriptionResolver) Tick(ctx context.Context) (<-chan int, error) {
+	ch := make(chan int, 1)
+	go func() {
+		defer close(ch)
+		t := time.NewTicker(tickInterval())
+		defer t.Stop()
+		for n := 1; ; n++ {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			select {
+			case ch <- n:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, nil
+}
+
 // Query returns QueryResolver implementation.
 func (r *Resolver) Query() QueryResolver { return &queryResolver{r} }
 
+// Subscription returns SubscriptionResolver implementation.
+func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionResolver{r} }
+
 type queryResolver struct{ *Resolver }
+type subscriptionResolver struct{ *Resolver }

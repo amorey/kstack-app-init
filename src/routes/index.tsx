@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { createRoute } from '@tanstack/react-router';
 import { Rocket, Sparkles } from 'lucide-react';
-import { useClient } from 'urql';
+import { useClient, useSubscription } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@kubetail/ui/elements/card';
@@ -24,6 +24,12 @@ export const Route = createRoute({
 const PingQuery = graphql(`
   query Ping {
     ping
+  }
+`);
+
+const TickSubscription = graphql(`
+  subscription Tick {
+    tick
   }
 `);
 
@@ -81,8 +87,18 @@ function Main() {
             Ping sidecar
           </Button>
           {ping && <pre className="text-xs whitespace-pre-wrap">{ping}</pre>}
+
+          <Separator />
+
+          <Tick />
         </CardContent>
       </Card>
     </main>
   );
+}
+
+function Tick() {
+  const [{ data, error }] = useSubscription({ query: TickSubscription });
+  if (error) return <p className="text-xs text-red-500">tick error: {error.message}</p>;
+  return <p className="text-xs">Tick: {data?.tick ?? '…'}</p>;
 }

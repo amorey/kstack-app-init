@@ -2,7 +2,7 @@
 // out individually via `#[allow(clippy::unwrap_used)]` on the `mod tests`.
 #![warn(clippy::unwrap_used)]
 
-use tauri::RunEvent;
+use tauri::{Manager, RunEvent};
 
 pub mod sidecar;
 
@@ -11,8 +11,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![sidecar::command::graphql_query])
+        .invoke_handler(tauri::generate_handler![
+            sidecar::command::graphql_query,
+            sidecar::command::graphql_subscribe,
+            sidecar::command::graphql_unsubscribe,
+        ])
         .setup(|app| {
+            app.manage(sidecar::command::Operations::default());
             sidecar::spawn(app)?;
             Ok(())
         })

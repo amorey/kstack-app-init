@@ -4,3 +4,6 @@ package graph
 
 type Query struct {
 }
+
+type Subscription struct {
+}

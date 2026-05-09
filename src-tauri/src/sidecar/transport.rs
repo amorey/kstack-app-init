@@ -19,6 +19,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Go side's `fmt.Printf("READY unix:%s\n", ...)` in sidecar/main.go.
 pub const READY_PREFIX: &str = "READY unix:";
 
+/// Host header value for HTTP/WS requests over the UDS. Meaningless on the
+/// wire (no DNS) but required by HTTP/1.1.
+pub(super) const HOST: &str = "sidecar.local";
+
+/// Connect to the sidecar's Unix domain socket.
+pub(super) async fn connect_uds(socket: &Path) -> Result<Stream, std::io::Error> {
+    let name = socket.to_fs_name::<GenericFilePath>()?;
+    Stream::connect(name).await
+}
+
 /// Cap response body size. Defends against a misbehaving sidecar buffering
 /// host memory; well above any realistic GraphQL response.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
@@ -38,15 +48,13 @@ pub enum SidecarError {
 /// POST `body` (typically a GraphQL JSON envelope) to /graphql over the UDS at
 /// `socket`. Returns the raw response body bytes — the caller decodes JSON.
 pub async fn query_uds(socket: &Path, body: &[u8]) -> Result<Vec<u8>, SidecarError> {
-    let name = socket
-        .to_fs_name::<GenericFilePath>()
-        .map_err(SidecarError::Connect)?;
-    let conn = Stream::connect(name).await.map_err(SidecarError::Connect)?;
+    let conn = connect_uds(socket).await.map_err(SidecarError::Connect)?;
 
     let mut req = Vec::with_capacity(160 + body.len());
     req.extend_from_slice(b"POST /graphql HTTP/1.1\r\n");
-    // Host header is meaningless for UDS but required by HTTP/1.1.
-    req.extend_from_slice(b"Host: sidecar.local\r\n");
+    req.extend_from_slice(b"Host: ");
+    req.extend_from_slice(HOST.as_bytes());
+    req.extend_from_slice(b"\r\n");
     req.extend_from_slice(b"Content-Type: application/json\r\n");
     req.extend_from_slice(b"Connection: close\r\n");
     use std::io::Write as _;

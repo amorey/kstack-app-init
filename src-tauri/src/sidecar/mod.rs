@@ -10,6 +10,7 @@
 // macro-generated `__cmd__graphql_query` helper next to the function.
 pub mod command;
 mod lifecycle;
+mod subscribe;
 mod transport;
 
 pub use lifecycle::{shutdown, spawn};

@@ -28,4 +28,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sy
 # Cross-platform local sockets: UDS on Unix, AF_UNIX on Windows 10+.
 interprocess = { version = "2", features = ["tokio"] }
 thiserror = "1"
+tokio-tungstenite = "0.24"
+http = "1"
+graphql-ws-client = { version = "0.13", features = ["tungstenite-0.24"] }
+futures-util = "0.3"
 
