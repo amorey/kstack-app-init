@@ -1,5 +1,8 @@
 import { lazy, Suspense } from 'react';
 import { createRootRoute, Outlet } from '@tanstack/react-router';
+import { Provider as UrqlProvider } from 'urql';
+
+import { createGraphqlClient } from '@/lib/graphql/client';
 
 const TanStackRouterDevtools =
   import.meta.env.VITE_ROUTER_DEVTOOLS === 'true'
@@ -9,6 +12,10 @@ const TanStackRouterDevtools =
         })),
       )
     : () => null;
+
+// Single client for the app's lifetime. Created at module load so tests
+// that mount via routeTree get the Provider transitively without extra wiring.
+const gqlClient = createGraphqlClient();
 
 export const Route = createRootRoute({
   notFoundComponent: NotFound,
@@ -26,11 +33,11 @@ export function NotFound() {
 
 function RootComponent() {
   return (
-    <>
+    <UrqlProvider value={gqlClient}>
       <Outlet />
       <Suspense>
         <TanStackRouterDevtools />
       </Suspense>
-    </>
+    </UrqlProvider>
   );
 }

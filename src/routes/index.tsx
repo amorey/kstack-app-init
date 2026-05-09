@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { createRoute } from '@tanstack/react-router';
 import { Rocket, Sparkles } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { useClient } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@kubetail/ui/elements/card';
@@ -10,6 +10,7 @@ import { Label } from '@kubetail/ui/elements/label';
 import { Separator } from '@kubetail/ui/elements/separator';
 import { Switch } from '@kubetail/ui/elements/switch';
 
+import { graphql } from '@/gql';
 import { Route as rootRoute } from '@/routes/__root';
 
 import '@/index.css';
@@ -20,19 +21,26 @@ export const Route = createRoute({
   component: Main,
 });
 
+const PingQuery = graphql(`
+  query Ping {
+    ping
+  }
+`);
+
 function Main() {
+  const client = useClient();
   const [name, setName] = useState('');
   const [notify, setNotify] = useState(true);
   const [ping, setPing] = useState<string>('');
 
   const sendPing = async () => {
-    try {
-      const resp = await invoke<string>('graphql_query', {
-        body: JSON.stringify({ query: '{ ping }' }),
-      });
-      setPing(resp);
-    } catch (err) {
-      setPing(`error: ${String(err)}`);
+    // network-only so each click bypasses the document cache and re-hits
+    // the sidecar — useful for a connectivity smoke check.
+    const result = await client.query(PingQuery, {}, { requestPolicy: 'network-only' }).toPromise();
+    if (result.error) {
+      setPing(`error: ${result.error.message}`);
+    } else {
+      setPing(result.data?.ping ?? '');
     }
   };
 

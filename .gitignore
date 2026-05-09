@@ -17,6 +17,9 @@ target
 # Sidecar build output (produced by `make sidecar`).
 src-tauri/binaries/
 
+# graphql-codegen output (regenerate with `pnpm codegen`).
+src/gql/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
