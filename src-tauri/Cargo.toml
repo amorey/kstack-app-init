@@ -32,4 +32,7 @@ tokio-tungstenite = "0.24"
 http = "1"
 graphql-ws-client = { version = "0.13", features = ["tungstenite-0.24"] }
 futures-util = "0.3"
+log = "0.4"
+tauri-plugin-log = "2"
+libc = "0.2.186"
 

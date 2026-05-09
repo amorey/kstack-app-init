@@ -5,7 +5,7 @@
 // it locks in the contract between the Tauri host and the sidecar
 // (transport + framing + shutdown), independent of any Tauri runtime.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -93,4 +93,44 @@ async fn sidecar_answers_ping_over_uds() {
     // Closing stdin triggers the sidecar's EOF-shutdown path.
     drop(child.stdin.take());
     let _ = child.wait();
+}
+
+/// Closing stdin should drive the sidecar through its graceful-shutdown
+/// branch, which logs `sidecar shutting down` to stderr. This is the
+/// contract that lets the host's `shutdown()` rely on stdin-EOF instead
+/// of SIGKILL — without it, the log never appears in the desktop log file.
+#[tokio::test(flavor = "multi_thread")]
+async fn sidecar_logs_shutting_down_on_stdin_eof() {
+    let bin = sidecar_binary();
+    assert!(
+        bin.exists(),
+        "sidecar binary missing at {bin:?} — run `make sidecar` first"
+    );
+
+    let mut child = Command::new(&bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sidecar");
+
+    // Wait for READY so we know the sidecar is past startup before we
+    // close stdin — avoids racing the shutdown path against init logging.
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut ready = String::new();
+    reader.read_line(&mut ready).expect("read READY");
+
+    drop(child.stdin.take());
+
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut buf = Vec::new();
+    let _ = stderr.read_to_end(&mut buf);
+    let _ = child.wait();
+
+    let s = String::from_utf8_lossy(&buf);
+    assert!(
+        s.contains("sidecar shutting down"),
+        "stderr should contain shutdown log; got:\n{s}",
+    );
 }

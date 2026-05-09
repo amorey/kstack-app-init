@@ -1,9 +1,9 @@
-//! Sidecar process lifecycle: spawn the externalBin, watch its stdout for
-//! the READY line, and kill it on app exit.
+//! Sidecar process lifecycle: spawn the externalBin, watch its stdout
+//! for the READY line, gracefully shut it down on app exit.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{App, AppHandle, Manager};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
@@ -11,16 +11,66 @@ use tauri_plugin_shell::ShellExt;
 use tokio::sync::watch;
 
 use super::transport::READY_PREFIX;
+use crate::KSTACK_LOG_ENV;
 
-/// Time `graphql_query` will wait for the sidecar to publish its socket
-/// path before failing. Sidecar normally prints READY within ~50ms.
+/// Sidecar normally prints READY within ~50ms.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Budget for stdin-EOF graceful exit (single-digit ms typically) plus the
+/// host's stderr-reader draining final log lines through tauri-plugin-log
+/// before SIGKILL fallback.
+const GRACE_PERIOD: Duration = Duration::from_millis(250);
+const GRACE_POLL: Duration = Duration::from_millis(10);
+
+fn sidecar_env_overrides<F: Fn(&str) -> Option<String>>(getenv: F) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(v) = getenv(KSTACK_LOG_ENV) {
+        out.push((KSTACK_LOG_ENV.to_string(), v));
+    }
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ShutdownOutcome {
+    Graceful,
+    Killed,
+}
+
+/// Drop `handle` (closes stdin → sidecar's EOF watcher runs its graceful
+/// exit branch in `sidecar/main.go`), then poll `is_alive` until it
+/// reports exit or `grace` elapses; on timeout call `force_kill`.
+fn graceful_kill<H, P, K>(handle: H, grace: Duration, is_alive: P, force_kill: K) -> ShutdownOutcome
+where
+    P: Fn() -> bool,
+    K: FnOnce(),
+{
+    drop(handle);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !is_alive() {
+            return ShutdownOutcome::Graceful;
+        }
+        std::thread::sleep(GRACE_POLL);
+    }
+    if !is_alive() {
+        return ShutdownOutcome::Graceful;
+    }
+    force_kill();
+    ShutdownOutcome::Killed
+}
+
+/// Strip a single trailing `\n` from a sidecar log line; lossy-decode so a
+/// malformed byte never panics the lifecycle task.
+fn format_sidecar_line(line: &[u8]) -> String {
+    String::from_utf8_lossy(line)
+        .trim_end_matches('\n')
+        .to_owned()
+}
+
 pub(crate) struct SidecarState {
-    /// `None` until the stdout reader sees `READY <prefix><path>`.
-    /// `watch` so commands can `await` readiness instead of polling.
+    /// `None` until the stdout reader sees the READY line.
     socket: watch::Receiver<Option<PathBuf>>,
-    /// Held for the lifetime of the app so we can `kill()` on Exit.
+    /// Held for the lifetime of the app so `shutdown()` can stop it.
     child: Mutex<Option<CommandChild>>,
 }
 
@@ -49,10 +99,14 @@ pub(super) async fn wait_for_socket(
         .map_err(|_| "timed out waiting for sidecar READY".to_string())?
 }
 
-/// Start the sidecar binary, install `SidecarState`, and watch its stdout.
-/// Returns once the child is spawned; the READY line is filled asynchronously.
+/// Start the sidecar binary and watch its stdout for the READY line; the
+/// `SidecarState` is filled asynchronously.
 pub fn spawn(app: &App) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut rx, child) = app.shell().sidecar("kstack-sidecar")?.spawn()?;
+    let mut cmd = app.shell().sidecar("kstack-sidecar")?;
+    for (k, v) in sidecar_env_overrides(|k| std::env::var(k).ok()) {
+        cmd = cmd.env(k, v);
+    }
+    let (mut rx, child) = cmd.spawn()?;
 
     let (socket_tx, socket_rx) = watch::channel::<Option<PathBuf>>(None);
     app.manage(SidecarState {
@@ -61,28 +115,26 @@ pub fn spawn(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     tauri::async_runtime::spawn(async move {
-        let mut ready_seen = false;
         while let Some(ev) = rx.recv().await {
             match ev {
                 CommandEvent::Stdout(line) => {
                     let s = String::from_utf8_lossy(&line);
-                    if !ready_seen {
+                    if socket_tx.borrow().is_none() {
                         if let Some(rest) = s.strip_prefix(READY_PREFIX) {
                             let _ = socket_tx.send(Some(PathBuf::from(rest.trim())));
-                            ready_seen = true;
                             continue;
                         }
                     }
-                    eprintln!("[sidecar:stdout] {}", s.trim_end());
+                    log::info!(target: "sidecar", "{}", format_sidecar_line(&line));
                 }
                 CommandEvent::Stderr(line) => {
-                    eprintln!(
-                        "[sidecar:stderr] {}",
-                        String::from_utf8_lossy(&line).trim_end()
-                    );
+                    log::info!(target: "sidecar", "{}", format_sidecar_line(&line));
+                }
+                CommandEvent::Error(e) => {
+                    log::error!(target: "sidecar", "command event error: {e}");
                 }
                 CommandEvent::Terminated(p) => {
-                    eprintln!("[sidecar] terminated: {p:?}");
+                    log::info!(target: "sidecar", "terminated: {p:?}");
                     break;
                 }
                 _ => {}
@@ -93,25 +145,146 @@ pub fn spawn(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Kill the sidecar child. Safe to call multiple times; later calls no-op.
+/// Drop the `CommandChild` so the sidecar sees stdin EOF and runs its
+/// graceful shutdown branch (see `sidecar/main.go`); SIGKILL fallback if
+/// it doesn't exit within `GRACE_PERIOD`. Safe to call multiple times.
 pub fn shutdown(app: &AppHandle) {
     if let Some(state) = app.try_state::<SidecarState>() {
-        // Recover the inner guard even on poison: a panicked previous holder
-        // shouldn't block our last-ditch attempt to kill the child.
+        // Recover even on poison: a panicked previous holder shouldn't
+        // block our last-ditch attempt to stop the child.
         let mut guard = state
             .child
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(child) = guard.take() {
-            let _ = child.kill();
+            let pid = child.pid();
+            let outcome = graceful_kill(
+                child,
+                GRACE_PERIOD,
+                || process_alive(pid),
+                || {
+                    log::warn!(
+                        target: "sidecar",
+                        "sidecar didn't exit within {GRACE_PERIOD:?}, sending SIGKILL"
+                    );
+                    force_kill(pid);
+                },
+            );
+            log::info!(target: "sidecar", "shutdown outcome: {outcome:?}");
         }
     }
 }
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with sig=0 only checks delivery permission; no signal sent.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn process_alive(_pid: u32) -> bool {
+    // No probe wired up on Windows yet; treat as dead so we skip the
+    // SIGKILL fallback. The stdin-EOF graceful path still runs.
+    false
+}
+
+#[cfg(unix)]
+fn force_kill(pid: u32) {
+    // SAFETY: PID came from a CommandChild we just dropped; reuse in the
+    // sub-second window between drop and probe is not a real risk on the
+    // platforms we ship to.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn force_kill(_pid: u32) {}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_sidecar_line_strips_trailing_newline() {
+        assert_eq!(format_sidecar_line(b"hello\n"), "hello");
+    }
+
+    #[test]
+    fn format_sidecar_line_handles_no_trailing_newline() {
+        assert_eq!(format_sidecar_line(b"hello"), "hello");
+    }
+
+    #[test]
+    fn format_sidecar_line_preserves_internal_newlines() {
+        assert_eq!(format_sidecar_line(b"line1\nline2\n"), "line1\nline2");
+    }
+
+    #[test]
+    fn format_sidecar_line_lossy_decodes_invalid_utf8() {
+        assert_eq!(format_sidecar_line(&[0xff]), "\u{FFFD}");
+    }
+
+    #[test]
+    fn sidecar_env_overrides_passes_through_kstack_log() {
+        let env = sidecar_env_overrides(|k| match k {
+            "KSTACK_LOG" => Some("debug".into()),
+            _ => None,
+        });
+        assert_eq!(env, vec![("KSTACK_LOG".to_string(), "debug".to_string())]);
+    }
+
+    #[test]
+    fn sidecar_env_overrides_is_empty_when_unset() {
+        let env = sidecar_env_overrides(|_| None);
+        assert!(env.is_empty(), "got: {env:?}");
+    }
+
+    /// Stand-in for `CommandChild` in tests — flips the cell on drop, so
+    /// tests can prove `graceful_kill` closes stdin before waiting.
+    struct DropProbe<'a>(&'a std::cell::Cell<bool>);
+    impl Drop for DropProbe<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[test]
+    fn graceful_kill_drops_handle_first_and_skips_force_kill_on_clean_exit() {
+        let dropped = std::cell::Cell::new(false);
+        let probe = DropProbe(&dropped);
+        let force_kill_calls = std::cell::Cell::new(0u32);
+
+        let outcome = graceful_kill(
+            probe,
+            Duration::from_millis(50),
+            || false,
+            || force_kill_calls.set(force_kill_calls.get() + 1),
+        );
+
+        assert!(dropped.get(), "handle must be dropped before the wait");
+        assert_eq!(force_kill_calls.get(), 0);
+        assert_eq!(outcome, ShutdownOutcome::Graceful);
+    }
+
+    #[test]
+    fn graceful_kill_force_kills_when_process_outlives_grace_period() {
+        let dropped = std::cell::Cell::new(false);
+        let probe = DropProbe(&dropped);
+        let force_kill_calls = std::cell::Cell::new(0u32);
+
+        let outcome = graceful_kill(
+            probe,
+            Duration::from_millis(20),
+            || true,
+            || force_kill_calls.set(force_kill_calls.get() + 1),
+        );
+
+        assert!(dropped.get());
+        assert_eq!(force_kill_calls.get(), 1);
+        assert_eq!(outcome, ShutdownOutcome::Killed);
+    }
 
     #[tokio::test]
     async fn returns_immediately_if_already_set() {
@@ -124,7 +297,6 @@ mod tests {
     async fn awaits_then_resolves_when_sender_publishes() {
         let (tx, rx) = watch::channel::<Option<PathBuf>>(None);
         let task = tokio::spawn(wait_for_socket(rx));
-        // Yield so the task gets to its first `changed().await`.
         tokio::task::yield_now().await;
         tx.send(Some(PathBuf::from("/tmp/late.sock"))).unwrap();
         let result = task.await.unwrap().unwrap();

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/logging"
 	"github.com/kubetail-org/kstack-app/sidecar/server"
 )
 
@@ -93,6 +95,45 @@ func TestTickSubscription(t *testing.T) {
 	}
 
 	mustWrite(t, conn, `{"id":"1","type":"complete"}`)
+}
+
+// TestResolverErrorIsLogged exercises the error presenter installed in
+// NewHandler: a query against an unknown field should produce one JSON
+// log line at ERROR level via the configured slog default.
+func TestResolverErrorIsLogged(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	var buf bytes.Buffer
+	slog.SetDefault(logging.Init(&buf, slog.LevelInfo))
+
+	ts := httptest.NewServer(server.NewHandler())
+	defer ts.Close()
+
+	body := strings.NewReader(`{"query":"{ noSuchField }"}`)
+	resp, err := http.Post(ts.URL+"/graphql", "application/json", body)
+	if err != nil {
+		t.Fatalf("POST /graphql: %v", err)
+	}
+	resp.Body.Close()
+
+	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	var found bool
+	for _, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("decode %q: %v", line, err)
+		}
+		if entry["level"] == "ERROR" && strings.Contains(entry["msg"].(string), "graphql") {
+			if entry["error"] == nil {
+				t.Errorf("missing error key: %v", entry)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an ERROR graphql log line, got: %s", buf.String())
+	}
 }
 
 func mustWrite(t *testing.T, c *websocket.Conn, msg string) {

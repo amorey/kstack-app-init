@@ -17,7 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -27,10 +27,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/logging"
 	"github.com/kubetail-org/kstack-app/sidecar/server"
 )
 
 func main() {
+	slog.SetDefault(logging.Init(os.Stderr, logging.ParseLevel(os.Getenv("KSTACK_LOG"))))
+
 	defaultSock := filepath.Join(os.TempDir(), fmt.Sprintf("kstack-sidecar-%d.sock", os.Getpid()))
 	sockPath := flag.String("socket", defaultSock, "path to the Unix domain socket to listen on")
 	flag.Parse()
@@ -40,7 +43,8 @@ func main() {
 
 	ln, err := net.Listen("unix", *sockPath)
 	if err != nil {
-		log.Fatalf("listen %s: %v", *sockPath, err)
+		slog.Error("listen", "socket", *sockPath, "err", err)
+		os.Exit(1)
 	}
 	// 0600: only the user that started us can connect. Windows ignores
 	// POSIX modes (Chmod only toggles the read-only bit there); skip the
@@ -48,10 +52,13 @@ func main() {
 	// the temp directory is the access boundary on Windows.
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(*sockPath, 0o600); err != nil {
-			log.Fatalf("chmod %s: %v", *sockPath, err)
+			slog.Error("chmod", "socket", *sockPath, "err", err)
+			os.Exit(1)
 		}
 	}
 	defer os.Remove(*sockPath)
+
+	slog.Info("sidecar starting", "socket", *sockPath, "pid", os.Getpid())
 
 	const maxRequestBytes = 64 * 1024 * 1024
 	srv := &http.Server{
@@ -75,14 +82,18 @@ func main() {
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 
+	reason := "signal"
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("serve: %v", err)
+			slog.Error("serve", "err", err)
+			os.Exit(1)
 		}
+		reason = "serve returned"
 	}
 
+	slog.Info("sidecar shutting down", "reason", reason)
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancelShutdown()
 	_ = srv.Shutdown(shutdownCtx)

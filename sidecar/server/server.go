@@ -4,12 +4,16 @@
 package server
 
 import (
+	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/99designs/gqlgen/graphql"
 	"github.com/99designs/gqlgen/graphql/handler"
 	"github.com/99designs/gqlgen/graphql/handler/transport"
 	"github.com/gorilla/websocket"
+	"github.com/vektah/gqlparser/v2/gqlerror"
 
 	"github.com/kubetail-org/kstack-app/sidecar/server/graph"
 )
@@ -28,6 +32,24 @@ func NewHandler() http.Handler {
 	})
 	srv.AddTransport(transport.POST{})
 	srv.AddTransport(transport.GET{})
+
+	// Single seam for resolver / parse errors. We log operation name and
+	// path but not `variables` — they can carry auth tokens or PII.
+	srv.SetErrorPresenter(func(ctx context.Context, e error) *gqlerror.Error {
+		err := graphql.DefaultErrorPresenter(ctx, e)
+		op, opName := "", ""
+		if oc := graphql.GetOperationContext(ctx); oc != nil {
+			opName = oc.OperationName
+			op = oc.RawQuery
+		}
+		slog.ErrorContext(ctx, "graphql error",
+			"op", opName,
+			"path", err.Path.String(),
+			"error", err.Message,
+			"raw", op,
+		)
+		return err
+	})
 
 	mux := http.NewServeMux()
 	mux.Handle("/graphql", srv)
