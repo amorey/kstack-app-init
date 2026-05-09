@@ -20,6 +20,12 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Async runtime for managing the sidecar lifecycle and UDS I/O.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "test-util"] }
+# Cross-platform local sockets: UDS on Unix, AF_UNIX on Windows 10+.
+interprocess = { version = "2", features = ["tokio"] }
+thiserror = "1"
 

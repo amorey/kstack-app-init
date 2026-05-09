@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { createRoute } from '@tanstack/react-router';
 import { Rocket, Sparkles } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 
 import { Button } from '@kubetail/ui/elements/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@kubetail/ui/elements/card';
@@ -22,6 +23,18 @@ export const Route = createRoute({
 function Main() {
   const [name, setName] = useState('');
   const [notify, setNotify] = useState(true);
+  const [ping, setPing] = useState<string>('');
+
+  const sendPing = async () => {
+    try {
+      const resp = await invoke<string>('graphql_query', {
+        body: JSON.stringify({ query: '{ ping }' }),
+      });
+      setPing(resp);
+    } catch (err) {
+      setPing(`error: ${String(err)}`);
+    }
+  };
 
   return (
     <main className="flex min-h-svh items-center justify-center bg-background p-6">
@@ -40,7 +53,7 @@ function Main() {
           </div>
 
           <div className="flex items-center justify-between">
-            <Label htmlFor="notify">Notify me</Label>
+            <Label htmlFor="notify">NOTIFY ME</Label>
             <Switch id="notify" checked={notify} onCheckedChange={setNotify} />
           </div>
 
@@ -53,6 +66,13 @@ function Main() {
               Create
             </Button>
           </div>
+
+          <Separator />
+
+          <Button variant="secondary" onClick={sendPing}>
+            Ping sidecar
+          </Button>
+          {ping && <pre className="text-xs whitespace-pre-wrap">{ping}</pre>}
         </CardContent>
       </Card>
     </main>

@@ -1,0 +1,4 @@
+type Query {
+  "Health-check field. Always returns 'pong'."
+  ping: String!
+}
