@@ -9,6 +9,7 @@ use tauri::{
 };
 use tauri_plugin_log::{Target, TargetKind};
 
+pub mod deep_link;
 pub mod sidecar;
 pub mod windows;
 
@@ -51,6 +52,7 @@ pub fn run() {
         // (including dynamically created `window-N` ones); restoration of
         // dynamic windows is explicit — see `windows::open_new`.
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
@@ -75,6 +77,7 @@ pub fn run() {
         .setup(|app| {
             app.manage(sidecar::command::Operations::default());
             sidecar::spawn(app)?;
+            deep_link::init(app.handle())?;
 
             // Tray icon with Show / Quit menu. The icon is reused from the
             // bundled app icon so we don't need to ship a separate asset.

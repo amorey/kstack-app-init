@@ -37,10 +37,15 @@ log = "0.4"
 tauri-plugin-log = "2"
 libc = "0.2.186"
 tauri-plugin-window-state = "2"
+tauri-plugin-deep-link = "2"
 
 # Desktop-only: prevent a second launch from starting another process; the
 # callback below forwards focus to the already-running instance. Critical
-# because the sidecar binds a single UDS path — two hosts would race.
+# because the sidecar binds a single UDS path — two hosts would race. The
+# `deep-link` feature makes the plugin forward second-launch URLs into
+# `tauri-plugin-deep-link`'s `on_open_url` stream on Windows/Linux (where
+# the OS launches a fresh process to deliver a URL). macOS uses native
+# Apple Events instead and doesn't need this glue.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
