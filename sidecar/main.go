@@ -62,10 +62,11 @@ func main() {
 
 	const maxRequestBytes = 64 * 1024 * 1024
 	srv := &http.Server{
-		Handler:           http.MaxBytesHandler(server.NewHandler(), maxRequestBytes),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, server.NewHandler())
+	srv.Handler = http.MaxBytesHandler(wrapped, maxRequestBytes)
 
 	// Announce. Host parses this line to learn the socket path.
 	fmt.Printf("READY unix:%s\n", *sockPath)
@@ -97,4 +98,8 @@ func main() {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancelShutdown()
 	_ = srv.Shutdown(shutdownCtx)
+	// http.Server.Shutdown doesn't wait for hijacked connections (per its
+	// docs); explicit wait so WS handlers finish writing their close frames
+	// before we exit and the OS reaps the socket.
+	waitForHijacked()
 }

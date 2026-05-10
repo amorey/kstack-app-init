@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -133,6 +134,83 @@ func TestResolverErrorIsLogged(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected an ERROR graphql log line, got: %s", buf.String())
+	}
+}
+
+// TestGracefulShutdownClosesWebsocket verifies that when the http.Server
+// begins shutdown, every active subscription receives a graceful WS Close
+// frame (CloseNormalClosure / 1000) instead of a TCP reset. This is what
+// keeps the Rust host's graphql-ws-client from logging a
+// `ResetWithoutClosingHandshake` warning on every app exit.
+func TestGracefulShutdownClosesWebsocket(t *testing.T) {
+	ts := httptest.NewUnstartedServer(http.NotFoundHandler())
+	wrapped, wait := server.AttachGracefulShutdown(ts.Config, server.NewHandler())
+	ts.Config.Handler = wrapped
+	ts.Start()
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/graphql"
+	dialer := websocket.Dialer{
+		Subprotocols:     []string{"graphql-transport-ws"},
+		HandshakeTimeout: 5 * time.Second,
+	}
+	conn, _, err := dialer.DialContext(context.Background(), wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer conn.Close()
+
+	mustWrite(t, conn, `{"type":"connection_init"}`)
+	if got := mustReadType(t, conn); got != "connection_ack" {
+		t.Fatalf("want connection_ack, got %q", got)
+	}
+	mustWrite(t, conn, `{"id":"1","type":"subscribe","payload":{"query":"subscription { tick }"}}`)
+
+	// Wait for one tick so we know the subscription is established.
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatalf("read first tick: %v", err)
+	}
+
+	// Trigger graceful shutdown in the background.
+	shutdownErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shutdownErr <- ts.Config.Shutdown(ctx)
+	}()
+
+	// The next read should eventually surface a graceful Close frame.
+	// Subsequent ticks may still arrive before the close lands; loop
+	// until we see the close (or fail).
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			continue
+		}
+		var ce *websocket.CloseError
+		if !errors.As(err, &ce) {
+			t.Fatalf("expected CloseError, got %v (%T)", err, err)
+		}
+		if ce.Code != websocket.CloseNormalClosure {
+			t.Errorf("expected NormalClosure (1000), got %d (%s)", ce.Code, ce.Text)
+		}
+		break
+	}
+
+	// Wait must complete promptly — proves hijacked WS handlers actually
+	// returned (so srv exit doesn't drop a half-written close frame).
+	done := make(chan struct{})
+	go func() { wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hijacked WS handler didn't finish after Close frame")
+	}
+
+	if err := <-shutdownErr; err != nil {
+		t.Errorf("shutdown returned: %v", err)
 	}
 }
 
