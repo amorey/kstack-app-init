@@ -18,6 +18,7 @@ use tauri::{
 };
 #[cfg(target_os = "windows")]
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_window_state::{StateFlags, WindowExt};
 
 /// Label of the window declared in `tauri.conf.json` — created automatically
 /// at startup. Additional windows use `window-N` from `WINDOW_COUNTER`.
@@ -32,16 +33,24 @@ static WINDOW_COUNTER: AtomicU32 = AtomicU32::new(2);
 const MENU_ID_NEW_WINDOW: &str = "new-window";
 
 /// Open a new window pointing at the same frontend entry as the main window.
-/// Geometry mirrors the `tauri.conf.json` defaults so first-open feels
-/// consistent; later this is what `tauri-plugin-window-state` will override
-/// on a per-label basis.
+/// Builder geometry is the fallback used the *first* time a given label is
+/// seen; on subsequent launches `tauri-plugin-window-state` restores the
+/// per-label saved size/position via `restore_state` below. (The plugin
+/// auto-restores windows declared in `tauri.conf.json` like `main`, but
+/// dynamically built windows have to opt in explicitly.)
 pub fn open_new<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<WebviewWindow<R>> {
     let n = WINDOW_COUNTER.fetch_add(1, Ordering::SeqCst);
     let label = format!("window-{n}");
-    WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
         .title("kstack-app")
         .inner_size(800.0, 600.0)
-        .build()
+        .build()?;
+    if let Err(err) = window.restore_state(StateFlags::all()) {
+        // Restoration failure is non-fatal — the window just opens at the
+        // builder defaults instead of its saved geometry.
+        log::warn!("window-state: could not restore {label}: {err}");
+    }
+    Ok(window)
 }
 
 /// Bring an existing window forward, or open one if none exist. Used by the

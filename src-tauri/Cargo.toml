@@ -36,6 +36,7 @@ futures-util = "0.3"
 log = "0.4"
 tauri-plugin-log = "2"
 libc = "0.2.186"
+tauri-plugin-window-state = "2"
 
 # Desktop-only: prevent a second launch from starting another process; the
 # callback below forwards focus to the already-running instance. Critical

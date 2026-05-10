@@ -46,6 +46,11 @@ pub fn run() {
     }
 
     builder
+        // Persists per-window size/position/maximized state across launches,
+        // keyed by window label. Auto-attaches save hooks to every window
+        // (including dynamically created `window-N` ones); restoration of
+        // dynamic windows is explicit — see `windows::open_new`.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
