@@ -6,7 +6,7 @@
 //
 // Backed by `EventTarget` so listeners are GC-friendly and order is FIFO.
 
-export type AppErrorSource = 'graphql' | 'subscription' | 'network' | 'render';
+export type AppErrorSource = 'graphql' | 'subscription' | 'network' | 'render' | 'auth';
 
 export type AppError = {
   source: AppErrorSource;

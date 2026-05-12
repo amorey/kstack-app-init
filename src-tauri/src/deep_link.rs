@@ -1,18 +1,22 @@
 //! Deep-link URL handling. Scheme `kstack://` is declared under
-//! `plugins.deep-link.desktop.schemes` in `tauri.conf.json` (which feeds the
-//! macOS Info.plist and the Linux `.desktop` MimeType at bundle time).
+//! `plugins.deep-link.desktop.schemes` in `tauri.conf.json` (which feeds
+//! the macOS Info.plist and the Linux `.desktop` MimeType at bundle
+//! time). It is **not** used for OAuth — auth rides on a loopback
+//! redirect (see `auth::loopback`) — but the registration is kept so
+//! future "open the app to a particular cluster from a URL in chat /
+//! email / a web dashboard" features can plug in here without redoing
+//! the OS plumbing.
 //!
-//! Three delivery paths all converge on this module's `on_open_url` listener:
+//! Three delivery paths all converge on this module's `on_open_url`
+//! listener:
 //! 1. **Cold start with a URL** — the OS launches us with the URL; the
 //!    plugin replays it as an `on_open_url` event after `setup`.
-//! 2. **macOS hot delivery** — the OS sends an Apple Event to the running
-//!    process, which the plugin turns into the same event.
-//! 3. **Windows/Linux hot delivery** — the OS launches a fresh process; the
-//!    single-instance plugin's `deep-link` feature forwards the URL into
-//!    the running process's event stream rather than into the argv callback.
-//!
-//! Routing logic (e.g. `kstack://oauth/callback?...`) is intentionally
-//! stubbed — TODO 9 (OAuth to kstack-cloud) is the first real consumer.
+//! 2. **macOS hot delivery** — the OS sends an Apple Event to the
+//!    running process, which the plugin turns into the same event.
+//! 3. **Windows/Linux hot delivery** — the OS launches a fresh process;
+//!    the single-instance plugin's `deep-link` feature forwards the URL
+//!    into the running process's event stream rather than into the argv
+//!    callback.
 
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -36,8 +40,9 @@ pub fn init<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let handle = app.clone();
     app.deep_link().on_open_url(move |event| {
         for url in event.urls() {
-            // Stub: bring a window forward and log. Real routing (OAuth
-            // callback, future cluster-share links, etc.) lands here.
+            // No routing yet — log and surface a window so the user sees
+            // the app come forward. Real handlers (e.g. `kstack://cluster
+            // /<id>` jumping to a cluster view) plug in here.
             log::info!("deep-link received: {url}");
             windows::show_or_open(&handle);
         }

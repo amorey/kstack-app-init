@@ -2,6 +2,8 @@ import { lazy, Suspense } from 'react';
 import { createRootRoute, Outlet } from '@tanstack/react-router';
 import { Provider as UrqlProvider } from 'urql';
 
+import { AuthProvider } from '@/lib/auth/auth-context';
+import { ProfileMenu } from '@/lib/auth/profile-menu';
 import { ConnectionStatus } from '@/lib/connection-status';
 import { ErrorBoundary } from '@/lib/error-boundary';
 import { createGraphqlClient } from '@/lib/graphql/client';
@@ -36,13 +38,18 @@ export function NotFound() {
 function RootComponent() {
   return (
     <ErrorBoundary>
-      <UrqlProvider value={gqlClient}>
-        <ConnectionStatus />
-        <Outlet />
-        <Suspense>
-          <TanStackRouterDevtools />
-        </Suspense>
-      </UrqlProvider>
+      <AuthProvider>
+        <UrqlProvider value={gqlClient}>
+          <div className="fixed right-3 top-3 z-50">
+            <ProfileMenu />
+          </div>
+          <ConnectionStatus />
+          <Outlet />
+          <Suspense>
+            <TanStackRouterDevtools />
+          </Suspense>
+        </UrqlProvider>
+      </AuthProvider>
     </ErrorBoundary>
   );
 }

@@ -5,10 +5,11 @@
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    Manager, RunEvent,
+    Emitter, Manager, RunEvent,
 };
 use tauri_plugin_log::{Target, TargetKind};
 
+pub mod auth;
 pub mod deep_link;
 pub mod sidecar;
 pub mod windows;
@@ -73,11 +74,29 @@ pub fn run() {
             sidecar::command::graphql_query,
             sidecar::command::graphql_subscribe,
             sidecar::command::graphql_unsubscribe,
+            auth::commands::auth_login,
+            auth::commands::auth_logout,
+            auth::commands::auth_status,
+            auth::commands::auth_access_token,
         ])
         .setup(|app| {
             app.manage(sidecar::command::Operations::default());
             sidecar::spawn(app)?;
             deep_link::init(app.handle())?;
+
+            // Silent restore from the keychain runs off the critical path.
+            // The event payload carries the resolved `Status` so the
+            // renderer doesn't need a follow-up `auth_status` round-trip.
+            let restore_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = auth::AUTH.try_restore().await {
+                    log::warn!("auth: restore failed: {e}");
+                }
+                let status = auth::AUTH.status().await;
+                if let Err(e) = restore_handle.emit(auth::RESTORE_EVENT, status) {
+                    log::warn!("auth: emit restore event: {e}");
+                }
+            });
 
             // Tray icon with Show / Quit menu. The icon is reused from the
             // bundled app icon so we don't need to ship a separate asset.
