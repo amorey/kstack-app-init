@@ -11,7 +11,7 @@ use tauri_plugin_shell::ShellExt;
 use tokio::sync::watch;
 
 use super::transport::READY_PREFIX;
-use crate::KSTACK_LOG_ENV;
+use crate::{KSTACK_CLOUD_URL_ENV, KSTACK_LOG_ENV};
 
 /// Sidecar normally prints READY within ~50ms.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,8 +24,10 @@ const GRACE_POLL: Duration = Duration::from_millis(10);
 
 fn sidecar_env_overrides<F: Fn(&str) -> Option<String>>(getenv: F) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if let Some(v) = getenv(KSTACK_LOG_ENV) {
-        out.push((KSTACK_LOG_ENV.to_string(), v));
+    for key in [KSTACK_LOG_ENV, KSTACK_CLOUD_URL_ENV] {
+        if let Some(v) = getenv(key) {
+            out.push((key.to_string(), v));
+        }
     }
     out
 }
@@ -239,6 +241,21 @@ mod tests {
     fn sidecar_env_overrides_is_empty_when_unset() {
         let env = sidecar_env_overrides(|_| None);
         assert!(env.is_empty(), "got: {env:?}");
+    }
+
+    #[test]
+    fn sidecar_env_overrides_passes_through_kstack_cloud_url() {
+        let env = sidecar_env_overrides(|k| match k {
+            "KSTACK_CLOUD_URL" => Some("https://api.example".into()),
+            _ => None,
+        });
+        assert_eq!(
+            env,
+            vec![(
+                "KSTACK_CLOUD_URL".to_string(),
+                "https://api.example".to_string()
+            )]
+        );
     }
 
     /// Stand-in for `CommandChild` in tests — flips the cell on drop, so

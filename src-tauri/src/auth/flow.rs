@@ -180,12 +180,13 @@ impl Auth {
         // Snapshot just the fields we need so we don't hold the read lock
         // (or clone the whole `Tokens` with its secrets) across the await
         // for the refresh path.
-        let snapshot = self
-            .tokens
-            .read()
-            .await
-            .as_ref()
-            .map(|t| (t.access_token.clone(), t.is_expired(), t.refresh_token.is_some()));
+        let snapshot = self.tokens.read().await.as_ref().map(|t| {
+            (
+                t.access_token.clone(),
+                t.is_expired(),
+                t.refresh_token.is_some(),
+            )
+        });
         match snapshot {
             None => Err("not authenticated".into()),
             Some((at, false, _)) => Ok(at),
@@ -203,12 +204,13 @@ impl Auth {
         let _g = self.refresh_lock.lock().await;
         // Snapshot expiry + RT under one read lock; another caller may
         // have just refreshed, in which case we hand back their AT.
-        let snapshot = self
-            .tokens
-            .read()
-            .await
-            .as_ref()
-            .map(|t| (t.access_token.clone(), t.is_expired(), t.refresh_token.clone()));
+        let snapshot = self.tokens.read().await.as_ref().map(|t| {
+            (
+                t.access_token.clone(),
+                t.is_expired(),
+                t.refresh_token.clone(),
+            )
+        });
         match snapshot {
             Some((at, false, _)) => Ok(at),
             Some((_, true, Some(rt))) => self.do_refresh(&rt).await,
@@ -278,11 +280,7 @@ impl Auth {
             .claims(&client.id_token_verifier(), nonce)
             .map_err(|e| format!("id_token verify: {e}"))?;
 
-        let expires_at = now()
-            + response
-                .expires_in()
-                .map(|d| d.as_secs())
-                .unwrap_or(3600);
+        let expires_at = now() + response.expires_in().map(|d| d.as_secs()).unwrap_or(3600);
 
         let tokens = Tokens {
             access_token: response.access_token().secret().clone(),
@@ -322,7 +320,12 @@ impl Auth {
         let (id_token, email, name, sub) = {
             let prev = self.tokens.read().await;
             match prev.as_ref() {
-                Some(p) => (p.id_token.clone(), p.email.clone(), p.name.clone(), p.sub.clone()),
+                Some(p) => (
+                    p.id_token.clone(),
+                    p.email.clone(),
+                    p.name.clone(),
+                    p.sub.clone(),
+                ),
                 None => (None, None, None, None),
             }
         };

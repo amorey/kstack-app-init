@@ -67,10 +67,10 @@ async fn mount_discovery(server: &MockServer, with_revocation: bool) -> Option<S
     let revoke = with_revocation.then(|| format!("{}/oauth2/revoke", server.uri()));
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(discovery_body(&issuer_for(server), revoke.as_deref()), "application/json"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            discovery_body(&issuer_for(server), revoke.as_deref()),
+            "application/json",
+        ))
         .mount(server)
         .await;
     revoke
@@ -135,7 +135,9 @@ async fn local_state_cleared_even_when_revocation_endpoint_500s() {
     // Failing revocation must not surface as an error: the user already
     // sees "signed out," and the only thing a 500 means we can't do is
     // tell the IdP — which it'll figure out when the tokens expire.
-    auth.logout().await.expect("logout must succeed despite IdP 5xx");
+    auth.logout()
+        .await
+        .expect("logout must succeed despite IdP 5xx");
     assert!(!auth.has_tokens().await);
 }
 
@@ -215,7 +217,10 @@ async fn revocation_post_is_form_encoded_with_client_id() {
             "RFC 7009 requires form encoding, got {ct:?}"
         );
         let body = std::str::from_utf8(&req.body).expect("utf-8 body");
-        assert!(body.contains(&format!("client_id={CLIENT_ID}")), "body: {body}");
+        assert!(
+            body.contains(&format!("client_id={CLIENT_ID}")),
+            "body: {body}"
+        );
         assert!(body.contains("token="), "body: {body}");
         assert!(body.contains("token_type_hint="), "body: {body}");
     }

@@ -2,8 +2,20 @@
 
 package graph
 
+type Mutation struct {
+}
+
 type Query struct {
 }
 
+// User-scoped preferences synced through the kstack cloud. Today this is a single free-form `placeholder` string — extend as the product grows.
+type Settings struct {
+	Placeholder string `json:"placeholder"`
+}
+
 type Subscription struct {
+}
+
+type UpdateSettingsInput struct {
+	Placeholder *string `json:"placeholder,omitempty"`
 }

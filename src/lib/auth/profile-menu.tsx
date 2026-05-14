@@ -9,6 +9,7 @@ import { Avatar, AvatarFallback } from '@kubetail/ui/elements/avatar';
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -43,27 +44,29 @@ export function ProfileMenu() {
           </AvatarFallback>
         </Avatar>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" sideOffset={6} className="min-w-[12rem]">
-        {status.authenticated ? (
-          <>
-            <DropdownMenuLabel className="flex flex-col font-normal">
-              <span className="text-sm font-medium">{status.name ?? status.email ?? 'Signed in'}</span>
-              {status.name && status.email ? (
-                <span className="text-xs text-muted-foreground">{status.email}</span>
-              ) : null}
-            </DropdownMenuLabel>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={() => logout().catch(() => {})}>
-              <LogOut className="size-4" aria-hidden />
-              Sign out
+      <DropdownMenuContent align="end" sideOffset={6} className="min-w-48">
+        <DropdownMenuGroup>
+          {status.authenticated ? (
+            <>
+              <DropdownMenuLabel className="flex flex-col font-normal">
+                <span className="text-sm font-medium">{status.name ?? status.email ?? 'Signed in'}</span>
+                {status.name && status.email ? (
+                  <span className="text-xs text-muted-foreground">{status.email}</span>
+                ) : null}
+              </DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => logout().catch(() => {})}>
+                <LogOut className="size-4" aria-hidden />
+                Sign out
+              </DropdownMenuItem>
+            </>
+          ) : (
+            <DropdownMenuItem disabled={loading} onClick={() => login().catch(() => {})}>
+              <LogIn className="size-4" aria-hidden />
+              Sign in
             </DropdownMenuItem>
-          </>
-        ) : (
-          <DropdownMenuItem disabled={loading} onSelect={() => login().catch(() => {})}>
-            <LogIn className="size-4" aria-hidden />
-            Sign in
-          </DropdownMenuItem>
-        )}
+          )}
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );

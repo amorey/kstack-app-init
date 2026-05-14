@@ -36,6 +36,11 @@ func main() {
 
 	defaultSock := filepath.Join(os.TempDir(), fmt.Sprintf("kstack-sidecar-%d.sock", os.Getpid()))
 	sockPath := flag.String("socket", defaultSock, "path to the Unix domain socket to listen on")
+	// Default points at production; override via env (or --cloud-url) for
+	// local dev. The cloud GraphQL client appends `/graphql` itself, so
+	// callers only ever name the host.
+	cloudURL := flag.String("cloud-url", envOr("KSTACK_CLOUD_URL", "https://api.kstack.sh"), "base URL of the kstack cloud (without /graphql)")
+	prefsPath := flag.String("prefs-path", server.DefaultPrefsPath(), "path to the local preferences cache file")
 	flag.Parse()
 
 	// Stale socket from a crashed previous run would block bind; remove it.
@@ -58,14 +63,22 @@ func main() {
 	}
 	defer os.Remove(*sockPath)
 
-	slog.Info("sidecar starting", "socket", *sockPath, "pid", os.Getpid())
+	slog.Info("sidecar starting",
+		"socket", *sockPath,
+		"pid", os.Getpid(),
+		"cloud_url", *cloudURL,
+		"prefs_path", *prefsPath,
+	)
 
 	const maxRequestBytes = 64 * 1024 * 1024
 	srv := &http.Server{
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, server.NewHandler())
+	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, server.NewHandler(server.Config{
+		CloudURL:  *cloudURL,
+		PrefsPath: *prefsPath,
+	}))
 	srv.Handler = http.MaxBytesHandler(wrapped, maxRequestBytes)
 
 	// Announce. Host parses this line to learn the socket path.
@@ -102,4 +115,14 @@ func main() {
 	// docs); explicit wait so WS handlers finish writing their close frames
 	// before we exit and the OS reaps the socket.
 	waitForHijacked()
+}
+
+// envOr returns the value of env var `key`, or `fallback` if unset/empty.
+// Used to give flags a "production default that env can override" shape
+// without each call site spelling out the lookup.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

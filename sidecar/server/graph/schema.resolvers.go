@@ -7,26 +7,48 @@ package graph
 
 import (
 	"context"
-	"os"
-	"strconv"
 	"time"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 )
 
-// tickInterval is the cadence of the `tick` subscription. Overridable via
-// SIDECAR_TICK_INTERVAL_MS so the server_test suite can use a sub-second
-// cadence without dragging the whole test run.
-func tickInterval() time.Duration {
-	if v := os.Getenv("SIDECAR_TICK_INTERVAL_MS"); v != "" {
-		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
-			return time.Duration(ms) * time.Millisecond
-		}
+// UpdateSettings is the resolver for the updateSettings field. Write-through:
+// push to the cloud, mirror the cloud's response into the local cache, then
+// notify any active settingsWatch subscribers in this process.
+func (r *mutationResolver) UpdateSettings(ctx context.Context, input UpdateSettingsInput) (*Settings, error) {
+	out, err := r.Cloud.UpdateSettings(ctx, bearer(ctx), cloudInput(input))
+	if err != nil {
+		return nil, err
 	}
-	return time.Second
+	if err := r.Store.Save(out); err != nil {
+		logResolverErr(ctx, "store.Save", err)
+	}
+	r.Hub.Publish(out)
+	return toGraphSettings(out), nil
 }
 
 // Ping is the resolver for the ping field.
 func (r *queryResolver) Ping(ctx context.Context) (string, error) {
 	return "pong", nil
+}
+
+// Settings is the resolver for the settings field. Read-through: try the
+// cloud first, refresh the local cache on success; fall back to the cache
+// when the cloud is unreachable.
+func (r *queryResolver) Settings(ctx context.Context) (*Settings, error) {
+	out, err := r.Cloud.GetSettings(ctx, bearer(ctx))
+	if err == nil {
+		if saveErr := r.Store.Save(out); saveErr != nil {
+			logResolverErr(ctx, "store.Save", saveErr)
+		}
+		return toGraphSettings(out), nil
+	}
+	logResolverErr(ctx, "cloud.GetSettings", err)
+	cached, loadErr := r.Store.Load()
+	if loadErr != nil {
+		return nil, loadErr
+	}
+	return toGraphSettings(cached), nil
 }
 
 // Tick is the resolver for the tick field. Streams 1, 2, 3, … on the
@@ -54,11 +76,73 @@ func (r *subscriptionResolver) Tick(ctx context.Context) (<-chan int, error) {
 	return ch, nil
 }
 
+// SettingsWatch is the resolver for the settingsWatch field. Opens a cloud
+// SSE stream scoped to this subscriber's bearer token; each event is
+// republished through the local Hub so any in-process subscriber sees it
+// (today: just this one client, but the indirection makes adding more
+// trivial). The cloud stream tears down automatically when ctx is cancelled.
+func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *Settings, error) {
+	streamCtx, cancel := context.WithCancel(ctx)
+
+	cloudCh, err := r.Cloud.WatchSettings(streamCtx, bearer(ctx))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	hubCh, unsub := r.Hub.Subscribe()
+
+	// Pump cloud → hub. Lives in its own goroutine so a slow hub consumer
+	// can't stall the cloud reader. Closes when the cloud stream ends.
+	go func() {
+		for s := range cloudCh {
+			if err := r.Store.Save(s); err != nil {
+				logResolverErr(streamCtx, "store.Save", err)
+			}
+			r.Hub.Publish(s)
+		}
+	}()
+
+	out := make(chan *Settings)
+	go func() {
+		defer close(out)
+		defer cancel()
+		defer unsub()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case s, ok := <-hubCh:
+				if !ok {
+					return
+				}
+				select {
+				case out <- toGraphSettings(s):
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out, nil
+}
+
+// cloudInput converts the gqlgen-generated input type into the cloud
+// client's mirror type. Same shape, but distinct packages so neither side
+// has to know about the other.
+func cloudInput(in UpdateSettingsInput) cloud.UpdateInput {
+	return cloud.UpdateInput{Placeholder: in.Placeholder}
+}
+
+// Mutation returns MutationResolver implementation.
+func (r *Resolver) Mutation() MutationResolver { return &mutationResolver{r} }
+
 // Query returns QueryResolver implementation.
 func (r *Resolver) Query() QueryResolver { return &queryResolver{r} }
 
 // Subscription returns SubscriptionResolver implementation.
 func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionResolver{r} }
 
+type mutationResolver struct{ *Resolver }
 type queryResolver struct{ *Resolver }
 type subscriptionResolver struct{ *Resolver }

@@ -22,7 +22,7 @@ import (
 // TestPingQuery is the canary: a fresh server should answer `{ ping }` with "pong".
 // If this passes, the gqlgen wiring (schema -> resolver -> handler) is intact.
 func TestPingQuery(t *testing.T) {
-	h := server.NewHandler()
+	h := server.NewHandler(server.Config{})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
@@ -51,7 +51,7 @@ func TestPingQuery(t *testing.T) {
 // `tick`, and asserts the first two values are 1 and 2. Validates that the
 // Websocket transport is wired and the Subscription resolver streams.
 func TestTickSubscription(t *testing.T) {
-	ts := httptest.NewServer(server.NewHandler())
+	ts := httptest.NewServer(server.NewHandler(server.Config{}))
 	defer ts.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/graphql"
@@ -108,7 +108,7 @@ func TestResolverErrorIsLogged(t *testing.T) {
 	var buf bytes.Buffer
 	slog.SetDefault(logging.Init(&buf, slog.LevelInfo))
 
-	ts := httptest.NewServer(server.NewHandler())
+	ts := httptest.NewServer(server.NewHandler(server.Config{}))
 	defer ts.Close()
 
 	body := strings.NewReader(`{"query":"{ noSuchField }"}`)
@@ -144,7 +144,7 @@ func TestResolverErrorIsLogged(t *testing.T) {
 // `ResetWithoutClosingHandshake` warning on every app exit.
 func TestGracefulShutdownClosesWebsocket(t *testing.T) {
 	ts := httptest.NewUnstartedServer(http.NotFoundHandler())
-	wrapped, wait := server.AttachGracefulShutdown(ts.Config, server.NewHandler())
+	wrapped, wait := server.AttachGracefulShutdown(ts.Config, server.NewHandler(server.Config{}))
 	ts.Config.Handler = wrapped
 	ts.Start()
 	defer ts.Close()

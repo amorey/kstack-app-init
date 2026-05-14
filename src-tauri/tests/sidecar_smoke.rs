@@ -81,7 +81,7 @@ async fn sidecar_answers_ping_over_uds() {
     let body = br#"{"query":"{ ping }"}"#;
     let resp = tokio::time::timeout(
         Duration::from_secs(2),
-        kstack_app_lib::sidecar::query_uds(socket.as_ref(), body),
+        kstack_app_lib::sidecar::query_uds(socket.as_ref(), body, None),
     )
     .await
     .expect("timeout")

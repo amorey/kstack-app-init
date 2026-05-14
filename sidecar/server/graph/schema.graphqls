@@ -1,9 +1,29 @@
+"User-scoped preferences synced through the kstack cloud. Today this is a single free-form `placeholder` string — extend as the product grows."
+type Settings {
+  placeholder: String!
+}
+
+input UpdateSettingsInput {
+  placeholder: String
+}
+
 type Query {
   "Health-check field. Always returns 'pong'."
   ping: String!
+
+  "Returns the current user's Settings. Read-through to the cloud, with a local JSON cache as offline fallback."
+  settings: Settings!
+}
+
+type Mutation {
+  "Write-through update: pushed to the cloud, then mirrored locally."
+  updateSettings(input: UpdateSettingsInput!): Settings!
 }
 
 type Subscription {
   "Emits an incrementing integer (starting at 1) every second. Cancelled when the client unsubscribes."
   tick: Int!
+
+  "Streams Settings updates as they arrive from the cloud (per-subscriber cloud SSE stream)."
+  settingsWatch: Settings!
 }

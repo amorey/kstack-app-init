@@ -12,6 +12,15 @@ use tokio::task::AbortHandle;
 use super::lifecycle::{wait_for_socket, SidecarState};
 use super::subscribe::{run_subscription, MsgSink};
 use super::transport;
+use crate::auth::AUTH;
+
+/// Fetch the current access token from the global `AUTH`, refreshing if
+/// expired. `None` here means "not logged in" — the sidecar then sees no
+/// Authorization header and any cloud-touching resolver will fail
+/// authentication, which is the correct behavior.
+async fn current_bearer() -> Option<String> {
+    AUTH.access_token().await.ok()
+}
 
 #[tauri::command]
 pub(crate) async fn graphql_query(
@@ -19,7 +28,8 @@ pub(crate) async fn graphql_query(
     body: String,
 ) -> Result<String, String> {
     let socket = wait_for_socket(state.socket_rx()).await?;
-    let bytes = transport::query_uds(&socket, body.as_bytes())
+    let bearer = current_bearer().await;
+    let bytes = transport::query_uds(&socket, body.as_bytes(), bearer.as_deref())
         .await
         .map_err(|e| e.to_string())?;
     String::from_utf8(bytes).map_err(|e| e.to_string())
@@ -54,10 +64,11 @@ pub(crate) async fn graphql_subscribe(
     let socket = wait_for_socket(state.socket_rx()).await?;
     let sink: Arc<dyn MsgSink> = Arc::new(ChannelSink(channel));
 
+    let bearer = current_bearer().await;
     let id = ops.next_id.fetch_add(1, Ordering::Relaxed);
     let registry = ops.inner.clone();
     let handle = tokio::spawn(async move {
-        let _ = run_subscription(socket, query, variables, sink).await;
+        let _ = run_subscription(socket, query, variables, bearer, sink).await;
         // Self-scrub on natural completion so the registry doesn't grow
         // unbounded across the app's lifetime.
         if let Ok(mut g) = registry.lock() {

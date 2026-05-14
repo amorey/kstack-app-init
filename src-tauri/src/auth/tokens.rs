@@ -64,8 +64,7 @@ mod backend {
     const USER: &str = "oauth-refresh";
 
     pub fn save(rt: Option<&str>) -> Result<(), String> {
-        let entry = keyring::Entry::new(SERVICE, USER)
-            .map_err(|e| format!("keyring open: {e}"))?;
+        let entry = keyring::Entry::new(SERVICE, USER).map_err(|e| format!("keyring open: {e}"))?;
         match rt {
             Some(s) => entry
                 .set_password(s)
@@ -79,8 +78,7 @@ mod backend {
     }
 
     pub fn load() -> Result<Option<String>, String> {
-        let entry = keyring::Entry::new(SERVICE, USER)
-            .map_err(|e| format!("keyring open: {e}"))?;
+        let entry = keyring::Entry::new(SERVICE, USER).map_err(|e| format!("keyring open: {e}"))?;
         match entry.get_password() {
             Ok(p) => Ok(Some(p)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -173,7 +171,10 @@ mod tests {
             .join("oauth-refresh.dev");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "dev token file must be user-only");
-        assert_eq!(load_refresh_token().unwrap().as_deref(), Some("rt-test-value"));
+        assert_eq!(
+            load_refresh_token().unwrap().as_deref(),
+            Some("rt-test-value")
+        );
         save_refresh_token(None).unwrap();
         assert!(load_refresh_token().unwrap().is_none());
     }

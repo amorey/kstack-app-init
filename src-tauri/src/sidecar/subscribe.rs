@@ -47,14 +47,18 @@ pub enum SubError {
 }
 
 /// Run one subscription end-to-end. The sink always observes a terminating
-/// `complete` or `error` frame before this function returns.
+/// `complete` or `error` frame before this function returns. `bearer`, when
+/// `Some`, is shipped in the `connection_init` payload so the sidecar's
+/// graphql-transport-ws InitFunc can pull it into the resolver context —
+/// the upgrade headers can't carry it reliably across all platforms.
 pub async fn run_subscription(
     socket: PathBuf,
     query: String,
     variables: serde_json::Value,
+    bearer: Option<String>,
     sink: Arc<dyn MsgSink>,
 ) -> Result<(), SubError> {
-    let result = run_inner(&socket, query, variables, sink.clone()).await;
+    let result = run_inner(&socket, query, variables, bearer, sink.clone()).await;
     if let Err(ref e) = result {
         sink.send(format!(
             r#"{{"type":"error","payload":{}}}"#,
@@ -85,6 +89,7 @@ async fn run_inner(
     socket: &Path,
     query: String,
     variables: serde_json::Value,
+    bearer: Option<String>,
     sink: Arc<dyn MsgSink>,
 ) -> Result<(), SubError> {
     let stream = connect_uds(socket).await.map_err(SubError::Connect)?;
@@ -107,9 +112,15 @@ async fn run_inner(
 
     let (ws, _resp) = client_async(request, stream).await?;
 
-    let mut sub = Client::build(ws)
-        .subscribe(RawOp { query, variables })
-        .await?;
+    let mut builder = Client::build(ws);
+    if let Some(token) = bearer {
+        // graphql-transport-ws ships an opaque `payload` map with
+        // `connection_init`; the sidecar's InitFunc pulls `Authorization`
+        // out of it. Keys are case-sensitive on the wire.
+        let payload = serde_json::json!({ "Authorization": format!("Bearer {token}") });
+        builder = builder.payload(payload)?;
+    }
+    let mut sub = builder.subscribe(RawOp { query, variables }).await?;
 
     while let Some(item) = sub.next().await {
         match item {
@@ -237,6 +248,7 @@ mod tests {
             socket,
             "subscription { tick }".into(),
             serde_json::json!({}),
+            None,
             sink,
         )
         .await
@@ -275,6 +287,7 @@ mod tests {
             socket,
             "subscription { tick }".into(),
             serde_json::json!({}),
+            None,
             sink,
         )
         .await
@@ -306,6 +319,7 @@ mod tests {
             socket,
             "subscription { tick }".into(),
             serde_json::json!({}),
+            None,
             sink,
         )
         .await;
@@ -353,12 +367,14 @@ mod tests {
                 socket,
                 "subscription { tick }".into(),
                 serde_json::json!({}),
+                None,
                 sink_a
             ),
             run_subscription(
                 socket2,
                 "subscription { tick }".into(),
                 serde_json::json!({}),
+                None,
                 sink_b
             ),
         );

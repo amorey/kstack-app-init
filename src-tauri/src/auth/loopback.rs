@@ -35,8 +35,8 @@ const NOT_FOUND_RESPONSE: &str =
 pub fn bind() -> Result<(TcpListener, String), String> {
     // Sync-bound via std so we can grab `local_addr()` before any await —
     // the redirect URI has to be in hand before we open the browser.
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("loopback bind: {e}"))?;
+    let std_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("loopback bind: {e}"))?;
     std_listener
         .set_nonblocking(true)
         .map_err(|e| format!("loopback nonblock: {e}"))?;
@@ -44,8 +44,8 @@ pub fn bind() -> Result<(TcpListener, String), String> {
         .local_addr()
         .map_err(|e| format!("loopback addr: {e}"))?
         .port();
-    let listener = TcpListener::from_std(std_listener)
-        .map_err(|e| format!("loopback from_std: {e}"))?;
+    let listener =
+        TcpListener::from_std(std_listener).map_err(|e| format!("loopback from_std: {e}"))?;
     let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
     Ok((listener, redirect_uri))
 }
@@ -108,7 +108,8 @@ async fn handle_connection(
         buf.extend_from_slice(&chunk[..n]);
     };
 
-    let line = std::str::from_utf8(&buf[..line_end]).map_err(|_| "loopback non-utf8".to_string())?;
+    let line =
+        std::str::from_utf8(&buf[..line_end]).map_err(|_| "loopback non-utf8".to_string())?;
     let path = line
         .split_whitespace()
         .nth(1)
@@ -116,8 +117,8 @@ async fn handle_connection(
 
     // Parse path even for non-callback requests so we can match cleanly.
     // `Url::parse` won't accept a bare path; prefix a dummy origin.
-    let url = Url::parse(&format!("http://127.0.0.1{path}"))
-        .map_err(|e| format!("loopback url: {e}"))?;
+    let url =
+        Url::parse(&format!("http://127.0.0.1{path}")).map_err(|e| format!("loopback url: {e}"))?;
 
     if url.path() != CALLBACK_PATH {
         let _ = stream.write_all(NOT_FOUND_RESPONSE.as_bytes()).await;

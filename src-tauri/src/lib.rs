@@ -18,6 +18,12 @@ pub mod windows;
 /// sidecar (mirrored in `sidecar/internal/logging.ParseLevel`).
 pub(crate) const KSTACK_LOG_ENV: &str = "KSTACK_LOG";
 
+/// Base URL of the kstack cloud (e.g. `https://api.kstack.sh`).
+/// Forwarded through to the sidecar (which is the only thing that talks
+/// to the cloud); the sidecar appends `/graphql` itself. Unset means
+/// "fall back to the compiled-in default" — see `sidecar/main.go`.
+pub(crate) const KSTACK_CLOUD_URL_ENV: &str = "KSTACK_CLOUD_URL";
+
 fn host_log_level() -> log::LevelFilter {
     match std::env::var(KSTACK_LOG_ENV)
         .unwrap_or_default()
@@ -105,9 +111,11 @@ pub fn run() {
             let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
 
             TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().cloned().ok_or(
-                    "missing default window icon — set bundle.icon in tauri.conf.json",
-                )?)
+                .icon(
+                    app.default_window_icon().cloned().ok_or(
+                        "missing default window icon — set bundle.icon in tauri.conf.json",
+                    )?,
+                )
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id().as_ref() {
