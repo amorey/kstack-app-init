@@ -70,6 +70,7 @@ runs:
       with:
         workspaces: "./src-tauri"
         shared-key: ${{ runner.os }}-${{ runner.arch }}
+        cache-bin: false
 
     - name: Set up PNPM
       if: inputs.setup-node == 'true'

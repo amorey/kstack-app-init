@@ -18,12 +18,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"runtime"
 	"syscall"
 	"time"
 
@@ -34,8 +31,7 @@ import (
 func main() {
 	slog.SetDefault(logging.Init(os.Stderr, logging.ParseLevel(os.Getenv("KSTACK_LOG"))))
 
-	defaultSock := filepath.Join(os.TempDir(), fmt.Sprintf("kstack-sidecar-%d.sock", os.Getpid()))
-	sockPath := flag.String("socket", defaultSock, "path to the Unix domain socket to listen on")
+	sockPath := flag.String("socket", defaultSocketPath(), "path to the IPC endpoint (Unix domain socket on Unix, named pipe on Windows) to listen on")
 	// Default points at production; override via env (or --cloud-url) for
 	// local dev. The cloud GraphQL client appends `/graphql` itself, so
 	// callers only ever name the host.
@@ -43,24 +39,15 @@ func main() {
 	prefsPath := flag.String("prefs-path", server.DefaultPrefsPath(), "path to the local preferences cache file")
 	flag.Parse()
 
-	// Stale socket from a crashed previous run would block bind; remove it.
-	_ = os.Remove(*sockPath)
-
-	ln, err := net.Listen("unix", *sockPath)
+	// Per-OS binding: AF_UNIX socket on Unix, named pipe on Windows.
+	// Both endpoints are restricted to the current user (chmod 0600 / DACL).
+	ln, err := listenSocket(*sockPath)
 	if err != nil {
 		slog.Error("listen", "socket", *sockPath, "err", err)
 		os.Exit(1)
 	}
-	// 0600: only the user that started us can connect. Windows ignores
-	// POSIX modes (Chmod only toggles the read-only bit there); skip the
-	// call to avoid a false sense of enforcement. NTFS DACL inherited from
-	// the temp directory is the access boundary on Windows.
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(*sockPath, 0o600); err != nil {
-			slog.Error("chmod", "socket", *sockPath, "err", err)
-			os.Exit(1)
-		}
-	}
+	// Named pipes vanish with their listener; only the UDS file needs explicit
+	// cleanup. Remove is a no-op for non-existent paths so unconditional is fine.
 	defer os.Remove(*sockPath)
 
 	slog.Info("sidecar starting",
