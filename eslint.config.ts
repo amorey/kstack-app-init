@@ -82,7 +82,7 @@ const customRulesConfig = [
 
 export default [
   includeIgnoreFile(gitignorePath),
-  { ignores: ['**/dist'] },
+  { ignores: ['**/dist', 'src/gql/**'] },
   ...jsConfig,
   ...reactConfig,
   ...typescriptConfig,
