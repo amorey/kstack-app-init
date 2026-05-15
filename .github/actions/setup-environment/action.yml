@@ -14,10 +14,6 @@ inputs:
     description: 'Node.js version to install'
     required: false
     default: '24'
-  pnpm-version:
-    description: 'PNPM version to install'
-    required: false
-    default: '11'
   setup-rust:
     description: 'Whether to set up Rust'
     required: false
@@ -48,6 +44,20 @@ runs:
       if: inputs.setup-protoc == 'true'
       uses: arduino/setup-protoc@v3
 
+    - name: Install Tauri Linux system dependencies
+      if: inputs.setup-rust == 'true' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libwebkit2gtk-4.1-dev \
+          libappindicator3-dev \
+          librsvg2-dev \
+          patchelf \
+          libgtk-3-dev \
+          libsoup-3.0-dev \
+          libjavascriptcoregtk-4.1-dev
+
     - name: Set up Rust
       if: inputs.setup-rust == 'true'
       uses: dtolnay/rust-toolchain@stable
@@ -63,8 +73,6 @@ runs:
     - name: Set up PNPM
       if: inputs.setup-node == 'true'
       uses: pnpm/action-setup@v6
-      with:
-        version: ${{ inputs.pnpm-version }}
 
     - name: Set up Node.js
       if: inputs.setup-node == 'true'
