@@ -162,12 +162,21 @@ mod tests {
     fn temp_socket() -> PathBuf {
         // Counter + pid keeps names unique across concurrent test binaries.
         // macOS limits UDS paths to ~104 bytes — keep the prefix short.
+        // Windows requires a named-pipe path (`\\.\pipe\...`); a temp-dir
+        // file path is rejected by `to_fs_name::<GenericFilePath>`.
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("ks-{}-{n}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        path
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(r"\\.\pipe\ks-{}-{n}", std::process::id()))
+        }
+        #[cfg(not(windows))]
+        {
+            let path = std::env::temp_dir().join(format!("ks-{}-{n}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            path
+        }
     }
 
     fn bind(socket: &Path) -> Listener {

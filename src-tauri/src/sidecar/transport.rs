@@ -181,12 +181,21 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_socket() -> PathBuf {
+        // Windows requires a named-pipe path (`\\.\pipe\...`); a temp-dir
+        // file path is rejected by `to_fs_name::<GenericFilePath>`.
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("ks-tx-{}-{n}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        p
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(r"\\.\pipe\ks-tx-{}-{n}", std::process::id()))
+        }
+        #[cfg(not(windows))]
+        {
+            let p = std::env::temp_dir().join(format!("ks-tx-{}-{n}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            p
+        }
     }
 
     fn bind(socket: &Path) -> Listener {

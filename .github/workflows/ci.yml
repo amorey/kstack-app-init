@@ -57,7 +57,7 @@ jobs:
   rust-vet:
     name: Rust · Vet
     strategy:
-      matrix:
+      matrix: &full-matrix
         os:
           - linux
           - macos-15
@@ -144,40 +144,7 @@ jobs:
       - go-lint
       - go-vet
     strategy:
-      matrix:
-        os:
-          - linux
-          - macos-15
-          - macos-26
-          - windows
-        arch:
-          - amd64
-          - arm64
-        include:
-          - os: linux
-            arch: amd64
-            runner: ubuntu-24.04
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          - os: macos-15
-            arch: amd64
-            runner: macos-15-intel
-          - os: macos-15
-            arch: arm64
-            runner: macos-15
-          - os: macos-26
-            arch: arm64
-            runner: macos-26
-          - os: windows
-            arch: amd64
-            runner: windows-2025
-          - os: windows
-            arch: arm64
-            runner: windows-11-arm
-        exclude:
-          - os: macos-26
-            arch: amd64
+      matrix: *full-matrix
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -198,40 +165,7 @@ jobs:
       - rust-lint
       - rust-vet
     strategy:
-      matrix:
-        os:
-          - linux
-          - macos-15
-          - macos-26
-          - windows
-        arch:
-          - amd64
-          - arm64
-        include:
-          - os: linux
-            arch: amd64
-            runner: ubuntu-24.04
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          - os: macos-15
-            arch: amd64
-            runner: macos-15-intel
-          - os: macos-15
-            arch: arm64
-            runner: macos-15
-          - os: macos-26
-            arch: arm64
-            runner: macos-26
-          - os: windows
-            arch: amd64
-            runner: windows-2025
-          - os: windows
-            arch: arm64
-            runner: windows-11-arm
-        exclude:
-          - os: macos-26
-            arch: amd64
+      matrix: *full-matrix
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -261,3 +195,60 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Test
         run: pnpm test run
+
+  ###########################
+  # Build jobs
+  ###########################
+
+  go-build:
+    name: Go · Build
+    needs:
+      - go-lint
+      - go-vet
+    strategy:
+      matrix: *full-matrix
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Build
+        working-directory: ./sidecar
+        run: go build
+
+  rust-build:
+    name: Rust · Build
+    needs:
+      - rust-lint
+      - rust-vet
+    strategy:
+      matrix: *full-matrix
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build sidecar
+        shell: bash
+        run: bash scripts/build-sidecar.sh
+      - name: Build
+        working-directory: ./src-tauri
+        run: cargo build
+
+  typescript-build:
+    name: TypeScript · Build
+    needs:
+      - typescript-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build
