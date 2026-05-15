@@ -49,6 +49,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 url = "2"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 once_cell = "1"
+# Used to decode the persisted ID token's payload on cold restart so we
+# can recover the user's identity claims before the refresh-token grant
+# returns. We trust this token (we wrote it), so the JOSE-level signature
+# check is skipped — only the payload is decoded.
+base64 = "0.22"
 # Used only by the debug-build refresh-token file fallback (dev sidesteps
 # the keychain ACL churn caused by binary signature changing each rebuild).
 dirs = "5"

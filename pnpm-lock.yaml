@@ -18,8 +18,8 @@ importers:
         specifier: ^3.2.0
         version: 3.2.0(graphql@16.14.0)
       '@kubetail/ui':
-        specifier: 3.0.0-rc4
-        version: 3.0.0-rc4(@base-ui/react@1.4.1(@types/react@19.2.14)(react-dom@19.2.6(react@19.2.6))(react@19.2.6))(lucide-react@1.14.0(react@19.2.6))(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(tailwindcss@4.2.4)
+        specifier: 3.0.0-rc5
+        version: 3.0.0-rc5(@base-ui/react@1.4.1(@types/react@19.2.14)(react-dom@19.2.6(react@19.2.6))(react@19.2.6))(lucide-react@1.14.0(react@19.2.6))(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(tailwindcss@4.2.4)
       '@radix-ui/react-avatar':
         specifier: ^1.1.11
         version: 1.1.11(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)
@@ -864,8 +864,8 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@kubetail/ui@3.0.0-rc4':
-    resolution: {integrity: sha512-qYAvtuNKHJijfooNBlGciIjpnravDE+8TagRspa93VlOsVmF0b0bv59/Nx5XYjWWx08WnA/do61Os0F018ePEQ==}
+  '@kubetail/ui@3.0.0-rc5':
+    resolution: {integrity: sha512-ZvfsgvKswHImrroiHdt42sM1ZksKn0gERb6YgIMRjBg3qYcSb2zDDUTJEB30WWKm9krZby4IPPQuHg+q9wYexg==}
     peerDependencies:
       '@base-ui/react': ^1
       lucide-react: '*'
@@ -4975,7 +4975,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@kubetail/ui@3.0.0-rc4(@base-ui/react@1.4.1(@types/react@19.2.14)(react-dom@19.2.6(react@19.2.6))(react@19.2.6))(lucide-react@1.14.0(react@19.2.6))(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(tailwindcss@4.2.4)':
+  '@kubetail/ui@3.0.0-rc5(@base-ui/react@1.4.1(@types/react@19.2.14)(react-dom@19.2.6(react@19.2.6))(react@19.2.6))(lucide-react@1.14.0(react@19.2.6))(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(tailwindcss@4.2.4)':
     dependencies:
       '@base-ui/react': 1.4.1(@types/react@19.2.14)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)
       class-variance-authority: 0.7.1

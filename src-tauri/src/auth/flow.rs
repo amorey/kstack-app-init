@@ -21,7 +21,9 @@
 //! deep links — e.g. opening the app to a particular cluster from a URL
 //! posted in chat — but the OAuth flow doesn't ride on it.
 
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
+use openidconnect::core::{
+    CoreAuthenticationFlow, CoreClient, CoreIdTokenClaims, CoreProviderMetadata,
+};
 use openidconnect::reqwest;
 use openidconnect::{
     AuthorizationCode, ClientId, CsrfToken, EndpointMaybeSet, EndpointNotSet, EndpointSet,
@@ -31,8 +33,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use super::loopback;
-use super::tokens::{load_refresh_token, now, save_refresh_token, Tokens};
+use super::tokens::{load_persisted, now, save_persisted, Persisted, Tokens};
 use super::{CLIENT_ID, ISSUER, SCOPES};
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 #[cfg(test)]
 mod logout_tests;
 
@@ -145,18 +150,34 @@ impl Auth {
     }
 
     /// On startup, try to silently restore a session from the stored RT.
-    /// Errors clear the keychain entry so we don't keep retrying a token
-    /// the IdP has already revoked.
+    /// Errors clear the persisted session so we don't keep retrying a
+    /// token the IdP has already revoked. We also seed identity claims
+    /// from the persisted ID token (unverified; see
+    /// [`decode_id_claims_unverified`]) so the menu can render before
+    /// `do_refresh` resolves.
     pub async fn try_restore(&self) -> Result<bool, String> {
-        let Some(rt) = load_refresh_token()? else {
+        let Some(persisted) = load_persisted()? else {
             return Ok(false);
         };
+        if let Some(idt) = persisted.id_token.as_deref() {
+            let (email, name, sub) = decode_id_claims_unverified(idt);
+            *self.tokens.write().await = Some(Tokens {
+                access_token: String::new(),
+                refresh_token: Some(persisted.refresh_token.clone()),
+                id_token: Some(idt.to_string()),
+                expires_at: 0,
+                email,
+                name,
+                sub,
+            });
+        }
         let _g = self.refresh_lock.lock().await;
-        match self.do_refresh(&rt).await {
+        match self.do_refresh(&persisted.refresh_token).await {
             Ok(_) => Ok(true),
             Err(e) => {
                 log::warn!("auth: refresh on startup failed: {e}");
-                let _ = save_refresh_token(None);
+                *self.tokens.write().await = None;
+                let _ = save_persisted(None);
                 Ok(false)
             }
         }
@@ -282,28 +303,27 @@ impl Auth {
 
         let expires_at = now() + response.expires_in().map(|d| d.as_secs()).unwrap_or(3600);
 
+        let (email, name, sub) = identity_from_claims(claims);
         let tokens = Tokens {
             access_token: response.access_token().secret().clone(),
             refresh_token: response.refresh_token().map(|r| r.secret().clone()),
             id_token: Some(id_token.to_string()),
             expires_at,
-            email: claims.email().map(|e| e.as_str().to_string()),
-            name: claims
-                .name()
-                .and_then(|n| n.get(None).map(|s| s.as_str().to_string())),
-            sub: Some(claims.subject().as_str().to_string()),
+            email,
+            name,
+            sub,
         };
-        if let Some(rt) = &tokens.refresh_token {
-            save_refresh_token(Some(rt))?;
-        }
+        persist_session(&tokens)?;
         *self.tokens.write().await = Some(tokens);
         Ok(())
     }
 
-    /// Refresh-token grant. Hydra rotates refresh tokens by default, so we
-    /// replace the stored value with whatever comes back. The `id_token`
-    /// is not reissued on refresh per OIDC core, so prior identity claims
-    /// are carried forward. Returns the new access token.
+    /// Refresh-token grant. Hydra rotates refresh tokens, so we replace
+    /// the stored value with whatever comes back. When the IdP reissues
+    /// an ID token, we verify it skipping the nonce check — refresh
+    /// responses don't echo the original nonce, and signature + iss/aud/
+    /// exp are what actually matter here. Otherwise we carry identity
+    /// claims forward from in-memory state.
     async fn do_refresh(&self, refresh_token: &str) -> Result<String, String> {
         let client = self.client().await?;
         let response = client
@@ -315,18 +335,20 @@ impl Auth {
 
         let expires_at = now() + response.expires_in().map(|d| d.as_secs()).unwrap_or(3600);
 
-        // Carry only the identity fields forward. Cloning the whole
-        // previous `Tokens` would copy secrets we're about to overwrite.
-        let (id_token, email, name, sub) = {
-            let prev = self.tokens.read().await;
-            match prev.as_ref() {
-                Some(p) => (
-                    p.id_token.clone(),
-                    p.email.clone(),
-                    p.name.clone(),
-                    p.sub.clone(),
-                ),
-                None => (None, None, None, None),
+        let (id_token, email, name, sub) = match response.extra_fields().id_token() {
+            Some(fresh) => {
+                let claims = fresh
+                    .claims(&client.id_token_verifier(), |_: Option<&Nonce>| Ok(()))
+                    .map_err(|e| format!("id_token verify on refresh: {e}"))?;
+                let (email, name, sub) = identity_from_claims(claims);
+                (Some(fresh.to_string()), email, name, sub)
+            }
+            None => {
+                let prev = self.tokens.read().await;
+                match prev.as_ref() {
+                    Some(p) => (p.id_token.clone(), p.email.clone(), p.name.clone(), p.sub.clone()),
+                    None => (None, None, None, None),
+                }
             }
         };
         let new = Tokens {
@@ -338,9 +360,7 @@ impl Auth {
             name,
             sub,
         };
-        if let Some(rt) = &new.refresh_token {
-            save_refresh_token(Some(rt))?;
-        }
+        persist_session(&new)?;
         let access_token = new.access_token.clone();
         *self.tokens.write().await = Some(new);
         Ok(access_token)
@@ -370,7 +390,7 @@ impl Auth {
                 None => (None, None),
             }
         };
-        save_refresh_token(None)?;
+        save_persisted(None)?;
 
         if access_token.is_none() && refresh_token.is_none() {
             return Ok(());
@@ -444,5 +464,57 @@ impl Auth {
             Ok(r) => log::warn!("auth: revoke {hint} returned {}", r.status()),
             Err(e) => log::warn!("auth: revoke {hint} failed: {e}"),
         }
+    }
+}
+
+fn persist_session(t: &Tokens) -> Result<(), String> {
+    match &t.refresh_token {
+        Some(rt) => save_persisted(Some(&Persisted {
+            refresh_token: rt.clone(),
+            id_token: t.id_token.clone(),
+        })),
+        // No RT means nothing usable to restore from — drop the slot
+        // entirely rather than leaving a stale ID token behind.
+        None => save_persisted(None),
+    }
+}
+
+fn identity_from_claims(
+    claims: &CoreIdTokenClaims,
+) -> (Option<String>, Option<String>, Option<String>) {
+    (
+        claims.email().map(|e| e.as_str().to_string()),
+        claims
+            .name()
+            .and_then(|n| n.get(None).map(|s| s.as_str().to_string())),
+        Some(claims.subject().as_str().to_string()),
+    )
+}
+
+/// Unverified decode of `email`/`name`/`sub` from a JWT. Used only to
+/// seed UI identity from our own persisted ID token at cold start; the
+/// upcoming refresh either replaces these with verified claims or carries
+/// them forward. Never trust the result for authorization decisions.
+fn decode_id_claims_unverified(
+    id_token: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let none = (None, None, None);
+    let mut parts = id_token.split('.');
+    let (_header, payload) = match (parts.next(), parts.next()) {
+        (Some(h), Some(p)) => (h, p),
+        _ => return none,
+    };
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload) else {
+        return none;
+    };
+    #[derive(serde::Deserialize)]
+    struct Claims {
+        email: Option<String>,
+        name: Option<String>,
+        sub: Option<String>,
+    }
+    match serde_json::from_slice::<Claims>(&bytes) {
+        Ok(c) => (c.email, c.name, c.sub),
+        Err(_) => none,
     }
 }

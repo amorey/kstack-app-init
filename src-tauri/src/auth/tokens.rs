@@ -15,7 +15,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// In-memory token set. Constructed from an `openidconnect` token response
 /// at the call site; everything that needs "is this expired?" goes through
@@ -48,14 +48,34 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn save_refresh_token(rt: Option<&str>) -> Result<(), String> {
-    backend::save(rt)
+/// Durable session state. Carries the refresh token (the only secret we
+/// strictly need to keep) alongside the most recent ID token, which lets
+/// the cold-start path recover identity claims (`email`, `name`, `sub`)
+/// before the refresh-token grant resolves — and gives the refresh path
+/// something to carry forward when the IdP doesn't reissue an ID token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Persisted {
+    pub refresh_token: String,
+    #[serde(default)]
+    pub id_token: Option<String>,
 }
 
-/// Returns `Ok(None)` when there is no stored token (first-launch case),
+pub fn save_persisted(p: Option<&Persisted>) -> Result<(), String> {
+    let blob = match p {
+        Some(p) => Some(serde_json::to_string(p).map_err(|e| format!("serialize: {e}"))?),
+        None => None,
+    };
+    backend::save(blob.as_deref())
+}
+
+/// Returns `Ok(None)` when there is no stored session (first-launch case),
 /// not an error.
-pub fn load_refresh_token() -> Result<Option<String>, String> {
-    backend::load()
+pub fn load_persisted() -> Result<Option<Persisted>, String> {
+    let Some(raw) = backend::load()? else {
+        return Ok(None);
+    };
+    let p = serde_json::from_str::<Persisted>(&raw).map_err(|e| format!("deserialize: {e}"))?;
+    Ok(Some(p))
 }
 
 #[cfg(not(debug_assertions))]
@@ -164,18 +184,21 @@ mod tests {
     /// path so this also flushes any stored value at the end.
     #[test]
     fn dev_file_is_user_only_and_roundtrips() {
-        save_refresh_token(Some("rt-test-value")).unwrap();
+        let p = Persisted {
+            refresh_token: "rt-test-value".into(),
+            id_token: Some("idt-test-value".into()),
+        };
+        save_persisted(Some(&p)).unwrap();
         let path = dirs::data_dir()
             .unwrap()
             .join("sh.kstack.app")
             .join("oauth-refresh.dev");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "dev token file must be user-only");
-        assert_eq!(
-            load_refresh_token().unwrap().as_deref(),
-            Some("rt-test-value")
-        );
-        save_refresh_token(None).unwrap();
-        assert!(load_refresh_token().unwrap().is_none());
+        let loaded = load_persisted().unwrap().expect("persisted present");
+        assert_eq!(loaded.refresh_token, "rt-test-value");
+        assert_eq!(loaded.id_token.as_deref(), Some("idt-test-value"));
+        save_persisted(None).unwrap();
+        assert!(load_persisted().unwrap().is_none());
     }
 }
