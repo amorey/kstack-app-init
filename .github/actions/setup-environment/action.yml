@@ -69,6 +69,7 @@ runs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "./src-tauri"
+        shared-key: ${{ runner.os }}-${{ runner.arch }}
 
     - name: Set up PNPM
       if: inputs.setup-node == 'true'

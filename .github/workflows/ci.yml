@@ -9,6 +9,10 @@ on:
       - "**"
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ##############################
   # Pre-flight jobs
@@ -38,24 +42,6 @@ jobs:
         working-directory: ./sidecar
         run: go vet ./...
 
-  go-vendor:
-    name: Go · Vendor
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-environment
-        with:
-          setup-go: "true"
-      - name: Create vendor bundle
-        working-directory: ./sidecar
-        run: go mod vendor
-      - name: Upload vendor bundle artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: go-vendor-bundle
-          path: sidecar/vendor
-          retention-days: 1
-
   rust-lint:
     name: Rust · Lint
     runs-on: ubuntu-24.04
@@ -70,15 +56,55 @@ jobs:
 
   rust-vet:
     name: Rust · Vet
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        os:
+          - linux
+          - macos-15
+          - macos-26
+          - windows
+        arch:
+          - amd64
+          - arm64
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: macos-15
+            arch: amd64
+            runner: macos-15-intel
+          - os: macos-15
+            arch: arm64
+            runner: macos-15
+          - os: macos-26
+            arch: arm64
+            runner: macos-26
+          - os: windows
+            arch: amd64
+            runner: windows-2025
+          - os: windows
+            arch: arm64
+            runner: windows-11-arm
+        exclude:
+          - os: macos-26
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-environment
         with:
-          setup-go: "true"
           setup-rust: "true"
-      - name: Build sidecar
-        run: make sidecar
+      - name: Stub sidecar binary
+        shell: bash
+        run: |
+          TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+          EXT=""
+          case "$TRIPLE" in *windows*) EXT=".exe" ;; esac
+          mkdir -p src-tauri/binaries
+          touch "src-tauri/binaries/kstack-sidecar-$TRIPLE$EXT"
       - name: Run clippy
         working-directory: ./src-tauri
         run: cargo clippy --all -- -D warnings
@@ -117,7 +143,6 @@ jobs:
     needs:
       - go-lint
       - go-vet
-      - go-vendor
     strategy:
       matrix:
         os:
@@ -159,18 +184,13 @@ jobs:
       - uses: ./.github/actions/setup-environment
         with:
           setup-go: "true"
-      - name: Download vendor bundle artifact
-        uses: actions/download-artifact@v5
-        with:
-          name: go-vendor-bundle
-          path: sidecar/vendor
       - name: Run tests
         working-directory: ./sidecar
-        run: go test -mod=vendor ./...
+        run: go test ./...
       - name: Run race tests
         if: ${{ !(matrix.os == 'windows' && matrix.arch == 'arm64') }}
         working-directory: ./sidecar
-        run: go test -race -mod=vendor ./...
+        run: go test -race ./...
 
   rust-test:
     name: Rust · Test
