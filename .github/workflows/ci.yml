@@ -1,0 +1,236 @@
+name: ci
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+jobs:
+  ##############################
+  # Pre-flight jobs
+  ##############################
+
+  go-lint:
+    name: Go · Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Run linter
+        working-directory: ./sidecar
+        run: test -z "$(gofmt -l .)"
+
+  go-vet:
+    name: Go · Vet
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Run vetter
+        working-directory: ./sidecar
+        run: go vet ./...
+
+  go-vendor:
+    name: Go · Vendor
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Create vendor bundle
+        working-directory: ./sidecar
+        run: go vendor
+      - name: Upload vendor bundle artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-vendor-bundle
+          path: sidecar/vendor
+          retention-days: 1
+
+  rust-lint:
+    name: Rust · Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+      - name: Run format check
+        working-directory: ./src-tauri
+        run: cargo fmt --all -- --check
+
+  rust-vet:
+    name: Rust · Vet
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+      - name: Run clippy
+        working-directory: ./src-tauri
+        run: cargo clippy --all -- -D warnings
+
+  shell-lint:
+    name: Shell · Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Run shellcheck
+        run: shellcheck scripts/*.sh
+
+  typescript-lint:
+    name: TypeScript · Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm lint
+
+  ###########################
+  # Test jobs
+  ###########################
+
+  go-test:
+    name: Go · Test
+    needs:
+      - go-lint
+      - go-vet
+      - go-vendor
+    strategy:
+      matrix:
+        os:
+          - linux
+          - macos-15
+          - macos-26
+          - windows
+        arch:
+          - amd64
+          - arm64
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: macos-15
+            arch: amd64
+            runner: macos-15-intel
+          - os: macos-15
+            arch: arm64
+            runner: macos-15
+          - os: macos-26
+            arch: arm64
+            runner: macos-26
+          - os: windows
+            arch: amd64
+            runner: windows-2025
+          - os: windows
+            arch: arm64
+            runner: windows-11-arm
+        exclude:
+          - os: macos-26
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Download vendor bundle artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: go-vendor-bundle
+          path: sidecar/vendor
+      - name: Run tests
+        working-directory: ./sidecar
+        run: go test -mod=vendor ./...
+      - name: Run race tests
+        if: ${{ !(matrix.os == 'windows' && matrix.arch == 'arm64') }}
+        working-directory: ./sidecar
+        run: go test -race -mod=vendor ./...
+
+  rust-test:
+    name: Rust · Test
+    needs:
+      - rust-lint
+      - rust-vet
+    strategy:
+      matrix:
+        os:
+          - linux
+          - macos-15
+          - macos-26
+          - windows
+        arch:
+          - amd64
+          - arm64
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: macos-15
+            arch: amd64
+            runner: macos-15-intel
+          - os: macos-15
+            arch: arm64
+            runner: macos-15
+          - os: macos-26
+            arch: arm64
+            runner: macos-26
+          - os: windows
+            arch: amd64
+            runner: windows-2025
+          - os: windows
+            arch: arm64
+            runner: windows-11-arm
+        exclude:
+          - os: macos-26
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run tests
+        working-directory: ./src-tauri
+        run: cargo test
+
+  typescript-test:
+    name: TypeScript · Test
+    needs:
+      - typescript-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test
+        run: pnpm test run

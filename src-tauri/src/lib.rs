@@ -127,7 +127,7 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(|window, event| windows::on_close_requested(window, event))
+        .on_window_event(windows::on_close_requested)
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {

@@ -177,7 +177,6 @@ mod tests {
         }
     }
 
-    use interprocess::local_socket::traits::tokio::Listener as _;
     use interprocess::local_socket::{tokio::Listener, GenericFilePath, ListenerOptions, ToFsName};
     use std::path::PathBuf;
 

@@ -97,7 +97,7 @@ async fn revokes_both_tokens_and_clears_local_state() {
         .and(path("/oauth2/revoke"))
         .and(body_string_contains("token=rt-secret"))
         .and(body_string_contains("token_type_hint=refresh_token"))
-        .and(body_string_contains(&format!("client_id={CLIENT_ID}")))
+        .and(body_string_contains(format!("client_id={CLIENT_ID}")))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&server)

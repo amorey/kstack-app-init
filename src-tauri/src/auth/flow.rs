@@ -101,6 +101,12 @@ pub struct Auth {
     issuer: String,
 }
 
+impl Default for Auth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Auth {
     pub fn new() -> Self {
         Self::with_issuer(ISSUER.to_string())
@@ -346,7 +352,12 @@ impl Auth {
             None => {
                 let prev = self.tokens.read().await;
                 match prev.as_ref() {
-                    Some(p) => (p.id_token.clone(), p.email.clone(), p.name.clone(), p.sub.clone()),
+                    Some(p) => (
+                        p.id_token.clone(),
+                        p.email.clone(),
+                        p.name.clone(),
+                        p.sub.clone(),
+                    ),
                     None => (None, None, None, None),
                 }
             }
@@ -495,9 +506,7 @@ fn identity_from_claims(
 /// seed UI identity from our own persisted ID token at cold start; the
 /// upcoming refresh either replaces these with verified claims or carries
 /// them forward. Never trust the result for authorization decisions.
-fn decode_id_claims_unverified(
-    id_token: &str,
-) -> (Option<String>, Option<String>, Option<String>) {
+fn decode_id_claims_unverified(id_token: &str) -> (Option<String>, Option<String>, Option<String>) {
     let none = (None, None, None);
     let mut parts = id_token.split('.');
     let (_header, payload) = match (parts.next(), parts.next()) {
