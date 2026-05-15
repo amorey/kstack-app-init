@@ -134,6 +134,7 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&PredefinedMenuItem::select_all(app, None)?)
         .build()?;
 
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut builder = MenuBuilder::new(app);
 
     #[cfg(target_os = "macos")]
