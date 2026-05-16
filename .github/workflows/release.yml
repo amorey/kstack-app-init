@@ -300,8 +300,8 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: assets
           parameters: |
-            arch: ${{ matrix.tauri_arch }}
-            version: ${{ needs.config.outputs.version }}
+            arch: ${{ toJSON(matrix.tauri_arch) }}
+            version: ${{ toJSON(needs.config.outputs.version) }}
 
       - name: Upload signed MSI
         uses: actions/upload-artifact@v5
