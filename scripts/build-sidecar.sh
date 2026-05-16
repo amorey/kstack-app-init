@@ -11,8 +11,9 @@ SIDECAR_DIR="$ROOT/sidecar"
 OUT_DIR="$ROOT/src-tauri/binaries"
 BASENAME="kstack-sidecar"
 
-# Tauri uses the *Rust* host triple, not the Go one. Derive it from rustc.
-TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+# Tauri uses the *Rust* host triple, not the Go one. Derive it from rustc,
+# or take it from KSTACK_HOST_TRIPLE so CI can skip installing Rust here.
+TRIPLE="${KSTACK_HOST_TRIPLE:-$(rustc -vV | sed -n 's/^host: //p')}"
 EXT=""
 case "$TRIPLE" in
   *windows*) EXT=".exe" ;;
