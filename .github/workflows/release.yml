@@ -160,6 +160,15 @@ jobs:
       - name: Build bundle
         run: pnpm tauri build -c '{"version":"${{ needs.config.outputs.version }}","build":{"beforeBuildCommand":"pnpm build"}}'
 
+      - name: Upload bundle
+        uses: actions/upload-artifact@v5
+        with:
+          name: assets-bundle-linux-${{ matrix.arch }}
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/appimage/*.AppImage
+
   build-bundle-macos:
     name: Build bundle · macOS
     needs: [config, build-sidecar]
@@ -285,9 +294,8 @@ jobs:
         id: upload-artifact
         uses: actions/upload-artifact@v5
         with:
-          name: assets-bundle-windows-${{ matrix.arch }}
+          name: assets-bundle-windows-${{ matrix.arch }}-unsigned
           path: src-tauri/target/${{ matrix.triple }}/release/bundle/msi/*.msi
-          overwrite: true
 
       - name: Sign MSI with SignPath
         uses: signpath/github-action-submit-signing-request@v1.3
