@@ -49,8 +49,31 @@ jobs:
             echo "dry_run=false" >> $GITHUB_OUTPUT
           fi
 
-  build:
-    name: Build packages
+  build-frontend:
+    name: Build frontend
+    needs: [config]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          path: dist/*
+          name: assets-frontend
+
+  build-sidecar:
+    name: Build sidecar
     needs: [config]
     strategy:
       fail-fast: false
@@ -63,6 +86,9 @@ jobs:
           - amd64
           - arm64
         include:
+          - os: darwin
+            arch: amd64
+            runner: macos-26-intel
           - os: darwin
             arch: arm64
             runner: macos-26
@@ -78,21 +104,46 @@ jobs:
           - os: windows
             arch: arm64
             runner: windows-11-arm
-        exclude:
-          - os: darwin
-            arch: amd64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
+
       - uses: ./.github/actions/setup-environment
         with:
           setup-go: "true"
-          setup-node: "true"
           setup-rust: "true"
+
+      - name: Build
+        shell: bash
+        run: ./scripts/build-sidecar.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          path: src-tauri/binaries/*
+          name: assets-sidecar-${{ matrix.os }}-${{ matrix.arch }}
+
+  build-bundle-linux:
+    name: Build bundle · Linux
+    needs: [config, build-frontend, build-sidecar]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Install Linux bundle dependencies
-        if: matrix.os == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -100,5 +151,93 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev librsvg2-bin \
             patchelf file desktop-file-utils xdg-utils \
             build-essential
+
+      - uses: actions/checkout@v6
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: assets-frontend
+          path: dist
+
+      - name: Download sidecar artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: assets-sidecar-linux-${{ matrix.arch }}
+          path: src-tauri/binaries
+
+      # Frontend and sidecar are prebuilt and downloaded above; override
+      # beforeBuildCommand so tauri doesn't rebuild them.
       - name: Build bundle
-        run: pnpm tauri build
+        run: pnpm tauri build -c '{"build":{"beforeBuildCommand":""}}'
+
+  build-bundle-macos:
+    name: Build bundle · macOS
+    needs: [config, build-frontend, build-sidecar]
+    runs-on: macos-26
+    steps:
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+
+      - name: Add x86_64 Rust target (darwin universal)
+        run: rustup target add x86_64-apple-darwin
+
+      - uses: actions/checkout@v6
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: assets-frontend
+          path: dist
+
+      - name: Download sidecar artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: assets-sidecar-darwin-*
+          path: src-tauri/binaries
+          merge-multiple: true
+
+      # Frontend and sidecar are prebuilt and downloaded above; override
+      # beforeBuildCommand so tauri doesn't rebuild them.
+      - name: Build bundle (darwin universal)
+        run: pnpm tauri build --target universal-apple-darwin -c '{"build":{"beforeBuildCommand":""}}'
+
+  build-bundle-windows:
+    name: Build bundle · Windows
+    needs: [config, build-frontend, build-sidecar]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+        include:
+          - arch: amd64
+            runner: windows-2025-vs2026
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+
+      - uses: actions/checkout@v6
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: assets-frontend
+          path: dist
+
+      - name: Download sidecar artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: assets-sidecar-windows-${{ matrix.arch }}
+          path: src-tauri/binaries
+
+      # Frontend and sidecar are prebuilt and downloaded above; override
+      # beforeBuildCommand so tauri doesn't rebuild them.
+      - name: Build bundle
+        run: pnpm tauri build -c '{"build":{"beforeBuildCommand":""}}'
