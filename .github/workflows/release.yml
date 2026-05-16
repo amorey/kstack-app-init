@@ -152,6 +152,12 @@ jobs:
           name: assets-sidecar-linux-${{ matrix.arch }}
           path: src-tauri/binaries
 
+      # upload/download-artifact round-trips through a zip and drops the
+      # Unix exec bit; without this Tauri embeds a non-executable sidecar
+      # and the host panics with EACCES spawning it (os error 13).
+      - name: Restore sidecar exec bit
+        run: chmod +x src-tauri/binaries/*
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
