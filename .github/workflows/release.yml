@@ -242,7 +242,6 @@ jobs:
           name: assets-bundle-macos
           path: |
             src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
 
   build-bundle-windows:
     name: Build bundle · Windows
