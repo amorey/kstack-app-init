@@ -1,0 +1,94 @@
+name: release
+
+permissions:
+  contents: write
+  deployments: write
+
+on:
+  push:
+    tags:
+      - "desktop/v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release"
+        required: true
+        type: string
+      signing_policy:
+        description: "SignPath slug"
+        required: true
+        type: choice
+        default: test-signing
+        options:
+          - test-signing
+          - release-signing
+      dry_run:
+        description: "Dry run"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  config:
+    name: Configure workflow
+    runs-on: ubuntu-slim
+    outputs:
+      version: ${{ steps.config.outputs.version }}
+      signing_policy: ${{ steps.config.outputs.signing_policy }}
+      dry_run: ${{ steps.config.outputs.dry_run }}
+    steps:
+      - id: config
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "signing_policy=${{ github.event.inputs.signing_policy }}" >> $GITHUB_OUTPUT
+            echo "dry_run=${{ github.event.inputs.dry_run }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/cli/v}" >> $GITHUB_OUTPUT
+            echo "signing_policy=release-signing" >> $GITHUB_OUTPUT
+            echo "dry_run=false" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Build packages
+    needs: [config]
+    strategy:
+      matrix:
+        os:
+          - darwin
+          - linux
+          - windows
+        arch:
+          - amd64
+          - arm64
+        include:
+          - os: darwin
+            arch: amd64
+            runner: macos-26-intel
+          - os: darwin
+            arch: arm64
+            runner: macos-26
+          - os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+          - os: windows
+            arch: amd64
+            runner: windows-2025-vs2026
+          - os: windows
+            arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+          setup-node: "true"
+          setup-rust: "true"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm tauri build
