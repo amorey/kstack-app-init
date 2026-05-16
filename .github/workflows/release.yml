@@ -249,9 +249,11 @@ jobs:
           - arch: amd64
             runner: windows-2025-vs2026
             tauri_arch: x64
+            triple: x86_64-pc-windows-msvc
           - arch: arm64
             runner: windows-11-arm
             tauri_arch: arm64
+            triple: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -272,16 +274,19 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.triple }}
+
       - name: Build bundle
         shell: bash
-        run: pnpm tauri build -c '{"version":"${{ needs.config.outputs.version }}","build":{"beforeBuildCommand":"pnpm build"},"bundle":{"targets":["msi"]}}'
+        run: pnpm tauri build --target ${{ matrix.triple }} -c '{"version":"${{ needs.config.outputs.version }}","build":{"beforeBuildCommand":"pnpm build"},"bundle":{"targets":["msi"]}}'
 
       - name: Upload unsigned MSI
         id: upload-artifact
         uses: actions/upload-artifact@v5
         with:
           name: assets-bundle-windows-${{ matrix.arch }}
-          path: src-tauri/target/*/release/bundle/msi/*.msi
+          path: src-tauri/target/${{ matrix.triple }}/release/bundle/msi/*.msi
 
       - name: Sign MSI with SignPath
         uses: signpath/github-action-submit-signing-request@v1.3
