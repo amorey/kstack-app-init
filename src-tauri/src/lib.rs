@@ -11,6 +11,7 @@ use tauri_plugin_log::{Target, TargetKind};
 
 pub mod auth;
 pub mod deep_link;
+pub mod gpu;
 pub mod sidecar;
 pub mod windows;
 
@@ -39,6 +40,12 @@ fn host_log_level() -> log::LevelFilter {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Must run before the builder creates the WebKitGTK window: on
+    // Linux, decide whether to force software rendering so a missing /
+    // broken EGL display degrades gracefully instead of aborting the
+    // process. No-op on macOS/Windows.
+    gpu::apply_webkit_compositing_fallback();
+
     let mut builder = tauri::Builder::default();
 
     // Single-instance must be registered first: when a second launch happens
