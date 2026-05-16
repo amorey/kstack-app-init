@@ -290,11 +290,16 @@ jobs:
         shell: bash
         run: pnpm tauri build --target ${{ matrix.triple }} -c '{"version":"${{ needs.config.outputs.version }}","build":{"beforeBuildCommand":"pnpm build"},"bundle":{"targets":["msi"]}}'
 
+      # SignPath pulls this by artifact-id to sign it. Its name is
+      # deliberately NOT prefixed "assets-bundle-" so the release job's
+      # `pattern: assets-bundle-*` excludes it: the unsigned MSI has the
+      # same internal filename as the signed one and would otherwise
+      # clobber it under `merge-multiple: true`.
       - name: Upload unsigned MSI
         id: upload-artifact
         uses: actions/upload-artifact@v5
         with:
-          name: assets-bundle-windows-${{ matrix.arch }}-unsigned
+          name: signpath-input-windows-${{ matrix.arch }}
           path: src-tauri/target/${{ matrix.triple }}/release/bundle/msi/*.msi
 
       - name: Sign MSI with SignPath
@@ -317,3 +322,56 @@ jobs:
         with:
           path: assets
           name: assets-bundle-windows-${{ matrix.arch }}
+
+  release:
+    name: Create GitHub release
+    needs:
+      - config
+      - build-bundle-linux
+      - build-bundle-macos
+      - build-bundle-windows
+    environment: production
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download bundles
+        uses: actions/download-artifact@v6
+        with:
+          pattern: assets-bundle-*
+          path: assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: ./assets
+        run: |
+          sha256sum * > SHA256SUMS
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@v6.3.0
+        with:
+          gpg_private_key: ${{ secrets.KUBETAIL_BOT_GPG_SIGNING_KEY }}
+          passphrase: ${{ secrets.KUBETAIL_BOT_GPG_PASSWORD }}
+          fingerprint: ${{ vars.KUBETAIL_BOT_GPG_SIGNING_KEY_FINGERPRINT }}
+
+      - name: Sign SHA256SUMS with GPG
+        working-directory: ./assets
+        run: |
+          gpg --armor --detach-sign SHA256SUMS
+
+      - name: Debug
+        if: ${{ needs.config.outputs.dry_run == 'true' }}
+        run: |
+          ls -lah assets/*
+          cat assets/SHA256SUMS
+          cat assets/SHA256SUMS.asc
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2.3.2
+        if: ${{ needs.config.outputs.dry_run == 'false' }}
+        with:
+          files: assets/*
+          draft: true
+          prerelease: ${{ contains(needs.config.outputs.version, '-') }}
+
+      - name: Cleanup GPG
+        if: always()
+        run: rm -rf ~/.gnupg
