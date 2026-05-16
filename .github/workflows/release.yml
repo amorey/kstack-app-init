@@ -160,14 +160,18 @@ jobs:
       - name: Build bundle
         run: pnpm tauri build -c '{"version":"${{ needs.config.outputs.version }}","build":{"beforeBuildCommand":"pnpm build"}}'
 
+      - name: Collect bundle
+        run: |
+          mkdir -p assets
+          cp src-tauri/target/release/bundle/deb/*.deb assets/
+          cp src-tauri/target/release/bundle/rpm/*.rpm assets/
+          cp src-tauri/target/release/bundle/appimage/*.AppImage assets/
+
       - name: Upload bundle
         uses: actions/upload-artifact@v5
         with:
           name: assets-bundle-linux-${{ matrix.arch }}
-          path: |
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
-            src-tauri/target/release/bundle/appimage/*.AppImage
+          path: assets/*
 
   build-bundle-macos:
     name: Build bundle · macOS
@@ -236,12 +240,16 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP/asc"
 
+      - name: Collect bundle
+        run: |
+          mkdir -p assets
+          cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg assets/
+
       - name: Upload signed bundle
         uses: actions/upload-artifact@v5
         with:
           name: assets-bundle-macos
-          path: |
-            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          path: assets/*
 
   build-bundle-windows:
     name: Build bundle · Windows
