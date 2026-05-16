@@ -40,14 +40,17 @@ jobs:
       - id: config
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-            echo "signing_policy=${{ github.event.inputs.signing_policy }}" >> $GITHUB_OUTPUT
-            echo "dry_run=${{ github.event.inputs.dry_run }}" >> $GITHUB_OUTPUT
+            version="${{ github.event.inputs.version }}"
+            signing_policy="${{ github.event.inputs.signing_policy }}"
+            dry_run="${{ github.event.inputs.dry_run }}"
           else
-            echo "version=${GITHUB_REF#refs/tags/cli/v}" >> $GITHUB_OUTPUT
-            echo "signing_policy=release-signing" >> $GITHUB_OUTPUT
-            echo "dry_run=false" >> $GITHUB_OUTPUT
+            version="${GITHUB_REF#refs/tags/desktop/v}"
+            signing_policy="release-signing"
+            dry_run="false"
           fi
+          echo "version=${version}" >> $GITHUB_OUTPUT
+          echo "signing_policy=${signing_policy}" >> $GITHUB_OUTPUT
+          echo "dry_run=${dry_run}" >> $GITHUB_OUTPUT
 
   build-sidecar:
     name: Build sidecar
@@ -90,6 +93,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/desktop/v${{ needs.config.outputs.version }}
 
       - uses: ./.github/actions/setup-environment
         with:
@@ -124,6 +129,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/desktop/v${{ needs.config.outputs.version }}
 
       - uses: ./.github/actions/setup-environment
         with:
@@ -151,7 +158,7 @@ jobs:
       # Sidecar is prebuilt and downloaded above; override
       # beforeBuildCommand to build the frontend but not the sidecar.
       - name: Build bundle
-        run: pnpm tauri build -c '{"build":{"beforeBuildCommand":"pnpm build"}}'
+        run: pnpm tauri build -c '{"version":"${{ needs.config.outputs.version }}","build":{"beforeBuildCommand":"pnpm build"}}'
 
   build-bundle-macos:
     name: Build bundle · macOS
@@ -160,6 +167,8 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/desktop/v${{ needs.config.outputs.version }}
 
       - uses: ./.github/actions/setup-environment
         with:
@@ -185,13 +194,12 @@ jobs:
           lipo -create -output kstack-sidecar-universal-apple-darwin \
             kstack-sidecar-x86_64-apple-darwin \
             kstack-sidecar-aarch64-apple-darwin
+          chmod +x kstack-sidecar-universal-apple-darwin
           lipo -info kstack-sidecar-universal-apple-darwin
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Write the App Store Connect API key (.p8) to disk so notarytool
-      # (invoked by Tauri) can read it via APPLE_API_KEY_PATH.
       - name: Stage App Store Connect API key
         run: |
           install -m 700 -d "$RUNNER_TEMP/asc"
@@ -213,7 +221,7 @@ jobs:
           APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/asc/AuthKey.p8
-        run: pnpm tauri build --target universal-apple-darwin -c '{"build":{"beforeBuildCommand":"pnpm build"}}'
+        run: pnpm tauri build --target universal-apple-darwin -c '{"version":"${{ needs.config.outputs.version }}","build":{"beforeBuildCommand":"pnpm build"}}'
 
       - name: Remove staged API key
         if: always()
@@ -230,6 +238,7 @@ jobs:
   build-bundle-windows:
     name: Build bundle · Windows
     needs: [config, build-sidecar]
+    environment: production
     strategy:
       fail-fast: false
       matrix:
@@ -239,11 +248,15 @@ jobs:
         include:
           - arch: amd64
             runner: windows-2025-vs2026
+            tauri_arch: x64
           - arch: arm64
             runner: windows-11-arm
+            tauri_arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/desktop/v${{ needs.config.outputs.version }}
 
       - uses: ./.github/actions/setup-environment
         with:
@@ -259,10 +272,34 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Sidecar is prebuilt and downloaded above; override
-      # beforeBuildCommand to build the frontend but not the sidecar.
-      # Force bash: the default Windows shell (PowerShell) strips the
-      # single quotes and corrupts the inline JSON config.
       - name: Build bundle
         shell: bash
-        run: pnpm tauri build -c '{"build":{"beforeBuildCommand":"pnpm build"}}'
+        run: pnpm tauri build -c '{"version":"${{ needs.config.outputs.version }}","build":{"beforeBuildCommand":"pnpm build"},"bundle":{"targets":["msi"]}}'
+
+      - name: Upload unsigned MSI
+        id: upload-artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: assets-bundle-windows-${{ matrix.arch }}
+          path: src-tauri/target/*/release/bundle/msi/*.msi
+
+      - name: Sign MSI with SignPath
+        uses: signpath/github-action-submit-signing-request@v1.3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: "kubetail"
+          signing-policy-slug: ${{ needs.config.outputs.signing_policy }}
+          github-artifact-id: ${{ steps.upload-artifact.outputs.artifact-id }}
+          artifact-configuration-slug: kstack-desktop
+          wait-for-completion: true
+          output-artifact-directory: assets
+          parameters: |
+            arch: ${{ matrix.tauri_arch }}
+            version: ${{ needs.config.outputs.version }}
+
+      - name: Upload signed MSI
+        uses: actions/upload-artifact@v5
+        with:
+          path: assets
+          name: assets-bundle-windows-${{ matrix.arch }}
