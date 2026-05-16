@@ -78,7 +78,7 @@ pub fn load_persisted() -> Result<Option<Persisted>, String> {
     Ok(Some(p))
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), not(windows)))]
 mod backend {
     const SERVICE: &str = "sh.kstack.app";
     const USER: &str = "oauth-refresh";
@@ -104,6 +104,123 @@ mod backend {
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(format!("keyring get: {e}")),
         }
+    }
+}
+
+#[cfg(all(not(debug_assertions), windows))]
+mod backend {
+    //! Windows Credential Manager caps one credential blob at
+    //! `CRED_MAX_CREDENTIAL_BLOB_SIZE` = 2560 bytes (the keyring crate
+    //! measures the UTF-16 encoding). Our persisted blob is a JSON object
+    //! carrying the refresh token *and* the most recent ID token — a JWT
+    //! that routinely pushes it past that ceiling. macOS Keychain has no
+    //! comparable small limit, so only Windows splits.
+    //!
+    //! Layout: a manifest entry at `oauth-refresh` holds the decimal chunk
+    //! count; data lives in `oauth-refresh.0..N`. The manifest is written
+    //! *last* on save and read *first* on load, so a torn write is
+    //! detectable (a chunk missing under a committed count) and resolves to
+    //! "no session" — a clean forced re-login, not a hard error.
+    //!
+    //! Backward compat: an older build could have left a single short blob
+    //! directly under `oauth-refresh`. If the manifest doesn't parse as an
+    //! integer we treat it as that legacy whole blob.
+
+    const SERVICE: &str = "sh.kstack.app";
+    const USER: &str = "oauth-refresh";
+
+    /// UTF-16 byte cap is 2560; 1000 BMP chars = 2000 bytes, leaving margin.
+    /// Tokens are ASCII base64url in practice, so this is conservative.
+    const CHUNK_CHARS: usize = 1000;
+
+    /// Upper bound on stale-chunk scans, so a corrupt manifest can't spin
+    /// us forever.
+    const MAX_CHUNKS: usize = 256;
+
+    fn entry(user: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(SERVICE, user).map_err(|e| format!("keyring open: {e}"))
+    }
+
+    fn chunk_user(i: usize) -> String {
+        format!("{USER}.{i}")
+    }
+
+    /// `Ok(true)` if a credential existed and was removed, `Ok(false)` if
+    /// it was already absent.
+    fn delete(user: &str) -> Result<bool, String> {
+        match entry(user)?.delete_credential() {
+            Ok(()) => Ok(true),
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(e) => Err(format!("keyring delete: {e}")),
+        }
+    }
+
+    /// Delete the dense chunk run starting at `start`, stopping at the
+    /// first gap. Chunks are always written contiguously, so a gap means
+    /// no higher chunk survives.
+    fn delete_chunks_from(start: usize) -> Result<(), String> {
+        for i in start..MAX_CHUNKS {
+            if !delete(&chunk_user(i))? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete every data chunk plus the manifest. Used by logout and to
+    /// scrub a partial write.
+    fn purge() -> Result<(), String> {
+        delete_chunks_from(0)?;
+        delete(USER)?;
+        Ok(())
+    }
+
+    pub fn save(rt: Option<&str>) -> Result<(), String> {
+        let Some(s) = rt else {
+            return purge();
+        };
+        let chars: Vec<char> = s.chars().collect();
+        let count = chars.len().div_ceil(CHUNK_CHARS).max(1);
+        // Write data first; the manifest is what commits the write.
+        for i in 0..count {
+            let start = i * CHUNK_CHARS;
+            let end = ((i + 1) * CHUNK_CHARS).min(chars.len());
+            let blob: String = chars[start..end].iter().collect();
+            entry(&chunk_user(i))?
+                .set_password(&blob)
+                .map_err(|e| format!("keyring set: {e}"))?;
+        }
+        entry(USER)?
+            .set_password(&count.to_string())
+            .map_err(|e| format!("keyring set: {e}"))?;
+        // Drop chunks left behind by a previously longer value.
+        delete_chunks_from(count)
+    }
+
+    pub fn load() -> Result<Option<String>, String> {
+        let manifest = match entry(USER)?.get_password() {
+            Ok(m) => m,
+            Err(keyring::Error::NoEntry) => return Ok(None),
+            Err(e) => return Err(format!("keyring get: {e}")),
+        };
+        let Ok(count) = manifest.parse::<usize>() else {
+            // Legacy single-entry blob from a pre-chunking build.
+            return Ok(Some(manifest));
+        };
+        let mut out = String::new();
+        for i in 0..count {
+            match entry(&chunk_user(i))?.get_password() {
+                Ok(part) => out.push_str(&part),
+                // Committed count but a chunk is gone: torn write. Scrub and
+                // report "no session" so the app forces a clean login.
+                Err(keyring::Error::NoEntry) => {
+                    let _ = purge();
+                    return Ok(None);
+                }
+                Err(e) => return Err(format!("keyring get: {e}")),
+            }
+        }
+        Ok(Some(out))
     }
 }
 
