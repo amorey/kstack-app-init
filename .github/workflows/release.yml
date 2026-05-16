@@ -287,6 +287,7 @@ jobs:
         with:
           name: assets-bundle-windows-${{ matrix.arch }}
           path: src-tauri/target/${{ matrix.triple }}/release/bundle/msi/*.msi
+          overwrite: true
 
       - name: Sign MSI with SignPath
         uses: signpath/github-action-submit-signing-request@v1.3
