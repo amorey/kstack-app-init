@@ -24,6 +24,8 @@ The `Makefile` is the polyglot entry point (Go/Rust/JS commands meet here); use 
 
 The Rust host embeds the Go sidecar via Tauri's `externalBin`. `scripts/build-sidecar.sh` compiles it to `src-tauri/binaries/kstack-sidecar-<rust-host-triple>` — note the filename uses the **Rust** host triple (from `rustc -vV`), not Go's. The Rust integration tests spawn the *real* sidecar binary, so anything that builds or tests Rust must build the sidecar first. `make test-rust` and `tauri.conf.json`'s before-commands already encode this dependency; preserve it if you add new build paths.
 
+For a **universal macOS build** (`tauri build --target universal-apple-darwin`), `externalBin` looks for a single fat binary named `kstack-sidecar-universal-apple-darwin`. Tauri does *not* lipo the per-arch sidecars together for you — the `build-bundle-macos` job in `.github/workflows/release.yml` downloads both per-arch sidecars and `lipo -create`s them into the universal-named binary before `tauri build`.
+
 ## Architecture: the request path
 
 The webview cannot dial the sidecar directly (it's on an AF_UNIX socket, not a TCP port). Every GraphQL operation flows through the host:

@@ -156,6 +156,7 @@ jobs:
   build-bundle-macos:
     name: Build bundle · macOS
     needs: [config, build-sidecar]
+    environment: production
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
@@ -175,13 +176,56 @@ jobs:
           path: src-tauri/binaries
           merge-multiple: true
 
+      # The two per-arch sidecars are built separately; Tauri's
+      # externalBin for a universal target wants a single fat binary
+      # named with the universal-apple-darwin triple. lipo them.
+      - name: Fuse universal sidecar binary
+        run: |
+          cd src-tauri/binaries
+          lipo -create -output kstack-sidecar-universal-apple-darwin \
+            kstack-sidecar-x86_64-apple-darwin \
+            kstack-sidecar-aarch64-apple-darwin
+          lipo -info kstack-sidecar-universal-apple-darwin
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Write the App Store Connect API key (.p8) to disk so notarytool
+      # (invoked by Tauri) can read it via APPLE_API_KEY_PATH.
+      - name: Stage App Store Connect API key
+        run: |
+          install -m 700 -d "$RUNNER_TEMP/asc"
+          printf '%s' "${{ secrets.APPLE_API_KEY_CONTENT }}" \
+            > "$RUNNER_TEMP/asc/AuthKey.p8"
+          chmod 600 "$RUNNER_TEMP/asc/AuthKey.p8"
+
       # Sidecar is prebuilt and downloaded above; override
       # beforeBuildCommand to build the frontend but not the sidecar.
-      - name: Build bundle (darwin universal)
+      #
+      # Tauri signs the .app inside-out (embedded sidecar + frameworks →
+      # app → .dmg), notarizes the .dmg with the ASC key, and staples it.
+      # The APPLE_* env vars below are what its bundler looks for.
+      - name: Build, sign & notarize bundle (darwin universal)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/asc/AuthKey.p8
         run: pnpm tauri build --target universal-apple-darwin -c '{"build":{"beforeBuildCommand":"pnpm build"}}'
+
+      - name: Remove staged API key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"
+
+      - name: Upload signed bundle
+        uses: actions/upload-artifact@v5
+        with:
+          name: assets-bundle-macos
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
 
   build-bundle-windows:
     name: Build bundle · Windows
@@ -217,5 +261,8 @@ jobs:
 
       # Sidecar is prebuilt and downloaded above; override
       # beforeBuildCommand to build the frontend but not the sidecar.
+      # Force bash: the default Windows shell (PowerShell) strips the
+      # single quotes and corrupts the inline JSON config.
       - name: Build bundle
+        shell: bash
         run: pnpm tauri build -c '{"build":{"beforeBuildCommand":"pnpm build"}}'
