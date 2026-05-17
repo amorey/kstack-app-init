@@ -1,7 +1,6 @@
 package server_test
 
 import (
-	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -9,23 +8,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
-
+	"github.com/kubetail-org/kstack-app/sidecar/internal/hub"
 	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
 	"github.com/kubetail-org/kstack-app/sidecar/server"
 	"github.com/kubetail-org/kstack-app/sidecar/server/graph"
 )
 
 // fakeStatus is a hand StatusSource: drives Status() / WatchStatus()
-// without standing up a real engine + fake upstream.
+// without standing up a real engine + fake upstream. The fan-out is the
+// real hub.Hub (same as the engine uses), so the test double can't drift
+// from production subscribe/unsub semantics.
 type fakeStatus struct {
-	mu   sync.Mutex
-	cur  syncpkg.Status
-	subs map[chan syncpkg.Status]struct{}
+	mu  sync.Mutex
+	cur syncpkg.Status
+	hub *hub.Hub[syncpkg.Status]
 }
 
 func newFakeStatus(s syncpkg.Status) *fakeStatus {
-	return &fakeStatus{cur: s, subs: make(map[chan syncpkg.Status]struct{})}
+	return &fakeStatus{cur: s, hub: hub.New[syncpkg.Status]()}
 }
 
 func (f *fakeStatus) Status() syncpkg.Status {
@@ -35,30 +35,14 @@ func (f *fakeStatus) Status() syncpkg.Status {
 }
 
 func (f *fakeStatus) WatchStatus() (<-chan syncpkg.Status, func()) {
-	ch := make(chan syncpkg.Status, 4)
-	f.mu.Lock()
-	f.subs[ch] = struct{}{}
-	f.mu.Unlock()
-	return ch, func() {
-		f.mu.Lock()
-		if _, ok := f.subs[ch]; ok {
-			delete(f.subs, ch)
-			close(ch)
-		}
-		f.mu.Unlock()
-	}
+	return f.hub.Subscribe()
 }
 
 func (f *fakeStatus) push(s syncpkg.Status) {
 	f.mu.Lock()
 	f.cur = s
-	for ch := range f.subs {
-		select {
-		case ch <- s:
-		default:
-		}
-	}
 	f.mu.Unlock()
+	f.hub.Publish(s)
 }
 
 func statusStack(t *testing.T, fs graph.StatusSource) string {
@@ -123,21 +107,7 @@ func TestSyncStatusWatchSnapshotThenTransitions(t *testing.T) {
 	fs := newFakeStatus(syncpkg.Status{State: syncpkg.StateConnecting})
 	url := statusStack(t, fs)
 
-	wsURL := "ws" + strings.TrimPrefix(url, "http") + "/graphql"
-	dialer := websocket.Dialer{
-		Subprotocols:     []string{"graphql-transport-ws"},
-		HandshakeTimeout: 5 * time.Second,
-	}
-	conn, _, err := dialer.DialContext(context.Background(), wsURL, nil)
-	if err != nil {
-		t.Fatalf("ws dial: %v", err)
-	}
-	defer conn.Close()
-
-	mustWrite(t, conn, `{"type":"connection_init"}`)
-	if got := mustReadType(t, conn); got != "connection_ack" {
-		t.Fatalf("want connection_ack, got %q", got)
-	}
+	conn := dialGraphQLWS(t, url, "")
 	mustWrite(t, conn, `{"id":"1","type":"subscribe","payload":{"query":"subscription { syncStatusWatch { state } }"}}`)
 
 	readState := func(want string) {

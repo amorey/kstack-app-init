@@ -56,22 +56,7 @@ func TestTickSubscription(t *testing.T) {
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/graphql"
-	dialer := websocket.Dialer{
-		Subprotocols:     []string{"graphql-transport-ws"},
-		HandshakeTimeout: 5 * time.Second,
-	}
-	conn, _, err := dialer.DialContext(context.Background(), wsURL, nil)
-	if err != nil {
-		t.Fatalf("ws dial: %v", err)
-	}
-	defer conn.Close()
-
-	mustWrite(t, conn, `{"type":"connection_init"}`)
-	if got := mustReadType(t, conn); got != "connection_ack" {
-		t.Fatalf("want connection_ack, got %q", got)
-	}
-
+	conn := dialGraphQLWS(t, ts.URL, "")
 	mustWrite(t, conn, `{"id":"1","type":"subscribe","payload":{"query":"subscription { tick }"}}`)
 
 	for want := 1; want <= 2; want++ {
@@ -153,21 +138,7 @@ func TestGracefulShutdownClosesWebsocket(t *testing.T) {
 	ts.Start()
 	defer ts.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/graphql"
-	dialer := websocket.Dialer{
-		Subprotocols:     []string{"graphql-transport-ws"},
-		HandshakeTimeout: 5 * time.Second,
-	}
-	conn, _, err := dialer.DialContext(context.Background(), wsURL, nil)
-	if err != nil {
-		t.Fatalf("ws dial: %v", err)
-	}
-	defer conn.Close()
-
-	mustWrite(t, conn, `{"type":"connection_init"}`)
-	if got := mustReadType(t, conn); got != "connection_ack" {
-		t.Fatalf("want connection_ack, got %q", got)
-	}
+	conn := dialGraphQLWS(t, ts.URL, "")
 	mustWrite(t, conn, `{"id":"1","type":"subscribe","payload":{"query":"subscription { tick }"}}`)
 
 	// Wait for one tick so we know the subscription is established.
@@ -216,6 +187,39 @@ func TestGracefulShutdownClosesWebsocket(t *testing.T) {
 	if err := <-shutdownErr; err != nil {
 		t.Errorf("shutdown returned: %v", err)
 	}
+}
+
+// dialGraphQLWS opens a graphql-transport-ws connection to srvURL's
+// /graphql endpoint, performs the connection_init/connection_ack
+// handshake, and returns the live conn (closed via t.Cleanup). A
+// non-empty token is sent both as an Authorization header and in the
+// connection_init payload (the two auth channels the host accepts).
+func dialGraphQLWS(t *testing.T, srvURL, token string) *websocket.Conn {
+	t.Helper()
+	wsURL := "ws" + strings.TrimPrefix(srvURL, "http") + "/graphql"
+	dialer := websocket.Dialer{
+		Subprotocols:     []string{"graphql-transport-ws"},
+		HandshakeTimeout: 5 * time.Second,
+	}
+	var hdr http.Header
+	if token != "" {
+		hdr = http.Header{"Authorization": []string{"Bearer " + token}}
+	}
+	conn, _, err := dialer.DialContext(context.Background(), wsURL, hdr)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	initMsg := `{"type":"connection_init"}`
+	if token != "" {
+		initMsg = `{"type":"connection_init","payload":{"Authorization":"Bearer ` + token + `"}}`
+	}
+	mustWrite(t, conn, initMsg)
+	if got := mustReadType(t, conn); got != "connection_ack" {
+		t.Fatalf("want connection_ack, got %q", got)
+	}
+	return conn
 }
 
 func mustWrite(t *testing.T, c *websocket.Conn, msg string) {

@@ -1,7 +1,6 @@
 package server_test
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/gorilla/websocket"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
@@ -145,23 +142,7 @@ func TestSettingsWatchSnapshotThenHubDeltas(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wsURL := "ws" + strings.TrimPrefix(url, "http") + "/graphql"
-	dialer := websocket.Dialer{
-		Subprotocols:     []string{"graphql-transport-ws"},
-		HandshakeTimeout: 5 * time.Second,
-	}
-	conn, _, err := dialer.DialContext(context.Background(), wsURL, http.Header{
-		"Authorization": []string{"Bearer tok"},
-	})
-	if err != nil {
-		t.Fatalf("ws dial: %v", err)
-	}
-	defer conn.Close()
-
-	mustWrite(t, conn, `{"type":"connection_init","payload":{"Authorization":"Bearer tok"}}`)
-	if got := mustReadType(t, conn); got != "connection_ack" {
-		t.Fatalf("want connection_ack, got %q", got)
-	}
+	conn := dialGraphQLWS(t, url, "tok")
 	mustWrite(t, conn, `{"id":"1","type":"subscribe","payload":{"query":"subscription { settingsWatch { placeholder } }"}}`)
 
 	readPlaceholder := func(want string) {
