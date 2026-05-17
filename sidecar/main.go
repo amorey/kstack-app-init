@@ -21,10 +21,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/logging"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
+	syncengine "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 	"github.com/kubetail-org/kstack-app/sidecar/server"
 )
 
@@ -62,9 +67,9 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	// The credential Holder is owned by NewHandler; the always-on engine
-	// will read it once wired. Discarded until then.
-	handler, _ := server.NewHandler(server.Config{
+	// NewHandler owns the credential Holder; the always-on engine reads
+	// the same instance the host pushes to via /control/credentials.
+	handler, creds := server.NewHandler(server.Config{
 		CloudURL:  *cloudURL,
 		PrefsPath: *prefsPath,
 	})
@@ -81,6 +86,25 @@ func main() {
 	go func() {
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		cancel()
+	}()
+
+	// Always-on reconcile engine. It authenticates via the host-pushed
+	// credential Holder (Offline until the first push), persists to a
+	// versioned syncstore next to the prefs cache, and fans events into
+	// its own Hub. Transitional: resolvers still use the per-request
+	// cloud path, so this is a second upstream connection until Cycle 5
+	// cuts reads over to the store/Hub.
+	syncStorePath := filepath.Join(filepath.Dir(*prefsPath), "sync", "settings.json")
+	engine := syncengine.New(
+		syncengine.NewCloudUpstream(cloud.New(*cloudURL), creds),
+		syncstore.NewStore[prefs.Settings](syncStorePath),
+		prefs.NewHub(),
+		syncengine.Options{},
+	)
+	engineDone := make(chan struct{})
+	go func() {
+		engine.Run(ctx)
+		close(engineDone)
 	}()
 
 	errCh := make(chan error, 1)
@@ -105,6 +129,15 @@ func main() {
 	// docs); explicit wait so WS handlers finish writing their close frames
 	// before we exit and the OS reaps the socket.
 	waitForHijacked()
+
+	// Engine.Run returns once ctx is cancelled; bounded so a wedged
+	// engine can't hang process exit (the OS would reap us anyway, but a
+	// clean join keeps shutdown logs coherent).
+	select {
+	case <-engineDone:
+	case <-time.After(2 * time.Second):
+		slog.Warn("sync engine did not stop within 2s")
+	}
 }
 
 // envOr returns the value of env var `key`, or `fallback` if unset/empty.
