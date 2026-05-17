@@ -146,10 +146,17 @@ type Engine struct {
 	lastEnv syncstore.Envelope[prefs.Settings]
 	seeded  bool
 
-	// activeCancel cancels the in-flight watch so the wake detector can
-	// force a reconnect without waiting for the upstream to end. Nil
-	// between watches.
+	// activeCancel cancels the in-flight watch so a poke can force a
+	// reconnect without waiting for the upstream to end. Nil between
+	// watches.
 	activeCancel context.CancelFunc
+
+	// pokeCh wakes an in-flight backoff so Run retries immediately.
+	// Buffered size 1: pokes between waits coalesce, and a poke delivered
+	// while Run isn't waiting pre-arms the *next* wait (it short-circuits
+	// one later backoff). Benign — a spurious early retry is idempotent
+	// and the upstream result is still the source of truth.
+	pokeCh chan struct{}
 
 	// statusSubs fans every status transition out to syncStatusWatch
 	// subscribers. Same shape as prefs.Hub (buffered, drop-on-full) so a
@@ -167,6 +174,28 @@ func New(up Upstream, store *syncstore.Store[prefs.Settings], hub *prefs.Hub, op
 		hub:        hub,
 		opt:        opt,
 		statusSubs: make(map[chan Status]struct{}),
+		pokeCh:     make(chan struct{}, 1),
+	}
+}
+
+// Poke triggers an immediate resync: it cancels the active watch (so a
+// healthy-but-stale connection is dropped and Run resnapshots) and wakes
+// any in-flight backoff so Run retries now instead of waiting out the
+// delay. Idempotent and safe to call from any goroutine — it never blocks
+// (a pending poke coalesces). It does not change state itself: the next
+// upstream call result is still the source of truth. Producers: the
+// wall-clock wakeLoop backstop and host OS power/network events via
+// /control/resync.
+func (e *Engine) Poke() {
+	select {
+	case e.pokeCh <- struct{}{}:
+	default: // a poke is already pending; coalesce
+	}
+	e.mu.Lock()
+	cancel := e.activeCancel
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -380,7 +409,29 @@ func (e *Engine) enterWaiting(ctx context.Context, attempt *int, st State, errMs
 		s.LastError = errMsg
 		s.RetryAt = e.opt.Now().Add(d)
 	})
-	return e.opt.Sleep(ctx, d) != nil
+
+	// Race the (injectable) backoff sleep against a poke. The sleeper
+	// runs under a child ctx cancelled on every return, so a poke (or
+	// ctx end) reclaims it immediately instead of leaving it parked for
+	// up to MaxBackoff — keeps at most one sleeper in flight even under a
+	// poke storm. Sleep's only contractful error is ctx (it's a pure
+	// timing seam); the real stop signal is the ctx.Err() re-check below,
+	// so its return is intentionally discarded.
+	sctx, scancel := context.WithCancel(ctx)
+	defer scancel()
+	slept := make(chan struct{})
+	go func() {
+		_ = e.opt.Sleep(sctx, d)
+		close(slept)
+	}()
+	select {
+	case <-ctx.Done():
+		return true
+	case <-e.pokeCh:
+		return false
+	case <-slept:
+		return ctx.Err() != nil
+	}
 }
 
 // setActiveCancel publishes (or clears, with nil) the in-flight watch's
@@ -391,10 +442,12 @@ func (e *Engine) setActiveCancel(c context.CancelFunc) {
 	e.mu.Unlock()
 }
 
-// wakeLoop is the resume detector. The ticker can't fire while the process
-// is frozen, so on the first tick after a sleep the wall clock has jumped
-// far past the heartbeat interval — that gap forces the active watch
-// closed, which makes Run take a fresh snapshot.
+// wakeLoop is the wall-clock resume backstop: a producer of Poke, not a
+// special path. The ticker can't fire while the process is frozen, so on
+// the first tick after a sleep the wall clock has jumped far past the
+// heartbeat interval — that gap pokes the engine into an immediate
+// resync. Always available even when no OS wake source is wired or one
+// is missed on a platform.
 func (e *Engine) wakeLoop(ctx context.Context) {
 	t := time.NewTicker(e.opt.Tick)
 	defer t.Stop()
@@ -408,12 +461,7 @@ func (e *Engine) wakeLoop(ctx context.Context) {
 		case <-t.C:
 			now := e.opt.Now()
 			if now.Sub(lastSeen) > threshold {
-				e.mu.Lock()
-				cancel := e.activeCancel
-				e.mu.Unlock()
-				if cancel != nil {
-					cancel()
-				}
+				e.Poke()
 			}
 			lastSeen = now
 		}

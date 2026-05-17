@@ -394,3 +394,36 @@ func TestOnConnectedFiresOnLive(t *testing.T) {
 		t.Fatal("OnConnected never fired on reaching Live")
 	}
 }
+
+// Poke interrupts an in-flight backoff so Run retries immediately,
+// instead of waiting out the (here, very long) delay.
+func TestPokeInterruptsBackoff(t *testing.T) {
+	up := &fakeUpstream{
+		snapshot: func(context.Context, int64) (prefs.Settings, error) {
+			return prefs.Settings{}, errors.New("down")
+		},
+	}
+	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{
+		BaseBackoff: 30 * time.Second, // ≫ test deadline; only a poke can shortcut it
+		MaxBackoff:  30 * time.Second,
+	})
+	go eng.Run(t.Context())
+
+	waitCount(t, &up.snapshots, 1) // first attempt failed → now in backoff
+	eng.Poke()
+	waitCount(t, &up.snapshots, 2) // retried well before 30s would elapse
+}
+
+// Poke cancels the active watch so a healthy-but-stale connection is
+// dropped and Run resnapshots (the OS-resume path; same effect the
+// wall-clock backstop produces).
+func TestPokeCancelsActiveWatch(t *testing.T) {
+	// Default fakeUpstream.Watch already blocks until ctx is cancelled.
+	up := &fakeUpstream{}
+	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{})
+	go eng.Run(t.Context())
+
+	waitCount(t, &up.snapshots, 1) // Live on the first watch
+	eng.Poke()
+	waitCount(t, &up.snapshots, 2) // watch cancelled → resnapshot
+}

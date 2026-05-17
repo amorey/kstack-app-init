@@ -269,16 +269,7 @@ func TestControlCredentials(t *testing.T) {
 		t.Fatal("expiresAt not parsed into holder")
 	}
 
-	// Wrong method: rejected, holder unchanged.
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
-	got, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	got.Body.Close()
-	if got.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("GET status = %d, want 405", got.StatusCode)
-	}
+	assertMethodNotAllowed(t, url) // wrong method rejected, holder unchanged
 
 	// Malformed JSON and empty token: rejected, prior token preserved.
 	for _, bad := range []string{`{not json`, `{"token":""}`} {
@@ -293,5 +284,56 @@ func TestControlCredentials(t *testing.T) {
 		if got := creds.Token(); got != "tok-abc" {
 			t.Fatalf("bad push %q clobbered token: now %q", bad, got)
 		}
+	}
+}
+
+// /control/resync invokes the configured poke on a valid POST; a wrong
+// method is rejected and does not.
+func TestControlResync(t *testing.T) {
+	poked := make(chan struct{}, 1)
+	h := server.NewHandler(server.Config{Poke: func() {
+		select {
+		case poked <- struct{}{}:
+		default:
+		}
+	}})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	url := ts.URL + "/control/resync"
+
+	resp, err := http.Post(url, "", nil)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	select {
+	case <-poked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("poke not invoked")
+	}
+
+	assertMethodNotAllowed(t, url)
+	select {
+	case <-poked:
+		t.Fatal("GET must not poke")
+	default:
+	}
+}
+
+// assertMethodNotAllowed checks the host-only control endpoints reject a
+// non-POST with 405 (shared by the /control/* tests).
+func assertMethodNotAllowed(t *testing.T, url string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET %s status = %d, want 405", url, resp.StatusCode)
 	}
 }

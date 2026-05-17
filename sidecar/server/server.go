@@ -58,6 +58,9 @@ type Config struct {
 	Creds    *authcreds.Holder
 	Sync     graph.StatusSource
 	Queue    *mutationqueue.Queue
+	// Poke triggers an immediate engine resync, invoked by the host-only
+	// /control/resync endpoint. nil ⇒ no-op.
+	Poke func()
 }
 
 // NewHandler returns an http.Handler serving GraphQL at /graphql plus the
@@ -96,11 +99,30 @@ func NewHandler(cfg Config) http.Handler {
 		Queue: queue,
 		Sync:  status,
 	}
+	poke := cfg.Poke
+	if poke == nil {
+		poke = func() {}
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/control/credentials", controlCredentials(creds))
+	mux.Handle("/control/resync", controlResync(poke))
 	// Everything else (GraphQL, WS) goes to the resolver handler.
 	mux.Handle("/", NewHandlerWithResolver(r))
 	return mux
+}
+
+// controlResync is the host-only OS-wake hook. Like /control/credentials
+// it's deliberately off the GraphQL surface — a host→sidecar control
+// signal, not data. See Engine.Poke for the trigger-only semantics.
+func controlResync(poke func()) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		poke()
+		w.WriteHeader(http.StatusNoContent)
+	})
 }
 
 // controlCredentials accepts the host's token push. Kept off the GraphQL

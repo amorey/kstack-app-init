@@ -107,6 +107,7 @@ func main() {
 		Creds:    creds,
 		Sync:     engine,
 		Queue:    queue,
+		Poke:     engine.Poke,
 	})
 	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, handler)
 	srv.Handler = http.MaxBytesHandler(wrapped, maxRequestBytes)
