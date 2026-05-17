@@ -47,6 +47,9 @@ importers:
       '@tauri-apps/plugin-opener':
         specifier: ^2
         version: 2.5.4
+      '@urql/exchange-retry':
+        specifier: ^2.0.0
+        version: 2.0.0(@urql/core@6.0.1(graphql@16.14.0))
       graphql:
         specifier: ^16.14.0
         version: 16.14.0
@@ -1849,6 +1852,11 @@ packages:
 
   '@urql/core@6.0.1':
     resolution: {integrity: sha512-FZDiQk6jxbj5hixf2rEPv0jI+IZz0EqqGW8mJBEug68/zHTtT+f34guZDmyjJZyiWbj0vL165LoMr/TkeDHaug==}
+
+  '@urql/exchange-retry@2.0.0':
+    resolution: {integrity: sha512-VdSMCiOptd6Ah6g5Bo+MzrNMAGzgRMC775W86strLRQN7lvvNlhx1LwU0gzb2h/z0atcJFAmDJEbMyvupkT+7A==}
+    peerDependencies:
+      '@urql/core': ^6.0.0
 
   '@vitejs/plugin-react@6.0.1':
     resolution: {integrity: sha512-l9X/E3cDb+xY3SWzlG1MOGt2usfEHGMNIaegaUGFsLkb3RCn/k8/TOXBcab+OndDI4TBtktT8/9BwwW8Vi9KUQ==}
@@ -5806,6 +5814,11 @@ snapshots:
       wonka: 6.3.6
     transitivePeerDependencies:
       - graphql
+
+  '@urql/exchange-retry@2.0.0(@urql/core@6.0.1(graphql@16.14.0))':
+    dependencies:
+      '@urql/core': 6.0.1(graphql@16.14.0)
+      wonka: 6.3.6
 
   '@vitejs/plugin-react@6.0.1(vite@8.0.11(@types/node@24.12.2)(jiti@2.6.1)(yaml@2.8.4))':
     dependencies:

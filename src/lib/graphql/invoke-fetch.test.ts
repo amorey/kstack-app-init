@@ -29,13 +29,19 @@ describe('invokeFetch', () => {
     await expect(res.json()).resolves.toEqual({ data: { ping: 'pong' } });
   });
 
-  it('translates an invoke rejection into a 500 response with errors[]', async () => {
+  it('rethrows an invoke rejection as an Error (a real network failure, not a 500 envelope)', async () => {
     invokeMock.mockRejectedValueOnce('boom');
 
-    const res = await invokeFetch('tauri://graphql', { method: 'POST', body: '{}' });
+    // A transport failure must surface as a thrown error so urql produces a
+    // CombinedError with a `networkError` — not a synthetic GraphQL 500,
+    // which is indistinguishable from a real server error and not retryable.
+    await expect(invokeFetch('tauri://graphql', { method: 'POST', body: '{}' })).rejects.toThrow('boom');
+  });
 
-    expect(res.ok).toBe(false);
-    expect(res.status).toBe(500);
-    await expect(res.json()).resolves.toEqual({ errors: [{ message: 'boom' }] });
+  it('preserves an Error rejection instance as-is', async () => {
+    const original = new Error('socket closed');
+    invokeMock.mockRejectedValueOnce(original);
+
+    await expect(invokeFetch('tauri://graphql', { method: 'POST', body: '{}' })).rejects.toBe(original);
   });
 });

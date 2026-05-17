@@ -26,6 +26,7 @@
     "@tanstack/react-router": "^1.168.18",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
+    "@urql/exchange-retry": "^2.0.0",
     "graphql": "^16.14.0",
     "graphql-ws": "^6.0.8",
     "lucide-react": "^1.8.0",
