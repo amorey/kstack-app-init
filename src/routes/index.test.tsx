@@ -1,4 +1,4 @@
-import { screen } from '@testing-library/react';
+import { act, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -77,7 +77,9 @@ describe('index route', () => {
     });
     // Tick subscribes first.
     const tick = channels[0];
-    tick.onmessage!(JSON.stringify({ type: 'next', payload: { data: { tick: 3 } } }));
+    await act(async () => {
+      tick.onmessage!(JSON.stringify({ type: 'next', payload: { data: { tick: 3 } } }));
+    });
     expect(await screen.findByText(/Tick: 3/)).toBeInTheDocument();
   });
 
@@ -118,12 +120,14 @@ describe('index route', () => {
     await renderWithRouter(routeTree, '/');
     await screen.findByDisplayValue('initial');
     const settings = await settingsChannel();
-    settings.onmessage!(
-      JSON.stringify({
-        type: 'next',
-        payload: { data: { settingsWatch: { placeholder: 'pushed' } } },
-      }),
-    );
+    await act(async () => {
+      settings.onmessage!(
+        JSON.stringify({
+          type: 'next',
+          payload: { data: { settingsWatch: { placeholder: 'pushed' } } },
+        }),
+      );
+    });
     expect(await screen.findByDisplayValue('pushed')).toBeInTheDocument();
   });
 });

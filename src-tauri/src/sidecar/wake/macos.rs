@@ -22,7 +22,7 @@ use objc2_foundation::NSNotification;
 // Via system-configuration's re-export so CFRunLoop is the same
 // core-foundation version its API expects (0.9, not the latest).
 use system_configuration::core_foundation::runloop::{
-    kCFRunLoopCommonModes, CFRunLoop, CFRunLoopRunResult,
+    kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopRunResult,
 };
 use system_configuration::network_reachability::SCNetworkReachability;
 
@@ -83,6 +83,8 @@ fn spawn_reachability(waker: Waker) {
             let run_loop = CFRunLoop::get_current();
             // SAFETY: kCFRunLoopCommonModes is a valid, non-null CF run
             // loop mode constant.
+            // Register the source in *all* common modes so it stays
+            // serviced regardless of which mode the run loop is in.
             let scheduled =
                 unsafe { reach.schedule_with_runloop(&run_loop, kCFRunLoopCommonModes) };
             if scheduled.is_err() {
@@ -93,9 +95,16 @@ fn spawn_reachability(waker: Waker) {
             // Service the callback for the process lifetime. `reach` is
             // held by this closure so the registration lives.
             loop {
+                // Run in a *concrete* mode. `kCFRunLoopCommonModes` is a
+                // pseudo-mode valid only for scheduling sources, not for
+                // CFRunLoopRunInMode — passing it is rejected outright and
+                // the loop exits immediately. The default mode is a member
+                // of the common-modes set, so the source scheduled above is
+                // still serviced here.
                 let result = CFRunLoop::run_in_mode(
-                    // SAFETY: same valid CF run loop mode constant.
-                    unsafe { kCFRunLoopCommonModes },
+                    // SAFETY: kCFRunLoopDefaultMode is a valid, non-null CF
+                    // run loop mode constant.
+                    unsafe { kCFRunLoopDefaultMode },
                     Duration::from_secs(24 * 60 * 60),
                     false,
                 );
