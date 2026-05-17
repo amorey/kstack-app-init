@@ -4,19 +4,16 @@
 // SyncEngine needs to resume after a sleep/outage: a version/cursor and
 // last-synced / last-event timestamps.
 //
-// Storage is a single JSON file per resource, written atomically
-// (tmp + rename in the same directory) so a crash mid-write can never leave
-// a partial document for the next Load to choke on. The generic Store[T]
-// keeps the engine resource-agnostic — Settings today, cluster state later.
+// The crash-safe file mechanics (tmp + rename) live in internal/atomicjson;
+// this package adds the generic Envelope shape — keeping the engine
+// resource-agnostic (Settings today, cluster state later) — and serializes
+// writers behind a mutex.
 package syncstore
 
 import (
-	"encoding/json"
-	"errors"
-	"io/fs"
-	"os"
-	"path/filepath"
 	"sync"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/atomicjson"
 )
 
 // Envelope is the on-disk shape: the reconciled payload plus the sync
@@ -52,19 +49,7 @@ func NewStore[T any](path string) *Store[T] {
 func (s *Store[T]) Load() (Envelope[T], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	data, err := os.ReadFile(s.path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return Envelope[T]{}, nil
-		}
-		return Envelope[T]{}, err
-	}
-	var out Envelope[T]
-	if err := json.Unmarshal(data, &out); err != nil {
-		return Envelope[T]{}, err
-	}
-	return out, nil
+	return atomicjson.Load[Envelope[T]](s.path)
 }
 
 // Save writes the Envelope to disk atomically. Concurrent Save calls
@@ -74,35 +59,5 @@ func (s *Store[T]) Load() (Envelope[T], error) {
 func (s *Store[T]) Save(e Envelope[T]) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
-	}
-
-	data, err := json.Marshal(e)
-	if err != nil {
-		return err
-	}
-
-	// Tmp file in the same directory so rename is atomic (same filesystem).
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".syncstore-*.json")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	// Best-effort cleanup if anything below fails before the rename.
-	defer func() { _ = os.Remove(tmpName) }()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, s.path)
+	return atomicjson.Save(s.path, e)
 }
