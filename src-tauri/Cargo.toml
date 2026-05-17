@@ -68,6 +68,20 @@ dirs = "5"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
+# macOS host wake sources: NSWorkspace didWake (power resume) via objc2 —
+# already in the tree transitively via Tauri 2 — and SCNetworkReachability
+# (network change) via `system-configuration`. objc2-foundation features
+# are spelled out (not relied on transitively via objc2-app-kit): the
+# addObserverForName… binding is gated on NSOperation + block2.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSOperation", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace"] }
+block2 = "0.6"
+# core_foundation is used via system-configuration's re-export so the
+# CFRunLoop type matches its API (the crate pins core-foundation 0.9).
+system-configuration = "0.6"
+
 [dev-dependencies]
 # In-process HTTP mock for testing OIDC discovery + RFC 7009 revocation
 # against a fake IdP. Pinned at 0.6 to match the `http` 1.x ecosystem

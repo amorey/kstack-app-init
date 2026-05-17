@@ -13,11 +13,11 @@
 //!
 //! `tokio::time::sleep` is monotonic and pauses during system suspend, so
 //! a long pre-suspend sleep would fire late on resume. The loop also
-//! `select!`s on the host wake signal (`wake.rs`) so that once a real OS
-//! power/network source is attached, resume re-derives the token at once.
-//! Until such a source exists `MAX_REARM` caps the sleep so the gap after
-//! resume is always bounded; the cap is removed when a platform source
-//! lands.
+//! `select!`s on the host wake signal (`wake.rs`): an OS power/network
+//! wake re-derives the token at once. `MAX_REARM` is kept as a permanent
+//! defense-in-depth backstop — it only matters when a wake is missed or
+//! the platform's source isn't wired (same role as the engine's
+//! wall-clock backstop), and costs nothing when wakes work.
 
 use std::future::Future;
 use std::time::Duration;
@@ -33,9 +33,10 @@ use super::wake::changed;
 /// ~75% elapsed), but never inside the last `MIN_MARGIN` — that headroom
 /// must cover the refresh round-trip plus at least one failed retry.
 const MIN_MARGIN: Duration = Duration::from_secs(60);
-/// Caps a single sleep so the monotonic-clock-pauses-during-suspend gap
-/// is bounded even with no OS wake source wired yet. Removed once a
-/// platform wake source lands (the `wake_rx` arm then covers resume).
+/// Permanent backstop: caps a single sleep so the
+/// monotonic-clock-pauses-during-suspend gap stays bounded if an OS wake
+/// is missed or that platform's source isn't wired. The `wake_rx` arm is
+/// the fast path; this only fires when it doesn't.
 const MAX_REARM: Duration = Duration::from_secs(600);
 /// Backoff after a failed push before retrying within the margin.
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
@@ -173,9 +174,8 @@ mod tests {
         assert_eq!(refresh_delay(0, 120), Duration::from_secs(60));
         // Past expiry → refresh immediately.
         assert_eq!(refresh_delay(500, 400), Duration::ZERO);
-        // Long-lived token → clamped to MAX_REARM (bounded suspend gap
-        // until an OS wake source is wired; not a poll — each wake
-        // re-derives).
+        // Long-lived token → clamped to MAX_REARM (the backstop; the
+        // wake arm is the fast path, this bounds a missed/unwired wake).
         assert_eq!(refresh_delay(0, 86_400), MAX_REARM);
         // Inside the floor margin already → no sleep.
         assert_eq!(refresh_delay(0, 30), Duration::ZERO);

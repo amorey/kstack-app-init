@@ -58,11 +58,21 @@ pub(crate) async fn changed(rx: &mut watch::Receiver<u64>) -> bool {
     rx.changed().await.is_ok()
 }
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 /// Spawn the per-OS wake listeners. They `waker.wake()` on power-resume /
-/// network-change. Takes the `Waker` by value (it's `Clone`) so a real
-/// implementation can move it into OS observers / its own task. Until a
-/// platform source is attached this is a no-op and the sidecar engine's
-/// wall-clock backstop covers suspend/resume.
+/// network-change. Takes the `Waker` by value (it's `Clone`) so an
+/// implementation can move it into OS observers / its own task. On
+/// platforms without a source yet this is a no-op and the engine
+/// wall-clock + credential-pusher `MAX_REARM` backstops cover
+/// suspend/resume.
+#[cfg(target_os = "macos")]
+fn run_os_wake_sources(waker: Waker) {
+    macos::spawn(waker);
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_os_wake_sources(_waker: Waker) {}
 
 /// Drive a `/control/resync` push on every wake until `shutdown`. Generic
