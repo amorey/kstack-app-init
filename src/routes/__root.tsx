@@ -7,6 +7,8 @@ import { ProfileMenu } from '@/lib/auth/profile-menu';
 import { ConnectionStatus } from '@/lib/connection-status';
 import { ErrorBoundary } from '@/lib/error-boundary';
 import { createGraphqlClient } from '@/lib/graphql/client';
+import { SyncHealthBadge } from '@/lib/sync/sync-health-badge';
+import { SyncStatusProvider } from '@/lib/sync/sync-status-context';
 
 const TanStackRouterDevtools =
   import.meta.env.VITE_ROUTER_DEVTOOLS === 'true'
@@ -40,14 +42,19 @@ function RootComponent() {
     <ErrorBoundary>
       <AuthProvider>
         <UrqlProvider value={gqlClient}>
-          <div className="fixed right-3 top-3 z-50">
-            <ProfileMenu />
-          </div>
-          <ConnectionStatus />
-          <Outlet />
-          <Suspense>
-            <TanStackRouterDevtools />
-          </Suspense>
+          {/* Consumes a urql subscription, so it must be a descendant of
+              the urql client. */}
+          <SyncStatusProvider>
+            <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
+              <SyncHealthBadge />
+              <ProfileMenu />
+            </div>
+            <ConnectionStatus />
+            <Outlet />
+            <Suspense>
+              <TanStackRouterDevtools />
+            </Suspense>
+          </SyncStatusProvider>
         </UrqlProvider>
       </AuthProvider>
     </ErrorBoundary>

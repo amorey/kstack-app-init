@@ -15,6 +15,7 @@ import type { TypedDocumentNode as DocumentNode } from '@graphql-typed-document-
  */
 type Documents = {
     "\n  subscription Tick {\n    tick\n  }\n": typeof types.TickDocument,
+    "\n  subscription SyncStatusWatch {\n    syncStatusWatch {\n      state\n      lastError\n      lastSyncedAt\n      retryAt\n    }\n  }\n": typeof types.SyncStatusWatchDocument,
     "\n  query Ping {\n    ping\n  }\n": typeof types.PingDocument,
     "\n  query Settings {\n    settings {\n      placeholder\n    }\n  }\n": typeof types.SettingsDocument,
     "\n  mutation UpdateSettings($input: UpdateSettingsInput!) {\n    updateSettings(input: $input) {\n      placeholder\n    }\n  }\n": typeof types.UpdateSettingsDocument,
@@ -22,6 +23,7 @@ type Documents = {
 };
 const documents: Documents = {
     "\n  subscription Tick {\n    tick\n  }\n": types.TickDocument,
+    "\n  subscription SyncStatusWatch {\n    syncStatusWatch {\n      state\n      lastError\n      lastSyncedAt\n      retryAt\n    }\n  }\n": types.SyncStatusWatchDocument,
     "\n  query Ping {\n    ping\n  }\n": types.PingDocument,
     "\n  query Settings {\n    settings {\n      placeholder\n    }\n  }\n": types.SettingsDocument,
     "\n  mutation UpdateSettings($input: UpdateSettingsInput!) {\n    updateSettings(input: $input) {\n      placeholder\n    }\n  }\n": types.UpdateSettingsDocument,
@@ -46,6 +48,10 @@ export function graphql(source: string): unknown;
  * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
  */
 export function graphql(source: "\n  subscription Tick {\n    tick\n  }\n"): (typeof documents)["\n  subscription Tick {\n    tick\n  }\n"];
+/**
+ * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
+ */
+export function graphql(source: "\n  subscription SyncStatusWatch {\n    syncStatusWatch {\n      state\n      lastError\n      lastSyncedAt\n      retryAt\n    }\n  }\n"): (typeof documents)["\n  subscription SyncStatusWatch {\n    syncStatusWatch {\n      state\n      lastError\n      lastSyncedAt\n      retryAt\n    }\n  }\n"];
 /**
  * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
  */
