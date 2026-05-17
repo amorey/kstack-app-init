@@ -82,6 +82,13 @@ block2 = "0.6"
 # CFRunLoop type matches its API (the crate pins core-foundation 0.9).
 system-configuration = "0.6"
 
+# Linux host wake sources: logind PrepareForSleep (power resume) +
+# NetworkManager StateChanged (network change), both system-bus D-Bus
+# signals. zbus is already in the tree transitively; the `tokio` feature
+# makes it usable from the app's tokio runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", features = ["tokio"] }
+
 [dev-dependencies]
 # In-process HTTP mock for testing OIDC discovery + RFC 7009 revocation
 # against a fake IdP. Pinned at 0.6 to match the `http` 1.x ecosystem

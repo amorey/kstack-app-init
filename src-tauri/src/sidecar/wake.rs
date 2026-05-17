@@ -58,6 +58,8 @@ pub(crate) async fn changed(rx: &mut watch::Receiver<u64>) -> bool {
     rx.changed().await.is_ok()
 }
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -72,7 +74,14 @@ fn run_os_wake_sources(waker: Waker) {
     macos::spawn(waker);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn run_os_wake_sources(waker: Waker) {
+    // logind/NetworkManager listening is async (zbus); run it on the
+    // app's tokio runtime.
+    tauri::async_runtime::spawn(linux::run(waker));
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn run_os_wake_sources(_waker: Waker) {}
 
 /// Drive a `/control/resync` push on every wake until `shutdown`. Generic
