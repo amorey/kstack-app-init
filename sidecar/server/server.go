@@ -19,6 +19,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
 	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
@@ -56,6 +57,7 @@ type Config struct {
 	Hub      *prefs.Hub
 	Creds    *authcreds.Holder
 	Sync     graph.StatusSource
+	Queue    *mutationqueue.Queue
 }
 
 // NewHandler returns an http.Handler serving GraphQL at /graphql plus the
@@ -65,8 +67,7 @@ func NewHandler(cfg Config) http.Handler {
 	if store == nil {
 		// Tests that pass Config{} never exercise the settings surface;
 		// a never-read store keeps the Resolver non-nil.
-		store = syncstore.NewStore[prefs.Settings](
-			filepath.Join(filepath.Dir(DefaultPrefsPath()), "sync", "settings.json"))
+		store = syncstore.NewStore[prefs.Settings](SyncPath(DefaultPrefsPath(), "settings.json"))
 	}
 	hub := cfg.Hub
 	if hub == nil {
@@ -82,10 +83,17 @@ func NewHandler(cfg Config) http.Handler {
 		// not panic on syncStatus — report Offline, stream nothing.
 		status = noopStatus{}
 	}
+	queue := cfg.Queue
+	if queue == nil {
+		// Never written unless a cloud write fails in a test that didn't
+		// wire one; keeps the Resolver non-nil (parallels Store).
+		queue = mutationqueue.New(SyncPath(DefaultPrefsPath(), "mutations.json"))
+	}
 	r := &graph.Resolver{
 		Cloud: cloud.New(cfg.CloudURL),
 		Store: store,
 		Hub:   hub,
+		Queue: queue,
 		Sync:  status,
 	}
 	mux := http.NewServeMux()

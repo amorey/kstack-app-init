@@ -21,13 +21,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/logging"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
 	syncengine "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
@@ -75,15 +75,30 @@ func main() {
 	//     the Hub it publishes to, and exposes its Status();
 	//   - /control/credentials writes the Holder the engine authenticates
 	//     with.
-	syncStore := syncstore.NewStore[prefs.Settings](
-		filepath.Join(filepath.Dir(*prefsPath), "sync", "settings.json"))
+	syncStore := syncstore.NewStore[prefs.Settings](server.SyncPath(*prefsPath, "settings.json"))
 	hub := prefs.NewHub()
 	creds := authcreds.NewHolder()
+	cloudClient := cloud.New(*cloudURL)
+	queue := mutationqueue.New(server.SyncPath(*prefsPath, "mutations.json"))
 	engine := syncengine.New(
-		syncengine.NewCloudUpstream(cloud.New(*cloudURL), creds),
+		syncengine.NewCloudUpstream(cloudClient, creds),
 		syncStore,
 		hub,
-		syncengine.Options{},
+		syncengine.Options{
+			// Drain offline-queued mutations whenever the upstream is
+			// healthy. A failed drain stays queued and retries on the
+			// next Live via the engine's own reconnect/backoff.
+			OnConnected: func(ctx context.Context) {
+				if err := queue.Drain(ctx, func(ctx context.Context, in cloud.UpdateInput) error {
+					_, err := cloudClient.UpdateSettings(ctx, creds.Token(), in)
+					return err
+				}); err != nil {
+					// Transient push failures retry on the next Live; a
+					// persistent disk error would otherwise loop unseen.
+					slog.Debug("mutation queue drain failed", "err", err)
+				}
+			},
+		},
 	)
 	handler := server.NewHandler(server.Config{
 		CloudURL: *cloudURL,
@@ -91,6 +106,7 @@ func main() {
 		Hub:      hub,
 		Creds:    creds,
 		Sync:     engine,
+		Queue:    queue,
 	})
 	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, handler)
 	srv.Handler = http.MaxBytesHandler(wrapped, maxRequestBytes)

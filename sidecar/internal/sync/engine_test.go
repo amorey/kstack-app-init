@@ -365,3 +365,32 @@ func TestWatchStatusStreamsTransitions(t *testing.T) {
 		}
 	}
 }
+
+// OnConnected fires when the engine reaches Live (the offline-queue
+// drainer hooks here). It runs concurrently with streaming and is
+// cancelled when the connection drops.
+func TestOnConnectedFiresOnLive(t *testing.T) {
+	up := &fakeUpstream{
+		watch: func(ctx context.Context, _ int64) (<-chan prefs.Settings, error) {
+			ch := make(chan prefs.Settings)
+			go func() { <-ctx.Done(); close(ch) }()
+			return ch, nil
+		},
+	}
+	connected := make(chan struct{}, 1)
+	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{
+		OnConnected: func(context.Context) {
+			select {
+			case connected <- struct{}{}:
+			default:
+			}
+		},
+	})
+	go eng.Run(t.Context())
+
+	select {
+	case <-connected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnConnected never fired on reaching Live")
+	}
+}

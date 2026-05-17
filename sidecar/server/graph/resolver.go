@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
 	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
@@ -30,6 +31,7 @@ type Resolver struct {
 	Store *syncstore.Store[prefs.Settings]
 	Hub   *prefs.Hub
 	Sync  StatusSource
+	Queue *mutationqueue.Queue
 }
 
 // StatusSource is the slice of the always-on engine the syncStatus

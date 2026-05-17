@@ -7,6 +7,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -19,8 +20,15 @@ import (
 // `settings` query may briefly lag, but the UI consumes `settingsWatch`,
 // which the Hub publish satisfies at once.
 func (r *mutationResolver) UpdateSettings(ctx context.Context, input UpdateSettingsInput) (*Settings, error) {
-	out, err := r.Cloud.UpdateSettings(ctx, bearer(ctx), cloudInput(input))
+	ci := cloudInput(input)
+	out, err := r.Cloud.UpdateSettings(ctx, bearer(ctx), ci)
 	if err != nil {
+		// Offline/transient: persist (coalesced) so the engine replays
+		// it on its next Live. Still surface the error — the client
+		// must know it hasn't reached the cloud yet.
+		if qErr := r.Queue.Enqueue(ci); qErr != nil {
+			return nil, fmt.Errorf("%w (also failed to queue: %v)", err, qErr)
+		}
 		return nil, err
 	}
 	r.Hub.Publish(out)

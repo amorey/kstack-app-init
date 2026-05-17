@@ -77,6 +77,14 @@ type Options struct {
 	Now    func() time.Time
 	Sleep  func(context.Context, time.Duration) error
 	Jitter func(time.Duration) time.Duration
+
+	// OnConnected, if set, is invoked each time the engine reaches Live,
+	// in a goroutine bound to that connection's context (cancelled on
+	// disconnect/wake). A failure isn't retried here — the next Live
+	// re-invokes it via the engine's own reconnect/backoff. Kept
+	// resource-agnostic: the engine signals liveness, the caller decides
+	// what to do (the offline mutation-queue drainer hooks here).
+	OnConnected func(context.Context)
 }
 
 func (o *Options) applyDefaults() {
@@ -255,6 +263,11 @@ func (e *Engine) Run(ctx context.Context) {
 			s.State = StateLive
 			s.LastError = ""
 		})
+		if e.opt.OnConnected != nil {
+			// Concurrent with streaming, cancelled if the connection
+			// drops mid-drain; the next Live retries.
+			go e.opt.OnConnected(watchCtx)
+		}
 
 		progressed := false
 		for ev := range ch {
