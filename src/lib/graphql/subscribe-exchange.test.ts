@@ -2,21 +2,12 @@ import { pipe, subscribe } from 'wonka';
 import { Client, gql } from 'urql';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { mockTauriCore } from '@/test-utils';
+
 // Mocks ---------------------------------------------------------------
 
-// Capture every Channel constructed so the test can drive the active
-// connection's onmessage (a reconnect builds a fresh Channel).
-type FakeChannel = { onmessage?: (raw: string) => void };
-const channels: FakeChannel[] = [];
-const liveChannel = () => channels.at(-1)!;
-
-const invokeMock = vi.fn();
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: (...args: unknown[]) => invokeMock(...args),
-  Channel: function FakeChannelCtor(this: FakeChannel) {
-    channels.push(this);
-  },
-}));
+const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
+vi.mock('@tauri-apps/api/core', () => factory());
 
 const reportErrorMock = vi.fn();
 vi.mock('../error-bus', () => ({

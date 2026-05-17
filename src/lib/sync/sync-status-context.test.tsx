@@ -2,19 +2,12 @@ import { render, screen, act } from '@testing-library/react';
 import { Provider as UrqlProvider } from 'urql';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { mockTauriCore } from '@/test-utils';
+
 // Mocks ---------------------------------------------------------------
 
-type FakeChannel = { onmessage?: (raw: string) => void };
-const channels: FakeChannel[] = [];
-const liveChannel = () => channels.at(-1)!;
-
-const invokeMock = vi.fn();
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: (...args: unknown[]) => invokeMock(...args),
-  Channel: function FakeChannelCtor(this: FakeChannel) {
-    channels.push(this);
-  },
-}));
+const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
+vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
 const { SyncStatusProvider, useSyncStatus, formatSyncFreshness } = await import('./sync-status-context');
