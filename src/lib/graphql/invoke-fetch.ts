@@ -5,6 +5,8 @@
 // JSON response body.
 import { invoke } from '@tauri-apps/api/core';
 
+import { toError } from '../error-bus';
+
 const JSON_HEADERS = { 'content-type': 'application/json' } as const;
 
 export const invokeFetch: typeof fetch = async (_input, init) => {
@@ -20,6 +22,6 @@ export const invokeFetch: typeof fetch = async (_input, init) => {
     // CombinedError with a real `networkError`: the UI can tell "sidecar
     // down" from a server error, and retryExchange (network-errors-only)
     // can retry it. A fabricated 500 envelope would defeat both.
-    throw err instanceof Error ? err : new Error(String(err));
+    throw toError(err);
   }
 };

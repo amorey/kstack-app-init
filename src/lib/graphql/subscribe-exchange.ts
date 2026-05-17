@@ -23,7 +23,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { subscriptionExchange } from 'urql';
 
-import { reportError } from '../error-bus';
+import { errorMessage, reportError } from '../error-bus';
 
 // Mirrors the JSON envelopes the Rust bridge writes into the channel.
 type SubMessage =
@@ -119,7 +119,7 @@ export const tauriSubscriptionExchange = subscriptionExchange({
                 opId = id;
               }
             })
-            .catch((err: unknown) => end(String(err), err));
+            .catch((err: unknown) => end(errorMessage(err), err));
         }
 
         connect();

@@ -6,7 +6,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 
-import { reportError } from '@/lib/error-bus';
+import { errorMessage, reportError } from '@/lib/error-bus';
 
 export type AuthStatus = {
   authenticated: boolean;
@@ -33,8 +33,7 @@ type AuthContextValue = {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 function reportAuthError(action: string, e: unknown): void {
-  const message = e instanceof Error ? e.message : String(e);
-  reportError({ source: 'auth', message: `${action}: ${message}`, cause: e });
+  reportError({ source: 'auth', message: `${action}: ${errorMessage(e)}`, cause: e });
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {

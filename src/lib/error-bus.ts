@@ -16,6 +16,20 @@ export type AppError = {
   cause?: unknown;
 };
 
+// Coerce an unknown thrown/rejected value into an Error. Pass-through if
+// it already is one (preserves the original stack); otherwise wrap
+// String(x). `catch` and rejected-promise values are `unknown` in TS, so
+// this is the one place that narrowing lives.
+export function toError(x: unknown): Error {
+  return x instanceof Error ? x : new Error(String(x));
+}
+
+// The human-readable message of an unknown thrown value — an Error's
+// `.message` (not its `"Error: …"` toString), or String(x) otherwise.
+export function errorMessage(x: unknown): string {
+  return toError(x).message;
+}
+
 const target = new EventTarget();
 const ERROR_EVENT = 'app-error';
 
