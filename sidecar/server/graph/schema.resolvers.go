@@ -12,16 +12,18 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 )
 
-// UpdateSettings is the resolver for the updateSettings field. Write-through:
-// push to the cloud, mirror the cloud's response into the local cache, then
-// notify any active settingsWatch subscribers in this process.
+// UpdateSettings is the resolver for the updateSettings field.
+// Write-through: push to the cloud, then publish to the shared Hub so
+// active subscribers update immediately. Persistence is intentionally NOT
+// done here — the engine is the sole syncstore writer; it persists this
+// change when the cloud echoes it back on its stream (single-writer keeps
+// the engine's version/mirror coherent). Read-after-write via the
+// `settings` query may briefly lag, but the UI consumes `settingsWatch`,
+// which the Hub publish satisfies at once.
 func (r *mutationResolver) UpdateSettings(ctx context.Context, input UpdateSettingsInput) (*Settings, error) {
 	out, err := r.Cloud.UpdateSettings(ctx, bearer(ctx), cloudInput(input))
 	if err != nil {
 		return nil, err
-	}
-	if err := r.Store.Save(out); err != nil {
-		logResolverErr(ctx, "store.Save", err)
 	}
 	r.Hub.Publish(out)
 	return toGraphSettings(out), nil
@@ -32,23 +34,16 @@ func (r *queryResolver) Ping(ctx context.Context) (string, error) {
 	return "pong", nil
 }
 
-// Settings is the resolver for the settings field. Read-through: try the
-// cloud first, refresh the local cache on success; fall back to the cache
-// when the cloud is unreachable.
+// Settings is the resolver for the settings field. Served entirely from
+// the engine-maintained syncstore — the engine owns the only cloud
+// connection, so reads never touch the network. An empty store (engine
+// never synced, e.g. logged out) yields the zero value, not an error.
 func (r *queryResolver) Settings(ctx context.Context) (*Settings, error) {
-	out, err := r.Cloud.GetSettings(ctx, bearer(ctx))
-	if err == nil {
-		if saveErr := r.Store.Save(out); saveErr != nil {
-			logResolverErr(ctx, "store.Save", saveErr)
-		}
-		return toGraphSettings(out), nil
+	env, err := r.Store.Load()
+	if err != nil {
+		return nil, err
 	}
-	logResolverErr(ctx, "cloud.GetSettings", err)
-	cached, loadErr := r.Store.Load()
-	if loadErr != nil {
-		return nil, loadErr
-	}
-	return toGraphSettings(cached), nil
+	return toGraphSettings(env.Data), nil
 }
 
 // Tick is the resolver for the tick field. Streams 1, 2, 3, … on the
@@ -76,38 +71,26 @@ func (r *subscriptionResolver) Tick(ctx context.Context) (<-chan int, error) {
 	return ch, nil
 }
 
-// SettingsWatch is the resolver for the settingsWatch field. Opens a cloud
-// SSE stream scoped to this subscriber's bearer token; each event is
-// republished through the local Hub so any in-process subscriber sees it
-// (today: just this one client, but the indirection makes adding more
-// trivial). The cloud stream tears down automatically when ctx is cancelled.
+// SettingsWatch is the resolver for the settingsWatch field. Subscribes
+// the shared Hub only — the engine is the single upstream consumer and
+// fans cloud changes (plus mutation publishes) through this Hub. A new
+// subscriber gets the current syncstore snapshot first so it doesn't have
+// to wait for the next change, then live Hub deltas.
 func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *Settings, error) {
-	streamCtx, cancel := context.WithCancel(ctx)
-
-	cloudCh, err := r.Cloud.WatchSettings(streamCtx, bearer(ctx))
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
 	hubCh, unsub := r.Hub.Subscribe()
-
-	// Pump cloud → hub. Lives in its own goroutine so a slow hub consumer
-	// can't stall the cloud reader. Closes when the cloud stream ends.
-	go func() {
-		for s := range cloudCh {
-			if err := r.Store.Save(s); err != nil {
-				logResolverErr(streamCtx, "store.Save", err)
-			}
-			r.Hub.Publish(s)
-		}
-	}()
 
 	out := make(chan *Settings)
 	go func() {
 		defer close(out)
-		defer cancel()
 		defer unsub()
+
+		env, _ := r.Store.Load()
+		select {
+		case out <- toGraphSettings(env.Data):
+		case <-ctx.Done():
+			return
+		}
+
 		for {
 			select {
 			case <-ctx.Done():

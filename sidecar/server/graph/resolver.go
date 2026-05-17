@@ -7,7 +7,6 @@ package graph
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,14 +14,19 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
 
 // Resolver carries the dependencies every operation needs: a Client for
 // outbound cloud calls, a Store for the local cache, and a Hub to fan out
 // settingsWatch events to all local subscribers.
+// Resolver carries the dependencies operations need. Post-cutover the
+// read path is served from the engine-maintained syncstore and the shared
+// Hub (the engine is the only cloud talker); Cloud is retained only for
+// the `updateSettings` write-through.
 type Resolver struct {
 	Cloud *cloud.Client
-	Store *prefs.Store
+	Store *syncstore.Store[prefs.Settings]
 	Hub   *prefs.Hub
 }
 
@@ -88,10 +92,4 @@ func bearer(ctx context.Context) string {
 // conversion explicit means schema and cache can evolve independently.
 func toGraphSettings(s prefs.Settings) *Settings {
 	return &Settings{Placeholder: s.Placeholder}
-}
-
-// logResolverErr logs cloud failures at warn — they're expected during
-// transient connectivity loss and shouldn't pollute error logs.
-func logResolverErr(ctx context.Context, op string, err error) {
-	slog.WarnContext(ctx, "cloud call failed", "op", op, "err", err)
 }

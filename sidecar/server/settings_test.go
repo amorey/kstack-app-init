@@ -3,7 +3,6 @@ package server_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,27 +15,29 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 	"github.com/kubetail-org/kstack-app/sidecar/server"
 	"github.com/kubetail-org/kstack-app/sidecar/server/graph"
 )
 
-// Spins up a fake cloud (handler chosen by caller) plus a sidecar handler
-// wired to it. Returns the running sidecar URL plus the prefs.Store so
-// tests can inspect the local cache.
-func newStack(t *testing.T, cloudHandler http.Handler) (sidecarURL string, store *prefs.Store) {
+// Post-cutover wiring: the Resolver reads the engine's syncstore and shares
+// the engine's Hub. The read path never touches the cloud (the engine is
+// the only cloud talker); only `updateSettings` still write-throughs.
+func newStack(t *testing.T, cloudHandler http.Handler) (sidecarURL string, store *syncstore.Store[prefs.Settings], hub *prefs.Hub) {
 	t.Helper()
 	cloudSrv := httptest.NewServer(cloudHandler)
 	t.Cleanup(cloudSrv.Close)
 
-	store = prefs.NewStore(filepath.Join(t.TempDir(), "preferences.json"))
+	store = syncstore.NewStore[prefs.Settings](filepath.Join(t.TempDir(), "settings.json"))
+	hub = prefs.NewHub()
 	r := &graph.Resolver{
 		Cloud: cloud.New(cloudSrv.URL),
 		Store: store,
-		Hub:   prefs.NewHub(),
+		Hub:   hub,
 	}
 	sidecar := httptest.NewServer(server.NewHandlerWithResolver(r))
 	t.Cleanup(sidecar.Close)
-	return sidecar.URL, store
+	return sidecar.URL, store, hub
 }
 
 func postGQL(t *testing.T, url, token, body string) []byte {
@@ -55,50 +56,47 @@ func postGQL(t *testing.T, url, token, body string) []byte {
 	return raw
 }
 
-// `settings` query: sidecar forwards to cloud (with the bearer header
-// from the inbound request), returns the cloud value, and writes it to
-// the local store.
-func TestSettingsQueryWriteThrough(t *testing.T) {
-	var sawAuth string
-	url, store := newStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawAuth = r.Header.Get("Authorization")
-		_, _ = w.Write([]byte(`{"data":{"settings":{"placeholder":"from-cloud"}}}`))
+// `settings` is served from the syncstore (engine-maintained) and must not
+// contact the cloud — the engine owns the only upstream connection.
+func TestSettingsServedFromStoreNoCloud(t *testing.T) {
+	cloudHit := false
+	url, store, _ := newStack(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		cloudHit = true
 	}))
-
-	raw := postGQL(t, url, "abc", `{"query":"{ settings { placeholder } }"}`)
-	if !strings.Contains(string(raw), `"placeholder":"from-cloud"`) {
-		t.Fatalf("response: %s", raw)
-	}
-	if sawAuth != "Bearer abc" {
-		t.Fatalf("bearer not forwarded to cloud: %q", sawAuth)
-	}
-	got, _ := store.Load()
-	if got.Placeholder != "from-cloud" {
-		t.Fatalf("store not updated: %+v", got)
-	}
-}
-
-// When the cloud errors, `settings` falls back to whatever is in the
-// local store — the offline-read promise.
-func TestSettingsQueryFallsBackToCache(t *testing.T) {
-	url, store := newStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "down", http.StatusBadGateway)
-	}))
-	if err := store.Save(prefs.Settings{Placeholder: "cached"}); err != nil {
+	if err := store.Save(syncstore.Envelope[prefs.Settings]{
+		Data:    prefs.Settings{Placeholder: "from-store"},
+		Version: "1",
+	}); err != nil {
 		t.Fatal(err)
 	}
 
 	raw := postGQL(t, url, "tok", `{"query":"{ settings { placeholder } }"}`)
-	if !strings.Contains(string(raw), `"placeholder":"cached"`) {
+	if !strings.Contains(string(raw), `"placeholder":"from-store"`) {
+		t.Fatalf("response: %s", raw)
+	}
+	if cloudHit {
+		t.Fatal("read path contacted the cloud")
+	}
+}
+
+// An empty store (engine never synced — e.g. logged out) is not an error;
+// the zero value flows through.
+func TestSettingsEmptyStoreReturnsZero(t *testing.T) {
+	url, _, _ := newStack(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("cloud must not be contacted")
+	}))
+	raw := postGQL(t, url, "tok", `{"query":"{ settings { placeholder } }"}`)
+	if !strings.Contains(string(raw), `"placeholder":""`) {
 		t.Fatalf("response: %s", raw)
 	}
 }
 
-// `updateSettings` posts to the cloud, stores the cloud's response,
-// and publishes to any active settingsWatch subscriber.
-func TestUpdateSettingsWriteThrough(t *testing.T) {
+// `updateSettings` still write-throughs to the cloud and publishes to the
+// shared Hub so active subscribers see it immediately (the engine persists
+// it when the cloud echoes it back on its stream).
+func TestUpdateSettingsWriteThroughAndPublishes(t *testing.T) {
 	var sawInput map[string]any
-	url, store := newStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	url, _, hub := newStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if vars, ok := body["variables"].(map[string]any); ok {
@@ -106,6 +104,9 @@ func TestUpdateSettingsWriteThrough(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"data":{"updateSettings":{"placeholder":"v2"}}}`))
 	}))
+
+	sub, unsub := hub.Subscribe()
+	defer unsub()
 
 	mutation := `{"query":"mutation($input: UpdateSettingsInput!) { updateSettings(input: $input) { placeholder } }",` +
 		`"variables":{"input":{"placeholder":"v2"}}}`
@@ -116,47 +117,42 @@ func TestUpdateSettingsWriteThrough(t *testing.T) {
 	if sawInput["placeholder"] != "v2" {
 		t.Fatalf("input not forwarded: %+v", sawInput)
 	}
-	got, _ := store.Load()
-	if got.Placeholder != "v2" {
-		t.Fatalf("store not updated: %+v", got)
+	select {
+	case s := <-sub:
+		if s.Placeholder != "v2" {
+			t.Fatalf("hub got %+v", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mutation did not publish to the Hub")
 	}
 }
 
-// `settingsWatch` over WebSocket: each cloud SSE event lands on the
-// client's WS stream in order; cancelling the WS tears down the cloud SSE.
-func TestSettingsWatchSubscription(t *testing.T) {
-	emit := make(chan string, 4)
-	cloudClosed := make(chan struct{})
-	cloudHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Accept") != "text/event-stream" {
-			// Non-subscription request — answer cleanly to keep tests focused.
-			_, _ = w.Write([]byte(`{"data":{}}`))
-			return
+// `settingsWatch` subscribes the shared Hub only (no per-resolver cloud
+// SSE): a new subscriber gets the current store snapshot first, then live
+// Hub publishes.
+func TestSettingsWatchSnapshotThenHubDeltas(t *testing.T) {
+	url, store, hub := newStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A cloud SSE attempt here is a regression (per-resolver SSE
+		// must be gone).
+		if r.Header.Get("Accept") == "text/event-stream" {
+			t.Error("settingsWatch opened a cloud SSE")
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher := w.(http.Flusher)
-		flusher.Flush()
-		defer close(cloudClosed)
-		for {
-			select {
-			case <-r.Context().Done():
-				return
-			case v := <-emit:
-				fmt.Fprintf(w, "event: next\ndata: {\"data\":{\"settingsWatch\":{\"placeholder\":%q}}}\n\n", v)
-				flusher.Flush()
-			}
-		}
-	})
-	url, _ := newStack(t, cloudHandler)
+		_, _ = w.Write([]byte(`{"data":{}}`))
+	}))
+	if err := store.Save(syncstore.Envelope[prefs.Settings]{
+		Data: prefs.Settings{Placeholder: "snap"}, Version: "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	wsURL := "ws" + strings.TrimPrefix(url, "http") + "/graphql"
 	dialer := websocket.Dialer{
 		Subprotocols:     []string{"graphql-transport-ws"},
 		HandshakeTimeout: 5 * time.Second,
 	}
-	header := http.Header{"Authorization": []string{"Bearer tok"}}
-	conn, _, err := dialer.DialContext(context.Background(), wsURL, header)
+	conn, _, err := dialer.DialContext(context.Background(), wsURL, http.Header{
+		"Authorization": []string{"Bearer tok"},
+	})
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)
 	}
@@ -168,11 +164,7 @@ func TestSettingsWatchSubscription(t *testing.T) {
 	}
 	mustWrite(t, conn, `{"id":"1","type":"subscribe","payload":{"query":"subscription { settingsWatch { placeholder } }"}}`)
 
-	// Push two events from the fake cloud.
-	emit <- "alpha"
-	emit <- "beta"
-
-	for _, want := range []string{"alpha", "beta"} {
+	readPlaceholder := func(want string) {
 		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -192,15 +184,13 @@ func TestSettingsWatchSubscription(t *testing.T) {
 			t.Fatalf("decode %s: %v", raw, err)
 		}
 		if msg.Type != "next" || msg.Payload.Data.SettingsWatch.Placeholder != want {
-			t.Fatalf("event %s: got %s", want, raw)
+			t.Fatalf("want %q, got %s", want, raw)
 		}
 	}
 
-	// Client unsubscribe — cloud SSE should tear down.
+	readPlaceholder("snap") // current snapshot first
+	hub.Publish(prefs.Settings{Placeholder: "live"})
+	readPlaceholder("live") // then live Hub deltas
+
 	mustWrite(t, conn, `{"id":"1","type":"complete"}`)
-	select {
-	case <-cloudClosed:
-	case <-time.After(3 * time.Second):
-		t.Fatal("cloud SSE not closed after client unsubscribe")
-	}
 }

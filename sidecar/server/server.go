@@ -20,15 +20,20 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 	"github.com/kubetail-org/kstack-app/sidecar/server/graph"
 )
 
-// Config bundles the configurable pieces of the sidecar handler. main()
-// builds one from flags/env; tests build one inline. CloudURL is the cloud
-// API's base URL — `cloud.New` appends `/graphql` itself.
+// Config bundles the configurable pieces of the sidecar handler. CloudURL
+// is the cloud API's base URL — `cloud.New` appends `/graphql` itself.
+// Store and Hub are the engine-shared instances main() builds (the
+// Resolver reads the same syncstore the engine writes and subscribes the
+// same Hub it publishes to); nil ⇒ fresh empties for tests that never
+// touch the settings surface.
 type Config struct {
-	CloudURL  string
-	PrefsPath string
+	CloudURL string
+	Store    *syncstore.Store[prefs.Settings]
+	Hub      *prefs.Hub
 }
 
 // NewHandler returns an http.Handler serving GraphQL at /graphql plus the
@@ -37,10 +42,21 @@ type Config struct {
 // instance by construction: the always-on engine (Cycle 4) reads the same
 // one the host pushes to. Callers that don't need it discard with `_`.
 func NewHandler(cfg Config) (http.Handler, *authcreds.Holder) {
+	store := cfg.Store
+	if store == nil {
+		// Tests that pass Config{} never exercise the settings surface;
+		// a never-read store keeps the Resolver non-nil.
+		store = syncstore.NewStore[prefs.Settings](
+			filepath.Join(filepath.Dir(DefaultPrefsPath()), "sync", "settings.json"))
+	}
+	hub := cfg.Hub
+	if hub == nil {
+		hub = prefs.NewHub()
+	}
 	r := &graph.Resolver{
 		Cloud: cloud.New(cfg.CloudURL),
-		Store: prefs.NewStore(cfg.PrefsPath),
-		Hub:   prefs.NewHub(),
+		Store: store,
+		Hub:   hub,
 	}
 	creds := authcreds.NewHolder()
 	mux := http.NewServeMux()

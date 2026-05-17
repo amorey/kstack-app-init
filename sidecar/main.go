@@ -67,11 +67,17 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	// NewHandler owns the credential Holder; the always-on engine reads
-	// the same instance the host pushes to via /control/credentials.
+	// Engine and Resolver share one syncstore + Hub: the Resolver serves
+	// reads from the store the engine maintains and subscribes the Hub it
+	// publishes to (single upstream). The credential Holder is owned by
+	// NewHandler; the engine reads the same instance the host pushes to.
+	syncStore := syncstore.NewStore[prefs.Settings](
+		filepath.Join(filepath.Dir(*prefsPath), "sync", "settings.json"))
+	hub := prefs.NewHub()
 	handler, creds := server.NewHandler(server.Config{
-		CloudURL:  *cloudURL,
-		PrefsPath: *prefsPath,
+		CloudURL: *cloudURL,
+		Store:    syncStore,
+		Hub:      hub,
 	})
 	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, handler)
 	srv.Handler = http.MaxBytesHandler(wrapped, maxRequestBytes)
@@ -88,17 +94,14 @@ func main() {
 		cancel()
 	}()
 
-	// Always-on reconcile engine. It authenticates via the host-pushed
-	// credential Holder (Offline until the first push), persists to a
-	// versioned syncstore next to the prefs cache, and fans events into
-	// its own Hub. Transitional: resolvers still use the per-request
-	// cloud path, so this is a second upstream connection until Cycle 5
-	// cuts reads over to the store/Hub.
-	syncStorePath := filepath.Join(filepath.Dir(*prefsPath), "sync", "settings.json")
+	// Always-on reconcile engine: the single upstream connection. It
+	// authenticates via the host-pushed credential Holder (Offline until
+	// the first push), persists to the shared syncstore, and fans cloud
+	// changes into the shared Hub the Resolver serves reads from.
 	engine := syncengine.New(
 		syncengine.NewCloudUpstream(cloud.New(*cloudURL), creds),
-		syncstore.NewStore[prefs.Settings](syncStorePath),
-		prefs.NewHub(),
+		syncStore,
+		hub,
 		syncengine.Options{},
 	)
 	engineDone := make(chan struct{})
