@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/hub"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
@@ -129,10 +130,10 @@ func (o *Options) applyDefaults() {
 
 // Engine reconciles one resource. Construct with New, run with Run.
 type Engine struct {
-	up    Upstream
-	store *syncstore.Store[prefs.Settings]
-	hub   *prefs.Hub
-	opt   Options
+	up          Upstream
+	store       *syncstore.Store[prefs.Settings]
+	settingsHub *prefs.Hub
+	opt         Options
 
 	mu     sync.Mutex
 	status Status
@@ -158,23 +159,22 @@ type Engine struct {
 	// and the upstream result is still the source of truth.
 	pokeCh chan struct{}
 
-	// statusSubs fans every status transition out to syncStatusWatch
-	// subscribers. Same shape as prefs.Hub (buffered, drop-on-full) so a
-	// slow consumer can't stall the supervisor loop.
-	subsMu     sync.Mutex
-	statusSubs map[chan Status]struct{}
+	// statusHub fans every status transition out to syncStatusWatch
+	// subscribers (buffered, drop-on-full) so a slow consumer can't stall
+	// the supervisor loop.
+	statusHub *hub.Hub[Status]
 }
 
 // New builds an Engine. It does not start anything; call Run.
-func New(up Upstream, store *syncstore.Store[prefs.Settings], hub *prefs.Hub, opt Options) *Engine {
+func New(up Upstream, store *syncstore.Store[prefs.Settings], settingsHub *prefs.Hub, opt Options) *Engine {
 	opt.applyDefaults()
 	return &Engine{
-		up:         up,
-		store:      store,
-		hub:        hub,
-		opt:        opt,
-		statusSubs: make(map[chan Status]struct{}),
-		pokeCh:     make(chan struct{}, 1),
+		up:          up,
+		store:       store,
+		settingsHub: settingsHub,
+		opt:         opt,
+		statusHub:   hub.New[Status](),
+		pokeCh:      make(chan struct{}, 1),
 	}
 }
 
@@ -204,33 +204,7 @@ func (e *Engine) Poke() {
 // callers that need the current value read Status() first (the
 // syncStatusWatch resolver emits that snapshot before streaming).
 func (e *Engine) WatchStatus() (<-chan Status, func()) {
-	ch := make(chan Status, 4)
-	e.subsMu.Lock()
-	e.statusSubs[ch] = struct{}{}
-	e.subsMu.Unlock()
-
-	var once sync.Once
-	return ch, func() {
-		once.Do(func() {
-			e.subsMu.Lock()
-			if _, ok := e.statusSubs[ch]; ok {
-				delete(e.statusSubs, ch)
-				close(ch)
-			}
-			e.subsMu.Unlock()
-		})
-	}
-}
-
-func (e *Engine) broadcastStatus(s Status) {
-	e.subsMu.Lock()
-	defer e.subsMu.Unlock()
-	for ch := range e.statusSubs {
-		select {
-		case ch <- s:
-		default:
-		}
-	}
+	return e.statusHub.Subscribe()
 }
 
 // Status returns the current health snapshot. Safe for concurrent use.
@@ -253,7 +227,7 @@ func (e *Engine) setStatus(mut func(*Status)) {
 	s := e.status
 	e.mu.Unlock()
 	if s != prev {
-		e.broadcastStatus(s)
+		e.statusHub.Publish(s)
 	}
 }
 
@@ -380,7 +354,7 @@ func (e *Engine) apply(v prefs.Settings, snapshot bool) {
 	e.mu.Unlock()
 
 	_ = e.store.Save(env)
-	e.hub.Publish(v)
+	e.settingsHub.Publish(v)
 }
 
 // backoffDelay is the exponential-with-jitter delay for a given attempt,
