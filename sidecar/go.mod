@@ -4,12 +4,12 @@ go 1.25.0
 
 require (
 	github.com/99designs/gqlgen v0.17.90
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/gorilla/websocket v1.5.0
 	github.com/vektah/gqlparser/v2 v2.5.33
 )
 
 require (
-	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/agnivade/levenshtein v1.2.1 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect

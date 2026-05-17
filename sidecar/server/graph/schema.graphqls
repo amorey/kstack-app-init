@@ -7,16 +7,39 @@ input UpdateSettingsInput {
   placeholder: String
 }
 
+"Engine connection lifecycle."
+enum SyncState {
+  CONNECTING
+  LIVE
+  BACKOFF
+  OFFLINE
+}
+
+"Connection/sync health of the always-on engine that owns the single upstream connection."
+type SyncStatus {
+  "Engine lifecycle state."
+  state: SyncState!
+  "Last upstream error; empty string when healthy."
+  lastError: String!
+  "Unix-millis of the last successful snapshot reconcile; 0 if never synced."
+  lastSyncedAt: Int!
+  "Unix-millis of the next scheduled reconnect while in `backoff`; 0 otherwise."
+  retryAt: Int!
+}
+
 type Query {
   "Health-check field. Always returns 'pong'."
   ping: String!
 
-  "Returns the current user's Settings. Read-through to the cloud, with a local JSON cache as offline fallback."
+  "Returns the current user's Settings, served from the locally-reconciled store the always-on engine maintains (no synchronous cloud call)."
   settings: Settings!
+
+  "Current sync health of the always-on engine."
+  syncStatus: SyncStatus!
 }
 
 type Mutation {
-  "Write-through update: pushed to the cloud, then mirrored locally."
+  "Write-through update: pushed to the cloud, then published locally; the engine persists it when the cloud echoes it back."
   updateSettings(input: UpdateSettingsInput!): Settings!
 }
 
@@ -24,6 +47,9 @@ type Subscription {
   "Emits an incrementing integer (starting at 1) every second. Cancelled when the client unsubscribes."
   tick: Int!
 
-  "Streams Settings updates as they arrive from the cloud (per-subscriber cloud SSE stream)."
+  "Streams Settings updates: the current snapshot first, then live changes fanned out from the engine's shared hub."
   settingsWatch: Settings!
+
+  "Streams the engine's sync health: the current status first, then every transition."
+  syncStatusWatch: SyncStatus!
 }

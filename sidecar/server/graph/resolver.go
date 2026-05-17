@@ -14,6 +14,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
+	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
 
@@ -28,6 +29,60 @@ type Resolver struct {
 	Cloud *cloud.Client
 	Store *syncstore.Store[prefs.Settings]
 	Hub   *prefs.Hub
+	Sync  StatusSource
+}
+
+// StatusSource is the slice of the always-on engine the syncStatus
+// resolvers need. An interface (not *sync.Engine) so server tests can
+// inject a fake without standing up a real engine.
+type StatusSource interface {
+	Status() syncpkg.Status
+	WatchStatus() (<-chan syncpkg.Status, func())
+}
+
+// cloudInput converts the gqlgen-generated input type into the cloud
+// client's mirror type. Lives here (hand-written file) so gqlgen doesn't
+// relocate it into a regenerated resolver file.
+func cloudInput(in UpdateSettingsInput) cloud.UpdateInput {
+	return cloud.UpdateInput{Placeholder: in.Placeholder}
+}
+
+// graphSyncState maps the engine's State enum onto the generated GraphQL
+// enum. The four engine states are total; default is defensive only.
+func graphSyncState(s syncpkg.State) SyncState {
+	switch s {
+	case syncpkg.StateConnecting:
+		return SyncStateConnecting
+	case syncpkg.StateLive:
+		return SyncStateLive
+	case syncpkg.StateBackoff:
+		return SyncStateBackoff
+	default:
+		return SyncStateOffline
+	}
+}
+
+// toGraphSyncStatus maps the engine's Status onto the generated GraphQL
+// type. Timestamps are Unix-millis ints (0 when zero-valued); RetryAt is
+// only meaningful while backing off (the engine's Status documents this
+// invariant — the mapper just honors it).
+func toGraphSyncStatus(s syncpkg.Status) *SyncStatus {
+	ms := func(t time.Time) int {
+		if t.IsZero() {
+			return 0
+		}
+		return int(t.UnixMilli())
+	}
+	retry := 0
+	if s.State == syncpkg.StateBackoff {
+		retry = ms(s.RetryAt)
+	}
+	return &SyncStatus{
+		State:        graphSyncState(s.State),
+		LastError:    s.LastError,
+		LastSyncedAt: ms(s.LastSyncedAt),
+		RetryAt:      retry,
+	}
 }
 
 // tickInterval is the cadence of the `tick` subscription. Overridable via

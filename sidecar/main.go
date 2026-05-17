@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/logging"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
@@ -67,17 +68,29 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	// Engine and Resolver share one syncstore + Hub: the Resolver serves
-	// reads from the store the engine maintains and subscribes the Hub it
-	// publishes to (single upstream). The credential Holder is owned by
-	// NewHandler; the engine reads the same instance the host pushes to.
+	// Composition root. The engine must exist before the Resolver (it's
+	// the syncStatus source) yet needs the credential Holder, so main
+	// owns the shared instances and threads them both ways:
+	//   - Resolver reads the syncstore the engine maintains, subscribes
+	//     the Hub it publishes to, and exposes its Status();
+	//   - /control/credentials writes the Holder the engine authenticates
+	//     with.
 	syncStore := syncstore.NewStore[prefs.Settings](
 		filepath.Join(filepath.Dir(*prefsPath), "sync", "settings.json"))
 	hub := prefs.NewHub()
-	handler, creds := server.NewHandler(server.Config{
+	creds := authcreds.NewHolder()
+	engine := syncengine.New(
+		syncengine.NewCloudUpstream(cloud.New(*cloudURL), creds),
+		syncStore,
+		hub,
+		syncengine.Options{},
+	)
+	handler := server.NewHandler(server.Config{
 		CloudURL: *cloudURL,
 		Store:    syncStore,
 		Hub:      hub,
+		Creds:    creds,
+		Sync:     engine,
 	})
 	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, handler)
 	srv.Handler = http.MaxBytesHandler(wrapped, maxRequestBytes)
@@ -93,17 +106,6 @@ func main() {
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		cancel()
 	}()
-
-	// Always-on reconcile engine: the single upstream connection. It
-	// authenticates via the host-pushed credential Holder (Offline until
-	// the first push), persists to the shared syncstore, and fans cloud
-	// changes into the shared Hub the Resolver serves reads from.
-	engine := syncengine.New(
-		syncengine.NewCloudUpstream(cloud.New(*cloudURL), creds),
-		syncStore,
-		hub,
-		syncengine.Options{},
-	)
 	engineDone := make(chan struct{})
 	go func() {
 		engine.Run(ctx)

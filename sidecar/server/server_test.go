@@ -15,6 +15,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/logging"
 	"github.com/kubetail-org/kstack-app/sidecar/server"
 )
@@ -22,7 +23,7 @@ import (
 // TestPingQuery is the canary: a fresh server should answer `{ ping }` with "pong".
 // If this passes, the gqlgen wiring (schema -> resolver -> handler) is intact.
 func TestPingQuery(t *testing.T) {
-	h, _ := server.NewHandler(server.Config{})
+	h := server.NewHandler(server.Config{})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
@@ -51,7 +52,7 @@ func TestPingQuery(t *testing.T) {
 // `tick`, and asserts the first two values are 1 and 2. Validates that the
 // Websocket transport is wired and the Subscription resolver streams.
 func TestTickSubscription(t *testing.T) {
-	h, _ := server.NewHandler(server.Config{})
+	h := server.NewHandler(server.Config{})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
@@ -109,7 +110,7 @@ func TestResolverErrorIsLogged(t *testing.T) {
 	var buf bytes.Buffer
 	slog.SetDefault(logging.Init(&buf, slog.LevelInfo))
 
-	h, _ := server.NewHandler(server.Config{})
+	h := server.NewHandler(server.Config{})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
@@ -146,7 +147,7 @@ func TestResolverErrorIsLogged(t *testing.T) {
 // `ResetWithoutClosingHandshake` warning on every app exit.
 func TestGracefulShutdownClosesWebsocket(t *testing.T) {
 	ts := httptest.NewUnstartedServer(http.NotFoundHandler())
-	h, _ := server.NewHandler(server.Config{})
+	h := server.NewHandler(server.Config{})
 	wrapped, wait := server.AttachGracefulShutdown(ts.Config, h)
 	ts.Config.Handler = wrapped
 	ts.Start()
@@ -245,7 +246,8 @@ func mustReadType(t *testing.T, c *websocket.Conn) string {
 // populates the shared authcreds.Holder; anything malformed leaves it
 // untouched so a bad push can't blank a working token.
 func TestControlCredentials(t *testing.T) {
-	h, creds := server.NewHandler(server.Config{})
+	creds := authcreds.NewHolder()
+	h := server.NewHandler(server.Config{Creds: creds})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 	url := ts.URL + "/control/credentials"

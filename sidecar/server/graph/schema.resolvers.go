@@ -8,8 +8,6 @@ package graph
 import (
 	"context"
 	"time"
-
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 )
 
 // UpdateSettings is the resolver for the updateSettings field.
@@ -44,6 +42,11 @@ func (r *queryResolver) Settings(ctx context.Context) (*Settings, error) {
 		return nil, err
 	}
 	return toGraphSettings(env.Data), nil
+}
+
+// SyncStatus is the resolver for the syncStatus field.
+func (r *queryResolver) SyncStatus(ctx context.Context) (*SyncStatus, error) {
+	return toGraphSyncStatus(r.Sync.Status()), nil
 }
 
 // Tick is the resolver for the tick field. Streams 1, 2, 3, … on the
@@ -84,11 +87,16 @@ func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *Setti
 		defer close(out)
 		defer unsub()
 
-		env, _ := r.Store.Load()
-		select {
-		case out <- toGraphSettings(env.Data):
-		case <-ctx.Done():
-			return
+		// Emit the current snapshot first so a new subscriber doesn't
+		// wait for the next change. On a load error, skip it (fall
+		// straight to live deltas) rather than present a fabricated
+		// zero value as real state.
+		if env, err := r.Store.Load(); err == nil {
+			select {
+			case out <- toGraphSettings(env.Data):
+			case <-ctx.Done():
+				return
+			}
 		}
 
 		for {
@@ -110,11 +118,40 @@ func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *Setti
 	return out, nil
 }
 
-// cloudInput converts the gqlgen-generated input type into the cloud
-// client's mirror type. Same shape, but distinct packages so neither side
-// has to know about the other.
-func cloudInput(in UpdateSettingsInput) cloud.UpdateInput {
-	return cloud.UpdateInput{Placeholder: in.Placeholder}
+// SyncStatusWatch is the resolver for the syncStatusWatch field. Emits
+// the current status immediately (so a new subscriber doesn't wait for the
+// next transition), then every subsequent transition from the engine.
+func (r *subscriptionResolver) SyncStatusWatch(ctx context.Context) (<-chan *SyncStatus, error) {
+	sub, unsub := r.Sync.WatchStatus()
+
+	out := make(chan *SyncStatus)
+	go func() {
+		defer close(out)
+		defer unsub()
+
+		select {
+		case out <- toGraphSyncStatus(r.Sync.Status()):
+		case <-ctx.Done():
+			return
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case s, ok := <-sub:
+				if !ok {
+					return
+				}
+				select {
+				case out <- toGraphSyncStatus(s):
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out, nil
 }
 
 // Mutation returns MutationResolver implementation.

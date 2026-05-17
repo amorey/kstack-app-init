@@ -20,28 +20,47 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
+	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 	"github.com/kubetail-org/kstack-app/sidecar/server/graph"
 )
 
+// noopStatus is the default StatusSource when none is wired (Config{} in
+// tests / surfaces that don't run the engine): reports Offline and an
+// already-closed watch, so syncStatus/syncStatusWatch degrade gracefully
+// instead of nil-panicking — matching the Store/Hub/Creds nil-defaults.
+type noopStatus struct{}
+
+func (noopStatus) Status() syncpkg.Status {
+	return syncpkg.Status{State: syncpkg.StateOffline}
+}
+
+func (noopStatus) WatchStatus() (<-chan syncpkg.Status, func()) {
+	ch := make(chan syncpkg.Status)
+	close(ch)
+	return ch, func() {}
+}
+
 // Config bundles the configurable pieces of the sidecar handler. CloudURL
 // is the cloud API's base URL — `cloud.New` appends `/graphql` itself.
-// Store and Hub are the engine-shared instances main() builds (the
-// Resolver reads the same syncstore the engine writes and subscribes the
-// same Hub it publishes to); nil ⇒ fresh empties for tests that never
-// touch the settings surface.
+// Store/Hub/Creds/Sync are the engine-shared instances main() builds: the
+// Resolver reads the same syncstore the engine writes, subscribes the same
+// Hub it publishes to, the /control/credentials endpoint writes the same
+// Holder the engine authenticates with, and syncStatus reads the engine.
+// main() owns these because the engine must exist before the Resolver
+// (Sync) yet needs Creds — a cycle only the composition root can break.
+// nil ⇒ fresh empties for tests that don't touch those surfaces.
 type Config struct {
 	CloudURL string
 	Store    *syncstore.Store[prefs.Settings]
 	Hub      *prefs.Hub
+	Creds    *authcreds.Holder
+	Sync     graph.StatusSource
 }
 
 // NewHandler returns an http.Handler serving GraphQL at /graphql plus the
-// host-only /control/credentials endpoint, and the credential Holder that
-// endpoint writes. NewHandler owns the Holder so there is exactly one
-// instance by construction: the always-on engine (Cycle 4) reads the same
-// one the host pushes to. Callers that don't need it discard with `_`.
-func NewHandler(cfg Config) (http.Handler, *authcreds.Holder) {
+// host-only /control/credentials endpoint.
+func NewHandler(cfg Config) http.Handler {
 	store := cfg.Store
 	if store == nil {
 		// Tests that pass Config{} never exercise the settings surface;
@@ -53,17 +72,27 @@ func NewHandler(cfg Config) (http.Handler, *authcreds.Holder) {
 	if hub == nil {
 		hub = prefs.NewHub()
 	}
+	creds := cfg.Creds
+	if creds == nil {
+		creds = authcreds.NewHolder()
+	}
+	status := cfg.Sync
+	if status == nil {
+		// Consistent with the other nil-defaults: a Config{} handler must
+		// not panic on syncStatus — report Offline, stream nothing.
+		status = noopStatus{}
+	}
 	r := &graph.Resolver{
 		Cloud: cloud.New(cfg.CloudURL),
 		Store: store,
 		Hub:   hub,
+		Sync:  status,
 	}
-	creds := authcreds.NewHolder()
 	mux := http.NewServeMux()
 	mux.Handle("/control/credentials", controlCredentials(creds))
 	// Everything else (GraphQL, WS) goes to the resolver handler.
 	mux.Handle("/", NewHandlerWithResolver(r))
-	return mux, creds
+	return mux
 }
 
 // controlCredentials accepts the host's token push. Kept off the GraphQL

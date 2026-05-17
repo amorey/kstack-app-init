@@ -142,12 +142,58 @@ type Engine struct {
 	// force a reconnect without waiting for the upstream to end. Nil
 	// between watches.
 	activeCancel context.CancelFunc
+
+	// statusSubs fans every status transition out to syncStatusWatch
+	// subscribers. Same shape as prefs.Hub (buffered, drop-on-full) so a
+	// slow consumer can't stall the supervisor loop.
+	subsMu     sync.Mutex
+	statusSubs map[chan Status]struct{}
 }
 
 // New builds an Engine. It does not start anything; call Run.
 func New(up Upstream, store *syncstore.Store[prefs.Settings], hub *prefs.Hub, opt Options) *Engine {
 	opt.applyDefaults()
-	return &Engine{up: up, store: store, hub: hub, opt: opt}
+	return &Engine{
+		up:         up,
+		store:      store,
+		hub:        hub,
+		opt:        opt,
+		statusSubs: make(map[chan Status]struct{}),
+	}
+}
+
+// WatchStatus returns a buffered channel of status transitions and an
+// unsubscribe func (closed on unsub; idempotent). It streams *changes*;
+// callers that need the current value read Status() first (the
+// syncStatusWatch resolver emits that snapshot before streaming).
+func (e *Engine) WatchStatus() (<-chan Status, func()) {
+	ch := make(chan Status, 4)
+	e.subsMu.Lock()
+	e.statusSubs[ch] = struct{}{}
+	e.subsMu.Unlock()
+
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() {
+			e.subsMu.Lock()
+			if _, ok := e.statusSubs[ch]; ok {
+				delete(e.statusSubs, ch)
+				close(ch)
+			}
+			e.subsMu.Unlock()
+		})
+	}
+}
+
+func (e *Engine) broadcastStatus(s Status) {
+	e.subsMu.Lock()
+	defer e.subsMu.Unlock()
+	for ch := range e.statusSubs {
+		select {
+		case ch <- s:
+		default:
+		}
+	}
 }
 
 // Status returns the current health snapshot. Safe for concurrent use.
@@ -157,10 +203,21 @@ func (e *Engine) Status() Status {
 	return e.status
 }
 
+// setStatus applies mut and, only if the resulting Status actually
+// changed, fans it out. Called exclusively from the supervisor goroutine
+// (Run and its callees), so transitions are serialized — broadcast order
+// matches mutation order without holding e.mu across the fan-out. The
+// change guard stops a reconnect storm (Connecting→Offline→Connecting…)
+// from spamming subscribers with byte-identical statuses.
 func (e *Engine) setStatus(mut func(*Status)) {
 	e.mu.Lock()
+	prev := e.status
 	mut(&e.status)
+	s := e.status
 	e.mu.Unlock()
+	if s != prev {
+		e.broadcastStatus(s)
+	}
 }
 
 // Run blocks until ctx is cancelled, supervising the upstream connection.

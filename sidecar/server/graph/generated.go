@@ -42,8 +42,9 @@ type ComplexityRoot struct {
 	}
 
 	Query struct {
-		Ping     func(childComplexity int) int
-		Settings func(childComplexity int) int
+		Ping       func(childComplexity int) int
+		Settings   func(childComplexity int) int
+		SyncStatus func(childComplexity int) int
 	}
 
 	Settings struct {
@@ -51,8 +52,16 @@ type ComplexityRoot struct {
 	}
 
 	Subscription struct {
-		SettingsWatch func(childComplexity int) int
-		Tick          func(childComplexity int) int
+		SettingsWatch   func(childComplexity int) int
+		SyncStatusWatch func(childComplexity int) int
+		Tick            func(childComplexity int) int
+	}
+
+	SyncStatus struct {
+		LastError    func(childComplexity int) int
+		LastSyncedAt func(childComplexity int) int
+		RetryAt      func(childComplexity int) int
+		State        func(childComplexity int) int
 	}
 }
 
@@ -62,10 +71,12 @@ type MutationResolver interface {
 type QueryResolver interface {
 	Ping(ctx context.Context) (string, error)
 	Settings(ctx context.Context) (*Settings, error)
+	SyncStatus(ctx context.Context) (*SyncStatus, error)
 }
 type SubscriptionResolver interface {
 	Tick(ctx context.Context) (<-chan int, error)
 	SettingsWatch(ctx context.Context) (<-chan *Settings, error)
+	SyncStatusWatch(ctx context.Context) (<-chan *SyncStatus, error)
 }
 
 type executableSchema graphql.ExecutableSchemaState[ResolverRoot, DirectiveRoot, ComplexityRoot]
@@ -106,6 +117,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Query.Settings(childComplexity), true
+	case "Query.syncStatus":
+		if e.ComplexityRoot.Query.SyncStatus == nil {
+			break
+		}
+
+		return e.ComplexityRoot.Query.SyncStatus(childComplexity), true
 
 	case "Settings.placeholder":
 		if e.ComplexityRoot.Settings.Placeholder == nil {
@@ -120,12 +137,43 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Subscription.SettingsWatch(childComplexity), true
+	case "Subscription.syncStatusWatch":
+		if e.ComplexityRoot.Subscription.SyncStatusWatch == nil {
+			break
+		}
+
+		return e.ComplexityRoot.Subscription.SyncStatusWatch(childComplexity), true
 	case "Subscription.tick":
 		if e.ComplexityRoot.Subscription.Tick == nil {
 			break
 		}
 
 		return e.ComplexityRoot.Subscription.Tick(childComplexity), true
+
+	case "SyncStatus.lastError":
+		if e.ComplexityRoot.SyncStatus.LastError == nil {
+			break
+		}
+
+		return e.ComplexityRoot.SyncStatus.LastError(childComplexity), true
+	case "SyncStatus.lastSyncedAt":
+		if e.ComplexityRoot.SyncStatus.LastSyncedAt == nil {
+			break
+		}
+
+		return e.ComplexityRoot.SyncStatus.LastSyncedAt(childComplexity), true
+	case "SyncStatus.retryAt":
+		if e.ComplexityRoot.SyncStatus.RetryAt == nil {
+			break
+		}
+
+		return e.ComplexityRoot.SyncStatus.RetryAt(childComplexity), true
+	case "SyncStatus.state":
+		if e.ComplexityRoot.SyncStatus.State == nil {
+			break
+		}
+
+		return e.ComplexityRoot.SyncStatus.State(childComplexity), true
 
 	}
 	return 0, false
@@ -253,6 +301,20 @@ func (ec *executionContext) childFields_Settings(ctx context.Context, field grap
 		return ec.fieldContext_Settings_placeholder(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type Settings", field.Name)
+}
+
+func (ec *executionContext) childFields_SyncStatus(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "state":
+		return ec.fieldContext_SyncStatus_state(ctx, field)
+	case "lastError":
+		return ec.fieldContext_SyncStatus_lastError(ctx, field)
+	case "lastSyncedAt":
+		return ec.fieldContext_SyncStatus_lastSyncedAt(ctx, field)
+	case "retryAt":
+		return ec.fieldContext_SyncStatus_retryAt(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type SyncStatus", field.Name)
 }
 
 func (ec *executionContext) childFields___Directive(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -562,6 +624,38 @@ func (ec *executionContext) fieldContext_Query_settings(_ context.Context, field
 	return fc, nil
 }
 
+func (ec *executionContext) _Query_syncStatus(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Query_syncStatus(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return ec.Resolvers.Query().SyncStatus(ctx)
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *SyncStatus) graphql.Marshaler {
+			return ec.marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚐSyncStatus(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Query_syncStatus(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Query",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_SyncStatus(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
 func (ec *executionContext) _Query___type(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -714,6 +808,130 @@ func (ec *executionContext) fieldContext_Subscription_settingsWatch(_ context.Co
 		},
 	}
 	return fc, nil
+}
+
+func (ec *executionContext) _Subscription_syncStatusWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
+	return graphql.ResolveFieldStream(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Subscription_syncStatusWatch(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return ec.Resolvers.Subscription().SyncStatusWatch(ctx)
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *SyncStatus) graphql.Marshaler {
+			return ec.marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚐSyncStatus(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Subscription_syncStatusWatch(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Subscription",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_SyncStatus(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _SyncStatus_state(ctx context.Context, field graphql.CollectedField, obj *SyncStatus) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_SyncStatus_state(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.State, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v SyncState) graphql.Marshaler {
+			return ec.marshalNSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚐSyncState(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_SyncStatus_state(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("SyncStatus", field, false, false, errors.New("field of type SyncState does not have child fields"))
+}
+
+func (ec *executionContext) _SyncStatus_lastError(ctx context.Context, field graphql.CollectedField, obj *SyncStatus) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_SyncStatus_lastError(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.LastError, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_SyncStatus_lastError(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("SyncStatus", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _SyncStatus_lastSyncedAt(ctx context.Context, field graphql.CollectedField, obj *SyncStatus) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_SyncStatus_lastSyncedAt(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.LastSyncedAt, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_SyncStatus_lastSyncedAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("SyncStatus", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _SyncStatus_retryAt(ctx context.Context, field graphql.CollectedField, obj *SyncStatus) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_SyncStatus_retryAt(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.RetryAt, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_SyncStatus_retryAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("SyncStatus", field, false, false, errors.New("field of type Int does not have child fields"))
 }
 
 func (ec *executionContext) ___Directive_name(ctx context.Context, field graphql.CollectedField, obj *introspection.Directive) (ret graphql.Marshaler) {
@@ -1925,6 +2143,28 @@ func (ec *executionContext) _Query(ctx context.Context, sel ast.SelectionSet) gr
 			}
 
 			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return rrm(innerCtx) })
+		case "syncStatus":
+			field := field
+
+			innerFunc := func(ctx context.Context, fs *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._Query_syncStatus(ctx, field)
+				if res == graphql.Null {
+					atomic.AddUint32(&fs.Invalids, 1)
+				}
+				return res
+			}
+
+			rrm := func(ctx context.Context) graphql.Marshaler {
+				return ec.OperationContext.RootResolverMiddleware(ctx,
+					func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return rrm(innerCtx) })
 		case "__type":
 			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
 				return ec._Query___type(ctx, field)
@@ -2012,9 +2252,65 @@ func (ec *executionContext) _Subscription(ctx context.Context, sel ast.Selection
 		return ec._Subscription_tick(ctx, fields[0])
 	case "settingsWatch":
 		return ec._Subscription_settingsWatch(ctx, fields[0])
+	case "syncStatusWatch":
+		return ec._Subscription_syncStatusWatch(ctx, fields[0])
 	default:
 		panic("unknown field " + strconv.Quote(fields[0].Name))
 	}
+}
+
+var syncStatusImplementors = []string{"SyncStatus"}
+
+func (ec *executionContext) _SyncStatus(ctx context.Context, sel ast.SelectionSet, obj *SyncStatus) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, syncStatusImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("SyncStatus")
+		case "state":
+			out.Values[i] = ec._SyncStatus_state(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "lastError":
+			out.Values[i] = ec._SyncStatus_lastError(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "lastSyncedAt":
+			out.Values[i] = ec._SyncStatus_lastSyncedAt(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "retryAt":
+			out.Values[i] = ec._SyncStatus_retryAt(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
 }
 
 var __DirectiveImplementors = []string{"__Directive"}
@@ -2412,6 +2708,30 @@ func (ec *executionContext) marshalNString2string(ctx context.Context, sel ast.S
 		}
 	}
 	return res
+}
+
+func (ec *executionContext) unmarshalNSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚐSyncState(ctx context.Context, v any) (SyncState, error) {
+	var res SyncState
+	err := res.UnmarshalGQL(v)
+	return res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) marshalNSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚐSyncState(ctx context.Context, sel ast.SelectionSet, v SyncState) graphql.Marshaler {
+	return v
+}
+
+func (ec *executionContext) marshalNSyncStatus2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚐSyncStatus(ctx context.Context, sel ast.SelectionSet, v SyncStatus) graphql.Marshaler {
+	return ec._SyncStatus(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚐSyncStatus(ctx context.Context, sel ast.SelectionSet, v *SyncStatus) graphql.Marshaler {
+	if v == nil {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+		return graphql.Null
+	}
+	return ec._SyncStatus(ctx, sel, v)
 }
 
 func (ec *executionContext) unmarshalNUpdateSettingsInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚐUpdateSettingsInput(ctx context.Context, v any) (UpdateSettingsInput, error) {

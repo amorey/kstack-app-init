@@ -334,3 +334,34 @@ func waitCount(t *testing.T, c *atomic.Int64, want int64) {
 	}
 	t.Fatalf("counter never reached %d (got %d)", want, c.Load())
 }
+
+// WatchStatus streams transitions to subscribers (push-based, like
+// prefs.Hub — the syncStatusWatch resolver relies on this instead of
+// polling Status()).
+func TestWatchStatusStreamsTransitions(t *testing.T) {
+	up := &fakeUpstream{
+		snapshot: func(context.Context, int64) (prefs.Settings, error) {
+			return prefs.Settings{}, errors.New("boom")
+		},
+	}
+	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{
+		BaseBackoff: 5 * time.Millisecond,
+		MaxBackoff:  5 * time.Millisecond,
+		Jitter:      func(d time.Duration) time.Duration { return d },
+	})
+	sub, unsub := eng.WatchStatus()
+	defer unsub()
+	go eng.Run(t.Context())
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case s := <-sub:
+			if s.State == syncpkg.StateOffline && s.LastError == "boom" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("never observed Offline on the status stream")
+		}
+	}
+}
