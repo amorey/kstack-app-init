@@ -89,6 +89,19 @@ system-configuration = "0.6"
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", features = ["tokio"] }
 
+# Windows host wake sources: PowerRegisterSuspendResumeNotification
+# (power resume, callback) + NotifyAddrChange (network change). The
+# `windows` crate is already in the tree transitively at 0.61; only the
+# specific Win32 sub-feature modules used here are enabled (additive).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_System_IO",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_NetworkManagement_IpHelper",
+] }
+
 [dev-dependencies]
 # In-process HTTP mock for testing OIDC discovery + RFC 7009 revocation
 # against a fake IdP. Pinned at 0.6 to match the `http` 1.x ecosystem

@@ -62,6 +62,8 @@ pub(crate) async fn changed(rx: &mut watch::Receiver<u64>) -> bool {
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod win;
 
 /// Spawn the per-OS wake listeners. They `waker.wake()` on power-resume /
 /// network-change. Takes the `Waker` by value (it's `Clone`) so an
@@ -81,7 +83,12 @@ fn run_os_wake_sources(waker: Waker) {
     tauri::async_runtime::spawn(linux::run(waker));
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+fn run_os_wake_sources(waker: Waker) {
+    win::spawn(waker);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn run_os_wake_sources(_waker: Waker) {}
 
 /// Drive a `/control/resync` push on every wake until `shutdown`. Generic
