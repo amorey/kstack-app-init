@@ -30,7 +30,7 @@ use openidconnect::{
     IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge, RedirectUrl, RefreshToken, Scope,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 
 use super::loopback;
 use super::tokens::{load_persisted, now, save_persisted, Persisted, Tokens};
@@ -99,6 +99,12 @@ pub struct Auth {
     /// point at a local mock IdP without monkey-patching the const.
     /// Production code uses [`Auth::new`], which pins it to [`ISSUER`].
     issuer: String,
+    /// Bumped on every token-set change (login / restore / refresh /
+    /// logout). The always-on credential pusher waits on this instead of
+    /// polling, so a new token reaches the sidecar immediately rather than
+    /// on the next tick. The value is an opaque generation counter — only
+    /// "it changed" matters.
+    creds_gen: watch::Sender<u64>,
 }
 
 impl Default for Auth {
@@ -122,6 +128,7 @@ impl Auth {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
+        let (creds_gen, _) = watch::channel(0u64);
         Self {
             tokens: RwLock::new(None),
             oidc: RwLock::new(None),
@@ -129,7 +136,22 @@ impl Auth {
             refresh_lock: Mutex::new(()),
             http,
             issuer,
+            creds_gen,
         }
+    }
+
+    /// A receiver that fires whenever the token set changes. The credential
+    /// pusher `select!`s on `changed()` to re-push immediately on
+    /// login/refresh/logout instead of polling.
+    pub fn watch_credentials(&self) -> watch::Receiver<u64> {
+        self.creds_gen.subscribe()
+    }
+
+    /// Signal a credentials change. `send_modify` notifies receivers even
+    /// when there are none registered yet (no lost wakeup once they
+    /// subscribe — they observe the changed value).
+    fn bump_creds(&self) {
+        self.creds_gen.send_modify(|g| *g = g.wrapping_add(1));
     }
 
     async fn client(&self) -> Result<OidcClient, String> {
@@ -184,6 +206,7 @@ impl Auth {
                 log::warn!("auth: refresh on startup failed: {e}");
                 *self.tokens.write().await = None;
                 let _ = save_persisted(None);
+                self.bump_creds();
                 Ok(false)
             }
         }
@@ -204,6 +227,13 @@ impl Auth {
     }
 
     pub async fn access_token(&self) -> Result<String, String> {
+        Ok(self.access_token_with_expiry().await?.0)
+    }
+
+    /// Like [`access_token`] but also returns the token's absolute expiry
+    /// (Unix seconds). The credential pusher needs the expiry to schedule
+    /// its next refresh at ~75% of the token's lifetime instead of polling.
+    pub async fn access_token_with_expiry(&self) -> Result<(String, u64), String> {
         // Snapshot just the fields we need so we don't hold the read lock
         // (or clone the whole `Tokens` with its secrets) across the await
         // for the refresh path.
@@ -212,13 +242,14 @@ impl Auth {
                 t.access_token.clone(),
                 t.is_expired(),
                 t.refresh_token.is_some(),
+                t.expires_at,
             )
         });
         match snapshot {
             None => Err("not authenticated".into()),
-            Some((at, false, _)) => Ok(at),
-            Some((_, true, false)) => Err("not authenticated".into()),
-            Some((_, true, true)) => self.refresh_now().await,
+            Some((at, false, _, exp)) => Ok((at, exp)),
+            Some((_, true, false, _)) => Err("not authenticated".into()),
+            Some((_, true, true, _)) => self.refresh_now().await,
         }
     }
 
@@ -227,7 +258,7 @@ impl Auth {
     /// token endpoint sees at most one in-flight refresh and always uses
     /// the *current* RT — Hydra rotates refresh tokens. Returns the new
     /// access token directly, avoiding a second read on `self.tokens`.
-    async fn refresh_now(&self) -> Result<String, String> {
+    async fn refresh_now(&self) -> Result<(String, u64), String> {
         let _g = self.refresh_lock.lock().await;
         // Snapshot expiry + RT under one read lock; another caller may
         // have just refreshed, in which case we hand back their AT.
@@ -236,11 +267,12 @@ impl Auth {
                 t.access_token.clone(),
                 t.is_expired(),
                 t.refresh_token.clone(),
+                t.expires_at,
             )
         });
         match snapshot {
-            Some((at, false, _)) => Ok(at),
-            Some((_, true, Some(rt))) => self.do_refresh(&rt).await,
+            Some((at, false, _, exp)) => Ok((at, exp)),
+            Some((_, true, Some(rt), _)) => self.do_refresh(&rt).await,
             _ => Err("no refresh token".into()),
         }
     }
@@ -321,6 +353,7 @@ impl Auth {
         };
         persist_session(&tokens)?;
         *self.tokens.write().await = Some(tokens);
+        self.bump_creds();
         Ok(())
     }
 
@@ -330,7 +363,7 @@ impl Auth {
     /// responses don't echo the original nonce, and signature + iss/aud/
     /// exp are what actually matter here. Otherwise we carry identity
     /// claims forward from in-memory state.
-    async fn do_refresh(&self, refresh_token: &str) -> Result<String, String> {
+    async fn do_refresh(&self, refresh_token: &str) -> Result<(String, u64), String> {
         let client = self.client().await?;
         let response = client
             .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
@@ -373,8 +406,10 @@ impl Auth {
         };
         persist_session(&new)?;
         let access_token = new.access_token.clone();
+        let expires_at = new.expires_at;
         *self.tokens.write().await = Some(new);
-        Ok(access_token)
+        self.bump_creds();
+        Ok((access_token, expires_at))
     }
 
     /// Clears local session, then revokes the OAuth tokens at the IdP per
@@ -406,6 +441,9 @@ impl Auth {
         if access_token.is_none() && refresh_token.is_none() {
             return Ok(());
         }
+        // Local state is now cleared — signal the pusher so it stops
+        // shipping a token the user just revoked.
+        self.bump_creds();
 
         // `openidconnect`'s `CoreProviderMetadata` doesn't surface
         // `revocation_endpoint` without an `AdditionalProviderMetadata`

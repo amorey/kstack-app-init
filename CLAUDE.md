@@ -37,7 +37,19 @@ urql  →  invokeFetch (src/lib/graphql/invoke-fetch.ts)
       →  AF_UNIX socket  →  Go sidecar (sidecar/server)  →  kstack cloud
 ```
 
-`invokeFetch` adapts urql's stock `fetchExchange` onto the Tauri `invoke` bridge instead of `window.fetch`. The Rust transport speaks one `Content-Length`-framed HTTP/1.1 POST per call, no keep-alive — both ends are controlled, so it's deliberately minimal. The sidecar is started by `sidecar::spawn` (`src-tauri/src/sidecar/lifecycle.rs`), announces `READY unix:<path>` on stdout for the host to parse, and shuts down on SIGINT/SIGTERM **or stdin EOF** (the host closing its end is the cross-platform "parent gone" signal). IPC is AF_UNIX everywhere — UDS on macOS/Linux, named pipe / AF_UNIX on Windows (requires Windows 10 build 17063+); see `sidecar/listen_unix.go` vs `listen_windows.go`.
+`invokeFetch` adapts urql's stock `fetchExchange` onto the Tauri `invoke` bridge instead of `window.fetch`. The Rust transport speaks one `Content-Length`-framed HTTP/1.1 POST per call, no keep-alive — both ends are controlled, so it's deliberately minimal (`transport::post_uds` is the shared request builder; `query_uds` and `push_credentials` both delegate). The sidecar is started by `sidecar::spawn` (`src-tauri/src/sidecar/lifecycle.rs`), announces `READY unix:<path>` on stdout for the host to parse, and shuts down on SIGINT/SIGTERM **or stdin EOF** (the host closing its end is the cross-platform "parent gone" signal). IPC is AF_UNIX everywhere — UDS on macOS/Linux, named pipe / AF_UNIX on Windows (requires Windows 10 build 17063+); see `sidecar/listen_unix.go` vs `listen_windows.go`.
+
+The UDS is not GraphQL-only and the host does more than bridge requests: the same socket also serves a **host-only `POST /control/credentials`** endpoint (deliberately off the GraphQL surface — the webview has no business setting process credentials; the UDS is already user-0600), and the host runs background tasks (e.g. the credential pusher, see Auth). This is the first step of the sidecar becoming an always-on stateful daemon.
+
+## Architecture: always-on sidecar (incremental — partially landed)
+
+The sidecar is being grown from a request proxy into an always-on engine that keeps cloud-synced state locally. Built bottom-up; **most of it is compiled but not yet started**, so don't assume it runs:
+
+- `sidecar/internal/syncstore` — generic `Store[T]` of a versioned `Envelope` (data + version + last-synced/-event timestamps), atomic write via `internal/atomicjson` (which `internal/prefs` also now delegates to).
+- `sidecar/internal/sync` — `SyncEngine`: supervised single-upstream reconcile (snapshot → persist → stream into `prefs.Hub`) with exponential backoff, a state machine, and a wall-clock wake detector. **Library only — nothing constructs/starts it yet** (that's a later cycle: a cloud→`Upstream` adapter + start in `main.go`).
+- `sidecar/internal/authcreds` — `Holder` for the always-on token (see Auth). Owned by `server.NewHandler`, written by `/control/credentials`; **no reader yet**.
+
+Net: until the engine is wired, this scaffolding changes no runtime behavior.
 
 ## Architecture: the GraphQL schema is single-source, dual-generated
 
@@ -51,6 +63,11 @@ A schema edit that updates only one side will compile but drift.
 ## Auth
 
 OAuth loopback flow lives in `src-tauri/src/auth/` (Rust): `auth_login`/`auth_logout`/`auth_status`/`auth_access_token` invoke handlers, tokens in the OS keychain. On startup the host attempts a silent keychain restore off the critical path and emits `RESTORE_EVENT` with the resolved status so the renderer needs no follow-up round-trip. The frontend consumes this via `src/lib/auth/auth-context.tsx`.
+
+There are **two auth paths**, don't conflate them:
+
+- **Request-scoped** (every webview op): bearer travels per-request through `graphql_query` → resolver context. Stateless; the sidecar never stores it.
+- **Always-on** (the engine has no inbound request): a background **credential pusher** (`src-tauri/src/sidecar/credentials.rs`) ships the access token to the sidecar's `/control/credentials`. It is **event-driven, not polled** — it `select!`s on `Auth::watch_credentials()` (a `watch` bumped on every token-set change: login/restore/refresh/logout) and a timer derived from `Auth::access_token_with_expiry()` (refresh at ~75% of TTL, `MIN_MARGIN` floor, `MAX_REARM` cap). Token refresh itself still happens lazily inside `access_token()` (≈once per token lifetime, single-flighted by `refresh_lock`); the pusher adds no refresh traffic. `MAX_REARM` is an interim bound on the monotonic-clock-pauses-during-suspend gap until the OS-power/network `Poke` lands; the `select!` already has the extension point. If you add new `Auth` token mutations, bump the `creds_gen` watch (`bump_creds`) or the pusher won't see them.
 
 ## Conventions
 

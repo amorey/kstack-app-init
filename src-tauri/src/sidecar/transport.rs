@@ -45,22 +45,23 @@ pub enum SidecarError {
     Status(u16),
 }
 
-/// POST `body` (typically a GraphQL JSON envelope) to /graphql over the UDS at
-/// `socket`. Returns the raw response body bytes — the caller decodes JSON.
-///
-/// `bearer` is the OAuth access token. When `Some`, attached as
-/// `Authorization: Bearer <token>` so the sidecar can forward credentials to
-/// the cloud API for any operation that needs them. When `None`, no header
-/// is sent — useful for purely-local operations (e.g. `ping`).
-pub async fn query_uds(
+/// POST `body` to `path` over the UDS at `socket`; returns the raw
+/// response body bytes. One `Content-Length`-framed HTTP/1.1 request, no
+/// keep-alive. `bearer`, when `Some`, is attached as `Authorization:
+/// Bearer <token>`. Both callers below share this so the wire framing
+/// lives in exactly one place.
+async fn post_uds(
     socket: &Path,
-    body: &[u8],
+    path: &str,
     bearer: Option<&str>,
+    body: &[u8],
 ) -> Result<Vec<u8>, SidecarError> {
     let conn = connect_uds(socket).await.map_err(SidecarError::Connect)?;
 
-    let mut req = Vec::with_capacity(160 + body.len());
-    req.extend_from_slice(b"POST /graphql HTTP/1.1\r\n");
+    let mut req = Vec::with_capacity(200 + body.len());
+    req.extend_from_slice(b"POST ");
+    req.extend_from_slice(path.as_bytes());
+    req.extend_from_slice(b" HTTP/1.1\r\n");
     req.extend_from_slice(b"Host: ");
     req.extend_from_slice(HOST.as_bytes());
     req.extend_from_slice(b"\r\n");
@@ -84,6 +85,34 @@ pub async fn query_uds(
     rx.take(MAX_RESPONSE_BYTES).read_to_end(&mut raw).await?;
 
     parse_response(raw)
+}
+
+/// POST `body` (typically a GraphQL JSON envelope) to /graphql over the UDS
+/// at `socket`. Returns the raw response body bytes — the caller decodes
+/// JSON.
+///
+/// `bearer` is the OAuth access token. When `Some`, attached as
+/// `Authorization: Bearer <token>` so the sidecar can forward credentials to
+/// the cloud API for any operation that needs them. When `None`, no header
+/// is sent — useful for purely-local operations (e.g. `ping`).
+pub async fn query_uds(
+    socket: &Path,
+    body: &[u8],
+    bearer: Option<&str>,
+) -> Result<Vec<u8>, SidecarError> {
+    post_uds(socket, "/graphql", bearer, body).await
+}
+
+/// POST the host's bearer token to the sidecar's host-only
+/// `/control/credentials` endpoint so the always-on engine can authenticate
+/// without an inbound request. Deliberately not on the GraphQL path (see
+/// `sidecar/server/server.go`); the sidecar replies 204 (empty body) and
+/// any non-2xx is surfaced as an error so the caller can retry.
+pub async fn push_credentials(socket: &Path, token: &str) -> Result<(), SidecarError> {
+    let body = serde_json::json!({ "token": token }).to_string();
+    post_uds(socket, "/control/credentials", None, body.as_bytes())
+        .await
+        .map(|_| ())
 }
 
 fn parse_response(mut raw: Vec<u8>) -> Result<Vec<u8>, SidecarError> {
@@ -203,27 +232,38 @@ mod tests {
         ListenerOptions::new().name(name).create_tokio().unwrap()
     }
 
-    /// Reads one HTTP request off conn, echoes back a fixed 200 with the
-    /// observed Authorization header as the body. Lets the test assert on
-    /// what actually crossed the wire.
-    async fn echo_auth(conn: interprocess::local_socket::tokio::Stream) {
-        let (rx, mut tx) = conn.split();
+    /// Read one full HTTP request (headers + declared Content-Length body)
+    /// off `rx`. Shared by the fake-server helpers below.
+    async fn read_http_request<R: tokio::io::AsyncReadExt + Unpin>(rx: &mut R) -> Vec<u8> {
         let mut buf = Vec::with_capacity(2048);
-        // Read until we see the header terminator, then drain the
-        // declared content-length. Good enough for a fixed-size test
-        // request.
-        let mut reader = rx;
         let mut chunk = [0u8; 1024];
         loop {
-            let n = reader.read(&mut chunk).await.unwrap();
+            let n = rx.read(&mut chunk).await.unwrap();
             if n == 0 {
                 break;
             }
             buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&buf[..p]);
+                let len: usize = header
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() >= p + 4 + len {
+                    break;
+                }
             }
         }
+        buf
+    }
+
+    /// Reads one HTTP request off conn, echoes back a fixed 200 with the
+    /// observed Authorization header as the body. Lets the test assert on
+    /// what actually crossed the wire.
+    async fn echo_auth(conn: interprocess::local_socket::tokio::Stream) {
+        let (mut rx, mut tx) = conn.split();
+        let buf = read_http_request(&mut rx).await;
         let header = String::from_utf8_lossy(&buf);
         let auth = header
             .lines()
@@ -269,5 +309,54 @@ mod tests {
         let body = query_uds(&socket, b"{}", None).await.unwrap();
         let got = String::from_utf8(body).unwrap();
         assert!(got.contains(r#""auth":"<none>""#), "got {got}");
+    }
+
+    /// Reads one HTTP request, sends back `status_line` with an empty body,
+    /// and returns the bytes it observed so the test can assert on the
+    /// request line + JSON body that crossed the wire.
+    async fn capture_request(
+        conn: interprocess::local_socket::tokio::Stream,
+        status_line: &str,
+    ) -> String {
+        let (mut rx, mut tx) = conn.split();
+        let buf = read_http_request(&mut rx).await;
+        let resp = format!("{status_line}\r\nContent-Length: 0\r\n\r\n");
+        tx.write_all(resp.as_bytes()).await.unwrap();
+        tx.flush().await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test]
+    async fn push_credentials_posts_token_and_succeeds() {
+        let socket = temp_socket();
+        let listener = bind(&socket);
+        let seen = tokio::spawn(async move {
+            let conn = listener.accept().await.unwrap();
+            capture_request(conn, "HTTP/1.1 204 No Content").await
+        });
+
+        push_credentials(&socket, "tok-xyz").await.unwrap();
+
+        let req = seen.await.unwrap();
+        assert!(
+            req.starts_with("POST /control/credentials HTTP/1.1"),
+            "request line: {req}"
+        );
+        assert!(req.contains(r#""token":"tok-xyz""#), "body: {req}");
+    }
+
+    #[tokio::test]
+    async fn push_credentials_non_2xx_is_error() {
+        let socket = temp_socket();
+        let listener = bind(&socket);
+        tokio::spawn(async move {
+            let conn = listener.accept().await.unwrap();
+            capture_request(conn, "HTTP/1.1 400 Bad Request").await;
+        });
+
+        match push_credentials(&socket, "tok").await {
+            Err(SidecarError::Status(400)) => {}
+            other => panic!("expected Status(400), got {other:?}"),
+        }
     }
 }

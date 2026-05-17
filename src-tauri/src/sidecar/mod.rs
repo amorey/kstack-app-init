@@ -9,9 +9,11 @@
 // command path against this module tree and needs to reach the
 // macro-generated `__cmd__graphql_query` helper next to the function.
 pub mod command;
+mod credentials;
 mod lifecycle;
 mod subscribe;
 mod transport;
 
+pub use credentials::spawn_credential_pusher;
 pub use lifecycle::{shutdown, spawn};
 pub use transport::{query_uds, SidecarError, READY_PREFIX};
