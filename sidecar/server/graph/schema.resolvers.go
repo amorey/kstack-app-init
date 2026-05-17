@@ -89,41 +89,15 @@ func (r *subscriptionResolver) Tick(ctx context.Context) (<-chan int, error) {
 // to wait for the next change, then live Hub deltas.
 func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *Settings, error) {
 	hubCh, unsub := r.Hub.Subscribe()
-
-	out := make(chan *Settings)
-	go func() {
-		defer close(out)
-		defer unsub()
-
-		// Emit the current snapshot first so a new subscriber doesn't
-		// wait for the next change. On a load error, skip it (fall
-		// straight to live deltas) rather than present a fabricated
-		// zero value as real state.
-		if env, err := r.Store.Load(); err == nil {
-			select {
-			case out <- toGraphSettings(env.Data):
-			case <-ctx.Done():
-				return
-			}
+	return streamWithSnapshot(ctx, hubCh, unsub, toGraphSettings, func() (*Settings, bool) {
+		// A failed load (e.g. nothing persisted yet) is non-fatal here:
+		// ok=false skips the snapshot (see streamWithSnapshot's doc).
+		env, err := r.Store.Load()
+		if err != nil {
+			return nil, false
 		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case s, ok := <-hubCh:
-				if !ok {
-					return
-				}
-				select {
-				case out <- toGraphSettings(s):
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-	return out, nil
+		return toGraphSettings(env.Data), true
+	}), nil
 }
 
 // SyncStatusWatch is the resolver for the syncStatusWatch field. Emits
@@ -131,35 +105,9 @@ func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *Setti
 // next transition), then every subsequent transition from the engine.
 func (r *subscriptionResolver) SyncStatusWatch(ctx context.Context) (<-chan *SyncStatus, error) {
 	sub, unsub := r.Sync.WatchStatus()
-
-	out := make(chan *SyncStatus)
-	go func() {
-		defer close(out)
-		defer unsub()
-
-		select {
-		case out <- toGraphSyncStatus(r.Sync.Status()):
-		case <-ctx.Done():
-			return
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case s, ok := <-sub:
-				if !ok {
-					return
-				}
-				select {
-				case out <- toGraphSyncStatus(s):
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-	return out, nil
+	return streamWithSnapshot(ctx, sub, unsub, toGraphSyncStatus, func() (*SyncStatus, bool) {
+		return toGraphSyncStatus(r.Sync.Status()), true
+	}), nil
 }
 
 // Mutation returns MutationResolver implementation.
