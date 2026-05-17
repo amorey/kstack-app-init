@@ -62,10 +62,13 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, server.NewHandler(server.Config{
+	// The credential Holder is owned by NewHandler; the always-on engine
+	// will read it once wired. Discarded until then.
+	handler, _ := server.NewHandler(server.Config{
 		CloudURL:  *cloudURL,
 		PrefsPath: *prefsPath,
-	}))
+	})
+	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, handler)
 	srv.Handler = http.MaxBytesHandler(wrapped, maxRequestBytes)
 
 	// Announce. Host parses this line to learn the socket path.

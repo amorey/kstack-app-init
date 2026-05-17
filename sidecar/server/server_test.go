@@ -22,7 +22,7 @@ import (
 // TestPingQuery is the canary: a fresh server should answer `{ ping }` with "pong".
 // If this passes, the gqlgen wiring (schema -> resolver -> handler) is intact.
 func TestPingQuery(t *testing.T) {
-	h := server.NewHandler(server.Config{})
+	h, _ := server.NewHandler(server.Config{})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
@@ -51,7 +51,8 @@ func TestPingQuery(t *testing.T) {
 // `tick`, and asserts the first two values are 1 and 2. Validates that the
 // Websocket transport is wired and the Subscription resolver streams.
 func TestTickSubscription(t *testing.T) {
-	ts := httptest.NewServer(server.NewHandler(server.Config{}))
+	h, _ := server.NewHandler(server.Config{})
+	ts := httptest.NewServer(h)
 	defer ts.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/graphql"
@@ -108,7 +109,8 @@ func TestResolverErrorIsLogged(t *testing.T) {
 	var buf bytes.Buffer
 	slog.SetDefault(logging.Init(&buf, slog.LevelInfo))
 
-	ts := httptest.NewServer(server.NewHandler(server.Config{}))
+	h, _ := server.NewHandler(server.Config{})
+	ts := httptest.NewServer(h)
 	defer ts.Close()
 
 	body := strings.NewReader(`{"query":"{ noSuchField }"}`)
@@ -144,7 +146,8 @@ func TestResolverErrorIsLogged(t *testing.T) {
 // `ResetWithoutClosingHandshake` warning on every app exit.
 func TestGracefulShutdownClosesWebsocket(t *testing.T) {
 	ts := httptest.NewUnstartedServer(http.NotFoundHandler())
-	wrapped, wait := server.AttachGracefulShutdown(ts.Config, server.NewHandler(server.Config{}))
+	h, _ := server.NewHandler(server.Config{})
+	wrapped, wait := server.AttachGracefulShutdown(ts.Config, h)
 	ts.Config.Handler = wrapped
 	ts.Start()
 	defer ts.Close()
@@ -235,4 +238,58 @@ func mustReadType(t *testing.T, c *websocket.Conn) string {
 		t.Fatalf("decode %s: %v", raw, err)
 	}
 	return head.Type
+}
+
+// The host pushes the always-on engine's bearer token to a dedicated,
+// host-only control endpoint (kept off the GraphQL surface). A valid POST
+// populates the shared authcreds.Holder; anything malformed leaves it
+// untouched so a bad push can't blank a working token.
+func TestControlCredentials(t *testing.T) {
+	h, creds := server.NewHandler(server.Config{})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	url := ts.URL + "/control/credentials"
+
+	// Valid push.
+	body := `{"token":"tok-abc","expiresAt":"2030-01-02T03:04:05Z"}`
+	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	if got := creds.Token(); got != "tok-abc" {
+		t.Fatalf("holder token = %q, want tok-abc", got)
+	}
+	if exp := creds.Get().ExpiresAt; exp.IsZero() {
+		t.Fatal("expiresAt not parsed into holder")
+	}
+
+	// Wrong method: rejected, holder unchanged.
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	got, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	got.Body.Close()
+	if got.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d, want 405", got.StatusCode)
+	}
+
+	// Malformed JSON and empty token: rejected, prior token preserved.
+	for _, bad := range []string{`{not json`, `{"token":""}`} {
+		resp, err := http.Post(url, "application/json", strings.NewReader(bad))
+		if err != nil {
+			t.Fatalf("POST %q: %v", bad, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("POST %q status = %d, want 400", bad, resp.StatusCode)
+		}
+		if got := creds.Token(); got != "tok-abc" {
+			t.Fatalf("bad push %q clobbered token: now %q", bad, got)
+		}
+	}
 }

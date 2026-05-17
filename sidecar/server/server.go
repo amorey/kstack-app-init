@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
 	"github.com/kubetail-org/kstack-app/sidecar/server/graph"
@@ -29,15 +31,47 @@ type Config struct {
 	PrefsPath string
 }
 
-// NewHandler returns an http.Handler that serves GraphQL at /graphql,
-// using a Resolver constructed from cfg.
-func NewHandler(cfg Config) http.Handler {
+// NewHandler returns an http.Handler serving GraphQL at /graphql plus the
+// host-only /control/credentials endpoint, and the credential Holder that
+// endpoint writes. NewHandler owns the Holder so there is exactly one
+// instance by construction: the always-on engine (Cycle 4) reads the same
+// one the host pushes to. Callers that don't need it discard with `_`.
+func NewHandler(cfg Config) (http.Handler, *authcreds.Holder) {
 	r := &graph.Resolver{
 		Cloud: cloud.New(cfg.CloudURL),
 		Store: prefs.NewStore(cfg.PrefsPath),
 		Hub:   prefs.NewHub(),
 	}
-	return NewHandlerWithResolver(r)
+	creds := authcreds.NewHolder()
+	mux := http.NewServeMux()
+	mux.Handle("/control/credentials", controlCredentials(creds))
+	// Everything else (GraphQL, WS) goes to the resolver handler.
+	mux.Handle("/", NewHandlerWithResolver(r))
+	return mux, creds
+}
+
+// controlCredentials accepts the host's token push. Kept off the GraphQL
+// surface deliberately: setting process credentials is host-only, and the
+// UDS is already user-restricted (0600). A malformed or empty-token push
+// is rejected and leaves the existing credentials intact, so a bad push
+// can never blank a working token.
+func controlCredentials(creds *authcreds.Holder) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Token     string    `json:"token"`
+			ExpiresAt time.Time `json:"expiresAt"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token == "" {
+			http.Error(w, "bad credentials payload", http.StatusBadRequest)
+			return
+		}
+		creds.Set(authcreds.Credentials{Token: body.Token, ExpiresAt: body.ExpiresAt})
+		w.WriteHeader(http.StatusNoContent)
+	})
 }
 
 // NewHandlerWithResolver builds a handler around a fully-constructed
