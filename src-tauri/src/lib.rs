@@ -109,11 +109,12 @@ pub fn run() {
                 if let Err(e) = restore_handle.emit(auth::RESTORE_EVENT, status) {
                     log::warn!("auth: emit restore event: {e}");
                 }
-                // Start pushing the access token to the sidecar's always-on
-                // engine now that restore has resolved — the pusher's first
-                // tick is immediate, so a restored session reaches the
-                // sidecar promptly; later ticks cover login + refresh.
-                sidecar::spawn_credential_pusher(&restore_handle);
+                // Host wake (OS power-resume / network-change): drives a
+                // /control/resync poster and feeds the credential pusher
+                // so a restored session — and recovery after suspend —
+                // reaches the sidecar promptly.
+                let wake_rx = sidecar::spawn_wake(&restore_handle);
+                sidecar::spawn_credential_pusher(&restore_handle, wake_rx);
             });
 
             // Tray icon with Show / Quit menu. The icon is reused from the

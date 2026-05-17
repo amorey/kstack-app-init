@@ -115,6 +115,15 @@ pub async fn push_credentials(socket: &Path, token: &str) -> Result<(), SidecarE
         .map(|_| ())
 }
 
+/// POST the host-only `/control/resync` trigger so the always-on engine
+/// resyncs now (host OS power-resume / network-change). Empty body; the
+/// sidecar replies 204 and any non-2xx is surfaced so the caller can retry.
+pub async fn push_resync(socket: &Path) -> Result<(), SidecarError> {
+    post_uds(socket, "/control/resync", None, &[])
+        .await
+        .map(|_| ())
+}
+
 fn parse_response(mut raw: Vec<u8>) -> Result<Vec<u8>, SidecarError> {
     let split = raw
         .windows(4)
@@ -343,6 +352,24 @@ mod tests {
             "request line: {req}"
         );
         assert!(req.contains(r#""token":"tok-xyz""#), "body: {req}");
+    }
+
+    #[tokio::test]
+    async fn push_resync_posts_and_succeeds() {
+        let socket = temp_socket();
+        let listener = bind(&socket);
+        let seen = tokio::spawn(async move {
+            let conn = listener.accept().await.unwrap();
+            capture_request(conn, "HTTP/1.1 204 No Content").await
+        });
+
+        push_resync(&socket).await.unwrap();
+
+        let req = seen.await.unwrap();
+        assert!(
+            req.starts_with("POST /control/resync HTTP/1.1"),
+            "request line: {req}"
+        );
     }
 
     #[tokio::test]

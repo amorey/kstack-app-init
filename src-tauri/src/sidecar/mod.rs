@@ -13,7 +13,9 @@ mod credentials;
 mod lifecycle;
 mod subscribe;
 mod transport;
+mod wake;
 
 pub use credentials::spawn_credential_pusher;
 pub use lifecycle::{shutdown, spawn};
 pub use transport::{query_uds, SidecarError, READY_PREFIX};
+pub use wake::{spawn_wake, Waker};

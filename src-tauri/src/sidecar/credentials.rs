@@ -11,11 +11,13 @@
 //! (login / restore / refresh / logout) — so a fresh token reaches the
 //! sidecar at once, with no fixed-interval no-op wakeups.
 //!
-//! Interim limitation: the schedule uses `tokio::time::sleep`, whose clock
-//! pauses during system suspend on some platforms — a long sleep set before
-//! sleep would fire late on resume. `MAX_REARM` caps the sleep so the gap
-//! after resume is bounded; Cycle 6's `Poke` (OS power/network) will attach
-//! to the same `select!` and make resume instant, letting the cap go.
+//! `tokio::time::sleep` is monotonic and pauses during system suspend, so
+//! a long pre-suspend sleep would fire late on resume. The loop also
+//! `select!`s on the host wake signal (`wake.rs`) so that once a real OS
+//! power/network source is attached, resume re-derives the token at once.
+//! Until such a source exists `MAX_REARM` caps the sleep so the gap after
+//! resume is always bounded; the cap is removed when a platform source
+//! lands.
 
 use std::future::Future;
 use std::time::Duration;
@@ -25,15 +27,15 @@ use tokio::sync::watch;
 
 use super::lifecycle::{wait_for_socket, SidecarState};
 use super::transport;
+use super::wake::changed;
 
 /// Refresh once 25% of the token's remaining lifetime is left (i.e. at
 /// ~75% elapsed), but never inside the last `MIN_MARGIN` — that headroom
 /// must cover the refresh round-trip plus at least one failed retry.
 const MIN_MARGIN: Duration = Duration::from_secs(60);
-/// Upper bound on a single sleep. Bounds the resume gap until Cycle 6's
-/// `Poke` lands (see module docs); also the only wakeup cadence for a
-/// very long-lived token. Not a poll — each wakeup re-derives the
-/// schedule, it doesn't blindly re-push.
+/// Caps a single sleep so the monotonic-clock-pauses-during-suspend gap
+/// is bounded even with no OS wake source wired yet. Removed once a
+/// platform wake source lands (the `wake_rx` arm then covers resume).
 const MAX_REARM: Duration = Duration::from_secs(600);
 /// Backoff after a failed push before retrying within the margin.
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
@@ -60,6 +62,7 @@ pub(crate) async fn run_credential_pusher<TF, TFut, PF, PFut, NF, S>(
     token_fn: TF,
     push_fn: PF,
     mut creds_rx: watch::Receiver<u64>,
+    mut wake_rx: watch::Receiver<u64>,
     now_unix: NF,
     shutdown: S,
 ) where
@@ -80,8 +83,11 @@ pub(crate) async fn run_credential_pusher<TF, TFut, PF, PFut, NF, S>(
                 log::debug!("credential pusher: no token: {e}");
                 tokio::select! {
                     _ = &mut shutdown => return,
-                    r = creds_rx.changed() => {
-                        if r.is_err() { return }
+                    ok = changed(&mut creds_rx) => {
+                        if !ok { return }
+                    }
+                    ok = changed(&mut wake_rx) => {
+                        if !ok { return }
                     }
                 }
             }
@@ -92,8 +98,11 @@ pub(crate) async fn run_credential_pusher<TF, TFut, PF, PFut, NF, S>(
                         tokio::select! {
                             _ = &mut shutdown => return,
                             _ = tokio::time::sleep(RETRY_BACKOFF) => {}
-                            r = creds_rx.changed() => {
-                                if r.is_err() { return }
+                            ok = changed(&mut creds_rx) => {
+                                if !ok { return }
+                            }
+                            ok = changed(&mut wake_rx) => {
+                                if !ok { return }
                             }
                         }
                         continue; // re-derive token + retry
@@ -104,8 +113,11 @@ pub(crate) async fn run_credential_pusher<TF, TFut, PF, PFut, NF, S>(
                 tokio::select! {
                     _ = &mut shutdown => return,
                     _ = tokio::time::sleep(delay) => {}
-                    r = creds_rx.changed() => {
-                        if r.is_err() { return }
+                    ok = changed(&mut creds_rx) => {
+                        if !ok { return }
+                    }
+                    ok = changed(&mut wake_rx) => {
+                        if !ok { return }
                     }
                 }
             }
@@ -127,7 +139,7 @@ async fn push_once<R: Runtime>(app: &AppHandle<R>, token: &str) -> Result<(), St
 /// Spawn the long-lived pusher task. Lives for the process; the runtime
 /// drops it on exit (the sidecar dies with the host anyway, so no explicit
 /// shutdown signal is needed).
-pub fn spawn_credential_pusher<R: Runtime>(app: &AppHandle<R>) {
+pub fn spawn_credential_pusher<R: Runtime>(app: &AppHandle<R>, wake_rx: watch::Receiver<u64>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         run_credential_pusher(
@@ -137,6 +149,7 @@ pub fn spawn_credential_pusher<R: Runtime>(app: &AppHandle<R>) {
                 async move { push_once(&app, &token).await }
             },
             crate::auth::AUTH.watch_credentials(),
+            wake_rx,
             crate::auth::tokens::now,
             std::future::pending::<()>(),
         )
@@ -153,16 +166,16 @@ mod tests {
 
     #[test]
     fn refresh_delay_is_proportional_floored_and_capped() {
-        // 25% margin dominates when remaining is large-ish but under cap:
-        // remaining=400 → margin=100 → sleep=300.
+        // 25% margin dominates: remaining=400 → margin=100 → sleep=300.
         assert_eq!(refresh_delay(0, 400), Duration::from_secs(300));
         // MIN_MARGIN floor: remaining=120 → 25%=30 < 60 → margin=60 →
         // sleep=60.
         assert_eq!(refresh_delay(0, 120), Duration::from_secs(60));
         // Past expiry → refresh immediately.
         assert_eq!(refresh_delay(500, 400), Duration::ZERO);
-        // Long-lived token → sleep clamped to MAX_REARM (bounded resume
-        // gap; not a no-op poll — each wake re-derives).
+        // Long-lived token → clamped to MAX_REARM (bounded suspend gap
+        // until an OS wake source is wired; not a poll — each wake
+        // re-derives).
         assert_eq!(refresh_delay(0, 86_400), MAX_REARM);
         // Inside the floor margin already → no sleep.
         assert_eq!(refresh_delay(0, 30), Duration::ZERO);
@@ -179,6 +192,7 @@ mod tests {
         let fail_first_b = Mutex::new(true);
         let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (creds_tx, creds_rx) = watch::channel(0u64);
+        let (_wake_tx, wake_rx) = watch::channel(0u64);
         let (shut_tx, shut_rx) = tokio::sync::oneshot::channel::<()>();
 
         let pusher = run_credential_pusher(
@@ -191,6 +205,7 @@ mod tests {
                 Ok(())
             },
             creds_rx,
+            wake_rx,
             || 0u64,
             async {
                 let _ = shut_rx.await;
@@ -217,6 +232,7 @@ mod tests {
         let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let (creds_tx, creds_rx) = watch::channel(0u64);
+        let (_wake_tx, wake_rx) = watch::channel(0u64);
         let (shut_tx, shut_rx) = tokio::sync::oneshot::channel::<()>();
 
         let pusher = run_credential_pusher(
@@ -232,6 +248,7 @@ mod tests {
                 Ok(())
             },
             creds_rx,
+            wake_rx,
             || 0u64,
             async {
                 let _ = shut_rx.await;
@@ -257,6 +274,7 @@ mod tests {
         let authed = Mutex::new(false);
         let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (creds_tx, creds_rx) = watch::channel(0u64);
+        let (_wake_tx, wake_rx) = watch::channel(0u64);
         let (shut_tx, shut_rx) = tokio::sync::oneshot::channel::<()>();
 
         let pusher = run_credential_pusher(
@@ -272,6 +290,7 @@ mod tests {
                 Ok(())
             },
             creds_rx,
+            wake_rx,
             || 0u64,
             async {
                 let _ = shut_rx.await;
@@ -282,6 +301,42 @@ mod tests {
             *authed.lock().unwrap() = true;
             creds_tx.send_modify(|v| *v += 1); // "you logged in"
             assert_eq!(push_rx.recv().await.unwrap(), "tok");
+            shut_tx.send(()).unwrap();
+        };
+
+        tokio::join!(pusher, driver);
+    }
+
+    /// A host wake (OS power-resume / network-change) re-derives the token
+    /// and re-pushes — the wake-signal path that, once an OS source is
+    /// wired, makes resume recovery instant.
+    #[tokio::test(start_paused = true)]
+    async fn wake_re_derives_and_re_pushes() {
+        let phase = Mutex::new(("a".to_string(), 10_000u64));
+        let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (_creds_tx, creds_rx) = watch::channel(0u64);
+        let (wake_tx, wake_rx) = watch::channel(0u64);
+        let (shut_tx, shut_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let pusher = run_credential_pusher(
+            || async { Ok(phase.lock().unwrap().clone()) },
+            |token| async {
+                push_tx.send(token).unwrap();
+                Ok(())
+            },
+            creds_rx,
+            wake_rx,
+            || 0u64,
+            async {
+                let _ = shut_rx.await;
+            },
+        );
+
+        let driver = async {
+            assert_eq!(push_rx.recv().await.unwrap(), "a"); // initial push, now scheduled
+            *phase.lock().unwrap() = ("b".to_string(), 10_000);
+            wake_tx.send_modify(|v| *v += 1); // OS resume → re-derive
+            assert_eq!(push_rx.recv().await.unwrap(), "b");
             shut_tx.send(()).unwrap();
         };
 
