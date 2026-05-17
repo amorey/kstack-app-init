@@ -3,6 +3,7 @@ package atomicjson_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/atomicjson"
@@ -99,6 +100,12 @@ func TestSaveCreatesDirAndTightPerms(t *testing.T) {
 	fi, err := os.Stat(p)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Windows has no POSIX permission bits; Go's Chmod is a best-effort
+	// no-op there and Stat reports 0666 for any writable file. The 0600
+	// guarantee only holds on Unix.
+	if runtime.GOOS == "windows" {
+		return
 	}
 	if perm := fi.Mode().Perm(); perm != 0o600 {
 		t.Fatalf("file perm = %o, want 600", perm)
