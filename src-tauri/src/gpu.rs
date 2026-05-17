@@ -147,8 +147,7 @@ fn egl_default_display_works(lib: *mut std::os::raw::c_void) -> bool {
             // SAFETY: `terminate` resolved non-null above; POSIX
             // guarantees a `dlsym` result is convertible to a function
             // pointer, and the ABI matches `eglTerminate`.
-            let terminate =
-                unsafe { std::mem::transmute::<*mut c_void, EglTerminate>(terminate) };
+            let terminate = unsafe { std::mem::transmute::<*mut c_void, EglTerminate>(terminate) };
             // SAFETY: `display` is the live display brought up above.
             unsafe {
                 terminate(display);
