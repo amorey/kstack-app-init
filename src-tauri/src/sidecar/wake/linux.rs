@@ -102,7 +102,7 @@ async fn proxy(
 /// cover); the other source still runs.
 async fn subscribe(
     proxy: &Option<Proxy<'static>>,
-    signal: &str,
+    signal: &'static str,
     label: &str,
     streams: &mut Vec<SignalStream<'static>>,
 ) {
