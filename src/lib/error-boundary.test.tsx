@@ -16,7 +16,7 @@ import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { AppError } from './error-bus';
+import type { AppError } from '@/lib/error-bus';
 
 const reportError = vi.fn<(e: AppError) => void>();
 vi.mock('./error-bus', () => ({ reportError: (e: AppError) => reportError(e) }));

@@ -1,14 +1,25 @@
-// urql exchange that taps the result stream and forwards any operation
-// errors (network or GraphQL) to the global error bus. Pure observer — does
-// not transform results — so it can sit anywhere between cache and network
-// without affecting cache hits or mutations.
+// Copyright 2026 The Kubetail Authors
 //
-// Built on `mapExchange` (urql 4+); replaces the older `errorExchange`.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 import { mapExchange } from 'urql';
 
 import { reportError, type AppErrorSource } from '../error-bus';
 
+// urql exchange that taps the result stream and forwards any operation
+// errors (network or GraphQL) to the global error bus. Pure observer — does
+// not transform results — so it can sit anywhere between cache and network
+// without affecting cache hits or mutations.
 export const errorReportExchange = mapExchange({
   onError(error, operation) {
     const source: AppErrorSource = operation.kind === 'subscription' ? 'subscription' : 'graphql';

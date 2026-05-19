@@ -22,7 +22,7 @@
 
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 
-import { reportError } from './error-bus';
+import { reportError } from '@/lib/error-bus';
 
 type Props = { children: ReactNode };
 type State = { error: Error | null };

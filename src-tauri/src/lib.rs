@@ -97,6 +97,12 @@ pub fn run() {
             sidecar::spawn(app)?;
             deep_link::init(app.handle())?;
 
+            // Fan auth session changes out to every window so a logout
+            // (or login) in one window updates the others. Subscribed
+            // here, before the restore task below can bump credentials,
+            // so no change is missed.
+            auth::broadcast::spawn_session_broadcaster(app.handle());
+
             // Silent restore from the keychain runs off the critical path.
             // The event payload carries the resolved `Status` so the
             // renderer doesn't need a follow-up `auth_status` round-trip.

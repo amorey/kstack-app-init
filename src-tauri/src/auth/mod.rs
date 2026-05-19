@@ -29,6 +29,7 @@
 //!   token (RS256 signature against the JWKS, plus `iss`/`aud`/`exp`/
 //!   `nonce`); the loopback handler validates `state` to prevent CSRF.
 
+pub mod broadcast;
 pub mod commands;
 pub mod flow;
 pub mod loopback;
@@ -49,6 +50,12 @@ pub const CLIENT_ID: &str = "kstack-desktop";
 /// (success *or* failure). The renderer listens to flip its idle splash
 /// off without polling.
 pub const RESTORE_EVENT: &str = "auth:restore-complete";
+
+/// Tauri event emitted on every *post-startup* auth session change
+/// (login / logout / refresh), broadcast to all windows so a logout in
+/// one window updates the others. Distinct from [`RESTORE_EVENT`], which
+/// is the one-shot cold-start signal. See [`broadcast`].
+pub const SESSION_EVENT: &str = "auth:session-changed";
 
 /// Scopes requested at every login. `offline_access` is what makes Hydra
 /// issue a refresh token; without it, sessions die when the access token

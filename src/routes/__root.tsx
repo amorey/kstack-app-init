@@ -21,8 +21,8 @@ import { ProfileMenu } from '@/components/widgets/profile-menu';
 import { ConnectionStatus } from '@/lib/connection-status';
 import { ErrorBoundary } from '@/lib/error-boundary';
 import { createGraphqlClient } from '@/lib/graphql/client';
-import { SyncHealthBadge } from '@/lib/sync/sync-health-badge';
-import { SyncStatusProvider } from '@/lib/sync/sync-status-context';
+import { SyncHealthBadge } from '@/components/widgets/sync-health-badge';
+import { SyncStatusProvider } from '@/lib/sync-status';
 
 const TanStackRouterDevtools =
   import.meta.env.VITE_ROUTER_DEVTOOLS === 'true'

@@ -54,7 +54,7 @@ type OidcClient = CoreClient<
     EndpointMaybeSet, // HasUserInfoUrl
 >;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Status {
     pub authenticated: bool,
     pub email: Option<String>,

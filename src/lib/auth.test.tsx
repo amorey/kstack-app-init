@@ -18,18 +18,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 type Status = { authenticated: boolean; email: string | null; name: string | null; sub: string | null };
 type EventCb = (e: { payload: Status }) => void;
 
+const RESTORE_EVENT = 'auth:restore-complete';
+const SESSION_EVENT = 'auth:session-changed';
+
 const invokeMock = vi.fn<(cmd: string, payload?: unknown) => Promise<unknown>>();
 
-// `listen()` resolves with an unlisten fn; we keep the registered handler
-// so tests can fire the host's restore event by hand.
+// `listen()` resolves with an unlisten fn. We keep every registered
+// handler keyed by event name so tests can fire the host's restore /
+// session-changed events by hand.
 const unlistenMock = vi.fn();
-let listenEvent = '';
-let listenHandler: EventCb | null = null;
+const listenHandlers = new Map<string, EventCb>();
 const listenMock = vi.fn(async (event: string, cb: EventCb) => {
-  listenEvent = event;
-  listenHandler = cb;
+  listenHandlers.set(event, cb);
   return unlistenMock;
 });
+
+function fireEvent(event: string, payload: Status) {
+  const cb = listenHandlers.get(event);
+  if (!cb) throw new Error(`no listener registered for ${event}`);
+  cb({ payload });
+}
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (cmd: string, payload?: unknown) => invokeMock(cmd, payload),
@@ -56,8 +64,7 @@ describe('SessionProvider / useSession', () => {
     invokeMock.mockReset();
     listenMock.mockClear();
     unlistenMock.mockClear();
-    listenEvent = '';
-    listenHandler = null;
+    listenHandlers.clear();
   });
 
   afterEach(cleanup);
@@ -81,17 +88,46 @@ describe('SessionProvider / useSession', () => {
     invokeMock.mockResolvedValue(ANON);
     renderSession();
     await waitFor(() => expect(listenMock).toHaveBeenCalled());
-    expect(listenEvent).toBe('auth:restore-complete');
+    expect(listenHandlers.has(RESTORE_EVENT)).toBe(true);
   });
 
   it('settles from the restore event when it arrives first', async () => {
     invokeMock.mockReturnValue(new Promise<never>(() => {})); // auth_status hangs
     const { result } = renderSession();
-    await waitFor(() => expect(listenHandler).not.toBeNull());
+    await waitFor(() => expect(listenHandlers.has(RESTORE_EVENT)).toBe(true));
     await act(async () => {
-      listenHandler!({ payload: AUTHED });
+      fireEvent(RESTORE_EVENT, AUTHED);
     });
     expect(result.current.loading).toBe(false);
+    expect(result.current.session).toEqual(AUTHED);
+  });
+
+  it('subscribes to the session-changed event', async () => {
+    invokeMock.mockResolvedValue(ANON);
+    renderSession();
+    await waitFor(() => expect(listenHandlers.has(SESSION_EVENT)).toBe(true));
+  });
+
+  it('syncs to anonymous when another window logs out (session-changed)', async () => {
+    invokeMock.mockResolvedValue(AUTHED); // this window is signed in
+    const { result } = renderSession();
+    await waitFor(() => expect(result.current.session).toEqual(AUTHED));
+
+    // The host broadcasts the post-logout status from the other window.
+    await act(async () => {
+      fireEvent(SESSION_EVENT, ANON);
+    });
+    expect(result.current.session).toEqual(ANON);
+  });
+
+  it('syncs to authenticated when another window logs in (session-changed)', async () => {
+    invokeMock.mockResolvedValue(ANON);
+    const { result } = renderSession();
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      fireEvent(SESSION_EVENT, AUTHED);
+    });
     expect(result.current.session).toEqual(AUTHED);
   });
 
@@ -154,12 +190,13 @@ describe('SessionProvider / useSession', () => {
     expect(result.current.session).toEqual(ANON); // unchanged on failure
   });
 
-  it('unsubscribes from the restore event on unmount', async () => {
+  it('unsubscribes from every event listener on unmount', async () => {
     invokeMock.mockResolvedValue(ANON);
     const { unmount } = renderSession();
-    await waitFor(() => expect(listenMock).toHaveBeenCalled());
+    await waitFor(() => expect(listenHandlers.has(SESSION_EVENT)).toBe(true));
     unmount();
-    expect(unlistenMock).toHaveBeenCalledTimes(1);
+    // One unlisten per registered listener (restore + session-changed).
+    expect(unlistenMock).toHaveBeenCalledTimes(2);
   });
 
   it('throws when useSession is used outside a provider', () => {

@@ -37,6 +37,12 @@ const ANON_SESSION: Session = { authenticated: false, email: null, name: null, s
 // fresh session, so the renderer skips a follow-up `auth_status` call.
 const RESTORE_EVENT = 'auth:restore-complete';
 
+// Mirror of `auth::SESSION_EVENT` in src-tauri. The host broadcasts the
+// fresh session on every post-startup auth change (login / logout /
+// refresh) to *all* windows, so a logout in one window updates the
+// others instead of leaving them on a stale authenticated UI.
+const SESSION_EVENT = 'auth:session-changed';
+
 type SessionContextValue = {
   session: Session;
   loading: boolean;
@@ -56,7 +62,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
-    let unlisten: (() => void) | null = null;
+    const unlisteners: (() => void)[] = [];
 
     const settle = (s: Session) => {
       if (cancelled) return;
@@ -66,15 +72,20 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 
     // Tauri events are not buffered, so an event that fires between mount
     // and `listen()` resolving would be lost. Order matters: register the
-    // subscription first, *then* fetch — guarantees we either see the
-    // event or read the post-restore session directly.
+    // subscriptions first, *then* fetch — guarantees we either see the
+    // restore event or read the post-restore session directly. The
+    // session-changed listener stays mounted for the provider's whole
+    // life: unlike the one-shot restore, auth changes keep arriving.
     (async () => {
       try {
-        unlisten = await listen<Session>(RESTORE_EVENT, (e) => settle(e.payload));
+        const offRestore = await listen<Session>(RESTORE_EVENT, (e) => settle(e.payload));
+        const offSession = await listen<Session>(SESSION_EVENT, (e) => settle(e.payload));
         if (cancelled) {
-          unlisten();
+          offRestore();
+          offSession();
           return;
         }
+        unlisteners.push(offRestore, offSession);
         const s = await invoke<Session>('auth_status');
         settle(s);
       } catch (e) {
@@ -85,7 +96,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       cancelled = true;
-      if (unlisten) unlisten();
+      unlisteners.forEach((off) => off());
     };
   }, []);
 

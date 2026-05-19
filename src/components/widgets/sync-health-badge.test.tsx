@@ -1,3 +1,17 @@
+// Copyright 2026 The Kubetail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import { render, screen, act } from '@testing-library/react';
 import { Provider as UrqlProvider } from 'urql';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -10,7 +24,7 @@ const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
-const { SyncStatusProvider, useSyncStatus, formatSyncFreshness } = await import('./sync-status-context');
+const { SyncStatusProvider } = await import('@/lib/sync-status');
 const { SyncHealthBadge } = await import('./sync-health-badge');
 
 // Helpers -------------------------------------------------------------
@@ -35,40 +49,17 @@ function pushStatus(s: {
   );
 }
 
-function renderWithProvider(ui: React.ReactNode) {
+function renderBadge() {
   return render(
     <UrqlProvider value={createGraphqlClient()}>
-      <SyncStatusProvider>{ui}</SyncStatusProvider>
+      <SyncStatusProvider>
+        <SyncHealthBadge />
+      </SyncStatusProvider>
     </UrqlProvider>,
   );
 }
 
-describe('formatSyncFreshness', () => {
-  const base = 1_000_000_000_000;
-
-  it('reports never-synced for 0', () => {
-    expect(formatSyncFreshness(0, base)).toMatch(/never synced/i);
-  });
-
-  it('buckets recent syncs into a relative label', () => {
-    expect(formatSyncFreshness(base - 2_000, base)).toMatch(/just now/i);
-    expect(formatSyncFreshness(base - 42_000, base)).toMatch(/42s/);
-    expect(formatSyncFreshness(base - 5 * 60_000, base)).toMatch(/5m/);
-    expect(formatSyncFreshness(base - 3 * 3_600_000, base)).toMatch(/3h/);
-  });
-
-  it('handles the exact bucket boundaries (strict <)', () => {
-    expect(formatSyncFreshness(base - 5_000, base)).toMatch(/5s/); // not "just now"
-    expect(formatSyncFreshness(base - 60_000, base)).toMatch(/1m/); // not "60s"
-    expect(formatSyncFreshness(base - 3_600_000, base)).toMatch(/1h/); // not "60m"
-  });
-
-  it('clamps a future lastSyncedAt to "just now" (clock skew)', () => {
-    expect(formatSyncFreshness(base + 10_000, base)).toMatch(/just now/i);
-  });
-});
-
-describe('SyncStatusProvider / SyncHealthBadge', () => {
+describe('SyncHealthBadge', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     channels.length = 0;
@@ -83,22 +74,14 @@ describe('SyncStatusProvider / SyncHealthBadge', () => {
     });
   });
 
-  it('useSyncStatus throws outside the provider', () => {
-    function Bare() {
-      useSyncStatus();
-      return null;
-    }
-    expect(() => render(<Bare />)).toThrow(/SyncStatusProvider/);
-  });
-
   it('renders a muted connecting state before the first push', async () => {
-    renderWithProvider(<SyncHealthBadge />);
+    renderBadge();
     await flush();
     expect(screen.getByRole('status')).toHaveTextContent(/connecting/i);
   });
 
   it('subscribes to syncStatusWatch and reflects the engine state', async () => {
-    renderWithProvider(<SyncHealthBadge />);
+    renderBadge();
     await flush();
 
     expect(invokeMock).toHaveBeenCalledWith(
@@ -113,7 +96,7 @@ describe('SyncStatusProvider / SyncHealthBadge', () => {
   });
 
   it('updates the badge when a new status is pushed (wake/backoff)', async () => {
-    renderWithProvider(<SyncHealthBadge />);
+    renderBadge();
     await flush();
 
     await act(async () => {
@@ -128,7 +111,7 @@ describe('SyncStatusProvider / SyncHealthBadge', () => {
   });
 
   it('surfaces the last error when offline', async () => {
-    renderWithProvider(<SyncHealthBadge />);
+    renderBadge();
     await flush();
 
     await act(async () => {
@@ -137,5 +120,15 @@ describe('SyncStatusProvider / SyncHealthBadge', () => {
     const badge = screen.getByRole('status');
     expect(badge).toHaveTextContent(/offline/i);
     expect(badge).toHaveTextContent(/no credentials/);
+  });
+
+  it('shows a bare Offline label when no error is attached', async () => {
+    renderBadge();
+    await flush();
+
+    await act(async () => {
+      pushStatus({ state: 'OFFLINE' });
+    });
+    expect(screen.getByRole('status')).toHaveTextContent(/^offline$/i);
   });
 });
