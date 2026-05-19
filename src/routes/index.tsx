@@ -1,3 +1,17 @@
+// Copyright 2026 The Kubetail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import { useState } from 'react';
 import { createRoute } from '@tanstack/react-router';
 import { Cloud, Rocket, Sparkles } from 'lucide-react';
@@ -11,7 +25,7 @@ import { Separator } from '@kubetail/ui/elements/separator';
 import { Switch } from '@kubetail/ui/elements/switch';
 
 import { graphql } from '@/gql';
-import { useAuth } from '@/lib/auth/auth-context';
+import { useSession } from '@/lib/auth';
 import { Route as rootRoute } from '@/routes/__root';
 
 import '@/index.css';
@@ -126,16 +140,16 @@ function Main() {
   );
 }
 
-// Gating the cloud-sync ops on auth status avoids racing the host's
+// Gating the cloud-sync ops on the session avoids racing the host's
 // silent-restore on startup (without a bearer the cloud returns
 // `unauthorized`), and unmounts the subscription on logout so the cloud
 // SSE stream tears down cleanly.
 function CloudSyncGate() {
-  const { status, loading } = useAuth();
+  const { session, loading } = useSession();
   if (loading) {
     return <p className="text-xs text-muted-foreground">Checking sign-in…</p>;
   }
-  if (!status.authenticated) {
+  if (!session.authenticated) {
     return <p className="text-xs text-muted-foreground">Sign in to sync preferences.</p>;
   }
   return <CloudSyncDemo />;

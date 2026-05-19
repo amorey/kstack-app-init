@@ -1,9 +1,23 @@
+// Copyright 2026 The Kubetail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import { lazy, Suspense } from 'react';
 import { createRootRoute, Outlet } from '@tanstack/react-router';
 import { Provider as UrqlProvider } from 'urql';
 
-import { AuthProvider } from '@/lib/auth/auth-context';
-import { ProfileMenu } from '@/lib/auth/profile-menu';
+import { SessionProvider } from '@/lib/auth';
+import { ProfileMenu } from '@/components/widgets/profile-menu';
 import { ConnectionStatus } from '@/lib/connection-status';
 import { ErrorBoundary } from '@/lib/error-boundary';
 import { createGraphqlClient } from '@/lib/graphql/client';
@@ -40,10 +54,8 @@ export function NotFound() {
 function RootComponent() {
   return (
     <ErrorBoundary>
-      <AuthProvider>
+      <SessionProvider>
         <UrqlProvider value={gqlClient}>
-          {/* Consumes a urql subscription, so it must be a descendant of
-              the urql client. */}
           <SyncStatusProvider>
             <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
               <SyncHealthBadge />
@@ -56,7 +68,7 @@ function RootComponent() {
             </Suspense>
           </SyncStatusProvider>
         </UrqlProvider>
-      </AuthProvider>
+      </SessionProvider>
     </ErrorBoundary>
   );
 }
