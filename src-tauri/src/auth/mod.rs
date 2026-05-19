@@ -46,15 +46,18 @@ pub const ISSUER: &str = "https://oauth.kstack.sh/";
 /// Public client ID registered via `hydra create oauth2-client`.
 pub const CLIENT_ID: &str = "kstack-desktop";
 
-/// Tauri event emitted when the silent-restore path on startup finishes
-/// (success *or* failure). The renderer listens to flip its idle splash
-/// off without polling.
-pub const RESTORE_EVENT: &str = "auth:restore-complete";
+/// Tauri event emitted once when the silent keychain session-restore on
+/// startup resolves — *success or failure* (a failed/absent restore still
+/// fires it with an anonymous `Status`). One-shot cold-start signal, paired
+/// with [`SESSION_EVENT`]; the renderer listens to flip its idle splash off
+/// without polling. Named for *session resolution*, not OS power/network
+/// "restore" (those drive the wake path, not this event).
+pub const SESSION_RESOLVED_EVENT: &str = "auth:session-resolved";
 
 /// Tauri event emitted on every *post-startup* auth session change
 /// (login / logout / refresh), broadcast to all windows so a logout in
-/// one window updates the others. Distinct from [`RESTORE_EVENT`], which
-/// is the one-shot cold-start signal. See [`broadcast`].
+/// one window updates the others. Distinct from [`SESSION_RESOLVED_EVENT`],
+/// which is the one-shot cold-start signal. See [`broadcast`].
 pub const SESSION_EVENT: &str = "auth:session-changed";
 
 /// Scopes requested at every login. `offline_access` is what makes Hydra

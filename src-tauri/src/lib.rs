@@ -112,7 +112,7 @@ pub fn run() {
                     log::warn!("auth: restore failed: {e}");
                 }
                 let status = auth::AUTH.status().await;
-                if let Err(e) = restore_handle.emit(auth::RESTORE_EVENT, status) {
+                if let Err(e) = restore_handle.emit(auth::SESSION_RESOLVED_EVENT, status) {
                     log::warn!("auth: emit restore event: {e}");
                 }
                 // Host wake (OS power-resume / network-change): drives a

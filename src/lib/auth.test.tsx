@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 type Status = { authenticated: boolean; email: string | null; name: string | null; sub: string | null };
 type EventCb = (e: { payload: Status }) => void;
 
-const RESTORE_EVENT = 'auth:restore-complete';
+const SESSION_RESOLVED_EVENT = 'auth:session-resolved';
 const SESSION_EVENT = 'auth:session-changed';
 
 const invokeMock = vi.fn<(cmd: string, payload?: unknown) => Promise<unknown>>();
@@ -88,15 +88,15 @@ describe('SessionProvider / useSession', () => {
     invokeMock.mockResolvedValue(ANON);
     renderSession();
     await waitFor(() => expect(listenMock).toHaveBeenCalled());
-    expect(listenHandlers.has(RESTORE_EVENT)).toBe(true);
+    expect(listenHandlers.has(SESSION_RESOLVED_EVENT)).toBe(true);
   });
 
   it('settles from the restore event when it arrives first', async () => {
     invokeMock.mockReturnValue(new Promise<never>(() => {})); // auth_status hangs
     const { result } = renderSession();
-    await waitFor(() => expect(listenHandlers.has(RESTORE_EVENT)).toBe(true));
+    await waitFor(() => expect(listenHandlers.has(SESSION_RESOLVED_EVENT)).toBe(true));
     await act(async () => {
-      fireEvent(RESTORE_EVENT, AUTHED);
+      fireEvent(SESSION_RESOLVED_EVENT, AUTHED);
     });
     expect(result.current.loading).toBe(false);
     expect(result.current.session).toEqual(AUTHED);

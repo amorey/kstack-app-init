@@ -1,6 +1,7 @@
 //! Broadcasts post-startup auth session changes to every webview window.
 //!
-//! [`RESTORE_EVENT`](super::RESTORE_EVENT) is the one-shot startup signal.
+//! [`SESSION_RESOLVED_EVENT`](super::SESSION_RESOLVED_EVENT) is the one-shot
+//! startup signal.
 //! After that, a login / logout / refresh in *any* window (or the
 //! background refresh) must reach *every* window — otherwise a logout in
 //! one window leaves the others rendering a stale authenticated UI. The
@@ -23,7 +24,7 @@ use super::SESSION_EVENT;
 /// Emit a fresh [`Status`] on every credentials change until `shutdown`
 /// resolves. Generic over the status source / sink / shutdown so it is
 /// unit-testable without Tauri or real time. The initial watch value is
-/// *not* emitted (cold start is `RESTORE_EVENT`'s job) — only post-
+/// *not* emitted (cold start is `SESSION_RESOLVED_EVENT`'s job) — only post-
 /// subscribe changes are.
 pub(crate) async fn run_session_broadcaster<SF, SFut, EF, S>(
     status_fn: SF,
@@ -88,7 +89,7 @@ mod tests {
     }
 
     /// Each credentials change emits the *current* status; the initial
-    /// watch value is not emitted (that's `RESTORE_EVENT`'s job). Channel-
+    /// watch value is not emitted (that's `SESSION_RESOLVED_EVENT`'s job). Channel-
     /// driven so it's deterministic, mirroring the credential pusher tests.
     #[tokio::test(start_paused = true)]
     async fn emits_current_status_on_each_change() {

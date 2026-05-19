@@ -32,10 +32,11 @@ export type Session = {
 
 const ANON_SESSION: Session = { authenticated: false, email: null, name: null, sub: null };
 
-// Mirror of `auth::RESTORE_EVENT` in src-tauri. The host emits exactly
-// once at startup after `try_restore` resolves; the payload is the
-// fresh session, so the renderer skips a follow-up `auth_status` call.
-const RESTORE_EVENT = 'auth:restore-complete';
+// Mirror of `auth::SESSION_RESOLVED_EVENT` in src-tauri. The host emits
+// exactly once at startup after `try_restore` resolves (success *or*
+// failure); the payload is the fresh session, so the renderer skips a
+// follow-up `auth_status` call. Not the OS power/network wake path.
+const SESSION_RESOLVED_EVENT = 'auth:session-resolved';
 
 // Mirror of `auth::SESSION_EVENT` in src-tauri. The host broadcasts the
 // fresh session on every post-startup auth change (login / logout /
@@ -78,7 +79,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     // life: unlike the one-shot restore, auth changes keep arriving.
     (async () => {
       try {
-        const offRestore = await listen<Session>(RESTORE_EVENT, (e) => settle(e.payload));
+        const offRestore = await listen<Session>(SESSION_RESOLVED_EVENT, (e) => settle(e.payload));
         const offSession = await listen<Session>(SESSION_EVENT, (e) => settle(e.payload));
         if (cancelled) {
           offRestore();
