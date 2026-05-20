@@ -1,3 +1,17 @@
+// Copyright 2026 The Kubetail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Token storage. The refresh token is the only durable secret — it lives
 //! in the OS keychain in release builds, or in a 0600 file under the app
 //! data dir in debug builds.
@@ -13,7 +27,7 @@
 //! (Hydra's default `ttl.access_token` is 1h) and persisting them only
 //! widens the blast radius of a leak.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,19 +39,33 @@ pub struct Tokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,
-    /// Absolute Unix timestamp; computed once at issuance.
+    /// Absolute Unix timestamps; both computed once at issuance.
+    pub issued_at: u64,
     pub expires_at: u64,
     pub email: Option<String>,
     pub name: Option<String>,
     pub sub: Option<String>,
 }
 
+/// Minimum headroom before `expires_at` to treat the token as expired —
+/// covers the refresh round-trip plus a retry for short-lived tokens
+/// where 25% of lifetime would be too small.
+const REFRESH_FLOOR: Duration = Duration::from_secs(60);
+
 impl Tokens {
-    /// Treat the token as expired 30s before it actually is, so a request
-    /// that picks up the token on its way out won't fail mid-flight when
-    /// the network is slow.
+    /// Refresh once 75% of the token's lifetime has elapsed (i.e. 25%
+    /// remaining), with a floor of [`REFRESH_FLOOR`] so very short-lived
+    /// tokens still get a sane margin. Matches the credential pusher's
+    /// scheduling so the request path and the background pusher agree on
+    /// "stale enough to refresh".
     pub fn is_expired(&self) -> bool {
-        now() + 30 >= self.expires_at
+        self.is_expired_at(now())
+    }
+
+    fn is_expired_at(&self, now: u64) -> bool {
+        let lifetime = self.expires_at.saturating_sub(self.issued_at);
+        let margin = (lifetime / 4).max(REFRESH_FLOOR.as_secs());
+        now.saturating_add(margin) >= self.expires_at
     }
 }
 
@@ -286,6 +314,54 @@ mod backend {
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("read: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn tk(issued_at: u64, expires_at: u64) -> Tokens {
+        Tokens {
+            access_token: String::new(),
+            refresh_token: None,
+            id_token: None,
+            issued_at,
+            expires_at,
+            email: None,
+            name: None,
+            sub: None,
+        }
+    }
+
+    /// With a 1h token, refresh should trip at exactly 75% elapsed
+    /// (i.e. 25% = 900s remaining).
+    #[test]
+    fn proportional_margin_at_75_percent_of_lifetime() {
+        let t = tk(1_000, 4_600); // lifetime = 3600
+        assert!(!t.is_expired_at(1_000), "just issued");
+        assert!(!t.is_expired_at(3_699), "74.97% elapsed, still fresh");
+        assert!(t.is_expired_at(3_700), "75% elapsed, refresh now");
+        assert!(t.is_expired_at(4_600), "at expiry");
+        assert!(t.is_expired_at(9_999), "past expiry");
+    }
+
+    /// Short-lived tokens hit the floor instead of 25%. lifetime=120 →
+    /// 25%=30s, but the 60s floor wins, so refresh at remaining ≤ 60s.
+    #[test]
+    fn floor_dominates_for_short_lifetimes() {
+        let t = tk(1_000, 1_120); // lifetime = 120
+        assert!(!t.is_expired_at(1_059), "61s remaining > 60s floor");
+        assert!(t.is_expired_at(1_060), "60s remaining hits floor");
+    }
+
+    /// Degenerate token (issued_at == expires_at, lifetime = 0): floor
+    /// applies, and any non-future `now` is expired.
+    #[test]
+    fn zero_lifetime_is_always_expired() {
+        let t = tk(0, 0);
+        assert!(t.is_expired_at(0));
     }
 }
 

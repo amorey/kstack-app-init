@@ -1,3 +1,17 @@
+// Copyright 2026 The Kubetail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Login state machine. Wraps `openidconnect::CoreClient`, which owns the
 //! protocol — discovery, PKCE, the token endpoint, and ID token signature
 //! + claim verification. This module's job is the desktop-shaped glue:
@@ -193,6 +207,7 @@ impl Auth {
                 access_token: String::new(),
                 refresh_token: Some(persisted.refresh_token.clone()),
                 id_token: Some(idt.to_string()),
+                issued_at: 0,
                 expires_at: 0,
                 email,
                 name,
@@ -339,13 +354,15 @@ impl Auth {
             .claims(&client.id_token_verifier(), nonce)
             .map_err(|e| format!("id_token verify: {e}"))?;
 
-        let expires_at = now() + response.expires_in().map(|d| d.as_secs()).unwrap_or(3600);
+        let issued_at = now();
+        let expires_at = issued_at + response.expires_in().map(|d| d.as_secs()).unwrap_or(3600);
 
         let (email, name, sub) = identity_from_claims(claims);
         let tokens = Tokens {
             access_token: response.access_token().secret().clone(),
             refresh_token: response.refresh_token().map(|r| r.secret().clone()),
             id_token: Some(id_token.to_string()),
+            issued_at,
             expires_at,
             email,
             name,
@@ -372,7 +389,8 @@ impl Auth {
             .await
             .map_err(|e| format!("refresh: {e}"))?;
 
-        let expires_at = now() + response.expires_in().map(|d| d.as_secs()).unwrap_or(3600);
+        let issued_at = now();
+        let expires_at = issued_at + response.expires_in().map(|d| d.as_secs()).unwrap_or(3600);
 
         let (id_token, email, name, sub) = match response.extra_fields().id_token() {
             Some(fresh) => {
@@ -399,6 +417,7 @@ impl Auth {
             access_token: response.access_token().secret().clone(),
             refresh_token: response.refresh_token().map(|r| r.secret().clone()),
             id_token,
+            issued_at,
             expires_at,
             email,
             name,

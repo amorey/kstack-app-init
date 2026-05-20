@@ -46,6 +46,7 @@ fn make_tokens(access: &str, refresh: Option<&str>) -> Tokens {
         access_token: access.into(),
         refresh_token: refresh.map(String::from),
         id_token: None,
+        issued_at: 0,
         // Far future so nothing about "is expired" affects the test.
         expires_at: u64::MAX,
         email: None,
