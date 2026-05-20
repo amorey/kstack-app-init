@@ -28,6 +28,7 @@ pub mod deep_link;
 pub mod sidecar;
 pub mod wake;
 pub mod windows;
+pub mod wiring;
 
 /// Single env var controls verbosity for both the Rust host and the Go
 /// sidecar (mirrored in `sidecar/internal/logging.ParseLevel`).
@@ -105,11 +106,12 @@ pub fn run() {
             sidecar::spawn(app)?;
             deep_link::init(app.handle())?;
 
-            // Fan auth session changes out to every window so a logout
-            // (or login) in one window updates the others. Subscribed
-            // here, before the restore task below can bump credentials,
-            // so no change is missed.
-            auth::broadcast::spawn_session_broadcaster(app.handle());
+            // Pre-restore tasks (today: session broadcaster) must be live
+            // before the restore below can bump credentials, so no change
+            // is missed. Post-restore tasks (wake + its subscribers +
+            // credential pusher) run after the restore completes. See
+            // `wiring` for the event-flow table.
+            wiring::spawn_pre_restore(app.handle());
 
             // Silent restore from the keychain runs off the critical path.
             // The event payload carries the resolved `Status` so the
@@ -123,16 +125,7 @@ pub fn run() {
                 if let Err(e) = restore_handle.emit(auth::SESSION_RESOLVED_EVENT, status) {
                     log::warn!("auth: emit restore event: {e}");
                 }
-                // Wire host wake (OS power-resume / network-change) to
-                // its subscribers. `Waker` owns the watch sender; if it
-                // dropped at end of this setup task, every subscriber's
-                // `changed()` would error — `manage` keeps it alive for
-                // the process.
-                let waker = wake::spawn_wake();
-                auth::refresher::spawn_auth_refresher(waker.subscribe());
-                sidecar::spawn_wake_poster(&restore_handle, waker.subscribe());
-                restore_handle.manage(waker);
-                sidecar::spawn_credential_pusher(&restore_handle);
+                wiring::spawn_post_restore(&restore_handle);
             });
 
             // Tray icon with Show / Quit menu. The icon is reused from the

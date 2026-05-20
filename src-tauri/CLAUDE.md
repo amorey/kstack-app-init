@@ -12,11 +12,20 @@ bridged to the sidecar over AF_UNIX (see the request path in the root
   load-bearing**: `tauri_plugin_single_instance` must stay first (a second
   launch exits inside its init and forwards into the original process before
   any other plugin binds shared resources). `setup` spawns the sidecar, inits
-  deep links, starts the auth session broadcaster, runs the off-critical-path
-  keychain restore, then spawns the wake signal + credential pusher. Closing
-  the last window does **not** exit (`ExitRequested` with no code →
-  `prevent_exit`); exit is the tray "Quit" / Cmd+Q calling `app.exit`.
-  `host_log_level` mirrors the sidecar's `KSTACK_LOG_LEVEL` mapping — keep in sync.
+  deep links, then delegates background task spawning to
+  [`wiring`](#wiring--single-source-of-truth-for-the-event-topology): a
+  pre-restore phase, the off-critical-path keychain restore itself, and a
+  post-restore phase. Closing the last window does **not** exit
+  (`ExitRequested` with no code → `prevent_exit`); exit is the tray "Quit" /
+  Cmd+Q calling `app.exit`. `host_log_level` mirrors the sidecar's
+  `KSTACK_LOG_LEVEL` mapping — keep in sync.
+- **`wiring.rs`** — single source of truth for the event topology. The
+  doc-comment at the top is a flow table (trigger → producer → channel →
+  consumer → effect) covering creds fan-out, wake fan-out, and sidecar
+  readiness. Exposes `spawn_pre_restore` (session broadcaster — must be
+  live before restore mutates auth) and `spawn_post_restore` (wake +
+  refresher + wake_poster + credential pusher). New long-lived tasks
+  belong here, not in `lib.rs`.
 
 ## `auth/` — OAuth 2.1 / OIDC (public client, PKCE, no secret)
 

@@ -45,6 +45,13 @@ impl Waker {
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.0.subscribe()
     }
+
+    /// Number of live `Receiver`s subscribed to this waker. Used by
+    /// [`wiring`](crate::wiring) tests to assert the wake fan-out
+    /// (refresher + wake_poster) is wired as expected.
+    pub fn receiver_count(&self) -> usize {
+        self.0.receiver_count()
+    }
 }
 
 impl Default for Waker {
@@ -108,6 +115,20 @@ pub fn spawn_wake() -> Waker {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiver_count_reflects_live_subscribers() {
+        let w = Waker::new();
+        assert_eq!(w.receiver_count(), 0);
+        let rx1 = w.subscribe();
+        assert_eq!(w.receiver_count(), 1);
+        let rx2 = w.subscribe();
+        assert_eq!(w.receiver_count(), 2);
+        drop(rx1);
+        assert_eq!(w.receiver_count(), 1);
+        drop(rx2);
+        assert_eq!(w.receiver_count(), 0);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn wake_is_observed_by_subscribers_and_coalesces() {
