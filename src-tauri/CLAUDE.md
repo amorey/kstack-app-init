@@ -70,10 +70,6 @@ identically in dev/prod, signed/unsigned, every OS.
 - **`deep_link.rs`** — `kstack://` scheme registration (declared in
   `tauri.conf.json`). **Not** used for OAuth; kept for future "open to a
   cluster from a URL" features. Three delivery paths converge on `on_open_url`.
-- **`gpu.rs`** — Linux-only WebKitGTK EGL probe; sets
-  `WEBKIT_DISABLE_COMPOSITING_MODE=1` only when the probe fails (avoids a hard
-  abort on headless/odd setups). No-op on macOS/Windows. Must run before the
-  window is built (top of `run`).
 - **`windows.rs`** — multi-window spawning, the app menu, and the
   close-to-tray policy (last visible window hides, process stays alive so the
   sidecar/engine keep running).
