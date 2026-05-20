@@ -234,7 +234,7 @@ fn force_kill(pid: u32) {
     // SAFETY: PID came from a CommandChild we just dropped; reuse in the
     // sub-second window between drop and probe is not a real risk on the
     // platforms we ship to. Handle is closed on every path.
-    if let Ok(handle) = (unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }) {
+    if let Ok(handle) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
         let _ = unsafe { TerminateProcess(handle, 1) };
         let _ = unsafe { CloseHandle(handle) };
     }
