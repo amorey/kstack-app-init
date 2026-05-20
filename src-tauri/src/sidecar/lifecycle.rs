@@ -1,3 +1,17 @@
+// Copyright 2026 The Kubetail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Sidecar process lifecycle: spawn the externalBin, watch its stdout
 //! for the READY line, gracefully shut it down on app exit.
 
@@ -184,10 +198,22 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn process_alive(_pid: u32) -> bool {
-    // No probe wired up on Windows yet; treat as dead so we skip the
-    // SIGKILL fallback. The stdin-EOF graceful path still runs.
-    false
+fn process_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: OpenProcess returns either a valid handle or an error; we close
+    // it on every path. GetExitCodeProcess writes to a stack u32 we own.
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return false;
+    };
+    let mut code: u32 = 0;
+    let alive =
+        unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok() && code == STILL_ACTIVE.0 as u32;
+    let _ = unsafe { CloseHandle(handle) };
+    alive
 }
 
 #[cfg(unix)]
@@ -201,7 +227,18 @@ fn force_kill(pid: u32) {
 }
 
 #[cfg(windows)]
-fn force_kill(_pid: u32) {}
+fn force_kill(pid: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    // SAFETY: PID came from a CommandChild we just dropped; reuse in the
+    // sub-second window between drop and probe is not a real risk on the
+    // platforms we ship to. Handle is closed on every path.
+    if let Ok(handle) = (unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }) {
+        let _ = unsafe { TerminateProcess(handle, 1) };
+        let _ = unsafe { CloseHandle(handle) };
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -340,5 +377,77 @@ mod tests {
         tokio::time::advance(READY_TIMEOUT + Duration::from_secs(1)).await;
         let err = task.await.unwrap().unwrap_err();
         assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_alive_returns_false_for_unused_pid() {
+        // i32::MAX is above the default pid_max on every Unix we ship to,
+        // so kill(sig=0) returns ESRCH and the probe reports dead.
+        assert!(!process_alive(i32::MAX as u32));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_alive_tracks_real_child_and_force_kill_terminates_it() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        assert!(
+            process_alive(pid),
+            "child should be alive immediately after spawn"
+        );
+
+        force_kill(pid);
+        let _ = child.wait();
+
+        assert!(
+            !process_alive(pid),
+            "child should report dead after force_kill + wait"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_alive_returns_false_for_unused_pid() {
+        // PID 0 is the System Idle Process on Windows; OpenProcess refuses
+        // it with ERROR_INVALID_PARAMETER, so the probe must report dead
+        // rather than panicking or returning true.
+        assert!(!process_alive(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_alive_tracks_real_child_and_force_kill_terminates_it() {
+        // `ping -n 30 127.0.0.1` runs ~29s — long enough that the assertions
+        // below are not racing the child's natural exit.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 > nul"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id();
+
+        assert!(
+            process_alive(pid),
+            "child should be alive immediately after spawn"
+        );
+
+        force_kill(pid);
+        let _ = child.wait();
+
+        // After wait() the kernel object is signaled; OpenProcess may still
+        // succeed briefly on a zombie, but GetExitCodeProcess will report a
+        // non-STILL_ACTIVE code.
+        assert!(
+            !process_alive(pid),
+            "child should report dead after force_kill + wait"
+        );
     }
 }
