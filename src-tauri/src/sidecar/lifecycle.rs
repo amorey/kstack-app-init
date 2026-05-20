@@ -11,7 +11,7 @@ use tauri_plugin_shell::ShellExt;
 use tokio::sync::watch;
 
 use super::transport::READY_PREFIX;
-use crate::{KSTACK_CLOUD_URL_ENV, KSTACK_LOG_ENV};
+use crate::{KSTACK_CLOUD_URL_ENV, KSTACK_LOG_LEVEL_ENV};
 
 /// Sidecar normally prints READY within ~50ms.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,7 +24,7 @@ const GRACE_POLL: Duration = Duration::from_millis(10);
 
 fn sidecar_env_overrides<F: Fn(&str) -> Option<String>>(getenv: F) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for key in [KSTACK_LOG_ENV, KSTACK_CLOUD_URL_ENV] {
+    for key in [KSTACK_LOG_LEVEL_ENV, KSTACK_CLOUD_URL_ENV] {
         if let Some(v) = getenv(key) {
             out.push((key.to_string(), v));
         }
@@ -231,10 +231,13 @@ mod tests {
     #[test]
     fn sidecar_env_overrides_passes_through_kstack_log() {
         let env = sidecar_env_overrides(|k| match k {
-            "KSTACK_LOG" => Some("debug".into()),
+            "KSTACK_LOG_LEVEL" => Some("debug".into()),
             _ => None,
         });
-        assert_eq!(env, vec![("KSTACK_LOG".to_string(), "debug".to_string())]);
+        assert_eq!(
+            env,
+            vec![("KSTACK_LOG_LEVEL".to_string(), "debug".to_string())]
+        );
     }
 
     #[test]

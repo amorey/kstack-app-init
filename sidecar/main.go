@@ -35,7 +35,7 @@ import (
 )
 
 func main() {
-	slog.SetDefault(logging.Init(os.Stderr, logging.ParseLevel(os.Getenv("KSTACK_LOG"))))
+	slog.SetDefault(logging.Init(os.Stderr, logging.ParseLevel(os.Getenv("KSTACK_LOG_LEVEL"))))
 
 	sockPath := flag.String("socket", defaultSocketPath(), "path to the IPC endpoint (Unix domain socket on Unix, named pipe on Windows) to listen on")
 	// Default points at production; override via env (or --cloud-url) for

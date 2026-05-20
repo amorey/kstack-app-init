@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Tauri 2 desktop app for kstack. Three languages, one process tree:
 
-- **`src/`** — React 19 + TypeScript frontend (Vite, urql, TanStack Router). Runs in the Tauri webview.
-- **`src-tauri/`** — Rust Tauri host. Owns windows, tray, menus, auth, and the sidecar lifecycle.
-- **`sidecar/`** — Go binary. The **only** component that talks to the kstack cloud. Serves a local GraphQL API (gqlgen).
+- **`src/`** — React 19 + TypeScript frontend (Vite, urql, TanStack Router). Runs in the Tauri webview. **Detailed below** — this root file covers the frontend and the cross-process contracts.
+- **`src-tauri/`** — Rust Tauri host. Owns windows, tray, menus, auth, and the sidecar lifecycle. **See `src-tauri/CLAUDE.md`** for the per-module map.
+- **`sidecar/`** — Go binary. The **only** component that talks to the kstack cloud. Serves a local GraphQL API (gqlgen) and runs the always-on sync engine. **See `sidecar/CLAUDE.md`** for the per-package map.
 
 ## Commands
 
@@ -39,17 +39,57 @@ urql  →  invokeFetch (src/lib/graphql/invoke-fetch.ts)
 
 `invokeFetch` adapts urql's stock `fetchExchange` onto the Tauri `invoke` bridge instead of `window.fetch`. The Rust transport speaks one `Content-Length`-framed HTTP/1.1 POST per call, no keep-alive — both ends are controlled, so it's deliberately minimal (`transport::post_uds` is the shared request builder; `query_uds` and `push_credentials` both delegate). The sidecar is started by `sidecar::spawn` (`src-tauri/src/sidecar/lifecycle.rs`), announces `READY unix:<path>` on stdout for the host to parse, and shuts down on SIGINT/SIGTERM **or stdin EOF** (the host closing its end is the cross-platform "parent gone" signal). IPC is AF_UNIX everywhere — UDS on macOS/Linux, named pipe / AF_UNIX on Windows (requires Windows 10 build 17063+); see `sidecar/listen_unix.go` vs `listen_windows.go`.
 
-The UDS is not GraphQL-only and the host does more than bridge requests: the same socket also serves a **host-only `POST /control/credentials`** endpoint (deliberately off the GraphQL surface — the webview has no business setting process credentials; the UDS is already user-0600), and the host runs background tasks (e.g. the credential pusher, see Auth). This is the first step of the sidecar becoming an always-on stateful daemon.
+The UDS is not GraphQL-only and the host does more than bridge requests: the same socket also serves **host-only `POST /control/credentials`** and **`POST /control/resync`** endpoints (deliberately off the GraphQL surface — the webview has no business setting process credentials or poking the engine; the UDS is already user-0600), and the host runs background tasks (the credential pusher and wake poster, see Auth). The sidecar is now an always-on stateful daemon (see "always-on sidecar" below).
 
-## Architecture: always-on sidecar (incremental — partially landed)
+## Architecture: the frontend (`src/`)
 
-The sidecar is being grown from a request proxy into an always-on engine that keeps cloud-synced state locally. Built bottom-up; **most of it is compiled but not yet started**, so don't assume it runs:
+The webview app. Entry is `src/main.tsx` → TanStack Router (`routeTree.ts`,
+`routes/`). The tree is file-light today (`__root.tsx` + `index.tsx`); `__root`
+mounts the app-wide providers in order: `UrqlProvider` → `SessionProvider` →
+`SyncStatusProvider`, plus `ErrorBoundary`, `ConnectionStatus`, `ProfileMenu`,
+`SyncHealthBadge`. UI primitives come from `@kubetail/ui`.
 
-- `sidecar/internal/syncstore` — generic `Store[T]` of a versioned `Envelope` (data + version + last-synced/-event timestamps), atomic write via `internal/atomicjson` (which `internal/prefs` also now delegates to).
-- `sidecar/internal/sync` — `SyncEngine`: supervised single-upstream reconcile (snapshot → persist → stream into `prefs.Hub`) with exponential backoff, a state machine, and a wall-clock wake detector. **Library only — nothing constructs/starts it yet** (that's a later cycle: a cloud→`Upstream` adapter + start in `main.go`).
-- `sidecar/internal/authcreds` — `Holder` for the always-on token (see Auth). Owned by `server.NewHandler`, written by `/control/credentials`; **no reader yet**.
+Key modules under `src/lib/`:
 
-Net: until the engine is wired, this scaffolding changes no runtime behavior.
+- **`graphql/`** — the urql client and its custom exchanges.
+  `client.ts` assembles the client (`cacheExchange` → `errorReportExchange` →
+  `networkRetryExchange` → `tauriSubscriptionExchange` → `fetchExchange`). The
+  URL is a dummy — **`invoke-fetch.ts`** swaps urql's `window.fetch` for the
+  Tauri `invoke` bridge (see the request path above). `subscribe-exchange.ts`
+  routes subscription operations over the host's WS bridge with its own
+  reconnect (no jitter — one long-lived client). `networkRetryExchange` retries
+  **only** `networkError`s (sidecar restart blips), never GraphQL errors,
+  bounded, with jitter to de-correlate a route's parallel queries.
+- **`auth.tsx`** — `SessionProvider` / `useSession`. The renderer **never holds
+  tokens**: it reads session state from the Rust host and triggers login/logout
+  via Tauri commands; the access token is fetched on demand by `invoke-fetch`.
+  Consumes the one-shot `auth:session-resolved` startup event (mirror of
+  `auth::SESSION_RESOLVED_EVENT`) so no follow-up `auth_status` round-trip is
+  needed.
+- **`sync-status.tsx`** — `SyncStatusProvider`: subscribes `syncStatusWatch`
+  (snapshot then live transitions) and adapts the engine's health into context;
+  `sync-health-badge.tsx` renders it.
+- **`error-bus.ts`** — tiny `EventTarget`-backed pub/sub. Producers (graphql /
+  subscription / network / render / auth failures) publish; `connection-status.tsx`
+  renders the latest as an auto-dismissing banner. `error-boundary.tsx` feeds
+  render-time exceptions in. Decoupled so a future Sentry tap needs no producer
+  changes.
+
+Frontend dev/test: `pnpm dev` (frontend only, **no sidecar** — cloud ops fail),
+`pnpm tauri dev` (full stack), `pnpm test -- <name>` / `pnpm test --run`,
+`pnpm codegen` after a schema change (see dual-codegen below).
+
+## Architecture: always-on sidecar (landed)
+
+The sidecar is now an always-on engine that keeps cloud-synced state locally,
+not just a request proxy. It is constructed and started in `sidecar/main.go`
+(`engine.Run` in a goroutine); the read path (`settings`, `settingsWatch`,
+`syncStatusWatch`) is served from the engine-maintained local store + hub, with
+no synchronous cloud call. The frontend contract: query `settings`/`syncStatus`
+and subscribe `settingsWatch`/`syncStatusWatch`; `updateSettings` is a
+write-through (cloud, then echoed back and persisted; queued offline). Engine
+internals — `syncstore`, `sync` (engine + cloud upstream), `mutationqueue`,
+`authcreds`, `hub` — are mapped in **`sidecar/CLAUDE.md`**.
 
 ## Architecture: the GraphQL schema is single-source, dual-generated
 
@@ -62,16 +102,20 @@ A schema edit that updates only one side will compile but drift.
 
 ## Auth
 
-OAuth loopback flow lives in `src-tauri/src/auth/` (Rust): `auth_login`/`auth_logout`/`auth_status`/`auth_access_token` invoke handlers, tokens in the OS keychain. On startup the host attempts a silent keychain restore off the critical path and emits `RESTORE_EVENT` with the resolved status so the renderer needs no follow-up round-trip. The frontend consumes this via `src/lib/auth/auth-context.tsx`.
+OAuth loopback flow lives in `src-tauri/src/auth/` (Rust) — per-module detail in
+**`src-tauri/CLAUDE.md`**. On startup the host does a silent keychain restore
+off the critical path and emits the one-shot `auth:session-resolved` event
+(`auth::SESSION_RESOLVED_EVENT`) carrying the resolved status, so the renderer
+needs no follow-up round-trip. The frontend consumes it in `src/lib/auth.tsx`.
 
 There are **two auth paths**, don't conflate them:
 
 - **Request-scoped** (every webview op): bearer travels per-request through `graphql_query` → resolver context. Stateless; the sidecar never stores it.
-- **Always-on** (the engine has no inbound request): a background **credential pusher** (`src-tauri/src/sidecar/credentials.rs`) ships the access token to the sidecar's `/control/credentials`. It is **event-driven, not polled** — it `select!`s on `Auth::watch_credentials()` (a `watch` bumped on every token-set change: login/restore/refresh/logout) and a timer derived from `Auth::access_token_with_expiry()` (refresh at ~75% of TTL, `MIN_MARGIN` floor, `MAX_REARM` cap). Token refresh itself still happens lazily inside `access_token()` (≈once per token lifetime, single-flighted by `refresh_lock`); the pusher adds no refresh traffic. `MAX_REARM` is an interim bound on the monotonic-clock-pauses-during-suspend gap until the OS-power/network `Poke` lands; the `select!` already has the extension point. If you add new `Auth` token mutations, bump the `creds_gen` watch (`bump_creds`) or the pusher won't see them.
+- **Always-on** (the engine has no inbound request): a background **credential pusher** (`src-tauri/src/sidecar/credentials.rs`) ships the access token to the sidecar's `/control/credentials`, where the `authcreds.Holder` feeds the engine's cloud upstream. It is **event-driven, not polled** — it `select!`s on `Auth::watch_credentials()` (bumped on login/restore/refresh/logout), a TTL-derived timer (~75% of lifetime, `MIN_MARGIN` floor, `MAX_REARM` cap), **and** the OS power/network host wake (`src-tauri/src/sidecar/wake.rs`), which also `POST`s the sidecar's `/control/resync` to poke the engine. `MAX_REARM` is now a defense-in-depth backstop for a missed wake, not an interim stopgap. If you add new `Auth` token mutations, bump the `creds_gen` watch (`bump_creds`) or the pusher won't see them.
 
 ## Conventions
 
-- **Env vars**: `KSTACK_LOG` sets verbosity for *both* the Rust host and the Go sidecar (kept in sync between `lib.rs::host_log_level` and `sidecar/internal/logging.ParseLevel`). `KSTACK_CLOUD_URL` is the cloud base URL — forwarded to the sidecar, which appends `/graphql` itself; unset means the compiled-in production default.
+- **Env vars**: `KSTACK_LOG_LEVEL` sets verbosity for *both* the Rust host and the Go sidecar (kept in sync between `lib.rs::host_log_level` and `sidecar/internal/logging.ParseLevel`). `KSTACK_CLOUD_URL` is the cloud base URL — forwarded to the sidecar, which appends `/graphql` itself; unset means the compiled-in production default.
 - **Rust**: `#![warn(clippy::unwrap_used)]` is on for runtime code; tests opt out per-module. `make vet-rust` runs clippy with `-D warnings`.
 - **Window/process lifecycle**: closing the last window does **not** exit — the process stays alive (tray "Quit" or Cmd+Q calls `app.exit`). `tauri_plugin_single_instance` must stay registered first; second launches forward into the original process. Don't reorder plugin registration in `lib.rs` casually.
 - **Cross-platform builds**: Tauri can't cross-compile to Windows from macOS; the CI matrix in `.github/workflows/ci.yml` covers Linux/macOS/Windows × amd64/arm64 for Go and Rust. `ci.yml` has `workflow_dispatch` enabled (`gh workflow run ci.yml --ref <branch>`).

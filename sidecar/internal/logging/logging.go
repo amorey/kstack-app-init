@@ -16,7 +16,7 @@ func Init(w io.Writer, level slog.Level) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level}))
 }
 
-// ParseLevel maps the value of the KSTACK_LOG env var to a slog.Level.
+// ParseLevel maps the value of the KSTACK_LOG_LEVEL env var to a slog.Level.
 // Unknown values fall back to Info so a typo doesn't silence the logger.
 func ParseLevel(s string) slog.Level {
 	switch strings.ToLower(s) {

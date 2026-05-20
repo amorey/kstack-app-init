@@ -17,7 +17,7 @@ pub mod windows;
 
 /// Single env var controls verbosity for both the Rust host and the Go
 /// sidecar (mirrored in `sidecar/internal/logging.ParseLevel`).
-pub(crate) const KSTACK_LOG_ENV: &str = "KSTACK_LOG";
+pub(crate) const KSTACK_LOG_LEVEL_ENV: &str = "KSTACK_LOG_LEVEL";
 
 /// Base URL of the kstack cloud (e.g. `https://api.kstack.sh`).
 /// Forwarded through to the sidecar (which is the only thing that talks
@@ -26,7 +26,7 @@ pub(crate) const KSTACK_LOG_ENV: &str = "KSTACK_LOG";
 pub(crate) const KSTACK_CLOUD_URL_ENV: &str = "KSTACK_CLOUD_URL";
 
 fn host_log_level() -> log::LevelFilter {
-    match std::env::var(KSTACK_LOG_ENV)
+    match std::env::var(KSTACK_LOG_LEVEL_ENV)
         .unwrap_or_default()
         .to_lowercase()
         .as_str()
