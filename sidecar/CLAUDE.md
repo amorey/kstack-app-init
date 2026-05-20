@@ -26,7 +26,7 @@ request path and build ordering; this file is the per-package map.
 - **`server.go`** — wires the gqlgen executable schema into an
   `http.Handler`. Also mounts two **host-only** control endpoints off the
   GraphQL surface: `POST /control/credentials` (writes the `authcreds.Holder`)
-  and `POST /control/resync` (calls the engine's `Poke` — the OS-wake hook).
+  and `POST /control/wake` (calls the engine's `Poke` — the OS-wake hook).
   `Config{}` with no engine wired falls back to a no-op status source so tests
   don't need the engine.
 - **`paths.go`** — single definition of the on-disk layout

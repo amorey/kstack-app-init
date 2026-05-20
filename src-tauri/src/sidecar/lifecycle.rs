@@ -115,6 +115,18 @@ pub(super) async fn wait_for_socket(
         .map_err(|_| "timed out waiting for sidecar READY".to_string())?
 }
 
+/// Resolve the sidecar's UDS path, waiting up to `READY_TIMEOUT` for the
+/// READY line if the sidecar hasn't announced yet. Shared by every
+/// host-only POST helper (credentials, resync, …).
+pub(super) async fn resolve_socket<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<PathBuf, String> {
+    let state = app
+        .try_state::<SidecarState>()
+        .ok_or("sidecar state not managed")?;
+    wait_for_socket(state.socket_rx()).await
+}
+
 /// Start the sidecar binary and watch its stdout for the READY line; the
 /// `SidecarState` is filled asynchronously.
 pub fn spawn(app: &App) -> Result<(), Box<dyn std::error::Error>> {

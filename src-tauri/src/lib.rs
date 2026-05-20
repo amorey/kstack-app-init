@@ -26,6 +26,7 @@ use tauri_plugin_log::{Target, TargetKind};
 pub mod auth;
 pub mod deep_link;
 pub mod sidecar;
+pub mod wake;
 pub mod windows;
 
 /// Single env var controls verbosity for both the Rust host and the Go
@@ -122,12 +123,16 @@ pub fn run() {
                 if let Err(e) = restore_handle.emit(auth::SESSION_RESOLVED_EVENT, status) {
                     log::warn!("auth: emit restore event: {e}");
                 }
-                // Host wake (OS power-resume / network-change): drives a
-                // /control/resync poster and feeds the credential pusher
-                // so a restored session — and recovery after suspend —
-                // reaches the sidecar promptly.
-                let wake_rx = sidecar::spawn_wake(&restore_handle);
-                sidecar::spawn_credential_pusher(&restore_handle, wake_rx);
+                // Wire host wake (OS power-resume / network-change) to
+                // its subscribers. `Waker` owns the watch sender; if it
+                // dropped at end of this setup task, every subscriber's
+                // `changed()` would error — `manage` keeps it alive for
+                // the process.
+                let waker = wake::spawn_wake();
+                auth::refresher::spawn_auth_refresher(waker.subscribe());
+                sidecar::spawn_wake_poster(&restore_handle, waker.subscribe());
+                restore_handle.manage(waker);
+                sidecar::spawn_credential_pusher(&restore_handle);
             });
 
             // Tray icon with Show / Quit menu. The icon is reused from the

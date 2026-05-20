@@ -28,6 +28,12 @@ identically in dev/prod, signed/unsigned, every OS.
   constants (`SESSION_RESOLVED_EVENT`).
 - **`flow.rs`** — login state machine wrapping `openidconnect::CoreClient`
   (which owns discovery/PKCE/token endpoint/ID-token verification).
+- **`refresher.rs`** — the proactive refresh driver. Owns refresh *timing*:
+  `select!`s on a TTL-derived timer (~75% of lifetime, `MIN_MARGIN` floor,
+  `MAX_REARM` cap) + the host wake signal; on either it calls
+  `access_token_with_expiry`, which runs the expiry-gated refresh path. A
+  successful refresh bumps `creds_gen`, which the sidecar credential pusher
+  observes.
 - **`loopback.rs`** — ephemeral 127.0.0.1 listener that catches the redirect
   for one login.
 - **`tokens.rs`** — token storage. Refresh token (only durable secret) → OS
@@ -55,15 +61,35 @@ identically in dev/prod, signed/unsigned, every OS.
   line, graceful shutdown on app exit.
 - **`subscribe.rs`** — graphql-transport-ws over UDS, one WebSocket per
   subscription (no browser per-origin cap to dodge here).
-- **`credentials.rs`** — the **credential pusher**: re-publishes the access
-  token to the sidecar's `/control/credentials`. Event-driven, not polled —
-  `select!`s on `Auth::watch_credentials()` and a TTL-derived timer (~75% of
-  lifetime, `MIN_MARGIN` floor, `MAX_REARM` cap) **and** the host wake signal.
-- **`wake.rs`** — OS power-resume / network-change signal (a `watch<u64>`
-  generation). Fans to two consumers: the credential pusher (re-derive token)
-  and a poster that `POST`s the sidecar's `/control/resync` (pokes the engine
-  into an immediate reconnect). `wake/{macos,linux,win}.rs` are the per-OS
-  sources; the sidecar's wall-clock backstop covers any unwired platform.
+- **`credentials.rs`** — the **credential pusher**: pure transport that
+  re-publishes the access token to the sidecar's `/control/credentials`.
+  `select!`s only on `Auth::watch_credentials()` (bumped by the auth
+  refresher on login / refresh / logout); pushes when the token actually
+  changed (dedup on `last`). No timer, no wake here — see
+  `auth/refresher.rs`.
+- **`wake_poster.rs`** — on every host wake, `POST`s the sidecar's
+  `/control/wake` so the engine reacts immediately (today: an upstream
+  resync) instead of waiting on its wall-clock backstop. Best-effort:
+  failures are logged at debug and the next wake retries. Subscribes to
+  the top-level [`wake`](#wake--host-level-os-wake-signal) module.
+
+## `wake/` — host-level OS wake signal
+
+- **`mod.rs`** — `Waker` (a cheaply-cloneable `watch<u64>` publisher) +
+  `spawn_wake()` which starts the per-OS listeners and returns the
+  `Waker`. The caller (`lib.rs`) is responsible for keeping the `Waker`
+  alive (handed to `app.manage`); if every clone drops, the channel
+  closes and every subscriber's `changed()` errors. `changed()` is the
+  shared helper that names the `.changed().await.is_ok()` pattern used
+  across `select!` arms.
+- **`{macos,linux,win}.rs`** — per-OS sources (NSWorkspace notifications,
+  zbus over logind/NetworkManager, Win32 power/network broadcasts).
+  Unwired platforms compile to a no-op; the engine wall-clock backstop
+  and the refresher's `MAX_REARM` cover suspend/resume.
+
+  Top-level (not under `sidecar/`) because the signal is a host-level
+  OS event with subscribers in both `auth` and `sidecar`, and `auth`
+  shouldn't depend on `sidecar`.
 
 ## Other modules
 

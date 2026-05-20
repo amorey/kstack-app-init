@@ -245,6 +245,20 @@ impl Auth {
         Ok(self.access_token_with_expiry().await?.0)
     }
 
+    /// Snapshot the current refreshable token's absolute expiry, or
+    /// `None` if logged out / no refresh token. Used by the refresher to
+    /// schedule the next wake without forcing a refresh — calling
+    /// [`access_token_with_expiry`] would refresh eagerly once the
+    /// auth-layer expiry threshold tripped.
+    pub async fn refreshable_expiry(&self) -> Option<u64> {
+        self.tokens
+            .read()
+            .await
+            .as_ref()
+            .filter(|t| t.refresh_token.is_some())
+            .map(|t| t.expires_at)
+    }
+
     /// Like [`access_token`] but also returns the token's absolute expiry
     /// (Unix seconds). The credential pusher needs the expiry to schedule
     /// its next refresh at ~75% of the token's lifetime instead of polling.

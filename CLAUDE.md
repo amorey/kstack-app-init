@@ -39,7 +39,7 @@ urql  →  invokeFetch (src/lib/graphql/invoke-fetch.ts)
 
 `invokeFetch` adapts urql's stock `fetchExchange` onto the Tauri `invoke` bridge instead of `window.fetch`. The Rust transport speaks one `Content-Length`-framed HTTP/1.1 POST per call, no keep-alive — both ends are controlled, so it's deliberately minimal (`transport::post_uds` is the shared request builder; `query_uds` and `push_credentials` both delegate). The sidecar is started by `sidecar::spawn` (`src-tauri/src/sidecar/lifecycle.rs`), announces `READY unix:<path>` on stdout for the host to parse, and shuts down on SIGINT/SIGTERM **or stdin EOF** (the host closing its end is the cross-platform "parent gone" signal). IPC is AF_UNIX everywhere — UDS on macOS/Linux, named pipe / AF_UNIX on Windows (requires Windows 10 build 17063+); see `sidecar/listen_unix.go` vs `listen_windows.go`.
 
-The UDS is not GraphQL-only and the host does more than bridge requests: the same socket also serves **host-only `POST /control/credentials`** and **`POST /control/resync`** endpoints (deliberately off the GraphQL surface — the webview has no business setting process credentials or poking the engine; the UDS is already user-0600), and the host runs background tasks (the credential pusher and wake poster, see Auth). The sidecar is now an always-on stateful daemon (see "always-on sidecar" below).
+The UDS is not GraphQL-only and the host does more than bridge requests: the same socket also serves **host-only `POST /control/credentials`** and **`POST /control/wake`** endpoints (deliberately off the GraphQL surface — the webview has no business setting process credentials or poking the engine; the UDS is already user-0600), and the host runs background tasks (the credential pusher and wake poster, see Auth). The sidecar is now an always-on stateful daemon (see "always-on sidecar" below).
 
 ## Architecture: the frontend (`src/`)
 
@@ -111,7 +111,24 @@ needs no follow-up round-trip. The frontend consumes it in `src/lib/auth.tsx`.
 There are **two auth paths**, don't conflate them:
 
 - **Request-scoped** (every webview op): bearer travels per-request through `graphql_query` → resolver context. Stateless; the sidecar never stores it.
-- **Always-on** (the engine has no inbound request): a background **credential pusher** (`src-tauri/src/sidecar/credentials.rs`) ships the access token to the sidecar's `/control/credentials`, where the `authcreds.Holder` feeds the engine's cloud upstream. It is **event-driven, not polled** — it `select!`s on `Auth::watch_credentials()` (bumped on login/restore/refresh/logout), a TTL-derived timer (~75% of lifetime, `MIN_MARGIN` floor, `MAX_REARM` cap), **and** the OS power/network host wake (`src-tauri/src/sidecar/wake.rs`), which also `POST`s the sidecar's `/control/resync` to poke the engine. `MAX_REARM` is now a defense-in-depth backstop for a missed wake, not an interim stopgap. If you add new `Auth` token mutations, bump the `creds_gen` watch (`bump_creds`) or the pusher won't see them.
+- **Always-on** (the engine has no inbound request): two cooperating tasks.
+  - The **auth refresher** (`src-tauri/src/auth/refresher.rs`) owns the
+    *timing* of refresh: it `select!`s on a TTL-derived timer (~75% of
+    lifetime, `MIN_MARGIN` floor, `MAX_REARM` cap) and the OS power/network
+    host wake (`src-tauri/src/wake/`); on either it calls
+    `Auth::access_token_with_expiry`, which runs the expiry-gated refresh
+    path. A successful refresh bumps `creds_gen`.
+  - The **credential pusher** (`src-tauri/src/sidecar/credentials.rs`) is
+    pure transport: it `select!`s only on `Auth::watch_credentials()` and
+    pushes the current access token to the sidecar's `/control/credentials`
+    whenever the token actually changed (dedup on `last`). No timer, no
+    wake — the refresher's `creds_gen` bump is the only signal it needs.
+
+  A separate **wake poster** (`src-tauri/src/sidecar/wake_poster.rs`) also
+  subscribes to the wake signal and `POST`s the sidecar's `/control/wake`
+  to poke the engine into an immediate reconnect. `MAX_REARM` is a
+  defense-in-depth backstop for a missed wake or an unwired platform. If you add new `Auth` token mutations, bump the
+  `creds_gen` watch (`bump_creds`) or neither task will see them.
 
 ## Conventions
 

@@ -185,7 +185,7 @@ func New(up Upstream, store *syncstore.Store[prefs.Settings], settingsHub *prefs
 // (a pending poke coalesces). It does not change state itself: the next
 // upstream call result is still the source of truth. Producers: the
 // wall-clock wakeLoop backstop and host OS power/network events via
-// /control/resync.
+// /control/wake.
 func (e *Engine) Poke() {
 	select {
 	case e.pokeCh <- struct{}{}:

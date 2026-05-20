@@ -129,11 +129,13 @@ pub async fn push_credentials(socket: &Path, token: &str) -> Result<(), SidecarE
         .map(|_| ())
 }
 
-/// POST the host-only `/control/resync` trigger so the always-on engine
-/// resyncs now (host OS power-resume / network-change). Empty body; the
-/// sidecar replies 204 and any non-2xx is surfaced so the caller can retry.
-pub async fn push_resync(socket: &Path) -> Result<(), SidecarError> {
-    post_uds(socket, "/control/resync", None, &[])
+/// POST the host-only `/control/wake` trigger on every host OS wake
+/// (power-resume / network-change). Generic name on purpose: today the
+/// sidecar responds by resyncing, but the wire stays stable if future
+/// wake-responses are added. Empty body; sidecar replies 204 and any
+/// non-2xx is surfaced so the caller can retry.
+pub async fn post_wake(socket: &Path) -> Result<(), SidecarError> {
+    post_uds(socket, "/control/wake", None, &[])
         .await
         .map(|_| ())
 }
@@ -369,7 +371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_resync_posts_and_succeeds() {
+    async fn post_wake_posts_and_succeeds() {
         let socket = temp_socket();
         let listener = bind(&socket);
         let seen = tokio::spawn(async move {
@@ -377,11 +379,11 @@ mod tests {
             capture_request(conn, "HTTP/1.1 204 No Content").await
         });
 
-        push_resync(&socket).await.unwrap();
+        post_wake(&socket).await.unwrap();
 
         let req = seen.await.unwrap();
         assert!(
-            req.starts_with("POST /control/resync HTTP/1.1"),
+            req.starts_with("POST /control/wake HTTP/1.1"),
             "request line: {req}"
         );
     }

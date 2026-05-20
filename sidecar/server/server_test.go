@@ -291,9 +291,9 @@ func TestControlCredentials(t *testing.T) {
 	}
 }
 
-// /control/resync invokes the configured poke on a valid POST; a wrong
+// /control/wake invokes the configured poke on a valid POST; a wrong
 // method is rejected and does not.
-func TestControlResync(t *testing.T) {
+func TestControlWake(t *testing.T) {
 	poked := make(chan struct{}, 1)
 	h := server.NewHandler(server.Config{Poke: func() {
 		select {
@@ -303,7 +303,7 @@ func TestControlResync(t *testing.T) {
 	}})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
-	url := ts.URL + "/control/resync"
+	url := ts.URL + "/control/wake"
 
 	resp, err := http.Post(url, "", nil)
 	if err != nil {
