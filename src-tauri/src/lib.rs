@@ -168,6 +168,18 @@ pub fn run() {
             RunEvent::Ready => {
                 // TODO: app is ready
             }
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } => {
+                if !has_visible_windows {
+                    let state = app_handle.state::<AppState>();
+                    if let Err(err) = state.window_manager.show_main_window(app_handle) {
+                        tracing::error!(%err, "failed to show main window on dock reopen");
+                    }
+                }
+            }
             RunEvent::ExitRequested { api, code, .. } => {
                 match code {
                     // Keep app open in background when the last window is closing
