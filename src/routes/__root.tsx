@@ -21,6 +21,7 @@ import { ProfileMenu } from '@/components/widgets/profile-menu';
 import { ConnectionStatus } from '@/lib/connection-status';
 import { ErrorBoundary } from '@/lib/error-boundary';
 import { createGraphqlClient } from '@/lib/graphql/client';
+import { ReadyGate } from '@/lib/ready-gate';
 import { SyncHealthBadge } from '@/components/widgets/sync-health-badge';
 import { SyncStatusProvider } from '@/lib/sync-status';
 
@@ -54,21 +55,23 @@ export function NotFound() {
 function RootComponent() {
   return (
     <ErrorBoundary>
-      <SessionProvider>
-        <UrqlProvider value={gqlClient}>
-          <SyncStatusProvider>
-            <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
-              <SyncHealthBadge />
-              <ProfileMenu />
-            </div>
-            <ConnectionStatus />
-            <Outlet />
-            <Suspense>
-              <TanStackRouterDevtools />
-            </Suspense>
-          </SyncStatusProvider>
-        </UrqlProvider>
-      </SessionProvider>
+      <ReadyGate>
+        <SessionProvider>
+          <UrqlProvider value={gqlClient}>
+            <SyncStatusProvider>
+              <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
+                <SyncHealthBadge />
+                <ProfileMenu />
+              </div>
+              <ConnectionStatus />
+              <Outlet />
+              <Suspense>
+                <TanStackRouterDevtools />
+              </Suspense>
+            </SyncStatusProvider>
+          </UrqlProvider>
+        </SessionProvider>
+      </ReadyGate>
     </ErrorBoundary>
   );
 }
