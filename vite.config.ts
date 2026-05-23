@@ -1,5 +1,6 @@
+import babel from '@rolldown/plugin-babel';
 import tailwindcss from '@tailwindcss/vite';
-import react from '@vitejs/plugin-react';
+import react, { reactCompilerPreset } from '@vitejs/plugin-react';
 import Unfonts from 'unplugin-fonts/vite';
 import { defineConfig, mergeConfig } from 'vite';
 import { defineConfig as defineVitestConfig } from 'vitest/config';
@@ -13,6 +14,9 @@ const viteConfig = defineConfig({
   },
   plugins: [
     react(),
+    babel({
+      presets: [reactCompilerPreset()],
+    }),
     tailwindcss(),
     Unfonts({
       fontsource: {

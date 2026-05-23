@@ -19,7 +19,7 @@ type Status = { authenticated: boolean; email: string | null; name: string | nul
 type EventCb = (e: { payload: Status }) => void;
 
 const SESSION_RESOLVED_EVENT = 'auth:session-resolved';
-const SESSION_EVENT = 'auth:session-changed';
+const SESSION_CHANGED_EVENT = 'auth:session-changed';
 
 const invokeMock = vi.fn<(cmd: string, payload?: unknown) => Promise<unknown>>();
 
@@ -105,7 +105,7 @@ describe('SessionProvider / useSession', () => {
   it('subscribes to the session-changed event', async () => {
     invokeMock.mockResolvedValue(ANON);
     renderSession();
-    await waitFor(() => expect(listenHandlers.has(SESSION_EVENT)).toBe(true));
+    await waitFor(() => expect(listenHandlers.has(SESSION_CHANGED_EVENT)).toBe(true));
   });
 
   it('syncs to anonymous when another window logs out (session-changed)', async () => {
@@ -115,7 +115,7 @@ describe('SessionProvider / useSession', () => {
 
     // The host broadcasts the post-logout status from the other window.
     await act(async () => {
-      fireEvent(SESSION_EVENT, ANON);
+      fireEvent(SESSION_CHANGED_EVENT, ANON);
     });
     expect(result.current.session).toEqual(ANON);
   });
@@ -126,7 +126,7 @@ describe('SessionProvider / useSession', () => {
     await waitFor(() => expect(result.current.loading).toBe(false));
 
     await act(async () => {
-      fireEvent(SESSION_EVENT, AUTHED);
+      fireEvent(SESSION_CHANGED_EVENT, AUTHED);
     });
     expect(result.current.session).toEqual(AUTHED);
   });
@@ -193,7 +193,7 @@ describe('SessionProvider / useSession', () => {
   it('unsubscribes from every event listener on unmount', async () => {
     invokeMock.mockResolvedValue(ANON);
     const { unmount } = renderSession();
-    await waitFor(() => expect(listenHandlers.has(SESSION_EVENT)).toBe(true));
+    await waitFor(() => expect(listenHandlers.has(SESSION_CHANGED_EVENT)).toBe(true));
     unmount();
     // One unlisten per registered listener (restore + session-changed).
     expect(unlistenMock).toHaveBeenCalledTimes(2);

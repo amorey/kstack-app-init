@@ -112,8 +112,11 @@ func main() {
 	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, handler)
 	srv.Handler = http.MaxBytesHandler(wrapped, maxRequestBytes)
 
-	// Announce. Host parses this line to learn the socket path.
-	fmt.Printf("READY unix:%s\n", *sockPath)
+	// Announce. The host matches the `READY ` prefix to know the listener
+	// is up; the scheme + path are for human-readable logs (the host
+	// already knows the path — it picked it pre-spawn and passed it via
+	// --socket).
+	fmt.Printf("READY %s:%s\n", socketScheme, *sockPath)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

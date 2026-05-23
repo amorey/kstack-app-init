@@ -51,13 +51,17 @@ function installDefaultInvokes() {
     if (cmd === 'graphql_unsubscribe') return undefined;
     if (cmd === 'graphql_query') {
       const body = payload?.body ?? '';
+      // The host's `graphql_query` command now returns a structured
+      // { status, body } envelope so the frontend can preserve HTTP
+      // status (4xx/5xx no longer get conflated with networkError).
+      // See src-tauri/src/services/sidecar/graphql/query.rs (GraphqlResponse).
       if (body.includes('updateSettings')) {
-        return '{"data":{"updateSettings":{"placeholder":"updated"}}}';
+        return { status: 200, body: '{"data":{"updateSettings":{"placeholder":"updated"}}}' };
       }
       if (body.includes('settings')) {
-        return '{"data":{"settings":{"placeholder":"initial"}}}';
+        return { status: 200, body: '{"data":{"settings":{"placeholder":"initial"}}}' };
       }
-      return '{"data":{"ping":"pong"}}';
+      return { status: 200, body: '{"data":{"ping":"pong"}}' };
     }
     return '';
   });

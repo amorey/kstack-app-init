@@ -1,15 +1,11 @@
 # TODO
 
-2. CI workflow
+- Sidecar lifecycle
+- Rust->Sidecar graphql bridge
+- ~~Oauth~~ (sign-in/logout, token storage, multi-window sync, startup restore)
+- Rust->Sidecar credentials push (Oauth access token -> /control/credentials)
+- Oauth access-token refresh (background + on-demand; refresh token already stored)
+- Waker
+- Rust->Sidecar waker
 
-3. Try on other oses
-
-4. e2e tests
-
-5. handle updates
-
-7. AI agent API keys
-
-8. Agent Client Protocol
-
-9. Oauth to kstack-cloud
+- React compiler

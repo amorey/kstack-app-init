@@ -57,6 +57,7 @@ jobs:
   rust-vet:
     name: Rust · Vet
     strategy:
+      fail-fast: false
       matrix: &full-matrix
         os:
           - linux
@@ -144,6 +145,7 @@ jobs:
       - go-lint
       - go-vet
     strategy:
+      fail-fast: false
       matrix: *full-matrix
     runs-on: ${{ matrix.runner }}
     steps:
@@ -165,6 +167,7 @@ jobs:
       - rust-lint
       - rust-vet
     strategy:
+      fail-fast: false
       matrix: *full-matrix
     runs-on: ${{ matrix.runner }}
     steps:
@@ -206,6 +209,7 @@ jobs:
       - go-lint
       - go-vet
     strategy:
+      fail-fast: false
       matrix: *full-matrix
     runs-on: ${{ matrix.runner }}
     steps:
@@ -223,6 +227,7 @@ jobs:
       - rust-lint
       - rust-vet
     strategy:
+      fail-fast: false
       matrix: *full-matrix
     runs-on: ${{ matrix.runner }}
     steps:

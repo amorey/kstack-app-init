@@ -10,6 +10,12 @@ import (
 	"syscall"
 )
 
+// socketScheme labels the IPC transport in human-readable diagnostics
+// (e.g. the `READY <scheme>:<path>` line in main.go). The host doesn't
+// parse this; it's a hint for logs and external tooling. The Windows
+// build uses `pipe:` for named pipes.
+const socketScheme = "unix"
+
 // defaultSocketPath returns the platform-native default IPC endpoint: an
 // AF_UNIX socket in the temp directory, namespaced by pid so concurrent
 // sidecars don't collide.

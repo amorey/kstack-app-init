@@ -37,9 +37,9 @@ const dropOp = (id: number) => {
 };
 
 // Bridges urql's subscriptionExchange to the Tauri host's
-// `graphql_subscribe` / `graphql_unsubscribe` invoke commands. Each
-// subscription gets its own WebSocket on the Rust side (see
-// src-tauri/src/sidecar/subscribe.rs for the rationale).
+// `graphql_subscribe` / `graphql_unsubscribe` invoke commands. All
+// subscriptions multiplex over a single host-side WebSocket (see
+// src-tauri/src/services/sidecar/subscribe.rs for the rationale).
 //
 // The transport dies silently on sleep/network loss: the host WS ends and
 // the channel emits `complete` (or `error`). urql would treat that as the
@@ -69,6 +69,13 @@ export const tauriSubscriptionExchange = subscriptionExchange({
 
         function scheduleReconnect(message: string, cause?: unknown) {
           if (cancelled) return;
+          // Always dropOp before forgetting the id: most terminal paths
+          // (server-sent `complete`/`error`, fan_out_complete on WS drop)
+          // have the host already remove the entry, but the malformed-
+          // frame path leaves it live — graphql_unsubscribe is documented
+          // as tolerant of unknown ids, so this is a safe no-op when the
+          // host already cleared things up.
+          if (opId != null) dropOp(opId);
           opId = null;
           // Report only the first drop of an outage. Backoff caps at 30s
           // and the banner auto-dismisses after 5s, so reporting every

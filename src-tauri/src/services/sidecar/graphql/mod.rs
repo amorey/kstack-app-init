@@ -1,0 +1,26 @@
+// Copyright 2026 The Kubetail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Host-side GraphQL clients to the sidecar.
+//!
+//! Split by transport because the mechanics diverge: `http` is stateless
+//! (one HTTP/1 connection per call) for queries and mutations, while `ws`
+//! owns a long-lived multiplexed `graphql-transport-ws` session for
+//! subscriptions.
+
+mod query;
+mod subscribe;
+
+pub use query::{GraphqlResponse, QueryClient};
+pub use subscribe::{FrameSink, SubscriptionClient};

@@ -38,11 +38,11 @@ const ANON_SESSION: Session = { authenticated: false, email: null, name: null, s
 // follow-up `auth_status` call. Not the OS power/network wake path.
 const SESSION_RESOLVED_EVENT = 'auth:session-resolved';
 
-// Mirror of `auth::SESSION_EVENT` in src-tauri. The host broadcasts the
+// Mirror of `auth::SESSION_CHANGED_EVENT` in src-tauri. The host broadcasts the
 // fresh session on every post-startup auth change (login / logout /
 // refresh) to *all* windows, so a logout in one window updates the
 // others instead of leaving them on a stale authenticated UI.
-const SESSION_EVENT = 'auth:session-changed';
+const SESSION_CHANGED_EVENT = 'auth:session-changed';
 
 type SessionContextValue = {
   session: Session;
@@ -80,7 +80,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     (async () => {
       try {
         const offRestore = await listen<Session>(SESSION_RESOLVED_EVENT, (e) => settle(e.payload));
-        const offSession = await listen<Session>(SESSION_EVENT, (e) => settle(e.payload));
+        const offSession = await listen<Session>(SESSION_CHANGED_EVENT, (e) => settle(e.payload));
         if (cancelled) {
           offRestore();
           offSession();
@@ -106,6 +106,8 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       const s = await invoke<Session>('auth_login');
       setSession(s);
     } catch (e) {
+      // A newer login click cancelled this attempt — expected, not a failure.
+      if (errorMessage(e).includes('superseded')) return;
       reportSessionError('login', e);
       throw e;
     }

@@ -30,7 +30,7 @@ describe('invokeFetch', () => {
   });
 
   it('forwards the request body to graphql_query and wraps the response', async () => {
-    invokeMock.mockResolvedValueOnce('{"data":{"ping":"pong"}}');
+    invokeMock.mockResolvedValueOnce({ status: 200, body: '{"data":{"ping":"pong"}}' });
 
     const res = await invokeFetch('tauri://graphql', {
       method: 'POST',
@@ -41,6 +41,24 @@ describe('invokeFetch', () => {
     expect(res.ok).toBe(true);
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ data: { ping: 'pong' } });
+  });
+
+  it('preserves a non-2xx status so urql treats it as a server error, not a network error', async () => {
+    // A 401 from the sidecar (e.g. auth required) must reach urql as a
+    // Response with status=401 — that path is non-retryable in urql's
+    // retryExchange. If we collapsed it to status=200 the GraphQL
+    // CombinedError would have no networkError, retryExchange wouldn't
+    // touch it, and the auth failure would propagate. If we collapsed it
+    // to a thrown error retryExchange would loop on it forever.
+    invokeMock.mockResolvedValueOnce({
+      status: 401,
+      body: '{"errors":[{"message":"no auth"}]}',
+    });
+
+    const res = await invokeFetch('tauri://graphql', { method: 'POST', body: '{}' });
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toEqual({ errors: [{ message: 'no auth' }] });
   });
 
   it('rethrows an invoke rejection as an Error (a real network failure, not a 500 envelope)', async () => {

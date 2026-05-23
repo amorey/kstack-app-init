@@ -18,18 +18,26 @@ import { toError } from '../error-bus';
 
 const JSON_HEADERS = { 'content-type': 'application/json' } as const;
 
+// What the Rust `graphql_query` command returns. See
+// src-tauri/src/services/sidecar/graphql/query.rs (GraphqlResponse). The status
+// is carried separately so we can preserve it on the synthesized
+// Response — urql treats 4xx/5xx as non-retryable server errors and
+// network errors as retryable. Collapsing them (e.g. status: 200
+// regardless) would have retryExchange hammer a permanent 4xx forever.
+type GraphqlResponse = { status: number; body: string };
+
 // Adapter that lets urql's stock fetchExchange talk to the Tauri sidecar
 // over the host's `graphql_query` invoke handler instead of `window.fetch`.
 // The sidecar listens on a Unix domain socket, so the webview can't dial
-// it directly — the Rust host bridges the request and returns the raw
-// JSON response body.
+// it directly — the Rust host bridges the request and hands back the raw
+// JSON response body alongside the real HTTP status.
 export const invokeFetch: typeof fetch = async (_input, init) => {
   // urql's fetchExchange always sends a string body for POST. If anything
   // else shows up we forward an empty body and let the sidecar reject it.
   const body = typeof init?.body === 'string' ? init.body : '';
   try {
-    const text = await invoke<string>('graphql_query', { body });
-    return new Response(text, { status: 200, headers: JSON_HEADERS });
+    const { status, body: text } = await invoke<GraphqlResponse>('graphql_query', { body });
+    return new Response(text, { status, headers: JSON_HEADERS });
   } catch (err) {
     // A transport failure (sidecar unreachable / restarting) is a *network*
     // error, not a GraphQL one. Throw so urql's fetchExchange yields a

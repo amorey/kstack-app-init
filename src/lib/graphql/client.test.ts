@@ -37,7 +37,7 @@ describe('createGraphqlClient', () => {
   });
 
   it('routes a query through invokeFetch and returns parsed data', async () => {
-    invokeMock.mockResolvedValueOnce('{"data":{"ping":"pong"}}');
+    invokeMock.mockResolvedValueOnce({ status: 200, body: '{"data":{"ping":"pong"}}' });
 
     const client = createGraphqlClient();
     const result = await client.query('{ ping }', {}).toPromise();
@@ -57,7 +57,7 @@ describe('createGraphqlClient', () => {
     vi.useFakeTimers();
     invokeMock
       .mockRejectedValueOnce('sidecar momentarily unreachable')
-      .mockResolvedValueOnce('{"data":{"ping":"pong"}}');
+      .mockResolvedValueOnce({ status: 200, body: '{"data":{"ping":"pong"}}' });
 
     const client = createGraphqlClient();
     const pending = client.query('{ ping }', {}).toPromise();
@@ -88,7 +88,7 @@ describe('createGraphqlClient', () => {
 
   it('does not retry a GraphQL error (deterministic — only transport failures retry)', async () => {
     vi.useFakeTimers();
-    invokeMock.mockResolvedValue('{"errors":[{"message":"bad field"}]}');
+    invokeMock.mockResolvedValue({ status: 200, body: '{"errors":[{"message":"bad field"}]}' });
 
     const client = createGraphqlClient();
     const pending = client.query('{ ping }', {}).toPromise();
