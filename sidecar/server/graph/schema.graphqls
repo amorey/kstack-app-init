@@ -38,6 +38,21 @@ type Query {
   syncStatus: SyncStatus!
 }
 
+input ChatMessageInput {
+  role: String!
+  content: String!
+}
+
+input ChatInput {
+  messages: [ChatMessageInput!]!
+}
+
+"Streaming chat chunk. `delta` is the next piece of assistant text; `done` is true on the final frame (delta may be empty)."
+type ChatChunk {
+  delta: String!
+  done: Boolean!
+}
+
 type Mutation {
   "Write-through update: pushed to the cloud, then published locally; the engine persists it when the cloud echoes it back."
   updateSettings(input: UpdateSettingsInput!): Settings!
@@ -52,4 +67,7 @@ type Subscription {
 
   "Streams the engine's sync health: the current status first, then every transition."
   syncStatusWatch: SyncStatus!
+
+  "Streams the assistant's reply token-by-token. Completes after a frame with `done: true`."
+  chatStream(input: ChatInput!): ChatChunk!
 }

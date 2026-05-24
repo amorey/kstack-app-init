@@ -16,18 +16,12 @@ import type { TypedDocumentNode as DocumentNode } from '@graphql-typed-document-
 type Documents = {
     "\n  subscription Tick {\n    tick\n  }\n": typeof types.TickDocument,
     "\n  subscription SyncStatusWatch {\n    syncStatusWatch {\n      state\n      lastError\n      lastSyncedAt\n      retryAt\n    }\n  }\n": typeof types.SyncStatusWatchDocument,
-    "\n  query Ping {\n    ping\n  }\n": typeof types.PingDocument,
-    "\n  query Settings {\n    settings {\n      placeholder\n    }\n  }\n": typeof types.SettingsDocument,
-    "\n  mutation UpdateSettings($input: UpdateSettingsInput!) {\n    updateSettings(input: $input) {\n      placeholder\n    }\n  }\n": typeof types.UpdateSettingsDocument,
-    "\n  subscription SettingsWatch {\n    settingsWatch {\n      placeholder\n    }\n  }\n": typeof types.SettingsWatchDocument,
+    "\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n": typeof types.ChatStreamDocument,
 };
 const documents: Documents = {
     "\n  subscription Tick {\n    tick\n  }\n": types.TickDocument,
     "\n  subscription SyncStatusWatch {\n    syncStatusWatch {\n      state\n      lastError\n      lastSyncedAt\n      retryAt\n    }\n  }\n": types.SyncStatusWatchDocument,
-    "\n  query Ping {\n    ping\n  }\n": types.PingDocument,
-    "\n  query Settings {\n    settings {\n      placeholder\n    }\n  }\n": types.SettingsDocument,
-    "\n  mutation UpdateSettings($input: UpdateSettingsInput!) {\n    updateSettings(input: $input) {\n      placeholder\n    }\n  }\n": types.UpdateSettingsDocument,
-    "\n  subscription SettingsWatch {\n    settingsWatch {\n      placeholder\n    }\n  }\n": types.SettingsWatchDocument,
+    "\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n": types.ChatStreamDocument,
 };
 
 /**
@@ -55,19 +49,7 @@ export function graphql(source: "\n  subscription SyncStatusWatch {\n    syncSta
 /**
  * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
  */
-export function graphql(source: "\n  query Ping {\n    ping\n  }\n"): (typeof documents)["\n  query Ping {\n    ping\n  }\n"];
-/**
- * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
- */
-export function graphql(source: "\n  query Settings {\n    settings {\n      placeholder\n    }\n  }\n"): (typeof documents)["\n  query Settings {\n    settings {\n      placeholder\n    }\n  }\n"];
-/**
- * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
- */
-export function graphql(source: "\n  mutation UpdateSettings($input: UpdateSettingsInput!) {\n    updateSettings(input: $input) {\n      placeholder\n    }\n  }\n"): (typeof documents)["\n  mutation UpdateSettings($input: UpdateSettingsInput!) {\n    updateSettings(input: $input) {\n      placeholder\n    }\n  }\n"];
-/**
- * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
- */
-export function graphql(source: "\n  subscription SettingsWatch {\n    settingsWatch {\n      placeholder\n    }\n  }\n"): (typeof documents)["\n  subscription SettingsWatch {\n    settingsWatch {\n      placeholder\n    }\n  }\n"];
+export function graphql(source: "\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n"): (typeof documents)["\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n"];
 
 export function graphql(source: string) {
   return (documents as any)[source] ?? {};

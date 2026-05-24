@@ -9,6 +9,21 @@ import (
 	"strconv"
 )
 
+// Streaming chat chunk. `delta` is the next piece of assistant text; `done` is true on the final frame (delta may be empty).
+type ChatChunk struct {
+	Delta string `json:"delta"`
+	Done  bool   `json:"done"`
+}
+
+type ChatInput struct {
+	Messages []*ChatMessageInput `json:"messages"`
+}
+
+type ChatMessageInput struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 type Mutation struct {
 }
 

@@ -9,6 +9,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
 )
 
 // UpdateSettings is the resolver for the updateSettings field.
@@ -108,6 +110,69 @@ func (r *subscriptionResolver) SyncStatusWatch(ctx context.Context) (<-chan *Syn
 	return streamWithSnapshot(ctx, sub, unsub, toGraphSyncStatus, func() (*SyncStatus, bool) {
 		return toGraphSyncStatus(r.Sync.Status()), true
 	}), nil
+}
+
+// ChatStream is the resolver for the chatStream field. POC: forwards the
+// conversation to Anthropic and streams the assistant's reply token-by-token.
+// Emits `{delta, done:false}` per text chunk and a final `{delta:"", done:true}`
+// frame so the client can tear down without the subscribe-exchange treating
+// the channel close as a transport drop (which would trigger reconnect).
+func (r *subscriptionResolver) ChatStream(ctx context.Context, input ChatInput) (<-chan *ChatChunk, error) {
+	msgs := make([]anthropic.MessageParam, 0, len(input.Messages))
+	for _, m := range input.Messages {
+		block := anthropic.NewTextBlock(m.Content)
+		if m.Role == "assistant" {
+			msgs = append(msgs, anthropic.NewAssistantMessage(block))
+		} else {
+			msgs = append(msgs, anthropic.NewUserMessage(block))
+		}
+	}
+	ch := make(chan *ChatChunk)
+	go func() {
+		defer close(ch)
+		emit := func(c *ChatChunk) bool {
+			select {
+			case ch <- c:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		client := anthropic.NewClient()
+		stream := client.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
+			Model:     anthropic.ModelClaudeHaiku4_5,
+			MaxTokens: 1024,
+			Messages:  msgs,
+			Tools: []anthropic.ToolUnionParam{
+				{OfWebSearchTool20250305: &anthropic.WebSearchTool20250305Param{}},
+				{OfWebFetchTool20260309: &anthropic.WebFetchTool20260309Param{}},
+			},
+		})
+		for stream.Next() {
+			evt := stream.Current()
+			if d, ok := evt.AsAny().(anthropic.ContentBlockDeltaEvent); ok {
+				if td, ok := d.Delta.AsAny().(anthropic.TextDelta); ok && td.Text != "" {
+					if !emit(&ChatChunk{Delta: td.Text, Done: false}) {
+						return
+					}
+				}
+			}
+		}
+		if err := stream.Err(); err != nil {
+			emit(&ChatChunk{Delta: "error: " + err.Error(), Done: true})
+		} else {
+			emit(&ChatChunk{Delta: "", Done: true})
+		}
+		// Keep the channel open until the client unsubscribes. If we
+		// returned here, gqlgen would emit a `complete` frame and the
+		// subscribe-exchange would treat it as a transport drop —
+		// flashing a "Subscription dropped" banner before the client's
+		// pause-driven unsubscribe lands. ctx.Done() fires the moment
+		// the client tears down, so the goroutine still cleans up
+		// promptly.
+		<-ctx.Done()
+	}()
+	return ch, nil
 }
 
 // Mutation returns MutationResolver implementation.

@@ -13,6 +13,7 @@ dist-ssr
 *.local
 .pnpm-store
 target
+.env.local
 
 # Sidecar build output (produced by `make sidecar`).
 src-tauri/binaries/
