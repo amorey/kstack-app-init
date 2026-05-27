@@ -5,11 +5,11 @@ go 1.26.0
 require (
 	github.com/99designs/gqlgen v0.17.90
 	github.com/Microsoft/go-winio v0.6.2
+	github.com/amorey/gochan v0.0.2
 	github.com/anthropics/anthropic-sdk-go v1.45.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
-	github.com/kubetail-org/littlebus v0.0.1
 	github.com/stretchr/testify v1.11.1
 	github.com/vektah/gqlparser/v2 v2.5.33
 	golang.org/x/sys v0.42.0

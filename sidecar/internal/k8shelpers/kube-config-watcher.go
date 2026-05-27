@@ -21,24 +21,24 @@ import (
 	"sync"
 	"time"
 
+	"github.com/amorey/gochan/watch"
 	"github.com/fsnotify/fsnotify"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
-
-	"github.com/kubetail-org/littlebus"
 )
 
 const HOMEPATH_TILDE = "~"
 
 // Subscription represents an active subscription that can be cancelled
-type Subscription = littlebus.Subscription[*api.Config]
+type Subscription = *watch.Receiver[*api.Config]
 
 // Represents KubeConfigWatcher
 type KubeConfigWatcher struct {
 	kubeConfig   *api.Config
 	loadingRules *clientcmd.ClientConfigLoadingRules
 	watcher      *fsnotify.Watcher
-	lb           *littlebus.LittleBus[string, *api.Config]
+	hub          *watch.Hub[*api.Config]
+	tx           *watch.Sender[*api.Config]
 	mu           sync.RWMutex
 }
 
@@ -66,11 +66,14 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 		}
 	}
 
+	hub := watch.New[*api.Config](nil)
+
 	// Initialize kube-config-watcher instance
 	w := &KubeConfigWatcher{
 		loadingRules: loadingRules,
 		watcher:      watcher,
-		lb:           littlebus.New[string, *api.Config](),
+		hub:          hub,
+		tx:           hub.Sender(),
 	}
 
 	// Initialize config
@@ -96,13 +99,13 @@ func (w *KubeConfigWatcher) Get() *api.Config {
 
 // Subscribe
 func (w *KubeConfigWatcher) Subscribe() Subscription {
-	return w.lb.Subscribe("MODIFIED", littlebus.WithOverflowPolicy(littlebus.PolicyDropOldest))
+	return w.hub.Receiver()
 }
 
 // Close
 func (w *KubeConfigWatcher) Close() {
 	w.watcher.Close()
-	w.lb.Close()
+	w.tx.Close()
 }
 
 // Start
@@ -143,7 +146,7 @@ func (w *KubeConfigWatcher) start() {
 					}
 
 					// Publish event
-					w.lb.Publish("MODIFIED", cfg)
+					w.tx.Send(cfg) //nolint:errcheck
 				})
 			}
 		}

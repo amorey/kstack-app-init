@@ -177,14 +177,17 @@ func TestKubeConfigWatcherSubscribeModified(t *testing.T) {
 
 	// Subscribe to changes
 	sub := watcher.Subscribe()
-	defer sub.Unsubscribe()
+	defer sub.Close()
+
+	// Drain the seeded initial value
+	<-sub.Chan()
 
 	// Modify one of the files
 	cfg2, err := createKubeConfig(p2)
 	require.NoError(t, err)
 
 	// Get change
-	cfgActual := <-sub.Ch()
+	cfgActual := <-sub.Chan()
 
 	// Check new config
 	expectedClusters := mergeMaps(cfg1.Clusters, cfg2.Clusters)
