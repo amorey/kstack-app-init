@@ -58,7 +58,9 @@ function Chat() {
   useSubscription(
     {
       query: ChatStreamSubscription,
-      variables: { input: { messages: pending ?? [] } },
+      variables: {
+        input: { messages: (pending ?? []).map((m) => ({ role: m.from, content: m.content })) },
+      },
       pause: pending === null,
     },
     (prev: string | undefined, data) => {
