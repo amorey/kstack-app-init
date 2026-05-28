@@ -33,7 +33,6 @@ export function ReadyGate({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
-    setState({ status: 'pending' });
     (async () => {
       try {
         await invoke('ready');
@@ -47,7 +46,10 @@ export function ReadyGate({ children }: { children: React.ReactNode }) {
     };
   }, [attempt]);
 
-  const retry = useCallback(() => setAttempt((n) => n + 1), []);
+  const retry = useCallback(() => {
+    setState({ status: 'pending' });
+    setAttempt((n) => n + 1);
+  }, []);
 
   if (state.status === 'ready') return <>{children}</>;
 

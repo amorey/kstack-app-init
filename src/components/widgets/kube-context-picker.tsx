@@ -18,13 +18,7 @@
 // renderer-only. Wire to a mutation when the sidecar exposes one.
 import { useState } from 'react';
 
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@kubetail/ui/elements/select';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@kubetail/ui/elements/select';
 
 import { useKubeConfig } from '@/lib/kube-config';
 

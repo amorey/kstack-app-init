@@ -39,7 +39,7 @@ const ChatStreamSubscription = graphql(`
   }
 `);
 
-type Msg = { role: 'user' | 'assistant'; content: string };
+type Msg = { id: string; from: 'user' | 'assistant'; content: string };
 
 function Chat() {
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -67,7 +67,7 @@ function Chat() {
       if (chunk.done) {
         if (finishedRef.current) return next;
         finishedRef.current = true;
-        setMessages((m) => [...m, { role: 'assistant', content: next }]);
+        setMessages((m) => [...m, { id: crypto.randomUUID(), from: 'assistant', content: next }]);
         setStreamed('');
         setPending(null);
       } else {
@@ -80,7 +80,7 @@ function Chat() {
   const send = () => {
     const text = draft.trim();
     if (!text || pending) return;
-    const next: Msg[] = [...messages, { role: 'user', content: text }];
+    const next: Msg[] = [...messages, { id: crypto.randomUUID(), from: 'user', content: text }];
     finishedRef.current = false;
     setMessages(next);
     setDraft('');
@@ -95,12 +95,12 @@ function Chat() {
           {messages.length === 0 && !pending && (
             <p className="text-sm text-muted-foreground">Say hi to start a chat.</p>
           )}
-          {messages.map((m, i) => (
-            <Bubble key={i} role={m.role}>
+          {messages.map((m) => (
+            <Bubble key={m.id} from={m.from}>
               {m.content}
             </Bubble>
           ))}
-          {pending && <Bubble role="assistant">{streamed || '…'}</Bubble>}
+          {pending && <Bubble from="assistant">{streamed || '…'}</Bubble>}
         </div>
         <form
           className="flex gap-2"
@@ -124,11 +124,11 @@ function Chat() {
   );
 }
 
-function Bubble({ role, children }: { role: 'user' | 'assistant'; children: React.ReactNode }) {
+function Bubble({ from, children }: { from: 'user' | 'assistant'; children: React.ReactNode }) {
   return (
     <div
       className={
-        role === 'user'
+        from === 'user'
           ? 'ml-auto max-w-[80%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground whitespace-pre-wrap'
           : 'mr-auto max-w-[80%] rounded-lg bg-muted px-3 py-2 text-sm whitespace-pre-wrap'
       }
