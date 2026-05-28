@@ -16,7 +16,6 @@ package k8shelpers
 
 import (
 	"log/slog"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -63,36 +62,39 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 		return nil, err
 	}
 
-	// Attach fsnotify to each precedence path. For paths whose file is
-	// missing today, fall back to watching the parent directory so a
-	// later CREATE delivers an event — the start() filter narrows those
-	// down to just our files. Parent-dir adds are deduped (multiple
-	// missing precedence files in the same dir share one watch).
+	// Always watch the parent directory of each precedence path, never
+	// the file itself. Two reasons:
+	//
+	//   1. Linux inotify detaches a file-level watch the moment the
+	//      inode is unlinked or renamed (the editor / clientcmd
+	//      atomic-replace pattern). Subsequent writes to the new inode
+	//      go unobserved. Parent-dir watches don't have this problem —
+	//      they keep firing across rename-over-write cycles.
+	//   2. It uniformly handles "file exists" and "file absent at
+	//      startup" — the same parent watch surfaces a later CREATE.
+	//
+	// inotify and ReadDirectoryChangesW deliver child events natively
+	// when a directory is watched; macOS kqueue does it via fsnotify's
+	// watchDirectoryFiles helper. The start() filter trims dir-level
+	// noise down to just our precedence paths.
 	watchedPaths := make(map[string]struct{}, len(loadingRules.GetLoadingPrecedence()))
 	watchedDirs := make(map[string]struct{})
 	for _, pathname := range loadingRules.GetLoadingPrecedence() {
 		clean := filepath.Clean(pathname)
 		watchedPaths[clean] = struct{}{}
 
-		if err := watcher.Add(pathname); err != nil {
-			if !os.IsNotExist(err) {
-				watcher.Close()
-				return nil, err
-			}
-			// File missing — watch the parent so we observe the CREATE.
-			dir := filepath.Dir(clean)
-			if _, already := watchedDirs[dir]; already {
-				continue
-			}
-			if dirErr := watcher.Add(dir); dirErr != nil {
-				// Parent dir missing too — nothing to attach to. Skip;
-				// the watcher stays usable, just blind to this file.
-				slog.Info("kubeconfig path absent and parent unwatchable, skipping",
-					"path", pathname, "parent", dir, "err", dirErr)
-				continue
-			}
-			watchedDirs[dir] = struct{}{}
+		dir := filepath.Dir(clean)
+		if _, already := watchedDirs[dir]; already {
+			continue
 		}
+		if err := watcher.Add(dir); err != nil {
+			// Parent dir doesn't exist (or is unwatchable). Skip; the
+			// watcher stays usable, just blind to this path.
+			slog.Info("kubeconfig parent dir unwatchable, skipping",
+				"path", pathname, "parent", dir, "err", err)
+			continue
+		}
+		watchedDirs[dir] = struct{}{}
 	}
 
 	// Load whatever clientcmd resolves from the precedence list. Returns

@@ -16,7 +16,7 @@
 // currentContext off the `kubeConfigWatch` snapshot. Local selection
 // state for now — no setKubeContext mutation exists yet, so changes are
 // renderer-only. Wire to a mutation when the sidecar exposes one.
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
 import {
   Select,
@@ -30,16 +30,10 @@ import { useKubeConfig } from '@/lib/kube-config';
 
 export function KubeContextPicker() {
   const { kubeConfig } = useKubeConfig();
+  // null = user hasn't picked yet; render-time fallback below follows the
+  // watcher's currentContext until they do. Once they pick, their choice
+  // sticks until they pick again.
   const [selected, setSelected] = useState<string | null>(null);
-
-  // Adopt the watcher's currentContext as the initial selection, and
-  // re-sync if it changes on disk while the user hasn't picked anything
-  // yet. Once the user picks, their choice sticks until they pick again.
-  useEffect(() => {
-    if (selected === null && kubeConfig?.currentContext) {
-      setSelected(kubeConfig.currentContext);
-    }
-  }, [kubeConfig?.currentContext, selected]);
 
   const contexts = kubeConfig?.contexts ?? [];
   const value = selected ?? kubeConfig?.currentContext ?? '';
@@ -53,7 +47,7 @@ export function KubeContextPicker() {
   }
 
   return (
-    <Select value={value} onValueChange={(v) => setSelected(v as string)}>
+    <Select value={value} onValueChange={(v) => setSelected(v)}>
       <SelectTrigger size="sm" className="min-w-[10rem]">
         <SelectValue placeholder="Select context" />
       </SelectTrigger>
