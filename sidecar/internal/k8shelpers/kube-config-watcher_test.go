@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -202,23 +203,119 @@ func TestKubeConfigWatcherSubscribeModified(t *testing.T) {
 	assert.Equal(t, cfg1.CurrentContext, cfgActual.CurrentContext)
 }
 
+// A missing kubeconfig is non-fatal: the watcher constructs successfully
+// with an empty *api.Config seed so resolvers stay safe and the renderer
+// can surface the empty state. (Picking up a file that appears later is
+// a separate enhancement.)
 func TestKubeConfigWatcher_FileNotFound(t *testing.T) {
-	// Create temporary directory
 	tempDir, err := os.MkdirTemp("", "kube-config-watcher-test-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir) // Clean up after test
+	defer os.RemoveAll(tempDir)
 
-	// Define non-existent path
 	nonExistentPath := filepath.Join(tempDir, "non-existent-config")
 
-	// Initialize watcher
-	_, err = NewKubeConfigWatcher(nonExistentPath)
+	w, err := NewKubeConfigWatcher(nonExistentPath)
+	require.NoError(t, err)
+	defer w.Close()
 
-	// Assert error
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), fmt.Sprintf("kubeconfig file not found at '%s'", nonExistentPath))
-	assert.Contains(t, err.Error(), "use the '--kubeconfig' flag")
-	assert.Contains(t, err.Error(), "use the '--in-cluster' flag")
+	cfg := w.Get()
+	require.NotNil(t, cfg)
+	assert.Empty(t, cfg.AuthInfos)
+	assert.Empty(t, cfg.Clusters)
+	assert.Empty(t, cfg.Contexts)
+}
+
+// atomicReplaceKubeConfig writes a fresh config to a temp sibling and
+// renames it over the target — the editor-style "write to .swp / rename"
+// pattern that detaches a file-level fsnotify watch on the first rename.
+// (clientcmd.WriteToFile is in-place truncate, so it can't exercise this.)
+func atomicReplaceKubeConfig(t *testing.T, kubeconfigPath string) *clientcmdapi.Config {
+	t.Helper()
+	tmp := kubeconfigPath + ".tmp"
+	cfg, err := createKubeConfig(tmp)
+	require.NoError(t, err)
+	require.NoError(t, os.Rename(tmp, kubeconfigPath))
+	return cfg
+}
+
+// Editors and many config-management tools use write-tmp-then-rename,
+// which detaches a file-level fsnotify watch on the first rename. The
+// watcher must remain observant across repeated atomic writes — emit one
+// reload per write, indefinitely, without restart.
+func TestKubeConfigWatcher_HandlesRepeatedAtomicWrites(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "kube-config-watcher-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	kubeconfigPath := filepath.Join(tempDir, "config")
+
+	// File exists at startup so the watcher takes the file-present code path.
+	_, err = createKubeConfig(kubeconfigPath)
+	require.NoError(t, err)
+
+	w, err := NewKubeConfigWatcher(kubeconfigPath)
+	require.NoError(t, err)
+	defer w.Close()
+
+	sub := w.Subscribe()
+	defer sub.Close()
+
+	// Drain the seeded initial value.
+	select {
+	case <-sub.Chan():
+	case <-time.After(time.Second):
+		t.Fatal("expected initial seeded value")
+	}
+
+	for i := 0; i < 2; i++ {
+		cfgExpected := atomicReplaceKubeConfig(t, kubeconfigPath)
+
+		select {
+		case cfgActual := <-sub.Chan():
+			compareMaps(t, cfgExpected.Clusters, cfgActual.Clusters)
+			assert.Equal(t, cfgExpected.CurrentContext, cfgActual.CurrentContext)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("reload %d did not arrive — file watch likely detached after the first atomic write", i+1)
+		}
+	}
+}
+
+// When the configured path doesn't exist at start time, the watcher must
+// still publish a reload event once the file appears on disk. Without
+// parent-dir watching, fsnotify can't observe a CREATE on an absent file.
+func TestKubeConfigWatcher_PicksUpFileCreatedAfterStart(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "kube-config-watcher-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	kubeconfigPath := filepath.Join(tempDir, "config")
+
+	w, err := NewKubeConfigWatcher(kubeconfigPath)
+	require.NoError(t, err)
+	defer w.Close()
+
+	sub := w.Subscribe()
+	defer sub.Close()
+
+	// Drain the empty seed so the next Chan read is the post-create reload.
+	select {
+	case <-sub.Chan():
+	case <-time.After(time.Second):
+		t.Fatal("expected initial seeded value")
+	}
+
+	cfgExpected, err := createKubeConfig(kubeconfigPath)
+	require.NoError(t, err)
+
+	select {
+	case cfgActual := <-sub.Chan():
+		compareMaps(t, cfgExpected.Clusters, cfgActual.Clusters)
+		compareMaps(t, cfgExpected.AuthInfos, cfgActual.AuthInfos)
+		compareMaps(t, cfgExpected.Contexts, cfgActual.Contexts)
+		assert.Equal(t, cfgExpected.CurrentContext, cfgActual.CurrentContext)
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not publish reload after kubeconfig was created")
+	}
 }

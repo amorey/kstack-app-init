@@ -22,7 +22,9 @@ import { ConnectionStatus } from '@/lib/connection-status';
 import { ErrorBoundary } from '@/lib/error-boundary';
 import { createGraphqlClient } from '@/lib/graphql/client';
 import { ReadyGate } from '@/lib/ready-gate';
+import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 import { SyncHealthBadge } from '@/components/widgets/sync-health-badge';
+import { KubeConfigProvider } from '@/lib/kube-config';
 import { SyncStatusProvider } from '@/lib/sync-status';
 
 const TanStackRouterDevtools =
@@ -59,15 +61,20 @@ function RootComponent() {
         <SessionProvider>
           <UrqlProvider value={gqlClient}>
             <SyncStatusProvider>
-              <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
-                <SyncHealthBadge />
-                <ProfileMenu />
-              </div>
-              <ConnectionStatus />
-              <Outlet />
-              <Suspense>
-                <TanStackRouterDevtools />
-              </Suspense>
+              <KubeConfigProvider>
+                <div className="fixed left-3 top-3 z-50">
+                  <KubeContextPicker />
+                </div>
+                <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
+                  <SyncHealthBadge />
+                  <ProfileMenu />
+                </div>
+                <ConnectionStatus />
+                <Outlet />
+                <Suspense>
+                  <TanStackRouterDevtools />
+                </Suspense>
+              </KubeConfigProvider>
             </SyncStatusProvider>
           </UrqlProvider>
         </SessionProvider>

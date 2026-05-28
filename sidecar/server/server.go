@@ -19,6 +19,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
 	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
@@ -56,8 +57,9 @@ type Config struct {
 	Store    *syncstore.Store[prefs.Settings]
 	Hub      *prefs.Hub
 	Creds    *authcreds.Holder
-	Sync     graph.StatusSource
-	Queue    *mutationqueue.Queue
+	Sync       graph.StatusSource
+	Queue      *mutationqueue.Queue
+	KubeConfig *k8shelpers.KubeConfigWatcher
 	// Poke triggers an immediate engine resync, invoked by the host-only
 	// /control/wake endpoint. nil ⇒ no-op.
 	Poke func()
@@ -93,11 +95,12 @@ func NewHandler(cfg Config) http.Handler {
 		queue = mutationqueue.New(SyncPath(DefaultPrefsPath(), "mutations.json"))
 	}
 	r := &graph.Resolver{
-		Cloud: cloud.New(cfg.CloudURL),
-		Store: store,
-		Hub:   hub,
-		Queue: queue,
-		Sync:  status,
+		Cloud:             cloud.New(cfg.CloudURL),
+		Store:             store,
+		Hub:               hub,
+		Queue:             queue,
+		Sync:              status,
+		KubeConfigWatcher: cfg.KubeConfig,
 	}
 	poke := cfg.Poke
 	if poke == nil {

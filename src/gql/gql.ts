@@ -15,11 +15,13 @@ import type { TypedDocumentNode as DocumentNode } from '@graphql-typed-document-
  */
 type Documents = {
     "\n  subscription Tick {\n    tick\n  }\n": typeof types.TickDocument,
+    "\n  subscription KubeConfigWatch {\n    kubeConfigWatch {\n      type\n      object {\n        currentContext\n        authInfos {\n          name\n          locationOfOrigin\n        }\n        clusters {\n          name\n          locationOfOrigin\n          server\n        }\n        contexts {\n          name\n          locationOfOrigin\n          cluster\n          authInfo\n          namespace\n        }\n      }\n    }\n  }\n": typeof types.KubeConfigWatchDocument,
     "\n  subscription SyncStatusWatch {\n    syncStatusWatch {\n      state\n      lastError\n      lastSyncedAt\n      retryAt\n    }\n  }\n": typeof types.SyncStatusWatchDocument,
     "\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n": typeof types.ChatStreamDocument,
 };
 const documents: Documents = {
     "\n  subscription Tick {\n    tick\n  }\n": types.TickDocument,
+    "\n  subscription KubeConfigWatch {\n    kubeConfigWatch {\n      type\n      object {\n        currentContext\n        authInfos {\n          name\n          locationOfOrigin\n        }\n        clusters {\n          name\n          locationOfOrigin\n          server\n        }\n        contexts {\n          name\n          locationOfOrigin\n          cluster\n          authInfo\n          namespace\n        }\n      }\n    }\n  }\n": types.KubeConfigWatchDocument,
     "\n  subscription SyncStatusWatch {\n    syncStatusWatch {\n      state\n      lastError\n      lastSyncedAt\n      retryAt\n    }\n  }\n": types.SyncStatusWatchDocument,
     "\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n": types.ChatStreamDocument,
 };
@@ -42,6 +44,10 @@ export function graphql(source: string): unknown;
  * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
  */
 export function graphql(source: "\n  subscription Tick {\n    tick\n  }\n"): (typeof documents)["\n  subscription Tick {\n    tick\n  }\n"];
+/**
+ * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
+ */
+export function graphql(source: "\n  subscription KubeConfigWatch {\n    kubeConfigWatch {\n      type\n      object {\n        currentContext\n        authInfos {\n          name\n          locationOfOrigin\n        }\n        clusters {\n          name\n          locationOfOrigin\n          server\n        }\n        contexts {\n          name\n          locationOfOrigin\n          cluster\n          authInfo\n          namespace\n        }\n      }\n    }\n  }\n"): (typeof documents)["\n  subscription KubeConfigWatch {\n    kubeConfigWatch {\n      type\n      object {\n        currentContext\n        authInfos {\n          name\n          locationOfOrigin\n        }\n        clusters {\n          name\n          locationOfOrigin\n          server\n        }\n        contexts {\n          name\n          locationOfOrigin\n          cluster\n          authInfo\n          namespace\n        }\n      }\n    }\n  }\n"];
 /**
  * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
  */

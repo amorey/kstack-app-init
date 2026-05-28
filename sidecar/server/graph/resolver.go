@@ -1,5 +1,7 @@
 package graph
 
+//go:generate go run github.com/99designs/gqlgen generate
+
 // This file will not be regenerated automatically.
 //
 // It serves as dependency injection for your app, add any dependencies you require
@@ -13,10 +15,12 @@ import (
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
 	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
+	"github.com/kubetail-org/kstack-app/sidecar/server/graph/model"
 )
 
 // Resolver carries the dependencies every operation needs: a Client for
@@ -27,11 +31,12 @@ import (
 // Hub (the engine is the only cloud talker); Cloud is retained only for
 // the `updateSettings` write-through.
 type Resolver struct {
-	Cloud *cloud.Client
-	Store *syncstore.Store[prefs.Settings]
-	Hub   *prefs.Hub
-	Sync  StatusSource
-	Queue *mutationqueue.Queue
+	Cloud      *cloud.Client
+	Store      *syncstore.Store[prefs.Settings]
+	Hub        *prefs.Hub
+	Sync       StatusSource
+	Queue      *mutationqueue.Queue
+	KubeConfigWatcher *k8shelpers.KubeConfigWatcher
 }
 
 // StatusSource is the slice of the always-on engine the syncStatus
@@ -45,22 +50,22 @@ type StatusSource interface {
 // cloudInput converts the gqlgen-generated input type into the cloud
 // client's mirror type. Lives here (hand-written file) so gqlgen doesn't
 // relocate it into a regenerated resolver file.
-func cloudInput(in UpdateSettingsInput) cloud.UpdateInput {
+func cloudInput(in model.UpdateSettingsInput) cloud.UpdateInput {
 	return cloud.UpdateInput{Placeholder: in.Placeholder}
 }
 
 // graphSyncState maps the engine's State enum onto the generated GraphQL
 // enum. The four engine states are total; default is defensive only.
-func graphSyncState(s syncpkg.State) SyncState {
+func graphSyncState(s syncpkg.State) model.SyncState {
 	switch s {
 	case syncpkg.StateConnecting:
-		return SyncStateConnecting
+		return model.SyncStateConnecting
 	case syncpkg.StateLive:
-		return SyncStateLive
+		return model.SyncStateLive
 	case syncpkg.StateBackoff:
-		return SyncStateBackoff
+		return model.SyncStateBackoff
 	default:
-		return SyncStateOffline
+		return model.SyncStateOffline
 	}
 }
 
@@ -68,7 +73,7 @@ func graphSyncState(s syncpkg.State) SyncState {
 // type. Timestamps are Unix-millis ints (0 when zero-valued); RetryAt is
 // only meaningful while backing off (the engine's Status documents this
 // invariant — the mapper just honors it).
-func toGraphSyncStatus(s syncpkg.Status) *SyncStatus {
+func toGraphSyncStatus(s syncpkg.Status) *model.SyncStatus {
 	ms := func(t time.Time) int {
 		if t.IsZero() {
 			return 0
@@ -79,7 +84,7 @@ func toGraphSyncStatus(s syncpkg.Status) *SyncStatus {
 	if s.State == syncpkg.StateBackoff {
 		retry = ms(s.RetryAt)
 	}
-	return &SyncStatus{
+	return &model.SyncStatus{
 		State:        graphSyncState(s.State),
 		LastError:    s.LastError,
 		LastSyncedAt: ms(s.LastSyncedAt),
@@ -147,6 +152,6 @@ func bearer(ctx context.Context) string {
 // toGraphSettings converts the persistence model into gqlgen's generated
 // Settings type. They have the same shape today, but keeping the
 // conversion explicit means schema and cache can evolve independently.
-func toGraphSettings(s prefs.Settings) *Settings {
-	return &Settings{Placeholder: s.Placeholder}
+func toGraphSettings(s prefs.Settings) *model.Settings {
+	return &model.Settings{Placeholder: s.Placeholder}
 }

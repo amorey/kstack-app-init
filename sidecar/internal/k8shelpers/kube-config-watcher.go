@@ -15,9 +15,9 @@
 package k8shelpers
 
 import (
-	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -39,10 +39,19 @@ type KubeConfigWatcher struct {
 	watcher      *fsnotify.Watcher
 	hub          *watch.Hub[*api.Config]
 	tx           *watch.Sender[*api.Config]
+	// Canonicalized precedence paths. Used to filter fsnotify events down
+	// to relevant files when we're watching parent directories (which
+	// emit events for every child).
+	watchedPaths map[string]struct{}
 	mu           sync.RWMutex
 }
 
-// Creates new KubeConfigWatcher instance
+// NewKubeConfigWatcher constructs a watcher that always returns a usable
+// instance. Missing kubeconfig paths are skipped (logged, not fatal) so
+// the sidecar can start on a fresh machine with no cluster wired up — the
+// renderer's empty-state surfaces this. fsnotify-NewWatcher failures
+// (kernel-level: ENOMEM, ulimit, /proc not mounted) are the only fatal
+// case left, since without an inotify handle we can't watch anything.
 func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 	// Initialize loading rules (outsources kubeconfig file/env handling to clientcmd library)
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
@@ -54,30 +63,60 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 		return nil, err
 	}
 
-	// Watch kubeconfig paths
+	// Attach fsnotify to each precedence path. For paths whose file is
+	// missing today, fall back to watching the parent directory so a
+	// later CREATE delivers an event — the start() filter narrows those
+	// down to just our files. Parent-dir adds are deduped (multiple
+	// missing precedence files in the same dir share one watch).
+	watchedPaths := make(map[string]struct{}, len(loadingRules.GetLoadingPrecedence()))
+	watchedDirs := make(map[string]struct{})
 	for _, pathname := range loadingRules.GetLoadingPrecedence() {
-		err = watcher.Add(pathname)
-		if err != nil {
-			watcher.Close()
-			if os.IsNotExist(err) {
-				return nil, fmt.Errorf("kubeconfig file not found at '%s'.\n\nPlease ensure the file exists or use the '--kubeconfig' flag to specify a custom path.\nIf you are running inside a cluster, use the '--in-cluster' flag", pathname)
+		clean := filepath.Clean(pathname)
+		watchedPaths[clean] = struct{}{}
+
+		if err := watcher.Add(pathname); err != nil {
+			if !os.IsNotExist(err) {
+				watcher.Close()
+				return nil, err
 			}
-			return nil, err
+			// File missing — watch the parent so we observe the CREATE.
+			dir := filepath.Dir(clean)
+			if _, already := watchedDirs[dir]; already {
+				continue
+			}
+			if dirErr := watcher.Add(dir); dirErr != nil {
+				// Parent dir missing too — nothing to attach to. Skip;
+				// the watcher stays usable, just blind to this file.
+				slog.Info("kubeconfig path absent and parent unwatchable, skipping",
+					"path", pathname, "parent", dir, "err", dirErr)
+				continue
+			}
+			watchedDirs[dir] = struct{}{}
 		}
 	}
 
-	hub := watch.New[*api.Config](nil)
+	// Load whatever clientcmd resolves from the precedence list. Returns
+	// an empty *api.Config (not an error) when no file is found, which is
+	// the state we want to seed: subscribers get a real pointer, field
+	// resolvers iterate empty maps, the picker renders the empty state.
+	cfg, err := loadingRules.Load()
+	if err != nil {
+		// Load only errors on a malformed file, not on absence. Treat as
+		// non-fatal: log it and degrade to an empty config so the rest of
+		// the sidecar surfaces stay up.
+		slog.Warn("kubeconfig load failed, starting with empty config", "err", err)
+		cfg = &api.Config{}
+	}
 
-	// Initialize kube-config-watcher instance
+	hub := watch.New[*api.Config](cfg)
 	w := &KubeConfigWatcher{
+		kubeConfig:   cfg,
 		loadingRules: loadingRules,
 		watcher:      watcher,
 		hub:          hub,
 		tx:           hub.Sender(),
+		watchedPaths: watchedPaths,
 	}
-
-	// Initialize config
-	w.reloadConfig() //nolint:errcheck
 
 	// Start event listeners
 	go w.start()
@@ -127,6 +166,13 @@ func (w *KubeConfigWatcher) start() {
 			// Kill goroutine on watcher close
 			if !ok {
 				return
+			}
+
+			// Ignore events for files we don't care about. When a parent
+			// dir is watched (for absent precedence paths), fsnotify
+			// delivers events for every child — drop noise here.
+			if _, ok := w.watchedPaths[filepath.Clean(fsEv.Name)]; !ok {
+				continue
 			}
 
 			// Handle fsnotify Create, Write, Remove events

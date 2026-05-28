@@ -10,8 +10,36 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/anthropics/anthropic-sdk-go"
+	anthropic "github.com/anthropics/anthropic-sdk-go"
+	"github.com/kubetail-org/kstack-app/sidecar/server/graph/model"
 )
+
+// AuthInfos is the resolver for the authInfos field.
+func (r *kubeConfigResolver) AuthInfos(ctx context.Context, obj *model.KubeConfig) ([]*model.KubeConfigAuthInfo, error) {
+	outList := make([]*model.KubeConfigAuthInfo, 0, len(obj.Config.AuthInfos))
+	for name, val := range obj.Config.AuthInfos {
+		outList = append(outList, &model.KubeConfigAuthInfo{AuthInfo: val, Name: name})
+	}
+	return outList, nil
+}
+
+// Clusters is the resolver for the clusters field.
+func (r *kubeConfigResolver) Clusters(ctx context.Context, obj *model.KubeConfig) ([]*model.KubeConfigCluster, error) {
+	outList := make([]*model.KubeConfigCluster, 0, len(obj.Config.Clusters))
+	for name, val := range obj.Config.Clusters {
+		outList = append(outList, &model.KubeConfigCluster{Cluster: val, Name: name})
+	}
+	return outList, nil
+}
+
+// Contexts is the resolver for the contexts field.
+func (r *kubeConfigResolver) Contexts(ctx context.Context, obj *model.KubeConfig) ([]*model.KubeConfigContext, error) {
+	outList := make([]*model.KubeConfigContext, 0, len(obj.Config.Contexts))
+	for name, val := range obj.Config.Contexts {
+		outList = append(outList, &model.KubeConfigContext{Context: val, Name: name})
+	}
+	return outList, nil
+}
 
 // UpdateSettings is the resolver for the updateSettings field.
 // Write-through: push to the cloud, then publish to the shared Hub so
@@ -21,7 +49,7 @@ import (
 // the engine's version/mirror coherent). Read-after-write via the
 // `settings` query may briefly lag, but the UI consumes `settingsWatch`,
 // which the Hub publish satisfies at once.
-func (r *mutationResolver) UpdateSettings(ctx context.Context, input UpdateSettingsInput) (*Settings, error) {
+func (r *mutationResolver) UpdateSettings(ctx context.Context, input model.UpdateSettingsInput) (*model.Settings, error) {
 	ci := cloudInput(input)
 	out, err := r.Cloud.UpdateSettings(ctx, bearer(ctx), ci)
 	if err != nil {
@@ -46,7 +74,7 @@ func (r *queryResolver) Ping(ctx context.Context) (string, error) {
 // the engine-maintained syncstore — the engine owns the only cloud
 // connection, so reads never touch the network. An empty store (engine
 // never synced, e.g. logged out) yields the zero value, not an error.
-func (r *queryResolver) Settings(ctx context.Context) (*Settings, error) {
+func (r *queryResolver) Settings(ctx context.Context) (*model.Settings, error) {
 	env, err := r.Store.Load()
 	if err != nil {
 		return nil, err
@@ -55,7 +83,7 @@ func (r *queryResolver) Settings(ctx context.Context) (*Settings, error) {
 }
 
 // SyncStatus is the resolver for the syncStatus field.
-func (r *queryResolver) SyncStatus(ctx context.Context) (*SyncStatus, error) {
+func (r *queryResolver) SyncStatus(ctx context.Context) (*model.SyncStatus, error) {
 	return toGraphSyncStatus(r.Sync.Status()), nil
 }
 
@@ -89,9 +117,9 @@ func (r *subscriptionResolver) Tick(ctx context.Context) (<-chan int, error) {
 // fans cloud changes (plus mutation publishes) through this Hub. A new
 // subscriber gets the current syncstore snapshot first so it doesn't have
 // to wait for the next change, then live Hub deltas.
-func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *Settings, error) {
+func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *model.Settings, error) {
 	hubCh, unsub := r.Hub.Subscribe()
-	return streamWithSnapshot(ctx, hubCh, unsub, toGraphSettings, func() (*Settings, bool) {
+	return streamWithSnapshot(ctx, hubCh, unsub, toGraphSettings, func() (*model.Settings, bool) {
 		// A failed load (e.g. nothing persisted yet) is non-fatal here:
 		// ok=false skips the snapshot (see streamWithSnapshot's doc).
 		env, err := r.Store.Load()
@@ -105,9 +133,9 @@ func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *Setti
 // SyncStatusWatch is the resolver for the syncStatusWatch field. Emits
 // the current status immediately (so a new subscriber doesn't wait for the
 // next transition), then every subsequent transition from the engine.
-func (r *subscriptionResolver) SyncStatusWatch(ctx context.Context) (<-chan *SyncStatus, error) {
+func (r *subscriptionResolver) SyncStatusWatch(ctx context.Context) (<-chan *model.SyncStatus, error) {
 	sub, unsub := r.Sync.WatchStatus()
-	return streamWithSnapshot(ctx, sub, unsub, toGraphSyncStatus, func() (*SyncStatus, bool) {
+	return streamWithSnapshot(ctx, sub, unsub, toGraphSyncStatus, func() (*model.SyncStatus, bool) {
 		return toGraphSyncStatus(r.Sync.Status()), true
 	}), nil
 }
@@ -117,7 +145,7 @@ func (r *subscriptionResolver) SyncStatusWatch(ctx context.Context) (<-chan *Syn
 // Emits `{delta, done:false}` per text chunk and a final `{delta:"", done:true}`
 // frame so the client can tear down without the subscribe-exchange treating
 // the channel close as a transport drop (which would trigger reconnect).
-func (r *subscriptionResolver) ChatStream(ctx context.Context, input ChatInput) (<-chan *ChatChunk, error) {
+func (r *subscriptionResolver) ChatStream(ctx context.Context, input model.ChatInput) (<-chan *model.ChatChunk, error) {
 	msgs := make([]anthropic.MessageParam, 0, len(input.Messages))
 	for _, m := range input.Messages {
 		block := anthropic.NewTextBlock(m.Content)
@@ -127,10 +155,10 @@ func (r *subscriptionResolver) ChatStream(ctx context.Context, input ChatInput) 
 			msgs = append(msgs, anthropic.NewUserMessage(block))
 		}
 	}
-	ch := make(chan *ChatChunk)
+	ch := make(chan *model.ChatChunk)
 	go func() {
 		defer close(ch)
-		emit := func(c *ChatChunk) bool {
+		emit := func(c *model.ChatChunk) bool {
 			select {
 			case ch <- c:
 				return true
@@ -152,16 +180,16 @@ func (r *subscriptionResolver) ChatStream(ctx context.Context, input ChatInput) 
 			evt := stream.Current()
 			if d, ok := evt.AsAny().(anthropic.ContentBlockDeltaEvent); ok {
 				if td, ok := d.Delta.AsAny().(anthropic.TextDelta); ok && td.Text != "" {
-					if !emit(&ChatChunk{Delta: td.Text, Done: false}) {
+					if !emit(&model.ChatChunk{Delta: td.Text, Done: false}) {
 						return
 					}
 				}
 			}
 		}
 		if err := stream.Err(); err != nil {
-			emit(&ChatChunk{Delta: "error: " + err.Error(), Done: true})
+			emit(&model.ChatChunk{Delta: "error: " + err.Error(), Done: true})
 		} else {
-			emit(&ChatChunk{Delta: "", Done: true})
+			emit(&model.ChatChunk{Delta: "", Done: true})
 		}
 		// Keep the channel open until the client unsubscribes. If we
 		// returned here, gqlgen would emit a `complete` frame and the
@@ -175,6 +203,61 @@ func (r *subscriptionResolver) ChatStream(ctx context.Context, input ChatInput) 
 	return ch, nil
 }
 
+// KubeConfigWatch is the resolver for the kubeConfigWatch field. The
+// first frame is ADDED with whatever the watcher's hub currently holds
+// (seeded with the loaded config at NewKubeConfigWatcher); subsequent
+// frames are MODIFIED, one per reload. Defensive nil-skip in case the
+// hub ever publishes a nil slot.
+func (r *subscriptionResolver) KubeConfigWatch(ctx context.Context) (<-chan *model.KubeConfigWatchEvent, error) {
+	if r.KubeConfigWatcher == nil {
+		// Parallels noopStatus / closed-channel defaults the rest of
+		// NewHandler installs: a Config{} handler must not panic on
+		// kubeConfigWatch — stream nothing, end immediately.
+		ch := make(chan *model.KubeConfigWatchEvent)
+		close(ch)
+		return ch, nil
+	}
+	sub := r.KubeConfigWatcher.Subscribe()
+	out := make(chan *model.KubeConfigWatchEvent)
+	go func() {
+		defer close(out)
+		defer sub.Close()
+		first := true
+		ch := sub.Chan()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case cfg, ok := <-ch:
+				if !ok {
+					return
+				}
+				if cfg == nil {
+					continue
+				}
+				t := model.WatchEventTypeModified
+				if first {
+					t = model.WatchEventTypeAdded
+					first = false
+				}
+				ev := &model.KubeConfigWatchEvent{
+					Type:   t,
+					Object: &model.KubeConfig{Config: cfg},
+				}
+				select {
+				case out <- ev:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out, nil
+}
+
+// KubeConfig returns KubeConfigResolver implementation.
+func (r *Resolver) KubeConfig() KubeConfigResolver { return &kubeConfigResolver{r} }
+
 // Mutation returns MutationResolver implementation.
 func (r *Resolver) Mutation() MutationResolver { return &mutationResolver{r} }
 
@@ -184,6 +267,7 @@ func (r *Resolver) Query() QueryResolver { return &queryResolver{r} }
 // Subscription returns SubscriptionResolver implementation.
 func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionResolver{r} }
 
+type kubeConfigResolver struct{ *Resolver }
 type mutationResolver struct{ *Resolver }
 type queryResolver struct{ *Resolver }
 type subscriptionResolver struct{ *Resolver }

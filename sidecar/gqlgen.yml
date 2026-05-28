@@ -6,8 +6,8 @@ exec:
   package: graph
 
 model:
-  filename: server/graph/models_gen.go
-  package: graph
+  filename: server/graph/model/models_gen.go
+  package: model
 
 resolver:
   layout: follow-schema
@@ -15,12 +15,39 @@ resolver:
   package: graph
   filename_template: "{name}.resolvers.go"
 
-autobind: []
+autobind:
+  - github.com/kubetail-org/kstack-app/sidecar/server/graph/model
 
 models:
+  # --- KubeConfig ---
+  KubeConfig:
+    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfig
+    fields:
+      authInfos:
+        resolver: true
+      clusters:
+        resolver: true
+      contexts:
+        resolver: true
+
+  KubeConfigAuthInfo:
+    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfigAuthInfo
+
+  KubeConfigCluster:
+    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfigCluster
+
+  KubeConfigContext:
+    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfigContext
+
+  KubeConfigExtensions:
+    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfigExtensions
+
+  # --- gqlgen ---
   ID:
     model:
       - github.com/99designs/gqlgen/graphql.ID
+      - k8s.io/apimachinery/pkg/types.UID
+
   Int:
     model:
       - github.com/99designs/gqlgen/graphql.Int

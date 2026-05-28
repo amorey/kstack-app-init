@@ -26,6 +26,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/logging"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
@@ -43,6 +44,7 @@ func main() {
 	// callers only ever name the host.
 	cloudURL := flag.String("cloud-url", envOr("KSTACK_CLOUD_URL", "https://api.kstack.sh"), "base URL of the kstack cloud (without /graphql)")
 	prefsPath := flag.String("prefs-path", server.DefaultPrefsPath(), "path to the local preferences cache file")
+	kubeconfigPath := flag.String("kubeconfig", "", "explicit kubeconfig path; empty uses the clientcmd default-loading rules ($KUBECONFIG / ~/.kube/config)")
 	flag.Parse()
 
 	// Per-OS binding: AF_UNIX socket on Unix, named pipe on Windows.
@@ -80,6 +82,15 @@ func main() {
 	creds := authcreds.NewHolder()
 	cloudClient := cloud.New(*cloudURL)
 	queue := mutationqueue.New(server.SyncPath(*prefsPath, "mutations.json"))
+	// Always non-nil: the watcher tolerates missing/malformed kubeconfigs
+	// and seeds with an empty *api.Config so resolvers stay safe. Only
+	// fatal here is a kernel-level fsnotify failure (ENOMEM, ulimit).
+	kubeConfigWatcher, err := k8shelpers.NewKubeConfigWatcher(*kubeconfigPath)
+	if err != nil {
+		slog.Error("kubeconfig watcher init", "err", err)
+		os.Exit(1)
+	}
+	defer kubeConfigWatcher.Close()
 	engine := syncengine.New(
 		syncengine.NewCloudUpstream(cloudClient, creds),
 		syncStore,
@@ -101,13 +112,14 @@ func main() {
 		},
 	)
 	handler := server.NewHandler(server.Config{
-		CloudURL: *cloudURL,
-		Store:    syncStore,
-		Hub:      hub,
-		Creds:    creds,
-		Sync:     engine,
-		Queue:    queue,
-		Poke:     engine.Poke,
+		CloudURL:   *cloudURL,
+		Store:      syncStore,
+		Hub:        hub,
+		Creds:      creds,
+		Sync:       engine,
+		Queue:      queue,
+		Poke:       engine.Poke,
+		KubeConfig: kubeConfigWatcher,
 	})
 	wrapped, waitForHijacked := server.AttachGracefulShutdown(srv, handler)
 	srv.Handler = http.MaxBytesHandler(wrapped, maxRequestBytes)
