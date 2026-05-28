@@ -53,10 +53,10 @@ func (noopStatus) WatchStatus() (<-chan syncpkg.Status, func()) {
 // (Sync) yet needs Creds — a cycle only the composition root can break.
 // nil ⇒ fresh empties for tests that don't touch those surfaces.
 type Config struct {
-	CloudURL string
-	Store    *syncstore.Store[prefs.Settings]
-	Hub      *prefs.Hub
-	Creds    *authcreds.Holder
+	CloudURL   string
+	Store      *syncstore.Store[prefs.Settings]
+	Hub        *prefs.Hub
+	Creds      *authcreds.Holder
 	Sync       graph.StatusSource
 	Queue      *mutationqueue.Queue
 	KubeConfig *k8shelpers.KubeConfigWatcher

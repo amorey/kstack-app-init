@@ -31,11 +31,11 @@ import (
 // Hub (the engine is the only cloud talker); Cloud is retained only for
 // the `updateSettings` write-through.
 type Resolver struct {
-	Cloud      *cloud.Client
-	Store      *syncstore.Store[prefs.Settings]
-	Hub        *prefs.Hub
-	Sync       StatusSource
-	Queue      *mutationqueue.Queue
+	Cloud             *cloud.Client
+	Store             *syncstore.Store[prefs.Settings]
+	Hub               *prefs.Hub
+	Sync              StatusSource
+	Queue             *mutationqueue.Queue
 	KubeConfigWatcher *k8shelpers.KubeConfigWatcher
 }
 
