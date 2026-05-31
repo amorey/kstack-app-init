@@ -26,8 +26,8 @@
 //!   2. **Dialing.** Free functions [`connect`] / [`connect_with_budget`]
 //!      open a [`Stream`] against an `Endpoint` (with capped-backoff
 //!      retry), returning a type that impls `AsyncRead + AsyncWrite +
-//!      Unpin` — what hyper and tokio-tungstenite consume identically on
-//!      both platforms.
+//!      Unpin` — what hyper consumes identically on both platforms (for
+//!      both query calls and SSE subscription streams).
 //!
 //! "Socket" would only describe half of this (Windows named pipes aren't
 //! sockets in the Win32 sense); `ipc` is the platform-neutral name for
@@ -68,8 +68,7 @@ const MAX_RETRY_DELAY: Duration = Duration::from_millis(500);
 ///
 /// The [`interprocess`] crate hides the platform split: this resolves to
 /// a UDS stream on Unix and a named-pipe stream on Windows, both behind
-/// the same `AsyncRead + AsyncWrite + Unpin` surface that hyper and
-/// tokio-tungstenite consume.
+/// the same `AsyncRead + AsyncWrite + Unpin` surface that hyper consumes.
 pub type Stream = interprocess::local_socket::tokio::Stream;
 
 /// The address the sidecar listens on and the host dials.

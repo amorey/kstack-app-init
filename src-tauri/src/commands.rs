@@ -55,8 +55,8 @@ pub async fn graphql_query(state: State<'_, AppState>, body: String) -> Result<G
     state.sidecar.query(body).await
 }
 
-/// Registers a new GraphQL subscription on the host's shared
-/// graphql-transport-ws connection. Returns the op id urql will pass to
+/// Registers a new GraphQL subscription, which the host streams over its own
+/// SSE connection to the sidecar. Returns the op id urql will pass to
 /// [`graphql_unsubscribe`] on teardown. Argument shape matches
 /// `src/lib/graphql/subscribe-exchange.ts`.
 #[tauri::command]

@@ -1,27 +1,27 @@
 schema:
-  - server/graph/*.graphqls
+  - graph/*.graphqls
 
 exec:
-  filename: server/graph/generated.go
+  filename: graph/generated.go
   package: graph
 
 model:
-  filename: server/graph/model/models_gen.go
+  filename: graph/model/models_gen.go
   package: model
 
 resolver:
   layout: follow-schema
-  dir: server/graph
+  dir: graph
   package: graph
   filename_template: "{name}.resolvers.go"
 
 autobind:
-  - github.com/kubetail-org/kstack-app/sidecar/server/graph/model
+  - github.com/kubetail-org/kstack-app/sidecar/graph/model
 
 models:
   # --- KubeConfig ---
   KubeConfig:
-    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfig
+    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfig
     fields:
       authInfos:
         resolver: true
@@ -31,16 +31,16 @@ models:
         resolver: true
 
   KubeConfigAuthInfo:
-    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfigAuthInfo
+    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfigAuthInfo
 
   KubeConfigCluster:
-    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfigCluster
+    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfigCluster
 
   KubeConfigContext:
-    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfigContext
+    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfigContext
 
   KubeConfigExtensions:
-    model: github.com/kubetail-org/kstack-app/sidecar/server/graph/model.KubeConfigExtensions
+    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfigExtensions
 
   # --- gqlgen ---
   ID:

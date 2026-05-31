@@ -1,6 +1,6 @@
 //go:build !windows
 
-package main
+package ipc
 
 import (
 	"os"
@@ -16,14 +16,14 @@ import (
 // otherwise another local user on a shared box could connect during the
 // window between bind and chmod. See listen_unix.go for the umask dance
 // this guards.
-func TestListenSocket_IsOwnerOnly(t *testing.T) {
+func TestListen_IsOwnerOnly(t *testing.T) {
 	for _, umask := range []int{0o022, 0o000} {
 		t.Run("", func(t *testing.T) {
 			prev := syscall.Umask(umask)
 			defer syscall.Umask(prev)
 
 			path := filepath.Join(t.TempDir(), "s.sock")
-			ln, err := listenSocket(path)
+			ln, err := Listen(path)
 			require.NoError(t, err)
 			defer ln.Close()
 

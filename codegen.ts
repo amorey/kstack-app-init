@@ -4,7 +4,7 @@
 import type { CodegenConfig } from '@graphql-codegen/cli';
 
 const config: CodegenConfig = {
-  schema: 'sidecar/server/graph/schema.graphqls',
+  schema: 'sidecar/graph/schema.graphqls',
   documents: ['src/**/*.{ts,tsx}', '!src/gql/**'],
   ignoreNoDocuments: true,
   generates: {

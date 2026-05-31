@@ -15,6 +15,7 @@
 package k8shelpers
 
 import (
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"sync"
@@ -136,6 +137,66 @@ func (w *KubeConfigWatcher) Get() *api.Config {
 	}
 
 	return w.kubeConfig
+}
+
+// SetCurrentContext persists `name` as the kubeconfig current-context.
+//
+// It validates that the context exists in the loaded config (rejecting
+// empty/unknown names before touching disk), then writes the change via
+// clientcmd.ModifyConfig — not WriteToFile, which would flatten a
+// multi-file kubeconfig into one file and lose each entry's
+// locationOfOrigin. ModifyConfig writes the minimal current-context delta
+// to the file that already defines it (or, if unset, the first file in
+// precedence), matching `kubectl config use-context` semantics.
+//
+// The in-memory snapshot is updated and republished to subscribers
+// immediately rather than relying on the debounced fsnotify echo, so the
+// switch is delivered deterministically. The echo that follows reloads an
+// identical config — an idempotent, harmless second publish.
+func (w *KubeConfigWatcher) SetCurrentContext(name string) error {
+	updated, err := w.writeCurrentContext(name)
+	if err != nil {
+		return err
+	}
+
+	// Publish after releasing the lock so a slow receiver can't stall the
+	// fan-out while we hold w.mu (mirrors start()'s send-without-lock).
+	w.tx.Send(updated) //nolint:errcheck
+
+	return nil
+}
+
+// writeCurrentContext validates `name`, persists it as the current-context,
+// and updates the in-memory snapshot — all under the write lock. It returns
+// the new config for SetCurrentContext to publish once the lock is released.
+func (w *KubeConfigWatcher) writeCurrentContext(name string) (*api.Config, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.kubeConfig == nil {
+		return nil, fmt.Errorf("no kubeconfig loaded")
+	}
+	if name == "" {
+		return nil, fmt.Errorf("context name is empty")
+	}
+	if _, ok := w.kubeConfig.Contexts[name]; !ok {
+		return nil, fmt.Errorf("unknown context %q", name)
+	}
+
+	// ModifyConfig diffs against what's on disk and writes only the
+	// current-context change to the right file. Pass a copy so a write
+	// failure can't leave the in-memory CurrentContext mutated.
+	updated := w.kubeConfig.DeepCopy()
+	updated.CurrentContext = name
+
+	pathOptions := clientcmd.NewDefaultPathOptions()
+	pathOptions.LoadingRules = w.loadingRules
+	if err := clientcmd.ModifyConfig(pathOptions, *updated, false); err != nil {
+		return nil, err
+	}
+
+	w.kubeConfig = updated
+	return updated, nil
 }
 
 // Subscribe

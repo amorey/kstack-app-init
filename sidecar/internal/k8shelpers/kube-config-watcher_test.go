@@ -59,6 +59,25 @@ func createKubeConfig(kubeconfigPath string) (*clientcmdapi.Config, error) {
 	return cfg, nil
 }
 
+// Helper function to create a kubeconfig file with the given named
+// contexts (each with its own cluster + user) and current-context.
+func createKubeConfigWithContexts(kubeconfigPath, current string, contexts ...string) (*clientcmdapi.Config, error) {
+	cfg := clientcmdapi.NewConfig()
+	for _, name := range contexts {
+		cluster := fmt.Sprintf("cluster-%s", name)
+		user := fmt.Sprintf("user-%s", name)
+		cfg.Clusters[cluster] = &clientcmdapi.Cluster{}
+		cfg.AuthInfos[user] = &clientcmdapi.AuthInfo{}
+		cfg.Contexts[name] = &clientcmdapi.Context{Cluster: cluster, AuthInfo: user}
+	}
+	cfg.CurrentContext = current
+
+	if err := clientcmd.WriteToFile(*cfg, kubeconfigPath); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
 // Helper function to merge two maps
 func mergeMaps[K comparable, V any](a, b map[K]V) map[K]V {
 	out := make(map[K]V, len(a)+len(b))
@@ -201,6 +220,77 @@ func TestKubeConfigWatcherSubscribeModified(t *testing.T) {
 	compareMaps(t, expectedContexts, cfgActual.Contexts)
 
 	assert.Equal(t, cfg1.CurrentContext, cfgActual.CurrentContext)
+}
+
+// SetCurrentContext on a valid context must (1) persist to disk so kubectl
+// and other tools see the change, (2) update the in-memory snapshot, and
+// (3) republish the new config to subscribers without waiting on the
+// debounced fsnotify echo.
+func TestSetCurrentContext_ValidPersistsAndReloads(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "kube-config-watcher-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	kubeconfigPath := filepath.Join(tempDir, "config")
+	_, err = createKubeConfigWithContexts(kubeconfigPath, "context-A", "context-A", "context-B")
+	require.NoError(t, err)
+
+	w, err := NewKubeConfigWatcher(kubeconfigPath)
+	require.NoError(t, err)
+	defer w.Close()
+
+	sub := w.Subscribe()
+	defer sub.Close()
+
+	// Drain the seeded initial value.
+	select {
+	case <-sub.Chan():
+	case <-time.After(time.Second):
+		t.Fatal("expected initial seeded value")
+	}
+
+	require.NoError(t, w.SetCurrentContext("context-B"))
+
+	// In-memory snapshot reflects the change.
+	assert.Equal(t, "context-B", w.Get().CurrentContext)
+
+	// Persisted to disk (kubectl-visible).
+	onDisk, err := clientcmd.LoadFromFile(kubeconfigPath)
+	require.NoError(t, err)
+	assert.Equal(t, "context-B", onDisk.CurrentContext)
+
+	// Subscribers receive a config carrying the new current-context.
+	select {
+	case cfgActual := <-sub.Chan():
+		assert.Equal(t, "context-B", cfgActual.CurrentContext)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected republish after SetCurrentContext")
+	}
+}
+
+// SetCurrentContext on an unknown context must error and leave both disk
+// and the in-memory snapshot untouched.
+func TestSetCurrentContext_UnknownContextErrors(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "kube-config-watcher-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	kubeconfigPath := filepath.Join(tempDir, "config")
+	_, err = createKubeConfigWithContexts(kubeconfigPath, "context-A", "context-A", "context-B")
+	require.NoError(t, err)
+
+	w, err := NewKubeConfigWatcher(kubeconfigPath)
+	require.NoError(t, err)
+	defer w.Close()
+
+	err = w.SetCurrentContext("does-not-exist")
+	require.Error(t, err)
+
+	assert.Equal(t, "context-A", w.Get().CurrentContext)
+
+	onDisk, err := clientcmd.LoadFromFile(kubeconfigPath)
+	require.NoError(t, err)
+	assert.Equal(t, "context-A", onDisk.CurrentContext)
 }
 
 // A missing kubeconfig is non-fatal: the watcher constructs successfully

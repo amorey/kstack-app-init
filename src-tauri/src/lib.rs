@@ -22,29 +22,35 @@
 //! call it to build, configure, and run the Tauri application. The module
 //! layout:
 //!
+//! - [`app_menu`] — the application menu bar.
 //! - [`commands`] — `#[tauri::command]` handlers invoked from the webview.
 //! - `dock_menu` — custom macOS Dock menu (macOS only).
 //! - [`error`] — the host-wide [`AppError`](error::AppError) type.
-//! - [`helpers`] — menu and tray construction.
 //! - [`services`] — long-lived services: the [`SidecarService`] and the
 //!   OAuth [`AuthService`].
 //! - [`state`] — the Tauri-managed [`AppState`].
+//! - [`tray`] — the system tray icon, menu, and live context subscription.
 //! - [`window_manager`] — window creation and focus.
 
 #![warn(clippy::unwrap_used)]
+// `unwrap()` is idiomatic in tests; the lint above exists to keep
+// production code unwrap-free, so silence it under `cfg(test)`.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod app_menu;
 mod commands;
 #[cfg(target_os = "macos")]
 mod dock_menu;
 mod error;
-mod helpers;
 mod services;
 mod state;
+mod tray;
 mod window_manager;
 
 use std::time::Duration;
 
 use tauri::{Manager, RunEvent};
+use tokio_util::sync::CancellationToken;
 
 use crate::services::auth::{AuthConfig, AuthService};
 use crate::services::sidecar::SidecarService;
@@ -77,6 +83,63 @@ fn init_process() {
     if let Err(err) = keyring::use_native_store(true) {
         tracing::warn!(%err, "failed to initialize the OS keychain");
     }
+}
+
+/// Routes Unix termination signals into the same graceful-exit path as an
+/// explicit "Quit".
+///
+/// Tao installs no signal handlers, so without this a `SIGTERM` / `SIGINT` /
+/// `SIGHUP` would kill the process outright — bypassing the `RunEvent`
+/// shutdown hooks entirely. Funneling through [`AppHandle::exit`] produces the
+/// same sequence as the menu/tray "Quit": `ExitRequested { code: Some(0) }`
+/// followed by `Exit`. `SIGKILL` remains uncatchable by design.
+///
+/// Spawned onto Tauri's async runtime; the task lives until a signal arrives
+/// or the process exits.
+///
+/// Unix-only, and deliberately so:
+/// - **Windows** has no POSIX signals. Its real session-end (logout / restart
+///   / shutdown) arrives as a `WM_ENDSESSION` window message, which tao already
+///   handles by firing `RunEvent::Exit` — so it lands in the event loop's
+///   shutdown arm with no handler needed here.
+/// - **macOS** system shutdown is caught earlier, in `applicationShouldTerminate:`
+///   (see the `dock_menu` module).
+#[cfg(all(desktop, unix))]
+fn spawn_signal_handler(app: &tauri::AppHandle) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // If Quit happens through another path (menu/tray), the shutdown
+        // signal fires and this task exits instead of lingering for a signal
+        // that will never come.
+        let shutdown = app.state::<AppState>().shutdown.clone();
+
+        // A failed registration is logged and abandons signal handling
+        // entirely rather than leaving a partial set wired up.
+        let mut streams = match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::hangup()),
+        ) {
+            (Ok(term), Ok(int), Ok(hup)) => (term, int, hup),
+            (term, int, hup) => {
+                let err = term.err().or(int.err()).or(hup.err());
+                tracing::error!(?err, "failed to install termination signal handlers");
+                return;
+            }
+        };
+
+        let received = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = streams.0.recv() => "SIGTERM",
+            _ = streams.1.recv() => "SIGINT",
+            _ = streams.2.recv() => "SIGHUP",
+        };
+
+        tracing::info!(signal = received, "received termination signal; exiting");
+        app.exit(0);
+    });
 }
 
 /// Builds, configures, and runs the Tauri application.
@@ -138,14 +201,19 @@ pub fn run() {
                 sidecar,
                 window_manager,
                 auth,
+                shutdown: CancellationToken::new(),
             });
 
             // Restore any persisted OAuth session in the background.
             AuthService::spawn_restore(app.handle());
 
             // Build menu and tray
-            helpers::build_app_menu(app.handle())?;
-            helpers::build_tray(app.handle())?;
+            app_menu::build_app_menu(app.handle())?;
+            tray::build_tray(app.handle())?;
+
+            // Keep the tray's kube-context list live off the sidecar's
+            // kubeConfigWatch stream (populates on the first frame).
+            tray::spawn_tray_subscription(app.handle());
 
             // Custom macOS Dock menu (no Tauri API — see dock_menu module).
             #[cfg(target_os = "macos")]
@@ -153,9 +221,9 @@ pub fn run() {
 
             // Route Unix termination signals into the graceful-exit path.
             // (Windows session-end arrives as WM_ENDSESSION, which tao already
-            // routes to RunEvent::Exit — see helpers::spawn_signal_handler.)
+            // routes to RunEvent::Exit — see spawn_signal_handler.)
             #[cfg(all(desktop, unix))]
-            helpers::spawn_signal_handler(app.handle());
+            spawn_signal_handler(app.handle());
 
             Ok(())
         })
@@ -190,6 +258,11 @@ pub fn run() {
                         tracing::info!(code, "exit requested; initiating graceful shutdown");
 
                         let state = app_handle.state::<AppState>();
+                        // Stop the app-lifetime background tasks first (tray
+                        // supervisor, signal handler) so they don't reconnect
+                        // or sit in a backoff sleep while we tear the sidecar
+                        // down. Cancelling is idempotent.
+                        state.shutdown.cancel();
                         if !state.sidecar.graceful_shutdown(SIDECAR_SHUTDOWN_GRACE) {
                             tracing::warn!("sidecar did not exit within grace period");
                         }

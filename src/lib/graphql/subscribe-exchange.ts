@@ -37,27 +37,28 @@ const dropOp = (id: number) => {
 };
 
 // Bridges urql's subscriptionExchange to the Tauri host's
-// `graphql_subscribe` / `graphql_unsubscribe` invoke commands. All
-// subscriptions multiplex over a single host-side WebSocket (see
-// src-tauri/src/services/sidecar/subscribe.rs for the rationale).
+// `graphql_subscribe` / `graphql_unsubscribe` invoke commands. Each
+// subscription is streamed over its own host-side SSE connection to the
+// sidecar (see src-tauri/src/services/sidecar/graphql/subscribe.rs); the host
+// translates the SSE frames into the `next`/`complete`/`error` channel
+// envelopes this file consumes.
 //
-// The transport dies silently on sleep/network loss: the host WS ends and
-// the channel emits `complete` (or `error`). urql would treat that as the
-// subscription finishing — collapsing it with no reconnect. This app's
+// The transport dies silently on sleep/network loss: the host's SSE stream
+// ends and the channel emits `complete` (or `error`). urql would treat that as
+// the subscription finishing — collapsing it with no reconnect. This app's
 // subscriptions (settingsWatch/syncStatusWatch) are long-lived and never
 // legitimately complete, so a transport-end while the consumer is still
 // subscribed is reconnected with capped exponential backoff. Only a
 // consumer-initiated teardown actually ends the subscription.
 //
-// A server-sent `error` frame is treated the same as a transport drop
-// (reconnect, not `sink.error`) on purpose: the only subscriptions here
-// are the engine-backed settings/sync watches, and a failure is almost
-// always transient (the always-on engine + credential pusher re-establish
-// auth/upstream). Surfacing it terminally would also kill the very stream
-// that recovery flows through. A genuinely permanent error (schema/
-// permission) therefore degrades to a quiet capped retry rather than a
-// hard failure — acceptable, since these two internal watches have no
-// terminal UI and the alternative is a dead, unrecoverable subscription.
+// An `error` frame is now transport-level only: gqlgen's SSE transport delivers
+// GraphQL operation errors inside the `next` payload's `errors` field, so the
+// host emits `error` solely when the connection itself fails (dial/handshake/
+// non-200). It's treated the same as a transport drop (reconnect, not
+// `sink.error`) on purpose: the only subscriptions here are the engine-backed
+// settings/sync watches, and such a failure is almost always transient (the
+// always-on engine + credential pusher re-establish auth/upstream). Surfacing
+// it terminally would also kill the very stream that recovery flows through.
 export const tauriSubscriptionExchange = subscriptionExchange({
   forwardSubscription(operation) {
     return {

@@ -13,9 +13,11 @@
 // limitations under the License.
 
 mod graphql;
+mod grpc;
 mod ipc;
 mod logs;
 mod service;
 
 pub use graphql::GraphqlResponse;
+pub use grpc::KubeContextState;
 pub use service::SidecarService;

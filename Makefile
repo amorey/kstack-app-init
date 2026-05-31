@@ -2,12 +2,33 @@
 # so it doesn't belong in package.json scripts; this Makefile is the
 # place where Go, Rust, and JS commands meet.
 
-.PHONY: sidecar test test-go test-rust test-js lint lint-go lint-rust lint-js vet vet-go vet-rust clean
+.PHONY: sidecar proto proto-go proto-rust test test-go test-rust test-js lint lint-go lint-rust lint-js vet vet-go vet-rust clean
 
 # Build the Go sidecar into src-tauri/binaries/ with the Tauri-required
 # `<name>-<rust-host-triple>` filename. Tauri's externalBin picks it up.
 sidecar:
 	bash scripts/build-sidecar.sh
+
+# Regenerate the gRPC bindings from the shared repo-root proto/ for both
+# languages. proto/ is the single source of truth (host <-> sidecar wire
+# format); the Go bindings are committed, the Rust ones are produced by
+# src-tauri/build.rs at compile time (using a vendored protoc, so plain Rust
+# builds need no system install).
+proto: proto-go proto-rust
+
+# Go: protoc-gen-go + protoc-gen-go-grpc via the //go:generate directive in
+# sidecar/grpc/kubecontextpb. One-time tooling for regenerating the committed
+# Go bindings: install `protoc`, then `go install
+# google.golang.org/protobuf/cmd/protoc-gen-go` and `go install
+# google.golang.org/grpc/cmd/protoc-gen-go-grpc` (versions pinned in
+# sidecar/tools.go). The Rust side needs none of this — its protoc is vendored.
+proto-go:
+	cd sidecar && go generate ./grpc/...
+
+# Rust: bindings are emitted by src-tauri/build.rs on build; this forces a
+# rebuild so any proto/codegen error surfaces from `make proto`.
+proto-rust:
+	cd src-tauri && cargo build
 
 # Run every test suite in the repo.
 test: test-go test-rust test-js

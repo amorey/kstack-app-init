@@ -14,7 +14,7 @@ import (
 
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/99designs/gqlgen/graphql/introspection"
-	"github.com/kubetail-org/kstack-app/sidecar/server/graph/model"
+	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
 	gqlparser "github.com/vektah/gqlparser/v2"
 	"github.com/vektah/gqlparser/v2/ast"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -81,7 +81,8 @@ type ComplexityRoot struct {
 	}
 
 	Mutation struct {
-		UpdateSettings func(childComplexity int, input model.UpdateSettingsInput) int
+		SetCurrentContext func(childComplexity int, name string) int
+		UpdateSettings    func(childComplexity int, input model.UpdateSettingsInput) int
 	}
 
 	Query struct {
@@ -117,6 +118,7 @@ type KubeConfigResolver interface {
 }
 type MutationResolver interface {
 	UpdateSettings(ctx context.Context, input model.UpdateSettingsInput) (*model.Settings, error)
+	SetCurrentContext(ctx context.Context, name string) (bool, error)
 }
 type QueryResolver interface {
 	Ping(ctx context.Context) (string, error)
@@ -283,6 +285,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.KubeConfigWatchEvent.Type(childComplexity), true
 
+	case "Mutation.setCurrentContext":
+		if e.ComplexityRoot.Mutation.SetCurrentContext == nil {
+			break
+		}
+
+		args, err := ec.field_Mutation_setCurrentContext_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.ComplexityRoot.Mutation.SetCurrentContext(childComplexity, args["name"].(string)), true
 	case "Mutation.updateSettings":
 		if e.ComplexityRoot.Mutation.UpdateSettings == nil {
 			break
@@ -722,12 +735,26 @@ func (ec *executionContext) childFields___Type(ctx context.Context, field graphq
 
 // region    ***************************** args.gotpl *****************************
 
+func (ec *executionContext) field_Mutation_setCurrentContext_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "name",
+		func(ctx context.Context, v any) (string, error) {
+			return ec.unmarshalNString2string(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["name"] = arg0
+	return args, nil
+}
+
 func (ec *executionContext) field_Mutation_updateSettings_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "input",
 		func(ctx context.Context, v any) (model.UpdateSettingsInput, error) {
-			return ec.unmarshalNUpdateSettingsInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐUpdateSettingsInput(ctx, v)
+			return ec.unmarshalNUpdateSettingsInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐUpdateSettingsInput(ctx, v)
 		})
 	if err != nil {
 		return nil, err
@@ -755,7 +782,7 @@ func (ec *executionContext) field_Subscription_chatStream_args(ctx context.Conte
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "input",
 		func(ctx context.Context, v any) (model.ChatInput, error) {
-			return ec.unmarshalNChatInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐChatInput(ctx, v)
+			return ec.unmarshalNChatInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatInput(ctx, v)
 		})
 	if err != nil {
 		return nil, err
@@ -887,7 +914,7 @@ func (ec *executionContext) _KubeConfig_authInfos(ctx context.Context, field gra
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v []*model.KubeConfigAuthInfo) graphql.Marshaler {
-			return ec.marshalNKubeConfigAuthInfo2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigAuthInfoᚄ(ctx, selections, v)
+			return ec.marshalNKubeConfigAuthInfo2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigAuthInfoᚄ(ctx, selections, v)
 		},
 		true,
 		true,
@@ -919,7 +946,7 @@ func (ec *executionContext) _KubeConfig_clusters(ctx context.Context, field grap
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v []*model.KubeConfigCluster) graphql.Marshaler {
-			return ec.marshalNKubeConfigCluster2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigClusterᚄ(ctx, selections, v)
+			return ec.marshalNKubeConfigCluster2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigClusterᚄ(ctx, selections, v)
 		},
 		true,
 		true,
@@ -951,7 +978,7 @@ func (ec *executionContext) _KubeConfig_contexts(ctx context.Context, field grap
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v []*model.KubeConfigContext) graphql.Marshaler {
-			return ec.marshalNKubeConfigContext2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigContextᚄ(ctx, selections, v)
+			return ec.marshalNKubeConfigContext2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigContextᚄ(ctx, selections, v)
 		},
 		true,
 		true,
@@ -1328,7 +1355,7 @@ func (ec *executionContext) _KubeConfigWatchEvent_type(ctx context.Context, fiel
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v model.WatchEventType) graphql.Marshaler {
-			return ec.marshalNWatchEventType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐWatchEventType(ctx, selections, v)
+			return ec.marshalNWatchEventType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐWatchEventType(ctx, selections, v)
 		},
 		true,
 		true,
@@ -1351,7 +1378,7 @@ func (ec *executionContext) _KubeConfigWatchEvent_object(ctx context.Context, fi
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *model.KubeConfig) graphql.Marshaler {
-			return ec.marshalOKubeConfig2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfig(ctx, selections, v)
+			return ec.marshalOKubeConfig2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfig(ctx, selections, v)
 		},
 		true,
 		false,
@@ -1384,7 +1411,7 @@ func (ec *executionContext) _Mutation_updateSettings(ctx context.Context, field 
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *model.Settings) graphql.Marshaler {
-			return ec.marshalNSettings2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSettings(ctx, selections, v)
+			return ec.marshalNSettings2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSettings(ctx, selections, v)
 		},
 		true,
 		true,
@@ -1408,6 +1435,50 @@ func (ec *executionContext) fieldContext_Mutation_updateSettings(ctx context.Con
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
 	if fc.Args, err = ec.field_Mutation_updateSettings_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Mutation_setCurrentContext(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Mutation_setCurrentContext(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.Resolvers.Mutation().SetCurrentContext(ctx, fc.Args["name"].(string))
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
+			return ec.marshalNBoolean2bool(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Mutation_setCurrentContext(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Mutation",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return nil, errors.New("field of type Boolean does not have child fields")
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Mutation_setCurrentContext_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -1450,7 +1521,7 @@ func (ec *executionContext) _Query_settings(ctx context.Context, field graphql.C
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *model.Settings) graphql.Marshaler {
-			return ec.marshalNSettings2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSettings(ctx, selections, v)
+			return ec.marshalNSettings2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSettings(ctx, selections, v)
 		},
 		true,
 		true,
@@ -1482,7 +1553,7 @@ func (ec *executionContext) _Query_syncStatus(ctx context.Context, field graphql
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *model.SyncStatus) graphql.Marshaler {
-			return ec.marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSyncStatus(ctx, selections, v)
+			return ec.marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSyncStatus(ctx, selections, v)
 		},
 		true,
 		true,
@@ -1636,7 +1707,7 @@ func (ec *executionContext) _Subscription_settingsWatch(ctx context.Context, fie
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *model.Settings) graphql.Marshaler {
-			return ec.marshalNSettings2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSettings(ctx, selections, v)
+			return ec.marshalNSettings2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSettings(ctx, selections, v)
 		},
 		true,
 		true,
@@ -1668,7 +1739,7 @@ func (ec *executionContext) _Subscription_syncStatusWatch(ctx context.Context, f
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *model.SyncStatus) graphql.Marshaler {
-			return ec.marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSyncStatus(ctx, selections, v)
+			return ec.marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSyncStatus(ctx, selections, v)
 		},
 		true,
 		true,
@@ -1701,7 +1772,7 @@ func (ec *executionContext) _Subscription_chatStream(ctx context.Context, field 
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *model.ChatChunk) graphql.Marshaler {
-			return ec.marshalNChatChunk2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐChatChunk(ctx, selections, v)
+			return ec.marshalNChatChunk2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatChunk(ctx, selections, v)
 		},
 		true,
 		true,
@@ -1744,7 +1815,7 @@ func (ec *executionContext) _Subscription_kubeConfigWatch(ctx context.Context, f
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *model.KubeConfigWatchEvent) graphql.Marshaler {
-			return ec.marshalOKubeConfigWatchEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigWatchEvent(ctx, selections, v)
+			return ec.marshalOKubeConfigWatchEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigWatchEvent(ctx, selections, v)
 		},
 		true,
 		false,
@@ -1776,7 +1847,7 @@ func (ec *executionContext) _SyncStatus_state(ctx context.Context, field graphql
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v model.SyncState) graphql.Marshaler {
-			return ec.marshalNSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSyncState(ctx, selections, v)
+			return ec.marshalNSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSyncState(ctx, selections, v)
 		},
 		true,
 		true,
@@ -2934,7 +3005,7 @@ func (ec *executionContext) unmarshalInputChatInput(ctx context.Context, obj any
 		switch k {
 		case "messages":
 			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("messages"))
-			data, err := ec.unmarshalNChatMessageInput2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐChatMessageInputᚄ(ctx, v)
+			data, err := ec.unmarshalNChatMessageInput2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatMessageInputᚄ(ctx, v)
 			if err != nil {
 				return it, err
 			}
@@ -3433,6 +3504,13 @@ func (ec *executionContext) _Mutation(ctx context.Context, sel ast.SelectionSet)
 		case "updateSettings":
 			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
 				return ec._Mutation_updateSettings(ctx, field)
+			})
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "setCurrentContext":
+			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
+				return ec._Mutation_setCurrentContext(ctx, field)
 			})
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
@@ -4048,11 +4126,11 @@ func (ec *executionContext) marshalNBoolean2bool(ctx context.Context, sel ast.Se
 	return res
 }
 
-func (ec *executionContext) marshalNChatChunk2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐChatChunk(ctx context.Context, sel ast.SelectionSet, v model.ChatChunk) graphql.Marshaler {
+func (ec *executionContext) marshalNChatChunk2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatChunk(ctx context.Context, sel ast.SelectionSet, v model.ChatChunk) graphql.Marshaler {
 	return ec._ChatChunk(ctx, sel, &v)
 }
 
-func (ec *executionContext) marshalNChatChunk2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐChatChunk(ctx context.Context, sel ast.SelectionSet, v *model.ChatChunk) graphql.Marshaler {
+func (ec *executionContext) marshalNChatChunk2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatChunk(ctx context.Context, sel ast.SelectionSet, v *model.ChatChunk) graphql.Marshaler {
 	if v == nil {
 		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
 			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
@@ -4062,19 +4140,19 @@ func (ec *executionContext) marshalNChatChunk2ᚖgithubᚗcomᚋkubetailᚑorg�
 	return ec._ChatChunk(ctx, sel, v)
 }
 
-func (ec *executionContext) unmarshalNChatInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐChatInput(ctx context.Context, v any) (model.ChatInput, error) {
+func (ec *executionContext) unmarshalNChatInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatInput(ctx context.Context, v any) (model.ChatInput, error) {
 	res, err := ec.unmarshalInputChatInput(ctx, v)
 	return res, graphql.ErrorOnPath(ctx, err)
 }
 
-func (ec *executionContext) unmarshalNChatMessageInput2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐChatMessageInputᚄ(ctx context.Context, v any) ([]*model.ChatMessageInput, error) {
+func (ec *executionContext) unmarshalNChatMessageInput2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatMessageInputᚄ(ctx context.Context, v any) ([]*model.ChatMessageInput, error) {
 	var vSlice []any
 	vSlice = graphql.CoerceList(v)
 	var err error
 	res := make([]*model.ChatMessageInput, len(vSlice))
 	for i := range vSlice {
 		ctx := graphql.WithPathContext(ctx, graphql.NewPathWithIndex(i))
-		res[i], err = ec.unmarshalNChatMessageInput2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐChatMessageInput(ctx, vSlice[i])
+		res[i], err = ec.unmarshalNChatMessageInput2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatMessageInput(ctx, vSlice[i])
 		if err != nil {
 			return nil, err
 		}
@@ -4082,7 +4160,7 @@ func (ec *executionContext) unmarshalNChatMessageInput2ᚕᚖgithubᚗcomᚋkube
 	return res, nil
 }
 
-func (ec *executionContext) unmarshalNChatMessageInput2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐChatMessageInput(ctx context.Context, v any) (*model.ChatMessageInput, error) {
+func (ec *executionContext) unmarshalNChatMessageInput2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatMessageInput(ctx context.Context, v any) (*model.ChatMessageInput, error) {
 	res, err := ec.unmarshalInputChatMessageInput(ctx, v)
 	return &res, graphql.ErrorOnPath(ctx, err)
 }
@@ -4103,11 +4181,11 @@ func (ec *executionContext) marshalNInt2int(ctx context.Context, sel ast.Selecti
 	return res
 }
 
-func (ec *executionContext) marshalNKubeConfigAuthInfo2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigAuthInfoᚄ(ctx context.Context, sel ast.SelectionSet, v []*model.KubeConfigAuthInfo) graphql.Marshaler {
+func (ec *executionContext) marshalNKubeConfigAuthInfo2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigAuthInfoᚄ(ctx context.Context, sel ast.SelectionSet, v []*model.KubeConfigAuthInfo) graphql.Marshaler {
 	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
 		fc := graphql.GetFieldContext(ctx)
 		fc.Result = &v[i]
-		return ec.marshalNKubeConfigAuthInfo2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigAuthInfo(ctx, sel, v[i])
+		return ec.marshalNKubeConfigAuthInfo2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigAuthInfo(ctx, sel, v[i])
 	})
 
 	for _, e := range ret {
@@ -4119,7 +4197,7 @@ func (ec *executionContext) marshalNKubeConfigAuthInfo2ᚕᚖgithubᚗcomᚋkube
 	return ret
 }
 
-func (ec *executionContext) marshalNKubeConfigAuthInfo2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigAuthInfo(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfigAuthInfo) graphql.Marshaler {
+func (ec *executionContext) marshalNKubeConfigAuthInfo2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigAuthInfo(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfigAuthInfo) graphql.Marshaler {
 	if v == nil {
 		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
 			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
@@ -4129,11 +4207,11 @@ func (ec *executionContext) marshalNKubeConfigAuthInfo2ᚖgithubᚗcomᚋkubetai
 	return ec._KubeConfigAuthInfo(ctx, sel, v)
 }
 
-func (ec *executionContext) marshalNKubeConfigCluster2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigClusterᚄ(ctx context.Context, sel ast.SelectionSet, v []*model.KubeConfigCluster) graphql.Marshaler {
+func (ec *executionContext) marshalNKubeConfigCluster2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigClusterᚄ(ctx context.Context, sel ast.SelectionSet, v []*model.KubeConfigCluster) graphql.Marshaler {
 	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
 		fc := graphql.GetFieldContext(ctx)
 		fc.Result = &v[i]
-		return ec.marshalNKubeConfigCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigCluster(ctx, sel, v[i])
+		return ec.marshalNKubeConfigCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigCluster(ctx, sel, v[i])
 	})
 
 	for _, e := range ret {
@@ -4145,7 +4223,7 @@ func (ec *executionContext) marshalNKubeConfigCluster2ᚕᚖgithubᚗcomᚋkubet
 	return ret
 }
 
-func (ec *executionContext) marshalNKubeConfigCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigCluster(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfigCluster) graphql.Marshaler {
+func (ec *executionContext) marshalNKubeConfigCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigCluster(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfigCluster) graphql.Marshaler {
 	if v == nil {
 		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
 			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
@@ -4155,11 +4233,11 @@ func (ec *executionContext) marshalNKubeConfigCluster2ᚖgithubᚗcomᚋkubetail
 	return ec._KubeConfigCluster(ctx, sel, v)
 }
 
-func (ec *executionContext) marshalNKubeConfigContext2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigContextᚄ(ctx context.Context, sel ast.SelectionSet, v []*model.KubeConfigContext) graphql.Marshaler {
+func (ec *executionContext) marshalNKubeConfigContext2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigContextᚄ(ctx context.Context, sel ast.SelectionSet, v []*model.KubeConfigContext) graphql.Marshaler {
 	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
 		fc := graphql.GetFieldContext(ctx)
 		fc.Result = &v[i]
-		return ec.marshalNKubeConfigContext2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigContext(ctx, sel, v[i])
+		return ec.marshalNKubeConfigContext2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigContext(ctx, sel, v[i])
 	})
 
 	for _, e := range ret {
@@ -4171,7 +4249,7 @@ func (ec *executionContext) marshalNKubeConfigContext2ᚕᚖgithubᚗcomᚋkubet
 	return ret
 }
 
-func (ec *executionContext) marshalNKubeConfigContext2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigContext(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfigContext) graphql.Marshaler {
+func (ec *executionContext) marshalNKubeConfigContext2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigContext(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfigContext) graphql.Marshaler {
 	if v == nil {
 		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
 			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
@@ -4181,11 +4259,11 @@ func (ec *executionContext) marshalNKubeConfigContext2ᚖgithubᚗcomᚋkubetail
 	return ec._KubeConfigContext(ctx, sel, v)
 }
 
-func (ec *executionContext) marshalNSettings2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSettings(ctx context.Context, sel ast.SelectionSet, v model.Settings) graphql.Marshaler {
+func (ec *executionContext) marshalNSettings2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSettings(ctx context.Context, sel ast.SelectionSet, v model.Settings) graphql.Marshaler {
 	return ec._Settings(ctx, sel, &v)
 }
 
-func (ec *executionContext) marshalNSettings2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSettings(ctx context.Context, sel ast.SelectionSet, v *model.Settings) graphql.Marshaler {
+func (ec *executionContext) marshalNSettings2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSettings(ctx context.Context, sel ast.SelectionSet, v *model.Settings) graphql.Marshaler {
 	if v == nil {
 		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
 			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
@@ -4211,21 +4289,21 @@ func (ec *executionContext) marshalNString2string(ctx context.Context, sel ast.S
 	return res
 }
 
-func (ec *executionContext) unmarshalNSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSyncState(ctx context.Context, v any) (model.SyncState, error) {
+func (ec *executionContext) unmarshalNSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSyncState(ctx context.Context, v any) (model.SyncState, error) {
 	var res model.SyncState
 	err := res.UnmarshalGQL(v)
 	return res, graphql.ErrorOnPath(ctx, err)
 }
 
-func (ec *executionContext) marshalNSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSyncState(ctx context.Context, sel ast.SelectionSet, v model.SyncState) graphql.Marshaler {
+func (ec *executionContext) marshalNSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSyncState(ctx context.Context, sel ast.SelectionSet, v model.SyncState) graphql.Marshaler {
 	return v
 }
 
-func (ec *executionContext) marshalNSyncStatus2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSyncStatus(ctx context.Context, sel ast.SelectionSet, v model.SyncStatus) graphql.Marshaler {
+func (ec *executionContext) marshalNSyncStatus2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSyncStatus(ctx context.Context, sel ast.SelectionSet, v model.SyncStatus) graphql.Marshaler {
 	return ec._SyncStatus(ctx, sel, &v)
 }
 
-func (ec *executionContext) marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐSyncStatus(ctx context.Context, sel ast.SelectionSet, v *model.SyncStatus) graphql.Marshaler {
+func (ec *executionContext) marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐSyncStatus(ctx context.Context, sel ast.SelectionSet, v *model.SyncStatus) graphql.Marshaler {
 	if v == nil {
 		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
 			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
@@ -4235,18 +4313,18 @@ func (ec *executionContext) marshalNSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorg�
 	return ec._SyncStatus(ctx, sel, v)
 }
 
-func (ec *executionContext) unmarshalNUpdateSettingsInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐUpdateSettingsInput(ctx context.Context, v any) (model.UpdateSettingsInput, error) {
+func (ec *executionContext) unmarshalNUpdateSettingsInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐUpdateSettingsInput(ctx context.Context, v any) (model.UpdateSettingsInput, error) {
 	res, err := ec.unmarshalInputUpdateSettingsInput(ctx, v)
 	return res, graphql.ErrorOnPath(ctx, err)
 }
 
-func (ec *executionContext) unmarshalNWatchEventType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐWatchEventType(ctx context.Context, v any) (model.WatchEventType, error) {
+func (ec *executionContext) unmarshalNWatchEventType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐWatchEventType(ctx context.Context, v any) (model.WatchEventType, error) {
 	var res model.WatchEventType
 	err := res.UnmarshalGQL(v)
 	return res, graphql.ErrorOnPath(ctx, err)
 }
 
-func (ec *executionContext) marshalNWatchEventType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐWatchEventType(ctx context.Context, sel ast.SelectionSet, v model.WatchEventType) graphql.Marshaler {
+func (ec *executionContext) marshalNWatchEventType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐWatchEventType(ctx context.Context, sel ast.SelectionSet, v model.WatchEventType) graphql.Marshaler {
 	return v
 }
 
@@ -4421,7 +4499,7 @@ func (ec *executionContext) marshalOBoolean2ᚖbool(ctx context.Context, sel ast
 	return res
 }
 
-func (ec *executionContext) marshalOKubeConfig2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfig(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfig) graphql.Marshaler {
+func (ec *executionContext) marshalOKubeConfig2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfig(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfig) graphql.Marshaler {
 	if v == nil {
 		return graphql.Null
 	}
@@ -4446,7 +4524,7 @@ func (ec *executionContext) marshalOKubeConfigExtensions2map(ctx context.Context
 	return res
 }
 
-func (ec *executionContext) marshalOKubeConfigWatchEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋserverᚋgraphᚋmodelᚐKubeConfigWatchEvent(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfigWatchEvent) graphql.Marshaler {
+func (ec *executionContext) marshalOKubeConfigWatchEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐKubeConfigWatchEvent(ctx context.Context, sel ast.SelectionSet, v *model.KubeConfigWatchEvent) graphql.Marshaler {
 	if v == nil {
 		return graphql.Null
 	}

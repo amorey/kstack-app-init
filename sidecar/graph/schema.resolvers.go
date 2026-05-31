@@ -11,7 +11,7 @@ import (
 	"time"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
-	"github.com/kubetail-org/kstack-app/sidecar/server/graph/model"
+	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
 )
 
 // AuthInfos is the resolver for the authInfos field.
@@ -63,6 +63,22 @@ func (r *mutationResolver) UpdateSettings(ctx context.Context, input model.Updat
 	}
 	r.Hub.Publish(out)
 	return toGraphSettings(out), nil
+}
+
+// SetCurrentContext is the resolver for the setCurrentContext field. It
+// persists the kubeconfig current-context to disk via the watcher; the
+// change is delivered to clients through the kubeConfigWatch subscription,
+// so the mutation returns only a success boolean. nil-guards the watcher
+// (parallels KubeConfigWatch) so a Config{} handler errors cleanly instead
+// of panicking.
+func (r *mutationResolver) SetCurrentContext(ctx context.Context, name string) (bool, error) {
+	if r.KubeConfigWatcher == nil {
+		return false, fmt.Errorf("kubeconfig watcher not available")
+	}
+	if err := r.KubeConfigWatcher.SetCurrentContext(name); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Ping is the resolver for the ping field.

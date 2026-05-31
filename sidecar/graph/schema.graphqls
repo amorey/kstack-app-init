@@ -128,6 +128,9 @@ type Query {
 type Mutation {
   "Write-through update: pushed to the cloud, then published locally; the engine persists it when the cloud echoes it back."
   updateSettings(input: UpdateSettingsInput!): Settings!
+
+  "Sets the kubeconfig current-context, persisting it to disk (kubectl-visible). Returns true on success; errors if the context is unknown. The updated config is delivered to clients via the kubeConfigWatch subscription."
+  setCurrentContext(name: String!): Boolean!
 }
 
 type Subscription {

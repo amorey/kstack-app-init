@@ -14,13 +14,13 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
 	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
-	"github.com/kubetail-org/kstack-app/sidecar/server/graph/model"
 )
 
 // Resolver carries the dependencies every operation needs: a Client for
@@ -112,9 +112,9 @@ func tickInterval() time.Duration {
 //
 // The sidecar is stateless re: auth. Each inbound HTTP request carries an
 // `Authorization: Bearer <token>` header; the resolver layer pulls that token
-// out of the request context and passes it to the cloud client. WS clients
-// have two ways to supply credentials (header during the upgrade, or
-// `connection_init` payload); we read whichever is set.
+// out of the request context and passes it to the cloud client. This holds for
+// every transport — queries, mutations, and SSE subscriptions all flow through
+// the same `withBearer` middleware, so there's a single auth path.
 
 type ctxKey int
 
@@ -128,9 +128,7 @@ func WithRequestContext(ctx context.Context, r *http.Request) context.Context {
 }
 
 // WithAuthHeader overlays the bearer token parsed from a raw `Authorization`
-// header onto ctx. Empty header → ctx returned unchanged. Also used by the
-// Websocket transport's InitFunc, which receives the `connection_init`
-// payload's `Authorization` entry in the same shape.
+// header onto ctx. Empty header → ctx returned unchanged.
 func WithAuthHeader(ctx context.Context, header string) context.Context {
 	const prefix = "Bearer "
 	switch {

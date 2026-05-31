@@ -25,6 +25,7 @@ use tokio::sync::watch;
 use crate::error::{AppError, Result};
 
 use super::graphql::{FrameSink, GraphqlResponse, QueryClient, SubscriptionClient};
+use super::grpc::{GrpcClient, WatchStream};
 use super::ipc::{Endpoint, DEFAULT_CONNECT_BUDGET};
 use super::logs::{forward_sidecar_line, Severity};
 
@@ -59,7 +60,7 @@ struct State {
 }
 
 /// Owns the bundled sidecar child process and the IPC bridges that talk to
-/// it: the per-request HTTP client and the multiplexed subscription registry.
+/// it: the per-request HTTP client and the per-subscription SSE reader.
 ///
 /// All three are built around the same [`Endpoint`] picked at spawn time.
 /// Construct via [`SidecarService::spawn`]; reach the IPC bridges through the
@@ -80,6 +81,9 @@ pub struct SidecarService {
     ready_rx: watch::Receiver<bool>,
     query_client: QueryClient,
     subscription_client: SubscriptionClient,
+    /// gRPC channel to the sidecar's host-internal control surface (kube-context
+    /// watch + set), multiplexed over the same socket as GraphQL via h2c.
+    grpc_client: GrpcClient,
 }
 
 impl SidecarService {
@@ -153,7 +157,8 @@ impl SidecarService {
         });
 
         let query_client = QueryClient::new(endpoint.clone());
-        let subscription_client = SubscriptionClient::new(endpoint);
+        let subscription_client = SubscriptionClient::new(endpoint.clone());
+        let grpc_client = GrpcClient::new(endpoint);
 
         Ok(Self {
             state,
@@ -161,6 +166,7 @@ impl SidecarService {
             ready_rx,
             query_client,
             subscription_client,
+            grpc_client,
         })
     }
 
@@ -213,19 +219,21 @@ impl SidecarService {
         self.query_client.query(body).await
     }
 
-    /// Registers a new GraphQL subscription on the shared
-    /// graphql-transport-ws connection, lazily opening the WS on first use.
-    /// Forwards every inbound envelope to `channel`. Returns the host-side
-    /// op id to pass to [`SidecarService::unsubscribe`].
+    /// Registers a new GraphQL subscription, opening a dedicated SSE
+    /// connection to the sidecar for it. Forwards every inbound envelope to
+    /// `channel`. Returns the host-side op id to pass to
+    /// [`SidecarService::unsubscribe`].
     pub async fn subscribe(
         &self,
         query: String,
         variables: serde_json::Value,
         channel: Channel<String>,
     ) -> Result<u64> {
-        let sink: Arc<dyn FrameSink> = Arc::new(TauriChannelSink(channel));
+        // `subscription_client.subscribe` takes an `Arc<dyn FrameSink>`, so the
+        // seam stays open for any future host-internal GraphQL consumer; the
+        // webview wraps its `Channel` in `TauriChannelSink`.
         self.subscription_client
-            .subscribe(query, variables, sink)
+            .subscribe(query, variables, Arc::new(TauriChannelSink(channel)))
             .await
     }
 
@@ -235,11 +243,27 @@ impl SidecarService {
         self.subscription_client.unsubscribe(id).await;
     }
 
+    /// Persists `name` as the kubeconfig current-context over gRPC. Used by the
+    /// tray's context picker. The shared watcher fans the change out to the
+    /// gRPC watch stream and the webview's GraphQL subscription alike.
+    pub async fn set_current_context(&self, name: String) -> Result<()> {
+        self.grpc_client.set_current_context(name).await
+    }
+
+    /// Opens the host-internal kube-context watch stream over gRPC: a snapshot
+    /// first, then a fresh snapshot on every kubeconfig change. Drives the
+    /// tray's "Default Context" submenu. The caller pulls frames with
+    /// `stream.message().await`; an error / end-of-stream means the connection
+    /// dropped (e.g. sidecar restart) and the supervisor should re-open it.
+    pub async fn watch_kube_context(&self) -> Result<WatchStream> {
+        self.grpc_client.watch().await
+    }
+
     /// Asks the sidecar to shut down gracefully, blocking until it exits or
     /// `timeout` elapses.
     ///
     /// The sidecar treats stdin EOF as a "parent gone" signal and runs its own
-    /// clean shutdown (HTTP drain, WebSocket close frames, sync-engine join).
+    /// clean shutdown (HTTP drain, SSE stream completion, sync-engine join).
     /// We trigger that EOF by dropping the [`CommandChild`], which drops the
     /// stdin pipe it owns. This works identically on every platform — unlike
     /// POSIX signals, which Windows lacks entirely.

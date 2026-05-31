@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Host-side GraphQL clients to the sidecar.
-//!
-//! Split by transport because the mechanics diverge: `http` is stateless
-//! (one HTTP/1 connection per call) for queries and mutations, while `ws`
-//! owns a long-lived multiplexed `graphql-transport-ws` session for
-//! subscriptions.
+//! Host-side GraphQL clients to the sidecar. Both dial the sidecar over its
+//! UDS / named pipe and speak HTTP/1:
+//!   * `query` — stateless, one connection per query/mutation call.
+//!   * `subscribe` — one SSE (`text/event-stream`) connection per
+//!     subscription, streaming gqlgen's `next`/`complete` frames.
 
 mod query;
 mod subscribe;

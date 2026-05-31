@@ -23,7 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/server/graph/errors"
+	"github.com/kubetail-org/kstack-app/sidecar/graph/errors"
 )
 
 // Overload k8s.io/client-go/tools/clientcmd/api.Config
