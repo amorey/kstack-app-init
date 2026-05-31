@@ -39,7 +39,7 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and **appends r
 
 - **Nil-tolerant resolver**: a bare `&graph.Resolver{}` (used by tests / surfaces that don't run the engine) must not panic. `graph.NewServer` defaults a nil `Sync` to an Offline `noopStatus`; resolvers nil-guard their optional deps (e.g. `KubeConfigWatch`, `SetCurrentContext` guard `KubeConfigWatcher == nil`). Preserve this when adding resolvers.
 - **Pub/sub**: `internal/hub` and `github.com/amorey/gochan/watch` hubs fan snapshots to subscribers. Watchers (`k8shelpers`) use fsnotify + a debounce, then publish the new snapshot.
-- **Subscription resolvers**: return a channel that **emits the current snapshot first, then deltas** (see `streamWithSnapshot`, and the `kubeConfigWatch` resolver). Honor `ctx.Done()`.
+- **Subscription resolvers**: return a channel that **emits the current snapshot first, then deltas** (see `streamWithSnapshot`, and the `kubeConfigWatch` resolver). Honor `ctx.Done()`. `clusterSyncStatusWatch` is a **stub** today — it emits one empty `[]ClusterSyncStatus` snapshot then holds the stream open on `ctx.Done()` (frontend builds against the contract now; a follow-up backs it with the real per-cluster source via `streamWithSnapshot`).
 - **Single-writer sync engine** (`internal/sync`): it owns the only cloud connection. Reads are served from the local `syncstore` and never touch the network; write-through mutations publish to the hub and let the engine persist on the cloud echo.
 
 ## Tests & checks

@@ -24,6 +24,8 @@ import { createGraphqlClient } from '@/lib/graphql/client';
 import { ReadyGate } from '@/lib/ready-gate';
 import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 import { SyncHealthBadge } from '@/components/widgets/sync-health-badge';
+import { ClusterSyncPanel } from '@/components/widgets/cluster-sync-panel';
+import { ClusterSyncProvider } from '@/lib/cluster-sync';
 import { KubeConfigProvider } from '@/lib/kube-config';
 import { SyncStatusProvider } from '@/lib/sync-status';
 
@@ -61,20 +63,23 @@ function RootComponent() {
         <SessionProvider>
           <UrqlProvider value={gqlClient}>
             <SyncStatusProvider>
-              <KubeConfigProvider>
-                <div className="fixed left-3 top-3 z-50">
-                  <KubeContextPicker />
-                </div>
-                <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
-                  <SyncHealthBadge />
-                  <ProfileMenu />
-                </div>
-                <ConnectionStatus />
-                <Outlet />
-                <Suspense>
-                  <TanStackRouterDevtools />
-                </Suspense>
-              </KubeConfigProvider>
+              <ClusterSyncProvider>
+                <KubeConfigProvider>
+                  <div className="fixed left-3 top-3 z-50">
+                    <KubeContextPicker />
+                  </div>
+                  <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
+                    <SyncHealthBadge />
+                    <ClusterSyncPanel />
+                    <ProfileMenu />
+                  </div>
+                  <ConnectionStatus />
+                  <Outlet />
+                  <Suspense>
+                    <TanStackRouterDevtools />
+                  </Suspense>
+                </KubeConfigProvider>
+              </ClusterSyncProvider>
             </SyncStatusProvider>
           </UrqlProvider>
         </SessionProvider>

@@ -45,6 +45,14 @@ type ComplexityRoot struct {
 		Done  func(childComplexity int) int
 	}
 
+	ClusterSyncStatus struct {
+		Context         func(childComplexity int) int
+		DownloadRateBps func(childComplexity int) int
+		LastError       func(childComplexity int) int
+		LastSyncedAt    func(childComplexity int) int
+		State           func(childComplexity int) int
+	}
+
 	KubeConfig struct {
 		AuthInfos      func(childComplexity int) int
 		Clusters       func(childComplexity int) int
@@ -96,11 +104,12 @@ type ComplexityRoot struct {
 	}
 
 	Subscription struct {
-		ChatStream      func(childComplexity int, input model.ChatInput) int
-		KubeConfigWatch func(childComplexity int) int
-		SettingsWatch   func(childComplexity int) int
-		SyncStatusWatch func(childComplexity int) int
-		Tick            func(childComplexity int) int
+		ChatStream             func(childComplexity int, input model.ChatInput) int
+		ClusterSyncStatusWatch func(childComplexity int) int
+		KubeConfigWatch        func(childComplexity int) int
+		SettingsWatch          func(childComplexity int) int
+		SyncStatusWatch        func(childComplexity int) int
+		Tick                   func(childComplexity int) int
 	}
 
 	SyncStatus struct {
@@ -129,6 +138,7 @@ type SubscriptionResolver interface {
 	Tick(ctx context.Context) (<-chan int, error)
 	SettingsWatch(ctx context.Context) (<-chan *model.Settings, error)
 	SyncStatusWatch(ctx context.Context) (<-chan *model.SyncStatus, error)
+	ClusterSyncStatusWatch(ctx context.Context) (<-chan []*model.ClusterSyncStatus, error)
 	ChatStream(ctx context.Context, input model.ChatInput) (<-chan *model.ChatChunk, error)
 	KubeConfigWatch(ctx context.Context) (<-chan *model.KubeConfigWatchEvent, error)
 }
@@ -159,6 +169,37 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ChatChunk.Done(childComplexity), true
+
+	case "ClusterSyncStatus.context":
+		if e.ComplexityRoot.ClusterSyncStatus.Context == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterSyncStatus.Context(childComplexity), true
+	case "ClusterSyncStatus.downloadRateBps":
+		if e.ComplexityRoot.ClusterSyncStatus.DownloadRateBps == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterSyncStatus.DownloadRateBps(childComplexity), true
+	case "ClusterSyncStatus.lastError":
+		if e.ComplexityRoot.ClusterSyncStatus.LastError == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterSyncStatus.LastError(childComplexity), true
+	case "ClusterSyncStatus.lastSyncedAt":
+		if e.ComplexityRoot.ClusterSyncStatus.LastSyncedAt == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterSyncStatus.LastSyncedAt(childComplexity), true
+	case "ClusterSyncStatus.state":
+		if e.ComplexityRoot.ClusterSyncStatus.State == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterSyncStatus.State(childComplexity), true
 
 	case "KubeConfig.authInfos":
 		if e.ComplexityRoot.KubeConfig.AuthInfos == nil {
@@ -345,6 +386,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Subscription.ChatStream(childComplexity, args["input"].(model.ChatInput)), true
+	case "Subscription.clusterSyncStatusWatch":
+		if e.ComplexityRoot.Subscription.ClusterSyncStatusWatch == nil {
+			break
+		}
+
+		return e.ComplexityRoot.Subscription.ClusterSyncStatusWatch(childComplexity), true
 	case "Subscription.kubeConfigWatch":
 		if e.ComplexityRoot.Subscription.KubeConfigWatch == nil {
 			break
@@ -525,6 +572,22 @@ func (ec *executionContext) childFields_ChatChunk(ctx context.Context, field gra
 		return ec.fieldContext_ChatChunk_done(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ChatChunk", field.Name)
+}
+
+func (ec *executionContext) childFields_ClusterSyncStatus(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "context":
+		return ec.fieldContext_ClusterSyncStatus_context(ctx, field)
+	case "state":
+		return ec.fieldContext_ClusterSyncStatus_state(ctx, field)
+	case "lastError":
+		return ec.fieldContext_ClusterSyncStatus_lastError(ctx, field)
+	case "lastSyncedAt":
+		return ec.fieldContext_ClusterSyncStatus_lastSyncedAt(ctx, field)
+	case "downloadRateBps":
+		return ec.fieldContext_ClusterSyncStatus_downloadRateBps(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type ClusterSyncStatus", field.Name)
 }
 
 func (ec *executionContext) childFields_KubeConfig(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -899,6 +962,121 @@ func (ec *executionContext) _ChatChunk_done(ctx context.Context, field graphql.C
 }
 func (ec *executionContext) fieldContext_ChatChunk_done(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ChatChunk", field, false, false, errors.New("field of type Boolean does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterSyncStatus_context(ctx context.Context, field graphql.CollectedField, obj *model.ClusterSyncStatus) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterSyncStatus_context(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Context, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterSyncStatus_context(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterSyncStatus", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterSyncStatus_state(ctx context.Context, field graphql.CollectedField, obj *model.ClusterSyncStatus) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterSyncStatus_state(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.State, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v model.ClusterSyncState) graphql.Marshaler {
+			return ec.marshalNClusterSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterSyncState(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterSyncStatus_state(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterSyncStatus", field, false, false, errors.New("field of type ClusterSyncState does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterSyncStatus_lastError(ctx context.Context, field graphql.CollectedField, obj *model.ClusterSyncStatus) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterSyncStatus_lastError(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.LastError, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterSyncStatus_lastError(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterSyncStatus", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterSyncStatus_lastSyncedAt(ctx context.Context, field graphql.CollectedField, obj *model.ClusterSyncStatus) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterSyncStatus_lastSyncedAt(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.LastSyncedAt, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterSyncStatus_lastSyncedAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterSyncStatus", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterSyncStatus_downloadRateBps(ctx context.Context, field graphql.CollectedField, obj *model.ClusterSyncStatus) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterSyncStatus_downloadRateBps(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.DownloadRateBps, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterSyncStatus_downloadRateBps(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterSyncStatus", field, false, false, errors.New("field of type Int does not have child fields"))
 }
 
 func (ec *executionContext) _KubeConfig_authInfos(ctx context.Context, field graphql.CollectedField, obj *model.KubeConfig) (ret graphql.Marshaler) {
@@ -1753,6 +1931,38 @@ func (ec *executionContext) fieldContext_Subscription_syncStatusWatch(_ context.
 		IsResolver: true,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 			return ec.childFields_SyncStatus(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Subscription_clusterSyncStatusWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
+	return graphql.ResolveFieldStream(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Subscription_clusterSyncStatusWatch(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return ec.Resolvers.Subscription().ClusterSyncStatusWatch(ctx)
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v []*model.ClusterSyncStatus) graphql.Marshaler {
+			return ec.marshalNClusterSyncStatus2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterSyncStatusᚄ(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Subscription_clusterSyncStatusWatch(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Subscription",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterSyncStatus(ctx, field)
 		},
 	}
 	return fc, nil
@@ -3134,6 +3344,65 @@ func (ec *executionContext) _ChatChunk(ctx context.Context, sel ast.SelectionSet
 	return out
 }
 
+var clusterSyncStatusImplementors = []string{"ClusterSyncStatus"}
+
+func (ec *executionContext) _ClusterSyncStatus(ctx context.Context, sel ast.SelectionSet, obj *model.ClusterSyncStatus) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, clusterSyncStatusImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("ClusterSyncStatus")
+		case "context":
+			out.Values[i] = ec._ClusterSyncStatus_context(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "state":
+			out.Values[i] = ec._ClusterSyncStatus_state(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "lastError":
+			out.Values[i] = ec._ClusterSyncStatus_lastError(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "lastSyncedAt":
+			out.Values[i] = ec._ClusterSyncStatus_lastSyncedAt(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "downloadRateBps":
+			out.Values[i] = ec._ClusterSyncStatus_downloadRateBps(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
 var kubeConfigImplementors = []string{"KubeConfig"}
 
 func (ec *executionContext) _KubeConfig(ctx context.Context, sel ast.SelectionSet, obj *model.KubeConfig) graphql.Marshaler {
@@ -3712,6 +3981,8 @@ func (ec *executionContext) _Subscription(ctx context.Context, sel ast.Selection
 		return ec._Subscription_settingsWatch(ctx, fields[0])
 	case "syncStatusWatch":
 		return ec._Subscription_syncStatusWatch(ctx, fields[0])
+	case "clusterSyncStatusWatch":
+		return ec._Subscription_clusterSyncStatusWatch(ctx, fields[0])
 	case "chatStream":
 		return ec._Subscription_chatStream(ctx, fields[0])
 	case "kubeConfigWatch":
@@ -4163,6 +4434,42 @@ func (ec *executionContext) unmarshalNChatMessageInput2ᚕᚖgithubᚗcomᚋkube
 func (ec *executionContext) unmarshalNChatMessageInput2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatMessageInput(ctx context.Context, v any) (*model.ChatMessageInput, error) {
 	res, err := ec.unmarshalInputChatMessageInput(ctx, v)
 	return &res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) unmarshalNClusterSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterSyncState(ctx context.Context, v any) (model.ClusterSyncState, error) {
+	var res model.ClusterSyncState
+	err := res.UnmarshalGQL(v)
+	return res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) marshalNClusterSyncState2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterSyncState(ctx context.Context, sel ast.SelectionSet, v model.ClusterSyncState) graphql.Marshaler {
+	return v
+}
+
+func (ec *executionContext) marshalNClusterSyncStatus2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterSyncStatusᚄ(ctx context.Context, sel ast.SelectionSet, v []*model.ClusterSyncStatus) graphql.Marshaler {
+	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
+		fc := graphql.GetFieldContext(ctx)
+		fc.Result = &v[i]
+		return ec.marshalNClusterSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterSyncStatus(ctx, sel, v[i])
+	})
+
+	for _, e := range ret {
+		if e == graphql.Null {
+			return graphql.Null
+		}
+	}
+
+	return ret
+}
+
+func (ec *executionContext) marshalNClusterSyncStatus2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterSyncStatus(ctx context.Context, sel ast.SelectionSet, v *model.ClusterSyncStatus) graphql.Marshaler {
+	if v == nil {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+		return graphql.Null
+	}
+	return ec._ClusterSyncStatus(ctx, sel, v)
 }
 
 func (ec *executionContext) unmarshalNInt2int(ctx context.Context, v any) (int, error) {

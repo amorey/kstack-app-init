@@ -24,6 +24,20 @@ type ChatMessageInput struct {
 	Content string `json:"content"`
 }
 
+// Sync status of a single cluster being mirrored into the local cache.
+type ClusterSyncStatus struct {
+	// Kube-context name — the row identity.
+	Context string `json:"context"`
+	// Per-cluster sync lifecycle state.
+	State ClusterSyncState `json:"state"`
+	// Last sync error; empty string when healthy.
+	LastError string `json:"lastError"`
+	// Unix-millis of the last successful reconcile; 0 if never synced.
+	LastSyncedAt int `json:"lastSyncedAt"`
+	// Current download rate in bytes/sec; 0 when idle or offline.
+	DownloadRateBps int `json:"downloadRateBps"`
+}
+
 type KubeConfigWatchEvent struct {
 	Type   WatchEventType `json:"type"`
 	Object *KubeConfig    `json:"object,omitempty"`
@@ -57,6 +71,73 @@ type SyncStatus struct {
 
 type UpdateSettingsInput struct {
 	Placeholder *string `json:"placeholder,omitempty"`
+}
+
+// Per-cluster sync lifecycle for the local-cache sync engine.
+type ClusterSyncState string
+
+const (
+	// Queued; sync not started yet.
+	ClusterSyncStatePending ClusterSyncState = "PENDING"
+	// Actively downloading the cluster's resources into the local cache.
+	ClusterSyncStateSyncing ClusterSyncState = "SYNCING"
+	// Caught up; watching for incremental changes.
+	ClusterSyncStateLive ClusterSyncState = "LIVE"
+	// Retrying after an error.
+	ClusterSyncStateBackoff ClusterSyncState = "BACKOFF"
+	// Cluster unreachable.
+	ClusterSyncStateOffline ClusterSyncState = "OFFLINE"
+)
+
+var AllClusterSyncState = []ClusterSyncState{
+	ClusterSyncStatePending,
+	ClusterSyncStateSyncing,
+	ClusterSyncStateLive,
+	ClusterSyncStateBackoff,
+	ClusterSyncStateOffline,
+}
+
+func (e ClusterSyncState) IsValid() bool {
+	switch e {
+	case ClusterSyncStatePending, ClusterSyncStateSyncing, ClusterSyncStateLive, ClusterSyncStateBackoff, ClusterSyncStateOffline:
+		return true
+	}
+	return false
+}
+
+func (e ClusterSyncState) String() string {
+	return string(e)
+}
+
+func (e *ClusterSyncState) UnmarshalGQL(v any) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = ClusterSyncState(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid ClusterSyncState", str)
+	}
+	return nil
+}
+
+func (e ClusterSyncState) MarshalGQL(w io.Writer) {
+	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *ClusterSyncState) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e ClusterSyncState) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
 }
 
 // Engine connection lifecycle.

@@ -156,6 +156,28 @@ func (r *subscriptionResolver) SyncStatusWatch(ctx context.Context) (<-chan *mod
 	}), nil
 }
 
+// ClusterSyncStatusWatch is the resolver for the clusterSyncStatusWatch
+// field. Stub: per-cluster sync isn't wired to the engine yet, so it emits
+// one empty snapshot (so a subscriber gets a valid first frame rather than
+// hanging) and then holds the stream open until the client unsubscribes —
+// the same "don't close, wait for ctx.Done()" shape ChatStream uses to keep
+// the subscribe-exchange from treating a close as a transport drop. The
+// follow-up PR replaces this with a real per-cluster source via
+// streamWithSnapshot.
+func (r *subscriptionResolver) ClusterSyncStatusWatch(ctx context.Context) (<-chan []*model.ClusterSyncStatus, error) {
+	ch := make(chan []*model.ClusterSyncStatus)
+	go func() {
+		defer close(ch)
+		select {
+		case ch <- []*model.ClusterSyncStatus{}:
+		case <-ctx.Done():
+			return
+		}
+		<-ctx.Done()
+	}()
+	return ch, nil
+}
+
 // ChatStream is the resolver for the chatStream field. POC: forwards the
 // conversation to Anthropic and streams the assistant's reply token-by-token.
 // Emits `{delta, done:false}` per text chunk and a final `{delta:"", done:true}`

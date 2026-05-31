@@ -368,6 +368,40 @@ func TestSyncStatusWatchSnapshotThenTransitions(t *testing.T) {
 	readState("LIVE") // then transitions
 }
 
+// clusterSyncStatusWatch is a stub today: it emits an empty snapshot
+// (no clusters wired to the sync engine yet), then holds the stream open
+// until the client unsubscribes. The follow-up PR backs it with the real
+// per-cluster source. This pins the contract + transport so the frontend
+// can build against it now.
+func TestClusterSyncStatusWatchEmitsEmptySnapshot(t *testing.T) {
+	h := graph.NewServer(&graph.Resolver{})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	resp := openSSESubscription(t, ts.URL, "",
+		"subscription { clusterSyncStatusWatch { context state lastError lastSyncedAt downloadRateBps } }")
+	defer resp.Body.Close() // ends the subscription; must run before ts.Close()
+	events := sseEvents(resp)
+
+	ev := nextSSE(t, events)
+	if ev.event != "next" {
+		t.Fatalf("want event=next, got %q (data=%s)", ev.event, ev.data)
+	}
+	var msg struct {
+		Data struct {
+			ClusterSyncStatusWatch []struct {
+				Context string `json:"context"`
+			} `json:"clusterSyncStatusWatch"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(ev.data), &msg); err != nil {
+		t.Fatalf("decode %s: %v", ev.data, err)
+	}
+	if len(msg.Data.ClusterSyncStatusWatch) != 0 {
+		t.Fatalf("want empty cluster list, got %s", ev.data)
+	}
+}
+
 // --- kubeConfig / setCurrentContext ---------------------------------------
 
 // writeKubeConfig writes a kubeconfig with the named contexts and the given

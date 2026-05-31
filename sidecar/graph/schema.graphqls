@@ -43,6 +43,34 @@ type SyncStatus {
   retryAt: Int!
 }
 
+"Per-cluster sync lifecycle for the local-cache sync engine."
+enum ClusterSyncState {
+  "Queued; sync not started yet."
+  PENDING
+  "Actively downloading the cluster's resources into the local cache."
+  SYNCING
+  "Caught up; watching for incremental changes."
+  LIVE
+  "Retrying after an error."
+  BACKOFF
+  "Cluster unreachable."
+  OFFLINE
+}
+
+"Sync status of a single cluster being mirrored into the local cache."
+type ClusterSyncStatus {
+  "Kube-context name — the row identity."
+  context: String!
+  "Per-cluster sync lifecycle state."
+  state: ClusterSyncState!
+  "Last sync error; empty string when healthy."
+  lastError: String!
+  "Unix-millis of the last successful reconcile; 0 if never synced."
+  lastSyncedAt: Int!
+  "Current download rate in bytes/sec; 0 when idle or offline."
+  downloadRateBps: Int!
+}
+
 input ChatMessageInput {
   role: String!
   content: String!
@@ -142,6 +170,9 @@ type Subscription {
 
   "Streams the engine's sync health: the current status first, then every transition."
   syncStatusWatch: SyncStatus!
+
+  "Streams per-cluster sync status: the full snapshot first, then updates. Stub today (emits an empty list); wired to the sync engine in a follow-up."
+  clusterSyncStatusWatch: [ClusterSyncStatus!]!
 
   "Streams the assistant's reply token-by-token. Completes after a frame with `done: true`."
   chatStream(input: ChatInput!): ChatChunk!
