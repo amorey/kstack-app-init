@@ -336,6 +336,7 @@ func statusFromConditions(u *unstructured.Unstructured) string {
 	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
 	var lastTrue, lastFalseType, lastFalseReason string
 	var lastTrueAt time.Time
+	haveTrue := false
 	for _, c := range conds {
 		m, ok := c.(map[string]any)
 		if !ok {
@@ -350,7 +351,13 @@ func statusFromConditions(u *unstructured.Unstructured) string {
 			at, _ = time.Parse(time.RFC3339, lt)
 		}
 		if s == string(corev1.ConditionTrue) {
-			if at.After(lastTrueAt) {
+			// Take the first True condition unconditionally, then prefer any
+			// later one with a newer timestamp. Without the haveTrue guard a
+			// True condition that omits (or malforms) lastTransitionTime has a
+			// zero `at`, never beats the zero lastTrueAt, and would be dropped —
+			// falling through to a False/empty summary despite being True.
+			if !haveTrue || at.After(lastTrueAt) {
+				haveTrue = true
 				lastTrueAt = at
 				lastTrue = t
 			}

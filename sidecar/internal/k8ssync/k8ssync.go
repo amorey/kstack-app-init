@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustercache"
 )
@@ -79,7 +80,12 @@ type Cluster struct {
 // auth-provider config (command/args/env/plugin settings) — runtime token
 // minting is the transport's job, but editing how tokens are obtained must
 // invalidate the fingerprint.
-func configFingerprint(cfg *rest.Config) string {
+//
+// proxyURL is the kubeconfig cluster's proxy-url. clientcmd compiles it into
+// rest.Config.Proxy (an opaque func we can't hash), so the caller passes the raw
+// string: a changed proxy routes the connection differently and must restart the
+// reflectors, even when every other field is identical.
+func configFingerprint(cfg *rest.Config, proxyURL string) string {
 	if cfg == nil {
 		return ""
 	}
@@ -87,6 +93,8 @@ func configFingerprint(cfg *rest.Config) string {
 	// NUL-separate every field so boundaries can't be aliased by concatenation.
 	write := func(s string) { h.Write([]byte(s)); h.Write([]byte{0}) }
 	writeBytes := func(b []byte) { h.Write(b); h.Write([]byte{0}) }
+
+	write(proxyURL)
 
 	t := cfg.TLSClientConfig
 	for _, s := range []string{
@@ -137,6 +145,22 @@ func configFingerprint(cfg *rest.Config) string {
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// contextProxyURL returns the proxy-url of the cluster a kubeconfig context
+// points at, or "" if the context, its cluster, or the field is absent. The
+// Coordinator folds it into the config fingerprint because clientcmd compiles it
+// into rest.Config.Proxy, an opaque func the fingerprint can't otherwise see.
+func contextProxyURL(cfg *api.Config, ctxName string) string {
+	ctx, ok := cfg.Contexts[ctxName]
+	if !ok || ctx == nil {
+		return ""
+	}
+	cluster, ok := cfg.Clusters[ctx.Cluster]
+	if !ok || cluster == nil {
+		return ""
+	}
+	return cluster.ProxyURL
 }
 
 // sortedKeys returns a map's keys in deterministic order, so hashing a map

@@ -15,8 +15,12 @@ func TestConfigFingerprintCoversAuthFields(t *testing.T) {
 	base := func() *rest.Config {
 		return &rest.Config{Host: "https://x:6443", BearerToken: "tok"}
 	}
-	fp := configFingerprint(base())
-	require.Equal(t, fp, configFingerprint(base()), "identical configs hash equal")
+	fp := configFingerprint(base(), "")
+	require.Equal(t, fp, configFingerprint(base(), ""), "identical configs hash equal")
+
+	// proxy-url lives in the kubeconfig, not rest.Config's hashable fields, so it
+	// is passed alongside: a changed proxy must restart sync.
+	require.NotEqual(t, fp, configFingerprint(base(), "http://proxy:8080"), "proxy-url change must change the fingerprint")
 
 	edits := map[string]func(*rest.Config){
 		"exec command": func(c *rest.Config) {
@@ -39,7 +43,7 @@ func TestConfigFingerprintCoversAuthFields(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := base()
 			edit(c)
-			require.NotEqual(t, fp, configFingerprint(c), "edit must change the fingerprint")
+			require.NotEqual(t, fp, configFingerprint(c, ""), "edit must change the fingerprint")
 		})
 	}
 
@@ -47,5 +51,5 @@ func TestConfigFingerprintCoversAuthFields(t *testing.T) {
 	e1, e2 := base(), base()
 	e1.ExecProvider = &clientcmdapi.ExecConfig{Command: "t", Args: []string{"--a"}}
 	e2.ExecProvider = &clientcmdapi.ExecConfig{Command: "t", Args: []string{"--b"}}
-	require.NotEqual(t, configFingerprint(e1), configFingerprint(e2), "editing exec args changes the fingerprint")
+	require.NotEqual(t, configFingerprint(e1, ""), configFingerprint(e2, ""), "editing exec args changes the fingerprint")
 }

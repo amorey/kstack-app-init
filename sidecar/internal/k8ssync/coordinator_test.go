@@ -362,6 +362,40 @@ func TestProbeOutageKeepsContextPresent(t *testing.T) {
 	require.True(t, ok, "present context's row survives DeleteCache during outage")
 }
 
+// A mutation's reconcile must run against the coordinator's lifetime context, not
+// the (possibly already-cancelled) request context of the GraphQL client that
+// triggered it. Otherwise a client disconnecting mid-mutation cancels every
+// in-reconcile probe, empties the desired set, and closes all open clusters.
+func TestMutationReconcileIgnoresRequestContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fw := newFakeWatcher(kubeconfig("a", "a", "b"))
+	c, cache, _ := newTestCoordinator(t, fw)
+	t.Cleanup(func() { _ = cache.Shutdown(context.Background()) })
+
+	// Probe honors its context, so a cancelled context fails every identify.
+	base := c.identify
+	c.identify = func(ctx context.Context, cfg *rest.Config) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return base(ctx, cfg)
+	}
+
+	go c.Run(ctx)
+	waitFor(t, func() bool { return len(openUIDs(c)) == 2 }, "two clusters open")
+
+	// SetEnabled with an already-cancelled request context. The follow-up
+	// reconcile must use the live lifetime context, so the clusters stay open.
+	reqCtx, reqCancel := context.WithCancel(context.Background())
+	reqCancel()
+	_, err := c.SetEnabled(reqCtx, uidFor("a"), true)
+	require.NoError(t, err)
+	require.Equal(t, []string{uidFor("a"), uidFor("b")}, openUIDs(c),
+		"a cancelled request context must not close open clusters")
+}
+
 // A context whose kubeconfig credentials change but which still resolves to the
 // same cluster UUID must have its sync restarted, so the reflectors stop running
 // on the stale rest.Config. A restart replaces the cluster's ClusterDB handle.

@@ -160,3 +160,54 @@ func TestExtractEventInvolvedObject(t *testing.T) {
 		require.Equal(t, "mypod", row.InvolvedName)
 	})
 }
+
+func cond(t, status, reason, lastTransitionTime string) map[string]any {
+	m := map[string]any{"type": t, "status": status}
+	if reason != "" {
+		m["reason"] = reason
+	}
+	if lastTransitionTime != "" {
+		m["lastTransitionTime"] = lastTransitionTime
+	}
+	return m
+}
+
+func crdWithConditions(conds ...map[string]any) *unstructured.Unstructured {
+	slice := make([]any, len(conds))
+	for i, c := range conds {
+		slice[i] = c
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{"conditions": slice},
+	}}
+}
+
+func TestStatusFromConditions(t *testing.T) {
+	t.Run("most-recently-true condition wins", func(t *testing.T) {
+		u := crdWithConditions(
+			cond("Ready", "True", "", "2021-01-01T00:00:00Z"),
+			cond("Synced", "True", "", "2021-02-01T00:00:00Z"),
+		)
+		require.Equal(t, "Synced", statusFromConditions(u))
+	})
+
+	t.Run("True with no timestamp is still surfaced", func(t *testing.T) {
+		// lastTransitionTime omitted: the True condition must not be dropped in
+		// favor of a False/empty fallback just because its timestamp is zero.
+		u := crdWithConditions(
+			cond("Degraded", "False", "AllGood", ""),
+			cond("Ready", "True", "", ""),
+		)
+		require.Equal(t, "Ready", statusFromConditions(u))
+	})
+
+	t.Run("True with unparsable timestamp is still surfaced", func(t *testing.T) {
+		u := crdWithConditions(cond("Ready", "True", "", "not-a-timestamp"))
+		require.Equal(t, "Ready", statusFromConditions(u))
+	})
+
+	t.Run("False condition reports type and reason", func(t *testing.T) {
+		u := crdWithConditions(cond("Synced", "False", "OutOfSync", "2021-01-01T00:00:00Z"))
+		require.Equal(t, "Synced (OutOfSync)", statusFromConditions(u))
+	})
+}

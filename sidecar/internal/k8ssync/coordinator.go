@@ -88,6 +88,13 @@ type Coordinator struct {
 
 	flushInterval time.Duration // freshness flush cadence (overridable in tests)
 
+	// baseCtx is the coordinator's lifetime context (set by Run). Store-mutation
+	// reconciles (SetEnabled/DeleteCache) run against it rather than the caller's
+	// request context: a GraphQL client disconnecting mid-mutation must not cancel
+	// the probes inside reconcile, which would make every context fail to identify,
+	// empty the desired set, and close all currently-open clusters.
+	baseCtx context.Context
+
 	// actionMu serializes reconcile + SetEnabled + DeleteCache.
 	actionMu sync.Mutex
 
@@ -151,6 +158,10 @@ func NewCoordinator(cache *clustercache.Manager, watcher configSubscriber, regis
 // current config first, so the initial cluster set is opened on the first
 // iteration.
 func (c *Coordinator) Run(ctx context.Context) {
+	c.mu.Lock()
+	c.baseCtx = ctx
+	c.mu.Unlock()
+
 	go c.freshnessLoop(ctx)
 
 	sub := c.watcher.Subscribe()
@@ -313,7 +324,7 @@ func (c *Coordinator) reconcileLocked(ctx context.Context, cfg *api.Config) {
 		if !ok || !rec.Enabled {
 			continue
 		}
-		want[r.uid] = Cluster{UUID: r.uid, Name: r.name, Context: r.name, config: r.cfg, fingerprint: configFingerprint(r.cfg)}
+		want[r.uid] = Cluster{UUID: r.uid, Name: r.name, Context: r.name, config: r.cfg, fingerprint: configFingerprint(r.cfg, contextProxyURL(cfg, r.name))}
 	}
 
 	c.mu.RLock()
@@ -479,7 +490,7 @@ func (c *Coordinator) SetEnabled(ctx context.Context, uuid string, enabled bool)
 	if !ok {
 		return ClusterView{}, fmt.Errorf("unknown cluster %q", uuid)
 	}
-	c.reconcileFromLastCfg(ctx)
+	c.reconcileFromLastCfg()
 	return c.viewFor(uuid), nil
 }
 
@@ -521,17 +532,26 @@ func (c *Coordinator) DeleteCache(ctx context.Context, uuid string) error {
 			return err
 		}
 	}
-	c.reconcileFromLastCfg(ctx)
+	c.reconcileFromLastCfg()
 	return nil
 }
 
 // reconcileFromLastCfg re-runs reconciliation against the most recent kubeconfig
 // (so a store mutation takes effect without waiting for a kubeconfig event), or
 // just publishes if no config has been seen yet. Caller holds actionMu.
-func (c *Coordinator) reconcileFromLastCfg(ctx context.Context) {
+//
+// It deliberately reconciles against the coordinator's lifetime context, not the
+// mutating caller's request context: a client disconnecting mid-mutation would
+// otherwise cancel the in-reconcile probes, drop every context from the desired
+// set, and close all open clusters.
+func (c *Coordinator) reconcileFromLastCfg() {
 	c.mu.RLock()
 	cfg := c.lastCfg
+	ctx := c.baseCtx
 	c.mu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background() // mutation before Run; should not happen in practice
+	}
 	if cfg != nil {
 		c.reconcileLocked(ctx, cfg)
 		return
