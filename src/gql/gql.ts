@@ -16,6 +16,7 @@ import type { TypedDocumentNode as DocumentNode } from '@graphql-typed-document-
 type Documents = {
     "\n  mutation SetClusterEnabled($uuid: String!, $enabled: Boolean!) {\n    setClusterEnabled(uuid: $uuid, enabled: $enabled) {\n      uuid\n      enabled\n    }\n  }\n": typeof types.SetClusterEnabledDocument,
     "\n  mutation DeleteClusterCache($uuid: String!) {\n    deleteClusterCache(uuid: $uuid)\n  }\n": typeof types.DeleteClusterCacheDocument,
+    "\n  mutation RemoveCluster($uuid: String!) {\n    removeCluster(uuid: $uuid)\n  }\n": typeof types.RemoveClusterDocument,
     "\n  subscription ClustersWatch {\n    clustersWatch {\n      uuid\n      name\n      context\n      isCurrent\n      enabled\n      present\n      cached\n      cacheBytes\n      lastSyncedAt\n      lastSeenInKubeconfigAt\n    }\n  }\n": typeof types.ClustersWatchDocument,
     "\n  subscription Tick {\n    tick\n  }\n": typeof types.TickDocument,
     "\n  subscription KubeConfigWatch {\n    kubeConfigWatch {\n      type\n      object {\n        currentContext\n        authInfos {\n          name\n          locationOfOrigin\n        }\n        clusters {\n          name\n          locationOfOrigin\n          server\n        }\n        contexts {\n          name\n          locationOfOrigin\n          cluster\n          authInfo\n          namespace\n        }\n      }\n    }\n  }\n": typeof types.KubeConfigWatchDocument,
@@ -25,6 +26,7 @@ type Documents = {
 const documents: Documents = {
     "\n  mutation SetClusterEnabled($uuid: String!, $enabled: Boolean!) {\n    setClusterEnabled(uuid: $uuid, enabled: $enabled) {\n      uuid\n      enabled\n    }\n  }\n": types.SetClusterEnabledDocument,
     "\n  mutation DeleteClusterCache($uuid: String!) {\n    deleteClusterCache(uuid: $uuid)\n  }\n": types.DeleteClusterCacheDocument,
+    "\n  mutation RemoveCluster($uuid: String!) {\n    removeCluster(uuid: $uuid)\n  }\n": types.RemoveClusterDocument,
     "\n  subscription ClustersWatch {\n    clustersWatch {\n      uuid\n      name\n      context\n      isCurrent\n      enabled\n      present\n      cached\n      cacheBytes\n      lastSyncedAt\n      lastSeenInKubeconfigAt\n    }\n  }\n": types.ClustersWatchDocument,
     "\n  subscription Tick {\n    tick\n  }\n": types.TickDocument,
     "\n  subscription KubeConfigWatch {\n    kubeConfigWatch {\n      type\n      object {\n        currentContext\n        authInfos {\n          name\n          locationOfOrigin\n        }\n        clusters {\n          name\n          locationOfOrigin\n          server\n        }\n        contexts {\n          name\n          locationOfOrigin\n          cluster\n          authInfo\n          namespace\n        }\n      }\n    }\n  }\n": types.KubeConfigWatchDocument,
@@ -54,6 +56,10 @@ export function graphql(source: "\n  mutation SetClusterEnabled($uuid: String!, 
  * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
  */
 export function graphql(source: "\n  mutation DeleteClusterCache($uuid: String!) {\n    deleteClusterCache(uuid: $uuid)\n  }\n"): (typeof documents)["\n  mutation DeleteClusterCache($uuid: String!) {\n    deleteClusterCache(uuid: $uuid)\n  }\n"];
+/**
+ * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
+ */
+export function graphql(source: "\n  mutation RemoveCluster($uuid: String!) {\n    removeCluster(uuid: $uuid)\n  }\n"): (typeof documents)["\n  mutation RemoveCluster($uuid: String!) {\n    removeCluster(uuid: $uuid)\n  }\n"];
 /**
  * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
  */

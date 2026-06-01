@@ -54,6 +54,7 @@ type Manager interface {
 	Subscribe() (<-chan []ClusterView, func())
 	SetEnabled(ctx context.Context, uuid string, enabled bool) (ClusterView, error)
 	DeleteCache(ctx context.Context, uuid string) error
+	RemoveCluster(ctx context.Context, uuid string) error
 }
 
 // configSubscriber is the slice of *k8shelpers.KubeConfigWatcher the Coordinator
@@ -494,17 +495,17 @@ func (c *Coordinator) SetEnabled(ctx context.Context, uuid string, enabled bool)
 	return c.viewFor(uuid), nil
 }
 
-// DeleteCache removes a cluster's cache files. The follow-up effect depends on
-// whether its context is still in the kubeconfig:
+// DeleteCache removes a cluster's cache files but always keeps its registry row,
+// so the cluster stays listed (now uncached). The follow-up effect depends on
+// the cluster's state:
 //   - present + enabled → reconcile re-discovers it and re-syncs from scratch
 //     ("delete = wipe and re-fetch", the chosen semantics);
-//   - present + disabled → files are freed but the (disabled) row stays, so the
-//     user can re-enable later;
-//   - absent (orphan) → the row is forgotten entirely.
+//   - present + disabled → files are freed and the (disabled) row stays;
+//   - absent (orphan) → files are freed and the orphan row stays, so the user can
+//     still see it (and remove it outright via RemoveCluster).
 //
-// The record is only dropped for an absent cluster; keeping it for a present one
-// preserves the user's enabled/disabled choice (and avoids a disabled cluster
-// silently re-enabling on the next reconcile's RecordSeen).
+// Keeping the record preserves the user's enabled/disabled choice and keeps
+// clear-cache distinct from "forget this cluster" (see RemoveCluster).
 func (c *Coordinator) DeleteCache(ctx context.Context, uuid string) error {
 	c.actionMu.Lock()
 	defer c.actionMu.Unlock()
@@ -513,24 +514,39 @@ func (c *Coordinator) DeleteCache(ctx context.Context, uuid string) error {
 	// records them at startup), so an unknown UUID is either gone already or a
 	// malformed value; rejecting it before DeleteCacheFiles keeps a string like
 	// "../../foo" from reaching the filesystem layer.
-	rec, known, err := c.registry.Get(uuid)
-	if err != nil {
+	if _, known, err := c.registry.Get(uuid); err != nil {
 		return fmt.Errorf("delete cache %q: %w", uuid, err)
-	}
-	if !known {
+	} else if !known {
 		return fmt.Errorf("unknown cluster %q", uuid)
 	}
 	c.forgetOpen(uuid) // drop our bookkeeping so reconcile re-opens cleanly
 	if err := c.cache.DeleteCacheFiles(ctx, uuid); err != nil {
 		return err
 	}
-	c.mu.RLock()
-	present := recordPresent(c.presence, rec)
-	c.mu.RUnlock()
-	if !present {
-		if err := c.registry.Delete(uuid); err != nil {
-			return err
-		}
+	c.reconcileFromLastCfg()
+	return nil
+}
+
+// RemoveCluster forgets a cluster entirely: it deletes any cache files and drops
+// the registry row, so the cluster disappears from the list. It's meant for an
+// orphan (a context gone from the kubeconfig) — a still-present context would be
+// re-discovered and re-added by the next reconcile. Errors for an unknown uuid;
+// rejecting it before DeleteCacheFiles also keeps a traversal string off the
+// filesystem layer.
+func (c *Coordinator) RemoveCluster(ctx context.Context, uuid string) error {
+	c.actionMu.Lock()
+	defer c.actionMu.Unlock()
+	if _, known, err := c.registry.Get(uuid); err != nil {
+		return fmt.Errorf("remove cluster %q: %w", uuid, err)
+	} else if !known {
+		return fmt.Errorf("unknown cluster %q", uuid)
+	}
+	c.forgetOpen(uuid)
+	if err := c.cache.DeleteCacheFiles(ctx, uuid); err != nil {
+		return err
+	}
+	if err := c.registry.Delete(uuid); err != nil {
+		return err
 	}
 	c.reconcileFromLastCfg()
 	return nil

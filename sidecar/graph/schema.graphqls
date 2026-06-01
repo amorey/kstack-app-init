@@ -233,8 +233,11 @@ type Mutation {
   "Enable or disable syncing for a cluster. Disabling stops its sync and freezes its cache (no longer browsable); enabling resumes it. Returns the updated cluster; errors if the uuid is unknown."
   setClusterEnabled(uuid: String!, enabled: Boolean!): Cluster!
 
-  "Delete a cluster's local cache files. If its context is still present and enabled it re-syncs from scratch; a disabled cluster's row is kept (files freed); an orphan (gone from kubeconfig) is forgotten. Returns true."
+  "Delete a cluster's local cache files, keeping its registry row (now uncached). If its context is still present and enabled it re-syncs from scratch; otherwise the files are simply freed and the row — including an orphan — stays listed. Returns true; errors if the uuid is unknown."
   deleteClusterCache(uuid: String!): Boolean!
+
+  "Forget a cluster entirely: delete its cache files and remove its row from the local registry (app.db). Meant for an orphan (gone from the kubeconfig); a still-present context is re-discovered on the next reconcile. Returns true; errors if the uuid is unknown."
+  removeCluster(uuid: String!): Boolean!
 }
 
 type Subscription {

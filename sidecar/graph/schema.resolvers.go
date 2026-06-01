@@ -106,6 +106,17 @@ func (r *mutationResolver) DeleteClusterCache(ctx context.Context, uuid string) 
 	return true, nil
 }
 
+// RemoveCluster is the resolver for the removeCluster field.
+func (r *mutationResolver) RemoveCluster(ctx context.Context, uuid string) (bool, error) {
+	if r.ClusterManager == nil {
+		return false, fmt.Errorf("cluster cache is not configured")
+	}
+	if err := r.ClusterManager.RemoveCluster(ctx, uuid); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Ping is the resolver for the ping field.
 func (r *queryResolver) Ping(ctx context.Context) (string, error) {
 	return "pong", nil

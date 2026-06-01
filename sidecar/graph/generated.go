@@ -119,6 +119,7 @@ type ComplexityRoot struct {
 
 	Mutation struct {
 		DeleteClusterCache func(childComplexity int, uuid string) int
+		RemoveCluster      func(childComplexity int, uuid string) int
 		SetClusterEnabled  func(childComplexity int, uuid string, enabled bool) int
 		SetCurrentContext  func(childComplexity int, name string) int
 		UpdateSettings     func(childComplexity int, input model.UpdateSettingsInput) int
@@ -199,6 +200,7 @@ type MutationResolver interface {
 	SetCurrentContext(ctx context.Context, name string) (bool, error)
 	SetClusterEnabled(ctx context.Context, uuid string, enabled bool) (*model.Cluster, error)
 	DeleteClusterCache(ctx context.Context, uuid string) (bool, error)
+	RemoveCluster(ctx context.Context, uuid string) (bool, error)
 }
 type QueryResolver interface {
 	Ping(ctx context.Context) (string, error)
@@ -558,6 +560,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Mutation.DeleteClusterCache(childComplexity, args["uuid"].(string)), true
+	case "Mutation.removeCluster":
+		if e.ComplexityRoot.Mutation.RemoveCluster == nil {
+			break
+		}
+
+		args, err := ec.field_Mutation_removeCluster_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.ComplexityRoot.Mutation.RemoveCluster(childComplexity, args["uuid"].(string)), true
 	case "Mutation.setClusterEnabled":
 		if e.ComplexityRoot.Mutation.SetClusterEnabled == nil {
 			break
@@ -1379,6 +1392,20 @@ func (ec *executionContext) childFields___Type(ctx context.Context, field graphq
 // region    ***************************** args.gotpl *****************************
 
 func (ec *executionContext) field_Mutation_deleteClusterCache_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "uuid",
+		func(ctx context.Context, v any) (string, error) {
+			return ec.unmarshalNString2string(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["uuid"] = arg0
+	return args, nil
+}
+
+func (ec *executionContext) field_Mutation_removeCluster_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "uuid",
@@ -3024,6 +3051,50 @@ func (ec *executionContext) fieldContext_Mutation_deleteClusterCache(ctx context
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
 	if fc.Args, err = ec.field_Mutation_deleteClusterCache_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Mutation_removeCluster(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Mutation_removeCluster(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.Resolvers.Mutation().RemoveCluster(ctx, fc.Args["uuid"].(string))
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
+			return ec.marshalNBoolean2bool(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Mutation_removeCluster(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Mutation",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return nil, errors.New("field of type Boolean does not have child fields")
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Mutation_removeCluster_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -6209,6 +6280,13 @@ func (ec *executionContext) _Mutation(ctx context.Context, sel ast.SelectionSet)
 		case "deleteClusterCache":
 			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
 				return ec._Mutation_deleteClusterCache(ctx, field)
+			})
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "removeCluster":
+			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
+				return ec._Mutation_removeCluster(ctx, field)
 			})
 			if out.Values[i] == graphql.Null {
 				out.Invalids++

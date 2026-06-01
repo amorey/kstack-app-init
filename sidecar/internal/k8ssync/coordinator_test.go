@@ -224,7 +224,7 @@ func TestDeletePresentDisabledFreesFilesKeepsRow(t *testing.T) {
 	require.False(t, v.Cached)
 }
 
-func TestDeleteOrphanForgetsIt(t *testing.T) {
+func TestDeleteOrphanCacheKeepsRow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -234,13 +234,39 @@ func TestDeleteOrphanForgetsIt(t *testing.T) {
 	go c.Run(ctx)
 	waitFor(t, func() bool { return len(openUIDs(c)) == 2 }, "two open")
 
-	// Remove "b" → orphan (absent, cached). Deleting it forgets the row.
+	// Remove "b" → orphan (absent, cached). Clearing its cache frees the files
+	// but keeps the (now uncached) orphan row, so it stays listed and removable.
 	fw.publish(kubeconfig("a", "a"))
 	waitFor(t, func() bool { _, ok := viewByName(c, "b"); return ok && len(openUIDs(c)) == 1 }, "b orphaned")
 
 	require.NoError(t, c.DeleteCache(ctx, uidFor("b")))
+	vb, ok := viewByName(c, "b")
+	require.True(t, ok, "orphan row kept after clearing cache")
+	require.False(t, vb.Present, "still absent from kubeconfig")
+	require.False(t, vb.Cached, "cache files freed")
+	require.Len(t, c.Clusters(), 2)
+}
+
+func TestRemoveOrphanForgetsIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fw := newFakeWatcher(kubeconfig("a", "a", "b"))
+	c, cache, _ := newTestCoordinator(t, fw)
+	t.Cleanup(func() { _ = cache.Shutdown(context.Background()) })
+	go c.Run(ctx)
+	waitFor(t, func() bool { return len(openUIDs(c)) == 2 }, "two open")
+
+	// Remove "b" → orphan (absent, cached). RemoveCluster forgets the row AND
+	// frees its cache files in one step.
+	fw.publish(kubeconfig("a", "a"))
+	waitFor(t, func() bool { _, ok := viewByName(c, "b"); return ok && len(openUIDs(c)) == 1 }, "b orphaned")
+
+	require.NoError(t, c.RemoveCluster(ctx, uidFor("b")))
 	_, ok := viewByName(c, "b")
 	require.False(t, ok, "orphan fully forgotten")
+	_, cached := cache.CacheBytes(uidFor("b"))
+	require.False(t, cached, "cache files removed")
 	require.Len(t, c.Clusters(), 1)
 }
 
@@ -478,6 +504,8 @@ func TestDeleteCacheRejectsUnknownUUID(t *testing.T) {
 
 	require.Error(t, c.DeleteCache(ctx, "../../foo"), "path-traversal UUID rejected")
 	require.Error(t, c.DeleteCache(ctx, uidFor("does-not-exist")), "unknown UUID rejected")
+	require.Error(t, c.RemoveCluster(ctx, "../../foo"), "RemoveCluster rejects path-traversal UUID")
+	require.Error(t, c.RemoveCluster(ctx, uidFor("does-not-exist")), "RemoveCluster rejects unknown UUID")
 }
 
 // A kubeconfig context whose UID probe never succeeds (e.g. a stopped minikube:

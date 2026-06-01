@@ -38,6 +38,7 @@ type Row = {
   enabled: boolean;
   present: boolean;
   cached: boolean;
+  isCurrent?: boolean;
   cacheBytes?: number;
   lastSyncedAt?: number;
 };
@@ -72,6 +73,18 @@ function renderPanel() {
   );
 }
 
+// Render the panel, push rows, and open the sheet.
+async function openWith(rows: Row[]) {
+  const user = userEvent.setup();
+  renderPanel();
+  await flush();
+  await act(async () => {
+    pushClusters(rows);
+  });
+  await user.click(screen.getByRole('button', { name: /clusters/i }));
+  return user;
+}
+
 describe('ClusterSyncPanel', () => {
   // base-ui's dialog relies on pointer-capture / scroll APIs jsdom lacks.
   beforeAll(() => {
@@ -91,13 +104,14 @@ describe('ClusterSyncPanel', () => {
       }
       if (cmd === 'graphql_unsubscribe') return undefined;
       if (cmd === 'graphql_query') {
-        // Either mutation succeeds; extra fields are ignored by urql.
+        // Any mutation succeeds; extra fields are ignored by urql.
         return {
           status: 200,
           body: JSON.stringify({
             data: {
               setClusterEnabled: { __typename: 'Cluster', uuid: 'u', enabled: false },
               deleteClusterCache: true,
+              removeCluster: true,
             },
           }),
         };
@@ -118,155 +132,117 @@ describe('ClusterSyncPanel', () => {
   });
 
   it('shows an empty state when there are no clusters', async () => {
-    const user = userEvent.setup();
-    renderPanel();
-    await flush();
-    await act(async () => {
-      pushClusters([]);
-    });
-
-    await user.click(screen.getByRole('button', { name: /clusters/i }));
+    const user = await openWith([]);
+    expect(user).toBeDefined();
     expect(await screen.findByText(/no clusters yet/i)).toBeInTheDocument();
   });
 
-  it('lists a row per cluster with derived status and cache size', async () => {
-    const user = userEvent.setup();
-    renderPanel();
-    await flush();
-    await act(async () => {
-      pushClusters([
-        { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, cacheBytes: 1_300_000 },
-        { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: true, cacheBytes: 524_288 },
-        { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true, cacheBytes: 1024 },
-      ]);
-    });
-
-    await user.click(screen.getByRole('button', { name: /clusters/i }));
-
-    expect(await screen.findByText('prod-us')).toBeInTheDocument();
-    expect(screen.getByText('staging')).toBeInTheDocument();
-    expect(screen.getByText('old-cluster')).toBeInTheDocument();
-
-    // Status derived from the enabled/present flags.
-    expect(screen.getByText(/^syncing$/i)).toBeInTheDocument(); // prod: enabled + present
-    expect(screen.getByText(/^paused$/i)).toBeInTheDocument(); // staging: disabled
-    expect(screen.getByText(/^orphaned$/i)).toBeInTheDocument(); // old: enabled but gone
-
-    // Cache sizes formatted (binary units).
-    expect(screen.getByText(/1\.2 MB/)).toBeInTheDocument();
-    expect(screen.getByText(/512\.0 KB/)).toBeInTheDocument();
+  it('renders the table columns', async () => {
+    await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
+    expect(await screen.findByRole('columnheader', { name: /^cluster$/i })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: /^connection$/i })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: /sync status/i })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: /^cache$/i })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: /actions/i })).toBeInTheDocument();
   });
 
-  it('splits clusters into active and orphaned groups by kubeconfig presence', async () => {
-    const user = userEvent.setup();
-    renderPanel();
-    await flush();
-    await act(async () => {
-      pushClusters([
-        // In kubeconfig (present) -> active, regardless of enabled/sync state.
-        { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, cacheBytes: 1_300_000 },
-        { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: true, cacheBytes: 524_288 },
-        // Cached but gone from kubeconfig -> orphaned.
-        { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true, cacheBytes: 1024 },
-      ]);
-    });
+  it('splits clusters into active and orphaned row groups by kubeconfig presence', async () => {
+    await openWith([
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, cacheBytes: 1_300_000 },
+      { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: true, cacheBytes: 524_288 },
+      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true, cacheBytes: 1024 },
+    ]);
 
-    await user.click(screen.getByRole('button', { name: /clusters/i }));
+    const active = await screen.findByRole('rowgroup', { name: /active/i });
+    const orphaned = screen.getByRole('rowgroup', { name: /orphaned/i });
 
-    const active = await screen.findByRole('region', { name: /active/i });
-    const orphaned = screen.getByRole('region', { name: /orphaned/i });
-
-    // Active group holds every cluster still in the kubeconfig.
     expect(within(active).getByText('prod-us')).toBeInTheDocument();
     expect(within(active).getByText('staging')).toBeInTheDocument();
     expect(within(active).queryByText('old-cluster')).not.toBeInTheDocument();
 
-    // Orphaned group holds the leftover cache.
     expect(within(orphaned).getByText('old-cluster')).toBeInTheDocument();
     expect(within(orphaned).queryByText('prod-us')).not.toBeInTheDocument();
+
+    // Status + formatted cache sizes (binary units).
+    expect(within(active).getByText(/^syncing$/i)).toBeInTheDocument();
+    expect(within(active).getByText(/^paused$/i)).toBeInTheDocument();
+    expect(within(orphaned).getByText(/^stopped$/i)).toBeInTheDocument();
+    expect(screen.getByText(/1\.2 MB/)).toBeInTheDocument();
+    expect(screen.getByText(/512\.0 KB/)).toBeInTheDocument();
   });
 
-  it('shows an unreachable kubeconfig context as a pending active row with no toggle', async () => {
-    const user = userEvent.setup();
-    renderPanel();
-    await flush();
-    await act(async () => {
-      // minikube-style: present in the kubeconfig but never identified, so no
-      // UUID and nothing cached yet.
-      pushClusters([{ uuid: '', name: 'minikube', enabled: false, present: true, cached: false }]);
-    });
+  it('shows a short connection status for each cluster', async () => {
+    await openWith([
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, isCurrent: true },
+      { uuid: '', name: 'minikube', enabled: false, present: true, cached: false },
+      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true },
+    ]);
 
-    await user.click(screen.getByRole('button', { name: /clusters/i }));
+    // Scoped to cells so the group-header "Active" label doesn't collide.
+    const active = await screen.findByRole('rowgroup', { name: /active/i });
+    const orphaned = screen.getByRole('rowgroup', { name: /orphaned/i });
 
-    const active = await screen.findByRole('region', { name: /active/i });
-    expect(within(active).getByText('minikube')).toBeInTheDocument();
-    expect(within(active).getByText(/not synced/i)).toBeInTheDocument();
-    // No sync toggle (and no delete) until the cluster is reachable + identified.
-    expect(within(active).queryByRole('switch')).not.toBeInTheDocument();
-    expect(within(active).queryByRole('button', { name: /delete cache/i })).not.toBeInTheDocument();
+    expect(within(active).getByRole('cell', { name: 'Active' })).toBeInTheDocument(); // reachable
+    expect(within(active).getByRole('cell', { name: 'Error' })).toBeInTheDocument(); // probe failed
+    expect(within(orphaned).getByRole('cell', { name: 'Unavailable' })).toBeInTheDocument(); // gone
   });
 
-  it('omits a group that has no members', async () => {
-    const user = userEvent.setup();
-    renderPanel();
-    await flush();
-    await act(async () => {
-      pushClusters([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
-    });
-
-    await user.click(screen.getByRole('button', { name: /clusters/i }));
-
-    expect(await screen.findByRole('region', { name: /active/i })).toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: /orphaned/i })).not.toBeInTheDocument();
+  it('omits a row group that has no members', async () => {
+    await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
+    expect(await screen.findByRole('rowgroup', { name: /active/i })).toBeInTheDocument();
+    expect(screen.queryByRole('rowgroup', { name: /orphaned/i })).not.toBeInTheDocument();
   });
 
-  it('reflects the backend enabled flag on each switch', async () => {
-    const user = userEvent.setup();
-    renderPanel();
-    await flush();
-    await act(async () => {
-      pushClusters([
-        { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true },
-        { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: true },
-      ]);
-    });
+  it('toggling sync fires the play/pause action via setClusterEnabled', async () => {
+    const user = await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
 
-    await user.click(screen.getByRole('button', { name: /clusters/i }));
-    expect(await screen.findByRole('switch', { name: /prod-us/i })).toBeChecked();
-    expect(screen.getByRole('switch', { name: /staging/i })).not.toBeChecked();
-  });
-
-  it('toggling a cluster fires the setClusterEnabled mutation', async () => {
-    const user = userEvent.setup();
-    renderPanel();
-    await flush();
-    await act(async () => {
-      pushClusters([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
-    });
-
-    await user.click(screen.getByRole('button', { name: /clusters/i }));
-    await user.click(await screen.findByRole('switch', { name: /prod-us/i }));
-
+    // Enabled + active → a Pause button.
+    await user.click(await screen.findByRole('button', { name: /pause sync for prod-us/i }));
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
       expect.objectContaining({ body: expect.stringContaining('setClusterEnabled') }),
     );
   });
 
-  it('deleting a cached cluster fires the deleteClusterCache mutation', async () => {
-    const user = userEvent.setup();
-    renderPanel();
-    await flush();
-    await act(async () => {
-      pushClusters([{ uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true }]);
-    });
+  it('clearing a cache fires deleteClusterCache, and is disabled when uncached', async () => {
+    const user = await openWith([
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true },
+      { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: false },
+    ]);
 
-    await user.click(screen.getByRole('button', { name: /clusters/i }));
-    await user.click(await screen.findByRole('button', { name: /delete cache for old-cluster/i }));
+    expect(await screen.findByRole('button', { name: /clear cache for staging/i })).toBeDisabled();
 
+    await user.click(screen.getByRole('button', { name: /clear cache for prod-us/i }));
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
       expect.objectContaining({ body: expect.stringContaining('deleteClusterCache') }),
+    );
+  });
+
+  it('shows an unreachable kubeconfig context as a pending active row with disabled actions', async () => {
+    await openWith([{ uuid: '', name: 'minikube', enabled: false, present: true, cached: false }]);
+
+    const active = await screen.findByRole('rowgroup', { name: /active/i });
+    expect(within(active).getByText('minikube')).toBeInTheDocument();
+    expect(within(active).getByText(/not synced/i)).toBeInTheDocument();
+    // Can't sync or clear a context with no identity / no cache yet.
+    expect(screen.getByRole('button', { name: /sync for minikube/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /clear cache for minikube/i })).toBeDisabled();
+    // Remove is rendered (so the Actions column aligns) but disabled in Active.
+    expect(screen.getByRole('button', { name: /^remove minikube/i })).toBeDisabled();
+  });
+
+  it('disables play/pause for orphaned rows and removes them via removeCluster', async () => {
+    const user = await openWith([{ uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true }]);
+
+    expect(await screen.findByRole('button', { name: /sync for old-cluster/i })).toBeDisabled();
+
+    const remove = screen.getByRole('button', { name: /^remove old-cluster/i });
+    expect(remove).toBeEnabled();
+    await user.click(remove);
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_query',
+      expect.objectContaining({ body: expect.stringContaining('removeCluster') }),
     );
   });
 });

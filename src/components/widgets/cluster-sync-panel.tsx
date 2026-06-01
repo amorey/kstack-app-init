@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Slide-out panel listing every cluster in the app's registry, split into two
-// groups: Active (still in the current kubeconfig) and Orphaned (a leftover
-// cache whose context has left the kubeconfig). Each row shows its sync state
-// and cache size; the toggle enables or disables syncing, and cached rows can
-// have their cache deleted.
-// The caller positions the trigger (today: the top-right toolbar). Data + state
-// come from the sidecar via useClusters() — the toggle and delete write through
-// to it, and the resulting clustersWatch push updates the row.
-import { Database, Trash2 } from 'lucide-react';
+// Slide-out panel showing the app's cluster registry as a table, with rows
+// grouped into Active (still in the current kubeconfig) and Orphaned (a leftover
+// cache whose context has left the kubeconfig). Columns: Cluster & connection,
+// Sync status, Cache, Actions. Each row's actions are a play/pause toggle for
+// syncing and a clear-cache button; orphaned rows disable play/pause and add a
+// trash button that forgets the cluster entirely (removes it from app.db).
+// Data + state come from the sidecar via useClusters() — the mutations write
+// through to it, and the resulting clustersWatch push updates the table.
+import { Database, Pause, Play, Slash, Trash2 } from 'lucide-react';
 import { useMutation } from 'urql';
 
+import { Button } from '@kubetail/ui/elements/button';
 import {
   Sheet,
   SheetContent,
@@ -31,7 +32,7 @@ import {
   SheetTitle,
   SheetTrigger,
 } from '@kubetail/ui/elements/sheet';
-import { Switch } from '@kubetail/ui/elements/switch';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@kubetail/ui/elements/table';
 
 import { graphql } from '@/gql';
 import { type Cluster, formatBytes, useClusters } from '@/lib/clusters';
@@ -53,15 +54,20 @@ const DeleteClusterCacheMutation = graphql(`
   }
 `);
 
-type Tone = 'ok' | 'warn' | 'muted';
+const RemoveClusterMutation = graphql(`
+  mutation RemoveCluster($uuid: String!) {
+    removeCluster(uuid: $uuid)
+  }
+`);
+
+type Tone = 'ok' | 'error' | 'muted';
+type Group = 'active' | 'orphaned';
 
 const DOT_CLASS: Record<Tone, string> = {
   ok: 'bg-emerald-500',
-  warn: 'bg-amber-500',
+  error: 'bg-red-500',
   muted: 'bg-muted-foreground/50',
 };
-
-type Group = 'active' | 'orphaned';
 
 // A pending cluster is a kubeconfig context the sidecar hasn't identified yet
 // (its kube-system UID probe hasn't succeeded — e.g. a stopped minikube): it has
@@ -70,75 +76,132 @@ function isPending(c: Cluster): boolean {
   return !c.uuid;
 }
 
-// A row's sync state is derived from its group and flags. Orphaned rows need no
-// status word — the section header already says "Orphaned" — so they just carry
-// an amber dot. A pending (unidentified) context reads as "Not synced"; an
-// identified active row is Syncing (enabled) or Paused (off).
-function statusOf(c: Cluster, group: Group): { label: string | null; tone: Tone } {
-  if (group === 'orphaned') return { label: null, tone: 'warn' };
+function displayName(c: Cluster): string {
+  return c.name || c.uuid || c.context;
+}
+
+// The Connection column: can we currently reach the cluster's API? A reachable,
+// identified context is Active (green); one we can't reach (its UID probe failed)
+// is an Error (red); an orphan has no live cluster to connect to (Unavailable).
+function connectionStatus(c: Cluster, group: Group): { label: string; tone: Tone } {
+  if (group === 'orphaned') return { label: 'Unavailable', tone: 'muted' };
+  if (isPending(c)) return { label: 'Error', tone: 'error' };
+  return { label: 'Active', tone: 'ok' };
+}
+
+// Sync status: an orphan isn't syncing (its cluster is gone — "Stopped", not
+// repeating the group's "Orphaned" header); a pending context can't sync yet;
+// otherwise it's Syncing (enabled) or Paused (off).
+function statusOf(c: Cluster, group: Group): { label: string; tone: Tone } {
+  if (group === 'orphaned') return { label: 'Stopped', tone: 'muted' };
   if (isPending(c)) return { label: 'Not synced', tone: 'muted' };
   return c.enabled ? { label: 'Syncing', tone: 'ok' } : { label: 'Paused', tone: 'muted' };
+}
+
+// A database icon with a diagonal line through it — "clear the cache".
+function ClearCacheIcon() {
+  return (
+    <span className="relative inline-flex size-4" aria-hidden>
+      <Database className="size-full" />
+      <Slash className="absolute inset-0 size-full" />
+    </span>
+  );
 }
 
 function ClusterRow({
   cluster,
   group,
   onToggle,
-  onDelete,
+  onClearCache,
+  onRemove,
 }: {
   cluster: Cluster;
   group: Group;
   onToggle: (enabled: boolean) => void;
-  onDelete: () => void;
+  onClearCache: () => void;
+  onRemove: () => void;
 }) {
+  const name = displayName(cluster);
+  const connection = connectionStatus(cluster, group);
   const status = statusOf(cluster, group);
-  const detail = [
-    cluster.cached ? formatBytes(cluster.cacheBytes) : null,
-    cluster.lastSyncedAt ? formatSyncFreshness(cluster.lastSyncedAt) : null,
-  ]
-    .filter(Boolean)
-    .join(' · ');
+  const orphaned = group === 'orphaned';
+  const pending = isPending(cluster);
+  // Sync can only start/stop for an identified cluster still in the kubeconfig.
+  const syncing = cluster.enabled && !orphaned && !pending;
+  const canToggle = !orphaned && !pending;
+
   return (
-    <li className="flex items-center gap-3 py-2">
-      <span aria-hidden className={`size-2 shrink-0 rounded-full ${DOT_CLASS[status.tone]}`} />
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-medium">{cluster.name || cluster.uuid}</div>
-        <div className="text-xs text-muted-foreground">
-          {/* Status in its own span so it stays individually addressable. */}
-          {status.label ? <span>{status.label}</span> : null}
-          {detail ? <span>{status.label ? ` · ${detail}` : detail}</span> : null}
+    <TableRow>
+      <TableCell className="font-medium">{name}</TableCell>
+      <TableCell>
+        <span className="inline-flex items-center gap-1.5">
+          <span aria-hidden className={`size-2 shrink-0 rounded-full ${DOT_CLASS[connection.tone]}`} />
+          {connection.label}
+        </span>
+      </TableCell>
+      <TableCell>
+        <span className="inline-flex items-center gap-1.5">
+          <span aria-hidden className={`size-2 shrink-0 rounded-full ${DOT_CLASS[status.tone]}`} />
+          {status.label}
+        </span>
+        {cluster.lastSyncedAt ? (
+          <div className="text-xs text-muted-foreground">{formatSyncFreshness(cluster.lastSyncedAt)}</div>
+        ) : null}
+      </TableCell>
+      <TableCell className="tabular-nums">{cluster.cached ? formatBytes(cluster.cacheBytes) : '—'}</TableCell>
+      <TableCell>
+        <div className="flex items-center justify-end gap-0.5">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`${syncing ? 'Pause' : 'Resume'} sync for ${name}`}
+            disabled={!canToggle}
+            onClick={() => onToggle(!cluster.enabled)}
+          >
+            {syncing ? <Pause className="size-4" aria-hidden /> : <Play className="size-4" aria-hidden />}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Clear cache for ${name}`}
+            disabled={!cluster.cached}
+            onClick={onClearCache}
+          >
+            <ClearCacheIcon />
+          </Button>
+          {/* Always rendered so both groups have the same action count (columns
+              stay aligned); removing only applies to an orphan, so it's disabled
+              for an active cluster (a present context would just be re-discovered). */}
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Remove ${name}`}
+            className="hover:text-destructive"
+            disabled={!orphaned}
+            onClick={onRemove}
+          >
+            <Trash2 className="size-4" aria-hidden />
+          </Button>
         </div>
-      </div>
-      {cluster.cached ? (
-        <button
-          type="button"
-          aria-label={`Delete cache for ${cluster.name || cluster.uuid}`}
-          onClick={onDelete}
-          className="shrink-0 rounded p-1 text-muted-foreground outline-none hover:text-destructive focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <Trash2 className="size-3.5" aria-hidden />
-        </button>
-      ) : null}
-      {/* No sync toggle for a pending context — there's no UUID to enable yet. */}
-      {isPending(cluster) ? null : (
-        <Switch
-          size="sm"
-          aria-label={`Sync ${cluster.name || cluster.uuid}`}
-          checked={cluster.enabled}
-          onCheckedChange={onToggle}
-          className="shrink-0"
-        />
-      )}
-    </li>
+      </TableCell>
+    </TableRow>
   );
 }
 
 // Active = still in the current kubeconfig; Orphaned = a leftover cache whose
 // context is gone (so !present). Anything not present is shown as orphaned so
 // no known cluster is silently dropped. Empty groups are omitted by the caller.
-const GROUPS: { key: Group; label: string; match: (c: Cluster) => boolean }[] = [
-  { key: 'active', label: 'Active', match: (c) => c.present },
-  { key: 'orphaned', label: 'Orphaned', match: (c) => !c.present },
+const GROUPS: { key: Group; label: string; suffix: string; match: (c: Cluster) => boolean }[] = [
+  { key: 'active', label: 'Active', suffix: 'in kubeconfig', match: (c) => c.present },
+  {
+    key: 'orphaned',
+    label: 'Orphaned',
+    suffix: 'cache on disk, no longer in kubeconfig',
+    match: (c) => !c.present,
+  },
 ];
 
 export function ClusterSyncPanel() {
@@ -146,23 +209,16 @@ export function ClusterSyncPanel() {
   const rows = clusters ?? [];
   const groups = GROUPS.map((g) => ({ ...g, clusters: rows.filter(g.match) })).filter((g) => g.clusters.length > 0);
 
-  // Toggle/delete write through to the sidecar; the resulting clustersWatch
-  // push is the source of truth for each row's state (no local mirror). urql's
-  // execute resolves (never rejects) with an OperationResult, so a failed
-  // mutation would otherwise be swallowed — surface its error on the bus.
+  // Each action writes through to the sidecar; the resulting clustersWatch push
+  // is the source of truth for each row's state (no local mirror). urql's execute
+  // resolves (never rejects) with an OperationResult, so a failed mutation would
+  // otherwise be swallowed — surface its error on the bus.
   const [, setClusterEnabledMut] = useMutation(SetClusterEnabledMutation);
   const [, deleteClusterCacheMut] = useMutation(DeleteClusterCacheMutation);
+  const [, removeClusterMut] = useMutation(RemoveClusterMutation);
 
-  const setClusterEnabled = (uuid: string, enabled: boolean) => {
-    setClusterEnabledMut({ uuid, enabled }).then((result) => {
-      if (result.error) {
-        reportError({ source: 'graphql', message: errorMessage(result.error), cause: result.error });
-      }
-    });
-  };
-
-  const deleteClusterCache = (uuid: string) => {
-    deleteClusterCacheMut({ uuid }).then((result) => {
+  const run = (p: Promise<{ error?: unknown }>) => {
+    p.then((result) => {
       if (result.error) {
         reportError({ source: 'graphql', message: errorMessage(result.error), cause: result.error });
       }
@@ -175,7 +231,10 @@ export function ClusterSyncPanel() {
         <Database className="size-3.5" aria-hidden />
         Clusters
       </SheetTrigger>
-      <SheetContent side="right" className="w-80">
+      {/* Match the sheet's own `data-[side=right]:` width utilities so tailwind-merge
+          replaces them (a plain `w-…` is a different key, so it'd be kept *alongside*
+          the built-in and lose on specificity) — widen the panel to fit the table. */}
+      <SheetContent side="right" className="data-[side=right]:w-[56rem] data-[side=right]:sm:max-w-[95vw]">
         <SheetHeader>
           <SheetTitle>Clusters</SheetTitle>
           <SheetDescription>Clusters in your kubeconfig and any leftover local caches.</SheetDescription>
@@ -183,23 +242,38 @@ export function ClusterSyncPanel() {
         {rows.length === 0 ? (
           <p className="px-4 py-6 text-sm text-muted-foreground">No clusters yet.</p>
         ) : (
-          <div className="flex flex-col gap-5 px-4">
-            {groups.map((g) => (
-              <section key={g.key} aria-label={`${g.label} clusters`}>
-                <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{g.label}</h3>
-                <ul className="divide-y">
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Cluster</TableHead>
+                  <TableHead>Connection</TableHead>
+                  <TableHead>Sync status</TableHead>
+                  <TableHead>Cache</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              {groups.map((g) => (
+                <TableBody key={g.key} aria-label={`${g.label} clusters`}>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead colSpan={5} className="h-auto py-1 text-xs tracking-wide text-muted-foreground">
+                      <span className="font-semibold uppercase">{g.label}</span>
+                      <span className="font-normal"> · {g.suffix}</span>
+                    </TableHead>
+                  </TableRow>
                   {g.clusters.map((c) => (
                     <ClusterRow
                       key={c.uuid || c.context}
                       cluster={c}
                       group={g.key}
-                      onToggle={(enabled) => setClusterEnabled(c.uuid, enabled)}
-                      onDelete={() => deleteClusterCache(c.uuid)}
+                      onToggle={(enabled) => run(setClusterEnabledMut({ uuid: c.uuid, enabled }))}
+                      onClearCache={() => run(deleteClusterCacheMut({ uuid: c.uuid }))}
+                      onRemove={() => run(removeClusterMut({ uuid: c.uuid }))}
                     />
                   ))}
-                </ul>
-              </section>
-            ))}
+                </TableBody>
+              ))}
+            </Table>
           </div>
         )}
       </SheetContent>
