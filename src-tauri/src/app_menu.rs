@@ -16,33 +16,55 @@
 //! menu-event handler routes user actions through the shared [`AppState`] and
 //! its `window_manager`.
 
-use tauri::menu::{MenuBuilder, MenuItem, SubmenuBuilder};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::error::Result;
-use crate::state::AppState;
 
-/// Builds and installs the application menu bar.
+#[cfg(target_os = "macos")]
+use crate::state::AppState;
+#[cfg(target_os = "macos")]
+use tauri::menu::{MenuBuilder, MenuItem, SubmenuBuilder};
+#[cfg(target_os = "macos")]
+use tauri::Manager;
+
+/// Builds and installs the application menu bar (macOS only).
 ///
-/// Constructs a single "File" submenu with a "New Window" item (`CmdOrCtrl+N`)
-/// and a "Quit" item (`CmdOrCtrl+Q`), sets it as the app menu, and registers a
-/// menu-event handler.
+/// On macOS this constructs a single "File" submenu with a "New Window" item
+/// (`CmdOrCtrl+N`) and a "Quit" item (`CmdOrCtrl+Q`), sets it as the global
+/// menu bar, and registers a menu-event handler.
+///
+/// On **Linux/Windows this is a no-op**: the native menu would render as a bar
+/// *inside* each window, which we don't want. There the webview's in-app
+/// `MenuRibbon` provides the same File ▸ New Window / Quit affordances and owns
+/// the matching `Ctrl`-modified shortcuts, driving them through the
+/// `new_window` / `quit` Tauri commands (see `commands.rs`).
 ///
 /// "Quit" is a custom item rather than [`SubmenuBuilder::quit`] on purpose: the
 /// predefined quit terminates the process natively (macOS `terminate:`), which
 /// skips Tauri's `RunEvent::ExitRequested` graceful-shutdown hook. Routing it
 /// through [`AppHandle::exit`] takes the same path as the tray's "Quit".
 ///
-/// The handler responds to `new_window` by creating a window via the
-/// [`AppState`] `window_manager` (a failure is logged rather than propagated,
-/// since menu callbacks cannot return errors) and to `quit` via
-/// [`AppHandle::exit`].
-///
 /// # Errors
 ///
 /// Returns an error if any menu item or submenu fails to build, or if setting
 /// the menu on the app fails.
 pub fn build_app_menu(app: &AppHandle) -> Result<()> {
+    // Linux/Windows: the native menu is suppressed in favor of the webview
+    // `MenuRibbon`; nothing to install on the host.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        build_macos_menu(app)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_menu(app: &AppHandle) -> Result<()> {
     let new_window = MenuItem::with_id(app, "new_window", "New Window", true, Some("CmdOrCtrl+N"))?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, Some("CmdOrCtrl+Q"))?;
 

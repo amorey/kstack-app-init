@@ -190,6 +190,8 @@ pub fn run() {
             commands::graphql_query,
             commands::graphql_subscribe,
             commands::graphql_unsubscribe,
+            commands::new_window,
+            commands::quit,
         ])
         .setup(|app| {
             // Initialize dependencies

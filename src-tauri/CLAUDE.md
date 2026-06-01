@@ -6,9 +6,9 @@ The desktop app's native host (Tauri 2). It owns windows, the tray and menus, th
 
 - `main.rs` — thin; just calls `lib::run()`.
 - `lib.rs` — **entry point** (`run()`): builds the Tauri app, registers plugins + webview commands, runs the `setup` hook (spawn sidecar, build menu/tray, start background tasks), and owns the shutdown event loop.
-- `commands.rs` — `#[tauri::command]` handlers the webview invokes (`graphql_query/subscribe/unsubscribe`, `auth_*`, `ready`). Keep thin — delegate to services.
+- `commands.rs` — `#[tauri::command]` handlers the webview invokes (`graphql_query/subscribe/unsubscribe`, `auth_*`, `ready`, `new_window`, `quit`). Keep thin — delegate to services. (`new_window`/`quit` back the Linux/Windows `MenuRibbon`; `quit` routes through `AppHandle::exit` for graceful shutdown.)
 - `state.rs` — `AppState` (sidecar, window_manager, auth, shutdown), shared via `app.manage` / `app.state::<AppState>()`. `shutdown` is a `tokio_util::sync::CancellationToken` cancelled once on Quit (`lib.rs` `RunEvent::ExitRequested`, before the sidecar teardown); the app-lifetime background tasks select on it for clean shutdown — see below.
-- `app_menu.rs` — application menu bar construction.
+- `app_menu.rs` — application menu bar construction. **macOS only** — it builds the global menu bar there; on Linux/Windows `build_app_menu` is a no-op (the native menu would render *inside* each window) and the webview's `MenuRibbon` replaces it, driving the same actions via the `new_window` / `quit` commands.
 - `tray/` — system tray icon, menu, and the host-internal **gRPC** kube-context watch that keeps the live context list current. `tray/mod.rs` is the Tauri wiring (and the watch supervisor); `tray/default_context_picker.rs` is the pure, unit-tested "Default Context" submenu logic (menu-id formatting, descriptor building).
 - `window_manager.rs`, `dock_menu.rs` (macOS), `error.rs`.
 - `services/sidecar/` — sidecar process + IPC. `services/auth/` — OAuth.

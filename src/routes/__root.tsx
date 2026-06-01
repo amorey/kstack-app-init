@@ -23,6 +23,7 @@ import { ErrorBoundary } from '@/lib/error-boundary';
 import { createGraphqlClient } from '@/lib/graphql/client';
 import { ReadyGate } from '@/lib/ready-gate';
 import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
+import { MenuRibbon } from '@/components/widgets/menu-ribbon';
 import { SyncHealthBadge } from '@/components/widgets/sync-health-badge';
 import { ClusterSyncPanel } from '@/components/widgets/cluster-sync-panel';
 import { ClustersProvider } from '@/lib/clusters';
@@ -65,7 +66,8 @@ function RootComponent() {
             <SyncStatusProvider>
               <ClustersProvider>
                 <KubeConfigProvider>
-                  <div className="fixed left-3 top-3 z-50">
+                  <div className="fixed left-3 top-3 z-50 flex items-center gap-2">
+                    <MenuRibbon />
                     <KubeContextPicker />
                   </div>
                   <div className="fixed right-3 top-3 z-50 flex items-center gap-2">

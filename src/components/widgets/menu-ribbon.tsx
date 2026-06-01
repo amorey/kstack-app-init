@@ -1,0 +1,91 @@
+// Copyright 2026 The Kubetail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// In-app menu ribbon. macOS keeps its native, global menu bar (built in the
+// Rust host); on Linux/Windows the native bar is suppressed and this ribbon is
+// the replacement. It mirrors the macOS "File" menu — New Window and Quit — and
+// owns the matching keyboard shortcuts there, since with no native menu nothing
+// else registers them. Actions cross into the host via Tauri commands.
+import { useEffect } from 'react';
+
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuTrigger,
+} from '@kubetail/ui/elements/dropdown-menu';
+import { invoke } from '@tauri-apps/api/core';
+
+import { isMacOS } from '@/lib/platform';
+
+/** Host commands the ribbon drives. Keep in sync with `commands.rs`. */
+const NEW_WINDOW_CMD = 'new_window';
+const QUIT_CMD = 'quit';
+
+function newWindow() {
+  invoke(NEW_WINDOW_CMD).catch(() => {});
+}
+
+function quit() {
+  invoke(QUIT_CMD).catch(() => {});
+}
+
+export function MenuRibbon() {
+  // macOS already has the native menu bar (and its accelerators); a ribbon
+  // would be redundant there. Render only on Linux/Windows.
+  if (isMacOS()) return null;
+  return <MenuRibbonImpl />;
+}
+
+function MenuRibbonImpl() {
+  // The native menu is gone here, so nothing else binds these accelerators —
+  // the ribbon owns them. Window-scoped (only while a webview window is
+  // focused), matching the macOS menu's CmdOrCtrl semantics.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (!e.ctrlKey && !e.metaKey) return;
+      const key = e.key.toLowerCase();
+      if (key === 'n') {
+        e.preventDefault();
+        newWindow();
+      } else if (key === 'q') {
+        e.preventDefault();
+        quit();
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger className="rounded px-2 py-1 text-sm outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">
+        File
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" sideOffset={4} className="min-w-48">
+        <DropdownMenuItem onClick={newWindow}>
+          New Window
+          <DropdownMenuShortcut>Ctrl+N</DropdownMenuShortcut>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={quit}>
+          Quit
+          <DropdownMenuShortcut>Ctrl+Q</DropdownMenuShortcut>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
