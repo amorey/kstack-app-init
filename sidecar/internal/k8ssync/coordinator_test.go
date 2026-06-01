@@ -480,9 +480,37 @@ func TestDeleteCacheRejectsUnknownUUID(t *testing.T) {
 	require.Error(t, c.DeleteCache(ctx, uidFor("does-not-exist")), "unknown UUID rejected")
 }
 
-// A probe that errors on first sight keeps the context out until a later
-// reconcile re-probes it and succeeds.
-func TestProbeFailureSkipsContext(t *testing.T) {
+// A kubeconfig context whose UID probe never succeeds (e.g. a stopped minikube:
+// in the kubeconfig but the API server is unreachable) still belongs in the
+// list as a pending Active row — present in the kubeconfig, but with no stable
+// UUID, no cache, and not syncing until a probe succeeds.
+func TestUnreachableContextShownAsPending(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fw := newFakeWatcher(kubeconfig("a", "a"))
+	c, cache, _ := newTestCoordinator(t, fw)
+	t.Cleanup(func() { _ = cache.Shutdown(context.Background()) })
+
+	c.identify = func(context.Context, *rest.Config) (string, error) {
+		return "", fmt.Errorf("unreachable")
+	}
+
+	go c.Run(ctx)
+
+	waitFor(t, func() bool { _, ok := viewByName(c, "a"); return ok }, "unreachable context listed")
+	require.Empty(t, openUIDs(c), "unreachable cluster is not syncing")
+	v, _ := viewByName(c, "a")
+	require.True(t, v.Present, "present in kubeconfig")
+	require.False(t, v.Cached, "nothing cached yet")
+	require.Empty(t, v.UUID, "no stable identity until probed")
+	require.True(t, v.IsCurrent, "still the current context")
+}
+
+// A context that starts unreachable shows as a pending row, then — once a later
+// reconcile re-probes it successfully — becomes a fully identified, syncing,
+// cached cluster (its pending row is replaced by the real one).
+func TestPendingContextBecomesIdentifiedOnceReachable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -501,8 +529,19 @@ func TestProbeFailureSkipsContext(t *testing.T) {
 	}
 
 	go c.Run(ctx)
-	require.Never(t, func() bool { return len(c.Clusters()) > 0 }, 200*time.Millisecond, 20*time.Millisecond)
 
+	// Pending while unreachable: listed, present, no UUID, not open.
+	waitFor(t, func() bool {
+		v, ok := viewByName(c, "a")
+		return ok && v.UUID == "" && v.Present && !v.Cached
+	}, "shown as pending while unreachable")
+	require.Empty(t, openUIDs(c))
+
+	// Becomes reachable → identified and syncing; exactly one row for it.
 	fw.publish(kubeconfig("a", "a"))
 	waitFor(t, func() bool { return len(openUIDs(c)) == 1 }, "opens after retry")
+	v, _ := viewByName(c, "a")
+	require.Equal(t, uidFor("a"), v.UUID, "now identified")
+	require.True(t, v.Cached)
+	require.Len(t, c.Clusters(), 1, "pending row replaced, not duplicated")
 }

@@ -32,7 +32,7 @@ const freshnessFlushInterval = 30 * time.Second
 // registry fields from the store plus live facts (present in kubeconfig, has a
 // cache file, current-context). It's what the GraphQL `clusters` surface maps.
 type ClusterView struct {
-	UUID                   string
+	UUID                   string // empty for a pending context not yet identified by a probe
 	Name                   string
 	Context                string
 	IsCurrent              bool
@@ -593,10 +593,36 @@ func (c *Coordinator) buildViews() []ClusterView {
 	c.mu.RUnlock()
 
 	out := make([]ClusterView, 0, len(records))
+	have := make(map[string]struct{}, len(records))
 	for _, r := range records {
+		have[r.Name] = struct{}{}
 		out = append(out, c.viewFromRecord(r, current, recordPresent(presence, r)))
 	}
-	return out
+
+	// Surface kubeconfig contexts we've never identified — a context whose
+	// kube-system UID probe has never succeeded (e.g. a stopped minikube) has no
+	// registry record, so it would otherwise be invisible. Show it as a pending
+	// Active row: present in the kubeconfig, but with no stable UUID, nothing
+	// cached, and nothing to sync until a probe succeeds. Skip a name that already
+	// has a record (a previously-probed context, now unreachable, keeps its row)
+	// and a probed alias (it's shown via the registry record it resolved to).
+	pending := make([]ClusterView, 0)
+	for name, p := range presence {
+		if p.probed {
+			continue
+		}
+		if _, ok := have[name]; ok {
+			continue
+		}
+		pending = append(pending, ClusterView{
+			Name:      name,
+			Context:   name,
+			IsCurrent: isCurrentContext(name, current),
+			Present:   true,
+		})
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].Name < pending[j].Name })
+	return append(out, pending...)
 }
 
 // viewFor builds the single merged view for one UUID (for mutation returns).
@@ -627,13 +653,19 @@ func recordPresent(presence map[string]ctxPresence, r clusterregistry.Record) bo
 	return inCfg && (!p.probed || p.uid == r.UUID)
 }
 
+// isCurrentContext reports whether a context name is the kubeconfig's
+// current-context, treating an unset current ("") as "nothing is current".
+func isCurrentContext(name, current string) bool {
+	return current != "" && name == current
+}
+
 func (c *Coordinator) viewFromRecord(r clusterregistry.Record, current string, isPresent bool) ClusterView {
 	bytes, cached := c.cache.CacheBytes(r.UUID)
 	return ClusterView{
 		UUID:                   r.UUID,
 		Name:                   r.Name,
 		Context:                r.Name,
-		IsCurrent:              current != "" && r.Name == current,
+		IsCurrent:              isCurrentContext(r.Name, current),
 		Enabled:                r.Enabled,
 		Present:                isPresent,
 		Cached:                 cached,

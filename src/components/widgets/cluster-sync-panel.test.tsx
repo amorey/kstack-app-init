@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { cleanup, render, screen, act } from '@testing-library/react';
+import { cleanup, render, screen, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Provider as UrqlProvider } from 'urql';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -155,6 +155,69 @@ describe('ClusterSyncPanel', () => {
     // Cache sizes formatted (binary units).
     expect(screen.getByText(/1\.2 MB/)).toBeInTheDocument();
     expect(screen.getByText(/512\.0 KB/)).toBeInTheDocument();
+  });
+
+  it('splits clusters into active and orphaned groups by kubeconfig presence', async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await flush();
+    await act(async () => {
+      pushClusters([
+        // In kubeconfig (present) -> active, regardless of enabled/sync state.
+        { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, cacheBytes: 1_300_000 },
+        { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: true, cacheBytes: 524_288 },
+        // Cached but gone from kubeconfig -> orphaned.
+        { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true, cacheBytes: 1024 },
+      ]);
+    });
+
+    await user.click(screen.getByRole('button', { name: /clusters/i }));
+
+    const active = await screen.findByRole('region', { name: /active/i });
+    const orphaned = screen.getByRole('region', { name: /orphaned/i });
+
+    // Active group holds every cluster still in the kubeconfig.
+    expect(within(active).getByText('prod-us')).toBeInTheDocument();
+    expect(within(active).getByText('staging')).toBeInTheDocument();
+    expect(within(active).queryByText('old-cluster')).not.toBeInTheDocument();
+
+    // Orphaned group holds the leftover cache.
+    expect(within(orphaned).getByText('old-cluster')).toBeInTheDocument();
+    expect(within(orphaned).queryByText('prod-us')).not.toBeInTheDocument();
+  });
+
+  it('shows an unreachable kubeconfig context as a pending active row with no toggle', async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await flush();
+    await act(async () => {
+      // minikube-style: present in the kubeconfig but never identified, so no
+      // UUID and nothing cached yet.
+      pushClusters([{ uuid: '', name: 'minikube', enabled: false, present: true, cached: false }]);
+    });
+
+    await user.click(screen.getByRole('button', { name: /clusters/i }));
+
+    const active = await screen.findByRole('region', { name: /active/i });
+    expect(within(active).getByText('minikube')).toBeInTheDocument();
+    expect(within(active).getByText(/not synced/i)).toBeInTheDocument();
+    // No sync toggle (and no delete) until the cluster is reachable + identified.
+    expect(within(active).queryByRole('switch')).not.toBeInTheDocument();
+    expect(within(active).queryByRole('button', { name: /delete cache/i })).not.toBeInTheDocument();
+  });
+
+  it('omits a group that has no members', async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await flush();
+    await act(async () => {
+      pushClusters([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
+    });
+
+    await user.click(screen.getByRole('button', { name: /clusters/i }));
+
+    expect(await screen.findByRole('region', { name: /active/i })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: /orphaned/i })).not.toBeInTheDocument();
   });
 
   it('reflects the backend enabled flag on each switch', async () => {
