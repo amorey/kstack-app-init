@@ -12,16 +12,25 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
 	grpcserver "github.com/kubetail-org/kstack-app/sidecar/grpc"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/appdb"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustercache"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clusterdata"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clusterregistry"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/k8ssync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
-	syncengine "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
 
@@ -37,6 +46,10 @@ type Config struct {
 	// KubeconfigPath is an explicit kubeconfig path; empty uses clientcmd's
 	// default-loading rules.
 	KubeconfigPath string
+	// DataDir is the host-supplied per-machine app data dir for the per-cluster
+	// SQLite cache. Empty disables the cluster cache (standalone/dev/test runs);
+	// the cluster-data resolvers then degrade to empty results.
+	DataDir string
 }
 
 // App owns the composed sidecar: one h2c handler fronting the GraphQL and gRPC
@@ -47,7 +60,12 @@ type App struct {
 	graphql *graph.Server
 	grpcSrv *grpcserver.Server
 	watcher *k8shelpers.KubeConfigWatcher
-	engine  *syncengine.Engine
+	engine  *prefsync.Engine
+
+	// clusterCache + coordinator + appDB are nil when no DataDir was supplied.
+	clusterCache *clustercache.Manager
+	coordinator  *k8ssync.Coordinator
+	appDB        *appdb.DB
 
 	engineCancel context.CancelFunc
 	engineDone   chan struct{}
@@ -79,11 +97,11 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 
-	engine := syncengine.New(
-		syncengine.NewCloudUpstream(cloudClient, creds),
+	engine := prefsync.New(
+		prefsync.NewCloudUpstream(cloudClient, creds),
 		syncStore,
 		hub,
-		syncengine.Options{
+		prefsync.Options{
 			// Drain offline-queued mutations whenever the upstream is healthy. A
 			// failed drain stays queued and retries on the next Live via the
 			// engine's own reconnect/backoff.
@@ -98,6 +116,36 @@ func New(cfg Config) (*App, error) {
 		},
 	)
 
+	// Per-cluster SQLite cache. Only when the host supplied a data dir: build the
+	// registry, the durable cluster store (a versioned JSON index of every cluster
+	// we've seen), and a coordinator that keeps both in lockstep with the
+	// kube-config watcher (discover/identify clusters, open enabled ones, freeze
+	// disabled ones, surface orphaned caches). The reader is the resolver's read
+	// side; the coordinator is the cluster registry + enable/delete control
+	// surface. All nil when DataDir is empty, in which case the cluster resolvers
+	// degrade to empty results.
+	var (
+		clusterCache   *clustercache.Manager
+		coordinator    *k8ssync.Coordinator
+		clusterManager k8ssync.Manager
+		appDB          *appdb.DB
+	)
+	if cfg.DataDir != "" {
+		clusterCache = clustercache.NewManager(cfg.DataDir, nil)
+		db, err := appdb.Open(filepath.Join(cfg.DataDir, "app.db"))
+		if err != nil {
+			return nil, err
+		}
+		appDB = db
+		store := clusterregistry.New(db.SQL())
+		coordinator = k8ssync.NewCoordinator(clusterCache, watcher, store)
+		clusterManager = coordinator
+	}
+	// The Reader is always non-nil and tolerates a nil registry (no --data-dir),
+	// so the cluster-data resolvers can call it unconditionally — nil-tolerance
+	// lives in one place rather than at every resolver.
+	clusterReader := clusterdata.NewReader(clusterCache)
+
 	// The Resolver reads the same syncstore the engine maintains, subscribes the
 	// Hub it publishes to, exposes its Status (Sync), and write-throughs settings
 	// via the shared cloud client; the KubeConfigWatcher is shared with the gRPC
@@ -109,6 +157,8 @@ func New(cfg Config) (*App, error) {
 		Sync:              engine,
 		Queue:             queue,
 		KubeConfigWatcher: watcher,
+		ClusterData:       clusterReader,
+		ClusterManager:    clusterManager,
 	})
 	grpcSrv := grpcserver.NewServer(watcher)
 
@@ -120,16 +170,31 @@ func New(cfg Config) (*App, error) {
 	mux.Handle("/control/wake", controlWake(engine.Poke))
 	mux.Handle("/graphql", graphql)
 
+	// gRPC (host-internal control channel) shares the socket with GraphQL via
+	// h2c. The dispatcher routes requests matching grpcserver.IsGRPCRequest
+	// (HTTP/2 application/grpc) to the gRPC server and everything else (HTTP/1.1
+	// GraphQL POST/SSE, /control/*) to the mux above — grpc/ owns the "what is a
+	// gRPC request" rule, the composition here owns that the two surfaces share
+	// one socket. h2c.NewHandler serves HTTP/1.1 unchanged and upgrades only the
+	// HTTP/2 prior-knowledge preface (what the Rust tonic client sends), so SSE
+	// keeps its Flusher-backed writer and streams unbuffered.
+	handler := h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if grpcserver.IsGRPCRequest(r) {
+			grpcSrv.GRPC().ServeHTTP(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}), &http2.Server{})
+
 	return &App{
-		// gRPC (host-internal control channel) shares the socket with GraphQL
-		// via h2c: NewH2CHandler routes HTTP/2 application/grpc requests to the
-		// gRPC server and everything else (HTTP/1.1 GraphQL POST/SSE, /control/*)
-		// to the mux above.
-		handler: grpcserver.NewH2CHandler(mux, grpcSrv.GRPC()),
-		graphql: graphql,
-		grpcSrv: grpcSrv,
-		watcher: watcher,
-		engine:  engine,
+		handler:      handler,
+		graphql:      graphql,
+		grpcSrv:      grpcSrv,
+		watcher:      watcher,
+		engine:       engine,
+		clusterCache: clusterCache,
+		coordinator:  coordinator,
+		appDB:        appDB,
 	}, nil
 }
 
@@ -148,6 +213,13 @@ func (a *App) Start(ctx context.Context) {
 		a.engine.Run(ctx)
 		close(a.engineDone)
 	}()
+	// The coordinator reconciles the cluster cache against the kube-config
+	// watcher for the app's lifetime; it stops when this ctx is cancelled (by
+	// Close or a parent cancel). Per-cluster sync goroutines it opens are torn
+	// down by clusterCache.Shutdown in Close.
+	if a.coordinator != nil {
+		go a.coordinator.Run(ctx)
+	}
 }
 
 // NotifyShutdown signals both transports' long-lived streams to close cleanly:
@@ -185,6 +257,24 @@ func (a *App) Close() error {
 			slog.Warn("sync engine did not stop within 2s")
 		}
 	}
+	// Shut down every per-cluster sync goroutine + DB pool. The engineCancel
+	// above already stopped the coordinator's reconcile loop, so no new clusters
+	// can open while this drains. Bounded so a wedged sync can't hang exit.
+	if a.clusterCache != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := a.clusterCache.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("cluster cache shutdown", "err", err)
+		}
+		cancel()
+	}
 	a.watcher.Close()
+	// Finally release the app.db handle. Done last so the cluster cache's
+	// per-cluster sync goroutines and any in-flight reconcile (driven by the
+	// engineCancel'd coordinator + now-closed watcher) have stopped writing to it.
+	if a.appDB != nil {
+		if err := a.appDB.Close(); err != nil {
+			slog.Warn("app db close", "err", err)
+		}
+	}
 	return nil
 }

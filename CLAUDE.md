@@ -11,7 +11,7 @@ The **`Makefile` is the polyglot entry point** — Go/Rust/JS commands meet ther
 
 ## Host↔sidecar transport: GraphQL **and** gRPC over one socket (h2c)
 
-The host and sidecar share a single Unix socket / named pipe. **GraphQL** (webview↔sidecar) rides HTTP/1.1 (POST + SSE). **gRPC** (host↔sidecar control channel — today the tray's kube-context watch/set) rides HTTP/2. Both are multiplexed by **h2c**: the sidecar wraps its handler in `grpcserver.NewH2CHandler`, which routes HTTP/2 `application/grpc` requests to the gRPC server and everything else to GraphQL. No TLS (the socket is user-restricted). gRPC and GraphQL kube-context surfaces share the one `KubeConfigWatcher`, so a change via either is seen by both.
+The host and sidecar share a single Unix socket / named pipe. **GraphQL** (webview↔sidecar) rides HTTP/1.1 (POST + SSE). **gRPC** (host↔sidecar control channel — today the tray's kube-context watch/set) rides HTTP/2. Both are multiplexed by **h2c**: the sidecar's composition root (`internal/app`) wraps its handler in `h2c.NewHandler` with a dispatcher (keyed on `grpcserver.IsGRPCRequest`) that routes HTTP/2 `application/grpc` requests to the gRPC server and everything else to GraphQL. No TLS (the socket is user-restricted). gRPC and GraphQL kube-context surfaces share the one `KubeConfigWatcher`, so a change via either is seen by both.
 
 > **Keep these docs current.** There's a `CLAUDE.md` per area (root/frontend, `src-tauri/`, `sidecar/`). When you change architecture, conventions, commands, or add a pattern worth knowing, update the relevant `CLAUDE.md` in the same change.
 

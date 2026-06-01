@@ -1,5 +1,6 @@
 // Package grpcserver builds the sidecar's gRPC surface. It rides the same
-// socket as GraphQL (h2c multiplexing, see NewH2CHandler) and is
+// socket as GraphQL (h2c multiplexing in internal/app, keyed on
+// IsGRPCRequest) and is
 // consumed only by the native host (the tray), never the webview.
 //
 // The KubeContextService reuses the one *k8shelpers.KubeConfigWatcher that
@@ -14,8 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
@@ -113,35 +112,16 @@ func toState(cfg *api.Config) *kubecontextpb.KubeContextState {
 	return out
 }
 
-// NewH2CHandler lets one listener serve both `base` (the HTTP/1.1 GraphQL/SSE
-// surface) and HTTP/2 gRPC over cleartext (h2c). No TLS: the socket is already
-// user-restricted (0600 / named-pipe DACL). It lives here, beside the gRPC
-// server, because the dispatch rule *is* the definition of "a gRPC request" —
-// the `server` package shouldn't have to depend on gRPC just to route to it.
-//
-// h2c.NewHandler serves HTTP/1.1 cleartext unchanged and only upgrades a
-// connection that opens with the HTTP/2 prior-knowledge preface — which is
-// exactly what the Rust tonic client does. The HTTP/1.1 GraphQL client (POSTs
-// and SSE subscription streams) keeps `ProtoMajor == 1` and falls straight
-// through to `base`, including its Flusher-backed ResponseWriter, so SSE keeps
-// streaming frames unbuffered. A request reaches the gRPC server only when it
-// is HTTP/2 *and* carries the gRPC content-type, so a future HTTP/2 GraphQL
-// client would still reach `base`.
-//
-// Shutdown caveat: grpc streams here can't ride srv.Shutdown's graceful drain
-// (grpc.Server.GracefulStop panics on the ServeHTTP path, and srv.Shutdown's
-// BaseContext cancel only tears the connection down abruptly). The caller must
-// instead cancel the servingCtx passed to New and wait on its drainStreams
-// before srv.Shutdown; see New's doc and main.go.
-func NewH2CHandler(base http.Handler, grpcSrv *grpc.Server) http.Handler {
-	dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
-			grpcSrv.ServeHTTP(w, r)
-			return
-		}
-		base.ServeHTTP(w, r)
-	})
-	return h2c.NewHandler(dispatch, &http2.Server{})
+// IsGRPCRequest reports whether r is a gRPC call: HTTP/2 carrying the gRPC
+// content-type. This *is* the definition of "a gRPC request", so it lives here
+// beside the gRPC server rather than in whatever multiplexes the socket — the
+// composition root (internal/app) uses it in its h2c dispatcher to route HTTP/2
+// gRPC traffic to the gRPC server while HTTP/1.1 GraphQL (POSTs + SSE) falls
+// through. gRPC is
+// inherently HTTP/2, so the ProtoMajor check belongs in the predicate; requiring
+// the content-type too means a future HTTP/2 GraphQL client would not match.
+func IsGRPCRequest(r *http.Request) bool {
+	return r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
 }
 
 // Server bundles the *grpc.Server with the lifecycle surface the app layer
@@ -166,8 +146,8 @@ func NewServer(watcher *k8shelpers.KubeConfigWatcher) *Server {
 	return &Server{grpc: srv, cancel: cancel, drain: drainStreams}
 }
 
-// GRPC exposes the underlying *grpc.Server so the h2c dispatcher can hand it
-// HTTP/2 application/grpc requests (see NewH2CHandler).
+// GRPC exposes the underlying *grpc.Server so the h2c dispatcher (in internal/app)
+// can hand it HTTP/2 application/grpc requests (see IsGRPCRequest).
 func (s *Server) GRPC() *grpc.Server { return s.grpc }
 
 // NotifyShutdown cancels the serving context so every Watch handler returns nil

@@ -25,7 +25,7 @@ const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
-const { ClusterSyncProvider } = await import('@/lib/cluster-sync');
+const { ClustersProvider } = await import('@/lib/clusters');
 const { ClusterSyncPanel } = await import('./cluster-sync-panel');
 
 // Helpers -------------------------------------------------------------
@@ -33,11 +33,13 @@ const { ClusterSyncPanel } = await import('./cluster-sync-panel');
 const flush = () => act(async () => {});
 
 type Row = {
-  context: string;
-  state: 'PENDING' | 'SYNCING' | 'LIVE' | 'BACKOFF' | 'OFFLINE';
-  lastError?: string;
+  uuid: string;
+  name: string;
+  enabled: boolean;
+  present: boolean;
+  cached: boolean;
+  cacheBytes?: number;
   lastSyncedAt?: number;
-  downloadRateBps?: number;
 };
 
 function pushClusters(rows: Row[]) {
@@ -46,10 +48,12 @@ function pushClusters(rows: Row[]) {
       type: 'next',
       payload: {
         data: {
-          clusterSyncStatusWatch: rows.map((r) => ({
-            lastError: '',
+          clustersWatch: rows.map((r) => ({
+            context: r.name,
+            isCurrent: false,
+            cacheBytes: 0,
             lastSyncedAt: 0,
-            downloadRateBps: 0,
+            lastSeenInKubeconfigAt: 0,
             ...r,
           })),
         },
@@ -61,9 +65,9 @@ function pushClusters(rows: Row[]) {
 function renderPanel() {
   return render(
     <UrqlProvider value={createGraphqlClient()}>
-      <ClusterSyncProvider>
+      <ClustersProvider>
         <ClusterSyncPanel />
-      </ClusterSyncProvider>
+      </ClustersProvider>
     </UrqlProvider>,
   );
 }
@@ -86,28 +90,34 @@ describe('ClusterSyncPanel', () => {
         return id;
       }
       if (cmd === 'graphql_unsubscribe') return undefined;
+      if (cmd === 'graphql_query') {
+        // Either mutation succeeds; extra fields are ignored by urql.
+        return {
+          status: 200,
+          body: JSON.stringify({
+            data: {
+              setClusterEnabled: { __typename: 'Cluster', uuid: 'u', enabled: false },
+              deleteClusterCache: true,
+            },
+          }),
+        };
+      }
       throw new Error(`unexpected ${cmd}`);
     });
   });
 
   afterEach(cleanup);
 
-  it('renders a toolbar trigger button', async () => {
-    renderPanel();
-    await flush();
-    expect(screen.getByRole('button', { name: /clusters/i })).toBeInTheDocument();
-  });
-
-  it('subscribes to clusterSyncStatusWatch', async () => {
+  it('subscribes to clustersWatch', async () => {
     renderPanel();
     await flush();
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_subscribe',
-      expect.objectContaining({ query: expect.stringContaining('clusterSyncStatusWatch') }),
+      expect.objectContaining({ query: expect.stringContaining('clustersWatch') }),
     );
   });
 
-  it('shows an empty state when no clusters are syncing', async () => {
+  it('shows an empty state when there are no clusters', async () => {
     const user = userEvent.setup();
     renderPanel();
     await flush();
@@ -116,74 +126,84 @@ describe('ClusterSyncPanel', () => {
     });
 
     await user.click(screen.getByRole('button', { name: /clusters/i }));
-    expect(await screen.findByText(/no clusters syncing/i)).toBeInTheDocument();
+    expect(await screen.findByText(/no clusters yet/i)).toBeInTheDocument();
   });
 
-  it('lists a row per cluster with state and download rate', async () => {
+  it('lists a row per cluster with derived status and cache size', async () => {
     const user = userEvent.setup();
     renderPanel();
     await flush();
     await act(async () => {
       pushClusters([
-        { context: 'prod-us', state: 'LIVE', lastSyncedAt: 1_700_000_000_000, downloadRateBps: 1_300_000 },
-        { context: 'staging', state: 'SYNCING', downloadRateBps: 348_160 },
-        { context: 'dev-local', state: 'OFFLINE', lastError: 'unreachable' },
+        { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, cacheBytes: 1_300_000 },
+        { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: true, cacheBytes: 524_288 },
+        { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true, cacheBytes: 1024 },
       ]);
     });
 
     await user.click(screen.getByRole('button', { name: /clusters/i }));
 
-    // Each cluster name renders.
     expect(await screen.findByText('prod-us')).toBeInTheDocument();
     expect(screen.getByText('staging')).toBeInTheDocument();
-    expect(screen.getByText('dev-local')).toBeInTheDocument();
+    expect(screen.getByText('old-cluster')).toBeInTheDocument();
 
-    // States surface as labels.
-    expect(screen.getByText(/^live$/i)).toBeInTheDocument();
-    expect(screen.getByText(/^syncing$/i)).toBeInTheDocument();
-    expect(screen.getByText(/^offline$/i)).toBeInTheDocument();
+    // Status derived from the enabled/present flags.
+    expect(screen.getByText(/^syncing$/i)).toBeInTheDocument(); // prod: enabled + present
+    expect(screen.getByText(/^paused$/i)).toBeInTheDocument(); // staging: disabled
+    expect(screen.getByText(/^orphaned$/i)).toBeInTheDocument(); // old: enabled but gone
 
-    // Download rate: formatted for active clusters, em dash for the idle one.
-    expect(screen.getByText('1.2 MB/s')).toBeInTheDocument();
-    expect(screen.getByText('340.0 KB/s')).toBeInTheDocument();
-    expect(screen.getByText('—')).toBeInTheDocument();
+    // Cache sizes formatted (binary units).
+    expect(screen.getByText(/1\.2 MB/)).toBeInTheDocument();
+    expect(screen.getByText(/512\.0 KB/)).toBeInTheDocument();
   });
 
-  it('renders a per-cluster sync toggle, on by default', async () => {
+  it('reflects the backend enabled flag on each switch', async () => {
     const user = userEvent.setup();
     renderPanel();
     await flush();
     await act(async () => {
       pushClusters([
-        { context: 'prod-us', state: 'LIVE' },
-        { context: 'staging', state: 'SYNCING' },
+        { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true },
+        { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: true },
       ]);
     });
 
     await user.click(screen.getByRole('button', { name: /clusters/i }));
-
-    const prod = await screen.findByRole('switch', { name: /prod-us/i });
-    const staging = screen.getByRole('switch', { name: /staging/i });
-    expect(prod).toBeChecked();
-    expect(staging).toBeChecked();
+    expect(await screen.findByRole('switch', { name: /prod-us/i })).toBeChecked();
+    expect(screen.getByRole('switch', { name: /staging/i })).not.toBeChecked();
   });
 
-  it('toggling a cluster off flips its switch without any backend call (no-op for now)', async () => {
+  it('toggling a cluster fires the setClusterEnabled mutation', async () => {
     const user = userEvent.setup();
     renderPanel();
     await flush();
     await act(async () => {
-      pushClusters([{ context: 'prod-us', state: 'LIVE' }]);
+      pushClusters([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
     });
 
     await user.click(screen.getByRole('button', { name: /clusters/i }));
-    const prod = await screen.findByRole('switch', { name: /prod-us/i });
+    await user.click(await screen.findByRole('switch', { name: /prod-us/i }));
 
-    await user.click(prod);
-    expect(prod).not.toBeChecked();
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_query',
+      expect.objectContaining({ body: expect.stringContaining('setClusterEnabled') }),
+    );
+  });
 
-    // No-op: nothing is sent to the sidecar. The only IPC is the provider's
-    // own subscription; no query/mutation is fired by the toggle.
-    expect(invokeMock).not.toHaveBeenCalledWith('graphql_query', expect.anything());
+  it('deleting a cached cluster fires the deleteClusterCache mutation', async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await flush();
+    await act(async () => {
+      pushClusters([{ uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true }]);
+    });
+
+    await user.click(screen.getByRole('button', { name: /clusters/i }));
+    await user.click(await screen.findByRole('button', { name: /delete cache for old-cluster/i }));
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_query',
+      expect.objectContaining({ body: expect.stringContaining('deleteClusterCache') }),
+    );
   });
 });

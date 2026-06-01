@@ -29,7 +29,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
-	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
 
@@ -252,25 +252,25 @@ func TestUpdateSettingsQueuesOnCloudFailure(t *testing.T) {
 // from production subscribe/unsub semantics.
 type fakeStatus struct {
 	mu  sync.Mutex
-	cur syncpkg.Status
-	hub *hub.Hub[syncpkg.Status]
+	cur prefsync.Status
+	hub *hub.Hub[prefsync.Status]
 }
 
-func newFakeStatus(s syncpkg.Status) *fakeStatus {
-	return &fakeStatus{cur: s, hub: hub.New[syncpkg.Status]()}
+func newFakeStatus(s prefsync.Status) *fakeStatus {
+	return &fakeStatus{cur: s, hub: hub.New[prefsync.Status]()}
 }
 
-func (f *fakeStatus) Status() syncpkg.Status {
+func (f *fakeStatus) Status() prefsync.Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.cur
 }
 
-func (f *fakeStatus) WatchStatus() (<-chan syncpkg.Status, func()) {
+func (f *fakeStatus) WatchStatus() (<-chan prefsync.Status, func()) {
 	return f.hub.Subscribe()
 }
 
-func (f *fakeStatus) push(s syncpkg.Status) {
+func (f *fakeStatus) push(s prefsync.Status) {
 	f.mu.Lock()
 	f.cur = s
 	f.mu.Unlock()
@@ -290,8 +290,8 @@ func statusStack(t *testing.T, fs graph.StatusSource) string {
 func TestSyncStatusQueryMapsEngineStatus(t *testing.T) {
 	synced := time.UnixMilli(1_700_000_000_000)
 	retry := time.UnixMilli(1_700_000_030_000)
-	url := statusStack(t, newFakeStatus(syncpkg.Status{
-		State:        syncpkg.StateBackoff,
+	url := statusStack(t, newFakeStatus(prefsync.Status{
+		State:        prefsync.StateBackoff,
 		LastError:    "cloud unreachable",
 		LastSyncedAt: synced,
 		RetryAt:      retry,
@@ -323,8 +323,8 @@ func TestSyncStatusQueryMapsEngineStatus(t *testing.T) {
 // RetryAt is zeroed unless the engine is actually backing off, even if a
 // stale RetryAt lingers on the struct.
 func TestSyncStatusRetryAtZeroWhenNotBackoff(t *testing.T) {
-	url := statusStack(t, newFakeStatus(syncpkg.Status{
-		State:   syncpkg.StateLive,
+	url := statusStack(t, newFakeStatus(prefsync.Status{
+		State:   prefsync.StateLive,
 		RetryAt: time.UnixMilli(1_700_000_030_000),
 	}))
 	raw := postGQL(t, url, "", `{"query":"{ syncStatus { state retryAt lastSyncedAt } }"}`)
@@ -336,7 +336,7 @@ func TestSyncStatusRetryAtZeroWhenNotBackoff(t *testing.T) {
 // syncStatusWatch emits the current status immediately, then every
 // transition.
 func TestSyncStatusWatchSnapshotThenTransitions(t *testing.T) {
-	fs := newFakeStatus(syncpkg.Status{State: syncpkg.StateConnecting})
+	fs := newFakeStatus(prefsync.Status{State: prefsync.StateConnecting})
 	url := statusStack(t, fs)
 
 	resp := openSSESubscription(t, url, "", "subscription { syncStatusWatch { state } }")
@@ -364,41 +364,28 @@ func TestSyncStatusWatchSnapshotThenTransitions(t *testing.T) {
 	}
 
 	readState("CONNECTING") // current snapshot first
-	fs.push(syncpkg.Status{State: syncpkg.StateLive})
+	fs.push(prefsync.Status{State: prefsync.StateLive})
 	readState("LIVE") // then transitions
 }
 
-// clusterSyncStatusWatch is a stub today: it emits an empty snapshot
-// (no clusters wired to the sync engine yet), then holds the stream open
-// until the client unsubscribes. The follow-up PR backs it with the real
-// per-cluster source. This pins the contract + transport so the frontend
-// can build against it now.
-func TestClusterSyncStatusWatchEmitsEmptySnapshot(t *testing.T) {
+// clustersWatch degrades to a closed stream when no cluster cache is configured
+// (a bare Resolver has no ClusterManager), per the nil-tolerant resolver
+// contract: gqlgen flushes a terminal `complete` with no `next` snapshot rather
+// than erroring. (The per-cluster sync-status surface clusterSyncStatusWatch was
+// removed; status is now derived from the present/enabled/cached flags on
+// clustersWatch.)
+func TestClustersWatchDegradesWithoutCache(t *testing.T) {
 	h := graph.NewServer(&graph.Resolver{})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
 	resp := openSSESubscription(t, ts.URL, "",
-		"subscription { clusterSyncStatusWatch { context state lastError lastSyncedAt downloadRateBps } }")
+		"subscription { clustersWatch { uuid name present enabled cached } }")
 	defer resp.Body.Close() // ends the subscription; must run before ts.Close()
 	events := sseEvents(resp)
 
-	ev := nextSSE(t, events)
-	if ev.event != "next" {
-		t.Fatalf("want event=next, got %q (data=%s)", ev.event, ev.data)
-	}
-	var msg struct {
-		Data struct {
-			ClusterSyncStatusWatch []struct {
-				Context string `json:"context"`
-			} `json:"clusterSyncStatusWatch"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(ev.data), &msg); err != nil {
-		t.Fatalf("decode %s: %v", ev.data, err)
-	}
-	if len(msg.Data.ClusterSyncStatusWatch) != 0 {
-		t.Fatalf("want empty cluster list, got %s", ev.data)
+	if ev := nextSSE(t, events); ev.event != "complete" {
+		t.Fatalf("want event=complete (degraded stream), got %q (data=%s)", ev.event, ev.data)
 	}
 }
 

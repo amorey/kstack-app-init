@@ -16,10 +16,12 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clusterdata"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/k8ssync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
-	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
 
@@ -37,14 +39,23 @@ type Resolver struct {
 	Sync              StatusSource
 	Queue             *mutationqueue.Queue
 	KubeConfigWatcher *k8shelpers.KubeConfigWatcher
+	// ClusterData is the read side of the per-cluster SQLite mirror. Always
+	// non-nil (the composition root constructs it unconditionally); it tolerates
+	// a nil registry internally when the sidecar ran without --data-dir, so the
+	// cluster-data resolvers degrade to empty results without nil-guarding.
+	ClusterData *clusterdata.Reader
+	// ClusterManager is the cluster read+control surface (the `clusters`/
+	// `clustersWatch` reads and the enable/delete mutations). nil when no cache
+	// is configured; the resolvers guard that and degrade to empty.
+	ClusterManager k8ssync.Manager
 }
 
 // StatusSource is the slice of the always-on engine the syncStatus
 // resolvers need. An interface (not *sync.Engine) so server tests can
 // inject a fake without standing up a real engine.
 type StatusSource interface {
-	Status() syncpkg.Status
-	WatchStatus() (<-chan syncpkg.Status, func())
+	Status() prefsync.Status
+	WatchStatus() (<-chan prefsync.Status, func())
 }
 
 // cloudInput converts the gqlgen-generated input type into the cloud
@@ -56,13 +67,13 @@ func cloudInput(in model.UpdateSettingsInput) cloud.UpdateInput {
 
 // graphSyncState maps the engine's State enum onto the generated GraphQL
 // enum. The four engine states are total; default is defensive only.
-func graphSyncState(s syncpkg.State) model.SyncState {
+func graphSyncState(s prefsync.State) model.SyncState {
 	switch s {
-	case syncpkg.StateConnecting:
+	case prefsync.StateConnecting:
 		return model.SyncStateConnecting
-	case syncpkg.StateLive:
+	case prefsync.StateLive:
 		return model.SyncStateLive
-	case syncpkg.StateBackoff:
+	case prefsync.StateBackoff:
 		return model.SyncStateBackoff
 	default:
 		return model.SyncStateOffline
@@ -73,7 +84,7 @@ func graphSyncState(s syncpkg.State) model.SyncState {
 // type. Timestamps are Unix-millis ints (0 when zero-valued); RetryAt is
 // only meaningful while backing off (the engine's Status documents this
 // invariant — the mapper just honors it).
-func toGraphSyncStatus(s syncpkg.Status) *model.SyncStatus {
+func toGraphSyncStatus(s prefsync.Status) *model.SyncStatus {
 	ms := func(t time.Time) int {
 		if t.IsZero() {
 			return 0
@@ -81,7 +92,7 @@ func toGraphSyncStatus(s syncpkg.Status) *model.SyncStatus {
 		return int(t.UnixMilli())
 	}
 	retry := 0
-	if s.State == syncpkg.StateBackoff {
+	if s.State == prefsync.StateBackoff {
 		retry = ms(s.RetryAt)
 	}
 	return &model.SyncStatus{

@@ -1,4 +1,4 @@
-package sync_test
+package prefsync_test
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
-	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
 
@@ -67,7 +67,7 @@ func TestBackoffScheduleExponentialAndCapped(t *testing.T) {
 		},
 	}
 
-	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{
+	eng := prefsync.New(up, newStore(t), prefs.NewHub(), prefsync.Options{
 		BaseBackoff: 10 * time.Millisecond,
 		MaxBackoff:  40 * time.Millisecond,
 		Jitter:      func(d time.Duration) time.Duration { return d }, // identity
@@ -132,7 +132,7 @@ func TestSnapshotThenStreamPersistedWithMetadata(t *testing.T) {
 
 	now := atomic.Int64{}
 	now.Store(1_000)
-	eng := syncpkg.New(up, store, hub, syncpkg.Options{
+	eng := prefsync.New(up, store, hub, prefsync.Options{
 		Now: func() time.Time { return time.UnixMilli(now.Load()) },
 	})
 	go eng.Run(t.Context())
@@ -199,17 +199,17 @@ func TestStateMachineTransitions(t *testing.T) {
 	}
 	// Backoff long enough that Offline is comfortably observable by the
 	// 1ms poller during the post-error wait.
-	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{
+	eng := prefsync.New(up, newStore(t), prefs.NewHub(), prefsync.Options{
 		BaseBackoff: 50 * time.Millisecond,
 		MaxBackoff:  50 * time.Millisecond,
 		Jitter:      func(d time.Duration) time.Duration { return d },
 	})
 	go eng.Run(t.Context())
 
-	waitState(t, eng, syncpkg.StateOffline, "boom")
-	waitState(t, eng, syncpkg.StateLive, "")
+	waitState(t, eng, prefsync.StateOffline, "boom")
+	waitState(t, eng, prefsync.StateLive, "")
 	close(endLive)
-	waitState(t, eng, syncpkg.StateBackoff, "")
+	waitState(t, eng, prefsync.StateBackoff, "")
 }
 
 // (d) Wake detector: a wall-clock gap far larger than the heartbeat tick
@@ -228,7 +228,7 @@ func TestWakeGapForcesResync(t *testing.T) {
 			return ch, nil
 		},
 	}
-	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{
+	eng := prefsync.New(up, newStore(t), prefs.NewHub(), prefsync.Options{
 		Tick:      20 * time.Millisecond,
 		GapFactor: 2,
 		Now:       func() time.Time { return time.UnixMilli(now.Load()) },
@@ -270,7 +270,7 @@ func TestSingleUpstreamFansOutToAllSubscribers(t *testing.T) {
 	defer ua()
 	defer ub()
 
-	eng := syncpkg.New(up, newStore(t), hub, syncpkg.Options{})
+	eng := prefsync.New(up, newStore(t), hub, prefsync.Options{})
 	go eng.Run(t.Context())
 
 	// Drain the snapshot publish that precedes streaming.
@@ -309,10 +309,10 @@ func waitEnvelope(t *testing.T, s *syncstore.Store[prefs.Settings], ok func(sync
 	return syncstore.Envelope[prefs.Settings]{}
 }
 
-func waitState(t *testing.T, eng *syncpkg.Engine, want syncpkg.State, wantErrSubstr string) {
+func waitState(t *testing.T, eng *prefsync.Engine, want prefsync.State, wantErrSubstr string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
-	var last syncpkg.Status
+	var last prefsync.Status
 	for time.Now().Before(deadline) {
 		last = eng.Status()
 		if last.State == want && strings.Contains(last.LastError, wantErrSubstr) {
@@ -344,7 +344,7 @@ func TestWatchStatusStreamsTransitions(t *testing.T) {
 			return prefs.Settings{}, errors.New("boom")
 		},
 	}
-	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{
+	eng := prefsync.New(up, newStore(t), prefs.NewHub(), prefsync.Options{
 		BaseBackoff: 5 * time.Millisecond,
 		MaxBackoff:  5 * time.Millisecond,
 		Jitter:      func(d time.Duration) time.Duration { return d },
@@ -357,7 +357,7 @@ func TestWatchStatusStreamsTransitions(t *testing.T) {
 	for {
 		select {
 		case s := <-sub:
-			if s.State == syncpkg.StateOffline && s.LastError == "boom" {
+			if s.State == prefsync.StateOffline && s.LastError == "boom" {
 				return
 			}
 		case <-deadline:
@@ -378,7 +378,7 @@ func TestOnConnectedFiresOnLive(t *testing.T) {
 		},
 	}
 	connected := make(chan struct{}, 1)
-	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{
+	eng := prefsync.New(up, newStore(t), prefs.NewHub(), prefsync.Options{
 		OnConnected: func(context.Context) {
 			select {
 			case connected <- struct{}{}:
@@ -403,7 +403,7 @@ func TestPokeInterruptsBackoff(t *testing.T) {
 			return prefs.Settings{}, errors.New("down")
 		},
 	}
-	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{
+	eng := prefsync.New(up, newStore(t), prefs.NewHub(), prefsync.Options{
 		BaseBackoff: 30 * time.Second, // ≫ test deadline; only a poke can shortcut it
 		MaxBackoff:  30 * time.Second,
 	})
@@ -420,7 +420,7 @@ func TestPokeInterruptsBackoff(t *testing.T) {
 func TestPokeCancelsActiveWatch(t *testing.T) {
 	// Default fakeUpstream.Watch already blocks until ctx is cancelled.
 	up := &fakeUpstream{}
-	eng := syncpkg.New(up, newStore(t), prefs.NewHub(), syncpkg.Options{})
+	eng := prefsync.New(up, newStore(t), prefs.NewHub(), prefsync.Options{})
 	go eng.Run(t.Context())
 
 	waitCount(t, &up.snapshots, 1) // Live on the first watch

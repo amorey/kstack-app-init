@@ -41,6 +41,10 @@ func main() {
 	cloudURL := flag.String("cloud-url", envOr("KSTACK_CLOUD_URL", "https://api.kstack.sh"), "base URL of the kstack cloud (without /graphql)")
 	prefsPath := flag.String("prefs-path", app.DefaultPrefsPath(), "path to the local preferences cache file")
 	kubeconfigPath := flag.String("kubeconfig", "", "explicit kubeconfig path; empty uses the clientcmd default-loading rules ($KUBECONFIG / ~/.kube/config)")
+	// The Tauri host passes its app_local_data_dir() here so per-cluster SQLite
+	// caches land in the OS-correct per-machine data location. Standalone runs
+	// (tests, dev) may omit it; the cluster cache is then disabled.
+	dataDir := flag.String("data-dir", envOr("KSTACK_DATA_DIR", ""), "host-supplied app data dir for the per-cluster cluster cache (defaults to KSTACK_DATA_DIR; empty disables the cache)")
 	flag.Parse()
 
 	// Per-OS binding: AF_UNIX socket on Unix, named pipe on Windows.
@@ -59,12 +63,14 @@ func main() {
 		"pid", os.Getpid(),
 		"cloud_url", *cloudURL,
 		"prefs_path", *prefsPath,
+		"data_dir", *dataDir,
 	)
 
 	application, err := app.New(app.Config{
 		CloudURL:       *cloudURL,
 		PrefsPath:      *prefsPath,
 		KubeconfigPath: *kubeconfigPath,
+		DataDir:        *dataDir,
 	})
 	if err != nil {
 		slog.Error("app init", "err", err)

@@ -25,7 +25,7 @@ import { ReadyGate } from '@/lib/ready-gate';
 import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 import { SyncHealthBadge } from '@/components/widgets/sync-health-badge';
 import { ClusterSyncPanel } from '@/components/widgets/cluster-sync-panel';
-import { ClusterSyncProvider } from '@/lib/cluster-sync';
+import { ClustersProvider } from '@/lib/clusters';
 import { KubeConfigProvider } from '@/lib/kube-config';
 import { SyncStatusProvider } from '@/lib/sync-status';
 
@@ -63,7 +63,7 @@ function RootComponent() {
         <SessionProvider>
           <UrqlProvider value={gqlClient}>
             <SyncStatusProvider>
-              <ClusterSyncProvider>
+              <ClustersProvider>
                 <KubeConfigProvider>
                   <div className="fixed left-3 top-3 z-50">
                     <KubeContextPicker />
@@ -79,7 +79,7 @@ function RootComponent() {
                     <TanStackRouterDevtools />
                   </Suspense>
                 </KubeConfigProvider>
-              </ClusterSyncProvider>
+              </ClustersProvider>
             </SyncStatusProvider>
           </UrqlProvider>
         </SessionProvider>

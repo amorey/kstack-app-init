@@ -43,32 +43,84 @@ type SyncStatus {
   retryAt: Int!
 }
 
-"Per-cluster sync lifecycle for the local-cache sync engine."
-enum ClusterSyncState {
-  "Queued; sync not started yet."
-  PENDING
-  "Actively downloading the cluster's resources into the local cache."
-  SYNCING
-  "Caught up; watching for incremental changes."
-  LIVE
-  "Retrying after an error."
-  BACKOFF
-  "Cluster unreachable."
-  OFFLINE
+# --- Cluster cache ---
+
+"A cluster in the app's local registry. `uuid` is the cluster's `kube-system` namespace UID — stable across kubeconfig context renames and unique per cluster. A cluster stays listed even after it leaves the kubeconfig (so its cache can be inspected or cleaned up); the `present`/`cached`/`enabled` flags describe its current state."
+type Cluster {
+  uuid: String!
+  name: String!
+  context: String!
+  "True when this entry matches the kubeconfig's `current-context`."
+  isCurrent: Boolean!
+  "Whether the user has syncing enabled for this cluster. Disabling freezes its cache (no longer browsable)."
+  enabled: Boolean!
+  "True while the cluster's kube-context is present in the current kubeconfig."
+  present: Boolean!
+  "True when a local SQLite cache exists on disk for this cluster."
+  cached: Boolean!
+  "On-disk size of the cache (sqlite + WAL/shm sidecars) in bytes; 0 when not cached."
+  cacheBytes: Int!
+  "Unix-millis of the last time the cache received fresh data; 0 if never."
+  lastSyncedAt: Int!
+  "Unix-millis of the last time this cluster's context was seen in the kubeconfig; 0 if never."
+  lastSeenInKubeconfigAt: Int!
 }
 
-"Sync status of a single cluster being mirrored into the local cache."
-type ClusterSyncStatus {
-  "Kube-context name — the row identity."
-  context: String!
-  "Per-cluster sync lifecycle state."
-  state: ClusterSyncState!
-  "Last sync error; empty string when healthy."
-  lastError: String!
-  "Unix-millis of the last successful reconcile; 0 if never synced."
-  lastSyncedAt: Int!
-  "Current download rate in bytes/sec; 0 when idle or offline."
-  downloadRateBps: Int!
+"A single cached pod from a cluster's local SQLite mirror. `clusterUuid` identifies which cluster this row belongs to; all other fields mirror the underlying object."
+type Pod {
+  clusterUuid: String!
+  namespace: String!
+  name: String!
+  uid: String!
+  phase: String!
+  nodeName: String!
+  updatedAt: Int!
+}
+
+"A cached Service. Mirrors the columns in the local SQLite mirror."
+type Service {
+  clusterUuid: String!
+  namespace: String!
+  name: String!
+  uid: String!
+  type: String!
+  clusterIp: String!
+  updatedAt: Int!
+}
+
+"A cached Deployment. Replica counts are the spec'd vs ready values."
+type Deployment {
+  clusterUuid: String!
+  namespace: String!
+  name: String!
+  uid: String!
+  replicas: Int!
+  readyReplicas: Int!
+  updatedAt: Int!
+}
+
+"A cached Node. `ready` is true when the node has a Ready=True condition."
+type Node {
+  clusterUuid: String!
+  name: String!
+  uid: String!
+  ready: Boolean!
+  updatedAt: Int!
+}
+
+"A cached Kubernetes Event. Mirrors the dedicated `events` table; ordered by lastSeen DESC when listed."
+type Event {
+  clusterUuid: String!
+  uid: String!
+  type: String!
+  reason: String!
+  message: String!
+  involvedKind: String!
+  involvedNamespace: String!
+  involvedName: String!
+  firstSeen: Int!
+  lastSeen: Int!
+  count: Int!
 }
 
 input ChatMessageInput {
@@ -151,6 +203,24 @@ type Query {
 
   "Current sync health of the always-on engine."
   syncStatus: SyncStatus!
+
+  "Every cluster in the local registry — those in the current kubeconfig plus any with a leftover cache. Sorted by name."
+  clusters: [Cluster!]!
+
+  "Snapshot of pods cached for the given cluster, ordered by namespace then name."
+  pods(clusterUuid: String!): [Pod!]!
+
+  "Snapshot of services cached for the given cluster."
+  services(clusterUuid: String!): [Service!]!
+
+  "Snapshot of deployments cached for the given cluster."
+  deployments(clusterUuid: String!): [Deployment!]!
+
+  "Snapshot of nodes cached for the given cluster."
+  nodes(clusterUuid: String!): [Node!]!
+
+  "Recent Kubernetes events from the local mirror, newest first. `limit` defaults to 100 and is capped at 500."
+  events(clusterUuid: String!, limit: Int): [Event!]!
 }
 
 type Mutation {
@@ -159,6 +229,12 @@ type Mutation {
 
   "Sets the kubeconfig current-context, persisting it to disk (kubectl-visible). Returns true on success; errors if the context is unknown. The updated config is delivered to clients via the kubeConfigWatch subscription."
   setCurrentContext(name: String!): Boolean!
+
+  "Enable or disable syncing for a cluster. Disabling stops its sync and freezes its cache (no longer browsable); enabling resumes it. Returns the updated cluster; errors if the uuid is unknown."
+  setClusterEnabled(uuid: String!, enabled: Boolean!): Cluster!
+
+  "Delete a cluster's local cache files. If its context is still present and enabled it re-syncs from scratch; a disabled cluster's row is kept (files freed); an orphan (gone from kubeconfig) is forgotten. Returns true."
+  deleteClusterCache(uuid: String!): Boolean!
 }
 
 type Subscription {
@@ -171,11 +247,23 @@ type Subscription {
   "Streams the engine's sync health: the current status first, then every transition."
   syncStatusWatch: SyncStatus!
 
-  "Streams per-cluster sync status: the full snapshot first, then updates. Stub today (emits an empty list); wired to the sync engine in a follow-up."
-  clusterSyncStatusWatch: [ClusterSyncStatus!]!
+  "Streams the cluster registry: the full snapshot first, then a fresh snapshot on every change (discovery, enable/disable, sync freshness, deletion)."
+  clustersWatch: [Cluster!]!
 
   "Streams the assistant's reply token-by-token. Completes after a frame with `done: true`."
   chatStream(input: ChatInput!): ChatChunk!
+
+  "Streams the cluster's pod list: snapshot first, then a fresh snapshot every time the local cache changes."
+  podsWatch(clusterUuid: String!): [Pod!]!
+
+  "Streams the cluster's service list, same shape as podsWatch."
+  servicesWatch(clusterUuid: String!): [Service!]!
+
+  "Streams the cluster's deployment list."
+  deploymentsWatch(clusterUuid: String!): [Deployment!]!
+
+  "Streams the cluster's node list."
+  nodesWatch(clusterUuid: String!): [Node!]!
 
   """
   KubeConfig watchers

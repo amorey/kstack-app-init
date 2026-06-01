@@ -13,8 +13,9 @@ import (
 	"github.com/99designs/gqlgen/graphql/handler/transport"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clusterdata"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
-	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
 )
 
 // noopStatus is the default StatusSource when a Resolver is built without one
@@ -23,12 +24,12 @@ import (
 // gracefully instead of nil-panicking. Production always wires the engine.
 type noopStatus struct{}
 
-func (noopStatus) Status() syncpkg.Status {
-	return syncpkg.Status{State: syncpkg.StateOffline}
+func (noopStatus) Status() prefsync.Status {
+	return prefsync.Status{State: prefsync.StateOffline}
 }
 
-func (noopStatus) WatchStatus() (<-chan syncpkg.Status, func()) {
-	ch := make(chan syncpkg.Status)
+func (noopStatus) WatchStatus() (<-chan prefsync.Status, func()) {
+	ch := make(chan prefsync.Status)
 	close(ch)
 	return ch, func() {}
 }
@@ -57,6 +58,13 @@ type Server struct {
 func NewServer(r *Resolver) *Server {
 	if r.Sync == nil {
 		r.Sync = noopStatus{}
+	}
+	// Keep the cluster-data resolvers nil-safe for a bare &Resolver{} (tests /
+	// minimal surfaces): a Reader over a nil registry returns empty snapshots
+	// and closed watch channels. ClusterProvider stays nil — its resolver guards
+	// that directly.
+	if r.ClusterData == nil {
+		r.ClusterData = clusterdata.NewReader(nil)
 	}
 
 	srv := handler.New(NewExecutableSchema(Config{Resolvers: r}))

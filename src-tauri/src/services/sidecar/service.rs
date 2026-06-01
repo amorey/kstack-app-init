@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::watch;
@@ -95,10 +95,23 @@ impl SidecarService {
     /// ownership of the child so it can be shut down later.
     pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<Self> {
         let endpoint = Endpoint::pick(&std::env::temp_dir())?;
+
+        // Per-machine, non-roaming app data dir. Tauri maps this to
+        // ~/Library/Application Support/<bundle> on macOS, %LOCALAPPDATA%\<bundle>
+        // on Windows, and ~/.local/share/<bundle> on Linux — the OS-correct
+        // location for the per-cluster SQLite cache. Created up front so the
+        // sidecar can mkdir subdirs under it without worrying about parents.
+        let data_dir = app.path().app_local_data_dir().map_err(|e| {
+            AppError::Io(std::io::Error::other(format!(
+                "resolve app_local_data_dir: {e}"
+            )))
+        })?;
+        std::fs::create_dir_all(&data_dir).map_err(AppError::Io)?;
+
         let (mut rx, child) = app
             .shell()
             .sidecar("kstack-sidecar")?
-            .args(cmd_args(&endpoint))
+            .args(cmd_args(&endpoint, &data_dir))
             .spawn()?;
         let pid = child.pid();
 
@@ -352,8 +365,13 @@ impl SidecarService {
 /// Factored out so the host↔sidecar argument contract is unit-testable
 /// without standing up the Tauri runtime: the spawn site just hands the
 /// returned vector to `Command::args`.
-fn cmd_args(socket: &Endpoint) -> Vec<String> {
-    vec!["--socket".to_string(), socket.as_arg().to_owned()]
+fn cmd_args(socket: &Endpoint, data_dir: &std::path::Path) -> Vec<String> {
+    vec![
+        "--socket".to_string(),
+        socket.as_arg().to_owned(),
+        "--data-dir".to_string(),
+        data_dir.to_string_lossy().into_owned(),
+    ]
 }
 
 /// Terminates a process by pid using the platform's native API.
@@ -406,14 +424,24 @@ mod tests {
     use super::*;
 
     /// Locks the host↔sidecar CLI contract: the host hands the sidecar the
-    /// address to listen on via `--socket <path>`. Changing this shape
-    /// without updating the sidecar would silently leave both sides binding
-    /// to different addresses and the connection would never come up.
+    /// listen address via `--socket <path>` and the app data dir via
+    /// `--data-dir <path>`. Changing this shape without updating the sidecar
+    /// would silently leave the cluster cache pointed at the wrong location (or
+    /// the sockets binding to different paths).
     #[test]
-    fn cmd_args_passes_socket_flag() {
+    fn cmd_args_passes_socket_and_data_dir() {
         let base = std::env::temp_dir();
         let path = Endpoint::pick(&base).expect("pick should succeed");
-        let args = cmd_args(&path);
-        assert_eq!(args, vec!["--socket".to_string(), path.as_arg().to_owned()]);
+        let data_dir = std::path::PathBuf::from("/some/app/data");
+        let args = cmd_args(&path, &data_dir);
+        assert_eq!(
+            args,
+            vec![
+                "--socket".to_string(),
+                path.as_arg().to_owned(),
+                "--data-dir".to_string(),
+                data_dir.to_string_lossy().into_owned(),
+            ]
+        );
     }
 }

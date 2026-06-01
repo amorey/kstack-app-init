@@ -81,6 +81,31 @@ func (r *mutationResolver) SetCurrentContext(ctx context.Context, name string) (
 	return true, nil
 }
 
+// SetClusterEnabled is the resolver for the setClusterEnabled field. Delegates
+// to the cluster manager, which persists the flag and reconciles (opening or
+// freezing the cache). Returns the updated cluster.
+func (r *mutationResolver) SetClusterEnabled(ctx context.Context, uuid string, enabled bool) (*model.Cluster, error) {
+	if r.ClusterManager == nil {
+		return nil, fmt.Errorf("cluster cache is not configured")
+	}
+	view, err := r.ClusterManager.SetEnabled(ctx, uuid, enabled)
+	if err != nil {
+		return nil, err
+	}
+	return toGraphCluster(view), nil
+}
+
+// DeleteClusterCache is the resolver for the deleteClusterCache field.
+func (r *mutationResolver) DeleteClusterCache(ctx context.Context, uuid string) (bool, error) {
+	if r.ClusterManager == nil {
+		return false, fmt.Errorf("cluster cache is not configured")
+	}
+	if err := r.ClusterManager.DeleteCache(ctx, uuid); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Ping is the resolver for the ping field.
 func (r *queryResolver) Ping(ctx context.Context) (string, error) {
 	return "pong", nil
@@ -101,6 +126,67 @@ func (r *queryResolver) Settings(ctx context.Context) (*model.Settings, error) {
 // SyncStatus is the resolver for the syncStatus field.
 func (r *queryResolver) SyncStatus(ctx context.Context) (*model.SyncStatus, error) {
 	return toGraphSyncStatus(r.Sync.Status()), nil
+}
+
+// Clusters is the resolver for the clusters field. Returns the clusters the
+// coordinator currently has mirrored. Empty list (not an error) when no cache is
+// configured.
+func (r *queryResolver) Clusters(ctx context.Context) ([]*model.Cluster, error) {
+	if r.ClusterManager == nil {
+		return []*model.Cluster{}, nil
+	}
+	return toGraphClusters(r.ClusterManager.Clusters()), nil
+}
+
+// Pods is the resolver for the pods field. Served from the per-cluster SQLite
+// mirror; never touches the upstream synchronously.
+func (r *queryResolver) Pods(ctx context.Context, clusterUUID string) ([]*model.Pod, error) {
+	pods, err := r.ClusterData.Pods(ctx, clusterUUID)
+	if err != nil {
+		return nil, err
+	}
+	return mapSlice(pods, toGraphPod), nil
+}
+
+// Services is the resolver for the services field.
+func (r *queryResolver) Services(ctx context.Context, clusterUUID string) ([]*model.Service, error) {
+	svcs, err := r.ClusterData.Services(ctx, clusterUUID)
+	if err != nil {
+		return nil, err
+	}
+	return mapSlice(svcs, toGraphService), nil
+}
+
+// Deployments is the resolver for the deployments field.
+func (r *queryResolver) Deployments(ctx context.Context, clusterUUID string) ([]*model.Deployment, error) {
+	deps, err := r.ClusterData.Deployments(ctx, clusterUUID)
+	if err != nil {
+		return nil, err
+	}
+	return mapSlice(deps, toGraphDeployment), nil
+}
+
+// Nodes is the resolver for the nodes field.
+func (r *queryResolver) Nodes(ctx context.Context, clusterUUID string) ([]*model.Node, error) {
+	nodes, err := r.ClusterData.Nodes(ctx, clusterUUID)
+	if err != nil {
+		return nil, err
+	}
+	return mapSlice(nodes, toGraphNode), nil
+}
+
+// Events is the resolver for the events field. limit nil/<=0 defaults to 100,
+// capped at 500 inside the read layer.
+func (r *queryResolver) Events(ctx context.Context, clusterUUID string, limit *int) ([]*model.Event, error) {
+	n := 0
+	if limit != nil {
+		n = *limit
+	}
+	events, err := r.ClusterData.Events(ctx, clusterUUID, n)
+	if err != nil {
+		return nil, err
+	}
+	return mapSlice(events, toGraphEvent), nil
 }
 
 // Tick is the resolver for the tick field. Streams 1, 2, 3, … on the
@@ -156,26 +242,19 @@ func (r *subscriptionResolver) SyncStatusWatch(ctx context.Context) (<-chan *mod
 	}), nil
 }
 
-// ClusterSyncStatusWatch is the resolver for the clusterSyncStatusWatch
-// field. Stub: per-cluster sync isn't wired to the engine yet, so it emits
-// one empty snapshot (so a subscriber gets a valid first frame rather than
-// hanging) and then holds the stream open until the client unsubscribes —
-// the same "don't close, wait for ctx.Done()" shape ChatStream uses to keep
-// the subscribe-exchange from treating a close as a transport drop. The
-// follow-up PR replaces this with a real per-cluster source via
-// streamWithSnapshot.
-func (r *subscriptionResolver) ClusterSyncStatusWatch(ctx context.Context) (<-chan []*model.ClusterSyncStatus, error) {
-	ch := make(chan []*model.ClusterSyncStatus)
-	go func() {
-		defer close(ch)
-		select {
-		case ch <- []*model.ClusterSyncStatus{}:
-		case <-ctx.Done():
-			return
-		}
-		<-ctx.Done()
-	}()
-	return ch, nil
+// ClustersWatch is the resolver for the clustersWatch field. Emits the current
+// cluster registry snapshot, then a fresh snapshot on every change. Degrades to
+// a closed stream when no cache is configured.
+func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan []*model.Cluster, error) {
+	if r.ClusterManager == nil {
+		ch := make(chan []*model.Cluster)
+		close(ch)
+		return ch, nil
+	}
+	sub, unsub := r.ClusterManager.Subscribe()
+	return streamWithSnapshot(ctx, sub, unsub, toGraphClusters,
+		func() ([]*model.Cluster, bool) { return toGraphClusters(r.ClusterManager.Clusters()), true },
+	), nil
 }
 
 // ChatStream is the resolver for the chatStream field. POC: forwards the
@@ -239,6 +318,43 @@ func (r *subscriptionResolver) ChatStream(ctx context.Context, input model.ChatI
 		<-ctx.Done()
 	}()
 	return ch, nil
+}
+
+// PodsWatch is the resolver for the podsWatch field. Pushes a fresh snapshot
+// every time the per-cluster SQLite cache reports a change.
+func (r *subscriptionResolver) PodsWatch(ctx context.Context, clusterUUID string) (<-chan []*model.Pod, error) {
+	ch, err := r.ClusterData.WatchPods(ctx, clusterUUID)
+	if err != nil {
+		return nil, err
+	}
+	return relay(ctx, ch, toGraphPod), nil
+}
+
+// ServicesWatch is the resolver for the servicesWatch field.
+func (r *subscriptionResolver) ServicesWatch(ctx context.Context, clusterUUID string) (<-chan []*model.Service, error) {
+	ch, err := r.ClusterData.WatchServices(ctx, clusterUUID)
+	if err != nil {
+		return nil, err
+	}
+	return relay(ctx, ch, toGraphService), nil
+}
+
+// DeploymentsWatch is the resolver for the deploymentsWatch field.
+func (r *subscriptionResolver) DeploymentsWatch(ctx context.Context, clusterUUID string) (<-chan []*model.Deployment, error) {
+	ch, err := r.ClusterData.WatchDeployments(ctx, clusterUUID)
+	if err != nil {
+		return nil, err
+	}
+	return relay(ctx, ch, toGraphDeployment), nil
+}
+
+// NodesWatch is the resolver for the nodesWatch field.
+func (r *subscriptionResolver) NodesWatch(ctx context.Context, clusterUUID string) (<-chan []*model.Node, error) {
+	ch, err := r.ClusterData.WatchNodes(ctx, clusterUUID)
+	if err != nil {
+		return nil, err
+	}
+	return relay(ctx, ch, toGraphNode), nil
 }
 
 // KubeConfigWatch is the resolver for the kubeConfigWatch field. The

@@ -10,7 +10,7 @@
 // alerting layer hanging off the same applied-state stream — can reuse it
 // without rework. This package is a pure library: nothing here starts it;
 // wiring into the process lifecycle is a later step.
-package sync
+package prefsync
 
 import (
 	"context"

@@ -24,18 +24,51 @@ type ChatMessageInput struct {
 	Content string `json:"content"`
 }
 
-// Sync status of a single cluster being mirrored into the local cache.
-type ClusterSyncStatus struct {
-	// Kube-context name — the row identity.
+// A cluster in the app's local registry. `uuid` is the cluster's `kube-system` namespace UID — stable across kubeconfig context renames and unique per cluster. A cluster stays listed even after it leaves the kubeconfig (so its cache can be inspected or cleaned up); the `present`/`cached`/`enabled` flags describe its current state.
+type Cluster struct {
+	UUID    string `json:"uuid"`
+	Name    string `json:"name"`
 	Context string `json:"context"`
-	// Per-cluster sync lifecycle state.
-	State ClusterSyncState `json:"state"`
-	// Last sync error; empty string when healthy.
-	LastError string `json:"lastError"`
-	// Unix-millis of the last successful reconcile; 0 if never synced.
+	// True when this entry matches the kubeconfig's `current-context`.
+	IsCurrent bool `json:"isCurrent"`
+	// Whether the user has syncing enabled for this cluster. Disabling freezes its cache (no longer browsable).
+	Enabled bool `json:"enabled"`
+	// True while the cluster's kube-context is present in the current kubeconfig.
+	Present bool `json:"present"`
+	// True when a local SQLite cache exists on disk for this cluster.
+	Cached bool `json:"cached"`
+	// On-disk size of the cache (sqlite + WAL/shm sidecars) in bytes; 0 when not cached.
+	CacheBytes int `json:"cacheBytes"`
+	// Unix-millis of the last time the cache received fresh data; 0 if never.
 	LastSyncedAt int `json:"lastSyncedAt"`
-	// Current download rate in bytes/sec; 0 when idle or offline.
-	DownloadRateBps int `json:"downloadRateBps"`
+	// Unix-millis of the last time this cluster's context was seen in the kubeconfig; 0 if never.
+	LastSeenInKubeconfigAt int `json:"lastSeenInKubeconfigAt"`
+}
+
+// A cached Deployment. Replica counts are the spec'd vs ready values.
+type Deployment struct {
+	ClusterUUID   string `json:"clusterUuid"`
+	Namespace     string `json:"namespace"`
+	Name          string `json:"name"`
+	UID           string `json:"uid"`
+	Replicas      int    `json:"replicas"`
+	ReadyReplicas int    `json:"readyReplicas"`
+	UpdatedAt     int    `json:"updatedAt"`
+}
+
+// A cached Kubernetes Event. Mirrors the dedicated `events` table; ordered by lastSeen DESC when listed.
+type Event struct {
+	ClusterUUID       string `json:"clusterUuid"`
+	UID               string `json:"uid"`
+	Type              string `json:"type"`
+	Reason            string `json:"reason"`
+	Message           string `json:"message"`
+	InvolvedKind      string `json:"involvedKind"`
+	InvolvedNamespace string `json:"involvedNamespace"`
+	InvolvedName      string `json:"involvedName"`
+	FirstSeen         int    `json:"firstSeen"`
+	LastSeen          int    `json:"lastSeen"`
+	Count             int    `json:"count"`
 }
 
 type KubeConfigWatchEvent struct {
@@ -46,7 +79,38 @@ type KubeConfigWatchEvent struct {
 type Mutation struct {
 }
 
+// A cached Node. `ready` is true when the node has a Ready=True condition.
+type Node struct {
+	ClusterUUID string `json:"clusterUuid"`
+	Name        string `json:"name"`
+	UID         string `json:"uid"`
+	Ready       bool   `json:"ready"`
+	UpdatedAt   int    `json:"updatedAt"`
+}
+
+// A single cached pod from a cluster's local SQLite mirror. `clusterUuid` identifies which cluster this row belongs to; all other fields mirror the underlying object.
+type Pod struct {
+	ClusterUUID string `json:"clusterUuid"`
+	Namespace   string `json:"namespace"`
+	Name        string `json:"name"`
+	UID         string `json:"uid"`
+	Phase       string `json:"phase"`
+	NodeName    string `json:"nodeName"`
+	UpdatedAt   int    `json:"updatedAt"`
+}
+
 type Query struct {
+}
+
+// A cached Service. Mirrors the columns in the local SQLite mirror.
+type Service struct {
+	ClusterUUID string `json:"clusterUuid"`
+	Namespace   string `json:"namespace"`
+	Name        string `json:"name"`
+	UID         string `json:"uid"`
+	Type        string `json:"type"`
+	ClusterIP   string `json:"clusterIp"`
+	UpdatedAt   int    `json:"updatedAt"`
 }
 
 // User-scoped preferences synced through the kstack cloud. Today this is a single free-form `placeholder` string — extend as the product grows.
@@ -71,73 +135,6 @@ type SyncStatus struct {
 
 type UpdateSettingsInput struct {
 	Placeholder *string `json:"placeholder,omitempty"`
-}
-
-// Per-cluster sync lifecycle for the local-cache sync engine.
-type ClusterSyncState string
-
-const (
-	// Queued; sync not started yet.
-	ClusterSyncStatePending ClusterSyncState = "PENDING"
-	// Actively downloading the cluster's resources into the local cache.
-	ClusterSyncStateSyncing ClusterSyncState = "SYNCING"
-	// Caught up; watching for incremental changes.
-	ClusterSyncStateLive ClusterSyncState = "LIVE"
-	// Retrying after an error.
-	ClusterSyncStateBackoff ClusterSyncState = "BACKOFF"
-	// Cluster unreachable.
-	ClusterSyncStateOffline ClusterSyncState = "OFFLINE"
-)
-
-var AllClusterSyncState = []ClusterSyncState{
-	ClusterSyncStatePending,
-	ClusterSyncStateSyncing,
-	ClusterSyncStateLive,
-	ClusterSyncStateBackoff,
-	ClusterSyncStateOffline,
-}
-
-func (e ClusterSyncState) IsValid() bool {
-	switch e {
-	case ClusterSyncStatePending, ClusterSyncStateSyncing, ClusterSyncStateLive, ClusterSyncStateBackoff, ClusterSyncStateOffline:
-		return true
-	}
-	return false
-}
-
-func (e ClusterSyncState) String() string {
-	return string(e)
-}
-
-func (e *ClusterSyncState) UnmarshalGQL(v any) error {
-	str, ok := v.(string)
-	if !ok {
-		return fmt.Errorf("enums must be strings")
-	}
-
-	*e = ClusterSyncState(str)
-	if !e.IsValid() {
-		return fmt.Errorf("%s is not a valid ClusterSyncState", str)
-	}
-	return nil
-}
-
-func (e ClusterSyncState) MarshalGQL(w io.Writer) {
-	fmt.Fprint(w, strconv.Quote(e.String()))
-}
-
-func (e *ClusterSyncState) UnmarshalJSON(b []byte) error {
-	s, err := strconv.Unquote(string(b))
-	if err != nil {
-		return err
-	}
-	return e.UnmarshalGQL(s)
-}
-
-func (e ClusterSyncState) MarshalJSON() ([]byte, error) {
-	var buf bytes.Buffer
-	e.MarshalGQL(&buf)
-	return buf.Bytes(), nil
 }
 
 // Engine connection lifecycle.

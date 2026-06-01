@@ -1,4 +1,4 @@
-package sync_test
+package prefsync_test
 
 import (
 	"context"
@@ -10,11 +10,11 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
-	syncpkg "github.com/kubetail-org/kstack-app/sidecar/internal/sync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
 )
 
 // Compile-time proof the adapter satisfies the engine's Upstream.
-var _ syncpkg.Upstream = (*syncpkg.CloudUpstream)(nil)
+var _ prefsync.Upstream = (*prefsync.CloudUpstream)(nil)
 
 // No credentials yet (the host hasn't pushed): the adapter must error
 // *without* touching the cloud, so the engine just goes Offline instead of
@@ -26,7 +26,7 @@ func TestCloudUpstreamErrsWhenNoCredentials(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	up := syncpkg.NewCloudUpstream(cloud.New(srv.URL), authcreds.NewHolder())
+	up := prefsync.NewCloudUpstream(cloud.New(srv.URL), authcreds.NewHolder())
 
 	if _, err := up.Snapshot(context.Background()); err == nil {
 		t.Fatal("Snapshot: want error with empty holder, got nil")
@@ -51,7 +51,7 @@ func TestCloudUpstreamSnapshotForwardsToken(t *testing.T) {
 
 	creds := authcreds.NewHolder()
 	creds.Set(authcreds.Credentials{Token: "tok-1"})
-	up := syncpkg.NewCloudUpstream(cloud.New(srv.URL), creds)
+	up := prefsync.NewCloudUpstream(cloud.New(srv.URL), creds)
 
 	got, err := up.Snapshot(context.Background())
 	if err != nil {
@@ -88,7 +88,7 @@ func TestCloudUpstreamWatchStreamsEvents(t *testing.T) {
 
 	creds := authcreds.NewHolder()
 	creds.Set(authcreds.Credentials{Token: "tok-2"})
-	up := syncpkg.NewCloudUpstream(cloud.New(srv.URL), creds)
+	up := prefsync.NewCloudUpstream(cloud.New(srv.URL), creds)
 
 	// Explicit cancel, not t.Context(): defers are LIFO, so this cancel
 	// runs before `defer srv.Close()`. With t.Context() (cancelled only

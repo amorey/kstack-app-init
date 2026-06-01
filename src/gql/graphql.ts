@@ -13,19 +13,6 @@ export type ChatMessageInput = {
   role: string;
 };
 
-/** Per-cluster sync lifecycle for the local-cache sync engine. */
-export type ClusterSyncState =
-  /** Retrying after an error. */
-  | 'BACKOFF'
-  /** Caught up; watching for incremental changes. */
-  | 'LIVE'
-  /** Cluster unreachable. */
-  | 'OFFLINE'
-  /** Queued; sync not started yet. */
-  | 'PENDING'
-  /** Actively downloading the cluster's resources into the local cache. */
-  | 'SYNCING';
-
 /** Engine connection lifecycle. */
 export type SyncState =
   | 'BACKOFF'
@@ -40,10 +27,25 @@ export type WatchEventType =
   | 'ERROR'
   | 'MODIFIED';
 
-export type ClusterSyncStatusWatchSubscriptionVariables = Exact<{ [key: string]: never; }>;
+export type SetClusterEnabledMutationVariables = Exact<{
+  uuid: string;
+  enabled: boolean;
+}>;
 
 
-export type ClusterSyncStatusWatchSubscription = { clusterSyncStatusWatch: Array<{ context: string, state: ClusterSyncState, lastError: string, lastSyncedAt: number, downloadRateBps: number }> };
+export type SetClusterEnabledMutation = { setClusterEnabled: { uuid: string, enabled: boolean } };
+
+export type DeleteClusterCacheMutationVariables = Exact<{
+  uuid: string;
+}>;
+
+
+export type DeleteClusterCacheMutation = { deleteClusterCache: boolean };
+
+export type ClustersWatchSubscriptionVariables = Exact<{ [key: string]: never; }>;
+
+
+export type ClustersWatchSubscription = { clustersWatch: Array<{ uuid: string, name: string, context: string, isCurrent: boolean, enabled: boolean, present: boolean, cached: boolean, cacheBytes: number, lastSyncedAt: number, lastSeenInKubeconfigAt: number }> };
 
 export type TickSubscriptionVariables = Exact<{ [key: string]: never; }>;
 
@@ -68,7 +70,9 @@ export type ChatStreamSubscriptionVariables = Exact<{
 export type ChatStreamSubscription = { chatStream: { delta: string, done: boolean } };
 
 
-export const ClusterSyncStatusWatchDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"subscription","name":{"kind":"Name","value":"ClusterSyncStatusWatch"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"clusterSyncStatusWatch"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"context"}},{"kind":"Field","name":{"kind":"Name","value":"state"}},{"kind":"Field","name":{"kind":"Name","value":"lastError"}},{"kind":"Field","name":{"kind":"Name","value":"lastSyncedAt"}},{"kind":"Field","name":{"kind":"Name","value":"downloadRateBps"}}]}}]}}]} as unknown as DocumentNode<ClusterSyncStatusWatchSubscription, ClusterSyncStatusWatchSubscriptionVariables>;
+export const SetClusterEnabledDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"mutation","name":{"kind":"Name","value":"SetClusterEnabled"},"variableDefinitions":[{"kind":"VariableDefinition","variable":{"kind":"Variable","name":{"kind":"Name","value":"uuid"}},"type":{"kind":"NonNullType","type":{"kind":"NamedType","name":{"kind":"Name","value":"String"}}}},{"kind":"VariableDefinition","variable":{"kind":"Variable","name":{"kind":"Name","value":"enabled"}},"type":{"kind":"NonNullType","type":{"kind":"NamedType","name":{"kind":"Name","value":"Boolean"}}}}],"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"setClusterEnabled"},"arguments":[{"kind":"Argument","name":{"kind":"Name","value":"uuid"},"value":{"kind":"Variable","name":{"kind":"Name","value":"uuid"}}},{"kind":"Argument","name":{"kind":"Name","value":"enabled"},"value":{"kind":"Variable","name":{"kind":"Name","value":"enabled"}}}],"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"uuid"}},{"kind":"Field","name":{"kind":"Name","value":"enabled"}}]}}]}}]} as unknown as DocumentNode<SetClusterEnabledMutation, SetClusterEnabledMutationVariables>;
+export const DeleteClusterCacheDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"mutation","name":{"kind":"Name","value":"DeleteClusterCache"},"variableDefinitions":[{"kind":"VariableDefinition","variable":{"kind":"Variable","name":{"kind":"Name","value":"uuid"}},"type":{"kind":"NonNullType","type":{"kind":"NamedType","name":{"kind":"Name","value":"String"}}}}],"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"deleteClusterCache"},"arguments":[{"kind":"Argument","name":{"kind":"Name","value":"uuid"},"value":{"kind":"Variable","name":{"kind":"Name","value":"uuid"}}}]}]}}]} as unknown as DocumentNode<DeleteClusterCacheMutation, DeleteClusterCacheMutationVariables>;
+export const ClustersWatchDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"subscription","name":{"kind":"Name","value":"ClustersWatch"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"clustersWatch"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"uuid"}},{"kind":"Field","name":{"kind":"Name","value":"name"}},{"kind":"Field","name":{"kind":"Name","value":"context"}},{"kind":"Field","name":{"kind":"Name","value":"isCurrent"}},{"kind":"Field","name":{"kind":"Name","value":"enabled"}},{"kind":"Field","name":{"kind":"Name","value":"present"}},{"kind":"Field","name":{"kind":"Name","value":"cached"}},{"kind":"Field","name":{"kind":"Name","value":"cacheBytes"}},{"kind":"Field","name":{"kind":"Name","value":"lastSyncedAt"}},{"kind":"Field","name":{"kind":"Name","value":"lastSeenInKubeconfigAt"}}]}}]}}]} as unknown as DocumentNode<ClustersWatchSubscription, ClustersWatchSubscriptionVariables>;
 export const TickDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"subscription","name":{"kind":"Name","value":"Tick"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"tick"}}]}}]} as unknown as DocumentNode<TickSubscription, TickSubscriptionVariables>;
 export const KubeConfigWatchDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"subscription","name":{"kind":"Name","value":"KubeConfigWatch"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"kubeConfigWatch"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"type"}},{"kind":"Field","name":{"kind":"Name","value":"object"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"currentContext"}},{"kind":"Field","name":{"kind":"Name","value":"authInfos"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"name"}},{"kind":"Field","name":{"kind":"Name","value":"locationOfOrigin"}}]}},{"kind":"Field","name":{"kind":"Name","value":"clusters"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"name"}},{"kind":"Field","name":{"kind":"Name","value":"locationOfOrigin"}},{"kind":"Field","name":{"kind":"Name","value":"server"}}]}},{"kind":"Field","name":{"kind":"Name","value":"contexts"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"name"}},{"kind":"Field","name":{"kind":"Name","value":"locationOfOrigin"}},{"kind":"Field","name":{"kind":"Name","value":"cluster"}},{"kind":"Field","name":{"kind":"Name","value":"authInfo"}},{"kind":"Field","name":{"kind":"Name","value":"namespace"}}]}}]}}]}}]}}]} as unknown as DocumentNode<KubeConfigWatchSubscription, KubeConfigWatchSubscriptionVariables>;
 export const SyncStatusWatchDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"subscription","name":{"kind":"Name","value":"SyncStatusWatch"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"syncStatusWatch"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"state"}},{"kind":"Field","name":{"kind":"Name","value":"lastError"}},{"kind":"Field","name":{"kind":"Name","value":"lastSyncedAt"}},{"kind":"Field","name":{"kind":"Name","value":"retryAt"}}]}}]}}]} as unknown as DocumentNode<SyncStatusWatchSubscription, SyncStatusWatchSubscriptionVariables>;

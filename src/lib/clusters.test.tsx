@@ -24,19 +24,13 @@ const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
-const { formatDownloadRate, ClusterSyncProvider, useClusterSync } = await import('./cluster-sync');
+const { formatBytes, ClustersProvider, useClusters } = await import('./clusters');
 
 // Helpers -------------------------------------------------------------
 
 const flush = () => act(async () => {});
 
-type Row = {
-  context: string;
-  state: 'PENDING' | 'SYNCING' | 'LIVE' | 'BACKOFF' | 'OFFLINE';
-  lastError?: string;
-  lastSyncedAt?: number;
-  downloadRateBps?: number;
-};
+type Row = { uuid: string; name: string; enabled?: boolean; present?: boolean; cached?: boolean };
 
 function pushClusters(rows: Row[]) {
   liveChannel().onmessage!(
@@ -44,10 +38,15 @@ function pushClusters(rows: Row[]) {
       type: 'next',
       payload: {
         data: {
-          clusterSyncStatusWatch: rows.map((r) => ({
-            lastError: '',
+          clustersWatch: rows.map((r) => ({
+            context: r.name,
+            isCurrent: false,
+            enabled: true,
+            present: true,
+            cached: false,
+            cacheBytes: 0,
             lastSyncedAt: 0,
-            downloadRateBps: 0,
+            lastSeenInKubeconfigAt: 0,
             ...r,
           })),
         },
@@ -58,47 +57,47 @@ function pushClusters(rows: Row[]) {
 
 // A probe that renders the hook's value so tests can assert on it.
 function Probe() {
-  const { clusters } = useClusterSync();
-  return <div data-testid="probe">{clusters === null ? 'null' : JSON.stringify(clusters.map((c) => c.context))}</div>;
+  const { clusters } = useClusters();
+  return <div data-testid="probe">{clusters === null ? 'null' : JSON.stringify(clusters.map((c) => c.name))}</div>;
 }
 
 function renderProvider() {
   return render(
     <UrqlProvider value={createGraphqlClient()}>
-      <ClusterSyncProvider>
+      <ClustersProvider>
         <Probe />
-      </ClusterSyncProvider>
+      </ClustersProvider>
     </UrqlProvider>,
   );
 }
 
-// formatDownloadRate --------------------------------------------------
+// formatBytes ---------------------------------------------------------
 
-describe('formatDownloadRate', () => {
-  it('renders an em dash for an idle/zero rate', () => {
-    expect(formatDownloadRate(0)).toBe('—');
+describe('formatBytes', () => {
+  it('renders an em dash for an uncached/zero size', () => {
+    expect(formatBytes(0)).toBe('—');
   });
 
-  it('reports raw bytes/sec below 1 KiB (no decimals)', () => {
-    expect(formatDownloadRate(512)).toBe('512 B/s');
-    expect(formatDownloadRate(1)).toBe('1 B/s');
+  it('reports raw bytes below 1 KiB (no decimals)', () => {
+    expect(formatBytes(512)).toBe('512 B');
+    expect(formatBytes(1)).toBe('1 B');
   });
 
-  it('scales to KB/s, MB/s, GB/s with one decimal (binary base)', () => {
-    expect(formatDownloadRate(1536)).toBe('1.5 KB/s'); // 1.5 * 1024
-    expect(formatDownloadRate(5_000_000)).toBe('4.8 MB/s'); // 5e6 / 1024^2 ≈ 4.768
-    expect(formatDownloadRate(3 * 1024 ** 3)).toBe('3.0 GB/s');
+  it('scales to KB, MB, GB with one decimal (binary base)', () => {
+    expect(formatBytes(1536)).toBe('1.5 KB'); // 1.5 * 1024
+    expect(formatBytes(5_000_000)).toBe('4.8 MB'); // 5e6 / 1024^2 ≈ 4.768
+    expect(formatBytes(3 * 1024 ** 3)).toBe('3.0 GB');
   });
 
   it('crosses unit boundaries at 1024, not 1000', () => {
-    expect(formatDownloadRate(1023)).toBe('1023 B/s');
-    expect(formatDownloadRate(1024)).toBe('1.0 KB/s');
+    expect(formatBytes(1023)).toBe('1023 B');
+    expect(formatBytes(1024)).toBe('1.0 KB');
   });
 });
 
-// ClusterSyncProvider / useClusterSync --------------------------------
+// ClustersProvider / useClusters --------------------------------------
 
-describe('useClusterSync', () => {
+describe('useClusters', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     channels.length = 0;
@@ -115,10 +114,10 @@ describe('useClusterSync', () => {
 
   it('throws outside the provider', () => {
     function Bare() {
-      useClusterSync();
+      useClusters();
       return null;
     }
-    expect(() => render(<Bare />)).toThrow(/ClusterSyncProvider/);
+    expect(() => render(<Bare />)).toThrow(/ClustersProvider/);
   });
 
   it('reports null before the first push', async () => {
@@ -127,12 +126,12 @@ describe('useClusterSync', () => {
     expect(screen.getByTestId('probe')).toHaveTextContent('null');
   });
 
-  it('subscribes to clusterSyncStatusWatch', async () => {
+  it('subscribes to clustersWatch', async () => {
     renderProvider();
     await flush();
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_subscribe',
-      expect.objectContaining({ query: expect.stringContaining('clusterSyncStatusWatch') }),
+      expect.objectContaining({ query: expect.stringContaining('clustersWatch') }),
     );
   });
 
@@ -142,8 +141,8 @@ describe('useClusterSync', () => {
 
     await act(async () => {
       pushClusters([
-        { context: 'prod-us', state: 'LIVE' },
-        { context: 'staging', state: 'SYNCING', downloadRateBps: 1536 },
+        { uuid: 'u-a', name: 'prod-us' },
+        { uuid: 'u-b', name: 'staging', enabled: false },
       ]);
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us","staging"]');
