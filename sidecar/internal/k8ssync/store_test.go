@@ -3,23 +3,33 @@ package k8ssync
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustercache"
 )
 
-// migratedWriter opens a fresh, migrated per-cluster cache DB and returns its
-// writer pool. The cache is shut down on cleanup.
-func migratedWriter(t *testing.T) *sql.DB {
+// migratedCDB opens a fresh, migrated per-cluster cache DB. The cache is shut
+// down on cleanup.
+func migratedCDB(t *testing.T) *clustercache.ClusterDB {
 	t.Helper()
 	ctx := context.Background()
 	cache := clustercache.NewManager(t.TempDir(), nil)
 	cdb, err := cache.Open(ctx, "c1")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cache.Shutdown(ctx) })
-	return cdb.Writer()
+	return cdb
+}
+
+// migratedWriter opens a fresh, migrated per-cluster cache DB and returns its
+// writer pool. The cache is shut down on cleanup.
+func migratedWriter(t *testing.T) *sql.DB {
+	t.Helper()
+	return migratedCDB(t).Writer()
 }
 
 func insertObject(t *testing.T, w *sql.DB, uid, apiVersion, kind string) {
@@ -45,6 +55,67 @@ func countWhere(t *testing.T, w *sql.DB, table, col, val string) int {
 	require.NoError(t, w.QueryRow(
 		`SELECT COUNT(*) FROM `+table+` WHERE `+col+`=?`, val).Scan(&n))
 	return n
+}
+
+// raw_json is stored zlib-compressed, not as plaintext JSON: the stored cell
+// must be a zlib stream (first byte 0x78) that decompresses back to the exact
+// object JSON — never the readable plaintext. Both write paths (objects and
+// events) must hold this property.
+func TestStoresCompressedRawJSON(t *testing.T) {
+	cases := []struct {
+		name  string
+		table string
+		uid   string
+		obj   map[string]any
+		write func(ctx context.Context, cdb *clustercache.ClusterDB, u *unstructured.Unstructured) error
+	}{
+		{
+			name: "objects", table: "objects", uid: "pod-uid",
+			obj: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata":   map[string]any{"uid": "pod-uid", "name": "nginx", "namespace": "default"},
+				"spec":       map[string]any{"nodeName": "node-1"},
+			},
+			write: func(ctx context.Context, cdb *clustercache.ClusterDB, u *unstructured.Unstructured) error {
+				return newObjectsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, cdb.Writer(), cdb).upsert(u)
+			},
+		},
+		{
+			name: "events", table: "events", uid: "evt-uid",
+			obj: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Event",
+				"metadata":   map[string]any{"uid": "evt-uid", "name": "e1", "namespace": "default"},
+				"type":       "Warning",
+				"reason":     "BackOff",
+				"message":    "Back-off restarting failed container",
+			},
+			write: func(ctx context.Context, cdb *clustercache.ClusterDB, u *unstructured.Unstructured) error {
+				return newEventsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Event"}, cdb.Writer(), cdb).upsert(u)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			cdb := migratedCDB(t)
+			u := &unstructured.Unstructured{Object: tc.obj}
+			require.NoError(t, tc.write(ctx, cdb, u))
+			wantJSON, err := json.Marshal(u.Object)
+			require.NoError(t, err)
+
+			var cell []byte
+			require.NoError(t, cdb.Writer().QueryRowContext(ctx,
+				`SELECT raw_json FROM `+tc.table+` WHERE uid=?`, tc.uid).Scan(&cell))
+
+			require.NotEqual(t, wantJSON, cell, "raw_json must not be stored as plaintext")
+			require.Equal(t, byte(0x78), cell[0], "expected a zlib stream")
+			got, err := clustercache.DecompressRaw(cell)
+			require.NoError(t, err)
+			require.JSONEq(t, string(wantJSON), string(got))
+		})
+	}
 }
 
 // An uninstalled CRD's custom resources must be evicted from objects: no

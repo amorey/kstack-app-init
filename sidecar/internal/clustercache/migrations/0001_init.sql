@@ -50,7 +50,11 @@ CREATE TABLE cluster_meta (
 --   CRD         status: best-effort from .status.conditions[].type/status
 --                       (most CRDs follow the conditions convention)
 --
--- raw_json is the full object; kind-specific deep views render from it.
+-- raw_json is the full object; kind-specific deep views render from it. Stored
+-- zlib-compressed (see clustercache.CompressRaw/DecompressRaw) — a BLOB, not
+-- text. The format is self-identifying (a zlib stream begins with 0x78, plain
+-- JSON with '{' = 0x7B), so there is no version prefix yet; one can be added
+-- later without a migration.
 CREATE TABLE objects (
     uid              TEXT PRIMARY KEY,
     api_version      TEXT NOT NULL,
@@ -66,7 +70,7 @@ CREATE TABLE objects (
     total_count      INTEGER,
     restart_count    INTEGER,
     host             TEXT,
-    raw_json         TEXT NOT NULL
+    raw_json         BLOB NOT NULL    -- zlib-compressed object JSON
 );
 CREATE INDEX objects_kind_ns_name ON objects(kind, namespace, name);
 CREATE INDEX objects_kind_host    ON objects(kind, host);
@@ -110,7 +114,7 @@ CREATE TABLE events (
     first_seen    INTEGER,
     last_seen     INTEGER,
     count         INTEGER,
-    raw_json      TEXT NOT NULL,
+    raw_json      BLOB NOT NULL,    -- zlib-compressed event JSON
     updated_at    INTEGER NOT NULL
 );
 CREATE INDEX events_involved        ON events(involved_uid, last_seen DESC);

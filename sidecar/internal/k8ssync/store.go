@@ -205,6 +205,11 @@ func writeObjectRow(ctx context.Context, tx *sql.Tx, r ObjectRow) error {
 		}
 	}
 
+	rawJSON, err := clustercache.CompressRaw(r.RawJSON)
+	if err != nil {
+		return err
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO objects (
 			uid, api_version, kind, namespace, name,
@@ -229,7 +234,7 @@ func writeObjectRow(ctx context.Context, tx *sql.Tx, r ObjectRow) error {
 		r.UID, r.APIVersion, r.Kind, r.Namespace, r.Name,
 		r.ResourceVersion, r.Generation, r.CreatedAt, now,
 		nullIfEmpty(r.StatusSummary), nullableInt(r.ReadyCount), nullableInt(r.TotalCount), nullableInt(r.RestartCount), nullIfEmpty(r.Host),
-		string(r.RawJSON),
+		rawJSON,
 	); err != nil {
 		return err
 	}
@@ -401,17 +406,21 @@ func (s *eventsStore) Delete(obj any) error {
 	return nil
 }
 
-func (s *eventsStore) upsert(obj any) error {
-	u, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		return fmt.Errorf("eventsStore.upsert: %T", obj)
-	}
-	row, err := extractEvent(u)
+// execer is the subset of *sql.DB / *sql.Tx that insertEventRow needs, so the
+// incremental upsert (direct on the writer) and the relist Replace (inside a
+// txn) can share one INSERT.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// insertEventRow upserts one event, compressing raw_json. The single write
+// chokepoint for the events table — both event write paths route through it.
+func (s *eventsStore) insertEventRow(ex execer, row EventRow, now int64) error {
+	rawJSON, err := clustercache.CompressRaw(row.RawJSON)
 	if err != nil {
 		return err
 	}
-	now := time.Now().UnixMilli()
-	_, err = s.writer.ExecContext(s.ctx, `
+	_, err = ex.ExecContext(s.ctx, `
 		INSERT INTO events (
 			uid, involved_uid, involved_kind, involved_ns, involved_name,
 			type, reason, message, first_seen, last_seen, count, raw_json, updated_at
@@ -432,9 +441,21 @@ func (s *eventsStore) upsert(obj any) error {
 		row.UID, nullIfEmpty(row.InvolvedUID), nullIfEmpty(row.InvolvedKind),
 		nullIfEmpty(row.InvolvedNS), nullIfEmpty(row.InvolvedName),
 		nullIfEmpty(row.Type), nullIfEmpty(row.Reason), nullIfEmpty(row.Message),
-		nullableInt64(row.FirstSeen), nullableInt64(row.LastSeen), row.Count, string(row.RawJSON), now,
+		nullableInt64(row.FirstSeen), nullableInt64(row.LastSeen), row.Count, rawJSON, now,
 	)
 	return err
+}
+
+func (s *eventsStore) upsert(obj any) error {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return fmt.Errorf("eventsStore.upsert: %T", obj)
+	}
+	row, err := extractEvent(u)
+	if err != nil {
+		return err
+	}
+	return s.insertEventRow(s.writer, row, time.Now().UnixMilli())
 }
 
 // Replace prunes events that didn't appear in the LIST. Events are
@@ -457,29 +478,7 @@ func (s *eventsStore) Replace(items []any, resourceVersion string) error {
 		if err != nil {
 			continue
 		}
-		if _, err := tx.ExecContext(s.ctx, `
-			INSERT INTO events (
-				uid, involved_uid, involved_kind, involved_ns, involved_name,
-				type, reason, message, first_seen, last_seen, count, raw_json, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(uid) DO UPDATE SET
-				involved_uid=excluded.involved_uid,
-				involved_kind=excluded.involved_kind,
-				involved_ns=excluded.involved_ns,
-				involved_name=excluded.involved_name,
-				type=excluded.type,
-				reason=excluded.reason,
-				message=excluded.message,
-				first_seen=excluded.first_seen,
-				last_seen=excluded.last_seen,
-				count=excluded.count,
-				raw_json=excluded.raw_json,
-				updated_at=excluded.updated_at`,
-			row.UID, nullIfEmpty(row.InvolvedUID), nullIfEmpty(row.InvolvedKind),
-			nullIfEmpty(row.InvolvedNS), nullIfEmpty(row.InvolvedName),
-			nullIfEmpty(row.Type), nullIfEmpty(row.Reason), nullIfEmpty(row.Message),
-			nullableInt64(row.FirstSeen), nullableInt64(row.LastSeen), row.Count, string(row.RawJSON), now,
-		); err != nil {
+		if err := s.insertEventRow(tx, row, now); err != nil {
 			return err
 		}
 	}
