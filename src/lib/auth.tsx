@@ -12,124 +12,113 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// React-side session state. The renderer never holds tokens — it asks
-// the Rust host for the current session and triggers login/logout via
-// Tauri commands. The access token is fetched on demand by
-// request-issuing code (e.g. the urql fetch adapter), so it never
-// lingers in component state.
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+// React-side auth state, sourced entirely from the sidecar over GraphQL.
+// The renderer never holds tokens: the sidecar owns the OAuth flow + OS
+// keychain, and publishes the current auth state on the `authStateWatch`
+// subscription (current snapshot first, then deltas on sign-in / sign-out /
+// refresh). `login`/`logout` are thin `login`/`logout` mutations — the
+// resulting state change arrives back over the same subscription, so there's
+// one source of truth. Sign-in is non-blocking: the mutation returns as soon
+// as the sidecar opens the browser; the signed-in state lands later via the
+// subscription (or not at all if the user abandons the browser flow).
+import { createContext, useCallback, useContext, useMemo } from 'react';
+import { useMutation, useSubscription } from 'urql';
 
-import { errorMessage, reportError } from '@/lib/error-bus';
+import { graphql } from '@/gql';
+import type { AuthStateWatchSubscription } from '@/gql/graphql';
 
-export type Session = {
-  authenticated: boolean;
-  email: string | null;
-  name: string | null;
-  sub: string | null;
+// AuthState mirrors the sidecar's GraphQL shape: `authenticated` is the explicit
+// sign-in signal; `identity` carries the verified claims and is non-null only
+// when authenticated.
+export type Identity = {
+  sub: string;
+  email: string;
+  name: string;
 };
 
-const ANON_SESSION: Session = { authenticated: false, email: null, name: null, sub: null };
+export type AuthState = {
+  authenticated: boolean;
+  identity: Identity | null;
+};
 
-// Mirror of `auth::SESSION_RESOLVED_EVENT` in src-tauri. The host emits
-// exactly once at startup after `try_restore` resolves (success *or*
-// failure); the payload is the fresh session, so the renderer skips a
-// follow-up `auth_status` call. Not the OS power/network wake path.
-const SESSION_RESOLVED_EVENT = 'auth:session-resolved';
+const SIGNED_OUT: AuthState = { authenticated: false, identity: null };
 
-// Mirror of `auth::SESSION_CHANGED_EVENT` in src-tauri. The host broadcasts the
-// fresh session on every post-startup auth change (login / logout /
-// refresh) to *all* windows, so a logout in one window updates the
-// others instead of leaving them on a stale authenticated UI.
-const SESSION_CHANGED_EVENT = 'auth:session-changed';
+const AuthStateWatchSubscription = graphql(`
+  subscription AuthStateWatch {
+    authStateWatch {
+      authenticated
+      identity {
+        sub
+        email
+        name
+      }
+    }
+  }
+`);
 
-type SessionContextValue = {
-  session: Session;
+const StartLoginMutation = graphql(`
+  mutation StartLogin {
+    startLogin
+  }
+`);
+
+const LogoutMutation = graphql(`
+  mutation Logout {
+    logout
+  }
+`);
+
+type AuthStateContextValue = {
+  authState: AuthState;
   loading: boolean;
   login: () => Promise<void>;
   logout: () => Promise<void>;
 };
 
-const SessionContext = createContext<SessionContextValue | null>(null);
+const AuthStateContext = createContext<AuthStateContextValue | null>(null);
 
-function reportSessionError(action: string, e: unknown): void {
-  reportError({ source: 'auth', message: `${action}: ${errorMessage(e)}`, cause: e });
+// toAuthState adapts the GraphQL shape to the renderer's AuthState, mirroring its
+// nesting. Identity is null while signed out, so an absent identity reads as
+// anonymous regardless of the boolean.
+function toAuthState(s: AuthStateWatchSubscription['authStateWatch']): AuthState {
+  return {
+    authenticated: s.authenticated,
+    identity: s.identity ? { sub: s.identity.sub, email: s.identity.email, name: s.identity.name } : null,
+  };
 }
 
-export function SessionProvider({ children }: { children: React.ReactNode }) {
-  const [session, setSession] = useState<Session>(ANON_SESSION);
-  const [loading, setLoading] = useState(true);
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [{ data }] = useSubscription({ query: AuthStateWatchSubscription });
+  const [, runStartLogin] = useMutation(StartLoginMutation);
+  const [, runLogout] = useMutation(LogoutMutation);
 
-  useEffect(() => {
-    let cancelled = false;
-    const unlisteners: (() => void)[] = [];
+  // No frame yet → still loading, anonymous. Once the first snapshot lands the
+  // state reflects it (the sidecar always emits a current snapshot first).
+  const authState = data ? toAuthState(data.authStateWatch) : SIGNED_OUT;
+  const loading = data === undefined;
 
-    const settle = (s: Session) => {
-      if (cancelled) return;
-      setSession(s);
-      setLoading(false);
-    };
-
-    // Tauri events are not buffered, so an event that fires between mount
-    // and `listen()` resolving would be lost. Order matters: register the
-    // subscriptions first, *then* fetch — guarantees we either see the
-    // restore event or read the post-restore session directly. The
-    // session-changed listener stays mounted for the provider's whole
-    // life: unlike the one-shot restore, auth changes keep arriving.
-    (async () => {
-      try {
-        const offRestore = await listen<Session>(SESSION_RESOLVED_EVENT, (e) => settle(e.payload));
-        const offSession = await listen<Session>(SESSION_CHANGED_EVENT, (e) => settle(e.payload));
-        if (cancelled) {
-          offRestore();
-          offSession();
-          return;
-        }
-        unlisteners.push(offRestore, offSession);
-        const s = await invoke<Session>('auth_status');
-        settle(s);
-      } catch (e) {
-        reportSessionError('init', e);
-        settle(ANON_SESSION);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      unlisteners.forEach((off) => off());
-    };
-  }, []);
-
+  // login/logout just fire the mutations; the resulting state arrives over the
+  // subscription. Mutation/transport errors are reported to the error bus by the
+  // GraphQL error exchange — here we only surface them to callers (ProfileMenu
+  // swallows them). The eventual outcome of the async browser sign-in is not a
+  // mutation error; it shows up as an auth-state change (or stays signed-out).
   const login = useCallback(async () => {
-    try {
-      const s = await invoke<Session>('auth_login');
-      setSession(s);
-    } catch (e) {
-      // A newer login click cancelled this attempt — expected, not a failure.
-      if (errorMessage(e).includes('superseded')) return;
-      reportSessionError('login', e);
-      throw e;
-    }
-  }, []);
+    const res = await runStartLogin({});
+    if (res.error) throw res.error;
+  }, [runStartLogin]);
 
   const logout = useCallback(async () => {
-    try {
-      await invoke('auth_logout');
-      setSession(ANON_SESSION);
-    } catch (e) {
-      reportSessionError('logout', e);
-      throw e;
-    }
-  }, []);
+    const res = await runLogout({});
+    if (res.error) throw res.error;
+  }, [runLogout]);
 
-  const value = useMemo(() => ({ session, loading, login, logout }), [session, loading, login, logout]);
+  const value = useMemo(() => ({ authState, loading, login, logout }), [authState, loading, login, logout]);
 
-  return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
+  return <AuthStateContext.Provider value={value}>{children}</AuthStateContext.Provider>;
 }
 
-export function useSession(): SessionContextValue {
-  const ctx = useContext(SessionContext);
-  if (!ctx) throw new Error('useSession must be used inside <SessionProvider>');
+export function useAuthState(): AuthStateContextValue {
+  const ctx = useContext(AuthStateContext);
+  if (!ctx) throw new Error('useAuthState must be used inside <AuthProvider>');
   return ctx;
 }

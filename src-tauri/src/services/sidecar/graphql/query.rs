@@ -166,11 +166,8 @@ impl QueryClient {
 
         let req = Request::builder()
             .method("POST")
-            // Sidecar exposes GraphQL at `/graphql` (server.go:66; mirrors
-            // its own test at server_test.go:199). The mux happens to
-            // wildcard unknown paths to the same handler, but `/graphql`
-            // is the contract — `/control/*` is reserved for host↔sidecar
-            // signals.
+            // Sidecar exposes GraphQL at `/graphql` (server.go; mirrors its
+            // own test at server_test.go). That path is the contract.
             .uri("/graphql")
             // hyper requires a Host header on HTTP/1.1 requests, even when
             // the underlying transport (UDS) makes it semantically empty.

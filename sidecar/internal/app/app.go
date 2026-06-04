@@ -1,174 +1,138 @@
 // Package app is the sidecar's composition root and lifecycle owner. It builds
-// the engine-shared instances (store, hub, sync engine, creds, kube-config
-// watcher), wires the GraphQL and gRPC servers, and multiplexes them onto one
-// h2c handler. main() stays thin: it binds the listener and drives the shutdown
-// surface this package exposes — NotifyShutdown / DrainWithContext / Close —
-// mirroring the server/app split used across the kubetail and kstack-cloud
-// services.
+// the shared instances (the kube-config watcher and, when a data dir is given,
+// the cluster-cache service), wires the GraphQL and gRPC servers, and
+// multiplexes them onto one h2c handler. main() stays thin: it binds the
+// listener and drives the shutdown surface this package exposes — NotifyShutdown
+// / DrainWithContext / Close — mirroring the server/app split used across the
+// kubetail and kstack-cloud services.
 package app
 
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"net/http"
-	"path/filepath"
-	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
 	grpcserver "github.com/kubetail-org/kstack-app/sidecar/grpc"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/appdb"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/authcreds"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustercache"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clusterdata"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clusterregistry"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/k8ssync"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
+
+// defaultKeychainService is the OS-keychain service name the sidecar stores the
+// auth token under when Config.KeychainService is empty. It is a product-level,
+// frontend-neutral name (not the desktop app's): the sidecar owns the one
+// credential and future frontends — e.g. a TUI — read it through the sidecar
+// under this same name. The host overrides it (via env) to a dev-specific name
+// in development builds so a dev run and an installed release don't share — and
+// clobber — the same stored sign-in.
+const defaultKeychainService = "Kstack"
 
 // Config is the subset of process configuration the composition root needs.
 // main() resolves these from flags/env and hands them over.
 type Config struct {
-	// CloudURL is the kstack cloud base URL (without /graphql); the cloud
-	// client appends the path itself.
-	CloudURL string
-	// PrefsPath is the local preferences cache file; the engine derives its
-	// sync state files alongside it. Empty falls back to server.DefaultPrefsPath().
-	PrefsPath string
 	// KubeconfigPath is an explicit kubeconfig path; empty uses clientcmd's
 	// default-loading rules.
 	KubeconfigPath string
 	// DataDir is the host-supplied per-machine app data dir for the per-cluster
 	// SQLite cache. Empty disables the cluster cache (standalone/dev/test runs);
-	// the cluster-data resolvers then degrade to empty results.
+	// the cluster-data resolvers then degrade to empty results. It also holds the
+	// cloud settings-sync file/queue when cloud is configured.
 	DataDir string
+	// CloudURL is the kstack-cloud API base URL. Empty disables the cloud account
+	// subsystem (standalone/dev/test runs ⇒ signed-out, no network).
+	CloudURL string
+	// OAuthIssuerURL is the Hydra OAuth issuer base URL. The auth service derives
+	// every endpoint (authorize/token/jwks/revocation) from it, baking in Hydra's
+	// standard path layout, so only the issuer + client id need to be configured.
+	OAuthIssuerURL string
+	// OAuthClientID is the public (PKCE/loopback) OAuth client id.
+	OAuthClientID string
+	// KeychainService is the OS-keychain service name the auth token is stored
+	// under. Empty uses defaultKeychainService; the host sets a dev-specific name
+	// in development so dev and release runs don't share the same keychain entry.
+	KeychainService string
 }
 
 // App owns the composed sidecar: one h2c handler fronting the GraphQL and gRPC
-// servers, plus the sync engine and kube-config watcher they share. It is an
-// http.Handler; main() mounts it on the listener.
+// servers, plus the cluster-cache service and kube-config watcher they share. It
+// is an http.Handler; main() mounts it on the listener.
 type App struct {
-	handler http.Handler
-	graphql *graph.Server
-	grpcSrv *grpcserver.Server
-	watcher *k8shelpers.KubeConfigWatcher
-	engine  *prefsync.Engine
-
-	// clusterCache + coordinator + appDB are nil when no DataDir was supplied.
-	clusterCache *clustercache.Manager
-	coordinator  *k8ssync.Coordinator
-	appDB        *appdb.DB
-
-	engineCancel context.CancelFunc
-	engineDone   chan struct{}
+	handler           http.Handler
+	graphqlServer     *graph.Server
+	grpcServer        *grpcserver.Server
+	kubeConfigWatcher *k8shelpers.KubeConfigWatcher
+	clusterSvc        *cluster.Service
+	authSvc           auth.Service
+	cloudSvc          *cloud.Service
 }
 
-// New builds the composition root. The engine must exist before the Resolver
-// (it is the syncStatus source) yet needs the credential Holder, so this
-// function owns the shared instances and threads them both ways — the cycle
-// only the composition root can break. The kube-config watcher is shared by the
+// New builds the composition root. The kube-config watcher is shared by the
 // GraphQL resolver and the gRPC KubeContextService, so a context switch over
 // either transport fans out to both.
 func New(cfg Config) (*App, error) {
-	prefsPath := cfg.PrefsPath
-	if prefsPath == "" {
-		prefsPath = DefaultPrefsPath()
-	}
-
-	syncStore := syncstore.NewStore[prefs.Settings](SyncPath(prefsPath, "settings.json"))
-	hub := prefs.NewHub()
-	creds := authcreds.NewHolder()
-	cloudClient := cloud.New(cfg.CloudURL)
-	queue := mutationqueue.New(SyncPath(prefsPath, "mutations.json"))
-
 	// Always non-nil: the watcher tolerates missing/malformed kubeconfigs and
 	// seeds with an empty *api.Config so resolvers stay safe. Only fatal here is
 	// a kernel-level fsnotify failure (ENOMEM, ulimit).
-	watcher, err := k8shelpers.NewKubeConfigWatcher(cfg.KubeconfigPath)
+	kubeConfigWatcher, err := k8shelpers.NewKubeConfigWatcher(cfg.KubeconfigPath)
 	if err != nil {
 		return nil, err
 	}
 
-	engine := prefsync.New(
-		prefsync.NewCloudUpstream(cloudClient, creds),
-		syncStore,
-		hub,
-		prefsync.Options{
-			// Drain offline-queued mutations whenever the upstream is healthy. A
-			// failed drain stays queued and retries on the next Live via the
-			// engine's own reconnect/backoff.
-			OnConnected: func(ctx context.Context) {
-				if err := queue.Drain(ctx, func(ctx context.Context, in cloud.UpdateInput) error {
-					_, err := cloudClient.UpdateSettings(ctx, creds.Token(), in)
-					return err
-				}); err != nil {
-					slog.Debug("mutation queue drain failed", "err", err)
-				}
-			},
-		},
-	)
-
-	// Per-cluster SQLite cache. Only when the host supplied a data dir: build the
-	// registry, the durable cluster store (a versioned JSON index of every cluster
-	// we've seen), and a coordinator that keeps both in lockstep with the
-	// kube-config watcher (discover/identify clusters, open enabled ones, freeze
-	// disabled ones, surface orphaned caches). The reader is the resolver's read
-	// side; the coordinator is the cluster registry + enable/delete control
-	// surface. All nil when DataDir is empty, in which case the cluster resolvers
-	// degrade to empty results.
-	var (
-		clusterCache   *clustercache.Manager
-		coordinator    *k8ssync.Coordinator
-		clusterManager k8ssync.Manager
-		appDB          *appdb.DB
-	)
-	if cfg.DataDir != "" {
-		clusterCache = clustercache.NewManager(cfg.DataDir, nil)
-		db, err := appdb.Open(filepath.Join(cfg.DataDir, "app.db"))
-		if err != nil {
-			return nil, err
-		}
-		appDB = db
-		store := clusterregistry.New(db.SQL())
-		coordinator = k8ssync.NewCoordinator(clusterCache, watcher, store)
-		clusterManager = coordinator
+	// The cluster-cache service owns the per-cluster SQLite cache, the durable
+	// registry, and the coordinator that keeps both in lockstep with the
+	// kube-config watcher. Enabled only when the host supplied a data dir; with
+	// an empty DataDir it degrades to a Reader that yields empty results and a
+	// nil ClusterManager, so the cluster resolvers stay safe.
+	clusterSvc, err := cluster.New(cfg.DataDir, kubeConfigWatcher)
+	if err != nil {
+		return nil, err
 	}
-	// The Reader is always non-nil and tolerates a nil registry (no --data-dir),
-	// so the cluster-data resolvers can call it unconditionally — nil-tolerance
-	// lives in one place rather than at every resolver.
-	clusterReader := clusterdata.NewReader(clusterCache)
 
-	// The Resolver reads the same syncstore the engine maintains, subscribes the
-	// Hub it publishes to, exposes its Status (Sync), and write-throughs settings
-	// via the shared cloud client; the KubeConfigWatcher is shared with the gRPC
-	// KubeContextService so a context switch over either transport fans out to both.
-	graphql := graph.NewServer(&graph.Resolver{
-		Cloud:             cloudClient,
-		Store:             syncStore,
-		Hub:               hub,
-		Sync:              engine,
-		Queue:             queue,
-		KubeConfigWatcher: watcher,
-		ClusterData:       clusterReader,
-		ClusterManager:    clusterManager,
+	// The local-first auth/identity service. The sidecar owns the OS keychain
+	// directly (loopback OAuth already pins the browser to this machine), so we
+	// hand auth a keychain service name and it builds its own keyring store — no
+	// host channel. auth.New degrades when neither a service name nor a store is
+	// given (we always pass a name here, so it's signed-out until the user signs
+	// in); its Session surface is always non-nil and safe.
+	keychainService := cfg.KeychainService
+	if keychainService == "" {
+		keychainService = defaultKeychainService
+	}
+	authSvc, err := auth.New(auth.Config{
+		IssuerURL:       cfg.OAuthIssuerURL,
+		ClientID:        cfg.OAuthClientID,
+		KeychainService: keychainService,
 	})
-	grpcSrv := grpcserver.NewServer(watcher)
+	if err != nil {
+		return nil, err
+	}
 
-	// Routing: the GraphQL server at /graphql, the host-only control endpoints
-	// alongside it. The credential push writes the same Holder the engine
-	// authenticates with; /control/wake triggers an immediate engine resync.
+	// The cloud-synced settings service depends on auth (for the token source and
+	// the session change signal). It degrades when CloudURL/DataDir are empty
+	// (standalone/test runs ⇒ no settings sync).
+	cloudSvc, err := cloud.New(cfg.DataDir, cfg.CloudURL, authSvc)
+	if err != nil {
+		return nil, err
+	}
+
+	// The KubeConfigWatcher is shared with the gRPC KubeContextService so a
+	// context switch over either transport fans out to both.
+	graphqlServer := graph.NewServer(&graph.Resolver{
+		KubeConfigWatcher: kubeConfigWatcher,
+		ClusterData:       clusterSvc.Reader(),
+		ClusterManager:    clusterSvc.Manager(),
+		Auth:              authSvc,
+	})
+	grpcServer := grpcserver.NewServer(kubeConfigWatcher)
+
+	// Routing: the GraphQL server at /graphql.
 	mux := http.NewServeMux()
-	mux.Handle("/control/credentials", controlCredentials(creds))
-	mux.Handle("/control/wake", controlWake(engine.Poke))
-	mux.Handle("/graphql", graphql)
+	mux.Handle("/graphql", graphqlServer)
 
 	// gRPC (host-internal control channel) shares the socket with GraphQL via
 	// h2c. The dispatcher routes requests matching grpcserver.IsGRPCRequest
@@ -180,21 +144,20 @@ func New(cfg Config) (*App, error) {
 	// keeps its Flusher-backed writer and streams unbuffered.
 	handler := h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if grpcserver.IsGRPCRequest(r) {
-			grpcSrv.GRPC().ServeHTTP(w, r)
+			grpcServer.GRPC().ServeHTTP(w, r)
 			return
 		}
 		mux.ServeHTTP(w, r)
 	}), &http2.Server{})
 
 	return &App{
-		handler:      handler,
-		graphql:      graphql,
-		grpcSrv:      grpcSrv,
-		watcher:      watcher,
-		engine:       engine,
-		clusterCache: clusterCache,
-		coordinator:  coordinator,
-		appDB:        appDB,
+		handler:           handler,
+		graphqlServer:     graphqlServer,
+		grpcServer:        grpcServer,
+		kubeConfigWatcher: kubeConfigWatcher,
+		clusterSvc:        clusterSvc,
+		authSvc:           authSvc,
+		cloudSvc:          cloudSvc,
 	}, nil
 }
 
@@ -203,23 +166,12 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.handler.ServeHTTP(w, r)
 }
 
-// Start launches the sync engine, bound to a context derived from ctx so a
-// cancel of ctx (or Close) stops it. Call once, before serving.
+// Start launches the cluster-cache service's reconcile loop, bound to a context
+// derived from ctx so a cancel of ctx (or Close) stops it. Call once, before
+// serving.
 func (a *App) Start(ctx context.Context) {
-	ctx, cancel := context.WithCancel(ctx)
-	a.engineCancel = cancel
-	a.engineDone = make(chan struct{})
-	go func() {
-		a.engine.Run(ctx)
-		close(a.engineDone)
-	}()
-	// The coordinator reconciles the cluster cache against the kube-config
-	// watcher for the app's lifetime; it stops when this ctx is cancelled (by
-	// Close or a parent cancel). Per-cluster sync goroutines it opens are torn
-	// down by clusterCache.Shutdown in Close.
-	if a.coordinator != nil {
-		go a.coordinator.Run(ctx)
-	}
+	a.clusterSvc.Start(ctx)
+	a.cloudSvc.Start(ctx)
 }
 
 // NotifyShutdown signals both transports' long-lived streams to close cleanly:
@@ -228,8 +180,8 @@ func (a *App) Start(ctx context.Context) {
 // the moment Shutdown begins. The two transports are independent — neither
 // ordering nor BaseContext is involved — so a single fan-out is safe.
 func (a *App) NotifyShutdown() {
-	a.grpcSrv.NotifyShutdown()
-	a.graphql.NotifyShutdown()
+	a.grpcServer.NotifyShutdown()
+	a.graphqlServer.NotifyShutdown()
 }
 
 // DrainWithContext waits for both transports' handlers to unwind (so their
@@ -239,42 +191,21 @@ func (a *App) NotifyShutdown() {
 // Shutdown does not track.
 func (a *App) DrainWithContext(ctx context.Context) error {
 	errs := make(chan error, 2)
-	go func() { errs <- a.graphql.DrainWithContext(ctx) }()
-	go func() { errs <- a.grpcSrv.DrainWithContext(ctx) }()
+	go func() { errs <- a.graphqlServer.DrainWithContext(ctx) }()
+	go func() { errs <- a.grpcServer.DrainWithContext(ctx) }()
 	return errors.Join(<-errs, <-errs)
 }
 
 // Close releases resources after DrainWithContext returns: it stops the gRPC
-// transports, stops the sync engine (bounded so a wedged engine can't hang
-// exit), and closes the kube-config watcher. Safe to call without Start.
+// transports, closes the cluster-cache service (which stops the coordinator,
+// drains the per-cluster cache, and closes app.db), and closes the kube-config
+// watcher. The service is closed before the watcher so the coordinator's
+// reconcile loop — the watcher's only subscriber here — has stopped before its
+// source goes away. Safe to call without Start.
 func (a *App) Close() error {
-	a.grpcSrv.Stop()
-	if a.engineCancel != nil {
-		a.engineCancel()
-		select {
-		case <-a.engineDone:
-		case <-time.After(2 * time.Second):
-			slog.Warn("sync engine did not stop within 2s")
-		}
-	}
-	// Shut down every per-cluster sync goroutine + DB pool. The engineCancel
-	// above already stopped the coordinator's reconcile loop, so no new clusters
-	// can open while this drains. Bounded so a wedged sync can't hang exit.
-	if a.clusterCache != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := a.clusterCache.Shutdown(shutdownCtx); err != nil {
-			slog.Warn("cluster cache shutdown", "err", err)
-		}
-		cancel()
-	}
-	a.watcher.Close()
-	// Finally release the app.db handle. Done last so the cluster cache's
-	// per-cluster sync goroutines and any in-flight reconcile (driven by the
-	// engineCancel'd coordinator + now-closed watcher) have stopped writing to it.
-	if a.appDB != nil {
-		if err := a.appDB.Close(); err != nil {
-			slog.Warn("app db close", "err", err)
-		}
-	}
-	return nil
+	a.grpcServer.Stop()
+	cloudErr := a.cloudSvc.Close()
+	clusterErr := a.clusterSvc.Close()
+	a.kubeConfigWatcher.Close()
+	return errors.Join(cloudErr, clusterErr)
 }

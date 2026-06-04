@@ -13,26 +13,9 @@ import (
 	"github.com/99designs/gqlgen/graphql/handler/transport"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clusterdata"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clusterdata"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
 )
-
-// noopStatus is the default StatusSource when a Resolver is built without one
-// (bare resolvers in tests / surfaces that don't run the engine): it reports
-// Offline and an already-closed watch, so syncStatus/syncStatusWatch degrade
-// gracefully instead of nil-panicking. Production always wires the engine.
-type noopStatus struct{}
-
-func (noopStatus) Status() prefsync.Status {
-	return prefsync.Status{State: prefsync.StateOffline}
-}
-
-func (noopStatus) WatchStatus() (<-chan prefsync.Status, func()) {
-	ch := make(chan prefsync.Status)
-	close(ch)
-	return ch, func() {}
-}
 
 // Server is the GraphQL surface: the gqlgen handler plus the shutdown lifecycle
 // the app layer drives. It owns a shutdownCh that NotifyShutdown closes to end
@@ -53,12 +36,9 @@ type Server struct {
 }
 
 // NewServer builds the GraphQL server around a fully-constructed Resolver. A
-// bare Resolver (nil Sync) is tolerated — syncStatus degrades to Offline rather
-// than panicking — so tests can stand up a minimal surface.
+// bare Resolver is tolerated — the optional cluster deps degrade to empty
+// results rather than panicking — so tests can stand up a minimal surface.
 func NewServer(r *Resolver) *Server {
-	if r.Sync == nil {
-		r.Sync = noopStatus{}
-	}
 	// Keep the cluster-data resolvers nil-safe for a bare &Resolver{} (tests /
 	// minimal surfaces): a Reader over a nil registry returns empty snapshots
 	// and closed watch channels. ClusterProvider stays nil — its resolver guards
@@ -106,17 +86,13 @@ func NewServer(r *Resolver) *Server {
 }
 
 // ServeHTTP runs the GraphQL handler, tracking every request so DrainWithContext
-// can wait for in-flight handlers. It lifts the Authorization header off the
-// request into the context resolvers see (keeping them HTTP-transport-agnostic),
-// the single auth path shared by queries, mutations, and SSE. SSE subscriptions
-// (the only long-lived requests) additionally get a context cancelled when the
-// server shuts down, so gqlgen flushes their terminal `event: complete` instead
-// of the stream being cut mid-frame.
+// can wait for in-flight handlers. SSE subscriptions (the only long-lived
+// requests) get a context cancelled when the server shuts down, so gqlgen
+// flushes their terminal `event: complete` instead of the stream being cut
+// mid-frame.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.wg.Add(1)
 	defer s.wg.Done()
-
-	r = r.WithContext(WithRequestContext(r.Context(), r))
 
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		ctx, cancel := context.WithCancel(r.Context())

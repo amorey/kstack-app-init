@@ -5,9 +5,9 @@
 // value — callers treat "no file yet" as "nothing cached".
 //
 // The functions are not internally synchronized. Callers that allow
-// concurrent writers serialize them (the prefs and syncstore Stores each
-// hold a sync.Mutex); the temp+rename then guarantees every on-disk state
-// is a complete document, with last-writer-wins between racing Saves.
+// concurrent writers must serialize them (e.g. behind a sync.Mutex); the
+// temp+rename then guarantees every on-disk state is a complete document,
+// with last-writer-wins between racing Saves.
 package atomicjson
 
 import (

@@ -35,11 +35,6 @@ func main() {
 	slog.SetDefault(logging.Init(os.Stderr, logging.ParseLevel(os.Getenv("KSTACK_LOG_LEVEL"))))
 
 	sockPath := flag.String("socket", ipc.DefaultSocketPath(), "path to the IPC endpoint (Unix domain socket on Unix, named pipe on Windows) to listen on")
-	// Default points at production; override via env (or --cloud-url) for
-	// local dev. The cloud GraphQL client appends `/graphql` itself, so
-	// callers only ever name the host.
-	cloudURL := flag.String("cloud-url", envOr("KSTACK_CLOUD_URL", "https://api.kstack.sh"), "base URL of the kstack cloud (without /graphql)")
-	prefsPath := flag.String("prefs-path", app.DefaultPrefsPath(), "path to the local preferences cache file")
 	kubeconfigPath := flag.String("kubeconfig", "", "explicit kubeconfig path; empty uses the clientcmd default-loading rules ($KUBECONFIG / ~/.kube/config)")
 	// The Tauri host passes its app_local_data_dir() here so per-cluster SQLite
 	// caches land in the OS-correct per-machine data location. Standalone runs
@@ -61,16 +56,25 @@ func main() {
 	slog.Info("sidecar starting",
 		"socket", *sockPath,
 		"pid", os.Getpid(),
-		"cloud_url", *cloudURL,
-		"prefs_path", *prefsPath,
 		"data_dir", *dataDir,
 	)
 
+	// Cloud account config. CloudURL and the OAuth issuer default to the kstack
+	// production endpoints so a release build is signed-in-capable out of the box;
+	// both are env-overridable to point dev/staging at a different backend. The
+	// OAuth client is a public PKCE/loopback client (no secret) and the endpoints
+	// are public, so baking the defaults into the binary leaks nothing. auth
+	// derives Hydra's standard endpoint paths from the issuer base.
 	application, err := app.New(app.Config{
-		CloudURL:       *cloudURL,
-		PrefsPath:      *prefsPath,
 		KubeconfigPath: *kubeconfigPath,
 		DataDir:        *dataDir,
+		CloudURL:       envOr("KSTACK_CLOUD_URL", "https://api.kstack.sh"),
+		OAuthIssuerURL: envOr("KSTACK_OAUTH_ISSUER", "https://oauth.kstack.sh"),
+		OAuthClientID:  envOr("KSTACK_OAUTH_CLIENT_ID", "kstack-desktop"),
+		// Empty in a normal release run ⇒ the "Kstack" default. The host sets
+		// this to a dev-specific name in development so a dev sign-in and an
+		// installed release don't share one keychain entry.
+		KeychainService: os.Getenv("KSTACK_KEYCHAIN_SERVICE"),
 	})
 	if err != nil {
 		slog.Error("app init", "err", err)

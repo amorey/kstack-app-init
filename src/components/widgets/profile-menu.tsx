@@ -30,7 +30,7 @@ import {
   DropdownMenuTrigger,
 } from '@kubetail/ui/elements/dropdown-menu';
 
-import { useSession } from '@/lib/auth';
+import { useAuthState } from '@/lib/auth';
 
 function initials(s: string): string {
   // Two letters max. Splits on whitespace and common separators so an
@@ -43,29 +43,32 @@ function initials(s: string): string {
 }
 
 export function ProfileMenu() {
-  const { session, loading, login, logout } = useSession();
-  const label = session.email ?? session.name ?? null;
+  const { authState, loading, login, logout } = useAuthState();
+  const { authenticated, identity } = authState;
+  // Identity.email/name are non-null strings (empty = absent), so fall back with
+  // `||` rather than `??`.
+  const label = identity?.email || identity?.name || null;
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        aria-label={session.authenticated ? `Account: ${label ?? 'signed in'}` : 'Sign in'}
+        aria-label={authenticated ? `Account: ${label ?? 'signed in'}` : 'Sign in'}
         className="rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <Avatar size="sm">
           <AvatarFallback>
-            {session.authenticated && label ? initials(label) : <User className="size-4" aria-hidden />}
+            {authenticated && label ? initials(label) : <User className="size-4" aria-hidden />}
           </AvatarFallback>
         </Avatar>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" sideOffset={6} className="min-w-48">
         <DropdownMenuGroup>
-          {session.authenticated ? (
+          {authenticated ? (
             <>
               <DropdownMenuLabel className="flex flex-col font-normal">
-                <span className="text-sm font-medium">{session.name ?? session.email ?? 'Signed in'}</span>
-                {session.name && session.email ? (
-                  <span className="text-xs text-muted-foreground">{session.email}</span>
+                <span className="text-sm font-medium">{identity?.name || identity?.email || 'Signed in'}</span>
+                {identity?.name && identity?.email ? (
+                  <span className="text-xs text-muted-foreground">{identity.email}</span>
                 ) : null}
               </DropdownMenuLabel>
               <DropdownMenuSeparator />

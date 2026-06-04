@@ -11,7 +11,7 @@
 // pure data-access layers over the shared handle and add their tables as new
 // numbered migrations here. The per-cluster caches under clusters/ are a
 // different story — one file per cluster, each its own sequence — and stay owned
-// by internal/clustercache.
+// by internal/cluster/clustercache.
 //
 // app.db deliberately lives outside the clusters/ dir so the per-cluster cache
 // scan never mistakes it for a <uuid>.db cache. The pool is a single-connection

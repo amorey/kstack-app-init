@@ -46,20 +46,6 @@ pub enum AppError {
     #[error("shell error: {0}")]
     Shell(#[from] tauri_plugin_shell::Error),
 
-    /// An OAuth/OIDC protocol or flow failure that has no dedicated source
-    /// type — a cancelled login, a CSRF `state` mismatch, a token exchange or
-    /// revocation error, a malformed callback or ID token, and so on.
-    #[error("auth error: {0}")]
-    Auth(String),
-
-    /// A failure accessing the OS keychain where OAuth tokens are stored.
-    #[error("keyring error: {0}")]
-    Keyring(#[from] keyring_core::Error),
-
-    /// An HTTP client failure.
-    #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
-
     /// A JSON (de)serialization failure.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),

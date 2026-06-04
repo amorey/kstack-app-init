@@ -26,8 +26,7 @@
 //! - [`commands`] — `#[tauri::command]` handlers invoked from the webview.
 //! - `dock_menu` — custom macOS Dock menu (macOS only).
 //! - [`error`] — the host-wide [`AppError`](error::AppError) type.
-//! - [`services`] — long-lived services: the [`SidecarService`] and the
-//!   OAuth [`AuthService`].
+//! - [`services`] — long-lived services: the [`SidecarService`].
 //! - [`state`] — the Tauri-managed [`AppState`].
 //! - [`tray`] — the system tray icon, menu, and live context subscription.
 //! - [`window_manager`] — window creation and focus.
@@ -52,7 +51,6 @@ use std::time::Duration;
 use tauri::{Manager, RunEvent};
 use tokio_util::sync::CancellationToken;
 
-use crate::services::auth::{AuthConfig, AuthService};
 use crate::services::sidecar::SidecarService;
 use crate::state::AppState;
 use crate::window_manager::WindowManager;
@@ -63,7 +61,7 @@ use crate::window_manager::WindowManager;
 /// `main.go`); this allows for that plus a margin.
 const SIDECAR_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
 
-/// Process-global setup: logging and the OS keychain store.
+/// Process-global setup: logging.
 ///
 /// Run once at the very start of [`run`], before the Tauri builder. Kept here
 /// (rather than in `main`) so it also covers the mobile entry point.
@@ -76,13 +74,6 @@ fn init_process() {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
-
-    // Register the OS keychain as keyring's default store (OAuth tokens are
-    // persisted there). Non-fatal on failure: auth still works in-memory for
-    // the session, it just will not survive a restart.
-    if let Err(err) = keyring::use_native_store(true) {
-        tracing::warn!(%err, "failed to initialize the OS keychain");
-    }
 }
 
 /// Routes Unix termination signals into the same graceful-exit path as an
@@ -183,9 +174,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
-            commands::auth_login,
-            commands::auth_logout,
-            commands::auth_status,
             commands::ready,
             commands::graphql_query,
             commands::graphql_subscribe,
@@ -197,17 +185,12 @@ pub fn run() {
             // Initialize dependencies
             let sidecar = SidecarService::spawn(app.handle())?;
             let window_manager = WindowManager::new();
-            let auth = AuthService::new(AuthConfig::from_env());
 
             app.manage(AppState {
                 sidecar,
                 window_manager,
-                auth,
                 shutdown: CancellationToken::new(),
             });
-
-            // Restore any persisted OAuth session in the background.
-            AuthService::spawn_restore(app.handle());
 
             // Build menu and tray
             app_menu::build_app_menu(app.handle())?;

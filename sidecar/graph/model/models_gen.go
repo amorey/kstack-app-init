@@ -9,6 +9,12 @@ import (
 	"strconv"
 )
 
+// A snapshot of the user's authentication state. `authenticated` is the explicit sign-in signal; `identity` carries the verified claims and is non-null only when `authenticated` is true.
+type AuthState struct {
+	Authenticated bool      `json:"authenticated"`
+	Identity      *Identity `json:"identity,omitempty"`
+}
+
 // Streaming chat chunk. `delta` is the next piece of assistant text; `done` is true on the final frame (delta may be empty).
 type ChatChunk struct {
 	Delta string `json:"delta"`
@@ -71,6 +77,13 @@ type Event struct {
 	Count             int    `json:"count"`
 }
 
+// The verified identity of the signed-in user, from the OIDC ID-token claims.
+type Identity struct {
+	Sub   string `json:"sub"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+}
+
 type KubeConfigWatchEvent struct {
 	Type   WatchEventType `json:"type"`
 	Object *KubeConfig    `json:"object,omitempty"`
@@ -113,88 +126,7 @@ type Service struct {
 	UpdatedAt   int    `json:"updatedAt"`
 }
 
-// User-scoped preferences synced through the kstack cloud. Today this is a single free-form `placeholder` string — extend as the product grows.
-type Settings struct {
-	Placeholder string `json:"placeholder"`
-}
-
 type Subscription struct {
-}
-
-// Connection/sync health of the always-on engine that owns the single upstream connection.
-type SyncStatus struct {
-	// Engine lifecycle state.
-	State SyncState `json:"state"`
-	// Last upstream error; empty string when healthy.
-	LastError string `json:"lastError"`
-	// Unix-millis of the last successful snapshot reconcile; 0 if never synced.
-	LastSyncedAt int `json:"lastSyncedAt"`
-	// Unix-millis of the next scheduled reconnect while in `backoff`; 0 otherwise.
-	RetryAt int `json:"retryAt"`
-}
-
-type UpdateSettingsInput struct {
-	Placeholder *string `json:"placeholder,omitempty"`
-}
-
-// Engine connection lifecycle.
-type SyncState string
-
-const (
-	SyncStateConnecting SyncState = "CONNECTING"
-	SyncStateLive       SyncState = "LIVE"
-	SyncStateBackoff    SyncState = "BACKOFF"
-	SyncStateOffline    SyncState = "OFFLINE"
-)
-
-var AllSyncState = []SyncState{
-	SyncStateConnecting,
-	SyncStateLive,
-	SyncStateBackoff,
-	SyncStateOffline,
-}
-
-func (e SyncState) IsValid() bool {
-	switch e {
-	case SyncStateConnecting, SyncStateLive, SyncStateBackoff, SyncStateOffline:
-		return true
-	}
-	return false
-}
-
-func (e SyncState) String() string {
-	return string(e)
-}
-
-func (e *SyncState) UnmarshalGQL(v any) error {
-	str, ok := v.(string)
-	if !ok {
-		return fmt.Errorf("enums must be strings")
-	}
-
-	*e = SyncState(str)
-	if !e.IsValid() {
-		return fmt.Errorf("%s is not a valid SyncState", str)
-	}
-	return nil
-}
-
-func (e SyncState) MarshalGQL(w io.Writer) {
-	fmt.Fprint(w, strconv.Quote(e.String()))
-}
-
-func (e *SyncState) UnmarshalJSON(b []byte) error {
-	s, err := strconv.Unquote(string(b))
-	if err != nil {
-		return err
-	}
-	return e.UnmarshalGQL(s)
-}
-
-func (e SyncState) MarshalJSON() ([]byte, error) {
-	var buf bytes.Buffer
-	e.MarshalGQL(&buf)
-	return buf.Bytes(), nil
 }
 
 type WatchEventType string

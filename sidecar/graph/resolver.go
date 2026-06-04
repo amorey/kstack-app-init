@@ -8,36 +8,20 @@ package graph
 // here.
 
 import (
-	"context"
-	"net/http"
 	"os"
 	"strconv"
 	"time"
 
-	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clusterdata"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clusterdata"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clustersync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/k8ssync"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
 
-// Resolver carries the dependencies every operation needs: a Client for
-// outbound cloud calls, a Store for the local cache, and a Hub to fan out
-// settingsWatch events to all local subscribers.
-// Resolver carries the dependencies operations need. Post-cutover the
-// read path is served from the engine-maintained syncstore and the shared
-// Hub (the engine is the only cloud talker); Cloud is retained only for
-// the `updateSettings` write-through.
+// Resolver carries the dependencies every operation needs: the kube-config
+// watcher (shared with the gRPC KubeContextService) and the per-cluster cache
+// read + control surfaces.
 type Resolver struct {
-	Cloud             *cloud.Client
-	Store             *syncstore.Store[prefs.Settings]
-	Hub               *prefs.Hub
-	Sync              StatusSource
-	Queue             *mutationqueue.Queue
 	KubeConfigWatcher *k8shelpers.KubeConfigWatcher
 	// ClusterData is the read side of the per-cluster SQLite mirror. Always
 	// non-nil (the composition root constructs it unconditionally); it tolerates
@@ -47,60 +31,13 @@ type Resolver struct {
 	// ClusterManager is the cluster read+control surface (the `clusters`/
 	// `clustersWatch` reads and the enable/delete mutations). nil when no cache
 	// is configured; the resolvers guard that and degrade to empty.
-	ClusterManager k8ssync.Manager
-}
-
-// StatusSource is the slice of the always-on engine the syncStatus
-// resolvers need. An interface (not *sync.Engine) so server tests can
-// inject a fake without standing up a real engine.
-type StatusSource interface {
-	Status() prefsync.Status
-	WatchStatus() (<-chan prefsync.Status, func())
-}
-
-// cloudInput converts the gqlgen-generated input type into the cloud
-// client's mirror type. Lives here (hand-written file) so gqlgen doesn't
-// relocate it into a regenerated resolver file.
-func cloudInput(in model.UpdateSettingsInput) cloud.UpdateInput {
-	return cloud.UpdateInput{Placeholder: in.Placeholder}
-}
-
-// graphSyncState maps the engine's State enum onto the generated GraphQL
-// enum. The four engine states are total; default is defensive only.
-func graphSyncState(s prefsync.State) model.SyncState {
-	switch s {
-	case prefsync.StateConnecting:
-		return model.SyncStateConnecting
-	case prefsync.StateLive:
-		return model.SyncStateLive
-	case prefsync.StateBackoff:
-		return model.SyncStateBackoff
-	default:
-		return model.SyncStateOffline
-	}
-}
-
-// toGraphSyncStatus maps the engine's Status onto the generated GraphQL
-// type. Timestamps are Unix-millis ints (0 when zero-valued); RetryAt is
-// only meaningful while backing off (the engine's Status documents this
-// invariant — the mapper just honors it).
-func toGraphSyncStatus(s prefsync.Status) *model.SyncStatus {
-	ms := func(t time.Time) int {
-		if t.IsZero() {
-			return 0
-		}
-		return int(t.UnixMilli())
-	}
-	retry := 0
-	if s.State == prefsync.StateBackoff {
-		retry = ms(s.RetryAt)
-	}
-	return &model.SyncStatus{
-		State:        graphSyncState(s.State),
-		LastError:    s.LastError,
-		LastSyncedAt: ms(s.LastSyncedAt),
-		RetryAt:      retry,
-	}
+	ClusterManager clustersync.Manager
+	// Auth is the local-first identity subsystem: its Current/Subscribe read+watch
+	// surface backs the `authState` query and `authStateWatch` subscription (identity
+	// lives here), and its Login/Logout control backs the `login`/`logout`
+	// mutations. nil when no cloud account is configured; the resolvers guard that
+	// and degrade to signed-out / no-op.
+	Auth auth.Service
 }
 
 // tickInterval is the cadence of the `tick` subscription. Overridable via
@@ -117,50 +54,4 @@ func tickInterval() time.Duration {
 		}
 	}
 	return time.Second
-}
-
-// Bearer-token plumbing ------------------------------------------------------
-//
-// The sidecar is stateless re: auth. Each inbound HTTP request carries an
-// `Authorization: Bearer <token>` header; the resolver layer pulls that token
-// out of the request context and passes it to the cloud client. This holds for
-// every transport — queries, mutations, and SSE subscriptions all flow through
-// the same `withBearer` middleware, so there's a single auth path.
-
-type ctxKey int
-
-const bearerKey ctxKey = 0
-
-// WithRequestContext is the per-request hook installed on the gqlgen handler:
-// copy the bearer token from the HTTP request into the GraphQL context so
-// resolvers can read it without seeing http.Request directly.
-func WithRequestContext(ctx context.Context, r *http.Request) context.Context {
-	return WithAuthHeader(ctx, r.Header.Get("Authorization"))
-}
-
-// WithAuthHeader overlays the bearer token parsed from a raw `Authorization`
-// header onto ctx. Empty header → ctx returned unchanged.
-func WithAuthHeader(ctx context.Context, header string) context.Context {
-	const prefix = "Bearer "
-	switch {
-	case header == "":
-		return ctx
-	case len(header) > len(prefix) && header[:len(prefix)] == prefix:
-		return context.WithValue(ctx, bearerKey, header[len(prefix):])
-	default:
-		return context.WithValue(ctx, bearerKey, header)
-	}
-}
-
-// bearer returns the token attached to ctx, or "" if none.
-func bearer(ctx context.Context) string {
-	v, _ := ctx.Value(bearerKey).(string)
-	return v
-}
-
-// toGraphSettings converts the persistence model into gqlgen's generated
-// Settings type. They have the same shape today, but keeping the
-// conversion explicit means schema and cache can evolve independently.
-func toGraphSettings(s prefs.Settings) *model.Settings {
-	return &model.Settings{Placeholder: s.Placeholder}
 }

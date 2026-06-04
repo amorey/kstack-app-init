@@ -20,11 +20,10 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/app"
 )
 
-// newTestApp builds an App backed by a temp prefs dir and a kubeconfig with two
-// contexts, then serves it over httptest (HTTP/1.1 for GraphQL/SSE, h2c upgrade
-// for gRPC — exactly the production split). It does NOT call Start(), so the
-// sync engine never dials the (fake) cloud; the lifecycle surface is what's
-// under test.
+// newTestApp builds an App backed by a kubeconfig with two contexts, then serves
+// it over httptest (HTTP/1.1 for GraphQL/SSE, h2c upgrade for gRPC — exactly the
+// production split). It does NOT call Start(), so the cluster-cache coordinator
+// never runs; the lifecycle surface is what's under test.
 func newTestApp(t *testing.T) (*app.App, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -47,8 +46,6 @@ users:
 `), 0o600))
 
 	a, err := app.New(app.Config{
-		CloudURL:       "http://127.0.0.1:1", // never dialed (Start not called)
-		PrefsPath:      filepath.Join(dir, "preferences.json"),
 		KubeconfigPath: kubeconfig,
 	})
 	require.NoError(t, err)
@@ -69,6 +66,23 @@ func TestAppServesPing(t *testing.T) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(raw), `"ping":"pong"`)
+}
+
+// With no cloud config (the standalone/test default), the account surface is
+// wired through composition but degraded: the authState query answers signed-out
+// instead of panicking. Proves the cloud service is threaded into the resolver.
+func TestAppAuthStateDegradesSignedOut(t *testing.T) {
+	a, _ := newTestApp(t)
+	ts := httptest.NewServer(a)
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/graphql", "application/json",
+		strings.NewReader(`{"query":"{ authState { authenticated identity { sub } } }"}`))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(raw), `"identity":null`)
+	assert.Contains(t, string(raw), `"authenticated":false`)
 }
 
 // TestAppShutdownDrainsBothTransports is the heart of the lifecycle contract:

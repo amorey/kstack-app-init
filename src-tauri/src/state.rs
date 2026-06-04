@@ -14,14 +14,12 @@
 
 use tokio_util::sync::CancellationToken;
 
-use crate::services::auth::AuthService;
 use crate::services::sidecar::SidecarService;
 use crate::window_manager::WindowManager;
 
 pub struct AppState {
     pub sidecar: SidecarService,
     pub window_manager: WindowManager,
-    pub auth: AuthService,
     /// App-wide graceful-shutdown signal. Cancelled once on Quit (see
     /// `lib.rs`'s `RunEvent::ExitRequested`), which is *before* the sidecar is
     /// torn down. The long-lived background tasks spawned at setup — the tray

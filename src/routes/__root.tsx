@@ -16,7 +16,7 @@ import { lazy, Suspense } from 'react';
 import { createRootRoute, Outlet } from '@tanstack/react-router';
 import { Provider as UrqlProvider } from 'urql';
 
-import { SessionProvider } from '@/lib/auth';
+import { AuthProvider } from '@/lib/auth';
 import { ProfileMenu } from '@/components/widgets/profile-menu';
 import { ConnectionStatus } from '@/lib/connection-status';
 import { ErrorBoundary } from '@/lib/error-boundary';
@@ -61,8 +61,8 @@ function RootComponent() {
   return (
     <ErrorBoundary>
       <ReadyGate>
-        <SessionProvider>
-          <UrqlProvider value={gqlClient}>
+        <UrqlProvider value={gqlClient}>
+          <AuthProvider>
             <SyncStatusProvider>
               <ClustersProvider>
                 <KubeConfigProvider>
@@ -83,8 +83,8 @@ function RootComponent() {
                 </KubeConfigProvider>
               </ClustersProvider>
             </SyncStatusProvider>
-          </UrqlProvider>
-        </SessionProvider>
+          </AuthProvider>
+        </UrqlProvider>
       </ReadyGate>
     </ErrorBoundary>
   );

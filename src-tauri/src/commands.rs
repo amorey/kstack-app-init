@@ -16,7 +16,6 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
 use crate::error::Result;
-use crate::services::auth::Session;
 use crate::services::sidecar::GraphqlResponse;
 use crate::state::AppState;
 
@@ -46,21 +45,6 @@ pub fn new_window(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
 #[tauri::command]
 pub fn quit(app: AppHandle) {
     app.exit(0);
-}
-
-#[tauri::command]
-pub async fn auth_login(app: AppHandle, state: State<'_, AppState>) -> Result<Session> {
-    state.auth.login(&app).await
-}
-
-#[tauri::command]
-pub async fn auth_logout(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
-    state.auth.logout(&app).await
-}
-
-#[tauri::command]
-pub async fn auth_status(state: State<'_, AppState>) -> Result<Session> {
-    Ok(state.auth.current_session())
 }
 
 /// Forwards a GraphQL query/mutation body to the sidecar over its UDS HTTP

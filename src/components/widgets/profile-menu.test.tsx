@@ -16,26 +16,27 @@ import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-type Session = { authenticated: boolean; email: string | null; name: string | null; sub: string | null };
-type SessionValue = {
-  session: Session;
+type Identity = { sub: string; email: string; name: string };
+type AuthState = { authenticated: boolean; identity: Identity | null };
+type AuthStateValue = {
+  authState: AuthState;
   loading: boolean;
   login: () => Promise<void>;
   logout: () => Promise<void>;
 };
 
-const sessionValue = vi.fn<() => SessionValue>();
-vi.mock('@/lib/auth', () => ({ useSession: () => sessionValue() }));
+const authStateValue = vi.fn<() => AuthStateValue>();
+vi.mock('@/lib/auth', () => ({ useAuthState: () => authStateValue() }));
 
 const { ProfileMenu } = await import('./profile-menu');
 
 const login = vi.fn<() => Promise<void>>();
 const logout = vi.fn<() => Promise<void>>();
 
-const ANON: Session = { authenticated: false, email: null, name: null, sub: null };
+const ANON: AuthState = { authenticated: false, identity: null };
 
-function setSession(over: Partial<SessionValue> = {}) {
-  sessionValue.mockReturnValue({ session: ANON, loading: false, login, logout, ...over });
+function setAuthState(over: Partial<AuthStateValue> = {}) {
+  authStateValue.mockReturnValue({ authState: ANON, loading: false, login, logout, ...over });
 }
 
 describe('ProfileMenu', () => {
@@ -49,13 +50,13 @@ describe('ProfileMenu', () => {
   beforeEach(() => {
     login.mockReset().mockResolvedValue(undefined);
     logout.mockReset().mockResolvedValue(undefined);
-    sessionValue.mockReset();
+    authStateValue.mockReset();
   });
 
   afterEach(cleanup);
 
   it('signed out: trigger reads "Sign in" and the menu offers sign-in', async () => {
-    setSession();
+    setAuthState();
     const user = userEvent.setup();
     render(<ProfileMenu />);
 
@@ -69,7 +70,7 @@ describe('ProfileMenu', () => {
   });
 
   it('signed out + loading: the sign-in item is disabled and does not log in', async () => {
-    setSession({ loading: true });
+    setAuthState({ loading: true });
     const user = userEvent.setup();
     render(<ProfileMenu />);
 
@@ -82,8 +83,8 @@ describe('ProfileMenu', () => {
   });
 
   it('signed in: shows initials, an account label, and signs out', async () => {
-    setSession({
-      session: { authenticated: true, email: 'andres.morey@example.com', name: null, sub: 's1' },
+    setAuthState({
+      authState: { authenticated: true, identity: { sub: 's1', email: 'andres.morey@example.com', name: '' } },
     });
     const user = userEvent.setup();
     render(<ProfileMenu />);
@@ -100,8 +101,8 @@ describe('ProfileMenu', () => {
   });
 
   it('signed in with a name: shows the name as primary and email as secondary', async () => {
-    setSession({
-      session: { authenticated: true, email: 'ada@example.io', name: 'Ada Lovelace', sub: 's2' },
+    setAuthState({
+      authState: { authenticated: true, identity: { sub: 's2', email: 'ada@example.io', name: 'Ada Lovelace' } },
     });
     const user = userEvent.setup();
     render(<ProfileMenu />);
@@ -113,8 +114,8 @@ describe('ProfileMenu', () => {
   });
 
   it('falls back to a generic label when signed in without email or name', () => {
-    setSession({
-      session: { authenticated: true, email: null, name: null, sub: 's3' },
+    setAuthState({
+      authState: { authenticated: true, identity: { sub: 's3', email: '', name: '' } },
     });
     render(<ProfileMenu />);
     expect(screen.getByRole('button', { name: 'Account: signed in' })).toBeInTheDocument();

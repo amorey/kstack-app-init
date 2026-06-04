@@ -41,30 +41,6 @@ func (r *kubeConfigResolver) Contexts(ctx context.Context, obj *model.KubeConfig
 	return outList, nil
 }
 
-// UpdateSettings is the resolver for the updateSettings field.
-// Write-through: push to the cloud, then publish to the shared Hub so
-// active subscribers update immediately. Persistence is intentionally NOT
-// done here — the engine is the sole syncstore writer; it persists this
-// change when the cloud echoes it back on its stream (single-writer keeps
-// the engine's version/mirror coherent). Read-after-write via the
-// `settings` query may briefly lag, but the UI consumes `settingsWatch`,
-// which the Hub publish satisfies at once.
-func (r *mutationResolver) UpdateSettings(ctx context.Context, input model.UpdateSettingsInput) (*model.Settings, error) {
-	ci := cloudInput(input)
-	out, err := r.Cloud.UpdateSettings(ctx, bearer(ctx), ci)
-	if err != nil {
-		// Offline/transient: persist (coalesced) so the engine replays
-		// it on its next Live. Still surface the error — the client
-		// must know it hasn't reached the cloud yet.
-		if qErr := r.Queue.Enqueue(ci); qErr != nil {
-			return nil, fmt.Errorf("%w (also failed to queue: %v)", err, qErr)
-		}
-		return nil, err
-	}
-	r.Hub.Publish(out)
-	return toGraphSettings(out), nil
-}
-
 // SetCurrentContext is the resolver for the setCurrentContext field. It
 // persists the kubeconfig current-context to disk via the watcher; the
 // change is delivered to clients through the kubeConfigWatch subscription,
@@ -117,26 +93,36 @@ func (r *mutationResolver) RemoveCluster(ctx context.Context, uuid string) (bool
 	return true, nil
 }
 
+// StartLogin is the resolver for the startLogin field. It runs the flow's setup
+// phase (loopback bind + browser open) synchronously and returns any setup error
+// — surfaced here as a GraphQL error — then finishes the browser round-trip in
+// the background; the resulting signed-in state is delivered via authStateWatch.
+func (r *mutationResolver) StartLogin(ctx context.Context) (bool, error) {
+	if r.Auth == nil {
+		return false, fmt.Errorf("cloud account is not configured")
+	}
+	if err := r.Auth.StartLogin(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Logout is the resolver for the logout field. Delegates to the account, which
+// clears the local credentials, broadcasts signed-out, and revokes the token
+// server-side (best-effort).
+func (r *mutationResolver) Logout(ctx context.Context) (bool, error) {
+	if r.Auth == nil {
+		return false, fmt.Errorf("cloud account is not configured")
+	}
+	if err := r.Auth.Logout(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Ping is the resolver for the ping field.
 func (r *queryResolver) Ping(ctx context.Context) (string, error) {
 	return "pong", nil
-}
-
-// Settings is the resolver for the settings field. Served entirely from
-// the engine-maintained syncstore — the engine owns the only cloud
-// connection, so reads never touch the network. An empty store (engine
-// never synced, e.g. logged out) yields the zero value, not an error.
-func (r *queryResolver) Settings(ctx context.Context) (*model.Settings, error) {
-	env, err := r.Store.Load()
-	if err != nil {
-		return nil, err
-	}
-	return toGraphSettings(env.Data), nil
-}
-
-// SyncStatus is the resolver for the syncStatus field.
-func (r *queryResolver) SyncStatus(ctx context.Context) (*model.SyncStatus, error) {
-	return toGraphSyncStatus(r.Sync.Status()), nil
 }
 
 // Clusters is the resolver for the clusters field. Returns the clusters the
@@ -200,6 +186,18 @@ func (r *queryResolver) Events(ctx context.Context, clusterUUID string, limit *i
 	return mapSlice(events, toGraphEvent), nil
 }
 
+// AuthState is the resolver for the authState field.
+func (r *queryResolver) AuthState(ctx context.Context) (*model.AuthState, error) {
+	if r.Auth == nil {
+		return &model.AuthState{}, nil
+	}
+	st, err := r.Auth.Current(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return toGraphAuthState(st), nil
+}
+
 // Tick is the resolver for the tick field. Streams 1, 2, 3, … on the
 // configured interval. Cancellation comes from the gqlgen runtime when the
 // client unsubscribes (or the WebSocket closes).
@@ -223,34 +221,6 @@ func (r *subscriptionResolver) Tick(ctx context.Context) (<-chan int, error) {
 		}
 	}()
 	return ch, nil
-}
-
-// SettingsWatch is the resolver for the settingsWatch field. Subscribes
-// the shared Hub only — the engine is the single upstream consumer and
-// fans cloud changes (plus mutation publishes) through this Hub. A new
-// subscriber gets the current syncstore snapshot first so it doesn't have
-// to wait for the next change, then live Hub deltas.
-func (r *subscriptionResolver) SettingsWatch(ctx context.Context) (<-chan *model.Settings, error) {
-	hubCh, unsub := r.Hub.Subscribe()
-	return streamWithSnapshot(ctx, hubCh, unsub, toGraphSettings, func() (*model.Settings, bool) {
-		// A failed load (e.g. nothing persisted yet) is non-fatal here:
-		// ok=false skips the snapshot (see streamWithSnapshot's doc).
-		env, err := r.Store.Load()
-		if err != nil {
-			return nil, false
-		}
-		return toGraphSettings(env.Data), true
-	}), nil
-}
-
-// SyncStatusWatch is the resolver for the syncStatusWatch field. Emits
-// the current status immediately (so a new subscriber doesn't wait for the
-// next transition), then every subsequent transition from the engine.
-func (r *subscriptionResolver) SyncStatusWatch(ctx context.Context) (<-chan *model.SyncStatus, error) {
-	sub, unsub := r.Sync.WatchStatus()
-	return streamWithSnapshot(ctx, sub, unsub, toGraphSyncStatus, func() (*model.SyncStatus, bool) {
-		return toGraphSyncStatus(r.Sync.Status()), true
-	}), nil
 }
 
 // ClustersWatch is the resolver for the clustersWatch field. Emits the current
@@ -418,6 +388,21 @@ func (r *subscriptionResolver) KubeConfigWatch(ctx context.Context) (<-chan *mod
 		}
 	}()
 	return out, nil
+}
+
+// AuthStateWatch is the resolver for the authStateWatch field. Emits the current
+// auth-state snapshot, then a fresh snapshot on every sign-in / sign-out / refresh
+// change. Degrades to a closed stream when no cloud account is configured.
+func (r *subscriptionResolver) AuthStateWatch(ctx context.Context) (<-chan *model.AuthState, error) {
+	if r.Auth == nil {
+		ch := make(chan *model.AuthState)
+		close(ch)
+		return ch, nil
+	}
+	// The auth-state stream is latest-value (current-on-subscribe), so its first
+	// value already seeds the current state — just map each State through.
+	states, cancel := r.Auth.Subscribe()
+	return mapStream(ctx, states, cancel, toGraphAuthState), nil
 }
 
 // KubeConfig returns KubeConfigResolver implementation.

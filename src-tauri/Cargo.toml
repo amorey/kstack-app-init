@@ -50,22 +50,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tauri-plugin-single-instance = "2.4.2"
 tauri-plugin-shell = "2.3.5"
-tauri-plugin-oauth = "2.0.0"
-# OIDC: discovery, PKCE, JWKS, and full ID-token verification (signature,
-# iss/aud/exp/azp, nonce). `openidconnect` owns the whole protocol; it is built
-# on `oauth2`, which it re-exports. rustls keeps the build off system TLS and
-# the crypto pure-Rust for clean cross-compilation to every OS.
-openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
-# keyring 4.x splits into a `keyring-core` API crate plus per-OS store crates
-# (pulled in automatically as platform deps). The default store is registered
-# at startup via `keyring::use_native_store`; `keyring-core` provides `Entry`.
-keyring = "4.0.1"
-keyring-core = "1"
-# HTTP client `openidconnect` drives discovery, JWKS, token, and revocation
-# requests through. rustls keeps the build off a system TLS dep.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# The OAuth flow runs an async loopback wait (`oneshot` + `timeout`); tauri's
-# re-exported runtime does not cover those, so depend on tokio directly.
+# Async runtime primitives tauri's re-exported runtime does not cover (the
+# loopback waits, channels, and `select!` the host's background tasks use).
 tokio = { version = "1", features = ["rt", "time", "sync", "macros", "io-util"] }
 # `CancellationToken` backs the app-wide graceful-shutdown signal (`AppState::
 # shutdown`): app Quit cancels it so long-lived background tasks (the tray
@@ -86,8 +72,6 @@ hyper = { version = "1", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
-url = "2"
-zeroize = "1"
 # SSE wire-format parser for the GraphQL subscription transport
 # (`graphql/subscribe.rs`). Transport-agnostic: turns the hyper response
 # body's `Bytes` stream into parsed SSE events, replacing a hand-rolled

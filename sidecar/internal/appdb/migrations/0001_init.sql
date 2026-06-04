@@ -1,7 +1,7 @@
 -- The durable, app-level registry of clusters the sidecar has discovered: one
 -- row per cluster, identified by its kube-system namespace UID. Holds the
 -- user's enable/disable choice and a few bookkeeping timestamps (unix-millis;
--- 0 means "never"). Small and low-traffic — written only by the k8ssync
+-- 0 means "never"). Small and low-traffic — written only by the clustersync
 -- Coordinator via internal/clusterregistry. Owned by internal/appdb (the
 -- app-level <data-dir>/app.db), migrated by the shared internal/sqlitemigrate
 -- runner.

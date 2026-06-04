@@ -8,13 +8,12 @@ package graph_test
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -24,25 +23,16 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/hub"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/mutationqueue"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/prefs"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/prefsync"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/syncstore"
 )
 
 // postGQL POSTs a GraphQL query/mutation body to url's /graphql endpoint and
-// returns the raw response. A non-empty token is sent as the Authorization
-// bearer header — the single auth path shared with SSE subscriptions.
-func postGQL(t *testing.T, url, token, body string) []byte {
+// returns the raw response.
+func postGQL(t *testing.T, url, body string) []byte {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, url+"/graphql", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST %s: %v", url, err)
@@ -50,322 +40,6 @@ func postGQL(t *testing.T, url, token, body string) []byte {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	return raw
-}
-
-// --- settings -------------------------------------------------------------
-
-// Post-cutover wiring: the Resolver reads the engine's syncstore and shares
-// the engine's Hub. The read path never touches the cloud (the engine is
-// the only cloud talker); only `updateSettings` still write-throughs.
-func newStack(t *testing.T, cloudHandler http.Handler) (sidecarURL string, store *syncstore.Store[prefs.Settings], hub *prefs.Hub) {
-	t.Helper()
-	cloudSrv := httptest.NewServer(cloudHandler)
-	t.Cleanup(cloudSrv.Close)
-
-	store = syncstore.NewStore[prefs.Settings](filepath.Join(t.TempDir(), "settings.json"))
-	hub = prefs.NewHub()
-	r := &graph.Resolver{
-		Cloud: cloud.New(cloudSrv.URL),
-		Store: store,
-		Hub:   hub,
-	}
-	sidecar := httptest.NewServer(graph.NewServer(r))
-	t.Cleanup(sidecar.Close)
-	return sidecar.URL, store, hub
-}
-
-// `settings` is served from the syncstore (engine-maintained) and must not
-// contact the cloud — the engine owns the only upstream connection.
-func TestSettingsServedFromStoreNoCloud(t *testing.T) {
-	cloudHit := false
-	url, store, _ := newStack(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		cloudHit = true
-	}))
-	if err := store.Save(syncstore.Envelope[prefs.Settings]{
-		Data:    prefs.Settings{Placeholder: "from-store"},
-		Version: "1",
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	raw := postGQL(t, url, "tok", `{"query":"{ settings { placeholder } }"}`)
-	if !strings.Contains(string(raw), `"placeholder":"from-store"`) {
-		t.Fatalf("response: %s", raw)
-	}
-	if cloudHit {
-		t.Fatal("read path contacted the cloud")
-	}
-}
-
-// An empty store (engine never synced — e.g. logged out) is not an error;
-// the zero value flows through.
-func TestSettingsEmptyStoreReturnsZero(t *testing.T) {
-	url, _, _ := newStack(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Error("cloud must not be contacted")
-	}))
-	raw := postGQL(t, url, "tok", `{"query":"{ settings { placeholder } }"}`)
-	if !strings.Contains(string(raw), `"placeholder":""`) {
-		t.Fatalf("response: %s", raw)
-	}
-}
-
-// `updateSettings` still write-throughs to the cloud and publishes to the
-// shared Hub so active subscribers see it immediately (the engine persists
-// it when the cloud echoes it back on its stream).
-func TestUpdateSettingsWriteThroughAndPublishes(t *testing.T) {
-	var sawInput map[string]any
-	url, _, hub := newStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		if vars, ok := body["variables"].(map[string]any); ok {
-			sawInput, _ = vars["input"].(map[string]any)
-		}
-		_, _ = w.Write([]byte(`{"data":{"updateSettings":{"placeholder":"v2"}}}`))
-	}))
-
-	sub, unsub := hub.Subscribe()
-	defer unsub()
-
-	mutation := `{"query":"mutation($input: UpdateSettingsInput!) { updateSettings(input: $input) { placeholder } }",` +
-		`"variables":{"input":{"placeholder":"v2"}}}`
-	raw := postGQL(t, url, "tok", mutation)
-	if !strings.Contains(string(raw), `"placeholder":"v2"`) {
-		t.Fatalf("response: %s", raw)
-	}
-	if sawInput["placeholder"] != "v2" {
-		t.Fatalf("input not forwarded: %+v", sawInput)
-	}
-	select {
-	case s := <-sub:
-		if s.Placeholder != "v2" {
-			t.Fatalf("hub got %+v", s)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("mutation did not publish to the Hub")
-	}
-}
-
-// `settingsWatch` subscribes the shared Hub only (no per-resolver cloud
-// SSE): a new subscriber gets the current store snapshot first, then live
-// Hub publishes.
-func TestSettingsWatchSnapshotThenHubDeltas(t *testing.T) {
-	url, store, hub := newStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// A cloud SSE attempt here is a regression (per-resolver SSE
-		// must be gone).
-		if r.Header.Get("Accept") == "text/event-stream" {
-			t.Error("settingsWatch opened a cloud SSE")
-		}
-		_, _ = w.Write([]byte(`{"data":{}}`))
-	}))
-	if err := store.Save(syncstore.Envelope[prefs.Settings]{
-		Data: prefs.Settings{Placeholder: "snap"}, Version: "1",
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	resp := openSSESubscription(t, url, "tok", "subscription { settingsWatch { placeholder } }")
-	defer resp.Body.Close() // ends the subscription; must run before srv.Close()
-	events := sseEvents(resp)
-
-	readPlaceholder := func(want string) {
-		ev := nextSSE(t, events)
-		if ev.event != "next" {
-			t.Fatalf("want event=next, got %q (data=%s)", ev.event, ev.data)
-		}
-		var msg struct {
-			Data struct {
-				SettingsWatch struct {
-					Placeholder string `json:"placeholder"`
-				} `json:"settingsWatch"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal([]byte(ev.data), &msg); err != nil {
-			t.Fatalf("decode %s: %v", ev.data, err)
-		}
-		if msg.Data.SettingsWatch.Placeholder != want {
-			t.Fatalf("want %q, got %s", want, ev.data)
-		}
-	}
-
-	readPlaceholder("snap") // current snapshot first
-	hub.Publish(prefs.Settings{Placeholder: "live"})
-	readPlaceholder("live") // then live Hub deltas
-}
-
-// updateSettings: a cloud-failed write surfaces the error to the client AND
-// persists the mutation; a subsequent successful Drain replays it and clears
-// the queue.
-func TestUpdateSettingsQueuesOnCloudFailure(t *testing.T) {
-	cloudCalls := 0
-	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cloudCalls++
-		http.Error(w, "upstream down", http.StatusBadGateway)
-	}))
-	defer cloudSrv.Close()
-
-	q := mutationqueue.New(filepath.Join(t.TempDir(), "mutations.json"))
-	r := &graph.Resolver{
-		Cloud: cloud.New(cloudSrv.URL),
-		Store: syncstore.NewStore[prefs.Settings](filepath.Join(t.TempDir(), "settings.json")),
-		Hub:   prefs.NewHub(),
-		Queue: q,
-	}
-	sidecar := httptest.NewServer(graph.NewServer(r))
-	defer sidecar.Close()
-
-	mutation := `{"query":"mutation($input: UpdateSettingsInput!) { updateSettings(input: $input) { placeholder } }",` +
-		`"variables":{"input":{"placeholder":"offline-edit"}}}`
-	raw := postGQL(t, sidecar.URL, "tok", mutation)
-
-	// Client is told it failed (not silently 'ok').
-	if !strings.Contains(string(raw), `"errors"`) {
-		t.Fatalf("want a GraphQL error surfaced, got %s", raw)
-	}
-	if p, _ := q.Pending(); !p {
-		t.Fatal("mutation not queued after cloud failure")
-	}
-
-	// A successful drain replays the queued mutation and clears it.
-	var pushed string
-	if err := q.Drain(context.Background(), func(_ context.Context, in cloud.UpdateInput) error {
-		pushed = *in.Placeholder
-		return nil
-	}); err != nil {
-		t.Fatalf("Drain: %v", err)
-	}
-	if pushed != "offline-edit" {
-		t.Fatalf("drained input = %q", pushed)
-	}
-	if p, _ := q.Pending(); p {
-		t.Fatal("queue not cleared after successful drain")
-	}
-	if cloudCalls == 0 {
-		t.Fatal("cloud was never attempted")
-	}
-}
-
-// --- syncStatus -----------------------------------------------------------
-
-// fakeStatus is a hand StatusSource: drives Status() / WatchStatus()
-// without standing up a real engine + fake upstream. The fan-out is the
-// real hub.Hub (same as the engine uses), so the test double can't drift
-// from production subscribe/unsub semantics.
-type fakeStatus struct {
-	mu  sync.Mutex
-	cur prefsync.Status
-	hub *hub.Hub[prefsync.Status]
-}
-
-func newFakeStatus(s prefsync.Status) *fakeStatus {
-	return &fakeStatus{cur: s, hub: hub.New[prefsync.Status]()}
-}
-
-func (f *fakeStatus) Status() prefsync.Status {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.cur
-}
-
-func (f *fakeStatus) WatchStatus() (<-chan prefsync.Status, func()) {
-	return f.hub.Subscribe()
-}
-
-func (f *fakeStatus) push(s prefsync.Status) {
-	f.mu.Lock()
-	f.cur = s
-	f.mu.Unlock()
-	f.hub.Publish(s)
-}
-
-func statusStack(t *testing.T, fs graph.StatusSource) string {
-	t.Helper()
-	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Sync: fs}))
-	t.Cleanup(srv.Close)
-	return srv.URL
-}
-
-// syncStatus query maps the engine Status onto the GraphQL type: state
-// stringified, timestamps as Unix-millis ints, RetryAt only while backing
-// off.
-func TestSyncStatusQueryMapsEngineStatus(t *testing.T) {
-	synced := time.UnixMilli(1_700_000_000_000)
-	retry := time.UnixMilli(1_700_000_030_000)
-	url := statusStack(t, newFakeStatus(prefsync.Status{
-		State:        prefsync.StateBackoff,
-		LastError:    "cloud unreachable",
-		LastSyncedAt: synced,
-		RetryAt:      retry,
-	}))
-
-	raw := postGQL(t, url, "", `{"query":"{ syncStatus { state lastError lastSyncedAt retryAt } }"}`)
-	var resp struct {
-		Data struct {
-			SyncStatus struct {
-				State        string `json:"state"`
-				LastError    string `json:"lastError"`
-				LastSyncedAt int64  `json:"lastSyncedAt"`
-				RetryAt      int64  `json:"retryAt"`
-			} `json:"syncStatus"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		t.Fatalf("decode %s: %v", raw, err)
-	}
-	got := resp.Data.SyncStatus
-	if got.State != "BACKOFF" || got.LastError != "cloud unreachable" {
-		t.Fatalf("got %+v", got)
-	}
-	if got.LastSyncedAt != synced.UnixMilli() || got.RetryAt != retry.UnixMilli() {
-		t.Fatalf("timestamps: got %+v", got)
-	}
-}
-
-// RetryAt is zeroed unless the engine is actually backing off, even if a
-// stale RetryAt lingers on the struct.
-func TestSyncStatusRetryAtZeroWhenNotBackoff(t *testing.T) {
-	url := statusStack(t, newFakeStatus(prefsync.Status{
-		State:   prefsync.StateLive,
-		RetryAt: time.UnixMilli(1_700_000_030_000),
-	}))
-	raw := postGQL(t, url, "", `{"query":"{ syncStatus { state retryAt lastSyncedAt } }"}`)
-	if !strings.Contains(string(raw), `"retryAt":0`) || !strings.Contains(string(raw), `"state":"LIVE"`) {
-		t.Fatalf("want live + retryAt 0, got %s", raw)
-	}
-}
-
-// syncStatusWatch emits the current status immediately, then every
-// transition.
-func TestSyncStatusWatchSnapshotThenTransitions(t *testing.T) {
-	fs := newFakeStatus(prefsync.Status{State: prefsync.StateConnecting})
-	url := statusStack(t, fs)
-
-	resp := openSSESubscription(t, url, "", "subscription { syncStatusWatch { state } }")
-	defer resp.Body.Close() // ends the subscription; must run before srv.Close()
-	events := sseEvents(resp)
-
-	readState := func(want string) {
-		ev := nextSSE(t, events)
-		if ev.event != "next" {
-			t.Fatalf("want event=next, got %q (data=%s)", ev.event, ev.data)
-		}
-		var msg struct {
-			Data struct {
-				SyncStatusWatch struct {
-					State string `json:"state"`
-				} `json:"syncStatusWatch"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal([]byte(ev.data), &msg); err != nil {
-			t.Fatalf("decode %s: %v", ev.data, err)
-		}
-		if msg.Data.SyncStatusWatch.State != want {
-			t.Fatalf("want %q, got %s", want, ev.data)
-		}
-	}
-
-	readState("CONNECTING") // current snapshot first
-	fs.push(prefsync.Status{State: prefsync.StateLive})
-	readState("LIVE") // then transitions
 }
 
 // clustersWatch degrades to a closed stream when no cluster cache is configured
@@ -425,7 +99,7 @@ func TestSetCurrentContext_Mutation_Success(t *testing.T) {
 	path := writeKubeConfig(t, "context-A", "context-A", "context-B")
 	url, w := newKubeConfigStack(t, path)
 
-	raw := postGQL(t, url, "", `{"query":"mutation { setCurrentContext(name: \"context-B\") }"}`)
+	raw := postGQL(t, url, `{"query":"mutation { setCurrentContext(name: \"context-B\") }"}`)
 	if !strings.Contains(string(raw), `"setCurrentContext":true`) {
 		t.Fatalf("response: %s", raw)
 	}
@@ -441,7 +115,7 @@ func TestSetCurrentContext_Mutation_UnknownContext(t *testing.T) {
 	path := writeKubeConfig(t, "context-A", "context-A", "context-B")
 	url, w := newKubeConfigStack(t, path)
 
-	raw := postGQL(t, url, "", `{"query":"mutation { setCurrentContext(name: \"nope\") }"}`)
+	raw := postGQL(t, url, `{"query":"mutation { setCurrentContext(name: \"nope\") }"}`)
 	if !strings.Contains(string(raw), `"errors"`) {
 		t.Fatalf("expected GraphQL error, got: %s", raw)
 	}
@@ -454,8 +128,188 @@ func TestSetCurrentContext_Mutation_NilWatcher(t *testing.T) {
 	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{}))
 	t.Cleanup(srv.Close)
 
-	raw := postGQL(t, srv.URL, "", `{"query":"mutation { setCurrentContext(name: \"x\") }"}`)
+	raw := postGQL(t, srv.URL, `{"query":"mutation { setCurrentContext(name: \"x\") }"}`)
 	if !strings.Contains(string(raw), `"errors"`) {
 		t.Fatalf("expected GraphQL error, got: %s", raw)
+	}
+}
+
+// --- cloud account: authState / login / logout / authStateWatch -----------
+//
+// The fakes (memCredStore/fakeOAuthFlow/fakeLoopback) live in testutils_test.go;
+// the postGQL / SSE helpers are defined above + in server_test.go.
+
+// The authState query degrades to signed-out on a bare Resolver (no cloud account).
+func TestAuthStateQueryDegradesSignedOut(t *testing.T) {
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{}))
+	defer srv.Close()
+
+	raw := string(postGQL(t, srv.URL, `{"query":"{ authState { authenticated identity { sub } } }"}`))
+	if !strings.Contains(raw, `"identity":null`) {
+		t.Fatalf("want signed-out auth state (null identity), got: %s", raw)
+	}
+	if !strings.Contains(raw, `"authenticated":false`) {
+		t.Fatalf("want authenticated false, got: %s", raw)
+	}
+}
+
+// signedInAuth returns a fake auth.Service already signed in as the given
+// identity. The resolver depends on the auth.Service interface, so the tests fake
+// it (see fakeAuth) rather than constructing the real service.
+func signedInAuth(t *testing.T, id auth.Identity) auth.Service {
+	t.Helper()
+	return signedInFakeAuth(id)
+}
+
+// configuredAuth returns a signed-out fake auth.Service that signs in as id when
+// Login runs (the resolver's login flow).
+func configuredAuth(t *testing.T, id auth.Identity) auth.Service {
+	t.Helper()
+	return newFakeAuth(id)
+}
+
+// The authState query reflects the current signed-in identity.
+func TestAuthStateQuerySignedIn(t *testing.T) {
+	svc := signedInAuth(t, auth.Identity{UserID: "u1", Email: "a@x.com", Name: "Ada"})
+
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Auth: svc}))
+	defer srv.Close()
+
+	raw := string(postGQL(t, srv.URL, `{"query":"{ authState { authenticated identity { sub email name } } }"}`))
+	if !strings.Contains(raw, `"email":"a@x.com"`) {
+		t.Fatalf("want signed-in identity, got: %s", raw)
+	}
+	if !strings.Contains(raw, `"authenticated":true`) {
+		t.Fatalf("want authenticated true, got: %s", raw)
+	}
+}
+
+// authStateWatch emits the current snapshot first, then a fresh snapshot on change.
+func TestAuthStateWatchSnapshotThenDelta(t *testing.T) {
+	svc := configuredAuth(t, auth.Identity{Email: "a@x.com"})
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Auth: svc}))
+	defer srv.Close()
+
+	resp := openSSESubscription(t, srv.URL, "",
+		"subscription { authStateWatch { authenticated identity { email } } }")
+	defer resp.Body.Close() // ends the subscription; must run before srv.Close()
+	events := sseEvents(resp)
+
+	if ev := nextSSE(t, events); ev.event != "next" || !strings.Contains(ev.data, `"authenticated":false`) {
+		t.Fatalf("first frame: event=%q data=%s", ev.event, ev.data)
+	}
+
+	if err := svc.StartLogin(context.Background()); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	if ev := nextSSE(t, events); ev.event != "next" || !strings.Contains(ev.data, `"email":"a@x.com"`) {
+		t.Fatalf("delta frame: event=%q data=%s", ev.event, ev.data)
+	}
+}
+
+// authStateWatch degrades to a closed stream (terminal complete) without a cloud
+// account, per the nil-tolerant resolver contract.
+func TestAuthStateWatchDegradesWithoutAccount(t *testing.T) {
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{}))
+	defer srv.Close()
+
+	resp := openSSESubscription(t, srv.URL, "", "subscription { authStateWatch { identity { sub } } }")
+	defer resp.Body.Close()
+	events := sseEvents(resp)
+
+	if ev := nextSSE(t, events); ev.event != "complete" {
+		t.Fatalf("want complete (degraded stream), got %q (data=%s)", ev.event, ev.data)
+	}
+}
+
+// logout delegates to the account: returns true and flips the session signed-out.
+func TestLogoutMutation(t *testing.T) {
+	svc := signedInFakeAuth(auth.Identity{})
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Auth: svc}))
+	defer srv.Close()
+
+	raw := string(postGQL(t, srv.URL, `{"query":"mutation { logout }"}`))
+	if !strings.Contains(raw, `"logout":true`) {
+		t.Fatalf("want logout true, got: %s", raw)
+	}
+	if cur, _ := svc.Current(context.Background()); cur.Authenticated {
+		t.Fatal("session still signed in after logout")
+	}
+}
+
+// logout errors cleanly (no panic) when no cloud account is configured.
+func TestLogoutMutationDegradesError(t *testing.T) {
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{}))
+	defer srv.Close()
+
+	raw := string(postGQL(t, srv.URL, `{"query":"mutation { logout }"}`))
+	if !strings.Contains(raw, `"errors"`) {
+		t.Fatalf("want GraphQL error, got: %s", raw)
+	}
+}
+
+// login is non-blocking: it returns true immediately and the resulting signed-in
+// session arrives asynchronously (observed here via the auth-state watch), proving
+// the mutation kicked off the flow without blocking on the browser round-trip.
+func TestLoginMutationKicksOffFlow(t *testing.T) {
+	svc := newFakeAuth(auth.Identity{Email: "a@x.com"})
+
+	// The auth-state stream is latest-value (current-on-subscribe): the first State
+	// is the signed-out baseline, and the signed-in flow surfaces as a later State
+	// with Authenticated true. The loop skips the baseline and waits for sign-in.
+	states, cancel := svc.Subscribe()
+	defer cancel()
+
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Auth: svc}))
+	defer srv.Close()
+
+	raw := string(postGQL(t, srv.URL, `{"query":"mutation { startLogin }"}`))
+	if !strings.Contains(raw, `"startLogin":true`) {
+		t.Fatalf("want login true, got: %s", raw)
+	}
+
+	for {
+		select {
+		case st := <-states:
+			if st.Authenticated {
+				if st.Identity == nil || st.Identity.Email != "a@x.com" {
+					t.Fatalf("signed-in identity = %+v", st.Identity)
+				}
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("login never produced a signed-in session")
+		}
+	}
+}
+
+// login errors cleanly when no cloud account is configured.
+func TestLoginMutationDegradesError(t *testing.T) {
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{}))
+	defer srv.Close()
+
+	raw := string(postGQL(t, srv.URL, `{"query":"mutation { startLogin }"}`))
+	if !strings.Contains(raw, `"errors"`) {
+		t.Fatalf("want GraphQL error, got: %s", raw)
+	}
+}
+
+// A synchronous setup failure (loopback bind / browser launch) surfaces as a
+// GraphQL error rather than a silent login:true — the whole point of running the
+// flow's setup phase synchronously.
+func TestLoginMutationSurfacesSetupError(t *testing.T) {
+	svc := newFakeAuth(auth.Identity{Email: "a@x.com"})
+	svc.loginErr = errors.New("loopback bind failed")
+
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Auth: svc}))
+	defer srv.Close()
+
+	raw := string(postGQL(t, srv.URL, `{"query":"mutation { startLogin }"}`))
+	if !strings.Contains(raw, `"errors"`) {
+		t.Fatalf("want GraphQL error for a setup failure, got: %s", raw)
+	}
+	if strings.Contains(raw, `"startLogin":true`) {
+		t.Fatalf("login must not report true when setup failed, got: %s", raw)
 	}
 }

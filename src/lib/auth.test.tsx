@@ -13,199 +13,179 @@
 // limitations under the License.
 
 import { act, cleanup, render, renderHook, waitFor } from '@testing-library/react';
+import { Provider as UrqlProvider } from 'urql';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-type Status = { authenticated: boolean; email: string | null; name: string | null; sub: string | null };
-type EventCb = (e: { payload: Status }) => void;
+import { mockTauriCore } from '@/test-utils';
 
-const SESSION_RESOLVED_EVENT = 'auth:session-resolved';
-const SESSION_CHANGED_EVENT = 'auth:session-changed';
+// Mocks ---------------------------------------------------------------
 
-const invokeMock = vi.fn<(cmd: string, payload?: unknown) => Promise<unknown>>();
+const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
+vi.mock('@tauri-apps/api/core', () => factory());
 
-// `listen()` resolves with an unlisten fn. We keep every registered
-// handler keyed by event name so tests can fire the host's restore /
-// session-changed events by hand.
-const unlistenMock = vi.fn();
-const listenHandlers = new Map<string, EventCb>();
-const listenMock = vi.fn(async (event: string, cb: EventCb) => {
-  listenHandlers.set(event, cb);
-  return unlistenMock;
-});
+const { createGraphqlClient } = await import('@/lib/graphql/client');
+const { AuthProvider, useAuthState } = await import('./auth');
 
-function fireEvent(event: string, payload: Status) {
-  const cb = listenHandlers.get(event);
-  if (!cb) throw new Error(`no listener registered for ${event}`);
-  cb({ payload });
+// Helpers -------------------------------------------------------------
+
+const flush = () => act(async () => {});
+
+type GqlIdentity = { sub: string; email: string; name: string };
+type GqlAuthState = { authenticated: boolean; identity: GqlIdentity | null };
+
+// The mutation response graphql_query returns; overridable per-test.
+let mutationBody: unknown = { data: { login: true, logout: true } };
+
+function pushAuthState(s: GqlAuthState) {
+  liveChannel().onmessage!(JSON.stringify({ type: 'next', payload: { data: { authStateWatch: s } } }));
 }
 
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: (cmd: string, payload?: unknown) => invokeMock(cmd, payload),
-}));
+const SIGNED_IN: GqlAuthState = {
+  authenticated: true,
+  identity: { sub: 'sub-1', email: 'a@example.com', name: 'Ada' },
+};
+const SIGNED_OUT: GqlAuthState = { authenticated: false, identity: null };
 
-vi.mock('@tauri-apps/api/event', () => ({
-  listen: (event: string, cb: EventCb) => listenMock(event, cb),
-}));
-
-// Real error bus — exercising the integration is cheap and confirms the
-// `source: 'auth'` contract that `ConnectionStatus` filters on.
-const { onError } = await import('@/lib/error-bus');
-const { SessionProvider, useSession } = await import('./auth');
-
-const AUTHED: Status = { authenticated: true, email: 'a@example.com', name: 'Ada', sub: 'sub-1' };
-const ANON: Status = { authenticated: false, email: null, name: null, sub: null };
-
-function renderSession() {
-  return renderHook(() => useSession(), { wrapper: SessionProvider });
+function renderAuthState() {
+  const client = createGraphqlClient();
+  function wrapper({ children }: { children: React.ReactNode }) {
+    return (
+      <UrqlProvider value={client}>
+        <AuthProvider>{children}</AuthProvider>
+      </UrqlProvider>
+    );
+  }
+  return renderHook(() => useAuthState(), { wrapper });
 }
 
-describe('SessionProvider / useSession', () => {
+describe('AuthProvider / useAuthState', () => {
   beforeEach(() => {
     invokeMock.mockReset();
-    listenMock.mockClear();
-    unlistenMock.mockClear();
-    listenHandlers.clear();
+    channels.length = 0;
+    mutationBody = { data: { login: true, logout: true } };
+    let id = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'graphql_subscribe') {
+        id += 1;
+        return id;
+      }
+      if (cmd === 'graphql_unsubscribe') return undefined;
+      if (cmd === 'graphql_query') {
+        return { status: 200, body: JSON.stringify(mutationBody) };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
   });
 
   afterEach(cleanup);
 
-  it('starts loading with an anonymous session', () => {
-    invokeMock.mockReturnValue(new Promise<never>(() => {})); // never settles
-    const { result } = renderSession();
+  it('starts loading with an anonymous auth state before the first frame', async () => {
+    const { result } = renderAuthState();
+    await flush();
     expect(result.current.loading).toBe(true);
-    expect(result.current.session).toEqual(ANON);
+    expect(result.current.authState.authenticated).toBe(false);
   });
 
-  it('settles the session from auth_status', async () => {
-    invokeMock.mockResolvedValue(AUTHED);
-    const { result } = renderSession();
-    await waitFor(() => expect(result.current.loading).toBe(false));
-    expect(result.current.session).toEqual(AUTHED);
-    expect(invokeMock).toHaveBeenCalledWith('auth_status', undefined);
+  it('subscribes to authStateWatch', async () => {
+    renderAuthState();
+    await flush();
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_subscribe',
+      expect.objectContaining({ query: expect.stringContaining('authStateWatch') }),
+    );
   });
 
-  it('subscribes to the restore event before fetching status', async () => {
-    invokeMock.mockResolvedValue(ANON);
-    renderSession();
-    await waitFor(() => expect(listenMock).toHaveBeenCalled());
-    expect(listenHandlers.has(SESSION_RESOLVED_EVENT)).toBe(true);
-  });
-
-  it('settles from the restore event when it arrives first', async () => {
-    invokeMock.mockReturnValue(new Promise<never>(() => {})); // auth_status hangs
-    const { result } = renderSession();
-    await waitFor(() => expect(listenHandlers.has(SESSION_RESOLVED_EVENT)).toBe(true));
+  it('settles to anonymous on the first (signed-out) snapshot', async () => {
+    const { result } = renderAuthState();
+    await flush();
     await act(async () => {
-      fireEvent(SESSION_RESOLVED_EVENT, AUTHED);
+      pushAuthState(SIGNED_OUT);
     });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.authState).toEqual({ authenticated: false, identity: null });
+  });
+
+  it('adopts the identity from a signed-in frame', async () => {
+    const { result } = renderAuthState();
+    await flush();
+    await act(async () => {
+      pushAuthState(SIGNED_IN);
+    });
+    await waitFor(() =>
+      expect(result.current.authState).toEqual({
+        authenticated: true,
+        identity: { sub: 'sub-1', email: 'a@example.com', name: 'Ada' },
+      }),
+    );
     expect(result.current.loading).toBe(false);
-    expect(result.current.session).toEqual(AUTHED);
   });
 
-  it('subscribes to the session-changed event', async () => {
-    invokeMock.mockResolvedValue(ANON);
-    renderSession();
-    await waitFor(() => expect(listenHandlers.has(SESSION_CHANGED_EVENT)).toBe(true));
-  });
-
-  it('syncs to anonymous when another window logs out (session-changed)', async () => {
-    invokeMock.mockResolvedValue(AUTHED); // this window is signed in
-    const { result } = renderSession();
-    await waitFor(() => expect(result.current.session).toEqual(AUTHED));
-
-    // The host broadcasts the post-logout status from the other window.
+  it('returns to anonymous when a signed-out frame arrives (sign-out / other window)', async () => {
+    const { result } = renderAuthState();
+    await flush();
     await act(async () => {
-      fireEvent(SESSION_CHANGED_EVENT, ANON);
+      pushAuthState(SIGNED_IN);
     });
-    expect(result.current.session).toEqual(ANON);
-  });
-
-  it('syncs to authenticated when another window logs in (session-changed)', async () => {
-    invokeMock.mockResolvedValue(ANON);
-    const { result } = renderSession();
-    await waitFor(() => expect(result.current.loading).toBe(false));
+    await waitFor(() => expect(result.current.authState.authenticated).toBe(true));
 
     await act(async () => {
-      fireEvent(SESSION_CHANGED_EVENT, AUTHED);
+      pushAuthState(SIGNED_OUT);
     });
-    expect(result.current.session).toEqual(AUTHED);
+    await waitFor(() => expect(result.current.authState.authenticated).toBe(false));
   });
 
-  it('login() invokes auth_login and adopts the returned session', async () => {
-    invokeMock.mockResolvedValueOnce(ANON); // initial auth_status
-    const { result } = renderSession();
-    await waitFor(() => expect(result.current.loading).toBe(false));
+  it('login() runs the startLogin mutation', async () => {
+    const { result } = renderAuthState();
+    await flush();
+    await act(async () => {
+      pushAuthState(SIGNED_OUT);
+    });
 
-    invokeMock.mockResolvedValueOnce(AUTHED); // auth_login
     await act(async () => {
       await result.current.login();
     });
-    expect(invokeMock).toHaveBeenCalledWith('auth_login', undefined);
-    expect(result.current.session).toEqual(AUTHED);
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_query',
+      expect.objectContaining({ body: expect.stringContaining('startLogin') }),
+    );
   });
 
-  it('logout() invokes auth_logout and resets to an anonymous session', async () => {
-    invokeMock.mockResolvedValueOnce(AUTHED); // initial auth_status
-    const { result } = renderSession();
-    await waitFor(() => expect(result.current.session).toEqual(AUTHED));
+  it('logout() runs the logout mutation', async () => {
+    const { result } = renderAuthState();
+    await flush();
+    await act(async () => {
+      pushAuthState(SIGNED_IN);
+    });
 
-    invokeMock.mockResolvedValueOnce(undefined); // auth_logout
     await act(async () => {
       await result.current.logout();
     });
-    expect(invokeMock).toHaveBeenCalledWith('auth_logout', undefined);
-    expect(result.current.session).toEqual(ANON);
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_query',
+      expect.objectContaining({ body: expect.stringContaining('logout') }),
+    );
   });
 
-  it('reports an auth-source error and stays anonymous when init fails', async () => {
-    const errors: { source: string; message: string }[] = [];
-    const off = onError((e) => errors.push(e));
-    invokeMock.mockRejectedValue(new Error('keychain locked'));
+  it('login() rejects when the mutation errors', async () => {
+    const { result } = renderAuthState();
+    await flush();
+    await act(async () => {
+      pushAuthState(SIGNED_OUT);
+    });
 
-    const { result } = renderSession();
-    await waitFor(() => expect(result.current.loading).toBe(false));
-    off();
-
-    expect(result.current.session).toEqual(ANON);
-    expect(errors).toHaveLength(1);
-    expect(errors[0].source).toBe('auth');
-    expect(errors[0].message).toContain('init: keychain locked');
+    mutationBody = { errors: [{ message: 'cloud account is not configured' }] };
+    await act(async () => {
+      await expect(result.current.login()).rejects.toBeTruthy();
+    });
   });
 
-  it('reports and rethrows when login fails', async () => {
-    invokeMock.mockResolvedValueOnce(ANON); // initial auth_status
-    const { result } = renderSession();
-    await waitFor(() => expect(result.current.loading).toBe(false));
-
-    const errors: { source: string; message: string }[] = [];
-    const off = onError((e) => errors.push(e));
-    invokeMock.mockRejectedValueOnce(new Error('user cancelled'));
-
-    await expect(result.current.login()).rejects.toThrow('user cancelled');
-    off();
-
-    expect(errors).toHaveLength(1);
-    expect(errors[0].source).toBe('auth');
-    expect(errors[0].message).toContain('login: user cancelled');
-    expect(result.current.session).toEqual(ANON); // unchanged on failure
-  });
-
-  it('unsubscribes from every event listener on unmount', async () => {
-    invokeMock.mockResolvedValue(ANON);
-    const { unmount } = renderSession();
-    await waitFor(() => expect(listenHandlers.has(SESSION_CHANGED_EVENT)).toBe(true));
-    unmount();
-    // One unlisten per registered listener (restore + session-changed).
-    expect(unlistenMock).toHaveBeenCalledTimes(2);
-  });
-
-  it('throws when useSession is used outside a provider', () => {
+  it('throws when useAuthState is used outside a provider', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     function Bare() {
-      useSession();
+      useAuthState();
       return null;
     }
-    expect(() => render(<Bare />)).toThrow(/useSession must be used inside <SessionProvider>/);
+    expect(() => render(<Bare />)).toThrow(/useAuthState must be used inside <AuthProvider>/);
     spy.mockRestore();
   });
 });

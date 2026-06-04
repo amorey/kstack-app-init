@@ -96,23 +96,45 @@ impl SidecarService {
     pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<Self> {
         let endpoint = Endpoint::pick(&std::env::temp_dir())?;
 
-        // Per-machine, non-roaming app data dir. Tauri maps this to
-        // ~/Library/Application Support/<bundle> on macOS, %LOCALAPPDATA%\<bundle>
-        // on Windows, and ~/.local/share/<bundle> on Linux — the OS-correct
-        // location for the per-cluster SQLite cache. Created up front so the
-        // sidecar can mkdir subdirs under it without worrying about parents.
-        let data_dir = app.path().app_local_data_dir().map_err(|e| {
-            AppError::Io(std::io::Error::other(format!(
-                "resolve app_local_data_dir: {e}"
-            )))
-        })?;
+        // Per-machine, non-roaming app data dir — the OS-correct location for the
+        // per-cluster SQLite cache and cloud settings/queue. We join a
+        // human-readable name onto the OS base dir (`local_data_dir`) rather than
+        // using Tauri's `app_local_data_dir`, which derives the leaf from the
+        // reverse-DNS bundle identifier (`sh.kstack.app`); the convention in
+        // ~/Library/Application Support is a display name (e.g. "Headlamp"). The
+        // base maps to ~/Library/Application Support on macOS,
+        // %LOCALAPPDATA% on Windows, and ~/.local/share on Linux.
+        //
+        // A debug build (`tauri dev`) uses a separate "Kstack-dev" sibling so a
+        // development run's cache/queue can't collide with an installed release's
+        // "Kstack". Created up front so the sidecar can mkdir subdirs under it.
+        let dir_name = if cfg!(debug_assertions) {
+            "Kstack-dev"
+        } else {
+            "Kstack"
+        };
+        let data_dir = app
+            .path()
+            .local_data_dir()
+            .map_err(|e| {
+                AppError::Io(std::io::Error::other(format!(
+                    "resolve local_data_dir: {e}"
+                )))
+            })?
+            .join(dir_name);
         std::fs::create_dir_all(&data_dir).map_err(AppError::Io)?;
 
-        let (mut rx, child) = app
+        let mut command = app
             .shell()
             .sidecar("kstack-sidecar")?
-            .args(cmd_args(&endpoint, &data_dir))
-            .spawn()?;
+            .args(cmd_args(&endpoint, &data_dir));
+        // Isolate a development run's stored sign-in from an installed release:
+        // point the sidecar's keychain at a dev-specific service name in debug
+        // builds (`tauri dev`) so the two don't share — and clobber — one entry.
+        if cfg!(debug_assertions) {
+            command = command.env("KSTACK_KEYCHAIN_SERVICE", dir_name);
+        }
+        let (mut rx, child) = command.spawn()?;
         let pid = child.pid();
 
         let state = Arc::new(Mutex::new(State {

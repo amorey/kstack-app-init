@@ -4,24 +4,24 @@ import (
 	"context"
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clusterdata"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/k8ssync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clusterdata"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clustersync"
 )
 
 // This file holds the presentation-only mapping between the clusterdata domain
-// structs (and k8ssync.Cluster) and the gqlgen-generated model.* types, plus the
+// structs (and clustersync.Cluster) and the gqlgen-generated model.* types, plus the
 // channel relays the subscription resolvers use. Keeping it here lets
 // schema.resolvers.go stay a thin set of one-line delegations and keeps all the
-// read/query logic in internal/clusterdata.
+// read/query logic in internal/cluster/clusterdata.
 
 // toGraphClusters maps a cluster-view snapshot to the GraphQL list. Kept here
-// (where k8ssync is already imported) so schema.resolvers.go and the
+// (where clustersync is already imported) so schema.resolvers.go and the
 // clustersWatch stream needn't name the view type.
-func toGraphClusters(views []k8ssync.ClusterView) []*model.Cluster {
+func toGraphClusters(views []clustersync.ClusterView) []*model.Cluster {
 	return mapSlice(views, toGraphCluster)
 }
 
-func toGraphCluster(v k8ssync.ClusterView) *model.Cluster {
+func toGraphCluster(v clustersync.ClusterView) *model.Cluster {
 	return &model.Cluster{
 		UUID:                   v.UUID,
 		Name:                   v.Name,
