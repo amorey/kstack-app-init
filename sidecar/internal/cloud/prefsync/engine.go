@@ -1,8 +1,8 @@
 // Package prefsync is the sidecar's always-on settings reconciliation
 // engine. It owns one supervised connection to the cloud: take a snapshot,
 // apply it locally, then stream events. On any upstream end/error it
-// reconnects with exponential backoff; on a detected wall-clock gap (machine
-// sleep/resume) it forces an immediate resync.
+// reconnects with exponential backoff. Wake/resync signals arrive via the
+// shared poke.Service passed to New.
 //
 // The path is local-first: Set writes the local store immediately and queues
 // the patch, so an edit takes effect (and survives a restart) even offline.
@@ -21,6 +21,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefs"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // Upstream is the slice of the cloud client the engine needs. Snapshot is a
@@ -73,37 +74,31 @@ type Status struct {
 	LastSyncedAt time.Time
 }
 
-// Options configures an Engine. Zero values get sane defaults; the
-// injectable seams (Now/Sleep/Jitter) keep tests deterministic.
-type Options struct {
-	BaseBackoff time.Duration
-	MaxBackoff  time.Duration
-	Tick        time.Duration // wake-detector heartbeat interval
-	GapFactor   float64       // wall gap > Tick*GapFactor ⇒ treat as resume
+// engineOpts holds the backoff knobs and the injectable seams. Zero values get
+// sane defaults. It is not part of the public surface: production calls New
+// (defaults only); white-box tests inject deterministic seams via the option
+// functions below, applied by newWithOptions.
+type engineOpts struct {
+	baseBackoff time.Duration
+	maxBackoff  time.Duration
 
-	Now    func() time.Time
-	Sleep  func(context.Context, time.Duration) error
-	Jitter func(time.Duration) time.Duration
+	now    func() time.Time
+	sleep  func(context.Context, time.Duration) error
+	jitter func(time.Duration) time.Duration
 }
 
-func (o *Options) applyDefaults() {
-	if o.BaseBackoff <= 0 {
-		o.BaseBackoff = time.Second
+func (o *engineOpts) applyDefaults() {
+	if o.baseBackoff <= 0 {
+		o.baseBackoff = time.Second
 	}
-	if o.MaxBackoff <= 0 {
-		o.MaxBackoff = 30 * time.Second
+	if o.maxBackoff <= 0 {
+		o.maxBackoff = 30 * time.Second
 	}
-	if o.Tick <= 0 {
-		o.Tick = 15 * time.Second
+	if o.now == nil {
+		o.now = time.Now
 	}
-	if o.GapFactor <= 0 {
-		o.GapFactor = 2
-	}
-	if o.Now == nil {
-		o.Now = time.Now
-	}
-	if o.Sleep == nil {
-		o.Sleep = func(ctx context.Context, d time.Duration) error {
+	if o.sleep == nil {
+		o.sleep = func(ctx context.Context, d time.Duration) error {
 			t := time.NewTimer(d)
 			defer t.Stop()
 			select {
@@ -114,9 +109,9 @@ func (o *Options) applyDefaults() {
 			}
 		}
 	}
-	if o.Jitter == nil {
+	if o.jitter == nil {
 		// Full-ish jitter: a random point in [d/2, d].
-		o.Jitter = func(d time.Duration) time.Duration {
+		o.jitter = func(d time.Duration) time.Duration {
 			if d <= 0 {
 				return 0
 			}
@@ -125,12 +120,36 @@ func (o *Options) applyDefaults() {
 	}
 }
 
+// option is an unexported build seam for newWithOptions. Because the type is
+// unexported, only this package's white-box tests can construct one — the
+// production New takes no seams. Mirrors the auth/cloud option pattern.
+type option func(*engineOpts)
+
+// withBackoff overrides the base/max backoff (defaults: 1s/30s).
+func withBackoff(base, max time.Duration) option {
+	return func(o *engineOpts) { o.baseBackoff, o.maxBackoff = base, max }
+}
+
+// withNow overrides the clock seam.
+func withNow(f func() time.Time) option { return func(o *engineOpts) { o.now = f } }
+
+// withSleep overrides the backoff-sleep seam.
+func withSleep(f func(context.Context, time.Duration) error) option {
+	return func(o *engineOpts) { o.sleep = f }
+}
+
+// withJitter overrides the backoff-jitter seam.
+func withJitter(f func(time.Duration) time.Duration) option {
+	return func(o *engineOpts) { o.jitter = f }
+}
+
 // Engine reconciles the settings resource. Construct with New, run with Run.
 type Engine struct {
-	up    Upstream
-	store *prefs.Store
-	queue *mutationqueue.Queue
-	opt   Options
+	up      Upstream
+	store   *prefs.Store
+	queue   *mutationqueue.Queue
+	pokeSvc *poke.Service // resync source; nil disables external wake signals
+	opt     engineOpts
 
 	mu     sync.Mutex
 	status Status
@@ -146,15 +165,30 @@ type Engine struct {
 	pokeCh chan struct{}
 }
 
-// New builds an Engine. It does not start anything; call Run.
-func New(up Upstream, store *prefs.Store, queue *mutationqueue.Queue, opt Options) *Engine {
-	opt.applyDefaults()
+// New builds an Engine. It does not start anything; call Run. pokeSvc is the
+// resync source (the shared poke.Service); pass nil to disable external wake
+// signals (tests, degraded deployments). The backoff/clock seams use defaults —
+// only this package's white-box tests override them via newWithOptions.
+func New(up Upstream, store *prefs.Store, queue *mutationqueue.Queue, pokeSvc *poke.Service) *Engine {
+	return newWithOptions(up, store, queue, pokeSvc)
+}
+
+// newWithOptions is the build entry point that also accepts the unexported test
+// seams. New is the production wrapper (no options); in-package white-box tests
+// call this directly to inject a deterministic clock/backoff.
+func newWithOptions(up Upstream, store *prefs.Store, queue *mutationqueue.Queue, pokeSvc *poke.Service, opts ...option) *Engine {
+	var o engineOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+	o.applyDefaults()
 	return &Engine{
-		up:     up,
-		store:  store,
-		queue:  queue,
-		opt:    opt,
-		pokeCh: make(chan struct{}, 1),
+		up:      up,
+		store:   store,
+		queue:   queue,
+		pokeSvc: pokeSvc,
+		opt:     o,
+		pokeCh:  make(chan struct{}, 1),
 	}
 }
 
@@ -217,7 +251,15 @@ func (e *Engine) Poke() {
 
 // Run blocks until ctx is cancelled, supervising the upstream connection.
 func (e *Engine) Run(ctx context.Context) {
-	go e.wakeLoop(ctx)
+	if e.pokeSvc != nil {
+		ch, cancel := e.pokeSvc.Subscribe()
+		defer cancel()
+		go func() {
+			for range ch {
+				e.Poke()
+			}
+		}()
+	}
 
 	attempt := 0
 	for ctx.Err() == nil {
@@ -375,7 +417,7 @@ func (e *Engine) apply(v prefs.Settings, snapshot bool) error {
 		return err
 	}
 	if snapshot {
-		now := e.opt.Now()
+		now := e.opt.now()
 		e.setStatus(func(s *Status) { s.LastSyncedAt = now })
 	}
 	return nil
@@ -433,11 +475,11 @@ func (e *Engine) abandonAttempt(ctx context.Context, cancel context.CancelFunc) 
 // backoffDelay is the exponential-with-jitter delay for an attempt, clamped
 // to MaxBackoff.
 func (e *Engine) backoffDelay(attempt int) time.Duration {
-	d := e.opt.BaseBackoff << attempt
-	if d <= 0 || d > e.opt.MaxBackoff {
-		d = e.opt.MaxBackoff
+	d := e.opt.baseBackoff << attempt
+	if d <= 0 || d > e.opt.maxBackoff {
+		d = e.opt.maxBackoff
 	}
-	return e.opt.Jitter(d)
+	return e.opt.jitter(d)
 }
 
 // enterWaiting records the retry state and sleeps the backoff delay, racing
@@ -445,20 +487,20 @@ func (e *Engine) backoffDelay(attempt int) time.Duration {
 // delay reaches the cap. Returns true if ctx ended during the wait.
 func (e *Engine) enterWaiting(ctx context.Context, attempt *int, st State, errMsg string) bool {
 	d := e.backoffDelay(*attempt)
-	if e.opt.BaseBackoff<<*attempt < e.opt.MaxBackoff {
+	if e.opt.baseBackoff<<*attempt < e.opt.maxBackoff {
 		*attempt++
 	}
 	e.setStatus(func(s *Status) {
 		s.State = st
 		s.LastError = errMsg
-		s.RetryAt = e.opt.Now().Add(d)
+		s.RetryAt = e.opt.now().Add(d)
 	})
 
 	sctx, scancel := context.WithCancel(ctx)
 	defer scancel()
 	slept := make(chan struct{})
 	go func() {
-		_ = e.opt.Sleep(sctx, d)
+		_ = e.opt.sleep(sctx, d)
 		close(slept)
 	}()
 	select {
@@ -468,28 +510,5 @@ func (e *Engine) enterWaiting(ctx context.Context, attempt *int, st State, errMs
 		return false
 	case <-slept:
 		return ctx.Err() != nil
-	}
-}
-
-// wakeLoop is the wall-clock resume backstop: the ticker can't fire while the
-// process is frozen, so a tick arriving far past the heartbeat interval means
-// a sleep/resume — poke an immediate resync.
-func (e *Engine) wakeLoop(ctx context.Context) {
-	t := time.NewTicker(e.opt.Tick)
-	defer t.Stop()
-
-	lastSeen := e.opt.Now()
-	threshold := time.Duration(float64(e.opt.Tick) * e.opt.GapFactor)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			now := e.opt.Now()
-			if now.Sub(lastSeen) > threshold {
-				e.Poke()
-			}
-			lastSeen = now
-		}
 	}
 }

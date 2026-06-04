@@ -1,4 +1,4 @@
-package prefsync_test
+package prefsync
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefs"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefsync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 var epoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -195,13 +195,13 @@ func (u *streamErrUpstream) Update(context.Context, prefs.Settings) (prefs.Setti
 func TestStreamErrorIsSurfaced(t *testing.T) {
 	store, q := newStoreQueue(t)
 	up := &streamErrUpstream{err: errors.New("connection reset")}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	runEngine(t, e)
 
 	waitFor(t, func() bool {
 		s := e.Status()
-		return s.State == prefsync.StateBackoff && s.LastError == "connection reset"
+		return s.State == StateBackoff && s.LastError == "connection reset"
 	}, "stream terminal error was not surfaced as a backoff with LastError")
 }
 
@@ -212,7 +212,7 @@ func TestStreamErrorIsSurfaced(t *testing.T) {
 func TestPokeCancelsInFlightSnapshot(t *testing.T) {
 	store, q := newStoreQueue(t)
 	up := &blockSnapshotUpstream{entered: make(chan struct{}, 4)}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	runEngine(t, e)
 
@@ -234,7 +234,7 @@ func TestPokeCancelsInFlightSnapshot(t *testing.T) {
 // runEngine starts e.Run in the background and registers cleanup that cancels
 // it and WAITS for the goroutine to exit, so tests don't leak Run goroutines
 // across repeated package runs (go test -count=N). Returns the run context.
-func runEngine(t *testing.T, e *prefsync.Engine) context.Context {
+func runEngine(t *testing.T, e *Engine) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -252,17 +252,15 @@ func runEngine(t *testing.T, e *prefsync.Engine) context.Context {
 // testOpts parks the backoff sleep until ctx is cancelled, so the engine
 // applies once and then idles deterministically (no spin, no wall-clock
 // waits).
-func testOpts() prefsync.Options {
-	return prefsync.Options{
-		BaseBackoff: time.Second,
-		MaxBackoff:  time.Minute,
-		Tick:        time.Hour,
-		Now:         func() time.Time { return epoch },
-		Jitter:      func(d time.Duration) time.Duration { return d },
-		Sleep: func(ctx context.Context, _ time.Duration) error {
+func testOpts() []option {
+	return []option{
+		withBackoff(time.Second, time.Minute),
+		withNow(func() time.Time { return epoch }),
+		withJitter(func(d time.Duration) time.Duration { return d }),
+		withSleep(func(ctx context.Context, _ time.Duration) error {
 			<-ctx.Done()
 			return ctx.Err()
-		},
+		}),
 	}
 }
 
@@ -333,7 +331,7 @@ func readUntil(t *testing.T, sub prefs.Subscription, pred func(prefs.Settings) b
 func TestSnapshotApplied(t *testing.T) {
 	store, q := newStoreQueue(t)
 	up := &fakeUpstream{snap: prefs.Settings{Theme: new("dark")}, watchCh: closedCh()}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	sub := store.Subscribe()
 	defer sub.Close()
@@ -348,7 +346,7 @@ func TestStreamDeltaApplied(t *testing.T) {
 	store, q := newStoreQueue(t)
 	ch := make(chan prefs.Settings, 1)
 	up := &fakeUpstream{snap: prefs.Settings{Theme: new("base")}, watchCh: ch}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	sub := store.Subscribe()
 	defer sub.Close()
@@ -367,13 +365,13 @@ func TestUpstreamErrorBacksOff(t *testing.T) {
 
 	sleeps := make(chan time.Duration)
 	release := make(chan struct{})
-	opt := testOpts()
 	// Report the backoff delay, then PARK inside Sleep until the test releases
 	// us. The real Sleep blocks for the whole delay — during which the engine
 	// is genuinely Offline — so the fake must keep the engine parked too.
 	// Returning right after the send would let Run loop back to StateConnecting
-	// before the test reads Status(), racing the assertion below.
-	opt.Sleep = func(ctx context.Context, d time.Duration) error {
+	// before the test reads Status(), racing the assertion below. Override the
+	// parking sleep from testOpts by appending a withSleep last.
+	opts := append(testOpts(), withSleep(func(ctx context.Context, d time.Duration) error {
 		select {
 		case sleeps <- d:
 		case <-ctx.Done():
@@ -385,14 +383,14 @@ func TestUpstreamErrorBacksOff(t *testing.T) {
 			return ctx.Err()
 		}
 		return nil
-	}
-	e := prefsync.New(up, store, q, opt)
+	}))
+	e := newWithOptions(up, store, q, nil, opts...)
 
 	runEngine(t, e)
 
 	// First error: engine is parked in Sleep, so the state is settled at Offline.
 	d1 := <-sleeps
-	if got := e.Status().State; got != prefsync.StateOffline {
+	if got := e.Status().State; got != StateOffline {
 		t.Fatalf("state after error: want Offline, got %v", got)
 	}
 	release <- struct{}{} // let the first backoff finish → engine retries, fails again
@@ -409,7 +407,7 @@ func TestUpstreamErrorBacksOff(t *testing.T) {
 func TestLocalSetWritesAndEnqueues(t *testing.T) {
 	store, q := newStoreQueue(t)
 	up := &fakeUpstream{updates: make(chan prefs.Settings, 1)}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	if err := e.Set(prefs.Settings{Theme: new("dark")}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -441,7 +439,7 @@ func TestSetNotExposedWhenEnqueueFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("queue New: %v", err)
 	}
-	e := prefsync.New(&fakeUpstream{}, store, q, testOpts())
+	e := newWithOptions(&fakeUpstream{}, store, q, nil, testOpts()...)
 
 	// Break the dir so the enqueue's atomic persist fails (cross-platform).
 	breakDir(t, dir)
@@ -471,7 +469,7 @@ func TestSetRollsBackQueueWhenStoreFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("queue New: %v", err)
 	}
-	e := prefsync.New(&fakeUpstream{}, store, q, testOpts())
+	e := newWithOptions(&fakeUpstream{}, store, q, nil, testOpts()...)
 
 	// Break only the store dir so Enqueue (separate dir) succeeds while the
 	// store write fails — exercising the rollback path cross-platform.
@@ -499,14 +497,14 @@ func TestSnapshotApplyFailureIsSyncFailure(t *testing.T) {
 	}
 	// Watch would block forever if reached — the test asserts we never get there.
 	up := &fakeUpstream{snap: prefs.Settings{Theme: new("dark")}, watchCh: make(chan prefs.Settings)}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	// Break the store dir so persisting the snapshot fails (cross-platform).
 	breakDir(t, storeDir)
 
 	runEngine(t, e)
 
-	waitFor(t, func() bool { return e.Status().State == prefsync.StateOffline },
+	waitFor(t, func() bool { return e.Status().State == StateOffline },
 		"engine did not enter Offline on a failed snapshot apply")
 	if !e.Status().LastSyncedAt.IsZero() {
 		t.Fatal("LastSyncedAt stamped despite the snapshot never being persisted")
@@ -522,7 +520,7 @@ func TestQueueDrainedOnConnect(t *testing.T) {
 		watchCh: make(chan prefs.Settings), // stays open → engine reaches Live
 		updates: make(chan prefs.Settings, 4),
 	}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	// Enqueue an offline edit before the engine connects.
 	if err := e.Set(prefs.Settings{Theme: new("dark")}); err != nil {
@@ -560,7 +558,7 @@ func TestDrainStopsWhenAckFails(t *testing.T) {
 		watchCh: make(chan prefs.Settings),
 		updates: make(chan prefs.Settings, 8),
 	}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	// Two queued offline edits, enqueued while the dir still exists.
 	if err := e.Set(prefs.Settings{Theme: new("a")}); err != nil {
@@ -610,7 +608,7 @@ func TestDrainStopsWhenAckFails(t *testing.T) {
 func TestDrainBeforeWatchProtectsAckedEdit(t *testing.T) {
 	store, q := newStoreQueue(t)
 	up := &echoUpstream{state: prefs.Settings{Theme: new("cloud"), Locale: new("x")}}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	// A local-first edit: applied locally and queued before connecting.
 	if err := e.Set(prefs.Settings{Theme: new("local")}); err != nil {
@@ -634,7 +632,7 @@ func TestDrainBeforeWatchProtectsAckedEdit(t *testing.T) {
 func TestDrainFailureBacksOffAndRetries(t *testing.T) {
 	store, q := newStoreQueue(t)
 	up := &failDrainUpstream{updateErr: errors.New("transient update failure")}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	// Queue a local edit for the engine to drain.
 	if err := e.Set(prefs.Settings{Theme: new("dark")}); err != nil {
@@ -643,7 +641,7 @@ func TestDrainFailureBacksOffAndRetries(t *testing.T) {
 
 	runEngine(t, e)
 
-	waitFor(t, func() bool { return e.Status().State == prefsync.StateOffline },
+	waitFor(t, func() bool { return e.Status().State == StateOffline },
 		"engine did not back off after a failed drain")
 	// The failed entry stays durably queued for the next cycle.
 	if n := len(q.Pending()); n != 1 {
@@ -656,7 +654,7 @@ func TestDrainFailureBacksOffAndRetries(t *testing.T) {
 // the lock, both merge from the same base and the later write drops a field.)
 func TestConcurrentSetsDoNotDropFields(t *testing.T) {
 	store, q := newStoreQueue(t)
-	e := prefsync.New(&fakeUpstream{}, store, q, testOpts())
+	e := newWithOptions(&fakeUpstream{}, store, q, nil, testOpts()...)
 
 	for i := 0; i < 200; i++ {
 		v := strconv.Itoa(i)
@@ -683,7 +681,7 @@ func TestPendingPatchMergedOverSnapshot(t *testing.T) {
 		watchCh:   closedCh(),
 		updateErr: errors.New("still offline"), // Update fails → patch stays pending
 	}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	// Local edit: Theme=dark, still pending.
 	if err := e.Set(prefs.Settings{Theme: new("dark")}); err != nil {
@@ -711,7 +709,7 @@ func TestPendingPatchMergedOverSnapshot(t *testing.T) {
 func TestPokeDuringConnectIsNotAFailure(t *testing.T) {
 	store, q := newStoreQueue(t)
 	up := &blockSnapshotUpstream{entered: make(chan struct{}, 4)}
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	runEngine(t, e)
 
@@ -776,7 +774,7 @@ func TestDrainDoesNotAckAfterCancel(t *testing.T) {
 	up := &cancelOnUpdateUpstream{updated: make(chan struct{}, 1)}
 	// Cancel between Update succeeding and the Ack — the engine then exits.
 	up.onUpdate = cancel
-	e := prefsync.New(up, store, q, testOpts())
+	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	if err := e.Set(prefs.Settings{Theme: new("dark")}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -798,5 +796,37 @@ func TestDrainDoesNotAckAfterCancel(t *testing.T) {
 
 	if n := len(q.Pending()); n != 1 {
 		t.Fatalf("want the pushed-but-unacked patch still queued, got %d pending", n)
+	}
+}
+
+// B6: a Signal received from the Notifier collapses the backoff and triggers
+// an immediate reconnect — the wakeLoop test that was never written when the
+// detector lived inside the engine.
+func TestEngine_NotifierSignalPokes(t *testing.T) {
+	store, q := newStoreQueue(t)
+	// Upstream always fails Snapshot so the engine parks in backoff.
+	up := &blockSnapshotUpstream{entered: make(chan struct{}, 4)}
+
+	b := poke.New(poke.Options{Now: func() time.Time { return epoch }})
+	e := newWithOptions(up, store, q, b, testOpts()...)
+
+	runEngine(t, e)
+
+	// Wait for the first Snapshot to block (engine is in connecting state).
+	select {
+	case <-up.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("engine never entered Snapshot")
+	}
+
+	// Poke the broadcaster — the forwarding goroutine calls e.Poke(), which
+	// cancels the in-flight Snapshot and wakes any in-flight backoff.
+	b.Poke(poke.SourceHost)
+
+	// Engine should re-enter Snapshot promptly (proving the poke propagated).
+	select {
+	case <-up.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("notifier poke did not trigger a reconnect")
 	}
 }

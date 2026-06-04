@@ -21,6 +21,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // defaultKeychainService is the OS-keychain service name the sidecar stores the
@@ -70,6 +71,7 @@ type App struct {
 	clusterSvc        *cluster.Service
 	authSvc           auth.Service
 	cloudSvc          *cloud.Service
+	pokeSvc           *poke.Service
 }
 
 // New builds the composition root. The kube-config watcher is shared by the
@@ -113,10 +115,16 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 
+	// The resync broadcaster is the shared, cross-subsystem poke bus. It owns the
+	// wall-clock gap detector (machine sleep/resume backstop) and will accept pokes
+	// from the host via gRPC (follow-up PR). App owns its lifecycle; cloud and other
+	// subsystems subscribe to it.
+	pokeSvc := poke.New(poke.Options{})
+
 	// The cloud-synced settings service depends on auth (for the token source and
 	// the session change signal). It degrades when CloudURL/DataDir are empty
 	// (standalone/test runs ⇒ no settings sync).
-	cloudSvc, err := cloud.New(cfg.DataDir, cfg.CloudURL, authSvc)
+	cloudSvc, err := cloud.New(cfg.DataDir, cfg.CloudURL, authSvc, pokeSvc)
 	if err != nil {
 		return nil, err
 	}
@@ -159,6 +167,7 @@ func New(cfg Config) (*App, error) {
 		clusterSvc:        clusterSvc,
 		authSvc:           authSvc,
 		cloudSvc:          cloudSvc,
+		pokeSvc:           pokeSvc,
 	}, nil
 }
 
@@ -171,6 +180,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // derived from ctx so a cancel of ctx (or Close) stops it. Call once, before
 // serving.
 func (a *App) Start(ctx context.Context) {
+	a.pokeSvc.Start(ctx)
 	a.clusterSvc.Start(ctx)
 	a.cloudSvc.Start(ctx)
 }
@@ -207,6 +217,7 @@ func (a *App) Close() error {
 	a.grpcServer.Stop()
 	cloudErr := a.cloudSvc.Close()
 	clusterErr := a.clusterSvc.Close()
+	a.pokeSvc.Close()
 	a.kubeConfigWatcher.Close()
 	return errors.Join(cloudErr, clusterErr)
 }

@@ -36,8 +36,9 @@ strip = true        # strip symbols from the shipped binary
 [features]
 # Compiles the webview inspector (devtools) into an otherwise-release build so
 # production behavior — e.g. the bundled CSP with its injected nonces — can be
-# inspected. DO NOT ship: on macOS this links private WebKit APIs and triggers
-# App Store rejection. Build with `pnpm tauri build --features debug-prod`.
+# inspected. DO NOT ship to users: on macOS this links private WebKit APIs.
+# (We don't distribute via the Mac App Store, so this is a prod-hygiene rule,
+# not an App Store one.) Build with `pnpm tauri build --features debug-prod`.
 debug-prod = ["tauri/devtools"]
 
 [dependencies]

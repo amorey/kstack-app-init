@@ -155,7 +155,7 @@ func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 		watchOpened: make(chan struct{}, 8),
 		cancelled:   make(chan struct{}, 8),
 	}
-	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", authSvc, withUpstream(up))
+	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", authSvc, nil, withUpstream(up))
 	if err != nil {
 		t.Fatalf("cloud.New: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 func TestStartIsIdempotent(t *testing.T) {
 	authSvc, _ := auth.New(auth.Config{})
 	up := &signalUpstream{started: make(chan struct{}, 1)}
-	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", authSvc, withUpstream(up))
+	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", authSvc, nil, withUpstream(up))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestStartIsIdempotent(t *testing.T) {
 // A Service built with no cloud config (and no auth) is safe — Prefs is absent
 // and the lifecycle is a no-op.
 func TestDegradedConstruction(t *testing.T) {
-	svc, err := New("", "", nil)
+	svc, err := New("", "", nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestDegradedConstruction(t *testing.T) {
 
 // Start/Close on a degraded Service are no-ops and don't panic.
 func TestDegradedLifecycleNoop(t *testing.T) {
-	svc, err := New("", "", nil)
+	svc, err := New("", "", nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestDegradedLifecycleNoop(t *testing.T) {
 func TestConfiguredStartStop(t *testing.T) {
 	authSvc, _ := auth.New(auth.Config{})
 	up := &signalUpstream{started: make(chan struct{}, 1)}
-	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", authSvc, withUpstream(up)) // test seam: inject fake instead of the api client
+	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", authSvc, nil, withUpstream(up)) // test seam: inject fake instead of the api client
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

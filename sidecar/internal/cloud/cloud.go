@@ -20,6 +20,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefs"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefsync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // option is an unexported build seam for New. Because the type is unexported,
@@ -60,14 +61,17 @@ type Service struct {
 // engine, no prefs store) unless dataDir is set and an upstream is available —
 // the api client needs cloudURL plus an oauth2.TokenSource from a configured auth
 // service.
-func New(dataDir, cloudURL string, authSvc auth.Service) (*Service, error) {
-	return newWithOptions(dataDir, cloudURL, authSvc)
+// New builds the cloud settings service. pokeSvc is the shared resync
+// broadcaster owned by the app; nil disables external wake signals (degraded
+// deployments, tests).
+func New(dataDir, cloudURL string, authSvc auth.Service, pokeSvc *poke.Service) (*Service, error) {
+	return newWithOptions(dataDir, cloudURL, authSvc, pokeSvc)
 }
 
 // newWithOptions is the build entry point that also accepts the unexported test
 // seams. New is the production wrapper (no options); in-package white-box tests
 // call this directly to inject a fake upstream.
-func newWithOptions(dataDir, cloudURL string, authSvc auth.Service, opts ...option) (*Service, error) {
+func newWithOptions(dataDir, cloudURL string, authSvc auth.Service, pokeSvc *poke.Service, opts ...option) (*Service, error) {
 	var o buildOpts
 	for _, opt := range opts {
 		opt(&o)
@@ -100,7 +104,7 @@ func newWithOptions(dataDir, cloudURL string, authSvc auth.Service, opts ...opti
 	}
 
 	s.prefs = prefsStore
-	s.engine = prefsync.New(up, prefsStore, queue, prefsync.Options{})
+	s.engine = prefsync.New(up, prefsStore, queue, pokeSvc)
 	return s, nil
 }
 

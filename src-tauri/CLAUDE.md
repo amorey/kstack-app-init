@@ -2,6 +2,12 @@
 
 The desktop app's native host (Tauri 2). It owns windows, the tray and menus, the Go sidecar's lifecycle, and bridges GraphQL from the webview to the sidecar over a Unix socket (named pipe on Windows).
 
+## Distribution & updates
+
+**This app is NOT distributed through the Mac App Store** — we ship notarized direct downloads (`.dmg`/`.app`) on macOS plus Windows/Linux bundles. There is no MAS build target.
+
+Because we control distribution end-to-end, in-app updates use the **official `tauri-plugin-updater`** (signed bundles + a hosted release manifest), not Apple's update mechanism. The MAS self-update prohibition does not apply to us. Note the app and its bundled Go sidecar (`externalBin`) are versioned and updated together — the whole bundle is replaced — so a release bump covers either side changing.
+
 ## Layout
 
 - `main.rs` — thin; just calls `lib::run()`.
