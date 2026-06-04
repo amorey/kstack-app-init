@@ -12,9 +12,13 @@ fn main() {
     // Go sidecar). The host is a client only, so skip server codegen.
     tonic_prost_build::configure()
         .build_server(false)
-        .compile_protos(&["../proto/kubecontext.proto"], &["../proto"])
-        .expect("compile kubecontext.proto");
+        .compile_protos(
+            &["../proto/kubecontext.proto", "../proto/auth.proto"],
+            &["../proto"],
+        )
+        .expect("compile proto");
     println!("cargo:rerun-if-changed=../proto/kubecontext.proto");
+    println!("cargo:rerun-if-changed=../proto/auth.proto");
 
     tauri_build::build();
 }

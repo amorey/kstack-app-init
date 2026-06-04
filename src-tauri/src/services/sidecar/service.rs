@@ -25,7 +25,7 @@ use tokio::sync::watch;
 use crate::error::{AppError, Result};
 
 use super::graphql::{FrameSink, GraphqlResponse, QueryClient, SubscriptionClient};
-use super::grpc::{GrpcClient, WatchStream};
+use super::grpc::{AuthStateStream, GrpcClient, WatchStream};
 use super::ipc::{Endpoint, DEFAULT_CONNECT_BUDGET};
 use super::logs::{forward_sidecar_line, Severity};
 
@@ -292,6 +292,28 @@ impl SidecarService {
     /// dropped (e.g. sidecar restart) and the supervisor should re-open it.
     pub async fn watch_kube_context(&self) -> Result<WatchStream> {
         self.grpc_client.watch().await
+    }
+
+    /// Runs the synchronous login setup phase on the sidecar (loopback bind +
+    /// browser open). Returns once setup succeeds or fails; the resulting session
+    /// change is delivered via [`Self::watch_auth_state`].
+    pub async fn start_login(&self) -> Result<()> {
+        self.grpc_client.start_login().await
+    }
+
+    /// Clears local credentials and revokes the refresh token (fire-and-forget
+    /// revocation on the sidecar).
+    pub async fn logout(&self) -> Result<()> {
+        self.grpc_client.logout().await
+    }
+
+    /// Opens the host-internal auth-state watch stream over gRPC: the current
+    /// snapshot first (latest-value), then a fresh snapshot on every session
+    /// change. Drives the tray's account submenu. The caller pulls frames with
+    /// `stream.message().await`; an error / end-of-stream means the connection
+    /// dropped and the supervisor should re-open it.
+    pub async fn watch_auth_state(&self) -> Result<AuthStateStream> {
+        self.grpc_client.watch_auth_state().await
     }
 
     /// Asks the sidecar to shut down gracefully, blocking until it exits or

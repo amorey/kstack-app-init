@@ -21,7 +21,9 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/grpc/authpb"
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/kubecontextpb"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 )
@@ -136,13 +138,13 @@ type Server struct {
 	once   sync.Once
 }
 
-// NewServer registers the KubeContextService on a fresh *grpc.Server bound to a
-// serving context it owns. The webview never reaches gRPC (h2c routes it to the
-// host's tray); a nil watcher keeps every method safe, mirroring the GraphQL
-// resolver nil-guards.
-func NewServer(watcher *k8shelpers.KubeConfigWatcher) *Server {
+// NewServer registers KubeContextService and AuthService on a fresh *grpc.Server
+// bound to a serving context it owns. The webview never reaches gRPC (h2c routes
+// it to the host's tray); nil watcher/authSvc keeps every method safe, mirroring
+// the GraphQL resolver nil-guards.
+func NewServer(watcher *k8shelpers.KubeConfigWatcher, authSvc auth.Service) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	srv, drainStreams := newServer(ctx, watcher)
+	srv, drainStreams := newServer(ctx, watcher, authSvc)
 	return &Server{grpc: srv, cancel: cancel, drain: drainStreams}
 }
 
@@ -184,7 +186,7 @@ func (s *Server) Stop() { s.grpc.Stop() }
 // The keepalive ping keeps an idle Watch stream's h2c connection alive under the
 // HTTP server's 60s IdleTimeout (an idle kubeconfig can sit unchanged for far
 // longer than that).
-func newServer(servingCtx context.Context, watcher *k8shelpers.KubeConfigWatcher) (srv *grpc.Server, drainStreams func()) {
+func newServer(servingCtx context.Context, watcher *k8shelpers.KubeConfigWatcher, authSvc auth.Service) (srv *grpc.Server, drainStreams func()) {
 	var streams sync.WaitGroup
 	srv = grpc.NewServer(grpc.KeepaliveParams(keepalive.ServerParameters{
 		Time:    30 * time.Second,
@@ -192,6 +194,11 @@ func newServer(servingCtx context.Context, watcher *k8shelpers.KubeConfigWatcher
 	}))
 	kubecontextpb.RegisterKubeContextServiceServer(srv, &kubeContextServer{
 		watcher:    watcher,
+		servingCtx: servingCtx,
+		streams:    &streams,
+	})
+	authpb.RegisterAuthServiceServer(srv, &authServer{
+		auth:       authSvc,
 		servingCtx: servingCtx,
 		streams:    &streams,
 	})

@@ -68,7 +68,7 @@ func main() {
 	application, err := app.New(app.Config{
 		KubeconfigPath: *kubeconfigPath,
 		DataDir:        *dataDir,
-		CloudURL:       envOr("KSTACK_CLOUD_URL", "https://api.kstack.sh"),
+		CloudURL:       envOr("KSTACK_CLOUD_API_URL", "https://api.kstack.sh"),
 		OAuthIssuerURL: envOr("KSTACK_OAUTH_ISSUER", "https://oauth.kstack.sh"),
 		OAuthClientID:  envOr("KSTACK_OAUTH_CLIENT_ID", "kstack-desktop"),
 		// Empty in a normal release run ⇒ the "Kstack" default. The host sets

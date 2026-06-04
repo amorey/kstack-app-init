@@ -17,11 +17,12 @@
 //!
 //! The Tauri wiring lives here; the pure, unit-tested domain logic behind the
 //! "Default Context" submenu (menu-id formatting, descriptor building) lives in
-//! [`default_context_picker`]. [`build_tray`] and [`spawn_tray_subscription`]
+//! [`default_context_picker`]. [`build_tray`] and [`spawn_kubeconfig_subscription`]
 //! are each called once during app setup (see `lib.rs`). The menu event handler
 //! routes user actions — opening or focusing windows, switching context,
 //! quitting — through the shared [`AppState`].
 
+pub mod account_menu;
 mod default_context_picker;
 
 use std::time::Duration;
@@ -33,9 +34,28 @@ use tauri::{AppHandle, Manager, Wry};
 use crate::error::Result;
 use crate::services::sidecar::KubeContextState;
 use crate::state::AppState;
+use account_menu::{
+    account_snapshot_from, build_account_descriptor, AccountMenuDescriptor, ACCOUNT_LOGIN_ID,
+    ACCOUNT_LOGOUT_ID, ACCOUNT_SETTINGS_ID,
+};
 use default_context_picker::{
     build_context_descriptors, context_menu_id, parse_context_menu_id, ContextItem,
 };
+
+/// Holds the latest gRPC snapshots for both tray watch streams so each rebuild
+/// sees the most-recent state from both. Updated by whichever stream fires;
+/// the other field starts as `None` and renders as its safe default (Loading /
+/// SignedOut) until its stream delivers. Protected by a plain `std::sync::Mutex`:
+/// the critical section is tiny and synchronous — no `.await` is ever held
+/// under the lock — so poisoning uses `unwrap_or_else(|p| p.into_inner())`.
+#[derive(Default)]
+pub(crate) struct TraySnapshots {
+    kube: Option<KubeContextState>,
+    account: Option<account_menu::AccountSnapshot>,
+}
+
+/// Base URL for the kstack cloud dashboard.
+const KSTACK_CLOUD_DASHBOARD_URL: &str = "https://app.kstack.sh";
 
 /// Stable id for the system tray icon, so the watch supervisor can look it up
 /// via [`Manager::tray_by_id`] and swap its menu without owning the handle.
@@ -59,9 +79,14 @@ const TRAY_ID: &str = "main";
 ///
 /// Panics if the app has no default window icon.
 pub fn build_tray(app: &AppHandle) -> Result<()> {
-    // Start in the loading state; the host-internal kubeConfigWatch
-    // subscription's first frame populates the real contexts (see below).
-    let menu = build_tray_menu(app, ContextMenuState::Loading)?;
+    // Start in the loading state for both sections; the watch supervisors
+    // populate them on their first frames (see spawn_kubeconfig_subscription /
+    // spawn_authstate_subscription below).
+    let menu = build_tray_menu(
+        app,
+        ContextMenuState::Loading,
+        AccountMenuDescriptor::SignedOut,
+    )?;
 
     TrayIconBuilder::with_id(TrayIconId::new(TRAY_ID))
         .menu(&menu)
@@ -87,6 +112,46 @@ pub fn build_tray(app: &AppHandle) -> Result<()> {
                     }
                 });
                 return;
+            }
+
+            // Account auth actions — async RPCs, fire-and-forget; the result
+            // comes back through the auth-state watch stream and rebuilds the
+            // menu automatically.
+            match id {
+                ACCOUNT_LOGIN_ID => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app.state::<AppState>();
+                        if let Err(err) = state.sidecar.start_login().await {
+                            tracing::error!(%err, "failed to start login from tray");
+                        }
+                    });
+                    return;
+                }
+                ACCOUNT_LOGOUT_ID => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app.state::<AppState>();
+                        if let Err(err) = state.sidecar.logout().await {
+                            tracing::error!(%err, "failed to logout from tray");
+                        }
+                    });
+                    return;
+                }
+                ACCOUNT_SETTINGS_ID => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        use tauri_plugin_opener::OpenerExt;
+                        if let Err(err) = app.opener().open_url(
+                            format!("{KSTACK_CLOUD_DASHBOARD_URL}/account"),
+                            None::<&str>,
+                        ) {
+                            tracing::error!(%err, "failed to open account settings URL");
+                        }
+                    });
+                    return;
+                }
+                _ => {}
             }
 
             let state = app.state::<AppState>();
@@ -124,11 +189,14 @@ enum ContextMenuState<'a> {
 }
 
 /// Builds the full system-tray menu, including the dynamic "Default Context"
-/// submenu. Used both for the initial tray build (with [`ContextMenuState::Loading`])
-/// and for every rebuild [`KubeContextTraySink`] performs on a config change,
-/// so the static items (New Window / Show Main Window / Quit) stay defined in
-/// one place.
-fn build_tray_menu(app: &AppHandle, state: ContextMenuState) -> tauri::Result<Menu<Wry>> {
+/// submenu and the account section. Used both for the initial tray build and
+/// for every rebuild triggered by either watch stream, so the static items
+/// (New Window / Show Main Window / Quit) stay defined in one place.
+fn build_tray_menu(
+    app: &AppHandle,
+    ctx_state: ContextMenuState,
+    account: AccountMenuDescriptor,
+) -> tauri::Result<Menu<Wry>> {
     let new_window = MenuItem::with_id(app, "tray_new_window", "New Window", true, None::<&str>)?;
     let show_main = MenuItem::with_id(
         app,
@@ -139,8 +207,39 @@ fn build_tray_menu(app: &AppHandle, state: ContextMenuState) -> tauri::Result<Me
     )?;
     let quit = MenuItem::with_id(app, "tray_quit", "Quit", true, None::<&str>)?;
 
+    // Account section: "Sign in / Sign up" when signed out, or a submenu
+    // titled with the user's name containing "Account Settings" + "Sign out".
+    let acct_menu_item: Box<dyn tauri::menu::IsMenuItem<Wry>> = match account {
+        AccountMenuDescriptor::SignedOut => {
+            let item = MenuItem::with_id(
+                app,
+                ACCOUNT_LOGIN_ID,
+                "Sign in / Sign up",
+                true,
+                None::<&str>,
+            )?;
+            Box::new(item)
+        }
+        AccountMenuDescriptor::SignedIn { title } => {
+            let settings = MenuItem::with_id(
+                app,
+                ACCOUNT_SETTINGS_ID,
+                "Account Settings",
+                true,
+                None::<&str>,
+            )?;
+            let sign_out =
+                MenuItem::with_id(app, ACCOUNT_LOGOUT_ID, "Sign out", true, None::<&str>)?;
+            let submenu = SubmenuBuilder::new(app, title)
+                .item(&settings)
+                .item(&sign_out)
+                .build()?;
+            Box::new(submenu)
+        }
+    };
+
     let mut ctx_builder = SubmenuBuilder::new(app, "Default Context");
-    match state {
+    match ctx_state {
         // Disabled placeholders carry distinct ids so they never match the
         // `kube_ctx::` prefix the menu-event handler routes on.
         ContextMenuState::Loading => {
@@ -178,6 +277,8 @@ fn build_tray_menu(app: &AppHandle, state: ContextMenuState) -> tauri::Result<Me
     Menu::with_items(
         app,
         &[
+            acct_menu_item.as_ref(),
+            &PredefinedMenuItem::separator(app)?,
             &new_window,
             &show_main,
             &PredefinedMenuItem::separator(app)?,
@@ -188,20 +289,51 @@ fn build_tray_menu(app: &AppHandle, state: ContextMenuState) -> tauri::Result<Me
     )
 }
 
-/// Rebuilds the tray's "Default Context" submenu from a gRPC kube-context
-/// snapshot. muda requires menu mutation on the main thread, so the work is
-/// queued there via [`AppHandle::run_on_main_thread`] rather than run on the
-/// stream-reader task.
-fn rebuild_tray_menu(app: &AppHandle, state: &KubeContextState) {
-    let contexts: Vec<String> = state.contexts.iter().map(|c| c.name.clone()).collect();
-    let current = state.current_context.clone();
+/// Rebuilds the full tray menu from the combined latest kube-context and auth
+/// snapshots stored in [`AppState::tray`]. Both watch supervisors call this
+/// whenever their stream delivers a new frame.
+///
+/// muda requires menu mutation on the main thread, so the work is queued via
+/// [`AppHandle::run_on_main_thread`] rather than run on the stream-reader task.
+fn rebuild_tray_menu(app: &AppHandle) {
+    // Extract both states under the lock, release before the main-thread
+    // dispatch — no .await is ever held under this lock.
+    let (kube_data, account_snap) = {
+        let state = app.state::<AppState>();
+        let guard = state.tray.lock().unwrap_or_else(|p| p.into_inner());
+        // Project kube to (Vec<String>, String); KubeContextState isn't Clone.
+        let kube_data = guard.kube.as_ref().map(|k| {
+            (
+                k.contexts
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+                k.current_context.clone(),
+            )
+        });
+        let account_snap = guard
+            .account
+            .clone()
+            .unwrap_or_else(account_menu::AccountSnapshot::signed_out);
+        (kube_data, account_snap)
+    };
+
     let menu_app = app.clone();
     if let Err(err) = app.run_on_main_thread(move || {
         let Some(tray) = menu_app.tray_by_id(TRAY_ID) else {
             return;
         };
-        let descriptors = build_context_descriptors(&contexts, &current);
-        match build_tray_menu(&menu_app, ContextMenuState::Loaded(&descriptors)) {
+        // Build account descriptor inside the closure — it's cheap and avoids
+        // moving a non-Copy enum across both match arms.
+        let account = build_account_descriptor(&account_snap);
+        let menu_result = match kube_data.as_ref() {
+            None => build_tray_menu(&menu_app, ContextMenuState::Loading, account),
+            Some((contexts, current)) => {
+                let descriptors = build_context_descriptors(contexts, current);
+                build_tray_menu(&menu_app, ContextMenuState::Loaded(&descriptors), account)
+            }
+        };
+        match menu_result {
             Ok(menu) => {
                 if let Err(err) = tray.set_menu(Some(menu)) {
                     tracing::error!(%err, "failed to set tray menu");
@@ -234,7 +366,7 @@ fn rebuild_tray_menu(app: &AppHandle, state: &KubeContextState) {
 ///     backoff. The tray stays on "Loading…" until a snapshot lands.
 ///
 /// The task only ends when the app exits.
-pub fn spawn_tray_subscription(app: &AppHandle) {
+pub fn spawn_kubeconfig_subscription(app: &AppHandle) {
     /// First retry delay; doubles each failure up to `MAX_BACKOFF`.
     const BASE_BACKOFF: Duration = Duration::from_millis(500);
     /// Ceiling for the backoff so a sidecar that never comes up doesn't
@@ -272,9 +404,19 @@ pub fn spawn_tray_subscription(app: &AppHandle) {
                             msg = stream.message() => msg,
                         };
                         match msg {
-                            Ok(Some(state)) => {
+                            Ok(Some(kube)) => {
                                 saw_snapshot = true;
-                                rebuild_tray_menu(&app, &state);
+                                // Write the new kube snapshot into the shared
+                                // holder, then rebuild from both latest states.
+                                {
+                                    let app_state = app.state::<AppState>();
+                                    app_state
+                                        .tray
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .kube = Some(kube);
+                                }
+                                rebuild_tray_menu(&app);
                             }
                             // Clean end-of-stream or a transport error: leave
                             // the loop and reconnect (the inner select already
@@ -314,6 +456,98 @@ pub fn spawn_tray_subscription(app: &AppHandle) {
 
             // Cancellable backoff: Quit shouldn't wait out a full sleep
             // (up to MAX_BACKOFF) before the task exits.
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    });
+}
+
+/// Starts the host-internal gRPC auth-state watch that keeps the tray's account
+/// section live, and supervises it for the app's lifetime.
+///
+/// The first frame (a full snapshot) populates the account section; subsequent
+/// frames track session changes (sign-in, sign-out, token refresh carrying the
+/// same `authenticated` bit). Resilience mirrors [`spawn_kubeconfig_subscription`]:
+/// failed opens retry with capped backoff; a stream that ends after delivering
+/// data reconnects promptly; one that ends without data backs off to avoid
+/// busy-looping.
+///
+/// The task only ends when the app exits.
+pub fn spawn_authstate_subscription(app: &AppHandle) {
+    /// First retry delay; doubles each failure up to `MAX_BACKOFF`.
+    const BASE_BACKOFF: Duration = Duration::from_millis(500);
+    /// Ceiling for the backoff so a sidecar that never comes up doesn't
+    /// stretch the retry interval unboundedly.
+    const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let shutdown = app.state::<AppState>().shutdown.clone();
+        let mut backoff = BASE_BACKOFF;
+        loop {
+            let state = app.state::<AppState>();
+            let open = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                open = state.sidecar.watch_auth_state() => open,
+            };
+
+            let delay = match open {
+                Ok(mut stream) => {
+                    let mut saw_snapshot = false;
+                    loop {
+                        let msg = tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => return,
+                            msg = stream.message() => msg,
+                        };
+                        match msg {
+                            Ok(Some(auth_state)) => {
+                                saw_snapshot = true;
+                                // Write the new auth snapshot into the shared
+                                // holder, then rebuild from both latest states.
+                                {
+                                    let app_state = app.state::<AppState>();
+                                    app_state
+                                        .tray
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .account = Some(account_snapshot_from(&auth_state));
+                                }
+                                rebuild_tray_menu(&app);
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                tracing::warn!(%err, "auth-state tray watch stream error");
+                                break;
+                            }
+                        }
+                    }
+                    if saw_snapshot {
+                        backoff = BASE_BACKOFF;
+                        tracing::info!("auth-state tray watch ended; reconnecting");
+                        BASE_BACKOFF
+                    } else {
+                        tracing::warn!(
+                            ?backoff,
+                            "auth-state watch ended before any snapshot; backing off"
+                        );
+                        let delay = backoff;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        delay
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(%err, ?backoff, "auth-state tray watch failed; retrying");
+                    let delay = backoff;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    delay
+                }
+            };
+
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,

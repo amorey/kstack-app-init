@@ -12,18 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::{Arc, Mutex};
+
 use tokio_util::sync::CancellationToken;
 
 use crate::services::sidecar::SidecarService;
+use crate::tray::TraySnapshots;
 use crate::window_manager::WindowManager;
 
 pub struct AppState {
     pub sidecar: SidecarService,
     pub window_manager: WindowManager,
+    /// Combined latest-state holder for both tray watch streams. Shared between
+    /// `spawn_kubeconfig_subscription` (kube) and `spawn_authstate_subscription` (auth).
+    pub tray: Arc<Mutex<TraySnapshots>>,
     /// App-wide graceful-shutdown signal. Cancelled once on Quit (see
     /// `lib.rs`'s `RunEvent::ExitRequested`), which is *before* the sidecar is
     /// torn down. The long-lived background tasks spawned at setup — the tray
-    /// kube-context supervisor (`tray::spawn_tray_subscription`) and the Unix
+    /// kube-context supervisor (`tray::spawn_kubeconfig_subscription`), the tray
+    /// auth-state supervisor (`tray::spawn_authstate_subscription`), and the Unix
     /// signal handler (`lib::spawn_signal_handler`) — select on
     /// [`CancellationToken::cancelled`] so they stop their reconnect/retry
     /// loops and pending sleeps instead of churning against a sidecar that's

@@ -45,6 +45,7 @@ type Config struct {
 	DataDir string
 	// CloudURL is the kstack-cloud API base URL. Empty disables the cloud account
 	// subsystem (standalone/dev/test runs ⇒ signed-out, no network).
+	// Configured via KSTACK_CLOUD_API_URL.
 	CloudURL string
 	// OAuthIssuerURL is the Hydra OAuth issuer base URL. The auth service derives
 	// every endpoint (authorize/token/jwks/revocation) from it, baking in Hydra's
@@ -128,7 +129,7 @@ func New(cfg Config) (*App, error) {
 		ClusterManager:    clusterSvc.Manager(),
 		Auth:              authSvc,
 	})
-	grpcServer := grpcserver.NewServer(kubeConfigWatcher)
+	grpcServer := grpcserver.NewServer(kubeConfigWatcher, authSvc)
 
 	// Routing: the GraphQL server at /graphql.
 	mux := http.NewServeMux()

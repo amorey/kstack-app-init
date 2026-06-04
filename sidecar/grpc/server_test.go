@@ -3,17 +3,11 @@ package grpcserver_test
 import (
 	"context"
 	"io"
-	"net"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 
 	grpcserver "github.com/kubetail-org/kstack-app/sidecar/grpc"
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/kubecontextpb"
@@ -30,20 +24,8 @@ func TestServerLifecycleDrainsWatch(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
-	grpcSrv := grpcserver.NewServer(w)
-	// All traffic in this lifecycle test is gRPC, so wrap the server in h2c
-	// directly — no need for the GraphQL-vs-gRPC dispatch the app layer builds.
-	h := h2c.NewHandler(grpcSrv.GRPC(), &http2.Server{})
-
-	srv := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: h}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
-
-	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
+	grpcSrv := grpcserver.NewServer(w, nil)
+	conn := newGRPCTestConn(t, grpcSrv)
 	client := kubecontextpb.NewKubeContextServiceClient(conn)
 
 	stream, err := client.Watch(context.Background(), &kubecontextpb.WatchRequest{})

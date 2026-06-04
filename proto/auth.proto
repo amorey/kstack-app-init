@@ -1,0 +1,55 @@
+// Shared proto contract for host(Rust) <-> sidecar(Go) gRPC auth control channel.
+//
+// This file is the single source of truth for the AuthService wire format,
+// consumed by both the Go sidecar (via protoc, see sidecar/grpc/authpb) and
+// the Rust host (via tonic-build, see src-tauri/build.rs). It deliberately
+// sits at the repo root alongside kubecontext.proto.
+syntax = "proto3";
+
+package auth;
+
+option go_package = "github.com/kubetail-org/kstack-app/sidecar/grpc/authpb";
+
+// AuthService is the host-internal control channel for the local-first identity
+// session. It rides the same socket as GraphQL and KubeContextService (h2c
+// multiplexing) but is consumed only by the native host (the tray), never the
+// webview — the webview keeps using the GraphQL authState/login/logout/
+// authStateWatch surface. Both transports share the one auth.Service, so a
+// sign-in via either is observed by both.
+service AuthService {
+  // StartLogin runs the synchronous setup phase (loopback bind + browser open)
+  // and returns its result. The async sign-in tail — redirect exchange, verify,
+  // persist — runs in the background; its completion is observed via
+  // AuthStateWatch. Mirrors the GraphQL `login` mutation shape.
+  rpc StartLogin(StartLoginRequest) returns (StartLoginResponse);
+
+  // Logout clears local credentials and revokes the refresh token
+  // (fire-and-forget revocation). Mirrors the GraphQL `logout` mutation.
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+  // AuthStateWatch streams the current AuthState immediately (latest-value:
+  // current-on-subscribe), then a fresh snapshot on every session change.
+  // Long-lived; ends on client cancel or sidecar shutdown.
+  rpc AuthStateWatch(AuthStateWatchRequest) returns (stream AuthState);
+}
+
+message StartLoginRequest {}
+message StartLoginResponse {}
+
+message LogoutRequest {}
+message LogoutResponse {}
+
+message AuthStateWatchRequest {}
+
+// AuthState mirrors auth.State's tokenless projection: identity is unset while
+// signed out, so the host can't render stale claims.
+message AuthState {
+  bool authenticated = 1;
+  Identity identity = 2; // unset (nil) while signed out
+}
+
+message Identity {
+  string user_id = 1;
+  string email = 2;
+  string name = 3;
+}

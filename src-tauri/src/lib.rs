@@ -46,6 +46,7 @@ mod state;
 mod tray;
 mod window_manager;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tauri::{Manager, RunEvent};
@@ -189,6 +190,7 @@ pub fn run() {
             app.manage(AppState {
                 sidecar,
                 window_manager,
+                tray: Arc::new(Mutex::new(tray::TraySnapshots::default())),
                 shutdown: CancellationToken::new(),
             });
 
@@ -198,7 +200,11 @@ pub fn run() {
 
             // Keep the tray's kube-context list live off the sidecar's
             // kubeConfigWatch stream (populates on the first frame).
-            tray::spawn_tray_subscription(app.handle());
+            tray::spawn_kubeconfig_subscription(app.handle());
+
+            // Keep the tray's account section live off the sidecar's
+            // AuthStateWatch stream (populates on the first frame).
+            tray::spawn_authstate_subscription(app.handle());
 
             // Custom macOS Dock menu (no Tauri API — see dock_menu module).
             #[cfg(target_os = "macos")]

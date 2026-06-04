@@ -19,5 +19,7 @@ mod logs;
 mod service;
 
 pub use graphql::GraphqlResponse;
-pub use grpc::KubeContextState;
+#[cfg(test)]
+pub use grpc::Identity;
+pub use grpc::{AuthState, KubeContextState};
 pub use service::SidecarService;

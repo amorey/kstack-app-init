@@ -42,13 +42,28 @@ pub mod kubecontext {
     tonic::include_proto!("kubecontext");
 }
 
+// The generated bindings for proto/auth.proto.
+pub mod auth {
+    tonic::include_proto!("auth");
+}
+
 use kubecontext::kube_context_service_client::KubeContextServiceClient;
 pub use kubecontext::KubeContextState;
 use kubecontext::{SetCurrentContextRequest, WatchRequest};
 
+use auth::auth_service_client::AuthServiceClient;
+pub use auth::AuthState;
+#[cfg(test)]
+pub use auth::Identity;
+use auth::{AuthStateWatchRequest, LogoutRequest, StartLoginRequest};
+
 /// A server-streamed `Watch` response: each item is a full kube-context
 /// snapshot, or a transport error that ends the stream.
 pub type WatchStream = tonic::Streaming<KubeContextState>;
+
+/// A server-streamed `AuthStateWatch` response: each item is a full auth-state
+/// snapshot, or a transport error that ends the stream.
+pub type AuthStateStream = tonic::Streaming<AuthState>;
 
 /// Holds the sidecar's gRPC channel, dialing lazily on first use and re-dialing
 /// if the connection was lost (e.g. a sidecar restart). Construct via
@@ -111,6 +126,48 @@ impl GrpcClient {
     pub async fn watch(&self) -> Result<WatchStream> {
         let mut client = KubeContextServiceClient::new(self.channel().await?);
         match client.watch(WatchRequest {}).await {
+            Ok(resp) => Ok(resp.into_inner()),
+            Err(status) => {
+                self.reset().await;
+                Err(status_to_err(status))
+            }
+        }
+    }
+
+    /// Runs the synchronous login setup (loopback bind + browser open) on the
+    /// sidecar. Returns once setup succeeds or fails; the async sign-in tail
+    /// delivers its result via [`Self::watch_auth_state`].
+    pub async fn start_login(&self) -> Result<()> {
+        let mut client = AuthServiceClient::new(self.channel().await?);
+        match client.start_login(StartLoginRequest {}).await {
+            Ok(_) => Ok(()),
+            Err(status) => {
+                self.reset().await;
+                Err(status_to_err(status))
+            }
+        }
+    }
+
+    /// Clears local credentials and revokes the refresh token (fire-and-forget
+    /// revocation). Returns once the local teardown is complete.
+    pub async fn logout(&self) -> Result<()> {
+        let mut client = AuthServiceClient::new(self.channel().await?);
+        match client.logout(LogoutRequest {}).await {
+            Ok(_) => Ok(()),
+            Err(status) => {
+                self.reset().await;
+                Err(status_to_err(status))
+            }
+        }
+    }
+
+    /// Opens the auth-state watch stream: the current snapshot first (latest-
+    /// value), then a fresh snapshot on every session change. The caller drives
+    /// it with `stream.message().await`; a returned error / `None` ends the
+    /// stream and the cached channel is reset so the next attempt re-dials.
+    pub async fn watch_auth_state(&self) -> Result<AuthStateStream> {
+        let mut client = AuthServiceClient::new(self.channel().await?);
+        match client.auth_state_watch(AuthStateWatchRequest {}).await {
             Ok(resp) => Ok(resp.into_inner()),
             Err(status) => {
                 self.reset().await;
