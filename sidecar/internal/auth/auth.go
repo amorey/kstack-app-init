@@ -26,6 +26,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -315,7 +316,14 @@ func (s *service) StartLogin(ctx context.Context) error {
 
 		tok, id, err := finish(ctx)
 		if err != nil {
-			slog.Error("cloud sign-in failed", "err", err)
+			// A timed-out tail means the user abandoned the browser flow (or just
+			// took longer than loginTimeout) — expected, not a fault. Anything
+			// else (exchange/verify/transport failure) is a genuine error.
+			if errors.Is(err, context.DeadlineExceeded) {
+				slog.Warn("cloud sign-in timed out", "err", err)
+			} else {
+				slog.Error("cloud sign-in failed", "err", err)
+			}
 			return
 		}
 		if err := s.grant.set(tok, id); err != nil {
