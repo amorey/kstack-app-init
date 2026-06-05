@@ -33,6 +33,12 @@ lto = true          # link-time optimization across crate boundaries
 opt-level = 3       # maximum runtime speed
 strip = true        # strip symbols from the shipped binary
 
+[dev-dependencies]
+# Test-only tokio features: `test-util` provides the paused-clock helpers
+# (`pause`/`advance`/`start_paused`) the wake coalescer tests use to drive the
+# debounce deterministically without wall-clock sleeps.
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+
 [features]
 # Compiles the webview inspector (devtools) into an otherwise-release build so
 # production behavior — e.g. the bundled CSP with its injected nonces — can be
@@ -104,13 +110,25 @@ objc2-foundation = { version = "0.3", features = [
   "NSAppleEventManager",
   "NSAppleEventDescriptor",
   "objc2-core-services",
+  # Notification-center types used to observe NSWorkspace's wake notification
+  # (see wake/macos.rs).
+  "NSNotification",
 ] }
 objc2-app-kit = { version = "0.3", features = [
   "NSApplication",
   "NSMenu",
   "NSMenuItem",
   "NSResponder",
+  # NSWorkspace + its NSWorkspaceDidWakeNotification, observed to fire a Poke
+  # on wake-from-sleep (see wake/macos.rs).
+  "NSWorkspace",
 ] }
+# Wake-from-sleep / network-return event sources (wake/macos.rs):
+# objc2-foundation's notification-center types receive NSWorkspace's wake
+# notification; system-configuration's SCNetworkReachability (scheduled on a
+# CFRunLoop from core-foundation) reports connectivity transitions.
+system-configuration = "0.6"
+core-foundation = "0.9"
 
 # Unix-only: tao installs no signal handlers, so SIGTERM/SIGINT/SIGHUP are
 # captured and funneled into the graceful-exit path (see
@@ -122,6 +140,13 @@ objc2-app-kit = { version = "0.3", features = [
 tokio = { version = "1", features = ["signal", "macros"] }
 libc = "0.2"
 
+# Linux-only: the wake/network-return event sources (wake/linux.rs) subscribe to
+# systemd-logind's `PrepareForSleep` signal and NetworkManager's `StateChanged`,
+# both on the system D-Bus bus. `default-features = false` + `tokio` integrates
+# zbus with the app's existing tokio runtime (drops its default async-io stack).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
 # Windows-only: force-terminate the sidecar by pid via TerminateProcess once
 # its CommandChild handle has been dropped (see sidecar::lifecycle). Windows
 # has no POSIX signals, so the graceful path is stdin-EOF instead.
@@ -129,5 +154,12 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_System_Threading",
+  # wake/windows.rs: callback-based resume-from-sleep notification
+  # (PowerRegisterSuspendResumeNotification + PBT_* / DEVICE_NOTIFY_CALLBACK),
+  # plus the network connectivity-hint change notification.
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Power",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
 ] }
 

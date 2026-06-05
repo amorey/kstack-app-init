@@ -47,6 +47,11 @@ pub mod auth {
     tonic::include_proto!("auth");
 }
 
+// The generated bindings for proto/poke.proto.
+pub mod poke {
+    tonic::include_proto!("poke");
+}
+
 use kubecontext::kube_context_service_client::KubeContextServiceClient;
 pub use kubecontext::KubeContextState;
 use kubecontext::{SetCurrentContextRequest, WatchRequest};
@@ -56,6 +61,9 @@ pub use auth::AuthState;
 #[cfg(test)]
 pub use auth::Identity;
 use auth::{AuthStateWatchRequest, LogoutRequest, StartLoginRequest};
+
+use poke::poke_service_client::PokeServiceClient;
+use poke::PokeRequest;
 
 /// A server-streamed `Watch` response: each item is a full kube-context
 /// snapshot, or a transport error that ends the stream.
@@ -153,6 +161,22 @@ impl GrpcClient {
     pub async fn logout(&self) -> Result<()> {
         let mut client = AuthServiceClient::new(self.channel().await?);
         match client.logout(LogoutRequest {}).await {
+            Ok(_) => Ok(()),
+            Err(status) => {
+                self.reset().await;
+                Err(status_to_err(status))
+            }
+        }
+    }
+
+    /// Best-effort resync nudge (unary RPC): asks the sidecar to broadcast a
+    /// `SourceHost` resync to its in-process subscribers (cluster-sync, settings-
+    /// sync). Driven by the host's wake / network-return supervisor (see
+    /// [`crate::wake`]). On a transport failure the cached channel is reset so the
+    /// next attempt re-dials — mirroring [`Self::set_current_context`].
+    pub async fn poke(&self) -> Result<()> {
+        let mut client = PokeServiceClient::new(self.channel().await?);
+        match client.poke(PokeRequest {}).await {
             Ok(_) => Ok(()),
             Err(status) => {
                 self.reset().await;

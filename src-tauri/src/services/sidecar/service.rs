@@ -316,6 +316,15 @@ impl SidecarService {
         self.grpc_client.watch_auth_state().await
     }
 
+    /// Nudges the sidecar to resync over gRPC (best-effort). Driven by the
+    /// host's wake / network-return supervisor ([`crate::wake`]); the sidecar
+    /// broadcasts a `SourceHost` resync to its cluster-sync and settings-sync
+    /// engines. Failures are the caller's to swallow — the sidecar's wall-clock
+    /// detector is the backstop.
+    pub async fn poke(&self) -> Result<()> {
+        self.grpc_client.poke().await
+    }
+
     /// Asks the sidecar to shut down gracefully, blocking until it exits or
     /// `timeout` elapses.
     ///

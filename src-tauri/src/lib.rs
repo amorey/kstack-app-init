@@ -44,6 +44,7 @@ mod error;
 mod services;
 mod state;
 mod tray;
+mod wake;
 mod window_manager;
 
 use std::sync::{Arc, Mutex};
@@ -205,6 +206,11 @@ pub fn run() {
             // Keep the tray's account section live off the sidecar's
             // AuthStateWatch stream (populates on the first frame).
             tray::spawn_authstate_subscription(app.handle());
+
+            // Fire the sidecar's Poke on OS wake / network-return so long-lived
+            // connections resync promptly (accelerates the sidecar's wall-clock
+            // detector and covers network-return without sleep).
+            wake::spawn_wake_poke_supervisor(app.handle());
 
             // Custom macOS Dock menu (no Tauri API — see dock_menu module).
             #[cfg(target_os = "macos")]
