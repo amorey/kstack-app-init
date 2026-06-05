@@ -1,13 +1,20 @@
 // Package clustersync drives the per-cluster local cache from real
 // Kubernetes clusters defined in the user's kubeconfig.
 //
-// Discovery + dynamic client + raw Reflectors means one code path serves
-// every Kind on every cluster — built-ins and CRDs alike. At startup we
-// walk /apis discovery, pick every list/watchable resource, and spin up
-// one Reflector per (group, version, resource) feeding a SQLite-backed
-// cache.Store. Events get their own store (and table) because their
-// access pattern differs; everything else lands in the universal
-// `objects` table.
+// Discovery + dynamic/metadata clients + one per-GVR kindDriver means one
+// code path serves every Kind on every cluster — built-ins and CRDs alike.
+// At startup we walk /apis discovery, pick every list/watchable resource,
+// and spin up one driver per (group, version, resource) feeding a
+// SQLite-backed store. Events get their own store (and table) because their
+// access pattern differs; everything else lands in the universal `objects`
+// table.
+//
+// Each driver (driver.go) is built instead of a raw client-go Reflector so a
+// wake can resume cheaply: it seeds a RetryWatcher from the kind's persisted
+// resourceVersion (resume — apply deltas, no LIST) and only on a 410 (RV too
+// old) or a cold cache falls back to a metadata-first full re-sync (list
+// metadata, fetch bodies for just the changed objects). The stock Reflector
+// can't be seeded with a stored RV, so it always re-LISTs every body.
 package clustersync
 
 import (
@@ -26,15 +33,12 @@ import (
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clustercache"
@@ -271,6 +275,10 @@ func (u *Upstream) Run(ctx context.Context, clusterUUID string, writer *sql.DB) 
 	if err != nil {
 		return fmt.Errorf("dynamic client: %w", err)
 	}
+	md, err := metadata.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("metadata client: %w", err)
+	}
 
 	cdb := u.cache.Lookup(clusterUUID)
 	if cdb == nil {
@@ -283,25 +291,28 @@ func (u *Upstream) Run(ctx context.Context, clusterUUID string, writer *sql.DB) 
 	}
 	slog.Info("clustersync: discovered resources", "cluster", clusterUUID, "count", len(entries))
 
-	stop := make(chan struct{})
-	go func() {
-		<-ctx.Done()
-		close(stop)
-	}()
-
 	var wg sync.WaitGroup
 	for _, e := range entries {
-		var store cache.Store
+		var store kindStore
 		if isEventGVK(e.GVK) {
 			store = newEventsStore(ctx, clusterUUID, e.GVK, writer, cdb)
 		} else {
 			store = newObjectsStore(ctx, clusterUUID, e.GVK, writer, cdb)
 		}
-		lw := newDynamicListWatch(ctx, dyn, e)
-		r := cache.NewReflector(lw, &unstructured.Unstructured{}, store, 0)
-		slog.Debug("clustersync: starting reflector", "cluster", clusterUUID, "gvk", e.GVK.String())
+		// Seed the driver from the kind's persisted resourceVersion so it resumes
+		// the watch instead of re-LISTing every body; "" (never synced, or a read
+		// error) just means start with a full re-sync.
+		seedRV, err := readLastListRV(ctx, writer, e.GVK)
+		if err != nil {
+			slog.Warn("clustersync: read resume rv", "gvk", e.GVK.String(), "err", err)
+			seedRV = ""
+		}
+		d := newKindDriver(newLiveSource(dyn, md, e), store, e.GVK, seedRV)
+		slog.Debug("clustersync: starting driver", "cluster", clusterUUID, "gvk", e.GVK.String(), "seedRV", seedRV)
 		wg.Go(func() {
-			r.Run(stop)
+			if err := d.Run(ctx); err != nil && ctx.Err() == nil {
+				slog.Warn("clustersync: driver exited", "cluster", clusterUUID, "gvk", e.GVK.String(), "err", err)
+			}
 		})
 	}
 	wg.Wait()
@@ -513,19 +524,4 @@ func crdSchemaJSON(crds []apiextensionsv1.CustomResourceDefinition, gvk schema.G
 		}
 	}
 	return ""
-}
-
-// newDynamicListWatch builds a ListerWatcher that calls the dynamic
-// client's per-GVR Resource(). Namespaced vs cluster-scoped is the same
-// API surface (dynamic.NamespaceableResourceInterface), so we don't
-// branch on it.
-func newDynamicListWatch(ctx context.Context, dyn dynamic.Interface, e gvrEntry) cache.ListerWatcher {
-	return &cache.ListWatch{
-		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
-			return dyn.Resource(e.GVR).List(ctx, opts)
-		},
-		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
-			return dyn.Resource(e.GVR).Watch(ctx, opts)
-		},
-	}
 }

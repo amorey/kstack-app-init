@@ -9,3 +9,6 @@
 - Rust->Sidecar waker
 
 - React compiler
+
+- Check RBAC permissions?
+- SSO failure didn't retry

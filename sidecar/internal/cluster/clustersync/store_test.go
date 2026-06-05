@@ -57,6 +57,91 @@ func countWhere(t *testing.T, w *sql.DB, table, col, val string) int {
 	return n
 }
 
+// SnapshotRVs returns exactly the {uid: resource_version} pairs for the store's
+// own kind — scoped by (kind, api_version) so a sibling kind's rows never leak
+// in. This is the map the metadata-diff resync diffs against.
+func TestObjectsStoreSnapshotRVs(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json) VALUES
+		('p1','v1','Pod','p1','10',0,0,'{}'),
+		('p2','v1','Pod','p2','20',0,0,'{}'),
+		('d1','apps/v1','Deployment','d1','30',0,0,'{}')`)
+	require.NoError(t, err)
+
+	s := newObjectsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, w, cdb)
+	got, err := s.SnapshotRVs(ctx)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"p1": "10", "p2": "20"}, got)
+}
+
+// PersistRV advances the kind's last_list_rv (+ last_list_at) cookie without
+// touching the objects table — it's called on every watch delta to keep the
+// resume point fresh.
+func TestObjectsStorePersistRVWritesMetaOnly(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	insertObject(t, w, "p1", "v1", "Pod")
+	before := countObjectsByKind(t, w, "Pod", "v1")
+
+	s := newObjectsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, w, cdb)
+	require.NoError(t, s.PersistRV(ctx, "999"))
+
+	require.Equal(t, before, countObjectsByKind(t, w, "Pod", "v1"), "objects table must be untouched")
+	var rv string
+	require.NoError(t, w.QueryRowContext(ctx,
+		`SELECT value FROM cluster_meta WHERE key=?`, "v1/Pod.last_list_rv").Scan(&rv))
+	require.Equal(t, "999", rv)
+	var at string
+	require.NoError(t, w.QueryRowContext(ctx,
+		`SELECT value FROM cluster_meta WHERE key=?`, "v1/Pod.last_list_at").Scan(&at))
+	require.NotEmpty(t, at)
+}
+
+// readLastListRV reads back what PersistRV wrote (the seed for a resume watch),
+// and returns "" for a kind that has never synced.
+func TestReadLastListRVRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	gvk := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+
+	got, err := readLastListRV(ctx, w, gvk)
+	require.NoError(t, err)
+	require.Equal(t, "", got, "absent key reads as empty")
+
+	s := newObjectsStore(ctx, "c1", gvk, w, cdb)
+	require.NoError(t, s.PersistRV(ctx, "555"))
+	got, err = readLastListRV(ctx, w, gvk)
+	require.NoError(t, err)
+	require.Equal(t, "555", got)
+}
+
+// DeleteByUID removes one object plus its cascade rows — the metadata-diff path
+// uses it to evict uids that vanished from the cluster.
+func TestObjectsStoreDeleteByUIDCascades(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	insertObject(t, w, "p1", "v1", "Pod")
+	_, err := w.Exec(`INSERT INTO labels(uid,key,value) VALUES('p1','app','x')`)
+	require.NoError(t, err)
+	_, err = w.Exec(`INSERT INTO owner_refs(child_uid,owner_uid) VALUES('p1','owner-1')`)
+	require.NoError(t, err)
+	_, err = w.Exec(`INSERT INTO status_history(uid,at,summary) VALUES('p1',1,'Ready')`)
+	require.NoError(t, err)
+
+	s := newObjectsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, w, cdb)
+	require.NoError(t, s.DeleteByUID(ctx, "p1"))
+
+	require.Equal(t, 0, countObjectsByKind(t, w, "Pod", "v1"))
+	require.Equal(t, 0, countWhere(t, w, "labels", "uid", "p1"))
+	require.Equal(t, 0, countWhere(t, w, "owner_refs", "child_uid", "p1"))
+	require.Equal(t, 0, countWhere(t, w, "status_history", "uid", "p1"))
+}
+
 // raw_json is stored zlib-compressed, not as plaintext JSON: the stored cell
 // must be a zlib stream (first byte 0x78) that decompresses back to the exact
 // object JSON — never the readable plaintext. Both write paths (objects and

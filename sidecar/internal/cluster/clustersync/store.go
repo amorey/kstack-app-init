@@ -11,6 +11,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clustercache"
@@ -51,23 +52,7 @@ func (s *objectsStore) Delete(obj any) error {
 	if !ok {
 		return fmt.Errorf("objectsStore.Delete: expected *unstructured, got %T", obj)
 	}
-	uid := string(u.GetUID())
-	if uid == "" {
-		return nil
-	}
-	tx, err := s.writer.BeginTx(s.ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() //nolint:errcheck
-	if err := deleteObjectRows(s.ctx, tx, uid); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	s.cdb.Notify()
-	return nil
+	return s.DeleteByUID(s.ctx, string(u.GetUID()))
 }
 
 func (s *objectsStore) upsert(obj any) error {
@@ -157,13 +142,7 @@ func (s *objectsStore) Replace(items []any, resourceVersion string) error {
 		}
 	}
 
-	if err := upsertClusterMeta(s.ctx, tx,
-		fmt.Sprintf("%s/%s.last_list_rv", s.gvk.GroupVersion().String(), s.gvk.Kind), resourceVersion); err != nil {
-		return err
-	}
-	if err := upsertClusterMeta(s.ctx, tx,
-		fmt.Sprintf("%s/%s.last_list_at", s.gvk.GroupVersion().String(), s.gvk.Kind),
-		strconv.FormatInt(time.Now().UnixMilli(), 10)); err != nil {
+	if err := persistListRVMeta(s.ctx, tx, s.gvk, resourceVersion); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -180,6 +159,76 @@ func (s *objectsStore) List() []any                          { return nil }
 func (s *objectsStore) ListKeys() []string                   { return nil }
 func (s *objectsStore) Get(any) (any, bool, error)           { return nil, false, nil }
 func (s *objectsStore) GetByKey(string) (any, bool, error)   { return nil, false, nil }
+
+// --- objectsStore: kindStore surface (driven by kindDriver, not the Reflector) ---
+
+// ApplyEvent applies one watch delta: Added/Modified upsert, Deleted removes.
+func (s *objectsStore) ApplyEvent(t watch.EventType, u *unstructured.Unstructured) error {
+	switch t {
+	case watch.Added, watch.Modified:
+		return s.upsert(u)
+	case watch.Deleted:
+		return s.Delete(u)
+	default:
+		return nil
+	}
+}
+
+// ReplaceFull is the typed wrapper over Replace the driver's full-resync path
+// uses (keeps the per-kind delete-missing prune + RV write).
+func (s *objectsStore) ReplaceFull(items []*unstructured.Unstructured, rv string) error {
+	return s.Replace(toAny(items), rv)
+}
+
+// SnapshotRVs returns {uid: resource_version} currently cached for this kind —
+// the baseline the metadata-diff resync compares the live metadata list against.
+// Scoped by (kind, api_version) exactly like Replace's delete-missing prune.
+func (s *objectsStore) SnapshotRVs(ctx context.Context) (map[string]string, error) {
+	rows, err := s.writer.QueryContext(ctx,
+		`SELECT uid, resource_version FROM objects WHERE kind=? AND api_version=?`,
+		s.gvk.Kind, s.gvk.GroupVersion().String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var uid, rv string
+		if err := rows.Scan(&uid, &rv); err != nil {
+			return nil, err
+		}
+		out[uid] = rv
+	}
+	return out, rows.Err()
+}
+
+// PersistRV advances the kind's resume cookie (last_list_rv + last_list_at)
+// without touching object rows. Called on every watch delta — no transaction:
+// two single-row upserts on the serialized writer conn.
+func (s *objectsStore) PersistRV(ctx context.Context, rv string) error {
+	return persistListRVMeta(ctx, s.writer, s.gvk, rv)
+}
+
+// DeleteByUID removes one object plus its cascade rows (the metadata-diff
+// resync uses it for uids that vanished from the cluster).
+func (s *objectsStore) DeleteByUID(ctx context.Context, uid string) error {
+	if uid == "" {
+		return nil
+	}
+	tx, err := s.writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := deleteObjectRows(ctx, tx, uid); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.cdb.Notify()
+	return nil
+}
 
 // writeObjectRow runs the three-table atomic write for a single object.
 // The order matters: objects first (so owner_refs/labels FKs would be
@@ -490,13 +539,7 @@ func (s *eventsStore) Replace(items []any, resourceVersion string) error {
 	// the per-event upsert plus the janitor's TTL: stale rows age out and
 	// subsequent LISTs converge.
 
-	if err := upsertClusterMeta(s.ctx, tx,
-		fmt.Sprintf("%s/%s.last_list_rv", s.gvk.GroupVersion().String(), s.gvk.Kind), resourceVersion); err != nil {
-		return err
-	}
-	if err := upsertClusterMeta(s.ctx, tx,
-		fmt.Sprintf("%s/%s.last_list_at", s.gvk.GroupVersion().String(), s.gvk.Kind),
-		strconv.FormatInt(time.Now().UnixMilli(), 10)); err != nil {
+	if err := persistListRVMeta(s.ctx, tx, s.gvk, resourceVersion); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -510,14 +553,87 @@ func (s *eventsStore) ListKeys() []string                   { return nil }
 func (s *eventsStore) Get(any) (any, bool, error)           { return nil, false, nil }
 func (s *eventsStore) GetByKey(string) (any, bool, error)   { return nil, false, nil }
 
+// --- eventsStore: kindStore surface ---
+//
+// Events take the simple path: resume-by-RV applies (the watch loop persists RV
+// and a full resync just relists), but eventsStore deliberately does NOT
+// implement metadataDiffStore — the events table has no resource_version column
+// and the two event reflectors share it with no delete-missing, so the
+// metadata-diff doesn't apply. fullResync's type assertion routes events to a
+// plain full LIST instead.
+
+func (s *eventsStore) ApplyEvent(t watch.EventType, u *unstructured.Unstructured) error {
+	switch t {
+	case watch.Added, watch.Modified:
+		return s.upsert(u)
+	case watch.Deleted:
+		return s.Delete(u)
+	default:
+		return nil
+	}
+}
+
+func (s *eventsStore) ReplaceFull(items []*unstructured.Unstructured, rv string) error {
+	return s.Replace(toAny(items), rv)
+}
+
+func (s *eventsStore) PersistRV(ctx context.Context, rv string) error {
+	return persistListRVMeta(ctx, s.writer, s.gvk, rv)
+}
+
 // --- helpers ------------------------------------------------------------
 
-func upsertClusterMeta(ctx context.Context, tx *sql.Tx, key, value string) error {
-	_, err := tx.ExecContext(ctx,
+func upsertClusterMeta(ctx context.Context, ex execer, key, value string) error {
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO cluster_meta(key, value) VALUES(?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 		key, value)
 	return err
+}
+
+// lastListRVKey is the cluster_meta key holding a kind's resume cookie — the
+// resourceVersion to seed the next watch from. readLastListRV reads it;
+// persistListRVMeta writes it.
+func lastListRVKey(gvk schema.GroupVersionKind) string {
+	return fmt.Sprintf("%s/%s.last_list_rv", gvk.GroupVersion().String(), gvk.Kind)
+}
+
+// persistListRVMeta writes a kind's resume cookie (last_list_rv + last_list_at).
+// It takes an execer so it works both inside the full Replace's transaction and
+// directly on the writer for the per-delta PersistRV (two single-row upserts on
+// the serialized writer conn — no transaction needed); the shared helper keeps
+// the two key spellings from drifting.
+func persistListRVMeta(ctx context.Context, ex execer, gvk schema.GroupVersionKind, rv string) error {
+	if err := upsertClusterMeta(ctx, ex, lastListRVKey(gvk), rv); err != nil {
+		return err
+	}
+	return upsertClusterMeta(ctx, ex,
+		fmt.Sprintf("%s/%s.last_list_at", gvk.GroupVersion().String(), gvk.Kind),
+		strconv.FormatInt(time.Now().UnixMilli(), 10))
+}
+
+// readLastListRV reads a kind's persisted resume cookie, returning "" when the
+// kind has never synced (so the driver starts with a full re-sync).
+func readLastListRV(ctx context.Context, db *sql.DB, gvk schema.GroupVersionKind) (string, error) {
+	var v string
+	err := db.QueryRowContext(ctx, `SELECT value FROM cluster_meta WHERE key=?`, lastListRVKey(gvk)).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
+// toAny widens a typed unstructured slice to []any for the cache.Store-shaped
+// Replace, which predates the typed kindStore surface.
+func toAny(items []*unstructured.Unstructured) []any {
+	out := make([]any, len(items))
+	for i, it := range items {
+		out[i] = it
+	}
+	return out
 }
 
 func nullIfEmpty(s string) any {
