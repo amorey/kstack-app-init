@@ -24,7 +24,7 @@ func TestServerLifecycleDrainsWatch(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
-	grpcSrv := grpcserver.NewServer(w, nil)
+	grpcSrv := grpcserver.NewServer(w, nil, nil)
 	conn := newGRPCTestConn(t, grpcSrv)
 	client := kubecontextpb.NewKubeContextServiceClient(conn)
 

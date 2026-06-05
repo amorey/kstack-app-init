@@ -22,6 +22,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clusterregistry"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clustersync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // cacheShutdownTimeout bounds the per-cluster cache drain in Close so a wedged
@@ -50,10 +51,13 @@ type Service struct {
 // cache that yields empty snapshots and closed watches. With a dataDir it opens
 // app.db, builds the registry + per-cluster cache, and wires a coordinator that
 // keeps them in lockstep with watcher. The returned Service is always non-nil.
-func New(dataDir string, watcher *k8shelpers.KubeConfigWatcher) (*Service, error) {
+// pokeSvc is the shared resync broadcaster handed to the per-cluster cache so a
+// poke (machine wake / host network-on) restarts the cluster's reflectors; nil
+// disables resync (degraded/test runs).
+func New(dataDir string, watcher *k8shelpers.KubeConfigWatcher, pokeSvc *poke.Service) (*Service, error) {
 	s := &Service{}
 	if dataDir != "" {
-		s.cache = clustercache.NewManager(dataDir, nil)
+		s.cache = clustercache.NewManager(dataDir, nil, pokeSvc)
 		db, err := appdb.Open(filepath.Join(dataDir, "app.db"))
 		if err != nil {
 			return nil, err

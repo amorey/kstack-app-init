@@ -32,31 +32,53 @@ type Signal struct {
 	At     time.Time
 }
 
-// Options configures a Service. Zero values get sane defaults.
-type Options struct {
-	Tick      time.Duration // gap-detector heartbeat (default 15s)
-	GapFactor float64       // wall gap > Tick*GapFactor ⇒ treat as resume (default 2.0)
-	Now       func() time.Time
-	// NewTicker returns a tick channel and a stop function. Injectable for tests.
-	NewTicker func(time.Duration) (<-chan time.Time, func())
+// options configures a Service: the gap-detector tuning plus the clock and
+// ticker seams. Zero values get sane defaults via applyDefaults. The struct and
+// its with* seams are unexported because production tunes nothing — New takes no
+// arguments, and only this package's white-box tests inject seams via
+// newWithOptions, mirroring the auth/cloud/prefsync option convention.
+type options struct {
+	tick      time.Duration // gap-detector heartbeat (default 15s)
+	gapFactor float64       // wall gap > tick*gapFactor ⇒ treat as resume (default 2.0)
+	now       func() time.Time
+	newTicker func(time.Duration) (<-chan time.Time, func())
 }
 
-func (o *Options) applyDefaults() {
-	if o.Tick <= 0 {
-		o.Tick = 15 * time.Second
+func (o *options) applyDefaults() {
+	if o.tick <= 0 {
+		o.tick = 15 * time.Second
 	}
-	if o.GapFactor <= 0 {
-		o.GapFactor = 2.0
+	if o.gapFactor <= 0 {
+		o.gapFactor = 2.0
 	}
-	if o.Now == nil {
-		o.Now = time.Now
+	if o.now == nil {
+		o.now = time.Now
 	}
-	if o.NewTicker == nil {
-		o.NewTicker = func(d time.Duration) (<-chan time.Time, func()) {
+	if o.newTicker == nil {
+		o.newTicker = func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
 		}
 	}
+}
+
+// option is an unexported build seam for newWithOptions. Because the type is
+// unexported, only this package's white-box tests can construct one — the
+// production New takes no seams. Mirrors the auth/cloud/prefsync option pattern.
+type option func(*options)
+
+// withTick overrides the gap-detector heartbeat (default 15s).
+func withTick(d time.Duration) option { return func(o *options) { o.tick = d } }
+
+// withGapFactor overrides the resume-detection factor (default 2.0).
+func withGapFactor(f float64) option { return func(o *options) { o.gapFactor = f } }
+
+// withNow overrides the clock seam.
+func withNow(f func() time.Time) option { return func(o *options) { o.now = f } }
+
+// withTicker overrides the ticker seam.
+func withTicker(f func(time.Duration) (<-chan time.Time, func())) option {
+	return func(o *options) { o.newTicker = f }
 }
 
 // Service fans resync pokes to all subscribers. Construct with New, then
@@ -65,20 +87,34 @@ func (o *Options) applyDefaults() {
 type Service struct {
 	hub *broadcast.Hub[Signal]
 	tx  *broadcast.Sender[Signal]
-	opt Options
+	opt options
 
 	cancel context.CancelFunc
 	done   chan struct{} // closed when the Run goroutine exits
 }
 
-// New builds a Service. It does not start anything; call Start (or Run).
-func New(opt Options) *Service {
-	opt.applyDefaults()
+// New builds a Service with production defaults. It does not start anything;
+// call Start (or Run). The gap-detector tuning and clock/ticker seams use
+// defaults — only this package's white-box tests override them via
+// newWithOptions.
+func New() *Service {
+	return newWithOptions()
+}
+
+// newWithOptions is the build entry point that also accepts the unexported test
+// seams. New is the production wrapper (no options); in-package white-box tests
+// call this directly to inject a deterministic clock/ticker.
+func newWithOptions(opts ...option) *Service {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	o.applyDefaults()
 	hub := broadcast.New[Signal](hubCapacity)
 	return &Service{
 		hub: hub,
 		tx:  hub.Sender(),
-		opt: opt,
+		opt: o,
 	}
 }
 
@@ -86,7 +122,7 @@ func New(opt Options) *Service {
 // This is the entry point for the gRPC resync handler (follow-up PR) and for
 // any in-process caller that detects a wake or network-return event.
 func (s *Service) Poke(src Source) {
-	_ = s.tx.Send(Signal{Source: src, At: s.opt.Now()})
+	_ = s.tx.Send(Signal{Source: src, At: s.opt.now()})
 }
 
 // Subscribe returns a channel that receives Signals and a cancel function.
@@ -124,11 +160,11 @@ func (s *Service) Close() {
 // On exit it closes the hub so all subscriber channels are closed. Call once
 // per Service (Start wraps this in a goroutine).
 func (s *Service) Run(ctx context.Context) {
-	tickC, stop := s.opt.NewTicker(s.opt.Tick)
+	tickC, stop := s.opt.newTicker(s.opt.tick)
 	defer stop()
 
-	lastSeen := s.opt.Now()
-	threshold := time.Duration(float64(s.opt.Tick) * s.opt.GapFactor)
+	lastSeen := s.opt.now()
+	threshold := time.Duration(float64(s.opt.tick) * s.opt.gapFactor)
 
 	for {
 		select {
@@ -136,7 +172,7 @@ func (s *Service) Run(ctx context.Context) {
 			s.hub.Close()
 			return
 		case <-tickC:
-			now := s.opt.Now()
+			now := s.opt.now()
 			if now.Sub(lastSeen) > threshold {
 				s.Poke(SourceWallClock)
 			}

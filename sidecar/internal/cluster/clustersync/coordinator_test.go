@@ -77,7 +77,7 @@ func uidFor(name string) string { return uidForHost("https://" + name + ".exampl
 func newTestCoordinator(t *testing.T, fw *fakeWatcher) (*Coordinator, *clustercache.Manager, *clusterregistry.Registry) {
 	t.Helper()
 	dir := t.TempDir()
-	cache := clustercache.NewManager(dir, nil)
+	cache := clustercache.NewManager(dir, nil, nil)
 	db, err := appdb.Open(filepath.Join(dir, "app.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -294,12 +294,12 @@ func TestBackfillSurfacesOrphanedCache(t *testing.T) {
 	dir := t.TempDir()
 	// Pre-seed a stray cache file with no store entry, as if a cluster was
 	// removed from kubeconfig in a previous run.
-	seed := clustercache.NewManager(dir, nil)
+	seed := clustercache.NewManager(dir, nil, nil)
 	_, err := seed.Open(context.Background(), "ghost")
 	require.NoError(t, err)
 	require.NoError(t, seed.Shutdown(context.Background()))
 
-	cache := clustercache.NewManager(dir, nil)
+	cache := clustercache.NewManager(dir, nil, nil)
 	db, err := appdb.Open(filepath.Join(dir, "app.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })

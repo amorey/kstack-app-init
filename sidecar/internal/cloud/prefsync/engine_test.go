@@ -807,7 +807,7 @@ func TestEngine_NotifierSignalPokes(t *testing.T) {
 	// Upstream always fails Snapshot so the engine parks in backoff.
 	up := &blockSnapshotUpstream{entered: make(chan struct{}, 4)}
 
-	b := poke.New(poke.Options{Now: func() time.Time { return epoch }})
+	b := poke.New()
 	e := newWithOptions(up, store, q, b, testOpts()...)
 
 	runEngine(t, e)

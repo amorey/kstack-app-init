@@ -23,9 +23,11 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/authpb"
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/kubecontextpb"
+	"github.com/kubetail-org/kstack-app/sidecar/grpc/pokepb"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // kubeContextServer implements kubecontextpb.KubeContextServiceServer on top
@@ -138,13 +140,13 @@ type Server struct {
 	once   sync.Once
 }
 
-// NewServer registers KubeContextService and AuthService on a fresh *grpc.Server
-// bound to a serving context it owns. The webview never reaches gRPC (h2c routes
-// it to the host's tray); nil watcher/authSvc keeps every method safe, mirroring
-// the GraphQL resolver nil-guards.
-func NewServer(watcher *k8shelpers.KubeConfigWatcher, authSvc auth.Service) *Server {
+// NewServer registers KubeContextService, AuthService and PokeService on a fresh
+// *grpc.Server bound to a serving context it owns. The webview never reaches
+// gRPC (h2c routes it to the host's tray); nil watcher/authSvc/pokeSvc keeps
+// every method safe, mirroring the GraphQL resolver nil-guards.
+func NewServer(watcher *k8shelpers.KubeConfigWatcher, authSvc auth.Service, pokeSvc *poke.Service) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	srv, drainStreams := newServer(ctx, watcher, authSvc)
+	srv, drainStreams := newServer(ctx, watcher, authSvc, pokeSvc)
 	return &Server{grpc: srv, cancel: cancel, drain: drainStreams}
 }
 
@@ -186,7 +188,7 @@ func (s *Server) Stop() { s.grpc.Stop() }
 // The keepalive ping keeps an idle Watch stream's h2c connection alive under the
 // HTTP server's 60s IdleTimeout (an idle kubeconfig can sit unchanged for far
 // longer than that).
-func newServer(servingCtx context.Context, watcher *k8shelpers.KubeConfigWatcher, authSvc auth.Service) (srv *grpc.Server, drainStreams func()) {
+func newServer(servingCtx context.Context, watcher *k8shelpers.KubeConfigWatcher, authSvc auth.Service, pokeSvc *poke.Service) (srv *grpc.Server, drainStreams func()) {
 	var streams sync.WaitGroup
 	srv = grpc.NewServer(grpc.KeepaliveParams(keepalive.ServerParameters{
 		Time:    30 * time.Second,
@@ -202,5 +204,8 @@ func newServer(servingCtx context.Context, watcher *k8shelpers.KubeConfigWatcher
 		servingCtx: servingCtx,
 		streams:    &streams,
 	})
+	// PokeService is unary-only (no long-lived streams), so it doesn't join the
+	// streams WaitGroup — there's nothing to drain at shutdown.
+	pokepb.RegisterPokeServiceServer(srv, &pokeServer{pokeSvc: pokeSvc})
 	return srv, streams.Wait
 }

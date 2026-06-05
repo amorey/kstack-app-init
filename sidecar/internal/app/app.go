@@ -86,12 +86,20 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 
+	// The resync broadcaster is the shared, cross-subsystem poke bus. It owns the
+	// wall-clock gap detector (machine sleep/resume backstop) and accepts pokes
+	// from the host via the gRPC PokeService. App owns its lifecycle; the cluster
+	// cache and cloud settings engine subscribe to it. Built before cluster/cloud
+	// so it can be handed to both.
+	pokeSvc := poke.New()
+
 	// The cluster-cache service owns the per-cluster SQLite cache, the durable
 	// registry, and the coordinator that keeps both in lockstep with the
 	// kube-config watcher. Enabled only when the host supplied a data dir; with
 	// an empty DataDir it degrades to a Reader that yields empty results and a
-	// nil ClusterManager, so the cluster resolvers stay safe.
-	clusterSvc, err := cluster.New(cfg.DataDir, kubeConfigWatcher)
+	// nil ClusterManager, so the cluster resolvers stay safe. The poke bus lets a
+	// machine-wake / host network-on event restart its per-cluster reflectors.
+	clusterSvc, err := cluster.New(cfg.DataDir, kubeConfigWatcher, pokeSvc)
 	if err != nil {
 		return nil, err
 	}
@@ -115,12 +123,6 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 
-	// The resync broadcaster is the shared, cross-subsystem poke bus. It owns the
-	// wall-clock gap detector (machine sleep/resume backstop) and will accept pokes
-	// from the host via gRPC (follow-up PR). App owns its lifecycle; cloud and other
-	// subsystems subscribe to it.
-	pokeSvc := poke.New(poke.Options{})
-
 	// The cloud-synced settings service depends on auth (for the token source and
 	// the session change signal). It degrades when CloudURL/DataDir are empty
 	// (standalone/test runs ⇒ no settings sync).
@@ -137,7 +139,7 @@ func New(cfg Config) (*App, error) {
 		ClusterManager:    clusterSvc.Manager(),
 		Auth:              authSvc,
 	})
-	grpcServer := grpcserver.NewServer(kubeConfigWatcher, authSvc)
+	grpcServer := grpcserver.NewServer(kubeConfigWatcher, authSvc, pokeSvc)
 
 	// Routing: the GraphQL server at /graphql.
 	mux := http.NewServeMux()

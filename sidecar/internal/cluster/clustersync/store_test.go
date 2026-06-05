@@ -18,7 +18,7 @@ import (
 func migratedCDB(t *testing.T) *clustercache.ClusterDB {
 	t.Helper()
 	ctx := context.Background()
-	cache := clustercache.NewManager(t.TempDir(), nil)
+	cache := clustercache.NewManager(t.TempDir(), nil, nil)
 	cdb, err := cache.Open(ctx, "c1")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cache.Shutdown(ctx) })

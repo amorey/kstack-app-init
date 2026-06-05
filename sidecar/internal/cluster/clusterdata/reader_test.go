@@ -25,7 +25,7 @@ func seedPod(ctx context.Context, t *testing.T, cdb *clustercache.ClusterDB, ns,
 
 func TestReaderPodsSnapshot(t *testing.T) {
 	ctx := context.Background()
-	cache := clustercache.NewManager(t.TempDir(), nil)
+	cache := clustercache.NewManager(t.TempDir(), nil, nil)
 	t.Cleanup(func() { _ = cache.Shutdown(ctx) })
 
 	cdb, err := cache.Open(ctx, "cluster-a")
@@ -47,7 +47,7 @@ func TestReaderPodsSnapshot(t *testing.T) {
 
 func TestReaderUnopenedClusterIsEmpty(t *testing.T) {
 	ctx := context.Background()
-	cache := clustercache.NewManager(t.TempDir(), nil)
+	cache := clustercache.NewManager(t.TempDir(), nil, nil)
 	t.Cleanup(func() { _ = cache.Shutdown(ctx) })
 
 	// A cluster the registry has not opened (disabled / absent / unknown) must
@@ -89,7 +89,7 @@ func TestReaderNilRegistryDegrades(t *testing.T) {
 func TestReaderWatchPodsEmitsOnChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cache := clustercache.NewManager(t.TempDir(), nil)
+	cache := clustercache.NewManager(t.TempDir(), nil, nil)
 	t.Cleanup(func() { _ = cache.Shutdown(context.Background()) })
 
 	cdb, err := cache.Open(ctx, "cluster-a")

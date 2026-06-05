@@ -24,8 +24,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/sqlitemigrate"
 )
 
@@ -86,6 +88,11 @@ type Upstream interface {
 type Manager struct {
 	dataDir  string
 	upstream Upstream
+	// poke is the shared resync broadcaster. Each open cluster's sync runner
+	// subscribes to it and restarts its reflectors on a poke (machine wake /
+	// host network-on), re-listing immediately instead of waiting for client-go
+	// to notice a connection killed by sleep. nil disables resync (tests/degraded).
+	poke *poke.Service
 
 	mu    sync.RWMutex
 	dbs   map[string]*ClusterDB
@@ -95,10 +102,12 @@ type Manager struct {
 // NewManager returns a Manager rooted at dataDir. The directory is created
 // lazily on first Open. upstream may be nil to disable background sync —
 // useful for tests and for the initial PR where the upstream isn't wired yet.
-func NewManager(dataDir string, upstream Upstream) *Manager {
+// pk may be nil to disable resync pokes (tests, degraded runs).
+func NewManager(dataDir string, upstream Upstream, pk *poke.Service) *Manager {
 	return &Manager{
 		dataDir:  dataDir,
 		upstream: upstream,
+		poke:     pk,
 		dbs:      make(map[string]*ClusterDB),
 	}
 }
@@ -147,7 +156,7 @@ func (m *Manager) Open(ctx context.Context, clusterUUID string) (*ClusterDB, err
 	}
 
 	if m.upstream != nil {
-		cdb.startSync(m.upstream)
+		cdb.startSync(m.upstream, m.poke)
 	}
 	m.dbs[clusterUUID] = cdb
 	return cdb, nil
@@ -447,26 +456,65 @@ func quarantineCorrupt(path string) error {
 	return nil
 }
 
-func (c *ClusterDB) startSync(up Upstream) {
+func (c *ClusterDB) startSync(up Upstream, pk *poke.Service) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.syncCancel = cancel
 	c.syncDone = make(chan struct{})
+
+	// Subscribe to resync pokes (machine wake / host network-on). A nil
+	// broadcaster (tests/degraded) leaves sigs nil — a receive on a nil channel
+	// blocks forever, so the selects below never fire and the loop behaves
+	// exactly as before. The broadcast hub coalesces a burst to the newest
+	// signal, so we don't buffer ourselves.
+	var sigs <-chan poke.Signal
+	var cancelSub func()
+	if pk != nil {
+		sigs, cancelSub = pk.Subscribe()
+	}
+
 	go func() {
 		defer close(c.syncDone)
+		if cancelSub != nil {
+			defer cancelSub()
+		}
 		backoff := syncRetryInitial
 		for {
-			err := up.Run(ctx, c.uuid, c.writeDB)
-			// A live ctx means the cluster is still open, so any return —
-			// error or a premature nil (e.g. discovery found no resources) —
-			// is abnormal: retry until the cluster is closed (ctx cancelled).
+			runCtx, runCancel := context.WithCancel(ctx)
+			// Abort this run's reflectors on a poke so the loop re-lists
+			// immediately. pokedRun records that this run ended because of a
+			// poke (a healthy restart) rather than a failure, so we skip backoff.
+			var pokedRun atomic.Bool
+			go func() {
+				select {
+				case <-runCtx.Done():
+				case <-sigs:
+					pokedRun.Store(true)
+					runCancel()
+				}
+			}()
+			err := up.Run(runCtx, c.uuid, c.writeDB)
+			runCancel()
+			// A cancelled parent ctx means the cluster is closing — stop.
 			if ctx.Err() != nil {
 				return
 			}
+			// A poke ended the run: re-list now and reset backoff.
+			if pokedRun.Load() {
+				slog.Info("clustercache: resync poke, restarting sync", "uuid", c.uuid)
+				backoff = syncRetryInitial
+				continue
+			}
+			// Otherwise the run returned on its own — an error or a premature
+			// nil (e.g. discovery found no resources): retry with backoff,
+			// but cut the wait short if a poke arrives meanwhile.
 			slog.Error("clustercache: sync runner exited, retrying",
 				"uuid", c.uuid, "err", err, "backoff", backoff)
 			select {
 			case <-ctx.Done():
 				return
+			case <-sigs:
+				backoff = syncRetryInitial
+				continue
 			case <-time.After(backoff):
 			}
 			if backoff *= 2; backoff > syncRetryMax {

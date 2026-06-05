@@ -49,12 +49,12 @@ func manualTicker(ch chan time.Time) func(time.Duration) (<-chan time.Time, func
 func TestWallClock_SmallGap_NoPoke(t *testing.T) {
 	tickCh := make(chan time.Time, 1)
 	// Tick=10s, GapFactor=2.0 → threshold=20s; Now always returns epoch → gap=0 → no poke.
-	b := New(Options{
-		Tick:      10 * time.Second,
-		GapFactor: 2.0,
-		Now:       func() time.Time { return epoch },
-		NewTicker: manualTicker(tickCh),
-	})
+	b := newWithOptions(
+		withTick(10*time.Second),
+		withGapFactor(2.0),
+		withNow(func() time.Time { return epoch }),
+		withTicker(manualTicker(tickCh)),
+	)
 
 	ch, cancel := b.Subscribe()
 	defer cancel()
@@ -72,17 +72,17 @@ func TestWallClock_LargeGap_Poke(t *testing.T) {
 	tickCh := make(chan time.Time, 1)
 	// Tick=10s, GapFactor=2.0 → threshold=20s; gap=30s → poke.
 	var callN atomic.Int64
-	b := New(Options{
-		Tick:      10 * time.Second,
-		GapFactor: 2.0,
-		Now: func() time.Time {
+	b := newWithOptions(
+		withTick(10*time.Second),
+		withGapFactor(2.0),
+		withNow(func() time.Time {
 			if callN.Add(1) == 1 {
 				return epoch // first call: seed lastSeen
 			}
 			return epoch.Add(30 * time.Second) // subsequent: 30s gap
-		},
-		NewTicker: manualTicker(tickCh),
-	})
+		}),
+		withTicker(manualTicker(tickCh)),
+	)
 
 	ch, cancel := b.Subscribe()
 	defer cancel()
@@ -98,7 +98,7 @@ func TestWallClock_LargeGap_Poke(t *testing.T) {
 
 // A3: Poke fans a Signal out to every active subscriber.
 func TestPoke_FanOut(t *testing.T) {
-	b := New(Options{Now: func() time.Time { return epoch }})
+	b := newWithOptions(withNow(func() time.Time { return epoch }))
 
 	ch1, cancel1 := b.Subscribe()
 	defer cancel1()
@@ -117,7 +117,7 @@ func TestPoke_FanOut(t *testing.T) {
 
 // A4: cancelling Run's context closes all subscriber channels.
 func TestRun_CtxCancel_ClosesSubscribers(t *testing.T) {
-	b := New(Options{Now: func() time.Time { return epoch }})
+	b := newWithOptions(withNow(func() time.Time { return epoch }))
 
 	ch, cancel := b.Subscribe()
 	defer cancel()

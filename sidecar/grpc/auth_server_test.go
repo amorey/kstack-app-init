@@ -139,7 +139,7 @@ func TestAuthStateWatchSnapshotThenDelta(t *testing.T) {
 	t.Cleanup(w.Close)
 
 	svc := newFakeAuthSvc(auth.Identity{Email: "ada@example.com", Name: "Ada"})
-	grpcSrv := grpcserver.NewServer(w, svc)
+	grpcSrv := grpcserver.NewServer(w, svc, nil)
 	conn := newGRPCTestConn(t, grpcSrv)
 	t.Cleanup(grpcSrv.Stop)
 
@@ -174,7 +174,7 @@ func TestStartLoginAndLogoutRPC(t *testing.T) {
 	t.Cleanup(w.Close)
 
 	svc := signedInFakeAuthSvc(auth.Identity{Email: "ada@example.com"})
-	grpcSrv := grpcserver.NewServer(w, svc)
+	grpcSrv := grpcserver.NewServer(w, svc, nil)
 	conn := newGRPCTestConn(t, grpcSrv)
 	t.Cleanup(grpcSrv.Stop)
 
@@ -205,7 +205,7 @@ func TestAuthRPCsNilServiceTolerant(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
-	grpcSrv := grpcserver.NewServer(w, nil)
+	grpcSrv := grpcserver.NewServer(w, nil, nil)
 	conn := newGRPCTestConn(t, grpcSrv)
 	t.Cleanup(grpcSrv.Stop)
 
@@ -237,7 +237,7 @@ func TestAuthStateWatchDrainsOnShutdown(t *testing.T) {
 	t.Cleanup(w.Close)
 
 	svc := newFakeAuthSvc(auth.Identity{})
-	grpcSrv := grpcserver.NewServer(w, svc)
+	grpcSrv := grpcserver.NewServer(w, svc, nil)
 	conn := newGRPCTestConn(t, grpcSrv)
 
 	client := authpb.NewAuthServiceClient(conn)

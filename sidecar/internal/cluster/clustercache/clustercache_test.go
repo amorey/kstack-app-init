@@ -12,11 +12,13 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 func TestOpenMigrateClose(t *testing.T) {
 	dir := t.TempDir()
-	r := NewManager(dir, nil)
+	r := NewManager(dir, nil, nil)
 	ctx := context.Background()
 
 	cdb, err := r.Open(ctx, "cluster-a")
@@ -37,7 +39,7 @@ func TestOpenMigrateClose(t *testing.T) {
 // is silent (the DB just grows), so guard the resulting mode explicitly.
 func TestAutoVacuumIsIncremental(t *testing.T) {
 	dir := t.TempDir()
-	r := NewManager(dir, nil)
+	r := NewManager(dir, nil, nil)
 	ctx := context.Background()
 
 	cdb, err := r.Open(ctx, "cluster-a")
@@ -55,7 +57,7 @@ func TestAutoVacuumIsIncremental(t *testing.T) {
 // drop the second transition — guard the schema directly.
 func TestStatusHistoryKeepsSameMillisecondTransitions(t *testing.T) {
 	dir := t.TempDir()
-	r := NewManager(dir, nil)
+	r := NewManager(dir, nil, nil)
 	ctx := context.Background()
 
 	cdb, err := r.Open(ctx, "cluster-a")
@@ -80,7 +82,7 @@ func TestStatusHistoryKeepsSameMillisecondTransitions(t *testing.T) {
 // outside the clusters dir.
 func TestDeleteCacheFilesRejectsTraversal(t *testing.T) {
 	dir := t.TempDir()
-	r := NewManager(dir, nil)
+	r := NewManager(dir, nil, nil)
 	ctx := context.Background()
 
 	// A sentinel sibling of the clusters dir that must survive a traversal attempt.
@@ -96,7 +98,7 @@ func TestDeleteCacheFilesRejectsTraversal(t *testing.T) {
 
 func TestOpenIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	r := NewManager(dir, nil)
+	r := NewManager(dir, nil, nil)
 	ctx := context.Background()
 
 	a, err := r.Open(ctx, "cluster-a")
@@ -112,7 +114,7 @@ func TestReopenRunsNoMigrations(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	r1 := NewManager(dir, nil)
+	r1 := NewManager(dir, nil, nil)
 	cdb1, err := r1.Open(ctx, "c")
 	require.NoError(t, err)
 	var firstCount int
@@ -120,7 +122,7 @@ func TestReopenRunsNoMigrations(t *testing.T) {
 		`SELECT COUNT(*) FROM schema_migrations`).Scan(&firstCount))
 	require.NoError(t, r1.Shutdown(ctx))
 
-	r2 := NewManager(dir, nil)
+	r2 := NewManager(dir, nil, nil)
 	cdb2, err := r2.Open(ctx, "c")
 	require.NoError(t, err)
 	var secondCount int
@@ -132,7 +134,7 @@ func TestReopenRunsNoMigrations(t *testing.T) {
 
 func TestConcurrentReadersDuringWriter(t *testing.T) {
 	dir := t.TempDir()
-	r := NewManager(dir, nil)
+	r := NewManager(dir, nil, nil)
 	ctx := context.Background()
 	cdb, err := r.Open(ctx, "c")
 	require.NoError(t, err)
@@ -201,7 +203,7 @@ func TestCorruptFileQuarantined(t *testing.T) {
 	// invalid header and will fail integrity_check on first query.
 	require.NoError(t, os.WriteFile(dbPath, []byte("not a sqlite file"), 0o600))
 
-	r := NewManager(dir, nil)
+	r := NewManager(dir, nil, nil)
 	ctx := context.Background()
 	cdb, err := r.Open(ctx, "broken")
 	require.NoError(t, err, "open should recover from a corrupt file by quarantining it")
@@ -217,7 +219,7 @@ func TestCorruptFileQuarantined(t *testing.T) {
 
 func TestJanitorTrimsStaleEvents(t *testing.T) {
 	dir := t.TempDir()
-	r := NewManager(dir, nil)
+	r := NewManager(dir, nil, nil)
 	ctx := context.Background()
 	cdb, err := r.Open(ctx, "c")
 	require.NoError(t, err)
@@ -251,7 +253,7 @@ func TestJanitorTrimsStaleEvents(t *testing.T) {
 func TestSyncRunnerLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	up := &fakeUpstream{started: make(chan struct{}, 1)}
-	r := NewManager(dir, up)
+	r := NewManager(dir, up, nil)
 	ctx := context.Background()
 
 	_, err := r.Open(ctx, "c")
@@ -279,7 +281,7 @@ func TestSyncRunnerRetriesAfterError(t *testing.T) {
 
 	dir := t.TempDir()
 	up := &flakyUpstream{calls: make(chan struct{}, 8)}
-	r := NewManager(dir, up)
+	r := NewManager(dir, up, nil)
 	ctx := context.Background()
 
 	_, err := r.Open(ctx, "c")
@@ -293,6 +295,41 @@ func TestSyncRunnerRetriesAfterError(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("expected sync runner call %d after a prior abnormal exit", i+1)
 		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, r.Shutdown(shutdownCtx))
+}
+
+// A poke (machine wake / host network-on) must abort the in-flight sync and
+// re-list immediately, so the per-cluster reflectors recover without waiting
+// for client-go to notice a connection killed by sleep.
+func TestSyncRunnerRestartsOnPoke(t *testing.T) {
+	dir := t.TempDir()
+	up := &fakeUpstream{started: make(chan struct{}, 4)}
+	// A real broadcaster; we drive pokes directly rather than rely on the
+	// wall-clock detector, so no ticker is started.
+	pk := poke.New()
+	r := NewManager(dir, up, pk)
+	ctx := context.Background()
+
+	_, err := r.Open(ctx, "c")
+	require.NoError(t, err)
+
+	// First run starts and blocks on its ctx.
+	select {
+	case <-up.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sync runner did not start")
+	}
+
+	// A poke aborts that run; the loop restarts it (re-enters Run) promptly.
+	pk.Poke(poke.SourceHost)
+	select {
+	case <-up.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("poke did not restart the sync runner")
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
