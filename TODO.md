@@ -12,3 +12,4 @@
 
 - Check RBAC permissions?
 - SSO failure didn't retry
+- detect new GVRs

@@ -289,7 +289,7 @@ func (u *Upstream) Run(ctx context.Context, clusterUUID string, writer *sql.DB) 
 	if err != nil {
 		return fmt.Errorf("discover: %w", err)
 	}
-	slog.Info("clustersync: discovered resources", "cluster", clusterUUID, "count", len(entries))
+	slog.Info("clustersync: discovered syncable GVRs on API server", "cluster", clusterUUID, "count", len(entries))
 
 	var wg sync.WaitGroup
 	for _, e := range entries {
