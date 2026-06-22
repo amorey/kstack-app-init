@@ -7,11 +7,10 @@
 // Why a dedicated owner: a SQLite file has exactly one schema_migrations table
 // with a single monotonic version sequence, so its schema cannot be co-owned by
 // several feature packages each embedding their own migrations. appdb holds that
-// sequence centrally; consumers (today internal/kube's registry, tomorrow
-// others) are pure data-access layers over the shared handle and add their
-// tables as new numbered migrations here. The per-cluster caches under clusters/
+// sequence centrally; consumers are pure data-access layers over the shared
+// handle and add their tables as new numbered migrations here. The per-cluster caches under clusters/
 // are a different story — one file per cluster, each its own sequence — and stay
-// owned by internal/kube.
+// owned by internal/cluster.
 //
 // app.db deliberately lives outside the clusters/ dir so the per-cluster cache
 // scan never mistakes it for a <uuid>.db cache. The pool is a single-connection

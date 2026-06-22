@@ -16,8 +16,9 @@
 // SQLite database file per cluster record under the host-supplied data dir.
 // The package owns the lifecycle of those files (open/migrate/quarantine/
 // delete) plus a per-cluster janitor goroutine; it does NOT own syncing —
-// the kube package's sync controller starts an engine (internal/kube/
-// clustersync) that writes through the ClusterDB this package hands out.
+// the cluster package's ClusterCacheController starts an engine
+// (internal/cluster/cachesync) that writes through the ClusterDB this package
+// hands out.
 //
 // Concurrency model: SQLite is opened in WAL mode so readers don't block a
 // writer. We expose two *sql.DB handles against the same file — a single-

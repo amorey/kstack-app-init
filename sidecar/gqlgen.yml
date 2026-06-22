@@ -48,22 +48,22 @@ models:
   # controllers.ClusterStatus + the ClusterID) because its cache field resolver
   # needs the cluster's ID and a child resolver only sees its own obj.
   Cluster:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.Cluster
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.Cluster
     fields:
       status:
         resolver: true
 
   ClusterSpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterSpec
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSpec
 
   ClusterSource:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterSource
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSource
 
   ClusterSourceKubeconfig:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterSourceKubeconfig
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSourceKubeconfig
 
   ClusterSourceStatus:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterSourceStatus
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSourceStatus
 
   ClusterStatus:
     model: github.com/kubetail-org/kstack-app/sidecar/graph/model.ClusterStatus
@@ -72,13 +72,13 @@ models:
         resolver: true
 
   ClusterServer:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterServer
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterServer
 
   ClusterKubeconfig:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.KubeconfigStatus
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.KubeconfigStatus
 
   ClusterPrincipal:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterPrincipal
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterPrincipal
     fields:
       permissions:
         resolver: true
@@ -86,19 +86,19 @@ models:
   # The conditions ride the wire as-is (the controllers domain shapes; the
   # webview derives display state from type/status/reason).
   ClusterCondition:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterCondition
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCondition
 
   ConditionStatus:
     model: github.com/amorey/beehive.ConditionStatus
 
   ClusterSyncStatus:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterCacheStatus
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheStatus
 
   ClusterCache:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.CacheStats
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.CacheStats
 
   CachedResource:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.CachedResourceStats
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.CachedResourceStats
 
   # --- Auth ---
   # Bind the GraphQL auth types straight to the auth domain types so the
@@ -119,7 +119,7 @@ models:
     model:
       - github.com/99designs/gqlgen/graphql.ID
       - k8s.io/apimachinery/pkg/types.UID
-      - github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterID
+      - github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterID
 
   Int:
     model:
@@ -130,4 +130,4 @@ models:
   String:
     model:
       - github.com/99designs/gqlgen/graphql.String
-      - github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterConditionType
+      - github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterConditionType

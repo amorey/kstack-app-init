@@ -1,62 +1,148 @@
 package graph_test
 
-// Behavioral tests for the cluster query resolvers, exercised over a real
-// gqlgen HTTP server. The resolver depends on beehive clients, so the tests
-// wire a real beehive (in-memory SQLite) with a statusSeedController that
-// seeds pre-defined statuses on first reconcile — only the cluster and
-// cache-status surfaces are modeled, since that's all the cluster resolvers
-// touch. Cache stats resolve through the CacheManager (no on-disk files means
-// the "no cache" placeholder is always returned).
+// Behavioral tests for the cluster resolvers, exercised over a real gqlgen HTTP
+// server. The resolvers now delegate to a cluster.ClusterService, so the tests
+// wire a fakeClusterService built from fixtures — that keeps the focus on the
+// GraphQL wire mapping (nil→null, conditions/cache shapes) and off beehive,
+// which the service-level tests in internal/cluster already cover.
 
 import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/amorey/beehive"
-	beehivesqlite "github.com/amorey/beehive/sqlite"
-	"github.com/stretchr/testify/require"
-
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/clustercache/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 )
-
-// statusSeedController calls UpdateStatus from a pre-seeded map on the first
-// reconcile of each object, keyed by slug. On deletion-pending objects it
-// no-ops so the beehive GC can proceed.
-type statusSeedController[Spec, Status any] struct {
-	statuses map[string]Status
-	client   beehive.ControllerClient[Status]
-}
-
-func (c *statusSeedController[Spec, Status]) Start(cl beehive.ControllerClient[Status]) error {
-	c.client = cl
-	return nil
-}
-
-func (c *statusSeedController[Spec, Status]) Stop(_ context.Context) error { return nil }
-
-func (c *statusSeedController[Spec, Status]) Reconcile(ctx context.Context, obj *beehive.Object[Spec, Status]) (beehive.Result, error) {
-	if obj.DeletionRequestedAt != nil || obj.Slug == nil {
-		return beehive.Result{}, nil
-	}
-	if status, ok := c.statuses[*obj.Slug]; ok {
-		_ = c.client.UpdateStatus(ctx, obj.ID, obj.Generation, status)
-	}
-	return beehive.Result{}, nil
-}
 
 // clusterFixture bundles all data for one test cluster record.
 type clusterFixture struct {
 	id          string
-	spec        controllers.ClusterSpec
-	connStatus  controllers.ClusterConnectionStatus
-	cacheStatus controllers.ClusterCacheStatus
+	spec        cluster.ClusterSpec
+	connStatus  cluster.ClusterConnectionStatus
+	cacheStatus cluster.ClusterCacheStatus
+}
+
+// fakeClusterService implements cluster.ClusterService over an in-memory map
+// built from fixtures: it joins each fixture's connection + cache status into a
+// domain Cluster (exactly as the real service's buildCluster does), so the
+// resolver/wire assertions see the same shapes.
+type fakeClusterService struct {
+	mu       sync.Mutex
+	order    []cluster.ClusterID
+	clusters map[cluster.ClusterID]*cluster.Cluster
+}
+
+var _ cluster.ClusterService = (*fakeClusterService)(nil)
+
+func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
+	f := &fakeClusterService{clusters: map[cluster.ClusterID]*cluster.Cluster{}}
+	for _, fx := range fixtures {
+		id := cluster.ClusterID(fx.id)
+		f.order = append(f.order, id)
+		f.clusters[id] = &cluster.Cluster{
+			ID:   id,
+			Spec: fx.spec,
+			Status: cluster.ClusterStatus{
+				Source:          fx.connStatus.Source,
+				Server:          fx.connStatus.Server,
+				Principal:       fx.connStatus.Principal,
+				LastConnectedAt: fx.connStatus.LastConnectedAt,
+				Conditions:      fx.connStatus.Conditions,
+				SyncStatus:      fx.cacheStatus,
+			},
+		}
+	}
+	return f
+}
+
+func (f *fakeClusterService) snapshot() []*cluster.Cluster {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*cluster.Cluster, 0, len(f.order))
+	for _, id := range f.order {
+		if c, ok := f.clusters[id]; ok {
+			cp := *c
+			out = append(out, &cp)
+		}
+	}
+	return out
+}
+
+func (f *fakeClusterService) List(context.Context) ([]*cluster.Cluster, error) {
+	return f.snapshot(), nil
+}
+
+func (f *fakeClusterService) Get(_ context.Context, id cluster.ClusterID) (*cluster.Cluster, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.clusters[id]
+	if !ok {
+		return nil, nil
+	}
+	cp := *c
+	return &cp, nil
+}
+
+func (f *fakeClusterService) Watch(ctx context.Context) (<-chan []*cluster.Cluster, error) {
+	ch := make(chan []*cluster.Cluster, 1)
+	ch <- f.snapshot()
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
+
+func (f *fakeClusterService) CacheStats(context.Context, cluster.ClusterID) (*cluster.CacheStats, error) {
+	return &cluster.CacheStats{}, nil
+}
+
+func (f *fakeClusterService) SetSyncEnabled(_ context.Context, id cluster.ClusterID, enabled bool) (*cluster.Cluster, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.clusters[id]
+	if !ok {
+		return nil, cluster.ErrNotFound
+	}
+	c.Spec.IsSyncEnabled = enabled
+	cp := *c
+	return &cp, nil
+}
+
+func (f *fakeClusterService) RetryConnection(_ context.Context, id cluster.ClusterID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.clusters[id]; !ok {
+		return cluster.ErrNotFound
+	}
+	return nil
+}
+
+func (f *fakeClusterService) ClearCache(_ context.Context, id cluster.ClusterID) (*cluster.Cluster, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.clusters[id]
+	if !ok {
+		return nil, cluster.ErrNotFound
+	}
+	cp := *c
+	return &cp, nil
+}
+
+func (f *fakeClusterService) Delete(_ context.Context, id cluster.ClusterID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.clusters[id]; !ok {
+		return cluster.ErrNotFound
+	}
+	delete(f.clusters, id)
+	return nil
 }
 
 // clusterFixtures returns two records: one fully-probed/present (cl-1) and
@@ -69,28 +155,28 @@ func clusterFixtures() []clusterFixture {
 	return []clusterFixture{
 		{
 			id: "cl-1",
-			spec: controllers.ClusterSpec{
+			spec: cluster.ClusterSpec{
 				Name:          &prodName,
 				IsSyncEnabled: true,
 				IsActive:      true,
-				Source:        controllers.ClusterSource{Kubeconfig: &controllers.ClusterSourceKubeconfig{Context: "prod"}},
+				Source:        cluster.ClusterSource{Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: "prod"}},
 			},
-			connStatus: controllers.ClusterConnectionStatus{
-				Source: controllers.ClusterSourceStatus{Kubeconfig: &controllers.KubeconfigStatus{
+			connStatus: cluster.ClusterConnectionStatus{
+				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.KubeconfigStatus{
 					Cluster: "prod-cluster", User: "prod-user",
 					IsPresent: true, IsDefault: true,
 				}},
-				Server:    controllers.ClusterServer{UID: &uid1, Version: &ver},
-				Principal: controllers.ClusterPrincipal{Username: &admin},
+				Server:    cluster.ClusterServer{UID: &uid1, Version: &ver},
+				Principal: cluster.ClusterPrincipal{Username: &admin},
 			},
 		},
 		{
 			id: "cl-2",
-			spec: controllers.ClusterSpec{
-				Source: controllers.ClusterSource{Kubeconfig: &controllers.ClusterSourceKubeconfig{Context: "staging"}},
+			spec: cluster.ClusterSpec{
+				Source: cluster.ClusterSource{Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: "staging"}},
 			},
-			connStatus: controllers.ClusterConnectionStatus{
-				Source: controllers.ClusterSourceStatus{Kubeconfig: &controllers.KubeconfigStatus{
+			connStatus: cluster.ClusterConnectionStatus{
+				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.KubeconfigStatus{
 					Cluster: "staging-cluster", User: "staging-user",
 				}},
 			},
@@ -98,78 +184,14 @@ func clusterFixtures() []clusterFixture {
 	}
 }
 
-// newTestServer builds a beehive (in-memory SQLite) with statusSeedControllers
-// for the given fixtures, creates the Cluster and ClusterCache objects, waits
-// for statuses to be seeded, then returns an httptest.Server backed by a real
-// resolver. Cleanup is registered via t.Cleanup so callers need not defer Close.
+// newTestServer returns an httptest.Server backed by a real resolver wired to a
+// fakeClusterService built from the fixtures. Cleanup is registered via
+// t.Cleanup so callers need not defer Close.
 func newTestServer(t *testing.T, fixtures []clusterFixture) *httptest.Server {
 	t.Helper()
-
-	clusterStatuses := make(map[string]controllers.ClusterConnectionStatus, len(fixtures))
-	cacheStatuses := make(map[string]controllers.ClusterCacheStatus, len(fixtures))
-	for _, f := range fixtures {
-		id := controllers.ClusterID(f.id)
-		clusterStatuses[controllers.ClusterSlug(id)] = f.connStatus
-		cacheStatuses[controllers.ClusterCacheSlug(id)] = f.cacheStatus
-	}
-
-	st, err := beehivesqlite.OpenMemory()
-	require.NoError(t, err)
-	bh, err := beehive.New(st, beehive.WithResyncInterval(0))
-	require.NoError(t, err)
-
-	srcClient := beehive.NewClient[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus](bh, controllers.ClusterSourceGroupKind)
-	clusterClient := beehive.NewClient[controllers.ClusterSpec, controllers.ClusterConnectionStatus](bh, controllers.ClusterGroupKind)
-	cacheClient := beehive.NewClient[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus](bh, controllers.ClusterCacheGroupKind)
-
-	require.NoError(t, beehive.Register(bh, controllers.ClusterSourceGroupKind,
-		&statusSeedController[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus]{
-			statuses: map[string]controllers.ClusterSourceObjStatus{},
-		}))
-	require.NoError(t, beehive.Register(bh, controllers.ClusterGroupKind,
-		&statusSeedController[controllers.ClusterSpec, controllers.ClusterConnectionStatus]{
-			statuses: clusterStatuses,
-		}))
-	require.NoError(t, beehive.Register(bh, controllers.ClusterCacheGroupKind,
-		&statusSeedController[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus]{
-			statuses: cacheStatuses,
-		}))
-
-	stop, err := bh.Start(context.Background())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = stop(context.Background()) })
-
-	ctx := context.Background()
-	for _, f := range fixtures {
-		id := controllers.ClusterID(f.id)
-		_, err := clusterClient.Create(ctx, f.spec, beehive.WithSlug(controllers.ClusterSlug(id)))
-		require.NoError(t, err)
-		_, err = cacheClient.Create(ctx, controllers.ClusterCacheSpec{}, beehive.WithSlug(controllers.ClusterCacheSlug(id)))
-		require.NoError(t, err)
-	}
-
-	// Wait for status seeds to land so reads return consistent data.
-	for _, f := range fixtures {
-		id := controllers.ClusterID(f.id)
-		require.Eventually(t, func() bool {
-			obj, err := clusterClient.GetBySlug(ctx, controllers.ClusterSlug(id))
-			return err == nil && obj.Status != nil
-		}, 2*time.Second, 10*time.Millisecond)
-		require.Eventually(t, func() bool {
-			obj, err := cacheClient.GetBySlug(ctx, controllers.ClusterCacheSlug(id))
-			return err == nil && obj.Status != nil
-		}, 2*time.Second, 10*time.Millisecond)
-	}
-
-	cacheManager := store.NewManager(t.TempDir())
-	t.Cleanup(func() { cacheManager.Shutdown(context.Background()) })
-
 	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{
-		ClusterClient: clusterClient,
-		CacheClient:   cacheClient,
-		SrcClient:     srcClient,
-		CacheManager:  cacheManager,
-		Auth:          newFakeAuth(auth.Identity{}),
+		ClusterSvc: newFakeClusterService(fixtures),
+		Auth:       newFakeAuth(auth.Identity{}),
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -389,14 +411,14 @@ func TestClusterEphemeralFields(t *testing.T) {
 func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 	at := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
 	fixtures := clusterFixtures()
-	fixtures[0].connStatus.Conditions = []controllers.ClusterCondition{{
-		Type: controllers.ClusterConditionConnected, Status: controllers.ConditionFalse,
+	fixtures[0].connStatus.Conditions = []cluster.ClusterCondition{{
+		Type: cluster.ClusterConditionConnected, Status: cluster.ConditionFalse,
 		Reason: "ProbeFailed", Message: "connection refused",
 		ObservedGeneration: 2, LastTransitionTime: at,
 	}}
-	fixtures[0].cacheStatus = controllers.ClusterCacheStatus{
-		Conditions: []controllers.ClusterCondition{{
-			Type: controllers.ClusterConditionSynced, Status: controllers.ConditionTrue,
+	fixtures[0].cacheStatus = cluster.ClusterCacheStatus{
+		Conditions: []cluster.ClusterCondition{{
+			Type: cluster.ClusterConditionSynced, Status: cluster.ConditionTrue,
 			Reason: "Watching", LastTransitionTime: at,
 		}},
 		LastSyncedAt: &at,

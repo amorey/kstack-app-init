@@ -25,7 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/clustercache/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/store"
 )
 
 // migratedCDB opens a fresh, migrated per-cluster cache DB. The cache is shut

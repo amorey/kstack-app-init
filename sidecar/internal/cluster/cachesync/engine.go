@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package clustersync mirrors one real Kubernetes cluster into its local
-// SQLite cache (internal/kube/clustercache).
+// Package cachesync mirrors one real Kubernetes cluster into its local
+// SQLite cache (internal/cluster/store).
 //
 // Discovery + dynamic/metadata clients + one per-GVR kindDriver means one
 // code path serves every Kind on every cluster — built-ins and CRDs alike.
@@ -61,7 +61,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/clustercache/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/store"
 )
 
 // init routes client-go's API-server warning headers (deprecation

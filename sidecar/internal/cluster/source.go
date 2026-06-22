@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package clustersource
+package cluster
 
 import (
 	"context"
@@ -20,8 +20,6 @@ import (
 
 	"github.com/amorey/beehive"
 	"github.com/google/uuid"
-
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
 )
 
 // ClusterSourceController reconciles ClusterSource beehive objects: it creates
@@ -36,18 +34,18 @@ import (
 // The ClusterController mirrors SourceObs into ClusterConnectionStatus.Source
 // during its reconcile so the GraphQL layer reads from status as expected.
 type ClusterSourceController struct {
-	clusterClient beehive.Client[controllers.ClusterSpec, controllers.ClusterConnectionStatus]
-	controlClient beehive.ControllerClient[controllers.ClusterSourceObjStatus]
+	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
+	controlClient beehive.ControllerClient[ClusterSourceObjStatus]
 }
 
 // NewClusterSourceController builds a controller that will manage Cluster
 // children using clusterClient.
-func NewClusterSourceController(clusterClient beehive.Client[controllers.ClusterSpec, controllers.ClusterConnectionStatus]) *ClusterSourceController {
+func NewClusterSourceController(clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]) *ClusterSourceController {
 	return &ClusterSourceController{clusterClient: clusterClient}
 }
 
 // Start stores the ControllerClient for use in Reconcile.
-func (c *ClusterSourceController) Start(cl beehive.ControllerClient[controllers.ClusterSourceObjStatus]) error {
+func (c *ClusterSourceController) Start(cl beehive.ControllerClient[ClusterSourceObjStatus]) error {
 	c.controlClient = cl
 	return nil
 }
@@ -57,7 +55,7 @@ func (c *ClusterSourceController) Stop(_ context.Context) error { return nil }
 
 // Reconcile converges one ClusterSource object: ensures a Cluster child exists
 // and keeps its SourceObs spec field current with the source spec.
-func (c *ClusterSourceController) Reconcile(ctx context.Context, obj *beehive.Object[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus]) (beehive.Result, error) {
+func (c *ClusterSourceController) Reconcile(ctx context.Context, obj *beehive.Object[ClusterSourceSpec, ClusterSourceObjStatus]) (beehive.Result, error) {
 	if obj.DeletionRequestedAt != nil {
 		// Beehive GC cascades deletion to owned Cluster and transitively to
 		// ClusterCache. No finalizers to clear.
@@ -79,7 +77,7 @@ func (c *ClusterSourceController) Reconcile(ctx context.Context, obj *beehive.Ob
 
 	// Persist ClusterID in our own status once after creating the child.
 	if obj.Status == nil || obj.Status.ClusterID == nil {
-		return beehive.Result{}, c.controlClient.UpdateStatus(ctx, obj.ID, obj.Generation, controllers.ClusterSourceObjStatus{
+		return beehive.Result{}, c.controlClient.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterSourceObjStatus{
 			ClusterID: &clusterID,
 		})
 	}
@@ -88,28 +86,28 @@ func (c *ClusterSourceController) Reconcile(ctx context.Context, obj *beehive.Ob
 
 // ensureClusterChild creates the Cluster child if it does not already exist,
 // returning the child's ClusterID (UUID) and whether it was just created.
-func (c *ClusterSourceController) ensureClusterChild(ctx context.Context, obj *beehive.Object[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus]) (controllers.ClusterID, bool, error) {
+func (c *ClusterSourceController) ensureClusterChild(ctx context.Context, obj *beehive.Object[ClusterSourceSpec, ClusterSourceObjStatus]) (ClusterID, bool, error) {
 	if obj.Status != nil && obj.Status.ClusterID != nil {
 		return *obj.Status.ClusterID, false, nil
 	}
 
-	id := controllers.ClusterID(uuid.NewString())
-	obs := controllers.KubeconfigStatus{
+	id := ClusterID(uuid.NewString())
+	obs := KubeconfigStatus{
 		Cluster:   obj.Spec.ClusterName,
 		User:      obj.Spec.UserName,
 		IsPresent: obj.Spec.IsPresent,
 		IsDefault: obj.Spec.IsDefault,
 	}
-	_, err := c.clusterClient.Create(ctx, controllers.ClusterSpec{
+	_, err := c.clusterClient.Create(ctx, ClusterSpec{
 		IsSyncEnabled: true,
 		IsActive:      true,
-		Source: controllers.ClusterSource{
-			Kubeconfig: &controllers.ClusterSourceKubeconfig{
+		Source: ClusterSource{
+			Kubeconfig: &ClusterSourceKubeconfig{
 				Context: obj.Spec.ContextName,
 			},
 		},
 		SourceObs: &obs,
-	}, beehive.WithSlug(controllers.ClusterSlug(id)), beehive.WithOwner(obj.ID))
+	}, beehive.WithSlug(ClusterSlug(id)), beehive.WithOwner(obj.ID))
 	if err != nil {
 		return "", false, err
 	}
@@ -118,8 +116,8 @@ func (c *ClusterSourceController) ensureClusterChild(ctx context.Context, obj *b
 
 // syncSourceObs updates ClusterSpec.SourceObs to reflect the current source
 // spec — a no-op when nothing changed.
-func (c *ClusterSourceController) syncSourceObs(ctx context.Context, clusterID controllers.ClusterID, spec controllers.ClusterSourceSpec) error {
-	clusterObj, err := c.clusterClient.GetBySlug(ctx, controllers.ClusterSlug(clusterID))
+func (c *ClusterSourceController) syncSourceObs(ctx context.Context, clusterID ClusterID, spec ClusterSourceSpec) error {
+	clusterObj, err := c.clusterClient.GetBySlug(ctx, ClusterSlug(clusterID))
 	if err != nil {
 		if errors.Is(err, beehive.ErrNotFound) {
 			return nil // GC race; next reconcile re-creates the child
@@ -127,7 +125,7 @@ func (c *ClusterSourceController) syncSourceObs(ctx context.Context, clusterID c
 		return err
 	}
 
-	desired := controllers.KubeconfigStatus{
+	desired := KubeconfigStatus{
 		Cluster:   spec.ClusterName,
 		User:      spec.UserName,
 		IsPresent: spec.IsPresent,

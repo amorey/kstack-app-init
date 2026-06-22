@@ -1,6 +1,6 @@
 // Package cloud is the composition + lifecycle owner for the cloud-synced
 // settings feature (prefs, mutationqueue, api, prefsync). It mirrors
-// internal/kube's Service shape — New wires the pieces, Start launches the
+// internal/cluster's Service shape — New wires the pieces, Start launches the
 // background sync, Close tears it down — and degrades gracefully when the host
 // hasn't configured a cloud URL / data dir (then it's a no-op with no settings
 // store).

@@ -26,22 +26,21 @@ import (
 
 	"github.com/amorey/beehive"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/cluster"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/testutil"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/testutil"
 )
 
 // staticProbe returns a ProbeFunc that always yields the given server/principal.
-func staticProbe(server controllers.ClusterServer, principal controllers.ClusterPrincipal) cluster.ProbeFunc {
-	return func(context.Context, *rest.Config) (controllers.ClusterServer, controllers.ClusterPrincipal, error) {
+func staticProbe(server cluster.ClusterServer, principal cluster.ClusterPrincipal) cluster.ProbeFunc {
+	return func(context.Context, *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
 		return server, principal, nil
 	}
 }
 
 // errProbe returns a ProbeFunc that always fails.
 func errProbe(err error) cluster.ProbeFunc {
-	return func(context.Context, *rest.Config) (controllers.ClusterServer, controllers.ClusterPrincipal, error) {
-		return controllers.ClusterServer{}, controllers.ClusterPrincipal{}, err
+	return func(context.Context, *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
+		return cluster.ClusterServer{}, cluster.ClusterPrincipal{}, err
 	}
 }
 
@@ -54,17 +53,17 @@ func staticCheck(phase cluster.HealthPhase) cluster.CheckFunc {
 
 // newClusterTestBeehive builds a beehive with the real ClusterController using
 // the given probe/check fakes plus NoopControllers for the other kinds.
-func newClusterTestBeehive(t *testing.T, w controllers.KubeConfigSource, probe cluster.ProbeFunc, check cluster.CheckFunc) (beehive.Client[controllers.ClusterSpec, controllers.ClusterConnectionStatus], beehive.Client[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus]) {
+func newClusterTestBeehive(t *testing.T, w cluster.KubeConfigSource, probe cluster.ProbeFunc, check cluster.CheckFunc) (beehive.Client[cluster.ClusterSpec, cluster.ClusterConnectionStatus], beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]) {
 	t.Helper()
 	bh := testutil.NewTestBeehiveUnstarted(t)
 
-	clusterClient := beehive.NewClient[controllers.ClusterSpec, controllers.ClusterConnectionStatus](bh, controllers.ClusterGroupKind)
-	cacheClient := beehive.NewClient[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus](bh, controllers.ClusterCacheGroupKind)
+	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
+	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
 
 	ctrl := cluster.NewClusterController(w, cacheClient, probe, check)
-	require.NoError(t, beehive.Register(bh, controllers.ClusterSourceGroupKind, &testutil.NoopController[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus]{}))
-	require.NoError(t, beehive.Register(bh, controllers.ClusterGroupKind, ctrl))
-	require.NoError(t, beehive.Register(bh, controllers.ClusterCacheGroupKind, &testutil.NoopController[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus]{}))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterSourceGroupKind, &testutil.NoopController[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus]{}))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, ctrl))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })
@@ -73,7 +72,7 @@ func newClusterTestBeehive(t *testing.T, w controllers.KubeConfigSource, probe c
 }
 
 // waitCondition polls until the object has the named condition or the deadline.
-func waitCondition(t *testing.T, cl beehive.Client[controllers.ClusterSpec, controllers.ClusterConnectionStatus], id beehive.ObjectID, condType controllers.ClusterConditionType) *beehive.Object[controllers.ClusterSpec, controllers.ClusterConnectionStatus] {
+func waitCondition(t *testing.T, cl beehive.Client[cluster.ClusterSpec, cluster.ClusterConnectionStatus], id beehive.ObjectID, condType cluster.ClusterConditionType) *beehive.Object[cluster.ClusterSpec, cluster.ClusterConnectionStatus] {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -93,14 +92,14 @@ func waitCondition(t *testing.T, cl beehive.Client[controllers.ClusterSpec, cont
 }
 
 // eligibleSpec builds a Cluster spec that passes ConnectionEligible.
-func eligibleSpec(contextName string) controllers.ClusterSpec {
-	return controllers.ClusterSpec{
+func eligibleSpec(contextName string) cluster.ClusterSpec {
+	return cluster.ClusterSpec{
 		IsActive:      true,
 		IsSyncEnabled: true,
-		Source: controllers.ClusterSource{
-			Kubeconfig: &controllers.ClusterSourceKubeconfig{Context: contextName},
+		Source: cluster.ClusterSource{
+			Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: contextName},
 		},
-		SourceObs: &controllers.KubeconfigStatus{
+		SourceObs: &cluster.KubeconfigStatus{
 			Cluster:   contextName + "-cluster",
 			User:      contextName + "-user",
 			IsPresent: true,
@@ -116,32 +115,32 @@ func TestClusterControllerSuccessfulProbeWritesConditions(t *testing.T) {
 
 	clusterClient, cacheClient := newClusterTestBeehive(t, w,
 		staticProbe(
-			controllers.ClusterServer{UID: &uid, Version: &ver},
-			controllers.ClusterPrincipal{Username: &user},
+			cluster.ClusterServer{UID: &uid, Version: &ver},
+			cluster.ClusterPrincipal{Username: &user},
 		),
 		staticCheck(cluster.HealthPhaseHealthy),
 	)
 	ctx := context.Background()
 
-	id := controllers.ClusterID("test-uid")
+	id := cluster.ClusterID("test-uid")
 	obj, err := clusterClient.Create(ctx, eligibleSpec("alpha"),
-		beehive.WithSlug(controllers.ClusterSlug(id)))
+		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 
-	got := waitCondition(t, clusterClient, obj.ID, controllers.ClusterConditionConnected)
+	got := waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
 	require.NotNil(t, got.Status)
 
-	connected := findCondition(t, got.Status.Conditions, controllers.ClusterConditionConnected)
-	assert.Equal(t, controllers.ConditionTrue, connected.Status)
-	assert.Equal(t, controllers.ReasonConnected, connected.Reason)
+	connected := findCondition(t, got.Status.Conditions, cluster.ClusterConditionConnected)
+	assert.Equal(t, cluster.ConditionTrue, connected.Status)
+	assert.Equal(t, cluster.ReasonConnected, connected.Reason)
 
-	healthy := findCondition(t, got.Status.Conditions, controllers.ClusterConditionHealthy)
-	assert.Equal(t, controllers.ConditionTrue, healthy.Status)
+	healthy := findCondition(t, got.Status.Conditions, cluster.ClusterConditionHealthy)
+	assert.Equal(t, cluster.ConditionTrue, healthy.Status)
 
 	assert.NotNil(t, got.Status.LastConnectedAt)
 
 	// ClusterCache child must have been created.
-	_, err = cacheClient.GetBySlug(ctx, controllers.ClusterCacheSlug(id))
+	_, err = cacheClient.GetBySlug(ctx, cluster.ClusterCacheSlug(id))
 	require.NoError(t, err, "ClusterCache child must exist after successful reconcile")
 }
 
@@ -154,21 +153,21 @@ func TestClusterControllerProbeFailureSetsConnectedFalse(t *testing.T) {
 	ctx := context.Background()
 
 	obj, err := clusterClient.Create(ctx, eligibleSpec("alpha"),
-		beehive.WithSlug(controllers.ClusterSlug("probe-fail-id")))
+		beehive.WithSlug(cluster.ClusterSlug("probe-fail-id")))
 	require.NoError(t, err)
 
-	got := waitCondition(t, clusterClient, obj.ID, controllers.ClusterConditionConnected)
-	connected := findCondition(t, got.Status.Conditions, controllers.ClusterConditionConnected)
-	assert.Equal(t, controllers.ConditionFalse, connected.Status)
-	assert.Equal(t, controllers.ReasonProbeFailed, connected.Reason)
+	got := waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+	connected := findCondition(t, got.Status.Conditions, cluster.ClusterConditionConnected)
+	assert.Equal(t, cluster.ConditionFalse, connected.Status)
+	assert.Equal(t, cluster.ReasonProbeFailed, connected.Reason)
 }
 
 func TestClusterControllerIneligibleClusterDoesNotProbe(t *testing.T) {
 	probeCalled := false
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
-	probe := func(_ context.Context, _ *rest.Config) (controllers.ClusterServer, controllers.ClusterPrincipal, error) {
+	probe := func(_ context.Context, _ *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
 		probeCalled = true
-		return controllers.ClusterServer{}, controllers.ClusterPrincipal{}, nil
+		return cluster.ClusterServer{}, cluster.ClusterPrincipal{}, nil
 	}
 	clusterClient, _ := newClusterTestBeehive(t, w, probe, staticCheck(cluster.HealthPhaseHealthy))
 	ctx := context.Background()
@@ -177,17 +176,17 @@ func TestClusterControllerIneligibleClusterDoesNotProbe(t *testing.T) {
 	spec := eligibleSpec("alpha")
 	spec.IsActive = false
 	obj, err := clusterClient.Create(ctx, spec,
-		beehive.WithSlug(controllers.ClusterSlug("inactive-id")))
+		beehive.WithSlug(cluster.ClusterSlug("inactive-id")))
 	require.NoError(t, err)
 
-	got := waitCondition(t, clusterClient, obj.ID, controllers.ClusterConditionConnected)
-	connected := findCondition(t, got.Status.Conditions, controllers.ClusterConditionConnected)
-	assert.Equal(t, controllers.ConditionFalse, connected.Status)
-	assert.Equal(t, controllers.ReasonInactive, connected.Reason)
+	got := waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+	connected := findCondition(t, got.Status.Conditions, cluster.ClusterConditionConnected)
+	assert.Equal(t, cluster.ConditionFalse, connected.Status)
+	assert.Equal(t, cluster.ReasonInactive, connected.Reason)
 	assert.False(t, probeCalled, "probe must not be called for ineligible cluster")
 }
 
-func findCondition(t *testing.T, conds []controllers.ClusterCondition, typ controllers.ClusterConditionType) controllers.ClusterCondition {
+func findCondition(t *testing.T, conds []cluster.ClusterCondition, typ cluster.ClusterConditionType) cluster.ClusterCondition {
 	t.Helper()
 	for _, c := range conds {
 		if c.Type == typ {
@@ -195,5 +194,5 @@ func findCondition(t *testing.T, conds []controllers.ClusterCondition, typ contr
 		}
 	}
 	t.Fatalf("condition %s not found in %v", typ, conds)
-	return controllers.ClusterCondition{}
+	return cluster.ClusterCondition{}
 }

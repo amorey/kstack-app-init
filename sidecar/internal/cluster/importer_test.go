@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package clustersource_test
+package cluster_test
 
 import (
 	"context"
@@ -24,19 +24,18 @@ import (
 
 	"github.com/amorey/beehive"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/clustersource"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/testutil"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/testutil"
 )
 
 // newTestImporter builds a KubeconfigImporter against a fresh beehive
 // (no controllers registered — the importer only calls srcClient).
-func newTestImporter(t *testing.T, cfg *api.Config) *clustersource.KubeconfigImporter {
+func newTestImporter(t *testing.T, cfg *api.Config) *cluster.KubeconfigImporter {
 	t.Helper()
 	bh := testutil.NewTestBeehive(t)
-	srcClient := beehive.NewClient[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus](bh, controllers.ClusterSourceGroupKind)
+	srcClient := beehive.NewClient[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus](bh, cluster.ClusterSourceGroupKind)
 	w := testutil.NewStaticWatcher(t, cfg)
-	return clustersource.NewKubeconfigImporter(w, srcClient)
+	return cluster.NewKubeconfigImporter(w, srcClient)
 }
 
 func TestImporterNewContextCreatesClusterSource(t *testing.T) {
@@ -106,7 +105,7 @@ func TestImporterUnchangedSnapshotWritesNothing(t *testing.T) {
 	assert.Equal(t, obj1.Generation, obj2.Generation, "unchanged snapshot must not bump generation")
 }
 
-func mustSingleObj(t *testing.T, cl beehive.Client[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus]) *beehive.Object[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus] {
+func mustSingleObj(t *testing.T, cl beehive.Client[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus]) *beehive.Object[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus] {
 	t.Helper()
 	objs, err := cl.List(context.Background())
 	require.NoError(t, err)

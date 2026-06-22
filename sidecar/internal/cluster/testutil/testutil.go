@@ -25,7 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 )
 
@@ -37,7 +37,7 @@ type StaticWatcher struct {
 
 // NewStaticWatcher creates a KubeConfigSource that delivers cfg as its current
 // snapshot. cfg may be nil (an empty config is delivered then).
-func NewStaticWatcher(t *testing.T, cfg *api.Config) controllers.KubeConfigSource {
+func NewStaticWatcher(t *testing.T, cfg *api.Config) cluster.KubeConfigSource {
 	t.Helper()
 	if cfg == nil {
 		cfg = &api.Config{Contexts: map[string]*api.Context{}}
@@ -106,9 +106,9 @@ func (c *NoopController[Spec, Status]) Reconcile(_ context.Context, _ *beehive.O
 func NewTestBeehive(t *testing.T) *beehive.Beehive {
 	t.Helper()
 	bh := NewTestBeehiveUnstarted(t)
-	require.NoError(t, beehive.Register(bh, controllers.ClusterSourceGroupKind, &NoopController[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus]{}))
-	require.NoError(t, beehive.Register(bh, controllers.ClusterGroupKind, &NoopController[controllers.ClusterSpec, controllers.ClusterConnectionStatus]{}))
-	require.NoError(t, beehive.Register(bh, controllers.ClusterCacheGroupKind, &NoopController[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus]{}))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterSourceGroupKind, &NoopController[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus]{}))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, &NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{}))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })

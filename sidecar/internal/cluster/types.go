@@ -31,7 +31,7 @@
 // into one combined status view — Cluster carries connection status (Connected,
 // Healthy conditions + server/principal facts), ClusterCache carries sync
 // status (Synced condition + lastSyncedAt).
-package controllers
+package cluster
 
 import (
 	"errors"

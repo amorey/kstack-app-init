@@ -7,18 +7,16 @@ package graph
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
-	"github.com/amorey/beehive"
 	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 )
 
 // Status is the resolver for the status field. It pairs the status block with
 // the cluster's ID, which the cache child resolver needs to query its sub-API.
-func (r *clusterResolver) Status(ctx context.Context, obj *controllers.Cluster) (*model.ClusterStatus, error) {
+func (r *clusterResolver) Status(ctx context.Context, obj *cluster.Cluster) (*model.ClusterStatus, error) {
 	return &model.ClusterStatus{ClusterStatus: obj.Status, ClusterID: obj.ID}, nil
 }
 
@@ -26,44 +24,26 @@ func (r *clusterResolver) Status(ctx context.Context, obj *controllers.Cluster) 
 // call on the Cluster surface, so it runs only when explicitly selected.
 // TODO: run a SelfSubjectRulesReview. No honest placeholder for RBAC data,
 // so this errors until implemented.
-func (r *clusterPrincipalResolver) Permissions(ctx context.Context, obj *controllers.ClusterPrincipal, namespace string) (*model.ClusterPermissions, error) {
+func (r *clusterPrincipalResolver) Permissions(ctx context.Context, obj *cluster.ClusterPrincipal, namespace string) (*model.ClusterPermissions, error) {
 	return nil, fmt.Errorf("not implemented: permissions")
 }
 
 // Cache is the resolver for the cache field: live stats from the per-cluster
 // cache (a resolver so a query only pays the stat query when it selects them).
-func (r *clusterStatusResolver) Cache(ctx context.Context, obj *model.ClusterStatus) (*controllers.CacheStats, error) {
-	return r.buildCacheStats(ctx, obj.ClusterID)
+func (r *clusterStatusResolver) Cache(ctx context.Context, obj *model.ClusterStatus) (*cluster.CacheStats, error) {
+	return r.ClusterSvc.CacheStats(ctx, obj.ClusterID)
 }
 
 // ClusterSyncEnabledSet is the resolver for the clusterSyncEnabledSet field.
-func (r *mutationResolver) ClusterSyncEnabledSet(ctx context.Context, id string, syncEnabled bool) (*controllers.Cluster, error) {
-	obj, err := r.clusterByID(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	spec := obj.Spec
-	spec.IsSyncEnabled = syncEnabled
-	updated, err := r.ClusterClient.Update(ctx, obj.ID, spec)
-	if err != nil {
-		return nil, err
-	}
-	cluster := r.buildCluster(ctx, updated)
-	return &cluster, nil
+func (r *mutationResolver) ClusterSyncEnabledSet(ctx context.Context, id string, syncEnabled bool) (*cluster.Cluster, error) {
+	return r.ClusterSvc.SetSyncEnabled(ctx, cluster.ClusterID(id), syncEnabled)
 }
 
 // ClusterConnectionRetry is the resolver for the clusterConnectionRetry field.
 // The retry's outcome is not returned here — it lands on the record's
 // conditions and reaches the webview through the cluster watch.
 func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id string) (bool, error) {
-	obj, err := r.clusterByID(ctx, id)
-	if err != nil {
-		return false, err
-	}
-	spec := obj.Spec
-	spec.RetryGeneration++
-	_, err = r.ClusterClient.Update(ctx, obj.ID, spec)
-	if err != nil {
+	if err := r.ClusterSvc.RetryConnection(ctx, cluster.ClusterID(id)); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -72,50 +52,14 @@ func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id string
 // ClusterCacheClear is the resolver for the clusterCacheClear field: delete
 // the on-disk cache and bounce the sync engine; the cluster record (returned)
 // stays. A still-eligible cluster re-syncs from scratch.
-func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id string) (*controllers.Cluster, error) {
-	// Validate cluster exists before touching disk.
-	obj, err := r.clusterByID(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-
-	// Delete the on-disk cache files.
-	if err := r.CacheManager.DeleteCacheFiles(ctx, string(controllers.ClusterID(id))); err != nil {
-		return nil, err
-	}
-
-	// Bump PokeSyncGeneration on the parent Cluster to bounce the running engine.
-	spec := obj.Spec
-	spec.PokeSyncGeneration++
-	updated, err := r.ClusterClient.Update(ctx, obj.ID, spec)
-	if err != nil {
-		return nil, err
-	}
-	cluster := r.buildCluster(ctx, updated)
-	return &cluster, nil
+func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id string) (*cluster.Cluster, error) {
+	return r.ClusterSvc.ClearCache(ctx, cluster.ClusterID(id))
 }
 
 // ClusterDelete is the resolver for the clusterDelete field. Deletes the
 // parent ClusterSource so beehive GC cascades to Cluster → ClusterCache.
 func (r *mutationResolver) ClusterDelete(ctx context.Context, id string) (bool, error) {
-	obj, err := r.clusterByID(ctx, id)
-	if err != nil {
-		return false, err
-	}
-
-	// Find and delete the parent ClusterSource; GC cascades to Cluster + ClusterCache.
-	if obj.Spec.Source.Kubeconfig != nil {
-		srcObj, srcErr := r.SrcClient.GetBySlug(ctx, controllers.ClusterSourceSlug(obj.Spec.Source.Kubeconfig.Context))
-		if srcErr == nil {
-			if err := r.SrcClient.Delete(ctx, srcObj.ID); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-	}
-
-	// Fallback: delete the Cluster directly (no parent source or lookup failed).
-	if err := r.ClusterClient.Delete(ctx, obj.ID); err != nil {
+	if err := r.ClusterSvc.Delete(ctx, cluster.ClusterID(id)); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -145,37 +89,14 @@ func (r *mutationResolver) AuthLogout(ctx context.Context) (bool, error) {
 
 // Cluster is the resolver for the cluster field. An untracked or
 // deletion-pending id is null per the schema, not an error.
-func (r *queryResolver) Cluster(ctx context.Context, id string) (*controllers.Cluster, error) {
-	obj, err := r.ClusterClient.GetBySlug(ctx, controllers.ClusterSlug(controllers.ClusterID(id)))
-	if errors.Is(err, beehive.ErrNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if obj.DeletionRequestedAt != nil {
-		return nil, nil
-	}
-	cluster := r.buildCluster(ctx, obj)
-	return &cluster, nil
+func (r *queryResolver) Cluster(ctx context.Context, id string) (*cluster.Cluster, error) {
+	return r.ClusterSvc.Get(ctx, cluster.ClusterID(id))
 }
 
 // Clusters is the resolver for the clusters field. Reads all Cluster records;
 // ephemeral nested objects resolve lazily per-selection.
-func (r *queryResolver) Clusters(ctx context.Context) ([]*controllers.Cluster, error) {
-	objs, err := r.ClusterClient.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	clusters := make([]*controllers.Cluster, 0, len(objs))
-	for _, obj := range objs {
-		if obj.DeletionRequestedAt != nil {
-			continue
-		}
-		c := r.buildCluster(ctx, obj)
-		clusters = append(clusters, &c)
-	}
-	return clusters, nil
+func (r *queryResolver) Clusters(ctx context.Context) ([]*cluster.Cluster, error) {
+	return r.ClusterSvc.List(ctx)
 }
 
 // AuthState is the resolver for the authState field. auth.State is bound
@@ -192,73 +113,8 @@ func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
 // ClustersWatch is the resolver for the clustersWatch field. Emits the current
 // cluster list on subscribe, then re-emits on every Cluster or ClusterCache
 // change (so sync-status updates propagate to the webview).
-func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan []*controllers.Cluster, error) {
-	// Seed with the current list.
-	objs, err := r.ClusterClient.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	seed := make([]*controllers.Cluster, 0, len(objs))
-	for _, obj := range objs {
-		if obj.DeletionRequestedAt != nil {
-			continue
-		}
-		c := r.buildCluster(ctx, obj)
-		seed = append(seed, &c)
-	}
-
-	clusterCh, err := r.ClusterClient.WatchList(ctx)
-	if err != nil {
-		return nil, err
-	}
-	cacheCh, err := r.CacheClient.WatchList(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	out := make(chan []*controllers.Cluster, 1)
-	out <- seed
-
-	go func() {
-		defer close(out)
-
-		emit := func() {
-			list, err := r.ClusterClient.List(ctx)
-			if err != nil {
-				return
-			}
-			clusters := make([]*controllers.Cluster, 0, len(list))
-			for _, obj := range list {
-				if obj.DeletionRequestedAt != nil {
-					continue
-				}
-				c := r.buildCluster(ctx, obj)
-				clusters = append(clusters, &c)
-			}
-			select {
-			case out <- clusters:
-			case <-ctx.Done():
-			}
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case _, ok := <-clusterCh:
-				if !ok {
-					return
-				}
-				emit()
-			case _, ok := <-cacheCh:
-				if !ok {
-					return
-				}
-				emit()
-			}
-		}
-	}()
-	return out, nil
+func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan []*cluster.Cluster, error) {
+	return r.ClusterSvc.Watch(ctx)
 }
 
 // ChatStream is the resolver for the chatStream field.
@@ -299,27 +155,3 @@ type clusterStatusResolver struct{ *Resolver }
 type mutationResolver struct{ *Resolver }
 type queryResolver struct{ *Resolver }
 type subscriptionResolver struct{ *Resolver }
-
-// !!! WARNING !!!
-// The code below was going to be deleted when updating resolvers. It has been copied here so you have
-// one last chance to move it out of harms way if you want. There are two reasons this happens:
-//  - When renaming or deleting a resolver the old code will be put in here. You can safely delete
-//    it when you're done.
-//  - You have helper methods in this file. Move them out to keep these resolver files clean.
-/*
-	func (r *clusterStatusResolver) Source(ctx context.Context, obj *model.ClusterStatus) (*controllers.ClusterSourceStatus, error) {
-	return &obj.ClusterStatus.Source, nil
-}
-func (r *clusterStatusResolver) Server(ctx context.Context, obj *model.ClusterStatus) (*controllers.ClusterServer, error) {
-	return &obj.ClusterStatus.Server, nil
-}
-func (r *clusterStatusResolver) Principal(ctx context.Context, obj *model.ClusterStatus) (*controllers.ClusterPrincipal, error) {
-	return &obj.ClusterStatus.Principal, nil
-}
-func (r *clusterStatusResolver) Conditions(ctx context.Context, obj *model.ClusterStatus) ([]*controllers.ClusterCondition, error) {
-	return ptrSlice(obj.ClusterStatus.Conditions), nil
-}
-func (r *clusterStatusResolver) SyncStatus(ctx context.Context, obj *model.ClusterStatus) (*controllers.ClusterCacheStatus, error) {
-	return &obj.ClusterStatus.SyncStatus, nil
-}
-*/

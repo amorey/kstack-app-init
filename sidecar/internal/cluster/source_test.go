@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package clustersource_test
+package cluster_test
 
 import (
 	"context"
@@ -24,14 +24,13 @@ import (
 
 	"github.com/amorey/beehive"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/clustersource"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/testutil"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/testutil"
 )
 
 // waitClusterSourceStatus polls until the ClusterSource status is populated or
 // the deadline passes. Returns the final object.
-func waitClusterSourceStatus(t *testing.T, cl beehive.Client[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus], id beehive.ObjectID) *beehive.Object[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus] {
+func waitClusterSourceStatus(t *testing.T, cl beehive.Client[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus], id beehive.ObjectID) *beehive.Object[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus] {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -48,17 +47,17 @@ func waitClusterSourceStatus(t *testing.T, cl beehive.Client[controllers.Cluster
 
 // newSourceTestBeehive builds a beehive with the real ClusterSourceController
 // plus NoopControllers for the downstream kinds.
-func newSourceTestBeehive(t *testing.T) (*beehive.Beehive, beehive.Client[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus], beehive.Client[controllers.ClusterSpec, controllers.ClusterConnectionStatus]) {
+func newSourceTestBeehive(t *testing.T) (*beehive.Beehive, beehive.Client[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus], beehive.Client[cluster.ClusterSpec, cluster.ClusterConnectionStatus]) {
 	t.Helper()
 	bh := testutil.NewTestBeehiveUnstarted(t)
 
-	clusterClient := beehive.NewClient[controllers.ClusterSpec, controllers.ClusterConnectionStatus](bh, controllers.ClusterGroupKind)
-	srcClient := beehive.NewClient[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus](bh, controllers.ClusterSourceGroupKind)
+	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
+	srcClient := beehive.NewClient[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus](bh, cluster.ClusterSourceGroupKind)
 
-	srcCtrl := clustersource.NewClusterSourceController(clusterClient)
-	require.NoError(t, beehive.Register(bh, controllers.ClusterSourceGroupKind, srcCtrl))
-	require.NoError(t, beehive.Register(bh, controllers.ClusterGroupKind, &testutil.NoopController[controllers.ClusterSpec, controllers.ClusterConnectionStatus]{}))
-	require.NoError(t, beehive.Register(bh, controllers.ClusterCacheGroupKind, &testutil.NoopController[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus]{}))
+	srcCtrl := cluster.NewClusterSourceController(clusterClient)
+	require.NoError(t, beehive.Register(bh, cluster.ClusterSourceGroupKind, srcCtrl))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, &testutil.NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{}))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })
@@ -70,12 +69,12 @@ func TestSourceControllerCreatesClusterChild(t *testing.T) {
 	ctx := context.Background()
 	_, srcClient, clusterClient := newSourceTestBeehive(t)
 
-	src, err := srcClient.Create(ctx, controllers.ClusterSourceSpec{
+	src, err := srcClient.Create(ctx, cluster.ClusterSourceSpec{
 		ContextName: "alpha",
 		ClusterName: "alpha-cluster",
 		UserName:    "alpha-user",
 		IsPresent:   true,
-	}, beehive.WithSlug(controllers.ClusterSourceSlug("alpha")))
+	}, beehive.WithSlug(cluster.ClusterSourceSlug("alpha")))
 	require.NoError(t, err)
 
 	// Wait for reconcile to set ClusterID in status.
@@ -83,7 +82,7 @@ func TestSourceControllerCreatesClusterChild(t *testing.T) {
 	require.NotNil(t, srcObj.Status.ClusterID)
 
 	// Verify the Cluster child exists.
-	clusterObj, err := clusterClient.GetBySlug(ctx, controllers.ClusterSlug(*srcObj.Status.ClusterID))
+	clusterObj, err := clusterClient.GetBySlug(ctx, cluster.ClusterSlug(*srcObj.Status.ClusterID))
 	require.NoError(t, err)
 	assert.Equal(t, "alpha", clusterObj.Spec.Source.Kubeconfig.Context)
 	assert.NotNil(t, clusterObj.Spec.SourceObs)
@@ -94,17 +93,17 @@ func TestSourceControllerIdempotentSecondReconcile(t *testing.T) {
 	ctx := context.Background()
 	_, srcClient, clusterClient := newSourceTestBeehive(t)
 
-	src, err := srcClient.Create(ctx, controllers.ClusterSourceSpec{
+	src, err := srcClient.Create(ctx, cluster.ClusterSourceSpec{
 		ContextName: "alpha",
 		IsPresent:   true,
-	}, beehive.WithSlug(controllers.ClusterSourceSlug("alpha")))
+	}, beehive.WithSlug(cluster.ClusterSourceSlug("alpha")))
 	require.NoError(t, err)
 
 	srcObj := waitClusterSourceStatus(t, srcClient, src.ID)
 	clusterID := *srcObj.Status.ClusterID
 
 	// Update the source spec (changes observation).
-	_, err = srcClient.Update(ctx, src.ID, controllers.ClusterSourceSpec{
+	_, err = srcClient.Update(ctx, src.ID, cluster.ClusterSourceSpec{
 		ContextName: "alpha",
 		ClusterName: "new-cluster",
 		IsPresent:   true,
@@ -114,7 +113,7 @@ func TestSourceControllerIdempotentSecondReconcile(t *testing.T) {
 	// Wait for updated SourceObs to propagate.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		clusterObj, err := clusterClient.GetBySlug(ctx, controllers.ClusterSlug(clusterID))
+		clusterObj, err := clusterClient.GetBySlug(ctx, cluster.ClusterSlug(clusterID))
 		require.NoError(t, err)
 		if clusterObj.Spec.SourceObs != nil && clusterObj.Spec.SourceObs.Cluster == "new-cluster" {
 			break
@@ -122,7 +121,7 @@ func TestSourceControllerIdempotentSecondReconcile(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	clusterObj, err := clusterClient.GetBySlug(ctx, controllers.ClusterSlug(clusterID))
+	clusterObj, err := clusterClient.GetBySlug(ctx, cluster.ClusterSlug(clusterID))
 	require.NoError(t, err)
 	assert.Equal(t, "new-cluster", clusterObj.Spec.SourceObs.Cluster)
 }
@@ -131,10 +130,10 @@ func TestSourceControllerDeletionNoOp(t *testing.T) {
 	ctx := context.Background()
 	_, srcClient, _ := newSourceTestBeehive(t)
 
-	src, err := srcClient.Create(ctx, controllers.ClusterSourceSpec{
+	src, err := srcClient.Create(ctx, cluster.ClusterSourceSpec{
 		ContextName: "alpha",
 		IsPresent:   true,
-	}, beehive.WithSlug(controllers.ClusterSourceSlug("alpha")))
+	}, beehive.WithSlug(cluster.ClusterSourceSlug("alpha")))
 	require.NoError(t, err)
 	waitClusterSourceStatus(t, srcClient, src.ID)
 

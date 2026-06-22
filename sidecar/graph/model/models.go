@@ -17,15 +17,15 @@
 package model
 
 import (
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 )
 
-// ClusterStatus backs the GraphQL ClusterStatus type. controllers.ClusterStatus
+// ClusterStatus backs the GraphQL ClusterStatus type. cluster.ClusterStatus
 // can't bind directly: the cache field resolver needs the cluster's ID to
 // query its sub-API, and a child resolver only sees its own obj. The
 // embedded status binds the durable fields (conditions included) as usual;
 // ClusterID is the one piece the wrapper adds.
 type ClusterStatus struct {
-	controllers.ClusterStatus
-	ClusterID controllers.ClusterID
+	cluster.ClusterStatus
+	ClusterID cluster.ClusterID
 }

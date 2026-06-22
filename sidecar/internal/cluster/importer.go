@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package clustersource
+package cluster
 
 import (
 	"context"
@@ -22,7 +22,6 @@ import (
 	"github.com/amorey/beehive"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 )
 
@@ -37,8 +36,8 @@ import (
 // here. The importer only writes ClusterSource specs; the controller reconciles
 // the downstream effects.
 type KubeconfigImporter struct {
-	cfgSource  controllers.KubeConfigSource
-	srcClient  beehive.Client[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus]
+	cfgSource  KubeConfigSource
+	srcClient  beehive.Client[ClusterSourceSpec, ClusterSourceObjStatus]
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
 	wg         sync.WaitGroup
@@ -46,7 +45,7 @@ type KubeconfigImporter struct {
 
 // NewKubeconfigImporter builds an importer that uses srcClient to manage
 // ClusterSource objects in beehive.
-func NewKubeconfigImporter(cfgSource controllers.KubeConfigSource, srcClient beehive.Client[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus]) *KubeconfigImporter {
+func NewKubeconfigImporter(cfgSource KubeConfigSource, srcClient beehive.Client[ClusterSourceSpec, ClusterSourceObjStatus]) *KubeconfigImporter {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &KubeconfigImporter{
 		cfgSource:  cfgSource,
@@ -58,7 +57,7 @@ func NewKubeconfigImporter(cfgSource controllers.KubeConfigSource, srcClient bee
 
 // SourceClient exposes the underlying beehive client for tests that need to
 // inspect the ClusterSource objects after a reconcile.
-func (im *KubeconfigImporter) SourceClient() beehive.Client[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus] {
+func (im *KubeconfigImporter) SourceClient() beehive.Client[ClusterSourceSpec, ClusterSourceObjStatus] {
 	return im.srcClient
 }
 
@@ -109,7 +108,7 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 		return err
 	}
 	// Index present ClusterSources by context name.
-	byContext := map[string]*beehive.Object[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus]{}
+	byContext := map[string]*beehive.Object[ClusterSourceSpec, ClusterSourceObjStatus]{}
 	for _, obj := range existing {
 		if obj.DeletionRequestedAt != nil {
 			continue // ignore objects being deleted
@@ -119,7 +118,7 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 
 	// Create or update a ClusterSource per context in the snapshot.
 	for name, kctx := range cfg.Contexts {
-		desired := controllers.ClusterSourceSpec{
+		desired := ClusterSourceSpec{
 			ContextName: name,
 			ClusterName: kctx.Cluster,
 			UserName:    kctx.AuthInfo,
@@ -131,7 +130,7 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 		}
 		// Create the ClusterSource (deterministic slug) or update the one already
 		// carrying that slug — CreateOrUpdate folds both into one atomic upsert.
-		if _, err := im.srcClient.CreateOrUpdate(ctx, controllers.ClusterSourceSlug(name), desired); err != nil {
+		if _, err := im.srcClient.CreateOrUpdate(ctx, ClusterSourceSlug(name), desired); err != nil {
 			return err
 		}
 	}

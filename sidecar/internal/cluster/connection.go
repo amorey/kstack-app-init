@@ -27,8 +27,6 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/amorey/beehive"
-
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
 )
 
 const (
@@ -63,7 +61,7 @@ const (
 
 // ProbeFunc dials the cluster and returns its server and principal identity.
 // Tests inject a fake; production uses probeCluster.
-type ProbeFunc func(ctx context.Context, cfg *rest.Config) (controllers.ClusterServer, controllers.ClusterPrincipal, error)
+type ProbeFunc func(ctx context.Context, cfg *rest.Config) (ClusterServer, ClusterPrincipal, error)
 
 // CheckFunc probes the API server's own health endpoint.
 // Tests inject a fake; production uses checkServerHealth.
@@ -79,9 +77,9 @@ type CheckFunc func(ctx context.Context, cfg *rest.Config) (HealthPhase, *string
 //  6. Probes server health (readyz endpoint).
 //  7. Writes all observations to ClusterConnectionStatus via UpdateStatus.
 type ClusterController struct {
-	cfgSource   controllers.KubeConfigSource
-	cacheClient beehive.Client[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus]
-	ctrlClient  beehive.ControllerClient[controllers.ClusterConnectionStatus]
+	cfgSource   KubeConfigSource
+	cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	ctrlClient  beehive.ControllerClient[ClusterConnectionStatus]
 
 	probe ProbeFunc
 	check CheckFunc
@@ -90,8 +88,8 @@ type ClusterController struct {
 // NewClusterController builds the controller. probe and check default to the
 // real network implementations; tests inject fakes.
 func NewClusterController(
-	cfgSource controllers.KubeConfigSource,
-	cacheClient beehive.Client[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus],
+	cfgSource KubeConfigSource,
+	cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus],
 	probe ProbeFunc,
 	check CheckFunc,
 ) *ClusterController {
@@ -110,7 +108,7 @@ func NewClusterController(
 }
 
 // Start stores the ControllerClient handed in by beehive.
-func (c *ClusterController) Start(cl beehive.ControllerClient[controllers.ClusterConnectionStatus]) error {
+func (c *ClusterController) Start(cl beehive.ControllerClient[ClusterConnectionStatus]) error {
 	c.ctrlClient = cl
 	return nil
 }
@@ -121,7 +119,7 @@ func (c *ClusterController) Stop(_ context.Context) error { return nil }
 // Reconcile converges one Cluster object. The reconcile steps run in sequence;
 // the first failure short-circuits (probe failure records an observation and
 // requests backoff, store errors return an error for the harness to retry).
-func (c *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[controllers.ClusterSpec, controllers.ClusterConnectionStatus]) (beehive.Result, error) {
+func (c *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterConnectionStatus]) (beehive.Result, error) {
 	if obj.DeletionRequestedAt != nil {
 		// No finalizers to clear; beehive GC handles ClusterCache cascade.
 		return beehive.Result{}, nil
@@ -136,11 +134,11 @@ func (c *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[c
 	}
 
 	// Load (or seed) the working status copy.
-	var loaded controllers.ClusterConnectionStatus
+	var loaded ClusterConnectionStatus
 	if obj.Status != nil {
 		loaded = *obj.Status
 	}
-	working := controllers.ClusterConnectionStatus{
+	working := ClusterConnectionStatus{
 		Source:          loaded.Source,
 		Server:          loaded.Server,
 		Principal:       loaded.Principal,
@@ -155,7 +153,7 @@ func (c *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[c
 
 	requeueAfter := c.converge(ctx, obj, &working)
 
-	if controllers.ClusterConnectionStatusEqual(loaded, working) {
+	if ClusterConnectionStatusEqual(loaded, working) {
 		return beehive.Result{RequeueAfter: requeueAfter}, nil
 	}
 	return beehive.Result{RequeueAfter: requeueAfter},
@@ -165,129 +163,129 @@ func (c *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[c
 // converge runs the eligibility gate → credential resolution → probe → health
 // phases, recording observations on working, and returns the desired
 // RequeueAfter delay.
-func (c *ClusterController) converge(ctx context.Context, obj *beehive.Object[controllers.ClusterSpec, controllers.ClusterConnectionStatus], working *controllers.ClusterConnectionStatus) time.Duration {
+func (c *ClusterController) converge(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterConnectionStatus], working *ClusterConnectionStatus) time.Duration {
 	gen := obj.Generation
 	conds := &working.Conditions
 
-	if !controllers.ConnectionEligible(obj) {
-		controllers.SetCondition(conds, controllers.ClusterCondition{
-			Type: controllers.ClusterConditionConnected, Status: controllers.ConditionFalse,
-			Reason: controllers.ReasonInactive, ObservedGeneration: gen,
+	if !ConnectionEligible(obj) {
+		SetCondition(conds, ClusterCondition{
+			Type: ClusterConditionConnected, Status: ConditionFalse,
+			Reason: ReasonInactive, ObservedGeneration: gen,
 		})
-		controllers.SetCondition(conds, controllers.ClusterCondition{
-			Type: controllers.ClusterConditionHealthy, Status: controllers.ConditionUnknown,
-			Reason: controllers.ReasonInactive, ObservedGeneration: gen,
+		SetCondition(conds, ClusterCondition{
+			Type: ClusterConditionHealthy, Status: ConditionUnknown,
+			Reason: ReasonInactive, ObservedGeneration: gen,
 		})
 		return 0
 	}
 
 	contextName := obj.Spec.Source.Kubeconfig.Context
-	restCfg, err := controllers.ResolveRESTConfig(c.cfgSource.Get(), contextName)
+	restCfg, err := ResolveRESTConfig(c.cfgSource.Get(), contextName)
 	if err != nil {
-		return c.observeConnectFailure(conds, gen, controllers.ReasonResolveFailed, err)
+		return c.observeConnectFailure(conds, gen, ReasonResolveFailed, err)
 	}
 
 	server, principal, err := c.probe(ctx, restCfg)
 	if err != nil {
-		return c.observeConnectFailure(conds, gen, controllers.ReasonProbeFailed, err)
+		return c.observeConnectFailure(conds, gen, ReasonProbeFailed, err)
 	}
 
 	now := time.Now().UTC()
 	working.Server = server
 	working.Principal = principal
 	working.LastConnectedAt = &now
-	controllers.SetCondition(conds, controllers.ClusterCondition{
-		Type: controllers.ClusterConditionConnected, Status: controllers.ConditionTrue,
-		Reason: controllers.ReasonConnected, ObservedGeneration: gen,
+	SetCondition(conds, ClusterCondition{
+		Type: ClusterConditionConnected, Status: ConditionTrue,
+		Reason: ReasonConnected, ObservedGeneration: gen,
 	})
 
 	phase, msg := c.check(ctx, restCfg)
-	controllers.SetCondition(conds, healthCondition(phase, msg, gen))
+	SetCondition(conds, healthCondition(phase, msg, gen))
 	return healthProbeInterval
 }
 
 // observeConnectFailure records a failed connect attempt on the working
 // conditions and returns the doubling-backoff requeue via the beehive harness.
-func (c *ClusterController) observeConnectFailure(conds *[]controllers.ClusterCondition, gen int64, reason string, err error) time.Duration {
-	controllers.SetCondition(conds, controllers.ClusterCondition{
-		Type: controllers.ClusterConditionConnected, Status: controllers.ConditionFalse,
+func (c *ClusterController) observeConnectFailure(conds *[]ClusterCondition, gen int64, reason string, err error) time.Duration {
+	SetCondition(conds, ClusterCondition{
+		Type: ClusterConditionConnected, Status: ConditionFalse,
 		Reason: reason, Message: err.Error(), ObservedGeneration: gen,
 	})
-	controllers.SetCondition(conds, controllers.ClusterCondition{
-		Type: controllers.ClusterConditionHealthy, Status: controllers.ConditionUnknown,
-		Reason: controllers.ReasonNoConnection, ObservedGeneration: gen,
+	SetCondition(conds, ClusterCondition{
+		Type: ClusterConditionHealthy, Status: ConditionUnknown,
+		Reason: ReasonNoConnection, ObservedGeneration: gen,
 	})
 	return connectionInitialBackoff
 }
 
 // ensureClusterCache creates the ClusterCache child if it does not exist.
-func (c *ClusterController) ensureClusterCache(ctx context.Context, clusterID controllers.ClusterID, ownerID beehive.ObjectID) error {
-	_, err := c.cacheClient.GetBySlug(ctx, controllers.ClusterCacheSlug(clusterID))
+func (c *ClusterController) ensureClusterCache(ctx context.Context, clusterID ClusterID, ownerID beehive.ObjectID) error {
+	_, err := c.cacheClient.GetBySlug(ctx, ClusterCacheSlug(clusterID))
 	if err == nil {
 		return nil // already exists
 	}
 	if !errors.Is(err, beehive.ErrNotFound) {
 		return err
 	}
-	_, err = c.cacheClient.Create(ctx, controllers.ClusterCacheSpec{},
-		beehive.WithSlug(controllers.ClusterCacheSlug(clusterID)),
+	_, err = c.cacheClient.Create(ctx, ClusterCacheSpec{},
+		beehive.WithSlug(ClusterCacheSlug(clusterID)),
 		beehive.WithOwner(ownerID),
 	)
 	return err
 }
 
 // clusterIDFromObj extracts the ClusterID UUID from the Cluster object's slug.
-func clusterIDFromObj(obj *beehive.Object[controllers.ClusterSpec, controllers.ClusterConnectionStatus]) controllers.ClusterID {
+func clusterIDFromObj(obj *beehive.Object[ClusterSpec, ClusterConnectionStatus]) ClusterID {
 	if obj.Slug == nil {
 		return ""
 	}
-	return controllers.ClusterIDFromSlug(*obj.Slug)
+	return ClusterIDFromSlug(*obj.Slug)
 }
 
 // healthCondition maps one health-probe outcome onto the Healthy condition.
-func healthCondition(phase HealthPhase, msg *string, gen int64) controllers.ClusterCondition {
-	cond := controllers.ClusterCondition{Type: controllers.ClusterConditionHealthy, ObservedGeneration: gen}
+func healthCondition(phase HealthPhase, msg *string, gen int64) ClusterCondition {
+	cond := ClusterCondition{Type: ClusterConditionHealthy, ObservedGeneration: gen}
 	if msg != nil {
 		cond.Message = *msg
 	}
 	switch phase {
 	case HealthPhaseHealthy:
-		cond.Status, cond.Reason = controllers.ConditionTrue, controllers.ReasonReady
+		cond.Status, cond.Reason = ConditionTrue, ReasonReady
 	case HealthPhaseDegraded:
-		cond.Status, cond.Reason = controllers.ConditionFalse, controllers.ReasonReadyzFailed
+		cond.Status, cond.Reason = ConditionFalse, ReasonReadyzFailed
 	case HealthPhaseUnreachable:
-		cond.Status, cond.Reason = controllers.ConditionFalse, controllers.ReasonUnreachable
+		cond.Status, cond.Reason = ConditionFalse, ReasonUnreachable
 	default:
-		cond.Status, cond.Reason = controllers.ConditionUnknown, controllers.ReasonNoConnection
+		cond.Status, cond.Reason = ConditionUnknown, ReasonNoConnection
 	}
 	return cond
 }
 
 // probeCluster dials the cluster and discovers server version, kube-system UID,
 // and the authenticated username via SelfSubjectReview.
-func probeCluster(ctx context.Context, cfg *rest.Config) (controllers.ClusterServer, controllers.ClusterPrincipal, error) {
+func probeCluster(ctx context.Context, cfg *rest.Config) (ClusterServer, ClusterPrincipal, error) {
 	probeCfg := rest.CopyConfig(cfg)
 	probeCfg.Timeout = connectionProbeTimeout
 	clientset, err := kubernetes.NewForConfig(probeCfg)
 	if err != nil {
-		return controllers.ClusterServer{}, controllers.ClusterPrincipal{}, err
+		return ClusterServer{}, ClusterPrincipal{}, err
 	}
 	ver, err := clientset.Discovery().ServerVersion()
 	if err != nil {
-		return controllers.ClusterServer{}, controllers.ClusterPrincipal{}, err
+		return ClusterServer{}, ClusterPrincipal{}, err
 	}
 	ns, err := clientset.CoreV1().Namespaces().Get(ctx, "kube-system", metav1.GetOptions{})
 	if err != nil {
-		return controllers.ClusterServer{}, controllers.ClusterPrincipal{}, err
+		return ClusterServer{}, ClusterPrincipal{}, err
 	}
 	ssr, err := clientset.AuthenticationV1().SelfSubjectReviews().Create(
 		ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
 	if err != nil {
-		return controllers.ClusterServer{}, controllers.ClusterPrincipal{}, err
+		return ClusterServer{}, ClusterPrincipal{}, err
 	}
 	uid := string(ns.UID)
-	return controllers.ClusterServer{UID: &uid, Version: &ver.GitVersion},
-		controllers.ClusterPrincipal{Username: &ssr.Status.UserInfo.Username}, nil
+	return ClusterServer{UID: &uid, Version: &ver.GitVersion},
+		ClusterPrincipal{Username: &ssr.Status.UserInfo.Username}, nil
 }
 
 // checkServerHealth probes the API server's own readiness endpoint.

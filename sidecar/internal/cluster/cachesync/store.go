@@ -27,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/clustercache/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/store"
 )
 
 // One store per (cluster, GVK). Two store implementations live here:
