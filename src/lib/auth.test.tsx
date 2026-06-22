@@ -134,7 +134,7 @@ describe('AuthProvider / useAuthState', () => {
     await waitFor(() => expect(result.current.authState.authenticated).toBe(false));
   });
 
-  it('login() runs the startLogin mutation', async () => {
+  it('login() runs the authLoginStart mutation', async () => {
     const { result } = renderAuthState();
     await flush();
     await act(async () => {
@@ -146,11 +146,11 @@ describe('AuthProvider / useAuthState', () => {
     });
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
-      expect.objectContaining({ body: expect.stringContaining('startLogin') }),
+      expect.objectContaining({ body: expect.stringContaining('authLoginStart') }),
     );
   });
 
-  it('logout() runs the logout mutation', async () => {
+  it('logout() runs the authLogout mutation', async () => {
     const { result } = renderAuthState();
     await flush();
     await act(async () => {
@@ -162,7 +162,7 @@ describe('AuthProvider / useAuthState', () => {
     });
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
-      expect.objectContaining({ body: expect.stringContaining('logout') }),
+      expect.objectContaining({ body: expect.stringContaining('authLogout') }),
     );
   });
 

@@ -13,7 +13,6 @@ import (
 	"github.com/99designs/gqlgen/graphql/handler/transport"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/clusterdata"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 )
 
@@ -35,18 +34,11 @@ type Server struct {
 	wg         sync.WaitGroup
 }
 
-// NewServer builds the GraphQL server around a fully-constructed Resolver. A
-// bare Resolver is tolerated — the optional cluster deps degrade to empty
-// results rather than panicking — so tests can stand up a minimal surface.
+// NewServer builds the GraphQL server around a fully-constructed Resolver. The
+// Resolver's dependencies must be non-nil — the composition root always wires
+// them, and the resolvers call them without guards; degraded behavior (e.g. no
+// cloud account) lives inside the services themselves.
 func NewServer(r *Resolver) *Server {
-	// Keep the cluster-data resolvers nil-safe for a bare &Resolver{} (tests /
-	// minimal surfaces): a Reader over a nil registry returns empty snapshots
-	// and closed watch channels. ClusterProvider stays nil — its resolver guards
-	// that directly.
-	if r.ClusterData == nil {
-		r.ClusterData = clusterdata.NewReader(nil)
-	}
-
 	srv := handler.New(NewExecutableSchema(Config{Resolvers: r}))
 	// Subscriptions ride SSE (transport.SSE): the host opens one
 	// `POST /graphql` with `Accept: text/event-stream` per subscription and

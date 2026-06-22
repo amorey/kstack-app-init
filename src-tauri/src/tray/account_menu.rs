@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn ids_are_distinct_and_stable() {
-        // Ids must not collide with each other or the kube_ctx::/tray_* namespaces.
+        // Ids must not collide with each other or the tray_* namespace.
         assert_eq!(ACCOUNT_LOGIN_ID, "account_login");
         assert_eq!(ACCOUNT_SETTINGS_ID, "account_settings");
         assert_eq!(ACCOUNT_LOGOUT_ID, "account_logout");
@@ -125,8 +125,7 @@ mod tests {
         assert_ne!(ACCOUNT_LOGIN_ID, ACCOUNT_SETTINGS_ID);
         assert_ne!(ACCOUNT_LOGIN_ID, ACCOUNT_LOGOUT_ID);
         assert_ne!(ACCOUNT_SETTINGS_ID, ACCOUNT_LOGOUT_ID);
-        // Don't match the kube_ctx or tray_ prefixes.
-        assert!(!ACCOUNT_LOGIN_ID.starts_with("kube_ctx"));
+        // Don't match the tray_ prefix.
         assert!(!ACCOUNT_LOGIN_ID.starts_with("tray_"));
     }
 

@@ -1,0 +1,425 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package store
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestOpenMigrateClose(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+
+	cdb, err := r.Open(ctx, "cluster-a")
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(dir, "clusters", "cluster-a.db"))
+
+	var n int
+	require.NoError(t, cdb.Reader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations`).Scan(&n))
+	require.Greater(t, n, 0, "expected at least one migration recorded")
+
+	require.NoError(t, r.Shutdown(ctx))
+}
+
+// auto_vacuum must end up INCREMENTAL (2) so the janitor's incremental_vacuum
+// can return trimmed pages to the OS. It has to be set before any table exists,
+// including the migration runner's schema_migrations table — a regression here
+// is silent (the DB just grows), so guard the resulting mode explicitly.
+func TestAutoVacuumIsIncremental(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+
+	cdb, err := r.Open(ctx, "cluster-a")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	var mode int
+	require.NoError(t, cdb.Reader().QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode))
+	require.Equal(t, 2, mode, "auto_vacuum should be INCREMENTAL (2)")
+}
+
+// status_history is intentionally a plain rowid table with no (uid, at) primary
+// key, so two distinct status transitions for the same object that land in the
+// same millisecond both survive. Re-adding a unique constraint would silently
+// drop the second transition — guard the schema directly.
+func TestStatusHistoryKeepsSameMillisecondTransitions(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+
+	cdb, err := r.Open(ctx, "cluster-a")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// A current timestamp: the janitor (running since Open) must not sweep
+	// the rows out from under the schema assertion.
+	uid, at := "pod-1", time.Now().UnixMilli()
+	for _, summary := range []string{"Pending", "Running"} {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO status_history(uid, at, summary) VALUES(?, ?, ?)`, uid, at, summary)
+		require.NoError(t, err, "same (uid, at) must not collide")
+	}
+
+	var n int
+	require.NoError(t, cdb.Reader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM status_history WHERE uid=? AND at=?`, uid, at).Scan(&n))
+	require.Equal(t, 2, n, "both same-millisecond transitions should persist")
+}
+
+// A cluster ID becomes a filesystem path, so DeleteCacheFiles (and Open) must
+// reject path-traversal values — otherwise "../foo" would delete foo.db
+// outside the clusters dir.
+func TestDeleteCacheFilesRejectsTraversal(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+
+	// A sentinel sibling of the clusters dir that must survive a traversal attempt.
+	sentinel := filepath.Join(dir, "foo.db")
+	require.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
+
+	require.Error(t, r.DeleteCacheFiles(ctx, "../foo"))
+	require.FileExists(t, sentinel, "file outside clusters dir must not be deleted")
+
+	_, err := r.Open(ctx, "../foo")
+	require.Error(t, err, "Open rejects a traversal id")
+}
+
+func TestDeleteCacheFilesRemovesClosedCluster(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+
+	_, err := r.Open(ctx, "c")
+	require.NoError(t, err)
+	path := filepath.Join(dir, "clusters", "c.db")
+	require.FileExists(t, path)
+
+	require.NoError(t, r.DeleteCacheFiles(ctx, "c"))
+	require.NoFileExists(t, path)
+	require.Nil(t, r.Lookup("c"), "delete closes the open handle")
+
+	// Bytes report gone; a repeat delete is a no-op.
+	_, exists := r.CacheBytes("c")
+	require.False(t, exists)
+	require.NoError(t, r.DeleteCacheFiles(ctx, "c"))
+	require.NoError(t, r.Shutdown(ctx))
+}
+
+func TestCacheBytesWorksClosed(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	r1 := NewManager(dir)
+	_, err := r1.Open(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, r1.Shutdown(ctx))
+
+	r2 := NewManager(dir)
+	n, exists := r2.CacheBytes("c")
+	require.True(t, exists, "stat-only size works without opening")
+	require.Greater(t, n, int64(0))
+
+	_, exists = r2.CacheBytes("never-opened")
+	require.False(t, exists)
+}
+
+func TestOpenIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+
+	a, err := r.Open(ctx, "cluster-a")
+	require.NoError(t, err)
+	b, err := r.Open(ctx, "cluster-a")
+	require.NoError(t, err)
+	require.Same(t, a, b, "second Open should return the same handle")
+	require.Same(t, a, r.Lookup("cluster-a"))
+	require.Nil(t, r.Lookup("cluster-b"))
+
+	require.NoError(t, r.Shutdown(ctx))
+}
+
+func TestReopenRunsNoMigrations(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	r1 := NewManager(dir)
+	cdb1, err := r1.Open(ctx, "c")
+	require.NoError(t, err)
+	var firstCount int
+	require.NoError(t, cdb1.Reader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations`).Scan(&firstCount))
+	require.NoError(t, r1.Shutdown(ctx))
+
+	r2 := NewManager(dir)
+	cdb2, err := r2.Open(ctx, "c")
+	require.NoError(t, err)
+	var secondCount int
+	require.NoError(t, cdb2.Reader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations`).Scan(&secondCount))
+	require.Equal(t, firstCount, secondCount, "reopen should not re-apply migrations")
+	require.NoError(t, r2.Shutdown(ctx))
+}
+
+func TestShutdownRefusesNewOpens(t *testing.T) {
+	r := NewManager(t.TempDir())
+	ctx := context.Background()
+	require.NoError(t, r.Shutdown(ctx))
+	_, err := r.Open(ctx, "c")
+	require.Error(t, err)
+}
+
+func TestConcurrentReadersDuringWriter(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, "c")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// Writer: 1000 pod upserts in a single transaction.
+	writerDone := make(chan error, 1)
+	go func() {
+		writerDone <- func() error {
+			tx, err := cdb.Writer().BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			for i := range 1000 {
+				if _, err := tx.ExecContext(ctx,
+					`INSERT OR REPLACE INTO objects
+					 (uid, api_version, kind, namespace, name, resource_version, generation,
+					  created_at, updated_at, status_summary, raw_json)
+					 VALUES (?, 'v1', 'Pod', 'default', ?, '1', 1, ?, ?, 'Running', '{}')`,
+					"uid-"+itoa(i), "pod-"+itoa(i), time.Now().UnixMilli(), time.Now().UnixMilli(),
+				); err != nil {
+					return err
+				}
+			}
+			return tx.Commit()
+		}()
+	}()
+
+	// Readers run concurrently. They should see either pre- or post-commit
+	// state — never an error.
+	var wg sync.WaitGroup
+	readerErr := make(chan error, 8)
+	for range 8 {
+		wg.Go(func() {
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				var n int
+				if err := cdb.Reader().QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM objects WHERE kind='Pod'`).Scan(&n); err != nil {
+					readerErr <- err
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(readerErr)
+	for err := range readerErr {
+		require.NoError(t, err, "reader saw SQLITE_BUSY or similar during writer txn")
+	}
+	require.NoError(t, <-writerDone)
+
+	var final int
+	require.NoError(t, cdb.Reader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM objects WHERE kind='Pod'`).Scan(&final))
+	require.Equal(t, 1000, final)
+}
+
+func TestCorruptFileQuarantined(t *testing.T) {
+	dir := t.TempDir()
+	clustersDir := filepath.Join(dir, "clusters")
+	require.NoError(t, os.MkdirAll(clustersDir, 0o700))
+	dbPath := filepath.Join(clustersDir, "broken.db")
+	// SQLite files start with a magic string; arbitrary bytes are an
+	// invalid header and will fail integrity_check on first query.
+	require.NoError(t, os.WriteFile(dbPath, []byte("not a sqlite file"), 0o600))
+
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, "broken")
+	require.NoError(t, err, "open should recover from a corrupt file by quarantining it")
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	matches, err := filepath.Glob(filepath.Join(clustersDir, "broken.db.corrupt-*"))
+	require.NoError(t, err)
+	require.NotEmpty(t, matches, "expected a quarantined .corrupt-* file")
+
+	// New DB is usable.
+	require.NoError(t, cdb.Reader().PingContext(ctx))
+}
+
+func TestJanitorTrimsStaleEvents(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, "c")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	now := time.Now().UnixMilli()
+	hourAgo := now - (60 * 60 * 1000)
+	twoDaysAgo := now - (48 * 60 * 60 * 1000)
+
+	// Two events: one within 24h, one beyond.
+	for i, last := range []int64{hourAgo, twoDaysAgo} {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
+			 VALUES(?, 'Normal', 'Test', 'hello', ?, ?, 1, '{}', ?)`,
+			"ev-"+itoa(i), last, last, now,
+		)
+		require.NoError(t, err)
+	}
+
+	sweep(ctx, "c", cdb.Writer(), Retention{
+		EventsTTL:        24 * time.Hour,
+		StatusHistoryTTL: 7 * 24 * time.Hour,
+		Interval:         time.Minute,
+	})
+
+	var count int
+	require.NoError(t, cdb.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&count))
+	require.Equal(t, 1, count, "expected only the recent event to remain")
+}
+
+func TestSubscribeNotifyAndCoalesce(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, "c")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	ch, cancel := cdb.Subscribe()
+	defer cancel()
+
+	// Two notifies with no consumer in between coalesce into one ping.
+	cdb.Notify()
+	cdb.Notify()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a ping after Notify")
+	}
+	select {
+	case <-ch:
+		t.Fatal("coalesced pings must not deliver twice")
+	default:
+	}
+
+	// A notify after draining delivers again.
+	cdb.Notify()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a ping after re-Notify")
+	}
+}
+
+func TestShutdownClosesSubscribers(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, "c")
+	require.NoError(t, err)
+
+	ch, cancel := cdb.Subscribe()
+	defer cancel()
+	require.NoError(t, r.Shutdown(ctx))
+
+	select {
+	case _, ok := <-ch:
+		require.False(t, ok, "shutdown must close subscriber channels")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber channel not closed on shutdown")
+	}
+}
+
+func TestResourceStats(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, "c")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// Empty cache: no rows at all (events row appears only when present).
+	stats, err := cdb.ResourceStats(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stats)
+
+	at := time.Now().UnixMilli()
+	insert := func(uid, apiVersion, kind string) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+			   created_at, updated_at, raw_json)
+			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, '{}')`,
+			uid, apiVersion, kind, uid, at, at)
+		require.NoError(t, err)
+	}
+	insert("p1", "v1", "Pod")
+	insert("p2", "v1", "Pod")
+	insert("d1", "apps/v1", "Deployment")
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
+		 VALUES('e1', 'Normal', 'Test', 'hello', ?, ?, 1, '{}', ?)`, at, at, at)
+	require.NoError(t, err)
+
+	stats, err = cdb.ResourceStats(ctx)
+	require.NoError(t, err)
+	require.Len(t, stats, 3)
+
+	byResource := map[string]ResourceStat{}
+	for _, s := range stats {
+		byResource[s.Resource] = s
+	}
+	require.Equal(t, 2, byResource["Pod"].Count, "core group is elided")
+	require.Equal(t, 1, byResource["apps/Deployment"].Count, "group qualifies, version dropped")
+	require.Equal(t, 1, byResource["events"].Count)
+	require.NotNil(t, byResource["Pod"].LastUpdatedAt)
+	require.Equal(t, at, byResource["Pod"].LastUpdatedAt.UnixMilli())
+}
+
+func itoa(i int) string {
+	// fmt.Sprintf would pull fmt into the hot loop; this is tight and
+	// deterministic.
+	if i == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	return string(buf[pos:])
+}

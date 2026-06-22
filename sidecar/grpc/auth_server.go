@@ -89,8 +89,8 @@ func (s *authServer) Logout(ctx context.Context, _ *authpb.LogoutRequest) (*auth
 }
 
 // toAuthState projects an auth.State down to the wire snapshot the host needs.
-// Identity is only set while signed in, mirroring toState (kubecontext) and
-// toGraphAuthState (cloud_mappers.go).
+// Identity is only set while signed in, mirroring toGraphAuthState
+// (cloud_mappers.go).
 func toAuthState(s auth.State) *authpb.AuthState {
 	out := &authpb.AuthState{Authenticated: s.Authenticated}
 	if s.Identity != nil {

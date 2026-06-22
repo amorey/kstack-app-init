@@ -16,7 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/kubetail-org/kstack-app/sidecar/grpc/kubecontextpb"
+	"github.com/kubetail-org/kstack-app/sidecar/grpc/authpb"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/app"
 )
 
@@ -47,6 +47,10 @@ users:
 
 	a, err := app.New(app.Config{
 		KubeconfigPath: kubeconfig,
+		// A real data dir so app.db lands in the per-test temp dir — with an
+		// empty DataDir app.New would create app.db relative to the test's
+		// working directory (the package dir).
+		DataDir: t.TempDir(),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = a.Close() })
@@ -54,23 +58,17 @@ users:
 	return a, kubeconfig
 }
 
-// TestAppServesPing is the canary: App is a working http.Handler with the
-// GraphQL surface wired through composition.
-func TestAppServesPing(t *testing.T) {
-	a, _ := newTestApp(t)
-	ts := httptest.NewServer(a)
-	defer ts.Close()
-
-	resp, err := http.Post(ts.URL+"/graphql", "application/json", strings.NewReader(`{"query":"{ ping }"}`))
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	assert.Contains(t, string(raw), `"ping":"pong"`)
+// DataDir is required: with an empty one New must error rather than create
+// app.db relative to whatever the process working directory happens to be.
+func TestAppRequiresDataDir(t *testing.T) {
+	_, err := app.New(app.Config{})
+	require.ErrorContains(t, err, "data dir")
 }
 
 // With no cloud config (the standalone/test default), the account surface is
 // wired through composition but degraded: the authState query answers signed-out
-// instead of panicking. Proves the cloud service is threaded into the resolver.
+// instead of panicking. This is also the canary that the composed App is a
+// working http.Handler with the GraphQL surface wired through composition.
 func TestAppAuthStateDegradesSignedOut(t *testing.T) {
 	a, _ := newTestApp(t)
 	ts := httptest.NewServer(a)
@@ -86,18 +84,18 @@ func TestAppAuthStateDegradesSignedOut(t *testing.T) {
 }
 
 // TestAppShutdownDrainsBothTransports is the heart of the lifecycle contract:
-// with a live SSE subscription AND a live gRPC Watch stream open, NotifyShutdown
-// signals both to close and DrainWithContext returns nil only once both handlers
-// have unwound. If either transport were left dangling, the GraphQL WaitGroup or
-// the gRPC stream WaitGroup would never reach zero and DrainWithContext would hit
-// its deadline instead.
+// with a live SSE subscription AND a live gRPC AuthStateWatch stream open,
+// NotifyShutdown signals both to close and DrainWithContext returns nil only once
+// both handlers have unwound. If either transport were left dangling, the GraphQL
+// WaitGroup or the gRPC stream WaitGroup would never reach zero and
+// DrainWithContext would hit its deadline instead.
 func TestAppShutdownDrainsBothTransports(t *testing.T) {
 	a, _ := newTestApp(t)
 	ts := httptest.NewServer(a)
 	defer ts.Close()
 
 	// Live SSE subscription.
-	sseReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/graphql", strings.NewReader(`{"query":"subscription { tick }"}`))
+	sseReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/graphql", strings.NewReader(`{"query":"subscription { authStateWatch { authenticated } }"}`))
 	sseReq.Header.Set("Content-Type", "application/json")
 	sseReq.Header.Set("Accept", "text/event-stream")
 	sseResp, err := http.DefaultClient.Do(sseReq)
@@ -107,15 +105,15 @@ func TestAppShutdownDrainsBothTransports(t *testing.T) {
 	_, err = sseResp.Body.Read(buf) // ensure the stream is established
 	require.NoError(t, err)
 
-	// Live gRPC Watch stream over h2c on the same listener.
+	// Live gRPC AuthStateWatch stream over h2c on the same listener.
 	conn, err := grpc.NewClient(strings.TrimPrefix(ts.URL, "http://"), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	defer conn.Close()
-	stream, err := kubecontextpb.NewKubeContextServiceClient(conn).Watch(context.Background(), &kubecontextpb.WatchRequest{})
+	stream, err := authpb.NewAuthServiceClient(conn).AuthStateWatch(context.Background(), &authpb.AuthStateWatchRequest{})
 	require.NoError(t, err)
 	snap, err := stream.Recv()
 	require.NoError(t, err)
-	assert.Equal(t, "context-A", snap.GetCurrentContext())
+	assert.False(t, snap.GetAuthenticated())
 
 	grpcRecvErr := make(chan error, 1)
 	go func() {

@@ -199,10 +199,6 @@ pub fn run() {
             app_menu::build_app_menu(app.handle())?;
             tray::build_tray(app.handle())?;
 
-            // Keep the tray's kube-context list live off the sidecar's
-            // kubeConfigWatch stream (populates on the first frame).
-            tray::spawn_kubeconfig_subscription(app.handle());
-
             // Keep the tray's account section live off the sidecar's
             // AuthStateWatch stream (populates on the first frame).
             tray::spawn_authstate_subscription(app.handle());

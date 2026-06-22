@@ -1,4 +1,4 @@
-# Copyright 2026 The Kubetail Authors
+# Copyright 2026 The Kstack Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,85 +14,230 @@
 
 # Kstack App Sidecar GraphQL schema
 
-# --- Cluster cache ---
+"An ISO-8601 encoded UTC date string."
+scalar Time
 
-"A cluster in the app's local registry. `uuid` is the cluster's `kube-system` namespace UID — stable across kubeconfig context renames and unique per cluster. A cluster stays listed even after it leaves the kubeconfig (so its cache can be inspected or cleaned up); the `present`/`cached`/`enabled` flags describe its current state."
+# --- Cluster (a tracked kube-context) ---
+
+"""
+A registered cluster connection: a tracked kube-context paired with its on-disk
+cache mirror. Modeled Kubernetes-style so a consumer knows where data comes
+from: `spec` is the user-owned desired state, `status` the observed state. Two
+records may point at the same physical cluster (`status.server.uid` tracks
+physical identity). A cluster stays listed after its context leaves the
+kubeconfig (so its cache can still be inspected or cleared).
+"""
 type Cluster {
-  uuid: String!
-  name: String!
+  "Unique identifier for this cluster record."
+  id: ID!
+
+  "When this cluster was first registered."
+  createdAt: Time!
+  "When this cluster was archived; null unless archived."
+  archivedAt: Time
+  "When this cluster was removed (soft-delete tombstone); null unless removed."
+  deletedAt: Time
+
+  "Desired state: the user-owned fields."
+  spec: ClusterSpec!
+  "Observed state: everything discovered by watching and probing."
+  status: ClusterStatus!
+}
+
+"A cluster record's desired state. Every field is user/API-owned; nothing here is observed."
+type ClusterSpec {
+  "User-assigned display name; null if unset."
+  name: String
+  "Whether syncing is enabled. Disabling stops sync and freezes the cache."
+  isSyncEnabled: Boolean!
+  "Whether the user has activated this cluster in the app."
+  isActive: Boolean!
+  "Where this record comes from and how its credentials resolve."
+  source: ClusterSource!
+}
+
+"""
+The discriminated union naming a cluster record's origin: exactly one variant
+is set. Each variant is owned by exactly one creator (the kubeconfig importer
+today; manual creation and kstack-cloud sync are future variants).
+"""
+type ClusterSource {
+  "Set when the record tracks a kube-context in the user's kubeconfig."
+  kubeconfig: ClusterSourceKubeconfig
+}
+
+"The kubeconfig-sourced variant of ClusterSource."
+type ClusterSourceKubeconfig {
+  "The kube-context name this record tracks."
   context: String!
-  "True when this entry matches the kubeconfig's `current-context`."
-  isCurrent: Boolean!
-  "Whether the user has syncing enabled for this cluster. Disabling freezes its cache (no longer browsable)."
-  enabled: Boolean!
-  "True while the cluster's kube-context is present in the current kubeconfig."
-  present: Boolean!
-  "True when a local SQLite cache exists on disk for this cluster."
-  cached: Boolean!
-  "On-disk size of the cache (sqlite + WAL/shm sidecars) in bytes; 0 when not cached."
-  cacheBytes: Int!
-  "Unix-millis of the last time the cache received fresh data; 0 if never."
-  lastSyncedAt: Int!
-  "Unix-millis of the last time this cluster's context was seen in the kubeconfig; 0 if never."
-  lastSeenInKubeconfigAt: Int!
 }
 
-"A single cached pod from a cluster's local SQLite mirror. `clusterUuid` identifies which cluster this row belongs to; all other fields mirror the underlying object."
-type Pod {
-  clusterUuid: String!
-  namespace: String!
-  name: String!
-  uid: String!
-  phase: String!
-  nodeName: String!
-  updatedAt: Int!
+"""
+A cluster record's observed state, persisted on the record by the reconcile
+loops and reported Kubernetes-style: probed facts plus status conditions —
+the consumer derives display state from the conditions' type/status/reason.
+`cache` is live subsystem state (a nested object so a consumer fetches it
+only when needed).
+"""
+type ClusterStatus {
+  "Per-source observation blocks, mirroring `spec.source`."
+  source: ClusterSourceStatus!
+  "Last-known facts about the remote cluster (uid, version), discovered by probing."
+  server: ClusterServer!
+  "The connecting client's identity and effective access on this cluster."
+  principal: ClusterPrincipal!
+  "When a connection probe last succeeded; null if never."
+  lastConnectedAt: Time
+
+  "The cluster controller's conditions (`Connected`, `Healthy`)."
+  conditions: [ClusterCondition!]!
+  "The sync controller's status block: its own conditions (`Synced`) plus cache freshness."
+  syncStatus: ClusterSyncStatus!
+  "The on-disk cache mirror for this cluster."
+  cache: ClusterCache!
 }
 
-"A cached Service. Mirrors the columns in the local SQLite mirror."
-type Service {
-  clusterUuid: String!
-  namespace: String!
-  name: String!
-  uid: String!
+"A condition's three-valued verdict, Kubernetes-style."
+enum ConditionStatus {
+  "The condition holds."
+  True
+  "The condition does not hold."
+  False
+  "The condition cannot currently be assessed."
+  Unknown
+}
+
+"""
+One Kubernetes-style status condition: an independently-tracked aspect of the
+record's observed state. Cluster-controller conditions: `Connected` (the last
+probe reached the API server; reasons Connecting/Connected/ResolveFailed/
+ProbeFailed/Inactive) and `Healthy` (the server's own readiness; reasons
+Ready/ReadyzFailed/Unreachable/NoConnection/Inactive). Sync-controller
+condition (under `syncStatus`): `Synced` (reasons Syncing/Watching/Paused/
+SyncFailed/ResolveFailed). New types/reasons may appear; consumers should
+treat unknown spellings as a degraded/unknown display state.
+"""
+type ClusterCondition {
+  "The aspect this condition tracks, e.g. \"Connected\"."
   type: String!
-  clusterIp: String!
-  updatedAt: Int!
-}
-
-"A cached Deployment. Replica counts are the spec'd vs ready values."
-type Deployment {
-  clusterUuid: String!
-  namespace: String!
-  name: String!
-  uid: String!
-  replicas: Int!
-  readyReplicas: Int!
-  updatedAt: Int!
-}
-
-"A cached Node. `ready` is true when the node has a Ready=True condition."
-type Node {
-  clusterUuid: String!
-  name: String!
-  uid: String!
-  ready: Boolean!
-  updatedAt: Int!
-}
-
-"A cached Kubernetes Event. Mirrors the dedicated `events` table; ordered by lastSeen DESC when listed."
-type Event {
-  clusterUuid: String!
-  uid: String!
-  type: String!
+  status: ConditionStatus!
+  "CamelCase machine-readable explanation of `status`."
   reason: String!
+  "Human-readable detail; empty when there is nothing to explain."
   message: String!
-  involvedKind: String!
-  involvedNamespace: String!
-  involvedName: String!
-  firstSeen: Int!
-  lastSeen: Int!
-  count: Int!
+  "The spec generation the pass that wrote this condition observed; a gap to the record's `generation` marks it stale."
+  observedGeneration: Int!
+  "When `status` last changed — not when the condition was last refreshed."
+  lastTransitionTime: Time!
 }
+
+"The sync controller's status block on a record."
+type ClusterSyncStatus {
+  "The sync-owned conditions (`Synced`)."
+  conditions: [ClusterCondition!]!
+  "When the cache last received fresh data; null if never. Refreshed coarsely (~30s) while syncing."
+  lastSyncedAt: Time
+}
+
+"""
+The status-side counterpart of ClusterSource: the per-source observation
+blocks, of which exactly the spec source variant's is set. Null blocks mean
+"this record's source has no such observation" — never that an observation
+went away (an orphaned kubeconfig record keeps its block with
+`isPresent: false`).
+"""
+type ClusterSourceStatus {
+  "Kubeconfig observation; null unless the record is kubeconfig-sourced."
+  kubeconfig: ClusterKubeconfig
+}
+
+"""
+A kubeconfig-sourced record's last-known kubeconfig observation: the cluster
+and user names its context (`spec.source.kubeconfig.context`) references, and
+whether the context is present. Cached from the last time the context was
+present, so they survive the context leaving the kubeconfig and let the UI
+identify an orphaned record. In a malformed kubeconfig the referenced entries
+may not resolve.
+"""
+type ClusterKubeconfig {
+  "Name of the cluster entry the context references; cached."
+  cluster: String!
+  "Name of the user (authInfo) entry the context references; cached."
+  user: String!
+  "True while the context is currently present in the kubeconfig; false when orphaned."
+  isPresent: Boolean!
+  "True when the context is the kubeconfig's `current-context`; false otherwise."
+  isDefault: Boolean!
+}
+
+"Last-known facts about the remote cluster, discovered by probing. Fields are null until a successful probe."
+type ClusterServer {
+  "The cluster's `kube-system` namespace UID; stable across context renames."
+  uid: String
+  "Server version, e.g. \"v1.29.3\"."
+  version: String
+}
+
+"The connecting client's identity and effective access on this cluster."
+type ClusterPrincipal {
+  "Authenticated username the API server last mapped this cluster's credentials to (SelfSubjectReview); null until probed."
+  username: String
+  "Effective RBAC in a namespace (live SelfSubjectRulesReview), resolved on demand. Point-in-time, for debugging only — not authoritative for access decisions."
+  permissions(namespace: String!): ClusterPermissions!
+}
+
+"""
+The connecting principal's effective RBAC in one namespace (live
+SelfSubjectRulesReview). Namespace-scoped (the API has no all-namespaces form)
+and point-in-time — for UI/debugging, not authoritative for access decisions.
+"""
+type ClusterPermissions {
+  "The namespace these rules were evaluated for."
+  namespace: String!
+  "Allowed resource rules (verbs × apiGroups × resources)."
+  resourceRules: [ResourceRule!]!
+  "Allowed non-resource rules (verbs × URLs), e.g. /healthz."
+  nonResourceRules: [NonResourceRule!]!
+  "True if some authorizers couldn't be evaluated, so the rule set may be incomplete."
+  incomplete: Boolean!
+}
+
+"A resource-scoped RBAC rule: the verbs the principal may use on the given apiGroups/resources (optionally narrowed to named instances)."
+type ResourceRule {
+  verbs: [String!]!
+  apiGroups: [String!]!
+  resources: [String!]!
+  "Specific resource names this rule is restricted to; empty means all."
+  resourceNames: [String!]!
+}
+
+"A non-resource RBAC rule: the verbs the principal may use against non-resource URLs (e.g. /healthz)."
+type NonResourceRule {
+  verbs: [String!]!
+  nonResourceUrls: [String!]!
+}
+
+"The on-disk cache mirror for a single cluster."
+type ClusterCache {
+  "True when a local cache exists on disk."
+  exists: Boolean!
+  "On-disk cache size (sqlite + WAL/shm) in bytes; 0 when not cached."
+  bytes: Int!
+  "Per-resource breakdown of what's cached."
+  resources: [CachedResource!]!
+}
+
+"Cache statistics for one resource kind within a cluster's cache."
+type CachedResource {
+  "Resource identifier, e.g. \"pods\" or \"apps/Deployment\"."
+  resource: String!
+  "Number of objects cached for this resource."
+  count: Int!
+  "Time of the last update to this resource's rows; null if never."
+  lastUpdatedAt: Time
+}
+
+# --- Chat ---
 
 input ChatMessageInput {
   role: String!
@@ -118,141 +263,59 @@ type Identity {
   name: String!
 }
 
-"A snapshot of the user's authentication state. `authenticated` is the explicit sign-in signal; `identity` carries the verified claims and is non-null only when `authenticated` is true."
+"The user's authentication state. `authenticated` is the sign-in signal; `identity` carries the verified claims and is non-null only when authenticated."
 type AuthState {
   authenticated: Boolean!
   identity: Identity
 }
 
-# --- KubeConfig ---
-
-# https://pkg.go.dev/k8s.io/client-go/tools/clientcmd/api#Config
-type KubeConfig {
-  authInfos: [KubeConfigAuthInfo!]!
-  clusters: [KubeConfigCluster!]!
-  contexts: [KubeConfigContext!]!
-  currentContext: String!
-  extensions: KubeConfigExtensions
-}
-
-# https://pkg.go.dev/k8s.io/client-go/tools/clientcmd/api#AuthInfo
-type KubeConfigAuthInfo {
-  name: String!
-  locationOfOrigin: String!
-  extensions: KubeConfigExtensions
-}
-
-# https://pkg.go.dev/k8s.io/client-go/tools/clientcmd/api#Cluster
-type KubeConfigCluster {
-  name: String!
-  locationOfOrigin: String!
-  server: String!
-  extensions: KubeConfigExtensions
-}
-
-# https://pkg.go.dev/k8s.io/client-go/tools/clientcmd/api#Context
-type KubeConfigContext {
-  name: String!
-  locationOfOrigin: String!
-  cluster: String!
-  authInfo: String!
-  namespace: String!
-  extensions: KubeConfigExtensions
-}
-
-type KubeConfigWatchEvent {
-  type: WatchEventType!
-  object: KubeConfig
-}
-
-scalar KubeConfigExtensions
-
-# --- Watch ---
-
-# https://pkg.go.dev/k8s.io/apimachinery/pkg/watch#EventType
-enum WatchEventType {
-  ADDED
-  MODIFIED
-  DELETED
-  BOOKMARK
-  ERROR
-}
-
 # --- Root operations ---
 
 type Query {
-  "Health-check field. Always returns 'pong'."
-  ping: String!
+  "A single cluster by id; null if not tracked."
+  cluster(id: ID!): Cluster
 
-  "Every cluster in the local registry — those in the current kubeconfig plus any with a leftover cache. Sorted by name."
+  "Every tracked cluster — those in the kubeconfig plus any with a leftover cache. Sorted by name."
   clusters: [Cluster!]!
 
-  "Snapshot of pods cached for the given cluster, ordered by namespace then name."
-  pods(clusterUuid: String!): [Pod!]!
-
-  "Snapshot of services cached for the given cluster."
-  services(clusterUuid: String!): [Service!]!
-
-  "Snapshot of deployments cached for the given cluster."
-  deployments(clusterUuid: String!): [Deployment!]!
-
-  "Snapshot of nodes cached for the given cluster."
-  nodes(clusterUuid: String!): [Node!]!
-
-  "Recent Kubernetes events from the local mirror, newest first. `limit` defaults to 100 and is capped at 500."
-  events(clusterUuid: String!, limit: Int): [Event!]!
-
-  "The current authentication state (signed-in flag + identity). Signed-out when no cloud account is configured. Live updates arrive via the authStateWatch subscription."
+  "Current authentication state. Signed-out when no cloud account is configured; live updates via authStateWatch."
   authState: AuthState!
 }
 
 type Mutation {
-  "Sets the kubeconfig current-context, persisting it to disk (kubectl-visible). Returns true on success; errors if the context is unknown. The updated config is delivered to clients via the kubeConfigWatch subscription."
-  setCurrentContext(name: String!): Boolean!
+  # --- Cluster mutations ---
 
-  "Enable or disable syncing for a cluster. Disabling stops its sync and freezes its cache (no longer browsable); enabling resumes it. Returns the updated cluster; errors if the uuid is unknown."
-  setClusterEnabled(uuid: String!, enabled: Boolean!): Cluster!
+  "Enable or disable syncing for a cluster. Disabling stops sync and freezes the cache. Returns the updated cluster."
+  clusterSyncEnabledSet(id: ID!, syncEnabled: Boolean!): Cluster!
 
-  "Delete a cluster's local cache files, keeping its registry row (now uncached). If its context is still present and enabled it re-syncs from scratch; otherwise the files are simply freed and the row — including an orphan — stays listed. Returns true; errors if the uuid is unknown."
-  deleteClusterCache(uuid: String!): Boolean!
+  "Force an immediate reconnection attempt, resetting any backoff. Returns true once scheduled."
+  clusterConnectionRetry(id: ID!): Boolean!
 
-  "Forget a cluster entirely: delete its cache files and remove its row from the local registry (app.db). Meant for an orphan (gone from the kubeconfig); a still-present context is re-discovered on the next reconcile. Returns true; errors if the uuid is unknown."
-  removeCluster(uuid: String!): Boolean!
+  "Clear a cluster's on-disk cache but keep its registry record; a present, enabled cluster re-syncs from scratch. Returns the updated cluster."
+  clusterCacheClear(id: ID!): Cluster!
 
-  "Start the sidecar-owned browser sign-in (OAuth). The setup phase (bind the loopback redirect listener, open the browser) runs synchronously, so a setup failure — or no cloud account configured — is returned as an error. Returns true once the browser has been launched; the slow token exchange then completes in the background and the resulting signed-in state is delivered via the authStateWatch subscription."
-  startLogin: Boolean!
+  "Forget a cluster: delete its cache and its registry record. A still-present context is re-discovered on the next kubeconfig reconcile. Returns true."
+  clusterDelete(id: ID!): Boolean!
 
-  "Sign out: clear the local credentials, broadcast signed-out, and revoke the token server-side (best-effort). Returns true. No-op on a service without a cloud account."
-  logout: Boolean!
+  # --- Auth mutations ---
+
+  "Start the sidecar-owned browser sign-in (OAuth). Setup (loopback bind + browser open) runs synchronously, so a setup failure — or no cloud account — returns an error. Returns true once the browser opens; the token exchange then completes in the background, with the signed-in state delivered via authStateWatch."
+  authLoginStart: Boolean!
+
+  "Sign out: clear local credentials, broadcast signed-out, and revoke the token server-side (best-effort). Returns true; no-op without a cloud account."
+  authLogout: Boolean!
 }
 
 type Subscription {
-  "Emits an incrementing integer (starting at 1) every second. Cancelled when the client unsubscribes."
-  tick: Int!
-
-  "Streams the cluster registry: the full snapshot first, then a fresh snapshot on every change (discovery, enable/disable, sync freshness, deletion)."
+  """
+  Streams the cluster list. Currently emits the full list once on subscribe and
+  holds the stream open; live re-emits on registry changes come later.
+  """
   clustersWatch: [Cluster!]!
 
   "Streams the assistant's reply token-by-token. Completes after a frame with `done: true`."
   chatStream(input: ChatInput!): ChatChunk!
 
-  "Streams the cluster's pod list: snapshot first, then a fresh snapshot every time the local cache changes."
-  podsWatch(clusterUuid: String!): [Pod!]!
-
-  "Streams the cluster's service list, same shape as podsWatch."
-  servicesWatch(clusterUuid: String!): [Service!]!
-
-  "Streams the cluster's deployment list."
-  deploymentsWatch(clusterUuid: String!): [Deployment!]!
-
-  "Streams the cluster's node list."
-  nodesWatch(clusterUuid: String!): [Node!]!
-
-  """
-  KubeConfig watchers
-  """
-  kubeConfigWatch: KubeConfigWatchEvent
-
-  "Streams the authentication state: the current snapshot first, then a fresh snapshot on every sign-in / sign-out / refresh-failure change."
+  "Streams authentication state: the current snapshot, then a fresh one on every sign-in / sign-out / refresh-failure change."
   authStateWatch: AuthState!
 }

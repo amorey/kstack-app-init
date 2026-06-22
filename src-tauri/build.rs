@@ -13,15 +13,10 @@ fn main() {
     tonic_prost_build::configure()
         .build_server(false)
         .compile_protos(
-            &[
-                "../proto/kubecontext.proto",
-                "../proto/auth.proto",
-                "../proto/poke.proto",
-            ],
+            &["../proto/auth.proto", "../proto/poke.proto"],
             &["../proto"],
         )
         .expect("compile proto");
-    println!("cargo:rerun-if-changed=../proto/kubecontext.proto");
     println!("cargo:rerun-if-changed=../proto/auth.proto");
     println!("cargo:rerun-if-changed=../proto/poke.proto");
 

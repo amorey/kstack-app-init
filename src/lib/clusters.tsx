@@ -13,12 +13,14 @@
 // limitations under the License.
 
 // The app's cluster registry surfaced to the renderer. The sidecar publishes
-// every known cluster — those in the current kubeconfig plus any with a
-// leftover cache — on the `clustersWatch` subscription (full snapshot first,
-// then a fresh snapshot on every change: discovery, enable/disable, sync
-// freshness, deletion). Each row carries durable registry fields (enabled,
-// timestamps) plus live facts (present in kubeconfig, cached on disk, size).
-// This provider adapts that stream into context.
+// every known cluster — those in the current kubeconfig plus any orphaned
+// records — on the `clustersWatch` subscription (currently the full snapshot
+// once on subscribe; live re-emits on registry changes come later). Each row
+// is Kubernetes-shaped: `spec` carries the user-owned fields (name, flags,
+// kube-context) and `status` the observed state (kubeconfig presence, probed
+// server facts, status conditions, and the live cache object) — display
+// state derives from the status fields client-side. This provider adapts
+// that stream into context.
 import { createContext, useContext, useMemo } from 'react';
 import { useSubscription } from 'urql';
 
@@ -30,16 +32,37 @@ export type Cluster = ClustersWatchSubscription['clustersWatch'][number];
 const ClustersWatchSubscription = graphql(`
   subscription ClustersWatch {
     clustersWatch {
-      uuid
-      name
-      context
-      isCurrent
-      enabled
-      present
-      cached
-      cacheBytes
-      lastSyncedAt
-      lastSeenInKubeconfigAt
+      id
+      spec {
+        name
+        isSyncEnabled
+        isActive
+        source {
+          kubeconfig {
+            context
+          }
+        }
+      }
+      status {
+        source {
+          kubeconfig {
+            cluster
+            user
+            isPresent
+            isDefault
+          }
+        }
+        server {
+          uid
+        }
+        syncStatus {
+          lastSyncedAt
+        }
+        cache {
+          exists
+          bytes
+        }
+      }
     }
   }
 `);

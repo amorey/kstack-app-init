@@ -33,14 +33,14 @@ const { ClusterSyncPanel } = await import('./cluster-sync-panel');
 const flush = () => act(async () => {});
 
 type Row = {
-  uuid: string;
+  uuid: string; // '' = pending (the UID probe never succeeded → server.uid null)
   name: string;
   enabled: boolean;
   present: boolean;
   cached: boolean;
   isCurrent?: boolean;
   cacheBytes?: number;
-  lastSyncedAt?: number;
+  lastSyncedAt?: string;
 };
 
 function pushClusters(rows: Row[]) {
@@ -49,13 +49,27 @@ function pushClusters(rows: Row[]) {
       type: 'next',
       payload: {
         data: {
-          clustersWatch: rows.map((r) => ({
-            context: r.name,
-            isCurrent: false,
-            cacheBytes: 0,
-            lastSyncedAt: 0,
-            lastSeenInKubeconfigAt: 0,
-            ...r,
+          clustersWatch: rows.map((r, i) => ({
+            id: r.uuid || `pending-${i}`,
+            spec: {
+              name: r.name,
+              isSyncEnabled: r.enabled,
+              isActive: true,
+              source: { kubeconfig: { context: r.name } },
+            },
+            status: {
+              source: {
+                kubeconfig: {
+                  cluster: `${r.name}-cluster`,
+                  user: `${r.name}-user`,
+                  isPresent: r.present,
+                  isDefault: r.isCurrent ?? false,
+                },
+              },
+              server: { uid: r.uuid || null },
+              syncStatus: { lastSyncedAt: r.lastSyncedAt ?? null },
+              cache: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
+            },
           })),
         },
       },
@@ -109,9 +123,9 @@ describe('ClusterSyncPanel', () => {
           status: 200,
           body: JSON.stringify({
             data: {
-              setClusterEnabled: { __typename: 'Cluster', uuid: 'u', enabled: false },
-              deleteClusterCache: true,
-              removeCluster: true,
+              clusterSyncEnabledSet: { __typename: 'Cluster', id: 'u', spec: { isSyncEnabled: false } },
+              clusterCacheClear: { __typename: 'Cluster', id: 'u' },
+              clusterDelete: true,
             },
           }),
         };
@@ -193,18 +207,18 @@ describe('ClusterSyncPanel', () => {
     expect(screen.queryByRole('rowgroup', { name: /orphaned/i })).not.toBeInTheDocument();
   });
 
-  it('toggling sync fires the play/pause action via setClusterEnabled', async () => {
+  it('toggling sync fires the play/pause action via clusterSyncEnabledSet', async () => {
     const user = await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
 
     // Enabled + active → a Pause button.
     await user.click(await screen.findByRole('button', { name: /pause sync for prod-us/i }));
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
-      expect.objectContaining({ body: expect.stringContaining('setClusterEnabled') }),
+      expect.objectContaining({ body: expect.stringContaining('clusterSyncEnabledSet') }),
     );
   });
 
-  it('clearing a cache fires deleteClusterCache, and is disabled when uncached', async () => {
+  it('clearing a cache fires clusterCacheClear, and is disabled when uncached', async () => {
     const user = await openWith([
       { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true },
       { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: false },
@@ -215,7 +229,7 @@ describe('ClusterSyncPanel', () => {
     await user.click(screen.getByRole('button', { name: /clear cache for prod-us/i }));
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
-      expect.objectContaining({ body: expect.stringContaining('deleteClusterCache') }),
+      expect.objectContaining({ body: expect.stringContaining('clusterCacheClear') }),
     );
   });
 
@@ -232,7 +246,7 @@ describe('ClusterSyncPanel', () => {
     expect(screen.getByRole('button', { name: /^remove minikube/i })).toBeDisabled();
   });
 
-  it('disables play/pause for orphaned rows and removes them via removeCluster', async () => {
+  it('disables play/pause for orphaned rows and removes them via clusterDelete', async () => {
     const user = await openWith([{ uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true }]);
 
     expect(await screen.findByRole('button', { name: /sync for old-cluster/i })).toBeDisabled();
@@ -242,7 +256,7 @@ describe('ClusterSyncPanel', () => {
     await user.click(remove);
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
-      expect.objectContaining({ body: expect.stringContaining('removeCluster') }),
+      expect.objectContaining({ body: expect.stringContaining('clusterDelete') }),
     );
   });
 });

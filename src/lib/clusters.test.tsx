@@ -30,7 +30,7 @@ const { formatBytes, ClustersProvider, useClusters } = await import('./clusters'
 
 const flush = () => act(async () => {});
 
-type Row = { uuid: string; name: string; enabled?: boolean; present?: boolean; cached?: boolean };
+type Row = { id: string; name: string; isSyncEnabled?: boolean };
 
 function pushClusters(rows: Row[]) {
   liveChannel().onmessage!(
@@ -39,15 +39,26 @@ function pushClusters(rows: Row[]) {
       payload: {
         data: {
           clustersWatch: rows.map((r) => ({
-            context: r.name,
-            isCurrent: false,
-            enabled: true,
-            present: true,
-            cached: false,
-            cacheBytes: 0,
-            lastSyncedAt: 0,
-            lastSeenInKubeconfigAt: 0,
-            ...r,
+            id: r.id,
+            spec: {
+              name: r.name,
+              isSyncEnabled: r.isSyncEnabled ?? true,
+              isActive: true,
+              source: { kubeconfig: { context: r.name } },
+            },
+            status: {
+              source: {
+                kubeconfig: {
+                  cluster: `${r.name}-cluster`,
+                  user: `${r.name}-user`,
+                  isPresent: true,
+                  isDefault: false,
+                },
+              },
+              server: { uid: `uid-${r.id}` },
+              syncStatus: { lastSyncedAt: null },
+              cache: { exists: false, bytes: 0 },
+            },
           })),
         },
       },
@@ -58,7 +69,7 @@ function pushClusters(rows: Row[]) {
 // A probe that renders the hook's value so tests can assert on it.
 function Probe() {
   const { clusters } = useClusters();
-  return <div data-testid="probe">{clusters === null ? 'null' : JSON.stringify(clusters.map((c) => c.name))}</div>;
+  return <div data-testid="probe">{clusters === null ? 'null' : JSON.stringify(clusters.map((c) => c.spec.name))}</div>;
 }
 
 function renderProvider() {
@@ -141,8 +152,8 @@ describe('useClusters', () => {
 
     await act(async () => {
       pushClusters([
-        { uuid: 'u-a', name: 'prod-us' },
-        { uuid: 'u-b', name: 'staging', enabled: false },
+        { id: 'u-a', name: 'prod-us' },
+        { id: 'u-b', name: 'staging', isSyncEnabled: false },
       ]);
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us","staging"]');

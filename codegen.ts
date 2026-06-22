@@ -5,13 +5,19 @@ import type { CodegenConfig } from '@graphql-codegen/cli';
 
 const config: CodegenConfig = {
   schema: 'sidecar/graph/schema.graphqls',
-  documents: ['src/**/*.{ts,tsx}', '!src/gql/**'],
+  // Tests are excluded: they don't define typed documents, and transport-level
+  // tests use raw gql tags with schema-less placeholder operations.
+  documents: ['src/**/*.{ts,tsx}', '!src/gql/**', '!src/**/*.test.{ts,tsx}'],
   ignoreNoDocuments: true,
   generates: {
     'src/gql/': {
       preset: 'client',
       config: {
         useTypeImports: true,
+        // The sidecar's Time scalar is an ISO-8601 UTC string on the wire.
+        scalars: {
+          Time: 'string',
+        },
       },
     },
   },

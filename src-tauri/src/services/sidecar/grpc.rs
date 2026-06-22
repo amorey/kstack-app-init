@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! gRPC client the host uses for the sidecar's host-internal control channel
-//! (today: the kube-context watch + set that drives the tray).
+//! (today: the auth-state watch + login/logout that drives the tray's account
+//! section, and the resync poke).
 //!
 //! gRPC needs HTTP/2; GraphQL stays HTTP/1.1. Both share the one socket via
 //! **h2c** — the sidecar's `NewH2CHandler` routes HTTP/2 `application/grpc`
@@ -36,13 +37,8 @@ use tower::service_fn;
 use super::ipc::{self, Endpoint};
 use crate::error::{AppError, Result};
 
-// The generated bindings for proto/kubecontext.proto (see build.rs). The
-// module name matches the proto `package`.
-pub mod kubecontext {
-    tonic::include_proto!("kubecontext");
-}
-
-// The generated bindings for proto/auth.proto.
+// The generated bindings for proto/auth.proto (see build.rs). The module name
+// matches the proto `package`.
 pub mod auth {
     tonic::include_proto!("auth");
 }
@@ -52,10 +48,6 @@ pub mod poke {
     tonic::include_proto!("poke");
 }
 
-use kubecontext::kube_context_service_client::KubeContextServiceClient;
-pub use kubecontext::KubeContextState;
-use kubecontext::{SetCurrentContextRequest, WatchRequest};
-
 use auth::auth_service_client::AuthServiceClient;
 pub use auth::AuthState;
 #[cfg(test)]
@@ -64,10 +56,6 @@ use auth::{AuthStateWatchRequest, LogoutRequest, StartLoginRequest};
 
 use poke::poke_service_client::PokeServiceClient;
 use poke::PokeRequest;
-
-/// A server-streamed `Watch` response: each item is a full kube-context
-/// snapshot, or a transport error that ends the stream.
-pub type WatchStream = tonic::Streaming<KubeContextState>;
 
 /// A server-streamed `AuthStateWatch` response: each item is a full auth-state
 /// snapshot, or a transport error that ends the stream.
@@ -110,38 +98,6 @@ impl GrpcClient {
         *self.channel.lock().await = None;
     }
 
-    /// Persists `name` as the kubeconfig current-context (unary RPC). The
-    /// change is observed by any active [`Self::watch`] stream and by the
-    /// webview's GraphQL subscription (shared watcher).
-    pub async fn set_current_context(&self, name: String) -> Result<()> {
-        let mut client = KubeContextServiceClient::new(self.channel().await?);
-        match client
-            .set_current_context(SetCurrentContextRequest { name })
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(status) => {
-                self.reset().await;
-                Err(status_to_err(status))
-            }
-        }
-    }
-
-    /// Opens the kube-context watch stream: a snapshot first, then a fresh
-    /// snapshot on every kubeconfig change. The caller drives it with
-    /// `stream.message().await`; a returned error / `None` ends the stream and
-    /// the cached channel is reset so the next attempt re-dials.
-    pub async fn watch(&self) -> Result<WatchStream> {
-        let mut client = KubeContextServiceClient::new(self.channel().await?);
-        match client.watch(WatchRequest {}).await {
-            Ok(resp) => Ok(resp.into_inner()),
-            Err(status) => {
-                self.reset().await;
-                Err(status_to_err(status))
-            }
-        }
-    }
-
     /// Runs the synchronous login setup (loopback bind + browser open) on the
     /// sidecar. Returns once setup succeeds or fails; the async sign-in tail
     /// delivers its result via [`Self::watch_auth_state`].
@@ -173,7 +129,7 @@ impl GrpcClient {
     /// `SourceHost` resync to its in-process subscribers (cluster-sync, settings-
     /// sync). Driven by the host's wake / network-return supervisor (see
     /// [`crate::wake`]). On a transport failure the cached channel is reset so the
-    /// next attempt re-dials — mirroring [`Self::set_current_context`].
+    /// next attempt re-dials — mirroring [`Self::logout`].
     pub async fn poke(&self) -> Result<()> {
         let mut client = PokeServiceClient::new(self.channel().await?);
         match client.poke(PokeRequest {}).await {

@@ -18,7 +18,7 @@ func TestOpenCreatesMigratesAndPersists(t *testing.T) {
 
 	// Migrations ran: the clusters table is queryable.
 	var n int
-	require.NoError(t, db.SQL().QueryRow(`SELECT count(*) FROM clusters`).Scan(&n))
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM clusters`).Scan(&n))
 	require.Equal(t, 0, n)
 	require.NoError(t, db.Close())
 
@@ -26,6 +26,6 @@ func TestOpenCreatesMigratesAndPersists(t *testing.T) {
 	db2, err := Open(path)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db2.Close() })
-	require.NoError(t, db2.SQL().QueryRow(`SELECT count(*) FROM clusters`).Scan(&n))
+	require.NoError(t, db2.QueryRow(`SELECT count(*) FROM clusters`).Scan(&n))
 	require.Equal(t, 0, n)
 }

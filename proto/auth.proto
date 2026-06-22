@@ -3,7 +3,7 @@
 // This file is the single source of truth for the AuthService wire format,
 // consumed by both the Go sidecar (via protoc, see sidecar/grpc/authpb) and
 // the Rust host (via tonic-build, see src-tauri/build.rs). It deliberately
-// sits at the repo root alongside kubecontext.proto.
+// sits at the repo root alongside poke.proto.
 syntax = "proto3";
 
 package auth;
@@ -11,11 +11,11 @@ package auth;
 option go_package = "github.com/kubetail-org/kstack-app/sidecar/grpc/authpb";
 
 // AuthService is the host-internal control channel for the local-first identity
-// session. It rides the same socket as GraphQL and KubeContextService (h2c
-// multiplexing) but is consumed only by the native host (the tray), never the
-// webview — the webview keeps using the GraphQL authState/login/logout/
-// authStateWatch surface. Both transports share the one auth.Service, so a
-// sign-in via either is observed by both.
+// session. It rides the same socket as GraphQL (h2c multiplexing) but is
+// consumed only by the native host (the tray), never the webview — the webview
+// keeps using the GraphQL authState/login/logout/authStateWatch surface. Both
+// transports share the one auth.Service, so a sign-in via either is observed by
+// both.
 service AuthService {
   // StartLogin runs the synchronous setup phase (loopback bind + browser open)
   // and returns its result. The async sign-in tail — redirect exchange, verify,

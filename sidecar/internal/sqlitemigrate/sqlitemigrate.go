@@ -9,8 +9,8 @@
 // the last committed version and the next start resumes from there. A DB written
 // by a newer binary is refused rather than truncated.
 //
-// Used by both internal/cluster/clustercache (per-cluster caches) and
-// internal/appdb (durable app-level state).
+// Used by both internal/kube (per-cluster caches) and internal/appdb (durable
+// app-level state).
 package sqlitemigrate
 
 import (

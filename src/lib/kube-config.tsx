@@ -12,59 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// KubeConfig surfaced to the renderer. The sidecar's fsnotify-backed
-// watcher publishes the current snapshot on the `kubeConfigWatch`
-// subscription (ADDED first, then MODIFIED on every reload). This
-// provider just adapts that stream into context — same shape as
-// SyncStatusProvider.
+// The kubeconfig's context list surfaced to the renderer, derived from the
+// cluster registry stream (each present cluster record carries its context
+// name and the current-context flag) — so this provider must be mounted
+// inside <ClustersProvider>. The sidecar no longer exposes a dedicated
+// kubeConfigWatch subscription; if a consumer ever needs the raw kubeconfig
+// (auth-infos, server URLs), grow the Cluster type instead.
 import { createContext, useContext, useMemo } from 'react';
-import { useSubscription } from 'urql';
 
-import { graphql } from '@/gql';
-import type { KubeConfigWatchSubscription } from '@/gql/graphql';
+import { useClusters } from '@/lib/clusters';
 
-export type KubeConfig = NonNullable<KubeConfigWatchSubscription['kubeConfigWatch']>['object'];
-
-const KubeConfigWatchSubscription = graphql(`
-  subscription KubeConfigWatch {
-    kubeConfigWatch {
-      type
-      object {
-        currentContext
-        authInfos {
-          name
-          locationOfOrigin
-        }
-        clusters {
-          name
-          locationOfOrigin
-          server
-        }
-        contexts {
-          name
-          locationOfOrigin
-          cluster
-          authInfo
-          namespace
-        }
-      }
-    }
-  }
-`);
+export type KubeConfig = {
+  currentContext: string;
+  contexts: { name: string }[];
+};
 
 type KubeConfigContextValue = {
+  // null = clusters not reported yet (first frame not landed).
   kubeConfig: KubeConfig | null;
 };
 
 const KubeConfigCtx = createContext<KubeConfigContextValue | null>(null);
 
 export function KubeConfigProvider({ children }: { children: React.ReactNode }) {
-  const [{ data }] = useSubscription({ query: KubeConfigWatchSubscription });
-  const kubeConfig = data?.kubeConfigWatch?.object ?? null;
-  // Treat the first ADDED frame and subsequent MODIFIED frames identically:
-  // both carry the current snapshot. Null = not reported yet (watcher
-  // disabled or first frame not landed).
-  const value = useMemo<KubeConfigContextValue>(() => ({ kubeConfig }), [kubeConfig]);
+  const { clusters } = useClusters();
+  const value = useMemo<KubeConfigContextValue>(() => {
+    if (clusters === null) return { kubeConfig: null };
+    // Only kubeconfig-sourced records carry a context; other sources don't
+    // belong in the context picker.
+    const present = clusters.filter((c) => c.status.source.kubeconfig?.isPresent && c.spec.source.kubeconfig);
+    return {
+      kubeConfig: {
+        currentContext:
+          present.find((c) => c.status.source.kubeconfig?.isDefault)?.spec.source.kubeconfig?.context ?? '',
+        contexts: present.map((c) => ({ name: c.spec.source.kubeconfig?.context ?? '' })),
+      },
+    };
+  }, [clusters]);
   return <KubeConfigCtx.Provider value={value}>{children}</KubeConfigCtx.Provider>;
 }
 

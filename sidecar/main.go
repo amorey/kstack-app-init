@@ -36,10 +36,11 @@ func main() {
 
 	sockPath := flag.String("socket", ipc.DefaultSocketPath(), "path to the IPC endpoint (Unix domain socket on Unix, named pipe on Windows) to listen on")
 	kubeconfigPath := flag.String("kubeconfig", "", "explicit kubeconfig path; empty uses the clientcmd default-loading rules ($KUBECONFIG / ~/.kube/config)")
-	// The Tauri host passes its app_local_data_dir() here so per-cluster SQLite
-	// caches land in the OS-correct per-machine data location. Standalone runs
-	// (tests, dev) may omit it; the cluster cache is then disabled.
-	dataDir := flag.String("data-dir", envOr("KSTACK_DATA_DIR", ""), "host-supplied app data dir for the per-cluster cluster cache (defaults to KSTACK_DATA_DIR; empty disables the cache)")
+	// The Tauri host passes its app_local_data_dir() here so app.db and the
+	// per-cluster SQLite caches land in the OS-correct per-machine data
+	// location. Required — app.New errors when it's empty, so a standalone run
+	// must supply one (e.g. a scratch dir).
+	dataDir := flag.String("data-dir", envOr("KSTACK_DATA_DIR", ""), "app data dir for app.db and the per-cluster caches (defaults to KSTACK_DATA_DIR; required)")
 	flag.Parse()
 
 	// Per-OS binding: AF_UNIX socket on Unix, named pipe on Windows.

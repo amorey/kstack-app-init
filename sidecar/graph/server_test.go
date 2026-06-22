@@ -15,17 +15,19 @@ import (
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/logging"
 )
 
-// TestPingQuery is the canary: a fresh server should answer `{ ping }` with "pong".
+// TestAuthStateQuery is the canary: a fresh server (signed-out fake auth)
+// should answer `{ authState { authenticated } }` with the signed-out state.
 // If this passes, the gqlgen wiring (schema -> resolver -> handler) is intact.
-func TestPingQuery(t *testing.T) {
-	h := graph.NewServer(&graph.Resolver{})
+func TestAuthStateQuery(t *testing.T) {
+	h := graph.NewServer(&graph.Resolver{Auth: newFakeAuth(auth.Identity{})})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
-	body := strings.NewReader(`{"query":"{ ping }"}`)
+	body := strings.NewReader(`{"query":"{ authState { authenticated } }"}`)
 	resp, err := http.Post(ts.URL+"/graphql", "application/json", body)
 	if err != nil {
 		t.Fatalf("POST /graphql: %v", err)
@@ -35,45 +37,16 @@ func TestPingQuery(t *testing.T) {
 	raw, _ := io.ReadAll(resp.Body)
 	var out struct {
 		Data struct {
-			Ping string `json:"ping"`
+			AuthState struct {
+				Authenticated bool `json:"authenticated"`
+			} `json:"authState"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(bytes.NewReader(raw)).Decode(&out); err != nil {
 		t.Fatalf("decode %s: %v", raw, err)
 	}
-	if out.Data.Ping != "pong" {
-		t.Fatalf("want ping=pong, got %q (raw=%s)", out.Data.Ping, raw)
-	}
-}
-
-// TestTickSubscription opens an SSE subscription to `tick` and asserts the
-// first two values are 1 and 2. Validates that the SSE transport is wired and
-// the Subscription resolver streams `event: next` frames.
-func TestTickSubscription(t *testing.T) {
-	h := graph.NewServer(&graph.Resolver{})
-	ts := httptest.NewServer(h)
-	defer ts.Close()
-
-	resp := openSSESubscription(t, ts.URL, "", "subscription { tick }")
-	defer resp.Body.Close() // ends the subscription; must run before ts.Close()
-	events := sseEvents(resp)
-
-	for want := 1; want <= 2; want++ {
-		ev := nextSSE(t, events)
-		if ev.event != "next" {
-			t.Fatalf("tick %d: want event=next, got %q (data=%s)", want, ev.event, ev.data)
-		}
-		var msg struct {
-			Data struct {
-				Tick int `json:"tick"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal([]byte(ev.data), &msg); err != nil {
-			t.Fatalf("decode %s: %v", ev.data, err)
-		}
-		if msg.Data.Tick != want {
-			t.Fatalf("tick %d: got %d (data=%s)", want, msg.Data.Tick, ev.data)
-		}
+	if out.Data.AuthState.Authenticated {
+		t.Fatalf("want authenticated=false, got true (raw=%s)", raw)
 	}
 }
 
@@ -125,15 +98,17 @@ func TestResolverErrorIsLogged(t *testing.T) {
 // fully unwound. This is the GraphQL half of the app's NotifyShutdown /
 // DrainWithContext shutdown surface.
 func TestGracefulShutdownEndsSSEStream(t *testing.T) {
-	srv := graph.NewServer(&graph.Resolver{})
+	// authStateWatch is the streaming canary: a fake auth emits the current
+	// snapshot on subscribe, then keeps the stream open until shutdown.
+	srv := graph.NewServer(&graph.Resolver{Auth: newFakeAuth(auth.Identity{})})
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp := openSSESubscription(t, ts.URL, "", "subscription { tick }")
+	resp := openSSESubscription(t, ts.URL, "", "subscription { authStateWatch { authenticated } }")
 	defer resp.Body.Close() // belt-and-suspenders; shutdown ends the stream
 	events := sseEvents(resp)
 
-	// Wait for one tick so we know the subscription is established.
+	// Wait for the first frame so we know the subscription is established.
 	if ev := nextSSE(t, events); ev.event != "next" {
 		t.Fatalf("want first event=next, got %q", ev.event)
 	}
@@ -143,9 +118,9 @@ func TestGracefulShutdownEndsSSEStream(t *testing.T) {
 	// real shutdown sequence).
 	srv.NotifyShutdown()
 
-	// The stream must terminate with a `complete` event (more ticks may
-	// still arrive first), proving the handler flushed its terminal frame
-	// on the shutdown-cancelled context rather than being cut mid-stream.
+	// The stream must terminate with a `complete` event, proving the handler
+	// flushed its terminal frame on the shutdown-cancelled context rather than
+	// being cut mid-stream.
 	for {
 		ev := nextSSE(t, events)
 		if ev.event == "complete" {

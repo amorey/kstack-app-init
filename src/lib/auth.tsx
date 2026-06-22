@@ -16,7 +16,7 @@
 // The renderer never holds tokens: the sidecar owns the OAuth flow + OS
 // keychain, and publishes the current auth state on the `authStateWatch`
 // subscription (current snapshot first, then deltas on sign-in / sign-out /
-// refresh). `login`/`logout` are thin `login`/`logout` mutations — the
+// refresh). `login`/`logout` are thin `authLoginStart`/`authLogout` mutations — the
 // resulting state change arrives back over the same subscription, so there's
 // one source of truth. Sign-in is non-blocking: the mutation returns as soon
 // as the sidecar opens the browser; the signed-in state lands later via the
@@ -56,15 +56,15 @@ const AuthStateWatchSubscription = graphql(`
   }
 `);
 
-const StartLoginMutation = graphql(`
-  mutation StartLogin {
-    startLogin
+const AuthLoginStartMutation = graphql(`
+  mutation AuthLoginStart {
+    authLoginStart
   }
 `);
 
-const LogoutMutation = graphql(`
-  mutation Logout {
-    logout
+const AuthLogoutMutation = graphql(`
+  mutation AuthLogout {
+    authLogout
   }
 `);
 
@@ -89,8 +89,8 @@ function toAuthState(s: AuthStateWatchSubscription['authStateWatch']): AuthState
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [{ data }] = useSubscription({ query: AuthStateWatchSubscription });
-  const [, runStartLogin] = useMutation(StartLoginMutation);
-  const [, runLogout] = useMutation(LogoutMutation);
+  const [, runStartLogin] = useMutation(AuthLoginStartMutation);
+  const [, runLogout] = useMutation(AuthLogoutMutation);
 
   // No frame yet → still loading, anonymous. Once the first snapshot lands the
   // state reflects it (the sidecar always emits a current snapshot first).

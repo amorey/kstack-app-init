@@ -25,7 +25,7 @@ use tokio::sync::watch;
 use crate::error::{AppError, Result};
 
 use super::graphql::{FrameSink, GraphqlResponse, QueryClient, SubscriptionClient};
-use super::grpc::{AuthStateStream, GrpcClient, WatchStream};
+use super::grpc::{AuthStateStream, GrpcClient};
 use super::ipc::{Endpoint, DEFAULT_CONNECT_BUDGET};
 use super::logs::{forward_sidecar_line, Severity};
 
@@ -81,8 +81,9 @@ pub struct SidecarService {
     ready_rx: watch::Receiver<bool>,
     query_client: QueryClient,
     subscription_client: SubscriptionClient,
-    /// gRPC channel to the sidecar's host-internal control surface (kube-context
-    /// watch + set), multiplexed over the same socket as GraphQL via h2c.
+    /// gRPC channel to the sidecar's host-internal control surface (auth-state
+    /// watch + login/logout, resync poke), multiplexed over the same socket as
+    /// GraphQL via h2c.
     grpc_client: GrpcClient,
 }
 
@@ -276,22 +277,6 @@ impl SidecarService {
     /// ids — see [`SubscriptionClient::unsubscribe`].
     pub async fn unsubscribe(&self, id: u64) {
         self.subscription_client.unsubscribe(id).await;
-    }
-
-    /// Persists `name` as the kubeconfig current-context over gRPC. Used by the
-    /// tray's context picker. The shared watcher fans the change out to the
-    /// gRPC watch stream and the webview's GraphQL subscription alike.
-    pub async fn set_current_context(&self, name: String) -> Result<()> {
-        self.grpc_client.set_current_context(name).await
-    }
-
-    /// Opens the host-internal kube-context watch stream over gRPC: a snapshot
-    /// first, then a fresh snapshot on every kubeconfig change. Drives the
-    /// tray's "Default Context" submenu. The caller pulls frames with
-    /// `stream.message().await`; an error / end-of-stream means the connection
-    /// dropped (e.g. sidecar restart) and the supervisor should re-open it.
-    pub async fn watch_kube_context(&self) -> Result<WatchStream> {
-        self.grpc_client.watch().await
     }
 
     /// Runs the synchronous login setup phase on the sidecar (loopback bind +

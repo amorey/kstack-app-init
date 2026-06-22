@@ -1,25 +1,35 @@
 // Package app is the sidecar's composition root and lifecycle owner. It builds
-// the shared instances (the kube-config watcher and, when a data dir is given,
-// the cluster-cache service), wires the GraphQL and gRPC servers, and
-// multiplexes them onto one h2c handler. main() stays thin: it binds the
-// listener and drives the shutdown surface this package exposes — NotifyShutdown
-// / DrainWithContext / Close — mirroring the server/app split used across the
-// kubetail and kstack-cloud services.
+// the shared instances (the kube-config watcher, beehive store, and controllers),
+// wires the GraphQL and gRPC servers, and multiplexes them onto one h2c
+// handler. main() stays thin: it binds the listener and drives the shutdown
+// surface this package exposes — NotifyShutdown / DrainWithContext / Close —
+// mirroring the server/app split used across the kubetail and kstack-cloud
+// services.
 package app
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"path/filepath"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+
+	"github.com/amorey/beehive"
+	beehivesqlite "github.com/amorey/beehive/sqlite"
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
 	grpcserver "github.com/kubetail-org/kstack-app/sidecar/grpc"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/cluster"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/clustercache"
+	cachestore "github.com/kubetail-org/kstack-app/sidecar/internal/controllers/clustercache/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/controllers/clustersource"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
@@ -39,10 +49,10 @@ type Config struct {
 	// KubeconfigPath is an explicit kubeconfig path; empty uses clientcmd's
 	// default-loading rules.
 	KubeconfigPath string
-	// DataDir is the host-supplied per-machine app data dir for the per-cluster
-	// SQLite cache. Empty disables the cluster cache (standalone/dev/test runs);
-	// the cluster-data resolvers then degrade to empty results. It also holds the
-	// cloud settings-sync file/queue when cloud is configured.
+	// DataDir is the host-supplied per-machine app data dir: it holds the
+	// beehive SQLite store, the per-cluster SQLite caches, and the cloud
+	// settings-sync file/queue. Required — New errors when empty, so the store
+	// can never be created relative to an arbitrary working directory.
 	DataDir string
 	// CloudURL is the kstack-cloud API base URL. Empty disables the cloud account
 	// subsystem (standalone/dev/test runs ⇒ signed-out, no network).
@@ -61,55 +71,88 @@ type Config struct {
 }
 
 // App owns the composed sidecar: one h2c handler fronting the GraphQL and gRPC
-// servers, plus the cluster-cache service and kube-config watcher they share. It
-// is an http.Handler; main() mounts it on the listener.
+// servers, plus the beehive store, controllers, and kube-config watcher they
+// share. It is an http.Handler; main() mounts it on the listener.
 type App struct {
-	handler           http.Handler
-	graphqlServer     *graph.Server
-	grpcServer        *grpcserver.Server
-	kubeConfigWatcher *k8shelpers.KubeConfigWatcher
-	clusterSvc        *cluster.Service
-	authSvc           auth.Service
-	cloudSvc          *cloud.Service
-	pokeSvc           *poke.Service
+	handler       http.Handler
+	graphqlServer *graph.Server
+	grpcServer    *grpcserver.Server
+	bh            *beehive.Beehive
+	bhStore       beehive.Store
+	bhStop        func(context.Context) error
+	importer      *clustersource.KubeconfigImporter
+	watcher       *k8shelpers.KubeConfigWatcher
+	cacheManager  *cachestore.Manager
+	clusterClient beehive.Client[controllers.ClusterSpec, controllers.ClusterConnectionStatus]
+	authSvc       auth.Service
+	cloudSvc      *cloud.Service
+	pokeSvc       *poke.Service
 }
 
-// New builds the composition root. The kube-config watcher is shared by the
-// GraphQL resolver and the gRPC KubeContextService, so a context switch over
-// either transport fans out to both.
+// New builds the composition root, wiring the beehive control-plane, auth, and
+// cloud subsystems into the GraphQL and gRPC servers that share one h2c socket.
 func New(cfg Config) (*App, error) {
-	// Always non-nil: the watcher tolerates missing/malformed kubeconfigs and
-	// seeds with an empty *api.Config so resolvers stay safe. Only fatal here is
-	// a kernel-level fsnotify failure (ENOMEM, ulimit).
-	kubeConfigWatcher, err := k8shelpers.NewKubeConfigWatcher(cfg.KubeconfigPath)
+	if cfg.DataDir == "" {
+		return nil, fmt.Errorf("data dir is required (--data-dir / KSTACK_DATA_DIR)")
+	}
+
+	// Open the beehive SQLite store at <data-dir>/beehive.db. The beehive instance
+	// owns the three resource kinds (ClusterSource, Cluster, ClusterCache) and
+	// drives their controllers level-triggered.
+	store, err := beehivesqlite.Open(filepath.Join(cfg.DataDir, "beehive.db"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open beehive store: %w", err)
+	}
+	bh, err := beehive.New(store)
+	if err != nil {
+		store.Close()
+		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
 	// The resync broadcaster is the shared, cross-subsystem poke bus. It owns the
 	// wall-clock gap detector (machine sleep/resume backstop) and accepts pokes
-	// from the host via the gRPC PokeService. App owns its lifecycle; the cluster
-	// cache and cloud settings engine subscribe to it. Built before cluster/cloud
-	// so it can be handed to both.
+	// from the host via the gRPC PokeService. Built before controllers so it can
+	// be handed to both.
 	pokeSvc := poke.New()
 
-	// The cluster-cache service owns the per-cluster SQLite cache, the durable
-	// registry, and the coordinator that keeps both in lockstep with the
-	// kube-config watcher. Enabled only when the host supplied a data dir; with
-	// an empty DataDir it degrades to a Reader that yields empty results and a
-	// nil ClusterManager, so the cluster resolvers stay safe. The poke bus lets a
-	// machine-wake / host network-on event restart its per-cluster reflectors.
-	clusterSvc, err := cluster.New(cfg.DataDir, kubeConfigWatcher, pokeSvc)
+	// The kubeconfig watcher publishes full *api.Config snapshots on every
+	// kubeconfig change (fsnotify + 100ms debounce). The importer and
+	// ClusterController consume it.
+	watcher, err := k8shelpers.NewKubeConfigWatcher(cfg.KubeconfigPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("init kubeconfig watcher: %w", err)
 	}
 
-	// The local-first auth/identity service. The sidecar owns the OS keychain
-	// directly (loopback OAuth already pins the browser to this machine), so we
-	// hand auth a keychain service name and it builds its own keyring store — no
-	// host channel. auth.New degrades when neither a service name nor a store is
-	// given (we always pass a name here, so it's signed-out until the user signs
-	// in); its Session surface is always non-nil and safe.
+	// Build beehive clients — one per kind. Resolvers and helpers hold these.
+	srcClient := beehive.NewClient[controllers.ClusterSourceSpec, controllers.ClusterSourceObjStatus](bh, controllers.ClusterSourceGroupKind)
+	clusterClient := beehive.NewClient[controllers.ClusterSpec, controllers.ClusterConnectionStatus](bh, controllers.ClusterGroupKind)
+	cacheClient := beehive.NewClient[controllers.ClusterCacheSpec, controllers.ClusterCacheStatus](bh, controllers.ClusterCacheGroupKind)
+
+	// The store.Manager owns the per-cluster SQLite cache files under
+	// <data-dir>/clusters/.
+	cacheManager := cachestore.NewManager(cfg.DataDir)
+
+	// Register the three controllers. The ClusterCacheController uses the
+	// production sync engine (real network).
+	srcCtrl := clustersource.NewClusterSourceController(clusterClient)
+	clusterCtrl := cluster.NewClusterController(watcher, cacheClient, nil, nil)
+	cacheCtrl := clustercache.NewClusterCacheController(watcher, clusterClient, cacheManager)
+
+	if err := beehive.Register(bh, controllers.ClusterSourceGroupKind, srcCtrl); err != nil {
+		return nil, fmt.Errorf("register ClusterSource controller: %w", err)
+	}
+	if err := beehive.Register(bh, controllers.ClusterGroupKind, clusterCtrl); err != nil {
+		return nil, fmt.Errorf("register Cluster controller: %w", err)
+	}
+	if err := beehive.Register(bh, controllers.ClusterCacheGroupKind, cacheCtrl); err != nil {
+		return nil, fmt.Errorf("register ClusterCache controller: %w", err)
+	}
+
+	// The kubeconfig importer creates/updates/orphans ClusterSource objects as
+	// the kubeconfig changes.
+	importer := clustersource.NewKubeconfigImporter(watcher, srcClient)
+
+	// The local-first auth/identity service.
 	keychainService := cfg.KeychainService
 	if keychainService == "" {
 		keychainService = defaultKeychainService
@@ -123,23 +166,21 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 
-	// The cloud-synced settings service depends on auth (for the token source and
-	// the session change signal). It degrades when CloudURL/DataDir are empty
-	// (standalone/test runs ⇒ no settings sync).
+	// The cloud-synced settings service depends on auth.
 	cloudSvc, err := cloud.New(cfg.DataDir, cfg.CloudURL, authSvc, pokeSvc)
 	if err != nil {
 		return nil, err
 	}
 
-	// The KubeConfigWatcher is shared with the gRPC KubeContextService so a
-	// context switch over either transport fans out to both.
 	graphqlServer := graph.NewServer(&graph.Resolver{
-		KubeConfigWatcher: kubeConfigWatcher,
-		ClusterData:       clusterSvc.Reader(),
-		ClusterManager:    clusterSvc.Manager(),
-		Auth:              authSvc,
+		ClusterClient: clusterClient,
+		CacheClient:   cacheClient,
+		SrcClient:     srcClient,
+		CacheManager:  cacheManager,
+		Auth:          authSvc,
 	})
-	grpcServer := grpcserver.NewServer(kubeConfigWatcher, authSvc, pokeSvc)
+
+	grpcServer := grpcserver.NewServer(authSvc, pokeSvc)
 
 	// Routing: the GraphQL server at /graphql.
 	mux := http.NewServeMux()
@@ -148,11 +189,7 @@ func New(cfg Config) (*App, error) {
 	// gRPC (host-internal control channel) shares the socket with GraphQL via
 	// h2c. The dispatcher routes requests matching grpcserver.IsGRPCRequest
 	// (HTTP/2 application/grpc) to the gRPC server and everything else (HTTP/1.1
-	// GraphQL POST/SSE, /control/*) to the mux above — grpc/ owns the "what is a
-	// gRPC request" rule, the composition here owns that the two surfaces share
-	// one socket. h2c.NewHandler serves HTTP/1.1 unchanged and upgrades only the
-	// HTTP/2 prior-knowledge preface (what the Rust tonic client sends), so SSE
-	// keeps its Flusher-backed writer and streams unbuffered.
+	// GraphQL POST/SSE, /control/*) to the mux above.
 	handler := h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if grpcserver.IsGRPCRequest(r) {
 			grpcServer.GRPC().ServeHTTP(w, r)
@@ -162,14 +199,18 @@ func New(cfg Config) (*App, error) {
 	}), &http2.Server{})
 
 	return &App{
-		handler:           handler,
-		graphqlServer:     graphqlServer,
-		grpcServer:        grpcServer,
-		kubeConfigWatcher: kubeConfigWatcher,
-		clusterSvc:        clusterSvc,
-		authSvc:           authSvc,
-		cloudSvc:          cloudSvc,
-		pokeSvc:           pokeSvc,
+		handler:       handler,
+		graphqlServer: graphqlServer,
+		grpcServer:    grpcServer,
+		bh:            bh,
+		bhStore:       store,
+		importer:      importer,
+		watcher:       watcher,
+		cacheManager:  cacheManager,
+		clusterClient: clusterClient,
+		authSvc:       authSvc,
+		cloudSvc:      cloudSvc,
+		pokeSvc:       pokeSvc,
 	}, nil
 }
 
@@ -178,30 +219,73 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.handler.ServeHTTP(w, r)
 }
 
-// Start launches the cluster-cache service's reconcile loop, bound to a context
-// derived from ctx so a cancel of ctx (or Close) stops it. Call once, before
-// serving.
-func (a *App) Start(ctx context.Context) {
+// Start launches the services' background loops. ctx reaches the poke and
+// cloud services (whose loops it can stop). Call once, before serving.
+func (a *App) Start(ctx context.Context) error {
+	// Start beehive (the controller harness + store subscription loop). ctx
+	// bounds startup only; the returned stop tears the control plane down at
+	// Close. The long-lived reconcile loops outlive ctx.
+	stop, err := a.bh.Start(ctx)
+	if err != nil {
+		return fmt.Errorf("start beehive: %w", err)
+	}
+	a.bhStop = stop
+
 	a.pokeSvc.Start(ctx)
-	a.clusterSvc.Start(ctx)
+
+	// Start the kubeconfig watcher; its fsnotify loop publishes snapshots.
+	a.watcher.Start()
+
+	// Start the importer; it subscribes to the watcher and seeds ClusterSource
+	// objects for every kubeconfig context.
+	a.importer.Start()
+
+	// Forward every poke to ClusterCache objects so running sync engines bounce.
+	go func() {
+		ch, unsub := a.pokeSvc.Subscribe()
+		defer unsub()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+				// Bump PokeSyncGeneration on all Cluster objects.
+				a.pokeAllClusters(ctx)
+			}
+		}
+	}()
+
 	a.cloudSvc.Start(ctx)
+	return nil
+}
+
+// pokeAllClusters increments PokeSyncGeneration on every Cluster object so the
+// ClusterCacheController bounces all running sync engines.
+func (a *App) pokeAllClusters(ctx context.Context) {
+	objs, err := a.clusterClient.List(ctx)
+	if err != nil {
+		return
+	}
+	for _, obj := range objs {
+		spec := obj.Spec
+		spec.PokeSyncGeneration++
+		_, _ = a.clusterClient.Update(ctx, obj.ID, spec)
+	}
 }
 
 // NotifyShutdown signals both transports' long-lived streams to close cleanly:
-// gRPC Watch handlers return (OK trailers flush) and SSE subscriptions flush
-// their terminal frame. Wire it into http.Server.RegisterOnShutdown so it fires
-// the moment Shutdown begins. The two transports are independent — neither
-// ordering nor BaseContext is involved — so a single fan-out is safe.
+// gRPC streaming handlers return (OK trailers flush) and SSE subscriptions flush
+// their terminal frame.
 func (a *App) NotifyShutdown() {
 	a.grpcServer.NotifyShutdown()
 	a.graphqlServer.NotifyShutdown()
 }
 
-// DrainWithContext waits for both transports' handlers to unwind (so their
-// terminal frames/trailers are flushed) or ctx to expire. Call after
-// http.Server.Shutdown, which has already drained the non-hijacked GraphQL
-// requests; this additionally waits on the hijacked h2c gRPC streams that
-// Shutdown does not track.
+// DrainWithContext waits for both transports' handlers to unwind or ctx to
+// expire. Call after http.Server.Shutdown.
 func (a *App) DrainWithContext(ctx context.Context) error {
 	errs := make(chan error, 2)
 	go func() { errs <- a.graphqlServer.DrainWithContext(ctx) }()
@@ -209,17 +293,26 @@ func (a *App) DrainWithContext(ctx context.Context) error {
 	return errors.Join(<-errs, <-errs)
 }
 
-// Close releases resources after DrainWithContext returns: it stops the gRPC
-// transports, closes the cluster-cache service (which stops the coordinator,
-// drains the per-cluster cache, and closes app.db), and closes the kube-config
-// watcher. The service is closed before the watcher so the coordinator's
-// reconcile loop — the watcher's only subscriber here — has stopped before its
-// source goes away. Safe to call without Start.
+// Close releases resources after DrainWithContext returns. Stops the gRPC
+// transports, stops the importer and watcher, stops beehive (all controllers
+// and engines) and closes its store, shuts down the cache manager, then closes
+// cloud and auth.
 func (a *App) Close() error {
 	a.grpcServer.Stop()
-	cloudErr := a.cloudSvc.Close()
-	clusterErr := a.clusterSvc.Close()
 	a.pokeSvc.Close()
-	a.kubeConfigWatcher.Close()
-	return errors.Join(cloudErr, clusterErr)
+	a.importer.Stop()
+	a.watcher.Close()
+	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if a.bhStop != nil {
+		_ = a.bhStop(stopCtx)
+	}
+	// beehive does not own the store's lifecycle, so close it ourselves — after
+	// the control plane has stopped, since its writers and watchers run against it.
+	var storeErr error
+	if a.bhStore != nil {
+		storeErr = a.bhStore.Close()
+	}
+	cacheErr := a.cacheManager.Shutdown(stopCtx)
+	return errors.Join(storeErr, cacheErr, a.cloudSvc.Close())
 }

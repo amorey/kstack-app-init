@@ -21,7 +21,6 @@ import (
 	grpcserver "github.com/kubetail-org/kstack-app/sidecar/grpc"
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/authpb"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 )
 
 // fakeAuthSvc is a hand-written auth.Service for the grpc server tests.
@@ -134,12 +133,8 @@ func newGRPCTestConn(t *testing.T, grpcSrv *grpcserver.Server) *grpc.ClientConn 
 // the first message is the current state (signed-out on subscribe), and after
 // StartLogin the next message delivers the authenticated identity.
 func TestAuthStateWatchSnapshotThenDelta(t *testing.T) {
-	w, err := k8shelpers.NewKubeConfigWatcher("")
-	require.NoError(t, err)
-	t.Cleanup(w.Close)
-
 	svc := newFakeAuthSvc(auth.Identity{Email: "ada@example.com", Name: "Ada"})
-	grpcSrv := grpcserver.NewServer(w, svc, nil)
+	grpcSrv := grpcserver.NewServer(svc, nil)
 	conn := newGRPCTestConn(t, grpcSrv)
 	t.Cleanup(grpcSrv.Stop)
 
@@ -169,19 +164,15 @@ func TestAuthStateWatchSnapshotThenDelta(t *testing.T) {
 // TestStartLoginAndLogoutRPC verifies the unary RPCs succeed on a functional
 // fake and that Logout causes the next watch to start signed-out.
 func TestStartLoginAndLogoutRPC(t *testing.T) {
-	w, err := k8shelpers.NewKubeConfigWatcher("")
-	require.NoError(t, err)
-	t.Cleanup(w.Close)
-
 	svc := signedInFakeAuthSvc(auth.Identity{Email: "ada@example.com"})
-	grpcSrv := grpcserver.NewServer(w, svc, nil)
+	grpcSrv := grpcserver.NewServer(svc, nil)
 	conn := newGRPCTestConn(t, grpcSrv)
 	t.Cleanup(grpcSrv.Stop)
 
 	client := authpb.NewAuthServiceClient(conn)
 
 	// StartLogin should succeed (fake does not error by default).
-	_, err = client.StartLogin(context.Background(), &authpb.StartLoginRequest{})
+	_, err := client.StartLogin(context.Background(), &authpb.StartLoginRequest{})
 	require.NoError(t, err)
 
 	// Logout should succeed.
@@ -198,14 +189,10 @@ func TestStartLoginAndLogoutRPC(t *testing.T) {
 
 // TestAuthRPCsNilServiceTolerant verifies that passing nil auth to NewServer
 // degrades safely: AuthStateWatch ends immediately (clean io.EOF), and the
-// unary RPCs return Unavailable — mirroring kubeContextServer's nil-watcher
-// behavior and the GraphQL resolver's nil-Auth degrade.
+// unary RPCs return Unavailable — mirroring the GraphQL resolver's nil-Auth
+// degrade.
 func TestAuthRPCsNilServiceTolerant(t *testing.T) {
-	w, err := k8shelpers.NewKubeConfigWatcher("")
-	require.NoError(t, err)
-	t.Cleanup(w.Close)
-
-	grpcSrv := grpcserver.NewServer(w, nil, nil)
+	grpcSrv := grpcserver.NewServer(nil, nil)
 	conn := newGRPCTestConn(t, grpcSrv)
 	t.Cleanup(grpcSrv.Stop)
 
@@ -232,12 +219,8 @@ func TestAuthRPCsNilServiceTolerant(t *testing.T) {
 // handler returns nil (grpc flushes OK trailers), the client sees io.EOF, and
 // DrainWithContext returns.
 func TestAuthStateWatchDrainsOnShutdown(t *testing.T) {
-	w, err := k8shelpers.NewKubeConfigWatcher("")
-	require.NoError(t, err)
-	t.Cleanup(w.Close)
-
 	svc := newFakeAuthSvc(auth.Identity{})
-	grpcSrv := grpcserver.NewServer(w, svc, nil)
+	grpcSrv := grpcserver.NewServer(svc, nil)
 	conn := newGRPCTestConn(t, grpcSrv)
 
 	client := authpb.NewAuthServiceClient(conn)

@@ -27,3 +27,6 @@ src-tauri/binaries/
 *.njsproj
 *.sln
 *.sw?
+
+# Agents
+.claude

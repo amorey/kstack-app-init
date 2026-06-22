@@ -43,7 +43,7 @@ const CHANNEL_DEPTH: usize = 16;
 /// app Quit cancels [`AppState::shutdown`] (or every source drops). Poke is
 /// best-effort: a failure is logged and swallowed, since the sidecar's own
 /// wall-clock detector still covers sleep. Mirrors the shape of the tray
-/// supervisors (`tray::spawn_kubeconfig_subscription`).
+/// account supervisor (`tray::spawn_authstate_subscription`).
 pub fn spawn_wake_poke_supervisor(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {

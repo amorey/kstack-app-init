@@ -2,19 +2,6 @@
 
 package model
 
-import (
-	"bytes"
-	"fmt"
-	"io"
-	"strconv"
-)
-
-// A snapshot of the user's authentication state. `authenticated` is the explicit sign-in signal; `identity` carries the verified claims and is non-null only when `authenticated` is true.
-type AuthState struct {
-	Authenticated bool      `json:"authenticated"`
-	Identity      *Identity `json:"identity,omitempty"`
-}
-
 // Streaming chat chunk. `delta` is the next piece of assistant text; `done` is true on the final frame (delta may be empty).
 type ChatChunk struct {
 	Delta string `json:"delta"`
@@ -30,162 +17,40 @@ type ChatMessageInput struct {
 	Content string `json:"content"`
 }
 
-// A cluster in the app's local registry. `uuid` is the cluster's `kube-system` namespace UID — stable across kubeconfig context renames and unique per cluster. A cluster stays listed even after it leaves the kubeconfig (so its cache can be inspected or cleaned up); the `present`/`cached`/`enabled` flags describe its current state.
-type Cluster struct {
-	UUID    string `json:"uuid"`
-	Name    string `json:"name"`
-	Context string `json:"context"`
-	// True when this entry matches the kubeconfig's `current-context`.
-	IsCurrent bool `json:"isCurrent"`
-	// Whether the user has syncing enabled for this cluster. Disabling freezes its cache (no longer browsable).
-	Enabled bool `json:"enabled"`
-	// True while the cluster's kube-context is present in the current kubeconfig.
-	Present bool `json:"present"`
-	// True when a local SQLite cache exists on disk for this cluster.
-	Cached bool `json:"cached"`
-	// On-disk size of the cache (sqlite + WAL/shm sidecars) in bytes; 0 when not cached.
-	CacheBytes int `json:"cacheBytes"`
-	// Unix-millis of the last time the cache received fresh data; 0 if never.
-	LastSyncedAt int `json:"lastSyncedAt"`
-	// Unix-millis of the last time this cluster's context was seen in the kubeconfig; 0 if never.
-	LastSeenInKubeconfigAt int `json:"lastSeenInKubeconfigAt"`
-}
-
-// A cached Deployment. Replica counts are the spec'd vs ready values.
-type Deployment struct {
-	ClusterUUID   string `json:"clusterUuid"`
-	Namespace     string `json:"namespace"`
-	Name          string `json:"name"`
-	UID           string `json:"uid"`
-	Replicas      int    `json:"replicas"`
-	ReadyReplicas int    `json:"readyReplicas"`
-	UpdatedAt     int    `json:"updatedAt"`
-}
-
-// A cached Kubernetes Event. Mirrors the dedicated `events` table; ordered by lastSeen DESC when listed.
-type Event struct {
-	ClusterUUID       string `json:"clusterUuid"`
-	UID               string `json:"uid"`
-	Type              string `json:"type"`
-	Reason            string `json:"reason"`
-	Message           string `json:"message"`
-	InvolvedKind      string `json:"involvedKind"`
-	InvolvedNamespace string `json:"involvedNamespace"`
-	InvolvedName      string `json:"involvedName"`
-	FirstSeen         int    `json:"firstSeen"`
-	LastSeen          int    `json:"lastSeen"`
-	Count             int    `json:"count"`
-}
-
-// The verified identity of the signed-in user, from the OIDC ID-token claims.
-type Identity struct {
-	Sub   string `json:"sub"`
-	Email string `json:"email"`
-	Name  string `json:"name"`
-}
-
-type KubeConfigWatchEvent struct {
-	Type   WatchEventType `json:"type"`
-	Object *KubeConfig    `json:"object,omitempty"`
+// The connecting principal's effective RBAC in one namespace (live
+// SelfSubjectRulesReview). Namespace-scoped (the API has no all-namespaces form)
+// and point-in-time — for UI/debugging, not authoritative for access decisions.
+type ClusterPermissions struct {
+	// The namespace these rules were evaluated for.
+	Namespace string `json:"namespace"`
+	// Allowed resource rules (verbs × apiGroups × resources).
+	ResourceRules []*ResourceRule `json:"resourceRules"`
+	// Allowed non-resource rules (verbs × URLs), e.g. /healthz.
+	NonResourceRules []*NonResourceRule `json:"nonResourceRules"`
+	// True if some authorizers couldn't be evaluated, so the rule set may be incomplete.
+	Incomplete bool `json:"incomplete"`
 }
 
 type Mutation struct {
 }
 
-// A cached Node. `ready` is true when the node has a Ready=True condition.
-type Node struct {
-	ClusterUUID string `json:"clusterUuid"`
-	Name        string `json:"name"`
-	UID         string `json:"uid"`
-	Ready       bool   `json:"ready"`
-	UpdatedAt   int    `json:"updatedAt"`
-}
-
-// A single cached pod from a cluster's local SQLite mirror. `clusterUuid` identifies which cluster this row belongs to; all other fields mirror the underlying object.
-type Pod struct {
-	ClusterUUID string `json:"clusterUuid"`
-	Namespace   string `json:"namespace"`
-	Name        string `json:"name"`
-	UID         string `json:"uid"`
-	Phase       string `json:"phase"`
-	NodeName    string `json:"nodeName"`
-	UpdatedAt   int    `json:"updatedAt"`
+// A non-resource RBAC rule: the verbs the principal may use against non-resource URLs (e.g. /healthz).
+type NonResourceRule struct {
+	Verbs           []string `json:"verbs"`
+	NonResourceUrls []string `json:"nonResourceUrls"`
 }
 
 type Query struct {
 }
 
-// A cached Service. Mirrors the columns in the local SQLite mirror.
-type Service struct {
-	ClusterUUID string `json:"clusterUuid"`
-	Namespace   string `json:"namespace"`
-	Name        string `json:"name"`
-	UID         string `json:"uid"`
-	Type        string `json:"type"`
-	ClusterIP   string `json:"clusterIp"`
-	UpdatedAt   int    `json:"updatedAt"`
+// A resource-scoped RBAC rule: the verbs the principal may use on the given apiGroups/resources (optionally narrowed to named instances).
+type ResourceRule struct {
+	Verbs     []string `json:"verbs"`
+	APIGroups []string `json:"apiGroups"`
+	Resources []string `json:"resources"`
+	// Specific resource names this rule is restricted to; empty means all.
+	ResourceNames []string `json:"resourceNames"`
 }
 
 type Subscription struct {
-}
-
-type WatchEventType string
-
-const (
-	WatchEventTypeAdded    WatchEventType = "ADDED"
-	WatchEventTypeModified WatchEventType = "MODIFIED"
-	WatchEventTypeDeleted  WatchEventType = "DELETED"
-	WatchEventTypeBookmark WatchEventType = "BOOKMARK"
-	WatchEventTypeError    WatchEventType = "ERROR"
-)
-
-var AllWatchEventType = []WatchEventType{
-	WatchEventTypeAdded,
-	WatchEventTypeModified,
-	WatchEventTypeDeleted,
-	WatchEventTypeBookmark,
-	WatchEventTypeError,
-}
-
-func (e WatchEventType) IsValid() bool {
-	switch e {
-	case WatchEventTypeAdded, WatchEventTypeModified, WatchEventTypeDeleted, WatchEventTypeBookmark, WatchEventTypeError:
-		return true
-	}
-	return false
-}
-
-func (e WatchEventType) String() string {
-	return string(e)
-}
-
-func (e *WatchEventType) UnmarshalGQL(v any) error {
-	str, ok := v.(string)
-	if !ok {
-		return fmt.Errorf("enums must be strings")
-	}
-
-	*e = WatchEventType(str)
-	if !e.IsValid() {
-		return fmt.Errorf("%s is not a valid WatchEventType", str)
-	}
-	return nil
-}
-
-func (e WatchEventType) MarshalGQL(w io.Writer) {
-	fmt.Fprint(w, strconv.Quote(e.String()))
-}
-
-func (e *WatchEventType) UnmarshalJSON(b []byte) error {
-	s, err := strconv.Unquote(string(b))
-	if err != nil {
-		return err
-	}
-	return e.UnmarshalGQL(s)
-}
-
-func (e WatchEventType) MarshalJSON() ([]byte, error) {
-	var buf bytes.Buffer
-	e.MarshalGQL(&buf)
-	return buf.Bytes(), nil
 }

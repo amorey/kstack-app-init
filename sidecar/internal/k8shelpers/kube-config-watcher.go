@@ -1,4 +1,4 @@
-// Copyright 2024 The Kubetail Authors
+// Copyright 2026 The Kstack Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 package k8shelpers
 
 import (
-	"fmt"
 	"log/slog"
 	"path/filepath"
 	"sync"
@@ -27,14 +26,19 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
+// HOMEPATH_TILDE is the leading "~" that denotes the user's home directory in
+// a kubeconfig path before expansion.
 const HOMEPATH_TILDE = "~"
 
-// Subscription represents an active subscription that can be cancelled
-type Subscription = *watch.Receiver[*api.Config]
+// KubeConfigSubscription is a handle to an active subscription on a
+// KubeConfigWatcher, delivering each new *api.Config and cancellable via the
+// receiver's own close.
+type KubeConfigSubscription = *watch.Receiver[*api.Config]
 
-// Represents KubeConfigWatcher
+// KubeConfigWatcher loads the user's kubeconfig and watches its precedence
+// paths for changes, publishing each reloaded *api.Config to subscribers.
 type KubeConfigWatcher struct {
-	kubeConfig   *api.Config
+	current      *api.Config
 	loadingRules *clientcmd.ClientConfigLoadingRules
 	watcher      *fsnotify.Watcher
 	hub          *watch.Hub[*api.Config]
@@ -44,6 +48,8 @@ type KubeConfigWatcher struct {
 	// emit events for every child).
 	watchedPaths map[string]struct{}
 	mu           sync.RWMutex
+	// wg tracks the event-loop goroutine Start launches, so Close can join it.
+	wg sync.WaitGroup
 }
 
 // NewKubeConfigWatcher constructs a watcher that always returns a usable
@@ -76,7 +82,7 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 	//
 	// inotify and ReadDirectoryChangesW deliver child events natively
 	// when a directory is watched; macOS kqueue does it via fsnotify's
-	// watchDirectoryFiles helper. The start() filter trims dir-level
+	// watchDirectoryFiles helper. The eventLoop filter trims dir-level
 	// noise down to just our precedence paths.
 	watchedPaths := make(map[string]struct{}, len(loadingRules.GetLoadingPrecedence()))
 	watchedDirs := make(map[string]struct{})
@@ -111,9 +117,9 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 		cfg = &api.Config{}
 	}
 
-	hub := watch.New[*api.Config](cfg)
+	hub := watch.New(cfg)
 	w := &KubeConfigWatcher{
-		kubeConfig:   cfg,
+		current:      cfg,
 		loadingRules: loadingRules,
 		watcher:      watcher,
 		hub:          hub,
@@ -121,97 +127,46 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 		watchedPaths: watchedPaths,
 	}
 
-	// Start event listeners
-	go w.start()
-
 	return w, nil
 }
 
-// Get
+// Get returns the most recently loaded kubeconfig, or an empty *api.Config if
+// none has been loaded yet (never nil).
 func (w *KubeConfigWatcher) Get() *api.Config {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	if w.kubeConfig == nil {
+	if w.current == nil {
 		return &api.Config{}
 	}
 
-	return w.kubeConfig
+	return w.current
 }
 
-// SetCurrentContext persists `name` as the kubeconfig current-context.
-//
-// It validates that the context exists in the loaded config (rejecting
-// empty/unknown names before touching disk), then writes the change via
-// clientcmd.ModifyConfig — not WriteToFile, which would flatten a
-// multi-file kubeconfig into one file and lose each entry's
-// locationOfOrigin. ModifyConfig writes the minimal current-context delta
-// to the file that already defines it (or, if unset, the first file in
-// precedence), matching `kubectl config use-context` semantics.
-//
-// The in-memory snapshot is updated and republished to subscribers
-// immediately rather than relying on the debounced fsnotify echo, so the
-// switch is delivered deterministically. The echo that follows reloads an
-// identical config — an idempotent, harmless second publish.
-func (w *KubeConfigWatcher) SetCurrentContext(name string) error {
-	updated, err := w.writeCurrentContext(name)
-	if err != nil {
-		return err
-	}
-
-	// Publish after releasing the lock so a slow receiver can't stall the
-	// fan-out while we hold w.mu (mirrors start()'s send-without-lock).
-	w.tx.Send(updated) //nolint:errcheck
-
-	return nil
-}
-
-// writeCurrentContext validates `name`, persists it as the current-context,
-// and updates the in-memory snapshot — all under the write lock. It returns
-// the new config for SetCurrentContext to publish once the lock is released.
-func (w *KubeConfigWatcher) writeCurrentContext(name string) (*api.Config, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.kubeConfig == nil {
-		return nil, fmt.Errorf("no kubeconfig loaded")
-	}
-	if name == "" {
-		return nil, fmt.Errorf("context name is empty")
-	}
-	if _, ok := w.kubeConfig.Contexts[name]; !ok {
-		return nil, fmt.Errorf("unknown context %q", name)
-	}
-
-	// ModifyConfig diffs against what's on disk and writes only the
-	// current-context change to the right file. Pass a copy so a write
-	// failure can't leave the in-memory CurrentContext mutated.
-	updated := w.kubeConfig.DeepCopy()
-	updated.CurrentContext = name
-
-	pathOptions := clientcmd.NewDefaultPathOptions()
-	pathOptions.LoadingRules = w.loadingRules
-	if err := clientcmd.ModifyConfig(pathOptions, *updated, false); err != nil {
-		return nil, err
-	}
-
-	w.kubeConfig = updated
-	return updated, nil
-}
-
-// Subscribe
-func (w *KubeConfigWatcher) Subscribe() Subscription {
+// Subscribe registers a new subscriber and returns its handle. The subscriber
+// receives the current config immediately, then each reload thereafter.
+func (w *KubeConfigWatcher) Subscribe() KubeConfigSubscription {
 	return w.hub.Receiver()
 }
 
-// Close
-func (w *KubeConfigWatcher) Close() {
-	w.watcher.Close()
-	w.tx.Close()
+// Start launches the watcher's event-loop goroutine.
+func (w *KubeConfigWatcher) Start() {
+	w.wg.Go(w.eventLoop)
 }
 
-// Start
-func (w *KubeConfigWatcher) start() {
+// Close stops the fsnotify watcher (which ends the event loop), waits for the
+// loop to exit, and tears down the publish hub, ending all subscriptions.
+func (w *KubeConfigWatcher) Close() error {
+	err := w.watcher.Close()
+	w.wg.Wait()
+	w.tx.Close()
+	return err
+}
+
+// eventLoop drains fsnotify events, filters them down to the watched
+// precedence paths, debounces bursts, and reloads + republishes the config on
+// each settled change. It returns when the fsnotify watcher is closed.
+func (w *KubeConfigWatcher) eventLoop() {
 	var debounceTimer *time.Timer
 	var debounceDelay = 100 * time.Millisecond
 
@@ -262,7 +217,8 @@ func (w *KubeConfigWatcher) start() {
 	}
 }
 
-// Reload config
+// reloadConfig re-resolves the kubeconfig from the loading rules and stores it
+// as the current config, returning the freshly loaded value.
 func (w *KubeConfigWatcher) reloadConfig() (*api.Config, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -271,7 +227,7 @@ func (w *KubeConfigWatcher) reloadConfig() (*api.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	w.kubeConfig = cfg
+	w.current = cfg
 
 	return cfg, nil
 }

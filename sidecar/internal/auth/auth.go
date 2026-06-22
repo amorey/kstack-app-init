@@ -18,7 +18,7 @@
 // OIDC protocol layer (auth/oauth) — a deep module (PKCE, JWKS verification,
 // revocation, token exchange/refresh) that auth builds a Client from and drives.
 // auth re-exports oauth's value types (Token, Identity) via the aliases below so
-// callers keep naming them auth.Token / auth.Identity. Like internal/cluster and
+// callers keep naming them auth.Token / auth.Identity. Like internal/kube and
 // internal/cloud, it is fronted by one composition owner (Service) and degrades
 // gracefully when the host hasn't wired a credentials store (then it's signed-out,
 // login errors, logout is a no-op, and TokenSource is nil).

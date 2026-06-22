@@ -16,8 +16,8 @@ sidecar:
 # builds need no system install).
 proto: proto-go proto-rust
 
-# Go: protoc-gen-go + protoc-gen-go-grpc via the //go:generate directive in
-# sidecar/grpc/kubecontextpb. One-time tooling for regenerating the committed
+# Go: protoc-gen-go + protoc-gen-go-grpc via the //go:generate directives in
+# sidecar/grpc/authpb and sidecar/grpc/pokepb. One-time tooling for regenerating the committed
 # Go bindings: install `protoc`, then `go install
 # google.golang.org/protobuf/cmd/protoc-gen-go` and `go install
 # google.golang.org/grpc/cmd/protoc-gen-go-grpc` (versions pinned in

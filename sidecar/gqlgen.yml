@@ -42,14 +42,92 @@ models:
   KubeConfigExtensions:
     model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfigExtensions
 
+  # --- Cluster ---
+  # The GraphQL Cluster types bind straight to the controllers domain types.
+  # ClusterStatus is a thin model.ClusterStatus wrapper (embedded
+  # controllers.ClusterStatus + the ClusterID) because its cache field resolver
+  # needs the cluster's ID and a child resolver only sees its own obj.
+  Cluster:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.Cluster
+    fields:
+      status:
+        resolver: true
+
+  ClusterSpec:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterSpec
+
+  ClusterSource:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterSource
+
+  ClusterSourceKubeconfig:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterSourceKubeconfig
+
+  ClusterSourceStatus:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterSourceStatus
+
+  ClusterStatus:
+    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.ClusterStatus
+    fields:
+      cache:
+        resolver: true
+
+  ClusterServer:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterServer
+
+  ClusterKubeconfig:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.KubeconfigStatus
+
+  ClusterPrincipal:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterPrincipal
+    fields:
+      permissions:
+        resolver: true
+
+  # The conditions ride the wire as-is (the controllers domain shapes; the
+  # webview derives display state from type/status/reason).
+  ClusterCondition:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterCondition
+
+  ConditionStatus:
+    model: github.com/amorey/beehive.ConditionStatus
+
+  ClusterSyncStatus:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterCacheStatus
+
+  ClusterCache:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.CacheStats
+
+  CachedResource:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/controllers.CachedResourceStats
+
+  # --- Auth ---
+  # Bind the GraphQL auth types straight to the auth domain types so the
+  # resolvers need no field-by-field mapper. Only schema fields are exposed —
+  # State.Tokens never reaches the wire — and Identity's `sub` claim maps onto
+  # the domain's UserID field.
+  AuthState:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/auth.State
+
+  Identity:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/auth.Identity
+    fields:
+      sub:
+        fieldName: UserID
+
   # --- gqlgen ---
   ID:
     model:
       - github.com/99designs/gqlgen/graphql.ID
       - k8s.io/apimachinery/pkg/types.UID
+      - github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterID
 
   Int:
     model:
       - github.com/99designs/gqlgen/graphql.Int
       - github.com/99designs/gqlgen/graphql.Int64
       - github.com/99designs/gqlgen/graphql.Int32
+
+  String:
+    model:
+      - github.com/99designs/gqlgen/graphql.String
+      - github.com/kubetail-org/kstack-app/sidecar/internal/controllers.ClusterConditionType
