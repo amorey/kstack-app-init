@@ -41,6 +41,13 @@ type Row = {
   isCurrent?: boolean;
   cacheBytes?: number;
   lastSyncedAt?: string;
+  // The live `Connected` condition the connection column reads. Defaults to
+  // 'True' (reachable); set 'False' to model a dropped connection (internet
+  // off / probe failed), 'Unknown' for not-yet-probed.
+  connected?: 'True' | 'False' | 'Unknown';
+  // Model an engine-level sync failure (Synced=False/SyncFailed). Defaults to a
+  // healthy Synced=True/Watching condition.
+  syncFailed?: boolean;
 };
 
 function pushClusters(rows: Row[]) {
@@ -67,7 +74,15 @@ function pushClusters(rows: Row[]) {
                 },
               },
               server: { uid: r.uuid || null },
-              syncStatus: { lastSyncedAt: r.lastSyncedAt ?? null },
+              conditions: [{ type: 'Connected', status: r.connected ?? 'True', reason: '' }],
+              syncStatus: {
+                conditions: [
+                  r.syncFailed
+                    ? { type: 'Synced', status: 'False', reason: 'SyncFailed' }
+                    : { type: 'Synced', status: 'True', reason: 'Watching' },
+                ],
+                lastSyncedAt: r.lastSyncedAt ?? null,
+              },
               cache: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
             },
           })),
@@ -187,8 +202,19 @@ describe('ClusterSyncPanel', () => {
 
   it('shows a short connection status for each cluster', async () => {
     await openWith([
-      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, isCurrent: true },
-      { uuid: '', name: 'minikube', enabled: false, present: true, cached: false },
+      {
+        uuid: 'u-prod',
+        name: 'prod-us',
+        enabled: true,
+        present: true,
+        cached: true,
+        isCurrent: true,
+        connected: 'True',
+      },
+      // Previously reachable but now unreachable (e.g. internet off): the
+      // Connected condition flips to False even though server.uid lingers.
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+      { uuid: '', name: 'minikube', enabled: false, present: true, cached: false, connected: 'Unknown' },
       { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true },
     ]);
 
@@ -197,8 +223,34 @@ describe('ClusterSyncPanel', () => {
     const orphaned = screen.getByRole('rowgroup', { name: /orphaned/i });
 
     expect(within(active).getByRole('cell', { name: 'Active' })).toBeInTheDocument(); // reachable
-    expect(within(active).getByRole('cell', { name: 'Error' })).toBeInTheDocument(); // probe failed
+    expect(within(active).getByRole('cell', { name: 'Disconnected' })).toBeInTheDocument(); // connection dropped
+    expect(within(active).getByRole('cell', { name: 'Connecting' })).toBeInTheDocument(); // not yet probed
     expect(within(orphaned).getByRole('cell', { name: 'Unavailable' })).toBeInTheDocument(); // gone
+  });
+
+  it('reflects the live sync state, not just the enabled toggle', async () => {
+    await openWith([
+      // Enabled + connected + watching → Syncing.
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, connected: 'True' },
+      // Enabled but disconnected: the engine keeps a stale Watching state, so
+      // gate on the connection — this is Stalled, not Syncing.
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+      // Enabled + connected but the engine reported an engine-level failure.
+      {
+        uuid: 'u-broke',
+        name: 'broke',
+        enabled: true,
+        present: true,
+        cached: true,
+        connected: 'True',
+        syncFailed: true,
+      },
+    ]);
+
+    const active = await screen.findByRole('rowgroup', { name: /active/i });
+    expect(within(active).getByRole('cell', { name: 'Syncing' })).toBeInTheDocument();
+    expect(within(active).getByRole('cell', { name: 'Stalled' })).toBeInTheDocument();
+    expect(within(active).getByRole('cell', { name: 'Error' })).toBeInTheDocument();
   });
 
   it('omits a row group that has no members', async () => {

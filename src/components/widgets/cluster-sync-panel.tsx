@@ -84,22 +84,44 @@ function displayName(c: Cluster): string {
   return c.spec.name || c.spec.source.kubeconfig?.context || c.id;
 }
 
-// The Connection column: can we currently reach the cluster's API? A reachable,
-// identified context is Active (green); one we can't reach (its UID probe failed)
-// is an Error (red); an orphan has no live cluster to connect to (Unavailable).
-function connectionStatus(c: Cluster, group: Group): { label: string; tone: Tone } {
-  if (group === 'orphaned') return { label: 'Unavailable', tone: 'muted' };
-  if (isPending(c)) return { label: 'Error', tone: 'error' };
-  return { label: 'Active', tone: 'ok' };
+// Look up a Kubernetes-style status condition by its type; undefined if absent.
+function findCondition<T extends { type: string }>(conditions: T[], type: string): T | undefined {
+  return conditions.find((cond) => cond.type === type);
 }
 
-// Sync status: an orphan isn't syncing (its cluster is gone — "Stopped", not
+// The Connection column: can we currently reach the cluster's API? This derives
+// from the live `Connected` condition the sidecar publishes (not the sticky
+// `server.uid`, which records the last *successful* probe and never clears —
+// so a dropped connection would otherwise keep reading "Active"). True → Active
+// (green); False → Disconnected (red, e.g. internet off / probe failed);
+// Unknown or not-yet-probed → Connecting (muted); an orphan has no live cluster
+// to connect to (Unavailable).
+function connectionStatus(c: Cluster, group: Group): { label: string; tone: Tone } {
+  if (group === 'orphaned') return { label: 'Unavailable', tone: 'muted' };
+  const connected = findCondition(c.status.conditions, 'Connected');
+  if (connected?.status === 'True') return { label: 'Active', tone: 'ok' };
+  if (connected?.status === 'False') return { label: 'Disconnected', tone: 'error' };
+  return { label: 'Connecting', tone: 'muted' };
+}
+
+// Sync status. An orphan isn't syncing (its cluster is gone — "Stopped", not
 // repeating the group's "Orphaned" header); a pending context can't sync yet;
-// otherwise it's Syncing (enabled) or Paused (off).
+// sync turned off is "Paused". For an enabled, identified cluster we reflect
+// the actual sync state, but the engine's own signal isn't enough on its own:
+// per-driver watch failures are retried in the background, so a dropped
+// connection leaves the engine reporting a stale "Watching" rather than an
+// error. So gate on the live `Connected` condition first — disconnected sync
+// is "Stalled" (engine retrying, no data flowing) — then surface an
+// engine-level "SyncFailed" as an Error, otherwise it's Syncing.
 function statusOf(c: Cluster, group: Group): { label: string; tone: Tone } {
   if (group === 'orphaned') return { label: 'Stopped', tone: 'muted' };
   if (isPending(c)) return { label: 'Not synced', tone: 'muted' };
-  return c.spec.isSyncEnabled ? { label: 'Syncing', tone: 'ok' } : { label: 'Paused', tone: 'muted' };
+  if (!c.spec.isSyncEnabled) return { label: 'Paused', tone: 'muted' };
+  const connected = findCondition(c.status.conditions, 'Connected');
+  if (connected?.status === 'False') return { label: 'Stalled', tone: 'muted' };
+  const synced = findCondition(c.status.syncStatus.conditions, 'Synced');
+  if (synced?.reason === 'SyncFailed') return { label: 'Error', tone: 'error' };
+  return { label: 'Syncing', tone: 'ok' };
 }
 
 // A database icon with a diagonal line through it — "clear the cache".
