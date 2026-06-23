@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -157,21 +156,27 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.handler.ServeHTTP(w, r)
 }
 
-// Start launches the services' background loops. ctx reaches the poke and
-// cloud services (whose loops it can stop). Call once, before serving.
-func (a *App) Start(ctx context.Context) error {
+// Start launches the services' background loops. ctx bounds startup only; the
+// returned stop func accepts a drain-deadline context, blocks until all
+// background work finishes, and must be called before Close.
+func (a *App) Start(ctx context.Context) (func(context.Context) error, error) {
 	a.pokeSvc.Start(ctx)
 
 	// Start the cluster service: it starts beehive (the controller harness) and
 	// the kubeconfig watcher, then the kubeconfig importer (seeds ClusterSource
 	// objects per context) and the poke→sync forwarder (bumps PokeSyncGeneration
 	// on every Cluster so running sync engines bounce).
-	if err := a.clusterSvc.Start(ctx); err != nil {
-		return fmt.Errorf("start cluster service: %w", err)
+	clusterSvcStop, err := a.clusterSvc.Start(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("start cluster service: %w", err)
 	}
 
 	a.cloudSvc.Start(ctx)
-	return nil
+
+	stop := func(ctx context.Context) error {
+		return errors.Join(clusterSvcStop(ctx), a.cloudSvc.Close())
+	}
+	return stop, nil
 }
 
 // NotifyShutdown signals both transports' long-lived streams to close cleanly:
@@ -191,16 +196,10 @@ func (a *App) DrainWithContext(ctx context.Context) error {
 	return errors.Join(<-errs, <-errs)
 }
 
-// Close releases resources after DrainWithContext returns. Stops the gRPC
-// transports, closes the poke broadcaster, then closes the cluster service and
-// cloud. The cluster service owns the full teardown order internally (close
-// watcher → stop writers → stop controllers/engines → shut the cache → close the
-// store), so app no longer sequences it.
+// Close releases OS resources after Stop returns: stops the gRPC transports,
+// closes the poke broadcaster, and closes the cluster store.
 func (a *App) Close() error {
 	a.grpcServer.Stop()
 	a.pokeSvc.Close()
-	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	clusterErr := a.clusterSvc.Close(stopCtx)
-	return errors.Join(clusterErr, a.cloudSvc.Close())
+	return a.clusterSvc.Close()
 }

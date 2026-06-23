@@ -29,30 +29,32 @@ import (
 )
 
 // newTestImporter builds a KubeconfigImporter against a fresh beehive
-// (no controllers registered — the importer only calls srcClient).
+// (no-op controllers — the importer only writes Cluster specs).
 func newTestImporter(t *testing.T, cfg *api.Config) *cluster.KubeconfigImporter {
 	t.Helper()
 	bh := testutil.NewTestBeehive(t)
-	srcClient := beehive.NewClient[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus](bh, cluster.ClusterSourceGroupKind)
+	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
 	w := testutil.NewStaticWatcher(t, cfg)
-	return cluster.NewKubeconfigImporter(w, srcClient)
+	return cluster.NewKubeconfigImporter(w, clusterClient)
 }
 
-func TestImporterNewContextCreatesClusterSource(t *testing.T) {
+func TestImporterNewContextCreatesCluster(t *testing.T) {
 	ctx := context.Background()
 	cfg := testutil.TestKubeConfig("alpha")
 	im := newTestImporter(t, cfg)
 
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
 
-	objs, err := im.SourceClient().List(ctx)
-	require.NoError(t, err)
-	require.Len(t, objs, 1)
-	assert.Equal(t, "alpha", objs[0].Spec.ContextName)
-	assert.Equal(t, "alpha-cluster", objs[0].Spec.ClusterName)
-	assert.Equal(t, "alpha-user", objs[0].Spec.UserName)
-	assert.True(t, objs[0].Spec.IsPresent)
-	assert.True(t, objs[0].Spec.IsDefault)
+	obj := mustSingleObj(t, im.ClusterClient())
+	require.NotNil(t, obj.Spec.Source.Kubeconfig)
+	assert.Equal(t, "alpha", obj.Spec.Source.Kubeconfig.Context)
+	assert.True(t, obj.Spec.IsActive)
+	assert.True(t, obj.Spec.IsSyncEnabled)
+	require.NotNil(t, obj.Spec.SourceObs)
+	assert.Equal(t, "alpha-cluster", obj.Spec.SourceObs.Cluster)
+	assert.Equal(t, "alpha-user", obj.Spec.SourceObs.User)
+	assert.True(t, obj.Spec.SourceObs.IsPresent)
+	assert.True(t, obj.Spec.SourceObs.IsDefault)
 }
 
 func TestImporterDepartedContextSetsNotPresent(t *testing.T) {
@@ -66,10 +68,9 @@ func TestImporterDepartedContextSetsNotPresent(t *testing.T) {
 	empty := &api.Config{Contexts: map[string]*api.Context{}}
 	require.NoError(t, im.ReconcileClusterSet(ctx, empty))
 
-	objs, err := im.SourceClient().List(ctx)
-	require.NoError(t, err)
-	require.Len(t, objs, 1, "departed context must not be deleted, only orphaned")
-	assert.False(t, objs[0].Spec.IsPresent)
+	obj := mustSingleObj(t, im.ClusterClient())
+	require.NotNil(t, obj.Spec.SourceObs, "departed context must not be deleted, only orphaned")
+	assert.False(t, obj.Spec.SourceObs.IsPresent)
 }
 
 func TestImporterReturningContextRevivesInPlace(t *testing.T) {
@@ -78,17 +79,18 @@ func TestImporterReturningContextRevivesInPlace(t *testing.T) {
 	im := newTestImporter(t, cfg)
 
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
-	origID := mustSingleObj(t, im.SourceClient()).ID
+	origID := mustSingleObj(t, im.ClusterClient()).ID
 
 	// Orphan it.
 	require.NoError(t, im.ReconcileClusterSet(ctx, &api.Config{Contexts: map[string]*api.Context{}}))
 
 	// Revive.
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
-	obj := mustSingleObj(t, im.SourceClient())
+	obj := mustSingleObj(t, im.ClusterClient())
 
-	assert.Equal(t, origID, obj.ID, "same object ID: revived in-place, no new row")
-	assert.True(t, obj.Spec.IsPresent)
+	assert.Equal(t, origID, obj.ID, "same object ID: revived in-place, no new cluster")
+	require.NotNil(t, obj.Spec.SourceObs)
+	assert.True(t, obj.Spec.SourceObs.IsPresent)
 }
 
 func TestImporterUnchangedSnapshotWritesNothing(t *testing.T) {
@@ -97,15 +99,15 @@ func TestImporterUnchangedSnapshotWritesNothing(t *testing.T) {
 	im := newTestImporter(t, cfg)
 
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
-	obj1 := mustSingleObj(t, im.SourceClient())
+	obj1 := mustSingleObj(t, im.ClusterClient())
 
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
-	obj2 := mustSingleObj(t, im.SourceClient())
+	obj2 := mustSingleObj(t, im.ClusterClient())
 
 	assert.Equal(t, obj1.Generation, obj2.Generation, "unchanged snapshot must not bump generation")
 }
 
-func mustSingleObj(t *testing.T, cl beehive.Client[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus]) *beehive.Object[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus] {
+func mustSingleObj(t *testing.T, cl beehive.Client[cluster.ClusterSpec, cluster.ClusterConnectionStatus]) *beehive.Object[cluster.ClusterSpec, cluster.ClusterConnectionStatus] {
 	t.Helper()
 	objs, err := cl.List(context.Background())
 	require.NoError(t, err)

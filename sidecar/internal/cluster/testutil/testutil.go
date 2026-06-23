@@ -100,13 +100,12 @@ func (c *NoopController[Spec, Status]) Reconcile(_ context.Context, _ *beehive.O
 	return beehive.Result{}, nil
 }
 
-// NewTestBeehive builds a beehive with all three controller kinds registered as
+// NewTestBeehive builds a beehive with both controller kinds registered as
 // no-ops and starts it. Use for tests that only exercise the importer or need a
 // fully-running beehive but don't care about controller behaviour.
 func NewTestBeehive(t *testing.T) *beehive.Beehive {
 	t.Helper()
 	bh := NewTestBeehiveUnstarted(t)
-	require.NoError(t, beehive.Register(bh, cluster.ClusterSourceGroupKind, &NoopController[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus]{}))
 	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, &NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{}))
 	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
 	stop, err := bh.Start(context.Background())

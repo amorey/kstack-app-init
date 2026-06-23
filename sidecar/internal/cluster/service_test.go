@@ -27,8 +27,9 @@ import (
 	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/rest"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
 // noopController satisfies beehive.Controller without reconciling — it just
@@ -58,12 +59,10 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterCac
 	bh, err := beehive.New(st, beehive.WithResyncInterval(0))
 	require.NoError(t, err)
 
-	srcClient := beehive.NewClient[ClusterSourceSpec, ClusterSourceObjStatus](bh, ClusterSourceGroupKind)
 	clusterClient := beehive.NewClient[ClusterSpec, ClusterConnectionStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
 	cacheNoop := &noopController[ClusterCacheSpec, ClusterCacheStatus]{}
-	require.NoError(t, beehive.Register(bh, ClusterSourceGroupKind, &noopController[ClusterSourceSpec, ClusterSourceObjStatus]{}))
 	require.NoError(t, beehive.Register(bh, ClusterGroupKind, &noopController[ClusterSpec, ClusterConnectionStatus]{}))
 	require.NoError(t, beehive.Register(bh, ClusterCacheGroupKind, cacheNoop))
 
@@ -72,24 +71,20 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterCac
 	t.Cleanup(func() { _ = stop(context.Background()) })
 
 	return &Service{
-		srcClient:     srcClient,
 		clusterClient: clusterClient,
 		cacheClient:   cacheClient,
 		cacheManager:  store.NewManager(t.TempDir()),
+		connMgr:       NewConnectionManager(),
 	}, cacheNoop.client
 }
 
-// seedCluster creates a ClusterSource + Cluster pair (as the controllers would)
-// and returns the minted ClusterID.
+// seedCluster creates a Cluster (as the importer would) and returns its
+// ClusterID.
 func seedCluster(t *testing.T, s *Service, ctxName string, id ClusterID) ClusterID {
 	t.Helper()
 	ctx := context.Background()
-	_, err := s.srcClient.Create(ctx, ClusterSourceSpec{ContextName: ctxName, IsPresent: true},
-		beehive.WithSlug(ClusterSourceSlug(ctxName)))
-	require.NoError(t, err)
-
 	name := ctxName
-	_, err = s.clusterClient.Create(ctx, ClusterSpec{
+	_, err := s.clusterClient.Create(ctx, ClusterSpec{
 		Name:          &name,
 		IsSyncEnabled: true,
 		IsActive:      true,
@@ -199,33 +194,31 @@ func TestServiceClearCacheBumpsPokeGeneration(t *testing.T) {
 	assert.Equal(t, int64(1), obj.Spec.PokeSyncGeneration)
 }
 
-func TestServiceDeleteRemovesParentSource(t *testing.T) {
+func TestServiceDeleteTombstonesCluster(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha", "id-alpha")
 
 	require.NoError(t, s.Delete(ctx, id))
 
-	// Delete tombstones the parent ClusterSource (soft delete); beehive GC then
-	// cascades to Cluster → ClusterCache.
-	srcObj, err := s.srcClient.GetBySlug(ctx, ClusterSourceSlug("alpha"))
+	// Delete tombstones the Cluster (soft delete); beehive GC then cascades to
+	// its ClusterCache.
+	obj, err := s.clusterClient.GetBySlug(ctx, ClusterSlug(id))
 	require.NoError(t, err)
-	assert.NotNil(t, srcObj.DeletionRequestedAt)
+	assert.NotNil(t, obj.DeletionRequestedAt)
 }
 
-func TestServicePokeAllSync(t *testing.T) {
-	ctx := context.Background()
+func TestServiceGetConnection(t *testing.T) {
 	s, _ := newServiceTest(t)
-	a := seedCluster(t, s, "alpha", "id-alpha")
-	b := seedCluster(t, s, "beta", "id-beta")
+	id := ClusterID("abc")
+	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
 
-	require.NoError(t, s.pokeAllSync(ctx))
+	// Nothing stored yet.
+	assert.Nil(t, s.GetConnection(id))
 
-	for _, id := range []ClusterID{a, b} {
-		obj, err := s.clusterClient.GetBySlug(ctx, ClusterSlug(id))
-		require.NoError(t, err)
-		assert.Equal(t, int64(1), obj.Spec.PokeSyncGeneration, "cluster %s", id)
-	}
+	// After the connection manager is populated it is readable via the service.
+	s.connMgr.Set(id, cfg)
+	assert.Equal(t, cfg, s.GetConnection(id))
 }
 
 func TestServiceWatchEmitsSeedThenReemits(t *testing.T) {

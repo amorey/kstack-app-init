@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cachesync
+package engine
 
 import (
 	"context"
@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
 // --- fakeSource: a scriptable kubeSource for driver state-machine tests -------

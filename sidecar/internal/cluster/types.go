@@ -13,18 +13,18 @@
 // limitations under the License.
 
 // Package controllers is the kstack sidecar's Kubernetes logic layer: domain
-// types for clusters and their caches, three beehive controller
-// implementations (ClusterSource, Cluster, ClusterCache), a kubeconfig
-// importer, and the two sub-packages (clustercache, clustersync) that back
-// the per-cluster on-disk mirrors.
+// types for clusters and their caches, two beehive controller implementations
+// (Cluster, ClusterCache), a kubeconfig importer, and the two cache sub-packages
+// (cache/store, cache/engine) that back the per-cluster on-disk mirrors.
 //
-// The three beehive resource kinds and their ownership chain:
+// The two beehive resource kinds and their ownership chain:
 //
-//	ClusterSource  (slug: "sources/kubeconfig/{contextName}")
-//	    ↓ owns
 //	Cluster        (slug: "clusters/{uuid}")
 //	    ↓ owns
 //	ClusterCache   (slug: "caches/{uuid}")
+//
+// Cluster objects are created directly by the kubeconfig importer (one per
+// kube-context); there is no separate intake kind.
 //
 // Domain types here are a superset of what beehive stores: the domain Cluster
 // (returned to resolvers) joins the Cluster and ClusterCache beehive objects
@@ -44,18 +44,11 @@ import (
 // is tracked.
 var ErrNotFound = errors.New("controllers: cluster not found")
 
-// Slug prefix constants for the three beehive resource kinds.
+// Slug prefix constants for the two beehive resource kinds.
 const (
-	slugPrefixClusterSource = "sources/kubeconfig/"
-	slugPrefixCluster       = "clusters/"
-	slugPrefixClusterCache  = "caches/"
+	slugPrefixCluster      = "clusters/"
+	slugPrefixClusterCache = "caches/"
 )
-
-// ClusterSourceSlug returns the beehive slug for a ClusterSource object from
-// its kubeconfig context name.
-func ClusterSourceSlug(contextName string) string {
-	return slugPrefixClusterSource + contextName
-}
 
 // ClusterSlug returns the beehive slug for a Cluster object from its UUID.
 func ClusterSlug(id ClusterID) string {
@@ -84,10 +77,11 @@ func ClusterIDFromSlug(slug string) ClusterID {
 
 // ClusterID uniquely and stably identifies a cluster record across context
 // renames and credential changes. Values are opaque to consumers (it binds to
-// the GraphQL ID scalar); the ClusterSourceController assigns a random UUID at
-// registration, deliberately independent of the remote cluster's UID (which is
-// unknown until the first probe, and shared by two records pointing at the same
-// physical cluster). Externally a ClusterID is the UUID string; internally
+// the GraphQL ID scalar); the kubeconfig importer assigns a random UUID the
+// first time it sees a context, deliberately independent of the remote
+// cluster's UID (which is unknown until the first probe, and shared by two
+// records pointing at the same physical cluster). Externally a ClusterID is
+// the UUID string; internally
 // beehive stores it as the slug "clusters/{uuid}".
 type ClusterID string
 
@@ -239,41 +233,6 @@ func ConditionsEqual(a, b []ClusterCondition) bool {
 	return true
 }
 
-// --- ClusterSource kind types ---
-
-// ClusterSourceGroupKind identifies the ClusterSource beehive resource kind.
-var ClusterSourceGroupKind = beehive.GroupKind{Kind: "ClusterSource"}
-
-// ClusterSourceSpec is the desired-state (importer-written) half of a
-// ClusterSource record: the kubeconfig observation — what the importer last
-// saw for this context. IsPresent=false marks an orphaned entry (context
-// departed the kubeconfig) without deleting the record (and its owned Cluster
-// child).
-type ClusterSourceSpec struct {
-	// ContextName is the kube-context name this source tracks.
-	ContextName string `json:"contextName"`
-	// ClusterName is the cluster entry name the context references (from
-	// kubeconfig); empty until first observed.
-	ClusterName string `json:"clusterName"`
-	// UserName is the user (authInfo) entry name the context references (from
-	// kubeconfig); empty until first observed.
-	UserName string `json:"userName"`
-	// IsPresent is true while the context is present in the kubeconfig.
-	IsPresent bool `json:"isPresent"`
-	// IsDefault is true when the context is the kubeconfig's current-context.
-	IsDefault bool `json:"isDefault"`
-}
-
-// ClusterSourceObjStatus is the controller-written half of a ClusterSource
-// beehive object: what the ClusterSourceController has done in response to the
-// spec. This is the stored status for the ClusterSource beehive kind — it is
-// not exposed in GraphQL (only Cluster and ClusterCache are).
-type ClusterSourceObjStatus struct {
-	// ClusterID is the UUID of the Cluster child object the controller created
-	// for this source; nil until the child is created.
-	ClusterID *ClusterID `json:"clusterID,omitempty"`
-}
-
 // --- Cluster kind types ---
 
 // ClusterGroupKind identifies the Cluster beehive resource kind.
@@ -329,14 +288,13 @@ type ClusterSpec struct {
 	IsActive      bool          `json:"isActive"`
 	Source        ClusterSource `json:"source"`
 
-	// SourceObs is the kubeconfig observation written by the
-	// ClusterSourceController when it detects changes in the kubeconfig
-	// (cluster/user entry names, presence, default status). It is stored in
-	// the spec because only the Cluster's own controller (ClusterController)
-	// can write its status, and the ClusterSourceController needs a write path
-	// that uses the ordinary Client.Update. The ClusterController copies
-	// SourceObs into ClusterConnectionStatus.Source.Kubeconfig during its
-	// reconcile, so the GraphQL layer reads from status as expected.
+	// SourceObs is the kubeconfig observation written by the kubeconfig importer
+	// (cluster/user entry names, presence, default status). It is stored in the
+	// spec because only the Cluster's own controller (ClusterController) can
+	// write its status, and the importer needs a write path that uses the
+	// ordinary Client.Update. The ClusterController copies SourceObs into
+	// ClusterConnectionStatus.Source.Kubeconfig during its reconcile, so the
+	// GraphQL layer reads from status as expected.
 	SourceObs *KubeconfigStatus `json:"sourceObs,omitempty"`
 
 	// RetryGeneration is incremented by Service.ConnectionRetry to force an

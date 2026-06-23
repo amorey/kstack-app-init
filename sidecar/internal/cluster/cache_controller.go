@@ -26,8 +26,8 @@ import (
 
 	"github.com/amorey/beehive"
 
-	cachesync "github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cachesync"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/engine"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
 const (
@@ -46,9 +46,9 @@ type EngineHandle interface {
 	Stop(ctx context.Context) error
 }
 
-// NewEngineFunc constructs one sync engine. Production uses a cachesync.NewEngine
+// NewEngineFunc constructs one sync engine. Production uses a engine.NewEngine
 // wrapper; tests inject a factory that returns fake handles.
-type NewEngineFunc func(cfg *rest.Config, clusterID ClusterID, sink cachesync.Sink) EngineHandle
+type NewEngineFunc func(cfg *rest.Config, clusterID ClusterID, sink engine.Sink) EngineHandle
 
 // engineEntry is the controller's runtime state for one running engine. The
 // pointer guards the sink: reports from a stopped or replaced engine are dropped
@@ -82,6 +82,7 @@ type ClusterCacheController struct {
 	cfgSource     KubeConfigSource
 	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
 	cacheManager  *store.Manager
+	connMgr       *ConnectionManager
 	ctrlClient    beehive.ControllerClient[ClusterCacheStatus]
 
 	// newEngine constructs one sync engine. Overridable for tests.
@@ -95,26 +96,29 @@ type ClusterCacheController struct {
 }
 
 // NewClusterCacheController builds the controller. manager owns the per-cluster
-// SQLite cache files; it is shared with the resolver so both see the same open DBs.
+// SQLite cache files; it is shared with the resolver so both see the same open
+// DBs. connMgr may be nil (credentials are then resolved from the kubeconfig).
 func NewClusterCacheController(
 	cfgSource KubeConfigSource,
 	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus],
 	manager *store.Manager,
+	connMgr *ConnectionManager,
 ) *ClusterCacheController {
 	c := &ClusterCacheController{
 		cfgSource:     cfgSource,
 		clusterClient: clusterClient,
 		cacheManager:  manager,
+		connMgr:       connMgr,
 		engines:       make(map[ClusterID]*engineEntry),
 	}
 	cm := manager
-	c.newEngine = func(cfg *rest.Config, id ClusterID, sink cachesync.Sink) EngineHandle {
+	c.newEngine = func(cfg *rest.Config, id ClusterID, sink engine.Sink) EngineHandle {
 		cdb, err := cm.Open(context.Background(), string(id))
 		if err != nil {
 			slog.Warn("clustercachecontroller: open cache db", "cluster", id, "err", err)
 			return nil
 		}
-		return cachesync.NewEngine(cfg, cdb, sink)
+		return engine.NewEngine(cfg, cdb, sink)
 	}
 	return c
 }
@@ -220,16 +224,23 @@ func (c *ClusterCacheController) converge(
 	}
 
 	contextName := clusterObj.Spec.Source.Kubeconfig.Context
-	restCfg, err := ResolveRESTConfig(c.cfgSource.Get(), contextName)
-	if err != nil {
-		c.stopEngine(clusterID)
-		SetCondition(conds, ClusterCondition{
-			Type: ClusterConditionSynced, Status: ConditionFalse,
-			Reason: ReasonSyncFailed, Message: err.Error(), ObservedGeneration: gen,
-		})
-		return syncRecheckInterval
+	var restCfg *rest.Config
+	if c.connMgr != nil {
+		restCfg = c.connMgr.Get(clusterID)
 	}
-	fingerprint := cachesync.ConfigFingerprint(restCfg, cachesync.ContextProxyURL(c.cfgSource.Get(), contextName))
+	if restCfg == nil {
+		var err error
+		restCfg, err = ResolveRESTConfig(c.cfgSource.Get(), contextName)
+		if err != nil {
+			c.stopEngine(clusterID)
+			SetCondition(conds, ClusterCondition{
+				Type: ClusterConditionSynced, Status: ConditionFalse,
+				Reason: ReasonSyncFailed, Message: err.Error(), ObservedGeneration: gen,
+			})
+			return syncRecheckInterval
+		}
+	}
+	fingerprint := engine.ConfigFingerprint(restCfg, engine.ContextProxyURL(c.cfgSource.Get(), contextName))
 
 	// Detect poke signals via PokeSyncGeneration.
 	bounce := false
@@ -301,7 +312,7 @@ type engineSink struct {
 	entry *engineEntry
 }
 
-func (s *engineSink) Report(st cachesync.EngineStatus) {
+func (s *engineSink) Report(st engine.EngineStatus) {
 	s.c.mu.Lock()
 	current := s.c.engines[s.id] == s.entry
 	s.c.mu.Unlock()
@@ -329,7 +340,7 @@ func (s *engineSink) Report(st cachesync.EngineStatus) {
 
 // applyEngineReport performs the read-modify-write for one engine status report.
 // Must be called with writeMu held.
-func (c *ClusterCacheController) applyEngineReport(ctx context.Context, entry *engineEntry, st cachesync.EngineStatus) error {
+func (c *ClusterCacheController) applyEngineReport(ctx context.Context, entry *engineEntry, st engine.EngineStatus) error {
 	cond := syncedCondition(st, entry.parentGen)
 	lastSyncedAt := st.LastSyncedAt
 
@@ -344,12 +355,12 @@ func (c *ClusterCacheController) applyEngineReport(ctx context.Context, entry *e
 }
 
 // syncedCondition maps one engine status report onto the Synced condition.
-func syncedCondition(st cachesync.EngineStatus, gen int64) ClusterCondition {
+func syncedCondition(st engine.EngineStatus, gen int64) ClusterCondition {
 	cond := ClusterCondition{Type: ClusterConditionSynced, ObservedGeneration: gen}
 	switch st.State {
-	case cachesync.EngineWatching:
+	case engine.EngineWatching:
 		cond.Status, cond.Reason = ConditionTrue, ReasonWatching
-	case cachesync.EngineErrored:
+	case engine.EngineErrored:
 		cond.Status, cond.Reason, cond.Message = ConditionFalse, ReasonSyncFailed, st.LastError
 	default:
 		cond.Status, cond.Reason = ConditionFalse, ReasonSyncing

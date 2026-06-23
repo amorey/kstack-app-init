@@ -70,26 +70,30 @@ type CheckFunc func(ctx context.Context, cfg *rest.Config) (HealthPhase, *string
 // ClusterController reconciles Cluster beehive objects. On each pass it:
 //  1. Creates a ClusterCache child if one does not exist.
 //  2. Mirrors ClusterSpec.SourceObs into ClusterConnectionStatus.Source.Kubeconfig
-//     (the kubeconfig observation written by the ClusterSourceController).
+//     (the kubeconfig observation written by the kubeconfig importer).
 //  3. Gates on eligibility (active + kubeconfig present + not being deleted).
 //  4. Resolves REST credentials from the current kubeconfig.
 //  5. Probes the connection (server version + UID + principal).
 //  6. Probes server health (readyz endpoint).
 //  7. Writes all observations to ClusterConnectionStatus via UpdateStatus.
+//  8. Updates connMgr: Set on success, Delete on failure or ineligibility.
 type ClusterController struct {
 	cfgSource   KubeConfigSource
 	cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	connMgr     *ConnectionManager
 	ctrlClient  beehive.ControllerClient[ClusterConnectionStatus]
 
 	probe ProbeFunc
 	check CheckFunc
 }
 
-// NewClusterController builds the controller. probe and check default to the
-// real network implementations; tests inject fakes.
+// NewClusterController builds the controller. connMgr may be nil (no connection
+// tracking). probe and check default to the real network implementations; tests
+// inject fakes.
 func NewClusterController(
 	cfgSource KubeConfigSource,
 	cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus],
+	connMgr *ConnectionManager,
 	probe ProbeFunc,
 	check CheckFunc,
 ) *ClusterController {
@@ -102,6 +106,7 @@ func NewClusterController(
 	return &ClusterController{
 		cfgSource:   cfgSource,
 		cacheClient: cacheClient,
+		connMgr:     connMgr,
 		probe:       probe,
 		check:       check,
 	}
@@ -167,7 +172,12 @@ func (c *ClusterController) converge(ctx context.Context, obj *beehive.Object[Cl
 	gen := obj.Generation
 	conds := &working.Conditions
 
+	clusterID := clusterIDFromObj(obj)
+
 	if !ConnectionEligible(obj) {
+		if c.connMgr != nil {
+			c.connMgr.Delete(clusterID)
+		}
 		SetCondition(conds, ClusterCondition{
 			Type: ClusterConditionConnected, Status: ConditionFalse,
 			Reason: ReasonInactive, ObservedGeneration: gen,
@@ -182,12 +192,22 @@ func (c *ClusterController) converge(ctx context.Context, obj *beehive.Object[Cl
 	contextName := obj.Spec.Source.Kubeconfig.Context
 	restCfg, err := ResolveRESTConfig(c.cfgSource.Get(), contextName)
 	if err != nil {
+		if c.connMgr != nil {
+			c.connMgr.Delete(clusterID)
+		}
 		return c.observeConnectFailure(conds, gen, ReasonResolveFailed, err)
 	}
 
 	server, principal, err := c.probe(ctx, restCfg)
 	if err != nil {
+		if c.connMgr != nil {
+			c.connMgr.Delete(clusterID)
+		}
 		return c.observeConnectFailure(conds, gen, ReasonProbeFailed, err)
+	}
+
+	if c.connMgr != nil {
+		c.connMgr.Set(clusterID, restCfg)
 	}
 
 	now := time.Now().UTC()

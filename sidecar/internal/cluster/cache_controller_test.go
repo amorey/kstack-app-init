@@ -26,8 +26,8 @@ import (
 	"github.com/amorey/beehive"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
-	cachesync "github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cachesync"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/engine"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/testutil"
 )
 
@@ -35,14 +35,14 @@ import (
 type fakeEngine struct {
 	started bool
 	stopped bool
-	sink    cachesync.Sink
+	sink    engine.Sink
 }
 
 func (f *fakeEngine) Start() {
 	f.started = true
 	// Report asynchronously — Start is called while the controller holds writeMu,
 	// and Report acquires writeMu too, so a synchronous call would deadlock.
-	go f.sink.Report(cachesync.EngineStatus{State: cachesync.EngineWatching})
+	go f.sink.Report(engine.EngineStatus{State: engine.EngineWatching})
 }
 
 func (f *fakeEngine) Stop(_ context.Context) error {
@@ -52,11 +52,13 @@ func (f *fakeEngine) Stop(_ context.Context) error {
 
 // newCacheTestBeehive builds a beehive with the real ClusterCacheController
 // using a fake engine factory plus NoopControllers for the other kinds.
-// Returns the clients and the factory's engine slot (populated on first call).
-func newCacheTestBeehive(t *testing.T) (
+// Returns the clients, the factory's engine slot (populated on first call),
+// and a pointer to a slot that holds the REST config passed to the engine factory.
+func newCacheTestBeehive(t *testing.T, connMgr *cluster.ConnectionManager) (
 	beehive.Client[cluster.ClusterSpec, cluster.ClusterConnectionStatus],
 	beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus],
 	*fakeEngine,
+	*capturedCfgSlot,
 ) {
 	t.Helper()
 	bh := testutil.NewTestBeehiveUnstarted(t)
@@ -67,22 +69,26 @@ func newCacheTestBeehive(t *testing.T) (
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
 	mgr := store.NewManager(t.TempDir())
 
-	ctrl := cluster.NewClusterCacheController(w, clusterClient, mgr)
-	engine := &fakeEngine{}
-	ctrl.SetNewEngine(func(cfg *rest.Config, id cluster.ClusterID, sink cachesync.Sink) cluster.EngineHandle {
-		engine.sink = sink
-		return engine
+	ctrl := cluster.NewClusterCacheController(w, clusterClient, mgr, connMgr)
+	fakeEng := &fakeEngine{}
+	slot := &capturedCfgSlot{}
+	ctrl.SetNewEngine(func(cfg *rest.Config, id cluster.ClusterID, sink engine.Sink) cluster.EngineHandle {
+		slot.cfg = cfg
+		fakeEng.sink = sink
+		return fakeEng
 	})
 
-	require.NoError(t, beehive.Register(bh, cluster.ClusterSourceGroupKind, &testutil.NoopController[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus]{}))
 	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, &testutil.NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{}))
 	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, ctrl))
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })
 
-	return clusterClient, cacheClient, engine
+	return clusterClient, cacheClient, fakeEng, slot
 }
+
+// capturedCfgSlot holds the REST config that was passed to the engine factory.
+type capturedCfgSlot struct{ cfg *rest.Config }
 
 // waitCacheCondition polls until the ClusterCache object has the Synced condition.
 func waitCacheCondition(t *testing.T, cl beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus], id beehive.ObjectID) *beehive.Object[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus] {
@@ -121,7 +127,7 @@ func eligibleClusterSpec(contextName string) cluster.ClusterSpec {
 
 func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
 	ctx := context.Background()
-	clusterClient, cacheClient, engine := newCacheTestBeehive(t)
+	clusterClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
 
 	id := cluster.ClusterID("abc-uuid")
 
@@ -140,12 +146,12 @@ func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
 	synced := findCacheCondition(t, got.Status.Conditions, cluster.ClusterConditionSynced)
 	assert.Equal(t, cluster.ConditionTrue, synced.Status,
 		"engine started and reported Watching → Synced=True")
-	assert.True(t, engine.started)
+	assert.True(t, fakeEng.started)
 }
 
 func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {
 	ctx := context.Background()
-	clusterClient, cacheClient, _ := newCacheTestBeehive(t)
+	clusterClient, cacheClient, _, _ := newCacheTestBeehive(t, nil)
 
 	id := cluster.ClusterID("paused-uuid")
 
@@ -174,7 +180,7 @@ func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {
 // beehive rejects the write as a future generation and the report is dropped.
 func TestCacheControllerReportWithParentGenerationAhead(t *testing.T) {
 	ctx := context.Background()
-	clusterClient, cacheClient, engine := newCacheTestBeehive(t)
+	clusterClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
 
 	id := cluster.ClusterID("gen-skew-uuid")
 
@@ -215,7 +221,54 @@ func TestCacheControllerReportWithParentGenerationAhead(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	assert.True(t, engine.started)
+	assert.True(t, fakeEng.started)
+}
+
+// TestCacheControllerUsesConnectionManagerConfig verifies that when a
+// ConnectionManager holds a REST config for a cluster, the cache controller
+// passes that config (not a freshly resolved one) to the engine factory.
+func TestCacheControllerUsesConnectionManagerConfig(t *testing.T) {
+	ctx := context.Background()
+	connMgr := cluster.NewConnectionManager()
+	id := cluster.ClusterID("conn-cfg-uuid")
+	injected := &rest.Config{Host: "https://from-conn-mgr:6443"}
+	connMgr.Set(id, injected)
+
+	clusterClient, cacheClient, _, slot := newCacheTestBeehive(t, connMgr)
+
+	clusterObj, err := clusterClient.Create(ctx, eligibleClusterSpec("alpha"),
+		beehive.WithSlug(cluster.ClusterSlug(id)))
+	require.NoError(t, err)
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	waitCacheCondition(t, cacheClient, cacheObj.ID)
+
+	assert.Equal(t, injected, slot.cfg,
+		"engine must receive the REST config from ConnectionManager, not a freshly resolved one")
+}
+
+// TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager verifies that
+// the cache controller still works when no ConnectionManager is provided.
+func TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager(t *testing.T) {
+	ctx := context.Background()
+	clusterClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
+
+	id := cluster.ClusterID("fallback-uuid")
+	clusterObj, err := clusterClient.Create(ctx, eligibleClusterSpec("alpha"),
+		beehive.WithSlug(cluster.ClusterSlug(id)))
+	require.NoError(t, err)
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	got := waitCacheCondition(t, cacheClient, cacheObj.ID)
+	synced := findCacheCondition(t, got.Status.Conditions, cluster.ClusterConditionSynced)
+	assert.Equal(t, cluster.ConditionTrue, synced.Status)
+	assert.True(t, fakeEng.started)
 }
 
 func findCacheConditionOK(conds []cluster.ClusterCondition, typ cluster.ClusterConditionType) *cluster.ClusterCondition {

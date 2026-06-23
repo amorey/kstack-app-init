@@ -53,15 +53,14 @@ func staticCheck(phase cluster.HealthPhase) cluster.CheckFunc {
 
 // newClusterTestBeehive builds a beehive with the real ClusterController using
 // the given probe/check fakes plus NoopControllers for the other kinds.
-func newClusterTestBeehive(t *testing.T, w cluster.KubeConfigSource, probe cluster.ProbeFunc, check cluster.CheckFunc) (beehive.Client[cluster.ClusterSpec, cluster.ClusterConnectionStatus], beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]) {
+func newClusterTestBeehive(t *testing.T, w cluster.KubeConfigSource, probe cluster.ProbeFunc, check cluster.CheckFunc, connMgr *cluster.ConnectionManager) (beehive.Client[cluster.ClusterSpec, cluster.ClusterConnectionStatus], beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]) {
 	t.Helper()
 	bh := testutil.NewTestBeehiveUnstarted(t)
 
 	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
 	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
 
-	ctrl := cluster.NewClusterController(w, cacheClient, probe, check)
-	require.NoError(t, beehive.Register(bh, cluster.ClusterSourceGroupKind, &testutil.NoopController[cluster.ClusterSourceSpec, cluster.ClusterSourceObjStatus]{}))
+	ctrl := cluster.NewClusterController(w, cacheClient, connMgr, probe, check)
 	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, ctrl))
 	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
 	stop, err := bh.Start(context.Background())
@@ -119,6 +118,7 @@ func TestClusterControllerSuccessfulProbeWritesConditions(t *testing.T) {
 			cluster.ClusterPrincipal{Username: &user},
 		),
 		staticCheck(cluster.HealthPhaseHealthy),
+		nil,
 	)
 	ctx := context.Background()
 
@@ -149,6 +149,7 @@ func TestClusterControllerProbeFailureSetsConnectedFalse(t *testing.T) {
 	clusterClient, _ := newClusterTestBeehive(t, w,
 		errProbe(errors.New("connection refused")),
 		staticCheck(cluster.HealthPhaseHealthy),
+		nil,
 	)
 	ctx := context.Background()
 
@@ -169,7 +170,7 @@ func TestClusterControllerIneligibleClusterDoesNotProbe(t *testing.T) {
 		probeCalled = true
 		return cluster.ClusterServer{}, cluster.ClusterPrincipal{}, nil
 	}
-	clusterClient, _ := newClusterTestBeehive(t, w, probe, staticCheck(cluster.HealthPhaseHealthy))
+	clusterClient, _ := newClusterTestBeehive(t, w, probe, staticCheck(cluster.HealthPhaseHealthy), nil)
 	ctx := context.Background()
 
 	// IsActive=false → ineligible.
@@ -184,6 +185,82 @@ func TestClusterControllerIneligibleClusterDoesNotProbe(t *testing.T) {
 	assert.Equal(t, cluster.ConditionFalse, connected.Status)
 	assert.Equal(t, cluster.ReasonInactive, connected.Reason)
 	assert.False(t, probeCalled, "probe must not be called for ineligible cluster")
+}
+
+func TestClusterControllerSuccessfulProbePopulatesConnectionManager(t *testing.T) {
+	uid := "kube-system-uid"
+	ver := "v1.31.0"
+	user := "alice"
+	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
+	connMgr := cluster.NewConnectionManager()
+
+	clusterClient, _ := newClusterTestBeehive(t, w,
+		staticProbe(
+			cluster.ClusterServer{UID: &uid, Version: &ver},
+			cluster.ClusterPrincipal{Username: &user},
+		),
+		staticCheck(cluster.HealthPhaseHealthy),
+		connMgr,
+	)
+
+	id := cluster.ClusterID("conn-mgr-set-id")
+	obj, err := clusterClient.Create(context.Background(), eligibleSpec("alpha"),
+		beehive.WithSlug(cluster.ClusterSlug(id)))
+	require.NoError(t, err)
+
+	waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+
+	got := connMgr.Get(id)
+	assert.NotNil(t, got, "ConnectionManager must have a REST config after successful probe")
+}
+
+func TestClusterControllerProbeFailureDeletesFromConnectionManager(t *testing.T) {
+	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
+	connMgr := cluster.NewConnectionManager()
+
+	id := cluster.ClusterID("conn-mgr-del-id")
+	// Pre-seed a stale entry so we can confirm it gets cleared.
+	connMgr.Set(id, &rest.Config{Host: "https://stale"})
+
+	clusterClient, _ := newClusterTestBeehive(t, w,
+		errProbe(errors.New("dial failed")),
+		staticCheck(cluster.HealthPhaseHealthy),
+		connMgr,
+	)
+
+	obj, err := clusterClient.Create(context.Background(), eligibleSpec("alpha"),
+		beehive.WithSlug(cluster.ClusterSlug(id)))
+	require.NoError(t, err)
+
+	waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+
+	got := connMgr.Get(id)
+	assert.Nil(t, got, "ConnectionManager must not hold a config after probe failure")
+}
+
+func TestClusterControllerIneligibleDeletesFromConnectionManager(t *testing.T) {
+	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
+	connMgr := cluster.NewConnectionManager()
+
+	id := cluster.ClusterID("conn-mgr-ineligible-id")
+	connMgr.Set(id, &rest.Config{Host: "https://stale"})
+
+	clusterClient, _ := newClusterTestBeehive(t, w,
+		staticProbe(cluster.ClusterServer{}, cluster.ClusterPrincipal{}),
+		staticCheck(cluster.HealthPhaseHealthy),
+		connMgr,
+	)
+
+	spec := eligibleSpec("alpha")
+	spec.IsActive = false
+	obj, err := clusterClient.Create(context.Background(), spec,
+		beehive.WithSlug(cluster.ClusterSlug(id)))
+	require.NoError(t, err)
+
+	waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+
+	got := connMgr.Get(id)
+	assert.Nil(t, got, "ConnectionManager must not hold a config for an ineligible cluster")
 }
 
 func findCondition(t *testing.T, conds []cluster.ClusterCondition, typ cluster.ClusterConditionType) cluster.ClusterCondition {

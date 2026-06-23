@@ -17,7 +17,7 @@
 // The package owns the lifecycle of those files (open/migrate/quarantine/
 // delete) plus a per-cluster janitor goroutine; it does NOT own syncing —
 // the cluster package's ClusterCacheController starts an engine
-// (internal/cluster/cachesync) that writes through the ClusterDB this package
+// (internal/cluster/cache/engine) that writes through the ClusterDB this package
 // hands out.
 //
 // Concurrency model: SQLite is opened in WAL mode so readers don't block a

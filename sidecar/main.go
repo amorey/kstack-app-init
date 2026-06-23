@@ -110,7 +110,11 @@ func main() {
 		cancel()
 	}()
 
-	application.Start(ctx)
+	stop, err := application.Start(ctx)
+	if err != nil {
+		slog.Error("app start", "err", err)
+		os.Exit(1)
+	}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
@@ -139,6 +143,11 @@ func main() {
 	_ = srv.Shutdown(shutdownCtx)
 	if err := application.DrainWithContext(shutdownCtx); err != nil {
 		slog.Warn("drain did not complete", "err", err)
+	}
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelStop()
+	if err := stop(stopCtx); err != nil {
+		slog.Warn("stop did not complete cleanly", "err", err)
 	}
 	_ = application.Close()
 }

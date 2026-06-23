@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package cachesync mirrors one real Kubernetes cluster into its local
-// SQLite cache (internal/cluster/store).
+// Package engine mirrors one real Kubernetes cluster into its local
+// SQLite cache (internal/cluster/cache/store).
 //
 // Discovery + dynamic/metadata clients + one per-GVR kindDriver means one
 // code path serves every Kind on every cluster — built-ins and CRDs alike.
@@ -34,7 +34,7 @@
 // controller: the controller decides when an engine starts, stops, or
 // restarts (spec changes, credential rotation, resync pokes); the engine
 // reports its coarse state back through the Sink it was constructed with.
-package cachesync
+package engine
 
 import (
 	"context"
@@ -61,7 +61,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
 // init routes client-go's API-server warning headers (deprecation

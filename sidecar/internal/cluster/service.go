@@ -18,23 +18,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"path/filepath"
-	"sync"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
+	"k8s.io/client-go/rest"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // ClusterService is the boundary between the frontend (GraphQL today, gRPC
 // later) and the cluster backend. Every beehive detail — slugs, the
-// ClusterSource → Cluster → ClusterCache owner chain, the spec/status split, the
-// ClusterCache status join, the two-channel watch merge — lives behind it, so
-// callers deal only in the domain Cluster type.
+// Cluster → ClusterCache owner chain, the spec/status split, the ClusterCache
+// status join, the two-channel watch merge — lives behind it, so callers deal
+// only in the domain Cluster type.
 type ClusterService interface {
 	// List returns every tracked cluster that is not deletion-pending, each with
 	// its ClusterCache sync status joined in.
@@ -57,41 +56,40 @@ type ClusterService interface {
 	// ClearCache deletes the on-disk cache and bounces the sync engine; the
 	// (returned) record stays.
 	ClearCache(ctx context.Context, id ClusterID) (*Cluster, error)
-	// Delete removes the cluster by deleting its parent ClusterSource so beehive
-	// GC cascades to Cluster → ClusterCache.
+	// Delete removes the cluster by deleting the Cluster object so beehive GC
+	// cascades to ClusterCache.
 	Delete(ctx context.Context, id ClusterID) error
+	// GetConnection returns the live REST config for id, or nil if the cluster
+	// is not currently connected.
+	GetConnection(id ClusterID) *rest.Config
 }
 
 // Service is the concrete ClusterService and the whole cluster control plane: it
-// owns the beehive store + instance, the kubeconfig watcher, the three beehive
-// clients, the three controllers (registered with beehive in New), the kubeconfig
-// importer, the poke→sync forwarder, and the per-cluster cache manager.
+// owns the beehive store + instance, the kubeconfig watcher, the two beehive
+// clients, the two controllers (registered with beehive in New), the kubeconfig
+// importer, the connection manager, and the per-cluster cache manager.
 type Service struct {
 	bh      *beehive.Beehive
 	bhStore beehive.Store
-	bhStop  func(context.Context) error
 
 	watcher *k8shelpers.KubeConfigWatcher
 
-	srcClient     beehive.Client[ClusterSourceSpec, ClusterSourceObjStatus]
 	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
 	cacheClient   beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
 	cacheManager  *store.Manager
+	connMgr       *ConnectionManager
 
 	importer *KubeconfigImporter
 	pokeSvc  *poke.Service
-
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
 }
 
 var _ ClusterService = (*Service)(nil)
 
 // New builds the cluster control plane: the kubeconfig watcher (over
 // kubeconfigPath), the beehive store + instance (at <dataDir>/beehive.db), the
-// three beehive clients, the three registered controllers (ClusterSource,
-// Cluster, ClusterCache), the kubeconfig importer, and the per-cluster cache
-// manager (rooted at <dataDir>/clusters/). The returned *Service is both the
+// two beehive clients, the two registered controllers (Cluster, ClusterCache),
+// the kubeconfig importer, and the per-cluster cache manager (rooted at
+// <dataDir>/clusters/). The returned *Service is both the
 // GraphQL boundary and the control plane: it owns the entire watcher + beehive +
 // importer + forwarder + cache lifecycle via Start/Close. The watcher and beehive
 // are cluster-only, so the service owns them outright; if a non-cluster consumer
@@ -118,7 +116,6 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	srcClient := beehive.NewClient[ClusterSourceSpec, ClusterSourceObjStatus](bh, ClusterSourceGroupKind)
 	clusterClient := beehive.NewClient[ClusterSpec, ClusterConnectionStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
@@ -126,12 +123,12 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	// <dataDir>/clusters/ — wholly a cluster concern, so the service owns it.
 	cacheManager := store.NewManager(dataDir)
 
-	srcCtrl := NewClusterSourceController(clusterClient)
-	clusterCtrl := NewClusterController(watcher, cacheClient, nil, nil)
-	cacheCtrl := NewClusterCacheController(watcher, clusterClient, cacheManager)
+	connMgr := NewConnectionManager()
+
+	clusterCtrl := NewClusterController(watcher, cacheClient, connMgr, nil, nil)
+	cacheCtrl := NewClusterCacheController(watcher, clusterClient, cacheManager, connMgr)
 
 	if err := errors.Join(
-		beehive.Register(bh, ClusterSourceGroupKind, srcCtrl),
 		beehive.Register(bh, ClusterGroupKind, clusterCtrl),
 		beehive.Register(bh, ClusterCacheGroupKind, cacheCtrl),
 	); err != nil {
@@ -144,78 +141,42 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 		bh:            bh,
 		bhStore:       bhStore,
 		watcher:       watcher,
-		srcClient:     srcClient,
 		clusterClient: clusterClient,
 		cacheClient:   cacheClient,
 		cacheManager:  cacheManager,
-		importer:      NewKubeconfigImporter(watcher, srcClient),
+		connMgr:       connMgr,
+		importer:      NewKubeconfigImporter(watcher, clusterClient),
 		pokeSvc:       pokeSvc,
 	}, nil
 }
 
 // Start launches beehive (the controller harness + store subscription loop) and
-// the kubeconfig watcher's fsnotify loop, then the kubeconfig importer and the
-// poke→sync forwarder (the forwarder bumps PokeSyncGeneration on every Cluster so
-// running sync engines bounce). ctx bounds beehive startup and scopes the
-// forwarder goroutine.
-func (s *Service) Start(ctx context.Context) error {
-	stop, err := s.bh.Start(ctx)
+// the kubeconfig watcher's fsnotify loop, then the kubeconfig importer. ctx
+// bounds beehive startup only; the returned stop func accepts a drain-deadline
+// context and blocks until all background work finishes. Call stop before Close.
+func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
+	bhStop, err := s.bh.Start(ctx)
 	if err != nil {
-		return fmt.Errorf("start beehive: %w", err)
+		return nil, fmt.Errorf("start beehive: %w", err)
 	}
-	s.bhStop = stop
 
 	// Start the watcher (fsnotify loop) before the importer, which subscribes to
 	// its snapshots current-on-subscribe.
 	s.watcher.Start()
 	s.importer.Start()
 
-	if s.pokeSvc != nil {
-		fctx, cancel := context.WithCancel(ctx)
-		s.cancel = cancel
-		ch, unsub := s.pokeSvc.Subscribe()
-		s.wg.Go(func() {
-			defer unsub()
-			for {
-				select {
-				case <-fctx.Done():
-					return
-				case _, ok := <-ch:
-					if !ok {
-						return
-					}
-					if err := s.pokeAllSync(fctx); err != nil {
-						slog.Warn("cluster service: poke forwarder failed to bump sync generation", "err", err)
-					}
-				}
-			}
-		})
+	stop := func(ctx context.Context) error {
+		s.watcher.Close()
+		s.importer.Stop()
+		cacheErr := s.cacheManager.Shutdown(ctx)
+		return errors.Join(bhStop(ctx), cacheErr)
 	}
-	return nil
+	return stop, nil
 }
 
-// Close tears the cluster control plane down in dependency order, so the
-// composition root doesn't have to sequence it: close the kubeconfig watcher
-// (ending the importer's snapshot stream) and stop the writers (importer + poke
-// forwarder, joining both), stop beehive (which stops every controller and sync
-// engine), shut down the per-cluster cache (safe only now the engines that write
-// into it are gone), then close the beehive store. ctx bounds the beehive stop
-// and the cache shutdown.
-func (s *Service) Close(ctx context.Context) error {
-	if s.cancel != nil {
-		s.cancel()
-	}
-	watcherErr := s.watcher.Close()
-	s.importer.Stop()
-	s.wg.Wait()
-
-	var bhErr error
-	if s.bhStop != nil {
-		bhErr = s.bhStop(ctx)
-	}
-	cacheErr := s.cacheManager.Shutdown(ctx)
-	storeErr := s.bhStore.Close()
-	return errors.Join(watcherErr, bhErr, cacheErr, storeErr)
+// Close releases the beehive store after Stop has finished. Call after Stop.
+func (s *Service) Close() error {
+	return s.bhStore.Close()
 }
 
 // List implements ClusterService.
@@ -333,20 +294,14 @@ func (s *Service) ClearCache(ctx context.Context, id ClusterID) (*Cluster, error
 	return &c, nil
 }
 
-// Delete implements ClusterService.
+// Delete implements ClusterService. It deletes the Cluster object; beehive GC
+// cascades to its ClusterCache. If the kube-context still exists, the importer
+// will re-create the cluster (with a fresh UUID) on its next reconcile.
 func (s *Service) Delete(ctx context.Context, id ClusterID) error {
 	obj, err := s.clusterByID(ctx, id)
 	if err != nil {
 		return err
 	}
-	// Find and delete the parent ClusterSource; GC cascades to Cluster + ClusterCache.
-	if obj.Spec.Source.Kubeconfig != nil {
-		srcObj, srcErr := s.srcClient.GetBySlug(ctx, ClusterSourceSlug(obj.Spec.Source.Kubeconfig.Context))
-		if srcErr == nil {
-			return s.srcClient.Delete(ctx, srcObj.ID)
-		}
-	}
-	// Fallback: delete the Cluster directly (no parent source or lookup failed).
 	return s.clusterClient.Delete(ctx, obj.ID)
 }
 
@@ -403,21 +358,9 @@ func (s *Service) Watch(ctx context.Context) (<-chan []*Cluster, error) {
 	return out, nil
 }
 
-// pokeAllSync increments PokeSyncGeneration on every Cluster object so the
-// ClusterCacheController bounces all running sync engines.
-func (s *Service) pokeAllSync(ctx context.Context) error {
-	objs, err := s.clusterClient.List(ctx)
-	if err != nil {
-		return err
-	}
-	for _, obj := range objs {
-		spec := obj.Spec
-		spec.PokeSyncGeneration++
-		if _, err := s.clusterClient.Update(ctx, obj.ID, spec); err != nil {
-			return err
-		}
-	}
-	return nil
+// GetConnection implements ClusterService.
+func (s *Service) GetConnection(id ClusterID) *rest.Config {
+	return s.connMgr.Get(id)
 }
 
 // buildCluster assembles a domain Cluster from a Cluster beehive object, joining
