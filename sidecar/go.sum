@@ -6,6 +6,8 @@ github.com/agnivade/levenshtein v1.2.1 h1:EHBY3UOn1gwdy/VbFwgo4cxecRznFk7fKWN1KO
 github.com/agnivade/levenshtein v1.2.1/go.mod h1:QVVI16kDrtSuwcpd0p1+xMC6Z/VfhtCyDIjcwga4/DU=
 github.com/amorey/beehive v0.2.0 h1:jnmCwNzSKKg4Yjb81DNSu4EqAjy4f8SGVzCAS0o4Tkk=
 github.com/amorey/beehive v0.2.0/go.mod h1:96He07nW4wa6KLoKitFa5Wa6YxSpIzztM1moGCwi4zw=
+github.com/amorey/beehive v0.3.0 h1:D3NDV5shor8Kkas8aSVrX5VbSk5JOvvJn/MEnlGEFZ4=
+github.com/amorey/beehive v0.3.0/go.mod h1:96He07nW4wa6KLoKitFa5Wa6YxSpIzztM1moGCwi4zw=
 github.com/amorey/gochan v0.1.0 h1:hb7ANxPSZNubSjZeYe9pvJEDr03GQcmiVDN+iT2G0UE=
 github.com/amorey/gochan v0.1.0/go.mod h1:7ZgZK6RFPTXozOPMs/Cc7V69D8TqJm3GdIL0JwRGgI4=
 github.com/andreyvit/diff v0.0.0-20170406064948-c7f18ee00883 h1:bvNMNQO63//z+xNgfBlViaCIJKLlCJ6/fmUseuG0wVQ=
