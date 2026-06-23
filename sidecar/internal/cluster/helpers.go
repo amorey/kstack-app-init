@@ -55,9 +55,10 @@ func ResolveRESTConfig(cfg *api.Config, contextName string) (*rest.Config, error
 
 // pokeSubscription runs a handler on every signal from the poke bus until
 // stopped. It owns the subscription, the worker goroutine, and a base context
-// cancelled on stop (so a long-running handler is interrupted). Both cluster
-// controllers use it to react to resync pokes, driven by their StartPoke/StopPoke
-// which the cluster Service sequences around the beehive lifecycle.
+// cancelled on stop (so a long-running handler is interrupted). The cache
+// controller uses it (StartPoke/StopPoke) for its single poke-driven reaction;
+// the core controller folds the poke bus into its own multi-source background
+// worker instead (StartBackground), so it doesn't use this helper.
 type pokeSubscription struct {
 	cancel func()
 	wg     sync.WaitGroup

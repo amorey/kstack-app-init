@@ -162,16 +162,27 @@ func TestServiceSetSyncEnabled(t *testing.T) {
 	assert.False(t, obj.Spec.IsSyncEnabled)
 }
 
-func TestServiceRetryConnectionBumpsGeneration(t *testing.T) {
+// RetryConnection does not mutate the spec: it dispatches an out-of-band re-probe
+// to the controller. The white-box harness has coreCtrl == nil, so the actual
+// re-probe is covered in core_controller_test.go; here we pin that the spec is
+// untouched and an unknown id still errors.
+func TestServiceRetryConnectionDoesNotMutateSpec(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha", "id-alpha")
 
+	before, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	require.NoError(t, err)
+
 	require.NoError(t, s.RetryConnection(ctx, id))
 
-	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	after, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), obj.Spec.RetryGeneration)
+	assert.Equal(t, before.Generation, after.Generation, "RetryConnection must not write the spec")
+	assert.Equal(t, before.Spec, after.Spec)
+
+	// An unknown id is still ErrNotFound.
+	assert.ErrorIs(t, s.RetryConnection(ctx, "nope"), ErrNotFound)
 }
 
 func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {

@@ -277,11 +277,10 @@ type ClusterPrincipal struct {
 	Username *string `json:"username,omitempty"`
 }
 
-// ClusterCoreSpec is a cluster record's desired state: the user/API-owned fields
-// plus an internal trigger counter (RetryGeneration) that is not exposed in the
-// GraphQL schema but is stored in the beehive spec JSON and used to force an
-// immediate reconcile without a dedicated "enqueue" API. (Resync pokes do not
-// use a spec counter — the controllers subscribe to the poke bus directly.)
+// ClusterCoreSpec is a cluster record's desired state: the user/API-owned fields.
+// There is no spec-level trigger counter — RetryConnection forces an immediate
+// re-probe out-of-band via the controller's in-process retry bus, and resync
+// pokes likewise drive the controllers directly, so neither writes the spec.
 type ClusterCoreSpec struct {
 	Name          *string       `json:"name,omitempty"`
 	IsSyncEnabled bool          `json:"isSyncEnabled"`
@@ -296,11 +295,6 @@ type ClusterCoreSpec struct {
 	// ClusterCoreStatus.Source.Kubeconfig during its reconcile, so the
 	// GraphQL layer reads from status as expected.
 	SourceObs *KubeconfigStatus `json:"sourceObs,omitempty"`
-
-	// RetryGeneration is incremented by Service.RetryConnection to force an
-	// immediate re-probe, resetting the cluster controller's failure backoff.
-	// Not in the GraphQL schema.
-	RetryGeneration int64 `json:"retryGeneration,omitempty"`
 }
 
 // ClusterCoreStatus is the Cluster beehive kind's stored status:

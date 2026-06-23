@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -89,11 +90,25 @@ type ClusterCoreController struct {
 
 	// pokeSvc is the resync bus; nil disables poke-driven re-probes (tests).
 	pokeSvc *poke.Service
-	pokeSub *pokeSubscription
+
+	// retryCh is the in-process targeted-retry bus: Service.RetryConnection sends
+	// a ClusterID and the background worker re-probes that one cluster out-of-band.
+	// Carries a payload (the target id), so it can't ride the payload-less poke bus.
+	retryCh chan ClusterID
+
+	// bgWG/bgCancel own the single background worker (StartBackground): it drains
+	// both the targeted-retry bus (one cluster) and the resync poke bus (all
+	// clusters) in one select, since both just trigger out-of-band re-probes.
+	bgWG     sync.WaitGroup
+	bgCancel context.CancelFunc
 
 	probe ProbeFunc
 	check CheckFunc
 }
+
+// retryBufferSize bounds the targeted-retry bus. A full buffer means a retry is
+// already queued, so further Reprobe calls are dropped (non-blocking).
+const retryBufferSize = 64
 
 // pokeReprobeTimeout bounds one cluster's poke-driven re-probe (its own probe +
 // health round-trips are separately capped inside probe/check).
@@ -124,37 +139,79 @@ func NewClusterCoreController(
 		cacheClient: cacheClient,
 		connMgr:     connMgr,
 		pokeSvc:     pokeSvc,
+		retryCh:     make(chan ClusterID, retryBufferSize),
 		probe:       probe,
 		check:       check,
 	}
 }
 
 // SetControllerClient injects the status-write client obtained from
-// beehive.Register. It backs the out-of-band poke re-probe (reprobeAll); the
-// reconcile path uses the client beehive passes into Reconcile instead. Call
+// beehive.Register. It backs the out-of-band re-probes (reprobeAll/reprobeOne);
+// the reconcile path uses the client beehive passes into Reconcile instead. Call
 // once, before the control plane starts.
 func (c *ClusterCoreController) SetControllerClient(cl beehive.ControllerClient[ClusterCoreStatus]) {
 	c.ctrlClient = cl
 }
 
-// StartPoke subscribes to the resync poke bus, re-probing every eligible cluster
-// on each signal. Call after the control plane has started; pair with StopPoke.
-func (c *ClusterCoreController) StartPoke() {
-	c.pokeSub = startPokeSubscription(c.pokeSvc, c.reprobeAll)
+// StartBackground launches the controller's single out-of-band worker. It drains
+// two re-probe sources in one select: the in-process targeted-retry bus (Reprobe →
+// reprobeOne, one cluster) and, when a poke bus is configured, the resync poke bus
+// (reprobeAll, every eligible cluster on OS resume / network-on). A nil pokeSvc
+// leaves the poke arm dormant (the channel stays nil and never fires), so the
+// retry bus still works. Call after the control plane has started; pair with
+// StopBackground.
+func (c *ClusterCoreController) StartBackground() {
+	ctx, cancelCtx := context.WithCancel(context.Background())
+
+	var pokeCh <-chan poke.Signal
+	cancelSub := func() {}
+	if c.pokeSvc != nil {
+		pokeCh, cancelSub = c.pokeSvc.Subscribe()
+	}
+	c.bgCancel = func() { cancelSub(); cancelCtx() }
+
+	c.bgWG.Go(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case id := <-c.retryCh:
+				c.reprobeOne(ctx, id)
+			case _, ok := <-pokeCh:
+				if !ok {
+					pokeCh = nil // poke bus closed; keep serving retries
+					continue
+				}
+				c.reprobeAll(ctx)
+			}
+		}
+	})
 }
 
-// StopPoke halts the poke subscription and joins its goroutine.
-func (c *ClusterCoreController) StopPoke() {
-	c.pokeSub.stop()
+// StopBackground halts the background worker (unsubscribing from the poke bus and
+// cancelling any in-flight re-probe) and joins its goroutine. Safe to call when
+// StartBackground was never called.
+func (c *ClusterCoreController) StopBackground() {
+	if c.bgCancel != nil {
+		c.bgCancel()
+	}
+	c.bgWG.Wait()
+}
+
+// Reprobe requests an immediate out-of-band re-probe of one cluster. Non-blocking:
+// the request is dropped if the bus buffer is full (a retry is already queued).
+// Backs Service.RetryConnection.
+func (c *ClusterCoreController) Reprobe(id ClusterID) {
+	select {
+	case c.retryCh <- id:
+	default:
+	}
 }
 
 // reprobeAll re-runs the connection reconcile for every eligible cluster,
 // forcing an immediate probe + health check (refreshing the connMgr config and
 // the Connected/Healthy conditions) instead of waiting for the next scheduled
-// reconcile. Driven by the poke bus on OS resume / network-on. It reuses
-// Reconcile, so a probe racing a beehive-scheduled reconcile for the same
-// cluster just does a redundant probe with an idempotent status write — pokes
-// are infrequent, so the double-probe is acceptable.
+// reconcile. Driven by the poke bus on OS resume / network-on.
 func (c *ClusterCoreController) reprobeAll(baseCtx context.Context) {
 	objs, err := c.coreClient.List(baseCtx)
 	if err != nil {
@@ -167,15 +224,38 @@ func (c *ClusterCoreController) reprobeAll(baseCtx context.Context) {
 		if baseCtx.Err() != nil {
 			return // shutting down
 		}
-		if !ConnectionEligible(obj) {
-			continue
+		c.reprobeObj(baseCtx, obj)
+	}
+}
+
+// reprobeOne re-runs the connection reconcile for one cluster by id, forcing an
+// immediate probe out-of-band. Driven by the targeted-retry bus
+// (Service.RetryConnection). An unknown id is a no-op (it may have been deleted
+// between the mutation and the worker draining the bus).
+func (c *ClusterCoreController) reprobeOne(baseCtx context.Context, id ClusterID) {
+	obj, err := c.coreClient.GetBySlug(baseCtx, ClusterSlug(id))
+	if err != nil {
+		if !errors.Is(err, beehive.ErrNotFound) && baseCtx.Err() == nil {
+			slog.Warn("clustercontroller: retry get cluster", "cluster", id, "err", err)
 		}
-		ctx, cancel := context.WithTimeout(baseCtx, pokeReprobeTimeout)
-		_, err := c.Reconcile(ctx, c.ctrlClient, obj)
-		cancel()
-		if err != nil {
-			slog.Warn("clustercontroller: poke re-probe", "cluster", obj.ID, "err", err)
-		}
+		return
+	}
+	c.reprobeObj(baseCtx, obj)
+}
+
+// reprobeObj forces an immediate out-of-band reconcile of one eligible cluster
+// object (shared by the poke-driven reprobeAll and the targeted reprobeOne). A
+// probe racing a beehive-scheduled reconcile for the same cluster just does a
+// redundant probe with an idempotent status write — re-probes are infrequent, so
+// the double-probe is acceptable.
+func (c *ClusterCoreController) reprobeObj(baseCtx context.Context, obj *beehive.Object[ClusterCoreSpec, ClusterCoreStatus]) {
+	if !ConnectionEligible(obj) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, pokeReprobeTimeout)
+	defer cancel()
+	if _, err := c.Reconcile(ctx, c.ctrlClient, obj); err != nil {
+		slog.Warn("clustercontroller: out-of-band re-probe", "cluster", obj.ID, "err", err)
 	}
 }
 

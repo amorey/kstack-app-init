@@ -49,9 +49,9 @@ type ClusterService interface {
 	CacheStats(ctx context.Context, id ClusterID) (*CacheStats, error)
 	// SetSyncEnabled toggles a cluster's sync and returns the updated record.
 	SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)
-	// RetryConnection forces an immediate re-probe (resetting the connection
-	// controller's failure backoff). The outcome lands on the record's
-	// conditions and reaches watchers through Watch.
+	// RetryConnection forces an immediate out-of-band re-probe of the cluster's
+	// connection. The outcome lands on the record's conditions and reaches
+	// watchers through Watch.
 	RetryConnection(ctx context.Context, id ClusterID) error
 	// ClearCache deletes the on-disk cache and bounces the sync engine; the
 	// (returned) record stays.
@@ -173,7 +173,10 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 	// The controllers' background work (poke-driven re-probe / engine restart) is
 	// the service's to drive now that beehive owns only the reconcile lifecycle.
 	// Start it once the control plane is running.
-	s.coreCtrl.StartPoke()
+	// The core controller's background worker drives both the targeted-retry bus
+	// (RetryConnection) and the poke bus; the cache controller reacts to pokes
+	// only. Both write status, so they live in the same start/drain window.
+	s.coreCtrl.StartBackground()
 	s.cacheCtrl.StartPoke()
 
 	// Start the watcher (fsnotify loop) before the importer, which subscribes to
@@ -185,9 +188,9 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 		s.watcher.Close()
 		s.importer.Stop()
 
-		// Stop poke-driven work before draining so no out-of-band re-probe or
-		// engine restart races the teardown.
-		s.coreCtrl.StopPoke()
+		// Stop out-of-band re-probe / engine-restart work before draining so none
+		// of it races the teardown.
+		s.coreCtrl.StopBackground()
 		s.cacheCtrl.StopPoke()
 
 		// Then drain the reconcile loops, tear down the engines (no reconcile can
@@ -287,16 +290,18 @@ func (s *Service) SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool
 	return &c, nil
 }
 
-// RetryConnection implements ClusterService.
+// RetryConnection implements ClusterService. It validates the cluster exists,
+// then dispatches an immediate out-of-band re-probe to the connection controller
+// via its in-process retry bus — no spec write. The outcome lands on the record's
+// conditions and reaches watchers through Watch.
 func (s *Service) RetryConnection(ctx context.Context, id ClusterID) error {
-	obj, err := s.clusterByID(ctx, id)
-	if err != nil {
+	if _, err := s.clusterByID(ctx, id); err != nil {
 		return err
 	}
-	spec := obj.Spec
-	spec.RetryGeneration++
-	_, err = s.coreClient.Update(ctx, obj.ID, spec)
-	return err
+	if s.coreCtrl != nil {
+		s.coreCtrl.Reprobe(id)
+	}
+	return nil
 }
 
 // ClearCache implements ClusterService. It validates the cluster exists before

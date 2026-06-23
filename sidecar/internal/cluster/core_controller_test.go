@@ -306,8 +306,8 @@ func TestClusterCoreControllerPokeReprobes(t *testing.T) {
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
-	ctrl.StartPoke()
-	t.Cleanup(func() { ctrl.StopPoke(); _ = stop(ctx) })
+	ctrl.StartBackground()
+	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
 
 	id := cluster.ClusterID("reprobe-uuid")
 	_, err = coreClient.Create(ctx, eligibleSpec("alpha"), beehive.WithSlug(cluster.ClusterSlug(id)))
@@ -322,4 +322,49 @@ func TestClusterCoreControllerPokeReprobes(t *testing.T) {
 	pk.Poke(poke.SourceHost)
 	require.Eventually(t, func() bool { return probeCount.Load() > before },
 		2*time.Second, 10*time.Millisecond, "poke should force an immediate re-probe")
+}
+
+// TestClusterCoreControllerReprobeOne verifies the in-process retry bus: Reprobe
+// forces an immediate out-of-band re-probe of one targeted cluster, rather than
+// waiting for the next scheduled (30s) reconcile.
+func TestClusterCoreControllerReprobeOne(t *testing.T) {
+	ctx := context.Background()
+
+	var probeCount atomic.Int32
+	probe := func(context.Context, *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
+		probeCount.Add(1)
+		uid := "uid"
+		return cluster.ClusterServer{UID: &uid}, cluster.ClusterPrincipal{}, nil
+	}
+
+	bh := testutil.NewTestBeehiveUnstarted(t)
+	coreClient := beehive.NewClient[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus](bh, cluster.ClusterGroupKind)
+	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
+	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
+
+	// pokeSvc is nil — the retry bus is in-process, independent of the poke bus.
+	ctrl := cluster.NewClusterCoreController(w, coreClient, cacheClient, nil, nil, probe, staticCheck(cluster.HealthPhaseHealthy))
+	cc, err := beehive.Register(bh, cluster.ClusterGroupKind, ctrl)
+	require.NoError(t, err)
+	ctrl.SetControllerClient(cc)
+	_, err = beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	ctrl.StartBackground()
+	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
+
+	id := cluster.ClusterID("retry-uuid")
+	_, err = coreClient.Create(ctx, eligibleSpec("alpha"), beehive.WithSlug(cluster.ClusterSlug(id)))
+	require.NoError(t, err)
+
+	// The initial scheduled reconcile probes once (then requeues ~30s out).
+	require.Eventually(t, func() bool { return probeCount.Load() >= 1 },
+		2*time.Second, 10*time.Millisecond, "initial reconcile should probe once")
+	before := probeCount.Load()
+
+	// Reprobe forces an immediate re-probe of the targeted cluster.
+	ctrl.Reprobe(id)
+	require.Eventually(t, func() bool { return probeCount.Load() > before },
+		2*time.Second, 10*time.Millisecond, "Reprobe should force an immediate re-probe")
 }
