@@ -87,16 +87,9 @@ func NewTestBeehiveUnstarted(t *testing.T) *beehive.Beehive {
 }
 
 // NoopController satisfies beehive.Controller without doing anything.
-type NoopController[Spec, Status any] struct {
-	Client beehive.ControllerClient[Status]
-}
+type NoopController[Spec, Status any] struct{}
 
-func (c *NoopController[Spec, Status]) Start(cl beehive.ControllerClient[Status]) error {
-	c.Client = cl
-	return nil
-}
-func (c *NoopController[Spec, Status]) Stop(_ context.Context) error { return nil }
-func (c *NoopController[Spec, Status]) Reconcile(_ context.Context, _ *beehive.Object[Spec, Status]) (beehive.Result, error) {
+func (c *NoopController[Spec, Status]) Reconcile(_ context.Context, _ beehive.ControllerClient[Status], _ *beehive.Object[Spec, Status]) (beehive.Result, error) {
 	return beehive.Result{}, nil
 }
 
@@ -106,8 +99,10 @@ func (c *NoopController[Spec, Status]) Reconcile(_ context.Context, _ *beehive.O
 func NewTestBeehive(t *testing.T) *beehive.Beehive {
 	t.Helper()
 	bh := NewTestBeehiveUnstarted(t)
-	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, &NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{}))
-	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
+	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{})
+	require.NoError(t, err)
+	_, err = beehive.Register(bh, cluster.ClusterCacheGroupKind, &NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{})
+	require.NoError(t, err)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })

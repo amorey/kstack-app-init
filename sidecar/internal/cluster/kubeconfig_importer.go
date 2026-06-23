@@ -42,29 +42,29 @@ import (
 // A future creator (manual, cloud) is a sibling importer writing Cluster
 // objects with a different Source variant — they share this one Cluster kind.
 type KubeconfigImporter struct {
-	cfgSource     KubeConfigSource
-	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
-	baseCtx       context.Context
-	baseCancel    context.CancelFunc
-	wg            sync.WaitGroup
+	cfgSource  KubeConfigSource
+	coreClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+	wg         sync.WaitGroup
 }
 
-// NewKubeconfigImporter builds an importer that uses clusterClient to manage
+// NewKubeconfigImporter builds an importer that uses coreClient to manage
 // kubeconfig-sourced Cluster objects in beehive.
-func NewKubeconfigImporter(cfgSource KubeConfigSource, clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]) *KubeconfigImporter {
+func NewKubeconfigImporter(cfgSource KubeConfigSource, coreClient beehive.Client[ClusterSpec, ClusterConnectionStatus]) *KubeconfigImporter {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &KubeconfigImporter{
-		cfgSource:     cfgSource,
-		clusterClient: clusterClient,
-		baseCtx:       ctx,
-		baseCancel:    cancel,
+		cfgSource:  cfgSource,
+		coreClient: coreClient,
+		baseCtx:    ctx,
+		baseCancel: cancel,
 	}
 }
 
 // ClusterClient exposes the underlying beehive client for tests that need to
 // inspect the Cluster objects after a reconcile.
 func (im *KubeconfigImporter) ClusterClient() beehive.Client[ClusterSpec, ClusterConnectionStatus] {
-	return im.clusterClient
+	return im.coreClient
 }
 
 // Start launches the import loop. The watcher subscription is established
@@ -110,7 +110,7 @@ func (im *KubeconfigImporter) run(sub k8shelpers.KubeConfigSubscription) {
 // times: an unchanged snapshot writes nothing, so it triggers nothing
 // downstream.
 func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.Config) error {
-	existing, err := im.clusterClient.List(ctx)
+	existing, err := im.coreClient.List(ctx)
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,7 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 		}
 		spec := obj.Spec
 		spec.SourceObs = &obs
-		if _, err := im.clusterClient.Update(ctx, obj.ID, spec); err != nil {
+		if _, err := im.coreClient.Update(ctx, obj.ID, spec); err != nil {
 			return err
 		}
 	}
@@ -164,7 +164,7 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 		orphaned.IsDefault = false
 		spec := obj.Spec
 		spec.SourceObs = &orphaned
-		if _, err := im.clusterClient.Update(ctx, obj.ID, spec); err != nil {
+		if _, err := im.coreClient.Update(ctx, obj.ID, spec); err != nil {
 			return err
 		}
 	}
@@ -176,7 +176,7 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 // of the remote cluster's UID (unknown until the first probe).
 func (im *KubeconfigImporter) createCluster(ctx context.Context, contextName string, obs KubeconfigStatus) error {
 	id := ClusterID(uuid.NewString())
-	_, err := im.clusterClient.Create(ctx, ClusterSpec{
+	_, err := im.coreClient.Create(ctx, ClusterSpec{
 		IsSyncEnabled: true,
 		IsActive:      true,
 		Source:        ClusterSource{Kubeconfig: &ClusterSourceKubeconfig{Context: contextName}},

@@ -81,11 +81,11 @@ type CheckFunc func(ctx context.Context, cfg *rest.Config) (HealthPhase, *string
 //  7. Writes all observations to ClusterConnectionStatus via UpdateStatus.
 //  8. Updates connMgr: Set on success, Delete on failure or ineligibility.
 type ClusterController struct {
-	cfgSource     KubeConfigSource
-	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
-	cacheClient   beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
-	connMgr       *ConnectionManager
-	ctrlClient    beehive.ControllerClient[ClusterConnectionStatus]
+	cfgSource   KubeConfigSource
+	coreClient  beehive.Client[ClusterSpec, ClusterConnectionStatus]
+	cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	connMgr     *ConnectionManager
+	ctrlClient  beehive.ControllerClient[ClusterConnectionStatus]
 
 	// pokeSvc is the resync bus; nil disables poke-driven re-probes (tests).
 	pokeSvc *poke.Service
@@ -99,13 +99,13 @@ type ClusterController struct {
 // health round-trips are separately capped inside probe/check).
 const pokeReprobeTimeout = connectionProbeTimeout + healthProbeTimeout
 
-// NewClusterController builds the controller. clusterClient lets it enumerate
+// NewClusterController builds the controller. coreClient lets it enumerate
 // clusters for a poke-driven re-probe; connMgr may be nil (no connection
 // tracking); pokeSvc may be nil (no poke-driven re-probe). probe and check
 // default to the real network implementations; tests inject fakes.
 func NewClusterController(
 	cfgSource KubeConfigSource,
-	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus],
+	coreClient beehive.Client[ClusterSpec, ClusterConnectionStatus],
 	cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus],
 	connMgr *ConnectionManager,
 	pokeSvc *poke.Service,
@@ -119,28 +119,33 @@ func NewClusterController(
 		check = checkServerHealth
 	}
 	return &ClusterController{
-		cfgSource:     cfgSource,
-		clusterClient: clusterClient,
-		cacheClient:   cacheClient,
-		connMgr:       connMgr,
-		pokeSvc:       pokeSvc,
-		probe:         probe,
-		check:         check,
+		cfgSource:   cfgSource,
+		coreClient:  coreClient,
+		cacheClient: cacheClient,
+		connMgr:     connMgr,
+		pokeSvc:     pokeSvc,
+		probe:       probe,
+		check:       check,
 	}
 }
 
-// Start stores the ControllerClient handed in by beehive and subscribes to the
-// poke bus, re-probing every eligible cluster on each resync signal.
-func (c *ClusterController) Start(cl beehive.ControllerClient[ClusterConnectionStatus]) error {
+// SetControllerClient injects the status-write client obtained from
+// beehive.Register. It backs the out-of-band poke re-probe (reprobeAll); the
+// reconcile path uses the client beehive passes into Reconcile instead. Call
+// once, before the control plane starts.
+func (c *ClusterController) SetControllerClient(cl beehive.ControllerClient[ClusterConnectionStatus]) {
 	c.ctrlClient = cl
-	c.pokeSub = startPokeSubscription(c.pokeSvc, c.reprobeAll)
-	return nil
 }
 
-// Stop halts the poke subscription and joins its goroutine.
-func (c *ClusterController) Stop(_ context.Context) error {
+// StartPoke subscribes to the resync poke bus, re-probing every eligible cluster
+// on each signal. Call after the control plane has started; pair with StopPoke.
+func (c *ClusterController) StartPoke() {
+	c.pokeSub = startPokeSubscription(c.pokeSvc, c.reprobeAll)
+}
+
+// StopPoke halts the poke subscription and joins its goroutine.
+func (c *ClusterController) StopPoke() {
 	c.pokeSub.stop()
-	return nil
 }
 
 // reprobeAll re-runs the connection reconcile for every eligible cluster,
@@ -151,7 +156,7 @@ func (c *ClusterController) Stop(_ context.Context) error {
 // cluster just does a redundant probe with an idempotent status write — pokes
 // are infrequent, so the double-probe is acceptable.
 func (c *ClusterController) reprobeAll(baseCtx context.Context) {
-	objs, err := c.clusterClient.List(baseCtx)
+	objs, err := c.coreClient.List(baseCtx)
 	if err != nil {
 		if baseCtx.Err() == nil {
 			slog.Warn("clustercontroller: poke list clusters", "err", err)
@@ -166,7 +171,7 @@ func (c *ClusterController) reprobeAll(baseCtx context.Context) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(baseCtx, pokeReprobeTimeout)
-		_, err := c.Reconcile(ctx, obj)
+		_, err := c.Reconcile(ctx, c.ctrlClient, obj)
 		cancel()
 		if err != nil {
 			slog.Warn("clustercontroller: poke re-probe", "cluster", obj.ID, "err", err)
@@ -177,7 +182,7 @@ func (c *ClusterController) reprobeAll(baseCtx context.Context) {
 // Reconcile converges one Cluster object. The reconcile steps run in sequence;
 // the first failure short-circuits (probe failure records an observation and
 // requests backoff, store errors return an error for the harness to retry).
-func (c *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterConnectionStatus]) (beehive.Result, error) {
+func (c *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterConnectionStatus], obj *beehive.Object[ClusterSpec, ClusterConnectionStatus]) (beehive.Result, error) {
 	if obj.DeletionRequestedAt != nil {
 		// No finalizers to clear; beehive GC handles ClusterCache cascade.
 		return beehive.Result{}, nil
@@ -215,7 +220,7 @@ func (c *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[C
 		return beehive.Result{RequeueAfter: requeueAfter}, nil
 	}
 	return beehive.Result{RequeueAfter: requeueAfter},
-		c.ctrlClient.UpdateStatus(ctx, obj.ID, obj.Generation, working)
+		client.UpdateStatus(ctx, obj.ID, obj.Generation, working)
 }
 
 // converge runs the eligibility gate → credential resolution → probe → health

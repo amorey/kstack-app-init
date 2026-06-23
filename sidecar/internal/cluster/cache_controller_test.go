@@ -68,13 +68,13 @@ func newCacheTestBeehive(t *testing.T, connMgr *cluster.ConnectionManager) (
 	t.Helper()
 	bh := testutil.NewTestBeehiveUnstarted(t)
 
-	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
+	coreClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
 	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
 
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
 	mgr := store.NewManager(t.TempDir())
 
-	ctrl := cluster.NewClusterCacheController(w, clusterClient, mgr, connMgr, nil)
+	ctrl := cluster.NewClusterCacheController(w, coreClient, mgr, connMgr, nil)
 	fakeEng := &fakeEngine{}
 	slot := &capturedCfgSlot{}
 	ctrl.SetNewEngine(func(cfg *rest.Config, id cluster.ClusterID, sink engine.Sink) cluster.EngineHandle {
@@ -83,13 +83,16 @@ func newCacheTestBeehive(t *testing.T, connMgr *cluster.ConnectionManager) (
 		return fakeEng
 	})
 
-	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, &testutil.NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{}))
-	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, ctrl))
+	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &testutil.NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{})
+	require.NoError(t, err)
+	cc, err := beehive.Register(bh, cluster.ClusterCacheGroupKind, ctrl)
+	require.NoError(t, err)
+	ctrl.SetControllerClient(cc)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = stop(context.Background()) })
+	t.Cleanup(func() { _ = stop(context.Background()); _ = ctrl.StopEngines() })
 
-	return clusterClient, cacheClient, fakeEng, slot
+	return coreClient, cacheClient, fakeEng, slot
 }
 
 // capturedCfgSlot holds the REST config that was passed to the engine factory.
@@ -132,12 +135,12 @@ func eligibleClusterSpec(contextName string) cluster.ClusterSpec {
 
 func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
 	ctx := context.Background()
-	clusterClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
+	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
 
 	id := cluster.ClusterID("abc-uuid")
 
 	// Create parent Cluster.
-	clusterObj, err := clusterClient.Create(ctx, eligibleClusterSpec("alpha"),
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"),
 		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 
@@ -156,14 +159,14 @@ func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
 
 func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {
 	ctx := context.Background()
-	clusterClient, cacheClient, _, _ := newCacheTestBeehive(t, nil)
+	coreClient, cacheClient, _, _ := newCacheTestBeehive(t, nil)
 
 	id := cluster.ClusterID("paused-uuid")
 
 	// IsSyncEnabled=false → ineligible for sync.
 	spec := eligibleClusterSpec("alpha")
 	spec.IsSyncEnabled = false
-	clusterObj, err := clusterClient.Create(ctx, spec,
+	clusterObj, err := coreClient.Create(ctx, spec,
 		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 
@@ -185,19 +188,19 @@ func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {
 // beehive rejects the write as a future generation and the report is dropped.
 func TestCacheControllerReportWithParentGenerationAhead(t *testing.T) {
 	ctx := context.Background()
-	clusterClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
+	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
 
 	id := cluster.ClusterID("gen-skew-uuid")
 
 	// Create the parent Cluster, then advance its generation past 1 by editing
 	// its spec, before the ClusterCache child exists.
 	spec := eligibleClusterSpec("alpha")
-	clusterObj, err := clusterClient.Create(ctx, spec, beehive.WithSlug(cluster.ClusterSlug(id)))
+	clusterObj, err := coreClient.Create(ctx, spec, beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 	for _, name := range []string{"rename-1", "rename-2"} {
 		n := name
 		spec.Name = &n
-		clusterObj, err = clusterClient.Update(ctx, clusterObj.ID, spec)
+		clusterObj, err = coreClient.Update(ctx, clusterObj.ID, spec)
 		require.NoError(t, err)
 	}
 	require.Greater(t, clusterObj.Generation, int64(1),
@@ -239,9 +242,9 @@ func TestCacheControllerUsesConnectionManagerConfig(t *testing.T) {
 	injected := &rest.Config{Host: "https://from-conn-mgr:6443"}
 	connMgr.Set(id, injected)
 
-	clusterClient, cacheClient, _, slot := newCacheTestBeehive(t, connMgr)
+	coreClient, cacheClient, _, slot := newCacheTestBeehive(t, connMgr)
 
-	clusterObj, err := clusterClient.Create(ctx, eligibleClusterSpec("alpha"),
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"),
 		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
@@ -259,10 +262,10 @@ func TestCacheControllerUsesConnectionManagerConfig(t *testing.T) {
 // the cache controller still works when no ConnectionManager is provided.
 func TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager(t *testing.T) {
 	ctx := context.Background()
-	clusterClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
+	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
 
 	id := cluster.ClusterID("fallback-uuid")
-	clusterObj, err := clusterClient.Create(ctx, eligibleClusterSpec("alpha"),
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"),
 		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
@@ -284,12 +287,12 @@ func TestCacheControllerPokeRestartsLiveEngine(t *testing.T) {
 	pk := poke.New()
 
 	bh := testutil.NewTestBeehiveUnstarted(t)
-	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
+	coreClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
 	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
 	mgr := store.NewManager(t.TempDir())
 
-	ctrl := cluster.NewClusterCacheController(w, clusterClient, mgr, nil, pk)
+	ctrl := cluster.NewClusterCacheController(w, coreClient, mgr, nil, pk)
 
 	// Factory records every engine it builds, so the test can see the restart
 	// (old engine stopped, a second engine created and started).
@@ -303,14 +306,18 @@ func TestCacheControllerPokeRestartsLiveEngine(t *testing.T) {
 		return e
 	})
 
-	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, &testutil.NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{}))
-	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, ctrl))
+	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &testutil.NoopController[cluster.ClusterSpec, cluster.ClusterConnectionStatus]{})
+	require.NoError(t, err)
+	cc, err := beehive.Register(bh, cluster.ClusterCacheGroupKind, ctrl)
+	require.NoError(t, err)
+	ctrl.SetControllerClient(cc)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = stop(ctx) })
+	ctrl.StartPoke()
+	t.Cleanup(func() { ctrl.StopPoke(); _ = stop(ctx); _ = ctrl.StopEngines() })
 
 	id := cluster.ClusterID("poke-uuid")
-	clusterObj, err := clusterClient.Create(ctx, eligibleClusterSpec("alpha"),
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"),
 		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 	_, err = cacheClient.Create(ctx, cluster.ClusterCacheSpec{},

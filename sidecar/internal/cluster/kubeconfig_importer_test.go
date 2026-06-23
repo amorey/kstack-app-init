@@ -33,9 +33,9 @@ import (
 func newTestImporter(t *testing.T, cfg *api.Config) *cluster.KubeconfigImporter {
 	t.Helper()
 	bh := testutil.NewTestBeehive(t)
-	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
+	coreClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
 	w := testutil.NewStaticWatcher(t, cfg)
-	return cluster.NewKubeconfigImporter(w, clusterClient)
+	return cluster.NewKubeconfigImporter(w, coreClient)
 }
 
 func TestImporterNewContextCreatesCluster(t *testing.T) {

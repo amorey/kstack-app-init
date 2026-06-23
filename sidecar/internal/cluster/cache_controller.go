@@ -89,11 +89,11 @@ type engineEntry struct {
 // engines are in-memory runtime state the controller already owns, so a poke
 // needs no durable spec write — see restartLiveEngines.
 type ClusterCacheController struct {
-	cfgSource     KubeConfigSource
-	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
-	cacheManager  *store.Manager
-	connMgr       *ConnectionManager
-	ctrlClient    beehive.ControllerClient[ClusterCacheStatus]
+	cfgSource    KubeConfigSource
+	coreClient   beehive.Client[ClusterSpec, ClusterConnectionStatus]
+	cacheManager *store.Manager
+	connMgr      *ConnectionManager
+	ctrlClient   beehive.ControllerClient[ClusterCacheStatus]
 
 	// pokeSvc is the resync bus; nil disables poke-driven restarts (tests).
 	pokeSvc *poke.Service
@@ -114,18 +114,18 @@ type ClusterCacheController struct {
 // DBs. connMgr may be nil (credentials are then resolved from the kubeconfig).
 func NewClusterCacheController(
 	cfgSource KubeConfigSource,
-	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus],
+	coreClient beehive.Client[ClusterSpec, ClusterConnectionStatus],
 	manager *store.Manager,
 	connMgr *ConnectionManager,
 	pokeSvc *poke.Service,
 ) *ClusterCacheController {
 	c := &ClusterCacheController{
-		cfgSource:     cfgSource,
-		clusterClient: clusterClient,
-		cacheManager:  manager,
-		connMgr:       connMgr,
-		pokeSvc:       pokeSvc,
-		engines:       make(map[ClusterID]*engineEntry),
+		cfgSource:    cfgSource,
+		coreClient:   coreClient,
+		cacheManager: manager,
+		connMgr:      connMgr,
+		pokeSvc:      pokeSvc,
+		engines:      make(map[ClusterID]*engineEntry),
 	}
 	cm := manager
 	c.newEngine = func(cfg *rest.Config, id ClusterID, sink engine.Sink) EngineHandle {
@@ -144,17 +144,31 @@ func (c *ClusterCacheController) SetNewEngine(f NewEngineFunc) {
 	c.newEngine = f
 }
 
-// Start stores the ControllerClient and subscribes to the poke bus, restarting
-// live engines on each resync signal.
-func (c *ClusterCacheController) Start(cl beehive.ControllerClient[ClusterCacheStatus]) error {
+// SetControllerClient injects the status-write client obtained from
+// beehive.Register. It backs the out-of-band engine sink (applyEngineReport),
+// which writes status from engine goroutines; the reconcile path uses the client
+// beehive passes into Reconcile instead. Call once, before the control plane
+// starts — an engine spawned by a startup reconcile may report immediately.
+func (c *ClusterCacheController) SetControllerClient(cl beehive.ControllerClient[ClusterCacheStatus]) {
 	c.ctrlClient = cl
-	c.pokeSub = startPokeSubscription(c.pokeSvc, func(context.Context) { c.restartLiveEngines() })
-	return nil
 }
 
-// Stop halts the poke subscription, then tears down every running engine.
-func (c *ClusterCacheController) Stop(_ context.Context) error {
+// StartPoke subscribes to the resync poke bus, restarting every live engine on
+// each signal. Call after the control plane has started; pair with StopPoke.
+func (c *ClusterCacheController) StartPoke() {
+	c.pokeSub = startPokeSubscription(c.pokeSvc, func(context.Context) { c.restartLiveEngines() })
+}
+
+// StopPoke halts the poke subscription and joins its goroutine. Call before
+// draining the reconcile loops so a resync restart can't race teardown.
+func (c *ClusterCacheController) StopPoke() {
 	c.pokeSub.stop()
+}
+
+// StopEngines tears down every running sync engine. Call after the reconcile
+// loops have drained (so no reconcile can spawn a fresh engine) and before the
+// per-cluster cache the engines write into is shut down.
+func (c *ClusterCacheController) StopEngines() error {
 	c.mu.Lock()
 	entries := c.engines
 	c.engines = make(map[ClusterID]*engineEntry)
@@ -170,14 +184,14 @@ func (c *ClusterCacheController) Stop(_ context.Context) error {
 }
 
 // Reconcile converges one ClusterCache object toward its parent Cluster's spec.
-func (c *ClusterCacheController) Reconcile(ctx context.Context, obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) (beehive.Result, error) {
+func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) (beehive.Result, error) {
 	if obj.Slug == nil {
 		return beehive.Result{}, errors.New("clustercachecontroller: object has no slug")
 	}
 	clusterID := ClusterIDFromSlug(*obj.Slug)
 
 	// Read the parent Cluster to determine eligibility.
-	clusterObj, err := c.clusterClient.GetBySlug(ctx, ClusterSlug(clusterID))
+	clusterObj, err := c.coreClient.GetBySlug(ctx, ClusterSlug(clusterID))
 	if err != nil {
 		if errors.Is(err, beehive.ErrNotFound) {
 			// Parent gone (GC race); our object will be cleaned up too.
@@ -188,7 +202,7 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, obj *beehive.Obj
 
 	// Add DependsOn edge so beehive re-queues us when the parent Cluster spec
 	// changes (e.g. IsSyncEnabled toggled), propagating eligibility changes.
-	if err := c.ctrlClient.AddDependency(ctx, obj.ID, clusterObj.ID); err != nil {
+	if err := client.AddDependency(ctx, obj.ID, clusterObj.ID); err != nil {
 		return beehive.Result{}, err
 	}
 
@@ -217,7 +231,7 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, obj *beehive.Obj
 		return beehive.Result{RequeueAfter: requeueAfter}, nil
 	}
 	return beehive.Result{RequeueAfter: requeueAfter},
-		c.ctrlClient.UpdateStatus(ctx, obj.ID, obj.Generation, working)
+		client.UpdateStatus(ctx, obj.ID, obj.Generation, working)
 }
 
 // converge manages the sync engine toward the parent Cluster's spec.

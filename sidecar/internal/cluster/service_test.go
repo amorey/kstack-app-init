@@ -32,19 +32,12 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
-// noopController satisfies beehive.Controller without reconciling — it just
-// captures its ControllerClient so a test can write status directly (the plain
-// Client cannot).
-type noopController[Spec, Status any] struct {
-	client beehive.ControllerClient[Status]
-}
+// noopController satisfies beehive.Controller without reconciling. A test gets a
+// ControllerClient to write status directly (the plain Client cannot) from the
+// value beehive.Register returns for the kind.
+type noopController[Spec, Status any] struct{}
 
-func (c *noopController[Spec, Status]) Start(cl beehive.ControllerClient[Status]) error {
-	c.client = cl
-	return nil
-}
-func (c *noopController[Spec, Status]) Stop(context.Context) error { return nil }
-func (c *noopController[Spec, Status]) Reconcile(context.Context, *beehive.Object[Spec, Status]) (beehive.Result, error) {
+func (c *noopController[Spec, Status]) Reconcile(context.Context, beehive.ControllerClient[Status], *beehive.Object[Spec, Status]) (beehive.Result, error) {
 	return beehive.Result{}, nil
 }
 
@@ -59,23 +52,24 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterCac
 	bh, err := beehive.New(st, beehive.WithResyncInterval(0))
 	require.NoError(t, err)
 
-	clusterClient := beehive.NewClient[ClusterSpec, ClusterConnectionStatus](bh, ClusterGroupKind)
+	coreClient := beehive.NewClient[ClusterSpec, ClusterConnectionStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
-	cacheNoop := &noopController[ClusterCacheSpec, ClusterCacheStatus]{}
-	require.NoError(t, beehive.Register(bh, ClusterGroupKind, &noopController[ClusterSpec, ClusterConnectionStatus]{}))
-	require.NoError(t, beehive.Register(bh, ClusterCacheGroupKind, cacheNoop))
+	_, err = beehive.Register(bh, ClusterGroupKind, &noopController[ClusterSpec, ClusterConnectionStatus]{})
+	require.NoError(t, err)
+	cacheCC, err := beehive.Register(bh, ClusterCacheGroupKind, &noopController[ClusterCacheSpec, ClusterCacheStatus]{})
+	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })
 
 	return &Service{
-		clusterClient: clusterClient,
-		cacheClient:   cacheClient,
-		cacheManager:  store.NewManager(t.TempDir()),
-		connMgr:       NewConnectionManager(),
-	}, cacheNoop.client
+		coreClient:   coreClient,
+		cacheClient:  cacheClient,
+		cacheManager: store.NewManager(t.TempDir()),
+		connMgr:      NewConnectionManager(),
+	}, cacheCC
 }
 
 // seedCluster creates a Cluster (as the importer would) and returns its
@@ -84,7 +78,7 @@ func seedCluster(t *testing.T, s *Service, ctxName string, id ClusterID) Cluster
 	t.Helper()
 	ctx := context.Background()
 	name := ctxName
-	_, err := s.clusterClient.Create(ctx, ClusterSpec{
+	_, err := s.coreClient.Create(ctx, ClusterSpec{
 		Name:          &name,
 		IsSyncEnabled: true,
 		IsActive:      true,
@@ -144,9 +138,9 @@ func TestServiceGetDeletionPendingIsNil(t *testing.T) {
 	s, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha", "id-alpha")
 
-	obj, err := s.clusterClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	require.NoError(t, err)
-	require.NoError(t, s.clusterClient.Delete(ctx, obj.ID))
+	require.NoError(t, s.coreClient.Delete(ctx, obj.ID))
 
 	c, err := s.Get(ctx, id)
 	require.NoError(t, err)
@@ -163,7 +157,7 @@ func TestServiceSetSyncEnabled(t *testing.T) {
 	require.NotNil(t, c)
 	assert.False(t, c.Spec.IsSyncEnabled)
 
-	obj, err := s.clusterClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	require.NoError(t, err)
 	assert.False(t, obj.Spec.IsSyncEnabled)
 }
@@ -175,7 +169,7 @@ func TestServiceRetryConnectionBumpsGeneration(t *testing.T) {
 
 	require.NoError(t, s.RetryConnection(ctx, id))
 
-	obj, err := s.clusterClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), obj.Spec.RetryGeneration)
 }
@@ -208,7 +202,7 @@ func TestServiceDeleteTombstonesCluster(t *testing.T) {
 
 	// Delete tombstones the Cluster (soft delete); beehive GC then cascades to
 	// its ClusterCache.
-	obj, err := s.clusterClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	require.NoError(t, err)
 	assert.NotNil(t, obj.DeletionRequestedAt)
 }

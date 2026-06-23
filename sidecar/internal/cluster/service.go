@@ -74,11 +74,12 @@ type Service struct {
 
 	watcher *k8shelpers.KubeConfigWatcher
 
-	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
-	cacheClient   beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
-	cacheManager  *store.Manager
-	connMgr       *ConnectionManager
-	cacheCtrl     *ClusterCacheController
+	coreClient   beehive.Client[ClusterSpec, ClusterConnectionStatus]
+	cacheClient  beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	cacheManager *store.Manager
+	connMgr      *ConnectionManager
+	coreCtrl     *ClusterController
+	cacheCtrl    *ClusterCacheController
 
 	importer *KubeconfigImporter
 	pokeSvc  *poke.Service
@@ -117,7 +118,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	clusterClient := beehive.NewClient[ClusterSpec, ClusterConnectionStatus](bh, ClusterGroupKind)
+	coreClient := beehive.NewClient[ClusterSpec, ClusterConnectionStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
 	// The cache manager owns the per-cluster SQLite cache files under
@@ -126,29 +127,36 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 
 	connMgr := NewConnectionManager()
 
-	clusterCtrl := NewClusterController(watcher, clusterClient, cacheClient, connMgr, pokeSvc, nil, nil)
-	cacheCtrl := NewClusterCacheController(watcher, clusterClient, cacheManager, connMgr, pokeSvc)
+	coreCtrl := NewClusterController(watcher, coreClient, cacheClient, connMgr, pokeSvc, nil, nil)
+	cacheCtrl := NewClusterCacheController(watcher, coreClient, cacheManager, connMgr, pokeSvc)
 
-	if err := errors.Join(
-		beehive.Register(bh, ClusterGroupKind, clusterCtrl),
-		beehive.Register(bh, ClusterCacheGroupKind, cacheCtrl),
-	); err != nil {
+	// Register returns each kind's status-write ControllerClient. The reconcile
+	// path receives it as a Reconcile argument, but the controllers also write
+	// status out-of-band (the connection controller's poke re-probe, the cache
+	// controller's engine sink), so we inject it now — before bh.Start, since a
+	// startup reconcile may spawn an engine that reports immediately.
+	coreCC, errCluster := beehive.Register(bh, ClusterGroupKind, coreCtrl)
+	cacheCC, errCache := beehive.Register(bh, ClusterCacheGroupKind, cacheCtrl)
+	if err := errors.Join(errCluster, errCache); err != nil {
 		bhStore.Close()
 		_ = watcher.Close()
 		return nil, fmt.Errorf("register cluster controllers: %w", err)
 	}
+	coreCtrl.SetControllerClient(coreCC)
+	cacheCtrl.SetControllerClient(cacheCC)
 
 	return &Service{
-		bh:            bh,
-		bhStore:       bhStore,
-		watcher:       watcher,
-		clusterClient: clusterClient,
-		cacheClient:   cacheClient,
-		cacheManager:  cacheManager,
-		connMgr:       connMgr,
-		cacheCtrl:     cacheCtrl,
-		importer:      NewKubeconfigImporter(watcher, clusterClient),
-		pokeSvc:       pokeSvc,
+		bh:           bh,
+		bhStore:      bhStore,
+		watcher:      watcher,
+		coreClient:   coreClient,
+		cacheClient:  cacheClient,
+		cacheManager: cacheManager,
+		connMgr:      connMgr,
+		coreCtrl:     coreCtrl,
+		cacheCtrl:    cacheCtrl,
+		importer:     NewKubeconfigImporter(watcher, coreClient),
+		pokeSvc:      pokeSvc,
 	}, nil
 }
 
@@ -162,6 +170,12 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 		return nil, fmt.Errorf("start beehive: %w", err)
 	}
 
+	// The controllers' background work (poke-driven re-probe / engine restart) is
+	// the service's to drive now that beehive owns only the reconcile lifecycle.
+	// Start it once the control plane is running.
+	s.coreCtrl.StartPoke()
+	s.cacheCtrl.StartPoke()
+
 	// Start the watcher (fsnotify loop) before the importer, which subscribes to
 	// its snapshots current-on-subscribe.
 	s.watcher.Start()
@@ -170,8 +184,18 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 	stop := func(ctx context.Context) error {
 		s.watcher.Close()
 		s.importer.Stop()
+
+		// Stop poke-driven work before draining so no out-of-band re-probe or
+		// engine restart races the teardown.
+		s.coreCtrl.StopPoke()
+		s.cacheCtrl.StopPoke()
+
+		// Then drain the reconcile loops, tear down the engines (no reconcile can
+		// spawn a fresh one now), and only then shut the cache they wrote into.
+		bhErr := bhStop(ctx)
+		engErr := s.cacheCtrl.StopEngines()
 		cacheErr := s.cacheManager.Shutdown(ctx)
-		return errors.Join(bhStop(ctx), cacheErr)
+		return errors.Join(bhErr, engErr, cacheErr)
 	}
 	return stop, nil
 }
@@ -190,7 +214,7 @@ func (s *Service) List(ctx context.Context) ([]*Cluster, error) {
 // each into a domain Cluster (joining its ClusterCache sync status). Shared by
 // List and Watch's seed + re-emit.
 func (s *Service) listClusters(ctx context.Context) ([]*Cluster, error) {
-	objs, err := s.clusterClient.List(ctx)
+	objs, err := s.coreClient.List(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +232,7 @@ func (s *Service) listClusters(ctx context.Context) ([]*Cluster, error) {
 // Get implements ClusterService. An untracked or deletion-pending id is (nil,
 // nil), not an error.
 func (s *Service) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
-	obj, err := s.clusterClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	if errors.Is(err, beehive.ErrNotFound) {
 		return nil, nil
 	}
@@ -255,7 +279,7 @@ func (s *Service) SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool
 	}
 	spec := obj.Spec
 	spec.IsSyncEnabled = enabled
-	updated, err := s.clusterClient.Update(ctx, obj.ID, spec)
+	updated, err := s.coreClient.Update(ctx, obj.ID, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -271,7 +295,7 @@ func (s *Service) RetryConnection(ctx context.Context, id ClusterID) error {
 	}
 	spec := obj.Spec
 	spec.RetryGeneration++
-	_, err = s.clusterClient.Update(ctx, obj.ID, spec)
+	_, err = s.coreClient.Update(ctx, obj.ID, spec)
 	return err
 }
 
@@ -303,7 +327,7 @@ func (s *Service) Delete(ctx context.Context, id ClusterID) error {
 	if err != nil {
 		return err
 	}
-	return s.clusterClient.Delete(ctx, obj.ID)
+	return s.coreClient.Delete(ctx, obj.ID)
 }
 
 // Watch implements ClusterService.
@@ -313,7 +337,7 @@ func (s *Service) Watch(ctx context.Context) (<-chan []*Cluster, error) {
 		return nil, err
 	}
 
-	clusterCh, err := s.clusterClient.WatchList(ctx)
+	clusterCh, err := s.coreClient.WatchList(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +426,7 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterS
 // clusterByID fetches a Cluster object by id, mapping beehive.ErrNotFound to the
 // package's ErrNotFound.
 func (s *Service) clusterByID(ctx context.Context, id ClusterID) (*beehive.Object[ClusterSpec, ClusterConnectionStatus], error) {
-	obj, err := s.clusterClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	if errors.Is(err, beehive.ErrNotFound) {
 		return nil, ErrNotFound
 	}

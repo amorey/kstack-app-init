@@ -59,17 +59,20 @@ func newClusterTestBeehive(t *testing.T, w cluster.KubeConfigSource, probe clust
 	t.Helper()
 	bh := testutil.NewTestBeehiveUnstarted(t)
 
-	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
+	coreClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
 	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
 
-	ctrl := cluster.NewClusterController(w, clusterClient, cacheClient, connMgr, nil, probe, check)
-	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, ctrl))
-	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
+	ctrl := cluster.NewClusterController(w, coreClient, cacheClient, connMgr, nil, probe, check)
+	cc, err := beehive.Register(bh, cluster.ClusterGroupKind, ctrl)
+	require.NoError(t, err)
+	ctrl.SetControllerClient(cc)
+	_, err = beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{})
+	require.NoError(t, err)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })
 
-	return clusterClient, cacheClient
+	return coreClient, cacheClient
 }
 
 // waitCondition polls until the object has the named condition or the deadline.
@@ -114,7 +117,7 @@ func TestClusterControllerSuccessfulProbeWritesConditions(t *testing.T) {
 	user := "alice"
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
 
-	clusterClient, cacheClient := newClusterTestBeehive(t, w,
+	coreClient, cacheClient := newClusterTestBeehive(t, w,
 		staticProbe(
 			cluster.ClusterServer{UID: &uid, Version: &ver},
 			cluster.ClusterPrincipal{Username: &user},
@@ -125,11 +128,11 @@ func TestClusterControllerSuccessfulProbeWritesConditions(t *testing.T) {
 	ctx := context.Background()
 
 	id := cluster.ClusterID("test-uid")
-	obj, err := clusterClient.Create(ctx, eligibleSpec("alpha"),
+	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"),
 		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 
-	got := waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+	got := waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 	require.NotNil(t, got.Status)
 
 	connected := findCondition(t, got.Status.Conditions, cluster.ClusterConditionConnected)
@@ -148,18 +151,18 @@ func TestClusterControllerSuccessfulProbeWritesConditions(t *testing.T) {
 
 func TestClusterControllerProbeFailureSetsConnectedFalse(t *testing.T) {
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
-	clusterClient, _ := newClusterTestBeehive(t, w,
+	coreClient, _ := newClusterTestBeehive(t, w,
 		errProbe(errors.New("connection refused")),
 		staticCheck(cluster.HealthPhaseHealthy),
 		nil,
 	)
 	ctx := context.Background()
 
-	obj, err := clusterClient.Create(ctx, eligibleSpec("alpha"),
+	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"),
 		beehive.WithSlug(cluster.ClusterSlug("probe-fail-id")))
 	require.NoError(t, err)
 
-	got := waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+	got := waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 	connected := findCondition(t, got.Status.Conditions, cluster.ClusterConditionConnected)
 	assert.Equal(t, cluster.ConditionFalse, connected.Status)
 	assert.Equal(t, cluster.ReasonProbeFailed, connected.Reason)
@@ -172,17 +175,17 @@ func TestClusterControllerIneligibleClusterDoesNotProbe(t *testing.T) {
 		probeCalled = true
 		return cluster.ClusterServer{}, cluster.ClusterPrincipal{}, nil
 	}
-	clusterClient, _ := newClusterTestBeehive(t, w, probe, staticCheck(cluster.HealthPhaseHealthy), nil)
+	coreClient, _ := newClusterTestBeehive(t, w, probe, staticCheck(cluster.HealthPhaseHealthy), nil)
 	ctx := context.Background()
 
 	// IsActive=false → ineligible.
 	spec := eligibleSpec("alpha")
 	spec.IsActive = false
-	obj, err := clusterClient.Create(ctx, spec,
+	obj, err := coreClient.Create(ctx, spec,
 		beehive.WithSlug(cluster.ClusterSlug("inactive-id")))
 	require.NoError(t, err)
 
-	got := waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+	got := waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 	connected := findCondition(t, got.Status.Conditions, cluster.ClusterConditionConnected)
 	assert.Equal(t, cluster.ConditionFalse, connected.Status)
 	assert.Equal(t, cluster.ReasonInactive, connected.Reason)
@@ -196,7 +199,7 @@ func TestClusterControllerSuccessfulProbePopulatesConnectionManager(t *testing.T
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
 	connMgr := cluster.NewConnectionManager()
 
-	clusterClient, _ := newClusterTestBeehive(t, w,
+	coreClient, _ := newClusterTestBeehive(t, w,
 		staticProbe(
 			cluster.ClusterServer{UID: &uid, Version: &ver},
 			cluster.ClusterPrincipal{Username: &user},
@@ -206,11 +209,11 @@ func TestClusterControllerSuccessfulProbePopulatesConnectionManager(t *testing.T
 	)
 
 	id := cluster.ClusterID("conn-mgr-set-id")
-	obj, err := clusterClient.Create(context.Background(), eligibleSpec("alpha"),
+	obj, err := coreClient.Create(context.Background(), eligibleSpec("alpha"),
 		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 
-	waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+	waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 
 	got := connMgr.Get(id)
 	assert.NotNil(t, got, "ConnectionManager must have a REST config after successful probe")
@@ -224,17 +227,17 @@ func TestClusterControllerProbeFailureDeletesFromConnectionManager(t *testing.T)
 	// Pre-seed a stale entry so we can confirm it gets cleared.
 	connMgr.Set(id, &rest.Config{Host: "https://stale"})
 
-	clusterClient, _ := newClusterTestBeehive(t, w,
+	coreClient, _ := newClusterTestBeehive(t, w,
 		errProbe(errors.New("dial failed")),
 		staticCheck(cluster.HealthPhaseHealthy),
 		connMgr,
 	)
 
-	obj, err := clusterClient.Create(context.Background(), eligibleSpec("alpha"),
+	obj, err := coreClient.Create(context.Background(), eligibleSpec("alpha"),
 		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 
-	waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+	waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 
 	got := connMgr.Get(id)
 	assert.Nil(t, got, "ConnectionManager must not hold a config after probe failure")
@@ -247,7 +250,7 @@ func TestClusterControllerIneligibleDeletesFromConnectionManager(t *testing.T) {
 	id := cluster.ClusterID("conn-mgr-ineligible-id")
 	connMgr.Set(id, &rest.Config{Host: "https://stale"})
 
-	clusterClient, _ := newClusterTestBeehive(t, w,
+	coreClient, _ := newClusterTestBeehive(t, w,
 		staticProbe(cluster.ClusterServer{}, cluster.ClusterPrincipal{}),
 		staticCheck(cluster.HealthPhaseHealthy),
 		connMgr,
@@ -255,11 +258,11 @@ func TestClusterControllerIneligibleDeletesFromConnectionManager(t *testing.T) {
 
 	spec := eligibleSpec("alpha")
 	spec.IsActive = false
-	obj, err := clusterClient.Create(context.Background(), spec,
+	obj, err := coreClient.Create(context.Background(), spec,
 		beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 
-	waitCondition(t, clusterClient, obj.ID, cluster.ClusterConditionConnected)
+	waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 
 	got := connMgr.Get(id)
 	assert.Nil(t, got, "ConnectionManager must not hold a config for an ineligible cluster")
@@ -291,19 +294,23 @@ func TestClusterControllerPokeReprobes(t *testing.T) {
 	}
 
 	bh := testutil.NewTestBeehiveUnstarted(t)
-	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
+	coreClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
 	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
 
-	ctrl := cluster.NewClusterController(w, clusterClient, cacheClient, nil, pk, probe, staticCheck(cluster.HealthPhaseHealthy))
-	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, ctrl))
-	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
+	ctrl := cluster.NewClusterController(w, coreClient, cacheClient, nil, pk, probe, staticCheck(cluster.HealthPhaseHealthy))
+	cc, err := beehive.Register(bh, cluster.ClusterGroupKind, ctrl)
+	require.NoError(t, err)
+	ctrl.SetControllerClient(cc)
+	_, err = beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = stop(ctx) })
+	ctrl.StartPoke()
+	t.Cleanup(func() { ctrl.StopPoke(); _ = stop(ctx) })
 
 	id := cluster.ClusterID("reprobe-uuid")
-	_, err = clusterClient.Create(ctx, eligibleSpec("alpha"), beehive.WithSlug(cluster.ClusterSlug(id)))
+	_, err = coreClient.Create(ctx, eligibleSpec("alpha"), beehive.WithSlug(cluster.ClusterSlug(id)))
 	require.NoError(t, err)
 
 	// The initial scheduled reconcile probes once (then requeues ~30s out).
