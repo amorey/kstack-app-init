@@ -104,7 +104,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	}
 
 	// Open the beehive SQLite store at <dataDir>/beehive.db. The beehive instance
-	// owns the three resource kinds and drives their controllers level-triggered.
+	// owns the two resource kinds and drives their controllers level-triggered.
 	bhStore, err := beehivesqlite.Open(filepath.Join(dataDir, "beehive.db"))
 	if err != nil {
 		_ = watcher.Close()
