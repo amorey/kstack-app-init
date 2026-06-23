@@ -109,7 +109,7 @@ const (
 	ClusterConditionHealthy ClusterConditionType = "Healthy"
 	// ClusterConditionSynced reports the state of the cluster's cache-sync
 	// engine. It lives in ClusterCacheStatus (the ClusterCache kind), not in
-	// ClusterConnectionStatus.
+	// ClusterCoreStatus.
 	ClusterConditionSynced ClusterConditionType = "Synced"
 )
 
@@ -277,12 +277,12 @@ type ClusterPrincipal struct {
 	Username *string `json:"username,omitempty"`
 }
 
-// ClusterSpec is a cluster record's desired state: the user/API-owned fields
+// ClusterCoreSpec is a cluster record's desired state: the user/API-owned fields
 // plus an internal trigger counter (RetryGeneration) that is not exposed in the
 // GraphQL schema but is stored in the beehive spec JSON and used to force an
 // immediate reconcile without a dedicated "enqueue" API. (Resync pokes do not
 // use a spec counter — the controllers subscribe to the poke bus directly.)
-type ClusterSpec struct {
+type ClusterCoreSpec struct {
 	Name          *string       `json:"name,omitempty"`
 	IsSyncEnabled bool          `json:"isSyncEnabled"`
 	IsActive      bool          `json:"isActive"`
@@ -290,10 +290,10 @@ type ClusterSpec struct {
 
 	// SourceObs is the kubeconfig observation written by the kubeconfig importer
 	// (cluster/user entry names, presence, default status). It is stored in the
-	// spec because only the Cluster's own controller (ClusterController) can
+	// spec because only the Cluster's own controller (ClusterCoreController) can
 	// write its status, and the importer needs a write path that uses the
-	// ordinary Client.Update. The ClusterController copies SourceObs into
-	// ClusterConnectionStatus.Source.Kubeconfig during its reconcile, so the
+	// ordinary Client.Update. The ClusterCoreController copies SourceObs into
+	// ClusterCoreStatus.Source.Kubeconfig during its reconcile, so the
 	// GraphQL layer reads from status as expected.
 	SourceObs *KubeconfigStatus `json:"sourceObs,omitempty"`
 
@@ -303,10 +303,10 @@ type ClusterSpec struct {
 	RetryGeneration int64 `json:"retryGeneration,omitempty"`
 }
 
-// ClusterConnectionStatus is the Cluster beehive kind's stored status:
-// connection/health observations from the ClusterController. Distinct from the
+// ClusterCoreStatus is the Cluster beehive kind's stored status:
+// connection/health observations from the ClusterCoreController. Distinct from the
 // domain ClusterStatus (which also includes sync status from ClusterCache).
-type ClusterConnectionStatus struct {
+type ClusterCoreStatus struct {
 	Source          ClusterSourceStatus `json:"source"`
 	Server          ClusterServer       `json:"server"`
 	Principal       ClusterPrincipal    `json:"principal"`
@@ -322,7 +322,7 @@ var ClusterCacheGroupKind = beehive.GroupKind{Kind: "ClusterCache"}
 
 // ClusterCacheSpec is the ClusterCache kind's spec. It carries no user-facing
 // fields; the parent cluster UUID is encoded in the object's slug
-// ("caches/{uuid}"). The ClusterController creates ClusterCache objects with
+// ("caches/{uuid}"). The ClusterCoreController creates ClusterCache objects with
 // this empty spec.
 type ClusterCacheSpec struct{}
 
@@ -364,7 +364,7 @@ type Cluster struct {
 	ArchivedAt *time.Time // always nil today; reserved for future archiving
 	DeletedAt  *time.Time // derived from obj.DeletionRequestedAt
 
-	Spec   ClusterSpec
+	Spec   ClusterCoreSpec
 	Status ClusterStatus
 }
 
@@ -419,9 +419,9 @@ func SeedSyncConditions(gen int64, now time.Time) []ClusterCondition {
 
 // --- Status equality helpers (skip-the-write guards) ---
 
-// ClusterConnectionStatusEqual reports whether two ClusterConnectionStatus
-// blocks are observably equal — the ClusterController's skip-the-write guard.
-func ClusterConnectionStatusEqual(a, b ClusterConnectionStatus) bool {
+// ClusterCoreStatusEqual reports whether two ClusterCoreStatus
+// blocks are observably equal — the ClusterCoreController's skip-the-write guard.
+func ClusterCoreStatusEqual(a, b ClusterCoreStatus) bool {
 	return ptrEqual(a.Source.Kubeconfig, b.Source.Kubeconfig) &&
 		ptrEqual(a.Server.UID, b.Server.UID) &&
 		ptrEqual(a.Server.Version, b.Server.Version) &&

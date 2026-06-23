@@ -1636,8 +1636,8 @@ func (ec *executionContext) _Cluster_spec(ctx context.Context, field graphql.Col
 			return obj.Spec, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v cluster.ClusterSpec) graphql.Marshaler {
-			return ec.marshalNClusterSpec2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterSpec(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v cluster.ClusterCoreSpec) graphql.Marshaler {
+			return ec.marshalNClusterSpec2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCoreSpec(ctx, selections, v)
 		},
 		true,
 		true,
@@ -2306,7 +2306,7 @@ func (ec *executionContext) fieldContext_ClusterSourceStatus_kubeconfig(_ contex
 	return fc, nil
 }
 
-func (ec *executionContext) _ClusterSpec_name(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterSpec) (ret graphql.Marshaler) {
+func (ec *executionContext) _ClusterSpec_name(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCoreSpec) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
 		ec.OperationContext,
@@ -2329,7 +2329,7 @@ func (ec *executionContext) fieldContext_ClusterSpec_name(_ context.Context, fie
 	return graphql.NewScalarFieldContext("ClusterSpec", field, false, false, errors.New("field of type String does not have child fields"))
 }
 
-func (ec *executionContext) _ClusterSpec_isSyncEnabled(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterSpec) (ret graphql.Marshaler) {
+func (ec *executionContext) _ClusterSpec_isSyncEnabled(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCoreSpec) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
 		ec.OperationContext,
@@ -2352,7 +2352,7 @@ func (ec *executionContext) fieldContext_ClusterSpec_isSyncEnabled(_ context.Con
 	return graphql.NewScalarFieldContext("ClusterSpec", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
-func (ec *executionContext) _ClusterSpec_isActive(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterSpec) (ret graphql.Marshaler) {
+func (ec *executionContext) _ClusterSpec_isActive(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCoreSpec) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
 		ec.OperationContext,
@@ -2375,7 +2375,7 @@ func (ec *executionContext) fieldContext_ClusterSpec_isActive(_ context.Context,
 	return graphql.NewScalarFieldContext("ClusterSpec", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
-func (ec *executionContext) _ClusterSpec_source(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterSpec) (ret graphql.Marshaler) {
+func (ec *executionContext) _ClusterSpec_source(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCoreSpec) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
 		ec.OperationContext,
@@ -5196,7 +5196,7 @@ func (ec *executionContext) _ClusterSourceStatus(ctx context.Context, sel ast.Se
 
 var clusterSpecImplementors = []string{"ClusterSpec"}
 
-func (ec *executionContext) _ClusterSpec(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterSpec) graphql.Marshaler {
+func (ec *executionContext) _ClusterSpec(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterCoreSpec) graphql.Marshaler {
 	fields := graphql.CollectFields(ec.OperationContext, sel, clusterSpecImplementors)
 
 	out := graphql.NewFieldSet(fields)
@@ -6269,7 +6269,7 @@ func (ec *executionContext) marshalNClusterSourceStatus2githubᚗcomᚋkubetail�
 	return ec._ClusterSourceStatus(ctx, sel, &v)
 }
 
-func (ec *executionContext) marshalNClusterSpec2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterSpec(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterSpec) graphql.Marshaler {
+func (ec *executionContext) marshalNClusterSpec2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCoreSpec(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterCoreSpec) graphql.Marshaler {
 	return ec._ClusterSpec(ctx, sel, &v)
 }
 

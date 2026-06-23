@@ -74,11 +74,11 @@ type Service struct {
 
 	watcher *k8shelpers.KubeConfigWatcher
 
-	coreClient   beehive.Client[ClusterSpec, ClusterConnectionStatus]
+	coreClient   beehive.Client[ClusterCoreSpec, ClusterCoreStatus]
 	cacheClient  beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
 	cacheManager *store.Manager
 	connMgr      *ConnectionManager
-	coreCtrl     *ClusterController
+	coreCtrl     *ClusterCoreController
 	cacheCtrl    *ClusterCacheController
 
 	importer *KubeconfigImporter
@@ -98,7 +98,7 @@ var _ ClusterService = (*Service)(nil)
 // ever needs either, hoist it back up to the composition root and inject it.
 func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error) {
 	// The kubeconfig watcher publishes *api.Config snapshots; the importer and
-	// ClusterController consume it (through the KubeConfigSource interface).
+	// ClusterCoreController consume it (through the KubeConfigSource interface).
 	watcher, err := k8shelpers.NewKubeConfigWatcher(kubeconfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("init kubeconfig watcher: %w", err)
@@ -118,7 +118,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	coreClient := beehive.NewClient[ClusterSpec, ClusterConnectionStatus](bh, ClusterGroupKind)
+	coreClient := beehive.NewClient[ClusterCoreSpec, ClusterCoreStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
 	// The cache manager owns the per-cluster SQLite cache files under
@@ -127,7 +127,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 
 	connMgr := NewConnectionManager()
 
-	coreCtrl := NewClusterController(watcher, coreClient, cacheClient, connMgr, pokeSvc, nil, nil)
+	coreCtrl := NewClusterCoreController(watcher, coreClient, cacheClient, connMgr, pokeSvc, nil, nil)
 	cacheCtrl := NewClusterCacheController(watcher, coreClient, cacheManager, connMgr, pokeSvc)
 
 	// Register returns each kind's status-write ControllerClient. The reconcile
@@ -390,7 +390,7 @@ func (s *Service) GetConnection(id ClusterID) *rest.Config {
 
 // buildCluster assembles a domain Cluster from a Cluster beehive object, joining
 // in ClusterCache sync status from the cache client.
-func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterConnectionStatus]) Cluster {
+func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterCoreSpec, ClusterCoreStatus]) Cluster {
 	var id ClusterID
 	if obj.Slug != nil {
 		id = ClusterIDFromSlug(*obj.Slug)
@@ -425,7 +425,7 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterS
 
 // clusterByID fetches a Cluster object by id, mapping beehive.ErrNotFound to the
 // package's ErrNotFound.
-func (s *Service) clusterByID(ctx context.Context, id ClusterID) (*beehive.Object[ClusterSpec, ClusterConnectionStatus], error) {
+func (s *Service) clusterByID(ctx context.Context, id ClusterID) (*beehive.Object[ClusterCoreSpec, ClusterCoreStatus], error) {
 	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	if errors.Is(err, beehive.ErrNotFound) {
 		return nil, ErrNotFound

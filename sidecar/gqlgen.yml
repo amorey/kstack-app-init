@@ -54,7 +54,7 @@ models:
         resolver: true
 
   ClusterSpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSpec
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCoreSpec
 
   ClusterSource:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSource

@@ -90,7 +90,7 @@ type engineEntry struct {
 // needs no durable spec write — see restartLiveEngines.
 type ClusterCacheController struct {
 	cfgSource    KubeConfigSource
-	coreClient   beehive.Client[ClusterSpec, ClusterConnectionStatus]
+	coreClient   beehive.Client[ClusterCoreSpec, ClusterCoreStatus]
 	cacheManager *store.Manager
 	connMgr      *ConnectionManager
 	ctrlClient   beehive.ControllerClient[ClusterCacheStatus]
@@ -114,7 +114,7 @@ type ClusterCacheController struct {
 // DBs. connMgr may be nil (credentials are then resolved from the kubeconfig).
 func NewClusterCacheController(
 	cfgSource KubeConfigSource,
-	coreClient beehive.Client[ClusterSpec, ClusterConnectionStatus],
+	coreClient beehive.Client[ClusterCoreSpec, ClusterCoreStatus],
 	manager *store.Manager,
 	connMgr *ConnectionManager,
 	pokeSvc *poke.Service,
@@ -239,7 +239,7 @@ func (c *ClusterCacheController) converge(
 	clusterID ClusterID,
 	cacheObjID beehive.ObjectID,
 	cacheGen int64,
-	clusterObj *beehive.Object[ClusterSpec, ClusterConnectionStatus],
+	clusterObj *beehive.Object[ClusterCoreSpec, ClusterCoreStatus],
 	working *ClusterCacheStatus,
 ) time.Duration {
 	gen := clusterObj.Generation
@@ -385,7 +385,7 @@ func (c *ClusterCacheController) stopEngine(id ClusterID) {
 }
 
 // syncEligible reports whether a cluster should have a running sync engine.
-func syncEligible(obj *beehive.Object[ClusterSpec, ClusterConnectionStatus]) bool {
+func syncEligible(obj *beehive.Object[ClusterCoreSpec, ClusterCoreStatus]) bool {
 	return ConnectionEligible(obj) && obj.Spec.IsSyncEnabled
 }
 

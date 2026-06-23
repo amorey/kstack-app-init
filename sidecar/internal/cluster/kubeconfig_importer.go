@@ -30,20 +30,20 @@ import (
 // Cluster beehive objects with each snapshot. It is the sole creator of
 // kubeconfig-sourced clusters (one Cluster per kube-context):
 //   - New context → create a Cluster, minting a random UUID and seeding the
-//     kubeconfig observation into ClusterSpec.SourceObs.
+//     kubeconfig observation into ClusterCoreSpec.SourceObs.
 //   - Changed observation (cluster/user names, IsDefault, presence) → update
 //     SourceObs.
 //   - Departed context → SourceObs.IsPresent=false (never a deletion).
 //   - Returning context → revive in place (same object, IsPresent=true).
 //
-// Because only the Cluster's own controller (ClusterController) may write its
+// Because only the Cluster's own controller (ClusterCoreController) may write its
 // status, the importer writes the observation into the spec (SourceObs); the
-// ClusterController mirrors it into ClusterConnectionStatus.Source.Kubeconfig.
+// ClusterCoreController mirrors it into ClusterCoreStatus.Source.Kubeconfig.
 // A future creator (manual, cloud) is a sibling importer writing Cluster
 // objects with a different Source variant — they share this one Cluster kind.
 type KubeconfigImporter struct {
 	cfgSource  KubeConfigSource
-	coreClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
+	coreClient beehive.Client[ClusterCoreSpec, ClusterCoreStatus]
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
 	wg         sync.WaitGroup
@@ -51,7 +51,7 @@ type KubeconfigImporter struct {
 
 // NewKubeconfigImporter builds an importer that uses coreClient to manage
 // kubeconfig-sourced Cluster objects in beehive.
-func NewKubeconfigImporter(cfgSource KubeConfigSource, coreClient beehive.Client[ClusterSpec, ClusterConnectionStatus]) *KubeconfigImporter {
+func NewKubeconfigImporter(cfgSource KubeConfigSource, coreClient beehive.Client[ClusterCoreSpec, ClusterCoreStatus]) *KubeconfigImporter {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &KubeconfigImporter{
 		cfgSource:  cfgSource,
@@ -63,7 +63,7 @@ func NewKubeconfigImporter(cfgSource KubeConfigSource, coreClient beehive.Client
 
 // ClusterClient exposes the underlying beehive client for tests that need to
 // inspect the Cluster objects after a reconcile.
-func (im *KubeconfigImporter) ClusterClient() beehive.Client[ClusterSpec, ClusterConnectionStatus] {
+func (im *KubeconfigImporter) ClusterClient() beehive.Client[ClusterCoreSpec, ClusterCoreStatus] {
 	return im.coreClient
 }
 
@@ -115,7 +115,7 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 		return err
 	}
 	// Index live kubeconfig-sourced Clusters by their context name.
-	byContext := map[string]*beehive.Object[ClusterSpec, ClusterConnectionStatus]{}
+	byContext := map[string]*beehive.Object[ClusterCoreSpec, ClusterCoreStatus]{}
 	for _, obj := range existing {
 		if obj.DeletionRequestedAt != nil {
 			continue // ignore objects being deleted
@@ -176,7 +176,7 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 // of the remote cluster's UID (unknown until the first probe).
 func (im *KubeconfigImporter) createCluster(ctx context.Context, contextName string, obs KubeconfigStatus) error {
 	id := ClusterID(uuid.NewString())
-	_, err := im.coreClient.Create(ctx, ClusterSpec{
+	_, err := im.coreClient.Create(ctx, ClusterCoreSpec{
 		IsSyncEnabled: true,
 		IsActive:      true,
 		Source:        ClusterSource{Kubeconfig: &ClusterSourceKubeconfig{Context: contextName}},

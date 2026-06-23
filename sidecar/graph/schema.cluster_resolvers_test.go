@@ -25,8 +25,8 @@ import (
 // clusterFixture bundles all data for one test cluster record.
 type clusterFixture struct {
 	id          string
-	spec        cluster.ClusterSpec
-	connStatus  cluster.ClusterConnectionStatus
+	spec        cluster.ClusterCoreSpec
+	connStatus  cluster.ClusterCoreStatus
 	cacheStatus cluster.ClusterCacheStatus
 }
 
@@ -159,13 +159,13 @@ func clusterFixtures() []clusterFixture {
 	return []clusterFixture{
 		{
 			id: "cl-1",
-			spec: cluster.ClusterSpec{
+			spec: cluster.ClusterCoreSpec{
 				Name:          &prodName,
 				IsSyncEnabled: true,
 				IsActive:      true,
 				Source:        cluster.ClusterSource{Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: "prod"}},
 			},
-			connStatus: cluster.ClusterConnectionStatus{
+			connStatus: cluster.ClusterCoreStatus{
 				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.KubeconfigStatus{
 					Cluster: "prod-cluster", User: "prod-user",
 					IsPresent: true, IsDefault: true,
@@ -176,10 +176,10 @@ func clusterFixtures() []clusterFixture {
 		},
 		{
 			id: "cl-2",
-			spec: cluster.ClusterSpec{
+			spec: cluster.ClusterCoreSpec{
 				Source: cluster.ClusterSource{Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: "staging"}},
 			},
-			connStatus: cluster.ClusterConnectionStatus{
+			connStatus: cluster.ClusterCoreStatus{
 				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.KubeconfigStatus{
 					Cluster: "staging-cluster", User: "staging-user",
 				}},

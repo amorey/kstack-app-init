@@ -21,7 +21,7 @@ import (
 )
 
 // ConnectionManager holds the live REST config for each connected cluster.
-// ClusterController writes to it on probe success/failure; ClusterCacheController
+// ClusterCoreController writes to it on probe success/failure; ClusterCacheController
 // and future agent callers read from it to obtain credentials without re-resolving
 // the kubeconfig on every reconcile.
 type ConnectionManager struct {

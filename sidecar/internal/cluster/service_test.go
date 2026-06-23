@@ -52,10 +52,10 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterCac
 	bh, err := beehive.New(st, beehive.WithResyncInterval(0))
 	require.NoError(t, err)
 
-	coreClient := beehive.NewClient[ClusterSpec, ClusterConnectionStatus](bh, ClusterGroupKind)
+	coreClient := beehive.NewClient[ClusterCoreSpec, ClusterCoreStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
-	_, err = beehive.Register(bh, ClusterGroupKind, &noopController[ClusterSpec, ClusterConnectionStatus]{})
+	_, err = beehive.Register(bh, ClusterGroupKind, &noopController[ClusterCoreSpec, ClusterCoreStatus]{})
 	require.NoError(t, err)
 	cacheCC, err := beehive.Register(bh, ClusterCacheGroupKind, &noopController[ClusterCacheSpec, ClusterCacheStatus]{})
 	require.NoError(t, err)
@@ -78,7 +78,7 @@ func seedCluster(t *testing.T, s *Service, ctxName string, id ClusterID) Cluster
 	t.Helper()
 	ctx := context.Background()
 	name := ctxName
-	_, err := s.coreClient.Create(ctx, ClusterSpec{
+	_, err := s.coreClient.Create(ctx, ClusterCoreSpec{
 		Name:          &name,
 		IsSyncEnabled: true,
 		IsActive:      true,
