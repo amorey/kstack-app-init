@@ -78,6 +78,7 @@ type Service struct {
 	cacheClient   beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
 	cacheManager  *store.Manager
 	connMgr       *ConnectionManager
+	cacheCtrl     *ClusterCacheController
 
 	importer *KubeconfigImporter
 	pokeSvc  *poke.Service
@@ -125,8 +126,8 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 
 	connMgr := NewConnectionManager()
 
-	clusterCtrl := NewClusterController(watcher, cacheClient, connMgr, nil, nil)
-	cacheCtrl := NewClusterCacheController(watcher, clusterClient, cacheManager, connMgr)
+	clusterCtrl := NewClusterController(watcher, clusterClient, cacheClient, connMgr, pokeSvc, nil, nil)
+	cacheCtrl := NewClusterCacheController(watcher, clusterClient, cacheManager, connMgr, pokeSvc)
 
 	if err := errors.Join(
 		beehive.Register(bh, ClusterGroupKind, clusterCtrl),
@@ -145,6 +146,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 		cacheClient:   cacheClient,
 		cacheManager:  cacheManager,
 		connMgr:       connMgr,
+		cacheCtrl:     cacheCtrl,
 		importer:      NewKubeconfigImporter(watcher, clusterClient),
 		pokeSvc:       pokeSvc,
 	}, nil
@@ -274,8 +276,8 @@ func (s *Service) RetryConnection(ctx context.Context, id ClusterID) error {
 }
 
 // ClearCache implements ClusterService. It validates the cluster exists before
-// touching disk, deletes the on-disk cache, then bumps PokeSyncGeneration to
-// bounce the running engine.
+// touching disk, deletes the on-disk cache, then restarts the running engine so
+// it rebuilds.
 func (s *Service) ClearCache(ctx context.Context, id ClusterID) (*Cluster, error) {
 	obj, err := s.clusterByID(ctx, id)
 	if err != nil {
@@ -284,13 +286,12 @@ func (s *Service) ClearCache(ctx context.Context, id ClusterID) (*Cluster, error
 	if err := s.cacheManager.DeleteCacheFiles(ctx, string(id)); err != nil {
 		return nil, err
 	}
-	spec := obj.Spec
-	spec.PokeSyncGeneration++
-	updated, err := s.clusterClient.Update(ctx, obj.ID, spec)
-	if err != nil {
-		return nil, err
+	// Restart the running engine so it rebuilds against the now-empty cache. A
+	// no-op if no engine is running (it cold-syncs next time it starts).
+	if s.cacheCtrl != nil {
+		s.cacheCtrl.RestartEngine(id)
 	}
-	c := s.buildCluster(ctx, updated)
+	c := s.buildCluster(ctx, obj)
 	return &c, nil
 }
 

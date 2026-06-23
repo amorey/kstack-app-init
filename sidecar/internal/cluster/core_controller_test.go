@@ -17,6 +17,7 @@ package cluster_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/testutil"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // staticProbe returns a ProbeFunc that always yields the given server/principal.
@@ -60,7 +62,7 @@ func newClusterTestBeehive(t *testing.T, w cluster.KubeConfigSource, probe clust
 	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
 	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
 
-	ctrl := cluster.NewClusterController(w, cacheClient, connMgr, probe, check)
+	ctrl := cluster.NewClusterController(w, clusterClient, cacheClient, connMgr, nil, probe, check)
 	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, ctrl))
 	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
 	stop, err := bh.Start(context.Background())
@@ -272,4 +274,45 @@ func findCondition(t *testing.T, conds []cluster.ClusterCondition, typ cluster.C
 	}
 	t.Fatalf("condition %s not found in %v", typ, conds)
 	return cluster.ClusterCondition{}
+}
+
+// TestClusterControllerPokeReprobes verifies the controller subscribes to the
+// poke bus and forces an immediate re-probe of every eligible cluster, rather
+// than waiting for the next scheduled (30s) reconcile.
+func TestClusterControllerPokeReprobes(t *testing.T) {
+	ctx := context.Background()
+	pk := poke.New()
+
+	var probeCount atomic.Int32
+	probe := func(context.Context, *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
+		probeCount.Add(1)
+		uid := "uid"
+		return cluster.ClusterServer{UID: &uid}, cluster.ClusterPrincipal{}, nil
+	}
+
+	bh := testutil.NewTestBeehiveUnstarted(t)
+	clusterClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterConnectionStatus](bh, cluster.ClusterGroupKind)
+	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
+	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
+
+	ctrl := cluster.NewClusterController(w, clusterClient, cacheClient, nil, pk, probe, staticCheck(cluster.HealthPhaseHealthy))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterGroupKind, ctrl))
+	require.NoError(t, beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{}))
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = stop(ctx) })
+
+	id := cluster.ClusterID("reprobe-uuid")
+	_, err = clusterClient.Create(ctx, eligibleSpec("alpha"), beehive.WithSlug(cluster.ClusterSlug(id)))
+	require.NoError(t, err)
+
+	// The initial scheduled reconcile probes once (then requeues ~30s out).
+	require.Eventually(t, func() bool { return probeCount.Load() >= 1 },
+		2*time.Second, 10*time.Millisecond, "initial reconcile should probe once")
+	before := probeCount.Load()
+
+	// A poke forces an immediate re-probe without waiting for the 30s cadence.
+	pk.Poke(poke.SourceHost)
+	require.Eventually(t, func() bool { return probeCount.Load() > before },
+		2*time.Second, 10*time.Millisecond, "poke should force an immediate re-probe")
 }

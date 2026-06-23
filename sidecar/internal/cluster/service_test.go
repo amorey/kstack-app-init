@@ -180,18 +180,23 @@ func TestServiceRetryConnectionBumpsGeneration(t *testing.T) {
 	assert.Equal(t, int64(1), obj.Spec.RetryGeneration)
 }
 
-func TestServiceClearCacheBumpsPokeGeneration(t *testing.T) {
+func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha", "id-alpha")
 
+	// cacheCtrl is nil in this white-box harness, so ClearCache deletes the
+	// on-disk cache (a no-op here — none exists) and returns the record without
+	// restarting an engine. The engine-restart path is covered in
+	// cache_controller_test.go.
 	c, err := s.ClearCache(ctx, id)
 	require.NoError(t, err)
 	require.NotNil(t, c)
+	assert.Equal(t, id, c.ID)
 
-	obj, err := s.clusterClient.GetBySlug(ctx, ClusterSlug(id))
+	stats, err := s.CacheStats(ctx, id)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), obj.Spec.PokeSyncGeneration)
+	assert.False(t, stats.Exists)
 }
 
 func TestServiceDeleteTombstonesCluster(t *testing.T) {

@@ -278,10 +278,10 @@ type ClusterPrincipal struct {
 }
 
 // ClusterSpec is a cluster record's desired state: the user/API-owned fields
-// plus internal trigger counters (RetryGeneration, PokeSyncGeneration) that
-// are not exposed in the GraphQL schema but are stored in the beehive spec
-// JSON and used to trigger immediate reconciles without a dedicated "enqueue"
-// API.
+// plus an internal trigger counter (RetryGeneration) that is not exposed in the
+// GraphQL schema but is stored in the beehive spec JSON and used to force an
+// immediate reconcile without a dedicated "enqueue" API. (Resync pokes do not
+// use a spec counter — the controllers subscribe to the poke bus directly.)
 type ClusterSpec struct {
 	Name          *string       `json:"name,omitempty"`
 	IsSyncEnabled bool          `json:"isSyncEnabled"`
@@ -297,14 +297,10 @@ type ClusterSpec struct {
 	// GraphQL layer reads from status as expected.
 	SourceObs *KubeconfigStatus `json:"sourceObs,omitempty"`
 
-	// RetryGeneration is incremented by Service.ConnectionRetry to force an
+	// RetryGeneration is incremented by Service.RetryConnection to force an
 	// immediate re-probe, resetting the cluster controller's failure backoff.
 	// Not in the GraphQL schema.
 	RetryGeneration int64 `json:"retryGeneration,omitempty"`
-	// PokeSyncGeneration is incremented by the poke handler to bounce running
-	// sync engines. Detected by the ClusterCache controller via the Cluster
-	// DependsOn edge. Not in the GraphQL schema.
-	PokeSyncGeneration int64 `json:"pokeSyncGeneration,omitempty"`
 }
 
 // ClusterConnectionStatus is the Cluster beehive kind's stored status:
@@ -338,10 +334,6 @@ type ClusterCacheStatus struct {
 	Conditions []ClusterCondition `json:"conditions"`
 	// LastSyncedAt is when the cache last received fresh data; nil if never.
 	LastSyncedAt *time.Time `json:"lastSyncedAt,omitempty"`
-	// ObservedPokeSyncGeneration is the last PokeSyncGeneration value the
-	// ClusterCacheController acted on; used to detect poke signals via the
-	// Cluster DependsOn edge.
-	ObservedPokeSyncGeneration int64 `json:"observedPokeSyncGeneration,omitempty"`
 }
 
 // --- Domain (combined) types exposed to resolvers ---
@@ -442,8 +434,7 @@ func ClusterConnectionStatusEqual(a, b ClusterConnectionStatus) bool {
 // observably equal — the ClusterCacheController's skip-the-write guard.
 func ClusterCacheStatusEqual(a, b ClusterCacheStatus) bool {
 	return timePtrEqual(a.LastSyncedAt, b.LastSyncedAt) &&
-		ConditionsEqual(a.Conditions, b.Conditions) &&
-		a.ObservedPokeSyncGeneration == b.ObservedPokeSyncGeneration
+		ConditionsEqual(a.Conditions, b.Conditions)
 }
 
 func ptrEqual[T comparable](a, b *T) bool {

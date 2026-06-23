@@ -28,6 +28,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/engine"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 const (
@@ -54,7 +55,10 @@ type NewEngineFunc func(cfg *rest.Config, clusterID ClusterID, sink engine.Sink)
 // pointer guards the sink: reports from a stopped or replaced engine are dropped
 // by comparing pointer identity.
 type engineEntry struct {
-	handle      EngineHandle
+	handle EngineHandle
+	// restCfg is the connection config the engine was started with, kept so a
+	// poke-driven restart can respawn the engine without re-resolving it.
+	restCfg     *rest.Config
 	fingerprint string
 	// cacheObjID is the beehive ObjectID of the ClusterCache object this engine
 	// reports into. Stored so the sink can call UpdateStatus without a lookup.
@@ -74,16 +78,26 @@ type engineEntry struct {
 // back into ClusterCacheStatus as the Synced condition.
 //
 // The controller reads the parent Cluster (via ClusterClient) to determine
-// eligibility (connection-eligible + IsSyncEnabled), and detects poke signals
-// via the DependsOn edge (ClusterCache depends on Cluster): when
-// PokeSyncGeneration in ClusterSpec increases, beehive re-queues this cache,
-// and the controller bounces the running engine.
+// eligibility (connection-eligible + IsSyncEnabled), and adds a DependsOn edge
+// (ClusterCache depends on Cluster) so beehive re-queues this cache when the
+// parent Cluster spec changes (e.g. IsSyncEnabled toggled).
+//
+// Resync pokes (OS resume / network-on / wall-clock gap) arrive out-of-band on
+// the poke bus, not through beehive: the controller subscribes in Start and, on
+// each signal, restarts its live engines in place (dropping stale watch streams;
+// each driver re-resumes cheaply from its persisted resourceVersion). The
+// engines are in-memory runtime state the controller already owns, so a poke
+// needs no durable spec write — see restartLiveEngines.
 type ClusterCacheController struct {
 	cfgSource     KubeConfigSource
 	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus]
 	cacheManager  *store.Manager
 	connMgr       *ConnectionManager
 	ctrlClient    beehive.ControllerClient[ClusterCacheStatus]
+
+	// pokeSvc is the resync bus; nil disables poke-driven restarts (tests).
+	pokeSvc *poke.Service
+	pokeSub *pokeSubscription
 
 	// newEngine constructs one sync engine. Overridable for tests.
 	newEngine NewEngineFunc
@@ -103,12 +117,14 @@ func NewClusterCacheController(
 	clusterClient beehive.Client[ClusterSpec, ClusterConnectionStatus],
 	manager *store.Manager,
 	connMgr *ConnectionManager,
+	pokeSvc *poke.Service,
 ) *ClusterCacheController {
 	c := &ClusterCacheController{
 		cfgSource:     cfgSource,
 		clusterClient: clusterClient,
 		cacheManager:  manager,
 		connMgr:       connMgr,
+		pokeSvc:       pokeSvc,
 		engines:       make(map[ClusterID]*engineEntry),
 	}
 	cm := manager
@@ -128,14 +144,17 @@ func (c *ClusterCacheController) SetNewEngine(f NewEngineFunc) {
 	c.newEngine = f
 }
 
-// Start stores the ControllerClient.
+// Start stores the ControllerClient and subscribes to the poke bus, restarting
+// live engines on each resync signal.
 func (c *ClusterCacheController) Start(cl beehive.ControllerClient[ClusterCacheStatus]) error {
 	c.ctrlClient = cl
+	c.pokeSub = startPokeSubscription(c.pokeSvc, func(context.Context) { c.restartLiveEngines() })
 	return nil
 }
 
-// Stop tears down every running engine.
+// Stop halts the poke subscription, then tears down every running engine.
 func (c *ClusterCacheController) Stop(_ context.Context) error {
+	c.pokeSub.stop()
 	c.mu.Lock()
 	entries := c.engines
 	c.engines = make(map[ClusterID]*engineEntry)
@@ -167,8 +186,8 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, obj *beehive.Obj
 		return beehive.Result{}, err
 	}
 
-	// Add DependsOn edge so beehive re-queues us when the parent Cluster changes
-	// (enabling poke signal detection and spec change propagation).
+	// Add DependsOn edge so beehive re-queues us when the parent Cluster spec
+	// changes (e.g. IsSyncEnabled toggled), propagating eligibility changes.
 	if err := c.ctrlClient.AddDependency(ctx, obj.ID, clusterObj.ID); err != nil {
 		return beehive.Result{}, err
 	}
@@ -188,9 +207,8 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, obj *beehive.Obj
 	defer c.writeMu.Unlock()
 
 	working := ClusterCacheStatus{
-		Conditions:                 slices.Clone(loaded.Conditions),
-		LastSyncedAt:               loaded.LastSyncedAt,
-		ObservedPokeSyncGeneration: loaded.ObservedPokeSyncGeneration,
+		Conditions:   slices.Clone(loaded.Conditions),
+		LastSyncedAt: loaded.LastSyncedAt,
 	}
 
 	requeueAfter := c.converge(ctx, clusterID, obj.ID, obj.Generation, clusterObj, &working)
@@ -242,44 +260,99 @@ func (c *ClusterCacheController) converge(
 	}
 	fingerprint := engine.ConfigFingerprint(restCfg, engine.ContextProxyURL(c.cfgSource.Get(), contextName))
 
-	// Detect poke signals via PokeSyncGeneration.
-	bounce := false
 	c.mu.Lock()
 	entry, running := c.engines[clusterID]
-	if clusterObj.Spec.PokeSyncGeneration != working.ObservedPokeSyncGeneration {
-		bounce = true
-		working.ObservedPokeSyncGeneration = clusterObj.Spec.PokeSyncGeneration
-	}
 	c.mu.Unlock()
 
-	if running && entry.fingerprint == fingerprint && !bounce {
+	if running && entry.fingerprint == fingerprint {
 		return syncRecheckInterval
 	}
 
-	// Stop any running engine before starting a new one.
+	// Stop any running engine before starting a new one (credential change).
 	c.stopEngine(clusterID)
 	SetCondition(conds, ClusterCondition{
 		Type: ClusterConditionSynced, Status: ConditionFalse,
 		Reason: ReasonSyncing, ObservedGeneration: gen,
 	})
+	c.spawnEngine(clusterID, restCfg, fingerprint, cacheObjID, cacheGen, gen)
+	return syncRecheckInterval
+}
 
+// spawnEngine constructs, registers, and starts a sync engine for clusterID.
+// The caller is responsible for stopping any prior engine first and for holding
+// writeMu (so it serializes with Reconcile and the sink). A nil engine (cache
+// open failure) leaves no entry registered.
+func (c *ClusterCacheController) spawnEngine(
+	clusterID ClusterID,
+	restCfg *rest.Config,
+	fingerprint string,
+	cacheObjID beehive.ObjectID,
+	cacheGen, parentGen int64,
+) {
 	newEntry := &engineEntry{
+		restCfg:     restCfg,
 		fingerprint: fingerprint,
 		cacheObjID:  cacheObjID,
 		cacheGen:    cacheGen,
-		parentGen:   gen,
+		parentGen:   parentGen,
 	}
 	sink := &engineSink{c: c, id: clusterID, entry: newEntry}
 	handle := c.newEngine(restCfg, clusterID, sink)
 	if handle == nil {
-		return syncRecheckInterval
+		return
 	}
 	newEntry.handle = handle
 	c.mu.Lock()
 	c.engines[clusterID] = newEntry
 	c.mu.Unlock()
 	handle.Start()
-	return syncRecheckInterval
+}
+
+// restartLiveEngines stops and respawns every running engine, reusing each
+// engine's stored connection config. Driven by the poke bus on OS resume /
+// network-on: a restart drops watch streams that may have gone stale while the
+// process was frozen, and each driver re-resumes from its persisted
+// resourceVersion (cheap — no full re-list unless the RV expired). It holds
+// writeMu for the whole pass so it serializes with Reconcile and the engine
+// sinks, exactly as a converge-driven engine swap does.
+func (c *ClusterCacheController) restartLiveEngines() {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	c.mu.Lock()
+	ids := make([]ClusterID, 0, len(c.engines))
+	for id := range c.engines {
+		ids = append(ids, id)
+	}
+	c.mu.Unlock()
+
+	for _, id := range ids {
+		c.restartEngineLocked(id)
+	}
+}
+
+// RestartEngine stops and respawns the engine for id (if one is running),
+// reusing its stored config. Used by Service.ClearCache to rebuild the cache
+// after deleting it on disk. A no-op when no engine is running for id.
+func (c *ClusterCacheController) RestartEngine(id ClusterID) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.restartEngineLocked(id)
+}
+
+// restartEngineLocked stops id's engine and respawns it with the same config and
+// bookkeeping. Caller must hold writeMu.
+func (c *ClusterCacheController) restartEngineLocked(id ClusterID) {
+	c.mu.Lock()
+	entry, ok := c.engines[id]
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	restCfg, fingerprint := entry.restCfg, entry.fingerprint
+	cacheObjID, cacheGen, parentGen := entry.cacheObjID, entry.cacheGen, entry.parentGen
+	c.stopEngine(id)
+	c.spawnEngine(id, restCfg, fingerprint, cacheObjID, cacheGen, parentGen)
 }
 
 // stopEngine tears down a cluster's engine if one is running.
@@ -344,9 +417,6 @@ func (c *ClusterCacheController) applyEngineReport(ctx context.Context, entry *e
 	cond := syncedCondition(st, entry.parentGen)
 	lastSyncedAt := st.LastSyncedAt
 
-	// Build status from the engine report. ObservedPokeSyncGeneration is reset to
-	// zero here; the next Reconcile restores it. This is acceptable because the
-	// poke bounce uses the Reconcile loop, not the sink.
 	status := ClusterCacheStatus{
 		Conditions:   []ClusterCondition{cond},
 		LastSyncedAt: lastSyncedAt,

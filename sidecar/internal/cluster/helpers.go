@@ -15,6 +15,9 @@
 package cluster
 
 import (
+	"context"
+	"sync"
+
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
@@ -22,6 +25,7 @@ import (
 	"github.com/amorey/beehive"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // KubeConfigSource is the read surface of the kubeconfig watcher. Satisfied by
@@ -47,4 +51,44 @@ func ResolveRESTConfig(cfg *api.Config, contextName string) (*rest.Config, error
 	return clientcmd.NewNonInteractiveClientConfig(
 		*cfg, contextName, &clientcmd.ConfigOverrides{}, nil,
 	).ClientConfig()
+}
+
+// pokeSubscription runs a handler on every signal from the poke bus until
+// stopped. It owns the subscription, the worker goroutine, and a base context
+// cancelled on stop (so a long-running handler is interrupted). Both cluster
+// controllers use it to react to resync pokes in their beehive Start/Stop.
+type pokeSubscription struct {
+	cancel func()
+	wg     sync.WaitGroup
+}
+
+// startPokeSubscription subscribes to pokeSvc and invokes handler(ctx) on each
+// signal; ctx is cancelled when the subscription is stopped. Returns nil when
+// pokeSvc is nil (poke-driven behavior disabled, e.g. in tests) — stop is
+// nil-safe.
+func startPokeSubscription(pokeSvc *poke.Service, handler func(context.Context)) *pokeSubscription {
+	if pokeSvc == nil {
+		return nil
+	}
+	ch, cancelSub := pokeSvc.Subscribe()
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	s := &pokeSubscription{cancel: func() { cancelSub(); cancelCtx() }}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for range ch {
+			handler(ctx)
+		}
+	}()
+	return s
+}
+
+// stop halts the subscription (closing the channel so the worker returns) and
+// joins it. Safe to call on a nil subscription.
+func (s *pokeSubscription) stop() {
+	if s == nil {
+		return
+	}
+	s.cancel()
+	s.wg.Wait()
 }

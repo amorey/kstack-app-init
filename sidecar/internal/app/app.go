@@ -89,9 +89,10 @@ func New(cfg Config) (*App, error) {
 
 	// The cluster service is the whole cluster control plane behind one boundary:
 	// it owns the kubeconfig watcher, the beehive store + instance (at
-	// <data-dir>/beehive.db), the three controllers, the kubeconfig importer +
-	// poke→sync forwarder, and the per-cluster cache manager. app hands it the
-	// data dir, the kubeconfig path, and the poke bus, then drives Start/Close.
+	// <data-dir>/beehive.db), the two controllers (which subscribe to the poke
+	// bus for resync), the kubeconfig importer, and the per-cluster cache
+	// manager. app hands it the data dir, the kubeconfig path, and the poke bus,
+	// then drives Start/Close.
 	clusterSvc, err := cluster.New(cfg.DataDir, cfg.KubeconfigPath, pokeSvc)
 	if err != nil {
 		return nil, err
@@ -163,9 +164,9 @@ func (a *App) Start(ctx context.Context) (func(context.Context) error, error) {
 	a.pokeSvc.Start(ctx)
 
 	// Start the cluster service: it starts beehive (the controller harness) and
-	// the kubeconfig watcher, then the kubeconfig importer (seeds ClusterSource
-	// objects per context) and the poke→sync forwarder (bumps PokeSyncGeneration
-	// on every Cluster so running sync engines bounce).
+	// the kubeconfig watcher, then the kubeconfig importer (creates one Cluster
+	// per kube-context). The controllers subscribe to the poke bus themselves for
+	// resync (connection re-probe + sync-engine restart).
 	clusterSvcStop, err := a.clusterSvc.Start(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("start cluster service: %w", err)
