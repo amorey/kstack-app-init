@@ -211,7 +211,7 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, obj *beehive.Obj
 		LastSyncedAt: loaded.LastSyncedAt,
 	}
 
-	requeueAfter := c.converge(ctx, clusterID, obj.ID, obj.Generation, clusterObj, &working)
+	requeueAfter := c.converge(clusterID, obj.ID, obj.Generation, clusterObj, &working)
 
 	if ClusterCacheStatusEqual(loaded, working) {
 		return beehive.Result{RequeueAfter: requeueAfter}, nil
@@ -222,7 +222,6 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, obj *beehive.Obj
 
 // converge manages the sync engine toward the parent Cluster's spec.
 func (c *ClusterCacheController) converge(
-	ctx context.Context,
 	clusterID ClusterID,
 	cacheObjID beehive.ObjectID,
 	cacheGen int64,

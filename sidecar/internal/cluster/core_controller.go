@@ -232,12 +232,16 @@ func (c *ClusterController) converge(ctx context.Context, obj *beehive.Object[Cl
 			c.connMgr.Delete(clusterID)
 		}
 		SetCondition(conds, ClusterCondition{
-			Type: ClusterConditionConnected, Status: ConditionFalse,
-			Reason: ReasonInactive, ObservedGeneration: gen,
+			Type:               ClusterConditionConnected,
+			Status:             ConditionFalse,
+			Reason:             ReasonInactive,
+			ObservedGeneration: gen,
 		})
 		SetCondition(conds, ClusterCondition{
-			Type: ClusterConditionHealthy, Status: ConditionUnknown,
-			Reason: ReasonInactive, ObservedGeneration: gen,
+			Type:               ClusterConditionHealthy,
+			Status:             ConditionUnknown,
+			Reason:             ReasonInactive,
+			ObservedGeneration: gen,
 		})
 		return 0
 	}
@@ -268,8 +272,10 @@ func (c *ClusterController) converge(ctx context.Context, obj *beehive.Object[Cl
 	working.Principal = principal
 	working.LastConnectedAt = &now
 	SetCondition(conds, ClusterCondition{
-		Type: ClusterConditionConnected, Status: ConditionTrue,
-		Reason: ReasonConnected, ObservedGeneration: gen,
+		Type:               ClusterConditionConnected,
+		Status:             ConditionTrue,
+		Reason:             ReasonConnected,
+		ObservedGeneration: gen,
 	})
 
 	phase, msg := c.check(ctx, restCfg)

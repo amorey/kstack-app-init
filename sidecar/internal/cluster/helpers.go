@@ -73,13 +73,11 @@ func startPokeSubscription(pokeSvc *poke.Service, handler func(context.Context))
 	ch, cancelSub := pokeSvc.Subscribe()
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	s := &pokeSubscription{cancel: func() { cancelSub(); cancelCtx() }}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
+	s.wg.Go(func() {
 		for range ch {
 			handler(ctx)
 		}
-	}()
+	})
 	return s
 }
 
