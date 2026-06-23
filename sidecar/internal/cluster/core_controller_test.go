@@ -17,7 +17,6 @@ package cluster_test
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,6 +52,45 @@ func staticCheck(phase cluster.HealthPhase) cluster.CheckFunc {
 	}
 }
 
+// signalingProbe returns a successful ProbeFunc that signals every invocation on
+// the returned channel, so a test can wait on the probe event instead of polling
+// a counter. The send is non-blocking (buffered + select/default) so a slow
+// reader can never stall the controller's reconcile.
+func signalingProbe() (cluster.ProbeFunc, chan struct{}) {
+	ch := make(chan struct{}, 16)
+	probe := func(context.Context, *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+		uid := "uid"
+		return cluster.ClusterServer{UID: &uid}, cluster.ClusterPrincipal{}, nil
+	}
+	return probe, ch
+}
+
+// awaitProbe blocks until the probe fires once, or fails on timeout.
+func awaitProbe(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for probe")
+	}
+}
+
+// drainProbes consumes any already-buffered probe signals so a following
+// awaitProbe observes only probes that fire after this point.
+func drainProbes(ch <-chan struct{}) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
 // newClusterTestBeehive builds a beehive with the real ClusterCoreController using
 // the given probe/check fakes plus NoopControllers for the other kinds.
 func newClusterTestBeehive(t *testing.T, w cluster.KubeConfigSource, probe cluster.ProbeFunc, check cluster.CheckFunc, connMgr *cluster.ConnectionManager) (beehive.Client[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus], beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]) {
@@ -75,24 +113,36 @@ func newClusterTestBeehive(t *testing.T, w cluster.KubeConfigSource, probe clust
 	return coreClient, cacheClient
 }
 
-// waitCondition polls until the object has the named condition or the deadline.
+// waitCondition blocks on the object's beehive watch until it carries the named
+// condition, then returns that object. beehive's Watch is current-on-subscribe
+// (a snapshot Added event, then live Modified events), so this is event-driven —
+// no polling.
 func waitCondition(t *testing.T, cl beehive.Client[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus], id beehive.ObjectID, condType cluster.ClusterConditionType) *beehive.Object[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus] {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		obj, err := cl.Get(context.Background(), id)
-		require.NoError(t, err)
-		if obj.Status != nil {
-			for _, c := range obj.Status.Conditions {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := cl.Watch(ctx, id)
+	require.NoError(t, err)
+
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				t.Fatalf("watch closed before condition %s", condType)
+			}
+			if ev.Object == nil || ev.Object.Status == nil {
+				continue
+			}
+			for _, c := range ev.Object.Status.Conditions {
 				if c.Type == condType {
-					return obj
+					return ev.Object
 				}
 			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for condition %s", condType)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for condition %s", condType)
-	return nil
 }
 
 // eligibleSpec builds a Cluster spec that passes ConnectionEligible.
@@ -286,12 +336,7 @@ func TestClusterCoreControllerPokeReprobes(t *testing.T) {
 	ctx := context.Background()
 	pk := poke.New()
 
-	var probeCount atomic.Int32
-	probe := func(context.Context, *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
-		probeCount.Add(1)
-		uid := "uid"
-		return cluster.ClusterServer{UID: &uid}, cluster.ClusterPrincipal{}, nil
-	}
+	probe, probeCh := signalingProbe()
 
 	bh := testutil.NewTestBeehiveUnstarted(t)
 	coreClient := beehive.NewClient[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus](bh, cluster.ClusterGroupKind)
@@ -314,14 +359,12 @@ func TestClusterCoreControllerPokeReprobes(t *testing.T) {
 	require.NoError(t, err)
 
 	// The initial scheduled reconcile probes once (then requeues ~30s out).
-	require.Eventually(t, func() bool { return probeCount.Load() >= 1 },
-		2*time.Second, 10*time.Millisecond, "initial reconcile should probe once")
-	before := probeCount.Load()
+	awaitProbe(t, probeCh)
+	drainProbes(probeCh)
 
 	// A poke forces an immediate re-probe without waiting for the 30s cadence.
 	pk.Poke(poke.SourceHost)
-	require.Eventually(t, func() bool { return probeCount.Load() > before },
-		2*time.Second, 10*time.Millisecond, "poke should force an immediate re-probe")
+	awaitProbe(t, probeCh)
 }
 
 // TestClusterCoreControllerReprobeOne verifies the in-process retry bus: Reprobe
@@ -330,12 +373,7 @@ func TestClusterCoreControllerPokeReprobes(t *testing.T) {
 func TestClusterCoreControllerReprobeOne(t *testing.T) {
 	ctx := context.Background()
 
-	var probeCount atomic.Int32
-	probe := func(context.Context, *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
-		probeCount.Add(1)
-		uid := "uid"
-		return cluster.ClusterServer{UID: &uid}, cluster.ClusterPrincipal{}, nil
-	}
+	probe, probeCh := signalingProbe()
 
 	bh := testutil.NewTestBeehiveUnstarted(t)
 	coreClient := beehive.NewClient[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus](bh, cluster.ClusterGroupKind)
@@ -359,12 +397,10 @@ func TestClusterCoreControllerReprobeOne(t *testing.T) {
 	require.NoError(t, err)
 
 	// The initial scheduled reconcile probes once (then requeues ~30s out).
-	require.Eventually(t, func() bool { return probeCount.Load() >= 1 },
-		2*time.Second, 10*time.Millisecond, "initial reconcile should probe once")
-	before := probeCount.Load()
+	awaitProbe(t, probeCh)
+	drainProbes(probeCh)
 
 	// Reprobe forces an immediate re-probe of the targeted cluster.
 	ctrl.Reprobe(id)
-	require.Eventually(t, func() bool { return probeCount.Load() > before },
-		2*time.Second, 10*time.Millisecond, "Reprobe should force an immediate re-probe")
+	awaitProbe(t, probeCh)
 }

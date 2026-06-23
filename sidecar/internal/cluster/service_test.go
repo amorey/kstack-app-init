@@ -207,12 +207,27 @@ func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 func TestServiceDeleteTombstonesCluster(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
-	id := seedCluster(t, s, "alpha", "id-alpha")
+
+	// Seed with a finalizer so the soft-delete tombstone is observable without a
+	// race: beehive GC is a no-op while an object still holds a finalizer, so the
+	// deletion-pending row lingers deterministically. Without it, the kind's (noop)
+	// controller collects the finalizer-less, referrer-less row on the reconcile
+	// pass that Delete enqueues — and that physical delete races the GetBySlug
+	// below (passing locally, "object not found" under CI timing).
+	id := ClusterID("id-alpha")
+	name := "alpha"
+	_, err := s.coreClient.Create(ctx, ClusterCoreSpec{
+		Name:          &name,
+		IsSyncEnabled: true,
+		IsActive:      true,
+		Source:        ClusterSource{Kubeconfig: &ClusterSourceKubeconfig{Context: "alpha"}},
+	}, beehive.WithSlug(ClusterSlug(id)), beehive.WithFinalizers("test/hold"))
+	require.NoError(t, err)
 
 	require.NoError(t, s.Delete(ctx, id))
 
-	// Delete tombstones the Cluster (soft delete); beehive GC then cascades to
-	// its ClusterCache.
+	// Delete tombstones the Cluster (soft delete); beehive GC then cascades to its
+	// ClusterCache once the finalizers clear.
 	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	require.NoError(t, err)
 	assert.NotNil(t, obj.DeletionRequestedAt)

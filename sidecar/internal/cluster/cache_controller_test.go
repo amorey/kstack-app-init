@@ -98,24 +98,39 @@ func newCacheTestBeehive(t *testing.T, connMgr *cluster.ConnectionManager) (
 // capturedCfgSlot holds the REST config that was passed to the engine factory.
 type capturedCfgSlot struct{ cfg *rest.Config }
 
-// waitCacheCondition polls until the ClusterCache object has the Synced condition.
-func waitCacheCondition(t *testing.T, cl beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus], id beehive.ObjectID) *beehive.Object[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus] {
+// awaitCacheSyncedStatus blocks on the ClusterCache object's beehive watch until
+// its Synced condition reaches the wanted status, then returns that condition.
+// beehive's Watch is current-on-subscribe (a snapshot Added event, then live
+// Modified events), so this is fully event-driven — no polling.
+//
+// Waiting for a specific status matters because converge commits a transient
+// Synced=Syncing (ConditionFalse) synchronously, then the engine's async
+// Watching report flips it to ConditionTrue; a test that wants the settled value
+// must wait for it, not the first write, or it races the async report.
+func awaitCacheSyncedStatus(t *testing.T, cl beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus], id beehive.ObjectID, want cluster.ConditionStatus) cluster.ClusterCondition {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		obj, err := cl.Get(context.Background(), id)
-		require.NoError(t, err)
-		if obj.Status != nil {
-			for _, c := range obj.Status.Conditions {
-				if c.Type == cluster.ClusterConditionSynced {
-					return obj
-				}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := cl.Watch(ctx, id)
+	require.NoError(t, err)
+
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				t.Fatalf("watch closed before Synced=%s on ClusterCache", want)
 			}
+			if ev.Object == nil || ev.Object.Status == nil {
+				continue
+			}
+			if c := findCacheConditionOK(ev.Object.Status.Conditions, cluster.ClusterConditionSynced); c != nil && c.Status == want {
+				return *c
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for Synced=%s on ClusterCache", want)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("timed out waiting for Synced condition on ClusterCache")
-	return nil
 }
 
 func eligibleClusterCoreSpec(contextName string) cluster.ClusterCoreSpec {
@@ -150,8 +165,7 @@ func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
-	got := waitCacheCondition(t, cacheClient, cacheObj.ID)
-	synced := findCacheCondition(t, got.Status.Conditions, cluster.ClusterConditionSynced)
+	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, cluster.ConditionTrue)
 	assert.Equal(t, cluster.ConditionTrue, synced.Status,
 		"engine started and reported Watching → Synced=True")
 	assert.True(t, fakeEng.started.Load())
@@ -175,8 +189,7 @@ func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
-	got := waitCacheCondition(t, cacheClient, cacheObj.ID)
-	synced := findCacheCondition(t, got.Status.Conditions, cluster.ClusterConditionSynced)
+	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, cluster.ConditionFalse)
 	assert.Equal(t, cluster.ConditionFalse, synced.Status)
 	assert.Equal(t, cluster.ReasonPaused, synced.Reason)
 }
@@ -214,21 +227,7 @@ func TestCacheControllerReportWithParentGenerationAhead(t *testing.T) {
 	// The async engine report must land as Synced=True. With the parent's
 	// generation wrongly used as observedGeneration this write is rejected and
 	// the condition never flips past the synchronous Syncing state.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		obj, err := cacheClient.Get(ctx, cacheObj.ID)
-		require.NoError(t, err)
-		if obj.Status != nil {
-			synced := findCacheConditionOK(obj.Status.Conditions, cluster.ClusterConditionSynced)
-			if synced != nil && synced.Status == cluster.ConditionTrue {
-				break
-			}
-		}
-		if !time.Now().Before(deadline) {
-			t.Fatal("timed out waiting for Synced=True from engine report")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, cluster.ConditionTrue)
 	assert.True(t, fakeEng.started.Load())
 }
 
@@ -252,7 +251,7 @@ func TestCacheControllerUsesConnectionManagerConfig(t *testing.T) {
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
-	waitCacheCondition(t, cacheClient, cacheObj.ID)
+	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, cluster.ConditionTrue)
 
 	assert.Equal(t, injected, slot.cfg,
 		"engine must receive the REST config from ConnectionManager, not a freshly resolved one")
@@ -273,8 +272,7 @@ func TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager(t *testing.
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
-	got := waitCacheCondition(t, cacheClient, cacheObj.ID)
-	synced := findCacheCondition(t, got.Status.Conditions, cluster.ClusterConditionSynced)
+	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, cluster.ConditionTrue)
 	assert.Equal(t, cluster.ConditionTrue, synced.Status)
 	assert.True(t, fakeEng.started.Load())
 }
@@ -348,15 +346,4 @@ func findCacheConditionOK(conds []cluster.ClusterCondition, typ cluster.ClusterC
 		}
 	}
 	return nil
-}
-
-func findCacheCondition(t *testing.T, conds []cluster.ClusterCondition, typ cluster.ClusterConditionType) cluster.ClusterCondition {
-	t.Helper()
-	for _, c := range conds {
-		if c.Type == typ {
-			return c
-		}
-	}
-	t.Fatalf("condition %s not found", typ)
-	return cluster.ClusterCondition{}
 }
