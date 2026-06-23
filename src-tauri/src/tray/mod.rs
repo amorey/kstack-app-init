@@ -152,10 +152,7 @@ pub fn build_tray(app: &AppHandle) -> Result<()> {
 /// for the initial tray build and for every rebuild triggered by the account
 /// watch stream, so the static items (New Window / Show Main Window / Quit) stay
 /// defined in one place.
-fn build_tray_menu(
-    app: &AppHandle,
-    account: AccountMenuDescriptor,
-) -> tauri::Result<Menu<Wry>> {
+fn build_tray_menu(app: &AppHandle, account: AccountMenuDescriptor) -> tauri::Result<Menu<Wry>> {
     let new_window = MenuItem::with_id(app, "tray_new_window", "New Window", true, None::<&str>)?;
     let show_main = MenuItem::with_id(
         app,

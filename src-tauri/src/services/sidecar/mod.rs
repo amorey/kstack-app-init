@@ -19,7 +19,7 @@ mod logs;
 mod service;
 
 pub use graphql::GraphqlResponse;
+pub use grpc::AuthState;
 #[cfg(test)]
 pub use grpc::Identity;
-pub use grpc::AuthState;
 pub use service::SidecarService;
