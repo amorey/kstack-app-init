@@ -33,7 +33,7 @@ import (
 func newTestImporter(t *testing.T, cfg *api.Config) *cluster.KubeconfigImporter {
 	t.Helper()
 	bh := testutil.NewTestBeehive(t)
-	coreClient := beehive.NewClient[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus](bh, cluster.ClusterGroupKind)
+	coreClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterStatus](bh, cluster.ClusterGroupKind)
 	w := testutil.NewStaticWatcher(t, cfg)
 	return cluster.NewKubeconfigImporter(w, coreClient)
 }
@@ -48,8 +48,8 @@ func TestImporterNewContextCreatesCluster(t *testing.T) {
 	obj := mustSingleObj(t, im.ClusterClient())
 	require.NotNil(t, obj.Spec.Source.Kubeconfig)
 	assert.Equal(t, "alpha", obj.Spec.Source.Kubeconfig.Context)
-	assert.True(t, obj.Spec.IsActive)
-	assert.True(t, obj.Spec.IsSyncEnabled)
+	assert.True(t, obj.Spec.Enabled)
+	assert.True(t, obj.Spec.SyncEnabled)
 	require.NotNil(t, obj.Spec.SourceObs)
 	assert.Equal(t, "alpha-cluster", obj.Spec.SourceObs.Cluster)
 	assert.Equal(t, "alpha-user", obj.Spec.SourceObs.User)
@@ -107,7 +107,7 @@ func TestImporterUnchangedSnapshotWritesNothing(t *testing.T) {
 	assert.Equal(t, obj1.Generation, obj2.Generation, "unchanged snapshot must not bump generation")
 }
 
-func mustSingleObj(t *testing.T, cl beehive.Client[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus]) *beehive.Object[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus] {
+func mustSingleObj(t *testing.T, cl beehive.Client[cluster.ClusterSpec, cluster.ClusterStatus]) *beehive.Object[cluster.ClusterSpec, cluster.ClusterStatus] {
 	t.Helper()
 	objs, err := cl.List(context.Background())
 	require.NoError(t, err)

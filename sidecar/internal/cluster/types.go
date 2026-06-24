@@ -109,7 +109,7 @@ const (
 	ClusterConditionHealthy ClusterConditionType = "Healthy"
 	// ClusterConditionSynced reports the state of the cluster's cache-sync
 	// engine. It lives in ClusterCacheStatus (the ClusterCache kind), not in
-	// ClusterCoreStatus.
+	// the Cluster kind's ClusterStatus.
 	ClusterConditionSynced ClusterConditionType = "Synced"
 )
 
@@ -238,10 +238,10 @@ func ConditionsEqual(a, b []ClusterCondition) bool {
 // ClusterGroupKind identifies the Cluster beehive resource kind.
 var ClusterGroupKind = beehive.GroupKind{Kind: "Cluster"}
 
-// KubeconfigStatus is the kubeconfig-sourced record's last-known kubeconfig
+// ClusterKubeconfig is the kubeconfig-sourced record's last-known kubeconfig
 // observation: the cluster/user entry names and presence. Cached from the
 // last time the context was present so it survives orphaning.
-type KubeconfigStatus struct {
+type ClusterKubeconfig struct {
 	Cluster   string `json:"cluster"`
 	User      string `json:"user"`
 	IsPresent bool   `json:"isPresent"`
@@ -261,7 +261,7 @@ type ClusterSourceKubeconfig struct {
 
 // ClusterSourceStatus is the status-side counterpart of ClusterSource.
 type ClusterSourceStatus struct {
-	Kubeconfig *KubeconfigStatus `json:"kubeconfig,omitempty"`
+	Kubeconfig *ClusterKubeconfig `json:"kubeconfig,omitempty"`
 }
 
 // ClusterServer holds last-known facts about the remote cluster, discovered by
@@ -277,30 +277,34 @@ type ClusterPrincipal struct {
 	Username *string `json:"username,omitempty"`
 }
 
-// ClusterCoreSpec is a cluster record's desired state: the user/API-owned fields.
-// There is no spec-level trigger counter — RetryConnection forces an immediate
-// re-probe out-of-band via the controller's in-process retry bus, and resync
-// pokes likewise drive the controllers directly, so neither writes the spec.
-type ClusterCoreSpec struct {
-	Name          *string       `json:"name,omitempty"`
-	IsSyncEnabled bool          `json:"isSyncEnabled"`
-	IsActive      bool          `json:"isActive"`
-	Source        ClusterSource `json:"source"`
+// ClusterSpec is a cluster record's desired state: the user/API-owned fields.
+// Field names are declarative (no "is" prefix) — spec states the desired
+// condition, it does not ask a question. There is no spec-level trigger
+// counter — RetryConnection forces an immediate re-probe out-of-band via the
+// controller's in-process retry bus, and resync pokes likewise drive the
+// controllers directly, so neither writes the spec.
+type ClusterSpec struct {
+	Name        *string       `json:"name,omitempty"`
+	Enabled     bool          `json:"enabled"`
+	SyncEnabled bool          `json:"syncEnabled"`
+	Source      ClusterSource `json:"source"`
 
 	// SourceObs is the kubeconfig observation written by the kubeconfig importer
 	// (cluster/user entry names, presence, default status). It is stored in the
 	// spec because only the Cluster's own controller (ClusterCoreController) can
 	// write its status, and the importer needs a write path that uses the
 	// ordinary Client.Update. The ClusterCoreController copies SourceObs into
-	// ClusterCoreStatus.Source.Kubeconfig during its reconcile, so the
-	// GraphQL layer reads from status as expected.
-	SourceObs *KubeconfigStatus `json:"sourceObs,omitempty"`
+	// ClusterStatus.Source.Kubeconfig during its reconcile, so the GraphQL layer
+	// reads from status as expected. Not exposed on the GraphQL ClusterSpec.
+	SourceObs *ClusterKubeconfig `json:"sourceObs,omitempty"`
 }
 
-// ClusterCoreStatus is the Cluster beehive kind's stored status:
-// connection/health observations from the ClusterCoreController. Distinct from the
-// domain ClusterStatus (which also includes sync status from ClusterCache).
-type ClusterCoreStatus struct {
+// ClusterStatus is the Cluster beehive kind's stored status AND the domain
+// status surfaced to the GraphQL layer: connection/health observations written
+// by the ClusterCoreController. Sync status lives separately on the ClusterCache
+// child (see ClusterCacheStatus), mirroring the beehive owner chain, so there is
+// no merge type — this one struct is both stored and served.
+type ClusterStatus struct {
 	Source          ClusterSourceStatus `json:"source"`
 	Server          ClusterServer       `json:"server"`
 	Principal       ClusterPrincipal    `json:"principal"`
@@ -321,8 +325,9 @@ var ClusterCacheGroupKind = beehive.GroupKind{Kind: "ClusterCache"}
 type ClusterCacheSpec struct{}
 
 // ClusterCacheStatus is the ClusterCache kind's stored status, written by the
-// ClusterCacheController. It serves as both the beehive stored type and the
-// domain ClusterSyncStatus.
+// ClusterCacheController, and the domain sync-status block served under the
+// Cluster's cache child. Both stored and served — there is no separate
+// projection type.
 type ClusterCacheStatus struct {
 	// Conditions holds the sync-controller-owned condition (Synced).
 	Conditions []ClusterCondition `json:"conditions"`
@@ -330,57 +335,47 @@ type ClusterCacheStatus struct {
 	LastSyncedAt *time.Time `json:"lastSyncedAt,omitempty"`
 }
 
-// --- Domain (combined) types exposed to resolvers ---
+// --- Domain types exposed to resolvers ---
 
-// ClusterStatus is the combined observed state of a cluster as returned by
-// the resolver layer: connection/health from the Cluster beehive object plus
-// sync status from its ClusterCache peer.
-type ClusterStatus struct {
-	Source          ClusterSourceStatus `json:"source"`
-	Server          ClusterServer       `json:"server"`
-	Principal       ClusterPrincipal    `json:"principal"`
-	LastConnectedAt *time.Time          `json:"lastConnectedAt,omitempty"`
-	// Conditions holds the cluster-controller-owned conditions (Connected,
-	// Healthy).
-	Conditions []ClusterCondition `json:"conditions"`
-	// SyncStatus is the sync controller's status block, populated from the
-	// ClusterCache peer object.
-	SyncStatus ClusterCacheStatus `json:"syncStatus"`
+// ClusterCache is the domain view of a cluster's owned ClusterCache child,
+// mirroring the beehive owner chain: the sync Status (joined from the
+// ClusterCache beehive object) plus the cluster ID, which the live-stats
+// resolver needs to query the per-cluster cache. This replaces the old
+// model.ClusterStatus wrapper — the ID now rides a real domain object.
+type ClusterCache struct {
+	ID     ClusterID
+	Status ClusterCacheStatus
 }
 
 // Cluster is the domain record for one tracked cluster connection (one
-// kube-context): the restart-surviving facts about it. Assembled by the
-// resolver layer from the Cluster + ClusterCache beehive objects.
+// kube-context): the restart-surviving facts about it. Assembled by the service
+// layer from the Cluster + ClusterCache beehive objects. Status binds directly
+// to the stored Cluster-kind status; Cache carries the ClusterCache child.
 type Cluster struct {
 	ID         ClusterID
 	Generation int64
 	CreatedAt  time.Time
-	ArchivedAt *time.Time // always nil today; reserved for future archiving
 	DeletedAt  *time.Time // derived from obj.DeletionRequestedAt
 
-	Spec   ClusterCoreSpec
+	Spec   ClusterSpec
 	Status ClusterStatus
-}
-
-// ClusterPatch describes a user-initiated mutation. Nil fields are unchanged.
-type ClusterPatch struct {
-	IsSyncEnabled *bool
+	Cache  ClusterCache
 }
 
 // --- Cache statistics types (for the ClusterCache GraphQL resolver) ---
 
-// CachedResourceStats is the per-resource breakdown of one cluster's cache.
-type CachedResourceStats struct {
+// CachedResource is the per-resource breakdown of one cluster's cache.
+type CachedResource struct {
 	Resource      string
 	Count         int
 	LastUpdatedAt *time.Time
 }
 
-// CacheStats reports a cluster's on-disk cache statistics.
-type CacheStats struct {
+// ClusterCacheStats reports a cluster's live on-disk cache statistics.
+type ClusterCacheStats struct {
 	Exists    bool
 	Bytes     int64
-	Resources []CachedResourceStats
+	Resources []CachedResource
 }
 
 // --- Seed conditions ---
@@ -413,9 +408,9 @@ func SeedSyncConditions(gen int64, now time.Time) []ClusterCondition {
 
 // --- Status equality helpers (skip-the-write guards) ---
 
-// ClusterCoreStatusEqual reports whether two ClusterCoreStatus
-// blocks are observably equal — the ClusterCoreController's skip-the-write guard.
-func ClusterCoreStatusEqual(a, b ClusterCoreStatus) bool {
+// ClusterStatusEqual reports whether two ClusterStatus blocks are observably
+// equal — the ClusterCoreController's skip-the-write guard.
+func ClusterStatusEqual(a, b ClusterStatus) bool {
 	return ptrEqual(a.Source.Kubeconfig, b.Source.Kubeconfig) &&
 		ptrEqual(a.Server.UID, b.Server.UID) &&
 		ptrEqual(a.Server.Version, b.Server.Version) &&

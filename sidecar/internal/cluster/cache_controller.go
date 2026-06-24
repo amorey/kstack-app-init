@@ -78,9 +78,9 @@ type engineEntry struct {
 // back into ClusterCacheStatus as the Synced condition.
 //
 // The controller reads the parent Cluster (via ClusterClient) to determine
-// eligibility (connection-eligible + IsSyncEnabled), and adds a DependsOn edge
+// eligibility (connection-eligible + SyncEnabled), and adds a DependsOn edge
 // (ClusterCache depends on Cluster) so beehive re-queues this cache when the
-// parent Cluster spec changes (e.g. IsSyncEnabled toggled).
+// parent Cluster spec changes (e.g. SyncEnabled toggled).
 //
 // Resync pokes (OS resume / network-on / wall-clock gap) arrive out-of-band on
 // the poke bus, not through beehive: the controller subscribes in Start and, on
@@ -90,7 +90,7 @@ type engineEntry struct {
 // needs no durable spec write — see restartLiveEngines.
 type ClusterCacheController struct {
 	cfgSource    KubeConfigSource
-	coreClient   beehive.Client[ClusterCoreSpec, ClusterCoreStatus]
+	coreClient   beehive.Client[ClusterSpec, ClusterStatus]
 	cacheManager *store.Manager
 	connMgr      *ConnectionManager
 	ctrlClient   beehive.ControllerClient[ClusterCacheStatus]
@@ -114,7 +114,7 @@ type ClusterCacheController struct {
 // DBs. connMgr may be nil (credentials are then resolved from the kubeconfig).
 func NewClusterCacheController(
 	cfgSource KubeConfigSource,
-	coreClient beehive.Client[ClusterCoreSpec, ClusterCoreStatus],
+	coreClient beehive.Client[ClusterSpec, ClusterStatus],
 	manager *store.Manager,
 	connMgr *ConnectionManager,
 	pokeSvc *poke.Service,
@@ -201,7 +201,7 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 	}
 
 	// Add DependsOn edge so beehive re-queues us when the parent Cluster spec
-	// changes (e.g. IsSyncEnabled toggled), propagating eligibility changes.
+	// changes (e.g. SyncEnabled toggled), propagating eligibility changes.
 	if err := client.AddDependency(ctx, obj.ID, clusterObj.ID); err != nil {
 		return beehive.Result{}, err
 	}
@@ -239,7 +239,7 @@ func (c *ClusterCacheController) converge(
 	clusterID ClusterID,
 	cacheObjID beehive.ObjectID,
 	cacheGen int64,
-	clusterObj *beehive.Object[ClusterCoreSpec, ClusterCoreStatus],
+	clusterObj *beehive.Object[ClusterSpec, ClusterStatus],
 	working *ClusterCacheStatus,
 ) time.Duration {
 	gen := clusterObj.Generation
@@ -385,8 +385,8 @@ func (c *ClusterCacheController) stopEngine(id ClusterID) {
 }
 
 // syncEligible reports whether a cluster should have a running sync engine.
-func syncEligible(obj *beehive.Object[ClusterCoreSpec, ClusterCoreStatus]) bool {
-	return ConnectionEligible(obj) && obj.Spec.IsSyncEnabled
+func syncEligible(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+	return ConnectionEligible(obj) && obj.Spec.SyncEnabled
 }
 
 // engineSink delivers one engine's status reports into the ClusterCacheStatus

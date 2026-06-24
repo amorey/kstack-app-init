@@ -38,9 +38,9 @@ type KubeConfigSource interface {
 // ConnectionEligible reports whether a Cluster record should have a live
 // connection: kubeconfig-sourced, observed present, activated, and not being
 // deleted.
-func ConnectionEligible(obj *beehive.Object[ClusterCoreSpec, ClusterCoreStatus]) bool {
+func ConnectionEligible(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
 	return obj.DeletionRequestedAt == nil &&
-		obj.Spec.IsActive &&
+		obj.Spec.Enabled &&
 		obj.Spec.Source.Kubeconfig != nil &&
 		obj.Spec.SourceObs != nil &&
 		obj.Spec.SourceObs.IsPresent

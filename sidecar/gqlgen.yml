@@ -19,42 +19,18 @@ autobind:
   - github.com/kubetail-org/kstack-app/sidecar/graph/model
 
 models:
-  # --- KubeConfig ---
-  KubeConfig:
-    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfig
-    fields:
-      authInfos:
-        resolver: true
-      clusters:
-        resolver: true
-      contexts:
-        resolver: true
-
-  KubeConfigAuthInfo:
-    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfigAuthInfo
-
-  KubeConfigCluster:
-    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfigCluster
-
-  KubeConfigContext:
-    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfigContext
-
-  KubeConfigExtensions:
-    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.KubeConfigExtensions
-
   # --- Cluster ---
-  # The GraphQL Cluster types bind straight to the controllers domain types.
-  # ClusterStatus is a thin model.ClusterStatus wrapper (embedded
-  # controllers.ClusterStatus + the ClusterID) because its cache field resolver
-  # needs the cluster's ID and a child resolver only sees its own obj.
+  # The GraphQL Cluster types bind 1:1 (same name) to the internal/cluster
+  # domain types — gqlgen autobinds with no wrapper. The schema mirrors beehive's
+  # owner chain: Cluster.status is the Cluster kind's stored status, and the
+  # ClusterCache child carries the ClusterCache kind's sync status (`status`) plus
+  # live on-disk `stats` (a resolver, so a query pays the stat cost only when it
+  # selects them). The ClusterCache child carries the cluster ID for that resolver.
   Cluster:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.Cluster
-    fields:
-      status:
-        resolver: true
 
   ClusterSpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCoreSpec
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSpec
 
   ClusterSource:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSource
@@ -66,16 +42,13 @@ models:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSourceStatus
 
   ClusterStatus:
-    model: github.com/kubetail-org/kstack-app/sidecar/graph/model.ClusterStatus
-    fields:
-      cache:
-        resolver: true
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterStatus
 
   ClusterServer:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterServer
 
   ClusterKubeconfig:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.KubeconfigStatus
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterKubeconfig
 
   ClusterPrincipal:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterPrincipal
@@ -83,22 +56,28 @@ models:
       permissions:
         resolver: true
 
-  # The conditions ride the wire as-is (the controllers domain shapes; the
-  # webview derives display state from type/status/reason).
+  # The conditions ride the wire as-is (the domain shapes; the webview derives
+  # display state from type/status/reason).
   ClusterCondition:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCondition
 
   ConditionStatus:
     model: github.com/amorey/beehive.ConditionStatus
 
-  ClusterSyncStatus:
+  ClusterCache:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCache
+    fields:
+      stats:
+        resolver: true
+
+  ClusterCacheStatus:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheStatus
 
-  ClusterCache:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.CacheStats
+  ClusterCacheStats:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheStats
 
   CachedResource:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.CachedResourceStats
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.CachedResource
 
   # --- Auth ---
   # Bind the GraphQL auth types straight to the auth domain types so the

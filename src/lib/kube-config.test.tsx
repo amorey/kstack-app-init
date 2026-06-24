@@ -24,13 +24,20 @@ const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
-const { formatBytes, ClustersProvider, useClusters } = await import('./clusters');
+const { ClustersProvider } = await import('./clusters');
+const { KubeConfigProvider, useKubeConfig } = await import('./kube-config');
 
 // Helpers -------------------------------------------------------------
 
 const flush = () => act(async () => {});
 
-type Row = { id: string; name: string; syncEnabled?: boolean; enabled?: boolean };
+type Row = {
+  id: string;
+  name: string;
+  present?: boolean;
+  enabled?: boolean;
+  isDefault?: boolean;
+};
 
 function pushClusters(rows: Row[]) {
   liveChannel().onmessage!(
@@ -42,7 +49,7 @@ function pushClusters(rows: Row[]) {
             id: r.id,
             spec: {
               name: r.name,
-              syncEnabled: r.syncEnabled ?? true,
+              syncEnabled: true,
               enabled: r.enabled ?? true,
               source: { kubeconfig: { context: r.name } },
             },
@@ -51,8 +58,8 @@ function pushClusters(rows: Row[]) {
                 kubeconfig: {
                   cluster: `${r.name}-cluster`,
                   user: `${r.name}-user`,
-                  isPresent: true,
-                  isDefault: false,
+                  isPresent: r.present ?? true,
+                  isDefault: r.isDefault ?? false,
                 },
               },
               server: { uid: `uid-${r.id}` },
@@ -69,49 +76,25 @@ function pushClusters(rows: Row[]) {
   );
 }
 
-// A probe that renders the hook's value so tests can assert on it.
+// A probe that renders the derived kubeconfig so tests can assert on it.
 function Probe() {
-  const { clusters } = useClusters();
-  return <div data-testid="probe">{clusters === null ? 'null' : JSON.stringify(clusters.map((c) => c.spec.name))}</div>;
+  const { kubeConfig } = useKubeConfig();
+  return <div data-testid="probe">{kubeConfig === null ? 'null' : JSON.stringify(kubeConfig)}</div>;
 }
 
 function renderProvider() {
   return render(
     <UrqlProvider value={createGraphqlClient()}>
       <ClustersProvider>
-        <Probe />
+        <KubeConfigProvider>
+          <Probe />
+        </KubeConfigProvider>
       </ClustersProvider>
     </UrqlProvider>,
   );
 }
 
-// formatBytes ---------------------------------------------------------
-
-describe('formatBytes', () => {
-  it('renders an em dash for an uncached/zero size', () => {
-    expect(formatBytes(0)).toBe('—');
-  });
-
-  it('reports raw bytes below 1 KiB (no decimals)', () => {
-    expect(formatBytes(512)).toBe('512 B');
-    expect(formatBytes(1)).toBe('1 B');
-  });
-
-  it('scales to KB, MB, GB with one decimal (binary base)', () => {
-    expect(formatBytes(1536)).toBe('1.5 KB'); // 1.5 * 1024
-    expect(formatBytes(5_000_000)).toBe('4.8 MB'); // 5e6 / 1024^2 ≈ 4.768
-    expect(formatBytes(3 * 1024 ** 3)).toBe('3.0 GB');
-  });
-
-  it('crosses unit boundaries at 1024, not 1000', () => {
-    expect(formatBytes(1023)).toBe('1023 B');
-    expect(formatBytes(1024)).toBe('1.0 KB');
-  });
-});
-
-// ClustersProvider / useClusters --------------------------------------
-
-describe('useClusters', () => {
+describe('useKubeConfig', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     channels.length = 0;
@@ -126,39 +109,21 @@ describe('useClusters', () => {
     });
   });
 
-  it('throws outside the provider', () => {
-    function Bare() {
-      useClusters();
-      return null;
-    }
-    expect(() => render(<Bare />)).toThrow(/ClustersProvider/);
-  });
-
-  it('reports null before the first push', async () => {
-    renderProvider();
-    await flush();
-    expect(screen.getByTestId('probe')).toHaveTextContent('null');
-  });
-
-  it('subscribes to clustersWatch', async () => {
-    renderProvider();
-    await flush();
-    expect(invokeMock).toHaveBeenCalledWith(
-      'graphql_subscribe',
-      expect.objectContaining({ query: expect.stringContaining('clustersWatch') }),
-    );
-  });
-
-  it('reflects the pushed cluster list', async () => {
+  it('excludes disabled and orphaned clusters from the context list', async () => {
     renderProvider();
     await flush();
 
     await act(async () => {
       pushClusters([
-        { id: 'u-a', name: 'prod-us' },
-        { id: 'u-b', name: 'staging', syncEnabled: false },
+        { id: 'a', name: 'prod', enabled: true, present: true, isDefault: true },
+        { id: 'b', name: 'staging', enabled: false, present: true },
+        { id: 'c', name: 'gone', enabled: true, present: false },
       ]);
     });
-    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us","staging"]');
+
+    const probe = screen.getByTestId('probe');
+    const kubeConfig = JSON.parse(probe.textContent ?? '');
+    expect(kubeConfig.contexts).toEqual([{ name: 'prod' }]);
+    expect(kubeConfig.currentContext).toBe('prod');
   });
 });

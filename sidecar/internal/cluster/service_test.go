@@ -52,10 +52,10 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterCac
 	bh, err := beehive.New(st, beehive.WithResyncInterval(0))
 	require.NoError(t, err)
 
-	coreClient := beehive.NewClient[ClusterCoreSpec, ClusterCoreStatus](bh, ClusterGroupKind)
+	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
-	_, err = beehive.Register(bh, ClusterGroupKind, &noopController[ClusterCoreSpec, ClusterCoreStatus]{})
+	_, err = beehive.Register(bh, ClusterGroupKind, &noopController[ClusterSpec, ClusterStatus]{})
 	require.NoError(t, err)
 	cacheCC, err := beehive.Register(bh, ClusterCacheGroupKind, &noopController[ClusterCacheSpec, ClusterCacheStatus]{})
 	require.NoError(t, err)
@@ -78,11 +78,11 @@ func seedCluster(t *testing.T, s *Service, ctxName string, id ClusterID) Cluster
 	t.Helper()
 	ctx := context.Background()
 	name := ctxName
-	_, err := s.coreClient.Create(ctx, ClusterCoreSpec{
-		Name:          &name,
-		IsSyncEnabled: true,
-		IsActive:      true,
-		Source:        ClusterSource{Kubeconfig: &ClusterSourceKubeconfig{Context: ctxName}},
+	_, err := s.coreClient.Create(ctx, ClusterSpec{
+		Name:        &name,
+		SyncEnabled: true,
+		Enabled:     true,
+		Source:      ClusterSource{Kubeconfig: &ClusterSourceKubeconfig{Context: ctxName}},
 	}, beehive.WithSlug(ClusterSlug(id)))
 	require.NoError(t, err)
 	return id
@@ -129,8 +129,8 @@ func TestServiceGetJoinsSyncStatus(t *testing.T) {
 	c, err := s.Get(ctx, id)
 	require.NoError(t, err)
 	require.NotNil(t, c)
-	require.NotNil(t, c.Status.SyncStatus.LastSyncedAt)
-	assert.WithinDuration(t, now, *c.Status.SyncStatus.LastSyncedAt, time.Second)
+	require.NotNil(t, c.Cache.Status.LastSyncedAt)
+	assert.WithinDuration(t, now, *c.Cache.Status.LastSyncedAt, time.Second)
 }
 
 func TestServiceGetDeletionPendingIsNil(t *testing.T) {
@@ -147,6 +147,21 @@ func TestServiceGetDeletionPendingIsNil(t *testing.T) {
 	assert.Nil(t, c)
 }
 
+func TestServiceSetEnabled(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha", "id-alpha")
+
+	c, err := s.SetEnabled(ctx, id, false)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	assert.False(t, c.Spec.Enabled)
+
+	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	require.NoError(t, err)
+	assert.False(t, obj.Spec.Enabled)
+}
+
 func TestServiceSetSyncEnabled(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
@@ -155,11 +170,11 @@ func TestServiceSetSyncEnabled(t *testing.T) {
 	c, err := s.SetSyncEnabled(ctx, id, false)
 	require.NoError(t, err)
 	require.NotNil(t, c)
-	assert.False(t, c.Spec.IsSyncEnabled)
+	assert.False(t, c.Spec.SyncEnabled)
 
 	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	require.NoError(t, err)
-	assert.False(t, obj.Spec.IsSyncEnabled)
+	assert.False(t, obj.Spec.SyncEnabled)
 }
 
 // RetryConnection does not mutate the spec: it dispatches an out-of-band re-probe
@@ -216,11 +231,11 @@ func TestServiceDeleteTombstonesCluster(t *testing.T) {
 	// below (passing locally, "object not found" under CI timing).
 	id := ClusterID("id-alpha")
 	name := "alpha"
-	_, err := s.coreClient.Create(ctx, ClusterCoreSpec{
-		Name:          &name,
-		IsSyncEnabled: true,
-		IsActive:      true,
-		Source:        ClusterSource{Kubeconfig: &ClusterSourceKubeconfig{Context: "alpha"}},
+	_, err := s.coreClient.Create(ctx, ClusterSpec{
+		Name:        &name,
+		SyncEnabled: true,
+		Enabled:     true,
+		Source:      ClusterSource{Kubeconfig: &ClusterSourceKubeconfig{Context: "alpha"}},
 	}, beehive.WithSlug(ClusterSlug(id)), beehive.WithFinalizers("test/hold"))
 	require.NoError(t, err)
 
@@ -269,7 +284,7 @@ func TestServiceWatchEmitsSeedThenReemits(t *testing.T) {
 	for {
 		list := recvListBy(t, ch, deadline)
 		require.Len(t, list, 1)
-		if !list[0].Spec.IsSyncEnabled {
+		if !list[0].Spec.SyncEnabled {
 			return
 		}
 	}

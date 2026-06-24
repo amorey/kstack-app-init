@@ -35,8 +35,8 @@ const ClustersWatchSubscription = graphql(`
       id
       spec {
         name
-        isSyncEnabled
-        isActive
+        syncEnabled
+        enabled
         source {
           kubeconfig {
             context
@@ -60,7 +60,9 @@ const ClustersWatchSubscription = graphql(`
           status
           reason
         }
-        syncStatus {
+      }
+      cache {
+        status {
           conditions {
             type
             status
@@ -68,7 +70,7 @@ const ClustersWatchSubscription = graphql(`
           }
           lastSyncedAt
         }
-        cache {
+        stats {
           exists
           bytes
         }

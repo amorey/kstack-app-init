@@ -25,8 +25,8 @@ import (
 // clusterFixture bundles all data for one test cluster record.
 type clusterFixture struct {
 	id          string
-	spec        cluster.ClusterCoreSpec
-	connStatus  cluster.ClusterCoreStatus
+	spec        cluster.ClusterSpec
+	connStatus  cluster.ClusterStatus
 	cacheStatus cluster.ClusterCacheStatus
 }
 
@@ -48,16 +48,10 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 		id := cluster.ClusterID(fx.id)
 		f.order = append(f.order, id)
 		f.clusters[id] = &cluster.Cluster{
-			ID:   id,
-			Spec: fx.spec,
-			Status: cluster.ClusterStatus{
-				Source:          fx.connStatus.Source,
-				Server:          fx.connStatus.Server,
-				Principal:       fx.connStatus.Principal,
-				LastConnectedAt: fx.connStatus.LastConnectedAt,
-				Conditions:      fx.connStatus.Conditions,
-				SyncStatus:      fx.cacheStatus,
-			},
+			ID:     id,
+			Spec:   fx.spec,
+			Status: fx.connStatus,
+			Cache:  cluster.ClusterCache{ID: id, Status: fx.cacheStatus},
 		}
 	}
 	return f
@@ -101,8 +95,20 @@ func (f *fakeClusterService) Watch(ctx context.Context) (<-chan []*cluster.Clust
 	return ch, nil
 }
 
-func (f *fakeClusterService) CacheStats(context.Context, cluster.ClusterID) (*cluster.CacheStats, error) {
-	return &cluster.CacheStats{}, nil
+func (f *fakeClusterService) CacheStats(context.Context, cluster.ClusterID) (*cluster.ClusterCacheStats, error) {
+	return &cluster.ClusterCacheStats{}, nil
+}
+
+func (f *fakeClusterService) SetEnabled(_ context.Context, id cluster.ClusterID, enabled bool) (*cluster.Cluster, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.clusters[id]
+	if !ok {
+		return nil, cluster.ErrNotFound
+	}
+	c.Spec.Enabled = enabled
+	cp := *c
+	return &cp, nil
 }
 
 func (f *fakeClusterService) SetSyncEnabled(_ context.Context, id cluster.ClusterID, enabled bool) (*cluster.Cluster, error) {
@@ -112,7 +118,7 @@ func (f *fakeClusterService) SetSyncEnabled(_ context.Context, id cluster.Cluste
 	if !ok {
 		return nil, cluster.ErrNotFound
 	}
-	c.Spec.IsSyncEnabled = enabled
+	c.Spec.SyncEnabled = enabled
 	cp := *c
 	return &cp, nil
 }
@@ -159,14 +165,14 @@ func clusterFixtures() []clusterFixture {
 	return []clusterFixture{
 		{
 			id: "cl-1",
-			spec: cluster.ClusterCoreSpec{
-				Name:          &prodName,
-				IsSyncEnabled: true,
-				IsActive:      true,
-				Source:        cluster.ClusterSource{Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: "prod"}},
+			spec: cluster.ClusterSpec{
+				Name:        &prodName,
+				SyncEnabled: true,
+				Enabled:     true,
+				Source:      cluster.ClusterSource{Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: "prod"}},
 			},
-			connStatus: cluster.ClusterCoreStatus{
-				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.KubeconfigStatus{
+			connStatus: cluster.ClusterStatus{
+				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.ClusterKubeconfig{
 					Cluster: "prod-cluster", User: "prod-user",
 					IsPresent: true, IsDefault: true,
 				}},
@@ -176,11 +182,11 @@ func clusterFixtures() []clusterFixture {
 		},
 		{
 			id: "cl-2",
-			spec: cluster.ClusterCoreSpec{
+			spec: cluster.ClusterSpec{
 				Source: cluster.ClusterSource{Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: "staging"}},
 			},
-			connStatus: cluster.ClusterCoreStatus{
-				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.KubeconfigStatus{
+			connStatus: cluster.ClusterStatus{
+				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.ClusterKubeconfig{
 					Cluster: "staging-cluster", User: "staging-user",
 				}},
 			},
@@ -228,7 +234,8 @@ func clustersQueryData(t *testing.T, query string) map[string]any {
 func TestClustersQuery(t *testing.T) {
 	data := clustersQueryData(t, `{ clusters {
 		id
-		spec { name isSyncEnabled isActive source { kubeconfig { context } } }
+		generation
+		spec { name syncEnabled enabled source { kubeconfig { context } } }
 		status {
 			source { kubeconfig { cluster user isPresent isDefault } }
 			server { uid version }
@@ -244,7 +251,7 @@ func TestClustersQuery(t *testing.T) {
 
 	probed := clusters[0].(map[string]any)
 	spec := probed["spec"].(map[string]any)
-	if spec["name"] != "Production" || spec["isSyncEnabled"] != true {
+	if spec["name"] != "Production" || spec["syncEnabled"] != true || spec["enabled"] != true {
 		t.Errorf("probed cluster spec: %v", spec)
 	}
 	if kcSrc := spec["source"].(map[string]any)["kubeconfig"].(map[string]any); kcSrc["context"] != "prod" {
@@ -341,19 +348,36 @@ func TestClustersWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
 	}
 }
 
+// clusterEnabledSet writes through and returns the updated record; the change
+// is visible in subsequent reads.
+func TestClusterEnabledSetMutation(t *testing.T) {
+	srv := newTestServer(t, clusterFixtures())
+
+	raw := string(postGQL(t, srv.URL,
+		`{"query":"mutation { clusterEnabledSet(id: \"cl-1\", enabled: false) { id spec { enabled } } }"}`))
+	if !strings.Contains(raw, `"enabled":false`) || strings.Contains(raw, `"errors"`) {
+		t.Fatalf("mutation result: %s", raw)
+	}
+
+	raw = string(postGQL(t, srv.URL, `{"query":"{ cluster(id: \"cl-1\") { spec { enabled } } }"}`))
+	if !strings.Contains(raw, `"enabled":false`) {
+		t.Fatalf("change not visible to reads: %s", raw)
+	}
+}
+
 // clusterSyncEnabledSet writes through the beehive store and returns the
 // updated record; the change is visible in subsequent reads.
 func TestClusterSyncEnabledSetMutation(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	raw := string(postGQL(t, srv.URL,
-		`{"query":"mutation { clusterSyncEnabledSet(id: \"cl-1\", syncEnabled: false) { id spec { isSyncEnabled } } }"}`))
-	if !strings.Contains(raw, `"isSyncEnabled":false`) || strings.Contains(raw, `"errors"`) {
+		`{"query":"mutation { clusterSyncEnabledSet(id: \"cl-1\", syncEnabled: false) { id spec { syncEnabled } } }"}`))
+	if !strings.Contains(raw, `"syncEnabled":false`) || strings.Contains(raw, `"errors"`) {
 		t.Fatalf("mutation result: %s", raw)
 	}
 
-	raw = string(postGQL(t, srv.URL, `{"query":"{ cluster(id: \"cl-1\") { spec { isSyncEnabled } } }"}`))
-	if !strings.Contains(raw, `"isSyncEnabled":false`) {
+	raw = string(postGQL(t, srv.URL, `{"query":"{ cluster(id: \"cl-1\") { spec { syncEnabled } } }"}`))
+	if !strings.Contains(raw, `"syncEnabled":false`) {
 		t.Fatalf("change not visible to reads: %s", raw)
 	}
 }
@@ -384,29 +408,33 @@ func TestClusterDeleteMutation(t *testing.T) {
 // arrays on the wire, never null) and the cache manager has no on-disk files
 // (exists=false, bytes=0, resources=[]).
 func TestClusterEphemeralFields(t *testing.T) {
-	data := clustersQueryData(t, `{ cluster(id: "cl-1") { status {
-		conditions { type status reason }
-		syncStatus { conditions { type } lastSyncedAt }
-		cache { exists bytes resources { resource } }
-	} } }`)
+	data := clustersQueryData(t, `{ cluster(id: "cl-1") {
+		status { conditions { type status reason } }
+		cache {
+			status { conditions { type } lastSyncedAt }
+			stats { exists bytes resources { resource } }
+		}
+	} }`)
 
-	cl := data["cluster"].(map[string]any)["status"].(map[string]any)
-	if conds, ok := cl["conditions"].([]any); !ok || len(conds) != 0 {
-		t.Errorf("conditions should be an empty list, got: %v", cl["conditions"])
-	}
-	syncStatus := cl["syncStatus"].(map[string]any)
-	if conds, ok := syncStatus["conditions"].([]any); !ok || len(conds) != 0 {
-		t.Errorf("sync conditions should be an empty list, got: %v", syncStatus["conditions"])
-	}
-	if at := syncStatus["lastSyncedAt"]; at != nil {
-		t.Errorf("never-synced lastSyncedAt should be null, got: %v", at)
+	cl := data["cluster"].(map[string]any)
+	status := cl["status"].(map[string]any)
+	if conds, ok := status["conditions"].([]any); !ok || len(conds) != 0 {
+		t.Errorf("conditions should be an empty list, got: %v", status["conditions"])
 	}
 	cache := cl["cache"].(map[string]any)
-	if cache["exists"] != false || cache["bytes"] != float64(0) {
-		t.Errorf("cache placeholder: %v", cache)
+	cacheStatus := cache["status"].(map[string]any)
+	if conds, ok := cacheStatus["conditions"].([]any); !ok || len(conds) != 0 {
+		t.Errorf("sync conditions should be an empty list, got: %v", cacheStatus["conditions"])
 	}
-	if res, ok := cache["resources"].([]any); !ok || len(res) != 0 {
-		t.Errorf("cache resources should be empty list, got: %v", cache["resources"])
+	if at := cacheStatus["lastSyncedAt"]; at != nil {
+		t.Errorf("never-synced lastSyncedAt should be null, got: %v", at)
+	}
+	stats := cache["stats"].(map[string]any)
+	if stats["exists"] != false || stats["bytes"] != float64(0) {
+		t.Errorf("cache stats placeholder: %v", stats)
+	}
+	if res, ok := stats["resources"].([]any); !ok || len(res) != 0 {
+		t.Errorf("cache resources should be empty list, got: %v", stats["resources"])
 	}
 }
 
@@ -430,11 +458,13 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 
 	srv := newTestServer(t, fixtures)
 
-	body, _ := json.Marshal(map[string]string{"query": `{ cluster(id: "cl-1") { status {
-		conditions { type status reason message observedGeneration lastTransitionTime }
-		syncStatus { conditions { type status reason } lastSyncedAt }
-		cache { exists bytes }
-	} } }`})
+	body, _ := json.Marshal(map[string]string{"query": `{ cluster(id: "cl-1") {
+		status { conditions { type status reason message observedGeneration lastTransitionTime } }
+		cache {
+			status { conditions { type status reason } lastSyncedAt }
+			stats { exists bytes }
+		}
+	} }`})
 	raw := postGQL(t, srv.URL, string(body))
 
 	type wireCondition struct {
@@ -450,15 +480,17 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 			Cluster struct {
 				Status struct {
 					Conditions []wireCondition `json:"conditions"`
-					SyncStatus struct {
+				} `json:"status"`
+				Cache struct {
+					Status struct {
 						Conditions   []wireCondition `json:"conditions"`
 						LastSyncedAt *string         `json:"lastSyncedAt"`
-					} `json:"syncStatus"`
-					Cache struct {
+					} `json:"status"`
+					Stats struct {
 						Exists bool    `json:"exists"`
 						Bytes  float64 `json:"bytes"`
-					} `json:"cache"`
-				} `json:"status"`
+					} `json:"stats"`
+				} `json:"cache"`
 			} `json:"cluster"`
 		} `json:"data"`
 		Errors []struct{ Message string } `json:"errors"`
@@ -480,7 +512,7 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 		t.Errorf("Connected condition on the wire: %+v", conds[0])
 	}
 
-	syncStatus := resp.Data.Cluster.Status.SyncStatus
+	syncStatus := resp.Data.Cluster.Cache.Status
 	if len(syncStatus.Conditions) != 1 || syncStatus.Conditions[0].Type != "Synced" ||
 		syncStatus.Conditions[0].Status != "True" || syncStatus.Conditions[0].Reason != "Watching" {
 		t.Errorf("Synced condition on the wire: %+v", syncStatus.Conditions)
@@ -490,7 +522,7 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 	}
 
 	// Cache stats with no on-disk files: exists=false.
-	if resp.Data.Cluster.Status.Cache.Exists {
+	if resp.Data.Cluster.Cache.Stats.Exists {
 		t.Errorf("cache without files should report exists=false")
 	}
 }

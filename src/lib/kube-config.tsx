@@ -38,9 +38,13 @@ export function KubeConfigProvider({ children }: { children: React.ReactNode }) 
   const { clusters } = useClusters();
   const value = useMemo<KubeConfigContextValue>(() => {
     if (clusters === null) return { kubeConfig: null };
-    // Only kubeconfig-sourced records carry a context; other sources don't
-    // belong in the context picker.
-    const present = clusters.filter((c) => c.status.source.kubeconfig?.isPresent && c.spec.source.kubeconfig);
+    // The context picker shows only clusters the user has enabled in the app and
+    // that are still present in the kubeconfig. Disabled records stay tracked but
+    // hidden; orphaned ones (context gone) have nothing to switch to. Only
+    // kubeconfig-sourced records carry a context.
+    const present = clusters.filter(
+      (c) => c.spec.enabled && c.status.source.kubeconfig?.isPresent && c.spec.source.kubeconfig,
+    );
     return {
       kubeConfig: {
         currentContext:

@@ -14,10 +14,11 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 )
 
-// Status is the resolver for the status field. It pairs the status block with
-// the cluster's ID, which the cache child resolver needs to query its sub-API.
-func (r *clusterResolver) Status(ctx context.Context, obj *cluster.Cluster) (*model.ClusterStatus, error) {
-	return &model.ClusterStatus{ClusterStatus: obj.Status, ClusterID: obj.ID}, nil
+// Stats is the resolver for the cache.stats field: live stats from the
+// per-cluster cache (a resolver so a query only pays the stat query when it
+// selects them). The ClusterCache child carries the cluster ID for the lookup.
+func (r *clusterCacheResolver) Stats(ctx context.Context, obj *cluster.ClusterCache) (*cluster.ClusterCacheStats, error) {
+	return r.ClusterSvc.CacheStats(ctx, obj.ID)
 }
 
 // Permissions is the resolver for the permissions field — the one live cluster
@@ -28,10 +29,11 @@ func (r *clusterPrincipalResolver) Permissions(ctx context.Context, obj *cluster
 	return nil, fmt.Errorf("not implemented: permissions")
 }
 
-// Cache is the resolver for the cache field: live stats from the per-cluster
-// cache (a resolver so a query only pays the stat query when it selects them).
-func (r *clusterStatusResolver) Cache(ctx context.Context, obj *model.ClusterStatus) (*cluster.CacheStats, error) {
-	return r.ClusterSvc.CacheStats(ctx, obj.ClusterID)
+// ClusterEnabledSet is the resolver for the clusterEnabledSet field. Enables or
+// disables a cluster in the app; the change reaches the webview through the
+// cluster watch.
+func (r *mutationResolver) ClusterEnabledSet(ctx context.Context, id string, enabled bool) (*cluster.Cluster, error) {
+	return r.ClusterSvc.SetEnabled(ctx, cluster.ClusterID(id), enabled)
 }
 
 // ClusterSyncEnabledSet is the resolver for the clusterSyncEnabledSet field.
@@ -131,14 +133,11 @@ func (r *subscriptionResolver) AuthStateWatch(ctx context.Context) (<-chan *auth
 	return mapStream(ctx, states, cancel, func(s auth.State) *auth.State { return &s }), nil
 }
 
-// Cluster returns ClusterResolver implementation.
-func (r *Resolver) Cluster() ClusterResolver { return &clusterResolver{r} }
+// ClusterCache returns ClusterCacheResolver implementation.
+func (r *Resolver) ClusterCache() ClusterCacheResolver { return &clusterCacheResolver{r} }
 
 // ClusterPrincipal returns ClusterPrincipalResolver implementation.
 func (r *Resolver) ClusterPrincipal() ClusterPrincipalResolver { return &clusterPrincipalResolver{r} }
-
-// ClusterStatus returns ClusterStatusResolver implementation.
-func (r *Resolver) ClusterStatus() ClusterStatusResolver { return &clusterStatusResolver{r} }
 
 // Mutation returns MutationResolver implementation.
 func (r *Resolver) Mutation() MutationResolver { return &mutationResolver{r} }
@@ -149,9 +148,8 @@ func (r *Resolver) Query() QueryResolver { return &queryResolver{r} }
 // Subscription returns SubscriptionResolver implementation.
 func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionResolver{r} }
 
-type clusterResolver struct{ *Resolver }
+type clusterCacheResolver struct{ *Resolver }
 type clusterPrincipalResolver struct{ *Resolver }
-type clusterStatusResolver struct{ *Resolver }
 type mutationResolver struct{ *Resolver }
 type queryResolver struct{ *Resolver }
 type subscriptionResolver struct{ *Resolver }

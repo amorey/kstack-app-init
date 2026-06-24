@@ -31,27 +31,29 @@ type Cluster {
   "Unique identifier for this cluster record."
   id: ID!
 
+  "The record's spec generation, bumped on every spec write. Compare against a condition's observedGeneration to detect a stale (not-yet-reconciled) condition."
+  generation: Int!
   "When this cluster was first registered."
   createdAt: Time!
-  "When this cluster was archived; null unless archived."
-  archivedAt: Time
   "When this cluster was removed (soft-delete tombstone); null unless removed."
   deletedAt: Time
 
   "Desired state: the user-owned fields."
   spec: ClusterSpec!
-  "Observed state: everything discovered by watching and probing."
+  "Observed connection/health state, discovered by probing."
   status: ClusterStatus!
+  "The owned cache child (beehive ClusterCache): its sync status plus live on-disk stats."
+  cache: ClusterCache!
 }
 
 "A cluster record's desired state. Every field is user/API-owned; nothing here is observed."
 type ClusterSpec {
   "User-assigned display name; null if unset."
   name: String
-  "Whether syncing is enabled. Disabling stops sync and freezes the cache."
-  isSyncEnabled: Boolean!
-  "Whether the user has activated this cluster in the app."
-  isActive: Boolean!
+  "Whether the user has enabled this cluster in the app: it appears in cluster lists / context pickers and is eligible to connect. Disabled clusters stay tracked but dormant."
+  enabled: Boolean!
+  "Whether cache syncing is enabled. Disabling stops sync and freezes the cache. Only meaningful while enabled."
+  syncEnabled: Boolean!
   "Where this record comes from and how its credentials resolve."
   source: ClusterSource!
 }
@@ -73,11 +75,11 @@ type ClusterSourceKubeconfig {
 }
 
 """
-A cluster record's observed state, persisted on the record by the reconcile
-loops and reported Kubernetes-style: probed facts plus status conditions —
-the consumer derives display state from the conditions' type/status/reason.
-`cache` is live subsystem state (a nested object so a consumer fetches it
-only when needed).
+A cluster record's observed connection/health state, persisted on the Cluster
+record by the connection controller and reported Kubernetes-style: probed facts
+plus status conditions — the consumer derives display state from the conditions'
+type/status/reason. Sync status and the on-disk cache live on the `cache` child
+(mirroring the beehive ClusterCache kind), not here.
 """
 type ClusterStatus {
   "Per-source observation blocks, mirroring `spec.source`."
@@ -89,12 +91,8 @@ type ClusterStatus {
   "When a connection probe last succeeded; null if never."
   lastConnectedAt: Time
 
-  "The cluster controller's conditions (`Connected`, `Healthy`)."
+  "The connection controller's conditions (`Connected`, `Healthy`)."
   conditions: [ClusterCondition!]!
-  "The sync controller's status block: its own conditions (`Synced`) plus cache freshness."
-  syncStatus: ClusterSyncStatus!
-  "The on-disk cache mirror for this cluster."
-  cache: ClusterCache!
 }
 
 "A condition's three-valued verdict, Kubernetes-style."
@@ -109,13 +107,13 @@ enum ConditionStatus {
 
 """
 One Kubernetes-style status condition: an independently-tracked aspect of the
-record's observed state. Cluster-controller conditions: `Connected` (the last
-probe reached the API server; reasons Connecting/Connected/ResolveFailed/
-ProbeFailed/Inactive) and `Healthy` (the server's own readiness; reasons
-Ready/ReadyzFailed/Unreachable/NoConnection/Inactive). Sync-controller
-condition (under `syncStatus`): `Synced` (reasons Syncing/Watching/Paused/
-SyncFailed/ResolveFailed). New types/reasons may appear; consumers should
-treat unknown spellings as a degraded/unknown display state.
+record's observed state. Connection-controller conditions (under `status`):
+`Connected` (the last probe reached the API server; reasons Connecting/
+Connected/ResolveFailed/ProbeFailed/Inactive) and `Healthy` (the server's own
+readiness; reasons Ready/ReadyzFailed/Unreachable/NoConnection/Inactive).
+Sync-controller condition (under `cache.status`): `Synced` (reasons Syncing/
+Watching/Paused/SyncFailed/ResolveFailed). New types/reasons may appear;
+consumers should treat unknown spellings as a degraded/unknown display state.
 """
 type ClusterCondition {
   "The aspect this condition tracks, e.g. \"Connected\"."
@@ -131,8 +129,20 @@ type ClusterCondition {
   lastTransitionTime: Time!
 }
 
-"The sync controller's status block on a record."
-type ClusterSyncStatus {
+"""
+The owned cache child, mirroring the beehive ClusterCache kind: its observed
+sync `status` plus live on-disk `stats`. A nested object so a consumer fetches
+the (stat-querying) stats only when it selects them.
+"""
+type ClusterCache {
+  "The sync controller's status block: its conditions (`Synced`) plus cache freshness."
+  status: ClusterCacheStatus!
+  "Live on-disk cache statistics, queried on demand."
+  stats: ClusterCacheStats!
+}
+
+"The sync controller's status block on the cache child."
+type ClusterCacheStatus {
   "The sync-owned conditions (`Synced`)."
   conditions: [ClusterCondition!]!
   "When the cache last received fresh data; null if never. Refreshed coarsely (~30s) while syncing."
@@ -217,8 +227,8 @@ type NonResourceRule {
   nonResourceUrls: [String!]!
 }
 
-"The on-disk cache mirror for a single cluster."
-type ClusterCache {
+"Live on-disk cache statistics for a single cluster."
+type ClusterCacheStats {
   "True when a local cache exists on disk."
   exists: Boolean!
   "On-disk cache size (sqlite + WAL/shm) in bytes; 0 when not cached."
@@ -284,6 +294,9 @@ type Query {
 
 type Mutation {
   # --- Cluster mutations ---
+
+  "Enable or disable a cluster in the app. Disabling keeps the record tracked but dormant (no connection, hidden from context pickers). Returns the updated cluster."
+  clusterEnabledSet(id: ID!, enabled: Boolean!): Cluster!
 
   "Enable or disable syncing for a cluster. Disabling stops sync and freezes the cache. Returns the updated cluster."
   clusterSyncEnabledSet(id: ID!, syncEnabled: Boolean!): Cluster!

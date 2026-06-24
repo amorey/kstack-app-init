@@ -45,8 +45,11 @@ type ClusterService interface {
 	// list on every Cluster or ClusterCache change. The channel closes when ctx
 	// ends.
 	Watch(ctx context.Context) (<-chan []*Cluster, error)
-	// CacheStats returns live per-cluster cache statistics.
-	CacheStats(ctx context.Context, id ClusterID) (*CacheStats, error)
+	// ClusterCacheStats returns live per-cluster cache statistics.
+	CacheStats(ctx context.Context, id ClusterID) (*ClusterCacheStats, error)
+	// SetEnabled enables or disables a cluster in the app (connection eligibility
+	// + visibility in pickers) and returns the updated record.
+	SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)
 	// SetSyncEnabled toggles a cluster's sync and returns the updated record.
 	SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)
 	// RetryConnection forces an immediate out-of-band re-probe of the cluster's
@@ -74,7 +77,7 @@ type Service struct {
 
 	watcher *k8shelpers.KubeConfigWatcher
 
-	coreClient   beehive.Client[ClusterCoreSpec, ClusterCoreStatus]
+	coreClient   beehive.Client[ClusterSpec, ClusterStatus]
 	cacheClient  beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
 	cacheManager *store.Manager
 	connMgr      *ConnectionManager
@@ -118,7 +121,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	coreClient := beehive.NewClient[ClusterCoreSpec, ClusterCoreStatus](bh, ClusterGroupKind)
+	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
 	// The cache manager owns the per-cluster SQLite cache files under
@@ -249,45 +252,58 @@ func (s *Service) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
 	return &c, nil
 }
 
-// CacheStats implements ClusterService.
-func (s *Service) CacheStats(ctx context.Context, id ClusterID) (*CacheStats, error) {
+// ClusterCacheStats implements ClusterService.
+func (s *Service) CacheStats(ctx context.Context, id ClusterID) (*ClusterCacheStats, error) {
 	bytes, exists := s.cacheManager.CacheBytes(string(id))
 	if !exists {
-		return &CacheStats{}, nil
+		return &ClusterCacheStats{}, nil
 	}
 	db := s.cacheManager.Lookup(string(id))
 	if db == nil {
-		return &CacheStats{Exists: true, Bytes: bytes}, nil
+		return &ClusterCacheStats{Exists: true, Bytes: bytes}, nil
 	}
 	rss, err := db.ResourceStats(ctx)
 	if err != nil {
 		return nil, err
 	}
-	resources := make([]CachedResourceStats, len(rss))
+	resources := make([]CachedResource, len(rss))
 	for i, rs := range rss {
-		resources[i] = CachedResourceStats{
+		resources[i] = CachedResource{
 			Resource:      rs.Resource,
 			Count:         rs.Count,
 			LastUpdatedAt: rs.LastUpdatedAt,
 		}
 	}
-	return &CacheStats{Exists: true, Bytes: bytes, Resources: resources}, nil
+	return &ClusterCacheStats{Exists: true, Bytes: bytes, Resources: resources}, nil
 }
 
-// SetSyncEnabled implements ClusterService.
-func (s *Service) SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error) {
+// updateSpec applies mutate to a copy of the cluster's spec and persists it. The
+// spec write bumps the generation, so the connection + cache controllers
+// re-reconcile and the change propagates to watchers. It backs the spec-toggle
+// mutations below.
+func (s *Service) updateSpec(ctx context.Context, id ClusterID, mutate func(*ClusterSpec)) (*Cluster, error) {
 	obj, err := s.clusterByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	spec := obj.Spec
-	spec.IsSyncEnabled = enabled
+	mutate(&spec)
 	updated, err := s.coreClient.Update(ctx, obj.ID, spec)
 	if err != nil {
 		return nil, err
 	}
 	c := s.buildCluster(ctx, updated)
 	return &c, nil
+}
+
+// SetEnabled implements ClusterService.
+func (s *Service) SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error) {
+	return s.updateSpec(ctx, id, func(spec *ClusterSpec) { spec.Enabled = enabled })
+}
+
+// SetSyncEnabled implements ClusterService.
+func (s *Service) SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error) {
+	return s.updateSpec(ctx, id, func(spec *ClusterSpec) { spec.SyncEnabled = enabled })
 }
 
 // RetryConnection implements ClusterService. It validates the cluster exists,
@@ -395,7 +411,7 @@ func (s *Service) GetConnection(id ClusterID) *rest.Config {
 
 // buildCluster assembles a domain Cluster from a Cluster beehive object, joining
 // in ClusterCache sync status from the cache client.
-func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterCoreSpec, ClusterCoreStatus]) Cluster {
+func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus]) Cluster {
 	var id ClusterID
 	if obj.Slug != nil {
 		id = ClusterIDFromSlug(*obj.Slug)
@@ -412,17 +428,15 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterC
 		c.DeletedAt = &t
 	}
 	if obj.Status != nil {
-		c.Status.Source = obj.Status.Source
-		c.Status.Server = obj.Status.Server
-		c.Status.Principal = obj.Status.Principal
-		c.Status.LastConnectedAt = obj.Status.LastConnectedAt
-		c.Status.Conditions = obj.Status.Conditions
+		c.Status = *obj.Status
 	}
 
-	// Join in ClusterCache sync status.
+	// Join in the ClusterCache child: its sync status plus the ID the live-stats
+	// resolver needs.
+	c.Cache.ID = id
 	cacheObj, err := s.cacheClient.GetBySlug(ctx, ClusterCacheSlug(id))
 	if err == nil && cacheObj.Status != nil {
-		c.Status.SyncStatus = *cacheObj.Status
+		c.Cache.Status = *cacheObj.Status
 	}
 
 	return c
@@ -430,7 +444,7 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterC
 
 // clusterByID fetches a Cluster object by id, mapping beehive.ErrNotFound to the
 // package's ErrNotFound.
-func (s *Service) clusterByID(ctx context.Context, id ClusterID) (*beehive.Object[ClusterCoreSpec, ClusterCoreStatus], error) {
+func (s *Service) clusterByID(ctx context.Context, id ClusterID) (*beehive.Object[ClusterSpec, ClusterStatus], error) {
 	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
 	if errors.Is(err, beehive.ErrNotFound) {
 		return nil, ErrNotFound

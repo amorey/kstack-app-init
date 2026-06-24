@@ -99,7 +99,7 @@ func (c *NoopController[Spec, Status]) Reconcile(_ context.Context, _ beehive.Co
 func NewTestBeehive(t *testing.T) *beehive.Beehive {
 	t.Helper()
 	bh := NewTestBeehiveUnstarted(t)
-	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &NoopController[cluster.ClusterCoreSpec, cluster.ClusterCoreStatus]{})
+	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &NoopController[cluster.ClusterSpec, cluster.ClusterStatus]{})
 	require.NoError(t, err)
 	_, err = beehive.Register(bh, cluster.ClusterCacheGroupKind, &NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{})
 	require.NoError(t, err)

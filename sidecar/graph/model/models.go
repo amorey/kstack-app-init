@@ -12,20 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Hand-written models that live alongside the generated models_gen.go.
-
+// Package model holds the gqlgen-generated GraphQL models (models_gen.go).
+//
+// This hand-written file exists only to keep the package non-empty: gqlgen
+// rewrites models_gen.go on every run (deleting it first), so without a
+// permanent file here the package would momentarily have no Go files and gqlgen
+// could not load it for autobinding. Most GraphQL types bind directly to
+// internal/cluster and internal/auth domain types (see gqlgen.yml), so there
+// are no hand-written models left to carry.
 package model
-
-import (
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
-)
-
-// ClusterStatus backs the GraphQL ClusterStatus type. cluster.ClusterStatus
-// can't bind directly: the cache field resolver needs the cluster's ID to
-// query its sub-API, and a child resolver only sees its own obj. The
-// embedded status binds the durable fields (conditions included) as usual;
-// ClusterID is the one piece the wrapper adds.
-type ClusterStatus struct {
-	cluster.ClusterStatus
-	ClusterID cluster.ClusterID
-}

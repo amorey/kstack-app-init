@@ -60,8 +60,8 @@ function pushClusters(rows: Row[]) {
             id: r.uuid || `pending-${i}`,
             spec: {
               name: r.name,
-              isSyncEnabled: r.enabled,
-              isActive: true,
+              syncEnabled: r.enabled,
+              enabled: true,
               source: { kubeconfig: { context: r.name } },
             },
             status: {
@@ -75,7 +75,9 @@ function pushClusters(rows: Row[]) {
               },
               server: { uid: r.uuid || null },
               conditions: [{ type: 'Connected', status: r.connected ?? 'True', reason: '' }],
-              syncStatus: {
+            },
+            cache: {
+              status: {
                 conditions: [
                   r.syncFailed
                     ? { type: 'Synced', status: 'False', reason: 'SyncFailed' }
@@ -83,7 +85,7 @@ function pushClusters(rows: Row[]) {
                 ],
                 lastSyncedAt: r.lastSyncedAt ?? null,
               },
-              cache: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
+              stats: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
             },
           })),
         },
@@ -138,7 +140,8 @@ describe('ClusterSyncPanel', () => {
           status: 200,
           body: JSON.stringify({
             data: {
-              clusterSyncEnabledSet: { __typename: 'Cluster', id: 'u', spec: { isSyncEnabled: false } },
+              clusterEnabledSet: { __typename: 'Cluster', id: 'u', spec: { enabled: false } },
+              clusterSyncEnabledSet: { __typename: 'Cluster', id: 'u', spec: { syncEnabled: false } },
               clusterCacheClear: { __typename: 'Cluster', id: 'u' },
               clusterDelete: true,
             },
@@ -267,6 +270,17 @@ describe('ClusterSyncPanel', () => {
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
       expect.objectContaining({ body: expect.stringContaining('clusterSyncEnabledSet') }),
+    );
+  });
+
+  it('toggling enable fires clusterEnabledSet', async () => {
+    const user = await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: false }]);
+
+    // The row's spec.enabled defaults to true (see pushClusters) → a Disable button.
+    await user.click(await screen.findByRole('button', { name: /disable prod-us/i }));
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_query',
+      expect.objectContaining({ body: expect.stringContaining('clusterEnabledSet') }),
     );
   });
 

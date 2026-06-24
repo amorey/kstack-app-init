@@ -20,7 +20,7 @@
 // trash button that forgets the cluster entirely (removes it from app.db).
 // Data + state come from the sidecar via useClusters() — the mutations write
 // through to it, and the resulting clustersWatch push updates the table.
-import { Database, Pause, Play, Slash, Trash2 } from 'lucide-react';
+import { Database, Pause, Play, Power, PowerOff, Slash, Trash2 } from 'lucide-react';
 import { useMutation } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
@@ -39,12 +39,23 @@ import { type Cluster, formatBytes, useClusters } from '@/lib/clusters';
 import { errorMessage, reportError } from '@/lib/error-bus';
 import { formatSyncFreshness } from '@/lib/sync-status';
 
+const ClusterEnabledSetMutation = graphql(`
+  mutation ClusterEnabledSet($id: ID!, $enabled: Boolean!) {
+    clusterEnabledSet(id: $id, enabled: $enabled) {
+      id
+      spec {
+        enabled
+      }
+    }
+  }
+`);
+
 const ClusterSyncEnabledSetMutation = graphql(`
   mutation ClusterSyncEnabledSet($id: ID!, $syncEnabled: Boolean!) {
     clusterSyncEnabledSet(id: $id, syncEnabled: $syncEnabled) {
       id
       spec {
-        isSyncEnabled
+        syncEnabled
       }
     }
   }
@@ -116,10 +127,10 @@ function connectionStatus(c: Cluster, group: Group): { label: string; tone: Tone
 function statusOf(c: Cluster, group: Group): { label: string; tone: Tone } {
   if (group === 'orphaned') return { label: 'Stopped', tone: 'muted' };
   if (isPending(c)) return { label: 'Not synced', tone: 'muted' };
-  if (!c.spec.isSyncEnabled) return { label: 'Paused', tone: 'muted' };
+  if (!c.spec.syncEnabled) return { label: 'Paused', tone: 'muted' };
   const connected = findCondition(c.status.conditions, 'Connected');
   if (connected?.status === 'False') return { label: 'Stalled', tone: 'muted' };
-  const synced = findCondition(c.status.syncStatus.conditions, 'Synced');
+  const synced = findCondition(c.cache.status.conditions, 'Synced');
   if (synced?.reason === 'SyncFailed') return { label: 'Error', tone: 'error' };
   return { label: 'Syncing', tone: 'ok' };
 }
@@ -137,12 +148,14 @@ function ClearCacheIcon() {
 function ClusterRow({
   cluster,
   group,
+  onSetEnabled,
   onToggle,
   onClearCache,
   onRemove,
 }: {
   cluster: Cluster;
   group: Group;
+  onSetEnabled: (enabled: boolean) => void;
   onToggle: (enabled: boolean) => void;
   onClearCache: () => void;
   onRemove: () => void;
@@ -152,9 +165,11 @@ function ClusterRow({
   const status = statusOf(cluster, group);
   const orphaned = group === 'orphaned';
   const pending = isPending(cluster);
-  // Sync can only start/stop for an identified cluster still in the kubeconfig.
-  const syncing = cluster.spec.isSyncEnabled && !orphaned && !pending;
-  const canToggle = !orphaned && !pending;
+  const { enabled } = cluster.spec;
+  // Sync can only start/stop for an enabled, identified cluster still in the
+  // kubeconfig.
+  const syncing = cluster.spec.syncEnabled && enabled && !orphaned && !pending;
+  const canToggle = enabled && !orphaned && !pending;
 
   return (
     <TableRow>
@@ -170,24 +185,38 @@ function ClusterRow({
           <span aria-hidden className={`size-2 shrink-0 rounded-full ${DOT_CLASS[status.tone]}`} />
           {status.label}
         </span>
-        {cluster.status.syncStatus.lastSyncedAt ? (
+        {cluster.cache.status.lastSyncedAt ? (
           <div className="text-xs text-muted-foreground">
-            {formatSyncFreshness(Date.parse(cluster.status.syncStatus.lastSyncedAt))}
+            {formatSyncFreshness(Date.parse(cluster.cache.status.lastSyncedAt))}
           </div>
         ) : null}
       </TableCell>
       <TableCell className="tabular-nums">
-        {cluster.status.cache.exists ? formatBytes(cluster.status.cache.bytes) : '—'}
+        {cluster.cache.stats.exists ? formatBytes(cluster.cache.stats.bytes) : '—'}
       </TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-0.5">
+          {/* Enable/disable the cluster in the app. A disabled cluster stays
+              tracked but dormant (no connection, hidden from the context picker).
+              Only meaningful while the context is present, so it's disabled for
+              an orphan. */}
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`${enabled ? 'Disable' : 'Enable'} ${name}`}
+            disabled={orphaned}
+            onClick={() => onSetEnabled(!enabled)}
+          >
+            {enabled ? <Power className="size-4" aria-hidden /> : <PowerOff className="size-4" aria-hidden />}
+          </Button>
           <Button
             type="button"
             variant="ghost"
             size="icon-sm"
             aria-label={`${syncing ? 'Pause' : 'Resume'} sync for ${name}`}
             disabled={!canToggle}
-            onClick={() => onToggle(!cluster.spec.isSyncEnabled)}
+            onClick={() => onToggle(!cluster.spec.syncEnabled)}
           >
             {syncing ? <Pause className="size-4" aria-hidden /> : <Play className="size-4" aria-hidden />}
           </Button>
@@ -196,7 +225,7 @@ function ClusterRow({
             variant="ghost"
             size="icon-sm"
             aria-label={`Clear cache for ${name}`}
-            disabled={!cluster.status.cache.exists}
+            disabled={!cluster.cache.stats.exists}
             onClick={onClearCache}
           >
             <ClearCacheIcon />
@@ -249,6 +278,7 @@ export function ClusterSyncPanel() {
   // is the source of truth for each row's state (no local mirror). urql's execute
   // resolves (never rejects) with an OperationResult, so a failed mutation would
   // otherwise be swallowed — surface its error on the bus.
+  const [, clusterEnabledSetMut] = useMutation(ClusterEnabledSetMutation);
   const [, clusterSyncEnabledSetMut] = useMutation(ClusterSyncEnabledSetMutation);
   const [, clusterCacheClearMut] = useMutation(ClusterCacheClearMutation);
   const [, clusterDeleteMut] = useMutation(ClusterDeleteMutation);
@@ -302,6 +332,7 @@ export function ClusterSyncPanel() {
                       key={c.id}
                       cluster={c}
                       group={g.key}
+                      onSetEnabled={(enabled) => run(clusterEnabledSetMut({ id: c.id, enabled }))}
                       onToggle={(syncEnabled) => run(clusterSyncEnabledSetMut({ id: c.id, syncEnabled }))}
                       onClearCache={() => run(clusterCacheClearMut({ id: c.id }))}
                       onRemove={() => run(clusterDeleteMut({ id: c.id }))}
