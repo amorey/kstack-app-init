@@ -120,30 +120,14 @@ func newClusterTestBeehive(t *testing.T, w cluster.KubeConfigSource, probe clust
 // no polling.
 func waitCondition(t *testing.T, cl beehive.Client[cluster.ClusterSpec, cluster.ClusterStatus], id beehive.ObjectID, condType cluster.ClusterConditionType) *beehive.Object[cluster.ClusterSpec, cluster.ClusterStatus] {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ch, err := cl.Watch(ctx, id)
-	require.NoError(t, err)
-
-	timeout := time.After(2 * time.Second)
-	for {
-		select {
-		case ev, ok := <-ch:
-			if !ok {
-				t.Fatalf("watch closed before condition %s", condType)
+	return waitForStatus(t, cl, id, func(s *cluster.ClusterStatus) bool {
+		for _, c := range s.Conditions {
+			if c.Type == condType {
+				return true
 			}
-			if ev.Object == nil || ev.Object.Status == nil {
-				continue
-			}
-			for _, c := range ev.Object.Status.Conditions {
-				if c.Type == condType {
-					return ev.Object
-				}
-			}
-		case <-timeout:
-			t.Fatalf("timed out waiting for condition %s", condType)
 		}
-	}
+		return false
+	})
 }
 
 // waitForStatus blocks on the object's beehive watch until its status satisfies

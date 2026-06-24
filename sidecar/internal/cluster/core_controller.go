@@ -164,7 +164,7 @@ func NewClusterCoreController(
 }
 
 // SetControllerClient injects the status-write client obtained from
-// beehive.Register. It backs the out-of-band re-probes (reprobeAll/reprobeOne);
+// beehive.Register. It backs the out-of-band reconciles (reconcileAll/reprobeOne);
 // the reconcile path uses the client beehive passes into Reconcile instead. Call
 // once, before the control plane starts.
 func (c *ClusterCoreController) SetControllerClient(cl beehive.ControllerClient[ClusterStatus]) {
@@ -172,12 +172,12 @@ func (c *ClusterCoreController) SetControllerClient(cl beehive.ControllerClient[
 }
 
 // StartBackground launches the controller's single out-of-band worker. It drains
-// two re-probe sources in one select: the in-process targeted-retry bus (Reprobe →
-// reprobeOne, one cluster) and, when a poke bus is configured, the resync poke bus
-// (reprobeAll, every eligible cluster on OS resume / network-on). A nil pokeSvc
-// leaves the poke arm dormant (the channel stays nil and never fires), so the
-// retry bus still works. Call after the control plane has started; pair with
-// StopBackground.
+// three sources in one select: the in-process targeted-retry bus (Reprobe →
+// reprobeOne, one cluster), the resync poke bus (reconcileAll on OS resume /
+// network-on), and the kubeconfig watcher (reconcileAll on a change, so
+// presence/isDefault updates propagate promptly). A nil pokeSvc leaves the poke
+// arm dormant (the channel stays nil and never fires), so the retry + watcher arms
+// still work. Call after the control plane has started; pair with StopBackground.
 func (c *ClusterCoreController) StartBackground() {
 	ctx, cancelCtx := context.WithCancel(context.Background())
 
@@ -209,13 +209,13 @@ func (c *ClusterCoreController) StartBackground() {
 					pokeCh = nil // poke bus closed; keep serving retries
 					continue
 				}
-				c.reprobeAll(ctx)
+				c.reconcileAll(ctx)
 			case _, ok := <-kcCh:
 				if !ok {
 					kcCh = nil // watcher closed; keep serving retries/pokes
 					continue
 				}
-				c.reconcileAllForKubeconfig(ctx)
+				c.reconcileAll(ctx)
 			}
 		}
 	})
@@ -241,37 +241,18 @@ func (c *ClusterCoreController) Reprobe(id ClusterID) {
 	}
 }
 
-// reprobeAll re-runs the connection reconcile for every eligible cluster,
-// forcing an immediate probe + health check (refreshing the connMgr config and
-// the Connected/Healthy conditions) instead of waiting for the next scheduled
-// reconcile. Driven by the poke bus on OS resume / network-on.
-func (c *ClusterCoreController) reprobeAll(baseCtx context.Context) {
+// reconcileAll re-runs the reconcile for every (non-deleting) cluster. Driven by
+// both the resync poke bus (OS resume / network-on) and the kubeconfig watcher
+// (presence / isDefault / name changes): both want a full re-reconcile, and
+// Reconcile re-reads each object fresh under writeMu, re-observes the kubeconfig,
+// and gates eligibility — so a now-ineligible (e.g. just-departed) cluster still
+// updates its observation and conditions, and the status write wakes its
+// ClusterCache dependent. The List snapshot is used only to enumerate ids.
+func (c *ClusterCoreController) reconcileAll(baseCtx context.Context) {
 	objs, err := c.coreClient.List(baseCtx)
 	if err != nil {
 		if baseCtx.Err() == nil {
-			slog.Warn("clustercontroller: poke list clusters", "err", err)
-		}
-		return
-	}
-	for _, obj := range objs {
-		if baseCtx.Err() != nil {
-			return // shutting down
-		}
-		c.reprobeObj(baseCtx, obj)
-	}
-}
-
-// reconcileAllForKubeconfig re-runs Reconcile for every cluster after a
-// kubeconfig change, so each record's source observation (presence, isDefault,
-// cluster/user names) is refreshed and — via the status write waking the
-// ClusterCache dependent — engines start/stop as eligibility flips. Unlike the
-// poke-driven reprobeAll it does NOT pre-gate on eligibility: a just-departed
-// cluster is now ineligible but must still be reconciled to record IsPresent=false.
-func (c *ClusterCoreController) reconcileAllForKubeconfig(baseCtx context.Context) {
-	objs, err := c.coreClient.List(baseCtx)
-	if err != nil {
-		if baseCtx.Err() == nil {
-			slog.Warn("clustercontroller: kubeconfig list clusters", "err", err)
+			slog.Warn("clustercontroller: list clusters for re-reconcile", "err", err)
 		}
 		return
 	}
@@ -282,13 +263,7 @@ func (c *ClusterCoreController) reconcileAllForKubeconfig(baseCtx context.Contex
 		if obj.DeletionRequestedAt != nil {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(baseCtx, pokeReprobeTimeout)
-		// Reconcile re-reads the object fresh under writeMu, so passing the (possibly
-		// stale) List snapshot is safe — it is used only to find the object.
-		if _, err := c.Reconcile(ctx, c.ctrlClient, obj); err != nil {
-			slog.Warn("clustercontroller: kubeconfig re-reconcile", "cluster", obj.ID, "err", err)
-		}
-		cancel()
+		c.reprobeObj(baseCtx, obj)
 	}
 }
 
@@ -308,7 +283,7 @@ func (c *ClusterCoreController) reprobeOne(baseCtx context.Context, id ClusterID
 }
 
 // reprobeObj forces an immediate out-of-band reconcile of one cluster object
-// (shared by the poke-driven reprobeAll and the targeted reprobeOne). It does not
+// (shared by reconcileAll and the targeted reprobeOne). It does not
 // pre-gate on eligibility: Reconcile re-reads the object fresh under writeMu and
 // re-observes the kubeconfig, so eligibility is decided there from current state
 // (a stale pre-gate could wrongly skip a cluster whose observation was written
