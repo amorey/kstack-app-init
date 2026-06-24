@@ -83,7 +83,7 @@ func newCacheTestBeehive(t *testing.T, connMgr *cluster.ConnectionManager) (
 		return fakeEng
 	})
 
-	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &testutil.NoopController[cluster.ClusterSpec, cluster.ClusterStatus]{})
+	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &presenceController{})
 	require.NoError(t, err)
 	cc, err := beehive.Register(bh, cluster.ClusterCacheGroupKind, ctrl)
 	require.NoError(t, err)
@@ -137,15 +137,39 @@ func eligibleClusterSpec(contextName string) cluster.ClusterSpec {
 	return cluster.ClusterSpec{
 		Enabled:     true,
 		SyncEnabled: true,
-		Source: cluster.ClusterSource{
-			Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: contextName},
-		},
-		SourceObs: &cluster.ClusterKubeconfig{
-			Cluster:   contextName + "-cluster",
-			User:      contextName + "-user",
-			IsPresent: true,
+		Source: cluster.ClusterSpecSource{
+			Kubeconfig: &cluster.ClusterSpecSourceKubeconfig{Context: contextName},
 		},
 	}
+}
+
+// presenceController is the test stand-in for the Cluster kind's controller in
+// the cache tests. The cache controller gates on the parent's *observed* presence
+// (ClusterStatus.Source.Kubeconfig.IsPresent), which the real ClusterCoreController
+// writes from the live kubeconfig — so the cache tests need that status present.
+// This minimal controller stamps it (and the status write wakes the ClusterCache
+// dependent, exercising the real trigger path) without the probing machinery.
+type presenceController struct{}
+
+func (presenceController) Reconcile(
+	ctx context.Context,
+	client beehive.ControllerClient[cluster.ClusterStatus],
+	obj *beehive.Object[cluster.ClusterSpec, cluster.ClusterStatus],
+) (beehive.Result, error) {
+	kc := obj.Spec.Source.Kubeconfig
+	if kc == nil {
+		return beehive.Result{}, nil
+	}
+	want := cluster.ClusterStatusSourceKubeconfig{
+		Cluster:   kc.Context + "-cluster",
+		User:      kc.Context + "-user",
+		IsPresent: true,
+	}
+	if obj.Status != nil && obj.Status.Source.Kubeconfig != nil && *obj.Status.Source.Kubeconfig == want {
+		return beehive.Result{}, nil // already stamped: no rewrite
+	}
+	status := cluster.ClusterStatus{Source: cluster.ClusterStatusSource{Kubeconfig: &want}}
+	return beehive.Result{}, client.UpdateStatus(ctx, obj.ID, obj.Generation, status)
 }
 
 func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
@@ -304,7 +328,7 @@ func TestCacheControllerPokeRestartsLiveEngine(t *testing.T) {
 		return e
 	})
 
-	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &testutil.NoopController[cluster.ClusterSpec, cluster.ClusterStatus]{})
+	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &presenceController{})
 	require.NoError(t, err)
 	cc, err := beehive.Register(bh, cluster.ClusterCacheGroupKind, ctrl)
 	require.NoError(t, err)

@@ -32,14 +32,14 @@ models:
   ClusterSpec:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSpec
 
-  ClusterSource:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSource
+  ClusterSpecSource:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSpecSource
 
-  ClusterSourceKubeconfig:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSourceKubeconfig
+  ClusterSpecSourceKubeconfig:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSpecSourceKubeconfig
 
-  ClusterSourceStatus:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSourceStatus
+  ClusterStatusSource:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterStatusSource
 
   ClusterStatus:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterStatus
@@ -47,8 +47,8 @@ models:
   ClusterServer:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterServer
 
-  ClusterKubeconfig:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterKubeconfig
+  ClusterStatusSourceKubeconfig:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterStatusSourceKubeconfig
 
   ClusterPrincipal:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterPrincipal

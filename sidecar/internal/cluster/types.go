@@ -238,30 +238,30 @@ func ConditionsEqual(a, b []ClusterCondition) bool {
 // ClusterGroupKind identifies the Cluster beehive resource kind.
 var ClusterGroupKind = beehive.GroupKind{Kind: "Cluster"}
 
-// ClusterKubeconfig is the kubeconfig-sourced record's last-known kubeconfig
+// ClusterStatusSourceKubeconfig is the kubeconfig-sourced record's last-known kubeconfig
 // observation: the cluster/user entry names and presence. Cached from the
 // last time the context was present so it survives orphaning.
-type ClusterKubeconfig struct {
+type ClusterStatusSourceKubeconfig struct {
 	Cluster   string `json:"cluster"`
 	User      string `json:"user"`
 	IsPresent bool   `json:"isPresent"`
 	IsDefault bool   `json:"isDefault"`
 }
 
-// ClusterSource is the discriminated union naming where a cluster record
+// ClusterSpecSource is the discriminated union naming where a cluster record
 // comes from and how its credentials resolve.
-type ClusterSource struct {
-	Kubeconfig *ClusterSourceKubeconfig `json:"kubeconfig,omitempty"`
+type ClusterSpecSource struct {
+	Kubeconfig *ClusterSpecSourceKubeconfig `json:"kubeconfig,omitempty"`
 }
 
-// ClusterSourceKubeconfig is the kubeconfig-sourced variant of ClusterSource.
-type ClusterSourceKubeconfig struct {
+// ClusterSpecSourceKubeconfig is the kubeconfig-sourced variant of ClusterSpecSource.
+type ClusterSpecSourceKubeconfig struct {
 	Context string `json:"context"`
 }
 
-// ClusterSourceStatus is the status-side counterpart of ClusterSource.
-type ClusterSourceStatus struct {
-	Kubeconfig *ClusterKubeconfig `json:"kubeconfig,omitempty"`
+// ClusterStatusSource is the status-side counterpart of ClusterSpecSource.
+type ClusterStatusSource struct {
+	Kubeconfig *ClusterStatusSourceKubeconfig `json:"kubeconfig,omitempty"`
 }
 
 // ClusterServer holds last-known facts about the remote cluster, discovered by
@@ -284,19 +284,15 @@ type ClusterPrincipal struct {
 // controller's in-process retry bus, and resync pokes likewise drive the
 // controllers directly, so neither writes the spec.
 type ClusterSpec struct {
-	Name        *string       `json:"name,omitempty"`
-	Enabled     bool          `json:"enabled"`
-	SyncEnabled bool          `json:"syncEnabled"`
-	Source      ClusterSource `json:"source"`
-
-	// SourceObs is the kubeconfig observation written by the kubeconfig importer
-	// (cluster/user entry names, presence, default status). It is stored in the
-	// spec because only the Cluster's own controller (ClusterCoreController) can
-	// write its status, and the importer needs a write path that uses the
-	// ordinary Client.Update. The ClusterCoreController copies SourceObs into
-	// ClusterStatus.Source.Kubeconfig during its reconcile, so the GraphQL layer
-	// reads from status as expected. Not exposed on the GraphQL ClusterSpec.
-	SourceObs *ClusterKubeconfig `json:"sourceObs,omitempty"`
+	Name        *string `json:"name,omitempty"`
+	Enabled     bool    `json:"enabled"`
+	SyncEnabled bool    `json:"syncEnabled"`
+	// Source is the reference: where this record comes from and how its
+	// credentials resolve (GraphQL `spec.source`). The matching *observation*
+	// (cluster/user entry names, presence, default flag) is not stored here — the
+	// ClusterCoreController observes it live from the kubeconfig each reconcile and
+	// writes it to ClusterStatus.Source (see ClusterStatusSource).
+	Source ClusterSpecSource `json:"source"`
 }
 
 // ClusterStatus is the Cluster beehive kind's stored status AND the domain
@@ -305,7 +301,7 @@ type ClusterSpec struct {
 // child (see ClusterCacheStatus), mirroring the beehive owner chain, so there is
 // no merge type — this one struct is both stored and served.
 type ClusterStatus struct {
-	Source          ClusterSourceStatus `json:"source"`
+	Source          ClusterStatusSource `json:"source"`
 	Server          ClusterServer       `json:"server"`
 	Principal       ClusterPrincipal    `json:"principal"`
 	LastConnectedAt *time.Time          `json:"lastConnectedAt,omitempty"`

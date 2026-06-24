@@ -82,7 +82,7 @@ func seedCluster(t *testing.T, s *Service, ctxName string, id ClusterID) Cluster
 		Name:        &name,
 		SyncEnabled: true,
 		Enabled:     true,
-		Source:      ClusterSource{Kubeconfig: &ClusterSourceKubeconfig{Context: ctxName}},
+		Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: ctxName}},
 	}, beehive.WithSlug(ClusterSlug(id)))
 	require.NoError(t, err)
 	return id
@@ -235,7 +235,7 @@ func TestServiceDeleteTombstonesCluster(t *testing.T) {
 		Name:        &name,
 		SyncEnabled: true,
 		Enabled:     true,
-		Source:      ClusterSource{Kubeconfig: &ClusterSourceKubeconfig{Context: "alpha"}},
+		Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: "alpha"}},
 	}, beehive.WithSlug(ClusterSlug(id)), beehive.WithFinalizers("test/hold"))
 	require.NoError(t, err)
 

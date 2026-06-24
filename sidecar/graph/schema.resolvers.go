@@ -59,7 +59,7 @@ func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id string) (*c
 }
 
 // ClusterDelete is the resolver for the clusterDelete field. Deletes the
-// parent ClusterSource so beehive GC cascades to Cluster → ClusterCache.
+// Cluster so beehive GC cascades to its ClusterCache child.
 func (r *mutationResolver) ClusterDelete(ctx context.Context, id string) (bool, error) {
 	if err := r.ClusterSvc.Delete(ctx, cluster.ClusterID(id)); err != nil {
 		return false, err

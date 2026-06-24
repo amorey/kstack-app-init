@@ -55,7 +55,7 @@ type ClusterSpec {
   "Whether cache syncing is enabled. Disabling stops sync and freezes the cache. Only meaningful while enabled."
   syncEnabled: Boolean!
   "Where this record comes from and how its credentials resolve."
-  source: ClusterSource!
+  source: ClusterSpecSource!
 }
 
 """
@@ -63,13 +63,13 @@ The discriminated union naming a cluster record's origin: exactly one variant
 is set. Each variant is owned by exactly one creator (the kubeconfig importer
 today; manual creation and kstack-cloud sync are future variants).
 """
-type ClusterSource {
+type ClusterSpecSource {
   "Set when the record tracks a kube-context in the user's kubeconfig."
-  kubeconfig: ClusterSourceKubeconfig
+  kubeconfig: ClusterSpecSourceKubeconfig
 }
 
-"The kubeconfig-sourced variant of ClusterSource."
-type ClusterSourceKubeconfig {
+"The kubeconfig-sourced variant of ClusterSpecSource."
+type ClusterSpecSourceKubeconfig {
   "The kube-context name this record tracks."
   context: String!
 }
@@ -83,7 +83,7 @@ type/status/reason. Sync status and the on-disk cache live on the `cache` child
 """
 type ClusterStatus {
   "Per-source observation blocks, mirroring `spec.source`."
-  source: ClusterSourceStatus!
+  source: ClusterStatusSource!
   "Last-known facts about the remote cluster (uid, version), discovered by probing."
   server: ClusterServer!
   "The connecting client's identity and effective access on this cluster."
@@ -150,15 +150,15 @@ type ClusterCacheStatus {
 }
 
 """
-The status-side counterpart of ClusterSource: the per-source observation
+The status-side counterpart of ClusterSpecSource: the per-source observation
 blocks, of which exactly the spec source variant's is set. Null blocks mean
 "this record's source has no such observation" — never that an observation
 went away (an orphaned kubeconfig record keeps its block with
 `isPresent: false`).
 """
-type ClusterSourceStatus {
+type ClusterStatusSource {
   "Kubeconfig observation; null unless the record is kubeconfig-sourced."
-  kubeconfig: ClusterKubeconfig
+  kubeconfig: ClusterStatusSourceKubeconfig
 }
 
 """
@@ -169,7 +169,7 @@ present, so they survive the context leaving the kubeconfig and let the UI
 identify an orphaned record. In a malformed kubeconfig the referenced entries
 may not resolve.
 """
-type ClusterKubeconfig {
+type ClusterStatusSourceKubeconfig {
   "Name of the cluster entry the context references; cached."
   cluster: String!
   "Name of the user (authInfo) entry the context references; cached."

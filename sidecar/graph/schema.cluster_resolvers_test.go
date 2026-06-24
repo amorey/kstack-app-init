@@ -169,10 +169,10 @@ func clusterFixtures() []clusterFixture {
 				Name:        &prodName,
 				SyncEnabled: true,
 				Enabled:     true,
-				Source:      cluster.ClusterSource{Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: "prod"}},
+				Source:      cluster.ClusterSpecSource{Kubeconfig: &cluster.ClusterSpecSourceKubeconfig{Context: "prod"}},
 			},
 			connStatus: cluster.ClusterStatus{
-				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.ClusterKubeconfig{
+				Source: cluster.ClusterStatusSource{Kubeconfig: &cluster.ClusterStatusSourceKubeconfig{
 					Cluster: "prod-cluster", User: "prod-user",
 					IsPresent: true, IsDefault: true,
 				}},
@@ -183,10 +183,10 @@ func clusterFixtures() []clusterFixture {
 		{
 			id: "cl-2",
 			spec: cluster.ClusterSpec{
-				Source: cluster.ClusterSource{Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: "staging"}},
+				Source: cluster.ClusterSpecSource{Kubeconfig: &cluster.ClusterSpecSourceKubeconfig{Context: "staging"}},
 			},
 			connStatus: cluster.ClusterStatus{
-				Source: cluster.ClusterSourceStatus{Kubeconfig: &cluster.ClusterKubeconfig{
+				Source: cluster.ClusterStatusSource{Kubeconfig: &cluster.ClusterStatusSourceKubeconfig{
 					Cluster: "staging-cluster", User: "staging-user",
 				}},
 			},

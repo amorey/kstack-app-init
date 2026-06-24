@@ -38,6 +38,9 @@ func newTestImporter(t *testing.T, cfg *api.Config) *cluster.KubeconfigImporter 
 	return cluster.NewKubeconfigImporter(w, coreClient)
 }
 
+// The importer creates a Cluster carrying only the source reference; the
+// observation (cluster/user names, presence, isDefault) is the controller's job
+// and is not written by the importer.
 func TestImporterNewContextCreatesCluster(t *testing.T) {
 	ctx := context.Background()
 	cfg := testutil.TestKubeConfig("alpha")
@@ -50,30 +53,11 @@ func TestImporterNewContextCreatesCluster(t *testing.T) {
 	assert.Equal(t, "alpha", obj.Spec.Source.Kubeconfig.Context)
 	assert.True(t, obj.Spec.Enabled)
 	assert.True(t, obj.Spec.SyncEnabled)
-	require.NotNil(t, obj.Spec.SourceObs)
-	assert.Equal(t, "alpha-cluster", obj.Spec.SourceObs.Cluster)
-	assert.Equal(t, "alpha-user", obj.Spec.SourceObs.User)
-	assert.True(t, obj.Spec.SourceObs.IsPresent)
-	assert.True(t, obj.Spec.SourceObs.IsDefault)
 }
 
-func TestImporterDepartedContextSetsNotPresent(t *testing.T) {
-	ctx := context.Background()
-	cfg := testutil.TestKubeConfig("alpha")
-	im := newTestImporter(t, cfg)
-
-	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
-
-	// Remove context from config.
-	empty := &api.Config{Contexts: map[string]*api.Context{}}
-	require.NoError(t, im.ReconcileClusterSet(ctx, empty))
-
-	obj := mustSingleObj(t, im.ClusterClient())
-	require.NotNil(t, obj.Spec.SourceObs, "departed context must not be deleted, only orphaned")
-	assert.False(t, obj.Spec.SourceObs.IsPresent)
-}
-
-func TestImporterReturningContextRevivesInPlace(t *testing.T) {
+// A departed context is never deleted by the importer — the Cluster (and its
+// owned cache) survives. Flipping it to not-present is the controller's job.
+func TestImporterDepartedContextKeepsCluster(t *testing.T) {
 	ctx := context.Background()
 	cfg := testutil.TestKubeConfig("alpha")
 	im := newTestImporter(t, cfg)
@@ -81,19 +65,35 @@ func TestImporterReturningContextRevivesInPlace(t *testing.T) {
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
 	origID := mustSingleObj(t, im.ClusterClient()).ID
 
-	// Orphan it.
-	require.NoError(t, im.ReconcileClusterSet(ctx, &api.Config{Contexts: map[string]*api.Context{}}))
+	// Remove context from config: the importer must not delete the record.
+	empty := &api.Config{Contexts: map[string]*api.Context{}}
+	require.NoError(t, im.ReconcileClusterSet(ctx, empty))
 
-	// Revive.
-	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
 	obj := mustSingleObj(t, im.ClusterClient())
-
-	assert.Equal(t, origID, obj.ID, "same object ID: revived in-place, no new cluster")
-	require.NotNil(t, obj.Spec.SourceObs)
-	assert.True(t, obj.Spec.SourceObs.IsPresent)
+	assert.Equal(t, origID, obj.ID, "departed context must not be deleted")
 }
 
-func TestImporterUnchangedSnapshotWritesNothing(t *testing.T) {
+// A returning context reuses its (never-deleted) Cluster — the importer finds it
+// by context and creates no duplicate.
+func TestImporterReturningContextCreatesNoDuplicate(t *testing.T) {
+	ctx := context.Background()
+	cfg := testutil.TestKubeConfig("alpha")
+	im := newTestImporter(t, cfg)
+
+	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
+	origID := mustSingleObj(t, im.ClusterClient()).ID
+
+	// Depart, then return.
+	require.NoError(t, im.ReconcileClusterSet(ctx, &api.Config{Contexts: map[string]*api.Context{}}))
+	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
+
+	obj := mustSingleObj(t, im.ClusterClient())
+	assert.Equal(t, origID, obj.ID, "same object ID: reused in-place, no new cluster")
+}
+
+// An already-tracked context creates nothing on a repeat snapshot (no duplicate,
+// no spec write — the importer only ever creates).
+func TestImporterRepeatSnapshotCreatesNothing(t *testing.T) {
 	ctx := context.Background()
 	cfg := testutil.TestKubeConfig("alpha")
 	im := newTestImporter(t, cfg)
@@ -104,7 +104,8 @@ func TestImporterUnchangedSnapshotWritesNothing(t *testing.T) {
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
 	obj2 := mustSingleObj(t, im.ClusterClient())
 
-	assert.Equal(t, obj1.Generation, obj2.Generation, "unchanged snapshot must not bump generation")
+	assert.Equal(t, obj1.ID, obj2.ID, "repeat snapshot must not create a second cluster")
+	assert.Equal(t, obj1.Generation, obj2.Generation, "repeat snapshot must not bump generation")
 }
 
 func mustSingleObj(t *testing.T, cl beehive.Client[cluster.ClusterSpec, cluster.ClusterStatus]) *beehive.Object[cluster.ClusterSpec, cluster.ClusterStatus] {

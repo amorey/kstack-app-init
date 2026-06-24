@@ -36,14 +36,26 @@ type KubeConfigSource interface {
 }
 
 // ConnectionEligible reports whether a Cluster record should have a live
-// connection: kubeconfig-sourced, observed present, activated, and not being
-// deleted.
+// connection: kubeconfig-sourced, observed present, enabled, and not being
+// deleted. Presence is read from the observed status (written by the
+// ClusterCoreController from the live kubeconfig), so callers that react to a
+// record — the cache controller, the targeted-retry pre-gate — see the latest
+// committed observation. The ClusterCoreController's own reconcile uses
+// connectionEligible with a freshly-observed presence instead, so its gate does
+// not lag the status it is about to write.
 func ConnectionEligible(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+	present := obj.Status != nil &&
+		obj.Status.Source.Kubeconfig != nil &&
+		obj.Status.Source.Kubeconfig.IsPresent
+	return connectionEligible(obj, present)
+}
+
+// connectionEligible is ConnectionEligible with presence supplied explicitly.
+func connectionEligible(obj *beehive.Object[ClusterSpec, ClusterStatus], present bool) bool {
 	return obj.DeletionRequestedAt == nil &&
 		obj.Spec.Enabled &&
 		obj.Spec.Source.Kubeconfig != nil &&
-		obj.Spec.SourceObs != nil &&
-		obj.Spec.SourceObs.IsPresent
+		present
 }
 
 // ResolveRESTConfig materializes client credentials for one kube-context.

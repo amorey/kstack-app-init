@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/amorey/beehive"
 
@@ -145,18 +146,39 @@ func waitCondition(t *testing.T, cl beehive.Client[cluster.ClusterSpec, cluster.
 	}
 }
 
-// eligibleSpec builds a Cluster spec that passes ConnectionEligible.
+// waitForStatus blocks on the object's beehive watch until its status satisfies
+// pred, then returns the object. Event-driven (current-on-subscribe), no polling.
+func waitForStatus(t *testing.T, cl beehive.Client[cluster.ClusterSpec, cluster.ClusterStatus], id beehive.ObjectID, pred func(*cluster.ClusterStatus) bool) *beehive.Object[cluster.ClusterSpec, cluster.ClusterStatus] {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := cl.Watch(ctx, id)
+	require.NoError(t, err)
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				t.Fatal("watch closed before status predicate met")
+			}
+			if ev.Object != nil && ev.Object.Status != nil && pred(ev.Object.Status) {
+				return ev.Object
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for status predicate")
+		}
+	}
+}
+
+// eligibleSpec builds a Cluster spec that passes ConnectionEligible — provided
+// contextName is present in the test watcher's kubeconfig, since the controller
+// now observes presence live from the kubeconfig (it is no longer parked in spec).
 func eligibleSpec(contextName string) cluster.ClusterSpec {
 	return cluster.ClusterSpec{
 		Enabled:     true,
 		SyncEnabled: true,
-		Source: cluster.ClusterSource{
-			Kubeconfig: &cluster.ClusterSourceKubeconfig{Context: contextName},
-		},
-		SourceObs: &cluster.ClusterKubeconfig{
-			Cluster:   contextName + "-cluster",
-			User:      contextName + "-user",
-			IsPresent: true,
+		Source: cluster.ClusterSpecSource{
+			Kubeconfig: &cluster.ClusterSpecSourceKubeconfig{Context: contextName},
 		},
 	}
 }
@@ -403,4 +425,57 @@ func TestClusterCoreControllerReprobeOne(t *testing.T) {
 	// Reprobe forces an immediate re-probe of the targeted cluster.
 	ctrl.Reprobe(id)
 	awaitProbe(t, probeCh)
+}
+
+// The controller observes the kubeconfig live and writes it to status.Source (the
+// importer no longer parks it in spec). Its watcher subscription re-reconciles on
+// a kubeconfig change, so a departed context flips IsPresent=false — keeping its
+// last-known names — and goes Inactive.
+func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
+	ctx := context.Background()
+	uid, ver, user := "u", "v1.31.0", "alice"
+	w := testutil.NewMutableWatcher(testutil.TestKubeConfig("alpha"))
+
+	bh := testutil.NewTestBeehiveUnstarted(t)
+	coreClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterStatus](bh, cluster.ClusterGroupKind)
+	cacheClient := beehive.NewClient[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus](bh, cluster.ClusterCacheGroupKind)
+	ctrl := cluster.NewClusterCoreController(w, coreClient, cacheClient, nil, nil,
+		staticProbe(cluster.ClusterServer{UID: &uid, Version: &ver}, cluster.ClusterPrincipal{Username: &user}),
+		staticCheck(cluster.HealthPhaseHealthy))
+	cc, err := beehive.Register(bh, cluster.ClusterGroupKind, ctrl)
+	require.NoError(t, err)
+	ctrl.SetControllerClient(cc)
+	_, err = beehive.Register(bh, cluster.ClusterCacheGroupKind, &testutil.NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	ctrl.StartBackground()
+	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
+
+	id := cluster.ClusterID("observe-uuid")
+	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"), beehive.WithSlug(cluster.ClusterSlug(id)))
+	require.NoError(t, err)
+
+	// Present: the observation is written to status from the kubeconfig.
+	got := waitForStatus(t, coreClient, obj.ID, func(s *cluster.ClusterStatus) bool {
+		return s.Source.Kubeconfig != nil && s.Source.Kubeconfig.IsPresent
+	})
+	kc := got.Status.Source.Kubeconfig
+	assert.Equal(t, "alpha-cluster", kc.Cluster)
+	assert.Equal(t, "alpha-user", kc.User)
+	assert.True(t, kc.IsDefault, "alpha is the current-context")
+
+	// Depart: the context leaves the kubeconfig → watcher wake → re-reconcile.
+	w.Set(&api.Config{Contexts: map[string]*api.Context{}})
+
+	got = waitForStatus(t, coreClient, obj.ID, func(s *cluster.ClusterStatus) bool {
+		return s.Source.Kubeconfig != nil && !s.Source.Kubeconfig.IsPresent
+	})
+	kc = got.Status.Source.Kubeconfig
+	assert.Equal(t, "alpha-cluster", kc.Cluster, "departed record keeps its last-known names")
+	assert.Equal(t, "alpha-user", kc.User)
+	assert.False(t, kc.IsDefault)
+	connected := findCondition(t, got.Status.Conditions, cluster.ClusterConditionConnected)
+	assert.Equal(t, cluster.ConditionFalse, connected.Status)
+	assert.Equal(t, cluster.ReasonInactive, connected.Reason)
 }

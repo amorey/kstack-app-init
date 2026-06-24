@@ -200,10 +200,18 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 		return beehive.Result{}, err
 	}
 
-	// Add DependsOn edge so beehive re-queues us when the parent Cluster spec
-	// changes (e.g. SyncEnabled toggled), propagating eligibility changes.
+	// Add the DependsOn edge so beehive re-queues us when the parent Cluster
+	// changes — spec edits (e.g. SyncEnabled toggled) AND status writes (the
+	// ClusterCoreController's live source observation, which drives presence-based
+	// eligibility). Then re-read the parent: establishing the edge before relying on
+	// the parent's status closes the race where the parent is stamped between our
+	// first read and AddDependency (which would wake nothing, leaving us stuck on a
+	// stale 'not yet observed' view).
 	if err := client.AddDependency(ctx, obj.ID, clusterObj.ID); err != nil {
 		return beehive.Result{}, err
+	}
+	if fresh, err := c.coreClient.GetBySlug(ctx, ClusterSlug(clusterID)); err == nil {
+		clusterObj = fresh
 	}
 
 	if obj.DeletionRequestedAt != nil {

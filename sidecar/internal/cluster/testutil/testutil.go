@@ -17,6 +17,7 @@ package testutil
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/amorey/beehive"
@@ -49,6 +50,46 @@ func (s *StaticWatcher) Get() *api.Config { return s.cfg }
 
 func (s *StaticWatcher) Subscribe() k8shelpers.KubeConfigSubscription {
 	return watch.New(s.cfg).Receiver()
+}
+
+// MutableWatcher is a KubeConfigSource whose config can change at runtime via
+// Set, which publishes the new snapshot to subscribers — for tests that exercise
+// the controller's reaction to kubeconfig changes (departures, renames, etc.).
+type MutableWatcher struct {
+	mu  sync.RWMutex
+	cfg *api.Config
+	hub *watch.Hub[*api.Config]
+	tx  *watch.Sender[*api.Config]
+}
+
+// NewMutableWatcher creates a KubeConfigSource seeded with cfg (nil → empty).
+func NewMutableWatcher(cfg *api.Config) *MutableWatcher {
+	if cfg == nil {
+		cfg = &api.Config{Contexts: map[string]*api.Context{}}
+	}
+	hub := watch.New(cfg)
+	return &MutableWatcher{cfg: cfg, hub: hub, tx: hub.Sender()}
+}
+
+func (m *MutableWatcher) Get() *api.Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg
+}
+
+func (m *MutableWatcher) Subscribe() k8shelpers.KubeConfigSubscription {
+	return m.hub.Receiver()
+}
+
+// Set swaps the current config and publishes it to subscribers.
+func (m *MutableWatcher) Set(cfg *api.Config) {
+	if cfg == nil {
+		cfg = &api.Config{Contexts: map[string]*api.Context{}}
+	}
+	m.mu.Lock()
+	m.cfg = cfg
+	m.mu.Unlock()
+	_ = m.tx.Send(cfg)
 }
 
 // OpenMemoryStore opens a fresh in-memory SQLite store for testing.
