@@ -458,10 +458,10 @@ type ClusterCache struct {
 // migration; Caches lists them all and ActiveCache points at the live one (the
 // element with Enabled==true), or is nil when the cluster has no active cache yet.
 type Cluster struct {
-	ID         ClusterID
-	Generation int64
-	CreatedAt  time.Time
-	DeletedAt  *time.Time // derived from obj.DeletionRequestedAt
+	ID                  ClusterID
+	Generation          int64
+	CreatedAt           time.Time
+	DeletionRequestedAt *time.Time // beehive's soft-delete tombstone, surfaced as-is
 
 	Spec        ClusterSpec
 	Status      ClusterStatus

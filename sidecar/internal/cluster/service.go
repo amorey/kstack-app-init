@@ -441,7 +441,7 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterS
 	}
 	if obj.DeletionRequestedAt != nil {
 		t := *obj.DeletionRequestedAt
-		c.DeletedAt = &t
+		c.DeletionRequestedAt = &t
 	}
 	if obj.Status != nil {
 		c.Status = *obj.Status

@@ -43,8 +43,8 @@ type Cluster {
   generation: Int!
   "When this cluster was first registered."
   createdAt: Time!
-  "When this cluster was removed (soft-delete tombstone); null unless removed."
-  deletedAt: Time
+  "When this cluster's deletion was requested (beehive soft-delete tombstone); null unless deletion is pending. The record lingers until its finalizers clear."
+  deletionRequestedAt: Time
 
   "Desired state: the user-owned fields."
   spec: ClusterSpec!
