@@ -19,12 +19,17 @@
 //
 // The two beehive resource kinds and their ownership chain:
 //
-//	Cluster        (slug: "clusters/{uuid}")
+//	Cluster        (slug: "{source}/{naturalKey}", e.g. "kubeconfig/{context}")
 //	    ↓ owns
-//	ClusterCache   (slug: "caches/{uuid}")
+//	ClusterCache   (slug: "caches/{ClusterID}")
 //
 // Cluster objects are created directly by the kubeconfig importer (one per
-// kube-context); there is no separate intake kind.
+// kube-context); there is no separate intake kind. A Cluster's slug IS its
+// ClusterID — a source prefix plus that source's natural key — so each source
+// owns a disjoint slug namespace within the one Cluster kind, the importer
+// reconciles by slug (beehive's per-kind slug-uniqueness rules out duplicates),
+// and the on-disk cache is keyed separately by beehive ObjectIDs so the slug's
+// arbitrary text never reaches the filesystem.
 //
 // Domain types here are a superset of what beehive stores: the domain Cluster
 // (returned to resolvers) joins the Cluster and ClusterCache beehive objects
@@ -34,56 +39,115 @@
 package cluster
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"strconv"
 	"time"
 
 	"github.com/amorey/beehive"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
 // ErrNotFound is returned by client helpers when no cluster with the given id
 // is tracked.
 var ErrNotFound = errors.New("controllers: cluster not found")
 
-// Slug prefix constants for the two beehive resource kinds.
+// Slug prefixes. The slug is a per-kind reconcile/uniqueness key, NOT the
+// identity surfaced to consumers (that is the ClusterID, the beehive ObjectID).
+//
+//   - A kubeconfig-sourced Cluster is created with the slug "kubeconfig/{context}"
+//     — the source's natural key, used purely by the importer so beehive's per-kind
+//     slug-uniqueness rules out a duplicate for a context (race-safe). Future
+//     sources add their own prefix ("cloud/", "manual/"). Nothing reads a Cluster
+//     back by this slug; lookups go through the ObjectID.
+//   - A ClusterCache is created with the slug "caches/{ClusterObjID}" so its parent
+//     can address it (beehive exposes no owner→children lookup pre-v0.5.0); its
+//     ClusterID segment is the parent's ObjectID.
 const (
-	slugPrefixCluster      = "clusters/"
+	slugPrefixKubeconfig   = "kubeconfig/"
 	slugPrefixClusterCache = "caches/"
 )
 
-// ClusterSlug returns the beehive slug for a Cluster object from its UUID.
-func ClusterSlug(id ClusterID) string {
-	return slugPrefixCluster + string(id)
+// kubeconfigSlug returns the beehive slug a kubeconfig-sourced Cluster is created
+// with: the importer's natural key for one kube-context. It is not an identity —
+// see ClusterID.
+func kubeconfigSlug(contextName string) string {
+	return slugPrefixKubeconfig + contextName
 }
 
-// ClusterCacheSlug returns the beehive slug for a ClusterCache object from the
-// parent cluster UUID.
+// ClusterCacheSlug returns the slug a ClusterCache is created with and looked up
+// by: "caches/{ClusterObjID}", addressing the cache from its parent's id.
 func ClusterCacheSlug(id ClusterID) string {
-	return slugPrefixClusterCache + string(id)
+	return slugPrefixClusterCache + strconv.FormatInt(int64(id), 10)
 }
 
-// ClusterIDFromSlug extracts the ClusterID from a Cluster or ClusterCache
-// slug. Returns empty string for an unrecognised prefix.
-func ClusterIDFromSlug(slug string) ClusterID {
-	if len(slug) > len(slugPrefixCluster) && slug[:len(slugPrefixCluster)] == slugPrefixCluster {
-		return ClusterID(slug[len(slugPrefixCluster):])
-	}
-	if len(slug) > len(slugPrefixClusterCache) && slug[:len(slugPrefixClusterCache)] == slugPrefixClusterCache {
-		return ClusterID(slug[len(slugPrefixClusterCache):])
-	}
-	return ""
+// newCacheRef builds the on-disk cache locator from the parent Cluster and
+// ClusterCache beehive ObjectIDs. It is the single place the beehive
+// ObjectID→int64 conversion happens, so the leaf store package stays
+// beehive-free.
+func newCacheRef(clusterObjID, cacheObjID beehive.ObjectID) store.CacheRef {
+	return store.CacheRef{ClusterID: int64(clusterObjID), CacheID: int64(cacheObjID)}
 }
 
 // --- Identity ---
 
-// ClusterID uniquely and stably identifies a cluster record across context
-// renames and credential changes. Values are opaque to consumers (it binds to
-// the GraphQL ID scalar); the kubeconfig importer assigns a random UUID the
-// first time it sees a context, deliberately independent of the remote
-// cluster's UID (which is unknown until the first probe, and shared by two
-// records pointing at the same physical cluster). Externally a ClusterID is
-// the UUID string; internally
-// beehive stores it as the slug "clusters/{uuid}".
-type ClusterID string
+// ClusterID uniquely identifies a cluster record: the beehive ObjectID of its
+// Cluster object. It is opaque and stable for the life of the record (a departed
+// kube-context is orphaned, not deleted, so its id survives a return; the id
+// changes only on an explicit Delete), and it is source-agnostic — the same
+// identity regardless of which importer created the record. The source's natural
+// key (e.g. a kube-context name) lives only on the beehive *slug*, an
+// importer-internal reconcile/uniqueness key, never surfaced here. ClusterID
+// binds to the GraphQL ID scalar, marshalled as its decimal string.
+type ClusterID int64
+
+// parseClusterID parses a ClusterID from its decimal-string wire form; a
+// malformed value is a client error surfaced through UnmarshalGQL.
+func parseClusterID(s string) (ClusterID, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid cluster id %q: %w", s, err)
+	}
+	return ClusterID(n), nil
+}
+
+// MarshalGQL writes the ClusterID to the GraphQL ClusterID scalar as a quoted
+// decimal string (its wire form).
+func (id ClusterID) MarshalGQL(w io.Writer) {
+	io.WriteString(w, strconv.Quote(strconv.FormatInt(int64(id), 10)))
+}
+
+// UnmarshalGQL parses the GraphQL ClusterID scalar into a typed ClusterID, so
+// gqlgen hands resolvers the typed id with no per-resolver parsing. The scalar
+// accepts a string or an integer literal: gqlgen delivers a quoted literal /
+// JSON string as string, an inline integer literal as int64, and a JSON-variable
+// number as json.Number.
+func (id *ClusterID) UnmarshalGQL(v any) error {
+	switch t := v.(type) {
+	case string:
+		n, err := parseClusterID(t)
+		if err != nil {
+			return err
+		}
+		*id = n
+	case json.Number:
+		n, err := parseClusterID(t.String())
+		if err != nil {
+			return err
+		}
+		*id = n
+	case int64:
+		*id = ClusterID(t)
+	case int:
+		*id = ClusterID(t)
+	default:
+		return fmt.Errorf("ClusterID must be a string or integer, got %T", v)
+	}
+	return nil
+}
 
 // --- Conditions ---
 
@@ -315,9 +379,9 @@ type ClusterStatus struct {
 var ClusterCacheGroupKind = beehive.GroupKind{Kind: "ClusterCache"}
 
 // ClusterCacheSpec is the ClusterCache kind's spec. It carries no user-facing
-// fields; the parent cluster UUID is encoded in the object's slug
-// ("caches/{uuid}"). The ClusterCoreController creates ClusterCache objects with
-// this empty spec.
+// fields; the parent ClusterID is encoded in the object's slug
+// ("caches/{ClusterID}"). The ClusterCoreController creates ClusterCache objects
+// with this empty spec.
 type ClusterCacheSpec struct{}
 
 // ClusterCacheStatus is the ClusterCache kind's stored status, written by the

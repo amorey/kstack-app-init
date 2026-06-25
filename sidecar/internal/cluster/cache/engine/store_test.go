@@ -34,7 +34,7 @@ func migratedCDB(t *testing.T) *store.ClusterDB {
 	t.Helper()
 	ctx := context.Background()
 	cache := store.NewManager(t.TempDir())
-	cdb, err := cache.Open(ctx, "c1")
+	cdb, err := cache.Open(ctx, store.CacheRef{ClusterID: 1, CacheID: 1})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cache.Shutdown(ctx) })
 	return cdb

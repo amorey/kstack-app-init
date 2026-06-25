@@ -32,20 +32,20 @@ func (r *clusterPrincipalResolver) Permissions(ctx context.Context, obj *cluster
 // ClusterEnabledSet is the resolver for the clusterEnabledSet field. Enables or
 // disables a cluster in the app; the change reaches the webview through the
 // cluster watch.
-func (r *mutationResolver) ClusterEnabledSet(ctx context.Context, id string, enabled bool) (*cluster.Cluster, error) {
-	return r.ClusterSvc.SetEnabled(ctx, cluster.ClusterID(id), enabled)
+func (r *mutationResolver) ClusterEnabledSet(ctx context.Context, id cluster.ClusterID, enabled bool) (*cluster.Cluster, error) {
+	return r.ClusterSvc.SetEnabled(ctx, id, enabled)
 }
 
 // ClusterSyncEnabledSet is the resolver for the clusterSyncEnabledSet field.
-func (r *mutationResolver) ClusterSyncEnabledSet(ctx context.Context, id string, syncEnabled bool) (*cluster.Cluster, error) {
-	return r.ClusterSvc.SetSyncEnabled(ctx, cluster.ClusterID(id), syncEnabled)
+func (r *mutationResolver) ClusterSyncEnabledSet(ctx context.Context, id cluster.ClusterID, syncEnabled bool) (*cluster.Cluster, error) {
+	return r.ClusterSvc.SetSyncEnabled(ctx, id, syncEnabled)
 }
 
 // ClusterConnectionRetry is the resolver for the clusterConnectionRetry field.
 // The retry's outcome is not returned here — it lands on the record's
 // conditions and reaches the webview through the cluster watch.
-func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id string) (bool, error) {
-	if err := r.ClusterSvc.RetryConnection(ctx, cluster.ClusterID(id)); err != nil {
+func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id cluster.ClusterID) (bool, error) {
+	if err := r.ClusterSvc.RetryConnection(ctx, id); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -54,14 +54,14 @@ func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id string
 // ClusterCacheClear is the resolver for the clusterCacheClear field: delete
 // the on-disk cache and bounce the sync engine; the cluster record (returned)
 // stays. A still-eligible cluster re-syncs from scratch.
-func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id string) (*cluster.Cluster, error) {
-	return r.ClusterSvc.ClearCache(ctx, cluster.ClusterID(id))
+func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id cluster.ClusterID) (*cluster.Cluster, error) {
+	return r.ClusterSvc.ClearCache(ctx, id)
 }
 
 // ClusterDelete is the resolver for the clusterDelete field. Deletes the
 // Cluster so beehive GC cascades to its ClusterCache child.
-func (r *mutationResolver) ClusterDelete(ctx context.Context, id string) (bool, error) {
-	if err := r.ClusterSvc.Delete(ctx, cluster.ClusterID(id)); err != nil {
+func (r *mutationResolver) ClusterDelete(ctx context.Context, id cluster.ClusterID) (bool, error) {
+	if err := r.ClusterSvc.Delete(ctx, id); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -91,8 +91,8 @@ func (r *mutationResolver) AuthLogout(ctx context.Context) (bool, error) {
 
 // Cluster is the resolver for the cluster field. An untracked or
 // deletion-pending id is null per the schema, not an error.
-func (r *queryResolver) Cluster(ctx context.Context, id string) (*cluster.Cluster, error) {
-	return r.ClusterSvc.Get(ctx, cluster.ClusterID(id))
+func (r *queryResolver) Cluster(ctx context.Context, id cluster.ClusterID) (*cluster.Cluster, error) {
+	return r.ClusterSvc.Get(ctx, id)
 }
 
 // Clusters is the resolver for the clusters field. Reads all Cluster records;

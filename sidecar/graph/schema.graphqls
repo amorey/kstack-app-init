@@ -17,6 +17,12 @@
 "An ISO-8601 encoded UTC date string."
 scalar Time
 
+"""
+A cluster record's identity, opaque to clients (a decimal-string id on the wire).
+Use values returned by the server verbatim; do not construct or parse them.
+"""
+scalar ClusterID
+
 # --- Cluster (a tracked kube-context) ---
 
 """
@@ -29,7 +35,7 @@ kubeconfig (so its cache can still be inspected or cleared).
 """
 type Cluster {
   "Unique identifier for this cluster record."
-  id: ID!
+  id: ClusterID!
 
   "The record's spec generation, bumped on every spec write. Compare against a condition's observedGeneration to detect a stale (not-yet-reconciled) condition."
   generation: Int!
@@ -283,7 +289,7 @@ type AuthState {
 
 type Query {
   "A single cluster by id; null if not tracked."
-  cluster(id: ID!): Cluster
+  cluster(id: ClusterID!): Cluster
 
   "Every tracked cluster — those in the kubeconfig plus any with a leftover cache. Sorted by name."
   clusters: [Cluster!]!
@@ -296,19 +302,19 @@ type Mutation {
   # --- Cluster mutations ---
 
   "Enable or disable a cluster in the app. Disabling keeps the record tracked but dormant (no connection, hidden from context pickers). Returns the updated cluster."
-  clusterEnabledSet(id: ID!, enabled: Boolean!): Cluster!
+  clusterEnabledSet(id: ClusterID!, enabled: Boolean!): Cluster!
 
   "Enable or disable syncing for a cluster. Disabling stops sync and freezes the cache. Returns the updated cluster."
-  clusterSyncEnabledSet(id: ID!, syncEnabled: Boolean!): Cluster!
+  clusterSyncEnabledSet(id: ClusterID!, syncEnabled: Boolean!): Cluster!
 
   "Force an immediate reconnection attempt, resetting any backoff. Returns true once scheduled."
-  clusterConnectionRetry(id: ID!): Boolean!
+  clusterConnectionRetry(id: ClusterID!): Boolean!
 
   "Clear a cluster's on-disk cache but keep its registry record; a present, enabled cluster re-syncs from scratch. Returns the updated cluster."
-  clusterCacheClear(id: ID!): Cluster!
+  clusterCacheClear(id: ClusterID!): Cluster!
 
   "Forget a cluster: delete its cache and its registry record. A still-present context is re-discovered on the next kubeconfig reconcile. Returns true."
-  clusterDelete(id: ID!): Boolean!
+  clusterDelete(id: ClusterID!): Boolean!
 
   # --- Auth mutations ---
 

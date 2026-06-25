@@ -47,9 +47,11 @@ type EngineHandle interface {
 	Stop(ctx context.Context) error
 }
 
-// NewEngineFunc constructs one sync engine. Production uses a engine.NewEngine
-// wrapper; tests inject a factory that returns fake handles.
-type NewEngineFunc func(cfg *rest.Config, clusterID ClusterID, sink engine.Sink) EngineHandle
+// NewEngineFunc constructs one sync engine. ref locates the on-disk cache by
+// beehive ObjectID (parent Cluster + ClusterCache); clusterID is the domain id,
+// kept for log labels. Production uses a engine.NewEngine wrapper; tests inject a
+// factory that returns fake handles.
+type NewEngineFunc func(cfg *rest.Config, clusterID ClusterID, ref store.CacheRef, sink engine.Sink) EngineHandle
 
 // engineEntry is the controller's runtime state for one running engine. The
 // pointer guards the sink: reports from a stopped or replaced engine are dropped
@@ -60,8 +62,13 @@ type engineEntry struct {
 	// poke-driven restart can respawn the engine without re-resolving it.
 	restCfg     *rest.Config
 	fingerprint string
+	// clusterObjID is the beehive ObjectID of the parent Cluster object; it names
+	// the on-disk cache directory (clusters/<clusterObjID>/). Stored so a
+	// poke-driven restart can rebuild the store.CacheRef without re-reading.
+	clusterObjID beehive.ObjectID
 	// cacheObjID is the beehive ObjectID of the ClusterCache object this engine
-	// reports into. Stored so the sink can call UpdateStatus without a lookup.
+	// reports into. It names the on-disk cache file (<cacheObjID>.db) and lets the
+	// sink call UpdateStatus without a lookup.
 	cacheObjID beehive.ObjectID
 	// cacheGen is the ClusterCache object's own generation, used as the
 	// observedGeneration when the sink calls UpdateStatus. It must be this
@@ -128,8 +135,8 @@ func NewClusterCacheController(
 		engines:      make(map[ClusterID]*engineEntry),
 	}
 	cm := manager
-	c.newEngine = func(cfg *rest.Config, id ClusterID, sink engine.Sink) EngineHandle {
-		cdb, err := cm.Open(context.Background(), string(id))
+	c.newEngine = func(cfg *rest.Config, id ClusterID, ref store.CacheRef, sink engine.Sink) EngineHandle {
+		cdb, err := cm.Open(context.Background(), ref)
 		if err != nil {
 			slog.Warn("clustercachecontroller: open cache db", "cluster", id, "err", err)
 			return nil
@@ -185,13 +192,20 @@ func (c *ClusterCacheController) StopEngines() error {
 
 // Reconcile converges one ClusterCache object toward its parent Cluster's spec.
 func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) (beehive.Result, error) {
-	if obj.Slug == nil {
-		return beehive.Result{}, errors.New("clustercachecontroller: object has no slug")
+	// The parent ClusterID is the ClusterCache's owner (its owned_by edge), read
+	// from beehive's object graph rather than re-parsed out of the slug.
+	owner, ok, err := client.GetOwner(ctx, obj.ID)
+	if err != nil {
+		return beehive.Result{}, err
 	}
-	clusterID := ClusterIDFromSlug(*obj.Slug)
+	if !ok {
+		// No owner — the parent was GC'd; our object is being cleaned up too.
+		return beehive.Result{}, nil
+	}
+	clusterID := ClusterID(owner.ID)
 
 	// Read the parent Cluster to determine eligibility.
-	clusterObj, err := c.coreClient.GetBySlug(ctx, ClusterSlug(clusterID))
+	clusterObj, err := c.coreClient.Get(ctx, owner.ID)
 	if err != nil {
 		if errors.Is(err, beehive.ErrNotFound) {
 			// Parent gone (GC race); our object will be cleaned up too.
@@ -210,7 +224,7 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 	if err := client.AddDependency(ctx, obj.ID, clusterObj.ID); err != nil {
 		return beehive.Result{}, err
 	}
-	if fresh, err := c.coreClient.GetBySlug(ctx, ClusterSlug(clusterID)); err == nil {
+	if fresh, err := c.coreClient.Get(ctx, beehive.ObjectID(clusterID)); err == nil {
 		clusterObj = fresh
 	}
 
@@ -295,7 +309,7 @@ func (c *ClusterCacheController) converge(
 		Type: ClusterConditionSynced, Status: ConditionFalse,
 		Reason: ReasonSyncing, ObservedGeneration: gen,
 	})
-	c.spawnEngine(clusterID, restCfg, fingerprint, cacheObjID, cacheGen, gen)
+	c.spawnEngine(clusterID, restCfg, fingerprint, clusterObj.ID, cacheObjID, cacheGen, gen)
 	return syncRecheckInterval
 }
 
@@ -307,18 +321,20 @@ func (c *ClusterCacheController) spawnEngine(
 	clusterID ClusterID,
 	restCfg *rest.Config,
 	fingerprint string,
-	cacheObjID beehive.ObjectID,
+	clusterObjID, cacheObjID beehive.ObjectID,
 	cacheGen, parentGen int64,
 ) {
 	newEntry := &engineEntry{
-		restCfg:     restCfg,
-		fingerprint: fingerprint,
-		cacheObjID:  cacheObjID,
-		cacheGen:    cacheGen,
-		parentGen:   parentGen,
+		restCfg:      restCfg,
+		fingerprint:  fingerprint,
+		clusterObjID: clusterObjID,
+		cacheObjID:   cacheObjID,
+		cacheGen:     cacheGen,
+		parentGen:    parentGen,
 	}
 	sink := &engineSink{c: c, id: clusterID, entry: newEntry}
-	handle := c.newEngine(restCfg, clusterID, sink)
+	ref := newCacheRef(clusterObjID, cacheObjID)
+	handle := c.newEngine(restCfg, clusterID, ref, sink)
 	if handle == nil {
 		return
 	}
@@ -371,9 +387,10 @@ func (c *ClusterCacheController) restartEngineLocked(id ClusterID) {
 		return
 	}
 	restCfg, fingerprint := entry.restCfg, entry.fingerprint
-	cacheObjID, cacheGen, parentGen := entry.cacheObjID, entry.cacheGen, entry.parentGen
+	clusterObjID, cacheObjID := entry.clusterObjID, entry.cacheObjID
+	cacheGen, parentGen := entry.cacheGen, entry.parentGen
 	c.stopEngine(id)
-	c.spawnEngine(id, restCfg, fingerprint, cacheObjID, cacheGen, parentGen)
+	c.spawnEngine(id, restCfg, fingerprint, clusterObjID, cacheObjID, cacheGen, parentGen)
 }
 
 // stopEngine tears down a cluster's engine if one is running.

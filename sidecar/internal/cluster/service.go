@@ -238,7 +238,7 @@ func (s *Service) listClusters(ctx context.Context) ([]*Cluster, error) {
 // Get implements ClusterService. An untracked or deletion-pending id is (nil,
 // nil), not an error.
 func (s *Service) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
-	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
 	if errors.Is(err, beehive.ErrNotFound) {
 		return nil, nil
 	}
@@ -254,11 +254,18 @@ func (s *Service) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
 
 // ClusterCacheStats implements ClusterService.
 func (s *Service) CacheStats(ctx context.Context, id ClusterID) (*ClusterCacheStats, error) {
-	bytes, exists := s.cacheManager.CacheBytes(string(id))
+	ref, found, err := s.cacheRef(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return &ClusterCacheStats{}, nil
+	}
+	bytes, exists := s.cacheManager.CacheBytes(ref)
 	if !exists {
 		return &ClusterCacheStats{}, nil
 	}
-	db := s.cacheManager.Lookup(string(id))
+	db := s.cacheManager.Lookup(ref.CacheID)
 	if db == nil {
 		return &ClusterCacheStats{Exists: true, Bytes: bytes}, nil
 	}
@@ -328,8 +335,17 @@ func (s *Service) ClearCache(ctx context.Context, id ClusterID) (*Cluster, error
 	if err != nil {
 		return nil, err
 	}
-	if err := s.cacheManager.DeleteCacheFiles(ctx, string(id)); err != nil {
+	// Resolve the cache child to locate its on-disk files. If there is no
+	// ClusterCache object yet (cluster never became sync-eligible), there are no
+	// files to delete — skip straight to the engine restart (also a no-op).
+	ref, found, err := s.cacheRef(ctx, id)
+	if err != nil {
 		return nil, err
+	}
+	if found {
+		if derr := s.cacheManager.DeleteCacheFiles(ctx, ref); derr != nil {
+			return nil, derr
+		}
 	}
 	// Restart the running engine so it rebuilds against the now-empty cache. A
 	// no-op if no engine is running (it cold-syncs next time it starts).
@@ -342,7 +358,8 @@ func (s *Service) ClearCache(ctx context.Context, id ClusterID) (*Cluster, error
 
 // Delete implements ClusterService. It deletes the Cluster object; beehive GC
 // cascades to its ClusterCache. If the kube-context still exists, the importer
-// will re-create the cluster (with a fresh UUID) on its next reconcile.
+// will re-create the cluster on its next reconcile — with the same
+// "kubeconfig/{context}" slug, since that is the context's natural key.
 func (s *Service) Delete(ctx context.Context, id ClusterID) error {
 	obj, err := s.clusterByID(ctx, id)
 	if err != nil {
@@ -412,10 +429,7 @@ func (s *Service) GetConnection(id ClusterID) *rest.Config {
 // buildCluster assembles a domain Cluster from a Cluster beehive object, joining
 // in ClusterCache sync status from the cache client.
 func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus]) Cluster {
-	var id ClusterID
-	if obj.Slug != nil {
-		id = ClusterIDFromSlug(*obj.Slug)
-	}
+	id := ClusterID(obj.ID)
 
 	c := Cluster{
 		ID:         id,
@@ -445,9 +459,29 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterS
 // clusterByID fetches a Cluster object by id, mapping beehive.ErrNotFound to the
 // package's ErrNotFound.
 func (s *Service) clusterByID(ctx context.Context, id ClusterID) (*beehive.Object[ClusterSpec, ClusterStatus], error) {
-	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
 	if errors.Is(err, beehive.ErrNotFound) {
 		return nil, ErrNotFound
 	}
 	return obj, err
+}
+
+// cacheRef resolves the on-disk cache locator for a cluster: the beehive
+// ObjectIDs of the parent Cluster (directory) and its ClusterCache child (file).
+// found is false when the ClusterCache is missing — the cluster has no cache
+// files (it never became sync-eligible, or is being torn down), which callers
+// treat as "no cache" rather than an error.
+//
+// One lookup: the ClusterID IS the parent Cluster's ObjectID (the directory), so
+// only the ClusterCache child (the file) needs fetching — by its slug, which is
+// keyed on that same parent ObjectID.
+func (s *Service) cacheRef(ctx context.Context, id ClusterID) (store.CacheRef, bool, error) {
+	cacheObj, err := s.cacheClient.GetBySlug(ctx, ClusterCacheSlug(id))
+	if errors.Is(err, beehive.ErrNotFound) {
+		return store.CacheRef{}, false, nil
+	}
+	if err != nil {
+		return store.CacheRef{}, false, err
+	}
+	return newCacheRef(beehive.ObjectID(id), cacheObj.ID), true, nil
 }

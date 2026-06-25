@@ -20,7 +20,6 @@ import (
 	"sync"
 
 	"github.com/amorey/beehive"
-	"github.com/google/uuid"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
@@ -28,9 +27,11 @@ import (
 
 // KubeconfigImporter watches the kubeconfig and is the sole creator of
 // kubeconfig-sourced Cluster beehive objects (one Cluster per kube-context). Its
-// only job is creation: on each snapshot it creates a Cluster (minting a random
-// UUID) for every context that no Cluster yet references, writing only the source
-// *reference* (ClusterSpec.Source). It never updates, orphans, or deletes.
+// only job is creation: on each snapshot it creates a Cluster — keyed by the
+// deterministic slug "kubeconfig/{context}" — for every context that no Cluster
+// yet references, writing only the source *reference* (ClusterSpec.Source). It
+// never updates, orphans, or deletes. The deterministic slug means beehive's
+// per-kind slug-uniqueness rules out a duplicate even under a concurrent create.
 //
 // Everything observed about the context — the cluster/user entry names, whether
 // it is still present, whether it is the current-context — is written to
@@ -143,15 +144,15 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 	return nil
 }
 
-// createCluster mints a new kubeconfig-sourced Cluster with a random UUID slug,
-// writing only the source reference. The UUID is deliberately independent of the
-// remote cluster's UID (unknown until the first probe).
+// createCluster creates a kubeconfig-sourced Cluster keyed by the deterministic
+// slug "kubeconfig/{context}", writing only the source reference. The slug is the
+// context's natural key (the importer's reconcile/uniqueness key); the record's
+// identity is the ObjectID beehive assigns, not this slug.
 func (im *KubeconfigImporter) createCluster(ctx context.Context, contextName string) error {
-	id := ClusterID(uuid.NewString())
 	_, err := im.coreClient.Create(ctx, ClusterSpec{
 		SyncEnabled: true,
 		Enabled:     true,
 		Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: contextName}},
-	}, beehive.WithSlug(ClusterSlug(id)))
+	}, beehive.WithSlug(kubeconfigSlug(contextName)))
 	return err
 }

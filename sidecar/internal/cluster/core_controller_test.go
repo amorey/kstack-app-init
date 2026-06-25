@@ -183,10 +183,9 @@ func TestClusterCoreControllerSuccessfulProbeWritesConditions(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	id := cluster.ClusterID("test-uid")
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"),
-		beehive.WithSlug(cluster.ClusterSlug(id)))
+	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
+	id := cluster.ClusterID(obj.ID)
 
 	got := waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 	require.NotNil(t, got.Status)
@@ -214,8 +213,7 @@ func TestClusterCoreControllerProbeFailureSetsConnectedFalse(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"),
-		beehive.WithSlug(cluster.ClusterSlug("probe-fail-id")))
+	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
 
 	got := waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
@@ -237,8 +235,7 @@ func TestClusterCoreControllerIneligibleClusterDoesNotProbe(t *testing.T) {
 	// Enabled=false → ineligible.
 	spec := eligibleSpec("alpha")
 	spec.Enabled = false
-	obj, err := coreClient.Create(ctx, spec,
-		beehive.WithSlug(cluster.ClusterSlug("inactive-id")))
+	obj, err := coreClient.Create(ctx, spec)
 	require.NoError(t, err)
 
 	got := waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
@@ -264,10 +261,9 @@ func TestClusterCoreControllerSuccessfulProbePopulatesConnectionManager(t *testi
 		connMgr,
 	)
 
-	id := cluster.ClusterID("conn-mgr-set-id")
-	obj, err := coreClient.Create(context.Background(), eligibleSpec("alpha"),
-		beehive.WithSlug(cluster.ClusterSlug(id)))
+	obj, err := coreClient.Create(context.Background(), eligibleSpec("alpha"))
 	require.NoError(t, err)
+	id := cluster.ClusterID(obj.ID)
 
 	waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 
@@ -279,19 +275,17 @@ func TestClusterCoreControllerProbeFailureDeletesFromConnectionManager(t *testin
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
 	connMgr := cluster.NewConnectionManager()
 
-	id := cluster.ClusterID("conn-mgr-del-id")
-	// Pre-seed a stale entry so we can confirm it gets cleared.
-	connMgr.Set(id, &rest.Config{Host: "https://stale"})
-
 	coreClient, _ := newClusterTestBeehive(t, w,
 		errProbe(errors.New("dial failed")),
 		staticCheck(cluster.HealthPhaseHealthy),
 		connMgr,
 	)
 
-	obj, err := coreClient.Create(context.Background(), eligibleSpec("alpha"),
-		beehive.WithSlug(cluster.ClusterSlug(id)))
+	obj, err := coreClient.Create(context.Background(), eligibleSpec("alpha"))
 	require.NoError(t, err)
+	id := cluster.ClusterID(obj.ID)
+	// Pre-seed a stale entry so we can confirm it gets cleared.
+	connMgr.Set(id, &rest.Config{Host: "https://stale"})
 
 	waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 
@@ -303,9 +297,6 @@ func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.
 	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
 	connMgr := cluster.NewConnectionManager()
 
-	id := cluster.ClusterID("conn-mgr-ineligible-id")
-	connMgr.Set(id, &rest.Config{Host: "https://stale"})
-
 	coreClient, _ := newClusterTestBeehive(t, w,
 		staticProbe(cluster.ClusterServer{}, cluster.ClusterPrincipal{}),
 		staticCheck(cluster.HealthPhaseHealthy),
@@ -314,9 +305,10 @@ func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.
 
 	spec := eligibleSpec("alpha")
 	spec.Enabled = false
-	obj, err := coreClient.Create(context.Background(), spec,
-		beehive.WithSlug(cluster.ClusterSlug(id)))
+	obj, err := coreClient.Create(context.Background(), spec)
 	require.NoError(t, err)
+	id := cluster.ClusterID(obj.ID)
+	connMgr.Set(id, &rest.Config{Host: "https://stale"})
 
 	waitCondition(t, coreClient, obj.ID, cluster.ClusterConditionConnected)
 
@@ -360,8 +352,7 @@ func TestClusterCoreControllerPokeReprobes(t *testing.T) {
 	ctrl.StartBackground()
 	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
 
-	id := cluster.ClusterID("reprobe-uuid")
-	_, err = coreClient.Create(ctx, eligibleSpec("alpha"), beehive.WithSlug(cluster.ClusterSlug(id)))
+	_, err = coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
 
 	// The initial scheduled reconcile probes once (then requeues ~30s out).
@@ -398,9 +389,9 @@ func TestClusterCoreControllerReprobeOne(t *testing.T) {
 	ctrl.StartBackground()
 	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
 
-	id := cluster.ClusterID("retry-uuid")
-	_, err = coreClient.Create(ctx, eligibleSpec("alpha"), beehive.WithSlug(cluster.ClusterSlug(id)))
+	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
+	id := cluster.ClusterID(obj.ID)
 
 	// The initial scheduled reconcile probes once (then requeues ~30s out).
 	awaitProbe(t, probeCh)
@@ -436,8 +427,7 @@ func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
 	ctrl.StartBackground()
 	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
 
-	id := cluster.ClusterID("observe-uuid")
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"), beehive.WithSlug(cluster.ClusterSlug(id)))
+	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
 
 	// Present: the observation is written to status from the kubeconfig.

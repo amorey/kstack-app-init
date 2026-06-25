@@ -39,6 +39,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,22 +56,37 @@ var migrationsFS embed.FS
 // three.
 var dbSuffixes = []string{"", "-wal", "-shm"}
 
-// clusterDBPath is the on-disk path of a cluster's main SQLite file. The
-// sidecars live at this path + each dbSuffixes entry.
-func clusterDBPath(dataDir, clusterID string) string {
-	return filepath.Join(dataDir, "clusters", clusterID+".db")
+// CacheRef identifies one on-disk cache incarnation by the beehive ObjectIDs of
+// the parent Cluster (ClusterID — the directory) and its ClusterCache child
+// (CacheID — the file). Both are beehive AUTOINCREMENT ids (int64), so they are
+// inherently path-safe (digits only) and never reused: a ClusterCache
+// delete+recreate yields a strictly-greater CacheID and thus a fresh file, with
+// no finalize-vs-recreate race. The fields are int64 (not beehive.ObjectID) to
+// keep this leaf package free of a beehive import; the cluster package converts
+// at the call boundary.
+type CacheRef struct {
+	ClusterID int64
+	CacheID   int64
 }
 
-// validClusterID guards every cluster ID that becomes a filesystem path. A
-// ClusterID is a registry-minted UUID, so it never contains a path separator
-// or "..". Rejecting those keeps a hostile/buggy ID (e.g. "../../foo" from a
-// GraphQL mutation) from escaping the clusters dir in clusterDBPath — without
-// it DeleteCacheFiles could remove "foo.db" anywhere on disk.
-func validClusterID(id string) bool {
-	if id == "" || strings.Contains(id, "..") || strings.ContainsAny(id, `/\`) {
-		return false
-	}
-	return filepath.Base(id) == id
+func (r CacheRef) valid() bool { return r.ClusterID > 0 && r.CacheID > 0 }
+
+func (r CacheRef) label() string {
+	return strconv.FormatInt(r.ClusterID, 10) + "/" + strconv.FormatInt(r.CacheID, 10)
+}
+
+// clusterDir is the per-cluster directory holding one cluster's cache
+// incarnations: <dataDir>/clusters/<ClusterID>/.
+func clusterDir(dataDir string, ref CacheRef) string {
+	return filepath.Join(dataDir, "clusters", strconv.FormatInt(ref.ClusterID, 10))
+}
+
+// clusterDBPath is the on-disk path of a cache incarnation's main SQLite file,
+// <dataDir>/clusters/<ClusterID>/<CacheID>.db. The sidecars live at this path +
+// each dbSuffixes entry. Both segments are AUTOINCREMENT ids, so the path can
+// never escape the clusters dir — there is no string hygiene to do.
+func clusterDBPath(dataDir string, ref CacheRef) string {
+	return filepath.Join(clusterDir(dataDir, ref), strconv.FormatInt(ref.CacheID, 10)+".db")
 }
 
 // readerPoolSize caps concurrent SQLite read connections per cluster.
@@ -79,12 +95,14 @@ func validClusterID(id string) bool {
 // GraphQL resolvers running without serializing.
 const readerPoolSize = 4
 
-// Manager owns one ClusterDB per cluster ID. Safe for concurrent use.
+// Manager owns one ClusterDB per open cache incarnation, keyed by CacheID (the
+// ClusterCache ObjectID — the precise incarnation; one is live per cluster at a
+// time). Safe for concurrent use.
 type Manager struct {
 	dataDir string
 
 	mu    sync.RWMutex
-	dbs   map[string]*ClusterDB
+	dbs   map[int64]*ClusterDB
 	close bool
 }
 
@@ -93,7 +111,7 @@ type Manager struct {
 func NewManager(dataDir string) *Manager {
 	return &Manager{
 		dataDir: dataDir,
-		dbs:     make(map[string]*ClusterDB),
+		dbs:     make(map[int64]*ClusterDB),
 	}
 }
 
@@ -101,9 +119,9 @@ func NewManager(dataDir string) *Manager {
 // migrating the on-disk SQLite file on first call (and starting its
 // janitor). Subsequent calls return the same handle. After Shutdown the
 // Manager refuses new opens.
-func (m *Manager) Open(ctx context.Context, clusterID string) (*ClusterDB, error) {
-	if !validClusterID(clusterID) {
-		return nil, fmt.Errorf("invalid cluster id %q", clusterID)
+func (m *Manager) Open(ctx context.Context, ref CacheRef) (*ClusterDB, error) {
+	if !ref.valid() {
+		return nil, fmt.Errorf("invalid cache ref %+v", ref)
 	}
 
 	m.mu.RLock()
@@ -111,7 +129,7 @@ func (m *Manager) Open(ctx context.Context, clusterID string) (*ClusterDB, error
 		m.mu.RUnlock()
 		return nil, errors.New("cache is shut down")
 	}
-	if cdb, ok := m.dbs[clusterID]; ok {
+	if cdb, ok := m.dbs[ref.CacheID]; ok {
 		m.mu.RUnlock()
 		return cdb, nil
 	}
@@ -122,36 +140,36 @@ func (m *Manager) Open(ctx context.Context, clusterID string) (*ClusterDB, error
 	if m.close {
 		return nil, errors.New("cache is shut down")
 	}
-	if cdb, ok := m.dbs[clusterID]; ok {
+	if cdb, ok := m.dbs[ref.CacheID]; ok {
 		return cdb, nil
 	}
 
-	cdb, err := openClusterDB(ctx, m.dataDir, clusterID)
+	cdb, err := openClusterDB(ctx, m.dataDir, ref)
 	if err != nil {
 		return nil, err
 	}
 	cdb.startJanitor()
-	m.dbs[clusterID] = cdb
+	m.dbs[ref.CacheID] = cdb
 	return cdb, nil
 }
 
-// Lookup returns the ClusterDB for id if it is currently open, or nil.
-// Unlike Open it never creates or starts anything, so reader paths use it
+// Lookup returns the ClusterDB for the given CacheID if it is currently open, or
+// nil. Unlike Open it never creates or starts anything, so reader paths use it
 // to reach an already-open handle.
-func (m *Manager) Lookup(id string) *ClusterDB {
+func (m *Manager) Lookup(cacheID int64) *ClusterDB {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.dbs[id]
+	return m.dbs[cacheID]
 }
 
 // CacheBytes returns the total on-disk size of a cluster's cache (main DB plus
 // -wal/-shm sidecars) and whether any cache file exists. Cheap stat-only; works
 // whether or not the cluster is currently open.
-func (m *Manager) CacheBytes(clusterID string) (int64, bool) {
-	if !validClusterID(clusterID) {
+func (m *Manager) CacheBytes(ref CacheRef) (int64, bool) {
+	if !ref.valid() {
 		return 0, false
 	}
-	path := clusterDBPath(m.dataDir, clusterID)
+	path := clusterDBPath(m.dataDir, ref)
 	var (
 		total int64
 		found bool
@@ -170,28 +188,32 @@ func (m *Manager) CacheBytes(clusterID string) (int64, bool) {
 // DeleteCacheFiles closes the cluster (releasing the file handles — required on
 // Windows) and removes its cache files (main DB + sidecars). Safe for an
 // unknown/closed cluster. A later Open recreates a fresh, empty cache.
-func (m *Manager) DeleteCacheFiles(ctx context.Context, clusterID string) error {
-	if !validClusterID(clusterID) {
-		return fmt.Errorf("invalid cluster id %q", clusterID)
+func (m *Manager) DeleteCacheFiles(ctx context.Context, ref CacheRef) error {
+	if !ref.valid() {
+		return fmt.Errorf("invalid cache ref %+v", ref)
 	}
-	if err := m.Close(ctx, clusterID); err != nil {
+	if err := m.Close(ctx, ref.CacheID); err != nil {
 		return err
 	}
-	path := clusterDBPath(m.dataDir, clusterID)
+	path := clusterDBPath(m.dataDir, ref)
 	for _, suffix := range dbSuffixes {
 		if err := os.Remove(path + suffix); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("delete %s: %w", path+suffix, err)
 		}
 	}
+	// Reap the now-(maybe-)empty per-cluster directory. os.Remove only succeeds
+	// on an empty dir, so a directory still holding another incarnation's file is
+	// left intact; "not empty"/"not exist" are both expected and ignored.
+	_ = os.Remove(clusterDir(m.dataDir, ref))
 	return nil
 }
 
-// Close shuts down a single cluster's DB and janitor goroutine. Safe to call
-// for an unknown ID (returns nil).
-func (m *Manager) Close(ctx context.Context, clusterID string) error {
+// Close shuts down a single cache incarnation's DB and janitor goroutine,
+// addressed by CacheID. Safe to call for an unknown id (returns nil).
+func (m *Manager) Close(ctx context.Context, cacheID int64) error {
 	m.mu.Lock()
-	cdb, ok := m.dbs[clusterID]
-	delete(m.dbs, clusterID)
+	cdb, ok := m.dbs[cacheID]
+	delete(m.dbs, cacheID)
 	m.mu.Unlock()
 	if !ok {
 		return nil
@@ -210,7 +232,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	var firstErr error
 	for id, cdb := range dbs {
 		if err := cdb.shutdown(ctx); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("close %s: %w", id, err)
+			firstErr = fmt.Errorf("close cache %d: %w", id, err)
 		}
 	}
 	return firstErr
@@ -243,7 +265,8 @@ func (c *ClusterDB) Reader() *sql.DB { return c.readDB }
 // `BEGIN IMMEDIATE; ... COMMIT;` for a single fsync per batch.
 func (c *ClusterDB) Writer() *sql.DB { return c.writeDB }
 
-// ID returns the cluster ID this DB is bound to.
+// ID returns a human-readable label for the cache incarnation this DB is bound
+// to ("<ClusterID>/<CacheID>"), used in log lines.
 func (c *ClusterDB) ID() string { return c.id }
 
 // Path returns the on-disk SQLite file path. Exposed for diagnostics.
@@ -330,12 +353,12 @@ func millisPtr(ni sql.NullInt64) *time.Time {
 	return &t
 }
 
-func openClusterDB(ctx context.Context, dataDir, clusterID string) (*ClusterDB, error) {
-	clusterDir := filepath.Join(dataDir, "clusters")
-	if err := os.MkdirAll(clusterDir, 0o700); err != nil {
-		return nil, fmt.Errorf("mkdir %s: %w", clusterDir, err)
+func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterDB, error) {
+	dir := clusterDir(dataDir, ref)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	dbPath := clusterDBPath(dataDir, clusterID)
+	dbPath := clusterDBPath(dataDir, ref)
 
 	writeDB, err := openPool(dbPath, true)
 	if err != nil {
@@ -347,7 +370,7 @@ func openClusterDB(ctx context.Context, dataDir, clusterID string) (*ClusterDB, 
 		if quarantineErr := quarantineCorrupt(dbPath); quarantineErr != nil {
 			return nil, fmt.Errorf("integrity check failed (%v) and quarantine failed: %w", err, quarantineErr)
 		}
-		slog.Warn("clustercache: quarantined corrupt db", "id", clusterID, "err", err)
+		slog.Warn("clustercache: quarantined corrupt db", "id", ref.label(), "err", err)
 		writeDB, err = openPool(dbPath, true)
 		if err != nil {
 			return nil, fmt.Errorf("reopen after quarantine: %w", err)
@@ -388,7 +411,7 @@ func openClusterDB(ctx context.Context, dataDir, clusterID string) (*ClusterDB, 
 	}
 
 	return &ClusterDB{
-		id:      clusterID,
+		id:      ref.label(),
 		path:    dbPath,
 		writeDB: writeDB,
 		readDB:  readDB,

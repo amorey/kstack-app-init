@@ -26,13 +26,13 @@ import (
 
 func TestConnectionManagerGetMissReturnsNil(t *testing.T) {
 	cm := cluster.NewConnectionManager()
-	got := cm.Get(cluster.ClusterID("unknown"))
+	got := cm.Get(cluster.ClusterID(999999))
 	assert.Nil(t, got)
 }
 
 func TestConnectionManagerSetThenGet(t *testing.T) {
 	cm := cluster.NewConnectionManager()
-	id := cluster.ClusterID("abc")
+	id := cluster.ClusterID(1)
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
 
 	cm.Set(id, cfg)
@@ -43,7 +43,7 @@ func TestConnectionManagerSetThenGet(t *testing.T) {
 
 func TestConnectionManagerDeleteRemovesEntry(t *testing.T) {
 	cm := cluster.NewConnectionManager()
-	id := cluster.ClusterID("abc")
+	id := cluster.ClusterID(1)
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
 
 	cm.Set(id, cfg)
@@ -56,12 +56,12 @@ func TestConnectionManagerDeleteRemovesEntry(t *testing.T) {
 func TestConnectionManagerDeleteMissingIsNoop(t *testing.T) {
 	cm := cluster.NewConnectionManager()
 	// Should not panic.
-	cm.Delete(cluster.ClusterID("nonexistent"))
+	cm.Delete(cluster.ClusterID(999999))
 }
 
 func TestConnectionManagerSetOverwrites(t *testing.T) {
 	cm := cluster.NewConnectionManager()
-	id := cluster.ClusterID("abc")
+	id := cluster.ClusterID(1)
 	first := &rest.Config{Host: "https://first:6443"}
 	second := &rest.Config{Host: "https://second:6443"}
 
@@ -78,7 +78,7 @@ func TestConnectionManagerConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(n * 3)
 	for i := range n {
-		id := cluster.ClusterID("id")
+		id := cluster.ClusterID(1)
 		cfg := &rest.Config{Host: "https://host"}
 		go func() { defer wg.Done(); cm.Set(id, cfg) }()
 		go func() { defer wg.Done(); cm.Get(id) }()

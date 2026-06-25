@@ -14,9 +14,12 @@ const config: CodegenConfig = {
       preset: 'client',
       config: {
         useTypeImports: true,
-        // The sidecar's Time scalar is an ISO-8601 UTC string on the wire.
+        // Custom scalars and their TS wire types. Time is an ISO-8601 UTC
+        // string; ClusterID is an opaque decimal-string id (an int64 server-side,
+        // a string on the wire) — the webview treats it as an opaque string.
         scalars: {
           Time: 'string',
+          ClusterID: 'string',
         },
       },
     },

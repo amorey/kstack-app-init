@@ -72,41 +72,41 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterCac
 	}, cacheCC
 }
 
-// seedCluster creates a Cluster (as the importer would) and returns its
-// ClusterID.
-func seedCluster(t *testing.T, s *Service, ctxName string, id ClusterID) ClusterID {
+// seedCluster creates a Cluster (as the importer would, with the kubeconfig
+// slug) and returns its ClusterID — the beehive ObjectID beehive assigned.
+func seedCluster(t *testing.T, s *Service, ctxName string) ClusterID {
 	t.Helper()
 	ctx := context.Background()
 	name := ctxName
-	_, err := s.coreClient.Create(ctx, ClusterSpec{
+	obj, err := s.coreClient.Create(ctx, ClusterSpec{
 		Name:        &name,
 		SyncEnabled: true,
 		Enabled:     true,
 		Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: ctxName}},
-	}, beehive.WithSlug(ClusterSlug(id)))
+	}, beehive.WithSlug(kubeconfigSlug(ctxName)))
 	require.NoError(t, err)
-	return id
+	return ClusterID(obj.ID)
 }
 
 func TestServiceListAndGet(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
-	seedCluster(t, s, "alpha", "id-alpha")
-	seedCluster(t, s, "beta", "id-beta")
+	idAlpha := seedCluster(t, s, "alpha")
+	seedCluster(t, s, "beta")
 
 	list, err := s.List(ctx)
 	require.NoError(t, err)
 	assert.Len(t, list, 2)
 
-	c, err := s.Get(ctx, "id-alpha")
+	c, err := s.Get(ctx, idAlpha)
 	require.NoError(t, err)
 	require.NotNil(t, c)
-	assert.Equal(t, ClusterID("id-alpha"), c.ID)
+	assert.Equal(t, idAlpha, c.ID)
 	require.NotNil(t, c.Spec.Name)
 	assert.Equal(t, "alpha", *c.Spec.Name)
 
 	// Unknown id is (nil, nil), not an error.
-	missing, err := s.Get(ctx, "nope")
+	missing, err := s.Get(ctx, ClusterID(999999))
 	require.NoError(t, err)
 	assert.Nil(t, missing)
 }
@@ -114,7 +114,7 @@ func TestServiceListAndGet(t *testing.T) {
 func TestServiceGetJoinsSyncStatus(t *testing.T) {
 	ctx := context.Background()
 	s, cacheCtl := newServiceTest(t)
-	id := seedCluster(t, s, "alpha", "id-alpha")
+	id := seedCluster(t, s, "alpha")
 
 	now := time.Now().UTC()
 	_, err := s.cacheClient.Create(ctx, ClusterCacheSpec{}, beehive.WithSlug(ClusterCacheSlug(id)))
@@ -136,9 +136,9 @@ func TestServiceGetJoinsSyncStatus(t *testing.T) {
 func TestServiceGetDeletionPendingIsNil(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
-	id := seedCluster(t, s, "alpha", "id-alpha")
+	id := seedCluster(t, s, "alpha")
 
-	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
 	require.NoError(t, err)
 	require.NoError(t, s.coreClient.Delete(ctx, obj.ID))
 
@@ -150,14 +150,14 @@ func TestServiceGetDeletionPendingIsNil(t *testing.T) {
 func TestServiceSetEnabled(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
-	id := seedCluster(t, s, "alpha", "id-alpha")
+	id := seedCluster(t, s, "alpha")
 
 	c, err := s.SetEnabled(ctx, id, false)
 	require.NoError(t, err)
 	require.NotNil(t, c)
 	assert.False(t, c.Spec.Enabled)
 
-	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
 	require.NoError(t, err)
 	assert.False(t, obj.Spec.Enabled)
 }
@@ -165,14 +165,14 @@ func TestServiceSetEnabled(t *testing.T) {
 func TestServiceSetSyncEnabled(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
-	id := seedCluster(t, s, "alpha", "id-alpha")
+	id := seedCluster(t, s, "alpha")
 
 	c, err := s.SetSyncEnabled(ctx, id, false)
 	require.NoError(t, err)
 	require.NotNil(t, c)
 	assert.False(t, c.Spec.SyncEnabled)
 
-	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
 	require.NoError(t, err)
 	assert.False(t, obj.Spec.SyncEnabled)
 }
@@ -184,26 +184,26 @@ func TestServiceSetSyncEnabled(t *testing.T) {
 func TestServiceRetryConnectionDoesNotMutateSpec(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
-	id := seedCluster(t, s, "alpha", "id-alpha")
+	id := seedCluster(t, s, "alpha")
 
-	before, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	before, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
 	require.NoError(t, err)
 
 	require.NoError(t, s.RetryConnection(ctx, id))
 
-	after, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	after, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
 	require.NoError(t, err)
 	assert.Equal(t, before.Generation, after.Generation, "RetryConnection must not write the spec")
 	assert.Equal(t, before.Spec, after.Spec)
 
 	// An unknown id is still ErrNotFound.
-	assert.ErrorIs(t, s.RetryConnection(ctx, "nope"), ErrNotFound)
+	assert.ErrorIs(t, s.RetryConnection(ctx, ClusterID(999999)), ErrNotFound)
 }
 
 func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
-	id := seedCluster(t, s, "alpha", "id-alpha")
+	id := seedCluster(t, s, "alpha")
 
 	// cacheCtrl is nil in this white-box harness, so ClearCache deletes the
 	// on-disk cache (a no-op here — none exists) and returns the record without
@@ -219,6 +219,32 @@ func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	assert.False(t, stats.Exists)
 }
 
+// cacheRef resolves the on-disk locator in one lookup: the directory id is the
+// ClusterID itself (the parent Cluster's beehive ObjectID), and only the
+// ClusterCache child (the file id) is fetched, by its slug. A cluster with no
+// ClusterCache child resolves to found=false (no error).
+func TestServiceCacheRefResolvesObjectIDs(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	cacheObj, err := s.cacheClient.Create(ctx, ClusterCacheSpec{},
+		beehive.WithSlug(ClusterCacheSlug(id)), beehive.WithOwner(beehive.ObjectID(id)))
+	require.NoError(t, err)
+
+	ref, found, err := s.cacheRef(ctx, id)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, store.CacheRef{ClusterID: int64(id), CacheID: int64(cacheObj.ID)}, ref,
+		"ref must be the parent Cluster + ClusterCache ObjectIDs")
+
+	// A cluster with no ClusterCache child: no cache files, no error.
+	id2 := seedCluster(t, s, "beta")
+	_, found2, err := s.cacheRef(ctx, id2)
+	require.NoError(t, err)
+	assert.False(t, found2)
+}
+
 func TestServiceDeleteTombstonesCluster(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newServiceTest(t)
@@ -227,30 +253,30 @@ func TestServiceDeleteTombstonesCluster(t *testing.T) {
 	// race: beehive GC is a no-op while an object still holds a finalizer, so the
 	// deletion-pending row lingers deterministically. Without it, the kind's (noop)
 	// controller collects the finalizer-less, referrer-less row on the reconcile
-	// pass that Delete enqueues — and that physical delete races the GetBySlug
+	// pass that Delete enqueues — and that physical delete races the Get
 	// below (passing locally, "object not found" under CI timing).
-	id := ClusterID("id-alpha")
 	name := "alpha"
-	_, err := s.coreClient.Create(ctx, ClusterSpec{
+	obj, err := s.coreClient.Create(ctx, ClusterSpec{
 		Name:        &name,
 		SyncEnabled: true,
 		Enabled:     true,
 		Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: "alpha"}},
-	}, beehive.WithSlug(ClusterSlug(id)), beehive.WithFinalizers("test/hold"))
+	}, beehive.WithSlug(kubeconfigSlug("alpha")), beehive.WithFinalizers("test/hold"))
 	require.NoError(t, err)
+	id := ClusterID(obj.ID)
 
 	require.NoError(t, s.Delete(ctx, id))
 
 	// Delete tombstones the Cluster (soft delete); beehive GC then cascades to its
 	// ClusterCache once the finalizers clear.
-	obj, err := s.coreClient.GetBySlug(ctx, ClusterSlug(id))
+	obj, err = s.coreClient.Get(ctx, beehive.ObjectID(id))
 	require.NoError(t, err)
 	assert.NotNil(t, obj.DeletionRequestedAt)
 }
 
 func TestServiceGetConnection(t *testing.T) {
 	s, _ := newServiceTest(t)
-	id := ClusterID("abc")
+	id := ClusterID(1)
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
 
 	// Nothing stored yet.
@@ -265,7 +291,7 @@ func TestServiceWatchEmitsSeedThenReemits(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s, _ := newServiceTest(t)
-	id := seedCluster(t, s, "alpha", "id-alpha")
+	id := seedCluster(t, s, "alpha")
 
 	ch, err := s.Watch(ctx)
 	require.NoError(t, err)

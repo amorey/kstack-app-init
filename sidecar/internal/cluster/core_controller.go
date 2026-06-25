@@ -272,7 +272,7 @@ func (c *ClusterCoreController) reconcileAll(baseCtx context.Context) {
 // (Service.RetryConnection). An unknown id is a no-op (it may have been deleted
 // between the mutation and the worker draining the bus).
 func (c *ClusterCoreController) reprobeOne(baseCtx context.Context, id ClusterID) {
-	obj, err := c.coreClient.GetBySlug(baseCtx, ClusterSlug(id))
+	obj, err := c.coreClient.Get(baseCtx, beehive.ObjectID(id))
 	if err != nil {
 		if !errors.Is(err, beehive.ErrNotFound) && baseCtx.Err() == nil {
 			slog.Warn("clustercontroller: retry get cluster", "cluster", id, "err", err)
@@ -307,7 +307,7 @@ func (c *ClusterCoreController) Reconcile(ctx context.Context, client beehive.Co
 	// the (possibly stale) snapshot it was handed. Out-of-band and scheduled
 	// reconciles both serialize here; status writes have no resourceVersion guard,
 	// so a stale snapshot would otherwise clobber a newer source observation.
-	if fresh, err := c.coreClient.GetBySlug(ctx, ClusterSlug(clusterIDFromObj(obj))); err == nil {
+	if fresh, err := c.coreClient.Get(ctx, obj.ID); err == nil {
 		obj = fresh
 	} else if errors.Is(err, beehive.ErrNotFound) {
 		return beehive.Result{}, nil
@@ -490,12 +490,10 @@ func (c *ClusterCoreController) ensureClusterCache(ctx context.Context, clusterI
 	return nil
 }
 
-// clusterIDFromObj extracts the ClusterID UUID from the Cluster object's slug.
+// clusterIDFromObj returns the ClusterID of a Cluster object: its beehive
+// ObjectID.
 func clusterIDFromObj(obj *beehive.Object[ClusterSpec, ClusterStatus]) ClusterID {
-	if obj.Slug == nil {
-		return ""
-	}
-	return ClusterIDFromSlug(*obj.Slug)
+	return ClusterID(obj.ID)
 }
 
 // healthCondition maps one health-probe outcome onto the Healthy condition.

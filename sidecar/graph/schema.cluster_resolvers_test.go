@@ -22,9 +22,10 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 )
 
-// clusterFixture bundles all data for one test cluster record.
+// clusterFixture bundles all data for one test cluster record. id is the beehive
+// ObjectID; on the wire it is its decimal string ("1", "2", …).
 type clusterFixture struct {
-	id          string
+	id          cluster.ClusterID
 	spec        cluster.ClusterSpec
 	connStatus  cluster.ClusterStatus
 	cacheStatus cluster.ClusterCacheStatus
@@ -45,7 +46,7 @@ var _ cluster.ClusterService = (*fakeClusterService)(nil)
 func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 	f := &fakeClusterService{clusters: map[cluster.ClusterID]*cluster.Cluster{}}
 	for _, fx := range fixtures {
-		id := cluster.ClusterID(fx.id)
+		id := fx.id
 		f.order = append(f.order, id)
 		f.clusters[id] = &cluster.Cluster{
 			ID:     id,
@@ -155,8 +156,8 @@ func (f *fakeClusterService) Delete(_ context.Context, id cluster.ClusterID) err
 
 func (f *fakeClusterService) GetConnection(cluster.ClusterID) *rest.Config { return nil }
 
-// clusterFixtures returns two records: one fully-probed/present (cl-1) and
-// one never-probed/orphaned (cl-2), so nullable fields exercise both arms.
+// clusterFixtures returns two records: one fully-probed/present (1) and
+// one never-probed/orphaned (2), so nullable fields exercise both arms.
 func clusterFixtures() []clusterFixture {
 	prodName := "Production"
 	uid1 := "uid-1"
@@ -164,7 +165,7 @@ func clusterFixtures() []clusterFixture {
 	admin := "system:admin"
 	return []clusterFixture{
 		{
-			id: "cl-1",
+			id: 1,
 			spec: cluster.ClusterSpec{
 				Name:        &prodName,
 				SyncEnabled: true,
@@ -181,7 +182,7 @@ func clusterFixtures() []clusterFixture {
 			},
 		},
 		{
-			id: "cl-2",
+			id: 2,
 			spec: cluster.ClusterSpec{
 				Source: cluster.ClusterSpecSource{Kubeconfig: &cluster.ClusterSpecSourceKubeconfig{Context: "staging"}},
 			},
@@ -286,15 +287,15 @@ func TestClustersQuery(t *testing.T) {
 
 // The cluster query returns the record for a tracked id.
 func TestClusterQueryByID(t *testing.T) {
-	data := clustersQueryData(t, `{ cluster(id: "cl-2") {
+	data := clustersQueryData(t, `{ cluster(id: 2) {
 		id
 		spec { source { kubeconfig { context } } }
 		status { source { kubeconfig { isPresent } } }
 	} }`)
 
 	cl, ok := data["cluster"].(map[string]any)
-	if !ok || cl["id"] != "cl-2" {
-		t.Fatalf("want cluster cl-2, got: %v", data["cluster"])
+	if !ok || cl["id"] != "2" {
+		t.Fatalf("want cluster 2, got: %v", data["cluster"])
 	}
 	spec := cl["spec"].(map[string]any)
 	if kcSrc := spec["source"].(map[string]any)["kubeconfig"].(map[string]any); kcSrc["context"] != "staging" {
@@ -307,7 +308,7 @@ func TestClusterQueryByID(t *testing.T) {
 
 // An untracked id resolves to null, not a GraphQL error.
 func TestClusterQueryNotFound(t *testing.T) {
-	data := clustersQueryData(t, `{ cluster(id: "nope") { id } }`)
+	data := clustersQueryData(t, `{ cluster(id: "999") { id } }`)
 	if data["cluster"] != nil {
 		t.Fatalf("want null cluster, got: %v", data["cluster"])
 	}
@@ -327,7 +328,7 @@ func TestClustersWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
 	if ev.event != "next" {
 		t.Fatalf("want first event=next, got %q", ev.event)
 	}
-	if !strings.Contains(ev.data, `"id":"cl-1"`) || !strings.Contains(ev.data, `"id":"cl-2"`) {
+	if !strings.Contains(ev.data, `"id":"1"`) || !strings.Contains(ev.data, `"id":"2"`) {
 		t.Fatalf("snapshot frame should carry both clusters, got: %s", ev.data)
 	}
 
@@ -354,12 +355,12 @@ func TestClusterEnabledSetMutation(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	raw := string(postGQL(t, srv.URL,
-		`{"query":"mutation { clusterEnabledSet(id: \"cl-1\", enabled: false) { id spec { enabled } } }"}`))
+		`{"query":"mutation { clusterEnabledSet(id: \"1\", enabled: false) { id spec { enabled } } }"}`))
 	if !strings.Contains(raw, `"enabled":false`) || strings.Contains(raw, `"errors"`) {
 		t.Fatalf("mutation result: %s", raw)
 	}
 
-	raw = string(postGQL(t, srv.URL, `{"query":"{ cluster(id: \"cl-1\") { spec { enabled } } }"}`))
+	raw = string(postGQL(t, srv.URL, `{"query":"{ cluster(id: \"1\") { spec { enabled } } }"}`))
 	if !strings.Contains(raw, `"enabled":false`) {
 		t.Fatalf("change not visible to reads: %s", raw)
 	}
@@ -371,12 +372,12 @@ func TestClusterSyncEnabledSetMutation(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	raw := string(postGQL(t, srv.URL,
-		`{"query":"mutation { clusterSyncEnabledSet(id: \"cl-1\", syncEnabled: false) { id spec { syncEnabled } } }"}`))
+		`{"query":"mutation { clusterSyncEnabledSet(id: \"1\", syncEnabled: false) { id spec { syncEnabled } } }"}`))
 	if !strings.Contains(raw, `"syncEnabled":false`) || strings.Contains(raw, `"errors"`) {
 		t.Fatalf("mutation result: %s", raw)
 	}
 
-	raw = string(postGQL(t, srv.URL, `{"query":"{ cluster(id: \"cl-1\") { spec { syncEnabled } } }"}`))
+	raw = string(postGQL(t, srv.URL, `{"query":"{ cluster(id: \"1\") { spec { syncEnabled } } }"}`))
 	if !strings.Contains(raw, `"syncEnabled":false`) {
 		t.Fatalf("change not visible to reads: %s", raw)
 	}
@@ -387,17 +388,17 @@ func TestClusterSyncEnabledSetMutation(t *testing.T) {
 func TestClusterDeleteMutation(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
-	raw := string(postGQL(t, srv.URL, `{"query":"mutation { clusterDelete(id: \"cl-2\") }"}`))
+	raw := string(postGQL(t, srv.URL, `{"query":"mutation { clusterDelete(id: \"2\") }"}`))
 	if !strings.Contains(raw, `"clusterDelete":true`) {
 		t.Fatalf("delete result: %s", raw)
 	}
 
-	raw = string(postGQL(t, srv.URL, `{"query":"{ cluster(id: \"cl-2\") { id } }"}`))
+	raw = string(postGQL(t, srv.URL, `{"query":"{ cluster(id: \"2\") { id } }"}`))
 	if !strings.Contains(raw, `"cluster":null`) {
 		t.Fatalf("deleted cluster still readable: %s", raw)
 	}
 
-	raw = string(postGQL(t, srv.URL, `{"query":"mutation { clusterDelete(id: \"nope\") }"}`))
+	raw = string(postGQL(t, srv.URL, `{"query":"mutation { clusterDelete(id: \"999\") }"}`))
 	if !strings.Contains(raw, `"errors"`) {
 		t.Fatalf("want error for unknown id, got: %s", raw)
 	}
@@ -408,7 +409,7 @@ func TestClusterDeleteMutation(t *testing.T) {
 // arrays on the wire, never null) and the cache manager has no on-disk files
 // (exists=false, bytes=0, resources=[]).
 func TestClusterEphemeralFields(t *testing.T) {
-	data := clustersQueryData(t, `{ cluster(id: "cl-1") {
+	data := clustersQueryData(t, `{ cluster(id: 1) {
 		status { conditions { type status reason } }
 		cache {
 			status { conditions { type } lastSyncedAt }
@@ -458,7 +459,7 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 
 	srv := newTestServer(t, fixtures)
 
-	body, _ := json.Marshal(map[string]string{"query": `{ cluster(id: "cl-1") {
+	body, _ := json.Marshal(map[string]string{"query": `{ cluster(id: 1) {
 		status { conditions { type status reason message observedGeneration lastTransitionTime } }
 		cache {
 			status { conditions { type status reason } lastSyncedAt }
@@ -532,13 +533,13 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 func TestClusterCacheClearMutation(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
-	body, _ := json.Marshal(map[string]string{"query": `mutation { clusterCacheClear(id: "cl-1") { id } }`})
+	body, _ := json.Marshal(map[string]string{"query": `mutation { clusterCacheClear(id: 1) { id } }`})
 	raw := postGQL(t, srv.URL, string(body))
-	if !strings.Contains(string(raw), `"id":"cl-1"`) {
+	if !strings.Contains(string(raw), `"id":"1"`) {
 		t.Errorf("expected the cleared cluster back, got %s", raw)
 	}
 
-	body, _ = json.Marshal(map[string]string{"query": `mutation { clusterCacheClear(id: "nope") { id } }`})
+	body, _ = json.Marshal(map[string]string{"query": `mutation { clusterCacheClear(id: "999") { id } }`})
 	raw = postGQL(t, srv.URL, string(body))
 	if !strings.Contains(string(raw), "errors") {
 		t.Errorf("expected a GraphQL error for an unknown id, got %s", raw)

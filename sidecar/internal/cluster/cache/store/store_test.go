@@ -25,14 +25,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// ref builds a CacheRef from a parent-cluster and cache ObjectID. Most tests use
+// (1, 1); the values only have to be positive and distinct where a test opens
+// more than one incarnation.
+func ref(clusterID, cacheID int64) CacheRef {
+	return CacheRef{ClusterID: clusterID, CacheID: cacheID}
+}
+
 func TestOpenMigrateClose(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
 
-	cdb, err := r.Open(ctx, "cluster-a")
+	cdb, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
-	require.FileExists(t, filepath.Join(dir, "clusters", "cluster-a.db"))
+	require.FileExists(t, clusterDBPath(dir, ref(1, 1)))
 
 	var n int
 	require.NoError(t, cdb.Reader().QueryRowContext(ctx,
@@ -51,7 +58,7 @@ func TestAutoVacuumIsIncremental(t *testing.T) {
 	r := NewManager(dir)
 	ctx := context.Background()
 
-	cdb, err := r.Open(ctx, "cluster-a")
+	cdb, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
@@ -69,7 +76,7 @@ func TestStatusHistoryKeepsSameMillisecondTransitions(t *testing.T) {
 	r := NewManager(dir)
 	ctx := context.Background()
 
-	cdb, err := r.Open(ctx, "cluster-a")
+	cdb, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
@@ -88,23 +95,27 @@ func TestStatusHistoryKeepsSameMillisecondTransitions(t *testing.T) {
 	require.Equal(t, 2, n, "both same-millisecond transitions should persist")
 }
 
-// A cluster ID becomes a filesystem path, so DeleteCacheFiles (and Open) must
-// reject path-traversal values — otherwise "../foo" would delete foo.db
-// outside the clusters dir.
-func TestDeleteCacheFilesRejectsTraversal(t *testing.T) {
+// A CacheRef's segments are beehive AUTOINCREMENT ObjectIDs (int64 > 0), so the
+// on-disk path is digits only and can never escape the clusters dir — path
+// traversal is structurally impossible. The only invalid ref is a non-positive
+// id, which every disk-touching method must reject.
+func TestRejectsNonPositiveRef(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
 
-	// A sentinel sibling of the clusters dir that must survive a traversal attempt.
+	// A sentinel sibling of the clusters dir that must stay untouched.
 	sentinel := filepath.Join(dir, "foo.db")
 	require.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
 
-	require.Error(t, r.DeleteCacheFiles(ctx, "../foo"))
-	require.FileExists(t, sentinel, "file outside clusters dir must not be deleted")
-
-	_, err := r.Open(ctx, "../foo")
-	require.Error(t, err, "Open rejects a traversal id")
+	for _, bad := range []CacheRef{ref(0, 1), ref(1, 0), ref(-1, 1), {}} {
+		_, err := r.Open(ctx, bad)
+		require.Error(t, err, "Open rejects %+v", bad)
+		require.Error(t, r.DeleteCacheFiles(ctx, bad), "DeleteCacheFiles rejects %+v", bad)
+		_, exists := r.CacheBytes(bad)
+		require.False(t, exists, "CacheBytes rejects %+v", bad)
+	}
+	require.FileExists(t, sentinel, "no filesystem writes for an invalid ref")
 }
 
 func TestDeleteCacheFilesRemovesClosedCluster(t *testing.T) {
@@ -112,19 +123,20 @@ func TestDeleteCacheFilesRemovesClosedCluster(t *testing.T) {
 	r := NewManager(dir)
 	ctx := context.Background()
 
-	_, err := r.Open(ctx, "c")
+	_, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
-	path := filepath.Join(dir, "clusters", "c.db")
+	path := clusterDBPath(dir, ref(1, 1))
 	require.FileExists(t, path)
 
-	require.NoError(t, r.DeleteCacheFiles(ctx, "c"))
+	require.NoError(t, r.DeleteCacheFiles(ctx, ref(1, 1)))
 	require.NoFileExists(t, path)
-	require.Nil(t, r.Lookup("c"), "delete closes the open handle")
+	require.NoDirExists(t, clusterDir(dir, ref(1, 1)), "empty per-cluster dir is reaped")
+	require.Nil(t, r.Lookup(1), "delete closes the open handle")
 
 	// Bytes report gone; a repeat delete is a no-op.
-	_, exists := r.CacheBytes("c")
+	_, exists := r.CacheBytes(ref(1, 1))
 	require.False(t, exists)
-	require.NoError(t, r.DeleteCacheFiles(ctx, "c"))
+	require.NoError(t, r.DeleteCacheFiles(ctx, ref(1, 1)))
 	require.NoError(t, r.Shutdown(ctx))
 }
 
@@ -133,17 +145,17 @@ func TestCacheBytesWorksClosed(t *testing.T) {
 	ctx := context.Background()
 
 	r1 := NewManager(dir)
-	_, err := r1.Open(ctx, "c")
+	_, err := r1.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	require.NoError(t, r1.Shutdown(ctx))
 
 	r2 := NewManager(dir)
-	n, exists := r2.CacheBytes("c")
+	n, exists := r2.CacheBytes(ref(1, 1))
 	require.True(t, exists, "stat-only size works without opening")
 	require.Greater(t, n, int64(0))
 
-	_, exists = r2.CacheBytes("never-opened")
-	require.False(t, exists)
+	_, exists = r2.CacheBytes(ref(1, 2))
+	require.False(t, exists, "never-opened incarnation reports no cache")
 }
 
 func TestOpenIsIdempotent(t *testing.T) {
@@ -151,13 +163,13 @@ func TestOpenIsIdempotent(t *testing.T) {
 	r := NewManager(dir)
 	ctx := context.Background()
 
-	a, err := r.Open(ctx, "cluster-a")
+	a, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
-	b, err := r.Open(ctx, "cluster-a")
+	b, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	require.Same(t, a, b, "second Open should return the same handle")
-	require.Same(t, a, r.Lookup("cluster-a"))
-	require.Nil(t, r.Lookup("cluster-b"))
+	require.Same(t, a, r.Lookup(1))
+	require.Nil(t, r.Lookup(2))
 
 	require.NoError(t, r.Shutdown(ctx))
 }
@@ -167,7 +179,7 @@ func TestReopenRunsNoMigrations(t *testing.T) {
 	ctx := context.Background()
 
 	r1 := NewManager(dir)
-	cdb1, err := r1.Open(ctx, "c")
+	cdb1, err := r1.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	var firstCount int
 	require.NoError(t, cdb1.Reader().QueryRowContext(ctx,
@@ -175,7 +187,7 @@ func TestReopenRunsNoMigrations(t *testing.T) {
 	require.NoError(t, r1.Shutdown(ctx))
 
 	r2 := NewManager(dir)
-	cdb2, err := r2.Open(ctx, "c")
+	cdb2, err := r2.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	var secondCount int
 	require.NoError(t, cdb2.Reader().QueryRowContext(ctx,
@@ -188,7 +200,7 @@ func TestShutdownRefusesNewOpens(t *testing.T) {
 	r := NewManager(t.TempDir())
 	ctx := context.Background()
 	require.NoError(t, r.Shutdown(ctx))
-	_, err := r.Open(ctx, "c")
+	_, err := r.Open(ctx, ref(1, 1))
 	require.Error(t, err)
 }
 
@@ -196,7 +208,7 @@ func TestConcurrentReadersDuringWriter(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
-	cdb, err := r.Open(ctx, "c")
+	cdb, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
@@ -256,20 +268,20 @@ func TestConcurrentReadersDuringWriter(t *testing.T) {
 
 func TestCorruptFileQuarantined(t *testing.T) {
 	dir := t.TempDir()
-	clustersDir := filepath.Join(dir, "clusters")
-	require.NoError(t, os.MkdirAll(clustersDir, 0o700))
-	dbPath := filepath.Join(clustersDir, "broken.db")
+	broken := ref(1, 1)
+	dbPath := clusterDBPath(dir, broken)
+	require.NoError(t, os.MkdirAll(clusterDir(dir, broken), 0o700))
 	// SQLite files start with a magic string; arbitrary bytes are an
 	// invalid header and will fail integrity_check on first query.
 	require.NoError(t, os.WriteFile(dbPath, []byte("not a sqlite file"), 0o600))
 
 	r := NewManager(dir)
 	ctx := context.Background()
-	cdb, err := r.Open(ctx, "broken")
+	cdb, err := r.Open(ctx, broken)
 	require.NoError(t, err, "open should recover from a corrupt file by quarantining it")
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
-	matches, err := filepath.Glob(filepath.Join(clustersDir, "broken.db.corrupt-*"))
+	matches, err := filepath.Glob(dbPath + ".corrupt-*")
 	require.NoError(t, err)
 	require.NotEmpty(t, matches, "expected a quarantined .corrupt-* file")
 
@@ -281,7 +293,7 @@ func TestJanitorTrimsStaleEvents(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
-	cdb, err := r.Open(ctx, "c")
+	cdb, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
@@ -314,7 +326,7 @@ func TestSubscribeNotifyAndCoalesce(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
-	cdb, err := r.Open(ctx, "c")
+	cdb, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
@@ -348,7 +360,7 @@ func TestShutdownClosesSubscribers(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
-	cdb, err := r.Open(ctx, "c")
+	cdb, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 
 	ch, cancel := cdb.Subscribe()
@@ -367,7 +379,7 @@ func TestResourceStats(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
-	cdb, err := r.Open(ctx, "c")
+	cdb, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 

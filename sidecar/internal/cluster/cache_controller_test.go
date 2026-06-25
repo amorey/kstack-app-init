@@ -77,8 +77,9 @@ func newCacheTestBeehive(t *testing.T, connMgr *cluster.ConnectionManager) (
 	ctrl := cluster.NewClusterCacheController(w, coreClient, mgr, connMgr, nil)
 	fakeEng := &fakeEngine{}
 	slot := &capturedCfgSlot{}
-	ctrl.SetNewEngine(func(cfg *rest.Config, id cluster.ClusterID, sink engine.Sink) cluster.EngineHandle {
+	ctrl.SetNewEngine(func(cfg *rest.Config, id cluster.ClusterID, ref store.CacheRef, sink engine.Sink) cluster.EngineHandle {
 		slot.cfg = cfg
+		slot.ref = ref
 		fakeEng.sink = sink
 		return fakeEng
 	})
@@ -95,8 +96,11 @@ func newCacheTestBeehive(t *testing.T, connMgr *cluster.ConnectionManager) (
 	return coreClient, cacheClient, fakeEng, slot
 }
 
-// capturedCfgSlot holds the REST config that was passed to the engine factory.
-type capturedCfgSlot struct{ cfg *rest.Config }
+// capturedCfgSlot holds the REST config and cache ref passed to the engine factory.
+type capturedCfgSlot struct {
+	cfg *rest.Config
+	ref store.CacheRef
+}
 
 // awaitCacheSyncedStatus blocks on the ClusterCache object's beehive watch until
 // its Synced condition reaches the wanted status, then returns that condition.
@@ -176,12 +180,10 @@ func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
 	ctx := context.Background()
 	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
 
-	id := cluster.ClusterID("abc-uuid")
-
 	// Create parent Cluster.
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"),
-		beehive.WithSlug(cluster.ClusterSlug(id)))
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
 	require.NoError(t, err)
+	id := cluster.ClusterID(clusterObj.ID)
 
 	// Create ClusterCache child.
 	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
@@ -199,14 +201,12 @@ func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {
 	ctx := context.Background()
 	coreClient, cacheClient, _, _ := newCacheTestBeehive(t, nil)
 
-	id := cluster.ClusterID("paused-uuid")
-
 	// SyncEnabled=false → ineligible for sync.
 	spec := eligibleClusterSpec("alpha")
 	spec.SyncEnabled = false
-	clusterObj, err := coreClient.Create(ctx, spec,
-		beehive.WithSlug(cluster.ClusterSlug(id)))
+	clusterObj, err := coreClient.Create(ctx, spec)
 	require.NoError(t, err)
+	id := cluster.ClusterID(clusterObj.ID)
 
 	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
 		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
@@ -227,13 +227,12 @@ func TestCacheControllerReportWithParentGenerationAhead(t *testing.T) {
 	ctx := context.Background()
 	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
 
-	id := cluster.ClusterID("gen-skew-uuid")
-
 	// Create the parent Cluster, then advance its generation past 1 by editing
 	// its spec, before the ClusterCache child exists.
 	spec := eligibleClusterSpec("alpha")
-	clusterObj, err := coreClient.Create(ctx, spec, beehive.WithSlug(cluster.ClusterSlug(id)))
+	clusterObj, err := coreClient.Create(ctx, spec)
 	require.NoError(t, err)
+	id := cluster.ClusterID(clusterObj.ID)
 	for _, name := range []string{"rename-1", "rename-2"} {
 		n := name
 		spec.Name = &n
@@ -261,15 +260,14 @@ func TestCacheControllerReportWithParentGenerationAhead(t *testing.T) {
 func TestCacheControllerUsesConnectionManagerConfig(t *testing.T) {
 	ctx := context.Background()
 	connMgr := cluster.NewConnectionManager()
-	id := cluster.ClusterID("conn-cfg-uuid")
 	injected := &rest.Config{Host: "https://from-conn-mgr:6443"}
-	connMgr.Set(id, injected)
 
 	coreClient, cacheClient, _, slot := newCacheTestBeehive(t, connMgr)
 
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"),
-		beehive.WithSlug(cluster.ClusterSlug(id)))
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
 	require.NoError(t, err)
+	id := cluster.ClusterID(clusterObj.ID)
+	connMgr.Set(id, injected)
 	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
 		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
 		beehive.WithOwner(clusterObj.ID))
@@ -279,6 +277,8 @@ func TestCacheControllerUsesConnectionManagerConfig(t *testing.T) {
 
 	assert.Equal(t, injected, slot.cfg,
 		"engine must receive the REST config from ConnectionManager, not a freshly resolved one")
+	assert.Equal(t, store.CacheRef{ClusterID: int64(clusterObj.ID), CacheID: int64(cacheObj.ID)}, slot.ref,
+		"engine cache ref must be the parent Cluster + ClusterCache beehive ObjectIDs")
 }
 
 // TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager verifies that
@@ -287,10 +287,9 @@ func TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager(t *testing.
 	ctx := context.Background()
 	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
 
-	id := cluster.ClusterID("fallback-uuid")
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"),
-		beehive.WithSlug(cluster.ClusterSlug(id)))
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
 	require.NoError(t, err)
+	id := cluster.ClusterID(clusterObj.ID)
 	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
 		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
 		beehive.WithOwner(clusterObj.ID))
@@ -320,7 +319,7 @@ func TestCacheControllerPokeRestartsLiveEngine(t *testing.T) {
 	// (old engine stopped, a second engine created and started).
 	var mu sync.Mutex
 	var created []*fakeEngine
-	ctrl.SetNewEngine(func(_ *rest.Config, _ cluster.ClusterID, sink engine.Sink) cluster.EngineHandle {
+	ctrl.SetNewEngine(func(_ *rest.Config, _ cluster.ClusterID, _ store.CacheRef, sink engine.Sink) cluster.EngineHandle {
 		e := &fakeEngine{sink: sink}
 		mu.Lock()
 		created = append(created, e)
@@ -338,10 +337,9 @@ func TestCacheControllerPokeRestartsLiveEngine(t *testing.T) {
 	ctrl.StartPoke()
 	t.Cleanup(func() { ctrl.StopPoke(); _ = stop(ctx); _ = ctrl.StopEngines() })
 
-	id := cluster.ClusterID("poke-uuid")
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"),
-		beehive.WithSlug(cluster.ClusterSlug(id)))
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
 	require.NoError(t, err)
+	id := cluster.ClusterID(clusterObj.ID)
 	_, err = cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
 		beehive.WithSlug(cluster.ClusterCacheSlug(id)), beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)

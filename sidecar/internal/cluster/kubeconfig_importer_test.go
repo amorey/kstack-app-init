@@ -53,6 +53,30 @@ func TestImporterNewContextCreatesCluster(t *testing.T) {
 	assert.Equal(t, "alpha", obj.Spec.Source.Kubeconfig.Context)
 	assert.True(t, obj.Spec.Enabled)
 	assert.True(t, obj.Spec.SyncEnabled)
+	// The slug is the source's natural key — the context name under the
+	// kubeconfig source prefix. It is the importer's reconcile/uniqueness key, not
+	// the record's identity (that is the beehive ObjectID).
+	require.NotNil(t, obj.Slug)
+	assert.Equal(t, "kubeconfig/alpha", *obj.Slug)
+}
+
+// Distinct contexts get distinct, deterministic source-prefixed slugs.
+func TestImporterSlugIsDeterministicNaturalKey(t *testing.T) {
+	ctx := context.Background()
+	cfg := testutil.TestKubeConfig("alpha", "beta")
+	im := newTestImporter(t, cfg)
+
+	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
+
+	objs, err := im.ClusterClient().List(ctx)
+	require.NoError(t, err)
+	slugs := map[string]bool{}
+	for _, o := range objs {
+		require.NotNil(t, o.Slug)
+		slugs[*o.Slug] = true
+	}
+	assert.True(t, slugs["kubeconfig/alpha"])
+	assert.True(t, slugs["kubeconfig/beta"])
 }
 
 // A departed context is never deleted by the importer — the Cluster (and its

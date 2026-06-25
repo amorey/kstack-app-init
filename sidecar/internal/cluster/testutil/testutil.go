@@ -97,22 +97,25 @@ func OpenMemoryStore() (beehive.Store, error) {
 	return sqlite.OpenMemory()
 }
 
-// TestKubeConfig builds an in-memory kubeconfig resolvable for contextName
-// without touching the network. The cluster entry is "<ctx>-cluster", user is
-// "<ctx>-user", server is always https://127.0.0.1:6443.
-func TestKubeConfig(contextName string) *api.Config {
-	return &api.Config{
-		CurrentContext: contextName,
-		Contexts: map[string]*api.Context{
-			contextName: {Cluster: contextName + "-cluster", AuthInfo: contextName + "-user"},
-		},
-		Clusters: map[string]*api.Cluster{
-			contextName + "-cluster": {Server: "https://127.0.0.1:6443"},
-		},
-		AuthInfos: map[string]*api.AuthInfo{
-			contextName + "-user": {Token: "test-token"},
-		},
+// TestKubeConfig builds an in-memory kubeconfig resolvable for the given
+// contexts without touching the network. For each context the cluster entry is
+// "<ctx>-cluster", user is "<ctx>-user", server is always https://127.0.0.1:6443;
+// the first context is the current-context.
+func TestKubeConfig(contextNames ...string) *api.Config {
+	cfg := &api.Config{
+		Contexts:  map[string]*api.Context{},
+		Clusters:  map[string]*api.Cluster{},
+		AuthInfos: map[string]*api.AuthInfo{},
 	}
+	if len(contextNames) > 0 {
+		cfg.CurrentContext = contextNames[0]
+	}
+	for _, name := range contextNames {
+		cfg.Contexts[name] = &api.Context{Cluster: name + "-cluster", AuthInfo: name + "-user"}
+		cfg.Clusters[name+"-cluster"] = &api.Cluster{Server: "https://127.0.0.1:6443"}
+		cfg.AuthInfos[name+"-user"] = &api.AuthInfo{Token: "test-token"}
+	}
+	return cfg
 }
 
 // NewTestBeehiveUnstarted builds a beehive with no controllers registered and

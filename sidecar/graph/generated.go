@@ -156,11 +156,11 @@ type ComplexityRoot struct {
 	Mutation struct {
 		AuthLoginStart         func(childComplexity int) int
 		AuthLogout             func(childComplexity int) int
-		ClusterCacheClear      func(childComplexity int, id string) int
-		ClusterConnectionRetry func(childComplexity int, id string) int
-		ClusterDelete          func(childComplexity int, id string) int
-		ClusterEnabledSet      func(childComplexity int, id string, enabled bool) int
-		ClusterSyncEnabledSet  func(childComplexity int, id string, syncEnabled bool) int
+		ClusterCacheClear      func(childComplexity int, id cluster.ClusterID) int
+		ClusterConnectionRetry func(childComplexity int, id cluster.ClusterID) int
+		ClusterDelete          func(childComplexity int, id cluster.ClusterID) int
+		ClusterEnabledSet      func(childComplexity int, id cluster.ClusterID, enabled bool) int
+		ClusterSyncEnabledSet  func(childComplexity int, id cluster.ClusterID, syncEnabled bool) int
 	}
 
 	NonResourceRule struct {
@@ -170,7 +170,7 @@ type ComplexityRoot struct {
 
 	Query struct {
 		AuthState func(childComplexity int) int
-		Cluster   func(childComplexity int, id string) int
+		Cluster   func(childComplexity int, id cluster.ClusterID) int
 		Clusters  func(childComplexity int) int
 	}
 
@@ -195,16 +195,16 @@ type ClusterPrincipalResolver interface {
 	Permissions(ctx context.Context, obj *cluster.ClusterPrincipal, namespace string) (*model.ClusterPermissions, error)
 }
 type MutationResolver interface {
-	ClusterEnabledSet(ctx context.Context, id string, enabled bool) (*cluster.Cluster, error)
-	ClusterSyncEnabledSet(ctx context.Context, id string, syncEnabled bool) (*cluster.Cluster, error)
-	ClusterConnectionRetry(ctx context.Context, id string) (bool, error)
-	ClusterCacheClear(ctx context.Context, id string) (*cluster.Cluster, error)
-	ClusterDelete(ctx context.Context, id string) (bool, error)
+	ClusterEnabledSet(ctx context.Context, id cluster.ClusterID, enabled bool) (*cluster.Cluster, error)
+	ClusterSyncEnabledSet(ctx context.Context, id cluster.ClusterID, syncEnabled bool) (*cluster.Cluster, error)
+	ClusterConnectionRetry(ctx context.Context, id cluster.ClusterID) (bool, error)
+	ClusterCacheClear(ctx context.Context, id cluster.ClusterID) (*cluster.Cluster, error)
+	ClusterDelete(ctx context.Context, id cluster.ClusterID) (bool, error)
 	AuthLoginStart(ctx context.Context) (bool, error)
 	AuthLogout(ctx context.Context) (bool, error)
 }
 type QueryResolver interface {
-	Cluster(ctx context.Context, id string) (*cluster.Cluster, error)
+	Cluster(ctx context.Context, id cluster.ClusterID) (*cluster.Cluster, error)
 	Clusters(ctx context.Context) ([]*cluster.Cluster, error)
 	AuthState(ctx context.Context) (*auth.State, error)
 }
@@ -597,7 +597,7 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Mutation.ClusterCacheClear(childComplexity, args["id"].(string)), true
+		return e.ComplexityRoot.Mutation.ClusterCacheClear(childComplexity, args["id"].(cluster.ClusterID)), true
 	case "Mutation.clusterConnectionRetry":
 		if e.ComplexityRoot.Mutation.ClusterConnectionRetry == nil {
 			break
@@ -608,7 +608,7 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Mutation.ClusterConnectionRetry(childComplexity, args["id"].(string)), true
+		return e.ComplexityRoot.Mutation.ClusterConnectionRetry(childComplexity, args["id"].(cluster.ClusterID)), true
 	case "Mutation.clusterDelete":
 		if e.ComplexityRoot.Mutation.ClusterDelete == nil {
 			break
@@ -619,7 +619,7 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Mutation.ClusterDelete(childComplexity, args["id"].(string)), true
+		return e.ComplexityRoot.Mutation.ClusterDelete(childComplexity, args["id"].(cluster.ClusterID)), true
 	case "Mutation.clusterEnabledSet":
 		if e.ComplexityRoot.Mutation.ClusterEnabledSet == nil {
 			break
@@ -630,7 +630,7 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Mutation.ClusterEnabledSet(childComplexity, args["id"].(string), args["enabled"].(bool)), true
+		return e.ComplexityRoot.Mutation.ClusterEnabledSet(childComplexity, args["id"].(cluster.ClusterID), args["enabled"].(bool)), true
 	case "Mutation.clusterSyncEnabledSet":
 		if e.ComplexityRoot.Mutation.ClusterSyncEnabledSet == nil {
 			break
@@ -641,7 +641,7 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Mutation.ClusterSyncEnabledSet(childComplexity, args["id"].(string), args["syncEnabled"].(bool)), true
+		return e.ComplexityRoot.Mutation.ClusterSyncEnabledSet(childComplexity, args["id"].(cluster.ClusterID), args["syncEnabled"].(bool)), true
 
 	case "NonResourceRule.nonResourceUrls":
 		if e.ComplexityRoot.NonResourceRule.NonResourceUrls == nil {
@@ -672,7 +672,7 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Query.Cluster(childComplexity, args["id"].(string)), true
+		return e.ComplexityRoot.Query.Cluster(childComplexity, args["id"].(cluster.ClusterID)), true
 	case "Query.clusters":
 		if e.ComplexityRoot.Query.Clusters == nil {
 			break
@@ -1224,8 +1224,8 @@ func (ec *executionContext) field_Mutation_clusterCacheClear_args(ctx context.Co
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
-		func(ctx context.Context, v any) (string, error) {
-			return ec.unmarshalNID2string(ctx, v)
+		func(ctx context.Context, v any) (cluster.ClusterID, error) {
+			return ec.unmarshalNClusterID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx, v)
 		})
 	if err != nil {
 		return nil, err
@@ -1238,8 +1238,8 @@ func (ec *executionContext) field_Mutation_clusterConnectionRetry_args(ctx conte
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
-		func(ctx context.Context, v any) (string, error) {
-			return ec.unmarshalNID2string(ctx, v)
+		func(ctx context.Context, v any) (cluster.ClusterID, error) {
+			return ec.unmarshalNClusterID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx, v)
 		})
 	if err != nil {
 		return nil, err
@@ -1252,8 +1252,8 @@ func (ec *executionContext) field_Mutation_clusterDelete_args(ctx context.Contex
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
-		func(ctx context.Context, v any) (string, error) {
-			return ec.unmarshalNID2string(ctx, v)
+		func(ctx context.Context, v any) (cluster.ClusterID, error) {
+			return ec.unmarshalNClusterID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx, v)
 		})
 	if err != nil {
 		return nil, err
@@ -1266,8 +1266,8 @@ func (ec *executionContext) field_Mutation_clusterEnabledSet_args(ctx context.Co
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
-		func(ctx context.Context, v any) (string, error) {
-			return ec.unmarshalNID2string(ctx, v)
+		func(ctx context.Context, v any) (cluster.ClusterID, error) {
+			return ec.unmarshalNClusterID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx, v)
 		})
 	if err != nil {
 		return nil, err
@@ -1288,8 +1288,8 @@ func (ec *executionContext) field_Mutation_clusterSyncEnabledSet_args(ctx contex
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
-		func(ctx context.Context, v any) (string, error) {
-			return ec.unmarshalNID2string(ctx, v)
+		func(ctx context.Context, v any) (cluster.ClusterID, error) {
+			return ec.unmarshalNClusterID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx, v)
 		})
 	if err != nil {
 		return nil, err
@@ -1324,8 +1324,8 @@ func (ec *executionContext) field_Query_cluster_args(ctx context.Context, rawArg
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
-		func(ctx context.Context, v any) (string, error) {
-			return ec.unmarshalNID2string(ctx, v)
+		func(ctx context.Context, v any) (cluster.ClusterID, error) {
+			return ec.unmarshalNClusterID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx, v)
 		})
 	if err != nil {
 		return nil, err
@@ -1595,14 +1595,14 @@ func (ec *executionContext) _Cluster_id(ctx context.Context, field graphql.Colle
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v cluster.ClusterID) graphql.Marshaler {
-			return ec.marshalNID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx, selections, v)
+			return ec.marshalNClusterID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_Cluster_id(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("Cluster", field, false, false, errors.New("field of type ID does not have child fields"))
+	return graphql.NewScalarFieldContext("Cluster", field, false, false, errors.New("field of type ClusterID does not have child fields"))
 }
 
 func (ec *executionContext) _Cluster_generation(ctx context.Context, field graphql.CollectedField, obj *cluster.Cluster) (ret graphql.Marshaler) {
@@ -2838,7 +2838,7 @@ func (ec *executionContext) _Mutation_clusterEnabledSet(ctx context.Context, fie
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Mutation().ClusterEnabledSet(ctx, fc.Args["id"].(string), fc.Args["enabled"].(bool))
+			return ec.Resolvers.Mutation().ClusterEnabledSet(ctx, fc.Args["id"].(cluster.ClusterID), fc.Args["enabled"].(bool))
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *cluster.Cluster) graphql.Marshaler {
@@ -2882,7 +2882,7 @@ func (ec *executionContext) _Mutation_clusterSyncEnabledSet(ctx context.Context,
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Mutation().ClusterSyncEnabledSet(ctx, fc.Args["id"].(string), fc.Args["syncEnabled"].(bool))
+			return ec.Resolvers.Mutation().ClusterSyncEnabledSet(ctx, fc.Args["id"].(cluster.ClusterID), fc.Args["syncEnabled"].(bool))
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *cluster.Cluster) graphql.Marshaler {
@@ -2926,7 +2926,7 @@ func (ec *executionContext) _Mutation_clusterConnectionRetry(ctx context.Context
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Mutation().ClusterConnectionRetry(ctx, fc.Args["id"].(string))
+			return ec.Resolvers.Mutation().ClusterConnectionRetry(ctx, fc.Args["id"].(cluster.ClusterID))
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
@@ -2970,7 +2970,7 @@ func (ec *executionContext) _Mutation_clusterCacheClear(ctx context.Context, fie
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Mutation().ClusterCacheClear(ctx, fc.Args["id"].(string))
+			return ec.Resolvers.Mutation().ClusterCacheClear(ctx, fc.Args["id"].(cluster.ClusterID))
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *cluster.Cluster) graphql.Marshaler {
@@ -3014,7 +3014,7 @@ func (ec *executionContext) _Mutation_clusterDelete(ctx context.Context, field g
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Mutation().ClusterDelete(ctx, fc.Args["id"].(string))
+			return ec.Resolvers.Mutation().ClusterDelete(ctx, fc.Args["id"].(cluster.ClusterID))
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
@@ -3150,7 +3150,7 @@ func (ec *executionContext) _Query_cluster(ctx context.Context, field graphql.Co
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Query().Cluster(ctx, fc.Args["id"].(string))
+			return ec.Resolvers.Query().Cluster(ctx, fc.Args["id"].(cluster.ClusterID))
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *cluster.Cluster) graphql.Marshaler {
@@ -6391,6 +6391,16 @@ func (ec *executionContext) marshalNClusterCondition2ᚕgithubᚗcomᚋkubetail�
 	return ret
 }
 
+func (ec *executionContext) unmarshalNClusterID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx context.Context, v any) (cluster.ClusterID, error) {
+	var res cluster.ClusterID
+	err := res.UnmarshalGQL(v)
+	return res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) marshalNClusterID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterID) graphql.Marshaler {
+	return v
+}
+
 func (ec *executionContext) marshalNClusterPermissions2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterPermissions(ctx context.Context, sel ast.SelectionSet, v model.ClusterPermissions) graphql.Marshaler {
 	return ec._ClusterPermissions(ctx, sel, &v)
 }
@@ -6438,39 +6448,6 @@ func (ec *executionContext) unmarshalNConditionStatus2githubᚗcomᚋamoreyᚋbe
 func (ec *executionContext) marshalNConditionStatus2githubᚗcomᚋamoreyᚋbeehiveᚐConditionStatus(ctx context.Context, sel ast.SelectionSet, v beehive.ConditionStatus) graphql.Marshaler {
 	_ = sel
 	res := graphql.MarshalString(string(v))
-	if res == graphql.Null {
-		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
-			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
-		}
-	}
-	return res
-}
-
-func (ec *executionContext) unmarshalNID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx context.Context, v any) (cluster.ClusterID, error) {
-	tmp, err := graphql.UnmarshalString(v)
-	res := cluster.ClusterID(tmp)
-	return res, graphql.ErrorOnPath(ctx, err)
-}
-
-func (ec *executionContext) marshalNID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterID(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterID) graphql.Marshaler {
-	_ = sel
-	res := graphql.MarshalString(string(v))
-	if res == graphql.Null {
-		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
-			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
-		}
-	}
-	return res
-}
-
-func (ec *executionContext) unmarshalNID2string(ctx context.Context, v any) (string, error) {
-	res, err := graphql.UnmarshalID(v)
-	return res, graphql.ErrorOnPath(ctx, err)
-}
-
-func (ec *executionContext) marshalNID2string(ctx context.Context, sel ast.SelectionSet, v string) graphql.Marshaler {
-	_ = sel
-	res := graphql.MarshalID(v)
 	if res == graphql.Null {
 		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
 			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
