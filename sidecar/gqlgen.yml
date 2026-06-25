@@ -93,11 +93,12 @@ models:
       sub:
         fieldName: UserID
 
-  # The cluster identity scalar binds to the typed int64 ClusterID (its
+  # The object-identity scalar binds to the typed int64 ObjectID (its
   # MarshalGQL/UnmarshalGQL handle the decimal-string wire form), so resolver
-  # arguments arrive already typed — no per-resolver parsing.
-  ClusterID:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterID
+  # arguments arrive already typed — no per-resolver parsing. ClusterID (and
+  # future per-kind ids) are aliases of this one type, sharing its machinery.
+  ObjectID:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ObjectID
 
   # --- gqlgen ---
   ID:

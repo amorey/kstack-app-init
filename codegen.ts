@@ -15,11 +15,12 @@ const config: CodegenConfig = {
       config: {
         useTypeImports: true,
         // Custom scalars and their TS wire types. Time is an ISO-8601 UTC
-        // string; ClusterID is an opaque decimal-string id (an int64 server-side,
-        // a string on the wire) — the webview treats it as an opaque string.
+        // string; ObjectID is an opaque decimal-string object id (an int64
+        // server-side, a string on the wire) — the webview treats it as an
+        // opaque string.
         scalars: {
           Time: 'string',
-          ClusterID: 'string',
+          ObjectID: 'string',
         },
       },
     },

@@ -40,7 +40,7 @@ import { errorMessage, reportError } from '@/lib/error-bus';
 import { formatSyncFreshness } from '@/lib/sync-status';
 
 const ClusterEnabledSetMutation = graphql(`
-  mutation ClusterEnabledSet($id: ClusterID!, $enabled: Boolean!) {
+  mutation ClusterEnabledSet($id: ObjectID!, $enabled: Boolean!) {
     clusterEnabledSet(id: $id, enabled: $enabled) {
       id
       spec {
@@ -51,7 +51,7 @@ const ClusterEnabledSetMutation = graphql(`
 `);
 
 const ClusterSyncEnabledSetMutation = graphql(`
-  mutation ClusterSyncEnabledSet($id: ClusterID!, $syncEnabled: Boolean!) {
+  mutation ClusterSyncEnabledSet($id: ObjectID!, $syncEnabled: Boolean!) {
     clusterSyncEnabledSet(id: $id, syncEnabled: $syncEnabled) {
       id
       spec {
@@ -62,7 +62,7 @@ const ClusterSyncEnabledSetMutation = graphql(`
 `);
 
 const ClusterCacheClearMutation = graphql(`
-  mutation ClusterCacheClear($id: ClusterID!) {
+  mutation ClusterCacheClear($id: ObjectID!) {
     clusterCacheClear(id: $id) {
       id
     }
@@ -70,7 +70,7 @@ const ClusterCacheClearMutation = graphql(`
 `);
 
 const ClusterDeleteMutation = graphql(`
-  mutation ClusterDelete($id: ClusterID!) {
+  mutation ClusterDelete($id: ObjectID!) {
     clusterDelete(id: $id)
   }
 `);

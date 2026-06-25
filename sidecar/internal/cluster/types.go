@@ -94,57 +94,67 @@ func newCacheRef(clusterObjID, cacheObjID beehive.ObjectID) store.CacheRef {
 
 // --- Identity ---
 
+// ObjectID is the identity of a persisted object — the beehive ObjectID of any
+// kind (a Cluster, a ClusterCache, …). It is opaque on the wire (a decimal
+// string) and binds to the one GraphQL `ObjectID` scalar; its
+// MarshalGQL/UnmarshalGQL are the single id (un)marshalling path every kind
+// reuses, so a new kind's id needs no new scalar or parsing. Per-kind aliases
+// (ClusterID below, ClusterCacheID later) name the same type purely to document
+// which kind an id refers to in Go signatures.
+type ObjectID int64
+
 // ClusterID uniquely identifies a cluster record: the beehive ObjectID of its
 // Cluster object. It is opaque and stable for the life of the record (a departed
 // kube-context is orphaned, not deleted, so its id survives a return; the id
 // changes only on an explicit Delete), and it is source-agnostic — the same
 // identity regardless of which importer created the record. The source's natural
 // key (e.g. a kube-context name) lives only on the beehive *slug*, an
-// importer-internal reconcile/uniqueness key, never surfaced here. ClusterID
-// binds to the GraphQL ID scalar, marshalled as its decimal string.
-type ClusterID int64
+// importer-internal reconcile/uniqueness key, never surfaced here. It is an
+// alias of [ObjectID] — a documentation name, not a distinct type, so it shares
+// the one GraphQL scalar and (un)marshalling machinery.
+type ClusterID = ObjectID
 
-// parseClusterID parses a ClusterID from its decimal-string wire form; a
+// parseObjectID parses an ObjectID from its decimal-string wire form; a
 // malformed value is a client error surfaced through UnmarshalGQL.
-func parseClusterID(s string) (ClusterID, error) {
+func parseObjectID(s string) (ObjectID, error) {
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("invalid cluster id %q: %w", s, err)
+		return 0, fmt.Errorf("invalid object id %q: %w", s, err)
 	}
-	return ClusterID(n), nil
+	return ObjectID(n), nil
 }
 
-// MarshalGQL writes the ClusterID to the GraphQL ClusterID scalar as a quoted
+// MarshalGQL writes the ObjectID to the GraphQL ObjectID scalar as a quoted
 // decimal string (its wire form).
-func (id ClusterID) MarshalGQL(w io.Writer) {
+func (id ObjectID) MarshalGQL(w io.Writer) {
 	io.WriteString(w, strconv.Quote(strconv.FormatInt(int64(id), 10)))
 }
 
-// UnmarshalGQL parses the GraphQL ClusterID scalar into a typed ClusterID, so
+// UnmarshalGQL parses the GraphQL ObjectID scalar into a typed ObjectID, so
 // gqlgen hands resolvers the typed id with no per-resolver parsing. The scalar
 // accepts a string or an integer literal: gqlgen delivers a quoted literal /
 // JSON string as string, an inline integer literal as int64, and a JSON-variable
 // number as json.Number.
-func (id *ClusterID) UnmarshalGQL(v any) error {
+func (id *ObjectID) UnmarshalGQL(v any) error {
 	switch t := v.(type) {
 	case string:
-		n, err := parseClusterID(t)
+		n, err := parseObjectID(t)
 		if err != nil {
 			return err
 		}
 		*id = n
 	case json.Number:
-		n, err := parseClusterID(t.String())
+		n, err := parseObjectID(t.String())
 		if err != nil {
 			return err
 		}
 		*id = n
 	case int64:
-		*id = ClusterID(t)
+		*id = ObjectID(t)
 	case int:
-		*id = ClusterID(t)
+		*id = ObjectID(t)
 	default:
-		return fmt.Errorf("ClusterID must be a string or integer, got %T", v)
+		return fmt.Errorf("ObjectID must be a string or integer, got %T", v)
 	}
 	return nil
 }
