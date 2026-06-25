@@ -56,11 +56,43 @@ func (f *fakeEngine) Stop(_ context.Context) error {
 	return nil
 }
 
+// fakeReprober records Reprobe calls so a test can assert the engine-error hook
+// poked a connection re-probe. Safe for concurrent use (the cache controller
+// invokes Reprobe from its engine-sink goroutine).
+type fakeReprober struct {
+	mu  sync.Mutex
+	ids []cluster.ClusterID
+}
+
+func (r *fakeReprober) Reprobe(id cluster.ClusterID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ids = append(r.ids, id)
+}
+
+func (r *fakeReprober) calls() []cluster.ClusterID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]cluster.ClusterID(nil), r.ids...)
+}
+
 // newCacheTestBeehive builds a beehive with the real ClusterCacheController
 // using a fake engine factory plus NoopControllers for the other kinds.
 // Returns the clients, the factory's engine slot (populated on first call),
 // and a pointer to a slot that holds the REST config passed to the engine factory.
 func newCacheTestBeehive(t *testing.T, connMgr *cluster.ConnectionManager) (
+	beehive.Client[cluster.ClusterSpec, cluster.ClusterStatus],
+	beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus],
+	*fakeEngine,
+	*capturedCfgSlot,
+) {
+	return newCacheTestBeehiveReprober(t, connMgr, nil)
+}
+
+// newCacheTestBeehiveReprober is newCacheTestBeehive with a connection re-prober
+// wired into the cache controller (the hook that re-probes a cluster when its
+// sync engine reports a failure). A nil reprober leaves the hook disabled.
+func newCacheTestBeehiveReprober(t *testing.T, connMgr *cluster.ConnectionManager, reprober cluster.ConnectionReprober) (
 	beehive.Client[cluster.ClusterSpec, cluster.ClusterStatus],
 	beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus],
 	*fakeEngine,
@@ -76,6 +108,9 @@ func newCacheTestBeehive(t *testing.T, connMgr *cluster.ConnectionManager) (
 	mgr := store.NewManager(t.TempDir())
 
 	ctrl := cluster.NewClusterCacheController(w, coreClient, mgr, connMgr, nil)
+	if reprober != nil {
+		ctrl.SetReprober(reprober)
+	}
 	fakeEng := &fakeEngine{}
 	slot := &capturedCfgSlot{}
 	ctrl.SetNewEngine(func(cfg *rest.Config, id cluster.ClusterID, ref store.CacheRef, sink engine.Sink) cluster.EngineHandle {
@@ -349,6 +384,69 @@ func TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager(t *testing.
 	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, cluster.ConditionTrue)
 	assert.Equal(t, cluster.ConditionTrue, synced.Status)
 	assert.True(t, fakeEng.started.Load())
+}
+
+// TestCacheControllerEngineErrorReprobesConnection verifies that when a sync
+// engine reports a failure (its live watch streams are the earliest signal a
+// connection died), the cache controller pokes a targeted connection re-probe of
+// the engine's parent cluster — so Connected/Healthy refresh promptly instead of
+// on the core controller's ~30s health cadence.
+func TestCacheControllerEngineErrorReprobesConnection(t *testing.T) {
+	ctx := context.Background()
+	rep := &fakeReprober{}
+	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehiveReprober(t, nil, rep)
+
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := cluster.ClusterID(clusterObj.ID)
+
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id, testCacheUID)),
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	// Let the engine spin up (reports Watching → Synced=True) so its sink is live
+	// and lastReportedState is Watching — the next Errored report is a transition.
+	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, cluster.ConditionTrue)
+	require.True(t, fakeEng.started.Load())
+
+	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineErrored, LastError: "watch closed"})
+
+	require.Eventually(t, func() bool { return len(rep.calls()) >= 1 },
+		2*time.Second, 10*time.Millisecond, "engine error must trigger a connection re-probe")
+	assert.Equal(t, []cluster.ClusterID{id}, rep.calls(),
+		"re-probe must target the engine's parent cluster")
+}
+
+// TestCacheControllerErrorReprobeFiresOncePerTransition pins the transition gate:
+// a persistent outage (repeated Errored reports) pokes once, and a fresh failure
+// after a recovery pokes again — so the re-probe cadence follows the engine's own
+// backoff rather than every report.
+func TestCacheControllerErrorReprobeFiresOncePerTransition(t *testing.T) {
+	ctx := context.Background()
+	rep := &fakeReprober{}
+	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehiveReprober(t, nil, rep)
+
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := cluster.ClusterID(clusterObj.ID)
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id, testCacheUID)),
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, cluster.ConditionTrue)
+
+	// Report is synchronous (it acquires writeMu and folds the status inline), so
+	// each call's reprobe is recorded by the time it returns.
+	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineErrored, LastError: "boom"})
+	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineErrored, LastError: "boom"})
+	assert.Equal(t, []cluster.ClusterID{id}, rep.calls(),
+		"a repeated Errored report must not re-poke")
+
+	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineWatching})
+	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineErrored, LastError: "boom again"})
+	assert.Equal(t, []cluster.ClusterID{id, id}, rep.calls(),
+		"a fresh Errored transition after recovery must re-poke")
 }
 
 // TestCacheControllerPokeRestartsLiveEngine verifies the controller subscribes

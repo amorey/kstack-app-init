@@ -53,6 +53,16 @@ type EngineHandle interface {
 // factory that returns fake handles.
 type NewEngineFunc func(cfg *rest.Config, clusterID ClusterID, ref store.CacheRef, sink engine.Sink) EngineHandle
 
+// ConnectionReprober triggers an immediate, out-of-band connection re-probe of
+// one cluster. Satisfied by *ClusterCoreController (its Reprobe method). The
+// cache controller calls it when a sync engine reports a connection failure, so
+// the Connected/Healthy conditions refresh within a re-probe instead of waiting
+// for the core controller's ~30s health-poll cadence — the engine's live watch
+// streams are the earliest signal that a connection died.
+type ConnectionReprober interface {
+	Reprobe(id ClusterID)
+}
+
 // engineEntry is the controller's runtime state for one running engine. The
 // pointer guards the sink: reports from a stopped or replaced engine are dropped
 // by comparing pointer identity.
@@ -78,6 +88,10 @@ type engineEntry struct {
 	// parentGen is the parent Cluster's generation stamp recorded in the Synced
 	// condition's ObservedGeneration (the condition observes the parent's spec).
 	parentGen int64
+	// lastReportedState is the engine state of the previous sink report, used to
+	// fire a connection re-probe only on the transition *into* EngineErrored (not
+	// on every repeat). Read/written under writeMu in applyEngineReport.
+	lastReportedState engine.EngineState
 }
 
 // cacheFilesFinalizer gates a ClusterCache's deletion on this controller deleting
@@ -111,6 +125,10 @@ type ClusterCacheController struct {
 	// pokeSvc is the resync bus; nil disables poke-driven restarts (tests).
 	pokeSvc *poke.Service
 	pokeSub *pokeSubscription
+
+	// reprober re-probes a cluster's connection when its sync engine reports a
+	// failure; nil disables the hook (tests, and any wiring that omits it).
+	reprober ConnectionReprober
 
 	// newEngine constructs one sync engine. Overridable for tests.
 	newEngine NewEngineFunc
@@ -161,6 +179,13 @@ func NewClusterCacheController(
 // SetNewEngine replaces the engine factory — for tests.
 func (c *ClusterCacheController) SetNewEngine(f NewEngineFunc) {
 	c.newEngine = f
+}
+
+// SetReprober injects the connection re-prober invoked when a sync engine reports
+// a failure (so the core controller re-probes that cluster's connection promptly).
+// nil leaves the hook disabled. Call once, before the control plane starts.
+func (c *ClusterCacheController) SetReprober(r ConnectionReprober) {
+	c.reprober = r
 }
 
 // SetControllerClient injects the status-write client obtained from
@@ -517,6 +542,15 @@ func (s *engineSink) Report(st engine.EngineStatus) {
 // applyEngineReport performs the read-modify-write for one engine status report.
 // Must be called with writeMu held.
 func (c *ClusterCacheController) applyEngineReport(ctx context.Context, entry *engineEntry, st engine.EngineStatus) error {
+	// Poke a connection re-probe on the *transition into* EngineErrored (a broken
+	// watch is the earliest connection-loss signal — see ConnectionReprober).
+	// Gating on the transition, not every Errored report, keeps a persistent
+	// outage from re-poking faster than the engine's own backoff.
+	if c.reprober != nil && st.State == engine.EngineErrored && entry.lastReportedState != engine.EngineErrored {
+		c.reprober.Reprobe(ClusterID(entry.clusterObjID))
+	}
+	entry.lastReportedState = st.State
+
 	cond := syncedCondition(st, entry.parentGen)
 	lastSyncedAt := st.LastSyncedAt
 

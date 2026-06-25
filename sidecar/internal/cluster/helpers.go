@@ -16,6 +16,8 @@ package cluster
 
 import (
 	"context"
+	"os"
+	"strconv"
 	"sync"
 
 	"k8s.io/client-go/rest"
@@ -27,6 +29,39 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
+
+const (
+	// http2ReadIdleTimeoutSeconds and http2PingTimeoutSeconds tighten client-go's
+	// HTTP/2 connection health check, which detects and tears down a silently-dead
+	// API-server connection: an idle HTTP/2 connection is pinged after the read-idle
+	// timeout, and dropped if no pong arrives within the ping timeout. client-go
+	// enables the check by default but at 30s/15s — so a broken watch stream can
+	// linger ~45s before the engine even notices. Tightening to 10s/5s cuts
+	// worst-case connection-loss detection to ~15s, which is what lets the engine's
+	// watch-break → connection re-probe hook (the cache controller's reprober) fire
+	// promptly instead of waiting on the health-poll cadence.
+	http2ReadIdleTimeoutSeconds = 10
+	http2PingTimeoutSeconds     = 5
+)
+
+// ConfigureKubeHTTP2Keepalive tightens the HTTP/2 keepalive client-go applies to
+// every kube connection, by setting the env vars apimachinery's transport
+// defaults read (HTTP2_READ_IDLE_TIMEOUT_SECONDS / HTTP2_PING_TIMEOUT_SECONDS).
+// It writes a var only when unset, so an operator (or test) override wins, and is
+// safe to call once at startup — before any kube client builds its transport, the
+// values are read lazily per transport build. The composition root calls it.
+func ConfigureKubeHTTP2Keepalive() {
+	setEnvIfUnset("HTTP2_READ_IDLE_TIMEOUT_SECONDS", strconv.Itoa(http2ReadIdleTimeoutSeconds))
+	setEnvIfUnset("HTTP2_PING_TIMEOUT_SECONDS", strconv.Itoa(http2PingTimeoutSeconds))
+}
+
+// setEnvIfUnset sets key=val only when key is currently unset, so an existing
+// override is preserved.
+func setEnvIfUnset(key, val string) {
+	if _, ok := os.LookupEnv(key); !ok {
+		_ = os.Setenv(key, val)
+	}
+}
 
 // KubeConfigSource is the read surface of the kubeconfig watcher. Satisfied by
 // *k8shelpers.KubeConfigWatcher; tests substitute a static fake.

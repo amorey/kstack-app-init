@@ -153,6 +153,12 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	coreCtrl.SetControllerClient(coreCC)
 	cacheCtrl.SetControllerClient(cacheCC)
 
+	// When a sync engine's watch streams break (the earliest connection-loss
+	// signal), have the cache controller poke the core controller to re-probe that
+	// cluster's connection immediately, rather than waiting for the health-poll
+	// cadence.
+	cacheCtrl.SetReprober(coreCtrl)
+
 	return &Service{
 		bh:           bh,
 		bhStore:      bhStore,

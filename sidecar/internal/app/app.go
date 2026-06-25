@@ -81,6 +81,13 @@ func New(cfg Config) (*App, error) {
 		return nil, fmt.Errorf("data dir is required (--data-dir / KSTACK_DATA_DIR)")
 	}
 
+	// Tighten client-go's HTTP/2 keepalive so a silently-dropped API-server
+	// connection is detected in ~15s instead of client-go's ~45s default — the
+	// engine then surfaces the broken watch promptly and the cache controller's
+	// reprober re-probes the cluster's connection. Set once, before any kube
+	// client is built.
+	cluster.ConfigureKubeHTTP2Keepalive()
+
 	// The resync broadcaster is the shared, cross-subsystem poke bus. It owns the
 	// wall-clock gap detector (machine sleep/resume backstop) and accepts pokes
 	// from the host via the gRPC PokeService. Built before the cluster service so
