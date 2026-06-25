@@ -411,15 +411,17 @@ func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Objec
 	})
 
 	// Now that a probe has confirmed the physical cluster's kube-system UID, ensure a
-	// ClusterCache exists for that identity (one per identity per cluster — a migration
-	// to a new UID adds a second, coexisting cache). Creation is gated on the UID
-	// because it keys the cache's slug + spec. A store error here is non-fatal: the
+	// ClusterCache exists for that identity, then delete any cache left behind by a
+	// physical-cluster migration (a different, now-superseded UID). Both steps are
+	// gated on a confirmed UID — never on a transient disconnect (server.UID == nil),
+	// which must not prune the existing cache. A store error here is non-fatal: the
 	// status write below still records the successful connection, and the next reconcile
-	// (health cadence) retries the create.
+	// (health cadence) retries.
 	if server.UID != nil {
 		if err := c.ensureClusterCache(ctx, clusterID, obj.ID, *server.UID); err != nil {
 			slog.Warn("clustercontroller: ensure cache child", "cluster", clusterID, "err", err)
 		}
+		c.pruneSupersededCaches(ctx, clusterID, obj.ID, *server.UID)
 	}
 
 	phase, msg := c.check(ctx, restCfg)
@@ -474,10 +476,11 @@ func (c *ClusterCoreController) observeConnectFailure(conds *[]ClusterCondition,
 }
 
 // ensureClusterCache creates the ClusterCache child for one physical identity
-// (kube-system UID) if it does not already exist. The slug ("caches/{clusterID}/{uid}")
+// (kube-system UID) if it does not already exist. The slug ("{clusterID}/{uid}")
 // keys beehive's UNIQUE(slug) dedup, so concurrent reconciles racing the create
-// converge on one cache per (cluster, UID); a migration to a new UID adds a second,
-// coexisting cache rather than colliding.
+// converge on one cache per (cluster, UID). On a physical-cluster migration the new
+// UID's cache is created here and the superseded one is removed by
+// pruneSupersededCaches, so a Cluster keeps a single cache for its current identity.
 func (c *ClusterCoreController) ensureClusterCache(ctx context.Context, clusterID ClusterID, ownerID beehive.ObjectID, uid string) error {
 	slug := ClusterCacheSlug(clusterID, uid)
 	_, err := c.cacheClient.GetBySlug(ctx, slug)
@@ -490,6 +493,10 @@ func (c *ClusterCoreController) ensureClusterCache(ctx context.Context, clusterI
 	_, err = c.cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: uid},
 		beehive.WithSlug(slug),
 		beehive.WithOwner(ownerID),
+		// Gate deletion on the cache controller flushing this cache's on-disk
+		// files (UID-switch prune or cluster-delete cascade): GC won't collect the
+		// row until the finalizer is cleared, so the .db file can't leak.
+		beehive.WithFinalizers(cacheFilesFinalizer),
 	)
 	if err != nil {
 		// A concurrent reconcile (e.g. an out-of-band kubeconfig re-reconcile racing
@@ -501,6 +508,40 @@ func (c *ClusterCoreController) ensureClusterCache(ctx context.Context, clusterI
 		return err
 	}
 	return nil
+}
+
+// pruneSupersededCaches requests deletion of every ClusterCache owned by ownerID
+// whose ServerUID differs from activeUID — the caches left behind when the cluster's
+// physical identity changed (a kube-context now points at a different cluster). The
+// active identity's cache is kept. Deletion is a soft request (beehive sets
+// DeletionRequestedAt); the ClusterCache's own finalizer holds the row until the cache
+// controller has stopped its engine and deleted the on-disk file, so this never races
+// the file cleanup. Only ever called with a confirmed activeUID (post-probe), so a
+// disconnected cluster (no Server.UID) never prunes. Errors are logged, not fatal: the
+// next reconcile retries, and a half-pruned set converges.
+func (c *ClusterCoreController) pruneSupersededCaches(ctx context.Context, clusterID ClusterID, ownerID beehive.ObjectID, activeUID string) {
+	// ListOwned is scoped to the client's own kind, so it must run on the owner's
+	// (Cluster) client; the children are then read/deleted through the cache client.
+	refs, err := c.coreClient.ListOwned(ctx, ownerID)
+	if err != nil {
+		slog.Warn("clustercontroller: list caches for prune", "cluster", clusterID, "err", err)
+		return
+	}
+	for _, ref := range refs {
+		if ref.Kind != ClusterCacheGroupKind.Kind {
+			continue
+		}
+		cacheObj, err := c.cacheClient.Get(ctx, ref.ID)
+		if err != nil {
+			continue
+		}
+		if cacheObj.Spec.ServerUID == activeUID || cacheObj.DeletionRequestedAt != nil {
+			continue // the active cache, or one already being deleted
+		}
+		if err := c.cacheClient.Delete(ctx, ref.ID); err != nil {
+			slog.Warn("clustercontroller: delete superseded cache", "cluster", clusterID, "cache", ref.ID, "err", err)
+		}
+	}
 }
 
 // clusterIDFromObj returns the ClusterID of a Cluster object: its beehive

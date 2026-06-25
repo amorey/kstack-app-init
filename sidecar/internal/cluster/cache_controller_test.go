@@ -16,6 +16,7 @@ package cluster_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -208,6 +209,43 @@ func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
 	assert.Equal(t, cluster.ConditionTrue, synced.Status,
 		"engine started and reported Watching → Synced=True")
 	assert.True(t, fakeEng.started.Load())
+}
+
+// TestCacheControllerDeletionStopsEngineAndClearsFinalizer verifies the cache
+// teardown path used by a UID-switch prune (and a cluster-delete cascade): when a
+// ClusterCache carrying the file-cleanup finalizer is deleted, the controller stops
+// its engine, flushes the on-disk file, then clears the finalizer so GC collects the
+// row. Without clearing the finalizer the deletion-pending row would linger forever.
+func TestCacheControllerDeletionStopsEngineAndClearsFinalizer(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
+
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := cluster.ClusterID(clusterObj.ID)
+
+	// Create the cache exactly as ensureClusterCache does in production: owned,
+	// slugged, and carrying the file-cleanup finalizer (the literal must match the
+	// package's cacheFilesFinalizer — see the core controller test, which pins it
+	// against the production create path).
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id, testCacheUID)),
+		beehive.WithOwner(clusterObj.ID),
+		beehive.WithFinalizers("kstack.io/cache-files"))
+	require.NoError(t, err)
+
+	// Let the engine spin up so its stop is observable.
+	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, cluster.ConditionTrue)
+	require.True(t, fakeEng.started.Load())
+
+	// Delete → controller flushes files + clears the finalizer → GC removes the row.
+	require.NoError(t, cacheClient.Delete(ctx, cacheObj.ID))
+
+	require.Eventually(t, func() bool {
+		_, err := cacheClient.Get(ctx, cacheObj.ID)
+		return errors.Is(err, beehive.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "cache row must be GC'd once its finalizer is cleared")
+	assert.True(t, fakeEng.stopped.Load(), "engine must be stopped on deletion")
 }
 
 func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {

@@ -80,6 +80,12 @@ type engineEntry struct {
 	parentGen int64
 }
 
+// cacheFilesFinalizer gates a ClusterCache's deletion on this controller deleting
+// its on-disk cache file. It is set at creation (ensureClusterCache) and cleared on
+// the deletion reconcile once the file is gone, so GC can't collect the row — and
+// orphan the file — before the cleanup runs.
+const cacheFilesFinalizer = "kstack.io/cache-files"
+
 // ClusterCacheController reconciles ClusterCache beehive objects: it manages
 // the sync engine lifecycle for each cluster cache, folding engine reports
 // back into ClusterCacheStatus as the Synced condition.
@@ -204,8 +210,27 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 	if err != nil {
 		return beehive.Result{}, err
 	}
+
+	// Deletion (a UID-switch prune or a cluster-delete cascade): stop the engine,
+	// delete the on-disk cache file, then clear the finalizer so GC can collect the
+	// row. The locator is the owner's id (the per-cluster dir) + this cache's id (the
+	// file); if the owner is already gone we can't form that path, so we clean up the
+	// engine and clear the finalizer best-effort rather than wedging GC forever. A
+	// file-delete error returns without clearing the finalizer, so the row lingers and
+	// the next reconcile retries — the file can't be orphaned.
+	if obj.DeletionRequestedAt != nil {
+		c.stopEngine(obj.ID)
+		if ok {
+			if err := c.cacheManager.DeleteCacheFiles(ctx, newCacheRef(owner.ID, obj.ID)); err != nil {
+				return beehive.Result{}, err
+			}
+		}
+		return beehive.Result{}, c.clearCacheFilesFinalizer(ctx, client, obj)
+	}
+
 	if !ok {
-		// No owner — the parent was GC'd; our object is being cleaned up too.
+		// No owner and not being deleted — the parent was GC'd; our object is being
+		// cleaned up too.
 		return beehive.Result{}, nil
 	}
 	clusterID := ClusterID(owner.ID)
@@ -232,11 +257,6 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 	}
 	if fresh, err := c.coreClient.Get(ctx, beehive.ObjectID(clusterID)); err == nil {
 		clusterObj = fresh
-	}
-
-	if obj.DeletionRequestedAt != nil {
-		c.stopEngine(obj.ID)
-		return beehive.Result{}, nil
 	}
 
 	// This cache is "active" when it mirrors the cluster's currently-connected
@@ -267,6 +287,17 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 	}
 	return beehive.Result{RequeueAfter: requeueAfter},
 		client.UpdateStatus(ctx, obj.ID, obj.Generation, working)
+}
+
+// clearCacheFilesFinalizer removes cacheFilesFinalizer so GC can collect the row.
+// It is a no-op when the finalizer is absent — a ClusterCache created before the
+// finalizer was introduced, or a double reconcile of the deletion — so it never errors
+// on a missing finalizer.
+func (c *ClusterCacheController) clearCacheFilesFinalizer(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) error {
+	if !slices.Contains(obj.Finalizers, cacheFilesFinalizer) {
+		return nil
+	}
+	return client.DeleteFinalizer(ctx, obj.ID, cacheFilesFinalizer)
 }
 
 // converge manages this ClusterCache's sync engine toward the parent Cluster's

@@ -17,6 +17,7 @@ package cluster_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +44,48 @@ func staticProbe(server cluster.ClusterServer, principal cluster.ClusterPrincipa
 func errProbe(err error) cluster.ProbeFunc {
 	return func(context.Context, *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
 		return cluster.ClusterServer{}, cluster.ClusterPrincipal{}, err
+	}
+}
+
+// mutableProbe returns a successful ProbeFunc whose reported kube-system UID can be
+// changed between reconciles, so a test can simulate a physical-cluster migration: the
+// same kube-context now resolving to a different cluster identity. The read is
+// mutex-guarded because the controller probes from its own goroutine.
+func mutableProbe(initial string) (cluster.ProbeFunc, func(string)) {
+	var mu sync.Mutex
+	uid := initial
+	probe := func(context.Context, *rest.Config) (cluster.ClusterServer, cluster.ClusterPrincipal, error) {
+		mu.Lock()
+		u := uid
+		mu.Unlock()
+		return cluster.ClusterServer{UID: &u}, cluster.ClusterPrincipal{}, nil
+	}
+	return probe, func(n string) { mu.Lock(); uid = n; mu.Unlock() }
+}
+
+// waitForCacheBySlug blocks until a ClusterCache with the given slug exists, then
+// returns it (or fails on timeout). It is event-driven over WatchList — current-on-
+// subscribe, then live deltas — so it observes a cache that exists already as well as
+// one created after the subscribe (the first Added carrying the slug), with no polling.
+func waitForCacheBySlug(t *testing.T, cl beehive.Client[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus], slug string) *beehive.Object[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus] {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := cl.WatchList(ctx)
+	require.NoError(t, err)
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				t.Fatalf("watch closed before ClusterCache %q appeared", slug)
+			}
+			if ev.Object != nil && ev.Object.Slug != nil && *ev.Object.Slug == slug {
+				return ev.Object
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for ClusterCache %q", slug)
+		}
 	}
 }
 
@@ -203,6 +246,52 @@ func TestClusterCoreControllerSuccessfulProbeWritesConditions(t *testing.T) {
 	cacheObj, err := cacheClient.GetBySlug(ctx, cluster.ClusterCacheSlug(id, uid))
 	require.NoError(t, err, "ClusterCache child must exist after successful reconcile")
 	assert.Equal(t, uid, cacheObj.Spec.ServerUID, "cache spec records the identity it mirrors")
+}
+
+// TestClusterCoreControllerUIDSwitchPrunesSupersededCache verifies the server-UID
+// switch behavior: when a probe reports a new kube-system UID (the kube-context now
+// points at a different physical cluster), the controller creates a cache for the new
+// identity and requests deletion of the superseded one — while the Cluster's own id
+// (its beehive ObjectID) stays consistent. The old cache is held in a deletion-pending
+// state by its finalizer (the NoopController here never clears it), which is exactly
+// what gates the cache controller's on-disk file cleanup in production.
+func TestClusterCoreControllerUIDSwitchPrunesSupersededCache(t *testing.T) {
+	w := testutil.NewStaticWatcher(t, testutil.TestKubeConfig("alpha"))
+	probe, setUID := mutableProbe("uid-old")
+	coreClient, cacheClient := newClusterTestBeehive(t, w, probe, staticCheck(cluster.HealthPhaseHealthy), nil)
+	ctx := context.Background()
+
+	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
+	require.NoError(t, err)
+	id := cluster.ClusterID(obj.ID)
+
+	// First probe creates the cache for the original identity — carrying the finalizer
+	// that gates its deletion on file cleanup.
+	oldCache := waitForCacheBySlug(t, cacheClient, cluster.ClusterCacheSlug(id, "uid-old"))
+	assert.Contains(t, oldCache.Finalizers, "kstack.io/cache-files",
+		"a created cache must carry the file-cleanup finalizer")
+
+	// Simulate the migration, then force a re-probe with a spec edit (bumps generation).
+	setUID("uid-new")
+	renamed := eligibleSpec("alpha")
+	name := "renamed"
+	renamed.Name = &name
+	_, err = coreClient.Update(ctx, beehive.ObjectID(id), renamed)
+	require.NoError(t, err)
+
+	// A cache for the new identity is created...
+	newCache := waitForCacheBySlug(t, cacheClient, cluster.ClusterCacheSlug(id, "uid-new"))
+	assert.Equal(t, "uid-new", newCache.Spec.ServerUID)
+	assert.NotEqual(t, oldCache.ID, newCache.ID, "a migration mints a fresh cache, not a reuse")
+
+	// ...and the superseded one is requested for deletion (lingering on its finalizer).
+	require.Eventually(t, func() bool {
+		got, err := cacheClient.Get(ctx, oldCache.ID)
+		return err == nil && got.DeletionRequestedAt != nil
+	}, 2*time.Second, 10*time.Millisecond, "superseded cache must be deletion-requested")
+
+	// The Cluster identity is unchanged across the switch.
+	assert.Equal(t, beehive.ObjectID(id), obj.ID)
 }
 
 func TestClusterCoreControllerProbeFailureSetsConnectedFalse(t *testing.T) {
