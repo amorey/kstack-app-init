@@ -43,8 +43,9 @@ func (c *noopController[Spec, Status]) Reconcile(context.Context, beehive.Contro
 
 // newServiceTest builds a started beehive with no-op controllers and returns a
 // service wired to its clients plus a temp cache manager. The returned
-// ControllerClient writes ClusterCache status (the controller-owned surface).
-func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterCacheStatus]) {
+// ControllerClients write Cluster status (core) and ClusterCache status — the
+// controller-owned surfaces a white-box test stamps directly.
+func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterStatus], beehive.ControllerClient[ClusterCacheStatus]) {
 	t.Helper()
 	st, err := sqlite.OpenMemory()
 	require.NoError(t, err)
@@ -55,7 +56,7 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterCac
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
-	_, err = beehive.Register(bh, ClusterGroupKind, &noopController[ClusterSpec, ClusterStatus]{})
+	coreCC, err := beehive.Register(bh, ClusterGroupKind, &noopController[ClusterSpec, ClusterStatus]{})
 	require.NoError(t, err)
 	cacheCC, err := beehive.Register(bh, ClusterCacheGroupKind, &noopController[ClusterCacheSpec, ClusterCacheStatus]{})
 	require.NoError(t, err)
@@ -69,7 +70,7 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterCac
 		cacheClient:  cacheClient,
 		cacheManager: store.NewManager(t.TempDir()),
 		connMgr:      NewConnectionManager(),
-	}, cacheCC
+	}, coreCC, cacheCC
 }
 
 // seedCluster creates a Cluster (as the importer would, with the kubeconfig
@@ -88,9 +89,36 @@ func seedCluster(t *testing.T, s *Service, ctxName string) ClusterID {
 	return ClusterID(obj.ID)
 }
 
+// stampActiveUID records uid as a cluster's last-probed kube-system identity by
+// writing it to Status.Server.UID (as the ClusterCoreController would after a
+// probe). A ClusterCache for the same uid then resolves as the cluster's active
+// cache.
+func stampActiveUID(t *testing.T, s *Service, coreCC beehive.ControllerClient[ClusterStatus], id ClusterID, uid string) {
+	t.Helper()
+	ctx := context.Background()
+	obj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
+	require.NoError(t, err)
+	require.NoError(t, coreCC.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterStatus{
+		Server: ClusterServer{UID: &uid},
+	}))
+}
+
+// seedActiveCache creates an active ClusterCache for a cluster: it stamps the
+// cluster's connected UID and creates a ClusterCache (owned, UID-keyed slug) for
+// that identity. Returns the cache's ObjectID.
+func seedActiveCache(t *testing.T, s *Service, coreCC beehive.ControllerClient[ClusterStatus], id ClusterID, uid string) beehive.ObjectID {
+	t.Helper()
+	ctx := context.Background()
+	stampActiveUID(t, s, coreCC, id, uid)
+	cacheObj, err := s.cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: uid},
+		beehive.WithSlug(ClusterCacheSlug(id, uid)), beehive.WithOwner(beehive.ObjectID(id)))
+	require.NoError(t, err)
+	return cacheObj.ID
+}
+
 func TestServiceListAndGet(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newServiceTest(t)
+	s, _, _ := newServiceTest(t)
 	idAlpha := seedCluster(t, s, "alpha")
 	seedCluster(t, s, "beta")
 
@@ -113,14 +141,15 @@ func TestServiceListAndGet(t *testing.T) {
 
 func TestServiceGetJoinsSyncStatus(t *testing.T) {
 	ctx := context.Background()
-	s, cacheCtl := newServiceTest(t)
+	s, coreCC, cacheCtl := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+
 	now := time.Now().UTC()
-	_, err := s.cacheClient.Create(ctx, ClusterCacheSpec{}, beehive.WithSlug(ClusterCacheSlug(id)))
-	require.NoError(t, err)
 	// Give the ClusterCache a Synced status to join in.
-	cacheObj, err := s.cacheClient.GetBySlug(ctx, ClusterCacheSlug(id))
+	cacheObj, err := s.cacheClient.Get(ctx, cacheID)
 	require.NoError(t, err)
 	require.NoError(t, cacheCtl.UpdateStatus(ctx, cacheObj.ID, cacheObj.Generation, ClusterCacheStatus{
 		LastSyncedAt: &now,
@@ -129,13 +158,49 @@ func TestServiceGetJoinsSyncStatus(t *testing.T) {
 	c, err := s.Get(ctx, id)
 	require.NoError(t, err)
 	require.NotNil(t, c)
-	require.NotNil(t, c.Cache.Status.LastSyncedAt)
-	assert.WithinDuration(t, now, *c.Cache.Status.LastSyncedAt, time.Second)
+	// The owned cache shows up in Caches and, because its UID matches the cluster's
+	// active identity, as ActiveCache with the joined sync status.
+	require.Len(t, c.Caches, 1)
+	assert.Equal(t, ClusterCacheID(cacheID), c.Caches[0].ID)
+	assert.True(t, c.Caches[0].Enabled)
+	require.NotNil(t, c.ActiveCache)
+	assert.Equal(t, uid, c.ActiveCache.ServerUID)
+	require.NotNil(t, c.ActiveCache.Status.LastSyncedAt)
+	assert.WithinDuration(t, now, *c.ActiveCache.Status.LastSyncedAt, time.Second)
+}
+
+// A cache whose UID does not match the cluster's last-probed identity (left behind
+// by a physical migration) is listed in Caches but is not the ActiveCache.
+func TestServiceGetInactiveCacheNotActive(t *testing.T) {
+	ctx := context.Background()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	// Active identity is "new-uid"; an older cache for "old-uid" lingers.
+	seedActiveCache(t, s, coreCC, id, "new-uid")
+	_, err := s.cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: "old-uid"},
+		beehive.WithSlug(ClusterCacheSlug(id, "old-uid")), beehive.WithOwner(beehive.ObjectID(id)))
+	require.NoError(t, err)
+
+	c, err := s.Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	require.Len(t, c.Caches, 2)
+	require.NotNil(t, c.ActiveCache)
+	assert.Equal(t, "new-uid", c.ActiveCache.ServerUID)
+	// Exactly one is enabled (the active identity's cache).
+	enabledCount := 0
+	for _, cc := range c.Caches {
+		if cc.Enabled {
+			enabledCount++
+		}
+	}
+	assert.Equal(t, 1, enabledCount)
 }
 
 func TestServiceGetDeletionPendingIsNil(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newServiceTest(t)
+	s, _, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
 	obj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
@@ -149,7 +214,7 @@ func TestServiceGetDeletionPendingIsNil(t *testing.T) {
 
 func TestServiceSetEnabled(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newServiceTest(t)
+	s, _, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
 	c, err := s.SetEnabled(ctx, id, false)
@@ -164,7 +229,7 @@ func TestServiceSetEnabled(t *testing.T) {
 
 func TestServiceSetSyncEnabled(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newServiceTest(t)
+	s, _, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
 	c, err := s.SetSyncEnabled(ctx, id, false)
@@ -183,7 +248,7 @@ func TestServiceSetSyncEnabled(t *testing.T) {
 // untouched and an unknown id still errors.
 func TestServiceRetryConnectionDoesNotMutateSpec(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newServiceTest(t)
+	s, _, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
 	before, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
@@ -202,52 +267,65 @@ func TestServiceRetryConnectionDoesNotMutateSpec(t *testing.T) {
 
 func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newServiceTest(t)
+	s, coreCC, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+
 	// cacheCtrl is nil in this white-box harness, so ClearCache deletes the
-	// on-disk cache (a no-op here — none exists) and returns the record without
-	// restarting an engine. The engine-restart path is covered in
+	// on-disk cache (a no-op here — none exists on disk) and returns the record
+	// without restarting an engine. The engine-restart path is covered in
 	// cache_controller_test.go.
 	c, err := s.ClearCache(ctx, id)
 	require.NoError(t, err)
 	require.NotNil(t, c)
 	assert.Equal(t, id, c.ID)
 
-	stats, err := s.CacheStats(ctx, id)
+	stats, err := s.CacheStats(ctx, id, ClusterCacheID(cacheID))
 	require.NoError(t, err)
 	assert.False(t, stats.Exists)
 }
 
-// cacheRef resolves the on-disk locator in one lookup: the directory id is the
-// ClusterID itself (the parent Cluster's beehive ObjectID), and only the
-// ClusterCache child (the file id) is fetched, by its slug. A cluster with no
-// ClusterCache child resolves to found=false (no error).
-func TestServiceCacheRefResolvesObjectIDs(t *testing.T) {
+// cacheRef resolves the *active* cache's on-disk locator: the directory id is the
+// ClusterID (the parent Cluster's beehive ObjectID), and the file id is the
+// ClusterCache for the cluster's currently-connected identity (its UID matches
+// Status.Server.UID). A cluster with no active cache resolves to found=false.
+func TestServiceCacheRefResolvesActiveCache(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newServiceTest(t)
+	s, coreCC, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
-	cacheObj, err := s.cacheClient.Create(ctx, ClusterCacheSpec{},
-		beehive.WithSlug(ClusterCacheSlug(id)), beehive.WithOwner(beehive.ObjectID(id)))
-	require.NoError(t, err)
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
 
 	ref, found, err := s.cacheRef(ctx, id)
 	require.NoError(t, err)
 	require.True(t, found)
-	assert.Equal(t, store.CacheRef{ClusterID: int64(id), CacheID: int64(cacheObj.ID)}, ref,
-		"ref must be the parent Cluster + ClusterCache ObjectIDs")
+	assert.Equal(t, store.CacheRef{ClusterID: int64(id), CacheID: int64(cacheID)}, ref,
+		"ref must be the parent Cluster + active ClusterCache ObjectIDs")
 
-	// A cluster with no ClusterCache child: no cache files, no error.
+	// A cluster that has never probed (no Server.UID) has no active cache: no error.
 	id2 := seedCluster(t, s, "beta")
 	_, found2, err := s.cacheRef(ctx, id2)
 	require.NoError(t, err)
 	assert.False(t, found2)
+
+	// A cluster whose only cache is for a migrated-away identity (UID != active) also
+	// has no active cache.
+	id3 := seedCluster(t, s, "gamma")
+	stampActiveUID(t, s, coreCC, id3, "new-uid")
+	_, err = s.cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: "old-uid"},
+		beehive.WithSlug(ClusterCacheSlug(id3, "old-uid")), beehive.WithOwner(beehive.ObjectID(id3)))
+	require.NoError(t, err)
+	_, found3, err := s.cacheRef(ctx, id3)
+	require.NoError(t, err)
+	assert.False(t, found3)
 }
 
 func TestServiceDeleteTombstonesCluster(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newServiceTest(t)
+	s, _, _ := newServiceTest(t)
 
 	// Seed with a finalizer so the soft-delete tombstone is observable without a
 	// race: beehive GC is a no-op while an object still holds a finalizer, so the
@@ -275,7 +353,7 @@ func TestServiceDeleteTombstonesCluster(t *testing.T) {
 }
 
 func TestServiceGetConnection(t *testing.T) {
-	s, _ := newServiceTest(t)
+	s, _, _ := newServiceTest(t)
 	id := ClusterID(1)
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
 
@@ -290,7 +368,7 @@ func TestServiceGetConnection(t *testing.T) {
 func TestServiceWatchEmitsSeedThenReemits(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s, _ := newServiceTest(t)
+	s, _, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
 	ch, err := s.Watch(ctx)

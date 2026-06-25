@@ -15,10 +15,12 @@
 package cluster
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
@@ -45,8 +47,11 @@ type ClusterService interface {
 	// list on every Cluster or ClusterCache change. The channel closes when ctx
 	// ends.
 	Watch(ctx context.Context) (<-chan []*Cluster, error)
-	// ClusterCacheStats returns live per-cluster cache statistics.
-	CacheStats(ctx context.Context, id ClusterID) (*ClusterCacheStats, error)
+	// CacheStats returns live on-disk statistics for one ClusterCache, located by
+	// its parent ClusterID (the cache directory) and its own ClusterCacheID (the
+	// cache file). A cluster can own several caches, so stats are per-cache, not
+	// per-cluster.
+	CacheStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*ClusterCacheStats, error)
 	// SetEnabled enables or disables a cluster in the app (connection eligibility
 	// + visibility in pickers) and returns the updated record.
 	SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)
@@ -252,15 +257,12 @@ func (s *Service) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
 	return &c, nil
 }
 
-// ClusterCacheStats implements ClusterService.
-func (s *Service) CacheStats(ctx context.Context, id ClusterID) (*ClusterCacheStats, error) {
-	ref, found, err := s.cacheRef(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return &ClusterCacheStats{}, nil
-	}
+// CacheStats implements ClusterService. It stats one specific ClusterCache (by
+// parent ClusterID + cache id), so the live-stats resolver can report the cache it
+// was asked about — active or a migrated-away one — without re-resolving "the"
+// cache for a cluster.
+func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*ClusterCacheStats, error) {
+	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	bytes, exists := s.cacheManager.CacheBytes(ref)
 	if !exists {
 		return &ClusterCacheStats{}, nil
@@ -445,15 +447,57 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterS
 		c.Status = *obj.Status
 	}
 
-	// Join in the ClusterCache child: its sync status plus the ID the live-stats
-	// resolver needs.
-	c.Cache.ID = id
-	cacheObj, err := s.cacheClient.GetBySlug(ctx, ClusterCacheSlug(id))
-	if err == nil && cacheObj.Status != nil {
-		c.Cache.Status = *cacheObj.Status
-	}
+	// Join in the cluster's owned ClusterCache children (zero or more): each carries
+	// its own sync status, the ids the live-stats resolver needs, and whether it is
+	// the currently-active identity's cache.
+	c.Caches, c.ActiveCache = s.listCaches(ctx, obj)
 
 	return c
+}
+
+// listCaches enumerates a cluster's owned ClusterCache children via the beehive
+// owner edge (ListOwned on the Cluster kind), builds each into a domain ClusterCache,
+// and returns them sorted by id alongside a pointer to the active one (the cache whose
+// UID matches the cluster's last-probed Server.UID), or nil when none is active. A
+// per-child read error skips that child rather than failing the whole join — a partial
+// view beats none for a status read.
+func (s *Service) listCaches(ctx context.Context, clusterObj *beehive.Object[ClusterSpec, ClusterStatus]) ([]ClusterCache, *ClusterCache) {
+	clusterID := ClusterID(clusterObj.ID)
+
+	refs, err := s.coreClient.ListOwned(ctx, clusterObj.ID)
+	if err != nil {
+		return nil, nil
+	}
+	caches := make([]ClusterCache, 0, len(refs))
+	for _, ref := range refs {
+		if ref.Kind != ClusterCacheGroupKind.Kind {
+			continue
+		}
+		cacheObj, err := s.cacheClient.Get(ctx, ref.ID)
+		if err != nil {
+			continue
+		}
+		cc := ClusterCache{
+			ID:        ClusterCacheID(cacheObj.ID),
+			ClusterID: clusterID,
+			ServerUID: cacheObj.Spec.ServerUID,
+			Enabled:   cacheIsActive(clusterObj, cacheObj.Spec.ServerUID),
+		}
+		if cacheObj.Status != nil {
+			cc.Status = *cacheObj.Status
+		}
+		caches = append(caches, cc)
+	}
+	slices.SortFunc(caches, func(a, b ClusterCache) int { return cmp.Compare(a.ID, b.ID) })
+
+	var active *ClusterCache
+	for i := range caches {
+		if caches[i].Enabled {
+			active = &caches[i]
+			break
+		}
+	}
+	return caches, active
 }
 
 // clusterByID fetches a Cluster object by id, mapping beehive.ErrNotFound to the
@@ -466,17 +510,26 @@ func (s *Service) clusterByID(ctx context.Context, id ClusterID) (*beehive.Objec
 	return obj, err
 }
 
-// cacheRef resolves the on-disk cache locator for a cluster: the beehive
-// ObjectIDs of the parent Cluster (directory) and its ClusterCache child (file).
-// found is false when the ClusterCache is missing — the cluster has no cache
-// files (it never became sync-eligible, or is being torn down), which callers
-// treat as "no cache" rather than an error.
-//
-// One lookup: the ClusterID IS the parent Cluster's ObjectID (the directory), so
-// only the ClusterCache child (the file) needs fetching — by its slug, which is
-// keyed on that same parent ObjectID.
+// cacheRef resolves the on-disk cache locator for a cluster's *active* cache: the
+// beehive ObjectIDs of the parent Cluster (directory) and the ClusterCache for its
+// currently-connected identity (file). found is false when there is no active cache
+// — the cluster has never successfully probed (no Server.UID yet), or the cache for
+// that UID is missing/torn-down — which callers treat as "no cache" rather than an
+// error. The active identity's UID keys the cache slug, so resolving it takes the
+// parent read (for Server.UID) plus a slug lookup.
 func (s *Service) cacheRef(ctx context.Context, id ClusterID) (store.CacheRef, bool, error) {
-	cacheObj, err := s.cacheClient.GetBySlug(ctx, ClusterCacheSlug(id))
+	clusterObj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
+	if errors.Is(err, beehive.ErrNotFound) {
+		return store.CacheRef{}, false, nil
+	}
+	if err != nil {
+		return store.CacheRef{}, false, err
+	}
+	activeUID := clusterActiveUID(clusterObj)
+	if activeUID == "" {
+		return store.CacheRef{}, false, nil
+	}
+	cacheObj, err := s.cacheClient.GetBySlug(ctx, ClusterCacheSlug(id, activeUID))
 	if errors.Is(err, beehive.ErrNotFound) {
 		return store.CacheRef{}, false, nil
 	}

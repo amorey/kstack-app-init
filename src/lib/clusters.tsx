@@ -61,7 +61,10 @@ const ClustersWatchSubscription = graphql(`
           reason
         }
       }
-      cache {
+      activeCache {
+        id
+        serverUid
+        enabled
         status {
           conditions {
             type

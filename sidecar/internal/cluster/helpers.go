@@ -58,6 +58,26 @@ func connectionEligible(obj *beehive.Object[ClusterSpec, ClusterStatus], present
 		present
 }
 
+// clusterActiveUID returns the kube-system UID of a cluster's currently-connected
+// physical identity — its last-probed Server.UID — or "" if it has never
+// successfully probed. This UID selects which owned ClusterCache is active.
+func clusterActiveUID(obj *beehive.Object[ClusterSpec, ClusterStatus]) string {
+	if obj.Status != nil && obj.Status.Server.UID != nil {
+		return *obj.Status.Server.UID
+	}
+	return ""
+}
+
+// cacheIsActive reports whether a ClusterCache mirroring kube-system UID cacheUID
+// is its parent's currently-active identity (cacheUID == the cluster's active UID).
+// A cache for an empty/unknown identity is never active. This is the single
+// definition of "active cache" shared by the cache controller (engine gating) and
+// the service (domain join + active-cache resolution).
+func cacheIsActive(clusterObj *beehive.Object[ClusterSpec, ClusterStatus], cacheUID string) bool {
+	active := clusterActiveUID(clusterObj)
+	return active != "" && cacheUID == active
+}
+
 // ResolveRESTConfig materializes client credentials for one kube-context.
 func ResolveRESTConfig(cfg *api.Config, contextName string) (*rest.Config, error) {
 	return clientcmd.NewNonInteractiveClientConfig(

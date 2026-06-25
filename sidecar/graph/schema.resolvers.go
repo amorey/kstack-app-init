@@ -14,11 +14,12 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 )
 
-// Stats is the resolver for the cache.stats field: live stats from the
-// per-cluster cache (a resolver so a query only pays the stat query when it
-// selects them). The ClusterCache child carries the cluster ID for the lookup.
+// Stats is the resolver for the cache.stats field: live stats from this specific
+// cache (a resolver so a query only pays the stat query when it selects them). The
+// ClusterCache child carries both its parent cluster id (the cache directory) and
+// its own id (the cache file) for the lookup.
 func (r *clusterCacheResolver) Stats(ctx context.Context, obj *cluster.ClusterCache) (*cluster.ClusterCacheStats, error) {
-	return r.ClusterSvc.CacheStats(ctx, obj.ID)
+	return r.ClusterSvc.CacheStats(ctx, obj.ClusterID, obj.ID)
 }
 
 // Permissions is the resolver for the permissions field — the one live cluster

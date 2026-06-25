@@ -147,12 +147,19 @@ func eligibleClusterSpec(contextName string) cluster.ClusterSpec {
 	}
 }
 
+// testCacheUID is the kube-system UID the cache tests' parent Cluster reports as
+// its connected identity. A ClusterCache is the parent's *active* cache (and so
+// runs an engine) only when its spec UID matches the parent's Status.Server.UID,
+// so the tests create their cache with this UID and presenceController stamps it.
+const testCacheUID = "kube-system-uid"
+
 // presenceController is the test stand-in for the Cluster kind's controller in
 // the cache tests. The cache controller gates on the parent's *observed* presence
-// (ClusterStatus.Source.Kubeconfig.IsPresent), which the real ClusterCoreController
-// writes from the live kubeconfig — so the cache tests need that status present.
-// This minimal controller stamps it (and the status write wakes the ClusterCache
-// dependent, exercising the real trigger path) without the probing machinery.
+// (ClusterStatus.Source.Kubeconfig.IsPresent) AND on the cache being the active
+// identity (its UID == ClusterStatus.Server.UID) — both written by the real
+// ClusterCoreController after a probe. This minimal controller stamps both (and the
+// status write wakes the ClusterCache dependent, exercising the real trigger path)
+// without the probing machinery.
 type presenceController struct{}
 
 func (presenceController) Reconcile(
@@ -164,15 +171,21 @@ func (presenceController) Reconcile(
 	if kc == nil {
 		return beehive.Result{}, nil
 	}
-	want := cluster.ClusterStatusSourceKubeconfig{
+	wantSrc := cluster.ClusterStatusSourceKubeconfig{
 		Cluster:   kc.Context + "-cluster",
 		User:      kc.Context + "-user",
 		IsPresent: true,
 	}
-	if obj.Status != nil && obj.Status.Source.Kubeconfig != nil && *obj.Status.Source.Kubeconfig == want {
+	uid := testCacheUID
+	if obj.Status != nil && obj.Status.Source.Kubeconfig != nil &&
+		*obj.Status.Source.Kubeconfig == wantSrc &&
+		obj.Status.Server.UID != nil && *obj.Status.Server.UID == uid {
 		return beehive.Result{}, nil // already stamped: no rewrite
 	}
-	status := cluster.ClusterStatus{Source: cluster.ClusterStatusSource{Kubeconfig: &want}}
+	status := cluster.ClusterStatus{
+		Source: cluster.ClusterStatusSource{Kubeconfig: &wantSrc},
+		Server: cluster.ClusterServer{UID: &uid},
+	}
 	return beehive.Result{}, client.UpdateStatus(ctx, obj.ID, obj.Generation, status)
 }
 
@@ -186,8 +199,8 @@ func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
 	id := cluster.ClusterID(clusterObj.ID)
 
 	// Create ClusterCache child.
-	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
-		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id, testCacheUID)),
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
@@ -208,8 +221,8 @@ func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {
 	require.NoError(t, err)
 	id := cluster.ClusterID(clusterObj.ID)
 
-	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
-		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id, testCacheUID)),
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
@@ -242,8 +255,8 @@ func TestCacheControllerReportWithParentGenerationAhead(t *testing.T) {
 	require.Greater(t, clusterObj.Generation, int64(1),
 		"parent generation must be ahead of the cache object's gen 1")
 
-	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
-		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id, testCacheUID)),
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
@@ -268,8 +281,8 @@ func TestCacheControllerUsesConnectionManagerConfig(t *testing.T) {
 	require.NoError(t, err)
 	id := cluster.ClusterID(clusterObj.ID)
 	connMgr.Set(id, injected)
-	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
-		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id, testCacheUID)),
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
@@ -290,8 +303,8 @@ func TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager(t *testing.
 	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
 	require.NoError(t, err)
 	id := cluster.ClusterID(clusterObj.ID)
-	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
-		beehive.WithSlug(cluster.ClusterCacheSlug(id)),
+	cacheObj, err := cacheClient.Create(ctx, cluster.ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id, testCacheUID)),
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
@@ -340,8 +353,8 @@ func TestCacheControllerPokeRestartsLiveEngine(t *testing.T) {
 	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
 	require.NoError(t, err)
 	id := cluster.ClusterID(clusterObj.ID)
-	_, err = cacheClient.Create(ctx, cluster.ClusterCacheSpec{},
-		beehive.WithSlug(cluster.ClusterCacheSlug(id)), beehive.WithOwner(clusterObj.ID))
+	_, err = cacheClient.Create(ctx, cluster.ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(cluster.ClusterCacheSlug(id, testCacheUID)), beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
 	// The first engine starts for the eligible cluster.

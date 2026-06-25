@@ -199,9 +199,10 @@ func TestClusterCoreControllerSuccessfulProbeWritesConditions(t *testing.T) {
 
 	assert.NotNil(t, got.Status.LastConnectedAt)
 
-	// ClusterCache child must have been created.
-	_, err = cacheClient.GetBySlug(ctx, cluster.ClusterCacheSlug(id))
+	// ClusterCache child must have been created, keyed by the probed kube-system UID.
+	cacheObj, err := cacheClient.GetBySlug(ctx, cluster.ClusterCacheSlug(id, uid))
 	require.NoError(t, err, "ClusterCache child must exist after successful reconcile")
+	assert.Equal(t, uid, cacheObj.Spec.ServerUID, "cache spec records the identity it mirrors")
 }
 
 func TestClusterCoreControllerProbeFailureSetsConnectedFalse(t *testing.T) {

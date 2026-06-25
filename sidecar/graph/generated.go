@@ -62,18 +62,22 @@ type ComplexityRoot struct {
 	}
 
 	Cluster struct {
-		Cache      func(childComplexity int) int
-		CreatedAt  func(childComplexity int) int
-		DeletedAt  func(childComplexity int) int
-		Generation func(childComplexity int) int
-		ID         func(childComplexity int) int
-		Spec       func(childComplexity int) int
-		Status     func(childComplexity int) int
+		ActiveCache func(childComplexity int) int
+		Caches      func(childComplexity int) int
+		CreatedAt   func(childComplexity int) int
+		DeletedAt   func(childComplexity int) int
+		Generation  func(childComplexity int) int
+		ID          func(childComplexity int) int
+		Spec        func(childComplexity int) int
+		Status      func(childComplexity int) int
 	}
 
 	ClusterCache struct {
-		Stats  func(childComplexity int) int
-		Status func(childComplexity int) int
+		Enabled   func(childComplexity int) int
+		ID        func(childComplexity int) int
+		ServerUID func(childComplexity int) int
+		Stats     func(childComplexity int) int
+		Status    func(childComplexity int) int
 	}
 
 	ClusterCacheStats struct {
@@ -273,12 +277,18 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.ChatChunk.Done(childComplexity), true
 
-	case "Cluster.cache":
-		if e.ComplexityRoot.Cluster.Cache == nil {
+	case "Cluster.activeCache":
+		if e.ComplexityRoot.Cluster.ActiveCache == nil {
 			break
 		}
 
-		return e.ComplexityRoot.Cluster.Cache(childComplexity), true
+		return e.ComplexityRoot.Cluster.ActiveCache(childComplexity), true
+	case "Cluster.caches":
+		if e.ComplexityRoot.Cluster.Caches == nil {
+			break
+		}
+
+		return e.ComplexityRoot.Cluster.Caches(childComplexity), true
 	case "Cluster.createdAt":
 		if e.ComplexityRoot.Cluster.CreatedAt == nil {
 			break
@@ -316,6 +326,24 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.Cluster.Status(childComplexity), true
 
+	case "ClusterCache.enabled":
+		if e.ComplexityRoot.ClusterCache.Enabled == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCache.Enabled(childComplexity), true
+	case "ClusterCache.id":
+		if e.ComplexityRoot.ClusterCache.ID == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCache.ID(childComplexity), true
+	case "ClusterCache.serverUid":
+		if e.ComplexityRoot.ClusterCache.ServerUID == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCache.ServerUID(childComplexity), true
 	case "ClusterCache.stats":
 		if e.ComplexityRoot.ClusterCache.Stats == nil {
 			break
@@ -896,14 +924,22 @@ func (ec *executionContext) childFields_Cluster(ctx context.Context, field graph
 		return ec.fieldContext_Cluster_spec(ctx, field)
 	case "status":
 		return ec.fieldContext_Cluster_status(ctx, field)
-	case "cache":
-		return ec.fieldContext_Cluster_cache(ctx, field)
+	case "caches":
+		return ec.fieldContext_Cluster_caches(ctx, field)
+	case "activeCache":
+		return ec.fieldContext_Cluster_activeCache(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type Cluster", field.Name)
 }
 
 func (ec *executionContext) childFields_ClusterCache(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 	switch field.Name {
+	case "id":
+		return ec.fieldContext_ClusterCache_id(ctx, field)
+	case "serverUid":
+		return ec.fieldContext_ClusterCache_serverUid(ctx, field)
+	case "enabled":
+		return ec.fieldContext_ClusterCache_enabled(ctx, field)
 	case "status":
 		return ec.fieldContext_ClusterCache_status(ctx, field)
 	case "stats":
@@ -1738,26 +1774,26 @@ func (ec *executionContext) fieldContext_Cluster_status(_ context.Context, field
 	return fc, nil
 }
 
-func (ec *executionContext) _Cluster_cache(ctx context.Context, field graphql.CollectedField, obj *cluster.Cluster) (ret graphql.Marshaler) {
+func (ec *executionContext) _Cluster_caches(ctx context.Context, field graphql.CollectedField, obj *cluster.Cluster) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
 		ec.OperationContext,
 		field,
 		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_Cluster_cache(ctx, field)
+			return ec.fieldContext_Cluster_caches(ctx, field)
 		},
 		func(ctx context.Context) (any, error) {
-			return obj.Cache, nil
+			return obj.Caches, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v cluster.ClusterCache) graphql.Marshaler {
-			return ec.marshalNClusterCache2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCache(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v []cluster.ClusterCache) graphql.Marshaler {
+			return ec.marshalNClusterCache2ᚕgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCacheᚄ(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
-func (ec *executionContext) fieldContext_Cluster_cache(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+func (ec *executionContext) fieldContext_Cluster_caches(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	fc = &graphql.FieldContext{
 		Object:     "Cluster",
 		Field:      field,
@@ -1768,6 +1804,107 @@ func (ec *executionContext) fieldContext_Cluster_cache(_ context.Context, field 
 		},
 	}
 	return fc, nil
+}
+
+func (ec *executionContext) _Cluster_activeCache(ctx context.Context, field graphql.CollectedField, obj *cluster.Cluster) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Cluster_activeCache(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.ActiveCache, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *cluster.ClusterCache) graphql.Marshaler {
+			return ec.marshalOClusterCache2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCache(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_Cluster_activeCache(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Cluster",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterCache(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _ClusterCache_id(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCache) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCache_id(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.ID, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v cluster.ObjectID) graphql.Marshaler {
+			return ec.marshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐObjectID(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCache_id(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCache", field, false, false, errors.New("field of type ObjectID does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCache_serverUid(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCache) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCache_serverUid(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.ServerUID, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCache_serverUid(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCache", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCache_enabled(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCache) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCache_enabled(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Enabled, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
+			return ec.marshalNBoolean2bool(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCache_enabled(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCache", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCache_status(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCache) (ret graphql.Marshaler) {
@@ -4827,11 +4964,13 @@ func (ec *executionContext) _Cluster(ctx context.Context, sel ast.SelectionSet, 
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
-		case "cache":
-			out.Values[i] = ec._Cluster_cache(ctx, field, obj)
+		case "caches":
+			out.Values[i] = ec._Cluster_caches(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
+		case "activeCache":
+			out.Values[i] = ec._Cluster_activeCache(ctx, field, obj)
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -4866,6 +5005,21 @@ func (ec *executionContext) _ClusterCache(ctx context.Context, sel ast.Selection
 		switch field.Name {
 		case "__typename":
 			out.Values[i] = graphql.MarshalString("ClusterCache")
+		case "id":
+			out.Values[i] = ec._ClusterCache_id(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "serverUid":
+			out.Values[i] = ec._ClusterCache_serverUid(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "enabled":
+			out.Values[i] = ec._ClusterCache_enabled(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
 		case "status":
 			out.Values[i] = ec._ClusterCache_status(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
@@ -6353,6 +6507,22 @@ func (ec *executionContext) marshalNClusterCache2githubᚗcomᚋkubetailᚑorg�
 	return ec._ClusterCache(ctx, sel, &v)
 }
 
+func (ec *executionContext) marshalNClusterCache2ᚕgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCacheᚄ(ctx context.Context, sel ast.SelectionSet, v []cluster.ClusterCache) graphql.Marshaler {
+	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
+		fc := graphql.GetFieldContext(ctx)
+		fc.Result = &v[i]
+		return ec.marshalNClusterCache2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCache(ctx, sel, v[i])
+	})
+
+	for _, e := range ret {
+		if e == graphql.Null {
+			return graphql.Null
+		}
+	}
+
+	return ret
+}
+
 func (ec *executionContext) marshalNClusterCacheStats2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCacheStats(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterCacheStats) graphql.Marshaler {
 	return ec._ClusterCacheStats(ctx, sel, &v)
 }
@@ -6795,6 +6965,13 @@ func (ec *executionContext) marshalOCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋk
 		return graphql.Null
 	}
 	return ec._Cluster(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalOClusterCache2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCache(ctx context.Context, sel ast.SelectionSet, v *cluster.ClusterCache) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return ec._ClusterCache(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalOClusterSpecSourceKubeconfig2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterSpecSourceKubeconfig(ctx context.Context, sel ast.SelectionSet, v *cluster.ClusterSpecSourceKubeconfig) graphql.Marshaler {

@@ -63,13 +63,19 @@ var ErrNotFound = errors.New("controllers: cluster not found")
 //     slug-uniqueness rules out a duplicate for a context (race-safe). Future
 //     sources add their own prefix ("cloud/", "manual/"). Nothing reads a Cluster
 //     back by this slug; lookups go through the ObjectID.
-//   - A ClusterCache is created with the slug "caches/{ClusterObjID}" so its parent
-//     can address it (beehive exposes no owner→children lookup pre-v0.5.0); its
-//     ClusterID segment is the parent's ObjectID.
-const (
-	slugPrefixKubeconfig   = "kubeconfig/"
-	slugPrefixClusterCache = "caches/"
-)
+//   - A ClusterCache is created with the slug "{ClusterID}/{serverUID}": its
+//     parent's ObjectID plus the kube-system namespace UID of the physical cluster it
+//     mirrors. beehive's per-kind UNIQUE(slug) then means "one cache per physical
+//     identity per cluster" — a physical-cluster migration (the kube-context repointed
+//     at a freshly-built cluster) yields a new UID and so a second, coexisting
+//     ClusterCache under the same parent, rather than colliding on a one-per-cluster slug.
+//     Children are enumerated via the owner edge (Client.ListOwned), not by re-deriving
+//     this slug, so the UID need not be known to list a cluster's caches. There is no
+//     "caches/" prefix: ClusterCache is its own beehive kind, so its slugs already sit
+//     in a namespace disjoint from Cluster's — unlike the Cluster kind, whose source
+//     prefix partitions multiple importers within the one kind, ClusterCache has no
+//     second axis a prefix would disambiguate.
+const slugPrefixKubeconfig = "kubeconfig/"
 
 // kubeconfigSlug returns the beehive slug a kubeconfig-sourced Cluster is created
 // with: the importer's natural key for one kube-context. It is not an identity —
@@ -78,10 +84,16 @@ func kubeconfigSlug(contextName string) string {
 	return slugPrefixKubeconfig + contextName
 }
 
-// ClusterCacheSlug returns the slug a ClusterCache is created with and looked up
-// by: "caches/{ClusterObjID}", addressing the cache from its parent's id.
-func ClusterCacheSlug(id ClusterID) string {
-	return slugPrefixClusterCache + strconv.FormatInt(int64(id), 10)
+// ClusterCacheSlug returns the slug a ClusterCache is created with:
+// "{ClusterID}/{serverUID}", where serverUID is the kube-system namespace UID of
+// the physical cluster the cache mirrors. The parent-ObjectID segment scopes the UID
+// to one cluster (two clusters that ever probe the same physical identity keep
+// distinct caches), and the serverUID segment is the migration-turnover key that
+// backs beehive's UNIQUE(slug) dedup in ensureClusterCache. The slug is a
+// creation/dedup key only — a cluster's caches are enumerated through the owner edge,
+// never by re-deriving this slug, so callers that lack a serverUID can still list them.
+func ClusterCacheSlug(clusterID ClusterID, serverUID string) string {
+	return strconv.FormatInt(int64(clusterID), 10) + "/" + serverUID
 }
 
 // newCacheRef builds the on-disk cache locator from the parent Cluster and
@@ -113,6 +125,14 @@ type ObjectID int64
 // alias of [ObjectID] — a documentation name, not a distinct type, so it shares
 // the one GraphQL scalar and (un)marshalling machinery.
 type ClusterID = ObjectID
+
+// ClusterCacheID identifies one ClusterCache record: the beehive ObjectID of its
+// ClusterCache object. Like [ClusterID] it is an alias of [ObjectID] — a
+// documentation name for the cache's own id (distinct from its parent ClusterID),
+// sharing the one GraphQL scalar and (un)marshalling machinery. A cluster can own
+// several ClusterCache records (one per physical identity it has mirrored), so the
+// cache id is not derivable from the cluster id.
+type ClusterCacheID = ObjectID
 
 // parseObjectID parses an ObjectID from its decimal-string wire form; a
 // malformed value is a client error surfaced through UnmarshalGQL.
@@ -389,10 +409,18 @@ type ClusterStatus struct {
 var ClusterCacheGroupKind = beehive.GroupKind{Kind: "ClusterCache"}
 
 // ClusterCacheSpec is the ClusterCache kind's spec. It carries no user-facing
-// fields; the parent ClusterID is encoded in the object's slug
-// ("caches/{ClusterID}"). The ClusterCoreController creates ClusterCache objects
-// with this empty spec.
-type ClusterCacheSpec struct{}
+// fields; the parent ClusterID is the object's owner edge, and ServerUID is the
+// kube-system namespace UID of the physical cluster this cache mirrors — the
+// identity a physical migration turns over (named to match the
+// ClusterStatus.Server.UID it is compared against). The ClusterCoreController writes
+// it at creation (once a probe has confirmed it); the ClusterCacheController reads
+// it to decide whether this cache is the parent's currently-active one (ServerUID ==
+// parent's last-probed Server.UID) and so should run a sync engine. It also rides
+// the slug ("{ClusterID}/{ServerUID}") purely so beehive's UNIQUE(slug) dedups a
+// per-identity create; spec.ServerUID, not the slug, is what the controller reads.
+type ClusterCacheSpec struct {
+	ServerUID string `json:"serverUid"`
+}
 
 // ClusterCacheStatus is the ClusterCache kind's stored status, written by the
 // ClusterCacheController, and the domain sync-status block served under the
@@ -407,29 +435,38 @@ type ClusterCacheStatus struct {
 
 // --- Domain types exposed to resolvers ---
 
-// ClusterCache is the domain view of a cluster's owned ClusterCache child,
-// mirroring the beehive owner chain: the sync Status (joined from the
-// ClusterCache beehive object) plus the cluster ID, which the live-stats
-// resolver needs to query the per-cluster cache. This replaces the old
-// model.ClusterStatus wrapper — the ID now rides a real domain object.
+// ClusterCache is the domain view of one of a cluster's owned ClusterCache
+// children, mirroring the beehive owner chain. ID is the cache's own ObjectID and
+// ClusterID its parent's — together they locate the on-disk cache (the live-stats
+// resolver builds a store.CacheRef from the pair). ServerUID is the kube-system UID
+// this cache mirrors, and Enabled marks it as the parent's currently-live identity
+// (ServerUID == the cluster's last-probed Server.UID) — the one cache a sync engine
+// runs for; other (migrated-away) caches linger read-only until cleared.
 type ClusterCache struct {
-	ID     ClusterID
-	Status ClusterCacheStatus
+	ID        ClusterCacheID
+	ClusterID ClusterID
+	ServerUID string
+	Enabled   bool
+	Status    ClusterCacheStatus
 }
 
 // Cluster is the domain record for one tracked cluster connection (one
 // kube-context): the restart-surviving facts about it. Assembled by the service
-// layer from the Cluster + ClusterCache beehive objects. Status binds directly
-// to the stored Cluster-kind status; Cache carries the ClusterCache child.
+// layer from the Cluster + ClusterCache beehive objects. Status binds directly to
+// the stored Cluster-kind status. A cluster owns zero or more ClusterCache records
+// — none until its first successful probe, and more than one across a physical
+// migration; Caches lists them all and ActiveCache points at the live one (the
+// element with Enabled==true), or is nil when the cluster has no active cache yet.
 type Cluster struct {
 	ID         ClusterID
 	Generation int64
 	CreatedAt  time.Time
 	DeletedAt  *time.Time // derived from obj.DeletionRequestedAt
 
-	Spec   ClusterSpec
-	Status ClusterStatus
-	Cache  ClusterCache
+	Spec        ClusterSpec
+	Status      ClusterStatus
+	Caches      []ClusterCache
+	ActiveCache *ClusterCache
 }
 
 // --- Cache statistics types (for the ClusterCache GraphQL resolver) ---

@@ -130,7 +130,7 @@ function statusOf(c: Cluster, group: Group): { label: string; tone: Tone } {
   if (!c.spec.syncEnabled) return { label: 'Paused', tone: 'muted' };
   const connected = findCondition(c.status.conditions, 'Connected');
   if (connected?.status === 'False') return { label: 'Stalled', tone: 'muted' };
-  const synced = findCondition(c.cache.status.conditions, 'Synced');
+  const synced = findCondition(c.activeCache?.status.conditions ?? [], 'Synced');
   if (synced?.reason === 'SyncFailed') return { label: 'Error', tone: 'error' };
   return { label: 'Syncing', tone: 'ok' };
 }
@@ -185,14 +185,14 @@ function ClusterRow({
           <span aria-hidden className={`size-2 shrink-0 rounded-full ${DOT_CLASS[status.tone]}`} />
           {status.label}
         </span>
-        {cluster.cache.status.lastSyncedAt ? (
+        {cluster.activeCache?.status.lastSyncedAt ? (
           <div className="text-xs text-muted-foreground">
-            {formatSyncFreshness(Date.parse(cluster.cache.status.lastSyncedAt))}
+            {formatSyncFreshness(Date.parse(cluster.activeCache.status.lastSyncedAt))}
           </div>
         ) : null}
       </TableCell>
       <TableCell className="tabular-nums">
-        {cluster.cache.stats.exists ? formatBytes(cluster.cache.stats.bytes) : '—'}
+        {cluster.activeCache?.stats.exists ? formatBytes(cluster.activeCache.stats.bytes) : '—'}
       </TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-0.5">
@@ -225,7 +225,7 @@ function ClusterRow({
             variant="ghost"
             size="icon-sm"
             aria-label={`Clear cache for ${name}`}
-            disabled={!cluster.cache.stats.exists}
+            disabled={!cluster.activeCache?.stats.exists}
             onClick={onClearCache}
           >
             <ClearCacheIcon />

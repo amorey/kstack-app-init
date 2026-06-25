@@ -76,17 +76,22 @@ function pushClusters(rows: Row[]) {
               server: { uid: r.uuid || null },
               conditions: [{ type: 'Connected', status: r.connected ?? 'True', reason: '' }],
             },
-            cache: {
-              status: {
-                conditions: [
-                  r.syncFailed
-                    ? { type: 'Synced', status: 'False', reason: 'SyncFailed' }
-                    : { type: 'Synced', status: 'True', reason: 'Watching' },
-                ],
-                lastSyncedAt: r.lastSyncedAt ?? null,
-              },
-              stats: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
-            },
+            activeCache: r.uuid
+              ? {
+                  id: `cache-${r.uuid}`,
+                  serverUid: r.uuid,
+                  enabled: true,
+                  status: {
+                    conditions: [
+                      r.syncFailed
+                        ? { type: 'Synced', status: 'False', reason: 'SyncFailed' }
+                        : { type: 'Synced', status: 'True', reason: 'Watching' },
+                    ],
+                    lastSyncedAt: r.lastSyncedAt ?? null,
+                  },
+                  stats: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
+                }
+              : null,
           })),
         },
       },

@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -48,12 +49,22 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 	for _, fx := range fixtures {
 		id := fx.id
 		f.order = append(f.order, id)
-		f.clusters[id] = &cluster.Cluster{
-			ID:     id,
-			Spec:   fx.spec,
-			Status: fx.connStatus,
-			Cache:  cluster.ClusterCache{ID: id, Status: fx.cacheStatus},
+		cache := cluster.ClusterCache{
+			ID:        id,
+			ClusterID: id,
+			ServerUID: "uid-" + strconv.FormatInt(int64(id), 10),
+			Enabled:   true,
+			Status:    fx.cacheStatus,
 		}
+		c := &cluster.Cluster{
+			ID:          id,
+			Spec:        fx.spec,
+			Status:      fx.connStatus,
+			Caches:      []cluster.ClusterCache{cache},
+			ActiveCache: &cache,
+		}
+		c.ActiveCache = &c.Caches[0]
+		f.clusters[id] = c
 	}
 	return f
 }
@@ -96,7 +107,7 @@ func (f *fakeClusterService) Watch(ctx context.Context) (<-chan []*cluster.Clust
 	return ch, nil
 }
 
-func (f *fakeClusterService) CacheStats(context.Context, cluster.ClusterID) (*cluster.ClusterCacheStats, error) {
+func (f *fakeClusterService) CacheStats(context.Context, cluster.ClusterID, cluster.ClusterCacheID) (*cluster.ClusterCacheStats, error) {
 	return &cluster.ClusterCacheStats{}, nil
 }
 
@@ -411,7 +422,8 @@ func TestClusterDeleteMutation(t *testing.T) {
 func TestClusterEphemeralFields(t *testing.T) {
 	data := clustersQueryData(t, `{ cluster(id: 1) {
 		status { conditions { type status reason } }
-		cache {
+		activeCache {
+			id serverUid enabled
 			status { conditions { type } lastSyncedAt }
 			stats { exists bytes resources { resource } }
 		}
@@ -422,7 +434,10 @@ func TestClusterEphemeralFields(t *testing.T) {
 	if conds, ok := status["conditions"].([]any); !ok || len(conds) != 0 {
 		t.Errorf("conditions should be an empty list, got: %v", status["conditions"])
 	}
-	cache := cl["cache"].(map[string]any)
+	cache := cl["activeCache"].(map[string]any)
+	if cache["enabled"] != true {
+		t.Errorf("fixture cache should be enabled, got: %v", cache["enabled"])
+	}
 	cacheStatus := cache["status"].(map[string]any)
 	if conds, ok := cacheStatus["conditions"].([]any); !ok || len(conds) != 0 {
 		t.Errorf("sync conditions should be an empty list, got: %v", cacheStatus["conditions"])
@@ -461,7 +476,7 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 
 	body, _ := json.Marshal(map[string]string{"query": `{ cluster(id: 1) {
 		status { conditions { type status reason message observedGeneration lastTransitionTime } }
-		cache {
+		activeCache {
 			status { conditions { type status reason } lastSyncedAt }
 			stats { exists bytes }
 		}
@@ -482,7 +497,7 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 				Status struct {
 					Conditions []wireCondition `json:"conditions"`
 				} `json:"status"`
-				Cache struct {
+				ActiveCache struct {
 					Status struct {
 						Conditions   []wireCondition `json:"conditions"`
 						LastSyncedAt *string         `json:"lastSyncedAt"`
@@ -491,7 +506,7 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 						Exists bool    `json:"exists"`
 						Bytes  float64 `json:"bytes"`
 					} `json:"stats"`
-				} `json:"cache"`
+				} `json:"activeCache"`
 			} `json:"cluster"`
 		} `json:"data"`
 		Errors []struct{ Message string } `json:"errors"`
@@ -513,7 +528,7 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 		t.Errorf("Connected condition on the wire: %+v", conds[0])
 	}
 
-	syncStatus := resp.Data.Cluster.Cache.Status
+	syncStatus := resp.Data.Cluster.ActiveCache.Status
 	if len(syncStatus.Conditions) != 1 || syncStatus.Conditions[0].Type != "Synced" ||
 		syncStatus.Conditions[0].Status != "True" || syncStatus.Conditions[0].Reason != "Watching" {
 		t.Errorf("Synced condition on the wire: %+v", syncStatus.Conditions)
@@ -523,7 +538,7 @@ func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
 	}
 
 	// Cache stats with no on-disk files: exists=false.
-	if resp.Data.Cluster.Cache.Stats.Exists {
+	if resp.Data.Cluster.ActiveCache.Stats.Exists {
 		t.Errorf("cache without files should report exists=false")
 	}
 }

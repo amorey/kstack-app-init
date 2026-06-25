@@ -58,7 +58,10 @@ function pushClusters(rows: Row[]) {
               server: { uid: `uid-${r.id}` },
               conditions: [],
             },
-            cache: {
+            activeCache: {
+              id: `cache-${r.id}`,
+              serverUid: `uid-${r.id}`,
+              enabled: true,
               status: { conditions: [], lastSyncedAt: null },
               stats: { exists: false, bytes: 0 },
             },

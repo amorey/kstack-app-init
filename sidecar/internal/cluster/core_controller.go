@@ -318,13 +318,9 @@ func (c *ClusterCoreController) Reconcile(ctx context.Context, client beehive.Co
 		return beehive.Result{}, nil
 	}
 
-	// Extract the cluster UUID from the slug.
-	clusterID := clusterIDFromObj(obj)
-
-	// Ensure ClusterCache child exists.
-	if err := c.ensureClusterCache(ctx, clusterID, obj.ID); err != nil {
-		return beehive.Result{}, err
-	}
+	// The ClusterCache child is no longer created here, eagerly: it is keyed by the
+	// physical cluster's kube-system UID, which is unknown until a probe succeeds, so
+	// converge creates it post-probe (ensureClusterCache).
 
 	// Load (or seed) the working status copy.
 	var loaded ClusterStatus
@@ -414,6 +410,18 @@ func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Objec
 		ObservedGeneration: gen,
 	})
 
+	// Now that a probe has confirmed the physical cluster's kube-system UID, ensure a
+	// ClusterCache exists for that identity (one per identity per cluster — a migration
+	// to a new UID adds a second, coexisting cache). Creation is gated on the UID
+	// because it keys the cache's slug + spec. A store error here is non-fatal: the
+	// status write below still records the successful connection, and the next reconcile
+	// (health cadence) retries the create.
+	if server.UID != nil {
+		if err := c.ensureClusterCache(ctx, clusterID, obj.ID, *server.UID); err != nil {
+			slog.Warn("clustercontroller: ensure cache child", "cluster", clusterID, "err", err)
+		}
+	}
+
 	phase, msg := c.check(ctx, restCfg)
 	SetCondition(conds, healthCondition(phase, msg, gen))
 	return healthProbeInterval
@@ -465,24 +473,29 @@ func (c *ClusterCoreController) observeConnectFailure(conds *[]ClusterCondition,
 	return connectionInitialBackoff
 }
 
-// ensureClusterCache creates the ClusterCache child if it does not exist.
-func (c *ClusterCoreController) ensureClusterCache(ctx context.Context, clusterID ClusterID, ownerID beehive.ObjectID) error {
-	_, err := c.cacheClient.GetBySlug(ctx, ClusterCacheSlug(clusterID))
+// ensureClusterCache creates the ClusterCache child for one physical identity
+// (kube-system UID) if it does not already exist. The slug ("caches/{clusterID}/{uid}")
+// keys beehive's UNIQUE(slug) dedup, so concurrent reconciles racing the create
+// converge on one cache per (cluster, UID); a migration to a new UID adds a second,
+// coexisting cache rather than colliding.
+func (c *ClusterCoreController) ensureClusterCache(ctx context.Context, clusterID ClusterID, ownerID beehive.ObjectID, uid string) error {
+	slug := ClusterCacheSlug(clusterID, uid)
+	_, err := c.cacheClient.GetBySlug(ctx, slug)
 	if err == nil {
 		return nil // already exists
 	}
 	if !errors.Is(err, beehive.ErrNotFound) {
 		return err
 	}
-	_, err = c.cacheClient.Create(ctx, ClusterCacheSpec{},
-		beehive.WithSlug(ClusterCacheSlug(clusterID)),
+	_, err = c.cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: uid},
+		beehive.WithSlug(slug),
 		beehive.WithOwner(ownerID),
 	)
 	if err != nil {
 		// A concurrent reconcile (e.g. an out-of-band kubeconfig re-reconcile racing
 		// the beehive-scheduled one) may have created the child between our Get and
 		// Create — treat an existing child as success.
-		if _, gerr := c.cacheClient.GetBySlug(ctx, ClusterCacheSlug(clusterID)); gerr == nil {
+		if _, gerr := c.cacheClient.GetBySlug(ctx, slug); gerr == nil {
 			return nil
 		}
 		return err

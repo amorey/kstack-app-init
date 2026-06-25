@@ -113,7 +113,13 @@ type ClusterCacheController struct {
 	// worker and from the engines' sink goroutines.
 	writeMu sync.Mutex
 	mu      sync.Mutex
-	engines map[ClusterID]*engineEntry
+	// engines is keyed by the ClusterCache object's own ObjectID, not its parent
+	// ClusterID: a cluster can own several ClusterCache records (one per physical
+	// identity it has mirrored), and the controller reconciles each independently —
+	// only the active one (UID == the parent's last-probed Server.UID) runs an engine,
+	// but keying by cache id keeps a migration's old/new caches from racing on a shared
+	// per-cluster slot during the hand-over.
+	engines map[beehive.ObjectID]*engineEntry
 }
 
 // NewClusterCacheController builds the controller. manager owns the per-cluster
@@ -132,7 +138,7 @@ func NewClusterCacheController(
 		cacheManager: manager,
 		connMgr:      connMgr,
 		pokeSvc:      pokeSvc,
-		engines:      make(map[ClusterID]*engineEntry),
+		engines:      make(map[beehive.ObjectID]*engineEntry),
 	}
 	cm := manager
 	c.newEngine = func(cfg *rest.Config, id ClusterID, ref store.CacheRef, sink engine.Sink) EngineHandle {
@@ -178,12 +184,12 @@ func (c *ClusterCacheController) StopPoke() {
 func (c *ClusterCacheController) StopEngines() error {
 	c.mu.Lock()
 	entries := c.engines
-	c.engines = make(map[ClusterID]*engineEntry)
+	c.engines = make(map[beehive.ObjectID]*engineEntry)
 	c.mu.Unlock()
-	for id, entry := range entries {
+	for cacheID, entry := range entries {
 		stopCtx, cancel := context.WithTimeout(context.Background(), engineStopTimeout)
 		if err := entry.handle.Stop(stopCtx); err != nil {
-			slog.Warn("clustercachecontroller: engine stop", "cluster", id, "err", err)
+			slog.Warn("clustercachecontroller: engine stop", "cluster", entry.clusterObjID, "cache", cacheID, "err", err)
 		}
 		cancel()
 	}
@@ -229,9 +235,16 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 	}
 
 	if obj.DeletionRequestedAt != nil {
-		c.stopEngine(clusterID)
+		c.stopEngine(obj.ID)
 		return beehive.Result{}, nil
 	}
+
+	// This cache is "active" when it mirrors the cluster's currently-connected
+	// physical identity (its UID matches the parent's last-probed kube-system UID).
+	// Only the active cache runs a sync engine — a cache left behind by a physical
+	// migration (its UID no longer matches) is paused, so the engine never writes
+	// fresh data from the new cluster into the old identity's file.
+	active := cacheIsActive(clusterObj, obj.Spec.ServerUID)
 
 	// Load the working status copy.
 	var loaded ClusterCacheStatus
@@ -247,7 +260,7 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 		LastSyncedAt: loaded.LastSyncedAt,
 	}
 
-	requeueAfter := c.converge(clusterID, obj.ID, obj.Generation, clusterObj, &working)
+	requeueAfter := c.converge(clusterID, obj.ID, obj.Generation, active, clusterObj, &working)
 
 	if ClusterCacheStatusEqual(loaded, working) {
 		return beehive.Result{RequeueAfter: requeueAfter}, nil
@@ -256,19 +269,24 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 		client.UpdateStatus(ctx, obj.ID, obj.Generation, working)
 }
 
-// converge manages the sync engine toward the parent Cluster's spec.
+// converge manages this ClusterCache's sync engine toward the parent Cluster's
+// spec. active reports whether this cache mirrors the cluster's currently-connected
+// identity; an inactive cache (a physical migration left it behind) is paused like
+// a sync-ineligible one, so the engine never writes the new cluster's data into a
+// stale identity's file.
 func (c *ClusterCacheController) converge(
 	clusterID ClusterID,
 	cacheObjID beehive.ObjectID,
 	cacheGen int64,
+	active bool,
 	clusterObj *beehive.Object[ClusterSpec, ClusterStatus],
 	working *ClusterCacheStatus,
 ) time.Duration {
 	gen := clusterObj.Generation
 	conds := &working.Conditions
 
-	if !syncEligible(clusterObj) {
-		c.stopEngine(clusterID)
+	if !syncEligible(clusterObj) || !active {
+		c.stopEngine(cacheObjID)
 		SetCondition(conds, ClusterCondition{
 			Type: ClusterConditionSynced, Status: ConditionFalse,
 			Reason: ReasonPaused, ObservedGeneration: gen,
@@ -285,7 +303,7 @@ func (c *ClusterCacheController) converge(
 		var err error
 		restCfg, err = ResolveRESTConfig(c.cfgSource.Get(), contextName)
 		if err != nil {
-			c.stopEngine(clusterID)
+			c.stopEngine(cacheObjID)
 			SetCondition(conds, ClusterCondition{
 				Type: ClusterConditionSynced, Status: ConditionFalse,
 				Reason: ReasonSyncFailed, Message: err.Error(), ObservedGeneration: gen,
@@ -296,7 +314,7 @@ func (c *ClusterCacheController) converge(
 	fingerprint := engine.ConfigFingerprint(restCfg, engine.ContextProxyURL(c.cfgSource.Get(), contextName))
 
 	c.mu.Lock()
-	entry, running := c.engines[clusterID]
+	entry, running := c.engines[cacheObjID]
 	c.mu.Unlock()
 
 	if running && entry.fingerprint == fingerprint {
@@ -304,7 +322,7 @@ func (c *ClusterCacheController) converge(
 	}
 
 	// Stop any running engine before starting a new one (credential change).
-	c.stopEngine(clusterID)
+	c.stopEngine(cacheObjID)
 	SetCondition(conds, ClusterCondition{
 		Type: ClusterConditionSynced, Status: ConditionFalse,
 		Reason: ReasonSyncing, ObservedGeneration: gen,
@@ -332,7 +350,7 @@ func (c *ClusterCacheController) spawnEngine(
 		cacheGen:     cacheGen,
 		parentGen:    parentGen,
 	}
-	sink := &engineSink{c: c, id: clusterID, entry: newEntry}
+	sink := &engineSink{c: c, clusterID: clusterID, cacheID: cacheObjID, entry: newEntry}
 	ref := newCacheRef(clusterObjID, cacheObjID)
 	handle := c.newEngine(restCfg, clusterID, ref, sink)
 	if handle == nil {
@@ -340,7 +358,7 @@ func (c *ClusterCacheController) spawnEngine(
 	}
 	newEntry.handle = handle
 	c.mu.Lock()
-	c.engines[clusterID] = newEntry
+	c.engines[cacheObjID] = newEntry
 	c.mu.Unlock()
 	handle.Start()
 }
@@ -357,47 +375,61 @@ func (c *ClusterCacheController) restartLiveEngines() {
 	defer c.writeMu.Unlock()
 
 	c.mu.Lock()
-	ids := make([]ClusterID, 0, len(c.engines))
-	for id := range c.engines {
-		ids = append(ids, id)
+	ids := make([]beehive.ObjectID, 0, len(c.engines))
+	for cacheID := range c.engines {
+		ids = append(ids, cacheID)
 	}
 	c.mu.Unlock()
 
-	for _, id := range ids {
-		c.restartEngineLocked(id)
+	for _, cacheID := range ids {
+		c.restartEngineLocked(cacheID)
 	}
 }
 
-// RestartEngine stops and respawns the engine for id (if one is running),
-// reusing its stored config. Used by Service.ClearCache to rebuild the cache
-// after deleting it on disk. A no-op when no engine is running for id.
-func (c *ClusterCacheController) RestartEngine(id ClusterID) {
+// RestartEngine stops and respawns the running engine(s) for clusterID, reusing
+// the stored config. Used by Service.ClearCache to rebuild the cache after deleting
+// it on disk. A no-op when no engine is running for the cluster. A cluster has at
+// most one active (engine-running) cache, but this restarts every live engine owned
+// by it, so a clear during a migration hand-over rebuilds whichever is running.
+func (c *ClusterCacheController) RestartEngine(clusterID ClusterID) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	c.restartEngineLocked(id)
+	c.mu.Lock()
+	var cacheIDs []beehive.ObjectID
+	for cacheID, entry := range c.engines {
+		if ClusterID(entry.clusterObjID) == clusterID {
+			cacheIDs = append(cacheIDs, cacheID)
+		}
+	}
+	c.mu.Unlock()
+	for _, cacheID := range cacheIDs {
+		c.restartEngineLocked(cacheID)
+	}
 }
 
-// restartEngineLocked stops id's engine and respawns it with the same config and
-// bookkeeping. Caller must hold writeMu.
-func (c *ClusterCacheController) restartEngineLocked(id ClusterID) {
+// restartEngineLocked stops the engine for cacheID and respawns it with the same
+// config and bookkeeping. Caller must hold writeMu.
+func (c *ClusterCacheController) restartEngineLocked(cacheID beehive.ObjectID) {
 	c.mu.Lock()
-	entry, ok := c.engines[id]
+	entry, ok := c.engines[cacheID]
 	c.mu.Unlock()
 	if !ok {
 		return
 	}
+	clusterID := ClusterID(entry.clusterObjID)
 	restCfg, fingerprint := entry.restCfg, entry.fingerprint
 	clusterObjID, cacheObjID := entry.clusterObjID, entry.cacheObjID
 	cacheGen, parentGen := entry.cacheGen, entry.parentGen
-	c.stopEngine(id)
-	c.spawnEngine(id, restCfg, fingerprint, clusterObjID, cacheObjID, cacheGen, parentGen)
+	c.stopEngine(cacheID)
+	c.spawnEngine(clusterID, restCfg, fingerprint, clusterObjID, cacheObjID, cacheGen, parentGen)
 }
 
-// stopEngine tears down a cluster's engine if one is running.
-func (c *ClusterCacheController) stopEngine(id ClusterID) {
+// stopEngine tears down a cache's engine if one is running, keyed by the
+// ClusterCache ObjectID.
+func (c *ClusterCacheController) stopEngine(cacheID beehive.ObjectID) {
 	c.mu.Lock()
-	entry, ok := c.engines[id]
-	delete(c.engines, id)
+	entry, ok := c.engines[cacheID]
+	delete(c.engines, cacheID)
 	c.mu.Unlock()
 	if !ok {
 		return
@@ -405,7 +437,7 @@ func (c *ClusterCacheController) stopEngine(id ClusterID) {
 	stopCtx, cancel := context.WithTimeout(context.Background(), engineStopTimeout)
 	defer cancel()
 	if err := entry.handle.Stop(stopCtx); err != nil {
-		slog.Warn("clustercachecontroller: engine stop", "cluster", id, "err", err)
+		slog.Warn("clustercachecontroller: engine stop", "cluster", entry.clusterObjID, "cache", cacheID, "err", err)
 	}
 }
 
@@ -415,17 +447,19 @@ func syncEligible(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
 }
 
 // engineSink delivers one engine's status reports into the ClusterCacheStatus
-// via the controller's ControllerClient. It holds the entry pointer so reports
-// from a stopped or replaced engine are silently dropped.
+// via the controller's ControllerClient. It holds the entry pointer (keyed in the
+// map by the ClusterCache ObjectID) so reports from a stopped or replaced engine
+// are silently dropped; clusterID is kept only for log labels.
 type engineSink struct {
-	c     *ClusterCacheController
-	id    ClusterID
-	entry *engineEntry
+	c         *ClusterCacheController
+	clusterID ClusterID
+	cacheID   beehive.ObjectID
+	entry     *engineEntry
 }
 
 func (s *engineSink) Report(st engine.EngineStatus) {
 	s.c.mu.Lock()
-	current := s.c.engines[s.id] == s.entry
+	current := s.c.engines[s.cacheID] == s.entry
 	s.c.mu.Unlock()
 	if !current {
 		return
@@ -438,14 +472,14 @@ func (s *engineSink) Report(st engine.EngineStatus) {
 	// Re-check under writeMu to avoid a race between the engine lock release
 	// above and acquiring writeMu.
 	s.c.mu.Lock()
-	current = s.c.engines[s.id] == s.entry
+	current = s.c.engines[s.cacheID] == s.entry
 	s.c.mu.Unlock()
 	if !current {
 		return
 	}
 
 	if err := s.c.applyEngineReport(ctx, s.entry, st); err != nil {
-		slog.Warn("clustercachecontroller: fold engine report", "cluster", s.id, "err", err)
+		slog.Warn("clustercachecontroller: fold engine report", "cluster", s.clusterID, "cache", s.cacheID, "err", err)
 	}
 }
 

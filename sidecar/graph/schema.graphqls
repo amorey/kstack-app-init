@@ -50,8 +50,10 @@ type Cluster {
   spec: ClusterSpec!
   "Observed connection/health state, discovered by probing."
   status: ClusterStatus!
-  "The owned cache child (beehive ClusterCache): its sync status plus live on-disk stats."
-  cache: ClusterCache!
+  "All owned cache children (beehive ClusterCache), one per physical identity this cluster has mirrored. Empty until the first successful probe; more than one across a physical-cluster migration (old + new identity coexist). Sorted by id."
+  caches: [ClusterCache!]!
+  "The cache for the cluster's currently-connected identity (its UID matches `status.server.uid`), or null when the cluster has no active cache yet (never probed, or mid-migration). This is the cache a sync engine runs for and the one a UI shows for the row."
+  activeCache: ClusterCache
 }
 
 "A cluster record's desired state. Every field is user/API-owned; nothing here is observed."
@@ -86,7 +88,7 @@ type ClusterSpecSourceKubeconfig {
 A cluster record's observed connection/health state, persisted on the Cluster
 record by the connection controller and reported Kubernetes-style: probed facts
 plus status conditions — the consumer derives display state from the conditions'
-type/status/reason. Sync status and the on-disk cache live on the `cache` child
+type/status/reason. Sync status and the on-disk cache live on the `caches` children
 (mirroring the beehive ClusterCache kind), not here.
 """
 type ClusterStatus {
@@ -119,7 +121,7 @@ record's observed state. Connection-controller conditions (under `status`):
 `Connected` (the last probe reached the API server; reasons Connecting/
 Connected/ResolveFailed/ProbeFailed/Inactive) and `Healthy` (the server's own
 readiness; reasons Ready/ReadyzFailed/Unreachable/NoConnection/Inactive).
-Sync-controller condition (under `cache.status`): `Synced` (reasons Syncing/
+Sync-controller condition (under a cache's `status`): `Synced` (reasons Syncing/
 Watching/Paused/SyncFailed/ResolveFailed). New types/reasons may appear;
 consumers should treat unknown spellings as a degraded/unknown display state.
 """
@@ -138,11 +140,19 @@ type ClusterCondition {
 }
 
 """
-The owned cache child, mirroring the beehive ClusterCache kind: its observed
-sync `status` plus live on-disk `stats`. A nested object so a consumer fetches
-the (stat-querying) stats only when it selects them.
+One owned cache child, mirroring the beehive ClusterCache kind: a mirror of one
+physical cluster identity. Carries its identity (`id`, `serverUid`, `enabled`), observed
+sync `status`, and live on-disk `stats` (a nested object so a consumer fetches the
+stat-querying stats only when it selects them). A cluster owns one per identity it
+has mirrored; `enabled` marks the one for its currently-connected identity.
 """
 type ClusterCache {
+  "Unique identifier for this cache record (distinct from its parent cluster's id)."
+  id: ObjectID!
+  "The kube-system namespace UID of the physical cluster this cache mirrors — the identity a physical migration turns over. Mirrors `status.server.uid`."
+  serverUid: String!
+  "Whether this cache is the cluster's enabled (live) one: its `serverUid` matches the cluster's last-probed `status.server.uid`. Only the enabled cache syncs; the rest linger read-only until cleared."
+  enabled: Boolean!
   "The sync controller's status block: its conditions (`Synced`) plus cache freshness."
   status: ClusterCacheStatus!
   "Live on-disk cache statistics, queried on demand."
