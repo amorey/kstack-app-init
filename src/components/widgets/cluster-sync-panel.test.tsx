@@ -26,7 +26,7 @@ vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
 const { ClustersProvider } = await import('@/lib/clusters');
-const { ClusterSyncPanel } = await import('./cluster-sync-panel');
+const { ClusterSyncPanel, overallTone } = await import('./cluster-sync-panel');
 
 // Helpers -------------------------------------------------------------
 
@@ -48,6 +48,10 @@ type Row = {
   // Model an engine-level sync failure (Synced=False/SyncFailed). Defaults to a
   // healthy Synced=True/Watching condition.
   syncFailed?: boolean;
+  // Connection diagnostics surfaced in the Disconnected popover.
+  connMessage?: string; // Connected condition's `message` (the probe error)
+  disconnectedSince?: string; // Connected condition's `lastTransitionTime` (ISO)
+  lastConnectedAt?: string; // status.lastConnectedAt (ISO; null = never)
 };
 
 function pushClusters(rows: Row[]) {
@@ -74,7 +78,16 @@ function pushClusters(rows: Row[]) {
                 },
               },
               server: { uid: r.uuid || null },
-              conditions: [{ type: 'Connected', status: r.connected ?? 'True', reason: '' }],
+              lastConnectedAt: r.lastConnectedAt ?? null,
+              conditions: [
+                {
+                  type: 'Connected',
+                  status: r.connected ?? 'True',
+                  reason: '',
+                  message: r.connMessage ?? '',
+                  lastTransitionTime: r.disconnectedSince ?? null,
+                },
+              ],
             },
             activeCache: r.uuid
               ? {
@@ -121,6 +134,18 @@ async function openWith(rows: Row[]) {
   return user;
 }
 
+describe('overallTone', () => {
+  it('rolls up to the most severe of the two sub-system tones', () => {
+    expect(overallTone('ok', 'ok')).toBe('ok');
+    expect(overallTone('ok', 'muted')).toBe('ok');
+    expect(overallTone('muted', 'muted')).toBe('muted');
+    expect(overallTone('attention', 'muted')).toBe('attention');
+    expect(overallTone('ok', 'attention')).toBe('attention');
+    expect(overallTone('error', 'attention')).toBe('error');
+    expect(overallTone('ok', 'error')).toBe('error');
+  });
+});
+
 describe('ClusterSyncPanel', () => {
   // base-ui's dialog relies on pointer-capture / scroll APIs jsdom lacks.
   beforeAll(() => {
@@ -149,6 +174,7 @@ describe('ClusterSyncPanel', () => {
               clusterSyncEnabledSet: { __typename: 'Cluster', id: 'u', spec: { syncEnabled: false } },
               clusterCacheClear: { __typename: 'Cluster', id: 'u' },
               clusterDelete: true,
+              clusterConnectionRetry: true,
             },
           }),
         };
@@ -259,6 +285,94 @@ describe('ClusterSyncPanel', () => {
     expect(within(active).getByRole('cell', { name: 'Syncing' })).toBeInTheDocument();
     expect(within(active).getByRole('cell', { name: 'Stalled' })).toBeInTheDocument();
     expect(within(active).getByRole('cell', { name: 'Error' })).toBeInTheDocument();
+  });
+
+  it('shows one overall status indicator per row, rolled up to the most severe axis', async () => {
+    await openWith([
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, connected: 'True' },
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+      { uuid: '', name: 'minikube', enabled: false, present: true, cached: false, connected: 'Unknown' },
+      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true },
+    ]);
+
+    // One indicator per row, named by both axes (the tooltip summary), tinted by
+    // the most severe of the two.
+    expect(await screen.findByRole('img', { name: 'Active · Syncing' })).toHaveAttribute('data-tone', 'ok');
+    expect(screen.getByRole('img', { name: 'Disconnected · Stalled' })).toHaveAttribute('data-tone', 'error');
+    expect(screen.getByRole('img', { name: 'Connecting · Not synced' })).toHaveAttribute('data-tone', 'attention');
+    expect(screen.getByRole('img', { name: 'Unavailable · Stopped' })).toHaveAttribute('data-tone', 'muted');
+  });
+
+  it('color-codes the connection and sync text by their own tone, to explain the overall color', async () => {
+    await openWith([
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, connected: 'True' },
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+      { uuid: '', name: 'minikube', enabled: false, present: true, cached: false, connected: 'Unknown' },
+      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true },
+    ]);
+
+    await screen.findByRole('rowgroup', { name: /active/i });
+    // Connection axis — the `[data-tone]` selector disambiguates the cell label
+    // from the group-header text (which shares words like "Active").
+    expect(screen.getByText('Active', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'ok');
+    expect(screen.getByText('Disconnected', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'error');
+    expect(screen.getByText('Connecting', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'attention');
+    expect(screen.getByText('Unavailable', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'muted');
+    // Sync axis.
+    expect(screen.getByText('Syncing', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'ok');
+    // Stalled is a *gated* value (its fault is the connection, not sync), so it
+    // grays out rather than going amber — the red "Disconnected" carries the cause.
+    expect(screen.getByText('Stalled', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'muted');
+    expect(screen.getByText('Not synced', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'muted');
+    expect(screen.getByText('Stopped', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'muted');
+  });
+
+  it('requests connection diagnostics in the clustersWatch subscription', async () => {
+    renderPanel();
+    await flush();
+    const sub = invokeMock.mock.calls.find(([cmd]) => cmd === 'graphql_subscribe')?.[1] as { query: string };
+    expect(sub.query).toContain('lastConnectedAt');
+    expect(sub.query).toContain('message');
+    expect(sub.query).toContain('lastTransitionTime');
+  });
+
+  it('reveals the underlying error and a retry action when a disconnected cluster is opened', async () => {
+    const user = await openWith([
+      {
+        uuid: 'u-remote',
+        name: 'remote',
+        enabled: true,
+        present: true,
+        cached: true,
+        connected: 'False',
+        connMessage: 'dial tcp 10.0.0.1:6443: connect: connection refused',
+        disconnectedSince: new Date(Date.now() - 3 * 60_000).toISOString(),
+        lastConnectedAt: new Date(Date.now() - 12 * 60_000).toISOString(),
+      },
+    ]);
+
+    // The Disconnected label is an interactive trigger (only the error state is).
+    await user.click(await screen.findByRole('button', { name: /disconnected/i }));
+
+    // The popover surfaces the probe error and when it was last connected.
+    expect(await screen.findByText(/connection refused/i)).toBeInTheDocument();
+    expect(screen.getByText(/last connected/i)).toBeInTheDocument();
+
+    // Retry fires clusterConnectionRetry.
+    await user.click(screen.getByRole('button', { name: /retry/i }));
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_query',
+      expect.objectContaining({ body: expect.stringContaining('clusterConnectionRetry') }),
+    );
+  });
+
+  it('does not make the connection label interactive when the cluster is reachable', async () => {
+    await openWith([
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, connected: 'True' },
+    ]);
+    await screen.findByRole('rowgroup', { name: /active/i });
+    // "Active" is plain text, not a popover trigger.
+    expect(screen.queryByRole('button', { name: /^active$/i })).not.toBeInTheDocument();
   });
 
   it('omits a row group that has no members', async () => {

@@ -55,10 +55,13 @@ const ClustersWatchSubscription = graphql(`
         server {
           uid
         }
+        lastConnectedAt
         conditions {
           type
           status
           reason
+          message
+          lastTransitionTime
         }
       }
       activeCache {
