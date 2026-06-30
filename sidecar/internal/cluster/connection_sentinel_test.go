@@ -1,0 +1,117 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// White-box (package cluster): the connection-sentinel tests drive the controller
+// through SetSentinelWatcher, sharing the probe/spec helpers in core_controller_test.go.
+package cluster
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/rest"
+
+	"github.com/amorey/beehive"
+)
+
+// fakeWatch is a controllable watch.Interface for connection-sentinel tests: its
+// result channel stays open until Stop closes it. Stop is idempotent (sync.Once), so
+// the sentinel's own deferred Stop after a test-driven break is harmless. Closing the
+// channel simulates the cluster's liveness watch breaking.
+type fakeWatch struct {
+	ch   chan watch.Event
+	once sync.Once
+}
+
+func newFakeWatch() *fakeWatch { return &fakeWatch{ch: make(chan watch.Event)} }
+
+func (w *fakeWatch) Stop()                          { w.once.Do(func() { close(w.ch) }) }
+func (w *fakeWatch) ResultChan() <-chan watch.Event { return w.ch }
+
+// liveSentinelWatch is a SentinelWatchFunc that always establishes a fresh,
+// never-closing watch, so converge's sentinel stays open and never re-probes. Tests
+// that exercise the controller's other out-of-band triggers inject it so the (real,
+// network-dialing) default sentinel watch never runs.
+func liveSentinelWatch(context.Context, *rest.Config) (watch.Interface, error) {
+	return newFakeWatch(), nil
+}
+
+// awaitWatch blocks until a sentinel watch is established, or fails on timeout.
+func awaitWatch(t *testing.T, ch <-chan *fakeWatch) *fakeWatch {
+	t.Helper()
+	select {
+	case w := <-ch:
+		return w
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sentinel watch")
+		return nil
+	}
+}
+
+// TestClusterCoreControllerSentinelReprobesOnWatchBreak verifies the connection
+// sentinel: after a successful probe the controller holds a liveness watch open, and
+// when that watch closes (the earliest connection-loss signal) it forces an
+// out-of-band re-probe — fast detection owned by the connection controller itself,
+// with no sync engine involved.
+func TestClusterCoreControllerSentinelReprobesOnWatchBreak(t *testing.T) {
+	ctx := context.Background()
+
+	probe, probeCh := signalingProbe()
+
+	bh := NewTestBeehiveUnstarted(t)
+	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
+	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
+	w := NewStaticWatcher(t, testKubeConfig("alpha"))
+
+	ctrl := NewClusterCoreController(w, coreClient, cacheClient, nil, nil, probe, staticCheck(HealthPhaseHealthy))
+
+	// Hand each established sentinel watch back to the test so it can break one.
+	watches := make(chan *fakeWatch, 8)
+	ctrl.SetSentinelWatcher(func(context.Context, *rest.Config) (watch.Interface, error) {
+		fw := newFakeWatch()
+		select {
+		case watches <- fw:
+		default:
+		}
+		return fw, nil
+	})
+
+	cc, err := beehive.Register(bh, ClusterGroupKind, ctrl)
+	require.NoError(t, err)
+	ctrl.SetControllerClient(cc)
+	_, err = beehive.Register(bh, ClusterCacheGroupKind, &NoopController[ClusterCacheSpec, ClusterCacheStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	ctrl.StartBackground()
+	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
+
+	_, err = coreClient.Create(ctx, eligibleSpec("alpha"))
+	require.NoError(t, err)
+
+	// The initial scheduled reconcile probes once and, on success, opens a sentinel.
+	awaitProbe(t, probeCh)
+	drainProbes(probeCh)
+
+	// Break the established liveness watch (simulating the connection dropping).
+	fw := awaitWatch(t, watches)
+	fw.Stop()
+
+	// The break must force an out-of-band re-probe without waiting for the 30s poll.
+	awaitProbe(t, probeCh)
+}

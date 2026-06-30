@@ -61,6 +61,9 @@ models:
   ClusterCondition:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCondition
 
+  ClusterConnectionAttempt:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterConnectionAttempt
+
   ConditionStatus:
     model: github.com/amorey/beehive.ConditionStatus
 

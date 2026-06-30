@@ -52,6 +52,8 @@ type Row = {
   connMessage?: string; // Connected condition's `message` (the probe error)
   disconnectedSince?: string; // Connected condition's `lastTransitionTime` (ISO)
   lastConnectedAt?: string; // status.lastConnectedAt (ISO; null = never)
+  nextAttemptAt?: string; // status.nextAttemptAt (ISO; null = no retry scheduled)
+  attempts?: { at: string; ok: boolean; reason: string; message: string }[]; // status.connectionAttempts
 };
 
 function pushClusters(rows: Row[]) {
@@ -79,6 +81,7 @@ function pushClusters(rows: Row[]) {
               },
               server: { uid: r.uuid || null },
               lastConnectedAt: r.lastConnectedAt ?? null,
+              connectionAttempts: r.attempts ?? [],
               conditions: [
                 {
                   type: 'Connected',
@@ -105,6 +108,7 @@ function pushClusters(rows: Row[]) {
                   stats: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
                 }
               : null,
+            nextAttemptAt: r.nextAttemptAt ?? null,
           })),
         },
       },
@@ -332,6 +336,8 @@ describe('ClusterSyncPanel', () => {
     await flush();
     const sub = invokeMock.mock.calls.find(([cmd]) => cmd === 'graphql_subscribe')?.[1] as { query: string };
     expect(sub.query).toContain('lastConnectedAt');
+    expect(sub.query).toContain('nextAttemptAt');
+    expect(sub.query).toContain('connectionAttempts');
     expect(sub.query).toContain('message');
     expect(sub.query).toContain('lastTransitionTime');
   });
@@ -348,15 +354,31 @@ describe('ClusterSyncPanel', () => {
         connMessage: 'dial tcp 10.0.0.1:6443: connect: connection refused',
         disconnectedSince: new Date(Date.now() - 3 * 60_000).toISOString(),
         lastConnectedAt: new Date(Date.now() - 12 * 60_000).toISOString(),
+        nextAttemptAt: new Date(Date.now() + 15_000).toISOString(),
+        attempts: [
+          { at: new Date(Date.now() - 90_000).toISOString(), ok: false, reason: 'ProbeFailed', message: 'i/o timeout' },
+          {
+            at: new Date(Date.now() - 30_000).toISOString(),
+            ok: false,
+            reason: 'ProbeFailed',
+            message: 'TLS handshake timeout',
+          },
+        ],
       },
     ]);
 
     // The Disconnected label is an interactive trigger (only the error state is).
     await user.click(await screen.findByRole('button', { name: /disconnected/i }));
 
-    // The popover surfaces the probe error and when it was last connected.
+    // The popover surfaces the probe error, the connection timestamps, the
+    // countdown to the next scheduled retry, and the recent-attempt log.
     expect(await screen.findByText(/connection refused/i)).toBeInTheDocument();
     expect(screen.getByText(/last connected/i)).toBeInTheDocument();
+    expect(screen.getByText(/next attempt/i)).toBeInTheDocument();
+    // The attempt history lists each recorded outcome (including an older one
+    // whose message differs from the current condition message).
+    expect(screen.getByText(/recent attempts/i)).toBeInTheDocument();
+    expect(screen.getByText(/i\/o timeout/i)).toBeInTheDocument();
 
     // Retry fires clusterConnectionRetry.
     await user.click(screen.getByRole('button', { name: /retry/i }));

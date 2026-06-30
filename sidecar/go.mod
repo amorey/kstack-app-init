@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/99designs/gqlgen v0.17.90
 	github.com/Microsoft/go-winio v0.6.2
-	github.com/amorey/beehive v0.6.0
+	github.com/amorey/beehive v0.10.0
 	github.com/amorey/gochan v0.1.0
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/fsnotify/fsnotify v1.10.1

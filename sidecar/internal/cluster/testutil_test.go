@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package testutil provides shared test helpers for the controllers sub-packages.
-package testutil
+// Shared white-box test helpers for the cluster package: kubeconfig sources, a
+// memory-backed beehive with the cluster kinds registered, and a no-op controller.
+// In a _test.go file (package cluster) so the testing/testify/sqlite deps stay out
+// of the production build while every other _test.go in the package can use them.
+package cluster
 
 import (
 	"context"
@@ -26,7 +29,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 )
 
@@ -38,7 +40,7 @@ type StaticWatcher struct {
 
 // NewStaticWatcher creates a KubeConfigSource that delivers cfg as its current
 // snapshot. cfg may be nil (an empty config is delivered then).
-func NewStaticWatcher(t *testing.T, cfg *api.Config) cluster.KubeConfigSource {
+func NewStaticWatcher(t *testing.T, cfg *api.Config) KubeConfigSource {
 	t.Helper()
 	if cfg == nil {
 		cfg = &api.Config{Contexts: map[string]*api.Context{}}
@@ -97,11 +99,11 @@ func OpenMemoryStore() (beehive.Store, error) {
 	return sqlite.OpenMemory()
 }
 
-// TestKubeConfig builds an in-memory kubeconfig resolvable for the given
+// testKubeConfig builds an in-memory kubeconfig resolvable for the given
 // contexts without touching the network. For each context the cluster entry is
 // "<ctx>-cluster", user is "<ctx>-user", server is always https://127.0.0.1:6443;
 // the first context is the current-context.
-func TestKubeConfig(contextNames ...string) *api.Config {
+func testKubeConfig(contextNames ...string) *api.Config {
 	cfg := &api.Config{
 		Contexts:  map[string]*api.Context{},
 		Clusters:  map[string]*api.Cluster{},
@@ -143,9 +145,9 @@ func (c *NoopController[Spec, Status]) Reconcile(_ context.Context, _ beehive.Co
 func NewTestBeehive(t *testing.T) *beehive.Beehive {
 	t.Helper()
 	bh := NewTestBeehiveUnstarted(t)
-	_, err := beehive.Register(bh, cluster.ClusterGroupKind, &NoopController[cluster.ClusterSpec, cluster.ClusterStatus]{})
+	_, err := beehive.Register(bh, ClusterGroupKind, &NoopController[ClusterSpec, ClusterStatus]{})
 	require.NoError(t, err)
-	_, err = beehive.Register(bh, cluster.ClusterCacheGroupKind, &NoopController[cluster.ClusterCacheSpec, cluster.ClusterCacheStatus]{})
+	_, err = beehive.Register(bh, ClusterCacheGroupKind, &NoopController[ClusterCacheSpec, ClusterCacheStatus]{})
 	require.NoError(t, err)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)

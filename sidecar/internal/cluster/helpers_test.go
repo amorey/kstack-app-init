@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cluster_test
+package cluster
 
 import (
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 )
 
 // TestConfigureKubeHTTP2KeepaliveSetsUnsetVars verifies the tightened HTTP/2
@@ -33,7 +31,7 @@ func TestConfigureKubeHTTP2KeepaliveSetsUnsetVars(t *testing.T) {
 	os.Unsetenv("HTTP2_READ_IDLE_TIMEOUT_SECONDS")
 	os.Unsetenv("HTTP2_PING_TIMEOUT_SECONDS")
 
-	cluster.ConfigureKubeHTTP2Keepalive()
+	ConfigureKubeHTTP2Keepalive()
 
 	assert.Equal(t, "10", os.Getenv("HTTP2_READ_IDLE_TIMEOUT_SECONDS"))
 	assert.Equal(t, "5", os.Getenv("HTTP2_PING_TIMEOUT_SECONDS"))
@@ -45,7 +43,7 @@ func TestConfigureKubeHTTP2KeepalivePreservesOverride(t *testing.T) {
 	t.Setenv("HTTP2_READ_IDLE_TIMEOUT_SECONDS", "0") // 0 disables the health check
 	t.Setenv("HTTP2_PING_TIMEOUT_SECONDS", "42")
 
-	cluster.ConfigureKubeHTTP2Keepalive()
+	ConfigureKubeHTTP2Keepalive()
 
 	assert.Equal(t, "0", os.Getenv("HTTP2_READ_IDLE_TIMEOUT_SECONDS"),
 		"an existing override must be preserved")

@@ -54,6 +54,8 @@ type Cluster {
   caches: [ClusterCache!]!
   "The cache for the cluster's currently-connected identity (its UID matches `status.server.uid`), or null when the cluster has no active cache yet (never probed, or mid-migration). This is the cache a sync engine runs for and the one a UI shows for the row."
   activeCache: ClusterCache
+  "When the next reconcile (for a disconnected cluster, its next backoff retry) is scheduled, derived live from the control plane's queue; null when nothing is scheduled. Observability, not a guarantee — an out-of-band trigger may reconcile sooner."
+  nextAttemptAt: Time
 }
 
 "A cluster record's desired state. Every field is user/API-owned; nothing here is observed."
@@ -100,6 +102,8 @@ type ClusterStatus {
   principal: ClusterPrincipal!
   "When a connection probe last succeeded; null if never."
   lastConnectedAt: Time
+  "Bounded, chronological history (oldest first) of recent connection-probe outcomes."
+  connectionAttempts: [ClusterConnectionAttempt!]!
 
   "The connection controller's conditions (`Connected`, `Healthy`)."
   conditions: [ClusterCondition!]!
@@ -137,6 +141,18 @@ type ClusterCondition {
   observedGeneration: Int!
   "When `status` last changed — not when the condition was last refreshed."
   lastTransitionTime: Time!
+}
+
+"One recorded connection-probe outcome in `status.connectionAttempts`."
+type ClusterConnectionAttempt {
+  "When the probe ran."
+  at: Time!
+  "True on a successful connect, false on a failure."
+  ok: Boolean!
+  "Machine-readable code: `Connected`, `ProbeFailed`, or `ResolveFailed`."
+  reason: String!
+  "The underlying error (truncated); empty on success."
+  message: String!
 }
 
 """

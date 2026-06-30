@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cluster_test
+package cluster
 
 import (
 	"sync"
@@ -20,19 +20,17 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"k8s.io/client-go/rest"
-
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 )
 
 func TestConnectionManagerGetMissReturnsNil(t *testing.T) {
-	cm := cluster.NewConnectionManager()
-	got := cm.Get(cluster.ClusterID(999999))
+	cm := NewConnectionManager()
+	got := cm.Get(ClusterID(999999))
 	assert.Nil(t, got)
 }
 
 func TestConnectionManagerSetThenGet(t *testing.T) {
-	cm := cluster.NewConnectionManager()
-	id := cluster.ClusterID(1)
+	cm := NewConnectionManager()
+	id := ClusterID(1)
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
 
 	cm.Set(id, cfg)
@@ -42,8 +40,8 @@ func TestConnectionManagerSetThenGet(t *testing.T) {
 }
 
 func TestConnectionManagerDeleteRemovesEntry(t *testing.T) {
-	cm := cluster.NewConnectionManager()
-	id := cluster.ClusterID(1)
+	cm := NewConnectionManager()
+	id := ClusterID(1)
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
 
 	cm.Set(id, cfg)
@@ -54,14 +52,14 @@ func TestConnectionManagerDeleteRemovesEntry(t *testing.T) {
 }
 
 func TestConnectionManagerDeleteMissingIsNoop(t *testing.T) {
-	cm := cluster.NewConnectionManager()
+	cm := NewConnectionManager()
 	// Should not panic.
-	cm.Delete(cluster.ClusterID(999999))
+	cm.Delete(ClusterID(999999))
 }
 
 func TestConnectionManagerSetOverwrites(t *testing.T) {
-	cm := cluster.NewConnectionManager()
-	id := cluster.ClusterID(1)
+	cm := NewConnectionManager()
+	id := ClusterID(1)
 	first := &rest.Config{Host: "https://first:6443"}
 	second := &rest.Config{Host: "https://second:6443"}
 
@@ -73,12 +71,12 @@ func TestConnectionManagerSetOverwrites(t *testing.T) {
 }
 
 func TestConnectionManagerConcurrentAccess(t *testing.T) {
-	cm := cluster.NewConnectionManager()
+	cm := NewConnectionManager()
 	const n = 100
 	var wg sync.WaitGroup
 	wg.Add(n * 3)
 	for i := range n {
-		id := cluster.ClusterID(1)
+		id := ClusterID(1)
 		cfg := &rest.Config{Host: "https://host"}
 		go func() { defer wg.Done(); cm.Set(id, cfg) }()
 		go func() { defer wg.Done(); cm.Get(id) }()

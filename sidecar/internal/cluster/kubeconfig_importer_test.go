@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cluster_test
+package cluster
 
 import (
 	"context"
@@ -23,19 +23,16 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/amorey/beehive"
-
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/testutil"
 )
 
 // newTestImporter builds a KubeconfigImporter against a fresh beehive
 // (no-op controllers — the importer only writes Cluster specs).
-func newTestImporter(t *testing.T, cfg *api.Config) *cluster.KubeconfigImporter {
+func newTestImporter(t *testing.T, cfg *api.Config) *KubeconfigImporter {
 	t.Helper()
-	bh := testutil.NewTestBeehive(t)
-	coreClient := beehive.NewClient[cluster.ClusterSpec, cluster.ClusterStatus](bh, cluster.ClusterGroupKind)
-	w := testutil.NewStaticWatcher(t, cfg)
-	return cluster.NewKubeconfigImporter(w, coreClient)
+	bh := NewTestBeehive(t)
+	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
+	w := NewStaticWatcher(t, cfg)
+	return NewKubeconfigImporter(w, coreClient)
 }
 
 // The importer creates a Cluster carrying only the source reference; the
@@ -43,7 +40,7 @@ func newTestImporter(t *testing.T, cfg *api.Config) *cluster.KubeconfigImporter 
 // and is not written by the importer.
 func TestImporterNewContextCreatesCluster(t *testing.T) {
 	ctx := context.Background()
-	cfg := testutil.TestKubeConfig("alpha")
+	cfg := testKubeConfig("alpha")
 	im := newTestImporter(t, cfg)
 
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
@@ -63,7 +60,7 @@ func TestImporterNewContextCreatesCluster(t *testing.T) {
 // Distinct contexts get distinct, deterministic source-prefixed slugs.
 func TestImporterSlugIsDeterministicNaturalKey(t *testing.T) {
 	ctx := context.Background()
-	cfg := testutil.TestKubeConfig("alpha", "beta")
+	cfg := testKubeConfig("alpha", "beta")
 	im := newTestImporter(t, cfg)
 
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
@@ -83,7 +80,7 @@ func TestImporterSlugIsDeterministicNaturalKey(t *testing.T) {
 // owned cache) survives. Flipping it to not-present is the controller's job.
 func TestImporterDepartedContextKeepsCluster(t *testing.T) {
 	ctx := context.Background()
-	cfg := testutil.TestKubeConfig("alpha")
+	cfg := testKubeConfig("alpha")
 	im := newTestImporter(t, cfg)
 
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
@@ -101,7 +98,7 @@ func TestImporterDepartedContextKeepsCluster(t *testing.T) {
 // by context and creates no duplicate.
 func TestImporterReturningContextCreatesNoDuplicate(t *testing.T) {
 	ctx := context.Background()
-	cfg := testutil.TestKubeConfig("alpha")
+	cfg := testKubeConfig("alpha")
 	im := newTestImporter(t, cfg)
 
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
@@ -119,7 +116,7 @@ func TestImporterReturningContextCreatesNoDuplicate(t *testing.T) {
 // no spec write — the importer only ever creates).
 func TestImporterRepeatSnapshotCreatesNothing(t *testing.T) {
 	ctx := context.Background()
-	cfg := testutil.TestKubeConfig("alpha")
+	cfg := testKubeConfig("alpha")
 	im := newTestImporter(t, cfg)
 
 	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
@@ -132,7 +129,7 @@ func TestImporterRepeatSnapshotCreatesNothing(t *testing.T) {
 	assert.Equal(t, obj1.Generation, obj2.Generation, "repeat snapshot must not bump generation")
 }
 
-func mustSingleObj(t *testing.T, cl beehive.Client[cluster.ClusterSpec, cluster.ClusterStatus]) *beehive.Object[cluster.ClusterSpec, cluster.ClusterStatus] {
+func mustSingleObj(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus]) *beehive.Object[ClusterSpec, ClusterStatus] {
 	t.Helper()
 	objs, err := cl.List(context.Background())
 	require.NoError(t, err)

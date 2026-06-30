@@ -72,6 +72,16 @@ type ClusterService interface {
 	GetConnection(id ClusterID) *rest.Config
 }
 
+// coreController is the subset of *ClusterCoreController that Service drives: the
+// background-worker lifecycle and the targeted out-of-band re-probe entry point.
+// Holding it behind an interface lets the white-box service tests inject a fake
+// (so the dispatch path has no production nil-guard).
+type coreController interface {
+	StartBackground()
+	StopBackground()
+	Reprobe(ClusterID)
+}
+
 // Service is the concrete ClusterService and the whole cluster control plane: it
 // owns the beehive store + instance, the kubeconfig watcher, the two beehive
 // clients, the two controllers (registered with beehive in New), the kubeconfig
@@ -86,7 +96,7 @@ type Service struct {
 	cacheClient  beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
 	cacheManager *store.Manager
 	connMgr      *ConnectionManager
-	coreCtrl     *ClusterCoreController
+	coreCtrl     coreController
 	cacheCtrl    *ClusterCacheController
 
 	importer *KubeconfigImporter
@@ -143,7 +153,10 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	// status out-of-band (the connection controller's poke re-probe, the cache
 	// controller's engine sink), so we inject it now — before bh.Start, since a
 	// startup reconcile may spawn an engine that reports immediately.
-	coreCC, errCluster := beehive.Register(bh, ClusterGroupKind, coreCtrl)
+	// Cap the connection controller's exponential reconnect backoff (base 1s, ×2)
+	// at connectionMaxBackoff — a failed probe returns an error, so beehive owns the
+	// doubling and resets it on the next success.
+	coreCC, errCluster := beehive.Register(bh, ClusterGroupKind, coreCtrl, beehive.WithMaxRetryInterval(connectionMaxBackoff))
 	cacheCC, errCache := beehive.Register(bh, ClusterCacheGroupKind, cacheCtrl)
 	if err := errors.Join(errCluster, errCache); err != nil {
 		bhStore.Close()
@@ -152,12 +165,6 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	}
 	coreCtrl.SetControllerClient(coreCC)
 	cacheCtrl.SetControllerClient(cacheCC)
-
-	// When a sync engine's watch streams break (the earliest connection-loss
-	// signal), have the cache controller poke the core controller to re-probe that
-	// cluster's connection immediately, rather than waiting for the health-poll
-	// cadence.
-	cacheCtrl.SetReprober(coreCtrl)
 
 	return &Service{
 		bh:           bh,
@@ -321,17 +328,20 @@ func (s *Service) SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool
 	return s.updateSpec(ctx, id, func(spec *ClusterSpec) { spec.SyncEnabled = enabled })
 }
 
-// RetryConnection implements ClusterService. It validates the cluster exists,
-// then dispatches an immediate out-of-band re-probe to the connection controller
-// via its in-process retry bus — no spec write. The outcome lands on the record's
-// conditions and reaches watchers through Watch.
+// RetryConnection implements ClusterService. It forces an immediate out-of-band
+// re-probe via the core controller's retry bus (Reprobe) — no spec write. The
+// reprobe is backoff-neutral: running off-worker, a failed manual probe leaves
+// beehive's reconnect ladder untouched (it neither resets to the 1s ramp nor
+// advances the schedule), so manual clicks don't perturb the automatic cadence.
+// (Routing through Client.Requeue instead would ride beehive's worker and so
+// participate in backoff.) Dispatch is fire-and-forget, after a cheap read-only
+// existence check that surfaces ErrNotFound for a just-deleted cluster. The
+// outcome lands on the record's conditions and reaches watchers through Watch.
 func (s *Service) RetryConnection(ctx context.Context, id ClusterID) error {
 	if _, err := s.clusterByID(ctx, id); err != nil {
 		return err
 	}
-	if s.coreCtrl != nil {
-		s.coreCtrl.Reprobe(id)
-	}
+	s.coreCtrl.Reprobe(id)
 	return nil
 }
 
@@ -451,6 +461,16 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterS
 	}
 	if obj.Status != nil {
 		c.Status = *obj.Status
+	}
+
+	// NextAttemptAt is derived read-side from beehive's actual schedule (a field on
+	// the domain Cluster, not persisted in Status): when it has queued this
+	// cluster's next reconcile — for a disconnected cluster, its next backoff retry,
+	// which the UI counts down to. A cheap in-memory queue read (no store lookup),
+	// so it's fine on this per-cluster watch-rebuild path. Zero means nothing is
+	// scheduled → leave it nil.
+	if at := s.coreClient.NextRequeueAt(ctx, obj.ID); !at.IsZero() {
+		c.NextAttemptAt = &at
 	}
 
 	// Join in the cluster's owned ClusterCache children (zero or more): each carries

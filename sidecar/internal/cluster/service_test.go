@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// White-box: the service test seeds beehive objects directly and exercises the
-// data/mutation/watch surface in isolation from the (network-touching) real
-// controllers, so it lives in package cluster (it cannot use the testutil
-// helpers, which import this package).
+// White-box (package cluster): the service test seeds beehive objects directly and
+// exercises the data/mutation/watch surface in isolation from the (network-touching)
+// real controllers, using the shared helpers in testutil_test.go.
 package cluster
 
 import (
@@ -40,6 +39,16 @@ type noopController[Spec, Status any] struct{}
 func (c *noopController[Spec, Status]) Reconcile(context.Context, beehive.ControllerClient[Status], *beehive.Object[Spec, Status]) (beehive.Result, error) {
 	return beehive.Result{}, nil
 }
+
+// fakeCoreController satisfies the coreController seam so the white-box service
+// test can assert the out-of-band dispatch (RetryConnection → Reprobe) without a
+// real, network-touching ClusterCoreController. StartBackground/StopBackground are
+// no-ops; Reprobe records the ids it was handed.
+type fakeCoreController struct{ reprobed []ClusterID }
+
+func (f *fakeCoreController) StartBackground()     {}
+func (f *fakeCoreController) StopBackground()      {}
+func (f *fakeCoreController) Reprobe(id ClusterID) { f.reprobed = append(f.reprobed, id) }
 
 // newServiceTest builds a started beehive with no-op controllers and returns a
 // service wired to its clients plus a temp cache manager. The returned
@@ -70,6 +79,7 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterSta
 		cacheClient:  cacheClient,
 		cacheManager: store.NewManager(t.TempDir()),
 		connMgr:      NewConnectionManager(),
+		coreCtrl:     &fakeCoreController{},
 	}, coreCC, cacheCC
 }
 
@@ -242,10 +252,10 @@ func TestServiceSetSyncEnabled(t *testing.T) {
 	assert.False(t, obj.Spec.SyncEnabled)
 }
 
-// RetryConnection does not mutate the spec: it dispatches an out-of-band re-probe
-// to the controller. The white-box harness has coreCtrl == nil, so the actual
-// re-probe is covered in core_controller_test.go; here we pin that the spec is
-// untouched and an unknown id still errors.
+// RetryConnection dispatches an out-of-band re-probe to the controller without
+// mutating the spec. The harness wires a fakeCoreController, so we pin both that
+// the dispatch reaches Reprobe and that the spec is untouched; an unknown id
+// errors before any dispatch.
 func TestServiceRetryConnectionDoesNotMutateSpec(t *testing.T) {
 	ctx := context.Background()
 	s, _, _ := newServiceTest(t)
@@ -260,9 +270,11 @@ func TestServiceRetryConnectionDoesNotMutateSpec(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, before.Generation, after.Generation, "RetryConnection must not write the spec")
 	assert.Equal(t, before.Spec, after.Spec)
+	assert.Equal(t, []ClusterID{id}, s.coreCtrl.(*fakeCoreController).reprobed, "retry must dispatch a reprobe")
 
-	// An unknown id is still ErrNotFound.
+	// An unknown id is ErrNotFound and dispatches nothing further.
 	assert.ErrorIs(t, s.RetryConnection(ctx, ClusterID(999999)), ErrNotFound)
+	assert.Equal(t, []ClusterID{id}, s.coreCtrl.(*fakeCoreController).reprobed, "unknown id must not reprobe")
 }
 
 func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {

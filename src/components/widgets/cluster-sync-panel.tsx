@@ -22,6 +22,7 @@
 // through to it, and the resulting clustersWatch push updates the table.
 import { ChevronDown, Database, Pause, Play, Power, PowerOff, RotateCw, Slash, Trash2 } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
+import ReactTimeAgo, { type Formatter } from 'react-timeago';
 import { useMutation } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
@@ -196,13 +197,77 @@ function parseTimeOrNull(iso: string | null | undefined): number | null {
 // timestamps. `message` is the live `Connected` condition's message (the
 // underlying error); `lostAt` is when it last flipped to disconnected;
 // `lastConnectedAt` is the last *successful* connect (null = never reached).
-function connectionDetail(c: Cluster): { message: string; lostAtMs: number | null; lastConnectedAtMs: number | null } {
+function connectionDetail(c: Cluster): {
+  message: string;
+  lostAtMs: number | null;
+  lastConnectedAtMs: number | null;
+  nextAttemptAtMs: number | null;
+  attempts: Cluster['status']['connectionAttempts'];
+} {
   const cond = findCondition(c.status.conditions, 'Connected');
   return {
     message: cond?.message ?? '',
     lostAtMs: parseTimeOrNull(cond?.lastTransitionTime),
     lastConnectedAtMs: parseTimeOrNull(c.status.lastConnectedAt),
+    nextAttemptAtMs: parseTimeOrNull(c.nextAttemptAt),
+    attempts: c.status.connectionAttempts,
   };
+}
+
+const SECOND_MS = 1_000;
+const MINUTE_MS = 60 * SECOND_MS;
+const HOUR_MS = 60 * MINUTE_MS;
+
+// Always surface the elapsed seconds (no "just now" bucket) so the connection
+// diagnostics read as a live counter — "1s ago", "2s ago", … — rolling up to
+// minutes/hours past those thresholds. react-timeago ticks every second while
+// sub-minute (lib/index.js), so this increments in realtime; only the 4th
+// formatter arg (the timestamp's epoch ms) is needed.
+const relativeFormatter: Formatter = (_value, _unit, _suffix, epochMs) => {
+  const diff = Math.max(0, Date.now() - epochMs);
+  if (diff < MINUTE_MS) return `${Math.floor(diff / SECOND_MS)}s ago`;
+  if (diff < HOUR_MS) return `${Math.floor(diff / MINUTE_MS)}m ago`;
+  return `${Math.floor(diff / HOUR_MS)}h ago`;
+};
+
+// The mirror image, counting *down* to a future time — "in 1m 30s", "in 14s" —
+// for the next scheduled retry. Shows minutes *and* seconds so it visibly ticks
+// the whole way down (not a static "1m"); "now" once it's due (a probe is
+// imminent; the next push restamps it into the future).
+const countdownFormatter: Formatter = (_value, _unit, _suffix, epochMs) => {
+  const totalSec = Math.floor(Math.max(0, epochMs - Date.now()) / SECOND_MS);
+  if (totalSec < 1) return 'now';
+  if (totalSec < 60) return `in ${totalSec}s`;
+  return `in ${Math.floor(totalSec / 60)}m ${totalSec % 60}s`;
+};
+
+// A live-ticking relative time. maxPeriod={1} forces a re-render every second:
+// react-timeago otherwise throttles to once-a-minute above 60s (its "X ago"
+// assumption), which freezes a countdown (e.g. stuck at "59s") instead of ticking.
+function RelativeTime({ ms, formatter = relativeFormatter }: { ms: number; formatter?: Formatter }) {
+  return <ReactTimeAgo date={ms} component="span" formatter={formatter} maxPeriod={1} />;
+}
+
+// One label/value line of the connection diagnostics. A non-null `ms` ticks live;
+// a null `ms` shows `fallback`, or the row is omitted entirely when there's none.
+function DetailRow({
+  label,
+  ms,
+  fallback,
+  formatter,
+}: {
+  label: string;
+  ms: number | null;
+  fallback?: ReactNode;
+  formatter?: Formatter;
+}) {
+  if (ms === null && fallback === undefined) return null;
+  return (
+    <div className="flex gap-2">
+      <dt className="w-28 shrink-0">{label}</dt>
+      <dd className="tabular-nums">{ms !== null ? <RelativeTime ms={ms} formatter={formatter} /> : fallback}</dd>
+    </div>
+  );
 }
 
 // The expanded connection diagnostics for a Disconnected cluster: the probe
@@ -232,19 +297,33 @@ function ConnectionDetail({ cluster, onRetry }: { cluster: Cluster; onRetry: () 
         <p className="break-words font-mono text-xs leading-snug text-muted-foreground">{detail.message}</p>
       ) : null}
       <dl className="space-y-0.5 text-xs text-muted-foreground">
-        <div className="flex gap-2">
-          <dt className="w-28 shrink-0">Last connected</dt>
-          <dd className="tabular-nums">
-            {detail.lastConnectedAtMs !== null ? formatSyncFreshness(detail.lastConnectedAtMs) : 'never'}
-          </dd>
-        </div>
-        {detail.lostAtMs !== null ? (
-          <div className="flex gap-2">
-            <dt className="w-28 shrink-0">Lost connection</dt>
-            <dd className="tabular-nums">{formatSyncFreshness(detail.lostAtMs)}</dd>
-          </div>
-        ) : null}
+        <DetailRow label="Last connected" ms={detail.lastConnectedAtMs} fallback="never" />
+        <DetailRow label="Lost connection" ms={detail.lostAtMs} />
+        <DetailRow label="Next attempt" ms={detail.nextAttemptAtMs} formatter={countdownFormatter} />
       </dl>
+      {detail.attempts.length > 0 ? (
+        <div className="space-y-1">
+          <p className="text-xs font-medium text-muted-foreground">Recent attempts</p>
+          {/* Newest first; backend keeps the history oldest-first. Scrolls so a
+              long history doesn't blow out the panel. */}
+          {/* Subgrid so the timestamp/reason columns size to their widest row and
+              every message starts at the same x. */}
+          <ul className="grid max-h-40 grid-cols-[auto_auto_1fr] divide-y overflow-y-auto rounded-md border text-xs">
+            {detail.attempts
+              .map((a, i) => ({ a, key: `${a.at}-${i}` }))
+              .reverse()
+              .map(({ a, key }) => (
+                <li key={key} className="col-span-3 grid grid-cols-subgrid items-baseline gap-x-2 px-2 py-1">
+                  <span className="font-mono text-muted-foreground">{a.at}</span>
+                  <span className={a.ok ? TONE.ok.text : TONE.error.text}>{a.ok ? 'connected' : a.reason}</span>
+                  <span className="truncate text-muted-foreground" title={a.message}>
+                    {a.message}
+                  </span>
+                </li>
+              ))}
+          </ul>
+        </div>
+      ) : null}
       <Button
         type="button"
         variant="outline"

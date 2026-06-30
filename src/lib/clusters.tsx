@@ -56,6 +56,12 @@ const ClustersWatchSubscription = graphql(`
           uid
         }
         lastConnectedAt
+        connectionAttempts {
+          at
+          ok
+          reason
+          message
+        }
         conditions {
           type
           status
@@ -81,6 +87,7 @@ const ClustersWatchSubscription = graphql(`
           bytes
         }
       }
+      nextAttemptAt
     }
   }
 `);

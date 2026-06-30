@@ -30,14 +30,15 @@ import (
 
 	"github.com/amorey/beehive"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/engine"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 const (
-	// connectionInitialBackoff and connectionMaxBackoff pace reconnect
-	// attempts after probe failures: doubling waits, capped.
-	connectionInitialBackoff = time.Second
-	connectionMaxBackoff     = 2 * time.Minute
+	// connectionMaxBackoff caps beehive's exponential reconnect backoff for a
+	// failing cluster — passed via WithMaxRetryInterval at registration. The base
+	// (1s) and ×2 factor are beehive's defaults.
+	connectionMaxBackoff = 2 * time.Minute
 
 	// connectionProbeTimeout bounds one identity probe's round-trips.
 	connectionProbeTimeout = 10 * time.Second
@@ -111,6 +112,20 @@ type ClusterCoreController struct {
 	bgWG     sync.WaitGroup
 	bgCancel context.CancelFunc
 
+	// Connection sentinels: one long-lived liveness watch per connected cluster,
+	// owned by converge (started on a successful probe, stopped on ineligibility/
+	// failure). A watch closing is the earliest connection-loss signal, so the
+	// sentinel re-probes out-of-band — making fast detection a property of the
+	// connection controller itself, independent of whether sync is running. See
+	// connection_sentinel.go.
+	sentinelWatch SentinelWatchFunc
+	// sentinelMu guards both the sentinels map and bgCtx (the base context the
+	// sentinel goroutines derive from, published by StartBackground).
+	sentinelMu sync.Mutex
+	sentinels  map[ClusterID]*connSentinel
+	sentinelWG sync.WaitGroup
+	bgCtx      context.Context
+
 	// writeMu serializes reconciles. Both beehive-scheduled and out-of-band
 	// (poke/retry/kubeconfig-change) reconciles take it and re-read the object's
 	// status fresh under it, so a reconcile holding a stale snapshot cannot clobber
@@ -152,15 +167,46 @@ func NewClusterCoreController(
 		check = checkServerHealth
 	}
 	return &ClusterCoreController{
-		cfgSource:   cfgSource,
-		coreClient:  coreClient,
-		cacheClient: cacheClient,
-		connMgr:     connMgr,
-		pokeSvc:     pokeSvc,
-		retryCh:     make(chan ClusterID, retryBufferSize),
-		probe:       probe,
-		check:       check,
+		cfgSource:     cfgSource,
+		coreClient:    coreClient,
+		cacheClient:   cacheClient,
+		connMgr:       connMgr,
+		pokeSvc:       pokeSvc,
+		retryCh:       make(chan ClusterID, retryBufferSize),
+		probe:         probe,
+		check:         check,
+		sentinelWatch: watchKubeSystem,
+		sentinels:     make(map[ClusterID]*connSentinel),
 	}
+}
+
+const (
+	// maxConnectionAttempts bounds the per-cluster probe-outcome history kept on
+	// ClusterStatus (it rides the full clustersWatch payload, so keep it small).
+	maxConnectionAttempts = 20
+	// maxAttemptMessageLen caps a recorded error message's length.
+	maxAttemptMessageLen = 200
+)
+
+// appendAttempt records one probe outcome on the working status, keeping the
+// history chronological (oldest first) and bounded to the most recent
+// maxConnectionAttempts.
+func appendAttempt(working *ClusterStatus, at time.Time, ok bool, reason, message string) {
+	working.ConnectionAttempts = append(working.ConnectionAttempts, ClusterConnectionAttempt{
+		At: at, OK: ok, Reason: reason, Message: truncateMessage(message),
+	})
+	if n := len(working.ConnectionAttempts); n > maxConnectionAttempts {
+		working.ConnectionAttempts = working.ConnectionAttempts[n-maxConnectionAttempts:]
+	}
+}
+
+// truncateMessage caps s at maxAttemptMessageLen bytes, appending an ellipsis
+// when it overflows. (Byte-bounded; error strings are effectively ASCII.)
+func truncateMessage(s string) string {
+	if len(s) <= maxAttemptMessageLen {
+		return s
+	}
+	return s[:maxAttemptMessageLen] + "…"
 }
 
 // SetControllerClient injects the status-write client obtained from
@@ -180,6 +226,13 @@ func (c *ClusterCoreController) SetControllerClient(cl beehive.ControllerClient[
 // still work. Call after the control plane has started; pair with StopBackground.
 func (c *ClusterCoreController) StartBackground() {
 	ctx, cancelCtx := context.WithCancel(context.Background())
+
+	// Publish the base context the connection sentinels anchor to. Until this is
+	// set, ensureSentinel skips (a reconcile may run between bh.Start and here); the
+	// next reconcile starts the sentinel once the worker is up.
+	c.sentinelMu.Lock()
+	c.bgCtx = ctx
+	c.sentinelMu.Unlock()
 
 	var pokeCh <-chan poke.Signal
 	cancelSub := func() {}
@@ -226,14 +279,19 @@ func (c *ClusterCoreController) StartBackground() {
 // StartBackground was never called.
 func (c *ClusterCoreController) StopBackground() {
 	if c.bgCancel != nil {
-		c.bgCancel()
+		c.bgCancel() // cancels the worker AND every sentinel (derived from bgCtx)
 	}
 	c.bgWG.Wait()
+	c.sentinelWG.Wait()
 }
 
 // Reprobe requests an immediate out-of-band re-probe of one cluster. Non-blocking:
 // the request is dropped if the bus buffer is full (a retry is already queued).
-// Backs Service.RetryConnection.
+// It is a general targeted-reprobe primitive with two producers: the connection
+// sentinel (connection_sentinel.go) on a liveness-watch close, and the
+// user-initiated retry (Service.RetryConnection). Both want the same thing — an
+// immediate, backoff-neutral probe now — so a manual "retry now" or a watch close
+// that fails to reconnect leaves beehive's scheduled backoff ladder intact.
 func (c *ClusterCoreController) Reprobe(id ClusterID) {
 	select {
 	case c.retryCh <- id:
@@ -328,26 +386,37 @@ func (c *ClusterCoreController) Reconcile(ctx context.Context, client beehive.Co
 		loaded = *obj.Status
 	}
 	working := ClusterStatus{
-		Source:          loaded.Source,
-		Server:          loaded.Server,
-		Principal:       loaded.Principal,
-		LastConnectedAt: loaded.LastConnectedAt,
-		Conditions:      slices.Clone(loaded.Conditions),
+		Source:             loaded.Source,
+		Server:             loaded.Server,
+		Principal:          loaded.Principal,
+		LastConnectedAt:    loaded.LastConnectedAt,
+		ConnectionAttempts: slices.Clone(loaded.ConnectionAttempts),
+		Conditions:         slices.Clone(loaded.Conditions),
 	}
 
-	requeueAfter := c.converge(ctx, obj, &working)
+	requeueAfter, convergeErr := c.converge(ctx, obj, &working)
 
-	if ClusterStatusEqual(loaded, working) {
-		return beehive.Result{RequeueAfter: requeueAfter}, nil
+	// Persist observations (conditions, attempt history, timestamps) before
+	// surfacing any failure — the status write must land even when the probe failed.
+	if !ClusterStatusEqual(loaded, working) {
+		if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, working); err != nil {
+			return beehive.Result{}, err
+		}
 	}
-	return beehive.Result{RequeueAfter: requeueAfter},
-		client.UpdateStatus(ctx, obj.ID, obj.Generation, working)
+	// A probe/resolve failure is returned as an error so beehive applies its
+	// exponential backoff; the status above is already recorded for the UI.
+	if convergeErr != nil {
+		return beehive.Result{}, convergeErr
+	}
+	return beehive.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // converge runs the eligibility gate → credential resolution → probe → health
-// phases, recording observations on working, and returns the desired
-// RequeueAfter delay.
-func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus], working *ClusterStatus) time.Duration {
+// phases, recording observations on working. It returns (requeueAfter, err): a
+// failed probe returns a non-nil error so beehive applies exponential backoff; a
+// success returns the steady health-poll interval; an ineligible cluster returns
+// (0, nil) — nothing scheduled.
+func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus], working *ClusterStatus) (time.Duration, error) {
 	gen := obj.Generation
 	conds := &working.Conditions
 
@@ -360,9 +429,7 @@ func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Objec
 	present := c.observeKubeconfig(obj, working)
 
 	if !connectionEligible(obj, present) {
-		if c.connMgr != nil {
-			c.connMgr.Delete(clusterID)
-		}
+		c.teardownConnection(clusterID)
 		SetCondition(conds, ClusterCondition{
 			Type:               ClusterConditionConnected,
 			Status:             ConditionFalse,
@@ -375,34 +442,42 @@ func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Objec
 			Reason:             ReasonInactive,
 			ObservedGeneration: gen,
 		})
-		return 0
+		return 0, nil
 	}
+
+	// Eligible: we're about to try to connect, so stamp the attempt time now —
+	// the single timestamp every outcome below records (resolve-fail, probe-fail,
+	// or success), so the recorded attempt and the success time agree.
+	now := time.Now().UTC()
 
 	contextName := obj.Spec.Source.Kubeconfig.Context
 	restCfg, err := ResolveRESTConfig(c.cfgSource.Get(), contextName)
 	if err != nil {
-		if c.connMgr != nil {
-			c.connMgr.Delete(clusterID)
-		}
-		return c.observeConnectFailure(conds, gen, ReasonResolveFailed, err)
+		c.teardownConnection(clusterID)
+		appendAttempt(working, now, false, ReasonResolveFailed, err.Error())
+		return 0, c.observeConnectFailure(conds, gen, ReasonResolveFailed, err)
 	}
 
 	server, principal, err := c.probe(ctx, restCfg)
 	if err != nil {
-		if c.connMgr != nil {
-			c.connMgr.Delete(clusterID)
-		}
-		return c.observeConnectFailure(conds, gen, ReasonProbeFailed, err)
+		c.teardownConnection(clusterID)
+		appendAttempt(working, now, false, ReasonProbeFailed, err.Error())
+		return 0, c.observeConnectFailure(conds, gen, ReasonProbeFailed, err)
 	}
 
 	if c.connMgr != nil {
 		c.connMgr.Set(clusterID, restCfg)
 	}
+	// Connected: hold a liveness watch open so a dropped connection is detected
+	// fast (watch close → re-probe), regardless of whether this cluster syncs. Keyed
+	// by the connection-config fingerprint so a credential rotation restarts it.
+	c.ensureSentinel(clusterID, restCfg,
+		engine.ConfigFingerprint(restCfg, engine.ContextProxyURL(c.cfgSource.Get(), contextName)))
 
-	now := time.Now().UTC()
 	working.Server = server
 	working.Principal = principal
 	working.LastConnectedAt = &now
+	appendAttempt(working, now, true, ReasonConnected, "")
 	SetCondition(conds, ClusterCondition{
 		Type:               ClusterConditionConnected,
 		Status:             ConditionTrue,
@@ -426,7 +501,9 @@ func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Objec
 
 	phase, msg := c.check(ctx, restCfg)
 	SetCondition(conds, healthCondition(phase, msg, gen))
-	return healthProbeInterval
+	// Connected — a nil error makes beehive reset any accumulated backoff; the
+	// steady cadence is the periodic health poll.
+	return healthProbeInterval, nil
 }
 
 // observeKubeconfig writes the live kubeconfig observation for obj's context into
@@ -461,9 +538,13 @@ func (c *ClusterCoreController) observeKubeconfig(obj *beehive.Object[ClusterSpe
 	return false
 }
 
-// observeConnectFailure records a failed connect attempt on the working
-// conditions and returns the doubling-backoff requeue via the beehive harness.
-func (c *ClusterCoreController) observeConnectFailure(conds *[]ClusterCondition, gen int64, reason string, err error) time.Duration {
+// observeConnectFailure records the failed-connect conditions and returns err so
+// the caller surfaces it from Reconcile. A returned error is how beehive applies
+// its exponential backoff (base 1s, ×2, capped by WithMaxRetryInterval) and resets
+// it on the next success — the idiomatic controller way to say "couldn't converge
+// this pass; retry with backoff." Out-of-band reprobes bypass beehive's worker, so
+// their errors don't disturb the scheduled cadence.
+func (c *ClusterCoreController) observeConnectFailure(conds *[]ClusterCondition, gen int64, reason string, err error) error {
 	SetCondition(conds, ClusterCondition{
 		Type: ClusterConditionConnected, Status: ConditionFalse,
 		Reason: reason, Message: err.Error(), ObservedGeneration: gen,
@@ -472,7 +553,7 @@ func (c *ClusterCoreController) observeConnectFailure(conds *[]ClusterCondition,
 		Type: ClusterConditionHealthy, Status: ConditionUnknown,
 		Reason: ReasonNoConnection, ObservedGeneration: gen,
 	})
-	return connectionInitialBackoff
+	return err
 }
 
 // ensureClusterCache creates the ClusterCache child for one physical identity

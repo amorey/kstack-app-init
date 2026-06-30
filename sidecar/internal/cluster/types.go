@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"time"
 
@@ -399,8 +400,24 @@ type ClusterStatus struct {
 	Server          ClusterServer       `json:"server"`
 	Principal       ClusterPrincipal    `json:"principal"`
 	LastConnectedAt *time.Time          `json:"lastConnectedAt,omitempty"`
+	// ConnectionAttempts is a bounded, chronological history of recent probe
+	// outcomes (oldest first), for the UI's attempt log. The last entry's At is
+	// the last attempt time (success or failure); LastConnectedAt is the last
+	// successful one.
+	ConnectionAttempts []ClusterConnectionAttempt `json:"connectionAttempts,omitempty"`
 	// Conditions holds the controller-written conditions (Connected, Healthy).
 	Conditions []ClusterCondition `json:"conditions"`
+}
+
+// ClusterConnectionAttempt is one recorded probe outcome in the bounded history
+// on ClusterStatus.ConnectionAttempts. OK marks a successful connect; Reason is
+// the machine code (Connected / ProbeFailed / ResolveFailed) and Message the
+// underlying error (truncated), empty on success.
+type ClusterConnectionAttempt struct {
+	At      time.Time `json:"at"`
+	OK      bool      `json:"ok"`
+	Reason  string    `json:"reason"`
+	Message string    `json:"message"`
 }
 
 // --- ClusterCache kind types ---
@@ -467,6 +484,11 @@ type Cluster struct {
 	Status      ClusterStatus
 	Caches      []ClusterCache
 	ActiveCache *ClusterCache
+	// NextAttemptAt is the scheduled time of the cluster's next reconcile (for a
+	// disconnected cluster, its next backoff retry), derived read-side from
+	// beehive's queue — not persisted in Status. Nil when nothing is scheduled.
+	// Out-of-band triggers (poke / manual retry) may attempt sooner.
+	NextAttemptAt *time.Time
 }
 
 // --- Cache statistics types (for the ClusterCache GraphQL resolver) ---
@@ -523,6 +545,7 @@ func ClusterStatusEqual(a, b ClusterStatus) bool {
 		ptrEqual(a.Server.Version, b.Server.Version) &&
 		ptrEqual(a.Principal.Username, b.Principal.Username) &&
 		timePtrEqual(a.LastConnectedAt, b.LastConnectedAt) &&
+		slices.Equal(a.ConnectionAttempts, b.ConnectionAttempts) &&
 		ConditionsEqual(a.Conditions, b.Conditions)
 }
 

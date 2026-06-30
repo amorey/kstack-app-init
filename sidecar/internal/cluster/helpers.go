@@ -36,10 +36,10 @@ const (
 	// API-server connection: an idle HTTP/2 connection is pinged after the read-idle
 	// timeout, and dropped if no pong arrives within the ping timeout. client-go
 	// enables the check by default but at 30s/15s — so a broken watch stream can
-	// linger ~45s before the engine even notices. Tightening to 10s/5s cuts
-	// worst-case connection-loss detection to ~15s, which is what lets the engine's
-	// watch-break → connection re-probe hook (the cache controller's reprober) fire
-	// promptly instead of waiting on the health-poll cadence.
+	// linger ~45s before anything notices. Tightening to 10s/5s cuts worst-case
+	// connection-loss detection to ~15s, which is what lets the connection
+	// controller's liveness sentinel see its watch close (→ re-probe) promptly
+	// instead of waiting on the health-poll cadence.
 	http2ReadIdleTimeoutSeconds = 10
 	http2PingTimeoutSeconds     = 5
 )
