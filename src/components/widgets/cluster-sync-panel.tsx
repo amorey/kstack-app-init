@@ -105,8 +105,9 @@ const TONE: Record<Tone, { severity: number; dot: string; text: string }> = {
 const COLUMN_COUNT = 6;
 
 // The leading status-circle column is sized to its dot; shared so the header,
-// each row, and the detail row's placeholder stay aligned.
-const STATUS_CELL_CLASS = 'w-0 pr-0';
+// each row, and the detail row's placeholder stay aligned. Must be a non-zero
+// width so table-fixed doesn't collapse the column to 0px.
+const STATUS_CELL_CLASS = 'w-5 pr-0';
 
 // Combine the connection and sync tones into the single overall tone. Exported
 // for unit testing.
@@ -349,7 +350,7 @@ function ConnectionDetail({
           {/* The timestamp/reason/duration columns size to their content (shown
               in full, never truncated); the message column takes the remaining
               space and wraps. Subgrid keeps a row's cells aligned to those tracks. */}
-          <ul className="grid max-h-40 grid-cols-[auto_auto_auto_1fr] divide-y overflow-y-auto rounded-md border text-xs">
+          <ul className="grid max-h-40 grid-cols-[auto_auto_auto_1fr] divide-y overflow-x-auto overflow-y-auto rounded-md border text-xs">
             {/* Each run starts at a distinct instant, so firstAt is a stable key. */}
             {detail.attempts.map((a) => {
               const firstMs = parseTimeOrNull(a.firstAt);
@@ -457,7 +458,7 @@ function ClusterRow({
             className={`mt-1 block size-2.5 shrink-0 rounded-full ${TONE[overall.tone].dot}`}
           />
         </TableCell>
-        <TableCell className="font-medium align-top">{name}</TableCell>
+        <TableCell className="max-w-0 truncate font-medium align-top">{name}</TableCell>
         <TableCell className="align-top">
           <button
             type="button"
@@ -606,17 +607,17 @@ export function ClusterSyncPanel() {
           <p className="px-4 py-6 text-sm text-muted-foreground">No clusters yet.</p>
         ) : (
           <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
-            <Table>
+            <Table className="table-fixed">
               <TableHeader>
                 <TableRow>
                   <TableHead className={STATUS_CELL_CLASS}>
                     <span className="sr-only">Status</span>
                   </TableHead>
                   <TableHead>Cluster</TableHead>
-                  <TableHead>Connection</TableHead>
-                  <TableHead>Sync status</TableHead>
-                  <TableHead>Cache</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
+                  <TableHead className="w-28">Connection</TableHead>
+                  <TableHead className="w-32">Sync status</TableHead>
+                  <TableHead className="w-20">Cache</TableHead>
+                  <TableHead className="w-36 text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               {groups.map((g) => (
