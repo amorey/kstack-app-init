@@ -380,15 +380,14 @@ describe('ClusterSyncPanel', () => {
     // The Disconnected label is an interactive trigger (only the error state is).
     await user.click(await screen.findByRole('button', { name: /disconnected/i }));
 
-    // The popover surfaces the probe error, the connection timestamps, the
-    // countdown to the next scheduled retry, and the recent-attempt log.
-    expect(await screen.findByText(/connection refused/i)).toBeInTheDocument();
-    expect(screen.getByText(/last connected/i)).toBeInTheDocument();
-    expect(screen.getByText(/next attempt/i)).toBeInTheDocument();
-    // The attempt history lists each recorded outcome (including an older one
-    // whose message differs from the current condition message).
+    // The popover surfaces the connection timestamps, the countdown to the next
+    // scheduled retry, and the recent-attempt log (which carries the probe errors).
+    expect(await screen.findByText(/uptime/i)).toBeInTheDocument();
+    expect(screen.getByText(/next check/i)).toBeInTheDocument();
+    // The attempt history lists each recorded outcome with its own probe message.
     expect(screen.getByText(/recent attempts/i)).toBeInTheDocument();
     expect(screen.getByText(/i\/o timeout/i)).toBeInTheDocument();
+    expect(screen.getByText(/tls handshake timeout/i)).toBeInTheDocument();
 
     // Retry fires clusterConnectionRetry.
     await user.click(screen.getByRole('button', { name: /retry/i }));
@@ -398,13 +397,18 @@ describe('ClusterSyncPanel', () => {
     );
   });
 
-  it('does not make the connection label interactive when the cluster is reachable', async () => {
-    await openWith([
+  it('expands connection diagnostics for a reachable cluster with the neutral (non-failed) header', async () => {
+    const user = await openWith([
       { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, connected: 'True' },
     ]);
     await screen.findByRole('rowgroup', { name: /active/i });
-    // "Active" is plain text, not a popover trigger.
-    expect(screen.queryByRole('button', { name: /^active$/i })).not.toBeInTheDocument();
+    // The connection label is a disclosure toggle in every state, including Active.
+    await user.click(screen.getByRole('button', { name: /^active$/i }));
+    // A healthy cluster gets the neutral "Connection" panel — not "Connection
+    // failed" — but the Retry action is still available in every state.
+    expect(await screen.findByText(/^connection$/i, { selector: 'p' })).toBeInTheDocument();
+    expect(screen.queryByText(/connection failed/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
   });
 
   it('omits a row group that has no members', async () => {

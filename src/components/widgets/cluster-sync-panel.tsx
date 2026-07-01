@@ -193,22 +193,21 @@ function parseTimeOrNull(iso: string | null | undefined): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
-// Diagnostics behind a Disconnected cluster: the probe error and the relevant
-// timestamps. `message` is the live `Connected` condition's message (the
-// underlying error); `lostAt` is when it last flipped to disconnected;
-// `lastConnectedAt` is the last *successful* connect (null = never reached).
+// Diagnostics behind a cluster's connection: whether it's currently up and
+// since when, when the next re-probe is due, and the recent-attempt history.
+// `stateSinceMs` is the `Connected` condition's last transition — how long it's
+// held its current up/down state. (Per-attempt error messages live in the
+// recent-attempts list, so there's no separate message field here.)
 function connectionDetail(c: Cluster): {
-  message: string;
-  lostAtMs: number | null;
-  lastConnectedAtMs: number | null;
+  connected: boolean;
+  stateSinceMs: number | null;
   nextAttemptAtMs: number | null;
   attempts: Cluster['connectionAttempts'];
 } {
   const cond = findCondition(c.status.conditions, 'Connected');
   return {
-    message: cond?.message ?? '',
-    lostAtMs: parseTimeOrNull(cond?.lastTransitionTime),
-    lastConnectedAtMs: parseTimeOrNull(c.status.lastConnectedAt),
+    connected: cond?.status === 'True',
+    stateSinceMs: parseTimeOrNull(cond?.lastTransitionTime),
     nextAttemptAtMs: parseTimeOrNull(c.nextAttemptAt),
     attempts: c.connectionAttempts,
   };
@@ -229,6 +228,28 @@ const relativeFormatter: Formatter = (_value, _unit, _suffix, epochMs) => {
   if (diff < HOUR_MS) return `${Math.floor(diff / MINUTE_MS)}m ago`;
   return `${Math.floor(diff / HOUR_MS)}h ago`;
 };
+
+// A coarse, slow-ticking elapsed counter ("<1m" / "5m" / "3h") — largest unit,
+// minute-grained. Used for how long the connection has held its current state
+// (up or down), so it doesn't tick by the second alongside the "Next check"
+// countdown (two fast counters running opposite directions read as noise).
+const elapsedCoarseFormatter: Formatter = (_value, _unit, _suffix, epochMs) => {
+  const diff = Math.max(0, Date.now() - epochMs);
+  if (diff < MINUTE_MS) return '<1m';
+  if (diff < HOUR_MS) return `${Math.floor(diff / MINUTE_MS)}m`;
+  return `${Math.floor(diff / HOUR_MS)}h`;
+};
+
+// Human-readable span of an aggregated run, largest unit only ("45s" / "3m" /
+// "2h"). "Once" when the run is a single probe (count === 1) — there's no
+// meaningful window to describe.
+function formatRunDuration(count: number, firstMs: number | null, lastMs: number | null): string {
+  if (count <= 1 || firstMs === null || lastMs === null) return 'Once';
+  const diff = Math.max(0, lastMs - firstMs);
+  if (diff < MINUTE_MS) return `${Math.floor(diff / SECOND_MS)}s`;
+  if (diff < HOUR_MS) return `${Math.floor(diff / MINUTE_MS)}m`;
+  return `${Math.floor(diff / HOUR_MS)}h`;
+}
 
 // The mirror image, counting *down* to a future time — "in 1m 30s", "in 14s" —
 // for the next scheduled retry. Shows minutes *and* seconds so it visibly ticks
@@ -270,13 +291,23 @@ function DetailRow({
   );
 }
 
-// The expanded connection diagnostics for a Disconnected cluster: the probe
-// error, how long it's been down, when it last connected, and a Retry-now action
-// (force an immediate reconnect, resetting backoff). Rendered inline in an
-// expandable row rather than a floating popover: the panel lives inside the modal
-// Sheet (a base-ui Dialog), which inerts everything outside its own subtree — so
-// a body-portaled popover would be unclickable.
-function ConnectionDetail({ cluster, onRetry }: { cluster: Cluster; onRetry: () => void }) {
+// The expanded connection diagnostics, available in every connection state: the
+// probe message, the connection timestamps, and the recent-attempt history. When
+// the connection is down (`connFailed`) it also titles itself "Connection failed"
+// and offers a Retry-now action (force an immediate reconnect, resetting backoff);
+// otherwise it stays a neutral read-only view. Rendered inline in an expandable
+// row rather than a floating popover: the panel lives inside the modal Sheet (a
+// base-ui Dialog), which inerts everything outside its own subtree — so a
+// body-portaled popover would be unclickable.
+function ConnectionDetail({
+  cluster,
+  connFailed,
+  onRetry,
+}: {
+  cluster: Cluster;
+  connFailed: boolean;
+  onRetry: () => void;
+}) {
   const detail = connectionDetail(cluster);
   // The re-probe runs out-of-band: the mutation resolves the instant it's
   // *scheduled*, and the actual outcome arrives later via clustersWatch (a
@@ -292,59 +323,67 @@ function ConnectionDetail({ cluster, onRetry }: { cluster: Cluster; onRetry: () 
 
   return (
     <div className="space-y-2 rounded-md border bg-muted/30 p-3">
-      <p className="text-sm font-medium">Connection failed</p>
-      {detail.message ? (
-        <p className="break-words font-mono text-xs leading-snug text-muted-foreground">{detail.message}</p>
-      ) : null}
+      <p className="text-sm font-medium">{connFailed ? 'Connection failed' : 'Connection'}</p>
       <dl className="space-y-0.5 text-xs text-muted-foreground">
-        <DetailRow label="Last connected" ms={detail.lastConnectedAtMs} fallback="never" />
-        <DetailRow label="Lost connection" ms={detail.lostAtMs} />
-        <DetailRow label="Next attempt" ms={detail.nextAttemptAtMs} formatter={countdownFormatter} />
+        {/* How long the connection has been up (coarse, so it doesn't tick by
+            the second against the "Next check" countdown) — "0m" while it's
+            down — then the countdown to the scheduled re-probe. */}
+        <DetailRow
+          label="Uptime"
+          ms={detail.connected ? detail.stateSinceMs : null}
+          fallback="0m"
+          formatter={elapsedCoarseFormatter}
+        />
+        {/* Keep a fallback so the row never unmounts while a probe is in flight
+            (nextAttemptAt momentarily null) — otherwise the line vanishes and
+            the panel reflows, which reads as a flicker. */}
+        <DetailRow label="Next check" ms={detail.nextAttemptAtMs} fallback="now" formatter={countdownFormatter} />
       </dl>
       {detail.attempts.length > 0 ? (
         <div className="space-y-1">
           <p className="text-xs font-medium text-muted-foreground">Recent attempts</p>
           {/* Backend already returns newest-run-first, and each entry is an
               aggregated run of consecutive same-outcome probes (×count over its
-              [firstAt, lastAt] window). Scrolls so a long history doesn't blow
-              out the panel. */}
-          {/* Subgrid so the timestamp/reason columns size to their widest row and
-              every message starts at the same x. */}
-          <ul className="grid max-h-40 grid-cols-[auto_auto_1fr] divide-y overflow-y-auto rounded-md border text-xs">
+              [firstAt, lastAt] window). Scrolls vertically so a long history
+              doesn't blow out the panel. */}
+          {/* The timestamp/reason/duration columns size to their content (shown
+              in full, never truncated); the message column takes the remaining
+              space and wraps. Subgrid keeps a row's cells aligned to those tracks. */}
+          <ul className="grid max-h-40 grid-cols-[auto_auto_auto_1fr] divide-y overflow-y-auto rounded-md border text-xs">
             {/* Each run starts at a distinct instant, so firstAt is a stable key. */}
             {detail.attempts.map((a) => {
               const firstMs = parseTimeOrNull(a.firstAt);
               const lastMs = parseTimeOrNull(a.lastAt);
               return (
-                <li key={a.firstAt} className="col-span-3 grid grid-cols-subgrid items-baseline gap-x-2 px-2 py-1">
-                  {/* Live end time (last probe of the run); for an aggregated run
-                      (count > 1) also show when the run started, with the full
-                      [firstAt, lastAt] window on hover. */}
+                <li key={a.firstAt} className="col-span-4 grid grid-cols-subgrid items-baseline gap-x-2 px-2 py-1">
+                  {/* {T2} — the run's end time. The start is implied
+                      (T1 = T2 − Duration); the full [firstAt, lastAt] window is
+                      on hover. */}
                   <span
-                    className="font-mono text-muted-foreground tabular-nums"
+                    className="whitespace-nowrap font-mono text-muted-foreground tabular-nums"
                     title={a.count > 1 ? `${a.firstAt} – ${a.lastAt}` : a.lastAt}
                   >
-                    {lastMs !== null ? <RelativeTime ms={lastMs} /> : a.lastAt}
-                    {a.count > 1 && firstMs !== null ? (
-                      <span className="text-muted-foreground/70">
-                        {' · since '}
-                        <RelativeTime ms={firstMs} />
-                      </span>
-                    ) : null}
+                    {a.lastAt}
                   </span>
-                  <span className={a.ok ? TONE.ok.text : TONE.error.text}>
-                    {a.ok ? 'connected' : a.reason}
-                    {a.count > 1 ? ` ×${a.count}` : ''}
+                  {/* {Reason} ×{Count} — a successful run has no reason code, so
+                      mirror the failure reasons ("ProbeFailed") with "Success". */}
+                  <span className={`whitespace-nowrap ${a.ok ? TONE.ok.text : TONE.error.text}`}>
+                    {`${a.ok ? 'Success' : a.reason} ×${a.count}`}
                   </span>
-                  <span className="truncate text-muted-foreground" title={a.message}>
-                    {a.message}
+                  {/* {Duration} — "Once" for a single probe, else the run's span. */}
+                  <span className="whitespace-nowrap font-mono text-muted-foreground tabular-nums">
+                    {`(${formatRunDuration(a.count, firstMs, lastMs)})`}
                   </span>
+                  {/* {Message} — fills the remaining space and wraps so it's shown
+                      in full rather than truncated. */}
+                  <span className="break-words text-muted-foreground">{a.message}</span>
                 </li>
               );
             })}
           </ul>
         </div>
       ) : null}
+      {/* Force an immediate re-probe (reset backoff) — available in any state. */}
       <Button
         type="button"
         variant="outline"
@@ -394,8 +433,9 @@ function ClusterRow({
   const status = statusOf(cluster, group);
   const overall = overallStatus(connection, status);
   const orphaned = group === 'orphaned';
-  // Only a Disconnected cluster has diagnostics worth expanding; its label
-  // becomes a disclosure toggle for an inline detail row.
+  // The connection label is a disclosure toggle in every state — expanding it
+  // shows the diagnostics and the recent-attempt history (failed or not). The
+  // detail panel adapts its header/actions to whether the connection is down.
   const connFailed = connection.tone === 'error';
   const [showDetail, setShowDetail] = useState(false);
   const pending = isPending(cluster);
@@ -419,20 +459,16 @@ function ClusterRow({
         </TableCell>
         <TableCell className="font-medium align-top">{name}</TableCell>
         <TableCell className="align-top">
-          {connFailed ? (
-            <button
-              type="button"
-              aria-expanded={showDetail}
-              onClick={() => setShowDetail((v) => !v)}
-              data-tone={connection.tone}
-              className={`${TONE[connection.tone].text} inline-flex cursor-pointer items-center gap-1 rounded-sm underline decoration-dotted underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring`}
-            >
-              {connection.label}
-              <ChevronDown className={`size-3 transition-transform ${showDetail ? 'rotate-180' : ''}`} aria-hidden />
-            </button>
-          ) : (
-            <ToneText tone={connection.tone}>{connection.label}</ToneText>
-          )}
+          <button
+            type="button"
+            aria-expanded={showDetail}
+            onClick={() => setShowDetail((v) => !v)}
+            data-tone={connection.tone}
+            className={`${TONE[connection.tone].text} inline-flex cursor-pointer items-center gap-1 rounded-sm underline decoration-dotted underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring`}
+          >
+            {connection.label}
+            <ChevronDown className={`size-3 transition-transform ${showDetail ? 'rotate-180' : ''}`} aria-hidden />
+          </button>
         </TableCell>
         <TableCell>
           <ToneText tone={status.tone}>{status.label}</ToneText>
@@ -498,11 +534,11 @@ function ClusterRow({
           </div>
         </TableCell>
       </TableRow>
-      {connFailed && showDetail ? (
+      {showDetail ? (
         <TableRow className="hover:bg-transparent">
           <TableCell className={STATUS_CELL_CLASS} />
           <TableCell colSpan={COLUMN_COUNT - 1} className="pt-0">
-            <ConnectionDetail cluster={cluster} onRetry={onRetry} />
+            <ConnectionDetail cluster={cluster} connFailed={connFailed} onRetry={onRetry} />
           </TableCell>
         </TableRow>
       ) : null}
