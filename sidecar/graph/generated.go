@@ -64,6 +64,7 @@ type ComplexityRoot struct {
 	Cluster struct {
 		ActiveCache         func(childComplexity int) int
 		Caches              func(childComplexity int) int
+		ConnectionAttempts  func(childComplexity int) int
 		CreatedAt           func(childComplexity int) int
 		DeletionRequestedAt func(childComplexity int) int
 		Generation          func(childComplexity int) int
@@ -102,7 +103,9 @@ type ComplexityRoot struct {
 	}
 
 	ClusterConnectionAttempt struct {
-		At      func(childComplexity int) int
+		Count   func(childComplexity int) int
+		FirstAt func(childComplexity int) int
+		LastAt  func(childComplexity int) int
 		Message func(childComplexity int) int
 		OK      func(childComplexity int) int
 		Reason  func(childComplexity int) int
@@ -141,12 +144,11 @@ type ComplexityRoot struct {
 	}
 
 	ClusterStatus struct {
-		Conditions         func(childComplexity int) int
-		ConnectionAttempts func(childComplexity int) int
-		LastConnectedAt    func(childComplexity int) int
-		Principal          func(childComplexity int) int
-		Server             func(childComplexity int) int
-		Source             func(childComplexity int) int
+		Conditions      func(childComplexity int) int
+		LastConnectedAt func(childComplexity int) int
+		Principal       func(childComplexity int) int
+		Server          func(childComplexity int) int
+		Source          func(childComplexity int) int
 	}
 
 	ClusterStatusSource struct {
@@ -298,6 +300,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Cluster.Caches(childComplexity), true
+	case "Cluster.connectionAttempts":
+		if e.ComplexityRoot.Cluster.ConnectionAttempts == nil {
+			break
+		}
+
+		return e.ComplexityRoot.Cluster.ConnectionAttempts(childComplexity), true
 	case "Cluster.createdAt":
 		if e.ComplexityRoot.Cluster.CreatedAt == nil {
 			break
@@ -441,12 +449,24 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.ClusterCondition.Type(childComplexity), true
 
-	case "ClusterConnectionAttempt.at":
-		if e.ComplexityRoot.ClusterConnectionAttempt.At == nil {
+	case "ClusterConnectionAttempt.count":
+		if e.ComplexityRoot.ClusterConnectionAttempt.Count == nil {
 			break
 		}
 
-		return e.ComplexityRoot.ClusterConnectionAttempt.At(childComplexity), true
+		return e.ComplexityRoot.ClusterConnectionAttempt.Count(childComplexity), true
+	case "ClusterConnectionAttempt.firstAt":
+		if e.ComplexityRoot.ClusterConnectionAttempt.FirstAt == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterConnectionAttempt.FirstAt(childComplexity), true
+	case "ClusterConnectionAttempt.lastAt":
+		if e.ComplexityRoot.ClusterConnectionAttempt.LastAt == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterConnectionAttempt.LastAt(childComplexity), true
 	case "ClusterConnectionAttempt.message":
 		if e.ComplexityRoot.ClusterConnectionAttempt.Message == nil {
 			break
@@ -567,12 +587,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterStatus.Conditions(childComplexity), true
-	case "ClusterStatus.connectionAttempts":
-		if e.ComplexityRoot.ClusterStatus.ConnectionAttempts == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterStatus.ConnectionAttempts(childComplexity), true
 	case "ClusterStatus.lastConnectedAt":
 		if e.ComplexityRoot.ClusterStatus.LastConnectedAt == nil {
 			break
@@ -976,6 +990,8 @@ func (ec *executionContext) childFields_Cluster(ctx context.Context, field graph
 		return ec.fieldContext_Cluster_activeCache(ctx, field)
 	case "nextAttemptAt":
 		return ec.fieldContext_Cluster_nextAttemptAt(ctx, field)
+	case "connectionAttempts":
+		return ec.fieldContext_Cluster_connectionAttempts(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type Cluster", field.Name)
 }
@@ -1038,14 +1054,18 @@ func (ec *executionContext) childFields_ClusterCondition(ctx context.Context, fi
 
 func (ec *executionContext) childFields_ClusterConnectionAttempt(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 	switch field.Name {
-	case "at":
-		return ec.fieldContext_ClusterConnectionAttempt_at(ctx, field)
 	case "ok":
 		return ec.fieldContext_ClusterConnectionAttempt_ok(ctx, field)
 	case "reason":
 		return ec.fieldContext_ClusterConnectionAttempt_reason(ctx, field)
 	case "message":
 		return ec.fieldContext_ClusterConnectionAttempt_message(ctx, field)
+	case "count":
+		return ec.fieldContext_ClusterConnectionAttempt_count(ctx, field)
+	case "firstAt":
+		return ec.fieldContext_ClusterConnectionAttempt_firstAt(ctx, field)
+	case "lastAt":
+		return ec.fieldContext_ClusterConnectionAttempt_lastAt(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterConnectionAttempt", field.Name)
 }
@@ -1124,8 +1144,6 @@ func (ec *executionContext) childFields_ClusterStatus(ctx context.Context, field
 		return ec.fieldContext_ClusterStatus_principal(ctx, field)
 	case "lastConnectedAt":
 		return ec.fieldContext_ClusterStatus_lastConnectedAt(ctx, field)
-	case "connectionAttempts":
-		return ec.fieldContext_ClusterStatus_connectionAttempts(ctx, field)
 	case "conditions":
 		return ec.fieldContext_ClusterStatus_conditions(ctx, field)
 	}
@@ -1925,6 +1943,38 @@ func (ec *executionContext) fieldContext_Cluster_nextAttemptAt(_ context.Context
 	return graphql.NewScalarFieldContext("Cluster", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
+func (ec *executionContext) _Cluster_connectionAttempts(ctx context.Context, field graphql.CollectedField, obj *cluster.Cluster) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Cluster_connectionAttempts(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.ConnectionAttempts, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v []cluster.ClusterConnectionAttempt) graphql.Marshaler {
+			return ec.marshalNClusterConnectionAttempt2ᚕgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterConnectionAttemptᚄ(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Cluster_connectionAttempts(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Cluster",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterConnectionAttempt(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
 func (ec *executionContext) _ClusterCache_id(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCache) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -2329,29 +2379,6 @@ func (ec *executionContext) fieldContext_ClusterCondition_lastTransitionTime(_ c
 	return graphql.NewScalarFieldContext("ClusterCondition", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
-func (ec *executionContext) _ClusterConnectionAttempt_at(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterConnectionAttempt) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterConnectionAttempt_at(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.At, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v time.Time) graphql.Marshaler {
-			return ec.marshalNTime2timeᚐTime(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterConnectionAttempt_at(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterConnectionAttempt", field, false, false, errors.New("field of type Time does not have child fields"))
-}
-
 func (ec *executionContext) _ClusterConnectionAttempt_ok(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterConnectionAttempt) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -2419,6 +2446,75 @@ func (ec *executionContext) _ClusterConnectionAttempt_message(ctx context.Contex
 }
 func (ec *executionContext) fieldContext_ClusterConnectionAttempt_message(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterConnectionAttempt", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterConnectionAttempt_count(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterConnectionAttempt) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterConnectionAttempt_count(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Count, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterConnectionAttempt_count(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterConnectionAttempt", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterConnectionAttempt_firstAt(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterConnectionAttempt) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterConnectionAttempt_firstAt(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.FirstAt, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v time.Time) graphql.Marshaler {
+			return ec.marshalNTime2timeᚐTime(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterConnectionAttempt_firstAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterConnectionAttempt", field, false, false, errors.New("field of type Time does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterConnectionAttempt_lastAt(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterConnectionAttempt) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterConnectionAttempt_lastAt(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.LastAt, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v time.Time) graphql.Marshaler {
+			return ec.marshalNTime2timeᚐTime(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterConnectionAttempt_lastAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterConnectionAttempt", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterPermissions_namespace(ctx context.Context, field graphql.CollectedField, obj *model.ClusterPermissions) (ret graphql.Marshaler) {
@@ -2917,38 +3013,6 @@ func (ec *executionContext) _ClusterStatus_lastConnectedAt(ctx context.Context, 
 }
 func (ec *executionContext) fieldContext_ClusterStatus_lastConnectedAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterStatus", field, false, false, errors.New("field of type Time does not have child fields"))
-}
-
-func (ec *executionContext) _ClusterStatus_connectionAttempts(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterStatus) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterStatus_connectionAttempts(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.ConnectionAttempts, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v []cluster.ClusterConnectionAttempt) graphql.Marshaler {
-			return ec.marshalNClusterConnectionAttempt2ᚕgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterConnectionAttemptᚄ(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterStatus_connectionAttempts(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	fc = &graphql.FieldContext{
-		Object:     "ClusterStatus",
-		Field:      field,
-		IsMethod:   false,
-		IsResolver: false,
-		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_ClusterConnectionAttempt(ctx, field)
-		},
-	}
-	return fc, nil
 }
 
 func (ec *executionContext) _ClusterStatus_conditions(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterStatus) (ret graphql.Marshaler) {
@@ -5184,6 +5248,11 @@ func (ec *executionContext) _Cluster(ctx context.Context, sel ast.SelectionSet, 
 			out.Values[i] = ec._Cluster_activeCache(ctx, field, obj)
 		case "nextAttemptAt":
 			out.Values[i] = ec._Cluster_nextAttemptAt(ctx, field, obj)
+		case "connectionAttempts":
+			out.Values[i] = ec._Cluster_connectionAttempts(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -5462,11 +5531,6 @@ func (ec *executionContext) _ClusterConnectionAttempt(ctx context.Context, sel a
 		switch field.Name {
 		case "__typename":
 			out.Values[i] = graphql.MarshalString("ClusterConnectionAttempt")
-		case "at":
-			out.Values[i] = ec._ClusterConnectionAttempt_at(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		case "ok":
 			out.Values[i] = ec._ClusterConnectionAttempt_ok(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
@@ -5479,6 +5543,21 @@ func (ec *executionContext) _ClusterConnectionAttempt(ctx context.Context, sel a
 			}
 		case "message":
 			out.Values[i] = ec._ClusterConnectionAttempt_message(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "count":
+			out.Values[i] = ec._ClusterConnectionAttempt_count(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "firstAt":
+			out.Values[i] = ec._ClusterConnectionAttempt_firstAt(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "lastAt":
+			out.Values[i] = ec._ClusterConnectionAttempt_lastAt(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
@@ -5823,11 +5902,6 @@ func (ec *executionContext) _ClusterStatus(ctx context.Context, sel ast.Selectio
 			}
 		case "lastConnectedAt":
 			out.Values[i] = ec._ClusterStatus_lastConnectedAt(ctx, field, obj)
-		case "connectionAttempts":
-			out.Values[i] = ec._ClusterStatus_connectionAttempts(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		case "conditions":
 			out.Values[i] = ec._ClusterStatus_conditions(ctx, field, obj)
 			if out.Values[i] == graphql.Null {

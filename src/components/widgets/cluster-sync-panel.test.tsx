@@ -53,7 +53,8 @@ type Row = {
   disconnectedSince?: string; // Connected condition's `lastTransitionTime` (ISO)
   lastConnectedAt?: string; // status.lastConnectedAt (ISO; null = never)
   nextAttemptAt?: string; // status.nextAttemptAt (ISO; null = no retry scheduled)
-  attempts?: { at: string; ok: boolean; reason: string; message: string }[]; // status.connectionAttempts
+  // connectionAttempts (aggregated runs, newest first)
+  attempts?: { ok: boolean; reason: string; message: string; count: number; firstAt: string; lastAt: string }[];
 };
 
 function pushClusters(rows: Row[]) {
@@ -81,7 +82,6 @@ function pushClusters(rows: Row[]) {
               },
               server: { uid: r.uuid || null },
               lastConnectedAt: r.lastConnectedAt ?? null,
-              connectionAttempts: r.attempts ?? [],
               conditions: [
                 {
                   type: 'Connected',
@@ -109,6 +109,7 @@ function pushClusters(rows: Row[]) {
                 }
               : null,
             nextAttemptAt: r.nextAttemptAt ?? null,
+            connectionAttempts: r.attempts ?? [],
           })),
         },
       },
@@ -356,12 +357,21 @@ describe('ClusterSyncPanel', () => {
         lastConnectedAt: new Date(Date.now() - 12 * 60_000).toISOString(),
         nextAttemptAt: new Date(Date.now() + 15_000).toISOString(),
         attempts: [
-          { at: new Date(Date.now() - 90_000).toISOString(), ok: false, reason: 'ProbeFailed', message: 'i/o timeout' },
           {
-            at: new Date(Date.now() - 30_000).toISOString(),
             ok: false,
             reason: 'ProbeFailed',
             message: 'TLS handshake timeout',
+            count: 2,
+            firstAt: new Date(Date.now() - 30_000).toISOString(),
+            lastAt: new Date(Date.now() - 20_000).toISOString(),
+          },
+          {
+            ok: false,
+            reason: 'ProbeFailed',
+            message: 'i/o timeout',
+            count: 5,
+            firstAt: new Date(Date.now() - 90_000).toISOString(),
+            lastAt: new Date(Date.now() - 40_000).toISOString(),
           },
         ],
       },

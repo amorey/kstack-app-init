@@ -43,7 +43,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"strconv"
 	"time"
 
@@ -400,24 +399,39 @@ type ClusterStatus struct {
 	Server          ClusterServer       `json:"server"`
 	Principal       ClusterPrincipal    `json:"principal"`
 	LastConnectedAt *time.Time          `json:"lastConnectedAt,omitempty"`
-	// ConnectionAttempts is a bounded, chronological history of recent probe
-	// outcomes (oldest first), for the UI's attempt log. The last entry's At is
-	// the last attempt time (success or failure); LastConnectedAt is the last
-	// successful one.
-	ConnectionAttempts []ClusterConnectionAttempt `json:"connectionAttempts,omitempty"`
 	// Conditions holds the controller-written conditions (Connected, Healthy).
 	Conditions []ClusterCondition `json:"conditions"`
 }
 
-// ClusterConnectionAttempt is one recorded probe outcome in the bounded history
-// on ClusterStatus.ConnectionAttempts. OK marks a successful connect; Reason is
-// the machine code (Connected / ProbeFailed / ResolveFailed) and Message the
-// underlying error (truncated), empty on success.
+// Connection-probe outcomes are no longer stored on ClusterStatus: the
+// ClusterCoreController records them into beehive's event log (category
+// ConnectionEventCategory) via RecordEvent, and the service reads them back
+// read-side into Cluster.ConnectionAttempts (see buildCluster). This keeps
+// per-probe chatter off the status watch — a repeated identical failure no
+// longer rewrites status — while beehive aggregates consecutive same-outcome
+// probes into runs and bounds retention (WithEventRetention).
+const (
+	// ConnectionEventCategory is the beehive event category the connection
+	// controller records probe outcomes under (its own object timeline).
+	ConnectionEventCategory = "connection"
+	// maxConnectionAttempts bounds both the retention ring (per cluster) and the
+	// read-side list limit for the connection event timeline.
+	maxConnectionAttempts = 20
+)
+
+// ClusterConnectionAttempt is one aggregated run of consecutive connection
+// probes that shared an outcome (Reason), read from beehive's event log. OK
+// marks a successful run (event type Normal); Reason is the machine code
+// (Connected / ProbeFailed / ResolveFailed) and Message the latest occurrence's
+// underlying error (truncated), empty on success. Count is the number of probes
+// coalesced into the run; [FirstAt, LastAt] is the run's window.
 type ClusterConnectionAttempt struct {
-	At      time.Time `json:"at"`
 	OK      bool      `json:"ok"`
 	Reason  string    `json:"reason"`
 	Message string    `json:"message"`
+	Count   int       `json:"count"`
+	FirstAt time.Time `json:"firstAt"`
+	LastAt  time.Time `json:"lastAt"`
 }
 
 // --- ClusterCache kind types ---
@@ -484,6 +498,12 @@ type Cluster struct {
 	Status      ClusterStatus
 	Caches      []ClusterCache
 	ActiveCache *ClusterCache
+	// ConnectionAttempts is the recent connection-probe history (newest run
+	// first), read read-side from beehive's event log rather than stored on
+	// Status — a derived field, like NextAttemptAt. Each element is one
+	// aggregated run of consecutive same-outcome probes. Bounded to the most
+	// recent maxConnectionAttempts runs.
+	ConnectionAttempts []ClusterConnectionAttempt
 	// NextAttemptAt is the scheduled time of the cluster's next reconcile (for a
 	// disconnected cluster, its next backoff retry), derived read-side from
 	// beehive's queue — not persisted in Status. Nil when nothing is scheduled.
@@ -545,7 +565,6 @@ func ClusterStatusEqual(a, b ClusterStatus) bool {
 		ptrEqual(a.Server.Version, b.Server.Version) &&
 		ptrEqual(a.Principal.Username, b.Principal.Username) &&
 		timePtrEqual(a.LastConnectedAt, b.LastConnectedAt) &&
-		slices.Equal(a.ConnectionAttempts, b.ConnectionAttempts) &&
 		ConditionsEqual(a.Conditions, b.Conditions)
 }
 

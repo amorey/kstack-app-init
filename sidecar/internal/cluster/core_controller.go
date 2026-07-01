@@ -180,23 +180,30 @@ func NewClusterCoreController(
 	}
 }
 
-const (
-	// maxConnectionAttempts bounds the per-cluster probe-outcome history kept on
-	// ClusterStatus (it rides the full clustersWatch payload, so keep it small).
-	maxConnectionAttempts = 20
-	// maxAttemptMessageLen caps a recorded error message's length.
-	maxAttemptMessageLen = 200
-)
+// maxAttemptMessageLen caps a recorded event message's length.
+const maxAttemptMessageLen = 200
 
-// appendAttempt records one probe outcome on the working status, keeping the
-// history chronological (oldest first) and bounded to the most recent
-// maxConnectionAttempts.
-func appendAttempt(working *ClusterStatus, at time.Time, ok bool, reason, message string) {
-	working.ConnectionAttempts = append(working.ConnectionAttempts, ClusterConnectionAttempt{
-		At: at, OK: ok, Reason: reason, Message: truncateMessage(message),
+// recordAttempt appends one probe outcome to the cluster's beehive event log
+// (category ConnectionEventCategory). beehive coalesces consecutive outcomes
+// sharing (category, type, reason) into one aggregated run, so a repeated
+// failure bumps the current run's count/window instead of writing status — the
+// per-probe chatter the old status-stored history used to cause. It is
+// best-effort: a write failure is logged and swallowed so it neither fails the
+// reconcile nor disturbs beehive's backoff (the connection outcome is carried
+// separately by the conditions the caller sets).
+func (c *ClusterCoreController) recordAttempt(ctx context.Context, client beehive.ControllerClient[ClusterStatus], id beehive.ObjectID, ok bool, reason, message string) {
+	typ := beehive.EventWarning
+	if ok {
+		typ = beehive.EventNormal
+	}
+	err := client.RecordEvent(ctx, id, beehive.EventSpec{
+		Category: ConnectionEventCategory,
+		Type:     typ,
+		Reason:   reason,
+		Message:  truncateMessage(message),
 	})
-	if n := len(working.ConnectionAttempts); n > maxConnectionAttempts {
-		working.ConnectionAttempts = working.ConnectionAttempts[n-maxConnectionAttempts:]
+	if err != nil && ctx.Err() == nil {
+		slog.Warn("clustercontroller: record connection event", "cluster", id, "reason", reason, "err", err)
 	}
 }
 
@@ -386,18 +393,18 @@ func (c *ClusterCoreController) Reconcile(ctx context.Context, client beehive.Co
 		loaded = *obj.Status
 	}
 	working := ClusterStatus{
-		Source:             loaded.Source,
-		Server:             loaded.Server,
-		Principal:          loaded.Principal,
-		LastConnectedAt:    loaded.LastConnectedAt,
-		ConnectionAttempts: slices.Clone(loaded.ConnectionAttempts),
-		Conditions:         slices.Clone(loaded.Conditions),
+		Source:          loaded.Source,
+		Server:          loaded.Server,
+		Principal:       loaded.Principal,
+		LastConnectedAt: loaded.LastConnectedAt,
+		Conditions:      slices.Clone(loaded.Conditions),
 	}
 
-	requeueAfter, convergeErr := c.converge(ctx, obj, &working)
+	requeueAfter, convergeErr := c.converge(ctx, client, obj, &working)
 
-	// Persist observations (conditions, attempt history, timestamps) before
-	// surfacing any failure — the status write must land even when the probe failed.
+	// Persist observations (conditions, timestamps) before surfacing any failure —
+	// the status write must land even when the probe failed. The probe-outcome
+	// event was already recorded (out-of-band of this status write) by converge.
 	if !ClusterStatusEqual(loaded, working) {
 		if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, working); err != nil {
 			return beehive.Result{}, err
@@ -416,7 +423,7 @@ func (c *ClusterCoreController) Reconcile(ctx context.Context, client beehive.Co
 // failed probe returns a non-nil error so beehive applies exponential backoff; a
 // success returns the steady health-poll interval; an ineligible cluster returns
 // (0, nil) — nothing scheduled.
-func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus], working *ClusterStatus) (time.Duration, error) {
+func (c *ClusterCoreController) converge(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus], working *ClusterStatus) (time.Duration, error) {
 	gen := obj.Generation
 	conds := &working.Conditions
 
@@ -445,23 +452,23 @@ func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Objec
 		return 0, nil
 	}
 
-	// Eligible: we're about to try to connect, so stamp the attempt time now —
-	// the single timestamp every outcome below records (resolve-fail, probe-fail,
-	// or success), so the recorded attempt and the success time agree.
+	// Eligible: we're about to try to connect. now stamps LastConnectedAt on
+	// success; each probe outcome is recorded into the event log separately
+	// (beehive stamps the event's own window).
 	now := time.Now().UTC()
 
 	contextName := obj.Spec.Source.Kubeconfig.Context
 	restCfg, err := ResolveRESTConfig(c.cfgSource.Get(), contextName)
 	if err != nil {
 		c.teardownConnection(clusterID)
-		appendAttempt(working, now, false, ReasonResolveFailed, err.Error())
+		c.recordAttempt(ctx, client, obj.ID, false, ReasonResolveFailed, err.Error())
 		return 0, c.observeConnectFailure(conds, gen, ReasonResolveFailed, err)
 	}
 
 	server, principal, err := c.probe(ctx, restCfg)
 	if err != nil {
 		c.teardownConnection(clusterID)
-		appendAttempt(working, now, false, ReasonProbeFailed, err.Error())
+		c.recordAttempt(ctx, client, obj.ID, false, ReasonProbeFailed, err.Error())
 		return 0, c.observeConnectFailure(conds, gen, ReasonProbeFailed, err)
 	}
 
@@ -477,7 +484,7 @@ func (c *ClusterCoreController) converge(ctx context.Context, obj *beehive.Objec
 	working.Server = server
 	working.Principal = principal
 	working.LastConnectedAt = &now
-	appendAttempt(working, now, true, ReasonConnected, "")
+	c.recordAttempt(ctx, client, obj.ID, true, ReasonConnected, "")
 	SetCondition(conds, ClusterCondition{
 		Type:               ClusterConditionConnected,
 		Status:             ConditionTrue,

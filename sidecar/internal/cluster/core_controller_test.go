@@ -350,12 +350,13 @@ func TestClusterCoreControllerRecordsAttemptOnSuccessfulProbe(t *testing.T) {
 	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
 
-	got := waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
-	require.NotNil(t, got.Status)
-	require.NotEmpty(t, got.Status.ConnectionAttempts, "a successful probe records an attempt")
-	last := got.Status.ConnectionAttempts[len(got.Status.ConnectionAttempts)-1]
-	assert.True(t, last.OK, "a successful probe is recorded as OK")
-	assert.Equal(t, ReasonConnected, last.Reason)
+	waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
+	evs, err := coreClient.ListEvents(ctx, obj.ID, beehive.WithEventCategory(ConnectionEventCategory))
+	require.NoError(t, err)
+	require.NotEmpty(t, evs, "a successful probe records an attempt")
+	latest := evs[0] // ListEvents is newest-run-first
+	assert.Equal(t, beehive.EventNormal, latest.Type, "a successful probe is recorded as Normal")
+	assert.Equal(t, ReasonConnected, latest.Reason)
 }
 
 func TestClusterCoreControllerIneligibleClusterRecordsNoAttempt(t *testing.T) {
@@ -373,9 +374,10 @@ func TestClusterCoreControllerIneligibleClusterRecordsNoAttempt(t *testing.T) {
 	obj, err := coreClient.Create(ctx, spec)
 	require.NoError(t, err)
 
-	got := waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
-	require.NotNil(t, got.Status)
-	assert.Empty(t, got.Status.ConnectionAttempts, "an ineligible cluster makes no attempt, so the history stays empty")
+	waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
+	evs, err := coreClient.ListEvents(ctx, obj.ID, beehive.WithEventCategory(ConnectionEventCategory))
+	require.NoError(t, err)
+	assert.Empty(t, evs, "an ineligible cluster makes no attempt, so the history stays empty")
 }
 
 func TestClusterCoreControllerRecordsConnectionAttempts(t *testing.T) {
@@ -390,17 +392,17 @@ func TestClusterCoreControllerRecordsConnectionAttempts(t *testing.T) {
 	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
 
-	var got *beehive.Object[ClusterSpec, ClusterStatus]
+	var evs []beehive.Event
 	require.Eventually(t, func() bool {
-		got, _ = coreClient.Get(ctx, obj.ID)
-		return got != nil && got.Status != nil && len(got.Status.ConnectionAttempts) >= 1
+		evs, _ = coreClient.ListEvents(ctx, obj.ID, beehive.WithEventCategory(ConnectionEventCategory))
+		return len(evs) >= 1
 	}, 2*time.Second, 10*time.Millisecond, "a failed probe is recorded in the attempt history")
 
-	last := got.Status.ConnectionAttempts[len(got.Status.ConnectionAttempts)-1]
-	assert.False(t, last.OK, "a failed probe is recorded as not-OK")
-	assert.Equal(t, ReasonProbeFailed, last.Reason)
-	assert.Equal(t, "connection refused", last.Message)
-	assert.False(t, last.At.IsZero(), "the attempt carries a timestamp")
+	latest := evs[0] // ListEvents is newest-run-first
+	assert.Equal(t, beehive.EventWarning, latest.Type, "a failed probe is recorded as Warning")
+	assert.Equal(t, ReasonProbeFailed, latest.Reason)
+	assert.Equal(t, "connection refused", latest.Message)
+	assert.False(t, latest.LastAt.IsZero(), "the attempt carries a timestamp")
 }
 
 func TestClusterCoreControllerSuccessfulProbePopulatesConnectionManager(t *testing.T) {
@@ -615,28 +617,9 @@ func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
 	assert.Equal(t, ReasonInactive, connected.Reason)
 }
 
-// The bounded-history append and message-truncation helpers are the heart of the
-// attempt-log feature and are cheapest to pin directly.
-
-func TestAppendAttemptCapsHistory(t *testing.T) {
-	var s ClusterStatus
-	for i := 0; i < maxConnectionAttempts+5; i++ {
-		appendAttempt(&s, time.Now().UTC(), false, ReasonProbeFailed, "boom")
-	}
-	assert.Len(t, s.ConnectionAttempts, maxConnectionAttempts, "history is bounded to the cap")
-}
-
-func TestAppendAttemptKeepsNewest(t *testing.T) {
-	var s ClusterStatus
-	for i := 0; i < maxConnectionAttempts+3; i++ {
-		appendAttempt(&s, time.Now().UTC(), false, ReasonProbeFailed, "msg")
-	}
-	// Oldest are dropped: the records are chronological and the last appended is last.
-	appendAttempt(&s, time.Now().UTC(), true, ReasonConnected, "")
-	last := s.ConnectionAttempts[len(s.ConnectionAttempts)-1]
-	assert.True(t, last.OK)
-	assert.Equal(t, ReasonConnected, last.Reason)
-}
+// Aggregation into runs and per-object retention are now beehive's (RecordEvent +
+// WithEventRetention), covered by its own tests; here we only pin the local
+// message-truncation helper.
 
 func TestTruncateMessage(t *testing.T) {
 	assert.Equal(t, "short", truncateMessage("short"))

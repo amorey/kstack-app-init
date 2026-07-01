@@ -202,7 +202,7 @@ function connectionDetail(c: Cluster): {
   lostAtMs: number | null;
   lastConnectedAtMs: number | null;
   nextAttemptAtMs: number | null;
-  attempts: Cluster['status']['connectionAttempts'];
+  attempts: Cluster['connectionAttempts'];
 } {
   const cond = findCondition(c.status.conditions, 'Connected');
   return {
@@ -210,7 +210,7 @@ function connectionDetail(c: Cluster): {
     lostAtMs: parseTimeOrNull(cond?.lastTransitionTime),
     lastConnectedAtMs: parseTimeOrNull(c.status.lastConnectedAt),
     nextAttemptAtMs: parseTimeOrNull(c.nextAttemptAt),
-    attempts: c.status.connectionAttempts,
+    attempts: c.connectionAttempts,
   };
 }
 
@@ -304,23 +304,44 @@ function ConnectionDetail({ cluster, onRetry }: { cluster: Cluster; onRetry: () 
       {detail.attempts.length > 0 ? (
         <div className="space-y-1">
           <p className="text-xs font-medium text-muted-foreground">Recent attempts</p>
-          {/* Newest first; backend keeps the history oldest-first. Scrolls so a
-              long history doesn't blow out the panel. */}
+          {/* Backend already returns newest-run-first, and each entry is an
+              aggregated run of consecutive same-outcome probes (×count over its
+              [firstAt, lastAt] window). Scrolls so a long history doesn't blow
+              out the panel. */}
           {/* Subgrid so the timestamp/reason columns size to their widest row and
               every message starts at the same x. */}
           <ul className="grid max-h-40 grid-cols-[auto_auto_1fr] divide-y overflow-y-auto rounded-md border text-xs">
-            {detail.attempts
-              .map((a, i) => ({ a, key: `${a.at}-${i}` }))
-              .reverse()
-              .map(({ a, key }) => (
-                <li key={key} className="col-span-3 grid grid-cols-subgrid items-baseline gap-x-2 px-2 py-1">
-                  <span className="font-mono text-muted-foreground">{a.at}</span>
-                  <span className={a.ok ? TONE.ok.text : TONE.error.text}>{a.ok ? 'connected' : a.reason}</span>
+            {/* Each run starts at a distinct instant, so firstAt is a stable key. */}
+            {detail.attempts.map((a) => {
+              const firstMs = parseTimeOrNull(a.firstAt);
+              const lastMs = parseTimeOrNull(a.lastAt);
+              return (
+                <li key={a.firstAt} className="col-span-3 grid grid-cols-subgrid items-baseline gap-x-2 px-2 py-1">
+                  {/* Live end time (last probe of the run); for an aggregated run
+                      (count > 1) also show when the run started, with the full
+                      [firstAt, lastAt] window on hover. */}
+                  <span
+                    className="font-mono text-muted-foreground tabular-nums"
+                    title={a.count > 1 ? `${a.firstAt} – ${a.lastAt}` : a.lastAt}
+                  >
+                    {lastMs !== null ? <RelativeTime ms={lastMs} /> : a.lastAt}
+                    {a.count > 1 && firstMs !== null ? (
+                      <span className="text-muted-foreground/70">
+                        {' · since '}
+                        <RelativeTime ms={firstMs} />
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className={a.ok ? TONE.ok.text : TONE.error.text}>
+                    {a.ok ? 'connected' : a.reason}
+                    {a.count > 1 ? ` ×${a.count}` : ''}
+                  </span>
                   <span className="truncate text-muted-foreground" title={a.message}>
                     {a.message}
                   </span>
                 </li>
-              ))}
+              );
+            })}
           </ul>
         </div>
       ) : null}

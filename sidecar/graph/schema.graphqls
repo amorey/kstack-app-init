@@ -56,6 +56,8 @@ type Cluster {
   activeCache: ClusterCache
   "When the next reconcile (for a disconnected cluster, its next backoff retry) is scheduled, derived live from the control plane's queue; null when nothing is scheduled. Observability, not a guarantee — an out-of-band trigger may reconcile sooner."
   nextAttemptAt: Time
+  "Recent connection-probe history (newest run first), derived live from the control plane's event log. Consecutive same-outcome probes are aggregated into runs; bounded to the most recent runs. Empty until the first probe."
+  connectionAttempts: [ClusterConnectionAttempt!]!
 }
 
 "A cluster record's desired state. Every field is user/API-owned; nothing here is observed."
@@ -102,8 +104,6 @@ type ClusterStatus {
   principal: ClusterPrincipal!
   "When a connection probe last succeeded; null if never."
   lastConnectedAt: Time
-  "Bounded, chronological history (oldest first) of recent connection-probe outcomes."
-  connectionAttempts: [ClusterConnectionAttempt!]!
 
   "The connection controller's conditions (`Connected`, `Healthy`)."
   conditions: [ClusterCondition!]!
@@ -143,16 +143,23 @@ type ClusterCondition {
   lastTransitionTime: Time!
 }
 
-"One recorded connection-probe outcome in `status.connectionAttempts`."
+"""
+One aggregated run of consecutive connection probes that shared an outcome, in
+`connectionAttempts`. A change in outcome (reason) starts a new run.
+"""
 type ClusterConnectionAttempt {
-  "When the probe ran."
-  at: Time!
-  "True on a successful connect, false on a failure."
+  "True on a successful-connect run, false on a failure run."
   ok: Boolean!
   "Machine-readable code: `Connected`, `ProbeFailed`, or `ResolveFailed`."
   reason: String!
-  "The underlying error (truncated); empty on success."
+  "The latest occurrence's underlying error (truncated); empty on success."
   message: String!
+  "Number of probes coalesced into this run (>= 1)."
+  count: Int!
+  "When the run started (first occurrence)."
+  firstAt: Time!
+  "When the run last extended (latest occurrence)."
+  lastAt: Time!
 }
 
 """

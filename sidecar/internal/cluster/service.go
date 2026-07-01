@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"slices"
 
@@ -129,7 +130,10 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 		_ = watcher.Close()
 		return nil, fmt.Errorf("open beehive store: %w", err)
 	}
-	bh, err := beehive.New(bhStore)
+	// WithEventRetention bounds each object's connection event timeline to the
+	// newest maxConnectionAttempts runs (per category), GC-swept — the retention
+	// the old status-stored ConnectionAttempts slice used to enforce by hand.
+	bh, err := beehive.New(bhStore, beehive.WithEventRetention(maxConnectionAttempts, 0))
 	if err != nil {
 		bhStore.Close()
 		_ = watcher.Close()
@@ -408,16 +412,65 @@ func (s *Service) Watch(ctx context.Context) (<-chan []*Cluster, error) {
 	go func() {
 		defer close(out)
 
+		// Per-cluster connection-event watchers. Recording a probe outcome
+		// (RecordEvent) does NOT fire the object WatchList, so without these a
+		// steadily-disconnected cluster — whose status stops changing once it has
+		// settled into a failing run — would never re-emit, freezing both its
+		// connectionAttempts history and its nextAttemptAt countdown in the UI. Each
+		// watcher pokes eventSignal on any recorded run; we reconcile the watcher set
+		// against the live cluster list on every emit (and cancel them all on exit).
+		eventSignal := make(chan struct{}, 1)
+		evWatchers := make(map[ClusterID]context.CancelFunc)
+		defer func() {
+			for _, cancel := range evWatchers {
+				cancel()
+			}
+		}()
+		syncEventWatchers := func(clusters []*Cluster) {
+			seen := make(map[ClusterID]struct{}, len(clusters))
+			for _, c := range clusters {
+				seen[c.ID] = struct{}{}
+				if _, ok := evWatchers[c.ID]; ok {
+					continue
+				}
+				wctx, cancel := context.WithCancel(ctx)
+				ch, err := s.coreClient.WatchEvents(wctx, beehive.ObjectID(c.ID),
+					beehive.WithEventCategory(ConnectionEventCategory))
+				if err != nil {
+					cancel()
+					continue
+				}
+				evWatchers[c.ID] = cancel
+				go func() {
+					for range ch { // one poke per recorded/extended run
+						select {
+						case eventSignal <- struct{}{}:
+						default: // a poke is already pending; coalesce
+						}
+					}
+				}()
+			}
+			for id, cancel := range evWatchers {
+				if _, ok := seen[id]; !ok {
+					cancel()
+					delete(evWatchers, id)
+				}
+			}
+		}
+
 		emit := func() {
 			clusters, err := s.listClusters(ctx)
 			if err != nil {
 				return
 			}
+			syncEventWatchers(clusters)
 			select {
 			case out <- clusters:
 			case <-ctx.Done():
 			}
 		}
+
+		syncEventWatchers(seed)
 
 		for {
 			select {
@@ -432,6 +485,8 @@ func (s *Service) Watch(ctx context.Context) (<-chan []*Cluster, error) {
 				if !ok {
 					return
 				}
+				emit()
+			case <-eventSignal:
 				emit()
 			}
 		}
@@ -473,12 +528,47 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterS
 		c.NextAttemptAt = &at
 	}
 
+	// Join in the recent connection-probe history (newest run first) from beehive's
+	// event log — a derived read-side field like NextAttemptAt, no longer stored on
+	// Status. RecordEvent doesn't fire the object WatchList, so Watch subscribes to
+	// each cluster's event log separately to re-emit on new probes (see Watch); this
+	// per-cluster read is on that refresh path.
+	c.ConnectionAttempts = s.connectionAttempts(ctx, obj.ID)
+
 	// Join in the cluster's owned ClusterCache children (zero or more): each carries
 	// its own sync status, the ids the live-stats resolver needs, and whether it is
 	// the currently-active identity's cache.
 	c.Caches, c.ActiveCache = s.listCaches(ctx, obj)
 
 	return c
+}
+
+// connectionAttempts reads the cluster's connection event timeline (newest run
+// first, bounded to maxConnectionAttempts) and maps beehive Events to the domain
+// ClusterConnectionAttempt runs. A read error yields nil (no history) rather than
+// failing the whole cluster read — a partial view beats none for a status read.
+func (s *Service) connectionAttempts(ctx context.Context, id beehive.ObjectID) []ClusterConnectionAttempt {
+	evs, err := s.coreClient.ListEvents(ctx, id,
+		beehive.WithEventCategory(ConnectionEventCategory),
+		beehive.WithEventLimit(maxConnectionAttempts))
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("clusterservice: list connection events", "cluster", id, "err", err)
+		}
+		return nil
+	}
+	out := make([]ClusterConnectionAttempt, 0, len(evs))
+	for _, e := range evs {
+		out = append(out, ClusterConnectionAttempt{
+			OK:      e.Type == beehive.EventNormal,
+			Reason:  e.Reason,
+			Message: e.Message,
+			Count:   e.Count,
+			FirstAt: e.FirstAt,
+			LastAt:  e.LastAt,
+		})
+	}
+	return out
 }
 
 // listCaches enumerates a cluster's owned ClusterCache children via the beehive

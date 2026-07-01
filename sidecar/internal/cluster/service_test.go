@@ -406,6 +406,43 @@ func TestServiceWatchEmitsSeedThenReemits(t *testing.T) {
 	}
 }
 
+// A recorded connection-probe event must re-emit the watch list even though it
+// writes no status — this is what keeps a steadily-failing cluster's
+// connectionAttempts (and its nextAttemptAt countdown) live in the UI, since
+// RecordEvent does not fire the object WatchList.
+func TestServiceWatchReemitsOnConnectionEvent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	ch, err := s.Watch(ctx)
+	require.NoError(t, err)
+
+	seed := recvList(t, ch)
+	require.Len(t, seed, 1)
+	require.Empty(t, seed[0].ConnectionAttempts, "no probes yet")
+
+	err = coreCC.RecordEvent(ctx, beehive.ObjectID(id), beehive.EventSpec{
+		Category: ConnectionEventCategory,
+		Type:     beehive.EventWarning,
+		Reason:   ReasonProbeFailed,
+		Message:  "boom",
+	})
+	require.NoError(t, err)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		list := recvListBy(t, ch, deadline)
+		require.Len(t, list, 1)
+		if atts := list[0].ConnectionAttempts; len(atts) == 1 && atts[0].Reason == ReasonProbeFailed {
+			assert.False(t, atts[0].OK)
+			assert.Equal(t, 1, atts[0].Count)
+			return
+		}
+	}
+}
+
 func recvList(t *testing.T, ch <-chan []*Cluster) []*Cluster {
 	t.Helper()
 	return recvListBy(t, ch, time.After(2*time.Second))
