@@ -196,6 +196,21 @@ func waitForStatus(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus], 
 	}
 }
 
+// waitForObservedGeneration blocks (event-driven) until the object's Connected
+// condition has been re-stamped by a reconcile that observed at least gen — i.e.
+// the reconcile triggered by the generation-bumping spec edit has written status.
+func waitForObservedGeneration(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus], id beehive.ObjectID, gen int64) *beehive.Object[ClusterSpec, ClusterStatus] {
+	t.Helper()
+	return waitForStatus(t, cl, id, func(s *ClusterStatus) bool {
+		for _, c := range s.Conditions {
+			if c.Type == ClusterConditionConnected && c.ObservedGeneration >= gen {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 // eligibleSpec builds a Cluster spec that passes ConnectionEligible — provided
 // contextName is present in the test watcher's kubeconfig, since the controller
 // now observes presence live from the kubeconfig (it is no longer parked in spec).
@@ -441,16 +456,29 @@ func TestClusterCoreControllerProbeFailureDeletesFromConnectionManager(t *testin
 		connMgr,
 	)
 
-	obj, err := coreClient.Create(context.Background(), eligibleSpec("alpha"))
+	ctx := context.Background()
+	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
-	// Pre-seed a stale entry so we can confirm it gets cleared.
-	connMgr.Set(id, &rest.Config{Host: "https://stale"})
 
+	// Wait for the first reconcile (failed probe) to land its Connected condition.
 	waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
 
-	got := connMgr.Get(id)
-	assert.Nil(t, got, "ConnectionManager must not hold a config after probe failure")
+	// Pre-seed a stale entry, then force a fresh reconcile (a spec edit bumps
+	// generation) so the probe-failure path runs again with the seed in place —
+	// seeding before this second reconcile is what makes the clear observable.
+	connMgr.Set(id, &rest.Config{Host: "https://stale"})
+	renamed := eligibleSpec("alpha")
+	name := "renamed"
+	renamed.Name = &name
+	updated, err := coreClient.Update(ctx, beehive.ObjectID(id), renamed)
+	require.NoError(t, err)
+
+	// teardownConnection (which clears connMgr) runs before the status write in the
+	// same reconcile, so observing the second reconcile's status — its Connected
+	// condition stamped with the new generation — means the clear has landed.
+	waitForObservedGeneration(t, coreClient, obj.ID, updated.Generation)
+	assert.Nil(t, connMgr.Get(id), "ConnectionManager must not hold a config after probe failure")
 }
 
 func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.T) {
@@ -463,17 +491,30 @@ func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.
 		connMgr,
 	)
 
+	ctx := context.Background()
 	spec := eligibleSpec("alpha")
 	spec.Enabled = false
-	obj, err := coreClient.Create(context.Background(), spec)
+	obj, err := coreClient.Create(ctx, spec)
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
-	connMgr.Set(id, &rest.Config{Host: "https://stale"})
 
+	// Wait for the first reconcile (ineligible) to land its Connected condition.
 	waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
 
-	got := connMgr.Get(id)
-	assert.Nil(t, got, "ConnectionManager must not hold a config for an ineligible cluster")
+	// Pre-seed a stale entry, then force a fresh reconcile (a spec edit bumps
+	// generation, staying ineligible) so the teardown path runs with the seed in place.
+	connMgr.Set(id, &rest.Config{Host: "https://stale"})
+	renamed := spec
+	name := "renamed"
+	renamed.Name = &name
+	updated, err := coreClient.Update(ctx, beehive.ObjectID(id), renamed)
+	require.NoError(t, err)
+
+	// teardownConnection (which clears connMgr) runs before the status write in the
+	// same reconcile, so observing the second reconcile's status — its Connected
+	// condition stamped with the new generation — means the clear has landed.
+	waitForObservedGeneration(t, coreClient, obj.ID, updated.Generation)
+	assert.Nil(t, connMgr.Get(id), "ConnectionManager must not hold a config for an ineligible cluster")
 }
 
 func findCondition(t *testing.T, conds []ClusterCondition, typ ClusterConditionType) ClusterCondition {
