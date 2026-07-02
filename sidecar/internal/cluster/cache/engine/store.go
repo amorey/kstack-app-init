@@ -80,8 +80,8 @@ func (s *objectsStore) upsert(u *unstructured.Unstructured) error {
 	return nil
 }
 
-// ApplyEvent applies one watch delta: Added/Modified upsert, Deleted removes.
-func (s *objectsStore) ApplyEvent(t watch.EventType, u *unstructured.Unstructured) error {
+// ApplyChange applies one watch delta: Added/Modified upsert, Deleted removes.
+func (s *objectsStore) ApplyChange(t watch.EventType, u *unstructured.Unstructured) error {
 	switch t {
 	case watch.Added, watch.Modified:
 		return s.upsert(u)
@@ -468,8 +468,8 @@ func (s *eventsStore) delete(u *unstructured.Unstructured) error {
 	return nil
 }
 
-// ApplyEvent applies one watch delta: Added/Modified upsert, Deleted removes.
-func (s *eventsStore) ApplyEvent(t watch.EventType, u *unstructured.Unstructured) error {
+// ApplyChange applies one watch delta: Added/Modified upsert, Deleted removes.
+func (s *eventsStore) ApplyChange(t watch.EventType, u *unstructured.Unstructured) error {
 	switch t {
 	case watch.Added, watch.Modified:
 		return s.upsert(u)

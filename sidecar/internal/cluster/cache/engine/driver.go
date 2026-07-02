@@ -80,7 +80,7 @@ type kubeSource interface {
 // kindStore is the store seam every driver writes through. Both objectsStore and
 // eventsStore satisfy it (see store.go); the driver never touches SQL directly.
 type kindStore interface {
-	ApplyEvent(t watch.EventType, u *unstructured.Unstructured) error
+	ApplyChange(t watch.EventType, u *unstructured.Unstructured) error
 	ReplaceFull(items []*unstructured.Unstructured, rv string) error
 	PersistRV(ctx context.Context, rv string) error
 }
@@ -262,8 +262,8 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 				if !ok {
 					continue
 				}
-				if err := d.store.ApplyEvent(ev.Type, u); err != nil {
-					slog.Warn("clustersync: apply watch event", "gvk", d.gvk.String(), "err", err)
+				if err := d.store.ApplyChange(ev.Type, u); err != nil {
+					slog.Warn("clustersync: apply watch change", "gvk", d.gvk.String(), "err", err)
 					continue
 				}
 				progressed = true
@@ -336,7 +336,7 @@ func (d *kindDriver) fullResync(ctx context.Context) (string, error) {
 			}
 			return "", err
 		}
-		if err := d.store.ApplyEvent(watch.Modified, u); err != nil {
+		if err := d.store.ApplyChange(watch.Modified, u); err != nil {
 			return "", err
 		}
 	}
