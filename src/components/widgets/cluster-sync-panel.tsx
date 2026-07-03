@@ -565,7 +565,7 @@ function SyncDetail({ cacheId }: { cacheId: string }) {
   const events = useSyncEvents(cacheId);
   return (
     <div className="space-y-2 rounded-md border bg-muted/30 p-3">
-      <p className="text-sm font-medium">Sync</p>
+      <p className="text-sm font-medium">Sync status</p>
       {events.length > 0 ? (
         <EventRunList title="Recent sync events" runs={events} labelOf={(e) => e.reason} />
       ) : (
@@ -611,12 +611,16 @@ function ClusterRow({
   // shows the diagnostics and the recent-attempt history (failed or not). The
   // detail panel adapts its header/actions to whether the connection is down.
   const connFailed = connection.tone === 'error';
-  const [showDetail, setShowDetail] = useState(false);
+  // Only one detail row can be open at a time — opening one collapses the other.
+  const [openDetail, setOpenDetail] = useState<'connection' | 'sync' | null>(null);
+  const showDetail = openDetail === 'connection';
+  const setShowDetail = (open: boolean) => setOpenDetail(open ? 'connection' : null);
   // The sync label is a disclosure too — but only when there's an active cache to
   // stream sync events for (a pending/never-cached row has no timeline). Expanding
   // it shows the recent cache-sync event history.
   const cacheId = cluster.activeCache?.id;
-  const [showSyncDetail, setShowSyncDetail] = useState(false);
+  const showSyncDetail = openDetail === 'sync';
+  const setShowSyncDetail = (open: boolean) => setOpenDetail(open ? 'sync' : null);
   const pending = isPending(cluster);
   const { enabled } = cluster.spec;
   // Sync can only start/stop for an enabled, identified cluster still in the
@@ -641,7 +645,7 @@ function ClusterRow({
           <button
             type="button"
             aria-expanded={showDetail}
-            onClick={() => setShowDetail((v) => !v)}
+            onClick={() => setShowDetail(!showDetail)}
             data-tone={connection.tone}
             className={`${TONE[connection.tone].text} inline-flex cursor-pointer items-center gap-1 rounded-sm underline decoration-dotted underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring`}
           >
@@ -657,7 +661,7 @@ function ClusterRow({
             <button
               type="button"
               aria-expanded={showSyncDetail}
-              onClick={() => setShowSyncDetail((v) => !v)}
+              onClick={() => setShowSyncDetail(!showSyncDetail)}
               data-tone={status.tone}
               className={`${TONE[status.tone].text} inline-flex cursor-pointer items-center gap-1 rounded-sm underline decoration-dotted underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring`}
             >
