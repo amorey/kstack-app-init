@@ -375,6 +375,17 @@ func (c *ClusterCoreController) StartBackground() {
 // cancelling any in-flight re-probe) and joins its goroutine. Safe to call when
 // StartBackground was never called.
 func (c *ClusterCoreController) StopBackground() {
+	// Close the sentinel gate before waiting: clear bgCtx under sentinelMu so every
+	// subsequent ensureSentinel skips its sentinelWG.Add (ensureSentinel checks
+	// bgCtx==nil under this same lock). Beehive reconciles still reach converge →
+	// ensureSentinel after this point — beehive isn't drained until bhStop, which runs
+	// after StopBackground in Service.stop — so without the gate a late Add(1) would
+	// race the sentinelWG.Wait below, the WaitGroup misuse the race detector flags.
+	// Doing it under the mutex gives every prior Add a happens-before with Wait.
+	c.sentinelMu.Lock()
+	c.bgCtx = nil
+	c.sentinelMu.Unlock()
+
 	if c.bgCancel != nil {
 		c.bgCancel() // cancels the worker AND every sentinel (derived from bgCtx)
 	}

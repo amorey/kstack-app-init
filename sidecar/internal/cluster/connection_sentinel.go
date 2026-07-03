@@ -49,10 +49,12 @@ func (c *ClusterCoreController) SetSentinelWatcher(f SentinelWatchFunc) {
 // cluster, started with the given connection config. It is a no-op when one is
 // already running on the same config fingerprint; a fingerprint change (credential
 // rotation) restarts it. Called from converge after a successful probe, so the
-// sentinel exists exactly while the cluster is connected. Before StartBackground
-// has supplied the base context there is nowhere to anchor the goroutine's
-// lifetime, so it is skipped — the next reconcile (health poll / poke / kubeconfig
-// change) starts it once the worker is up.
+// sentinel exists exactly while the cluster is connected. A nil bgCtx skips the
+// launch: before StartBackground supplies the base context there is nowhere to
+// anchor the goroutine's lifetime (the next reconcile starts it once the worker is
+// up), and after StopBackground clears bgCtx under sentinelMu it is the shutdown
+// gate — a reconcile racing teardown must not sentinelWG.Add after StopBackground's
+// Wait has begun.
 func (c *ClusterCoreController) ensureSentinel(id ClusterID, cfg *rest.Config, fingerprint string) {
 	c.sentinelMu.Lock()
 	defer c.sentinelMu.Unlock()
