@@ -245,6 +245,33 @@ const (
 	// reasonSyncFailed: the engine hit an engine-level failure (discovery,
 	// cache open) and is retrying with backoff.
 	ReasonSyncFailed = "SyncFailed"
+	// reasonStale: the engine is caught up but a driver's watch stopped proving
+	// itself alive past the threshold — the cache may be behind (a Synced=False
+	// state distinct from SyncFailed, which is a hard engine failure).
+	ReasonStale = "Stale"
+
+	// The following are sync-EVENT reasons (the ClusterCache event log's
+	// transition vocabulary), distinct from the Synced-condition reasons above
+	// (which name the current state). Events are transition-oriented and carry
+	// richer messages; a healthy steady state records no event at all.
+	//
+	// reasonSyncStarted: a cold cache began its first-ever build.
+	ReasonSyncStarted = "SyncStarted"
+	// reasonInitialSyncComplete: a cold build reached the caught-up milestone —
+	// the local copy is now complete.
+	ReasonInitialSyncComplete = "InitialSyncComplete"
+	// reasonResynced: an already-populated cache re-reached the caught-up
+	// milestone after a resume (poke, reconnect, credential restart).
+	ReasonResynced = "Resynced"
+	// reasonSyncDegraded: an engine-level failure; the engine is retrying with
+	// backoff. The event-log parallel of the SyncFailed condition reason.
+	ReasonSyncDegraded = "SyncDegraded"
+	// reasonSyncStopped: the sync engine was torn down because the cluster became
+	// sync-ineligible (sync paused/disabled, or the context departed).
+	ReasonSyncStopped = "SyncStopped"
+	// reasonSyncStale: a caught-up watch stopped delivering updates past the
+	// threshold — the event-log parallel of the Stale condition reason.
+	ReasonSyncStale = "SyncStale"
 )
 
 // ClusterCondition is one Kubernetes-style status condition on a cluster

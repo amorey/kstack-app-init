@@ -92,6 +92,7 @@ const ClusterCachesWatchSubscription = graphql(`
             type
             status
             reason
+            message
           }
           lastSyncedAt
         }

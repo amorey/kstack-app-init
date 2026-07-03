@@ -533,11 +533,16 @@ func upsertClusterMeta(ctx context.Context, ex execer, key, value string) error 
 	return err
 }
 
+// lastListRVSuffix is the cluster_meta key suffix marking a kind's resume
+// cookie. It has a single owner here so lastListRVKey and any LIKE query that
+// detects a resume cookie can't drift apart.
+const lastListRVSuffix = ".last_list_rv"
+
 // lastListRVKey is the cluster_meta key holding a kind's resume cookie — the
 // resourceVersion to seed the next watch from. readLastListRV reads it;
 // persistListRVMeta writes it.
 func lastListRVKey(gvk schema.GroupVersionKind) string {
-	return fmt.Sprintf("%s/%s.last_list_rv", gvk.GroupVersion().String(), gvk.Kind)
+	return fmt.Sprintf("%s/%s%s", gvk.GroupVersion().String(), gvk.Kind, lastListRVSuffix)
 }
 
 // persistListRVMeta writes a kind's resume cookie (last_list_rv + last_list_at).

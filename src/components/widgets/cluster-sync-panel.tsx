@@ -309,6 +309,10 @@ function statusOf(c: Cluster, group: Group): { label: string; tone: Tone } {
   if (connected?.status === 'False') return { label: 'Stalled', tone: 'muted' };
   const synced = findCondition(c.activeCache?.status.conditions ?? [], 'Synced');
   if (synced?.reason === 'SyncFailed') return { label: 'Error', tone: 'error' };
+  // Connected but the watch went quiet past the freshness threshold: the cache
+  // may be behind. Amber (attention) — a real concern, but not the hard error a
+  // SyncFailed is, and the connection axis is fine.
+  if (synced?.reason === 'Stale') return { label: 'Stale', tone: 'attention' };
   return { label: 'Syncing', tone: 'ok' };
 }
 
@@ -561,13 +565,64 @@ function ConnectionDetail({
 // cluster's active cache. Mirrors ConnectionDetail (an inline expandable region,
 // not a popover, for the same modal-Sheet inert reason), keyed by the active
 // cache's id — the sync-event stream lives on the ClusterCache, not the Cluster.
-function SyncDetail({ cacheId }: { cacheId: string }) {
+// Friendly labels for the sync event log's transition vocabulary (the reason
+// codes the cache controller records). Falls back to the raw reason so a
+// server-side reason we don't recognise yet still renders (forward-compatible).
+const SYNC_EVENT_LABELS: Record<string, string> = {
+  SyncStarted: 'Starting sync',
+  Syncing: 'Syncing',
+  InitialSyncComplete: 'Initial sync complete',
+  Resynced: 'Re-synced',
+  SyncDegraded: 'Sync error',
+  SyncStopped: 'Sync stopped',
+  SyncStale: 'Watch stalled',
+};
+
+function syncEventLabel(reason: string): string {
+  return SYNC_EVENT_LABELS[reason] ?? reason;
+}
+
+function SyncDetail({
+  cacheId,
+  lastSyncedAt,
+  syncReason,
+  syncMessage,
+}: {
+  cacheId: string;
+  lastSyncedAt: string | null;
+  syncReason?: string;
+  syncMessage?: string;
+}) {
   const events = useSyncEvents(cacheId);
+  const lastSyncedMs = parseTimeOrNull(lastSyncedAt);
+  // Staleness is engine-derived (the Stale condition reason), never inferred from
+  // lastSyncedAt's age — a quiet-but-healthy cache legitimately has an old
+  // lastSyncedAt, so only the engine's watch-liveness signal can flag it.
+  const stale = syncReason === 'Stale';
   return (
     <div className="space-y-2 rounded-md border bg-muted/30 p-3">
       <p className="text-sm font-medium">Sync status</p>
+      {stale ? (
+        <p className={`text-xs ${TONE.attention.text}`}>
+          Possibly stale — {syncMessage || 'the watch may have stopped delivering updates.'}
+        </p>
+      ) : null}
+      {/* Freshness — "is my local copy current?" — answered by when the cache last
+          received data, as a live relative counter. Deliberately separate from the
+          sync-event history below (which is a transition log): the two answer
+          different questions ("is it current now?" vs "what happened?"). */}
+      {lastSyncedMs !== null ? (
+        <div className="flex gap-2 text-xs text-muted-foreground">
+          <span>Last update received</span>
+          <span className="tabular-nums">
+            <RelativeTime ms={lastSyncedMs} />
+          </span>
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">No updates received yet.</p>
+      )}
       {events.length > 0 ? (
-        <EventRunList title="Recent sync events" runs={events} labelOf={(e) => e.reason} />
+        <EventRunList title="Recent sync events" runs={events} labelOf={(e) => syncEventLabel(e.reason)} />
       ) : (
         <p className="text-xs text-muted-foreground">No sync events yet.</p>
       )}
@@ -619,6 +674,8 @@ function ClusterRow({
   // stream sync events for (a pending/never-cached row has no timeline). Expanding
   // it shows the recent cache-sync event history.
   const cacheId = cluster.activeCache?.id;
+  // The active cache's Synced condition — drives the sync detail's stale banner.
+  const syncCond = findCondition(cluster.activeCache?.status.conditions ?? [], 'Synced');
   const showSyncDetail = openDetail === 'sync';
   const setShowSyncDetail = (open: boolean) => setOpenDetail(open ? 'sync' : null);
   const pending = isPending(cluster);
@@ -743,7 +800,12 @@ function ClusterRow({
         <TableRow className="hover:bg-transparent">
           <TableCell className={STATUS_CELL_CLASS} />
           <TableCell colSpan={COLUMN_COUNT - 1} className="pt-0">
-            <SyncDetail cacheId={cacheId} />
+            <SyncDetail
+              cacheId={cacheId}
+              lastSyncedAt={cluster.activeCache?.status.lastSyncedAt ?? null}
+              syncReason={syncCond?.reason}
+              syncMessage={syncCond?.message}
+            />
           </TableCell>
         </TableRow>
       ) : null}

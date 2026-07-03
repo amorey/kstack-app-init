@@ -96,6 +96,12 @@ const (
 	// EngineErrored means the engine hit an engine-level failure (discovery,
 	// client construction) and is retrying with backoff.
 	EngineErrored EngineState = "Errored"
+	// EngineStale means the engine was caught up (Watching) but at least one
+	// driver's watch stopped proving it's alive (no delta, bookmark, or reconnect)
+	// past the staleness threshold — the cache may be behind. Distinct from
+	// Errored (a hard engine failure): the engine is still running, just not
+	// demonstrably current.
+	EngineStale EngineState = "Stale"
 )
 
 // EngineStatus is one coherent snapshot of the engine's reportable state.
@@ -109,6 +115,36 @@ type EngineStatus struct {
 	// LastSyncedAt is when the cache last received fresh data; nil if not
 	// yet this engine run. Flushed coarsely (~30s), not per write.
 	LastSyncedAt *time.Time
+
+	// The following describe the catch-up milestone and are set only on the
+	// report that first reaches EngineWatching after a (re)start — they are zero
+	// on every other report (reset when the engine re-enters EngineSyncing). The
+	// controller reads them on that transition to compose its event message.
+	//
+	// ColdStart is true when this was the cache's first-ever sync (no prior
+	// state), false when it resumed an already-populated cache — the signal that
+	// separates SyncStarted/InitialSyncComplete from Resynced.
+	ColdStart bool
+	// SyncedObjects/SyncedKinds are how much the catch-up mirrored (objects across
+	// kinds); CaughtUpIn is how long it took. All three power the human-facing
+	// "Cached N objects across M kinds in Ds" message.
+	SyncedObjects int
+	SyncedKinds   int
+	CaughtUpIn    time.Duration
+
+	// StaleKinds names the kinds whose watch went quiet past the threshold; set
+	// only on EngineStale reports (the "no watch heartbeat for X" message), zero
+	// otherwise.
+	StaleKinds []string
+}
+
+// clearCatchUp zeroes the catch-up milestone facts so a later report (a
+// heartbeat, an error, or a liveness recovery) can't carry a prior run's stale
+// counts. Called wherever the engine leaves the caught-up state.
+func (s *EngineStatus) clearCatchUp() {
+	s.ColdStart = false
+	s.SyncedObjects, s.SyncedKinds, s.CaughtUpIn = 0, 0, 0
+	s.StaleKinds = nil
 }
 
 // Sink receives engine status snapshots; implemented by the kube package's
@@ -132,9 +168,11 @@ type Engine struct {
 	mu     sync.Mutex
 	status EngineStatus
 
-	backoffInit   time.Duration
-	backoffMax    time.Duration
-	flushInterval time.Duration
+	backoffInit        time.Duration
+	backoffMax         time.Duration
+	flushInterval      time.Duration
+	staleThreshold     time.Duration
+	staleCheckInterval time.Duration
 	// sleep/now are test seams (deterministic backoff and freshness stamps).
 	sleep func(ctx context.Context, d time.Duration) error
 	now   func() time.Time
@@ -157,6 +195,17 @@ const (
 	// timestamp is flushed through the sink. Coarse on purpose — the value
 	// backs a human-facing "synced N ago" label, not precise accounting.
 	freshnessFlushInterval = 30 * time.Second
+
+	// staleThreshold is how long a caught-up driver may go without proving its
+	// watch is alive (delta, bookmark, or reconnect) before the engine flags the
+	// cache stale. Comfortably above the API server's ~1min bookmark cadence so a
+	// few missed bookmarks don't trip it; the connection sentinel catches hard
+	// disconnects far faster, so this is the slow backstop for a silently-wedged
+	// watch. (A rare API server that honours no bookmarks and holds watches open
+	// for long stretches could false-positive — an accepted limitation.)
+	staleThreshold = 5 * time.Minute
+	// staleCheckInterval is how often the liveness monitor re-evaluates.
+	staleCheckInterval = 30 * time.Second
 )
 
 // engineOption configures an Engine's test seams. Production never tunes
@@ -176,6 +225,14 @@ func withEngineNow(fn func() time.Time) engineOption {
 	return func(e *Engine) { e.now = fn }
 }
 
+func withStaleThreshold(d time.Duration) engineOption {
+	return func(e *Engine) { e.staleThreshold = d }
+}
+
+func withStaleCheckInterval(d time.Duration) engineOption {
+	return func(e *Engine) { e.staleCheckInterval = d }
+}
+
 // NewEngine builds an engine over resolved credentials, an open cluster
 // cache, and the status sink. It starts nothing; call Start.
 func NewEngine(cfg *rest.Config, cdb *store.ClusterDB, sink Sink) *Engine {
@@ -185,16 +242,18 @@ func NewEngine(cfg *rest.Config, cdb *store.ClusterDB, sink Sink) *Engine {
 func newEngineWithOptions(cfg *rest.Config, cdb *store.ClusterDB, sink Sink, opts ...engineOption) *Engine {
 	baseCtx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		cfg:           cfg,
-		cdb:           cdb,
-		sink:          sink,
-		backoffInit:   engineBackoffInit,
-		backoffMax:    engineBackoffMax,
-		flushInterval: freshnessFlushInterval,
-		sleep:         ctxSleep,
-		now:           time.Now,
-		baseCtx:       baseCtx,
-		baseCtxCancel: cancel,
+		cfg:                cfg,
+		cdb:                cdb,
+		sink:               sink,
+		backoffInit:        engineBackoffInit,
+		backoffMax:         engineBackoffMax,
+		flushInterval:      freshnessFlushInterval,
+		staleThreshold:     staleThreshold,
+		staleCheckInterval: staleCheckInterval,
+		sleep:              ctxSleep,
+		now:                time.Now,
+		baseCtx:            baseCtx,
+		baseCtxCancel:      cancel,
 	}
 	for _, o := range opts {
 		o(e)
@@ -242,14 +301,75 @@ func (e *Engine) report(update func(*EngineStatus)) {
 	e.sink.Report(snapshot)
 }
 
+// reportCaughtUp emits the catch-up milestone — every driver has entered its
+// watch phase. It totals what was mirrored (a single read query, at the
+// transition only — not per report) and stamps the elapsed time so the
+// controller can compose the InitialSyncComplete/Resynced message. A count
+// failure is logged and reported as zero rather than failing the milestone.
+func (e *Engine) reportCaughtUp(ctx context.Context, coldStart bool, kinds int, startedAt time.Time) {
+	objects := 0
+	if n, err := cachedObjectCount(ctx, e.cdb); err != nil {
+		slog.Warn("clustersync: count cached objects", "id", e.cdb.ID(), "err", err)
+	} else {
+		objects = n
+	}
+	elapsed := e.now().Sub(startedAt)
+	e.report(func(s *EngineStatus) {
+		s.State, s.LastError = EngineWatching, ""
+		s.ColdStart = coldStart
+		s.SyncedKinds = kinds
+		s.SyncedObjects = objects
+		s.CaughtUpIn = elapsed
+	})
+}
+
+// cacheHasData reports whether this cache already holds a prior sync's state —
+// any kind has persisted a resume cookie. Read once at run start (before the
+// drivers repopulate anything), so the catch-up milestone can tell a cold cache
+// (first-ever sync) from a resume — keyed on the resume cookie rather than an
+// object count so an empty cluster's resume isn't misread as a cold start.
+func cacheHasData(ctx context.Context, cdb *store.ClusterDB) (bool, error) {
+	var has bool
+	err := cdb.Reader().QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM cluster_meta WHERE key LIKE ?)`,
+		"%"+lastListRVSuffix).Scan(&has)
+	return has, err
+}
+
+// cachedObjectCount totals the objects mirrored across every kind (the universal
+// objects table plus events), reported at catch-up for the "Cached N objects
+// across M kinds" message.
+func cachedObjectCount(ctx context.Context, cdb *store.ClusterDB) (int, error) {
+	var total int
+	err := cdb.Reader().QueryRowContext(ctx,
+		`SELECT (SELECT COUNT(*) FROM objects) + (SELECT COUNT(*) FROM events)`).Scan(&total)
+	return total, err
+}
+
 // runLoop supervises run: any return while the engine is still wanted (a
 // startup error, or discovery transiently yielding nothing) is abnormal —
 // report Errored and retry with capped backoff until Stop.
 func (e *Engine) runLoop(ctx context.Context) {
 	backoff := e.backoffInit
 	for {
-		e.report(func(s *EngineStatus) { s.State, s.LastError = EngineSyncing, "" })
-		err := e.run(ctx)
+		// Decide cold-vs-resume before anything repopulates the cache, so the
+		// in-progress Syncing report carries ColdStart (a first-ever build is a
+		// SyncStarted transition, a resume is the plain Syncing) and run() reuses
+		// the same verdict for the catch-up milestone.
+		coldStart := true
+		if has, err := cacheHasData(ctx, e.cdb); err != nil {
+			slog.Warn("clustersync: read cache state", "id", e.cdb.ID(), "err", err)
+		} else {
+			coldStart = !has
+		}
+		// Re-entering Syncing clears the previous run's catch-up facts so a later
+		// snapshot (a heartbeat or an error) can't carry stale counts.
+		e.report(func(s *EngineStatus) {
+			s.State, s.LastError = EngineSyncing, ""
+			s.clearCatchUp()
+			s.ColdStart = coldStart
+		})
+		err := e.run(ctx, coldStart)
 		if ctx.Err() != nil {
 			return
 		}
@@ -272,7 +392,7 @@ func (e *Engine) runLoop(ctx context.Context) {
 // run blocks for one engine generation: build clients, walk discovery, and
 // drive one kindDriver per discovered GVR until ctx is cancelled. The state
 // flips to Watching once every driver has entered its watch phase.
-func (e *Engine) run(ctx context.Context) error {
+func (e *Engine) run(ctx context.Context, coldStart bool) error {
 	dc, err := discovery.NewDiscoveryClientForConfig(e.cfg)
 	if err != nil {
 		return fmt.Errorf("discovery client: %w", err)
@@ -298,8 +418,23 @@ func (e *Engine) run(ctx context.Context) error {
 	}
 	slog.Info("clustersync: discovered syncable GVRs on API server", "id", e.cdb.ID(), "count", len(entries))
 
+	// coldStart was decided by runLoop before this report chain began (before the
+	// drivers repopulate anything); stamp the run's start so the catch-up milestone
+	// can report elapsed time alongside it.
+	startedAt := e.now()
+	kinds := len(entries)
+
+	// runCtx scopes the liveness monitor to this run: it's cancelled when the
+	// drivers finish even if the parent ctx hasn't (a driver-exhausted run retries),
+	// so the monitor never outlives the drivers it watches.
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
 	var pending atomic.Int64
 	pending.Store(int64(len(entries)))
+	caughtUp := make(chan struct{})
+	var caughtUpOnce sync.Once
+	drivers := make([]*kindDriver, 0, len(entries))
 
 	var wg sync.WaitGroup
 	for _, entry := range entries {
@@ -318,20 +453,86 @@ func (e *Engine) run(ctx context.Context) error {
 			seedRV = ""
 		}
 		d := newKindDriver(newLiveSource(dyn, md, entry), store, entry.GVK, seedRV)
+		d.now = e.now // one clock: driver liveness is judged against the engine's now
 		d.onWatch = func() {
 			if pending.Add(-1) == 0 {
-				e.report(func(s *EngineStatus) { s.State, s.LastError = EngineWatching, "" })
+				e.reportCaughtUp(runCtx, coldStart, kinds, startedAt)
+				caughtUpOnce.Do(func() { close(caughtUp) })
 			}
 		}
+		drivers = append(drivers, d)
 		slog.Debug("clustersync: starting driver", "id", e.cdb.ID(), "gvk", entry.GVK.String(), "seedRV", seedRV)
 		wg.Go(func() {
-			if err := d.Run(ctx); err != nil && ctx.Err() == nil {
+			if err := d.Run(runCtx); err != nil && runCtx.Err() == nil {
 				slog.Warn("clustersync: driver exited", "id", e.cdb.ID(), "gvk", entry.GVK.String(), "err", err)
 			}
 		})
 	}
+
+	var monWg sync.WaitGroup
+	monWg.Go(func() { e.livenessMonitor(runCtx, drivers, caughtUp) })
+
 	wg.Wait()
+	runCancel()  // drivers done → stop the monitor
+	monWg.Wait() // and join it before the run returns
 	return ctx.Err()
+}
+
+// livenessMonitor flags the cache stale once a driver stops proving its watch is
+// alive past staleThreshold, and recovers it once liveness returns. It only judges
+// staleness after catch-up (before that the engine is legitimately still Syncing).
+// It re-reports whenever the wedged set changes — not just on the healthy/stale
+// edge — so a multi-kind cache never keeps naming a kind that has recovered (or
+// omits a newly-wedged one) while it stays stale overall; an unchanged set doesn't
+// re-emit every tick. The recovery report carries no catch-up counts — it's a
+// liveness resume, not a fresh sync — which the controller renders as "watch
+// recovered".
+func (e *Engine) livenessMonitor(ctx context.Context, drivers []*kindDriver, caughtUp <-chan struct{}) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-caughtUp:
+	}
+	ticker := time.NewTicker(e.staleCheckInterval)
+	defer ticker.Stop()
+	// reported is the laggard set last published as stale; nil while watching. A
+	// non-nil, non-equal set means the wedged kinds shifted and must be re-reported.
+	var reported []string
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			laggards := staleLaggards(drivers, e.now(), e.staleThreshold)
+			switch {
+			case len(laggards) > 0 && !slices.Equal(laggards, reported):
+				reported = laggards
+				e.report(func(s *EngineStatus) {
+					s.State, s.LastError, s.StaleKinds = EngineStale, "", laggards
+				})
+			case len(laggards) == 0 && reported != nil:
+				reported = nil
+				e.report(func(s *EngineStatus) {
+					s.State = EngineWatching
+					s.clearCatchUp()
+				})
+			}
+		}
+	}
+}
+
+// staleLaggards names the kinds whose watch hasn't proven liveness within
+// threshold. Liveness is a delta, a bookmark, or a reconnect (each stamps the
+// driver), so a genuinely quiet-but-healthy kind — still receiving the server's
+// periodic bookmarks — never appears here; only a silently-wedged watch does.
+func staleLaggards(drivers []*kindDriver, now time.Time, threshold time.Duration) []string {
+	var laggards []string
+	for _, d := range drivers {
+		if now.Sub(d.liveAt()) > threshold {
+			laggards = append(laggards, d.gvk.Kind)
+		}
+	}
+	return laggards
 }
 
 // freshnessLoop tracks when the cache last received data (via the ClusterDB's

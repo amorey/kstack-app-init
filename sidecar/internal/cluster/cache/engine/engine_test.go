@@ -21,10 +21,30 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
+
+// fakeClock is a manually-advanced clock for the liveness-monitor tests, safe for
+// the monitor goroutine and the test to share.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
 
 // recordingSink captures every Report for assertion; statuses() snapshots them.
 type recordingSink struct {
@@ -80,6 +100,8 @@ func TestEngineReportsErroredAndRetriesWithBackoff(t *testing.T) {
 		case EngineSyncing:
 			sawSyncing = true
 			require.Empty(t, st.LastError, "Syncing reports carry no error")
+			require.True(t, st.ColdStart,
+				"an empty cache's Syncing report is a cold start (drives the SyncStarted event)")
 		case EngineErrored:
 			sawErrored = true
 			require.NotEmpty(t, st.LastError, "Errored reports carry the failure")
@@ -235,6 +257,162 @@ func TestContextProxyURL(t *testing.T) {
 	require.Equal(t, "http://proxy:8080", ContextProxyURL(cfg, "a"))
 	require.Equal(t, "", ContextProxyURL(cfg, "b"), "dangling cluster reference")
 	require.Equal(t, "", ContextProxyURL(cfg, "nope"), "absent context")
+}
+
+// cacheHasData tells a cold cache (never synced) from a resume of prior state,
+// keyed on any kind having persisted a resume cookie. It's what lets the catch-up
+// milestone report ColdStart, so the controller can distinguish
+// SyncStarted/InitialSyncComplete from a Resynced resume.
+func TestEngineCacheHasData(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+
+	has, err := cacheHasData(ctx, cdb)
+	require.NoError(t, err)
+	require.False(t, has, "a freshly migrated cache is cold")
+
+	// A persisted resume cookie marks the cache as previously synced — even for a
+	// cluster that mirrors zero objects, so an empty cluster's resume isn't
+	// misread as a cold first-ever sync.
+	store := newObjectsStore(ctx, cdb.ID(), podGVK(), cdb.Writer(), cdb)
+	require.NoError(t, store.PersistRV(ctx, "123"))
+
+	has, err = cacheHasData(ctx, cdb)
+	require.NoError(t, err)
+	require.True(t, has, "a persisted resume cookie means a resume, not a cold start")
+}
+
+// reportCaughtUp emits the catch-up milestone: State=Watching plus the facts the
+// controller composes into its message — whether this was a cold build, how many
+// objects/kinds were mirrored, and how long catching up took.
+func TestEngineReportsCatchUpFacts(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+
+	// Seed two cached objects so the reported count is real.
+	store := newObjectsStore(ctx, cdb.ID(), podGVK(), cdb.Writer(), cdb)
+	require.NoError(t, store.ApplyChange(watch.Added, uObj("p1", "v1", "Pod", "default", "p1", "1")))
+	require.NoError(t, store.ApplyChange(watch.Added, uObj("p2", "v1", "Pod", "default", "p2", "2")))
+
+	sink := newRecordingSink()
+	at := time.Date(2026, 6, 12, 10, 0, 5, 0, time.UTC)
+	startedAt := at.Add(-3 * time.Second)
+	e := newEngineWithOptions(nil, cdb, sink, withEngineNow(func() time.Time { return at }))
+
+	e.reportCaughtUp(ctx, true /*coldStart*/, 4 /*kinds*/, startedAt)
+
+	sts := sink.statuses()
+	require.Len(t, sts, 1)
+	got := sts[0]
+	require.Equal(t, EngineWatching, got.State)
+	require.True(t, got.ColdStart)
+	require.Equal(t, 4, got.SyncedKinds)
+	require.Equal(t, 2, got.SyncedObjects)
+	require.Equal(t, 3*time.Second, got.CaughtUpIn)
+}
+
+// The liveness monitor flags EngineStale (naming the wedged kind) once a driver
+// stops proving its watch is alive past the threshold, and recovers to Watching
+// once it does again — the engine half of SyncStale, keyed on watch liveness
+// rather than object churn, so a quiet-but-healthy kind never trips it.
+func TestEngineLivenessMonitorFlagsStaleAndRecovers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+
+	clk := &fakeClock{t: time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)}
+	store := newObjectsStore(ctx, cdb.ID(), podGVK(), cdb.Writer(), cdb)
+	svcGVK := schema.GroupVersionKind{Version: "v1", Kind: "Service"}
+	dPod := newKindDriverWithOptions(&fakeSource{}, store, podGVK(), "1", withNow(clk.now))
+	dSvc := newKindDriverWithOptions(&fakeSource{}, store, svcGVK, "1", withNow(clk.now))
+	dPod.markLive()
+	dSvc.markLive()
+
+	sink := newRecordingSink()
+	e := newEngineWithOptions(nil, cdb, sink,
+		withEngineNow(clk.now),
+		withStaleThreshold(5*time.Minute),
+		withStaleCheckInterval(time.Millisecond))
+
+	caughtUp := make(chan struct{})
+	close(caughtUp)
+	done := make(chan struct{})
+	go func() { defer close(done); e.livenessMonitor(ctx, []*kindDriver{dPod, dSvc}, caughtUp) }()
+
+	// Keep Service alive but let Pod go quiet past the threshold → stale, naming Pod.
+	clk.advance(6 * time.Minute)
+	dSvc.markLive()
+	waitFor(t, func() bool {
+		for _, st := range sink.statuses() {
+			if st.State == EngineStale && len(st.StaleKinds) == 1 && st.StaleKinds[0] == "Pod" {
+				return true
+			}
+		}
+		return false
+	}, "EngineStale flagged, naming the wedged kind")
+
+	// Pod proves liveness again → recovery back to Watching.
+	dPod.markLive()
+	waitFor(t, func() bool {
+		sts := sink.statuses()
+		return len(sts) > 0 && sts[len(sts)-1].State == EngineWatching
+	}, "recovers to Watching once liveness returns")
+
+	cancel()
+	<-done
+}
+
+// While a multi-kind cache stays stale overall, a shift in which kinds are wedged
+// must re-report: otherwise StaleKinds keeps naming a kind that has recovered and
+// omits the newly-wedged one until every watch recovers.
+func TestEngineLivenessMonitorReReportsChangedLaggards(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+
+	clk := &fakeClock{t: time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)}
+	store := newObjectsStore(ctx, cdb.ID(), podGVK(), cdb.Writer(), cdb)
+	svcGVK := schema.GroupVersionKind{Version: "v1", Kind: "Service"}
+	dPod := newKindDriverWithOptions(&fakeSource{}, store, podGVK(), "1", withNow(clk.now))
+	dSvc := newKindDriverWithOptions(&fakeSource{}, store, svcGVK, "1", withNow(clk.now))
+	dPod.markLive()
+	dSvc.markLive()
+
+	sink := newRecordingSink()
+	e := newEngineWithOptions(nil, cdb, sink,
+		withEngineNow(clk.now),
+		withStaleThreshold(5*time.Minute),
+		withStaleCheckInterval(time.Millisecond))
+
+	caughtUp := make(chan struct{})
+	close(caughtUp)
+	done := make(chan struct{})
+	go func() { defer close(done); e.livenessMonitor(ctx, []*kindDriver{dPod, dSvc}, caughtUp) }()
+
+	staleNaming := func(kind string) func() bool {
+		return func() bool {
+			for _, st := range sink.statuses() {
+				if st.State == EngineStale && len(st.StaleKinds) == 1 && st.StaleKinds[0] == kind {
+					return true
+				}
+			}
+			return false
+		}
+	}
+
+	// Pod goes quiet past the threshold, Service stays alive → stale, naming Pod.
+	clk.advance(6 * time.Minute)
+	dSvc.markLive()
+	waitFor(t, staleNaming("Pod"), "stale flagged naming Pod")
+
+	// The wedged set flips while still stale: Pod recovers, Service goes quiet. The
+	// report must now name Service, not the stale Pod set.
+	clk.advance(6 * time.Minute)
+	dPod.markLive()
+	waitFor(t, staleNaming("Service"), "re-reports the new laggard set once it changes")
+
+	cancel()
+	<-done
 }
 
 // The driver invokes onWatch exactly once — the first time it enters its watch

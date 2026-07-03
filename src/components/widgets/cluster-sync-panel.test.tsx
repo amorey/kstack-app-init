@@ -48,6 +48,9 @@ type Row = {
   // Model an engine-level sync failure (Synced=False/SyncFailed). Defaults to a
   // healthy Synced=True/Watching condition.
   syncFailed?: boolean;
+  // Model a stalled-but-connected watch (Synced=False/Stale) — the cache may be
+  // behind even though the connection is up.
+  stale?: boolean;
   // Connection diagnostics surfaced in the Disconnected popover.
   connMessage?: string; // Connected condition's `message` (the probe error)
   disconnectedSince?: string; // Connected condition's `lastTransitionTime` (ISO)
@@ -63,6 +66,21 @@ function channelFor(queryPart: string) {
   const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
   if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
   return channels[idx];
+}
+
+// The `Synced` condition a probed row's ClusterCache carries, keyed off the
+// row's modelled sync state (failed / stale / healthy).
+function syncedCondition(r: Row) {
+  if (r.syncFailed) return { type: 'Synced', status: 'False', reason: 'SyncFailed' };
+  if (r.stale) {
+    return {
+      type: 'Synced',
+      status: 'False',
+      reason: 'Stale',
+      message: 'No watch heartbeat for Pod — cache may be behind',
+    };
+  }
+  return { type: 'Synced', status: 'True', reason: 'Watching' };
 }
 
 // Push each row as an Added change on the two delta streams: a Cluster change on
@@ -129,11 +147,7 @@ function pushClusters(rows: Row[]) {
                 clusterID: id,
                 serverUid: r.uuid,
                 status: {
-                  conditions: [
-                    r.syncFailed
-                      ? { type: 'Synced', status: 'False', reason: 'SyncFailed' }
-                      : { type: 'Synced', status: 'True', reason: 'Watching' },
-                  ],
+                  conditions: [syncedCondition(r)],
                   lastSyncedAt: r.lastSyncedAt ?? null,
                 },
                 stats: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
@@ -491,12 +505,12 @@ describe('ClusterSyncPanel', () => {
     await user.click(await screen.findByRole('button', { name: /syncing/i }));
 
     // The sync history streams in as bare runs (newest first by lastAt), with `ok`
-    // derived from the generic event type (Normal = a healthy Watching run).
+    // derived from the generic event type (Normal = a healthy run).
     await act(async () => {
       pushSyncEvent({
         id: '2',
         type: 'Warning',
-        reason: 'SyncFailed',
+        reason: 'SyncDegraded',
         message: 'discovery returned no syncable resources',
         count: 3,
         firstAt: new Date(Date.now() - 60_000).toISOString(),
@@ -505,21 +519,77 @@ describe('ClusterSyncPanel', () => {
       pushSyncEvent({
         id: '1',
         type: 'Normal',
-        reason: 'Watching',
-        message: '',
+        reason: 'InitialSyncComplete',
+        message: 'Cached 5 objects across 3 kinds in 2s',
         count: 1,
         firstAt: new Date(Date.now() - 90_000).toISOString(),
         lastAt: new Date(Date.now() - 80_000).toISOString(),
       });
     });
 
-    // The sync detail lists each recorded run with its reason and message.
+    // The sync detail lists each recorded run with a friendly label (not the raw
+    // reason code) and its message.
     expect(await screen.findByText(/recent sync events/i)).toBeInTheDocument();
     expect(await screen.findByText(/discovery returned no syncable resources/i)).toBeInTheDocument();
-    expect(screen.getByText(/SyncFailed ×3/i)).toBeInTheDocument();
-    // A single occurrence renders the bare label with no "×1" multiplier.
-    expect(screen.getByText('Watching')).toBeInTheDocument();
-    expect(screen.queryByText(/Watching ×1/i)).not.toBeInTheDocument();
+    // Friendly labels, with the run's ×count multiplier when > 1.
+    expect(screen.getByText(/Sync error ×3/i)).toBeInTheDocument();
+    expect(screen.getByText('Initial sync complete')).toBeInTheDocument();
+    // The raw reason codes are not surfaced.
+    expect(screen.queryByText(/SyncDegraded/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/InitialSyncComplete/)).not.toBeInTheDocument();
+  });
+
+  it('shows a last-update freshness line in the sync detail, driven by lastSyncedAt', async () => {
+    const syncedAt = new Date(Date.now() - 30_000).toISOString();
+    const user = await openWith([
+      { uuid: 'u-fresh', name: 'prod', enabled: true, present: true, cached: true, lastSyncedAt: syncedAt },
+    ]);
+
+    // Open the sync-status disclosure (the row has an active cache).
+    await user.click(await screen.findByRole('button', { name: /syncing/i }));
+
+    // The freshness line answers "is my cache current?" directly from lastSyncedAt
+    // — a live relative counter, independent of the (separate) sync-event history.
+    expect(await screen.findByText(/last update received/i)).toBeInTheDocument();
+    expect(await screen.findByText(/\d+s ago/)).toBeInTheDocument();
+  });
+
+  it('surfaces a stalled watch: the sync column reads Stale and the detail explains why', async () => {
+    const user = await openWith([
+      {
+        uuid: 'u-stale',
+        name: 'prod',
+        enabled: true,
+        present: true,
+        cached: true,
+        stale: true,
+        lastSyncedAt: new Date(Date.now() - 6 * 60_000).toISOString(),
+      },
+    ]);
+
+    // The sync column reflects the stalled state (not a healthy "Syncing").
+    const staleBtn = await screen.findByRole('button', { name: /stale/i });
+    await user.click(staleBtn);
+
+    // The detail flags it and carries the condition's explanation.
+    expect(await screen.findByText(/possibly stale/i)).toBeInTheDocument();
+    expect(screen.getByText(/no watch heartbeat for pod/i)).toBeInTheDocument();
+
+    // A SyncStale event renders with a friendly label (not the raw reason code).
+    await act(async () => {
+      pushSyncEvent({
+        id: '9',
+        type: 'Warning',
+        reason: 'SyncStale',
+        message: 'Pod watch went quiet',
+        count: 1,
+        firstAt: new Date(Date.now() - 60_000).toISOString(),
+        lastAt: new Date(Date.now() - 10_000).toISOString(),
+      });
+    });
+    expect(await screen.findByText('Watch stalled')).toBeInTheDocument();
+    expect(screen.getByText(/pod watch went quiet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/SyncStale/)).not.toBeInTheDocument();
   });
 
   it('holds the countdown across an in-flight probe, then clears it once the schedule is authoritatively empty', async () => {

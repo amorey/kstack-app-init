@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -355,8 +356,98 @@ func TestEmptyCacheFallsBackToFullLIST(t *testing.T) {
 	require.Equal(t, 1, countObjectsByKind(t, cdb.Writer(), "Pod", "v1"))
 }
 
-// The persisted resume RV advances with each object delta (bookmarks aren't
-// forwarded by RetryWatcher, so object events drive persistence).
+// A bookmark proves the watch is alive without any object delta: it stamps the
+// driver's liveness time and advances the persisted resume RV, but applies no
+// object. RetryWatcher swallows bookmarks, so the driver observes them by tapping
+// the watch stream ahead of it — this is what lets the engine tell a quiet-but-
+// healthy watch (still receiving periodic bookmarks) from a wedged one.
+func TestDriverBookmarkMarksLiveAndPersistsRV(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+	fs := &fakeSource{watchers: make(chan *watch.FakeWatcher, 4)}
+
+	at := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	d := newKindDriverWithOptions(fs, store, podGVK(), "100", withNow(func() time.Time { return at }))
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	fw := <-fs.watchers
+	// A bookmark carrying a fresh RV, no object change.
+	fw.Action(watch.Bookmark, uObj("", "v1", "Pod", "", "", "205"))
+
+	waitFor(t, func() bool { return metaValue(t, cdb, "v1/Pod.last_list_rv") == "205" }, "bookmark rv persisted")
+	require.Equal(t, at, d.liveAt(), "the bookmark stamped liveness")
+	require.Equal(t, 0, countObjectsByKind(t, cdb.Writer(), "Pod", "v1"), "a bookmark applies no object")
+
+	cancel()
+	<-done
+}
+
+// A bookmark must not advance the resume cookie past deltas the driver hasn't
+// applied yet: the tap sees a bookmark ahead of the apply loop, so persisting its
+// RV eagerly would let a crash/restart resume from it and skip un-applied changes,
+// leaving the cache permanently behind. onBookmark holds the cookie until
+// deltaApplied catches the deltaSeen high-water mark, while still marking liveness.
+func TestBookmarkHoldsRVUntilDeltasApplied(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+	at := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	d := newKindDriverWithOptions(nil, store, podGVK(), "100", withNow(func() time.Time { return at }))
+
+	// The tap forwarded two deltas the apply loop hasn't stored yet — a bookmark
+	// past them must hold the cookie, but still prove the watch is alive.
+	d.deltaSeen.Store(2)
+	d.onBookmark(ctx, "205")
+	require.Equal(t, at, d.liveAt(), "the bookmark stamps liveness even while the cookie is held")
+	require.Empty(t, metaValue(t, cdb, "v1/Pod.last_list_rv"), "cookie held while deltas are un-applied")
+
+	// Once both deltas are durable, the next bookmark advances the cookie.
+	d.deltaApplied.Store(2)
+	d.onBookmark(ctx, "206")
+	require.Equal(t, "206", metaValue(t, cdb, "v1/Pod.last_list_rv"), "cookie advances once applied catches up")
+}
+
+// A successful RetryWatcher reconnect is itself proof the watch is alive: on a
+// quiet cluster a watch can drop and reopen with no delta or bookmark in between,
+// and without stamping liveness on reconnect the monitor would falsely flag the
+// kind stale past the threshold. The replacement watch's open must refresh liveAt.
+func TestReconnectMarksLive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+	fs := &fakeSource{watchers: make(chan *watch.FakeWatcher, 4)}
+
+	t0 := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(10 * time.Minute)
+	var clk atomic.Int64
+	clk.Store(t0.UnixNano())
+	d := newKindDriverWithOptions(fs, store, podGVK(), "100",
+		withNow(func() time.Time { return time.Unix(0, clk.Load()) }))
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	w1 := <-fs.watchers
+	waitFor(t, func() bool { return d.liveAt().Equal(t0) }, "initial connect stamped liveness at t0")
+
+	// Advance the clock and drop the watch (a clean close). RetryWatcher reopens a
+	// replacement watch with no delta or bookmark in between; liveness must refresh.
+	clk.Store(t1.UnixNano())
+	w1.Stop()
+	<-fs.watchers // the reconnect's replacement watch
+	waitFor(t, func() bool { return d.liveAt().Equal(t1) }, "reconnect refreshed liveness at t1")
+
+	cancel()
+	<-done
+}
+
+// The persisted resume RV advances with each object delta.
 func TestRVPersistedOnEachEvent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

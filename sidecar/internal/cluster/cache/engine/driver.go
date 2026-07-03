@@ -18,9 +18,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -120,6 +123,25 @@ type kindDriver struct {
 	backoffMax    time.Duration
 	// sleep is a ctx-aware backoff sleep; a test seam so backoff is deterministic.
 	sleep func(ctx context.Context, d time.Duration) error
+	// now stamps the liveness time; a test seam (defaults to time.Now).
+	now func() time.Time
+
+	// lastLiveAt is when the watch last proved it's alive — a delta OR a bookmark.
+	// Bookmarks matter because a quiet cluster delivers no deltas yet the watch is
+	// healthy; the server's periodic bookmarks keep this fresh regardless of churn,
+	// so the engine can read liveAt() to tell quiet-but-healthy from wedged. Guarded
+	// by liveMu because a delta (the run goroutine) and a bookmark (the watch tap's
+	// goroutine) can stamp it concurrently.
+	liveMu     sync.Mutex
+	lastLiveAt time.Time
+
+	// deltaSeen counts object deltas the watch tap has forwarded downstream;
+	// deltaApplied counts those the driver has durably applied+persisted. A bookmark
+	// advances the resume cookie only once applied has caught up to seen, so a crash
+	// or restart never resumes past a delta the cache hasn't stored yet. Both are
+	// monotonic and touched from the tap and run goroutines, hence atomic.
+	deltaSeen    atomic.Int64
+	deltaApplied atomic.Int64
 }
 
 // option configures a kindDriver's test seams. Production never tunes them, so
@@ -133,6 +155,10 @@ func withSleep(fn func(context.Context, time.Duration) error) option {
 
 func withDiffThreshold(n int) option {
 	return func(d *kindDriver) { d.diffThreshold = n }
+}
+
+func withNow(fn func() time.Time) option {
+	return func(d *kindDriver) { d.now = fn }
 }
 
 func newKindDriver(src kubeSource, store kindStore, gvk schema.GroupVersionKind, seedRV string) *kindDriver {
@@ -149,6 +175,7 @@ func newKindDriverWithOptions(src kubeSource, store kindStore, gvk schema.GroupV
 		backoffInit:   1 * time.Second,
 		backoffMax:    30 * time.Second,
 		sleep:         ctxSleep,
+		now:           time.Now,
 	}
 	for _, o := range opts {
 		o(d)
@@ -227,10 +254,13 @@ func (d *kindDriver) nextBackoff(b time.Duration) time.Duration {
 // — Run re-syncs either way). It reports whether the watch made progress (applied
 // at least one delta), which Run uses to tell a healthy watch that dropped from
 // one that never worked. RetryWatcher requests bookmarks and tracks RV across
-// reconnects internally; it does not forward bookmark events, so we persist RV
-// from object deltas only.
+// reconnects internally but does not forward bookmark events, so the driver taps
+// the underlying watch ahead of it (watcherFor's tapEvent) to observe them —
+// bumping liveness and persisting the bookmark RV, but only once the deltas before
+// it have been applied (see onBookmark). Object deltas persist their RV inline below.
 func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool, err error) {
-	rw, err := toolswatch.NewRetryWatcherWithContext(ctx, rv, watcherFor(d.src))
+	watcher := watcherFor(d.src, d.markLive, func(ev watch.Event) { d.tapEvent(ctx, ev) })
+	rw, err := toolswatch.NewRetryWatcherWithContext(ctx, rv, watcher)
 	if err != nil {
 		// e.g. an unusable RV; let Run fall to a full re-sync.
 		return false, err
@@ -239,6 +269,10 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 
 	if !d.sawWatch {
 		d.sawWatch = true
+		// Entering the watch phase is itself proof the watch is alive — seed
+		// liveness at catch-up so a quiet kind isn't judged stale before its first
+		// bookmark arrives.
+		d.markLive()
 		if d.onWatch != nil {
 			d.onWatch()
 		}
@@ -267,11 +301,14 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 					continue
 				}
 				progressed = true
+				d.markLive()
 				if rvNow := u.GetResourceVersion(); rvNow != "" {
 					if err := d.store.PersistRV(ctx, rvNow); err != nil {
 						slog.Warn("clustersync: persist rv", "gvk", d.gvk.String(), "err", err)
 					}
 				}
+				// This delta is now durable — let a pending bookmark advance past it.
+				d.deltaApplied.Add(1)
 			case watch.Error:
 				// RetryWatcher forwards the Status then closes the channel. A 410
 				// means our RV expired; anything else it treats as fatal too.
@@ -371,12 +408,96 @@ func isExpired(obj runtime.Object) bool {
 	return apierrors.IsResourceExpired(err) || apierrors.IsGone(err)
 }
 
+// markLive stamps the driver's liveness time — the watch just proved it's alive
+// (a delta, a bookmark, or a fresh (re)connect). Safe to call from the run and
+// watch-tap goroutines.
+func (d *kindDriver) markLive() {
+	t := d.now()
+	d.liveMu.Lock()
+	d.lastLiveAt = t
+	d.liveMu.Unlock()
+}
+
+// liveAt returns when the watch last proved it's alive; the zero time until the
+// first delta or bookmark. The engine reads this across all drivers to decide
+// whether the cache is still current (freshness) or has gone stale.
+func (d *kindDriver) liveAt() time.Time {
+	d.liveMu.Lock()
+	defer d.liveMu.Unlock()
+	return d.lastLiveAt
+}
+
+// tapEvent inspects one raw watch event the tap observed ahead of RetryWatcher
+// (which is why it runs in the tap's goroutine, not the apply loop). Object
+// deltas bump deltaSeen — the ordered high-water mark a bookmark checks against —
+// while bookmarks stamp liveness and conditionally advance the resume cookie.
+func (d *kindDriver) tapEvent(ctx context.Context, ev watch.Event) {
+	switch ev.Type {
+	case watch.Added, watch.Modified, watch.Deleted:
+		d.deltaSeen.Add(1)
+	case watch.Bookmark:
+		d.onBookmark(ctx, resourceVersionOf(ev.Object))
+	}
+}
+
+// onBookmark handles a bookmark the watch tap observed: stamp liveness and
+// advance the persisted resume cookie (so a cold restart resumes closer to head
+// even on a quiet cluster). The cookie only moves once the driver has applied
+// every delta the tap forwarded before this bookmark (deltaApplied has caught up
+// to the deltaSeen snapshot): the server places a bookmark at/after all prior
+// events, so advancing while a delta is still un-applied — or if ApplyChange
+// failed — would let a restart resume past it and skip it permanently. Deltas in
+// flight simply defer the advance to the next bookmark once they land. Liveness,
+// which only needs proof the watch is alive, is stamped regardless. Best-effort
+// persistence — a write error is logged and swallowed.
+func (d *kindDriver) onBookmark(ctx context.Context, rv string) {
+	if rv == "" {
+		return
+	}
+	// Snapshot the high-water mark before marking live. The tap is single-threaded,
+	// so no new delta is forwarded while this runs — deltaSeen is frozen at exactly
+	// the count of deltas preceding this bookmark.
+	seen := d.deltaSeen.Load()
+	d.markLive()
+	if d.deltaApplied.Load() < seen {
+		return
+	}
+	if err := d.store.PersistRV(ctx, rv); err != nil {
+		slog.Warn("clustersync: persist bookmark rv", "gvk", d.gvk.String(), "err", err)
+	}
+}
+
 // watcherFor adapts a kubeSource to the cache.WatcherWithContext that
-// NewRetryWatcherWithContext consumes (RetryWatcher fills in RV + bookmarks).
-func watcherFor(src kubeSource) cache.WatcherWithContext {
+// NewRetryWatcherWithContext consumes (RetryWatcher fills in RV + bookmarks). It
+// wraps each opened watch in a tap: RetryWatcher consumes bookmarks internally and
+// never forwards them, so the tap observes every event here — ahead of
+// RetryWatcher — while passing each through unchanged, so RetryWatcher's
+// reconnect/RV bookkeeping is untouched. onConnect fires on every successful
+// (re)open: RetryWatcher reconnects by re-invoking this func, so a freshly opened
+// replacement watch is itself proof of liveness even before its first event — the
+// signal a quiet cluster needs so a benign reconnect isn't misread as stale.
+func watcherFor(src kubeSource, onConnect func(), tap func(watch.Event)) cache.WatcherWithContext {
 	return watcherFunc(func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-		return src.Watch(ctx, opts)
+		w, err := src.Watch(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		onConnect()
+		return watch.Filter(w, func(in watch.Event) (watch.Event, bool) {
+			tap(in)
+			return in, true
+		}), nil
 	})
+}
+
+// resourceVersionOf extracts an object's resourceVersion, or "" if it has none /
+// isn't a metadata-bearing object.
+func resourceVersionOf(obj runtime.Object) string {
+	acc, err := meta.Accessor(obj)
+	if err != nil {
+		return ""
+	}
+	return acc.GetResourceVersion()
 }
 
 type watcherFunc func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error)

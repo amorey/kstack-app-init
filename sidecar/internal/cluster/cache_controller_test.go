@@ -45,8 +45,13 @@ type fakeEngine struct {
 func (f *fakeEngine) Start() {
 	f.started.Store(true)
 	// Report asynchronously — Start is called while the controller holds writeMu,
-	// and Report acquires writeMu too, so a synchronous call would deadlock.
-	go f.sink.Report(engine.EngineStatus{State: engine.EngineWatching})
+	// and Report acquires writeMu too, so a synchronous call would deadlock. Model
+	// a realistic cold first sync (ColdStart + catch-up counts) so the recorded
+	// event is InitialSyncComplete, not a bare Watching.
+	go f.sink.Report(engine.EngineStatus{
+		State: engine.EngineWatching, ColdStart: true,
+		SyncedObjects: 5, SyncedKinds: 3, CaughtUpIn: 2 * time.Second,
+	})
 }
 
 func (f *fakeEngine) Stop(_ context.Context) error {
@@ -251,10 +256,13 @@ func TestCacheControllerDeletionStopsEngineAndClearsFinalizer(t *testing.T) {
 // category — the parallel of the connection controller's probe-outcome history,
 // exposed generically to the frontend. Watching → Normal/Watching, Errored →
 // Warning/SyncFailed (carrying the engine's LastError), Syncing → Normal/Syncing.
-// Like the connection side, it records every report and lets beehive coalesce
-// consecutive same-(type, reason) outcomes into one aggregated run: a repeated
-// Watching report (the engine's freshness heartbeat, only bumping LastSyncedAt)
-// bumps the Watching run's count rather than opening a new run.
+// It records only on a *transition* — a change in (type, reason) — so the
+// engine's steady-state freshness heartbeat (a repeated catch-up report that only
+// bumps LastSyncedAt) does NOT open or extend an event run. This is what keeps a
+// healthy cluster from reading as a meaningless "Watching ×27"; the heartbeat
+// still lands on LastSyncedAt via the status write. The reasons are the
+// transition vocabulary: a cold catch-up is InitialSyncComplete (with a "Cached N
+// objects across M kinds" message), an engine failure is SyncDegraded.
 func TestCacheControllerRecordsSyncEvents(t *testing.T) {
 	ctx := context.Background()
 	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
@@ -268,36 +276,138 @@ func TestCacheControllerRecordsSyncEvents(t *testing.T) {
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
-	// Sync-point on the engine's first (async) Watching report, so the reports
+	// Sync-point on the engine's first (async) catch-up report, so the reports
 	// below run strictly after it. Once the entry is live, sink.Report is
 	// synchronous from this goroutine (it just takes writeMu), so no further
 	// awaits are needed to observe each recorded event.
 	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
 
-	// A second Watching report (the engine's freshness heartbeat, only bumping
-	// LastSyncedAt) coalesces into the existing Watching run.
+	// A second catch-up report (the engine's freshness heartbeat, only bumping
+	// LastSyncedAt) is NOT a transition — it must not open/extend an event run.
 	now := time.Now()
-	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineWatching, LastSyncedAt: &now})
-	// Transition to Errored, then back to Syncing.
+	fakeEng.sink.Report(engine.EngineStatus{
+		State: engine.EngineWatching, ColdStart: true,
+		SyncedObjects: 5, SyncedKinds: 3, CaughtUpIn: 2 * time.Second, LastSyncedAt: &now,
+	})
+	// Transition to Errored, then to a (warm) Syncing.
 	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineErrored, LastError: "boom"})
 	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineSyncing})
 
 	evs, err := cacheClient.ListEvents(ctx, cacheObj.ID, beehive.WithEventCategory(SyncEventCategory))
 	require.NoError(t, err)
-	require.Len(t, evs, 3, "one run per distinct sync state (the two Watching reports coalesce)")
+	require.Len(t, evs, 3, "one run per transition (the repeated catch-up heartbeat is not recorded)")
 
 	// ListEvents is newest-run-first.
 	assert.Equal(t, beehive.EventNormal, evs[0].Type)
 	assert.Equal(t, ReasonSyncing, evs[0].Reason)
 
 	assert.Equal(t, beehive.EventWarning, evs[1].Type)
-	assert.Equal(t, ReasonSyncFailed, evs[1].Reason)
+	assert.Equal(t, ReasonSyncDegraded, evs[1].Reason)
 	assert.Equal(t, "boom", evs[1].Message)
 
 	assert.Equal(t, beehive.EventNormal, evs[2].Type)
-	assert.Equal(t, ReasonWatching, evs[2].Reason)
-	assert.Equal(t, 2, evs[2].Count,
-		"the two Watching reports coalesce into one run with a bumped count")
+	assert.Equal(t, ReasonInitialSyncComplete, evs[2].Reason)
+	assert.Equal(t, 1, evs[2].Count,
+		"the steady-state catch-up heartbeat is not recorded, so the run stays count 1")
+	assert.Equal(t, "Cached 5 objects across 3 kinds in 2s", evs[2].Message)
+}
+
+// A cold Syncing report reads as SyncStarted; a warm catch-up (an already-
+// populated cache resuming) reads as Resynced, with a "Re-synced …" message — the
+// pair that distinguishes a first-ever build from a reconnect.
+func TestCacheControllerSyncEventVocabulary(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
+
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	// Wait for the initial cold catch-up (InitialSyncComplete) so the entry is live.
+	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
+
+	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineSyncing, ColdStart: true})
+	fakeEng.sink.Report(engine.EngineStatus{
+		State: engine.EngineWatching, ColdStart: false,
+		SyncedObjects: 7, SyncedKinds: 4, CaughtUpIn: 1500 * time.Millisecond,
+	})
+
+	evs, err := cacheClient.ListEvents(ctx, cacheObj.ID, beehive.WithEventCategory(SyncEventCategory))
+	require.NoError(t, err)
+	require.Len(t, evs, 3) // newest-first: Resynced, SyncStarted, InitialSyncComplete
+
+	assert.Equal(t, ReasonResynced, evs[0].Reason)
+	assert.Equal(t, "Re-synced 7 objects across 4 kinds in 1.5s", evs[0].Message)
+	assert.Equal(t, ReasonSyncStarted, evs[1].Reason)
+	assert.Equal(t, ReasonInitialSyncComplete, evs[2].Reason)
+}
+
+// An EngineStale report flips the Synced condition to False/Stale and records a
+// SyncStale warning naming the wedged kinds — a stalled watch surfaced as its own
+// state, distinct from a hard SyncFailed.
+func TestCacheControllerStaleReport(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
+
+	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	// Live (cold catch-up), then the liveness monitor reports the watch stale.
+	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
+	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineStale, StaleKinds: []string{"Pod", "Endpoints"}})
+
+	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionFalse)
+	assert.Equal(t, ReasonStale, synced.Reason)
+
+	evs, err := cacheClient.ListEvents(ctx, cacheObj.ID, beehive.WithEventCategory(SyncEventCategory))
+	require.NoError(t, err)
+	require.NotEmpty(t, evs)
+	assert.Equal(t, ReasonSyncStale, evs[0].Reason)
+	assert.Equal(t, beehive.EventWarning, evs[0].Type)
+	assert.Contains(t, evs[0].Message, "Pod")
+}
+
+// Pausing sync (SyncEnabled → false) stops the running engine and records a
+// SyncStopped event — but only on the actual running→stopped transition and only
+// for a user-facing pause (not a migration prune or a restart).
+func TestCacheControllerRecordsSyncStopped(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, _, _ := newCacheTestBeehive(t, nil)
+
+	spec := eligibleClusterSpec("alpha")
+	clusterObj, err := coreClient.Create(ctx, spec)
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	// Engine running (cold catch-up).
+	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
+
+	// Pause sync → the cache re-reconciles (DependsOn the parent), stops the
+	// engine, and records SyncStopped before flipping the condition to Paused.
+	spec.SyncEnabled = false
+	_, err = coreClient.Update(ctx, clusterObj.ID, spec)
+	require.NoError(t, err)
+	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionFalse)
+	require.Equal(t, ReasonPaused, synced.Reason)
+
+	evs, err := cacheClient.ListEvents(ctx, cacheObj.ID, beehive.WithEventCategory(SyncEventCategory))
+	require.NoError(t, err)
+	require.NotEmpty(t, evs)
+	assert.Equal(t, ReasonSyncStopped, evs[0].Reason, "the newest sync event is SyncStopped")
+	assert.Equal(t, beehive.EventNormal, evs[0].Type)
 }
 
 func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {

@@ -17,8 +17,10 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,6 +80,15 @@ type engineEntry struct {
 	// parentGen is the parent Cluster's generation stamp recorded in the Synced
 	// condition's ObservedGeneration (the condition observes the parent's spec).
 	parentGen int64
+
+	// lastSyncReason is the reason of the most recent sync event actually recorded
+	// for this engine, or "" before the first (syncEvent never returns an empty
+	// reason, and each reason maps 1:1 to its EventType, so the reason alone keys
+	// the transition). recordSyncEvent records only on a transition — a change in
+	// this reason — so the engine's steady-state freshness heartbeat (a repeated
+	// Watching report) doesn't append a redundant "Watching ×N" run. Mutated only
+	// under writeMu (the sink path holds it), so no extra guard is needed.
+	lastSyncReason string
 }
 
 // cacheFilesFinalizer gates a ClusterCache's deletion on this controller deleting
@@ -317,7 +328,14 @@ func (c *ClusterCacheController) converge(
 	conds := &working.Conditions
 
 	if !syncEligible(clusterObj) || !active {
-		c.stopEngine(cacheObjID)
+		stopped := c.stopEngine(cacheObjID)
+		// Record SyncStopped only for a user-facing pause/ineligibility (sync
+		// disabled, cluster disabled, context departed) — not for a migration
+		// prune of a superseded cache (!active), which is an internal hand-over —
+		// and only on the running→stopped transition (stopped).
+		if stopped && !syncEligible(clusterObj) {
+			c.recordSyncStopped(context.Background(), cacheObjID)
+		}
 		SetCondition(conds, ClusterCondition{
 			Type: ClusterConditionSynced, Status: ConditionFalse,
 			Reason: ReasonPaused, ObservedGeneration: gen,
@@ -456,19 +474,40 @@ func (c *ClusterCacheController) restartEngineLocked(cacheID beehive.ObjectID) {
 }
 
 // stopEngine tears down a cache's engine if one is running, keyed by the
-// ClusterCache ObjectID.
-func (c *ClusterCacheController) stopEngine(cacheID beehive.ObjectID) {
+// ClusterCache ObjectID. Returns whether an engine was actually running — a
+// running→stopped transition — so a caller can record a one-shot SyncStopped
+// event without re-recording it on every reconcile of an already-stopped cache.
+func (c *ClusterCacheController) stopEngine(cacheID beehive.ObjectID) bool {
 	c.mu.Lock()
 	entry, ok := c.engines[cacheID]
 	delete(c.engines, cacheID)
 	c.mu.Unlock()
 	if !ok {
-		return
+		return false
 	}
 	stopCtx, cancel := context.WithTimeout(context.Background(), engineStopTimeout)
 	defer cancel()
 	if err := entry.handle.Stop(stopCtx); err != nil {
 		slog.Warn("clustercachecontroller: engine stop", "cluster", entry.clusterObjID, "cache", cacheID, "err", err)
+	}
+	return true
+}
+
+// recordSyncStopped records the terminal SyncStopped event when a running engine
+// is torn down because the cluster became sync-ineligible (paused/disabled/
+// departed). Recorded directly rather than through recordSyncEvent's per-entry
+// transition dedup: the caller invokes it only on an actual running→stopped
+// transition (stopEngine returned true), so it's already once-per-stop.
+// Best-effort — a write failure is logged and swallowed. Must hold writeMu.
+func (c *ClusterCacheController) recordSyncStopped(ctx context.Context, cacheID beehive.ObjectID) {
+	err := c.ctrlClient.RecordEvent(ctx, cacheID, beehive.EventSpec{
+		Category: SyncEventCategory,
+		Type:     beehive.EventNormal,
+		Reason:   ReasonSyncStopped,
+		Message:  "Sync stopped",
+	})
+	if err != nil && ctx.Err() == nil {
+		slog.Warn("clustercachecontroller: record sync stopped", "cache", cacheID, "err", err)
 	}
 }
 
@@ -531,39 +570,89 @@ func (c *ClusterCacheController) applyEngineReport(ctx context.Context, entry *e
 
 // recordSyncEvent appends one engine status report to the ClusterCache's beehive
 // event log (category SyncEventCategory) — the sync-side parallel of the core
-// controller's recordAttempt. Like recordAttempt it records every report and lets
-// beehive coalesce consecutive same-(category, type, reason) outcomes into one
-// aggregated run: a steady Watching cluster is a single run whose count/window
-// grow as the engine's freshness heartbeat re-reports it, and a genuine flap reads
-// as a compact transition timeline. Best-effort — a write failure is logged and
-// swallowed so it neither disturbs the status write nor the engine. Must hold
-// writeMu (which the sink path does).
+// controller's recordAttempt. It records only on a *transition*: a report whose
+// (type, reason) matches the last recorded one is dropped. The engine re-reports
+// its current state on a coarse (~30s) freshness heartbeat, so recording every
+// report would grow the steady-state Watching run into a meaningless "Watching
+// ×27" — the heartbeat carries no new information, only a fresh LastSyncedAt,
+// which lands on the status write instead. A genuine flap still reads as a
+// compact transition timeline. Best-effort — a write failure is logged and
+// swallowed (and does not advance the last-recorded state, so the next report
+// retries) so it neither disturbs the status write nor the engine. Must hold
+// writeMu (which the sink path does; entry's last-recorded fields are mutated
+// here under it).
 func (c *ClusterCacheController) recordSyncEvent(ctx context.Context, entry *engineEntry, st engine.EngineStatus) {
 	typ, reason, message := syncEvent(st)
+	if entry.lastSyncReason == reason {
+		return
+	}
 	err := c.ctrlClient.RecordEvent(ctx, entry.cacheObjID, beehive.EventSpec{
 		Category: SyncEventCategory,
 		Type:     typ,
 		Reason:   reason,
 		Message:  truncateMessage(message),
 	})
-	if err != nil && ctx.Err() == nil {
-		slog.Warn("clustercachecontroller: record sync event", "cache", entry.cacheObjID, "reason", reason, "err", err)
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("clustercachecontroller: record sync event", "cache", entry.cacheObjID, "reason", reason, "err", err)
+		}
+		return
 	}
+	entry.lastSyncReason = reason
 }
 
 // syncEvent maps one engine status report onto a beehive event's (type, reason,
-// message), mirroring syncedCondition's reasons: Watching → Normal/Watching,
-// Errored → Warning/SyncFailed (carrying LastError), everything else (Syncing) →
-// Normal/Syncing.
+// message) — the transition vocabulary the event log speaks (distinct from
+// syncedCondition, which names the current state). The catch-up milestone splits
+// on ColdStart: a first-ever build is InitialSyncComplete, a resume of an
+// already-populated cache is Resynced, both carrying the "…N objects across M
+// kinds in Ds" message. The in-progress Syncing state likewise splits — a cold
+// build's is SyncStarted, a resume's is the plain Syncing — and a failure is
+// SyncDegraded, carrying the engine's error.
 func syncEvent(st engine.EngineStatus) (beehive.EventType, string, string) {
 	switch st.State {
 	case engine.EngineWatching:
-		return beehive.EventNormal, ReasonWatching, ""
+		if st.ColdStart {
+			return beehive.EventNormal, ReasonInitialSyncComplete, catchUpMessage(st)
+		}
+		return beehive.EventNormal, ReasonResynced, catchUpMessage(st)
 	case engine.EngineErrored:
-		return beehive.EventWarning, ReasonSyncFailed, st.LastError
-	default:
+		return beehive.EventWarning, ReasonSyncDegraded, st.LastError
+	case engine.EngineStale:
+		return beehive.EventWarning, ReasonSyncStale, staleMessage(st)
+	default: // EngineSyncing
+		if st.ColdStart {
+			return beehive.EventNormal, ReasonSyncStarted, ""
+		}
 		return beehive.EventNormal, ReasonSyncing, ""
 	}
+}
+
+// catchUpMessage describes what a catch-up milestone produced: how many objects
+// across how many kinds, and how long it took. "Cached …" for a cold build,
+// "Re-synced …" for a resume. The duration is rounded to a tenth of a second so
+// the message stays stable and readable (e.g. "in 4.2s").
+func catchUpMessage(st engine.EngineStatus) string {
+	// A resume that carries no catch-up counts is a liveness recovery (a stale
+	// watch resuming), not a full re-sync — describe it as such rather than
+	// reporting a misleading "Re-synced 0 objects".
+	if !st.ColdStart && st.SyncedKinds == 0 && st.SyncedObjects == 0 {
+		return "Watch recovered — streaming updates again"
+	}
+	verb := "Cached"
+	if !st.ColdStart {
+		verb = "Re-synced"
+	}
+	return fmt.Sprintf("%s %d objects across %d kinds in %s",
+		verb, st.SyncedObjects, st.SyncedKinds, st.CaughtUpIn.Round(100*time.Millisecond))
+}
+
+// staleMessage names the kinds whose watch went quiet, for the SyncStale event.
+func staleMessage(st engine.EngineStatus) string {
+	if len(st.StaleKinds) == 0 {
+		return "Watch stopped delivering updates — cache may be behind"
+	}
+	return fmt.Sprintf("No watch heartbeat for %s — cache may be behind", strings.Join(st.StaleKinds, ", "))
 }
 
 // syncedCondition maps one engine status report onto the Synced condition.
@@ -574,6 +663,8 @@ func syncedCondition(st engine.EngineStatus, gen int64) ClusterCondition {
 		cond.Status, cond.Reason = ConditionTrue, ReasonWatching
 	case engine.EngineErrored:
 		cond.Status, cond.Reason, cond.Message = ConditionFalse, ReasonSyncFailed, st.LastError
+	case engine.EngineStale:
+		cond.Status, cond.Reason, cond.Message = ConditionFalse, ReasonStale, staleMessage(st)
 	default:
 		cond.Status, cond.Reason = ConditionFalse, ReasonSyncing
 	}
