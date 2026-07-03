@@ -520,11 +520,50 @@ func (c *ClusterCacheController) applyEngineReport(ctx context.Context, entry *e
 	cond := syncedCondition(st, entry.parentGen)
 	lastSyncedAt := st.LastSyncedAt
 
+	c.recordSyncEvent(ctx, entry, st)
+
 	status := ClusterCacheStatus{
 		Conditions:   []ClusterCondition{cond},
 		LastSyncedAt: lastSyncedAt,
 	}
 	return c.ctrlClient.UpdateStatus(ctx, entry.cacheObjID, entry.cacheGen, status)
+}
+
+// recordSyncEvent appends one engine status report to the ClusterCache's beehive
+// event log (category SyncEventCategory) — the sync-side parallel of the core
+// controller's recordAttempt. Like recordAttempt it records every report and lets
+// beehive coalesce consecutive same-(category, type, reason) outcomes into one
+// aggregated run: a steady Watching cluster is a single run whose count/window
+// grow as the engine's freshness heartbeat re-reports it, and a genuine flap reads
+// as a compact transition timeline. Best-effort — a write failure is logged and
+// swallowed so it neither disturbs the status write nor the engine. Must hold
+// writeMu (which the sink path does).
+func (c *ClusterCacheController) recordSyncEvent(ctx context.Context, entry *engineEntry, st engine.EngineStatus) {
+	typ, reason, message := syncEvent(st)
+	err := c.ctrlClient.RecordEvent(ctx, entry.cacheObjID, beehive.EventSpec{
+		Category: SyncEventCategory,
+		Type:     typ,
+		Reason:   reason,
+		Message:  truncateMessage(message),
+	})
+	if err != nil && ctx.Err() == nil {
+		slog.Warn("clustercachecontroller: record sync event", "cache", entry.cacheObjID, "reason", reason, "err", err)
+	}
+}
+
+// syncEvent maps one engine status report onto a beehive event's (type, reason,
+// message), mirroring syncedCondition's reasons: Watching → Normal/Watching,
+// Errored → Warning/SyncFailed (carrying LastError), everything else (Syncing) →
+// Normal/Syncing.
+func syncEvent(st engine.EngineStatus) (beehive.EventType, string, string) {
+	switch st.State {
+	case engine.EngineWatching:
+		return beehive.EventNormal, ReasonWatching, ""
+	case engine.EngineErrored:
+		return beehive.EventWarning, ReasonSyncFailed, st.LastError
+	default:
+		return beehive.EventNormal, ReasonSyncing, ""
+	}
 }
 
 // syncedCondition maps one engine status report onto the Synced condition.

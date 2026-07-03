@@ -20,7 +20,7 @@ import { mockTauriCore } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
+const { invokeMock, channels, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
@@ -32,44 +32,64 @@ const flush = () => act(async () => {});
 
 type Row = { id: string; name: string; syncEnabled?: boolean; enabled?: boolean };
 
-function pushClusters(rows: Row[]) {
-  liveChannel().onmessage!(
-    JSON.stringify({
-      type: 'next',
-      payload: {
-        data: {
-          clustersWatch: rows.map((r) => ({
-            id: r.id,
-            spec: {
-              name: r.name,
-              syncEnabled: r.syncEnabled ?? true,
-              enabled: r.enabled ?? true,
-              source: { kubeconfig: { context: r.name } },
-            },
-            status: {
-              source: {
-                kubeconfig: {
-                  cluster: `${r.name}-cluster`,
-                  user: `${r.name}-user`,
-                  isPresent: true,
-                  isDefault: false,
-                },
-              },
-              server: { uid: `uid-${r.id}` },
-              conditions: [],
-            },
-            activeCache: {
-              id: `cache-${r.id}`,
-              serverUid: `uid-${r.id}`,
-              enabled: true,
-              status: { conditions: [], lastSyncedAt: null },
-              stats: { exists: false, bytes: 0 },
-            },
-          })),
-        },
+// The provider opens two subscriptions (clustersWatch + clusterCachesWatch), so
+// target the channel by query rather than liveChannel().
+function channelFor(queryPart: string) {
+  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
+  const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
+  if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
+  return channels[idx];
+}
+
+function clusterOf(r: Row) {
+  return {
+    id: r.id,
+    spec: {
+      name: r.name,
+      syncEnabled: r.syncEnabled ?? true,
+      enabled: r.enabled ?? true,
+      source: { kubeconfig: { context: r.name } },
+    },
+    status: {
+      source: {
+        kubeconfig: { cluster: `${r.name}-cluster`, user: `${r.name}-user`, isPresent: true, isDefault: false },
       },
-    }),
+      server: { uid: `uid-${r.id}` },
+      lastConnectedAt: null,
+      conditions: [],
+    },
+  };
+}
+
+// Push one Cluster change on the clustersWatch delta stream.
+function pushClusterChange(type: 'Added' | 'Modified' | 'Deleted', cluster: object) {
+  channelFor('clustersWatch').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clustersWatch: { type, cluster } } } }),
   );
+}
+
+// Push one ClusterCache change on the clusterCachesWatch delta stream.
+function pushCacheChange(type: 'Added' | 'Modified' | 'Deleted', cache: object) {
+  channelFor('clusterCachesWatch').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clusterCachesWatch: { type, cache } } } }),
+  );
+}
+
+// Convenience: seed each row as an Added cluster change (the snapshot).
+function pushClusters(rows: Row[]) {
+  rows.forEach((r) => pushClusterChange('Added', clusterOf(r)));
+}
+
+// A cache mirroring a row's active identity (serverUid matches the cluster's uid),
+// so the provider joins it as that cluster's activeCache.
+function cacheOf(r: Row) {
+  return {
+    id: `cache-${r.id}`,
+    clusterID: r.id,
+    serverUid: `uid-${r.id}`,
+    status: { conditions: [], lastSyncedAt: null },
+    stats: { exists: false, bytes: 0 },
+  };
 }
 
 // A probe that renders the hook's value so tests can assert on it.
@@ -78,12 +98,20 @@ function Probe() {
   return <div data-testid="probe">{clusters === null ? 'null' : JSON.stringify(clusters.map((c) => c.spec.name))}</div>;
 }
 
-function renderProvider() {
+// A probe that also reveals each cluster's joined activeCache (id or '-').
+function JoinProbe() {
+  const { clusters } = useClusters();
+  return (
+    <div data-testid="probe">
+      {clusters === null ? 'null' : JSON.stringify(clusters.map((c) => `${c.spec.name}:${c.activeCache?.id ?? '-'}`))}
+    </div>
+  );
+}
+
+function renderProvider(probe: React.ReactNode = <Probe />) {
   return render(
     <UrqlProvider value={createGraphqlClient()}>
-      <ClustersProvider>
-        <Probe />
-      </ClustersProvider>
+      <ClustersProvider>{probe}</ClustersProvider>
     </UrqlProvider>,
   );
 }
@@ -143,16 +171,20 @@ describe('useClusters', () => {
     expect(screen.getByTestId('probe')).toHaveTextContent('null');
   });
 
-  it('subscribes to clustersWatch', async () => {
+  it('subscribes to both the cluster and cache delta watches', async () => {
     renderProvider();
     await flush();
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_subscribe',
       expect.objectContaining({ query: expect.stringContaining('clustersWatch') }),
     );
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_subscribe',
+      expect.objectContaining({ query: expect.stringContaining('clusterCachesWatch') }),
+    );
   });
 
-  it('reflects the pushed cluster list', async () => {
+  it('accumulates Added changes into the cluster list', async () => {
     renderProvider();
     await flush();
 
@@ -163,5 +195,40 @@ describe('useClusters', () => {
       ]);
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us","staging"]');
+  });
+
+  it('removes a cluster on a Deleted change', async () => {
+    renderProvider();
+    await flush();
+
+    await act(async () => {
+      pushClusters([
+        { id: 'u-a', name: 'prod-us' },
+        { id: 'u-b', name: 'staging' },
+      ]);
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us","staging"]');
+
+    await act(async () => {
+      pushClusterChange('Deleted', clusterOf({ id: 'u-a', name: 'prod-us' }));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["staging"]');
+  });
+
+  it('joins a cache onto its cluster by matching serverUid', async () => {
+    renderProvider(<JoinProbe />);
+    await flush();
+
+    // Cluster arrives first, with no cache yet.
+    await act(async () => {
+      pushClusters([{ id: 'u-a', name: 'prod-us' }]);
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:-"]');
+
+    // Its cache lands on the other stream and is joined as the active cache.
+    await act(async () => {
+      pushCacheChange('Added', cacheOf({ id: 'u-a', name: 'prod-us' }));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:cache-u-a"]');
   });
 });

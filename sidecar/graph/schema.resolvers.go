@@ -102,6 +102,28 @@ func (r *queryResolver) Clusters(ctx context.Context) ([]*cluster.Cluster, error
 	return r.ClusterSvc.List(ctx)
 }
 
+// ClusterEvents is the resolver for the clusterEvents field — a cluster's event
+// timeline, kind-scoped to the Cluster client in the service. gqlgen wants a
+// pointer slice, so the value results are adapted.
+func (r *queryResolver) ClusterEvents(ctx context.Context, id cluster.ObjectID, category *string, limit *int) ([]*cluster.Event, error) {
+	evs, err := r.ClusterSvc.ClusterEvents(ctx, id, category, limit)
+	if err != nil {
+		return nil, err
+	}
+	return ptrSlice(evs), nil
+}
+
+// ClusterCacheEvents is the resolver for the clusterCacheEvents field — a
+// ClusterCache's event timeline, kind-scoped to the ClusterCache client in the
+// service. gqlgen wants a pointer slice, so the value results are adapted.
+func (r *queryResolver) ClusterCacheEvents(ctx context.Context, id cluster.ObjectID, category *string, limit *int) ([]*cluster.Event, error) {
+	evs, err := r.ClusterSvc.ClusterCacheEvents(ctx, id, category, limit)
+	if err != nil {
+		return nil, err
+	}
+	return ptrSlice(evs), nil
+}
+
 // AuthState is the resolver for the authState field. auth.State is bound
 // directly to the GraphQL AuthState type (see gqlgen.yml) — only the schema
 // fields are exposed, so State.Tokens never reaches the wire.
@@ -113,11 +135,61 @@ func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
 	return &state, nil
 }
 
-// ClustersWatch is the resolver for the clustersWatch field. Emits the current
-// cluster list on subscribe, then re-emits on every Cluster or ClusterCache
-// change (so sync-status updates propagate to the webview).
-func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan []*cluster.Cluster, error) {
-	return r.ClusterSvc.Watch(ctx)
+// ClustersWatch is the resolver for the clustersWatch field — the cluster list as a
+// delta watch (Added snapshot, then per-cluster Added/Modified/Deleted). Cache sync
+// status rides clusterCachesWatch, joined client-side. The service streams value
+// changes; gqlgen wants pointers, so each is adapted through mapStream.
+func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *cluster.ClusterChange, error) {
+	ch, err := r.ClusterSvc.Watch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterChange) *cluster.ClusterChange { return &c }), nil
+}
+
+// ClusterCachesWatch is the resolver for the clusterCachesWatch field — cache records
+// as a delta watch parallel to clustersWatch, joined to clusters client-side by
+// clusterID. gqlgen wants pointers, so each is adapted through mapStream.
+func (r *subscriptionResolver) ClusterCachesWatch(ctx context.Context) (<-chan *cluster.ClusterCacheChange, error) {
+	ch, err := r.ClusterSvc.WatchCaches(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterCacheChange) *cluster.ClusterCacheChange { return &c }), nil
+}
+
+// ClusterEventsWatch is the resolver for the clusterEventsWatch field — the live
+// event tail for one cluster, decoupled from clustersWatch. The service streams
+// bare runs; gqlgen wants pointers, so each is adapted through mapStream.
+func (r *subscriptionResolver) ClusterEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error) {
+	ch, err := r.ClusterSvc.ClusterEventsWatch(ctx, id, category)
+	if err != nil {
+		return nil, err
+	}
+	return mapStream(ctx, ch, func() {}, func(e cluster.Event) *cluster.Event { return &e }), nil
+}
+
+// ClusterCacheEventsWatch is the resolver for the clusterCacheEventsWatch field —
+// the live event tail for one ClusterCache, decoupled from clusterCachesWatch. The
+// service streams bare runs; gqlgen wants pointers, so each is adapted through
+// mapStream.
+func (r *subscriptionResolver) ClusterCacheEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error) {
+	ch, err := r.ClusterSvc.ClusterCacheEventsWatch(ctx, id, category)
+	if err != nil {
+		return nil, err
+	}
+	return mapStream(ctx, ch, func() {}, func(e cluster.Event) *cluster.Event { return &e }), nil
+}
+
+// ClusterScheduleWatch is the resolver for the clusterScheduleWatch field — the
+// live reconcile-schedule gauge for one cluster (next-attempt countdown),
+// decoupled from clustersWatch. gqlgen wants pointers, so each is adapted.
+func (r *subscriptionResolver) ClusterScheduleWatch(ctx context.Context, id cluster.ObjectID) (<-chan *cluster.Schedule, error) {
+	ch, err := r.ClusterSvc.ClusterScheduleWatch(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return mapStream(ctx, ch, func() {}, func(s cluster.Schedule) *cluster.Schedule { return &s }), nil
 }
 
 // ChatStream is the resolver for the chatStream field.

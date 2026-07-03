@@ -29,6 +29,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/amorey/beehive"
+	"github.com/amorey/gochan/broadcast"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/engine"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
@@ -135,9 +136,34 @@ type ClusterCoreController struct {
 	// app's handful of clusters the serialized probing is acceptable.
 	writeMu sync.Mutex
 
+	// probeMu guards the in-flight probe set and serializes hub publishes with the
+	// current-value read a new subscriber does (WatchProbe), so a subscriber can
+	// never miss a transition nor double-count one straddling its subscribe. probing
+	// holds the ids whose network probe is currently running (converge, between the
+	// eligibility gate and the probe/health round-trips returning); probeHub fans
+	// each start/stop transition out. This surfaces the in-flight window the
+	// controller already knows about (it holds writeMu across the probe) so the
+	// webview can show a definite "checking now" — see WatchProbe / Schedule.Probing.
+	probeMu  sync.Mutex
+	probing  map[ClusterID]bool
+	probeHub *broadcast.Hub[probeUpdate]
+	probeTx  *broadcast.Sender[probeUpdate]
+
 	probe ProbeFunc
 	check CheckFunc
 }
+
+// probeUpdate is one in-flight-probe transition fanned out over probeHub: Active
+// true when a cluster's network probe starts, false when it returns.
+type probeUpdate struct {
+	ID     ClusterID
+	Active bool
+}
+
+// probeHubCapacity bounds the probe-transition fan-out buffer. Probes serialize
+// on writeMu (one in flight at a time) and are seconds apart, so a small buffer
+// is ample.
+const probeHubCapacity = 16
 
 // retryBufferSize bounds the targeted-retry bus. A full buffer means a retry is
 // already queued, so further Reprobe calls are dropped (non-blocking).
@@ -166,6 +192,7 @@ func NewClusterCoreController(
 	if check == nil {
 		check = checkServerHealth
 	}
+	probeHub := broadcast.New[probeUpdate](probeHubCapacity)
 	return &ClusterCoreController{
 		cfgSource:     cfgSource,
 		coreClient:    coreClient,
@@ -177,7 +204,70 @@ func NewClusterCoreController(
 		check:         check,
 		sentinelWatch: watchKubeSystem,
 		sentinels:     make(map[ClusterID]*connSentinel),
+		probing:       make(map[ClusterID]bool),
+		probeHub:      probeHub,
+		probeTx:       probeHub.Sender(),
 	}
+}
+
+// setProbing records (and fans out) whether id's network probe is in flight.
+// The map + publish are done under probeMu so a concurrent WatchProbe subscribe —
+// which reads the current value and registers under the same lock — observes a
+// consistent snapshot with no missed or duplicated transition. tx.Send never
+// blocks, so holding the lock across it is safe.
+func (c *ClusterCoreController) setProbing(id ClusterID, active bool) {
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	if active {
+		c.probing[id] = true
+	} else {
+		delete(c.probing, id)
+	}
+	_ = c.probeTx.Send(probeUpdate{ID: id, Active: active})
+}
+
+// WatchProbe streams whether id's connection probe is currently in flight:
+// current-on-subscribe (so a subscriber opening mid-probe sees true), then one
+// value per transition. The returned channel closes when ctx ends. The current
+// read and the hub subscribe happen under probeMu (the same lock setProbing
+// publishes under), so no transition is lost in the gap between them. Backs the
+// Probing field merged into ClusterScheduleWatch.
+func (c *ClusterCoreController) WatchProbe(ctx context.Context, id ClusterID) <-chan bool {
+	c.probeMu.Lock()
+	cur := c.probing[id]
+	rx := c.probeHub.Receiver()
+	c.probeMu.Unlock()
+
+	out := make(chan bool, 1)
+	go func() {
+		defer close(out)
+		defer rx.Close()
+		// Current-on-subscribe.
+		select {
+		case out <- cur:
+		case <-ctx.Done():
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case u, ok := <-rx.Chan():
+				if !ok {
+					return
+				}
+				if u.ID != id {
+					continue
+				}
+				select {
+				case out <- u.Active:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out
 }
 
 // maxAttemptMessageLen caps a recorded event message's length.
@@ -452,9 +542,15 @@ func (c *ClusterCoreController) converge(ctx context.Context, client beehive.Con
 		return 0, nil
 	}
 
-	// Eligible: we're about to try to connect. now stamps LastConnectedAt on
-	// success; each probe outcome is recorded into the event log separately
-	// (beehive stamps the event's own window).
+	// Eligible: we're about to run the network probe. Mark it in flight so the
+	// webview shows a definite "checking now" for the round-trip's duration (the
+	// resolve/probe/health calls below can take seconds). The defer clears it the
+	// moment converge returns — success, failure, or resolve error alike.
+	c.setProbing(clusterID, true)
+	defer c.setProbing(clusterID, false)
+
+	// now stamps LastConnectedAt on success; each probe outcome is recorded into
+	// the event log separately (beehive stamps the event's own window).
 	now := time.Now().UTC()
 
 	contextName := obj.Spec.Source.Kubeconfig.Context

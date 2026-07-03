@@ -14,60 +14,79 @@
 
 // The app's cluster registry surfaced to the renderer. The sidecar publishes
 // every known cluster — those in the current kubeconfig plus any orphaned
-// records — on the `clustersWatch` subscription (currently the full snapshot
-// once on subscribe; live re-emits on registry changes come later). Each row
-// is Kubernetes-shaped: `spec` carries the user-owned fields (name, flags,
-// kube-context) and `status` the observed state (kubeconfig presence, probed
-// server facts, status conditions, and the live cache object) — display
-// state derives from the status fields client-side. This provider adapts
-// that stream into context.
+// records — and their caches as two independent Kubernetes-style delta watches:
+// `clustersWatch` (Cluster kind) and `clusterCachesWatch` (ClusterCache kind),
+// each replaying the current set as `Added` changes on subscribe, then streaming
+// `Added`/`Modified`/`Deleted` per object. This provider reduces each stream into
+// a map keyed by object id, then **joins** the caches onto the clusters
+// client-side (a cluster's active cache is the one whose `serverUid` matches its
+// last-probed `status.server.uid`) — so consumers still see a Kubernetes-shaped
+// `Cluster` with `spec`/`status`/`activeCache`, exactly as before the split.
 import { createContext, useContext, useMemo } from 'react';
 import { useSubscription } from 'urql';
 
 import { graphql } from '@/gql';
-import type { ClustersWatchSubscription } from '@/gql/graphql';
+import type { ClustersWatchSubscription, ClusterCachesWatchSubscription } from '@/gql/graphql';
 
-export type Cluster = ClustersWatchSubscription['clustersWatch'][number];
+// One object on each delta stream (the `cluster` / `cache` payload of a change).
+type ClusterRow = ClustersWatchSubscription['clustersWatch']['cluster'];
+type CacheRow = ClusterCachesWatchSubscription['clusterCachesWatch']['cache'];
+
+// A cluster joined with its active cache — the cache mirroring the cluster's
+// currently-connected identity (its `serverUid` matches `status.server.uid`), or
+// null when the cluster has no active cache yet (never probed, or mid-migration).
+export type Cluster = ClusterRow & { activeCache: CacheRow | null };
 
 const ClustersWatchSubscription = graphql(`
   subscription ClustersWatch {
     clustersWatch {
-      id
-      spec {
-        name
-        syncEnabled
-        enabled
-        source {
-          kubeconfig {
-            context
-          }
-        }
-      }
-      status {
-        source {
-          kubeconfig {
-            cluster
-            user
-            isPresent
-            isDefault
-          }
-        }
-        server {
-          uid
-        }
-        lastConnectedAt
-        conditions {
-          type
-          status
-          reason
-          message
-          lastTransitionTime
-        }
-      }
-      activeCache {
+      type
+      cluster {
         id
+        spec {
+          name
+          syncEnabled
+          enabled
+          source {
+            kubeconfig {
+              context
+            }
+          }
+        }
+        status {
+          source {
+            kubeconfig {
+              cluster
+              user
+              isPresent
+              isDefault
+            }
+          }
+          server {
+            uid
+          }
+          lastConnectedAt
+          conditions {
+            type
+            status
+            reason
+            message
+            lastTransitionTime
+          }
+        }
+      }
+    }
+  }
+`);
+
+const ClusterCachesWatchSubscription = graphql(`
+  subscription ClusterCachesWatch {
+    clusterCachesWatch {
+      type
+      cache {
+        id
+        clusterID
         serverUid
-        enabled
         status {
           conditions {
             type
@@ -81,15 +100,6 @@ const ClustersWatchSubscription = graphql(`
           bytes
         }
       }
-      nextAttemptAt
-      connectionAttempts {
-        ok
-        reason
-        message
-        count
-        firstAt
-        lastAt
-      }
     }
   }
 `);
@@ -101,9 +111,49 @@ type ClustersContextValue = {
 
 const ClustersContext = createContext<ClustersContextValue | null>(null);
 
+// A map keyed by object id, accumulated from a delta stream.
+type Keyed<T> = ReadonlyMap<string, T>;
+
+// Apply one delta-watch change to a keyed map, returning a NEW map (fresh
+// identity so React re-renders): Added/Modified upsert by id, Deleted removes.
+function applyChange<T>(prev: Keyed<T> | undefined, type: string, id: string, entity: T): Keyed<T> {
+  const next = new Map(prev);
+  if (type === 'Deleted') next.delete(id);
+  else next.set(id, entity);
+  return next;
+}
+
 export function ClustersProvider({ children }: { children: React.ReactNode }) {
-  const [{ data }] = useSubscription({ query: ClustersWatchSubscription });
-  const clusters = data?.clustersWatch ?? null;
+  // Each stream is reduced into its own id-keyed map via urql's accumulator: the
+  // `Added` snapshot builds the map, later deltas patch it.
+  const [{ data: clusterMap }] = useSubscription(
+    { query: ClustersWatchSubscription },
+    (prev: Keyed<ClusterRow> | undefined, data): Keyed<ClusterRow> => {
+      const { type, cluster } = data.clustersWatch;
+      return applyChange(prev, type, cluster.id, cluster);
+    },
+  );
+  const [{ data: cacheMap }] = useSubscription(
+    { query: ClusterCachesWatchSubscription },
+    (prev: Keyed<CacheRow> | undefined, data): Keyed<CacheRow> => {
+      const { type, cache } = data.clusterCachesWatch;
+      return applyChange(prev, type, cache.id, cache);
+    },
+  );
+
+  // Join: attach each cluster's active cache. The two streams carry no mutual
+  // ordering guarantee, so a cluster can briefly have no matching cache (renders
+  // as no active cache) — resolved once the cache frame lands. null (no cluster
+  // frame yet) is distinct from [] (no clusters).
+  const clusters = useMemo<Cluster[] | null>(() => {
+    if (!clusterMap) return null;
+    const caches = cacheMap ? [...cacheMap.values()] : [];
+    return [...clusterMap.values()].map((c) => ({
+      ...c,
+      activeCache: caches.find((cache) => cache.clusterID === c.id && cache.serverUid === c.status.server.uid) ?? null,
+    }));
+  }, [clusterMap, cacheMap]);
+
   // Mirror SyncStatusProvider: no `error` branch (subscribe-exchange reconnects
   // transport drops internally), and a memo keeps the context value stable
   // between non-push re-renders.

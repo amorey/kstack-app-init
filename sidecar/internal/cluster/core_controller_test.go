@@ -605,6 +605,55 @@ func TestClusterCoreControllerReprobeOne(t *testing.T) {
 	awaitProbe(t, probeCh)
 }
 
+// WatchProbe streams the in-flight probe state per cluster: current-on-subscribe
+// (a mid-probe subscriber sees true), then one value per transition, filtered to
+// the subscribed id. This exercises the hub directly (setProbing is what converge
+// calls around the network probe), so no beehive/network is needed.
+func TestClusterCoreControllerWatchProbe(t *testing.T) {
+	var coreClient beehive.Client[ClusterSpec, ClusterStatus]
+	var cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	ctrl := NewClusterCoreController(nil, coreClient, cacheClient, nil, nil, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const a, b = ClusterID(1), ClusterID(2)
+
+	// Current-on-subscribe: no probe in flight → false.
+	sub := ctrl.WatchProbe(ctx, a)
+	assert.False(t, recv(t, sub), "idle cluster starts not-probing")
+
+	// A probe on a starts → true; finishes → false.
+	ctrl.setProbing(a, true)
+	assert.True(t, recv(t, sub))
+	ctrl.setProbing(a, false)
+	assert.False(t, recv(t, sub))
+
+	// Transitions for a different cluster are filtered out — a is idle, so its
+	// stream must stay silent while b probes.
+	ctrl.setProbing(b, true)
+	select {
+	case v := <-sub:
+		t.Fatalf("cluster a's stream saw cluster b's transition: %v", v)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// A subscriber opening while b is mid-probe sees true immediately.
+	subB := ctrl.WatchProbe(ctx, b)
+	assert.True(t, recv(t, subB), "mid-probe subscriber sees checking now")
+
+	// ctx cancel closes the stream.
+	cancel()
+	assert.Eventually(t, func() bool {
+		select {
+		case _, ok := <-subB:
+			return !ok
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond, "stream closes on ctx cancel")
+}
+
 // The controller observes the kubeconfig live and writes it to status.Source (the
 // importer no longer parks it in spec). Its watcher subscription re-reconciles on
 // a kubeconfig change, so a departed context flips IsPresent=false — keeping its

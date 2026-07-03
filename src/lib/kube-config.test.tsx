@@ -20,7 +20,7 @@ import { mockTauriCore } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
+const { invokeMock, channels, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
@@ -39,44 +39,54 @@ type Row = {
   isDefault?: boolean;
 };
 
+// kube-config only reads spec/status, so this pushes cluster Added deltas on the
+// clustersWatch stream and ignores the parallel cache stream entirely. The provider
+// opens two subscriptions, so target the channel by query rather than liveChannel().
+function channelFor(queryPart: string) {
+  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
+  const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
+  if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
+  return channels[idx];
+}
+
 function pushClusters(rows: Row[]) {
-  liveChannel().onmessage!(
-    JSON.stringify({
-      type: 'next',
-      payload: {
-        data: {
-          clustersWatch: rows.map((r) => ({
-            id: r.id,
-            spec: {
-              name: r.name,
-              syncEnabled: true,
-              enabled: r.enabled ?? true,
-              source: { kubeconfig: { context: r.name } },
-            },
-            status: {
-              source: {
-                kubeconfig: {
-                  cluster: `${r.name}-cluster`,
-                  user: `${r.name}-user`,
-                  isPresent: r.present ?? true,
-                  isDefault: r.isDefault ?? false,
+  const ch = channelFor('clustersWatch');
+  rows.forEach((r) => {
+    ch.onmessage!(
+      JSON.stringify({
+        type: 'next',
+        payload: {
+          data: {
+            clustersWatch: {
+              type: 'Added',
+              cluster: {
+                id: r.id,
+                spec: {
+                  name: r.name,
+                  syncEnabled: true,
+                  enabled: r.enabled ?? true,
+                  source: { kubeconfig: { context: r.name } },
+                },
+                status: {
+                  source: {
+                    kubeconfig: {
+                      cluster: `${r.name}-cluster`,
+                      user: `${r.name}-user`,
+                      isPresent: r.present ?? true,
+                      isDefault: r.isDefault ?? false,
+                    },
+                  },
+                  server: { uid: `uid-${r.id}` },
+                  lastConnectedAt: null,
+                  conditions: [],
                 },
               },
-              server: { uid: `uid-${r.id}` },
-              conditions: [],
             },
-            activeCache: {
-              id: `cache-${r.id}`,
-              serverUid: `uid-${r.id}`,
-              enabled: true,
-              status: { conditions: [], lastSyncedAt: null },
-              stats: { exists: false, bytes: 0 },
-            },
-          })),
+          },
         },
-      },
-    }),
-  );
+      }),
+    );
+  });
 }
 
 // A probe that renders the derived kubeconfig so tests can assert on it.

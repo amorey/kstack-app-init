@@ -61,11 +61,38 @@ models:
   ClusterCondition:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCondition
 
-  ClusterConnectionAttempt:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterConnectionAttempt
+  # The generic event surface. Event binds 1:1 to the domain type; its run id
+  # rides the shared ObjectID scalar (no dedicated Event id scalar), and EventType
+  # binds straight to beehive.EventType (values Normal/Warning match), the same
+  # external-enum pattern as ConditionStatus.
+  Event:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.Event
+
+  EventType:
+    model: github.com/amorey/beehive.EventType
+
+  # The generic reconcile-schedule gauge (next-requeue countdown), decoupled from
+  # the cluster/list watch. Binds 1:1 to the domain type.
+  Schedule:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.Schedule
 
   ConditionStatus:
     model: github.com/amorey/beehive.ConditionStatus
+
+  # The delta watches (clustersWatch / clusterCachesWatch). ChangeType binds to the
+  # domain cluster.ChangeType (values Added/Modified/Deleted match the enum), the same
+  # external-enum pattern as EventType/ConditionStatus — a defined type mirroring
+  # beehive's, not beehive.ChangeType itself (that is an alias into an internal package
+  # gqlgen can't import). The two change wrappers bind 1:1 to the domain types the watch
+  # pumps emit.
+  ChangeType:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ChangeType
+
+  ClusterChange:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterChange
+
+  ClusterCacheChange:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheChange
 
   ClusterCache:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCache

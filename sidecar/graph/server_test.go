@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -106,7 +108,7 @@ func TestGracefulShutdownEndsSSEStream(t *testing.T) {
 
 	resp := openSSESubscription(t, ts.URL, "", "subscription { authStateWatch { authenticated } }")
 	defer resp.Body.Close() // belt-and-suspenders; shutdown ends the stream
-	events := sseEvents(resp)
+	events := sseEvents(t, resp)
 
 	// Wait for the first frame so we know the subscription is established.
 	if ev := nextSSE(t, events); ev.event != "next" {
@@ -178,8 +180,11 @@ func openSSESubscription(t *testing.T, srvURL, token, query string) *http.Respon
 
 // sseEvents parses resp.Body into a stream of events, skipping comment-only
 // frames (gqlgen's leading `:` and its keep-alive `: ping` lines). The channel
-// closes when the body ends.
-func sseEvents(resp *http.Response) <-chan sseEvent {
+// closes when the body ends. A scan error (as opposed to a clean EOF) is
+// reported via t.Errorf — goroutine-safe, unlike t.Fatal — so a truncated
+// stream surfaces as a real failure rather than a mysterious early close.
+func sseEvents(t *testing.T, resp *http.Response) <-chan sseEvent {
+	t.Helper()
 	ch := make(chan sseEvent)
 	go func() {
 		defer close(ch)
@@ -199,6 +204,12 @@ func sseEvents(resp *http.Response) <-chan sseEvent {
 				ev.data = strings.TrimSpace(line[len("data:"):])
 				// `:` comment / keep-alive lines fall through and are ignored.
 			}
+		}
+		// net.ErrClosed is the expected teardown: a caller's deferred
+		// resp.Body.Close() (cancelling the subscription) races this
+		// mid-read. Only a genuine scan failure is worth a test error.
+		if err := sc.Err(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("SSE scan: %v", err)
 		}
 	}()
 	return ch

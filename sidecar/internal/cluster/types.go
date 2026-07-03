@@ -403,35 +403,73 @@ type ClusterStatus struct {
 	Conditions []ClusterCondition `json:"conditions"`
 }
 
-// Connection-probe outcomes are no longer stored on ClusterStatus: the
+// Connection-probe outcomes are not stored on ClusterStatus: the
 // ClusterCoreController records them into beehive's event log (category
-// ConnectionEventCategory) via RecordEvent, and the service reads them back
-// read-side into Cluster.ConnectionAttempts (see buildCluster). This keeps
-// per-probe chatter off the status watch — a repeated identical failure no
-// longer rewrites status — while beehive aggregates consecutive same-outcome
-// probes into runs and bounds retention (WithEventRetention).
+// ConnectionEventCategory) via RecordEvent, exposed generically through the
+// cluster events surface (clusterEvents / clusterEventsWatch, category
+// "connection"). This keeps per-probe chatter off the status watch — a repeated
+// identical failure no longer rewrites status — while beehive aggregates
+// consecutive same-outcome probes into runs and bounds retention
+// (WithEventRetention).
 const (
 	// ConnectionEventCategory is the beehive event category the connection
 	// controller records probe outcomes under (its own object timeline).
 	ConnectionEventCategory = "connection"
-	// maxConnectionAttempts bounds both the retention ring (per cluster) and the
-	// read-side list limit for the connection event timeline.
+	// SyncEventCategory is the beehive event category the cache controller records
+	// engine-state transitions under, on the ClusterCache object's own timeline —
+	// the sync-side parallel of ConnectionEventCategory, exposed generically through
+	// the events surface (clusterCacheEvents / clusterCacheEventsWatch, category
+	// "sync").
+	SyncEventCategory = "sync"
+	// maxConnectionAttempts bounds the per-cluster connection-event retention ring.
 	maxConnectionAttempts = 20
 )
 
-// ClusterConnectionAttempt is one aggregated run of consecutive connection
-// probes that shared an outcome (Reason), read from beehive's event log. OK
-// marks a successful run (event type Normal); Reason is the machine code
-// (Connected / ProbeFailed / ResolveFailed) and Message the latest occurrence's
-// underlying error (truncated), empty on success. Count is the number of probes
-// coalesced into the run; [FirstAt, LastAt] is the run's window.
-type ClusterConnectionAttempt struct {
-	OK      bool      `json:"ok"`
-	Reason  string    `json:"reason"`
-	Message string    `json:"message"`
-	Count   int       `json:"count"`
-	FirstAt time.Time `json:"firstAt"`
-	LastAt  time.Time `json:"lastAt"`
+// defaultEventLimit bounds an events read (or watch snapshot) when the caller
+// gives no explicit limit.
+const defaultEventLimit = 50
+
+// Schedule is the generic domain projection of a beehive object's reconcile
+// schedule (a gauge, mapped from beehive.Schedule): when the control plane has
+// queued the object's next reconcile. It is kind-agnostic like Event — the
+// getter/watcher entrypoints are kind-scoped (ClusterScheduleWatch), but the
+// value shape is not. A struct rather than a bare time so it can grow (mirroring
+// beehive.Schedule's own extensibility). Served live via the schedule watch — a
+// scheduling change fires no object WatchList, so this is the only way to observe
+// the countdown move for an otherwise-idle object.
+type Schedule struct {
+	// NextRequeueAt is the scheduled time of the object's next reconcile (for a
+	// disconnected cluster, its next backoff retry), or nil when nothing is scheduled.
+	NextRequeueAt *time.Time `json:"nextRequeueAt"`
+	// Probing reports whether a reconcile is *actively running its network probe*
+	// right now (the controller is between "eligible, about to connect" and the
+	// probe/health round-trips returning). Unlike NextRequeueAt — which the
+	// scheduler drives — this is asserted by the ClusterCoreController itself, so
+	// the webview can show a definite "checking now" state during the in-flight
+	// window rather than inferring it from the (ambiguous) absence of a next-attempt
+	// time. It is merged into this gauge (not the list watch) because a probe
+	// starting/ending fires no object WatchList.
+	Probing bool `json:"probing"`
+}
+
+// Event is the generic domain projection of one coalesced run from a beehive
+// object's event timeline, served under every kind's events surface. It drops
+// beehive.Event's ObjectID (the addressed object is the surface's subject) and
+// Detail (no JSON scalar yet). ID is the run's identity, carried on the shared
+// ObjectID scalar (an opaque int64) — a client's upsert key on a watch, since a
+// reason can repeat across a change-and-back while the run id does not. Type
+// binds straight to beehive.EventType (Normal/Warning). A repeated same-outcome
+// occurrence bumps Count rather than adding a run; [FirstAt, LastAt] is the run's
+// window.
+type Event struct {
+	ID       ObjectID          `json:"id"`
+	Category string            `json:"category"`
+	Type     beehive.EventType `json:"type"`
+	Reason   string            `json:"reason"`
+	Message  string            `json:"message"`
+	Count    int               `json:"count"`
+	FirstAt  time.Time         `json:"firstAt"`
+	LastAt   time.Time         `json:"lastAt"`
 }
 
 // --- ClusterCache kind types ---
@@ -466,49 +504,72 @@ type ClusterCacheStatus struct {
 
 // --- Domain types exposed to resolvers ---
 
-// ClusterCache is the domain view of one of a cluster's owned ClusterCache
-// children, mirroring the beehive owner chain. ID is the cache's own ObjectID and
-// ClusterID its parent's — together they locate the on-disk cache (the live-stats
-// resolver builds a store.CacheRef from the pair). ServerUID is the kube-system UID
-// this cache mirrors, and Enabled marks it as the parent's currently-live identity
-// (ServerUID == the cluster's last-probed Server.UID) — the one cache a sync engine
-// runs for; other (migrated-away) caches linger read-only until cleared.
+// ClusterCache is the domain view of one ClusterCache beehive object, streamed
+// standalone via WatchCaches and joined to its parent client-side. ID is the cache's
+// own ObjectID and ClusterID its parent's (the beehive owner) — together they locate
+// the on-disk cache (the live-stats resolver builds a store.CacheRef from the pair)
+// and let the client join the cache onto its cluster. ServerUID is the kube-system
+// UID this cache mirrors; the client treats the cache whose ServerUID matches the
+// cluster's last-probed Server.UID as the active one. Active-ness is deliberately
+// *not* a field: it depends on the parent's status, which changes with no cache
+// event, so it can't be kept fresh on a per-cache stream — only the client's live
+// join is correct.
 type ClusterCache struct {
 	ID        ClusterCacheID
 	ClusterID ClusterID
 	ServerUID string
-	Enabled   bool
 	Status    ClusterCacheStatus
 }
 
 // Cluster is the domain record for one tracked cluster connection (one
-// kube-context): the restart-surviving facts about it. Assembled by the service
-// layer from the Cluster + ClusterCache beehive objects. Status binds directly to
-// the stored Cluster-kind status. A cluster owns zero or more ClusterCache records
-// — none until its first successful probe, and more than one across a physical
-// migration; Caches lists them all and ActiveCache points at the live one (the
-// element with Enabled==true), or is nil when the cluster has no active cache yet.
+// kube-context): the restart-surviving facts about it. Built from a single Cluster
+// beehive object. Status binds directly to the stored Cluster-kind status. A
+// cluster's owned ClusterCache records are *not* joined in here — they stream
+// standalone via WatchCaches and are joined client-side, so cache churn never
+// re-emits a cluster.
 type Cluster struct {
 	ID                  ClusterID
 	Generation          int64
 	CreatedAt           time.Time
 	DeletionRequestedAt *time.Time // beehive's soft-delete tombstone, surfaced as-is
 
-	Spec        ClusterSpec
-	Status      ClusterStatus
-	Caches      []ClusterCache
-	ActiveCache *ClusterCache
-	// ConnectionAttempts is the recent connection-probe history (newest run
-	// first), read read-side from beehive's event log rather than stored on
-	// Status — a derived field, like NextAttemptAt. Each element is one
-	// aggregated run of consecutive same-outcome probes. Bounded to the most
-	// recent maxConnectionAttempts runs.
-	ConnectionAttempts []ClusterConnectionAttempt
-	// NextAttemptAt is the scheduled time of the cluster's next reconcile (for a
-	// disconnected cluster, its next backoff retry), derived read-side from
-	// beehive's queue — not persisted in Status. Nil when nothing is scheduled.
-	// Out-of-band triggers (poke / manual retry) may attempt sooner.
-	NextAttemptAt *time.Time
+	Spec   ClusterSpec
+	Status ClusterStatus
+	// The cluster's next-reconcile time is not a field here — it is a gauge served
+	// live via ClusterScheduleWatch (a scheduling change fires no object WatchList,
+	// so it can't ride this record's watch), and its probe history via the events
+	// surface.
+}
+
+// ChangeType classifies a delta-watch change, mirroring a Kubernetes watch event
+// (and beehive's own change type). Its string values are deliberately identical to
+// beehive.Added/Modified/Deleted, so the watch pumps map beehive→domain with a plain
+// conversion; it is a defined type (not an alias of beehive.ChangeType, which is
+// itself an alias into an internal package gqlgen cannot import) so the GraphQL
+// ChangeType enum can bind straight to it, the external-enum pattern used for
+// EventType/ConditionStatus. Values: Added (incl. the on-subscribe snapshot),
+// Modified, Deleted.
+type ChangeType string
+
+const (
+	ChangeAdded    ChangeType = "Added"
+	ChangeModified ChangeType = "Modified"
+	ChangeDeleted  ChangeType = "Deleted"
+)
+
+// ClusterChange is one delta on the cluster list watch: what happened (Type) to
+// which cluster (Cluster). On a Deleted change Cluster carries the last-known state;
+// consumers key on Cluster.ID. Binds 1:1 to the GraphQL ClusterChange.
+type ClusterChange struct {
+	Type    ChangeType
+	Cluster *Cluster
+}
+
+// ClusterCacheChange is the ClusterCache-kind counterpart of ClusterChange, carried
+// on the standalone cache watch. Binds 1:1 to the GraphQL ClusterCacheChange.
+type ClusterCacheChange struct {
+	Type  ChangeType
+	Cache *ClusterCache
 }
 
 // --- Cache statistics types (for the ClusterCache GraphQL resolver) ---

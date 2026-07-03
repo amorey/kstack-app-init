@@ -15,13 +15,11 @@
 package cluster
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"slices"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
@@ -34,25 +32,53 @@ import (
 
 // ClusterService is the boundary between the frontend (GraphQL today, gRPC
 // later) and the cluster backend. Every beehive detail — slugs, the
-// Cluster → ClusterCache owner chain, the spec/status split, the ClusterCache
-// status join, the two-channel watch merge — lives behind it, so callers deal
-// only in the domain Cluster type.
+// Cluster → ClusterCache owner chain, the spec/status split, the delta-watch
+// mapping — lives behind it, so callers deal only in the domain Cluster /
+// ClusterCache types.
 type ClusterService interface {
-	// List returns every tracked cluster that is not deletion-pending, each with
-	// its ClusterCache sync status joined in.
+	// List returns every tracked cluster that is not deletion-pending. Cache sync
+	// status is not joined in — it is read via the cache watch and joined by the
+	// caller.
 	List(ctx context.Context) ([]*Cluster, error)
 	// Get returns one cluster by id, or (nil, nil) when it is unknown or
 	// deletion-pending.
 	Get(ctx context.Context, id ClusterID) (*Cluster, error)
-	// Watch emits the current cluster list on subscribe, then re-emits the full
-	// list on every Cluster or ClusterCache change. The channel closes when ctx
-	// ends.
-	Watch(ctx context.Context) (<-chan []*Cluster, error)
+	// Watch streams the cluster list as a Kubernetes-style delta watch: the current
+	// set as Added changes on subscribe (the snapshot), then one Added/Modified/
+	// Deleted change per cluster. A deletion-pending cluster is surfaced as Deleted.
+	// The channel closes when ctx ends.
+	Watch(ctx context.Context) (<-chan ClusterChange, error)
+	// WatchCaches streams cache records as a Kubernetes-style delta watch parallel to
+	// Watch — the current set as Added changes, then per-cache Added/Modified/Deleted.
+	// Standalone (no parent join); the caller joins caches onto clusters by
+	// ClusterID. The channel closes when ctx ends.
+	WatchCaches(ctx context.Context) (<-chan ClusterCacheChange, error)
 	// CacheStats returns live on-disk statistics for one ClusterCache, located by
 	// its parent ClusterID (the cache directory) and its own ClusterCacheID (the
 	// cache file). A cluster can own several caches, so stats are per-cache, not
 	// per-cluster.
 	CacheStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*ClusterCacheStats, error)
+	// ClusterEvents returns a cluster's beehive event timeline (newest run first),
+	// optionally filtered to one category and bounded by limit. Decoupled from the
+	// cluster/list watch — event chatter never re-emits the cluster.
+	ClusterEvents(ctx context.Context, id ClusterID, category *string, limit *int) ([]Event, error)
+	// ClusterEventsWatch streams a cluster's event log as bare runs — the matching
+	// runs as a snapshot, then live runs, conflating per run id (the consumer
+	// upserts by Event.ID). Independent of Watch. The channel closes when ctx ends.
+	ClusterEventsWatch(ctx context.Context, id ClusterID, category *string) (<-chan Event, error)
+	// ClusterCacheEvents returns a ClusterCache's beehive event timeline (newest run
+	// first), the ClusterCache-kind counterpart of ClusterEvents — keyed by the
+	// cache's own ClusterCacheID (e.g. the sync-event history, category "sync").
+	ClusterCacheEvents(ctx context.Context, id ClusterCacheID, category *string, limit *int) ([]Event, error)
+	// ClusterCacheEventsWatch streams a ClusterCache's event log as bare runs, the
+	// ClusterCache-kind counterpart of ClusterEventsWatch. The channel closes when
+	// ctx ends.
+	ClusterCacheEventsWatch(ctx context.Context, id ClusterCacheID, category *string) (<-chan Event, error)
+	// ClusterScheduleWatch streams a cluster's reconcile-schedule gauge (the next
+	// requeue time), current-on-subscribe then on every (re)schedule. A scheduling
+	// change fires no object WatchList, so this is the live source for the UI's
+	// next-attempt countdown. The channel closes when ctx ends.
+	ClusterScheduleWatch(ctx context.Context, id ClusterID) (<-chan Schedule, error)
 	// SetEnabled enables or disables a cluster in the app (connection eligibility
 	// + visibility in pickers) and returns the updated record.
 	SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)
@@ -81,6 +107,9 @@ type coreController interface {
 	StartBackground()
 	StopBackground()
 	Reprobe(ClusterID)
+	// WatchProbe streams whether a cluster's connection probe is in flight
+	// (current-on-subscribe, then per transition); merged into ClusterScheduleWatch.
+	WatchProbe(ctx context.Context, id ClusterID) <-chan bool
 }
 
 // Service is the concrete ClusterService and the whole cluster control plane: it
@@ -131,8 +160,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 		return nil, fmt.Errorf("open beehive store: %w", err)
 	}
 	// WithEventRetention bounds each object's connection event timeline to the
-	// newest maxConnectionAttempts runs (per category), GC-swept — the retention
-	// the old status-stored ConnectionAttempts slice used to enforce by hand.
+	// newest maxConnectionAttempts runs (per category), GC-swept.
 	bh, err := beehive.New(bhStore, beehive.WithEventRetention(maxConnectionAttempts, 0))
 	if err != nil {
 		bhStore.Close()
@@ -251,7 +279,7 @@ func (s *Service) listClusters(ctx context.Context) ([]*Cluster, error) {
 		if obj.DeletionRequestedAt != nil {
 			continue
 		}
-		c := s.buildCluster(ctx, obj)
+		c := s.buildCluster(obj)
 		clusters = append(clusters, &c)
 	}
 	return clusters, nil
@@ -270,7 +298,7 @@ func (s *Service) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
 	if obj.DeletionRequestedAt != nil {
 		return nil, nil
 	}
-	c := s.buildCluster(ctx, obj)
+	c := s.buildCluster(obj)
 	return &c, nil
 }
 
@@ -318,7 +346,7 @@ func (s *Service) updateSpec(ctx context.Context, id ClusterID, mutate func(*Clu
 	if err != nil {
 		return nil, err
 	}
-	c := s.buildCluster(ctx, updated)
+	c := s.buildCluster(updated)
 	return &c, nil
 }
 
@@ -374,7 +402,7 @@ func (s *Service) ClearCache(ctx context.Context, id ClusterID) (*Cluster, error
 	if s.cacheCtrl != nil {
 		s.cacheCtrl.RestartEngine(id)
 	}
-	c := s.buildCluster(ctx, obj)
+	c := s.buildCluster(obj)
 	return &c, nil
 }
 
@@ -390,108 +418,57 @@ func (s *Service) Delete(ctx context.Context, id ClusterID) error {
 	return s.coreClient.Delete(ctx, obj.ID)
 }
 
-// Watch implements ClusterService.
-func (s *Service) Watch(ctx context.Context) (<-chan []*Cluster, error) {
-	seed, err := s.listClusters(ctx)
+// changeType maps a beehive change to the domain ChangeType, collapsing a
+// deletion-pending object (a Modified carrying a soft-delete tombstone) to Deleted:
+// beehive keeps the object around, tombstoned, until its finalizers clear, but
+// callers treat a tombstoned record as gone (List/Get hide it), so the watch removes
+// it from the client's view at once. The trailing hard Deleted then repeats
+// idempotently. A real Deleted stays Deleted. Generic over both kinds — it reads only
+// the change type + the object's tombstone, which every kind carries.
+func changeType[Spec, Status any](ev beehive.Change[Spec, Status]) ChangeType {
+	if ev.Object.DeletionRequestedAt != nil {
+		return ChangeDeleted
+	}
+	// beehive.ChangeType and ChangeType share their string values by construction
+	// (both mirror the k8s Added/Modified/Deleted words), so this is a value-preserving
+	// conversion, not a remap.
+	return ChangeType(ev.Type)
+}
+
+// Watch implements ClusterService. It forwards beehive's Cluster-kind WatchList as a
+// delta stream: the on-subscribe snapshot arrives as Added changes, then one change
+// per object write. beehive conflates per object (a Deleted still carries the final
+// body), so a slow client converges to each cluster's latest state rather than
+// lagging as loss. Per-probe chatter and the next-attempt countdown are deliberately
+// NOT here — probe history streams via clusterEventsWatch and the schedule gauge via
+// clusterScheduleWatch, both per-cluster — so a steadily-disconnected cluster whose
+// status has settled produces no churn. Cache sync status streams standalone via
+// WatchCaches (joined client-side), so cache changes never re-emit a cluster.
+func (s *Service) Watch(ctx context.Context) (<-chan ClusterChange, error) {
+	src, err := s.coreClient.WatchList(ctx)
 	if err != nil {
 		return nil, err
 	}
+	return mapChan(ctx, src, func(ev beehive.Change[ClusterSpec, ClusterStatus]) ClusterChange {
+		c := s.buildCluster(ev.Object)
+		return ClusterChange{Type: changeType(ev), Cluster: &c}
+	}), nil
+}
 
-	clusterCh, err := s.coreClient.WatchList(ctx)
+// WatchCaches implements ClusterService. The ClusterCache-kind counterpart of Watch:
+// beehive's cache WatchList forwarded as a standalone delta stream (snapshot as Added,
+// then per-cache changes), each object built into a domain ClusterCache with its
+// parent ClusterID resolved from the owner edge. The caller joins these onto clusters
+// by ClusterID; deletion-pending caches are remapped to Deleted, same as Watch.
+func (s *Service) WatchCaches(ctx context.Context) (<-chan ClusterCacheChange, error) {
+	src, err := s.cacheClient.WatchList(ctx)
 	if err != nil {
 		return nil, err
 	}
-	cacheCh, err := s.cacheClient.WatchList(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	out := make(chan []*Cluster, 1)
-	out <- seed
-
-	go func() {
-		defer close(out)
-
-		// Per-cluster connection-event watchers. Recording a probe outcome
-		// (RecordEvent) does NOT fire the object WatchList, so without these a
-		// steadily-disconnected cluster — whose status stops changing once it has
-		// settled into a failing run — would never re-emit, freezing both its
-		// connectionAttempts history and its nextAttemptAt countdown in the UI. Each
-		// watcher pokes eventSignal on any recorded run; we reconcile the watcher set
-		// against the live cluster list on every emit (and cancel them all on exit).
-		eventSignal := make(chan struct{}, 1)
-		evWatchers := make(map[ClusterID]context.CancelFunc)
-		defer func() {
-			for _, cancel := range evWatchers {
-				cancel()
-			}
-		}()
-		syncEventWatchers := func(clusters []*Cluster) {
-			seen := make(map[ClusterID]struct{}, len(clusters))
-			for _, c := range clusters {
-				seen[c.ID] = struct{}{}
-				if _, ok := evWatchers[c.ID]; ok {
-					continue
-				}
-				wctx, cancel := context.WithCancel(ctx)
-				ch, err := s.coreClient.WatchEvents(wctx, beehive.ObjectID(c.ID),
-					beehive.WithEventCategory(ConnectionEventCategory))
-				if err != nil {
-					cancel()
-					continue
-				}
-				evWatchers[c.ID] = cancel
-				go func() {
-					for range ch { // one poke per recorded/extended run
-						select {
-						case eventSignal <- struct{}{}:
-						default: // a poke is already pending; coalesce
-						}
-					}
-				}()
-			}
-			for id, cancel := range evWatchers {
-				if _, ok := seen[id]; !ok {
-					cancel()
-					delete(evWatchers, id)
-				}
-			}
-		}
-
-		emit := func() {
-			clusters, err := s.listClusters(ctx)
-			if err != nil {
-				return
-			}
-			syncEventWatchers(clusters)
-			select {
-			case out <- clusters:
-			case <-ctx.Done():
-			}
-		}
-
-		syncEventWatchers(seed)
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case _, ok := <-clusterCh:
-				if !ok {
-					return
-				}
-				emit()
-			case _, ok := <-cacheCh:
-				if !ok {
-					return
-				}
-				emit()
-			case <-eventSignal:
-				emit()
-			}
-		}
-	}()
-	return out, nil
+	return mapChan(ctx, src, func(ev beehive.Change[ClusterCacheSpec, ClusterCacheStatus]) ClusterCacheChange {
+		cc := s.buildClusterCache(ctx, ev.Object)
+		return ClusterCacheChange{Type: changeType(ev), Cache: &cc}
+	}), nil
 }
 
 // GetConnection implements ClusterService.
@@ -499,13 +476,12 @@ func (s *Service) GetConnection(id ClusterID) *rest.Config {
 	return s.connMgr.Get(id)
 }
 
-// buildCluster assembles a domain Cluster from a Cluster beehive object, joining
-// in ClusterCache sync status from the cache client.
-func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus]) Cluster {
-	id := ClusterID(obj.ID)
-
+// buildCluster assembles a domain Cluster from a single Cluster beehive object. It
+// does not join cache children — those stream standalone via WatchCaches and are
+// joined by the caller — so it needs no ctx-bound reads.
+func (s *Service) buildCluster(obj *beehive.Object[ClusterSpec, ClusterStatus]) Cluster {
 	c := Cluster{
-		ID:         id,
+		ID:         ClusterID(obj.ID),
 		Generation: obj.Generation,
 		CreatedAt:  obj.CreatedAt,
 		Spec:       obj.Spec,
@@ -517,103 +493,239 @@ func (s *Service) buildCluster(ctx context.Context, obj *beehive.Object[ClusterS
 	if obj.Status != nil {
 		c.Status = *obj.Status
 	}
-
-	// NextAttemptAt is derived read-side from beehive's actual schedule (a field on
-	// the domain Cluster, not persisted in Status): when it has queued this
-	// cluster's next reconcile — for a disconnected cluster, its next backoff retry,
-	// which the UI counts down to. A cheap in-memory queue read (no store lookup),
-	// so it's fine on this per-cluster watch-rebuild path. Zero means nothing is
-	// scheduled → leave it nil.
-	if at := s.coreClient.NextRequeueAt(ctx, obj.ID); !at.IsZero() {
-		c.NextAttemptAt = &at
-	}
-
-	// Join in the recent connection-probe history (newest run first) from beehive's
-	// event log — a derived read-side field like NextAttemptAt, no longer stored on
-	// Status. RecordEvent doesn't fire the object WatchList, so Watch subscribes to
-	// each cluster's event log separately to re-emit on new probes (see Watch); this
-	// per-cluster read is on that refresh path.
-	c.ConnectionAttempts = s.connectionAttempts(ctx, obj.ID)
-
-	// Join in the cluster's owned ClusterCache children (zero or more): each carries
-	// its own sync status, the ids the live-stats resolver needs, and whether it is
-	// the currently-active identity's cache.
-	c.Caches, c.ActiveCache = s.listCaches(ctx, obj)
-
 	return c
 }
 
-// connectionAttempts reads the cluster's connection event timeline (newest run
-// first, bounded to maxConnectionAttempts) and maps beehive Events to the domain
-// ClusterConnectionAttempt runs. A read error yields nil (no history) rather than
-// failing the whole cluster read — a partial view beats none for a status read.
-func (s *Service) connectionAttempts(ctx context.Context, id beehive.ObjectID) []ClusterConnectionAttempt {
-	evs, err := s.coreClient.ListEvents(ctx, id,
-		beehive.WithEventCategory(ConnectionEventCategory),
-		beehive.WithEventLimit(maxConnectionAttempts))
+// buildClusterCache assembles a domain ClusterCache from a single ClusterCache
+// beehive object, resolving its parent ClusterID via the owner edge (best-effort: a
+// hard-deleted cache has no edge left, but by then the client has already dropped it
+// from the soft-delete → Deleted change, so a zero ClusterID on the trailing hard
+// Deleted is harmless — the client keys removal on the cache id).
+func (s *Service) buildClusterCache(ctx context.Context, obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) ClusterCache {
+	cc := ClusterCache{
+		ID:        ClusterCacheID(obj.ID),
+		ServerUID: obj.Spec.ServerUID,
+	}
+	if owner, ok, err := s.cacheClient.GetOwner(ctx, obj.ID); err == nil && ok {
+		cc.ClusterID = ClusterID(owner.ID)
+	}
+	if obj.Status != nil {
+		cc.Status = *obj.Status
+	}
+	return cc
+}
+
+// eventClient is the slice of a beehive kind client that reads its objects'
+// event logs. coreClient and cacheClient both satisfy it (ListEvents/WatchEvents
+// don't mention Spec/Status), so one reader serves every kind's events surface.
+type eventClient interface {
+	ListEvents(ctx context.Context, id beehive.ObjectID, opts ...beehive.EventOption) ([]beehive.Event, error)
+	WatchEvents(ctx context.Context, id beehive.ObjectID, opts ...beehive.EventOption) (<-chan beehive.Event, error)
+}
+
+// eventOpts builds the beehive read/watch options for an events query: an
+// optional category filter plus a limit bound.
+func eventOpts(category *string, limit int) []beehive.EventOption {
+	opts := []beehive.EventOption{beehive.WithEventLimit(limit)}
+	if category != nil {
+		opts = append(opts, beehive.WithEventCategory(*category))
+	}
+	return opts
+}
+
+// toDomainEvent maps one beehive run to the wire shape — the beehive→domain
+// crossing (like buildCluster/listCaches), kept trivial by reusing the ObjectID
+// scalar for the run id and binding Type straight to beehive.EventType.
+func toDomainEvent(e beehive.Event) Event {
+	return Event{
+		ID:       ObjectID(e.ID),
+		Category: e.Category,
+		Type:     e.Type,
+		Reason:   e.Reason,
+		Message:  e.Message,
+		Count:    e.Count,
+		FirstAt:  e.FirstAt,
+		LastAt:   e.LastAt,
+	}
+}
+
+// events reads one object's event timeline (newest run first) through the given
+// kind client, optionally filtered to one category and bounded by limit (nil or
+// <= 0 uses defaultEventLimit). A read error yields nil, not an error — a partial
+// status read beats none.
+func (s *Service) events(ctx context.Context, c eventClient, id beehive.ObjectID, category *string, limit *int) ([]Event, error) {
+	n := defaultEventLimit
+	if limit != nil && *limit > 0 {
+		n = *limit
+	}
+	evs, err := c.ListEvents(ctx, id, eventOpts(category, n)...)
 	if err != nil {
 		if ctx.Err() == nil {
-			slog.Warn("clusterservice: list connection events", "cluster", id, "err", err)
+			slog.Warn("clusterservice: list events", "object", id, "category", category, "err", err)
 		}
-		return nil
+		return nil, nil
 	}
-	out := make([]ClusterConnectionAttempt, 0, len(evs))
+	out := make([]Event, 0, len(evs))
 	for _, e := range evs {
-		out = append(out, ClusterConnectionAttempt{
-			OK:      e.Type == beehive.EventNormal,
-			Reason:  e.Reason,
-			Message: e.Message,
-			Count:   e.Count,
-			FirstAt: e.FirstAt,
-			LastAt:  e.LastAt,
-		})
+		out = append(out, toDomainEvent(e))
 	}
+	return out, nil
+}
+
+// scheduleClient is the slice of a beehive kind client the schedule watch needs —
+// the live reconcile-schedule gauge. The real coreClient satisfies it; tests fake it.
+type scheduleClient interface {
+	WatchSchedule(ctx context.Context, id beehive.ObjectID) (<-chan beehive.Schedule, error)
+}
+
+// toSchedule maps the beehive Schedule gauge to the domain view: a non-zero
+// NextRequeueAt becomes a pointer, the zero time (nothing scheduled) becomes nil.
+func toSchedule(s beehive.Schedule) Schedule {
+	if s.NextRequeueAt.IsZero() {
+		return Schedule{}
+	}
+	at := s.NextRequeueAt
+	return Schedule{NextRequeueAt: &at}
+}
+
+// mapChan streams every value from src onto a fresh buffered channel, applying
+// fn, until src closes or ctx ends; the out channel is closed on exit. It's the
+// shared body of the per-object gauge/log pumps (scheduleWatch, watchEvents),
+// which differ only in element type and mapper.
+func mapChan[A, B any](ctx context.Context, src <-chan A, fn func(A) B) <-chan B {
+	out := make(chan B, 1)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case v, ok := <-src:
+				if !ok {
+					return
+				}
+				select {
+				case out <- fn(v):
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
 	return out
 }
 
-// listCaches enumerates a cluster's owned ClusterCache children via the beehive
-// owner edge (ListOwned on the Cluster kind), builds each into a domain ClusterCache,
-// and returns them sorted by id alongside a pointer to the active one (the cache whose
-// UID matches the cluster's last-probed Server.UID), or nil when none is active. A
-// per-child read error skips that child rather than failing the whole join — a partial
-// view beats none for a status read.
-func (s *Service) listCaches(ctx context.Context, clusterObj *beehive.Object[ClusterSpec, ClusterStatus]) ([]ClusterCache, *ClusterCache) {
-	clusterID := ClusterID(clusterObj.ID)
-
-	refs, err := s.coreClient.ListOwned(ctx, clusterObj.ID)
+// scheduleWatch streams one object's reconcile-schedule gauge through the given
+// client, mapping each beehive.Schedule to the domain Schedule. A scheduling change
+// fires no object WatchList, so this is the live source for the next-attempt
+// countdown. The channel closes when the source closes or ctx ends.
+func (s *Service) scheduleWatch(ctx context.Context, c scheduleClient, id beehive.ObjectID) (<-chan Schedule, error) {
+	src, err := c.WatchSchedule(ctx, id)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
-	caches := make([]ClusterCache, 0, len(refs))
-	for _, ref := range refs {
-		if ref.Kind != ClusterCacheGroupKind.Kind {
-			continue
-		}
-		cacheObj, err := s.cacheClient.Get(ctx, ref.ID)
-		if err != nil {
-			continue
-		}
-		cc := ClusterCache{
-			ID:        ClusterCacheID(cacheObj.ID),
-			ClusterID: clusterID,
-			ServerUID: cacheObj.Spec.ServerUID,
-			Enabled:   cacheIsActive(clusterObj, cacheObj.Spec.ServerUID),
-		}
-		if cacheObj.Status != nil {
-			cc.Status = *cacheObj.Status
-		}
-		caches = append(caches, cc)
-	}
-	slices.SortFunc(caches, func(a, b ClusterCache) int { return cmp.Compare(a.ID, b.ID) })
+	return mapChan(ctx, src, toSchedule), nil
+}
 
-	var active *ClusterCache
-	for i := range caches {
-		if caches[i].Enabled {
-			active = &caches[i]
-			break
-		}
+// ClusterScheduleWatch implements ClusterService — the Cluster-kind entrypoint to
+// the (generic) reconcile-schedule gauge, merged with the controller's in-flight
+// probe signal so a single subscription drives both the "Next check" countdown
+// and the "checking now" state. The scheduler owns NextRequeueAt; the core
+// controller owns Probing (it holds writeMu across the probe). Both sub-sources
+// are current-on-subscribe, so the merged stream emits a fresh Schedule as either
+// side moves.
+func (s *Service) ClusterScheduleWatch(ctx context.Context, id ClusterID) (<-chan Schedule, error) {
+	schedSrc, err := s.scheduleWatch(ctx, s.coreClient, beehive.ObjectID(id))
+	if err != nil {
+		return nil, err
 	}
-	return caches, active
+	probeSrc := s.coreCtrl.WatchProbe(ctx, id)
+	return mergeSchedule(ctx, schedSrc, probeSrc), nil
+}
+
+// mergeSchedule folds the schedule gauge (NextRequeueAt) and the in-flight probe
+// signal (Probing) into one Schedule stream, re-emitting the combined latest each
+// time either side changes. A closed sub-source is dropped (nil'd) rather than
+// ending the stream, so the other keeps flowing; the goroutine exits when both
+// close or ctx ends. The out channel closes on exit.
+func mergeSchedule(ctx context.Context, schedSrc <-chan Schedule, probeSrc <-chan bool) <-chan Schedule {
+	out := make(chan Schedule, 1)
+	go func() {
+		defer close(out)
+		var cur Schedule
+		emit := func() bool {
+			select {
+			case out <- cur:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		for schedSrc != nil || probeSrc != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case sc, ok := <-schedSrc:
+				if !ok {
+					schedSrc = nil
+					continue
+				}
+				cur.NextRequeueAt = sc.NextRequeueAt
+				if !emit() {
+					return
+				}
+			case p, ok := <-probeSrc:
+				if !ok {
+					probeSrc = nil
+					continue
+				}
+				cur.Probing = p
+				if !emit() {
+					return
+				}
+			}
+		}
+	}()
+	return out
+}
+
+// ClusterEvents implements ClusterService — the Cluster-kind entrypoint to the
+// generic event reader.
+func (s *Service) ClusterEvents(ctx context.Context, id ClusterID, category *string, limit *int) ([]Event, error) {
+	return s.events(ctx, s.coreClient, beehive.ObjectID(id), category, limit)
+}
+
+// ClusterEventsWatch implements ClusterService — the Cluster-kind entrypoint to
+// the generic event watch.
+func (s *Service) ClusterEventsWatch(ctx context.Context, id ClusterID, category *string) (<-chan Event, error) {
+	return s.watchEvents(ctx, s.coreClient, beehive.ObjectID(id), category)
+}
+
+// ClusterCacheEvents implements ClusterService — the ClusterCache-kind entrypoint
+// to the generic event reader (over the cache client).
+func (s *Service) ClusterCacheEvents(ctx context.Context, id ClusterCacheID, category *string, limit *int) ([]Event, error) {
+	return s.events(ctx, s.cacheClient, beehive.ObjectID(id), category, limit)
+}
+
+// ClusterCacheEventsWatch implements ClusterService — the ClusterCache-kind
+// entrypoint to the generic event watch (over the cache client).
+func (s *Service) ClusterCacheEventsWatch(ctx context.Context, id ClusterCacheID, category *string) (<-chan Event, error) {
+	return s.watchEvents(ctx, s.cacheClient, beehive.ObjectID(id), category)
+}
+
+// watchEvents streams one object's event log as bare runs through the given kind
+// client, mirroring beehive's own WatchEvents (which streams <-chan Event, not a
+// delta). beehive replays the matching runs as a snapshot (oldest-first) then live
+// runs, conflating per run id — a lagging subscriber converges to each run's latest
+// state — so the consumer upserts by Event.ID (a re-delivered run id is an updated
+// run, a new id is a new run); no add/modify classification is needed here. The
+// returned channel closes when the source closes or ctx ends.
+func (s *Service) watchEvents(ctx context.Context, c eventClient, id beehive.ObjectID, category *string) (<-chan Event, error) {
+	src, err := c.WatchEvents(ctx, id, eventOpts(category, defaultEventLimit)...)
+	if err != nil {
+		return nil, err
+	}
+	return mapChan(ctx, src, toDomainEvent), nil
 }
 
 // clusterByID fetches a Cluster object by id, mapping beehive.ErrNotFound to the

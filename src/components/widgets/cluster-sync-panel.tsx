@@ -23,7 +23,7 @@
 import { ChevronDown, Database, Pause, Play, Power, PowerOff, RotateCw, Slash, Trash2 } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
 import ReactTimeAgo, { type Formatter } from 'react-timeago';
-import { useMutation } from 'urql';
+import { useMutation, useSubscription } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
 import {
@@ -34,12 +34,12 @@ import {
   SheetTitle,
   SheetTrigger,
 } from '@kubetail/ui/elements/sheet';
+import { Spinner } from '@kubetail/ui/elements/spinner';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@kubetail/ui/elements/table';
 
 import { graphql } from '@/gql';
 import { type Cluster, formatBytes, useClusters } from '@/lib/clusters';
 import { errorMessage, reportError } from '@/lib/error-bus';
-import { formatSyncFreshness } from '@/lib/sync-status';
 
 const ClusterEnabledSetMutation = graphql(`
   mutation ClusterEnabledSet($id: ObjectID!, $enabled: Boolean!) {
@@ -82,6 +82,138 @@ const ClusterConnectionRetryMutation = graphql(`
     clusterConnectionRetry(id: $id)
   }
 `);
+
+// The connection-probe history is served generically from the control plane's
+// event log (category "connection"), decoupled from the clustersWatch list so
+// probe chatter never re-emits the whole registry. It streams bare runs — the
+// timeline as a snapshot on subscribe, then live runs conflated per id — so this
+// is only subscribed while a row's diagnostics are open.
+const ClusterConnectionEventsSubscription = graphql(`
+  subscription ClusterConnectionEvents($id: ObjectID!) {
+    clusterEventsWatch(id: $id, category: "connection") {
+      id
+      type
+      reason
+      message
+      count
+      firstAt
+      lastAt
+    }
+  }
+`);
+
+// One aggregated event run, projected from a generic Event: `ok` derives from the
+// event type (Normal = a healthy/successful run). Shared by the connection-probe
+// and cache-sync histories — both are the same generic Event timeline, keyed and
+// rendered identically.
+type EventRun = {
+  id: string;
+  ok: boolean;
+  reason: string;
+  message: string;
+  count: number;
+  firstAt: string;
+  lastAt: string;
+};
+
+// A raw generic Event frame off a *EventsWatch subscription, before `ok` is
+// derived from its type.
+type RawEvent = Omit<EventRun, 'ok'> & { type: string };
+
+// Fold one raw Event frame into a newest-first run list: upsert by run id (a
+// re-delivered id is an updated run with a bumped count; a new id is a new run),
+// then re-sort by lastAt descending.
+function foldRun(prev: EventRun[] | undefined, ev: RawEvent): EventRun[] {
+  const run: EventRun = {
+    id: ev.id,
+    ok: ev.type === 'Normal',
+    reason: ev.reason,
+    message: ev.message,
+    count: ev.count,
+    firstAt: ev.firstAt,
+    lastAt: ev.lastAt,
+  };
+  const next = (prev ?? []).filter((a) => a.id !== run.id);
+  next.push(run);
+  next.sort((a, b) => (a.lastAt < b.lastAt ? 1 : -1));
+  return next;
+}
+
+// The per-cluster connection-probe history (event category "connection"),
+// subscribed only while a row's diagnostics are open.
+function useConnectionAttempts(clusterId: string): EventRun[] {
+  const [{ data }] = useSubscription<{ clusterEventsWatch: RawEvent }, EventRun[]>(
+    { query: ClusterConnectionEventsSubscription, variables: { id: clusterId } },
+    (prev, resp) => foldRun(prev, resp.clusterEventsWatch),
+  );
+  return data ?? [];
+}
+
+// The per-cache sync-event history: the cache controller records each engine
+// state (Watching / Syncing / SyncFailed) under category "sync" on the
+// ClusterCache's own timeline, streamed generically like the connection history
+// but keyed by the active cache's id. Subscribed only while a row's sync detail
+// is open, so an idle cluster costs nothing.
+const ClusterSyncEventsSubscription = graphql(`
+  subscription ClusterSyncEvents($id: ObjectID!) {
+    clusterCacheEventsWatch(id: $id, category: "sync") {
+      id
+      type
+      reason
+      message
+      count
+      firstAt
+      lastAt
+    }
+  }
+`);
+
+function useSyncEvents(cacheId: string): EventRun[] {
+  const [{ data }] = useSubscription<{ clusterCacheEventsWatch: RawEvent }, EventRun[]>(
+    { query: ClusterSyncEventsSubscription, variables: { id: cacheId } },
+    (prev, resp) => foldRun(prev, resp.clusterCacheEventsWatch),
+  );
+  return data ?? [];
+}
+
+// The next-reconcile time is a gauge streamed per-cluster (current-on-subscribe,
+// then a fresh value on every reschedule), decoupled from the clustersWatch list.
+// A scheduling change fires no list watch, so this is the only way the "Next
+// check" countdown stays live for an otherwise-idle disconnected cluster —
+// subscribed only while a row's diagnostics are open.
+const ClusterScheduleSubscription = graphql(`
+  subscription ClusterSchedule($id: ObjectID!) {
+    clusterScheduleWatch(id: $id) {
+      nextRequeueAt
+      probing
+    }
+  }
+`);
+
+type NextCheck = { atMs: number | null; probing: boolean };
+
+function useNextCheck(clusterId: string): NextCheck {
+  // Two facts ride this one gauge: `nextRequeueAt` (when the next probe is
+  // scheduled) and `probing` (a probe is running *now*, asserted by the
+  // controller). `nextRequeueAt` is null in two very different situations: the
+  // scheduler reports the zero time *while a reconcile is in flight* (so `probing`
+  // is true), and separately when nothing is scheduled at all — a disabled,
+  // orphaned, or otherwise ineligible cluster (so `probing` is false). Hold the
+  // last scheduled time only across the in-flight window; once `probing` is false a
+  // null is authoritative and must *clear* the countdown, not freeze a stale one.
+  // `probing` is always taken from the latest frame (no holding).
+  const [{ data }] = useSubscription<
+    { clusterScheduleWatch: { nextRequeueAt: string | null; probing: boolean } },
+    { nextRequeueAt: string | null; probing: boolean }
+  >({ query: ClusterScheduleSubscription, variables: { id: clusterId } }, (prev, resp) => {
+    const { nextRequeueAt, probing } = resp.clusterScheduleWatch;
+    return {
+      nextRequeueAt: nextRequeueAt ?? (probing ? (prev?.nextRequeueAt ?? null) : null),
+      probing,
+    };
+  });
+  return { atMs: parseTimeOrNull(data?.nextRequeueAt ?? null), probing: data?.probing ?? false };
+}
 
 type Tone = 'ok' | 'attention' | 'error' | 'muted';
 type Group = 'active' | 'orphaned';
@@ -194,23 +326,19 @@ function parseTimeOrNull(iso: string | null | undefined): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
-// Diagnostics behind a cluster's connection: whether it's currently up and
-// since when, when the next re-probe is due, and the recent-attempt history.
-// `stateSinceMs` is the `Connected` condition's last transition — how long it's
-// held its current up/down state. (Per-attempt error messages live in the
-// recent-attempts list, so there's no separate message field here.)
+// Diagnostics behind a cluster's connection: whether it's currently up and since
+// when. `stateSinceMs` is the `Connected` condition's last transition — how long
+// it's held its current up/down state. The next-reconcile time and the
+// recent-attempt history are fetched separately (per open row) via
+// useNextCheck / useConnectionAttempts, not carried on the cluster object.
 function connectionDetail(c: Cluster): {
   connected: boolean;
   stateSinceMs: number | null;
-  nextAttemptAtMs: number | null;
-  attempts: Cluster['connectionAttempts'];
 } {
   const cond = findCondition(c.status.conditions, 'Connected');
   return {
     connected: cond?.status === 'True',
     stateSinceMs: parseTimeOrNull(cond?.lastTransitionTime),
-    nextAttemptAtMs: parseTimeOrNull(c.nextAttemptAt),
-    attempts: c.connectionAttempts,
   };
 }
 
@@ -292,6 +420,55 @@ function DetailRow({
   );
 }
 
+// A newest-first list of aggregated event runs (a probe/sync history), under a
+// small heading — the shared body of the connection and sync detail panes. Each
+// entry is a run of consecutive same-outcome occurrences (×count over its
+// [firstAt, lastAt] window). Renders nothing until at least one run has streamed
+// in. `labelOf` names a run for its category (a connection success has no reason
+// code, so it's labelled "Success"; a sync run just shows its reason).
+function EventRunList({ title, runs, labelOf }: { title: string; runs: EventRun[]; labelOf: (r: EventRun) => string }) {
+  if (runs.length === 0) return null;
+  return (
+    <div className="space-y-1">
+      <p className="text-xs font-medium text-muted-foreground">{title}</p>
+      {/* The stream returns newest-run-first. Scrolls vertically so a long history
+          doesn't blow out the panel. The timestamp/reason/duration columns size to
+          their content (shown in full, never truncated); the message column takes
+          the remaining space and wraps. Subgrid keeps a row's cells aligned. */}
+      <ul className="grid max-h-40 grid-cols-[auto_auto_auto_1fr] divide-y overflow-x-auto overflow-y-auto rounded-md border text-xs">
+        {/* The run id is stable across re-deliveries (an extended run keeps it). */}
+        {runs.map((a) => {
+          const firstMs = parseTimeOrNull(a.firstAt);
+          const lastMs = parseTimeOrNull(a.lastAt);
+          return (
+            <li key={a.id} className="col-span-4 grid grid-cols-subgrid items-baseline gap-x-2 px-2 py-1">
+              {/* {T2} — the run's end time. The start is implied (T1 = T2 −
+                  Duration); the full [firstAt, lastAt] window is on hover. */}
+              <span
+                className="whitespace-nowrap font-mono text-muted-foreground tabular-nums"
+                title={a.count > 1 ? `${a.firstAt} – ${a.lastAt}` : a.lastAt}
+              >
+                {a.lastAt}
+              </span>
+              {/* {Label} ×{Count} — coloured by the run's own tone. */}
+              <span className={`whitespace-nowrap ${a.ok ? TONE.ok.text : TONE.error.text}`}>
+                {a.count > 1 ? `${labelOf(a)} ×${a.count}` : labelOf(a)}
+              </span>
+              {/* {Duration} — "Once" for a single occurrence, else the run's span. */}
+              <span className="whitespace-nowrap font-mono text-muted-foreground tabular-nums">
+                {`(${formatRunDuration(a.count, firstMs, lastMs)})`}
+              </span>
+              {/* {Message} — fills the remaining space and wraps so it's shown in
+                  full rather than truncated. */}
+              <span className="wrap-break-word text-muted-foreground">{a.message}</span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 // The expanded connection diagnostics, available in every connection state: the
 // probe message, the connection timestamps, and the recent-attempt history. When
 // the connection is down (`connFailed`) it also titles itself "Connection failed"
@@ -310,6 +487,8 @@ function ConnectionDetail({
   onRetry: () => void;
 }) {
   const detail = connectionDetail(cluster);
+  const attempts = useConnectionAttempts(cluster.id);
+  const { atMs: nextAttemptAtMs, probing } = useNextCheck(cluster.id);
   // The re-probe runs out-of-band: the mutation resolves the instant it's
   // *scheduled*, and the actual outcome arrives later via clustersWatch (a
   // successful reconnect flips the row to Active and unmounts this panel). So
@@ -335,55 +514,31 @@ function ConnectionDetail({
           fallback="0m"
           formatter={elapsedCoarseFormatter}
         />
-        {/* Keep a fallback so the row never unmounts while a probe is in flight
-            (nextAttemptAt momentarily null) — otherwise the line vanishes and
-            the panel reflows, which reads as a flicker. */}
-        <DetailRow label="Next check" ms={detail.nextAttemptAtMs} fallback="now" formatter={countdownFormatter} />
+        {/* While a probe is actually in flight (`probing`, asserted by the
+            controller) show the "checking…" spinner in place of the countdown —
+            this is the definite signal, not the older heuristic of a missing
+            next-requeue time. When nothing is scheduled and no probe is running
+            (a disabled/orphaned/ineligible cluster, or the brief pre-first-schedule
+            window) the countdown is genuinely absent — show a neutral placeholder,
+            never the spinner, so an idle cluster doesn't look like it's probing.
+            The row stays mounted either way so the panel never reflows/flickers. */}
+        <DetailRow
+          label="Next check"
+          ms={probing ? null : nextAttemptAtMs}
+          fallback={
+            probing ? (
+              <span className="inline-flex items-center gap-1">
+                <Spinner size="xs" className="mr-0" />
+                checking…
+              </span>
+            ) : (
+              '—'
+            )
+          }
+          formatter={countdownFormatter}
+        />
       </dl>
-      {detail.attempts.length > 0 ? (
-        <div className="space-y-1">
-          <p className="text-xs font-medium text-muted-foreground">Recent attempts</p>
-          {/* Backend already returns newest-run-first, and each entry is an
-              aggregated run of consecutive same-outcome probes (×count over its
-              [firstAt, lastAt] window). Scrolls vertically so a long history
-              doesn't blow out the panel. */}
-          {/* The timestamp/reason/duration columns size to their content (shown
-              in full, never truncated); the message column takes the remaining
-              space and wraps. Subgrid keeps a row's cells aligned to those tracks. */}
-          <ul className="grid max-h-40 grid-cols-[auto_auto_auto_1fr] divide-y overflow-x-auto overflow-y-auto rounded-md border text-xs">
-            {/* Each run starts at a distinct instant, so firstAt is a stable key. */}
-            {detail.attempts.map((a) => {
-              const firstMs = parseTimeOrNull(a.firstAt);
-              const lastMs = parseTimeOrNull(a.lastAt);
-              return (
-                <li key={a.firstAt} className="col-span-4 grid grid-cols-subgrid items-baseline gap-x-2 px-2 py-1">
-                  {/* {T2} — the run's end time. The start is implied
-                      (T1 = T2 − Duration); the full [firstAt, lastAt] window is
-                      on hover. */}
-                  <span
-                    className="whitespace-nowrap font-mono text-muted-foreground tabular-nums"
-                    title={a.count > 1 ? `${a.firstAt} – ${a.lastAt}` : a.lastAt}
-                  >
-                    {a.lastAt}
-                  </span>
-                  {/* {Reason} ×{Count} — a successful run has no reason code, so
-                      mirror the failure reasons ("ProbeFailed") with "Success". */}
-                  <span className={`whitespace-nowrap ${a.ok ? TONE.ok.text : TONE.error.text}`}>
-                    {`${a.ok ? 'Success' : a.reason} ×${a.count}`}
-                  </span>
-                  {/* {Duration} — "Once" for a single probe, else the run's span. */}
-                  <span className="whitespace-nowrap font-mono text-muted-foreground tabular-nums">
-                    {`(${formatRunDuration(a.count, firstMs, lastMs)})`}
-                  </span>
-                  {/* {Message} — fills the remaining space and wraps so it's shown
-                      in full rather than truncated. */}
-                  <span className="break-words text-muted-foreground">{a.message}</span>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      ) : null}
+      <EventRunList title="Recent attempts" runs={attempts} labelOf={(a) => (a.ok ? 'Success' : a.reason)} />
       {/* Force an immediate re-probe (reset backoff) — available in any state. */}
       <Button
         type="button"
@@ -398,6 +553,24 @@ function ConnectionDetail({
         <RotateCw className={`size-3.5 ${retrying ? 'animate-spin' : ''}`} aria-hidden />
         {retrying ? 'Retrying…' : 'Retry now'}
       </Button>
+    </div>
+  );
+}
+
+// The expanded sync diagnostics: the recent cache-sync event history for a
+// cluster's active cache. Mirrors ConnectionDetail (an inline expandable region,
+// not a popover, for the same modal-Sheet inert reason), keyed by the active
+// cache's id — the sync-event stream lives on the ClusterCache, not the Cluster.
+function SyncDetail({ cacheId }: { cacheId: string }) {
+  const events = useSyncEvents(cacheId);
+  return (
+    <div className="space-y-2 rounded-md border bg-muted/30 p-3">
+      <p className="text-sm font-medium">Sync</p>
+      {events.length > 0 ? (
+        <EventRunList title="Recent sync events" runs={events} labelOf={(e) => e.reason} />
+      ) : (
+        <p className="text-xs text-muted-foreground">No sync events yet.</p>
+      )}
     </div>
   );
 }
@@ -439,6 +612,11 @@ function ClusterRow({
   // detail panel adapts its header/actions to whether the connection is down.
   const connFailed = connection.tone === 'error';
   const [showDetail, setShowDetail] = useState(false);
+  // The sync label is a disclosure too — but only when there's an active cache to
+  // stream sync events for (a pending/never-cached row has no timeline). Expanding
+  // it shows the recent cache-sync event history.
+  const cacheId = cluster.activeCache?.id;
+  const [showSyncDetail, setShowSyncDetail] = useState(false);
   const pending = isPending(cluster);
   const { enabled } = cluster.spec;
   // Sync can only start/stop for an enabled, identified cluster still in the
@@ -471,13 +649,27 @@ function ClusterRow({
             <ChevronDown className={`size-3 transition-transform ${showDetail ? 'rotate-180' : ''}`} aria-hidden />
           </button>
         </TableCell>
-        <TableCell>
-          <ToneText tone={status.tone}>{status.label}</ToneText>
-          {cluster.activeCache?.status.lastSyncedAt ? (
-            <div className="text-xs text-muted-foreground">
-              {formatSyncFreshness(Date.parse(cluster.activeCache.status.lastSyncedAt))}
-            </div>
-          ) : null}
+        <TableCell className="align-top">
+          {/* The sync label is a disclosure (recent sync-event history) when the
+              cluster has an active cache; otherwise it's plain text (nothing to
+              show). Mirrors the connection column's toggle. */}
+          {cacheId ? (
+            <button
+              type="button"
+              aria-expanded={showSyncDetail}
+              onClick={() => setShowSyncDetail((v) => !v)}
+              data-tone={status.tone}
+              className={`${TONE[status.tone].text} inline-flex cursor-pointer items-center gap-1 rounded-sm underline decoration-dotted underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring`}
+            >
+              {status.label}
+              <ChevronDown
+                className={`size-3 transition-transform ${showSyncDetail ? 'rotate-180' : ''}`}
+                aria-hidden
+              />
+            </button>
+          ) : (
+            <ToneText tone={status.tone}>{status.label}</ToneText>
+          )}
         </TableCell>
         <TableCell className="tabular-nums">
           {cluster.activeCache?.stats.exists ? formatBytes(cluster.activeCache.stats.bytes) : '—'}
@@ -543,6 +735,14 @@ function ClusterRow({
           </TableCell>
         </TableRow>
       ) : null}
+      {showSyncDetail && cacheId ? (
+        <TableRow className="hover:bg-transparent">
+          <TableCell className={STATUS_CELL_CLASS} />
+          <TableCell colSpan={COLUMN_COUNT - 1} className="pt-0">
+            <SyncDetail cacheId={cacheId} />
+          </TableCell>
+        </TableRow>
+      ) : null}
     </>
   );
 }
@@ -598,7 +798,7 @@ export function ClusterSyncPanel() {
       {/* Match the sheet's own `data-[side=right]:` width utilities so tailwind-merge
           replaces them (a plain `w-…` is a different key, so it'd be kept *alongside*
           the built-in and lose on specificity) — widen the panel to fit the table. */}
-      <SheetContent side="right" className="data-[side=right]:w-[56rem] data-[side=right]:sm:max-w-[95vw]">
+      <SheetContent side="right" className="data-[side=right]:w-4xl data-[side=right]:sm:max-w-[95vw]">
         <SheetHeader>
           <SheetTitle>Clusters</SheetTitle>
           <SheetDescription>Clusters in your kubeconfig and any leftover local caches.</SheetDescription>

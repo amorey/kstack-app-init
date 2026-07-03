@@ -50,6 +50,14 @@ func (f *fakeCoreController) StartBackground()     {}
 func (f *fakeCoreController) StopBackground()      {}
 func (f *fakeCoreController) Reprobe(id ClusterID) { f.reprobed = append(f.reprobed, id) }
 
+// WatchProbe returns a closed channel: this fake never probes, so the interface
+// is satisfied without a live in-flight signal.
+func (f *fakeCoreController) WatchProbe(context.Context, ClusterID) <-chan bool {
+	ch := make(chan bool)
+	close(ch)
+	return ch
+}
+
 // newServiceTest builds a started beehive with no-op controllers and returns a
 // service wired to its clients plus a temp cache manager. The returned
 // ControllerClients write Cluster status (core) and ClusterCache status — the
@@ -149,8 +157,13 @@ func TestServiceListAndGet(t *testing.T) {
 	assert.Nil(t, missing)
 }
 
-func TestServiceGetJoinsSyncStatus(t *testing.T) {
-	ctx := context.Background()
+// WatchCaches streams each ClusterCache standalone (no parent join): the snapshot
+// carries an Added change per cache with its parent ClusterID resolved from the owner
+// edge, its ServerUID, and its joined sync status. Active-ness is a client-side join,
+// so it is deliberately not asserted here.
+func TestServiceWatchCachesEmitsCaches(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	s, coreCC, cacheCtl := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
@@ -158,54 +171,31 @@ func TestServiceGetJoinsSyncStatus(t *testing.T) {
 	cacheID := seedActiveCache(t, s, coreCC, id, uid)
 
 	now := time.Now().UTC()
-	// Give the ClusterCache a Synced status to join in.
+	// Give the ClusterCache a Synced status to carry through.
 	cacheObj, err := s.cacheClient.Get(ctx, cacheID)
 	require.NoError(t, err)
 	require.NoError(t, cacheCtl.UpdateStatus(ctx, cacheObj.ID, cacheObj.Generation, ClusterCacheStatus{
 		LastSyncedAt: &now,
 	}))
 
-	c, err := s.Get(ctx, id)
-	require.NoError(t, err)
-	require.NotNil(t, c)
-	// The owned cache shows up in Caches and, because its UID matches the cluster's
-	// active identity, as ActiveCache with the joined sync status.
-	require.Len(t, c.Caches, 1)
-	assert.Equal(t, ClusterCacheID(cacheID), c.Caches[0].ID)
-	assert.True(t, c.Caches[0].Enabled)
-	require.NotNil(t, c.ActiveCache)
-	assert.Equal(t, uid, c.ActiveCache.ServerUID)
-	require.NotNil(t, c.ActiveCache.Status.LastSyncedAt)
-	assert.WithinDuration(t, now, *c.ActiveCache.Status.LastSyncedAt, time.Second)
-}
-
-// A cache whose UID does not match the cluster's last-probed identity (left behind
-// by a physical migration) is listed in Caches but is not the ActiveCache.
-func TestServiceGetInactiveCacheNotActive(t *testing.T) {
-	ctx := context.Background()
-	s, coreCC, _ := newServiceTest(t)
-	id := seedCluster(t, s, "alpha")
-
-	// Active identity is "new-uid"; an older cache for "old-uid" lingers.
-	seedActiveCache(t, s, coreCC, id, "new-uid")
-	_, err := s.cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: "old-uid"},
-		beehive.WithSlug(ClusterCacheSlug(id, "old-uid")), beehive.WithOwner(beehive.ObjectID(id)))
+	ch, err := s.WatchCaches(ctx)
 	require.NoError(t, err)
 
-	c, err := s.Get(ctx, id)
-	require.NoError(t, err)
-	require.NotNil(t, c)
-	require.Len(t, c.Caches, 2)
-	require.NotNil(t, c.ActiveCache)
-	assert.Equal(t, "new-uid", c.ActiveCache.ServerUID)
-	// Exactly one is enabled (the active identity's cache).
-	enabledCount := 0
-	for _, cc := range c.Caches {
-		if cc.Enabled {
-			enabledCount++
+	// WatchList replays current state on subscribe (conflated per object), so drain
+	// Added changes until the synced status lands.
+	deadline := time.After(2 * time.Second)
+	for {
+		ev := recvBy(t, ch, deadline)
+		assert.Equal(t, ChangeAdded, ev.Type)
+		require.NotNil(t, ev.Cache)
+		assert.Equal(t, ClusterCacheID(cacheID), ev.Cache.ID)
+		assert.Equal(t, id, ev.Cache.ClusterID) // resolved from the owner edge
+		assert.Equal(t, uid, ev.Cache.ServerUID)
+		if ev.Cache.Status.LastSyncedAt != nil {
+			assert.WithinDuration(t, now, *ev.Cache.Status.LastSyncedAt, time.Second)
+			return
 		}
 	}
-	assert.Equal(t, 1, enabledCount)
 }
 
 func TestServiceGetDeletionPendingIsNil(t *testing.T) {
@@ -377,7 +367,7 @@ func TestServiceGetConnection(t *testing.T) {
 	assert.Equal(t, cfg, s.GetConnection(id))
 }
 
-func TestServiceWatchEmitsSeedThenReemits(t *testing.T) {
+func TestServiceWatchEmitsSnapshotThenDeltas(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s, _, _ := newServiceTest(t)
@@ -386,75 +376,326 @@ func TestServiceWatchEmitsSeedThenReemits(t *testing.T) {
 	ch, err := s.Watch(ctx)
 	require.NoError(t, err)
 
-	// Seed emission.
-	seed := recvList(t, ch)
-	assert.Len(t, seed, 1)
+	// Snapshot: one Added change for the seeded cluster.
+	seed := recv(t, ch)
+	assert.Equal(t, ChangeAdded, seed.Type)
+	require.NotNil(t, seed.Cluster)
+	assert.Equal(t, id, seed.Cluster.ID)
 
-	// A spec change re-emits the full list. WatchList replays current state on
-	// subscribe, so drain emissions until the change lands (this mirrors the
-	// webview, which renders the latest full list).
+	// A spec change emits a Modified change carrying the new state. WatchList replays
+	// current state on subscribe, so drain until the change lands.
 	_, err = s.SetSyncEnabled(ctx, id, false)
 	require.NoError(t, err)
 
 	deadline := time.After(2 * time.Second)
 	for {
-		list := recvListBy(t, ch, deadline)
-		require.Len(t, list, 1)
-		if !list[0].Spec.SyncEnabled {
+		ev := recvBy(t, ch, deadline)
+		require.NotNil(t, ev.Cluster)
+		if !ev.Cluster.Spec.SyncEnabled {
+			assert.Equal(t, ChangeModified, ev.Type)
 			return
 		}
 	}
 }
 
-// A recorded connection-probe event must re-emit the watch list even though it
-// writes no status — this is what keeps a steadily-failing cluster's
-// connectionAttempts (and its nextAttemptAt countdown) live in the UI, since
-// RecordEvent does not fire the object WatchList.
-func TestServiceWatchReemitsOnConnectionEvent(t *testing.T) {
+// fakeScheduleClient drives the schedule-watch wrapper with a channel the test
+// controls, so the mapping (beehive.Schedule → Schedule, zero → nil) and
+// the ctx lifecycle are exercised deterministically — beehive's own tests cover
+// the queue/gauge semantics behind the real WatchSchedule.
+type fakeScheduleClient struct{ ch chan beehive.Schedule }
+
+func (f *fakeScheduleClient) WatchSchedule(context.Context, beehive.ObjectID) (<-chan beehive.Schedule, error) {
+	return f.ch, nil
+}
+
+// scheduleWatch maps the beehive Schedule gauge to the domain Schedule: a
+// non-zero NextRequeueAt becomes a NextRequeueAt pointer, the zero time becomes
+// nil (nothing scheduled). The out channel closes when the source closes.
+func TestServiceScheduleWatchMapsGauge(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &Service{}
+	fake := &fakeScheduleClient{ch: make(chan beehive.Schedule, 1)}
+
+	out, err := s.scheduleWatch(ctx, fake, 1)
+	require.NoError(t, err)
+
+	// a scheduled time → NextRequeueAt pointer
+	at := time.Now().Add(time.Hour).UTC()
+	fake.ch <- beehive.Schedule{NextRequeueAt: at}
+	got := recv(t, out)
+	require.NotNil(t, got.NextRequeueAt)
+	assert.Equal(t, at, *got.NextRequeueAt)
+
+	// the zero time → nil (nothing scheduled)
+	fake.ch <- beehive.Schedule{}
+	got = recv(t, out)
+	assert.Nil(t, got.NextRequeueAt)
+
+	// source close → out closes
+	close(fake.ch)
+	_, ok := <-out
+	assert.False(t, ok, "out must close when the schedule source closes")
+}
+
+// mergeSchedule folds the schedule gauge (NextRequeueAt) and the in-flight probe
+// signal (Probing) into one Schedule stream, re-emitting the combined latest as
+// either side moves; a closed sub-source is dropped without ending the stream,
+// and the out channel closes only when both close.
+func TestMergeScheduleCombinesGaugeAndProbe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	schedCh := make(chan Schedule, 1)
+	probeCh := make(chan bool, 1)
+	out := mergeSchedule(ctx, schedCh, probeCh)
+
+	// A probe starts → Probing true, no scheduled time yet.
+	probeCh <- true
+	got := recv(t, out)
+	assert.True(t, got.Probing)
+	assert.Nil(t, got.NextRequeueAt)
+
+	// A scheduled time arrives → NextRequeueAt set, Probing still asserted (the
+	// combined latest carries both).
+	at := time.Now().Add(time.Hour).UTC()
+	schedCh <- Schedule{NextRequeueAt: &at}
+	got = recv(t, out)
+	assert.True(t, got.Probing)
+	require.NotNil(t, got.NextRequeueAt)
+	assert.Equal(t, at, *got.NextRequeueAt)
+
+	// The probe finishes → Probing clears, the scheduled time is retained.
+	probeCh <- false
+	got = recv(t, out)
+	assert.False(t, got.Probing)
+	require.NotNil(t, got.NextRequeueAt)
+
+	// Closing one source keeps the other flowing.
+	close(probeCh)
+	schedCh <- Schedule{}
+	got = recv(t, out)
+	assert.Nil(t, got.NextRequeueAt)
+	assert.False(t, got.Probing)
+
+	// Closing both → out closes.
+	close(schedCh)
+	_, ok := <-out
+	assert.False(t, ok, "out must close when both sub-sources close")
+}
+
+// ClusterScheduleWatch, through the ClusterService interface, streams the real
+// beehive schedule gauge for a cluster (snapshot on subscribe, then live).
+func TestClusterScheduleWatchPublicSurface(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, _, _ := newServiceTest(t)
+	var svc ClusterService = s
+	id := seedCluster(t, s, "alpha")
+
+	ch, err := svc.ClusterScheduleWatch(ctx, id)
+	require.NoError(t, err)
+	// The snapshot arrives (value depends on queue state; the contract is that the
+	// stream is live and closes on ctx).
+	recv(t, ch)
+
+	cancel()
+	assert.Eventually(t, func() bool {
+		select {
+		case _, ok := <-ch:
+			return !ok
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond, "stream should close on ctx cancel")
+}
+
+// The generic event reader maps beehive's coalesced runs to the domain Event
+// wire shape, newest-run-first, honoring the category filter and limit. beehive
+// coalesces consecutive same-(category,type,reason) occurrences into one run, so
+// a repeated reason bumps Count rather than adding a run, and a changed reason
+// starts a new run.
+func TestServiceEventsReadsTimeline(t *testing.T) {
+	ctx := context.Background()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+	oid := beehive.ObjectID(id)
+
+	const cat = "test-timeline"
+	// run A (failure), repeated → one run, Count 2
+	for range 2 {
+		require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+			Category: cat, Type: beehive.EventWarning, Reason: "ReasonA", Message: "boom",
+		}))
+	}
+	// run B (success) → new run, Count 1
+	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+		Category: cat, Type: beehive.EventNormal, Reason: "ReasonB",
+	}))
+
+	category := cat
+	evs, err := s.events(ctx, s.coreClient, oid, &category, nil)
+	require.NoError(t, err)
+	require.Len(t, evs, 2, "two runs: A coalesced, B new")
+
+	// newest run first
+	assert.Equal(t, "ReasonB", evs[0].Reason)
+	assert.Equal(t, beehive.EventNormal, evs[0].Type)
+	assert.Equal(t, 1, evs[0].Count)
+
+	assert.Equal(t, "ReasonA", evs[1].Reason)
+	assert.Equal(t, beehive.EventWarning, evs[1].Type)
+	assert.Equal(t, "boom", evs[1].Message)
+	assert.Equal(t, 2, evs[1].Count)
+
+	assert.NotEqual(t, evs[0].ID, evs[1].ID, "distinct run ids")
+	assert.NotZero(t, evs[0].ID)
+	assert.False(t, evs[0].FirstAt.IsZero())
+	assert.False(t, evs[0].LastAt.IsZero())
+
+	// category filter: a non-matching category yields no runs
+	other := "no-such-category"
+	none, err := s.events(ctx, s.coreClient, oid, &other, nil)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+
+	// limit bounds the read to the newest run
+	limit := 1
+	limited, err := s.events(ctx, s.coreClient, oid, &category, &limit)
+	require.NoError(t, err)
+	require.Len(t, limited, 1)
+	assert.Equal(t, "ReasonB", limited[0].Reason)
+}
+
+// watchEvents streams bare runs (mirroring beehive's WatchEvents): the
+// on-subscribe snapshot replays existing runs, a repeated same-outcome occurrence
+// re-delivers the run with a bumped count under the same id (the consumer upserts),
+// and a changed reason delivers a fresh run with a distinct id.
+func TestServiceWatchEventsStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s, coreCC, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
+	oid := beehive.ObjectID(id)
 
-	ch, err := s.Watch(ctx)
+	const cat = "test-watch"
+	// one existing run before subscribe → replayed in the snapshot
+	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+		Category: cat, Type: beehive.EventWarning, Reason: "ReasonA", Message: "boom",
+	}))
+
+	category := cat
+	ch, err := s.watchEvents(ctx, s.coreClient, oid, &category)
 	require.NoError(t, err)
 
-	seed := recvList(t, ch)
-	require.Len(t, seed, 1)
-	require.Empty(t, seed[0].ConnectionAttempts, "no probes yet")
+	// snapshot: run A
+	e := recv(t, ch)
+	assert.Equal(t, "ReasonA", e.Reason)
+	assert.Equal(t, beehive.EventWarning, e.Type)
+	assert.Equal(t, 1, e.Count)
+	runA := e.ID
+	assert.NotZero(t, runA)
 
-	err = coreCC.RecordEvent(ctx, beehive.ObjectID(id), beehive.EventSpec{
-		Category: ConnectionEventCategory,
-		Type:     beehive.EventWarning,
-		Reason:   ReasonProbeFailed,
-		Message:  "boom",
-	})
-	require.NoError(t, err)
+	// extend run A → re-delivered with the same id, count 2
+	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+		Category: cat, Type: beehive.EventWarning, Reason: "ReasonA", Message: "boom",
+	}))
+	e = recv(t, ch)
+	assert.Equal(t, runA, e.ID)
+	assert.Equal(t, 2, e.Count)
 
-	deadline := time.After(2 * time.Second)
-	for {
-		list := recvListBy(t, ch, deadline)
-		require.Len(t, list, 1)
-		if atts := list[0].ConnectionAttempts; len(atts) == 1 && atts[0].Reason == ReasonProbeFailed {
-			assert.False(t, atts[0].OK)
-			assert.Equal(t, 1, atts[0].Count)
-			return
+	// changed reason → new run, distinct id
+	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+		Category: cat, Type: beehive.EventNormal, Reason: "ReasonB",
+	}))
+	e = recv(t, ch)
+	assert.Equal(t, "ReasonB", e.Reason)
+	assert.NotEqual(t, runA, e.ID)
+
+	// ctx cancel closes the stream
+	cancel()
+	assert.Eventually(t, func() bool {
+		select {
+		case _, ok := <-ch:
+			return !ok
+		default:
+			return false
 		}
-	}
+	}, 2*time.Second, 10*time.Millisecond, "stream should close on ctx cancel")
 }
 
-func recvList(t *testing.T, ch <-chan []*Cluster) []*Cluster {
-	t.Helper()
-	return recvListBy(t, ch, time.After(2*time.Second))
+// The kind-scoped public surface (ClusterEvents / ClusterEventsWatch) is reached
+// through the ClusterService interface — it delegates to the generic reader/watch
+// against the Cluster kind client. Asserting via the interface value locks the
+// public API shape, not just the concrete method.
+func TestClusterEventsPublicSurface(t *testing.T) {
+	ctx := t.Context()
+	s, coreCC, _ := newServiceTest(t)
+	var svc ClusterService = s
+	id := seedCluster(t, s, "alpha")
+	oid := beehive.ObjectID(id)
+
+	const cat = "connection"
+	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+		Category: cat, Type: beehive.EventWarning, Reason: "ReasonA", Message: "boom",
+	}))
+
+	// ClusterEvents: point read, filtered to the category
+	category := cat
+	evs, err := svc.ClusterEvents(ctx, id, &category, nil)
+	require.NoError(t, err)
+	require.Len(t, evs, 1)
+	assert.Equal(t, "ReasonA", evs[0].Reason)
+
+	// ClusterEventsWatch: snapshot replays the existing run, then a live run arrives
+	ch, err := svc.ClusterEventsWatch(ctx, id, &category)
+	require.NoError(t, err)
+
+	e := recv(t, ch)
+	assert.Equal(t, "ReasonA", e.Reason)
+
+	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+		Category: cat, Type: beehive.EventNormal, Reason: "ReasonB",
+	}))
+	e = recv(t, ch)
+	assert.Equal(t, "ReasonB", e.Reason)
 }
 
-func recvListBy(t *testing.T, ch <-chan []*Cluster, deadline <-chan time.Time) []*Cluster {
-	t.Helper()
-	select {
-	case list := <-ch:
-		return list
-	case <-deadline:
-		t.Fatal("timed out waiting for cluster list emission")
-		return nil
-	}
+// ClusterCacheEvents / ClusterCacheEventsWatch are the ClusterCache-kind
+// counterparts of the Cluster-kind entrypoints: same generic reader/watch, but
+// against the cache client and keyed by the ClusterCache's own ObjectID (the
+// sync-event timeline the cache controller writes under category "sync"). Asserting
+// via the ClusterService interface value locks the public API shape.
+func TestClusterCacheEventsPublicSurface(t *testing.T) {
+	ctx := t.Context()
+	s, coreCC, cacheCC := newServiceTest(t)
+	var svc ClusterService = s
+	id := seedCluster(t, s, "alpha")
+	cacheOID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+
+	const cat = "sync"
+	require.NoError(t, cacheCC.RecordEvent(ctx, cacheOID, beehive.EventSpec{
+		Category: cat, Type: beehive.EventNormal, Reason: "Watching",
+	}))
+
+	// ClusterCacheEvents: point read, filtered to the category, keyed by cache id.
+	category := cat
+	evs, err := svc.ClusterCacheEvents(ctx, ClusterCacheID(cacheOID), &category, nil)
+	require.NoError(t, err)
+	require.Len(t, evs, 1)
+	assert.Equal(t, "Watching", evs[0].Reason)
+	assert.Equal(t, beehive.EventNormal, evs[0].Type)
+
+	// ClusterCacheEventsWatch: snapshot replays the existing run, then a live run.
+	ch, err := svc.ClusterCacheEventsWatch(ctx, ClusterCacheID(cacheOID), &category)
+	require.NoError(t, err)
+
+	e := recv(t, ch)
+	assert.Equal(t, "Watching", e.Reason)
+
+	require.NoError(t, cacheCC.RecordEvent(ctx, cacheOID, beehive.EventSpec{
+		Category: cat, Type: beehive.EventWarning, Reason: "SyncFailed", Message: "boom",
+	}))
+	e = recv(t, ch)
+	assert.Equal(t, "SyncFailed", e.Reason)
+	assert.Equal(t, "boom", e.Message)
 }

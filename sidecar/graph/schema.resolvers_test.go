@@ -94,7 +94,7 @@ func TestAuthStateWatchSnapshotThenDelta(t *testing.T) {
 	resp := openSSESubscription(t, srv.URL, "",
 		"subscription { authStateWatch { authenticated identity { email } } }")
 	defer resp.Body.Close() // ends the subscription; must run before srv.Close()
-	events := sseEvents(resp)
+	events := sseEvents(t, resp)
 
 	if ev := nextSSE(t, events); ev.event != "next" || !strings.Contains(ev.data, `"authenticated":false`) {
 		t.Fatalf("first frame: event=%q data=%s", ev.event, ev.data)

@@ -21,7 +21,7 @@ import { mockTauriCore } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
+const { invokeMock, channels, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
@@ -52,68 +52,138 @@ type Row = {
   connMessage?: string; // Connected condition's `message` (the probe error)
   disconnectedSince?: string; // Connected condition's `lastTransitionTime` (ISO)
   lastConnectedAt?: string; // status.lastConnectedAt (ISO; null = never)
-  nextAttemptAt?: string; // status.nextAttemptAt (ISO; null = no retry scheduled)
-  // connectionAttempts (aggregated runs, newest first)
-  attempts?: { ok: boolean; reason: string; message: string; count: number; firstAt: string; lastAt: string }[];
 };
 
+// The subscribe-exchange news a fake Channel per graphql_subscribe in call order,
+// so the Nth subscribe (matched by query text) maps to channels[N]. The panel runs
+// several subscriptions at once (clustersWatch, and per open row clusterEventsWatch
+// + clusterScheduleWatch), so target by query rather than liveChannel().
+function channelFor(queryPart: string) {
+  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
+  const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
+  if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
+  return channels[idx];
+}
+
+// Push each row as an Added change on the two delta streams: a Cluster change on
+// clustersWatch, plus (for a probed row) its ClusterCache change on
+// clusterCachesWatch. The provider joins them into the row's activeCache by
+// matching cache.serverUid to cluster.status.server.uid.
 function pushClusters(rows: Row[]) {
-  liveChannel().onmessage!(
-    JSON.stringify({
-      type: 'next',
-      payload: {
-        data: {
-          clustersWatch: rows.map((r, i) => ({
-            id: r.uuid || `pending-${i}`,
-            spec: {
-              name: r.name,
-              syncEnabled: r.enabled,
-              enabled: true,
-              source: { kubeconfig: { context: r.name } },
-            },
-            status: {
-              source: {
-                kubeconfig: {
-                  cluster: `${r.name}-cluster`,
-                  user: `${r.name}-user`,
-                  isPresent: r.present,
-                  isDefault: r.isCurrent ?? false,
+  const clusterCh = channelFor('clustersWatch');
+  const cacheCh = channelFor('clusterCachesWatch');
+  rows.forEach((r, i) => {
+    const id = r.uuid || `pending-${i}`;
+    clusterCh.onmessage!(
+      JSON.stringify({
+        type: 'next',
+        payload: {
+          data: {
+            clustersWatch: {
+              type: 'Added',
+              cluster: {
+                id,
+                spec: {
+                  name: r.name,
+                  syncEnabled: r.enabled,
+                  enabled: true,
+                  source: { kubeconfig: { context: r.name } },
+                },
+                status: {
+                  source: {
+                    kubeconfig: {
+                      cluster: `${r.name}-cluster`,
+                      user: `${r.name}-user`,
+                      isPresent: r.present,
+                      isDefault: r.isCurrent ?? false,
+                    },
+                  },
+                  server: { uid: r.uuid || null },
+                  lastConnectedAt: r.lastConnectedAt ?? null,
+                  conditions: [
+                    {
+                      type: 'Connected',
+                      status: r.connected ?? 'True',
+                      reason: '',
+                      message: r.connMessage ?? '',
+                      lastTransitionTime: r.disconnectedSince ?? null,
+                    },
+                  ],
                 },
               },
-              server: { uid: r.uuid || null },
-              lastConnectedAt: r.lastConnectedAt ?? null,
-              conditions: [
-                {
-                  type: 'Connected',
-                  status: r.connected ?? 'True',
-                  reason: '',
-                  message: r.connMessage ?? '',
-                  lastTransitionTime: r.disconnectedSince ?? null,
-                },
-              ],
             },
-            activeCache: r.uuid
-              ? {
-                  id: `cache-${r.uuid}`,
-                  serverUid: r.uuid,
-                  enabled: true,
-                  status: {
-                    conditions: [
-                      r.syncFailed
-                        ? { type: 'Synced', status: 'False', reason: 'SyncFailed' }
-                        : { type: 'Synced', status: 'True', reason: 'Watching' },
-                    ],
-                    lastSyncedAt: r.lastSyncedAt ?? null,
-                  },
-                  stats: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
-                }
-              : null,
-            nextAttemptAt: r.nextAttemptAt ?? null,
-            connectionAttempts: r.attempts ?? [],
-          })),
+          },
         },
-      },
-    }),
+      }),
+    );
+    if (!r.uuid) return;
+    cacheCh.onmessage!(
+      JSON.stringify({
+        type: 'next',
+        payload: {
+          data: {
+            clusterCachesWatch: {
+              type: 'Added',
+              cache: {
+                id: `cache-${r.uuid}`,
+                clusterID: id,
+                serverUid: r.uuid,
+                status: {
+                  conditions: [
+                    r.syncFailed
+                      ? { type: 'Synced', status: 'False', reason: 'SyncFailed' }
+                      : { type: 'Synced', status: 'True', reason: 'Watching' },
+                  ],
+                  lastSyncedAt: r.lastSyncedAt ?? null,
+                },
+                stats: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
+              },
+            },
+          },
+        },
+      }),
+    );
+  });
+}
+
+// Push one frame on the per-cluster clusterEventsWatch stream (a bare Event).
+// Call after a row's diagnostics are open (mounts the events subscription).
+function pushConnectionEvent(ev: {
+  id: string;
+  type: 'Normal' | 'Warning';
+  reason: string;
+  message: string;
+  count: number;
+  firstAt: string;
+  lastAt: string;
+}) {
+  channelFor('clusterEventsWatch').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clusterEventsWatch: ev } } }),
+  );
+}
+
+// Push one frame on the per-cache clusterCacheEventsWatch stream (a bare Event).
+// Call after a row's sync diagnostics are open (mounts the sync-events subscription).
+function pushSyncEvent(ev: {
+  id: string;
+  type: 'Normal' | 'Warning';
+  reason: string;
+  message: string;
+  count: number;
+  firstAt: string;
+  lastAt: string;
+}) {
+  channelFor('clusterCacheEventsWatch').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clusterCacheEventsWatch: ev } } }),
+  );
+}
+
+// Push one frame on the per-cluster clusterScheduleWatch gauge (the next-attempt
+// time + the in-flight `probing` flag). Call after a row's diagnostics are open
+// (mounts the schedule subscription).
+function pushSchedule(nextRequeueAt: string | null, probing = false) {
+  channelFor('clusterScheduleWatch').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clusterScheduleWatch: { nextRequeueAt, probing } } } }),
   );
 }
 
@@ -335,12 +405,16 @@ describe('ClusterSyncPanel', () => {
   it('requests connection diagnostics in the clustersWatch subscription', async () => {
     renderPanel();
     await flush();
-    const sub = invokeMock.mock.calls.find(([cmd]) => cmd === 'graphql_subscribe')?.[1] as { query: string };
+    const sub = invokeMock.mock.calls.find(
+      ([cmd, arg]) => cmd === 'graphql_subscribe' && (arg as { query: string }).query.includes('clustersWatch'),
+    )?.[1] as { query: string };
     expect(sub.query).toContain('lastConnectedAt');
-    expect(sub.query).toContain('nextAttemptAt');
-    expect(sub.query).toContain('connectionAttempts');
     expect(sub.query).toContain('message');
     expect(sub.query).toContain('lastTransitionTime');
+    // The probe history and the next-attempt countdown are no longer inlined on
+    // the list — they stream per-row via clusterEventsWatch / clusterScheduleWatch.
+    expect(sub.query).not.toContain('connectionAttempts');
+    expect(sub.query).not.toContain('nextAttemptAt');
   });
 
   it('reveals the underlying error and a retry action when a disconnected cluster is opened', async () => {
@@ -355,38 +429,48 @@ describe('ClusterSyncPanel', () => {
         connMessage: 'dial tcp 10.0.0.1:6443: connect: connection refused',
         disconnectedSince: new Date(Date.now() - 3 * 60_000).toISOString(),
         lastConnectedAt: new Date(Date.now() - 12 * 60_000).toISOString(),
-        nextAttemptAt: new Date(Date.now() + 15_000).toISOString(),
-        attempts: [
-          {
-            ok: false,
-            reason: 'ProbeFailed',
-            message: 'TLS handshake timeout',
-            count: 2,
-            firstAt: new Date(Date.now() - 30_000).toISOString(),
-            lastAt: new Date(Date.now() - 20_000).toISOString(),
-          },
-          {
-            ok: false,
-            reason: 'ProbeFailed',
-            message: 'i/o timeout',
-            count: 5,
-            firstAt: new Date(Date.now() - 90_000).toISOString(),
-            lastAt: new Date(Date.now() - 40_000).toISOString(),
-          },
-        ],
       },
     ]);
 
     // The Disconnected label is an interactive trigger (only the error state is).
+    // Opening it mounts the per-row clusterEventsWatch + clusterScheduleWatch subs.
     await user.click(await screen.findByRole('button', { name: /disconnected/i }));
 
+    // The next-attempt countdown streams in on the schedule gauge (decoupled from
+    // the list), and the probe history on the events stream (bare runs, newest
+    // first by lastAt), with `ok` derived from the generic event type.
+    await act(async () => {
+      pushSchedule(new Date(Date.now() + 15_000).toISOString());
+      pushConnectionEvent({
+        id: '2',
+        type: 'Warning',
+        reason: 'ProbeFailed',
+        message: 'TLS handshake timeout',
+        count: 2,
+        firstAt: new Date(Date.now() - 30_000).toISOString(),
+        lastAt: new Date(Date.now() - 20_000).toISOString(),
+      });
+      pushConnectionEvent({
+        id: '1',
+        type: 'Warning',
+        reason: 'ProbeFailed',
+        message: 'i/o timeout',
+        count: 5,
+        firstAt: new Date(Date.now() - 90_000).toISOString(),
+        lastAt: new Date(Date.now() - 40_000).toISOString(),
+      });
+    });
+
     // The popover surfaces the connection timestamps, the countdown to the next
-    // scheduled retry, and the recent-attempt log (which carries the probe errors).
+    // scheduled retry (streamed from the schedule gauge), and the recent-attempt
+    // log (which carries the probe errors).
     expect(await screen.findByText(/uptime/i)).toBeInTheDocument();
     expect(screen.getByText(/next check/i)).toBeInTheDocument();
+    // The ~15s-out schedule renders a live countdown, not the "now" fallback.
+    expect(screen.getByText(/in \d+s/i)).toBeInTheDocument();
     // The attempt history lists each recorded outcome with its own probe message.
     expect(screen.getByText(/recent attempts/i)).toBeInTheDocument();
-    expect(screen.getByText(/i\/o timeout/i)).toBeInTheDocument();
+    expect(await screen.findByText(/i\/o timeout/i)).toBeInTheDocument();
     expect(screen.getByText(/tls handshake timeout/i)).toBeInTheDocument();
 
     // Retry fires clusterConnectionRetry.
@@ -395,6 +479,114 @@ describe('ClusterSyncPanel', () => {
       'graphql_query',
       expect.objectContaining({ body: expect.stringContaining('clusterConnectionRetry') }),
     );
+  });
+
+  it('reveals recent sync events when a cached cluster’s sync status is opened', async () => {
+    const user = await openWith([{ uuid: 'u-sync', name: 'prod', enabled: true, present: true, cached: true }]);
+
+    // The sync-status label is a disclosure trigger for a row with an active cache
+    // (there's a cache to stream sync events for). A healthy cached row reads
+    // "Syncing". Opening it mounts the per-cache clusterCacheEventsWatch sub, keyed
+    // by the active cache's id — decoupled from clusterCachesWatch.
+    await user.click(await screen.findByRole('button', { name: /syncing/i }));
+
+    // The sync history streams in as bare runs (newest first by lastAt), with `ok`
+    // derived from the generic event type (Normal = a healthy Watching run).
+    await act(async () => {
+      pushSyncEvent({
+        id: '2',
+        type: 'Warning',
+        reason: 'SyncFailed',
+        message: 'discovery returned no syncable resources',
+        count: 3,
+        firstAt: new Date(Date.now() - 60_000).toISOString(),
+        lastAt: new Date(Date.now() - 20_000).toISOString(),
+      });
+      pushSyncEvent({
+        id: '1',
+        type: 'Normal',
+        reason: 'Watching',
+        message: '',
+        count: 1,
+        firstAt: new Date(Date.now() - 90_000).toISOString(),
+        lastAt: new Date(Date.now() - 80_000).toISOString(),
+      });
+    });
+
+    // The sync detail lists each recorded run with its reason and message.
+    expect(await screen.findByText(/recent sync events/i)).toBeInTheDocument();
+    expect(await screen.findByText(/discovery returned no syncable resources/i)).toBeInTheDocument();
+    expect(screen.getByText(/SyncFailed ×3/i)).toBeInTheDocument();
+    // A single occurrence renders the bare label with no "×1" multiplier.
+    expect(screen.getByText('Watching')).toBeInTheDocument();
+    expect(screen.queryByText(/Watching ×1/i)).not.toBeInTheDocument();
+  });
+
+  it('holds the countdown across an in-flight probe, then clears it once the schedule is authoritatively empty', async () => {
+    const user = await openWith([
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+    ]);
+    await user.click(await screen.findByRole('button', { name: /disconnected/i }));
+
+    // A scheduled next attempt → a live countdown.
+    await act(async () => pushSchedule(new Date(Date.now() + 15_000).toISOString()));
+    expect(await screen.findByText(/in \d+s/i)).toBeInTheDocument();
+
+    // The gauge reports the zero time (null) while the scheduled reconcile is
+    // dispatched — but the controller asserts the probe is running (probing:
+    // true). That is the in-flight case: show "checking…", not a blank countdown.
+    await act(async () => pushSchedule(null, true));
+    expect(await screen.findByText(/checking…/i)).toBeInTheDocument();
+
+    // The probe ends and the cluster is now ineligible (e.g. disabled): nothing
+    // scheduled and no probe running ({ null, false }). That is authoritative —
+    // the stale countdown must clear, and nothing should imply an active probe.
+    await act(async () => pushSchedule(null, false));
+    expect(screen.queryByText(/in \d+s/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/checking…/i)).not.toBeInTheDocument();
+  });
+
+  it('shows the "checking…" spinner while a probe is in flight, even with a scheduled next attempt', async () => {
+    const user = await openWith([
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+    ]);
+    await user.click(await screen.findByRole('button', { name: /disconnected/i }));
+
+    // A scheduled next attempt → a live countdown.
+    await act(async () => pushSchedule(new Date(Date.now() + 15_000).toISOString()));
+    expect(await screen.findByText(/in \d+s/i)).toBeInTheDocument();
+
+    // The controller asserts a probe is now running (probing: true) while the
+    // schedule still carries the last time → "checking…" overrides the countdown.
+    await act(async () => pushSchedule(new Date(Date.now() + 15_000).toISOString(), true));
+    expect(await screen.findByText(/checking…/i)).toBeInTheDocument();
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.queryByText(/in \d+s/i)).not.toBeInTheDocument();
+
+    // The probe finishes and re-arms a schedule (probing: false) → back to a countdown.
+    await act(async () => pushSchedule(new Date(Date.now() + 30_000).toISOString(), false));
+    expect(await screen.findByText(/in \d+s/i)).toBeInTheDocument();
+    expect(screen.queryByText(/checking…/i)).not.toBeInTheDocument();
+  });
+
+  it('shows a "checking…" spinner only while a probe is actually in flight, not merely when nothing is scheduled', async () => {
+    const user = await openWith([
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+    ]);
+    await user.click(await screen.findByRole('button', { name: /disconnected/i }));
+
+    // Nothing scheduled and no probe running (the pre-first-schedule window, or an
+    // ineligible cluster): a neutral placeholder, never the spinner — an idle
+    // cluster must not look like it is actively probing.
+    await act(async () => pushSchedule(null, false));
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(screen.queryByText(/checking…/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/in \d+s/i)).not.toBeInTheDocument();
+
+    // The controller now asserts a probe is in flight → the spinner appears.
+    await act(async () => pushSchedule(null, true));
+    expect(await screen.findByText(/checking…/i)).toBeInTheDocument();
+    expect(screen.getByRole('status')).toBeInTheDocument();
   });
 
   it('expands connection diagnostics for a reachable cluster with the neutral (non-failed) header', async () => {

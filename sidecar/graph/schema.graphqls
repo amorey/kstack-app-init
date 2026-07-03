@@ -50,14 +50,6 @@ type Cluster {
   spec: ClusterSpec!
   "Observed connection/health state, discovered by probing."
   status: ClusterStatus!
-  "All owned cache children (beehive ClusterCache), one per physical identity this cluster has mirrored. Empty until the first successful probe; more than one across a physical-cluster migration (old + new identity coexist). Sorted by id."
-  caches: [ClusterCache!]!
-  "The cache for the cluster's currently-connected identity (its UID matches `status.server.uid`), or null when the cluster has no active cache yet (never probed, or mid-migration). This is the cache a sync engine runs for and the one a UI shows for the row."
-  activeCache: ClusterCache
-  "When the next reconcile (for a disconnected cluster, its next backoff retry) is scheduled, derived live from the control plane's queue; null when nothing is scheduled. Observability, not a guarantee — an out-of-band trigger may reconcile sooner."
-  nextAttemptAt: Time
-  "Recent connection-probe history (newest run first), derived live from the control plane's event log. Consecutive same-outcome probes are aggregated into runs; bounded to the most recent runs. Empty until the first probe."
-  connectionAttempts: [ClusterConnectionAttempt!]!
 }
 
 "A cluster record's desired state. Every field is user/API-owned; nothing here is observed."
@@ -143,18 +135,32 @@ type ClusterCondition {
   lastTransitionTime: Time!
 }
 
+"An event's severity, mirroring the control plane's event type: Normal (✓) or Warning (✗)."
+enum EventType {
+  Normal
+  Warning
+}
+
 """
-One aggregated run of consecutive connection probes that shared an outcome, in
-`connectionAttempts`. A change in outcome (reason) starts a new run.
+One coalesced run from an object's control-plane event timeline: consecutive
+occurrences sharing an outcome (category, type, reason) are aggregated, so
+`count`/`firstAt`/`lastAt` describe the run. A generic projection served under
+every kind's events surface — `category` names the timeline (e.g. `"connection"`),
+`reason` is an open, category-specific machine code; consumers should treat
+unknown spellings as a degraded/unknown state. The client upserts a live stream
+by `id` (a re-delivered id is an updated run; a new id is a new run).
 """
-type ClusterConnectionAttempt {
-  "True on a successful-connect run, false on a failure run."
-  ok: Boolean!
-  "Machine-readable code: `Connected`, `ProbeFailed`, or `ResolveFailed`."
+type Event {
+  "Stable run identity — the client's upsert key on a watch. An opaque int64 id, same wire form as ObjectID."
+  id: ObjectID!
+  "The timeline this run belongs to, e.g. `\"connection\"`."
+  category: String!
+  type: EventType!
+  "CamelCase machine code, e.g. `Connected` / `ProbeFailed`. Open-ended per category."
   reason: String!
-  "The latest occurrence's underlying error (truncated); empty on success."
+  "The latest occurrence's detail; empty when there is nothing to explain."
   message: String!
-  "Number of probes coalesced into this run (>= 1)."
+  "Occurrences coalesced into this run (>= 1)."
   count: Int!
   "When the run started (first occurrence)."
   firstAt: Time!
@@ -163,19 +169,44 @@ type ClusterConnectionAttempt {
 }
 
 """
-One owned cache child, mirroring the beehive ClusterCache kind: a mirror of one
-physical cluster identity. Carries its identity (`id`, `serverUid`, `enabled`), observed
-sync `status`, and live on-disk `stats` (a nested object so a consumer fetches the
-stat-querying stats only when it selects them). A cluster owns one per identity it
-has mirrored; `enabled` marks the one for its currently-connected identity.
+An object's reconcile-schedule gauge: when the control plane has queued the
+object's next reconcile (a cluster's next backoff retry, for a disconnected one),
+which a UI counts down to. Generic like Event — the watch entrypoints are
+kind-scoped (clusterScheduleWatch) but the value shape is not. A struct (not a
+bare Time) so it can grow. Observed live via a schedule watch — a scheduling
+change fires no object/list watch, so this is the only way to keep the countdown
+moving for an otherwise-idle object.
+"""
+type Schedule {
+  "The scheduled time of the next reconcile, or null when nothing is scheduled."
+  nextRequeueAt: Time
+  """
+  Whether a connection probe is running right now. Asserted by the controller for
+  the in-flight window (not inferred from a missing nextRequeueAt), so the UI can
+  show a definite "checking now" while the probe's round-trips are in flight.
+  """
+  probing: Boolean!
+}
+
+"""
+A cache record, mirroring the beehive ClusterCache kind: a mirror of one physical
+cluster identity. Streamed independently of its parent Cluster via
+`clusterCachesWatch` and joined to it client-side by `clusterID`. Carries its
+identity (`id`, `clusterID`, `serverUid`), observed sync `status`, and live on-disk
+`stats` (a nested object so a consumer fetches the stat-querying stats only when it
+selects them). A cluster owns one per identity it has mirrored; the *active* cache
+— the one a sync engine runs for and a UI shows for the row — is the one whose
+`serverUid` matches the cluster's last-probed `status.server.uid`, a join the
+client derives (it is not a field here, because it depends on the parent's status,
+which changes with no cache event and so cannot be kept fresh on this stream).
 """
 type ClusterCache {
   "Unique identifier for this cache record (distinct from its parent cluster's id)."
   id: ObjectID!
-  "The kube-system namespace UID of the physical cluster this cache mirrors — the identity a physical migration turns over. Mirrors `status.server.uid`."
+  "The id of the Cluster this cache belongs to (its beehive owner). The client joins caches onto clusters by this id."
+  clusterID: ObjectID!
+  "The kube-system namespace UID of the physical cluster this cache mirrors — the identity a physical migration turns over. Matches the parent cluster's `status.server.uid` while this is the active cache."
   serverUid: String!
-  "Whether this cache is the cluster's enabled (live) one: its `serverUid` matches the cluster's last-probed `status.server.uid`. Only the enabled cache syncs; the rest linger read-only until cleared."
-  enabled: Boolean!
   "The sync controller's status block: its conditions (`Synced`) plus cache freshness."
   status: ClusterCacheStatus!
   "Live on-disk cache statistics, queried on demand."
@@ -288,6 +319,36 @@ type CachedResource {
   lastUpdatedAt: Time
 }
 
+# --- Delta watches ---
+
+"""
+Classifies a delta-watch change, mirroring a Kubernetes watch event. On subscribe a
+watch replays the current set as `Added` changes (the snapshot), then streams live
+changes. A `Deleted` change carries the object's last-known state; the client keys
+on its `id`.
+"""
+enum ChangeType {
+  Added
+  Modified
+  Deleted
+}
+
+"One change on the `clustersWatch` stream: the affected cluster and what happened to it."
+type ClusterChange {
+  "Whether this cluster was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: ChangeType!
+  "The affected cluster. On `Deleted`, its last-known state; the client removes it by `id`."
+  cluster: Cluster!
+}
+
+"One change on the `clusterCachesWatch` stream: the affected cache and what happened to it."
+type ClusterCacheChange {
+  "Whether this cache was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: ChangeType!
+  "The affected cache. On `Deleted`, its last-known state; the client removes it by `id`."
+  cache: ClusterCache!
+}
+
 # --- Chat ---
 
 input ChatMessageInput {
@@ -329,6 +390,23 @@ type Query {
   "Every tracked cluster — those in the kubeconfig plus any with a leftover cache. Sorted by name."
   clusters: [Cluster!]!
 
+  """
+  A cluster's control-plane event timeline (newest run first), optionally filtered
+  to one `category` (e.g. `"connection"`) and bounded by `limit`. Empty for an
+  unknown cluster or one with no events. Decoupled from the cluster/list watch —
+  event chatter never re-emits the cluster.
+  """
+  clusterEvents(id: ObjectID!, category: String, limit: Int): [Event!]!
+
+  """
+  A ClusterCache's control-plane event timeline (newest run first), the
+  ClusterCache-kind counterpart of `clusterEvents` — keyed by the cache's own `id`
+  and optionally filtered to one `category` (e.g. `"sync"`, the cache-sync history).
+  Empty for an unknown cache or one with no events. Decoupled from the cache/list
+  watch.
+  """
+  clusterCacheEvents(id: ObjectID!, category: String, limit: Int): [Event!]!
+
   "Current authentication state. Signed-out when no cloud account is configured; live updates via authStateWatch."
   authState: AuthState!
 }
@@ -362,10 +440,54 @@ type Mutation {
 
 type Subscription {
   """
-  Streams the cluster list. Currently emits the full list once on subscribe and
-  holds the stream open; live re-emits on registry changes come later.
+  Streams the cluster list as a Kubernetes-style delta watch: the current set as an
+  `Added` burst on subscribe (the snapshot), then one `Added`/`Modified`/`Deleted`
+  change per cluster as the registry changes. The client maintains a map keyed by
+  `cluster.id`, applying each change (a deletion-pending cluster arrives as
+  `Deleted`). Cache sync status is *not* here — it streams separately via
+  `clusterCachesWatch` and is joined client-side — so cache churn never re-emits a
+  cluster, and a consumer that only needs the cluster list (e.g. a context picker)
+  is undisturbed by it.
   """
-  clustersWatch: [Cluster!]!
+  clustersWatch: ClusterChange!
+
+  """
+  Streams cache records as a Kubernetes-style delta watch, parallel to
+  `clustersWatch`: the current set as an `Added` burst, then one
+  `Added`/`Modified`/`Deleted` change per cache. The client maintains a map keyed by
+  `cache.id` and joins each cache onto its cluster by `cache.clusterID`, treating the
+  cache whose `serverUid` matches the cluster's `status.server.uid` as the active
+  one. Independent of `clustersWatch` (the two streams carry no mutual ordering
+  guarantee, so the client tolerates a cache whose cluster has not arrived yet, and
+  drops caches orphaned by a cluster deletion).
+  """
+  clusterCachesWatch: ClusterCacheChange!
+
+  """
+  Streams a cluster's event timeline: the matching runs as a snapshot, then live
+  runs (a re-delivered run bumps its count under the same `id`). Optionally
+  filtered to one `category`. Independent of clustersWatch, so probe chatter never
+  re-emits the cluster (or the list). The client upserts by `id`.
+  """
+  clusterEventsWatch(id: ObjectID!, category: String): Event!
+
+  """
+  Streams a ClusterCache's event timeline, the ClusterCache-kind counterpart of
+  `clusterEventsWatch`: the matching runs as a snapshot, then live runs (a
+  re-delivered run bumps its count under the same `id`), keyed by the cache's own
+  `id` and optionally filtered to one `category` (e.g. `"sync"`). Independent of
+  `clusterCachesWatch`, so sync chatter never re-emits the cache. The client upserts
+  by `id`.
+  """
+  clusterCacheEventsWatch(id: ObjectID!, category: String): Event!
+
+  """
+  Streams a cluster's reconcile-schedule gauge: the current next-attempt time on
+  subscribe, then a fresh value on every (re)schedule (backoff step, retry, poke).
+  Independent of clustersWatch — a scheduling change fires no cluster/list watch —
+  so this is what keeps a disconnected cluster's "next attempt" countdown live.
+  """
+  clusterScheduleWatch(id: ObjectID!): Schedule!
 
   "Streams the assistant's reply token-by-token. Completes after a frame with `done: true`."
   chatStream(input: ChatInput!): ChatChunk!

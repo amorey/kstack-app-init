@@ -22,6 +22,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/amorey/beehive"
 	"github.com/amorey/beehive/sqlite"
@@ -153,4 +154,30 @@ func NewTestBeehive(t *testing.T) *beehive.Beehive {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })
 	return bh
+}
+
+// recv blocks for the next value on a stream channel, failing the test if the
+// channel closes first or nothing arrives within 2s. Shared by the per-object
+// stream tests (schedule/event/probe watches) and the delta watches, which differ
+// only in element type.
+func recv[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	return recvBy(t, ch, time.After(2*time.Second))
+}
+
+// recvBy is recv with a caller-supplied deadline, so a drain loop can share one
+// deadline across iterations instead of resetting it each receive.
+func recvBy[T any](t *testing.T, ch <-chan T, deadline <-chan time.Time) T {
+	t.Helper()
+	select {
+	case v, ok := <-ch:
+		if !ok {
+			t.Fatal("stream closed unexpectedly")
+		}
+		return v
+	case <-deadline:
+		t.Fatal("timed out waiting for a stream value")
+		var zero T
+		return zero
+	}
 }
