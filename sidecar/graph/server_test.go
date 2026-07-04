@@ -205,14 +205,28 @@ func sseEvents(t *testing.T, resp *http.Response) <-chan sseEvent {
 				// `:` comment / keep-alive lines fall through and are ignored.
 			}
 		}
-		// net.ErrClosed is the expected teardown: a caller's deferred
-		// resp.Body.Close() (cancelling the subscription) races this
-		// mid-read. Only a genuine scan failure is worth a test error.
-		if err := sc.Err(); err != nil && !errors.Is(err, net.ErrClosed) {
+		// The expected teardown is a caller's deferred resp.Body.Close()
+		// (cancelling the subscription) racing this mid-read. That surfaces
+		// two ways depending on which side wins the race: net.ErrClosed when
+		// the underlying conn is torn down, or net/http's unexported
+		// errReadOnClosedResBody ("http: read on closed response body") when
+		// the client closes the body first. Neither is a real scan failure —
+		// only something else is worth a test error.
+		if err := sc.Err(); err != nil && !isExpectedStreamClose(err) {
 			t.Errorf("SSE scan: %v", err)
 		}
 	}()
 	return ch
+}
+
+// isExpectedStreamClose reports whether err is the benign result of the
+// subscription being torn down mid-read (deferred resp.Body.Close). It covers
+// net.ErrClosed (underlying conn gone) and net/http's unexported
+// errReadOnClosedResBody, which has no sentinel to match with errors.Is, so it
+// is matched by its stable message.
+func isExpectedStreamClose(err error) bool {
+	return errors.Is(err, net.ErrClosed) ||
+		strings.Contains(err.Error(), "read on closed response body")
 }
 
 // nextSSE pulls the next event with a deadline so a stalled stream fails the
