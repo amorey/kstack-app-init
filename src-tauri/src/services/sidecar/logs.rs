@@ -58,7 +58,7 @@ pub(super) enum Severity {
 type Classified = (Severity, String, String);
 
 /// Decides how a single line of sidecar output should be re-emitted, without
-/// touching `tracing`. Split out from [`forward_sidecar_line`] so the parsing
+/// touching `tracing`. Separate from [`forward_sidecar_line`] so the parsing
 /// and level-mapping rules can be unit-tested in isolation.
 ///
 /// Returns `None` for an empty or whitespace-only line (nothing to emit).

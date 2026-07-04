@@ -213,7 +213,7 @@ func waitForObservedGeneration(t *testing.T, cl beehive.Client[ClusterSpec, Clus
 
 // eligibleSpec builds a Cluster spec that passes ConnectionEligible — provided
 // contextName is present in the test watcher's kubeconfig, since the controller
-// now observes presence live from the kubeconfig (it is no longer parked in spec).
+// observes presence live from the kubeconfig.
 func eligibleSpec(contextName string) ClusterSpec {
 	return ClusterSpec{
 		Enabled:     true,
@@ -654,8 +654,8 @@ func TestClusterCoreControllerWatchProbe(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "stream closes on ctx cancel")
 }
 
-// The controller observes the kubeconfig live and writes it to status.Source (the
-// importer no longer parks it in spec). Its watcher subscription re-reconciles on
+// The controller observes the kubeconfig live and writes it to status.Source.
+// Its watcher subscription re-reconciles on
 // a kubeconfig change, so a departed context flips IsPresent=false — keeping its
 // last-known names — and goes Inactive.
 func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {

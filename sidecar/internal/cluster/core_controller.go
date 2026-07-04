@@ -76,9 +76,8 @@ type CheckFunc func(ctx context.Context, cfg *rest.Config) (HealthPhase, *string
 // ClusterCoreController reconciles Cluster beehive objects. On each pass it:
 //  1. Creates a ClusterCache child if one does not exist.
 //  2. Observes the kubeconfig live and writes the source observation
-//     (cluster/user names, presence, isDefault) to ClusterStatus.Source — the
-//     importer no longer parks it in spec; a departed context keeps its last-known
-//     names with IsPresent=false.
+//     (cluster/user names, presence, isDefault) to ClusterStatus.Source; a
+//     departed context keeps its last-known names with IsPresent=false.
 //  3. Gates on eligibility (enabled + kubeconfig present + not being deleted),
 //     using the freshly-observed presence.
 //  4. Resolves REST credentials from the current kubeconfig.
@@ -131,8 +130,8 @@ type ClusterCoreController struct {
 	// (poke/retry/kubeconfig-change) reconciles take it and re-read the object's
 	// status fresh under it, so a reconcile holding a stale snapshot cannot clobber
 	// a newer observation — beehive status writes carry no resourceVersion guard, so
-	// without this the now-status-owned source observation could be lost on a race
-	// (it used to be durable in spec). It is held across the probe; for a desktop
+	// without this the status-owned source observation could be lost on a race.
+	// It is held across the probe; for a desktop
 	// app's handful of clusters the serialized probing is acceptable.
 	writeMu sync.Mutex
 
@@ -276,8 +275,8 @@ const maxAttemptMessageLen = 200
 // recordAttempt appends one probe outcome to the cluster's beehive event log
 // (category ConnectionEventCategory). beehive coalesces consecutive outcomes
 // sharing (category, type, reason) into one aggregated run, so a repeated
-// failure bumps the current run's count/window instead of writing status — the
-// per-probe chatter the old status-stored history used to cause. It is
+// failure bumps the current run's count/window instead of writing status,
+// avoiding the per-probe chatter a status-stored history would cause. It is
 // best-effort: a write failure is logged and swallowed so it neither fails the
 // reconcile nor disturbs beehive's backoff (the connection outcome is carried
 // separately by the conditions the caller sets).
@@ -339,8 +338,7 @@ func (c *ClusterCoreController) StartBackground() {
 
 	// Subscribe to the kubeconfig watcher: on every change re-reconcile all
 	// clusters so presence/isDefault observations (and the engine start/stop the
-	// cache controller derives from them) update promptly. This replaces the
-	// trigger the importer used to provide when it parked the observation in spec.
+	// cache controller derives from them) update promptly.
 	// The stream is current-on-subscribe, so the first value reconciles everything
 	// at startup.
 	kcSub := c.cfgSource.Subscribe()
@@ -484,7 +482,7 @@ func (c *ClusterCoreController) Reconcile(ctx context.Context, client beehive.Co
 		return beehive.Result{}, nil
 	}
 
-	// The ClusterCache child is no longer created here, eagerly: it is keyed by the
+	// The ClusterCache child is not created here: it is keyed by the
 	// physical cluster's kube-system UID, which is unknown until a probe succeeds, so
 	// converge creates it post-probe (ensureClusterCache).
 
@@ -530,8 +528,8 @@ func (c *ClusterCoreController) converge(ctx context.Context, client beehive.Con
 
 	clusterID := clusterIDFromObj(obj)
 
-	// Observe the kubeconfig live and record it on status (the importer no longer
-	// parks it in spec). A departed context keeps its last-known names with
+	// Observe the kubeconfig live and record it on status. A departed context
+	// keeps its last-known names with
 	// IsPresent=false. The freshly-observed presence drives this reconcile's gate,
 	// so it never lags the status we are about to write.
 	present := c.observeKubeconfig(obj, working)

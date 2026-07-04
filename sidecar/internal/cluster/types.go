@@ -239,8 +239,8 @@ const (
 	// reasonSyncing: the engine is starting or catching up (discovery walk,
 	// drivers pre-first-watch). Condition-only — the event vocabulary names the
 	// start transitions SyncStart/ResyncStart instead, so "Syncing" is never an
-	// event reason (it used to double as one, which read ambiguously against this
-	// same-named condition state).
+	// event reason — a same-named event reason would read ambiguously against this
+	// condition state.
 	ReasonSyncing = "Syncing"
 	// reasonWatching: every driver reached its watch phase — the cache is
 	// caught up and streaming deltas.
@@ -446,7 +446,7 @@ type ClusterStatus struct {
 // ConnectionEventCategory) via RecordEvent, exposed generically through the
 // cluster events surface (clusterEvents / clusterEventsWatch, category
 // "connection"). This keeps per-probe chatter off the status watch — a repeated
-// identical failure no longer rewrites status — while beehive aggregates
+// identical failure does not rewrite status — while beehive aggregates
 // consecutive same-outcome probes into runs and bounds retention
 // (WithEventRetention).
 const (

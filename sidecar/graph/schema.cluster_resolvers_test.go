@@ -61,8 +61,8 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 			Spec:   fx.spec,
 			Status: fx.connStatus,
 		}
-		// Caches are no longer joined onto the Cluster — they stream standalone via
-		// WatchCaches and are joined client-side. Give each fixture one cache whose
+		// Caches stream standalone via WatchCaches and are joined client-side.
+		// Give each fixture one cache whose
 		// ServerUID matches the cluster's identity (the client's active-cache rule).
 		f.caches = append(f.caches, cluster.ClusterCache{
 			ID:        cluster.ClusterCacheID(id),
@@ -545,8 +545,8 @@ func TestClustersWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
 
 // firstCacheFrame opens clusterCachesWatch and returns the `cache` payload of the
 // first Added frame for cluster "1", decoded to a generic map — the cache-side
-// analogue of clustersQueryData, used by the wire-shape tests now that cache status
-// no longer hangs off the Cluster query.
+// analogue of clustersQueryData, used by the wire-shape tests; cache status is
+// exposed through clusterCachesWatch, not the Cluster query.
 func firstCacheFrame(t *testing.T, srvURL string) map[string]any {
 	t.Helper()
 	resp := openSSESubscription(t, srvURL, "",

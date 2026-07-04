@@ -543,8 +543,8 @@ function ConnectionDetail({
         />
         {/* While a probe is actually in flight (`probing`, asserted by the
             controller) show the "checking…" spinner in place of the countdown —
-            this is the definite signal, not the older heuristic of a missing
-            next-requeue time. When nothing is scheduled and no probe is running
+            the `probing` flag is the signal for the spinner. When nothing is
+            scheduled and no probe is running
             (a disabled/orphaned/ineligible cluster, or the brief pre-first-schedule
             window) the countdown is genuinely absent — show a neutral placeholder,
             never the spinner, so an idle cluster doesn't look like it's probing.

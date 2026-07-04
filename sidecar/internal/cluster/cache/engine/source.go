@@ -27,8 +27,8 @@ import (
 
 // liveSource is the production kubeSource for one GVR: full bodies + watch come
 // from the dynamic client, metadata-only lists from the metadata client. List
-// and Watch are cluster-wide (no namespace) — the same surface the old reflector
-// used — so a single driver mirrors a namespaced kind across all namespaces.
+// and Watch are cluster-wide (no namespace), so a single driver mirrors a
+// namespaced kind across all namespaces.
 type liveSource struct {
 	dyn  dynamic.Interface
 	meta metadata.Interface

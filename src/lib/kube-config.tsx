@@ -15,7 +15,7 @@
 // The kubeconfig's context list surfaced to the renderer, derived from the
 // cluster registry stream (each present cluster record carries its context
 // name and the current-context flag) — so this provider must be mounted
-// inside <ClustersProvider>. The sidecar no longer exposes a dedicated
+// inside <ClustersProvider>. The sidecar exposes no dedicated
 // kubeConfigWatch subscription; if a consumer ever needs the raw kubeconfig
 // (auth-infos, server URLs), grow the Cluster type instead.
 import { createContext, useContext, useMemo } from 'react';

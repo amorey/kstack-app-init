@@ -14,18 +14,16 @@
 
 // Engine sync-health, surfaced to the renderer.
 //
-// TODO(sync-status): the `syncStatusWatch` GraphQL surface this provider used to
-// consume was removed from the sidecar schema during the auth/cloud refactor and
-// not yet re-added. The prefsync engine still tracks status (Connecting / Live /
-// Backoff / Offline + LastError + LastSyncedAt via Engine.Status()), but it isn't
-// exposed over GraphQL — re-wiring it needs a schema SyncStatus type + a resolver
-// over a status watch hub. Until then this provider reports `null` (the
-// SyncHealthBadge degrades to its "Connecting…" muted state). Pre-existing on this
-// branch; stubbed here only to unblock codegen, tracked as separate work.
+// TODO(sync-status): the sidecar schema has no SyncStatus surface yet. The
+// prefsync engine tracks status (Connecting / Live / Backoff / Offline +
+// LastError + LastSyncedAt via Engine.Status()), but it isn't exposed over
+// GraphQL — wiring it up needs a schema SyncStatus type + a resolver over a
+// status watch hub. Until then this provider reports `null` (the
+// SyncHealthBadge degrades to its "Connecting…" muted state).
 import { createContext, useContext, useMemo } from 'react';
 
 // Mirrors the engine's status snapshot the SyncHealthBadge renders, kept as a
-// hand-written type until the GraphQL surface is restored (see TODO above).
+// hand-written type until a GraphQL surface exists (see TODO above).
 export type SyncStatus = {
   state: 'CONNECTING' | 'LIVE' | 'BACKOFF' | 'OFFLINE';
   lastError: string | null;
@@ -40,7 +38,7 @@ type SyncStatusContextValue = {
 const SyncStatusContext = createContext<SyncStatusContextValue | null>(null);
 
 export function SyncStatusProvider({ children }: { children: React.ReactNode }) {
-  // Stubbed: no status source wired yet (see TODO above). null = "not reported".
+  // No status source wired yet (see TODO above). null = "not reported".
   const value = useMemo<SyncStatusContextValue>(() => ({ status: null }), []);
   return <SyncStatusContext.Provider value={value}>{children}</SyncStatusContext.Provider>;
 }

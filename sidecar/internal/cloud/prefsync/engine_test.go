@@ -703,9 +703,7 @@ func TestPendingPatchMergedOverSnapshot(t *testing.T) {
 // intentional restart, not a sync failure: it must not be recorded as an error
 // (which would surface a false LastError and briefly read Offline) nor ratchet
 // backoff. We prove it by poking a blocked Snapshot and confirming the engine
-// re-enters Snapshot with no LastError set — under the old behavior the cancel
-// flowed through connectFailed, which set LastError="context canceled" (synchronously,
-// before the loop continued) and stayed set until the next Live.
+// re-enters Snapshot with no LastError set.
 func TestPokeDuringConnectIsNotAFailure(t *testing.T) {
 	store, q := newStoreQueue(t)
 	up := &blockSnapshotUpstream{entered: make(chan struct{}, 4)}

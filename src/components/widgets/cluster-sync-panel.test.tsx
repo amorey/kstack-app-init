@@ -432,7 +432,7 @@ describe('ClusterSyncPanel', () => {
     expect(sub.query).toContain('lastConnectedAt');
     expect(sub.query).toContain('message');
     expect(sub.query).toContain('lastTransitionTime');
-    // The probe history and the next-attempt countdown are no longer inlined on
+    // The probe history and the next-attempt countdown are not inlined on
     // the list — they stream per-row via clusterEventsWatch / clusterScheduleWatch.
     expect(sub.query).not.toContain('connectionAttempts');
     expect(sub.query).not.toContain('nextAttemptAt');

@@ -624,7 +624,7 @@ func TestFullResyncBacksOffOnListError(t *testing.T) {
 // Regression: a kind whose LIST succeeds but WATCH is unusable (e.g.
 // list-but-not-watch RBAC, or an aggregated API that rejects watch) must back
 // off between attempts rather than hot-looping full LISTs. The watch never makes
-// progress, so the resync-success no longer resets the backoff.
+// progress, so a resync-success does not reset the backoff.
 func TestUnwatchableKindBacksOff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

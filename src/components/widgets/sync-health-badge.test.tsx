@@ -17,7 +17,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { SyncStatus } from '@/lib/sync-status';
 
-// The `syncStatusWatch` GraphQL surface is stubbed out for now (see the TODO in
+// The `syncStatusWatch` GraphQL surface does not exist yet (see the TODO in
 // sync-status.tsx), so we drive the badge by mocking useSyncStatus directly. This
 // keeps the badge's label/tone logic covered independent of the (currently
 // absent) status source; formatSyncFreshness stays real via importOriginal.
