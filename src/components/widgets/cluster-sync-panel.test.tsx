@@ -519,8 +519,8 @@ describe('ClusterSyncPanel', () => {
       pushSyncEvent({
         id: '1',
         type: 'Normal',
-        reason: 'InitialSyncComplete',
-        message: 'Cached 5 objects across 3 kinds in 2s',
+        reason: 'SyncComplete',
+        message: 'Initial sync complete — cached 5 objects across 3 kinds in 2s',
         count: 1,
         firstAt: new Date(Date.now() - 90_000).toISOString(),
         lastAt: new Date(Date.now() - 80_000).toISOString(),
@@ -536,7 +536,7 @@ describe('ClusterSyncPanel', () => {
     expect(screen.getByText('Initial sync complete')).toBeInTheDocument();
     // The raw reason codes are not surfaced.
     expect(screen.queryByText(/SyncDegraded/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/InitialSyncComplete/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/SyncComplete/)).not.toBeInTheDocument();
   });
 
   it('shows a last-update freshness line in the sync detail, driven by lastSyncedAt', async () => {

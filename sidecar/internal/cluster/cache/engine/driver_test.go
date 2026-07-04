@@ -277,6 +277,66 @@ func TestMetadataDiffFetchesChanged(t *testing.T) {
 	require.Equal(t, "2", rv)
 }
 
+// A resume that falls back to a metadata-diff re-sync records the work: didResync
+// plus the count of bodies re-pulled — so the engine can report "re-synced N
+// objects" rather than a bare "watches resumed".
+func TestFullResyncRecordsResyncWorkViaMetadataDiff(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
+		VALUES ('a','v1','Pod','a','1',0,0,'{}')`)
+	require.NoError(t, err)
+	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
+
+	// 'a' changed (1→2) and 'c' is new — two bodies to re-pull via the metadata diff.
+	fs := &fakeSource{
+		metas: []objMeta{
+			{UID: "a", Namespace: "default", Name: "a", ResourceVersion: "2"},
+			{UID: "c", Namespace: "default", Name: "c", ResourceVersion: "2"},
+		},
+		metaRV: "50",
+		getByName: map[string]*unstructured.Unstructured{
+			"default/a": uObj("a", "v1", "Pod", "default", "a", "2"),
+			"default/c": uObj("c", "v1", "Pod", "default", "c", "2"),
+		},
+	}
+	d := newKindDriver(fs, store, podGVK(), "")
+
+	_, err = d.fullResync(ctx)
+	require.NoError(t, err)
+	require.True(t, d.didResync, "a full re-sync records didResync")
+	require.Equal(t, 2, d.resyncObjects, "counts the two bodies re-pulled")
+}
+
+// The full-LIST fallback (empty cache, or a changeset over the diff threshold)
+// counts every listed body as re-synced.
+func TestFullResyncRecordsResyncWorkViaFullList(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
+		VALUES ('a','v1','Pod','a','1',0,0,'{}')`)
+	require.NoError(t, err)
+	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
+
+	fs := &fakeSource{
+		metas: []objMeta{
+			{UID: "a", Namespace: "default", Name: "a", ResourceVersion: "2"},
+			{UID: "c", Namespace: "default", Name: "c", ResourceVersion: "2"},
+		},
+		metaRV:   "50",
+		listObjs: []*unstructured.Unstructured{uObj("a", "v1", "Pod", "default", "a", "2"), uObj("c", "v1", "Pod", "default", "c", "2")},
+		listRV:   "60",
+	}
+	d := newKindDriverWithOptions(fs, store, podGVK(), "", withDiffThreshold(1)) // two changed > 1 => full LIST
+
+	_, err = d.fullResync(ctx)
+	require.NoError(t, err)
+	require.True(t, d.didResync)
+	require.Equal(t, 2, d.resyncObjects, "counts every listed body")
+}
+
 // A uid present in the cache but absent from the live metadata list is deleted.
 func TestMetadataDiffDeletesMissing(t *testing.T) {
 	ctx := context.Background()

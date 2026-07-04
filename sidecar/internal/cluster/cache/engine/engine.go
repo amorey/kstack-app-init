@@ -116,21 +116,34 @@ type EngineStatus struct {
 	// yet this engine run. Flushed coarsely (~30s), not per write.
 	LastSyncedAt *time.Time
 
-	// The following describe the catch-up milestone and are set only on the
-	// report that first reaches EngineWatching after a (re)start — they are zero
-	// on every other report (reset when the engine re-enters EngineSyncing). The
-	// controller reads them on that transition to compose its event message.
+	// The following describe the catch-up milestone and feed the controller's event
+	// message; which reports carry each field varies, so see the per-field notes
+	// below (the counts, notably, also ride the warm EngineSyncing start report).
+	// All are reset (clearCatchUp) when the engine re-enters EngineSyncing.
 	//
 	// ColdStart is true when this was the cache's first-ever sync (no prior
 	// state), false when it resumed an already-populated cache — the signal that
-	// separates SyncStarted/InitialSyncComplete from Resynced.
+	// separates SyncStart/SyncComplete from ResyncStart/ResyncComplete.
 	ColdStart bool
-	// SyncedObjects/SyncedKinds are how much the catch-up mirrored (objects across
-	// kinds); CaughtUpIn is how long it took. All three power the human-facing
-	// "Cached N objects across M kinds in Ds" message.
+	// SyncedObjects/SyncedKinds are how many objects across how many kinds the sync
+	// involves, and CaughtUpIn is how long the catch-up took. They power the
+	// human-facing "…N objects across M kinds in Ds" messages. Set on the caught-up
+	// EngineWatching report (the mirrored total, with CaughtUpIn); SyncedObjects/
+	// SyncedKinds are also set on a *warm* EngineSyncing start report (the warm
+	// cache being resumed, CaughtUpIn still zero). Zero on every other report.
 	SyncedObjects int
 	SyncedKinds   int
 	CaughtUpIn    time.Duration
+
+	// ResyncedKinds/ResyncedObjects break down how much of a warm resume was real
+	// work rather than a clean reconnect: how many kinds fell back to a full
+	// re-sync (saved resourceVersion missing or expired) and how many object bodies
+	// those re-pulled. Aggregated across the drivers, set only on the caught-up
+	// EngineWatching report; zero on a pure reconnect (every kind resumed its watch
+	// directly) and on a cold build. The controller renders them into the
+	// ResyncComplete message.
+	ResyncedKinds   int
+	ResyncedObjects int
 
 	// StaleKinds names the kinds whose watch went quiet past the threshold; set
 	// only on EngineStale reports (the "no watch heartbeat for X" message), zero
@@ -144,6 +157,7 @@ type EngineStatus struct {
 func (s *EngineStatus) clearCatchUp() {
 	s.ColdStart = false
 	s.SyncedObjects, s.SyncedKinds, s.CaughtUpIn = 0, 0, 0
+	s.ResyncedKinds, s.ResyncedObjects = 0, 0
 	s.StaleKinds = nil
 }
 
@@ -302,16 +316,16 @@ func (e *Engine) report(update func(*EngineStatus)) {
 }
 
 // reportCaughtUp emits the catch-up milestone — every driver has entered its
-// watch phase. It totals what was mirrored (a single read query, at the
-// transition only — not per report) and stamps the elapsed time so the
-// controller can compose the InitialSyncComplete/Resynced message. A count
-// failure is logged and reported as zero rather than failing the milestone.
-func (e *Engine) reportCaughtUp(ctx context.Context, coldStart bool, kinds int, startedAt time.Time) {
+// watch phase. It stamps the elapsed time and carries the drivers' aggregated
+// re-sync breakdown (resyncedKinds/resyncedObjects) so the controller can
+// compose the SyncComplete/ResyncComplete message. Only a cold build's message
+// reports the object total, so the whole-table count runs on that path alone (a
+// warm resume's message is watch-oriented and never reads SyncedObjects); a
+// count failure is logged and reported as zero rather than failing the milestone.
+func (e *Engine) reportCaughtUp(ctx context.Context, coldStart bool, kinds int, startedAt time.Time, resyncedKinds, resyncedObjects int) {
 	objects := 0
-	if n, err := cachedObjectCount(ctx, e.cdb); err != nil {
-		slog.Warn("clustersync: count cached objects", "id", e.cdb.ID(), "err", err)
-	} else {
-		objects = n
+	if coldStart {
+		objects = e.countOrZero(ctx, cachedObjectCount, "count cached objects")
 	}
 	elapsed := e.now().Sub(startedAt)
 	e.report(func(s *EngineStatus) {
@@ -320,6 +334,8 @@ func (e *Engine) reportCaughtUp(ctx context.Context, coldStart bool, kinds int, 
 		s.SyncedKinds = kinds
 		s.SyncedObjects = objects
 		s.CaughtUpIn = elapsed
+		s.ResyncedKinds = resyncedKinds
+		s.ResyncedObjects = resyncedObjects
 	})
 }
 
@@ -336,14 +352,34 @@ func cacheHasData(ctx context.Context, cdb *store.ClusterDB) (bool, error) {
 	return has, err
 }
 
+// countOrZero runs a cache-count query, logging and returning 0 on error so a
+// failed count degrades the event message rather than failing the sync.
+func (e *Engine) countOrZero(ctx context.Context, count func(context.Context, *store.ClusterDB) (int, error), what string) int {
+	n, err := count(ctx, e.cdb)
+	if err != nil {
+		slog.Warn("clustersync: "+what, "id", e.cdb.ID(), "err", err)
+		return 0
+	}
+	return n
+}
+
 // cachedObjectCount totals the objects mirrored across every kind (the universal
-// objects table plus events), reported at catch-up for the "Cached N objects
-// across M kinds" message.
+// objects table plus events), reported at catch-up for the "…N objects across M
+// kinds" message (and at a warm ResyncStart for the warm-cache size).
 func cachedObjectCount(ctx context.Context, cdb *store.ClusterDB) (int, error) {
 	var total int
 	err := cdb.Reader().QueryRowContext(ctx,
 		`SELECT (SELECT COUNT(*) FROM objects) + (SELECT COUNT(*) FROM events)`).Scan(&total)
 	return total, err
+}
+
+// cachedKindCount totals the distinct kinds the cache already tracks — the prior
+// run's kind_catalog, still present at a warm resume's start (discovery rebuilds
+// it later, inside run) — for the ResyncStart "across M kinds" warm-cache size.
+func cachedKindCount(ctx context.Context, cdb *store.ClusterDB) (int, error) {
+	var n int
+	err := cdb.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM kind_catalog`).Scan(&n)
+	return n, err
 }
 
 // runLoop supervises run: any return while the engine is still wanted (a
@@ -354,7 +390,7 @@ func (e *Engine) runLoop(ctx context.Context) {
 	for {
 		// Decide cold-vs-resume before anything repopulates the cache, so the
 		// in-progress Syncing report carries ColdStart (a first-ever build is a
-		// SyncStarted transition, a resume is the plain Syncing) and run() reuses
+		// SyncStart transition, a resume is a ResyncStart) and run() reuses
 		// the same verdict for the catch-up milestone.
 		coldStart := true
 		if has, err := cacheHasData(ctx, e.cdb); err != nil {
@@ -362,12 +398,22 @@ func (e *Engine) runLoop(ctx context.Context) {
 		} else {
 			coldStart = !has
 		}
+		// For a warm resume, read the warm cache's size so the ResyncStart event can
+		// report what it's resuming from. A cold start's cache is empty, so it needs
+		// no counts (its message is the static "Starting initial sync").
+		var warmObjects, warmKinds int
+		if !coldStart {
+			warmObjects = e.countOrZero(ctx, cachedObjectCount, "count cached objects")
+			warmKinds = e.countOrZero(ctx, cachedKindCount, "count cached kinds")
+		}
 		// Re-entering Syncing clears the previous run's catch-up facts so a later
-		// snapshot (a heartbeat or an error) can't carry stale counts.
+		// snapshot (a heartbeat or an error) can't carry stale counts; the warm-cache
+		// size (set only for a resume) then rides the ResyncStart report.
 		e.report(func(s *EngineStatus) {
 			s.State, s.LastError = EngineSyncing, ""
 			s.clearCatchUp()
 			s.ColdStart = coldStart
+			s.SyncedObjects, s.SyncedKinds = warmObjects, warmKinds
 		})
 		err := e.run(ctx, coldStart)
 		if ctx.Err() != nil {
@@ -432,6 +478,12 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 
 	var pending atomic.Int64
 	pending.Store(int64(len(entries)))
+	// Aggregate the per-driver re-sync work as each driver reaches its watch phase.
+	// Each driver contributes its own snapshot once (from its Run goroutine, at first
+	// watch entry) — folded into these atomics rather than read back from the driver
+	// structs, so a driver's later full-resync retry can't race the aggregation or
+	// bleed post-catch-up work into the first ResyncComplete counts.
+	var resyncedKinds, resyncedObjects atomic.Int64
 	caughtUp := make(chan struct{})
 	var caughtUpOnce sync.Once
 	drivers := make([]*kindDriver, 0, len(entries))
@@ -454,9 +506,14 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 		}
 		d := newKindDriver(newLiveSource(dyn, md, entry), store, entry.GVK, seedRV)
 		d.now = e.now // one clock: driver liveness is judged against the engine's now
-		d.onWatch = func() {
+		d.onWatch = func(resynced bool, objects int) {
+			if resynced {
+				resyncedKinds.Add(1)
+				resyncedObjects.Add(int64(objects))
+			}
 			if pending.Add(-1) == 0 {
-				e.reportCaughtUp(runCtx, coldStart, kinds, startedAt)
+				e.reportCaughtUp(runCtx, coldStart, kinds, startedAt,
+					int(resyncedKinds.Load()), int(resyncedObjects.Load()))
 				caughtUpOnce.Do(func() { close(caughtUp) })
 			}
 		}

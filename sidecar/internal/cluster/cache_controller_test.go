@@ -47,7 +47,7 @@ func (f *fakeEngine) Start() {
 	// Report asynchronously — Start is called while the controller holds writeMu,
 	// and Report acquires writeMu too, so a synchronous call would deadlock. Model
 	// a realistic cold first sync (ColdStart + catch-up counts) so the recorded
-	// event is InitialSyncComplete, not a bare Watching.
+	// event is SyncComplete, not a bare Watching.
 	go f.sink.Report(engine.EngineStatus{
 		State: engine.EngineWatching, ColdStart: true,
 		SyncedObjects: 5, SyncedKinds: 3, CaughtUpIn: 2 * time.Second,
@@ -254,15 +254,16 @@ func TestCacheControllerDeletionStopsEngineAndClearsFinalizer(t *testing.T) {
 // TestCacheControllerRecordsSyncEvents verifies the cache controller records each
 // engine status report into the ClusterCache's beehive event log under the "sync"
 // category — the parallel of the connection controller's probe-outcome history,
-// exposed generically to the frontend. Watching → Normal/Watching, Errored →
-// Warning/SyncFailed (carrying the engine's LastError), Syncing → Normal/Syncing.
+// exposed generically to the frontend. A caught-up Watching → Normal/SyncComplete
+// (cold) or ResyncComplete (warm), Errored → Warning/SyncDegraded (carrying the
+// engine's LastError), a warm Syncing → Normal/ResyncStart.
 // It records only on a *transition* — a change in (type, reason) — so the
 // engine's steady-state freshness heartbeat (a repeated catch-up report that only
 // bumps LastSyncedAt) does NOT open or extend an event run. This is what keeps a
 // healthy cluster from reading as a meaningless "Watching ×27"; the heartbeat
 // still lands on LastSyncedAt via the status write. The reasons are the
-// transition vocabulary: a cold catch-up is InitialSyncComplete (with a "Cached N
-// objects across M kinds" message), an engine failure is SyncDegraded.
+// transition vocabulary: a cold catch-up is SyncComplete (with a "…N objects
+// across M kinds…" message), an engine failure is SyncDegraded.
 func TestCacheControllerRecordsSyncEvents(t *testing.T) {
 	ctx := context.Background()
 	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
@@ -299,22 +300,22 @@ func TestCacheControllerRecordsSyncEvents(t *testing.T) {
 
 	// ListEvents is newest-run-first.
 	assert.Equal(t, beehive.EventNormal, evs[0].Type)
-	assert.Equal(t, ReasonSyncing, evs[0].Reason)
+	assert.Equal(t, ReasonResyncStart, evs[0].Reason)
 
 	assert.Equal(t, beehive.EventWarning, evs[1].Type)
 	assert.Equal(t, ReasonSyncDegraded, evs[1].Reason)
 	assert.Equal(t, "boom", evs[1].Message)
 
 	assert.Equal(t, beehive.EventNormal, evs[2].Type)
-	assert.Equal(t, ReasonInitialSyncComplete, evs[2].Reason)
+	assert.Equal(t, ReasonSyncComplete, evs[2].Reason)
 	assert.Equal(t, 1, evs[2].Count,
 		"the steady-state catch-up heartbeat is not recorded, so the run stays count 1")
-	assert.Equal(t, "Cached 5 objects across 3 kinds in 2s", evs[2].Message)
+	assert.Equal(t, "Initial sync complete — cached 5 objects across 3 kinds in 2s", evs[2].Message)
 }
 
-// A cold Syncing report reads as SyncStarted; a warm catch-up (an already-
-// populated cache resuming) reads as Resynced, with a "Re-synced …" message — the
-// pair that distinguishes a first-ever build from a reconnect.
+// A cold Syncing report reads as SyncStart; a warm catch-up (an already-populated
+// cache resuming) reads as ResyncComplete, with a "Re-sync complete …" message —
+// the start/complete pairs that distinguish a first-ever build from a reconnect.
 func TestCacheControllerSyncEventVocabulary(t *testing.T) {
 	ctx := context.Background()
 	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
@@ -327,7 +328,7 @@ func TestCacheControllerSyncEventVocabulary(t *testing.T) {
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
-	// Wait for the initial cold catch-up (InitialSyncComplete) so the entry is live.
+	// Wait for the initial cold catch-up (SyncComplete) so the entry is live.
 	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
 
 	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineSyncing, ColdStart: true})
@@ -338,12 +339,48 @@ func TestCacheControllerSyncEventVocabulary(t *testing.T) {
 
 	evs, err := cacheClient.ListEvents(ctx, cacheObj.ID, beehive.WithEventCategory(SyncEventCategory))
 	require.NoError(t, err)
-	require.Len(t, evs, 3) // newest-first: Resynced, SyncStarted, InitialSyncComplete
+	require.Len(t, evs, 3) // newest-first: ResyncComplete, SyncStart, SyncComplete
 
-	assert.Equal(t, ReasonResynced, evs[0].Reason)
-	assert.Equal(t, "Re-synced 7 objects across 4 kinds in 1.5s", evs[0].Message)
-	assert.Equal(t, ReasonSyncStarted, evs[1].Reason)
-	assert.Equal(t, ReasonInitialSyncComplete, evs[2].Reason)
+	assert.Equal(t, ReasonResyncComplete, evs[0].Reason)
+	assert.Equal(t, "Re-sync complete — resumed watches for 4 kinds in 1.5s", evs[0].Message)
+	assert.Equal(t, ReasonSyncStart, evs[1].Reason)
+	assert.Equal(t, ReasonSyncComplete, evs[2].Reason)
+}
+
+// resyncCompleteMessage has three shapes, keyed on the engine's aggregated facts:
+// a bare liveness recovery (no kinds caught up), a pure watch-reconnect (kinds
+// resumed but none re-listed), and a resume where some kinds fell back to a full
+// re-sync (reporting the re-pulled bodies and how many kinds did the work).
+func TestResyncCompleteMessage(t *testing.T) {
+	tests := []struct {
+		name string
+		st   engine.EngineStatus
+		want string
+	}{
+		{
+			name: "bare liveness recovery",
+			st:   engine.EngineStatus{SyncedKinds: 0},
+			want: "Re-sync complete — watch recovered, streaming updates again",
+		},
+		{
+			name: "pure reconnect — nothing re-listed",
+			st:   engine.EngineStatus{SyncedKinds: 120, CaughtUpIn: 0},
+			want: "Re-sync complete — resumed watches for 120 kinds in 0s",
+		},
+		{
+			name: "some kinds re-synced",
+			st: engine.EngineStatus{
+				SyncedKinds: 120, ResyncedKinds: 4, ResyncedObjects: 340,
+				CaughtUpIn: 8 * time.Second,
+			},
+			want: "Re-sync complete — resumed watches for 120 kinds — re-synced 340 objects in 4 of them — in 8s",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, resyncCompleteMessage(tt.st))
+		})
+	}
 }
 
 // An EngineStale report flips the Synced condition to False/Stale and records a

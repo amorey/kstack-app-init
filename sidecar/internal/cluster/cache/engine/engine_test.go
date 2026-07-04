@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
@@ -101,7 +102,7 @@ func TestEngineReportsErroredAndRetriesWithBackoff(t *testing.T) {
 			sawSyncing = true
 			require.Empty(t, st.LastError, "Syncing reports carry no error")
 			require.True(t, st.ColdStart,
-				"an empty cache's Syncing report is a cold start (drives the SyncStarted event)")
+				"an empty cache's Syncing report is a cold start (drives the SyncStart event)")
 		case EngineErrored:
 			sawErrored = true
 			require.NotEmpty(t, st.LastError, "Errored reports carry the failure")
@@ -262,7 +263,7 @@ func TestContextProxyURL(t *testing.T) {
 // cacheHasData tells a cold cache (never synced) from a resume of prior state,
 // keyed on any kind having persisted a resume cookie. It's what lets the catch-up
 // milestone report ColdStart, so the controller can distinguish
-// SyncStarted/InitialSyncComplete from a Resynced resume.
+// SyncStart/SyncComplete from a ResyncStart/ResyncComplete resume.
 func TestEngineCacheHasData(t *testing.T) {
 	ctx := context.Background()
 	cdb := migratedCDB(t)
@@ -299,7 +300,7 @@ func TestEngineReportsCatchUpFacts(t *testing.T) {
 	startedAt := at.Add(-3 * time.Second)
 	e := newEngineWithOptions(nil, cdb, sink, withEngineNow(func() time.Time { return at }))
 
-	e.reportCaughtUp(ctx, true /*coldStart*/, 4 /*kinds*/, startedAt)
+	e.reportCaughtUp(ctx, true /*coldStart*/, 4 /*kinds*/, startedAt, 0 /*resyncedKinds*/, 0 /*resyncedObjects*/)
 
 	sts := sink.statuses()
 	require.Len(t, sts, 1)
@@ -309,6 +310,26 @@ func TestEngineReportsCatchUpFacts(t *testing.T) {
 	require.Equal(t, 4, got.SyncedKinds)
 	require.Equal(t, 2, got.SyncedObjects)
 	require.Equal(t, 3*time.Second, got.CaughtUpIn)
+}
+
+// A warm resume's catch-up carries the re-sync breakdown the drivers aggregated:
+// how many kinds fell back to a full re-sync and how many bodies they re-pulled,
+// which the controller renders into the ResyncComplete message.
+func TestEngineReportsResyncFacts(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	sink := newRecordingSink()
+	at := time.Date(2026, 6, 12, 10, 0, 8, 0, time.UTC)
+	startedAt := at.Add(-8 * time.Second)
+	e := newEngineWithOptions(nil, cdb, sink, withEngineNow(func() time.Time { return at }))
+
+	e.reportCaughtUp(ctx, false /*coldStart*/, 120 /*kinds*/, startedAt, 4 /*resyncedKinds*/, 340 /*resyncedObjects*/)
+
+	sts := sink.statuses()
+	require.Len(t, sts, 1)
+	got := sts[0]
+	require.Equal(t, 4, got.ResyncedKinds)
+	require.Equal(t, 340, got.ResyncedObjects)
 }
 
 // The liveness monitor flags EngineStale (naming the wedged kind) once a driver
@@ -432,11 +453,14 @@ func TestDriverOnWatchFiresOnce(t *testing.T) {
 
 	var mu sync.Mutex
 	calls := 0
+	var gotResynced bool
+	var gotObjects int
 	noSleep := func(context.Context, time.Duration) error { return nil }
 	d := newKindDriverWithOptions(fs, store, podGVK(), "100", withSleep(noSleep))
-	d.onWatch = func() {
+	d.onWatch = func(resynced bool, objects int) {
 		mu.Lock()
 		calls++
+		gotResynced, gotObjects = resynced, objects
 		mu.Unlock()
 	}
 
@@ -453,8 +477,104 @@ func TestDriverOnWatchFiresOnce(t *testing.T) {
 
 	mu.Lock()
 	got := calls
-	mu.Unlock()
 	require.Equal(t, 1, got, "onWatch fires exactly once per driver")
+	require.False(t, gotResynced, "a clean watch-resume (valid seed RV) did no full re-sync")
+	require.Equal(t, 0, gotObjects, "and re-pulled no bodies")
+	mu.Unlock()
+
+	cancel()
+	<-done
+}
+
+// A warm resume whose saved cookie is server-expired reports the re-sync, not a
+// clean reconnect. The first watch is accepted and only then 410s, so onWatch is
+// deferred (not fired) on that attempt; Run falls back to fullResync and re-enters
+// with a fresh RV, where onWatch fires with didResync=true and the re-pulled count.
+// A never-firing grace isolates the fix: the only path to onWatch here is the
+// post-410 re-sync, so a premature clean-resume report would leave calls at 0.
+func TestDriverOnWatchReportsResyncAfterExpiredCookie(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	insertObject(t, w, "a", "v1", "Pod") // warm cache: 'a' present at RV 1, now stale
+	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
+
+	fs := &fakeSource{
+		watchers:        make(chan *watch.FakeWatcher, 4),
+		autoExpireFirst: true, // first watch 410s → forces the re-sync
+		metas:           []objMeta{{UID: "a", Namespace: "default", Name: "a", ResourceVersion: "2"}},
+		metaRV:          "200",
+		getByName:       map[string]*unstructured.Unstructured{"default/a": uObj("a", "v1", "Pod", "default", "a", "2")},
+	}
+
+	var mu sync.Mutex
+	calls := 0
+	var gotResynced bool
+	var gotObjects int
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	neverGrace := func(time.Duration) (<-chan time.Time, func()) { return nil, func() {} }
+	d := newKindDriverWithOptions(fs, store, podGVK(), "5", withSleep(noSleep), withGraceTimer(neverGrace))
+	d.onWatch = func(resynced bool, objects int) {
+		mu.Lock()
+		calls++
+		gotResynced, gotObjects = resynced, objects
+		mu.Unlock()
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return calls == 1 }, "onWatch fired after the re-sync")
+
+	mu.Lock()
+	require.Equal(t, 1, calls, "onWatch fires exactly once")
+	require.True(t, gotResynced, "the expired cookie forced a full re-sync — reported, not a clean resume")
+	require.Equal(t, 1, gotObjects, "the one changed body the re-sync re-pulled")
+	mu.Unlock()
+
+	cancel()
+	<-done
+}
+
+// A warm resume with a still-valid but quiet cookie (no deltas, no 410) reports a
+// clean resume: onWatch is deferred on entry and fires once the resumeGrace elapses
+// with didResync=false — the grace being what lets a prompt 410 disqualify the
+// clean-resume report first (see TestDriverOnWatchReportsResyncAfterExpiredCookie).
+func TestDriverOnWatchFiresOnGraceForQuietResume(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+	fs := &fakeSource{watchers: make(chan *watch.FakeWatcher, 4)} // quiet: never pushes a delta
+
+	grace := make(chan time.Time, 1)
+	var mu sync.Mutex
+	calls := 0
+	var gotResynced bool
+	d := newKindDriverWithOptions(fs, store, podGVK(), "100",
+		withGraceTimer(func(time.Duration) (<-chan time.Time, func()) { return grace, func() {} }))
+	d.onWatch = func(resynced bool, _ int) {
+		mu.Lock()
+		calls++
+		gotResynced = resynced
+		mu.Unlock()
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	<-fs.watchers // watch established and accepted; it stays quiet
+	mu.Lock()
+	require.Equal(t, 0, calls, "a quiet valid-cookie resume doesn't report until the grace elapses")
+	mu.Unlock()
+
+	grace <- time.Time{} // grace elapses with no 410 → clean resume
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return calls == 1 }, "onWatch fired on grace")
+
+	mu.Lock()
+	require.False(t, gotResynced, "a quiet valid cookie is a clean resume, not a re-sync")
+	mu.Unlock()
 
 	cancel()
 	<-done

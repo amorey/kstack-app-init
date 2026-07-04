@@ -55,6 +55,19 @@ import (
 // cache) takes the LIST.
 const defaultDiffThreshold = 200
 
+// defaultResumeGrace is how long a first watch seeded from the saved cookie waits
+// to prove usable before onWatch reports it as a clean resume. A stale-cookie 410
+// is a synchronous server rejection that arrives within a round trip, so this need
+// only clear network/tail latency; it is also the one-time delay a warm resume's
+// Syncing→Watching flip pays (drivers wait it concurrently, so it isn't summed).
+const defaultResumeGrace = 2 * time.Second
+
+// realGraceTimer is the production graceTimer: a time.Timer's channel plus its Stop.
+func realGraceTimer(d time.Duration) (<-chan time.Time, func()) {
+	t := time.NewTimer(d)
+	return t.C, func() { t.Stop() }
+}
+
 // errExpired means the watch's resourceVersion is too old (410 Gone); the only
 // recovery is a full re-sync to obtain a fresh RV.
 var errExpired = errors.New("clustersync: watch resourceVersion expired")
@@ -113,14 +126,24 @@ type kindDriver struct {
 
 	seedRV string // persisted resume point at construction
 
-	// onWatch, when set, is invoked once — the first time the driver enters
-	// its watch phase. The engine counts these down to flip its reported
-	// state from Syncing to Watching.
-	onWatch       func()
+	// onWatch, when set, is fired once per Run — reporting whether this driver fell
+	// back to a full re-sync and how many bodies it re-pulled (didResync/
+	// resyncObjects). The engine counts these down to flip its reported state from
+	// Syncing to Watching, and aggregates the re-sync work for the ResyncComplete
+	// message. It is fired by fireOnWatch (see watchPhase for when), which sawWatch
+	// guards to once.
+	onWatch       func(resynced bool, objects int)
 	sawWatch      bool
 	diffThreshold int
 	backoffInit   time.Duration
 	backoffMax    time.Duration
+	// resumeGrace bounds how long the first watch seeded straight from the saved
+	// cookie waits to prove usable before onWatch reports it as a clean resume — long
+	// enough that a prompt 410 (expired cookie) reliably arrives first. See watchPhase.
+	resumeGrace time.Duration
+	// graceTimer starts the resumeGrace countdown, returning its fire channel and a
+	// stop func; a test seam (defaults to realGraceTimer over time.NewTimer).
+	graceTimer func(time.Duration) (<-chan time.Time, func())
 	// sleep is a ctx-aware backoff sleep; a test seam so backoff is deterministic.
 	sleep func(ctx context.Context, d time.Duration) error
 	// now stamps the liveness time; a test seam (defaults to time.Now).
@@ -142,6 +165,15 @@ type kindDriver struct {
 	// monotonic and touched from the tap and run goroutines, hence atomic.
 	deltaSeen    atomic.Int64
 	deltaApplied atomic.Int64
+
+	// didResync records whether this driver fell back to a full re-sync — a
+	// metadata-diff or a full LIST, because its saved resourceVersion was missing or
+	// expired — rather than resuming its watch directly, and resyncObjects counts the
+	// object bodies it re-pulled doing so. The engine reads them at the catch-up
+	// handoff to tell a clean reconnect from a resume that had to re-list. Written
+	// only from the Run goroutine (fullResync/fullList), so they need no locking.
+	didResync     bool
+	resyncObjects int
 }
 
 // option configures a kindDriver's test seams. Production never tunes them, so
@@ -161,6 +193,10 @@ func withNow(fn func() time.Time) option {
 	return func(d *kindDriver) { d.now = fn }
 }
 
+func withGraceTimer(fn func(time.Duration) (<-chan time.Time, func())) option {
+	return func(d *kindDriver) { d.graceTimer = fn }
+}
+
 func newKindDriver(src kubeSource, store kindStore, gvk schema.GroupVersionKind, seedRV string) *kindDriver {
 	return newKindDriverWithOptions(src, store, gvk, seedRV)
 }
@@ -174,6 +210,8 @@ func newKindDriverWithOptions(src kubeSource, store kindStore, gvk schema.GroupV
 		diffThreshold: defaultDiffThreshold,
 		backoffInit:   1 * time.Second,
 		backoffMax:    30 * time.Second,
+		resumeGrace:   defaultResumeGrace,
+		graceTimer:    realGraceTimer,
 		sleep:         ctxSleep,
 		now:           time.Now,
 	}
@@ -249,6 +287,16 @@ func (d *kindDriver) nextBackoff(b time.Duration) time.Duration {
 	return b
 }
 
+// fireOnWatch reports the catch-up milestone for this driver — once per Run,
+// guarded by sawWatch — snapshotting its resync facts (didResync/resyncObjects) in
+// the Run goroutine so the engine's aggregation never races a later re-sync write.
+func (d *kindDriver) fireOnWatch() {
+	d.sawWatch = true
+	if d.onWatch != nil {
+		d.onWatch(d.didResync, d.resyncObjects)
+	}
+}
+
 // watchPhase resumes the watch from rv via a RetryWatcher and applies deltas
 // until ctx cancellation, a 410 (errExpired), or the RetryWatcher giving up (nil
 // — Run re-syncs either way). It reports whether the watch made progress (applied
@@ -267,14 +315,29 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 	}
 	defer rw.Stop()
 
+	// Entering the watch phase is itself proof the watch is alive — seed liveness at
+	// catch-up so a quiet kind isn't judged stale before its first bookmark arrives.
+	d.markLive()
+
+	// Fire onWatch (the catch-up milestone + resync-facts snapshot) exactly once per
+	// Run. When a re-sync already ran this iteration — a cold start, or the re-entry
+	// after a 410 — the RV is fresh and can't expire, so fire immediately for a prompt
+	// Syncing→Watching flip. When resuming straight from the saved cookie, though, the
+	// server can accept the watch and only then return a 410 (expired cookie): firing
+	// on entry would misreport that re-list as a clean resume. So defer the fire until
+	// the watch proves usable — the first delta, or a resumeGrace with no 410 (a quiet
+	// but valid cookie) — and skip it entirely if the watch 410s first; Run then
+	// re-syncs and re-enters here with didResync=true, taking the immediate-fire path.
+	var graceC <-chan time.Time
+	pendingFire := false
 	if !d.sawWatch {
-		d.sawWatch = true
-		// Entering the watch phase is itself proof the watch is alive — seed
-		// liveness at catch-up so a quiet kind isn't judged stale before its first
-		// bookmark arrives.
-		d.markLive()
-		if d.onWatch != nil {
-			d.onWatch()
+		if d.didResync {
+			d.fireOnWatch()
+		} else {
+			pendingFire = true
+			ch, stop := d.graceTimer(d.resumeGrace)
+			defer stop()
+			graceC = ch
 		}
 	}
 
@@ -283,6 +346,11 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 		select {
 		case <-ctx.Done():
 			return progressed, ctx.Err()
+		case <-graceC:
+			// No delta and no 410 within the grace — the watch accepted the cookie and
+			// is merely quiet, so this is a clean resume. Fire and stop watching grace.
+			d.fireOnWatch()
+			pendingFire, graceC = false, nil
 		case ev, ok := <-rw.ResultChan():
 			if !ok {
 				if sawExpired {
@@ -292,6 +360,12 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 			}
 			switch ev.Type {
 			case watch.Added, watch.Modified, watch.Deleted:
+				// The first forwarded delta proves the cookie was accepted; fire a still-
+				// pending onWatch now rather than waiting out the grace.
+				if pendingFire {
+					d.fireOnWatch()
+					pendingFire, graceC = false, nil
+				}
 				u, ok := ev.Object.(*unstructured.Unstructured)
 				if !ok {
 					continue
@@ -326,6 +400,9 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 // large or the cache is empty, where one full LIST is cheaper. Events take the
 // plain full-LIST path. Returns the resourceVersion to seed the watch from.
 func (d *kindDriver) fullResync(ctx context.Context) (string, error) {
+	// Reaching fullResync means this kind couldn't resume its watch directly (no
+	// saved resource-version, or it expired) — record that for the catch-up report.
+	d.didResync = true
 	md, ok := d.store.(metadataDiffStore)
 	if !ok {
 		return d.fullList(ctx) // events: no metadata diff
@@ -376,6 +453,7 @@ func (d *kindDriver) fullResync(ctx context.Context) (string, error) {
 		if err := d.store.ApplyChange(watch.Modified, u); err != nil {
 			return "", err
 		}
+		d.resyncObjects++
 	}
 	for uid := range have {
 		if _, ok := seen[uid]; !ok {
@@ -398,6 +476,7 @@ func (d *kindDriver) fullList(ctx context.Context) (string, error) {
 	if err := d.store.ReplaceFull(items, rv); err != nil {
 		return "", err
 	}
+	d.resyncObjects += len(items)
 	return rv, nil
 }
 

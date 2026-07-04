@@ -237,7 +237,10 @@ const (
 	// deactivated, orphaned, or archived.
 	ReasonPaused = "Paused"
 	// reasonSyncing: the engine is starting or catching up (discovery walk,
-	// drivers pre-first-watch).
+	// drivers pre-first-watch). Condition-only — the event vocabulary names the
+	// start transitions SyncStart/ResyncStart instead, so "Syncing" is never an
+	// event reason (it used to double as one, which read ambiguously against this
+	// same-named condition state).
 	ReasonSyncing = "Syncing"
 	// reasonWatching: every driver reached its watch phase — the cache is
 	// caught up and streaming deltas.
@@ -253,16 +256,24 @@ const (
 	// The following are sync-EVENT reasons (the ClusterCache event log's
 	// transition vocabulary), distinct from the Synced-condition reasons above
 	// (which name the current state). Events are transition-oriented and carry
-	// richer messages; a healthy steady state records no event at all.
+	// richer messages; a healthy steady state records no event at all. They come
+	// in start/complete pairs, cold and warm, so the log reads symmetrically:
+	// SyncStart→SyncComplete for a first-ever build, ResyncStart→ResyncComplete
+	// for a resume.
 	//
-	// reasonSyncStarted: a cold cache began its first-ever build.
-	ReasonSyncStarted = "SyncStarted"
-	// reasonInitialSyncComplete: a cold build reached the caught-up milestone —
-	// the local copy is now complete.
-	ReasonInitialSyncComplete = "InitialSyncComplete"
-	// reasonResynced: an already-populated cache re-reached the caught-up
-	// milestone after a resume (poke, reconnect, credential restart).
-	ReasonResynced = "Resynced"
+	// reasonSyncStart: a cold cache began its first-ever build.
+	ReasonSyncStart = "SyncStart"
+	// reasonSyncComplete: a cold build reached the caught-up milestone — the
+	// local copy is now complete.
+	ReasonSyncComplete = "SyncComplete"
+	// reasonResyncStart: an already-populated cache began resuming (poke,
+	// reconnect, credential restart) — its message reports the warm cache size.
+	ReasonResyncStart = "ResyncStart"
+	// reasonResyncComplete: a resume re-reached the caught-up milestone. Its
+	// message disambiguates the two shapes a resume can take — a real catch-up
+	// (carrying counts) vs a bare liveness recovery (a stale watch resuming, no
+	// counts) — so no separate reason is needed for the recovery case.
+	ReasonResyncComplete = "ResyncComplete"
 	// reasonSyncDegraded: an engine-level failure; the engine is retrying with
 	// backoff. The event-log parallel of the SyncFailed condition reason.
 	ReasonSyncDegraded = "SyncDegraded"

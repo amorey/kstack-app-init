@@ -603,48 +603,84 @@ func (c *ClusterCacheController) recordSyncEvent(ctx context.Context, entry *eng
 
 // syncEvent maps one engine status report onto a beehive event's (type, reason,
 // message) — the transition vocabulary the event log speaks (distinct from
-// syncedCondition, which names the current state). The catch-up milestone splits
-// on ColdStart: a first-ever build is InitialSyncComplete, a resume of an
-// already-populated cache is Resynced, both carrying the "…N objects across M
-// kinds in Ds" message. The in-progress Syncing state likewise splits — a cold
-// build's is SyncStarted, a resume's is the plain Syncing — and a failure is
-// SyncDegraded, carrying the engine's error.
+// syncedCondition, which names the current state). Every phase splits on
+// ColdStart into a symmetric start/complete pair: an in-progress Syncing report
+// is SyncStart (cold) or ResyncStart (warm), and the caught-up milestone is
+// SyncComplete (cold) or ResyncComplete (warm) — each carrying a "…N objects
+// across M kinds…" message. A failure is SyncDegraded (the engine's error) and a
+// wedged watch is SyncStale.
 func syncEvent(st engine.EngineStatus) (beehive.EventType, string, string) {
 	switch st.State {
 	case engine.EngineWatching:
 		if st.ColdStart {
-			return beehive.EventNormal, ReasonInitialSyncComplete, catchUpMessage(st)
+			return beehive.EventNormal, ReasonSyncComplete, syncCompleteMessage(st)
 		}
-		return beehive.EventNormal, ReasonResynced, catchUpMessage(st)
+		return beehive.EventNormal, ReasonResyncComplete, resyncCompleteMessage(st)
 	case engine.EngineErrored:
 		return beehive.EventWarning, ReasonSyncDegraded, st.LastError
 	case engine.EngineStale:
 		return beehive.EventWarning, ReasonSyncStale, staleMessage(st)
 	default: // EngineSyncing
 		if st.ColdStart {
-			return beehive.EventNormal, ReasonSyncStarted, ""
+			return beehive.EventNormal, ReasonSyncStart, "Starting initial sync"
 		}
-		return beehive.EventNormal, ReasonSyncing, ""
+		return beehive.EventNormal, ReasonResyncStart, resyncStartMessage(st)
 	}
 }
 
-// catchUpMessage describes what a catch-up milestone produced: how many objects
-// across how many kinds, and how long it took. "Cached …" for a cold build,
-// "Re-synced …" for a resume. The duration is rounded to a tenth of a second so
-// the message stays stable and readable (e.g. "in 4.2s").
-func catchUpMessage(st engine.EngineStatus) string {
-	// A resume that carries no catch-up counts is a liveness recovery (a stale
-	// watch resuming), not a full re-sync — describe it as such rather than
-	// reporting a misleading "Re-synced 0 objects".
-	if !st.ColdStart && st.SyncedKinds == 0 && st.SyncedObjects == 0 {
-		return "Watch recovered — streaming updates again"
+// syncCompleteMessage describes a finished cold build: what it cached and how
+// long it took.
+func syncCompleteMessage(st engine.EngineStatus) string {
+	return fmt.Sprintf("Initial sync complete — cached %d objects across %d kinds in %s",
+		st.SyncedObjects, st.SyncedKinds, roundSyncDuration(st.CaughtUpIn))
+}
+
+// resyncStartMessage describes a warm resume as it begins: the size of the cache
+// it's resuming from. The per-kind resume cookies aren't a single
+// resource-version (one cache holds ~one cookie per kind), so the resume point
+// is described qualitatively rather than as a bogus single number.
+func resyncStartMessage(st engine.EngineStatus) string {
+	return fmt.Sprintf("Starting re-sync from warm cache — %d objects across %d kinds, resuming watches from saved positions",
+		st.SyncedObjects, st.SyncedKinds)
+}
+
+// resyncCompleteMessage describes a finished warm resume. The message carries the
+// disambiguation that keeps ResyncComplete from being overloaded: a bare liveness
+// recovery (a stale watch resuming) caught up zero kinds — the engine's
+// livenessMonitor clears the catch-up facts, whereas a real catch-up always
+// reports the discovered-kind count (≥ 1) — so SyncedKinds == 0 uniquely marks a
+// recovery, and it's described as such rather than a misleading "0 objects".
+// (SyncedKinds is the stable discriminator here; the object count is not, since a
+// real resume of an empty cluster can legitimately re-pull zero objects.)
+//
+// Crucially it does NOT report the cache's object total: a resume re-establishes
+// each kind's watch from its saved position and does not re-fetch the objects
+// (they stream in as deltas afterward), so a "N objects … in 0s" line would
+// misread as "processed N objects instantly". The honest completion fact is how
+// many watches resumed and how long that took — near-zero on a clean reconnect,
+// real seconds when an expired resume cookie forces a re-list. When some kinds DID
+// have to re-list, it names the bodies actually re-pulled (the real delta, scoped
+// to that work — not the whole-cache total) and how many kinds did it.
+func resyncCompleteMessage(st engine.EngineStatus) string {
+	if st.SyncedKinds == 0 {
+		return "Re-sync complete — watch recovered, streaming updates again"
 	}
-	verb := "Cached"
-	if !st.ColdStart {
-		verb = "Re-synced"
+	// Most resumes just reopen every watch from its saved position (no bodies
+	// re-fetched). When some kinds couldn't — an expired or missing resume cookie
+	// forced a full re-list — name that real work: how many bodies were re-pulled
+	// and how many of the kinds did it.
+	if st.ResyncedKinds > 0 {
+		return fmt.Sprintf("Re-sync complete — resumed watches for %d kinds — re-synced %d objects in %d of them — in %s",
+			st.SyncedKinds, st.ResyncedObjects, st.ResyncedKinds, roundSyncDuration(st.CaughtUpIn))
 	}
-	return fmt.Sprintf("%s %d objects across %d kinds in %s",
-		verb, st.SyncedObjects, st.SyncedKinds, st.CaughtUpIn.Round(100*time.Millisecond))
+	return fmt.Sprintf("Re-sync complete — resumed watches for %d kinds in %s",
+		st.SyncedKinds, roundSyncDuration(st.CaughtUpIn))
+}
+
+// roundSyncDuration rounds a catch-up duration to a tenth of a second so the
+// event message stays stable and readable (e.g. "in 4.2s").
+func roundSyncDuration(d time.Duration) time.Duration {
+	return d.Round(100 * time.Millisecond)
 }
 
 // staleMessage names the kinds whose watch went quiet, for the SyncStale event.

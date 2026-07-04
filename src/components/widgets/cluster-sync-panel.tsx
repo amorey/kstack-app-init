@@ -569,10 +569,10 @@ function ConnectionDetail({
 // codes the cache controller records). Falls back to the raw reason so a
 // server-side reason we don't recognise yet still renders (forward-compatible).
 const SYNC_EVENT_LABELS: Record<string, string> = {
-  SyncStarted: 'Starting sync',
-  Syncing: 'Syncing',
-  InitialSyncComplete: 'Initial sync complete',
-  Resynced: 'Re-synced',
+  SyncStart: 'Starting initial sync',
+  SyncComplete: 'Initial sync complete',
+  ResyncStart: 'Starting re-sync',
+  ResyncComplete: 'Re-sync complete',
   SyncDegraded: 'Sync error',
   SyncStopped: 'Sync stopped',
   SyncStale: 'Watch stalled',
