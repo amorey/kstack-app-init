@@ -527,16 +527,14 @@ describe('ClusterSyncPanel', () => {
       });
     });
 
-    // The sync detail lists each recorded run with a friendly label (not the raw
-    // reason code) and its message.
+    // The sync detail lists each recorded run by its raw reason code (the message
+    // field already carries the human-readable detail, so a friendly label would
+    // just repeat it) and its message.
     expect(await screen.findByText(/recent sync events/i)).toBeInTheDocument();
     expect(await screen.findByText(/discovery returned no syncable resources/i)).toBeInTheDocument();
-    // Friendly labels, with the run's ×count multiplier when > 1.
-    expect(screen.getByText(/Sync error ×3/i)).toBeInTheDocument();
-    expect(screen.getByText('Initial sync complete')).toBeInTheDocument();
-    // The raw reason codes are not surfaced.
-    expect(screen.queryByText(/SyncDegraded/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/SyncComplete/)).not.toBeInTheDocument();
+    // Raw reason codes, with the run's ×count multiplier when > 1.
+    expect(screen.getByText(/SyncDegraded ×3/i)).toBeInTheDocument();
+    expect(screen.getByText('SyncComplete')).toBeInTheDocument();
   });
 
   it('shows a last-update freshness line in the sync detail, driven by lastSyncedAt', async () => {
@@ -575,7 +573,7 @@ describe('ClusterSyncPanel', () => {
     expect(await screen.findByText(/possibly stale/i)).toBeInTheDocument();
     expect(screen.getByText(/no watch heartbeat for pod/i)).toBeInTheDocument();
 
-    // A SyncStale event renders with a friendly label (not the raw reason code).
+    // A SyncStale event renders by its raw reason code alongside its message.
     await act(async () => {
       pushSyncEvent({
         id: '9',
@@ -587,9 +585,8 @@ describe('ClusterSyncPanel', () => {
         lastAt: new Date(Date.now() - 10_000).toISOString(),
       });
     });
-    expect(await screen.findByText('Watch stalled')).toBeInTheDocument();
+    expect(await screen.findByText('SyncStale')).toBeInTheDocument();
     expect(screen.getByText(/pod watch went quiet/i)).toBeInTheDocument();
-    expect(screen.queryByText(/SyncStale/)).not.toBeInTheDocument();
   });
 
   it('holds the countdown across an in-flight probe, then clears it once the schedule is authoritatively empty', async () => {

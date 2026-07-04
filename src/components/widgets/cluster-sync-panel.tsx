@@ -430,7 +430,19 @@ function DetailRow({
 // [firstAt, lastAt] window). Renders nothing until at least one run has streamed
 // in. `labelOf` names a run for its category (a connection success has no reason
 // code, so it's labelled "Success"; a sync run just shows its reason).
-function EventRunList({ title, runs, labelOf }: { title: string; runs: EventRun[]; labelOf: (r: EventRun) => string }) {
+// `showDuration` adds a per-run duration column ("Once" / "45s"); the sync pane
+// omits it since its runs are one-shot transitions.
+function EventRunList({
+  title,
+  runs,
+  labelOf,
+  showDuration = true,
+}: {
+  title: string;
+  runs: EventRun[];
+  labelOf: (r: EventRun) => string;
+  showDuration?: boolean;
+}) {
   if (runs.length === 0) return null;
   return (
     <div className="space-y-1">
@@ -439,13 +451,22 @@ function EventRunList({ title, runs, labelOf }: { title: string; runs: EventRun[
           doesn't blow out the panel. The timestamp/reason/duration columns size to
           their content (shown in full, never truncated); the message column takes
           the remaining space and wraps. Subgrid keeps a row's cells aligned. */}
-      <ul className="grid max-h-40 grid-cols-[auto_auto_auto_1fr] divide-y overflow-x-auto overflow-y-auto rounded-md border text-xs">
+      <ul
+        className={`grid max-h-40 ${
+          showDuration ? 'grid-cols-[auto_auto_auto_1fr]' : 'grid-cols-[auto_auto_1fr]'
+        } divide-y overflow-x-auto overflow-y-auto rounded-md border text-xs`}
+      >
         {/* The run id is stable across re-deliveries (an extended run keeps it). */}
         {runs.map((a) => {
           const firstMs = parseTimeOrNull(a.firstAt);
           const lastMs = parseTimeOrNull(a.lastAt);
           return (
-            <li key={a.id} className="col-span-4 grid grid-cols-subgrid items-baseline gap-x-2 px-2 py-1">
+            <li
+              key={a.id}
+              className={`${
+                showDuration ? 'col-span-4' : 'col-span-3'
+              } grid grid-cols-subgrid items-baseline gap-x-2 px-2 py-1`}
+            >
               {/* {T2} — the run's end time. The start is implied (T1 = T2 −
                   Duration); the full [firstAt, lastAt] window is on hover. */}
               <span
@@ -459,9 +480,11 @@ function EventRunList({ title, runs, labelOf }: { title: string; runs: EventRun[
                 {a.count > 1 ? `${labelOf(a)} ×${a.count}` : labelOf(a)}
               </span>
               {/* {Duration} — "Once" for a single occurrence, else the run's span. */}
-              <span className="whitespace-nowrap font-mono text-muted-foreground tabular-nums">
-                {`(${formatRunDuration(a.count, firstMs, lastMs)})`}
-              </span>
+              {showDuration ? (
+                <span className="whitespace-nowrap font-mono text-muted-foreground tabular-nums">
+                  {`(${formatRunDuration(a.count, firstMs, lastMs)})`}
+                </span>
+              ) : null}
               {/* {Message} — fills the remaining space and wraps so it's shown in
                   full rather than truncated. */}
               <span className="wrap-break-word text-muted-foreground">{a.message}</span>
@@ -565,23 +588,6 @@ function ConnectionDetail({
 // cluster's active cache. Mirrors ConnectionDetail (an inline expandable region,
 // not a popover, for the same modal-Sheet inert reason), keyed by the active
 // cache's id — the sync-event stream lives on the ClusterCache, not the Cluster.
-// Friendly labels for the sync event log's transition vocabulary (the reason
-// codes the cache controller records). Falls back to the raw reason so a
-// server-side reason we don't recognise yet still renders (forward-compatible).
-const SYNC_EVENT_LABELS: Record<string, string> = {
-  SyncStart: 'Starting initial sync',
-  SyncComplete: 'Initial sync complete',
-  ResyncStart: 'Starting re-sync',
-  ResyncComplete: 'Re-sync complete',
-  SyncDegraded: 'Sync error',
-  SyncStopped: 'Sync stopped',
-  SyncStale: 'Watch stalled',
-};
-
-function syncEventLabel(reason: string): string {
-  return SYNC_EVENT_LABELS[reason] ?? reason;
-}
-
 function SyncDetail({
   cacheId,
   lastSyncedAt,
@@ -622,7 +628,7 @@ function SyncDetail({
         <p className="text-xs text-muted-foreground">No updates received yet.</p>
       )}
       {events.length > 0 ? (
-        <EventRunList title="Recent sync events" runs={events} labelOf={(e) => syncEventLabel(e.reason)} />
+        <EventRunList title="Recent sync events" runs={events} labelOf={(e) => e.reason} showDuration={false} />
       ) : (
         <p className="text-xs text-muted-foreground">No sync events yet.</p>
       )}
