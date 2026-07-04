@@ -321,14 +321,22 @@ func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID C
 		return nil, err
 	}
 	resources := make([]CachedResource, len(rss))
+	objectCount := 0
 	for i, rs := range rss {
 		resources[i] = CachedResource{
 			Resource:      rs.Resource,
 			Count:         rs.Count,
 			LastUpdatedAt: rs.LastUpdatedAt,
 		}
+		objectCount += rs.Count
 	}
-	return &ClusterCacheStats{Exists: true, Bytes: bytes, Resources: resources}, nil
+	return &ClusterCacheStats{
+		Exists:      true,
+		Bytes:       bytes,
+		ObjectCount: objectCount,
+		KindCount:   len(resources),
+		Resources:   resources,
+	}, nil
 }
 
 // updateSpec applies mutate to a copy of the cluster's spec and persists it. The

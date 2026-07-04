@@ -621,9 +621,15 @@ type CachedResource struct {
 
 // ClusterCacheStats reports a cluster's live on-disk cache statistics.
 type ClusterCacheStats struct {
-	Exists    bool
-	Bytes     int64
-	Resources []CachedResource
+	Exists bool
+	Bytes  int64
+	// ObjectCount/KindCount are the whole-cache rollup of Resources (total
+	// objects and distinct kinds), precomputed so a summary consumer need not
+	// stream the full per-resource breakdown. Both include the synthetic events
+	// row, matching Resources.
+	ObjectCount int
+	KindCount   int
+	Resources   []CachedResource
 }
 
 // --- Seed conditions ---

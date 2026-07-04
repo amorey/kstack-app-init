@@ -584,6 +584,15 @@ function ConnectionDetail({
   );
 }
 
+// "2,203 objects across 120 kinds" — the cache-content summary, thousands-grouped
+// and pluralised. Includes cached events (one of the kinds), matching the
+// engine's own object/kind rollup.
+function cacheSummary(objectCount: number, kindCount: number): string {
+  const objects = `${objectCount.toLocaleString()} ${objectCount === 1 ? 'object' : 'objects'}`;
+  const kinds = `${kindCount.toLocaleString()} ${kindCount === 1 ? 'kind' : 'kinds'}`;
+  return `${objects} across ${kinds}`;
+}
+
 // The expanded sync diagnostics: the recent cache-sync event history for a
 // cluster's active cache. Mirrors ConnectionDetail (an inline expandable region,
 // not a popover, for the same modal-Sheet inert reason), keyed by the active
@@ -591,11 +600,15 @@ function ConnectionDetail({
 function SyncDetail({
   cacheId,
   lastSyncedAt,
+  objectCount,
+  kindCount,
   syncReason,
   syncMessage,
 }: {
   cacheId: string;
   lastSyncedAt: string | null;
+  objectCount: number;
+  kindCount: number;
   syncReason?: string;
   syncMessage?: string;
 }) {
@@ -613,13 +626,23 @@ function SyncDetail({
           Possibly stale — {syncMessage || 'the watch may have stopped delivering updates.'}
         </p>
       ) : null}
+      {/* Cache-content summary — "how much do I hold?", a static counterpart to the
+          freshness line below. Shown only when the cache has objects (an empty or
+          not-yet-populated cache is already covered by the freshness line's
+          "No updates received yet."). */}
+      {objectCount > 0 ? (
+        <div className="flex gap-2 text-xs text-muted-foreground">
+          <span>Cached:</span>
+          <span className="tabular-nums">{cacheSummary(objectCount, kindCount)}</span>
+        </div>
+      ) : null}
       {/* Freshness — "is my local copy current?" — answered by when the cache last
           received data, as a live relative counter. Deliberately separate from the
           sync-event history below (which is a transition log): the two answer
           different questions ("is it current now?" vs "what happened?"). */}
       {lastSyncedMs !== null ? (
         <div className="flex gap-2 text-xs text-muted-foreground">
-          <span>Last update received</span>
+          <span>Last update received:</span>
           <span className="tabular-nums">
             <RelativeTime ms={lastSyncedMs} />
           </span>
@@ -809,6 +832,8 @@ function ClusterRow({
             <SyncDetail
               cacheId={cacheId}
               lastSyncedAt={cluster.activeCache?.status.lastSyncedAt ?? null}
+              objectCount={cluster.activeCache?.stats.objectCount ?? 0}
+              kindCount={cluster.activeCache?.stats.kindCount ?? 0}
               syncReason={syncCond?.reason}
               syncMessage={syncCond?.message}
             />

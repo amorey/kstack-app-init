@@ -40,6 +40,8 @@ type Row = {
   cached: boolean;
   isCurrent?: boolean;
   cacheBytes?: number;
+  objectCount?: number;
+  kindCount?: number;
   lastSyncedAt?: string;
   // The live `Connected` condition the connection column reads. Defaults to
   // 'True' (reachable); set 'False' to model a dropped connection (internet
@@ -150,7 +152,12 @@ function pushClusters(rows: Row[]) {
                   conditions: [syncedCondition(r)],
                   lastSyncedAt: r.lastSyncedAt ?? null,
                 },
-                stats: { exists: r.cached, bytes: r.cacheBytes ?? 0 },
+                stats: {
+                  exists: r.cached,
+                  bytes: r.cacheBytes ?? 0,
+                  objectCount: r.objectCount ?? 0,
+                  kindCount: r.kindCount ?? 0,
+                },
               },
             },
           },
@@ -550,6 +557,38 @@ describe('ClusterSyncPanel', () => {
     // — a live relative counter, independent of the (separate) sync-event history.
     expect(await screen.findByText(/last update received/i)).toBeInTheDocument();
     expect(await screen.findByText(/\d+s ago/)).toBeInTheDocument();
+  });
+
+  it('summarises cache contents (objects across kinds) in the sync detail, thousands-grouped', async () => {
+    const user = await openWith([
+      {
+        uuid: 'u-big',
+        name: 'prod',
+        enabled: true,
+        present: true,
+        cached: true,
+        objectCount: 2203,
+        kindCount: 120,
+      },
+    ]);
+
+    await user.click(await screen.findByRole('button', { name: /syncing/i }));
+
+    // The summary is the static "how much do I hold?" counterpart to the
+    // freshness line — locale-grouped and pluralised.
+    expect(await screen.findByText('2,203 objects across 120 kinds')).toBeInTheDocument();
+  });
+
+  it('omits the cache summary when the cache holds no objects', async () => {
+    const user = await openWith([
+      { uuid: 'u-empty', name: 'prod', enabled: true, present: true, cached: true, objectCount: 0 },
+    ]);
+
+    await user.click(await screen.findByRole('button', { name: /syncing/i }));
+
+    // An empty cache is already covered by the freshness line; no "0 objects" noise.
+    expect(await screen.findByText(/no updates received yet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/objects across/i)).not.toBeInTheDocument();
   });
 
   it('surfaces a stalled watch: the sync column reads Stale and the detail explains why', async () => {

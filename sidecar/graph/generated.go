@@ -84,9 +84,11 @@ type ComplexityRoot struct {
 	}
 
 	ClusterCacheStats struct {
-		Bytes     func(childComplexity int) int
-		Exists    func(childComplexity int) int
-		Resources func(childComplexity int) int
+		Bytes       func(childComplexity int) int
+		Exists      func(childComplexity int) int
+		KindCount   func(childComplexity int) int
+		ObjectCount func(childComplexity int) int
+		Resources   func(childComplexity int) int
 	}
 
 	ClusterCacheStatus struct {
@@ -406,6 +408,18 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCacheStats.Exists(childComplexity), true
+	case "ClusterCacheStats.kindCount":
+		if e.ComplexityRoot.ClusterCacheStats.KindCount == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCacheStats.KindCount(childComplexity), true
+	case "ClusterCacheStats.objectCount":
+		if e.ComplexityRoot.ClusterCacheStats.ObjectCount == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCacheStats.ObjectCount(childComplexity), true
 	case "ClusterCacheStats.resources":
 		if e.ComplexityRoot.ClusterCacheStats.Resources == nil {
 			break
@@ -1133,6 +1147,10 @@ func (ec *executionContext) childFields_ClusterCacheStats(ctx context.Context, f
 		return ec.fieldContext_ClusterCacheStats_exists(ctx, field)
 	case "bytes":
 		return ec.fieldContext_ClusterCacheStats_bytes(ctx, field)
+	case "objectCount":
+		return ec.fieldContext_ClusterCacheStats_objectCount(ctx, field)
+	case "kindCount":
+		return ec.fieldContext_ClusterCacheStats_kindCount(ctx, field)
 	case "resources":
 		return ec.fieldContext_ClusterCacheStats_resources(ctx, field)
 	}
@@ -2344,6 +2362,52 @@ func (ec *executionContext) _ClusterCacheStats_bytes(ctx context.Context, field 
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheStats_bytes(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCacheStats_objectCount(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCacheStats) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCacheStats_objectCount(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.ObjectCount, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCacheStats_objectCount(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCacheStats_kindCount(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCacheStats) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCacheStats_kindCount(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.KindCount, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCacheStats_kindCount(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
 }
 
@@ -6006,6 +6070,16 @@ func (ec *executionContext) _ClusterCacheStats(ctx context.Context, sel ast.Sele
 			}
 		case "bytes":
 			out.Values[i] = ec._ClusterCacheStats_bytes(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "objectCount":
+			out.Values[i] = ec._ClusterCacheStats_objectCount(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "kindCount":
+			out.Values[i] = ec._ClusterCacheStats_kindCount(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}

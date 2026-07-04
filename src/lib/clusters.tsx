@@ -99,6 +99,8 @@ const ClusterCachesWatchSubscription = graphql(`
         stats {
           exists
           bytes
+          objectCount
+          kindCount
         }
       }
     }

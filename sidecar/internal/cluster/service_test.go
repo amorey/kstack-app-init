@@ -289,6 +289,45 @@ func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	assert.False(t, stats.Exists)
 }
 
+// CacheStats rolls the per-resource breakdown up into ObjectCount/KindCount (the
+// whole-cache totals the sync-status summary shows), events row included.
+func TestServiceCacheStatsRollup(t *testing.T) {
+	ctx := context.Background()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+
+	// Populate the active cache's on-disk DB: two object kinds (2 Pods, 1
+	// Deployment) plus one event.
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+	at := time.Now().UnixMilli()
+	insert := func(objUID, apiVersion, kind string) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+			   created_at, updated_at, raw_json)
+			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, '{}')`,
+			objUID, apiVersion, kind, objUID, at, at)
+		require.NoError(t, err)
+	}
+	insert("p1", "v1", "Pod")
+	insert("p2", "v1", "Pod")
+	insert("d1", "apps/v1", "Deployment")
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
+		 VALUES('e1', 'Normal', 'Test', 'hello', ?, ?, 1, '{}', ?)`, at, at, at)
+	require.NoError(t, err)
+
+	stats, err := s.CacheStats(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+	assert.True(t, stats.Exists)
+	assert.Equal(t, 3, stats.KindCount, "two object kinds + the events row")
+	assert.Equal(t, 4, stats.ObjectCount, "2 Pods + 1 Deployment + 1 event")
+	assert.Len(t, stats.Resources, stats.KindCount, "KindCount must match the breakdown length")
+}
+
 // cacheRef resolves the *active* cache's on-disk locator: the directory id is the
 // ClusterID (the parent Cluster's beehive ObjectID), and the file id is the
 // ClusterCache for the cluster's currently-connected identity (its UID matches
