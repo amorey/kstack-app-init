@@ -44,6 +44,42 @@ export function mockTauriCore() {
   };
 }
 
+// Shared fake for '@tauri-apps/api/window' — components that drive the native
+// window (e.g. `WindowControls`, `AppSidebar`) reach it through `getCurrentWindow`.
+// Usage mirrors `mockTauriCore`:
+//
+//   const { windowMock, factory } = mockTauriWindow();
+//   vi.mock('@tauri-apps/api/window', () => factory());
+//
+// `windowMock` exposes the spied methods for asserting calls; callers that only
+// need the module to resolve can ignore it.
+export function mockTauriWindow() {
+  const windowMock = {
+    minimize: vi.fn(() => Promise.resolve()),
+    toggleMaximize: vi.fn(() => Promise.resolve()),
+    close: vi.fn(() => Promise.resolve()),
+  };
+  return {
+    windowMock,
+    factory: () => ({ getCurrentWindow: () => windowMock }),
+  };
+}
+
+// User-agent strings and overrides for exercising `isMacOS()`-branched UI. The
+// WebView's UA is fixed per-OS, so tests flip it to pick a platform.
+export const MAC_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15';
+export const NON_MAC_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36';
+
+const originalUserAgent = window.navigator.userAgent;
+
+export function setUserAgent(value: string) {
+  Object.defineProperty(window.navigator, 'userAgent', { value, configurable: true });
+}
+
+export function restoreUserAgent() {
+  setUserAgent(originalUserAgent);
+}
+
 export async function renderWithRouter(routeTree: AnyRoute, path: string) {
   const router = createRouter({
     routeTree,

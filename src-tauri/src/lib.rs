@@ -188,6 +188,11 @@ pub fn run() {
             let sidecar = SidecarService::spawn(app.handle())?;
             let window_manager = WindowManager::new();
 
+            // The floating sidebar is the window's title bar; drop native
+            // decorations on Linux/Windows so the webview draws its own chrome
+            // (macOS keeps its Overlay title bar from tauri.conf.json).
+            window_manager.apply_main_window_chrome(app.handle())?;
+
             app.manage(AppState {
                 sidecar,
                 window_manager,

@@ -15,7 +15,10 @@
         "label": "main",
         "title": "kstack-app",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 20, "y": 24 }
       }
     ],
     "security": {
