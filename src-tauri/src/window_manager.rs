@@ -209,7 +209,10 @@ mod tests {
         // and centered in the header: (header - 12px button) / 2 below its top.
         let (x, y) = super::traffic_light_position(super::SIDEBAR_GAP, super::TITLE_BAR_HEIGHT);
         assert_eq!(x, super::SIDEBAR_GAP + super::TRAFFIC_LIGHT_LEFT_INSET);
-        assert_eq!(y, super::SIDEBAR_GAP + (super::TITLE_BAR_HEIGHT - 12.0) / 2.0);
+        assert_eq!(
+            y,
+            super::SIDEBAR_GAP + (super::TITLE_BAR_HEIGHT - 12.0) / 2.0
+        );
     }
 
     #[test]
