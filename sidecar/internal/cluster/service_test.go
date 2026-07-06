@@ -82,10 +82,16 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterSta
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })
 
+	// Shut the cache manager down before the test ends so its SQLite connection
+	// pools are closed and TempDir cleanup can remove the .db files — on Windows
+	// an open file can't be unlinked, so a leaked pool fails the TempDir RemoveAll.
+	cacheManager := store.NewManager(t.TempDir())
+	t.Cleanup(func() { _ = cacheManager.Shutdown(context.Background()) })
+
 	return &Service{
 		coreClient:   coreClient,
 		cacheClient:  cacheClient,
-		cacheManager: store.NewManager(t.TempDir()),
+		cacheManager: cacheManager,
 		connMgr:      NewConnectionManager(),
 		coreCtrl:     &fakeCoreController{},
 	}, coreCC, cacheCC
