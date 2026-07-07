@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// In-app menu ribbon. macOS keeps its native, global menu bar (built in the
-// Rust host); on Linux/Windows the native bar is suppressed and this ribbon is
-// the replacement. It mirrors the macOS "File" menu — New Window and Quit — and
-// owns the matching keyboard shortcuts there, since with no native menu nothing
-// else registers them. Actions cross into the host via Tauri commands.
+// The File menu for Linux/Windows. macOS keeps its native, global menu bar
+// (built in the Rust host); off macOS the native bar is suppressed and this
+// hamburger button — sitting at the left of the custom title bar — is the
+// replacement. It mirrors the macOS "File" menu (New Window and Quit) and owns
+// the matching keyboard shortcuts there, since with no native menu nothing else
+// registers them. Actions cross into the host via Tauri commands.
 import { useEffect } from 'react';
 
 import {
@@ -27,11 +28,12 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from '@kubetail/ui/elements/dropdown-menu';
+import { Menu } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
 import { isMacOS } from '@/lib/platform';
 
-/** Host commands the ribbon drives. Keep in sync with `commands.rs`. */
+/** Host commands the menu drives. Keep in sync with `commands.rs`. */
 const NEW_WINDOW_CMD = 'new_window';
 const QUIT_CMD = 'quit';
 
@@ -43,16 +45,16 @@ function quit() {
   invoke(QUIT_CMD).catch(() => {});
 }
 
-export function MenuRibbon() {
-  // macOS already has the native menu bar (and its accelerators); a ribbon
+export function FileMenu() {
+  // macOS already has the native menu bar (and its accelerators); a hamburger
   // would be redundant there. Render only on Linux/Windows.
   if (isMacOS()) return null;
-  return <MenuRibbonImpl />;
+  return <FileMenuImpl />;
 }
 
-function MenuRibbonImpl() {
+function FileMenuImpl() {
   // The native menu is gone here, so nothing else binds these accelerators —
-  // the ribbon owns them. Window-scoped (only while a webview window is
+  // this menu owns them. Window-scoped (only while a webview window is
   // focused), matching the macOS menu's CmdOrCtrl semantics.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -72,8 +74,11 @@ function MenuRibbonImpl() {
 
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger className="rounded px-2 py-1 text-sm outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">
-        File
+      <DropdownMenuTrigger
+        aria-label="File"
+        className="flex h-full items-center rounded px-2 outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Menu className="h-4 w-4" aria-hidden />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" sideOffset={4} className="min-w-48">
         <DropdownMenuItem onClick={newWindow}>

@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The app's floating sidebar shell. Wraps the page in a `floating`-variant
-// sidebar whose header doubles as the window title bar: on macOS it reserves a
-// gutter for the native traffic lights (positioned by the host via the Overlay
-// title bar); on Linux/Windows the frameless window has no native controls, so
-// the header renders `WindowControls` instead. The header carries a draggable
-// strip (`data-tauri-drag-region`) so the whole title-bar area moves the window.
-import type { ReactNode } from 'react';
+// The app's floating sidebar shell. The window is chromeless on every platform,
+// but the title bar takes a different shape per OS:
+//
+//   • macOS keeps its native traffic lights (drawn over the Overlay title bar by
+//     the host). The sidebar's header doubles as the title bar: it reserves a
+//     gutter for the lights, and a full-width drag band covers the rest of the
+//     top strip so the whole band moves the window.
+//   • Linux/Windows have no native window controls, so a full-width custom title
+//     bar sits across the top — hamburger `FileMenu` at the left, a draggable
+//     strip in the middle, and `WindowControls` (minimize/maximize/close) at the
+//     right. The floating sidebar is offset to start just below it.
+import type { CSSProperties, ReactNode } from 'react';
 
 import {
   Sidebar,
@@ -30,55 +35,82 @@ import {
 } from '@kubetail/ui/elements/sidebar';
 
 import { isMacOS } from '@/lib/platform';
+import { FileMenu } from '@/components/widgets/file-menu';
 import { WindowControls } from '@/components/widgets/window-controls';
 
-// Horizontal space (px) reserved at the header's left edge for the cluster of
-// three macOS traffic lights. This is an independent visual reservation for the
+// Horizontal space (px) reserved at the macOS header's left edge for the cluster
+// of three traffic lights. This is an independent visual reservation for the
 // lights' full width — not derived from the host's `trafficLightPosition`
 // (which sets only the first light's origin); eyeball it against the native
 // buttons when tuning.
 const TRAFFIC_LIGHT_GUTTER = 62;
 
-// Title-bar band height (Tailwind class). The sidebar header and the window
-// drag band must cover the same strip, so both take their height from here
-// (44px — matches the host's `TITLE_BAR_HEIGHT` in `window_manager.rs`).
-const TITLE_BAR_HEIGHT = 'h-11';
+// macOS title-bar band height (Tailwind class). The sidebar header and the
+// window drag band must cover the same strip, so both take their height from
+// here (44px — matches the host's `TITLE_BAR_HEIGHT` in `window_manager.rs`).
+const MAC_TITLE_BAR_HEIGHT = 'h-11';
 
-// A window-wide drag strip across the top, spanning the whole title-bar band —
-// including the area beside the floating sidebar (over the page). Its `z-0`
-// keeps it below the sidebar's `z-10` so the sidebar's own controls stay
+// Linux/Windows custom title-bar band height. 32px is close to a native Windows
+// caption bar. This is the single source of truth: it's published as the
+// `--win-titlebar-h` CSS variable on the sidebar wrapper (see `AppSidebar`), and
+// both the title bar's own height and the sidebar's offset read from that
+// variable — so the band height is stated in exactly one place.
+const WIN_TITLE_BAR_HEIGHT_PX = '32px';
+
+// Title-bar height and sidebar offset, both derived from `--win-titlebar-h`.
+const WIN_TITLE_BAR_HEIGHT = 'h-[var(--win-titlebar-h)]';
+
+// Offset applied to the floating sidebar container off macOS so it starts just
+// below the custom title bar instead of at the window top. Overrides the
+// sidebar's default `inset-y-0`/`h-svh` via tailwind-merge (`top-*` wins the top
+// edge, the explicit height replaces `h-svh`).
+const WIN_SIDEBAR_OFFSET = 'top-[var(--win-titlebar-h)] h-[calc(100svh-var(--win-titlebar-h))]';
+
+// macOS: a window-wide drag strip across the top, spanning the whole title-bar
+// band — including the area beside the floating sidebar (over the page). Its
+// `z-0` keeps it below the sidebar's `z-10` so the sidebar's own controls stay
 // clickable; rendered after the inset it still paints over the page background,
 // so clicking the empty top background there moves the window. Pages reserve
 // this band with top padding, so it never covers interactive page content.
-function WindowDragBand() {
+function MacWindowDragBand() {
   return (
     <div
       data-testid="window-drag-region"
       data-tauri-drag-region
       aria-hidden
-      className={`fixed inset-x-0 top-0 z-0 ${TITLE_BAR_HEIGHT}`}
+      className={`fixed inset-x-0 top-0 z-0 ${MAC_TITLE_BAR_HEIGHT}`}
     />
   );
 }
 
-function TitleBar() {
-  const mac = isMacOS();
+// macOS: the sidebar header doubles as the title bar. Reserves the traffic-light
+// gutter, then a draggable strip fills the rest.
+function MacTitleBar() {
   return (
-    <SidebarHeader className={`${TITLE_BAR_HEIGHT} flex-row items-center gap-1 p-2`}>
-      {mac && (
-        <div
-          data-testid="traffic-light-gutter"
-          aria-hidden
-          className="shrink-0"
-          style={{ width: TRAFFIC_LIGHT_GUTTER }}
-        />
-      )}
-      {/* Draggable strip fills the free space; interactive siblings (controls,
-          and the header widgets added later) stay outside it so they still
-          receive clicks. */}
+    <SidebarHeader className={`${MAC_TITLE_BAR_HEIGHT} flex-row items-center gap-1 p-2`}>
+      <div
+        data-testid="traffic-light-gutter"
+        aria-hidden
+        className="shrink-0"
+        style={{ width: TRAFFIC_LIGHT_GUTTER }}
+      />
+      {/* Draggable strip fills the free space; interactive siblings (added
+          later) stay outside it so they still receive clicks. */}
       <div data-tauri-drag-region className="h-full flex-1" />
-      {!mac && <WindowControls />}
     </SidebarHeader>
+  );
+}
+
+// Linux/Windows: a full-width custom title bar across the top of the window.
+// Fixed and above the sidebar (`z-30` over the sidebar's `z-10`) so its controls
+// stay clickable; its middle strip is the window's drag region.
+function WinTitleBar() {
+  return (
+    <div className={`fixed inset-x-0 top-0 z-30 flex ${WIN_TITLE_BAR_HEIGHT} items-stretch bg-background`}>
+      <FileMenu />
+      <div data-testid="window-drag-region" data-tauri-drag-region aria-hidden className="h-full flex-1" />
+      <WindowControls />
+    </div>
   );
 }
 
@@ -92,16 +124,20 @@ type AppSidebarProps = {
 };
 
 export function AppSidebar({ nav, footer, children }: AppSidebarProps) {
+  const mac = isMacOS();
   return (
-    <SidebarProvider>
-      <Sidebar variant="floating">
-        <TitleBar />
+    // Off macOS, publish the custom title-bar height so the bar and the sidebar
+    // offset can both read it from one place (see `WIN_TITLE_BAR_HEIGHT_PX`).
+    <SidebarProvider style={mac ? undefined : ({ '--win-titlebar-h': WIN_TITLE_BAR_HEIGHT_PX } as CSSProperties)}>
+      {!mac && <WinTitleBar />}
+      <Sidebar variant="floating" className={mac ? undefined : WIN_SIDEBAR_OFFSET}>
+        {mac && <MacTitleBar />}
         <SidebarContent>{nav}</SidebarContent>
         <SidebarFooter>{footer}</SidebarFooter>
       </Sidebar>
       <SidebarInset>{children}</SidebarInset>
-      {/* Must render after SidebarInset — see WindowDragBand for why. */}
-      <WindowDragBand />
+      {/* Must render after SidebarInset — see MacWindowDragBand for why. */}
+      {mac && <MacWindowDragBand />}
     </SidebarProvider>
   );
 }

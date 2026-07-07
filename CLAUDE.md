@@ -24,7 +24,7 @@ React 19 + TanStack Router + [urql] (GraphQL) + Vite + Tailwind v4. UI primitive
 - Entry: `src/main.tsx` → `RouterProvider`. Routes in `src/routes/` (`__root.tsx` is the layout shell that mounts all providers; `index.tsx` etc. are pages). `src/routeTree.ts` wires them.
 - Path alias: **`@/*` → `src/*`**.
 - App-wide concerns live in `src/lib/` (auth, error bus/boundary, sync-status, kube-config, ready-gate, `platform.ts` for sync `isMacOS()` UA detection); reusable UI in `src/components/widgets/`.
-- **Menu**: macOS uses the host's native menu bar (`src-tauri/app_menu.rs`). On Linux/Windows that's suppressed and `components/widgets/menu-ribbon.tsx` (`MenuRibbon`) is the in-app replacement — it renders only off-macOS, mirrors File ▸ New Window / Quit, and owns the `Ctrl/Cmd+N` / `Ctrl/Cmd+Q` shortcuts, invoking the `new_window` / `quit` Tauri commands.
+- **Title bar / menu**: macOS keeps its native traffic lights and native global menu bar (`src-tauri/app_menu.rs`); the sidebar header doubles as the title bar. On Linux/Windows the window is frameless with a full-width custom title bar across the top (`app-sidebar.tsx`): a hamburger **File menu** (`components/widgets/file-menu.tsx`, `FileMenu`) at the left, a draggable strip in the middle, and custom **window controls** (`components/widgets/window-controls.tsx`, `WindowControls` — minimize/maximize/close, styled to read as native since there are no OS caption buttons) at the right; the floating sidebar starts just below the bar. `FileMenu` renders only off-macOS, mirrors File ▸ New Window / Quit, and owns the `Ctrl/Cmd+N` / `Ctrl/Cmd+Q` shortcuts, invoking the `new_window` / `quit` Tauri commands.
 
 ### GraphQL — never talks HTTP directly
 

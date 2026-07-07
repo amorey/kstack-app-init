@@ -13,10 +13,12 @@
 // limitations under the License.
 
 // Custom window controls (minimize / maximize / close) for the frameless
-// window on Linux/Windows. macOS keeps its native traffic lights (drawn over
-// the Overlay title bar by the host), so this renders nothing there — the
-// mirror of `MenuRibbon`. Actions cross into the host via the official
-// `@tauri-apps/api/window` core API.
+// window on Linux/Windows, sitting at the right of the custom title bar. The
+// window is frameless (`decorations(false)`), so there are no OS-native caption
+// buttons to keep — these HTML buttons are styled to read as native (including
+// the Windows-style red close hover). macOS keeps its native traffic lights
+// (drawn over the Overlay title bar by the host), so this renders nothing there.
+// Actions cross into the host via the official `@tauri-apps/api/window` core API.
 import { Minus, Square, X } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
@@ -40,9 +42,10 @@ function close() {
     .catch(() => {});
 }
 
-// Shared button styling; each control adds its own hover treatment.
+// Shared button styling; each control adds its own hover treatment. Buttons
+// fill the title-bar height and take a wide, native caption-button footprint.
 const BUTTON_CLASS =
-  'flex h-8 w-8 items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-ring';
+  'flex h-full w-11 items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring';
 
 const CONTROLS = [
   { label: 'Minimize', onClick: minimize, icon: <Minus className="h-4 w-4" aria-hidden />, hover: 'hover:bg-accent' },

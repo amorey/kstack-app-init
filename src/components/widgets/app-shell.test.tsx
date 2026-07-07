@@ -19,15 +19,16 @@ import { mockTauriWindow } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-// `WindowControls` (inside the sidebar title bar) drives the native window via
-// `getCurrentWindow`.
+// `WindowControls` (in the custom title bar off macOS) drives the native window
+// via `getCurrentWindow`.
 const { factory } = mockTauriWindow();
 vi.mock('@tauri-apps/api/window', () => factory());
 
 // Replace each chrome widget with an identifiable stub so the test asserts
-// *placement* (sidebar vs inset) without dragging in their providers.
-vi.mock('@/components/widgets/menu-ribbon', () => ({
-  MenuRibbon: () => <div data-testid="menu-ribbon" />,
+// *placement* (title bar vs sidebar vs inset) without dragging in their
+// providers.
+vi.mock('@/components/widgets/file-menu', () => ({
+  FileMenu: () => <div data-testid="file-menu" />,
 }));
 vi.mock('@/components/widgets/kube-context-picker', () => ({
   KubeContextPicker: () => <div data-testid="kube-context-picker" />,
@@ -67,8 +68,14 @@ describe('AppShell', () => {
   it('places the navigation chrome inside the sidebar', () => {
     const { container } = render(<AppShell />);
     const sidebar = sidebarOf(container);
-    expect(sidebar.contains(screen.getByTestId('menu-ribbon'))).toBe(true);
     expect(sidebar.contains(screen.getByTestId('kube-context-picker'))).toBe(true);
+  });
+
+  it('places the File menu in the title bar, not the sidebar', () => {
+    const { container } = render(<AppShell />);
+    // Off macOS the File menu is a hamburger in the custom title bar, which sits
+    // outside the sidebar.
+    expect(sidebarOf(container).contains(screen.getByTestId('file-menu'))).toBe(false);
   });
 
   it('places the status/account chrome inside the sidebar', () => {

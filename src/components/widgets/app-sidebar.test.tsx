@@ -49,27 +49,24 @@ describe('AppSidebar', () => {
     expect(container.querySelector('[data-tauri-drag-region]')).not.toBeNull();
   });
 
-  it('exposes a full-width drag band in addition to the header strip', () => {
-    const { container } = render(<AppSidebar />);
-    // A window-wide band over the old title-bar area lets clicking the empty
-    // top background (beside/over the page) move the window. It's a *second*
-    // drag region alongside the sidebar header's own strip.
-    const band = screen.getByTestId('window-drag-region');
-    expect(band).toHaveAttribute('data-tauri-drag-region');
-    expect(container.querySelectorAll('[data-tauri-drag-region]').length).toBeGreaterThanOrEqual(2);
+  it('renders a full-width custom title bar with File menu and window controls on Linux/Windows', () => {
+    render(<AppSidebar />);
+    // Off macOS the title bar carries the hamburger File menu, a drag strip, and
+    // the custom window controls — and there's no macOS traffic-light gutter.
+    expect(screen.getByRole('button', { name: /file/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /minimize/i })).toBeInTheDocument();
+    expect(screen.getByTestId('window-drag-region')).toHaveAttribute('data-tauri-drag-region');
+    expect(screen.queryByTestId('traffic-light-gutter')).not.toBeInTheDocument();
   });
 
-  it('reserves a traffic-light gutter and hides custom controls on macOS', () => {
+  it('reserves a traffic-light gutter and hides the custom title bar on macOS', () => {
     setUserAgent(MAC_USER_AGENT);
     render(<AppSidebar />);
+    // macOS keeps the native traffic lights and its header-as-title-bar, so the
+    // custom File menu and window controls are absent.
     expect(screen.getByTestId('traffic-light-gutter')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /file/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /minimize/i })).not.toBeInTheDocument();
-  });
-
-  it('renders custom window controls and no gutter on Linux/Windows', () => {
-    render(<AppSidebar />);
-    expect(screen.getByRole('button', { name: /minimize/i })).toBeInTheDocument();
-    expect(screen.queryByTestId('traffic-light-gutter')).not.toBeInTheDocument();
   });
 
   it('renders page content in the inset', () => {

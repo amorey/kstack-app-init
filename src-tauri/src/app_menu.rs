@@ -35,7 +35,7 @@ use tauri::Manager;
 ///
 /// On **Linux/Windows this is a no-op**: the native menu would render as a bar
 /// *inside* each window, which we don't want. There the webview's in-app
-/// `MenuRibbon` provides the same File ▸ New Window / Quit affordances and owns
+/// `FileMenu` provides the same File ▸ New Window / Quit affordances and owns
 /// the matching `Ctrl`-modified shortcuts, driving them through the
 /// `new_window` / `quit` Tauri commands (see `commands.rs`).
 ///
@@ -50,7 +50,7 @@ use tauri::Manager;
 /// the menu on the app fails.
 pub fn build_app_menu(app: &AppHandle) -> Result<()> {
     // Linux/Windows: the native menu is suppressed in favor of the webview
-    // `MenuRibbon`; nothing to install on the host.
+    // `FileMenu`; nothing to install on the host.
     #[cfg(not(target_os = "macos"))]
     {
         let _ = app;

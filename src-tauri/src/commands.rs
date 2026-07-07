@@ -28,7 +28,7 @@ pub async fn ready(state: State<'_, AppState>) -> Result<()> {
     state.sidecar.ready().await
 }
 
-/// Opens a new application window. Backs the webview `MenuRibbon`'s
+/// Opens a new application window. Backs the webview `FileMenu`'s
 /// "New Window" item and `Ctrl+N` shortcut on Linux/Windows; macOS drives the
 /// same action through its native menu (`app_menu.rs`). Delegates to the
 /// shared `WindowManager` so labeling/focus stay consistent.
@@ -40,7 +40,7 @@ pub fn new_window(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
 
 /// Quits the app. Routes through [`AppHandle::exit`] — the same
 /// graceful-shutdown path as the tray and macOS-menu "Quit" — so the
-/// `RunEvent::ExitRequested` teardown runs. Backs the `MenuRibbon` "Quit" item
+/// `RunEvent::ExitRequested` teardown runs. Backs the `FileMenu` "Quit" item
 /// and `Ctrl+Q` on Linux/Windows.
 #[tauri::command]
 pub fn quit(app: AppHandle) {
