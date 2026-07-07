@@ -26,14 +26,7 @@ import ReactTimeAgo, { type Formatter } from 'react-timeago';
 import { useMutation, useSubscription } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger,
-} from '@kubetail/ui/elements/sheet';
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@kubetail/ui/elements/sheet';
 import { Spinner } from '@kubetail/ui/elements/spinner';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@kubetail/ui/elements/table';
 
@@ -863,7 +856,17 @@ const GROUPS: { key: Group; label: string; suffix: string; match: (c: Cluster) =
   },
 ];
 
-export function ClusterSyncPanel() {
+// The panel has no trigger of its own — its open state is controlled by the
+// caller (the account menu opens it from a menu item), so it renders just the
+// Sheet's slide-out content. `clustersWatch` is subscribed on mount regardless
+// of `open`, so the app tracks the registry even while the panel is closed; the
+// per-row event/schedule streams mount only when a row's diagnostics are opened.
+type ClusterSyncPanelProps = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+};
+
+export function ClusterSyncPanel({ open, onOpenChange }: ClusterSyncPanelProps) {
   const { clusters } = useClusters();
   const rows = clusters ?? [];
   const groups = GROUPS.map((g) => ({ ...g, clusters: rows.filter(g.match) })).filter((g) => g.clusters.length > 0);
@@ -887,11 +890,7 @@ export function ClusterSyncPanel() {
   };
 
   return (
-    <Sheet>
-      <SheetTrigger className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-1 text-xs font-medium text-muted-foreground outline-none hover:bg-muted/80 focus-visible:ring-2 focus-visible:ring-ring">
-        <Database className="size-3.5" aria-hidden />
-        Clusters
-      </SheetTrigger>
+    <Sheet open={open} onOpenChange={onOpenChange}>
       {/* Match the sheet's own `data-[side=right]:` width utilities so tailwind-merge
           replaces them (a plain `w-…` is a different key, so it'd be kept *alongside*
           the built-in and lose on specificity) — widen the panel to fit the table. */}

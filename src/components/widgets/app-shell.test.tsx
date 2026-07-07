@@ -33,11 +33,8 @@ vi.mock('@/components/widgets/file-menu', () => ({
 vi.mock('@/components/widgets/kube-context-picker', () => ({
   KubeContextPicker: () => <div data-testid="kube-context-picker" />,
 }));
-vi.mock('@/components/widgets/cluster-sync-panel', () => ({
-  ClusterSyncPanel: () => <div data-testid="cluster-sync-panel" />,
-}));
-vi.mock('@/components/widgets/profile-menu', () => ({
-  ProfileMenu: () => <div data-testid="profile-menu" />,
+vi.mock('@/components/widgets/account-menu', () => ({
+  AccountMenu: () => <div data-testid="account-menu" />,
 }));
 vi.mock('@/lib/connection-status', () => ({
   ConnectionStatus: () => <div data-testid="connection-status" />,
@@ -75,11 +72,10 @@ describe('AppShell', () => {
     expect(sidebarOf(container).contains(screen.getByTestId('file-menu'))).toBe(false);
   });
 
-  it('places the status/account chrome inside the sidebar', () => {
+  it('places the account chrome inside the sidebar', () => {
     const { container } = render(<AppShell />);
     const sidebar = sidebarOf(container);
-    expect(sidebar.contains(screen.getByTestId('cluster-sync-panel'))).toBe(true);
-    expect(sidebar.contains(screen.getByTestId('profile-menu'))).toBe(true);
+    expect(sidebar.contains(screen.getByTestId('account-menu'))).toBe(true);
   });
 
   it('renders page content in the inset, not the sidebar', () => {

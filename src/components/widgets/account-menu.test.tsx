@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -28,7 +28,17 @@ type AuthStateValue = {
 const authStateValue = vi.fn<() => AuthStateValue>();
 vi.mock('@/lib/auth', () => ({ useAuthState: () => authStateValue() }));
 
-const { ProfileMenu } = await import('./profile-menu');
+// The account menu owns the cluster-sync panel's Sheet; stub it so the menu can
+// be tested without its GraphQL provider stack, and assert it's opened on select.
+const clustersOpen = vi.fn<(open: boolean) => void>();
+vi.mock('@/components/widgets/cluster-sync-panel', () => ({
+  ClusterSyncPanel: ({ open }: { open: boolean }) => {
+    clustersOpen(open);
+    return <div data-testid="cluster-sync-panel" data-open={open} />;
+  },
+}));
+
+const { AccountMenu } = await import('./account-menu');
 
 const login = vi.fn<() => Promise<void>>();
 const logout = vi.fn<() => Promise<void>>();
@@ -39,8 +49,8 @@ function setAuthState(over: Partial<AuthStateValue> = {}) {
   authStateValue.mockReturnValue({ authState: ANON, loading: false, login, logout, ...over });
 }
 
-describe('ProfileMenu', () => {
-  // Radix's dropdown relies on pointer-capture / scroll APIs jsdom lacks.
+describe('AccountMenu', () => {
+  // base-ui's menu relies on pointer-capture / scroll APIs jsdom lacks.
   beforeAll(() => {
     Element.prototype.hasPointerCapture = vi.fn();
     Element.prototype.releasePointerCapture = vi.fn();
@@ -50,17 +60,19 @@ describe('ProfileMenu', () => {
   beforeEach(() => {
     login.mockReset().mockResolvedValue(undefined);
     logout.mockReset().mockResolvedValue(undefined);
+    clustersOpen.mockReset();
     authStateValue.mockReset();
   });
 
   afterEach(cleanup);
 
-  it('signed out: trigger reads "Sign in" and the menu offers sign-in', async () => {
+  it('signed out: the button reads "Guest" and the menu offers sign-in', async () => {
     setAuthState();
     const user = userEvent.setup();
-    render(<ProfileMenu />);
+    render(<AccountMenu />);
 
-    const trigger = screen.getByRole('button', { name: 'Sign in' });
+    const trigger = screen.getByRole('button', { name: 'Account: Guest' });
+    expect(within(trigger).getByText('Guest')).toBeInTheDocument();
     await user.click(trigger);
 
     const item = await screen.findByRole('menuitem', { name: /sign in/i });
@@ -72,9 +84,9 @@ describe('ProfileMenu', () => {
   it('signed out + loading: the sign-in item is disabled and does not log in', async () => {
     setAuthState({ loading: true });
     const user = userEvent.setup();
-    render(<ProfileMenu />);
+    render(<AccountMenu />);
 
-    await user.click(screen.getByRole('button', { name: 'Sign in' }));
+    await user.click(screen.getByRole('button', { name: 'Account: Guest' }));
     const item = await screen.findByRole('menuitem', { name: /sign in/i });
     expect(item).toHaveAttribute('aria-disabled', 'true');
 
@@ -82,42 +94,57 @@ describe('ProfileMenu', () => {
     expect(login).not.toHaveBeenCalled();
   });
 
-  it('signed in: shows initials, an account label, and signs out', async () => {
+  it('signed in: the button shows the email and the menu signs out', async () => {
     setAuthState({
       authState: { authenticated: true, identity: { sub: 's1', email: 'andres.morey@example.com', name: '' } },
     });
     const user = userEvent.setup();
-    render(<ProfileMenu />);
+    render(<AccountMenu />);
 
     const trigger = screen.getByRole('button', { name: 'Account: andres.morey@example.com' });
-    expect(await screen.findByText('AM')).toBeInTheDocument();
+    expect(within(trigger).getByText('andres.morey@example.com')).toBeInTheDocument();
 
     await user.click(trigger);
-    expect(await screen.findByText('andres.morey@example.com')).toBeInTheDocument();
-
-    await user.click(screen.getByRole('menuitem', { name: /sign out/i }));
+    const signOut = await screen.findByRole('menuitem', { name: /sign out/i });
+    // Signed out is not offered while signed in.
+    expect(screen.queryByRole('menuitem', { name: /^sign in$/i })).not.toBeInTheDocument();
+    await user.click(signOut);
     expect(logout).toHaveBeenCalledTimes(1);
     expect(login).not.toHaveBeenCalled();
   });
 
-  it('signed in with a name: shows the name as primary and email as secondary', async () => {
+  it('signed in with a name: shows the name and email, with initials in the avatar', async () => {
     setAuthState({
       authState: { authenticated: true, identity: { sub: 's2', email: 'ada@example.io', name: 'Ada Lovelace' } },
     });
-    const user = userEvent.setup();
-    render(<ProfileMenu />);
+    render(<AccountMenu />);
 
-    await user.click(screen.getByRole('button', { name: 'Account: ada@example.io' }));
-
-    expect(await screen.findByText('Ada Lovelace')).toBeInTheDocument();
-    expect(screen.getByText('ada@example.io')).toBeInTheDocument();
+    const trigger = screen.getByRole('button', { name: 'Account: ada@example.io' });
+    expect(within(trigger).getByText('Ada Lovelace')).toBeInTheDocument();
+    expect(within(trigger).getByText('ada@example.io')).toBeInTheDocument();
+    expect(within(trigger).getByText('AL')).toBeInTheDocument();
   });
 
-  it('falls back to a generic label when signed in without email or name', () => {
-    setAuthState({
-      authState: { authenticated: true, identity: { sub: 's3', email: '', name: '' } },
-    });
-    render(<ProfileMenu />);
-    expect(screen.getByRole('button', { name: 'Account: signed in' })).toBeInTheDocument();
+  it('opens the cluster-sync panel from the Clusters item', async () => {
+    setAuthState();
+    const user = userEvent.setup();
+    render(<AccountMenu />);
+
+    // The panel starts closed.
+    expect(screen.getByTestId('cluster-sync-panel')).toHaveAttribute('data-open', 'false');
+
+    await user.click(screen.getByRole('button', { name: 'Account: Guest' }));
+    await user.click(await screen.findByRole('menuitem', { name: /clusters/i }));
+
+    expect(clustersOpen).toHaveBeenLastCalledWith(true);
+  });
+
+  it('offers a Settings entry point in both states', async () => {
+    setAuthState();
+    const user = userEvent.setup();
+    render(<AccountMenu />);
+
+    await user.click(screen.getByRole('button', { name: 'Account: Guest' }));
+    expect(await screen.findByRole('menuitem', { name: /settings/i })).toBeInTheDocument();
   });
 });

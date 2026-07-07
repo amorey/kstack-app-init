@@ -14,6 +14,7 @@
 
 import { cleanup, render, screen, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useState } from 'react';
 import { Provider as UrqlProvider } from 'urql';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -208,11 +209,26 @@ function pushSchedule(nextRequeueAt: string | null, probing = false) {
   );
 }
 
+// The panel is controlled by its caller, so wrap it in a harness that owns the
+// open state and exposes a "Clusters" button to open it — mirroring how the
+// account menu drives it in the app.
+function Harness() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}>
+        Clusters
+      </button>
+      <ClusterSyncPanel open={open} onOpenChange={setOpen} />
+    </>
+  );
+}
+
 function renderPanel() {
   return render(
     <UrqlProvider value={createGraphqlClient()}>
       <ClustersProvider>
-        <ClusterSyncPanel />
+        <Harness />
       </ClustersProvider>
     </UrqlProvider>,
   );
