@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Top-bar picker for the active kubeconfig context. Reads contexts and
+// Picker for the active kubeconfig context, shown in the chat area. Reads contexts and
 // currentContext off the `kubeConfigWatch` snapshot. Local selection
 // state for now — no setKubeContext mutation exists yet, so changes are
 // renderer-only. Wire to a mutation when the sidecar exposes one.

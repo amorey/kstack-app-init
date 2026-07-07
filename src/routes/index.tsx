@@ -20,6 +20,7 @@ import { Button } from '@kubetail/ui/elements/button';
 import { Input } from '@kubetail/ui/elements/input';
 
 import { graphql } from '@/gql';
+import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 import { Route as rootRoute } from '@/routes/__root';
 
 import '@/index.css';
@@ -93,6 +94,9 @@ function Chat() {
   return (
     <main className="flex min-h-svh flex-col bg-background">
       <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-3 p-6 pt-16">
+        <div className="flex items-center">
+          <KubeContextPicker />
+        </div>
         <div className="flex-1 space-y-3 overflow-y-auto">
           {messages.length === 0 && !pending && (
             <p className="text-sm text-muted-foreground">Say hi to start a chat.</p>

@@ -30,9 +30,6 @@ vi.mock('@tauri-apps/api/window', () => factory());
 vi.mock('@/components/widgets/file-menu', () => ({
   FileMenu: () => <div data-testid="file-menu" />,
 }));
-vi.mock('@/components/widgets/kube-context-picker', () => ({
-  KubeContextPicker: () => <div data-testid="kube-context-picker" />,
-}));
 vi.mock('@/components/widgets/account-menu', () => ({
   AccountMenu: () => <div data-testid="account-menu" />,
 }));
@@ -59,12 +56,6 @@ function insetOf(container: HTMLElement) {
 // Tests ---------------------------------------------------------------
 
 describe('AppShell', () => {
-  it('places the navigation chrome inside the sidebar', () => {
-    const { container } = render(<AppShell />);
-    const sidebar = sidebarOf(container);
-    expect(sidebar.contains(screen.getByTestId('kube-context-picker'))).toBe(true);
-  });
-
   it('places the File menu in the title bar, not the sidebar', () => {
     const { container } = render(<AppShell />);
     // Off macOS the File menu is a hamburger in the custom title bar, which sits

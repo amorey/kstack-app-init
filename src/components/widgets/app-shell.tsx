@@ -13,32 +13,23 @@
 // limitations under the License.
 
 // The app's visual shell: the floating sidebar plus the page beside it. The
-// navigation chrome (kube-context picker) and the account chrome (the full-width
-// account menu, which also hosts the cluster-sync panel) live in the sidebar;
-// the routed page renders in the inset. The Linux/Windows File menu lives in the
-// title bar (see `AppSidebar`), not here. Kept separate from `__root.tsx` so the
-// layout can be tested without the provider stack.
+// account chrome (the full-width account menu, which also hosts the cluster-sync
+// panel) lives in the sidebar; the routed page renders in the inset. The
+// kube-context picker lives in the chat area itself (see `src/routes/index.tsx`).
+// The Linux/Windows File menu lives in the title bar (see `AppSidebar`), not
+// here. Kept separate from `__root.tsx` so the layout can be tested without the
+// provider stack.
 import type { ReactNode } from 'react';
 
 import { AccountMenu } from '@/components/widgets/account-menu';
 import { AppSidebar } from '@/components/widgets/app-sidebar';
 import { ConnectionStatus } from '@/lib/connection-status';
-import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 
 export function AppShell({ children }: { children?: ReactNode }) {
   return (
     <>
       <ConnectionStatus />
-      <AppSidebar
-        nav={
-          <div className="flex items-center gap-2 px-2">
-            <KubeContextPicker />
-          </div>
-        }
-        footer={<AccountMenu />}
-      >
-        {children}
-      </AppSidebar>
+      <AppSidebar footer={<AccountMenu />}>{children}</AppSidebar>
     </>
   );
 }
