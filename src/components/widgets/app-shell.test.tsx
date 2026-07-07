@@ -33,9 +33,6 @@ vi.mock('@/components/widgets/file-menu', () => ({
 vi.mock('@/components/widgets/kube-context-picker', () => ({
   KubeContextPicker: () => <div data-testid="kube-context-picker" />,
 }));
-vi.mock('@/components/widgets/sync-health-badge', () => ({
-  SyncHealthBadge: () => <div data-testid="sync-health-badge" />,
-}));
 vi.mock('@/components/widgets/cluster-sync-panel', () => ({
   ClusterSyncPanel: () => <div data-testid="cluster-sync-panel" />,
 }));
@@ -81,7 +78,6 @@ describe('AppShell', () => {
   it('places the status/account chrome inside the sidebar', () => {
     const { container } = render(<AppShell />);
     const sidebar = sidebarOf(container);
-    expect(sidebar.contains(screen.getByTestId('sync-health-badge'))).toBe(true);
     expect(sidebar.contains(screen.getByTestId('cluster-sync-panel'))).toBe(true);
     expect(sidebar.contains(screen.getByTestId('profile-menu'))).toBe(true);
   });

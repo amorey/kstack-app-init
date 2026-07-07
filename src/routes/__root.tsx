@@ -23,7 +23,6 @@ import { createGraphqlClient } from '@/lib/graphql/client';
 import { ReadyGate } from '@/lib/ready-gate';
 import { ClustersProvider } from '@/lib/clusters';
 import { KubeConfigProvider } from '@/lib/kube-config';
-import { SyncStatusProvider } from '@/lib/sync-status';
 
 const TanStackRouterDevtools =
   import.meta.env.VITE_ROUTER_DEVTOOLS === 'true'
@@ -58,18 +57,16 @@ function RootComponent() {
       <ReadyGate>
         <UrqlProvider value={gqlClient}>
           <AuthProvider>
-            <SyncStatusProvider>
-              <ClustersProvider>
-                <KubeConfigProvider>
-                  <AppShell>
-                    <Outlet />
-                  </AppShell>
-                  <Suspense>
-                    <TanStackRouterDevtools />
-                  </Suspense>
-                </KubeConfigProvider>
-              </ClustersProvider>
-            </SyncStatusProvider>
+            <ClustersProvider>
+              <KubeConfigProvider>
+                <AppShell>
+                  <Outlet />
+                </AppShell>
+                <Suspense>
+                  <TanStackRouterDevtools />
+                </Suspense>
+              </KubeConfigProvider>
+            </ClustersProvider>
           </AuthProvider>
         </UrqlProvider>
       </ReadyGate>

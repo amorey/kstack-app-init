@@ -157,9 +157,9 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
     }));
   }, [clusterMap, cacheMap]);
 
-  // Mirror SyncStatusProvider: no `error` branch (subscribe-exchange reconnects
-  // transport drops internally), and a memo keeps the context value stable
-  // between non-push re-renders.
+  // No `error` branch (subscribe-exchange reconnects transport drops
+  // internally), and a memo keeps the context value stable between non-push
+  // re-renders.
   const value = useMemo<ClustersContextValue>(() => ({ clusters }), [clusters]);
   return <ClustersContext.Provider value={value}>{children}</ClustersContext.Provider>;
 }

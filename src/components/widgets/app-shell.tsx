@@ -13,9 +13,9 @@
 // limitations under the License.
 
 // The app's visual shell: the floating sidebar plus the page beside it. The
-// navigation chrome (kube-context picker) and the status/account chrome (sync
-// health, cluster-sync panel, profile) live in the sidebar; the routed page
-// renders in the inset. The Linux/Windows File menu lives in the title bar (see
+// navigation chrome (kube-context picker) and the status/account chrome
+// (cluster-sync panel, profile) live in the sidebar; the routed page renders in
+// the inset. The Linux/Windows File menu lives in the title bar (see
 // `AppSidebar`), not here. Kept separate from `__root.tsx` so the layout can be
 // tested without the provider stack.
 import type { ReactNode } from 'react';
@@ -25,7 +25,6 @@ import { ClusterSyncPanel } from '@/components/widgets/cluster-sync-panel';
 import { ConnectionStatus } from '@/lib/connection-status';
 import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 import { ProfileMenu } from '@/components/widgets/profile-menu';
-import { SyncHealthBadge } from '@/components/widgets/sync-health-badge';
 
 export function AppShell({ children }: { children?: ReactNode }) {
   return (
@@ -39,7 +38,6 @@ export function AppShell({ children }: { children?: ReactNode }) {
         }
         footer={
           <div className="flex items-center gap-2 px-2">
-            <SyncHealthBadge />
             <ClusterSyncPanel />
             <ProfileMenu />
           </div>
