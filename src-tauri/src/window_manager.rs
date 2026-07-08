@@ -228,10 +228,13 @@ mod tests {
         // The statically-declared `main` window carries the traffic-light
         // position as a JSON literal (baked in before Rust runs, so it can't
         // read the constants). Pin the literal to the computed value so the two
-        // can't silently drift when the sidebar geometry is retuned.
+        // can't silently drift when the sidebar geometry is retuned. The
+        // literal lives in the macOS config overlay (traffic lights are
+        // macOS-only; the base config is the transparent Linux/Windows window).
         let (x, y) = super::traffic_light_position(super::SIDEBAR_GAP, super::TITLE_BAR_HEIGHT);
         let config: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid config JSON");
+            serde_json::from_str(include_str!("../tauri.macos.conf.json"))
+                .expect("valid config JSON");
         let pos = &config["app"]["windows"][0]["trafficLightPosition"];
         assert_eq!(pos["x"].as_f64(), Some(x));
         assert_eq!(pos["y"].as_f64(), Some(y));
