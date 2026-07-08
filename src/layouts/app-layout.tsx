@@ -26,19 +26,25 @@
 import { Outlet } from '@tanstack/react-router';
 
 import { AccountMenu } from '@/components/widgets/account-menu';
+import { AppDialogs } from '@/components/widgets/app-dialogs';
 import { AppSidebar } from '@/components/widgets/app-sidebar';
 import { ModeNav } from '@/components/widgets/mode-nav';
 import { ConnectionStatus } from '@/lib/connection-status';
+import { DialogProvider } from '@/lib/dialog';
 
 export function AppLayout() {
   return (
-    <>
+    // The dialogs host lives outside the sidebar so an open dialog survives the
+    // card unmounting when the window auto-collapses below the md breakpoint —
+    // the account menu (in the sidebar footer) only requests opens via context.
+    <DialogProvider>
       <ConnectionStatus />
       <AppSidebar nav={<ModeNav />} footer={<AccountMenu />}>
         <main className="flex min-h-svh flex-col bg-background pt-16">
           <Outlet />
         </main>
       </AppSidebar>
-    </>
+      <AppDialogs />
+    </DialogProvider>
   );
 }

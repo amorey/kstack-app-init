@@ -16,9 +16,10 @@
 // that reads "Guest" when signed out and the user's identity (name/email) when
 // signed in, opening a menu that rises above it. A session is an add-on, not a
 // gate — the app loads regardless, and the user can sign in / out at will from
-// here. The menu also hosts entry points to the cluster-sync panel (whose Sheet
-// this component owns) and Settings.
-import { useState } from 'react';
+// here. The menu also hosts entry points to the cluster-sync panel and Settings
+// dialogs — it only requests them open through `useDialog`; the dialogs render
+// above the sidebar (see `AppDialogs`) so they outlive this menu when the sidebar
+// card unmounts on auto-collapse.
 import { ChevronUp, Database, LogOut, Settings, User } from 'lucide-react';
 
 import { Avatar, AvatarFallback } from '@kubetail/ui/elements/avatar';
@@ -30,8 +31,8 @@ import {
   DropdownMenuTrigger,
 } from '@kubetail/ui/elements/dropdown-menu';
 
-import { ClusterSyncPanel } from '@/components/widgets/cluster-sync-panel';
 import { useAuthState } from '@/lib/auth';
+import { useDialog } from '@/lib/dialog';
 
 function initials(s: string): string {
   // Two letters max. Splits on whitespace and common separators so an
@@ -53,77 +54,76 @@ export function AccountMenu() {
   // The trigger's accessible label: the signed-in identity, or "Guest".
   const account = authenticated ? email || name || 'Signed in' : 'Guest';
 
-  // The cluster-sync panel is opened from a menu item; its Sheet is rendered
-  // here and its open state lives here so the item can trigger it.
-  const [clustersOpen, setClustersOpen] = useState(false);
+  // The overlay dialogs are opened by id; they render above the sidebar so they
+  // survive this menu (and its sidebar card) unmounting.
+  const { openDialog } = useDialog();
 
   return (
-    <>
-      <DropdownMenu>
-        <DropdownMenuTrigger
-          aria-label={`Account: ${account}`}
-          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <Avatar size="sm">
-            <AvatarFallback>
-              {authenticated && (name || email) ? initials(name || email!) : <User className="size-4" aria-hidden />}
-            </AvatarFallback>
-          </Avatar>
-          <span className="min-w-0 flex-1">
-            {authenticated ? (
-              <>
-                <span className="block truncate text-sm font-medium">{name || email}</span>
-                {name && email ? <span className="block truncate text-xs text-muted-foreground">{email}</span> : null}
-              </>
-            ) : (
-              <span className="block truncate text-sm font-medium">Guest</span>
-            )}
-          </span>
-          <ChevronUp className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-        </DropdownMenuTrigger>
-        {/* Rises above the button (it sits at the sidebar's foot); min-width keeps
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        aria-label={`Account: ${account}`}
+        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Avatar size="sm">
+          <AvatarFallback>
+            {authenticated && (name || email) ? initials(name || email!) : <User className="size-4" aria-hidden />}
+          </AvatarFallback>
+        </Avatar>
+        <span className="min-w-0 flex-1">
+          {authenticated ? (
+            <>
+              <span className="block truncate text-sm font-medium">{name || email}</span>
+              {name && email ? <span className="block truncate text-xs text-muted-foreground">{email}</span> : null}
+            </>
+          ) : (
+            <span className="block truncate text-sm font-medium">Guest</span>
+          )}
+        </span>
+        <ChevronUp className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+      </DropdownMenuTrigger>
+      {/* Rises above the button (it sits at the sidebar's foot); min-width keeps
             it from collapsing narrower than the trigger. */}
-        <DropdownMenuContent align="start" side="top" sideOffset={6} className="min-w-56">
-          {!authenticated && (
-            <>
-              {/* A prominent primary call-to-action, matching the mockup's blue
+      <DropdownMenuContent align="start" side="top" sideOffset={6} className="min-w-56">
+        {!authenticated && (
+          <>
+            {/* A prominent primary call-to-action, matching the mockup's blue
                   sign-in button. */}
-              <DropdownMenuItem
-                disabled={loading}
-                onClick={() => login().catch(() => {})}
-                className="flex-col items-start gap-0 bg-primary text-primary-foreground focus:bg-primary/90 focus:text-primary-foreground"
-              >
-                <span className="text-sm font-semibold">Sign in</span>
-                <span className="text-xs opacity-90">or create an account</span>
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-            </>
-          )}
-          <DropdownMenuItem onClick={() => setClustersOpen(true)}>
-            <Database className="size-4" aria-hidden />
-            Clusters
-          </DropdownMenuItem>
-          {/* Settings has no screen yet — a placeholder entry point. */}
-          <DropdownMenuItem
-            onClick={() => {
-              /* TODO: open settings once a settings screen exists */
-            }}
-          >
-            <Settings className="size-4" aria-hidden />
-            Settings
-          </DropdownMenuItem>
-          {authenticated && (
-            <>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => logout().catch(() => {})}>
-                <LogOut className="size-4" aria-hidden />
-                Sign out
-              </DropdownMenuItem>
-            </>
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
-      <ClusterSyncPanel open={clustersOpen} onOpenChange={setClustersOpen} />
-    </>
+            <DropdownMenuItem
+              disabled={loading}
+              onClick={() => login().catch(() => {})}
+              className="flex-col items-start gap-0 bg-primary text-primary-foreground focus:bg-primary/90 focus:text-primary-foreground"
+            >
+              <span className="text-sm font-semibold">Sign in</span>
+              <span className="text-xs opacity-90">or create an account</span>
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
+        <DropdownMenuItem onClick={() => openDialog('clusters')}>
+          <Database className="size-4" aria-hidden />
+          Clusters
+        </DropdownMenuItem>
+        {/* Settings has no dialog yet — a placeholder entry point. Wire it to
+              `openDialog('settings')` once the Settings dialog is registered in
+              AppDialogs. */}
+        <DropdownMenuItem
+          onClick={() => {
+            /* TODO: openDialog('settings') once a settings dialog exists */
+          }}
+        >
+          <Settings className="size-4" aria-hidden />
+          Settings
+        </DropdownMenuItem>
+        {authenticated && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => logout().catch(() => {})}>
+              <LogOut className="size-4" aria-hidden />
+              Sign out
+            </DropdownMenuItem>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

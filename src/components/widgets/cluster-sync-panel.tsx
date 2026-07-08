@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Slide-out panel showing the app's cluster registry as a table, with rows
+// Dialog showing the app's cluster registry as a table, with rows
 // grouped into Active (still in the current kubeconfig) and Orphaned (a leftover
 // cache whose context has left the kubeconfig). Columns: Cluster & connection,
 // Sync status, Cache, Actions. Each row's actions are a play/pause toggle for
@@ -26,12 +26,13 @@ import ReactTimeAgo, { type Formatter } from 'react-timeago';
 import { useMutation, useSubscription } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@kubetail/ui/elements/sheet';
 import { Spinner } from '@kubetail/ui/elements/spinner';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@kubetail/ui/elements/table';
 
+import { Dialog } from '@/components/widgets/dialog';
 import { graphql } from '@/gql';
 import { type Cluster, formatBytes, useClusters } from '@/lib/clusters';
+import { type AppDialogProps } from '@/lib/dialog';
 import { errorMessage, reportError } from '@/lib/error-bus';
 
 const ClusterEnabledSetMutation = graphql(`
@@ -494,7 +495,7 @@ function EventRunList({
 // the connection is down (`connFailed`) it also titles itself "Connection failed"
 // and offers a Retry-now action (force an immediate reconnect, resetting backoff);
 // otherwise it stays a neutral read-only view. Rendered inline in an expandable
-// row rather than a floating popover: the panel lives inside the modal Sheet (a
+// row rather than a floating popover: the panel lives inside the modal dialog (a
 // base-ui Dialog), which inerts everything outside its own subtree — so a
 // body-portaled popover would be unclickable.
 function ConnectionDetail({
@@ -588,7 +589,7 @@ function cacheSummary(objectCount: number, kindCount: number): string {
 
 // The expanded sync diagnostics: the recent cache-sync event history for a
 // cluster's active cache. Mirrors ConnectionDetail (an inline expandable region,
-// not a popover, for the same modal-Sheet inert reason), keyed by the active
+// not a popover, for the same modal-dialog inert reason), keyed by the active
 // cache's id — the sync-event stream lives on the ClusterCache, not the Cluster.
 function SyncDetail({
   cacheId,
@@ -857,16 +858,11 @@ const GROUPS: { key: Group; label: string; suffix: string; match: (c: Cluster) =
 ];
 
 // The panel has no trigger of its own — its open state is controlled by the
-// caller (the account menu opens it from a menu item), so it renders just the
-// Sheet's slide-out content. `clustersWatch` is subscribed on mount regardless
-// of `open`, so the app tracks the registry even while the panel is closed; the
-// per-row event/schedule streams mount only when a row's diagnostics are opened.
-type ClusterSyncPanelProps = {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-};
-
-export function ClusterSyncPanel({ open, onOpenChange }: ClusterSyncPanelProps) {
+// caller (`AppDialogs`, driven by the account menu), so it renders just the
+// dialog's content. It mounts only while the dialog is open; the app tracks the
+// cluster registry regardless via `ClustersProvider`'s `clustersWatch` at the
+// root. Per-row event/schedule streams mount only when a row's diagnostics open.
+export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
   const { clusters } = useClusters();
   const rows = clusters ?? [];
   const groups = GROUPS.map((g) => ({ ...g, clusters: rows.filter(g.match) })).filter((g) => g.clusters.length > 0);
@@ -890,61 +886,54 @@ export function ClusterSyncPanel({ open, onOpenChange }: ClusterSyncPanelProps) 
   };
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      {/* Match the sheet's own `data-[side=right]:` width utilities so tailwind-merge
-          replaces them (a plain `w-…` is a different key, so it'd be kept *alongside*
-          the built-in and lose on specificity) — widen the panel to fit the table. */}
-      <SheetContent side="right" className="data-[side=right]:w-4xl data-[side=right]:sm:max-w-[95vw]">
-        <SheetHeader>
-          <SheetTitle>Clusters</SheetTitle>
-          <SheetDescription>Clusters in your kubeconfig and any leftover local caches.</SheetDescription>
-        </SheetHeader>
-        {rows.length === 0 ? (
-          <p className="px-4 py-6 text-sm text-muted-foreground">No clusters yet.</p>
-        ) : (
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
-            <Table className="table-fixed">
-              <TableHeader>
-                <TableRow>
-                  <TableHead className={STATUS_CELL_CLASS}>
-                    <span className="sr-only">Status</span>
-                  </TableHead>
-                  <TableHead>Cluster</TableHead>
-                  <TableHead className="w-28">Connection</TableHead>
-                  <TableHead className="w-32">Sync status</TableHead>
-                  <TableHead className="w-20">Cache</TableHead>
-                  <TableHead className="w-36 text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              {groups.map((g) => (
-                <TableBody key={g.key} aria-label={`${g.label} clusters`}>
-                  <TableRow className="hover:bg-transparent">
-                    <TableHead
-                      colSpan={COLUMN_COUNT}
-                      className="h-auto py-1 text-xs tracking-wide text-muted-foreground"
-                    >
-                      <span className="font-semibold uppercase">{g.label}</span>
-                      <span className="font-normal"> · {g.suffix}</span>
-                    </TableHead>
-                  </TableRow>
-                  {g.clusters.map((c) => (
-                    <ClusterRow
-                      key={c.id}
-                      cluster={c}
-                      group={g.key}
-                      onSetEnabled={(enabled) => run(clusterEnabledSetMut({ id: c.id, enabled }))}
-                      onToggle={(syncEnabled) => run(clusterSyncEnabledSetMut({ id: c.id, syncEnabled }))}
-                      onClearCache={() => run(clusterCacheClearMut({ id: c.id }))}
-                      onRemove={() => run(clusterDeleteMut({ id: c.id }))}
-                      onRetry={() => run(clusterConnectionRetryMut({ id: c.id }))}
-                    />
-                  ))}
-                </TableBody>
+    <Dialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="Clusters"
+      description="Clusters in your kubeconfig and any leftover local caches."
+      // Widen well past the dialog's reading-measure default to fit the table.
+      className="sm:max-w-4xl"
+    >
+      {rows.length === 0 ? (
+        <p className="py-6 text-sm text-muted-foreground">No clusters yet.</p>
+      ) : (
+        <Table className="table-fixed">
+          <TableHeader>
+            <TableRow>
+              <TableHead className={STATUS_CELL_CLASS}>
+                <span className="sr-only">Status</span>
+              </TableHead>
+              <TableHead>Cluster</TableHead>
+              <TableHead className="w-28">Connection</TableHead>
+              <TableHead className="w-32">Sync status</TableHead>
+              <TableHead className="w-20">Cache</TableHead>
+              <TableHead className="w-36 text-right">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          {groups.map((g) => (
+            <TableBody key={g.key} aria-label={`${g.label} clusters`}>
+              <TableRow className="hover:bg-transparent">
+                <TableHead colSpan={COLUMN_COUNT} className="h-auto py-1 text-xs tracking-wide text-muted-foreground">
+                  <span className="font-semibold uppercase">{g.label}</span>
+                  <span className="font-normal"> · {g.suffix}</span>
+                </TableHead>
+              </TableRow>
+              {g.clusters.map((c) => (
+                <ClusterRow
+                  key={c.id}
+                  cluster={c}
+                  group={g.key}
+                  onSetEnabled={(enabled) => run(clusterEnabledSetMut({ id: c.id, enabled }))}
+                  onToggle={(syncEnabled) => run(clusterSyncEnabledSetMut({ id: c.id, syncEnabled }))}
+                  onClearCache={() => run(clusterCacheClearMut({ id: c.id }))}
+                  onRemove={() => run(clusterDeleteMut({ id: c.id }))}
+                  onRetry={() => run(clusterConnectionRetryMut({ id: c.id }))}
+                />
               ))}
-            </Table>
-          </div>
-        )}
-      </SheetContent>
-    </Sheet>
+            </TableBody>
+          ))}
+        </Table>
+      )}
+    </Dialog>
   );
 }

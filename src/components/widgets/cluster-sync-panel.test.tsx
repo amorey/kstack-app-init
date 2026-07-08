@@ -234,7 +234,7 @@ function renderPanel() {
   );
 }
 
-// Render the panel, push rows, and open the sheet.
+// Render the panel, push rows, and open the dialog.
 async function openWith(rows: Row[]) {
   const user = userEvent.setup();
   renderPanel();

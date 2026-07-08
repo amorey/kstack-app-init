@@ -37,6 +37,11 @@ vi.mock('@/components/widgets/account-menu', () => ({
 vi.mock('@/components/widgets/mode-nav', () => ({
   ModeNav: () => <div data-testid="mode-nav" />,
 }));
+// The dialogs host mounts the real overlay panels (which need the GraphQL/clusters
+// provider stack); stub it — this test is about chrome placement, not dialogs.
+vi.mock('@/components/widgets/app-dialogs', () => ({
+  AppDialogs: () => <div data-testid="app-dialogs" />,
+}));
 vi.mock('@/lib/connection-status', () => ({
   ConnectionStatus: () => <div data-testid="connection-status" />,
 }));

@@ -28,14 +28,12 @@ type AuthStateValue = {
 const authStateValue = vi.fn<() => AuthStateValue>();
 vi.mock('@/lib/auth', () => ({ useAuthState: () => authStateValue() }));
 
-// The account menu owns the cluster-sync panel's Sheet; stub it so the menu can
-// be tested without its GraphQL provider stack, and assert it's opened on select.
-const clustersOpen = vi.fn<(open: boolean) => void>();
-vi.mock('@/components/widgets/cluster-sync-panel', () => ({
-  ClusterSyncPanel: ({ open }: { open: boolean }) => {
-    clustersOpen(open);
-    return <div data-testid="cluster-sync-panel" data-open={open} />;
-  },
+// The account menu opens the overlay dialogs through the `useDialog` controller
+// (it no longer renders them). Stub the controller so we can assert the menu
+// requests the right dialog on select, without a DialogProvider ancestor.
+const openDialog = vi.fn<(id: string) => void>();
+vi.mock('@/lib/dialog', () => ({
+  useDialog: () => ({ activeDialog: null, openDialog, closeDialog: vi.fn() }),
 }));
 
 const { AccountMenu } = await import('./account-menu');
@@ -60,7 +58,7 @@ describe('AccountMenu', () => {
   beforeEach(() => {
     login.mockReset().mockResolvedValue(undefined);
     logout.mockReset().mockResolvedValue(undefined);
-    clustersOpen.mockReset();
+    openDialog.mockReset();
     authStateValue.mockReset();
   });
 
@@ -130,13 +128,10 @@ describe('AccountMenu', () => {
     const user = userEvent.setup();
     render(<AccountMenu />);
 
-    // The panel starts closed.
-    expect(screen.getByTestId('cluster-sync-panel')).toHaveAttribute('data-open', 'false');
-
     await user.click(screen.getByRole('button', { name: 'Account: Guest' }));
     await user.click(await screen.findByRole('menuitem', { name: /clusters/i }));
 
-    expect(clustersOpen).toHaveBeenLastCalledWith(true);
+    expect(openDialog).toHaveBeenCalledWith('clusters');
   });
 
   it('offers a Settings entry point in both states', async () => {
