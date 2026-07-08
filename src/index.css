@@ -10,6 +10,12 @@
 }
 
 @layer base {
+  html,
+  body {
+    /* Kill the webview rubber-band / overscroll "bounce" at the document edges. */
+    overscroll-behavior: none;
+  }
+
   body {
     @apply antialiased;
     font-feature-settings: 'rlig' 1, 'calt' 1;
