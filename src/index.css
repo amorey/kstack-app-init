@@ -59,3 +59,23 @@
     background: transparent;
   }
 }
+
+/*
+ * Dialog scrim clipped to the frame. base-ui portals the overlay to <body>,
+ * outside `WindowFrame`, so its default `inset-0` darkens the transparent gutter
+ * the frame leaves around the app — the scrim spills past the rounded window
+ * edge. Inset it to match the frame instead. Kept in step with `WindowFrame`'s
+ * `inset-4`/`rounded-lg` by hand. Unlayered (not in `@layer base`) so it wins
+ * over Tailwind's `.inset-0` utility on the overlay. macOS (no `.frameless`) and
+ * a maximized frameless window (the frame is full-bleed `inset-0` then, flagged
+ * by `.frame-maximized` from `WindowFrame`) keep the full-window scrim.
+ */
+html.frameless [data-slot='dialog-overlay'] {
+  inset: 1rem;
+  border-radius: 0.5rem;
+}
+
+html.frameless.frame-maximized [data-slot='dialog-overlay'] {
+  inset: 0;
+  border-radius: 0;
+}

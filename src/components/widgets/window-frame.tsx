@@ -43,12 +43,22 @@
 // full-bleed `inset-0` surface — no inset, corners, border, or shadow — while
 // maximized, and `WindowResizeHandles` hides its grips to match.
 import type { ReactNode } from 'react';
+import { useEffect } from 'react';
 
 import { isMacOS } from '@/lib/platform';
 import { useWindowMaximized } from '@/lib/window-maximized';
 
 export function WindowFrame({ children }: { children?: ReactNode }) {
   const maximized = useWindowMaximized();
+
+  // Mirror the maximized state onto <html> so portaled chrome that can't reach
+  // into the frame — chiefly the dialog scrim, which base-ui portals to <body>
+  // outside this frame — can match the frame's geometry from CSS (see the
+  // `[data-slot='dialog-overlay']` rule in `index.css`). Always false on macOS.
+  useEffect(() => {
+    document.documentElement.classList.toggle('frame-maximized', maximized);
+  }, [maximized]);
+
   if (isMacOS()) return <>{children}</>;
   const className = maximized
     ? 'fixed inset-0 overflow-hidden bg-background contain-[paint]'
