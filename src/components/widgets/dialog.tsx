@@ -28,6 +28,7 @@
 // completion to the host so a lazily-mounted dialog is unmounted only once its
 // exit animation has played — dialog components need do nothing for this.
 import type { ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 
 import {
   Dialog as DialogRoot,
@@ -38,7 +39,41 @@ import {
 } from '@kubetail/ui/elements/dialog';
 import { cn } from '@kubetail/ui/lib/utils';
 
+import { isMacOS } from '@/lib/platform';
 import { useDialogHost } from '@/lib/dialog';
+
+// True when a native event landed on the window's drag region — the title-bar
+// strip carrying `data-tauri-drag-region` (see `WindowDragBand` below and the
+// shell's bands in `app-sidebar.tsx`).
+function isDragRegionEvent(event: Event): boolean {
+  const { target } = event;
+  return target instanceof Element && target.closest('[data-tauri-drag-region]') !== null;
+}
+
+// A window-drag strip painted across the top of the *dialog's* portal. While a
+// dialog is open its backdrop (and, when modal, base-ui's internal backdrop)
+// covers the shell's own title-bar drag band and swallows the mousedown that
+// moves the window — and both live in the portal's stacking context, above the
+// whole app, so a band rendered in the app tree can't reach over them. Portaling
+// this band to `document.body` puts it in that same top-level context, where a
+// high `z-index` lets it sit above the backdrop and start a window drag again.
+//
+// It spans only the title-bar band (matched to `app-sidebar.tsx`: 44px on macOS,
+// 32px elsewhere), well clear of a centered dialog's body. On macOS the native
+// traffic lights float above web content, so they stay clickable through it.
+// A press here reads as an outside-press to base-ui; `Dialog` cancels that
+// dismissal (see below) so dragging the window never closes the dialog.
+function WindowDragBand() {
+  return createPortal(
+    <div
+      data-testid="dialog-window-drag-region"
+      data-tauri-drag-region
+      aria-hidden
+      className={`fixed inset-x-0 top-0 z-[60] ${isMacOS() ? 'h-11' : 'h-8'}`}
+    />,
+    document.body,
+  );
+}
 
 type DialogProps = {
   open: boolean;
@@ -55,12 +90,25 @@ export function Dialog({ open, onOpenChange, title, description, className, chil
   return (
     <DialogRoot
       open={open}
-      onOpenChange={onOpenChange}
+      onOpenChange={(nextOpen, eventDetails) => {
+        // Grabbing the window-drag band (which overlays the backdrop) reads as an
+        // outside-press to base-ui and would dismiss the dialog the instant the
+        // user starts moving the window. Cancel that — dragging the window must
+        // not close the dialog. Escape, the close button, and clicking the dimmed
+        // backdrop still dismiss it.
+        if (!nextOpen && eventDetails.reason === 'outside-press' && isDragRegionEvent(eventDetails.event)) {
+          eventDetails.cancel();
+          return;
+        }
+        onOpenChange(nextOpen);
+      }}
       // Once the close transition settles, tell the host so it can unmount us.
       onOpenChangeComplete={(nextOpen) => {
         if (!nextOpen) host?.notifyClosed();
       }}
     >
+      {/* Keeps the window draggable by its title bar while the dialog is open. */}
+      {open && <WindowDragBand />}
       {/* Cap at the viewport and lay out as a column so the body scrolls within
           the dialog instead of pushing it off-screen. */}
       <DialogContent className={cn('flex max-h-[85vh] flex-col', className)}>
