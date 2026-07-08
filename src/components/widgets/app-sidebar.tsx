@@ -30,7 +30,8 @@
 // `Sidebar`. That component slides the panel in/out over 200ms with no way to
 // opt out; we want an instant show/hide, so our shell simply mounts/unmounts the
 // floating card and toggles a layout spacer's width.
-import type { CSSProperties, ReactNode } from 'react';
+import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
+import { useCallback, useState } from 'react';
 
 import {
   SidebarContent,
@@ -76,6 +77,86 @@ const WIN_TITLE_BAR_HEIGHT_PX = '32px';
 
 // Title-bar height, derived from `--win-titlebar-h`.
 const WIN_TITLE_BAR_HEIGHT = 'h-[var(--win-titlebar-h)]';
+
+// Sidebar width bounds (px). The card is drag-resizable from its right edge
+// between these; `DEFAULT_SIDEBAR_WIDTH` matches the library's 16rem default.
+// The chosen width is published as `--sidebar-width` (overriding the library
+// default) so both the floating card and the layout spacer track it, and is
+// persisted to `localStorage` under `SIDEBAR_WIDTH_KEY` across sessions.
+const MIN_SIDEBAR_WIDTH = 200;
+const MAX_SIDEBAR_WIDTH = 480;
+const DEFAULT_SIDEBAR_WIDTH = 256;
+const SIDEBAR_WIDTH_KEY = 'sidebar_width';
+
+// The floating card's `p-2` padding (px): `--sidebar-width` spans the whole
+// card, so the *visible* sidebar border sits this far inside the card's right
+// edge. The resize handle centers on that visible border and the drag math
+// offsets by it, so grabbing the border doesn't jump the width.
+const CARD_PADDING = 8;
+
+const clampWidth = (px: number) => Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, px));
+
+// Persisted, clamped sidebar width plus a setter that mirrors changes to
+// `localStorage`. Reads the stored value lazily on first render. The app can
+// open several main windows at once; they share one webview origin (hence one
+// `localStorage`), but each keeps its own width in React state and never syncs
+// live — so resizing one window leaves the others untouched, while a *newly*
+// opened window inherits the last-saved width from `localStorage` on mount.
+function useSidebarWidth(): [number, (px: number) => void] {
+  const [width, setWidth] = useState(() => {
+    const stored = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+    return stored ? clampWidth(stored) : DEFAULT_SIDEBAR_WIDTH;
+  });
+  const set = useCallback((px: number) => {
+    const next = clampWidth(px);
+    setWidth(next);
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
+  }, []);
+  return [width, set];
+}
+
+// Drag handle centered on the sidebar's visible right border, straddling it
+// symmetrically. On pointer-drag it maps the pointer's x-position (measured from
+// the window's left edge, where the card sits) to the card width — adding the
+// card padding so the visible border tracks the cursor without jumping on grab;
+// the parent clamps and persists it. Pointer capture keeps the drag alive even
+// when the cursor outruns the thin handle.
+function ResizeHandle({ onResize }: { onResize: (px: number) => void }) {
+  const handlePointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      // Force the resize cursor for the whole drag: without this it reverts
+      // whenever the pointer strays off the thin handle onto other elements.
+      // `user-select: none` stops text getting selected as the pointer moves.
+      const { body } = document;
+      const prevCursor = body.style.cursor;
+      const prevSelect = body.style.userSelect;
+      body.style.cursor = 'col-resize';
+      body.style.userSelect = 'none';
+      const onMove = (ev: PointerEvent) => onResize(ev.clientX + CARD_PADDING);
+      const onUp = () => {
+        body.style.cursor = prevCursor;
+        body.style.userSelect = prevSelect;
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    },
+    [onResize],
+  );
+
+  return (
+    <div
+      data-testid="sidebar-resize-handle"
+      role="separator"
+      aria-orientation="vertical"
+      onPointerDown={handlePointerDown}
+      className="absolute inset-y-0 right-1 z-20 w-2 cursor-col-resize touch-none"
+    />
+  );
+}
 
 // macOS: a window-wide drag strip across the top, spanning the whole title-bar
 // band — including the area beside the floating sidebar (over the page). Its
@@ -140,6 +221,7 @@ function WinTitleBar() {
 
 type ShellProps = {
   mac: boolean;
+  onResize: (px: number) => void;
   nav?: ReactNode;
   footer?: ReactNode;
   children?: ReactNode;
@@ -150,7 +232,7 @@ type ShellProps = {
 // same-width spacer reserves room for it in the flex row so the page inset sits
 // beside it. When collapsed, both vanish immediately (no slide) and the inset
 // reclaims the full width.
-function SidebarShell({ mac, nav, footer, children }: ShellProps) {
+function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
   const { open } = useSidebar();
 
   // Off macOS the card starts just below the custom title bar; on macOS it spans
@@ -172,6 +254,7 @@ function SidebarShell({ mac, nav, footer, children }: ShellProps) {
             <SidebarContent>{nav}</SidebarContent>
             <SidebarFooter>{footer}</SidebarFooter>
           </div>
+          <ResizeHandle onResize={onResize} />
         </div>
       )}
 
@@ -201,11 +284,19 @@ type AppSidebarProps = {
 
 export function AppSidebar({ nav, footer, children }: AppSidebarProps) {
   const mac = isMacOS();
+  const [width, setWidth] = useSidebarWidth();
+
+  // Publish the drag-chosen width as `--sidebar-width` (overriding the library
+  // default) and, off macOS, the custom title-bar height — both so the bar and
+  // the sidebar offset can read it from one place (see `WIN_TITLE_BAR_HEIGHT_PX`).
+  const style = {
+    '--sidebar-width': `${width}px`,
+    ...(mac ? {} : { '--win-titlebar-h': WIN_TITLE_BAR_HEIGHT_PX }),
+  } as CSSProperties;
+
   return (
-    // Off macOS, publish the custom title-bar height so the bar and the sidebar
-    // offset can both read it from one place (see `WIN_TITLE_BAR_HEIGHT_PX`).
-    <SidebarProvider style={mac ? undefined : ({ '--win-titlebar-h': WIN_TITLE_BAR_HEIGHT_PX } as CSSProperties)}>
-      <SidebarShell mac={mac} nav={nav} footer={footer}>
+    <SidebarProvider style={style}>
+      <SidebarShell mac={mac} onResize={setWidth} nav={nav} footer={footer}>
         {children}
       </SidebarShell>
     </SidebarProvider>
