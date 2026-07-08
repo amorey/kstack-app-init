@@ -19,6 +19,12 @@
 // rounded corners, with a thin border and a soft outer shadow that paints into the
 // transparent gutter — so the window reads as a distinct floating surface.
 //
+// The gutter (`inset-4`) must be at least as wide as the shadow's reach (blur +
+// offset). The OS window rectangle ends at the gutter's outer edge and clips
+// anything beyond it, so a shadow that reaches farther than the gutter gets cut off
+// into a hard band. Keep the shadow blur/offset small enough to fade out within the
+// inset.
+//
 // The inset works without touching any of the app's fixed chrome (custom title
 // bar, floating sidebar): `contain: paint` makes this element the containing block
 // for its `position: fixed` descendants, so they anchor to the frame's inset box
@@ -39,7 +45,7 @@ export function WindowFrame({ children }: { children?: ReactNode }) {
   return (
     <div
       data-testid="window-frame"
-      className="fixed inset-2 overflow-hidden rounded-lg border border-black/5 bg-background shadow-[0_10px_30px_rgba(0,0,0,0.45)] contain-[paint] dark:border-white/5"
+      className="fixed inset-4 overflow-hidden rounded-lg border border-black/5 bg-background shadow-[0_6px_16px_rgba(0,0,0,0.35)] contain-[paint] dark:border-white/5"
     >
       {children}
     </div>
