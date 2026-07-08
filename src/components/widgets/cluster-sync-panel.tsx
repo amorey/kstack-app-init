@@ -891,8 +891,10 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
       onOpenChange={onOpenChange}
       title="Clusters"
       description="Clusters in your kubeconfig and any leftover local caches."
-      // Widen well past the dialog's reading-measure default to fit the table.
-      className="sm:max-w-4xl"
+      // Widen well past the dialog's reading-measure default to fit the table,
+      // but keep a margin off the window edges at every width until it hits its
+      // max (then it stays centered) rather than hugging the sides in between.
+      className="w-[calc(100%-4rem)] max-w-4xl sm:max-w-4xl"
     >
       {rows.length === 0 ? (
         <p className="py-6 text-sm text-muted-foreground">No clusters yet.</p>
