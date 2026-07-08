@@ -20,7 +20,7 @@
 //     gutter for the lights, and a full-width drag band covers the rest of the
 //     top strip so the whole band moves the window.
 //   • Linux/Windows have no native window controls, so a full-width custom title
-//     bar sits across the top — hamburger `FileMenu` at the left, a draggable
+//     bar sits across the top — hamburger `AppMenu` at the left, a draggable
 //     strip in the middle, and `WindowControls` (minimize/maximize/close) at the
 //     right. The floating sidebar is offset to start just below it.
 import type { CSSProperties, ReactNode } from 'react';
@@ -35,7 +35,7 @@ import {
 } from '@kubetail/ui/elements/sidebar';
 
 import { isMacOS } from '@/lib/platform';
-import { FileMenu } from '@/components/widgets/file-menu';
+import { AppMenu } from '@/components/widgets/app-menu';
 import { WindowControls } from '@/components/widgets/window-controls';
 
 // Horizontal space (px) reserved at the macOS header's left edge for the cluster
@@ -107,7 +107,7 @@ function MacTitleBar() {
 function WinTitleBar() {
   return (
     <div className={`fixed inset-x-0 top-0 z-30 flex ${WIN_TITLE_BAR_HEIGHT} items-stretch bg-background`}>
-      <FileMenu />
+      <AppMenu />
       <div data-testid="window-drag-region" data-tauri-drag-region aria-hidden className="h-full flex-1" />
       <WindowControls />
     </div>

@@ -49,11 +49,11 @@ describe('AppSidebar', () => {
     expect(container.querySelector('[data-tauri-drag-region]')).not.toBeNull();
   });
 
-  it('renders a full-width custom title bar with File menu and window controls on Linux/Windows', () => {
+  it('renders a full-width custom title bar with app menu and window controls on Linux/Windows', () => {
     render(<AppSidebar />);
-    // Off macOS the title bar carries the hamburger File menu, a drag strip, and
+    // Off macOS the title bar carries the hamburger app menu, a drag strip, and
     // the custom window controls — and there's no macOS traffic-light gutter.
-    expect(screen.getByRole('button', { name: /file/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /application menu/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /minimize/i })).toBeInTheDocument();
     expect(screen.getByTestId('window-drag-region')).toHaveAttribute('data-tauri-drag-region');
     expect(screen.queryByTestId('traffic-light-gutter')).not.toBeInTheDocument();
@@ -63,7 +63,7 @@ describe('AppSidebar', () => {
     setUserAgent(MAC_USER_AGENT);
     render(<AppSidebar />);
     // macOS keeps the native traffic lights and its header-as-title-bar, so the
-    // custom File menu and window controls are absent.
+    // custom app menu and window controls are absent.
     expect(screen.getByTestId('traffic-light-gutter')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /file/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /minimize/i })).not.toBeInTheDocument();

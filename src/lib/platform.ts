@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // Lightweight, synchronous platform detection for the webview. We avoid the
-// async `@tauri-apps/plugin-os` round-trip because callers (e.g. the menu
-// ribbon) need to decide layout at first render. The webview's user agent is
+// async `@tauri-apps/plugin-os` round-trip because callers (e.g. the app
+// menu) need to decide layout at first render. The webview's user agent is
 // fixed per-OS by the system WebView, so sniffing it is reliable here.
 
 /** True when running inside the macOS system WebView. */

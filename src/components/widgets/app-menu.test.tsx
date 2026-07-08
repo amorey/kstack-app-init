@@ -23,7 +23,7 @@ import { mockTauriCore } from '@/test-utils';
 const { invokeMock, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
-const { FileMenu } = await import('./file-menu');
+const { AppMenu } = await import('./app-menu');
 
 // Helpers -------------------------------------------------------------
 
@@ -46,61 +46,61 @@ afterEach(() => {
 
 // Tests ---------------------------------------------------------------
 
-describe('FileMenu', () => {
-  it('renders a File menu trigger on Linux/Windows', () => {
-    render(<FileMenu />);
-    expect(screen.getByRole('button', { name: /file/i })).toBeInTheDocument();
+describe('AppMenu', () => {
+  it('renders an application menu trigger on Linux/Windows', () => {
+    render(<AppMenu />);
+    expect(screen.getByRole('button', { name: /application menu/i })).toBeInTheDocument();
   });
 
   it('renders nothing on macOS (native menu bar owns it)', () => {
     setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15');
-    const { container } = render(<FileMenu />);
+    const { container } = render(<AppMenu />);
     expect(container).toBeEmptyDOMElement();
   });
 
   it('invokes new_window when the New Window item is clicked', async () => {
     const user = userEvent.setup();
-    render(<FileMenu />);
-    await user.click(screen.getByRole('button', { name: /file/i }));
+    render(<AppMenu />);
+    await user.click(screen.getByRole('button', { name: /application menu/i }));
     await user.click(await screen.findByRole('menuitem', { name: /new window/i }));
     expect(invokeMock).toHaveBeenCalledWith('new_window');
   });
 
   it('invokes quit when the Quit item is clicked', async () => {
     const user = userEvent.setup();
-    render(<FileMenu />);
-    await user.click(screen.getByRole('button', { name: /file/i }));
+    render(<AppMenu />);
+    await user.click(screen.getByRole('button', { name: /application menu/i }));
     await user.click(await screen.findByRole('menuitem', { name: /quit/i }));
     expect(invokeMock).toHaveBeenCalledWith('quit');
   });
 
   it('invokes new_window on Ctrl+N', async () => {
-    render(<FileMenu />);
+    render(<AppMenu />);
     fireEvent.keyDown(window, { key: 'n', ctrlKey: true });
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('new_window'));
   });
 
   it('invokes quit on Ctrl+Q', async () => {
-    render(<FileMenu />);
+    render(<AppMenu />);
     fireEvent.keyDown(window, { key: 'q', ctrlKey: true });
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('quit'));
   });
 
   it('also accepts the Cmd (meta) modifier for shortcuts', async () => {
-    render(<FileMenu />);
+    render(<AppMenu />);
     fireEvent.keyDown(window, { key: 'n', metaKey: true });
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('new_window'));
   });
 
   it('ignores plain keypresses without a modifier', () => {
-    render(<FileMenu />);
+    render(<AppMenu />);
     fireEvent.keyDown(window, { key: 'n' });
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it('does not register shortcuts on macOS', () => {
     setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15');
-    render(<FileMenu />);
+    render(<AppMenu />);
     fireEvent.keyDown(window, { key: 'n', ctrlKey: true });
     expect(invokeMock).not.toHaveBeenCalled();
   });

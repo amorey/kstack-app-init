@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The File menu for Linux/Windows. macOS keeps its native, global menu bar
-// (built in the Rust host); off macOS the native bar is suppressed and this
-// hamburger button — sitting at the left of the custom title bar — is the
-// replacement. It mirrors the macOS "File" menu (New Window and Quit) and owns
-// the matching keyboard shortcuts there, since with no native menu nothing else
-// registers them. Actions cross into the host via Tauri commands.
+// The application menu for Linux/Windows. macOS keeps its native, global menu
+// bar (built in the Rust host); off macOS the native bar is suppressed and this
+// hamburger button — sitting at the left of the custom title bar — stands in for
+// the whole menu bar. It surfaces the app-wide actions (New Window and Quit) and
+// owns the matching keyboard shortcuts there, since with no native menu nothing
+// else registers them. Actions cross into the host via Tauri commands.
 import { useEffect } from 'react';
 
 import {
@@ -45,14 +45,14 @@ function quit() {
   invoke(QUIT_CMD).catch(() => {});
 }
 
-export function FileMenu() {
+export function AppMenu() {
   // macOS already has the native menu bar (and its accelerators); a hamburger
   // would be redundant there. Render only on Linux/Windows.
   if (isMacOS()) return null;
-  return <FileMenuImpl />;
+  return <AppMenuImpl />;
 }
 
-function FileMenuImpl() {
+function AppMenuImpl() {
   // The native menu is gone here, so nothing else binds these accelerators —
   // this menu owns them. Window-scoped (only while a webview window is
   // focused), matching the macOS menu's CmdOrCtrl semantics.
@@ -75,7 +75,7 @@ function FileMenuImpl() {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        aria-label="File"
+        aria-label="Application menu"
         className="flex h-full items-center rounded px-2 outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
       >
         <Menu className="h-4 w-4" aria-hidden />

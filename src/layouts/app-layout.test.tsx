@@ -28,8 +28,8 @@ vi.mock('@tauri-apps/api/window', () => factory());
 // Replace each chrome widget with an identifiable stub so the test asserts
 // *placement* (title bar vs sidebar vs inset) without dragging in their
 // providers.
-vi.mock('@/components/widgets/file-menu', () => ({
-  FileMenu: () => <div data-testid="file-menu" />,
+vi.mock('@/components/widgets/app-menu', () => ({
+  AppMenu: () => <div data-testid="app-menu" />,
 }));
 vi.mock('@/components/widgets/account-menu', () => ({
   AccountMenu: () => <div data-testid="account-menu" />,
@@ -83,9 +83,9 @@ describe('AppLayout', () => {
     expect(sidebarOf(container).contains(screen.getByTestId('account-menu'))).toBe(true);
   });
 
-  it('places the File menu in the title bar, not the sidebar', async () => {
+  it('places the app menu in the title bar, not the sidebar', async () => {
     const { container } = await renderWithRouter(buildTree(), '/');
-    expect(sidebarOf(container).contains(screen.getByTestId('file-menu'))).toBe(false);
+    expect(sidebarOf(container).contains(screen.getByTestId('app-menu'))).toBe(false);
   });
 
   it('renders the routed page in the inset, not the sidebar', async () => {
