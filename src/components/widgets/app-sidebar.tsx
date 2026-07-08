@@ -224,10 +224,10 @@ function MacTitleBar() {
 // outside the sidebar (not in `MacTitleBar`) so it stays put — and stays
 // clickable to reopen — when the sidebar is hidden. `z-20` keeps it above both
 // the sidebar (`z-10`) and the window drag band (`z-0`).
-function MacSidebarToggle({ onHoverStart, onHoverEnd }: HoverHandlers) {
+function MacSidebarToggle(handlers: HoverHandlers) {
   return (
     <div className={`fixed top-0 z-20 flex ${MAC_TITLE_BAR_HEIGHT} items-center`} style={{ left: MAC_TOGGLE_LEFT }}>
-      <SidebarToggle onHoverStart={onHoverStart} onHoverEnd={onHoverEnd} />
+      <SidebarToggle {...handlers} />
     </div>
   );
 }
@@ -237,7 +237,7 @@ function MacSidebarToggle({ onHoverStart, onHoverEnd }: HoverHandlers) {
 // stay clickable; its middle strip is the window's drag region. The sidebar
 // toggle sits next to the hamburger and, being part of this fixed bar rather
 // than the sidebar itself, stays visible to reopen a hidden sidebar.
-function WinTitleBar({ onHoverStart, onHoverEnd }: HoverHandlers) {
+function WinTitleBar(handlers: HoverHandlers) {
   return (
     // `transform-gpu` (translateZ(0)) pins this fixed, opaque bar to its own
     // retained compositor layer. Without it, WebKitGTK re-rasters the layer
@@ -250,18 +250,21 @@ function WinTitleBar({ onHoverStart, onHoverEnd }: HoverHandlers) {
       className={`fixed inset-x-0 top-0 z-30 flex transform-gpu ${WIN_TITLE_BAR_HEIGHT} items-stretch gap-0.5 bg-background`}
     >
       <AppMenu />
-      <SidebarToggle onHoverStart={onHoverStart} onHoverEnd={onHoverEnd} />
+      <SidebarToggle {...handlers} />
       <div data-testid="window-drag-region" data-tauri-drag-region aria-hidden className="h-full flex-1" />
       <WindowControls />
     </div>
   );
 }
 
-// Handlers the toggle fires on hover, wired by the shell to preview a collapsed
-// sidebar as a popup.
+// Handlers the toggle fires, wired by the shell to preview a collapsed sidebar as
+// a popup: `onHoverStart`/`onHoverEnd` open/close it on hover, and `onClick`
+// overrides the default pin/collapse so a click while collapsed shows/hides the
+// popup instead of pinning the full sidebar open.
 type HoverHandlers = {
   onHoverStart?: () => void;
   onHoverEnd?: () => void;
+  onClick?: () => void;
 };
 
 type ShellProps = {
@@ -278,7 +281,8 @@ type ShellProps = {
 // beside it. When collapsed, both vanish immediately (no slide) and the inset
 // reclaims the full width — but hovering the toggle then re-mounts the same card
 // as an unpinned popup that overlays the page (no spacer) and disappears once
-// the pointer leaves both the toggle and the card.
+// the pointer leaves both the toggle and the card. Clicking the toggle while
+// collapsed shows/hides that popup in place (pinning stays on `Cmd/Ctrl+B`).
 function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
   const { open, setOpen } = useSidebar();
 
@@ -308,12 +312,23 @@ function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
     clearTimeout(closeTimer.current);
     closeTimer.current = setTimeout(() => setPreview(false), PREVIEW_CLOSE_DELAY_MS);
   }, []);
+  // Clicking the toggle while collapsed flips the popup on/off in place (rather
+  // than pinning the sidebar — that stays on `Cmd/Ctrl+B`). Cancels any pending
+  // close so a click right after a hover doesn't get undone by the grace timer.
+  const togglePreview = useCallback(() => {
+    clearTimeout(closeTimer.current);
+    setPreview((p) => !p);
+  }, []);
   useEffect(() => () => clearTimeout(closeTimer.current), []);
 
   // Only preview while collapsed; pinning open (or the width drag) takes over.
   const showingPreview = !open && preview;
   const cardVisible = open || showingPreview;
-  const hoverHandlers: HoverHandlers = open ? {} : { onHoverStart: showPreview, onHoverEnd: hidePreview };
+  // Pinned open, the toggle keeps its default collapse click. Collapsed, hover
+  // opens/closes the popup and a click toggles it in place.
+  const hoverHandlers: HoverHandlers = open
+    ? {}
+    : { onHoverStart: showPreview, onHoverEnd: hidePreview, onClick: togglePreview };
 
   // Card geometry differs between the pinned sidebar and the hover popup:
   //   • Pinned: full window height (`bottom-0`) anchored at the top — flush to

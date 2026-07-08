@@ -14,25 +14,28 @@
 
 // Title-bar button that collapses/expands the floating sidebar. Sits next to the
 // traffic lights on macOS and next to the `AppMenu` hamburger on Linux/Windows.
-// It drives the same `@kubetail/ui` sidebar state as the built-in `Cmd/Ctrl+B`
-// shortcut, so both stay in sync. While the sidebar is collapsed, hovering the
-// button previews it as a popup — the shell wires that up through the optional
-// `onHoverStart`/`onHoverEnd` handlers.
+// By default it drives the same `@kubetail/ui` sidebar state as the built-in
+// `Cmd/Ctrl+B` shortcut, so both stay in sync. While the sidebar is collapsed,
+// hovering the button previews it as a popup — the shell wires that up through
+// the optional `onHoverStart`/`onHoverEnd` handlers, and overrides the click via
+// `onClick` so a click in that state shows/hides the popup instead of pinning.
 import { PanelLeft } from 'lucide-react';
 import { useSidebar } from '@kubetail/ui/elements/sidebar';
 
 type SidebarToggleProps = {
   onHoverStart?: () => void;
   onHoverEnd?: () => void;
+  /** Overrides the default pin/collapse click (e.g. to toggle the hover popup). */
+  onClick?: () => void;
 };
 
-export function SidebarToggle({ onHoverStart, onHoverEnd }: SidebarToggleProps = {}) {
+export function SidebarToggle({ onHoverStart, onHoverEnd, onClick }: SidebarToggleProps = {}) {
   const { toggleSidebar } = useSidebar();
   return (
     <button
       type="button"
       aria-label="Toggle sidebar"
-      onClick={toggleSidebar}
+      onClick={onClick ?? toggleSidebar}
       onMouseEnter={onHoverStart}
       onMouseLeave={onHoverEnd}
       className="flex h-7 w-7 shrink-0 self-center items-center justify-center rounded text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"

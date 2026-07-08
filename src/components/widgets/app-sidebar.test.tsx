@@ -53,7 +53,7 @@ describe('AppSidebar', () => {
     expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
   });
 
-  it('shows and hides the sidebar via the toggle without unmounting the toggle', () => {
+  it('collapses the pinned sidebar via the toggle without unmounting the toggle', () => {
     render(<AppSidebar />);
     // Open by default: the floating card is mounted.
     expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
@@ -61,8 +61,34 @@ describe('AppSidebar', () => {
     // the toggle in place so the sidebar can be reopened.
     fireEvent.click(screen.getByRole('button', { name: /toggle sidebar/i }));
     expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: /toggle sidebar/i }));
+  });
+
+  it('shows and hides the hover popup on click while collapsed (without pinning)', () => {
+    render(<AppSidebar />);
+    const toggle = screen.getByRole('button', { name: /toggle sidebar/i });
+    // Collapse first.
+    fireEvent.click(toggle);
+    expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
+
+    // Clicking while collapsed brings up the popup (no resize handle: it's the
+    // unpinned popup, not the pinned sidebar), and clicking again hides it.
+    fireEvent.click(toggle);
     expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+    expect(screen.queryByTestId('sidebar-resize-handle')).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
+  });
+
+  it('hides the hovered popup on click, overriding the hover that opened it', () => {
+    render(<AppSidebar />);
+    const toggle = screen.getByRole('button', { name: /toggle sidebar/i });
+    fireEvent.click(toggle);
+
+    // Hover opens the popup; a click then dismisses it in place.
+    fireEvent.mouseEnter(toggle);
+    expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
   });
 
   it('previews the collapsed sidebar as a popup while hovering the toggle, then hides it on leave', async () => {
