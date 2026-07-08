@@ -22,6 +22,7 @@ import { createGraphqlClient } from '@/lib/graphql/client';
 import { ReadyGate } from '@/lib/ready-gate';
 import { ClustersProvider } from '@/lib/clusters';
 import { KubeConfigProvider } from '@/lib/kube-config';
+import { WindowFrame } from '@/components/widgets/window-frame';
 
 const TanStackRouterDevtools =
   import.meta.env.VITE_ROUTER_DEVTOOLS === 'true'
@@ -52,24 +53,28 @@ export function NotFound() {
 
 // Providers only — the visual shell lives in the `_app` layout route
 // (`AppLayout`). `Outlet` resolves to that layout, which renders the sidebar
-// and the routed page.
+// and the routed page. `WindowFrame` wraps everything (including the loading and
+// error states) so the frameless Linux/Windows window gets its border and outer
+// shadow; it's a passthrough on macOS.
 function RootComponent() {
   return (
-    <ErrorBoundary>
-      <ReadyGate>
-        <UrqlProvider value={gqlClient}>
-          <AuthProvider>
-            <ClustersProvider>
-              <KubeConfigProvider>
-                <Outlet />
-                <Suspense>
-                  <TanStackRouterDevtools />
-                </Suspense>
-              </KubeConfigProvider>
-            </ClustersProvider>
-          </AuthProvider>
-        </UrqlProvider>
-      </ReadyGate>
-    </ErrorBoundary>
+    <WindowFrame>
+      <ErrorBoundary>
+        <ReadyGate>
+          <UrqlProvider value={gqlClient}>
+            <AuthProvider>
+              <ClustersProvider>
+                <KubeConfigProvider>
+                  <Outlet />
+                  <Suspense>
+                    <TanStackRouterDevtools />
+                  </Suspense>
+                </KubeConfigProvider>
+              </ClustersProvider>
+            </AuthProvider>
+          </UrqlProvider>
+        </ReadyGate>
+      </ErrorBoundary>
+    </WindowFrame>
   );
 }

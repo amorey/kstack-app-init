@@ -117,11 +117,12 @@ impl WindowManager {
     /// window.
     ///
     /// Windows created via [`build_window`] get their chrome from the builder,
-    /// but Tauri builds the initial `"main"` window from `tauri.conf.json`
-    /// before the setup hook runs. On macOS the config's Overlay title bar and
-    /// traffic-light position already match; on Linux/Windows the native
-    /// decorations are dropped here so the first window is frameless like the
-    /// rest, letting the webview's own controls take over.
+    /// but Tauri builds the initial `"main"` window from the static config
+    /// before the setup hook runs. On macOS `tauri.macos.conf.json` gives it the
+    /// Overlay title bar + traffic-light position, which already match; the base
+    /// `tauri.conf.json` (Linux/Windows) leaves native decorations on, so they're
+    /// dropped here to make the first window frameless like the rest, letting the
+    /// webview's own controls take over.
     ///
     /// [`build_window`]: WindowManager::build_window
     pub fn apply_main_window_chrome(&self, app: &AppHandle) -> Result<()> {
@@ -179,7 +180,10 @@ impl WindowManager {
 
         #[cfg(not(target_os = "macos"))]
         {
-            builder = builder.decorations(false);
+            // Frameless, and transparent so the webview's `WindowFrame` can paint
+            // its own rounded border and outer shadow into a gutter at the window
+            // edge (the OS draws neither for a decoration-less window).
+            builder = builder.decorations(false).transparent(true);
         }
 
         let window = builder.build()?;

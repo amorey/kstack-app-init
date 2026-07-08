@@ -27,4 +27,17 @@
   #root {
     isolation: isolate;
   }
+
+  /*
+   * Frameless Linux/Windows windows (see `WindowFrame`): the window is
+   * transparent, so the document itself must be transparent to expose the small
+   * gutter around the frame where its drop shadow paints. The `frameless` class
+   * is set on <html> at startup off macOS (see `main.tsx`); macOS keeps its
+   * native decorations, so its document stays opaque.
+   */
+  html.frameless,
+  html.frameless body,
+  html.frameless #root {
+    background: transparent;
+  }
 }

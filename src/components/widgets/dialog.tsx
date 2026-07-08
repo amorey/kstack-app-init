@@ -69,7 +69,7 @@ function WindowDragBand() {
       data-testid="dialog-window-drag-region"
       data-tauri-drag-region
       aria-hidden
-      className={`fixed inset-x-0 top-0 z-[60] ${isMacOS() ? 'h-11' : 'h-8'}`}
+      className={`fixed inset-x-0 top-0 z-60 ${isMacOS() ? 'h-11' : 'h-8'}`}
     />,
     document.body,
   );

@@ -43,9 +43,9 @@ function close() {
 }
 
 // Shared button styling; each control adds its own hover treatment. Buttons
-// fill the title-bar height and take a wide, native caption-button footprint.
+// fill the title-bar height and sit close together with a compact footprint.
 const BUTTON_CLASS =
-  'flex h-full w-11 items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring';
+  'flex h-full w-8 items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring';
 
 const CONTROLS = [
   { label: 'Minimize', onClick: minimize, icon: <Minus className="h-4 w-4" aria-hidden />, hover: 'hover:bg-accent' },
