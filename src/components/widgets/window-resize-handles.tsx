@@ -35,9 +35,10 @@ function startResize(direction: ResizeDirection) {
 }
 
 // Grip footprint: edges span the ~16px transparent gutter; corners are a bit
-// larger so the diagonal target is easy to hit.
-const EDGE = 'fixed z-50';
-const CORNER = 'fixed z-50 h-5 w-5';
+// larger so the diagonal target is easy to hit. `select-none` + `touch-none`
+// keep the webview from claiming the press (see the mousedown handler).
+const EDGE = 'fixed z-50 select-none touch-none';
+const CORNER = 'fixed z-50 h-5 w-5 select-none touch-none';
 
 const HANDLES: { key: string; className: string; cursor: string; direction: ResizeDirection }[] = [
   // Edges.
@@ -62,9 +63,17 @@ export function WindowResizeHandles() {
           aria-hidden
           className={className}
           style={{ cursor }}
-          onPointerDown={(e) => {
+          onMouseDown={(e) => {
             // Only the primary button; ignore right/middle so context menus etc. work.
             if (e.button !== 0) return;
+            // Critical on Linux/WebKitGTK: `startResizeDragging` is async (it
+            // IPCs to Rust, which then asks GTK to begin the resize grab). If the
+            // webview starts its own selection grab on this press first, GTK's
+            // grab loses the race and the drag silently fails into a text
+            // selection. Preventing the default press keeps the button free for
+            // GTK. Uses `mousedown` (not `pointerdown`) because that's what
+            // reliably suppresses the selection.
+            e.preventDefault();
             startResize(direction);
           }}
         />
