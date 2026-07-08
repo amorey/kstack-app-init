@@ -164,7 +164,9 @@ impl WindowManager {
     fn build_window(&self, app: &AppHandle, label: &str, title: &str) -> Result<WebviewWindow> {
         let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::default())
             .title(title)
-            .inner_size(800.0, 600.0);
+            .inner_size(800.0, 600.0)
+            // Floor the window so the layout never renders below its narrowest design.
+            .min_inner_size(600.0, 400.0);
 
         #[cfg(target_os = "macos")]
         {
