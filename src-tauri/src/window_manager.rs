@@ -53,7 +53,9 @@ const SIDEBAR_GAP: f64 = 8.0;
 const TITLE_BAR_HEIGHT: f64 = 44.0;
 
 /// Horizontal inset (logical px) from the sidebar card's left edge to the first
-/// traffic-light button.
+/// traffic-light button. The webview derives `MAC_TOGGLE_LEFT` (in
+/// `app-sidebar.tsx`) from this and `SIDEBAR_GAP` to place the sidebar toggle
+/// just past the lights — bump this and check that offset still clears them.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const TRAFFIC_LIGHT_LEFT_INSET: f64 = 12.0;
 

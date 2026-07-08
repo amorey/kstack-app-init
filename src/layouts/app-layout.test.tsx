@@ -59,13 +59,13 @@ function buildTree() {
 }
 
 function sidebarOf(container: HTMLElement) {
-  const el = container.querySelector('[data-slot="sidebar"]');
+  const el = container.querySelector('[data-testid="app-sidebar"]');
   if (!el) throw new Error('sidebar not found');
   return el;
 }
 
 function insetOf(container: HTMLElement) {
-  const el = container.querySelector('[data-slot="sidebar-inset"]');
+  const el = container.querySelector('[data-testid="sidebar-inset"]');
   if (!el) throw new Error('sidebar inset not found');
   return el;
 }

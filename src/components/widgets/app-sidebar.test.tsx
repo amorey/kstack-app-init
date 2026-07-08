@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MAC_USER_AGENT, NON_MAC_USER_AGENT, mockTauriWindow, restoreUserAgent, setUserAgent } from '@/test-utils';
@@ -39,9 +39,21 @@ afterEach(() => {
 // Tests ---------------------------------------------------------------
 
 describe('AppSidebar', () => {
-  it('renders a floating-variant sidebar', () => {
-    const { container } = render(<AppSidebar />);
-    expect(container.querySelector('[data-slot="sidebar"][data-variant="floating"]')).not.toBeNull();
+  it('renders the floating sidebar card', () => {
+    render(<AppSidebar />);
+    expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+  });
+
+  it('shows and hides the sidebar via the toggle without unmounting the toggle', () => {
+    render(<AppSidebar />);
+    // Open by default: the floating card is mounted.
+    expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+    // Collapsing unmounts the card outright (instant hide, no slide) but leaves
+    // the toggle in place so the sidebar can be reopened.
+    fireEvent.click(screen.getByRole('button', { name: /toggle sidebar/i }));
+    expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /toggle sidebar/i }));
+    expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
   });
 
   it('exposes a draggable title-bar region', () => {
@@ -57,6 +69,7 @@ describe('AppSidebar', () => {
     expect(screen.getByRole('button', { name: /minimize/i })).toBeInTheDocument();
     expect(screen.getByTestId('window-drag-region')).toHaveAttribute('data-tauri-drag-region');
     expect(screen.queryByTestId('traffic-light-gutter')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /toggle sidebar/i })).toBeInTheDocument();
   });
 
   it('reserves a traffic-light gutter and hides the custom title bar on macOS', () => {
@@ -67,6 +80,8 @@ describe('AppSidebar', () => {
     expect(screen.getByTestId('traffic-light-gutter')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /file/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /minimize/i })).not.toBeInTheDocument();
+    // The sidebar toggle sits beside the traffic lights.
+    expect(screen.getByRole('button', { name: /toggle sidebar/i })).toBeInTheDocument();
   });
 
   it('renders page content in the inset', () => {

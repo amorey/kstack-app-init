@@ -23,19 +23,26 @@
 //     bar sits across the top — hamburger `AppMenu` at the left, a draggable
 //     strip in the middle, and `WindowControls` (minimize/maximize/close) at the
 //     right. The floating sidebar is offset to start just below it.
+//
+// We drive the sidebar's open/collapsed state with the library's
+// `SidebarProvider`/`useSidebar` (cookie persistence + the `Cmd/Ctrl+B`
+// shortcut), but render the shell ourselves rather than using the library's
+// `Sidebar`. That component slides the panel in/out over 200ms with no way to
+// opt out; we want an instant show/hide, so our shell simply mounts/unmounts the
+// floating card and toggles a layout spacer's width.
 import type { CSSProperties, ReactNode } from 'react';
 
 import {
-  Sidebar,
   SidebarContent,
   SidebarFooter,
-  SidebarHeader,
   SidebarInset,
   SidebarProvider,
+  useSidebar,
 } from '@kubetail/ui/elements/sidebar';
 
 import { isMacOS } from '@/lib/platform';
 import { AppMenu } from '@/components/widgets/app-menu';
+import { SidebarToggle } from '@/components/widgets/sidebar-toggle';
 import { WindowControls } from '@/components/widgets/window-controls';
 
 // Horizontal space (px) reserved at the macOS header's left edge for the cluster
@@ -45,6 +52,16 @@ import { WindowControls } from '@/components/widgets/window-controls';
 // buttons when tuning.
 const TRAFFIC_LIGHT_GUTTER = 62;
 
+// Left offset (px, from the *window* edge) for the fixed macOS sidebar toggle.
+// The three native traffic lights sit at window-left + `SIDEBAR_GAP` (8) +
+// `TRAFFIC_LIGHT_LEFT_INSET` (12), 20px apart at 12px wide — so the cluster ends
+// ~72px in. This clears it with a comfortable gap. Distinct from
+// `TRAFFIC_LIGHT_GUTTER` (which reserves space *inside* the card header,
+// card-relative): the toggle is `position: fixed`, so it must be measured from
+// the window edge instead — the card can be unmounted (sidebar hidden) while
+// the toggle stays put.
+const MAC_TOGGLE_LEFT = 96;
+
 // macOS title-bar band height (Tailwind class). The sidebar header and the
 // window drag band must cover the same strip, so both take their height from
 // here (44px — matches the host's `TITLE_BAR_HEIGHT` in `window_manager.rs`).
@@ -53,18 +70,12 @@ const MAC_TITLE_BAR_HEIGHT = 'h-11';
 // Linux/Windows custom title-bar band height. 32px is close to a native Windows
 // caption bar. This is the single source of truth: it's published as the
 // `--win-titlebar-h` CSS variable on the sidebar wrapper (see `AppSidebar`), and
-// both the title bar's own height and the sidebar's offset read from that
+// both the title bar's own height and the sidebar's top offset read from that
 // variable — so the band height is stated in exactly one place.
 const WIN_TITLE_BAR_HEIGHT_PX = '32px';
 
-// Title-bar height and sidebar offset, both derived from `--win-titlebar-h`.
+// Title-bar height, derived from `--win-titlebar-h`.
 const WIN_TITLE_BAR_HEIGHT = 'h-[var(--win-titlebar-h)]';
-
-// Offset applied to the floating sidebar container off macOS so it starts just
-// below the custom title bar instead of at the window top. Overrides the
-// sidebar's default `inset-y-0`/`h-svh` via tailwind-merge (`top-*` wins the top
-// edge, the explicit height replaces `h-svh`).
-const WIN_SIDEBAR_OFFSET = 'top-[var(--win-titlebar-h)] h-[calc(100svh-var(--win-titlebar-h))]';
 
 // macOS: a window-wide drag strip across the top, spanning the whole title-bar
 // band — including the area beside the floating sidebar (over the page). Its
@@ -87,39 +98,104 @@ function MacWindowDragBand() {
 // gutter, then a draggable strip fills the rest.
 function MacTitleBar() {
   return (
-    <SidebarHeader className={`${MAC_TITLE_BAR_HEIGHT} flex-row items-center gap-1 p-2`}>
+    <div className={`flex ${MAC_TITLE_BAR_HEIGHT} shrink-0 flex-row items-center gap-1 p-2`}>
       <div
         data-testid="traffic-light-gutter"
         aria-hidden
         className="shrink-0"
         style={{ width: TRAFFIC_LIGHT_GUTTER }}
       />
-      {/* Draggable strip fills the free space; interactive siblings (added
-          later) stay outside it so they still receive clicks. */}
       <div data-tauri-drag-region className="h-full flex-1" />
-    </SidebarHeader>
+    </div>
+  );
+}
+
+// macOS: the sidebar toggle, fixed just right of the traffic lights. It lives
+// outside the sidebar (not in `MacTitleBar`) so it stays put — and stays
+// clickable to reopen — when the sidebar is hidden. `z-20` keeps it above both
+// the sidebar (`z-10`) and the window drag band (`z-0`).
+function MacSidebarToggle() {
+  return (
+    <div className={`fixed top-0 z-20 flex ${MAC_TITLE_BAR_HEIGHT} items-center`} style={{ left: MAC_TOGGLE_LEFT }}>
+      <SidebarToggle />
+    </div>
   );
 }
 
 // Linux/Windows: a full-width custom title bar across the top of the window.
 // Fixed and above the sidebar (`z-30` over the sidebar's `z-10`) so its controls
-// stay clickable; its middle strip is the window's drag region.
+// stay clickable; its middle strip is the window's drag region. The sidebar
+// toggle sits next to the hamburger and, being part of this fixed bar rather
+// than the sidebar itself, stays visible to reopen a hidden sidebar.
 function WinTitleBar() {
   return (
-    <div className={`fixed inset-x-0 top-0 z-30 flex ${WIN_TITLE_BAR_HEIGHT} items-stretch bg-background`}>
+    <div className={`fixed inset-x-0 top-0 z-30 flex ${WIN_TITLE_BAR_HEIGHT} items-stretch gap-0.5 bg-background`}>
       <AppMenu />
+      <SidebarToggle />
       <div data-testid="window-drag-region" data-tauri-drag-region aria-hidden className="h-full flex-1" />
       <WindowControls />
     </div>
   );
 }
 
-type AppSidebarProps = {
-  /** Sidebar body (navigation, pickers) — rendered in `SidebarContent`. */
+type ShellProps = {
+  mac: boolean;
   nav?: ReactNode;
-  /** Sidebar footer (status, account) — rendered in `SidebarFooter`. */
   footer?: ReactNode;
-  /** Page content — rendered in the `SidebarInset` beside the sidebar. */
+  children?: ReactNode;
+};
+
+// Our floating-sidebar shell. `SidebarProvider` (above) owns the open/collapsed
+// state; here we render it. When open, a fixed card holds the nav/footer and a
+// same-width spacer reserves room for it in the flex row so the page inset sits
+// beside it. When collapsed, both vanish immediately (no slide) and the inset
+// reclaims the full width.
+function SidebarShell({ mac, nav, footer, children }: ShellProps) {
+  const { open } = useSidebar();
+
+  // Off macOS the card starts just below the custom title bar; on macOS it spans
+  // to the window top. `bottom-0` + `top-*` sets the height implicitly.
+  const cardTop = mac ? 'top-0' : 'top-[var(--win-titlebar-h)]';
+
+  return (
+    <>
+      {!mac && <WinTitleBar />}
+
+      {/* Layout spacer: reserves the sidebar's width in the flex row so the inset
+          sits beside the floating card. Zero width when collapsed. */}
+      <div className="shrink-0" aria-hidden style={{ width: open ? 'var(--sidebar-width)' : 0 }} />
+
+      {open && (
+        <div data-testid="app-sidebar" className={`fixed bottom-0 left-0 z-10 flex w-(--sidebar-width) p-2 ${cardTop}`}>
+          <div className="flex size-full flex-col rounded-lg bg-sidebar shadow-sm ring-1 ring-sidebar-border">
+            {mac && <MacTitleBar />}
+            <SidebarContent>{nav}</SidebarContent>
+            <SidebarFooter>{footer}</SidebarFooter>
+          </div>
+        </div>
+      )}
+
+      <SidebarInset data-testid="sidebar-inset">{children}</SidebarInset>
+
+      {/* Mac-only trailing chrome: rendered after the inset so the drag band
+          paints over the page background (see MacWindowDragBand); the toggle
+          floats above everything (z-20). */}
+      {mac && (
+        <>
+          <MacWindowDragBand />
+          <MacSidebarToggle />
+        </>
+      )}
+    </>
+  );
+}
+
+type AppSidebarProps = {
+  /** Sidebar body (navigation, pickers) — rendered above the footer. */
+  nav?: ReactNode;
+  /** Sidebar footer (status, account) — rendered below the nav. */
+  footer?: ReactNode;
+  /** Page content — rendered in the inset beside the sidebar. */
   children?: ReactNode;
 };
 
@@ -129,15 +205,9 @@ export function AppSidebar({ nav, footer, children }: AppSidebarProps) {
     // Off macOS, publish the custom title-bar height so the bar and the sidebar
     // offset can both read it from one place (see `WIN_TITLE_BAR_HEIGHT_PX`).
     <SidebarProvider style={mac ? undefined : ({ '--win-titlebar-h': WIN_TITLE_BAR_HEIGHT_PX } as CSSProperties)}>
-      {!mac && <WinTitleBar />}
-      <Sidebar variant="floating" className={mac ? undefined : WIN_SIDEBAR_OFFSET}>
-        {mac && <MacTitleBar />}
-        <SidebarContent>{nav}</SidebarContent>
-        <SidebarFooter>{footer}</SidebarFooter>
-      </Sidebar>
-      <SidebarInset>{children}</SidebarInset>
-      {/* Must render after SidebarInset — see MacWindowDragBand for why. */}
-      {mac && <MacWindowDragBand />}
+      <SidebarShell mac={mac} nav={nav} footer={footer}>
+        {children}
+      </SidebarShell>
     </SidebarProvider>
   );
 }
