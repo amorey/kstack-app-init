@@ -36,17 +36,25 @@
 // shadow itself), so the webview stays full-bleed there and this is a passthrough.
 // It must wrap the app at the outermost level so the loading and error states get
 // the same frame and opaque background as the mounted app.
+//
+// When the window is maximized there's no off-window space to paint into, so the
+// gutter would just read as an empty transparent band around the app (native apps
+// like Firefox drop their rounded corners + shadow here too). We collapse to a
+// full-bleed `inset-0` surface — no inset, corners, border, or shadow — while
+// maximized, and `WindowResizeHandles` hides its grips to match.
 import type { ReactNode } from 'react';
 
 import { isMacOS } from '@/lib/platform';
+import { useWindowMaximized } from '@/lib/window-maximized';
 
 export function WindowFrame({ children }: { children?: ReactNode }) {
+  const maximized = useWindowMaximized();
   if (isMacOS()) return <>{children}</>;
+  const className = maximized
+    ? 'fixed inset-0 overflow-hidden bg-background contain-[paint]'
+    : 'fixed inset-4 overflow-hidden rounded-lg border border-black/5 bg-background shadow-[0_6px_16px_rgba(0,0,0,0.35)] contain-[paint] dark:border-white/5';
   return (
-    <div
-      data-testid="window-frame"
-      className="fixed inset-4 overflow-hidden rounded-lg border border-black/5 bg-background shadow-[0_6px_16px_rgba(0,0,0,0.35)] contain-[paint] dark:border-white/5"
-    >
+    <div data-testid="window-frame" className={className}>
       {children}
     </div>
   );

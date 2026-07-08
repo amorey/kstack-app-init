@@ -19,9 +19,13 @@
 // a native resize drag via the Tauri core window API on pointer-down. Corners sit
 // above the edges (later in DOM order + wider) so a corner grab resizes on both
 // axes. macOS keeps its native decorations, so this renders nothing there.
+//
+// A maximized window can't be edge-resized and leaves no gutter for the grips to
+// live in (see `WindowFrame`), so we render nothing while maximized either.
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
 import { isMacOS } from '@/lib/platform';
+import { useWindowMaximized } from '@/lib/window-maximized';
 
 // `@tauri-apps/api` declares this union but doesn't export it; mirror it here so
 // the direction constants below stay typed. Structurally matches the argument
@@ -54,7 +58,8 @@ const HANDLES: { key: string; className: string; cursor: string; direction: Resi
 ];
 
 export function WindowResizeHandles() {
-  if (isMacOS()) return null;
+  const maximized = useWindowMaximized();
+  if (isMacOS() || maximized) return null;
   return (
     <>
       {HANDLES.map(({ key, className, cursor, direction }) => (

@@ -12,14 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { render, screen } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { MAC_USER_AGENT, NON_MAC_USER_AGENT, restoreUserAgent, setUserAgent } from '@/test-utils';
+import { MAC_USER_AGENT, NON_MAC_USER_AGENT, mockTauriWindow, restoreUserAgent, setUserAgent } from '@/test-utils';
 
-import { WindowFrame } from './window-frame';
+// The frame queries the native window's maximized state (see `useWindowMaximized`).
+const { windowMock, factory } = mockTauriWindow();
+vi.mock('@tauri-apps/api/window', () => factory());
+
+const { WindowFrame } = await import('./window-frame');
 
 beforeEach(() => {
+  windowMock.isMaximized.mockClear().mockResolvedValue(false);
+  windowMock.onResized.mockClear();
   setUserAgent(NON_MAC_USER_AGENT);
 });
 
@@ -36,6 +42,24 @@ describe('WindowFrame', () => {
     );
     const frame = screen.getByTestId('window-frame');
     expect(frame).toContainElement(screen.getByText('content'));
+    // Restored (not maximized): inset gutter + rounded corners + shadow.
+    expect(frame.className).toContain('inset-4');
+    expect(frame.className).toContain('rounded-lg');
+  });
+
+  it('collapses the gutter to full-bleed when the window is maximized', async () => {
+    windowMock.isMaximized.mockResolvedValue(true);
+    render(
+      <WindowFrame>
+        <div>content</div>
+      </WindowFrame>,
+    );
+    await waitFor(() => {
+      const frame = screen.getByTestId('window-frame');
+      expect(frame.className).toContain('inset-0');
+      expect(frame.className).not.toContain('inset-4');
+      expect(frame.className).not.toContain('rounded-lg');
+    });
   });
 
   it('renders children full-bleed on macOS (native decorations own the frame)', () => {

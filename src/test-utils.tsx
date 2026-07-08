@@ -58,6 +58,9 @@ export function mockTauriWindow() {
     minimize: vi.fn(() => Promise.resolve()),
     toggleMaximize: vi.fn(() => Promise.resolve()),
     close: vi.fn(() => Promise.resolve()),
+    isMaximized: vi.fn(() => Promise.resolve(false)),
+    // Matches Tauri's `onResized`: resolves to an unlisten fn.
+    onResized: vi.fn(() => Promise.resolve(() => {})),
   };
   return {
     windowMock,
