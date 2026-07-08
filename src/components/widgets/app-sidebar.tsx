@@ -239,7 +239,16 @@ function MacSidebarToggle({ onHoverStart, onHoverEnd }: HoverHandlers) {
 // than the sidebar itself, stays visible to reopen a hidden sidebar.
 function WinTitleBar({ onHoverStart, onHoverEnd }: HoverHandlers) {
   return (
-    <div className={`fixed inset-x-0 top-0 z-30 flex ${WIN_TITLE_BAR_HEIGHT} items-stretch gap-0.5 bg-background`}>
+    // `transform-gpu` (translateZ(0)) pins this fixed, opaque bar to its own
+    // retained compositor layer. Without it, WebKitGTK re-rasters the layer
+    // during an interactive resize and — because the window is transparent —
+    // the title area briefly shows through to the gutter/desktop (a flash). A
+    // retained backing store survives the resize. Safe here: the bar has no body
+    // text, so the subpixel-rendering reason we avoid transforms app-wide (see
+    // `window-frame.tsx`) doesn't apply.
+    <div
+      className={`fixed inset-x-0 top-0 z-30 flex transform-gpu ${WIN_TITLE_BAR_HEIGHT} items-stretch gap-0.5 bg-background`}
+    >
       <AppMenu />
       <SidebarToggle onHoverStart={onHoverStart} onHoverEnd={onHoverEnd} />
       <div data-testid="window-drag-region" data-tauri-drag-region aria-hidden className="h-full flex-1" />
