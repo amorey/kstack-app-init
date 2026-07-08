@@ -51,7 +51,7 @@ export class ErrorBoundary extends Component<Props, State> {
     if (!error) return children;
 
     return (
-      <div className="flex min-h-svh items-center justify-center bg-background p-6">
+      <div className="flex min-h-[var(--app-min-h)] items-center justify-center bg-background p-6">
         <div className="max-w-lg space-y-4 text-center">
           <h1 className="text-xl font-semibold">Something went wrong</h1>
           <pre className="whitespace-pre-wrap rounded bg-muted p-3 text-left text-xs text-muted-foreground">

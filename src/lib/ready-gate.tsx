@@ -58,7 +58,7 @@ export function ReadyGate({ children }: { children: React.ReactNode }) {
       role="status"
       aria-live="polite"
       aria-busy={state.status === 'pending'}
-      className="flex min-h-svh flex-col items-center justify-center gap-3 bg-background p-6 text-sm"
+      className="flex min-h-[var(--app-min-h)] flex-col items-center justify-center gap-3 bg-background p-6 text-sm"
     >
       {state.status === 'pending' ? (
         <p className="text-muted-foreground">Starting…</p>

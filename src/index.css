@@ -16,6 +16,24 @@
     overscroll-behavior: none;
   }
 
+  /*
+   * The app's full-height reference. macOS is full-bleed (no `WindowFrame` box),
+   * so height is measured against the window viewport (`100svh`). Off macOS the
+   * app lives inside `WindowFrame` — a `position: fixed`, inset, `overflow-hidden`
+   * box — so `100svh` (the *window*) overflows the frame by its gutter and gets
+   * clipped at the bottom. There the reference is `100%` of that frame instead,
+   * which tracks the frame as it switches between the inset gutter and the
+   * full-bleed `inset-0` it uses while maximized. Consumed via
+   * `min-h-[var(--app-min-h)]` wherever a screen would otherwise use `min-h-svh`.
+   */
+  :root {
+    --app-min-h: 100svh;
+  }
+
+  html.frameless {
+    --app-min-h: 100%;
+  }
+
   body {
     @apply antialiased;
     font-feature-settings: 'rlig' 1, 'calt' 1;

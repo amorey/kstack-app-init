@@ -405,7 +405,11 @@ export function AppSidebar({ nav, footer, children }: AppSidebarProps) {
   } as CSSProperties;
 
   return (
-    <SidebarProvider defaultOpen={initialOpen} style={style}>
+    // The library's provider wrapper hardcodes `min-h-svh` (the window viewport);
+    // off macOS the app is inset inside `WindowFrame`, so override it to fill the
+    // frame instead (see `--app-min-h` in `index.css`). `cn` (tailwind-merge)
+    // dedupes the `min-h-*` utilities, keeping ours.
+    <SidebarProvider defaultOpen={initialOpen} style={style} className="min-h-[var(--app-min-h)]">
       <SidebarShell mac={mac} onResize={setWidth} nav={nav} footer={footer}>
         {children}
       </SidebarShell>
