@@ -41,6 +41,29 @@ if (!HTMLElement.prototype.setPointerCapture) {
 const wrapperWidth = (container: HTMLElement) =>
   (container.querySelector('[data-slot="sidebar-wrapper"]') as HTMLElement).style.getPropertyValue('--sidebar-width');
 
+// Installs a controllable `matchMedia` whose `matches` (i.e. "below the medium
+// breakpoint") can be flipped, firing a `change` event to registered listeners
+// exactly like the browser. Returns a `setNarrow` to drive breakpoint crossings.
+function mockBreakpoint(initialNarrow = false) {
+  let narrow = initialNarrow;
+  const listeners = new Set<(e: MediaQueryListEvent) => void>();
+  window.matchMedia = (() => ({
+    get matches() {
+      return narrow;
+    },
+    addEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => listeners.add(cb),
+    removeEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => listeners.delete(cb),
+  })) as unknown as typeof window.matchMedia;
+  return (next: boolean) => {
+    narrow = next;
+    act(() => {
+      listeners.forEach((cb) => cb({ matches: narrow } as MediaQueryListEvent));
+    });
+  };
+}
+
+const sidebarVisible = () => screen.queryByTestId('app-sidebar') !== null;
+
 afterEach(() => {
   restoreUserAgent();
 });
@@ -63,32 +86,32 @@ describe('AppSidebar', () => {
     expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
   });
 
-  it('shows and hides the hover popup on click while collapsed (without pinning)', () => {
+  it('pins the full sidebar back open on click while collapsed', () => {
     render(<AppSidebar />);
     const toggle = screen.getByRole('button', { name: /toggle sidebar/i });
     // Collapse first.
     fireEvent.click(toggle);
     expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
 
-    // Clicking while collapsed brings up the popup (no resize handle: it's the
-    // unpinned popup, not the pinned sidebar), and clicking again hides it.
+    // Clicking again pins the full sidebar back open — the pinned card carries a
+    // resize handle (the popup would not).
     fireEvent.click(toggle);
     expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
-    expect(screen.queryByTestId('sidebar-resize-handle')).not.toBeInTheDocument();
-    fireEvent.click(toggle);
-    expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
+    expect(screen.getByTestId('sidebar-resize-handle')).toBeInTheDocument();
   });
 
-  it('hides the hovered popup on click, overriding the hover that opened it', () => {
+  it('pins the sidebar open on click while its hover popup is showing', () => {
     render(<AppSidebar />);
     const toggle = screen.getByRole('button', { name: /toggle sidebar/i });
     fireEvent.click(toggle);
 
-    // Hover opens the popup; a click then dismisses it in place.
+    // Hover opens the unpinned popup (no resize handle); a click then pins the
+    // full sidebar open in its place (resize handle appears).
     fireEvent.mouseEnter(toggle);
-    expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+    expect(screen.queryByTestId('sidebar-resize-handle')).not.toBeInTheDocument();
     fireEvent.click(toggle);
-    expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
+    expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+    expect(screen.getByTestId('sidebar-resize-handle')).toBeInTheDocument();
   });
 
   it('previews the collapsed sidebar as a popup while hovering the toggle, then hides it on leave', async () => {
@@ -230,6 +253,52 @@ describe('AppSidebar', () => {
     localStorage.setItem('sidebar_width', '320');
     const { container } = render(<AppSidebar />);
     expect(wrapperWidth(container)).toBe('320px');
+  });
+
+  it('remembers a manual collapse across a narrow→wide breakpoint round-trip', () => {
+    const setNarrow = mockBreakpoint();
+    render(<AppSidebar />);
+    // Open by default (wide). User manually collapses it.
+    expect(sidebarVisible()).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /toggle sidebar/i }));
+    expect(sidebarVisible()).toBe(false);
+    // Narrow below md, then widen back: the sidebar must stay hidden, honoring
+    // the user's choice rather than auto-reopening.
+    setNarrow(true);
+    expect(sidebarVisible()).toBe(false);
+    setNarrow(false);
+    expect(sidebarVisible()).toBe(false);
+  });
+
+  it('auto-collapses when narrowing and restores an open sidebar when widening', () => {
+    const setNarrow = mockBreakpoint();
+    render(<AppSidebar />);
+    expect(sidebarVisible()).toBe(true);
+    setNarrow(true);
+    expect(sidebarVisible()).toBe(false);
+    setNarrow(false);
+    expect(sidebarVisible()).toBe(true);
+  });
+
+  it('toggles the hover popup on click while too narrow to pin the sidebar', () => {
+    const setNarrow = mockBreakpoint();
+    render(<AppSidebar />);
+    const toggle = screen.getByRole('button', { name: /toggle sidebar/i });
+    // Narrow below md: the sidebar auto-collapses and there's no room to pin it.
+    setNarrow(true);
+    expect(sidebarVisible()).toBe(false);
+
+    // Hover peeks the popup (unpinned: no resize handle). A click while narrow
+    // dismisses that popup in place rather than pinning the full sidebar.
+    fireEvent.mouseEnter(toggle);
+    expect(sidebarVisible()).toBe(true);
+    expect(screen.queryByTestId('sidebar-resize-handle')).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(sidebarVisible()).toBe(false);
+    // And clicking again brings the popup back (still unpinned).
+    fireEvent.click(toggle);
+    expect(sidebarVisible()).toBe(true);
+    expect(screen.queryByTestId('sidebar-resize-handle')).not.toBeInTheDocument();
   });
 
   it('renders page content in the inset', () => {

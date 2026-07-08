@@ -15,17 +15,19 @@
 // Title-bar button that collapses/expands the floating sidebar. Sits next to the
 // traffic lights on macOS and next to the `AppMenu` hamburger on Linux/Windows.
 // By default it drives the same `@kubetail/ui` sidebar state as the built-in
-// `Cmd/Ctrl+B` shortcut, so both stay in sync. While the sidebar is collapsed,
-// hovering the button previews it as a popup — the shell wires that up through
-// the optional `onHoverStart`/`onHoverEnd` handlers, and overrides the click via
-// `onClick` so a click in that state shows/hides the popup instead of pinning.
+// `Cmd/Ctrl+B` shortcut, so both stay in sync: a click pins the full sidebar open
+// or collapses it. While the sidebar is collapsed, hovering the button previews
+// it as a popup — the shell wires that up through the optional
+// `onHoverStart`/`onHoverEnd` handlers. When the frame is too narrow to pin the
+// real sidebar, the shell overrides the click via `onClick` so it dismisses the
+// peeked popup instead.
 import { PanelLeft } from 'lucide-react';
 import { useSidebar } from '@kubetail/ui/elements/sidebar';
 
 type SidebarToggleProps = {
   onHoverStart?: () => void;
   onHoverEnd?: () => void;
-  /** Overrides the default pin/collapse click (e.g. to toggle the hover popup). */
+  /** Overrides the default pin/collapse click (narrow mode toggles the popup). */
   onClick?: () => void;
 };
 
