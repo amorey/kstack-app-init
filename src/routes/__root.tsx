@@ -23,6 +23,7 @@ import { ReadyGate } from '@/lib/ready-gate';
 import { ClustersProvider } from '@/lib/clusters';
 import { KubeConfigProvider } from '@/lib/kube-config';
 import { WindowFrame } from '@/components/widgets/window-frame';
+import { WindowResizeHandles } from '@/components/widgets/window-resize-handles';
 
 const TanStackRouterDevtools =
   import.meta.env.VITE_ROUTER_DEVTOOLS === 'true'
@@ -55,26 +56,32 @@ export function NotFound() {
 // (`AppLayout`). `Outlet` resolves to that layout, which renders the sidebar
 // and the routed page. `WindowFrame` wraps everything (including the loading and
 // error states) so the frameless Linux/Windows window gets its border and outer
-// shadow; it's a passthrough on macOS.
+// shadow; it's a passthrough on macOS. `WindowResizeHandles` is a *sibling* (not a
+// child) so its `position: fixed` grips anchor to the window edge, not the frame's
+// inset box — `WindowFrame`'s `contain: paint` would otherwise re-anchor and clip
+// them. They land in the transparent gutter the frame leaves around the app.
 function RootComponent() {
   return (
-    <WindowFrame>
-      <ErrorBoundary>
-        <ReadyGate>
-          <UrqlProvider value={gqlClient}>
-            <AuthProvider>
-              <ClustersProvider>
-                <KubeConfigProvider>
-                  <Outlet />
-                  <Suspense>
-                    <TanStackRouterDevtools />
-                  </Suspense>
-                </KubeConfigProvider>
-              </ClustersProvider>
-            </AuthProvider>
-          </UrqlProvider>
-        </ReadyGate>
-      </ErrorBoundary>
-    </WindowFrame>
+    <>
+      <WindowFrame>
+        <ErrorBoundary>
+          <ReadyGate>
+            <UrqlProvider value={gqlClient}>
+              <AuthProvider>
+                <ClustersProvider>
+                  <KubeConfigProvider>
+                    <Outlet />
+                    <Suspense>
+                      <TanStackRouterDevtools />
+                    </Suspense>
+                  </KubeConfigProvider>
+                </ClustersProvider>
+              </AuthProvider>
+            </UrqlProvider>
+          </ReadyGate>
+        </ErrorBoundary>
+      </WindowFrame>
+      <WindowResizeHandles />
+    </>
   );
 }
