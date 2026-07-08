@@ -12,13 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { Route as rootRoute } from '@/routes/__root';
-import { Route as appRoute } from '@/routes/_app';
-import { Route as indexRoute } from '@/routes/index';
-import { Route as chatRoute } from '@/routes/chat';
-import { Route as dashboardRoute } from '@/routes/dashboard';
+import { createRoute } from '@tanstack/react-router';
 
-// Chat (`/chat`) and Dashboard (`/dashboard`) are peer routes under the pathless
-// `_app` layout route, so they share the sidebar shell (`AppLayout`); `/`
-// (indexRoute) just redirects to the default view.
-export const routeTree = rootRoute.addChildren([appRoute.addChildren([indexRoute, chatRoute, dashboardRoute])]);
+import { CenteredColumn } from '@/components/widgets/centered-column';
+import { Route as appRoute } from '@/routes/_app';
+
+export const Route = createRoute({
+  getParentRoute: () => appRoute,
+  path: '/dashboard',
+  component: Dashboard,
+});
+
+// Placeholder for the dashboard view; real content lands later.
+function Dashboard() {
+  return (
+    <CenteredColumn>
+      <h1 className="text-lg font-semibold">Dashboard</h1>
+      <p className="text-sm text-muted-foreground">The dashboard is coming soon.</p>
+    </CenteredColumn>
+  );
+}

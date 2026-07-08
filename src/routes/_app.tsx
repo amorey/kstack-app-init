@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { Route as rootRoute } from '@/routes/__root';
-import { Route as appRoute } from '@/routes/_app';
-import { Route as indexRoute } from '@/routes/index';
-import { Route as chatRoute } from '@/routes/chat';
-import { Route as dashboardRoute } from '@/routes/dashboard';
+// Pathless layout route for the main window's shell. It adds no path segment;
+// it just wraps its children (chat, dashboard) in `AppLayout` so they share the
+// sidebar. Secondary windows (log tail, exec) will nest under their own
+// sidebar-less layout route instead.
+import { createRoute } from '@tanstack/react-router';
 
-// Chat (`/chat`) and Dashboard (`/dashboard`) are peer routes under the pathless
-// `_app` layout route, so they share the sidebar shell (`AppLayout`); `/`
-// (indexRoute) just redirects to the default view.
-export const routeTree = rootRoute.addChildren([appRoute.addChildren([indexRoute, chatRoute, dashboardRoute])]);
+import { AppLayout } from '@/layouts/app-layout';
+import { Route as rootRoute } from '@/routes/__root';
+
+export const Route = createRoute({
+  getParentRoute: () => rootRoute,
+  id: 'app',
+  component: AppLayout,
+});

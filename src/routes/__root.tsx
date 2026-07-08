@@ -17,7 +17,6 @@ import { createRootRoute, Outlet } from '@tanstack/react-router';
 import { Provider as UrqlProvider } from 'urql';
 
 import { AuthProvider } from '@/lib/auth';
-import { AppShell } from '@/components/widgets/app-shell';
 import { ErrorBoundary } from '@/lib/error-boundary';
 import { createGraphqlClient } from '@/lib/graphql/client';
 import { ReadyGate } from '@/lib/ready-gate';
@@ -51,6 +50,9 @@ export function NotFound() {
   );
 }
 
+// Providers only — the visual shell lives in the `_app` layout route
+// (`AppLayout`). `Outlet` resolves to that layout, which renders the sidebar
+// and the routed page.
 function RootComponent() {
   return (
     <ErrorBoundary>
@@ -59,9 +61,7 @@ function RootComponent() {
           <AuthProvider>
             <ClustersProvider>
               <KubeConfigProvider>
-                <AppShell>
-                  <Outlet />
-                </AppShell>
+                <Outlet />
                 <Suspense>
                   <TanStackRouterDevtools />
                 </Suspense>

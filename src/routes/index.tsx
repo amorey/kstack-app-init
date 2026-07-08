@@ -12,134 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { useRef, useState } from 'react';
-import { createRoute } from '@tanstack/react-router';
-import { useSubscription } from 'urql';
+// `/` owns no view of its own — chat and dashboard are peer, named routes
+// (`/chat`, `/dashboard`). This route just redirects `/` to the landing view, so
+// changing the default (or the New Window / secondary-window entry point, which
+// open at `/`) is a one-line change to `DEFAULT_ROUTE`.
+import { createRoute, redirect } from '@tanstack/react-router';
 
-import { Button } from '@kubetail/ui/elements/button';
-import { Input } from '@kubetail/ui/elements/input';
+import { Route as appRoute } from '@/routes/_app';
 
-import { graphql } from '@/gql';
-import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
-import { Route as rootRoute } from '@/routes/__root';
-
-import '@/index.css';
+/** The view `/` lands on. Flip this to change the app's default. */
+export const DEFAULT_ROUTE = '/chat';
 
 export const Route = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appRoute,
   path: '/',
-  component: Chat,
+  beforeLoad: () => {
+    // TanStack signals a redirect by throwing the `redirect()` result.
+    // eslint-disable-next-line @typescript-eslint/only-throw-error
+    throw redirect({ to: DEFAULT_ROUTE });
+  },
 });
-
-const ChatStreamSubscription = graphql(`
-  subscription ChatStream($input: ChatInput!) {
-    chatStream(input: $input) {
-      delta
-      done
-    }
-  }
-`);
-
-type Msg = { id: string; from: 'user' | 'assistant'; content: string };
-
-function Chat() {
-  const [messages, setMessages] = useState<Msg[]>([]);
-  const [draft, setDraft] = useState('');
-  // While `pending` is set, the subscription is active and `streamed` holds
-  // the in-flight assistant text. On `done` we move the text into `messages`
-  // and clear `pending` in the same handler call — React 18 batches both
-  // setStates into one commit, so the streaming bubble and the finalized
-  // bubble never co-exist for a frame.
-  const [pending, setPending] = useState<Msg[] | null>(null);
-  const [streamed, setStreamed] = useState('');
-  // Guards against duplicate `done` deliveries (StrictMode double-mount in
-  // dev, late frames after the subscription is already paused, etc.).
-  const finishedRef = useRef(true);
-
-  useSubscription(
-    {
-      query: ChatStreamSubscription,
-      variables: {
-        input: { messages: (pending ?? []).map((m) => ({ role: m.from, content: m.content })) },
-      },
-      pause: pending === null,
-    },
-    (prev: string | undefined, data) => {
-      const chunk = data.chatStream;
-      const next = (prev ?? '') + chunk.delta;
-      if (chunk.done) {
-        if (finishedRef.current) return next;
-        finishedRef.current = true;
-        setMessages((m) => [...m, { id: crypto.randomUUID(), from: 'assistant', content: next }]);
-        setStreamed('');
-        setPending(null);
-      } else {
-        setStreamed(next);
-      }
-      return next;
-    },
-  );
-
-  const send = () => {
-    const text = draft.trim();
-    if (!text || pending) return;
-    const next: Msg[] = [...messages, { id: crypto.randomUUID(), from: 'user', content: text }];
-    finishedRef.current = false;
-    setMessages(next);
-    setDraft('');
-    setStreamed('');
-    setPending(next);
-  };
-
-  return (
-    <main className="flex min-h-svh flex-col bg-background">
-      <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-3 p-6 pt-16">
-        <div className="flex items-center">
-          <KubeContextPicker />
-        </div>
-        <div className="flex-1 space-y-3 overflow-y-auto">
-          {messages.length === 0 && !pending && (
-            <p className="text-sm text-muted-foreground">Say hi to start a chat.</p>
-          )}
-          {messages.map((m) => (
-            <Bubble key={m.id} from={m.from}>
-              {m.content}
-            </Bubble>
-          ))}
-          {pending && <Bubble from="assistant">{streamed || '…'}</Bubble>}
-        </div>
-        <form
-          className="flex gap-2"
-          onSubmit={(e) => {
-            e.preventDefault();
-            send();
-          }}
-        >
-          <Input
-            value={draft}
-            onChange={(e) => setDraft(e.currentTarget.value)}
-            placeholder="Message…"
-            disabled={!!pending}
-          />
-          <Button type="submit" disabled={!!pending || !draft.trim()}>
-            Send
-          </Button>
-        </form>
-      </div>
-    </main>
-  );
-}
-
-function Bubble({ from, children }: { from: 'user' | 'assistant'; children: React.ReactNode }) {
-  return (
-    <div
-      className={
-        from === 'user'
-          ? 'ml-auto max-w-[80%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground whitespace-pre-wrap'
-          : 'mr-auto max-w-[80%] rounded-lg bg-muted px-3 py-2 text-sm whitespace-pre-wrap'
-      }
-    >
-      {children}
-    </div>
-  );
-}

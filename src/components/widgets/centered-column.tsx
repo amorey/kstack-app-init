@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { Route as rootRoute } from '@/routes/__root';
-import { Route as appRoute } from '@/routes/_app';
-import { Route as indexRoute } from '@/routes/index';
-import { Route as chatRoute } from '@/routes/chat';
-import { Route as dashboardRoute } from '@/routes/dashboard';
+// A centered, readable-width content column that grows to fill its parent. Opt
+// in per page for the narrow chat/dashboard reading layout; a full-bleed page
+// (or a chrome-less window's own layout) simply doesn't use it. The window frame
+// itself — background, height, title-bar band reservation — lives in the layout
+// (`src/layouts/app-layout.tsx`), not here.
+import type { ReactNode } from 'react';
 
-// Chat (`/chat`) and Dashboard (`/dashboard`) are peer routes under the pathless
-// `_app` layout route, so they share the sidebar shell (`AppLayout`); `/`
-// (indexRoute) just redirects to the default view.
-export const routeTree = rootRoute.addChildren([appRoute.addChildren([indexRoute, chatRoute, dashboardRoute])]);
+export function CenteredColumn({ children }: { children?: ReactNode }) {
+  return <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-3 p-6">{children}</div>;
+}

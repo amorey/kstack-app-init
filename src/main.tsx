@@ -18,6 +18,7 @@ import { RouterProvider, createRouter } from '@tanstack/react-router';
 
 import { routeTree } from '@/routeTree';
 
+import '@/index.css';
 import 'unfonts.css';
 
 const router = createRouter({ routeTree });
