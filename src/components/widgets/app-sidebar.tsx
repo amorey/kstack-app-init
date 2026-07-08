@@ -86,6 +86,17 @@ const PREVIEW_POPUP_HEIGHT = 'h-[70svh]';
 // down onto the card, and keeps a brief flick off the edge from dismissing it.
 const PREVIEW_CLOSE_DELAY_MS = 300;
 
+// Below Tailwind's `md` breakpoint the floating card crowds the page, so we
+// auto-collapse it there and let the inset reclaim the full width (the toggle
+// stays available to reopen it). The threshold isn't hardcoded: we read
+// Tailwind's `--breakpoint-md` theme variable and match `< md` — the exact
+// inverse of the `md:` variant — so it tracks the theme if the breakpoint ever
+// changes.
+function mediumBreakpointQuery() {
+  const md = getComputedStyle(document.documentElement).getPropertyValue('--breakpoint-md').trim() || '48rem';
+  return `(max-width: calc(${md} - 1px))`;
+}
+
 // Linux/Windows custom title-bar band height. 32px is close to a native Windows
 // caption bar. This is the single source of truth: it's published as the
 // `--win-titlebar-h` CSS variable on the sidebar wrapper (see `AppSidebar`), and
@@ -260,7 +271,20 @@ type ShellProps = {
 // as an unpinned popup that overlays the page (no spacer) and disappears once
 // the pointer leaves both the toggle and the card.
 function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
-  const { open } = useSidebar();
+  const { open, setOpen } = useSidebar();
+
+  // Follow the medium breakpoint: collapse the sidebar when the window narrows
+  // below it and reopen it when the window widens back above. We act on each
+  // `change` edge (crossing the breakpoint), so between crossings a manual
+  // toggle still sticks. The narrow-at-mount case is handled synchronously by
+  // the provider's `defaultOpen` (see `AppSidebar`), so there's no post-paint
+  // collapse here that would flash the sidebar open first.
+  useEffect(() => {
+    const mql = window.matchMedia(mediumBreakpointQuery());
+    const onChange = (e: MediaQueryListEvent) => setOpen(!e.matches);
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, [setOpen]);
 
   // Hover-preview state for the collapsed sidebar. A short close delay
   // (`PREVIEW_CLOSE_DELAY_MS`) bridges the gap as the pointer travels from the
@@ -358,6 +382,11 @@ export function AppSidebar({ nav, footer, children }: AppSidebarProps) {
   const mac = isMacOS();
   const [width, setWidth] = useSidebarWidth();
 
+  // Start collapsed when the window opens already below the medium breakpoint.
+  // Computed synchronously (once) so the provider's first render is correct and
+  // the sidebar never flashes open before the breakpoint effect can close it.
+  const [initialOpen] = useState(() => !window.matchMedia(mediumBreakpointQuery()).matches);
+
   // Publish the drag-chosen width as `--sidebar-width` (overriding the library
   // default) and, off macOS, the custom title-bar height — both so the bar and
   // the sidebar offset can read it from one place (see `WIN_TITLE_BAR_HEIGHT_PX`).
@@ -367,7 +396,7 @@ export function AppSidebar({ nav, footer, children }: AppSidebarProps) {
   } as CSSProperties;
 
   return (
-    <SidebarProvider style={style}>
+    <SidebarProvider defaultOpen={initialOpen} style={style}>
       <SidebarShell mac={mac} onResize={setWidth} nav={nav} footer={footer}>
         {children}
       </SidebarShell>
