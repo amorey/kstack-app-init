@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MAC_USER_AGENT, NON_MAC_USER_AGENT, mockTauriWindow, restoreUserAgent, setUserAgent } from '@/test-utils';
@@ -63,6 +63,72 @@ describe('AppSidebar', () => {
     expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /toggle sidebar/i }));
     expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+  });
+
+  it('previews the collapsed sidebar as a popup while hovering the toggle, then hides it on leave', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<AppSidebar />);
+      const toggle = screen.getByRole('button', { name: /toggle sidebar/i });
+      // Collapse first: the card unmounts.
+      fireEvent.click(toggle);
+      expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
+
+      // Hovering the toggle re-mounts the card as a hover popup.
+      fireEvent.mouseEnter(toggle);
+      expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+      // The popup carries no resize handle (pinned-only affordance).
+      expect(screen.queryByTestId('sidebar-resize-handle')).not.toBeInTheDocument();
+
+      // Leaving the toggle closes it after the grace delay elapses.
+      fireEvent.mouseLeave(toggle);
+      expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(400);
+      });
+      expect(screen.queryByTestId('app-sidebar')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the hover popup open when the pointer moves from the toggle onto the card', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<AppSidebar />);
+      const toggle = screen.getByRole('button', { name: /toggle sidebar/i });
+      fireEvent.click(toggle);
+
+      fireEvent.mouseEnter(toggle);
+      const popup = screen.getByTestId('app-sidebar');
+      // Pointer leaves the toggle but lands on the card before the delay fires.
+      fireEvent.mouseLeave(toggle);
+      fireEvent.mouseEnter(popup);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(400);
+      });
+      // Still open — hover moved onto the card, cancelling the close.
+      expect(screen.getByTestId('app-sidebar')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('renders the macOS hover popup as a dropdown below the title bar (no in-card title bar)', () => {
+    setUserAgent(MAC_USER_AGENT);
+    render(<AppSidebar />);
+    const toggle = screen.getByRole('button', { name: /toggle sidebar/i });
+    // Pinned open: the card carries the macOS title bar (traffic-light gutter).
+    expect(screen.getByTestId('traffic-light-gutter')).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    fireEvent.mouseEnter(toggle);
+    // The popup drops below the band, so it omits the in-card title bar and hangs
+    // from the title-bar height rather than the window top.
+    const popup = screen.getByTestId('app-sidebar');
+    expect(screen.queryByTestId('traffic-light-gutter')).not.toBeInTheDocument();
+    expect(popup.className).toContain('top-11');
+    expect(popup.className).not.toContain('bottom-0');
   });
 
   it('exposes a draggable title-bar region', () => {

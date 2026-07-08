@@ -15,17 +15,26 @@
 // Title-bar button that collapses/expands the floating sidebar. Sits next to the
 // traffic lights on macOS and next to the `AppMenu` hamburger on Linux/Windows.
 // It drives the same `@kubetail/ui` sidebar state as the built-in `Cmd/Ctrl+B`
-// shortcut, so both stay in sync.
+// shortcut, so both stay in sync. While the sidebar is collapsed, hovering the
+// button previews it as a popup — the shell wires that up through the optional
+// `onHoverStart`/`onHoverEnd` handlers.
 import { PanelLeft } from 'lucide-react';
 import { useSidebar } from '@kubetail/ui/elements/sidebar';
 
-export function SidebarToggle() {
+type SidebarToggleProps = {
+  onHoverStart?: () => void;
+  onHoverEnd?: () => void;
+};
+
+export function SidebarToggle({ onHoverStart, onHoverEnd }: SidebarToggleProps = {}) {
   const { toggleSidebar } = useSidebar();
   return (
     <button
       type="button"
       aria-label="Toggle sidebar"
       onClick={toggleSidebar}
+      onMouseEnter={onHoverStart}
+      onMouseLeave={onHoverEnd}
       className="flex h-7 w-7 shrink-0 self-center items-center justify-center rounded text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
     >
       <PanelLeft className="h-4 w-4" aria-hidden />

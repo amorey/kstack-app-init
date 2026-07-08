@@ -31,7 +31,7 @@
 // opt out; we want an instant show/hide, so our shell simply mounts/unmounts the
 // floating card and toggles a layout spacer's width.
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
   SidebarContent,
@@ -67,6 +67,24 @@ const MAC_TOGGLE_LEFT = 96;
 // window drag band must cover the same strip, so both take their height from
 // here (44px — matches the host's `TITLE_BAR_HEIGHT` in `window_manager.rs`).
 const MAC_TITLE_BAR_HEIGHT = 'h-11';
+
+// Top offset matching `MAC_TITLE_BAR_HEIGHT` (44px), used to hang the hover popup
+// just below the macOS title-bar band so it drops from under the toggle. Kept in
+// step with `MAC_TITLE_BAR_HEIGHT` by hand — Tailwind can't derive one from the
+// other.
+const MAC_TITLE_BAR_TOP = 'top-11';
+
+// The hover popup is a standalone dropdown, not a preview of the pinned card, so
+// it gets its own fixed footprint (Tailwind classes) instead of tracking the
+// drag-chosen `--sidebar-width`. The height is a fixed fraction of the window
+// height, so it scales with the window; long content scrolls inside.
+const PREVIEW_POPUP_WIDTH = 'w-72';
+const PREVIEW_POPUP_HEIGHT = 'h-[70svh]';
+
+// Grace delay (ms) before the hover popup closes once the pointer leaves the
+// toggle (and the popup). Bridges the gap as the pointer travels from the toggle
+// down onto the card, and keeps a brief flick off the edge from dismissing it.
+const PREVIEW_CLOSE_DELAY_MS = 300;
 
 // Linux/Windows custom title-bar band height. 32px is close to a native Windows
 // caption bar. This is the single source of truth: it's published as the
@@ -195,10 +213,10 @@ function MacTitleBar() {
 // outside the sidebar (not in `MacTitleBar`) so it stays put — and stays
 // clickable to reopen — when the sidebar is hidden. `z-20` keeps it above both
 // the sidebar (`z-10`) and the window drag band (`z-0`).
-function MacSidebarToggle() {
+function MacSidebarToggle({ onHoverStart, onHoverEnd }: HoverHandlers) {
   return (
     <div className={`fixed top-0 z-20 flex ${MAC_TITLE_BAR_HEIGHT} items-center`} style={{ left: MAC_TOGGLE_LEFT }}>
-      <SidebarToggle />
+      <SidebarToggle onHoverStart={onHoverStart} onHoverEnd={onHoverEnd} />
     </div>
   );
 }
@@ -208,16 +226,23 @@ function MacSidebarToggle() {
 // stay clickable; its middle strip is the window's drag region. The sidebar
 // toggle sits next to the hamburger and, being part of this fixed bar rather
 // than the sidebar itself, stays visible to reopen a hidden sidebar.
-function WinTitleBar() {
+function WinTitleBar({ onHoverStart, onHoverEnd }: HoverHandlers) {
   return (
     <div className={`fixed inset-x-0 top-0 z-30 flex ${WIN_TITLE_BAR_HEIGHT} items-stretch gap-0.5 bg-background`}>
       <AppMenu />
-      <SidebarToggle />
+      <SidebarToggle onHoverStart={onHoverStart} onHoverEnd={onHoverEnd} />
       <div data-testid="window-drag-region" data-tauri-drag-region aria-hidden className="h-full flex-1" />
       <WindowControls />
     </div>
   );
 }
+
+// Handlers the toggle fires on hover, wired by the shell to preview a collapsed
+// sidebar as a popup.
+type HoverHandlers = {
+  onHoverStart?: () => void;
+  onHoverEnd?: () => void;
+};
 
 type ShellProps = {
   mac: boolean;
@@ -231,30 +256,77 @@ type ShellProps = {
 // state; here we render it. When open, a fixed card holds the nav/footer and a
 // same-width spacer reserves room for it in the flex row so the page inset sits
 // beside it. When collapsed, both vanish immediately (no slide) and the inset
-// reclaims the full width.
+// reclaims the full width — but hovering the toggle then re-mounts the same card
+// as an unpinned popup that overlays the page (no spacer) and disappears once
+// the pointer leaves both the toggle and the card.
 function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
   const { open } = useSidebar();
 
-  // Off macOS the card starts just below the custom title bar; on macOS it spans
-  // to the window top. `bottom-0` + `top-*` sets the height implicitly.
-  const cardTop = mac ? 'top-0' : 'top-[var(--win-titlebar-h)]';
+  // Hover-preview state for the collapsed sidebar. A short close delay
+  // (`PREVIEW_CLOSE_DELAY_MS`) bridges the gap as the pointer travels from the
+  // toggle down into the popup, so it doesn't flicker shut between the two.
+  const [preview, setPreview] = useState(false);
+  const closeTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const showPreview = useCallback(() => {
+    clearTimeout(closeTimer.current);
+    setPreview(true);
+  }, []);
+  const hidePreview = useCallback(() => {
+    clearTimeout(closeTimer.current);
+    closeTimer.current = setTimeout(() => setPreview(false), PREVIEW_CLOSE_DELAY_MS);
+  }, []);
+  useEffect(() => () => clearTimeout(closeTimer.current), []);
+
+  // Only preview while collapsed; pinning open (or the width drag) takes over.
+  const showingPreview = !open && preview;
+  const cardVisible = open || showingPreview;
+  const hoverHandlers: HoverHandlers = open ? {} : { onHoverStart: showPreview, onHoverEnd: hidePreview };
+
+  // Card geometry differs between the pinned sidebar and the hover popup:
+  //   • Pinned: full window height (`bottom-0`) anchored at the top — flush to
+  //     the window top on macOS (its header carries the title bar) or just below
+  //     the custom title bar off macOS.
+  //   • Popup: a dropdown that drops from under the toggle. It's height-fits-
+  //     content (no `bottom-0`, capped so long content scrolls) and hangs just
+  //     below the title-bar band on every platform, so on macOS it clears the
+  //     traffic lights instead of spanning up behind them like the real sidebar.
+  const dockedTop = mac ? 'top-0' : 'top-[var(--win-titlebar-h)]';
+  const previewTop = mac ? MAC_TITLE_BAR_TOP : 'top-[var(--win-titlebar-h)]';
 
   return (
     <>
-      {!mac && <WinTitleBar />}
+      {!mac && <WinTitleBar {...hoverHandlers} />}
 
       {/* Layout spacer: reserves the sidebar's width in the flex row so the inset
-          sits beside the floating card. Zero width when collapsed. */}
+          sits beside the floating card. Zero width when collapsed — the hover
+          popup overlays the page rather than reserving room. */}
       <div className="shrink-0" aria-hidden style={{ width: open ? 'var(--sidebar-width)' : 0 }} />
 
-      {open && (
-        <div data-testid="app-sidebar" className={`fixed bottom-0 left-0 z-10 flex w-(--sidebar-width) p-2 ${cardTop}`}>
-          <div className="flex size-full flex-col rounded-lg bg-sidebar shadow-sm ring-1 ring-sidebar-border">
-            {mac && <MacTitleBar />}
+      {cardVisible && (
+        <div
+          data-testid="app-sidebar"
+          onMouseEnter={showingPreview ? showPreview : undefined}
+          onMouseLeave={showingPreview ? hidePreview : undefined}
+          className={`fixed left-0 z-10 flex p-2 ${
+            showingPreview
+              ? `${previewTop} ${PREVIEW_POPUP_WIDTH} ${PREVIEW_POPUP_HEIGHT}`
+              : `bottom-0 w-(--sidebar-width) ${dockedTop}`
+          }`}
+        >
+          <div
+            className={`flex size-full min-h-0 flex-col rounded-lg bg-sidebar ring-1 ring-sidebar-border ${
+              showingPreview ? 'shadow-lg' : 'shadow-sm'
+            }`}
+          >
+            {/* The pinned macOS card doubles as the title bar; the popup drops
+                below it, so it needs no in-card title bar. */}
+            {mac && !showingPreview && <MacTitleBar />}
             <SidebarContent>{nav}</SidebarContent>
             <SidebarFooter>{footer}</SidebarFooter>
           </div>
-          <ResizeHandle onResize={onResize} />
+          {/* No resize handle on the transient popup — resizing is a pinned-only
+              affordance. */}
+          {!showingPreview && <ResizeHandle onResize={onResize} />}
         </div>
       )}
 
@@ -266,7 +338,7 @@ function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
       {mac && (
         <>
           <MacWindowDragBand />
-          <MacSidebarToggle />
+          <MacSidebarToggle {...hoverHandlers} />
         </>
       )}
     </>
