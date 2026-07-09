@@ -68,10 +68,13 @@ export function mockTauriWindow() {
   };
 }
 
-// User-agent strings and overrides for exercising `isMacOS()`-branched UI. The
-// WebView's UA is fixed per-OS, so tests flip it to pick a platform.
+// User-agent strings and overrides for exercising platform-branched UI (`isMacOS`
+// / `isLinux`). The WebView's UA is fixed per-OS, so tests flip it to pick a
+// platform. `NON_MAC_USER_AGENT` is a Linux UA (the frameless+transparent
+// window); `WINDOWS_USER_AGENT` is frameless-but-opaque.
 export const MAC_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15';
 export const NON_MAC_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36';
+export const WINDOWS_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 
 const originalUserAgent = window.navigator.userAgent;
 

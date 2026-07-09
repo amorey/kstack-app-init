@@ -120,9 +120,10 @@ impl WindowManager {
     /// but Tauri builds the initial `"main"` window from the static config
     /// before the setup hook runs. On macOS `tauri.macos.conf.json` gives it the
     /// Overlay title bar + traffic-light position, which already match; the base
-    /// `tauri.conf.json` (Linux/Windows) leaves native decorations on, so they're
-    /// dropped here to make the first window frameless like the rest, letting the
-    /// webview's own controls take over.
+    /// `tauri.conf.json` (Linux) and `tauri.windows.conf.json` (Windows) both
+    /// leave native decorations on, so they're dropped here to make the first
+    /// window frameless like the rest, letting the webview's own controls take
+    /// over.
     ///
     /// [`build_window`]: WindowManager::build_window
     pub fn apply_main_window_chrome(&self, app: &AppHandle) -> Result<()> {
@@ -162,6 +163,10 @@ impl WindowManager {
     /// Linux/Windows the window is frameless and the webview draws its own
     /// controls (`WindowControls`). `traffic_light_position` requires the
     /// Overlay style with decorations left on, so macOS keeps decorations.
+    ///
+    /// Linux additionally makes the window transparent so the webview's
+    /// `WindowFrame` can paint its own border + shadow into a gutter; Windows
+    /// stays opaque and lets DWM draw the borderless window's native shadow.
     fn build_window(&self, app: &AppHandle, label: &str, title: &str) -> Result<WebviewWindow> {
         let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::default())
             .title(title)
@@ -178,12 +183,22 @@ impl WindowManager {
                 .traffic_light_position(tauri::LogicalPosition::new(x, y));
         }
 
+        // Both non-macOS platforms are frameless — the webview's sidebar is the
+        // title bar and draws its own `WindowControls` (mirrors the same
+        // `not(macos)` decision in `apply_main_window_chrome`).
         #[cfg(not(target_os = "macos"))]
         {
-            // Frameless, and transparent so the webview's `WindowFrame` can paint
-            // its own rounded border and outer shadow into a gutter at the window
-            // edge (the OS draws neither for a decoration-less window).
-            builder = builder.decorations(false).transparent(true);
+            builder = builder.decorations(false);
+        }
+
+        // Linux additionally goes transparent so the webview's `WindowFrame` can
+        // paint its own rounded border + outer shadow into a gutter at the window
+        // edge (the OS draws neither for a decoration-less window). Windows stays
+        // opaque: DWM already draws a borderless window's own shadow (and rounds
+        // the corners on Win11), so a second custom one would double-stack.
+        #[cfg(target_os = "linux")]
+        {
+            builder = builder.transparent(true);
         }
 
         let window = builder.build()?;

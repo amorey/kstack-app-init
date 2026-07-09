@@ -17,16 +17,17 @@ import { createRoot } from 'react-dom/client';
 import { RouterProvider, createRouter } from '@tanstack/react-router';
 
 import { routeTree } from '@/routeTree';
-import { isMacOS } from '@/lib/platform';
+import { isLinux } from '@/lib/platform';
 
 import '@/index.css';
 import 'unfonts.css';
 
-// Off macOS the window is frameless and transparent (see `WindowFrame`); tag the
+// The Linux window is frameless *and* transparent (see `WindowFrame`); tag the
 // document so the base stylesheet can make it transparent and let the frame's
-// outer shadow show through. macOS keeps its native decorations, so it stays
-// opaque and full-bleed.
-if (!isMacOS()) document.documentElement.classList.add('frameless');
+// outer shadow show through. macOS keeps its native decorations, and Windows is
+// frameless but opaque (DWM draws its own shadow), so both stay opaque and
+// full-bleed — no `frameless` tag.
+if (isLinux()) document.documentElement.classList.add('frameless');
 
 const router = createRouter({ routeTree });
 

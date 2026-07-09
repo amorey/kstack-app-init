@@ -21,3 +21,13 @@
 export function isMacOS(): boolean {
   return /Mac/i.test(window.navigator.userAgent);
 }
+
+/**
+ * True when running inside the Linux system WebView (WebKitGTK) — the only
+ * window that is frameless *and* transparent, so it paints its own border and
+ * shadow (see `WindowFrame`). A positive sniff (rather than "not macOS and not
+ * Windows") keeps any unrecognized platform on the safe opaque, full-bleed path.
+ */
+export function isLinux(): boolean {
+  return /Linux/i.test(window.navigator.userAgent);
+}

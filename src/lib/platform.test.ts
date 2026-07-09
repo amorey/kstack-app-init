@@ -14,31 +14,43 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { isMacOS } from './platform';
+import { MAC_USER_AGENT, NON_MAC_USER_AGENT, WINDOWS_USER_AGENT, restoreUserAgent, setUserAgent } from '@/test-utils';
 
-function setUserAgent(value: string) {
-  Object.defineProperty(window.navigator, 'userAgent', { value, configurable: true });
-}
+import { isLinux, isMacOS } from './platform';
+
+// `NON_MAC_USER_AGENT` is a Linux UA (see `test-utils`).
+afterEach(restoreUserAgent);
 
 describe('isMacOS', () => {
-  const original = window.navigator.userAgent;
-
-  afterEach(() => {
-    setUserAgent(original);
-  });
-
   it('is true on a macOS webview user agent', () => {
-    setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)');
+    setUserAgent(MAC_USER_AGENT);
     expect(isMacOS()).toBe(true);
   });
 
   it('is false on Windows', () => {
-    setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    setUserAgent(WINDOWS_USER_AGENT);
     expect(isMacOS()).toBe(false);
   });
 
   it('is false on Linux', () => {
-    setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36');
+    setUserAgent(NON_MAC_USER_AGENT);
     expect(isMacOS()).toBe(false);
+  });
+});
+
+describe('isLinux', () => {
+  it('is true on a Linux webview user agent', () => {
+    setUserAgent(NON_MAC_USER_AGENT);
+    expect(isLinux()).toBe(true);
+  });
+
+  it('is false on macOS', () => {
+    setUserAgent(MAC_USER_AGENT);
+    expect(isLinux()).toBe(false);
+  });
+
+  it('is false on Windows', () => {
+    setUserAgent(WINDOWS_USER_AGENT);
+    expect(isLinux()).toBe(false);
   });
 });

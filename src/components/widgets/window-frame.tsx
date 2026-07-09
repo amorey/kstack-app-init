@@ -12,12 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The window's outer frame for the frameless Linux/Windows window. Those windows
-// are `decorations(false)` *and* `transparent`, so the OS draws no border or drop
-// shadow — with a same-color desktop behind them the edge is invisible. This
+// The window's outer frame for the frameless Linux window. That window is
+// `decorations(false)` *and* `transparent`, so the OS draws no border or drop
+// shadow — with a same-color desktop behind it the edge is invisible. This
 // wraps the whole app in a surface inset a few px from the window edge, clipped to
 // rounded corners, with a thin border and a soft outer shadow that paints into the
 // transparent gutter — so the window reads as a distinct floating surface.
+//
+// Windows is a passthrough (like macOS): its window is frameless but *opaque*, so
+// DWM draws the borderless window's own shadow (and rounds the corners on Win11).
+// Painting a second custom shadow into a gutter there just double-stacks with the
+// OS one, so Windows fills the window edge-to-edge and lets the OS own the frame.
 //
 // The gutter (`inset-4`) must be at least as wide as the shadow's reach (blur +
 // offset). The OS window rectangle ends at the gutter's outer edge and clips
@@ -33,9 +38,9 @@
 // then clips that chrome to the rounded corners.
 //
 // macOS keeps its native window decorations (the OS draws the rounded corners and
-// shadow itself), so the webview stays full-bleed there and this is a passthrough.
-// It must wrap the app at the outermost level so the loading and error states get
-// the same frame and opaque background as the mounted app.
+// shadow itself), so the webview stays full-bleed there and this is a passthrough
+// too. It must wrap the app at the outermost level so the loading and error states
+// get the same frame and opaque background as the mounted app.
 //
 // When the window is maximized there's no off-window space to paint into, so the
 // gutter would just read as an empty transparent band around the app (native apps
@@ -45,7 +50,7 @@
 import type { ReactNode } from 'react';
 import { useEffect } from 'react';
 
-import { isMacOS } from '@/lib/platform';
+import { isLinux } from '@/lib/platform';
 import { useWindowMaximized } from '@/lib/window-maximized';
 
 export function WindowFrame({ children }: { children?: ReactNode }) {
@@ -54,12 +59,14 @@ export function WindowFrame({ children }: { children?: ReactNode }) {
   // Mirror the maximized state onto <html> so portaled chrome that can't reach
   // into the frame — chiefly the dialog scrim, which base-ui portals to <body>
   // outside this frame — can match the frame's geometry from CSS (see the
-  // `[data-slot='dialog-overlay']` rule in `index.css`). Always false on macOS.
+  // `[data-slot='dialog-overlay']` rule in `index.css`). Only meaningful for the
+  // frameless Linux window; the scrim rules key off `html.frameless`, which macOS
+  // and Windows (both full-bleed passthroughs) don't set.
   useEffect(() => {
     document.documentElement.classList.toggle('frame-maximized', maximized);
   }, [maximized]);
 
-  if (isMacOS()) return <>{children}</>;
+  if (!isLinux()) return <>{children}</>;
   const className = maximized
     ? 'fixed inset-0 overflow-hidden bg-background contain-[paint]'
     : 'fixed inset-4 overflow-hidden rounded-lg border border-black/5 bg-background shadow-[0_6px_16px_rgba(0,0,0,0.35)] contain-[paint] dark:border-white/5';

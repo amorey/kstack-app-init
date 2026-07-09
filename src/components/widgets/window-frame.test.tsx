@@ -15,7 +15,14 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { MAC_USER_AGENT, NON_MAC_USER_AGENT, mockTauriWindow, restoreUserAgent, setUserAgent } from '@/test-utils';
+import {
+  MAC_USER_AGENT,
+  NON_MAC_USER_AGENT,
+  WINDOWS_USER_AGENT,
+  mockTauriWindow,
+  restoreUserAgent,
+  setUserAgent,
+} from '@/test-utils';
 
 // The frame queries the native window's maximized state (see `useWindowMaximized`).
 const { windowMock, factory } = mockTauriWindow();
@@ -34,7 +41,7 @@ afterEach(() => {
 });
 
 describe('WindowFrame', () => {
-  it('wraps children in the bordered frame on Linux/Windows', () => {
+  it('wraps children in the bordered frame on Linux', () => {
     render(
       <WindowFrame>
         <div>content</div>
@@ -62,8 +69,13 @@ describe('WindowFrame', () => {
     });
   });
 
-  it('renders children full-bleed on macOS (native decorations own the frame)', () => {
-    setUserAgent(MAC_USER_AGENT);
+  // macOS (native decorations own the frame) and Windows (DWM draws the
+  // borderless window's own shadow) are both opaque, full-bleed passthroughs.
+  it.each([
+    ['macOS', MAC_USER_AGENT],
+    ['Windows', WINDOWS_USER_AGENT],
+  ])('renders children full-bleed on %s', (_platform, userAgent) => {
+    setUserAgent(userAgent);
     render(
       <WindowFrame>
         <div>content</div>

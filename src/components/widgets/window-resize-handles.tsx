@@ -14,14 +14,16 @@
 
 // Edge/corner resize grips for the frameless Linux/Windows window. Dropping the
 // OS decorations (`decorations(false)`) also drops the native resize borders, so
-// the app draws its own: invisible fixed strips over the transparent gutter that
-// `WindowFrame` leaves around the app (see `window-frame.tsx`). Each strip starts
-// a native resize drag via the Tauri core window API on pointer-down. Corners sit
-// above the edges (later in DOM order + wider) so a corner grab resizes on both
-// axes. macOS keeps its native decorations, so this renders nothing there.
+// the app draws its own: invisible fixed strips along the window edges. On Linux
+// they sit over the transparent gutter `WindowFrame` leaves around the app; on
+// Windows (full-bleed, no gutter — see `window-frame.tsx`) they overlay the
+// outermost few px of the app instead. Each strip starts a native resize drag via
+// the Tauri core window API on pointer-down. Corners sit above the edges (later in
+// DOM order + wider) so a corner grab resizes on both axes. macOS keeps its native
+// decorations, so this renders nothing there.
 //
-// A maximized window can't be edge-resized and leaves no gutter for the grips to
-// live in (see `WindowFrame`), so we render nothing while maximized either.
+// A maximized window can't be edge-resized, so we render nothing while maximized
+// either.
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
 import { isMacOS } from '@/lib/platform';
@@ -38,9 +40,10 @@ function startResize(direction: ResizeDirection) {
     .catch(() => {});
 }
 
-// Grip footprint: edges span the ~16px transparent gutter; corners are a bit
-// larger so the diagonal target is easy to hit. `select-none` + `touch-none`
-// keep the webview from claiming the press (see the mousedown handler).
+// Grip footprint: edges are a ~16px strip along each window edge (matching
+// Linux's gutter width); corners are a bit larger so the diagonal target is easy
+// to hit. `select-none` + `touch-none` keep the webview from claiming the press
+// (see the mousedown handler).
 const EDGE = 'fixed z-50 select-none touch-none';
 const CORNER = 'fixed z-50 h-5 w-5 select-none touch-none';
 
