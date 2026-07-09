@@ -26,7 +26,7 @@
 // either.
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
-import { isMacOS } from '@/lib/platform';
+import { isLinux, isMacOS } from '@/lib/platform';
 import { useWindowMaximized } from '@/lib/window-maximized';
 
 // `@tauri-apps/api` declares this union but doesn't export it; mirror it here so
@@ -40,32 +40,43 @@ function startResize(direction: ResizeDirection) {
     .catch(() => {});
 }
 
-// Grip footprint: edges are a ~16px strip along each window edge (matching
-// Linux's gutter width); corners are a bit larger so the diagonal target is easy
-// to hit. `select-none` + `touch-none` keep the webview from claiming the press
-// (see the mousedown handler).
+// Grip footprint. `select-none` + `touch-none` keep the webview from claiming
+// the press (see the mousedown handler). Edge thickness / corner size depend on
+// the platform: on Linux the strips sit over the transparent gutter, so they're
+// as wide as the gutter (~16px) with no cost. On Windows they overlay real app
+// content, so a wide strip flips the cursor to the resize arrow well inside the
+// window — instead we hug the edge with a thin strip (~5px) like native windows.
 const EDGE = 'fixed z-50 select-none touch-none';
-const CORNER = 'fixed z-50 h-5 w-5 select-none touch-none';
+const CORNER = 'fixed z-50 select-none touch-none';
 
-const HANDLES: { key: string; className: string; cursor: string; direction: ResizeDirection }[] = [
-  // Edges.
-  { key: 'n', className: `${EDGE} inset-x-0 top-0 h-4`, cursor: 'ns-resize', direction: 'North' },
-  { key: 's', className: `${EDGE} inset-x-0 bottom-0 h-4`, cursor: 'ns-resize', direction: 'South' },
-  { key: 'w', className: `${EDGE} inset-y-0 left-0 w-4`, cursor: 'ew-resize', direction: 'West' },
-  { key: 'e', className: `${EDGE} inset-y-0 right-0 w-4`, cursor: 'ew-resize', direction: 'East' },
-  // Corners (above the edges).
-  { key: 'nw', className: `${CORNER} left-0 top-0`, cursor: 'nwse-resize', direction: 'NorthWest' },
-  { key: 'ne', className: `${CORNER} right-0 top-0`, cursor: 'nesw-resize', direction: 'NorthEast' },
-  { key: 'sw', className: `${CORNER} left-0 bottom-0`, cursor: 'nesw-resize', direction: 'SouthWest' },
-  { key: 'se', className: `${CORNER} right-0 bottom-0`, cursor: 'nwse-resize', direction: 'SouthEast' },
-];
+function buildHandles(edge: { h: string; w: string }, corner: string) {
+  return [
+    // Edges.
+    { key: 'n', className: `${EDGE} inset-x-0 top-0 ${edge.h}`, cursor: 'ns-resize', direction: 'North' },
+    { key: 's', className: `${EDGE} inset-x-0 bottom-0 ${edge.h}`, cursor: 'ns-resize', direction: 'South' },
+    { key: 'w', className: `${EDGE} inset-y-0 left-0 ${edge.w}`, cursor: 'ew-resize', direction: 'West' },
+    { key: 'e', className: `${EDGE} inset-y-0 right-0 ${edge.w}`, cursor: 'ew-resize', direction: 'East' },
+    // Corners (above the edges).
+    { key: 'nw', className: `${CORNER} ${corner} left-0 top-0`, cursor: 'nwse-resize', direction: 'NorthWest' },
+    { key: 'ne', className: `${CORNER} ${corner} right-0 top-0`, cursor: 'nesw-resize', direction: 'NorthEast' },
+    { key: 'sw', className: `${CORNER} ${corner} left-0 bottom-0`, cursor: 'nesw-resize', direction: 'SouthWest' },
+    { key: 'se', className: `${CORNER} ${corner} right-0 bottom-0`, cursor: 'nwse-resize', direction: 'SouthEast' },
+  ] satisfies { key: string; className: string; cursor: string; direction: ResizeDirection }[];
+}
+
+// Linux: wide strips filling the gutter. Windows (and any other frameless
+// platform): thin strips hugging the edge so the resize cursor only appears near
+// the very edge, matching native behavior.
+const LINUX_HANDLES = buildHandles({ h: 'h-4', w: 'w-4' }, 'h-5 w-5');
+const NARROW_HANDLES = buildHandles({ h: 'h-[5px]', w: 'w-[5px]' }, 'h-2.5 w-2.5');
 
 export function WindowResizeHandles() {
   const maximized = useWindowMaximized();
   if (isMacOS() || maximized) return null;
+  const handles = isLinux() ? LINUX_HANDLES : NARROW_HANDLES;
   return (
     <>
-      {HANDLES.map(({ key, className, cursor, direction }) => (
+      {handles.map(({ key, className, cursor, direction }) => (
         <div
           key={key}
           aria-hidden
