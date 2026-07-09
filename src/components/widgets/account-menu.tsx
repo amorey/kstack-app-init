@@ -103,14 +103,7 @@ export function AccountMenu() {
           <Database className="size-4" aria-hidden />
           Clusters
         </DropdownMenuItem>
-        {/* Settings has no dialog yet — a placeholder entry point. Wire it to
-              `openDialog('settings')` once the Settings dialog is registered in
-              AppDialogs. */}
-        <DropdownMenuItem
-          onClick={() => {
-            /* TODO: openDialog('settings') once a settings dialog exists */
-          }}
-        >
+        <DropdownMenuItem onClick={() => openDialog('settings')}>
           <Settings className="size-4" aria-hidden />
           Settings
         </DropdownMenuItem>

@@ -29,6 +29,10 @@ import 'unfonts.css';
 // full-bleed — no `frameless` tag.
 if (isLinux()) document.documentElement.classList.add('frameless');
 
+// The color scheme's `.dark` class is applied pre-paint by the inline script in
+// `index.html` (before this bundle loads, to avoid a white flash on new windows);
+// `ThemeProvider` re-applies it on mount and owns reactive changes thereafter.
+
 const router = createRouter({ routeTree });
 
 declare module '@tanstack/react-router' {

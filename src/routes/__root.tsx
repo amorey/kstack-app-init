@@ -20,6 +20,7 @@ import { AuthProvider } from '@/lib/auth';
 import { ErrorBoundary } from '@/lib/error-boundary';
 import { createGraphqlClient } from '@/lib/graphql/client';
 import { ReadyGate } from '@/lib/ready-gate';
+import { ThemeProvider } from '@/lib/theme';
 import { ClustersProvider } from '@/lib/clusters';
 import { KubeConfigProvider } from '@/lib/kube-config';
 import { WindowFrame } from '@/components/widgets/window-frame';
@@ -64,22 +65,24 @@ function RootComponent() {
   return (
     <>
       <WindowFrame>
-        <ErrorBoundary>
-          <ReadyGate>
-            <UrqlProvider value={gqlClient}>
-              <AuthProvider>
-                <ClustersProvider>
-                  <KubeConfigProvider>
-                    <Outlet />
-                    <Suspense>
-                      <TanStackRouterDevtools />
-                    </Suspense>
-                  </KubeConfigProvider>
-                </ClustersProvider>
-              </AuthProvider>
-            </UrqlProvider>
-          </ReadyGate>
-        </ErrorBoundary>
+        <ThemeProvider>
+          <ErrorBoundary>
+            <ReadyGate>
+              <UrqlProvider value={gqlClient}>
+                <AuthProvider>
+                  <ClustersProvider>
+                    <KubeConfigProvider>
+                      <Outlet />
+                      <Suspense>
+                        <TanStackRouterDevtools />
+                      </Suspense>
+                    </KubeConfigProvider>
+                  </ClustersProvider>
+                </AuthProvider>
+              </UrqlProvider>
+            </ReadyGate>
+          </ErrorBoundary>
+        </ThemeProvider>
       </WindowFrame>
       <WindowResizeHandles />
     </>

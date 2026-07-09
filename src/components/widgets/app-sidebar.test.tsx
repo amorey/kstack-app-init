@@ -15,7 +15,14 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { MAC_USER_AGENT, NON_MAC_USER_AGENT, mockTauriWindow, restoreUserAgent, setUserAgent } from '@/test-utils';
+import {
+  MAC_USER_AGENT,
+  NON_MAC_USER_AGENT,
+  mockMatchMedia,
+  mockTauriWindow,
+  restoreUserAgent,
+  setUserAgent,
+} from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
@@ -41,26 +48,10 @@ if (!HTMLElement.prototype.setPointerCapture) {
 const wrapperWidth = (container: HTMLElement) =>
   (container.querySelector('[data-slot="sidebar-wrapper"]') as HTMLElement).style.getPropertyValue('--sidebar-width');
 
-// Installs a controllable `matchMedia` whose `matches` (i.e. "below the medium
-// breakpoint") can be flipped, firing a `change` event to registered listeners
-// exactly like the browser. Returns a `setNarrow` to drive breakpoint crossings.
-function mockBreakpoint(initialNarrow = false) {
-  let narrow = initialNarrow;
-  const listeners = new Set<(e: MediaQueryListEvent) => void>();
-  window.matchMedia = (() => ({
-    get matches() {
-      return narrow;
-    },
-    addEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => listeners.add(cb),
-    removeEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => listeners.delete(cb),
-  })) as unknown as typeof window.matchMedia;
-  return (next: boolean) => {
-    narrow = next;
-    act(() => {
-      listeners.forEach((cb) => cb({ matches: narrow } as MediaQueryListEvent));
-    });
-  };
-}
+// Installs a controllable `matchMedia` whose `matches` here means "below the medium
+// breakpoint". Returns a `setNarrow` to drive breakpoint crossings (see
+// `mockMatchMedia`).
+const mockBreakpoint = mockMatchMedia;
 
 const sidebarVisible = () => screen.queryByTestId('app-sidebar') !== null;
 

@@ -23,12 +23,14 @@
 import type { ComponentType } from 'react';
 
 import { ClusterSyncPanel } from '@/components/widgets/cluster-sync-panel';
+import { SettingsDialog } from '@/components/widgets/settings-dialog';
 import { useDialog, type AppDialogProps, type DialogId } from '@/lib/dialog';
 
 // Each overlay dialog is a controlled component taking `AppDialogProps`. Partial
-// because a `DialogId` may be reserved before its dialog is built (e.g. settings).
+// because a `DialogId` may be reserved before its dialog is built.
 const DIALOGS: Partial<Record<DialogId, ComponentType<AppDialogProps>>> = {
   clusters: ClusterSyncPanel,
+  settings: SettingsDialog,
 };
 
 export function AppDialogs() {

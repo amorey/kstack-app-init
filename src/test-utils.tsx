@@ -86,6 +86,35 @@ export function restoreUserAgent() {
   setUserAgent(originalUserAgent);
 }
 
+// Installs a controllable `window.matchMedia` whose `matches` can be flipped,
+// firing a `change` event (wrapped in `act`) to registered listeners exactly like
+// the browser. Returns a `setMatches(next)` to drive media-query crossings — used
+// for both the color-scheme query (`prefers-color-scheme: dark`) and the sidebar
+// breakpoint. `matches` is a live getter so a captured `MediaQueryList` reflects
+// later flips. jsdom's default (non-controllable) stub lives in `vitest.setup.ts`.
+export function mockMatchMedia(initialMatches = false) {
+  let matches = initialMatches;
+  const listeners = new Set<(e: MediaQueryListEvent) => void>();
+  window.matchMedia = ((query: string) => ({
+    get matches() {
+      return matches;
+    },
+    media: query,
+    onchange: null,
+    addEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => listeners.add(cb),
+    removeEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => listeners.delete(cb),
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+  return (next: boolean) => {
+    matches = next;
+    act(() => {
+      listeners.forEach((cb) => cb({ matches } as MediaQueryListEvent));
+    });
+  };
+}
+
 export async function renderWithRouter(routeTree: AnyRoute, path: string) {
   const router = createRouter({
     routeTree,

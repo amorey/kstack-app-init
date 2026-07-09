@@ -40,6 +40,15 @@
     font-synthesis: none;
     text-rendering: optimizeLegibility;
     position: relative;
+    /*
+     * Paint the document itself from the resolved scheme's token, so a window's
+     * first frame is themed before React mounts any `bg-background` surface —
+     * otherwise a dark-scheme window flashes the webview's default white until the
+     * app renders. The pre-paint `.dark` class comes from the inline script in
+     * `index.html`. Linux is frameless+transparent, so `html.frameless body` below
+     * overrides this back to transparent (the gutter must show through).
+     */
+    background-color: var(--background);
   }
 
   #root {
