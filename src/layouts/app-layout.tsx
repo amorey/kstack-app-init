@@ -40,7 +40,7 @@ export function AppLayout() {
     <DialogProvider>
       <ConnectionStatus />
       <AppSidebar nav={<ModeNav />} footer={<AccountMenu />}>
-        <main className="flex min-h-[var(--app-min-h)] flex-col bg-background pt-16">
+        <main className="flex min-h-(--app-min-h) flex-col bg-background pt-16">
           <Outlet />
         </main>
       </AppSidebar>
