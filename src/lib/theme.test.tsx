@@ -12,32 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { act, render, screen } from '@testing-library/react';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { act, render, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ThemeProvider, applyPreference, readStoredPreference, useColorScheme } from '@/lib/theme';
-import { mockMatchMedia } from '@/test-utils';
+import { mockMatchMedia, mockTauriCore, mockTauriEvent } from '@/test-utils';
 
-const STORAGE_KEY = 'kstack:color-scheme-preference';
+const { invokeMock, factory: coreFactory } = mockTauriCore();
+vi.mock('@tauri-apps/api/core', () => coreFactory());
+
+const { emitEvent, factory: eventFactory } = mockTauriEvent();
+vi.mock('@tauri-apps/api/event', () => eventFactory());
+
+const { ThemeProvider, applyPreference, readInjectedPreference, useColorScheme } = await import('@/lib/theme');
 
 beforeEach(() => {
-  localStorage.clear();
+  // The injected global is per-window state; each test sets what it needs.
+  delete window.__KSTACK_HOST__;
   document.documentElement.classList.remove('dark');
+  invokeMock.mockReset();
+  invokeMock.mockResolvedValue(undefined);
 });
 
-describe('readStoredPreference', () => {
-  it('defaults to system when unset', () => {
-    expect(readStoredPreference()).toBe('system');
+describe('readInjectedPreference', () => {
+  it('reads the host-injected preference', () => {
+    window.__KSTACK_HOST__ = { schemaVersion: 1, colorSchemePreference: 'dark' };
+    expect(readInjectedPreference()).toBe('dark');
   });
 
-  it('returns a stored valid preference', () => {
-    localStorage.setItem(STORAGE_KEY, 'dark');
-    expect(readStoredPreference()).toBe('dark');
+  it('defaults to system when the global is absent', () => {
+    expect(readInjectedPreference()).toBe('system');
   });
 
-  it('falls back to system for a corrupt value', () => {
-    localStorage.setItem(STORAGE_KEY, 'chartreuse');
-    expect(readStoredPreference()).toBe('system');
+  it('defaults to system for an unknown value', () => {
+    window.__KSTACK_HOST__ = { schemaVersion: 1, colorSchemePreference: 'chartreuse' };
+    expect(readInjectedPreference()).toBe('system');
   });
 });
 
@@ -70,61 +78,66 @@ function Harness() {
       <button type="button" onClick={() => setPreference('dark')}>
         dark
       </button>
-      <button type="button" onClick={() => setPreference('system')}>
-        system
-      </button>
     </div>
   );
 }
 
+function renderProvider() {
+  return render(
+    <ThemeProvider>
+      <Harness />
+    </ThemeProvider>,
+  );
+}
+
 describe('ThemeProvider', () => {
-  it('applies the stored preference on mount', () => {
+  it('initializes from the host-injected preference', () => {
     mockMatchMedia(false);
-    localStorage.setItem(STORAGE_KEY, 'dark');
-    render(
-      <ThemeProvider>
-        <Harness />
-      </ThemeProvider>,
-    );
+    window.__KSTACK_HOST__ = { schemaVersion: 1, colorSchemePreference: 'dark' };
+    renderProvider();
     expect(document.documentElement.classList.contains('dark')).toBe(true);
     expect(screen.getByTestId('preference').textContent).toBe('dark');
   });
 
-  it('applies and persists an explicit choice', () => {
+  it('applies an explicit choice and persists it through the host', async () => {
     mockMatchMedia(false);
-    render(
-      <ThemeProvider>
-        <Harness />
-      </ThemeProvider>,
-    );
+    renderProvider();
     act(() => screen.getByText('dark').click());
     expect(document.documentElement.classList.contains('dark')).toBe(true);
-    expect(localStorage.getItem(STORAGE_KEY)).toBe('dark');
+    expect(screen.getByTestId('preference').textContent).toBe('dark');
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('update_host_file', { patch: { colorSchemePreference: 'dark' } }),
+    );
+  });
+
+  it('follows host-file-updated events (cross-window sync)', () => {
+    mockMatchMedia(false);
+    renderProvider();
+    expect(screen.getByTestId('preference').textContent).toBe('system');
+    emitEvent('host-file-updated', { schemaVersion: 1, colorSchemePreference: 'dark' });
+    expect(document.documentElement.classList.contains('dark')).toBe(true);
+    expect(screen.getByTestId('preference').textContent).toBe('dark');
+  });
+
+  it('ignores events with an unknown preference', () => {
+    mockMatchMedia(false);
+    window.__KSTACK_HOST__ = { schemaVersion: 1, colorSchemePreference: 'dark' };
+    renderProvider();
+    emitEvent('host-file-updated', { schemaVersion: 1, colorSchemePreference: 'chartreuse' });
     expect(screen.getByTestId('preference').textContent).toBe('dark');
   });
 
   it('re-applies when the OS scheme flips while on system', () => {
     const setDark = mockMatchMedia(false);
-    render(
-      <ThemeProvider>
-        <Harness />
-      </ThemeProvider>,
-    );
-    // Starts on system + light OS → no dark class.
+    renderProvider();
     expect(document.documentElement.classList.contains('dark')).toBe(false);
-    // OS flips to dark → the subscribed provider re-applies.
     setDark(true);
     expect(document.documentElement.classList.contains('dark')).toBe(true);
   });
 
   it('ignores OS changes once an explicit choice is made', () => {
     const setDark = mockMatchMedia(false);
-    render(
-      <ThemeProvider>
-        <Harness />
-      </ThemeProvider>,
-    );
-    // Choose Dark explicitly, then flip the OS to light: the explicit choice wins.
+    renderProvider();
     act(() => screen.getByText('dark').click());
     setDark(false);
     expect(document.documentElement.classList.contains('dark')).toBe(true);

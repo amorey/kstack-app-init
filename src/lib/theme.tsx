@@ -31,47 +31,34 @@
 //      (`themes[scheme]`). The word "theme" is reserved for that skin; the first
 //      axis is named "(color) scheme" throughout so the two never collide.
 //
-// The preference persists in `localStorage`. The first paint must already carry the
-// right scheme (no light-to-dark flash, especially when opening a new window), so an
-// inline script in `index.html` applies the `.dark` class before the app bundle even
-// loads — see that script, which mirrors `readStoredPreference`/`resolveColorScheme`
-// here. This provider then owns reactive changes (and re-applies on mount) once React
-// is running.
+// The preference is one field of the host's `host.json`, its source of truth (see
+// `lib/host-file.ts`, which owns the boot/change/sync protocol). Reading it at boot
+// is synchronous, so the first paint already carries the right scheme — the inline
+// script in `index.html` hand-mirrors `resolveColorScheme` against the same injected
+// global, and the host paints the window's *native* background from the same file,
+// covering the frame before the webview renders.
 import type { ReactNode } from 'react';
 import { createContext, useContext, useEffect, useMemo, useState } from 'react';
+
+import { readInjectedHostFile, subscribeHostFile, updateHostFile } from '@/lib/host-file';
 
 // The user's choice (includes "system"); resolves to a concrete `ColorScheme`.
 export type ColorSchemePreference = 'system' | 'light' | 'dark';
 // The resolved color scheme actually painted.
 export type ColorScheme = 'light' | 'dark';
 
-// Reserve the `kstack:theme*` key space for the future per-scheme skin choice; the
-// color-scheme preference lives under its own key. Kept in sync by hand with the
-// inline pre-paint script in `index.html`.
-const STORAGE_KEY = 'kstack:color-scheme-preference';
 const DEFAULT_PREFERENCE: ColorSchemePreference = 'system';
 
 function isColorSchemePreference(value: unknown): value is ColorSchemePreference {
   return value === 'system' || value === 'light' || value === 'dark';
 }
 
-// The stored preference, or the default when unset/corrupt. localStorage can throw
-// (private mode, disabled storage), so read defensively.
-export function readStoredPreference(): ColorSchemePreference {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return isColorSchemePreference(raw) ? raw : DEFAULT_PREFERENCE;
-  } catch {
-    return DEFAULT_PREFERENCE;
-  }
-}
-
-function writeStoredPreference(preference: ColorSchemePreference): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, preference);
-  } catch {
-    // Persistence is best-effort; a failed write just doesn't survive restart.
-  }
+// The preference from the host-injected `host.json` snapshot, or the default
+// ("system", follow the OS) when the file is absent (plain-browser dev), the
+// setting is unset, or the value is unrecognized.
+export function readInjectedPreference(): ColorSchemePreference {
+  const value = readInjectedHostFile().colorSchemePreference;
+  return isColorSchemePreference(value) ? value : DEFAULT_PREFERENCE;
 }
 
 // The OS-level scheme, used to resolve the "system" preference.
@@ -104,7 +91,7 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 // selection will live here too (hence the "Theme" umbrella name, distinct from the
 // scheme it currently exposes).
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [preference, setPreferenceState] = useState<ColorSchemePreference>(() => readStoredPreference());
+  const [preference, setPreferenceState] = useState<ColorSchemePreference>(() => readInjectedPreference());
 
   // Re-apply whenever the preference changes, and — while it's "system" — whenever
   // the OS scheme flips underneath us. The media-query listener only exists for the
@@ -118,24 +105,26 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     return () => mql.removeEventListener('change', onChange);
   }, [preference]);
 
-  // Keep windows in step: several app windows share one localStorage origin, so a
-  // change in one should re-theme the others. `storage` fires only in *other*
-  // windows, so this never races the local setter.
-  useEffect(() => {
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== STORAGE_KEY) return;
-      setPreferenceState(readStoredPreference());
-    };
-    window.addEventListener('storage', onStorage);
-    return () => window.removeEventListener('storage', onStorage);
-  }, []);
+  // Track the source of truth: the host broadcasts the merged `host.json` after
+  // every write, so a change made in any window (this one included — redundant
+  // but idempotent) lands here. An unrecognized value is ignored rather than
+  // reset, so a newer host format can't yank the scheme out from under us.
+  useEffect(
+    () =>
+      subscribeHostFile((file) => {
+        const value = file.colorSchemePreference;
+        if (isColorSchemePreference(value)) setPreferenceState(value);
+      }),
+    [],
+  );
 
   const value = useMemo<ThemeContextValue>(
     () => ({
       preference,
       setPreference: (next) => {
-        writeStoredPreference(next);
+        // Optimistic: apply locally now, persist in the background.
         setPreferenceState(next);
+        updateHostFile({ colorSchemePreference: next });
       },
     }),
     [preference],

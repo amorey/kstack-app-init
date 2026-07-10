@@ -14,10 +14,27 @@
 
 //! Window lifecycle for the Tauri host.
 //!
-//! The `"main"` window is declared statically in `tauri.conf.json`, so Tauri
-//! creates it at startup. After that, [`WindowManager`] owns all window
-//! operations: recreating `"main"` if the user closed it, and creating
-//! additional windows with unique labels.
+//! Every window — including the first `"main"` window, created in `lib.rs`'s
+//! `setup` hook — is built in code by [`WindowManager`], so all window chrome
+//! lives in one place (`build_window`); `tauri.conf.json` declares no windows.
+//! Beyond creation, [`WindowManager`] recreates `"main"` if the user closed it
+//! and creates additional windows with unique labels.
+//!
+//! **Windows are visible from creation and painted with the app's color scheme
+//! at t0** — the native surface carries the resolved `--background` color (see
+//! [`background_color_for`]) before the webview has drawn anything, so the very
+//! first frame is themed. Nothing is deferred and the webview plays no part:
+//! there is no reveal command and no hidden-then-shown dance.
+//!
+//! What makes that work is `tauri/macos-private-api`, which enables
+//! `wry/transparent` and so clears `WKWebView`'s opaque white backing (the
+//! private `drawsBackground` key). Without it the webview paints white over the
+//! window background until its first frame — the launch flash — no matter what
+//! the native layer is set to. Because that backing is cleared, the *document*
+//! must be opaque: `index.css` paints `html` from the same `--background` token
+//! on the opaque platforms, and `index.html`'s inline script applies the color
+//! scheme before any page script runs, so the webview's first paint lands on
+//! the same color the native surface is already showing.
 //!
 //! Closing the last window does not exit the process (see `lib.rs`), so the
 //! main window may be absent while the app is still running — every entry point
@@ -25,11 +42,13 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tauri::window::Color;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::error::Result;
+use crate::host_file::{self, ColorSchemePreference};
 
-/// Label of the statically-declared primary window.
+/// Label of the primary window (created at startup by `lib.rs`'s `setup`).
 const MAIN_LABEL: &str = "main";
 
 /// Title shown on every window the host creates.
@@ -79,6 +98,51 @@ fn traffic_light_position(gap: f64, header_height: f64) -> (f64, f64) {
     (x, y)
 }
 
+/// The `--background` token color for each resolved scheme, as `@kubetail/ui`
+/// defines it (`color-white` / `color-zinc-950`) and `index.css` paints `html`
+/// with. Nothing pins these to that package's tokens — the values live in its
+/// shipped CSS, not in this repo — but the webview paints the exact token over
+/// this the moment it draws, so they only ever need to match to the eye.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+const LIGHT_BACKGROUND: Color = Color(255, 255, 255, 255);
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+const DARK_BACKGROUND: Color = Color(9, 9, 11, 255);
+
+/// The native window background for a persisted color-scheme preference.
+///
+/// This is what prevents the launch flash: it is the color on screen from the
+/// moment the window appears until the webview's first paint, and the color the
+/// native surface shows whenever it is visible on its own thereafter (chiefly
+/// live resize, where the OS stretches the window ahead of a repaint).
+///
+/// Always a concrete color, never "leave it to the OS". `WebviewWindowBuilder::
+/// background_color` drives *two* layers — the window and the webview — and wry
+/// only clears the webview's opaque white backing when a color is set. Passing
+/// nothing would restore the very flash this exists to prevent, so `system`
+/// resolves against `os_prefers_dark` (from `os_theme`) rather than opting out.
+/// The cost is that a scheme change while the app is closed is picked up at the
+/// next launch, which is exactly when this is read.
+///
+/// Only *called* on the opaque platforms ([`build_window`] skips it on
+/// transparent Linux), but compiled and unit-tested everywhere so the mapping
+/// stays covered on CI — same pattern as the traffic-light geometry above.
+///
+/// [`build_window`]: WindowManager::build_window
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn background_color_for(preference: Option<ColorSchemePreference>, os_prefers_dark: bool) -> Color {
+    let dark = match preference {
+        Some(ColorSchemePreference::Light) => false,
+        Some(ColorSchemePreference::Dark) => true,
+        // `system` — and a file that predates the setting — follow the OS.
+        Some(ColorSchemePreference::System) | None => os_prefers_dark,
+    };
+    if dark {
+        DARK_BACKGROUND
+    } else {
+        LIGHT_BACKGROUND
+    }
+}
+
 /// Owns window creation and focus for the host.
 #[derive(Default)]
 pub struct WindowManager {
@@ -101,7 +165,7 @@ impl WindowManager {
     /// title is the same [`WINDOW_TITLE`] for every window.
     pub fn new_window(&self, app: &AppHandle) -> Result<WebviewWindow> {
         let label = self.next_label();
-        self.build_window(app, &label, WINDOW_TITLE)
+        self.build_window(app, &label)
     }
 
     /// Produce the next unique window label (`window-1`, `window-2`, …).
@@ -113,36 +177,12 @@ impl WindowManager {
         format!("window-{id}")
     }
 
-    /// Apply platform title-bar chrome to the statically-declared `"main"`
-    /// window.
-    ///
-    /// Windows created via [`build_window`] get their chrome from the builder,
-    /// but Tauri builds the initial `"main"` window from the static config
-    /// before the setup hook runs. On macOS `tauri.macos.conf.json` gives it the
-    /// Overlay title bar + traffic-light position, which already match; the base
-    /// `tauri.conf.json` (Linux) and `tauri.windows.conf.json` (Windows) both
-    /// leave native decorations on, so they're dropped here to make the first
-    /// window frameless like the rest, letting the webview's own controls take
-    /// over.
-    ///
-    /// [`build_window`]: WindowManager::build_window
-    pub fn apply_main_window_chrome(&self, app: &AppHandle) -> Result<()> {
-        #[cfg(not(target_os = "macos"))]
-        if let Some(window) = app.get_webview_window(MAIN_LABEL) {
-            window.set_decorations(false)?;
-        }
-        // On macOS the static config carries the Overlay chrome — nothing to do.
-        #[cfg(target_os = "macos")]
-        let _ = app;
-        Ok(())
-    }
-
-    /// Reveal the main window: recreate it if the user closed it, unminimize it
+    /// Surface the main window: recreate it if the user closed it, unminimize it
     /// if minimized, then show and focus it.
     pub fn show_main_window(&self, app: &AppHandle) -> Result<()> {
         let window = match app.get_webview_window(MAIN_LABEL) {
             Some(window) => window,
-            None => self.build_window(app, MAIN_LABEL, WINDOW_TITLE)?,
+            None => self.build_window(app, MAIN_LABEL)?,
         };
 
         // A minimized window won't surface on show()/set_focus() alone.
@@ -167,9 +207,13 @@ impl WindowManager {
     /// Linux additionally makes the window transparent so the webview's
     /// `WindowFrame` can paint its own border + shadow into a gutter; Windows
     /// stays opaque and lets DWM draw the borderless window's native shadow.
-    fn build_window(&self, app: &AppHandle, label: &str, title: &str) -> Result<WebviewWindow> {
+    ///
+    /// On the opaque platforms the window is painted with the app's resolved
+    /// color scheme at creation (see [`background_color_for`]), so its first
+    /// frame is themed without ever being hidden.
+    fn build_window(&self, app: &AppHandle, label: &str) -> Result<WebviewWindow> {
         let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::default())
-            .title(title)
+            .title(WINDOW_TITLE)
             .inner_size(800.0, 600.0)
             // Floor the window so the layout never renders below its narrowest design.
             .min_inner_size(600.0, 400.0);
@@ -184,8 +228,7 @@ impl WindowManager {
         }
 
         // Both non-macOS platforms are frameless — the webview's sidebar is the
-        // title bar and draws its own `WindowControls` (mirrors the same
-        // `not(macos)` decision in `apply_main_window_chrome`).
+        // title bar and draws its own `WindowControls`.
         #[cfg(not(target_os = "macos"))]
         {
             builder = builder.decorations(false);
@@ -199,6 +242,35 @@ impl WindowManager {
         #[cfg(target_os = "linux")]
         {
             builder = builder.transparent(true);
+        }
+
+        // `host.json` (the persisted host settings, source of truth for the
+        // color-scheme preference) feeds the window's pre-paint state two ways.
+        // A failed config-dir lookup degrades to defaults rather than failing
+        // window creation — worst case is the one-frame flash this prevents.
+        let host_file = host_file::path(app)
+            .map(|path| host_file::read(&path))
+            .unwrap_or_default();
+
+        // 1. Expose the file to the webview (`window.__KSTACK_HOST__`) before
+        //    any page script runs, so the first-paint inline script in
+        //    `index.html` reads the preference synchronously from the same
+        //    source the native background below is painted from.
+        builder = builder.initialization_script(host_file::init_script(&host_file));
+
+        // 2. On the opaque platforms, paint the native surface with the resolved
+        //    scheme so the window is themed from its very first frame. This also
+        //    clears the webview's opaque white backing (see the module docs), so
+        //    it must be set unconditionally — `system` resolves against the OS
+        //    rather than opting out. Linux is transparent, so its background
+        //    must stay unset.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let color = background_color_for(
+                host_file.color_scheme_preference,
+                crate::os_theme::prefers_dark(),
+            );
+            builder = builder.background_color(color);
         }
 
         let window = builder.build()?;
@@ -215,10 +287,44 @@ impl WindowManager {
 
 #[cfg(test)]
 mod tests {
-    use super::WindowManager;
+    use super::{background_color_for, WindowManager};
+    use crate::host_file::ColorSchemePreference;
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn explicit_preference_ignores_the_os_scheme() {
+        // An explicit choice wins over the OS in both directions — that's what
+        // makes the app's scheme, not the OS's, the one on screen at t0.
+        for os_prefers_dark in [false, true] {
+            assert_eq!(
+                background_color_for(Some(ColorSchemePreference::Light), os_prefers_dark),
+                super::LIGHT_BACKGROUND
+            );
+            assert_eq!(
+                background_color_for(Some(ColorSchemePreference::Dark), os_prefers_dark),
+                super::DARK_BACKGROUND
+            );
+        }
+    }
+
+    #[test]
+    fn system_preference_follows_the_os_scheme() {
+        // `system`, and a file predating the setting, defer to the OS. Never
+        // `None`: wry only clears the webview's white backing when a color is
+        // set, so opting out here would reinstate the launch flash.
+        for preference in [Some(ColorSchemePreference::System), None] {
+            assert_eq!(
+                background_color_for(preference, true),
+                super::DARK_BACKGROUND
+            );
+            assert_eq!(
+                background_color_for(preference, false),
+                super::LIGHT_BACKGROUND
+            );
+        }
+    }
 
     #[test]
     fn labels_start_at_one() {
@@ -239,20 +345,18 @@ mod tests {
     }
 
     #[test]
-    fn config_traffic_light_position_matches_computed_value() {
-        // The statically-declared `main` window carries the traffic-light
-        // position as a JSON literal (baked in before Rust runs, so it can't
-        // read the constants). Pin the literal to the computed value so the two
-        // can't silently drift when the sidebar geometry is retuned. The
-        // literal lives in the macOS config overlay (traffic lights are
-        // macOS-only; the base config is the transparent Linux/Windows window).
-        let (x, y) = super::traffic_light_position(super::SIDEBAR_GAP, super::TITLE_BAR_HEIGHT);
+    fn config_declares_no_windows() {
+        // Every window is created in code (`build_window`) so the chrome — and
+        // the pre-paint background/init-script it will carry — is defined in
+        // exactly one place. A window declared in the config would bypass all
+        // of it, so pin the config to declaring none.
         let config: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.macos.conf.json"))
-                .expect("valid config JSON");
-        let pos = &config["app"]["windows"][0]["trafficLightPosition"];
-        assert_eq!(pos["x"].as_f64(), Some(x));
-        assert_eq!(pos["y"].as_f64(), Some(y));
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid config JSON");
+        assert_eq!(
+            config["app"]["windows"].as_array().map(Vec::len),
+            Some(0),
+            "windows must be created via build_window, not declared in tauri.conf.json"
+        );
     }
 
     #[test]

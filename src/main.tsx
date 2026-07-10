@@ -30,8 +30,9 @@ import 'unfonts.css';
 if (isLinux()) document.documentElement.classList.add('frameless');
 
 // The color scheme's `.dark` class is applied pre-paint by the inline script in
-// `index.html` (before this bundle loads, to avoid a white flash on new windows);
-// `ThemeProvider` re-applies it on mount and owns reactive changes thereafter.
+// `index.html`, reading the host-injected `window.__KSTACK_HOST__` (the contents
+// of host.json, the source of truth) before this bundle loads. `ThemeProvider`
+// re-applies it on mount and owns changes thereafter.
 
 const router = createRouter({ routeTree });
 
