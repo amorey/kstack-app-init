@@ -38,13 +38,13 @@ import { listen } from '@tauri-apps/api/event';
 // external input — each setting's module validates its own field, so a newer
 // host format can't yank a value out from under an older webview.
 export type HostFile = {
-  version?: number;
+  schemaVersion?: number;
   colorSchemePreference?: string;
 };
 
 // A partial update: only the fields present are written; the host merges the
 // rest. Mirrors the host's `HostFilePatch`.
-export type HostFilePatch = Partial<Omit<HostFile, 'version'>>;
+export type HostFilePatch = Partial<Omit<HostFile, 'schemaVersion'>>;
 
 declare global {
   interface Window {

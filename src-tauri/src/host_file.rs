@@ -39,8 +39,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
-/// Format version stamped into the file on every write, for future migrations.
-const CURRENT_VERSION: u32 = 1;
+/// Schema version stamped into the file on every write, for future migrations.
+const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 /// Event broadcast to every window after `host.json` changes, carrying the
 /// merged [`HostFile`] as its payload (same camelCase JSON as the file and the
@@ -72,7 +72,7 @@ pub enum ColorSchemePreference {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HostFile {
-    pub version: u32,
+    pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_scheme_preference: Option<ColorSchemePreference>,
 }
@@ -80,7 +80,7 @@ pub struct HostFile {
 impl Default for HostFile {
     fn default() -> Self {
         Self {
-            version: CURRENT_VERSION,
+            schema_version: CURRENT_SCHEMA_VERSION,
             color_scheme_preference: None,
         }
     }
@@ -106,7 +106,7 @@ pub fn read(path: &Path) -> HostFile {
         .unwrap_or_default()
 }
 
-/// Merge `patch` onto the current file contents, stamp [`CURRENT_VERSION`],
+/// Merge `patch` onto the current file contents, stamp [`CURRENT_SCHEMA_VERSION`],
 /// and persist. The write is atomic (unique temp file + rename) so concurrent
 /// writers — e.g. two windows saving settings — can't interleave into a torn
 /// file; last writer wins. Creates the parent directory if needed (the app
@@ -116,7 +116,7 @@ pub fn update(path: &Path, patch: HostFilePatch) -> std::io::Result<HostFile> {
     if let Some(preference) = patch.color_scheme_preference {
         file.color_scheme_preference = Some(preference);
     }
-    file.version = CURRENT_VERSION;
+    file.schema_version = CURRENT_SCHEMA_VERSION;
 
     let parent = path
         .parent()
@@ -174,7 +174,7 @@ mod tests {
     fn read_missing_file_returns_defaults() {
         let file = read(&temp_path());
         assert_eq!(file, HostFile::default());
-        assert_eq!(file.version, CURRENT_VERSION);
+        assert_eq!(file.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(file.color_scheme_preference, None);
     }
 
@@ -182,7 +182,11 @@ mod tests {
     fn read_parses_existing_file() {
         let path = temp_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, r#"{"version":1,"colorSchemePreference":"dark"}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"schemaVersion":1,"colorSchemePreference":"dark"}"#,
+        )
+        .unwrap();
         let file = read(&path);
         assert_eq!(
             file.color_scheme_preference,
@@ -238,10 +242,14 @@ mod tests {
     fn update_stamps_current_version() {
         let path = temp_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, r#"{"version":0,"colorSchemePreference":"light"}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"schemaVersion":0,"colorSchemePreference":"light"}"#,
+        )
+        .unwrap();
         let updated = update(&path, HostFilePatch::default()).unwrap();
-        assert_eq!(updated.version, CURRENT_VERSION);
-        assert_eq!(read(&path).version, CURRENT_VERSION);
+        assert_eq!(updated.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(read(&path).schema_version, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -257,12 +265,12 @@ mod tests {
     #[test]
     fn init_script_exposes_the_file_as_a_global() {
         let file = HostFile {
-            version: 1,
+            schema_version: 1,
             color_scheme_preference: Some(ColorSchemePreference::Dark),
         };
         assert_eq!(
             init_script(&file),
-            r#"window.__KSTACK_HOST__ = {"version":1,"colorSchemePreference":"dark"};"#
+            r#"window.__KSTACK_HOST__ = {"schemaVersion":1,"colorSchemePreference":"dark"};"#
         );
     }
 
@@ -273,7 +281,7 @@ mod tests {
         // the contract identical to the file on disk.
         assert_eq!(
             init_script(&HostFile::default()),
-            r#"window.__KSTACK_HOST__ = {"version":1};"#
+            r#"window.__KSTACK_HOST__ = {"schemaVersion":1};"#
         );
     }
 }
