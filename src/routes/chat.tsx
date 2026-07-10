@@ -116,6 +116,7 @@ function Chat() {
           onChange={(e) => setDraft(e.currentTarget.value)}
           placeholder="Message…"
           disabled={!!pending}
+          className="bg-sidebar"
         />
         <Button type="submit" disabled={!!pending || !draft.trim()}>
           Send
