@@ -32,8 +32,17 @@ pub async fn ready(state: State<'_, AppState>) -> Result<()> {
 /// "New Window" item and `Ctrl+N` shortcut on Linux/Windows; macOS drives the
 /// same action through its native menu (`app_menu.rs`). Delegates to the
 /// shared `WindowManager` so labeling/focus stay consistent.
+///
+/// **Deliberately `async`** so Tauri runs it on the async runtime rather than
+/// the main thread. Building a `WebviewWindow` blocks the calling thread until
+/// the webview is created, and on Windows the WebView2 controller is created
+/// asynchronously by the main-thread event loop — so building on the main
+/// thread deadlocks (the loop can't pump while it's blocked in `build()`),
+/// leaving a blank window and freezing the whole app. Off the main thread the
+/// loop stays free to pump and the window materializes. (macOS/WKWebView needs
+/// no such pump, but async is harmless there.)
 #[tauri::command]
-pub fn new_window(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+pub async fn new_window(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
     state.window_manager.new_window(&app)?;
     Ok(())
 }

@@ -162,12 +162,17 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            let state = app.state::<AppState>();
-
-            // Bring the main window forward or create it if it was closed
-            if let Err(err) = state.window_manager.show_main_window(app) {
-                tracing::error!(%err, "failed to show main window on second-instance launch")
-            }
+            // Bring the main window forward or create it if it was closed.
+            // Spawn off the main thread: this callback runs on it, and a
+            // main-thread WebView2 build deadlocks on Windows (see
+            // `commands::new_window`) — recreating the closed window here
+            // would otherwise freeze the app.
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = app.state::<AppState>().window_manager.show_main_window(&app) {
+                    tracing::error!(%err, "failed to show main window on second-instance launch")
+                }
+            });
         }));
     }
 
