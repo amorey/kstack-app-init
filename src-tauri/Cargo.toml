@@ -48,7 +48,13 @@ tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 debug-prod = ["tauri/devtools"]
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# `macos-private-api` turns on `wry/transparent`, which clears `WKWebView`'s
+# opaque white backing (the private `drawsBackground` KVC key). Without it the
+# webview paints white over the window's `background_color` until its first
+# frame, i.e. the launch flash. We don't ship through the Mac App Store, so the
+# private-API prohibition doesn't apply — see this crate's `CLAUDE.md`. Mirrored
+# by `app.macOSPrivateApi` in `tauri.conf.json`, which the Tauri CLI reads.
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -113,6 +119,9 @@ objc2-foundation = { version = "0.3", features = [
   # Notification-center types used to observe NSWorkspace's wake notification
   # (see wake/macos.rs).
   "NSNotification",
+  # Reads the global-domain `AppleInterfaceStyle` to resolve the `system`
+  # color-scheme preference before the first window exists (see os_theme.rs).
+  "NSUserDefaults",
 ] }
 objc2-app-kit = { version = "0.3", features = [
   "NSApplication",
@@ -161,5 +170,8 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Power",
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",
+  # os_theme.rs: reads HKCU's `AppsUseLightTheme` to resolve the `system`
+  # color-scheme preference before the first window exists.
+  "Win32_System_Registry",
 ] }
 

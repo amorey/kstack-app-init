@@ -6,19 +6,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>kstack</title>
     <script>
-      // Apply the persisted color scheme before the app bundle (a deferred module)
-      // loads, so a freshly opened window paints its themed background on the first
-      // frame instead of flashing white. This must run ahead of any module, so it
-      // can't import — it hand-mirrors readStoredPreference/resolveColorScheme in
-      // src/lib/theme.tsx (key + resolution kept in sync by hand). Unknown/absent
-      // values fall back to "system" (follow the OS), matching that module.
+      // Apply the color-scheme preference before the app bundle (a deferred
+      // module) loads, so the window paints its themed background on the first
+      // frame instead of flashing. The preference comes from
+      // `window.__KSTACK_HOST__` — the host injects the contents of host.json
+      // (the source of truth) into every window ahead of any page script (see
+      // src-tauri/src/host_file.rs::init_script). This must run before the
+      // bundle, so it can't import — it hand-mirrors resolveColorScheme in
+      // src/lib/theme.tsx. An absent global (plain-browser dev) or unset
+      // preference falls back to "system" (follow the OS), matching that module.
       (function () {
         try {
-          var pref = localStorage.getItem('kstack:color-scheme-preference');
+          var pref = (window.__KSTACK_HOST__ || {}).colorSchemePreference;
           var dark = pref === 'dark' || (pref !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
           document.documentElement.classList.toggle('dark', dark);
         } catch (e) {
-          /* localStorage/matchMedia unavailable — leave the default (light). */
+          /* matchMedia unavailable — leave the default (light). */
         }
       })();
     </script>

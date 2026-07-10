@@ -86,6 +86,36 @@ export function restoreUserAgent() {
   setUserAgent(originalUserAgent);
 }
 
+// Shared fake for '@tauri-apps/api/event' — captures `listen` registrations and
+// lets a test fire an event to them (wrapped in `act`). Usage mirrors
+// `mockTauriCore`:
+//
+//   const { emitEvent, factory } = mockTauriEvent();
+//   vi.mock('@tauri-apps/api/event', () => factory());
+//   ...
+//   emitEvent('host-file-updated', { colorSchemePreference: 'dark' });
+export function mockTauriEvent() {
+  const listeners = new Map<string, Set<(event: { payload: unknown }) => void>>();
+  return {
+    emitEvent: (name: string, payload: unknown) => {
+      act(() => {
+        listeners.get(name)?.forEach((cb) => cb({ payload }));
+      });
+    },
+    factory: () => ({
+      listen: (name: string, cb: (event: { payload: unknown }) => void) => {
+        let set = listeners.get(name);
+        if (!set) {
+          set = new Set();
+          listeners.set(name, set);
+        }
+        set.add(cb);
+        return Promise.resolve(() => listeners.get(name)?.delete(cb));
+      },
+    }),
+  };
+}
+
 // Installs a controllable `window.matchMedia` whose `matches` can be flipped,
 // firing a `change` event (wrapped in `act`) to registered listeners exactly like
 // the browser. Returns a `setMatches(next)` to drive media-query crossings — used

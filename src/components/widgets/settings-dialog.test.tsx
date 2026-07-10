@@ -12,19 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { act, render, screen } from '@testing-library/react';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { act, render, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { SettingsDialog } from '@/components/widgets/settings-dialog';
-import { ThemeProvider } from '@/lib/theme';
+import { mockTauriCore } from '@/test-utils';
+
+const { invokeMock, factory } = mockTauriCore();
+vi.mock('@tauri-apps/api/core', () => factory());
+
+const { ThemeProvider } = await import('@/lib/theme');
+const { SettingsDialog } = await import('@/components/widgets/settings-dialog');
 
 beforeEach(() => {
-  localStorage.clear();
   document.documentElement.classList.remove('dark');
+  invokeMock.mockReset();
+  invokeMock.mockResolvedValue(undefined);
 });
 
 describe('SettingsDialog', () => {
-  it('drives the theme through the appearance picker', () => {
+  it('drives the theme through the appearance picker', async () => {
     render(
       <ThemeProvider>
         <SettingsDialog open onOpenChange={() => {}} />
@@ -36,9 +42,11 @@ describe('SettingsDialog', () => {
     expect(screen.getByRole('tab', { name: 'System' })).toBeInTheDocument();
     expect(screen.getByRole('tab', { name: 'Light' })).toBeInTheDocument();
 
-    // Picking Dark applies the scheme and persists it.
+    // Picking Dark applies the scheme and persists it through the host.
     act(() => dark.click());
     expect(document.documentElement.classList.contains('dark')).toBe(true);
-    expect(localStorage.getItem('kstack:color-scheme-preference')).toBe('dark');
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('update_host_file', { patch: { colorSchemePreference: 'dark' } }),
+    );
   });
 });

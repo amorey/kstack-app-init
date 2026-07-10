@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use tauri::ipc::Channel;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::error::Result;
+use crate::host_file::{self, HostFile, HostFilePatch};
 use crate::services::sidecar::GraphqlResponse;
 use crate::state::AppState;
 
@@ -45,6 +46,21 @@ pub async fn ready(state: State<'_, AppState>) -> Result<()> {
 pub async fn new_window(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
     state.window_manager.new_window(&app)?;
     Ok(())
+}
+
+/// Applies a partial update to `host.json`, the host's persisted settings
+/// file and the source of truth for what it holds (see the `host_file`
+/// module). Deliberately general — the webview sends just the fields it wants
+/// to change (e.g. `{ colorSchemePreference: "dark" }`); adding a
+/// host-persisted setting extends `HostFilePatch` rather than adding a
+/// command. On success the merged file is broadcast to every window as a
+/// `host_file::UPDATED_EVENT` — that push is how all open windows (including
+/// the caller's) track the file live — and returned to the caller directly.
+#[tauri::command]
+pub fn update_host_file(app: AppHandle, patch: HostFilePatch) -> Result<HostFile> {
+    let file = host_file::update(&host_file::path(&app)?, patch)?;
+    app.emit(host_file::UPDATED_EVENT, &file)?;
+    Ok(file)
 }
 
 /// Quits the app. Routes through [`AppHandle::exit`] — the same
