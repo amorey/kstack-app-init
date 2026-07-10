@@ -16,13 +16,23 @@
 // it just wraps its children (chat, dashboard) in `AppLayout` so they share the
 // sidebar. Secondary windows (log tail, exec) will nest under their own
 // sidebar-less layout route instead.
-import { createRoute } from '@tanstack/react-router';
+//
+// It also owns the `kubeContext` search param: the window's active kubeconfig
+// context (see `@/lib/active-context`). `retainSearchParams` carries it across
+// the chat<->dashboard navigation, so the choice is shared by both modes and
+// stays deep-linkable, without any provider.
+import { createRoute, retainSearchParams } from '@tanstack/react-router';
 
 import { AppLayout } from '@/layouts/app-layout';
 import { Route as rootRoute } from '@/routes/__root';
 
+type AppSearch = { kubeContext?: string };
+
 export const Route = createRoute({
   getParentRoute: () => rootRoute,
   id: 'app',
+  validateSearch: (search: Record<string, unknown>): AppSearch =>
+    typeof search.kubeContext === 'string' ? { kubeContext: search.kubeContext } : {},
+  search: { middlewares: [retainSearchParams(['kubeContext'])] },
   component: AppLayout,
 });

@@ -12,25 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Picker for the active kubeconfig context, shown in the chat area. Reads contexts and
-// currentContext off the `kubeConfigWatch` snapshot. Local selection
-// state for now — no setKubeContext mutation exists yet, so changes are
-// renderer-only. Wire to a mutation when the sidecar exposes one.
-import { useState } from 'react';
-
+// Picker for the window's active kubeconfig context. It's a thin control over
+// `useActiveContext`: the resolved context drives the value and picking one
+// writes it to the `kubeContext` URL param, so the choice is shared across chat
+// and dashboard (see `@/lib/active-context`). Selection is a frontend view-scope
+// only — it doesn't rewrite the kubeconfig's current-context.
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@kubetail/ui/elements/select';
 
-import { useKubeConfig } from '@/lib/kube-config';
+import { useActiveContext } from '@/lib/active-context';
 
 export function KubeContextPicker() {
-  const { kubeConfig } = useKubeConfig();
-  // null = user hasn't picked yet; render-time fallback below follows the
-  // watcher's currentContext until they do. Once they pick, their choice
-  // sticks until they pick again.
-  const [selected, setSelected] = useState<string | null>(null);
-
-  const contexts = kubeConfig?.contexts ?? [];
-  const value = selected ?? kubeConfig?.currentContext ?? '';
+  const { context, contexts, setContext } = useActiveContext();
 
   if (contexts.length === 0) {
     return (
@@ -41,7 +33,7 @@ export function KubeContextPicker() {
   }
 
   return (
-    <Select value={value} onValueChange={(v) => setSelected(v)}>
+    <Select value={context} onValueChange={(v) => v !== null && setContext(v)}>
       <SelectTrigger size="sm" className="min-w-[10rem]">
         <SelectValue placeholder="Select context" />
       </SelectTrigger>

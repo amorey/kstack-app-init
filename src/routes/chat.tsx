@@ -21,7 +21,6 @@ import { Input } from '@kubetail/ui/elements/input';
 
 import { graphql } from '@/gql';
 import { CenteredColumn } from '@/components/widgets/centered-column';
-import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 import { Route as appRoute } from '@/routes/_app';
 
 export const Route = createRoute({
@@ -92,9 +91,6 @@ function Chat() {
 
   return (
     <CenteredColumn>
-      <div className="flex items-center">
-        <KubeContextPicker />
-      </div>
       <div className="flex-1 space-y-3 overflow-y-auto">
         {messages.length === 0 && !pending && <p className="text-sm text-muted-foreground">Say hi to start a chat.</p>}
         {messages.map((m) => (
