@@ -171,10 +171,15 @@ pub fn run() {
             // Spawn off the main thread: this callback runs on it, and a
             // main-thread WebView2 build deadlocks on Windows (see
             // `commands::new_window`) — recreating the closed window here
-            // would otherwise freeze the app.
+            // would otherwise freeze the app. The blocking pool, not an async
+            // worker: the build parks its thread until the window exists.
             let app = app.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(err) = app.state::<AppState>().window_manager.show_main_window(&app) {
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(err) = app
+                    .state::<AppState>()
+                    .window_manager
+                    .show_main_window(&app)
+                {
                     tracing::error!(%err, "failed to show main window on second-instance launch")
                 }
             });

@@ -130,11 +130,13 @@ pub fn build_tray(app: &AppHandle) -> Result<()> {
             match id {
                 // Build off the main thread: a main-thread WebView2 build
                 // deadlocks on Windows (see `commands::new_window`). The tray
-                // menu event fires on the main thread, so spawn the build onto
-                // the async runtime and let the event loop stay free to pump.
+                // menu event fires on the main thread, so hand the build to the
+                // blocking pool — `build()` parks its thread until the window
+                // exists, so it must not sit on an async worker — and let the
+                // event loop stay free to pump.
                 "tray_new_window" => {
                     let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
+                    tauri::async_runtime::spawn_blocking(move || {
                         if let Err(err) = app.state::<AppState>().window_manager.new_window(&app) {
                             tracing::error!(%err, "failed to open window from tray");
                         }
@@ -142,9 +144,11 @@ pub fn build_tray(app: &AppHandle) -> Result<()> {
                 }
                 "tray_show_main" => {
                     let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(err) =
-                            app.state::<AppState>().window_manager.show_main_window(&app)
+                    tauri::async_runtime::spawn_blocking(move || {
+                        if let Err(err) = app
+                            .state::<AppState>()
+                            .window_manager
+                            .show_main_window(&app)
                         {
                             tracing::error!(%err, "failed to show main window");
                         }
