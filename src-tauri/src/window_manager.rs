@@ -18,7 +18,9 @@
 //! `setup` hook — is built in code by [`WindowManager`], so all window chrome
 //! lives in one place (`build_window`); `tauri.conf.json` declares no windows.
 //! Beyond creation, [`WindowManager`] recreates `"main"` if the user closed it
-//! and creates additional windows with unique labels.
+//! and creates additional windows with unique labels, cascading each one
+//! down-right of the window it was opened from (see [`cascade_position`]) so
+//! they never open exactly on top of one another.
 //!
 //! **Windows are visible from creation and painted with the app's color scheme
 //! at t0** — the native surface carries the resolved `--background` color (see
@@ -41,8 +43,9 @@
 //! here is written to recreate it on demand.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
-use tauri::window::Color;
+use tauri::window::{Color, Monitor};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::error::Result;
@@ -53,6 +56,10 @@ const MAIN_LABEL: &str = "main";
 
 /// Title shown on every window the host creates.
 const WINDOW_TITLE: &str = "kstack";
+
+/// Logical size every window opens at.
+const WINDOW_WIDTH: f64 = 800.0;
+const WINDOW_HEIGHT: f64 = 600.0;
 
 // The traffic-light geometry below is only *used* on macOS (via `build_window`),
 // but is compiled and unit-tested on every platform — only the native builder
@@ -143,6 +150,70 @@ fn background_color_for(preference: Option<ColorSchemePreference>, os_prefers_da
     }
 }
 
+/// Logical-pixel step between a window and the one it cascades from, down and
+/// to the right — roughly a title bar's worth, so the window beneath stays
+/// grabbable.
+const CASCADE_STEP: f64 = 28.0;
+
+/// Logical `(x, y)` for a new window of size `window`, cascading off `anchor`
+/// (the position of the window it opens from) within `work_area` — the monitor
+/// minus its taskbar / dock / menu bar, as `(x, y, width, height)` logical px.
+///
+/// The new window sits one [`CASCADE_STEP`] down-right of the anchor, so a run
+/// of New Windows walks diagonally from wherever the user last had one, even if
+/// they dragged it. With no anchor — the first window of the session — it
+/// centers.
+///
+/// The step is taken only if the result still fits entirely inside the work
+/// area; otherwise the cascade restarts from the centered position. That single
+/// fit check is what bounds the walk (no step cap needed) and it also absorbs a
+/// pathological anchor: a window the user dragged mostly off-screen, or onto
+/// another monitor, can't drag the new window off with it.
+///
+/// A window larger than the work area pins to its top-left corner and never
+/// steps — nowhere to cascade into.
+fn cascade_position(
+    anchor: Option<(f64, f64)>,
+    window: (f64, f64),
+    work_area: (f64, f64, f64, f64),
+) -> (f64, f64) {
+    let (win_w, win_h) = window;
+    let (area_x, area_y, area_w, area_h) = work_area;
+
+    // Center, but never above/left of the work area's origin — an oversized
+    // window would otherwise be centered into negative coordinates, hiding its
+    // title bar (and with it the traffic lights / custom window controls).
+    let centered = (
+        area_x + ((area_w - win_w) / 2.0).max(0.0),
+        area_y + ((area_h - win_h) / 2.0).max(0.0),
+    );
+
+    let Some((anchor_x, anchor_y)) = anchor else {
+        return centered;
+    };
+
+    let (x, y) = (anchor_x + CASCADE_STEP, anchor_y + CASCADE_STEP);
+    let fits =
+        x >= area_x && y >= area_y && x + win_w <= area_x + area_w && y + win_h <= area_y + area_h;
+
+    if fits {
+        (x, y)
+    } else {
+        centered
+    }
+}
+
+/// A monitor's work area — the screen minus its taskbar / dock / menu bar — as
+/// logical `(x, y, width, height)`, which is what [`cascade_position`] measures
+/// against. Tauri only exposes it in physical pixels.
+fn logical_work_area(monitor: &Monitor) -> (f64, f64, f64, f64) {
+    let scale = monitor.scale_factor();
+    let area = monitor.work_area();
+    let position = area.position.to_logical::<f64>(scale);
+    let size = area.size.to_logical::<f64>(scale);
+    (position.x, position.y, size.width, size.height)
+}
+
 /// Owns window creation and focus for the host.
 #[derive(Default)]
 pub struct WindowManager {
@@ -151,6 +222,15 @@ pub struct WindowManager {
     ///
     /// [`new_window`]: WindowManager::new_window
     next_id: AtomicU64,
+
+    /// Label of the most recently built window, the cascade's fallback anchor
+    /// when no window is focused — the tray and Dock menus can both open one
+    /// while another app holds focus (see [`anchor_window`]). Holds a label
+    /// rather than a `WebviewWindow` so a closed window drops normally and is
+    /// simply not found on the next lookup.
+    ///
+    /// [`anchor_window`]: WindowManager::anchor_window
+    last_built: Mutex<Option<String>>,
 }
 
 impl WindowManager {
@@ -175,6 +255,33 @@ impl WindowManager {
     fn next_label(&self) -> String {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         format!("window-{id}")
+    }
+
+    /// The window a new one should cascade off: the focused window, else the
+    /// last one built if it is still open.
+    ///
+    /// Focus is the right anchor for the common paths — the app menu's New
+    /// Window, `Cmd/Ctrl+N`, the webview's `AppMenu` — since the user is
+    /// looking at that window when they ask for another. The tray and Dock
+    /// menus are the case focus can't answer: both can be clicked while the app
+    /// has windows open but another application holds focus entirely, so fall
+    /// back to the last window built rather than centering a new one on top of
+    /// an existing one.
+    ///
+    /// `None` only when the app has no open windows at all, i.e. the first
+    /// window of the session.
+    fn anchor_window(&self, app: &AppHandle) -> Option<WebviewWindow> {
+        let focused = app
+            .webview_windows()
+            .into_values()
+            .find(|window| window.is_focused().unwrap_or(false));
+
+        focused.or_else(|| {
+            let last_built = self.last_built.lock().unwrap_or_else(|p| p.into_inner());
+            last_built
+                .as_deref()
+                .and_then(|label| app.get_webview_window(label))
+        })
     }
 
     /// Surface the main window: recreate it if the user closed it, unminimize it
@@ -211,12 +318,53 @@ impl WindowManager {
     /// On the opaque platforms the window is painted with the app's resolved
     /// color scheme at creation (see [`background_color_for`]), so its first
     /// frame is themed without ever being hidden.
+    ///
+    /// The window cascades one step down-right of the window it opens from (see
+    /// [`anchor_window`] and [`cascade_position`]) instead of stacking exactly
+    /// on it. The position is set on every platform: leaving it to the OS
+    /// staggers on macOS (AppKit cascades an unpositioned window) but piles up
+    /// on Linux/Windows.
+    ///
+    /// [`anchor_window`]: WindowManager::anchor_window
     fn build_window(&self, app: &AppHandle, label: &str) -> Result<WebviewWindow> {
         let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::default())
             .title(WINDOW_TITLE)
-            .inner_size(800.0, 600.0)
+            .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
             // Floor the window so the layout never renders below its narrowest design.
             .min_inner_size(600.0, 400.0);
+
+        // Cascade off the window the user is working in, measured on that
+        // window's own monitor. The two are resolved together: an anchor whose
+        // monitor can't be read is no anchor at all, rather than one measured
+        // against some other display. Anything unreadable here (a window
+        // closing as we measure it) degrades to a centered window, never to a
+        // failed build. `Monitor::scale_factor` is a cached field, so reusing
+        // it to convert the anchor's physical position costs no extra hop to
+        // the main thread.
+        let anchored = self.anchor_window(app).and_then(|window| {
+            let monitor = window.current_monitor().ok().flatten()?;
+            let position = window
+                .outer_position()
+                .ok()?
+                .to_logical::<f64>(monitor.scale_factor());
+            Some((monitor, (position.x, position.y)))
+        });
+
+        let (monitor, anchor_position) = match anchored {
+            Some((monitor, position)) => (Some(monitor), Some(position)),
+            // The session's first window, or an anchor that vanished mid-build.
+            None => (app.primary_monitor().ok().flatten(), None),
+        };
+
+        // No monitor to measure against (headless, or a display unplugged
+        // mid-call) — let the OS place the window rather than guess at
+        // coordinates that may be off-screen.
+        if let Some(monitor) = monitor {
+            let work_area = logical_work_area(&monitor);
+            let (x, y) =
+                cascade_position(anchor_position, (WINDOW_WIDTH, WINDOW_HEIGHT), work_area);
+            builder = builder.position(x, y);
+        }
 
         #[cfg(target_os = "macos")]
         {
@@ -275,6 +423,10 @@ impl WindowManager {
 
         let window = builder.build()?;
 
+        // Anchor the next cascade step here, for the paths where no window is
+        // focused when it is asked for (the tray's New Window).
+        *self.last_built.lock().unwrap_or_else(|p| p.into_inner()) = Some(label.to_string());
+
         // The `debug-prod` feature compiles the inspector into a release build
         // so production behavior (e.g. the bundled CSP) can be examined. Never
         // enabled in shipped builds — see the feature note in `Cargo.toml`.
@@ -287,7 +439,7 @@ impl WindowManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{background_color_for, WindowManager};
+    use super::{background_color_for, cascade_position, WindowManager};
     use crate::host_file::ColorSchemePreference;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -400,5 +552,108 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), THREADS * PER_THREAD);
+    }
+
+    // A roomy 1920x1080 work area at the origin, and the size every window
+    // opens at — the common case the cascade is tuned for.
+    const WINDOW: (f64, f64) = (super::WINDOW_WIDTH, super::WINDOW_HEIGHT);
+    const ROOMY: (f64, f64, f64, f64) = (0.0, 0.0, 1920.0, 1080.0);
+    const STEP: f64 = super::CASCADE_STEP;
+
+    #[test]
+    fn the_first_window_of_the_session_is_centered() {
+        // Nothing to cascade off, so the app opens where the user expects
+        // rather than pre-offset toward one corner.
+        assert_eq!(cascade_position(None, WINDOW, ROOMY), (560.0, 240.0));
+    }
+
+    #[test]
+    fn a_window_opens_one_step_down_right_of_its_anchor() {
+        // The whole point: cascade off wherever the anchor actually is — including
+        // somewhere the user dragged it, nowhere near the centered position — and
+        // not off a position derived from how many windows have been opened.
+        for anchor in [
+            (100.0, 80.0),
+            (12.0, 400.0),
+            cascade_position(None, WINDOW, ROOMY),
+        ] {
+            assert_eq!(
+                cascade_position(Some(anchor), WINDOW, ROOMY),
+                (anchor.0 + STEP, anchor.1 + STEP)
+            );
+        }
+    }
+
+    #[test]
+    fn the_cascade_restarts_from_the_center_when_the_next_step_would_not_fit() {
+        // An anchor flush against the work area's bottom-right corner: stepping
+        // again would hang the window off-screen, so wrap to the center.
+        let centered = cascade_position(None, WINDOW, ROOMY);
+        let corner = (1920.0 - WINDOW.0, 1080.0 - WINDOW.1);
+        assert_eq!(cascade_position(Some(corner), WINDOW, ROOMY), centered);
+    }
+
+    #[test]
+    fn an_anchor_dragged_off_screen_cannot_drag_the_new_window_with_it() {
+        // A window mostly off the right edge, or on a monitor we are not
+        // measuring against: the step does not fit, so the new window lands
+        // centered and visible instead of following it into the void.
+        let centered = cascade_position(None, WINDOW, ROOMY);
+        for anchor in [(1900.0, 40.0), (-780.0, 40.0), (3000.0, 3000.0)] {
+            assert_eq!(cascade_position(Some(anchor), WINDOW, ROOMY), centered);
+        }
+    }
+
+    #[test]
+    fn a_chain_of_cascades_never_leaves_the_work_area() {
+        // The invariant the function exists for, exercised the way the app uses
+        // it: each window anchors on the one before it, for many windows, on
+        // several monitor shapes — including one too short to step even once.
+        for area in [
+            ROOMY,
+            (0.0, 0.0, 1024.0, 700.0),
+            (100.0, 50.0, 1280.0, 800.0),
+            // 640px tall leaves 20px below the centered window — less than one
+            // step, so this wraps on every single window.
+            (0.0, 0.0, 1920.0, 640.0),
+        ] {
+            let (area_x, area_y, area_w, area_h) = area;
+            let mut anchor = None;
+            for window in 0..32 {
+                let (x, y) = cascade_position(anchor, WINDOW, area);
+                assert!(
+                    x >= area_x && y >= area_y,
+                    "window {window} at ({x}, {y}) starts before {area:?}"
+                );
+                assert!(
+                    x + WINDOW.0 <= area_x + area_w && y + WINDOW.1 <= area_y + area_h,
+                    "window {window} at ({x}, {y}) overflows {area:?}"
+                );
+                anchor = Some((x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_larger_than_the_work_area_pins_to_the_origin() {
+        // Nowhere to cascade into, and centering would push the title bar (with
+        // the traffic lights / window controls) off the top-left of the screen.
+        let tiny = (0.0, 0.0, 640.0, 480.0);
+        assert_eq!(cascade_position(None, WINDOW, tiny), (0.0, 0.0));
+        assert_eq!(cascade_position(Some((0.0, 0.0)), WINDOW, tiny), (0.0, 0.0));
+    }
+
+    #[test]
+    fn the_cascade_is_relative_to_the_work_areas_origin() {
+        // A second monitor to the right of the primary, with a 30px menu bar:
+        // positions are absolute in the virtual desktop, so the work area's
+        // origin must carry through instead of being dropped.
+        let secondary = (1920.0, 30.0, 1920.0, 1050.0);
+        let centered = cascade_position(None, WINDOW, secondary);
+        assert_eq!(centered, (2480.0, 255.0));
+        assert_eq!(
+            cascade_position(Some(centered), WINDOW, secondary),
+            (2480.0 + STEP, 255.0 + STEP)
+        );
     }
 }
