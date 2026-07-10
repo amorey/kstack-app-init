@@ -10,17 +10,8 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "kstack-app",
-        "width": 800,
-        "height": 600,
-        "minWidth": 600,
-        "minHeight": 400,
-        "transparent": true
-      }
-    ],
+    "windows": [],
+    "macOSPrivateApi": true,
     "security": {
       "csp": {
         "default-src": "'self'",

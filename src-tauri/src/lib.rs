@@ -41,6 +41,11 @@ mod commands;
 #[cfg(target_os = "macos")]
 mod dock_menu;
 mod error;
+mod host_file;
+// Only the opaque platforms paint a native window background; Linux is
+// transparent (see `window_manager`), so it never queries the OS scheme.
+#[cfg(not(target_os = "linux"))]
+mod os_theme;
 mod services;
 mod state;
 mod tray;
@@ -181,6 +186,7 @@ pub fn run() {
             commands::graphql_subscribe,
             commands::graphql_unsubscribe,
             commands::new_window,
+            commands::update_host_file,
             commands::quit,
         ])
         .setup(|app| {
@@ -188,10 +194,14 @@ pub fn run() {
             let sidecar = SidecarService::spawn(app.handle())?;
             let window_manager = WindowManager::new();
 
-            // The floating sidebar is the window's title bar; drop native
-            // decorations on Linux/Windows so the webview draws its own chrome
-            // (macOS keeps its Overlay title bar from tauri.macos.conf.json).
-            window_manager.apply_main_window_chrome(app.handle())?;
+            // Create the main window. All windows are built in code —
+            // `tauri.conf.json` declares none — so `build_window` is the single
+            // place that defines window chrome (per-platform title bar,
+            // transparency) and the pre-paint state read from `host.json`. It
+            // is visible from creation, its native background already painted
+            // with the resolved color scheme, so its first frame is themed and
+            // nothing has to reveal it.
+            window_manager.show_main_window(app.handle())?;
 
             app.manage(AppState {
                 sidecar,
