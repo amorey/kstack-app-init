@@ -22,6 +22,7 @@
 // real sidebar, the shell overrides the click via `onClick` so it dismisses the
 // peeked popup instead.
 import { PanelLeft } from 'lucide-react';
+import { Button } from '@kubetail/ui/elements/button';
 import { useSidebar } from '@kubetail/ui/elements/sidebar';
 
 type SidebarToggleProps = {
@@ -34,15 +35,16 @@ type SidebarToggleProps = {
 export function SidebarToggle({ onHoverStart, onHoverEnd, onClick }: SidebarToggleProps = {}) {
   const { toggleSidebar } = useSidebar();
   return (
-    <button
-      type="button"
+    <Button
+      variant="ghost"
+      size="icon-sm"
       aria-label="Toggle sidebar"
       onClick={onClick ?? toggleSidebar}
       onMouseEnter={onHoverStart}
       onMouseLeave={onHoverEnd}
-      className="flex h-7 w-7 shrink-0 self-center items-center justify-center rounded text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      className="shrink-0 self-center text-muted-foreground"
     >
       <PanelLeft className="h-4 w-4" aria-hidden />
-    </button>
+    </Button>
   );
 }

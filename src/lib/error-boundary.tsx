@@ -22,6 +22,8 @@
 
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 
+import { Button } from '@kubetail/ui/elements/button';
+
 import { reportError } from '@/lib/error-bus';
 
 type Props = { children: ReactNode };
@@ -57,13 +59,7 @@ export class ErrorBoundary extends Component<Props, State> {
           <pre className="whitespace-pre-wrap rounded bg-muted p-3 text-left text-xs text-muted-foreground">
             {error.message}
           </pre>
-          <button
-            type="button"
-            className="rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
-            onClick={() => window.location.reload()}
-          >
-            Reload window
-          </button>
+          <Button onClick={() => window.location.reload()}>Reload window</Button>
         </div>
       </div>
     );
