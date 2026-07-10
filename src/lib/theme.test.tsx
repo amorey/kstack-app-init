@@ -35,7 +35,7 @@ beforeEach(() => {
 
 describe('readInjectedPreference', () => {
   it('reads the host-injected preference', () => {
-    window.__KSTACK_HOST__ = { version: 1, colorSchemePreference: 'dark' };
+    window.__KSTACK_HOST__ = { schemaVersion: 1, colorSchemePreference: 'dark' };
     expect(readInjectedPreference()).toBe('dark');
   });
 
@@ -44,7 +44,7 @@ describe('readInjectedPreference', () => {
   });
 
   it('defaults to system for an unknown value', () => {
-    window.__KSTACK_HOST__ = { version: 1, colorSchemePreference: 'chartreuse' };
+    window.__KSTACK_HOST__ = { schemaVersion: 1, colorSchemePreference: 'chartreuse' };
     expect(readInjectedPreference()).toBe('system');
   });
 });
@@ -93,7 +93,7 @@ function renderProvider() {
 describe('ThemeProvider', () => {
   it('initializes from the host-injected preference', () => {
     mockMatchMedia(false);
-    window.__KSTACK_HOST__ = { version: 1, colorSchemePreference: 'dark' };
+    window.__KSTACK_HOST__ = { schemaVersion: 1, colorSchemePreference: 'dark' };
     renderProvider();
     expect(document.documentElement.classList.contains('dark')).toBe(true);
     expect(screen.getByTestId('preference').textContent).toBe('dark');
@@ -114,16 +114,16 @@ describe('ThemeProvider', () => {
     mockMatchMedia(false);
     renderProvider();
     expect(screen.getByTestId('preference').textContent).toBe('system');
-    emitEvent('host-file-updated', { version: 1, colorSchemePreference: 'dark' });
+    emitEvent('host-file-updated', { schemaVersion: 1, colorSchemePreference: 'dark' });
     expect(document.documentElement.classList.contains('dark')).toBe(true);
     expect(screen.getByTestId('preference').textContent).toBe('dark');
   });
 
   it('ignores events with an unknown preference', () => {
     mockMatchMedia(false);
-    window.__KSTACK_HOST__ = { version: 1, colorSchemePreference: 'dark' };
+    window.__KSTACK_HOST__ = { schemaVersion: 1, colorSchemePreference: 'dark' };
     renderProvider();
-    emitEvent('host-file-updated', { version: 1, colorSchemePreference: 'chartreuse' });
+    emitEvent('host-file-updated', { schemaVersion: 1, colorSchemePreference: 'chartreuse' });
     expect(screen.getByTestId('preference').textContent).toBe('dark');
   });
 
