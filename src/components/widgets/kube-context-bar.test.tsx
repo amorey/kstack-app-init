@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { render, screen, act } from '@testing-library/react';
+import { act, screen } from '@testing-library/react';
+import { createRootRoute, createRoute, Outlet, retainSearchParams } from '@tanstack/react-router';
 import { Provider as UrqlProvider } from 'urql';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore } from '@/test-utils';
+import { mockTauriCore, renderWithRouter } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
@@ -24,24 +25,14 @@ const { invokeMock, channels, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
-const { ClustersProvider } = await import('./clusters');
-const { KubeConfigProvider, useKubeConfig } = await import('./kube-config');
+const { ClustersProvider } = await import('@/lib/clusters');
+const { KubeConfigProvider } = await import('@/lib/kube-config');
+const { KubeContextBar } = await import('./kube-context-bar');
 
 // Helpers -------------------------------------------------------------
 
-const flush = () => act(async () => {});
+type Row = { id: string; name: string; enabled?: boolean; present?: boolean; isDefault?: boolean };
 
-type Row = {
-  id: string;
-  name: string;
-  present?: boolean;
-  enabled?: boolean;
-  isDefault?: boolean;
-};
-
-// kube-config only reads spec/status, so this pushes cluster Added deltas on the
-// clustersWatch stream and ignores the parallel cache stream entirely. The provider
-// opens two subscriptions, so target the channel by query rather than liveChannel().
 function channelFor(queryPart: string) {
   const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
   const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
@@ -49,6 +40,8 @@ function channelFor(queryPart: string) {
   return channels[idx];
 }
 
+// Push cluster Added deltas; each row's cluster/user derive from its name, so a
+// resolved context has predictable metadata to assert on.
 function pushClusters(rows: Row[]) {
   const ch = channelFor('clustersWatch');
   rows.forEach((r) => {
@@ -89,25 +82,37 @@ function pushClusters(rows: Row[]) {
   });
 }
 
-// A probe that renders the derived kubeconfig so tests can assert on it.
-function Probe() {
-  const { kubeConfig } = useKubeConfig();
-  return <div data-testid="probe">{kubeConfig === null ? 'null' : JSON.stringify(kubeConfig)}</div>;
+// Mirrors the `_app` layout's env: the router (for the `kubeContext` search
+// param) plus the kubeconfig providers the bar reads through.
+function buildTree() {
+  const root = createRootRoute({
+    component: () => (
+      <UrqlProvider value={createGraphqlClient()}>
+        <ClustersProvider>
+          <KubeConfigProvider>
+            <Outlet />
+          </KubeConfigProvider>
+        </ClustersProvider>
+      </UrqlProvider>
+    ),
+  });
+  const app = createRoute({
+    getParentRoute: () => root,
+    id: 'app',
+    validateSearch: (s: Record<string, unknown>): { kubeContext?: string } =>
+      typeof s.kubeContext === 'string' ? { kubeContext: s.kubeContext } : {},
+    search: { middlewares: [retainSearchParams(['kubeContext'])] },
+    component: () => <Outlet />,
+  });
+  const chat = createRoute({
+    getParentRoute: () => app,
+    path: '/chat',
+    component: () => <KubeContextBar />,
+  });
+  return root.addChildren([app.addChildren([chat])]);
 }
 
-function renderProvider() {
-  return render(
-    <UrqlProvider value={createGraphqlClient()}>
-      <ClustersProvider>
-        <KubeConfigProvider>
-          <Probe />
-        </KubeConfigProvider>
-      </ClustersProvider>
-    </UrqlProvider>,
-  );
-}
-
-describe('useKubeConfig', () => {
+describe('KubeContextBar', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     channels.length = 0;
@@ -122,21 +127,30 @@ describe('useKubeConfig', () => {
     });
   });
 
-  it('excludes disabled and orphaned clusters from the context list', async () => {
-    renderProvider();
-    await flush();
-
+  it('shows the active context plus its cluster and user metadata', async () => {
+    await renderWithRouter(buildTree(), '/chat?kubeContext=staging');
     await act(async () => {
       pushClusters([
-        { id: 'a', name: 'prod', enabled: true, present: true, isDefault: true },
-        { id: 'b', name: 'staging', enabled: false, present: true },
-        { id: 'c', name: 'gone', enabled: true, present: false },
+        { id: 'a', name: 'prod', isDefault: true },
+        { id: 'b', name: 'staging' },
       ]);
     });
 
-    const probe = screen.getByTestId('probe');
-    const kubeConfig = JSON.parse(probe.textContent ?? '');
-    expect(kubeConfig.contexts).toEqual([{ name: 'prod', cluster: 'prod-cluster', user: 'prod-user' }]);
-    expect(kubeConfig.currentContext).toBe('prod');
+    // Picker reflects the resolved context...
+    expect(screen.getByRole('combobox')).toHaveTextContent('staging');
+    // ...and the bar surfaces that context's cluster/user.
+    expect(screen.getByText('staging-cluster')).toBeInTheDocument();
+    expect(screen.getByText('staging-user')).toBeInTheDocument();
+  });
+
+  it('renders no metadata when there is no kubeconfig', async () => {
+    await renderWithRouter(buildTree(), '/chat');
+    await act(async () => {
+      // A disabled cluster is tracked but not a switchable context, so nothing
+      // resolves and the bar shows only the picker's empty state.
+      pushClusters([{ id: 'a', name: 'prod', enabled: false }]);
+    });
+    expect(screen.getByTestId('kube-context-empty')).toBeInTheDocument();
+    expect(screen.queryByText(/cluster/)).not.toBeInTheDocument();
   });
 });

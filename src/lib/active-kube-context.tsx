@@ -21,18 +21,22 @@
 import { useNavigate, useSearch } from '@tanstack/react-router';
 
 import { useKubeConfig } from '@/lib/kube-config';
+import type { KubeContextInfo } from '@/lib/kube-config';
 
-type ActiveContext = {
-  // The resolved context: the URL param when it names a present context, else
-  // the kubeconfig's current context, else '' (clusters not reported yet).
+type ActiveKubeContext = {
+  // The resolved context name: the URL param when it names a present context,
+  // else the kubeconfig's current context, else '' (clusters not reported yet).
   context: string;
+  // The resolved context's full record (cluster/user), or undefined when
+  // nothing resolves yet — the context bar reads its metadata from here.
+  active: KubeContextInfo | undefined;
   // Available contexts to switch between (enabled, present kubeconfig clusters).
-  contexts: { name: string }[];
+  contexts: KubeContextInfo[];
   // Persist a choice by writing it to the URL search param.
   setContext: (name: string) => void;
 };
 
-export function useActiveContext(): ActiveContext {
+export function useActiveKubeContext(): ActiveKubeContext {
   // `strict: false` decouples the hook from the owning route's id — it reads the
   // merged search of whatever `_app` descendant renders it.
   const { kubeContext: param } = useSearch({ strict: false });
@@ -44,10 +48,11 @@ export function useActiveContext(): ActiveContext {
   // default, so a stale deep link never points at nothing.
   const valid = param && contexts.some((c) => c.name === param) ? param : undefined;
   const context = valid ?? kubeConfig?.currentContext ?? '';
+  const active = contexts.find((c) => c.name === context);
 
   const setContext = (name: string) => {
     navigate({ to: '.', search: (prev) => ({ ...prev, kubeContext: name }) });
   };
 
-  return { context, contexts, setContext };
+  return { context, active, contexts, setContext };
 }

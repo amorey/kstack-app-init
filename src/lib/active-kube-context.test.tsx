@@ -27,7 +27,7 @@ vi.mock('@tauri-apps/api/core', () => factory());
 const { createGraphqlClient } = await import('@/lib/graphql/client');
 const { ClustersProvider } = await import('./clusters');
 const { KubeConfigProvider } = await import('./kube-config');
-const { useActiveContext } = await import('./active-context');
+const { useActiveKubeContext } = await import('./active-kube-context');
 
 // Helpers -------------------------------------------------------------
 
@@ -86,7 +86,7 @@ function pushClusters(rows: Row[]) {
 // A probe that surfaces the resolved active context and a way to change it, so
 // tests can drive and observe the hook. Rendered on both pages.
 function Probe() {
-  const { context, setContext } = useActiveContext();
+  const { context, setContext } = useActiveKubeContext();
   return (
     <div>
       <div data-testid="active">{context}</div>
@@ -143,7 +143,7 @@ function buildTree() {
   return root.addChildren([app.addChildren([chat, dashboard])]);
 }
 
-describe('useActiveContext', () => {
+describe('useActiveKubeContext', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     channels.length = 0;

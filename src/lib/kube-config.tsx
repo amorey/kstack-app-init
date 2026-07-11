@@ -22,9 +22,18 @@ import { createContext, useContext, useMemo } from 'react';
 
 import { useClusters } from '@/lib/clusters';
 
+// One switchable kubeconfig context: its name plus the cluster and user it
+// binds to (both kubeconfig-sourced). The picker shows the name; the context
+// bar surfaces the cluster/user the narrow name alone can't convey.
+export type KubeContextInfo = {
+  name: string;
+  cluster: string;
+  user: string;
+};
+
 export type KubeConfig = {
   currentContext: string;
-  contexts: { name: string }[];
+  contexts: KubeContextInfo[];
 };
 
 type KubeConfigContextValue = {
@@ -49,7 +58,11 @@ export function KubeConfigProvider({ children }: { children: React.ReactNode }) 
       kubeConfig: {
         currentContext:
           present.find((c) => c.status.source.kubeconfig?.isDefault)?.spec.source.kubeconfig?.context ?? '',
-        contexts: present.map((c) => ({ name: c.spec.source.kubeconfig?.context ?? '' })),
+        contexts: present.map((c) => ({
+          name: c.spec.source.kubeconfig?.context ?? '',
+          cluster: c.status.source.kubeconfig?.cluster ?? '',
+          user: c.status.source.kubeconfig?.user ?? '',
+        })),
       },
     };
   }, [clusters]);

@@ -13,16 +13,19 @@
 // limitations under the License.
 
 // Picker for the window's active kubeconfig context. It's a thin control over
-// `useActiveContext`: the resolved context drives the value and picking one
+// `useActiveKubeContext`: the resolved context drives the value and picking one
 // writes it to the `kubeContext` URL param, so the choice is shared across chat
-// and dashboard (see `@/lib/active-context`). Selection is a frontend view-scope
-// only — it doesn't rewrite the kubeconfig's current-context.
+// and dashboard (see `@/lib/active-kube-context`). Selection is a frontend view-scope
+// only — it doesn't rewrite the kubeconfig's current-context. It lives in the
+// content-area context bar (`kube-context-bar.tsx`), which has the horizontal room
+// the sidebar lacked — so the trigger grows to fit a full FQDN context name up
+// to a cap, past which the value line-clamps.
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@kubetail/ui/elements/select';
 
-import { useActiveContext } from '@/lib/active-context';
+import { useActiveKubeContext } from '@/lib/active-kube-context';
 
 export function KubeContextPicker() {
-  const { context, contexts, setContext } = useActiveContext();
+  const { context, contexts, setContext } = useActiveKubeContext();
 
   if (contexts.length === 0) {
     return (
@@ -34,7 +37,7 @@ export function KubeContextPicker() {
 
   return (
     <Select value={context} onValueChange={(v) => v !== null && setContext(v)}>
-      <SelectTrigger size="sm" className="min-w-[10rem]">
+      <SelectTrigger size="sm" className="min-w-[12rem] max-w-[32rem]">
         <SelectValue placeholder="Select context" />
       </SelectTrigger>
       <SelectContent>

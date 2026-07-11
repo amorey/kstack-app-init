@@ -28,7 +28,7 @@ import { Outlet } from '@tanstack/react-router';
 import { AccountMenu } from '@/components/widgets/account-menu';
 import { AppDialogs } from '@/components/widgets/app-dialogs';
 import { AppSidebar } from '@/components/widgets/app-sidebar';
-import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
+import { KubeContextBar } from '@/components/widgets/kube-context-bar';
 import { ModeNav } from '@/components/widgets/mode-nav';
 import { ConnectionStatus } from '@/lib/connection-status';
 import { DialogProvider } from '@/lib/dialog';
@@ -40,18 +40,12 @@ export function AppLayout() {
     // the account menu (in the sidebar footer) only requests opens via context.
     <DialogProvider>
       <ConnectionStatus />
-      {/* The context picker sits in the sidebar nav (not a page), so the active
-          context is one window-wide choice shared by chat and dashboard. */}
-      <AppSidebar
-        nav={
-          <>
-            <ModeNav />
-            <KubeContextPicker />
-          </>
-        }
-        footer={<AccountMenu />}
-      >
+      <AppSidebar nav={<ModeNav />} footer={<AccountMenu />}>
+        {/* The context bar spans the top of the content area (not the sidebar),
+            so the active context is one window-wide choice shared by chat and
+            dashboard, with room for the full context name plus its metadata. */}
         <main className="flex min-h-(--app-min-h) flex-col bg-background pt-16">
+          <KubeContextBar />
           <Outlet />
         </main>
       </AppSidebar>

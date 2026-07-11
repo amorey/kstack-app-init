@@ -18,7 +18,7 @@
 // sidebar-less layout route instead.
 //
 // It also owns the `kubeContext` search param: the window's active kubeconfig
-// context (see `@/lib/active-context`). `retainSearchParams` carries it across
+// context (see `@/lib/active-kube-context`). `retainSearchParams` carries it across
 // the chat<->dashboard navigation, so the choice is shared by both modes and
 // stays deep-linkable, without any provider.
 import { createRoute, retainSearchParams } from '@tanstack/react-router';

@@ -37,10 +37,10 @@ vi.mock('@/components/widgets/account-menu', () => ({
 vi.mock('@/components/widgets/mode-nav', () => ({
   ModeNav: () => <div data-testid="mode-nav" />,
 }));
-// The real picker needs the router search + kubeconfig providers; this test is
-// about placement, so stub it.
-vi.mock('@/components/widgets/kube-context-picker', () => ({
-  KubeContextPicker: () => <div data-testid="kube-context-picker" />,
+// The real context bar (which hosts the kube-context picker) needs the router
+// search + kubeconfig providers; this test is about placement, so stub it.
+vi.mock('@/components/widgets/kube-context-bar', () => ({
+  KubeContextBar: () => <div data-testid="kube-context-bar" />,
 }));
 // The dialogs host mounts the real overlay panels (which need the GraphQL/clusters
 // provider stack); stub it — this test is about chrome placement, not dialogs.
@@ -93,11 +93,11 @@ describe('AppLayout', () => {
     expect(sidebarOf(container).contains(screen.getByTestId('account-menu'))).toBe(true);
   });
 
-  it('places the kube-context picker inside the sidebar (shared by every mode)', async () => {
+  it('places the context bar in the inset content area, not the sidebar', async () => {
     const { container } = await renderWithRouter(buildTree(), '/');
-    const picker = screen.getByTestId('kube-context-picker');
-    expect(sidebarOf(container).contains(picker)).toBe(true);
-    expect(insetOf(container).contains(picker)).toBe(false);
+    const bar = screen.getByTestId('kube-context-bar');
+    expect(insetOf(container).contains(bar)).toBe(true);
+    expect(sidebarOf(container).contains(bar)).toBe(false);
   });
 
   it('places the app menu in the title bar, not the sidebar', async () => {
