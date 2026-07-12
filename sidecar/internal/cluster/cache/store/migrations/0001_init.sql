@@ -62,7 +62,7 @@ CREATE TABLE objects (
     namespace        TEXT NOT NULL DEFAULT '',
     name             TEXT NOT NULL,
     resource_version TEXT NOT NULL,
-    generation       INTEGER,
+    generation       INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,    -- object's creationTimestamp
     updated_at       INTEGER NOT NULL,    -- last sync write
     status_summary   TEXT,
@@ -72,10 +72,10 @@ CREATE TABLE objects (
     host             TEXT,
     raw_json         BLOB NOT NULL    -- zlib-compressed object JSON
 ) STRICT;
-CREATE INDEX objects_kind_ns_name ON objects(kind, namespace, name);
-CREATE INDEX objects_kind_host    ON objects(kind, host);
-CREATE INDEX objects_kind_ready   ON objects(kind, ready_count, total_count);
-CREATE INDEX objects_ns_kind      ON objects(namespace, kind);
+CREATE INDEX objects_kind_ns_name ON objects(api_version, kind, namespace, name);
+CREATE INDEX objects_kind_host    ON objects(api_version, kind, host);
+CREATE INDEX objects_kind_ready   ON objects(api_version, kind, ready_count, total_count) WHERE ready_count IS NOT NULL;
+CREATE INDEX objects_ns_kind      ON objects(namespace, api_version, kind);
 
 -- Ownership graph (Deployment → ReplicaSet → Pod, Job → Pod, CRD → CRD).
 -- Pre-extracted from metadata.ownerReferences so JOINs replace JSON parsing.
