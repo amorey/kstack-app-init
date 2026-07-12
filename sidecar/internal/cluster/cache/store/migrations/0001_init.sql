@@ -23,7 +23,7 @@
 CREATE TABLE cluster_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
+) STRICT;
 
 -- One row per Kubernetes object (built-in or CRD). The universal entry
 -- point. status_summary and the four count/host fields are cross-kind
@@ -71,7 +71,7 @@ CREATE TABLE objects (
     restart_count    INTEGER,
     host             TEXT,
     raw_json         BLOB NOT NULL    -- zlib-compressed object JSON
-);
+) STRICT;
 CREATE INDEX objects_kind_ns_name ON objects(kind, namespace, name);
 CREATE INDEX objects_kind_host    ON objects(kind, host);
 CREATE INDEX objects_kind_ready   ON objects(kind, ready_count, total_count);
@@ -84,7 +84,7 @@ CREATE TABLE owner_refs (
     owner_uid     TEXT NOT NULL,
     is_controller INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (child_uid, owner_uid)
-);
+) STRICT;
 CREATE INDEX owner_refs_owner ON owner_refs(owner_uid);
 
 -- Labels, one row per (object, key). Makes Service-selector resolution
@@ -94,7 +94,7 @@ CREATE TABLE labels (
     key   TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (uid, key)
-);
+) STRICT;
 CREATE INDEX labels_kv ON labels(key, value);
 
 -- Events. Separate from objects because they have unique columns
@@ -116,7 +116,7 @@ CREATE TABLE events (
     count         INTEGER,
     raw_json      BLOB NOT NULL,    -- zlib-compressed event JSON
     updated_at    INTEGER NOT NULL
-);
+) STRICT;
 CREATE INDEX events_involved        ON events(involved_uid, last_seen DESC);
 CREATE INDEX events_kind_ns_name    ON events(involved_kind, involved_ns, involved_name, last_seen DESC);
 CREATE INDEX events_last_seen       ON events(last_seen DESC);
@@ -149,7 +149,7 @@ CREATE TABLE status_history (
     uid     TEXT NOT NULL,
     at      INTEGER NOT NULL,
     summary TEXT NOT NULL
-);
+) STRICT;
 CREATE INDEX status_history_uid_at ON status_history(uid, at DESC);
 
 -- Catalog of every Kind discovered on the cluster (built-ins + CRDs).
@@ -164,4 +164,4 @@ CREATE TABLE kind_catalog (
     is_crd       INTEGER NOT NULL,
     schema_json  TEXT,            -- OpenAPI v3 schema for CRDs, NULL for built-ins
     PRIMARY KEY (api_version, kind)
-);
+) STRICT;

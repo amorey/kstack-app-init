@@ -226,7 +226,7 @@ func TestConcurrentReadersDuringWriter(t *testing.T) {
 					`INSERT OR REPLACE INTO objects
 					 (uid, api_version, kind, namespace, name, resource_version, generation,
 					  created_at, updated_at, status_summary, raw_json)
-					 VALUES (?, 'v1', 'Pod', 'default', ?, '1', 1, ?, ?, 'Running', '{}')`,
+					 VALUES (?, 'v1', 'Pod', 'default', ?, '1', 1, ?, ?, 'Running', x'7b7d')`,
 					"uid-"+itoa(i), "pod-"+itoa(i), time.Now().UnixMilli(), time.Now().UnixMilli(),
 				); err != nil {
 					return err
@@ -305,7 +305,7 @@ func TestJanitorTrimsStaleEvents(t *testing.T) {
 	for i, last := range []int64{hourAgo, twoDaysAgo} {
 		_, err := cdb.Writer().ExecContext(ctx,
 			`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
-			 VALUES(?, 'Normal', 'Test', 'hello', ?, ?, 1, '{}', ?)`,
+			 VALUES(?, 'Normal', 'Test', 'hello', ?, ?, 1, x'7b7d', ?)`,
 			"ev-"+itoa(i), last, last, now,
 		)
 		require.NoError(t, err)
@@ -393,7 +393,7 @@ func TestResourceStats(t *testing.T) {
 		_, err := cdb.Writer().ExecContext(ctx,
 			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
 			   created_at, updated_at, raw_json)
-			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, '{}')`,
+			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, x'7b7d')`,
 			uid, apiVersion, kind, uid, at, at)
 		require.NoError(t, err)
 	}
@@ -402,7 +402,7 @@ func TestResourceStats(t *testing.T) {
 	insert("d1", "apps/v1", "Deployment")
 	_, err = cdb.Writer().ExecContext(ctx,
 		`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
-		 VALUES('e1', 'Normal', 'Test', 'hello', ?, ?, 1, '{}', ?)`, at, at, at)
+		 VALUES('e1', 'Normal', 'Test', 'hello', ?, ?, 1, x'7b7d', ?)`, at, at, at)
 	require.NoError(t, err)
 
 	stats, err = cdb.ResourceStats(ctx)

@@ -314,7 +314,7 @@ func TestServiceCacheStatsRollup(t *testing.T) {
 		_, err := cdb.Writer().ExecContext(ctx,
 			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
 			   created_at, updated_at, raw_json)
-			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, '{}')`,
+			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, x'7b7d')`,
 			objUID, apiVersion, kind, objUID, at, at)
 		require.NoError(t, err)
 	}
@@ -323,7 +323,7 @@ func TestServiceCacheStatsRollup(t *testing.T) {
 	insert("d1", "apps/v1", "Deployment")
 	_, err = cdb.Writer().ExecContext(ctx,
 		`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
-		 VALUES('e1', 'Normal', 'Test', 'hello', ?, ?, 1, '{}', ?)`, at, at, at)
+		 VALUES('e1', 'Normal', 'Test', 'hello', ?, ?, 1, x'7b7d', ?)`, at, at, at)
 	require.NoError(t, err)
 
 	stats, err := s.CacheStats(ctx, id, ClusterCacheID(cacheID))

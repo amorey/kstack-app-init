@@ -68,7 +68,7 @@ func insertObject(t *testing.T, w *sql.DB, uid, apiVersion, kind string) {
 	t.Helper()
 	_, err := w.Exec(
 		`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		 VALUES (?, ?, ?, ?, '1', 0, 0, '{}')`,
+		 VALUES (?, ?, ?, ?, '1', 0, 0, x'7b7d')`,
 		uid, apiVersion, kind, uid)
 	require.NoError(t, err)
 }
@@ -97,9 +97,9 @@ func TestObjectsStoreSnapshotRVs(t *testing.T) {
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json) VALUES
-		('p1','v1','Pod','p1','10',0,0,'{}'),
-		('p2','v1','Pod','p2','20',0,0,'{}'),
-		('d1','apps/v1','Deployment','d1','30',0,0,'{}')`)
+		('p1','v1','Pod','p1','10',0,0,x'7b7d'),
+		('p2','v1','Pod','p2','20',0,0,x'7b7d'),
+		('d1','apps/v1','Deployment','d1','30',0,0,x'7b7d')`)
 	require.NoError(t, err)
 
 	s := newObjectsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, w, cdb)

@@ -232,7 +232,7 @@ func TestMetadataDiffSkipsUnchanged(t *testing.T) {
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		VALUES ('a','v1','Pod','a','9',0,0,'{}')`)
+		VALUES ('a','v1','Pod','a','9',0,0,x'7b7d')`)
 	require.NoError(t, err)
 	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
 
@@ -255,7 +255,7 @@ func TestMetadataDiffFetchesChanged(t *testing.T) {
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		VALUES ('a','v1','Pod','a','1',0,0,'{}')`)
+		VALUES ('a','v1','Pod','a','1',0,0,x'7b7d')`)
 	require.NoError(t, err)
 	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
 
@@ -285,7 +285,7 @@ func TestFullResyncRecordsResyncWorkViaMetadataDiff(t *testing.T) {
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		VALUES ('a','v1','Pod','a','1',0,0,'{}')`)
+		VALUES ('a','v1','Pod','a','1',0,0,x'7b7d')`)
 	require.NoError(t, err)
 	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
 
@@ -316,7 +316,7 @@ func TestFullResyncRecordsResyncWorkViaFullList(t *testing.T) {
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		VALUES ('a','v1','Pod','a','1',0,0,'{}')`)
+		VALUES ('a','v1','Pod','a','1',0,0,x'7b7d')`)
 	require.NoError(t, err)
 	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
 
@@ -343,7 +343,7 @@ func TestMetadataDiffDeletesMissing(t *testing.T) {
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		VALUES ('a','v1','Pod','a','1',0,0,'{}'), ('b','v1','Pod','b','1',0,0,'{}')`)
+		VALUES ('a','v1','Pod','a','1',0,0,x'7b7d'), ('b','v1','Pod','b','1',0,0,x'7b7d')`)
 	require.NoError(t, err)
 	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
 
@@ -368,7 +368,7 @@ func TestLargeChangesetFallsBackToFullLIST(t *testing.T) {
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		VALUES ('a','v1','Pod','a','1',0,0,'{}')`)
+		VALUES ('a','v1','Pod','a','1',0,0,x'7b7d')`)
 	require.NoError(t, err)
 	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
 

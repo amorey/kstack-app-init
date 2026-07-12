@@ -38,7 +38,7 @@ func TestLiveSourceMetadataDiffEndToEnd(t *testing.T) {
 	w := cdb.Writer()
 	// Cache already holds Pod "a" at RV 1 (so we're on the metadata-diff path).
 	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, namespace, resource_version, created_at, updated_at, raw_json)
-		VALUES ('uid-a','v1','Pod','a','default','1',0,0,'{}')`)
+		VALUES ('uid-a','v1','Pod','a','default','1',0,0,x'7b7d')`)
 	require.NoError(t, err)
 
 	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
