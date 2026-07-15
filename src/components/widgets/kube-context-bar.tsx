@@ -17,7 +17,10 @@
 // the single home for the kube-context picker — the sidebar was too narrow to
 // show a full FQDN context name or any of its metadata, so the picker moved
 // here where there's horizontal room, and the bar adds the cluster/user the
-// name alone doesn't convey (namespace isn't exposed by the sidecar yet).
+// name alone doesn't convey (namespace isn't exposed by the sidecar yet). The
+// back/forward `HistoryNav` sits at the bar's left edge, walking the router
+// history that context and resource selections push into.
+import { HistoryNav } from '@/components/widgets/history-nav';
 import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 import { useActiveKubeContext } from '@/lib/active-kube-context';
 
@@ -37,6 +40,7 @@ export function KubeContextBar() {
 
   return (
     <div className="flex h-11 shrink-0 items-center gap-4 border-b border-border bg-background px-4">
+      <HistoryNav />
       <KubeContextPicker />
       {active && (active.cluster || active.user) && (
         <div className="flex min-w-0 items-center gap-4 text-xs text-muted-foreground">

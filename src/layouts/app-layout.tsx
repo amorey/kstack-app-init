@@ -23,24 +23,42 @@
 // the top padding that reserves the title-bar band (see `app-sidebar.tsx`) so no
 // page slides content under the window drag strip. Pages emit only their content
 // and opt into a narrow reading width with `CenteredColumn`.
-import { Outlet } from '@tanstack/react-router';
+import { Outlet, useLocation } from '@tanstack/react-router';
 
 import { AccountMenu } from '@/components/widgets/account-menu';
 import { AppDialogs } from '@/components/widgets/app-dialogs';
 import { AppSidebar } from '@/components/widgets/app-sidebar';
+import { DashboardResourceNav } from '@/components/widgets/dashboard-resource-nav';
 import { KubeContextBar } from '@/components/widgets/kube-context-bar';
 import { ModeNav } from '@/components/widgets/mode-nav';
 import { ConnectionStatus } from '@/lib/connection-status';
 import { DialogProvider } from '@/lib/dialog';
 
 export function AppLayout() {
+  // The resource nav is a dashboard-mode affordance, so it's mounted in the
+  // sidebar only while the dashboard route is active — chat mode shows just the
+  // mode switch. This layout stays mounted across the chat<->dashboard switch
+  // (only the `Outlet` swaps), so it must subscribe to the location to recompute
+  // the mode: `useLocation` re-renders on every navigation, whereas
+  // `useMatchRoute` here would read stale until the window reloaded.
+  const pathname = useLocation({ select: (location) => location.pathname });
+  const onDashboard = pathname === '/dashboard' || pathname.startsWith('/dashboard/');
+
   return (
     // The dialogs host lives outside the sidebar so an open dialog survives the
     // card unmounting when the window auto-collapses below the md breakpoint —
     // the account menu (in the sidebar footer) only requests opens via context.
     <DialogProvider>
       <ConnectionStatus />
-      <AppSidebar nav={<ModeNav />} footer={<AccountMenu />}>
+      <AppSidebar
+        nav={
+          <div className="flex flex-col gap-3">
+            <ModeNav />
+            {onDashboard && <DashboardResourceNav />}
+          </div>
+        }
+        footer={<AccountMenu />}
+      >
         {/* The context bar spans the top of the content area (not the sidebar),
             so the active context is one window-wide choice shared by chat and
             dashboard, with room for the full context name plus its metadata. */}

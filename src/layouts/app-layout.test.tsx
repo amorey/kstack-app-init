@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import { createRootRoute, createRoute } from '@tanstack/react-router';
-import { screen } from '@testing-library/react';
+import { act, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { mockTauriWindow, renderWithRouter } from '@/test-utils';
@@ -65,7 +65,19 @@ function buildTree() {
     path: '/',
     component: () => <div data-testid="page-content" />,
   });
-  return root.addChildren([index]);
+  // Chat and dashboard peers, so the layout's mode detection has real routes to
+  // match against (the resource nav mounts only on dashboard).
+  const chat = createRoute({
+    getParentRoute: () => root,
+    path: '/chat',
+    component: () => <div data-testid="page-content" />,
+  });
+  const dashboard = createRoute({
+    getParentRoute: () => root,
+    path: '/dashboard',
+    component: () => <div data-testid="page-content" />,
+  });
+  return root.addChildren([index, chat, dashboard]);
 }
 
 function sidebarOf(container: HTMLElement) {
@@ -110,6 +122,37 @@ describe('AppLayout', () => {
     const page = screen.getByTestId('page-content');
     expect(insetOf(container).contains(page)).toBe(true);
     expect(sidebarOf(container).contains(page)).toBe(false);
+  });
+
+  it('mounts the resource nav in the sidebar while in dashboard mode', async () => {
+    const { container } = await renderWithRouter(buildTree(), '/dashboard');
+    const nav = screen.getByRole('navigation', { name: 'Resources' });
+    expect(sidebarOf(container).contains(nav)).toBe(true);
+  });
+
+  it('omits the resource nav outside dashboard mode', async () => {
+    await renderWithRouter(buildTree(), '/chat');
+    expect(screen.queryByRole('navigation', { name: 'Resources' })).not.toBeInTheDocument();
+  });
+
+  it('mounts the resource nav when navigating into dashboard on the persistent layout', async () => {
+    // The layout stays mounted across chat<->dashboard (only the Outlet swaps),
+    // so this exercises a *client navigation* — not a fresh load — which is where
+    // a non-reactive mode check would leave the nav stale until a reload.
+    const { router } = await renderWithRouter(buildTree(), '/chat');
+    expect(screen.queryByRole('navigation', { name: 'Resources' })).not.toBeInTheDocument();
+
+    await act(async () => {
+      await router.navigate({ to: '/dashboard' });
+    });
+
+    await waitFor(() => expect(screen.getByRole('navigation', { name: 'Resources' })).toBeInTheDocument());
+
+    // ...and unmounts again on the way back to chat.
+    await act(async () => {
+      await router.navigate({ to: '/chat' });
+    });
+    await waitFor(() => expect(screen.queryByRole('navigation', { name: 'Resources' })).not.toBeInTheDocument());
   });
 
   it('renders the connection-status banner', async () => {
