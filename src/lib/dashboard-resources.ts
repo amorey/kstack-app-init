@@ -27,15 +27,60 @@
 // `resource` is one flat id namespace, so a duplicate id would make two nodes
 // indistinguishable in the URL.
 export const DASHBOARD_NAV = [
+  { id: 'overview', label: 'Overview' },
   { id: 'nodes', label: 'Nodes' },
   { id: 'namespaces', label: 'Namespaces' },
+  { id: 'events', label: 'Events' },
   {
     id: 'workloads',
     label: 'Workloads',
     children: [
       { id: 'pods', label: 'Pods' },
+      { id: 'deployments', label: 'Deployments' },
       { id: 'daemonsets', label: 'DaemonSets' },
+      { id: 'statefulsets', label: 'StatefulSets' },
+      { id: 'jobs', label: 'Jobs' },
+      { id: 'cronjobs', label: 'CronJobs' },
     ],
+  },
+  {
+    id: 'config-and-storage',
+    label: 'Config & Storage',
+    children: [
+      { id: 'configmaps', label: 'ConfigMaps' },
+      { id: 'secrets', label: 'Secrets' },
+      { id: 'persistentvolumeclaims', label: 'PersistentVolumeClaims' },
+    ],
+  },
+  {
+    id: 'network',
+    label: 'Network',
+    children: [
+      { id: 'services', label: 'Services' },
+      { id: 'ingresses', label: 'Ingresses' },
+      { id: 'networkpolicies', label: 'NetworkPolicies' },
+    ],
+  },
+  {
+    id: 'security-and-access',
+    label: 'Security & Access',
+    children: [
+      { id: 'serviceaccounts', label: 'ServiceAccounts' },
+      { id: 'roles', label: 'Roles' },
+      { id: 'rolebindings', label: 'RoleBindings' },
+      { id: 'clusterroles', label: 'ClusterRoles' },
+      { id: 'clusterrolebindings', label: 'ClusterRoleBindings' },
+    ],
+  },
+  {
+    id: 'custom-resources',
+    label: 'Custom Resources',
+    children: [],
+  },
+  {
+    id: 'system',
+    label: 'System',
+    children: [],
   },
 ] as const;
 
