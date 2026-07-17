@@ -32,20 +32,7 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - Apply the mechanism uniformly to `clusterDataKindsWatch`, `clustersWatch`, and `clusterCachesWatch` rather than adding per-screen workarounds.
   - Add coverage that removes a kind, cluster, and cache while disconnected, reconnects, and verifies that each absent object is removed from accumulated UI state (including the fully-empty snapshot case).
 
-- **`src/lib/dashboard-nav.tsx` has type errors** (confirmed live via `pnpm exec tsc -b`) against the generated `ClusterDataKindsWatchSubscription` type: the reducer at `dashboard-nav.tsx:111` returns `Catalog | undefined` where a `SubscriptionHandler` requires `Catalog`; because that handler doesn't type-match, `data` falls back to the raw subscription type, so line 130 reads `.cacheID`/`.kinds` off the top level when the generated shape exposes those under `clusterDataKindsWatch`. Fix the reducer's return type (non-`undefined` seed) and the accessors to match the generated shape.
-
 ## Tests
 
 - **Extract `channelFor`/`pushClusters` cluster-delta test helpers into `src/test-utils.tsx`** — copied verbatim across 6 test files (`lib/clusters.test.tsx`, `components/widgets/cluster-sync-panel.test.tsx`, `lib/kube-config.test.tsx`, `lib/active-kube-context.test.tsx`, `components/widgets/kube-context-picker.test.tsx`, `components/widgets/kube-context-bar.test.tsx`). `channelFor` closes over `invokeMock`/`channels`, so expose it from `mockTauriCore()`'s return.
 
-## Done
-
-- ~~OAuth sign-in/logout~~ (token storage in OS keyring, multi-window sync, startup restore); on-demand access-token refresh.
-- ~~Sidecar lifecycle~~ — host spawns, monitors (READY gate), and gracefully shuts down the sidecar (`src-tauri/src/services/sidecar/`).
-- ~~Rust → sidecar GraphQL bridge~~ — `graphql_query`/`graphql_subscribe`/`graphql_unsubscribe` commands forward query/mutation as HTTP POST and each subscription as its own SSE stream.
-- ~~Waker + Rust → sidecar waker~~ — OS wake/network-return supervisor (`src-tauri/src/wake/`) pokes the sidecar's `poke` service over gRPC to trigger a resync.
-- ~~Rust → sidecar credentials push~~ — obsolete: auth moved entirely into the sidecar (refresh token in the OS keyring, login/logout over gRPC), so there's no host→sidecar credentials channel and no `/control/credentials` endpoint.
-- ~~Cluster-schema renames~~ — `ClusterKind` → `ClusterDataKind`; `ClusterCondition` → `Condition`.
-- ~~`CacheStats` reads the `ClusterData` kind catalog~~ — `objectCount`/`kindCount` now roll up `KindCatalog` (O(kinds) `kind_counts` aggregate) instead of the `ResourceStats` objects-table scan; the unused `ClusterCacheResourceStats` type + `resources[]`/`lastUpdatedAt` breakdown were removed (per-kind `lastUpdatedAt` re-implementation is pending, above).
-- ~~`cluster` service lifecycle migration~~ — `internal/cluster/service.go` `Start` returns a stop func.
-- ~~React compiler build transform~~ — wired into Vite via `babel-plugin-react-compiler` (ESLint plugin still pending, above).

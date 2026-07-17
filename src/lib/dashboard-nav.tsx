@@ -108,13 +108,15 @@ export function useDashboardNav(): { nav: DashboardNavNode[] } {
       variables: { id: clusterID ?? '', cacheID: cacheID ?? '' },
       pause: !clusterID || !cacheID,
     },
-    (prev: Catalog | undefined, res): Catalog | undefined => {
+    (prev: Catalog | undefined, res): Catalog => {
       const { type, kind, cacheID: frameCacheID } = res.clusterDataKindsWatch;
       // Drop a frame that isn't from the active cache — a late straggler from the old
       // subscription — leaving the active cache's accumulated catalog untouched. (Once
       // the active cache has streamed, this is what keeps a straggler from resetting the
-      // catalog to a singleton and losing the rest of the snapshot for good.)
-      if (frameCacheID !== cacheID) return prev;
+      // catalog to a singleton and losing the rest of the snapshot for good.) With no
+      // catalog yet, seed an empty one tagged for the active cache so the reducer never
+      // yields `undefined` (the build guard renders it curated-only until a real frame).
+      if (frameCacheID !== cacheID) return prev ?? { cacheID: cacheID ?? '', kinds: new Map() };
       // The frame is from the active cache. If prev is still the old cache (the first
       // frame after a swap), start fresh; otherwise patch the accumulated catalog.
       const kinds = prev && prev.cacheID === frameCacheID ? prev.kinds : undefined;
