@@ -39,7 +39,6 @@ package engine
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -453,7 +452,7 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 	}
 
 	writer := e.cdb.Writer()
-	entries, err := discoverGVRs(ctx, dc, writer)
+	entries, err := discoverGVRs(ctx, dc, e.cdb)
 	if err != nil {
 		return fmt.Errorf("discover: %w", err)
 	}
@@ -788,7 +787,8 @@ func isEventGVK(g schema.GroupVersionKind) bool {
 // watches against the same underlying data and getting deprecation
 // warnings on every alpha/beta version we accidentally watched.
 // Preferred-only gives us one driver per logical resource.
-func discoverGVRs(ctx context.Context, dc discovery.DiscoveryInterface, writer *sql.DB) ([]gvrEntry, error) {
+func discoverGVRs(ctx context.Context, dc discovery.DiscoveryInterface, cdb *store.ClusterDB) ([]gvrEntry, error) {
+	writer := cdb.Writer()
 	complete := true
 	lists, err := dc.ServerPreferredResources()
 	if err != nil {
@@ -910,6 +910,13 @@ func discoverGVRs(ctx context.Context, dc discovery.DiscoveryInterface, writer *
 			slog.Info("clustersync: pruned orphaned objects", "rows", n)
 		}
 	}
+
+	// Signal catalog subscribers (e.g. ClusterDataKindsWatch). The truncate-and-rewrite
+	// above, plus the orphan prune, don't go through the per-object stores that ping on
+	// write, so without this a kind added/removed since the last run — most visibly a
+	// CRD uninstalled during an in-place engine restart, where the db handle doesn't
+	// change — would stay stale until the next unrelated object write happened to ping.
+	cdb.Notify()
 
 	return out, nil
 }

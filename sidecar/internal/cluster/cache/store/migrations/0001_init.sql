@@ -165,3 +165,53 @@ CREATE TABLE kind_catalog (
     schema_json  TEXT,            -- OpenAPI v3 schema for CRDs, NULL for built-ins
     PRIMARY KEY (api_version, kind)
 ) STRICT;
+
+-- Maintained per-kind object counts. The dashboard nav shows a per-kind object
+-- count; reading it as a grouped COUNT-join of kind_catalog against the whole
+-- objects table would be O(objects) and re-run on every write ping. This table
+-- holds the count per (api_version, kind) so that read is O(kinds): a point join,
+-- no object scan.
+--
+-- It is kept SEPARATE from kind_catalog on purpose. The sync engine's discovery
+-- pass truncate-and-rewrites kind_catalog every run, and objects can be written
+-- before their catalog row exists (discovery and object sync are different code
+-- paths). A count column on kind_catalog would be reset on every rewrite and miss
+-- those early writes. kind_counts is keyed only by (api_version, kind) and is
+-- maintained SOLELY by the triggers below, so it stays exactly consistent with the
+-- objects table within each write transaction, independent of catalog churn.
+CREATE TABLE kind_counts (
+    api_version TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    count       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (api_version, kind)
+) STRICT;
+
+-- A new object bumps its kind's counter. An update of an existing object goes
+-- through INSERT ... ON CONFLICT(uid) DO UPDATE, which fires the UPDATE trigger
+-- (below), not this one — so this only ever counts genuinely-new rows.
+CREATE TRIGGER objects_kind_count_insert AFTER INSERT ON objects BEGIN
+    INSERT INTO kind_counts (api_version, kind, count)
+    VALUES (new.api_version, new.kind, 1)
+    ON CONFLICT(api_version, kind) DO UPDATE SET count = count + 1;
+END;
+
+-- A deleted object (watch delete, ReplaceFull prune, or orphaned-kind eviction)
+-- decrements its kind's counter. The row is left at 0 rather than removed — a
+-- still-advertised-but-empty kind should read 0, and re-adding is cheaper than
+-- churning the row.
+CREATE TRIGGER objects_kind_count_delete AFTER DELETE ON objects BEGIN
+    UPDATE kind_counts SET count = count - 1
+    WHERE api_version = old.api_version AND kind = old.kind;
+END;
+
+-- A k8s uid's kind is immutable, so an object update normally leaves the count
+-- untouched. This trigger fires only if an object's identity somehow changes
+-- (defensive), moving the count from the old kind to the new one.
+CREATE TRIGGER objects_kind_count_update AFTER UPDATE ON objects
+WHEN old.api_version <> new.api_version OR old.kind <> new.kind BEGIN
+    UPDATE kind_counts SET count = count - 1
+    WHERE api_version = old.api_version AND kind = old.kind;
+    INSERT INTO kind_counts (api_version, kind, count)
+    VALUES (new.api_version, new.kind, 1)
+    ON CONFLICT(api_version, kind) DO UPDATE SET count = count + 1;
+END;

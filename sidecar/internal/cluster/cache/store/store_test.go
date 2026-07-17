@@ -375,6 +375,84 @@ func TestShutdownClosesSubscribers(t *testing.T) {
 	}
 }
 
+// recvDB reads one handle off a WatchDB stream, failing on timeout or an
+// unexpected close.
+func recvDB(t *testing.T, ch <-chan *ClusterDB) *ClusterDB {
+	t.Helper()
+	select {
+	case db, ok := <-ch:
+		require.True(t, ok, "WatchDB stream closed early")
+		return db
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a WatchDB handle")
+		return nil
+	}
+}
+
+// WatchDB is a latest-value stream of a CacheID's open handle across its
+// lifecycle: current-on-subscribe (nil when not open), then a fresh value on open,
+// close, and replace. This is what lets a long-lived reader bind to a cache that
+// opens after it subscribes, or rebind when the db is swapped under it.
+func TestWatchDBFollowsHandleLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// Subscribe before the cache is open: current-on-subscribe yields nil.
+	ch, cancel := r.WatchDB(1)
+	defer cancel()
+	require.Nil(t, recvDB(t, ch), "unopened cache should watch as nil")
+
+	// Open → the handle appears.
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	require.Equal(t, cdb, recvDB(t, ch), "open should deliver the new handle")
+
+	// Delete (close) then reopen under the same CacheID → nil, then a fresh handle.
+	require.NoError(t, r.DeleteCacheFiles(ctx, ref(1, 1)))
+	require.Nil(t, recvDB(t, ch), "close should deliver nil")
+	cdb2, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	require.Equal(t, cdb2, recvDB(t, ch), "reopen should deliver the replacement handle")
+	require.NotSame(t, cdb, cdb2, "reopen must be a fresh handle")
+}
+
+// A WatchDB subscriber that arrives after the cache is already open sees that live
+// handle immediately (current-on-subscribe), with no open event to wait for.
+func TestWatchDBCurrentOnSubscribe(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+
+	ch, cancel := r.WatchDB(1)
+	defer cancel()
+	require.Equal(t, cdb, recvDB(t, ch), "an already-open cache should watch as its handle")
+}
+
+// Shutdown closes every WatchDB channel so its subscriber's stream ends.
+func TestWatchDBClosedOnShutdown(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+
+	ch, cancel := r.WatchDB(1)
+	defer cancel()
+	require.Nil(t, recvDB(t, ch))
+
+	require.NoError(t, r.Shutdown(ctx))
+	select {
+	case _, ok := <-ch:
+		require.False(t, ok, "shutdown must close WatchDB channels")
+	case <-time.After(2 * time.Second):
+		t.Fatal("WatchDB channel not closed on shutdown")
+	}
+}
+
 func TestResourceStats(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
@@ -477,6 +555,60 @@ func TestKindCatalog(t *testing.T) {
 	require.Equal(t, "v1", rows[2].APIVersion)
 	require.Equal(t, "Cluster", rows[2].Scope)
 	require.Equal(t, 0, rows[2].Count)
+}
+
+// The per-kind counts are maintained by triggers on the objects table (so
+// KindCatalog reads them without scanning objects). This pins the two properties
+// the trigger design relies on: a delete decrements the count, and an object
+// written before its catalog row still counts — kind_counts is keyed only by
+// (api_version, kind), independent of kind_catalog's discovery rewrite.
+func TestKindCatalogCountsMaintainedByTriggers(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	at := time.Now().UnixMilli()
+	insertObj := func(uid, apiVersion, kind string) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+			   created_at, updated_at, raw_json)
+			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, x'7b7d')`,
+			uid, apiVersion, kind, uid, at, at)
+		require.NoError(t, err)
+	}
+	countFor := func(kind string) int {
+		rows, err := cdb.KindCatalog(ctx)
+		require.NoError(t, err)
+		for _, row := range rows {
+			if row.Kind == kind {
+				return row.Count
+			}
+		}
+		t.Fatalf("kind %q not in catalog", kind)
+		return 0
+	}
+
+	// Objects written BEFORE the catalog row exists (discovery can land after the
+	// first object writes). The count is tracked regardless.
+	insertObj("d1", "apps/v1", "Deployment")
+	insertObj("d2", "apps/v1", "Deployment")
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+		 VALUES('apps/v1', 'Deployment', 'deployments', 'Namespaced', 0, NULL)`)
+	require.NoError(t, err)
+	require.Equal(t, 2, countFor("Deployment"), "objects written before the catalog row still count")
+
+	// A delete decrements; the last delete leaves the kind at 0, not missing.
+	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM objects WHERE uid='d1'`)
+	require.NoError(t, err)
+	require.Equal(t, 1, countFor("Deployment"), "delete decrements the maintained count")
+
+	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM objects WHERE uid='d2'`)
+	require.NoError(t, err)
+	require.Equal(t, 0, countFor("Deployment"), "an emptied but still-advertised kind counts 0")
 }
 
 func itoa(i int) string {

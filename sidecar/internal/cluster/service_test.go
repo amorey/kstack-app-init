@@ -94,6 +94,10 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterSta
 		cacheManager: cacheManager,
 		connMgr:      NewConnectionManager(),
 		coreCtrl:     &fakeCoreController{},
+		// A short (but non-zero) debounce keeps the per-step watch tests fast while
+		// still exercising the coalescing path (TestServiceClusterDataKindsWatch...
+		// Coalesces overrides it to a window it can pack multiple pings into).
+		dataKindsDebounce: 5 * time.Millisecond,
 	}, coreCC, cacheCC
 }
 
@@ -332,6 +336,310 @@ func TestServiceCacheStatsRollup(t *testing.T) {
 	assert.Equal(t, 3, stats.KindCount, "two object kinds + the events row")
 	assert.Equal(t, 4, stats.ObjectCount, "2 Pods + 1 Deployment + 1 event")
 	assert.Len(t, stats.Resources, stats.KindCount, "KindCount must match the breakdown length")
+}
+
+// recvKindChange reads one delta off the ClusterDataKindsWatch stream, failing on
+// timeout or an unexpected close.
+func recvKindChange(t *testing.T, ch <-chan ClusterDataKindChange) ClusterDataKindChange {
+	t.Helper()
+	select {
+	case ev, ok := <-ch:
+		require.True(t, ok, "stream closed early")
+		return ev
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a ClusterDataKindChange")
+		return ClusterDataKindChange{}
+	}
+}
+
+// ClusterDataKindsWatch streams the active cache's kind catalog as a delta watch:
+// the current catalog as an Added burst on subscribe, then one Added/Modified/Deleted
+// change per kind as the sync engine writes objects and pings the store. This is what
+// makes the dashboard resource nav (kinds + live per-kind counts) update in real time.
+func TestServiceClusterDataKindsWatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	insertKind := func(apiVersion, kind, resource, scope string, isCRD int) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+			 VALUES(?, ?, ?, ?, ?, NULL)`, apiVersion, kind, resource, scope, isCRD)
+		require.NoError(t, err)
+	}
+	insertObj := func(objUID, apiVersion, kind string) {
+		at := time.Now().UnixMilli()
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+			   created_at, updated_at, raw_json)
+			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, x'7b7d')`,
+			objUID, apiVersion, kind, objUID, at, at)
+		require.NoError(t, err)
+	}
+
+	// Seed a two-kind catalog with one Deployment cached before subscribing.
+	insertKind("apps/v1", "Deployment", "deployments", "Namespaced", 0)
+	insertKind("v1", "Node", "nodes", "Cluster", 0)
+	insertObj("d1", "apps/v1", "Deployment")
+
+	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+
+	// Snapshot: an Added per kind, ordered by (api_version, kind) like KindCatalog.
+	snap1 := recvKindChange(t, ch)
+	assert.Equal(t, ChangeAdded, snap1.Type)
+	assert.Equal(t, "Deployment", snap1.Kind.Kind)
+	assert.Equal(t, 1, snap1.Kind.Count)
+	// Every frame carries its own cache's id as provenance, so a client can reject a
+	// late frame from a superseded cache after a cache/context switch.
+	assert.Equal(t, ClusterCacheID(cacheID), snap1.CacheID)
+	snap2 := recvKindChange(t, ch)
+	assert.Equal(t, ChangeAdded, snap2.Type)
+	assert.Equal(t, "Node", snap2.Kind.Kind)
+	assert.Equal(t, 0, snap2.Kind.Count)
+
+	// A new object of an existing kind bumps its count → Modified.
+	insertObj("d2", "apps/v1", "Deployment")
+	cdb.Notify()
+	mod := recvKindChange(t, ch)
+	assert.Equal(t, ChangeModified, mod.Type)
+	assert.Equal(t, "Deployment", mod.Kind.Kind)
+	assert.Equal(t, 2, mod.Kind.Count)
+
+	// A newly-discovered kind → Added.
+	insertKind("batch/v1", "Job", "jobs", "Namespaced", 0)
+	cdb.Notify()
+	add := recvKindChange(t, ch)
+	assert.Equal(t, ChangeAdded, add.Type)
+	assert.Equal(t, "Job", add.Kind.Kind)
+	assert.Equal(t, "jobs", add.Kind.Resource)
+
+	// A kind leaving the catalog → Deleted (carries the last-known row).
+	_, err = cdb.Writer().ExecContext(ctx,
+		`DELETE FROM kind_catalog WHERE kind = 'Node'`)
+	require.NoError(t, err)
+	cdb.Notify()
+	del := recvKindChange(t, ch)
+	assert.Equal(t, ChangeDeleted, del.Type)
+	assert.Equal(t, "Node", del.Kind.Kind)
+
+	// ctx cancel ends the stream.
+	cancel()
+	select {
+	case _, ok := <-ch:
+		assert.False(t, ok, "stream must close on ctx cancel")
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not close on ctx cancel")
+	}
+}
+
+// A burst of write pings within one debounce window collapses into a single catalog
+// re-read, so a high-churn cluster doesn't re-run KindCatalog's whole-index count-join
+// per object event. If the pings weren't coalesced the first post-burst frame would
+// carry an intermediate count; coalesced, it jumps straight to the final one.
+func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	// A window wide enough to pack several synchronous pings into before it fires.
+	s.dataKindsDebounce = 100 * time.Millisecond
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	insertObj := func(objUID string) {
+		at := time.Now().UnixMilli()
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+			   created_at, updated_at, raw_json)
+			 VALUES (?, 'apps/v1', 'Deployment', 'default', ?, '1', ?, ?, x'7b7d')`,
+			objUID, objUID, at, at)
+		require.NoError(t, err)
+	}
+
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+		 VALUES('apps/v1', 'Deployment', 'deployments', 'Namespaced', 0, NULL)`)
+	require.NoError(t, err)
+	insertObj("d1")
+
+	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+
+	// Snapshot: Deployment at count 1.
+	snap := recvKindChange(t, ch)
+	require.Equal(t, ChangeAdded, snap.Type)
+	require.Equal(t, 1, snap.Kind.Count)
+
+	// Three writes + pings back-to-back, all inside the 100ms window. The store's
+	// cap-1 Subscribe channel plus the debounce collapse them into one re-read.
+	insertObj("d2")
+	cdb.Notify()
+	insertObj("d3")
+	cdb.Notify()
+	insertObj("d4")
+	cdb.Notify()
+
+	// The single coalesced re-read reports the final count (4), never an intermediate.
+	mod := recvKindChange(t, ch)
+	assert.Equal(t, ChangeModified, mod.Type)
+	assert.Equal(t, 4, mod.Kind.Count)
+}
+
+// A cache whose on-disk db isn't open (never synced / sync paused) yields a stream
+// that emits no frames and closes when ctx ends — mirroring ClusterDataKinds' empty
+// posture without leaking a goroutine.
+func TestServiceClusterDataKindsWatchNoOpenCache(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, _, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(999999))
+	require.NoError(t, err)
+
+	select {
+	case ev, ok := <-ch:
+		if ok {
+			t.Fatalf("expected no frames for an unopened cache, got %+v", ev)
+		}
+	case <-time.After(200 * time.Millisecond):
+		// No frame yet, as expected; cancel and require close.
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		assert.False(t, ok, "stream must close on ctx cancel")
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not close on ctx cancel")
+	}
+}
+
+// insertCatalogKind inserts one kind_catalog row into a cache db (test helper for
+// the ClusterDataKindsWatch lifecycle tests).
+func insertCatalogKind(t *testing.T, ctx context.Context, cdb *store.ClusterDB, apiVersion, kind, resource, scope string) {
+	t.Helper()
+	_, err := cdb.Writer().ExecContext(ctx,
+		`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+		 VALUES(?, ?, ?, ?, 0, NULL)`, apiVersion, kind, resource, scope)
+	require.NoError(t, err)
+}
+
+// A subscriber that opens the stream *before* the cache db is opened (the common
+// case for an unsynced cluster: the sync engine's discovery pass lands after the UI
+// subscribes) must bind to the cache when it opens and start streaming its catalog —
+// not miss it forever by binding once to the initial (nil) Lookup.
+func TestServiceClusterDataKindsWatchBindsCacheOpenedAfterSubscribe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+
+	// Subscribe first — the cache db is not open yet, so no frames arrive.
+	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+	select {
+	case ev, ok := <-ch:
+		if ok {
+			t.Fatalf("expected no frames before the cache opens, got %+v", ev)
+		}
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Open the cache and write a kind: the stream must now bind and emit it.
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+	insertCatalogKind(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
+	cdb.Notify()
+
+	ev := recvKindChange(t, ch)
+	assert.Equal(t, ChangeAdded, ev.Type)
+	assert.Equal(t, "Deployment", ev.Kind.Kind)
+}
+
+// Clearing a cache closes the on-disk db and reopens a fresh one under the *same*
+// CacheID. The stream must rebind to the new handle and keep diffing — the emptied
+// catalog surfacing as Deletes and the rebuild as Adds — instead of ending silently
+// (which, with an unchanged cache id, the client would never resubscribe from).
+func TestServiceClusterDataKindsWatchRebindsAfterCacheReplaced(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+	ref := newCacheRef(beehive.ObjectID(id), cacheID)
+
+	cdb, err := s.cacheManager.Open(ctx, ref)
+	require.NoError(t, err)
+	insertCatalogKind(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
+
+	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+	snap := recvKindChange(t, ch)
+	assert.Equal(t, ChangeAdded, snap.Type)
+	assert.Equal(t, "Deployment", snap.Kind.Kind)
+
+	// Clear: delete the files (closes the db) then reopen a fresh, empty cache.
+	require.NoError(t, s.cacheManager.DeleteCacheFiles(ctx, ref))
+	// The emptied catalog surfaces as a Delete of the prior kind once the new db binds.
+	cdb2, err := s.cacheManager.Open(ctx, ref)
+	require.NoError(t, err)
+	del := recvKindChange(t, ch)
+	assert.Equal(t, ChangeDeleted, del.Type)
+	assert.Equal(t, "Deployment", del.Kind.Kind)
+
+	// A write into the rebuilt cache streams through the rebound handle.
+	insertCatalogKind(t, ctx, cdb2, "v1", "Node", "nodes", "Cluster")
+	cdb2.Notify()
+	add := recvKindChange(t, ch)
+	assert.Equal(t, ChangeAdded, add.Type)
+	assert.Equal(t, "Node", add.Kind.Kind)
+}
+
+// A cache that closes and never reopens (a paused/cleared cache whose engine
+// doesn't restart) must reconcile the stream against an empty catalog — one Delete
+// per held kind — so the dashboard doesn't permanently retain the closed cache's
+// stale kinds while waiting for a reopen that never comes.
+func TestServiceClusterDataKindsWatchEmitsDeletesOnCloseWithoutReopen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+	ref := newCacheRef(beehive.ObjectID(id), cacheID)
+
+	cdb, err := s.cacheManager.Open(ctx, ref)
+	require.NoError(t, err)
+	insertCatalogKind(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
+
+	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+	snap := recvKindChange(t, ch)
+	assert.Equal(t, ChangeAdded, snap.Type)
+	assert.Equal(t, "Deployment", snap.Kind.Kind)
+
+	// Close the cache without reopening: the held kind must surface as a Delete.
+	require.NoError(t, s.cacheManager.Close(ctx, int64(cacheID)))
+	del := recvKindChange(t, ch)
+	assert.Equal(t, ChangeDeleted, del.Type)
+	assert.Equal(t, "Deployment", del.Kind.Kind)
 }
 
 // cacheRef resolves the *active* cache's on-disk locator: the directory id is the

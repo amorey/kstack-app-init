@@ -374,6 +374,20 @@ type ClusterCacheChange {
   cache: ClusterCache!
 }
 
+"One change on the `clusterDataKindsWatch` stream: the affected kind, what happened to it, and which cache it came from."
+type ClusterDataKindChange {
+  "Whether this kind was added (incl. the on-subscribe snapshot), modified (chiefly a `count` change), or deleted."
+  type: ChangeType!
+  "The affected kind. On `Deleted`, its last-known row; the client keys on `apiVersion` + `resource`."
+  kind: ClusterDataKind!
+  """
+  The cache this frame came from — the frame's provenance. A client watching the
+  active cache rejects a late frame from a superseded cache (one still draining
+  after a cache/context switch) by comparing this against the cache it subscribed for.
+  """
+  cacheID: ObjectID!
+}
+
 # --- Chat ---
 
 input ChatMessageInput {
@@ -495,6 +509,19 @@ type Subscription {
   drops caches orphaned by a cluster deletion).
   """
   clusterCachesWatch: ClusterCacheChange!
+
+  """
+  Streams one ClusterCache's discovered kind catalog as a Kubernetes-style delta
+  watch (the live counterpart of `clusterDataKinds`, keyed the same way — parent
+  cluster `id` + `cacheID`): the current catalog as an `Added` burst on subscribe,
+  then one `Added`/`Modified`/`Deleted` change per kind as the sync engine writes
+  objects — a kind's per-object `count` is live, so an object write re-emits it as
+  `Modified`. The client keys each kind by `apiVersion` + `resource` and rebuilds the
+  dashboard resource nav from the accumulated set, so the nav (kinds + counts) tracks
+  the cluster in real time. Empty (no frames) until that cache's db is open (a
+  never-synced / paused cache streams nothing until it syncs).
+  """
+  clusterDataKindsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterDataKindChange!
 
   """
   Streams a cluster's event timeline: the matching runs as a snapshot, then live

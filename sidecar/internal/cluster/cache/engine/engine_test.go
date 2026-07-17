@@ -16,17 +16,39 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
+	restfake "k8s.io/client-go/rest/fake"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
+
+// fakePreferredDiscovery is a minimal DiscoveryInterface covering the two things
+// discoverGVRs uses: ServerPreferredResources (the resource lists) and the RESTClient
+// listCRDs reaches for. The REST client is stubbed to fail every request, so listCRDs
+// records no CRDs (its error is ignored) without any network I/O.
+type fakePreferredDiscovery struct {
+	discovery.DiscoveryInterface
+	lists []*metav1.APIResourceList
+}
+
+func (f *fakePreferredDiscovery) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
+	return f.lists, nil
+}
+
+func (f *fakePreferredDiscovery) RESTClient() rest.Interface {
+	return &restfake.RESTClient{Err: errors.New("no CRDs in test")}
+}
 
 // fakeClock is a manually-advanced clock for the liveness-monitor tests, safe for
 // the monitor goroutine and the test to share.
@@ -310,6 +332,42 @@ func TestEngineReportsCatchUpFacts(t *testing.T) {
 	require.Equal(t, 4, got.SyncedKinds)
 	require.Equal(t, 2, got.SyncedObjects)
 	require.Equal(t, 3*time.Second, got.CaughtUpIn)
+}
+
+// discoverGVRs rewrites kind_catalog and prunes orphaned kinds outside the per-object
+// stores that ping on write, so it must signal catalog subscribers itself — otherwise a
+// kind added/removed since the last run (e.g. a CRD uninstalled during an in-place engine
+// restart, where the db handle doesn't change and no object write follows) would stay
+// stale until an unrelated write happened to ping.
+func TestDiscoverGVRsNotifiesCatalogSubscribers(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{{
+		GroupVersion: "apps/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "deployments", Kind: "Deployment", Namespaced: true, Verbs: []string{"list", "watch"}},
+		},
+	}}}
+
+	// Subscribe before discovery so the ping can't race the subscription (as the
+	// GraphQL watch does).
+	pings, cancelSub := cdb.Subscribe()
+	defer cancelSub()
+
+	entries, err := discoverGVRs(ctx, dc, cdb)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	select {
+	case <-pings:
+	case <-time.After(2 * time.Second):
+		t.Fatal("discoverGVRs did not notify catalog subscribers after rewriting kind_catalog")
+	}
+
+	rows, err := cdb.KindCatalog(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "Deployment", rows[0].Kind)
 }
 
 // A warm resume's catch-up carries the re-sync breakdown the drivers aggregated:

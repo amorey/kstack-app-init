@@ -169,6 +169,18 @@ func (r *subscriptionResolver) ClusterCachesWatch(ctx context.Context) (<-chan *
 	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterCacheChange) *cluster.ClusterCacheChange { return &c }), nil
 }
 
+// ClusterDataKindsWatch is the resolver for the clusterDataKindsWatch field — one
+// ClusterCache's kind catalog as a delta watch (the live counterpart of
+// clusterDataKinds), so the dashboard nav's kinds + counts track the cluster in real
+// time. gqlgen wants pointers, so each change is adapted through mapStream.
+func (r *subscriptionResolver) ClusterDataKindsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataKindChange, error) {
+	ch, err := r.ClusterSvc.ClusterDataKindsWatch(ctx, id, cacheID)
+	if err != nil {
+		return nil, err
+	}
+	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterDataKindChange) *cluster.ClusterDataKindChange { return &c }), nil
+}
+
 // ClusterEventsWatch is the resolver for the clusterEventsWatch field — the live
 // event tail for one cluster, decoupled from clustersWatch. The service streams
 // bare runs; gqlgen wants pointers, so each is adapted through mapStream.

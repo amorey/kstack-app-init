@@ -15,18 +15,30 @@
 import { renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The hook composes urql's `useQuery` with the active-context → cluster/cache join,
-// a sync-driven re-execute, and a cache-aware stale-data guard. Mock those seams so
-// the test drives the catalog + cache state directly and asserts the reactivity the
-// reviewer asked for, without standing up a real GraphQL client.
-const { useQueryMock, reexecuteQuery } = vi.hoisted(() => ({ useQueryMock: vi.fn(), reexecuteQuery: vi.fn() }));
+// The hook composes urql's `useSubscription` (a delta watch reduced into a keyed
+// catalog) with the active-context → cluster/cache join and a cache-aware guard. Mock
+// those seams so the test drives the delta stream + cache state directly and asserts
+// the nav updates live, without standing up a real GraphQL client. The mock stands in
+// for urql's accumulator: it captures the reducer and returns the accumulated data, so
+// `pushFrame` folds a delta through the real reducer just as urql would.
+const { useSubscriptionMock } = vi.hoisted(() => ({ useSubscriptionMock: vi.fn() }));
 const { useClustersMock, useActiveKubeContextMock } = vi.hoisted(() => ({
   useClustersMock: vi.fn(),
   useActiveKubeContextMock: vi.fn(),
 }));
 
-vi.mock('urql', () => ({ useQuery: useQueryMock }));
-vi.mock('@/lib/clusters', () => ({ useClusters: useClustersMock }));
+vi.mock('urql', () => ({ useSubscription: useSubscriptionMock }));
+// Mock the provider hook but keep the real `applyChange` reducer helper (a pure map
+// patch the hook reuses) so the delta accumulation under test runs unaltered.
+vi.mock('@/lib/clusters', () => ({
+  useClusters: useClustersMock,
+  applyChange: <T,>(prev: ReadonlyMap<string, T> | undefined, type: string, id: string, entity: T) => {
+    const next = new Map(prev);
+    if (type === 'Deleted') next.delete(id);
+    else next.set(id, entity);
+    return next;
+  },
+}));
 vi.mock('@/lib/active-kube-context', () => ({ useActiveKubeContext: useActiveKubeContextMock }));
 
 const { useDashboardNav } = await import('./dashboard-nav');
@@ -40,6 +52,17 @@ const REPLICASET = {
   count: 7,
 };
 
+// A non-curated workloads kind (so it lands in `moreChildren`, unlike the curated
+// `jobs`/`deployments`), used to exercise Added/Deleted of a second discovered kind.
+const CONTROLLER_REVISION = {
+  apiVersion: 'apps/v1',
+  kind: 'ControllerRevision',
+  resource: 'controllerrevisions',
+  scope: 'Namespaced',
+  isCRD: false,
+  count: 2,
+};
+
 // A cluster fixture for context "prod" whose active cache has the given id/serverUid
 // and Synced condition — or no active cache when `synced` is null.
 function clusterFixture(synced: { status: string; reason: string } | null, cacheId = 'c1', serverUid = 'uid-1') {
@@ -50,85 +73,183 @@ function clusterFixture(synced: { status: string; reason: string } | null, cache
   };
 }
 
-// Mock a query result: `clusterDataKinds` plus the cache id the data belongs to (urql
-// exposes it as `operation.variables.cacheID`; the hook rejects data whose cache id
-// doesn't match the active cache). Defaults to the fixture's cache "c1".
-function setQueryResult(clusterDataKinds: unknown[], forCacheID = 'c1') {
-  useQueryMock.mockReturnValue([
-    { data: { clusterDataKinds }, operation: { variables: { id: '1', cacheID: forCacheID } } },
-    reexecuteQuery,
-  ]);
-}
-
 const hasDiscovered = (nav: { moreChildren?: unknown }[]) => nav.some((n) => n.moreChildren);
+const workloadsExtra = (nav: { id: string; moreChildren?: readonly { id: string; count?: number }[] }[]) =>
+  nav.find((n) => n.id === 'workloads')?.moreChildren ?? [];
+
+// urql accumulator stand-in. `acc` is the reduced data the mock returns; `pushFrame`
+// folds a delta through the reducer captured on the last render, exactly as urql's live
+// handler would. Each frame carries its own cache id (its provenance) — defaulting to
+// the currently-subscribed cache, but overridable to model a late frame from a
+// superseded subscription.
+let acc: unknown;
+let lastArgs: { variables?: { cacheID?: string }; pause?: boolean } | undefined;
+let lastReducer: ((prev: unknown, res: unknown) => unknown) | undefined;
+
+function pushFrame(type: string, kind: unknown, cacheID = lastArgs?.variables?.cacheID) {
+  acc = lastReducer!(acc, { clusterDataKindsWatch: { type, cacheID, kind } });
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
+  acc = undefined;
+  lastArgs = undefined;
+  lastReducer = undefined;
   useActiveKubeContextMock.mockReturnValue({ context: 'prod' });
-  setQueryResult([]);
+  useSubscriptionMock.mockImplementation((args: typeof lastArgs, reducer: typeof lastReducer) => {
+    lastArgs = args;
+    lastReducer = reducer;
+    return [{ data: acc }];
+  });
 });
 
 describe('useDashboardNav', () => {
-  it('re-executes in place on a Synced transition of the same cache, skipping the first observation', () => {
-    // First observation of cache "c1": the variables-driven query fetches it, so no
-    // manual refetch on top.
+  it('builds discovered kinds with live counts from the snapshot delta burst', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'True', reason: 'Watching' })] });
-    const { rerender } = renderHook(() => useDashboardNav());
-    expect(reexecuteQuery).not.toHaveBeenCalled();
+    const { result, rerender } = renderHook(() => useDashboardNav());
 
-    // Same cache, Synced transitions (discovery repopulated kind_catalog): refetch once.
-    useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'False', reason: 'Syncing' })] });
-    rerender();
-    expect(reexecuteQuery).toHaveBeenCalledTimes(1);
-    expect(reexecuteQuery).toHaveBeenCalledWith({ requestPolicy: 'network-only' });
+    // Before any frame: curated-only.
+    expect(hasDiscovered(result.current.nav)).toBe(false);
 
-    // No change → no refetch (no loop).
+    // The on-subscribe snapshot arrives as an Added change; the kind + its count appear.
+    pushFrame('Added', REPLICASET);
     rerender();
-    expect(reexecuteQuery).toHaveBeenCalledTimes(1);
+    const extra = workloadsExtra(result.current.nav);
+    expect(extra.map((c) => c.id)).toEqual(['apps/replicasets']);
+    expect(extra[0].count).toBe(7);
   });
 
-  it('moves the query key when the active cache changes, without a manual refetch', () => {
+  it('updates a kind’s count live on a Modified frame', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'True', reason: 'Watching' })] });
+    const { result, rerender } = renderHook(() => useDashboardNav());
+
+    pushFrame('Added', REPLICASET);
+    rerender();
+    expect(workloadsExtra(result.current.nav)[0].count).toBe(7);
+
+    // A later object write bumps the count → Modified re-emits the same kind.
+    pushFrame('Modified', { ...REPLICASET, count: 12 });
+    rerender();
+    expect(workloadsExtra(result.current.nav)[0].count).toBe(12);
+  });
+
+  it('reveals a newly-discovered kind on an Added frame and removes one on Deleted', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'True', reason: 'Watching' })] });
+    const { result, rerender } = renderHook(() => useDashboardNav());
+
+    pushFrame('Added', REPLICASET);
+    pushFrame('Added', CONTROLLER_REVISION);
+    rerender();
+    expect(
+      workloadsExtra(result.current.nav)
+        .map((c) => c.id)
+        .sort(),
+    ).toEqual(['apps/controllerrevisions', 'apps/replicasets']);
+
+    // A kind leaving the catalog is dropped.
+    pushFrame('Deleted', REPLICASET);
+    rerender();
+    expect(workloadsExtra(result.current.nav).map((c) => c.id)).toEqual(['apps/controllerrevisions']);
+  });
+
+  it('moves the subscription key on a cache swap and drops the old cache’s kinds until the new cache streams', () => {
     useClustersMock.mockReturnValue({
       clusters: [clusterFixture({ status: 'True', reason: 'Watching' }, 'c1', 'uid-1')],
     });
-    const { rerender } = renderHook(() => useDashboardNav());
-    expect(useQueryMock.mock.lastCall?.[0].variables).toEqual({ id: '1', cacheID: 'c1' });
+    const { result, rerender } = renderHook(() => useDashboardNav());
+    expect(lastArgs?.variables?.cacheID).toBe('c1');
 
-    // A cache swap (repoint / UID switch) — a different cache id moves the query key,
-    // so urql refetches on its own; no manual reexecute needed.
+    pushFrame('Added', REPLICASET);
+    rerender();
+    expect(hasDiscovered(result.current.nav)).toBe(true);
+
+    // A cache swap (repoint / UID switch) moves the subscription key. urql retains the
+    // prior cache's accumulated data until the new cache's first frame, so the
+    // cache-aware guard must reject it → curated-only in the meantime.
     useClustersMock.mockReturnValue({
       clusters: [clusterFixture({ status: 'True', reason: 'Watching' }, 'c2', 'uid-2')],
     });
     rerender();
-    expect(useQueryMock.mock.lastCall?.[0].variables).toEqual({ id: '1', cacheID: 'c2' });
-    expect(reexecuteQuery).not.toHaveBeenCalled();
-  });
-
-  it('rejects data whose cache id doesn’t match the active cache, then shows it once it catches up', () => {
-    // Active cache is "c2", but urql still holds the previous cache's result ("c1").
-    useClustersMock.mockReturnValue({
-      clusters: [clusterFixture({ status: 'True', reason: 'Watching' }, 'c2', 'uid-2')],
-    });
-    setQueryResult([REPLICASET], 'c1');
-    const { result, rerender } = renderHook(() => useDashboardNav());
+    expect(lastArgs?.variables?.cacheID).toBe('c2');
     expect(hasDiscovered(result.current.nav)).toBe(false);
 
-    // The query resolves for the active cache "c2": its kinds appear.
-    setQueryResult([REPLICASET], 'c2');
+    // Once the new cache streams, its kinds appear (and the old cache's are gone).
+    pushFrame('Added', CONTROLLER_REVISION);
     rerender();
-    expect(result.current.nav.find((n) => n.id === 'workloads')?.moreChildren?.map((c) => c.id)).toEqual([
-      'apps/replicasets',
-    ]);
+    expect(workloadsExtra(result.current.nav).map((c) => c.id)).toEqual(['apps/controllerrevisions']);
   });
 
-  it('falls back to the curated-only tree when there is no active cluster or cache', () => {
-    setQueryResult([REPLICASET], 'c1'); // stale data urql kept around
+  it('rejects a late frame from a superseded cache instead of mis-tagging it as the active one', () => {
+    useClustersMock.mockReturnValue({
+      clusters: [clusterFixture({ status: 'True', reason: 'Watching' }, 'c1', 'uid-1')],
+    });
+    const { result, rerender } = renderHook(() => useDashboardNav());
+    expect(lastArgs?.variables?.cacheID).toBe('c1');
+
+    pushFrame('Added', REPLICASET);
+    rerender();
+    expect(hasDiscovered(result.current.nav)).toBe(true);
+
+    // Swap to c2. urql keeps the c1 subscription alive until effect cleanup, so a frame
+    // from c1 can still arrive while the render already targets c2. It carries its own
+    // (c1) provenance, so it must NOT be attributed to c2 — even though c2 has streamed
+    // nothing yet, the nav stays curated-only rather than showing c1's kind.
+    useClustersMock.mockReturnValue({
+      clusters: [clusterFixture({ status: 'True', reason: 'Watching' }, 'c2', 'uid-2')],
+    });
+    rerender();
+    expect(lastArgs?.variables?.cacheID).toBe('c2');
+
+    pushFrame('Added', CONTROLLER_REVISION, 'c1'); // a straggler from the old subscription
+    rerender();
+    expect(hasDiscovered(result.current.nav)).toBe(false);
+  });
+
+  it('preserves the active cache’s catalog when a late old-cache straggler arrives after the new cache has streamed', () => {
+    useClustersMock.mockReturnValue({
+      clusters: [clusterFixture({ status: 'True', reason: 'Watching' }, 'c1', 'uid-1')],
+    });
+    const { result, rerender } = renderHook(() => useDashboardNav());
+    pushFrame('Added', REPLICASET); // c1's snapshot
+    rerender();
+
+    // Swap to c2 and let its snapshot stream two kinds.
+    useClustersMock.mockReturnValue({
+      clusters: [clusterFixture({ status: 'True', reason: 'Watching' }, 'c2', 'uid-2')],
+    });
+    rerender();
+    pushFrame('Added', REPLICASET, 'c2');
+    pushFrame('Added', CONTROLLER_REVISION, 'c2');
+    rerender();
+    expect(
+      workloadsExtra(result.current.nav)
+        .map((c) => c.id)
+        .sort(),
+    ).toEqual(['apps/controllerrevisions', 'apps/replicasets']);
+
+    // A late straggler from the superseded c1 subscription must NOT wipe c2's catalog:
+    // it's dropped, and c2's fully-accumulated kinds stay put.
+    pushFrame('Added', { ...REPLICASET, resource: 'stragglers', apiVersion: 'apps/v1' }, 'c1');
+    rerender();
+    expect(
+      workloadsExtra(result.current.nav)
+        .map((c) => c.id)
+        .sort(),
+    ).toEqual(['apps/controllerrevisions', 'apps/replicasets']);
+
+    // A subsequent legitimate c2 delta still patches the intact catalog (it isn't reset
+    // to a singleton by the straggler), so the count updates live.
+    pushFrame('Modified', { ...REPLICASET, count: 99 }, 'c2');
+    rerender();
+    expect(workloadsExtra(result.current.nav).find((c) => c.id === 'apps/replicasets')?.count).toBe(99);
+  });
+
+  it('pauses the subscription and falls back to curated-only when there is no active cluster or cache', () => {
     // No cluster matches "prod" (departed/disabled); also covers a cluster with no
-    // active cache (cacheID undefined ⇒ query paused).
+    // active cache (cacheID undefined ⇒ subscription paused).
     useClustersMock.mockReturnValue({ clusters: [] });
     const { result } = renderHook(() => useDashboardNav());
     expect(hasDiscovered(result.current.nav)).toBe(false);
-    // The query is paused when there's no cache id.
-    expect(useQueryMock.mock.lastCall?.[0].pause).toBe(true);
+    expect(lastArgs?.pause).toBe(true);
   });
 });

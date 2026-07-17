@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"time"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
@@ -63,6 +64,11 @@ type ClusterService interface {
 	// CacheStats). Empty when that cache's db isn't open (never synced / sync paused).
 	// Read on demand (not streamed).
 	ClusterDataKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) ([]ClusterDataKind, error)
+	// ClusterDataKindsWatch streams one ClusterCache's kind catalog as a delta watch:
+	// the current catalog as an Added burst on subscribe, then Added/Modified/Deleted
+	// changes as the sync engine writes objects (so per-kind counts update live). Empty
+	// (no frames) when that cache's db isn't open, mirroring ClusterDataKinds' posture.
+	ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataKindChange, error)
 	// ClusterEvents returns a cluster's beehive event timeline (newest run first),
 	// optionally filtered to one category and bounded by limit. Decoupled from the
 	// cluster/list watch — event chatter never re-emits the cluster.
@@ -136,7 +142,20 @@ type Service struct {
 
 	importer *KubeconfigImporter
 	pokeSvc  *poke.Service
+
+	// dataKindsDebounce bounds how often ClusterDataKindsWatch re-reads and diffs the
+	// kind catalog. A busy cluster pings the store on every object write; each re-read
+	// runs KindCatalog's grouped count-join over the whole object index, so without a
+	// floor sustained watch traffic would keep the reader continuously aggregating.
+	// This coalesces a burst of pings into a single re-read per interval (trailing
+	// edge), keeping the live counts responsive without scanning per object event.
+	dataKindsDebounce time.Duration
 }
+
+// defaultDataKindsDebounce floors the kind-catalog re-read interval — small enough
+// that the dashboard nav's counts still read as live, large enough to collapse a
+// high-churn cluster's per-object write pings into a bounded aggregation rate.
+const defaultDataKindsDebounce = 250 * time.Millisecond
 
 var _ ClusterService = (*Service)(nil)
 
@@ -204,17 +223,18 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	cacheCtrl.SetControllerClient(cacheCC)
 
 	return &Service{
-		bh:           bh,
-		bhStore:      bhStore,
-		watcher:      watcher,
-		coreClient:   coreClient,
-		cacheClient:  cacheClient,
-		cacheManager: cacheManager,
-		connMgr:      connMgr,
-		coreCtrl:     coreCtrl,
-		cacheCtrl:    cacheCtrl,
-		importer:     NewKubeconfigImporter(watcher, coreClient),
-		pokeSvc:      pokeSvc,
+		bh:                bh,
+		bhStore:           bhStore,
+		watcher:           watcher,
+		coreClient:        coreClient,
+		cacheClient:       cacheClient,
+		cacheManager:      cacheManager,
+		connMgr:           connMgr,
+		coreCtrl:          coreCtrl,
+		cacheCtrl:         cacheCtrl,
+		importer:          NewKubeconfigImporter(watcher, coreClient),
+		pokeSvc:           pokeSvc,
+		dataKindsDebounce: defaultDataKindsDebounce,
 	}, nil
 }
 
@@ -362,16 +382,199 @@ func (s *Service) ClusterDataKinds(ctx context.Context, clusterID ClusterID, cac
 	}
 	kinds := make([]ClusterDataKind, len(rows))
 	for i, r := range rows {
-		kinds[i] = ClusterDataKind{
-			APIVersion: r.APIVersion,
-			Kind:       r.Kind,
-			Resource:   r.Resource,
-			Scope:      r.Scope,
-			IsCRD:      r.IsCRD,
-			Count:      r.Count,
-		}
+		kinds[i] = toDataKind(r)
 	}
 	return kinds, nil
+}
+
+// toDataKind maps a store KindCatalogRow onto the domain ClusterDataKind 1:1.
+func toDataKind(r store.KindCatalogRow) ClusterDataKind {
+	return ClusterDataKind{
+		APIVersion: r.APIVersion,
+		Kind:       r.Kind,
+		Resource:   r.Resource,
+		Scope:      r.Scope,
+		IsCRD:      r.IsCRD,
+		Count:      r.Count,
+	}
+}
+
+// dataKindKey is a kind's identity within a catalog: APIVersion + Resource is unique
+// per cache (the group/version plus the plural resource name), so it keys the diff.
+func dataKindKey(k ClusterDataKind) string {
+	return k.APIVersion + "/" + k.Resource
+}
+
+// ClusterDataKindsWatch implements ClusterService. It streams one ClusterCache's kind
+// catalog as a Kubernetes-style delta watch: the current catalog as an Added burst on
+// subscribe, then one Added/Modified/Deleted change per kind as the sync engine writes
+// objects and pings the store (Count is a live LEFT JOIN, so an object write that
+// changes a kind's count re-emits it as Modified). The store's coalescing Subscribe
+// drives the re-read; the goroutine diffs each fresh catalog against the last snapshot
+// it emitted.
+//
+// The stream follows the cache's on-disk db across its whole lifecycle via the store
+// Manager's WatchDB, rather than binding once to the handle present at subscribe: if
+// the cache isn't open yet (subscribed before the sync engine opens it — the common
+// case for an unsynced cluster), the goroutine waits and binds when it opens; if the
+// db is replaced under the same CacheID (a Clear-cache delete+reopen), it rebinds to
+// the new handle and keeps diffing (the emptied catalog surfaces as Deletes, then the
+// rebuild as Adds). An unopened cache simply emits nothing until it opens or ctx ends,
+// matching ClusterDataKinds' empty posture.
+func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataKindChange, error) {
+	out := make(chan ClusterDataKindChange, 1)
+	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
+	handles, cancelHandles := s.cacheManager.WatchDB(ref.CacheID)
+	go func() {
+		defer close(out)
+		defer cancelHandles()
+
+		prev := map[string]ClusterDataKind{}
+		// emit diffs db's freshly-read catalog against prev, sending one change per
+		// difference (Added/Modified/Deleted) and updating prev. Returns false if ctx
+		// ended mid-send so the goroutine can exit.
+		emit := func(db *store.ClusterDB) bool {
+			rows, err := db.KindCatalog(ctx)
+			if err != nil {
+				return ctx.Err() == nil // transient read error: keep the stream, retry on next ping
+			}
+			next := make(map[string]ClusterDataKind, len(rows))
+			for _, r := range rows {
+				k := toDataKind(r)
+				key := dataKindKey(k)
+				next[key] = k
+				old, existed := prev[key]
+				switch {
+				case !existed:
+					if !send(ctx, out, ClusterDataKindChange{Type: ChangeAdded, Kind: k, CacheID: cacheID}) {
+						return false
+					}
+				case old != k:
+					if !send(ctx, out, ClusterDataKindChange{Type: ChangeModified, Kind: k, CacheID: cacheID}) {
+						return false
+					}
+				}
+			}
+			for key, k := range prev {
+				if _, ok := next[key]; !ok {
+					if !send(ctx, out, ClusterDataKindChange{Type: ChangeDeleted, Kind: k, CacheID: cacheID}) {
+						return false
+					}
+				}
+			}
+			prev = next
+			return true
+		}
+
+		// emitEmpty reconciles prev against an empty catalog — one Deleted per held
+		// kind, then clears prev. Called when the cache closes so a cache that never
+		// reopens (a paused/cleared cache whose engine doesn't restart) doesn't leave
+		// the dashboard permanently showing the closed cache's stale kinds. Returns
+		// false if ctx ended mid-send. (No-op when prev is already empty, so an
+		// unopened cache still emits nothing.)
+		emitEmpty := func() bool {
+			for _, k := range prev {
+				if !send(ctx, out, ClusterDataKindChange{Type: ChangeDeleted, Kind: k, CacheID: cacheID}) {
+					return false
+				}
+			}
+			prev = map[string]ClusterDataKind{}
+			return true
+		}
+
+		// db/pings track the currently-bound handle and its write-ping stream; both are
+		// nil while no cache is open. bind swaps to a new handle (nil = closed),
+		// resubscribing to its pings and emitting its current catalog as the new baseline.
+		var (
+			db        *store.ClusterDB
+			pings     <-chan struct{}
+			cancelSub func()
+		)
+
+		// A write ping arms a debounce timer instead of re-reading the catalog inline:
+		// its fire drains a coalesced burst of per-object pings into a single re-read,
+		// so a high-churn cluster can't keep KindCatalog's whole-index count-join
+		// running back-to-back. `armed` tracks whether a re-read is pending; the timer
+		// starts disarmed. (Go's timer guarantees no stale tick after Stop/Reset, so
+		// the channel never needs a manual drain.)
+		debounce := time.NewTimer(s.dataKindsDebounce)
+		debounce.Stop()
+		defer debounce.Stop()
+		armed := false
+		arm := func() {
+			if !armed {
+				debounce.Reset(s.dataKindsDebounce)
+				armed = true
+			}
+		}
+		disarm := func() {
+			if armed {
+				debounce.Stop()
+				armed = false
+			}
+		}
+
+		bind := func(next *store.ClusterDB) bool {
+			disarm() // a fresh baseline is emitted below; drop any re-read pending for the old handle
+			if cancelSub != nil {
+				cancelSub()
+				cancelSub = nil
+				pings = nil
+			}
+			db = next
+			if db == nil {
+				return emitEmpty() // cache closed; reconcile against empty so a never-reopened cache doesn't retain stale kinds
+			}
+			pings, cancelSub = db.Subscribe()
+			return emit(db)
+		}
+		defer func() {
+			if cancelSub != nil {
+				cancelSub()
+			}
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case h, ok := <-handles:
+				if !ok {
+					return // store shutting down
+				}
+				if !bind(h) {
+					return
+				}
+			case _, ok := <-pings:
+				if !ok {
+					// The bound db closed out from under us (e.g. a Clear-cache delete);
+					// drop the stale sub (and any pending re-read) and wait for WatchDB
+					// to deliver the new handle.
+					disarm()
+					pings, cancelSub, db = nil, nil, nil
+					continue
+				}
+				arm() // coalesce; the debounce fire runs the actual re-read + diff
+			case <-debounce.C:
+				armed = false
+				if !emit(db) {
+					return
+				}
+			}
+		}
+	}()
+	return out, nil
+}
+
+// send delivers one value on out, honoring ctx cancellation. Returns false if ctx
+// ended before the send completed.
+func send[T any](ctx context.Context, out chan<- T, v T) bool {
+	select {
+	case out <- v:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // updateSpec applies mutate to a copy of the cluster's spec and persists it. The

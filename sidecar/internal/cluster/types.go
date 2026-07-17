@@ -610,6 +610,22 @@ type ClusterCacheChange struct {
 	Cache *ClusterCache
 }
 
+// ClusterDataKindChange is one delta on a cache's kind-catalog watch: what happened
+// (Type) to which kind (Kind), and which cache (CacheID) it came from. On subscribe
+// every catalog row arrives as an Added change (the snapshot); thereafter a new kind
+// is Added, a kind whose fields change (chiefly its live object Count) is Modified,
+// and a kind that leaves the catalog is Deleted (carrying its last-known row).
+// Consumers key on the kind's identity (APIVersion + Resource). CacheID carries the
+// frame's provenance: a client watching the active cache can reject a late frame from
+// a superseded cache (one still draining after a cache/context switch) by cache id,
+// rather than inferring provenance from render state. Binds 1:1 to the GraphQL
+// ClusterDataKindChange.
+type ClusterDataKindChange struct {
+	Type    ChangeType
+	Kind    ClusterDataKind
+	CacheID ClusterCacheID
+}
+
 // --- Cache statistics types (for the ClusterCache GraphQL resolver) ---
 
 // CachedResource is the per-resource breakdown of one cluster's cache.

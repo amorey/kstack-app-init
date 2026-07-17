@@ -44,6 +44,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/amorey/gochan/watch"
+
 	"github.com/kubetail-org/kstack-app/sidecar/internal/sqlitemigrate"
 )
 
@@ -104,14 +106,29 @@ type Manager struct {
 	mu    sync.RWMutex
 	dbs   map[int64]*ClusterDB
 	close bool
+
+	// dbWatchers holds one latest-value hub per watched CacheID, publishing the
+	// cache's open handle as it changes (open/close/replace). Created lazily on
+	// the first WatchDB for a CacheID and torn down when its last subscriber
+	// cancels (refs → 0), so it doesn't accumulate a hub per cache incarnation.
+	dbWatchers map[int64]*dbWatch
+}
+
+// dbWatch is one CacheID's handle-change hub plus a refcount of live WatchDB
+// subscribers (so the Manager can drop the hub once no one is watching).
+type dbWatch struct {
+	hub  *watch.Hub[*ClusterDB]
+	tx   *watch.Sender[*ClusterDB]
+	refs int
 }
 
 // NewManager returns a Manager rooted at dataDir. The clusters directory is
 // created lazily on first Open.
 func NewManager(dataDir string) *Manager {
 	return &Manager{
-		dataDir: dataDir,
-		dbs:     make(map[int64]*ClusterDB),
+		dataDir:    dataDir,
+		dbs:        make(map[int64]*ClusterDB),
+		dbWatchers: make(map[int64]*dbWatch),
 	}
 }
 
@@ -150,7 +167,57 @@ func (m *Manager) Open(ctx context.Context, ref CacheRef) (*ClusterDB, error) {
 	}
 	cdb.startJanitor()
 	m.dbs[ref.CacheID] = cdb
+	m.publishDBLocked(ref.CacheID, cdb)
 	return cdb, nil
+}
+
+// WatchDB streams the open ClusterDB handle for a CacheID as it changes over the
+// cache's lifecycle: the current handle (or nil if not open) on subscribe, then a
+// fresh value whenever that CacheID is opened (nil→handle), closed (handle→nil),
+// or replaced (e.g. a Clear-cache delete+reopen yields nil then the new handle).
+// Latest-value semantics (via gochan/watch) — a slow consumer converges on the
+// current handle. The channel closes on Manager Shutdown. Long-lived readers (the
+// dashboard's kind catalog watch) use this so they rebind to a cache that opens
+// after they subscribe, or that is swapped under them, instead of binding once to
+// Lookup.
+func (m *Manager) WatchDB(cacheID int64) (<-chan *ClusterDB, func()) {
+	m.mu.Lock()
+	if m.close {
+		m.mu.Unlock()
+		ch := make(chan *ClusterDB)
+		close(ch)
+		return ch, func() {}
+	}
+	w := m.dbWatchers[cacheID]
+	if w == nil {
+		// Seed the hub with the current handle so a subscriber that arrives while
+		// the cache is already open sees it immediately (nil when not open).
+		hub := watch.New(m.dbs[cacheID])
+		w = &dbWatch{hub: hub, tx: hub.Sender()}
+		m.dbWatchers[cacheID] = w
+	}
+	w.refs++
+	rx := w.hub.Receiver()
+	m.mu.Unlock()
+
+	return rx.Chan(), func() {
+		m.mu.Lock()
+		if w.refs--; w.refs == 0 {
+			w.hub.Close()
+			delete(m.dbWatchers, cacheID)
+		}
+		m.mu.Unlock()
+		rx.Close()
+	}
+}
+
+// publishDBLocked pushes db (nil = closed) to a CacheID's handle hub if anyone is
+// watching it. No-op when there are no subscribers — a later WatchDB seeds itself
+// from the current m.dbs entry. Must be called with m.mu held.
+func (m *Manager) publishDBLocked(cacheID int64, db *ClusterDB) {
+	if w := m.dbWatchers[cacheID]; w != nil {
+		w.tx.Send(db) //nolint:errcheck // Send never blocks; a closed hub is a no-op
+	}
 }
 
 // Lookup returns the ClusterDB for the given CacheID if it is currently open, or
@@ -214,6 +281,9 @@ func (m *Manager) Close(ctx context.Context, cacheID int64) error {
 	m.mu.Lock()
 	cdb, ok := m.dbs[cacheID]
 	delete(m.dbs, cacheID)
+	if ok {
+		m.publishDBLocked(cacheID, nil)
+	}
 	m.mu.Unlock()
 	if !ok {
 		return nil
@@ -227,6 +297,11 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	m.close = true
 	dbs := m.dbs
 	m.dbs = nil
+	// Hard-close every handle hub so each WatchDB subscriber's stream ends.
+	for _, w := range m.dbWatchers {
+		w.hub.Close()
+	}
+	m.dbWatchers = nil
 	m.mu.Unlock()
 
 	var firstErr error
@@ -354,15 +429,15 @@ type KindCatalogRow struct {
 
 // KindCatalog reads the cache's discovered kind catalog: one row per kind the
 // cluster's API server advertises (built-ins + CRDs), ordered for stable display.
-// Each row's Count is the number of cached objects of that kind (a LEFT JOIN, so
-// an advertised-but-empty kind counts 0). Empty until the sync engine has
-// populated it.
+// Each row's Count is the number of cached objects of that kind, read from the
+// trigger-maintained kind_counts aggregate (a point LEFT JOIN keyed by
+// api_version+kind, so an advertised-but-empty kind counts 0) — O(kinds), never a
+// scan of the objects table. Empty until the sync engine has populated it.
 func (c *ClusterDB) KindCatalog(ctx context.Context) ([]KindCatalogRow, error) {
 	rows, err := c.readDB.QueryContext(ctx,
-		`SELECT kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd, COUNT(o.uid)
+		`SELECT kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd, COALESCE(knt.count, 0)
 		 FROM kind_catalog kc
-		 LEFT JOIN objects o ON o.api_version = kc.api_version AND o.kind = kc.kind
-		 GROUP BY kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd
+		 LEFT JOIN kind_counts knt ON knt.api_version = kc.api_version AND knt.kind = kc.kind
 		 ORDER BY kc.api_version, kc.kind`)
 	if err != nil {
 		return nil, err

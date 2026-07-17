@@ -115,11 +115,13 @@ type ClustersContextValue = {
 const ClustersContext = createContext<ClustersContextValue | null>(null);
 
 // A map keyed by object id, accumulated from a delta stream.
-type Keyed<T> = ReadonlyMap<string, T>;
+export type Keyed<T> = ReadonlyMap<string, T>;
 
 // Apply one delta-watch change to a keyed map, returning a NEW map (fresh
 // identity so React re-renders): Added/Modified upsert by id, Deleted removes.
-function applyChange<T>(prev: Keyed<T> | undefined, type: string, id: string, entity: T): Keyed<T> {
+// Shared by every delta-watch reducer (this file's cluster/cache streams and the
+// dashboard nav's kind-catalog stream).
+export function applyChange<T>(prev: Keyed<T> | undefined, type: string, id: string, entity: T): Keyed<T> {
   const next = new Map(prev);
   if (type === 'Deleted') next.delete(id);
   else next.set(id, entity);

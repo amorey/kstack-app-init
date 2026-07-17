@@ -146,6 +146,21 @@ func (f *fakeClusterService) ClusterDataKinds(_ context.Context, clusterID clust
 	return f.kinds[clusterID], nil
 }
 
+func (f *fakeClusterService) ClusterDataKindsWatch(ctx context.Context, clusterID cluster.ClusterID, _ cluster.ClusterCacheID) (<-chan cluster.ClusterDataKindChange, error) {
+	f.mu.Lock()
+	snap := append([]cluster.ClusterDataKind(nil), f.kinds[clusterID]...)
+	f.mu.Unlock()
+	ch := make(chan cluster.ClusterDataKindChange, len(snap))
+	for _, k := range snap {
+		ch <- cluster.ClusterDataKindChange{Type: cluster.ChangeAdded, Kind: k}
+	}
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
+
 func (f *fakeClusterService) ClusterEvents(_ context.Context, id cluster.ClusterID, _ *string, _ *int) ([]cluster.Event, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -488,6 +503,82 @@ func TestClusterDataKindsResolver(t *testing.T) {
 	}
 	if len(resp2.Errors) > 0 || len(resp2.Data.ClusterDataKinds) != 0 {
 		t.Fatalf("unknown cluster should yield empty kinds, got %s", raw2)
+	}
+}
+
+// clusterDataKindsWatch streams the kind catalog as a delta watch: the resolver
+// adapts the service's ClusterDataKindChange stream to the wire 1:1, so the snapshot
+// arrives as Added changes carrying the kind's fields (incl. the live count) and the
+// stream stays open for live updates.
+func TestClusterDataKindsWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
+	fix := clusterFixtures()
+	svc := newFakeClusterService(fix)
+	id := fix[0].id
+	svc.kinds = map[cluster.ClusterID][]cluster.ClusterDataKind{
+		id: {
+			{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Scope: "Namespaced", IsCRD: false, Count: 3},
+			{APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: "Namespaced", IsCRD: true, Count: 0},
+		},
+	}
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{
+		ClusterSvc: svc, Auth: newFakeAuth(auth.Identity{}),
+	}))
+	t.Cleanup(srv.Close)
+
+	q := `subscription { clusterDataKindsWatch(id: "` + strconv.FormatInt(int64(id), 10) +
+		`", cacheID: "` + strconv.FormatInt(int64(id), 10) + `") { type kind { apiVersion kind resource count } } }`
+	resp := openSSESubscription(t, srv.URL, "", q)
+	defer resp.Body.Close()
+	events := sseEvents(t, resp)
+
+	seen := map[string]int{}
+	deadline := time.After(2 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("stream closed before snapshot completed")
+			}
+			if ev.event != "next" {
+				continue
+			}
+			if !strings.Contains(ev.data, `"type":"Added"`) {
+				t.Fatalf("snapshot change should be Added, got: %s", ev.data)
+			}
+			var frame struct {
+				Data struct {
+					ClusterDataKindsWatch struct {
+						Type string `json:"type"`
+						Kind struct {
+							Kind  string `json:"kind"`
+							Count int    `json:"count"`
+						} `json:"kind"`
+					} `json:"clusterDataKindsWatch"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
+				t.Fatalf("decode frame %s: %v", ev.data, err)
+			}
+			seen[frame.Data.ClusterDataKindsWatch.Kind.Kind] = frame.Data.ClusterDataKindsWatch.Kind.Count
+		case <-deadline:
+			t.Fatalf("timed out waiting for snapshot; saw %v", seen)
+		}
+	}
+	if seen["Deployment"] != 3 {
+		t.Errorf("Deployment count: want 3, got %d", seen["Deployment"])
+	}
+	if _, ok := seen["Widget"]; !ok {
+		t.Errorf("Widget kind missing from snapshot: %v", seen)
+	}
+
+	// The stream stays open after the snapshot (no completion).
+	select {
+	case _, ok := <-events:
+		if !ok {
+			t.Fatal("stream closed; want it held open")
+		}
+	case <-time.After(250 * time.Millisecond):
+		// stayed open ✓
 	}
 }
 
