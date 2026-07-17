@@ -31,7 +31,6 @@
 // active cache — the prior cache's retained kinds, or a late frame from a superseded
 // subscription — before the new cache's first frame lands.
 import { useMemo } from 'react';
-import { useSubscription } from 'urql';
 
 import { graphql } from '@/gql';
 import type { ClusterDataKindsWatchSubscription as ClusterDataKindsWatchSubscriptionType } from '@/gql/graphql';
@@ -40,6 +39,7 @@ import { useClusters, applyChange } from '@/lib/clusters';
 import type { Keyed } from '@/lib/clusters';
 import { buildDashboardNav } from '@/lib/dashboard-resources';
 import type { DashboardNavNode } from '@/lib/dashboard-resources';
+import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 
 const ClusterDataKindsWatchSubscription = graphql(`
   subscription ClusterDataKindsWatch($id: ObjectID!, $cacheID: ObjectID!) {
@@ -101,14 +101,16 @@ export function useDashboardNav(): { nav: DashboardNavNode[] } {
   // the old stream alive until effect cleanup) is *dropped* — preserving the active
   // cache's accumulated catalog rather than wiping it — while the active cache's own
   // first frame after a swap (prev still holds the old cache) starts a fresh catalog so
-  // the two caches' kinds never mix.
-  const [{ data }] = useSubscription(
+  // the two caches' kinds never mix. A transport reconnect (same cacheID, full snapshot
+  // replay) is handled one level down: useWatchSubscription resets the catalog to
+  // `undefined` before the replay streams.
+  const [{ data }] = useWatchSubscription(
     {
       query: ClusterDataKindsWatchSubscription,
       variables: { id: clusterID ?? '', cacheID: cacheID ?? '' },
       pause: !clusterID || !cacheID,
     },
-    (prev: Catalog | undefined, res): Catalog => {
+    (prev: Catalog | undefined, res) => {
       const { type, kind, cacheID: frameCacheID } = res.clusterDataKindsWatch;
       // Drop a frame that isn't from the active cache — a late straggler from the old
       // subscription — leaving the active cache's accumulated catalog untouched. (Once

@@ -16,9 +16,14 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import { subscriptionExchange } from 'urql';
 
 import { errorMessage, reportError } from '../error-bus';
+import { clearStatus, markConnected, markDisconnected } from './transport-status';
 
-// Mirrors the JSON envelopes the Rust bridge writes into the channel.
+// Mirrors the JSON envelopes the Rust bridge writes into the channel. `open`
+// is emitted once, before any `next`, when the SSE connection is actually
+// established (the sidecar returned 200) — the signal this file marks the op
+// connected on (see below).
 type SubMessage =
+  | { type: 'open' }
   | { type: 'next'; payload: { data?: unknown; errors?: unknown } }
   | { type: 'error'; payload: unknown }
   | { type: 'complete' };
@@ -51,6 +56,27 @@ const dropOp = (id: number) => {
 // subscribed is reconnected with capped exponential backoff. Only a
 // consumer-initiated teardown actually ends the subscription.
 //
+// Because a reconnect is invisible to urql (the operation and its accumulated
+// `useSubscription` state survive), the connection lifecycle is published out
+// of band on the transport-status side-channel (transport-status.ts), keyed by
+// `operation.key`: `markConnected` on every `open` (which also bumps a
+// generation), `markDisconnected` on every drop. useWatchSubscription reads it
+// to (1) expose `connected`, and (2) reset its accumulator when the generation
+// changes — so the reset signal no longer rides the data channel as a synthetic
+// frame, and `data` is only ever real GraphQL data. The sidecar replays a full
+// snapshot on every subscribe, so a delta reducer that starts over on the
+// generation bump ends up holding exactly the current server state — an object
+// deleted during an outage, which the replay simply omits, can't linger.
+//
+// The generation bumps on the host's `open` frame, which arrives once per
+// connection ahead of the snapshot: it fires on a real connection (even an
+// empty snapshot, which replays no `next`), but *not* on a failed dial — the
+// host acks `graphql_subscribe` before it dials, then reports a connect failure
+// as an `error` frame, so bumping on the ack would wrongly reset last-known
+// state on every failed retry during an outage. Both the status notify and the
+// data frames are driven off this one ordered channel, and the hook's reset is
+// generation-gated (idempotent), so no frame can outrace the reset.
+//
 // An `error` frame is now transport-level only: gqlgen's SSE transport delivers
 // GraphQL operation errors inside the `next` payload's `errors` field, so the
 // host emits `error` solely when the connection itself fails (dial/handshake/
@@ -60,9 +86,14 @@ const dropOp = (id: number) => {
 // always-on engine + credential pusher re-establish auth/upstream). Surfacing
 // it terminally would also kill the very stream that recovery flows through.
 export const tauriSubscriptionExchange = subscriptionExchange({
-  forwardSubscription(operation) {
+  // urql calls this with `(request, operation)`: `request` carries the printed
+  // query + variables, `operation` carries the stable `key` we stamp transport
+  // status under (the same key the client's operation — and useWatchSubscription
+  // — derive from query+variables).
+  forwardSubscription(request, operation) {
     return {
       subscribe(sink) {
+        const { key } = operation;
         let cancelled = false;
         let opId: number | null = null;
         let attempt = 0;
@@ -70,6 +101,10 @@ export const tauriSubscriptionExchange = subscriptionExchange({
 
         function scheduleReconnect(message: string, cause?: unknown) {
           if (cancelled) return;
+          // The connection is down: publish it so the hook can render
+          // "reconnecting" (it keeps its last-known data — the generation is
+          // untouched until the next `open`).
+          markDisconnected(key);
           // Always dropOp before forgetting the id: most terminal paths
           // (server-sent `complete`/`error`, fan_out_complete on WS drop)
           // have the host already remove the entry, but the malformed-
@@ -115,7 +150,12 @@ export const tauriSubscriptionExchange = subscriptionExchange({
               end(`malformed subscription frame: ${raw}`, raw);
               return;
             }
-            if (msg.type === 'next') {
+            if (msg.type === 'open') {
+              // The connection is up and the snapshot is about to stream. Mark
+              // the op connected (bumping its generation), so the hook resets
+              // its accumulator before the reconnect's snapshot folds in.
+              markConnected(key);
+            } else if (msg.type === 'next') {
               attempt = 0; // a good frame proves the connection is healthy
               sink.next(msg.payload as never);
             } else if (msg.type === 'error') {
@@ -127,8 +167,8 @@ export const tauriSubscriptionExchange = subscriptionExchange({
           };
 
           invoke<number>('graphql_subscribe', {
-            query: operation.query,
-            variables: operation.variables ?? {},
+            query: request.query,
+            variables: request.variables ?? {},
             channel,
           })
             .then((id) => {
@@ -151,6 +191,7 @@ export const tauriSubscriptionExchange = subscriptionExchange({
             cancelled = true;
             if (retryTimer) clearTimeout(retryTimer);
             if (opId != null) dropOp(opId);
+            clearStatus(key);
           },
         };
       },

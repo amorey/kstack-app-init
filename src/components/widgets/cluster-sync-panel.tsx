@@ -23,7 +23,7 @@
 import { ChevronDown, Database, Pause, Play, Power, PowerOff, RotateCw, Slash, Trash2 } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
 import ReactTimeAgo, { type Formatter } from 'react-timeago';
-import { useMutation, useSubscription } from 'urql';
+import { useMutation } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
 import { Spinner } from '@kubetail/ui/elements/spinner';
@@ -34,6 +34,7 @@ import { graphql } from '@/gql';
 import { type Cluster, formatBytes, useClusters } from '@/lib/clusters';
 import { type AppDialogProps } from '@/lib/dialog';
 import { errorMessage, reportError } from '@/lib/error-bus';
+import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 
 const ClusterEnabledSetMutation = graphql(`
   mutation ClusterEnabledSet($id: ObjectID!, $enabled: Boolean!) {
@@ -136,7 +137,7 @@ function foldRun(prev: EventRun[] | undefined, ev: RawEvent): EventRun[] {
 // The per-cluster connection-probe history (event category "connection"),
 // subscribed only while a row's diagnostics are open.
 function useConnectionAttempts(clusterId: string): EventRun[] {
-  const [{ data }] = useSubscription<{ clusterEventsWatch: RawEvent }, EventRun[]>(
+  const [{ data }] = useWatchSubscription<{ clusterEventsWatch: RawEvent }, EventRun[]>(
     { query: ClusterConnectionEventsSubscription, variables: { id: clusterId } },
     (prev, resp) => foldRun(prev, resp.clusterEventsWatch),
   );
@@ -163,7 +164,7 @@ const ClusterSyncEventsSubscription = graphql(`
 `);
 
 function useSyncEvents(cacheId: string): EventRun[] {
-  const [{ data }] = useSubscription<{ clusterCacheEventsWatch: RawEvent }, EventRun[]>(
+  const [{ data }] = useWatchSubscription<{ clusterCacheEventsWatch: RawEvent }, EventRun[]>(
     { query: ClusterSyncEventsSubscription, variables: { id: cacheId } },
     (prev, resp) => foldRun(prev, resp.clusterCacheEventsWatch),
   );
@@ -196,7 +197,7 @@ function useNextCheck(clusterId: string): NextCheck {
   // last scheduled time only across the in-flight window; once `probing` is false a
   // null is authoritative and must *clear* the countdown, not freeze a stale one.
   // `probing` is always taken from the latest frame (no holding).
-  const [{ data }] = useSubscription<
+  const [{ data }] = useWatchSubscription<
     { clusterScheduleWatch: { nextRequeueAt: string | null; probing: boolean } },
     { nextRequeueAt: string | null; probing: boolean }
   >({ query: ClusterScheduleSubscription, variables: { id: clusterId } }, (prev, resp) => {

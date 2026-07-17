@@ -30,10 +30,15 @@
 //! We translate that into the webview channel envelope the frontend already
 //! speaks (`subscribe-exchange.ts`):
 //! ```text
+//!   open     → {"type":"open"}    once, on 200, before any `next`
 //!   next     → {"type":"next","payload":<graphql.Response>}
 //!   complete → {"type":"complete"}                (also synthesized on EOF/drop)
 //!   error    → {"type":"error","payload":<message>}  (transport-level only)
 //! ```
+//! `open` is the "connection established" signal: it fires only after the dial
+//! succeeds (200 received), so the frontend can reset its per-subscription
+//! accumulators on a reconnect without also clearing them on a failed dial
+//! (which emits `error` instead). See `subscribe-exchange.ts`.
 //!
 //! There's no shared session, no `connection_init`/`ack`, and no demultiplexing:
 //! a dropped connection ends exactly one subscription, and the frontend's
@@ -71,6 +76,13 @@ pub trait FrameSink: Send + Sync {
 /// synthesized when the connection ends without one (sidecar restart, sleep,
 /// network loss) so the frontend's reconnect path fires.
 const COMPLETE_FRAME: &str = r#"{"type":"complete"}"#;
+
+/// The "connection established" envelope. Sent once, before any `next`, after
+/// the dial succeeds (200 received) — never on a failed dial (that emits
+/// `error`). The frontend resets its per-subscription accumulators on this
+/// frame so a reconnect's snapshot replaces rather than merges. See
+/// `subscribe-exchange.ts`.
+const OPEN_FRAME: &str = r#"{"type":"open"}"#;
 
 /// Opens one SSE connection per subscription and tracks a cancel handle for
 /// each so [`SubscriptionClient::unsubscribe`] can tear it down.
@@ -169,7 +181,13 @@ async fn run_subscription(
     };
 
     match opened {
-        Ok(resp) => stream_to_sink(resp, &sink, cancel_rx).await,
+        Ok(resp) => {
+            // Signal the live connection before streaming its snapshot, so the
+            // frontend resets accumulators here (and only here — a failed dial
+            // takes the `Err` arm and emits no `open`).
+            sink.send_frame(OPEN_FRAME.to_string());
+            stream_to_sink(resp, &sink, cancel_rx).await
+        }
         Err(err) => {
             // Connect / handshake / non-200: report it as a transport error.
             // The frontend treats `error` the same as a drop — it reconnects.
@@ -389,6 +407,7 @@ mod tests {
             .await
             .expect("subscribe");
 
+        assert_eq!(recv(&mut rx).await, OPEN_FRAME);
         assert_eq!(
             recv(&mut rx).await,
             r#"{"type":"next","payload":{"data":{"tick":1}}}"#
@@ -426,6 +445,7 @@ mod tests {
             .await
             .expect("subscribe");
 
+        assert_eq!(recv(&mut rx).await, OPEN_FRAME);
         assert_eq!(
             recv(&mut rx).await,
             r#"{"type":"next","payload":{"data":{"tick":1}}}"#
@@ -458,6 +478,7 @@ mod tests {
             .await
             .expect("subscribe");
 
+        assert_eq!(recv(&mut rx).await, OPEN_FRAME);
         assert_eq!(
             recv(&mut rx).await,
             r#"{"type":"next","payload":{"data":1}}"#
@@ -495,6 +516,7 @@ mod tests {
             .await
             .expect("subscribe");
 
+        assert_eq!(recv(&mut rx).await, OPEN_FRAME);
         assert_eq!(
             recv(&mut rx).await,
             r#"{"type":"next","payload":{"data":1}}"#
@@ -517,7 +539,9 @@ mod tests {
     }
 
     /// A dead socket surfaces as an `error` frame (not a hang) within the
-    /// connect budget — the frontend's reconnect path.
+    /// connect budget — the frontend's reconnect path. The `error` is the
+    /// *first* frame: no `open` precedes it, so the frontend won't reset
+    /// accumulators on a failed dial.
     #[tokio::test]
     async fn connect_failure_emits_error_frame() {
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");

@@ -22,10 +22,11 @@
 // as the sidecar opens the browser; the signed-in state lands later via the
 // subscription (or not at all if the user abandons the browser flow).
 import { createContext, useCallback, useContext, useMemo } from 'react';
-import { useMutation, useSubscription } from 'urql';
+import { useMutation } from 'urql';
 
 import { graphql } from '@/gql';
 import type { AuthStateWatchSubscription } from '@/gql/graphql';
+import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 
 // AuthState mirrors the sidecar's GraphQL shape: `authenticated` is the explicit
 // sign-in signal; `identity` carries the verified claims and is non-null only
@@ -88,7 +89,12 @@ function toAuthState(s: AuthStateWatchSubscription['authStateWatch']): AuthState
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [{ data }] = useSubscription({ query: AuthStateWatchSubscription });
+  // Last-value semantics; useWatchSubscription returns to "no frame yet" (→
+  // loading) on a transport reconnect, until the stream replays its snapshot.
+  const [{ data }] = useWatchSubscription<AuthStateWatchSubscription, AuthStateWatchSubscription>(
+    { query: AuthStateWatchSubscription },
+    (_prev, next) => next,
+  );
   const [, runStartLogin] = useMutation(AuthLoginStartMutation);
   const [, runLogout] = useMutation(AuthLogoutMutation);
 

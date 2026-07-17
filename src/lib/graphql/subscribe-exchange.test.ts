@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import { pipe, subscribe } from 'wonka';
-import { Client, gql } from 'urql';
+import { Client, createRequest, gql } from 'urql';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { mockTauriCore } from '@/test-utils';
@@ -26,6 +26,20 @@ vi.mock('@tauri-apps/api/core', () => factory());
 const reportErrorMock = vi.fn();
 vi.mock('../error-bus', () => ({
   reportError: (...args: unknown[]) => reportErrorMock(...args),
+  errorMessage: (err: unknown) => String(err),
+}));
+
+// The exchange's only job re: connection status is to call this side-channel
+// at the right moments; the generation/connected *semantics* it drives are
+// covered by transport-status.test.ts, and the real end-to-end wiring by
+// use-watch-subscription.test.tsx. So here we mock it and assert the contract.
+const markConnectedMock = vi.fn();
+const markDisconnectedMock = vi.fn();
+const clearStatusMock = vi.fn();
+vi.mock('./transport-status', () => ({
+  markConnected: (...args: unknown[]) => markConnectedMock(...args),
+  markDisconnected: (...args: unknown[]) => markDisconnectedMock(...args),
+  clearStatus: (...args: unknown[]) => clearStatusMock(...args),
 }));
 
 const { tauriSubscriptionExchange } = await import('./subscribe-exchange');
@@ -45,7 +59,15 @@ const TICK = gql`
   }
 `;
 
+// The op key the exchange stamps its transport status under — derived from the
+// query+variables exactly like the operation the client executes, so the test
+// can read the same registry entry the exchange writes.
+const KEY = createRequest(TICK, {}).key;
+
 const NEXT = (n: number) => JSON.stringify({ type: 'next', payload: { data: { tick: n } } });
+// The host's "connection established" frame — emitted before the snapshot on
+// every successful connection; the exchange marks the op connected on it.
+const OPEN = JSON.stringify({ type: 'open' });
 
 // Flush the pending microtask queue (the async invoke('graphql_subscribe')
 // chain) without advancing fake timers.
@@ -54,7 +76,9 @@ const flush = async () => {
   await Promise.resolve();
 };
 
-// Subscribe and collect every delivered `tick`.
+// Subscribe and collect every delivered `tick` — the reset signal no longer
+// rides the sink (it's on the transport-status side-channel), so `data` here is
+// only ever real GraphQL data.
 function start() {
   const client = makeClient();
   const seen: number[] = [];
@@ -71,6 +95,9 @@ describe('tauriSubscriptionExchange', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     reportErrorMock.mockReset();
+    markConnectedMock.mockReset();
+    markDisconnectedMock.mockReset();
+    clearStatusMock.mockReset();
     channels.length = 0;
     // graphql_subscribe hands back a unique, increasing op id per connect.
     let id = 0;
@@ -99,6 +126,8 @@ describe('tauriSubscriptionExchange', () => {
       expect.objectContaining({ query: expect.stringContaining('tick'), variables: {}, channel: expect.any(Object) }),
     );
 
+    liveChannel().onmessage!(OPEN);
+    expect(markConnectedMock).toHaveBeenCalledWith(KEY);
     liveChannel().onmessage!(NEXT(1));
     liveChannel().onmessage!(NEXT(2));
     expect(seen).toEqual([1, 2]);
@@ -106,25 +135,33 @@ describe('tauriSubscriptionExchange', () => {
     unsubscribe();
     await flush();
     expect(invokeMock).toHaveBeenCalledWith('graphql_unsubscribe', { id: 1 });
+    // Teardown forgets the op's transport status.
+    expect(clearStatusMock).toHaveBeenCalledWith(KEY);
   });
 
   it('reconnects (with backoff) when the transport completes while still subscribed', async () => {
     vi.useFakeTimers();
     const { seen, unsubscribe } = start();
     await flush();
+    liveChannel().onmessage!(OPEN); // first connection established
     expect(subscribeCalls()).toBe(1);
+    expect(markConnectedMock).toHaveBeenCalledTimes(1);
 
     // A transport-level `complete` must NOT tear the urql subscription down;
-    // it triggers a backoff reconnect instead. The user sees the banner.
+    // it marks the op disconnected and triggers a backoff reconnect instead.
     liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
     expect(reportErrorMock).toHaveBeenCalledWith(expect.objectContaining({ source: 'subscription' }));
+    expect(markDisconnectedMock).toHaveBeenCalledWith(KEY);
     expect(subscribeCalls()).toBe(1); // not immediate
 
     await vi.advanceTimersByTimeAsync(1_000); // first backoff step
     expect(subscribeCalls()).toBe(2);
 
-    // The reconnected channel delivers data again.
+    // The reconnected channel opens (a second markConnected — a new generation
+    // that drives the hook's reset) and delivers data again.
+    liveChannel().onmessage!(OPEN);
     liveChannel().onmessage!(NEXT(7));
+    expect(markConnectedMock).toHaveBeenCalledTimes(2);
     expect(seen).toEqual([7]);
 
     unsubscribe();
@@ -135,8 +172,10 @@ describe('tauriSubscriptionExchange', () => {
     const { seen, unsubscribe } = start();
     await flush();
 
+    liveChannel().onmessage!(OPEN); // first connection established
     liveChannel().onmessage!(JSON.stringify({ type: 'error', payload: 'boom' }));
     expect(reportErrorMock).toHaveBeenCalledWith(expect.objectContaining({ source: 'subscription' }));
+    expect(markDisconnectedMock).toHaveBeenCalledWith(KEY);
 
     await vi.advanceTimersByTimeAsync(1_000);
     expect(subscribeCalls()).toBe(2);
@@ -144,8 +183,10 @@ describe('tauriSubscriptionExchange', () => {
     // Healthy frame ⇒ backoff resets and no further errors are reported
     // (the banner auto-dismisses, so "recovered" == "we go quiet").
     reportErrorMock.mockClear();
+    liveChannel().onmessage!(OPEN);
     liveChannel().onmessage!(NEXT(1));
     expect(seen).toEqual([1]);
+    expect(markConnectedMock).toHaveBeenCalledTimes(2);
     expect(reportErrorMock).not.toHaveBeenCalled();
 
     // Backoff was reset by the healthy frame: the next drop reconnects
@@ -230,6 +271,7 @@ describe('tauriSubscriptionExchange', () => {
     vi.useFakeTimers();
     const { seen, unsubscribe } = start();
     await flush();
+    liveChannel().onmessage!(OPEN); // first connection established
 
     liveChannel().onmessage!('}{ not json');
     expect(reportErrorMock).toHaveBeenCalledWith(
@@ -238,8 +280,75 @@ describe('tauriSubscriptionExchange', () => {
 
     await vi.advanceTimersByTimeAsync(1_000);
     expect(subscribeCalls()).toBe(2);
+    liveChannel().onmessage!(OPEN);
     liveChannel().onmessage!(NEXT(5));
     expect(seen).toEqual([5]);
+
+    unsubscribe();
+  });
+
+  it('marks connected on the `open` frame, not on the subscribe ack, and sends no data on open', async () => {
+    const { seen, unsubscribe } = start();
+    await flush();
+    // The ack alone means nothing — the host acks before it dials, so keying
+    // connected off it would claim a connection that hasn't opened.
+    expect(markConnectedMock).not.toHaveBeenCalled();
+    expect(seen).toEqual([]);
+
+    liveChannel().onmessage!(OPEN);
+    // `open` marks connected but pushes nothing onto the data channel.
+    expect(markConnectedMock).toHaveBeenCalledWith(KEY);
+    expect(seen).toEqual([]);
+
+    liveChannel().onmessage!(NEXT(1));
+    expect(seen).toEqual([1]);
+
+    unsubscribe();
+  });
+
+  it('marks connected again on a reconnect open even when the replayed snapshot is empty', async () => {
+    vi.useFakeTimers();
+    const { seen, unsubscribe } = start();
+    await flush();
+    liveChannel().onmessage!(OPEN);
+    expect(markConnectedMock).toHaveBeenCalledTimes(1);
+
+    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    // The reconnection opens but the server has nothing to replay (everything
+    // was deleted during the outage) — the `open` frame alone must mark
+    // connected again (a fresh generation, so the hook resets), without any
+    // `next` to ride on.
+    liveChannel().onmessage!(OPEN);
+    expect(markConnectedMock).toHaveBeenCalledTimes(2);
+    expect(seen).toEqual([]);
+
+    unsubscribe();
+  });
+
+  it('does not mark connected for a reconnect attempt whose dial fails', async () => {
+    vi.useFakeTimers();
+    const { unsubscribe } = start();
+    await flush();
+    liveChannel().onmessage!(OPEN);
+    expect(markConnectedMock).toHaveBeenCalledTimes(1);
+
+    // Drop, then reconnect. The host acks `graphql_subscribe` (a new channel is
+    // opened) but the dial fails, so it emits an `error` frame instead of
+    // `open` — modelling a sidecar that's down. No `open` ⇒ no markConnected,
+    // so the hook keeps its last-known data through the outage.
+    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(subscribeCalls()).toBe(2);
+    liveChannel().onmessage!(JSON.stringify({ type: 'error', payload: 'sidecar down' }));
+    expect(markConnectedMock).toHaveBeenCalledTimes(1); // still just the first open
+    expect(markDisconnectedMock).toHaveBeenCalledWith(KEY);
+
+    // The next attempt connects for real (`open`) and marks connected again.
+    await vi.advanceTimersByTimeAsync(2_000);
+    liveChannel().onmessage!(OPEN);
+    expect(markConnectedMock).toHaveBeenCalledTimes(2);
 
     unsubscribe();
   });

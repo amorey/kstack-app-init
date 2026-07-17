@@ -26,8 +26,20 @@ const { useClustersMock, useActiveKubeContextMock } = vi.hoisted(() => ({
   useClustersMock: vi.fn(),
   useActiveKubeContextMock: vi.fn(),
 }));
+// useWatchSubscription reads the transport-status registry (keyed by op key) to
+// drive its generation-based reset. Mock it so `pushReset` bumps the generation
+// directly (the real registry + reset semantics are covered end-to-end in
+// use-watch-subscription.test.tsx). The snapshot is a stable per-generation
+// object so useSyncExternalStore's getSnapshot stays referentially stable.
+const { statusState } = vi.hoisted(() => ({
+  statusState: { snapshot: { connected: true, generation: 0 } },
+}));
 
-vi.mock('urql', () => ({ useSubscription: useSubscriptionMock }));
+vi.mock('urql', () => ({ useSubscription: useSubscriptionMock, createRequest: () => ({ key: 1 }) }));
+vi.mock('@/lib/graphql/transport-status', () => ({
+  getStatus: () => statusState.snapshot,
+  subscribeStatus: () => () => {},
+}));
 // Mock the provider hook but keep the real `applyChange` reducer helper (a pure map
 // patch the hook reuses) so the delta accumulation under test runs unaltered.
 vi.mock('@/lib/clusters', () => ({
@@ -90,11 +102,19 @@ function pushFrame(type: string, kind: unknown, cacheID = lastArgs?.variables?.c
   acc = lastReducer!(acc, { clusterDataKindsWatch: { type, cacheID, kind } });
 }
 
+// A transport reconnect: the exchange bumps the op's generation on the new
+// connection's `open`, which is what makes useWatchSubscription reset its
+// accumulator (fold onto a clean slate, and mask any not-yet-refolded state).
+function pushReset() {
+  statusState.snapshot = { connected: true, generation: statusState.snapshot.generation + 1 };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   acc = undefined;
   lastArgs = undefined;
   lastReducer = undefined;
+  statusState.snapshot = { connected: true, generation: 0 };
   useActiveKubeContextMock.mockReturnValue({ context: 'prod' });
   useSubscriptionMock.mockImplementation((args: typeof lastArgs, reducer: typeof lastReducer) => {
     lastArgs = args;
@@ -242,6 +262,43 @@ describe('useDashboardNav', () => {
     pushFrame('Modified', { ...REPLICASET, count: 99 }, 'c2');
     rerender();
     expect(workloadsExtra(result.current.nav).find((c) => c.id === 'apps/replicasets')?.count).toBe(99);
+  });
+
+  it('resets the catalog on a transport reset so kinds deleted during an outage are gone after the replay', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'True', reason: 'Watching' })] });
+    const { result, rerender } = renderHook(() => useDashboardNav());
+
+    pushFrame('Added', REPLICASET);
+    pushFrame('Added', CONTROLLER_REVISION);
+    rerender();
+    expect(
+      workloadsExtra(result.current.nav)
+        .map((c) => c.id)
+        .sort(),
+    ).toEqual(['apps/controllerrevisions', 'apps/replicasets']);
+
+    // The transport reconnects: replicasets was deleted during the outage, so
+    // the replayed snapshot carries only controllerrevisions — no Deleted
+    // frame ever arrives for the kind that vanished.
+    pushReset();
+    pushFrame('Added', CONTROLLER_REVISION);
+    rerender();
+    expect(workloadsExtra(result.current.nav).map((c) => c.id)).toEqual(['apps/controllerrevisions']);
+  });
+
+  it('falls back to curated-only after a transport reset when the replayed snapshot is empty', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'True', reason: 'Watching' })] });
+    const { result, rerender } = renderHook(() => useDashboardNav());
+
+    pushFrame('Added', REPLICASET);
+    rerender();
+    expect(hasDiscovered(result.current.nav)).toBe(true);
+
+    // Everything was deleted during the outage: nothing is replayed, so the
+    // reset alone must clear the accumulated catalog.
+    pushReset();
+    rerender();
+    expect(hasDiscovered(result.current.nav)).toBe(false);
   });
 
   it('pauses the subscription and falls back to curated-only when there is no active cluster or cache', () => {

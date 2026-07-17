@@ -14,7 +14,7 @@
 
 import { render, screen, act } from '@testing-library/react';
 import { Provider as UrqlProvider } from 'urql';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { mockTauriCore } from '@/test-utils';
 
@@ -33,12 +33,33 @@ const flush = () => act(async () => {});
 type Row = { id: string; name: string; syncEnabled?: boolean; enabled?: boolean };
 
 // The provider opens two subscriptions (clustersWatch + clusterCachesWatch), so
-// target the channel by query rather than liveChannel().
+// target the channel by query rather than liveChannel(). The *last* match is the
+// live one: a reconnect opens a fresh channel for the same query.
 function channelFor(queryPart: string) {
   const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
-  const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
+  // The *last* match is the live one; lastIndexOf keeps this ES2022-compatible
+  // (findLastIndex is ES2023, outside the app's configured TS lib).
+  const idx = subs.map(([, arg]) => (arg as { query: string }).query.includes(queryPart)).lastIndexOf(true);
   if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
   return channels[idx];
+}
+
+// Drop both transports (the host's SSE streams died), advance past the backoff
+// so subscribe-exchange re-establishes each subscription, then deliver the
+// `open` frame the host sends on each re-established connection (which resets
+// the accumulators before the snapshot replays).
+async function reconnectBothStreams() {
+  await act(async () => {
+    channelFor('clustersWatch').onmessage!(JSON.stringify({ type: 'complete' }));
+    channelFor('clusterCachesWatch').onmessage!(JSON.stringify({ type: 'complete' }));
+  });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1_000);
+  });
+  await act(async () => {
+    channelFor('clustersWatch').onmessage!(JSON.stringify({ type: 'open' }));
+    channelFor('clusterCachesWatch').onmessage!(JSON.stringify({ type: 'open' }));
+  });
 }
 
 function clusterOf(r: Row) {
@@ -157,6 +178,10 @@ describe('useClusters', () => {
     });
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('throws outside the provider', () => {
     function Bare() {
       useClusters();
@@ -230,5 +255,46 @@ describe('useClusters', () => {
       pushCacheChange('Added', cacheOf({ id: 'u-a', name: 'prod-us' }));
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:cache-u-a"]');
+  });
+
+  it('drops clusters and caches deleted during an outage once the transport reconnects', async () => {
+    vi.useFakeTimers();
+    renderProvider(<JoinProbe />);
+    await flush();
+
+    await act(async () => {
+      pushClusters([
+        { id: 'u-a', name: 'prod-us' },
+        { id: 'u-b', name: 'staging' },
+      ]);
+      pushCacheChange('Added', cacheOf({ id: 'u-a', name: 'prod-us' }));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:cache-u-a","staging:-"]');
+
+    // While the transport is down, prod-us and its cache are deleted
+    // server-side. The reconnect replays only what still exists (staging) —
+    // no Deleted frame is ever sent for the ones that vanished.
+    await reconnectBothStreams();
+    await act(async () => {
+      pushClusterChange('Added', clusterOf({ id: 'u-b', name: 'staging' }));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["staging:-"]');
+  });
+
+  it('resets to the not-reported state when the reconnect snapshot is empty', async () => {
+    vi.useFakeTimers();
+    renderProvider();
+    await flush();
+
+    await act(async () => {
+      pushClusters([{ id: 'u-a', name: 'prod-us' }]);
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us"]');
+
+    // Everything was deleted during the outage: the reconnected stream
+    // replays nothing, so no frame ever arrives to displace the stale map —
+    // the reset alone must clear it.
+    await reconnectBothStreams();
+    expect(screen.getByTestId('probe')).toHaveTextContent('null');
   });
 });

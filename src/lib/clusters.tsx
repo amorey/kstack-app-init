@@ -23,10 +23,10 @@
 // last-probed `status.server.uid`) — so consumers still see a Kubernetes-shaped
 // `Cluster` with `spec`/`status`/`activeCache`, exactly as before the split.
 import { createContext, useContext, useMemo } from 'react';
-import { useSubscription } from 'urql';
 
 import { graphql } from '@/gql';
 import type { ClustersWatchSubscription, ClusterCachesWatchSubscription } from '@/gql/graphql';
+import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 
 // One object on each delta stream (the `cluster` / `cache` payload of a change).
 type ClusterRow = ClustersWatchSubscription['clustersWatch']['cluster'];
@@ -129,18 +129,19 @@ export function applyChange<T>(prev: Keyed<T> | undefined, type: string, id: str
 }
 
 export function ClustersProvider({ children }: { children: React.ReactNode }) {
-  // Each stream is reduced into its own id-keyed map via urql's accumulator: the
-  // `Added` snapshot builds the map, later deltas patch it.
-  const [{ data: clusterMap }] = useSubscription(
+  // Each stream is reduced into its own id-keyed map: the `Added` snapshot
+  // builds the map, later deltas patch it. useWatchSubscription resets the map
+  // to `undefined` ("not reported yet") on a transport reconnect.
+  const [{ data: clusterMap }] = useWatchSubscription(
     { query: ClustersWatchSubscription },
-    (prev: Keyed<ClusterRow> | undefined, data): Keyed<ClusterRow> => {
+    (prev: Keyed<ClusterRow> | undefined, data) => {
       const { type, cluster } = data.clustersWatch;
       return applyChange(prev, type, cluster.id, cluster);
     },
   );
-  const [{ data: cacheMap }] = useSubscription(
+  const [{ data: cacheMap }] = useWatchSubscription(
     { query: ClusterCachesWatchSubscription },
-    (prev: Keyed<CacheRow> | undefined, data): Keyed<CacheRow> => {
+    (prev: Keyed<CacheRow> | undefined, data) => {
       const { type, cache } = data.clusterCachesWatch;
       return applyChange(prev, type, cache.id, cache);
     },

@@ -14,13 +14,13 @@
 
 import { useRef, useState } from 'react';
 import { createRoute } from '@tanstack/react-router';
-import { useSubscription } from 'urql';
 
 import { Button } from '@kubetail/ui/elements/button';
 import { Input } from '@kubetail/ui/elements/input';
 
 import { graphql } from '@/gql';
 import { CenteredColumn } from '@/components/widgets/centered-column';
+import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 import { Route as appRoute } from '@/routes/_app';
 
 export const Route = createRoute({
@@ -54,7 +54,7 @@ function Chat() {
   // dev, late frames after the subscription is already paused, etc.).
   const finishedRef = useRef(true);
 
-  useSubscription(
+  useWatchSubscription(
     {
       query: ChatStreamSubscription,
       variables: {
@@ -62,6 +62,8 @@ function Chat() {
       },
       pause: pending === null,
     },
+    // On a transport reconnect useWatchSubscription starts accumulation over —
+    // the re-established stream re-runs the request and streams from the top.
     (prev: string | undefined, data) => {
       const chunk = data.chatStream;
       const next = (prev ?? '') + chunk.delta;
