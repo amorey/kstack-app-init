@@ -340,6 +340,8 @@ type ClusterDataKind {
   scope: String!
   "True when this kind is backed by a CustomResourceDefinition."
   isCRD: Boolean!
+  "Number of objects of this kind currently in the cache (0 for an advertised-but-empty kind)."
+  count: Int!
 }
 
 # --- Delta watches ---

@@ -47,6 +47,17 @@ const ITEM =
 // spacer on a plain link, so both labels start at the same x.
 const SLOT = 'size-3 shrink-0';
 
+// The object-count badge on a kind row: pushed to the row's right edge, subdued and
+// tabular so the digits align down the column.
+const COUNT = 'ml-auto shrink-0 pl-2 text-xs tabular-nums text-muted-foreground/70';
+
+// A kind's object count, rendered only where one is known (leaf kinds; group and
+// overview rows carry none). Right-aligned inside the row.
+function CountBadge({ count }: { count: number | undefined }) {
+  if (count === undefined) return null;
+  return <span className={COUNT}>{count.toLocaleString()}</span>;
+}
+
 // The "Show more…"/"Show less" toggle: a subdued action row that still reserves the
 // leading slot, so its label aligns with the resource labels above it.
 const MORE =
@@ -114,6 +125,7 @@ function NavItem({ node, active, depth, isExpanded, toggle }: NavItemProps) {
           >
             {node.label}
           </Link>
+          <CountBadge count={node.count} />
         </div>
         {expanded && renderNodes(node.moreChildren)}
       </>
@@ -136,7 +148,8 @@ function NavItem({ node, active, depth, isExpanded, toggle }: NavItemProps) {
       >
         {/* Empty slot matching a disclosure's chevron, so labels align. */}
         <span className={SLOT} aria-hidden />
-        <span>{node.label}</span>
+        <span className="truncate">{node.label}</span>
+        <CountBadge count={node.count} />
       </Link>
       {renderNodes(node.children)}
       {more && more.length > 0 && (
@@ -150,7 +163,7 @@ function NavItem({ node, active, depth, isExpanded, toggle }: NavItemProps) {
             style={{ paddingLeft: `${INDENT_BASE + (depth + 1) * INDENT_STEP}rem` }}
           >
             <span className={SLOT} aria-hidden />
-            <span>{showingMore ? 'Show less' : 'Show more…'}</span>
+            <span>{showingMore ? 'Show less' : `Show more (${more.length})…`}</span>
           </button>
         </>
       )}

@@ -347,15 +347,23 @@ type KindCatalogRow struct {
 	Scope string
 	// IsCRD is true when the kind is backed by a CustomResourceDefinition.
 	IsCRD bool
+	// Count is the number of objects of this kind currently cached (0 for a kind
+	// the API server advertises but has no cached instances of).
+	Count int
 }
 
 // KindCatalog reads the cache's discovered kind catalog: one row per kind the
 // cluster's API server advertises (built-ins + CRDs), ordered for stable display.
-// Empty until the sync engine has populated it.
+// Each row's Count is the number of cached objects of that kind (a LEFT JOIN, so
+// an advertised-but-empty kind counts 0). Empty until the sync engine has
+// populated it.
 func (c *ClusterDB) KindCatalog(ctx context.Context) ([]KindCatalogRow, error) {
 	rows, err := c.readDB.QueryContext(ctx,
-		`SELECT api_version, kind, resource, scope, is_crd
-		 FROM kind_catalog ORDER BY api_version, kind`)
+		`SELECT kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd, COUNT(o.uid)
+		 FROM kind_catalog kc
+		 LEFT JOIN objects o ON o.api_version = kc.api_version AND o.kind = kc.kind
+		 GROUP BY kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd
+		 ORDER BY kc.api_version, kc.kind`)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +375,7 @@ func (c *ClusterDB) KindCatalog(ctx context.Context) ([]KindCatalogRow, error) {
 			r     KindCatalogRow
 			isCRD int64
 		)
-		if err := rows.Scan(&r.APIVersion, &r.Kind, &r.Resource, &r.Scope, &isCRD); err != nil {
+		if err := rows.Scan(&r.APIVersion, &r.Kind, &r.Resource, &r.Scope, &isCRD, &r.Count); err != nil {
 			return nil, err
 		}
 		r.IsCRD = isCRD != 0

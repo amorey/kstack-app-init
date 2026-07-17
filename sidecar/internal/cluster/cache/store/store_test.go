@@ -444,6 +444,20 @@ func TestKindCatalog(t *testing.T) {
 	insert("v1", "Node", "nodes", "Cluster", 0)
 	insert("example.com/v1", "Widget", "widgets", "Namespaced", 1)
 
+	// Cache two Deployments so the LEFT JOIN counts them; Node/Widget have no
+	// cached objects and must count 0.
+	at := time.Now().UnixMilli()
+	insertObj := func(uid, apiVersion, kind string) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+			   created_at, updated_at, raw_json)
+			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, x'7b7d')`,
+			uid, apiVersion, kind, uid, at, at)
+		require.NoError(t, err)
+	}
+	insertObj("d1", "apps/v1", "Deployment")
+	insertObj("d2", "apps/v1", "Deployment")
+
 	rows, err = cdb.KindCatalog(ctx)
 	require.NoError(t, err)
 	require.Len(t, rows, 3)
@@ -454,12 +468,15 @@ func TestKindCatalog(t *testing.T) {
 	require.Equal(t, "deployments", rows[0].Resource)
 	require.Equal(t, "Namespaced", rows[0].Scope)
 	require.False(t, rows[0].IsCRD)
+	require.Equal(t, 2, rows[0].Count, "counts cached objects of the kind")
 
 	require.Equal(t, "example.com/v1", rows[1].APIVersion)
 	require.True(t, rows[1].IsCRD, "is_crd decodes to bool")
+	require.Equal(t, 0, rows[1].Count, "advertised-but-empty kind counts 0")
 
 	require.Equal(t, "v1", rows[2].APIVersion)
 	require.Equal(t, "Cluster", rows[2].Scope)
+	require.Equal(t, 0, rows[2].Count)
 }
 
 func itoa(i int) string {

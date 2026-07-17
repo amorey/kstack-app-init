@@ -95,21 +95,29 @@ export type DashboardResource = string;
 // (e.g. System) hides its `moreChildren` behind a parent-level chevron (see
 // `DashboardResourceNav`). Either way `moreChildren` sit at the same depth as
 // `children` would.
+//
+// `count` is the number of objects of this kind currently in the active cache,
+// carried straight from the discovered kind's `ServerKind.count`. It's set only on
+// a leaf *kind* node — undefined on group/overview rows, which map to no discovered
+// kind — so the renderer shows a badge only where a real count exists.
 export type DashboardNavNode = {
   readonly id: DashboardResource;
   readonly label: string;
+  readonly count?: number;
   readonly children?: readonly DashboardNavNode[];
   readonly moreChildren?: readonly DashboardNavNode[];
 };
 
 // One kind advertised by a cluster's API server (a `clusterDataKinds` row). Declared
-// here — not imported from `@/gql` — so this module stays pure and testable.
+// here — not imported from `@/gql` — so this module stays pure and testable. `count`
+// is how many objects of the kind the active cache currently holds.
 export type ServerKind = {
   apiVersion: string;
   kind: string;
   resource: string;
   scope: string;
   isCRD: boolean;
+  count: number;
 };
 
 // The curated groups that can receive discovered kinds. Written as `Extract<…>` of
@@ -175,9 +183,34 @@ export function findNode(nodes: readonly DashboardNavNode[], id: DashboardResour
   return match;
 }
 
-// Every curated id (group + leaf), so a server kind that's already curated is not
-// duplicated among a group's discovered kinds.
-const CURATED_IDS = new Set<string>(flattenNav(DASHBOARD_NAV).map((n) => n.id));
+// The api group each curated *kind* leaf belongs to, keyed by its resource plural
+// (its node id). This is what pins a curated leaf to one specific built-in kind: a
+// discovered kind joins to it only when BOTH its api group and resource plural match,
+// so a CRD that reuses a built-in's plural in another api group can't hijack its row
+// or count. Group/overview rows are absent — they stand for no kind, so no discovered
+// kind ever adopts their id or count. The core group is "" (see `apiGroupOf`).
+const CURATED_LEAF_API_GROUP: Record<string, string> = {
+  nodes: '',
+  namespaces: '',
+  events: '',
+  pods: '',
+  deployments: 'apps',
+  daemonsets: 'apps',
+  statefulsets: 'apps',
+  jobs: 'batch',
+  cronjobs: 'batch',
+  configmaps: '',
+  secrets: '',
+  persistentvolumeclaims: '',
+  services: '',
+  ingresses: 'networking.k8s.io',
+  networkpolicies: 'networking.k8s.io',
+  serviceaccounts: '',
+  roles: 'rbac.authorization.k8s.io',
+  rolebindings: 'rbac.authorization.k8s.io',
+  clusterroles: 'rbac.authorization.k8s.io',
+  clusterrolebindings: 'rbac.authorization.k8s.io',
+};
 
 // The kind shown when the URL names none: the first node in reading order, so the
 // sidebar's default highlight and the panel's default view agree.
@@ -191,24 +224,47 @@ export function resolveDashboardResource(resource: DashboardResource | undefined
   return resource && resource.length > 0 ? resource : DEFAULT_DASHBOARD_RESOURCE;
 }
 
+// The curated leaf id a discovered kind *is*, or undefined when it isn't one of the
+// curated built-ins. Matches on both api group and resource plural (see
+// `CURATED_LEAF_API_GROUP`), so a CRD reusing a built-in's plural in another group —
+// or a plural that happens to equal a group row's id like "workloads" — doesn't
+// collide with it.
+function curatedLeafIdForKind(k: ServerKind): string | undefined {
+  const group = CURATED_LEAF_API_GROUP[k.resource];
+  return group !== undefined && group === apiGroupOf(k.apiVersion) ? k.resource : undefined;
+}
+
+// The nav node id a discovered kind maps to: a curated built-in is addressed by its
+// bare resource plural ("pods"), any other kind by `group/resource`
+// ("apps/replicasets"). The single home for this rule — both the bucketing and the
+// count join key nodes by it.
+function navIdForKind(k: ServerKind): string {
+  return curatedLeafIdForKind(k) ?? `${apiGroupOf(k.apiVersion)}/${k.resource}`;
+}
+
 // Merge the cluster's discovered kinds into the curated base: each non-curated
 // kind whose api group maps to a group is hung off that group's `moreChildren`
 // (sorted by label). The renderer derives the disclosure style from the shape — a
 // group with curated children reveals them behind "Show more…", a childless group
 // (e.g. System) behind a parent-level chevron — so this doesn't decide it here.
 // Kinds in unmapped api groups (incl. core) are skipped — reserved for Custom
-// Resources.
+// Resources. Every kind's `count` (from `ServerKind`) is joined onto its leaf node
+// in a single `withCount` pass — curated leaves (which live only in `DASHBOARD_NAV`)
+// and discovered kinds alike, keyed by `navIdForKind`.
 export function buildDashboardNav(serverKinds: readonly ServerKind[]): DashboardNavNode[] {
-  // Keyed by group id (a plain string): the ids are `DASHBOARD_NAV` node ids, so a
-  // lookup with `node.id` below needs no cast.
+  // `buckets`: discovered kinds hung under their group (keyed by group id — a
+  // `DASHBOARD_NAV` node id, so `node.id` lookups need no cast). `countById`: every
+  // kind's object count keyed by the node id it lands on, so `withCount` can reach
+  // curated leaves too. Both filled in one pass.
   const buckets = new Map<string, DashboardNavNode[]>();
+  const countById = new Map<string, number>();
   const seen = new Set<string>();
   serverKinds.forEach((k) => {
-    const apiGroup = apiGroupOf(k.apiVersion);
-    const group = API_GROUP_TO_GROUP[apiGroup];
+    const id = navIdForKind(k);
+    countById.set(id, k.count);
+    const group = API_GROUP_TO_GROUP[apiGroupOf(k.apiVersion)];
     if (!group) return; // unmapped api group (incl. core): deferred to Custom Resources
-    if (CURATED_IDS.has(k.resource)) return; // already curated — don't duplicate
-    const id = `${apiGroup}/${k.resource}`;
+    if (curatedLeafIdForKind(k) !== undefined) return; // already curated — don't duplicate
     if (seen.has(id)) return; // guard against duplicate discovery rows
     seen.add(id);
     const list = buckets.get(group) ?? [];
@@ -217,10 +273,20 @@ export function buildDashboardNav(serverKinds: readonly ServerKind[]): Dashboard
   });
   buckets.forEach((list) => list.sort((a, b) => a.label.localeCompare(b.label)));
 
+  const withCount = (node: DashboardNavNode): DashboardNavNode => {
+    const count = countById.get(node.id);
+    return {
+      ...node,
+      ...(count !== undefined ? { count } : {}),
+      ...(node.children ? { children: node.children.map(withCount) } : {}),
+      ...(node.moreChildren ? { moreChildren: node.moreChildren.map(withCount) } : {}),
+    };
+  };
+
   return DASHBOARD_NAV.map((node): DashboardNavNode => {
     const bucket = buckets.get(node.id); // never empty: a bucket exists only once a kind is pushed
     return bucket ? { ...node, moreChildren: bucket } : node;
-  });
+  }).map(withCount);
 }
 
 // The human label for an id, resolved against a built tree (so dynamic kinds

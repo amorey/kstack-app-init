@@ -39,12 +39,13 @@ const SAMPLE: readonly DashboardNavNode[] = [
   },
 ];
 
-const kind = (apiVersion: string, k: string, resource: string): ServerKind => ({
+const kind = (apiVersion: string, k: string, resource: string, count = 0): ServerKind => ({
   apiVersion,
   kind: k,
   resource,
   scope: 'Namespaced',
   isCRD: false,
+  count,
 });
 
 // A group node's discovered ("Show more…") kinds in a built tree.
@@ -145,6 +146,39 @@ describe('buildDashboardNav', () => {
     ['workloads', 'network', 'config-and-storage', 'security-and-access', 'system'].forEach((group) => {
       expect(moreOf(nav, group)).toBeUndefined();
     });
+  });
+
+  it('joins object counts onto both curated and discovered leaf kinds', () => {
+    const nav = buildDashboardNav([
+      kind('v1', 'Pod', 'pods', 42), // curated leaf, core group
+      kind('apps/v1', 'ReplicaSet', 'replicasets', 7), // discovered kind
+    ]);
+    const workloads = nav.find((n) => n.id === 'workloads');
+    expect(workloads?.children?.find((c) => c.id === 'pods')?.count).toBe(42);
+    expect(workloads?.moreChildren?.find((c) => c.id === 'apps/replicasets')?.count).toBe(7);
+    // Group and overview rows map to no kind, so they carry no count.
+    expect(workloads?.count).toBeUndefined();
+    expect(nav.find((n) => n.id === 'overview')?.count).toBeUndefined();
+  });
+
+  it('does not let a CRD reusing a built-in plural in another group steal its count', () => {
+    const nav = buildDashboardNav([
+      kind('v1', 'Pod', 'pods', 42), // the real built-in Pods
+      kind('example.com/v1', 'Pod', 'pods', 999), // a CRD that happens to be plural "pods"
+    ]);
+    const workloads = nav.find((n) => n.id === 'workloads');
+    // The core built-in keeps its own count; the CRD (unmapped group) neither
+    // overwrites it nor is treated as already-curated.
+    expect(workloads?.children?.find((c) => c.id === 'pods')?.count).toBe(42);
+  });
+
+  it('does not join a discovered kind whose plural equals a group row id to that group', () => {
+    const nav = buildDashboardNav([kind('apps/v1', 'Workload', 'workloads', 5)]);
+    const workloads = nav.find((n) => n.id === 'workloads');
+    // The group row never takes a count, and the kind is bucketed under its own id.
+    expect(workloads?.count).toBeUndefined();
+    expect(workloads?.moreChildren?.map((c) => c.id)).toEqual(['apps/workloads']);
+    expect(workloads?.moreChildren?.find((c) => c.id === 'apps/workloads')?.count).toBe(5);
   });
 
   it('sorts moreChildren by label and leaves a curated-only build untouched', () => {

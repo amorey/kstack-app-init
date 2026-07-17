@@ -112,6 +112,7 @@ type ComplexityRoot struct {
 
 	ClusterDataKind struct {
 		APIVersion func(childComplexity int) int
+		Count      func(childComplexity int) int
 		IsCRD      func(childComplexity int) int
 		Kind       func(childComplexity int) int
 		Resource   func(childComplexity int) int
@@ -506,6 +507,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterDataKind.APIVersion(childComplexity), true
+	case "ClusterDataKind.count":
+		if e.ComplexityRoot.ClusterDataKind.Count == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataKind.Count(childComplexity), true
 	case "ClusterDataKind.isCRD":
 		if e.ComplexityRoot.ClusterDataKind.IsCRD == nil {
 			break
@@ -1259,6 +1266,8 @@ func (ec *executionContext) childFields_ClusterDataKind(ctx context.Context, fie
 		return ec.fieldContext_ClusterDataKind_scope(ctx, field)
 	case "isCRD":
 		return ec.fieldContext_ClusterDataKind_isCRD(ctx, field)
+	case "count":
+		return ec.fieldContext_ClusterDataKind_count(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterDataKind", field.Name)
 }
@@ -2894,6 +2903,29 @@ func (ec *executionContext) _ClusterDataKind_isCRD(ctx context.Context, field gr
 }
 func (ec *executionContext) fieldContext_ClusterDataKind_isCRD(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterDataKind", field, false, false, errors.New("field of type Boolean does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataKind_count(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataKind_count(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Count, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataKind_count(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataKind", field, false, false, errors.New("field of type Int does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterPermissions_namespace(ctx context.Context, field graphql.CollectedField, obj *model.ClusterPermissions) (ret graphql.Marshaler) {
@@ -6542,6 +6574,11 @@ func (ec *executionContext) _ClusterDataKind(ctx context.Context, sel ast.Select
 			}
 		case "isCRD":
 			out.Values[i] = ec._ClusterDataKind_isCRD(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "count":
+			out.Values[i] = ec._ClusterDataKind_count(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}

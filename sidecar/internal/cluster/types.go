@@ -649,6 +649,9 @@ type ClusterDataKind struct {
 	Scope string
 	// IsCRD is true when the kind is backed by a CustomResourceDefinition.
 	IsCRD bool
+	// Count is the number of objects of this kind currently in the cache (0 for a
+	// kind the API server advertises but has no cached instances of).
+	Count int
 }
 
 // --- Seed conditions ---

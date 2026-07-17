@@ -35,7 +35,7 @@ const { NAV } = vi.hoisted(() => ({
       label: 'Workloads',
       children: [
         { id: 'pods', label: 'Pods' },
-        { id: 'daemonsets', label: 'DaemonSets' },
+        { id: 'daemonsets', label: 'DaemonSets', count: 3 },
       ],
       moreChildren: [{ id: 'apps/replicasets', label: 'ReplicaSet' }],
     },
@@ -88,9 +88,17 @@ describe('DashboardResourceNav', () => {
     const workloads = screen.getByRole('link', { name: 'Workloads' });
     const pods = screen.getByRole('link', { name: 'Pods' });
     expect(pods).toHaveAttribute('href', '/dashboard?resource=pods');
-    expect(screen.getByRole('link', { name: 'DaemonSets' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /DaemonSets/ })).toBeInTheDocument();
     const inset = (el: HTMLElement) => parseFloat(el.style.paddingLeft);
     expect(inset(pods)).toBeGreaterThan(inset(workloads));
+  });
+
+  it('shows a kind’s object count and folds the hidden-kind count into "Show more"', async () => {
+    await renderWithRouter(buildTree(), '/dashboard');
+    // A leaf kind's count rides its row (DaemonSets has 3).
+    expect(screen.getByRole('link', { name: /DaemonSets/ })).toHaveTextContent('3');
+    // The "Show more…" toggle names how many discovered kinds it hides.
+    expect(screen.getByRole('button', { name: 'Show more (1)…' })).toBeInTheDocument();
   });
 
   it('selects a nested child, writing its id to the param', async () => {

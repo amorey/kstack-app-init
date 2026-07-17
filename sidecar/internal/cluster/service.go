@@ -368,6 +368,7 @@ func (s *Service) ClusterDataKinds(ctx context.Context, clusterID ClusterID, cac
 			Resource:   r.Resource,
 			Scope:      r.Scope,
 			IsCRD:      r.IsCRD,
+			Count:      r.Count,
 		}
 	}
 	return kinds, nil

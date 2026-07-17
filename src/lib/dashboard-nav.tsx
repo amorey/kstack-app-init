@@ -46,6 +46,7 @@ const ClusterDataKindsQuery = graphql(`
       resource
       scope
       isCRD
+      count
     }
   }
 `);

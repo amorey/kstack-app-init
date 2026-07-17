@@ -37,6 +37,7 @@ const REPLICASET = {
   resource: 'replicasets',
   scope: 'Namespaced',
   isCRD: false,
+  count: 7,
 };
 
 // A cluster fixture for context "prod" whose active cache has the given id/serverUid
