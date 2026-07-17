@@ -40,7 +40,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -347,68 +346,6 @@ func (c *ClusterDB) ID() string { return c.id }
 // Path returns the on-disk SQLite file path. Exposed for diagnostics.
 func (c *ClusterDB) Path() string { return c.path }
 
-// ResourceStat is a per-resource cache breakdown row: how many objects of one
-// kind are cached and when its rows last changed.
-type ResourceStat struct {
-	// Resource identifies the kind, "<group>/<Kind>" with the core group
-	// elided (e.g. "Pod", "apps/Deployment"), or "events".
-	Resource string
-	// Count is the number of cached objects of this kind.
-	Count int
-	// LastUpdatedAt is the most recent sync write for this kind; nil if the
-	// table carries no timestamp for it.
-	LastUpdatedAt *time.Time
-}
-
-// ResourceStats reads the per-resource breakdown of the cache: one row per
-// cached kind from the universal objects table, plus one for events.
-func (c *ClusterDB) ResourceStats(ctx context.Context) ([]ResourceStat, error) {
-	rows, err := c.readDB.QueryContext(ctx,
-		`SELECT api_version, kind, COUNT(*), MAX(updated_at)
-		 FROM objects GROUP BY api_version, kind ORDER BY api_version, kind`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var stats []ResourceStat
-	for rows.Next() {
-		var (
-			apiVersion, kind string
-			count            int
-			updatedAt        sql.NullInt64
-		)
-		if err := rows.Scan(&apiVersion, &kind, &count, &updatedAt); err != nil {
-			return nil, err
-		}
-		stats = append(stats, ResourceStat{
-			Resource:      resourceLabel(apiVersion, kind),
-			Count:         count,
-			LastUpdatedAt: millisPtr(updatedAt),
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	var (
-		eventCount  int
-		eventUpdate sql.NullInt64
-	)
-	if err := c.readDB.QueryRowContext(ctx,
-		`SELECT COUNT(*), MAX(updated_at) FROM events`).Scan(&eventCount, &eventUpdate); err != nil {
-		return nil, err
-	}
-	if eventCount > 0 {
-		stats = append(stats, ResourceStat{
-			Resource:      "events",
-			Count:         eventCount,
-			LastUpdatedAt: millisPtr(eventUpdate),
-		})
-	}
-	return stats, nil
-}
-
 // KindCatalogRow is one entry in the cache's kind_catalog: a kind the cluster's
 // API server advertises, recorded at sync time from /apis discovery.
 type KindCatalogRow struct {
@@ -460,25 +397,6 @@ func (c *ClusterDB) KindCatalog(ctx context.Context) ([]KindCatalogRow, error) {
 		return nil, err
 	}
 	return out, nil
-}
-
-// resourceLabel renders an api_version + kind pair as the consumer-facing
-// resource identifier: the group qualifies the kind, the version is dropped,
-// and the core group is elided ("v1"+"Pod" → "Pod", "apps/v1"+"Deployment" →
-// "apps/Deployment").
-func resourceLabel(apiVersion, kind string) string {
-	if group, _, ok := strings.Cut(apiVersion, "/"); ok {
-		return group + "/" + kind
-	}
-	return kind
-}
-
-func millisPtr(ni sql.NullInt64) *time.Time {
-	if !ni.Valid {
-		return nil
-	}
-	t := time.UnixMilli(ni.Int64).UTC()
-	return &t
 }
 
 func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterDB, error) {

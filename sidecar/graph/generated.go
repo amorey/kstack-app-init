@@ -77,18 +77,11 @@ type ComplexityRoot struct {
 		Type  func(childComplexity int) int
 	}
 
-	ClusterCacheResourceStats struct {
-		Count         func(childComplexity int) int
-		LastUpdatedAt func(childComplexity int) int
-		Resource      func(childComplexity int) int
-	}
-
 	ClusterCacheStats struct {
 		Bytes       func(childComplexity int) int
 		Exists      func(childComplexity int) int
 		KindCount   func(childComplexity int) int
 		ObjectCount func(childComplexity int) int
-		Resources   func(childComplexity int) int
 	}
 
 	ClusterCacheStatus struct {
@@ -396,25 +389,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.ClusterCacheChange.Type(childComplexity), true
 
-	case "ClusterCacheResourceStats.count":
-		if e.ComplexityRoot.ClusterCacheResourceStats.Count == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCacheResourceStats.Count(childComplexity), true
-	case "ClusterCacheResourceStats.lastUpdatedAt":
-		if e.ComplexityRoot.ClusterCacheResourceStats.LastUpdatedAt == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCacheResourceStats.LastUpdatedAt(childComplexity), true
-	case "ClusterCacheResourceStats.resource":
-		if e.ComplexityRoot.ClusterCacheResourceStats.Resource == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCacheResourceStats.Resource(childComplexity), true
-
 	case "ClusterCacheStats.bytes":
 		if e.ComplexityRoot.ClusterCacheStats.Bytes == nil {
 			break
@@ -439,12 +413,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCacheStats.ObjectCount(childComplexity), true
-	case "ClusterCacheStats.resources":
-		if e.ComplexityRoot.ClusterCacheStats.Resources == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCacheStats.Resources(childComplexity), true
 
 	case "ClusterCacheStatus.conditions":
 		if e.ComplexityRoot.ClusterCacheStatus.Conditions == nil {
@@ -1226,18 +1194,6 @@ func (ec *executionContext) childFields_ClusterCacheChange(ctx context.Context, 
 	return nil, fmt.Errorf("no field named %q was found under type ClusterCacheChange", field.Name)
 }
 
-func (ec *executionContext) childFields_ClusterCacheResourceStats(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-	switch field.Name {
-	case "resource":
-		return ec.fieldContext_ClusterCacheResourceStats_resource(ctx, field)
-	case "count":
-		return ec.fieldContext_ClusterCacheResourceStats_count(ctx, field)
-	case "lastUpdatedAt":
-		return ec.fieldContext_ClusterCacheResourceStats_lastUpdatedAt(ctx, field)
-	}
-	return nil, fmt.Errorf("no field named %q was found under type ClusterCacheResourceStats", field.Name)
-}
-
 func (ec *executionContext) childFields_ClusterCacheStats(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 	switch field.Name {
 	case "exists":
@@ -1248,8 +1204,6 @@ func (ec *executionContext) childFields_ClusterCacheStats(ctx context.Context, f
 		return ec.fieldContext_ClusterCacheStats_objectCount(ctx, field)
 	case "kindCount":
 		return ec.fieldContext_ClusterCacheStats_kindCount(ctx, field)
-	case "resources":
-		return ec.fieldContext_ClusterCacheStats_resources(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterCacheStats", field.Name)
 }
@@ -2421,75 +2375,6 @@ func (ec *executionContext) fieldContext_ClusterCacheChange_cache(_ context.Cont
 	return fc, nil
 }
 
-func (ec *executionContext) _ClusterCacheResourceStats_resource(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCacheResourceStats) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCacheResourceStats_resource(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Resource, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
-			return ec.marshalNString2string(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCacheResourceStats_resource(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCacheResourceStats", field, false, false, errors.New("field of type String does not have child fields"))
-}
-
-func (ec *executionContext) _ClusterCacheResourceStats_count(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCacheResourceStats) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCacheResourceStats_count(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Count, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
-			return ec.marshalNInt2int(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCacheResourceStats_count(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCacheResourceStats", field, false, false, errors.New("field of type Int does not have child fields"))
-}
-
-func (ec *executionContext) _ClusterCacheResourceStats_lastUpdatedAt(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCacheResourceStats) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCacheResourceStats_lastUpdatedAt(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.LastUpdatedAt, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
-			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
-		},
-		true,
-		false,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCacheResourceStats_lastUpdatedAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCacheResourceStats", field, false, false, errors.New("field of type Time does not have child fields"))
-}
-
 func (ec *executionContext) _ClusterCacheStats_exists(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCacheStats) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -2580,38 +2465,6 @@ func (ec *executionContext) _ClusterCacheStats_kindCount(ctx context.Context, fi
 }
 func (ec *executionContext) fieldContext_ClusterCacheStats_kindCount(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
-}
-
-func (ec *executionContext) _ClusterCacheStats_resources(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCacheStats) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCacheStats_resources(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Resources, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v []cluster.ClusterCacheResourceStats) graphql.Marshaler {
-			return ec.marshalNClusterCacheResourceStats2ᚕgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCacheResourceStatsᚄ(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCacheStats_resources(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	fc = &graphql.FieldContext{
-		Object:     "ClusterCacheStats",
-		Field:      field,
-		IsMethod:   false,
-		IsResolver: false,
-		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_ClusterCacheResourceStats(ctx, field)
-		},
-	}
-	return fc, nil
 }
 
 func (ec *executionContext) _ClusterCacheStatus_conditions(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterCacheStatus) (ret graphql.Marshaler) {
@@ -6481,52 +6334,6 @@ func (ec *executionContext) _ClusterCacheChange(ctx context.Context, sel ast.Sel
 	return out
 }
 
-var clusterCacheResourceStatsImplementors = []string{"ClusterCacheResourceStats"}
-
-func (ec *executionContext) _ClusterCacheResourceStats(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterCacheResourceStats) graphql.Marshaler {
-	fields := graphql.CollectFields(ec.OperationContext, sel, clusterCacheResourceStatsImplementors)
-
-	out := graphql.NewFieldSet(fields)
-	deferred := make(map[string]*graphql.FieldSet)
-	for i, field := range fields {
-		switch field.Name {
-		case "__typename":
-			out.Values[i] = graphql.MarshalString("ClusterCacheResourceStats")
-		case "resource":
-			out.Values[i] = ec._ClusterCacheResourceStats_resource(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		case "count":
-			out.Values[i] = ec._ClusterCacheResourceStats_count(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		case "lastUpdatedAt":
-			out.Values[i] = ec._ClusterCacheResourceStats_lastUpdatedAt(ctx, field, obj)
-		default:
-			panic("unknown field " + strconv.Quote(field.Name))
-		}
-	}
-	out.Dispatch(ctx)
-	if out.Invalids > 0 {
-		return graphql.Null
-	}
-
-	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
-
-	for label, dfs := range deferred {
-		ec.ProcessDeferredGroup(graphql.DeferredGroup{
-			Label:    label,
-			Path:     graphql.GetPath(ctx),
-			FieldSet: dfs,
-			Context:  ctx,
-		})
-	}
-
-	return out
-}
-
 var clusterCacheStatsImplementors = []string{"ClusterCacheStats"}
 
 func (ec *executionContext) _ClusterCacheStats(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterCacheStats) graphql.Marshaler {
@@ -6555,11 +6362,6 @@ func (ec *executionContext) _ClusterCacheStats(ctx context.Context, sel ast.Sele
 			}
 		case "kindCount":
 			out.Values[i] = ec._ClusterCacheStats_kindCount(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		case "resources":
-			out.Values[i] = ec._ClusterCacheStats_resources(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
@@ -8323,26 +8125,6 @@ func (ec *executionContext) marshalNClusterCacheChange2ᚖgithubᚗcomᚋkubetai
 		return graphql.Null
 	}
 	return ec._ClusterCacheChange(ctx, sel, v)
-}
-
-func (ec *executionContext) marshalNClusterCacheResourceStats2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCacheResourceStats(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterCacheResourceStats) graphql.Marshaler {
-	return ec._ClusterCacheResourceStats(ctx, sel, &v)
-}
-
-func (ec *executionContext) marshalNClusterCacheResourceStats2ᚕgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCacheResourceStatsᚄ(ctx context.Context, sel ast.SelectionSet, v []cluster.ClusterCacheResourceStats) graphql.Marshaler {
-	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
-		fc := graphql.GetFieldContext(ctx)
-		fc.Result = &v[i]
-		return ec.marshalNClusterCacheResourceStats2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCacheResourceStats(ctx, sel, v[i])
-	})
-
-	for _, e := range ret {
-		if e == graphql.Null {
-			return graphql.Null
-		}
-	}
-
-	return ret
 }
 
 func (ec *executionContext) marshalNClusterCacheStats2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterCacheStats(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterCacheStats) graphql.Marshaler {

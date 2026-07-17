@@ -453,51 +453,6 @@ func TestWatchDBClosedOnShutdown(t *testing.T) {
 	}
 }
 
-func TestResourceStats(t *testing.T) {
-	dir := t.TempDir()
-	r := NewManager(dir)
-	ctx := context.Background()
-	cdb, err := r.Open(ctx, ref(1, 1))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = r.Shutdown(ctx) })
-
-	// Empty cache: no rows at all (events row appears only when present).
-	stats, err := cdb.ResourceStats(ctx)
-	require.NoError(t, err)
-	require.Empty(t, stats)
-
-	at := time.Now().UnixMilli()
-	insert := func(uid, apiVersion, kind string) {
-		_, err := cdb.Writer().ExecContext(ctx,
-			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
-			   created_at, updated_at, raw_json)
-			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, x'7b7d')`,
-			uid, apiVersion, kind, uid, at, at)
-		require.NoError(t, err)
-	}
-	insert("p1", "v1", "Pod")
-	insert("p2", "v1", "Pod")
-	insert("d1", "apps/v1", "Deployment")
-	_, err = cdb.Writer().ExecContext(ctx,
-		`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
-		 VALUES('e1', 'Normal', 'Test', 'hello', ?, ?, 1, x'7b7d', ?)`, at, at, at)
-	require.NoError(t, err)
-
-	stats, err = cdb.ResourceStats(ctx)
-	require.NoError(t, err)
-	require.Len(t, stats, 3)
-
-	byResource := map[string]ResourceStat{}
-	for _, s := range stats {
-		byResource[s.Resource] = s
-	}
-	require.Equal(t, 2, byResource["Pod"].Count, "core group is elided")
-	require.Equal(t, 1, byResource["apps/Deployment"].Count, "group qualifies, version dropped")
-	require.Equal(t, 1, byResource["events"].Count)
-	require.NotNil(t, byResource["Pod"].LastUpdatedAt)
-	require.Equal(t, at, byResource["Pod"].LastUpdatedAt.UnixMilli())
-}
-
 func TestKindCatalog(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)

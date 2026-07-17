@@ -341,26 +341,25 @@ func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID C
 	if db == nil {
 		return &ClusterCacheStats{Exists: true, Bytes: bytes}, nil
 	}
-	rss, err := db.ResourceStats(ctx)
+	// Roll up the kind catalog's trigger-maintained per-kind counts (O(kinds), no
+	// object scan): total objects and the number of non-empty kinds. The catalog
+	// lists advertised-but-empty kinds too, so KindCount only counts count > 0.
+	rows, err := db.KindCatalog(ctx)
 	if err != nil {
 		return nil, err
 	}
-	resources := make([]ClusterCacheResourceStats, len(rss))
-	objectCount := 0
-	for i, rs := range rss {
-		resources[i] = ClusterCacheResourceStats{
-			Resource:      rs.Resource,
-			Count:         rs.Count,
-			LastUpdatedAt: rs.LastUpdatedAt,
+	objectCount, kindCount := 0, 0
+	for _, r := range rows {
+		if r.Count > 0 {
+			objectCount += r.Count
+			kindCount++
 		}
-		objectCount += rs.Count
 	}
 	return &ClusterCacheStats{
 		Exists:      true,
 		Bytes:       bytes,
 		ObjectCount: objectCount,
-		KindCount:   len(resources),
-		Resources:   resources,
+		KindCount:   kindCount,
 	}, nil
 }
 

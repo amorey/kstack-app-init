@@ -628,24 +628,16 @@ type ClusterDataKindChange struct {
 
 // --- Cache statistics types (for the ClusterCache GraphQL resolver) ---
 
-// ClusterCacheResourceStats is the per-resource breakdown of one cluster's cache.
-type ClusterCacheResourceStats struct {
-	Resource      string
-	Count         int
-	LastUpdatedAt *time.Time
-}
-
 // ClusterCacheStats reports a cluster's live on-disk cache statistics.
 type ClusterCacheStats struct {
 	Exists bool
 	Bytes  int64
-	// ObjectCount/KindCount are the whole-cache rollup of Resources (total
-	// objects and distinct kinds), precomputed so a summary consumer need not
-	// stream the full per-resource breakdown. Both include the synthetic events
-	// row, matching Resources.
+	// ObjectCount/KindCount are the whole-cache rollup read from the kind
+	// catalog's trigger-maintained per-kind counts: the total cached objects and
+	// the number of kinds with at least one cached object. Both exclude events
+	// (events are not a catalog kind).
 	ObjectCount int
 	KindCount   int
-	Resources   []ClusterCacheResourceStats
 }
 
 // ClusterDataKind is one entry in a cluster's discovered kind catalog — a kind the

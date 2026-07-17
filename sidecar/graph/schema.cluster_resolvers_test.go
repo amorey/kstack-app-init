@@ -717,7 +717,7 @@ func firstCacheFrame(t *testing.T, srvURL string) map[string]any {
 	resp := openSSESubscription(t, srvURL, "",
 		`subscription { clusterCachesWatch { type cache { id clusterID serverUid `+
 			`status { conditions { type status reason } lastSyncedAt } `+
-			`stats { exists bytes resources { resource } } } } }`)
+			`stats { exists bytes objectCount kindCount } } } }`)
 	t.Cleanup(func() { resp.Body.Close() })
 	events := sseEvents(t, resp)
 
@@ -809,7 +809,7 @@ func TestClusterDeleteMutation(t *testing.T) {
 // The status condition lists and the cache object resolve without panicking
 // or erroring on bare fixtures: the cluster carries no conditions (empty arrays
 // on the wire, never null) and the cache — now streamed via clusterCachesWatch —
-// has no on-disk files (exists=false, bytes=0, resources=[]).
+// has no on-disk files (exists=false, bytes=0, objectCount=0, kindCount=0).
 func TestClusterEphemeralFields(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
@@ -852,8 +852,8 @@ func TestClusterEphemeralFields(t *testing.T) {
 	if stats["exists"] != false || stats["bytes"] != float64(0) {
 		t.Errorf("cache stats placeholder: %v", stats)
 	}
-	if res, ok := stats["resources"].([]any); !ok || len(res) != 0 {
-		t.Errorf("cache resources should be empty list, got: %v", stats["resources"])
+	if stats["objectCount"] != float64(0) || stats["kindCount"] != float64(0) {
+		t.Errorf("never-cached counts should be 0, got: %v", stats)
 	}
 }
 

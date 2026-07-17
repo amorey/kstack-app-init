@@ -299,8 +299,9 @@ func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	assert.False(t, stats.Exists)
 }
 
-// CacheStats rolls the per-resource breakdown up into ObjectCount/KindCount (the
-// whole-cache totals the sync-status summary shows), events row included.
+// CacheStats rolls the kind catalog's per-kind counts up into ObjectCount/KindCount
+// (the whole-cache totals the sync-status summary shows): only kinds with at least
+// one cached object count, and events are excluded (not a catalog kind).
 func TestServiceCacheStatsRollup(t *testing.T) {
 	ctx := context.Background()
 	s, coreCC, _ := newServiceTest(t)
@@ -309,10 +310,22 @@ func TestServiceCacheStatsRollup(t *testing.T) {
 	const uid = "kube-system-uid"
 	cacheID := seedActiveCache(t, s, coreCC, id, uid)
 
-	// Populate the active cache's on-disk DB: two object kinds (2 Pods, 1
-	// Deployment) plus one event.
+	// Populate the active cache's on-disk DB: an advertised kind catalog (Pod,
+	// Deployment, plus an advertised-but-empty Node), the objects the triggers
+	// count (2 Pods, 1 Deployment), and one event that must not be counted.
 	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
 	require.NoError(t, err)
+	catalog := func(apiVersion, kind, resource, scope string) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+			 VALUES(?, ?, ?, ?, 0, NULL)`,
+			apiVersion, kind, resource, scope)
+		require.NoError(t, err)
+	}
+	catalog("v1", "Pod", "pods", "Namespaced")
+	catalog("apps/v1", "Deployment", "deployments", "Namespaced")
+	catalog("v1", "Node", "nodes", "Cluster")
+
 	at := time.Now().UnixMilli()
 	insert := func(objUID, apiVersion, kind string) {
 		_, err := cdb.Writer().ExecContext(ctx,
@@ -333,9 +346,8 @@ func TestServiceCacheStatsRollup(t *testing.T) {
 	stats, err := s.CacheStats(ctx, id, ClusterCacheID(cacheID))
 	require.NoError(t, err)
 	assert.True(t, stats.Exists)
-	assert.Equal(t, 3, stats.KindCount, "two object kinds + the events row")
-	assert.Equal(t, 4, stats.ObjectCount, "2 Pods + 1 Deployment + 1 event")
-	assert.Len(t, stats.Resources, stats.KindCount, "KindCount must match the breakdown length")
+	assert.Equal(t, 2, stats.KindCount, "Pod and Deployment; the empty Node kind and events excluded")
+	assert.Equal(t, 3, stats.ObjectCount, "2 Pods + 1 Deployment; the event is excluded")
 }
 
 // recvKindChange reads one delta off the ClusterDataKindsWatch stream, failing on

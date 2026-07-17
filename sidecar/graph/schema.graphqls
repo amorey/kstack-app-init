@@ -305,22 +305,10 @@ type ClusterCacheStats {
   exists: Boolean!
   "On-disk cache size (sqlite + WAL/shm) in bytes; 0 when not cached."
   bytes: Int!
-  "Total number of cached objects across every kind (the sum of `resources[].count`, including cached events). 0 when not cached."
+  "Total number of cached objects across every kind (the sum of the kind catalog's per-kind counts; excludes cached events). 0 when not cached."
   objectCount: Int!
-  "Number of distinct kinds with at least one cached object (the length of `resources`, including the synthetic events row). 0 when not cached."
+  "Number of distinct kinds with at least one cached object. 0 when not cached."
   kindCount: Int!
-  "Per-resource breakdown of what's cached."
-  resources: [ClusterCacheResourceStats!]!
-}
-
-"Cache statistics for one resource kind within a cluster's cache."
-type ClusterCacheResourceStats {
-  "Resource identifier, e.g. \"pods\" or \"apps/Deployment\"."
-  resource: String!
-  "Number of objects cached for this resource."
-  count: Int!
-  "Time of the last update to this resource's rows; null if never."
-  lastUpdatedAt: Time
 }
 
 """
