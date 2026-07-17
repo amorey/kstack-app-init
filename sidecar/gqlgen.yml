@@ -57,9 +57,21 @@ models:
         resolver: true
 
   # The conditions ride the wire as-is (the domain shapes; the webview derives
-  # display state from type/status/reason).
-  ClusterCondition:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCondition
+  # display state from type/status/reason). Unprefixed shared vocabulary: the same
+  # Condition rides both the Cluster kind's status and the ClusterCache kind's, so
+  # it belongs to no single storage provenance.
+  #
+  # Condition/Event/Schedule are shared, kind-agnostic vocabulary on the wire but
+  # live in `internal/cluster` only because it's their sole consumer today. The
+  # wire-universal (unprefixed) name and the internal package home are orthogonal:
+  # the unprefixed name says "not specific to one wire namespace", not "must live
+  # package-neutral". When a non-cluster kind/subsystem first needs conditions,
+  # hoist all three together into a shared leaf package (e.g. internal/apimeta),
+  # leaving cluster its ConditionType constants (Connected/Healthy/Synced) — see
+  # sidecar/CLAUDE.md. Until that second consumer exists, a shared package would be
+  # a one-importer abstraction, so they stay here.
+  Condition:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.Condition
 
   # The generic event surface. Event binds 1:1 to the domain type; its run id
   # rides the shared ObjectID scalar (no dedicated Event id scalar), and EventType
@@ -106,8 +118,8 @@ models:
   ClusterCacheStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheStats
 
-  CachedResource:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.CachedResource
+  ClusterCacheResourceStats:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheResourceStats
 
   ClusterDataKind:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataKind
@@ -151,4 +163,4 @@ models:
   String:
     model:
       - github.com/99designs/gqlgen/graphql.String
-      - github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterConditionType
+      - github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ConditionType

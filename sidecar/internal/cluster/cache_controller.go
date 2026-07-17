@@ -336,8 +336,8 @@ func (c *ClusterCacheController) converge(
 		if stopped && !syncEligible(clusterObj) {
 			c.recordSyncStopped(context.Background(), cacheObjID)
 		}
-		SetCondition(conds, ClusterCondition{
-			Type: ClusterConditionSynced, Status: ConditionFalse,
+		SetCondition(conds, Condition{
+			Type: ConditionSynced, Status: ConditionFalse,
 			Reason: ReasonPaused, ObservedGeneration: gen,
 		})
 		return 0
@@ -353,8 +353,8 @@ func (c *ClusterCacheController) converge(
 		restCfg, err = ResolveRESTConfig(c.cfgSource.Get(), contextName)
 		if err != nil {
 			c.stopEngine(cacheObjID)
-			SetCondition(conds, ClusterCondition{
-				Type: ClusterConditionSynced, Status: ConditionFalse,
+			SetCondition(conds, Condition{
+				Type: ConditionSynced, Status: ConditionFalse,
 				Reason: ReasonSyncFailed, Message: err.Error(), ObservedGeneration: gen,
 			})
 			return syncRecheckInterval
@@ -372,8 +372,8 @@ func (c *ClusterCacheController) converge(
 
 	// Stop any running engine before starting a new one (credential change).
 	c.stopEngine(cacheObjID)
-	SetCondition(conds, ClusterCondition{
-		Type: ClusterConditionSynced, Status: ConditionFalse,
+	SetCondition(conds, Condition{
+		Type: ConditionSynced, Status: ConditionFalse,
 		Reason: ReasonSyncing, ObservedGeneration: gen,
 	})
 	c.spawnEngine(clusterID, restCfg, fingerprint, clusterObj.ID, cacheObjID, cacheGen, gen)
@@ -562,7 +562,7 @@ func (c *ClusterCacheController) applyEngineReport(ctx context.Context, entry *e
 	c.recordSyncEvent(ctx, entry, st)
 
 	status := ClusterCacheStatus{
-		Conditions:   []ClusterCondition{cond},
+		Conditions:   []Condition{cond},
 		LastSyncedAt: lastSyncedAt,
 	}
 	return c.ctrlClient.UpdateStatus(ctx, entry.cacheObjID, entry.cacheGen, status)
@@ -692,8 +692,8 @@ func staleMessage(st engine.EngineStatus) string {
 }
 
 // syncedCondition maps one engine status report onto the Synced condition.
-func syncedCondition(st engine.EngineStatus, gen int64) ClusterCondition {
-	cond := ClusterCondition{Type: ClusterConditionSynced, ObservedGeneration: gen}
+func syncedCondition(st engine.EngineStatus, gen int64) Condition {
+	cond := Condition{Type: ConditionSynced, ObservedGeneration: gen}
 	switch st.State {
 	case engine.EngineWatching:
 		cond.Status, cond.Reason = ConditionTrue, ReasonWatching

@@ -190,21 +190,21 @@ const (
 	ConditionUnknown = beehive.ConditionUnknown
 )
 
-// ClusterConditionType names one independently-tracked aspect of a cluster
+// ConditionType names one independently-tracked aspect of a cluster
 // record's observed state. Each type is owned by exactly one controller.
-type ClusterConditionType string
+type ConditionType string
 
 const (
-	// ClusterConditionConnected reports whether the last connection probe
+	// ConditionConnected reports whether the last connection probe
 	// reached the cluster's API server and resolved its identity facts.
-	ClusterConditionConnected ClusterConditionType = "Connected"
-	// ClusterConditionHealthy reports the API server's own condition (its
+	ConditionConnected ConditionType = "Connected"
+	// ConditionHealthy reports the API server's own condition (its
 	// readiness checks), as distinct from our ability to reach it.
-	ClusterConditionHealthy ClusterConditionType = "Healthy"
-	// ClusterConditionSynced reports the state of the cluster's cache-sync
+	ConditionHealthy ConditionType = "Healthy"
+	// ConditionSynced reports the state of the cluster's cache-sync
 	// engine. It lives in ClusterCacheStatus (the ClusterCache kind), not in
 	// the Cluster kind's ClusterStatus.
-	ClusterConditionSynced ClusterConditionType = "Synced"
+	ConditionSynced ConditionType = "Synced"
 )
 
 // Condition reason constants — CamelCase machine-readable explanations for a
@@ -285,14 +285,14 @@ const (
 	ReasonSyncStale = "SyncStale"
 )
 
-// ClusterCondition is one Kubernetes-style status condition on a cluster
+// Condition is one Kubernetes-style status condition on a cluster
 // record. Stored as a JSON array inside the beehive status blob so that
 // ObservedGeneration and LastTransitionTime survive the wire without a schema
 // change. (We do not use beehive.SetCondition because the public
 // beehive.Condition type elides those fields.)
-type ClusterCondition struct {
-	Type   ClusterConditionType `json:"type"`
-	Status ConditionStatus      `json:"status"`
+type Condition struct {
+	Type   ConditionType   `json:"type"`
+	Status ConditionStatus `json:"status"`
 	// Reason is a CamelCase, machine-readable explanation of Status.
 	Reason string `json:"reason"`
 	// Message is the human-readable detail; empty when there is nothing to
@@ -312,7 +312,7 @@ type ClusterCondition struct {
 // existing type updates in place, keeping LastTransitionTime unless Status
 // changed (c.LastTransitionTime is used for a transition when set, else now).
 // Reports whether anything changed.
-func SetCondition(conds *[]ClusterCondition, c ClusterCondition) bool {
+func SetCondition(conds *[]Condition, c Condition) bool {
 	if c.LastTransitionTime.IsZero() {
 		c.LastTransitionTime = time.Now().UTC()
 	}
@@ -332,7 +332,7 @@ func SetCondition(conds *[]ClusterCondition, c ClusterCondition) bool {
 }
 
 // FindCondition returns a pointer to the condition of the given type, or nil.
-func FindCondition(conds []ClusterCondition, t ClusterConditionType) *ClusterCondition {
+func FindCondition(conds []Condition, t ConditionType) *Condition {
 	for i := range conds {
 		if conds[i].Type == t {
 			return &conds[i]
@@ -344,7 +344,7 @@ func FindCondition(conds []ClusterCondition, t ClusterConditionType) *ClusterCon
 // ConditionEqual reports whether two conditions are observably equal — hand-
 // written because time.Time must compare by instant (reflect.DeepEqual trips
 // over monotonic readings and locations after a persistence round-trip).
-func ConditionEqual(a, b ClusterCondition) bool {
+func ConditionEqual(a, b Condition) bool {
 	return a.Type == b.Type && a.Status == b.Status &&
 		a.Reason == b.Reason && a.Message == b.Message &&
 		a.ObservedGeneration == b.ObservedGeneration &&
@@ -353,7 +353,7 @@ func ConditionEqual(a, b ClusterCondition) bool {
 
 // ConditionsEqual reports whether two condition slices are observably equal,
 // element-wise via ConditionEqual.
-func ConditionsEqual(a, b []ClusterCondition) bool {
+func ConditionsEqual(a, b []Condition) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -438,7 +438,7 @@ type ClusterStatus struct {
 	Principal       ClusterPrincipal    `json:"principal"`
 	LastConnectedAt *time.Time          `json:"lastConnectedAt,omitempty"`
 	// Conditions holds the controller-written conditions (Connected, Healthy).
-	Conditions []ClusterCondition `json:"conditions"`
+	Conditions []Condition `json:"conditions"`
 }
 
 // Connection-probe outcomes are not stored on ClusterStatus: the
@@ -535,7 +535,7 @@ type ClusterCacheSpec struct {
 // projection type.
 type ClusterCacheStatus struct {
 	// Conditions holds the sync-controller-owned condition (Synced).
-	Conditions []ClusterCondition `json:"conditions"`
+	Conditions []Condition `json:"conditions"`
 	// LastSyncedAt is when the cache last received fresh data; nil if never.
 	LastSyncedAt *time.Time `json:"lastSyncedAt,omitempty"`
 }
@@ -628,8 +628,8 @@ type ClusterDataKindChange struct {
 
 // --- Cache statistics types (for the ClusterCache GraphQL resolver) ---
 
-// CachedResource is the per-resource breakdown of one cluster's cache.
-type CachedResource struct {
+// ClusterCacheResourceStats is the per-resource breakdown of one cluster's cache.
+type ClusterCacheResourceStats struct {
 	Resource      string
 	Count         int
 	LastUpdatedAt *time.Time
@@ -645,7 +645,7 @@ type ClusterCacheStats struct {
 	// row, matching Resources.
 	ObjectCount int
 	KindCount   int
-	Resources   []CachedResource
+	Resources   []ClusterCacheResourceStats
 }
 
 // ClusterDataKind is one entry in a cluster's discovered kind catalog — a kind the
@@ -674,14 +674,14 @@ type ClusterDataKind struct {
 
 // SeedConnectionConditions returns the initial condition set for a freshly
 // minted Cluster record, before any probe has run.
-func SeedConnectionConditions(gen int64, now time.Time) []ClusterCondition {
-	return []ClusterCondition{
+func SeedConnectionConditions(gen int64, now time.Time) []Condition {
+	return []Condition{
 		{
-			Type: ClusterConditionConnected, Status: ConditionUnknown,
+			Type: ConditionConnected, Status: ConditionUnknown,
 			Reason: ReasonConnecting, ObservedGeneration: gen, LastTransitionTime: now,
 		},
 		{
-			Type: ClusterConditionHealthy, Status: ConditionUnknown,
+			Type: ConditionHealthy, Status: ConditionUnknown,
 			Reason: ReasonNoConnection, ObservedGeneration: gen, LastTransitionTime: now,
 		},
 	}
@@ -689,10 +689,10 @@ func SeedConnectionConditions(gen int64, now time.Time) []ClusterCondition {
 
 // SeedSyncConditions returns the initial condition set for a freshly minted
 // ClusterCache record, before any sync engine has started.
-func SeedSyncConditions(gen int64, now time.Time) []ClusterCondition {
-	return []ClusterCondition{
+func SeedSyncConditions(gen int64, now time.Time) []Condition {
+	return []Condition{
 		{
-			Type: ClusterConditionSynced, Status: ConditionUnknown,
+			Type: ConditionSynced, Status: ConditionUnknown,
 			Reason: ReasonSyncing, ObservedGeneration: gen, LastTransitionTime: now,
 		},
 	}

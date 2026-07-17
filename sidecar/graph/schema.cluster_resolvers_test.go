@@ -859,17 +859,17 @@ func TestClusterEphemeralFields(t *testing.T) {
 
 // Live conditions (cluster + sync blocks) reach the wire with the correct
 // GraphQL shapes — type/status/reason/message/observedGeneration/timestamps.
-func TestClusterConditionsAndSyncStatusOnWire(t *testing.T) {
+func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 	at := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
 	fixtures := clusterFixtures()
-	fixtures[0].connStatus.Conditions = []cluster.ClusterCondition{{
-		Type: cluster.ClusterConditionConnected, Status: cluster.ConditionFalse,
+	fixtures[0].connStatus.Conditions = []cluster.Condition{{
+		Type: cluster.ConditionConnected, Status: cluster.ConditionFalse,
 		Reason: "ProbeFailed", Message: "connection refused",
 		ObservedGeneration: 2, LastTransitionTime: at,
 	}}
 	fixtures[0].cacheStatus = cluster.ClusterCacheStatus{
-		Conditions: []cluster.ClusterCondition{{
-			Type: cluster.ClusterConditionSynced, Status: cluster.ConditionTrue,
+		Conditions: []cluster.Condition{{
+			Type: cluster.ConditionSynced, Status: cluster.ConditionTrue,
 			Reason: "Watching", LastTransitionTime: at,
 		}},
 		LastSyncedAt: &at,

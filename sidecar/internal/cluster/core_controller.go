@@ -536,14 +536,14 @@ func (c *ClusterCoreController) converge(ctx context.Context, client beehive.Con
 
 	if !connectionEligible(obj, present) {
 		c.teardownConnection(clusterID)
-		SetCondition(conds, ClusterCondition{
-			Type:               ClusterConditionConnected,
+		SetCondition(conds, Condition{
+			Type:               ConditionConnected,
 			Status:             ConditionFalse,
 			Reason:             ReasonInactive,
 			ObservedGeneration: gen,
 		})
-		SetCondition(conds, ClusterCondition{
-			Type:               ClusterConditionHealthy,
+		SetCondition(conds, Condition{
+			Type:               ConditionHealthy,
 			Status:             ConditionUnknown,
 			Reason:             ReasonInactive,
 			ObservedGeneration: gen,
@@ -590,8 +590,8 @@ func (c *ClusterCoreController) converge(ctx context.Context, client beehive.Con
 	working.Principal = principal
 	working.LastConnectedAt = &now
 	c.recordAttempt(ctx, client, obj.ID, true, ReasonConnected, "")
-	SetCondition(conds, ClusterCondition{
-		Type:               ClusterConditionConnected,
+	SetCondition(conds, Condition{
+		Type:               ConditionConnected,
 		Status:             ConditionTrue,
 		Reason:             ReasonConnected,
 		ObservedGeneration: gen,
@@ -656,13 +656,13 @@ func (c *ClusterCoreController) observeKubeconfig(obj *beehive.Object[ClusterSpe
 // it on the next success — the idiomatic controller way to say "couldn't converge
 // this pass; retry with backoff." Out-of-band reprobes bypass beehive's worker, so
 // their errors don't disturb the scheduled cadence.
-func (c *ClusterCoreController) observeConnectFailure(conds *[]ClusterCondition, gen int64, reason string, err error) error {
-	SetCondition(conds, ClusterCondition{
-		Type: ClusterConditionConnected, Status: ConditionFalse,
+func (c *ClusterCoreController) observeConnectFailure(conds *[]Condition, gen int64, reason string, err error) error {
+	SetCondition(conds, Condition{
+		Type: ConditionConnected, Status: ConditionFalse,
 		Reason: reason, Message: err.Error(), ObservedGeneration: gen,
 	})
-	SetCondition(conds, ClusterCondition{
-		Type: ClusterConditionHealthy, Status: ConditionUnknown,
+	SetCondition(conds, Condition{
+		Type: ConditionHealthy, Status: ConditionUnknown,
 		Reason: ReasonNoConnection, ObservedGeneration: gen,
 	})
 	return err
@@ -744,8 +744,8 @@ func clusterIDFromObj(obj *beehive.Object[ClusterSpec, ClusterStatus]) ClusterID
 }
 
 // healthCondition maps one health-probe outcome onto the Healthy condition.
-func healthCondition(phase HealthPhase, msg *string, gen int64) ClusterCondition {
-	cond := ClusterCondition{Type: ClusterConditionHealthy, ObservedGeneration: gen}
+func healthCondition(phase HealthPhase, msg *string, gen int64) Condition {
+	cond := Condition{Type: ConditionHealthy, ObservedGeneration: gen}
 	if msg != nil {
 		cond.Message = *msg
 	}

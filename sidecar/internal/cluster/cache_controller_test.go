@@ -115,7 +115,7 @@ type capturedCfgSlot struct {
 // Synced=Syncing (ConditionFalse) synchronously, then the engine's async
 // Watching report flips it to ConditionTrue; a test that wants the settled value
 // must wait for it, not the first write, or it races the async report.
-func awaitCacheSyncedStatus(t *testing.T, cl beehive.Client[ClusterCacheSpec, ClusterCacheStatus], id beehive.ObjectID, want ConditionStatus) ClusterCondition {
+func awaitCacheSyncedStatus(t *testing.T, cl beehive.Client[ClusterCacheSpec, ClusterCacheStatus], id beehive.ObjectID, want ConditionStatus) Condition {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -132,7 +132,7 @@ func awaitCacheSyncedStatus(t *testing.T, cl beehive.Client[ClusterCacheSpec, Cl
 			if ev.Object == nil || ev.Object.Status == nil {
 				continue
 			}
-			if c := findCacheConditionOK(ev.Object.Status.Conditions, ClusterConditionSynced); c != nil && c.Status == want {
+			if c := findCacheConditionOK(ev.Object.Status.Conditions, ConditionSynced); c != nil && c.Status == want {
 				return *c
 			}
 		case <-timeout:
@@ -611,7 +611,7 @@ func TestCacheControllerPokeRestartsLiveEngine(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "poke should restart the live engine")
 }
 
-func findCacheConditionOK(conds []ClusterCondition, typ ClusterConditionType) *ClusterCondition {
+func findCacheConditionOK(conds []Condition, typ ConditionType) *Condition {
 	for i := range conds {
 		if conds[i].Type == typ {
 			return &conds[i]

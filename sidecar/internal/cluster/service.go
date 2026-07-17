@@ -345,10 +345,10 @@ func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID C
 	if err != nil {
 		return nil, err
 	}
-	resources := make([]CachedResource, len(rss))
+	resources := make([]ClusterCacheResourceStats, len(rss))
 	objectCount := 0
 	for i, rs := range rss {
-		resources[i] = CachedResource{
+		resources[i] = ClusterCacheResourceStats{
 			Resource:      rs.Resource,
 			Count:         rs.Count,
 			LastUpdatedAt: rs.LastUpdatedAt,

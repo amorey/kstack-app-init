@@ -98,7 +98,7 @@ type ClusterStatus {
   lastConnectedAt: Time
 
   "The connection controller's conditions (`Connected`, `Healthy`)."
-  conditions: [ClusterCondition!]!
+  conditions: [Condition!]!
 }
 
 "A condition's three-valued verdict, Kubernetes-style."
@@ -121,7 +121,7 @@ Sync-controller condition (under a cache's `status`): `Synced` (reasons Syncing/
 Watching/Paused/SyncFailed/ResolveFailed). New types/reasons may appear;
 consumers should treat unknown spellings as a degraded/unknown display state.
 """
-type ClusterCondition {
+type Condition {
   "The aspect this condition tracks, e.g. \"Connected\"."
   type: String!
   status: ConditionStatus!
@@ -216,7 +216,7 @@ type ClusterCache {
 "The sync controller's status block on the cache child."
 type ClusterCacheStatus {
   "The sync-owned conditions (`Synced`)."
-  conditions: [ClusterCondition!]!
+  conditions: [Condition!]!
   "When the cache last received fresh data; null if never. Refreshed coarsely (~30s) while syncing."
   lastSyncedAt: Time
 }
@@ -310,11 +310,11 @@ type ClusterCacheStats {
   "Number of distinct kinds with at least one cached object (the length of `resources`, including the synthetic events row). 0 when not cached."
   kindCount: Int!
   "Per-resource breakdown of what's cached."
-  resources: [CachedResource!]!
+  resources: [ClusterCacheResourceStats!]!
 }
 
 "Cache statistics for one resource kind within a cluster's cache."
-type CachedResource {
+type ClusterCacheResourceStats {
   "Resource identifier, e.g. \"pods\" or \"apps/Deployment\"."
   resource: String!
   "Number of objects cached for this resource."

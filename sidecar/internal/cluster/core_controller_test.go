@@ -160,7 +160,7 @@ func newClusterTestBeehive(t *testing.T, w KubeConfigSource, probe ProbeFunc, ch
 // condition, then returns that object. beehive's Watch is current-on-subscribe
 // (a snapshot Added event, then live Modified events), so this is event-driven —
 // no polling.
-func waitCondition(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus], id beehive.ObjectID, condType ClusterConditionType) *beehive.Object[ClusterSpec, ClusterStatus] {
+func waitCondition(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus], id beehive.ObjectID, condType ConditionType) *beehive.Object[ClusterSpec, ClusterStatus] {
 	t.Helper()
 	return waitForStatus(t, cl, id, func(s *ClusterStatus) bool {
 		for _, c := range s.Conditions {
@@ -203,7 +203,7 @@ func waitForObservedGeneration(t *testing.T, cl beehive.Client[ClusterSpec, Clus
 	t.Helper()
 	return waitForStatus(t, cl, id, func(s *ClusterStatus) bool {
 		for _, c := range s.Conditions {
-			if c.Type == ClusterConditionConnected && c.ObservedGeneration >= gen {
+			if c.Type == ConditionConnected && c.ObservedGeneration >= gen {
 				return true
 			}
 		}
@@ -244,14 +244,14 @@ func TestClusterCoreControllerSuccessfulProbeWritesConditions(t *testing.T) {
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
 
-	got := waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
+	got := waitCondition(t, coreClient, obj.ID, ConditionConnected)
 	require.NotNil(t, got.Status)
 
-	connected := findCondition(t, got.Status.Conditions, ClusterConditionConnected)
+	connected := findCondition(t, got.Status.Conditions, ConditionConnected)
 	assert.Equal(t, ConditionTrue, connected.Status)
 	assert.Equal(t, ReasonConnected, connected.Reason)
 
-	healthy := findCondition(t, got.Status.Conditions, ClusterConditionHealthy)
+	healthy := findCondition(t, got.Status.Conditions, ConditionHealthy)
 	assert.Equal(t, ConditionTrue, healthy.Status)
 
 	assert.NotNil(t, got.Status.LastConnectedAt)
@@ -320,8 +320,8 @@ func TestClusterCoreControllerProbeFailureSetsConnectedFalse(t *testing.T) {
 	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
 
-	got := waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
-	connected := findCondition(t, got.Status.Conditions, ClusterConditionConnected)
+	got := waitCondition(t, coreClient, obj.ID, ConditionConnected)
+	connected := findCondition(t, got.Status.Conditions, ConditionConnected)
 	assert.Equal(t, ConditionFalse, connected.Status)
 	assert.Equal(t, ReasonProbeFailed, connected.Reason)
 }
@@ -342,8 +342,8 @@ func TestClusterCoreControllerIneligibleClusterDoesNotProbe(t *testing.T) {
 	obj, err := coreClient.Create(ctx, spec)
 	require.NoError(t, err)
 
-	got := waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
-	connected := findCondition(t, got.Status.Conditions, ClusterConditionConnected)
+	got := waitCondition(t, coreClient, obj.ID, ConditionConnected)
+	connected := findCondition(t, got.Status.Conditions, ConditionConnected)
 	assert.Equal(t, ConditionFalse, connected.Status)
 	assert.Equal(t, ReasonInactive, connected.Reason)
 	assert.False(t, probeCalled, "probe must not be called for ineligible cluster")
@@ -365,7 +365,7 @@ func TestClusterCoreControllerRecordsAttemptOnSuccessfulProbe(t *testing.T) {
 	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
 	require.NoError(t, err)
 
-	waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
+	waitCondition(t, coreClient, obj.ID, ConditionConnected)
 	evs, err := coreClient.ListEvents(ctx, obj.ID, beehive.WithEventCategory(ConnectionEventCategory))
 	require.NoError(t, err)
 	require.NotEmpty(t, evs, "a successful probe records an attempt")
@@ -389,7 +389,7 @@ func TestClusterCoreControllerIneligibleClusterRecordsNoAttempt(t *testing.T) {
 	obj, err := coreClient.Create(ctx, spec)
 	require.NoError(t, err)
 
-	waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
+	waitCondition(t, coreClient, obj.ID, ConditionConnected)
 	evs, err := coreClient.ListEvents(ctx, obj.ID, beehive.WithEventCategory(ConnectionEventCategory))
 	require.NoError(t, err)
 	assert.Empty(t, evs, "an ineligible cluster makes no attempt, so the history stays empty")
@@ -440,7 +440,7 @@ func TestClusterCoreControllerSuccessfulProbePopulatesConnectionManager(t *testi
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
 
-	waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
+	waitCondition(t, coreClient, obj.ID, ConditionConnected)
 
 	got := connMgr.Get(id)
 	assert.NotNil(t, got, "ConnectionManager must have a REST config after successful probe")
@@ -462,7 +462,7 @@ func TestClusterCoreControllerProbeFailureDeletesFromConnectionManager(t *testin
 	id := ClusterID(obj.ID)
 
 	// Wait for the first reconcile (failed probe) to land its Connected condition.
-	waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
+	waitCondition(t, coreClient, obj.ID, ConditionConnected)
 
 	// Pre-seed a stale entry, then force a fresh reconcile (a spec edit bumps
 	// generation) so the probe-failure path runs again with the seed in place —
@@ -499,7 +499,7 @@ func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.
 	id := ClusterID(obj.ID)
 
 	// Wait for the first reconcile (ineligible) to land its Connected condition.
-	waitCondition(t, coreClient, obj.ID, ClusterConditionConnected)
+	waitCondition(t, coreClient, obj.ID, ConditionConnected)
 
 	// Pre-seed a stale entry, then force a fresh reconcile (a spec edit bumps
 	// generation, staying ineligible) so the teardown path runs with the seed in place.
@@ -517,7 +517,7 @@ func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.
 	assert.Nil(t, connMgr.Get(id), "ConnectionManager must not hold a config for an ineligible cluster")
 }
 
-func findCondition(t *testing.T, conds []ClusterCondition, typ ClusterConditionType) ClusterCondition {
+func findCondition(t *testing.T, conds []Condition, typ ConditionType) Condition {
 	t.Helper()
 	for _, c := range conds {
 		if c.Type == typ {
@@ -525,7 +525,7 @@ func findCondition(t *testing.T, conds []ClusterCondition, typ ClusterConditionT
 		}
 	}
 	t.Fatalf("condition %s not found in %v", typ, conds)
-	return ClusterCondition{}
+	return Condition{}
 }
 
 // TestClusterCoreControllerPokeReprobes verifies the controller subscribes to the
@@ -702,7 +702,7 @@ func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
 	assert.Equal(t, "alpha-cluster", kc.Cluster, "departed record keeps its last-known names")
 	assert.Equal(t, "alpha-user", kc.User)
 	assert.False(t, kc.IsDefault)
-	connected := findCondition(t, got.Status.Conditions, ClusterConditionConnected)
+	connected := findCondition(t, got.Status.Conditions, ConditionConnected)
 	assert.Equal(t, ConditionFalse, connected.Status)
 	assert.Equal(t, ReasonInactive, connected.Reason)
 }
