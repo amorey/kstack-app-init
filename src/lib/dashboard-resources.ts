@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The dashboard's resource catalog — the tree the sidebar renders and the
-// authority for what the `resource` URL search param may hold (see
-// `routes/dashboard.tsx`). `DASHBOARD_NAV` is the **single source of truth**: it
-// is `as const`, and the selectable-id union, the default, the id→node lookup,
-// and the membership guard are all *derived* from it, so adding a resource kind
-// is a one-line data edit with nothing to keep in sync.
+// The dashboard's resource catalog. `DASHBOARD_NAV` is the **curated** base — the
+// hand-picked kinds that always appear in the sidebar, in the order they should
+// read. The rendered tree is `DASHBOARD_NAV` *augmented at runtime* with the
+// cluster's remaining kinds (from `clusterDataKinds`, live API discovery): every
+// server kind not already curated is bucketed into a group by its api group (see
+// `API_GROUP_TO_GROUP`) and revealed behind a "Show more…" toggle (or, for a
+// childless group, the group's own disclosure). `buildDashboardNav` does that
+// merge; kinds whose api group isn't mapped (including the core group) are left
+// for the Custom Resources work and not rendered here yet.
 //
-// Every node is selectable (it has its own view / `resource` value) and may
-// carry `children`, so the catalog is an ordered, uniformly-selectable tree —
-// e.g. a top-level `workloads` node with `pods`/`daemonsets` beneath it, sitting
-// alongside leaf nodes like `nodes` and `namespaces`. Keep it ordered as it
-// should read top-to-bottom, and keep every `id` unique across the whole tree:
-// `resource` is one flat id namespace, so a duplicate id would make two nodes
-// indistinguishable in the URL.
+// The `resource` URL search param (see `routes/dashboard.tsx`) can therefore hold
+// an id that isn't in the static curated tree — a dynamic kind's id — so
+// `DashboardResource` is a plain string, validated leniently (any non-empty
+// string) rather than against a closed union.
 export const DASHBOARD_NAV = [
   { id: 'overview', label: 'Overview' },
   { id: 'nodes', label: 'Nodes' },
@@ -84,51 +84,148 @@ export const DASHBOARD_NAV = [
   },
 ] as const;
 
-// The union of selectable ids, pulled out of the tree: each node contributes its
-// own id and — for groups — the ids of its descendants. Deriving it means the
-// union can never drift from the data.
-type NodeId<T> =
-  | (T extends { id: infer I extends string } ? I : never)
-  | (T extends { children: readonly (infer C)[] } ? NodeId<C> : never);
-export type DashboardResource = NodeId<(typeof DASHBOARD_NAV)[number]>;
+// A selectable id: a curated node id or a dynamic kind's id (`<group>/<resource>`,
+// e.g. "apps/replicasets"). Open string because dynamic kinds are data-driven.
+export type DashboardResource = string;
 
-// A node in the tree, general over the derived id union — the shape the sidebar
-// renders and `flattenNav` walks. `DASHBOARD_NAV` (its narrower `as const` type)
-// is assignable to a `readonly DashboardNavNode[]`.
+// A node in the rendered tree. Discovered (non-curated) kinds always live in
+// `moreChildren`, so the disclosure *style* is derived from the shape rather than
+// stored: a group with curated `children` keeps them visible and hides its
+// `moreChildren` behind a "Show more…" toggle; a group with no curated children
+// (e.g. System) hides its `moreChildren` behind a parent-level chevron (see
+// `DashboardResourceNav`). Either way `moreChildren` sit at the same depth as
+// `children` would.
 export type DashboardNavNode = {
   readonly id: DashboardResource;
   readonly label: string;
   readonly children?: readonly DashboardNavNode[];
+  readonly moreChildren?: readonly DashboardNavNode[];
 };
 
+// One kind advertised by a cluster's API server (a `clusterDataKinds` row). Declared
+// here — not imported from `@/gql` — so this module stays pure and testable.
+export type ServerKind = {
+  apiVersion: string;
+  kind: string;
+  resource: string;
+  scope: string;
+  isCRD: boolean;
+};
+
+// The curated groups that can receive discovered kinds. Written as `Extract<…>` of
+// the tree's top-level ids so it stays tied to `DASHBOARD_NAV`: rename or remove a
+// group there and it drops out of this union, which then fails the value check on
+// `API_GROUP_TO_GROUP` below — a build error instead of silently dropped kinds.
+type TopLevelId = (typeof DASHBOARD_NAV)[number]['id'];
+export type DashboardGroupId = Extract<
+  TopLevelId,
+  'workloads' | 'network' | 'config-and-storage' | 'security-and-access' | 'system'
+>;
+
+// api group → the curated group its non-curated kinds fall under. api groups not
+// listed here — including the core group ("") — are deferred to the Custom
+// Resources work and produce no entries yet.
+const API_GROUP_TO_GROUP: Record<string, DashboardGroupId> = {
+  apps: 'workloads',
+  batch: 'workloads',
+  autoscaling: 'workloads',
+  policy: 'workloads',
+  'networking.k8s.io': 'network',
+  'discovery.k8s.io': 'network',
+  'gateway.networking.k8s.io': 'network',
+  'storage.k8s.io': 'config-and-storage',
+  'rbac.authorization.k8s.io': 'security-and-access',
+  'certificates.k8s.io': 'security-and-access',
+  'admissionregistration.k8s.io': 'security-and-access',
+  'coordination.k8s.io': 'system',
+  'scheduling.k8s.io': 'system',
+  'node.k8s.io': 'system',
+  'flowcontrol.apiserver.k8s.io': 'system',
+  'resource.k8s.io': 'system',
+};
+
+// The api group of a "group/version" (or "" for the core group's bare "v1").
+export function apiGroupOf(apiVersion: string): string {
+  const slash = apiVersion.indexOf('/');
+  return slash === -1 ? '' : apiVersion.slice(0, slash);
+}
+
 // Depth-first, parent-before-children, preserving display order — the flat view
-// the identity-based helpers below index. Exported so the traversal is testable
-// against an arbitrary tree, not just the live catalog.
+// the id-based helpers below index. Walks both `children` and `moreChildren` so a
+// discovered kind behind a "Show more…" toggle still resolves (label lookup, etc.).
+// Exported so the traversal is testable against an arbitrary tree, not just the
+// live catalog.
 export function flattenNav(nodes: readonly DashboardNavNode[]): DashboardNavNode[] {
-  return nodes.flatMap((node) => [node, ...(node.children ? flattenNav(node.children) : [])]);
+  return nodes.flatMap((node) => [
+    node,
+    ...(node.children ? flattenNav(node.children) : []),
+    ...(node.moreChildren ? flattenNav(node.moreChildren) : []),
+  ]);
 }
 
-// Flatten once and derive both the id→node index and the default from it.
-const FLAT_NAV = flattenNav(DASHBOARD_NAV);
-const NODES_BY_ID = new Map<string, DashboardNavNode>(FLAT_NAV.map((node) => [node.id, node]));
-
-// The kind shown when the URL names none (or an unknown one): the first node in
-// reading order, so the sidebar's default highlight and the panel's default view
-// agree.
-export const DEFAULT_DASHBOARD_RESOURCE: DashboardResource = FLAT_NAV[0].id;
-
-export function isDashboardResource(value: unknown): value is DashboardResource {
-  return typeof value === 'string' && NODES_BY_ID.has(value);
+// Depth-first search for the node with `id`, walking `children` and `moreChildren`,
+// short-circuiting at the first match — the cheap way to answer "which node is this
+// id" (and, over a subtree, "does this id live here") without flattening the tree.
+export function findNode(nodes: readonly DashboardNavNode[], id: DashboardResource): DashboardNavNode | undefined {
+  let match: DashboardNavNode | undefined;
+  nodes.some((node) => {
+    match = node.id === id ? node : (findNode(node.children ?? [], id) ?? findNode(node.moreChildren ?? [], id));
+    return match !== undefined;
+  });
+  return match;
 }
 
-// Fold the optional `resource` URL param into a concrete kind: `validateSearch`
-// leaves it absent when the URL names none, and this is the one place that rule
-// (absent ⇒ default) lives, so the sidebar highlight and the panel can't drift.
+// Every curated id (group + leaf), so a server kind that's already curated is not
+// duplicated among a group's discovered kinds.
+const CURATED_IDS = new Set<string>(flattenNav(DASHBOARD_NAV).map((n) => n.id));
+
+// The kind shown when the URL names none: the first node in reading order, so the
+// sidebar's default highlight and the panel's default view agree.
+export const DEFAULT_DASHBOARD_RESOURCE: DashboardResource = DASHBOARD_NAV[0].id;
+
+// Fold the optional `resource` URL param into a concrete id: absent ⇒ the default.
+// A present value passes through untouched (it may be a dynamic kind not in the
+// curated tree), so a deep link to a server kind survives; an id that resolves to
+// no node just highlights nothing until its group's kinds load.
 export function resolveDashboardResource(resource: DashboardResource | undefined): DashboardResource {
-  return resource ?? DEFAULT_DASHBOARD_RESOURCE;
+  return resource && resource.length > 0 ? resource : DEFAULT_DASHBOARD_RESOURCE;
 }
 
-// The human label for a resource id (group or leaf), for the panel heading.
-export function dashboardResourceLabel(resource: DashboardResource): string {
-  return NODES_BY_ID.get(resource)?.label ?? resource;
+// Merge the cluster's discovered kinds into the curated base: each non-curated
+// kind whose api group maps to a group is hung off that group's `moreChildren`
+// (sorted by label). The renderer derives the disclosure style from the shape — a
+// group with curated children reveals them behind "Show more…", a childless group
+// (e.g. System) behind a parent-level chevron — so this doesn't decide it here.
+// Kinds in unmapped api groups (incl. core) are skipped — reserved for Custom
+// Resources.
+export function buildDashboardNav(serverKinds: readonly ServerKind[]): DashboardNavNode[] {
+  // Keyed by group id (a plain string): the ids are `DASHBOARD_NAV` node ids, so a
+  // lookup with `node.id` below needs no cast.
+  const buckets = new Map<string, DashboardNavNode[]>();
+  const seen = new Set<string>();
+  serverKinds.forEach((k) => {
+    const apiGroup = apiGroupOf(k.apiVersion);
+    const group = API_GROUP_TO_GROUP[apiGroup];
+    if (!group) return; // unmapped api group (incl. core): deferred to Custom Resources
+    if (CURATED_IDS.has(k.resource)) return; // already curated — don't duplicate
+    const id = `${apiGroup}/${k.resource}`;
+    if (seen.has(id)) return; // guard against duplicate discovery rows
+    seen.add(id);
+    const list = buckets.get(group) ?? [];
+    list.push({ id, label: k.kind });
+    buckets.set(group, list);
+  });
+  buckets.forEach((list) => list.sort((a, b) => a.label.localeCompare(b.label)));
+
+  return DASHBOARD_NAV.map((node): DashboardNavNode => {
+    const bucket = buckets.get(node.id); // never empty: a bucket exists only once a kind is pushed
+    return bucket ? { ...node, moreChildren: bucket } : node;
+  });
+}
+
+// The human label for an id, resolved against a built tree (so dynamic kinds
+// resolve too). Falls back to the raw id when no node matches — e.g. a dynamic
+// kind whose catalog hasn't loaded yet, or a stale deep link.
+export function dashboardResourceLabel(nav: readonly DashboardNavNode[], resource: DashboardResource): string {
+  return findNode(nav, resource)?.label ?? resource;
 }

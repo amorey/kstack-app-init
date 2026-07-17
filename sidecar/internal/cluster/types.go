@@ -632,6 +632,25 @@ type ClusterCacheStats struct {
 	Resources   []CachedResource
 }
 
+// ClusterDataKind is one entry in a cluster's discovered kind catalog — a kind the
+// cluster's API server advertises (built-in or CRD), read from the active cache's
+// kind_catalog at request time. Binds 1:1 to the GraphQL ClusterDataKind; it powers
+// the dashboard's dynamic resource nav, so consumers get the plural resource name
+// (to dedupe against the curated catalog) and the api group (via APIVersion) to
+// bucket the kind into a nav group.
+type ClusterDataKind struct {
+	// APIVersion is the group/version, e.g. "apps/v1" or "v1" for the core group.
+	APIVersion string
+	// Kind is the Kind name, e.g. "Deployment".
+	Kind string
+	// Resource is the plural lowercase URL form, e.g. "deployments".
+	Resource string
+	// Scope is "Namespaced" or "Cluster".
+	Scope string
+	// IsCRD is true when the kind is backed by a CustomResourceDefinition.
+	IsCRD bool
+}
+
 // --- Seed conditions ---
 
 // SeedConnectionConditions returns the initial condition set for a freshly

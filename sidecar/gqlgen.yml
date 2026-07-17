@@ -109,6 +109,9 @@ models:
   CachedResource:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.CachedResource
 
+  ClusterDataKind:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataKind
+
   # --- Auth ---
   # Bind the GraphQL auth types straight to the auth domain types so the
   # resolvers need no field-by-field mapper. Only schema fields are exposed —

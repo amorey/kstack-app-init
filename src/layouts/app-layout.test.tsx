@@ -50,6 +50,12 @@ vi.mock('@/components/widgets/app-dialogs', () => ({
 vi.mock('@/lib/connection-status', () => ({
   ConnectionStatus: () => <div data-testid="connection-status" />,
 }));
+// The real resource nav builds its tree from the active cluster's kinds (urql +
+// clusters providers); this test only checks that it mounts on dashboard, so stub
+// it with a nav that keeps the accessible "Resources" name the assertions match.
+vi.mock('@/components/widgets/dashboard-resource-nav', () => ({
+  DashboardResourceNav: () => <nav aria-label="Resources" />,
+}));
 
 const { AppLayout } = await import('./app-layout');
 

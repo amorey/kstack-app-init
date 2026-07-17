@@ -41,9 +41,10 @@ type fakeClusterService struct {
 	mu          sync.Mutex
 	order       []cluster.ClusterID
 	clusters    map[cluster.ClusterID]*cluster.Cluster
-	caches      []cluster.ClusterCache                     // one active cache per fixture, streamed via WatchCaches
-	events      map[cluster.ClusterID][]cluster.Event      // connection-event history, keyed by ClusterID
-	cacheEvents map[cluster.ClusterCacheID][]cluster.Event // sync-event history, keyed by ClusterCacheID
+	caches      []cluster.ClusterCache                          // one active cache per fixture, streamed via WatchCaches
+	events      map[cluster.ClusterID][]cluster.Event           // connection-event history, keyed by ClusterID
+	cacheEvents map[cluster.ClusterCacheID][]cluster.Event      // sync-event history, keyed by ClusterCacheID
+	kinds       map[cluster.ClusterID][]cluster.ClusterDataKind // discovered kind catalog, keyed by ClusterID
 }
 
 var _ cluster.ClusterService = (*fakeClusterService)(nil)
@@ -137,6 +138,12 @@ func (f *fakeClusterService) WatchCaches(ctx context.Context) (<-chan cluster.Cl
 
 func (f *fakeClusterService) CacheStats(context.Context, cluster.ClusterID, cluster.ClusterCacheID) (*cluster.ClusterCacheStats, error) {
 	return &cluster.ClusterCacheStats{}, nil
+}
+
+func (f *fakeClusterService) ClusterDataKinds(_ context.Context, clusterID cluster.ClusterID, _ cluster.ClusterCacheID) ([]cluster.ClusterDataKind, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.kinds[clusterID], nil
 }
 
 func (f *fakeClusterService) ClusterEvents(_ context.Context, id cluster.ClusterID, _ *string, _ *int) ([]cluster.Event, error) {
@@ -414,6 +421,73 @@ func TestClusterEventsResolver(t *testing.T) {
 	}
 	if ev["count"] != float64(3) {
 		t.Errorf("count: want 3, got %v", ev["count"])
+	}
+}
+
+// clusterDataKinds maps the service's domain ClusterDataKinds onto the wire 1:1 (bound
+// via gqlgen.yml), so the resolver just adapts the value slice to a pointer slice.
+func TestClusterDataKindsResolver(t *testing.T) {
+	fix := clusterFixtures()
+	svc := newFakeClusterService(fix)
+	id := fix[0].id
+	svc.kinds = map[cluster.ClusterID][]cluster.ClusterDataKind{
+		id: {
+			{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Scope: "Namespaced", IsCRD: false},
+			{APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: "Namespaced", IsCRD: true},
+		},
+	}
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{
+		ClusterSvc: svc, Auth: newFakeAuth(auth.Identity{}),
+	}))
+	t.Cleanup(srv.Close)
+
+	query := `{ clusterDataKinds(id: "` + strconv.FormatInt(int64(id), 10) + `", cacheID: "` + strconv.FormatInt(int64(id), 10) + `") {
+		apiVersion kind resource scope isCRD
+	} }`
+	body, _ := json.Marshal(map[string]string{"query": query})
+	raw := postGQL(t, srv.URL, string(body))
+
+	var resp struct {
+		Data struct {
+			ClusterDataKinds []map[string]any `json:"clusterDataKinds"`
+		}
+		Errors []struct{ Message string }
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if len(resp.Errors) > 0 {
+		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
+	}
+	if len(resp.Data.ClusterDataKinds) != 2 {
+		t.Fatalf("want 2 kinds, got %d: %s", len(resp.Data.ClusterDataKinds), raw)
+	}
+	k := resp.Data.ClusterDataKinds[0]
+	if k["apiVersion"] != "apps/v1" || k["kind"] != "Deployment" || k["resource"] != "deployments" {
+		t.Errorf("first kind: %v", k)
+	}
+	if k["scope"] != "Namespaced" || k["isCRD"] != false {
+		t.Errorf("first kind scope/isCRD: %v", k)
+	}
+	if resp.Data.ClusterDataKinds[1]["isCRD"] != true {
+		t.Errorf("second kind should be a CRD: %v", resp.Data.ClusterDataKinds[1])
+	}
+
+	// Unknown cluster → empty list, not an error.
+	q2 := `{ clusterDataKinds(id: "99999", cacheID: "99999") { kind } }`
+	b2, _ := json.Marshal(map[string]string{"query": q2})
+	raw2 := postGQL(t, srv.URL, string(b2))
+	var resp2 struct {
+		Data struct {
+			ClusterDataKinds []map[string]any `json:"clusterDataKinds"`
+		}
+		Errors []struct{ Message string }
+	}
+	if err := json.Unmarshal(raw2, &resp2); err != nil {
+		t.Fatalf("decode %s: %v", raw2, err)
+	}
+	if len(resp2.Errors) > 0 || len(resp2.Data.ClusterDataKinds) != 0 {
+		t.Fatalf("unknown cluster should yield empty kinds, got %s", raw2)
 	}
 }
 

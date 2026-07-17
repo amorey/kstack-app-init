@@ -420,6 +420,48 @@ func TestResourceStats(t *testing.T) {
 	require.Equal(t, at, byResource["Pod"].LastUpdatedAt.UnixMilli())
 }
 
+func TestKindCatalog(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// Empty until discovery populates it.
+	rows, err := cdb.KindCatalog(ctx)
+	require.NoError(t, err)
+	require.Empty(t, rows)
+
+	insert := func(apiVersion, kind, resource, scope string, isCRD int) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+			 VALUES(?, ?, ?, ?, ?, NULL)`,
+			apiVersion, kind, resource, scope, isCRD)
+		require.NoError(t, err)
+	}
+	insert("apps/v1", "Deployment", "deployments", "Namespaced", 0)
+	insert("v1", "Node", "nodes", "Cluster", 0)
+	insert("example.com/v1", "Widget", "widgets", "Namespaced", 1)
+
+	rows, err = cdb.KindCatalog(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 3)
+
+	// Ordered by (api_version, kind).
+	require.Equal(t, "apps/v1", rows[0].APIVersion)
+	require.Equal(t, "Deployment", rows[0].Kind)
+	require.Equal(t, "deployments", rows[0].Resource)
+	require.Equal(t, "Namespaced", rows[0].Scope)
+	require.False(t, rows[0].IsCRD)
+
+	require.Equal(t, "example.com/v1", rows[1].APIVersion)
+	require.True(t, rows[1].IsCRD, "is_crd decodes to bool")
+
+	require.Equal(t, "v1", rows[2].APIVersion)
+	require.Equal(t, "Cluster", rows[2].Scope)
+}
+
 func itoa(i int) string {
 	// fmt.Sprintf would pull fmt into the hot loop; this is tight and
 	// deterministic.

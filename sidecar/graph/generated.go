@@ -110,6 +110,14 @@ type ComplexityRoot struct {
 		Type               func(childComplexity int) int
 	}
 
+	ClusterDataKind struct {
+		APIVersion func(childComplexity int) int
+		IsCRD      func(childComplexity int) int
+		Kind       func(childComplexity int) int
+		Resource   func(childComplexity int) int
+		Scope      func(childComplexity int) int
+	}
+
 	ClusterPermissions struct {
 		Incomplete       func(childComplexity int) int
 		Namespace        func(childComplexity int) int
@@ -197,6 +205,7 @@ type ComplexityRoot struct {
 		AuthState          func(childComplexity int) int
 		Cluster            func(childComplexity int, id cluster.ObjectID) int
 		ClusterCacheEvents func(childComplexity int, id cluster.ObjectID, category *string, limit *int) int
+		ClusterDataKinds   func(childComplexity int, id cluster.ObjectID, cacheID cluster.ObjectID) int
 		ClusterEvents      func(childComplexity int, id cluster.ObjectID, category *string, limit *int) int
 		Clusters           func(childComplexity int) int
 	}
@@ -244,6 +253,7 @@ type QueryResolver interface {
 	Clusters(ctx context.Context) ([]*cluster.Cluster, error)
 	ClusterEvents(ctx context.Context, id cluster.ObjectID, category *string, limit *int) ([]*cluster.Event, error)
 	ClusterCacheEvents(ctx context.Context, id cluster.ObjectID, category *string, limit *int) ([]*cluster.Event, error)
+	ClusterDataKinds(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) ([]*cluster.ClusterDataKind, error)
 	AuthState(ctx context.Context) (*auth.State, error)
 }
 type SubscriptionResolver interface {
@@ -489,6 +499,37 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCondition.Type(childComplexity), true
+
+	case "ClusterDataKind.apiVersion":
+		if e.ComplexityRoot.ClusterDataKind.APIVersion == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataKind.APIVersion(childComplexity), true
+	case "ClusterDataKind.isCRD":
+		if e.ComplexityRoot.ClusterDataKind.IsCRD == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataKind.IsCRD(childComplexity), true
+	case "ClusterDataKind.kind":
+		if e.ComplexityRoot.ClusterDataKind.Kind == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataKind.Kind(childComplexity), true
+	case "ClusterDataKind.resource":
+		if e.ComplexityRoot.ClusterDataKind.Resource == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataKind.Resource(childComplexity), true
+	case "ClusterDataKind.scope":
+		if e.ComplexityRoot.ClusterDataKind.Scope == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataKind.Scope(childComplexity), true
 
 	case "ClusterPermissions.incomplete":
 		if e.ComplexityRoot.ClusterPermissions.Incomplete == nil {
@@ -825,6 +866,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Query.ClusterCacheEvents(childComplexity, args["id"].(cluster.ObjectID), args["category"].(*string), args["limit"].(*int)), true
+	case "Query.clusterDataKinds":
+		if e.ComplexityRoot.Query.ClusterDataKinds == nil {
+			break
+		}
+
+		args, err := ec.field_Query_clusterDataKinds_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.ComplexityRoot.Query.ClusterDataKinds(childComplexity, args["id"].(cluster.ObjectID), args["cacheID"].(cluster.ObjectID)), true
 	case "Query.clusterEvents":
 		if e.ComplexityRoot.Query.ClusterEvents == nil {
 			break
@@ -1193,6 +1245,22 @@ func (ec *executionContext) childFields_ClusterCondition(ctx context.Context, fi
 		return ec.fieldContext_ClusterCondition_lastTransitionTime(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterCondition", field.Name)
+}
+
+func (ec *executionContext) childFields_ClusterDataKind(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "apiVersion":
+		return ec.fieldContext_ClusterDataKind_apiVersion(ctx, field)
+	case "kind":
+		return ec.fieldContext_ClusterDataKind_kind(ctx, field)
+	case "resource":
+		return ec.fieldContext_ClusterDataKind_resource(ctx, field)
+	case "scope":
+		return ec.fieldContext_ClusterDataKind_scope(ctx, field)
+	case "isCRD":
+		return ec.fieldContext_ClusterDataKind_isCRD(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type ClusterDataKind", field.Name)
 }
 
 func (ec *executionContext) childFields_ClusterPermissions(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -1622,6 +1690,28 @@ func (ec *executionContext) field_Query_clusterCacheEvents_args(ctx context.Cont
 		return nil, err
 	}
 	args["limit"] = arg2
+	return args, nil
+}
+
+func (ec *executionContext) field_Query_clusterDataKinds_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
+		func(ctx context.Context, v any) (cluster.ObjectID, error) {
+			return ec.unmarshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐObjectID(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["id"] = arg0
+	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "cacheID",
+		func(ctx context.Context, v any) (cluster.ObjectID, error) {
+			return ec.unmarshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐObjectID(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["cacheID"] = arg1
 	return args, nil
 }
 
@@ -2689,6 +2779,121 @@ func (ec *executionContext) _ClusterCondition_lastTransitionTime(ctx context.Con
 }
 func (ec *executionContext) fieldContext_ClusterCondition_lastTransitionTime(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterCondition", field, false, false, errors.New("field of type Time does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataKind_apiVersion(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataKind_apiVersion(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.APIVersion, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataKind_apiVersion(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataKind", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataKind_kind(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataKind_kind(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Kind, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataKind_kind(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataKind", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataKind_resource(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataKind_resource(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Resource, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataKind_resource(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataKind", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataKind_scope(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataKind_scope(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Scope, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataKind_scope(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataKind", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataKind_isCRD(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataKind_isCRD(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.IsCRD, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
+			return ec.marshalNBoolean2bool(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataKind_isCRD(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataKind", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterPermissions_namespace(ctx context.Context, field graphql.CollectedField, obj *model.ClusterPermissions) (ret graphql.Marshaler) {
@@ -4068,6 +4273,50 @@ func (ec *executionContext) fieldContext_Query_clusterCacheEvents(ctx context.Co
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
 	if fc.Args, err = ec.field_Query_clusterCacheEvents_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Query_clusterDataKinds(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Query_clusterDataKinds(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.Resolvers.Query().ClusterDataKinds(ctx, fc.Args["id"].(cluster.ObjectID), fc.Args["cacheID"].(cluster.ObjectID))
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v []*cluster.ClusterDataKind) graphql.Marshaler {
+			return ec.marshalNClusterDataKind2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataKindᚄ(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Query_clusterDataKinds(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Query",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterDataKind(ctx, field)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Query_clusterDataKinds_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -6260,6 +6509,65 @@ func (ec *executionContext) _ClusterCondition(ctx context.Context, sel ast.Selec
 	return out
 }
 
+var clusterDataKindImplementors = []string{"ClusterDataKind"}
+
+func (ec *executionContext) _ClusterDataKind(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterDataKind) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, clusterDataKindImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("ClusterDataKind")
+		case "apiVersion":
+			out.Values[i] = ec._ClusterDataKind_apiVersion(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "kind":
+			out.Values[i] = ec._ClusterDataKind_kind(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "resource":
+			out.Values[i] = ec._ClusterDataKind_resource(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "scope":
+			out.Values[i] = ec._ClusterDataKind_scope(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "isCRD":
+			out.Values[i] = ec._ClusterDataKind_isCRD(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
 var clusterPermissionsImplementors = []string{"ClusterPermissions"}
 
 func (ec *executionContext) _ClusterPermissions(ctx context.Context, sel ast.SelectionSet, obj *model.ClusterPermissions) graphql.Marshaler {
@@ -7058,6 +7366,28 @@ func (ec *executionContext) _Query(ctx context.Context, sel ast.SelectionSet) gr
 			}
 
 			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return rrm(innerCtx) })
+		case "clusterDataKinds":
+			field := field
+
+			innerFunc := func(ctx context.Context, fs *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._Query_clusterDataKinds(ctx, field)
+				if res == graphql.Null {
+					atomic.AddUint32(&fs.Invalids, 1)
+				}
+				return res
+			}
+
+			rrm := func(ctx context.Context) graphql.Marshaler {
+				return ec.OperationContext.RootResolverMiddleware(ctx,
+					func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return rrm(innerCtx) })
 		case "authState":
 			field := field
 
@@ -7783,6 +8113,32 @@ func (ec *executionContext) marshalNClusterCondition2ᚕgithubᚗcomᚋkubetail�
 	}
 
 	return ret
+}
+
+func (ec *executionContext) marshalNClusterDataKind2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataKindᚄ(ctx context.Context, sel ast.SelectionSet, v []*cluster.ClusterDataKind) graphql.Marshaler {
+	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
+		fc := graphql.GetFieldContext(ctx)
+		fc.Result = &v[i]
+		return ec.marshalNClusterDataKind2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataKind(ctx, sel, v[i])
+	})
+
+	for _, e := range ret {
+		if e == graphql.Null {
+			return graphql.Null
+		}
+	}
+
+	return ret
+}
+
+func (ec *executionContext) marshalNClusterDataKind2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataKind(ctx context.Context, sel ast.SelectionSet, v *cluster.ClusterDataKind) graphql.Marshaler {
+	if v == nil {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+		return graphql.Null
+	}
+	return ec._ClusterDataKind(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalNClusterPermissions2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterPermissions(ctx context.Context, sel ast.SelectionSet, v model.ClusterPermissions) graphql.Marshaler {

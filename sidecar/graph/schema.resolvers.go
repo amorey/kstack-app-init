@@ -124,6 +124,17 @@ func (r *queryResolver) ClusterCacheEvents(ctx context.Context, id cluster.Objec
 	return ptrSlice(evs), nil
 }
 
+// ClusterDataKinds is the resolver for the clusterDataKinds field — one ClusterCache's
+// discovered kind catalog (parent cluster id + cache id). gqlgen wants a pointer
+// slice, so the value results are adapted.
+func (r *queryResolver) ClusterDataKinds(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) ([]*cluster.ClusterDataKind, error) {
+	kinds, err := r.ClusterSvc.ClusterDataKinds(ctx, id, cacheID)
+	if err != nil {
+		return nil, err
+	}
+	return ptrSlice(kinds), nil
+}
+
 // AuthState is the resolver for the authState field. auth.State is bound
 // directly to the GraphQL AuthState type (see gqlgen.yml) — only the schema
 // fields are exposed, so State.Tokens never reaches the wire.

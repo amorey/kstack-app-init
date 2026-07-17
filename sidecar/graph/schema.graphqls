@@ -323,6 +323,25 @@ type CachedResource {
   lastUpdatedAt: Time
 }
 
+"""
+One kind a cluster's API server advertises, from `/apis` discovery (built-ins +
+CRDs). The dashboard builds its dynamic resource nav from these: `resource` dedupes
+against the curated catalog and `apiVersion`'s group buckets the kind into a nav
+group.
+"""
+type ClusterDataKind {
+  "Group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
+  apiVersion: String!
+  "Kind name, e.g. \"Deployment\"."
+  kind: String!
+  "Plural lowercase resource name (the URL form), e.g. \"deployments\"."
+  resource: String!
+  "\"Namespaced\" or \"Cluster\"."
+  scope: String!
+  "True when this kind is backed by a CustomResourceDefinition."
+  isCRD: Boolean!
+}
+
 # --- Delta watches ---
 
 """
@@ -410,6 +429,14 @@ type Query {
   watch.
   """
   clusterCacheEvents(id: ObjectID!, category: String, limit: Int): [Event!]!
+
+  """
+  The kinds a cluster's API server advertises (from `/apis` discovery), read from one
+  ClusterCache's catalog (`id` = parent cluster, `cacheID` = the cache — typically the
+  active one). Used to build the dashboard's dynamic resource nav. Empty for a cache
+  that has not synced yet. Read on demand (per active cache), not streamed.
+  """
+  clusterDataKinds(id: ObjectID!, cacheID: ObjectID!): [ClusterDataKind!]!
 
   "Current authentication state. Signed-out when no cloud account is configured; live updates via authStateWatch."
   authState: AuthState!

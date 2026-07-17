@@ -58,6 +58,11 @@ type ClusterService interface {
 	// cache file). A cluster can own several caches, so stats are per-cache, not
 	// per-cluster.
 	CacheStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*ClusterCacheStats, error)
+	// ClusterDataKinds returns the kinds a cluster's API server advertises, read from one
+	// ClusterCache's discovered catalog (by parent ClusterID + cache id, like
+	// CacheStats). Empty when that cache's db isn't open (never synced / sync paused).
+	// Read on demand (not streamed).
+	ClusterDataKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) ([]ClusterDataKind, error)
 	// ClusterEvents returns a cluster's beehive event timeline (newest run first),
 	// optionally filtered to one category and bounded by limit. Decoupled from the
 	// cluster/list watch — event chatter never re-emits the cluster.
@@ -337,6 +342,35 @@ func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID C
 		KindCount:   len(resources),
 		Resources:   resources,
 	}, nil
+}
+
+// ClusterDataKinds implements ClusterService. It reads the kind catalog from one
+// specific ClusterCache (by parent ClusterID + cache id), mirroring CacheStats — so
+// the caller names the exact cache whose catalog it wants (its active cache), and a
+// cache/identity swap under the same cluster reads the new cache's catalog rather
+// than "the" cluster's. Returns nil (empty) when that cache's db isn't open (never
+// synced / sync paused), matching CacheStats' degrade-to-empty posture.
+func (s *Service) ClusterDataKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) ([]ClusterDataKind, error) {
+	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
+	db := s.cacheManager.Lookup(ref.CacheID)
+	if db == nil {
+		return nil, nil
+	}
+	rows, err := db.KindCatalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	kinds := make([]ClusterDataKind, len(rows))
+	for i, r := range rows {
+		kinds[i] = ClusterDataKind{
+			APIVersion: r.APIVersion,
+			Kind:       r.Kind,
+			Resource:   r.Resource,
+			Scope:      r.Scope,
+			IsCRD:      r.IsCRD,
+		}
+	}
+	return kinds, nil
 }
 
 // updateSpec applies mutate to a copy of the cluster's spec and persists it. The

@@ -334,6 +334,51 @@ func (c *ClusterDB) ResourceStats(ctx context.Context) ([]ResourceStat, error) {
 	return stats, nil
 }
 
+// KindCatalogRow is one entry in the cache's kind_catalog: a kind the cluster's
+// API server advertises, recorded at sync time from /apis discovery.
+type KindCatalogRow struct {
+	// APIVersion is the group/version, e.g. "apps/v1" or "v1" for the core group.
+	APIVersion string
+	// Kind is the Kind name, e.g. "Deployment".
+	Kind string
+	// Resource is the plural lowercase URL form, e.g. "deployments".
+	Resource string
+	// Scope is "Namespaced" or "Cluster".
+	Scope string
+	// IsCRD is true when the kind is backed by a CustomResourceDefinition.
+	IsCRD bool
+}
+
+// KindCatalog reads the cache's discovered kind catalog: one row per kind the
+// cluster's API server advertises (built-ins + CRDs), ordered for stable display.
+// Empty until the sync engine has populated it.
+func (c *ClusterDB) KindCatalog(ctx context.Context) ([]KindCatalogRow, error) {
+	rows, err := c.readDB.QueryContext(ctx,
+		`SELECT api_version, kind, resource, scope, is_crd
+		 FROM kind_catalog ORDER BY api_version, kind`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []KindCatalogRow
+	for rows.Next() {
+		var (
+			r     KindCatalogRow
+			isCRD int64
+		)
+		if err := rows.Scan(&r.APIVersion, &r.Kind, &r.Resource, &r.Scope, &isCRD); err != nil {
+			return nil, err
+		}
+		r.IsCRD = isCRD != 0
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // resourceLabel renders an api_version + kind pair as the consumer-facing
 // resource identifier: the group qualifies the kind, the version is dropped,
 // and the core group is elided ("v1"+"Pod" → "Pod", "apps/v1"+"Deployment" →
