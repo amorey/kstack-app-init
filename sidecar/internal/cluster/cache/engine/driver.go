@@ -33,15 +33,12 @@ import (
 	toolswatch "k8s.io/client-go/tools/watch"
 )
 
-// One kindDriver per (cluster, GVK) replaces the raw client-go Reflector. It
-// exists because the Reflector can't be seeded with a stored resourceVersion —
-// its lastSyncResourceVersion is unexported and starts empty, so it always
-// relists with RV="0", transferring every object body on every wake. The driver
-// instead:
+// One kindDriver per (cluster, GVK). Unlike a client-go Reflector — which can't
+// be seeded with a stored resourceVersion and so relists every body on every wake
+// — the driver:
 //
-//  1. RESUMES from the kind's persisted resourceVersion via a RetryWatcher (the
-//     right built-in for "watch from a known RV"): on a wake the server usually
-//     still has that RV, so we apply only deltas and never LIST.
+//  1. RESUMES from the kind's persisted resourceVersion via a RetryWatcher: on a
+//     wake the server usually still has that RV, so we apply only deltas, no LIST.
 //  2. On 410 Gone (RV too old) or a cold cache, falls back to a METADATA-FIRST
 //     full re-sync: list metadata only, diff by uid+resourceVersion, fetch full
 //     bodies only for new/changed objects, delete the ones that vanished.
@@ -57,9 +54,9 @@ const defaultDiffThreshold = 200
 
 // defaultResumeGrace is how long a first watch seeded from the saved cookie waits
 // to prove usable before onWatch reports it as a clean resume. A stale-cookie 410
-// is a synchronous server rejection that arrives within a round trip, so this need
-// only clear network/tail latency; it is also the one-time delay a warm resume's
-// Syncing→Watching flip pays (drivers wait it concurrently, so it isn't summed).
+// arrives within a round trip, so this need only clear network/tail latency; it's
+// the one-time delay a warm resume's Syncing→Watching flip pays (drivers wait it
+// concurrently, so it isn't summed).
 const defaultResumeGrace = 2 * time.Second
 
 // realGraceTimer is the production graceTimer: a time.Timer's channel plus its Stop.
@@ -126,20 +123,19 @@ type kindDriver struct {
 
 	seedRV string // persisted resume point at construction
 
-	// onWatch, when set, is fired once per Run — reporting whether this driver fell
-	// back to a full re-sync and how many bodies it re-pulled (didResync/
-	// resyncObjects). The engine counts these down to flip its reported state from
-	// Syncing to Watching, and aggregates the re-sync work for the ResyncComplete
-	// message. It is fired by fireOnWatch (see watchPhase for when), which sawWatch
-	// guards to once.
+	// onWatch, when set, fires once per Run — reporting whether this driver fell
+	// back to a full re-sync and how many bodies it re-pulled. The engine counts
+	// these down to flip Syncing→Watching and aggregates the re-sync work for the
+	// ResyncComplete message. Fired by fireOnWatch (see watchPhase), guarded to
+	// once by sawWatch.
 	onWatch       func(resynced bool, objects int)
 	sawWatch      bool
 	diffThreshold int
 	backoffInit   time.Duration
 	backoffMax    time.Duration
-	// resumeGrace bounds how long the first watch seeded straight from the saved
-	// cookie waits to prove usable before onWatch reports it as a clean resume — long
-	// enough that a prompt 410 (expired cookie) reliably arrives first. See watchPhase.
+	// resumeGrace bounds how long the first cookie-seeded watch waits to prove usable
+	// before onWatch reports a clean resume — long enough that a prompt 410 reliably
+	// arrives first. See watchPhase.
 	resumeGrace time.Duration
 	// graceTimer starts the resumeGrace countdown, returning its fire channel and a
 	// stop func; a test seam (defaults to realGraceTimer over time.NewTimer).
@@ -149,11 +145,10 @@ type kindDriver struct {
 	// now stamps the liveness time; a test seam (defaults to time.Now).
 	now func() time.Time
 
-	// lastLiveAt is when the watch last proved it's alive — a delta OR a bookmark.
-	// Bookmarks matter because a quiet cluster delivers no deltas yet the watch is
-	// healthy; the server's periodic bookmarks keep this fresh regardless of churn,
-	// so the engine can read liveAt() to tell quiet-but-healthy from wedged. Guarded
-	// by liveMu because a delta (the run goroutine) and a bookmark (the watch tap's
+	// lastLiveAt is when the watch last proved it's alive — a delta or a bookmark.
+	// Bookmarks matter because a quiet-but-healthy cluster delivers no deltas yet
+	// the server's periodic bookmarks keep this fresh, so liveAt() tells quiet from
+	// wedged. Guarded by liveMu: a delta (run goroutine) and a bookmark (watch-tap
 	// goroutine) can stamp it concurrently.
 	liveMu     sync.Mutex
 	lastLiveAt time.Time
@@ -166,12 +161,11 @@ type kindDriver struct {
 	deltaSeen    atomic.Int64
 	deltaApplied atomic.Int64
 
-	// didResync records whether this driver fell back to a full re-sync — a
-	// metadata-diff or a full LIST, because its saved resourceVersion was missing or
-	// expired — rather than resuming its watch directly, and resyncObjects counts the
-	// object bodies it re-pulled doing so. The engine reads them at the catch-up
-	// handoff to tell a clean reconnect from a resume that had to re-list. Written
-	// only from the Run goroutine (fullResync/fullList), so they need no locking.
+	// didResync records whether this driver fell back to a full re-sync (its saved
+	// resourceVersion was missing or expired) rather than resuming its watch
+	// directly; resyncObjects counts the bodies it re-pulled. The engine reads them
+	// at the catch-up handoff to tell a clean reconnect from a resume that re-listed.
+	// Written only from the Run goroutine, so no locking.
 	didResync     bool
 	resyncObjects int
 }
@@ -259,9 +253,8 @@ func (d *kindDriver) Run(ctx context.Context) error {
 		}
 		// Resume ended; recompute via a re-sync. A watch that delivered events is
 		// healthy — reset the backoff and re-sync immediately. A watch that ended
-		// without progress is unrecoverable for this kind (e.g. list-but-not-watch
-		// RBAC, or an aggregated API that rejects watch); back off so we don't
-		// hot-loop full LISTs against the API server and SQLite.
+		// without progress (e.g. list-but-not-watch RBAC, or an aggregated API that
+		// rejects watch) backs off so we don't hot-loop full LISTs.
 		if progressed {
 			backoff = d.backoffInit
 		} else {
@@ -297,15 +290,15 @@ func (d *kindDriver) fireOnWatch() {
 	}
 }
 
-// watchPhase resumes the watch from rv via a RetryWatcher and applies deltas
-// until ctx cancellation, a 410 (errExpired), or the RetryWatcher giving up (nil
-// — Run re-syncs either way). It reports whether the watch made progress (applied
-// at least one delta), which Run uses to tell a healthy watch that dropped from
-// one that never worked. RetryWatcher requests bookmarks and tracks RV across
-// reconnects internally but does not forward bookmark events, so the driver taps
-// the underlying watch ahead of it (watcherFor's tapEvent) to observe them —
-// bumping liveness and persisting the bookmark RV, but only once the deltas before
-// it have been applied (see onBookmark). Object deltas persist their RV inline below.
+// watchPhase resumes the watch from rv via a RetryWatcher and applies deltas until
+// ctx cancellation, a 410 (errExpired), or the RetryWatcher giving up (nil — Run
+// re-syncs either way). It reports whether the watch made progress (applied at
+// least one delta), which Run uses to tell a healthy watch that dropped from one
+// that never worked. RetryWatcher requests bookmarks but doesn't forward them, so
+// the driver taps the underlying watch ahead of it (watcherFor's tapEvent) to
+// observe them — bumping liveness and persisting the bookmark RV, but only once the
+// deltas before it have applied (see onBookmark). Object deltas persist their RV
+// inline below.
 func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool, err error) {
 	watcher := watcherFor(d.src, d.markLive, func(ev watch.Event) { d.tapEvent(ctx, ev) })
 	rw, err := toolswatch.NewRetryWatcherWithContext(ctx, rv, watcher)
@@ -320,14 +313,13 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 	d.markLive()
 
 	// Fire onWatch (the catch-up milestone + resync-facts snapshot) exactly once per
-	// Run. When a re-sync already ran this iteration — a cold start, or the re-entry
-	// after a 410 — the RV is fresh and can't expire, so fire immediately for a prompt
-	// Syncing→Watching flip. When resuming straight from the saved cookie, though, the
-	// server can accept the watch and only then return a 410 (expired cookie): firing
-	// on entry would misreport that re-list as a clean resume. So defer the fire until
-	// the watch proves usable — the first delta, or a resumeGrace with no 410 (a quiet
-	// but valid cookie) — and skip it entirely if the watch 410s first; Run then
-	// re-syncs and re-enters here with didResync=true, taking the immediate-fire path.
+	// Run. When a re-sync already ran this iteration (cold start, or the re-entry
+	// after a 410), the RV is fresh and can't expire, so fire immediately. When
+	// resuming straight from the saved cookie, the server can accept the watch and
+	// only then 410 (expired cookie), so firing on entry would misreport that re-list
+	// as a clean resume. So defer until the watch proves usable — the first delta, or
+	// a resumeGrace with no 410 — and skip it entirely if the watch 410s first; Run
+	// then re-syncs and re-enters with didResync=true, taking the immediate-fire path.
 	var graceC <-chan time.Time
 	pendingFire := false
 	if !d.sawWatch {
@@ -519,16 +511,14 @@ func (d *kindDriver) tapEvent(ctx context.Context, ev watch.Event) {
 	}
 }
 
-// onBookmark handles a bookmark the watch tap observed: stamp liveness and
-// advance the persisted resume cookie (so a cold restart resumes closer to head
-// even on a quiet cluster). The cookie only moves once the driver has applied
-// every delta the tap forwarded before this bookmark (deltaApplied has caught up
-// to the deltaSeen snapshot): the server places a bookmark at/after all prior
-// events, so advancing while a delta is still un-applied — or if ApplyChange
-// failed — would let a restart resume past it and skip it permanently. Deltas in
-// flight simply defer the advance to the next bookmark once they land. Liveness,
-// which only needs proof the watch is alive, is stamped regardless. Best-effort
-// persistence — a write error is logged and swallowed.
+// onBookmark handles a bookmark the watch tap observed: stamp liveness and advance
+// the persisted resume cookie (so a cold restart resumes closer to head even on a
+// quiet cluster). The cookie only moves once every delta the tap forwarded before
+// this bookmark has applied (deltaApplied caught up to the deltaSeen snapshot):
+// the server places a bookmark at/after all prior events, so advancing while a
+// delta is un-applied would let a restart skip it permanently. Deltas in flight
+// just defer the advance to the next bookmark. Liveness is stamped regardless.
+// Best-effort persistence — a write error is logged and swallowed.
 func (d *kindDriver) onBookmark(ctx context.Context, rv string) {
 	if rv == "" {
 		return
@@ -548,13 +538,12 @@ func (d *kindDriver) onBookmark(ctx context.Context, rv string) {
 
 // watcherFor adapts a kubeSource to the cache.WatcherWithContext that
 // NewRetryWatcherWithContext consumes (RetryWatcher fills in RV + bookmarks). It
-// wraps each opened watch in a tap: RetryWatcher consumes bookmarks internally and
-// never forwards them, so the tap observes every event here — ahead of
-// RetryWatcher — while passing each through unchanged, so RetryWatcher's
-// reconnect/RV bookkeeping is untouched. onConnect fires on every successful
-// (re)open: RetryWatcher reconnects by re-invoking this func, so a freshly opened
-// replacement watch is itself proof of liveness even before its first event — the
-// signal a quiet cluster needs so a benign reconnect isn't misread as stale.
+// wraps each opened watch in a tap so the driver observes every event — including
+// the bookmarks RetryWatcher swallows — ahead of RetryWatcher, passing each through
+// unchanged so its reconnect/RV bookkeeping is untouched. onConnect fires on every
+// successful (re)open: RetryWatcher reconnects by re-invoking this func, so a fresh
+// replacement watch is itself proof of liveness before its first event — what a
+// quiet cluster needs so a benign reconnect isn't misread as stale.
 func watcherFor(src kubeSource, onConnect func(), tap func(watch.Event)) cache.WatcherWithContext {
 	return watcherFunc(func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 		w, err := src.Watch(ctx, opts)

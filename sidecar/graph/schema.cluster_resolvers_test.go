@@ -1,7 +1,7 @@
 package graph_test
 
 // Behavioral tests for the cluster resolvers, exercised over a real gqlgen HTTP
-// server. The resolvers now delegate to a cluster.ClusterService, so the tests
+// server. The resolvers delegate to a cluster.ClusterService, so the tests
 // wire a fakeClusterService built from fixtures — that keeps the focus on the
 // GraphQL wire mapping (nil→null, conditions/cache shapes) and off beehive,
 // which the service-level tests in internal/cluster already cover.
@@ -63,8 +63,8 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 			Status: fx.connStatus,
 		}
 		// Caches stream standalone via WatchCaches and are joined client-side.
-		// Give each fixture one cache whose
-		// ServerUID matches the cluster's identity (the client's active-cache rule).
+		// Give each fixture one cache whose ServerUID matches the cluster's
+		// identity (the client's active-cache rule).
 		f.caches = append(f.caches, cluster.ClusterCache{
 			ID:        cluster.ClusterCacheID(id),
 			ClusterID: id,
@@ -808,7 +808,7 @@ func TestClusterDeleteMutation(t *testing.T) {
 
 // The status condition lists and the cache object resolve without panicking
 // or erroring on bare fixtures: the cluster carries no conditions (empty arrays
-// on the wire, never null) and the cache — now streamed via clusterCachesWatch —
+// on the wire, never null) and the cache — streamed via clusterCachesWatch —
 // has no on-disk files (exists=false, bytes=0, objectCount=0, kindCount=0).
 func TestClusterEphemeralFields(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())

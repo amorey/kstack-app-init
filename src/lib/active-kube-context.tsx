@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The window's active kubeconfig context — shared by every mode (chat,
-// dashboard) that renders under the `_app` layout route. The source of truth is
-// the `kubeContext` URL search param (see `_app.tsx`, which declares it and
-// retains it across the chat<->dashboard navigation), so selection is per-window,
-// deep-linkable, and survives the mode switch without any provider. Selection is
-// a frontend view-scope only; it never rewrites the kubeconfig's current-context.
+// The window's active kubeconfig context, shared by every mode under the `_app`
+// layout route. Source of truth is the `kubeContext` URL search param (see
+// `_app.tsx`), so selection is per-window, deep-linkable, and survives the mode
+// switch without a provider. It's a frontend view-scope only; it never rewrites
+// the kubeconfig's current-context.
 import { useNavigate, useSearch } from '@tanstack/react-router';
 
 import { useKubeConfig } from '@/lib/kube-config';

@@ -13,20 +13,16 @@
 // limitations under the License.
 
 // The app's reusable centered dialog: a controlled base-ui Dialog (via
-// @kubetail/ui) wrapped with a standard header (title + optional description) and
-// a scrollable body capped at the viewport height, so overlay screens (Clusters
-// today, Settings next) share one sizing/scroll/close shell. This is the opinionated
-// composition on top of the raw `Dialog*` primitives (imported here as
-// `DialogRoot`/`DialogContent`/…); consumers use this instead of hand-assembling
-// the parts. Fully controlled — the caller owns `open`/`onOpenChange`; there's no
-// built-in trigger. Width defaults to a comfortable reading measure; pass
-// `className` to widen (e.g. a wide data table) — it's tailwind-merged onto the
-// dialog content, so a `sm:max-w-*` utility replaces the built-in default rather
-// than stacking with it. A close button (top-right) and click-outside/Escape
-// dismissal come from the underlying Dialog. When rendered under the app's
-// `DialogProvider` (the usual case, via `AppDialogs`), it reports its close-
-// completion to the host so a lazily-mounted dialog is unmounted only once its
-// exit animation has played — dialog components need do nothing for this.
+// @kubetail/ui) wrapped with a standard header (title + optional description) and a
+// scrollable body capped at the viewport height, so overlay screens share one
+// sizing/scroll/close shell instead of hand-assembling the raw `Dialog*` primitives
+// (imported here as `DialogRoot`/`DialogContent`/…). Fully controlled — the caller
+// owns `open`/`onOpenChange`; there's no built-in trigger. Width defaults to a
+// comfortable reading measure; pass `className` to widen — it's tailwind-merged, so
+// a `sm:max-w-*` utility replaces the default rather than stacking with it. A close
+// button and click-outside/Escape dismissal come from the underlying Dialog. Under
+// the app's `DialogProvider` (via `AppDialogs`), it reports close-completion to the
+// host so a lazily-mounted dialog unmounts only once its exit animation has played.
 import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 

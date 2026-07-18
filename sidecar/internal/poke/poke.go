@@ -1,8 +1,7 @@
 // Package poke is a cross-subsystem resync broadcaster. It owns a wall-clock
 // gap detector (the backstop for machine sleep/resume) and fans poke Signals
-// out to all subscribers via a gochan broadcast hub. Any caller — today the
-// cloud settings engine, tomorrow the cluster-sync engine or a gRPC handler
-// from the host — subscribes or calls Poke directly.
+// out to all subscribers via a gochan broadcast hub. Callers subscribe or
+// call Poke directly.
 package poke
 
 import (
@@ -21,8 +20,8 @@ const (
 	// SourceWallClock is set by the built-in gap detector when it infers a
 	// machine sleep/resume from a wall-clock jump.
 	SourceWallClock Source = "wallclock"
-	// SourceHost is set by the gRPC resync handler (follow-up PR) when the
-	// Tauri host forwards an OS wake or network-on event.
+	// SourceHost is set by the gRPC resync handler when the Tauri host
+	// forwards an OS wake or network-on event.
 	SourceHost Source = "host"
 )
 
@@ -33,10 +32,9 @@ type Signal struct {
 }
 
 // options configures a Service: the gap-detector tuning plus the clock and
-// ticker seams. Zero values get sane defaults via applyDefaults. The struct and
-// its with* seams are unexported because production tunes nothing — New takes no
-// arguments, and only this package's white-box tests inject seams via
-// newWithOptions, mirroring the auth/cloud/prefsync option convention.
+// ticker seams. Zero values get defaults via applyDefaults. Unexported because
+// production tunes nothing — only white-box tests inject seams via
+// newWithOptions.
 type options struct {
 	tick      time.Duration // gap-detector heartbeat (default 15s)
 	gapFactor float64       // wall gap > tick*gapFactor ⇒ treat as resume (default 2.0)
@@ -62,9 +60,8 @@ func (o *options) applyDefaults() {
 	}
 }
 
-// option is an unexported build seam for newWithOptions. Because the type is
-// unexported, only this package's white-box tests can construct one — the
-// production New takes no seams. Mirrors the auth/cloud/prefsync option pattern.
+// option is an unexported build seam for newWithOptions, so only white-box
+// tests can construct one; production New takes no seams.
 type option func(*options)
 
 // withTick overrides the gap-detector heartbeat (default 15s).
@@ -94,16 +91,13 @@ type Service struct {
 }
 
 // New builds a Service with production defaults. It does not start anything;
-// call Start (or Run). The gap-detector tuning and clock/ticker seams use
-// defaults — only this package's white-box tests override them via
-// newWithOptions.
+// call Start (or Run).
 func New() *Service {
 	return newWithOptions()
 }
 
 // newWithOptions is the build entry point that also accepts the unexported test
-// seams. New is the production wrapper (no options); in-package white-box tests
-// call this directly to inject a deterministic clock/ticker.
+// seams; New is the production wrapper (no options).
 func newWithOptions(opts ...option) *Service {
 	var o options
 	for _, opt := range opts {
@@ -119,8 +113,8 @@ func newWithOptions(opts ...option) *Service {
 }
 
 // Poke broadcasts a Signal to all active subscribers. Never blocks; idempotent.
-// This is the entry point for the gRPC resync handler (follow-up PR) and for
-// any in-process caller that detects a wake or network-return event.
+// The entry point for the gRPC resync handler and any in-process caller that
+// detects a wake or network-return event.
 func (s *Service) Poke(src Source) {
 	_ = s.tx.Send(Signal{Source: src, At: s.opt.now()})
 }

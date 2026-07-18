@@ -145,29 +145,27 @@ type Service struct {
 
 	// dataKindsDebounce bounds how often ClusterDataKindsWatch re-reads and diffs the
 	// kind catalog. A busy cluster pings the store on every object write; each re-read
-	// runs KindCatalog's grouped count-join over the whole object index, so without a
-	// floor sustained watch traffic would keep the reader continuously aggregating.
-	// This coalesces a burst of pings into a single re-read per interval (trailing
-	// edge), keeping the live counts responsive without scanning per object event.
+	// runs KindCatalog's count-join over the object index, so a burst of pings is
+	// coalesced into one re-read per interval (trailing edge) to keep the reader from
+	// aggregating continuously.
 	dataKindsDebounce time.Duration
 }
 
 // defaultDataKindsDebounce floors the kind-catalog re-read interval — small enough
 // that the dashboard nav's counts still read as live, large enough to collapse a
-// high-churn cluster's per-object write pings into a bounded aggregation rate.
+// high-churn cluster's write pings into a bounded aggregation rate.
 const defaultDataKindsDebounce = 250 * time.Millisecond
 
 var _ ClusterService = (*Service)(nil)
 
-// New builds the cluster control plane: the kubeconfig watcher (over
-// kubeconfigPath), the beehive store + instance (at <dataDir>/beehive.db), the
-// two beehive clients, the two registered controllers (Cluster, ClusterCache),
-// the kubeconfig importer, and the per-cluster cache manager (rooted at
-// <dataDir>/clusters/). The returned *Service is both the
-// GraphQL boundary and the control plane: it owns the entire watcher + beehive +
-// importer + forwarder + cache lifecycle via Start/Close. The watcher and beehive
-// are cluster-only, so the service owns them outright; if a non-cluster consumer
-// ever needs either, hoist it back up to the composition root and inject it.
+// New builds the cluster control plane: the kubeconfig watcher (over kubeconfigPath),
+// the beehive store + instance (at <dataDir>/beehive.db), the two beehive clients, the
+// two registered controllers, the kubeconfig importer, and the per-cluster cache
+// manager (rooted at <dataDir>/clusters/). The returned *Service is both the GraphQL
+// boundary and the control plane, owning the whole watcher + beehive + importer + cache
+// lifecycle via Start/Close. The watcher and beehive are cluster-only, so the service
+// owns them outright; if a non-cluster consumer ever needs either, hoist it up to the
+// composition root and inject it.
 func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error) {
 	// The kubeconfig watcher publishes *api.Config snapshots; the importer and
 	// ClusterCoreController consume it (through the KubeConfigSource interface).
@@ -204,14 +202,12 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	coreCtrl := NewClusterCoreController(watcher, coreClient, cacheClient, connMgr, pokeSvc, nil, nil)
 	cacheCtrl := NewClusterCacheController(watcher, coreClient, cacheManager, connMgr, pokeSvc)
 
-	// Register returns each kind's status-write ControllerClient. The reconcile
-	// path receives it as a Reconcile argument, but the controllers also write
-	// status out-of-band (the connection controller's poke re-probe, the cache
-	// controller's engine sink), so we inject it now — before bh.Start, since a
-	// startup reconcile may spawn an engine that reports immediately.
-	// Cap the connection controller's exponential reconnect backoff (base 1s, ×2)
-	// at connectionMaxBackoff — a failed probe returns an error, so beehive owns the
-	// doubling and resets it on the next success.
+	// Register returns each kind's status-write ControllerClient. The reconcile path
+	// gets it as an argument, but the controllers also write status out-of-band (the
+	// connection controller's poke re-probe, the cache controller's engine sink), so
+	// inject it now — before bh.Start, since a startup reconcile may spawn an engine
+	// that reports immediately. WithMaxRetryInterval caps the connection controller's
+	// exponential reconnect backoff at connectionMaxBackoff.
 	coreCC, errCluster := beehive.Register(bh, ClusterGroupKind, coreCtrl, beehive.WithMaxRetryInterval(connectionMaxBackoff))
 	cacheCC, errCache := beehive.Register(bh, ClusterCacheGroupKind, cacheCtrl)
 	if err := errors.Join(errCluster, errCache); err != nil {
@@ -248,12 +244,10 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 		return nil, fmt.Errorf("start beehive: %w", err)
 	}
 
-	// The controllers' background work (poke-driven re-probe / engine restart) is
-	// the service's to drive now that beehive owns only the reconcile lifecycle.
-	// Start it once the control plane is running.
-	// The core controller's background worker drives both the targeted-retry bus
-	// (RetryConnection) and the poke bus; the cache controller reacts to pokes
-	// only. Both write status, so they live in the same start/drain window.
+	// Start the controllers' background work now the control plane is running. The core
+	// controller's worker drives the targeted-retry bus (RetryConnection) and the poke
+	// bus; the cache controller reacts to pokes only. Both write status, so they share
+	// the same start/drain window.
 	s.coreCtrl.StartBackground()
 	s.cacheCtrl.StartPoke()
 
@@ -405,21 +399,18 @@ func dataKindKey(k ClusterDataKind) string {
 }
 
 // ClusterDataKindsWatch implements ClusterService. It streams one ClusterCache's kind
-// catalog as a Kubernetes-style delta watch: the current catalog as an Added burst on
-// subscribe, then one Added/Modified/Deleted change per kind as the sync engine writes
-// objects and pings the store (Count is a live LEFT JOIN, so an object write that
-// changes a kind's count re-emits it as Modified). The store's coalescing Subscribe
-// drives the re-read; the goroutine diffs each fresh catalog against the last snapshot
-// it emitted.
+// catalog as a delta watch: the current catalog as an Added burst on subscribe, then
+// one Added/Modified/Deleted change per kind as the sync engine writes objects and
+// pings the store (Count is a live LEFT JOIN, so an object write that changes a count
+// re-emits its kind as Modified). The store's coalescing Subscribe drives the re-read;
+// the goroutine diffs each fresh catalog against the last snapshot it emitted.
 //
 // The stream follows the cache's on-disk db across its whole lifecycle via the store
-// Manager's WatchDB, rather than binding once to the handle present at subscribe: if
-// the cache isn't open yet (subscribed before the sync engine opens it — the common
-// case for an unsynced cluster), the goroutine waits and binds when it opens; if the
-// db is replaced under the same CacheID (a Clear-cache delete+reopen), it rebinds to
-// the new handle and keeps diffing (the emptied catalog surfaces as Deletes, then the
-// rebuild as Adds). An unopened cache simply emits nothing until it opens or ctx ends,
-// matching ClusterDataKinds' empty posture.
+// Manager's WatchDB, rather than binding once at subscribe: if the cache isn't open yet
+// (the common unsynced-cluster case) it binds when it opens; if the db is replaced under
+// the same CacheID (a Clear-cache delete+reopen) it rebinds and keeps diffing (the
+// emptied catalog surfaces as Deletes, then the rebuild as Adds). An unopened cache
+// emits nothing until it opens or ctx ends, matching ClusterDataKinds' empty posture.
 func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataKindChange, error) {
 	out := make(chan ClusterDataKindChange, 1)
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
@@ -467,10 +458,8 @@ func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID
 
 		// emitEmpty reconciles prev against an empty catalog — one Deleted per held
 		// kind, then clears prev. Called when the cache closes so a cache that never
-		// reopens (a paused/cleared cache whose engine doesn't restart) doesn't leave
-		// the dashboard permanently showing the closed cache's stale kinds. Returns
-		// false if ctx ended mid-send. (No-op when prev is already empty, so an
-		// unopened cache still emits nothing.)
+		// reopens doesn't leave the dashboard showing its stale kinds. Returns false if
+		// ctx ended mid-send. No-op when prev is already empty.
 		emitEmpty := func() bool {
 			for _, k := range prev {
 				if !send(ctx, out, ClusterDataKindChange{Type: ChangeDeleted, Kind: k, CacheID: cacheID}) {
@@ -490,12 +479,11 @@ func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID
 			cancelSub func()
 		)
 
-		// A write ping arms a debounce timer instead of re-reading the catalog inline:
-		// its fire drains a coalesced burst of per-object pings into a single re-read,
-		// so a high-churn cluster can't keep KindCatalog's whole-index count-join
-		// running back-to-back. `armed` tracks whether a re-read is pending; the timer
-		// starts disarmed. (Go's timer guarantees no stale tick after Stop/Reset, so
-		// the channel never needs a manual drain.)
+		// A write ping arms a debounce timer instead of re-reading inline: its fire
+		// drains a coalesced burst of pings into a single re-read, so a high-churn
+		// cluster can't keep the count-join running back-to-back. `armed` tracks whether
+		// a re-read is pending; the timer starts disarmed. (Go's timer guarantees no
+		// stale tick after Stop/Reset, so the channel never needs a manual drain.)
 		debounce := time.NewTimer(s.dataKindsDebounce)
 		debounce.Stop()
 		defer debounce.Stop()
@@ -606,14 +594,13 @@ func (s *Service) SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool
 }
 
 // RetryConnection implements ClusterService. It forces an immediate out-of-band
-// re-probe via the core controller's retry bus (Reprobe) — no spec write. The
-// reprobe is backoff-neutral: running off-worker, a failed manual probe leaves
-// beehive's reconnect ladder untouched (it neither resets to the 1s ramp nor
-// advances the schedule), so manual clicks don't perturb the automatic cadence.
-// (Routing through Client.Requeue instead would ride beehive's worker and so
-// participate in backoff.) Dispatch is fire-and-forget, after a cheap read-only
-// existence check that surfaces ErrNotFound for a just-deleted cluster. The
-// outcome lands on the record's conditions and reaches watchers through Watch.
+// re-probe via the core controller's retry bus (Reprobe) — no spec write. Running
+// off-worker, the reprobe is backoff-neutral: a failed manual probe leaves beehive's
+// reconnect ladder untouched, so manual clicks don't perturb the automatic cadence.
+// (Routing through Client.Requeue would ride beehive's worker and participate in
+// backoff.) Dispatch is fire-and-forget, after a read-only existence check that
+// surfaces ErrNotFound for a just-deleted cluster. The outcome lands on the record's
+// conditions and reaches watchers through Watch.
 func (s *Service) RetryConnection(ctx context.Context, id ClusterID) error {
 	if _, err := s.clusterByID(ctx, id); err != nil {
 		return err
@@ -665,30 +652,27 @@ func (s *Service) Delete(ctx context.Context, id ClusterID) error {
 
 // changeType maps a beehive change to the domain ChangeType, collapsing a
 // deletion-pending object (a Modified carrying a soft-delete tombstone) to Deleted:
-// beehive keeps the object around, tombstoned, until its finalizers clear, but
-// callers treat a tombstoned record as gone (List/Get hide it), so the watch removes
-// it from the client's view at once. The trailing hard Deleted then repeats
-// idempotently. A real Deleted stays Deleted. Generic over both kinds — it reads only
-// the change type + the object's tombstone, which every kind carries.
+// callers treat a tombstoned record as gone (List/Get hide it), so the watch removes it
+// from the client's view at once, and the trailing hard Deleted repeats idempotently. A
+// real Deleted stays Deleted. Generic over both kinds — it reads only the change type +
+// the object's tombstone.
 func changeType[Spec, Status any](ev beehive.Change[Spec, Status]) ChangeType {
 	if ev.Object.DeletionRequestedAt != nil {
 		return ChangeDeleted
 	}
-	// beehive.ChangeType and ChangeType share their string values by construction
-	// (both mirror the k8s Added/Modified/Deleted words), so this is a value-preserving
-	// conversion, not a remap.
+	// beehive.ChangeType and ChangeType share their string values by construction, so
+	// this is a value-preserving conversion, not a remap.
 	return ChangeType(ev.Type)
 }
 
 // Watch implements ClusterService. It forwards beehive's Cluster-kind WatchList as a
-// delta stream: the on-subscribe snapshot arrives as Added changes, then one change
-// per object write. beehive conflates per object (a Deleted still carries the final
-// body), so a slow client converges to each cluster's latest state rather than
-// lagging as loss. Per-probe chatter and the next-attempt countdown are deliberately
-// NOT here — probe history streams via clusterEventsWatch and the schedule gauge via
-// clusterScheduleWatch, both per-cluster — so a steadily-disconnected cluster whose
-// status has settled produces no churn. Cache sync status streams standalone via
-// WatchCaches (joined client-side), so cache changes never re-emit a cluster.
+// delta stream: the on-subscribe snapshot as Added changes, then one change per object
+// write. beehive conflates per object, so a slow client converges to each cluster's
+// latest state rather than lagging. Per-probe chatter and the next-attempt countdown
+// are deliberately NOT here — probe history streams via clusterEventsWatch and the
+// schedule gauge via clusterScheduleWatch — so a settled disconnected cluster produces
+// no churn. Cache sync status streams standalone via WatchCaches, so cache changes
+// never re-emit a cluster.
 func (s *Service) Watch(ctx context.Context) (<-chan ClusterChange, error) {
 	src, err := s.coreClient.WatchList(ctx)
 	if err != nil {
@@ -741,11 +725,11 @@ func (s *Service) buildCluster(obj *beehive.Object[ClusterSpec, ClusterStatus]) 
 	return c
 }
 
-// buildClusterCache assembles a domain ClusterCache from a single ClusterCache
-// beehive object, resolving its parent ClusterID via the owner edge (best-effort: a
-// hard-deleted cache has no edge left, but by then the client has already dropped it
-// from the soft-delete → Deleted change, so a zero ClusterID on the trailing hard
-// Deleted is harmless — the client keys removal on the cache id).
+// buildClusterCache assembles a domain ClusterCache from a single ClusterCache beehive
+// object, resolving its parent ClusterID via the owner edge (best-effort: a hard-deleted
+// cache has no edge, but by then the client dropped it from the soft-delete → Deleted
+// change, so a zero ClusterID on the trailing hard Deleted is harmless — the client keys
+// removal on the cache id).
 func (s *Service) buildClusterCache(ctx context.Context, obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) ClusterCache {
 	cc := ClusterCache{
 		ID:        ClusterCacheID(obj.ID),
@@ -778,9 +762,8 @@ func eventOpts(category *string, limit int) []beehive.EventOption {
 	return opts
 }
 
-// toDomainEvent maps one beehive run to the wire shape — the beehive→domain
-// crossing (like buildCluster/listCaches), kept trivial by reusing the ObjectID
-// scalar for the run id and binding Type straight to beehive.EventType.
+// toDomainEvent maps one beehive run to the wire shape, kept trivial by reusing the
+// ObjectID scalar for the run id and binding Type straight to beehive.EventType.
 func toDomainEvent(e beehive.Event) Event {
 	return Event{
 		ID:       ObjectID(e.ID),
@@ -833,10 +816,9 @@ func toSchedule(s beehive.Schedule) Schedule {
 	return Schedule{NextRequeueAt: &at}
 }
 
-// mapChan streams every value from src onto a fresh buffered channel, applying
-// fn, until src closes or ctx ends; the out channel is closed on exit. It's the
-// shared body of the per-object gauge/log pumps (scheduleWatch, watchEvents),
-// which differ only in element type and mapper.
+// mapChan streams every value from src onto a fresh buffered channel, applying fn,
+// until src closes or ctx ends (out is closed on exit). The shared body of the
+// per-object gauge/log pumps (scheduleWatch, watchEvents).
 func mapChan[A, B any](ctx context.Context, src <-chan A, fn func(A) B) <-chan B {
 	out := make(chan B, 1)
 	go func() {
@@ -872,13 +854,11 @@ func (s *Service) scheduleWatch(ctx context.Context, c scheduleClient, id beehiv
 	return mapChan(ctx, src, toSchedule), nil
 }
 
-// ClusterScheduleWatch implements ClusterService — the Cluster-kind entrypoint to
-// the (generic) reconcile-schedule gauge, merged with the controller's in-flight
-// probe signal so a single subscription drives both the "Next check" countdown
-// and the "checking now" state. The scheduler owns NextRequeueAt; the core
-// controller owns Probing (it holds writeMu across the probe). Both sub-sources
-// are current-on-subscribe, so the merged stream emits a fresh Schedule as either
-// side moves.
+// ClusterScheduleWatch implements ClusterService — the Cluster-kind entrypoint to the
+// reconcile-schedule gauge, merged with the controller's in-flight probe signal so one
+// subscription drives both the "Next check" countdown and the "checking now" state. The
+// scheduler owns NextRequeueAt, the core controller owns Probing; both sub-sources are
+// current-on-subscribe, so the merged stream emits a fresh Schedule as either moves.
 func (s *Service) ClusterScheduleWatch(ctx context.Context, id ClusterID) (<-chan Schedule, error) {
 	schedSrc, err := s.scheduleWatch(ctx, s.coreClient, beehive.ObjectID(id))
 	if err != nil {
@@ -959,12 +939,10 @@ func (s *Service) ClusterCacheEventsWatch(ctx context.Context, id ClusterCacheID
 }
 
 // watchEvents streams one object's event log as bare runs through the given kind
-// client, mirroring beehive's own WatchEvents (which streams <-chan Event, not a
-// delta). beehive replays the matching runs as a snapshot (oldest-first) then live
-// runs, conflating per run id — a lagging subscriber converges to each run's latest
-// state — so the consumer upserts by Event.ID (a re-delivered run id is an updated
-// run, a new id is a new run); no add/modify classification is needed here. The
-// returned channel closes when the source closes or ctx ends.
+// client, mirroring beehive's WatchEvents. beehive replays the matching runs as a
+// snapshot then live runs, conflating per run id, so the consumer upserts by Event.ID
+// (a re-delivered id is an updated run, a new id a new run) — no add/modify
+// classification needed. The channel closes when the source closes or ctx ends.
 func (s *Service) watchEvents(ctx context.Context, c eventClient, id beehive.ObjectID, category *string) (<-chan Event, error) {
 	src, err := c.WatchEvents(ctx, id, eventOpts(category, defaultEventLimit)...)
 	if err != nil {
@@ -983,13 +961,12 @@ func (s *Service) clusterByID(ctx context.Context, id ClusterID) (*beehive.Objec
 	return obj, err
 }
 
-// cacheRef resolves the on-disk cache locator for a cluster's *active* cache: the
-// beehive ObjectIDs of the parent Cluster (directory) and the ClusterCache for its
+// cacheRef resolves the on-disk locator for a cluster's active cache: the beehive
+// ObjectIDs of the parent Cluster (directory) and the ClusterCache for its
 // currently-connected identity (file). found is false when there is no active cache
-// — the cluster has never successfully probed (no Server.UID yet), or the cache for
-// that UID is missing/torn-down — which callers treat as "no cache" rather than an
-// error. The active identity's UID keys the cache slug, so resolving it takes the
-// parent read (for Server.UID) plus a slug lookup.
+// (never probed, or the cache for that UID is missing/torn-down), which callers treat
+// as "no cache" rather than an error. Resolving takes the parent read (for Server.UID)
+// plus a slug lookup.
 func (s *Service) cacheRef(ctx context.Context, id ClusterID) (store.CacheRef, bool, error) {
 	clusterObj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
 	if errors.Is(err, beehive.ErrNotFound) {

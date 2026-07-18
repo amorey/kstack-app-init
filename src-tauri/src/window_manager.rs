@@ -17,30 +17,29 @@
 //! Every window — including the first `"main"` window, created in `lib.rs`'s
 //! `setup` hook — is built in code by [`WindowManager`], so all window chrome
 //! lives in one place (`build_window`); `tauri.conf.json` declares no windows.
-//! Beyond creation, [`WindowManager`] recreates `"main"` if the user closed it
-//! and creates additional windows with unique labels, cascading each one
-//! down-right of the window it was opened from (see [`cascade_position`]) so
-//! they never open exactly on top of one another.
+//! [`WindowManager`] recreates `"main"` if the user closed it and creates
+//! additional windows with unique labels, cascading each down-right of the
+//! window it was opened from (see [`cascade_position`]).
 //!
-//! **Windows are visible from creation and painted with the app's color scheme
-//! at t0** — the native surface carries the resolved `--background` color (see
-//! [`background_color_for`]) before the webview has drawn anything, so the very
-//! first frame is themed. Nothing is deferred and the webview plays no part:
-//! there is no reveal command and no hidden-then-shown dance.
+//! Windows are visible from creation and painted with the app's color scheme at
+//! t0: the native surface carries the resolved `--background` color (see
+//! [`background_color_for`]) before the webview draws, so the first frame is
+//! themed. There is no reveal step — the webview must not drive when its window
+//! appears.
 //!
 //! What makes that work is `tauri/macos-private-api`, which enables
 //! `wry/transparent` and so clears `WKWebView`'s opaque white backing (the
 //! private `drawsBackground` key). Without it the webview paints white over the
-//! window background until its first frame — the launch flash — no matter what
-//! the native layer is set to. Because that backing is cleared, the *document*
-//! must be opaque: `index.css` paints `html` from the same `--background` token
-//! on the opaque platforms, and `index.html`'s inline script applies the color
-//! scheme before any page script runs, so the webview's first paint lands on
-//! the same color the native surface is already showing.
+//! window background until its first frame — the launch flash — regardless of
+//! the native layer. Because that backing is cleared, the *document* must be
+//! opaque: `index.css` paints `html` from the same `--background` token on the
+//! opaque platforms, and `index.html`'s inline script applies the scheme before
+//! any page script runs, so the webview's first paint lands on the color the
+//! native surface already shows.
 //!
 //! Closing the last window does not exit the process (see `lib.rs`), so the
-//! main window may be absent while the app is still running — every entry point
-//! here is written to recreate it on demand.
+//! main window may be absent while the app runs — every entry point here
+//! recreates it on demand.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -117,22 +116,20 @@ const DARK_BACKGROUND: Color = Color(9, 9, 11, 255);
 
 /// The native window background for a persisted color-scheme preference.
 ///
-/// This is what prevents the launch flash: it is the color on screen from the
-/// moment the window appears until the webview's first paint, and the color the
-/// native surface shows whenever it is visible on its own thereafter (chiefly
-/// live resize, where the OS stretches the window ahead of a repaint).
+/// This prevents the launch flash: it's the color on screen from the moment the
+/// window appears until the webview's first paint, and whenever the native
+/// surface is visible on its own thereafter (chiefly live resize).
 ///
-/// Always a concrete color, never "leave it to the OS". `WebviewWindowBuilder::
-/// background_color` drives *two* layers — the window and the webview — and wry
-/// only clears the webview's opaque white backing when a color is set. Passing
-/// nothing would restore the very flash this exists to prevent, so `system`
-/// resolves against `os_prefers_dark` (from `os_theme`) rather than opting out.
-/// The cost is that a scheme change while the app is closed is picked up at the
-/// next launch, which is exactly when this is read.
+/// Always a concrete color, never "leave it to the OS": `background_color`
+/// drives both the window and webview layers, and wry only clears the webview's
+/// opaque white backing when a color is set, so passing nothing would reinstate
+/// the flash. Hence `system` resolves against `os_prefers_dark` (from
+/// `os_theme`) rather than opting out — the cost being that a scheme change
+/// while the app is closed is only picked up at the next launch.
 ///
 /// Only *called* on the opaque platforms ([`build_window`] skips it on
 /// transparent Linux), but compiled and unit-tested everywhere so the mapping
-/// stays covered on CI — same pattern as the traffic-light geometry above.
+/// stays covered on CI.
 ///
 /// [`build_window`]: WindowManager::build_window
 #[cfg_attr(target_os = "linux", allow(dead_code))]
@@ -258,18 +255,14 @@ impl WindowManager {
     }
 
     /// The window a new one should cascade off: the focused window, else the
-    /// last one built if it is still open.
+    /// last one built if still open.
     ///
-    /// Focus is the right anchor for the common paths — the app menu's New
-    /// Window, `Cmd/Ctrl+N`, the webview's `AppMenu` — since the user is
-    /// looking at that window when they ask for another. The tray and Dock
-    /// menus are the case focus can't answer: both can be clicked while the app
-    /// has windows open but another application holds focus entirely, so fall
-    /// back to the last window built rather than centering a new one on top of
-    /// an existing one.
-    ///
-    /// `None` only when the app has no open windows at all, i.e. the first
-    /// window of the session.
+    /// Focus is the right anchor for the common paths (New Window, `Cmd/Ctrl+N`,
+    /// the webview's `AppMenu`). The tray and Dock menus are the case focus
+    /// can't answer — both can be clicked while another application holds focus —
+    /// so they fall back to the last window built rather than centering on top
+    /// of an existing window. `None` only when no windows are open (the
+    /// session's first).
     fn anchor_window(&self, app: &AppHandle) -> Option<WebviewWindow> {
         let focused = app
             .webview_windows()

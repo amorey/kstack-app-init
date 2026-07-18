@@ -43,11 +43,10 @@ type Msg = { id: string; from: 'user' | 'assistant'; content: string };
 function Chat() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [draft, setDraft] = useState('');
-  // While `pending` is set, the subscription is active and `streamed` holds
-  // the in-flight assistant text. On `done` we move the text into `messages`
-  // and clear `pending` in the same handler call — React 18 batches both
-  // setStates into one commit, so the streaming bubble and the finalized
-  // bubble never co-exist for a frame.
+  // While `pending` is set the subscription is active and `streamed` holds the
+  // in-flight assistant text. On `done` we move the text into `messages` and clear
+  // `pending` in one handler call — React 18 batches both setStates into one
+  // commit, so the streaming and finalized bubbles never co-exist for a frame.
   const [pending, setPending] = useState<Msg[] | null>(null);
   const [streamed, setStreamed] = useState('');
   // Guards against duplicate `done` deliveries (StrictMode double-mount in

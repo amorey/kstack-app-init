@@ -30,15 +30,13 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
-// One store per (cluster, GVK). Two store implementations live here:
-//   - objectsStore — writes to the universal `objects` table plus
-//     owner_refs, labels, and status_history. Handles every kind except
-//     core/v1 Event and events.k8s.io/v1 Event.
-//   - eventsStore — writes to the dedicated `events` table.
+// One store per (cluster, GVK). Two implementations live here:
+//   - objectsStore — the universal `objects` table plus owner_refs, labels, and
+//     status_history. Handles every kind except core/v1 and events.k8s.io/v1 Event.
+//   - eventsStore — the dedicated `events` table.
 //
-// Both implement kindStore and are driven by kindDrivers against the dynamic
-// client; nothing about either implementation depends on a typed Kubernetes
-// client. CRDs flow through the same code paths.
+// Both implement kindStore, driven by kindDrivers against the dynamic client;
+// neither depends on a typed Kubernetes client, so CRDs flow through the same paths.
 
 // --- objectsStore -------------------------------------------------------
 
@@ -60,8 +58,8 @@ func (s *objectsStore) upsert(u *unstructured.Unstructured) error {
 		return err
 	}
 	if isEvent {
-		// The driver wiring should never deliver events here (the event GVKs
-		// get an eventsStore). Defensive: log and skip.
+		// The driver wiring routes event GVKs to an eventsStore, so this is a
+		// routing mismatch; log and skip defensively.
 		slog.Warn("objectsStore got Event; routing mismatch", "uid", row.UID)
 		return nil
 	}
@@ -205,17 +203,14 @@ func (s *objectsStore) DeleteByUID(ctx context.Context, uid string) error {
 	return nil
 }
 
-// writeObjectRow runs the three-table atomic write for a single object.
-// The order matters: objects first (so owner_refs/labels FKs would be
-// satisfied if we had them — we omit FKs to keep deletes cheap), then
-// owner_refs and labels are deleted-then-reinserted because both can
-// shrink across updates and a simple upsert wouldn't catch removals.
+// writeObjectRow runs the three-table atomic write for a single object. owner_refs
+// and labels are deleted-then-reinserted because both can shrink across updates and
+// a plain upsert wouldn't catch removals. (FKs are omitted to keep deletes cheap.)
 func writeObjectRow(ctx context.Context, tx *sql.Tx, r ObjectRow) error {
 	now := time.Now().UnixMilli()
 
-	// Status history: only insert when the summary actually changed.
-	// Read the prior value under the txn so concurrent writers (there's
-	// only one per cluster, but defensive) can't insert duplicates.
+	// Status history: only insert when the summary changed. Read the prior value
+	// under the txn so a duplicate can't slip in.
 	var prev sql.NullString
 	if err := tx.QueryRowContext(ctx,
 		`SELECT status_summary FROM objects WHERE uid=?`, r.UID).Scan(&prev); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -291,12 +286,10 @@ func writeObjectRow(ctx context.Context, tx *sql.Tx, r ObjectRow) error {
 	return nil
 }
 
-// cascadeTables are the per-object child tables and the column in each that
-// holds the object's uid. Both deleters below (deleteObjectRows for one uid,
-// deleteKindRows for a whole kind) delete from these before deleting the
-// objects row, so the list lives here once — adding a new uid-keyed table
-// can't update one deleter and silently miss the other. (No FK ON DELETE
-// CASCADE does this for us; see writeObjectRow on why FKs are omitted.)
+// cascadeTables are the per-object child tables and the uid column in each. Both
+// deleters below (deleteObjectRows, deleteKindRows) clear these before the objects
+// row, so the list lives here once — a new uid-keyed table can't update one deleter
+// and silently miss the other. (No FK ON DELETE CASCADE; see writeObjectRow.)
 var cascadeTables = []struct{ table, uidCol string }{
 	{"labels", "uid"},
 	{"owner_refs", "child_uid"},
@@ -326,14 +319,11 @@ type kindKey struct {
 }
 
 // pruneOrphanedKinds deletes every objects row (and its cascade rows) whose
-// (kind, api_version) is absent from keep. Run only after a *complete*
-// discovery: it evicts resource types that no longer exist on the cluster —
-// most importantly an uninstalled CRD, whose custom resources would otherwise
-// linger forever. The per-kind ReplaceFull prune can't reap them because no
-// driver runs for a kind that vanished from discovery, and the janitor only
-// sweeps events/status_history, never objects. Returns the number of objects
-// rows removed. Caller must NOT invoke this on a partial discovery, or a kind
-// in a transiently-unavailable API group would be wrongly deleted.
+// (kind, api_version) is absent from keep, returning the count removed. It evicts
+// resource types that no longer exist on the cluster — chiefly an uninstalled CRD,
+// which nothing else reaps (no driver runs for a vanished kind, and the janitor
+// never sweeps objects). Caller must run this ONLY after a complete discovery, or a
+// kind in a transiently-unavailable API group would be wrongly deleted.
 func pruneOrphanedKinds(ctx context.Context, writer *sql.DB, keep map[kindKey]struct{}) (int64, error) {
 	tx, err := writer.BeginTx(ctx, nil)
 	if err != nil {
@@ -480,21 +470,15 @@ func (s *eventsStore) ApplyChange(t watch.EventType, u *unstructured.Unstructure
 	}
 }
 
-// ReplaceFull upserts the LISTed events. Events are short-lived server-side
-// (default 1h TTL) so a relist routinely covers half the table — this is
-// normal, not a bug.
+// ReplaceFull upserts the LISTed events. There is deliberately no delete-missing
+// pass: the two drivers (core/v1 and events.k8s.io/v1) share the events table with
+// no cross-store coordination, so a "delete UIDs not in this LIST" sweep would let
+// each delete the other's rows. Instead the per-event upsert plus the janitor's TTL
+// converge — fine because events are short-lived server-side anyway.
 //
-// Deliberately no delete-missing pass for events. The two drivers (core/v1
-// and events.k8s.io/v1) share the events table with no cross-store
-// coordination, so a "delete UIDs not in this LIST" sweep would let each
-// driver delete the other's rows. Instead we rely on the per-event upsert
-// plus the janitor's TTL: stale rows age out and subsequent LISTs converge.
-//
-// Events take resume-by-RV like any kind (the watch loop persists RV and a
-// full resync just relists), but eventsStore deliberately does NOT implement
-// metadataDiffStore — the events table has no resource_version column and no
-// delete-missing, so the metadata-diff doesn't apply. fullResync's type
-// assertion routes events to a plain full LIST instead.
+// eventsStore does NOT implement metadataDiffStore (the events table has no
+// resource_version column and no delete-missing), so fullResync's type assertion
+// routes events to a plain full LIST.
 func (s *eventsStore) ReplaceFull(items []*unstructured.Unstructured, resourceVersion string) error {
 	tx, err := s.writer.BeginTx(s.ctx, nil)
 	if err != nil {
@@ -546,10 +530,9 @@ func lastListRVKey(gvk schema.GroupVersionKind) string {
 }
 
 // persistListRVMeta writes a kind's resume cookie (last_list_rv + last_list_at).
-// It takes an execer so it works both inside the full ReplaceFull's transaction
-// and directly on the writer for the per-delta PersistRV (two single-row
-// upserts on the serialized writer conn — no transaction needed); the shared
-// helper keeps the two key spellings from drifting.
+// It takes an execer so it works both inside ReplaceFull's transaction and directly
+// on the writer for the per-delta PersistRV; the shared helper keeps the two key
+// spellings from drifting.
 func persistListRVMeta(ctx context.Context, ex execer, gvk schema.GroupVersionKind, rv string) error {
 	if err := upsertClusterMeta(ctx, ex, lastListRVKey(gvk), rv); err != nil {
 		return err

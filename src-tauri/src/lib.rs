@@ -73,7 +73,6 @@ const SIDECAR_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
 /// Run once at the very start of [`run`], before the Tauri builder. Kept here
 /// (rather than in `main`) so it also covers the mobile entry point.
 fn init_process() {
-    // Initialize logging as early as possible.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("KSTACK_LOG_LEVEL")
@@ -160,10 +159,9 @@ fn spawn_signal_handler(app: &tauri::AppHandle) {
 pub fn run() {
     init_process();
 
-    // Initialize builder
     let mut builder = tauri::Builder::default();
 
-    // Register app as single-instance (must come first)
+    // Single-instance must be registered before all other plugins.
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -186,7 +184,6 @@ pub fn run() {
         }));
     }
 
-    // Initialize app
     let app = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -200,7 +197,6 @@ pub fn run() {
             commands::quit,
         ])
         .setup(|app| {
-            // Initialize dependencies
             let sidecar = SidecarService::spawn(app.handle())?;
             let window_manager = WindowManager::new();
 

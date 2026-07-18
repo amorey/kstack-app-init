@@ -12,28 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package engine mirrors one real Kubernetes cluster into its local
-// SQLite cache (internal/cluster/cache/store).
+// Package engine mirrors one real Kubernetes cluster into its local SQLite cache
+// (internal/cluster/cache/store).
 //
-// Discovery + dynamic/metadata clients + one per-GVR kindDriver means one
-// code path serves every Kind on every cluster — built-ins and CRDs alike.
-// The Engine walks /apis discovery, picks every list/watchable resource,
-// and spins up one driver per (group, version, resource) feeding the
-// SQLite-backed stores. Events get their own store (and table) because their
-// access pattern differs; everything else lands in the universal `objects`
-// table.
+// The Engine walks /apis discovery and spins up one per-GVR kindDriver, so one
+// code path serves every Kind — built-ins and CRDs alike. Events get their own
+// store and table (their access pattern differs); everything else lands in the
+// universal `objects` table.
 //
-// Each driver (driver.go) is built instead of a raw client-go Reflector so a
-// wake can resume cheaply: it seeds a RetryWatcher from the kind's persisted
-// resourceVersion (resume — apply deltas, no LIST) and only on a 410 (RV too
-// old) or a cold cache falls back to a metadata-first full re-sync (list
-// metadata, fetch bodies for just the changed objects). The stock Reflector
+// Each driver (driver.go) resumes cheaply on a wake: it seeds a RetryWatcher from
+// the kind's persisted resourceVersion (apply deltas, no LIST) and only on a 410
+// or a cold cache falls back to a metadata-first full re-sync. A stock Reflector
 // can't be seeded with a stored RV, so it always re-LISTs every body.
 //
-// One Engine runs per synced cluster, owned by the kube package's sync
-// controller: the controller decides when an engine starts, stops, or
-// restarts (spec changes, credential rotation, resync pokes); the engine
-// reports its coarse state back through the Sink it was constructed with.
+// One Engine runs per synced cluster, owned by the cluster package's sync
+// controller, which decides when it starts, stops, or restarts (spec changes,
+// credential rotation, resync pokes); the engine reports its coarse state back
+// through the Sink it was constructed with.
 package engine
 
 import (
@@ -63,12 +58,10 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
-// init routes client-go's API-server warning headers (deprecation
-// notices, etc.) through slog at Debug level instead of stderr. The
-// default handler logs them as INFO/WARN, which makes the app logs
-// noisy whenever the cluster has any deprecated API in use — the
-// signal-to-noise ratio is poor because the warnings are about the
-// cluster's contents, not anything the sidecar can act on.
+// init routes client-go's API-server warning headers (deprecation notices, etc.)
+// through slog at Debug level. The default handler logs them as INFO/WARN, which
+// is noisy whenever the cluster uses any deprecated API — and the warnings are
+// about the cluster's contents, not anything the sidecar can act on.
 func init() {
 	rest.SetDefaultWarningHandler(slogWarningHandler{})
 }
@@ -116,31 +109,27 @@ type EngineStatus struct {
 	LastSyncedAt *time.Time
 
 	// The following describe the catch-up milestone and feed the controller's event
-	// message; which reports carry each field varies, so see the per-field notes
-	// below (the counts, notably, also ride the warm EngineSyncing start report).
-	// All are reset (clearCatchUp) when the engine re-enters EngineSyncing.
+	// message; which reports carry each field varies (see the per-field notes). All
+	// are reset (clearCatchUp) when the engine re-enters EngineSyncing.
 	//
-	// ColdStart is true when this was the cache's first-ever sync (no prior
-	// state), false when it resumed an already-populated cache — the signal that
-	// separates SyncStart/SyncComplete from ResyncStart/ResyncComplete.
+	// ColdStart is true for the cache's first-ever sync, false when it resumed an
+	// already-populated cache — the signal separating SyncStart/SyncComplete from
+	// ResyncStart/ResyncComplete.
 	ColdStart bool
 	// SyncedObjects/SyncedKinds are how many objects across how many kinds the sync
-	// involves, and CaughtUpIn is how long the catch-up took. They power the
-	// human-facing "…N objects across M kinds in Ds" messages. Set on the caught-up
-	// EngineWatching report (the mirrored total, with CaughtUpIn); SyncedObjects/
-	// SyncedKinds are also set on a *warm* EngineSyncing start report (the warm
-	// cache being resumed, CaughtUpIn still zero). Zero on every other report.
+	// involves; CaughtUpIn is how long catch-up took. They power the "…N objects
+	// across M kinds in Ds" messages. Set on the caught-up EngineWatching report;
+	// SyncedObjects/SyncedKinds are also set on a warm EngineSyncing start report
+	// (the warm cache being resumed, CaughtUpIn still zero). Zero otherwise.
 	SyncedObjects int
 	SyncedKinds   int
 	CaughtUpIn    time.Duration
 
 	// ResyncedKinds/ResyncedObjects break down how much of a warm resume was real
-	// work rather than a clean reconnect: how many kinds fell back to a full
-	// re-sync (saved resourceVersion missing or expired) and how many object bodies
-	// those re-pulled. Aggregated across the drivers, set only on the caught-up
-	// EngineWatching report; zero on a pure reconnect (every kind resumed its watch
-	// directly) and on a cold build. The controller renders them into the
-	// ResyncComplete message.
+	// work rather than a clean reconnect: how many kinds fell back to a full re-sync
+	// and how many bodies those re-pulled. Aggregated across drivers, set only on the
+	// caught-up EngineWatching report; zero on a pure reconnect and on a cold build.
+	// The controller renders them into the ResyncComplete message.
 	ResyncedKinds   int
 	ResyncedObjects int
 
@@ -209,13 +198,13 @@ const (
 	// backs a human-facing "synced N ago" label, not precise accounting.
 	freshnessFlushInterval = 30 * time.Second
 
-	// staleThreshold is how long a caught-up driver may go without proving its
-	// watch is alive (delta, bookmark, or reconnect) before the engine flags the
-	// cache stale. Comfortably above the API server's ~1min bookmark cadence so a
-	// few missed bookmarks don't trip it; the connection sentinel catches hard
+	// staleThreshold is how long a caught-up driver may go without proving its watch
+	// is alive (delta, bookmark, or reconnect) before the engine flags the cache
+	// stale. Comfortably above the API server's ~1min bookmark cadence so a few
+	// missed bookmarks don't trip it; the connection sentinel catches hard
 	// disconnects far faster, so this is the slow backstop for a silently-wedged
-	// watch. (A rare API server that honours no bookmarks and holds watches open
-	// for long stretches could false-positive — an accepted limitation.)
+	// watch. (A rare API server honouring no bookmarks could false-positive — an
+	// accepted limitation.)
 	staleThreshold = 5 * time.Minute
 	// staleCheckInterval is how often the liveness monitor re-evaluates.
 	staleCheckInterval = 30 * time.Second
@@ -314,13 +303,11 @@ func (e *Engine) report(update func(*EngineStatus)) {
 	e.sink.Report(snapshot)
 }
 
-// reportCaughtUp emits the catch-up milestone — every driver has entered its
-// watch phase. It stamps the elapsed time and carries the drivers' aggregated
-// re-sync breakdown (resyncedKinds/resyncedObjects) so the controller can
-// compose the SyncComplete/ResyncComplete message. Only a cold build's message
-// reports the object total, so the whole-table count runs on that path alone (a
-// warm resume's message is watch-oriented and never reads SyncedObjects); a
-// count failure is logged and reported as zero rather than failing the milestone.
+// reportCaughtUp emits the catch-up milestone — every driver has entered its watch
+// phase. It stamps elapsed time and carries the drivers' aggregated re-sync
+// breakdown so the controller can compose the SyncComplete/ResyncComplete message.
+// Only a cold build's message reports the object total, so the whole-table count
+// runs on that path alone; a count failure is logged and reported as zero.
 func (e *Engine) reportCaughtUp(ctx context.Context, coldStart bool, kinds int, startedAt time.Time, resyncedKinds, resyncedObjects int) {
 	objects := 0
 	if coldStart {
@@ -338,11 +325,10 @@ func (e *Engine) reportCaughtUp(ctx context.Context, coldStart bool, kinds int, 
 	})
 }
 
-// cacheHasData reports whether this cache already holds a prior sync's state —
-// any kind has persisted a resume cookie. Read once at run start (before the
-// drivers repopulate anything), so the catch-up milestone can tell a cold cache
-// (first-ever sync) from a resume — keyed on the resume cookie rather than an
-// object count so an empty cluster's resume isn't misread as a cold start.
+// cacheHasData reports whether any kind has persisted a resume cookie — i.e. the
+// cache holds a prior sync's state. Read once at run start so the catch-up
+// milestone can tell a cold cache from a resume; keyed on the resume cookie, not
+// an object count, so an empty cluster's resume isn't misread as a cold start.
 func cacheHasData(ctx context.Context, cdb *store.ClusterDB) (bool, error) {
 	var has bool
 	err := cdb.Reader().QueryRowContext(ctx,
@@ -387,10 +373,9 @@ func cachedKindCount(ctx context.Context, cdb *store.ClusterDB) (int, error) {
 func (e *Engine) runLoop(ctx context.Context) {
 	backoff := e.backoffInit
 	for {
-		// Decide cold-vs-resume before anything repopulates the cache, so the
-		// in-progress Syncing report carries ColdStart (a first-ever build is a
-		// SyncStart transition, a resume is a ResyncStart) and run() reuses
-		// the same verdict for the catch-up milestone.
+		// Decide cold-vs-resume before anything repopulates the cache, so the Syncing
+		// report carries ColdStart and run() reuses the same verdict for the
+		// catch-up milestone.
 		coldStart := true
 		if has, err := cacheHasData(ctx, e.cdb); err != nil {
 			slog.Warn("clustersync: read cache state", "id", e.cdb.ID(), "err", err)
@@ -398,16 +383,15 @@ func (e *Engine) runLoop(ctx context.Context) {
 			coldStart = !has
 		}
 		// For a warm resume, read the warm cache's size so the ResyncStart event can
-		// report what it's resuming from. A cold start's cache is empty, so it needs
-		// no counts (its message is the static "Starting initial sync").
+		// report what it's resuming from. A cold start's cache is empty, so no counts.
 		var warmObjects, warmKinds int
 		if !coldStart {
 			warmObjects = e.countOrZero(ctx, cachedObjectCount, "count cached objects")
 			warmKinds = e.countOrZero(ctx, cachedKindCount, "count cached kinds")
 		}
 		// Re-entering Syncing clears the previous run's catch-up facts so a later
-		// snapshot (a heartbeat or an error) can't carry stale counts; the warm-cache
-		// size (set only for a resume) then rides the ResyncStart report.
+		// snapshot can't carry stale counts; the warm-cache size (resume only) then
+		// rides the ResyncStart report.
 		e.report(func(s *EngineStatus) {
 			s.State, s.LastError = EngineSyncing, ""
 			s.clearCatchUp()
@@ -463,9 +447,8 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 	}
 	slog.Info("clustersync: discovered syncable GVRs on API server", "id", e.cdb.ID(), "count", len(entries))
 
-	// coldStart was decided by runLoop before this report chain began (before the
-	// drivers repopulate anything); stamp the run's start so the catch-up milestone
-	// can report elapsed time alongside it.
+	// coldStart was decided by runLoop before the drivers repopulate anything; stamp
+	// the run's start so the catch-up milestone can report elapsed time.
 	startedAt := e.now()
 	kinds := len(entries)
 
@@ -478,10 +461,9 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 	var pending atomic.Int64
 	pending.Store(int64(len(entries)))
 	// Aggregate the per-driver re-sync work as each driver reaches its watch phase.
-	// Each driver contributes its own snapshot once (from its Run goroutine, at first
-	// watch entry) — folded into these atomics rather than read back from the driver
-	// structs, so a driver's later full-resync retry can't race the aggregation or
-	// bleed post-catch-up work into the first ResyncComplete counts.
+	// Each contributes its snapshot once (from its Run goroutine) into these atomics
+	// rather than being read back from the driver struct, so a driver's later
+	// full-resync retry can't race the aggregation or bleed into the first counts.
 	var resyncedKinds, resyncedObjects atomic.Int64
 	caughtUp := make(chan struct{})
 	var caughtUpOnce sync.Once
@@ -496,8 +478,8 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 			store = newObjectsStore(ctx, e.cdb.ID(), entry.GVK, writer, e.cdb)
 		}
 		// Seed the driver from the kind's persisted resourceVersion so it resumes
-		// the watch instead of re-LISTing every body; "" (never synced, or a read
-		// error) just means start with a full re-sync.
+		// instead of re-LISTing; "" (never synced, or a read error) starts with a
+		// full re-sync.
 		seedRV, err := readLastListRV(ctx, writer, entry.GVK)
 		if err != nil {
 			slog.Warn("clustersync: read resume rv", "gvk", entry.GVK.String(), "err", err)
@@ -535,14 +517,13 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 }
 
 // livenessMonitor flags the cache stale once a driver stops proving its watch is
-// alive past staleThreshold, and recovers it once liveness returns. It only judges
-// staleness after catch-up (before that the engine is legitimately still Syncing).
-// It re-reports whenever the wedged set changes — not just on the healthy/stale
-// edge — so a multi-kind cache never keeps naming a kind that has recovered (or
-// omits a newly-wedged one) while it stays stale overall; an unchanged set doesn't
-// re-emit every tick. The recovery report carries no catch-up counts — it's a
-// liveness resume, not a fresh sync — which the controller renders as "watch
-// recovered".
+// alive past staleThreshold, and recovers once liveness returns. It only judges
+// staleness after catch-up (before that the engine is legitimately Syncing). It
+// re-reports whenever the wedged set changes — not just on the healthy/stale edge —
+// so a multi-kind cache never keeps naming a recovered kind (or omits a newly-wedged
+// one) while stale overall; an unchanged set doesn't re-emit every tick. The
+// recovery report carries no catch-up counts (a liveness resume, not a fresh sync),
+// which the controller renders as "watch recovered".
 func (e *Engine) livenessMonitor(ctx context.Context, drivers []*kindDriver, caughtUp <-chan struct{}) {
 	select {
 	case <-ctx.Done():
@@ -640,18 +621,16 @@ func (e *Engine) freshnessLoop(ctx context.Context, pings <-chan struct{}) {
 
 // ConfigFingerprint hashes the connection- and credential-relevant fields of a
 // rest.Config. Two configs with the same fingerprint connect and authenticate
-// identically, so the cluster's running drivers don't need restarting; a
-// different fingerprint (rotated token, new client cert, changed CA/server URL,
-// or an edited exec/auth-provider/impersonation block) means the open engine is
-// running on stale config and must be restarted. We hash the *static* exec/
-// auth-provider config (command/args/env/plugin settings) — runtime token
-// minting is the transport's job, but editing how tokens are obtained must
-// invalidate the fingerprint.
+// identically, so the running drivers need no restart; a different fingerprint
+// (rotated token, new cert, changed CA/server URL, or an edited exec/auth-provider/
+// impersonation block) means the open engine is on stale config and must restart.
+// We hash the *static* exec/auth-provider config — runtime token minting is the
+// transport's job, but editing how tokens are obtained must invalidate it.
 //
 // proxyURL is the kubeconfig cluster's proxy-url. clientcmd compiles it into
 // rest.Config.Proxy (an opaque func we can't hash), so the caller passes the raw
-// string (ContextProxyURL): a changed proxy routes the connection differently
-// and must restart the drivers, even when every other field is identical.
+// string (ContextProxyURL): a changed proxy must restart the drivers even when
+// every other field is identical.
 func ConfigFingerprint(cfg *rest.Config, proxyURL string) string {
 	if cfg == nil {
 		return ""
@@ -763,11 +742,10 @@ var skipGroups = map[string]bool{
 	"events.k8s.io":           true,
 }
 
-// Specific (group, resource) entries to skip even though they pass the
-// generic filters. Right now: v1 Endpoints — deprecated in k8s 1.33+ in
-// favor of discovery.k8s.io/v1 EndpointSlice, which we already mirror.
-// The two resources hold the same data; keeping both wastes a watch and
-// makes the API server emit a deprecation warning on every LIST.
+// Specific (group, resource) entries to skip even though they pass the generic
+// filters. v1 Endpoints — deprecated in k8s 1.33+ for discovery.k8s.io/v1
+// EndpointSlice, which we already mirror — holds the same data, so keeping both
+// wastes a watch and draws a deprecation warning on every LIST.
 var skipResources = map[string]map[string]bool{
 	"": {"endpoints": true}, // core/v1 endpoints
 }
@@ -776,35 +754,29 @@ func isEventGVK(g schema.GroupVersionKind) bool {
 	return g.Kind == "Event" && (g.Group == "" || g.Group == "events.k8s.io")
 }
 
-// discoverGVRs walks /apis, returns one entry per list/watchable
-// resource (preferred version only), and populates kind_catalog so the
-// agent (and UI) can ask "what kinds exist on this cluster?" without
-// re-doing discovery.
+// discoverGVRs walks /apis, returns one entry per list/watchable resource
+// (preferred version only), and populates kind_catalog so the agent (and UI) can
+// ask "what kinds exist on this cluster?" without re-doing discovery.
 //
-// We use ServerPreferredResources rather than ServerGroupsAndResources
-// because the latter returns every version of every resource, which
-// means we'd start one driver per (resource, version) — duplicating
-// watches against the same underlying data and getting deprecation
-// warnings on every alpha/beta version we accidentally watched.
-// Preferred-only gives us one driver per logical resource.
+// It uses ServerPreferredResources, not ServerGroupsAndResources: the latter
+// returns every version of every resource, which would start one driver per
+// (resource, version) — duplicating watches and drawing deprecation warnings on
+// every alpha/beta version. Preferred-only gives one driver per logical resource.
 func discoverGVRs(ctx context.Context, dc discovery.DiscoveryInterface, cdb *store.ClusterDB) ([]gvrEntry, error) {
 	writer := cdb.Writer()
 	complete := true
 	lists, err := dc.ServerPreferredResources()
 	if err != nil {
 		if len(lists) == 0 {
-			// Nothing usable came back (e.g. a transient discovery
-			// failure or unreachable API server). Returning zero entries
-			// here would make run start no drivers and report success,
-			// leaving an open cluster that never mirrors data until the
-			// next reconcile. Fail so the sync surfaces the error.
+			// Nothing usable came back. Returning zero entries would start no drivers
+			// yet report success, leaving an open cluster that never mirrors data;
+			// fail so the sync surfaces the error.
 			return nil, fmt.Errorf("discovery returned no resources: %w", err)
 		}
-		// Partial discovery errors are common when an aggregated API
-		// server is down; the returned lists are still usable. Log and
-		// continue rather than fail the whole cluster — but mark discovery
-		// incomplete so we don't prune objects for a kind that's merely in a
-		// transiently-unavailable group (see the prune below).
+		// Partial discovery errors are common when an aggregated API server is down;
+		// the returned lists are still usable, so log and continue — but mark
+		// discovery incomplete so the prune below doesn't evict a kind that's merely
+		// in a transiently-unavailable group.
 		complete = false
 		slog.Warn("clustersync: partial discovery", "err", err)
 	}
@@ -862,9 +834,8 @@ func discoverGVRs(ctx context.Context, dc discovery.DiscoveryInterface, cdb *sto
 		}
 	}
 
-	// Persist the kind catalog. Truncate-and-rewrite is correct because
-	// CRDs can be installed/uninstalled between sidecar runs and we want
-	// the catalog to reflect "what exists right now".
+	// Persist the kind catalog. Truncate-and-rewrite because CRDs can be
+	// installed/uninstalled between runs and the catalog must reflect what exists now.
 	tx, err := writer.BeginTx(ctx, nil)
 	if err != nil {
 		return out, err
@@ -893,10 +864,9 @@ func discoverGVRs(ctx context.Context, dc discovery.DiscoveryInterface, cdb *sto
 		return out, err
 	}
 
-	// Evict objects whose kind no longer exists on the cluster (e.g. an
-	// uninstalled CRD). Only safe after a complete discovery — a partial
-	// result omits kinds that are still live. Build the keep-set from the
-	// same catalog we just persisted so the two stay consistent.
+	// Evict objects whose kind no longer exists on the cluster (e.g. an uninstalled
+	// CRD). Only safe after a complete discovery — a partial result omits live kinds.
+	// Build the keep-set from the catalog we just persisted so the two stay consistent.
 	if complete {
 		keep := make(map[kindKey]struct{}, len(catalog))
 		for _, c := range catalog {
@@ -911,11 +881,11 @@ func discoverGVRs(ctx context.Context, dc discovery.DiscoveryInterface, cdb *sto
 		}
 	}
 
-	// Signal catalog subscribers (e.g. ClusterDataKindsWatch). The truncate-and-rewrite
-	// above, plus the orphan prune, don't go through the per-object stores that ping on
-	// write, so without this a kind added/removed since the last run — most visibly a
-	// CRD uninstalled during an in-place engine restart, where the db handle doesn't
-	// change — would stay stale until the next unrelated object write happened to ping.
+	// Signal catalog subscribers (e.g. ClusterDataKindsWatch). The catalog rewrite and
+	// orphan prune don't go through the per-object stores that ping on write, so
+	// without this a kind added/removed since the last run — most visibly a CRD
+	// uninstalled during an in-place restart, where the db handle doesn't change —
+	// would stay stale until the next unrelated write pinged.
 	cdb.Notify()
 
 	return out, nil

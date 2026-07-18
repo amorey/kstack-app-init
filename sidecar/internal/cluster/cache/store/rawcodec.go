@@ -20,15 +20,14 @@ import (
 	"io"
 )
 
-// raw_json blobs (the full Kubernetes object marshaled to JSON) are the largest
-// column in the cache and compress ~4-5x. We store them zlib-compressed.
+// raw_json blobs (the full Kubernetes object as JSON) are the cache's largest
+// column and compress ~4-5x, so we store them zlib-compressed.
 //
-// zlib (not gzip) because its output is deterministic — gzip embeds an mtime,
-// so the same input would yield different bytes each write — and its frame is
-// ~6 bytes vs gzip's ~18. We deliberately store no version prefix: a zlib
-// stream begins with 0x78 while plain JSON begins with '{' (0x7B), so the
-// format is self-identifying and a version scheme can be added later without a
-// migration of existing rows.
+// zlib not gzip: its output is deterministic (gzip embeds an mtime, so the same
+// input would yield different bytes each write) and its frame is ~6 bytes vs gzip's
+// ~18. No version prefix is stored — a zlib stream begins with 0x78 while plain JSON
+// begins with '{' (0x7B), so the format is self-identifying and a version scheme can
+// be retrofitted later without a migration.
 
 // CompressRaw zlib-compresses b. The result begins with the zlib header byte
 // 0x78.

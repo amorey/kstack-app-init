@@ -53,9 +53,8 @@ var defaultRetention = Retention{
 // serialize with sync writes via the pool's MaxOpenConns=1. WAL mode
 // keeps readers unblocked.
 func runJanitor(ctx context.Context, id string, writer *sql.DB, ret Retention) {
-	// Run once immediately on startup so a freshly-opened DB that already
-	// has stale rows doesn't have to wait the full interval. Cheap on an
-	// empty DB.
+	// Sweep once on startup so a freshly-opened DB with stale rows doesn't wait the
+	// full interval. Cheap on an empty DB.
 	sweep(ctx, id, writer, ret)
 
 	t := time.NewTicker(ret.Interval)
@@ -98,10 +97,9 @@ func sweep(ctx context.Context, id string, writer *sql.DB, ret Retention) {
 		totalDeleted += n
 	}
 
-	// Hand the freed pages back to the OS. Cheap and bounded — the
-	// migration set auto_vacuum=INCREMENTAL so this only walks the
-	// freelist, doesn't rewrite the whole file. No-op when nothing was
-	// deleted, so we skip the call to save a write txn on idle clusters.
+	// Hand freed pages back to the OS. With auto_vacuum=INCREMENTAL this only walks
+	// the freelist, not the whole file. Skip it when nothing was deleted to save a
+	// write txn on idle clusters.
 	if totalDeleted > 0 {
 		if _, err := writer.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
 			slog.Warn("janitor: incremental_vacuum failed", "id", id, "err", err)

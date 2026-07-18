@@ -23,10 +23,10 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 )
 
-// fakeAuthSvc is a hand-written auth.Service for the grpc server tests.
-// It mirrors the fakeAuth in graph/testutils_test.go: signed-out by default,
-// StartLogin signs in and publishes, Logout signs out and publishes, Subscribe
-// returns a latest-value channel (current-on-subscribe then changes).
+// fakeAuthSvc is a hand-written auth.Service for the grpc server tests:
+// signed-out by default; StartLogin signs in and publishes, Logout signs out and
+// publishes, Subscribe returns a latest-value channel (current-on-subscribe then
+// changes).
 type fakeAuthSvc struct {
 	mu       sync.Mutex
 	signedIn bool

@@ -31,9 +31,8 @@ import (
 // synchronous=NORMAL, foreign_keys on, and immediate txlock so writes grab the
 // lock up front. maxConns caps the pool: pass 1 for a writer pool (writes
 // serialize at the pool instead of fighting at the SQLite layer), or a larger
-// value for a WAL reader pool. Callers run Apply against the returned pool to
-// migrate it. This is the single home for the sidecar's SQLite open contract;
-// both the per-cluster caches and the app-level registry go through it.
+// value for a WAL reader pool. This is the single home for the sidecar's SQLite
+// open contract.
 func OpenPool(path string, maxConns int) (*sql.DB, error) {
 	// _pragma values are URL-encoded; modernc parses them and applies on each
 	// new connection.
@@ -103,11 +102,10 @@ func loadMigrations(fsys fs.FS, dir string) ([]migration, error) {
 }
 
 // Apply brings db up to the latest migration found in fsys under dir. Files are
-// NNNN_name.sql, applied in version order, each in its own transaction,
-// recorded in a schema_migrations(version, name, applied_at) table. Returns the
-// highest version present in the DB on disk after the call. A crash mid-upgrade
-// leaves the DB at the last committed version and the next call resumes from
-// there. A DB whose recorded version is newer than the embedded set is refused.
+// NNNN_name.sql, applied in version order, each in its own transaction, recorded
+// in a schema_migrations(version, name, applied_at) table. Returns the highest
+// version present in the DB after the call. A DB recorded newer than the
+// embedded set is refused.
 func Apply(ctx context.Context, db *sql.DB, fsys fs.FS, dir string) (int, error) {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    INTEGER PRIMARY KEY,

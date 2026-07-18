@@ -14,10 +14,8 @@
 
 // The app's settings dialog. Opened from the sidebar account menu via
 // `openDialog('settings')` and rendered above the sidebar by `AppDialogs`, so it
-// outlives the sidebar card unmounting on auto-collapse (same pattern as the
-// cluster panel). Each setting is a `Field` row from @kubetail/ui inside a
-// `FieldGroup`; today the only one is Appearance (the light/dark theme picker).
-// Add a setting by dropping another `Field` into the group.
+// outlives the sidebar card unmounting on auto-collapse. Each setting is a `Field`
+// row inside a `FieldGroup`; today the only one is Appearance (the theme picker).
 import { Monitor, Moon, Sun } from 'lucide-react';
 import type { ComponentType } from 'react';
 
@@ -28,16 +26,16 @@ import { Dialog } from '@/components/widgets/dialog';
 import { type AppDialogProps } from '@/lib/dialog';
 import { type ColorSchemePreference, useColorScheme } from '@/lib/theme';
 
-// The three color-scheme choices, in reading order. "System" leads because it's the
-// default (follow the OS). Each carries the icon that reads as its scheme.
+// The three color-scheme choices, in reading order. "System" leads because it's
+// the default (follow the OS).
 const COLOR_SCHEME_OPTIONS: { value: ColorSchemePreference; label: string; icon: ComponentType }[] = [
   { value: 'system', label: 'System', icon: Monitor },
   { value: 'light', label: 'Light', icon: Sun },
   { value: 'dark', label: 'Dark', icon: Moon },
 ];
 
-// A segmented single-choice control for the color scheme, using the library's
-// `Tabs` in its default (segmented) variant — no panels, just the strip as a picker.
+// Segmented single-choice control for the color scheme: the library's `Tabs`
+// strip used as a picker, no panels.
 function ColorSchemePicker() {
   const { preference, setPreference } = useColorScheme();
   return (

@@ -37,9 +37,8 @@ func main() {
 	sockPath := flag.String("socket", ipc.DefaultSocketPath(), "path to the IPC endpoint (Unix domain socket on Unix, named pipe on Windows) to listen on")
 	kubeconfigPath := flag.String("kubeconfig", "", "explicit kubeconfig path; empty uses the clientcmd default-loading rules ($KUBECONFIG / ~/.kube/config)")
 	// The Tauri host passes its app_local_data_dir() here so app.db and the
-	// per-cluster SQLite caches land in the OS-correct per-machine data
-	// location. Required — app.New errors when it's empty, so a standalone run
-	// must supply one (e.g. a scratch dir).
+	// per-cluster SQLite caches land in the OS-correct location. Required —
+	// app.New errors when empty, so a standalone run must supply one.
 	dataDir := flag.String("data-dir", envOr("KSTACK_DATA_DIR", ""), "app data dir for app.db and the per-cluster caches (defaults to KSTACK_DATA_DIR; required)")
 	flag.Parse()
 
@@ -61,11 +60,10 @@ func main() {
 	)
 
 	// Cloud account config. CloudURL and the OAuth issuer default to the kstack
-	// production endpoints so a release build is signed-in-capable out of the box;
-	// both are env-overridable to point dev/staging at a different backend. The
-	// OAuth client is a public PKCE/loopback client (no secret) and the endpoints
-	// are public, so baking the defaults into the binary leaks nothing. auth
-	// derives Hydra's standard endpoint paths from the issuer base.
+	// production endpoints (env-overridable for dev/staging). The OAuth client is
+	// a public PKCE/loopback client (no secret) and the endpoints are public, so
+	// baking the defaults into the binary leaks nothing. auth derives Hydra's
+	// standard endpoint paths from the issuer base.
 	application, err := app.New(app.Config{
 		KubeconfigPath: *kubeconfigPath,
 		DataDir:        *dataDir,
@@ -132,12 +130,11 @@ func main() {
 
 	slog.Info("sidecar shutting down", "reason", reason)
 
-	// Stop accepting connections and fire RegisterOnShutdown (app.NotifyShutdown),
-	// which signals both transports' long-lived streams. Shutdown then waits for
-	// the non-hijacked GraphQL requests (SSE flushes its terminal frame on the
-	// cancelled per-request context). DrainWithContext additionally waits for the
-	// hijacked h2c gRPC streams, and only then does Close stop the gRPC transports,
-	// the sync engine, and the kube-config watcher.
+	// Shutdown stops accepting and fires RegisterOnShutdown (app.NotifyShutdown),
+	// signaling both transports' long-lived streams, then waits for the
+	// non-hijacked GraphQL requests. DrainWithContext additionally waits for the
+	// hijacked h2c gRPC streams; only then does Close stop the transports and
+	// tear down the services.
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancelShutdown()
 	_ = srv.Shutdown(shutdownCtx)

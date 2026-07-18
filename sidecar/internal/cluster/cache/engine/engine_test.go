@@ -546,10 +546,10 @@ func TestDriverOnWatchFiresOnce(t *testing.T) {
 
 // A warm resume whose saved cookie is server-expired reports the re-sync, not a
 // clean reconnect. The first watch is accepted and only then 410s, so onWatch is
-// deferred (not fired) on that attempt; Run falls back to fullResync and re-enters
-// with a fresh RV, where onWatch fires with didResync=true and the re-pulled count.
-// A never-firing grace isolates the fix: the only path to onWatch here is the
-// post-410 re-sync, so a premature clean-resume report would leave calls at 0.
+// deferred on that attempt; Run falls back to fullResync and re-enters with a fresh
+// RV, where onWatch fires with didResync=true and the re-pulled count. The
+// never-firing grace isolates the fix: the only path to onWatch here is the
+// post-410 re-sync.
 func TestDriverOnWatchReportsResyncAfterExpiredCookie(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

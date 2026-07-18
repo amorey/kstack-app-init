@@ -29,10 +29,9 @@ import (
 	"github.com/amorey/beehive"
 )
 
-// fakeWatch is a controllable watch.Interface for connection-sentinel tests: its
-// result channel stays open until Stop closes it. Stop is idempotent (sync.Once), so
-// the sentinel's own deferred Stop after a test-driven break is harmless. Closing the
-// channel simulates the cluster's liveness watch breaking.
+// fakeWatch is a controllable watch.Interface: its result channel stays open until Stop
+// closes it (idempotent via sync.Once, so the sentinel's own deferred Stop is harmless).
+// Closing the channel simulates the cluster's liveness watch breaking.
 type fakeWatch struct {
 	ch   chan watch.Event
 	once sync.Once
@@ -43,10 +42,10 @@ func newFakeWatch() *fakeWatch { return &fakeWatch{ch: make(chan watch.Event)} }
 func (w *fakeWatch) Stop()                          { w.once.Do(func() { close(w.ch) }) }
 func (w *fakeWatch) ResultChan() <-chan watch.Event { return w.ch }
 
-// liveSentinelWatch is a SentinelWatchFunc that always establishes a fresh,
-// never-closing watch, so converge's sentinel stays open and never re-probes. Tests
-// that exercise the controller's other out-of-band triggers inject it so the (real,
-// network-dialing) default sentinel watch never runs.
+// liveSentinelWatch is a SentinelWatchFunc that always returns a fresh, never-closing
+// watch, so converge's sentinel stays open and never re-probes. Tests exercising the
+// controller's other out-of-band triggers inject it so the real network-dialing
+// sentinel watch never runs.
 func liveSentinelWatch(context.Context, *rest.Config) (watch.Interface, error) {
 	return newFakeWatch(), nil
 }
@@ -65,9 +64,8 @@ func awaitWatch(t *testing.T, ch <-chan *fakeWatch) *fakeWatch {
 
 // TestClusterCoreControllerSentinelReprobesOnWatchBreak verifies the connection
 // sentinel: after a successful probe the controller holds a liveness watch open, and
-// when that watch closes (the earliest connection-loss signal) it forces an
-// out-of-band re-probe — fast detection owned by the connection controller itself,
-// with no sync engine involved.
+// when that watch closes it forces an out-of-band re-probe — fast detection owned by
+// the connection controller, no sync engine involved.
 func TestClusterCoreControllerSentinelReprobesOnWatchBreak(t *testing.T) {
 	ctx := context.Background()
 

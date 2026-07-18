@@ -23,14 +23,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// All adapters operate on *unstructured.Unstructured so the same code
-// path serves both built-in kinds and CRDs — the dynamic client returns
-// unstructured for everything, and that's deliberate: it's the only way
-// to handle CRDs uniformly without code-genned typed clients.
-//
-// The universal schema lives in three tables (objects, owner_refs,
-// labels). The adapter extracts a single ObjectRow per object; the
-// store writes one row to each of the three tables (and optionally
+// All adapters operate on *unstructured.Unstructured so one code path serves
+// both built-in kinds and CRDs (the dynamic client returns unstructured for
+// everything). The adapter extracts one ObjectRow per object; the store writes
+// it across the universal objects/owner_refs/labels tables (and optionally
 // status_history) in one transaction.
 
 // OwnerRef is a row in owner_refs, pre-extracted from
@@ -74,20 +70,14 @@ func extractObject(u *unstructured.Unstructured) (ObjectRow, bool, error) {
 	}
 	kind := u.GetKind()
 	apiVersion := u.GetAPIVersion()
-	// Events from core/v1 ("Event") and events.k8s.io/v1 ("Event") both
-	// land here — we want them in the dedicated events table. Discriminate
-	// by group (core/v1 -> "v1", events.k8s.io/v1 -> "events.k8s.io/v1").
+	// Events from both API groups route to the dedicated events table.
 	if kind == "Event" && (apiVersion == "v1" || apiVersion == "events.k8s.io/v1") {
 		return ObjectRow{}, true, nil
 	}
 
-	// Secrets carry sensitive values in .data (base64-encoded) and
-	// .stringData. The agent's troubleshooting use case wants to know
-	// "this Secret exists, what type, what keys does it expose" — never
-	// the values. Redact in-place on a deep copy before marshaling so
-	// raw_json never holds the plaintext on disk. Keys are preserved so
-	// the agent can still answer "does this Pod's mounted Secret have
-	// the expected keys?"
+	// Secrets carry sensitive values in .data (base64) and .stringData. Redact on
+	// a deep copy before marshaling so raw_json never holds plaintext; keys are
+	// kept so the agent can still answer "does this Secret expose the expected keys?".
 	source := u.Object
 	if kind == "Secret" && apiVersion == "v1" {
 		source = redactSecret(u.Object)
@@ -111,8 +101,8 @@ func extractObject(u *unstructured.Unstructured) (ObjectRow, bool, error) {
 		Labels:          u.GetLabels(),
 	}
 	if row.UID == "" {
-		// Some Reflector frames briefly carry empty UID (e.g. server-side
-		// dry-runs); skip rather than wedge the PK.
+		// Some frames briefly carry an empty UID (e.g. server-side dry-runs); skip
+		// rather than wedge the PK.
 		return ObjectRow{}, false, fmt.Errorf("object %s/%s has empty UID", row.Namespace, row.Name)
 	}
 
@@ -170,10 +160,8 @@ func statusPod(u *unstructured.Unstructured) (string, *int, *int, *int, string) 
 	total := len(cs)
 	ready := 0
 	restarts := 0
-	// Surface the worst container state as the headline if any container
-	// isn't Ready — that's what the user wants to see ("CrashLoopBackOff"
-	// is far more useful than "Running" for a pod whose only container
-	// is in CrashLoopBackOff).
+	// Surface the worst container state as the headline — "CrashLoopBackOff" is
+	// far more useful than "Running" for a pod whose only container is crashing.
 	var worstReason string
 	for _, c := range cs {
 		m, ok := c.(map[string]any)
@@ -186,8 +174,8 @@ func statusPod(u *unstructured.Unstructured) (string, *int, *int, *int, string) 
 		if n, _, _ := unstructured.NestedInt64(m, "restartCount"); n > 0 {
 			restarts += int(n)
 		}
-		// state has at most one of waiting/running/terminated. Capture
-		// the waiting/terminated reason if present.
+		// state has at most one of waiting/running/terminated; capture the
+		// waiting/terminated reason if present.
 		if reason, _, _ := unstructured.NestedString(m, "state", "waiting", "reason"); reason != "" && worstReason == "" {
 			worstReason = reason
 		} else if reason, _, _ := unstructured.NestedString(m, "state", "terminated", "reason"); reason != "" && worstReason == "" && reason != "Completed" {
@@ -195,13 +183,11 @@ func statusPod(u *unstructured.Unstructured) (string, *int, *int, *int, string) 
 		}
 	}
 
-	// Init containers run (and can fail) before app containers start, so a
-	// pod blocked at Init:CrashLoopBackOff / Init:ImagePullBackOff reports
-	// the real reason under initContainerStatuses while containerStatuses
-	// still looks plain Pending. Their failure takes priority over any app
-	// container reason and is prefixed "Init:" to match kubectl. A completed
-	// init container (terminated/Completed) is normal and skipped; restarts
-	// of a crash-looping init container still matter, so count them.
+	// A pod blocked in init reports its real reason under initContainerStatuses
+	// while containerStatuses still looks plain Pending. An init failure takes
+	// priority over any app-container reason and is prefixed "Init:" to match
+	// kubectl; a completed init container is normal and skipped, but its restarts
+	// still count.
 	ics, _, _ := unstructured.NestedSlice(u.Object, "status", "initContainerStatuses")
 	var initReason string
 	for _, c := range ics {
@@ -230,11 +216,9 @@ func statusPod(u *unstructured.Unstructured) (string, *int, *int, *int, string) 
 }
 
 func statusReplicaController(u *unstructured.Unstructured) (string, *int, *int, *int, string) {
-	// Total is the desired count (spec.replicas), not status.replicas: while a
-	// workload scales up or is freshly created, status.replicas is the observed
-	// count and lags desired, so a desired-3 workload with status.replicas=0
-	// would otherwise render as "ScaledToZero 0/0". spec.replicas defaults to 1
-	// when omitted.
+	// Use desired (spec.replicas), not status.replicas: the observed count lags
+	// desired during scale-up, so a desired-3 workload would otherwise render as
+	// "ScaledToZero 0/0". spec.replicas defaults to 1 when omitted.
 	desired, found, _ := unstructured.NestedInt64(u.Object, "spec", "replicas")
 	if !found {
 		desired = 1
@@ -398,19 +382,14 @@ func statusFromConditions(u *unstructured.Unstructured) string {
 // top-level secret fields or raw_json would still leak the values.
 const lastAppliedAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
 
-// redactSecret returns a shallow-modified copy of a Secret's raw map
-// with .data and .stringData values replaced by "<redacted>". Keys are
-// preserved (key existence isn't sensitive; the values are). The input
-// map is not mutated — the caller's *unstructured.Unstructured retains
-// its original payload for in-process use (we just don't persist it).
+// redactSecret returns a copy of a Secret's raw map with .data/.stringData values
+// replaced by "<redacted>" (keys preserved — existence isn't sensitive). The input
+// is not mutated, so the caller's in-process object keeps its plaintext.
 //
-// We also scrub metadata.annotations["kubectl.kubernetes.io/last-applied-
-// configuration"]: kubectl itself stores the entire applied Secret (data and
-// all) there, so it's a first-class leak, not a user mistake. We still don't
-// chase "secrets" users hand-place in ConfigMaps or other annotations —
-// pretending to redact those would create a false sense of security. The
-// contract stays precise: Kubernetes-typed Secrets get their .data/.stringData
-// and the kubectl last-applied snapshot scrubbed.
+// It also scrubs metadata.annotations["kubectl.kubernetes.io/last-applied-
+// configuration"], where kubectl stores the entire applied Secret — a first-class
+// leak. It does not chase "secrets" hand-placed in ConfigMaps or other
+// annotations; the contract stays precise.
 func redactSecret(obj map[string]any) map[string]any {
 	out := make(map[string]any, len(obj))
 	for k, v := range obj {
@@ -478,9 +457,8 @@ type EventRow struct {
 	RawJSON      []byte
 }
 
-// extractEvent supports both core/v1 Event and events.k8s.io/v1 Event,
-// which use different field names for the same data. The two API groups
-// emit semantically identical data with renamed fields; we normalise.
+// extractEvent normalises both core/v1 Event and events.k8s.io/v1 Event, which
+// carry the same data under different field names.
 func extractEvent(u *unstructured.Unstructured) (EventRow, error) {
 	rawJSON, err := json.Marshal(u.Object)
 	if err != nil {
@@ -494,13 +472,10 @@ func extractEvent(u *unstructured.Unstructured) (EventRow, error) {
 		return EventRow{}, fmt.Errorf("event has empty UID")
 	}
 
-	// Common: involvedObject is the same on both groups for legacy reasons
-	// (events.k8s.io/v1 retains it as `regarding`, but kubelet still emits
-	// core/v1 events; check both).
-	// Branch on which field group is actually present, not on whether the UID
-	// happens to be set: involvedObject.uid is optional (name-only references
-	// are valid), so a missing UID must not be mistaken for an events.k8s.io
-	// object and clobber a real involvedObject identity.
+	// Branch on which field group is present, not on whether the UID is set:
+	// involvedObject.uid is optional (name-only references are valid), so a missing
+	// UID must not be mistaken for the events.k8s.io `regarding` spelling and
+	// clobber a real involvedObject identity.
 	if _, ok := u.Object["involvedObject"]; ok {
 		row.InvolvedUID, _, _ = unstructured.NestedString(u.Object, "involvedObject", "uid")
 		row.InvolvedKind, _, _ = unstructured.NestedString(u.Object, "involvedObject", "kind")
@@ -521,10 +496,8 @@ func extractEvent(u *unstructured.Unstructured) (EventRow, error) {
 		// events.k8s.io/v1 spelling
 		row.Message, _, _ = unstructured.NestedString(u.Object, "note")
 	}
-	// Read count from whichever spelling is actually present (core/v1 count,
-	// events.k8s.io/v1 series.count, or deprecatedCount) rather than treating
-	// a genuine 0 as "field absent". Only when no spelling carries the field
-	// do we default to 1 (a singleton event reports no count).
+	// Read count from whichever spelling is present rather than treating a genuine
+	// 0 as "field absent"; default to 1 only when no spelling carries it.
 	count, found, _ := unstructured.NestedInt64(u.Object, "count")
 	if !found {
 		count, found, _ = unstructured.NestedInt64(u.Object, "series", "count")

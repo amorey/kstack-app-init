@@ -51,11 +51,8 @@ pub enum AppError {
     Json(#[from] serde_json::Error),
 }
 
-/// Serializes as the error's `Display` string.
-///
-/// This is what makes `AppError` usable as a Tauri command error type: when a
-/// command returns `Err`, Tauri serializes it and the webview receives the
-/// human-readable message.
+/// Serializes as the error's `Display` string — the Tauri-boundary contract, so
+/// a command's `Err` reaches the webview as the human-readable message.
 impl serde::Serialize for AppError {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         s.serialize_str(&self.to_string())

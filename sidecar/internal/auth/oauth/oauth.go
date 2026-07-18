@@ -80,12 +80,11 @@ type Client struct {
 }
 
 // NewClient builds a Client. The ID-token verifier fetches Hydra's JWKS from
-// cfg.JWKSURL lazily (on first Verify), so construction does no network I/O.
-// That lazy fetch reuses the client's own 15s-timeout HTTP client (handed to
-// go-oidc via oidc.ClientContext), so a slow/hung JWKS endpoint can't block
-// Verify unbounded. go-oidc ignores context cancellation for the key set (it
-// stores the context WithoutCancel as a config bag), so the client timeout — not
-// a context — is what bounds the fetch, and no context parameter is needed.
+// cfg.JWKSURL lazily (on first Verify), so construction does no network I/O. That
+// fetch reuses the client's own 15s-timeout HTTP client (via oidc.ClientContext),
+// so a slow/hung JWKS endpoint can't block Verify unbounded — go-oidc ignores
+// context cancellation for the key set, so the client timeout, not a context,
+// bounds the fetch.
 func NewClient(cfg Config) *Client {
 	oc := &oauth2.Config{
 		ClientID: cfg.ClientID,

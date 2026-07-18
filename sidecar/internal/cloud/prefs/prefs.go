@@ -1,14 +1,10 @@
-// Package prefs holds the user's cloud-synced preferences: the Settings
-// type, a persistent Store backed by a JSON file, and a watch hub that
-// fans the current Settings to subscribers.
+// Package prefs holds the user's cloud-synced preferences: the Settings type, a
+// JSON-backed Store, and a watch hub fanning the current Settings to subscribers.
 //
-// Settings uses pointer fields so an absent field (nil) is distinct from a
-// field explicitly set to its zero value — the cloud deep-merges patches,
-// so "field not present" must not be confused with "field cleared". The
-// Store wraps internal/cloud/syncstore so the sync engine can carry its
-// reconcile metadata (version/timestamps) in the same file; this package
-// reads and writes only the payload (Data) and leaves the metadata to the
-// engine.
+// Settings uses pointer fields so absent (nil) is distinct from zero — the cloud
+// deep-merges patches, so "not present" must not read as "cleared". The Store
+// wraps internal/cloud/syncstore so the engine can carry its reconcile metadata
+// in the same file; this package reads/writes only the payload (Data).
 package prefs
 
 import (
@@ -20,21 +16,17 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/syncstore"
 )
 
-// Settings is the user's preferences payload. Fields are pointers + omitempty
-// so the JSON form distinguishes absent from zero (deep-merge semantics).
-// The concrete field set stays minimal until the cloud Settings schema is
-// finalized.
+// Settings is the user's preferences payload. Fields are pointers + omitempty so
+// the JSON form distinguishes absent from zero (deep-merge semantics).
 type Settings struct {
 	Theme  *string `json:"theme,omitempty"`
 	Locale *string `json:"locale,omitempty"`
 }
 
-// Merge deep-merges patch onto base: each non-nil field in patch overrides
-// base; nil (absent) fields leave base untouched. This is the local-first
-// reconcile primitive — a still-pending local patch is re-layered over an
-// incoming cloud snapshot so a snapshot that predates the edit can't clobber
-// it. The returned Settings owns fresh copies of every field, so it never
-// aliases base's or patch's pointers.
+// Merge deep-merges patch onto base: each non-nil patch field overrides base, nil
+// fields leave base untouched. The local-first reconcile primitive — a pending
+// local patch is re-layered over an incoming cloud snapshot so a stale snapshot
+// can't clobber it. The result owns fresh copies, never aliasing base or patch.
 func Merge(base, patch Settings) Settings {
 	out := base
 	if patch.Theme != nil {
@@ -46,10 +38,9 @@ func Merge(base, patch Settings) Settings {
 	return Clone(out)
 }
 
-// Clone returns a deep copy of s: the pointer fields point at fresh storage, so
-// the result and s never alias. The Store and the mutation queue clone at their
-// boundaries, so a caller mutating the string it passed to Set/Enqueue (or one
-// returned by Get/Pending) can't desync in-memory settings from disk.
+// Clone returns a deep copy of s with fresh pointer storage. The Store and the
+// mutation queue clone at their boundaries, so a caller mutating a string it
+// passed in (or got back) can't desync in-memory settings from disk.
 func Clone(s Settings) Settings {
 	return Settings{
 		Theme:  clonePtr(s.Theme),
@@ -76,9 +67,9 @@ type Store struct {
 	tx    *watch.Sender[Settings]
 
 	mu sync.Mutex
-	// env is the cached on-disk envelope. We own the file exclusively, so we
-	// keep the full envelope in memory and update Data in place on Set —
-	// avoiding a disk read on every write to preserve the engine's metadata.
+	// env is the cached on-disk envelope. We own the file exclusively, so we hold
+	// the full envelope in memory and update Data in place on Set — no per-write
+	// disk read needed to preserve the engine's metadata.
 	env syncstore.Envelope[Settings]
 	cur Settings
 }
@@ -91,9 +82,8 @@ func NewStore(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Seed the hub with a clone so a current-on-subscribe delivery doesn't hand
-	// out the same pointers held in cur/env (a subscriber mutating it would
-	// desync memory from disk).
+	// Seed with a clone so a current-on-subscribe delivery doesn't share the
+	// pointers held in cur/env (a subscriber mutating it would desync from disk).
 	hub := watch.New(Clone(env.Data))
 	return &Store{
 		store: st,
@@ -104,18 +94,17 @@ func NewStore(path string) (*Store, error) {
 	}, nil
 }
 
-// Get returns the current Settings. The result is a deep copy, so a caller
-// mutating its pointer fields can't reach into the store's in-memory state.
+// Get returns a deep copy of the current Settings, so a caller mutating its
+// fields can't reach into the store's in-memory state.
 func (s *Store) Get() Settings {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return Clone(s.cur)
 }
 
-// Set persists v as the current Settings and publishes it to subscribers,
-// preserving the engine's sync metadata in the envelope. It reports whether
-// the value actually changed: an equal Set is a no-op (no disk write, no
-// publish) so subscribers and the cloud only see real changes.
+// Set persists v and publishes it to subscribers, preserving the engine's sync
+// metadata in the envelope. It reports whether the value changed: an equal Set is
+// a no-op (no write, no publish) so subscribers and the cloud see only real changes.
 func (s *Store) Set(v Settings) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -124,13 +113,12 @@ func (s *Store) Set(v Settings) (bool, error) {
 		return false, nil
 	}
 
-	// Clone so we own the stored/published value: a caller mutating the string
-	// it passed in can't later desync our in-memory copy from the persisted JSON.
+	// Clone so we own the stored/published value; a caller mutating what it passed
+	// in can't desync our in-memory copy from disk.
 	v = Clone(v)
 
 	// Update the cached envelope's payload in place (preserving the engine's
-	// metadata) and persist — no disk read needed since we own the file. Roll
-	// the cache back if the write fails so it stays consistent with disk.
+	// metadata) and persist. Roll the cache back on write failure.
 	prev := s.env.Data
 	s.env.Data = v
 	if err := s.store.Save(s.env); err != nil {
@@ -138,8 +126,8 @@ func (s *Store) Set(v Settings) (bool, error) {
 		return false, err
 	}
 	s.cur = v
-	// Publish a separate clone: a subscriber mutating the snapshot it receives
-	// must not write through to s.cur (which would desync memory from disk).
+	// Publish a separate clone so a subscriber mutating its snapshot can't write
+	// through to s.cur.
 	s.tx.Send(Clone(v)) //nolint:errcheck // watch.Send never blocks; closed hub is a no-op
 	return true, nil
 }

@@ -26,24 +26,21 @@ import (
 )
 
 // KubeconfigImporter watches the kubeconfig and is the sole creator of
-// kubeconfig-sourced Cluster beehive objects (one Cluster per kube-context). Its
-// only job is creation: on each snapshot it creates a Cluster — keyed by the
-// deterministic slug "kubeconfig/{context}" — for every context that no Cluster
-// yet references, writing only the source *reference* (ClusterSpec.Source). It
-// never updates, orphans, or deletes. The deterministic slug means beehive's
-// per-kind slug-uniqueness rules out a duplicate even under a concurrent create.
+// kubeconfig-sourced Cluster beehive objects (one per kube-context). Creation-only:
+// on each snapshot it creates a Cluster — keyed by the deterministic slug
+// "kubeconfig/{context}" — for every context no Cluster yet references, writing only
+// the source reference (ClusterSpec.Source). It never updates, orphans, or deletes.
+// The deterministic slug means beehive's per-kind slug-uniqueness rules out a
+// duplicate even under a concurrent create.
 //
-// Everything observed about the context — the cluster/user entry names, whether
-// it is still present, whether it is the current-context — is written to
-// ClusterStatus.Source by the ClusterCoreController, which observes it live from
-// the kubeconfig each reconcile (the controller subscribes to the same watcher,
-// so a departure/rename/current-context switch re-reconciles promptly). So a
-// departed context is orphaned by the controller flipping IsPresent=false, and a
-// returning context revives because its (never-deleted) Cluster still references
-// it — the importer simply finds it and skips re-creation.
+// Everything observed about the context (cluster/user names, presence, is-current)
+// is written to ClusterStatus.Source by the ClusterCoreController, which observes it
+// live each reconcile. So a departed context is orphaned by the controller flipping
+// IsPresent=false, and a returning context revives because its (never-deleted)
+// Cluster still references it — the importer finds it and skips re-creation.
 //
-// A future creator (manual, cloud) is a sibling importer writing Cluster objects
-// with a different Source variant — they share this one Cluster kind.
+// A future creator (manual, cloud) is a sibling importer writing Cluster objects with
+// a different Source variant — they share this one Cluster kind.
 type KubeconfigImporter struct {
 	cfgSource  KubeConfigSource
 	coreClient beehive.Client[ClusterSpec, ClusterStatus]
@@ -117,9 +114,9 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 	if err != nil {
 		return err
 	}
-	// The set of contexts already tracked by a (non-deleting) kubeconfig-sourced
-	// Cluster. A departed context's Cluster still references it (never deleted), so
-	// a returning context is found here and skipped — the controller revives it.
+	// Contexts already tracked by a (non-deleting) kubeconfig-sourced Cluster. A
+	// departed context's Cluster still references it, so a returning context is found
+	// here and skipped — the controller revives it.
 	tracked := map[string]bool{}
 	for _, obj := range existing {
 		if obj.DeletionRequestedAt != nil {

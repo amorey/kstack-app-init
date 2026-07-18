@@ -15,9 +15,8 @@
 // Package model holds the gqlgen-generated GraphQL models (models_gen.go).
 //
 // This hand-written file exists only to keep the package non-empty: gqlgen
-// rewrites models_gen.go on every run (deleting it first), so without a
-// permanent file here the package would momentarily have no Go files and gqlgen
-// could not load it for autobinding. Most GraphQL types bind directly to
-// internal/cluster and internal/auth domain types (see gqlgen.yml), so there
-// are no hand-written models left to carry.
+// deletes and rewrites models_gen.go on every run, so without a permanent file
+// the package would momentarily have no Go files and gqlgen couldn't load it for
+// autobinding. Most GraphQL types bind directly to internal/cluster and
+// internal/auth domain types (see gqlgen.yml), so no hand-written models remain.
 package model

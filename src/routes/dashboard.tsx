@@ -19,15 +19,13 @@ import { dashboardResourceLabel, resolveDashboardResource } from '@/lib/dashboar
 import type { DashboardResource } from '@/lib/dashboard-resources';
 import { Route as appRoute } from '@/routes/_app';
 
-// The focused resource kind lives in the URL, so a selection is deep-linkable
-// and each change is its own history entry (see `dashboard-resources.ts`). It's
-// optional in the URL — an absent value resolves to the default in the component
-// — so we never rewrite a bare `/dashboard` on load. The value may be a curated
-// id or a dynamic kind's id, so it's validated leniently (any non-empty string)
-// rather than against a closed union. The picker itself is `DashboardResourceNav`,
-// which the app shell mounts in the floating sidebar while dashboard mode is active
-// (see `AppLayout`); this route just reads the param back and renders the matching
-// panel.
+// The focused resource kind lives in the `resource` search param, so a selection
+// is deep-linkable and each change is its own history entry. It's optional (absent
+// resolves to the default in the component, so a bare `/dashboard` isn't rewritten
+// on load) and may be a curated or dynamic kind's id, so it's validated leniently
+// (any non-empty string) rather than against a closed union. The picker is
+// `DashboardResourceNav` (mounted by `AppLayout`); this route reads the param back
+// and renders the matching panel.
 type DashboardSearch = { resource?: DashboardResource };
 
 export const Route = createRoute({

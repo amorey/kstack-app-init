@@ -24,18 +24,14 @@
 use serde::Deserialize;
 
 /// One structured log line emitted by the sidecar.
-///
-/// The sidecar's own `time` field is intentionally not captured: the host's
-/// `tracing` subscriber stamps every event with its own timestamp.
 #[derive(Deserialize)]
 struct SidecarLog {
     /// Sidecar-side severity: `DEBUG`, `INFO`, `WARN`, or `ERROR`.
     level: String,
     /// The human-readable message.
     msg: String,
-    /// Consumed but discarded: the sidecar's own timestamp. Naming the field
-    /// keeps `time` out of the flattened `extra` below — the host's `tracing`
-    /// subscriber stamps each event itself.
+    /// The sidecar's own timestamp, consumed but discarded (the host's `tracing`
+    /// subscriber stamps each event). Named so it stays out of `extra` below.
     #[serde(default, rename = "time")]
     _time: serde::de::IgnoredAny,
     /// Every remaining JSON field, re-attached to the tracing event verbatim.
@@ -57,14 +53,13 @@ pub(super) enum Severity {
 /// (empty when there are none).
 type Classified = (Severity, String, String);
 
-/// Decides how a single line of sidecar output should be re-emitted, without
-/// touching `tracing`. Separate from [`forward_sidecar_line`] so the parsing
-/// and level-mapping rules can be unit-tested in isolation.
+/// Decides how a line of sidecar output should be re-emitted, without touching
+/// `tracing` — split from [`forward_sidecar_line`] so the parsing/level-mapping
+/// rules unit-test in isolation.
 ///
-/// Returns `None` for an empty or whitespace-only line (nothing to emit).
-/// A line that parses as the sidecar's `slog` JSON is classified by its own
-/// `level`; anything else (Go panics, runtime messages) is forwarded verbatim
-/// at `fallback`.
+/// `None` for an empty/whitespace-only line. A line that parses as the sidecar's
+/// `slog` JSON is classified by its own `level`; anything else (Go panics,
+/// runtime messages) is forwarded verbatim at `fallback`.
 fn classify(raw: &[u8], fallback: Severity) -> Option<Classified> {
     let text = String::from_utf8_lossy(raw);
     let text = text.trim_end();
@@ -95,11 +90,11 @@ fn classify(raw: &[u8], fallback: Severity) -> Option<Classified> {
 
 /// Re-emits one line of sidecar output as a host `tracing` event.
 ///
-/// The sidecar's JSON log lines carry their own severity, so a sidecar `WARN`
-/// surfaces as a host `WARN` regardless of which pipe it arrived on (Go's
-/// `slog` writes to stderr by default, so without this everything would land
-/// at the stderr fallback level). Lines that are not the expected JSON —
-/// panics, Go runtime messages — are forwarded verbatim at `fallback`.
+/// The sidecar's JSON lines carry their own severity, so a sidecar `WARN`
+/// surfaces as a host `WARN` regardless of the pipe it arrived on (Go's `slog`
+/// writes to stderr by default, so without this everything would land at the
+/// stderr fallback). Non-JSON lines (panics, runtime messages) forward verbatim
+/// at `fallback`.
 pub(super) fn forward_sidecar_line(raw: &[u8], fallback: Severity) {
     let Some((severity, msg, extra)) = classify(raw, fallback) else {
         return;

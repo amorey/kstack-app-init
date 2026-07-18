@@ -40,10 +40,10 @@ func (c *noopController[Spec, Status]) Reconcile(context.Context, beehive.Contro
 	return beehive.Result{}, nil
 }
 
-// fakeCoreController satisfies the coreController seam so the white-box service
-// test can assert the out-of-band dispatch (RetryConnection → Reprobe) without a
-// real, network-touching ClusterCoreController. StartBackground/StopBackground are
-// no-ops; Reprobe records the ids it was handed.
+// fakeCoreController satisfies the coreController seam so the service test can assert
+// the out-of-band dispatch (RetryConnection → Reprobe) without a network-touching
+// ClusterCoreController. StartBackground/StopBackground are no-ops; Reprobe records the
+// ids it was handed.
 type fakeCoreController struct{ reprobed []ClusterID }
 
 func (f *fakeCoreController) StartBackground()     {}
@@ -82,9 +82,9 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterSta
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })
 
-	// Shut the cache manager down before the test ends so its SQLite connection
-	// pools are closed and TempDir cleanup can remove the .db files — on Windows
-	// an open file can't be unlinked, so a leaked pool fails the TempDir RemoveAll.
+	// Shut the cache manager down before the test ends so its SQLite pools close and
+	// TempDir cleanup can remove the .db files — on Windows an open file can't be
+	// unlinked, so a leaked pool fails the TempDir RemoveAll.
 	cacheManager := store.NewManager(t.TempDir())
 	t.Cleanup(func() { _ = cacheManager.Shutdown(context.Background()) })
 
@@ -94,9 +94,8 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterSta
 		cacheManager: cacheManager,
 		connMgr:      NewConnectionManager(),
 		coreCtrl:     &fakeCoreController{},
-		// A short (but non-zero) debounce keeps the per-step watch tests fast while
-		// still exercising the coalescing path (TestServiceClusterDataKindsWatch...
-		// Coalesces overrides it to a window it can pack multiple pings into).
+		// A short non-zero debounce keeps the watch tests fast while still exercising
+		// the coalescing path (the Coalesces test overrides it to a wider window).
 		dataKindsDebounce: 5 * time.Millisecond,
 	}, coreCC, cacheCC
 }
@@ -167,10 +166,9 @@ func TestServiceListAndGet(t *testing.T) {
 	assert.Nil(t, missing)
 }
 
-// WatchCaches streams each ClusterCache standalone (no parent join): the snapshot
-// carries an Added change per cache with its parent ClusterID resolved from the owner
-// edge, its ServerUID, and its joined sync status. Active-ness is a client-side join,
-// so it is deliberately not asserted here.
+// WatchCaches streams each ClusterCache standalone: the snapshot carries an Added
+// change per cache with its parent ClusterID resolved from the owner edge, its
+// ServerUID, and its sync status. Active-ness is a client-side join, not asserted here.
 func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -252,10 +250,9 @@ func TestServiceSetSyncEnabled(t *testing.T) {
 	assert.False(t, obj.Spec.SyncEnabled)
 }
 
-// RetryConnection dispatches an out-of-band re-probe to the controller without
-// mutating the spec. The harness wires a fakeCoreController, so we pin both that
-// the dispatch reaches Reprobe and that the spec is untouched; an unknown id
-// errors before any dispatch.
+// RetryConnection dispatches an out-of-band re-probe without mutating the spec. Via the
+// fakeCoreController we pin that the dispatch reaches Reprobe and the spec is untouched;
+// an unknown id errors before any dispatch.
 func TestServiceRetryConnectionDoesNotMutateSpec(t *testing.T) {
 	ctx := context.Background()
 	s, _, _ := newServiceTest(t)
@@ -285,10 +282,9 @@ func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	const uid = "kube-system-uid"
 	cacheID := seedActiveCache(t, s, coreCC, id, uid)
 
-	// cacheCtrl is nil in this white-box harness, so ClearCache deletes the
-	// on-disk cache (a no-op here — none exists on disk) and returns the record
-	// without restarting an engine. The engine-restart path is covered in
-	// cache_controller_test.go.
+	// cacheCtrl is nil in this harness, so ClearCache deletes the on-disk cache (a no-op
+	// here) and returns the record without restarting an engine. The engine-restart path
+	// is covered in cache_controller_test.go.
 	c, err := s.ClearCache(ctx, id)
 	require.NoError(t, err)
 	require.NotNil(t, c)
@@ -364,10 +360,10 @@ func recvKindChange(t *testing.T, ch <-chan ClusterDataKindChange) ClusterDataKi
 	}
 }
 
-// ClusterDataKindsWatch streams the active cache's kind catalog as a delta watch:
-// the current catalog as an Added burst on subscribe, then one Added/Modified/Deleted
-// change per kind as the sync engine writes objects and pings the store. This is what
-// makes the dashboard resource nav (kinds + live per-kind counts) update in real time.
+// ClusterDataKindsWatch streams the active cache's kind catalog as a delta watch: the
+// current catalog as an Added burst on subscribe, then Added/Modified/Deleted per kind
+// as the sync engine writes objects and pings the store — what makes the dashboard
+// resource nav (kinds + live counts) update in real time.
 func TestServiceClusterDataKindsWatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -409,8 +405,8 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 	assert.Equal(t, ChangeAdded, snap1.Type)
 	assert.Equal(t, "Deployment", snap1.Kind.Kind)
 	assert.Equal(t, 1, snap1.Kind.Count)
-	// Every frame carries its own cache's id as provenance, so a client can reject a
-	// late frame from a superseded cache after a cache/context switch.
+	// Every frame carries its cache's id as provenance, so a client can reject a late
+	// frame from a superseded cache after a cache/context switch.
 	assert.Equal(t, ClusterCacheID(cacheID), snap1.CacheID)
 	snap2 := recvKindChange(t, ch)
 	assert.Equal(t, ChangeAdded, snap2.Type)
@@ -453,9 +449,9 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 }
 
 // A burst of write pings within one debounce window collapses into a single catalog
-// re-read, so a high-churn cluster doesn't re-run KindCatalog's whole-index count-join
-// per object event. If the pings weren't coalesced the first post-burst frame would
-// carry an intermediate count; coalesced, it jumps straight to the final one.
+// re-read, so a high-churn cluster doesn't re-run the count-join per object event.
+// Un-coalesced, the first post-burst frame would carry an intermediate count; coalesced,
+// it jumps straight to the final one.
 func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -493,8 +489,8 @@ func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
 	require.Equal(t, ChangeAdded, snap.Type)
 	require.Equal(t, 1, snap.Kind.Count)
 
-	// Three writes + pings back-to-back, all inside the 100ms window. The store's
-	// cap-1 Subscribe channel plus the debounce collapse them into one re-read.
+	// Three writes + pings back-to-back inside the 100ms window; the store's cap-1
+	// Subscribe channel plus the debounce collapse them into one re-read.
 	insertObj("d2")
 	cdb.Notify()
 	insertObj("d3")
@@ -547,10 +543,9 @@ func insertCatalogKind(t *testing.T, ctx context.Context, cdb *store.ClusterDB, 
 	require.NoError(t, err)
 }
 
-// A subscriber that opens the stream *before* the cache db is opened (the common
-// case for an unsynced cluster: the sync engine's discovery pass lands after the UI
-// subscribes) must bind to the cache when it opens and start streaming its catalog —
-// not miss it forever by binding once to the initial (nil) Lookup.
+// A subscriber that opens the stream before the cache db is opened (the common
+// unsynced-cluster case) must bind to the cache when it opens and start streaming its
+// catalog — not miss it forever by binding once to the initial (nil) Lookup.
 func TestServiceClusterDataKindsWatchBindsCacheOpenedAfterSubscribe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -582,10 +577,10 @@ func TestServiceClusterDataKindsWatchBindsCacheOpenedAfterSubscribe(t *testing.T
 	assert.Equal(t, "Deployment", ev.Kind.Kind)
 }
 
-// Clearing a cache closes the on-disk db and reopens a fresh one under the *same*
-// CacheID. The stream must rebind to the new handle and keep diffing — the emptied
-// catalog surfacing as Deletes and the rebuild as Adds — instead of ending silently
-// (which, with an unchanged cache id, the client would never resubscribe from).
+// Clearing a cache closes the on-disk db and reopens a fresh one under the same CacheID.
+// The stream must rebind to the new handle and keep diffing — the emptied catalog
+// surfacing as Deletes, the rebuild as Adds — instead of ending silently (which, with an
+// unchanged cache id, the client would never resubscribe from).
 func TestServiceClusterDataKindsWatchRebindsAfterCacheReplaced(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -623,10 +618,10 @@ func TestServiceClusterDataKindsWatchRebindsAfterCacheReplaced(t *testing.T) {
 	assert.Equal(t, "Node", add.Kind.Kind)
 }
 
-// A cache that closes and never reopens (a paused/cleared cache whose engine
-// doesn't restart) must reconcile the stream against an empty catalog — one Delete
-// per held kind — so the dashboard doesn't permanently retain the closed cache's
-// stale kinds while waiting for a reopen that never comes.
+// A cache that closes and never reopens (a paused/cleared cache whose engine doesn't
+// restart) must reconcile the stream against an empty catalog — one Delete per held kind
+// — so the dashboard doesn't retain the closed cache's stale kinds waiting for a reopen
+// that never comes.
 func TestServiceClusterDataKindsWatchEmitsDeletesOnCloseWithoutReopen(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -654,10 +649,10 @@ func TestServiceClusterDataKindsWatchEmitsDeletesOnCloseWithoutReopen(t *testing
 	assert.Equal(t, "Deployment", del.Kind.Kind)
 }
 
-// cacheRef resolves the *active* cache's on-disk locator: the directory id is the
-// ClusterID (the parent Cluster's beehive ObjectID), and the file id is the
-// ClusterCache for the cluster's currently-connected identity (its UID matches
-// Status.Server.UID). A cluster with no active cache resolves to found=false.
+// cacheRef resolves the active cache's on-disk locator: the directory id is the
+// ClusterID, the file id is the ClusterCache for the cluster's currently-connected
+// identity (UID matches Status.Server.UID). A cluster with no active cache resolves to
+// found=false.
 func TestServiceCacheRefResolvesActiveCache(t *testing.T) {
 	ctx := context.Background()
 	s, coreCC, _ := newServiceTest(t)
@@ -694,12 +689,11 @@ func TestServiceDeleteTombstonesCluster(t *testing.T) {
 	ctx := context.Background()
 	s, _, _ := newServiceTest(t)
 
-	// Seed with a finalizer so the soft-delete tombstone is observable without a
-	// race: beehive GC is a no-op while an object still holds a finalizer, so the
-	// deletion-pending row lingers deterministically. Without it, the kind's (noop)
-	// controller collects the finalizer-less, referrer-less row on the reconcile
-	// pass that Delete enqueues — and that physical delete races the Get
-	// below (passing locally, "object not found" under CI timing).
+	// Seed with a finalizer so the soft-delete tombstone is observable without a race:
+	// beehive GC is a no-op while an object holds a finalizer, so the deletion-pending
+	// row lingers deterministically. Without it, the noop controller collects the
+	// finalizer-less row on the reconcile Delete enqueues, and that physical delete
+	// races the Get below.
 	name := "alpha"
 	obj, err := s.coreClient.Create(ctx, ClusterSpec{
 		Name:        &name,
@@ -763,10 +757,9 @@ func TestServiceWatchEmitsSnapshotThenDeltas(t *testing.T) {
 	}
 }
 
-// fakeScheduleClient drives the schedule-watch wrapper with a channel the test
-// controls, so the mapping (beehive.Schedule → Schedule, zero → nil) and
-// the ctx lifecycle are exercised deterministically — beehive's own tests cover
-// the queue/gauge semantics behind the real WatchSchedule.
+// fakeScheduleClient drives the schedule-watch wrapper with a test-controlled channel,
+// so the mapping (beehive.Schedule → Schedule, zero → nil) and the ctx lifecycle are
+// exercised deterministically — beehive's own tests cover the queue/gauge semantics.
 type fakeScheduleClient struct{ ch chan beehive.Schedule }
 
 func (f *fakeScheduleClient) WatchSchedule(context.Context, beehive.ObjectID) (<-chan beehive.Schedule, error) {
@@ -874,11 +867,10 @@ func TestClusterScheduleWatchPublicSurface(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "stream should close on ctx cancel")
 }
 
-// The generic event reader maps beehive's coalesced runs to the domain Event
-// wire shape, newest-run-first, honoring the category filter and limit. beehive
-// coalesces consecutive same-(category,type,reason) occurrences into one run, so
-// a repeated reason bumps Count rather than adding a run, and a changed reason
-// starts a new run.
+// The generic event reader maps beehive's coalesced runs to the domain Event wire
+// shape, newest-run-first, honoring the category filter and limit. beehive coalesces
+// same-(category,type,reason) occurrences into one run, so a repeated reason bumps
+// Count and a changed reason starts a new run.
 func TestServiceEventsReadsTimeline(t *testing.T) {
 	ctx := context.Background()
 	s, coreCC, _ := newServiceTest(t)
@@ -931,10 +923,10 @@ func TestServiceEventsReadsTimeline(t *testing.T) {
 	assert.Equal(t, "ReasonB", limited[0].Reason)
 }
 
-// watchEvents streams bare runs (mirroring beehive's WatchEvents): the
-// on-subscribe snapshot replays existing runs, a repeated same-outcome occurrence
-// re-delivers the run with a bumped count under the same id (the consumer upserts),
-// and a changed reason delivers a fresh run with a distinct id.
+// watchEvents streams bare runs (mirroring beehive's WatchEvents): the snapshot replays
+// existing runs, a repeated same-outcome occurrence re-delivers the run with a bumped
+// count under the same id (the consumer upserts), and a changed reason delivers a fresh
+// run with a distinct id.
 func TestServiceWatchEventsStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -988,10 +980,9 @@ func TestServiceWatchEventsStream(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "stream should close on ctx cancel")
 }
 
-// The kind-scoped public surface (ClusterEvents / ClusterEventsWatch) is reached
-// through the ClusterService interface — it delegates to the generic reader/watch
-// against the Cluster kind client. Asserting via the interface value locks the
-// public API shape, not just the concrete method.
+// The kind-scoped public surface (ClusterEvents / ClusterEventsWatch), reached through
+// the ClusterService interface, delegates to the generic reader/watch against the
+// Cluster kind client. Asserting via the interface value locks the public API shape.
 func TestClusterEventsPublicSurface(t *testing.T) {
 	ctx := t.Context()
 	s, coreCC, _ := newServiceTest(t)
@@ -1025,11 +1016,10 @@ func TestClusterEventsPublicSurface(t *testing.T) {
 	assert.Equal(t, "ReasonB", e.Reason)
 }
 
-// ClusterCacheEvents / ClusterCacheEventsWatch are the ClusterCache-kind
-// counterparts of the Cluster-kind entrypoints: same generic reader/watch, but
-// against the cache client and keyed by the ClusterCache's own ObjectID (the
-// sync-event timeline the cache controller writes under category "sync"). Asserting
-// via the ClusterService interface value locks the public API shape.
+// ClusterCacheEvents / ClusterCacheEventsWatch are the ClusterCache-kind counterparts:
+// same generic reader/watch, but against the cache client and keyed by the
+// ClusterCache's own ObjectID (the sync-event timeline under category "sync"). Asserting
+// via the interface value locks the public API shape.
 func TestClusterCacheEventsPublicSurface(t *testing.T) {
 	ctx := t.Context()
 	s, coreCC, cacheCC := newServiceTest(t)

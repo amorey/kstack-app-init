@@ -34,25 +34,22 @@ export type UseWatchSubscriptionResponse<Result, Variables extends AnyVariables>
   Base<Result, Variables>[1],
 ];
 
-// The app-wide replacement for urql's `useSubscription`. It owns the
-// transport-reset + connection-status contract: the exchange publishes each
-// subscription's connection lifecycle on the transport-status side-channel
-// (keyed by the operation key), and this hook renders it as `connected` and,
-// crucially, resets its accumulator across a reconnect *without* a synthetic
-// data frame — so `data` is only ever real GraphQL data.
+// The app-wide wrapper over urql's `useSubscription`. The exchange publishes each
+// subscription's connection lifecycle on the transport-status side-channel (keyed
+// by the operation key); this hook renders it as `connected` and resets its
+// accumulator across a reconnect without a synthetic data frame — so `data` is
+// only ever real GraphQL data.
 //
-// The reset is generation-gated two ways, both keyed off the same generation so
-// they're idempotent regardless of whether the side-channel notify or the sink
-// frame lands first:
-//   - the reducer folds a frame onto `undefined` (fresh) whenever the live
-//     generation differs from the accumulator's tag — the non-empty reconnect,
-//   - and the exposed `data` is masked to `undefined` whenever the accumulator's
-//     tag is stale — the empty-snapshot reconnect and the window between a
-//     connection's `open` and its first frame (so a spinner keyed on
-//     `data === undefined` distinguishes "connecting" from "connected, empty").
+// The reset is generation-gated two ways, both off the same generation so they're
+// idempotent whichever of the side-channel notify / sink frame lands first:
+//   - the reducer folds a frame onto `undefined` when the live generation differs
+//     from the accumulator's tag (the non-empty reconnect);
+//   - the exposed `data` is masked to `undefined` when the accumulator's tag is
+//     stale (the empty-snapshot reconnect, and the window between `open` and the
+//     first frame — so a spinner keyed on `data === undefined` tells "connecting"
+//     from "connected, empty").
 //
-// Every subscription must go through this hook; reducers then hold only domain
-// logic.
+// Every subscription goes through this hook; reducers then hold only domain logic.
 export function useWatchSubscription<Data, Result, Variables extends AnyVariables = AnyVariables>(
   args: UseSubscriptionArgs<Variables, Data>,
   reduce: (prev: Result | undefined, data: Data) => Result,

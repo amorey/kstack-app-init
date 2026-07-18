@@ -80,9 +80,9 @@ const flush = async () => {
   await Promise.resolve();
 };
 
-// Subscribe and collect every delivered `tick` — the reset signal no longer
-// rides the sink (it's on the transport-status side-channel), so `data` here is
-// only ever real GraphQL data.
+// Subscribe and collect every delivered `tick`. The reset signal rides the
+// transport-status side-channel, not the sink, so `data` here is only ever real
+// GraphQL data.
 function start() {
   const client = makeClient();
   const seen: number[] = [];

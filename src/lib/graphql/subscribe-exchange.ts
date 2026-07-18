@@ -18,14 +18,12 @@ import { subscriptionExchange } from 'urql';
 import { errorMessage, reportError } from '../error-bus';
 import { clearStatus, markConnected, markDisconnected } from './transport-status';
 
-// Mirrors the JSON envelopes the Rust bridge writes into the channel. `open`
-// is emitted once, before any `next`, when the SSE connection is actually
-// established (the sidecar returned 200) — the signal this file marks the op
-// connected on (see below).
+// Mirrors the JSON envelopes the Rust bridge writes into the channel. `open` is
+// emitted once, before any `next`, when the SSE connection is established (the
+// sidecar returned 200) — the signal this file marks the op connected on.
 // `complete` is the server's own graceful end (gqlgen's `event: complete`);
 // `closed` is synthesized by the host when the connection ends without one
-// (sidecar crash, sleep, network loss). Both reconnect — see below — but only
-// `closed` reports.
+// (sidecar crash, sleep, network loss). Both reconnect, but only `closed` reports.
 type SubMessage =
   | { type: 'open' }
   | { type: 'next'; payload: { data?: unknown; errors?: unknown } }
@@ -46,64 +44,54 @@ const dropOp = (id: number) => {
   invoke('graphql_unsubscribe', { id }).catch(() => undefined);
 };
 
-// Bridges urql's subscriptionExchange to the Tauri host's
-// `graphql_subscribe` / `graphql_unsubscribe` invoke commands. Each
-// subscription is streamed over its own host-side SSE connection to the
-// sidecar (see src-tauri/src/services/sidecar/graphql/subscribe.rs); the host
-// translates the SSE frames into the `next`/`complete`/`error` channel
-// envelopes this file consumes.
+// Bridges urql's subscriptionExchange to the Tauri host's `graphql_subscribe` /
+// `graphql_unsubscribe` invoke commands. Each subscription streams over its own
+// host-side SSE connection to the sidecar (see
+// src-tauri/src/services/sidecar/graphql/subscribe.rs); the host translates the
+// SSE frames into the channel envelopes this file consumes.
 //
-// The transport dies silently on sleep/network loss: the host's SSE stream
-// ends and the channel emits `complete` (or `error`). urql would treat that as
-// the subscription finishing — collapsing it with no reconnect. This app's
-// subscriptions (settingsWatch/syncStatusWatch) are long-lived and never
+// The transport dies silently on sleep/network loss: the SSE stream ends and the
+// channel emits `complete` (or `error`), which urql would treat as the
+// subscription finishing. This app's subscriptions are long-lived and never
 // legitimately complete, so a transport-end while the consumer is still
-// subscribed is reconnected with capped exponential backoff. Only a
-// consumer-initiated teardown actually ends the subscription.
+// subscribed reconnects with capped exponential backoff. Only a consumer-initiated
+// teardown actually ends the subscription.
 //
-// Because a reconnect is invisible to urql (the operation and its accumulated
-// `useSubscription` state survive), the connection lifecycle is published out
+// A reconnect is invisible to urql (the operation and its accumulated
+// `useSubscription` state survive), so the connection lifecycle is published out
 // of band on the transport-status side-channel (transport-status.ts), keyed by
-// `operation.key`: `markConnected` on every `open` (which also bumps a
-// generation), `markDisconnected` on every drop. useWatchSubscription reads it
-// to (1) expose `connected`, and (2) reset its accumulator when the generation
-// changes — so the reset signal no longer rides the data channel as a synthetic
-// frame, and `data` is only ever real GraphQL data. The sidecar replays a full
-// snapshot on every subscribe, so a delta reducer that starts over on the
-// generation bump ends up holding exactly the current server state — an object
-// deleted during an outage, which the replay simply omits, can't linger.
+// `operation.key`: `markConnected` on every `open` (bumping a generation),
+// `markDisconnected` on every drop. useWatchSubscription reads it to expose
+// `connected` and to reset its accumulator when the generation changes. The
+// sidecar replays a full snapshot on every subscribe, so a delta reducer that
+// starts over on the generation bump ends up holding exactly the current server
+// state — an object deleted during an outage can't linger.
 //
-// The generation bumps on the host's `open` frame, which arrives once per
-// connection ahead of the snapshot: it fires on a real connection (even an
-// empty snapshot, which replays no `next`), but *not* on a failed dial — the
-// host acks `graphql_subscribe` before it dials, then reports a connect failure
-// as an `error` frame, so bumping on the ack would wrongly reset last-known
-// state on every failed retry during an outage. Both the status notify and the
-// data frames are driven off this one ordered channel, and the hook's reset is
-// generation-gated (idempotent), so no frame can outrace the reset.
+// The generation bumps on the `open` frame, not the `graphql_subscribe` ack: the
+// host acks before it dials, then reports a connect failure as an `error` frame,
+// so bumping on the ack would wrongly reset last-known state on every failed
+// retry during an outage. `open` fires on a real connection (even an empty
+// snapshot). Status notify and data frames share this one ordered channel and the
+// hook's reset is generation-gated (idempotent), so no frame can outrace the reset.
 //
-// An `error` frame is now transport-level only: gqlgen's SSE transport delivers
-// GraphQL operation errors inside the `next` payload's `errors` field, so the
-// host emits `error` solely when the connection itself fails (dial/handshake/
-// non-200). It's treated the same as a transport drop (reconnect, not
-// `sink.error`) on purpose: the only subscriptions here are the engine-backed
-// settings/sync watches, and such a failure is almost always transient (the
-// always-on engine + credential pusher re-establish auth/upstream). Surfacing
-// it terminally would also kill the very stream that recovery flows through.
+// An `error` frame is transport-level only: gqlgen delivers GraphQL operation
+// errors inside the `next` payload's `errors` field, so the host emits `error`
+// only when the connection itself fails (dial/handshake/non-200). It reconnects
+// rather than calling `sink.error`: such failures are almost always transient
+// (the always-on engine + credential pusher re-establish auth/upstream), and
+// surfacing it terminally would kill the very stream recovery flows through.
 //
-// Every transport end reconnects, but they split on *reporting*. `closed`
-// (EOF/read failure) and `error` (failed dial) are abnormal and report to the
-// error bus; `complete` — the server's own graceful end — reconnects silently.
-// A server can complete a long-lived watch legitimately (sidecar shutdown, and
-// chat's finite stream completes after every response), so `complete` must
-// neither banner nor end the urql operation: if the sidecar really went away,
-// the reconnect's failed dial produces the `error` that reports; if it's chat,
-// the consumer's pause tears the subscription down before the retry fires.
+// Every transport end reconnects but they split on *reporting*: `closed`
+// (EOF/read failure) and `error` (failed dial) report to the error bus;
+// `complete` — the server's own graceful end — reconnects silently. A server can
+// complete legitimately (sidecar shutdown; chat's finite stream after each
+// response), so `complete` must neither banner nor end the urql operation: if the
+// sidecar really went away, the reconnect's failed dial produces the reporting
+// `error`; if it's chat, the consumer's pause tears the subscription down first.
 export const tauriSubscriptionExchange = subscriptionExchange({
   // urql calls this with `(request, operation)`: `request` carries the printed
-  // query + variables, `operation` carries the stable `key` we stamp transport
-  // status under (the same key the client's operation — and useWatchSubscription
-  // — derive from query+variables).
+  // query + variables, `operation` the stable `key` we stamp transport status
+  // under (the same key useWatchSubscription derives from query+variables).
   forwardSubscription(request, operation) {
     return {
       subscribe(sink) {
@@ -111,12 +99,10 @@ export const tauriSubscriptionExchange = subscriptionExchange({
         let cancelled = false;
         let opId: number | null = null;
         let attempt = 0;
-        // Whether the current outage has already been reported. Separate from
-        // `attempt` (the backoff level) because the two reset on different
-        // proofs: backoff resets on `open` (the dial succeeded, so the next
-        // drop is a fresh outage that deserves a prompt retry), while the
-        // report gate resets only on `next` (a healthy *data* frame) — a
-        // flapping server that 200s and immediately drops would otherwise
+        // Whether this outage has already been reported. Separate from `attempt`
+        // (the backoff level) because they reset on different proofs: backoff on
+        // `open` (dial succeeded), the report gate only on `next` (a healthy data
+        // frame). Otherwise a server that 200s then immediately drops would
         // re-report every cycle, flickering the auto-dismissing banner forever.
         let reportedOutage = false;
         let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -129,20 +115,15 @@ export const tauriSubscriptionExchange = subscriptionExchange({
           // "reconnecting" (it keeps its last-known data — the generation is
           // untouched until the next `open`).
           markDisconnected(key);
-          // Always dropOp before forgetting the id: most terminal paths
-          // (server-sent `complete`/`error`, fan_out_complete on WS drop)
-          // have the host already remove the entry, but the malformed-
-          // frame path leaves it live — graphql_unsubscribe is documented
-          // as tolerant of unknown ids, so this is a safe no-op when the
-          // host already cleared things up.
+          // Drop the op before forgetting the id. Most terminal paths have the
+          // host already remove the entry, but the malformed-frame path leaves
+          // it live — graphql_unsubscribe tolerates unknown ids, so this is a
+          // safe no-op either way.
           if (opId != null) dropOp(opId);
           opId = null;
-          // Report only the first abnormal drop of an outage. Backoff caps at
-          // 30s and the banner auto-dismisses after 5s, so reporting every
-          // retry would make it flicker forever while down. A healthy frame
-          // clears `reportedOutage`, so a fresh outage reports again. The
-          // banner is driven off the bus directly because the result no
-          // longer reaches the urql sink (errorReportExchange can't see it).
+          // Report only the first abnormal drop of an outage (a healthy frame
+          // clears the gate). Reported off the bus directly because the result
+          // never reaches the urql sink for errorReportExchange to see.
           if (report && !reportedOutage) {
             reportedOutage = true;
             reportError({ source: 'subscription', message, cause });
@@ -178,12 +159,10 @@ export const tauriSubscriptionExchange = subscriptionExchange({
               return;
             }
             if (msg.type === 'open') {
-              // The connection is up and the snapshot is about to stream. Mark
-              // the op connected (bumping its generation), so the hook resets
-              // its accumulator before the reconnect's snapshot folds in. The
-              // dial succeeded, so backoff starts over — without this, an
-              // outage recovered by an *empty*-snapshot connection (no `next`
-              // ever comes) would leave the next drop at the 30s cap.
+              // Connection up, snapshot about to stream. Mark connected (bumping
+              // the generation) so the hook resets before the snapshot folds in.
+              // Reset backoff too: the dial succeeded, so a recovery via an empty
+              // snapshot (no `next` ever comes) mustn't leave the next drop capped.
               attempt = 0;
               markConnected(key);
             } else if (msg.type === 'next') {
@@ -211,9 +190,9 @@ export const tauriSubscriptionExchange = subscriptionExchange({
             channel,
           })
             .then((id) => {
-              // graphql_subscribe can resolve after the connection was
-              // already torn down/ended (it raced unsubscribe() or an
-              // error): the host registered an op nobody will read — drop it.
+              // graphql_subscribe can resolve after teardown/end (it raced
+              // unsubscribe() or an error): the host registered an op nobody
+              // will read — drop it.
               if (isStale()) {
                 dropOp(id);
               } else {

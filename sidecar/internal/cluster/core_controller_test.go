@@ -46,10 +46,10 @@ func errProbe(err error) ProbeFunc {
 	}
 }
 
-// mutableProbe returns a successful ProbeFunc whose reported kube-system UID can be
-// changed between reconciles, so a test can simulate a physical-cluster migration: the
-// same kube-context now resolving to a different cluster identity. The read is
-// mutex-guarded because the controller probes from its own goroutine.
+// mutableProbe returns a successful ProbeFunc whose reported kube-system UID can change
+// between reconciles, so a test can simulate a migration (the same kube-context now
+// resolving to a different identity). The read is mutex-guarded because the controller
+// probes from its own goroutine.
 func mutableProbe(initial string) (ProbeFunc, func(string)) {
 	var mu sync.Mutex
 	uid := initial
@@ -63,9 +63,8 @@ func mutableProbe(initial string) (ProbeFunc, func(string)) {
 }
 
 // waitForCacheBySlug blocks until a ClusterCache with the given slug exists, then
-// returns it (or fails on timeout). It is event-driven over WatchList — current-on-
-// subscribe, then live deltas — so it observes a cache that exists already as well as
-// one created after the subscribe (the first Added carrying the slug), with no polling.
+// returns it (or fails on timeout). Event-driven over WatchList, so it observes a cache
+// that exists already as well as one created after the subscribe, with no polling.
 func waitForCacheBySlug(t *testing.T, cl beehive.Client[ClusterCacheSpec, ClusterCacheStatus], slug string) *beehive.Object[ClusterCacheSpec, ClusterCacheStatus] {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -95,10 +94,9 @@ func staticCheck(phase HealthPhase) CheckFunc {
 	}
 }
 
-// signalingProbe returns a successful ProbeFunc that signals every invocation on
-// the returned channel, so a test can wait on the probe event instead of polling
-// a counter. The send is non-blocking (buffered + select/default) so a slow
-// reader can never stall the controller's reconcile.
+// signalingProbe returns a successful ProbeFunc that signals every invocation on the
+// returned channel, so a test can wait on the probe event instead of polling. The send
+// is non-blocking, so a slow reader can't stall the controller's reconcile.
 func signalingProbe() (ProbeFunc, chan struct{}) {
 	ch := make(chan struct{}, 16)
 	probe := func(context.Context, *rest.Config) (ClusterServer, ClusterPrincipal, error) {
@@ -262,13 +260,11 @@ func TestClusterCoreControllerSuccessfulProbeWritesConditions(t *testing.T) {
 	assert.Equal(t, uid, cacheObj.Spec.ServerUID, "cache spec records the identity it mirrors")
 }
 
-// TestClusterCoreControllerUIDSwitchPrunesSupersededCache verifies the server-UID
-// switch behavior: when a probe reports a new kube-system UID (the kube-context now
-// points at a different physical cluster), the controller creates a cache for the new
-// identity and requests deletion of the superseded one — while the Cluster's own id
-// (its beehive ObjectID) stays consistent. The old cache is held in a deletion-pending
-// state by its finalizer (the NoopController here never clears it), which is exactly
-// what gates the cache controller's on-disk file cleanup in production.
+// TestClusterCoreControllerUIDSwitchPrunesSupersededCache verifies that when a probe
+// reports a new kube-system UID, the controller creates a cache for the new identity
+// and requests deletion of the superseded one, while the Cluster's own ObjectID stays
+// consistent. The old cache is held deletion-pending by its finalizer (the
+// NoopController never clears it), which is what gates the file cleanup in production.
 func TestClusterCoreControllerUIDSwitchPrunesSupersededCache(t *testing.T) {
 	w := NewStaticWatcher(t, testKubeConfig("alpha"))
 	probe, setUID := mutableProbe("uid-old")
@@ -464,9 +460,9 @@ func TestClusterCoreControllerProbeFailureDeletesFromConnectionManager(t *testin
 	// Wait for the first reconcile (failed probe) to land its Connected condition.
 	waitCondition(t, coreClient, obj.ID, ConditionConnected)
 
-	// Pre-seed a stale entry, then force a fresh reconcile (a spec edit bumps
-	// generation) so the probe-failure path runs again with the seed in place —
-	// seeding before this second reconcile is what makes the clear observable.
+	// Pre-seed a stale entry, then force a fresh reconcile (a spec edit bumps generation)
+	// so the probe-failure path runs again with the seed in place — which is what makes
+	// the clear observable.
 	connMgr.Set(id, &rest.Config{Host: "https://stale"})
 	renamed := eligibleSpec("alpha")
 	name := "renamed"
@@ -605,10 +601,10 @@ func TestClusterCoreControllerReprobeOne(t *testing.T) {
 	awaitProbe(t, probeCh)
 }
 
-// WatchProbe streams the in-flight probe state per cluster: current-on-subscribe
-// (a mid-probe subscriber sees true), then one value per transition, filtered to
-// the subscribed id. This exercises the hub directly (setProbing is what converge
-// calls around the network probe), so no beehive/network is needed.
+// WatchProbe streams the in-flight probe state per cluster: current-on-subscribe (a
+// mid-probe subscriber sees true), then one value per transition, filtered to the
+// subscribed id. Exercises the hub directly via setProbing, so no beehive/network is
+// needed.
 func TestClusterCoreControllerWatchProbe(t *testing.T) {
 	var coreClient beehive.Client[ClusterSpec, ClusterStatus]
 	var cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
@@ -654,10 +650,9 @@ func TestClusterCoreControllerWatchProbe(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "stream closes on ctx cancel")
 }
 
-// The controller observes the kubeconfig live and writes it to status.Source.
-// Its watcher subscription re-reconciles on
-// a kubeconfig change, so a departed context flips IsPresent=false — keeping its
-// last-known names — and goes Inactive.
+// The controller observes the kubeconfig live and writes it to status.Source. Its
+// watcher subscription re-reconciles on a change, so a departed context flips
+// IsPresent=false — keeping its last-known names — and goes Inactive.
 func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
 	ctx := context.Background()
 	uid, ver, user := "u", "v1.31.0", "alice"
@@ -707,7 +702,7 @@ func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
 	assert.Equal(t, ReasonInactive, connected.Reason)
 }
 
-// Aggregation into runs and per-object retention are now beehive's (RecordEvent +
+// Aggregation into runs and per-object retention are beehive's (RecordEvent +
 // WithEventRetention), covered by its own tests; here we only pin the local
 // message-truncation helper.
 

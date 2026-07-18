@@ -25,13 +25,11 @@ import (
 )
 
 // IsGRPCRequest reports whether r is a gRPC call: HTTP/2 carrying the gRPC
-// content-type. This *is* the definition of "a gRPC request", so it lives here
-// beside the gRPC server rather than in whatever multiplexes the socket — the
-// composition root (internal/app) uses it in its h2c dispatcher to route HTTP/2
-// gRPC traffic to the gRPC server while HTTP/1.1 GraphQL (POSTs + SSE) falls
-// through. gRPC is
-// inherently HTTP/2, so the ProtoMajor check belongs in the predicate; requiring
-// the content-type too means a future HTTP/2 GraphQL client would not match.
+// content-type. This is the definition of "a gRPC request", so it lives beside
+// the gRPC server; the composition root (internal/app) uses it in its h2c
+// dispatcher to route gRPC traffic to the gRPC server while HTTP/1.1 GraphQL
+// (POSTs + SSE) falls through. Requiring the content-type too (not just HTTP/2)
+// means a future HTTP/2 GraphQL client still falls through.
 func IsGRPCRequest(r *http.Request) bool {
 	return r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
 }
@@ -49,9 +47,8 @@ type Server struct {
 }
 
 // NewServer registers AuthService and PokeService on a fresh *grpc.Server bound
-// to a serving context it owns. The webview never reaches gRPC (h2c routes it to
-// the host's tray); nil authSvc/pokeSvc keeps every method safe, mirroring the
-// GraphQL resolver nil-guards.
+// to a serving context it owns. nil authSvc/pokeSvc keeps every method safe
+// (degraded).
 func NewServer(authSvc auth.Service, pokeSvc *poke.Service) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	srv, drainStreams := newServer(ctx, authSvc, pokeSvc)
@@ -82,21 +79,18 @@ func (s *Server) DrainWithContext(ctx context.Context) error {
 func (s *Server) Stop() { s.grpc.Stop() }
 
 // newServer returns a *grpc.Server with AuthService and PokeService registered,
-// plus a drainStreams func the shutdown sequence calls to gracefully close
-// streaming RPCs. NewServer wraps this with the lifecycle surface and owns the
-// serving context; this lower level stays separate only to keep that wiring
-// readable.
+// plus a drainStreams func the shutdown sequence uses to close streaming RPCs.
+// NewServer wraps this with the lifecycle surface; this level stays separate only
+// to keep that wiring readable.
 //
-// Shutdown is deliberately a two-step dance because grpc.Server.GracefulStop
-// panics on the ServeHTTP (h2c) path. On shutdown the caller: (1) cancels
-// servingCtx so every streaming handler (AuthStateWatch) returns nil — grpc then
-// writes its OK trailers and the client sees a clean stream end; (2) calls
-// drainStreams to block until those handlers have unwound, so the trailers are
-// flushed *before* Stop closes the transports.
+// Shutdown is a two-step dance because grpc.Server.GracefulStop panics on the
+// ServeHTTP (h2c) path: the caller (1) cancels servingCtx so every streaming
+// handler returns nil (grpc writes OK trailers, the client sees a clean end),
+// then (2) calls drainStreams to wait for those handlers to unwind so the
+// trailers flush before Stop closes the transports.
 //
 // The keepalive ping keeps an idle AuthStateWatch stream's h2c connection alive
-// under the HTTP server's 60s IdleTimeout (an idle session can sit unchanged for
-// far longer than that).
+// under the HTTP server's 60s IdleTimeout.
 func newServer(servingCtx context.Context, authSvc auth.Service, pokeSvc *poke.Service) (srv *grpc.Server, drainStreams func()) {
 	var streams sync.WaitGroup
 	srv = grpc.NewServer(grpc.KeepaliveParams(keepalive.ServerParameters{

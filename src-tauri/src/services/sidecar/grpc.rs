@@ -17,17 +17,16 @@
 //! section, and the resync poke).
 //!
 //! gRPC needs HTTP/2; GraphQL stays HTTP/1.1. Both share the one socket via
-//! **h2c** — the sidecar's `NewH2CHandler` routes HTTP/2 `application/grpc`
-//! requests to its gRPC server and everything else to GraphQL. tonic dials our
-//! cross-platform [`ipc::Stream`] (UDS / named pipe, *not* TCP) through a
-//! custom [`tower::service_fn`] connector, speaking HTTP/2 with prior
-//! knowledge (no TLS/ALPN — the socket is already user-restricted). The
-//! connector reuses [`ipc::connect`], so it inherits the same capped-backoff
-//! dial retry the GraphQL client gets.
+//! **h2c** — the sidecar's `NewH2CHandler` routes HTTP/2 `application/grpc` to
+//! its gRPC server and everything else to GraphQL. tonic dials our cross-platform
+//! [`ipc::Stream`] (UDS / named pipe, not TCP) through a custom
+//! [`tower::service_fn`] connector, speaking HTTP/2 with prior knowledge (no
+//! TLS/ALPN — the socket is user-restricted). The connector reuses
+//! [`ipc::connect`], inheriting its capped-backoff dial retry.
 //!
-//! Unlike the per-call HTTP/1 GraphQL client, a tonic [`Channel`] is cheap to
-//! clone and multiplexes many RPCs over one h2 connection, so [`GrpcClient`]
-//! holds a lazily-established channel and re-dials only if it's lost.
+//! A tonic [`Channel`] is cheap to clone and multiplexes many RPCs over one h2
+//! connection, so [`GrpcClient`] holds a lazily-established channel and re-dials
+//! only if it's lost.
 
 use hyper_util::rt::TokioIo;
 use tokio::sync::Mutex;
@@ -37,13 +36,13 @@ use tower::service_fn;
 use super::ipc::{self, Endpoint};
 use crate::error::{AppError, Result};
 
-// The generated bindings for proto/auth.proto (see build.rs). The module name
-// matches the proto `package`.
+// Generated bindings for proto/auth.proto (see build.rs); module name matches
+// the proto `package`.
 pub mod auth {
     tonic::include_proto!("auth");
 }
 
-// The generated bindings for proto/poke.proto.
+// Generated bindings for proto/poke.proto.
 pub mod poke {
     tonic::include_proto!("poke");
 }
@@ -66,8 +65,8 @@ pub type AuthStateStream = tonic::Streaming<AuthState>;
 /// [`GrpcClient::new`]; reach the RPCs through [`SidecarService`](super::SidecarService).
 pub struct GrpcClient {
     endpoint: Endpoint,
-    // Cached across calls; `None` until the first successful dial. Guarded so
-    // concurrent callers share one channel instead of each opening their own.
+    // `None` until the first successful dial. Guarded so concurrent callers share
+    // one channel instead of each opening their own.
     channel: Mutex<Option<Channel>>,
 }
 

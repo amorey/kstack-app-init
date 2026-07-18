@@ -104,14 +104,13 @@ pub fn win_connectivity_is_online(level: i32) -> bool {
 /// Consumes raw events from `rx`, applies edge detection + trailing-edge
 /// debounce, and calls `poke` once per burst.
 ///
-/// On a triggering edge the trailing timer is (re)armed to `window` from *now*;
-/// when it elapses with no further trigger, `poke().await` runs once. Additional
-/// triggers inside the window collapse into the single pending poke.
+/// A triggering edge (re)arms the trailing timer to `window` from now; when it
+/// elapses with no further trigger, `poke().await` runs once. Triggers inside the
+/// window collapse into the single pending poke.
 ///
 /// Returns when `shutdown` is cancelled (a pending poke is dropped — the
-/// sidecar's wall-clock detector is the backstop) or when every sender has been
-/// dropped (`rx` closed). `poke` is a closure, so the core needs no trait and no
-/// `async-trait` dependency.
+/// sidecar's wall-clock detector is the backstop) or when every sender drops
+/// (`rx` closed). `poke` is a closure, so the core needs no `async-trait`.
 pub async fn run_coalescer<F, Fut>(
     mut rx: Receiver<RawEvent>,
     window: Duration,

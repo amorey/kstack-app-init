@@ -143,11 +143,10 @@ func (u *cancelWatchUpstream) Update(_ context.Context, p prefs.Settings) (prefs
 	return p, nil
 }
 
-// Poke inversion: cloud observes the auth session and pokes its own engine,
-// rather than auth reaching into the settings-sync engine. Signing out via the
-// auth service must therefore tear down the
-// already-open, previously-authenticated watch (otherwise it could keep
-// delivering cloud events that mutate local prefs after sign-out).
+// cloud observes the auth session and pokes its own engine (auth never reaches
+// into the settings-sync engine), so signing out via the auth service must tear
+// down the already-open, previously-authenticated watch — otherwise it could keep
+// delivering cloud events that mutate local prefs after sign-out.
 func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 	authSvc := signedInFakeAuth()
 

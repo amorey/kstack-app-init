@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The render site for the app's overlay dialogs. Mounted once in AppLayout,
-// above the sidebar, so an open dialog survives the sidebar card unmounting when
-// the window auto-collapses below the md breakpoint. Only the *mounted* dialog is
-// rendered — each dialog's hooks and subscriptions cost nothing until it's opened
-// — so the registry scales as we add more. The mount lifecycle (open, linger for
-// the exit animation, then unmount) lives in `DialogProvider`; this host just
-// renders whatever it says is mounted. Register a dialog by adding a line to
-// `DIALOGS` (and a `DialogId` variant).
+// The render site for the app's overlay dialogs. Mounted once in AppLayout, above
+// the sidebar, so an open dialog survives the sidebar card unmounting when the
+// window auto-collapses below the md breakpoint. Only the *mounted* dialog is
+// rendered — each dialog's hooks and subscriptions cost nothing until opened. The
+// mount lifecycle (open, linger for the exit animation, then unmount) lives in
+// `DialogProvider`; this host just renders whatever it says is mounted. Register a
+// dialog by adding a line to `DIALOGS` (and a `DialogId` variant).
 import type { ComponentType } from 'react';
 
 import { ClusterSyncPanel } from '@/components/widgets/cluster-sync-panel';

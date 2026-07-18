@@ -12,31 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The app's theming controller. It owns two orthogonal axes; today only the first
-// exists, but the module is deliberately structured so the second slots in without
-// reworking the first:
+// The app's theming controller, structured around two orthogonal axes so the second
+// slots in later without reworking the first:
 //
 //   1. Color scheme — the user picks a `ColorSchemePreference` (`system`/`light`/
-//      `dark`, *when* the app is dark), which resolves to a concrete `ColorScheme`
-//      (`light`/`dark`; system defers to `prefers-color-scheme`). The resolved
-//      scheme is mirrored onto `<html>` as the `.dark` class Tailwind's dark variant
-//      keys on (`@custom-variant dark` in `index.css`; `@kubetail/ui` ships the
-//      `.dark` token overrides, and `index.css` paints the document background from
-//      the scheme's token).
-//   2. Theme (skin) — the named palette used *within* a resolved scheme (e.g. a
-//      light skin "github-light", a dark skin "catppuccin-mocha"). Not built yet.
-//      When it lands it becomes a per-scheme choice (`{ light, dark }`) applied as
-//      a `data-theme` attribute alongside the `.dark` class — `resolveColorScheme`
-//      below is the seam: the resolved `ColorScheme` indexes the chosen skin
-//      (`themes[scheme]`). The word "theme" is reserved for that skin; the first
-//      axis is named "(color) scheme" throughout so the two never collide.
+//      `dark`), resolved to a concrete `ColorScheme` (system defers to
+//      `prefers-color-scheme`). The resolved scheme toggles the `.dark` class on
+//      `<html>` that Tailwind's dark variant keys on (`@custom-variant dark` in
+//      `index.css`; `@kubetail/ui` ships the `.dark` token overrides).
+//   2. Theme (skin) — the named palette used within a resolved scheme (e.g.
+//      "github-light"). Not built yet: it would be a per-scheme choice applied as a
+//      `data-theme` attribute, indexed by the resolved scheme (`resolveColorScheme`
+//      is the seam). "theme" is reserved for that skin; this axis is "(color) scheme".
 //
 // The preference is one field of the host's `host.json`, its source of truth (see
-// `lib/host-file.ts`, which owns the boot/change/sync protocol). Reading it at boot
-// is synchronous, so the first paint already carries the right scheme — the inline
-// script in `index.html` hand-mirrors `resolveColorScheme` against the same injected
-// global, and the host paints the window's *native* background from the same file,
-// covering the frame before the webview renders.
+// `lib/host-file.ts`, which owns the boot/change/sync protocol). It reads synchronously
+// at boot, so the first paint carries the right scheme — the inline script in
+// `index.html` hand-mirrors `resolveColorScheme` against the same injected global, and
+// the host paints the window's native background from the same file.
 import type { ReactNode } from 'react';
 import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 
@@ -67,8 +60,7 @@ function systemPrefersDark(): boolean {
 }
 
 // Resolve a preference to the concrete scheme to paint: "system" defers to the OS.
-// This is the seam for the future skin axis — the resolved scheme will index the
-// chosen per-scheme skin (`themes[scheme]`) to apply as `data-theme`.
+// The seam for the future skin axis (the resolved scheme would index the skin).
 export function resolveColorScheme(preference: ColorSchemePreference): ColorScheme {
   if (preference === 'system') return systemPrefersDark() ? 'dark' : 'light';
   return preference;
@@ -87,9 +79,8 @@ type ThemeContextValue = {
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
-// The theming provider. Owns the color-scheme preference today; the future skin
-// selection will live here too (hence the "Theme" umbrella name, distinct from the
-// scheme it currently exposes).
+// Owns the color-scheme preference; the future skin selection would live here too
+// (hence the "Theme" umbrella name, distinct from the scheme it exposes).
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [preference, setPreferenceState] = useState<ColorSchemePreference>(() => readInjectedPreference());
 
@@ -105,10 +96,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     return () => mql.removeEventListener('change', onChange);
   }, [preference]);
 
-  // Track the source of truth: the host broadcasts the merged `host.json` after
-  // every write, so a change made in any window (this one included — redundant
-  // but idempotent) lands here. An unrecognized value is ignored rather than
-  // reset, so a newer host format can't yank the scheme out from under us.
+  // Track the source of truth: the host broadcasts the merged `host.json` after every
+  // write, so a change made in any window (this one included — redundant but idempotent)
+  // lands here. An unrecognized value is ignored rather than reset, so a newer host
+  // format can't yank the scheme out from under us.
   useEffect(
     () =>
       subscribeHostFile((file) => {

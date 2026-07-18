@@ -12,21 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Linux native event sources for the wake/network-return → `Poke` driver.
+//! Linux native event sources for the wake/network-return → `Poke` driver. Both
+//! ride the system D-Bus bus via `zbus`:
 //!
-//! Both ride the **system** D-Bus bus via `zbus`:
+//! - **Wake**: systemd-logind's `PrepareForSleep(b)` — the `false` (resume) edge
+//!   forwards a [`RawEvent::Resumed`].
+//! - **Network**: NetworkManager's `StateChanged(u32)` (plus a one-time `State`
+//!   read to prime the baseline), mapped via [`core::nm_state_is_online`].
 //!
-//! - **Wake**: systemd-logind emits `PrepareForSleep(b)` — `true` just before
-//!   suspend, `false` just after resume. The `false` edge forwards a
-//!   [`RawEvent::Resumed`].
-//! - **Network**: NetworkManager emits `StateChanged(u32)` (and exposes a
-//!   `State` property we read once to prime the baseline). The state is mapped
-//!   to online/offline by [`core::nm_state_is_online`]; the core derives the
-//!   offline→online edge.
-//!
-//! Each source is a tokio task that selects on `shutdown` so app Quit tears it
-//! down cleanly (mirroring the tray supervisors). If the system bus or a service
-//! is unavailable, the source logs and exits — the other source plus the
+//! Each source is a tokio task that selects on `shutdown` for clean Quit. On bus
+//! or service unavailability it logs and exits — the other source and the
 //! sidecar's wall-clock detector still function.
 
 use futures_util::StreamExt;
@@ -36,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::core::{self, RawEvent};
 
-/// systemd-logind manager — just the `PrepareForSleep` signal we need.
+/// systemd-logind manager — just the `PrepareForSleep` signal.
 #[zbus::proxy(
     interface = "org.freedesktop.login1.Manager",
     default_service = "org.freedesktop.login1",
@@ -58,17 +53,14 @@ trait NetworkManager {
     #[zbus(signal)]
     fn state_changed(&self, state: u32) -> zbus::Result<()>;
 
-    // Named `nm_state` (D-Bus name kept as `State`) to avoid colliding with the
-    // `state_changed` signal above: zbus derives `receive_state_changed` for
-    // both a `state` property's change stream and a `state_changed` signal.
+    // Named `nm_state` (D-Bus name `State`) so it doesn't collide with the
+    // `state_changed` signal: zbus would derive `receive_state_changed` for both.
     #[zbus(property, name = "State")]
     fn nm_state(&self) -> zbus::Result<u32>;
 }
 
-/// Spawns the logind wake source and the NetworkManager network source.
-///
-/// `app` is unused on Linux (no main-thread registration needed); accepted to
-/// match the cross-platform `spawn_sources` shape.
+/// Spawns the logind wake source and the NetworkManager network source. `app` is
+/// unused (no main-thread registration); accepted to match the cross-platform shape.
 pub fn spawn_sources(_app: &AppHandle, tx: Sender<RawEvent>, shutdown: CancellationToken) {
     let wake_tx = tx.clone();
     let wake_shutdown = shutdown.clone();
@@ -85,8 +77,8 @@ pub fn spawn_sources(_app: &AppHandle, tx: Sender<RawEvent>, shutdown: Cancellat
     });
 }
 
-/// Forwards a [`RawEvent::Resumed`] on each logind resume (`PrepareForSleep`
-/// `false`), until shutdown or the stream ends.
+/// Forwards a [`RawEvent::Resumed`] on each logind resume, until shutdown or
+/// stream end.
 async fn run_wake_source(tx: Sender<RawEvent>, shutdown: CancellationToken) -> zbus::Result<()> {
     let conn = zbus::Connection::system().await?;
     let proxy = LogindManagerProxy::new(&conn).await?;
@@ -102,19 +94,19 @@ async fn run_wake_source(tx: Sender<RawEvent>, shutdown: CancellationToken) -> z
 
         // `start == false` is the resume edge.
         if !signal.args()?.start && tx.send(RawEvent::Resumed).await.is_err() {
-            return Ok(()); // receiver gone
+            return Ok(());
         }
     }
 }
 
 /// Primes the baseline from NetworkManager's `State`, then forwards a
-/// [`RawEvent::NetworkChanged`] on each `StateChanged`, until shutdown or the
-/// stream ends.
+/// [`RawEvent::NetworkChanged`] on each `StateChanged`, until shutdown or stream
+/// end.
 async fn run_network_source(tx: Sender<RawEvent>, shutdown: CancellationToken) -> zbus::Result<()> {
     let conn = zbus::Connection::system().await?;
     let proxy = NetworkManagerProxy::new(&conn).await?;
 
-    // Prime: record the current state so a later offline→online is an edge.
+    // Prime so a later offline→online reads as an edge.
     if let Ok(state) = proxy.nm_state().await {
         let _ = tx
             .send(RawEvent::NetworkChanged {
@@ -134,7 +126,7 @@ async fn run_network_source(tx: Sender<RawEvent>, shutdown: CancellationToken) -
 
         let online = core::nm_state_is_online(signal.args()?.state);
         if tx.send(RawEvent::NetworkChanged { online }).await.is_err() {
-            return Ok(()); // receiver gone
+            return Ok(());
         }
     }
 }

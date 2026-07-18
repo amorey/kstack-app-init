@@ -10,9 +10,8 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
-// pokeServer implements pokepb.PokeServiceServer on top of the shared resync
-// broadcaster. A nil broadcaster degrades safely (Unavailable), mirroring
-// kubeContextServer's nil-watcher and authServer's nil-auth behavior.
+// pokeServer implements pokepb.PokeServiceServer over the shared resync
+// broadcaster. A nil broadcaster degrades safely (Unavailable).
 type pokeServer struct {
 	pokepb.UnimplementedPokeServiceServer
 	pokeSvc *poke.Service

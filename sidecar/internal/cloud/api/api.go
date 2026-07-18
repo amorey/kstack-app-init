@@ -1,10 +1,9 @@
 // Package api is a minimal GraphQL-over-HTTP client for the kstack cloud
-// API. Today it covers the Settings surface (get / update / watch); profile
-// and AI-model routing land here later.
+// API. It covers the Settings surface (get / update / watch); profile and
+// AI-model routing land here later.
 //
-// Unlike the removed first cut (which took a bearer token per call), this
-// client holds a token-source factory and pulls a fresh bearer for every
-// request — so auth lives in-process and callers never thread tokens through.
+// The client holds a token-source factory and pulls a fresh bearer for every
+// request, so auth lives in-process and callers never thread tokens through.
 // Three operations, one transport shape: GetSettings (POST), UpdateSettings
 // (POST), WatchSettings (SSE stream of `next` events).
 package api
@@ -48,11 +47,10 @@ type Client struct {
 	sse  *http.Client
 }
 
-// sseHeaderTimeout bounds the SSE open handshake — the wait for response
-// headers after the request is sent. It must NOT be a whole-request timeout
-// (the stream body is intentionally long-lived); it only stops a cloud/proxy
-// that accepts the connection but stalls before replying from hanging the
-// engine's open call forever (so it can back off and retry).
+// sseHeaderTimeout bounds the SSE open handshake (the wait for response headers).
+// It must NOT be a whole-request timeout — the stream body is long-lived — it only
+// stops a cloud/proxy that accepts the connection then stalls before replying from
+// hanging the engine's open call forever.
 var sseHeaderTimeout = 30 * time.Second
 
 // tokenFetchTimeout bounds acquiring the bearer token for a request (which may
@@ -66,9 +64,9 @@ var tokenFetchTimeout = 15 * time.Second
 // memory or hang.
 const maxErrBody = 4 << 10
 
-// maxRespBody caps a successful (2xx) response body. Settings payloads are tiny,
-// so 1 MiB is ample headroom; the cap exists only so a misconfigured cloud URL
-// or proxy returning a huge 200 can't allocate unbounded memory.
+// maxRespBody caps a successful (2xx) response body. Settings payloads are tiny;
+// the cap exists only so a misconfigured cloud URL or proxy returning a huge 200
+// can't allocate unbounded memory.
 const maxRespBody = 1 << 20
 
 // New returns a Client bound to the cloud API's base URL (e.g.
@@ -173,10 +171,8 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBody))
 		return fmt.Errorf("cloud responded %d: %s", resp.StatusCode, body)
 	}
-	// Cap the successful body too: a misconfigured cloud URL/proxy returning a
-	// huge 200 could otherwise allocate unbounded memory. Read one byte past the
-	// cap so an over-limit body is detected rather than silently truncated into a
-	// decode error.
+	// Cap the successful body too. Read one byte past the cap so an over-limit
+	// body is detected rather than silently truncated into a decode error.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBody+1))
 	if err != nil {
 		return err
@@ -239,12 +235,11 @@ func (c *Client) WatchSettings(ctx context.Context) (<-chan Settings, <-chan err
 	return out, errCh, nil
 }
 
-// readErrBody reads up to maxErrBody bytes of a non-2xx response body for use
-// in an error message, bounded by a deadline so a server that returns headers
-// then stalls the body can't hang the (deliberately no-overall-timeout) SSE
-// client. The read runs in a goroutine; the caller closes the body right after,
-// which unblocks a stalled read so the goroutine can't leak (the channel is
-// buffered, so its send never blocks).
+// readErrBody reads up to maxErrBody bytes of a non-2xx response body for an
+// error message, bounded by a deadline so a server that returns headers then
+// stalls the body can't hang the no-overall-timeout SSE client. The read runs in
+// a goroutine; the caller closes the body right after, unblocking a stalled read
+// so the goroutine can't leak (the buffered channel's send never blocks).
 func readErrBody(body io.Reader) string {
 	ch := make(chan []byte, 1)
 	go func() {
@@ -288,11 +283,11 @@ func parseSSE(ctx context.Context, r io.Reader, dataField string, out chan<- Set
 			if err := json.Unmarshal([]byte(dataBuf.String()), &env); err != nil {
 				return true // skip malformed frame; keep stream open
 			}
-			// An error frame (typically data:null) is not a settings update. End
-			// the stream with the error rather than skipping it: we still never
-			// publish a (zero) Settings that could wipe local prefs, but the
-			// failure now surfaces in Status.LastError and triggers a backoff +
-			// reconnect (which re-authenticates) instead of staying silently live.
+			// An error frame (typically data:null) is not a settings update. End the
+			// stream with the error rather than skipping it: never publish a (zero)
+			// Settings that could wipe local prefs, but surface the failure in
+			// Status.LastError so it backs off + reconnects instead of staying silently
+			// live.
 			if len(env.Errors) > 0 {
 				streamErr = fmt.Errorf("graphql error: %s", env.Errors[0].Message)
 				return false

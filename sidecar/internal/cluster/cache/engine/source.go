@@ -25,10 +25,9 @@ import (
 	"k8s.io/client-go/metadata"
 )
 
-// liveSource is the production kubeSource for one GVR: full bodies + watch come
-// from the dynamic client, metadata-only lists from the metadata client. List
-// and Watch are cluster-wide (no namespace), so a single driver mirrors a
-// namespaced kind across all namespaces.
+// liveSource is the production kubeSource for one GVR: full bodies + watch from
+// the dynamic client, metadata-only lists from the metadata client. List/Watch
+// are cluster-wide, so one driver mirrors a namespaced kind across all namespaces.
 type liveSource struct {
 	dyn  dynamic.Interface
 	meta metadata.Interface

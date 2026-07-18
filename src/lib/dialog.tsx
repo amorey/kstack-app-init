@@ -12,22 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// App-level dialog controller. The overlay screens (Clusters today, Settings
-// next) are opened from the sidebar's account menu — but the sidebar card
-// unmounts when the window auto-collapses below the md breakpoint (see
-// `app-sidebar.tsx`), so a dialog rendered inside it would vanish mid-view. This
-// splits the two concerns across the sidebar boundary: the *trigger* (a menu
-// item) stays in the sidebar and only calls `openDialog(id)` through this
-// context, while the dialog *render* lives above the sidebar (the `AppDialogs`
-// host in AppLayout), where it survives the card unmounting.
+// App-level dialog controller. Overlay screens are opened from the sidebar's
+// account menu, but the sidebar card unmounts when the window auto-collapses below
+// the md breakpoint (see `app-sidebar.tsx`), so a dialog rendered inside it would
+// vanish mid-view. So the *trigger* (a menu item) stays in the sidebar and only
+// calls `openDialog(id)` through this context, while the dialog *render* lives above
+// the sidebar (the `AppDialogs` host in AppLayout), surviving the card unmounting.
 //
-// The controller also owns the mount lifecycle so the host stays a dumb renderer
-// and dialog components never handle their own teardown: `mountedDialog` trails
-// `activeDialog` — opening sets both, closing clears only `activeDialog` (which
-// drives the dialog's `open` to false) and leaves `mountedDialog` set so the
-// dialog lingers for its exit animation. The shared `Dialog` wrapper calls
-// `notifyClosed` once base-ui reports the close transition settled, which clears
-// `mountedDialog` and unmounts the dialog. Only one dialog is open at a time.
+// The controller also owns the mount lifecycle, so the host stays a dumb renderer:
+// `mountedDialog` trails `activeDialog` — opening sets both; closing clears only
+// `activeDialog` (driving the dialog's `open` to false) and leaves `mountedDialog`
+// set so the dialog lingers for its exit animation. The shared `Dialog` wrapper calls
+// `notifyClosed` once base-ui reports the close settled, which clears `mountedDialog`
+// and unmounts. Only one dialog is open at a time.
 import type { ReactNode } from 'react';
 import { createContext, useContext, useMemo, useState } from 'react';
 

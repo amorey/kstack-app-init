@@ -19,8 +19,7 @@ import (
 // Server is the GraphQL surface: the gqlgen handler plus the shutdown lifecycle
 // the app layer drives. It owns a shutdownCh that NotifyShutdown closes to end
 // active SSE subscriptions, and a WaitGroup DrainWithContext blocks on until
-// their handlers unwind. Mount it at /graphql (see internal/app); it is the
-// sidecar's analogue of kstack-cloud's graph.Server.
+// their handlers unwind. Mount it at /graphql (see internal/app).
 //
 // SSE cancellation is deliberately per-request (a goroutine in ServeHTTP wired
 // to shutdownCh), not via http.Server.BaseContext: the shared h2c connection

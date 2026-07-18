@@ -12,36 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Browser-style back/forward buttons for the context bar (left of the picker).
-// They walk the router's history stack, so any history-pushing navigation is
-// reversible — today that's the kube-context switch and the dashboard resource
-// nav (see `dashboard-resource-nav.tsx`), and anything added later gets it for
-// free.
+// Browser-style back/forward buttons for the context bar, walking the router's
+// history stack so any history-pushing navigation is reversible (the kube-context
+// switch, the dashboard resource nav, and anything added later).
 //
-// Availability is derived purely from the *router-managed* stack, never the
-// browser's total history length — the frontend may run as a standalone site
-// reached via a link, where `window.history` holds entries predating the app
-// that must not count. TanStack stamps a 0-based `__TSR_index` on each entry, so
-// Back is available past index 0. Forward is available while the current index is
-// below the highest still-reachable index — a ceiling we track from the actions
-// themselves: a `push` truncates the forward entries (ceiling drops to the new
-// index); every other action (back/forward/go/replace) leaves the reachable top
-// intact. Both are read through `useSyncExternalStore` subscribed to
-// `router.history`, so the buttons re-enable and disable as navigation moves.
+// Availability derives purely from the router-managed stack, never the browser's
+// total history length — as a standalone site reached via a link, `window.history`
+// holds entries predating the app that must not count. TanStack stamps a 0-based
+// `__TSR_index` on each entry, so Back is available past index 0. Forward is
+// available while the current index is below the highest still-reachable index — a
+// ceiling tracked from the actions: a `push` truncates forward entries (ceiling
+// drops to the new index), every other action leaves the reachable top intact.
+// Both read through `useSyncExternalStore` on `router.history` so the buttons
+// track navigation.
 //
-// The ceiling is persisted in `sessionStorage`, because the browser keeps the
-// forward entries across a page reload: reloading from a rewound position must
-// restore the ceiling rather than reset it to the (lower) current index, or
-// Forward would be wrongly disabled even though `history.forward()` still works.
-// `sessionStorage` is scoped to the browsing context (one per window in the app,
-// the tab on a standalone site), so it mirrors the per-context history and clears
-// when that context closes.
+// The ceiling is persisted in `sessionStorage` because the browser keeps forward
+// entries across a reload: reloading from a rewound position must restore the
+// ceiling, not reset it to the current index, or Forward would be wrongly disabled
+// while `history.forward()` still works. `sessionStorage` is scoped to the browsing
+// context, mirroring the per-context history.
 //
-// The persisted value is tagged with the current entry's `__TSR_key` (TanStack's
-// per-entry id) and trusted only while it still matches. A reload preserves that
-// key, so the ceiling survives; but starting a *new* visit in the same tab (leave
-// the app, follow a link back) lands on a fresh entry with a new key, so the
-// earlier visit's stale ceiling is discarded rather than exposing a dead Forward.
+// The persisted value is tagged with the current entry's `__TSR_key` and trusted
+// only while it matches: a reload preserves the key (ceiling survives), but a new
+// visit in the same tab lands on a fresh key, discarding the stale ceiling rather
+// than exposing a dead Forward.
 import { useCallback, useRef, useSyncExternalStore } from 'react';
 
 import { useRouter } from '@tanstack/react-router';
@@ -50,17 +44,16 @@ import { ArrowLeft, ArrowRight } from 'lucide-react';
 
 import { Button } from '@kubetail/ui/elements/button';
 
-// sessionStorage key for the persisted forward ceiling (see the header comment).
-// Exported so tests can seed a pre-reload value.
+// sessionStorage key for the persisted forward ceiling. Exported so tests can
+// seed a pre-reload value.
 export const FORWARD_CEILING_STORAGE_KEY = 'kstack:history-forward-ceiling';
 
 type StoredCeiling = { ceiling: number; key: string };
 
-// Live reads of the current entry's TanStack index/key. Plain functions of
-// `history`, not memoized values: the index and key change on every navigation
-// while the `history` object identity is stable, so anything captured with
-// `useMemo`/`useCallback` keyed on it would go stale — these must re-read
-// `history.location` on each call.
+// Live reads of the current entry's TanStack index/key. Plain functions, not
+// memoized: index/key change on every navigation while `history`'s identity is
+// stable, so anything captured keyed on it goes stale — re-read `history.location`
+// each call.
 function getCurrentIndex(history: RouterHistory): number {
   return history.location.state.__TSR_index ?? 0;
 }
@@ -84,10 +77,9 @@ function readStoredCeiling(entryKey: string): number {
 function useHistoryNav() {
   const { history } = useRouter();
 
-  // The highest index still reachable forward from the current position, seeded
-  // from the persisted value (scoped to this entry's key) so it survives a reload
-  // but not a new visit, and never below the current entry. Lazily initialized
-  // once per mount.
+  // Highest index still reachable forward, seeded from the persisted value (scoped
+  // to this entry's key so it survives a reload but not a new visit) and never
+  // below the current entry. Lazily initialized once per mount.
   const ceilingRef = useRef<number | null>(null);
   if (ceilingRef.current === null) {
     ceilingRef.current = Math.max(readStoredCeiling(getCurrentKey(history)), getCurrentIndex(history));
@@ -96,9 +88,9 @@ function useHistoryNav() {
   const subscribe = useCallback(
     (onChange: () => void) =>
       history.subscribe(({ action }) => {
-        // A push truncates the forward entries (ceiling drops to the new index);
-        // every other action leaves the reachable top intact. Persist under the
-        // current entry's key so the ceiling survives a reload of this stack.
+        // A push truncates forward entries (ceiling drops to the new index); every
+        // other action leaves the reachable top intact. Persist under the current
+        // entry's key so the ceiling survives a reload.
         const index = getCurrentIndex(history);
         const ceiling = action.type === 'PUSH' ? index : Math.max(ceilingRef.current ?? 0, index);
         ceilingRef.current = ceiling;

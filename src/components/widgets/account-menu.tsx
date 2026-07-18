@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The account affordance at the foot of the sidebar: a single full-width button
-// that reads "Guest" when signed out and the user's identity (name/email) when
-// signed in, opening a menu that rises above it. A session is an add-on, not a
-// gate — the app loads regardless, and the user can sign in / out at will from
-// here. The menu also hosts entry points to the cluster-sync panel and Settings
-// dialogs — it only requests them open through `useDialog`; the dialogs render
-// above the sidebar (see `AppDialogs`) so they outlive this menu when the sidebar
-// card unmounts on auto-collapse.
+// The account affordance at the foot of the sidebar: a full-width button reading
+// "Guest" when signed out or the user's identity when signed in, opening a menu
+// that rises above it. A session is an add-on, not a gate — the app loads
+// regardless and the user can sign in/out at will. The menu also hosts entry
+// points to the cluster-sync panel and Settings; it only requests them open
+// through `useDialog`, and the dialogs render above the sidebar (see `AppDialogs`)
+// so they outlive this menu when the sidebar card unmounts on auto-collapse.
 import { ChevronUp, Database, LogOut, Settings, User } from 'lucide-react';
 
 import { Avatar, AvatarFallback } from '@kubetail/ui/elements/avatar';
@@ -35,8 +34,8 @@ import { useAuthState } from '@/lib/auth';
 import { useDialog } from '@/lib/dialog';
 
 function initials(s: string): string {
-  // Two letters max. Splits on whitespace and common separators so an
-  // email like `andres.morey@…` yields `AM`, not `AN`.
+  // Two letters max. Splits on whitespace and common separators so an email like
+  // `andres.morey@…` yields `AM`, not `AN`.
   const trimmed = s.trim();
   if (!trimmed) return '?';
   const parts = trimmed.split(/[\s._-]+/).filter(Boolean);
@@ -54,8 +53,6 @@ export function AccountMenu() {
   // The trigger's accessible label: the signed-in identity, or "Guest".
   const account = authenticated ? email || name || 'Signed in' : 'Guest';
 
-  // The overlay dialogs are opened by id; they render above the sidebar so they
-  // survive this menu (and its sidebar card) unmounting.
   const { openDialog } = useDialog();
 
   return (
@@ -81,13 +78,12 @@ export function AccountMenu() {
         </span>
         <ChevronUp className="size-4 shrink-0 text-muted-foreground" aria-hidden />
       </DropdownMenuTrigger>
-      {/* Rises above the button (it sits at the sidebar's foot); min-width keeps
-            it from collapsing narrower than the trigger. */}
+      {/* Rises above the button; min-width keeps it from collapsing narrower than
+            the trigger. */}
       <DropdownMenuContent align="start" side="top" sideOffset={6} className="min-w-56">
         {!authenticated && (
           <>
-            {/* A prominent primary call-to-action, matching the mockup's blue
-                  sign-in button. */}
+            {/* A prominent primary call-to-action. */}
             <DropdownMenuItem
               disabled={loading}
               onClick={() => login().catch(() => {})}

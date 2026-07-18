@@ -57,17 +57,14 @@ const TRAY_ID: &str = "main";
 
 /// Builds and installs the system tray icon and its context menu.
 ///
-/// The tray menu offers "New Window", "Show Main Window", and "Quit", using
-/// the app's default window icon. The menu-event handler routes each item
-/// through the [`AppState`] `window_manager`: `tray_new_window` creates a new
-/// window, `tray_show_main` shows the main window, and `tray_quit` exits the
-/// process via [`AppHandle::exit`]. Window-manager failures are logged rather
-/// than propagated, since menu callbacks cannot return errors.
+/// The menu offers "New Window", "Show Main Window", and "Quit", routed through
+/// the [`AppState`] `window_manager` (Quit exits via [`AppHandle::exit`]).
+/// Window-manager failures are logged rather than propagated, since menu
+/// callbacks cannot return errors.
 ///
 /// # Errors
 ///
-/// Returns an error if any menu item fails to build or if the tray icon fails
-/// to build.
+/// Returns an error if any menu item or the tray icon fails to build.
 ///
 /// # Panics
 ///
@@ -302,8 +299,8 @@ pub fn spawn_authstate_subscription(app: &AppHandle) {
                         match msg {
                             Ok(Some(auth_state)) => {
                                 saw_snapshot = true;
-                                // Write the new auth snapshot into the shared
-                                // holder, then rebuild from both latest states.
+                                // Store the new auth snapshot, then rebuild the
+                                // menu from it.
                                 {
                                     let app_state = app.state::<AppState>();
                                     app_state

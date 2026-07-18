@@ -29,27 +29,18 @@ pub async fn ready(state: State<'_, AppState>) -> Result<()> {
     state.sidecar.ready().await
 }
 
-/// Opens a new application window. Backs the webview `AppMenu`'s
-/// "New Window" item and `Ctrl+N` shortcut on Linux/Windows; macOS drives the
-/// same action through its native menu (`app_menu.rs`). Delegates to the
-/// shared `WindowManager` so labeling/focus stay consistent.
+/// Opens a new application window. Backs the webview `AppMenu`'s "New Window"
+/// item and `Ctrl+N` on Linux/Windows; macOS drives the same action through its
+/// native menu (`app_menu.rs`). Delegates to the shared `WindowManager`.
 ///
-/// **Deliberately `async`** so Tauri runs it on the async runtime rather than
-/// the main thread. Building a `WebviewWindow` blocks the calling thread until
-/// the webview is created, and on Windows the WebView2 controller is created
-/// asynchronously by the main-thread event loop — so building on the main
-/// thread deadlocks (the loop can't pump while it's blocked in `build()`),
-/// leaving a blank window and freezing the whole app. Off the main thread the
-/// loop stays free to pump and the window materializes. (macOS/WKWebView needs
-/// no such pump, but async is harmless there.)
-///
-/// **And deliberately on the blocking pool**, for the same reason stated the
-/// other way round: because `build()` parks its thread until the window exists,
-/// running it on an async worker would hold one of the threads that serve
-/// [`graphql_query`] for the whole build. `spawn_blocking` is the pool meant to
-/// absorb that. The `AppState` is resolved inside the closure rather than taken
-/// as a `State<'_, _>` parameter, since a borrow of `app` cannot cross into a
-/// `'static` task.
+/// `async` + `spawn_blocking` on purpose. `build()` parks its calling thread
+/// until the webview exists; on the main thread that deadlocks on Windows,
+/// where the WebView2 controller is created asynchronously by the main-thread
+/// event loop, which can't pump while blocked in `build()`. And the blocking
+/// pool rather than an async worker, since parking a worker would hold a thread
+/// that serves [`graphql_query`] for the whole build. `AppState` is resolved
+/// inside the closure because a borrow of `app` can't cross into a `'static`
+/// task.
 #[tauri::command]
 pub async fn new_window(app: AppHandle) -> Result<()> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -60,14 +51,13 @@ pub async fn new_window(app: AppHandle) -> Result<()> {
     .map_err(|err| std::io::Error::other(format!("window build task failed: {err}")))?
 }
 
-/// Applies a partial update to `host.json`, the host's persisted settings
-/// file and the source of truth for what it holds (see the `host_file`
-/// module). Deliberately general — the webview sends just the fields it wants
-/// to change (e.g. `{ colorSchemePreference: "dark" }`); adding a
-/// host-persisted setting extends `HostFilePatch` rather than adding a
-/// command. On success the merged file is broadcast to every window as a
-/// `host_file::UPDATED_EVENT` — that push is how all open windows (including
-/// the caller's) track the file live — and returned to the caller directly.
+/// Applies a partial update to `host.json`, the host's persisted settings file
+/// (see the `host_file` module). Deliberately general — the webview sends just
+/// the fields it wants to change (e.g. `{ colorSchemePreference: "dark" }`), so
+/// adding a setting extends `HostFilePatch` rather than the command list. On
+/// success the merged file is broadcast to every window as a
+/// `host_file::UPDATED_EVENT` (how all open windows track it live) and also
+/// returned to the caller.
 #[tauri::command]
 pub fn update_host_file(app: AppHandle, patch: HostFilePatch) -> Result<HostFile> {
     let file = host_file::update(&host_file::path(&app)?, patch)?;

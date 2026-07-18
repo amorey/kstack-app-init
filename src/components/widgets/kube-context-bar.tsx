@@ -13,13 +13,11 @@
 // limitations under the License.
 
 // The window's active kube-context bar: a slim strip across the top of the main
-// content area (mounted in `AppLayout`, so chat and dashboard share it). It's
-// the single home for the kube-context picker — the sidebar was too narrow to
-// show a full FQDN context name or any of its metadata, so the picker moved
-// here where there's horizontal room, and the bar adds the cluster/user the
-// name alone doesn't convey (namespace isn't exposed by the sidecar yet). The
-// back/forward `HistoryNav` sits at the bar's left edge, walking the router
-// history that context and resource selections push into.
+// content area (mounted in `AppLayout`, so chat and dashboard share it). Home of
+// the kube-context picker, which needs the horizontal room a full FQDN context
+// name and its cluster/user metadata demand (namespace isn't exposed by the
+// sidecar yet). The back/forward `HistoryNav` sits at the left edge, walking the
+// router history that context and resource selections push into.
 import { HistoryNav } from '@/components/widgets/history-nav';
 import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 import { useActiveKubeContext } from '@/lib/active-kube-context';

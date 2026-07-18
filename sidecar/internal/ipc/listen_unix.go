@@ -13,10 +13,9 @@ import (
 	"syscall"
 )
 
-// Scheme labels the IPC transport in human-readable diagnostics
-// (e.g. the `READY <scheme>:<path>` line in main.go). The host doesn't
-// parse this; it's a hint for logs and external tooling. The Windows
-// build uses `pipe:` for named pipes.
+// Scheme labels the IPC transport in human-readable diagnostics (the
+// `READY <scheme>:<path>` line in main.go); the host doesn't parse it.
+// The Windows build uses `pipe`.
 const Scheme = "unix"
 
 // DefaultSocketPath returns the platform-native default IPC endpoint: an
@@ -28,12 +27,11 @@ func DefaultSocketPath() string {
 
 // Listen binds the IPC endpoint and applies user-only access.
 //
-// Order matters for security: net.Listen creates the socket file with
-// mode 0777 & ~umask, so on a Linux box with default umask 022 and
-// /tmp at 1777, another local user could connect in the window between
-// bind and chmod. Tightening umask to 0177 first makes the socket land
-// at 0600 atomically; the explicit Chmod afterwards is belt-and-
-// suspenders against unusual umask states.
+// Order matters for security: net.Listen creates the socket with mode
+// 0777 & ~umask, so with a default umask another local user could connect
+// in the window between bind and chmod. Tightening umask to 0177 first
+// makes the socket land at 0600 atomically; the explicit Chmod is
+// belt-and-suspenders against unusual umask states.
 func Listen(path string) (net.Listener, error) {
 	_ = os.Remove(path)
 	prev := syscall.Umask(0o177)

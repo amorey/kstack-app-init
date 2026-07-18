@@ -12,24 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The app's floating sidebar shell. The window is chromeless on every platform,
-// but the title bar takes a different shape per OS:
+// The app's floating sidebar shell. The window is chromeless on every platform; the
+// title bar takes a different shape per OS:
 //
-//   • macOS keeps its native traffic lights (drawn over the Overlay title bar by
-//     the host). The sidebar's header doubles as the title bar: it reserves a
-//     gutter for the lights, and a full-width drag band covers the rest of the
-//     top strip so the whole band moves the window.
-//   • Linux/Windows have no native window controls, so a full-width custom title
-//     bar sits across the top — hamburger `AppMenu` at the left, a draggable
-//     strip in the middle, and `WindowControls` (minimize/maximize/close) at the
-//     right. The floating sidebar is offset to start just below it.
+//   • macOS keeps its native traffic lights. The sidebar's header doubles as the
+//     title bar (a gutter for the lights, then a full-width drag band).
+//   • Linux/Windows have no native controls, so a full-width custom title bar sits
+//     across the top — hamburger `AppMenu`, a draggable strip, and `WindowControls`
+//     at the right; the sidebar starts just below it.
 //
-// We drive the sidebar's open/collapsed state with the library's
-// `SidebarProvider`/`useSidebar` (cookie persistence + the `Cmd/Ctrl+B`
-// shortcut), but render the shell ourselves rather than using the library's
-// `Sidebar`. That component slides the panel in/out over 200ms with no way to
-// opt out; we want an instant show/hide, so our shell simply mounts/unmounts the
-// floating card and toggles a layout spacer's width.
+// The library's `SidebarProvider`/`useSidebar` owns open/collapsed state (cookie
+// persistence + `Cmd/Ctrl+B`), but we render the shell ourselves: the library's
+// `Sidebar` slides in/out over 200ms with no opt-out, and we want an instant
+// show/hide (mount/unmount the card, toggle a spacer's width).
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -46,60 +41,46 @@ import { AppMenu } from '@/components/widgets/app-menu';
 import { SidebarToggle } from '@/components/widgets/sidebar-toggle';
 import { WindowControls } from '@/components/widgets/window-controls';
 
-// Horizontal space (px) reserved at the macOS header's left edge for the cluster
-// of three traffic lights. This is an independent visual reservation for the
-// lights' full width — not derived from the host's `trafficLightPosition`
-// (which sets only the first light's origin); eyeball it against the native
-// buttons when tuning.
+// Horizontal space (px) reserved at the macOS header's left edge for the three
+// traffic lights. An independent visual reservation, not derived from the host's
+// `trafficLightPosition`; eyeball it against the native buttons when tuning.
 const TRAFFIC_LIGHT_GUTTER = 62;
 
-// Left offset (px, from the *window* edge) for the fixed macOS sidebar toggle.
-// The three native traffic lights sit at window-left + `SIDEBAR_GAP` (8) +
-// `TRAFFIC_LIGHT_LEFT_INSET` (12), 20px apart at 12px wide — so the cluster ends
-// ~72px in. This clears it with a comfortable gap. Distinct from
-// `TRAFFIC_LIGHT_GUTTER` (which reserves space *inside* the card header,
-// card-relative): the toggle is `position: fixed`, so it must be measured from
-// the window edge instead — the card can be unmounted (sidebar hidden) while
-// the toggle stays put.
+// Left offset (px, from the window edge) for the fixed macOS sidebar toggle, clearing
+// the traffic-light cluster (which ends ~72px in). Measured from the window edge, not
+// card-relative like `TRAFFIC_LIGHT_GUTTER`, since the toggle is `position: fixed` and
+// stays put while the card can be unmounted.
 const MAC_TOGGLE_LEFT = 96;
 
-// macOS title-bar band height (Tailwind class). The sidebar header and the
-// window drag band must cover the same strip, so both take their height from
-// here (44px — matches the host's `TITLE_BAR_HEIGHT` in `window_manager.rs`).
+// macOS title-bar band height. The sidebar header and the window drag band cover the
+// same strip, so both read from here (44px — matches the host's `TITLE_BAR_HEIGHT`).
 const MAC_TITLE_BAR_HEIGHT = 'h-11';
 
-// Top offset matching `MAC_TITLE_BAR_HEIGHT` (44px), used to hang the hover popup
-// just below the macOS title-bar band so it drops from under the toggle. Kept in
-// step with `MAC_TITLE_BAR_HEIGHT` by hand — Tailwind can't derive one from the
-// other.
+// Top offset matching `MAC_TITLE_BAR_HEIGHT` (44px), hanging the hover popup just below
+// the title-bar band. Kept in step by hand — Tailwind can't derive one from the other.
 const MAC_TITLE_BAR_TOP = 'top-11';
 
-// The hover popup is a standalone dropdown, not a preview of the pinned card, so
-// it gets its own fixed footprint (Tailwind classes) instead of tracking the
-// drag-chosen `--sidebar-width`. The height is a fixed fraction of the window
-// height, so it scales with the window; long content scrolls inside.
+// The hover popup is a standalone dropdown, not a preview of the pinned card, so it
+// gets its own fixed footprint rather than tracking `--sidebar-width`. Height scales
+// with the window; long content scrolls inside.
 const PREVIEW_POPUP_WIDTH = 'w-72';
 const PREVIEW_POPUP_HEIGHT = 'h-[70svh]';
 
-// Grace delay (ms) before the hover popup closes once the pointer leaves the
-// toggle (and the popup). Bridges the gap as the pointer travels from the toggle
-// down onto the card, and keeps a brief flick off the edge from dismissing it.
+// Grace delay (ms) before the hover popup closes on pointer-leave, bridging the travel
+// from toggle down onto the card and absorbing a brief flick off the edge.
 const PREVIEW_CLOSE_DELAY_MS = 300;
 
-// Below Tailwind's `md` breakpoint the floating card crowds the page, so we
-// auto-collapse it there and let the inset reclaim the full width (the toggle
-// stays available to reopen it). The threshold isn't hardcoded: we read
-// Tailwind's `--breakpoint-md` theme variable and match `< md` — the exact
-// inverse of the `md:` variant — so it tracks the theme if the breakpoint ever
-// changes.
+// Below Tailwind's `md` breakpoint the floating card crowds the page, so auto-collapse
+// it and let the inset reclaim full width (the toggle still reopens it). Reads the
+// `--breakpoint-md` theme variable and matches `< md` — the inverse of the `md:`
+// variant — so it tracks the theme if the breakpoint changes.
 function mediumBreakpointQuery() {
   const md = getComputedStyle(document.documentElement).getPropertyValue('--breakpoint-md').trim() || '48rem';
   return `(max-width: calc(${md} - 1px))`;
 }
 
-// Single owner of the "below the medium breakpoint" (too narrow for the pinned
-// sidebar) signal. Seeds synchronously on first render so the initial paint is
-// correct — no post-paint flash — then follows `change` events.
+// Single owner of the "below the medium breakpoint" (too narrow to pin) signal.
+// Seeds synchronously on first render (no post-paint flash), then follows `change`.
 function useIsNarrow() {
   const [narrow, setNarrow] = useState(() => window.matchMedia(mediumBreakpointQuery()).matches);
   useEffect(() => {
@@ -111,40 +92,33 @@ function useIsNarrow() {
   return narrow;
 }
 
-// Linux/Windows custom title-bar band height. 32px is close to a native Windows
-// caption bar. This is the single source of truth: it's published as the
-// `--win-titlebar-h` CSS variable on the sidebar wrapper (see `AppSidebar`), and
-// both the title bar's own height and the sidebar's top offset read from that
-// variable — so the band height is stated in exactly one place.
+// Linux/Windows custom title-bar band height (~a native Windows caption bar). Single
+// source of truth: published as the `--win-titlebar-h` CSS variable (see `AppSidebar`),
+// which both the bar's own height and the sidebar's top offset read from.
 const WIN_TITLE_BAR_HEIGHT_PX = '32px';
 
 // Title-bar height, derived from `--win-titlebar-h`.
 const WIN_TITLE_BAR_HEIGHT = 'h-[var(--win-titlebar-h)]';
 
-// Sidebar width bounds (px). The card is drag-resizable from its right edge
-// between these; `DEFAULT_SIDEBAR_WIDTH` matches the library's 16rem default.
-// The chosen width is published as `--sidebar-width` (overriding the library
-// default) so both the floating card and the layout spacer track it, and is
-// persisted to `localStorage` under `SIDEBAR_WIDTH_KEY` across sessions.
+// Sidebar width bounds (px); the card drag-resizes between these. `DEFAULT` matches the
+// library's 16rem. The chosen width is published as `--sidebar-width` (so card and
+// spacer track it) and persisted to `localStorage` under `SIDEBAR_WIDTH_KEY`.
 const MIN_SIDEBAR_WIDTH = 200;
 const MAX_SIDEBAR_WIDTH = 480;
 const DEFAULT_SIDEBAR_WIDTH = 256;
 const SIDEBAR_WIDTH_KEY = 'sidebar_width';
 
-// The floating card's `p-2` padding (px): `--sidebar-width` spans the whole
-// card, so the *visible* sidebar border sits this far inside the card's right
-// edge. The resize handle centers on that visible border and the drag math
-// offsets by it, so grabbing the border doesn't jump the width.
+// The floating card's `p-2` padding (px): `--sidebar-width` spans the whole card, so
+// the visible sidebar border sits this far inside its right edge. The resize handle
+// centers on that border and the drag math offsets by it, so grabbing it doesn't jump.
 const CARD_PADDING = 8;
 
 const clampWidth = (px: number) => Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, px));
 
-// Persisted, clamped sidebar width plus a setter that mirrors changes to
-// `localStorage`. Reads the stored value lazily on first render. The app can
-// open several main windows at once; they share one webview origin (hence one
-// `localStorage`), but each keeps its own width in React state and never syncs
-// live — so resizing one window leaves the others untouched, while a *newly*
-// opened window inherits the last-saved width from `localStorage` on mount.
+// Persisted, clamped sidebar width plus a `localStorage`-mirroring setter. Windows
+// share one webview origin (one `localStorage`) but each keeps its own width in React
+// state and never syncs live, so resizing one leaves the others untouched while a newly
+// opened window inherits the last-saved width on mount.
 function useSidebarWidth(): [number, (px: number) => void] {
   const [width, setWidth] = useState(() => {
     const stored = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
@@ -158,20 +132,17 @@ function useSidebarWidth(): [number, (px: number) => void] {
   return [width, set];
 }
 
-// Drag handle centered on the sidebar's visible right border, straddling it
-// symmetrically. On pointer-drag it maps the pointer's x-position (measured from
-// the window's left edge, where the card sits) to the card width — adding the
-// card padding so the visible border tracks the cursor without jumping on grab;
-// the parent clamps and persists it. Pointer capture keeps the drag alive even
-// when the cursor outruns the thin handle.
+// Drag handle centered on the sidebar's visible right border. On drag it maps the
+// pointer's x (from the window's left edge) to the card width, plus the card padding so
+// the border tracks the cursor without jumping; the parent clamps and persists. Pointer
+// capture keeps the drag alive when the cursor outruns the thin handle.
 function ResizeHandle({ onResize }: { onResize: (px: number) => void }) {
   const handlePointerDown = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
       e.preventDefault();
       e.currentTarget.setPointerCapture(e.pointerId);
-      // Force the resize cursor for the whole drag: without this it reverts
-      // whenever the pointer strays off the thin handle onto other elements.
-      // `user-select: none` stops text getting selected as the pointer moves.
+      // Force the resize cursor for the whole drag (else it reverts when the pointer
+      // strays off the thin handle); `user-select: none` stops text selection.
       const { body } = document;
       const prevCursor = body.style.cursor;
       const prevSelect = body.style.userSelect;
@@ -201,11 +172,9 @@ function ResizeHandle({ onResize }: { onResize: (px: number) => void }) {
   );
 }
 
-// macOS: a window-wide drag strip across the top, spanning the whole title-bar
-// band — including the area beside the floating sidebar (over the page). Its
-// `z-0` keeps it below the sidebar's `z-10` so the sidebar's own controls stay
-// clickable; rendered after the inset it still paints over the page background,
-// so clicking the empty top background there moves the window. Pages reserve
+// macOS: a window-wide drag strip across the top title-bar band, including the area
+// beside the sidebar (over the page). `z-0` keeps it below the sidebar's `z-10` so its
+// controls stay clickable, but it still paints over the page background. Pages reserve
 // this band with top padding, so it never covers interactive page content.
 function MacWindowDragBand() {
   return (
@@ -234,10 +203,9 @@ function MacTitleBar() {
   );
 }
 
-// macOS: the sidebar toggle, fixed just right of the traffic lights. It lives
-// outside the sidebar (not in `MacTitleBar`) so it stays put — and stays
-// clickable to reopen — when the sidebar is hidden. `z-20` keeps it above both
-// the sidebar (`z-10`) and the window drag band (`z-0`).
+// macOS: the sidebar toggle, fixed just right of the traffic lights. Lives outside the
+// sidebar so it stays put and clickable when the sidebar is hidden. `z-20` keeps it
+// above the sidebar (`z-10`) and the drag band (`z-0`).
 function MacSidebarToggle(handlers: HoverHandlers) {
   return (
     <div className={`fixed top-0 z-20 flex ${MAC_TITLE_BAR_HEIGHT} items-center`} style={{ left: MAC_TOGGLE_LEFT }}>
@@ -246,20 +214,16 @@ function MacSidebarToggle(handlers: HoverHandlers) {
   );
 }
 
-// Linux/Windows: a full-width custom title bar across the top of the window.
-// Fixed and above the sidebar (`z-30` over the sidebar's `z-10`) so its controls
-// stay clickable; its middle strip is the window's drag region. The sidebar
-// toggle sits next to the hamburger and, being part of this fixed bar rather
-// than the sidebar itself, stays visible to reopen a hidden sidebar.
+// Linux/Windows: a full-width custom title bar. Fixed above the sidebar (`z-30`) so its
+// controls stay clickable; its middle strip is the drag region. The toggle sits by the
+// hamburger and, being part of this fixed bar, stays visible to reopen a hidden sidebar.
 function WinTitleBar(handlers: HoverHandlers) {
   return (
-    // `transform-gpu` (translateZ(0)) pins this fixed, opaque bar to its own
-    // retained compositor layer. Without it, WebKitGTK re-rasters the layer
-    // during an interactive resize and — because the window is transparent —
-    // the title area briefly shows through to the gutter/desktop (a flash). A
-    // retained backing store survives the resize. Safe here: the bar has no body
-    // text, so the subpixel-rendering reason we avoid transforms app-wide (see
-    // `window-frame.tsx`) doesn't apply.
+    // `transform-gpu` pins this fixed, opaque bar to its own retained compositor layer.
+    // Without it WebKitGTK re-rasters during an interactive resize and — the window
+    // being transparent — the title area briefly flashes through to the desktop. Safe
+    // here: no body text, so the app-wide subpixel-rendering reason to avoid transforms
+    // (see `window-frame.tsx`) doesn't apply.
     <div
       className={`fixed inset-x-0 top-0 z-30 flex transform-gpu ${WIN_TITLE_BAR_HEIGHT} items-stretch gap-0.5 bg-background`}
     >
@@ -271,11 +235,10 @@ function WinTitleBar(handlers: HoverHandlers) {
   );
 }
 
-// Handlers the toggle fires, wired by the shell to preview a collapsed sidebar as
-// a popup: `onHoverStart`/`onHoverEnd` open/close it on hover. `onClick` is left
-// unset when a click should keep the toggle's default pin/collapse behavior
-// (wide → pin the full sidebar back open); it's supplied only in the narrow case,
-// where there's no room to pin and a click instead dismisses the peeked popup.
+// Handlers the toggle fires to preview a collapsed sidebar as a popup:
+// `onHoverStart`/`onHoverEnd` open/close it on hover. `onClick` is unset when a click
+// should keep the toggle's default pin/collapse behavior (wide case), and supplied only
+// when narrow, where there's no room to pin and a click dismisses the peeked popup.
 type HoverHandlers = {
   onHoverStart?: () => void;
   onHoverEnd?: () => void;
@@ -290,32 +253,24 @@ type ShellProps = {
   children?: ReactNode;
 };
 
-// Our floating-sidebar shell. `SidebarProvider` (above) owns the open/collapsed
-// state; here we render it. When open, a fixed card holds the nav/footer and a
-// same-width spacer reserves room for it in the flex row so the page inset sits
-// beside it. When collapsed, both vanish immediately (no slide) and the inset
-// reclaims the full width — but hovering the toggle then re-mounts the same card
-// as an unpinned popup that overlays the page (no spacer) and disappears once
-// the pointer leaves both the toggle and the card. Clicking the toggle pins the
-// full sidebar back open (same as `Cmd/Ctrl+B`).
+// The floating-sidebar shell. When open, a fixed card holds the nav/footer and a
+// same-width spacer reserves room for it so the inset sits beside it. When collapsed
+// both vanish instantly (no slide) and the inset reclaims full width — but hovering the
+// toggle re-mounts the card as an unpinned popup overlaying the page, gone once the
+// pointer leaves both. Clicking the toggle pins it back open (like `Cmd/Ctrl+B`).
 function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
   const { open } = useSidebar();
 
-  // Being below the medium breakpoint is a *presentation* constraint, not a
-  // state change: the floating card crowds a narrow window, so we hide it there
-  // without disturbing the user's choice. `open` stays the true intent (toggled
-  // by the button / `Cmd/Ctrl+B`); `effectiveOpen` is what actually renders. So
-  // narrowing hides the sidebar and widening restores it *for free* — a manual
-  // collapse survives a narrow→wide round-trip with no shadow state to keep in
-  // sync. `isNarrow` also drives the toggle's click behavior (see
-  // `hoverHandlers`), and is seeded synchronously so the sidebar never flashes
-  // open before a narrow-at-mount is accounted for.
+  // Narrowness is a presentation constraint, not a state change: `open` stays the true
+  // intent (button / `Cmd/Ctrl+B`), `effectiveOpen` is what renders. So narrowing hides
+  // the sidebar and widening restores it for free, with no shadow state to sync.
+  // `isNarrow` also drives the toggle's click behavior, and is seeded synchronously so
+  // the sidebar never flashes open before a narrow-at-mount is accounted for.
   const isNarrow = useIsNarrow();
   const effectiveOpen = open && !isNarrow;
 
-  // Hover-preview state for the collapsed sidebar. A short close delay
-  // (`PREVIEW_CLOSE_DELAY_MS`) bridges the gap as the pointer travels from the
-  // toggle down into the popup, so it doesn't flicker shut between the two.
+  // Hover-preview state for the collapsed sidebar. `PREVIEW_CLOSE_DELAY_MS` bridges the
+  // pointer's travel from toggle into the popup so it doesn't flicker shut between them.
   const [preview, setPreview] = useState(false);
   const closeTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const showPreview = useCallback(() => {
@@ -326,19 +281,15 @@ function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
     clearTimeout(closeTimer.current);
     closeTimer.current = setTimeout(() => setPreview(false), PREVIEW_CLOSE_DELAY_MS);
   }, []);
-  // Clicking the toggle while narrow-collapsed flips the popup on/off in place
-  // (there's no room to pin the full sidebar, so a click can only dismiss the
-  // peeked popup). Cancels any pending close so a click right after a hover isn't
-  // undone by the grace timer.
+  // Narrow-collapsed, clicking the toggle flips the popup on/off in place (no room to
+  // pin). Cancels any pending close so a click right after a hover isn't undone.
   const togglePreview = useCallback(() => {
     clearTimeout(closeTimer.current);
     setPreview((p) => !p);
   }, []);
   useEffect(() => () => clearTimeout(closeTimer.current), []);
-  // Drop any lingering hover-preview the moment the sidebar docks, so a later
-  // collapse starts fresh (no popup flashing up without a hover). Done as a
-  // render-time state adjustment on the docked edge (React's endorsed pattern)
-  // rather than an effect, so it lands before paint.
+  // Drop any lingering hover-preview the moment the sidebar docks, so a later collapse
+  // starts fresh. A render-time state adjustment (not an effect) so it lands before paint.
   const [prevEffectiveOpen, setPrevEffectiveOpen] = useState(effectiveOpen);
   if (effectiveOpen !== prevEffectiveOpen) {
     setPrevEffectiveOpen(effectiveOpen);
@@ -348,23 +299,17 @@ function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
   // Only preview while collapsed; the docked card (or the width drag) takes over.
   const showingPreview = !effectiveOpen && preview;
   const cardVisible = effectiveOpen || showingPreview;
-  // Docked, the toggle keeps its default collapse click. Collapsed, hover peeks
-  // the popup; the click then depends on whether there's room:
-  //   • Wide enough: pin the full sidebar back open (the toggle's default
-  //     `toggleSidebar`, same as `Cmd/Ctrl+B`) — leave `onClick` unset.
-  //   • Too narrow to pin: just show/hide the peeked popup in place.
+  // Docked, the toggle keeps its default collapse click. Collapsed, hover peeks the
+  // popup; the click then either pins the sidebar back open (wide → leave `onClick`
+  // unset) or toggles the peeked popup in place (too narrow to pin).
   const hoverHandlers: HoverHandlers = effectiveOpen
     ? {}
     : { onHoverStart: showPreview, onHoverEnd: hidePreview, onClick: isNarrow ? togglePreview : undefined };
 
-  // Card geometry differs between the pinned sidebar and the hover popup:
-  //   • Pinned: full window height (`bottom-0`) anchored at the top — flush to
-  //     the window top on macOS (its header carries the title bar) or just below
-  //     the custom title bar off macOS.
-  //   • Popup: a dropdown that drops from under the toggle. It's height-fits-
-  //     content (no `bottom-0`, capped so long content scrolls) and hangs just
-  //     below the title-bar band on every platform, so on macOS it clears the
-  //     traffic lights instead of spanning up behind them like the real sidebar.
+  // Card geometry differs between pinned and popup: pinned is full-height (`bottom-0`)
+  // anchored at the top (flush on macOS, below the custom title bar off macOS); the
+  // popup fits content and hangs just below the title-bar band on every platform, so on
+  // macOS it clears the traffic lights instead of spanning up behind them.
   const dockedTop = mac ? 'top-0' : 'top-[var(--win-titlebar-h)]';
   const previewTop = mac ? MAC_TITLE_BAR_TOP : 'top-[var(--win-titlebar-h)]';
 
@@ -372,9 +317,8 @@ function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
     <>
       {!mac && <WinTitleBar {...hoverHandlers} />}
 
-      {/* Layout spacer: reserves the sidebar's width in the flex row so the inset
-          sits beside the floating card. Zero width when collapsed — the hover
-          popup overlays the page rather than reserving room. */}
+      {/* Layout spacer reserving the sidebar's width so the inset sits beside the card.
+          Zero when collapsed — the hover popup overlays the page instead. */}
       <div className="shrink-0" aria-hidden style={{ width: effectiveOpen ? 'var(--sidebar-width)' : 0 }} />
 
       {cardVisible && (
@@ -393,23 +337,20 @@ function SidebarShell({ mac, onResize, nav, footer, children }: ShellProps) {
               showingPreview ? 'shadow-lg' : 'shadow-sm'
             }`}
           >
-            {/* The pinned macOS card doubles as the title bar; the popup drops
-                below it, so it needs no in-card title bar. */}
+            {/* The pinned macOS card doubles as the title bar; the popup drops below it. */}
             {mac && !showingPreview && <MacTitleBar />}
             <SidebarContent>{nav}</SidebarContent>
             <SidebarFooter>{footer}</SidebarFooter>
           </div>
-          {/* No resize handle on the transient popup — resizing is a pinned-only
-              affordance. */}
+          {/* No resize handle on the transient popup — resizing is pinned-only. */}
           {!showingPreview && <ResizeHandle onResize={onResize} />}
         </div>
       )}
 
       <SidebarInset data-testid="sidebar-inset">{children}</SidebarInset>
 
-      {/* Mac-only trailing chrome: rendered after the inset so the drag band
-          paints over the page background (see MacWindowDragBand); the toggle
-          floats above everything (z-20). */}
+      {/* Mac-only trailing chrome, after the inset so the drag band paints over the
+          page background; the toggle floats above everything (z-20). */}
       {mac && (
         <>
           <MacWindowDragBand />
@@ -433,19 +374,17 @@ export function AppSidebar({ nav, footer, children }: AppSidebarProps) {
   const mac = isMacOS();
   const [width, setWidth] = useSidebarWidth();
 
-  // Publish the drag-chosen width as `--sidebar-width` (overriding the library
-  // default) and, off macOS, the custom title-bar height — both so the bar and
-  // the sidebar offset can read it from one place (see `WIN_TITLE_BAR_HEIGHT_PX`).
+  // Publish the drag-chosen width as `--sidebar-width` and, off macOS, the custom
+  // title-bar height, so the bar and the sidebar offset read both from one place.
   const style = {
     '--sidebar-width': `${width}px`,
     ...(mac ? {} : { '--win-titlebar-h': WIN_TITLE_BAR_HEIGHT_PX }),
   } as CSSProperties;
 
   return (
-    // The library's provider wrapper hardcodes `min-h-svh` (the window viewport);
-    // off macOS the app is inset inside `WindowFrame`, so override it to fill the
-    // frame instead (see `--app-min-h` in `index.css`). `cn` (tailwind-merge)
-    // dedupes the `min-h-*` utilities, keeping ours.
+    // The provider wrapper hardcodes `min-h-svh`; off macOS the app is inset inside
+    // `WindowFrame`, so override it to fill the frame instead (`--app-min-h`). `cn`
+    // (tailwind-merge) dedupes the `min-h-*` utilities, keeping ours.
     <SidebarProvider style={style} className="min-h-(--app-min-h)">
       <SidebarShell mac={mac} onResize={setWidth} nav={nav} footer={footer}>
         {children}

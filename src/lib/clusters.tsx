@@ -18,10 +18,10 @@
 // `clustersWatch` (Cluster kind) and `clusterCachesWatch` (ClusterCache kind),
 // each replaying the current set as `Added` changes on subscribe, then streaming
 // `Added`/`Modified`/`Deleted` per object. This provider reduces each stream into
-// a map keyed by object id, then **joins** the caches onto the clusters
-// client-side (a cluster's active cache is the one whose `serverUid` matches its
-// last-probed `status.server.uid`) — so consumers still see a Kubernetes-shaped
-// `Cluster` with `spec`/`status`/`activeCache`, exactly as before the split.
+// a map keyed by object id, then joins the caches onto the clusters client-side (a
+// cluster's active cache is the one whose `serverUid` matches its last-probed
+// `status.server.uid`), so consumers see a Kubernetes-shaped `Cluster` with
+// `spec`/`status`/`activeCache`.
 import { createContext, useContext, useMemo } from 'react';
 
 import { graphql } from '@/gql';
@@ -117,10 +117,9 @@ const ClustersContext = createContext<ClustersContextValue | null>(null);
 // A map keyed by object id, accumulated from a delta stream.
 export type Keyed<T> = ReadonlyMap<string, T>;
 
-// Apply one delta-watch change to a keyed map, returning a NEW map (fresh
-// identity so React re-renders): Added/Modified upsert by id, Deleted removes.
-// Shared by every delta-watch reducer (this file's cluster/cache streams and the
-// dashboard nav's kind-catalog stream).
+// Apply one delta-watch change to a keyed map, returning a fresh map (new identity
+// so React re-renders): Added/Modified upsert by id, Deleted removes. Shared by
+// every delta-watch reducer (this file's streams and the dashboard nav's).
 export function applyChange<T>(prev: Keyed<T> | undefined, type: string, id: string, entity: T): Keyed<T> {
   const next = new Map(prev);
   if (type === 'Deleted') next.delete(id);
@@ -129,9 +128,9 @@ export function applyChange<T>(prev: Keyed<T> | undefined, type: string, id: str
 }
 
 export function ClustersProvider({ children }: { children: React.ReactNode }) {
-  // Each stream is reduced into its own id-keyed map: the `Added` snapshot
-  // builds the map, later deltas patch it. useWatchSubscription resets the map
-  // to `undefined` ("not reported yet") on a transport reconnect.
+  // Each stream reduces into its own id-keyed map: the `Added` snapshot builds it,
+  // later deltas patch it. useWatchSubscription resets the map to `undefined`
+  // ("not reported yet") on a transport reconnect.
   const [{ data: clusterMap }] = useWatchSubscription(
     { query: ClustersWatchSubscription },
     (prev: Keyed<ClusterRow> | undefined, data) => {
@@ -160,9 +159,8 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
     }));
   }, [clusterMap, cacheMap]);
 
-  // No `error` branch (subscribe-exchange reconnects transport drops
-  // internally), and a memo keeps the context value stable between non-push
-  // re-renders.
+  // No `error` branch — subscribe-exchange reconnects transport drops internally.
+  // The memo keeps the context value stable between non-push re-renders.
   const value = useMemo<ClustersContextValue>(() => ({ clusters }), [clusters]);
   return <ClustersContext.Provider value={value}>{children}</ClustersContext.Provider>;
 }

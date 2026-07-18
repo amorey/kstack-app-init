@@ -14,23 +14,17 @@
 
 //! Windows native event sources for the wake/network-return → `Poke` driver.
 //!
-//! Both use **callback-based** notifications, so there is no hidden window or
-//! message pump to run (a message-only window would not even receive the power
-//! *broadcast*):
+//! Both use callback-based notifications, so there's no hidden window or message
+//! pump:
 //!
-//! - **Wake**: `PowerRegisterSuspendResumeNotification` with
-//!   `DEVICE_NOTIFY_CALLBACK` invokes our routine on resume; a
-//!   `PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND` forwards a
-//!   [`RawEvent::Resumed`].
-//! - **Network**: `NotifyNetworkConnectivityHintChange` (with an initial
-//!   notification to prime the baseline) invokes our routine on connectivity
-//!   changes; the hint's `ConnectivityLevel` is mapped by
-//!   [`core::win_connectivity_is_online`] and forwarded as
-//!   [`RawEvent::NetworkChanged`].
+//! - **Wake**: `PowerRegisterSuspendResumeNotification` (`DEVICE_NOTIFY_CALLBACK`)
+//!   forwards a [`RawEvent::Resumed`] on the `PBT_APMRESUME*` codes.
+//! - **Network**: `NotifyNetworkConnectivityHintChange` (initial notification
+//!   primes the baseline) maps the hint's `ConnectivityLevel` via
+//!   [`core::win_connectivity_is_online`] into a [`RawEvent::NetworkChanged`].
 //!
-//! Both callbacks fire on system threads and forward through the [`WIN_TX`]
-//! global with `try_send` (best-effort, non-blocking). A shutdown task
-//! unregisters both notifications on app Quit.
+//! Both callbacks fire on system threads and forward through the [`WIN_TX`] global
+//! with best-effort `try_send`. A shutdown task unregisters both on app Quit.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -58,19 +52,17 @@ use super::core::{self, RawEvent};
 /// carry only an opaque context we don't use.
 static WIN_TX: OnceLock<Sender<RawEvent>> = OnceLock::new();
 
-/// Registration handle for the suspend/resume notification (as `isize`, since
-/// the raw `HPOWERNOTIFY`/`HANDLE` pointer is not `Send`). `0` = unregistered.
+/// Suspend/resume registration handle, as `isize` (the raw `HPOWERNOTIFY` isn't
+/// `Send`). `0` = unregistered.
 static POWER_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
-/// Registration handle for the connectivity-hint notification (as `isize`).
+/// Connectivity-hint registration handle, as `isize`.
 static NET_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
-/// Spawns the Windows wake + network sources.
-///
-/// `app` is unused on Windows (callbacks need no main-thread context); accepted
-/// to match the cross-platform `spawn_sources` shape.
+/// Spawns the Windows wake + network sources. `app` is unused (callbacks need no
+/// main-thread context); accepted to match the cross-platform shape.
 pub fn spawn_sources(_app: &AppHandle, tx: Sender<RawEvent>, shutdown: CancellationToken) {
-    // Storing the sender is the idempotency gate — a second call is a no-op.
+    // Storing the sender is the idempotency gate.
     if WIN_TX.set(tx).is_err() {
         return;
     }
@@ -85,17 +77,16 @@ pub fn spawn_sources(_app: &AppHandle, tx: Sender<RawEvent>, shutdown: Cancellat
     });
 }
 
-/// Registers the resume-from-sleep callback (no window required).
+/// Registers the resume-from-sleep callback.
 fn register_power_notification() {
-    // The OS copies Callback + Context out of this struct during the call, so a
-    // local is fine — it need not outlive the registration.
+    // The OS copies Callback + Context out during the call, so a local is fine.
     let mut params = DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
         Callback: Some(power_callback),
         Context: std::ptr::null_mut(),
     };
 
     let mut handle: HANDLE = std::ptr::null_mut();
-    // SAFETY: a valid callback + out-handle; DEVICE_NOTIFY_CALLBACK selects the
+    // SAFETY: valid callback + out-handle; DEVICE_NOTIFY_CALLBACK selects the
     // callback (not window) recipient form.
     let ret = unsafe {
         PowerRegisterSuspendResumeNotification(
@@ -116,7 +107,7 @@ fn register_power_notification() {
 /// initial notification.
 fn register_network_notification() {
     let mut handle: HANDLE = std::ptr::null_mut();
-    // SAFETY: a valid callback + out-handle; `1` (TRUE) requests an initial
+    // SAFETY: valid callback + out-handle; `1` (TRUE) requests an initial
     // notification so the edge detector gets a baseline.
     let ret = unsafe {
         NotifyNetworkConnectivityHintChange(
@@ -138,8 +129,8 @@ fn register_network_notification() {
 fn unregister_all() {
     let power = POWER_HANDLE.swap(0, Ordering::SeqCst);
     if power != 0 {
-        // SAFETY: a handle we registered and have not yet unregistered.
-        // HPOWERNOTIFY is an `isize`, so the stored value is passed directly.
+        // SAFETY: a handle we registered and have not yet unregistered;
+        // HPOWERNOTIFY is an `isize`, passed directly.
         unsafe { PowerUnregisterSuspendResumeNotification(power) };
     }
     let net = NET_HANDLE.swap(0, Ordering::SeqCst);
@@ -149,9 +140,8 @@ fn unregister_all() {
     }
 }
 
-/// `DEVICE_NOTIFY_CALLBACK` routine. `event_type` is a `PBT_*` power-broadcast
-/// code; the resume codes forward a [`RawEvent::Resumed`]. Returns
-/// `ERROR_SUCCESS` (`0`) as the API requires.
+/// `DEVICE_NOTIFY_CALLBACK` routine. Forwards a [`RawEvent::Resumed`] on the
+/// resume `PBT_*` codes; returns `ERROR_SUCCESS` (`0`) as the API requires.
 unsafe extern "system" fn power_callback(
     _context: *const c_void,
     event_type: u32,
@@ -165,8 +155,8 @@ unsafe extern "system" fn power_callback(
     0
 }
 
-/// `NotifyNetworkConnectivityHintChange` routine. Maps the hint's connectivity
-/// level to online/offline and forwards a [`RawEvent::NetworkChanged`].
+/// `NotifyNetworkConnectivityHintChange` routine. Forwards a
+/// [`RawEvent::NetworkChanged`] from the hint's connectivity level.
 unsafe extern "system" fn network_callback(
     _context: *const c_void,
     hint: NL_NETWORK_CONNECTIVITY_HINT,

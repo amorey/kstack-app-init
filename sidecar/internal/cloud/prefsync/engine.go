@@ -1,15 +1,12 @@
-// Package prefsync is the sidecar's always-on settings reconciliation
-// engine. It owns one supervised connection to the cloud: take a snapshot,
-// apply it locally, then stream events. On any upstream end/error it
-// reconnects with exponential backoff. Wake/resync signals arrive via the
-// shared poke.Service passed to New.
+// Package prefsync is the always-on settings reconciliation engine. It owns one
+// supervised cloud connection — snapshot, apply locally, stream events — and
+// reconnects with exponential backoff on any end/error. Wake/resync signals
+// arrive via the shared poke.Service passed to New.
 //
-// The path is local-first: Set writes the local store immediately and queues
-// the patch, so an edit takes effect (and survives a restart) even offline.
-// On reconnect the engine drains that queue to the cloud. Until a queued
-// patch is acked it is re-layered over every incoming snapshot/event
-// (prefs.Merge), so a cloud snapshot that predates a local edit can't clobber
-// it.
+// Local-first: Set writes the local store and queues the patch immediately, so
+// an edit survives offline/restart; on reconnect the engine drains the queue to
+// the cloud. Until acked, a queued patch is re-layered (prefs.Merge) over every
+// incoming snapshot/event, so a stale cloud snapshot can't clobber it.
 package prefsync
 
 import (
@@ -24,24 +21,21 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
-// Upstream is the slice of the cloud client the engine needs. Snapshot is a
-// point-in-time read; Watch opens a stream; Update pushes a local patch. Kept
-// minimal so tests can fake it.
+// Upstream is the slice of the cloud client the engine needs: Snapshot (a
+// point-in-time read), Watch (open a stream), Update (push a local patch).
 //
-// Watch's settings channel closes when the upstream ends or ctx is cancelled.
-// The second channel carries the stream's terminal error (buffered, exactly one
-// value): nil for a clean end or ctx cancel, non-nil for a read/transport
-// failure. It lets the engine distinguish an errored close (record it, keep
-// backing off) from a healthy one — a nil channel is treated as a clean end, so
-// fakes that don't model stream errors may return nil.
+// Watch's settings channel closes on upstream end or ctx cancel; the second
+// channel carries the stream's terminal error (buffered, exactly one value): nil
+// for a clean end/cancel, non-nil for a read/transport failure. It distinguishes
+// an errored close (record it, keep backing off) from a healthy one — a nil
+// channel is treated as a clean end.
 type Upstream interface {
 	Snapshot(ctx context.Context) (prefs.Settings, error)
 	Watch(ctx context.Context) (<-chan prefs.Settings, <-chan error, error)
 	Update(ctx context.Context, patch prefs.Settings) (prefs.Settings, error)
 }
 
-// State is the engine's connection lifecycle (exposed for a later
-// syncStatus surface).
+// State is the engine's connection lifecycle.
 type State int
 
 const (
@@ -74,10 +68,9 @@ type Status struct {
 	LastSyncedAt time.Time
 }
 
-// engineOpts holds the backoff knobs and the injectable seams. Zero values get
-// sane defaults. It is not part of the public surface: production calls New
-// (defaults only); white-box tests inject deterministic seams via the option
-// functions below, applied by newWithOptions.
+// engineOpts holds the backoff knobs and injectable seams. Zero values get
+// defaults. Production calls New (defaults only); white-box tests inject
+// deterministic seams via the option functions below.
 type engineOpts struct {
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
@@ -120,9 +113,8 @@ func (o *engineOpts) applyDefaults() {
 	}
 }
 
-// option is an unexported build seam for newWithOptions. Because the type is
-// unexported, only this package's white-box tests can construct one — the
-// production New takes no seams. Mirrors the auth/cloud option pattern.
+// option is an unexported build seam for newWithOptions, constructible only by
+// this package's white-box tests. Mirrors the auth/cloud option pattern.
 type option func(*engineOpts)
 
 // withBackoff overrides the base/max backoff (defaults: 1s/30s).
@@ -154,28 +146,24 @@ type Engine struct {
 	mu     sync.Mutex
 	status Status
 
-	// writeMu serializes the read-merge-write of the store (Set and apply), so
-	// two overlapping patches can't both merge from the same base and have the
-	// later write drop the earlier's field.
+	// writeMu serializes the store's read-merge-write (Set and apply), so two
+	// overlapping patches can't merge from the same base and drop a field.
 	writeMu sync.Mutex
 
-	// activeCancel cancels the in-flight watch so a poke forces a reconnect.
+	// activeCancel cancels the in-flight attempt so a poke forces a reconnect.
 	activeCancel context.CancelFunc
 	// pokeCh wakes an in-flight backoff so Run retries immediately.
 	pokeCh chan struct{}
 }
 
-// New builds an Engine. It does not start anything; call Run. pokeSvc is the
-// resync source (the shared poke.Service); pass nil to disable external wake
-// signals (tests, degraded deployments). The backoff/clock seams use defaults —
-// only this package's white-box tests override them via newWithOptions.
+// New builds an Engine. It starts nothing; call Run. pokeSvc is the resync
+// source; pass nil to disable external wake signals (tests, degraded deployments).
 func New(up Upstream, store *prefs.Store, queue *mutationqueue.Queue, pokeSvc *poke.Service) *Engine {
 	return newWithOptions(up, store, queue, pokeSvc)
 }
 
-// newWithOptions is the build entry point that also accepts the unexported test
-// seams. New is the production wrapper (no options); in-package white-box tests
-// call this directly to inject a deterministic clock/backoff.
+// newWithOptions is the build entry point accepting the unexported test seams;
+// New wraps it with no options.
 func newWithOptions(up Upstream, store *prefs.Store, queue *mutationqueue.Queue, pokeSvc *poke.Service, opts ...option) *Engine {
 	var o engineOpts
 	for _, opt := range opts {
@@ -192,10 +180,9 @@ func newWithOptions(up Upstream, store *prefs.Store, queue *mutationqueue.Queue,
 	}
 }
 
-// Set applies a patch locally and queues it for the cloud (local-first). The
-// store is updated and published immediately; the patch is durably enqueued
-// so it survives a restart; a Poke nudges the engine to push it now if live.
-// Offline, the patch simply waits in the queue.
+// Set applies a patch locally and queues it for the cloud (local-first): the
+// store is updated and published immediately, the patch durably enqueued so it
+// survives a restart, and a Poke nudges the engine to push it now if live.
 func (e *Engine) Set(patch prefs.Settings) error {
 	// Serialize the whole read-merge-write so an overlapping Set or incoming
 	// cloud apply can't merge from the same base and drop one patch's field.
@@ -203,21 +190,18 @@ func (e *Engine) Set(patch prefs.Settings) error {
 	defer e.writeMu.Unlock()
 
 	merged := prefs.Merge(e.store.Get(), patch)
-	// Durably enqueue BEFORE exposing the local change: a published/persisted
-	// edit must never exist without a queued mutation to carry it to the cloud,
-	// otherwise a failed enqueue would leave a local edit the next snapshot can
-	// silently clobber.
+	// Enqueue BEFORE exposing the local change: a persisted edit must never exist
+	// without a queued mutation to carry it to the cloud, else the next snapshot
+	// silently clobbers it.
 	ent, err := e.queue.Enqueue(patch)
 	if err != nil {
 		return err
 	}
 	if _, err := e.store.Set(merged); err != nil {
 		// Local persistence failed: roll the queued mutation back so we never
-		// send/ack an edit to the cloud that was never applied locally. If the
-		// rollback itself fails, surface both errors — the entry may still be
-		// queued (and would reconcile via the cloud), so the caller must know
-		// the local write and queue state diverged rather than assume a clean
-		// no-op.
+		// send an edit that was never applied locally. If the rollback also
+		// fails, surface both — the entry may still be queued, so the caller
+		// must know local write and queue state diverged.
 		if ackErr := e.queue.Ack(ent.ID); ackErr != nil {
 			return errors.Join(err, ackErr)
 		}
@@ -268,9 +252,7 @@ func (e *Engine) Run(ctx context.Context) {
 		// Install the per-attempt cancel BEFORE any upstream call, so a Poke
 		// (e.g. from sign-out) cancels whatever authenticated work is in flight
 		// — Snapshot, the drain's Updates, the Watch open, or the live stream —
-		// not just an already-open watch. Without this, a sign-out racing the
-		// connect could let a Snapshot/Update complete and mutate/ack after the
-		// user signed out.
+		// not just an already-open watch.
 		attemptCtx, cancel := context.WithCancel(ctx)
 		e.setActiveCancel(cancel)
 
@@ -281,10 +263,9 @@ func (e *Engine) Run(ctx context.Context) {
 			}
 			continue
 		}
-		// A poke (sign-out) may have cancelled the attempt between Snapshot
-		// returning and applying it. Don't apply a cloud snapshot or mark it
-		// synced after the user is signing out; abandon and reconnect (which
-		// then fails as signed-out and idles).
+		// A poke (sign-out) may have cancelled between Snapshot returning and
+		// applying it: don't apply a cloud snapshot or mark it synced as the user
+		// signs out; abandon and reconnect.
 		if attemptCtx.Err() != nil {
 			if e.abandonAttempt(ctx, cancel) {
 				return
@@ -292,21 +273,20 @@ func (e *Engine) Run(ctx context.Context) {
 			continue
 		}
 		if err := e.apply(snap, true); err != nil {
-			// Couldn't persist the snapshot locally — don't mark it synced or
-			// open the watch; back off and retry.
+			// Couldn't persist the snapshot: don't mark it synced or open the
+			// watch; back off and retry.
 			if e.connectFailed(ctx, attemptCtx, cancel, &attempt, err) {
 				return
 			}
 			continue
 		}
 
-		// Drain queued local edits to the cloud AFTER pulling the snapshot but
-		// BEFORE opening the watch. Opening the watch after the drain is what
-		// protects an acked edit: the stream's initial/on-subscribe state then
-		// already reflects the pushed edit, so there is no pre-update (stale)
-		// event left in flight that could clobber it once the queue stops
-		// re-layering it. Draining after the snapshot (not before) means a
-		// persistently-rejected Update can't block pulling cloud changes.
+		// Drain queued local edits AFTER the snapshot but BEFORE the watch.
+		// Opening the watch after the drain protects an acked edit: the stream's
+		// on-subscribe state already reflects the pushed edit, so no stale
+		// pre-update event can clobber it once the queue stops re-layering it.
+		// Draining after the snapshot means a persistently-rejected Update can't
+		// block pulling cloud changes.
 		if err := e.drain(attemptCtx); err != nil {
 			if e.connectFailed(ctx, attemptCtx, cancel, &attempt, err) {
 				return
@@ -331,9 +311,8 @@ func (e *Engine) Run(ctx context.Context) {
 		var applyErr error
 		for ev := range ch {
 			if err := e.apply(ev, false); err != nil {
-				// A local store failure mid-stream is a sync failure: tear the
-				// watch down and back off rather than streaming against
-				// unpersisted state.
+				// A store failure mid-stream is a sync failure: tear the watch
+				// down and back off rather than stream against unpersisted state.
 				applyErr = err
 				break
 			}
@@ -344,9 +323,8 @@ func (e *Engine) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		// Fold in the stream's terminal error: a read/transport failure that
-		// closed the stream is a sync failure too, not a clean end — surface it
-		// and don't reset the backoff (a flapping connection must keep escalating).
+		// Fold in the stream's terminal error: a read/transport failure is a sync
+		// failure, not a clean end — surface it and don't reset the backoff.
 		streamErr := applyErr
 		if streamErr == nil && streamErrCh != nil {
 			streamErr = <-streamErrCh
@@ -367,11 +345,8 @@ func (e *Engine) Run(ctx context.Context) {
 }
 
 // drain pushes each queued patch to the cloud in FIFO order, acking on success.
-// It runs synchronously after the snapshot and before the watch each connection
-// cycle, so a failure simply propagates up and the supervisor backs off and
-// retries the still-queued entries on the next cycle. It stops at the first
-// failure (the connection likely dropped), leaving that entry and the rest
-// queued.
+// It stops at the first failure (leaving that entry and the rest queued) and
+// propagates the error, so the supervisor backs off and retries next cycle.
 func (e *Engine) drain(ctx context.Context) error {
 	for _, ent := range e.queue.Pending() {
 		if err := ctx.Err(); err != nil {
@@ -381,15 +356,14 @@ func (e *Engine) drain(ctx context.Context) error {
 			return err
 		}
 		// A poke (sign-out) racing right after the cloud accepted the update must
-		// not let us ack it: bail with the cancellation, leaving the entry queued.
-		// The cloud's deep-merge makes re-sending it next cycle idempotent, so
-		// nothing is lost — and we avoid acking a mutation as the user signs out.
+		// not let us ack it: bail, leaving the entry queued. The cloud's
+		// deep-merge makes re-sending it next cycle idempotent, so nothing is lost.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// If the ack can't be durably persisted, stop draining: the entry is
-		// still in the queue, so continuing would let us consider already-sent
-		// patches drained while a restart would replay them. Retry next cycle.
+		// If the ack can't be persisted, stop: the entry is still queued, so
+		// continuing would treat an already-sent patch as drained while a restart
+		// would replay it. Retry next cycle.
 		if err := e.queue.Ack(ent.ID); err != nil {
 			return err
 		}
@@ -398,14 +372,13 @@ func (e *Engine) drain(ctx context.Context) error {
 }
 
 // apply reconciles an incoming cloud value: still-pending local patches are
-// re-layered on top (so a snapshot can't clobber an unacked edit), then the
-// result is written to the store (which dedups + publishes only on change).
-// snapshot==true stamps LastSyncedAt. A store failure is returned so the
-// caller treats it as a sync failure rather than marking unpersisted state as
-// synced and draining queued mutations against it.
+// re-layered on top (so a snapshot can't clobber an unacked edit), then written
+// to the store (which dedups + publishes only on change). snapshot==true stamps
+// LastSyncedAt. A store failure is returned so the caller treats it as a sync
+// failure rather than marking unpersisted state as synced.
 func (e *Engine) apply(v prefs.Settings, snapshot bool) error {
-	// Serialize against Set (and other applies): the re-layer + store write must
-	// be atomic so a concurrent local edit can't be lost.
+	// Serialize against Set (and other applies) so the re-layer + store write is
+	// atomic and a concurrent local edit can't be lost.
 	e.writeMu.Lock()
 	merged := v
 	for _, ent := range e.queue.Pending() {
@@ -435,21 +408,19 @@ func (e *Engine) setActiveCancel(c context.CancelFunc) {
 	e.mu.Unlock()
 }
 
-// clearActive unregisters the per-attempt cancel and cancels it, so the
-// attempt's context is released and a later Poke doesn't cancel a stale one.
+// clearActive unregisters and cancels the per-attempt cancel, releasing the
+// context so a later Poke doesn't cancel a stale one.
 func (e *Engine) clearActive(cancel context.CancelFunc) {
 	e.setActiveCancel(nil)
 	cancel()
 }
 
 // connectFailed handles a failure of a pre-Live connection step (snapshot,
-// snapshot-apply, drain, or watch open). A poke (sign-out / forced resync)
-// cancels the per-attempt context while the parent ctx is still alive; that's
-// an intentional restart, not a sync failure, so it must not record an error or
-// ratchet backoff — it's routed to abandonAttempt for an immediate reconnect.
-// Otherwise it tears down the in-flight attempt and enters the Offline backoff.
-// It returns true if ctx ended during the wait (Run should exit); the caller
-// otherwise continues to the next attempt.
+// snapshot-apply, drain, or watch open). If a poke cancelled the per-attempt
+// context while the parent ctx is still alive, that's an intentional restart —
+// routed to abandonAttempt for an immediate reconnect, no error recorded, no
+// backoff. Otherwise it tears down the attempt and enters Offline backoff.
+// Returns true if ctx ended during the wait (Run should exit).
 func (e *Engine) connectFailed(ctx, attemptCtx context.Context, cancel context.CancelFunc, attempt *int, err error) bool {
 	if ctx.Err() == nil && attemptCtx.Err() != nil {
 		return e.abandonAttempt(ctx, cancel)
@@ -458,11 +429,10 @@ func (e *Engine) connectFailed(ctx, attemptCtx context.Context, cancel context.C
 	return e.enterWaiting(ctx, attempt, StateOffline, err.Error())
 }
 
-// abandonAttempt tears down an attempt that a poke cancelled mid-step: there is
-// no failure to record and backoff must not escalate. It drains the pending
-// poke token — the immediate reconnect already serves the poke's intent, so the
-// token must not also short-circuit a later genuine backoff. Returns true if
-// the parent ctx ended (Run should exit).
+// abandonAttempt tears down an attempt a poke cancelled mid-step (no failure to
+// record, no backoff escalation). It drains the pending poke token — the
+// immediate reconnect already serves the poke, so the token must not also
+// short-circuit a later genuine backoff. Returns true if the parent ctx ended.
 func (e *Engine) abandonAttempt(ctx context.Context, cancel context.CancelFunc) bool {
 	e.clearActive(cancel)
 	select {
@@ -482,9 +452,9 @@ func (e *Engine) backoffDelay(attempt int) time.Duration {
 	return e.opt.jitter(d)
 }
 
-// enterWaiting records the retry state and sleeps the backoff delay, racing
-// the (injectable) sleep against a poke. attempt stops incrementing once the
-// delay reaches the cap. Returns true if ctx ended during the wait.
+// enterWaiting records the retry state and sleeps the backoff delay, racing the
+// sleep against a poke. attempt stops incrementing once the delay hits the cap.
+// Returns true if ctx ended during the wait.
 func (e *Engine) enterWaiting(ctx context.Context, attempt *int, st State, errMsg string) bool {
 	d := e.backoffDelay(*attempt)
 	if e.opt.baseBackoff<<*attempt < e.opt.maxBackoff {

@@ -24,10 +24,10 @@
 //!   `CFRunLoop` and forwards [`RawEvent::NetworkChanged`]; the core derives the
 //!   offline→online edge.
 //!
-//! Both sources are passive/idle once installed; we don't tear them down on
-//! shutdown — the observer and the run-loop thread are leaked for the process
-//! lifetime (they die with the process), mirroring `dock_menu`'s leaked statics.
-//! Once the supervisor's receiver drops, their `try_send`s simply no-op.
+//! Both sources are passive once installed; we don't tear them down on shutdown
+//! — the observer and run-loop thread are leaked for the process lifetime,
+//! mirroring `dock_menu`'s leaked statics. Once the supervisor's receiver drops,
+//! their `try_send`s simply no-op.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::OnceLock;

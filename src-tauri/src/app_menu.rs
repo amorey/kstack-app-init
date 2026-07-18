@@ -29,15 +29,13 @@ use tauri::Manager;
 
 /// Builds and installs the application menu bar (macOS only).
 ///
-/// On macOS this constructs a single "File" submenu with a "New Window" item
-/// (`CmdOrCtrl+N`) and a "Quit" item (`CmdOrCtrl+Q`), sets it as the global
-/// menu bar, and registers a menu-event handler.
+/// On macOS this builds a "File" submenu with "New Window" (`CmdOrCtrl+N`) and
+/// "Quit" (`CmdOrCtrl+Q`), sets it as the global menu bar, and registers a
+/// menu-event handler.
 ///
-/// On **Linux/Windows this is a no-op**: the native menu would render as a bar
-/// *inside* each window, which we don't want. There the webview's in-app
-/// `AppMenu` provides the same New Window / Quit affordances and owns
-/// the matching `Ctrl`-modified shortcuts, driving them through the
-/// `new_window` / `quit` Tauri commands (see `commands.rs`).
+/// On Linux/Windows this is a no-op: the native menu would render as a bar
+/// *inside* each window, so the webview's `AppMenu` provides the same New
+/// Window / Quit affordances via the `new_window` / `quit` commands instead.
 ///
 /// "Quit" is a custom item rather than [`SubmenuBuilder::quit`] on purpose: the
 /// predefined quit terminates the process natively (macOS `terminate:`), which
@@ -47,10 +45,9 @@ use tauri::Manager;
 /// # Errors
 ///
 /// Returns an error if any menu item or submenu fails to build, or if setting
-/// the menu on the app fails.
+/// the menu fails.
 pub fn build_app_menu(app: &AppHandle) -> Result<()> {
-    // Linux/Windows: the native menu is suppressed in favor of the webview
-    // `AppMenu`; nothing to install on the host.
+    // Linux/Windows: nothing to install; the webview's `AppMenu` stands in.
     #[cfg(not(target_os = "macos"))]
     {
         let _ = app;

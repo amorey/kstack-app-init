@@ -12,26 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The per-operation transport-status registry: the side-channel that carries a
-// subscription's connection state from subscribe-exchange (which owns the
-// host-side SSE lifecycle) to useWatchSubscription (which renders it), keyed by
-// urql's `operation.key`. It replaces the old in-band synthetic reset frame:
-// the reset signal now travels here, off the data channel, so a subscription's
-// `data` is only ever real GraphQL data (or `undefined`).
+// Per-operation transport-status registry, keyed by urql's `operation.key`. Carries
+// a subscription's connection state from subscribe-exchange (which owns the SSE
+// lifecycle) to useWatchSubscription.
 //
-// Two fields per key:
-//   - `connected` — up now? Flipped true on the host's `open` frame, false on
-//     any drop. Consumers render "connecting/reconnecting" from it.
-//   - `generation` — a **process-wide monotonic serial** stamped at each
-//     successful `open` (never bumped on a drop). It's the reset primitive: the
-//     hook rebuilds its accumulator whenever the generation it folded under no
-//     longer matches the current one, so a reconnect's snapshot replaces
-//     prior-connection state without a data frame. It is deliberately *global*,
-//     not a per-key counter: urql retains a `useSubscription` accumulator across
-//     a variables change (a new op key) and across a same-key pause/re-execute,
-//     so a per-key counter restarting at 1 could match that carried-over tag and
-//     fold new frames onto stale state. A globally-unique serial guarantees the
-//     retained tag can never alias a different (or reopened) connection's.
+//   - `connected` — is the connection up right now?
+//   - `generation` — a process-wide monotonic serial stamped on each successful open.
+//     The hook rebuilds its accumulator when the generation it folded under stops
+//     matching, so a reconnect's snapshot replaces prior state. It's global rather
+//     than per-key because urql retains accumulators across variable changes and
+//     pause/re-execute, where a per-key counter could alias a carried-over tag.
 export type TransportStatus = { connected: boolean; generation: number };
 
 // A single shared frozen default so an unknown key returns a referentially
@@ -86,19 +76,18 @@ export function subscribeStatus(key: number, cb: () => void): () => void {
   };
 }
 
-// The next connection-open serial. Monotonic across the whole process (all
-// keys), so every open is globally unique — see `generation` on TransportStatus.
+// Monotonic across the whole process, so every open is globally unique — see
+// `generation` on TransportStatus.
 let connectionSerial = 0;
 
-// A connection opened: up, and a fresh globally-unique generation (the hook's
-// reset trigger).
+// Mark up with a fresh globally-unique generation (the hook's reset trigger).
 export function markConnected(key: number) {
   connectionSerial += 1;
   set(key, { connected: true, generation: connectionSerial });
 }
 
-// A connection dropped: down, but the generation is untouched — a drop is not a
-// new connection, so the hook keeps its last-known data through the outage.
+// Mark down but keep the generation — a drop isn't a new connection, so the hook
+// keeps its last-known data through the outage.
 export function markDisconnected(key: number) {
   set(key, { connected: false, generation: getStatus(key).generation });
 }

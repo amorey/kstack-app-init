@@ -35,12 +35,10 @@ import { ConnectionStatus } from '@/lib/connection-status';
 import { DialogProvider } from '@/lib/dialog';
 
 export function AppLayout() {
-  // The resource nav is a dashboard-mode affordance, so it's mounted in the
-  // sidebar only while the dashboard route is active — chat mode shows just the
-  // mode switch. This layout stays mounted across the chat<->dashboard switch
-  // (only the `Outlet` swaps), so it must subscribe to the location to recompute
-  // the mode: `useLocation` re-renders on every navigation, whereas
-  // `useMatchRoute` here would read stale until the window reloaded.
+  // The resource nav mounts in the sidebar only in dashboard mode. This layout
+  // stays mounted across the chat<->dashboard switch (only the `Outlet` swaps), so
+  // it subscribes to the location via `useLocation` (re-renders on every
+  // navigation) rather than `useMatchRoute` (would read stale until a reload).
   const pathname = useLocation({ select: (location) => location.pathname });
   const onDashboard = pathname === '/dashboard' || pathname.startsWith('/dashboard/');
 

@@ -798,8 +798,7 @@ func TestDrainDoesNotAckAfterCancel(t *testing.T) {
 }
 
 // B6: a Signal received from the Notifier collapses the backoff and triggers
-// an immediate reconnect — the wakeLoop test that was never written when the
-// detector lived inside the engine.
+// an immediate reconnect.
 func TestEngine_NotifierSignalPokes(t *testing.T) {
 	store, q := newStoreQueue(t)
 	// Upstream always fails Snapshot so the engine parks in backoff.

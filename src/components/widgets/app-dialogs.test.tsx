@@ -19,11 +19,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DialogProvider, useDialog, type AppDialogProps } from '@/lib/dialog';
 
-// Stub the real panel (it needs the GraphQL/clusters provider stack) with a
-// probe that reflects its controlled `open` prop and can request a close. The
-// real panel's `Dialog` wrapper reports close-completion to the host once the
-// exit animation settles; stand in for that by calling `notifyClosed` when
-// closed, so the host's exit-then-unmount lifecycle can be exercised.
+// Stub the real panel (it needs the GraphQL/clusters provider stack) with a probe
+// that reflects its controlled `open` prop and can request a close. The real
+// panel's `Dialog` reports close-completion once the exit animation settles; stand
+// in for that by calling `notifyClosed` when closed, exercising the host's
+// exit-then-unmount lifecycle.
 vi.mock('@/components/widgets/cluster-sync-panel', () => ({
   ClusterSyncPanel: ({ open, onOpenChange }: AppDialogProps) => {
     const { notifyClosed } = useDialog();

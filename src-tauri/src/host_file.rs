@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `host.json` — the host's persisted settings file.
+//! `host.json` — the host's persisted settings file (`app_config_dir()/host.json`)
+//! and the durable source of truth for what it holds; the webview keeps no copy.
 //!
-//! Holds the settings the Rust host needs (chiefly at startup, before any
-//! webview exists), under `app_config_dir()/host.json`. It is the durable
-//! source of truth for those settings — the webview keeps no copy of its own.
 //! It reaches the webview two ways, both fed from one read in
 //! `window_manager::build_window`: [`init_script`] exposes the file as the
 //! `window.__KSTACK_HOST__` global before any page script runs (synchronous
@@ -24,15 +22,15 @@
 //! keeps already-open windows in step. The webview writes back through the
 //! general `update_host_file` command (see `commands.rs`).
 //!
-//! Today it carries one value: the color-scheme preference, which
+//! It carries one value today: the color-scheme preference, which
 //! `window_manager` turns into a native window background so a freshly created
 //! window's first frame matches the app's scheme.
 //!
 //! The format is a single versioned JSON object with optional fields; updates
 //! are partial ([`HostFilePatch`]) and merge onto the current contents, so
-//! adding a setting is a new `Option` field on [`HostFile`]/[`HostFilePatch`],
-//! not a new command. Reads are defensive (missing or corrupt file → defaults)
-//! and writes are atomic (unique temp file + rename).
+//! adding a setting is a new `Option` field, not a new command. Reads are
+//! defensive (missing or corrupt file → defaults) and writes are atomic (unique
+//! temp file + rename).
 
 use std::path::{Path, PathBuf};
 

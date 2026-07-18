@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// React-side auth state, sourced entirely from the sidecar over GraphQL.
-// The renderer never holds tokens: the sidecar owns the OAuth flow + OS
-// keychain, and publishes the current auth state on the `authStateWatch`
-// subscription (current snapshot first, then deltas on sign-in / sign-out /
-// refresh). `login`/`logout` are thin `authLoginStart`/`authLogout` mutations — the
-// resulting state change arrives back over the same subscription, so there's
-// one source of truth. Sign-in is non-blocking: the mutation returns as soon
-// as the sidecar opens the browser; the signed-in state lands later via the
-// subscription (or not at all if the user abandons the browser flow).
+// React-side auth state, sourced entirely from the sidecar over GraphQL. The
+// renderer never holds tokens: the sidecar owns the OAuth flow + OS keychain and
+// publishes auth state on `authStateWatch` (snapshot first, then deltas on
+// sign-in/sign-out/refresh). `login`/`logout` are thin `authLoginStart`/`authLogout`
+// mutations whose resulting state change arrives back over the same subscription,
+// so there's one source of truth. Sign-in is non-blocking: the mutation returns
+// once the sidecar opens the browser; the signed-in state lands later via the
+// subscription (or not at all if the user abandons the flow).
 import { createContext, useCallback, useContext, useMemo } from 'react';
 import { useMutation } from 'urql';
 
@@ -78,9 +77,8 @@ type AuthStateContextValue = {
 
 const AuthStateContext = createContext<AuthStateContextValue | null>(null);
 
-// toAuthState adapts the GraphQL shape to the renderer's AuthState, mirroring its
-// nesting. Identity is null while signed out, so an absent identity reads as
-// anonymous regardless of the boolean.
+// Adapt the GraphQL shape to the renderer's AuthState. Identity is null while
+// signed out, so an absent identity reads as anonymous regardless of the boolean.
 function toAuthState(s: AuthStateWatchSubscription['authStateWatch']): AuthState {
   return {
     authenticated: s.authenticated,
@@ -104,10 +102,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const loading = data === undefined;
 
   // login/logout just fire the mutations; the resulting state arrives over the
-  // subscription. Mutation/transport errors are reported to the error bus by the
-  // GraphQL error exchange — here we only surface them to callers (ProfileMenu
-  // swallows them). The eventual outcome of the async browser sign-in is not a
-  // mutation error; it shows up as an auth-state change (or stays signed-out).
+  // subscription. The GraphQL error exchange reports mutation/transport errors to
+  // the error bus; here we only surface them to callers (ProfileMenu swallows
+  // them). The async browser sign-in's outcome isn't a mutation error — it shows
+  // up as an auth-state change (or stays signed-out).
   const login = useCallback(async () => {
     const res = await runStartLogin({});
     if (res.error) throw res.error;

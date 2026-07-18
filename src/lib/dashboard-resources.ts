@@ -12,20 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The dashboard's resource catalog. `DASHBOARD_NAV` is the **curated** base — the
-// hand-picked kinds that always appear in the sidebar, in the order they should
-// read. The rendered tree is `DASHBOARD_NAV` *augmented at runtime* with the
-// cluster's remaining kinds (from `clusterDataKinds`, live API discovery): every
-// server kind not already curated is bucketed into a group by its api group (see
-// `API_GROUP_TO_GROUP`) and revealed behind a "Show more…" toggle (or, for a
-// childless group, the group's own disclosure). `buildDashboardNav` does that
-// merge; kinds whose api group isn't mapped (including the core group) are left
-// for the Custom Resources work and not rendered here yet.
+// The dashboard's resource catalog. `DASHBOARD_NAV` is the curated base — the
+// hand-picked kinds that always appear, in reading order. The rendered tree augments it
+// at runtime with the cluster's remaining kinds (from `clusterDataKinds` discovery),
+// bucketed into a group by api group (`API_GROUP_TO_GROUP`) and revealed behind a
+// "Show more…" toggle. `buildDashboardNav` does the merge; kinds whose api group isn't
+// mapped (including the core group) are left for Custom Resources.
 //
-// The `resource` URL search param (see `routes/dashboard.tsx`) can therefore hold
-// an id that isn't in the static curated tree — a dynamic kind's id — so
-// `DashboardResource` is a plain string, validated leniently (any non-empty
-// string) rather than against a closed union.
+// The `resource` URL search param can therefore hold a dynamic kind's id not in the
+// static tree, so `DashboardResource` is a plain string, validated leniently.
 export const DASHBOARD_NAV = [
   { id: 'overview', label: 'Overview' },
   { id: 'nodes', label: 'Nodes' },
@@ -88,18 +83,15 @@ export const DASHBOARD_NAV = [
 // e.g. "apps/replicasets"). Open string because dynamic kinds are data-driven.
 export type DashboardResource = string;
 
-// A node in the rendered tree. Discovered (non-curated) kinds always live in
-// `moreChildren`, so the disclosure *style* is derived from the shape rather than
-// stored: a group with curated `children` keeps them visible and hides its
-// `moreChildren` behind a "Show more…" toggle; a group with no curated children
-// (e.g. System) hides its `moreChildren` behind a parent-level chevron (see
-// `DashboardResourceNav`). Either way `moreChildren` sit at the same depth as
-// `children` would.
+// A node in the rendered tree. Discovered kinds always live in `moreChildren`, so the
+// disclosure style is derived from the shape rather than stored: a group with curated
+// `children` hides its `moreChildren` behind a "Show more…" toggle; a childless group
+// (e.g. System) hides them behind a parent-level chevron. Either way `moreChildren` sit
+// at the same depth as `children`.
 //
-// `count` is the number of objects of this kind currently in the active cache,
-// carried straight from the discovered kind's `ServerKind.count`. It's set only on
-// a leaf *kind* node — undefined on group/overview rows, which map to no discovered
-// kind — so the renderer shows a badge only where a real count exists.
+// `count` (objects of this kind in the active cache, from `ServerKind.count`) is set
+// only on a leaf kind node — undefined on group/overview rows — so the renderer badges
+// only where a real count exists.
 export type DashboardNavNode = {
   readonly id: DashboardResource;
   readonly label: string;
@@ -109,8 +101,7 @@ export type DashboardNavNode = {
 };
 
 // One kind advertised by a cluster's API server (a `clusterDataKinds` row). Declared
-// here — not imported from `@/gql` — so this module stays pure and testable. `count`
-// is how many objects of the kind the active cache currently holds.
+// here, not imported from `@/gql`, so this module stays pure and testable.
 export type ServerKind = {
   apiVersion: string;
   kind: string;
@@ -120,19 +111,18 @@ export type ServerKind = {
   count: number;
 };
 
-// The curated groups that can receive discovered kinds. Written as `Extract<…>` of
-// the tree's top-level ids so it stays tied to `DASHBOARD_NAV`: rename or remove a
-// group there and it drops out of this union, which then fails the value check on
-// `API_GROUP_TO_GROUP` below — a build error instead of silently dropped kinds.
+// The curated groups that can receive discovered kinds. `Extract<…>` of the tree's
+// top-level ids ties it to `DASHBOARD_NAV`: rename or remove a group there and it drops
+// out of this union, failing the `API_GROUP_TO_GROUP` value check — a build error
+// instead of silently dropped kinds.
 type TopLevelId = (typeof DASHBOARD_NAV)[number]['id'];
 export type DashboardGroupId = Extract<
   TopLevelId,
   'workloads' | 'network' | 'config-and-storage' | 'security-and-access' | 'system'
 >;
 
-// api group → the curated group its non-curated kinds fall under. api groups not
-// listed here — including the core group ("") — are deferred to the Custom
-// Resources work and produce no entries yet.
+// api group → the curated group its non-curated kinds fall under. Unlisted api groups
+// (including the core group "") are deferred to Custom Resources and produce no entries.
 const API_GROUP_TO_GROUP: Record<string, DashboardGroupId> = {
   apps: 'workloads',
   batch: 'workloads',
@@ -158,11 +148,8 @@ export function apiGroupOf(apiVersion: string): string {
   return slash === -1 ? '' : apiVersion.slice(0, slash);
 }
 
-// Depth-first, parent-before-children, preserving display order — the flat view
-// the id-based helpers below index. Walks both `children` and `moreChildren` so a
-// discovered kind behind a "Show more…" toggle still resolves (label lookup, etc.).
-// Exported so the traversal is testable against an arbitrary tree, not just the
-// live catalog.
+// Depth-first, parent-before-children, preserving display order. Walks both `children`
+// and `moreChildren` so a discovered kind behind a "Show more…" toggle still resolves.
 export function flattenNav(nodes: readonly DashboardNavNode[]): DashboardNavNode[] {
   return nodes.flatMap((node) => [
     node,
@@ -172,8 +159,7 @@ export function flattenNav(nodes: readonly DashboardNavNode[]): DashboardNavNode
 }
 
 // Depth-first search for the node with `id`, walking `children` and `moreChildren`,
-// short-circuiting at the first match — the cheap way to answer "which node is this
-// id" (and, over a subtree, "does this id live here") without flattening the tree.
+// short-circuiting at the first match — answers "which node is this id" without flattening.
 export function findNode(nodes: readonly DashboardNavNode[], id: DashboardResource): DashboardNavNode | undefined {
   let match: DashboardNavNode | undefined;
   nodes.some((node) => {
@@ -183,12 +169,11 @@ export function findNode(nodes: readonly DashboardNavNode[], id: DashboardResour
   return match;
 }
 
-// The api group each curated *kind* leaf belongs to, keyed by its resource plural
-// (its node id). This is what pins a curated leaf to one specific built-in kind: a
-// discovered kind joins to it only when BOTH its api group and resource plural match,
-// so a CRD that reuses a built-in's plural in another api group can't hijack its row
-// or count. Group/overview rows are absent — they stand for no kind, so no discovered
-// kind ever adopts their id or count. The core group is "" (see `apiGroupOf`).
+// The api group each curated kind leaf belongs to, keyed by its resource plural (node
+// id). Pins a curated leaf to one built-in kind: a discovered kind joins only when both
+// api group and resource plural match, so a CRD reusing a built-in's plural in another
+// group can't hijack its row or count. Group/overview rows are absent (they stand for
+// no kind). The core group is "".
 const CURATED_LEAF_API_GROUP: Record<string, string> = {
   nodes: '',
   namespaces: '',
@@ -212,50 +197,38 @@ const CURATED_LEAF_API_GROUP: Record<string, string> = {
   clusterrolebindings: 'rbac.authorization.k8s.io',
 };
 
-// The kind shown when the URL names none: the first node in reading order, so the
-// sidebar's default highlight and the panel's default view agree.
+// The kind shown when the URL names none: the first node in reading order.
 export const DEFAULT_DASHBOARD_RESOURCE: DashboardResource = DASHBOARD_NAV[0].id;
 
-// Fold the optional `resource` URL param into a concrete id: absent ⇒ the default.
-// A present value passes through untouched (it may be a dynamic kind not in the
-// curated tree), so a deep link to a server kind survives; an id that resolves to
-// no node just highlights nothing until its group's kinds load.
+// Fold the optional `resource` URL param into a concrete id: absent ⇒ default, present
+// passes through untouched (it may be a dynamic kind not yet in the tree).
 export function resolveDashboardResource(resource: DashboardResource | undefined): DashboardResource {
   return resource && resource.length > 0 ? resource : DEFAULT_DASHBOARD_RESOURCE;
 }
 
-// The curated leaf id a discovered kind *is*, or undefined when it isn't one of the
-// curated built-ins. Matches on both api group and resource plural (see
-// `CURATED_LEAF_API_GROUP`), so a CRD reusing a built-in's plural in another group —
-// or a plural that happens to equal a group row's id like "workloads" — doesn't
-// collide with it.
+// The curated leaf id a discovered kind is, or undefined when it isn't a curated
+// built-in. Matches on both api group and resource plural, so a CRD reusing a built-in's
+// plural in another group doesn't collide with it.
 function curatedLeafIdForKind(k: ServerKind): string | undefined {
   const group = CURATED_LEAF_API_GROUP[k.resource];
   return group !== undefined && group === apiGroupOf(k.apiVersion) ? k.resource : undefined;
 }
 
-// The nav node id a discovered kind maps to: a curated built-in is addressed by its
-// bare resource plural ("pods"), any other kind by `group/resource`
-// ("apps/replicasets"). The single home for this rule — both the bucketing and the
-// count join key nodes by it.
+// The nav node id a discovered kind maps to: a curated built-in by its bare resource
+// plural ("pods"), any other kind by `group/resource` ("apps/replicasets"). The single
+// home for this rule — both the bucketing and the count join key nodes by it.
 function navIdForKind(k: ServerKind): string {
   return curatedLeafIdForKind(k) ?? `${apiGroupOf(k.apiVersion)}/${k.resource}`;
 }
 
-// Merge the cluster's discovered kinds into the curated base: each non-curated
-// kind whose api group maps to a group is hung off that group's `moreChildren`
-// (sorted by label). The renderer derives the disclosure style from the shape — a
-// group with curated children reveals them behind "Show more…", a childless group
-// (e.g. System) behind a parent-level chevron — so this doesn't decide it here.
-// Kinds in unmapped api groups (incl. core) are skipped — reserved for Custom
-// Resources. Every kind's `count` (from `ServerKind`) is joined onto its leaf node
-// in a single `withCount` pass — curated leaves (which live only in `DASHBOARD_NAV`)
-// and discovered kinds alike, keyed by `navIdForKind`.
+// Merge the cluster's discovered kinds into the curated base: each non-curated kind
+// whose api group maps to a group is hung off that group's `moreChildren` (sorted by
+// label); unmapped groups (incl. core) are skipped for Custom Resources. Every kind's
+// `count` is joined onto its leaf node — curated leaves and discovered kinds alike — in
+// a single `withCount` pass keyed by `navIdForKind`.
 export function buildDashboardNav(serverKinds: readonly ServerKind[]): DashboardNavNode[] {
-  // `buckets`: discovered kinds hung under their group (keyed by group id — a
-  // `DASHBOARD_NAV` node id, so `node.id` lookups need no cast). `countById`: every
-  // kind's object count keyed by the node id it lands on, so `withCount` can reach
-  // curated leaves too. Both filled in one pass.
+  // `buckets`: discovered kinds under their group. `countById`: every kind's count keyed
+  // by the node id it lands on, so `withCount` reaches curated leaves too.
   const buckets = new Map<string, DashboardNavNode[]>();
   const countById = new Map<string, number>();
   const seen = new Set<string>();

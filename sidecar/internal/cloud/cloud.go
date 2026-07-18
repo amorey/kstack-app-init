@@ -56,14 +56,11 @@ type Service struct {
 }
 
 // New builds the cloud settings service over the given auth subsystem. dataDir is
-// the per-machine app data dir for the settings file + write queue; cloudURL is
-// the kstack cloud API base URL (e.g. https://api.kstack.sh). It degrades (no
-// engine, no prefs store) unless dataDir is set and an upstream is available —
-// the api client needs cloudURL plus an oauth2.TokenSource from a configured auth
-// service.
-// New builds the cloud settings service. pokeSvc is the shared resync
-// broadcaster owned by the app; nil disables external wake signals (degraded
-// deployments, tests).
+// the per-machine app data dir for the settings file + write queue; cloudURL is the
+// kstack cloud API base URL (e.g. https://api.kstack.sh); pokeSvc is the shared
+// resync broadcaster (nil disables external wake signals). It degrades (no engine,
+// no prefs store) unless dataDir is set and an upstream is available — the api
+// client needs cloudURL plus an oauth2.TokenSource from a configured auth service.
 func New(dataDir, cloudURL string, authSvc auth.Service, pokeSvc *poke.Service) (*Service, error) {
 	return newWithOptions(dataDir, cloudURL, authSvc, pokeSvc)
 }
@@ -124,19 +121,16 @@ func (s *Service) Start(ctx context.Context) {
 	s.cancel = cancel
 	s.done = make(chan struct{})
 
-	// Wake the engine on every auth sign-in / sign-out. This is the inverse of the
-	// old auth→engine poke: cloud (the dependent) observes auth's session state
-	// stream, and auth knows nothing of the engine. A sign-in pokes the idle
-	// engine so it authenticates and syncs now instead of waiting out its backoff;
-	// a sign-out pokes it to cancel the in-flight authenticated watch (which then
-	// reconnects as signed-out and idles).
+	// Wake the engine on every auth sign-in / sign-out: cloud (the dependent)
+	// observes auth's session state stream, and auth knows nothing of the engine. A
+	// sign-in pokes the idle engine so it authenticates and syncs now instead of
+	// waiting out its backoff; a sign-out pokes it to cancel the in-flight
+	// authenticated watch (which then reconnects as signed-out and idles).
 	//
-	// The stream is latest-value session State (current-on-subscribe). We track
-	// only the Authenticated bit and poke when it flips: the first receive seeds
-	// the baseline without poking (the engine authenticates from the token source
-	// on its own startup), and a routine token refresh leaves Authenticated
-	// unchanged, so it doesn't wake the engine. Coalescing is harmless here — what
-	// matters is the resulting sign-in state, not the path taken to it.
+	// The stream is latest-value session State (current-on-subscribe). We track only
+	// the Authenticated bit and poke when it flips: the first receive seeds the
+	// baseline without poking, and a routine token refresh leaves Authenticated
+	// unchanged, so it doesn't wake the engine.
 	if s.auth != nil {
 		states, cancelSub := s.auth.Subscribe()
 		s.pokeDone = make(chan struct{})

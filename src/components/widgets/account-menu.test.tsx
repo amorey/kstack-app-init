@@ -28,9 +28,9 @@ type AuthStateValue = {
 const authStateValue = vi.fn<() => AuthStateValue>();
 vi.mock('@/lib/auth', () => ({ useAuthState: () => authStateValue() }));
 
-// The account menu opens the overlay dialogs through the `useDialog` controller
-// (it no longer renders them). Stub the controller so we can assert the menu
-// requests the right dialog on select, without a DialogProvider ancestor.
+// The account menu opens the overlay dialogs through the `useDialog` controller.
+// Stub it so we can assert the menu requests the right dialog on select, without a
+// DialogProvider ancestor.
 const openDialog = vi.fn<(id: string) => void>();
 vi.mock('@/lib/dialog', () => ({
   useDialog: () => ({ activeDialog: null, openDialog, closeDialog: vi.fn() }),

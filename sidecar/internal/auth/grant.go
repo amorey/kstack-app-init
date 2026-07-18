@@ -83,14 +83,12 @@ func newGrant(store CredentialsStore, refresh RefreshFunc, opts ...grantOption) 
 	return s
 }
 
-// subscribe returns a latest-value stream of session State plus a cancel func
-// that tears the subscription down. The first receive yields the CURRENT State
-// (current-on-subscribe), then each subsequent change — so a consumer needs no
-// separate state() read to seed itself. Because it is latest-value, a consumer
-// that falls behind catches up to the newest State rather than seeing every
-// intermediate one (fine here: the only transitions are sign-in/out and the
-// occasional token refresh, and consumers care about the resulting state, not
-// the path taken).
+// subscribe returns a latest-value stream of session State plus a cancel func.
+// The first receive yields the current State (current-on-subscribe), then each
+// change — so a consumer needs no separate state() read to seed itself. A
+// consumer that falls behind catches up to the newest State rather than seeing
+// every intermediate one (fine here: consumers care about the resulting state,
+// not the path taken).
 func (s *grant) subscribe() (<-chan State, func()) {
 	rx := s.hub.Receiver()
 	return rx.Chan(), rx.Close
@@ -231,10 +229,9 @@ func (s *grant) ensureLoaded() error {
 	}
 	tok, err := s.store.Load()
 	if err != nil {
-		// A keyring that can't be read (locked, or no Secret Service backend at
-		// all) degrades to signed-out rather than failing every state read — the
-		// user can sign in again. Mark loaded so we don't re-hit the store on
-		// each call. This mirrors the local-first "degrade, never error" contract.
+		// A keyring that can't be read (locked, or no Secret Service backend)
+		// degrades to signed-out rather than failing every state read — the user
+		// can sign in again. Mark loaded so we don't re-hit the store each call.
 		slog.Warn("auth: could not read stored credentials; treating as signed out", "err", err)
 		s.loaded = true
 		return nil

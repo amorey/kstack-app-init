@@ -1,10 +1,8 @@
 // Package app is the sidecar's composition root and lifecycle owner. It builds
 // the shared instances (the poke bus and the cluster, auth, and cloud services),
 // wires the GraphQL and gRPC servers, and multiplexes them onto one h2c handler.
-// main() stays thin: it binds the listener and drives the shutdown
-// surface this package exposes — NotifyShutdown / DrainWithContext / Close —
-// mirroring the server/app split used across the kubetail and kstack-cloud
-// services.
+// main() stays thin: it binds the listener and drives the shutdown surface this
+// package exposes — NotifyShutdown / DrainWithContext / Close.
 package app
 
 import (
@@ -24,13 +22,11 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
-// defaultKeychainService is the OS-keychain service name the sidecar stores the
-// auth token under when Config.KeychainService is empty. It is a product-level,
-// frontend-neutral name (not the desktop app's): the sidecar owns the one
-// credential and future frontends — e.g. a TUI — read it through the sidecar
-// under this same name. The host overrides it (via env) to a dev-specific name
-// in development builds so a dev run and an installed release don't share — and
-// clobber — the same stored sign-in.
+// defaultKeychainService is the OS-keychain service name the auth token is stored
+// under when Config.KeychainService is empty. It's a product-level, frontend-
+// neutral name so any frontend (e.g. a TUI) reads the one credential through the
+// sidecar under it. The host overrides it (via env) to a dev-specific name so dev
+// and release runs don't share — and clobber — the same stored sign-in.
 const defaultKeychainService = "Kstack"
 
 // Config is the subset of process configuration the composition root needs.

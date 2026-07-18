@@ -14,22 +14,20 @@
 
 // The live dashboard resource tree: the curated base (`DASHBOARD_NAV`) merged with
 // the active cluster's discovered kinds. The active kube-context resolves to a
-// cluster (via the cluster registry's kubeconfig source), and `clusterDataKindsWatch`
-// streams that cluster's kind catalog as a Kubernetes-style delta watch — the current
-// catalog as an `Added` burst on subscribe, then per-kind `Added`/`Modified`/`Deleted`
-// as the sync engine writes objects. Because each kind's `count` is live, an object
-// write re-emits the kind as `Modified`, so the sidebar's kinds *and* their counts
+// cluster (via the registry's kubeconfig source), and `clusterDataKindsWatch` streams
+// that cluster's kind catalog as a delta watch — an `Added` burst on subscribe, then
+// per-kind `Added`/`Modified`/`Deleted` as the sync engine writes objects. Each kind's
+// `count` is live (an object write re-emits it as `Modified`), so kinds and counts
 // track the cluster in real time. Both the sidebar nav and the dashboard panel consume
-// this, so they agree on the tree (urql dedupes the shared subscription).
+// this and agree on the tree (urql dedupes the shared subscription).
 //
-// The catalog is populated by the sync engine's discovery pass, which may land *after*
-// this first subscribes (an unsynced cluster has no active cache, so the subscription
-// is paused → curated-only). Two things keep the nav accurate: the subscription is
-// keyed by the active cache id, so a cache swap (repoint / server-UID switch) moves the
-// key and re-subscribes to the new cache; and every frame carries its own cache id, so
-// the reducer/guard tag the catalog by that provenance and drop anything not from the
-// active cache — the prior cache's retained kinds, or a late frame from a superseded
-// subscription — before the new cache's first frame lands.
+// The catalog is filled by the sync engine's discovery pass, which may land after this
+// subscribes (an unsynced cluster has no active cache, so the subscription is paused →
+// curated-only). The subscription is keyed by the active cache id, so a cache swap
+// (repoint / server-UID switch) moves the key and re-subscribes; and every frame
+// carries its own cache id, so the reducer/guard tag the catalog by that provenance and
+// drop anything not from the active cache — the prior cache's retained kinds, or a late
+// straggler from a superseded subscription.
 import { useMemo } from 'react';
 
 import { graphql } from '@/gql';
@@ -68,10 +66,9 @@ function kindKey(k: { apiVersion: string; resource: string }): string {
   return `${k.apiVersion}/${k.resource}`;
 }
 
-// The reduced catalog: the kinds keyed by identity, tagged with the cache id the frames
-// came from (their provenance, read off each frame — not inferred from render state).
-// The tag is what lets both the reducer and the nav-build reject a previous cache's
-// data that urql retains across a re-subscribe (a cache swap).
+// The reduced catalog: kinds keyed by identity, tagged with the cache id the frames
+// came from (read off each frame, not inferred from render state). The tag lets the
+// reducer and nav-build reject a previous cache's data that urql retains across a swap.
 type Catalog = { cacheID: string; kinds: Keyed<KindRow> };
 
 // The rendered dashboard nav for the active context: curated + the cluster's
@@ -83,9 +80,8 @@ export function useDashboardNav(): { nav: DashboardNavNode[] } {
   const { clusters } = useClusters();
 
   // The active context's cluster and its active cache. Only kubeconfig-sourced records
-  // carry a context, so match on that. The catalog lives in a specific cache, so the
-  // subscription is keyed by (cluster id, cache id) — a cache swap under the same
-  // cluster is a different cache id, which moves the key and re-subscribes on its own.
+  // carry a context, so match on that. The subscription is keyed by (cluster id, cache
+  // id), so a cache swap under the same cluster moves the key and re-subscribes.
   const cluster = useMemo(
     () => clusters?.find((c) => c.spec.source.kubeconfig?.context === context),
     [clusters, context],
@@ -94,16 +90,14 @@ export function useDashboardNav(): { nav: DashboardNavNode[] } {
   const cacheID = cluster?.activeCache?.id;
 
   // Reduce the delta stream into a cache-tagged, id-keyed catalog: the `Added` snapshot
-  // builds it, later deltas patch it. urql always invokes the latest handler, so the
-  // reducer's `cacheID` closure is the currently-active cache. Each frame carries its
-  // own provenance (`frameCacheID`), and the two discriminate the two cases a frame from
-  // a "wrong" cache can be: a late straggler from a superseded subscription (urql keeps
-  // the old stream alive until effect cleanup) is *dropped* — preserving the active
-  // cache's accumulated catalog rather than wiping it — while the active cache's own
-  // first frame after a swap (prev still holds the old cache) starts a fresh catalog so
-  // the two caches' kinds never mix. A transport reconnect (same cacheID, full snapshot
-  // replay) is handled one level down: useWatchSubscription resets the catalog to
-  // `undefined` before the replay streams.
+  // builds it, later deltas patch it. urql invokes the latest handler, so the reducer's
+  // `cacheID` closure is the active cache. Comparing it against each frame's provenance
+  // (`frameCacheID`) discriminates the two "wrong cache" cases: a late straggler from a
+  // superseded subscription (urql keeps the old stream alive until cleanup) is dropped,
+  // preserving the active cache's catalog; while the active cache's own first frame after
+  // a swap (prev still holds the old cache) starts a fresh catalog so the two never mix.
+  // A transport reconnect (same cacheID, full replay) is handled one level down:
+  // useWatchSubscription resets the catalog to `undefined` before the replay streams.
   const [{ data }] = useWatchSubscription(
     {
       query: ClusterDataKindsWatchSubscription,
@@ -112,23 +106,19 @@ export function useDashboardNav(): { nav: DashboardNavNode[] } {
     },
     (prev: Catalog | undefined, res) => {
       const { type, kind, cacheID: frameCacheID } = res.clusterDataKindsWatch;
-      // Drop a frame that isn't from the active cache — a late straggler from the old
-      // subscription — leaving the active cache's accumulated catalog untouched. (Once
-      // the active cache has streamed, this is what keeps a straggler from resetting the
-      // catalog to a singleton and losing the rest of the snapshot for good.) With no
-      // catalog yet, seed an empty one tagged for the active cache so the reducer never
-      // yields `undefined` (the build guard renders it curated-only until a real frame).
+      // Drop a straggler from the old subscription, leaving the active cache's catalog
+      // untouched. With no catalog yet, seed an empty one tagged for the active cache so
+      // the reducer never yields `undefined` (the build guard keeps it curated-only).
       if (frameCacheID !== cacheID) return prev ?? { cacheID: cacheID ?? '', kinds: new Map() };
-      // The frame is from the active cache. If prev is still the old cache (the first
-      // frame after a swap), start fresh; otherwise patch the accumulated catalog.
+      // From the active cache. If prev is still the old cache (first frame after a swap),
+      // start fresh; otherwise patch the accumulated catalog.
       const kinds = prev && prev.cacheID === frameCacheID ? prev.kinds : undefined;
       return { cacheID: frameCacheID, kinds: applyChange(kinds, type, kindKey(kind), kind) };
     },
   );
 
-  // Build only from a catalog whose provenance tag matches the active cache — urql
-  // retains the previous cache's accumulated `data` across a swap (and may deliver a
-  // late frame from it), so reject any catalog not tagged for the active cache
+  // Build only from a catalog tagged for the active cache — urql retains the previous
+  // cache's `data` across a swap, so reject anything not tagged for the active cache
   // (curated-only) rather than leaking stale kinds.
   const nav = useMemo(
     () => buildDashboardNav(data && cacheID && data.cacheID === cacheID ? [...data.kinds.values()] : []),

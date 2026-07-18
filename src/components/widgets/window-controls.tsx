@@ -13,12 +13,11 @@
 // limitations under the License.
 
 // Custom window controls (minimize / maximize / close) for the frameless
-// window on Linux/Windows, sitting at the right of the custom title bar. The
-// window is frameless (`decorations(false)`), so there are no OS-native caption
-// buttons to keep — these HTML buttons are styled to read as native (including
-// the Windows-style red close hover). macOS keeps its native traffic lights
-// (drawn over the Overlay title bar by the host), so this renders nothing there.
-// Actions cross into the host via the official `@tauri-apps/api/window` core API.
+// Linux/Windows window, at the right of the custom title bar. With
+// `decorations(false)` there are no OS caption buttons, so these HTML buttons are
+// styled to read as native (including the Windows-style red close hover). macOS
+// keeps its native traffic lights, so this renders nothing there. Actions cross
+// into the host via the `@tauri-apps/api/window` core API.
 import { Minus, Square, X } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
@@ -42,8 +41,7 @@ function close() {
     .catch(() => {});
 }
 
-// Shared button styling; each control adds its own hover treatment. Buttons
-// fill the title-bar height and sit close together with a compact footprint.
+// Shared button styling; each control adds its own hover treatment.
 const BUTTON_CLASS =
   'flex h-full w-8 items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring';
 
@@ -64,9 +62,7 @@ const CONTROLS = [
 ] as const;
 
 export function WindowControls() {
-  // macOS surfaces the native traffic lights; custom controls would be
-  // redundant (and misplaced). Render only on Linux/Windows. No hooks here, so
-  // the early return can live directly in the exported component.
+  // macOS surfaces the native traffic lights; render only on Linux/Windows.
   if (isMacOS()) return null;
   return (
     <div className="flex items-center">

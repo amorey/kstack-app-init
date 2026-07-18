@@ -12,30 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Custom macOS Dock menu (the menu shown when right-clicking the Dock icon).
+//! Custom macOS Dock menu (shown when right-clicking the Dock icon).
 //!
-//! Neither Tauri nor tao expose an API for this — AppKit only obtains the Dock
-//! menu by sending `applicationDockMenu:` to the `NSApplication` delegate, and
-//! tao installs its own delegate (`TaoAppDelegateParent`) without implementing
-//! that selector. So this module:
+//! AppKit only gets the Dock menu by sending `applicationDockMenu:` to the
+//! `NSApplication` delegate, and tao installs its own delegate
+//! (`TaoAppDelegateParent`) without implementing it. So this module defines
+//! [`DockMenuTarget`] (an `NSObject` whose actions drive the [`WindowManager`]),
+//! stores its `NSMenu` and target in process-wide statics, and patches two
+//! implementations onto tao's live delegate class: `applicationDockMenu:` returns
+//! the stored menu, and `applicationShouldTerminate:` reroutes a user Quit through
+//! Tauri's graceful-shutdown hook (a system quit is left alone — see
+//! [`application_should_terminate`]).
 //!
-//! 1. Defines [`DockMenuTarget`], an `NSObject` subclass whose action methods
-//!    (`newWindow:`, `showMainWindow:`) drive the [`WindowManager`].
-//! 2. Builds an `NSMenu` of those items and stores it, along with the target,
-//!    in process-wide statics (the Objective-C runtime needs a stable owner).
-//! 3. Adds an `applicationDockMenu:` implementation to tao's live delegate
-//!    class, which simply returns the stored menu.
-//! 4. Adds an `applicationShouldTerminate:` implementation to the same
-//!    delegate, so a user "Quit" (the Dock menu's appended item, the app
-//!    menu's predefined item) is rerouted through Tauri's graceful-shutdown
-//!    hook instead of terminating the process directly. A system-initiated
-//!    quit — logout, restart, shutdown — is deliberately left to proceed
-//!    normally; see [`application_should_terminate`].
-//!
-//! All of this must run on the main thread, after Tauri/tao has installed the
-//! delegate — `install` is called from the Tauri `setup` hook.
-//!
-//! The module is gated to macOS by its `#[cfg]` declaration in `lib.rs`.
+//! Runs on the main thread after tao installs the delegate — `install` is called
+//! from the Tauri `setup` hook. Gated to macOS by its `#[cfg]` in `lib.rs`.
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
@@ -49,10 +39,9 @@ use tauri::{AppHandle, Manager};
 
 use crate::state::AppState;
 
-/// Wraps a value so it can live in a `static` even though the inner type is not
-/// `Sync`. Sound here because every access happens on the main thread — the
-/// statics are written by `install` (main thread) and read only by the
-/// Objective-C callbacks AppKit dispatches on the main thread.
+/// Wraps a non-`Sync` value so it can live in a `static`. Sound because every
+/// access is on the main thread — `install` writes it, AppKit's main-thread
+/// callbacks read it.
 struct MainThreadStatic<T>(T);
 
 // SAFETY: see the type-level comment — access is main-thread-only by construction.
@@ -62,28 +51,23 @@ unsafe impl<T> Sync for MainThreadStatic<T> {}
 /// Process-wide handle so the Objective-C action callbacks can reach Tauri.
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
-/// Keeps the Dock `NSMenu` alive for the lifetime of the process.
-///
-/// `applicationDockMenu:` returns a borrowed pointer into this; AppKit does not
-/// retain it, so the menu must not be dropped.
+/// Keeps the Dock `NSMenu` alive for the process lifetime; `applicationDockMenu:`
+/// returns a borrowed pointer into it that AppKit does not retain.
 static DOCK_MENU: OnceLock<MainThreadStatic<Retained<NSMenu>>> = OnceLock::new();
 
-/// Keeps the menu's action target alive for the lifetime of the process.
-///
-/// `NSMenuItem` holds only a weak `target`, so the [`DockMenuTarget`] instance
-/// must be owned elsewhere or the menu items would fire into freed memory.
+/// Keeps the menu's action target alive for the process lifetime — `NSMenuItem`
+/// holds only a weak `target`, so it must be owned here or items fire into freed
+/// memory.
 static MENU_TARGET: OnceLock<MainThreadStatic<Retained<DockMenuTarget>>> = OnceLock::new();
 
 define_class!(
-    /// Action target for the Dock menu items.
-    ///
-    /// Holds no state — every callback reaches Tauri through [`APP_HANDLE`].
+    /// Action target for the Dock menu items. Stateless — callbacks reach Tauri
+    /// through [`APP_HANDLE`].
     #[unsafe(super(objc2::runtime::NSObject))]
     #[name = "KstackDockMenuTarget"]
     struct DockMenuTarget;
 
     impl DockMenuTarget {
-        /// Backs the Dock menu's "New Window" item.
         #[unsafe(method(newWindow:))]
         fn new_window(&self, _sender: Option<&AnyObject>) {
             with_state(|app, state| {
@@ -93,7 +77,6 @@ define_class!(
             });
         }
 
-        /// Backs the Dock menu's "Show Main Window" item.
         #[unsafe(method(showMainWindow:))]
         fn show_main_window(&self, _sender: Option<&AnyObject>) {
             with_state(|app, state| {
@@ -115,11 +98,9 @@ fn with_state(f: impl FnOnce(&AppHandle, &AppState)) {
     f(app, &state);
 }
 
-/// Install the custom Dock menu. Must be called on the main thread.
-///
-/// Idempotent: a second call is a no-op (the statics are already set). Any
-/// failure to locate tao's delegate class is logged and swallowed — a missing
-/// Dock menu is not worth aborting startup over.
+/// Install the custom Dock menu. Must run on the main thread. Idempotent, and
+/// any failure to patch tao's delegate is logged and swallowed — a missing Dock
+/// menu isn't worth aborting startup over.
 pub fn install(app: &AppHandle) {
     let Some(mtm) = MainThreadMarker::new() else {
         tracing::error!("dock menu install() called off the main thread");
@@ -134,7 +115,6 @@ pub fn install(app: &AppHandle) {
     let target: Retained<DockMenuTarget> = unsafe { msg_send![DockMenuTarget::class(), new] };
     let menu = build_menu(mtm, &target);
 
-    // OnceLock keeps both alive for the process lifetime (see static docs).
     let _ = MENU_TARGET.set(MainThreadStatic(target));
     let _ = DOCK_MENU.set(MainThreadStatic(menu));
 
@@ -146,12 +126,9 @@ pub fn install(app: &AppHandle) {
     }
 }
 
-/// Build the Dock `NSMenu`: New Window, Show Main Window.
-///
-/// Quit is intentionally omitted — AppKit always appends its own standard
-/// section (Options, window list, Quit) below whatever this menu returns. That
-/// appended "Quit" sends `terminate:`; [`application_should_terminate`] catches
-/// it so the exit still runs through Tauri's graceful-shutdown path.
+/// Build the Dock `NSMenu`: New Window, Show Main Window. Quit is omitted —
+/// AppKit appends its own section (including a Quit that sends `terminate:`,
+/// caught by [`application_should_terminate`]) below whatever this returns.
 fn build_menu(mtm: MainThreadMarker, target: &DockMenuTarget) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
 
@@ -171,31 +148,23 @@ fn build_menu(mtm: MainThreadMarker, target: &DockMenuTarget) -> Retained<NSMenu
     menu
 }
 
-/// Add our `applicationDockMenu:` and `applicationShouldTerminate:`
-/// implementations to tao's live delegate class.
-///
-/// tao registers its delegate as `TaoAppDelegateParent` and (as of tao 0.35)
-/// implements neither selector — so AppKit falls back to the default Dock menu,
-/// and `terminate:` tears the process down directly. We add both methods at
-/// runtime: `applicationDockMenu:` returns the shared [`DOCK_MENU`], and
-/// `applicationShouldTerminate:` reroutes the exit (see that IMP's docs).
+/// Add `applicationDockMenu:` and `applicationShouldTerminate:` to tao's live
+/// delegate class, which (as of tao 0.35) implements neither. The former returns
+/// the shared [`DOCK_MENU`], the latter reroutes the exit (see that IMP's docs).
 fn patch_delegate_class() -> Result<(), &'static str> {
     let mtm = MainThreadMarker::new().ok_or("not on main thread")?;
     let app = NSApplication::sharedApplication(mtm);
 
     let delegate = app.delegate().ok_or("NSApplication has no delegate")?;
 
-    // The delegate's *class* is what owns method implementations. Go through
-    // AnyObject so this works regardless of the protocol-object wrapper type.
+    // The class owns method implementations. Go through AnyObject so it works
+    // regardless of the protocol-object wrapper type.
     let delegate_obj: &AnyObject = delegate.as_ref();
     let class: &AnyClass = delegate_obj.class();
 
-    // `Imp` is `extern "C-unwind" fn()`; transmute each typed IMP to it.
-    //
-    // Objective-C type encodings: receiver (@), selector (:), one object
-    // argument (@) — the NSApplication sender — and a return value that is an
-    // object (@) for the Dock menu and an NSUInteger (Q) for the terminate
-    // reply.
+    // `Imp` is `extern "C-unwind" fn()`; transmute each typed IMP to it. The type
+    // encodings below spell receiver, selector, one object arg, and the return
+    // (object `@` for the menu, NSUInteger `Q` for the terminate reply).
     let dock_menu_imp: Imp = unsafe {
         std::mem::transmute::<
             unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> *mut AnyObject,
@@ -220,11 +189,9 @@ fn patch_delegate_class() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Add `imp` for `sel` to `class`, unless the class already implements `sel`.
-///
-/// The selector check guards against a double patch (`install` is already
-/// idempotent) and leaves any future tao-provided implementation untouched.
-/// `types` is the Objective-C method type encoding.
+/// Add `imp` (with Objective-C type encoding `types`) for `sel` to `class`,
+/// unless the class already implements `sel` — guards against a double patch and
+/// leaves any tao-provided implementation untouched.
 fn add_method_if_absent(
     class: &AnyClass,
     sel: Sel,
@@ -251,9 +218,7 @@ fn add_method_if_absent(
     }
 }
 
-/// `applicationDockMenu:` IMP added to tao's delegate class.
-///
-/// Returns a borrowed (non-retained, autorelease-convention) pointer to the
+/// `applicationDockMenu:` IMP. Returns a borrowed (non-retained) pointer to the
 /// shared Dock menu; AppKit does not take ownership.
 unsafe extern "C-unwind" fn application_dock_menu(
     _self: *mut AnyObject,
@@ -266,22 +231,14 @@ unsafe extern "C-unwind" fn application_dock_menu(
     }
 }
 
-/// `applicationShouldTerminate:` IMP added to tao's delegate class.
-///
-/// AppKit sends `terminate:` for the Dock menu's appended "Quit" item (and the
-/// app menu's predefined Quit). Left to AppKit, that path terminates the
-/// process via `applicationWillTerminate:` and so skips Tauri's
-/// `RunEvent::ExitRequested` graceful-shutdown hook. For a **user** quit we
-/// cancel AppKit's termination (`NSTerminateCancel`) and re-drive the exit
-/// through [`AppHandle::exit`], which *does* emit `ExitRequested` — the same
-/// path the tray's "Quit" already takes. `AppHandle::exit` does not route back
-/// through `terminate:`, so this does not recurse.
-///
-/// A **system-initiated** quit (logout / restart / shutdown — see
-/// [`is_system_initiated_quit`]) is the exception: returning `NSTerminateCancel`
-/// there would abort the user's logout. We return `NSTerminateNow` and let
-/// AppKit terminate normally; `RunEvent::Exit` still runs the cleanup, it just
-/// does not get the richer `ExitRequested` hook.
+/// `applicationShouldTerminate:` IMP. AppKit sends `terminate:` for the Quit
+/// items, which would skip Tauri's `RunEvent::ExitRequested` graceful-shutdown
+/// hook. For a user quit we cancel it (`NSTerminateCancel`) and re-drive through
+/// [`AppHandle::exit`], which emits `ExitRequested` and does not route back
+/// through `terminate:` (so no recursion). A system-initiated quit (logout /
+/// restart / shutdown — see [`is_system_initiated_quit`]) instead returns
+/// `NSTerminateNow`, since cancelling would abort the user's logout; cleanup
+/// still runs via `RunEvent::Exit`.
 unsafe extern "C-unwind" fn application_should_terminate(
     _self: *mut AnyObject,
     _cmd: Sel,
@@ -302,8 +259,7 @@ unsafe extern "C-unwind" fn application_should_terminate(
             NS_TERMINATE_CANCEL
         }
         None => {
-            // Without the handle we cannot re-drive the exit; let AppKit
-            // terminate normally rather than trapping the user in a live app.
+            // Can't re-drive the exit without the handle; let AppKit terminate.
             tracing::error!("applicationShouldTerminate: fired before install()");
             NS_TERMINATE_NOW
         }
@@ -316,13 +272,11 @@ const fn four_char_code(code: [u8; 4]) -> u32 {
     u32::from_be_bytes(code)
 }
 
-/// Whether the in-flight termination was initiated by the OS — a logout,
-/// restart, or shutdown — rather than the user choosing "Quit".
-///
-/// macOS delivers a system quit as a `kAEQuitApplication` (`'quit'`) Apple
-/// Event carrying a `kAEQuitReason` (`'why?'`) parameter. A user "Quit" posts
-/// `terminate:` directly, so there is either no current Apple Event or no quit
-/// reason on it. Codes are from `<CoreServices/.../AppleEvents.h>`.
+/// Whether the in-flight termination came from the OS (logout / restart /
+/// shutdown) rather than the user choosing Quit. macOS delivers a system quit as
+/// a `kAEQuitApplication` (`'quit'`) Apple Event carrying a `kAEQuitReason`
+/// (`'why?'`) parameter; a user Quit posts `terminate:` directly, so there's no
+/// such event. Codes are from `<CoreServices/.../AppleEvents.h>`.
 fn is_system_initiated_quit() -> bool {
     const K_AE_QUIT_APPLICATION: u32 = four_char_code(*b"quit");
     const K_AE_QUIT_REASON: u32 = four_char_code(*b"why?");
@@ -341,8 +295,7 @@ mod tests {
 
     #[test]
     fn packs_big_endian_first_byte_most_significant() {
-        // The Objective-C `'abcd'` literal is the four bytes in order, with
-        // the first byte in the high position.
+        // Mirrors the Objective-C `'abcd'` literal: first byte in the high position.
         assert_eq!(four_char_code([0x12, 0x34, 0x56, 0x78]), 0x1234_5678);
     }
 

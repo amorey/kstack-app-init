@@ -15,22 +15,20 @@
 import { renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The hook composes urql's `useSubscription` (a delta watch reduced into a keyed
-// catalog) with the active-context → cluster/cache join and a cache-aware guard. Mock
-// those seams so the test drives the delta stream + cache state directly and asserts
-// the nav updates live, without standing up a real GraphQL client. The mock stands in
-// for urql's accumulator: it captures the reducer and returns the accumulated data, so
-// `pushFrame` folds a delta through the real reducer just as urql would.
+// The hook composes urql's `useSubscription` with the active-context → cluster/cache
+// join and a cache-aware guard. Mock those seams so the test drives the delta stream +
+// cache state directly, without a real GraphQL client. The mock stands in for urql's
+// accumulator: it captures the reducer and returns the accumulated data, so `pushFrame`
+// folds a delta through the real reducer just as urql would.
 const { useSubscriptionMock } = vi.hoisted(() => ({ useSubscriptionMock: vi.fn() }));
 const { useClustersMock, useActiveKubeContextMock } = vi.hoisted(() => ({
   useClustersMock: vi.fn(),
   useActiveKubeContextMock: vi.fn(),
 }));
-// useWatchSubscription reads the transport-status registry (keyed by op key) to
-// drive its generation-based reset. Mock it so `pushReset` bumps the generation
-// directly (the real registry + reset semantics are covered end-to-end in
-// use-watch-subscription.test.tsx). The snapshot is a stable per-generation
-// object so useSyncExternalStore's getSnapshot stays referentially stable.
+// useWatchSubscription reads the transport-status registry to drive its
+// generation-based reset. Mock it so `pushReset` bumps the generation directly (the
+// real reset semantics are covered in use-watch-subscription.test.tsx). The snapshot is
+// a stable per-generation object so useSyncExternalStore's getSnapshot stays stable.
 const { statusState } = vi.hoisted(() => ({
   statusState: { snapshot: { connected: true, generation: 0 } },
 }));

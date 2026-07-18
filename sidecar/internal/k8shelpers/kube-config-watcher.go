@@ -54,36 +54,28 @@ type KubeConfigWatcher struct {
 
 // NewKubeConfigWatcher constructs a watcher that always returns a usable
 // instance. Missing kubeconfig paths are skipped (logged, not fatal) so
-// the sidecar can start on a fresh machine with no cluster wired up — the
-// renderer's empty-state surfaces this. fsnotify-NewWatcher failures
-// (kernel-level: ENOMEM, ulimit, /proc not mounted) are the only fatal
-// case left, since without an inotify handle we can't watch anything.
+// the sidecar can start on a fresh machine with no cluster wired up. Only
+// a kernel-level fsnotify.NewWatcher failure (ENOMEM, ulimit, /proc not
+// mounted) is fatal, since without an inotify handle nothing can be watched.
 func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
-	// Initialize loading rules (outsources kubeconfig file/env handling to clientcmd library)
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	loadingRules.ExplicitPath = kubeconfigPath
 
-	// Initialize watcher
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 
-	// Always watch the parent directory of each precedence path, never
-	// the file itself. Two reasons:
+	// Always watch the parent directory of each precedence path, never the
+	// file itself:
 	//
-	//   1. Linux inotify detaches a file-level watch the moment the
-	//      inode is unlinked or renamed (the editor / clientcmd
-	//      atomic-replace pattern). Subsequent writes to the new inode
-	//      go unobserved. Parent-dir watches don't have this problem —
-	//      they keep firing across rename-over-write cycles.
-	//   2. It uniformly handles "file exists" and "file absent at
-	//      startup" — the same parent watch surfaces a later CREATE.
+	//   1. inotify detaches a file-level watch the moment the inode is
+	//      unlinked or renamed (the editor/clientcmd atomic-replace pattern);
+	//      parent-dir watches keep firing across rename-over-write cycles.
+	//   2. It uniformly handles "file exists" and "file absent at startup" —
+	//      the same parent watch surfaces a later CREATE.
 	//
-	// inotify and ReadDirectoryChangesW deliver child events natively
-	// when a directory is watched; macOS kqueue does it via fsnotify's
-	// watchDirectoryFiles helper. The eventLoop filter trims dir-level
-	// noise down to just our precedence paths.
+	// The eventLoop filter trims dir-level noise down to our precedence paths.
 	watchedPaths := make(map[string]struct{}, len(loadingRules.GetLoadingPrecedence()))
 	watchedDirs := make(map[string]struct{})
 	for _, pathname := range loadingRules.GetLoadingPrecedence() {
@@ -104,15 +96,13 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 		watchedDirs[dir] = struct{}{}
 	}
 
-	// Load whatever clientcmd resolves from the precedence list. Returns
-	// an empty *api.Config (not an error) when no file is found, which is
-	// the state we want to seed: subscribers get a real pointer, field
-	// resolvers iterate empty maps, the picker renders the empty state.
+	// clientcmd returns an empty *api.Config (not an error) when no file is
+	// found — the state to seed: subscribers get a real pointer and the
+	// picker renders the empty state.
 	cfg, err := loadingRules.Load()
 	if err != nil {
-		// Load only errors on a malformed file, not on absence. Treat as
-		// non-fatal: log it and degrade to an empty config so the rest of
-		// the sidecar surfaces stay up.
+		// Load only errors on a malformed file, not on absence. Degrade to
+		// an empty config so the rest of the sidecar stays up.
 		slog.Warn("kubeconfig load failed, starting with empty config", "err", err)
 		cfg = &api.Config{}
 	}
@@ -173,43 +163,31 @@ func (w *KubeConfigWatcher) eventLoop() {
 	for {
 		select {
 		case err, ok := <-w.watcher.Errors:
-			// Kill goroutine on watcher close
-			if !ok {
+			if !ok { // watcher closed
 				return
 			}
-
-			// Log error and keep listening
 			slog.Error("kubeconfig watcher error", "err", err)
 		case fsEv, ok := <-w.watcher.Events:
-			// Kill goroutine on watcher close
-			if !ok {
+			if !ok { // watcher closed
 				return
 			}
 
-			// Ignore events for files we don't care about. When a parent
-			// dir is watched (for absent precedence paths), fsnotify
-			// delivers events for every child — drop noise here.
+			// A watched parent dir delivers events for every child; keep
+			// only our precedence paths.
 			if _, ok := w.watchedPaths[filepath.Clean(fsEv.Name)]; !ok {
 				continue
 			}
 
-			// Handle fsnotify Create, Write, Remove events
 			if fsEv.Has(fsnotify.Create) || fsEv.Has(fsnotify.Write) || fsEv.Has(fsnotify.Remove) {
-				// Reset timer if it's already running
 				if debounceTimer != nil {
 					debounceTimer.Stop()
 				}
-
-				// Start a new timer
 				debounceTimer = time.AfterFunc(debounceDelay, func() {
-					// Reload config
 					cfg, err := w.reloadConfig()
 					if err != nil {
 						slog.Error("kubeconfig reload failed", "err", err)
 						return
 					}
-
-					// Publish event
 					w.tx.Send(cfg) //nolint:errcheck
 				})
 			}

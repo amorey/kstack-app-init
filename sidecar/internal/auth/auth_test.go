@@ -29,11 +29,10 @@ func (m *memStore) Save(t Token) error {
 }
 
 // Login's synchronous setup returns promptly, and the async tail persists the
-// minted credentials and flips the session to signed-in with the verified
-// identity — observed via Subscribe (no signed-in state on Login's return). The
-// browser/loopback/oauth mechanics are the loginFlow's own concern (see
-// login_test.go); here the login step is faked to a canned tail so the test
-// focuses on the service's setup-then-async-persist + sign-in responsibility.
+// minted credentials and flips the session to signed-in — observed via Subscribe.
+// The login step is faked to a canned tail so the test focuses on the service's
+// setup-then-async-persist + sign-in responsibility (the browser/loopback/oauth
+// mechanics are the loginFlow's own concern, see login_test.go).
 func TestLoginPersistsAndSignsIn(t *testing.T) {
 	store := &memStore{}
 	svc, err := newWithOptions(Config{},
@@ -76,9 +75,7 @@ func TestLoginPersistsAndSignsIn(t *testing.T) {
 
 // When the synchronous setup fails (loopback bind / browser launch), Login
 // surfaces the error to the caller and stays signed out — nothing persisted, no
-// signed-in broadcast. (A failure in the async tail — user cancels, exchange
-// fails — is logged-only and likewise stays signed-out; the synchronous contract
-// is what this test pins.)
+// signed-in broadcast.
 func TestLoginSetupErrorStaysSignedOut(t *testing.T) {
 	store := &memStore{}
 	svc, err := newWithOptions(Config{},

@@ -14,24 +14,17 @@
 
 //! IPC endpoint between the host and the sidecar.
 //!
-//! Two responsibilities for the host↔sidecar transport, deliberately
-//! split so neither type/function pulls in the other's concerns:
-//!   1. **Addressing.** [`Endpoint::pick`] generates a per-instance name —
-//!      a UDS path under a private runtime directory on Unix, a named pipe
-//!      under `\\.\pipe\` on Windows. The host picks the address *before*
-//!      spawning the sidecar and passes it via the `--socket` CLI flag, so
-//!      the sidecar never has to negotiate where to listen. `Endpoint` is
-//!      a pure value — clone it, store it, hand it to a CLI; it does no
-//!      I/O.
-//!   2. **Dialing.** Free functions [`connect`] / [`connect_with_budget`]
-//!      open a [`Stream`] against an `Endpoint` (with capped-backoff
-//!      retry), returning a type that impls `AsyncRead + AsyncWrite +
-//!      Unpin` — what hyper consumes identically on both platforms (for
-//!      both query calls and SSE subscription streams).
+//! Two responsibilities, split so neither pulls in the other's concerns:
+//!   1. **Addressing.** [`Endpoint::pick`] generates a per-instance name — a UDS
+//!      path under a private runtime dir on Unix, a `\\.\pipe\` name on Windows.
+//!      The host picks it *before* spawning the sidecar and passes it via the
+//!      `--socket` CLI flag, so the sidecar never negotiates where to listen.
+//!      `Endpoint` is a pure, I/O-free value.
+//!   2. **Dialing.** [`connect`] / [`connect_with_budget`] open a [`Stream`]
+//!      (with capped-backoff retry) impl'ing `AsyncRead + AsyncWrite + Unpin`,
+//!      which hyper consumes identically on both platforms.
 //!
-//! "Socket" would only describe half of this (Windows named pipes aren't
-//! sockets in the Win32 sense); `ipc` is the platform-neutral name for
-//! the family.
+//! `ipc` is the platform-neutral name; "socket" would exclude Windows named pipes.
 
 use std::path::Path;
 #[cfg(unix)]
@@ -51,16 +44,14 @@ const UNIX_SUN_PATH_MAX: usize = 104;
 /// process never collide on filename — important for parallel test runs.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Default time the host will keep retrying `connect` before giving up.
-/// Sized to cover the sidecar's normal startup window (process exec +
-/// listener bind) with margin, without dragging out app launch on a hard
-/// failure where the sidecar is never going to come up.
+/// Default time the host keeps retrying `connect` before giving up. Covers the
+/// sidecar's normal startup (exec + listener bind) with margin, without dragging
+/// out app launch when the sidecar is never going to come up.
 pub const DEFAULT_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 
-/// Initial delay between connect retries. Doubles each attempt up to
-/// [`MAX_RETRY_DELAY`]. Small enough that a fast-start sidecar is reached on
-/// the first or second poll; large enough that a hard-down socket isn't
-/// busy-looped on.
+/// Initial delay between connect retries, doubling up to [`MAX_RETRY_DELAY`].
+/// Small enough to reach a fast-start sidecar on the first or second poll, large
+/// enough not to busy-loop on a hard-down socket.
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_RETRY_DELAY: Duration = Duration::from_millis(500);
 
@@ -91,9 +82,8 @@ impl Endpoint {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         // `kstack-sidecar-` matches the sidecar's own default name
-        // (sidecar/listen_unix.go:16 — `kstack-sidecar-<pid>.sock`), so
-        // the two halves of the contract are recognizable on disk at a
-        // glance.
+        // (sidecar/listen_unix.go:16), so both halves of the contract are
+        // recognizable on disk at a glance.
         let filename = format!("kstack-sidecar-{pid}-{n}.sock");
         let path: PathBuf = base.join(&filename);
 
@@ -131,11 +121,8 @@ impl Endpoint {
     }
 }
 
-/// Dials `endpoint` with the default budget.
-///
-/// The sidecar takes a few milliseconds to bind after spawn, so callers
-/// should expect at least one retry. See [`connect_with_budget`] for the
-/// retry semantics.
+/// Dials `endpoint` with the default budget. The sidecar takes a few ms to bind
+/// after spawn, so expect at least one retry (see [`connect_with_budget`]).
 pub async fn connect(endpoint: &Endpoint) -> Result<Stream> {
     connect_with_budget(endpoint, DEFAULT_CONNECT_BUDGET).await
 }
@@ -162,10 +149,8 @@ pub async fn connect_with_budget(endpoint: &Endpoint, budget: Duration) -> Resul
 
     use interprocess::local_socket::{traits::tokio::Stream as _, GenericFilePath, ToFsName};
 
-    // `to_fs_name::<GenericFilePath>()` accepts both Unix filesystem
-    // paths and Windows `\\.\pipe\…` strings verbatim — that's the
-    // whole point of using `interprocess`, so we don't have to
-    // cfg-branch on the platform here.
+    // `to_fs_name::<GenericFilePath>()` accepts both Unix paths and Windows
+    // `\\.\pipe\…` strings verbatim, so no platform cfg-branch here.
     let name = endpoint
         .as_arg()
         .to_fs_name::<GenericFilePath>()
@@ -185,8 +170,7 @@ pub async fn connect_with_budget(endpoint: &Endpoint, budget: Duration) -> Resul
                 if !retryable || Instant::now() >= deadline {
                     break err;
                 }
-                // Cap each sleep at the remaining budget so we never
-                // overshoot the caller's deadline.
+                // Cap each sleep at the remaining budget so we never overshoot.
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let sleep_for = delay.min(remaining);
                 tokio::time::sleep(sleep_for).await;

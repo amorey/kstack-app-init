@@ -12,21 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package clustercache owns the sidecar's per-cluster on-disk caches: one
-// SQLite database file per cluster record under the host-supplied data dir.
-// The package owns the lifecycle of those files (open/migrate/quarantine/
-// delete) plus a per-cluster janitor goroutine; it does NOT own syncing —
-// the cluster package's ClusterCacheController starts an engine
-// (internal/cluster/cache/engine) that writes through the ClusterDB this package
-// hands out.
+// Package store owns the sidecar's per-cluster on-disk caches: one SQLite file per
+// cache incarnation under the host-supplied data dir. It owns those files'
+// lifecycle (open/migrate/quarantine/delete) plus a per-cluster janitor goroutine;
+// it does NOT own syncing — the cluster package's ClusterCacheController starts an
+// engine (internal/cluster/cache/engine) that writes through the ClusterDB handed out.
 //
-// Concurrency model: SQLite is opened in WAL mode so readers don't block a
-// writer. We expose two *sql.DB handles against the same file — a single-
-// connection writer pool (no SQLITE_BUSY storms) and a multi-connection
-// reader pool. Callers pick the right one via Reader() / Writer().
+// Concurrency: SQLite runs in WAL mode so readers don't block a writer. Two *sql.DB
+// handles share the same file — a single-connection writer pool (no SQLITE_BUSY
+// storms) and a multi-connection reader pool — picked via Writer() / Reader().
 //
-// Cross-platform: uses the pure-Go modernc.org/sqlite driver so no CGO
-// toolchain is required for darwin/linux/windows builds.
+// Cross-platform: the pure-Go modernc.org/sqlite driver, so no CGO toolchain.
 package store
 
 import (
@@ -57,14 +53,12 @@ var migrationsFS embed.FS
 // three.
 var dbSuffixes = []string{"", "-wal", "-shm"}
 
-// CacheRef identifies one on-disk cache incarnation by the beehive ObjectIDs of
-// the parent Cluster (ClusterID — the directory) and its ClusterCache child
-// (CacheID — the file). Both are beehive AUTOINCREMENT ids (int64), so they are
-// inherently path-safe (digits only) and never reused: a ClusterCache
-// delete+recreate yields a strictly-greater CacheID and thus a fresh file, with
-// no finalize-vs-recreate race. The fields are int64 (not beehive.ObjectID) to
-// keep this leaf package free of a beehive import; the cluster package converts
-// at the call boundary.
+// CacheRef identifies one on-disk cache incarnation by the beehive ObjectIDs of the
+// parent Cluster (ClusterID — the directory) and its ClusterCache child (CacheID —
+// the file). Both are AUTOINCREMENT ids, so they're path-safe (digits only) and
+// never reused: a delete+recreate yields a strictly-greater CacheID and thus a fresh
+// file, with no finalize-vs-recreate race. The fields are int64, not beehive.ObjectID,
+// to keep this leaf package beehive-free; the cluster package converts at the boundary.
 type CacheRef struct {
 	ClusterID int64
 	CacheID   int64
@@ -170,15 +164,14 @@ func (m *Manager) Open(ctx context.Context, ref CacheRef) (*ClusterDB, error) {
 	return cdb, nil
 }
 
-// WatchDB streams the open ClusterDB handle for a CacheID as it changes over the
-// cache's lifecycle: the current handle (or nil if not open) on subscribe, then a
-// fresh value whenever that CacheID is opened (nil→handle), closed (handle→nil),
-// or replaced (e.g. a Clear-cache delete+reopen yields nil then the new handle).
-// Latest-value semantics (via gochan/watch) — a slow consumer converges on the
-// current handle. The channel closes on Manager Shutdown. Long-lived readers (the
-// dashboard's kind catalog watch) use this so they rebind to a cache that opens
-// after they subscribe, or that is swapped under them, instead of binding once to
-// Lookup.
+// WatchDB streams a CacheID's open ClusterDB handle as it changes over the cache's
+// lifecycle: the current handle (nil if not open) on subscribe, then a fresh value
+// on open (nil→handle), close (handle→nil), or replace (a Clear-cache delete+reopen
+// yields nil then the new handle). Latest-value semantics — a slow consumer
+// converges on the current handle. The channel closes on Manager Shutdown.
+// Long-lived readers (the dashboard's kind catalog watch) use it to rebind to a
+// cache that opens after they subscribe, or is swapped under them, instead of
+// binding once to Lookup.
 func (m *Manager) WatchDB(cacheID int64) (<-chan *ClusterDB, func()) {
 	m.mu.Lock()
 	if m.close {
@@ -424,14 +417,12 @@ func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterD
 	}
 
 	// auto_vacuum=INCREMENTAL lets the janitor's PRAGMA incremental_vacuum return
-	// DELETE'd pages to the OS. It can't live in a migration: the runner creates
-	// its schema_migrations table first, and once any table exists the mode is
-	// sticky. It also can't be a plain PRAGMA here — opening the pool already
-	// writes the WAL header (auto_vacuum=0) before this runs. So set the mode and
-	// VACUUM to rewrite the file with it. Gate on the current mode: a fresh DB
-	// reports 0 and needs the one-time conversion; an already-converted DB
-	// reports 2, so we skip the VACUUM — otherwise every reopen would rewrite the
-	// whole file (potentially large) before sync can even start.
+	// freed pages to the OS. It can't live in a migration (the mode is sticky once
+	// any table exists, and the runner creates schema_migrations first) nor be a
+	// plain PRAGMA here (opening the pool already wrote the WAL header with
+	// auto_vacuum=0), so we set the mode and VACUUM to rewrite the file. Gate on the
+	// current mode: only a fresh DB (mode 0) needs the one-time conversion; skipping
+	// an already-converted DB (mode 2) avoids rewriting the whole file on every reopen.
 	const autoVacuumIncremental = 2
 	var mode int
 	if err := writeDB.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil {

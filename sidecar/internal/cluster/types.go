@@ -12,30 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package controllers is the kstack sidecar's Kubernetes logic layer: domain
-// types for clusters and their caches, two beehive controller implementations
-// (Cluster, ClusterCache), a kubeconfig importer, and the two cache sub-packages
-// (cache/store, cache/engine) that back the per-cluster on-disk mirrors.
+// Package cluster is the kstack sidecar's Kubernetes logic layer: domain types for
+// clusters and their caches, two beehive controllers (Cluster, ClusterCache), a
+// kubeconfig importer, and the two cache sub-packages (cache/store, cache/engine)
+// that back the per-cluster on-disk mirrors.
 //
 // The two beehive resource kinds and their ownership chain:
 //
 //	Cluster        (slug: "{source}/{naturalKey}", e.g. "kubeconfig/{context}")
 //	    ↓ owns
-//	ClusterCache   (slug: "caches/{ClusterID}")
+//	ClusterCache   (slug: "{ClusterID}/{serverUID}")
 //
 // Cluster objects are created directly by the kubeconfig importer (one per
-// kube-context); there is no separate intake kind. A Cluster's slug IS its
-// ClusterID — a source prefix plus that source's natural key — so each source
-// owns a disjoint slug namespace within the one Cluster kind, the importer
-// reconciles by slug (beehive's per-kind slug-uniqueness rules out duplicates),
-// and the on-disk cache is keyed separately by beehive ObjectIDs so the slug's
-// arbitrary text never reaches the filesystem.
+// kube-context); there is no separate intake kind. Each source owns a disjoint slug
+// namespace within the one Cluster kind, so the importer reconciles by slug
+// (beehive's per-kind slug-uniqueness rules out duplicates), and the on-disk cache is
+// keyed separately by beehive ObjectIDs so the slug's arbitrary text never reaches
+// the filesystem.
 //
-// Domain types here are a superset of what beehive stores: the domain Cluster
-// (returned to resolvers) joins the Cluster and ClusterCache beehive objects
-// into one combined status view — Cluster carries connection status (Connected,
-// Healthy conditions + server/principal facts), ClusterCache carries sync
-// status (Synced condition + lastSyncedAt).
+// Cluster carries connection status (Connected, Healthy conditions + server/principal
+// facts); its ClusterCache child carries sync status (Synced condition +
+// lastSyncedAt).
 package cluster
 
 import (
@@ -55,26 +52,20 @@ import (
 // is tracked.
 var ErrNotFound = errors.New("controllers: cluster not found")
 
-// Slug prefixes. The slug is a per-kind reconcile/uniqueness key, NOT the
-// identity surfaced to consumers (that is the ClusterID, the beehive ObjectID).
+// Slug prefixes. The slug is a per-kind reconcile/uniqueness key, NOT the identity
+// surfaced to consumers (that is the ClusterID, the beehive ObjectID).
 //
-//   - A kubeconfig-sourced Cluster is created with the slug "kubeconfig/{context}"
-//     — the source's natural key, used purely by the importer so beehive's per-kind
-//     slug-uniqueness rules out a duplicate for a context (race-safe). Future
-//     sources add their own prefix ("cloud/", "manual/"). Nothing reads a Cluster
-//     back by this slug; lookups go through the ObjectID.
-//   - A ClusterCache is created with the slug "{ClusterID}/{serverUID}": its
-//     parent's ObjectID plus the kube-system namespace UID of the physical cluster it
-//     mirrors. beehive's per-kind UNIQUE(slug) then means "one cache per physical
-//     identity per cluster" — a physical-cluster migration (the kube-context repointed
-//     at a freshly-built cluster) yields a new UID and so a second, coexisting
-//     ClusterCache under the same parent, rather than colliding on a one-per-cluster slug.
-//     Children are enumerated via the owner edge (Client.ListOwned), not by re-deriving
-//     this slug, so the UID need not be known to list a cluster's caches. There is no
-//     "caches/" prefix: ClusterCache is its own beehive kind, so its slugs already sit
-//     in a namespace disjoint from Cluster's — unlike the Cluster kind, whose source
-//     prefix partitions multiple importers within the one kind, ClusterCache has no
-//     second axis a prefix would disambiguate.
+//   - A kubeconfig-sourced Cluster's slug is "kubeconfig/{context}" — the source's
+//     natural key, used by the importer so beehive's per-kind slug-uniqueness rules out
+//     a duplicate for a context. Future sources add their own prefix ("cloud/",
+//     "manual/"). Nothing reads a Cluster back by this slug.
+//   - A ClusterCache's slug is "{ClusterID}/{serverUID}": its parent's ObjectID plus
+//     the kube-system UID it mirrors. beehive's UNIQUE(slug) then means "one cache per
+//     identity per cluster", so a migration to a new UID yields a second, coexisting
+//     cache rather than colliding on a one-per-cluster slug. Children are enumerated
+//     via the owner edge (Client.ListOwned), so the UID need not be known to list a
+//     cluster's caches. No "caches/" prefix is needed: ClusterCache is its own kind, so
+//     its slugs already sit in a namespace disjoint from Cluster's.
 const slugPrefixKubeconfig = "kubeconfig/"
 
 // kubeconfigSlug returns the beehive slug a kubeconfig-sourced Cluster is created
@@ -85,13 +76,11 @@ func kubeconfigSlug(contextName string) string {
 }
 
 // ClusterCacheSlug returns the slug a ClusterCache is created with:
-// "{ClusterID}/{serverUID}", where serverUID is the kube-system namespace UID of
-// the physical cluster the cache mirrors. The parent-ObjectID segment scopes the UID
-// to one cluster (two clusters that ever probe the same physical identity keep
-// distinct caches), and the serverUID segment is the migration-turnover key that
-// backs beehive's UNIQUE(slug) dedup in ensureClusterCache. The slug is a
-// creation/dedup key only — a cluster's caches are enumerated through the owner edge,
-// never by re-deriving this slug, so callers that lack a serverUID can still list them.
+// "{ClusterID}/{serverUID}". The parent-ObjectID segment scopes the UID to one cluster
+// (two clusters probing the same identity keep distinct caches); the serverUID segment
+// is the migration-turnover key backing beehive's UNIQUE(slug) dedup in
+// ensureClusterCache. A creation/dedup key only — caches are enumerated through the
+// owner edge, so callers lacking a serverUID can still list them.
 func ClusterCacheSlug(clusterID ClusterID, serverUID string) string {
 	return strconv.FormatInt(int64(clusterID), 10) + "/" + serverUID
 }
@@ -106,32 +95,25 @@ func newCacheRef(clusterObjID, cacheObjID beehive.ObjectID) store.CacheRef {
 
 // --- Identity ---
 
-// ObjectID is the identity of a persisted object — the beehive ObjectID of any
-// kind (a Cluster, a ClusterCache, …). It is opaque on the wire (a decimal
-// string) and binds to the one GraphQL `ObjectID` scalar; its
-// MarshalGQL/UnmarshalGQL are the single id (un)marshalling path every kind
-// reuses, so a new kind's id needs no new scalar or parsing. Per-kind aliases
-// (ClusterID below, ClusterCacheID later) name the same type purely to document
-// which kind an id refers to in Go signatures.
+// ObjectID is the identity of a persisted object — the beehive ObjectID of any kind
+// (a Cluster, a ClusterCache, …). It is opaque on the wire (a decimal string) and
+// binds to the one GraphQL `ObjectID` scalar; its MarshalGQL/UnmarshalGQL are the
+// single id (un)marshalling path every kind reuses. Per-kind aliases (ClusterID,
+// ClusterCacheID) name the same type purely to document which kind an id refers to.
 type ObjectID int64
 
-// ClusterID uniquely identifies a cluster record: the beehive ObjectID of its
-// Cluster object. It is opaque and stable for the life of the record (a departed
-// kube-context is orphaned, not deleted, so its id survives a return; the id
-// changes only on an explicit Delete), and it is source-agnostic — the same
-// identity regardless of which importer created the record. The source's natural
-// key (e.g. a kube-context name) lives only on the beehive *slug*, an
-// importer-internal reconcile/uniqueness key, never surfaced here. It is an
-// alias of [ObjectID] — a documentation name, not a distinct type, so it shares
-// the one GraphQL scalar and (un)marshalling machinery.
+// ClusterID uniquely identifies a cluster record: the beehive ObjectID of its Cluster
+// object. It is opaque and stable for the record's life (a departed kube-context is
+// orphaned, not deleted, so its id survives a return; it changes only on an explicit
+// Delete) and source-agnostic. The source's natural key (e.g. a kube-context name)
+// lives only on the beehive slug, never surfaced here. An alias of [ObjectID] — a
+// documentation name — so it shares the one GraphQL scalar and (un)marshalling.
 type ClusterID = ObjectID
 
 // ClusterCacheID identifies one ClusterCache record: the beehive ObjectID of its
-// ClusterCache object. Like [ClusterID] it is an alias of [ObjectID] — a
-// documentation name for the cache's own id (distinct from its parent ClusterID),
-// sharing the one GraphQL scalar and (un)marshalling machinery. A cluster can own
-// several ClusterCache records (one per physical identity it has mirrored), so the
-// cache id is not derivable from the cluster id.
+// ClusterCache object. Like [ClusterID], an alias of [ObjectID] naming the cache's own
+// id (distinct from its parent ClusterID). A cluster can own several ClusterCache
+// records, so the cache id is not derivable from the cluster id.
 type ClusterCacheID = ObjectID
 
 // parseObjectID parses an ObjectID from its decimal-string wire form; a
@@ -236,11 +218,10 @@ const (
 	// reasonPaused: no sync engine runs — the record is sync-disabled,
 	// deactivated, orphaned, or archived.
 	ReasonPaused = "Paused"
-	// reasonSyncing: the engine is starting or catching up (discovery walk,
-	// drivers pre-first-watch). Condition-only — the event vocabulary names the
-	// start transitions SyncStart/ResyncStart instead, so "Syncing" is never an
-	// event reason — a same-named event reason would read ambiguously against this
-	// condition state.
+	// reasonSyncing: the engine is starting or catching up (discovery walk, drivers
+	// pre-first-watch). Condition-only — the event vocabulary names the start
+	// transitions SyncStart/ResyncStart instead, so a same-named event reason can't
+	// read ambiguously against this condition state.
 	ReasonSyncing = "Syncing"
 	// reasonWatching: every driver reached its watch phase — the cache is
 	// caught up and streaming deltas.
@@ -253,13 +234,11 @@ const (
 	// state distinct from SyncFailed, which is a hard engine failure).
 	ReasonStale = "Stale"
 
-	// The following are sync-EVENT reasons (the ClusterCache event log's
-	// transition vocabulary), distinct from the Synced-condition reasons above
-	// (which name the current state). Events are transition-oriented and carry
-	// richer messages; a healthy steady state records no event at all. They come
-	// in start/complete pairs, cold and warm, so the log reads symmetrically:
-	// SyncStart→SyncComplete for a first-ever build, ResyncStart→ResyncComplete
-	// for a resume.
+	// The following are sync-EVENT reasons (the ClusterCache event log's transition
+	// vocabulary), distinct from the Synced-condition reasons above (which name the
+	// current state). They come in start/complete pairs, cold and warm:
+	// SyncStart→SyncComplete for a first-ever build, ResyncStart→ResyncComplete for a
+	// resume. A healthy steady state records no event at all.
 	//
 	// reasonSyncStart: a cold cache began its first-ever build.
 	ReasonSyncStart = "SyncStart"
@@ -441,14 +420,11 @@ type ClusterStatus struct {
 	Conditions []Condition `json:"conditions"`
 }
 
-// Connection-probe outcomes are not stored on ClusterStatus: the
-// ClusterCoreController records them into beehive's event log (category
-// ConnectionEventCategory) via RecordEvent, exposed generically through the
-// cluster events surface (clusterEvents / clusterEventsWatch, category
-// "connection"). This keeps per-probe chatter off the status watch — a repeated
-// identical failure does not rewrite status — while beehive aggregates
-// consecutive same-outcome probes into runs and bounds retention
-// (WithEventRetention).
+// Connection-probe outcomes are not stored on ClusterStatus: the ClusterCoreController
+// records them into beehive's event log (category ConnectionEventCategory), exposed
+// through the cluster events surface. This keeps per-probe chatter off the status
+// watch — a repeated identical failure doesn't rewrite status — while beehive
+// aggregates same-outcome probes into runs and bounds retention.
 const (
 	// ConnectionEventCategory is the beehive event category the connection
 	// controller records probe outcomes under (its own object timeline).
@@ -467,38 +443,32 @@ const (
 // gives no explicit limit.
 const defaultEventLimit = 50
 
-// Schedule is the generic domain projection of a beehive object's reconcile
-// schedule (a gauge, mapped from beehive.Schedule): when the control plane has
-// queued the object's next reconcile. It is kind-agnostic like Event — the
-// getter/watcher entrypoints are kind-scoped (ClusterScheduleWatch), but the
-// value shape is not. A struct rather than a bare time so it can grow (mirroring
-// beehive.Schedule's own extensibility). Served live via the schedule watch — a
-// scheduling change fires no object WatchList, so this is the only way to observe
-// the countdown move for an otherwise-idle object.
+// Schedule is the generic domain projection of a beehive object's reconcile schedule
+// (a gauge): when the control plane has queued the object's next reconcile. It is
+// kind-agnostic like Event — the entrypoints are kind-scoped (ClusterScheduleWatch),
+// the value shape isn't. Served live via the schedule watch — a scheduling change
+// fires no object WatchList, so this is the only way to observe the countdown move for
+// an otherwise-idle object.
 type Schedule struct {
 	// NextRequeueAt is the scheduled time of the object's next reconcile (for a
 	// disconnected cluster, its next backoff retry), or nil when nothing is scheduled.
 	NextRequeueAt *time.Time `json:"nextRequeueAt"`
-	// Probing reports whether a reconcile is *actively running its network probe*
-	// right now (the controller is between "eligible, about to connect" and the
-	// probe/health round-trips returning). Unlike NextRequeueAt — which the
-	// scheduler drives — this is asserted by the ClusterCoreController itself, so
-	// the webview can show a definite "checking now" state during the in-flight
-	// window rather than inferring it from the (ambiguous) absence of a next-attempt
-	// time. It is merged into this gauge (not the list watch) because a probe
-	// starting/ending fires no object WatchList.
+	// Probing reports whether a reconcile is actively running its network probe right
+	// now (between "eligible, about to connect" and the probe/health round-trips
+	// returning). Asserted by the ClusterCoreController itself, so the webview can show
+	// a definite "checking now" rather than inferring it from an absent next-attempt
+	// time. Merged into this gauge (not the list watch) because a probe start/end fires
+	// no object WatchList.
 	Probing bool `json:"probing"`
 }
 
-// Event is the generic domain projection of one coalesced run from a beehive
-// object's event timeline, served under every kind's events surface. It drops
-// beehive.Event's ObjectID (the addressed object is the surface's subject) and
-// Detail (no JSON scalar yet). ID is the run's identity, carried on the shared
-// ObjectID scalar (an opaque int64) — a client's upsert key on a watch, since a
-// reason can repeat across a change-and-back while the run id does not. Type
-// binds straight to beehive.EventType (Normal/Warning). A repeated same-outcome
-// occurrence bumps Count rather than adding a run; [FirstAt, LastAt] is the run's
-// window.
+// Event is the generic domain projection of one coalesced run from a beehive object's
+// event timeline, served under every kind's events surface. It drops beehive.Event's
+// ObjectID (the addressed object is the surface's subject) and Detail. ID is the run's
+// identity on the shared ObjectID scalar — a client's upsert key on a watch, since a
+// reason can repeat across a change-and-back while the run id does not. A repeated
+// same-outcome occurrence bumps Count rather than adding a run; [FirstAt, LastAt] is
+// the run's window.
 type Event struct {
 	ID       ObjectID          `json:"id"`
 	Category string            `json:"category"`
@@ -515,16 +485,15 @@ type Event struct {
 // ClusterCacheGroupKind identifies the ClusterCache beehive resource kind.
 var ClusterCacheGroupKind = beehive.GroupKind{Kind: "ClusterCache"}
 
-// ClusterCacheSpec is the ClusterCache kind's spec. It carries no user-facing
-// fields; the parent ClusterID is the object's owner edge, and ServerUID is the
-// kube-system namespace UID of the physical cluster this cache mirrors — the
-// identity a physical migration turns over (named to match the
-// ClusterStatus.Server.UID it is compared against). The ClusterCoreController writes
-// it at creation (once a probe has confirmed it); the ClusterCacheController reads
-// it to decide whether this cache is the parent's currently-active one (ServerUID ==
-// parent's last-probed Server.UID) and so should run a sync engine. It also rides
-// the slug ("{ClusterID}/{ServerUID}") purely so beehive's UNIQUE(slug) dedups a
-// per-identity create; spec.ServerUID, not the slug, is what the controller reads.
+// ClusterCacheSpec is the ClusterCache kind's spec. It carries no user-facing fields;
+// the parent ClusterID is the owner edge, and ServerUID is the kube-system UID this
+// cache mirrors — the identity a migration turns over (named to match the
+// ClusterStatus.Server.UID it's compared against). The ClusterCoreController writes it
+// at creation (once a probe confirms it); the ClusterCacheController reads it to decide
+// whether this cache is the parent's active one (ServerUID == parent's last-probed
+// Server.UID) and so should run an engine. It also rides the slug so beehive's
+// UNIQUE(slug) dedups a per-identity create, but the controller reads spec.ServerUID,
+// not the slug.
 type ClusterCacheSpec struct {
 	ServerUID string `json:"serverUid"`
 }
@@ -544,13 +513,11 @@ type ClusterCacheStatus struct {
 
 // ClusterCache is the domain view of one ClusterCache beehive object, streamed
 // standalone via WatchCaches and joined to its parent client-side. ID is the cache's
-// own ObjectID and ClusterID its parent's (the beehive owner) — together they locate
-// the on-disk cache (the live-stats resolver builds a store.CacheRef from the pair)
-// and let the client join the cache onto its cluster. ServerUID is the kube-system
-// UID this cache mirrors; the client treats the cache whose ServerUID matches the
-// cluster's last-probed Server.UID as the active one. Active-ness is deliberately
-// *not* a field: it depends on the parent's status, which changes with no cache
-// event, so it can't be kept fresh on a per-cache stream — only the client's live
+// own ObjectID and ClusterID its parent's — together they locate the on-disk cache and
+// let the client join the cache onto its cluster. ServerUID is the kube-system UID this
+// cache mirrors; the client treats the cache whose ServerUID matches the cluster's
+// last-probed Server.UID as active. Active-ness is deliberately not a field: it depends
+// on the parent's status, which changes with no cache event, so only the client's live
 // join is correct.
 type ClusterCache struct {
 	ID        ClusterCacheID
@@ -559,12 +526,11 @@ type ClusterCache struct {
 	Status    ClusterCacheStatus
 }
 
-// Cluster is the domain record for one tracked cluster connection (one
-// kube-context): the restart-surviving facts about it. Built from a single Cluster
-// beehive object. Status binds directly to the stored Cluster-kind status. A
-// cluster's owned ClusterCache records are *not* joined in here — they stream
-// standalone via WatchCaches and are joined client-side, so cache churn never
-// re-emits a cluster.
+// Cluster is the domain record for one tracked cluster connection (one kube-context).
+// Built from a single Cluster beehive object; Status binds directly to the stored
+// Cluster-kind status. Owned ClusterCache records are not joined in here — they stream
+// standalone via WatchCaches and are joined client-side, so cache churn never re-emits
+// a cluster.
 type Cluster struct {
 	ID                  ClusterID
 	Generation          int64
@@ -579,14 +545,13 @@ type Cluster struct {
 	// surface.
 }
 
-// ChangeType classifies a delta-watch change, mirroring a Kubernetes watch event
-// (and beehive's own change type). Its string values are deliberately identical to
-// beehive.Added/Modified/Deleted, so the watch pumps map beehive→domain with a plain
-// conversion; it is a defined type (not an alias of beehive.ChangeType, which is
-// itself an alias into an internal package gqlgen cannot import) so the GraphQL
-// ChangeType enum can bind straight to it, the external-enum pattern used for
-// EventType/ConditionStatus. Values: Added (incl. the on-subscribe snapshot),
-// Modified, Deleted.
+// ChangeType classifies a delta-watch change, mirroring a Kubernetes watch event. Its
+// string values are identical to beehive.Added/Modified/Deleted, so the watch pumps map
+// beehive→domain with a plain conversion; it is a defined type (not an alias of
+// beehive.ChangeType, which aliases into an internal package gqlgen can't import) so the
+// GraphQL ChangeType enum binds straight to it — the external-enum pattern used for
+// EventType/ConditionStatus. Values: Added (incl. the on-subscribe snapshot), Modified,
+// Deleted.
 type ChangeType string
 
 const (
@@ -611,15 +576,13 @@ type ClusterCacheChange struct {
 }
 
 // ClusterDataKindChange is one delta on a cache's kind-catalog watch: what happened
-// (Type) to which kind (Kind), and which cache (CacheID) it came from. On subscribe
-// every catalog row arrives as an Added change (the snapshot); thereafter a new kind
-// is Added, a kind whose fields change (chiefly its live object Count) is Modified,
-// and a kind that leaves the catalog is Deleted (carrying its last-known row).
-// Consumers key on the kind's identity (APIVersion + Resource). CacheID carries the
-// frame's provenance: a client watching the active cache can reject a late frame from
-// a superseded cache (one still draining after a cache/context switch) by cache id,
-// rather than inferring provenance from render state. Binds 1:1 to the GraphQL
-// ClusterDataKindChange.
+// (Type) to which kind (Kind), from which cache (CacheID). On subscribe every catalog
+// row arrives as Added (the snapshot); thereafter a new kind is Added, a kind whose
+// fields change (chiefly its live Count) is Modified, and a kind leaving the catalog is
+// Deleted (carrying its last-known row). Consumers key on APIVersion + Resource.
+// CacheID is the frame's provenance: a client watching the active cache can reject a
+// late frame from a superseded cache (one still draining after a cache/context switch).
+// Binds 1:1 to the GraphQL ClusterDataKindChange.
 type ClusterDataKindChange struct {
 	Type    ChangeType
 	Kind    ClusterDataKind
@@ -640,12 +603,11 @@ type ClusterCacheStats struct {
 	KindCount   int
 }
 
-// ClusterDataKind is one entry in a cluster's discovered kind catalog — a kind the
-// cluster's API server advertises (built-in or CRD), read from the active cache's
-// kind_catalog at request time. Binds 1:1 to the GraphQL ClusterDataKind; it powers
-// the dashboard's dynamic resource nav, so consumers get the plural resource name
-// (to dedupe against the curated catalog) and the api group (via APIVersion) to
-// bucket the kind into a nav group.
+// ClusterDataKind is one entry in a cluster's discovered kind catalog — a kind the API
+// server advertises (built-in or CRD), read from the active cache's kind_catalog. Binds
+// 1:1 to the GraphQL ClusterDataKind; it powers the dashboard's dynamic resource nav,
+// so it carries the plural resource name (to dedupe against the curated catalog) and
+// the api group (via APIVersion) to bucket the kind into a nav group.
 type ClusterDataKind struct {
 	// APIVersion is the group/version, e.g. "apps/v1" or "v1" for the core group.
 	APIVersion string

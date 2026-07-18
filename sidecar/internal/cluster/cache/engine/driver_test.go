@@ -416,11 +416,10 @@ func TestEmptyCacheFallsBackToFullLIST(t *testing.T) {
 	require.Equal(t, 1, countObjectsByKind(t, cdb.Writer(), "Pod", "v1"))
 }
 
-// A bookmark proves the watch is alive without any object delta: it stamps the
-// driver's liveness time and advances the persisted resume RV, but applies no
-// object. RetryWatcher swallows bookmarks, so the driver observes them by tapping
-// the watch stream ahead of it — this is what lets the engine tell a quiet-but-
-// healthy watch (still receiving periodic bookmarks) from a wedged one.
+// A bookmark proves the watch is alive without any object delta: it stamps liveness
+// and advances the persisted resume RV but applies no object. RetryWatcher swallows
+// bookmarks, so the driver taps the watch stream ahead of it — what lets the engine
+// tell a quiet-but-healthy watch from a wedged one.
 func TestDriverBookmarkMarksLiveAndPersistsRV(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -446,11 +445,10 @@ func TestDriverBookmarkMarksLiveAndPersistsRV(t *testing.T) {
 	<-done
 }
 
-// A bookmark must not advance the resume cookie past deltas the driver hasn't
-// applied yet: the tap sees a bookmark ahead of the apply loop, so persisting its
-// RV eagerly would let a crash/restart resume from it and skip un-applied changes,
-// leaving the cache permanently behind. onBookmark holds the cookie until
-// deltaApplied catches the deltaSeen high-water mark, while still marking liveness.
+// A bookmark must not advance the resume cookie past deltas not yet applied: the
+// tap sees the bookmark ahead of the apply loop, so persisting its RV eagerly would
+// let a restart skip those changes. onBookmark holds the cookie until deltaApplied
+// catches deltaSeen, while still marking liveness.
 func TestBookmarkHoldsRVUntilDeltasApplied(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Picker for the window's active kubeconfig context. It's a thin control over
+// Picker for the window's active kubeconfig context. A thin control over
 // `useActiveKubeContext`: the resolved context drives the value and picking one
-// writes it to the `kubeContext` URL param, so the choice is shared across chat
-// and dashboard (see `@/lib/active-kube-context`). Selection is a frontend view-scope
-// only — it doesn't rewrite the kubeconfig's current-context. It lives in the
-// content-area context bar (`kube-context-bar.tsx`), which has the horizontal room
-// the sidebar lacked — so the trigger grows to fit a full FQDN context name up
-// to a cap, past which the value line-clamps.
+// writes it to the `kubeContext` URL param, sharing the choice across chat and
+// dashboard. Selection is view-scope only — it doesn't rewrite the kubeconfig's
+// current-context. The trigger grows to fit a full FQDN context name up to a cap,
+// past which the value line-clamps.
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@kubetail/ui/elements/select';
 
 import { useActiveKubeContext } from '@/lib/active-kube-context';

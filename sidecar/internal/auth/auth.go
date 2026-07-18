@@ -1,27 +1,24 @@
 // Package auth is the local-first identity subsystem: it owns the signed-in
 // session state, the locally-persisted credentials (token store + refresh), and
-// the sidecar-owned browser sign-in/out flow. It is deliberately independent of
-// the cloud-synced settings feature — a user stays signed in offline (identity
-// is read back from a locally-stored ID token, and a present refresh token is
-// what marks "signed in"), and the cloud settings-sync subsystem depends on
-// this package (for an oauth2.TokenSource and the session change stream), not the
-// other way around.
+// the sidecar-owned browser sign-in/out flow. It is independent of the
+// cloud-synced settings feature — a user stays signed in offline (identity read
+// from a locally-stored ID token, a present refresh token marks "signed in"), and
+// the cloud settings-sync subsystem depends on this package (for an
+// oauth2.TokenSource and the session change stream), not the reverse.
 //
-// The subsystem is mostly one flat package organized by domain into four files:
-// the service facade (this file — the Service interface, the State/Identity/
-// TokenSet value types, Config + the composition owner), the OAuth grant
-// aggregate (grant.go — the credential state machine, its CredentialsStore/
-// RefreshFunc ports, and the oauth2.TokenSource adapter), the interactive login
-// flow (login.go — the loginFlow orchestration, its seams, and the 127.0.0.1
-// loopback redirect listener), and the OS-keyring credential persistence
-// (keyring.go). The one piece carved into its own sub-package is the OAuth2 /
-// OIDC protocol layer (auth/oauth) — a deep module (PKCE, JWKS verification,
-// revocation, token exchange/refresh) that auth builds a Client from and drives.
-// auth re-exports oauth's value types (Token, Identity) via the aliases below so
-// callers keep naming them auth.Token / auth.Identity. Like internal/cluster and
-// internal/cloud, it is fronted by one composition owner (Service) and degrades
-// gracefully when the host hasn't wired a credentials store (then it's signed-out,
-// login errors, logout is a no-op, and TokenSource is nil).
+// It's mostly one flat package organized by domain into four files: the service
+// facade (this file — the Service interface, the State/TokenSet value types,
+// Config + the composition owner), the OAuth grant aggregate (grant.go — the
+// credential state machine, its CredentialsStore/RefreshFunc ports, and the
+// oauth2.TokenSource adapter), the interactive login flow (login.go — the
+// loginFlow, its seams, and the loopback redirect listener), and the OS-keyring
+// credential persistence (keyring.go). The one carved-out sub-package is the
+// OAuth2/OIDC protocol layer (auth/oauth) — a deep module (PKCE, JWKS
+// verification, revocation, token exchange/refresh) that auth builds a Client
+// from and drives; auth re-exports its Token/Identity types via the aliases
+// below. Like internal/cluster and internal/cloud, it's fronted by one
+// composition owner (Service) and degrades when no credentials store is wired
+// (signed-out, login errors, logout a no-op, TokenSource nil).
 package auth
 
 import (
@@ -38,10 +35,9 @@ import (
 )
 
 // loginTimeout bounds the async tail of a browser sign-in so an abandoned flow
-// (the user closes the browser without finishing) can't leave the loopback
-// listener and tail goroutine alive indefinitely. The synchronous setup phase
-// uses the caller's context; only the post-browser wait/exchange/verify runs
-// under this bound.
+// can't leave the loopback listener and tail goroutine alive indefinitely. Only
+// the post-browser wait/exchange/verify runs under it; the synchronous setup uses
+// the caller's context.
 const loginTimeout = 5 * time.Minute
 
 // State is the public snapshot of the auth session. Authenticated is derived
@@ -54,21 +50,20 @@ type State struct {
 	Tokens        *TokenSet
 }
 
-// Token and Identity are re-exported (true aliases — the identical types, not
-// wrappers) from the auth/oauth sub-package, which owns them because the OAuth /
-// OIDC protocol layer produces them. The aliases let the rest of auth, and
-// external consumers, keep naming them auth.Token / auth.Identity without
-// importing the sub-package or any conversion. Token is the user's stored cloud
-// credential (access/refresh/id tokens + expiry); Identity is the subset of the
+// Token and Identity are true aliases of the types in the auth/oauth sub-package,
+// which owns them because the OAuth/OIDC protocol layer produces them. The aliases
+// let the rest of auth and external consumers name them auth.Token / auth.Identity
+// with no sub-package import or conversion. Token is the user's stored cloud
+// credential (access/refresh/id tokens + expiry); Identity is the subset of
 // verified ID-token claims the app cares about.
 type (
 	Token    = oauth.Token
 	Identity = oauth.Identity
 )
 
-// TokenSet is the tokenless-of-id-token public projection of the stored Token —
-// the access/refresh pair plus expiry, surfaced on State for downstream callers
-// that authenticate from it. (The id token stays internal; it's display-only.)
+// TokenSet is the public projection of the stored Token minus the id token — the
+// access/refresh pair plus expiry, surfaced on State for downstream callers that
+// authenticate from it. (The id token stays internal; it's display-only.)
 type TokenSet struct {
 	AccessToken  string
 	RefreshToken string
@@ -93,17 +88,14 @@ type Service interface {
 const revokeTimeout = 10 * time.Second
 
 // Config is what the composition root (internal/app) hands the auth service. It
-// carries only production knobs — a production caller supplies IssuerURL +
-// ClientID (+ optional Scopes) and a KeychainService name, and nothing here lets
-// it bypass the real OAuth flow. The test seams (a fake oauth flow, an in-memory
-// store, httptest endpoints, etc.) are unexported options instead (see option
-// below), so they're reachable only from in-package tests and can't leak onto
-// this public surface.
+// carries only production knobs — nothing here lets a caller bypass the real
+// OAuth flow. The test seams (fake oauth flow, in-memory store, httptest
+// endpoints) are unexported options instead (see option below), reachable only
+// from in-package tests.
 type Config struct {
-	// IssuerURL is the Hydra OAuth issuer base URL. The auth service derives every
+	// IssuerURL is the Hydra OAuth issuer base URL. The service derives every
 	// endpoint (authorize/token/jwks/revocation) and the expected ID-token "iss"
-	// from it via newHydraOAuthConfig, baking in Hydra's standard path layout — so a
-	// production caller supplies only IssuerURL + ClientID (+ optional Scopes).
+	// from it via newHydraOAuthConfig.
 	IssuerURL string
 	// ClientID is the public (PKCE/loopback) OAuth client id.
 	ClientID string
@@ -111,17 +103,15 @@ type Config struct {
 	// offline_access, email, profile).
 	Scopes []string
 	// KeychainService is the OS-keyring service name the auth token is persisted
-	// under. When set, the service builds its own keyringStore over it — the caller
-	// hands a name, not a store. Empty (and no withCredentialsStore option) ⇒
-	// degraded (signed-out, no persistence).
+	// under; the service builds its own keyringStore over it. Empty (and no
+	// withCredentialsStore option) ⇒ degraded (signed-out, no persistence).
 	KeychainService string
 }
 
-// option is an unexported build seam for New. Because the type is unexported,
-// only in-package (test) code can pass one — production callers configure auth
-// through Config alone and cannot inject a fake flow/store/endpoint. The seams
-// mirror what the now-white-box tests need: a fake oauth flow, an in-memory
-// credentials store, httptest endpoints, a canned loopback, a no-op browser.
+// option is an unexported build seam for New, so only in-package (test) code can
+// pass one — production callers configure auth through Config alone. The seams
+// cover a fake oauth flow, an in-memory store, httptest endpoints, a canned
+// loopback, a no-op browser.
 type option func(*buildOpts)
 
 // buildOpts collects the seam overrides applied by the options before New
@@ -129,7 +119,7 @@ type option func(*buildOpts)
 type buildOpts struct {
 	store       CredentialsStore
 	oauthConfig *oauth.Config // nil ⇒ derive from Config via newHydraOAuthConfig
-	start       loginStarter  // overrides the whole login step (the loginFlow seams are tested against the flow itself)
+	start       loginStarter  // overrides the whole login step (flow seams tested against the flow itself)
 }
 
 // withCredentialsStore injects a credentials store (in-memory, in tests) instead
@@ -144,11 +134,9 @@ func withOAuthConfig(c oauth.Config) option {
 	return func(o *buildOpts) { o.oauthConfig = &c }
 }
 
-// withLoginStarter overrides the login step wholesale (a fake whose setup phase
-// returns a canned pendingLogin tail, or a synchronous setup error), so a
-// service-level test exercises Login → setup → async persist → sign-in without
-// the loginFlow's loopback/browser/oauth seams — those are tested directly
-// against the flow in login_test.go.
+// withLoginStarter overrides the login step wholesale, so a service-level test
+// exercises Login → setup → async persist → sign-in without the loginFlow's
+// loopback/browser/oauth seams (those are tested directly in login_test.go).
 func withLoginStarter(fn loginStarter) option {
 	return func(o *buildOpts) { o.start = fn }
 }
@@ -184,10 +172,8 @@ func New(cfg Config) (Service, error) {
 }
 
 // newWithOptions is the build entry point that also accepts the unexported test
-// seams. New is the production wrapper (no options); in-package white-box tests
-// call this directly to inject a fake store/oauth/flow. The seams resolve here,
-// at construction, because they determine the store and oauth client the grant
-// is built over — they can't be applied to an already-built service.
+// seams (New is the production wrapper). The seams resolve here at construction
+// because they determine the store and oauth client the grant is built over.
 func newWithOptions(cfg Config, opts ...option) (Service, error) {
 	var o buildOpts
 	for _, opt := range opts {
@@ -233,14 +219,12 @@ func newWithOptions(cfg Config, opts ...option) (Service, error) {
 // offline_access (refresh token), email + profile (identity claims).
 var defaultScopes = []string{"openid", "offline_access", "email", "profile"}
 
-// newHydraOAuthConfig builds an OAuthConfig for an Ory Hydra issuer, deriving
-// Hydra's standard endpoint paths from the issuer base so the composition root
-// supplies only the issuer and client id (and, optionally, overriding scopes).
-// It's a caller-side helper for New — oauth.go stays Hydra-agnostic, taking the
-// resolved endpoint URLs. The base has any trailing slash trimmed before the
-// paths are appended; the expected "iss", however, is the base WITH a trailing
-// slash — Hydra issues ID tokens whose iss claim carries it, so verification
-// would otherwise fail with a spurious "issued by a different provider" mismatch.
+// newHydraOAuthConfig builds an oauth.Config for an Ory Hydra issuer, deriving
+// Hydra's standard endpoint paths from the issuer base (oauth.go stays
+// Hydra-agnostic, taking resolved URLs). The base's trailing slash is trimmed
+// before paths are appended, but the expected "iss" keeps it — Hydra's ID tokens
+// carry the trailing slash in their iss claim, so verification would otherwise
+// fail with a spurious provider mismatch.
 func newHydraOAuthConfig(issuer, clientID string, scopes ...string) oauth.Config {
 	base := strings.TrimRight(issuer, "/")
 	if len(scopes) == 0 {
@@ -282,18 +266,13 @@ func (s *service) TokenSource(ctx context.Context) oauth2.TokenSource {
 
 // StartLogin runs the desktop OAuth flow in two phases. The synchronous setup —
 // spin up the loopback redirect listener, open the system browser at the PKCE
-// authorize URL — runs under the caller's ctx and its failures (loopback bind,
-// browser launch) are returned, so the GraphQL login mutation can surface them
-// to the UI. The slow browser round-trip — wait for the redirect, exchange +
-// verify the code, persist, flip the session to signed-in — runs in a bounded,
-// detached goroutine; its completion (or failure) is observed via Subscribe /
-// authStateWatch, never blocking the caller. A tail failure is logged and leaves
-// the session signed-out (a known v1 limitation). The tail is fire-and-forget,
-// like Logout's revoke — not tied to shutdown (a sidecar shutdown is a process
-// exit, which reaps it).
+// authorize URL — runs under the caller's ctx and returns its failures so the
+// GraphQL login mutation can surface them to the UI. The slow browser round-trip
+// — wait for the redirect, exchange + verify, persist, flip to signed-in — runs
+// in a bounded, detached goroutine, its completion observed via Subscribe /
+// authStateWatch. A tail failure is logged and leaves the session signed-out.
 //
-// On a degraded service (no credentials store / oauth config) it returns an error
-// rather than half-running.
+// On a degraded service it returns an error rather than half-running.
 func (s *service) StartLogin(ctx context.Context) error {
 	if !s.configured || s.start == nil {
 		return fmt.Errorf("auth: login unavailable (service not configured)")
@@ -316,9 +295,9 @@ func (s *service) StartLogin(ctx context.Context) error {
 
 		tok, id, err := finish(ctx)
 		if err != nil {
-			// A timed-out tail means the user abandoned the browser flow (or just
-			// took longer than loginTimeout) — expected, not a fault. Anything
-			// else (exchange/verify/transport failure) is a genuine error.
+			// A timed-out tail means the user abandoned the browser flow (or took
+			// longer than loginTimeout) — expected, not a fault. Anything else is a
+			// genuine error.
 			if errors.Is(err, context.DeadlineExceeded) {
 				slog.Warn("cloud sign-in timed out", "err", err)
 			} else {
@@ -335,24 +314,21 @@ func (s *service) StartLogin(ctx context.Context) error {
 }
 
 // Logout tears down the local session first — erase the persisted credentials,
-// broadcast signed-out — and only then revokes the token server-side,
-// asynchronously and best-effort.
+// broadcast signed-out — then revokes the token server-side, asynchronously and
+// best-effort.
 //
 // Local teardown comes first on purpose: revocation is a network round-trip, and
-// a user signing out must not wait on (nor be blocked by) an unreachable server
-// while their old credentials are still live. The refresh token captured before
-// clear is handed to a fire-and-forget revoke; revoking it also invalidates the
-// grant's access tokens, and a failure is harmless (the token is already gone
-// locally and expires server-side on its own). ctx is not threaded into the
-// revoke (which runs on its own bounded background context) so a returning
-// mutation can't cancel it.
+// a user signing out must not wait on an unreachable server while their old
+// credentials are still live. The refresh token captured before clear is handed
+// to a fire-and-forget revoke (which also invalidates the access tokens); a
+// failure is harmless. ctx is not threaded into the revoke (its own bounded
+// context) so a returning mutation can't cancel it.
 //
-// Order within the local teardown matters: if the keychain write fails we return
-// the error while staying signed in (no signed-out broadcast) — reporting
-// signed-out while the durable refresh token survives (so a restart
-// re-authenticates) would be inconsistent. The settings-sync engine observes the
-// session change (see internal/cloud) and tears down any in-flight authenticated
-// watch itself; auth does not reach into it.
+// If the keychain write fails we return the error and stay signed in (no
+// signed-out broadcast) — reporting signed-out while the durable refresh token
+// survives to re-authenticate on restart would be inconsistent. The settings-sync
+// engine observes the session change itself (see internal/cloud); auth does not
+// reach into it.
 func (s *service) Logout(ctx context.Context) error {
 	// Capture the refresh token BEFORE clear erases it, for the revoke below.
 	var refreshToken string

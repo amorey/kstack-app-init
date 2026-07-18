@@ -44,10 +44,9 @@ type fakeEngine struct {
 
 func (f *fakeEngine) Start() {
 	f.started.Store(true)
-	// Report asynchronously — Start is called while the controller holds writeMu,
-	// and Report acquires writeMu too, so a synchronous call would deadlock. Model
-	// a realistic cold first sync (ColdStart + catch-up counts) so the recorded
-	// event is SyncComplete, not a bare Watching.
+	// Report asynchronously — Start runs while the controller holds writeMu, which
+	// Report also acquires, so a synchronous call would deadlock. Model a cold first
+	// sync (ColdStart + catch-up counts) so the recorded event is SyncComplete.
 	go f.sink.Report(engine.EngineStatus{
 		State: engine.EngineWatching, ColdStart: true,
 		SyncedObjects: 5, SyncedKinds: 3, CaughtUpIn: 2 * time.Second,
@@ -106,15 +105,12 @@ type capturedCfgSlot struct {
 	ref store.CacheRef
 }
 
-// awaitCacheSyncedStatus blocks on the ClusterCache object's beehive watch until
-// its Synced condition reaches the wanted status, then returns that condition.
-// beehive's Watch is current-on-subscribe (a snapshot Added event, then live
-// Modified events), so this is fully event-driven — no polling.
-//
-// Waiting for a specific status matters because converge commits a transient
-// Synced=Syncing (ConditionFalse) synchronously, then the engine's async
-// Watching report flips it to ConditionTrue; a test that wants the settled value
-// must wait for it, not the first write, or it races the async report.
+// awaitCacheSyncedStatus blocks on the ClusterCache object's beehive watch until its
+// Synced condition reaches want, then returns that condition (event-driven, no
+// polling). Waiting for a specific status matters because converge commits a transient
+// Synced=Syncing synchronously, then the engine's async Watching report flips it to
+// ConditionTrue — a test wanting the settled value must wait for it, not the first
+// write.
 func awaitCacheSyncedStatus(t *testing.T, cl beehive.Client[ClusterCacheSpec, ClusterCacheStatus], id beehive.ObjectID, want ConditionStatus) Condition {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -151,17 +147,16 @@ func eligibleClusterSpec(contextName string) ClusterSpec {
 	}
 }
 
-// testCacheUID is the kube-system UID the cache tests' parent Cluster reports as
-// its connected identity. A ClusterCache is the parent's *active* cache (and so
-// runs an engine) only when its spec UID matches the parent's Status.Server.UID,
-// so the tests create their cache with this UID and presenceController stamps it.
+// testCacheUID is the kube-system UID the cache tests' parent Cluster reports as its
+// connected identity. A ClusterCache is active (and runs an engine) only when its spec
+// UID matches the parent's Status.Server.UID, so the tests create their cache with this
+// UID and presenceController stamps it.
 const testCacheUID = "kube-system-uid"
 
-// presenceController is the test stand-in for the Cluster kind's controller in
-// the cache tests. The cache controller gates on the parent's *observed* presence
-// (ClusterStatus.Source.Kubeconfig.IsPresent) AND on the cache being the active
-// identity (its UID == ClusterStatus.Server.UID) — both written by the real
-// ClusterCoreController after a probe. This minimal controller stamps both (and the
+// presenceController is the test stand-in for the Cluster kind's controller. The cache
+// controller gates on the parent's observed presence (Source.Kubeconfig.IsPresent) AND
+// on the cache being the active identity (its UID == Server.UID) — both written by the
+// real ClusterCoreController after a probe. This minimal controller stamps both (its
 // status write wakes the ClusterCache dependent, exercising the real trigger path)
 // without the probing machinery.
 type presenceController struct{}
@@ -214,11 +209,10 @@ func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
 	assert.True(t, fakeEng.started.Load())
 }
 
-// TestCacheControllerDeletionStopsEngineAndClearsFinalizer verifies the cache
-// teardown path used by a UID-switch prune (and a cluster-delete cascade): when a
-// ClusterCache carrying the file-cleanup finalizer is deleted, the controller stops
-// its engine, flushes the on-disk file, then clears the finalizer so GC collects the
-// row. Without clearing the finalizer the deletion-pending row would linger forever.
+// TestCacheControllerDeletionStopsEngineAndClearsFinalizer verifies the cache teardown
+// path: deleting a ClusterCache that carries the file-cleanup finalizer stops its
+// engine, flushes the on-disk file, then clears the finalizer so GC collects the row
+// (without which the deletion-pending row would linger forever).
 func TestCacheControllerDeletionStopsEngineAndClearsFinalizer(t *testing.T) {
 	ctx := context.Background()
 	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
@@ -227,10 +221,8 @@ func TestCacheControllerDeletionStopsEngineAndClearsFinalizer(t *testing.T) {
 	require.NoError(t, err)
 	id := ClusterID(clusterObj.ID)
 
-	// Create the cache exactly as ensureClusterCache does in production: owned,
-	// slugged, and carrying the file-cleanup finalizer (the literal must match the
-	// package's cacheFilesFinalizer — see the core controller test, which pins it
-	// against the production create path).
+	// Create the cache as ensureClusterCache does: owned, slugged, and carrying the
+	// file-cleanup finalizer (the literal must match the package's cacheFilesFinalizer).
 	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
 		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
 		beehive.WithOwner(clusterObj.ID),
@@ -253,17 +245,12 @@ func TestCacheControllerDeletionStopsEngineAndClearsFinalizer(t *testing.T) {
 
 // TestCacheControllerRecordsSyncEvents verifies the cache controller records each
 // engine status report into the ClusterCache's beehive event log under the "sync"
-// category — the parallel of the connection controller's probe-outcome history,
-// exposed generically to the frontend. A caught-up Watching → Normal/SyncComplete
-// (cold) or ResyncComplete (warm), Errored → Warning/SyncDegraded (carrying the
-// engine's LastError), a warm Syncing → Normal/ResyncStart.
-// It records only on a *transition* — a change in (type, reason) — so the
-// engine's steady-state freshness heartbeat (a repeated catch-up report that only
-// bumps LastSyncedAt) does NOT open or extend an event run. This is what keeps a
-// healthy cluster from reading as a meaningless "Watching ×27"; the heartbeat
-// still lands on LastSyncedAt via the status write. The reasons are the
-// transition vocabulary: a cold catch-up is SyncComplete (with a "…N objects
-// across M kinds…" message), an engine failure is SyncDegraded.
+// category. A caught-up Watching → Normal/SyncComplete (cold) or ResyncComplete (warm),
+// Errored → Warning/SyncDegraded (with LastError), a warm Syncing → Normal/ResyncStart.
+// It records only on a transition (a change in (type, reason)), so the engine's
+// freshness heartbeat (a repeated catch-up report bumping only LastSyncedAt) does NOT
+// open or extend a run — keeping a healthy cluster from reading as "Watching ×27" while
+// LastSyncedAt still updates via the status write.
 func TestCacheControllerRecordsSyncEvents(t *testing.T) {
 	ctx := context.Background()
 	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
@@ -277,10 +264,9 @@ func TestCacheControllerRecordsSyncEvents(t *testing.T) {
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
-	// Sync-point on the engine's first (async) catch-up report, so the reports
-	// below run strictly after it. Once the entry is live, sink.Report is
-	// synchronous from this goroutine (it just takes writeMu), so no further
-	// awaits are needed to observe each recorded event.
+	// Sync-point on the engine's first (async) catch-up report so the reports below run
+	// after it. Once the entry is live, sink.Report is synchronous from this goroutine,
+	// so no further awaits are needed to observe each recorded event.
 	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
 
 	// A second catch-up report (the engine's freshness heartbeat, only bumping
@@ -469,10 +455,9 @@ func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {
 }
 
 // TestCacheControllerReportWithParentGenerationAhead reproduces the engine-sink
-// generation skew: the parent Cluster's generation runs ahead of the ClusterCache
-// object's own generation (e.g. after spec edits or poke bumps). The sink must
-// stamp UpdateStatus with the cache object's own generation, not the parent's, or
-// beehive rejects the write as a future generation and the report is dropped.
+// generation skew: the parent Cluster's generation runs ahead of the ClusterCache's
+// own. The sink must stamp UpdateStatus with the cache object's own generation, not the
+// parent's, or beehive rejects the write as a future generation and drops the report.
 func TestCacheControllerReportWithParentGenerationAhead(t *testing.T) {
 	ctx := context.Background()
 	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)

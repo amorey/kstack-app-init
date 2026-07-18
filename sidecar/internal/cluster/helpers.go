@@ -32,24 +32,20 @@ import (
 
 const (
 	// http2ReadIdleTimeoutSeconds and http2PingTimeoutSeconds tighten client-go's
-	// HTTP/2 connection health check, which detects and tears down a silently-dead
-	// API-server connection: an idle HTTP/2 connection is pinged after the read-idle
-	// timeout, and dropped if no pong arrives within the ping timeout. client-go
-	// enables the check by default but at 30s/15s — so a broken watch stream can
-	// linger ~45s before anything notices. Tightening to 10s/5s cuts worst-case
-	// connection-loss detection to ~15s, which is what lets the connection
-	// controller's liveness sentinel see its watch close (→ re-probe) promptly
-	// instead of waiting on the health-poll cadence.
+	// HTTP/2 health check, which pings an idle connection after the read-idle timeout
+	// and drops it if no pong arrives within the ping timeout. client-go's default
+	// 30s/15s lets a broken watch stream linger ~45s; tightening to 10s/5s cuts
+	// worst-case connection-loss detection to ~15s, so the liveness sentinel sees its
+	// watch close (→ re-probe) promptly instead of waiting on the health-poll cadence.
 	http2ReadIdleTimeoutSeconds = 10
 	http2PingTimeoutSeconds     = 5
 )
 
 // ConfigureKubeHTTP2Keepalive tightens the HTTP/2 keepalive client-go applies to
-// every kube connection, by setting the env vars apimachinery's transport
-// defaults read (HTTP2_READ_IDLE_TIMEOUT_SECONDS / HTTP2_PING_TIMEOUT_SECONDS).
-// It writes a var only when unset, so an operator (or test) override wins, and is
-// safe to call once at startup — before any kube client builds its transport, the
-// values are read lazily per transport build. The composition root calls it.
+// every kube connection, by setting the env vars apimachinery's transport defaults
+// read (HTTP2_READ_IDLE_TIMEOUT_SECONDS / HTTP2_PING_TIMEOUT_SECONDS). It writes a
+// var only when unset, so an operator (or test) override wins. Call once at startup;
+// the values are read lazily per transport build. The composition root calls it.
 func ConfigureKubeHTTP2Keepalive() {
 	setEnvIfUnset("HTTP2_READ_IDLE_TIMEOUT_SECONDS", strconv.Itoa(http2ReadIdleTimeoutSeconds))
 	setEnvIfUnset("HTTP2_PING_TIMEOUT_SECONDS", strconv.Itoa(http2PingTimeoutSeconds))
@@ -70,14 +66,13 @@ type KubeConfigSource interface {
 	Subscribe() k8shelpers.KubeConfigSubscription
 }
 
-// ConnectionEligible reports whether a Cluster record should have a live
-// connection: kubeconfig-sourced, observed present, enabled, and not being
-// deleted. Presence is read from the observed status (written by the
-// ClusterCoreController from the live kubeconfig), so callers that react to a
-// record — the cache controller, the targeted-retry pre-gate — see the latest
-// committed observation. The ClusterCoreController's own reconcile uses
-// connectionEligible with a freshly-observed presence instead, so its gate does
-// not lag the status it is about to write.
+// ConnectionEligible reports whether a Cluster record should have a live connection:
+// kubeconfig-sourced, observed present, enabled, and not being deleted. Presence is
+// read from the observed status (written by the ClusterCoreController), so callers
+// that react to a record — the cache controller, the targeted-retry pre-gate — see
+// the latest committed observation. The controller's own reconcile uses
+// connectionEligible with a freshly-observed presence, so its gate doesn't lag the
+// status it's about to write.
 func ConnectionEligible(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
 	present := obj.Status != nil &&
 		obj.Status.Source.Kubeconfig != nil &&
@@ -120,12 +115,11 @@ func ResolveRESTConfig(cfg *api.Config, contextName string) (*rest.Config, error
 	).ClientConfig()
 }
 
-// pokeSubscription runs a handler on every signal from the poke bus until
-// stopped. It owns the subscription, the worker goroutine, and a base context
-// cancelled on stop (so a long-running handler is interrupted). The cache
-// controller uses it (StartPoke/StopPoke) for its single poke-driven reaction;
-// the core controller folds the poke bus into its own multi-source background
-// worker instead (StartBackground), so it doesn't use this helper.
+// pokeSubscription runs a handler on every poke-bus signal until stopped. It owns the
+// subscription, the worker goroutine, and a base context cancelled on stop (so a
+// long-running handler is interrupted). The cache controller uses it (StartPoke/
+// StopPoke); the core controller folds the poke bus into its own multi-source worker
+// instead, so it doesn't.
 type pokeSubscription struct {
 	cancel func()
 	wg     sync.WaitGroup

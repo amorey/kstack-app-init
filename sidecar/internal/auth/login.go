@@ -66,13 +66,11 @@ type LoopbackFunc func(state string) (Loopback, error)
 type pendingLogin func(ctx context.Context) (Token, Identity, error)
 
 // loginStarter runs the synchronous setup of the interactive login — bind the
-// loopback listener and open the system browser at the authorize URL — and
-// returns the pendingLogin tail to finish asynchronously. The returned error is
-// the pre-browser setup failure, surfaced synchronously to the login mutation.
-// (*loginFlow).start is the production implementation; the service holds the
-// login step behind this func so a test can inject a canned result without
-// standing up the flow's loopback/browser/oauth seams — those are the
-// loginFlow's own concern, tested directly against it.
+// loopback listener and open the system browser — and returns the pendingLogin
+// tail to finish asynchronously. The returned error is the pre-browser setup
+// failure, surfaced synchronously to the login mutation. (*loginFlow).start is
+// the production implementation; the service holds the login step behind this
+// func so a test can inject a canned result without the flow's seams.
 type loginStarter func(ctx context.Context) (pendingLogin, error)
 
 // loginFlow orchestrates the interactive desktop login. It owns the three
@@ -88,16 +86,14 @@ type loginFlow struct {
 	openBrowser func(url string) error
 }
 
-// start runs the synchronous setup of the login flow — generate the PKCE
-// verifier + CSRF state, spin up the loopback redirect listener, and open the
-// system browser at the PKCE authorize URL — then returns a pendingLogin tail
-// that finishes the slow browser round-trip (wait for the redirect, exchange +
-// verify the code into the minted token and verified identity). The setup steps
-// are fast and deterministic, so their failures (loopback bind, browser launch)
-// are surfaced synchronously to the caller. On a browser-open failure the
-// listener is torn down before returning (no tail will run to close it); on
-// success the returned tail closes it when it completes, errors, or ctx is
-// cancelled.
+// start runs the synchronous setup of the login flow — generate the PKCE verifier
+// + CSRF state, spin up the loopback redirect listener, open the system browser
+// at the authorize URL — then returns a pendingLogin tail that finishes the slow
+// browser round-trip (wait for the redirect, exchange + verify into the minted
+// token and verified identity). Setup failures (loopback bind, browser launch)
+// are surfaced synchronously. On a browser-open failure the listener is torn down
+// before returning; on success the tail closes it when it completes, errors, or
+// ctx is cancelled.
 func (f *loginFlow) start(_ context.Context) (pendingLogin, error) {
 	verifier := generateVerifier()
 	state := generateState()

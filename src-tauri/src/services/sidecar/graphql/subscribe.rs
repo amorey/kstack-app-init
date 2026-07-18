@@ -27,8 +27,8 @@
 //!   event: complete\n\n                         terminal, sent once
 //! ```
 //!
-//! We translate that into the webview channel envelope the frontend already
-//! speaks (`subscribe-exchange.ts`):
+//! We translate that into the webview channel envelope the frontend speaks
+//! (`subscribe-exchange.ts`):
 //! ```text
 //!   open     → {"type":"open"}    once, on 200, before any `next`
 //!   next     → {"type":"next","payload":<graphql.Response>}
@@ -37,29 +37,23 @@
 //!   error    → {"type":"error","payload":<message>}  (transport-level only)
 //! ```
 //! `complete` vs `closed` is the "was this the server's decision?" split: both
-//! make the frontend reconnect (a long-lived watch completed by the server —
-//! e.g. sidecar shutdown — must come back), but only `closed` is an *abnormal*
-//! end worth reporting to the user; a graceful `complete` (also the normal end
-//! of a finite stream like chat) reconnects silently. See
-//! `subscribe-exchange.ts`.
+//! make the frontend reconnect, but only `closed` is an abnormal end worth
+//! reporting to the user; a graceful `complete` reconnects silently.
 //!
-//! The split is detected at the *body* level, not from the `complete` SSE
-//! event: gqlgen's `event: complete` carries no `data:` line, and the SSE spec
-//! discards data-less events at dispatch, so the parser never yields it.
-//! What distinguishes the endings is chunked transfer framing — a graceful
-//! completion ends with the server's chunked terminator (a clean end-of-body),
-//! while a crash/sleep/network drop truncates the chunked body and surfaces as
-//! a read error.
-//! `open` is the "connection established" signal: it fires only after the dial
-//! succeeds (200 received), so the frontend can reset its per-subscription
-//! accumulators on a reconnect without also clearing them on a failed dial
-//! (which emits `error` instead). See `subscribe-exchange.ts`.
+//! The split is read at the *body* level, not from the `complete` SSE event:
+//! gqlgen's `event: complete` carries no `data:` line, and the SSE spec discards
+//! data-less events, so the parser never yields it. A graceful completion ends
+//! with the server's chunked terminator (clean end-of-body); a crash/sleep/drop
+//! truncates the chunked body and surfaces as a read error.
 //!
-//! There's no shared session, no `connection_init`/`ack`, and no demultiplexing:
-//! a dropped connection ends exactly one subscription, and the frontend's
-//! capped-backoff reconnect (subscribe-exchange.ts) re-subscribes — which just
-//! opens a fresh connection here. The only state we keep is a table of cancel
-//! handles so `unsubscribe` can drop the right connection.
+//! `open` fires only after the dial succeeds (200 received), so the frontend can
+//! reset its per-subscription accumulators on a reconnect without clearing them
+//! on a failed dial (which emits `error`).
+//!
+//! There's no shared session, `connection_init`/`ack`, or demultiplexing: a
+//! dropped connection ends one subscription, and the frontend's capped-backoff
+//! reconnect just opens a fresh connection here. The only state kept is a table
+//! of cancel handles so `unsubscribe` can drop the right connection.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,23 +81,19 @@ pub trait FrameSink: Send + Sync {
     fn send_frame(&self, frame: String);
 }
 
-/// The graceful-end envelope: the server finished the stream on its own terms
-/// (clean end-of-body — how gqlgen's data-less `event: complete` actually
-/// surfaces, see the module docs). The frontend still reconnects (a
-/// server-completed watch — e.g. sidecar shutdown — must come back) but does
-/// not report it as an error.
+/// Graceful-end envelope: the server finished on its own terms (clean
+/// end-of-body). The frontend reconnects but doesn't report an error.
 const COMPLETE_FRAME: &str = r#"{"type":"complete"}"#;
 
-/// The abnormal-end envelope: the connection died mid-stream (truncated
-/// chunked body / read failure — sidecar crash, sleep, network loss). The
-/// frontend's reconnect path fires and, unlike `complete`, reports the drop.
+/// Abnormal-end envelope: the connection died mid-stream (truncated chunked body
+/// — sidecar crash, sleep, network loss). The frontend reconnects and, unlike
+/// `complete`, reports the drop.
 const CLOSED_FRAME: &str = r#"{"type":"closed"}"#;
 
-/// The "connection established" envelope. Sent once, before any `next`, after
-/// the dial succeeds (200 received) — never on a failed dial (that emits
-/// `error`). The frontend resets its per-subscription accumulators on this
-/// frame so a reconnect's snapshot replaces rather than merges. See
-/// `subscribe-exchange.ts`.
+/// "Connection established" envelope. Sent once, before any `next`, after the
+/// dial succeeds (200) — never on a failed dial (that emits `error`). The
+/// frontend resets its per-subscription accumulators on it so a reconnect's
+/// snapshot replaces rather than merges.
 const OPEN_FRAME: &str = r#"{"type":"open"}"#;
 
 /// Opens one SSE connection per subscription and tracks a cancel handle for
@@ -116,8 +106,8 @@ pub struct SubscriptionClient {
     /// Host-side op id counter. Monotonic for the process lifetime so the
     /// frontend can rely on distinct ids across reconnects.
     next_id: AtomicU64,
-    /// How long the initial UDS dial may take before the subscription gives up
-    /// and emits an `error` frame. Tests shrink this; production uses
+    /// How long the initial dial may take before the subscription gives up and
+    /// emits an `error` frame. Tests shrink this; production uses
     /// [`DEFAULT_CONNECT_BUDGET`].
     connect_budget: Duration,
 }
@@ -139,14 +129,13 @@ impl SubscriptionClient {
         }
     }
 
-    /// Registers a subscription: opens its own SSE connection to the sidecar
-    /// and streams frames to `sink` until the server completes, the connection
-    /// drops, or [`Self::unsubscribe`] is called. Returns the host-side op id.
+    /// Registers a subscription: opens its own SSE connection and streams frames
+    /// to `sink` until the server completes, the connection drops, or
+    /// [`Self::unsubscribe`] is called. Returns the host-side op id.
     ///
     /// Returns `Ok` as soon as the streaming task is spawned — connection and
-    /// stream failures surface on the sink (as an `error` or `closed`
-    /// envelope), which is exactly the frontend's reconnect path, so there's
-    /// no transport error to bubble up synchronously.
+    /// stream failures surface on the sink (`error`/`closed`), the frontend's
+    /// reconnect path, so nothing bubbles up synchronously.
     pub async fn subscribe(
         &self,
         query: String,
@@ -172,13 +161,12 @@ impl SubscriptionClient {
 
     /// Cancels a subscription by host-side op id, dropping its connection.
     ///
-    /// Tolerant of unknown ids — urql's subscribe-exchange can race teardown
-    /// with the `graphql_subscribe` resolve (subscribe-exchange.ts) and call
-    /// this with an id that already completed on its own.
+    /// Tolerant of unknown ids — urql's subscribe-exchange can race teardown with
+    /// the `graphql_subscribe` resolve and call this with an already-completed id.
     pub async fn unsubscribe(&self, id: u64) {
-        // Removing drops the cancel sender, which resolves the streaming task's
-        // cancel future → it stops and drops the connection. If the task
-        // already finished, the entry is gone and this is a no-op.
+        // Removing drops the cancel sender, which fires the streaming task's
+        // cancel future → it stops and drops the connection. A no-op if the task
+        // already finished.
         let _ = self.subs.lock().await.remove(&id);
     }
 }
@@ -204,15 +192,15 @@ async fn run_subscription(
 
     match opened {
         Ok(resp) => {
-            // Signal the live connection before streaming its snapshot, so the
-            // frontend resets accumulators here (and only here — a failed dial
-            // takes the `Err` arm and emits no `open`).
+            // Signal the live connection before the snapshot, so the frontend
+            // resets accumulators here (and only here — a failed dial takes the
+            // `Err` arm and emits no `open`).
             sink.send_frame(OPEN_FRAME.to_string());
             stream_to_sink(resp, &sink, cancel_rx).await
         }
         Err(err) => {
-            // Connect / handshake / non-200: report it as a transport error.
-            // The frontend treats `error` the same as a drop — it reconnects.
+            // Connect / handshake / non-200: report as a transport error, which
+            // the frontend treats like a drop and reconnects.
             sink.send_frame(error_frame(&err.to_string()));
         }
     }
@@ -233,8 +221,8 @@ async fn open_stream(
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
         .map_err(|e| AppError::Io(std::io::Error::other(e)))?;
-    // Drive the connection in the background. It must keep running for the
-    // streaming body to receive bytes; it ends when the body is dropped.
+    // Drive the connection in the background: it must keep running for the
+    // streaming body to receive bytes, and ends when the body is dropped.
     tokio::spawn(async move {
         if let Err(err) = conn.await {
             tracing::debug!(target: "sidecar", %err, "sse connection ended");
@@ -247,7 +235,7 @@ async fn open_stream(
         // hyper requires a Host header on HTTP/1.1 even over UDS.
         .header("host", "sidecar.local")
         .header("content-type", "application/json")
-        // The Accept header is what selects gqlgen's SSE transport over POST.
+        // Selects gqlgen's SSE transport over POST.
         .header("accept", "text/event-stream")
         .body(Full::new(Bytes::from(body)))
         .map_err(|e| AppError::Io(std::io::Error::other(format!("build request: {e}"))))?;
@@ -272,10 +260,9 @@ async fn stream_to_sink(
     sink: &Arc<dyn FrameSink>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) {
-    // Adapt hyper's streaming body into a `Bytes` stream and let
-    // `eventsource-stream` own the SSE wire parsing: line framing, the
-    // single-leading-space strip, multi-line `data:`, comment / keep-alive
-    // lines, and buffering events split across chunk boundaries.
+    // Let `eventsource-stream` own the SSE wire parsing: line framing, the
+    // leading-space strip, multi-line `data:`, comment/keep-alive lines, and
+    // events split across chunk boundaries.
     let mut events = resp.into_body().into_data_stream().eventsource();
     loop {
         tokio::select! {
@@ -287,33 +274,27 @@ async fn stream_to_sink(
                 match next {
                     Some(Ok(event)) => {
                         if event.event == "complete" {
-                            // Only reachable if a `complete` ever carries data
-                            // (gqlgen's is data-less, so the SSE parser discards
-                            // it and the graceful end surfaces as the clean EOF
-                            // below) — but if one does arrive, it means the same
-                            // thing.
+                            // Only reachable if a `complete` carries data;
+                            // gqlgen's is data-less, so the graceful end normally
+                            // surfaces as the clean EOF below. Means the same thing.
                             sink.send_frame(COMPLETE_FRAME.to_string());
                             return;
                         } else if !event.data.is_empty() {
-                            // gqlgen tags value events `next`; any non-empty
-                            // data frame carries a `graphql.Response`. Empty
-                            // dispatches (e.g. the initial `:` comment) are
-                            // dropped by the parser and never reach here.
+                            // Any non-empty data frame carries a `graphql.Response`.
+                            // Empty dispatches (e.g. the initial `:` comment) never
+                            // reach here.
                             sink.send_frame(next_frame(&event.data));
                         }
                     }
-                    // Clean end-of-body: the server wrote its chunked
-                    // terminator and finished — the graceful completion
-                    // (gqlgen's `event: complete` lands here, see module docs).
-                    // The frontend reconnects silently.
+                    // Clean end-of-body: the graceful completion (gqlgen's
+                    // data-less `event: complete` lands here). Reconnects silently.
                     None => {
                         sink.send_frame(COMPLETE_FRAME.to_string());
                         return;
                     }
-                    // Mid-stream read/parse failure (truncated chunked body —
-                    // sidecar crash, sleep, network loss): emit `closed` so the
-                    // frontend reconnects (rather than hanging) *and* reports
-                    // the drop.
+                    // Mid-stream read/parse failure (truncated body — crash,
+                    // sleep, network loss): emit `closed` so the frontend
+                    // reconnects and reports the drop.
                     Some(Err(_)) => {
                         sink.send_frame(CLOSED_FRAME.to_string());
                         return;
@@ -324,16 +305,13 @@ async fn stream_to_sink(
     }
 }
 
-/// Wraps a gqlgen `graphql.Response` (already JSON) in the `next` envelope.
-/// The data is valid JSON straight off the wire, so embedding it verbatim keeps
-/// the envelope valid without a parse round-trip.
+/// Wraps a gqlgen `graphql.Response` (already valid JSON off the wire) in the
+/// `next` envelope, embedding it verbatim without a parse round-trip.
 fn next_frame(data: &str) -> String {
     format!(r#"{{"type":"next","payload":{data}}}"#)
 }
 
-/// Builds the `error` envelope, escaping `message` via serde. Keeps `type`
-/// first to match the `next`/`complete` envelopes (the frontend parses by key,
-/// so order is cosmetic, but consistency keeps logs readable).
+/// Builds the `error` envelope, escaping `message` via serde.
 fn error_frame(message: &str) -> String {
     let payload = serde_json::to_string(message).unwrap_or_else(|_| "\"\"".to_string());
     format!(r#"{{"type":"error","payload":{payload}}}"#)
@@ -357,15 +335,13 @@ mod tests {
         }
     }
 
-    /// Stands up a one-shot HTTP/1 server on `path` that reads the request
-    /// headers, writes a `200 text/event-stream` head followed by `events` as
-    /// one chunk of a chunked body (matching gqlgen, whose streaming responses
-    /// are chunked — that framing is what lets the client tell the endings
-    /// apart), then runs `after` (e.g. return immediately, or wait to keep the
-    /// stream open). `clean_end` decides the ending: `true` writes the chunked
-    /// terminator before closing (a graceful completion), `false` just closes
-    /// (a truncated body — the abnormal drop). Uses `interprocess` so the same
-    /// fixture drives Unix UDS and Windows named-pipe tests.
+    /// One-shot HTTP/1 server on `path`: reads the request headers, writes a
+    /// `200 text/event-stream` head + `events` as one chunk of a chunked body
+    /// (matching gqlgen, whose chunked framing is what lets the client tell the
+    /// endings apart), then runs `after` (e.g. return, or wait to hold the stream
+    /// open). `clean_end` picks the ending: `true` writes the chunked terminator
+    /// (graceful completion), `false` just closes (truncated body — abnormal
+    /// drop). Uses `interprocess` for both Unix UDS and Windows named-pipe tests.
     async fn spawn_sse_server<Fut>(
         path: String,
         events: &'static str,
