@@ -41,6 +41,13 @@ function channelFor(queryPart: string) {
   return channels[idx];
 }
 
+// The `open` frame the host sends on each established connection (ahead of the
+// snapshot). It marks the clustersWatch stream connected, so the picker reads
+// "connected, empty" rather than "still connecting".
+function openStream() {
+  channelFor('clustersWatch').onmessage!(JSON.stringify({ type: 'open' }));
+}
+
 function pushClusters(rows: Row[]) {
   const ch = channelFor('clustersWatch');
   rows.forEach((r) => {
@@ -183,6 +190,24 @@ describe('KubeContextPicker', () => {
       pushClusters([{ id: 'a', name: 'prod', enabled: false }]);
     });
     expect(screen.getByTestId('kube-context-empty')).toBeInTheDocument();
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
+  });
+
+  it('renders "No kubeconfig" on a connected but empty registry snapshot', async () => {
+    await renderWithRouter(buildTree(), '/chat');
+    await act(async () => {
+      openStream(); // connection up, but the snapshot carries no clusters
+    });
+    expect(screen.getByTestId('kube-context-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('kube-context-connecting')).not.toBeInTheDocument();
+  });
+
+  it('shows a connecting state while the registry stream has not reported', async () => {
+    await renderWithRouter(buildTree(), '/chat');
+    // No `open`/`next` on clustersWatch: the transport is still dialing, so nothing
+    // has been reported. This must read as connecting, not as an empty kubeconfig.
+    expect(screen.getByTestId('kube-context-connecting')).toBeInTheDocument();
+    expect(screen.queryByTestId('kube-context-empty')).not.toBeInTheDocument();
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
   });
 });

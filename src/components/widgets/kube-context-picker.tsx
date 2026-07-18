@@ -19,13 +19,26 @@
 // current-context. The trigger grows to fit a full FQDN context name up to a cap,
 // past which the value line-clamps.
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@kubetail/ui/elements/select';
+import { Spinner } from '@kubetail/ui/elements/spinner';
 
 import { useActiveKubeContext } from '@/lib/active-kube-context';
 
 export function KubeContextPicker() {
-  const { context, contexts, setContext } = useActiveKubeContext();
+  const { context, contexts, phase, setContext } = useActiveKubeContext();
 
   if (contexts.length === 0) {
+    // Nothing to switch between. Split the reason so a stalled initial dial reads
+    // as "connecting" rather than a permanent-looking "No kubeconfig": only the
+    // `connecting` phase (transport down, nothing reported) shows the spinner; a
+    // reported-but-empty kubeconfig (or a reconnect) is the genuine empty state.
+    if (phase === 'connecting') {
+      return (
+        <span className="flex items-center gap-1.5 text-xs text-muted-foreground" data-testid="kube-context-connecting">
+          <Spinner size="xs" className="mr-0" />
+          Connecting…
+        </span>
+      );
+    }
     return (
       <span className="text-xs text-muted-foreground" data-testid="kube-context-empty">
         No kubeconfig

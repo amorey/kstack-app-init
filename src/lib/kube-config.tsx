@@ -39,14 +39,18 @@ export type KubeConfig = {
 type KubeConfigContextValue = {
   // null = clusters not reported yet (first frame not landed).
   kubeConfig: KubeConfig | null;
+  // Is the registry's transport up right now? Passed straight through from the
+  // cluster registry, so a consumer can pair it with `kubeConfig === null` (via
+  // `watchPhase`) to tell "connecting" from "connected, empty kubeconfig".
+  connected: boolean;
 };
 
 const KubeConfigCtx = createContext<KubeConfigContextValue | null>(null);
 
 export function KubeConfigProvider({ children }: { children: React.ReactNode }) {
-  const { clusters } = useClusters();
+  const { clusters, connected } = useClusters();
   const value = useMemo<KubeConfigContextValue>(() => {
-    if (clusters === null) return { kubeConfig: null };
+    if (clusters === null) return { kubeConfig: null, connected };
     // The context picker shows only clusters the user has enabled in the app and
     // that are still present in the kubeconfig. Disabled records stay tracked but
     // hidden; orphaned ones (context gone) have nothing to switch to. Only
@@ -55,6 +59,7 @@ export function KubeConfigProvider({ children }: { children: React.ReactNode }) 
       (c) => c.spec.enabled && c.status.source.kubeconfig?.isPresent && c.spec.source.kubeconfig,
     );
     return {
+      connected,
       kubeConfig: {
         currentContext:
           present.find((c) => c.status.source.kubeconfig?.isDefault)?.spec.source.kubeconfig?.context ?? '',
@@ -65,7 +70,7 @@ export function KubeConfigProvider({ children }: { children: React.ReactNode }) 
         })),
       },
     };
-  }, [clusters]);
+  }, [clusters, connected]);
   return <KubeConfigCtx.Provider value={value}>{children}</KubeConfigCtx.Provider>;
 }
 

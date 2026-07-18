@@ -19,6 +19,8 @@
 // the kubeconfig's current-context.
 import { useNavigate, useSearch } from '@tanstack/react-router';
 
+import { watchPhase } from '@/lib/graphql/use-watch-subscription';
+import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
 import { useKubeConfig } from '@/lib/kube-config';
 import type { KubeContextInfo } from '@/lib/kube-config';
 
@@ -31,6 +33,9 @@ type ActiveKubeContext = {
   active: KubeContextInfo | undefined;
   // Available contexts to switch between (enabled, present kubeconfig clusters).
   contexts: KubeContextInfo[];
+  // The registry watch's UI phase, so the picker can show "connecting" (still
+  // dialing, nothing reported) distinctly from "connected, empty kubeconfig".
+  phase: WatchPhase;
   // Persist a choice by writing it to the URL search param.
   setContext: (name: string) => void;
 };
@@ -40,8 +45,11 @@ export function useActiveKubeContext(): ActiveKubeContext {
   // merged search of whatever `_app` descendant renders it.
   const { kubeContext: param } = useSearch({ strict: false });
   const navigate = useNavigate();
-  const { kubeConfig } = useKubeConfig();
+  const { kubeConfig, connected } = useKubeConfig();
 
+  // `kubeConfig === null` is exactly "the registry hasn't reported" (an empty
+  // snapshot never lands a frame), so it's the `hasData` signal `watchPhase` wants.
+  const phase = watchPhase(kubeConfig !== null, connected);
   const contexts = kubeConfig?.contexts ?? [];
   // A param naming a context that's since disappeared silently yields to the
   // default, so a stale deep link never points at nothing.
@@ -53,5 +61,5 @@ export function useActiveKubeContext(): ActiveKubeContext {
     navigate({ to: '.', search: (prev) => ({ ...prev, kubeContext: name }) });
   };
 
-  return { context, active, contexts, setContext };
+  return { context, active, contexts, phase, setContext };
 }
