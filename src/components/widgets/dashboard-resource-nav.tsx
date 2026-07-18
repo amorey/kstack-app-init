@@ -26,6 +26,8 @@ import { useState } from 'react';
 import { Link, useSearch } from '@tanstack/react-router';
 import { ChevronRight } from 'lucide-react';
 
+import { Spinner } from '@kubetail/ui/elements/spinner';
+
 import { useDashboardNav } from '@/lib/dashboard-nav';
 import { findNode, resolveDashboardResource } from '@/lib/dashboard-resources';
 import type { DashboardNavNode, DashboardResource } from '@/lib/dashboard-resources';
@@ -158,9 +160,17 @@ function NavItem({ node, active, depth, isExpanded, toggle }: NavItemProps) {
 }
 
 export function DashboardResourceNav() {
-  const { nav } = useDashboardNav();
+  const { nav, active: watchActive, phase } = useDashboardNav();
   const { resource } = useSearch({ strict: false });
   const active = resolveDashboardResource(resource);
+
+  // The curated tree always renders, so the discovered kinds below it may be stale
+  // (a dropped watch) or not yet in (still dialing). Flag that — but only when the
+  // subscription is live (`watchActive`); a paused watch on an unsynced cluster is
+  // legitimately curated-only, not "reconnecting". `empty`/`live` show nothing.
+  let status: string | null = null;
+  if (watchActive && phase === 'reconnecting') status = 'Reconnecting…';
+  else if (watchActive && phase === 'connecting') status = 'Loading resources…';
 
   // Per-group reveal state. An explicit user toggle wins; absent one, a group is open
   // iff it holds the active kind, so a deep link to a discovered kind reveals it.
@@ -173,6 +183,14 @@ export function DashboardResourceNav() {
       {nav.map((node) => (
         <NavItem key={node.id} node={node} active={active} depth={0} isExpanded={isExpanded} toggle={toggle} />
       ))}
+      {/* A transport hint under the tree (below, so it never shifts the resource rows):
+          the discovered kinds may be stale or incomplete while it shows. */}
+      {status !== null && (
+        <p className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-muted-foreground" data-testid="nav-status">
+          <Spinner size="xs" className="mr-0" />
+          {status}
+        </p>
+      )}
     </nav>
   );
 }

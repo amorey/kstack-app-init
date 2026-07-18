@@ -14,7 +14,7 @@
 
 import { act, screen, waitFor } from '@testing-library/react';
 import { createRootRoute, createRoute, Outlet } from '@tanstack/react-router';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { renderWithRouter } from '@/test-utils';
 
@@ -25,7 +25,10 @@ import { renderWithRouter } from '@/test-utils';
 // on `moreChildren`, and a childless System group whose kinds are also on
 // `moreChildren` (empty curated `children`) — mirroring what `buildDashboardNav`
 // produces; the renderer derives System's parent-level chevron from that shape.
-const { NAV } = vi.hoisted(() => ({
+// The watch's UI state the hook exposes alongside `nav` — mutated per test to drive
+// the transport-hint footer. Defaults model a live, active subscription (no hint).
+const { NAV, navState } = vi.hoisted(() => ({
+  navState: { active: true, phase: 'live' },
   NAV: [
     { id: 'overview', label: 'Overview' },
     { id: 'nodes', label: 'Nodes' },
@@ -48,7 +51,9 @@ const { NAV } = vi.hoisted(() => ({
   ],
 }));
 
-vi.mock('@/lib/dashboard-nav', () => ({ useDashboardNav: () => ({ nav: NAV }) }));
+vi.mock('@/lib/dashboard-nav', () => ({
+  useDashboardNav: () => ({ nav: NAV, active: navState.active, phase: navState.phase }),
+}));
 
 const { DashboardResourceNav } = await import('./dashboard-resource-nav');
 
@@ -74,6 +79,13 @@ function buildTree() {
 }
 
 describe('DashboardResourceNav', () => {
+  beforeEach(() => {
+    // Reset to a live, active watch so the transport hint stays hidden unless a test
+    // opts in (the hoisted navState persists across tests otherwise).
+    navState.active = true;
+    navState.phase = 'live';
+  });
+
   it('links each resource to the dashboard with its own search param', async () => {
     await renderWithRouter(buildTree(), '/dashboard');
     expect(screen.getByRole('link', { name: 'Nodes' })).toHaveAttribute('href', '/dashboard?resource=nodes');
@@ -210,5 +222,36 @@ describe('DashboardResourceNav', () => {
     await renderWithRouter(buildTree(), '/dashboard?resource=coordination.k8s.io/leases');
     expect(screen.getByRole('button', { name: 'Collapse System' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Lease' })).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('shows no transport hint on a live watch', async () => {
+    navState.phase = 'live';
+    await renderWithRouter(buildTree(), '/dashboard');
+    expect(screen.queryByTestId('nav-status')).not.toBeInTheDocument();
+    // The curated tree still renders.
+    expect(screen.getByRole('link', { name: 'Nodes' })).toBeInTheDocument();
+  });
+
+  it('flags reconnecting under the tree when the live watch drops', async () => {
+    navState.phase = 'reconnecting';
+    await renderWithRouter(buildTree(), '/dashboard');
+    expect(screen.getByTestId('nav-status')).toHaveTextContent('Reconnecting…');
+    // The tree stays put above the hint.
+    expect(screen.getByRole('link', { name: 'Nodes' })).toBeInTheDocument();
+  });
+
+  it('shows a loading hint while an active watch is still dialing', async () => {
+    navState.phase = 'connecting';
+    await renderWithRouter(buildTree(), '/dashboard');
+    expect(screen.getByTestId('nav-status')).toHaveTextContent('Loading resources…');
+  });
+
+  it('stays silent (curated-only) when the watch is paused on an unsynced cluster', async () => {
+    // Paused: no active cache to stream from, so `connected` is meaninglessly false.
+    // This must NOT read as reconnecting — the curated tree is the correct state.
+    navState.active = false;
+    navState.phase = 'connecting';
+    await renderWithRouter(buildTree(), '/dashboard');
+    expect(screen.queryByTestId('nav-status')).not.toBeInTheDocument();
   });
 });

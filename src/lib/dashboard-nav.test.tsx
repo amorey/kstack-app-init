@@ -307,4 +307,48 @@ describe('useDashboardNav', () => {
     expect(hasDiscovered(result.current.nav)).toBe(false);
     expect(lastArgs?.pause).toBe(true);
   });
+
+  // The transport phase (for the sidebar's reconnecting/loading hint) — and, crucially,
+  // `active`, which gates it so a paused watch never reads as "reconnecting".
+  it('reports active=false while paused, so the paused false `connected` is not "reconnecting"', () => {
+    // A cluster with no active cache ⇒ subscription paused ⇒ `connected` is false, but
+    // that must not surface as a connection problem.
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(null)] });
+    statusState.snapshot = { connected: false, generation: 0 };
+    const { result } = renderHook(() => useDashboardNav());
+    expect(result.current.active).toBe(false);
+    expect(lastArgs?.pause).toBe(true);
+  });
+
+  it('reports active + live once the catalog has streamed on a healthy connection', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'True', reason: 'Watching' })] });
+    const { result, rerender } = renderHook(() => useDashboardNav());
+    expect(result.current.active).toBe(true);
+
+    pushFrame('Added', REPLICASET);
+    rerender();
+    expect(result.current.phase).toBe('live');
+  });
+
+  it('reports reconnecting when a live watch drops but keeps its last-known catalog', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'True', reason: 'Watching' })] });
+    const { result, rerender } = renderHook(() => useDashboardNav());
+    pushFrame('Added', REPLICASET);
+    rerender();
+    expect(result.current.phase).toBe('live');
+
+    // Transport drops (same generation → data held). Phase flips, kinds stay.
+    statusState.snapshot = { connected: false, generation: statusState.snapshot.generation };
+    rerender();
+    expect(result.current.phase).toBe('reconnecting');
+    expect(hasDiscovered(result.current.nav)).toBe(true);
+  });
+
+  it('reports connecting when the active watch has dialed but no frame has landed', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'True', reason: 'Watching' })] });
+    statusState.snapshot = { connected: false, generation: 0 };
+    const { result } = renderHook(() => useDashboardNav());
+    expect(result.current.active).toBe(true);
+    expect(result.current.phase).toBe('connecting');
+  });
 });

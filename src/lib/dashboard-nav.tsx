@@ -37,7 +37,8 @@ import { useClusters, applyChange } from '@/lib/clusters';
 import type { Keyed } from '@/lib/clusters';
 import { buildDashboardNav } from '@/lib/dashboard-resources';
 import type { DashboardNavNode } from '@/lib/dashboard-resources';
-import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
+import { useWatchSubscription, watchPhase } from '@/lib/graphql/use-watch-subscription';
+import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
 
 const ClusterDataKindsWatchSubscription = graphql(`
   subscription ClusterDataKindsWatch($id: ObjectID!, $cacheID: ObjectID!) {
@@ -75,7 +76,7 @@ type Catalog = { cacheID: string; kinds: Keyed<KindRow> };
 // discovered kinds, updated live. Falls back to the curated-only tree while
 // clusters/kinds haven't loaded (no active cluster, or an unsynced one — it has no
 // active cache, so the subscription is paused).
-export function useDashboardNav(): { nav: DashboardNavNode[] } {
+export function useDashboardNav(): { nav: DashboardNavNode[]; active: boolean; phase: WatchPhase } {
   const { context } = useActiveKubeContext();
   const { clusters } = useClusters();
 
@@ -98,7 +99,7 @@ export function useDashboardNav(): { nav: DashboardNavNode[] } {
   // a swap (prev still holds the old cache) starts a fresh catalog so the two never mix.
   // A transport reconnect (same cacheID, full replay) is handled one level down:
   // useWatchSubscription resets the catalog to `undefined` before the replay streams.
-  const [{ data }] = useWatchSubscription(
+  const [{ data, connected }] = useWatchSubscription(
     {
       query: ClusterDataKindsWatchSubscription,
       variables: { id: clusterID ?? '', cacheID: cacheID ?? '' },
@@ -124,5 +125,15 @@ export function useDashboardNav(): { nav: DashboardNavNode[] } {
     () => buildDashboardNav(data && cacheID && data.cacheID === cacheID ? [...data.kinds.values()] : []),
     [cacheID, data],
   );
-  return { nav };
+
+  // `active` = the subscription is live (there's a cluster + active cache to stream
+  // from). It's `false` while paused (an unsynced cluster has no active cache), where
+  // `connected` is meaninglessly `false` — so a "reconnecting/loading" affordance must
+  // gate on `active`, not on `phase` alone, to stay silent on the curated-only fallback.
+  const active = !!(clusterID && cacheID);
+  // The catalog counts as data only when it's present and tagged for the active cache —
+  // the same guard the nav-build uses. That's this watch's `hasData` for the phase.
+  const hasCatalog = !!(data && cacheID && data.cacheID === cacheID);
+  const phase = watchPhase(hasCatalog, connected);
+  return { nav, active, phase };
 }
