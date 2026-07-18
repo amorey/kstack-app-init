@@ -49,10 +49,7 @@ type Service struct {
 	prefs  *prefs.Store     // nil when degraded
 	engine *prefsync.Engine // nil when degraded
 
-	cancel   context.CancelFunc
-	done     chan struct{} // closed when the engine goroutine exits
-	pokeDone chan struct{} // closed when the session→poke goroutine exits (nil if no auth)
-	started  bool
+	started bool
 }
 
 // New builds the cloud settings service over the given auth subsystem. dataDir is
@@ -109,17 +106,19 @@ func newWithOptions(dataDir, cloudURL string, authSvc auth.Service, pokeSvc *pok
 func (s *Service) Prefs() *prefs.Store { return s.prefs }
 
 // Start launches the settings-sync engine bound to a context derived from ctx,
-// plus a goroutine that wakes the engine on every auth session change. No-op
-// when degraded or already started — a second call must not leak a second engine
-// goroutine that Close wouldn't wait on.
-func (s *Service) Start(ctx context.Context) {
+// plus a goroutine that wakes the engine on every auth session change. ctx scopes
+// initialization only; the returned stop func cancels both goroutines and blocks
+// until they unwind, honoring its own drain-deadline context. It returns a no-op
+// stop when degraded or already started — a second call must not leak a second
+// engine goroutine.
+func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
+	noop := func(context.Context) error { return nil }
 	if s.engine == nil || s.started {
-		return
+		return noop, nil
 	}
 	s.started = true
 	runCtx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
-	s.done = make(chan struct{})
+	done := make(chan struct{})
 
 	// Wake the engine on every auth sign-in / sign-out: cloud (the dependent)
 	// observes auth's session state stream, and auth knows nothing of the engine. A
@@ -131,11 +130,12 @@ func (s *Service) Start(ctx context.Context) {
 	// the Authenticated bit and poke when it flips: the first receive seeds the
 	// baseline without poking, and a routine token refresh leaves Authenticated
 	// unchanged, so it doesn't wake the engine.
+	var pokeDone chan struct{}
 	if s.auth != nil {
 		states, cancelSub := s.auth.Subscribe()
-		s.pokeDone = make(chan struct{})
+		pokeDone = make(chan struct{})
 		go func() {
-			defer close(s.pokeDone)
+			defer close(pokeDone)
 			defer cancelSub()
 			authed, seeded := false, false
 			for {
@@ -160,22 +160,27 @@ func (s *Service) Start(ctx context.Context) {
 	}
 
 	go func() {
-		defer close(s.done)
+		defer close(done)
 		s.engine.Run(runCtx)
 	}()
-}
 
-// Close stops the sync engine (and the session-poke goroutine) and waits for
-// them to unwind. Safe to call without Start and on a degraded service.
-func (s *Service) Close() error {
-	if s.cancel != nil {
-		s.cancel()
-		<-s.done
-		if s.pokeDone != nil {
-			<-s.pokeDone
+	// stop cancels the engine (and the session-poke goroutine) and waits for both
+	// to unwind, bounded by the drain-deadline ctx.
+	stop := func(ctx context.Context) error {
+		cancel()
+		for _, ch := range []chan struct{}{done, pokeDone} {
+			if ch == nil {
+				continue
+			}
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
+		return nil
 	}
-	return nil
+	return stop, nil
 }
 
 // apiUpstream adapts the cloud api client to the prefsync.Upstream interface.

@@ -161,7 +161,10 @@ func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	svc.Start(ctx)
+	stop, err := svc.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 
 	select {
 	case <-up.watchOpened:
@@ -182,13 +185,13 @@ func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 		t.Fatal("live watch was not torn down on auth sign-out")
 	}
 
-	if err := svc.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
 }
 
 // Start is idempotent: a second call must not launch (and leak) a second engine
-// goroutine, and Close still unwinds cleanly.
+// goroutine, and stop still unwinds cleanly.
 func TestStartIsIdempotent(t *testing.T) {
 	authSvc, _ := auth.New(auth.Config{})
 	up := &signalUpstream{started: make(chan struct{}, 1)}
@@ -198,16 +201,21 @@ func TestStartIsIdempotent(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	svc.Start(ctx)
-	svc.Start(ctx) // second start must be a no-op
+	stop, err := svc.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := svc.Start(ctx); err != nil { // second start must be a no-op
+		t.Fatalf("second Start: %v", err)
+	}
 
 	select {
 	case <-up.started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("engine did not start")
 	}
-	if err := svc.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
 }
 
@@ -223,15 +231,18 @@ func TestDegradedConstruction(t *testing.T) {
 	}
 }
 
-// Start/Close on a degraded Service are no-ops and don't panic.
+// Start (and its returned stop) on a degraded Service are no-ops and don't panic.
 func TestDegradedLifecycleNoop(t *testing.T) {
 	svc, err := New("", "", nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	svc.Start(context.Background())
-	if err := svc.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	stop, err := svc.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
 }
 
@@ -249,7 +260,10 @@ func TestConfiguredStartStop(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	svc.Start(ctx)
+	stop, err := svc.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 
 	select {
 	case <-up.started:
@@ -258,7 +272,7 @@ func TestConfiguredStartStop(t *testing.T) {
 		t.Fatal("engine did not start")
 	}
 
-	if err := svc.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
 }

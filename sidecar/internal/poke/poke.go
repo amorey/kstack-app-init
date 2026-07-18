@@ -85,9 +85,6 @@ type Service struct {
 	hub *broadcast.Hub[Signal]
 	tx  *broadcast.Sender[Signal]
 	opt options
-
-	cancel context.CancelFunc
-	done   chan struct{} // closed when the Run goroutine exits
 }
 
 // New builds a Service with production defaults. It does not start anything;
@@ -128,26 +125,29 @@ func (s *Service) Subscribe() (<-chan Signal, func()) {
 	return rx.Chan(), rx.Close
 }
 
-// Start launches Run in a goroutine bound to a context derived from ctx, so a
-// cancel of ctx (or Close) stops it. Mirrors cluster.Service/cloud.Service so
-// the composition root can own the lifecycle uniformly. Call once.
-func (s *Service) Start(ctx context.Context) {
+// Start launches Run in a goroutine bound to a context derived from ctx. ctx
+// scopes initialization only; the returned stop func cancels the detector and
+// blocks until it exits (which closes the hub and all subscriber channels),
+// honoring its own drain-deadline context. Mirrors cluster.Service/cloud.Service
+// so the composition root can own the lifecycle uniformly. Call once.
+func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
 	runCtx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
-	s.done = make(chan struct{})
+	done := make(chan struct{})
 	go func() {
-		defer close(s.done)
+		defer close(done)
 		s.Run(runCtx)
 	}()
-}
 
-// Close cancels the running detector and waits for it to exit (which closes the
-// hub and all subscriber channels). Safe to call without Start.
-func (s *Service) Close() {
-	if s.cancel != nil {
-		s.cancel()
-		<-s.done
+	stop := func(ctx context.Context) error {
+		cancel()
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+	return stop, nil
 }
 
 // Run starts the wall-clock gap detector and blocks until ctx is cancelled.

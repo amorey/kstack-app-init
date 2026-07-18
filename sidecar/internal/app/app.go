@@ -164,7 +164,10 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // returned stop func accepts a drain-deadline context, blocks until all
 // background work finishes, and must be called before Close.
 func (a *App) Start(ctx context.Context) (func(context.Context) error, error) {
-	a.pokeSvc.Start(ctx)
+	pokeSvcStop, err := a.pokeSvc.Start(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("start poke service: %w", err)
+	}
 
 	// Start the cluster service: it starts beehive (the controller harness) and
 	// the kubeconfig watcher, then the kubeconfig importer (creates one Cluster
@@ -175,10 +178,13 @@ func (a *App) Start(ctx context.Context) (func(context.Context) error, error) {
 		return nil, fmt.Errorf("start cluster service: %w", err)
 	}
 
-	a.cloudSvc.Start(ctx)
+	cloudSvcStop, err := a.cloudSvc.Start(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("start cloud service: %w", err)
+	}
 
 	stop := func(ctx context.Context) error {
-		return errors.Join(clusterSvcStop(ctx), a.cloudSvc.Close())
+		return errors.Join(clusterSvcStop(ctx), cloudSvcStop(ctx), pokeSvcStop(ctx))
 	}
 	return stop, nil
 }
@@ -200,10 +206,10 @@ func (a *App) DrainWithContext(ctx context.Context) error {
 	return errors.Join(<-errs, <-errs)
 }
 
-// Close releases OS resources after Stop returns: stops the gRPC transports,
-// closes the poke broadcaster, and closes the cluster store.
+// Close releases OS resources after Stop returns: stops the gRPC transports and
+// closes the cluster store. The poke broadcaster and cloud engine are already
+// drained by the stop func returned from Start.
 func (a *App) Close() error {
 	a.grpcServer.Stop()
-	a.pokeSvc.Close()
 	return a.clusterSvc.Close()
 }
