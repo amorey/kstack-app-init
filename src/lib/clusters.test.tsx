@@ -16,11 +16,12 @@ import { render, screen, act } from '@testing-library/react';
 import { Provider as UrqlProvider } from 'urql';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore } from '@/test-utils';
+import { clusterOf, mockTauriCore, pushClusters } from '@/test-utils';
+import type { ClusterRow } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-const { invokeMock, channels, factory } = mockTauriCore();
+const { invokeMock, channels, channelFor, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
@@ -29,20 +30,6 @@ const { formatBytes, ClustersProvider, useClusters } = await import('./clusters'
 // Helpers -------------------------------------------------------------
 
 const flush = () => act(async () => {});
-
-type Row = { id: string; name: string; syncEnabled?: boolean; enabled?: boolean };
-
-// The provider opens two subscriptions (clustersWatch + clusterCachesWatch), so
-// target the channel by query rather than liveChannel(). The *last* match is the
-// live one: a reconnect opens a fresh channel for the same query.
-function channelFor(queryPart: string) {
-  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
-  // The *last* match is the live one; lastIndexOf keeps this ES2022-compatible
-  // (findLastIndex is ES2023, outside the app's configured TS lib).
-  const idx = subs.map(([, arg]) => (arg as { query: string }).query.includes(queryPart)).lastIndexOf(true);
-  if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
-  return channels[idx];
-}
 
 // Drop both transports (the host's SSE streams died), advance past the backoff
 // so subscribe-exchange re-establishes each subscription, then deliver the
@@ -62,26 +49,6 @@ async function reconnectBothStreams() {
   });
 }
 
-function clusterOf(r: Row) {
-  return {
-    id: r.id,
-    spec: {
-      name: r.name,
-      syncEnabled: r.syncEnabled ?? true,
-      enabled: r.enabled ?? true,
-      source: { kubeconfig: { context: r.name } },
-    },
-    status: {
-      source: {
-        kubeconfig: { cluster: `${r.name}-cluster`, user: `${r.name}-user`, isPresent: true, isDefault: false },
-      },
-      server: { uid: `uid-${r.id}` },
-      lastConnectedAt: null,
-      conditions: [],
-    },
-  };
-}
-
 // Push one Cluster change on the clustersWatch delta stream.
 function pushClusterChange(type: 'Added' | 'Modified' | 'Deleted', cluster: object) {
   channelFor('clustersWatch').onmessage!(
@@ -96,14 +63,9 @@ function pushCacheChange(type: 'Added' | 'Modified' | 'Deleted', cache: object) 
   );
 }
 
-// Convenience: seed each row as an Added cluster change (the snapshot).
-function pushClusters(rows: Row[]) {
-  rows.forEach((r) => pushClusterChange('Added', clusterOf(r)));
-}
-
 // A cache mirroring a row's active identity (serverUid matches the cluster's uid),
 // so the provider joins it as that cluster's activeCache.
-function cacheOf(r: Row) {
+function cacheOf(r: ClusterRow) {
   return {
     id: `cache-${r.id}`,
     clusterID: r.id,
@@ -214,7 +176,7 @@ describe('useClusters', () => {
     await flush();
 
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'u-a', name: 'prod-us' },
         { id: 'u-b', name: 'staging', syncEnabled: false },
       ]);
@@ -227,7 +189,7 @@ describe('useClusters', () => {
     await flush();
 
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'u-a', name: 'prod-us' },
         { id: 'u-b', name: 'staging' },
       ]);
@@ -246,7 +208,7 @@ describe('useClusters', () => {
 
     // Cluster arrives first, with no cache yet.
     await act(async () => {
-      pushClusters([{ id: 'u-a', name: 'prod-us' }]);
+      pushClusters(channelFor, [{ id: 'u-a', name: 'prod-us' }]);
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:-"]');
 
@@ -263,7 +225,7 @@ describe('useClusters', () => {
     await flush();
 
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'u-a', name: 'prod-us' },
         { id: 'u-b', name: 'staging' },
       ]);
@@ -287,7 +249,7 @@ describe('useClusters', () => {
     await flush();
 
     await act(async () => {
-      pushClusters([{ id: 'u-a', name: 'prod-us' }]);
+      pushClusters(channelFor, [{ id: 'u-a', name: 'prod-us' }]);
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us"]');
 

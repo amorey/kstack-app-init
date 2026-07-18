@@ -31,9 +31,23 @@ export type FakeChannel = { onmessage?: (raw: string) => void };
 export function mockTauriCore() {
   const invokeMock = vi.fn();
   const channels: FakeChannel[] = [];
+  // Resolve the live fake Channel for the subscription whose query contains
+  // `queryPart`. subscribe-exchange news one Channel per `graphql_subscribe` in
+  // call order, so the Nth matching subscribe maps to `channels[N]`. The *last*
+  // match is the live one: a reconnect opens a fresh subscription (and channel)
+  // for the same query, so `lastIndexOf` skips the dead ones. (`lastIndexOf`
+  // keeps this ES2022-compatible; `findLastIndex` is ES2023, outside the app's
+  // configured TS lib.) Closes over `invokeMock`/`channels`, hence it lives here.
+  const channelFor = (queryPart: string): FakeChannel => {
+    const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
+    const idx = subs.map(([, arg]) => (arg as { query: string }).query.includes(queryPart)).lastIndexOf(true);
+    if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
+    return channels[idx];
+  };
   return {
     invokeMock,
     channels,
+    channelFor,
     liveChannel: () => channels.at(-1)!,
     factory: () => ({
       invoke: (...args: unknown[]) => invokeMock(...args),
@@ -42,6 +56,61 @@ export function mockTauriCore() {
       },
     }),
   };
+}
+
+// Cluster-delta test helpers ------------------------------------------
+//
+// The `clustersWatch` delta stream carries Cluster objects; several suites seed
+// the ClustersProvider by pushing `Added` frames for a list of rows. `clusterOf`
+// is the shared row→Cluster builder and `pushClusters` seeds them onto the stream.
+
+// A minimal cluster fixture. Cluster/user metadata derive from `name` so a
+// resolved context has predictable fields to assert on; the optional flags model
+// the sync toggle, the disabled state, and kubeconfig presence/current-context.
+export type ClusterRow = {
+  id: string;
+  name: string;
+  syncEnabled?: boolean;
+  enabled?: boolean;
+  present?: boolean;
+  isDefault?: boolean;
+};
+
+// Build the Cluster object a `clustersWatch` delta carries for a row.
+export function clusterOf(r: ClusterRow) {
+  return {
+    id: r.id,
+    spec: {
+      name: r.name,
+      syncEnabled: r.syncEnabled ?? true,
+      enabled: r.enabled ?? true,
+      source: { kubeconfig: { context: r.name } },
+    },
+    status: {
+      source: {
+        kubeconfig: {
+          cluster: `${r.name}-cluster`,
+          user: `${r.name}-user`,
+          isPresent: r.present ?? true,
+          isDefault: r.isDefault ?? false,
+        },
+      },
+      server: { uid: `uid-${r.id}` },
+      lastConnectedAt: null,
+      conditions: [],
+    },
+  };
+}
+
+// Seed each row as an `Added` cluster delta on the `clustersWatch` stream. Pass
+// the `channelFor` from `mockTauriCore()`.
+export function pushClusters(channelFor: (queryPart: string) => FakeChannel, rows: ClusterRow[]) {
+  const ch = channelFor('clustersWatch');
+  rows.forEach((r) => {
+    ch.onmessage!(
+      JSON.stringify({ type: 'next', payload: { data: { clustersWatch: { type: 'Added', cluster: clusterOf(r) } } } }),
+    );
+  });
 }
 
 // Shared fake for '@tauri-apps/api/window' — components that drive the native

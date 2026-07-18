@@ -17,11 +17,11 @@ import { createRootRoute, createRoute, Link, Outlet, retainSearchParams } from '
 import { Provider as UrqlProvider } from 'urql';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore, renderWithRouter } from '@/test-utils';
+import { mockTauriCore, pushClusters, renderWithRouter } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-const { invokeMock, channels, factory } = mockTauriCore();
+const { invokeMock, channels, channelFor, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
@@ -30,58 +30,6 @@ const { KubeConfigProvider } = await import('./kube-config');
 const { useActiveKubeContext } = await import('./active-kube-context');
 
 // Helpers -------------------------------------------------------------
-
-type Row = { id: string; name: string; enabled?: boolean; present?: boolean; isDefault?: boolean };
-
-// Push cluster Added deltas on the clustersWatch stream (the parallel cache
-// stream is irrelevant here). The providers open two subscriptions, so target
-// the channel by query text rather than by position.
-function channelFor(queryPart: string) {
-  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
-  const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
-  if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
-  return channels[idx];
-}
-
-function pushClusters(rows: Row[]) {
-  const ch = channelFor('clustersWatch');
-  rows.forEach((r) => {
-    ch.onmessage!(
-      JSON.stringify({
-        type: 'next',
-        payload: {
-          data: {
-            clustersWatch: {
-              type: 'Added',
-              cluster: {
-                id: r.id,
-                spec: {
-                  name: r.name,
-                  syncEnabled: true,
-                  enabled: r.enabled ?? true,
-                  source: { kubeconfig: { context: r.name } },
-                },
-                status: {
-                  source: {
-                    kubeconfig: {
-                      cluster: `${r.name}-cluster`,
-                      user: `${r.name}-user`,
-                      isPresent: r.present ?? true,
-                      isDefault: r.isDefault ?? false,
-                    },
-                  },
-                  server: { uid: `uid-${r.id}` },
-                  lastConnectedAt: null,
-                  conditions: [],
-                },
-              },
-            },
-          },
-        },
-      }),
-    );
-  });
-}
 
 // A probe that surfaces the resolved active context and a way to change it, so
 // tests can drive and observe the hook. Rendered on both pages.
@@ -161,7 +109,7 @@ describe('useActiveKubeContext', () => {
   it('resolves to the default context when no ?kubeContext= param is present', async () => {
     await renderWithRouter(buildTree(), '/chat');
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', isDefault: true },
         { id: 'b', name: 'staging' },
       ]);
@@ -172,7 +120,7 @@ describe('useActiveKubeContext', () => {
   it('resolves to the ?kubeContext= param when it names a present context', async () => {
     await renderWithRouter(buildTree(), '/chat?kubeContext=staging');
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', isDefault: true },
         { id: 'b', name: 'staging' },
       ]);
@@ -183,7 +131,7 @@ describe('useActiveKubeContext', () => {
   it('falls back to the default when the ?kubeContext= param names a gone context', async () => {
     await renderWithRouter(buildTree(), '/chat?kubeContext=ghost');
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', isDefault: true },
         { id: 'b', name: 'staging' },
       ]);
@@ -194,7 +142,7 @@ describe('useActiveKubeContext', () => {
   it('setContext writes the choice to the URL search param', async () => {
     const { router } = await renderWithRouter(buildTree(), '/chat');
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', isDefault: true },
         { id: 'b', name: 'staging' },
       ]);
@@ -213,7 +161,7 @@ describe('useActiveKubeContext', () => {
   it('retains the picked context across a chat -> dashboard navigation', async () => {
     const { router } = await renderWithRouter(buildTree(), '/chat');
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', isDefault: true },
         { id: 'b', name: 'staging' },
       ]);

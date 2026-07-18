@@ -18,11 +18,11 @@ import { createRootRoute, createRoute, Outlet, retainSearchParams } from '@tanst
 import { Provider as UrqlProvider } from 'urql';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore, renderWithRouter } from '@/test-utils';
+import { mockTauriCore, pushClusters, renderWithRouter } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-const { invokeMock, channels, factory } = mockTauriCore();
+const { invokeMock, channels, channelFor, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
@@ -32,60 +32,11 @@ const { KubeContextPicker } = await import('./kube-context-picker');
 
 // Helpers -------------------------------------------------------------
 
-type Row = { id: string; name: string; enabled?: boolean; present?: boolean; isDefault?: boolean };
-
-function channelFor(queryPart: string) {
-  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
-  const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
-  if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
-  return channels[idx];
-}
-
 // The `open` frame the host sends on each established connection (ahead of the
 // snapshot). It marks the clustersWatch stream connected, so the picker reads
 // "connected, empty" rather than "still connecting".
 function openStream() {
   channelFor('clustersWatch').onmessage!(JSON.stringify({ type: 'open' }));
-}
-
-function pushClusters(rows: Row[]) {
-  const ch = channelFor('clustersWatch');
-  rows.forEach((r) => {
-    ch.onmessage!(
-      JSON.stringify({
-        type: 'next',
-        payload: {
-          data: {
-            clustersWatch: {
-              type: 'Added',
-              cluster: {
-                id: r.id,
-                spec: {
-                  name: r.name,
-                  syncEnabled: true,
-                  enabled: r.enabled ?? true,
-                  source: { kubeconfig: { context: r.name } },
-                },
-                status: {
-                  source: {
-                    kubeconfig: {
-                      cluster: `${r.name}-cluster`,
-                      user: `${r.name}-user`,
-                      isPresent: r.present ?? true,
-                      isDefault: r.isDefault ?? false,
-                    },
-                  },
-                  server: { uid: `uid-${r.id}` },
-                  lastConnectedAt: null,
-                  conditions: [],
-                },
-              },
-            },
-          },
-        },
-      }),
-    );
-  });
 }
 
 // The picker reads/writes the active context, so it needs both the router (for
@@ -144,7 +95,7 @@ describe('KubeContextPicker', () => {
   it('shows the resolved active context as the trigger value', async () => {
     await renderWithRouter(buildTree(), '/chat');
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', isDefault: true },
         { id: 'b', name: 'staging' },
       ]);
@@ -155,7 +106,7 @@ describe('KubeContextPicker', () => {
   it('reflects the kubeContext URL param over the default', async () => {
     await renderWithRouter(buildTree(), '/chat?kubeContext=staging');
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', isDefault: true },
         { id: 'b', name: 'staging' },
       ]);
@@ -167,7 +118,7 @@ describe('KubeContextPicker', () => {
     const user = userEvent.setup();
     const { router } = await renderWithRouter(buildTree(), '/chat');
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', isDefault: true },
         { id: 'b', name: 'staging' },
       ]);
@@ -187,7 +138,7 @@ describe('KubeContextPicker', () => {
     await act(async () => {
       // A disabled cluster is tracked but not a switchable context, so the list
       // is empty even though the kubeconfig has reported.
-      pushClusters([{ id: 'a', name: 'prod', enabled: false }]);
+      pushClusters(channelFor, [{ id: 'a', name: 'prod', enabled: false }]);
     });
     expect(screen.getByTestId('kube-context-empty')).toBeInTheDocument();
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument();

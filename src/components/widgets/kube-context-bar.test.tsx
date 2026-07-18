@@ -17,11 +17,11 @@ import { createRootRoute, createRoute, Outlet, retainSearchParams } from '@tanst
 import { Provider as UrqlProvider } from 'urql';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore, renderWithRouter } from '@/test-utils';
+import { mockTauriCore, pushClusters, renderWithRouter } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-const { invokeMock, channels, factory } = mockTauriCore();
+const { invokeMock, channels, channelFor, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
@@ -30,57 +30,6 @@ const { KubeConfigProvider } = await import('@/lib/kube-config');
 const { KubeContextBar } = await import('./kube-context-bar');
 
 // Helpers -------------------------------------------------------------
-
-type Row = { id: string; name: string; enabled?: boolean; present?: boolean; isDefault?: boolean };
-
-function channelFor(queryPart: string) {
-  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
-  const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
-  if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
-  return channels[idx];
-}
-
-// Push cluster Added deltas; each row's cluster/user derive from its name, so a
-// resolved context has predictable metadata to assert on.
-function pushClusters(rows: Row[]) {
-  const ch = channelFor('clustersWatch');
-  rows.forEach((r) => {
-    ch.onmessage!(
-      JSON.stringify({
-        type: 'next',
-        payload: {
-          data: {
-            clustersWatch: {
-              type: 'Added',
-              cluster: {
-                id: r.id,
-                spec: {
-                  name: r.name,
-                  syncEnabled: true,
-                  enabled: r.enabled ?? true,
-                  source: { kubeconfig: { context: r.name } },
-                },
-                status: {
-                  source: {
-                    kubeconfig: {
-                      cluster: `${r.name}-cluster`,
-                      user: `${r.name}-user`,
-                      isPresent: r.present ?? true,
-                      isDefault: r.isDefault ?? false,
-                    },
-                  },
-                  server: { uid: `uid-${r.id}` },
-                  lastConnectedAt: null,
-                  conditions: [],
-                },
-              },
-            },
-          },
-        },
-      }),
-    );
-  });
-}
 
 // Mirrors the `_app` layout's env: the router (for the `kubeContext` search
 // param) plus the kubeconfig providers the bar reads through.
@@ -130,7 +79,7 @@ describe('KubeContextBar', () => {
   it('shows the active context plus its cluster and user metadata', async () => {
     await renderWithRouter(buildTree(), '/chat?kubeContext=staging');
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', isDefault: true },
         { id: 'b', name: 'staging' },
       ]);
@@ -148,7 +97,7 @@ describe('KubeContextBar', () => {
     await act(async () => {
       // A disabled cluster is tracked but not a switchable context, so nothing
       // resolves and the bar shows only the picker's empty state.
-      pushClusters([{ id: 'a', name: 'prod', enabled: false }]);
+      pushClusters(channelFor, [{ id: 'a', name: 'prod', enabled: false }]);
     });
     expect(screen.getByTestId('kube-context-empty')).toBeInTheDocument();
     expect(screen.queryByText(/cluster/)).not.toBeInTheDocument();

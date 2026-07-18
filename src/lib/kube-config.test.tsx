@@ -16,11 +16,11 @@ import { render, screen, act } from '@testing-library/react';
 import { Provider as UrqlProvider } from 'urql';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore } from '@/test-utils';
+import { mockTauriCore, pushClusters } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-const { invokeMock, channels, factory } = mockTauriCore();
+const { invokeMock, channels, channelFor, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
@@ -30,64 +30,6 @@ const { KubeConfigProvider, useKubeConfig } = await import('./kube-config');
 // Helpers -------------------------------------------------------------
 
 const flush = () => act(async () => {});
-
-type Row = {
-  id: string;
-  name: string;
-  present?: boolean;
-  enabled?: boolean;
-  isDefault?: boolean;
-};
-
-// kube-config only reads spec/status, so this pushes cluster Added deltas on the
-// clustersWatch stream and ignores the parallel cache stream entirely. The provider
-// opens two subscriptions, so target the channel by query rather than liveChannel().
-function channelFor(queryPart: string) {
-  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
-  const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
-  if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
-  return channels[idx];
-}
-
-function pushClusters(rows: Row[]) {
-  const ch = channelFor('clustersWatch');
-  rows.forEach((r) => {
-    ch.onmessage!(
-      JSON.stringify({
-        type: 'next',
-        payload: {
-          data: {
-            clustersWatch: {
-              type: 'Added',
-              cluster: {
-                id: r.id,
-                spec: {
-                  name: r.name,
-                  syncEnabled: true,
-                  enabled: r.enabled ?? true,
-                  source: { kubeconfig: { context: r.name } },
-                },
-                status: {
-                  source: {
-                    kubeconfig: {
-                      cluster: `${r.name}-cluster`,
-                      user: `${r.name}-user`,
-                      isPresent: r.present ?? true,
-                      isDefault: r.isDefault ?? false,
-                    },
-                  },
-                  server: { uid: `uid-${r.id}` },
-                  lastConnectedAt: null,
-                  conditions: [],
-                },
-              },
-            },
-          },
-        },
-      }),
-    );
-  });
-}
 
 // A probe that renders the derived kubeconfig so tests can assert on it.
 function Probe() {
@@ -127,7 +69,7 @@ describe('useKubeConfig', () => {
     await flush();
 
     await act(async () => {
-      pushClusters([
+      pushClusters(channelFor, [
         { id: 'a', name: 'prod', enabled: true, present: true, isDefault: true },
         { id: 'b', name: 'staging', enabled: false, present: true },
         { id: 'c', name: 'gone', enabled: true, present: false },

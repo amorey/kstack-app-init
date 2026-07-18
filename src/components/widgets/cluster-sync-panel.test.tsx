@@ -22,7 +22,7 @@ import { mockTauriCore } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
-const { invokeMock, channels, factory } = mockTauriCore();
+const { invokeMock, channels, channelFor, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
@@ -59,17 +59,6 @@ type Row = {
   disconnectedSince?: string; // Connected condition's `lastTransitionTime` (ISO)
   lastConnectedAt?: string; // status.lastConnectedAt (ISO; null = never)
 };
-
-// The subscribe-exchange news a fake Channel per graphql_subscribe in call order,
-// so the Nth subscribe (matched by query text) maps to channels[N]. The panel runs
-// several subscriptions at once (clustersWatch, and per open row clusterEventsWatch
-// + clusterScheduleWatch), so target by query rather than liveChannel().
-function channelFor(queryPart: string) {
-  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
-  const idx = subs.findIndex(([, arg]) => (arg as { query: string }).query.includes(queryPart));
-  if (idx < 0) throw new Error(`no subscription for ${queryPart}`);
-  return channels[idx];
-}
 
 // The `Synced` condition a probed row's ClusterCache carries, keyed off the
 // row's modelled sync state (failed / stale / healthy).
