@@ -32,7 +32,7 @@ vi.mock('../error-bus', () => ({
 }));
 
 const { tauriSubscriptionExchange } = await import('./subscribe-exchange');
-const { useWatchSubscription } = await import('./use-watch-subscription');
+const { useWatchSubscription, watchPhase } = await import('./use-watch-subscription');
 
 const TICK = gql`
   subscription Tick {
@@ -219,5 +219,23 @@ describe('useWatchSubscription', () => {
 
     await emit(NEXT(9));
     expect(state(r).data).toEqual([9]); // fresh — not [1, 2, 9]
+  });
+});
+
+describe('watchPhase', () => {
+  it('reads no-data-yet as connecting when the transport is down', () => {
+    expect(watchPhase(false, false)).toBe('connecting');
+  });
+
+  it('reads no-data-yet as empty when the transport is up (an empty snapshot)', () => {
+    expect(watchPhase(false, true)).toBe('empty');
+  });
+
+  it('reads held data through an outage as reconnecting', () => {
+    expect(watchPhase(true, false)).toBe('reconnecting');
+  });
+
+  it('reads data on a live connection as live', () => {
+    expect(watchPhase(true, true)).toBe('live');
   });
 });

@@ -30,7 +30,7 @@ import { graphql } from '@/gql';
 import { type Cluster, formatBytes, useClusters } from '@/lib/clusters';
 import { type AppDialogProps } from '@/lib/dialog';
 import { errorMessage, reportError } from '@/lib/error-bus';
-import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
+import { useWatchSubscription, watchPhase } from '@/lib/graphql/use-watch-subscription';
 
 const ClusterEnabledSetMutation = graphql(`
   mutation ClusterEnabledSet($id: ObjectID!, $enabled: Boolean!) {
@@ -774,9 +774,15 @@ const GROUPS: { key: Group; label: string; suffix: string; match: (c: Cluster) =
 // regardless by `ClustersProvider`'s root `clustersWatch`; per-row event/schedule
 // streams mount only when a row's diagnostics open.
 export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
-  const { clusters } = useClusters();
+  const { clusters, connected } = useClusters();
   const rows = clusters ?? [];
   const groups = GROUPS.map((g) => ({ ...g, clusters: rows.filter(g.match) })).filter((g) => g.clusters.length > 0);
+
+  // The registry's transport state, split so the empty-state copy reads correctly:
+  // "connecting" (spinner) when the stream hasn't reported yet and the transport is
+  // down, vs "empty" ("No clusters yet.") when it's up but carries no clusters. A
+  // drop with the registry already loaded is "reconnecting" — keep the table, flag it.
+  const phase = watchPhase(clusters !== null, connected);
 
   // Each action writes through to the sidecar; the resulting clustersWatch push is
   // the source of truth (no local mirror). urql's execute resolves (never rejects)
@@ -805,9 +811,27 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
       // window edges until it hits its max.
       className="w-[calc(100%-4rem)] max-w-4xl sm:max-w-4xl"
     >
-      {rows.length === 0 ? (
+      {/* The transport dropped with the registry already loaded: the table below is
+          last-known state, so flag it as reconnecting rather than silently going stale. */}
+      {phase === 'reconnecting' ? (
+        <p className={`mb-2 flex items-center gap-1.5 text-xs ${TONE.attention.text}`}>
+          <Spinner size="xs" className="mr-0" />
+          Reconnecting…
+        </p>
+      ) : null}
+      {/* Connecting (no snapshot, transport down) vs empty (up, no clusters) vs the
+          table. Split into guarded branches rather than a nested ternary; `rows` is
+          only non-empty once loaded, so the table and connecting states never overlap. */}
+      {phase === 'connecting' && (
+        <p className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+          <Spinner size="sm" className="mr-0" />
+          Connecting…
+        </p>
+      )}
+      {phase !== 'connecting' && rows.length === 0 && (
         <p className="py-6 text-sm text-muted-foreground">No clusters yet.</p>
-      ) : (
+      )}
+      {rows.length > 0 && (
         <Table className="table-fixed">
           <TableHeader>
             <TableRow>

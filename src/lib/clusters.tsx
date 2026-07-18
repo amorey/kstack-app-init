@@ -110,6 +110,11 @@ const ClusterCachesWatchSubscription = graphql(`
 type ClustersContextValue = {
   // null = not reported yet (first frame not landed); [] = no known clusters.
   clusters: Cluster[] | null;
+  // Is the registry's transport up right now? Sourced from the `clustersWatch`
+  // stream (the backbone `clusters` derives from; the caches stream just joins on),
+  // so consumers can pair it with `clusters` to tell "connecting" (down, no data)
+  // from "connected, empty snapshot" (up, no clusters) via `watchPhase`.
+  connected: boolean;
 };
 
 const ClustersContext = createContext<ClustersContextValue | null>(null);
@@ -131,7 +136,7 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
   // Each stream reduces into its own id-keyed map: the `Added` snapshot builds it,
   // later deltas patch it. useWatchSubscription resets the map to `undefined`
   // ("not reported yet") on a transport reconnect.
-  const [{ data: clusterMap }] = useWatchSubscription(
+  const [{ data: clusterMap, connected }] = useWatchSubscription(
     { query: ClustersWatchSubscription },
     (prev: Keyed<ClusterRow> | undefined, data) => {
       const { type, cluster } = data.clustersWatch;
@@ -161,7 +166,7 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
 
   // No `error` branch — subscribe-exchange reconnects transport drops internally.
   // The memo keeps the context value stable between non-push re-renders.
-  const value = useMemo<ClustersContextValue>(() => ({ clusters }), [clusters]);
+  const value = useMemo<ClustersContextValue>(() => ({ clusters, connected }), [clusters, connected]);
   return <ClustersContext.Provider value={value}>{children}</ClustersContext.Provider>;
 }
 

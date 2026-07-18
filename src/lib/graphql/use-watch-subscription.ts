@@ -81,3 +81,23 @@ export function useWatchSubscription<Data, Result, Variables extends AnyVariable
 
   return [{ ...result, data, connected: status.connected }, executeSubscription];
 }
+
+// Classifies a watch's UI state from the two independent signals this hook exposes:
+// whether a frame from the current connection has landed (`hasData`) and whether the
+// transport is up right now (`connected`). Crossing them separates the two cases a
+// bare `data === undefined` check conflates — "still connecting" (spinner) from
+// "connected, empty snapshot" (a real empty state) — so a whole-screen watch can
+// render each distinctly.
+//
+//   - connecting   — no frame yet and the transport is down (initial dial, or
+//                    dialing during an outage with nothing cached): show a spinner.
+//   - empty        — connected but the snapshot carried nothing: the real empty state.
+//   - reconnecting — the transport dropped but last-known data is held: show the
+//                    stale data with a subtle "reconnecting" affordance.
+//   - live         — connected with data: normal.
+export type WatchPhase = 'connecting' | 'empty' | 'reconnecting' | 'live';
+
+export function watchPhase(hasData: boolean, connected: boolean): WatchPhase {
+  if (!hasData) return connected ? 'empty' : 'connecting';
+  return connected ? 'live' : 'reconnecting';
+}

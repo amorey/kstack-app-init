@@ -86,6 +86,14 @@ function syncedCondition(r: Row) {
   return { type: 'Synced', status: 'True', reason: 'Watching' };
 }
 
+// Deliver the `open` frame the host sends on each established connection (ahead of
+// the snapshot). It marks the registry streams connected, so the panel reads
+// "connected, empty" rather than "still connecting" — the distinction under test.
+function openStreams() {
+  channelFor('clustersWatch').onmessage!(JSON.stringify({ type: 'open' }));
+  channelFor('clusterCachesWatch').onmessage!(JSON.stringify({ type: 'open' }));
+}
+
 // Push each row as an Added change on the two delta streams: a Cluster change on
 // clustersWatch, plus (for a probed row) its ClusterCache change on
 // clusterCachesWatch. The provider joins them into the row's activeCache by
@@ -240,6 +248,7 @@ async function openWith(rows: Row[]) {
   renderPanel();
   await flush();
   await act(async () => {
+    openStreams();
     pushClusters(rows);
   });
   await user.click(screen.getByRole('button', { name: /clusters/i }));
@@ -306,10 +315,37 @@ describe('ClusterSyncPanel', () => {
     );
   });
 
-  it('shows an empty state when there are no clusters', async () => {
+  it('shows an empty state when the registry is connected but carries no clusters', async () => {
     const user = await openWith([]);
     expect(user).toBeDefined();
     expect(await screen.findByText(/no clusters yet/i)).toBeInTheDocument();
+    // Connected + empty is a real answer, not a spinner.
+    expect(screen.queryByText(/connecting…/i)).not.toBeInTheDocument();
+  });
+
+  it('shows a connecting state while the registry stream has not reported', async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await flush();
+    // No `open`/`next` on clustersWatch: the transport is still dialing, so nothing
+    // has been reported. This must read as connecting, not as an empty registry.
+    await user.click(screen.getByRole('button', { name: /clusters/i }));
+    expect(await screen.findByText(/connecting…/i)).toBeInTheDocument();
+    expect(screen.queryByText(/no clusters yet/i)).not.toBeInTheDocument();
+  });
+
+  it('flags reconnecting but keeps the table when the transport drops after loading', async () => {
+    await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
+    expect(await screen.findByText('prod-us')).toBeInTheDocument();
+    expect(screen.queryByText(/reconnecting…/i)).not.toBeInTheDocument();
+
+    // The host closes the clustersWatch SSE stream: the registry stays loaded (the
+    // hook holds last-known data through the outage), so the table persists, flagged.
+    await act(async () => {
+      channelFor('clustersWatch').onmessage!(JSON.stringify({ type: 'closed' }));
+    });
+    expect(await screen.findByText(/reconnecting…/i)).toBeInTheDocument();
+    expect(screen.getByText('prod-us')).toBeInTheDocument();
   });
 
   it('renders the table columns', async () => {
