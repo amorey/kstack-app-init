@@ -22,11 +22,16 @@ import { clearStatus, markConnected, markDisconnected } from './transport-status
 // is emitted once, before any `next`, when the SSE connection is actually
 // established (the sidecar returned 200) — the signal this file marks the op
 // connected on (see below).
+// `complete` is the server's own graceful end (gqlgen's `event: complete`);
+// `closed` is synthesized by the host when the connection ends without one
+// (sidecar crash, sleep, network loss). Both reconnect — see below — but only
+// `closed` reports.
 type SubMessage =
   | { type: 'open' }
   | { type: 'next'; payload: { data?: unknown; errors?: unknown } }
   | { type: 'error'; payload: unknown }
-  | { type: 'complete' };
+  | { type: 'complete' }
+  | { type: 'closed' };
 
 const BASE_DELAY_MS = 1_000;
 const MAX_DELAY_MS = 30_000;
@@ -85,6 +90,15 @@ const dropOp = (id: number) => {
 // settings/sync watches, and such a failure is almost always transient (the
 // always-on engine + credential pusher re-establish auth/upstream). Surfacing
 // it terminally would also kill the very stream that recovery flows through.
+//
+// Every transport end reconnects, but they split on *reporting*. `closed`
+// (EOF/read failure) and `error` (failed dial) are abnormal and report to the
+// error bus; `complete` — the server's own graceful end — reconnects silently.
+// A server can complete a long-lived watch legitimately (sidecar shutdown, and
+// chat's finite stream completes after every response), so `complete` must
+// neither banner nor end the urql operation: if the sidecar really went away,
+// the reconnect's failed dial produces the `error` that reports; if it's chat,
+// the consumer's pause tears the subscription down before the retry fires.
 export const tauriSubscriptionExchange = subscriptionExchange({
   // urql calls this with `(request, operation)`: `request` carries the printed
   // query + variables, `operation` carries the stable `key` we stamp transport
@@ -97,9 +111,19 @@ export const tauriSubscriptionExchange = subscriptionExchange({
         let cancelled = false;
         let opId: number | null = null;
         let attempt = 0;
+        // Whether the current outage has already been reported. Separate from
+        // `attempt` (the backoff level) because the two reset on different
+        // proofs: backoff resets on `open` (the dial succeeded, so the next
+        // drop is a fresh outage that deserves a prompt retry), while the
+        // report gate resets only on `next` (a healthy *data* frame) — a
+        // flapping server that 200s and immediately drops would otherwise
+        // re-report every cycle, flickering the auto-dismissing banner forever.
+        let reportedOutage = false;
         let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-        function scheduleReconnect(message: string, cause?: unknown) {
+        // `report: false` is the graceful `complete` — reconnect without
+        // touching the error bus (see the frame-split note above).
+        function scheduleReconnect(message: string, cause?: unknown, report = true) {
           if (cancelled) return;
           // The connection is down: publish it so the hook can render
           // "reconnecting" (it keeps its last-known data — the generation is
@@ -113,13 +137,16 @@ export const tauriSubscriptionExchange = subscriptionExchange({
           // host already cleared things up.
           if (opId != null) dropOp(opId);
           opId = null;
-          // Report only the first drop of an outage. Backoff caps at 30s
-          // and the banner auto-dismisses after 5s, so reporting every
-          // retry would make it flicker forever while down. A healthy
-          // frame resets `attempt`, so a fresh outage reports again. The
+          // Report only the first abnormal drop of an outage. Backoff caps at
+          // 30s and the banner auto-dismisses after 5s, so reporting every
+          // retry would make it flicker forever while down. A healthy frame
+          // clears `reportedOutage`, so a fresh outage reports again. The
           // banner is driven off the bus directly because the result no
           // longer reaches the urql sink (errorReportExchange can't see it).
-          if (attempt === 0) reportError({ source: 'subscription', message, cause });
+          if (report && !reportedOutage) {
+            reportedOutage = true;
+            reportError({ source: 'subscription', message, cause });
+          }
           const delay = backoffDelay(attempt);
           attempt += 1;
           retryTimer = setTimeout(() => {
@@ -135,10 +162,10 @@ export const tauriSubscriptionExchange = subscriptionExchange({
           // and a later connect() took over. Either way it must stop
           // driving the sink / scheduling another reconnect.
           const isStale = () => cancelled || ended;
-          const end = (message: string, cause?: unknown) => {
+          const end = (message: string, cause?: unknown, report = true) => {
             if (ended) return;
             ended = true;
-            scheduleReconnect(message, cause);
+            scheduleReconnect(message, cause, report);
           };
 
           channel.onmessage = (raw) => {
@@ -153,15 +180,27 @@ export const tauriSubscriptionExchange = subscriptionExchange({
             if (msg.type === 'open') {
               // The connection is up and the snapshot is about to stream. Mark
               // the op connected (bumping its generation), so the hook resets
-              // its accumulator before the reconnect's snapshot folds in.
+              // its accumulator before the reconnect's snapshot folds in. The
+              // dial succeeded, so backoff starts over — without this, an
+              // outage recovered by an *empty*-snapshot connection (no `next`
+              // ever comes) would leave the next drop at the 30s cap.
+              attempt = 0;
               markConnected(key);
             } else if (msg.type === 'next') {
-              attempt = 0; // a good frame proves the connection is healthy
+              // A healthy data frame: the outage (if any) is over, so the next
+              // abnormal drop reports as a fresh one.
+              attempt = 0;
+              reportedOutage = false;
               sink.next(msg.payload as never);
             } else if (msg.type === 'error') {
               const m = typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload);
               end(m, msg.payload);
+            } else if (msg.type === 'complete') {
+              // The server's own graceful end: reconnect, silently.
+              end('subscription completed by server', undefined, false);
             } else {
+              // `closed` (EOF/drop synthesized by the host) — and, defensively,
+              // any frame type this file doesn't know.
               end('subscription transport closed');
             }
           };

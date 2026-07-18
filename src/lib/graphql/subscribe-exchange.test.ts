@@ -68,6 +68,10 @@ const NEXT = (n: number) => JSON.stringify({ type: 'next', payload: { data: { ti
 // The host's "connection established" frame — emitted before the snapshot on
 // every successful connection; the exchange marks the op connected on it.
 const OPEN = JSON.stringify({ type: 'open' });
+// Abnormal transport end (EOF/drop synthesized by the host): reconnect + report.
+const CLOSED = JSON.stringify({ type: 'closed' });
+// The server's own graceful end: reconnect, silently.
+const COMPLETE = JSON.stringify({ type: 'complete' });
 
 // Flush the pending microtask queue (the async invoke('graphql_subscribe')
 // chain) without advancing fake timers.
@@ -139,7 +143,7 @@ describe('tauriSubscriptionExchange', () => {
     expect(clearStatusMock).toHaveBeenCalledWith(KEY);
   });
 
-  it('reconnects (with backoff) when the transport completes while still subscribed', async () => {
+  it('reconnects (with backoff) when the transport drops while still subscribed', async () => {
     vi.useFakeTimers();
     const { seen, unsubscribe } = start();
     await flush();
@@ -147,9 +151,9 @@ describe('tauriSubscriptionExchange', () => {
     expect(subscribeCalls()).toBe(1);
     expect(markConnectedMock).toHaveBeenCalledTimes(1);
 
-    // A transport-level `complete` must NOT tear the urql subscription down;
+    // A transport-level `closed` must NOT tear the urql subscription down;
     // it marks the op disconnected and triggers a backoff reconnect instead.
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    liveChannel().onmessage!(CLOSED);
     expect(reportErrorMock).toHaveBeenCalledWith(expect.objectContaining({ source: 'subscription' }));
     expect(markDisconnectedMock).toHaveBeenCalledWith(KEY);
     expect(subscribeCalls()).toBe(1); // not immediate
@@ -163,6 +167,30 @@ describe('tauriSubscriptionExchange', () => {
     liveChannel().onmessage!(NEXT(7));
     expect(markConnectedMock).toHaveBeenCalledTimes(2);
     expect(seen).toEqual([7]);
+
+    unsubscribe();
+  });
+
+  it('reconnects silently on the server’s own `complete` (no error report)', async () => {
+    vi.useFakeTimers();
+    const { unsubscribe } = start();
+    await flush();
+    liveChannel().onmessage!(OPEN);
+
+    // A graceful server completion is legitimate (sidecar shutdown; chat's
+    // finite stream) — it must reconnect (a long-lived watch has to come back
+    // after a sidecar restart) but never banner.
+    liveChannel().onmessage!(COMPLETE);
+    expect(reportErrorMock).not.toHaveBeenCalled();
+    expect(markDisconnectedMock).toHaveBeenCalledWith(KEY);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(subscribeCalls()).toBe(2);
+
+    // If the sidecar really went away, the reconnect's failed dial produces
+    // the `error` frame — and *that* reports.
+    liveChannel().onmessage!(JSON.stringify({ type: 'error', payload: 'sidecar down' }));
+    expect(reportErrorMock).toHaveBeenCalledTimes(1);
 
     unsubscribe();
   });
@@ -191,9 +219,40 @@ describe('tauriSubscriptionExchange', () => {
 
     // Backoff was reset by the healthy frame: the next drop reconnects
     // again after the *base* delay, not a grown one.
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    liveChannel().onmessage!(CLOSED);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(subscribeCalls()).toBe(3);
+
+    unsubscribe();
+  });
+
+  it('resets backoff on `open`, so a drop after an empty-snapshot recovery retries promptly', async () => {
+    vi.useFakeTimers();
+    const { unsubscribe } = start();
+    await flush();
+    liveChannel().onmessage!(OPEN);
+
+    // Grow the backoff: a drop, then a failed redial.
+    liveChannel().onmessage!(CLOSED); // reports (first abnormal drop)
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(subscribeCalls()).toBe(2);
+    liveChannel().onmessage!(JSON.stringify({ type: 'error', payload: 'still down' }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(subscribeCalls()).toBe(3);
+
+    // Recovery via an *empty* snapshot: `open` arrives but no `next` ever
+    // does. The open alone must reset the backoff — the next drop is a fresh
+    // outage and deserves the base delay, not the grown one.
+    liveChannel().onmessage!(OPEN);
+    liveChannel().onmessage!(CLOSED);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(subscribeCalls()).toBe(3); // not yet — proves it's the base delay…
+    await vi.advanceTimersByTimeAsync(1);
+    expect(subscribeCalls()).toBe(4); // …not the pre-recovery 4s step
+
+    // The report gate is NOT open-reset (only a healthy `next` clears it):
+    // a flapping server that 200s then drops must not banner every cycle.
+    expect(reportErrorMock).toHaveBeenCalledTimes(1);
 
     unsubscribe();
   });
@@ -206,15 +265,16 @@ describe('tauriSubscriptionExchange', () => {
     // Drop the live connection, then assert the reconnect lands exactly at
     // `delay` (not a tick before) — proving the backoff curve and its cap.
     const dropThenReconnectAt = async (delay: number, priorCalls: number) => {
-      liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+      liveChannel().onmessage!(CLOSED);
       await vi.advanceTimersByTimeAsync(delay - 1);
       expect(subscribeCalls()).toBe(priorCalls); // not yet
       await vi.advanceTimersByTimeAsync(1);
       expect(subscribeCalls()).toBe(priorCalls + 1); // reconnected
     };
 
-    // Each new connection immediately dies ⇒ delay doubles: 1s, 2s, 4s …
-    // capped at 30s and held there.
+    // Each new connection dies without ever opening ⇒ delay doubles: 1s, 2s,
+    // 4s … capped at 30s and held there. (An `open` would reset the curve —
+    // covered separately.)
     await dropThenReconnectAt(1_000, 1);
     await dropThenReconnectAt(2_000, 2);
     await dropThenReconnectAt(4_000, 3);
@@ -236,8 +296,8 @@ describe('tauriSubscriptionExchange', () => {
     await flush();
     expect(invokeMock).toHaveBeenCalledWith('graphql_unsubscribe', { id: 1 });
 
-    // A late transport `complete` on the dead channel is inert.
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    // A late transport `closed` on the dead channel is inert.
+    liveChannel().onmessage!(CLOSED);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(subscribeCalls()).toBe(1);
   });
@@ -247,21 +307,21 @@ describe('tauriSubscriptionExchange', () => {
     const { unsubscribe } = start();
     await flush();
 
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    liveChannel().onmessage!(CLOSED);
     expect(reportErrorMock).toHaveBeenCalledTimes(1);
 
     // Still down: each capped retry reconnects but must NOT re-report
     // (otherwise the 5s-auto-dismiss banner flickers forever).
     await vi.advanceTimersByTimeAsync(1_000);
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    liveChannel().onmessage!(CLOSED);
     await vi.advanceTimersByTimeAsync(2_000);
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    liveChannel().onmessage!(CLOSED);
     expect(reportErrorMock).toHaveBeenCalledTimes(1);
 
     // Recover, then drop again ⇒ a fresh outage reports once more.
     await vi.advanceTimersByTimeAsync(4_000);
     liveChannel().onmessage!(NEXT(1));
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    liveChannel().onmessage!(CLOSED);
     expect(reportErrorMock).toHaveBeenCalledTimes(2);
 
     unsubscribe();
@@ -313,7 +373,7 @@ describe('tauriSubscriptionExchange', () => {
     liveChannel().onmessage!(OPEN);
     expect(markConnectedMock).toHaveBeenCalledTimes(1);
 
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    liveChannel().onmessage!(CLOSED);
     await vi.advanceTimersByTimeAsync(1_000);
 
     // The reconnection opens but the server has nothing to replay (everything
@@ -338,7 +398,7 @@ describe('tauriSubscriptionExchange', () => {
     // opened) but the dial fails, so it emits an `error` frame instead of
     // `open` — modelling a sidecar that's down. No `open` ⇒ no markConnected,
     // so the hook keeps its last-known data through the outage.
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' }));
+    liveChannel().onmessage!(CLOSED);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(subscribeCalls()).toBe(2);
     liveChannel().onmessage!(JSON.stringify({ type: 'error', payload: 'sidecar down' }));
@@ -358,7 +418,7 @@ describe('tauriSubscriptionExchange', () => {
     const { unsubscribe } = start();
     await flush();
 
-    liveChannel().onmessage!(JSON.stringify({ type: 'complete' })); // schedules reconnect
+    liveChannel().onmessage!(CLOSED); // schedules reconnect
     unsubscribe(); // before the backoff elapses
     await vi.advanceTimersByTimeAsync(60_000);
     expect(subscribeCalls()).toBe(1);
