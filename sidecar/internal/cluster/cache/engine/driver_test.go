@@ -580,7 +580,7 @@ func TestRunStopsOnCtxCancel(t *testing.T) {
 	select {
 	case err := <-errCh:
 		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("Run did not return after ctx cancel")
 	}
 }

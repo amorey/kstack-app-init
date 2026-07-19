@@ -30,7 +30,13 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// The retry deadline uses tokio's clock (real time in production, virtual under
+// tokio::time::pause) so connect_with_budget's budget/backoff is testable with a
+// paused clock instead of real sleeps. tokio::time::Instant is a drop-in for the
+// now()/+Duration/saturating_duration_since API std::time::Instant offered here.
+use tokio::time::Instant;
 
 use crate::error::{AppError, Result};
 
@@ -312,17 +318,17 @@ mod tests {
 
     /// The sidecar may not be ready the instant `connect` is first polled
     /// — it spawns concurrently. `connect` must keep retrying until the
-    /// listener comes up, within its budget.
-    #[tokio::test]
+    /// listener comes up, within its budget. Driven on a paused clock: the
+    /// endpoint appears at virtual 150ms while the dial retries, and tokio
+    /// auto-advances virtual time between the parked timers — no real sleep.
+    #[tokio::test(start_paused = true)]
     async fn connect_retries_until_endpoint_appears() {
-        use tokio::time::sleep;
-
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
         let path_arg = path.as_arg().to_owned();
         let dial = connect_with_budget(&path, Duration::from_secs(2));
 
         let bind_later = async move {
-            sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
             bind_listener(&path_arg)
         };
 

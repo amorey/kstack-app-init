@@ -48,10 +48,16 @@ func migratedWriter(t *testing.T) *sql.DB {
 }
 
 // waitFor polls cond until it holds or the deadline passes — the shared
-// "async work landed" assertion for driver tests.
+// "async work landed" assertion for driver tests. The deadline is only an
+// upper bound: cond is re-checked every 5ms and the call returns the instant
+// it holds, so a generous ceiling costs a passing test nothing. It's set well
+// above any real settle time deliberately — on an oversubscribed CI runner a
+// worker goroutine can be starved for seconds, and a tight 2s bound turned
+// that scheduling stall into a spurious timeout failure. A genuine hang still
+// fails, just later.
 func waitFor(t *testing.T, cond func() bool, msg string) {
 	t.Helper()
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(30 * time.Second)
 	for {
 		if cond() {
 			return

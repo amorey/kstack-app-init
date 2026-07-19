@@ -133,7 +133,7 @@ func TestEngineReportsErroredAndRetriesWithBackoff(t *testing.T) {
 	e.Start()
 
 	waitFor(t, func() bool { return len(snapshot()) >= 3 }, "three retries recorded")
-	stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	require.NoError(t, e.Stop(stopCtx))
 
@@ -193,7 +193,7 @@ func TestEngineFreshnessFlush(t *testing.T) {
 	e.baseCtxCancel()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("freshness loop did not stop on cancel")
 	}
 }
@@ -385,7 +385,7 @@ func TestDiscoverGVRsNotifiesCatalogSubscribers(t *testing.T) {
 
 	select {
 	case <-pings:
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("discoverGVRs did not notify catalog subscribers after rewriting kind_catalog")
 	}
 
@@ -564,37 +564,61 @@ func TestEngineDiscoveryLoopReconcilesDriversToDiscovery(t *testing.T) {
 	require.False(t, removed[deploymentGVK], "a still-present kind is never stopped")
 }
 
+// fakeDebounceTimer is an event-driven stand-in for the debounce timer: the test
+// fires the trailing window by sending on fireC, and each Reset (a trigger restarting
+// the window) is observed on resets. Stop always reports "was pending" — the test
+// never fires the window before a Stop — so debounceTriggers' drain path is never
+// taken, and the exact-standard-library drain contract needn't be modelled.
+type fakeDebounceTimer struct {
+	fireC  chan time.Time
+	resets chan struct{}
+}
+
+func (f *fakeDebounceTimer) C() <-chan time.Time      { return f.fireC }
+func (f *fakeDebounceTimer) Stop() bool               { return true }
+func (f *fakeDebounceTimer) Reset(time.Duration) bool { f.resets <- struct{}{}; return true }
+
 // debounceTriggers is a TRAILING window: each further trigger resets it, so a long
 // install burst reconciles once after it ends rather than at a fixed delay from the
-// first trigger. The behavior under test is inherently temporal, so this drives real
-// timers with generous margins (a fixed-delay bug would fire mid-burst, well under the
-// asserted lower bound) (P3).
+// first trigger. Event-driven — a fake timer lets the test observe a Reset per trigger
+// (the trailing-window invariant) and fire the window deterministically, asserting the
+// behavior directly instead of inferring it from wall-clock margins.
 func TestDebounceTriggersResetsWindowOnEachTrigger(t *testing.T) {
-	e := newEngineWithOptions(nil, migratedCDB(t), newRecordingSink(), withDiscoveryDebounce(60*time.Millisecond))
+	ft := &fakeDebounceTimer{fireC: make(chan time.Time, 1), resets: make(chan struct{})}
+	e := newEngineWithOptions(nil, migratedCDB(t), newRecordingSink(),
+		withDebounceTimer(func(time.Duration) resettableTimer { return ft }))
 	triggers := make(chan struct{}, 8)
 
-	ret := make(chan time.Duration, 1)
-	start := time.Now()
-	go func() {
-		e.debounceTriggers(context.Background(), triggers)
-		ret <- time.Since(start)
-	}()
+	done := make(chan bool, 1)
+	go func() { done <- e.debounceTriggers(context.Background(), triggers) }()
 
-	// Four triggers 40ms apart (each < the 60ms window), the last at ~120ms. A trailing
-	// window fires ~60ms after it (~180ms); a fixed delay from the first would fire at
-	// ~60ms, mid-burst. The 120ms lower bound cleanly separates the two.
-	triggers <- struct{}{}
-	for i := 0; i < 3; i++ {
-		time.Sleep(40 * time.Millisecond)
+	// Every trigger must RESTART the window (a Reset), not let a fixed window from the
+	// first trigger elapse. Four triggers → four resets, each observed before the next
+	// trigger, so the invariant is checked with no wall-clock wait.
+	for i := 0; i < 4; i++ {
 		triggers <- struct{}{}
+		select {
+		case <-ft.resets:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("trigger %d did not reset the debounce window", i)
+		}
 	}
 
+	// The window hasn't fired (only the test fires it), and the only other exit is
+	// ctx cancel — so debounceTriggers must still be waiting, never a fixed delay.
 	select {
-	case got := <-ret:
-		require.Greater(t, got, 120*time.Millisecond,
-			"debounce fires only after the LAST trigger (trailing window), not a fixed delay from the first")
-	case <-time.After(2 * time.Second):
-		t.Fatal("debounceTriggers did not return")
+	case got := <-done:
+		t.Fatalf("debounce returned (%v) before the trailing window elapsed", got)
+	default:
+	}
+
+	// Fire the trailing window → debounce ends and signals one reconcile.
+	ft.fireC <- time.Time{}
+	select {
+	case got := <-done:
+		require.True(t, got, "debounce returns true when the window elapses cleanly")
+	case <-time.After(30 * time.Second):
+		t.Fatal("debounceTriggers did not return after the window fired")
 	}
 }
 
@@ -1013,7 +1037,7 @@ func TestEngineWatchTriggerSourceSignalsOnDeltaOnly(t *testing.T) {
 	fw.Add(uObj("crd1", "apiextensions.k8s.io/v1", "CustomResourceDefinition", "", "widgets.example.com", "11"))
 	select {
 	case <-signals:
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("no signal on a CRD delta")
 	}
 
@@ -1074,7 +1098,7 @@ func TestDiscoveryPollLoopFiresOnInterval(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case <-signals:
-		case <-time.After(2 * time.Second):
+		case <-time.After(30 * time.Second):
 			t.Fatal("discovery poll did not fire on its interval")
 		}
 	}

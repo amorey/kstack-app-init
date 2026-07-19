@@ -242,8 +242,6 @@ mod tests {
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
         let arg = path.as_arg().to_owned();
         spawn_oneshot_server(arg.clone(), r#"{"data":{"ok":true}}"#).await;
-        // Bind is synchronous, so this is just paranoia on slow CI.
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
         let client = QueryClient::new(path);
         let resp = client
@@ -280,16 +278,18 @@ mod tests {
         // Server that announces a Content-Length larger than the cap.
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
         let arg = path.as_arg().to_owned();
-        let arg_for_server = arg.clone();
+        // Bind synchronously before spawning the accept loop, so the socket exists the
+        // instant this returns — the client connects into the listen backlog with no
+        // wait-for-bind race, and no sleep.
+        let name = arg
+            .as_str()
+            .to_fs_name::<GenericFilePath>()
+            .expect("to_fs_name");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .create_tokio()
+            .expect("bind");
         tokio::spawn(async move {
-            let name = arg_for_server
-                .as_str()
-                .to_fs_name::<GenericFilePath>()
-                .expect("to_fs_name");
-            let listener = ListenerOptions::new()
-                .name(name)
-                .create_tokio()
-                .expect("bind");
             if let Ok(mut stream) = listener.accept().await {
                 let mut buf = [0u8; 4096];
                 let mut total = Vec::new();
@@ -316,7 +316,6 @@ mod tests {
                 let _ = stream.shutdown().await;
             }
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
         let client = QueryClient::new(path);
         let err = client
@@ -342,7 +341,6 @@ mod tests {
             r#"{"errors":[{"message":"no auth"}]}"#,
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
         let client = QueryClient::new(path);
         let resp = client
@@ -389,7 +387,6 @@ mod tests {
         let arg = path.as_arg().to_owned();
 
         spawn_oneshot_server(arg.clone(), r#"{"data":1}"#).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let client = QueryClient::new(path);
 
         let first = client.query("{}".to_string()).await.expect("first");
@@ -398,7 +395,6 @@ mod tests {
         // Old server is gone (oneshot). Stand up a new one on the same path.
         let _ = std::fs::remove_file(&arg);
         spawn_oneshot_server(arg.clone(), r#"{"data":2}"#).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
         let second = client
             .query("{}".to_string())

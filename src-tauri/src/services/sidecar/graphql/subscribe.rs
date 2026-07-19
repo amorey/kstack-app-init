@@ -389,9 +389,9 @@ mod tests {
             }
             let _ = stream.shutdown().await;
         });
-        // UnixListener::bind is synchronous so the socket exists, but the
-        // accept loop hasn't started polling yet.
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The listener is bound+listening synchronously above (before the spawn), so a
+        // client connect queues in the listen backlog even before accept() is polled —
+        // no wait-for-server sleep is needed.
     }
 
     fn sink_pair() -> (Arc<dyn FrameSink>, mpsc::UnboundedReceiver<String>) {

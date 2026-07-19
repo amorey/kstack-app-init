@@ -197,6 +197,10 @@ type Engine struct {
 	// sleep/now are test seams (deterministic backoff and freshness stamps).
 	sleep func(ctx context.Context, d time.Duration) error
 	now   func() time.Time
+	// newDebounceTimer builds the resettable timer debounceTriggers drives; a test
+	// seam (defaults to a real time.Timer) so the trailing window can be fired
+	// deterministically instead of by waiting real wall-clock time.
+	newDebounceTimer func(time.Duration) resettableTimer
 
 	baseCtx       context.Context
 	baseCtxCancel context.CancelFunc
@@ -282,6 +286,10 @@ func withEngineResyncPeriod(d time.Duration) engineOption {
 	return func(e *Engine) { e.resyncPeriod = d }
 }
 
+func withDebounceTimer(fn func(time.Duration) resettableTimer) engineOption {
+	return func(e *Engine) { e.newDebounceTimer = fn }
+}
+
 // NewEngine builds an engine over resolved credentials, an open cluster
 // cache, and the status sink. It starts nothing; call Start.
 func NewEngine(cfg *rest.Config, cdb *store.ClusterDB, sink Sink) *Engine {
@@ -304,6 +312,7 @@ func newEngineWithOptions(cfg *rest.Config, cdb *store.ClusterDB, sink Sink, opt
 		resyncPeriod:       resyncPeriodDefault,
 		sleep:              ctxSleep,
 		now:                time.Now,
+		newDebounceTimer:   realResettableTimer,
 		baseCtx:            baseCtx,
 		baseCtxCancel:      cancel,
 	}
@@ -824,6 +833,23 @@ func (e *Engine) discoveryLoop(ctx context.Context, dc discovery.DiscoveryInterf
 	}
 }
 
+// resettableTimer is the Stop/Reset timer debounceTriggers drives, abstracted so a
+// test can fire the trailing window deterministically. realResettableTimer wraps a
+// *time.Timer; its contract mirrors the standard library's exactly.
+type resettableTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+	Reset(d time.Duration) bool
+}
+
+type realTimer struct{ t *time.Timer }
+
+func (r realTimer) C() <-chan time.Time        { return r.t.C }
+func (r realTimer) Stop() bool                 { return r.t.Stop() }
+func (r realTimer) Reset(d time.Duration) bool { return r.t.Reset(d) }
+
+func realResettableTimer(d time.Duration) resettableTimer { return realTimer{time.NewTimer(d)} }
+
 // debounceTriggers waits out the trailing debounce window, RESETTING it on every
 // further trigger so a burst reconciles once — discoveryDebounce after the LAST
 // trigger, not a fixed delay from the first. So an operator applying a long CRD bundle
@@ -831,7 +857,7 @@ func (e *Engine) discoveryLoop(ctx context.Context, dc discovery.DiscoveryInterf
 // /apis walk + catalog rewrite mid-burst. Returns false if ctx was cancelled while
 // waiting (the caller should stop).
 func (e *Engine) debounceTriggers(ctx context.Context, triggers <-chan struct{}) bool {
-	timer := time.NewTimer(e.discoveryDebounce)
+	timer := e.newDebounceTimer(e.discoveryDebounce)
 	defer timer.Stop()
 	for {
 		select {
@@ -840,12 +866,12 @@ func (e *Engine) debounceTriggers(ctx context.Context, triggers <-chan struct{})
 		case <-triggers:
 			// Another trigger in the same burst — restart the quiet window. Stop-and-drain
 			// before Reset so a timer that fired between the select and here can't leave a
-			// stale tick in timer.C.
+			// stale tick in timer.C().
 			if !timer.Stop() {
-				<-timer.C
+				<-timer.C()
 			}
 			timer.Reset(e.discoveryDebounce)
-		case <-timer.C:
+		case <-timer.C():
 			return true
 		}
 	}
