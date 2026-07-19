@@ -17,12 +17,15 @@ package engine
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -39,11 +42,32 @@ import (
 // records no CRDs (its error is ignored) without any network I/O.
 type fakePreferredDiscovery struct {
 	discovery.DiscoveryInterface
+	mu    sync.Mutex
 	lists []*metav1.APIResourceList
+	err   error // non-nil alongside usable lists → a partial (incomplete) discovery
 }
 
 func (f *fakePreferredDiscovery) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
-	return f.lists, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lists, f.err
+}
+
+// setLists swaps the advertised resource lists mid-run (error left unchanged) — used
+// to simulate a CRD installed/uninstalled while a run is live.
+func (f *fakePreferredDiscovery) setLists(lists []*metav1.APIResourceList) {
+	f.mu.Lock()
+	f.lists = lists
+	f.mu.Unlock()
+}
+
+// setResult swaps both the lists and the discovery error — used to flip a partial
+// discovery to a complete one once the unavailable API group recovers.
+func (f *fakePreferredDiscovery) setResult(lists []*metav1.APIResourceList, err error) {
+	f.mu.Lock()
+	f.lists = lists
+	f.err = err
+	f.mu.Unlock()
 }
 
 func (f *fakePreferredDiscovery) RESTClient() rest.Interface {
@@ -354,8 +378,9 @@ func TestDiscoverGVRsNotifiesCatalogSubscribers(t *testing.T) {
 	pings, cancelSub := cdb.Subscribe()
 	defer cancelSub()
 
-	entries, err := discoverGVRs(ctx, dc, cdb)
+	entries, complete, err := discoverGVRs(ctx, dc, cdb)
 	require.NoError(t, err)
+	require.True(t, complete, "a clean discovery (no group errors) is complete")
 	require.Len(t, entries, 1)
 
 	select {
@@ -368,6 +393,742 @@ func TestDiscoverGVRsNotifiesCatalogSubscribers(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "Deployment", rows[0].Kind)
+}
+
+// A PARTIAL discovery must not truncate kind_catalog: the momentarily-unavailable
+// group's kinds are absent from the pass, and wiping them would make the dashboard
+// lose them. Only a complete pass is authoritative and drops a removed kind (P2).
+func TestDiscoverGVRsPreservesCatalogOnPartialDiscovery(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	deploymentList := &metav1.APIResourceList{
+		GroupVersion: "apps/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "deployments", Kind: "Deployment", Namespaced: true, Verbs: []string{"list", "watch"}},
+		},
+	}
+
+	// A complete pass records both kinds.
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{deploymentList, widgetList("widgets", "Widget")}}
+	_, complete, err := discoverGVRs(ctx, dc, cdb)
+	require.NoError(t, err)
+	require.True(t, complete)
+	rows, err := cdb.KindCatalog(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 2, "complete pass records both kinds")
+
+	// A partial pass (example.com errored, only deployment returned) must PRESERVE the
+	// widget catalog row rather than truncating it.
+	dc.setResult([]*metav1.APIResourceList{deploymentList}, errors.New("example.com group is unavailable"))
+	entries, complete, err := discoverGVRs(ctx, dc, cdb)
+	require.NoError(t, err)
+	require.False(t, complete)
+	require.Len(t, entries, 1, "the partial pass only discovered deployment")
+	rows, err = cdb.KindCatalog(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 2, "a partial discovery preserves the prior catalog rows")
+
+	// A later complete pass without widget IS authoritative → widget dropped.
+	dc.setResult([]*metav1.APIResourceList{deploymentList}, nil)
+	_, complete, err = discoverGVRs(ctx, dc, cdb)
+	require.NoError(t, err)
+	require.True(t, complete)
+	rows, err = cdb.KindCatalog(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "a complete discovery is authoritative and drops the removed kind")
+}
+
+// A COMPLETE discovery whose CRD list fails must NOT reset a known CRD's
+// is_crd/schema_json: kind existence comes from /apis (so pruning uninstalled kinds
+// stays authoritative even without CRD read access), but the CRD metadata is
+// backfilled from the existing catalog so a transient apiextensions read failure
+// can't erase previously valid CRD schemas (P2).
+func TestDiscoverGVRsPreservesCRDMetadataWhenCRDListFails(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+
+	// Seed a CRD row as a prior pass with a good CRD list would have recorded it.
+	_, err := cdb.Writer().ExecContext(ctx,
+		`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+		 VALUES('example.com/v1', 'Widget', 'widgets', 'Namespaced', 1, '{"type":"object"}')`)
+	require.NoError(t, err)
+
+	// A complete discovery re-lists Widget, but fakePreferredDiscovery's CRD read
+	// always fails ("no CRDs in test").
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{widgetList("widgets", "Widget")}}
+	_, complete, err := discoverGVRs(ctx, dc, cdb)
+	require.NoError(t, err)
+	require.True(t, complete, "ServerPreferredResources answered cleanly, so the pass is complete despite the CRD-list failure")
+
+	rows, err := cdb.KindCatalog(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.True(t, rows[0].IsCRD, "is_crd preserved across a CRD-list failure")
+
+	var schemaJSON string
+	require.NoError(t, cdb.Writer().QueryRowContext(ctx,
+		`SELECT schema_json FROM kind_catalog WHERE api_version='example.com/v1' AND kind='Widget'`,
+	).Scan(&schemaJSON))
+	assert.Equal(t, `{"type":"object"}`, schemaJSON, "schema_json preserved across a CRD-list failure")
+}
+
+func widgetList(resource, kind string) *metav1.APIResourceList {
+	return &metav1.APIResourceList{
+		GroupVersion: "example.com/v1",
+		APIResources: []metav1.APIResource{
+			{Name: resource, Kind: kind, Namespaced: true, Verbs: []string{"list", "watch"}},
+		},
+	}
+}
+
+// A discovery trigger makes the reconciler re-walk /apis and reconcile the running
+// drivers toward it: launch a driver for a GVR that appeared (a freshly-installed
+// CRD) and stop one for a GVR that vanished (an uninstalled CRD), while leaving an
+// unchanged kind alone. Drivers are seeded directly into the set (no goroutines);
+// onNew and each driver's cancel record what the reconcile did.
+func TestEngineDiscoveryLoopReconcilesDriversToDiscovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+
+	deploymentGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+	deploymentList := &metav1.APIResourceList{
+		GroupVersion: "apps/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "deployments", Kind: "Deployment", Namespaced: true, Verbs: []string{"list", "watch"}},
+		},
+	}
+	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
+	gadgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Gadget"}
+	deploymentGVR := schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
+	widgetGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+
+	// Start with Deployment (a built-in, stays) and Widget (a CRD, will be removed).
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{deploymentList, widgetList("widgets", "Widget")}}
+	// Zero debounce keeps the test deterministic — a trigger reconciles immediately.
+	e := newEngineWithOptions(nil, cdb, newRecordingSink(), withDiscoveryDebounce(0))
+
+	var mu sync.Mutex
+	var added []schema.GroupVersionKind
+	removed := map[schema.GroupVersionKind]bool{}
+	ds := newDriverSet()
+	// Seed drivers directly (no goroutine); a pre-closed done lets remove's quiesce
+	// wait return immediately, and cancel records the stop. Each carries its GVR (the
+	// reconciler's repoint key) like a real driver does.
+	closedDone := make(chan struct{})
+	close(closedDone)
+	seed := func(gvk schema.GroupVersionKind, gvr schema.GroupVersionResource) {
+		g := gvk
+		ds.mu.Lock()
+		ds.byGVK[g] = driverHandle{
+			driver: newKindDriverWithOptions(&fakeSource{}, nil, g, "1", withGVR(gvr)),
+			cancel: func() { mu.Lock(); removed[g] = true; mu.Unlock() },
+			done:   closedDone,
+		}
+		ds.mu.Unlock()
+	}
+	seed(deploymentGVK, deploymentGVR)
+	seed(widgetGVK, widgetGVR)
+	startDriver := func(entry gvrEntry, _ func(bool), _ bool) {
+		mu.Lock()
+		added = append(added, entry.GVK)
+		mu.Unlock()
+		seed(entry.GVK, entry.GVR) // mirror driverSet.launch registering the driver
+	}
+
+	triggers := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() { defer close(done); e.discoveryLoop(ctx, dc, ds, startDriver, triggers) }()
+
+	// Install Gadget and uninstall Widget, then fire the trigger a watch event produces.
+	dc.setLists([]*metav1.APIResourceList{deploymentList, widgetList("gadgets", "Gadget")})
+	triggers <- struct{}{}
+
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Contains(added, gadgetGVK)
+	}, "a trigger launches a driver for the newly-installed CRD")
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return removed[widgetGVK]
+	}, "a trigger stops the driver for the uninstalled CRD")
+
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotContains(t, added, deploymentGVK, "an already-running kind is never restarted")
+	require.False(t, removed[deploymentGVK], "a still-present kind is never stopped")
+}
+
+// debounceTriggers is a TRAILING window: each further trigger resets it, so a long
+// install burst reconciles once after it ends rather than at a fixed delay from the
+// first trigger. The behavior under test is inherently temporal, so this drives real
+// timers with generous margins (a fixed-delay bug would fire mid-burst, well under the
+// asserted lower bound) (P3).
+func TestDebounceTriggersResetsWindowOnEachTrigger(t *testing.T) {
+	e := newEngineWithOptions(nil, migratedCDB(t), newRecordingSink(), withDiscoveryDebounce(60*time.Millisecond))
+	triggers := make(chan struct{}, 8)
+
+	ret := make(chan time.Duration, 1)
+	start := time.Now()
+	go func() {
+		e.debounceTriggers(context.Background(), triggers)
+		ret <- time.Since(start)
+	}()
+
+	// Four triggers 40ms apart (each < the 60ms window), the last at ~120ms. A trailing
+	// window fires ~60ms after it (~180ms); a fixed delay from the first would fire at
+	// ~60ms, mid-burst. The 120ms lower bound cleanly separates the two.
+	triggers <- struct{}{}
+	for i := 0; i < 3; i++ {
+		time.Sleep(40 * time.Millisecond)
+		triggers <- struct{}{}
+	}
+
+	select {
+	case got := <-ret:
+		require.Greater(t, got, 120*time.Millisecond,
+			"debounce fires only after the LAST trigger (trailing window), not a fixed delay from the first")
+	case <-time.After(2 * time.Second):
+		t.Fatal("debounceTriggers did not return")
+	}
+}
+
+// A CRD recreated within the debounce window under the same group/version/kind but a
+// DIFFERENT resource plural changes the GVR while the GVK is stable. The reconciler
+// keys drivers by GVK, so without comparing the GVR it would keep the old driver
+// watching the now-removed endpoint, leaving the kind wedged with no live driver. It
+// must instead stop the stale-GVR driver and relaunch against the new endpoint (P2).
+func TestReconcileDiscoveryRepointsDriverOnGVRChange(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+
+	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
+	oldGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	newGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "gizmos"}
+
+	// Discovery now serves Widget under a different resource plural (gizmos).
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{widgetList("gizmos", "Widget")}}
+	e := newEngineWithOptions(nil, cdb, newRecordingSink())
+
+	ds := newDriverSet()
+	closedDone := make(chan struct{})
+	close(closedDone)
+	var removed bool
+	// A running driver still watching the OLD GVR.
+	ds.byGVK[widgetGVK] = driverHandle{
+		driver: newKindDriverWithOptions(&fakeSource{}, nil, widgetGVK, "1", withGVR(oldGVR)),
+		cancel: func() { removed = true }, done: closedDone,
+	}
+
+	var added []gvrEntry
+	startDriver := func(entry gvrEntry, retire func(bool), _ bool) {
+		added = append(added, entry)
+		ds.mu.Lock()
+		ds.byGVK[entry.GVK] = driverHandle{
+			driver: newKindDriverWithOptions(&fakeSource{}, nil, entry.GVK, "1", withGVR(entry.GVR)),
+			cancel: func() {}, done: closedDone, retire: retire,
+		}
+		ds.mu.Unlock()
+	}
+
+	e.reconcileDiscovery(ctx, dc, ds, startDriver)
+
+	require.True(t, removed, "the stale-GVR driver is stopped")
+	require.Len(t, added, 1, "the kind is relaunched exactly once")
+	require.Equal(t, newGVR, added[0].GVR, "relaunched against the new endpoint")
+	gvr, ok := ds.gvr(widgetGVK)
+	require.True(t, ok, "a driver for the kind is still running")
+	require.Equal(t, newGVR, gvr, "the running driver now watches the new GVR")
+}
+
+// A PARTIAL discovery (usable lists + a group error) is a SINGLE pass with no internal
+// retry: it launches the kinds it did see and returns, and it does NOT remove or prune
+// (an omitted kind may just be in the transiently-unavailable group). The next trigger or
+// the discovery poll re-walks and completes the set — correctness rides on the backstop,
+// not on any one pass being exact.
+func TestReconcileDiscoveryPartialPassLaunchesWithoutRemoving(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+
+	deploymentGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+	deploymentList := &metav1.APIResourceList{
+		GroupVersion: "apps/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "deployments", Kind: "Deployment", Namespaced: true, Verbs: []string{"list", "watch"}},
+		},
+	}
+	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
+	widgetGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+
+	// A running Widget driver with a cached row; the partial pass omits the widget group,
+	// so Widget must be neither removed nor pruned.
+	insertObject(t, w, "w1", "example.com/v1", "Widget")
+	dc := &fakePreferredDiscovery{
+		lists: []*metav1.APIResourceList{deploymentList},
+		err:   errors.New("example.com group is unavailable"),
+	}
+	e := newEngineWithOptions(nil, cdb, newRecordingSink())
+
+	ds := newDriverSet()
+	closedDone := make(chan struct{})
+	close(closedDone)
+	ds.byGVK[widgetGVK] = driverHandle{
+		driver: newKindDriverWithOptions(&fakeSource{}, nil, widgetGVK, "1", withGVR(widgetGVR)),
+		cancel: func() {}, done: closedDone,
+	}
+
+	var added []schema.GroupVersionKind
+	startDriver := func(entry gvrEntry, _ func(bool), _ bool) {
+		added = append(added, entry.GVK)
+		ds.mu.Lock()
+		ds.byGVK[entry.GVK] = driverHandle{driver: newKindDriverWithOptions(&fakeSource{}, nil, entry.GVK, "1", withGVR(entry.GVR)), cancel: func() {}, done: closedDone}
+		ds.mu.Unlock()
+	}
+
+	// Single pass — returns immediately, no retry loop.
+	e.reconcileDiscovery(ctx, dc, ds, startDriver)
+
+	require.Equal(t, []schema.GroupVersionKind{deploymentGVK}, added, "the partial pass launches the kind it saw")
+	require.True(t, ds.has(widgetGVK), "a partial pass does not remove a kind omitted by the errored group")
+	require.Equal(t, 1, countObjectsByKind(t, w, "Widget", "example.com/v1"), "and does not prune its rows")
+}
+
+// The authoritative prune runs on EVERY complete pass, not only when this pass
+// removed a driver — so orphan rows a prior (failed) prune left behind, whose driver
+// is already gone, are still cleaned up rather than lingering until an engine restart
+// (P2). Here nothing is removed this pass, yet the pre-existing orphan is pruned.
+func TestReconcileDiscoveryPrunesOrphansOnEveryCompletePass(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+
+	// An orphan object for a kind discovery won't return and that has no driver — as a
+	// prior failed prune (or a CRD uninstalled while the engine was down) would leave.
+	insertObject(t, w, "ghost", "example.com/v1", "Widget")
+	require.Equal(t, 1, countObjectsByKind(t, w, "Widget", "example.com/v1"))
+
+	deploymentGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+	deploymentList := &metav1.APIResourceList{
+		GroupVersion: "apps/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "deployments", Kind: "Deployment", Namespaced: true, Verbs: []string{"list", "watch"}},
+		},
+	}
+	// A complete discovery listing only deployment (no widget) — nothing to remove.
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{deploymentList}}
+	e := newEngineWithOptions(nil, cdb, newRecordingSink())
+
+	ds := newDriverSet()
+	closedDone := make(chan struct{})
+	close(closedDone)
+	deploymentGVR := schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
+	ds.byGVK[deploymentGVK] = driverHandle{
+		driver: newKindDriverWithOptions(&fakeSource{}, nil, deploymentGVK, "1", withGVR(deploymentGVR)),
+		cancel: func() {}, done: closedDone,
+	}
+
+	// Complete pass returns after one iteration; deployment already running, nothing removed.
+	e.reconcileDiscovery(ctx, dc, ds, func(gvrEntry, func(bool), bool) {})
+
+	require.Equal(t, 0, countObjectsByKind(t, w, "Widget", "example.com/v1"),
+		"the orphan is pruned even though this complete pass removed no driver")
+	require.True(t, ds.has(deploymentGVK), "the still-present kind keeps its driver")
+}
+
+// A removed initial driver's catch-up retirement runs only AFTER its stale rows are
+// pruned: otherwise a removal that closes out the Syncing→Watching milestone would emit
+// the permanent catch-up event while the removed kind's rows are still present (P2).
+func TestReconcileDiscoveryRetiresRemovedDriverAfterPrune(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+
+	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
+	widgetGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	deploymentGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+	deploymentGVR := schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
+	deploymentList := &metav1.APIResourceList{
+		GroupVersion: "apps/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "deployments", Kind: "Deployment", Namespaced: true, Verbs: []string{"list", "watch"}},
+		},
+	}
+
+	// Widget has cached rows and a running driver; a complete discovery WITHOUT widget
+	// removes its driver and prunes its rows.
+	insertObject(t, w, "w1", "example.com/v1", "Widget")
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{deploymentList}}
+	e := newEngineWithOptions(nil, cdb, newRecordingSink())
+
+	ds := newDriverSet()
+	closedDone := make(chan struct{})
+	close(closedDone)
+	ds.byGVK[deploymentGVK] = driverHandle{
+		driver: newKindDriverWithOptions(&fakeSource{}, nil, deploymentGVK, "1", withGVR(deploymentGVR)),
+		cancel: func() {}, done: closedDone,
+	}
+	rowsAtRetire := -1
+	ds.byGVK[widgetGVK] = driverHandle{
+		driver: newKindDriverWithOptions(&fakeSource{}, nil, widgetGVK, "1", withGVR(widgetGVR)),
+		cancel: func() {}, done: closedDone,
+		retire: func(bool) { rowsAtRetire = countObjectsByKind(t, w, "Widget", "example.com/v1") },
+	}
+
+	e.reconcileDiscovery(ctx, dc, ds, func(gvrEntry, func(bool), bool) {})
+
+	require.Equal(t, 0, rowsAtRetire, "the retirement callback runs only after the removed kind's rows are pruned")
+	require.False(t, ds.has(widgetGVK), "the removed driver is dropped")
+	require.Equal(t, 0, countObjectsByKind(t, w, "Widget", "example.com/v1"), "the removed kind's rows are pruned")
+}
+
+// A complete discovery sweeps the resume cookie of a vanished kind along with its object
+// rows: left behind, a later re-registration of that GVR (same server, unchanged objects)
+// would resume its watch from the stale RV and skip the initial LIST, leaving the cache
+// permanently empty for that kind. A live kind's cookie is preserved (P1).
+func TestReconcileDiscoveryPrunesOrphanedResumeCookies(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+
+	deploymentGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+	deploymentGVR := schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
+	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
+	deploymentList := &metav1.APIResourceList{
+		GroupVersion: "apps/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "deployments", Kind: "Deployment", Namespaced: true, Verbs: []string{"list", "watch"}},
+		},
+	}
+
+	// Resume cookies for a live kind (Deployment) and a vanished one (Widget).
+	require.NoError(t, persistListRVMeta(ctx, cdb.Writer(), deploymentGVK, "100"))
+	require.NoError(t, persistListRVMeta(ctx, cdb.Writer(), widgetGVK, "42"))
+
+	// A complete discovery serving only Deployment (Widget is gone, no driver).
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{deploymentList}}
+	e := newEngineWithOptions(nil, cdb, newRecordingSink())
+
+	ds := newDriverSet()
+	closedDone := make(chan struct{})
+	close(closedDone)
+	ds.byGVK[deploymentGVK] = driverHandle{
+		driver: newKindDriverWithOptions(&fakeSource{}, nil, deploymentGVK, "1", withGVR(deploymentGVR)),
+		cancel: func() {}, done: closedDone,
+	}
+
+	e.reconcileDiscovery(ctx, dc, ds, func(gvrEntry, func(bool), bool) {})
+
+	widgetRV, err := readLastListRV(ctx, cdb.Writer(), widgetGVK)
+	require.NoError(t, err)
+	require.Equal(t, "", widgetRV, "the vanished kind's resume cookie is swept")
+
+	// The companion last_list_at row is swept too.
+	var atCount int
+	require.NoError(t, cdb.Writer().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM cluster_meta WHERE key=?`, lastListAtKey(widgetGVK)).Scan(&atCount))
+	require.Equal(t, 0, atCount, "the vanished kind's last_list_at is swept too")
+
+	depRV, err := readLastListRV(ctx, cdb.Writer(), deploymentGVK)
+	require.NoError(t, err)
+	require.Equal(t, "100", depRV, "the live kind's resume cookie is preserved")
+}
+
+// A GVR repoint relaunches the driver COLD and DURABLY invalidates the old resume cookie
+// first: the old rows survive the repoint (same GVK), so a surviving cookie would let a
+// restart in the relaunch window resume the new endpoint from the stale cluster-global RV
+// and skip the initial LIST. forceCold keeps this run cold; the cookie delete makes it
+// durable across a restart (P2).
+func TestReconcileDiscoveryRepointInvalidatesCookieAndRelaunchesCold(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+
+	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
+	oldGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+
+	// A persisted resume cookie for the kind, as a prior driver would have left.
+	require.NoError(t, persistListRVMeta(ctx, cdb.Writer(), widgetGVK, "12345"))
+
+	// Discovery serves Widget under a new resource plural (gizmos) → repoint.
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{widgetList("gizmos", "Widget")}}
+	e := newEngineWithOptions(nil, cdb, newRecordingSink())
+
+	ds := newDriverSet()
+	closedDone := make(chan struct{})
+	close(closedDone)
+	ds.byGVK[widgetGVK] = driverHandle{
+		driver: newKindDriverWithOptions(&fakeSource{}, nil, widgetGVK, "1", withGVR(oldGVR)),
+		cancel: func() {}, done: closedDone,
+	}
+
+	var forceCold []bool
+	startDriver := func(entry gvrEntry, _ func(bool), fc bool) {
+		forceCold = append(forceCold, fc)
+		ds.mu.Lock()
+		ds.byGVK[entry.GVK] = driverHandle{driver: newKindDriverWithOptions(&fakeSource{}, nil, entry.GVK, "1", withGVR(entry.GVR)), cancel: func() {}, done: closedDone}
+		ds.mu.Unlock()
+	}
+
+	e.reconcileDiscovery(ctx, dc, ds, startDriver)
+
+	require.Equal(t, []bool{true}, forceCold, "the repoint relaunches the replacement COLD so it full-LISTs the new endpoint")
+	rv, err := readLastListRV(ctx, cdb.Writer(), widgetGVK)
+	require.NoError(t, err)
+	require.Equal(t, "", rv, "the repoint durably deletes the old resume cookie so a restart can't resume the new endpoint from it")
+}
+
+// A GVR repoint TRANSFERS the old driver's catch-up token to the replacement rather than
+// firing it: if the old driver was an initial one still pre-watch, its Syncing→Watching
+// obligation must carry to the replacement, so the engine can't report Watching (caught up)
+// while the cache still holds the old endpoint's rows and the replacement's full LIST hasn't
+// finished (P2).
+func TestReconcileDiscoveryTransfersCatchUpTokenOnRepoint(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+
+	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
+	oldGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	newGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "gizmos"}
+
+	dc := &fakePreferredDiscovery{lists: []*metav1.APIResourceList{widgetList("gizmos", "Widget")}}
+	e := newEngineWithOptions(nil, cdb, newRecordingSink())
+
+	ds := newDriverSet()
+	closedDone := make(chan struct{})
+	close(closedDone)
+
+	// The old driver's token records every call — it must NOT be fired during the repoint
+	// (the obligation is transferred, not discharged).
+	var tokenCalls []bool
+	token := func(gone bool) { tokenCalls = append(tokenCalls, gone) }
+	ds.byGVK[widgetGVK] = driverHandle{
+		driver: newKindDriverWithOptions(&fakeSource{}, nil, widgetGVK, "1", withGVR(oldGVR)),
+		cancel: func() {}, done: closedDone, retire: token,
+	}
+
+	var replacementTokens []func(bool)
+	startDriver := func(entry gvrEntry, retire func(bool), _ bool) {
+		replacementTokens = append(replacementTokens, retire)
+		ds.mu.Lock()
+		ds.byGVK[entry.GVK] = driverHandle{
+			driver: newKindDriverWithOptions(&fakeSource{}, nil, entry.GVK, "1", withGVR(entry.GVR)),
+			cancel: func() {}, done: closedDone, retire: retire,
+		}
+		ds.mu.Unlock()
+	}
+
+	e.reconcileDiscovery(ctx, dc, ds, startDriver)
+
+	require.Empty(t, tokenCalls, "the old driver's catch-up token is NOT fired on a repoint")
+	require.Len(t, replacementTokens, 1, "the kind is relaunched once")
+	require.NotNil(t, replacementTokens[0], "the replacement inherits the catch-up obligation")
+	gvr, ok := ds.gvr(widgetGVK)
+	require.True(t, ok)
+	require.Equal(t, newGVR, gvr, "the replacement watches the new endpoint")
+
+	// The replacement holds the SAME token: firing it (as its watch phase would) records
+	// through to the original, so the milestone was gated on the replacement's catch-up.
+	replacementTokens[0](false)
+	require.Equal(t, []bool{false}, tokenCalls, "the replacement carries the transferred obligation")
+}
+
+// driverSet.remove is synchronous: it cancels the driver and blocks until its
+// goroutine has fully stopped (quiesced, so a later object prune can't be undone by an
+// in-flight watch event) before returning. It RETURNS the driver's catch-up token
+// rather than firing it, so the caller controls its fate — fire it (a vanished kind)
+// after pruning, or transfer it to a replacement (a GVR repoint) — P1 / P2.
+func TestDriverSetRemoveQuiescesThenReturnsRetire(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, cdb.ID(), podGVK(), cdb.Writer(), cdb)
+	fs := &fakeSource{watchers: make(chan *watch.FakeWatcher, 4), listRV: "1"}
+	d := newKindDriverWithOptions(fs, store, podGVK(), "1")
+
+	ds := newDriverSet()
+	var exited atomic.Bool
+	var retiredGone atomic.Int32 // -1 unset; 0 = retire(false); 1 = retire(true)
+	retiredGone.Store(-1)
+	// onExit must run before remove returns (proving quiesce); the token is the retire.
+	ds.launch(ctx, d,
+		func(error) { exited.Store(true) },
+		func(gone bool) {
+			if gone {
+				retiredGone.Store(1)
+			} else {
+				retiredGone.Store(0)
+			}
+		})
+
+	<-fs.watchers // the driver reached its watch phase (running)
+	require.True(t, ds.has(podGVK()))
+
+	retire := ds.remove(podGVK())
+
+	require.True(t, exited.Load(), "remove blocks until the driver goroutine has stopped (quiesced)")
+	require.Equal(t, int32(-1), retiredGone.Load(), "remove returns the token WITHOUT firing it — the caller controls timing")
+	require.False(t, ds.has(podGVK()), "removed from the set")
+
+	require.NotNil(t, retire, "an initial driver's catch-up token is returned for the caller to fire or transfer")
+	retire(true)
+	require.Equal(t, int32(1), retiredGone.Load(), "invoking the returned token retires the catch-up obligation")
+}
+
+// The trigger watch is a best-effort accelerator: it signals a re-discovery ONLY on a
+// delta (a CRD/APIService add/change/remove), for low latency. It does NOT signal on the
+// first LIST, a 410, or a plain reconnect — those are left to the discovery poll backstop,
+// so an ordinary reconnect never redundantly re-walks discovery. It reuses the driver's
+// LIST→RetryWatcher resume idiom.
+func TestEngineWatchTriggerSourceSignalsOnDeltaOnly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fs := &fakeSource{watchers: make(chan *watch.FakeWatcher, 4), listRV: "10"}
+	e := newEngineWithOptions(nil, migratedCDB(t), newRecordingSink())
+
+	signals := make(chan struct{}, 16)
+	done := make(chan struct{})
+	go func() { defer close(done); e.watchTriggerSource(ctx, fs, func() { signals <- struct{}{} }) }()
+
+	// The first watch establishes; the first LIST does NOT signal (the poll covers the
+	// startup gap).
+	fw := <-fs.watchers
+	select {
+	case <-signals:
+		t.Fatal("the first LIST must not signal — only deltas do")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// A CRD add arrives as a watch delta → signal.
+	fw.Add(uObj("crd1", "apiextensions.k8s.io/v1", "CustomResourceDefinition", "", "widgets.example.com", "11"))
+	select {
+	case <-signals:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no signal on a CRD delta")
+	}
+
+	// A 410 closes the RetryWatcher; the loop re-LISTs and re-watches but does NOT signal
+	// (the poll backstop, not this watch, catches anything the reopened watch skipped).
+	fw.Error(expiredStatus())
+	<-fs.watchers // the re-established watch
+	select {
+	case <-signals:
+		t.Fatal("a 410 re-establishment must not signal — the poll is the backstop")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+	<-done
+}
+
+// A trigger source that permits LIST but denies WATCH (an RBAC split) makes
+// RetryWatcher terminate without progress. watchTriggerSource must back off between
+// re-LIST attempts rather than hot-looping the API server (P1).
+func TestEngineWatchTriggerSourceBacksOffWhenWatchDenied(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fs := &fakeSource{
+		listRV: "10",
+		watchErr: apierrors.NewForbidden(
+			schema.GroupResource{Group: "apiextensions.k8s.io", Resource: "customresourcedefinitions"},
+			"", errors.New("watch denied")),
+	}
+	rec, snapshot := recordingSleep()
+	e := newEngineWithOptions(nil, migratedCDB(t), newRecordingSink(), withEngineSleep(rec))
+
+	done := make(chan struct{})
+	go func() { defer close(done); e.watchTriggerSource(ctx, fs, func() {}) }()
+
+	waitFor(t, func() bool { return len(snapshot()) >= 2 }, "backs off between terminal watch failures")
+	sleeps := snapshot()
+	require.Equal(t, e.backoffInit, sleeps[0], "first terminal watch failure backs off by the initial")
+	require.Equal(t, 2*e.backoffInit, sleeps[1], "and the backoff grows on the next")
+
+	cancel()
+	<-done
+}
+
+// The discovery poll is the pull-based backstop: it fires the reconcile trigger on a
+// fixed cadence regardless of watch activity, so anything the best-effort trigger watches
+// miss is still reconciled within one interval.
+func TestDiscoveryPollLoopFiresOnInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := newEngineWithOptions(nil, migratedCDB(t), newRecordingSink(), withDiscoveryPoll(20*time.Millisecond))
+
+	signals := make(chan struct{}, 16)
+	done := make(chan struct{})
+	go func() { defer close(done); e.discoveryPollLoop(ctx, func() { signals <- struct{}{} }) }()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-signals:
+		case <-time.After(2 * time.Second):
+			t.Fatal("discovery poll did not fire on its interval")
+		}
+	}
+	cancel()
+	<-done
+}
+
+// The per-driver periodic resync is the object-level backstop: a watch alive past
+// resyncPeriod ends itself so Run falls back to a full re-sync, reconciling any drift the
+// best-effort watch silently missed. Here a resume (no initial LIST) is followed, after a
+// short resync period, by a full LIST.
+func TestDriverPeriodicResyncForcesFullResync(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, cdb.ID(), podGVK(), cdb.Writer(), cdb)
+	fs := &fakeSource{watchers: make(chan *watch.FakeWatcher, 4), listRV: "200"}
+	d := newKindDriverWithOptions(fs, store, podGVK(), "100", withResyncPeriod(50*time.Millisecond))
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	<-fs.watchers // the resume watch established
+	list, _, _ := fs.counts()
+	require.Equal(t, 0, list, "the resume did not LIST")
+
+	// The resync timer ends the quiet watch → Run does a full re-sync (a LIST).
+	waitFor(t, func() bool { l, _, _ := fs.counts(); return l >= 1 }, "periodic resync forces a full LIST")
+
+	cancel()
+	<-done
+}
+
+// objectsStore.ResumeRV is the resume-eligibility guard: it returns the persisted cookie
+// only when the cache still holds objects of the kind to apply deltas onto, so a cookie
+// that outlived its objects (a kind removed then re-added) returns "" and forces a cold LIST.
+func TestObjectsStoreResumeRVGatesOnObjectExistence(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	gvk := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
+	s := newObjectsStore(ctx, cdb.ID(), gvk, w, cdb)
+
+	// A persisted cookie but no objects → not resumable (cold).
+	require.NoError(t, persistListRVMeta(ctx, w, gvk, "42"))
+	rv, err := s.ResumeRV(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "", rv, "a cookie with no cached objects is ineligible")
+
+	// With an object present, the cookie resumes.
+	insertObject(t, w, "w1", "example.com/v1", "Widget")
+	rv, err = s.ResumeRV(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "42", rv, "a cookie backed by cached objects resumes")
 }
 
 // A warm resume's catch-up carries the re-sync breakdown the drivers aggregated:
@@ -416,7 +1177,8 @@ func TestEngineLivenessMonitorFlagsStaleAndRecovers(t *testing.T) {
 	caughtUp := make(chan struct{})
 	close(caughtUp)
 	done := make(chan struct{})
-	go func() { defer close(done); e.livenessMonitor(ctx, []*kindDriver{dPod, dSvc}, caughtUp) }()
+	drivers := func() []*kindDriver { return []*kindDriver{dPod, dSvc} }
+	go func() { defer close(done); e.livenessMonitor(ctx, drivers, caughtUp) }()
 
 	// Keep Service alive but let Pod go quiet past the threshold → stale, naming Pod.
 	clk.advance(6 * time.Minute)
@@ -466,7 +1228,8 @@ func TestEngineLivenessMonitorReReportsChangedLaggards(t *testing.T) {
 	caughtUp := make(chan struct{})
 	close(caughtUp)
 	done := make(chan struct{})
-	go func() { defer close(done); e.livenessMonitor(ctx, []*kindDriver{dPod, dSvc}, caughtUp) }()
+	drivers := func() []*kindDriver { return []*kindDriver{dPod, dSvc} }
+	go func() { defer close(done); e.livenessMonitor(ctx, drivers, caughtUp) }()
 
 	staleNaming := func(kind string) func() bool {
 		return func() bool {
@@ -492,6 +1255,46 @@ func TestEngineLivenessMonitorReReportsChangedLaggards(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// staleLaggards sorts its output so that an unchanged stale set compares equal
+// across snapshots — the driver set is a map (random iteration order), and without
+// the sort livenessMonitor's slices.Equal dedup would treat a mere permutation as a
+// change and re-emit the same stale report (P2).
+func TestStaleLaggardsSortedForStableDedup(t *testing.T) {
+	old := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	now := old.Add(10 * time.Minute)
+	mk := func(kind string) *kindDriver {
+		gvk := schema.GroupVersionKind{Version: "v1", Kind: kind}
+		d := newKindDriverWithOptions(&fakeSource{}, nil, gvk, "1", withNow(func() time.Time { return old }))
+		d.markLive() // liveAt = old → stale against now past the 5m threshold
+		return d
+	}
+	// Pass drivers in unsorted order (as a map snapshot would); expect sorted output.
+	drivers := []*kindDriver{mk("Service"), mk("Pod"), mk("Node"), mk("ConfigMap")}
+	got := staleLaggards(drivers, now, 5*time.Minute)
+	require.Equal(t, []string{"ConfigMap", "Node", "Pod", "Service"}, got, "laggards are sorted regardless of driver order")
+}
+
+// A driver that hasn't entered its watch phase yet (zero liveAt) is judged from its
+// createdAt: it gets a bounded startup grace, so a mid-run kind still doing its first
+// sync isn't falsely flagged — but a kind that can never LIST/watch is flagged once
+// the grace expires, rather than hiding the engine as healthy forever (P2 / P1(b)).
+func TestStaleLaggardsBoundsNeverWatchedGrace(t *testing.T) {
+	now := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	mk := func(kind string, created time.Time) *kindDriver {
+		gvk := schema.GroupVersionKind{Version: "v1", Kind: kind}
+		d := newKindDriverWithOptions(&fakeSource{}, nil, gvk, "1", withNow(func() time.Time { return created }))
+		require.True(t, d.liveAt().IsZero(), "a never-watched driver has zero liveAt")
+		return d
+	}
+	// Created 2m ago, still starting up → within the 5m grace → not flagged.
+	starting := mk("Starting", now.Add(-2*time.Minute))
+	// Created 10m ago, never reached watch phase → past the grace → flagged.
+	stuck := mk("Stuck", now.Add(-10*time.Minute))
+
+	got := staleLaggards([]*kindDriver{starting, stuck}, now, 5*time.Minute)
+	require.Equal(t, []string{"Stuck"}, got, "a never-watched driver is flagged only after its startup grace")
 }
 
 // The driver invokes onWatch exactly once — the first time it enters its watch

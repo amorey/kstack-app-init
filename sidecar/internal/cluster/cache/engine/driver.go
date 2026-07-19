@@ -17,6 +17,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -96,6 +97,7 @@ type kindStore interface {
 	ApplyChange(t watch.EventType, u *unstructured.Unstructured) error
 	ReplaceFull(items []*unstructured.Unstructured, rv string) error
 	PersistRV(ctx context.Context, rv string) error
+	ResumeRV(ctx context.Context) (string, error)
 }
 
 // metadataDiffStore is the optional extension for kinds that participate in the
@@ -120,6 +122,7 @@ type kindDriver struct {
 	src   kubeSource
 	store kindStore
 	gvk   schema.GroupVersionKind
+	gvr   schema.GroupVersionResource
 
 	seedRV string // persisted resume point at construction
 
@@ -137,6 +140,14 @@ type kindDriver struct {
 	// before onWatch reports a clean resume — long enough that a prompt 410 reliably
 	// arrives first. See watchPhase.
 	resumeGrace time.Duration
+	// resyncPeriod, when > 0, forces a periodic full re-sync: a watch alive this long
+	// ends itself so Run falls back to fullResync, reconciling any drift the watch
+	// silently missed (a dropped delta, a stale cookie). This is the pull-based backstop
+	// — the correctness guarantee behind the best-effort watch. 0 disables it (tests /
+	// unconfigured). resyncDelay is the jittered interval derived from it once at
+	// construction (see gvkJitterFraction) so drivers don't relist in lockstep.
+	resyncPeriod time.Duration
+	resyncDelay  time.Duration
 	// graceTimer starts the resumeGrace countdown, returning its fire channel and a
 	// stop func; a test seam (defaults to realGraceTimer over time.NewTimer).
 	graceTimer func(time.Duration) (<-chan time.Time, func())
@@ -144,6 +155,13 @@ type kindDriver struct {
 	sleep func(ctx context.Context, d time.Duration) error
 	// now stamps the liveness time; a test seam (defaults to time.Now).
 	now func() time.Time
+
+	// createdAt is when the driver was constructed — the start of its startup grace.
+	// A driver that never reaches its watch phase keeps a zero lastLiveAt; the liveness
+	// monitor gives it grace from here rather than flagging it immediately, but only
+	// until the grace expires (see staleLaggards) so a kind that can never LIST/watch
+	// (forbidden, perpetually-unavailable API) doesn't hide as healthy forever.
+	createdAt time.Time
 
 	// lastLiveAt is when the watch last proved it's alive — a delta or a bookmark.
 	// Bookmarks matter because a quiet-but-healthy cluster delivers no deltas yet
@@ -191,6 +209,19 @@ func withGraceTimer(fn func(time.Duration) (<-chan time.Time, func())) option {
 	return func(d *kindDriver) { d.graceTimer = fn }
 }
 
+// withGVR sets the driver's resource endpoint — the reconciler's repoint key. Both
+// production (from the discovered gvrEntry) and tests that seed drivers into a
+// driverSet pass it, so a seeded driver carries its GVR like a real one.
+func withGVR(gvr schema.GroupVersionResource) option {
+	return func(d *kindDriver) { d.gvr = gvr }
+}
+
+// withResyncPeriod sets the periodic full-resync interval (see resyncPeriod). The
+// engine sets production's period; tests use a short one to exercise the resync path.
+func withResyncPeriod(d time.Duration) option {
+	return func(kd *kindDriver) { kd.resyncPeriod = d }
+}
+
 func newKindDriver(src kubeSource, store kindStore, gvk schema.GroupVersionKind, seedRV string) *kindDriver {
 	return newKindDriverWithOptions(src, store, gvk, seedRV)
 }
@@ -212,7 +243,22 @@ func newKindDriverWithOptions(src kubeSource, store kindStore, gvk schema.GroupV
 	for _, o := range opts {
 		o(d)
 	}
+	d.createdAt = d.now() // start the startup grace (after opts set the now seam)
+	if d.resyncPeriod > 0 {
+		// Deterministic per-kind jitter (up to 25% earlier) so drivers created together
+		// don't all relist at the same instant. Computed once — it depends only on the
+		// GVK and resyncPeriod, both fixed here.
+		d.resyncDelay = d.resyncPeriod - time.Duration(float64(d.resyncPeriod)*0.25*gvkJitterFraction(d.gvk))
+	}
 	return d
+}
+
+// gvkJitterFraction maps a GVK to a stable value in [0,1) — deterministic (hashed, not
+// random) so the resync jitter is reproducible in tests and stable across restarts.
+func gvkJitterFraction(gvk schema.GroupVersionKind) float64 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(gvk.String()))
+	return float64(h.Sum32()) / (1 << 32)
 }
 
 // Run blocks until ctx is cancelled, resuming from the seed RV when possible and
@@ -273,9 +319,14 @@ func (d *kindDriver) Run(ctx context.Context) error {
 }
 
 func (d *kindDriver) nextBackoff(b time.Duration) time.Duration {
-	b *= 2
-	if b > d.backoffMax {
-		b = d.backoffMax
+	return stepBackoff(b, d.backoffMax)
+}
+
+// stepBackoff doubles b and caps it at max — the package's one exponential-backoff
+// step, shared by the driver, the engine run loop, and the discovery-trigger watch.
+func stepBackoff(b, max time.Duration) time.Duration {
+	if b *= 2; b > max {
+		b = max
 	}
 	return b
 }
@@ -312,6 +363,18 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 	// catch-up so a quiet kind isn't judged stale before its first bookmark arrives.
 	d.markLive()
 
+	// The periodic pull-based backstop: a watch alive this long ends itself so Run
+	// falls back to fullResync, reconciling any drift the best-effort watch silently
+	// missed (a dropped delta, a stale resume cookie). Recreated fresh each watch phase,
+	// so a natural drop+resync resets the clock — resync fires resyncPeriod after the
+	// last sync, like a client-go informer. Disabled (nil channel) when resyncPeriod is 0.
+	var resyncC <-chan time.Time
+	if d.resyncPeriod > 0 {
+		rt := time.NewTimer(d.resyncDelay)
+		defer rt.Stop()
+		resyncC = rt.C
+	}
+
 	// Fire onWatch (the catch-up milestone + resync-facts snapshot) exactly once per
 	// Run. When a re-sync already ran this iteration (cold start, or the re-entry
 	// after a 410), the RV is fresh and can't expire, so fire immediately. When
@@ -343,6 +406,11 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 			// is merely quiet, so this is a clean resume. Fire and stop watching grace.
 			d.fireOnWatch()
 			pendingFire, graceC = false, nil
+		case <-resyncC:
+			// Periodic full re-sync fell due (the pull-based backstop). End the watch so
+			// Run re-syncs. Report progress so Run re-syncs immediately without backoff —
+			// a watch alive this long is healthy by definition.
+			return true, nil
 		case ev, ok := <-rw.ResultChan():
 			if !ok {
 				if sawExpired {

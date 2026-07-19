@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -180,6 +181,22 @@ func (s *objectsStore) SnapshotRVs(ctx context.Context) (map[string]string, erro
 // two single-row upserts on the serialized writer conn.
 func (s *objectsStore) PersistRV(ctx context.Context, rv string) error {
 	return persistListRVMeta(ctx, s.writer, s.gvk, rv)
+}
+
+// ResumeRV returns the resume cookie ONLY when the cache still holds objects of the kind
+// to apply deltas onto — one indexed query gates the cookie read on object existence, so
+// a cookie that outlived its objects (a kind removed then re-added) returns "" and the
+// driver cold-LISTs instead of resuming past the missing initial LIST.
+func (s *objectsStore) ResumeRV(ctx context.Context) (string, error) {
+	var v string
+	err := s.writer.QueryRowContext(ctx,
+		`SELECT value FROM cluster_meta WHERE key=?
+		   AND EXISTS(SELECT 1 FROM objects WHERE kind=? AND api_version=?)`,
+		lastListRVKey(s.gvk), s.gvk.Kind, s.gvk.GroupVersion().String()).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil // never synced, or the cookie outlived its objects
+	}
+	return v, err
 }
 
 // DeleteByUID removes one object plus its cascade rows (watch deletes and the
@@ -507,6 +524,13 @@ func (s *eventsStore) PersistRV(ctx context.Context, rv string) error {
 	return persistListRVMeta(ctx, s.writer, s.gvk, rv)
 }
 
+// ResumeRV returns the event kind's resume cookie unguarded: events live in their own
+// table (with a TTL) and aren't subject to the objects-table remove/re-add churn the
+// objectsStore guard defends against, so a persisted cookie always resumes.
+func (s *eventsStore) ResumeRV(ctx context.Context) (string, error) {
+	return readLastListRV(ctx, s.writer, s.gvk)
+}
+
 // --- helpers ------------------------------------------------------------
 
 func upsertClusterMeta(ctx context.Context, ex execer, key, value string) error {
@@ -517,16 +541,25 @@ func upsertClusterMeta(ctx context.Context, ex execer, key, value string) error 
 	return err
 }
 
-// lastListRVSuffix is the cluster_meta key suffix marking a kind's resume
-// cookie. It has a single owner here so lastListRVKey and any LIKE query that
-// detects a resume cookie can't drift apart.
-const lastListRVSuffix = ".last_list_rv"
+// lastListRVSuffix / lastListAtSuffix are the cluster_meta key suffixes marking a
+// kind's resume cookie (the resume RV and its timestamp). They have a single owner
+// here so the key builders and any query that detects/sweeps a resume cookie can't
+// drift apart.
+const (
+	lastListRVSuffix = ".last_list_rv"
+	lastListAtSuffix = ".last_list_at"
+)
 
 // lastListRVKey is the cluster_meta key holding a kind's resume cookie — the
 // resourceVersion to seed the next watch from. readLastListRV reads it;
 // persistListRVMeta writes it.
 func lastListRVKey(gvk schema.GroupVersionKind) string {
 	return fmt.Sprintf("%s/%s%s", gvk.GroupVersion().String(), gvk.Kind, lastListRVSuffix)
+}
+
+// lastListAtKey is the companion key holding when that resume cookie was last written.
+func lastListAtKey(gvk schema.GroupVersionKind) string {
+	return fmt.Sprintf("%s/%s%s", gvk.GroupVersion().String(), gvk.Kind, lastListAtSuffix)
 }
 
 // persistListRVMeta writes a kind's resume cookie (last_list_rv + last_list_at).
@@ -537,9 +570,71 @@ func persistListRVMeta(ctx context.Context, ex execer, gvk schema.GroupVersionKi
 	if err := upsertClusterMeta(ctx, ex, lastListRVKey(gvk), rv); err != nil {
 		return err
 	}
-	return upsertClusterMeta(ctx, ex,
-		fmt.Sprintf("%s/%s.last_list_at", gvk.GroupVersion().String(), gvk.Kind),
+	return upsertClusterMeta(ctx, ex, lastListAtKey(gvk),
 		strconv.FormatInt(time.Now().UnixMilli(), 10))
+}
+
+// pruneOrphanedResumeCookies deletes the resume-cookie rows (last_list_rv + last_list_at)
+// in cluster_meta whose cluster_meta key is absent from keep — the resume state of a
+// kind that no longer exists on the cluster (an uninstalled CRD / removed APIService).
+// Left behind, a later re-registration of that GVR against a server that kept its
+// objects would make the driver resume its watch from the stale RV and SKIP the initial
+// LIST, so its existing objects get no Added events and the cache stays empty for that
+// kind. Caller must run this ONLY after a complete discovery (same gate as the object
+// prune) and once any removed kind's driver has quiesced, so a live/transiently-absent
+// kind's cookie isn't wrongly cleared. Returns the count removed.
+func pruneOrphanedResumeCookies(ctx context.Context, writer *sql.DB, keep map[string]struct{}) (int64, error) {
+	tx, err := writer.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rows, err := tx.QueryContext(ctx, `SELECT key FROM cluster_meta`)
+	if err != nil {
+		return 0, err
+	}
+	var orphans []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		// Only resume-cookie keys; other cluster_meta rows (e.g. cluster identity) are
+		// left alone. Exact-suffix match, not SQL LIKE, since the suffix contains '_'
+		// (a LIKE single-char wildcard).
+		if !strings.HasSuffix(k, lastListRVSuffix) && !strings.HasSuffix(k, lastListAtSuffix) {
+			continue
+		}
+		if _, ok := keep[k]; !ok {
+			orphans = append(orphans, k)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, k := range orphans {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_meta WHERE key=?`, k); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int64(len(orphans)), nil
+}
+
+// deleteResumeRV durably removes a kind's resume cookie (last_list_rv + last_list_at) so
+// the next driver for it cold-LISTs. The GVR-repoint path calls it before relaunching the
+// replacement: the old rows survive the repoint (same GVK), so a surviving cookie would
+// let a restart in the relaunch window resume the new endpoint from the stale RV.
+func deleteResumeRV(ctx context.Context, db *sql.DB, gvk schema.GroupVersionKind) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM cluster_meta WHERE key IN (?, ?)`,
+		lastListRVKey(gvk), lastListAtKey(gvk))
+	return err
 }
 
 // readLastListRV reads a kind's persisted resume cookie, returning "" when the

@@ -119,6 +119,14 @@ func (f *fakeSource) counts() (list, meta, get int) {
 	return f.listCalls, f.metaCalls, f.getCalls
 }
 
+// setWatchErr toggles whether Watch fails to establish (stand-in for WATCH RBAC being
+// revoked or restored), safe to call while a watcher goroutine is running.
+func (f *fakeSource) setWatchErr(err error) {
+	f.mu.Lock()
+	f.watchErr = err
+	f.mu.Unlock()
+}
+
 // --- helpers ------------------------------------------------------------------
 
 func expiredStatus() *metav1.Status {
