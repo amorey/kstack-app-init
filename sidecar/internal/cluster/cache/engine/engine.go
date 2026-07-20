@@ -294,6 +294,19 @@ const (
 	// in flight per slot, 16 keeps the ceiling to tens of MB while clearing the small
 	// kinds in a couple of waves.
 	listConcurrency = 16
+
+	// clientQPS/clientBurst raise client-go's client-side rate limiter well above the
+	// engine's own concurrency ceiling (listConcurrency) so it never binds. client-go
+	// defaults to 5 QPS / 10 burst, which throttles a cold start — one LIST per discovered
+	// kind, up to listConcurrency at once, plus the discovery walk — to a crawl and spams
+	// the log with "Waited before sending request ... client-side throttling" warnings.
+	// The engine already bounds in-flight LISTs (listLimiter) and page size (listPageSize)
+	// for memory and API-server-burst safety, so the client-side token bucket is redundant
+	// with it; sizing the bucket past listConcurrency lets the engine's own limiter be the
+	// real governor while keeping a runaway backstop. (The server's API Priority and
+	// Fairness still throttles fairly on modern clusters.)
+	clientQPS   = 50
+	clientBurst = 100
 )
 
 // listLimiter bounds concurrent full LISTs across a run's drivers (see
@@ -866,6 +879,10 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 	// the long-lived watch path.
 	idleCfg := rest.CopyConfig(e.cfg)
 	idleCfg.Wrap(newIdleTimeoutWrapper(defaultListIdleTimeout))
+	// Lift client-go's client-side rate limiter above the engine's own concurrency
+	// ceiling so it doesn't re-throttle the cold-start LIST burst (see clientQPS).
+	idleCfg.QPS = clientQPS
+	idleCfg.Burst = clientBurst
 	dc, err := discovery.NewDiscoveryClientForConfig(idleCfg)
 	if err != nil {
 		return fmt.Errorf("discovery client: %w", err)
