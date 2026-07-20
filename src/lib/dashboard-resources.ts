@@ -262,6 +262,15 @@ export function buildDashboardNav(serverKinds: readonly ServerKind[]): Dashboard
   }).map(withCount);
 }
 
+// The `ServerKind` a selected nav id refers to, or undefined when the id names no
+// discovered kind (a group/overview row, or a kind whose catalog hasn't loaded). Resolves
+// a selectable id — curated ("pods") or dynamic ("apps/replicasets") — back to its full
+// kind row (apiVersion/resource/scope) via the same `navIdForKind` rule the tree is built
+// with, so a per-kind object table can look up the `apiVersion` a curated id omits.
+export function serverKindForResource(kinds: readonly ServerKind[], id: DashboardResource): ServerKind | undefined {
+  return kinds.find((k) => navIdForKind(k) === id);
+}
+
 // The human label for an id, resolved against a built tree (so dynamic kinds
 // resolve too). Falls back to the raw id when no node matches — e.g. a dynamic
 // kind whose catalog hasn't loaded yet, or a stale deep link.

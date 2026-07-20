@@ -1,6 +1,21 @@
 package graph
 
-import "context"
+import (
+	"context"
+	"time"
+)
+
+// nilIfZeroTime returns nil for the zero time (an absent timestamp) and a pointer
+// to t otherwise — the value→nullable mapping shared by the ClusterDataEvent
+// (firstSeen/lastSeen) and ClusterDataObject (creationTimestamp) field resolvers,
+// whose domain types keep value time.Time (comparable, required by the delta-watch
+// diff) but serialize an absent timestamp as null rather than 0001-01-01.
+func nilIfZeroTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
 
 // mapStream maps every value from a latest-value source channel onto the
 // returned channel until ctx ends or sub closes. It emits no separate snapshot

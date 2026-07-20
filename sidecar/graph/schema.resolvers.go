@@ -35,13 +35,11 @@ func (r *clusterDataEventResolver) LastSeen(ctx context.Context, obj *cluster.Cl
 	return nilIfZeroTime(obj.LastSeen), nil
 }
 
-// nilIfZeroTime returns nil for the zero time (an absent timestamp) and a pointer to t
-// otherwise — the value→nullable mapping the two event timestamp resolvers share.
-func nilIfZeroTime(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	return &t
+// CreationTimestamp is the resolver for the creationTimestamp field — the same
+// zero-time-to-null mapping as the ClusterDataEvent timestamp resolvers (the domain
+// keeps a value time.Time for the delta-watch diff).
+func (r *clusterDataObjectResolver) CreationTimestamp(ctx context.Context, obj *cluster.ClusterDataObject) (*time.Time, error) {
+	return nilIfZeroTime(obj.CreationTimestamp), nil
 }
 
 // Permissions is the resolver for the permissions field — the one live cluster
@@ -209,6 +207,17 @@ func (r *subscriptionResolver) ClusterDataEventsWatch(ctx context.Context, id cl
 	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterDataEventChange) *cluster.ClusterDataEventChange { return &c }), nil
 }
 
+// ClusterDataObjectsWatch is the resolver for the clusterDataObjectsWatch field — one
+// kind's cached objects as a delta watch, backing the dashboard's per-kind tables.
+// mapStream adapts each change to a pointer.
+func (r *subscriptionResolver) ClusterDataObjectsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID, apiVersion string, resource string) (<-chan *cluster.ClusterDataObjectChange, error) {
+	ch, err := r.ClusterSvc.ClusterDataObjectsWatch(ctx, id, cacheID, apiVersion, resource)
+	if err != nil {
+		return nil, err
+	}
+	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterDataObjectChange) *cluster.ClusterDataObjectChange { return &c }), nil
+}
+
 // ClusterEventsWatch is the resolver for the clusterEventsWatch field — the live
 // event tail for one cluster, decoupled from clustersWatch. mapStream adapts each
 // bare run to a pointer.
@@ -261,6 +270,11 @@ func (r *Resolver) ClusterCache() ClusterCacheResolver { return &clusterCacheRes
 // ClusterDataEvent returns ClusterDataEventResolver implementation.
 func (r *Resolver) ClusterDataEvent() ClusterDataEventResolver { return &clusterDataEventResolver{r} }
 
+// ClusterDataObject returns ClusterDataObjectResolver implementation.
+func (r *Resolver) ClusterDataObject() ClusterDataObjectResolver {
+	return &clusterDataObjectResolver{r}
+}
+
 // ClusterPrincipal returns ClusterPrincipalResolver implementation.
 func (r *Resolver) ClusterPrincipal() ClusterPrincipalResolver { return &clusterPrincipalResolver{r} }
 
@@ -275,6 +289,7 @@ func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionRes
 
 type clusterCacheResolver struct{ *Resolver }
 type clusterDataEventResolver struct{ *Resolver }
+type clusterDataObjectResolver struct{ *Resolver }
 type clusterPrincipalResolver struct{ *Resolver }
 type mutationResolver struct{ *Resolver }
 type queryResolver struct{ *Resolver }

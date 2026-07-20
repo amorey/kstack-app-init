@@ -177,6 +177,15 @@ func (f *fakeClusterService) ClusterDataEventsWatch(ctx context.Context, cluster
 	return ch, nil
 }
 
+func (f *fakeClusterService) ClusterDataObjectsWatch(ctx context.Context, _ cluster.ClusterID, _ cluster.ClusterCacheID, _, _ string) (<-chan cluster.ClusterDataObjectChange, error) {
+	ch := make(chan cluster.ClusterDataObjectChange)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
+
 func (f *fakeClusterService) ClusterEvents(_ context.Context, id cluster.ClusterID, _ *string, _ *int) ([]cluster.Event, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -519,6 +528,38 @@ func TestClusterDataKindsResolver(t *testing.T) {
 	}
 	if len(resp2.Errors) > 0 || len(resp2.Data.ClusterDataKinds) != 0 {
 		t.Fatalf("unknown cluster should yield empty kinds, got %s", raw2)
+	}
+}
+
+// clusterDataObjectsWatch wires the subscription resolver to the service: the fake stub
+// (like the sidecar's) opens an empty-until-ctx stream, so the SSE dial succeeds and the
+// stream stays open with no frames rather than erroring. Guards the schema/resolver
+// plumbing for the per-kind object tables ahead of the backend implementation.
+func TestClusterDataObjectsWatchOpensWithoutError(t *testing.T) {
+	fix := clusterFixtures()
+	svc := newFakeClusterService(fix)
+	id := fix[0].id
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{
+		ClusterSvc: svc, Auth: newFakeAuth(auth.Identity{}),
+	}))
+	t.Cleanup(srv.Close)
+
+	idStr := strconv.FormatInt(int64(id), 10)
+	q := `subscription { clusterDataObjectsWatch(id: "` + idStr + `", cacheID: "` + idStr +
+		`", apiVersion: "apps/v1", resource: "deployments") { type object { uid name } } }`
+	resp := openSSESubscription(t, srv.URL, "", q)
+	defer resp.Body.Close()
+	events := sseEvents(t, resp)
+
+	// The stub emits no frames; assert only that the dial produced no error frame within a
+	// short window (a `next` carrying `errors`, or an SSE `error`/`complete` on open).
+	select {
+	case ev, ok := <-events:
+		if ok && (ev.event == "error" || strings.Contains(ev.data, `"errors"`)) {
+			t.Fatalf("objects watch should open cleanly, got %s: %s", ev.event, ev.data)
+		}
+	case <-time.After(200 * time.Millisecond):
+		// No frame is the expected empty-until-ctx posture.
 	}
 }
 

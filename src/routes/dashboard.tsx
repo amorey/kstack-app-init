@@ -12,11 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { useMemo } from 'react';
+
 import { createRoute } from '@tanstack/react-router';
 
 import { EventsTable } from '@/components/widgets/events-table';
-import { useDashboardNav } from '@/lib/dashboard-nav';
-import { dashboardResourceLabel, resolveDashboardResource } from '@/lib/dashboard-resources';
+import { ObjectsTable } from '@/components/widgets/objects-table';
+import { useClusterDataKinds } from '@/lib/cluster-data-kinds';
+import {
+  buildDashboardNav,
+  dashboardResourceLabel,
+  resolveDashboardResource,
+  serverKindForResource,
+} from '@/lib/dashboard-resources';
 import type { DashboardResource } from '@/lib/dashboard-resources';
 import { Route as appRoute } from '@/routes/_app';
 
@@ -37,23 +45,42 @@ export const Route = createRoute({
   component: Dashboard,
 });
 
-// The panel reflects the resource kind chosen in the sidebar. Events is the first
-// real view (a live table); the other kinds still name the selection so the wiring
-// from sidebar → URL → panel stays visible. The label resolves against the same
-// built nav the sidebar uses, so dynamic kinds name themselves too.
+// The panel reflects the resource kind chosen in the sidebar. `events` has a bespoke
+// typed table; every other discovered kind renders the generic `ObjectsTable` (resolved
+// from the live catalog to its apiVersion/resource/scope); a selection that names no kind
+// (a group/overview row, or a not-yet-loaded catalog) shows a placeholder. The label and
+// kind both resolve against the same live catalog the sidebar uses, so dynamic kinds name
+// and render themselves too.
 function Dashboard() {
   const { resource } = Route.useSearch();
-  const { nav } = useDashboardNav();
+  const { kinds } = useClusterDataKinds();
   const resolved = resolveDashboardResource(resource);
-  const label = dashboardResourceLabel(nav, resolved);
+  // Both the label (needs the built tree so dynamic kinds name themselves) and the selected
+  // kind derive from the live catalog, which re-emits on count churn — memoize so a Modified
+  // frame doesn't rebuild the tree / rescan the catalog on every render.
+  const label = useMemo(() => dashboardResourceLabel(buildDashboardNav(kinds), resolved), [kinds, resolved]);
+  const serverKind = useMemo(() => serverKindForResource(kinds, resolved), [kinds, resolved]);
+
+  let panel;
+  if (resolved === 'events') {
+    panel = <EventsTable />;
+  } else if (serverKind) {
+    panel = (
+      <ObjectsTable
+        apiVersion={serverKind.apiVersion}
+        resource={serverKind.resource}
+        kind={serverKind.kind}
+        namespaced={serverKind.scope === 'Namespaced'}
+      />
+    );
+  } else {
+    panel = <p className="text-sm text-muted-foreground">The {label.toLowerCase()} view is coming soon.</p>;
+  }
+
   return (
     <section className="min-w-0 flex-1 p-6">
       <h1 className="mb-4 text-lg font-semibold">{label}</h1>
-      {resolved === 'events' ? (
-        <EventsTable />
-      ) : (
-        <p className="text-sm text-muted-foreground">The {label.toLowerCase()} view is coming soon.</p>
-      )}
+      {panel}
     </section>
   );
 }

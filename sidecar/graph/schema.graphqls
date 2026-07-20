@@ -366,6 +366,30 @@ type ClusterDataEvent {
   involvedName: String!
 }
 
+"""
+One cached Kubernetes object projected for a table row (any kind), read from the
+active cache. Only the universal identity is typed for now (`uid`/`apiVersion`/`kind`/
+`namespace`/`name`/`creationTimestamp`) — enough to key the watch, sort, and render a
+Name/Namespace/Age table. The nested object body (and kind-specific columns computed
+from it) is deferred to a follow-up: see the "ClusterDataObject — native nested body"
+item in `TODO.md`. Distinct from `ClusterDataEvent`, which is one specific kind with its
+own fully-typed shape.
+"""
+type ClusterDataObject {
+  "The object's UID — the stable identity the watch keys on."
+  uid: String!
+  "The object's group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
+  apiVersion: String!
+  "Kind name, e.g. \"Deployment\"."
+  kind: String!
+  "Namespace; empty for a cluster-scoped kind."
+  namespace: String!
+  "Object name."
+  name: String!
+  "creationTimestamp — drives the universal Age column; null when the source object carried none."
+  creationTimestamp: Time
+}
+
 # --- Delta watches ---
 
 """
@@ -416,6 +440,20 @@ type ClusterDataEventChange {
   type: ChangeType!
   "The affected event. On `Deleted`, its last-known row; the client keys on `uid`."
   event: ClusterDataEvent!
+  """
+  The cache this frame came from — the frame's provenance, mirroring
+  `ClusterDataKindChange.cacheID`. A client watching the active cache rejects a late
+  frame from a superseded cache by comparing this against the cache it subscribed for.
+  """
+  cacheID: ObjectID!
+}
+
+"One change on the `clusterDataObjectsWatch` stream: the affected object, what happened to it, and which cache it came from."
+type ClusterDataObjectChange {
+  "Whether this object was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: ChangeType!
+  "The affected object. On `Deleted`, its last-known row; the client keys on `uid`."
+  object: ClusterDataObject!
   """
   The cache this frame came from — the frame's provenance, mirroring
   `ClusterDataKindChange.cacheID`. A client watching the active cache rejects a late
@@ -571,6 +609,19 @@ type Subscription {
   `clusterEventsWatch`, which streams kstack's own control-plane timeline.
   """
   clusterDataEventsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterDataEventChange!
+
+  """
+  Streams one kind's cached objects from a ClusterCache as a Kubernetes-style delta
+  watch, keyed like `clusterDataEventsWatch` plus the target kind (`apiVersion` +
+  `resource`, e.g. `"apps/v1"` + `"deployments"`): the current object set for the kind
+  as an `Added` burst on subscribe (the snapshot), then one `Added`/`Modified`/`Deleted`
+  change per object as the sync engine writes it, each frame carrying its `cacheID`
+  provenance. The client keys each object by `uid` and maintains the table from the
+  accumulated set. Empty (no frames) until that cache's db is open and the kind has
+  synced (a never-synced / paused cache streams nothing until it syncs), mirroring
+  `clusterDataEventsWatch`'s posture.
+  """
+  clusterDataObjectsWatch(id: ObjectID!, cacheID: ObjectID!, apiVersion: String!, resource: String!): ClusterDataObjectChange!
 
   """
   Streams a cluster's event timeline: the matching runs as a snapshot, then live

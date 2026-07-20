@@ -76,6 +76,12 @@ type ClusterService interface {
 	// posture. Wakes on the events-only store broker, so an event burst never drives
 	// the kind-catalog re-read.
 	ClusterDataEventsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataEventChange, error)
+	// ClusterDataObjectsWatch streams one kind's cached objects from a ClusterCache as a
+	// delta watch (by parent ClusterID + cache id, plus apiVersion + resource): the
+	// current object set for the kind as an Added burst on subscribe, then
+	// Added/Modified/Deleted per object keyed by UID. Empty (no frames) when that cache's
+	// db isn't open or the kind hasn't synced, mirroring ClusterDataEventsWatch's posture.
+	ClusterDataObjectsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterDataObjectChange, error)
 	// ClusterEvents returns a cluster's beehive event timeline (newest run first),
 	// optionally filtered to one category and bounded by limit. Decoupled from the
 	// cluster/list watch — event chatter never re-emits the cluster.
@@ -491,6 +497,25 @@ func (s *Service) ClusterDataEventsWatch(ctx context.Context, clusterID ClusterI
 			return ClusterDataEventChange{Type: t, Event: e, CacheID: cacheID}
 		},
 	), nil
+}
+
+// ClusterDataObjectsWatch implements ClusterService.
+//
+// TODO(next PR): stream the kind's cached objects. The real implementation mirrors
+// ClusterDataEventsWatch — a cacheDeltaWatch over the object-write broker
+// (ObjectsSubscribe), re-reading a new store.Objects(kind) reader on each debounced ping,
+// keyed by UID, projecting each row to a ClusterDataObject (its typed identity, with the
+// nested body deferred — see TODO.md). Until then it returns a channel that emits nothing
+// and closes on ctx.Done — exactly the empty posture of an unsynced cache, so the webview
+// shows its "connecting"/"no objects" states rather than erroring (which would
+// reconnect-loop).
+func (s *Service) ClusterDataObjectsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterDataObjectChange, error) {
+	ch := make(chan ClusterDataObjectChange)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
 }
 
 // toDataEvent maps a store EventRow onto the domain ClusterDataEvent 1:1, decoding the

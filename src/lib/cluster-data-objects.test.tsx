@@ -1,0 +1,214 @@
+// Copyright 2026 The Kubetail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { renderHook } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// Same seams as cluster-data-events.test.tsx: mock urql's useSubscription (a delta
+// accumulator), the transport-status registry (so `pushReset` bumps the generation), the
+// clusters provider (keeping the real applyChange reducer), and the active-context hook.
+const { useSubscriptionMock } = vi.hoisted(() => ({ useSubscriptionMock: vi.fn() }));
+const { useClustersMock, useActiveKubeContextMock } = vi.hoisted(() => ({
+  useClustersMock: vi.fn(),
+  useActiveKubeContextMock: vi.fn(),
+}));
+const { statusState } = vi.hoisted(() => ({
+  statusState: { snapshot: { connected: true, generation: 0 } },
+}));
+
+vi.mock('urql', () => ({ useSubscription: useSubscriptionMock, createRequest: () => ({ key: 1 }) }));
+vi.mock('@/lib/graphql/transport-status', () => ({
+  getStatus: () => statusState.snapshot,
+  subscribeStatus: () => () => {},
+}));
+vi.mock('@/lib/clusters', () => ({
+  useClusters: useClustersMock,
+  applyChange: <T,>(prev: ReadonlyMap<string, T> | undefined, type: string, id: string, entity: T) => {
+    const next = new Map(prev);
+    if (type === 'Deleted') next.delete(id);
+    else next.set(id, entity);
+    return next;
+  },
+}));
+vi.mock('@/lib/active-kube-context', () => ({ useActiveKubeContext: useActiveKubeContextMock }));
+
+const { useClusterDataObjects } = await import('./cluster-data-objects');
+
+const PODS = { apiVersion: 'v1', resource: 'pods' };
+
+function obj(uid: string, over: Partial<{ namespace: string; name: string }> = {}) {
+  return {
+    uid,
+    apiVersion: 'v1',
+    kind: 'Pod',
+    namespace: over.namespace ?? 'default',
+    name: over.name ?? uid,
+    creationTimestamp: '2026-07-20T10:00:00Z',
+  };
+}
+
+function clusterFixture(hasCache: boolean, cacheId = 'c1', serverUid = 'uid-1') {
+  return {
+    id: '1',
+    spec: { source: { kubeconfig: { context: 'prod' } } },
+    activeCache: hasCache ? { id: cacheId, serverUid, status: { conditions: [] } } : null,
+  };
+}
+
+const uids = (objects: { uid: string }[]) => objects.map((o) => o.uid);
+
+// urql accumulator stand-in — folds a delta through the reducer captured on the last
+// render. Each frame carries its own cache provenance (defaulting to the subscribed cache).
+let acc: unknown;
+let lastArgs: { variables?: { cacheID?: string }; pause?: boolean } | undefined;
+let lastReducer: ((prev: unknown, res: unknown) => unknown) | undefined;
+
+function pushFrame(type: string, object: unknown, cacheID = lastArgs?.variables?.cacheID) {
+  acc = lastReducer!(acc, { clusterDataObjectsWatch: { type, cacheID, object } });
+}
+
+function pushReset() {
+  statusState.snapshot = { connected: true, generation: statusState.snapshot.generation + 1 };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  acc = undefined;
+  lastArgs = undefined;
+  lastReducer = undefined;
+  statusState.snapshot = { connected: true, generation: 0 };
+  useActiveKubeContextMock.mockReturnValue({ context: 'prod' });
+  useSubscriptionMock.mockImplementation((args: typeof lastArgs, reducer: typeof lastReducer) => {
+    lastArgs = args;
+    lastReducer = reducer;
+    return [{ data: acc }];
+  });
+});
+
+describe('useClusterDataObjects', () => {
+  it('accumulates the snapshot burst and returns objects sorted by (namespace, name)', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
+    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    expect(result.current.objects).toEqual([]);
+
+    pushFrame('Added', obj('b', { namespace: 'kube-system', name: 'b' }));
+    pushFrame('Added', obj('a', { namespace: 'default', name: 'a' }));
+    pushFrame('Added', obj('c', { namespace: 'default', name: 'c' }));
+    rerender();
+    // default/a, default/c, kube-system/b.
+    expect(uids(result.current.objects)).toEqual(['a', 'c', 'b']);
+  });
+
+  it('updates an object in place on a Modified frame', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
+    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    pushFrame('Added', obj('a', { name: 'pod-a' }));
+    rerender();
+    expect(result.current.objects[0].name).toBe('pod-a');
+
+    pushFrame('Modified', obj('a', { name: 'pod-a-renamed' }));
+    rerender();
+    expect(result.current.objects).toHaveLength(1);
+    expect(result.current.objects[0].name).toBe('pod-a-renamed');
+  });
+
+  it('adds an object on Added and removes it on Deleted', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
+    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    pushFrame('Added', obj('a', { name: 'a' }));
+    pushFrame('Added', obj('b', { name: 'b' }));
+    rerender();
+    expect(uids(result.current.objects)).toEqual(['a', 'b']);
+
+    pushFrame('Deleted', obj('a', { name: 'a' }));
+    rerender();
+    expect(uids(result.current.objects)).toEqual(['b']);
+  });
+
+  it('drops the old cache’s objects on a cache swap until the new cache streams', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true, 'c1', 'uid-1')] });
+    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    expect(lastArgs?.variables?.cacheID).toBe('c1');
+    pushFrame('Added', obj('a'));
+    rerender();
+    expect(result.current.objects).toHaveLength(1);
+
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true, 'c2', 'uid-2')] });
+    rerender();
+    expect(lastArgs?.variables?.cacheID).toBe('c2');
+    expect(result.current.objects).toEqual([]);
+
+    pushFrame('Added', obj('z'));
+    rerender();
+    expect(uids(result.current.objects)).toEqual(['z']);
+  });
+
+  it('preserves the active cache’s objects when a late old-cache straggler arrives', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true, 'c1', 'uid-1')] });
+    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    pushFrame('Added', obj('a'));
+    rerender();
+
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true, 'c2', 'uid-2')] });
+    rerender();
+    pushFrame('Added', obj('x'), 'c2');
+    rerender();
+    expect(uids(result.current.objects)).toEqual(['x']);
+
+    // A straggler from the superseded c1 subscription must NOT wipe or join c2's set.
+    pushFrame('Added', obj('stale'), 'c1');
+    rerender();
+    expect(uids(result.current.objects)).toEqual(['x']);
+  });
+
+  it('resets on a transport reconnect so an object deleted during the outage is gone after replay', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
+    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    pushFrame('Added', obj('a', { name: 'a' }));
+    pushFrame('Added', obj('b', { name: 'b' }));
+    rerender();
+    expect(uids(result.current.objects)).toEqual(['a', 'b']);
+
+    pushReset();
+    pushFrame('Added', obj('b', { name: 'b' }));
+    rerender();
+    expect(uids(result.current.objects)).toEqual(['b']);
+  });
+
+  it('pauses the watch and reports active=false when there is no active cache', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(false)] });
+    const { result } = renderHook(() => useClusterDataObjects(PODS));
+    expect(result.current.active).toBe(false);
+    expect(result.current.objects).toEqual([]);
+    expect(lastArgs?.pause).toBe(true);
+  });
+
+  it('reports connecting → live across the first frame, and reconnecting on a drop', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
+    statusState.snapshot = { connected: false, generation: 0 };
+    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    expect(result.current.active).toBe(true);
+    expect(result.current.phase).toBe('connecting');
+
+    statusState.snapshot = { connected: true, generation: 0 };
+    pushFrame('Added', obj('a'));
+    rerender();
+    expect(result.current.phase).toBe('live');
+
+    statusState.snapshot = { connected: false, generation: 0 };
+    rerender();
+    expect(result.current.phase).toBe('reconnecting');
+    expect(result.current.objects).toHaveLength(1);
+  });
+});

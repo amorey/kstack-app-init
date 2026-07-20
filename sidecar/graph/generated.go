@@ -36,6 +36,7 @@ type Config = graphql.Config[ResolverRoot, DirectiveRoot, ComplexityRoot]
 type ResolverRoot interface {
 	ClusterCache() ClusterCacheResolver
 	ClusterDataEvent() ClusterDataEventResolver
+	ClusterDataObject() ClusterDataObjectResolver
 	ClusterPrincipal() ClusterPrincipalResolver
 	Mutation() MutationResolver
 	Query() QueryResolver
@@ -126,6 +127,21 @@ type ComplexityRoot struct {
 	ClusterDataKindChange struct {
 		CacheID func(childComplexity int) int
 		Kind    func(childComplexity int) int
+		Type    func(childComplexity int) int
+	}
+
+	ClusterDataObject struct {
+		APIVersion        func(childComplexity int) int
+		CreationTimestamp func(childComplexity int) int
+		Kind              func(childComplexity int) int
+		Name              func(childComplexity int) int
+		Namespace         func(childComplexity int) int
+		UID               func(childComplexity int) int
+	}
+
+	ClusterDataObjectChange struct {
+		CacheID func(childComplexity int) int
+		Object  func(childComplexity int) int
 		Type    func(childComplexity int) int
 	}
 
@@ -249,6 +265,7 @@ type ComplexityRoot struct {
 		ClusterCachesWatch      func(childComplexity int) int
 		ClusterDataEventsWatch  func(childComplexity int, id cluster.ObjectID, cacheID cluster.ObjectID) int
 		ClusterDataKindsWatch   func(childComplexity int, id cluster.ObjectID, cacheID cluster.ObjectID) int
+		ClusterDataObjectsWatch func(childComplexity int, id cluster.ObjectID, cacheID cluster.ObjectID, apiVersion string, resource string) int
 		ClusterEventsWatch      func(childComplexity int, id cluster.ObjectID, category *string) int
 		ClusterScheduleWatch    func(childComplexity int, id cluster.ObjectID) int
 		ClustersWatch           func(childComplexity int) int
@@ -261,6 +278,9 @@ type ClusterCacheResolver interface {
 type ClusterDataEventResolver interface {
 	FirstSeen(ctx context.Context, obj *cluster.ClusterDataEvent) (*time.Time, error)
 	LastSeen(ctx context.Context, obj *cluster.ClusterDataEvent) (*time.Time, error)
+}
+type ClusterDataObjectResolver interface {
+	CreationTimestamp(ctx context.Context, obj *cluster.ClusterDataObject) (*time.Time, error)
 }
 type ClusterPrincipalResolver interface {
 	Permissions(ctx context.Context, obj *cluster.ClusterPrincipal, namespace string) (*model.ClusterPermissions, error)
@@ -287,6 +307,7 @@ type SubscriptionResolver interface {
 	ClusterCachesWatch(ctx context.Context) (<-chan *cluster.ClusterCacheChange, error)
 	ClusterDataKindsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataKindChange, error)
 	ClusterDataEventsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataEventChange, error)
+	ClusterDataObjectsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID, apiVersion string, resource string) (<-chan *cluster.ClusterDataObjectChange, error)
 	ClusterEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error)
 	ClusterCacheEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error)
 	ClusterScheduleWatch(ctx context.Context, id cluster.ObjectID) (<-chan *cluster.Schedule, error)
@@ -601,6 +622,62 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterDataKindChange.Type(childComplexity), true
+
+	case "ClusterDataObject.apiVersion":
+		if e.ComplexityRoot.ClusterDataObject.APIVersion == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObject.APIVersion(childComplexity), true
+	case "ClusterDataObject.creationTimestamp":
+		if e.ComplexityRoot.ClusterDataObject.CreationTimestamp == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObject.CreationTimestamp(childComplexity), true
+	case "ClusterDataObject.kind":
+		if e.ComplexityRoot.ClusterDataObject.Kind == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObject.Kind(childComplexity), true
+	case "ClusterDataObject.name":
+		if e.ComplexityRoot.ClusterDataObject.Name == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObject.Name(childComplexity), true
+	case "ClusterDataObject.namespace":
+		if e.ComplexityRoot.ClusterDataObject.Namespace == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObject.Namespace(childComplexity), true
+	case "ClusterDataObject.uid":
+		if e.ComplexityRoot.ClusterDataObject.UID == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObject.UID(childComplexity), true
+
+	case "ClusterDataObjectChange.cacheID":
+		if e.ComplexityRoot.ClusterDataObjectChange.CacheID == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObjectChange.CacheID(childComplexity), true
+	case "ClusterDataObjectChange.object":
+		if e.ComplexityRoot.ClusterDataObjectChange.Object == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObjectChange.Object(childComplexity), true
+	case "ClusterDataObjectChange.type":
+		if e.ComplexityRoot.ClusterDataObjectChange.Type == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObjectChange.Type(childComplexity), true
 
 	case "ClusterPermissions.incomplete":
 		if e.ComplexityRoot.ClusterPermissions.Incomplete == nil {
@@ -1097,6 +1174,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Subscription.ClusterDataKindsWatch(childComplexity, args["id"].(cluster.ObjectID), args["cacheID"].(cluster.ObjectID)), true
+	case "Subscription.clusterDataObjectsWatch":
+		if e.ComplexityRoot.Subscription.ClusterDataObjectsWatch == nil {
+			break
+		}
+
+		args, err := ec.field_Subscription_clusterDataObjectsWatch_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.ComplexityRoot.Subscription.ClusterDataObjectsWatch(childComplexity, args["id"].(cluster.ObjectID), args["cacheID"].(cluster.ObjectID), args["apiVersion"].(string), args["resource"].(string)), true
 	case "Subscription.clusterEventsWatch":
 		if e.ComplexityRoot.Subscription.ClusterEventsWatch == nil {
 			break
@@ -1411,6 +1499,36 @@ func (ec *executionContext) childFields_ClusterDataKindChange(ctx context.Contex
 		return ec.fieldContext_ClusterDataKindChange_cacheID(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterDataKindChange", field.Name)
+}
+
+func (ec *executionContext) childFields_ClusterDataObject(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "uid":
+		return ec.fieldContext_ClusterDataObject_uid(ctx, field)
+	case "apiVersion":
+		return ec.fieldContext_ClusterDataObject_apiVersion(ctx, field)
+	case "kind":
+		return ec.fieldContext_ClusterDataObject_kind(ctx, field)
+	case "namespace":
+		return ec.fieldContext_ClusterDataObject_namespace(ctx, field)
+	case "name":
+		return ec.fieldContext_ClusterDataObject_name(ctx, field)
+	case "creationTimestamp":
+		return ec.fieldContext_ClusterDataObject_creationTimestamp(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type ClusterDataObject", field.Name)
+}
+
+func (ec *executionContext) childFields_ClusterDataObjectChange(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "type":
+		return ec.fieldContext_ClusterDataObjectChange_type(ctx, field)
+	case "object":
+		return ec.fieldContext_ClusterDataObjectChange_object(ctx, field)
+	case "cacheID":
+		return ec.fieldContext_ClusterDataObjectChange_cacheID(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type ClusterDataObjectChange", field.Name)
 }
 
 func (ec *executionContext) childFields_ClusterPermissions(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -2004,6 +2122,44 @@ func (ec *executionContext) field_Subscription_clusterDataKindsWatch_args(ctx co
 		return nil, err
 	}
 	args["cacheID"] = arg1
+	return args, nil
+}
+
+func (ec *executionContext) field_Subscription_clusterDataObjectsWatch_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
+		func(ctx context.Context, v any) (cluster.ObjectID, error) {
+			return ec.unmarshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐObjectID(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["id"] = arg0
+	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "cacheID",
+		func(ctx context.Context, v any) (cluster.ObjectID, error) {
+			return ec.unmarshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐObjectID(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["cacheID"] = arg1
+	arg2, err := graphql.ProcessArgField(ctx, rawArgs, "apiVersion",
+		func(ctx context.Context, v any) (string, error) {
+			return ec.unmarshalNString2string(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["apiVersion"] = arg2
+	arg3, err := graphql.ProcessArgField(ctx, rawArgs, "resource",
+		func(ctx context.Context, v any) (string, error) {
+			return ec.unmarshalNString2string(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["resource"] = arg3
 	return args, nil
 }
 
@@ -3276,6 +3432,222 @@ func (ec *executionContext) _ClusterDataKindChange_cacheID(ctx context.Context, 
 }
 func (ec *executionContext) fieldContext_ClusterDataKindChange_cacheID(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterDataKindChange", field, false, false, errors.New("field of type ObjectID does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObject_uid(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObject) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObject_uid(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.UID, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObject_uid(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObject", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObject_apiVersion(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObject) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObject_apiVersion(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.APIVersion, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObject_apiVersion(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObject", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObject_kind(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObject) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObject_kind(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Kind, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObject_kind(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObject", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObject_namespace(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObject) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObject_namespace(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Namespace, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObject_namespace(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObject", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObject_name(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObject) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObject_name(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Name, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObject_name(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObject", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObject_creationTimestamp(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObject) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObject_creationTimestamp(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return ec.Resolvers.ClusterDataObject().CreationTimestamp(ctx, obj)
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
+			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObject_creationTimestamp(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObject", field, true, true, errors.New("field of type Time does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObjectChange_type(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObjectChange) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObjectChange_type(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Type, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v cluster.ChangeType) graphql.Marshaler {
+			return ec.marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐChangeType(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObjectChange_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObjectChange", field, false, false, errors.New("field of type ChangeType does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObjectChange_object(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObjectChange) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObjectChange_object(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Object, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v cluster.ClusterDataObject) graphql.Marshaler {
+			return ec.marshalNClusterDataObject2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataObject(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObjectChange_object(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "ClusterDataObjectChange",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterDataObject(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _ClusterDataObjectChange_cacheID(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObjectChange) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObjectChange_cacheID(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.CacheID, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v cluster.ObjectID) graphql.Marshaler {
+			return ec.marshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐObjectID(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObjectChange_cacheID(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObjectChange", field, false, false, errors.New("field of type ObjectID does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterPermissions_namespace(ctx context.Context, field graphql.CollectedField, obj *model.ClusterPermissions) (ret graphql.Marshaler) {
@@ -5235,6 +5607,50 @@ func (ec *executionContext) fieldContext_Subscription_clusterDataEventsWatch(ctx
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
 	if fc.Args, err = ec.field_Subscription_clusterDataEventsWatch_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Subscription_clusterDataObjectsWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
+	return graphql.ResolveFieldStream(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Subscription_clusterDataObjectsWatch(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.Resolvers.Subscription().ClusterDataObjectsWatch(ctx, fc.Args["id"].(cluster.ObjectID), fc.Args["cacheID"].(cluster.ObjectID), fc.Args["apiVersion"].(string), fc.Args["resource"].(string))
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *cluster.ClusterDataObjectChange) graphql.Marshaler {
+			return ec.marshalNClusterDataObjectChange2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataObjectChange(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Subscription_clusterDataObjectsWatch(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Subscription",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterDataObjectChange(ctx, field)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Subscription_clusterDataObjectsWatch_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -7304,6 +7720,147 @@ func (ec *executionContext) _ClusterDataKindChange(ctx context.Context, sel ast.
 	return out
 }
 
+var clusterDataObjectImplementors = []string{"ClusterDataObject"}
+
+func (ec *executionContext) _ClusterDataObject(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterDataObject) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, clusterDataObjectImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("ClusterDataObject")
+		case "uid":
+			out.Values[i] = ec._ClusterDataObject_uid(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "apiVersion":
+			out.Values[i] = ec._ClusterDataObject_apiVersion(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "kind":
+			out.Values[i] = ec._ClusterDataObject_kind(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "namespace":
+			out.Values[i] = ec._ClusterDataObject_namespace(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "name":
+			out.Values[i] = ec._ClusterDataObject_name(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "creationTimestamp":
+			field := field
+
+			innerFunc := func(ctx context.Context, _ *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._ClusterDataObject_creationTimestamp(ctx, field, obj)
+				return res
+			}
+
+			if field.Deferrable != nil {
+				dfs, ok := deferred[field.Deferrable.Label]
+				di := 0
+				if ok {
+					dfs.AddField(field)
+					di = len(dfs.Values) - 1
+				} else {
+					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
+					deferred[field.Deferrable.Label] = dfs
+				}
+				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
+					return innerFunc(ctx, dfs)
+				})
+
+				// don't run the out.Concurrently() call below
+				out.Values[i] = graphql.Null
+				continue
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
+var clusterDataObjectChangeImplementors = []string{"ClusterDataObjectChange"}
+
+func (ec *executionContext) _ClusterDataObjectChange(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterDataObjectChange) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, clusterDataObjectChangeImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("ClusterDataObjectChange")
+		case "type":
+			out.Values[i] = ec._ClusterDataObjectChange_type(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "object":
+			out.Values[i] = ec._ClusterDataObjectChange_object(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "cacheID":
+			out.Values[i] = ec._ClusterDataObjectChange_cacheID(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
 var clusterPermissionsImplementors = []string{"ClusterPermissions"}
 
 func (ec *executionContext) _ClusterPermissions(ctx context.Context, sel ast.SelectionSet, obj *model.ClusterPermissions) graphql.Marshaler {
@@ -8357,6 +8914,8 @@ func (ec *executionContext) _Subscription(ctx context.Context, sel ast.Selection
 		return ec._Subscription_clusterDataKindsWatch(ctx, fields[0])
 	case "clusterDataEventsWatch":
 		return ec._Subscription_clusterDataEventsWatch(ctx, fields[0])
+	case "clusterDataObjectsWatch":
+		return ec._Subscription_clusterDataObjectsWatch(ctx, fields[0])
 	case "clusterEventsWatch":
 		return ec._Subscription_clusterEventsWatch(ctx, fields[0])
 	case "clusterCacheEventsWatch":
@@ -8939,6 +9498,24 @@ func (ec *executionContext) marshalNClusterDataKindChange2ᚖgithubᚗcomᚋkube
 		return graphql.Null
 	}
 	return ec._ClusterDataKindChange(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalNClusterDataObject2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataObject(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterDataObject) graphql.Marshaler {
+	return ec._ClusterDataObject(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNClusterDataObjectChange2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataObjectChange(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterDataObjectChange) graphql.Marshaler {
+	return ec._ClusterDataObjectChange(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNClusterDataObjectChange2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataObjectChange(ctx context.Context, sel ast.SelectionSet, v *cluster.ClusterDataObjectChange) graphql.Marshaler {
+	if v == nil {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+		return graphql.Null
+	}
+	return ec._ClusterDataObjectChange(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalNClusterPermissions2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐClusterPermissions(ctx context.Context, sel ast.SelectionSet, v model.ClusterPermissions) graphql.Marshaler {

@@ -668,6 +668,43 @@ type ClusterDataEventChange struct {
 	CacheID ClusterCacheID
 }
 
+// ClusterDataObject is one cached Kubernetes object projected for a table row (any
+// kind), read from the active cache. Only the universal identity is typed for now
+// (UID/APIVersion/Kind/Namespace/Name/CreationTimestamp) — enough to key the watch,
+// sort, and render a Name/Namespace/Age table. The nested object body (and kind-specific
+// columns computed from it) is deferred to a follow-up (see TODO.md). Distinct from
+// ClusterDataEvent (a specific kind with its own typed shape). Binds 1:1 to the GraphQL
+// ClusterDataObject.
+type ClusterDataObject struct {
+	// UID is the object's UID — the stable identity a watch keys on.
+	UID string
+	// APIVersion is the group/version, e.g. "apps/v1".
+	APIVersion string
+	// Kind is the Kind name, e.g. "Deployment".
+	Kind string
+	// Namespace is the object's namespace (empty for a cluster-scoped kind).
+	Namespace string
+	// Name is the object's name.
+	Name string
+	// CreationTimestamp drives the universal Age column (zero when the source object
+	// carried none; the field resolver maps zero → null).
+	CreationTimestamp time.Time
+}
+
+// ClusterDataObjectChange is one delta on a cache's per-kind objects watch: what happened
+// (Type) to which object (Object), from which cache (CacheID). On subscribe the current
+// object set for the kind arrives as Added (the snapshot); thereafter a new object is
+// Added, an object whose fields change is Modified, and one removed from the cache is
+// Deleted (carrying its last-known row). Consumers key on UID. CacheID is the frame's
+// provenance, mirroring ClusterDataKindChange: a client watching the active cache can
+// reject a late frame from a superseded cache. Binds 1:1 to the GraphQL
+// ClusterDataObjectChange.
+type ClusterDataObjectChange struct {
+	Type    ChangeType
+	Object  ClusterDataObject
+	CacheID ClusterCacheID
+}
+
 // --- Seed conditions ---
 
 // SeedConnectionConditions returns the initial condition set for a freshly
