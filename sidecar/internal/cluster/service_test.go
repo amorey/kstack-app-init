@@ -348,7 +348,7 @@ func TestServiceCacheStatsRollup(t *testing.T) {
 
 // The Events kind now carries a real count in kind_counts (maintained by triggers
 // on the events table), and /apis discovery advertises it in kind_catalog — so it
-// appears in KindCatalog with a non-zero count. CacheStats must still exclude it
+// appears in Kinds with a non-zero count. CacheStats must still exclude it
 // from the whole-cache object totals: events aren't objects, and ObjectCount is
 // documented to leave them out. (TestServiceCacheStatsRollup above is insulated
 // only because it inserts no Event catalog row; this one adds it to exercise the
@@ -447,7 +447,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(cacheID))
 	require.NoError(t, err)
 
-	// Snapshot: an Added per kind, ordered by (api_version, kind) like KindCatalog.
+	// Snapshot: an Added per kind, ordered by (api_version, kind) like Kinds.
 	snap1 := recvKindChange(t, ch)
 	assert.Equal(t, ChangeAdded, snap1.Type)
 	assert.Equal(t, "Deployment", snap1.Kind.Kind)
@@ -462,7 +462,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 
 	// A new object of an existing kind bumps its count → Modified.
 	insertObj("d2", "apps/v1", "Deployment")
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	mod := recvKindChange(t, ch)
 	assert.Equal(t, ChangeModified, mod.Type)
 	assert.Equal(t, "Deployment", mod.Kind.Kind)
@@ -470,7 +470,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 
 	// A newly-discovered kind → Added.
 	insertKind("batch/v1", "Job", "jobs", "Namespaced", 0)
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	add := recvKindChange(t, ch)
 	assert.Equal(t, ChangeAdded, add.Type)
 	assert.Equal(t, "Job", add.Kind.Kind)
@@ -480,7 +480,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 	_, err = cdb.Writer().ExecContext(ctx,
 		`DELETE FROM kind_catalog WHERE kind = 'Node'`)
 	require.NoError(t, err)
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	del := recvKindChange(t, ch)
 	assert.Equal(t, ChangeDeleted, del.Type)
 	assert.Equal(t, "Node", del.Kind.Kind)
@@ -539,11 +539,11 @@ func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
 	// Three writes + pings back-to-back inside the 100ms window; the store's cap-1
 	// Subscribe channel plus the debounce collapse them into one re-read.
 	insertObj("d2")
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	insertObj("d3")
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	insertObj("d4")
-	cdb.Notify()
+	cdb.ObjectsNotify()
 
 	// The single coalesced re-read reports the final count (4), never an intermediate.
 	mod := recvKindChange(t, ch)
@@ -617,7 +617,7 @@ func TestServiceClusterDataKindsWatchBindsCacheOpenedAfterSubscribe(t *testing.T
 	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
 	require.NoError(t, err)
 	insertCatalogKind(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
-	cdb.Notify()
+	cdb.ObjectsNotify()
 
 	ev := recvKindChange(t, ch)
 	assert.Equal(t, ChangeAdded, ev.Type)
@@ -659,7 +659,7 @@ func TestServiceClusterDataKindsWatchRebindsAfterCacheReplaced(t *testing.T) {
 
 	// A write into the rebuilt cache streams through the rebound handle.
 	insertCatalogKind(t, ctx, cdb2, "v1", "Node", "nodes", "Cluster")
-	cdb2.Notify()
+	cdb2.ObjectsNotify()
 	add := recvKindChange(t, ch)
 	assert.Equal(t, ChangeAdded, add.Type)
 	assert.Equal(t, "Node", add.Kind.Kind)
@@ -812,7 +812,7 @@ func TestServiceClusterDataEventsWatchIgnoresObjectWrites(t *testing.T) {
 		   created_at, updated_at, raw_json)
 		 VALUES ('o1', 'v1', 'Pod', 'default', 'o1', '1', 1, 1, x'7b7d')`)
 	require.NoError(t, err)
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	select {
 	case ev := <-ch:
 		t.Fatalf("object write must not wake the events watch, got %+v", ev)

@@ -326,12 +326,12 @@ func TestSubscribeNotifyAndCoalesce(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
-	ch, cancel := cdb.Subscribe()
+	ch, cancel := cdb.ObjectsSubscribe()
 	defer cancel()
 
 	// Two notifies with no consumer in between coalesce into one ping.
-	cdb.Notify()
-	cdb.Notify()
+	cdb.ObjectsNotify()
+	cdb.ObjectsNotify()
 	select {
 	case <-ch:
 	case <-time.After(2 * time.Second):
@@ -344,7 +344,7 @@ func TestSubscribeNotifyAndCoalesce(t *testing.T) {
 	}
 
 	// A notify after draining delivers again.
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	select {
 	case <-ch:
 	case <-time.After(2 * time.Second):
@@ -406,7 +406,7 @@ func TestEventsBrokerIsSeparateFromWrites(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
-	writes, cancelW := cdb.Subscribe()
+	writes, cancelW := cdb.ObjectsSubscribe()
 	defer cancelW()
 	events, cancelE := cdb.EventsSubscribe()
 	defer cancelE()
@@ -425,7 +425,7 @@ func TestEventsBrokerIsSeparateFromWrites(t *testing.T) {
 	}
 
 	// Notify pings only the object-write subscriber.
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	select {
 	case <-writes:
 	case <-time.After(2 * time.Second):
@@ -445,7 +445,7 @@ func TestShutdownClosesSubscribers(t *testing.T) {
 	cdb, err := r.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 
-	ch, cancel := cdb.Subscribe()
+	ch, cancel := cdb.ObjectsSubscribe()
 	defer cancel()
 	require.NoError(t, r.Shutdown(ctx))
 
@@ -535,7 +535,7 @@ func TestWatchDBClosedOnShutdown(t *testing.T) {
 	}
 }
 
-func TestKindCatalog(t *testing.T) {
+func TestKinds(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
@@ -544,7 +544,7 @@ func TestKindCatalog(t *testing.T) {
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
 	// Empty until discovery populates it.
-	rows, err := cdb.KindCatalog(ctx)
+	rows, err := cdb.Kinds(ctx)
 	require.NoError(t, err)
 	require.Empty(t, rows)
 
@@ -573,7 +573,7 @@ func TestKindCatalog(t *testing.T) {
 	insertObj("d1", "apps/v1", "Deployment")
 	insertObj("d2", "apps/v1", "Deployment")
 
-	rows, err = cdb.KindCatalog(ctx)
+	rows, err = cdb.Kinds(ctx)
 	require.NoError(t, err)
 	require.Len(t, rows, 3)
 
@@ -595,11 +595,11 @@ func TestKindCatalog(t *testing.T) {
 }
 
 // The per-kind counts are maintained by triggers on the objects table (so
-// KindCatalog reads them without scanning objects). This pins the two properties
+// Kinds reads them without scanning objects). This pins the two properties
 // the trigger design relies on: a delete decrements the count, and an object
 // written before its catalog row still counts — kind_counts is keyed only by
 // (api_version, kind), independent of kind_catalog's discovery rewrite.
-func TestKindCatalogCountsMaintainedByTriggers(t *testing.T) {
+func TestKindCountsMaintainedByTriggers(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
@@ -617,7 +617,7 @@ func TestKindCatalogCountsMaintainedByTriggers(t *testing.T) {
 		require.NoError(t, err)
 	}
 	countFor := func(kind string) int {
-		rows, err := cdb.KindCatalog(ctx)
+		rows, err := cdb.Kinds(ctx)
 		require.NoError(t, err)
 		for _, row := range rows {
 			if row.Kind == kind {
@@ -669,7 +669,7 @@ func TestEventKindCountMaintainedByTriggers(t *testing.T) {
 	require.NoError(t, err)
 
 	countFor := func(kind string) int {
-		rows, err := cdb.KindCatalog(ctx)
+		rows, err := cdb.Kinds(ctx)
 		require.NoError(t, err)
 		for _, row := range rows {
 			if row.Kind == kind {

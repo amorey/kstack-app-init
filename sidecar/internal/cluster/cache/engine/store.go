@@ -75,7 +75,7 @@ func (s *objectsStore) upsert(u *unstructured.Unstructured) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.cdb.Notify()
+	s.cdb.ObjectsNotify()
 	return nil
 }
 
@@ -167,7 +167,7 @@ func (r *objectsReplaceSession) WritePage(items []*unstructured.Unstructured) er
 		return err
 	}
 	r.cookieCleared = true
-	r.s.cdb.Notify()
+	r.s.cdb.ObjectsNotify()
 	return nil
 }
 
@@ -213,7 +213,7 @@ func (r *objectsReplaceSession) Commit(resourceVersion string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.cdb.Notify()
+	s.cdb.ObjectsNotify()
 	return nil
 }
 
@@ -280,7 +280,7 @@ func (s *objectsStore) DeleteByUID(ctx context.Context, uid string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.cdb.Notify()
+	s.cdb.ObjectsNotify()
 	return nil
 }
 

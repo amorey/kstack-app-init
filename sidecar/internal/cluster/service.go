@@ -152,7 +152,7 @@ type Service struct {
 
 	// dataKindsDebounce bounds how often ClusterDataKindsWatch re-reads and diffs the
 	// kind catalog. A busy cluster pings the store on every object write; each re-read
-	// runs KindCatalog's count-join over the object index, so a burst of pings is
+	// runs Kinds' count-join over the object index, so a burst of pings is
 	// coalesced into one re-read per interval (trailing edge) to keep the reader from
 	// aggregating continuously.
 	dataKindsDebounce time.Duration
@@ -366,7 +366,7 @@ func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID C
 	// Roll up the kind catalog's trigger-maintained per-kind counts (O(kinds), no
 	// object scan): total objects and the number of non-empty kinds. The catalog
 	// lists advertised-but-empty kinds too, so KindCount only counts count > 0.
-	rows, err := db.KindCatalog(ctx)
+	rows, err := db.Kinds(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -404,7 +404,7 @@ func (s *Service) ClusterDataKinds(ctx context.Context, clusterID ClusterID, cac
 	if db == nil {
 		return nil, nil
 	}
-	rows, err := db.KindCatalog(ctx)
+	rows, err := db.Kinds(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -415,8 +415,8 @@ func (s *Service) ClusterDataKinds(ctx context.Context, clusterID ClusterID, cac
 	return kinds, nil
 }
 
-// toDataKind maps a store KindCatalogRow onto the domain ClusterDataKind 1:1.
-func toDataKind(r store.KindCatalogRow) ClusterDataKind {
+// toDataKind maps a store KindRow onto the domain ClusterDataKind 1:1.
+func toDataKind(r store.KindRow) ClusterDataKind {
 	return ClusterDataKind{
 		APIVersion: r.APIVersion,
 		Kind:       r.Kind,
@@ -437,19 +437,19 @@ func dataKindKey(k ClusterDataKind) string {
 // catalog as a delta watch: the current catalog as an Added burst on subscribe, then
 // one Added/Modified/Deleted change per kind as the sync engine writes objects and
 // pings the store (Count is a live LEFT JOIN, so an object write that changes a count
-// re-emits its kind as Modified). It follows the object-write broker (Subscribe) and
-// re-reads KindCatalog on each debounced ping, diffing against the last snapshot;
+// re-emits its kind as Modified). It follows the object-write broker (ObjectsSubscribe)
+// and re-reads Kinds on each debounced ping, diffing against the last snapshot;
 // cacheDeltaWatch owns the whole cache-lifecycle + coalescing loop.
 func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataKindChange, error) {
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheDeltaWatch(ctx, s.cacheManager, ref.CacheID, s.dataKindsDebounce,
-		(*store.ClusterDB).Subscribe,
+		(*store.ClusterDB).ObjectsSubscribe,
 		func(ctx context.Context, db *store.ClusterDB) ([]ClusterDataKind, error) {
-			rows, err := db.KindCatalog(ctx)
+			rows, err := db.Kinds(ctx)
 			if err != nil {
 				return nil, err
 			}
-			kinds := make([]ClusterDataKind, len(rows)) // KindCatalog order: (api_version, kind)
+			kinds := make([]ClusterDataKind, len(rows)) // Kinds order: (api_version, kind)
 			for i, r := range rows {
 				kinds[i] = toDataKind(r)
 			}
@@ -530,7 +530,7 @@ func millisToTime(ms int64) time.Time {
 // retain stale rows). `subscribe` selects which of the db's brokers to follow (object
 // writes vs event writes); `snapshot` reads the current rows as an **ordered** slice
 // (the reader's order is the emit order, so the on-subscribe Added burst is stable, e.g.
-// KindCatalog's (api_version, kind)); `keyOf` derives each value's identity (the diff and
+// Kinds' (api_version, kind)); `keyOf` derives each value's identity (the diff and
 // map key); `mkChange` adapts one (ChangeType, value) into the caller's domain change. The
 // returned channel closes when ctx ends or the store shuts down. T must be comparable so a
 // changed value is detected by ==; the diff sends the last-known value on a Deleted.

@@ -321,11 +321,12 @@ type ClusterDB struct {
 	janitorDone   chan struct{}
 
 	// writes and events are two independent coalescing write-notify brokers.
-	// writes backs Subscribe/Notify — the object-write ping that drives the
-	// kind-catalog watch — while events backs EventsSubscribe/EventsNotify — the
-	// event-write ping that drives the events watch. They are kept separate so an
-	// event burst wakes only event subscribers, never the (unrelated) kind-catalog
-	// re-read.
+	// writes backs ObjectsSubscribe/ObjectsNotify — the object-write ping. It drives
+	// both the kind-catalog watch (kinds and their counts are a read projection of
+	// object writes) and the objects watch — while events backs
+	// EventsSubscribe/EventsNotify — the event-write ping that drives the events
+	// watch. They are kept separate so an event burst wakes only event subscribers,
+	// never the (unrelated) object-write re-reads.
 	writes *notifyBroker
 	events *notifyBroker
 }
@@ -395,9 +396,9 @@ func (c *ClusterDB) ID() string { return c.id }
 // Path returns the on-disk SQLite file path. Exposed for diagnostics.
 func (c *ClusterDB) Path() string { return c.path }
 
-// KindCatalogRow is one entry in the cache's kind_catalog: a kind the cluster's
+// KindRow is one entry in the cache's kind_catalog: a kind the cluster's
 // API server advertises, recorded at sync time from /apis discovery.
-type KindCatalogRow struct {
+type KindRow struct {
 	// APIVersion is the group/version, e.g. "apps/v1" or "v1" for the core group.
 	APIVersion string
 	// Kind is the Kind name, e.g. "Deployment".
@@ -413,13 +414,13 @@ type KindCatalogRow struct {
 	Count int
 }
 
-// KindCatalog reads the cache's discovered kind catalog: one row per kind the
+// Kinds reads the cache's discovered kind catalog: one row per kind the
 // cluster's API server advertises (built-ins + CRDs), ordered for stable display.
 // Each row's Count is the number of cached objects of that kind, read from the
 // trigger-maintained kind_counts aggregate (a point LEFT JOIN keyed by
 // api_version+kind, so an advertised-but-empty kind counts 0) — O(kinds), never a
 // scan of the objects table. Empty until the sync engine has populated it.
-func (c *ClusterDB) KindCatalog(ctx context.Context) ([]KindCatalogRow, error) {
+func (c *ClusterDB) Kinds(ctx context.Context) ([]KindRow, error) {
 	rows, err := c.readDB.QueryContext(ctx,
 		`SELECT kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd, COALESCE(knt.count, 0)
 		 FROM kind_catalog kc
@@ -430,10 +431,10 @@ func (c *ClusterDB) KindCatalog(ctx context.Context) ([]KindCatalogRow, error) {
 	}
 	defer rows.Close()
 
-	var out []KindCatalogRow
+	var out []KindRow
 	for rows.Next() {
 		var (
-			r     KindCatalogRow
+			r     KindRow
 			isCRD int64
 		)
 		if err := rows.Scan(&r.APIVersion, &r.Kind, &r.Resource, &r.Scope, &isCRD, &r.Count); err != nil {
@@ -580,20 +581,21 @@ func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterD
 	}, nil
 }
 
-// Subscribe returns a channel that receives a non-blocking signal after every
-// Notify call. The channel has capacity 1 — additional pings while one is
-// already buffered are coalesced (the subscriber will re-query and observe
-// every change anyway). The returned cancel func unregisters the subscriber.
+// ObjectsSubscribe returns a channel that receives a non-blocking signal after
+// every ObjectsNotify call. The channel has capacity 1 — additional pings while one
+// is already buffered are coalesced (the subscriber will re-query and observe every
+// change anyway). The returned cancel func unregisters the subscriber.
 //
-// Use this in place of polling: object-write paths call Notify after commit, and
-// long-lived readers (e.g. the sync engine's freshness tracker, the kind-catalog
-// GraphQL subscription) block on the channel to know when to re-run their query.
-func (c *ClusterDB) Subscribe() (<-chan struct{}, func()) { return c.writes.subscribe() }
+// Use this in place of polling: object-write paths call ObjectsNotify after commit,
+// and long-lived readers (e.g. the sync engine's freshness tracker, the kind-catalog
+// and objects GraphQL subscriptions) block on the channel to know when to re-run
+// their query.
+func (c *ClusterDB) ObjectsSubscribe() (<-chan struct{}, func()) { return c.writes.subscribe() }
 
-// Notify wakes every active object-write subscriber. Non-blocking: if a
+// ObjectsNotify wakes every active object-write subscriber. Non-blocking: if a
 // subscriber's channel slot is full, the existing buffered ping subsumes this one.
 // Object writers should call this after committing a batch.
-func (c *ClusterDB) Notify() { c.writes.notify() }
+func (c *ClusterDB) ObjectsNotify() { c.writes.notify() }
 
 // EventsSubscribe is Subscribe for the events table: a channel that receives a
 // coalesced signal after every EventsNotify. Kept separate from Subscribe so an

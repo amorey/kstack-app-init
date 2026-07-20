@@ -408,7 +408,7 @@ func newEngineWithOptions(cfg *rest.Config, cdb *store.ClusterDB, sink Sink, opt
 // tracker. The freshness subscription is taken synchronously so no write ping
 // from the run loop's drivers can slip past it. Call once.
 func (e *Engine) Start() {
-	pings, cancelSub := e.cdb.Subscribe()
+	pings, cancelSub := e.cdb.ObjectsSubscribe()
 	e.wg.Go(func() { e.runLoop(e.baseCtx) })
 	e.wg.Go(func() {
 		defer cancelSub()
@@ -1836,7 +1836,7 @@ func discoverGVRs(ctx context.Context, dc discovery.DiscoveryInterface, cdb *sto
 	// kind added/removed since the last run — most visibly a CRD uninstalled during an
 	// in-place restart, where the db handle doesn't change — would stay stale until the
 	// next unrelated write pinged.
-	cdb.Notify()
+	cdb.ObjectsNotify()
 
 	return out, complete, nil
 }
@@ -1897,7 +1897,7 @@ func (e *Engine) pruneOrphanedObjects(ctx context.Context, entries []gvrEntry) {
 	}
 	if n > 0 {
 		slog.Info("clustersync: pruned orphaned objects", "id", e.cdb.ID(), "rows", n)
-		e.cdb.Notify() // the raw DELETE bypasses the per-object store ping
+		e.cdb.ObjectsNotify() // the raw DELETE bypasses the per-object store ping
 	}
 	// Sweep resume cookies too, so a re-added GVR can't resume-skip its initial LIST.
 	if c, err := pruneOrphanedResumeCookies(ctx, e.cdb.Writer(), keepCookies); err != nil {

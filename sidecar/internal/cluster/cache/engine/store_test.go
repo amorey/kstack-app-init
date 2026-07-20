@@ -192,7 +192,7 @@ func TestObjectsWritePageNotifiesPerPage(t *testing.T) {
 
 	// Subscribe before the write so the ping can't race the subscription (as the
 	// GraphQL watch does).
-	pings, cancelSub := cdb.Subscribe()
+	pings, cancelSub := cdb.ObjectsSubscribe()
 	defer cancelSub()
 
 	s := newObjectsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, cdb.Writer(), cdb)
@@ -411,7 +411,7 @@ func TestEventWritesFireEventsNotify(t *testing.T) {
 	cdb := migratedCDB(t)
 	events, cancelE := cdb.EventsSubscribe()
 	defer cancelE()
-	writes, cancelW := cdb.Subscribe()
+	writes, cancelW := cdb.ObjectsSubscribe()
 	defer cancelW()
 
 	drainEventPing := func(what string) {

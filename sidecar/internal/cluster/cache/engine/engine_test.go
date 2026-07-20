@@ -172,7 +172,7 @@ func TestEngineFreshnessFlush(t *testing.T) {
 	// Drive the freshness loop alone — the run loop needs a live cluster. The
 	// subscription is taken synchronously (as Start does) so the Notify below
 	// cannot race it.
-	pings, cancelSub := cdb.Subscribe()
+	pings, cancelSub := cdb.ObjectsSubscribe()
 	defer cancelSub()
 	done := make(chan struct{})
 	go func() {
@@ -180,7 +180,7 @@ func TestEngineFreshnessFlush(t *testing.T) {
 		e.freshnessLoop(e.baseCtx, pings)
 	}()
 
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	waitFor(t, func() bool {
 		for _, st := range sink.statuses() {
 			if st.LastSyncedAt != nil && st.LastSyncedAt.Equal(at) {
@@ -209,7 +209,7 @@ func TestEngineFreshnessFinalFlushOnStop(t *testing.T) {
 		withFlushInterval(time.Hour), // far past the test's lifetime
 		withEngineNow(func() time.Time { return at }))
 
-	pings, cancelSub := cdb.Subscribe()
+	pings, cancelSub := cdb.ObjectsSubscribe()
 	defer cancelSub()
 	done := make(chan struct{})
 	go func() {
@@ -220,7 +220,7 @@ func TestEngineFreshnessFinalFlushOnStop(t *testing.T) {
 	// The ping sits in the subscription's slot (taken before the loop ran), so
 	// the shutdown drain must carry it into the final flush even if the loop
 	// never consumed it before the cancel.
-	cdb.Notify()
+	cdb.ObjectsNotify()
 	e.baseCtxCancel()
 	<-done
 
@@ -545,7 +545,7 @@ func TestDiscoverGVRsNotifiesCatalogSubscribers(t *testing.T) {
 
 	// Subscribe before discovery so the ping can't race the subscription (as the
 	// GraphQL watch does).
-	pings, cancelSub := cdb.Subscribe()
+	pings, cancelSub := cdb.ObjectsSubscribe()
 	defer cancelSub()
 
 	entries, complete, err := discoverGVRs(ctx, dc, cdb)
@@ -559,7 +559,7 @@ func TestDiscoverGVRsNotifiesCatalogSubscribers(t *testing.T) {
 		t.Fatal("discoverGVRs did not notify catalog subscribers after rewriting kind_catalog")
 	}
 
-	rows, err := cdb.KindCatalog(ctx)
+	rows, err := cdb.Kinds(ctx)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "Deployment", rows[0].Kind)
@@ -583,7 +583,7 @@ func TestDiscoverGVRsPreservesCatalogOnPartialDiscovery(t *testing.T) {
 	_, complete, err := discoverGVRs(ctx, dc, cdb)
 	require.NoError(t, err)
 	require.True(t, complete)
-	rows, err := cdb.KindCatalog(ctx)
+	rows, err := cdb.Kinds(ctx)
 	require.NoError(t, err)
 	require.Len(t, rows, 2, "complete pass records both kinds")
 
@@ -594,7 +594,7 @@ func TestDiscoverGVRsPreservesCatalogOnPartialDiscovery(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, complete)
 	require.Len(t, entries, 1, "the partial pass only discovered deployment")
-	rows, err = cdb.KindCatalog(ctx)
+	rows, err = cdb.Kinds(ctx)
 	require.NoError(t, err)
 	require.Len(t, rows, 2, "a partial discovery preserves the prior catalog rows")
 
@@ -603,7 +603,7 @@ func TestDiscoverGVRsPreservesCatalogOnPartialDiscovery(t *testing.T) {
 	_, complete, err = discoverGVRs(ctx, dc, cdb)
 	require.NoError(t, err)
 	require.True(t, complete)
-	rows, err = cdb.KindCatalog(ctx)
+	rows, err = cdb.Kinds(ctx)
 	require.NoError(t, err)
 	require.Len(t, rows, 1, "a complete discovery is authoritative and drops the removed kind")
 }
@@ -630,7 +630,7 @@ func TestDiscoverGVRsPreservesCRDMetadataWhenCRDListFails(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, complete, "ServerPreferredResources answered cleanly, so the pass is complete despite the CRD-list failure")
 
-	rows, err := cdb.KindCatalog(ctx)
+	rows, err := cdb.Kinds(ctx)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.True(t, rows[0].IsCRD, "is_crd preserved across a CRD-list failure")
