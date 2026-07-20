@@ -22,12 +22,12 @@ import (
 )
 
 // Retention controls how long aging tables hold their rows.
+//
+// Events are deliberately NOT here: their retention is server-mirrored by the sync
+// engine (a relist prunes rows the cluster no longer has — see the engine's
+// eventsReplaceSession), so the cache reflects the server's current event set rather
+// than a locally-enforced window. The janitor only sweeps tables it alone owns.
 type Retention struct {
-	// EventsTTL caps how long events stay in SQLite after their last_seen
-	// timestamp. kube-apiserver GCs events at ~1h by default; we keep
-	// longer so the agent can answer "what happened overnight" questions
-	// but still discard truly stale data.
-	EventsTTL time.Duration
 	// StatusHistoryTTL caps how long the per-object status transition
 	// timeline is retained. Volume is tiny (only writes when a summary
 	// actually changes), so a week is cheap.
@@ -40,7 +40,6 @@ type Retention struct {
 // defaultRetention is what the production sidecar uses. Tests exercise
 // sweep directly with a custom retention instead of waiting on the ticker.
 var defaultRetention = Retention{
-	EventsTTL:        24 * time.Hour,
 	StatusHistoryTTL: 7 * 24 * time.Hour,
 	Interval:         5 * time.Minute,
 }
@@ -72,19 +71,6 @@ func runJanitor(ctx context.Context, id string, writer *sql.DB, ret Retention) {
 func sweep(ctx context.Context, id string, writer *sql.DB, ret Retention) {
 	now := time.Now().UnixMilli()
 	var totalDeleted int64
-
-	// events: prefer last_seen (server's view) but fall back to
-	// updated_at (our ingest time) so an event with missing timestamps
-	// still ages out instead of living forever.
-	if res, err := writer.ExecContext(ctx,
-		`DELETE FROM events WHERE COALESCE(last_seen, updated_at) < ?`,
-		now-ret.EventsTTL.Milliseconds(),
-	); err != nil {
-		slog.Warn("janitor: events sweep failed", "id", id, "err", err)
-	} else if n, _ := res.RowsAffected(); n > 0 {
-		slog.Debug("janitor: trimmed events", "id", id, "rows", n)
-		totalDeleted += n
-	}
 
 	// status_history: keyed by the transition time `at`.
 	if res, err := writer.ExecContext(ctx,

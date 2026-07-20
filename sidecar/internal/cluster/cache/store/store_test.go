@@ -289,7 +289,10 @@ func TestCorruptFileQuarantined(t *testing.T) {
 	require.NoError(t, cdb.Reader().PingContext(ctx))
 }
 
-func TestJanitorTrimsStaleEvents(t *testing.T) {
+// The janitor does not manage event retention: events are server-mirrored by the
+// sync engine (a relist prunes rows the cluster no longer has), so a stale-looking
+// event is not the janitor's to sweep. Even a long-dead event survives a sweep.
+func TestJanitorLeavesEventsAlone(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
 	ctx := context.Background()
@@ -298,28 +301,21 @@ func TestJanitorTrimsStaleEvents(t *testing.T) {
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
 	now := time.Now().UnixMilli()
-	hourAgo := now - (60 * 60 * 1000)
 	twoDaysAgo := now - (48 * 60 * 60 * 1000)
-
-	// Two events: one within 24h, one beyond.
-	for i, last := range []int64{hourAgo, twoDaysAgo} {
-		_, err := cdb.Writer().ExecContext(ctx,
-			`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
-			 VALUES(?, 'Normal', 'Test', 'hello', ?, ?, 1, x'7b7d', ?)`,
-			"ev-"+itoa(i), last, last, now,
-		)
-		require.NoError(t, err)
-	}
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
+		 VALUES('ev-old', 'Normal', 'Test', 'hello', ?, ?, 1, x'7b7d', ?)`,
+		twoDaysAgo, twoDaysAgo, now)
+	require.NoError(t, err)
 
 	sweep(ctx, "c", cdb.Writer(), Retention{
-		EventsTTL:        24 * time.Hour,
 		StatusHistoryTTL: 7 * 24 * time.Hour,
 		Interval:         time.Minute,
 	})
 
 	var count int
 	require.NoError(t, cdb.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&count))
-	require.Equal(t, 1, count, "expected only the recent event to remain")
+	require.Equal(t, 1, count, "the janitor must not sweep events; retention is server-mirrored")
 }
 
 func TestSubscribeNotifyAndCoalesce(t *testing.T) {

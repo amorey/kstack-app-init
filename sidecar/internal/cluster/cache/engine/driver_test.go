@@ -1066,19 +1066,18 @@ func TestFullListPaginatesEvents(t *testing.T) {
 	require.Equal(t, 2, n, "both pages' events landed")
 }
 
-// A complete event relist must NOT prune rows absent from the fresh LIST — unlike
-// objects, kube-apiserver GCs events (~1h) well inside the cache's 24h EventsTTL
-// (store/janitor.go), so a relist's LIST already reflects the apiserver's forgotten
-// view. Pruning against it would delete still-retained history the moment the
-// source forgets it, defeating the janitor's whole reason for a longer TTL.
-func TestFullListEventsRelistDoesNotPruneMissingRows(t *testing.T) {
+// A complete event relist prunes rows absent from the fresh LIST, mirroring the
+// server: an event the apiserver has already GC'd (gone from the LIST) is dropped, so
+// the cache reflects the cluster's current event set. Retention is server-side, not a
+// local TTL.
+func TestFullListEventsRelistPrunesMissingRows(t *testing.T) {
 	ctx := context.Background()
 	cdb := migratedCDB(t)
 	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Event"}
 	store := newEventsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
 
-	// A baseline event the apiserver has already GC'd — absent from every LIST below,
-	// but still within the cache's retention window — must survive the relist.
+	// A baseline event the apiserver has already GC'd — absent from every LIST below.
+	// The relist mirrors the server, so it must be pruned.
 	require.NoError(t, store.upsert(mkEvt("gcd-by-apiserver")))
 
 	fs := &fakeSource{
@@ -1094,15 +1093,15 @@ func TestFullListEventsRelistDoesNotPruneMissingRows(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "e1"), "a listed event is present")
 	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "e2"), "a listed event is present")
-	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "gcd-by-apiserver"),
-		"an event absent from the LIST (already GC'd server-side) is NOT pruned — only the janitor's TTL removes it")
+	require.Equal(t, 0, countWhere(t, cdb.Writer(), "events", "uid", "gcd-by-apiserver"),
+		"an event absent from the LIST (GC'd server-side) is pruned — the cache mirrors the server")
 }
 
 // A failed partial pass leaves whatever it managed to upsert on disk (nothing rolls
-// a committed page back — see eventsReplaceSession), and a later successful relist
-// that no longer lists that row must still not remove it, for the same
-// TTL-preservation reason as a complete relist.
-func TestFullListEventsPartialPassRowsSurviveLaterRelist(t *testing.T) {
+// a committed page back — see eventsReplaceSession), but a later successful relist
+// that no longer lists that row prunes it: the delete-missing pass reconciles the
+// leftover rows against the server's current set.
+func TestFullListEventsPartialPassRowsPrunedByLaterRelist(t *testing.T) {
 	ctx := context.Background()
 	cdb := migratedCDB(t)
 	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Event"}
@@ -1124,7 +1123,7 @@ func TestFullListEventsPartialPassRowsSurviveLaterRelist(t *testing.T) {
 	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "n1"),
 		"a partial pass's upserted row is left on disk")
 
-	// Second pass completes and no longer lists n1 — it must still survive.
+	// Second pass completes and no longer lists n1 — the prune reconciles it away.
 	fresh := &fakeSource{
 		listRV: "80",
 		listPages: [][]*unstructured.Unstructured{
@@ -1134,8 +1133,8 @@ func TestFullListEventsPartialPassRowsSurviveLaterRelist(t *testing.T) {
 	d2 := newKindDriver(fresh, store, gvk, "")
 	_, err = d2.fullList(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "n1"),
-		"n1 survives a later relist that no longer lists it — no delete-missing pass ever runs")
+	require.Equal(t, 0, countWhere(t, cdb.Writer(), "events", "uid", "n1"),
+		"n1 is pruned by a later complete relist that no longer lists it")
 	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "n2"), "the surviving event is present")
 }
 

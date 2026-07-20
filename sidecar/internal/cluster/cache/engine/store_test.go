@@ -340,3 +340,63 @@ func TestPruneOrphanedKindsKeepsEverythingWhenNoneVanished(t *testing.T) {
 	require.Equal(t, 1, countObjectsByKind(t, w, "Pod", "v1"))
 	require.Equal(t, 1, countObjectsByKind(t, w, "Widget", "example.com/v1"))
 }
+
+// eventUnstructured builds a minimal v1 Event carrying just the uid extractEvent
+// needs — enough to drive a relist WritePage.
+func eventUnstructured(uid string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Event",
+		"metadata":   map[string]any{"uid": uid},
+		"type":       "Normal",
+		"reason":     "Test",
+		"message":    "hello",
+	}}
+}
+
+func insertEventRow(t *testing.T, w *sql.DB, uid string) {
+	t.Helper()
+	now := time.Now().UnixMilli()
+	_, err := w.Exec(
+		`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
+		 VALUES(?, 'Normal', 'Test', 'hello', ?, ?, 1, x'7b7d', ?)`,
+		uid, now, now, now)
+	require.NoError(t, err)
+}
+
+// An events relist mirrors the cluster: rows absent from the LIST are pruned, so
+// the cache reflects the server's current event set rather than accumulating
+// history. (This is the delete-missing behavior objects already have; events adopt
+// it now that retention is server-mirrored, not TTL-managed.)
+func TestEventsReplaceSessionPrunesMissing(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+
+	// Prior cache state: e1, e2 already cached.
+	insertEventRow(t, w, "e1")
+	insertEventRow(t, w, "e2")
+
+	// A relist that no longer includes e1 and adds e3 — the server's current view.
+	s := newEventsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Event"}, w, cdb)
+	sess, err := s.BeginReplace(ctx)
+	require.NoError(t, err)
+	require.NoError(t, sess.WritePage([]*unstructured.Unstructured{
+		eventUnstructured("e2"), eventUnstructured("e3"),
+	}))
+	require.NoError(t, sess.Commit("100"))
+
+	got := map[string]struct{}{}
+	rows, err := w.QueryContext(ctx, `SELECT uid FROM events ORDER BY uid`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var uid string
+		require.NoError(t, rows.Scan(&uid))
+		got[uid] = struct{}{}
+	}
+	require.NoError(t, rows.Err())
+
+	require.Equal(t, map[string]struct{}{"e2": {}, "e3": {}}, got,
+		"relist mirrors the server: e1 pruned, e2 kept, e3 added")
+}

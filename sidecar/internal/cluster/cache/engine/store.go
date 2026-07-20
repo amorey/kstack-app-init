@@ -551,37 +551,46 @@ func (s *eventsStore) ApplyChange(t watch.EventType, u *unstructured.Unstructure
 	}
 }
 
-// BeginReplace opens a streaming full-LIST reconcile for the events table.
-// Deliberately NO delete-missing pass, unlike objects: kube-apiserver GCs events at
-// ~1h by default, well inside the cache's 24h EventsTTL (store/janitor.go) — the
-// whole point of that longer retention is to answer "what happened overnight" after
-// the apiserver has already forgotten. A relist's LIST reflects the apiserver's
-// current (already-GC'd) view, so pruning rows absent from it would delete
-// still-retained history the moment the source forgets it, defeating the janitor's
-// job. So a relist only upserts each page's rows; every row's removal is either an
-// explicit watch Deleted (ApplyChange) or the janitor's TTL sweep — never a relist.
+// BeginReplace opens a streaming full-LIST reconcile for the events table. Like
+// objects, it runs a delete-missing prune (in Commit) so the cache mirrors the
+// server's current event set — a row absent from the LIST is dropped. Retention is
+// therefore whatever the server enforces (--event-ttl); the janitor no longer manages
+// events. Every row's removal is a relist prune, an explicit watch Deleted
+// (ApplyChange), or the two combined.
 //
 // Clearing the resume cookie (per the kindStore.BeginReplace contract) is DEFERRED to
 // the first WritePage, matching objectsStore: a pass that fails before any page is
 // written leaves the untouched snapshot's cookie intact so the next start resumes
-// cheaply. For events that clear isn't load-bearing anyway — ResumeRV is unguarded
-// and a relist never prunes, so resuming from a pre-pass cookie after a crash would be
-// harmless (the watch either succeeds or 410s into a fresh fullList) — but riding the
-// same deferred-clear shape keeps the two stores uniform.
+// cheaply. Now that a relist prunes, this clear is load-bearing — a pass that fails
+// after writing pages but before Commit leaves no cookie, so the next start cold-LISTs
+// and its prune reconciles the leftover rows instead of resuming past them.
 //
 // eventsStore does NOT implement metadataDiffStore (the events table has no
 // resource_version column), so fullResync's type assertion routes events to a
 // plain full LIST.
 func (s *eventsStore) BeginReplace(context.Context) (replaceSession, error) {
-	return &eventsReplaceSession{s: s}, nil
+	return &eventsReplaceSession{s: s, keep: make(map[string]struct{})}, nil
 }
 
-// eventsReplaceSession streams a paginated event relist, upserting each page with no
-// delete-missing pass (see BeginReplace) — so there is nothing to track for a prune.
-// Committed pages are never reverted: a partial pass simply leaves whatever it
-// managed to upsert, same as a successful one.
+// eventsReplaceSession streams a paginated event relist into the events table,
+// mirroring the cluster: each page's uids accumulate in `keep` and Commit runs a
+// delete-missing prune against their union, so a row absent from the server's LIST
+// is dropped. The cache reflects the server's current event set (inheriting
+// whatever server-side retention --event-ttl enforces) rather than accumulating
+// history; the janitor no longer manages event retention. Unlike objectsReplaceSession
+// the prune isn't scoped by (kind, api_version): Event is a single kind in its own
+// table, so every row is in this session's scope.
+//
+// Per-page commits trade single-transaction atomicity for the memory bound (same as
+// objects): a pass that fails mid-pagination leaves its committed pages visible until
+// the next pass's prune reconciles them. The first WritePage clears the resume cookie
+// (rewritten only on Commit) in the same transaction that lands the first rows, so
+// partial state and a stale "sync completed" cookie can never coexist — a pass that
+// fails before Commit leaves no cookie and the next start cold-LISTs, whose prune
+// reconciles the leftover rows.
 type eventsReplaceSession struct {
 	s             *eventsStore
+	keep          map[string]struct{}
 	cookieCleared bool // whether the first WritePage has durably cleared the resume cookie
 }
 
@@ -609,6 +618,7 @@ func (r *eventsReplaceSession) WritePage(items []*unstructured.Unstructured) err
 		if err != nil {
 			continue
 		}
+		r.keep[row.UID] = struct{}{}
 		if err := r.s.insertEventRow(tx, row, now); err != nil {
 			return err
 		}
@@ -620,16 +630,47 @@ func (r *eventsReplaceSession) WritePage(items []*unstructured.Unstructured) err
 	return nil
 }
 
-// Commit persists the resume cookie; no prune (see BeginReplace). The cookie's two
-// cluster_meta writes (last_list_rv + last_list_at) go in ONE transaction so a
-// failed persist can't leave last_list_rv durably advanced — which would resume the
-// next watch from a newer RV and skip the Added events before it.
+// Commit runs the delete-missing prune (against the union of all pages' uids in
+// `keep`) then persists the resume cookie, so the cache mirrors the server's current
+// event set. The prune's per-row deletes fire the events_kind_count triggers, keeping
+// the kind_counts Event tally exact. The cookie's two cluster_meta writes (last_list_rv
+// + last_list_at) go in ONE transaction so a failed persist can't leave last_list_rv
+// durably advanced — which would resume the next watch from a newer RV and skip the
+// Added events before it.
 func (r *eventsReplaceSession) Commit(resourceVersion string) error {
 	tx, err := r.s.writer.BeginTx(r.s.ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
+
+	// Delete-missing: every event row not seen in this relist is gone from the
+	// server. Not scoped by kind — Event owns the whole events table.
+	rows, err := tx.QueryContext(r.s.ctx, `SELECT uid FROM events`)
+	if err != nil {
+		return err
+	}
+	var stale []string
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			rows.Close()
+			return err
+		}
+		if _, ok := r.keep[uid]; !ok {
+			stale = append(stale, uid)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, uid := range stale {
+		if _, err := tx.ExecContext(r.s.ctx, `DELETE FROM events WHERE uid=?`, uid); err != nil {
+			return err
+		}
+	}
+
 	if err := persistListRVMeta(r.s.ctx, tx, r.s.gvk, resourceVersion); err != nil {
 		return err
 	}
@@ -640,9 +681,12 @@ func (s *eventsStore) PersistRV(ctx context.Context, rv string) error {
 	return persistListRVMeta(ctx, s.writer, s.gvk, rv)
 }
 
-// ResumeRV returns the event kind's resume cookie unguarded: events live in their own
-// table (with a TTL) and aren't subject to the objects-table remove/re-add churn the
-// objectsStore guard defends against, so a persisted cookie always resumes.
+// ResumeRV returns the event kind's resume cookie unguarded: Event is a single,
+// always-present kind in its own table, so it isn't subject to the objects-table
+// remove/re-add churn the objectsStore existence-guard defends against. A completed
+// relist's cookie always validly resumes (even against an empty table — the relist
+// reconciled it); a partial pass cleared the cookie on its first WritePage, so the
+// next start cold-LISTs and its prune reconciles the leftover rows.
 func (s *eventsStore) ResumeRV(ctx context.Context) (string, error) {
 	return readLastListRV(ctx, s.writer, s.gvk)
 }
