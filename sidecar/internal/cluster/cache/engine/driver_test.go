@@ -55,9 +55,8 @@ type fakeSource struct {
 	// an expired continue token.
 	expireWithGone bool
 	// expireEveryContinue makes EVERY List with a non-empty Continue 410 (never
-	// cleared) — the persistent-expiry case where paginated restarts can't complete,
-	// so fullList must fall back to an unpaginated LIST (opts.Limit 0). In paginated
-	// mode a Limit-0 call returns all pages flattened with no continue token.
+	// cleared) — the persistent-expiry case where paginated restarts can't complete, so
+	// fullList exhausts its restart budget and returns errListRestartBudget.
 	expireEveryContinue bool
 	listContinues       []string // continue token passed on each List call, in order
 	listLimits          []int64  // Limit passed on each List call, in order
@@ -68,27 +67,55 @@ type fakeSource struct {
 
 	getByName map[string]*unstructured.Unstructured
 
+	// listEntered, if non-nil, receives a signal (non-blocking) at the top of every
+	// List call — a test seam for observing WHEN a driver reaches its LIST, used to
+	// assert the concurrency limiter gates it.
+	listEntered chan struct{}
+	// listBlock, if non-nil, makes List block (after signaling listEntered) until the
+	// channel is closed/sent or ctx is cancelled — lets a test hold the driver inside its
+	// LIST, e.g. to observe it holds a listLimiter slot across the list-heavy work.
+	listBlock chan struct{}
+
 	// watchers, if non-nil, receives a fresh FakeWatcher on each Watch call so a
 	// test can push events into it. autoExpireFirst makes the first Watch deliver
 	// a 410 on its own (no test coordination needed). watchErr makes every Watch
-	// fail to establish (e.g. list-but-not-watch RBAC).
+	// fail to establish (e.g. list-but-not-watch RBAC). watchBlocks makes every Watch
+	// hang until its ctx is cancelled (a wedged watch request whose headers never arrive,
+	// so onConnect never fires and RetryWatcher never closes its ResultChan).
 	watchers        chan *watch.FakeWatcher
 	autoExpireFirst bool
 	watchErr        error
+	watchBlocks     bool
 
 	listCalls, metaCalls, getCalls, watchCalls int
 }
 
 var _ kubeSource = (*fakeSource)(nil)
 
-func (f *fakeSource) List(_ context.Context, opts metav1.ListOptions) ([]*unstructured.Unstructured, string, string, error) {
+func (f *fakeSource) List(ctx context.Context, opts metav1.ListOptions) ([]*unstructured.Unstructured, string, string, error) {
 	f.mu.Lock()
 	i := f.listCalls
 	f.listCalls++
 	f.listContinues = append(f.listContinues, opts.Continue)
 	f.listLimits = append(f.listLimits, opts.Limit)
+	if f.listEntered != nil {
+		select {
+		case f.listEntered <- struct{}{}:
+		default:
+		}
+	}
+	block := f.listBlock
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return nil, "", "", ctx.Err()
+		}
+	}
+	f.mu.Lock()
 	// A persistent Continue-token expiry: every paginated continue fails, forever, so
-	// the restarts can't make progress and fullList must fall back to unpaginated.
+	// the restarts can't make progress and fullList exhausts its budget (errListRestartBudget).
 	if f.expireEveryContinue && opts.Continue != "" {
 		f.mu.Unlock()
 		return nil, "", "", apierrors.NewResourceExpired("continue token expired")
@@ -109,15 +136,6 @@ func (f *fakeSource) List(_ context.Context, opts metav1.ListOptions) ([]*unstru
 	}
 	// Paginated mode: resolve the requested page by continue token.
 	if f.listPages != nil {
-		// An unpaginated LIST (Limit 0, no Continue — the fullList fallback) returns
-		// every page's objects at once with no continue token.
-		if opts.Limit == 0 && opts.Continue == "" {
-			var all []*unstructured.Unstructured
-			for _, p := range f.listPages {
-				all = append(all, p...)
-			}
-			return all, "", f.listRV, nil
-		}
 		idx := 0
 		if opts.Continue != "" {
 			// tokens are "page-<n>" pointing at listPages[n]
@@ -167,11 +185,16 @@ func (f *fakeSource) Get(_ context.Context, ns, name string) (*unstructured.Unst
 	return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "objects"}, name)
 }
 
-func (f *fakeSource) Watch(context.Context, metav1.ListOptions) (watch.Interface, error) {
+func (f *fakeSource) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 	f.mu.Lock()
 	n := f.watchCalls
 	f.watchCalls++
+	blocks := f.watchBlocks
 	f.mu.Unlock()
+	if blocks {
+		<-ctx.Done() // a wedged watch request: hangs until RetryWatcher (rw.Stop) cancels it
+		return nil, ctx.Err()
+	}
 	if f.watchErr != nil {
 		return nil, f.watchErr
 	}
@@ -192,6 +215,12 @@ func (f *fakeSource) counts() (list, meta, get int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.listCalls, f.metaCalls, f.getCalls
+}
+
+func (f *fakeSource) watchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.watchCalls
 }
 
 // setWatchErr toggles whether Watch fails to establish (stand-in for WATCH RBAC being
@@ -429,6 +458,101 @@ func TestFullResyncRecordsResyncWorkViaFullList(t *testing.T) {
 	require.Equal(t, 2, d.resyncObjects, "counts every listed body")
 }
 
+// --- cold-start LIST concurrency limiter --------------------------------------
+
+// A size-1 limiter admits exactly one holder; a second acquire blocks until the
+// first releases its slot, then proceeds.
+func TestListLimiterBoundsConcurrency(t *testing.T) {
+	lim := newListLimiter(1)
+	rel1, err := lim.acquire(context.Background())
+	require.NoError(t, err)
+
+	acquired := make(chan func(), 1)
+	go func() {
+		r, aerr := lim.acquire(context.Background())
+		require.NoError(t, aerr)
+		acquired <- r
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("second acquire must block while the only slot is held")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	rel1() // free the slot
+	select {
+	case r := <-acquired:
+		r()
+	case <-time.After(time.Second):
+		t.Fatal("second acquire must proceed once the slot frees")
+	}
+}
+
+// acquire honours ctx cancellation while queued, returning the ctx error rather
+// than blocking forever, and its returned release is a safe no-op.
+func TestListLimiterAcquireRespectsCtx(t *testing.T) {
+	lim := newListLimiter(1)
+	rel, err := lim.acquire(context.Background())
+	require.NoError(t, err)
+	defer rel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	release, err := lim.acquire(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	release() // must not panic or over-release the held slot
+}
+
+// A nil limiter (drivers built directly in unit tests) imposes no bound and its
+// release is a no-op, so callers can defer it unconditionally.
+func TestNilListLimiterNoBound(t *testing.T) {
+	var lim listLimiter
+	rel, err := lim.acquire(context.Background())
+	require.NoError(t, err)
+	rel()
+}
+
+// fullResync acquires a limiter slot BEFORE its LIST and holds it across the list-heavy
+// work — the memory bound that keeps cold-start peak O(N pages) regardless of kind count.
+// Verified deterministically: the LIST blocks, and once it's entered the sole slot is
+// observably taken (a synchronous len(lim), not a timing window); on return it's freed.
+// If fullResync listed WITHOUT acquiring, the slot would read free while inside the LIST.
+func TestFullResyncHoldsListLimiterSlotDuringLIST(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+	fs := &fakeSource{
+		listObjs:    []*unstructured.Unstructured{uObj("p1", "v1", "Pod", "default", "p1", "10")},
+		listRV:      "10",
+		listEntered: make(chan struct{}, 1),
+		listBlock:   make(chan struct{}), // hold the driver inside its LIST until released
+	}
+
+	lim := newListLimiter(1)
+	d := newKindDriverWithOptions(fs, store, podGVK(), "", withListLimiter(lim))
+	done := make(chan string, 1)
+	go func() { rv, _ := d.fullResync(ctx); done <- rv }()
+
+	// The LIST is reached only after a slot is acquired.
+	select {
+	case <-fs.listEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fullResync never reached its LIST")
+	}
+	// While inside the LIST it holds the sole slot — a synchronous, race-free check.
+	require.Equal(t, 1, len(lim), "the LIST runs while holding the limiter slot")
+
+	close(fs.listBlock) // let the LIST finish
+	select {
+	case rv := <-done:
+		require.Equal(t, "10", rv)
+	case <-time.After(2 * time.Second):
+		t.Fatal("fullResync did not finish after listing")
+	}
+	require.Equal(t, 0, len(lim), "the slot is released when fullResync returns")
+}
+
 // A uid present in the cache but absent from the live metadata list is deleted.
 func TestMetadataDiffDeletesMissing(t *testing.T) {
 	ctx := context.Background()
@@ -551,15 +675,17 @@ func TestBookmarkHoldsRVUntilDeltasApplied(t *testing.T) {
 
 	// The tap forwarded two deltas the apply loop hasn't stored yet — a bookmark
 	// past them must hold the cookie, but still prove the watch is alive. Epoch 0 is
-	// the driver's initial watchEpoch (no watch phase has retired it).
-	d.deltaSeen.Store(2)
-	d.onBookmark(ctx, 0, "205")
+	// the driver's initial watchEpoch (no watch phase has retired it). seen/applied are
+	// the phase-local counters onBookmark compares (see watchPhase).
+	var seen, applied atomic.Int64
+	seen.Store(2)
+	d.onBookmark(ctx, 0, &seen, &applied, "205")
 	require.Equal(t, at, d.liveAt(), "the bookmark stamps liveness even while the cookie is held")
 	require.Empty(t, metaValue(t, cdb, "v1/Pod.last_list_rv"), "cookie held while deltas are un-applied")
 
 	// Once both deltas are durable, the next bookmark advances the cookie.
-	d.deltaApplied.Store(2)
-	d.onBookmark(ctx, 0, "206")
+	applied.Store(2)
+	d.onBookmark(ctx, 0, &seen, &applied, "206")
 	require.Equal(t, "206", metaValue(t, cdb, "v1/Pod.last_list_rv"), "cookie advances once applied catches up")
 }
 
@@ -757,10 +883,10 @@ func TestFullListRestartsOnBareGone(t *testing.T) {
 
 // When paginated restarts can't complete — a Continue token that keeps expiring at the
 // same point every pass (a kind whose full paginated pass outlives the token lifetime)
-// — fullList spends its restart budget then falls back to ONE unpaginated LIST rather
-// than erroring, so the kind completes instead of wedging in an endless heavy-LIST
-// cycle (client-go's FullListIfExpired).
-func TestFullListFallsBackToUnpaginatedOnPersistentExpiry(t *testing.T) {
+// — fullList spends its restart budget then returns errListRestartBudget rather than
+// falling back to a whole-kind unpaginated LIST (which would defeat the memory bound).
+// The caller's error budget surfaces the kind; no unpaginated LIST is ever issued.
+func TestFullListErrorsOnPersistentExpiry(t *testing.T) {
 	ctx := context.Background()
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
@@ -776,24 +902,22 @@ func TestFullListFallsBackToUnpaginatedOnPersistentExpiry(t *testing.T) {
 	}
 	d := newKindDriver(fs, store, podGVK(), "")
 
-	rv, err := d.fullList(ctx)
-	require.NoError(t, err, "persistent continue-token expiry is recovered by an unpaginated LIST")
-	require.Equal(t, "60", rv)
-	require.Equal(t, 2, countObjectsByKind(t, w, "Pod", "v1"), "the unpaginated fallback lists every object")
+	_, err := d.fullList(ctx)
+	require.ErrorIs(t, err, errListRestartBudget, "persistent continue-token expiry surfaces as an error, not a fallback")
 
-	// The paginated pass retries maxListRestarts times (each 410ing on "page-1"), then
-	// the final call is the unpaginated fallback: Limit 0, no continue token.
+	// The initial pass plus each restart 410s on "page-1"; then it gives up — no LIST is
+	// ever issued unpaginated (Limit 0).
 	limits, conts := fs.limitsSeen(), fs.continuesSeen()
-	require.Equal(t, int64(0), limits[len(limits)-1], "the fallback LIST is unpaginated (Limit 0)")
-	require.Equal(t, "", conts[len(conts)-1], "the fallback LIST starts from the top with no continue token")
-
+	for _, l := range limits {
+		require.Equal(t, int64(listPageSize), l, "every LIST stays paginated — no unpaginated fallback")
+	}
 	page1s := 0
 	for _, c := range conts {
 		if c == "page-1" {
 			page1s++
 		}
 	}
-	require.Equal(t, maxListRestarts+1, page1s, "the initial pass plus each restart 410 on the continue token before the fallback")
+	require.Equal(t, maxListRestarts+1, page1s, "the initial pass plus each restart 410 on the continue token before giving up")
 }
 
 // BeginReplace defers the resume-cookie delete to the first WritePage, so a relist
@@ -837,14 +961,16 @@ func TestBookmarkStragglerDoesNotResurrectCookie(t *testing.T) {
 	d := newKindDriver(nil, s, gvk, "")
 
 	// The driver has moved to epoch 1 (its watch phase retired). A bookmark still
-	// carrying epoch 0 is a straggler — it must not write the cookie.
+	// carrying epoch 0 is a straggler — it must not write the cookie. seen/applied are
+	// zero (no deltas), so the applied-caught-up gate passes and only the epoch fences it.
+	var seen, applied atomic.Int64
 	d.watchEpoch = 1
-	d.onBookmark(ctx, 0, "999")
+	d.onBookmark(ctx, 0, &seen, &applied, "999")
 	require.Empty(t, metaValue(t, cdb, lastListRVKey(gvk)),
 		"a straggler bookmark from a retired watch phase does not persist the cookie")
 
 	// A bookmark whose epoch matches the current one advances the cookie normally.
-	d.onBookmark(ctx, 1, "1000")
+	d.onBookmark(ctx, 1, &seen, &applied, "1000")
 	require.Equal(t, "1000", metaValue(t, cdb, lastListRVKey(gvk)),
 		"a bookmark from the current watch phase persists normally")
 }
@@ -1099,6 +1225,117 @@ func TestFullResyncBacksOffOnListError(t *testing.T) {
 	require.Equal(t, 4*d.backoffInit, sleeps[2], "third backoff doubled again")
 }
 
+// After stuckThreshold consecutive resync failures the driver marks itself stuck and
+// fires onStuck exactly once — the signal that retires its catch-up token so a kind
+// that can never sync stops blocking the milestone and gets surfaced by staleLaggards.
+func TestDriverMarksStuckAfterRepeatedFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+
+	fs := &fakeSource{} // every resync yields no usable resourceVersion → a failure
+	var stuckCalls atomic.Int64
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	d := newKindDriverWithOptions(fs, store, podGVK(), "", withSleep(noSleep), withStuckThreshold(3))
+	d.onStuck = func() { stuckCalls.Add(1) }
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	waitFor(t, func() bool { return d.isStuck() }, "driver becomes stuck after repeated failures")
+	waitFor(t, func() bool { return stuckCalls.Load() == 1 }, "onStuck fires when the budget is spent")
+	require.Equal(t, CauseListFailed, d.stuckCause(), "a kind that can't LIST reports ListFailed")
+
+	cancel()
+	<-done
+	require.Equal(t, int64(1), stuckCalls.Load(), "onStuck is one-shot even as failures continue")
+}
+
+// A successful resync clears the stuck flag — a kind that recovers is no longer
+// surfaced as stale. Driven deterministically by gating each backoff sleep so the test
+// steps the driver failure-by-failure.
+func TestDriverClearsStuckOnRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+
+	// Three LISTs fail (→ stuck at threshold 3); the fourth (outcomes exhausted) succeeds.
+	fs := &fakeSource{
+		listOutcomes: []bool{true, true, true},
+		listObjs:     []*unstructured.Unstructured{uObj("p1", "v1", "Pod", "default", "p1", "10")},
+		listRV:       "10",
+		watchers:     make(chan *watch.FakeWatcher, 4),
+	}
+	sleeps := make(chan struct{})
+	proceed := make(chan struct{})
+	gatedSleep := func(sctx context.Context, _ time.Duration) error {
+		select {
+		case sleeps <- struct{}{}:
+		case <-sctx.Done():
+			return sctx.Err()
+		}
+		select {
+		case <-proceed:
+			return nil
+		case <-sctx.Done():
+			return sctx.Err()
+		}
+	}
+	d := newKindDriverWithOptions(fs, store, podGVK(), "", withSleep(gatedSleep), withStuckThreshold(3))
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	for i := 1; i <= 3; i++ {
+		select {
+		case <-sleeps:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected a backoff sleep after failure %d", i)
+		}
+		if i < 3 {
+			require.False(t, d.isStuck(), "not stuck before the threshold")
+		} else {
+			require.True(t, d.isStuck(), "stuck once the budget is spent")
+		}
+		proceed <- struct{}{}
+	}
+	// The fourth attempt lists successfully → resync completes → stuck clears.
+	waitFor(t, func() bool { return !d.isStuck() }, "stuck clears after a successful resync")
+
+	cancel()
+	<-done
+}
+
+// Regression (P2): a previously-stuck driver whose cookie-resume watch merely OPENS then
+// immediately 410s must NOT clear the stuck flag on the bare connection. onConnect proves
+// only that the HTTP stream opened, not that it's usable — clearing stuck there would let
+// the milestone/liveness monitor report Watching (or refresh liveness in an open-then-error
+// loop) for a kind whose stream is unusable. The flag clears only at the usability proof
+// that fires onWatch (a delta, a clean-resume grace, or a fresh-RV connect); a watch that
+// opens then errors before proving usable leaves the kind stuck.
+func TestStuckNotClearedByBareWatchOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+
+	// autoExpireFirst: the (cookie-resume) watch opens — firing onConnect — then 410s before
+	// any delta or the resume grace, so this phase yields no usability proof.
+	fs := &fakeSource{autoExpireFirst: true}
+	// seedRV non-empty → cookie-resume path (didResync=false), so connecting alone is not the
+	// catch-up proof and fireOnWatch is deferred to a delta / clean grace.
+	d := newKindDriverWithOptions(fs, store, podGVK(), "5")
+	d.stuck.Store(true) // enter the phase already stuck
+
+	progressed, established, err := d.watchPhase(ctx, "5")
+	require.False(t, progressed, "no delta was applied")
+	require.True(t, established, "the watch opened, so onConnect fired")
+	require.ErrorIs(t, err, errExpired, "and then immediately 410'd")
+	require.True(t, d.isStuck(), "a bare open-then-410 must NOT clear the stuck flag")
+}
+
 // Regression: a kind whose LIST succeeds but WATCH is unusable (e.g.
 // list-but-not-watch RBAC, or an aggregated API that rejects watch) must back
 // off between attempts rather than hot-looping full LISTs. The watch never makes
@@ -1129,4 +1366,193 @@ func TestUnwatchableKindBacksOff(t *testing.T) {
 	require.Equal(t, d.backoffInit, sleeps[0], "first backoff is the initial")
 	require.Equal(t, 2*d.backoffInit, sleeps[1], "backoff grows across unwatchable retries")
 	require.Equal(t, 4*d.backoffInit, sleeps[2], "and keeps growing — not a hot loop")
+}
+
+// A kind that can LIST but never WATCH (list-but-not-watch RBAC) must eventually surface
+// as stuck. fullResync keeps succeeding — which alone would reset the budget forever — but
+// the watch never establishes, so that counts against the budget instead. And because
+// liveness is stamped only on real establishment (not on watch-phase entry), the driver's
+// lastLiveAt never advances, so it can't hide as healthy. Regression for the
+// "silently stale while the engine reports healthy" gap.
+func TestListButNotWatchBecomesStuck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+
+	fs := &fakeSource{
+		metaErr:  fmt.Errorf("no metadata endpoint"), // keep every resync on the full-LIST path (LIST succeeds)
+		listObjs: []*unstructured.Unstructured{uObj("a", "v1", "Pod", "default", "a", "2")},
+		listRV:   "60",
+		watchErr: apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "", fmt.Errorf("cannot watch")),
+	}
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	d := newKindDriverWithOptions(fs, store, podGVK(), "", withSleep(noSleep), withStuckThreshold(3))
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	waitFor(t, func() bool { return d.isStuck() }, "list-but-not-watch surfaces as stuck")
+	require.True(t, d.liveAt().IsZero(), "a watch that never established never stamps liveness")
+	require.Equal(t, CauseWatchFailed, d.stuckCause(), "list-but-not-watch reports WatchFailed, not ListFailed")
+
+	cancel()
+	<-done
+}
+
+// Regression (P1): a cold-start driver (didResync path) whose LIST succeeds but WATCH is
+// forbidden must NOT fire onWatch just because it entered its watch phase — the fresh
+// post-resync RV is real, but firing on entry would retire the catch-up token and report a
+// clean sync a kind that has no watch never achieved. onWatch fires only once the watch
+// actually ESTABLISHES; a never-establishing watch instead spends the error budget and goes
+// stuck, so the milestone surfaces it as stale rather than a false EngineWatching.
+func TestOnWatchWaitsForEstablishmentWhenWatchForbidden(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+
+	fs := &fakeSource{
+		metaErr:  fmt.Errorf("no metadata endpoint"), // keep every re-sync on the full-LIST path (LIST succeeds)
+		listObjs: []*unstructured.Unstructured{uObj("a", "v1", "Pod", "default", "a", "2")},
+		listRV:   "60",
+		watchErr: apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "", fmt.Errorf("cannot watch")),
+	}
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	var mu sync.Mutex
+	onWatchCalls := 0
+	d := newKindDriverWithOptions(fs, store, podGVK(), "", withSleep(noSleep), withStuckThreshold(3))
+	d.onWatch = func(bool, int) { mu.Lock(); onWatchCalls++; mu.Unlock() }
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	waitFor(t, func() bool { return d.isStuck() }, "a list-but-not-watch cold start goes stuck")
+	cancel()
+	<-done
+
+	mu.Lock()
+	require.Zero(t, onWatchCalls, "onWatch must not fire before the watch establishes — no false catch-up")
+	mu.Unlock()
+}
+
+// immediateTimer is a graceTimer/establishTimer seam that fires the instant it's armed, so a
+// test drives the resume-grace / establishment-timeout deterministically without a real clock.
+func immediateTimer(time.Duration) (<-chan time.Time, func()) {
+	ch := make(chan time.Time, 1)
+	ch <- time.Time{}
+	return ch, func() {}
+}
+
+// Regression (P1): a watch that never CONNECTS must not block watchPhase forever. When the
+// watch request hangs (headers never arrive), RetryWatcher never closes its ResultChan and
+// onConnect never fires — without the establishment timeout the driver would sit in its watch
+// phase indefinitely, never spending the error budget and holding its catch-up token, wedging
+// the engine in Syncing. The bounded wait charges CauseWatchFailed instead, so the kind
+// surfaces as stuck.
+func TestWatchThatNeverConnectsBecomesStuck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+
+	// LIST succeeds so only the WATCH fails; the watch request hangs (never connects).
+	fs := &fakeSource{
+		metaErr:     fmt.Errorf("no metadata endpoint"),
+		listObjs:    []*unstructured.Unstructured{uObj("a", "v1", "Pod", "default", "a", "2")},
+		listRV:      "60",
+		watchBlocks: true,
+	}
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	d := newKindDriverWithOptions(fs, store, podGVK(), "",
+		withSleep(noSleep), withStuckThreshold(3), withEstablishTimer(immediateTimer))
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	waitFor(t, func() bool { return d.isStuck() }, "a watch that never connects surfaces as stuck")
+	require.Equal(t, CauseWatchFailed, d.stuckCause(), "the establishment timeout charges WatchFailed")
+	require.True(t, d.liveAt().IsZero(), "a watch that never connected never stamps liveness")
+
+	cancel()
+	<-done
+}
+
+// Regression: a list-OK / watch-denied kind must not re-run a full re-sync every retry cycle.
+// fullResync obtains a valid resourceVersion; the watch then fails only to ESTABLISH
+// (errWatchNotEstablished). Because that leaves the RV valid — nothing expired it, the
+// connection just never came up — Run keeps it and retries the watch from it, rather than
+// clearing it and re-listing the whole kind's metadata on every backoff/stuck cycle
+// (perpetually once stuck at the slow cadence). So across many establishment failures the
+// source is LISTed exactly once.
+func TestWatchDeniedDoesNotRelistEveryCycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+
+	// Cold start (no seed RV) so the first iteration re-syncs via a full LIST; the watch then
+	// hangs forever (never connects), so every watch phase times out establishing.
+	fs := &fakeSource{
+		metaErr:     fmt.Errorf("no metadata endpoint"),
+		listObjs:    []*unstructured.Unstructured{uObj("a", "v1", "Pod", "default", "a", "2")},
+		listRV:      "60",
+		watchBlocks: true,
+	}
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	d := newKindDriverWithOptions(fs, store, podGVK(), "",
+		withSleep(noSleep), withStuckThreshold(3), withEstablishTimer(immediateTimer))
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	// Let many establishment-failure cycles elapse (stuck trips at 3; keep going well past it,
+	// noSleep makes even the stuck cadence instant) so a per-cycle re-list would be obvious.
+	waitFor(t, func() bool { return d.isStuck() }, "the never-connecting kind surfaces as stuck")
+	waitFor(t, func() bool { return fs.watchCount() >= 6 },
+		"the driver keeps retrying the watch across cycles")
+
+	list, _, _ := fs.counts()
+	require.Equal(t, 1, list, "the valid RV is retained across establishment failures — no re-list per cycle")
+
+	cancel()
+	<-done
+}
+
+// Regression (P2): the resume grace must be armed only AFTER the watch connects. Here the
+// watch never connects and the grace timer fires the instant it's armed — so if watchPhase
+// armed the grace at entry (the bug), it would fire onWatch and mis-report a clean resume
+// while no watch exists. It must not: the grace is armed from onConnect (which never happens),
+// so onWatch never fires and the never-connecting kind surfaces as stuck instead.
+func TestResumeGraceDoesNotFireBeforeConnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+
+	fs := &fakeSource{
+		metaErr:     fmt.Errorf("no metadata endpoint"),
+		listObjs:    []*unstructured.Unstructured{uObj("a", "v1", "Pod", "default", "a", "2")},
+		listRV:      "60",
+		watchBlocks: true, // never connects, so the grace must never be armed
+	}
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	var mu sync.Mutex
+	onWatchCalls := 0
+	// A warm resume (valid seed RV) — the cookie path, which is the one that arms the grace.
+	d := newKindDriverWithOptions(fs, store, podGVK(), "100",
+		withSleep(noSleep), withStuckThreshold(3),
+		withGraceTimer(immediateTimer), withEstablishTimer(immediateTimer))
+	d.onWatch = func(bool, int) { mu.Lock(); onWatchCalls++; mu.Unlock() }
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	waitFor(t, func() bool { return d.isStuck() }, "a never-connecting warm resume still surfaces as stuck")
+	cancel()
+	<-done
+
+	mu.Lock()
+	require.Zero(t, onWatchCalls, "the resume grace must not fire a clean-resume onWatch before the watch connects")
+	mu.Unlock()
 }

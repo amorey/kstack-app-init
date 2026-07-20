@@ -45,7 +45,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -86,15 +85,15 @@ const (
 	// EngineSyncing means the engine is starting or catching the cache up:
 	// discovery walk, or at least one driver still pre-first-watch.
 	EngineSyncing EngineState = "Syncing"
-	// EngineWatching means the initial discovery cohort has all entered their
-	// watch phase — the cache is caught up on the kinds present when the run
-	// started and is streaming deltas. A kind discovered mid-run (a CRD or
-	// aggregated API installed after catch-up) joins WITHOUT regressing this
-	// state: it doesn't gate the milestone, so the engine stays Watching while
-	// that late driver does its first LIST. The liveness monitor gives each such
-	// driver a bounded startup grace (staleLaggards) and flips the engine to
-	// EngineStale only if it never reaches its watch phase — so a late driver
-	// that can't LIST/watch surfaces as Stale, not as a silently-Watching gap.
+	// EngineWatching means the initial discovery cohort has all resolved — each driver
+	// either entered its watch phase OR exhausted its resync error budget (stuck) — and
+	// the cache is streaming deltas for the kinds that synced. A stuck initial kind
+	// doesn't wedge the engine in Syncing: it retires its milestone token so the engine
+	// reaches Watching for the healthy kinds, and the liveness monitor then surfaces the
+	// stuck kind as EngineStale (naming it). A kind discovered mid-run joins WITHOUT
+	// regressing this state — it doesn't gate the milestone — and likewise surfaces as
+	// EngineStale if it gets stuck, so a kind that can't LIST/watch is never a
+	// silently-Watching gap.
 	EngineWatching EngineState = "Watching"
 	// EngineErrored means the engine hit an engine-level failure (discovery,
 	// client construction) and is retrying with backoff.
@@ -106,6 +105,35 @@ const (
 	// demonstrably current.
 	EngineStale EngineState = "Stale"
 )
+
+// StaleCause categorizes WHY a single kind isn't current — the per-kind detail behind
+// an EngineStale report. It rides in KindStatus so the controller's Stale message can
+// name the actual failure per kind ("Pods: watch failed") instead of a bare list, which
+// is what makes a list-but-not-watch RBAC gap actionable. It stays per-kind: the
+// cache-wide condition reason is the coarse honest Stale; the cause lives in the detail.
+type StaleCause string
+
+const (
+	// CauseListFailed: the kind can't complete a full LIST — RBAC `list` denied, or a
+	// kind too large to paginate within the continue-token lifetime. It has no data, or
+	// data that can no longer be refreshed.
+	CauseListFailed StaleCause = "ListFailed"
+	// CauseWatchFailed: the kind can LIST but can't establish or keep a watch — RBAC
+	// `watch` denied, or an aggregated API that rejects watch. It has a snapshot but no
+	// live updates.
+	CauseWatchFailed StaleCause = "WatchFailed"
+	// CauseWatchStalled: the watch was live and went quiet past the freshness threshold
+	// (wedged) without the driver's error budget being spent. Usually transient.
+	CauseWatchStalled StaleCause = "WatchStalled"
+)
+
+// KindStatus names one not-current kind and why — the per-kind element of an
+// EngineStale report's StaleKinds. Comparable (all string fields), so a StaleKinds
+// slice compares by value for livenessMonitor's dedup.
+type KindStatus struct {
+	Kind  string
+	Cause StaleCause
+}
 
 // EngineStatus is one coherent snapshot of the engine's reportable state.
 // Per-driver errors are deliberately not folded in — they're logged; the
@@ -144,10 +172,11 @@ type EngineStatus struct {
 	ResyncedKinds   int
 	ResyncedObjects int
 
-	// StaleKinds names the kinds whose watch went quiet past the threshold; set
-	// only on EngineStale reports (the "no watch heartbeat for X" message), zero
-	// otherwise.
-	StaleKinds []string
+	// StaleKinds names the kinds that aren't current, each with its cause — a watch
+	// that went quiet past the threshold (CauseWatchStalled) or a kind stuck after
+	// exhausting its resync error budget (CauseListFailed / CauseWatchFailed, see
+	// staleLaggards). Set only on EngineStale reports, zero otherwise.
+	StaleKinds []KindStatus
 }
 
 // clearCatchUp zeroes the catch-up milestone facts so a later report (a
@@ -247,7 +276,47 @@ const (
 	// best-effort watch missed. A long interval — the watch handles the steady state;
 	// this is only the safety net — matching a client-go informer's resyncPeriod.
 	resyncPeriodDefault = 30 * time.Minute
+
+	// listConcurrency bounds how many drivers may run a full LIST/resync at once across
+	// one engine run. A cold driver goes straight to a full (paginated) LIST, so without
+	// a bound cold-start peak memory scales with the kind count — the sum of every kind's
+	// in-flight list pages at once. The limiter caps that to N drivers listing
+	// concurrently (the rest queue), making cold-start peak O(N pages) regardless of how
+	// many kinds the cluster serves — trading a little cold-start latency for a flat
+	// memory ceiling. Initial AND mid-run-discovered drivers share the one limiter (both
+	// go through the same startDriver), so a CRD bundle installing mid-run can't blow the
+	// ceiling either, and the periodic resync backstop is bounded by it too.
+	//
+	// 16 balances the two costs: peak memory (and API-server burst) grows linearly with
+	// it, while cold-start latency barely improves past it — a typical cluster's ~50-80
+	// kinds are mostly empty (they LIST in one fast page), so the long pole is a handful
+	// of large kinds we want bounded for memory anyway. With listPageSize (500) bodies
+	// in flight per slot, 16 keeps the ceiling to tens of MB while clearing the small
+	// kinds in a couple of waves.
+	listConcurrency = 16
 )
+
+// listLimiter bounds concurrent full LISTs across a run's drivers (see
+// listConcurrency). It is a counting semaphore over a buffered channel; a nil limiter
+// imposes no bound (drivers built directly in unit tests).
+type listLimiter chan struct{}
+
+func newListLimiter(n int) listLimiter { return make(listLimiter, n) }
+
+// acquire takes a slot, blocking until one is free or ctx is cancelled. It returns a
+// release func that returns the slot; the func is a safe no-op on a nil limiter or a
+// cancelled acquire, so callers can `defer release()` unconditionally.
+func (l listLimiter) acquire(ctx context.Context) (release func(), err error) {
+	if l == nil {
+		return func() {}, nil
+	}
+	select {
+	case <-ctx.Done():
+		return func() {}, ctx.Err()
+	case l <- struct{}{}:
+		return func() { <-l }, nil
+	}
+}
 
 // engineOption configures an Engine's test seams. Production never tunes
 // them, so NewEngine exposes none — the unexported-option pattern shared
@@ -362,12 +431,16 @@ func (e *Engine) report(update func(*EngineStatus)) {
 	e.sink.Report(snapshot)
 }
 
-// reportCaughtUp emits the catch-up milestone — every driver has entered its watch
-// phase. It stamps elapsed time and carries the drivers' aggregated re-sync
-// breakdown so the controller can compose the SyncComplete/ResyncComplete message.
-// Only a cold build's message reports the object total, so the whole-table count
-// runs on that path alone; a count failure is logged and reported as zero.
-func (e *Engine) reportCaughtUp(ctx context.Context, coldStart bool, kinds int, startedAt time.Time, resyncedKinds, resyncedObjects int) {
+// reportCaughtUp emits the caught-up milestone — every initial driver is watching.
+// syncedKinds is the count of kinds that actually REACHED a watch (the milestone's live
+// tally, incremented per driver in onWatch), not a cache query: at milestone time
+// kind_catalog is NOT the synced set — a partial initial discovery preserves catalog rows
+// for unavailable API groups whose drivers never started, and a mid-run discovery can add a
+// tokenless kind before the initial cohort finishes, both of which would inflate a
+// COUNT(*). For a cold build it also QUERIES the object total (a count failure is logged and
+// reported as zero). It carries the drivers' aggregated re-sync breakdown so the controller
+// can compose the SyncComplete/ResyncComplete message.
+func (e *Engine) reportCaughtUp(ctx context.Context, coldStart bool, startedAt time.Time, syncedKinds, resyncedKinds, resyncedObjects int) {
 	objects := 0
 	if coldStart {
 		objects = e.countOrZero(ctx, cachedObjectCount, "count cached objects")
@@ -376,11 +449,43 @@ func (e *Engine) reportCaughtUp(ctx context.Context, coldStart bool, kinds int, 
 	e.report(func(s *EngineStatus) {
 		s.State, s.LastError = EngineWatching, ""
 		s.ColdStart = coldStart
-		s.SyncedKinds = kinds
+		s.SyncedKinds = syncedKinds
 		s.SyncedObjects = objects
 		s.CaughtUpIn = elapsed
 		s.ResyncedKinds = resyncedKinds
 		s.ResyncedObjects = resyncedObjects
+		// A caught-up report has, by definition, nothing stale. Clearing this matters on
+		// the livenessMonitor's cold-completion recovery path, which calls reportCaughtUp
+		// AFTER a prior reportStale left StaleKinds populated.
+		s.StaleKinds = nil
+	})
+}
+
+// reportCaughtUpOrStale emits the milestone the last initial driver closes out. Every
+// initial driver has by now either watched or given up (stuck) — but "the cohort is
+// resolved" is not "the cohort synced": a stuck kind never synced, so reporting
+// EngineWatching/SyncComplete here would be a false success (corrected only on the
+// liveness monitor's next tick). So if any driver is stuck it reports EngineStale naming
+// them and skips the caught-up counts; only a fully-healthy cohort reports EngineWatching.
+// The monitor (started once caughtUp closes) then owns the stale↔recovered tracking.
+func (e *Engine) reportCaughtUpOrStale(ctx context.Context, drivers []*kindDriver, coldStart bool, startedAt time.Time, syncedKinds, resyncedKinds, resyncedObjects int) {
+	if laggards := staleLaggards(drivers, e.now(), e.staleThreshold); len(laggards) > 0 {
+		e.reportStale(laggards)
+		return
+	}
+	e.reportCaughtUp(ctx, coldStart, startedAt, syncedKinds, resyncedKinds, resyncedObjects)
+}
+
+// reportStale publishes EngineStale naming the kinds that aren't current — shared by the
+// catch-up milestone (reportCaughtUpOrStale) and the livenessMonitor.
+func (e *Engine) reportStale(laggards []KindStatus) {
+	e.report(func(s *EngineStatus) {
+		// Stale is a departure from the caught-up state, so clear the prior report's
+		// catch-up counts (clearCatchUp also nils StaleKinds) before naming the
+		// laggards — otherwise a Stale report would ride along a superseded run's
+		// SyncedObjects/CaughtUpIn.
+		s.clearCatchUp()
+		s.State, s.LastError, s.StaleKinds = EngineStale, "", laggards
 	})
 }
 
@@ -489,15 +594,15 @@ type driverSet struct {
 }
 
 // driverHandle is a running driver plus the machinery to stop just it: cancel its
-// context, wait for its goroutine to finish (done), and its catch-up token (retire —
-// the once-guarded milestone obligation of an initial driver; nil for a mid-run driver,
-// which owes nothing). remove returns the token so a caller can either fire it (a
-// vanished kind: retire(true)) or transfer it to a replacement (a GVR repoint).
+// context, wait for its goroutine to finish (done), and its catch-up token (retire — the
+// milestone obligation of an initial driver; nil for a mid-run driver, which owes
+// nothing). remove returns the token so a caller can either fire it (a vanished kind:
+// retire()) or transfer it to a replacement (a GVR repoint).
 type driverHandle struct {
 	driver *kindDriver
 	cancel context.CancelFunc
 	done   chan struct{}
-	retire func(bool)
+	retire *milestoneToken
 }
 
 func newDriverSet() *driverSet {
@@ -508,7 +613,7 @@ func newDriverSet() *driverSet {
 // Called synchronously for the initial set, then from the discovery reconciler for
 // new kinds. The child context lets remove() stop this one driver independently;
 // retire (may be nil) is the driver's catch-up token, surfaced back through remove().
-func (s *driverSet) launch(ctx context.Context, d *kindDriver, onExit func(error), retire func(bool)) {
+func (s *driverSet) launch(ctx context.Context, d *kindDriver, onExit func(error), retire *milestoneToken) {
 	dctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	s.mu.Lock()
@@ -547,10 +652,11 @@ func (s *driverSet) gvr(gvk schema.GroupVersionKind) (schema.GroupVersionResourc
 // (quiesced) before returning, so a caller can safely prune that kind's cached rows
 // (or clear its resume cookie) afterward without an in-flight watch event racing it.
 // It RETURNS the driver's catch-up token rather than firing it, so the caller controls
-// its fate: a vanished kind fires it as gone (retire(true)) AFTER pruning, while a GVR
-// repoint transfers the still-live token to the replacement so the milestone waits for
-// its catch-up. Returns nil if gvk isn't running or the driver held no token.
-func (s *driverSet) remove(gvk schema.GroupVersionKind) func(bool) {
+// its fate: a vanished kind resolves it as removed (retire.resolve(false)) AFTER pruning,
+// while a GVR repoint re-arms it and transfers it to the replacement (retire.rearm(), so the
+// milestone waits for the replacement's own catch-up). Returns nil if gvk isn't running or
+// the driver held no token.
+func (s *driverSet) remove(gvk schema.GroupVersionKind) *milestoneToken {
 	s.mu.Lock()
 	h, ok := s.byGVK[gvk]
 	delete(s.byGVK, gvk)
@@ -590,6 +696,160 @@ func (s *driverSet) snapshot() []*kindDriver {
 // wait blocks until every launched driver's Run has returned.
 func (s *driverSet) wait() { s.wg.Wait() }
 
+// milestone tracks the Syncing→Watching catch-up of one run's initial driver cohort. Each
+// initial kind holds one token (token()); the milestone fires ONCE, when every token has
+// released its gate — reached a watch, gone stuck, or been removed. Whether it reports
+// Watching or Stale is decided at fire time from live driver state (the fire callback →
+// reportCaughtUpOrStale); the caughtUp tally (kinds currently resolved by REACHING a watch)
+// is the SyncComplete kind count, handed to fire so the callback needn't re-lock.
+//
+// A token is deliberately NOT a permanent one-shot. A stuck token releases the gate (so a
+// permanently-broken kind — forbidden, un-paginatable — can't wedge the milestone in
+// Syncing) yet stays RE-GATE-ABLE, because a stuck initial kind can still change before the
+// milestone fires: it can recover (onWatch → re-counted), or discovery can repoint it
+// (rearm() re-holds the gate for the fresh replacement). Without re-gating, transferring a
+// stuck kind's spent release to a never-watched replacement would let another kind's
+// resolution fire a false EngineWatching while the replacement is still listing. All token
+// state lives under milestone.mu; the counts are plain ints, not atomics, because every
+// transition is a compare-and-adjust across pending+caughtUp that must be atomic together.
+// resyncTally aggregates the per-driver re-sync work (did the kind fall back to a full
+// re-list, and how many bodies it re-pulled) that feeds the ResyncComplete message,
+// keyed by GVK. Keying by kind — rather than summing into free atomics — makes a repeat
+// idempotent: a kind that reports more than once (a stuck→recovered driver re-firing
+// onWatch, or a GVR repoint whose forceCold replacement re-does the removed driver's
+// re-sync) overwrites its own entry (last-write-wins) instead of double-counting into
+// the run totals. record runs from each driver's Run goroutine and totals from the
+// milestone fire callback, so both take mu.
+type resyncTally struct {
+	mu     sync.Mutex
+	byKind map[schema.GroupVersionKind]int // objects re-pulled, per kind that re-synced
+}
+
+func newResyncTally() *resyncTally {
+	return &resyncTally{byKind: make(map[schema.GroupVersionKind]int)}
+}
+
+// record sets (or, for a clean resume, clears) this kind's re-sync contribution. Keyed by
+// GVK, so a second call for the same kind replaces the first rather than adding to it.
+func (t *resyncTally) record(gvk schema.GroupVersionKind, resynced bool, objects int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if resynced {
+		t.byKind[gvk] = objects
+	} else {
+		delete(t.byKind, gvk)
+	}
+}
+
+// totals returns how many kinds re-synced and the total bodies they re-pulled.
+func (t *resyncTally) totals() (kinds, objects int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, n := range t.byKind {
+		kinds++
+		objects += n
+	}
+	return kinds, objects
+}
+
+type milestone struct {
+	mu       sync.Mutex
+	pending  int // tokens still holding the gate; fires when this hits 0
+	caughtUp int // tokens currently resolved by reaching a watch
+	fired    bool
+	fire     func(syncedKinds int)
+}
+
+func newMilestone(n int, fire func(syncedKinds int)) *milestone {
+	return &milestone{pending: n, fire: fire}
+}
+
+// milestoneToken is one initial kind's contribution to the milestone. Its fields are touched
+// only under milestone.mu.
+type milestoneToken struct {
+	m        *milestone
+	holding  bool // holds the gate? (unresolved, or re-armed after a repoint); starts true
+	caughtUp bool // currently counted toward the milestone's caughtUp tally?
+}
+
+// token mints one initial kind's obligation. Unlike a bare one-shot, it can be resolved
+// repeatedly as the driver's state changes, and re-armed on a repoint (see milestone).
+func (m *milestone) token() *milestoneToken {
+	return &milestoneToken{m: m, holding: true}
+}
+
+// resolve records HOW this kind resolved: reachedWatch=true (onWatch — now watching) counts
+// it toward caughtUp; false (onStuck / removal) releases the gate without counting. It is
+// idempotent per state and re-entrant across transitions (stuck→recovered, recovered→
+// re-stuck) until the milestone fires. The fire callback runs AFTER unlocking so the
+// catch-up report isn't held under the milestone mutex.
+func (t *milestoneToken) resolve(reachedWatch bool) {
+	t.m.mu.Lock()
+	fire, syncedKinds := t.applyLocked(reachedWatch)
+	t.m.mu.Unlock()
+	if fire != nil {
+		fire(syncedKinds)
+	}
+}
+
+// applyLocked adjusts this token's caughtUp contribution and releases its gate, returning
+// the fire callback + caught-up count when this resolution clears the LAST gate (so the
+// caller can fire it after unlocking), or (nil, 0) otherwise.
+func (t *milestoneToken) applyLocked(reachedWatch bool) (func(int), int) {
+	if t.m.fired {
+		return nil, 0
+	}
+	t.setCaughtUpLocked(reachedWatch)
+	if !t.holding {
+		return nil, 0 // already released; a later re-resolve only updates the count
+	}
+	t.holding = false
+	t.m.pending--
+	if t.m.pending > 0 {
+		return nil, 0
+	}
+	t.m.fired = true
+	return t.m.fire, t.m.caughtUp
+}
+
+// setCaughtUpLocked moves this token in/out of the caughtUp tally to match its latest state.
+func (t *milestoneToken) setCaughtUpLocked(reachedWatch bool) {
+	if reachedWatch == t.caughtUp {
+		return
+	}
+	if reachedWatch {
+		t.m.caughtUp++
+	} else {
+		t.m.caughtUp--
+	}
+	t.caughtUp = reachedWatch
+}
+
+// rearm re-holds the gate for a token transferred to a fresh replacement driver on a GVR
+// repoint: the replacement hasn't synced, so the milestone must wait for it rather than
+// inherit the old driver's release. A caught-up token also drops its count until the
+// replacement re-earns it. No-op once the milestone has fired.
+func (t *milestoneToken) rearm() {
+	t.m.mu.Lock()
+	defer t.m.mu.Unlock()
+	if t.m.fired {
+		return
+	}
+	t.setCaughtUpLocked(false)
+	if !t.holding {
+		t.holding = true
+		t.m.pending++
+	}
+}
+
+// caughtUpCount is how many initial kinds are currently resolved by reaching a watch. The
+// fire callback gets this value passed in; tests read it after the milestone fires.
+func (m *milestone) caughtUpCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.caughtUp
+}
+
 // run blocks for one engine generation: build clients, walk discovery, and
 // drive one kindDriver per discovered GVR until ctx is cancelled. The state
 // flips to Watching once every driver in the initial discovery cohort has entered
@@ -597,15 +857,24 @@ func (s *driverSet) wait() { s.wg.Wait() }
 // It also watches the objects that mint GVRs (CRDs, APIServices) so a kind installed
 // mid-run starts mirroring without a restart (see watchDiscoveryTriggers / discoveryLoop).
 func (e *Engine) run(ctx context.Context, coldStart bool) error {
-	dc, err := discovery.NewDiscoveryClientForConfig(e.cfg)
+	// Every client gets a read-inactivity timeout (see idleTimeoutRoundTripper): a wedged
+	// LIST/GET is cancelled so it can't hold a limiter slot — or block the discovery walk
+	// — forever, while a slow-but-progressing transfer runs as long as it keeps streaming.
+	// Discovery needs it too: a registered-but-unreachable aggregated APIService (a hung
+	// /apis/<group>/<version>) is exactly the same wedge, on the equally hang-prone
+	// discovery path. The wrapper exempts watches, so the same dyn/md clients still serve
+	// the long-lived watch path.
+	idleCfg := rest.CopyConfig(e.cfg)
+	idleCfg.Wrap(newIdleTimeoutWrapper(defaultListIdleTimeout))
+	dc, err := discovery.NewDiscoveryClientForConfig(idleCfg)
 	if err != nil {
 		return fmt.Errorf("discovery client: %w", err)
 	}
-	dyn, err := dynamic.NewForConfig(e.cfg)
+	dyn, err := dynamic.NewForConfig(idleCfg)
 	if err != nil {
 		return fmt.Errorf("dynamic client: %w", err)
 	}
-	md, err := metadata.NewForConfig(e.cfg)
+	md, err := metadata.NewForConfig(idleCfg)
 	if err != nil {
 		return fmt.Errorf("metadata client: %w", err)
 	}
@@ -640,54 +909,42 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
-	var pending atomic.Int64
-	pending.Store(int64(len(entries)))
-	// reportedKinds is the catch-up milestone's kind count: it starts at the initial
-	// cohort size and is decremented when an initial driver is removed before it ever
-	// reaches its watch phase (an uninstalled CRD), so the SyncedKinds the report emits
-	// reflects the kinds that actually synced, not the never-synced removed ones.
-	var reportedKinds atomic.Int64
-	reportedKinds.Store(int64(len(entries)))
-	// Aggregate the per-driver re-sync work as each driver reaches its watch phase.
-	// Each contributes its snapshot once (from its Run goroutine) into these atomics
-	// rather than being read back from the driver struct, so a driver's later
-	// full-resync retry can't race the aggregation or bleed into the first counts.
-	var resyncedKinds, resyncedObjects atomic.Int64
+	// Aggregate the per-driver re-sync work as each driver reaches its watch phase. Each
+	// contributes from its Run goroutine, keyed by GVK, rather than being read back from the
+	// driver struct — so a driver's later full-resync retry can't race the aggregation, and
+	// a kind that reports twice (recovery or a repoint's replacement) counts once. (The count
+	// of kinds that reached a watch — the SyncComplete "M kinds" — is the milestone's own
+	// caughtUp tally, deduped on the one-shot token so a repointed kind counts once; see
+	// milestone.token.)
+	tally := newResyncTally()
 	caughtUp := make(chan struct{})
-	var caughtUpOnce sync.Once
 	drivers := newDriverSet()
 
-	// newRetire mints one catch-up token — a once-guarded closure that discharges an
-	// initial driver's Syncing→Watching obligation exactly once. onWatch fires it as
-	// synced (gone=false: the kind synced, so it stays in the reported cohort); a
-	// removal fires it as gone (gone=true: it never synced, so it drops out of the
-	// reported cohort). When pending hits zero the milestone flips to Watching. Each
-	// initial kind owns exactly one token, so `pending`/`reportedKinds` are sized to the
-	// cohort; a repoint TRANSFERS the token to the replacement rather than minting a new
-	// one (see reconcileDiscovery), keeping the count conserved and the milestone gated
-	// on the replacement's own catch-up.
-	newRetire := func() func(bool) {
-		var once sync.Once
-		return func(gone bool) {
-			once.Do(func() {
-				if gone {
-					reportedKinds.Add(-1)
-				}
-				if pending.Add(-1) == 0 {
-					e.reportCaughtUp(runCtx, coldStart, int(reportedKinds.Load()), startedAt,
-						int(resyncedKinds.Load()), int(resyncedObjects.Load()))
-					caughtUpOnce.Do(func() { close(caughtUp) })
-				}
-			})
-		}
-	}
+	// One full-LIST concurrency limiter shared by every driver this run starts —
+	// initial cohort and mid-run discoveries alike — so their combined in-flight LISTs
+	// never exceed listConcurrency, bounding cold-start peak memory (see listConcurrency).
+	listLim := newListLimiter(listConcurrency)
+
+	// The catch-up milestone tracks the initial cohort's Syncing→Watching. Each initial
+	// kind holds one one-shot token (ms.token(), see milestone); the fire callback runs
+	// once, when every kind has caught up / been removed / gone stuck, reporting
+	// EngineWatching if all healthy or EngineStale if a stuck kind closed it out (decided
+	// freshly from driver state; the kind count is the milestone's caughtUp tally, passed
+	// to fire). A repoint TRANSFERS and re-arms the token on the replacement (see
+	// reconcileDiscovery).
+	ms := newMilestone(len(entries), func(syncedKinds int) {
+		resyncedKinds, resyncedObjects := tally.totals()
+		e.reportCaughtUpOrStale(runCtx, drivers.snapshot(), coldStart, startedAt,
+			syncedKinds, resyncedKinds, resyncedObjects)
+		close(caughtUp)
+	})
 
 	// startDriver builds and launches one driver for a GVR. `retire` is the driver's
-	// catch-up token (see newRetire), or nil for a kind that owes nothing — a kind
+	// catch-up token (see milestone.token), or nil for a kind that owes nothing — a kind
 	// discovered mid-run joins AFTER catch-up, so it doesn't participate in the milestone
 	// and just streams. A driver holding a token counts down Syncing→Watching and feeds
 	// the re-sync aggregation when it reaches its watch phase.
-	startDriver := func(entry gvrEntry, retire func(bool), forceCold bool) {
+	startDriver := func(entry gvrEntry, retire *milestoneToken, forceCold bool) {
 		var kstore kindStore
 		if isEventGVK(entry.GVK) {
 			kstore = newEventsStore(ctx, e.cdb.ID(), entry.GVK, writer, e.cdb)
@@ -709,18 +966,27 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 			seedRV = rv
 		}
 		d := newKindDriverWithOptions(newLiveSource(dyn, md, entry), kstore, entry.GVK, seedRV,
-			withNow(e.now), withGVR(entry.GVR), withResyncPeriod(e.resyncPeriod))
-		// A tokenless driver (a mid-run discovery) can't participate in the milestone —
-		// it just streams. The liveness monitor gives it a bounded startup grace (from
-		// createdAt) before flagging it, via staleLaggards.
+			withNow(e.now), withGVR(entry.GVR), withResyncPeriod(e.resyncPeriod), withListLimiter(listLim))
+		// A tokenless driver (a mid-run discovery) can't participate in the milestone — it
+		// just streams; the liveness monitor still surfaces it if it gets stuck. An initial
+		// driver resolves its token when it reaches watch (onWatch) OR when it exhausts its
+		// error budget (onStuck), so a kind that can never sync stops blocking the
+		// Syncing→Watching milestone instead of wedging Syncing. The token is one-shot;
+		// whether a stuck kind reads as Stale is decided freshly at fire/monitor time from
+		// driver state, not the token.
 		if retire != nil {
 			d.onWatch = func(resynced bool, objects int) {
-				if resynced {
-					resyncedKinds.Add(1)
-					resyncedObjects.Add(int64(objects))
-				}
-				retire(false)
+				// Record this kind's re-sync contribution keyed by GVK. onWatch can fire again
+				// after a stuck→recovered transition (the driver re-arms it so the recovery
+				// re-counts the token below), and a GVR repoint's replacement re-does the removed
+				// driver's re-sync — the GVK key makes both idempotent (last-write-wins) instead
+				// of double-counting into the run totals.
+				tally.record(entry.GVK, resynced, objects)
+				// Re-entrant: (re)counts this kind toward the caught-up tally each time its
+				// watch proves live, including a recovery after onStuck de-counted it.
+				retire.resolve(true)
 			}
+			d.onStuck = func() { retire.resolve(false) } // resolved as stuck, not caught up
 		}
 		slog.Debug("clustersync: starting driver", "id", e.cdb.ID(), "gvk", entry.GVK.String(), "seedRV", seedRV)
 		drivers.launch(runCtx, d, func(err error) {
@@ -732,12 +998,17 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 		}, retire)
 	}
 
+	// The initial cohort's GVKs — the kinds whose sync the SyncComplete count reports. Kept
+	// so the cold-completion recovery counts only this cohort's live kinds, not any kind
+	// discovered mid-run (which is not part of the initial sync).
+	initialGVKs := make(map[schema.GroupVersionKind]struct{}, len(entries))
 	for _, entry := range entries {
-		startDriver(entry, newRetire(), false)
+		initialGVKs[entry.GVK] = struct{}{}
+		startDriver(entry, ms.token(), false)
 	}
 
 	var monWg sync.WaitGroup
-	monWg.Go(func() { e.livenessMonitor(runCtx, drivers.snapshot, caughtUp) })
+	monWg.Go(func() { e.livenessMonitor(runCtx, drivers.snapshot, caughtUp, coldStart, startedAt, initialGVKs) })
 
 	// Detect GVRs that appear or vanish mid-run. Two layers feed one reconcile path:
 	// (1) a best-effort ACCELERATOR — watches of the objects that mint GVRs
@@ -819,7 +1090,7 @@ func (e *Engine) discoveryPollLoop(ctx context.Context, signal func()) {
 // A trigger is debounced by a trailing quiet window so a bundle of CRDs installed
 // together collapses into one discovery pass. A trigger that lands during a pass is
 // held by the cap-1 channel and reconciled on the next iteration.
-func (e *Engine) discoveryLoop(ctx context.Context, dc discovery.DiscoveryInterface, drivers *driverSet, startDriver func(gvrEntry, func(bool), bool), triggers <-chan struct{}) {
+func (e *Engine) discoveryLoop(ctx context.Context, dc discovery.DiscoveryInterface, drivers *driverSet, startDriver func(gvrEntry, *milestoneToken, bool), triggers <-chan struct{}) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -893,7 +1164,7 @@ func (e *Engine) debounceTriggers(ctx context.Context, triggers <-chan struct{})
 // A repoint removes the old driver and relaunches COLD (forceCold): the replacement
 // full-LISTs the new endpoint, and the old cookie is left inert — the resume-eligibility
 // guard and periodic resync make a stale cookie harmless, so there is no cookie surgery.
-func (e *Engine) reconcileDiscovery(ctx context.Context, dc discovery.DiscoveryInterface, drivers *driverSet, startDriver func(gvrEntry, func(bool), bool)) {
+func (e *Engine) reconcileDiscovery(ctx context.Context, dc discovery.DiscoveryInterface, drivers *driverSet, startDriver func(gvrEntry, *milestoneToken, bool)) {
 	entries, complete, err := discoverGVRs(ctx, dc, e.cdb)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -929,11 +1200,17 @@ func (e *Engine) reconcileDiscovery(ctx context.Context, dc discovery.DiscoveryI
 			if err := deleteResumeRV(ctx, e.cdb.Writer(), entry.GVK); err != nil {
 				slog.Warn("clustersync: clear resume cookie on repoint", "id", e.cdb.ID(), "gvk", entry.GVK.String(), "err", err)
 			}
-			// TRANSFER the old driver's catch-up token to the replacement rather than firing
-			// it: if the old driver was an initial one still pre-watch, its Syncing→Watching
-			// obligation carries over so the milestone waits for the replacement's own full
-			// LIST instead of flipping to Watching while the old endpoint's rows are still
-			// present. A spent (already caught up) or nil (mid-run) token transfers harmlessly.
+			// TRANSFER the old driver's catch-up token to the replacement and RE-ARM it, so the
+			// milestone waits for the replacement's own full LIST rather than inheriting the old
+			// driver's resolution. This matters most when the old driver had already resolved
+			// (caught up, or gone stuck and released the gate): rearm re-holds the gate (and
+			// drops any caught-up count) so another kind's resolution can't fire a false
+			// EngineWatching while the never-watched replacement is still listing. A still-
+			// unresolved token is left holding (rearm is a no-op); a nil (mid-run) token owes
+			// nothing.
+			if retire != nil {
+				retire.rearm()
+			}
 			startDriver(entry, retire, true)
 		}
 	}
@@ -942,9 +1219,9 @@ func (e *Engine) reconcileDiscovery(ctx context.Context, dc discovery.DiscoveryI
 	}
 	// A complete pass is authoritative. Stop the drivers for vanished kinds (each remove
 	// blocks until the goroutine stops), then prune their cached rows and resume cookies.
-	// Fire each removed driver's catch-up token as gone AFTER the prune, so a removal that
-	// closes out the milestone can't report catch-up while stale rows are still present.
-	var retires []func(bool)
+	// Fire each removed driver's catch-up token as removed AFTER the prune, so a removal
+	// that closes out the milestone can't report catch-up while stale rows are still present.
+	var retires []*milestoneToken
 	for _, gvk := range drivers.gvks() {
 		if _, ok := discovered[gvk]; !ok {
 			slog.Info("clustersync: GVR removed mid-run, stopping driver", "id", e.cdb.ID(), "gvk", gvk.String())
@@ -955,7 +1232,7 @@ func (e *Engine) reconcileDiscovery(ctx context.Context, dc discovery.DiscoveryI
 	}
 	e.pruneOrphanedObjects(ctx, entries)
 	for _, retire := range retires {
-		retire(true)
+		retire.resolve(false) // removed, not caught up — releases the gate without counting
 	}
 }
 
@@ -1060,9 +1337,15 @@ func (e *Engine) streamTriggerEvents(ctx context.Context, src kubeSource, rv str
 // re-reports whenever the wedged set changes — not just on the healthy/stale edge —
 // so a multi-kind cache never keeps naming a recovered kind (or omits a newly-wedged
 // one) while stale overall; an unchanged set doesn't re-emit every tick. The
-// recovery report carries no catch-up counts (a liveness resume, not a fresh sync),
-// which the controller renders as "watch recovered".
-func (e *Engine) livenessMonitor(ctx context.Context, drivers func() []*kindDriver, caughtUp <-chan struct{}) {
+// recovery report normally carries no catch-up counts (a liveness resume, not a fresh
+// sync), which the controller renders as "watch recovered".
+//
+// The one exception is a COLD start whose catch-up milestone reported EngineStale
+// because a kind went stuck before ever watching (so the cold SyncComplete never
+// fired): coldStart+startedAt let the monitor emit that skipped initial-sync
+// completion when the cohort finally goes live, rather than a bare warm recovery that
+// would misreport the cache's first-ever sync.
+func (e *Engine) livenessMonitor(ctx context.Context, drivers func() []*kindDriver, caughtUp <-chan struct{}, coldStart bool, startedAt time.Time, initialGVKs map[schema.GroupVersionKind]struct{}) {
 	select {
 	case <-ctx.Done():
 		return
@@ -1072,7 +1355,18 @@ func (e *Engine) livenessMonitor(ctx context.Context, drivers func() []*kindDriv
 	defer ticker.Stop()
 	// reported is the laggard set last published as stale; nil while watching. A
 	// non-nil, non-equal set means the wedged kinds shifted and must be re-reported.
-	var reported []string
+	// Seed it from the state the milestone published (reportCaughtUpOrStale): if a stuck
+	// kind closed out catch-up it already published EngineStale naming it, so adopt that
+	// as the baseline — otherwise the monitor couldn't detect that kind's later recovery
+	// (it would think nothing was stale) and would leave the engine wrongly Stale.
+	//
+	// coldPending records that this cold build's SyncComplete is still owed: the milestone
+	// fired EngineStale instead of the caught-up EngineWatching, so the first recovery must
+	// emit the completion (with reconstructed counts) rather than clear the catch-up facts.
+	e.mu.Lock()
+	reported := slices.Clone(e.status.StaleKinds)
+	coldPending := coldStart && e.status.State == EngineStale
+	e.mu.Unlock()
 	for {
 		select {
 		case <-ctx.Done():
@@ -1082,53 +1376,87 @@ func (e *Engine) livenessMonitor(ctx context.Context, drivers func() []*kindDriv
 			switch {
 			case len(laggards) > 0 && !slices.Equal(laggards, reported):
 				reported = laggards
-				e.report(func(s *EngineStatus) {
-					s.State, s.LastError, s.StaleKinds = EngineStale, "", laggards
-				})
+				e.reportStale(laggards)
 			case len(laggards) == 0 && reported != nil:
 				reported = nil
-				e.report(func(s *EngineStatus) {
-					s.State = EngineWatching
-					s.clearCatchUp()
-				})
+				if coldPending {
+					// The cold build's SyncComplete never fired (a kind went stuck before ever
+					// watching, so the milestone reported EngineStale). Now that every kind is
+					// live, emit the initial-sync completion the milestone skipped — with counts
+					// reconstructed from live driver state, since the milestone's caughtUp tally
+					// is frozen at fire time — instead of a bare "watch recovered".
+					coldPending = false
+					e.reportCaughtUp(ctx, true, startedAt, syncedKindCount(drivers(), initialGVKs), 0, 0)
+				} else {
+					e.report(func(s *EngineStatus) {
+						s.State = EngineWatching
+						s.clearCatchUp()
+					})
+				}
 			}
 		}
 	}
 }
 
-// staleLaggards names the kinds whose watch hasn't proven liveness within
-// threshold. Liveness is a delta, a bookmark, or a reconnect (each stamps the
-// driver), so a genuinely quiet-but-healthy kind — still receiving the server's
-// periodic bookmarks — never appears here; only a silently-wedged watch does.
+// syncedKindCount counts INITIAL-cohort drivers that have reached a watch (non-zero
+// liveness) — how many of the initial kinds are actually synced right now. livenessMonitor
+// uses it to reconstruct the SyncComplete kind tally on the cold-completion recovery path,
+// where the milestone's own caughtUp tally is frozen at fire time and can't be reused. It's
+// filtered to initialGVKs so a kind discovered mid-run (a CRD installed after startup, which
+// is not part of the initial sync) can't inflate the reported "M kinds" of the first-ever
+// sync. At recovery the cohort's initial drivers have all resolved (the milestone fired), so
+// a previously-stuck kind that recovered now stamps liveness like the rest.
+func syncedKindCount(drivers []*kindDriver, initialGVKs map[schema.GroupVersionKind]struct{}) int {
+	n := 0
+	for _, d := range drivers {
+		if _, ok := initialGVKs[d.gvk]; !ok {
+			continue // discovered mid-run — not part of the initial sync
+		}
+		if !d.liveAt().IsZero() {
+			n++
+		}
+	}
+	return n
+}
+
+// staleLaggards names the kinds that are either stuck or whose watch hasn't proven
+// liveness within threshold. Two independent signals:
 //
-// A driver that hasn't entered its watch phase yet (zero liveAt) is judged against
-// its createdAt instead: it gets a startup grace of `threshold` to connect — its
-// initial sync or connection attempts may legitimately take a while — but once that
-// grace expires it IS flagged, so a kind that can never LIST/watch (forbidden or a
-// perpetually-unavailable API) surfaces as stale rather than hiding the engine as
-// healthy forever. The initial cohort never reaches this branch: it's shielded by the
-// caughtUp gate (the monitor starts only once every initial driver has reached watch
-// phase, so they all have a non-zero liveAt); only a kind discovered mid-run, which
-// has no such gate, relies on the createdAt grace.
+//   - Stuck (isStuck): the driver exhausted its resync error budget — it can't LIST/watch
+//     at all (forbidden, un-paginatable within the token lifetime, perpetually stalled).
+//     Surfaced regardless of watch state, since it may never have listed. A never-watched
+//     driver is judged by whether it's actually failing, not by how long it's been
+//     trying — so a large but *progressing* initial/mid-run LIST (which the transport
+//     idle timeout lets run arbitrarily long) is never falsely flagged.
+//   - Wedged watch: a driver that DID reach its watch phase (non-zero liveAt) but whose
+//     last liveness proof — a delta, bookmark, or reconnect — is older than threshold.
+//     A quiet-but-healthy kind still gets the server's periodic bookmarks, so only a
+//     silently-wedged watch appears here.
 //
-// The result is sorted: the driver set is a map (random iteration order), so an
+// A never-watched-but-not-stuck driver is legitimately still syncing and is NOT flagged.
+//
+// Each laggard carries its cause: a stuck driver reports the phase that spent its budget
+// (stuckCause — CauseListFailed vs CauseWatchFailed), a wedged-but-not-stuck watch is
+// CauseWatchStalled.
+//
+// The result is sorted by kind: the driver set is a map (random iteration order), so an
 // unsorted slice would let an unchanged laggard set permute between snapshots and
 // defeat livenessMonitor's slices.Equal dedup — re-emitting the same stale report
 // with reordered kind names.
-func staleLaggards(drivers []*kindDriver, now time.Time, threshold time.Duration) []string {
-	var laggards []string
+func staleLaggards(drivers []*kindDriver, now time.Time, threshold time.Duration) []KindStatus {
+	var laggards []KindStatus
 	for _, d := range drivers {
-		// Judge a never-watched driver from creation, a watched one from its last
-		// liveness proof; either way it's stale once `threshold` has elapsed.
-		since := d.liveAt()
-		if since.IsZero() {
-			since = d.createdAt
-		}
-		if now.Sub(since) > threshold {
-			laggards = append(laggards, d.gvk.Kind)
+		live := d.liveAt()
+		switch {
+		case d.isStuck():
+			laggards = append(laggards, KindStatus{Kind: d.gvk.Kind, Cause: d.stuckCause()})
+		case live.IsZero():
+			// Never watched but not stuck — still legitimately syncing; don't flag.
+		case now.Sub(live) > threshold:
+			laggards = append(laggards, KindStatus{Kind: d.gvk.Kind, Cause: CauseWatchStalled})
 		}
 	}
-	sort.Strings(laggards)
+	sort.Slice(laggards, func(i, j int) bool { return laggards[i].Kind < laggards[j].Kind })
 	return laggards
 }
 

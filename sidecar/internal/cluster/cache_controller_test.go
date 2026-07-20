@@ -386,7 +386,10 @@ func TestCacheControllerStaleReport(t *testing.T) {
 
 	// Live (cold catch-up), then the liveness monitor reports the watch stale.
 	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineStale, StaleKinds: []string{"Pod", "Endpoints"}})
+	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineStale, StaleKinds: []engine.KindStatus{
+		{Kind: "Pod", Cause: engine.CauseWatchFailed},
+		{Kind: "Endpoints", Cause: engine.CauseWatchStalled},
+	}})
 
 	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionFalse)
 	assert.Equal(t, ReasonStale, synced.Reason)
@@ -396,7 +399,8 @@ func TestCacheControllerStaleReport(t *testing.T) {
 	require.NotEmpty(t, evs)
 	assert.Equal(t, ReasonSyncStale, evs[0].Reason)
 	assert.Equal(t, beehive.EventWarning, evs[0].Type)
-	assert.Contains(t, evs[0].Message, "Pod")
+	assert.Contains(t, evs[0].Message, "Pod (watch failed)", "the per-kind stuck cause is named")
+	assert.Contains(t, evs[0].Message, "Endpoints (watch stalled)")
 }
 
 // Pausing sync (SyncEnabled → false) stops the running engine and records a

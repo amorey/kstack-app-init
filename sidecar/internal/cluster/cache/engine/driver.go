@@ -60,6 +60,30 @@ const defaultDiffThreshold = 200
 // concurrently, so it isn't summed).
 const defaultResumeGrace = 2 * time.Second
 
+// defaultStuckThreshold is how many consecutive fullResync failures mark a kind
+// "stuck" — enough to ride out a transient blip (an aggregated API restarting), few
+// enough that a genuinely broken kind (forbidden, un-paginatable within the token
+// lifetime, perpetually stalled) surfaces to the user within seconds instead of sitting
+// silently in Syncing. defaultStuckRetryInterval is the slow retry cadence a stuck kind
+// drops to, so a permanently-broken kind stops hammering the API server and re-taking a
+// limiter slot every backoff step.
+const (
+	defaultStuckThreshold     = 5
+	defaultStuckRetryInterval = 3 * time.Minute
+)
+
+// defaultEstablishTimeout bounds how long one watch phase waits for the watch to actually
+// CONNECT before treating the attempt as failed. RetryWatcher retries retriable errors (a
+// 5xx, an EOF, a timeout) internally without ever closing its ResultChan, and a hung watch
+// request (headers never arrive) never returns — so without this bound a watch that can't
+// connect would block watchPhase forever: the driver would never return, never spend its
+// error budget, and hold its catch-up token, wedging the whole engine in Syncing. On timeout
+// the phase returns so Run charges a CauseWatchFailed; enough failures surface the kind as
+// stuck. It's generous — a healthy watch connects in well under a second — so a brief
+// API-server blip isn't mistaken for a broken watch; this is a monitoring app, so a
+// persistent failure is surfaced to the user rather than retried forever.
+const defaultEstablishTimeout = 30 * time.Second
+
 // realGraceTimer is the production graceTimer: a time.Timer's channel plus its Stop.
 func realGraceTimer(d time.Duration) (<-chan time.Time, func()) {
 	t := time.NewTimer(d)
@@ -69,6 +93,11 @@ func realGraceTimer(d time.Duration) (<-chan time.Time, func()) {
 // errExpired means the watch's resourceVersion is too old (410 Gone); the only
 // recovery is a full re-sync to obtain a fresh RV.
 var errExpired = errors.New("clustersync: watch resourceVersion expired")
+
+// errWatchNotEstablished means the watch phase gave up waiting for the watch to connect
+// (see defaultEstablishTimeout). Run charges it against the error budget like any other
+// watch failure so a never-connecting kind surfaces as stuck instead of wedging Syncing.
+var errWatchNotEstablished = errors.New("clustersync: watch failed to establish within timeout")
 
 // objMeta is the minimal identity the metadata-diff needs from a metadata list.
 type objMeta struct {
@@ -163,20 +192,49 @@ type kindDriver struct {
 
 	seedRV string // persisted resume point at construction
 
-	// onWatch, when set, fires once per Run — reporting whether this driver fell
-	// back to a full re-sync and how many bodies it re-pulled. The engine counts
-	// these down to flip Syncing→Watching and aggregates the re-sync work for the
-	// ResyncComplete message. Fired by fireOnWatch (see watchPhase), guarded to
-	// once by sawWatch.
-	onWatch       func(resynced bool, objects int)
-	sawWatch      bool
-	diffThreshold int
-	backoffInit   time.Duration
-	backoffMax    time.Duration
+	// onWatch, when set, fires when this driver's watch first proves live — reporting
+	// whether it fell back to a full re-sync and how many bodies it re-pulled. The engine
+	// counts these to flip Syncing→Watching and aggregates the re-sync work for the
+	// ResyncComplete message. Fired by fireOnWatch (see watchPhase), guarded to once per
+	// catch-up episode by sawWatch. It is NOT strictly once-per-Run: a stuck transition
+	// re-arms it (recordFailure clears sawWatch) so a kind that caught up, went stuck, then
+	// recovered re-fires onWatch to re-count its milestone token — the engine's re-sync
+	// aggregation guards itself against double-counting the repeat.
+	onWatch  func(resynced bool, objects int)
+	sawWatch bool
+	// onStuck, when set, fires when this driver exhausts its sync error budget
+	// (stuckThreshold consecutive failures — a failed fullResync OR a watch that never
+	// established). The engine wires it to retire the driver's catch-up token as
+	// not-synced, so a stuck INITIAL driver stops blocking the Syncing→Watching milestone
+	// (nil for a mid-run driver, which owes no token — the liveness monitor still surfaces
+	// it via the stuck flag). It need not be one-shot: the production callback is the
+	// already-idempotent retire token, and Run fires it only on the exact threshold
+	// crossing (once per stuck episode).
+	onStuck func()
+	// stuck is set when the error budget is spent, cleared when the watch next proves
+	// usable (fireOnWatch — a delta, a clean-resume grace, or a fresh-RV connect), NOT on
+	// the bare watch open, so an open-then-error stream can't clear it. The liveness
+	// monitor (staleLaggards) reads it from another goroutine, so it's atomic; the
+	// consecutive-failure count that trips it is a Run-goroutine local.
+	stuck atomic.Bool
+	// failCause records the most recent sync failure's cause (CauseListFailed vs
+	// CauseWatchFailed) so a stuck driver can report WHY it's stuck (see stuckCause,
+	// read by staleLaggards from the monitor goroutine). Written on every recordFailure,
+	// so by the time stuck flips it holds the failure that spent the budget. atomic.Value
+	// because run and monitor goroutines touch it.
+	failCause          atomic.Value // StaleCause
+	stuckThreshold     int
+	stuckRetryInterval time.Duration
+	diffThreshold      int
+	backoffInit        time.Duration
+	backoffMax         time.Duration
 	// resumeGrace bounds how long the first cookie-seeded watch waits to prove usable
 	// before onWatch reports a clean resume — long enough that a prompt 410 reliably
-	// arrives first. See watchPhase.
+	// arrives first. Armed from the watch CONNECTING, not phase entry (see watchPhase).
 	resumeGrace time.Duration
+	// establishTimeout bounds how long a watch phase waits for the watch to connect before
+	// giving up (see defaultEstablishTimeout) so a never-connecting watch can't block forever.
+	establishTimeout time.Duration
 	// resyncPeriod, when > 0, forces a periodic full re-sync: a watch alive this long
 	// ends itself so Run falls back to fullResync, reconciling any drift the watch
 	// silently missed (a dropped delta, a stale cookie). This is the pull-based backstop
@@ -185,20 +243,23 @@ type kindDriver struct {
 	// construction (see gvkJitterFraction) so drivers don't relist in lockstep.
 	resyncPeriod time.Duration
 	resyncDelay  time.Duration
+	// limiter, when non-nil, bounds how many drivers run a full LIST/resync at once
+	// across the engine run (see listConcurrency) — acquired around fullResync so the
+	// slot is held only for the list-heavy work, not the indefinite watch phase, keeping
+	// cold-start peak memory O(N pages) instead of scaling with the kind count. nil in
+	// unit tests that drive one driver directly.
+	limiter listLimiter
 	// graceTimer starts the resumeGrace countdown, returning its fire channel and a
 	// stop func; a test seam (defaults to realGraceTimer over time.NewTimer).
 	graceTimer func(time.Duration) (<-chan time.Time, func())
+	// establishTimer starts the establishTimeout countdown; a separate test seam from
+	// graceTimer (both default to realGraceTimer) so a test can drive the establishment
+	// timeout deterministically without racing the resume grace on a shared seam.
+	establishTimer func(time.Duration) (<-chan time.Time, func())
 	// sleep is a ctx-aware backoff sleep; a test seam so backoff is deterministic.
 	sleep func(ctx context.Context, d time.Duration) error
 	// now stamps the liveness time; a test seam (defaults to time.Now).
 	now func() time.Time
-
-	// createdAt is when the driver was constructed — the start of its startup grace.
-	// A driver that never reaches its watch phase keeps a zero lastLiveAt; the liveness
-	// monitor gives it grace from here rather than flagging it immediately, but only
-	// until the grace expires (see staleLaggards) so a kind that can never LIST/watch
-	// (forbidden, perpetually-unavailable API) doesn't hide as healthy forever.
-	createdAt time.Time
 
 	// lastLiveAt is when the watch last proved it's alive — a delta or a bookmark.
 	// Bookmarks matter because a quiet-but-healthy cluster delivers no deltas yet
@@ -207,14 +268,6 @@ type kindDriver struct {
 	// goroutine) can stamp it concurrently.
 	liveMu     sync.Mutex
 	lastLiveAt time.Time
-
-	// deltaSeen counts object deltas the watch tap has forwarded downstream;
-	// deltaApplied counts those the driver has durably applied+persisted. A bookmark
-	// advances the resume cookie only once applied has caught up to seen, so a crash
-	// or restart never resumes past a delta the cache hasn't stored yet. Both are
-	// monotonic and touched from the tap and run goroutines, hence atomic.
-	deltaSeen    atomic.Int64
-	deltaApplied atomic.Int64
 
 	// cookieMu + watchEpoch fence a straggler bookmark from resurrecting the resume
 	// cookie. The bookmark tap runs in watch.Filter's forwarding goroutine, which
@@ -260,6 +313,12 @@ func withGraceTimer(fn func(time.Duration) (<-chan time.Time, func())) option {
 	return func(d *kindDriver) { d.graceTimer = fn }
 }
 
+// withEstablishTimer injects the establishment-timeout timer so a test can drive it
+// deterministically (defaults to realGraceTimer).
+func withEstablishTimer(fn func(time.Duration) (<-chan time.Time, func())) option {
+	return func(d *kindDriver) { d.establishTimer = fn }
+}
+
 // withGVR sets the driver's resource endpoint — the reconciler's repoint key. Both
 // production (from the discovered gvrEntry) and tests that seed drivers into a
 // driverSet pass it, so a seeded driver carries its GVR like a real one.
@@ -273,28 +332,44 @@ func withResyncPeriod(d time.Duration) option {
 	return func(kd *kindDriver) { kd.resyncPeriod = d }
 }
 
+// withListLimiter shares the engine run's full-LIST concurrency limiter with this
+// driver. The engine hands the same limiter to every driver it starts (initial and
+// mid-run), so they collectively never exceed listConcurrency in-flight LISTs.
+func withListLimiter(l listLimiter) option {
+	return func(d *kindDriver) { d.limiter = l }
+}
+
+// withStuckThreshold tunes the resync error budget; tests set a small threshold to reach
+// the stuck state quickly.
+func withStuckThreshold(n int) option {
+	return func(d *kindDriver) { d.stuckThreshold = n }
+}
+
 func newKindDriver(src kubeSource, store kindStore, gvk schema.GroupVersionKind, seedRV string) *kindDriver {
 	return newKindDriverWithOptions(src, store, gvk, seedRV)
 }
 
 func newKindDriverWithOptions(src kubeSource, store kindStore, gvk schema.GroupVersionKind, seedRV string, opts ...option) *kindDriver {
 	d := &kindDriver{
-		src:           src,
-		store:         store,
-		gvk:           gvk,
-		seedRV:        seedRV,
-		diffThreshold: defaultDiffThreshold,
-		backoffInit:   1 * time.Second,
-		backoffMax:    30 * time.Second,
-		resumeGrace:   defaultResumeGrace,
-		graceTimer:    realGraceTimer,
-		sleep:         ctxSleep,
-		now:           time.Now,
+		src:                src,
+		store:              store,
+		gvk:                gvk,
+		seedRV:             seedRV,
+		diffThreshold:      defaultDiffThreshold,
+		backoffInit:        1 * time.Second,
+		backoffMax:         30 * time.Second,
+		resumeGrace:        defaultResumeGrace,
+		establishTimeout:   defaultEstablishTimeout,
+		stuckThreshold:     defaultStuckThreshold,
+		stuckRetryInterval: defaultStuckRetryInterval,
+		graceTimer:         realGraceTimer,
+		establishTimer:     realGraceTimer,
+		sleep:              ctxSleep,
+		now:                time.Now,
 	}
 	for _, o := range opts {
 		o(d)
 	}
-	d.createdAt = d.now() // start the startup grace (after opts set the now seam)
 	if d.resyncPeriod > 0 {
 		// Deterministic per-kind jitter (up to 25% earlier) so drivers created together
 		// don't all relist at the same instant. Computed once — it depends only on the
@@ -317,6 +392,7 @@ func gvkJitterFraction(gvk schema.GroupVersionKind) float64 {
 func (d *kindDriver) Run(ctx context.Context) error {
 	rv := d.seedRV
 	backoff := d.backoffInit
+	failures := 0 // consecutive sync failures (failed resync OR never-established watch) — the error budget
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -334,8 +410,13 @@ func (d *kindDriver) Run(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				slog.Warn("clustersync: full re-sync failed, backing off", "gvk", d.gvk.String(), "err", err)
-				if serr := d.sleep(ctx, backoff); serr != nil {
+				// The LIST failed — charge the error budget (markStuck on the threshold
+				// crossing) and back off. Stuck drops to the slow cadence so a broken kind
+				// doesn't hammer the API server or re-take a limiter slot every step.
+				failures = d.recordFailure(failures, CauseListFailed)
+				slog.Warn("clustersync: full re-sync failed, backing off",
+					"gvk", d.gvk.String(), "err", err, "failures", failures)
+				if serr := d.sleep(ctx, d.retryDelay(backoff)); serr != nil {
 					return serr
 				}
 				backoff = d.nextBackoff(backoff)
@@ -344,33 +425,113 @@ func (d *kindDriver) Run(ctx context.Context) error {
 			rv = newRV
 		}
 
-		progressed, err := d.watchPhase(ctx, rv)
+		progressed, established, err := d.watchPhase(ctx, rv)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// Resume ended; recompute via a re-sync. A watch that delivered events is
-		// healthy — reset the backoff and re-sync immediately. A watch that ended
-		// without progress (e.g. list-but-not-watch RBAC, or an aggregated API that
-		// rejects watch) backs off so we don't hot-loop full LISTs.
+		// The watch establishing lets it make progress, so reset the consecutive-failure
+		// budget (the stuck FLAG clears separately, only once the watch proves usable —
+		// see fireOnWatch). A watch that NEVER established (LIST works but
+		// WATCH is denied/refused — list-but-not-watch RBAC, an aggregated API rejecting
+		// watch) is charged: fullResync alone can't keep the cache current, so the kind
+		// must eventually surface as stuck rather than look healthy while frozen.
+		if established {
+			failures = 0
+		} else {
+			failures = d.recordFailure(failures, CauseWatchFailed)
+		}
+		// A watch that delivered events is healthy — reset the backoff and re-sync
+		// immediately. Otherwise back off (the slow stuck cadence once stuck) so we don't
+		// hot-loop full LISTs.
 		if progressed {
 			backoff = d.backoffInit
 		} else {
-			if errors.Is(err, errExpired) {
+			switch {
+			case errors.Is(err, errExpired):
 				slog.Debug("clustersync: watch RV expired, full re-sync", "gvk", d.gvk.String())
-			} else {
+			case errors.Is(err, errWatchNotEstablished):
+				slog.Warn("clustersync: watch failed to establish, backing off",
+					"gvk", d.gvk.String(), "timeout", d.establishTimeout)
+			default:
 				slog.Warn("clustersync: watch ended without progress, backing off", "gvk", d.gvk.String())
 			}
-			if serr := d.sleep(ctx, backoff); serr != nil {
+			if serr := d.sleep(ctx, d.retryDelay(backoff)); serr != nil {
 				return serr
 			}
 			backoff = d.nextBackoff(backoff)
 		}
-		rv = ""
+		// Clear the seed RV so the next iteration re-syncs — EXCEPT when the watch only
+		// failed to ESTABLISH. There the RV we just held is still valid (nothing expired
+		// it; the connection never came up), so keep it and retry the watch from it next
+		// iteration rather than re-running a full metadata re-list of the whole kind every
+		// cycle — which, once the kind is stuck at the slow retry cadence, would otherwise
+		// repeat forever for a list-OK/watch-denied kind. A watch that connected and then
+		// expired (errExpired) or dropped without progress still clears it; a genuinely
+		// stale retained RV surfaces as a 410 on the retry and re-syncs then.
+		if !errors.Is(err, errWatchNotEstablished) {
+			rv = ""
+		}
 	}
 }
 
 func (d *kindDriver) nextBackoff(b time.Duration) time.Duration {
 	return stepBackoff(b, d.backoffMax)
+}
+
+// retryDelay is the sleep between resync attempts: the normal exponential backoff until
+// the kind is stuck, then the slow stuck cadence so a permanently-broken kind stops
+// hammering the API server (and re-taking a limiter slot) every backoff step.
+func (d *kindDriver) retryDelay(backoff time.Duration) time.Duration {
+	if d.stuck.Load() {
+		return d.stuckRetryInterval
+	}
+	return backoff
+}
+
+// recordFailure charges one sync failure — a failed fullResync (CauseListFailed), or a
+// watch that never established (CauseWatchFailed) — against the error budget, returning
+// the new consecutive-failure count. It records the cause each time (see failCause /
+// stuckCause) so a kind that goes stuck reports the phase that spent its budget. On the
+// exact threshold crossing it marks the kind stuck (the flag the liveness monitor reads
+// to surface it, see staleLaggards) and fires onStuck, which releases the driver's
+// catch-up token so a stuck INITIAL driver stops blocking the Syncing→Watching milestone.
+// The flag is cleared when the watch next proves usable (fireOnWatch, re-armed below via
+// sawWatch); onStuck (the idempotent retire token) is moot after catch-up. Firing on the
+// exact crossing keeps it once-per stuck episode without a sync.Once.
+func (d *kindDriver) recordFailure(failures int, cause StaleCause) int {
+	failures++
+	d.failCause.Store(cause)
+	if failures == d.stuckThreshold {
+		d.stuck.Store(true)
+		slog.Warn("clustersync: kind stuck after repeated sync failures",
+			"gvk", d.gvk.String(), "failures", failures)
+		// Re-arm the catch-up fire. onStuck (below) de-counts this kind's milestone token
+		// (retire.resolve(false)); if the watch later re-establishes before the milestone
+		// fires, the next watchPhase must fire onWatch again to re-count it — but fireOnWatch
+		// is one-shot via sawWatch, so clear it here. Harmless when the kind never caught up
+		// (sawWatch already false); the engine's onWatch aggregation guards against
+		// double-counting the re-sync facts across the repeat. All in the Run goroutine.
+		d.sawWatch = false
+		if d.onStuck != nil {
+			d.onStuck()
+		}
+	}
+	return failures
+}
+
+// isStuck reports whether the kind has exhausted its resync error budget; read by the
+// liveness monitor from another goroutine.
+func (d *kindDriver) isStuck() bool { return d.stuck.Load() }
+
+// stuckCause returns the cause of the current stuck episode — the most recent failure's
+// phase (see failCause). Meaningful only while isStuck. Returns the zero StaleCause ("")
+// when no failure has been recorded — an honestly-empty "unknown" rather than a specific
+// but possibly-wrong cause. A stuck driver always has a recorded cause, so the empty case
+// is unreachable in practice; keeping it honest guards a future path that sets stuck
+// without recording a failure.
+func (d *kindDriver) stuckCause() StaleCause {
+	v, _ := d.failCause.Load().(StaleCause)
+	return v
 }
 
 // stepBackoff doubles b and caps it at max — the package's one exponential-backoff
@@ -382,11 +543,19 @@ func stepBackoff(b, max time.Duration) time.Duration {
 	return b
 }
 
-// fireOnWatch reports the catch-up milestone for this driver — once per Run,
-// guarded by sawWatch — snapshotting its resync facts (didResync/resyncObjects) in
-// the Run goroutine so the engine's aggregation never races a later re-sync write.
+// fireOnWatch reports the catch-up milestone for this driver — once per catch-up
+// episode, guarded by sawWatch (which recordFailure re-arms on a stuck transition so a
+// recovery re-counts) — snapshotting its resync facts (didResync/resyncObjects) in the
+// Run goroutine so the engine's aggregation never races a later re-sync write.
+//
+// This is the driver's usability proof — the watch is proven live (a delta, a clean
+// resume grace, or a fresh-RV connect) — so it is also where the stuck flag clears, NOT
+// on the bare connect (onConnect). recordFailure re-arms sawWatch when it marks a kind
+// stuck, so stuck⟹sawWatch=false ⟹ pendingFire on the next phase ⟹ fireOnWatch runs on
+// recovery and clears stuck; a kind that connects but never proves usable stays stuck.
 func (d *kindDriver) fireOnWatch() {
 	d.sawWatch = true
+	d.stuck.Store(false) // proven usable — clear any surfaced-stale
 	if d.onWatch != nil {
 		d.onWatch(d.didResync, d.resyncObjects)
 	}
@@ -394,14 +563,15 @@ func (d *kindDriver) fireOnWatch() {
 
 // watchPhase resumes the watch from rv via a RetryWatcher and applies deltas until
 // ctx cancellation, a 410 (errExpired), or the RetryWatcher giving up (nil — Run
-// re-syncs either way). It reports whether the watch made progress (applied at
-// least one delta), which Run uses to tell a healthy watch that dropped from one
-// that never worked. RetryWatcher requests bookmarks but doesn't forward them, so
-// the driver taps the underlying watch ahead of it (watcherFor's tapEvent) to
-// observe them — bumping liveness and persisting the bookmark RV, but only once the
-// deltas before it have applied (see onBookmark). Object deltas persist their RV
-// inline below.
-func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool, err error) {
+// re-syncs either way). It reports `progressed` (applied at least one delta) and
+// `established` (the watch actually connected this phase). Run uses `progressed` to tell
+// a healthy watch that dropped from one that never worked, and `established` to charge a
+// never-connecting watch (list-but-not-watch RBAC) against the error budget. RetryWatcher
+// requests bookmarks but doesn't forward them, so the driver taps the underlying watch
+// ahead of it (watcherFor's tapEvent) to observe them — bumping liveness and persisting
+// the bookmark RV, but only once the deltas before it have applied (see onBookmark).
+// Object deltas persist their RV inline below.
+func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed, established bool, err error) {
 	// Capture this phase's epoch and retire it on return (before Run moves on to a
 	// fullList, in program order) so a straggler bookmark from this phase's tap can't
 	// resurrect the resume cookie — see cookieMu/watchEpoch.
@@ -414,17 +584,54 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 		d.cookieMu.Unlock()
 	}()
 
-	watcher := watcherFor(d.src, d.markLive, func(ev watch.Event) { d.tapEvent(ctx, epoch, ev) })
+	// connected records whether the watch established this phase — onConnect fires only
+	// after src.Watch succeeds, so a watch that's consistently denied/refused leaves it
+	// false. It's the liveness signal too: we stamp `lastLiveAt` here (on real
+	// establishment) and on each delta/bookmark, NOT merely on entering the phase — so a
+	// kind that can LIST but never WATCH doesn't keep refreshing its liveness every backoff
+	// cycle and hide as healthy. Set from the RetryWatcher goroutine, hence atomic.
+	var connected atomic.Bool
+	// connectedC wakes the select loop the instant the watch establishes. onConnect runs in
+	// the RetryWatcher goroutine, so it can't call fireOnWatch (which must snapshot the
+	// resync facts in the Run goroutine) directly — it signals here instead. Buffered and
+	// non-blocking so a reconnect never blocks onConnect; the loop coalesces repeats via
+	// pendingFire.
+	connectedC := make(chan struct{}, 1)
+	onConnect := func() {
+		connected.Store(true)
+		// NOTE: do NOT clear the stuck flag here. A watch that merely OPENS the HTTP
+		// stream hasn't proven usable — it can 410 or error immediately (an expired
+		// cookie, a flapping aggregated API), and clearing stuck on the bare open would
+		// let the milestone / liveness monitor report Watching for a kind that still
+		// can't watch, and let an open-then-error loop keep a stuck kind looking healthy.
+		// The stuck flag clears at the same usability proof that fires onWatch (a delta,
+		// a clean-resume grace, or a fresh-RV connect) — see fireOnWatch. markLive stays,
+		// though: a successful (re)open is the liveness signal a quiet cluster needs (see
+		// watcherFor), and a genuinely stuck kind is still surfaced by staleLaggards'
+		// isStuck() branch, which dominates the liveness check.
+		d.markLive()
+		select {
+		case connectedC <- struct{}{}:
+		default:
+		}
+	}
+	// Per-phase delta accounting. deltaSeen counts object deltas the tap has forwarded;
+	// deltaApplied counts those THIS phase has durably applied+persisted. A bookmark
+	// advances the resume cookie only once applied has caught up to seen, so a restart
+	// never resumes past a delta the cache hasn't stored yet. Scoped to this phase
+	// (captured by the tap closure and the apply loop below) rather than the driver: a
+	// straggler event from a prior phase — running in watch.Filter's un-joined forwarding
+	// goroutine — bumps its own now-dead counters, never these, so it can't leave a
+	// permanent seen>applied gap that would wedge cookie advancement for the rest of the
+	// run. Both are touched from the tap and Run goroutines, hence atomic.
+	var deltaSeen, deltaApplied atomic.Int64
+	watcher := watcherFor(d.src, onConnect, func(ev watch.Event) { d.tapEvent(ctx, epoch, &deltaSeen, &deltaApplied, ev) })
 	rw, err := toolswatch.NewRetryWatcherWithContext(ctx, rv, watcher)
 	if err != nil {
 		// e.g. an unusable RV; let Run fall to a full re-sync.
-		return false, err
+		return false, connected.Load(), err
 	}
 	defer rw.Stop()
-
-	// Entering the watch phase is itself proof the watch is alive — seed liveness at
-	// catch-up so a quiet kind isn't judged stale before its first bookmark arrives.
-	d.markLive()
 
 	// The periodic pull-based backstop: a watch alive this long ends itself so Run
 	// falls back to fullResync, reconciling any drift the best-effort watch silently
@@ -438,53 +645,88 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 		resyncC = rt.C
 	}
 
-	// Fire onWatch (the catch-up milestone + resync-facts snapshot) exactly once per
-	// Run. When a re-sync already ran this iteration (cold start, or the re-entry
-	// after a 410), the RV is fresh and can't expire, so fire immediately. When
-	// resuming straight from the saved cookie, the server can accept the watch and
-	// only then 410 (expired cookie), so firing on entry would misreport that re-list
-	// as a clean resume. So defer until the watch proves usable — the first delta, or
-	// a resumeGrace with no 410 — and skip it entirely if the watch 410s first; Run
-	// then re-syncs and re-enters with didResync=true, taking the immediate-fire path.
+	// Bound the wait for the watch to CONNECT this phase. RetryWatcher retries retriable
+	// errors (5xx, EOF, timeout) internally without ever closing ResultChan, and a hung watch
+	// request never returns, so without this the phase could block forever — never returning,
+	// never spending the error budget, holding its catch-up token and wedging the engine in
+	// Syncing. On timeout we return so Run charges a CauseWatchFailed and, after enough
+	// failures, surfaces the kind as stuck. Disarmed the moment the watch connects; a
+	// post-connect reconnect wedge is the liveness monitor's job (CauseWatchStalled), not this.
+	establishC, establishStop := d.establishTimer(d.establishTimeout)
+	defer establishStop()
+
+	// Fire onWatch (the catch-up milestone + resync-facts snapshot) exactly once per Run, but
+	// never before the watch is proven live — retiring the token early would report a clean
+	// sync a kind never achieved. Both proofs start from the watch CONNECTING (onConnect →
+	// connectedC); the resume-grace timer is armed from that connection, not phase entry, so a
+	// slow or denied watch can't fire a false clean-resume before any watch exists:
+	//
+	//   - A re-sync already ran this iteration (cold start, or the re-entry after a 410): the
+	//     RV is fresh and can't 410, so connecting IS the catch-up proof — fire on connect.
+	//     Firing on entry instead would retire the token even when LIST is allowed but WATCH is
+	//     forbidden (list-but-not-watch RBAC), reporting Watching for a kind with no watch.
+	//   - Resuming straight from the saved cookie: an accepted watch can still 410 (expired
+	//     cookie), so connecting isn't enough — on connect, wait a resumeGrace for the first
+	//     delta or a quiet interval with no 410 before reporting a clean resume, and skip the
+	//     fire entirely if the watch 410s first (Run re-syncs and re-enters didResync=true).
 	var graceC <-chan time.Time
-	pendingFire := false
-	if !d.sawWatch {
-		if d.didResync {
-			d.fireOnWatch()
-		} else {
-			pendingFire = true
-			ch, stop := d.graceTimer(d.resumeGrace)
-			defer stop()
-			graceC = ch
+	var graceStop func()
+	defer func() {
+		if graceStop != nil {
+			graceStop()
 		}
-	}
+	}()
+	pendingFire := !d.sawWatch
 
 	sawExpired := false
 	for {
 		select {
 		case <-ctx.Done():
-			return progressed, ctx.Err()
+			return progressed, connected.Load(), ctx.Err()
+		case <-establishC:
+			// The watch didn't connect within establishTimeout (RetryWatcher may be looping on
+			// a retriable error, or the request is wedged). Return so Run charges the failure
+			// rather than blocking here forever. Guard the connect race: if onConnect landed as
+			// the timer fired, treat it as connected and carry on.
+			if connected.Load() {
+				establishC = nil
+				continue
+			}
+			return progressed, false, errWatchNotEstablished
 		case <-graceC:
-			// No delta and no 410 within the grace — the watch accepted the cookie and
-			// is merely quiet, so this is a clean resume. Fire and stop watching grace.
+			// Connected, then no delta and no 410 within the grace — a clean resume. Fire.
 			d.fireOnWatch()
 			pendingFire, graceC = false, nil
+		case <-connectedC:
+			// The watch connected. Disarm the establishment timeout and start the fire path.
+			establishC = nil
+			if pendingFire {
+				if d.didResync {
+					// Fresh post-resync RV can't 410 — connecting IS the catch-up proof.
+					d.fireOnWatch()
+					pendingFire = false
+				} else if graceC == nil {
+					// Cookie resume: arm the grace FROM the connection. A delta or a quiet grace
+					// with no 410 then reports the clean resume; a 410 first disqualifies it.
+					graceC, graceStop = d.graceTimer(d.resumeGrace)
+				}
+			}
 		case <-resyncC:
 			// Periodic full re-sync fell due (the pull-based backstop). End the watch so
 			// Run re-syncs. Report progress so Run re-syncs immediately without backoff —
 			// a watch alive this long is healthy by definition.
-			return true, nil
+			return true, connected.Load(), nil
 		case ev, ok := <-rw.ResultChan():
 			if !ok {
 				if sawExpired {
-					return progressed, errExpired
+					return progressed, connected.Load(), errExpired
 				}
-				return progressed, nil
+				return progressed, connected.Load(), nil
 			}
 			switch ev.Type {
 			case watch.Added, watch.Modified, watch.Deleted:
-				// The first forwarded delta proves the cookie was accepted; fire a still-
-				// pending onWatch now rather than waiting out the grace.
+				// The first forwarded delta proves the watch is live; fire a still-pending
+				// onWatch now rather than waiting out the grace.
 				if pendingFire {
 					d.fireOnWatch()
 					pendingFire, graceC = false, nil
@@ -505,7 +747,7 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 					}
 				}
 				// This delta is now durable — let a pending bookmark advance past it.
-				d.deltaApplied.Add(1)
+				deltaApplied.Add(1)
 			case watch.Error:
 				// RetryWatcher forwards the Status then closes the channel. A 410
 				// means our RV expired; anything else it treats as fatal too.
@@ -523,6 +765,18 @@ func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool
 // large or the cache is empty, where one full LIST is cheaper. Events take the
 // plain full-LIST path. Returns the resourceVersion to seed the watch from.
 func (d *kindDriver) fullResync(ctx context.Context) (string, error) {
+	// Bound concurrent full LISTs across the run's drivers: a cold driver goes straight
+	// to a (paginated) full LIST — and even the metadata-diff path below lists all
+	// metadata at once — so without this cold-start peak memory would scale with the
+	// kind count. The slot is held only for this list-heavy work (released before Run
+	// re-enters the indefinite watch phase), so N drivers list at a time and the rest
+	// queue. A nil limiter (unit tests) imposes no bound.
+	release, err := d.limiter.acquire(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
 	// Reaching fullResync means this kind couldn't resume its watch directly (no
 	// saved resource-version, or it expired) — record that for the catch-up report.
 	d.didResync = true
@@ -594,12 +848,22 @@ func (d *kindDriver) fullResync(ctx context.Context) (string, error) {
 // listPageSize bounds how many objects one cold-LIST page pulls, so a kind's full
 // bodies stream into the store a page at a time instead of materializing at once —
 // the memory bound that makes a cold start / large-churn relist safe. maxListRestarts
-// caps the Continue-token-expiry restarts so persistent expiry surfaces to Run's
-// backoff rather than looping forever.
+// caps the Continue-token-expiry restarts before fullList gives up (errListRestartBudget),
+// so persistent expiry surfaces to Run's error budget rather than looping forever.
 const (
 	listPageSize    = 500
 	maxListRestarts = 3
 )
+
+// errListRestartBudget means a paginated full LIST couldn't finish within the
+// continue-token lifetime even after maxListRestarts re-lists from the top — a kind so
+// large (relative to the cluster's token TTL) that pagination can't complete. We return
+// this rather than falling back to a single unpaginated LIST: that would load the whole
+// kind's bodies into memory at once, the exact blow-up pagination exists to avoid, and
+// on a multi-million-object kind could OOM the sidecar. Run counts it toward the kind's
+// error budget (see recordFailure) and, once spent, marks the kind stuck so it's
+// surfaced to the user instead of retried hot.
+var errListRestartBudget = errors.New("clustersync: continue token kept expiring; kind too large to paginate within its lifetime")
 
 // fullList streams a paginated full LIST into the store: each page lands as it
 // arrives (bounding memory to one page of bodies), and a final Commit finalizes the
@@ -608,9 +872,8 @@ const (
 // mid-pagination — the driver discards the partial pass and re-lists from the top
 // (matching a client-go Reflector), bounded by maxListRestarts. Once that budget is
 // spent (a token that keeps expiring at the same point — a kind whose full paginated
-// pass outlives the token lifetime), it falls back once to an unpaginated LIST
-// (client-go's FullListIfExpired): trade the per-page memory bound once for
-// guaranteed completion, so the kind doesn't wedge in an endless heavy-LIST cycle.
+// pass outlives the token lifetime), it returns errListRestartBudget rather than
+// loading the whole kind unpaginated; the caller's error budget then surfaces the kind.
 func (d *kindDriver) fullList(ctx context.Context) (string, error) {
 	// BeginReplace opens the session (whose first WritePage invalidates the resume
 	// cookie, rewritten only by a successful Commit), so an exit at any point below —
@@ -627,26 +890,24 @@ func (d *kindDriver) fullList(ctx context.Context) (string, error) {
 	opts := metav1.ListOptions{Limit: listPageSize}
 	var lastRV string
 	listed, restarts := 0, 0
-	fellBack := false // whether we've already dropped to the unpaginated fallback
 	for {
+		// The request's read-inactivity timeout lives in the driver clients' transport
+		// (see idleTimeoutRoundTripper), so a slow-but-progressing page runs as long as it
+		// keeps streaming while a wedged one is cancelled — no wall-clock deadline here.
 		items, cont, rv, err := d.src.List(ctx, opts)
 		if err != nil {
-			if listExpired(err) && opts.Continue != "" && !fellBack {
-				// Fresh session either way — the partial pass is discarded and re-listed
-				// from the top.
+			if listExpired(err) && opts.Continue != "" {
+				if restarts >= maxListRestarts {
+					// The paginated pass can't finish inside the token lifetime. Give up —
+					// the error budget surfaces the kind rather than us loading it whole.
+					return "", errListRestartBudget
+				}
+				// Discard the partial pass and re-list from the top with a fresh session.
 				if sess, err = d.store.BeginReplace(ctx); err != nil {
 					return "", err
 				}
-				if restarts < maxListRestarts {
-					opts.Continue, listed = "", 0
-					restarts++
-					continue
-				}
-				// Restart budget spent: the paginated pass can't finish inside the
-				// token lifetime. Fall back once to a single unpaginated LIST (no Limit,
-				// no Continue) so the kind completes instead of looping heavy LISTs
-				// forever (Syncing → EngineStale, cold on disk).
-				opts, listed, fellBack = metav1.ListOptions{}, 0, true
+				opts.Continue, listed = "", 0
+				restarts++
 				continue
 			}
 			return "", err
@@ -704,38 +965,42 @@ func (d *kindDriver) liveAt() time.Time {
 
 // tapEvent inspects one raw watch event the tap observed ahead of RetryWatcher
 // (which is why it runs in the tap's goroutine, not the apply loop). Object
-// deltas bump deltaSeen — the ordered high-water mark a bookmark checks against —
-// while bookmarks stamp liveness and conditionally advance the resume cookie.
-func (d *kindDriver) tapEvent(ctx context.Context, epoch int64, ev watch.Event) {
+// deltas bump seen — the ordered high-water mark a bookmark checks against —
+// while bookmarks stamp liveness and conditionally advance the resume cookie. seen
+// and applied are the current watch phase's counters (see watchPhase), so a
+// straggler tap from an already-ended phase touches only that phase's counters.
+func (d *kindDriver) tapEvent(ctx context.Context, epoch int64, seen, applied *atomic.Int64, ev watch.Event) {
 	switch ev.Type {
 	case watch.Added, watch.Modified, watch.Deleted:
-		d.deltaSeen.Add(1)
+		seen.Add(1)
 	case watch.Bookmark:
-		d.onBookmark(ctx, epoch, resourceVersionOf(ev.Object))
+		d.onBookmark(ctx, epoch, seen, applied, resourceVersionOf(ev.Object))
 	}
 }
 
 // onBookmark handles a bookmark the watch tap observed: stamp liveness and advance
 // the persisted resume cookie (so a cold restart resumes closer to head even on a
 // quiet cluster). The cookie only moves once every delta the tap forwarded before
-// this bookmark has applied (deltaApplied caught up to the deltaSeen snapshot):
-// the server places a bookmark at/after all prior events, so advancing while a
-// delta is un-applied would let a restart skip it permanently. Deltas in flight
-// just defer the advance to the next bookmark. Liveness is stamped regardless.
+// this bookmark has applied (applied caught up to the seen snapshot): the server
+// places a bookmark at/after all prior events, so advancing while a delta is
+// un-applied would let a restart skip it permanently. Deltas in flight just defer
+// the advance to the next bookmark. Liveness is stamped regardless. seen/applied are
+// this watch phase's counters, so a straggler bookmark from an ended phase compares
+// that phase's own (dead) counts and never wedges a later phase's advancement.
 // Best-effort persistence — a write error is logged and swallowed. epoch is the
 // watch phase that spawned this tap; the cookie only moves while that phase is still
 // current (see cookieMu/watchEpoch), so a straggler surfacing after watchPhase
 // returned can't resurrect a cookie a concurrent fullList deleted.
-func (d *kindDriver) onBookmark(ctx context.Context, epoch int64, rv string) {
+func (d *kindDriver) onBookmark(ctx context.Context, epoch int64, seen, applied *atomic.Int64, rv string) {
 	if rv == "" {
 		return
 	}
 	// Snapshot the high-water mark before marking live. The tap is single-threaded,
-	// so no new delta is forwarded while this runs — deltaSeen is frozen at exactly
+	// so no new delta is forwarded while this runs — seen is frozen at exactly
 	// the count of deltas preceding this bookmark.
-	seen := d.deltaSeen.Load()
+	n := seen.Load()
 	d.markLive()
-	if d.deltaApplied.Load() < seen {
+	if applied.Load() < n {
 		return
 	}
 	d.cookieMu.Lock()

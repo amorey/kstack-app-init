@@ -336,26 +336,196 @@ func TestEngineReportsCatchUpFacts(t *testing.T) {
 	ctx := context.Background()
 	cdb := migratedCDB(t)
 
-	// Seed two cached objects so the reported count is real.
-	store := newObjectsStore(ctx, cdb.ID(), podGVK(), cdb.Writer(), cdb)
+	// Seed two cached objects (cold SyncedObjects is queried) plus four catalog kinds. The
+	// catalog is intentionally seeded to prove SyncedKinds is NOT read from it: kind_catalog
+	// at milestone time isn't the synced set (a partial discovery preserves rows for
+	// unavailable groups; a mid-run kind lands tokenless), so the count is the caught-up
+	// tally the milestone hands in — here 3, deliberately different from the 4 catalog rows.
+	w := cdb.Writer()
+	store := newObjectsStore(ctx, cdb.ID(), podGVK(), w, cdb)
 	require.NoError(t, store.ApplyChange(watch.Added, uObj("p1", "v1", "Pod", "default", "p1", "1")))
 	require.NoError(t, store.ApplyChange(watch.Added, uObj("p2", "v1", "Pod", "default", "p2", "2")))
+	for _, k := range [][2]string{{"Pod", "pods"}, {"Service", "services"}, {"Node", "nodes"}, {"ConfigMap", "configmaps"}} {
+		_, err := w.Exec(`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd) VALUES('v1', ?, ?, 'Namespaced', 0)`,
+			k[0], k[1])
+		require.NoError(t, err)
+	}
 
 	sink := newRecordingSink()
 	at := time.Date(2026, 6, 12, 10, 0, 5, 0, time.UTC)
 	startedAt := at.Add(-3 * time.Second)
 	e := newEngineWithOptions(nil, cdb, sink, withEngineNow(func() time.Time { return at }))
 
-	e.reportCaughtUp(ctx, true /*coldStart*/, 4 /*kinds*/, startedAt, 0 /*resyncedKinds*/, 0 /*resyncedObjects*/)
+	e.reportCaughtUp(ctx, true /*coldStart*/, startedAt, 3 /*syncedKinds*/, 0 /*resyncedKinds*/, 0 /*resyncedObjects*/)
 
 	sts := sink.statuses()
 	require.Len(t, sts, 1)
 	got := sts[0]
 	require.Equal(t, EngineWatching, got.State)
 	require.True(t, got.ColdStart)
-	require.Equal(t, 4, got.SyncedKinds)
+	require.Equal(t, 3, got.SyncedKinds, "the caught-up tally passed in, not a kind_catalog COUNT(*)")
 	require.Equal(t, 2, got.SyncedObjects)
 	require.Equal(t, 3*time.Second, got.CaughtUpIn)
+}
+
+// The milestone fires exactly once, when every initial kind has released its gate — reaching
+// watch, going stuck, or being removed all release it the same way. reachedWatch distinguishes
+// them only for the caughtUp tally: the SyncComplete kind count is how many resolved by
+// REACHING a watch, so a stuck kind never counts and a duplicate resolve can't inflate it.
+func TestMilestoneFiresOnceWhenCohortResolves(t *testing.T) {
+	fires, gotCount := 0, -1
+	m := newMilestone(3, func(syncedKinds int) { fires++; gotCount = syncedKinds })
+	a, b, c := m.token(), m.token(), m.token()
+	a.resolve(true)  // A reached watch
+	b.resolve(false) // B went stuck — same effect on the gate: it releases
+	require.Equal(t, 0, fires, "not fired until the last kind resolves")
+	c.resolve(true)
+	require.Equal(t, 1, fires, "fires once when the last kind resolves")
+	require.Equal(t, 2, gotCount, "the fire callback is handed the caught-up count")
+	// Idempotent — a duplicate resolve never re-fires and never double-counts the tally.
+	c.resolve(true)
+	a.resolve(true)
+	require.Equal(t, 1, fires)
+	require.Equal(t, 2, m.caughtUpCount(),
+		"only the two reached-watch kinds count; the stuck one doesn't, and duplicates don't inflate it")
+}
+
+// A stuck initial token releases the gate (so a permanently-broken kind can't wedge Syncing)
+// but stays re-gate-able: if it recovers before the milestone fires, its onWatch retroactively
+// counts it. Regression for the undercount the one-shot version produced.
+func TestMilestoneStuckTokenRecoversAndCounts(t *testing.T) {
+	fires, gotCount := 0, -1
+	m := newMilestone(2, func(syncedKinds int) { fires++; gotCount = syncedKinds })
+	a, b := m.token(), m.token()
+	a.resolve(false) // A goes stuck early — releases the gate without counting
+	require.Equal(t, 0, fires, "one kind still pending")
+	a.resolve(true) // A's watch establishes before the cohort finishes — now counted
+	b.resolve(true) // B catches up, closing the milestone
+	require.Equal(t, 1, fires)
+	require.Equal(t, 2, gotCount, "the recovered kind is counted, not undercounted at 1")
+}
+
+// Fix-1 regression (P2): a kind that reaches its watch, then exhausts its error budget
+// (stuck), then RECOVERS before the milestone fires must be re-counted toward the caught-up
+// tally. The DRIVER re-arms its one-shot onWatch fire on the stuck transition (clearing
+// sawWatch), and the engine's re-sync aggregation is separately guarded so the repeat fire
+// doesn't double-count. Without the re-arm, fireOnWatch stayed suppressed and SyncedKinds
+// undercounted. This exercises the driver mechanics wired exactly as startDriver does.
+func TestDriverReCountsMilestoneAfterStuckRecovery(t *testing.T) {
+	gotCount := -1
+	m := newMilestone(2, func(syncedKinds int) { gotCount = syncedKinds })
+	retire, other := m.token(), m.token()
+
+	// Wire a driver as the engine's startDriver does: onWatch aggregates the re-sync facts
+	// once (guarded) and re-counts the token; onStuck de-counts it.
+	d := newKindDriverWithOptions(&fakeSource{}, nil, podGVK(), "1", withStuckThreshold(2))
+	resyncKinds, resyncObjs, resyncReported := 0, 0, false
+	d.onWatch = func(resynced bool, objects int) {
+		if resynced && !resyncReported {
+			resyncKinds++
+			resyncObjs += objects
+			resyncReported = true
+		}
+		retire.resolve(true)
+	}
+	d.onStuck = func() { retire.resolve(false) }
+
+	// Reached its watch via a full re-sync of 5 bodies.
+	d.didResync, d.resyncObjects = true, 5
+	d.fireOnWatch()
+	require.True(t, d.sawWatch, "fired once")
+	require.Equal(t, 1, m.caughtUpCount(), "counted toward the tally")
+	require.Equal(t, 1, resyncKinds)
+	require.Equal(t, 5, resyncObjs)
+
+	// Exhausts its error budget: two failures cross the stuck threshold, firing onStuck
+	// (de-count) and re-arming the fire (sawWatch cleared).
+	failures := 0
+	failures = d.recordFailure(failures, CauseWatchFailed)
+	failures = d.recordFailure(failures, CauseWatchFailed)
+	require.True(t, d.isStuck())
+	require.False(t, d.sawWatch, "the stuck transition re-arms the catch-up fire")
+	require.Equal(t, 0, m.caughtUpCount(), "de-counted while stuck")
+
+	// Recovers before the milestone fires: the next watchPhase's pendingFire is armed
+	// (sawWatch false), so fireOnWatch fires again and re-counts the token.
+	d.fireOnWatch()
+	require.Equal(t, 1, m.caughtUpCount(), "recovery re-counts the kind")
+	require.Equal(t, 1, resyncKinds, "re-sync facts are not double-counted across the repeat")
+	require.Equal(t, 5, resyncObjs)
+
+	// The cohort closes out at the full count, not undercounted at 1.
+	other.resolve(true)
+	require.Equal(t, 2, gotCount, "SyncedKinds reflects the recovered kind")
+}
+
+// A stuck token that discovery repoints must RE-HOLD the gate for its (never-watched)
+// replacement — otherwise another kind resolving would fire a false catch-up while the
+// replacement is still listing. Regression for the false-EngineWatching repoint case.
+func TestMilestoneRepointReGatesStuckToken(t *testing.T) {
+	fires := 0
+	m := newMilestone(2, func(int) { fires++ })
+	a, b := m.token(), m.token()
+	a.resolve(false) // A stuck — releases the gate
+	a.rearm()        // discovery repoints A → transfer to a fresh replacement, re-hold the gate
+	b.resolve(true)  // B catches up — must NOT fire: A's replacement hasn't synced
+	require.Equal(t, 0, fires, "a re-armed token keeps the milestone open until its replacement resolves")
+	a.resolve(true) // the replacement finally reaches a watch
+	require.Equal(t, 1, fires, "now the whole cohort has resolved")
+	require.Equal(t, 2, m.caughtUpCount(),
+		"both kinds are watching; the repointed one counts once despite stuck→rearm→caught-up")
+}
+
+// When the initial cohort resolves with every kind healthy, the milestone reports a
+// genuine caught-up EngineWatching.
+func TestReportCaughtUpOrStaleHealthyReportsWatching(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	sink := newRecordingSink()
+	at := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	e := newEngineWithOptions(nil, cdb, sink, withEngineNow(func() time.Time { return at }))
+
+	mk := func(kind string) *kindDriver {
+		d := newKindDriverWithOptions(&fakeSource{}, nil, schema.GroupVersionKind{Version: "v1", Kind: kind}, "1",
+			withNow(func() time.Time { return at }))
+		d.markLive() // watched, fresh liveness
+		return d
+	}
+	e.reportCaughtUpOrStale(ctx, []*kindDriver{mk("Pod"), mk("Node")}, true, at.Add(-time.Second), 2 /*syncedKinds*/, 0, 0)
+
+	sts := sink.statuses()
+	require.Len(t, sts, 1)
+	require.Equal(t, EngineWatching, sts[0].State, "a fully-healthy cohort catches up")
+	require.Equal(t, 2, sts[0].SyncedKinds, "reports the caught-up kind tally it was handed")
+	require.Empty(t, sts[0].StaleKinds)
+}
+
+// Regression (P1): when a stuck initial driver closes out the milestone, the engine must
+// report EngineStale naming it — NOT a false EngineWatching/SyncComplete that the liveness
+// monitor only corrects on its next tick.
+func TestReportCaughtUpOrStaleStuckReportsStaleNotWatching(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	sink := newRecordingSink()
+	at := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	e := newEngineWithOptions(nil, cdb, sink, withEngineNow(func() time.Time { return at }))
+
+	watched := newKindDriverWithOptions(&fakeSource{}, nil, schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, "1",
+		withNow(func() time.Time { return at }))
+	watched.markLive()
+	stuck := newKindDriverWithOptions(&fakeSource{}, nil, schema.GroupVersionKind{Version: "v1", Kind: "Node"}, "1",
+		withNow(func() time.Time { return at }))
+	stuck.recordFailure(0, CauseListFailed) // record the cause that spent its budget
+	stuck.stuck.Store(true)                 // exhausted its error budget — never synced
+
+	e.reportCaughtUpOrStale(ctx, []*kindDriver{watched, stuck}, true, at.Add(-time.Second), 1 /*syncedKinds*/, 0, 0)
+
+	sts := sink.statuses()
+	require.Len(t, sts, 1)
+	got := sts[0]
+	require.Equal(t, EngineStale, got.State, "a stuck kind must surface as Stale, not a false catch-up")
+	require.Equal(t, []KindStatus{{Kind: "Node", Cause: CauseListFailed}}, got.StaleKinds)
+	require.Zero(t, got.CaughtUpIn, "no catch-up counts are emitted for a stuck milestone")
 }
 
 // discoverGVRs rewrites kind_catalog and prunes orphaned kinds outside the per-object
@@ -529,7 +699,7 @@ func TestEngineDiscoveryLoopReconcilesDriversToDiscovery(t *testing.T) {
 	}
 	seed(deploymentGVK, deploymentGVR)
 	seed(widgetGVK, widgetGVR)
-	startDriver := func(entry gvrEntry, _ func(bool), _ bool) {
+	startDriver := func(entry gvrEntry, _ *milestoneToken, _ bool) {
 		mu.Lock()
 		added = append(added, entry.GVK)
 		mu.Unlock()
@@ -651,7 +821,7 @@ func TestReconcileDiscoveryRepointsDriverOnGVRChange(t *testing.T) {
 	}
 
 	var added []gvrEntry
-	startDriver := func(entry gvrEntry, retire func(bool), _ bool) {
+	startDriver := func(entry gvrEntry, retire *milestoneToken, _ bool) {
 		added = append(added, entry)
 		ds.mu.Lock()
 		ds.byGVK[entry.GVK] = driverHandle{
@@ -710,7 +880,7 @@ func TestReconcileDiscoveryPartialPassLaunchesWithoutRemoving(t *testing.T) {
 	}
 
 	var added []schema.GroupVersionKind
-	startDriver := func(entry gvrEntry, _ func(bool), _ bool) {
+	startDriver := func(entry gvrEntry, _ *milestoneToken, _ bool) {
 		added = append(added, entry.GVK)
 		ds.mu.Lock()
 		ds.byGVK[entry.GVK] = driverHandle{driver: newKindDriverWithOptions(&fakeSource{}, nil, entry.GVK, "1", withGVR(entry.GVR)), cancel: func() {}, done: closedDone}
@@ -761,7 +931,7 @@ func TestReconcileDiscoveryPrunesOrphansOnEveryCompletePass(t *testing.T) {
 	}
 
 	// Complete pass returns after one iteration; deployment already running, nothing removed.
-	e.reconcileDiscovery(ctx, dc, ds, func(gvrEntry, func(bool), bool) {})
+	e.reconcileDiscovery(ctx, dc, ds, func(gvrEntry, *milestoneToken, bool) {})
 
 	require.Equal(t, 0, countObjectsByKind(t, w, "Widget", "example.com/v1"),
 		"the orphan is pruned even though this complete pass removed no driver")
@@ -801,14 +971,17 @@ func TestReconcileDiscoveryRetiresRemovedDriverAfterPrune(t *testing.T) {
 		driver: newKindDriverWithOptions(&fakeSource{}, nil, deploymentGVK, "1", withGVR(deploymentGVR)),
 		cancel: func() {}, done: closedDone,
 	}
+	// A one-kind milestone whose fire callback captures the widget row count at the moment
+	// the token resolves — so the test can prove the token is resolved only AFTER the prune.
 	rowsAtRetire := -1
+	m := newMilestone(1, func(int) { rowsAtRetire = countObjectsByKind(t, w, "Widget", "example.com/v1") })
 	ds.byGVK[widgetGVK] = driverHandle{
 		driver: newKindDriverWithOptions(&fakeSource{}, nil, widgetGVK, "1", withGVR(widgetGVR)),
 		cancel: func() {}, done: closedDone,
-		retire: func(bool) { rowsAtRetire = countObjectsByKind(t, w, "Widget", "example.com/v1") },
+		retire: m.token(),
 	}
 
-	e.reconcileDiscovery(ctx, dc, ds, func(gvrEntry, func(bool), bool) {})
+	e.reconcileDiscovery(ctx, dc, ds, func(gvrEntry, *milestoneToken, bool) {})
 
 	require.Equal(t, 0, rowsAtRetire, "the retirement callback runs only after the removed kind's rows are pruned")
 	require.False(t, ds.has(widgetGVK), "the removed driver is dropped")
@@ -850,7 +1023,7 @@ func TestReconcileDiscoveryPrunesOrphanedResumeCookies(t *testing.T) {
 		cancel: func() {}, done: closedDone,
 	}
 
-	e.reconcileDiscovery(ctx, dc, ds, func(gvrEntry, func(bool), bool) {})
+	e.reconcileDiscovery(ctx, dc, ds, func(gvrEntry, *milestoneToken, bool) {})
 
 	widgetRV, err := readLastListRV(ctx, cdb.Writer(), widgetGVK)
 	require.NoError(t, err)
@@ -896,7 +1069,7 @@ func TestReconcileDiscoveryRepointInvalidatesCookieAndRelaunchesCold(t *testing.
 	}
 
 	var forceCold []bool
-	startDriver := func(entry gvrEntry, _ func(bool), fc bool) {
+	startDriver := func(entry gvrEntry, _ *milestoneToken, fc bool) {
 		forceCold = append(forceCold, fc)
 		ds.mu.Lock()
 		ds.byGVK[entry.GVK] = driverHandle{driver: newKindDriverWithOptions(&fakeSource{}, nil, entry.GVK, "1", withGVR(entry.GVR)), cancel: func() {}, done: closedDone}
@@ -932,17 +1105,19 @@ func TestReconcileDiscoveryTransfersCatchUpTokenOnRepoint(t *testing.T) {
 	closedDone := make(chan struct{})
 	close(closedDone)
 
-	// The old driver's token records every call — it must NOT be fired during the repoint
-	// (the obligation is transferred, not discharged).
-	var tokenCalls []bool
-	token := func(gone bool) { tokenCalls = append(tokenCalls, gone) }
+	// A one-kind milestone whose token belongs to the old driver. The repoint must transfer
+	// and re-arm that token onto the replacement rather than firing the milestone, so the
+	// engine can't report Watching before the replacement's full LIST finishes.
+	milestoneFires := 0
+	m := newMilestone(1, func(int) { milestoneFires++ })
+	tok := m.token()
 	ds.byGVK[widgetGVK] = driverHandle{
 		driver: newKindDriverWithOptions(&fakeSource{}, nil, widgetGVK, "1", withGVR(oldGVR)),
-		cancel: func() {}, done: closedDone, retire: token,
+		cancel: func() {}, done: closedDone, retire: tok,
 	}
 
-	var replacementTokens []func(bool)
-	startDriver := func(entry gvrEntry, retire func(bool), _ bool) {
+	var replacementTokens []*milestoneToken
+	startDriver := func(entry gvrEntry, retire *milestoneToken, _ bool) {
 		replacementTokens = append(replacementTokens, retire)
 		ds.mu.Lock()
 		ds.byGVK[entry.GVK] = driverHandle{
@@ -954,17 +1129,18 @@ func TestReconcileDiscoveryTransfersCatchUpTokenOnRepoint(t *testing.T) {
 
 	e.reconcileDiscovery(ctx, dc, ds, startDriver)
 
-	require.Empty(t, tokenCalls, "the old driver's catch-up token is NOT fired on a repoint")
+	require.Zero(t, milestoneFires, "a repoint does not fire the catch-up milestone")
 	require.Len(t, replacementTokens, 1, "the kind is relaunched once")
-	require.NotNil(t, replacementTokens[0], "the replacement inherits the catch-up obligation")
+	require.Same(t, tok, replacementTokens[0], "the replacement inherits the SAME token")
 	gvr, ok := ds.gvr(widgetGVK)
 	require.True(t, ok)
 	require.Equal(t, newGVR, gvr, "the replacement watches the new endpoint")
 
-	// The replacement holds the SAME token: firing it (as its watch phase would) records
-	// through to the original, so the milestone was gated on the replacement's catch-up.
-	replacementTokens[0](false)
-	require.Equal(t, []bool{false}, tokenCalls, "the replacement carries the transferred obligation")
+	// Only when the REPLACEMENT reaches a watch does the milestone fire — gated on the
+	// replacement's own catch-up, not the old driver's.
+	replacementTokens[0].resolve(true)
+	require.Equal(t, 1, milestoneFires, "the replacement's catch-up closes the milestone")
+	require.Equal(t, 1, m.caughtUpCount())
 }
 
 // driverSet.remove is synchronous: it cancels the driver and blocks until its
@@ -981,18 +1157,13 @@ func TestDriverSetRemoveQuiescesThenReturnsRetire(t *testing.T) {
 
 	ds := newDriverSet()
 	var exited atomic.Bool
-	var retiredGone atomic.Int32 // -1 unset; 0 = retire(false); 1 = retire(true)
-	retiredGone.Store(-1)
-	// onExit must run before remove returns (proving quiesce); the token is the retire.
+	// onExit must run before remove returns (proving quiesce); a one-kind milestone's token
+	// is the retire, its fire callback observing when the obligation is discharged.
+	retired := 0
+	m := newMilestone(1, func(int) { retired++ })
 	ds.launch(ctx, d,
 		func(error) { exited.Store(true) },
-		func(gone bool) {
-			if gone {
-				retiredGone.Store(1)
-			} else {
-				retiredGone.Store(0)
-			}
-		})
+		m.token())
 
 	<-fs.watchers // the driver reached its watch phase (running)
 	require.True(t, ds.has(podGVK()))
@@ -1000,12 +1171,12 @@ func TestDriverSetRemoveQuiescesThenReturnsRetire(t *testing.T) {
 	retire := ds.remove(podGVK())
 
 	require.True(t, exited.Load(), "remove blocks until the driver goroutine has stopped (quiesced)")
-	require.Equal(t, int32(-1), retiredGone.Load(), "remove returns the token WITHOUT firing it — the caller controls timing")
+	require.Zero(t, retired, "remove returns the token WITHOUT resolving it — the caller controls timing")
 	require.False(t, ds.has(podGVK()), "removed from the set")
 
 	require.NotNil(t, retire, "an initial driver's catch-up token is returned for the caller to fire or transfer")
-	retire(true)
-	require.Equal(t, int32(1), retiredGone.Load(), "invoking the returned token retires the catch-up obligation")
+	retire.resolve(false)
+	require.Equal(t, 1, retired, "resolving the returned token retires the catch-up obligation")
 }
 
 // The trigger watch is a best-effort accelerator: it signals a re-discovery ONLY on a
@@ -1189,7 +1360,7 @@ func TestEngineReportsResyncFacts(t *testing.T) {
 	startedAt := at.Add(-8 * time.Second)
 	e := newEngineWithOptions(nil, cdb, sink, withEngineNow(func() time.Time { return at }))
 
-	e.reportCaughtUp(ctx, false /*coldStart*/, 120 /*kinds*/, startedAt, 4 /*resyncedKinds*/, 340 /*resyncedObjects*/)
+	e.reportCaughtUp(ctx, false /*coldStart*/, startedAt, 6 /*syncedKinds*/, 4 /*resyncedKinds*/, 340 /*resyncedObjects*/)
 
 	sts := sink.statuses()
 	require.Len(t, sts, 1)
@@ -1225,14 +1396,14 @@ func TestEngineLivenessMonitorFlagsStaleAndRecovers(t *testing.T) {
 	close(caughtUp)
 	done := make(chan struct{})
 	drivers := func() []*kindDriver { return []*kindDriver{dPod, dSvc} }
-	go func() { defer close(done); e.livenessMonitor(ctx, drivers, caughtUp) }()
+	go func() { defer close(done); e.livenessMonitor(ctx, drivers, caughtUp, false, time.Time{}, nil) }()
 
 	// Keep Service alive but let Pod go quiet past the threshold → stale, naming Pod.
 	clk.advance(6 * time.Minute)
 	dSvc.markLive()
 	waitFor(t, func() bool {
 		for _, st := range sink.statuses() {
-			if st.State == EngineStale && len(st.StaleKinds) == 1 && st.StaleKinds[0] == "Pod" {
+			if st.State == EngineStale && len(st.StaleKinds) == 1 && st.StaleKinds[0].Kind == "Pod" {
 				return true
 			}
 		}
@@ -1245,6 +1416,107 @@ func TestEngineLivenessMonitorFlagsStaleAndRecovers(t *testing.T) {
 		sts := sink.statuses()
 		return len(sts) > 0 && sts[len(sts)-1].State == EngineWatching
 	}, "recovers to Watching once liveness returns")
+
+	cancel()
+	<-done
+}
+
+// Regression: when a stuck kind closed out the catch-up milestone, reportCaughtUpOrStale
+// publishes EngineStale naming it. The monitor must SEED its baseline from that published
+// state — otherwise a kind that recovers before the monitor's first tick would leave the
+// engine wrongly Stale forever (the monitor would think nothing was ever stale, so never
+// publish the recovery).
+func TestEngineLivenessMonitorSeedsFromMilestoneStale(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clk := &fakeClock{t: time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)}
+	nodeGVK := schema.GroupVersionKind{Version: "v1", Kind: "Node"}
+	dNode := newKindDriverWithOptions(&fakeSource{}, nil, nodeGVK, "1", withNow(clk.now))
+	dNode.markLive() // the kind has since recovered (healthy, not stuck)
+
+	sink := newRecordingSink()
+	e := newEngineWithOptions(nil, nil, sink,
+		withEngineNow(clk.now),
+		withStaleThreshold(5*time.Minute),
+		withStaleCheckInterval(time.Millisecond))
+
+	// The milestone published EngineStale naming the stuck kind.
+	e.report(func(s *EngineStatus) {
+		s.State, s.StaleKinds = EngineStale, []KindStatus{{Kind: "Node", Cause: CauseListFailed}}
+	})
+
+	caughtUp := make(chan struct{})
+	close(caughtUp)
+	done := make(chan struct{})
+	drivers := func() []*kindDriver { return []*kindDriver{dNode} }
+	go func() { defer close(done); e.livenessMonitor(ctx, drivers, caughtUp, false, time.Time{}, nil) }()
+
+	// Seeded reported=[Node], sees Node healthy → publishes the recovery to Watching.
+	waitFor(t, func() bool {
+		sts := sink.statuses()
+		return len(sts) > 0 && sts[len(sts)-1].State == EngineWatching
+	}, "recovers to Watching from a milestone-time stale seed")
+
+	cancel()
+	<-done
+}
+
+// Fix-2 regression (P2): when a COLD start's catch-up milestone reported EngineStale
+// (a kind went stuck before ever watching, so the cold SyncComplete never fired), the
+// first liveness recovery must emit that skipped initial-sync completion — ColdStart=true
+// with reconstructed counts — not a bare warm "watch recovered" that would misreport the
+// cache's first-ever sync.
+func TestEngineLivenessMonitorEmitsColdCompleteAfterStuckRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+
+	// Seed one cached object so the reconstructed cold SyncedObjects is non-zero.
+	store := newObjectsStore(ctx, cdb.ID(), podGVK(), cdb.Writer(), cdb)
+	require.NoError(t, store.ApplyChange(watch.Added, uObj("p1", "v1", "Pod", "default", "p1", "1")))
+
+	clk := &fakeClock{t: time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)}
+	// The kind that was stuck at milestone time has since recovered: healthy, non-zero liveness.
+	dNode := newKindDriverWithOptions(&fakeSource{}, nil, schema.GroupVersionKind{Version: "v1", Kind: "Node"}, "1", withNow(clk.now))
+	dNode.markLive()
+
+	sink := newRecordingSink()
+	e := newEngineWithOptions(nil, cdb, sink,
+		withEngineNow(clk.now),
+		withStaleThreshold(5*time.Minute),
+		withStaleCheckInterval(time.Millisecond))
+
+	// The cold milestone published EngineStale naming the stuck kind; ColdStart stays true,
+	// carried from the Syncing report (reportStale preserves it).
+	startedAt := clk.now().Add(-2 * time.Second)
+	e.report(func(s *EngineStatus) {
+		s.State, s.ColdStart, s.StaleKinds = EngineStale, true, []KindStatus{{Kind: "Node", Cause: CauseWatchFailed}}
+	})
+
+	caughtUp := make(chan struct{})
+	close(caughtUp)
+	done := make(chan struct{})
+	drivers := func() []*kindDriver { return []*kindDriver{dNode} }
+	// Node is the sole initial-cohort kind, so the reconstructed SyncComplete count is 1.
+	initialGVKs := map[schema.GroupVersionKind]struct{}{dNode.gvk: {}}
+	go func() {
+		defer close(done)
+		e.livenessMonitor(ctx, drivers, caughtUp, true /*coldStart*/, startedAt, initialGVKs)
+	}()
+
+	waitFor(t, func() bool {
+		sts := sink.statuses()
+		return len(sts) > 0 && sts[len(sts)-1].State == EngineWatching && sts[len(sts)-1].ColdStart
+	}, "emits the cold SyncComplete on recovery, not a warm 'watch recovered'")
+
+	sts := sink.statuses()
+	got := sts[len(sts)-1]
+	require.True(t, got.ColdStart, "reports a cold initial-sync completion")
+	require.Equal(t, 1, got.SyncedKinds, "reconstructed from the now-live driver")
+	require.Equal(t, 1, got.SyncedObjects, "the cold object total is queried")
+	require.Equal(t, 2*time.Second, got.CaughtUpIn, "elapsed since the run started")
+	require.Empty(t, got.StaleKinds, "the caught-up report clears the prior stale set")
 
 	cancel()
 	<-done
@@ -1276,12 +1548,12 @@ func TestEngineLivenessMonitorReReportsChangedLaggards(t *testing.T) {
 	close(caughtUp)
 	done := make(chan struct{})
 	drivers := func() []*kindDriver { return []*kindDriver{dPod, dSvc} }
-	go func() { defer close(done); e.livenessMonitor(ctx, drivers, caughtUp) }()
+	go func() { defer close(done); e.livenessMonitor(ctx, drivers, caughtUp, false, time.Time{}, nil) }()
 
 	staleNaming := func(kind string) func() bool {
 		return func() bool {
 			for _, st := range sink.statuses() {
-				if st.State == EngineStale && len(st.StaleKinds) == 1 && st.StaleKinds[0] == kind {
+				if st.State == EngineStale && len(st.StaleKinds) == 1 && st.StaleKinds[0].Kind == kind {
 					return true
 				}
 			}
@@ -1320,28 +1592,38 @@ func TestStaleLaggardsSortedForStableDedup(t *testing.T) {
 	// Pass drivers in unsorted order (as a map snapshot would); expect sorted output.
 	drivers := []*kindDriver{mk("Service"), mk("Pod"), mk("Node"), mk("ConfigMap")}
 	got := staleLaggards(drivers, now, 5*time.Minute)
-	require.Equal(t, []string{"ConfigMap", "Node", "Pod", "Service"}, got, "laggards are sorted regardless of driver order")
+	require.Equal(t, []KindStatus{
+		{Kind: "ConfigMap", Cause: CauseWatchStalled},
+		{Kind: "Node", Cause: CauseWatchStalled},
+		{Kind: "Pod", Cause: CauseWatchStalled},
+		{Kind: "Service", Cause: CauseWatchStalled},
+	}, got, "laggards are sorted regardless of driver order; a wedged watch reports WatchStalled")
 }
 
-// A driver that hasn't entered its watch phase yet (zero liveAt) is judged from its
-// createdAt: it gets a bounded startup grace, so a mid-run kind still doing its first
-// sync isn't falsely flagged — but a kind that can never LIST/watch is flagged once
-// the grace expires, rather than hiding the engine as healthy forever (P2 / P1(b)).
-func TestStaleLaggardsBoundsNeverWatchedGrace(t *testing.T) {
+// A never-watched driver (zero liveAt) is flagged only when it's actually stuck — it
+// exhausted its resync error budget — not merely because it's been trying a while. So a
+// large-but-progressing initial/mid-run LIST (which the transport idle timeout lets run
+// arbitrarily long) is never falsely flagged, while a kind that can never LIST/watch is
+// surfaced as soon as its budget is spent.
+func TestStaleLaggardsFlagsStuckNotSlow(t *testing.T) {
 	now := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
-	mk := func(kind string, created time.Time) *kindDriver {
+	mk := func(kind string) *kindDriver {
 		gvk := schema.GroupVersionKind{Version: "v1", Kind: kind}
-		d := newKindDriverWithOptions(&fakeSource{}, nil, gvk, "1", withNow(func() time.Time { return created }))
+		d := newKindDriverWithOptions(&fakeSource{}, nil, gvk, "1", withNow(func() time.Time { return now }))
 		require.True(t, d.liveAt().IsZero(), "a never-watched driver has zero liveAt")
 		return d
 	}
-	// Created 2m ago, still starting up → within the 5m grace → not flagged.
-	starting := mk("Starting", now.Add(-2*time.Minute))
-	// Created 10m ago, never reached watch phase → past the grace → flagged.
-	stuck := mk("Stuck", now.Add(-10*time.Minute))
+	// Still syncing (no failures) → not flagged, however long it's been running.
+	syncing := mk("Syncing")
+	// Exhausted its error budget on a failed LIST → stuck → flagged immediately, watch
+	// state aside, carrying the cause that spent the budget.
+	stuck := mk("Stuck")
+	stuck.recordFailure(0, CauseListFailed)
+	stuck.stuck.Store(true)
 
-	got := staleLaggards([]*kindDriver{starting, stuck}, now, 5*time.Minute)
-	require.Equal(t, []string{"Stuck"}, got, "a never-watched driver is flagged only after its startup grace")
+	got := staleLaggards([]*kindDriver{syncing, stuck}, now, 5*time.Minute)
+	require.Equal(t, []KindStatus{{Kind: "Stuck", Cause: CauseListFailed}}, got,
+		"only the stuck kind is flagged (with its cause); a slow-but-progressing one is not")
 }
 
 // The driver invokes onWatch exactly once — the first time it enters its watch

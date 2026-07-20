@@ -651,12 +651,38 @@ func roundSyncDuration(d time.Duration) time.Duration {
 	return d.Round(100 * time.Millisecond)
 }
 
-// staleMessage names the kinds whose watch went quiet, for the SyncStale event.
+// staleMessage names the kinds that aren't current — each with its cause — for the
+// SyncStale event and Stale condition message. A kind lands here three ways (see
+// engine.staleLaggards): its watch went quiet (WatchStalled — was synced, now no
+// heartbeat), it can't LIST at all (ListFailed — forbidden, too large to paginate), or
+// it can LIST but not watch (WatchFailed — `watch` denied, aggregated API refuses watch).
+// Naming the per-kind cause makes the message actionable (e.g. grant `watch` on the
+// WatchFailed kinds) rather than a bare kind list.
 func staleMessage(st engine.EngineStatus) string {
 	if len(st.StaleKinds) == 0 {
-		return "Watch stopped delivering updates — cache may be behind"
+		return "Not receiving updates — cache may be behind"
 	}
-	return fmt.Sprintf("No watch heartbeat for %s — cache may be behind", strings.Join(st.StaleKinds, ", "))
+	parts := make([]string, len(st.StaleKinds))
+	for i, k := range st.StaleKinds {
+		parts[i] = fmt.Sprintf("%s (%s)", k.Kind, staleCausePhrase(k.Cause))
+	}
+	return fmt.Sprintf("Not receiving updates for %s — cache may be behind", strings.Join(parts, ", "))
+}
+
+// staleCausePhrase renders a StaleCause as a short human phrase for the Stale message.
+func staleCausePhrase(c engine.StaleCause) string {
+	switch c {
+	case engine.CauseListFailed:
+		return "list failed"
+	case engine.CauseWatchFailed:
+		return "watch failed"
+	case engine.CauseWatchStalled:
+		return "watch stalled"
+	default:
+		// Zero cause (no failure recorded) or a cause added to the engine without a
+		// phrase here — render honestly rather than leak a raw enum token.
+		return "unknown"
+	}
 }
 
 // syncedCondition maps one engine status report onto the Synced condition.
