@@ -346,6 +346,53 @@ func TestServiceCacheStatsRollup(t *testing.T) {
 	assert.Equal(t, 3, stats.ObjectCount, "2 Pods + 1 Deployment; the event is excluded")
 }
 
+// The Events kind now carries a real count in kind_counts (maintained by triggers
+// on the events table), and /apis discovery advertises it in kind_catalog — so it
+// appears in KindCatalog with a non-zero count. CacheStats must still exclude it
+// from the whole-cache object totals: events aren't objects, and ObjectCount is
+// documented to leave them out. (TestServiceCacheStatsRollup above is insulated
+// only because it inserts no Event catalog row; this one adds it to exercise the
+// exclusion.)
+func TestServiceCacheStatsExcludesEventKind(t *testing.T) {
+	ctx := context.Background()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+	catalog := func(apiVersion, kind, resource, scope string) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+			 VALUES(?, ?, ?, ?, 0, NULL)`,
+			apiVersion, kind, resource, scope)
+		require.NoError(t, err)
+	}
+	catalog("apps/v1", "Deployment", "deployments", "Namespaced")
+	catalog("v1", "Event", "events", "Namespaced")
+
+	at := time.Now().UnixMilli()
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+		   created_at, updated_at, raw_json)
+		 VALUES ('d1', 'apps/v1', 'Deployment', 'default', 'd1', '1', ?, ?, x'7b7d')`, at, at)
+	require.NoError(t, err)
+	for _, uid := range []string{"e1", "e2"} {
+		_, err = cdb.Writer().ExecContext(ctx,
+			`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
+			 VALUES(?, 'Normal', 'Test', 'hello', ?, ?, 1, x'7b7d', ?)`, uid, at, at, at)
+		require.NoError(t, err)
+	}
+
+	stats, err := s.CacheStats(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+	assert.True(t, stats.Exists)
+	assert.Equal(t, 1, stats.KindCount, "only Deployment; the Event kind is excluded")
+	assert.Equal(t, 1, stats.ObjectCount, "only the Deployment; the 2 events are excluded")
+}
+
 // recvKindChange reads one delta off the ClusterDataKindsWatch stream, failing on
 // timeout or an unexpected close.
 func recvKindChange(t *testing.T, ch <-chan ClusterDataKindChange) ClusterDataKindChange {

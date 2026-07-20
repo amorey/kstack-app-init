@@ -566,6 +566,67 @@ func TestKindCatalogCountsMaintainedByTriggers(t *testing.T) {
 	require.Equal(t, 0, countFor("Deployment"), "an emptied but still-advertised kind counts 0")
 }
 
+// Events live in their own table, not objects, so the objects-side kind_counts
+// triggers never see them — a dedicated pair of triggers on the events table
+// keeps the ('v1','Event') count so the dashboard nav's Events badge isn't stuck
+// at 0. This pins that the count tracks event inserts/deletes and that a
+// re-observed event (the warm-resume upsert path) does not double-count.
+func TestEventKindCountMaintainedByTriggers(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// Discovery advertises Event in the catalog; the count rides the LEFT JOIN
+	// against kind_counts just like every other kind.
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+		 VALUES('v1', 'Event', 'events', 'Namespaced', 0, NULL)`)
+	require.NoError(t, err)
+
+	countFor := func(kind string) int {
+		rows, err := cdb.KindCatalog(ctx)
+		require.NoError(t, err)
+		for _, row := range rows {
+			if row.Kind == kind {
+				return row.Count
+			}
+		}
+		t.Fatalf("kind %q not in catalog", kind)
+		return 0
+	}
+	at := time.Now().UnixMilli()
+	insertEvent := func(uid string) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO events(uid, type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
+			 VALUES(?, 'Normal', 'Test', 'hello', ?, ?, 1, x'7b7d', ?)
+			 ON CONFLICT(uid) DO UPDATE SET last_seen = excluded.last_seen`,
+			uid, at, at, at)
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, 0, countFor("Event"), "no events cached yet")
+
+	insertEvent("e1")
+	insertEvent("e2")
+	require.Equal(t, 2, countFor("Event"), "each new event bumps the count")
+
+	// Re-observing an existing event upserts through ON CONFLICT DO UPDATE, which
+	// fires the UPDATE trigger (undefined here), not INSERT — so the count holds.
+	insertEvent("e1")
+	require.Equal(t, 2, countFor("Event"), "a re-observed event does not double-count")
+
+	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM events WHERE uid='e1'`)
+	require.NoError(t, err)
+	require.Equal(t, 1, countFor("Event"), "a delete decrements the count")
+
+	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM events WHERE uid='e2'`)
+	require.NoError(t, err)
+	require.Equal(t, 0, countFor("Event"), "an emptied but still-advertised kind counts 0")
+}
+
 func itoa(i int) string {
 	// fmt.Sprintf would pull fmt into the hot loop; this is tight and
 	// deterministic.

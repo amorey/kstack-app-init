@@ -215,3 +215,25 @@ WHEN old.api_version <> new.api_version OR old.kind <> new.kind BEGIN
     VALUES (new.api_version, new.kind, 1)
     ON CONFLICT(api_version, kind) DO UPDATE SET count = count + 1;
 END;
+
+-- Events live in their own table (they have unique columns + a distinct access
+-- pattern), so the objects triggers above never count them and the dashboard
+-- nav's "Events" kind would read 0 forever. These two triggers maintain its
+-- kind_counts row so the badge is accurate. The key is hardcoded ('v1','Event'):
+-- the events table conflates core v1 and events.k8s.io/v1 into one row shape (no
+-- api_version column of the event itself), and both /apis discovery's catalog row
+-- and the webview's curated leaf join on core ('v1','Event') — so all cached
+-- events roll into that single key. There is no UPDATE trigger: an event's kind
+-- never changes, and a re-observed event upserts via ON CONFLICT(uid) DO UPDATE,
+-- which fires the UPDATE trigger (absent here), so it correctly leaves the count
+-- untouched — only genuinely-new rows increment.
+CREATE TRIGGER events_kind_count_insert AFTER INSERT ON events BEGIN
+    INSERT INTO kind_counts (api_version, kind, count)
+    VALUES ('v1', 'Event', 1)
+    ON CONFLICT(api_version, kind) DO UPDATE SET count = count + 1;
+END;
+
+CREATE TRIGGER events_kind_count_delete AFTER DELETE ON events BEGIN
+    UPDATE kind_counts SET count = count - 1
+    WHERE api_version = 'v1' AND kind = 'Event';
+END;

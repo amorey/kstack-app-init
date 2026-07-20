@@ -325,6 +325,16 @@ func (s *Service) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
 // parent ClusterID + cache id), so the live-stats resolver can report the cache it
 // was asked about — active or a migrated-away one — without re-resolving "the"
 // cache for a cluster.
+// eventKindAPIVersion/eventKind identify the core-group Event kind. Cached events
+// live in their own table, not objects, so their per-kind count is maintained by a
+// dedicated pair of triggers keyed on this ('v1','Event') pair (see the store's
+// 0001_init.sql); CacheStats excludes it from the object totals for the same
+// reason. Both spots must agree on this key.
+const (
+	eventKindAPIVersion = "v1"
+	eventKind           = "Event"
+)
+
 func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*ClusterCacheStats, error) {
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	bytes, exists := s.cacheManager.CacheBytes(ref)
@@ -344,6 +354,13 @@ func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID C
 	}
 	objectCount, kindCount := 0, 0
 	for _, r := range rows {
+		// Events carry a real kind_counts value (triggers on the events table
+		// maintain the ('v1','Event') row so the dashboard nav badge is accurate),
+		// but they live in their own table and are not objects — exclude them from
+		// the whole-cache object totals.
+		if r.APIVersion == eventKindAPIVersion && r.Kind == eventKind {
+			continue
+		}
 		if r.Count > 0 {
 			objectCount += r.Count
 			kindCount++
