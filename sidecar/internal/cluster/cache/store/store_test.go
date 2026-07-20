@@ -352,6 +352,92 @@ func TestSubscribeNotifyAndCoalesce(t *testing.T) {
 	}
 }
 
+// Events reads the newest cached events (ordered by last_seen DESC), flattens the
+// involved-object identity, and honors the limit — the read that backs the dashboard
+// events table.
+func TestEventsReadNewestFirstWithLimit(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	insert := func(uid string, lastSeen int64) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO events(uid, involved_kind, involved_ns, involved_name,
+			   type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
+			 VALUES(?, 'Pod', 'default', 'my-pod', 'Warning', 'BackOff', 'msg', ?, ?, 3, x'7b7d', ?)`,
+			uid, lastSeen, lastSeen, lastSeen)
+		require.NoError(t, err)
+	}
+	insert("a", 100)
+	insert("b", 300)
+	insert("c", 200)
+
+	all, err := cdb.Events(ctx, 0) // 0 → default window
+	require.NoError(t, err)
+	require.Len(t, all, 3)
+	// Newest last_seen first.
+	require.Equal(t, []string{"b", "c", "a"}, []string{all[0].UID, all[1].UID, all[2].UID})
+	// Fields flattened as expected.
+	require.Equal(t, "Warning", all[0].Type)
+	require.Equal(t, "BackOff", all[0].Reason)
+	require.Equal(t, 3, all[0].Count)
+	require.EqualValues(t, 300, all[0].LastSeen)
+	require.Equal(t, "Pod", all[0].InvolvedKind)
+	require.Equal(t, "default", all[0].InvolvedNS)
+	require.Equal(t, "my-pod", all[0].InvolvedName)
+
+	// A positive limit bounds the read to the newest N.
+	top2, err := cdb.Events(ctx, 2)
+	require.NoError(t, err)
+	require.Equal(t, []string{"b", "c"}, []string{top2[0].UID, top2[1].UID})
+}
+
+// The events broker is independent of the object-write broker: EventsNotify wakes only
+// EventsSubscribe, and Notify wakes only Subscribe. This separation is what keeps an
+// event burst from triggering the kind-catalog re-read.
+func TestEventsBrokerIsSeparateFromWrites(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	writes, cancelW := cdb.Subscribe()
+	defer cancelW()
+	events, cancelE := cdb.EventsSubscribe()
+	defer cancelE()
+
+	// EventsNotify pings only the events subscriber.
+	cdb.EventsNotify()
+	select {
+	case <-events:
+	case <-time.After(2 * time.Second):
+		t.Fatal("EventsNotify must ping an events subscriber")
+	}
+	select {
+	case <-writes:
+		t.Fatal("EventsNotify must not ping the object-write subscriber")
+	default:
+	}
+
+	// Notify pings only the object-write subscriber.
+	cdb.Notify()
+	select {
+	case <-writes:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Notify must ping a write subscriber")
+	}
+	select {
+	case <-events:
+		t.Fatal("Notify must not ping the events subscriber")
+	default:
+	}
+}
+
 func TestShutdownClosesSubscribers(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)

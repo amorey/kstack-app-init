@@ -69,6 +69,13 @@ type ClusterService interface {
 	// changes as the sync engine writes objects (so per-kind counts update live). Empty
 	// (no frames) when that cache's db isn't open, mirroring ClusterDataKinds' posture.
 	ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataKindChange, error)
+	// ClusterDataEventsWatch streams one ClusterCache's cached Kubernetes Events as a
+	// delta watch: the newest window of events as an Added burst on subscribe, then
+	// Added/Modified/Deleted changes as the sync engine writes events. Empty (no
+	// frames) when that cache's db isn't open, mirroring ClusterDataKindsWatch's
+	// posture. Wakes on the events-only store broker, so an event burst never drives
+	// the kind-catalog re-read.
+	ClusterDataEventsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataEventChange, error)
 	// ClusterEvents returns a cluster's beehive event timeline (newest run first),
 	// optionally filtered to one category and bounded by limit. Decoupled from the
 	// cluster/list watch — event chatter never re-emits the cluster.
@@ -149,12 +156,22 @@ type Service struct {
 	// coalesced into one re-read per interval (trailing edge) to keep the reader from
 	// aggregating continuously.
 	dataKindsDebounce time.Duration
+
+	// dataEventsDebounce bounds how often ClusterDataEventsWatch re-reads and diffs the
+	// events window. Events are high-volume, so a burst of event-write pings is coalesced
+	// into one re-read per interval (trailing edge) rather than a re-read per event.
+	dataEventsDebounce time.Duration
 }
 
 // defaultDataKindsDebounce floors the kind-catalog re-read interval — small enough
 // that the dashboard nav's counts still read as live, large enough to collapse a
 // high-churn cluster's write pings into a bounded aggregation rate.
 const defaultDataKindsDebounce = 250 * time.Millisecond
+
+// defaultDataEventsDebounce floors the events-watch re-read interval. Events are the
+// highest-volume stream, so this is a touch coarser than the kind-catalog debounce —
+// still live for a table, but collapsing an event storm into a bounded re-read rate.
+const defaultDataEventsDebounce = 500 * time.Millisecond
 
 var _ ClusterService = (*Service)(nil)
 
@@ -219,18 +236,19 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	cacheCtrl.SetControllerClient(cacheCC)
 
 	return &Service{
-		bh:                bh,
-		bhStore:           bhStore,
-		watcher:           watcher,
-		coreClient:        coreClient,
-		cacheClient:       cacheClient,
-		cacheManager:      cacheManager,
-		connMgr:           connMgr,
-		coreCtrl:          coreCtrl,
-		cacheCtrl:         cacheCtrl,
-		importer:          NewKubeconfigImporter(watcher, coreClient),
-		pokeSvc:           pokeSvc,
-		dataKindsDebounce: defaultDataKindsDebounce,
+		bh:                 bh,
+		bhStore:            bhStore,
+		watcher:            watcher,
+		coreClient:         coreClient,
+		cacheClient:        cacheClient,
+		cacheManager:       cacheManager,
+		connMgr:            connMgr,
+		coreCtrl:           coreCtrl,
+		cacheCtrl:          cacheCtrl,
+		importer:           NewKubeconfigImporter(watcher, coreClient),
+		pokeSvc:            pokeSvc,
+		dataKindsDebounce:  defaultDataKindsDebounce,
+		dataEventsDebounce: defaultDataEventsDebounce,
 	}, nil
 }
 
@@ -419,52 +437,149 @@ func dataKindKey(k ClusterDataKind) string {
 // catalog as a delta watch: the current catalog as an Added burst on subscribe, then
 // one Added/Modified/Deleted change per kind as the sync engine writes objects and
 // pings the store (Count is a live LEFT JOIN, so an object write that changes a count
-// re-emits its kind as Modified). The store's coalescing Subscribe drives the re-read;
-// the goroutine diffs each fresh catalog against the last snapshot it emitted.
-//
-// The stream follows the cache's on-disk db across its whole lifecycle via the store
-// Manager's WatchDB, rather than binding once at subscribe: if the cache isn't open yet
-// (the common unsynced-cluster case) it binds when it opens; if the db is replaced under
-// the same CacheID (a Clear-cache delete+reopen) it rebinds and keeps diffing (the
-// emptied catalog surfaces as Deletes, then the rebuild as Adds). An unopened cache
-// emits nothing until it opens or ctx ends, matching ClusterDataKinds' empty posture.
+// re-emits its kind as Modified). It follows the object-write broker (Subscribe) and
+// re-reads KindCatalog on each debounced ping, diffing against the last snapshot;
+// cacheDeltaWatch owns the whole cache-lifecycle + coalescing loop.
 func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataKindChange, error) {
-	out := make(chan ClusterDataKindChange, 1)
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
-	handles, cancelHandles := s.cacheManager.WatchDB(ref.CacheID)
+	return cacheDeltaWatch(ctx, s.cacheManager, ref.CacheID, s.dataKindsDebounce,
+		(*store.ClusterDB).Subscribe,
+		func(ctx context.Context, db *store.ClusterDB) ([]ClusterDataKind, error) {
+			rows, err := db.KindCatalog(ctx)
+			if err != nil {
+				return nil, err
+			}
+			kinds := make([]ClusterDataKind, len(rows)) // KindCatalog order: (api_version, kind)
+			for i, r := range rows {
+				kinds[i] = toDataKind(r)
+			}
+			return kinds, nil
+		},
+		dataKindKey,
+		func(t ChangeType, k ClusterDataKind) ClusterDataKindChange {
+			return ClusterDataKindChange{Type: t, Kind: k, CacheID: cacheID}
+		},
+	), nil
+}
+
+// ClusterDataEventsWatch implements ClusterService. It streams one ClusterCache's cached
+// Kubernetes Events as a delta watch: the newest window of events (Events' default limit)
+// as an Added burst on subscribe, then Added/Modified/Deleted changes as the sync engine
+// writes events. It follows the events-only broker (EventsSubscribe) and re-reads Events
+// on each debounced ping, keyed by event UID — so an event burst never drives the
+// kind-catalog re-read. Because the read is a bounded window, an event aging out of the
+// window as newer ones arrive surfaces as Deleted even though its row may still exist;
+// that is acceptable for a "latest events" table. cacheDeltaWatch owns the cache-lifecycle
+// + coalescing loop, so this matches ClusterDataKindsWatch's empty/rebind posture exactly.
+func (s *Service) ClusterDataEventsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataEventChange, error) {
+	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
+	return cacheDeltaWatch(ctx, s.cacheManager, ref.CacheID, s.dataEventsDebounce,
+		(*store.ClusterDB).EventsSubscribe,
+		func(ctx context.Context, db *store.ClusterDB) ([]ClusterDataEvent, error) {
+			rows, err := db.Events(ctx, 0) // 0 → store's default window; ordered by last_seen DESC
+			if err != nil {
+				return nil, err
+			}
+			events := make([]ClusterDataEvent, len(rows))
+			for i, r := range rows {
+				events[i] = toDataEvent(r)
+			}
+			return events, nil
+		},
+		func(e ClusterDataEvent) string { return e.UID },
+		func(t ChangeType, e ClusterDataEvent) ClusterDataEventChange {
+			return ClusterDataEventChange{Type: t, Event: e, CacheID: cacheID}
+		},
+	), nil
+}
+
+// toDataEvent maps a store EventRow onto the domain ClusterDataEvent 1:1, decoding the
+// stored unix-millis timestamps (0 → zero time).
+func toDataEvent(r store.EventRow) ClusterDataEvent {
+	return ClusterDataEvent{
+		UID:               r.UID,
+		Type:              r.Type,
+		Reason:            r.Reason,
+		Message:           r.Message,
+		Count:             r.Count,
+		FirstSeen:         millisToTime(r.FirstSeen),
+		LastSeen:          millisToTime(r.LastSeen),
+		InvolvedKind:      r.InvolvedKind,
+		InvolvedNamespace: r.InvolvedNS,
+		InvolvedName:      r.InvolvedName,
+	}
+}
+
+// millisToTime converts unix-millis to a time.Time, mapping 0 (no timestamp) to the
+// zero Time. Built consistently so two reads of the same row compare equal in the watch
+// diff (time.Time equality is stable for values with no monotonic reading).
+func millisToTime(ms int64) time.Time {
+	if ms == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms).UTC()
+}
+
+// cacheDeltaWatch is the shared engine behind ClusterDataKindsWatch and
+// ClusterDataEventsWatch. It follows one ClusterCache's on-disk db across its whole
+// lifecycle via the store Manager's WatchDB (binding when the cache opens, rebinding on a
+// Clear-cache delete+reopen), coalesces the db's write pings on a trailing-edge debounce,
+// and on each fire re-reads a keyed snapshot and diffs it against the last one it emitted —
+// sending Added for a new key, Modified for a changed value, Deleted for a vanished key
+// (and Deleted for every held key when the cache closes, so a never-reopened cache doesn't
+// retain stale rows). `subscribe` selects which of the db's brokers to follow (object
+// writes vs event writes); `snapshot` reads the current rows as an **ordered** slice
+// (the reader's order is the emit order, so the on-subscribe Added burst is stable, e.g.
+// KindCatalog's (api_version, kind)); `keyOf` derives each value's identity (the diff and
+// map key); `mkChange` adapts one (ChangeType, value) into the caller's domain change. The
+// returned channel closes when ctx ends or the store shuts down. T must be comparable so a
+// changed value is detected by ==; the diff sends the last-known value on a Deleted.
+func cacheDeltaWatch[T comparable, C any](
+	ctx context.Context,
+	mgr *store.Manager,
+	cacheID int64,
+	debounceDur time.Duration,
+	subscribe func(*store.ClusterDB) (<-chan struct{}, func()),
+	snapshot func(context.Context, *store.ClusterDB) ([]T, error),
+	keyOf func(T) string,
+	mkChange func(ChangeType, T) C,
+) <-chan C {
+	out := make(chan C, 1)
+	handles, cancelHandles := mgr.WatchDB(cacheID)
 	go func() {
 		defer close(out)
 		defer cancelHandles()
 
-		prev := map[string]ClusterDataKind{}
-		// emit diffs db's freshly-read catalog against prev, sending one change per
-		// difference (Added/Modified/Deleted) and updating prev. Returns false if ctx
-		// ended mid-send so the goroutine can exit.
+		prev := map[string]T{}
+		// emit diffs db's freshly-read snapshot against prev, sending one change per
+		// difference (Added/Modified/Deleted) and updating prev. Added/Modified are emitted
+		// in the snapshot's slice order (stable, from the reader's ORDER BY); Deleted follows
+		// in map order (only vanished keys, unordered — matching the pre-generic behavior).
+		// Returns false if ctx ended mid-send so the goroutine can exit.
 		emit := func(db *store.ClusterDB) bool {
-			rows, err := db.KindCatalog(ctx)
+			items, err := snapshot(ctx, db)
 			if err != nil {
 				return ctx.Err() == nil // transient read error: keep the stream, retry on next ping
 			}
-			next := make(map[string]ClusterDataKind, len(rows))
-			for _, r := range rows {
-				k := toDataKind(r)
-				key := dataKindKey(k)
-				next[key] = k
+			next := make(map[string]T, len(items))
+			for _, v := range items {
+				key := keyOf(v)
+				next[key] = v
 				old, existed := prev[key]
 				switch {
 				case !existed:
-					if !send(ctx, out, ClusterDataKindChange{Type: ChangeAdded, Kind: k, CacheID: cacheID}) {
+					if !send(ctx, out, mkChange(ChangeAdded, v)) {
 						return false
 					}
-				case old != k:
-					if !send(ctx, out, ClusterDataKindChange{Type: ChangeModified, Kind: k, CacheID: cacheID}) {
+				case old != v:
+					if !send(ctx, out, mkChange(ChangeModified, v)) {
 						return false
 					}
 				}
 			}
-			for key, k := range prev {
+			for key, v := range prev {
 				if _, ok := next[key]; !ok {
-					if !send(ctx, out, ClusterDataKindChange{Type: ChangeDeleted, Kind: k, CacheID: cacheID}) {
+					if !send(ctx, out, mkChange(ChangeDeleted, v)) {
 						return false
 					}
 				}
@@ -473,23 +588,23 @@ func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID
 			return true
 		}
 
-		// emitEmpty reconciles prev against an empty catalog — one Deleted per held
-		// kind, then clears prev. Called when the cache closes so a cache that never
-		// reopens doesn't leave the dashboard showing its stale kinds. Returns false if
-		// ctx ended mid-send. No-op when prev is already empty.
+		// emitEmpty reconciles prev against an empty snapshot — one Deleted per held
+		// value, then clears prev. Called when the cache closes so a cache that never
+		// reopens doesn't leave stale rows. Returns false if ctx ended mid-send. No-op
+		// when prev is already empty.
 		emitEmpty := func() bool {
-			for _, k := range prev {
-				if !send(ctx, out, ClusterDataKindChange{Type: ChangeDeleted, Kind: k, CacheID: cacheID}) {
+			for _, v := range prev {
+				if !send(ctx, out, mkChange(ChangeDeleted, v)) {
 					return false
 				}
 			}
-			prev = map[string]ClusterDataKind{}
+			prev = map[string]T{}
 			return true
 		}
 
 		// db/pings track the currently-bound handle and its write-ping stream; both are
 		// nil while no cache is open. bind swaps to a new handle (nil = closed),
-		// resubscribing to its pings and emitting its current catalog as the new baseline.
+		// resubscribing to its pings and emitting its current snapshot as the new baseline.
 		var (
 			db        *store.ClusterDB
 			pings     <-chan struct{}
@@ -498,16 +613,16 @@ func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID
 
 		// A write ping arms a debounce timer instead of re-reading inline: its fire
 		// drains a coalesced burst of pings into a single re-read, so a high-churn
-		// cluster can't keep the count-join running back-to-back. `armed` tracks whether
+		// cluster can't keep the read + diff running back-to-back. `armed` tracks whether
 		// a re-read is pending; the timer starts disarmed. (Go's timer guarantees no
 		// stale tick after Stop/Reset, so the channel never needs a manual drain.)
-		debounce := time.NewTimer(s.dataKindsDebounce)
+		debounce := time.NewTimer(debounceDur)
 		debounce.Stop()
 		defer debounce.Stop()
 		armed := false
 		arm := func() {
 			if !armed {
-				debounce.Reset(s.dataKindsDebounce)
+				debounce.Reset(debounceDur)
 				armed = true
 			}
 		}
@@ -527,9 +642,9 @@ func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID
 			}
 			db = next
 			if db == nil {
-				return emitEmpty() // cache closed; reconcile against empty so a never-reopened cache doesn't retain stale kinds
+				return emitEmpty() // cache closed; reconcile against empty so a never-reopened cache doesn't retain stale rows
 			}
-			pings, cancelSub = db.Subscribe()
+			pings, cancelSub = subscribe(db)
 			return emit(db)
 		}
 		defer func() {
@@ -567,7 +682,7 @@ func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID
 			}
 		}
 	}()
-	return out, nil
+	return out
 }
 
 // send delivers one value on out, honoring ctx cancellation. Returns false if ctx

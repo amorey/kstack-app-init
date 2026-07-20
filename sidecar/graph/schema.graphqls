@@ -332,6 +332,40 @@ type ClusterDataKind {
   count: Int!
 }
 
+"""
+One cached Kubernetes Event from a cluster's synced data (the raw `events.k8s.io`/core
+Event, read from the active cache). Powers the dashboard's events table. Distinct from
+`Event`, which is kstack's own control-plane timeline for a Cluster/ClusterCache — this
+is data synced *from* the cluster. The involved-object identity is flattened onto the
+record; the raw event body is not exposed.
+"""
+type ClusterDataEvent {
+  "The Event's own object UID — the stable identity the watch keys on."
+  uid: String!
+  """
+  Severity — conventionally `Normal` or `Warning`, but an **open string** (not the
+  closed `EventType` enum): Kubernetes does not constrain `Event.type`, so a cluster may
+  omit it (empty) or supply a custom value, which is passed through verbatim.
+  """
+  type: String!
+  "CamelCase machine reason, e.g. \"BackOff\" (empty if the Event carried none)."
+  reason: String!
+  "Human-readable detail (empty if none)."
+  message: String!
+  "How many times the event has fired (coalesced series count; >= 1)."
+  count: Int!
+  "First occurrence time, or null when the source Event carried no timestamp."
+  firstSeen: Time
+  "Latest occurrence time, or null when the source Event carried no timestamp."
+  lastSeen: Time
+  "Kind of the object the event is about, e.g. \"Pod\" (empty if unset)."
+  involvedKind: String!
+  "Namespace of the involved object (empty for a cluster-scoped or name-only reference)."
+  involvedNamespace: String!
+  "Name of the involved object (empty if unset)."
+  involvedName: String!
+}
+
 # --- Delta watches ---
 
 """
@@ -372,6 +406,20 @@ type ClusterDataKindChange {
   The cache this frame came from — the frame's provenance. A client watching the
   active cache rejects a late frame from a superseded cache (one still draining
   after a cache/context switch) by comparing this against the cache it subscribed for.
+  """
+  cacheID: ObjectID!
+}
+
+"One change on the `clusterDataEventsWatch` stream: the affected event, what happened to it, and which cache it came from."
+type ClusterDataEventChange {
+  "Whether this event was added (incl. the on-subscribe snapshot), modified (chiefly a `count`/`lastSeen` change as it re-fires), or deleted."
+  type: ChangeType!
+  "The affected event. On `Deleted`, its last-known row; the client keys on `uid`."
+  event: ClusterDataEvent!
+  """
+  The cache this frame came from — the frame's provenance, mirroring
+  `ClusterDataKindChange.cacheID`. A client watching the active cache rejects a late
+  frame from a superseded cache by comparing this against the cache it subscribed for.
   """
   cacheID: ObjectID!
 }
@@ -510,6 +558,19 @@ type Subscription {
   never-synced / paused cache streams nothing until it syncs).
   """
   clusterDataKindsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterDataKindChange!
+
+  """
+  Streams one ClusterCache's cached Kubernetes Events as a Kubernetes-style delta watch,
+  keyed like `clusterDataKindsWatch` (parent cluster `id` + `cacheID`): the newest window
+  of events as an `Added` burst on subscribe, then one `Added`/`Modified`/`Deleted` change
+  per event as the sync engine writes events (a re-firing event bumps its `count`/`lastSeen`
+  → `Modified`). The client keys each event by `uid` and maintains the table from the
+  accumulated set. Because the window is bounded, an event aging out of it as newer events
+  arrive surfaces as `Deleted`. Empty (no frames) until that cache's db is open (a
+  never-synced / paused cache streams nothing until it syncs). Distinct from
+  `clusterEventsWatch`, which streams kstack's own control-plane timeline.
+  """
+  clusterDataEventsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterDataEventChange!
 
   """
   Streams a cluster's event timeline: the matching runs as a snapshot, then live

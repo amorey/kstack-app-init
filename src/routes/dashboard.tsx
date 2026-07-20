@@ -14,6 +14,7 @@
 
 import { createRoute } from '@tanstack/react-router';
 
+import { EventsTable } from '@/components/widgets/events-table';
 import { useDashboardNav } from '@/lib/dashboard-nav';
 import { dashboardResourceLabel, resolveDashboardResource } from '@/lib/dashboard-resources';
 import type { DashboardResource } from '@/lib/dashboard-resources';
@@ -36,18 +37,23 @@ export const Route = createRoute({
   component: Dashboard,
 });
 
-// The panel reflects the resource kind chosen in the sidebar. Real content (a
-// live resource table) lands later; for now it names the selection so the wiring
-// from sidebar → URL → panel is visible. The label resolves against the same
+// The panel reflects the resource kind chosen in the sidebar. Events is the first
+// real view (a live table); the other kinds still name the selection so the wiring
+// from sidebar → URL → panel stays visible. The label resolves against the same
 // built nav the sidebar uses, so dynamic kinds name themselves too.
 function Dashboard() {
   const { resource } = Route.useSearch();
   const { nav } = useDashboardNav();
-  const label = dashboardResourceLabel(nav, resolveDashboardResource(resource));
+  const resolved = resolveDashboardResource(resource);
+  const label = dashboardResourceLabel(nav, resolved);
   return (
     <section className="min-w-0 flex-1 p-6">
-      <h1 className="text-lg font-semibold">{label}</h1>
-      <p className="text-sm text-muted-foreground">The {label.toLowerCase()} view is coming soon.</p>
+      <h1 className="mb-4 text-lg font-semibold">{label}</h1>
+      {resolved === 'events' ? (
+        <EventsTable />
+      ) : (
+        <p className="text-sm text-muted-foreground">The {label.toLowerCase()} view is coming soon.</p>
+      )}
     </section>
   );
 }

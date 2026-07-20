@@ -8,6 +8,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
@@ -19,6 +20,28 @@ import (
 // child carries its parent cluster id and its own id for the lookup.
 func (r *clusterCacheResolver) Stats(ctx context.Context, obj *cluster.ClusterCache) (*cluster.ClusterCacheStats, error) {
 	return r.ClusterSvc.CacheStats(ctx, obj.ClusterID, obj.ID)
+}
+
+// FirstSeen is the resolver for the firstSeen field: the domain carries a value
+// time.Time (kept comparable for the delta-watch diff), so the zero time — a source
+// Event with no timestamp — maps to null on the wire rather than 0001-01-01.
+func (r *clusterDataEventResolver) FirstSeen(ctx context.Context, obj *cluster.ClusterDataEvent) (*time.Time, error) {
+	return nilIfZeroTime(obj.FirstSeen), nil
+}
+
+// LastSeen is the resolver for the lastSeen field — same zero-time-to-null mapping as
+// FirstSeen.
+func (r *clusterDataEventResolver) LastSeen(ctx context.Context, obj *cluster.ClusterDataEvent) (*time.Time, error) {
+	return nilIfZeroTime(obj.LastSeen), nil
+}
+
+// nilIfZeroTime returns nil for the zero time (an absent timestamp) and a pointer to t
+// otherwise — the value→nullable mapping the two event timestamp resolvers share.
+func nilIfZeroTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 // Permissions is the resolver for the permissions field — the one live cluster
@@ -175,6 +198,17 @@ func (r *subscriptionResolver) ClusterDataKindsWatch(ctx context.Context, id clu
 	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterDataKindChange) *cluster.ClusterDataKindChange { return &c }), nil
 }
 
+// ClusterDataEventsWatch is the resolver for the clusterDataEventsWatch field — one
+// ClusterCache's cached Kubernetes Events as a delta watch, backing the dashboard's
+// events table. mapStream adapts each change to a pointer.
+func (r *subscriptionResolver) ClusterDataEventsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataEventChange, error) {
+	ch, err := r.ClusterSvc.ClusterDataEventsWatch(ctx, id, cacheID)
+	if err != nil {
+		return nil, err
+	}
+	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterDataEventChange) *cluster.ClusterDataEventChange { return &c }), nil
+}
+
 // ClusterEventsWatch is the resolver for the clusterEventsWatch field — the live
 // event tail for one cluster, decoupled from clustersWatch. mapStream adapts each
 // bare run to a pointer.
@@ -224,6 +258,9 @@ func (r *subscriptionResolver) AuthStateWatch(ctx context.Context) (<-chan *auth
 // ClusterCache returns ClusterCacheResolver implementation.
 func (r *Resolver) ClusterCache() ClusterCacheResolver { return &clusterCacheResolver{r} }
 
+// ClusterDataEvent returns ClusterDataEventResolver implementation.
+func (r *Resolver) ClusterDataEvent() ClusterDataEventResolver { return &clusterDataEventResolver{r} }
+
 // ClusterPrincipal returns ClusterPrincipalResolver implementation.
 func (r *Resolver) ClusterPrincipal() ClusterPrincipalResolver { return &clusterPrincipalResolver{r} }
 
@@ -237,6 +274,7 @@ func (r *Resolver) Query() QueryResolver { return &queryResolver{r} }
 func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionResolver{r} }
 
 type clusterCacheResolver struct{ *Resolver }
+type clusterDataEventResolver struct{ *Resolver }
 type clusterPrincipalResolver struct{ *Resolver }
 type mutationResolver struct{ *Resolver }
 type queryResolver struct{ *Resolver }

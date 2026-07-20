@@ -624,6 +624,50 @@ type ClusterDataKind struct {
 	Count int
 }
 
+// ClusterDataEvent is one cached Kubernetes Event from a cluster's synced data,
+// read from the active cache's events table. Binds 1:1 to the GraphQL
+// ClusterDataEvent; it powers the dashboard's events table. The involved-object
+// identity is flattened onto the record (any field may be empty — a name-only
+// reference carries no namespace, etc.); the raw event body is not exposed.
+type ClusterDataEvent struct {
+	// UID is the Event's own object UID — the stable identity a watch keys on.
+	UID string
+	// Type is the event severity — conventionally Normal or Warning, but an open string
+	// (Kubernetes doesn't constrain Event.type), so it's passed through verbatim rather
+	// than bound to the closed EventType enum. Empty when the source Event omitted it.
+	Type string
+	// Reason is the CamelCase machine reason, e.g. "BackOff" (empty if unset).
+	Reason string
+	// Message is the human-readable detail (empty if unset).
+	Message string
+	// Count is how many times the event has fired (coalesced series count; >= 1).
+	Count int
+	// FirstSeen/LastSeen are the first and latest occurrence times (zero when the
+	// source Event carried no timestamp).
+	FirstSeen time.Time
+	LastSeen  time.Time
+	// InvolvedKind/InvolvedNamespace/InvolvedName identify the object the event is
+	// about (any may be empty).
+	InvolvedKind      string
+	InvolvedNamespace string
+	InvolvedName      string
+}
+
+// ClusterDataEventChange is one delta on a cache's events watch: what happened
+// (Type) to which event (Event), from which cache (CacheID). On subscribe the newest
+// window of events arrives as Added (the snapshot); thereafter a new event is Added, an
+// event whose fields change (chiefly its Count/LastSeen as it re-fires) is Modified, and
+// an event leaving the watched window — dropped from the cache, or aged past the window
+// as newer events arrive — is Deleted (carrying its last-known row). Consumers key on
+// UID. CacheID is the frame's provenance, mirroring ClusterDataKindChange: a client
+// watching the active cache can reject a late frame from a superseded cache. Binds 1:1
+// to the GraphQL ClusterDataEventChange.
+type ClusterDataEventChange struct {
+	Type    ChangeType
+	Event   ClusterDataEvent
+	CacheID ClusterCacheID
+}
+
 // --- Seed conditions ---
 
 // SeedConnectionConditions returns the initial condition set for a freshly

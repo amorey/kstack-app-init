@@ -523,7 +523,15 @@ func (s *eventsStore) upsert(u *unstructured.Unstructured) error {
 	if err != nil {
 		return err
 	}
-	return s.insertEventRow(s.writer, row, time.Now().UnixMilli())
+	if err := s.insertEventRow(s.writer, row, time.Now().UnixMilli()); err != nil {
+		return err
+	}
+	// Wake the events watch on the dedicated events broker — not the object-write
+	// broker — so an event burst never triggers the (unrelated) kind-catalog re-read.
+	// The events watch coalesces + debounces these pings, so a burst still collapses
+	// into one re-read.
+	s.cdb.EventsNotify()
+	return nil
 }
 
 func (s *eventsStore) delete(u *unstructured.Unstructured) error {
@@ -534,8 +542,7 @@ func (s *eventsStore) delete(u *unstructured.Unstructured) error {
 	if _, err := s.writer.ExecContext(s.ctx, `DELETE FROM events WHERE uid=?`, uid); err != nil {
 		return err
 	}
-	// No Notify: events are read separately and notifying here would
-	// hammer every subscription on every event burst.
+	s.cdb.EventsNotify()
 	return nil
 }
 
@@ -627,6 +634,12 @@ func (r *eventsReplaceSession) WritePage(items []*unstructured.Unstructured) err
 		return err
 	}
 	r.cookieCleared = true
+	// Notify per committed page (like objectsReplaceSession.WritePage), so durable rows
+	// always reach the events watch — not only at Commit. A relist that commits pages
+	// then fails before Commit (an expired continuation token, a later page error) would
+	// otherwise leave those rows durable-but-unannounced until an unrelated later event
+	// write or a successful relist.
+	r.s.cdb.EventsNotify()
 	return nil
 }
 
@@ -674,7 +687,12 @@ func (r *eventsReplaceSession) Commit(resourceVersion string) error {
 	if err := persistListRVMeta(r.s.ctx, tx, r.s.gvk, resourceVersion); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// A relist prune adds/removes rows, so wake the events watch (dedicated broker).
+	r.s.cdb.EventsNotify()
+	return nil
 }
 
 func (s *eventsStore) PersistRV(ctx context.Context, rv string) error {
@@ -827,10 +845,12 @@ func nullableInt(p *int) any {
 	return *p
 }
 
-// nullableInt64 writes NULL for a zero timestamp so the janitor's
-// COALESCE(last_seen, updated_at) fallback fires. An event without any
-// lastTimestamp/eventTime would otherwise store 0, which is non-NULL and
-// older than any retention window, getting it swept on the next pass.
+// nullableInt64 writes NULL for a zero timestamp so a missing time reads as absence,
+// not a bogus 1970/0001 instant: an event without any lastTimestamp/eventTime stores
+// NULL rather than 0, which the read side surfaces as a null wire timestamp (via the
+// ClusterDataEvent firstSeen/lastSeen resolvers) and which a COALESCE(last_seen,
+// updated_at) ordering fallback can substitute ingest time for (see the events-ordering
+// TODO).
 func nullableInt64(n int64) any {
 	if n == 0 {
 		return nil

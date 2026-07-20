@@ -35,6 +35,7 @@ type Config = graphql.Config[ResolverRoot, DirectiveRoot, ComplexityRoot]
 
 type ResolverRoot interface {
 	ClusterCache() ClusterCacheResolver
+	ClusterDataEvent() ClusterDataEventResolver
 	ClusterPrincipal() ClusterPrincipalResolver
 	Mutation() MutationResolver
 	Query() QueryResolver
@@ -91,6 +92,25 @@ type ComplexityRoot struct {
 
 	ClusterChange struct {
 		Cluster func(childComplexity int) int
+		Type    func(childComplexity int) int
+	}
+
+	ClusterDataEvent struct {
+		Count             func(childComplexity int) int
+		FirstSeen         func(childComplexity int) int
+		InvolvedKind      func(childComplexity int) int
+		InvolvedName      func(childComplexity int) int
+		InvolvedNamespace func(childComplexity int) int
+		LastSeen          func(childComplexity int) int
+		Message           func(childComplexity int) int
+		Reason            func(childComplexity int) int
+		Type              func(childComplexity int) int
+		UID               func(childComplexity int) int
+	}
+
+	ClusterDataEventChange struct {
+		CacheID func(childComplexity int) int
+		Event   func(childComplexity int) int
 		Type    func(childComplexity int) int
 	}
 
@@ -227,6 +247,7 @@ type ComplexityRoot struct {
 		ChatStream              func(childComplexity int, input model.ChatInput) int
 		ClusterCacheEventsWatch func(childComplexity int, id cluster.ObjectID, category *string) int
 		ClusterCachesWatch      func(childComplexity int) int
+		ClusterDataEventsWatch  func(childComplexity int, id cluster.ObjectID, cacheID cluster.ObjectID) int
 		ClusterDataKindsWatch   func(childComplexity int, id cluster.ObjectID, cacheID cluster.ObjectID) int
 		ClusterEventsWatch      func(childComplexity int, id cluster.ObjectID, category *string) int
 		ClusterScheduleWatch    func(childComplexity int, id cluster.ObjectID) int
@@ -236,6 +257,10 @@ type ComplexityRoot struct {
 
 type ClusterCacheResolver interface {
 	Stats(ctx context.Context, obj *cluster.ClusterCache) (*cluster.ClusterCacheStats, error)
+}
+type ClusterDataEventResolver interface {
+	FirstSeen(ctx context.Context, obj *cluster.ClusterDataEvent) (*time.Time, error)
+	LastSeen(ctx context.Context, obj *cluster.ClusterDataEvent) (*time.Time, error)
 }
 type ClusterPrincipalResolver interface {
 	Permissions(ctx context.Context, obj *cluster.ClusterPrincipal, namespace string) (*model.ClusterPermissions, error)
@@ -261,6 +286,7 @@ type SubscriptionResolver interface {
 	ClustersWatch(ctx context.Context) (<-chan *cluster.ClusterChange, error)
 	ClusterCachesWatch(ctx context.Context) (<-chan *cluster.ClusterCacheChange, error)
 	ClusterDataKindsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataKindChange, error)
+	ClusterDataEventsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataEventChange, error)
 	ClusterEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error)
 	ClusterCacheEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error)
 	ClusterScheduleWatch(ctx context.Context, id cluster.ObjectID) (<-chan *cluster.Schedule, error)
@@ -439,6 +465,86 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterChange.Type(childComplexity), true
+
+	case "ClusterDataEvent.count":
+		if e.ComplexityRoot.ClusterDataEvent.Count == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.Count(childComplexity), true
+	case "ClusterDataEvent.firstSeen":
+		if e.ComplexityRoot.ClusterDataEvent.FirstSeen == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.FirstSeen(childComplexity), true
+	case "ClusterDataEvent.involvedKind":
+		if e.ComplexityRoot.ClusterDataEvent.InvolvedKind == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.InvolvedKind(childComplexity), true
+	case "ClusterDataEvent.involvedName":
+		if e.ComplexityRoot.ClusterDataEvent.InvolvedName == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.InvolvedName(childComplexity), true
+	case "ClusterDataEvent.involvedNamespace":
+		if e.ComplexityRoot.ClusterDataEvent.InvolvedNamespace == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.InvolvedNamespace(childComplexity), true
+	case "ClusterDataEvent.lastSeen":
+		if e.ComplexityRoot.ClusterDataEvent.LastSeen == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.LastSeen(childComplexity), true
+	case "ClusterDataEvent.message":
+		if e.ComplexityRoot.ClusterDataEvent.Message == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.Message(childComplexity), true
+	case "ClusterDataEvent.reason":
+		if e.ComplexityRoot.ClusterDataEvent.Reason == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.Reason(childComplexity), true
+	case "ClusterDataEvent.type":
+		if e.ComplexityRoot.ClusterDataEvent.Type == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.Type(childComplexity), true
+	case "ClusterDataEvent.uid":
+		if e.ComplexityRoot.ClusterDataEvent.UID == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEvent.UID(childComplexity), true
+
+	case "ClusterDataEventChange.cacheID":
+		if e.ComplexityRoot.ClusterDataEventChange.CacheID == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEventChange.CacheID(childComplexity), true
+	case "ClusterDataEventChange.event":
+		if e.ComplexityRoot.ClusterDataEventChange.Event == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEventChange.Event(childComplexity), true
+	case "ClusterDataEventChange.type":
+		if e.ComplexityRoot.ClusterDataEventChange.Type == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataEventChange.Type(childComplexity), true
 
 	case "ClusterDataKind.apiVersion":
 		if e.ComplexityRoot.ClusterDataKind.APIVersion == nil {
@@ -969,6 +1075,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Subscription.ClusterCachesWatch(childComplexity), true
+	case "Subscription.clusterDataEventsWatch":
+		if e.ComplexityRoot.Subscription.ClusterDataEventsWatch == nil {
+			break
+		}
+
+		args, err := ec.field_Subscription_clusterDataEventsWatch_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.ComplexityRoot.Subscription.ClusterDataEventsWatch(childComplexity, args["id"].(cluster.ObjectID), args["cacheID"].(cluster.ObjectID)), true
 	case "Subscription.clusterDataKindsWatch":
 		if e.ComplexityRoot.Subscription.ClusterDataKindsWatch == nil {
 			break
@@ -1226,6 +1343,44 @@ func (ec *executionContext) childFields_ClusterChange(ctx context.Context, field
 		return ec.fieldContext_ClusterChange_cluster(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterChange", field.Name)
+}
+
+func (ec *executionContext) childFields_ClusterDataEvent(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "uid":
+		return ec.fieldContext_ClusterDataEvent_uid(ctx, field)
+	case "type":
+		return ec.fieldContext_ClusterDataEvent_type(ctx, field)
+	case "reason":
+		return ec.fieldContext_ClusterDataEvent_reason(ctx, field)
+	case "message":
+		return ec.fieldContext_ClusterDataEvent_message(ctx, field)
+	case "count":
+		return ec.fieldContext_ClusterDataEvent_count(ctx, field)
+	case "firstSeen":
+		return ec.fieldContext_ClusterDataEvent_firstSeen(ctx, field)
+	case "lastSeen":
+		return ec.fieldContext_ClusterDataEvent_lastSeen(ctx, field)
+	case "involvedKind":
+		return ec.fieldContext_ClusterDataEvent_involvedKind(ctx, field)
+	case "involvedNamespace":
+		return ec.fieldContext_ClusterDataEvent_involvedNamespace(ctx, field)
+	case "involvedName":
+		return ec.fieldContext_ClusterDataEvent_involvedName(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type ClusterDataEvent", field.Name)
+}
+
+func (ec *executionContext) childFields_ClusterDataEventChange(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "type":
+		return ec.fieldContext_ClusterDataEventChange_type(ctx, field)
+	case "event":
+		return ec.fieldContext_ClusterDataEventChange_event(ctx, field)
+	case "cacheID":
+		return ec.fieldContext_ClusterDataEventChange_cacheID(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type ClusterDataEventChange", field.Name)
 }
 
 func (ec *executionContext) childFields_ClusterDataKind(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -1805,6 +1960,28 @@ func (ec *executionContext) field_Subscription_clusterCacheEventsWatch_args(ctx 
 		return nil, err
 	}
 	args["category"] = arg1
+	return args, nil
+}
+
+func (ec *executionContext) field_Subscription_clusterDataEventsWatch_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
+		func(ctx context.Context, v any) (cluster.ObjectID, error) {
+			return ec.unmarshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐObjectID(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["id"] = arg0
+	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "cacheID",
+		func(ctx context.Context, v any) (cluster.ObjectID, error) {
+			return ec.unmarshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐObjectID(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["cacheID"] = arg1
 	return args, nil
 }
 
@@ -2575,6 +2752,314 @@ func (ec *executionContext) fieldContext_ClusterChange_cluster(_ context.Context
 		},
 	}
 	return fc, nil
+}
+
+func (ec *executionContext) _ClusterDataEvent_uid(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_uid(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.UID, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_uid(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEvent_type(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_type(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Type, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEvent_reason(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_reason(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Reason, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_reason(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEvent_message(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_message(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Message, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_message(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEvent_count(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_count(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Count, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_count(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEvent_firstSeen(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_firstSeen(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return ec.Resolvers.ClusterDataEvent().FirstSeen(ctx, obj)
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
+			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_firstSeen(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, true, true, errors.New("field of type Time does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEvent_lastSeen(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_lastSeen(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return ec.Resolvers.ClusterDataEvent().LastSeen(ctx, obj)
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
+			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_lastSeen(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, true, true, errors.New("field of type Time does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEvent_involvedKind(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_involvedKind(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.InvolvedKind, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_involvedKind(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEvent_involvedNamespace(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_involvedNamespace(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.InvolvedNamespace, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_involvedNamespace(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEvent_involvedName(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEvent) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEvent_involvedName(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.InvolvedName, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEvent_involvedName(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEvent", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEventChange_type(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEventChange) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEventChange_type(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Type, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v cluster.ChangeType) graphql.Marshaler {
+			return ec.marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐChangeType(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEventChange_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEventChange", field, false, false, errors.New("field of type ChangeType does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataEventChange_event(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEventChange) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEventChange_event(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Event, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v cluster.ClusterDataEvent) graphql.Marshaler {
+			return ec.marshalNClusterDataEvent2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataEvent(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEventChange_event(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "ClusterDataEventChange",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterDataEvent(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _ClusterDataEventChange_cacheID(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataEventChange) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataEventChange_cacheID(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.CacheID, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v cluster.ObjectID) graphql.Marshaler {
+			return ec.marshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐObjectID(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataEventChange_cacheID(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataEventChange", field, false, false, errors.New("field of type ObjectID does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterDataKind_apiVersion(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataKind) (ret graphql.Marshaler) {
@@ -4712,6 +5197,50 @@ func (ec *executionContext) fieldContext_Subscription_clusterDataKindsWatch(ctx 
 	return fc, nil
 }
 
+func (ec *executionContext) _Subscription_clusterDataEventsWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
+	return graphql.ResolveFieldStream(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Subscription_clusterDataEventsWatch(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.Resolvers.Subscription().ClusterDataEventsWatch(ctx, fc.Args["id"].(cluster.ObjectID), fc.Args["cacheID"].(cluster.ObjectID))
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *cluster.ClusterDataEventChange) graphql.Marshaler {
+			return ec.marshalNClusterDataEventChange2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataEventChange(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Subscription_clusterDataEventsWatch(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Subscription",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterDataEventChange(ctx, field)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Subscription_clusterDataEventsWatch_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
 func (ec *executionContext) _Subscription_clusterEventsWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
 	return graphql.ResolveFieldStream(
 		ctx,
@@ -6473,6 +7002,195 @@ func (ec *executionContext) _ClusterChange(ctx context.Context, sel ast.Selectio
 	return out
 }
 
+var clusterDataEventImplementors = []string{"ClusterDataEvent"}
+
+func (ec *executionContext) _ClusterDataEvent(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterDataEvent) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, clusterDataEventImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("ClusterDataEvent")
+		case "uid":
+			out.Values[i] = ec._ClusterDataEvent_uid(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "type":
+			out.Values[i] = ec._ClusterDataEvent_type(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "reason":
+			out.Values[i] = ec._ClusterDataEvent_reason(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "message":
+			out.Values[i] = ec._ClusterDataEvent_message(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "count":
+			out.Values[i] = ec._ClusterDataEvent_count(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "firstSeen":
+			field := field
+
+			innerFunc := func(ctx context.Context, _ *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._ClusterDataEvent_firstSeen(ctx, field, obj)
+				return res
+			}
+
+			if field.Deferrable != nil {
+				dfs, ok := deferred[field.Deferrable.Label]
+				di := 0
+				if ok {
+					dfs.AddField(field)
+					di = len(dfs.Values) - 1
+				} else {
+					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
+					deferred[field.Deferrable.Label] = dfs
+				}
+				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
+					return innerFunc(ctx, dfs)
+				})
+
+				// don't run the out.Concurrently() call below
+				out.Values[i] = graphql.Null
+				continue
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+		case "lastSeen":
+			field := field
+
+			innerFunc := func(ctx context.Context, _ *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._ClusterDataEvent_lastSeen(ctx, field, obj)
+				return res
+			}
+
+			if field.Deferrable != nil {
+				dfs, ok := deferred[field.Deferrable.Label]
+				di := 0
+				if ok {
+					dfs.AddField(field)
+					di = len(dfs.Values) - 1
+				} else {
+					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
+					deferred[field.Deferrable.Label] = dfs
+				}
+				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
+					return innerFunc(ctx, dfs)
+				})
+
+				// don't run the out.Concurrently() call below
+				out.Values[i] = graphql.Null
+				continue
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+		case "involvedKind":
+			out.Values[i] = ec._ClusterDataEvent_involvedKind(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "involvedNamespace":
+			out.Values[i] = ec._ClusterDataEvent_involvedNamespace(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "involvedName":
+			out.Values[i] = ec._ClusterDataEvent_involvedName(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
+var clusterDataEventChangeImplementors = []string{"ClusterDataEventChange"}
+
+func (ec *executionContext) _ClusterDataEventChange(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterDataEventChange) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, clusterDataEventChangeImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("ClusterDataEventChange")
+		case "type":
+			out.Values[i] = ec._ClusterDataEventChange_type(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "event":
+			out.Values[i] = ec._ClusterDataEventChange_event(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "cacheID":
+			out.Values[i] = ec._ClusterDataEventChange_cacheID(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
 var clusterDataKindImplementors = []string{"ClusterDataKind"}
 
 func (ec *executionContext) _ClusterDataKind(ctx context.Context, sel ast.SelectionSet, obj *cluster.ClusterDataKind) graphql.Marshaler {
@@ -7637,6 +8355,8 @@ func (ec *executionContext) _Subscription(ctx context.Context, sel ast.Selection
 		return ec._Subscription_clusterCachesWatch(ctx, fields[0])
 	case "clusterDataKindsWatch":
 		return ec._Subscription_clusterDataKindsWatch(ctx, fields[0])
+	case "clusterDataEventsWatch":
+		return ec._Subscription_clusterDataEventsWatch(ctx, fields[0])
 	case "clusterEventsWatch":
 		return ec._Subscription_clusterEventsWatch(ctx, fields[0])
 	case "clusterCacheEventsWatch":
@@ -8157,6 +8877,24 @@ func (ec *executionContext) marshalNClusterChange2ᚖgithubᚗcomᚋkubetailᚑo
 		return graphql.Null
 	}
 	return ec._ClusterChange(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalNClusterDataEvent2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataEvent(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterDataEvent) graphql.Marshaler {
+	return ec._ClusterDataEvent(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNClusterDataEventChange2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataEventChange(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterDataEventChange) graphql.Marshaler {
+	return ec._ClusterDataEventChange(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNClusterDataEventChange2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataEventChange(ctx context.Context, sel ast.SelectionSet, v *cluster.ClusterDataEventChange) graphql.Marshaler {
+	if v == nil {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+		return graphql.Null
+	}
+	return ec._ClusterDataEventChange(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalNClusterDataKind2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐClusterDataKind(ctx context.Context, sel ast.SelectionSet, v cluster.ClusterDataKind) graphql.Marshaler {

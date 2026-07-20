@@ -127,6 +127,19 @@ models:
   ClusterDataKindChange:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataKindChange
 
+  ClusterDataEvent:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataEvent
+    # The domain carries value time.Time (must stay comparable for the delta-watch diff),
+    # so resolvers map the zero time to null instead of serializing 0001-01-01.
+    fields:
+      firstSeen:
+        resolver: true
+      lastSeen:
+        resolver: true
+
+  ClusterDataEventChange:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataEventChange
+
   # --- Auth ---
   # Bind the GraphQL auth types straight to the auth domain types so the
   # resolvers need no field-by-field mapper. Only schema fields are exposed —

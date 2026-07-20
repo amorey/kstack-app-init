@@ -320,9 +320,65 @@ type ClusterDB struct {
 	janitorCancel context.CancelFunc
 	janitorDone   chan struct{}
 
-	subsMu sync.Mutex
+	// writes and events are two independent coalescing write-notify brokers.
+	// writes backs Subscribe/Notify — the object-write ping that drives the
+	// kind-catalog watch — while events backs EventsSubscribe/EventsNotify — the
+	// event-write ping that drives the events watch. They are kept separate so an
+	// event burst wakes only event subscribers, never the (unrelated) kind-catalog
+	// re-read.
+	writes *notifyBroker
+	events *notifyBroker
+}
+
+// notifyBroker is a coalescing pub/sub over cap-1 channels: each subscriber gets a
+// channel that receives a non-blocking ping on every notify, additional pings while
+// one is already buffered being coalesced (the subscriber re-queries and observes
+// every change anyway). A ClusterDB holds one broker per independent write stream.
+type notifyBroker struct {
+	mu     sync.Mutex
 	subs   map[int]chan struct{}
 	nextID int
+}
+
+func newNotifyBroker() *notifyBroker {
+	return &notifyBroker{subs: make(map[int]chan struct{})}
+}
+
+func (b *notifyBroker) subscribe() (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	b.mu.Lock()
+	id := b.nextID
+	b.nextID++
+	b.subs[id] = ch
+	b.mu.Unlock()
+	return ch, func() {
+		b.mu.Lock()
+		if existing, ok := b.subs[id]; ok {
+			delete(b.subs, id)
+			close(existing)
+		}
+		b.mu.Unlock()
+	}
+}
+
+func (b *notifyBroker) notify() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, ch := range b.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (b *notifyBroker) close() {
+	b.mu.Lock()
+	for id, ch := range b.subs {
+		delete(b.subs, id)
+		close(ch)
+	}
+	b.mu.Unlock()
 }
 
 // Reader returns the multi-connection pool for SELECTs. Lock-free under WAL.
@@ -392,6 +448,73 @@ func (c *ClusterDB) KindCatalog(ctx context.Context) ([]KindCatalogRow, error) {
 	return out, nil
 }
 
+// EventRow is one cached Kubernetes Event, read from the events table for display.
+// It is the read projection (a subset of the stored columns, involved-object
+// identity flattened) that backs the dashboard's events table — the compressed
+// raw_json body is deliberately not read here.
+type EventRow struct {
+	// UID is the Event's own object UID (the stable identity a watch keys on).
+	UID string
+	// Type is the event severity: "Normal" or "Warning" (empty if unset).
+	Type string
+	// Reason is the CamelCase machine reason, e.g. "BackOff" (empty if unset).
+	Reason string
+	// Message is the human-readable detail (empty if unset).
+	Message string
+	// Count is how many times the event has fired (coalesced series count; >= 1).
+	Count int
+	// FirstSeen/LastSeen are unix-millis timestamps, 0 when the source carried none.
+	FirstSeen int64
+	LastSeen  int64
+	// InvolvedKind/InvolvedNS/InvolvedName identify the object the event is about
+	// (any may be empty — a name-only reference carries no namespace, etc.).
+	InvolvedKind string
+	InvolvedNS   string
+	InvolvedName string
+}
+
+// Events reads the most recent cached events, newest first (ordered by last_seen,
+// riding the events_last_seen index), bounded by limit. A non-positive limit is
+// treated as defaultEventsLimit. Empty until the sync engine has populated the
+// events table.
+func (c *ClusterDB) Events(ctx context.Context, limit int) ([]EventRow, error) {
+	if limit <= 0 {
+		limit = defaultEventsLimit
+	}
+	rows, err := c.readDB.QueryContext(ctx,
+		`SELECT uid,
+		        COALESCE(type, ''), COALESCE(reason, ''), COALESCE(message, ''),
+		        COALESCE(count, 0), COALESCE(first_seen, 0), COALESCE(last_seen, 0),
+		        COALESCE(involved_kind, ''), COALESCE(involved_ns, ''), COALESCE(involved_name, '')
+		 FROM events
+		 ORDER BY last_seen DESC
+		 LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]EventRow, 0, limit)
+	for rows.Next() {
+		var r EventRow
+		if err := rows.Scan(
+			&r.UID, &r.Type, &r.Reason, &r.Message, &r.Count,
+			&r.FirstSeen, &r.LastSeen, &r.InvolvedKind, &r.InvolvedNS, &r.InvolvedName,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// defaultEventsLimit bounds an unbounded Events read. The events watch diffs a
+// fixed window of the newest events, so this doubles as that window size.
+const defaultEventsLimit = 500
+
 func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterDB, error) {
 	dir := clusterDir(dataDir, ref)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -452,7 +575,8 @@ func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterD
 		path:    dbPath,
 		writeDB: writeDB,
 		readDB:  readDB,
-		subs:    make(map[int]chan struct{}),
+		writes:  newNotifyBroker(),
+		events:  newNotifyBroker(),
 	}, nil
 }
 
@@ -461,39 +585,26 @@ func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterD
 // already buffered are coalesced (the subscriber will re-query and observe
 // every change anyway). The returned cancel func unregisters the subscriber.
 //
-// Use this in place of polling: write paths call Notify after commit, and
-// long-lived readers (e.g. the sync engine's freshness tracker, GraphQL
-// subscriptions) block on the channel to know when to re-run their query.
-func (c *ClusterDB) Subscribe() (<-chan struct{}, func()) {
-	ch := make(chan struct{}, 1)
-	c.subsMu.Lock()
-	id := c.nextID
-	c.nextID++
-	c.subs[id] = ch
-	c.subsMu.Unlock()
-	return ch, func() {
-		c.subsMu.Lock()
-		if existing, ok := c.subs[id]; ok {
-			delete(c.subs, id)
-			close(existing)
-		}
-		c.subsMu.Unlock()
-	}
-}
+// Use this in place of polling: object-write paths call Notify after commit, and
+// long-lived readers (e.g. the sync engine's freshness tracker, the kind-catalog
+// GraphQL subscription) block on the channel to know when to re-run their query.
+func (c *ClusterDB) Subscribe() (<-chan struct{}, func()) { return c.writes.subscribe() }
 
-// Notify wakes every active subscriber. Non-blocking: if a subscriber's
-// channel slot is full, the existing buffered ping subsumes this one.
-// Writers should call this after committing a batch.
-func (c *ClusterDB) Notify() {
-	c.subsMu.Lock()
-	defer c.subsMu.Unlock()
-	for _, ch := range c.subs {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-	}
-}
+// Notify wakes every active object-write subscriber. Non-blocking: if a
+// subscriber's channel slot is full, the existing buffered ping subsumes this one.
+// Object writers should call this after committing a batch.
+func (c *ClusterDB) Notify() { c.writes.notify() }
+
+// EventsSubscribe is Subscribe for the events table: a channel that receives a
+// coalesced signal after every EventsNotify. Kept separate from Subscribe so an
+// event burst (which is high-volume) wakes only the events watch, never the
+// kind-catalog re-read. The returned cancel func unregisters the subscriber.
+func (c *ClusterDB) EventsSubscribe() (<-chan struct{}, func()) { return c.events.subscribe() }
+
+// EventsNotify wakes every active events subscriber. Non-blocking, like Notify.
+// The events-table write paths (incremental upsert/delete and the relist prune)
+// call it after committing.
+func (c *ClusterDB) EventsNotify() { c.events.notify() }
 
 // openPool opens a *sql.DB against path via the shared sqlitemigrate pool
 // opener. writer=true caps MaxOpenConns at 1 so write transactions serialize
@@ -575,12 +686,8 @@ func (c *ClusterDB) shutdown(ctx context.Context) error {
 		}
 	}
 	// Close subscriber channels so any blocked select returns.
-	c.subsMu.Lock()
-	for id, ch := range c.subs {
-		delete(c.subs, id)
-		close(ch)
-	}
-	c.subsMu.Unlock()
+	c.writes.close()
+	c.events.close()
 	var firstErr error
 	if err := c.readDB.Close(); err != nil {
 		firstErr = err

@@ -400,3 +400,48 @@ func TestEventsReplaceSessionPrunesMissing(t *testing.T) {
 	require.Equal(t, map[string]struct{}{"e2": {}, "e3": {}}, got,
 		"relist mirrors the server: e1 pruned, e2 kept, e3 added")
 }
+
+// Every event write path — incremental upsert/delete, each committed relist page, and
+// the relist Commit — must wake the events-only broker so ClusterDataEventsWatch
+// re-reads, and must use EventsNotify, not the object-write Notify. The per-page notify
+// matters because a relist can commit pages then fail before Commit; without it those
+// durable rows stay unannounced. drainEventPing consumes a coalesced ping (or fails).
+func TestEventWritesFireEventsNotify(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	events, cancelE := cdb.EventsSubscribe()
+	defer cancelE()
+	writes, cancelW := cdb.Subscribe()
+	defer cancelW()
+
+	drainEventPing := func(what string) {
+		select {
+		case <-events:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s must fire EventsNotify", what)
+		}
+		// It must NOT have pinged the object-write broker.
+		select {
+		case <-writes:
+			t.Fatalf("%s must not fire the object-write Notify", what)
+		default:
+		}
+	}
+
+	s := newEventsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Event"}, cdb.Writer(), cdb)
+
+	require.NoError(t, s.upsert(eventUnstructured("e1")))
+	drainEventPing("upsert")
+
+	require.NoError(t, s.delete(eventUnstructured("e1")))
+	drainEventPing("delete")
+
+	sess, err := s.BeginReplace(ctx)
+	require.NoError(t, err)
+	// Each committed page notifies on its own — proven by draining before Commit runs, so
+	// a relist that dies after a page but before Commit still announced its durable rows.
+	require.NoError(t, sess.WritePage([]*unstructured.Unstructured{eventUnstructured("e2")}))
+	drainEventPing("relist WritePage")
+	require.NoError(t, sess.Commit("100"))
+	drainEventPing("relist Commit")
+}

@@ -696,6 +696,138 @@ func TestServiceClusterDataKindsWatchEmitsDeletesOnCloseWithoutReopen(t *testing
 	assert.Equal(t, "Deployment", del.Kind.Kind)
 }
 
+func recvEventChange(t *testing.T, ch <-chan ClusterDataEventChange) ClusterDataEventChange {
+	t.Helper()
+	select {
+	case ev, ok := <-ch:
+		require.True(t, ok, "stream closed early")
+		return ev
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a ClusterDataEventChange")
+		return ClusterDataEventChange{}
+	}
+}
+
+// insertEvent writes one row directly into the events table (uid + the display columns),
+// standing in for what the sync engine's event driver would persist.
+func insertEvent(t *testing.T, ctx context.Context, cdb *store.ClusterDB, uid, evType, reason, message string, count, lastSeen int64) {
+	t.Helper()
+	_, err := cdb.Writer().ExecContext(ctx,
+		`INSERT INTO events (uid, involved_kind, involved_ns, involved_name,
+		   type, reason, message, first_seen, last_seen, count, raw_json, updated_at)
+		 VALUES (?, 'Pod', 'default', 'my-pod', ?, ?, ?, ?, ?, ?, x'7b7d', ?)
+		 ON CONFLICT(uid) DO UPDATE SET
+		   type=excluded.type, reason=excluded.reason, message=excluded.message,
+		   last_seen=excluded.last_seen, count=excluded.count, updated_at=excluded.updated_at`,
+		uid, evType, reason, message, lastSeen, lastSeen, count, lastSeen)
+	require.NoError(t, err)
+}
+
+// ClusterDataEventsWatch streams the active cache's cached Kubernetes Events as a delta
+// watch: the newest window as an Added burst, then Added/Modified/Deleted as the sync
+// engine writes events and pings the events-only store broker — what backs the dashboard
+// events table.
+func TestServiceClusterDataEventsWatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	// One event cached before subscribing forms the snapshot.
+	insertEvent(t, ctx, cdb, "e1", "Warning", "BackOff", "Back-off restarting", 1, 100)
+
+	ch, err := s.ClusterDataEventsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+
+	// Snapshot: an Added carrying the flattened involved-object identity + provenance.
+	snap := recvEventChange(t, ch)
+	assert.Equal(t, ChangeAdded, snap.Type)
+	assert.Equal(t, "e1", snap.Event.UID)
+	assert.EqualValues(t, "Warning", snap.Event.Type)
+	assert.Equal(t, "BackOff", snap.Event.Reason)
+	assert.Equal(t, "Pod", snap.Event.InvolvedKind)
+	assert.Equal(t, "default", snap.Event.InvolvedNamespace)
+	assert.Equal(t, "my-pod", snap.Event.InvolvedName)
+	assert.Equal(t, ClusterCacheID(cacheID), snap.CacheID)
+
+	// A brand-new event → Added.
+	insertEvent(t, ctx, cdb, "e2", "Normal", "Scheduled", "Successfully assigned", 1, 200)
+	cdb.EventsNotify()
+	add := recvEventChange(t, ch)
+	assert.Equal(t, ChangeAdded, add.Type)
+	assert.Equal(t, "e2", add.Event.UID)
+
+	// The same event re-firing (count/last_seen bump) → Modified under the same uid.
+	insertEvent(t, ctx, cdb, "e1", "Warning", "BackOff", "Back-off restarting", 5, 300)
+	cdb.EventsNotify()
+	mod := recvEventChange(t, ch)
+	assert.Equal(t, ChangeModified, mod.Type)
+	assert.Equal(t, "e1", mod.Event.UID)
+	assert.Equal(t, 5, mod.Event.Count)
+
+	// An event removed from the table → Deleted (carries the last-known row).
+	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM events WHERE uid = 'e2'`)
+	require.NoError(t, err)
+	cdb.EventsNotify()
+	del := recvEventChange(t, ch)
+	assert.Equal(t, ChangeDeleted, del.Type)
+	assert.Equal(t, "e2", del.Event.UID)
+
+	cancel()
+	select {
+	case _, ok := <-ch:
+		assert.False(t, ok, "stream must close on ctx cancel")
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not close on ctx cancel")
+	}
+}
+
+// An object write pings the object-write broker, not the events broker, so it must NOT
+// wake the events watch — the whole reason events use a dedicated broker. Conversely an
+// event write wakes it. This pins that separation.
+func TestServiceClusterDataEventsWatchIgnoresObjectWrites(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	insertEvent(t, ctx, cdb, "e1", "Normal", "Started", "Started container", 1, 100)
+	ch, err := s.ClusterDataEventsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+	require.Equal(t, "e1", recvEventChange(t, ch).Event.UID) // snapshot
+
+	// An object write + Notify (object broker) must not produce an events frame.
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+		   created_at, updated_at, raw_json)
+		 VALUES ('o1', 'v1', 'Pod', 'default', 'o1', '1', 1, 1, x'7b7d')`)
+	require.NoError(t, err)
+	cdb.Notify()
+	select {
+	case ev := <-ch:
+		t.Fatalf("object write must not wake the events watch, got %+v", ev)
+	case <-time.After(150 * time.Millisecond):
+		// Correct: no frame from an object write.
+	}
+
+	// An actual event write does wake it.
+	insertEvent(t, ctx, cdb, "e2", "Warning", "Failed", "Error", 1, 200)
+	cdb.EventsNotify()
+	add := recvEventChange(t, ch)
+	assert.Equal(t, ChangeAdded, add.Type)
+	assert.Equal(t, "e2", add.Event.UID)
+}
+
 // cacheRef resolves the active cache's on-disk locator: the directory id is the
 // ClusterID, the file id is the ClusterCache for the cluster's currently-connected
 // identity (UID matches Status.Server.UID). A cluster with no active cache resolves to

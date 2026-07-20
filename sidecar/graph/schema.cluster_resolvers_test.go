@@ -41,10 +41,11 @@ type fakeClusterService struct {
 	mu          sync.Mutex
 	order       []cluster.ClusterID
 	clusters    map[cluster.ClusterID]*cluster.Cluster
-	caches      []cluster.ClusterCache                          // one active cache per fixture, streamed via WatchCaches
-	events      map[cluster.ClusterID][]cluster.Event           // connection-event history, keyed by ClusterID
-	cacheEvents map[cluster.ClusterCacheID][]cluster.Event      // sync-event history, keyed by ClusterCacheID
-	kinds       map[cluster.ClusterID][]cluster.ClusterDataKind // discovered kind catalog, keyed by ClusterID
+	caches      []cluster.ClusterCache                           // one active cache per fixture, streamed via WatchCaches
+	events      map[cluster.ClusterID][]cluster.Event            // connection-event history, keyed by ClusterID
+	cacheEvents map[cluster.ClusterCacheID][]cluster.Event       // sync-event history, keyed by ClusterCacheID
+	kinds       map[cluster.ClusterID][]cluster.ClusterDataKind  // discovered kind catalog, keyed by ClusterID
+	dataEvents  map[cluster.ClusterID][]cluster.ClusterDataEvent // cached Kubernetes Events, keyed by ClusterID
 }
 
 var _ cluster.ClusterService = (*fakeClusterService)(nil)
@@ -153,6 +154,21 @@ func (f *fakeClusterService) ClusterDataKindsWatch(ctx context.Context, clusterI
 	ch := make(chan cluster.ClusterDataKindChange, len(snap))
 	for _, k := range snap {
 		ch <- cluster.ClusterDataKindChange{Type: cluster.ChangeAdded, Kind: k}
+	}
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
+
+func (f *fakeClusterService) ClusterDataEventsWatch(ctx context.Context, clusterID cluster.ClusterID, _ cluster.ClusterCacheID) (<-chan cluster.ClusterDataEventChange, error) {
+	f.mu.Lock()
+	snap := append([]cluster.ClusterDataEvent(nil), f.dataEvents[clusterID]...)
+	f.mu.Unlock()
+	ch := make(chan cluster.ClusterDataEventChange, len(snap))
+	for _, e := range snap {
+		ch <- cluster.ClusterDataEventChange{Type: cluster.ChangeAdded, Event: e}
 	}
 	go func() {
 		<-ctx.Done()
