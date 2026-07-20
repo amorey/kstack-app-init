@@ -42,6 +42,26 @@ type fakeSource struct {
 	listRV       string
 	listOutcomes []bool // true => return an error on that List call (by index)
 
+	// Pagination scripting (optional; when listPages is nil, List returns the
+	// single listObjs page). Each entry is one page's objects; the driver walks
+	// them by continue token ("page-1", "page-2", …), the last page returning "".
+	// expireOnContinue, when set, makes the List call that carries that continue
+	// token fail with a 410 Expired (a Continue-token expiry mid-pagination) —
+	// once, then it's cleared so the restart-from-top can succeed.
+	listPages        [][]*unstructured.Unstructured
+	expireOnContinue string
+	// expireWithGone makes expireOnContinue return a bare 410 Gone (reason "Gone", no
+	// "Expired") instead of ResourceExpired — a nonconforming intermediary's answer to
+	// an expired continue token.
+	expireWithGone bool
+	// expireEveryContinue makes EVERY List with a non-empty Continue 410 (never
+	// cleared) — the persistent-expiry case where paginated restarts can't complete,
+	// so fullList must fall back to an unpaginated LIST (opts.Limit 0). In paginated
+	// mode a Limit-0 call returns all pages flattened with no continue token.
+	expireEveryContinue bool
+	listContinues       []string // continue token passed on each List call, in order
+	listLimits          []int64  // Limit passed on each List call, in order
+
 	metas   []objMeta
 	metaRV  string
 	metaErr error
@@ -61,15 +81,70 @@ type fakeSource struct {
 
 var _ kubeSource = (*fakeSource)(nil)
 
-func (f *fakeSource) List(context.Context, metav1.ListOptions) ([]*unstructured.Unstructured, string, error) {
+func (f *fakeSource) List(_ context.Context, opts metav1.ListOptions) ([]*unstructured.Unstructured, string, string, error) {
 	f.mu.Lock()
 	i := f.listCalls
 	f.listCalls++
+	f.listContinues = append(f.listContinues, opts.Continue)
+	f.listLimits = append(f.listLimits, opts.Limit)
+	// A persistent Continue-token expiry: every paginated continue fails, forever, so
+	// the restarts can't make progress and fullList must fall back to unpaginated.
+	if f.expireEveryContinue && opts.Continue != "" {
+		f.mu.Unlock()
+		return nil, "", "", apierrors.NewResourceExpired("continue token expired")
+	}
+	// A Continue-token expiry fires once, then clears so the restart-from-top wins.
+	if f.expireOnContinue != "" && opts.Continue == f.expireOnContinue {
+		f.expireOnContinue = ""
+		gone := f.expireWithGone
+		f.mu.Unlock()
+		if gone {
+			return nil, "", "", apierrors.NewGone("continue token gone")
+		}
+		return nil, "", "", apierrors.NewResourceExpired("continue token expired")
+	}
 	f.mu.Unlock()
 	if i < len(f.listOutcomes) && f.listOutcomes[i] {
-		return nil, "", fmt.Errorf("list failed (call %d)", i)
+		return nil, "", "", fmt.Errorf("list failed (call %d)", i)
 	}
-	return f.listObjs, f.listRV, nil
+	// Paginated mode: resolve the requested page by continue token.
+	if f.listPages != nil {
+		// An unpaginated LIST (Limit 0, no Continue — the fullList fallback) returns
+		// every page's objects at once with no continue token.
+		if opts.Limit == 0 && opts.Continue == "" {
+			var all []*unstructured.Unstructured
+			for _, p := range f.listPages {
+				all = append(all, p...)
+			}
+			return all, "", f.listRV, nil
+		}
+		idx := 0
+		if opts.Continue != "" {
+			// tokens are "page-<n>" pointing at listPages[n]
+			fmt.Sscanf(opts.Continue, "page-%d", &idx)
+		}
+		page := f.listPages[idx]
+		cont := ""
+		if idx+1 < len(f.listPages) {
+			cont = fmt.Sprintf("page-%d", idx+1)
+		}
+		return page, cont, f.listRV, nil
+	}
+	return f.listObjs, "", f.listRV, nil
+}
+
+// continuesSeen returns the continue tokens List was called with, in order.
+func (f *fakeSource) continuesSeen() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.listContinues...)
+}
+
+// limitsSeen returns the Limit each List call was made with, in order.
+func (f *fakeSource) limitsSeen() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.listLimits...)
 }
 
 func (f *fakeSource) ListMetadata(context.Context, metav1.ListOptions) ([]objMeta, string, error) {
@@ -164,6 +239,15 @@ func metaValue(t *testing.T, cdb *store.ClusterDB, key string) string {
 }
 
 func podGVK() schema.GroupVersionKind { return schema.GroupVersionKind{Version: "v1", Kind: "Pod"} }
+
+// mkEvt builds a minimal Warning Event for the events-store tests.
+func mkEvt(uid string) *unstructured.Unstructured {
+	e := uObj(uid, "v1", "Event", "default", uid, "5")
+	e.Object["type"] = "Warning"
+	e.Object["reason"] = "BackOff"
+	e.Object["message"] = "boom"
+	return e
+}
 
 // --- tests --------------------------------------------------------------------
 
@@ -466,15 +550,16 @@ func TestBookmarkHoldsRVUntilDeltasApplied(t *testing.T) {
 	d := newKindDriverWithOptions(nil, store, podGVK(), "100", withNow(func() time.Time { return at }))
 
 	// The tap forwarded two deltas the apply loop hasn't stored yet — a bookmark
-	// past them must hold the cookie, but still prove the watch is alive.
+	// past them must hold the cookie, but still prove the watch is alive. Epoch 0 is
+	// the driver's initial watchEpoch (no watch phase has retired it).
 	d.deltaSeen.Store(2)
-	d.onBookmark(ctx, "205")
+	d.onBookmark(ctx, 0, "205")
 	require.Equal(t, at, d.liveAt(), "the bookmark stamps liveness even while the cookie is held")
 	require.Empty(t, metaValue(t, cdb, "v1/Pod.last_list_rv"), "cookie held while deltas are un-applied")
 
 	// Once both deltas are durable, the next bookmark advances the cookie.
 	d.deltaApplied.Store(2)
-	d.onBookmark(ctx, "206")
+	d.onBookmark(ctx, 0, "206")
 	require.Equal(t, "206", metaValue(t, cdb, "v1/Pod.last_list_rv"), "cookie advances once applied catches up")
 }
 
@@ -543,12 +628,8 @@ func TestEventsFullResyncUsesPlainLIST(t *testing.T) {
 	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Event"}
 	store := newEventsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
 
-	evt := uObj("e1", "v1", "Event", "default", "e1", "5")
-	evt.Object["type"] = "Warning"
-	evt.Object["reason"] = "BackOff"
-	evt.Object["message"] = "boom"
 	fs := &fakeSource{
-		listObjs: []*unstructured.Unstructured{evt},
+		listObjs: []*unstructured.Unstructured{mkEvt("e1")},
 		listRV:   "70",
 	}
 	d := newKindDriver(fs, store, gvk, "")
@@ -562,6 +643,397 @@ func TestEventsFullResyncUsesPlainLIST(t *testing.T) {
 	var n int
 	require.NoError(t, cdb.Writer().QueryRow(`SELECT COUNT(*) FROM events`).Scan(&n))
 	require.Equal(t, 1, n)
+}
+
+// A cold full LIST is paginated: each page is streamed into the store so an
+// entire kind's bodies never sit in memory at once. Every page's objects land,
+// and the driver walks the continue tokens page by page.
+func TestFullListPaginatesAllPages(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
+
+	fs := &fakeSource{
+		listRV: "60",
+		listPages: [][]*unstructured.Unstructured{
+			{uObj("a", "v1", "Pod", "default", "a", "2")},
+			{uObj("b", "v1", "Pod", "default", "b", "2")},
+			{uObj("c", "v1", "Pod", "default", "c", "2")},
+		},
+	}
+	d := newKindDriver(fs, store, podGVK(), "")
+
+	rv, err := d.fullList(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "60", rv)
+	require.Equal(t, 3, countObjectsByKind(t, w, "Pod", "v1"), "every page's objects landed")
+	require.Equal(t, []string{"", "page-1", "page-2"}, fs.continuesSeen(), "walked the continue tokens")
+	require.Equal(t, 3, d.resyncObjects, "counts every listed body across pages")
+}
+
+// The delete-missing prune must see the UNION of all pages' uids, not just the
+// last page's — otherwise a row present only in an earlier page would be wrongly
+// pruned. A stale uid absent from every page is deleted; page-1 and page-2
+// objects both survive.
+func TestFullListPrunesAgainstUnionOfPages(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	_, err := w.Exec(`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
+		VALUES ('old','v1','Pod','old','1',0,0,x'7b7d')`)
+	require.NoError(t, err)
+	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
+
+	fs := &fakeSource{
+		listRV: "60",
+		listPages: [][]*unstructured.Unstructured{
+			{uObj("a", "v1", "Pod", "default", "a", "2")},
+			{uObj("b", "v1", "Pod", "default", "b", "2")},
+		},
+	}
+	d := newKindDriver(fs, store, podGVK(), "")
+
+	_, err = d.fullList(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, countWhere(t, w, "objects", "uid", "a"), "page-1 object survives the later page's write")
+	require.Equal(t, 1, countWhere(t, w, "objects", "uid", "b"), "page-2 object present")
+	require.Equal(t, 0, countWhere(t, w, "objects", "uid", "old"), "stale uid absent from all pages pruned")
+}
+
+// A Continue token can expire (410) mid-pagination. The driver discards the
+// partial pass and restarts a fresh paginated LIST from the top, so the final
+// cache is still correct and no error escapes.
+func TestFullListRestartsOnContinueExpiry(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
+
+	fs := &fakeSource{
+		listRV:           "60",
+		expireOnContinue: "page-1", // the second page's fetch 410s, once
+		listPages: [][]*unstructured.Unstructured{
+			{uObj("a", "v1", "Pod", "default", "a", "2")},
+			{uObj("b", "v1", "Pod", "default", "b", "2")},
+		},
+	}
+	d := newKindDriver(fs, store, podGVK(), "")
+
+	rv, err := d.fullList(ctx)
+	require.NoError(t, err, "a mid-pagination 410 is recovered, not surfaced")
+	require.Equal(t, "60", rv)
+	require.Equal(t, 2, countObjectsByKind(t, w, "Pod", "v1"), "fresh pass lands every object")
+	// "" (page0), "page-1" (410), "" (restart page0), "page-1" (page1 succeeds).
+	require.Equal(t, []string{"", "page-1", "", "page-1"}, fs.continuesSeen(), "restarted from the top")
+	require.Equal(t, 2, d.resyncObjects, "aborted pages are not double-counted")
+}
+
+// A bare 410 Gone (reason "Gone", not "Expired") on a continue token — what a
+// nonconforming intermediary might answer with — is treated as continue-token expiry
+// too, so the driver restarts in place rather than surfacing it as a fatal error.
+func TestFullListRestartsOnBareGone(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
+
+	fs := &fakeSource{
+		listRV:           "60",
+		expireOnContinue: "page-1",
+		expireWithGone:   true, // a bare 410 Gone, not ResourceExpired
+		listPages: [][]*unstructured.Unstructured{
+			{uObj("a", "v1", "Pod", "default", "a", "2")},
+			{uObj("b", "v1", "Pod", "default", "b", "2")},
+		},
+	}
+	d := newKindDriver(fs, store, podGVK(), "")
+
+	rv, err := d.fullList(ctx)
+	require.NoError(t, err, "a bare 410 Gone mid-pagination is recovered like ResourceExpired")
+	require.Equal(t, "60", rv)
+	require.Equal(t, 2, countObjectsByKind(t, w, "Pod", "v1"), "the restart lands every object")
+}
+
+// When paginated restarts can't complete — a Continue token that keeps expiring at the
+// same point every pass (a kind whose full paginated pass outlives the token lifetime)
+// — fullList spends its restart budget then falls back to ONE unpaginated LIST rather
+// than erroring, so the kind completes instead of wedging in an endless heavy-LIST
+// cycle (client-go's FullListIfExpired).
+func TestFullListFallsBackToUnpaginatedOnPersistentExpiry(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	w := cdb.Writer()
+	store := newObjectsStore(ctx, "c1", podGVK(), w, cdb)
+
+	fs := &fakeSource{
+		listRV:              "60",
+		expireEveryContinue: true, // every continue-token fetch 410s, forever
+		listPages: [][]*unstructured.Unstructured{
+			{uObj("a", "v1", "Pod", "default", "a", "2")},
+			{uObj("b", "v1", "Pod", "default", "b", "2")},
+		},
+	}
+	d := newKindDriver(fs, store, podGVK(), "")
+
+	rv, err := d.fullList(ctx)
+	require.NoError(t, err, "persistent continue-token expiry is recovered by an unpaginated LIST")
+	require.Equal(t, "60", rv)
+	require.Equal(t, 2, countObjectsByKind(t, w, "Pod", "v1"), "the unpaginated fallback lists every object")
+
+	// The paginated pass retries maxListRestarts times (each 410ing on "page-1"), then
+	// the final call is the unpaginated fallback: Limit 0, no continue token.
+	limits, conts := fs.limitsSeen(), fs.continuesSeen()
+	require.Equal(t, int64(0), limits[len(limits)-1], "the fallback LIST is unpaginated (Limit 0)")
+	require.Equal(t, "", conts[len(conts)-1], "the fallback LIST starts from the top with no continue token")
+
+	page1s := 0
+	for _, c := range conts {
+		if c == "page-1" {
+			page1s++
+		}
+	}
+	require.Equal(t, maxListRestarts+1, page1s, "the initial pass plus each restart 410 on the continue token before the fallback")
+}
+
+// BeginReplace defers the resume-cookie delete to the first WritePage, so a relist
+// interrupted before any page is written (the first LIST fails, or the app quits)
+// leaves the untouched on-disk snapshot's cookie intact — the next start still resumes
+// cheaply instead of paying a needless cold LIST.
+func TestFullListZeroPagesKeepsResumeCookie(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	gvk := podGVK()
+	s := newObjectsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
+
+	// A resume cookie + objects from a prior complete sync.
+	insertObject(t, cdb.Writer(), "p1", "v1", "Pod")
+	require.NoError(t, s.PersistRV(ctx, "40"))
+
+	// The very first List (page-0) fails, before any page is written.
+	fs := &fakeSource{listOutcomes: []bool{true}}
+	d := newKindDriver(fs, s, gvk, "")
+
+	_, err := d.fullList(ctx)
+	require.Error(t, err, "the first List fails")
+	require.Equal(t, "40", metaValue(t, cdb, lastListRVKey(gvk)),
+		"no page was written, so the cookie (and the untouched snapshot) survive")
+	require.Equal(t, 1, countObjectsByKind(t, cdb.Writer(), "Pod", "v1"), "the snapshot is untouched")
+
+	rv, err := s.ResumeRV(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "40", rv, "the next start still resumes from the saved cookie")
+}
+
+// A straggler bookmark from a watch phase that already ended must not resurrect the
+// resume cookie: watch.Filter's forwarding goroutine is never joined, so a buffered
+// bookmark can surface after Run moved on to a fullList that cleared the cookie.
+// onBookmark persists only while its captured epoch is still the driver's current one.
+func TestBookmarkStragglerDoesNotResurrectCookie(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	gvk := podGVK()
+	s := newObjectsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
+	d := newKindDriver(nil, s, gvk, "")
+
+	// The driver has moved to epoch 1 (its watch phase retired). A bookmark still
+	// carrying epoch 0 is a straggler — it must not write the cookie.
+	d.watchEpoch = 1
+	d.onBookmark(ctx, 0, "999")
+	require.Empty(t, metaValue(t, cdb, lastListRVKey(gvk)),
+		"a straggler bookmark from a retired watch phase does not persist the cookie")
+
+	// A bookmark whose epoch matches the current one advances the cookie normally.
+	d.onBookmark(ctx, 1, "1000")
+	require.Equal(t, "1000", metaValue(t, cdb, lastListRVKey(gvk)),
+		"a bookmark from the current watch phase persists normally")
+}
+
+// fullList clears the resume cookie on the first page written, so a pass that fails
+// mid-pagination leaves NO cookie: the next start cold-LISTs (its Commit prune
+// reconciling the partial pages) rather than resuming from an RV that no longer matches
+// the half-written rows. This is what stops a committed page-1 from defeating ResumeRV's
+// objects-exist gate and resuming from an ancient cookie.
+func TestFullListClearsResumeCookieOnPartialFailure(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	gvk := podGVK()
+	s := newObjectsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
+
+	// A resume cookie from a prior complete sync.
+	require.NoError(t, s.PersistRV(ctx, "40"))
+	require.Equal(t, "40", metaValue(t, cdb, lastListRVKey(gvk)))
+
+	fs := &fakeSource{
+		listRV:       "70",
+		listOutcomes: []bool{false, true}, // page-0 ok, page-1 fails non-410
+		listPages: [][]*unstructured.Unstructured{
+			{uObj("p1", "v1", "Pod", "default", "p1", "5")},
+			{uObj("p2", "v1", "Pod", "default", "p2", "6")},
+		},
+	}
+	d := newKindDriver(fs, s, gvk, "")
+
+	_, err := d.fullList(ctx)
+	require.Error(t, err, "page-1 fails, so fullList surfaces it")
+	require.Equal(t, 1, countObjectsByKind(t, cdb.Writer(), "Pod", "v1"),
+		"page-0's committed rows remain — a partial snapshot the next pass's prune reconciles")
+	require.Empty(t, metaValue(t, cdb, lastListRVKey(gvk)),
+		"the stale cookie is cleared, so the next start cold-LISTs")
+
+	rv, err := s.ResumeRV(ctx)
+	require.NoError(t, err)
+	require.Empty(t, rv, "ResumeRV returns empty despite page-0 rows existing — no resume from the ancient cookie")
+}
+
+// Events clear the cookie on a failed pass too, for behavioral uniformity with
+// objects (see eventsStore.BeginReplace) — not for correctness, since an unguarded
+// ResumeRV resuming from the pre-pass cookie would be equally safe (events never
+// prune, so a partial pass can't leave a false-positive "this kind has data" signal).
+func TestFullListEventsClearsResumeCookieOnPartialFailure(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Event"}
+	store := newEventsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
+
+	require.NoError(t, store.PersistRV(ctx, "40"))
+
+	fs := &fakeSource{
+		listRV:       "70",
+		listOutcomes: []bool{false, true}, // page-0 ok, page-1 fails non-410
+		listPages: [][]*unstructured.Unstructured{
+			{mkEvt("n1")},
+			{mkEvt("n2")},
+		},
+	}
+	d := newKindDriver(fs, store, gvk, "")
+
+	_, err := d.fullList(ctx)
+	require.Error(t, err)
+	rv, err := store.ResumeRV(ctx)
+	require.NoError(t, err)
+	require.Empty(t, rv, "a failed events pass leaves no cookie, so the next start cold-LISTs")
+}
+
+// Events also take fullList (they have no metadata-diff), so their cold LIST
+// paginates too — every page's events land in the events table.
+func TestFullListPaginatesEvents(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Event"}
+	store := newEventsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
+
+	fs := &fakeSource{
+		listRV: "70",
+		listPages: [][]*unstructured.Unstructured{
+			{mkEvt("e1")},
+			{mkEvt("e2")},
+		},
+	}
+	d := newKindDriver(fs, store, gvk, "")
+
+	rv, err := d.fullList(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "70", rv)
+	var n int
+	require.NoError(t, cdb.Writer().QueryRow(`SELECT COUNT(*) FROM events`).Scan(&n))
+	require.Equal(t, 2, n, "both pages' events landed")
+}
+
+// A complete event relist must NOT prune rows absent from the fresh LIST — unlike
+// objects, kube-apiserver GCs events (~1h) well inside the cache's 24h EventsTTL
+// (store/janitor.go), so a relist's LIST already reflects the apiserver's forgotten
+// view. Pruning against it would delete still-retained history the moment the
+// source forgets it, defeating the janitor's whole reason for a longer TTL.
+func TestFullListEventsRelistDoesNotPruneMissingRows(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Event"}
+	store := newEventsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
+
+	// A baseline event the apiserver has already GC'd — absent from every LIST below,
+	// but still within the cache's retention window — must survive the relist.
+	require.NoError(t, store.upsert(mkEvt("gcd-by-apiserver")))
+
+	fs := &fakeSource{
+		listRV: "70",
+		listPages: [][]*unstructured.Unstructured{
+			{mkEvt("e1")},
+			{mkEvt("e2")},
+		},
+	}
+	d := newKindDriver(fs, store, gvk, "")
+
+	_, err := d.fullList(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "e1"), "a listed event is present")
+	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "e2"), "a listed event is present")
+	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "gcd-by-apiserver"),
+		"an event absent from the LIST (already GC'd server-side) is NOT pruned — only the janitor's TTL removes it")
+}
+
+// A failed partial pass leaves whatever it managed to upsert on disk (nothing rolls
+// a committed page back — see eventsReplaceSession), and a later successful relist
+// that no longer lists that row must still not remove it, for the same
+// TTL-preservation reason as a complete relist.
+func TestFullListEventsPartialPassRowsSurviveLaterRelist(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Event"}
+	store := newEventsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
+
+	// First pass: page-0 upserts n1, then page-1 fails non-410 — fullList surfaces
+	// the error, and n1 stays on disk.
+	failing := &fakeSource{
+		listRV:       "70",
+		listOutcomes: []bool{false, true}, // page-0 ok, page-1 fails non-410
+		listPages: [][]*unstructured.Unstructured{
+			{mkEvt("n1")},
+			{mkEvt("n2")},
+		},
+	}
+	d := newKindDriver(failing, store, gvk, "")
+	_, err := d.fullList(ctx)
+	require.Error(t, err)
+	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "n1"),
+		"a partial pass's upserted row is left on disk")
+
+	// Second pass completes and no longer lists n1 — it must still survive.
+	fresh := &fakeSource{
+		listRV: "80",
+		listPages: [][]*unstructured.Unstructured{
+			{mkEvt("n2")},
+		},
+	}
+	d2 := newKindDriver(fresh, store, gvk, "")
+	_, err = d2.fullList(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "n1"),
+		"n1 survives a later relist that no longer lists it — no delete-missing pass ever runs")
+	require.Equal(t, 1, countWhere(t, cdb.Writer(), "events", "uid", "n2"), "the surviving event is present")
+}
+
+// Commit's two resume-cookie writes (last_list_rv + last_list_at) must be atomic:
+// if the timestamp write fails, last_list_rv must NOT stay durably advanced, else a
+// restart resumes from a newer RV and skips the Added events before it. A trigger
+// forces the timestamp upsert to fail.
+func TestFullListEventsCommitCookieAtomic(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Event"}
+	_, err := cdb.Writer().Exec(
+		`CREATE TRIGGER fail_at BEFORE INSERT ON cluster_meta
+		   WHEN NEW.key LIKE '%` + lastListAtSuffix + `'
+		   BEGIN SELECT RAISE(ABORT, 'boom'); END;`)
+	require.NoError(t, err)
+	store := newEventsStore(ctx, "c1", gvk, cdb.Writer(), cdb)
+
+	sess, err := store.BeginReplace(ctx)
+	require.NoError(t, err)
+	err = sess.Commit("999")
+	require.Error(t, err, "the last_list_at upsert fails")
+	require.Empty(t, metaValue(t, cdb, lastListRVKey(gvk)),
+		"a failed Commit must not leave last_list_rv advanced — the two cookie writes are one transaction")
 }
 
 // Run returns promptly when its context is cancelled, even mid-watch.

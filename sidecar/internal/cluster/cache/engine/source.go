@@ -40,16 +40,18 @@ func newLiveSource(dyn dynamic.Interface, meta metadata.Interface, e gvrEntry) *
 
 var _ kubeSource = (*liveSource)(nil)
 
-func (s *liveSource) List(ctx context.Context, opts metav1.ListOptions) ([]*unstructured.Unstructured, string, error) {
+func (s *liveSource) List(ctx context.Context, opts metav1.ListOptions) ([]*unstructured.Unstructured, string, string, error) {
 	ul, err := s.dyn.Resource(s.gvr).List(ctx, opts)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	out := make([]*unstructured.Unstructured, len(ul.Items))
 	for i := range ul.Items {
 		out[i] = &ul.Items[i]
 	}
-	return out, ul.GetResourceVersion(), nil
+	// GetContinue() is non-empty while more pages remain; the paginating caller
+	// (fullList) loops on it and passes it back as opts.Continue.
+	return out, ul.GetContinue(), ul.GetResourceVersion(), nil
 }
 
 func (s *liveSource) ListMetadata(ctx context.Context, opts metav1.ListOptions) ([]objMeta, string, error) {

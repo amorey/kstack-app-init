@@ -81,8 +81,10 @@ type objMeta struct {
 // kubeSource is the per-GVR upstream the driver pulls from. liveSource wraps the
 // dynamic + metadata clients; tests supply a fake.
 type kubeSource interface {
-	// List returns full unstructured objects plus the list's resourceVersion.
-	List(ctx context.Context, opts metav1.ListOptions) ([]*unstructured.Unstructured, string, error)
+	// List returns one page of full unstructured objects, the list's continue
+	// token (non-empty while more pages remain — the caller loops on it via
+	// opts.Continue), and the list's resourceVersion.
+	List(ctx context.Context, opts metav1.ListOptions) ([]*unstructured.Unstructured, string, string, error)
 	// ListMetadata returns metadata-only identities plus the list's resourceVersion.
 	ListMetadata(ctx context.Context, opts metav1.ListOptions) ([]objMeta, string, error)
 	// Get fetches one full object (namespace "" = cluster-scoped).
@@ -94,10 +96,45 @@ type kubeSource interface {
 // kindStore is the store seam every driver writes through. Both objectsStore and
 // eventsStore satisfy it (see store.go); the driver never touches SQL directly.
 type kindStore interface {
+	// ApplyChange lands one watch delta: Added/Modified upsert the object,
+	// Deleted removes it by uid.
 	ApplyChange(t watch.EventType, u *unstructured.Unstructured) error
-	ReplaceFull(items []*unstructured.Unstructured, rv string) error
+	// BeginReplace opens a streaming full-LIST reconcile — the driver streams each
+	// page through the returned session, so a whole kind's bodies never sit in
+	// memory at once (see kindDriver.fullList). The session's first WritePage durably
+	// DELETES the kind's resume cookie (in the same transaction as the first rows),
+	// so the cookie means "a full LIST completed on disk": a pass that fails after
+	// writing a page leaves no cookie (Commit rewrites it only on success), so a
+	// restart re-lists in full instead of resuming from an RV that predates the
+	// partially-written rows. Clearing on the first write, not on open, means a pass
+	// that fails before any page is written leaves the untouched snapshot's cookie
+	// intact — the next start still resumes cheaply. An abandoned session needs no
+	// teardown — just drop it (its pages stay durable; see each implementation for
+	// how a later pass reconciles them).
+	BeginReplace(ctx context.Context) (replaceSession, error)
+	// PersistRV advances the kind's resume cookie without touching object rows —
+	// called on every watch delta so a wake resumes from the latest position.
 	PersistRV(ctx context.Context, rv string) error
+	// ResumeRV returns the resume cookie to seed a RetryWatcher from, or "" to
+	// force a cold full-LIST. The store owns the "should I resume?" decision:
+	// objectsStore returns it only while the kind's objects still exist (a cookie
+	// that outlived its objects can't apply deltas), while eventsStore — its own
+	// table — resumes unguarded.
 	ResumeRV(ctx context.Context) (string, error)
+}
+
+// replaceSession streams a paginated full LIST into a store — a whole kind's
+// bodies never sit in memory at once. Whether it prunes rows absent from the LIST
+// is a per-implementation choice: objectsReplaceSession does (the cache should
+// mirror the cluster); eventsReplaceSession deliberately does not (see its doc —
+// pruning against the apiserver's already-GC'd view would defeat the cache's
+// longer event retention).
+type replaceSession interface {
+	// WritePage lands one page in its own transaction.
+	WritePage(items []*unstructured.Unstructured) error
+	// Commit finalizes the pass — pruning rows absent from the LIST when the
+	// implementation does that — and persists the resume cookie at rv.
+	Commit(rv string) error
 }
 
 // metadataDiffStore is the optional extension for kinds that participate in the
@@ -178,6 +215,20 @@ type kindDriver struct {
 	// monotonic and touched from the tap and run goroutines, hence atomic.
 	deltaSeen    atomic.Int64
 	deltaApplied atomic.Int64
+
+	// cookieMu + watchEpoch fence a straggler bookmark from resurrecting the resume
+	// cookie. The bookmark tap runs in watch.Filter's forwarding goroutine, which
+	// nothing joins (rw.Stop doesn't wait for it), so a buffered bookmark can surface
+	// after watchPhase returned and Run began a fullList whose first WritePage deletes
+	// that cookie — a straggler PersistRV would resurrect it over half-written rows,
+	// and a later failed pass would then wrongly resume from it. Each watch phase
+	// captures the current watchEpoch and bumps it on return (before Run reaches
+	// fullList, in program order); onBookmark persists only while its captured epoch
+	// is still current, with the check+PersistRV held under cookieMu so it can't
+	// interleave with the epoch bump. A straggler that passes the check therefore
+	// always precedes the bump — and hence the fullList delete — so the delete wins.
+	cookieMu   sync.Mutex
+	watchEpoch int64 // guarded by cookieMu
 
 	// didResync records whether this driver fell back to a full re-sync (its saved
 	// resourceVersion was missing or expired) rather than resuming its watch
@@ -351,7 +402,19 @@ func (d *kindDriver) fireOnWatch() {
 // deltas before it have applied (see onBookmark). Object deltas persist their RV
 // inline below.
 func (d *kindDriver) watchPhase(ctx context.Context, rv string) (progressed bool, err error) {
-	watcher := watcherFor(d.src, d.markLive, func(ev watch.Event) { d.tapEvent(ctx, ev) })
+	// Capture this phase's epoch and retire it on return (before Run moves on to a
+	// fullList, in program order) so a straggler bookmark from this phase's tap can't
+	// resurrect the resume cookie — see cookieMu/watchEpoch.
+	d.cookieMu.Lock()
+	epoch := d.watchEpoch
+	d.cookieMu.Unlock()
+	defer func() {
+		d.cookieMu.Lock()
+		d.watchEpoch++
+		d.cookieMu.Unlock()
+	}()
+
+	watcher := watcherFor(d.src, d.markLive, func(ev watch.Event) { d.tapEvent(ctx, epoch, ev) })
 	rw, err := toolswatch.NewRetryWatcherWithContext(ctx, rv, watcher)
 	if err != nil {
 		// e.g. an unusable RV; let Run fall to a full re-sync.
@@ -528,16 +591,89 @@ func (d *kindDriver) fullResync(ctx context.Context) (string, error) {
 	return listRV, nil
 }
 
+// listPageSize bounds how many objects one cold-LIST page pulls, so a kind's full
+// bodies stream into the store a page at a time instead of materializing at once —
+// the memory bound that makes a cold start / large-churn relist safe. maxListRestarts
+// caps the Continue-token-expiry restarts so persistent expiry surfaces to Run's
+// backoff rather than looping forever.
+const (
+	listPageSize    = 500
+	maxListRestarts = 3
+)
+
+// fullList streams a paginated full LIST into the store: each page lands as it
+// arrives (bounding memory to one page of bodies), and a final Commit finalizes the
+// pass (pruning rows absent from every page, for stores that do — see
+// replaceSession) and persists the resume cookie. A Continue token can expire (410)
+// mid-pagination — the driver discards the partial pass and re-lists from the top
+// (matching a client-go Reflector), bounded by maxListRestarts. Once that budget is
+// spent (a token that keeps expiring at the same point — a kind whose full paginated
+// pass outlives the token lifetime), it falls back once to an unpaginated LIST
+// (client-go's FullListIfExpired): trade the per-page memory bound once for
+// guaranteed completion, so the kind doesn't wedge in an endless heavy-LIST cycle.
 func (d *kindDriver) fullList(ctx context.Context) (string, error) {
-	items, rv, err := d.src.List(ctx, metav1.ListOptions{})
+	// BeginReplace opens the session (whose first WritePage invalidates the resume
+	// cookie, rewritten only by a successful Commit), so an exit at any point below —
+	// error return or 410 restart — just drops the session: any cookie left is
+	// consistent with whatever pages were written, the next start cold-LISTs when
+	// partial pages exist, and (for objects) that re-list's Commit prune reconciles
+	// them. A warm big-delta relist that fails after writing a page drops to cold next
+	// time — correctness over latency, bounded by resyncPeriod.
+	sess, err := d.store.BeginReplace(ctx)
 	if err != nil {
 		return "", err
 	}
-	if err := d.store.ReplaceFull(items, rv); err != nil {
+
+	opts := metav1.ListOptions{Limit: listPageSize}
+	var lastRV string
+	listed, restarts := 0, 0
+	fellBack := false // whether we've already dropped to the unpaginated fallback
+	for {
+		items, cont, rv, err := d.src.List(ctx, opts)
+		if err != nil {
+			if listExpired(err) && opts.Continue != "" && !fellBack {
+				// Fresh session either way — the partial pass is discarded and re-listed
+				// from the top.
+				if sess, err = d.store.BeginReplace(ctx); err != nil {
+					return "", err
+				}
+				if restarts < maxListRestarts {
+					opts.Continue, listed = "", 0
+					restarts++
+					continue
+				}
+				// Restart budget spent: the paginated pass can't finish inside the
+				// token lifetime. Fall back once to a single unpaginated LIST (no Limit,
+				// no Continue) so the kind completes instead of looping heavy LISTs
+				// forever (Syncing → EngineStale, cold on disk).
+				opts, listed, fellBack = metav1.ListOptions{}, 0, true
+				continue
+			}
+			return "", err
+		}
+		if err := sess.WritePage(items); err != nil {
+			return "", err
+		}
+		listed += len(items)
+		lastRV = rv
+		if cont == "" {
+			break
+		}
+		opts.Continue = cont
+	}
+	if err := sess.Commit(lastRV); err != nil {
 		return "", err
 	}
-	d.resyncObjects += len(items)
-	return rv, nil
+	d.resyncObjects += listed
+	return lastRV, nil
+}
+
+// listExpired reports whether a LIST error is a continue-token expiry (410). A stock
+// kube-apiserver returns ResourceExpired (reason "Expired"); a nonconforming
+// intermediary may answer an expired continue token with a bare 410 Gone, so accept
+// that too — matching the watch path's isExpired.
+func listExpired(err error) bool {
+	return apierrors.IsResourceExpired(err) || apierrors.IsGone(err)
 }
 
 // isExpired reports whether a watch.Error event object is a 410 Gone /
@@ -570,12 +706,12 @@ func (d *kindDriver) liveAt() time.Time {
 // (which is why it runs in the tap's goroutine, not the apply loop). Object
 // deltas bump deltaSeen — the ordered high-water mark a bookmark checks against —
 // while bookmarks stamp liveness and conditionally advance the resume cookie.
-func (d *kindDriver) tapEvent(ctx context.Context, ev watch.Event) {
+func (d *kindDriver) tapEvent(ctx context.Context, epoch int64, ev watch.Event) {
 	switch ev.Type {
 	case watch.Added, watch.Modified, watch.Deleted:
 		d.deltaSeen.Add(1)
 	case watch.Bookmark:
-		d.onBookmark(ctx, resourceVersionOf(ev.Object))
+		d.onBookmark(ctx, epoch, resourceVersionOf(ev.Object))
 	}
 }
 
@@ -586,8 +722,11 @@ func (d *kindDriver) tapEvent(ctx context.Context, ev watch.Event) {
 // the server places a bookmark at/after all prior events, so advancing while a
 // delta is un-applied would let a restart skip it permanently. Deltas in flight
 // just defer the advance to the next bookmark. Liveness is stamped regardless.
-// Best-effort persistence — a write error is logged and swallowed.
-func (d *kindDriver) onBookmark(ctx context.Context, rv string) {
+// Best-effort persistence — a write error is logged and swallowed. epoch is the
+// watch phase that spawned this tap; the cookie only moves while that phase is still
+// current (see cookieMu/watchEpoch), so a straggler surfacing after watchPhase
+// returned can't resurrect a cookie a concurrent fullList deleted.
+func (d *kindDriver) onBookmark(ctx context.Context, epoch int64, rv string) {
 	if rv == "" {
 		return
 	}
@@ -597,6 +736,13 @@ func (d *kindDriver) onBookmark(ctx context.Context, rv string) {
 	seen := d.deltaSeen.Load()
 	d.markLive()
 	if d.deltaApplied.Load() < seen {
+		return
+	}
+	d.cookieMu.Lock()
+	defer d.cookieMu.Unlock()
+	if d.watchEpoch != epoch {
+		// This tap's watch phase ended; Run may be mid-fullList (cookie deleted).
+		// Persisting now would resurrect a stale cookie over half-written rows.
 		return
 	}
 	if err := d.store.PersistRV(ctx, rv); err != nil {

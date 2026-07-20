@@ -989,7 +989,12 @@ func (e *Engine) watchTriggerSource(ctx context.Context, src kubeSource, signal 
 		if ctx.Err() != nil {
 			return
 		}
-		_, rv, err := src.List(ctx, metav1.ListOptions{})
+		// Only the collection's resourceVersion is needed to seed the trigger watch,
+		// and the list RV is the same at any page size — so cap the LIST at one item.
+		// Without the cap this would materialize the entire CRD/APIService collection
+		// (CRD bodies embed OpenAPI schemas, 100s of KB each) on every (re)connect and
+		// backoff cycle just to read the collection resourceVersion.
+		_, _, rv, err := src.List(ctx, metav1.ListOptions{Limit: 1})
 		if err != nil {
 			if ctx.Err() != nil {
 				return

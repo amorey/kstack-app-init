@@ -80,3 +80,29 @@ func TestLiveSourceMetadataDiffEndToEnd(t *testing.T) {
 	require.Equal(t, "2", rv)
 	require.Equal(t, "node-1", host)
 }
+
+// liveSource.List decodes the dynamic list into *unstructured, forwards paging
+// opts, and returns the list's continue token and resourceVersion. (client-go's
+// dynamicfake doesn't implement chunked pagination, so it returns a single page
+// with an empty continue token; genuine multi-page walking is proven at the
+// driver level against fakeSource.)
+func TestLiveSourceListReturnsContinueAndRV(t *testing.T) {
+	ctx := context.Background()
+	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+	scheme := runtime.NewScheme()
+	podA := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata":   map[string]any{"uid": "uid-a", "name": "a", "namespace": "default", "resourceVersion": "2"},
+	}}
+	dynClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+		map[schema.GroupVersionResource]string{gvr: "PodList"}, podA)
+	src := newLiveSource(dynClient, nil, gvrEntry{GVR: gvr, GVK: podGVK(), Namespaced: true})
+
+	items, cont, rv, err := src.List(ctx, metav1.ListOptions{Limit: 500})
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	require.Equal(t, "a", items[0].GetName())
+	require.Empty(t, cont, "single fake page has no continue token")
+	require.NotEmpty(t, rv)
+}

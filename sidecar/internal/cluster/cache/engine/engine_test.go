@@ -1055,6 +1055,29 @@ func TestEngineWatchTriggerSourceSignalsOnDeltaOnly(t *testing.T) {
 	<-done
 }
 
+// The trigger-watch seed LIST needs only the collection resourceVersion, so it must
+// cap the LIST at one item — otherwise every (re)connect materializes the whole
+// CRD/APIService collection (CRD bodies embed 100s-of-KB OpenAPI schemas) just to read
+// the list RV.
+func TestEngineWatchTriggerSourceSeedListIsBounded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fs := &fakeSource{watchers: make(chan *watch.FakeWatcher, 4), listRV: "10"}
+	e := newEngineWithOptions(nil, migratedCDB(t), newRecordingSink())
+
+	done := make(chan struct{})
+	go func() { defer close(done); e.watchTriggerSource(ctx, fs, func() {}) }()
+
+	<-fs.watchers // the first watch established, so the seed LIST has run
+	cancel()
+	<-done
+
+	limits := fs.limitsSeen()
+	require.NotEmpty(t, limits)
+	require.Equal(t, int64(1), limits[0], "the seed LIST caps at one item — only the list RV is needed")
+}
+
 // A trigger source that permits LIST but denies WATCH (an RBAC split) makes
 // RetryWatcher terminate without progress. watchTriggerSource must back off between
 // re-LIST attempts rather than hot-looping the API server (P1).

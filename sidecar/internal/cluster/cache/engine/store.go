@@ -91,33 +91,96 @@ func (s *objectsStore) ApplyChange(t watch.EventType, u *unstructured.Unstructur
 	}
 }
 
-// ReplaceFull reconciles the table for this kind to exactly `items`. Atomic:
-// a crash mid-reconcile leaves the previous snapshot intact.
-func (s *objectsStore) ReplaceFull(items []*unstructured.Unstructured, resourceVersion string) error {
+// BeginReplace opens a streaming full-LIST reconcile: the paginating caller
+// (kindDriver.fullList) streams each page through WritePage — one page's bodies
+// in memory at a time, never the whole kind — then Commit prunes and persists.
+// Clearing the resume cookie (the kindStore.BeginReplace contract: the cookie means
+// "a full LIST completed", so an abandoned pass leaves none and the next start
+// cold-LISTs instead of resuming past the half-written rows) is DEFERRED to the first
+// WritePage — the first moment partial state can exist — so a pass that fails before
+// any page is written (the first LIST errors, the app quits) leaves the untouched
+// snapshot's cookie intact and the next start still resumes cheaply.
+func (s *objectsStore) BeginReplace(context.Context) (replaceSession, error) {
+	return &objectsReplaceSession{s: s, keep: make(map[string]struct{})}, nil
+}
+
+// objectsReplaceSession streams a paginated relist into the objects table. Each
+// WritePage is its own transaction (so the single writer conn isn't held across
+// the network round-trips between pages); the union of every page's uids is
+// accumulated in `keep` and the kind-scoped delete-missing prune is deferred to
+// Commit, so a row present only in an earlier page is never wrongly pruned.
+//
+// Per-page commits trade single-transaction atomicity for the memory bound: on a
+// warm large-churn relist a reader may briefly see a partial snapshot before Commit
+// prunes, and a pass that fails mid-pagination leaves its committed pages visible
+// until the next pass's prune reconciles them. The first WritePage clears the resume
+// cookie (rewritten only on Commit) in the same transaction that lands the first
+// rows, so once any partial state exists it can't be mistaken for a completed sync —
+// the next start cold-LISTs. On a cold cache nothing observes the intermediate state
+// anyway.
+//
+// Each committed page Notifies (like every other objects write), so durable rows
+// always reach subscribers — not only at Commit. This is what keeps a pass whose
+// Commit fails from leaving rows durable-but-unannounced: without it, the fullResync
+// retry sees those rows (SnapshotRVs), takes the metadata-diff path, finds nothing
+// changed, and would persist only the RV — never notifying — so a subscriber that
+// bound before the pages landed would stay blocked despite the objects being present.
+type objectsReplaceSession struct {
+	s             *objectsStore
+	keep          map[string]struct{}
+	cookieCleared bool // whether the first WritePage has durably cleared the resume cookie
+}
+
+var _ replaceSession = (*objectsReplaceSession)(nil)
+
+func (r *objectsReplaceSession) WritePage(items []*unstructured.Unstructured) error {
+	if len(items) == 0 {
+		return nil
+	}
+	tx, err := r.s.writer.BeginTx(r.s.ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	// Clear the resume cookie in the same transaction as the first rows this pass
+	// writes: partial state and a stale "sync completed" cookie can never coexist.
+	if !r.cookieCleared {
+		if err := deleteResumeRV(r.s.ctx, tx, r.s.gvk); err != nil {
+			return err
+		}
+	}
+	for _, u := range items {
+		row, isEvent, err := extractObject(u)
+		if err != nil {
+			slog.Warn("objectsStore.WritePage skip", "err", err)
+			continue
+		}
+		if isEvent {
+			continue
+		}
+		r.keep[row.UID] = struct{}{}
+		if err := writeObjectRow(r.s.ctx, tx, row); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.cookieCleared = true
+	r.s.cdb.Notify()
+	return nil
+}
+
+func (r *objectsReplaceSession) Commit(resourceVersion string) error {
+	s := r.s
 	tx, err := s.writer.BeginTx(s.ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	keep := make(map[string]struct{}, len(items))
-	for _, u := range items {
-		row, isEvent, err := extractObject(u)
-		if err != nil {
-			slog.Warn("objectsStore.ReplaceFull skip", "err", err)
-			continue
-		}
-		if isEvent {
-			continue
-		}
-		keep[row.UID] = struct{}{}
-		if err := writeObjectRow(s.ctx, tx, row); err != nil {
-			return err
-		}
-	}
-
-	// Delete-missing: scope only to this Kind so we don't blow away rows
-	// owned by a different driver. The kind catalog supplies the key.
+	// Delete-missing: scope only to this Kind so we don't blow away rows owned by
+	// a different driver, and prune against the UNION of all pages' uids (keep).
 	rows, err := tx.QueryContext(s.ctx,
 		`SELECT uid FROM objects WHERE kind=? AND api_version=?`, s.gvk.Kind, s.gvk.GroupVersion().String())
 	if err != nil {
@@ -130,7 +193,7 @@ func (s *objectsStore) ReplaceFull(items []*unstructured.Unstructured, resourceV
 			rows.Close()
 			return err
 		}
-		if _, ok := keep[uid]; !ok {
+		if _, ok := r.keep[uid]; !ok {
 			stale = append(stale, uid)
 		}
 	}
@@ -156,7 +219,8 @@ func (s *objectsStore) ReplaceFull(items []*unstructured.Unstructured, resourceV
 
 // SnapshotRVs returns {uid: resource_version} currently cached for this kind —
 // the baseline the metadata-diff resync compares the live metadata list against.
-// Scoped by (kind, api_version) exactly like ReplaceFull's delete-missing prune.
+// Scoped by (kind, api_version) exactly like objectsReplaceSession.Commit's
+// delete-missing prune.
 func (s *objectsStore) SnapshotRVs(ctx context.Context) (map[string]string, error) {
 	rows, err := s.writer.QueryContext(ctx,
 		`SELECT uid, resource_version FROM objects WHERE kind=? AND api_version=?`,
@@ -328,7 +392,7 @@ func deleteObjectRows(ctx context.Context, tx *sql.Tx, uid string) error {
 
 // kindKey identifies a resource type as stored in the objects table:
 // (kind, api_version) where api_version is the GroupVersion string ("v1",
-// "apps/v1", "example.com/v1") — the same pair objectsStore.ReplaceFull scopes
+// "apps/v1", "example.com/v1") — the same pair objectsReplaceSession.Commit scopes
 // its per-kind delete-missing prune to.
 type kindKey struct {
 	kind       string
@@ -415,7 +479,7 @@ func newEventsStore(ctx context.Context, clusterID string, gvk schema.GroupVersi
 }
 
 // execer is the subset of *sql.DB / *sql.Tx that insertEventRow needs, so the
-// incremental upsert (direct on the writer) and the relist ReplaceFull (inside
+// incremental upsert (direct on the writer) and the relist WritePage (inside
 // a txn) can share one INSERT.
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -487,34 +551,86 @@ func (s *eventsStore) ApplyChange(t watch.EventType, u *unstructured.Unstructure
 	}
 }
 
-// ReplaceFull upserts the LISTed events. There is deliberately no delete-missing
-// pass: the two drivers (core/v1 and events.k8s.io/v1) share the events table with
-// no cross-store coordination, so a "delete UIDs not in this LIST" sweep would let
-// each delete the other's rows. Instead the per-event upsert plus the janitor's TTL
-// converge — fine because events are short-lived server-side anyway.
+// BeginReplace opens a streaming full-LIST reconcile for the events table.
+// Deliberately NO delete-missing pass, unlike objects: kube-apiserver GCs events at
+// ~1h by default, well inside the cache's 24h EventsTTL (store/janitor.go) — the
+// whole point of that longer retention is to answer "what happened overnight" after
+// the apiserver has already forgotten. A relist's LIST reflects the apiserver's
+// current (already-GC'd) view, so pruning rows absent from it would delete
+// still-retained history the moment the source forgets it, defeating the janitor's
+// job. So a relist only upserts each page's rows; every row's removal is either an
+// explicit watch Deleted (ApplyChange) or the janitor's TTL sweep — never a relist.
+//
+// Clearing the resume cookie (per the kindStore.BeginReplace contract) is DEFERRED to
+// the first WritePage, matching objectsStore: a pass that fails before any page is
+// written leaves the untouched snapshot's cookie intact so the next start resumes
+// cheaply. For events that clear isn't load-bearing anyway — ResumeRV is unguarded
+// and a relist never prunes, so resuming from a pre-pass cookie after a crash would be
+// harmless (the watch either succeeds or 410s into a fresh fullList) — but riding the
+// same deferred-clear shape keeps the two stores uniform.
 //
 // eventsStore does NOT implement metadataDiffStore (the events table has no
-// resource_version column and no delete-missing), so fullResync's type assertion
-// routes events to a plain full LIST.
-func (s *eventsStore) ReplaceFull(items []*unstructured.Unstructured, resourceVersion string) error {
-	tx, err := s.writer.BeginTx(s.ctx, nil)
+// resource_version column), so fullResync's type assertion routes events to a
+// plain full LIST.
+func (s *eventsStore) BeginReplace(context.Context) (replaceSession, error) {
+	return &eventsReplaceSession{s: s}, nil
+}
+
+// eventsReplaceSession streams a paginated event relist, upserting each page with no
+// delete-missing pass (see BeginReplace) — so there is nothing to track for a prune.
+// Committed pages are never reverted: a partial pass simply leaves whatever it
+// managed to upsert, same as a successful one.
+type eventsReplaceSession struct {
+	s             *eventsStore
+	cookieCleared bool // whether the first WritePage has durably cleared the resume cookie
+}
+
+var _ replaceSession = (*eventsReplaceSession)(nil)
+
+func (r *eventsReplaceSession) WritePage(items []*unstructured.Unstructured) error {
+	if len(items) == 0 {
+		return nil
+	}
+	tx, err := r.s.writer.BeginTx(r.s.ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-
+	// Clear the resume cookie in the same transaction as the first upserted page (see
+	// BeginReplace), so the deferred-clear shape matches objectsStore.
+	if !r.cookieCleared {
+		if err := deleteResumeRV(r.s.ctx, tx, r.s.gvk); err != nil {
+			return err
+		}
+	}
 	now := time.Now().UnixMilli()
 	for _, u := range items {
 		row, err := extractEvent(u)
 		if err != nil {
 			continue
 		}
-		if err := s.insertEventRow(tx, row, now); err != nil {
+		if err := r.s.insertEventRow(tx, row, now); err != nil {
 			return err
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.cookieCleared = true
+	return nil
+}
 
-	if err := persistListRVMeta(s.ctx, tx, s.gvk, resourceVersion); err != nil {
+// Commit persists the resume cookie; no prune (see BeginReplace). The cookie's two
+// cluster_meta writes (last_list_rv + last_list_at) go in ONE transaction so a
+// failed persist can't leave last_list_rv durably advanced — which would resume the
+// next watch from a newer RV and skip the Added events before it.
+func (r *eventsReplaceSession) Commit(resourceVersion string) error {
+	tx, err := r.s.writer.BeginTx(r.s.ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := persistListRVMeta(r.s.ctx, tx, r.s.gvk, resourceVersion); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -563,7 +679,7 @@ func lastListAtKey(gvk schema.GroupVersionKind) string {
 }
 
 // persistListRVMeta writes a kind's resume cookie (last_list_rv + last_list_at).
-// It takes an execer so it works both inside ReplaceFull's transaction and directly
+// It takes an execer so it works both inside a Commit transaction and directly
 // on the writer for the per-delta PersistRV; the shared helper keeps the two key
 // spellings from drifting.
 func persistListRVMeta(ctx context.Context, ex execer, gvk schema.GroupVersionKind, rv string) error {
@@ -627,12 +743,14 @@ func pruneOrphanedResumeCookies(ctx context.Context, writer *sql.DB, keep map[st
 	return int64(len(orphans)), nil
 }
 
-// deleteResumeRV durably removes a kind's resume cookie (last_list_rv + last_list_at) so
-// the next driver for it cold-LISTs. The GVR-repoint path calls it before relaunching the
-// replacement: the old rows survive the repoint (same GVK), so a surviving cookie would
-// let a restart in the relaunch window resume the new endpoint from the stale RV.
-func deleteResumeRV(ctx context.Context, db *sql.DB, gvk schema.GroupVersionKind) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM cluster_meta WHERE key IN (?, ?)`,
+// deleteResumeRV durably removes a kind's resume cookie (last_list_rv + last_list_at)
+// so the next driver for it cold-LISTs. Takes an execer so it runs either directly on
+// the writer (the GVR-repoint path, before relaunching the replacement — the old rows
+// survive the repoint under the same GVK, so a surviving cookie would let a restart in
+// the relaunch window resume the new endpoint from the stale RV) or inside a
+// replaceSession's first-page transaction (BeginReplace's deferred clear).
+func deleteResumeRV(ctx context.Context, ex execer, gvk schema.GroupVersionKind) error {
+	_, err := ex.ExecContext(ctx, `DELETE FROM cluster_meta WHERE key IN (?, ?)`,
 		lastListRVKey(gvk), lastListAtKey(gvk))
 	return err
 }

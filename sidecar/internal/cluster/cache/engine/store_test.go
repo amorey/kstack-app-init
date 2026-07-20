@@ -180,6 +180,37 @@ func TestObjectsStoreDeleteByUIDCascades(t *testing.T) {
 	require.Equal(t, 0, countWhere(t, w, "status_history", "uid", "p1"))
 }
 
+// Regression: every committed page of an objects relist Notifies, so durable rows
+// reach subscribers even before Commit. Without this, a pass whose Commit fails
+// leaves its pages durable-but-unannounced; the fullResync retry then takes the
+// metadata-diff path (SnapshotRVs sees the rows), finds nothing changed, persists
+// only the RV, and never notifies — so a subscriber bound before the pages landed
+// stays blocked despite the objects being present.
+func TestObjectsWritePageNotifiesPerPage(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+
+	// Subscribe before the write so the ping can't race the subscription (as the
+	// GraphQL watch does).
+	pings, cancelSub := cdb.Subscribe()
+	defer cancelSub()
+
+	s := newObjectsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, cdb.Writer(), cdb)
+	sess, err := s.BeginReplace(ctx)
+	require.NoError(t, err)
+
+	// A committed page notifies — no Commit needed.
+	require.NoError(t, sess.WritePage([]*unstructured.Unstructured{
+		uObj("p1", "v1", "Pod", "default", "p1", "10"),
+	}))
+	select {
+	case <-pings:
+	case <-time.After(30 * time.Second):
+		t.Fatal("WritePage did not notify subscribers after committing a page")
+	}
+	require.Equal(t, 1, countObjectsByKind(t, cdb.Writer(), "Pod", "v1"))
+}
+
 // raw_json is stored zlib-compressed, not as plaintext JSON: the stored cell
 // must be a zlib stream (first byte 0x78) that decompresses back to the exact
 // object JSON — never the readable plaintext. Both write paths (objects and
