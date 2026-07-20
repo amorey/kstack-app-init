@@ -1626,6 +1626,43 @@ func TestStaleLaggardsFlagsStuckNotSlow(t *testing.T) {
 		"only the stuck kind is flagged (with its cause); a slow-but-progressing one is not")
 }
 
+// The kube-apiserver serves Events without its watch cache, so it never sends watch
+// bookmarks for them — on a quiet cluster an Event watch then goes silent (no deltas,
+// no bookmarks) past the threshold though it's healthy. staleLaggards exempts Events
+// from the wedged-watch (CauseWatchStalled) check so this silence isn't a false Stale,
+// while a non-exempt kind gone equally quiet is still flagged.
+func TestStaleLaggardsExemptsBookmarklessKinds(t *testing.T) {
+	old := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	now := old.Add(10 * time.Minute)
+	mk := func(gvk schema.GroupVersionKind) *kindDriver {
+		d := newKindDriverWithOptions(&fakeSource{}, nil, gvk, "1", withNow(func() time.Time { return old }))
+		d.markLive() // liveAt = old → quiet past the 5m threshold against now
+		return d
+	}
+	coreEvent := mk(schema.GroupVersionKind{Version: "v1", Kind: "Event"})
+	newEvent := mk(schema.GroupVersionKind{Group: "events.k8s.io", Version: "v1", Kind: "Event"})
+	pod := mk(schema.GroupVersionKind{Version: "v1", Kind: "Pod"})
+
+	got := staleLaggards([]*kindDriver{coreEvent, newEvent, pod}, now, 5*time.Minute)
+	require.Equal(t, []KindStatus{{Kind: "Pod", Cause: CauseWatchStalled}}, got,
+		"a quiet Event watch is exempt (no bookmarks expected); a quiet Pod watch is still flagged")
+}
+
+// A bookmarkless Event that's genuinely stuck (spent its resync error budget) is still
+// surfaced — the exemption only covers the wedged-watch heuristic, not the isStuck
+// signal, which means the kind can't LIST/watch at all.
+func TestStaleLaggardsStillFlagsStuckBookmarklessKind(t *testing.T) {
+	now := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Event"}
+	d := newKindDriverWithOptions(&fakeSource{}, nil, gvk, "1", withNow(func() time.Time { return now }))
+	d.recordFailure(0, CauseWatchFailed)
+	d.stuck.Store(true)
+
+	got := staleLaggards([]*kindDriver{d}, now, 5*time.Minute)
+	require.Equal(t, []KindStatus{{Kind: "Event", Cause: CauseWatchFailed}}, got,
+		"a stuck Event is still surfaced; the bookmarkless exemption covers only CauseWatchStalled")
+}
+
 // The driver invokes onWatch exactly once — the first time it enters its watch
 // phase — which is what the engine's Syncing→Watching countdown rides on.
 func TestDriverOnWatchFiresOnce(t *testing.T) {

@@ -1452,12 +1452,34 @@ func staleLaggards(drivers []*kindDriver, now time.Time, threshold time.Duration
 			laggards = append(laggards, KindStatus{Kind: d.gvk.Kind, Cause: d.stuckCause()})
 		case live.IsZero():
 			// Never watched but not stuck — still legitimately syncing; don't flag.
+		case bookmarkless(d.gvk):
+			// The kube-apiserver serves this kind without its watch cache (Events),
+			// so it never sends watch bookmarks — regardless of AllowWatchBookmarks.
+			// On a quiet cluster the watch then delivers no deltas AND no bookmarks
+			// for arbitrarily long, so lastLiveAt legitimately goes cold even though
+			// the watch is fine. Skip the wedged-watch check: connection death is
+			// still caught (HTTP/2 keepalive drops the conn → reconnect stamps
+			// liveness), a genuinely broken kind still surfaces via isStuck above,
+			// and the periodic resync reconciles any missed drift. A stall we can't
+			// distinguish from healthy silence is not worth a false Stale.
 		case now.Sub(live) > threshold:
 			laggards = append(laggards, KindStatus{Kind: d.gvk.Kind, Cause: CauseWatchStalled})
 		}
 	}
 	sort.Slice(laggards, func(i, j int) bool { return laggards[i].Kind < laggards[j].Kind })
 	return laggards
+}
+
+// bookmarkless reports whether the kube-apiserver serves gvk without a watch cache
+// and so never emits watch bookmarks for it. Today that's Events — both the core
+// group ("") and events.k8s.io host a Kind "Event", and the apiserver disables the
+// watch cache for events by default (they're high-churn and TTL'd), so their watches
+// stream straight from etcd with no bookmarks. staleLaggards exempts these kinds from
+// the wedged-watch (CauseWatchStalled) check, since bookmark silence on them is
+// indistinguishable from a healthy quiet watch. There's no API that advertises this
+// property, so the set is hardcoded to the known real-world case.
+func bookmarkless(gvk schema.GroupVersionKind) bool {
+	return gvk.Kind == "Event" && (gvk.Group == "" || gvk.Group == "events.k8s.io")
 }
 
 // freshnessLoop tracks when the cache last received data (via the ClusterDB's
