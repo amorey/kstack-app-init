@@ -19,30 +19,34 @@
 // plus the target kind (`apiVersion` + `resource`), streams the kind's cached objects — the
 // newest set as an `Added` burst, then `Added`/`Modified`/`Deleted` keyed by `uid`.
 //
-// For now each object carries only its typed universal identity (uid/namespace/name/
-// creationTimestamp), enough for a Name/Namespace/Age table. The nested object body (and
-// kind-specific columns computed from it) is a follow-up — see the "ClusterDataObject —
-// native nested body" item in TODO.md.
+// Each object carries its typed universal identity (uid/namespace/name/creationTimestamp)
+// plus `rawJSON`, the full native body — the frontend casts the body to a typed Kubernetes
+// object and derives kind-specific columns from it (see ObjectsTable).
 //
-// The delta reducer is cache-aware in the exact same way as `useClusterDataEvents`: every
-// frame carries its cache id, so a straggler from a superseded subscription is dropped and
-// the active cache's own first frame after a swap starts fresh — two caches' objects never
-// mix. Rows are sorted by (namespace, name), kubectl-style.
+// Reduction runs through the shared `useCacheDeltaWatch`, but with a fuller provenance key
+// than the kinds/events watches: cacheID + apiVersion + resource, because this watch is
+// keyed by kind too. Every frame carries that triple, so a straggler from a superseded cache
+// *or* from the previous kind's still-draining subscription (same cache, different resource)
+// is dropped, and the first frame after a cache swap or resource switch starts fresh — two
+// caches' *or* two kinds' objects never mix. Rows are sorted by (namespace, name),
+// kubectl-style.
 import { useMemo } from 'react';
 
 import { graphql } from '@/gql';
 import type { ClusterDataObjectsWatchSubscription as ClusterDataObjectsWatchSubscriptionType } from '@/gql/graphql';
-import { useActiveKubeContext } from '@/lib/active-kube-context';
-import { useClusters, applyChange } from '@/lib/clusters';
-import type { Keyed } from '@/lib/clusters';
-import { useWatchSubscription, watchPhase } from '@/lib/graphql/use-watch-subscription';
+import { useActiveCluster } from '@/lib/active-cluster';
+import { useCacheDeltaWatch, joinProvenance } from '@/lib/graphql/use-cache-delta-watch';
 import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
+import { gvrKey } from '@/lib/gvr';
+import type { GVR } from '@/lib/gvr';
 
 const ClusterDataObjectsWatchSubscription = graphql(`
   subscription ClusterDataObjectsWatch($id: ObjectID!, $cacheID: ObjectID!, $apiVersion: String!, $resource: String!) {
     clusterDataObjectsWatch(id: $id, cacheID: $cacheID, apiVersion: $apiVersion, resource: $resource) {
       type
       cacheID
+      apiVersion
+      resource
       object {
         uid
         apiVersion
@@ -50,6 +54,7 @@ const ClusterDataObjectsWatchSubscription = graphql(`
         namespace
         name
         creationTimestamp
+        rawJSON
       }
     }
   }
@@ -58,66 +63,51 @@ const ClusterDataObjectsWatchSubscription = graphql(`
 // One cached object (the `object` payload of a change), as the table renders a row from.
 export type ClusterDataObject = ClusterDataObjectsWatchSubscriptionType['clusterDataObjectsWatch']['object'];
 
-// The reduced set: objects keyed by uid, tagged with the cache id the frames came from
-// (read off each frame, not inferred from render state) so the reducer/read can reject a
-// previous cache's objects that urql retains across a swap.
-type ObjectSet = { cacheID: string; objects: Keyed<ClusterDataObject> };
-
-// The kind whose objects to stream — its group/version and plural resource.
-export type ObjectKind = { apiVersion: string; resource: string };
+// One collator for the (namespace, name) sort, hoisted to module scope: the reducer hands
+// back a new array on every delta frame, so the whole list re-sorts per frame — and
+// `String.prototype.localeCompare` re-derives a collator on each call, which is the slowest
+// way to compare strings in JS. Reusing one instance keeps a large kind's re-sort cheap.
+const COLLATOR = new Intl.Collator();
 
 // The active context's cached objects of `kind`, updated live. Empty while
 // clusters/objects haven't loaded (no active cluster, or an unsynced one — no active cache,
 // so the watch is paused). `active` = the watch is live (a cluster + active cache to stream
 // from); `phase` classifies connecting vs. empty-snapshot for a spinner, mirroring
 // `useClusterDataEvents`.
-export function useClusterDataObjects(kind: ObjectKind): {
+//
+// Provenance carries the FULL key this watch is keyed on — cacheID + apiVersion + resource —
+// not just cacheID like the kinds/events watches, because switching resources within one
+// cache keeps the cacheID: without the kind in the key, the previous kind's retained set /
+// stragglers would leak into the new kind's table. `useCacheDeltaWatch` drops any frame
+// whose provenance doesn't match and starts fresh on a change.
+export function useClusterDataObjects(kind: GVR): {
   objects: ClusterDataObject[];
   active: boolean;
   phase: WatchPhase;
 } {
-  const { context } = useActiveKubeContext();
-  const { clusters } = useClusters();
+  const { clusterID, cacheID, active } = useActiveCluster();
 
-  const cluster = useMemo(
-    () => clusters?.find((c) => c.spec.source.kubeconfig?.context === context),
-    [clusters, context],
-  );
-  const clusterID = cluster?.id;
-  const cacheID = cluster?.activeCache?.id;
-  const paused = !clusterID || !cacheID;
-
-  // The same cache-aware reduction as useClusterDataEvents: drop a straggler from a
-  // superseded subscription (leaving the active cache's set untouched), and start fresh on
-  // the active cache's first frame after a swap. A transport reconnect (same cacheID, full
-  // replay) is handled by useWatchSubscription resetting the set to `undefined`.
-  const [{ data, connected }] = useWatchSubscription(
+  const { items, phase } = useCacheDeltaWatch<ClusterDataObjectsWatchSubscriptionType, ClusterDataObject>(
     {
       query: ClusterDataObjectsWatchSubscription,
       variables: { id: clusterID ?? '', cacheID: cacheID ?? '', apiVersion: kind.apiVersion, resource: kind.resource },
-      pause: paused,
+      pause: !active,
     },
-    (prev: ObjectSet | undefined, res) => {
-      const { type, object, cacheID: frameCacheID } = res.clusterDataObjectsWatch;
-      if (frameCacheID !== cacheID) return prev ?? { cacheID: cacheID ?? '', objects: new Map() };
-      const objects = prev && prev.cacheID === frameCacheID ? prev.objects : undefined;
-      return { cacheID: frameCacheID, objects: applyChange(objects, type, object.uid, object) };
+    {
+      select: (d) => {
+        const f = d.clusterDataObjectsWatch;
+        return { type: f.type, entity: f.object, provenance: joinProvenance(f.cacheID, gvrKey(f)) };
+      },
+      keyOf: (o) => o.uid,
+      currentProvenance: joinProvenance(cacheID ?? '', gvrKey(kind)),
     },
   );
-
-  // The accumulated set, but only when it's tagged for the active cache — urql retains the
-  // previous cache's `data` across a swap, so reject anything not tagged for it. This one
-  // guard feeds both the rendered rows and the watch phase.
-  const activeSet = data && cacheID && data.cacheID === cacheID ? data.objects : undefined;
 
   // Sort by (namespace, name) so the table order is stable across delta churn.
   const objects = useMemo(
-    () =>
-      activeSet
-        ? [...activeSet.values()].sort((a, b) => a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name))
-        : [],
-    [activeSet],
+    () => [...items].sort((a, b) => COLLATOR.compare(a.namespace, b.namespace) || COLLATOR.compare(a.name, b.name)),
+    [items],
   );
 
-  return { objects, active: !paused, phase: watchPhase(!!activeSet, connected) };
+  return { objects, active, phase };
 }

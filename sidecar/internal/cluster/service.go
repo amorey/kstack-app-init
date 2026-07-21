@@ -516,8 +516,8 @@ func (s *Service) ClusterDataEventsWatch(ctx context.Context, clusterID ClusterI
 // objects. It mirrors ClusterDataEventsWatch's shape but follows the object-write broker
 // (ObjectsSubscribe) — the same broker the kind catalog watches — re-reading a new
 // store.Objects(apiVersion, resource) snapshot on each debounced ping, keyed by UID and
-// projecting each row to a ClusterDataObject (its universal identity; the nested body is
-// deferred — see TODO.md). cacheDeltaWatch owns the whole cache-lifecycle + coalescing
+// projecting each row to a ClusterDataObject (universal identity + the native body, so an
+// in-place edit surfaces as Modified). cacheDeltaWatch owns the whole cache-lifecycle + coalescing
 // loop, so this matches ClusterDataKindsWatch's empty/rebind posture exactly (no open
 // cache → no frames until it opens or ctx ends).
 func (s *Service) ClusterDataObjectsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterDataObjectChange, error) {
@@ -545,14 +545,16 @@ func (s *Service) ClusterDataObjectsWatch(ctx context.Context, clusterID Cluster
 		},
 		func(o ClusterDataObject) string { return o.UID },
 		func(t ChangeType, o ClusterDataObject) ClusterDataObjectChange {
-			return ClusterDataObjectChange{Type: t, Object: o, CacheID: cacheID}
+			return ClusterDataObjectChange{Type: t, Object: o, CacheID: cacheID, APIVersion: apiVersion, Resource: resource}
 		},
 	), nil
 }
 
 // toDataObject maps a store ObjectRow onto the domain ClusterDataObject 1:1, decoding the
 // stored unix-millis creationTimestamp (0 → zero time) consistently with the events read
-// so two reads of the same row compare equal in the watch diff.
+// so two reads of the same row compare equal in the watch diff. RawJSON carries the
+// decompressed native body verbatim; because it's part of the struct, an in-place edit
+// (which rewrites the body) differs across reads and surfaces as Modified.
 func toDataObject(r store.ObjectRow) ClusterDataObject {
 	return ClusterDataObject{
 		UID:               r.UID,
@@ -561,6 +563,7 @@ func toDataObject(r store.ObjectRow) ClusterDataObject {
 		Namespace:         r.Namespace,
 		Name:              r.Name,
 		CreationTimestamp: millisToTime(r.CreatedAt),
+		RawJSON:           RawJSON(r.RawJSON),
 	}
 }
 
@@ -591,8 +594,8 @@ func millisToTime(ms int64) time.Time {
 	return time.UnixMilli(ms).UTC()
 }
 
-// cacheDeltaWatch is the shared engine behind ClusterDataKindsWatch and
-// ClusterDataEventsWatch. It follows one ClusterCache's on-disk db across its whole
+// cacheDeltaWatch is the shared engine behind ClusterDataKindsWatch, ClusterDataEventsWatch,
+// and ClusterDataObjectsWatch. It follows one ClusterCache's on-disk db across its whole
 // lifecycle via the store Manager's WatchDB (binding when the cache opens, rebinding on a
 // Clear-cache delete+reopen), coalesces the db's write pings on a trailing-edge debounce,
 // and on each fire re-reads a keyed snapshot and diffs it against the last one it emitted —

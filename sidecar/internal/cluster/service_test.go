@@ -19,6 +19,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -328,8 +329,8 @@ func TestServiceCacheStatsRollup(t *testing.T) {
 		_, err := cdb.Writer().ExecContext(ctx,
 			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
 			   created_at, updated_at, raw_json)
-			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, x'7b7d')`,
-			objUID, apiVersion, kind, objUID, at, at)
+			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, ?)`,
+			objUID, apiVersion, kind, objUID, at, at, emptyRawJSON(t))
 		require.NoError(t, err)
 	}
 	insert("p1", "v1", "Pod")
@@ -378,7 +379,7 @@ func TestServiceCacheStatsExcludesEventKind(t *testing.T) {
 	_, err = cdb.Writer().ExecContext(ctx,
 		`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
 		   created_at, updated_at, raw_json)
-		 VALUES ('d1', 'apps/v1', 'Deployment', 'default', 'd1', '1', ?, ?, x'7b7d')`, at, at)
+		 VALUES ('d1', 'apps/v1', 'Deployment', 'default', 'd1', '1', ?, ?, ?)`, at, at, emptyRawJSON(t))
 	require.NoError(t, err)
 	for _, uid := range []string{"e1", "e2"} {
 		_, err = cdb.Writer().ExecContext(ctx,
@@ -435,8 +436,8 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 		_, err := cdb.Writer().ExecContext(ctx,
 			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
 			   created_at, updated_at, raw_json)
-			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, x'7b7d')`,
-			objUID, apiVersion, kind, objUID, at, at)
+			 VALUES (?, ?, ?, 'default', ?, '1', ?, ?, ?)`,
+			objUID, apiVersion, kind, objUID, at, at, emptyRawJSON(t))
 		require.NoError(t, err)
 	}
 
@@ -518,8 +519,8 @@ func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
 		_, err := cdb.Writer().ExecContext(ctx,
 			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
 			   created_at, updated_at, raw_json)
-			 VALUES (?, 'apps/v1', 'Deployment', 'default', ?, '1', ?, ?, x'7b7d')`,
-			objUID, objUID, at, at)
+			 VALUES (?, 'apps/v1', 'Deployment', 'default', ?, '1', ?, ?, ?)`,
+			objUID, objUID, at, at, emptyRawJSON(t))
 		require.NoError(t, err)
 	}
 
@@ -743,15 +744,33 @@ func recvObjectChange(t *testing.T, ch <-chan ClusterDataObjectChange) ClusterDa
 // driver would persist. createdAt is the object's creationTimestamp as unix-millis.
 func insertObject(t *testing.T, ctx context.Context, cdb *store.ClusterDB, uid, apiVersion, kind, namespace, name, rv string, createdAt int64) {
 	t.Helper()
-	_, err := cdb.Writer().ExecContext(ctx,
+	// The body carries the resourceVersion (as it does in a real object), so a bare rv
+	// bump rewrites raw_json — which is what makes an in-place edit surface as Modified.
+	// raw_json is updated on conflict too, so a re-insert with a new rv changes the body.
+	body, err := store.CompressRaw([]byte(fmt.Sprintf(
+		`{"metadata":{"namespace":%q,"name":%q,"resourceVersion":%q}}`, namespace, name, rv)))
+	require.NoError(t, err)
+	_, err = cdb.Writer().ExecContext(ctx,
 		`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
 		   created_at, updated_at, raw_json)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, x'7b7d')
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(uid) DO UPDATE SET
 		   namespace=excluded.namespace, name=excluded.name,
-		   resource_version=excluded.resource_version, updated_at=excluded.updated_at`,
-		uid, apiVersion, kind, namespace, name, rv, createdAt, createdAt)
+		   resource_version=excluded.resource_version, updated_at=excluded.updated_at,
+		   raw_json=excluded.raw_json`,
+		uid, apiVersion, kind, namespace, name, rv, createdAt, createdAt, body)
 	require.NoError(t, err)
+}
+
+// emptyRawJSON is a zlib-compressed "{}" for object seeds read only via CacheStats/Kinds
+// (which never decompress): store.Objects decompresses raw_json, so a seed on that read
+// path must be compressed like the engine write path. (Event rows aren't decompressed by
+// store.Events, so those seeds stay raw.)
+func emptyRawJSON(t *testing.T) []byte {
+	t.Helper()
+	b, err := store.CompressRaw([]byte(`{}`))
+	require.NoError(t, err)
+	return b
 }
 
 // insertObjectCatalog writes one kind_catalog row so the objects reader can translate
@@ -904,6 +923,13 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 	assert.Equal(t, "web", snap.Object.Name)
 	assert.False(t, snap.Object.CreationTimestamp.IsZero())
 	assert.Equal(t, ClusterCacheID(cacheID), snap.CacheID)
+	// The frame carries its (apiVersion, resource) kind provenance, so a client switching
+	// resources within one cache can reject a straggler from the previous kind.
+	assert.Equal(t, "apps/v1", snap.APIVersion)
+	assert.Equal(t, "deployments", snap.Resource)
+	// The native body rides along, forwarded verbatim from the cache.
+	assert.JSONEq(t, `{"metadata":{"namespace":"default","name":"web","resourceVersion":"1"}}`,
+		string(snap.Object.RawJSON))
 
 	// A brand-new object → Added.
 	insertObject(t, ctx, cdb, "d2", "apps/v1", "Deployment", "kube-system", "coredns", "2", 200)
@@ -912,18 +938,16 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 	assert.Equal(t, ChangeAdded, add.Type)
 	assert.Equal(t, "d2", add.Object.UID)
 
-	// ClusterDataObject projects only the object's immutable identity (uid/apiVersion/
-	// kind/namespace/name/creationTimestamp) for now — the nested body is deferred (see
-	// TODO.md). So a bare resourceVersion bump changes no projected field and must NOT
-	// produce a frame; a Modified only becomes observable once the body ships.
+	// The projection carries the native body, so an in-place edit — a bare resourceVersion
+	// bump that rewrites raw_json under a stable uid/identity — now differs across reads and
+	// surfaces as Modified (the closed gap the identity-only projection couldn't observe).
 	insertObject(t, ctx, cdb, "d1", "apps/v1", "Deployment", "default", "web", "9", 100)
 	cdb.ObjectsNotify()
-	select {
-	case ev := <-ch:
-		t.Fatalf("a non-identity change must not surface with the identity-only projection, got %+v", ev)
-	case <-time.After(150 * time.Millisecond):
-		// Correct: no frame — only identity is projected today.
-	}
+	mod := recvObjectChange(t, ch)
+	assert.Equal(t, ChangeModified, mod.Type)
+	assert.Equal(t, "d1", mod.Object.UID)
+	assert.JSONEq(t, `{"metadata":{"namespace":"default","name":"web","resourceVersion":"9"}}`,
+		string(mod.Object.RawJSON))
 
 	// An object removed from the table → Deleted (carries the last-known row).
 	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM objects WHERE uid = 'd2'`)

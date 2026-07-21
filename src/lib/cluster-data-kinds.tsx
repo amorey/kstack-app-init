@@ -21,21 +21,16 @@
 // `Added` burst on subscribe, then per-kind `Added`/`Modified`/`Deleted` (a per-kind
 // `count` is live, so an object write re-emits it as `Modified`).
 //
-// The reducer is cache-aware in the same way as `useClusterDataEvents`: each frame carries
-// its cache id, so a straggler from a superseded subscription is dropped and the active
-// cache's own first frame after a swap starts fresh — two caches' kinds never mix. urql
-// dedupes the underlying subscription, so `useDashboardNav` and an object table both
-// consuming this share one transport.
-import { useMemo } from 'react';
-
+// Reduction runs through the shared `useCacheDeltaWatch` (cache-aware provenance: a straggler
+// from a superseded cache is dropped and the active cache's first frame after a swap starts
+// fresh, so two caches' kinds never mix).
 import { graphql } from '@/gql';
 import type { ClusterDataKindsWatchSubscription as ClusterDataKindsWatchSubscriptionType } from '@/gql/graphql';
-import { useActiveKubeContext } from '@/lib/active-kube-context';
-import { useClusters, applyChange } from '@/lib/clusters';
-import type { Keyed } from '@/lib/clusters';
+import { useActiveCluster } from '@/lib/active-cluster';
 import type { ServerKind } from '@/lib/dashboard-resources';
-import { useWatchSubscription, watchPhase } from '@/lib/graphql/use-watch-subscription';
+import { useCacheDeltaWatch, joinProvenance } from '@/lib/graphql/use-cache-delta-watch';
 import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
+import { gvrKey } from '@/lib/gvr';
 
 const ClusterDataKindsWatchSubscription = graphql(`
   subscription ClusterDataKindsWatch($id: ObjectID!, $cacheID: ObjectID!) {
@@ -58,62 +53,32 @@ const ClusterDataKindsWatchSubscription = graphql(`
 // `ServerKind` (apiVersion/kind/resource/scope/isCRD/count).
 type KindRow = ClusterDataKindsWatchSubscriptionType['clusterDataKindsWatch']['kind'];
 
-// A kind's identity within a catalog: apiVersion + resource is unique per cache,
-// matching the sidecar's diff key — so a `Modified`/`Deleted` targets the right entry.
-function kindKey(k: { apiVersion: string; resource: string }): string {
-  return `${k.apiVersion}/${k.resource}`;
-}
-
-// The reduced catalog: kinds keyed by identity, tagged with the cache id the frames came
-// from (read off each frame, not inferred from render state). The tag lets the reducer and
-// readers reject a previous cache's data that urql retains across a swap.
-type Catalog = { cacheID: string; kinds: Keyed<KindRow> };
-
 // The active context's discovered kinds, updated live. `kinds` is empty while
 // clusters/kinds haven't loaded (no active cluster, or an unsynced one — it has no active
 // cache, so the subscription is paused). `active` = the subscription is live (a cluster +
 // active cache to stream from); `phase` classifies connecting vs. empty-snapshot for a
-// spinner, mirroring `useClusterDataEvents`.
+// spinner, mirroring `useClusterDataEvents`. This watch's variables carry no kind, so its
+// provenance is just the cacheID (a cache swap under the same cluster moves the key and
+// re-subscribes). urql dedupes the subscription, so `useDashboardNav` and an object table
+// both consuming this share one transport. Kinds keep insertion order (no sort).
 export function useClusterDataKinds(): { kinds: ServerKind[]; active: boolean; phase: WatchPhase } {
-  const { context } = useActiveKubeContext();
-  const { clusters } = useClusters();
+  const { clusterID, cacheID, active } = useActiveCluster();
 
-  // The active context's cluster and its active cache. Only kubeconfig-sourced records
-  // carry a context, so match on that. The subscription is keyed by (cluster id, cache
-  // id), so a cache swap under the same cluster moves the key and re-subscribes.
-  const cluster = useMemo(
-    () => clusters?.find((c) => c.spec.source.kubeconfig?.context === context),
-    [clusters, context],
-  );
-  const clusterID = cluster?.id;
-  const cacheID = cluster?.activeCache?.id;
-
-  // Reduce the delta stream into a cache-tagged, id-keyed catalog. Comparing the reducer's
-  // active `cacheID` closure against each frame's provenance (`frameCacheID`) discriminates
-  // the two "wrong cache" cases: a late straggler from a superseded subscription is dropped
-  // (leaving the active cache's catalog untouched), while the active cache's own first frame
-  // after a swap starts a fresh catalog so the two never mix. A transport reconnect (same
-  // cacheID, full replay) is handled by useWatchSubscription resetting to `undefined`.
-  const [{ data, connected }] = useWatchSubscription(
+  const { items, phase } = useCacheDeltaWatch<ClusterDataKindsWatchSubscriptionType, KindRow>(
     {
       query: ClusterDataKindsWatchSubscription,
       variables: { id: clusterID ?? '', cacheID: cacheID ?? '' },
-      pause: !clusterID || !cacheID,
+      pause: !active,
     },
-    (prev: Catalog | undefined, res) => {
-      const { type, kind, cacheID: frameCacheID } = res.clusterDataKindsWatch;
-      if (frameCacheID !== cacheID) return prev ?? { cacheID: cacheID ?? '', kinds: new Map() };
-      const kinds = prev && prev.cacheID === frameCacheID ? prev.kinds : undefined;
-      return { cacheID: frameCacheID, kinds: applyChange(kinds, type, kindKey(kind), kind) };
+    {
+      select: (d) => {
+        const f = d.clusterDataKindsWatch;
+        return { type: f.type, entity: f.kind, provenance: joinProvenance(f.cacheID) };
+      },
+      keyOf: gvrKey,
+      currentProvenance: joinProvenance(cacheID ?? ''),
     },
   );
 
-  // The accumulated catalog, but only when it's tagged for the active cache — urql retains
-  // the previous cache's `data` across a swap, so reject anything not tagged for it. This
-  // one guard feeds both the returned kinds and the watch phase.
-  const activeCatalog = data && cacheID && data.cacheID === cacheID ? data.kinds : undefined;
-  const kinds = useMemo(() => (activeCatalog ? [...activeCatalog.values()] : []), [activeCatalog]);
-
-  const active = !!(clusterID && cacheID);
-  return { kinds, active, phase: watchPhase(!!activeCatalog, connected) };
+  return { kinds: items, active, phase };
 }

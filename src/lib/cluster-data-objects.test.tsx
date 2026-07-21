@@ -69,13 +69,20 @@ function clusterFixture(hasCache: boolean, cacheId = 'c1', serverUid = 'uid-1') 
 const uids = (objects: { uid: string }[]) => objects.map((o) => o.uid);
 
 // urql accumulator stand-in — folds a delta through the reducer captured on the last
-// render. Each frame carries its own cache provenance (defaulting to the subscribed cache).
+// render. Each frame carries its own provenance (cache + kind), defaulting to the
+// subscribed variables so a normal frame is always accepted.
 let acc: unknown;
-let lastArgs: { variables?: { cacheID?: string }; pause?: boolean } | undefined;
+let lastArgs: { variables?: { cacheID?: string; apiVersion?: string; resource?: string }; pause?: boolean } | undefined;
 let lastReducer: ((prev: unknown, res: unknown) => unknown) | undefined;
 
-function pushFrame(type: string, object: unknown, cacheID = lastArgs?.variables?.cacheID) {
-  acc = lastReducer!(acc, { clusterDataObjectsWatch: { type, cacheID, object } });
+function pushFrame(
+  type: string,
+  object: unknown,
+  cacheID = lastArgs?.variables?.cacheID,
+  apiVersion = lastArgs?.variables?.apiVersion,
+  resource = lastArgs?.variables?.resource,
+) {
+  acc = lastReducer!(acc, { clusterDataObjectsWatch: { type, cacheID, apiVersion, resource, object } });
 }
 
 function pushReset() {
@@ -170,6 +177,38 @@ describe('useClusterDataObjects', () => {
     pushFrame('Added', obj('stale'), 'c1');
     rerender();
     expect(uids(result.current.objects)).toEqual(['x']);
+  });
+
+  it('drops the previous kind’s objects on a resource switch under one cache (same apiVersion)', () => {
+    // Deployments and DaemonSets share apiVersion apps/v1 — the dashboard's workloads group,
+    // the common navigation — so cacheID alone can't tell their frames apart; the fix keys on
+    // the full (cacheID, apiVersion, resource) provenance carried by each frame.
+    const deployments = { apiVersion: 'apps/v1', resource: 'deployments' };
+    const daemonsets = { apiVersion: 'apps/v1', resource: 'daemonsets' };
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true, 'c1', 'uid-1')] });
+    const { result, rerender } = renderHook((k: typeof deployments) => useClusterDataObjects(k), {
+      initialProps: deployments,
+    });
+    expect(lastArgs?.variables?.resource).toBe('deployments');
+    pushFrame('Added', obj('dep'));
+    rerender(deployments);
+    expect(uids(result.current.objects)).toEqual(['dep']);
+
+    // Switch to DaemonSets — same cache, so cacheID is unchanged; only the kind differs.
+    rerender(daemonsets);
+    expect(lastArgs?.variables?.resource).toBe('daemonsets');
+    // The retained deployments set must not leak into the daemonsets view.
+    expect(result.current.objects).toEqual([]);
+
+    pushFrame('Added', obj('ds'));
+    rerender(daemonsets);
+    expect(uids(result.current.objects)).toEqual(['ds']);
+
+    // A straggler from the still-draining deployments subscription (same cache, same
+    // apiVersion, different resource) must NOT join the daemonsets set.
+    pushFrame('Added', obj('stale-dep'), 'c1', 'apps/v1', 'deployments');
+    rerender(daemonsets);
+    expect(uids(result.current.objects)).toEqual(['ds']);
   });
 
   it('resets on a transport reconnect so an object deleted during the outage is gone after replay', () => {

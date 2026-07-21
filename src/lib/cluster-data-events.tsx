@@ -19,18 +19,16 @@
 // resolves to a cluster (via the registry's kubeconfig source), and
 // `clusterDataEventsWatch` streams that cache's events as a delta watch — the newest
 // window as an `Added` burst on subscribe, then per-event `Added`/`Modified`/`Deleted`
-// (a re-firing event bumps its count/lastSeen → `Modified`). The reducer keys by event
-// `uid` and is cache-aware in the exact same way as the nav hook: every frame carries
-// its cache id, so a straggler from a superseded subscription is dropped and the active
-// cache's own first frame after a swap starts fresh, so two caches' events never mix.
+// (a re-firing event bumps its count/lastSeen → `Modified`). Reduction runs through the
+// shared `useCacheDeltaWatch`, keyed by event `uid` with cacheID provenance, so a straggler
+// from a superseded cache is dropped and the active cache's first frame after a swap starts
+// fresh — two caches' events never mix.
 import { useMemo } from 'react';
 
 import { graphql } from '@/gql';
 import type { ClusterDataEventsWatchSubscription as ClusterDataEventsWatchSubscriptionType } from '@/gql/graphql';
-import { useActiveKubeContext } from '@/lib/active-kube-context';
-import { useClusters, applyChange } from '@/lib/clusters';
-import type { Keyed } from '@/lib/clusters';
-import { useWatchSubscription, watchPhase } from '@/lib/graphql/use-watch-subscription';
+import { useActiveCluster } from '@/lib/active-cluster';
+import { useCacheDeltaWatch, joinProvenance } from '@/lib/graphql/use-cache-delta-watch';
 import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
 
 const ClusterDataEventsWatchSubscription = graphql(`
@@ -57,61 +55,44 @@ const ClusterDataEventsWatchSubscription = graphql(`
 // One cached event (the `event` payload of a change), as the table renders it.
 export type ClusterDataEvent = ClusterDataEventsWatchSubscriptionType['clusterDataEventsWatch']['event'];
 
-// The reduced set: events keyed by uid, tagged with the cache id the frames came from
-// (read off each frame, not inferred from render state) so the reducer/read can reject a
-// previous cache's events that urql retains across a swap.
-type EventSet = { cacheID: string; events: Keyed<ClusterDataEvent> };
-
 // The active context's cached events, newest first (by lastSeen), updated live. Empty
 // while clusters/events haven't loaded (no active cluster, or an unsynced one — it has no
 // active cache, so the subscription is paused). `active` = the subscription is live (a
 // cluster + active cache to stream from); `phase` classifies connecting vs. empty-snapshot
-// for a spinner, mirroring `useDashboardNav`.
+// for a spinner, mirroring `useDashboardNav`. This watch's variables carry no kind, so its
+// provenance is just the cacheID.
 export function useClusterDataEvents(): { events: ClusterDataEvent[]; active: boolean; phase: WatchPhase } {
-  const { context } = useActiveKubeContext();
-  const { clusters } = useClusters();
+  const { clusterID, cacheID, active } = useActiveCluster();
 
-  const cluster = useMemo(
-    () => clusters?.find((c) => c.spec.source.kubeconfig?.context === context),
-    [clusters, context],
-  );
-  const clusterID = cluster?.id;
-  const cacheID = cluster?.activeCache?.id;
-
-  // The same cache-aware reduction as useDashboardNav: drop a straggler from a superseded
-  // subscription (leaving the active cache's set untouched), and start fresh on the active
-  // cache's first frame after a swap. A transport reconnect (same cacheID, full replay) is
-  // handled by useWatchSubscription resetting the set to `undefined` before the replay.
-  const [{ data, connected }] = useWatchSubscription(
+  const { items, phase } = useCacheDeltaWatch<ClusterDataEventsWatchSubscriptionType, ClusterDataEvent>(
     {
       query: ClusterDataEventsWatchSubscription,
       variables: { id: clusterID ?? '', cacheID: cacheID ?? '' },
-      pause: !clusterID || !cacheID,
+      pause: !active,
     },
-    (prev: EventSet | undefined, res) => {
-      const { type, event, cacheID: frameCacheID } = res.clusterDataEventsWatch;
-      if (frameCacheID !== cacheID) return prev ?? { cacheID: cacheID ?? '', events: new Map() };
-      const events = prev && prev.cacheID === frameCacheID ? prev.events : undefined;
-      return { cacheID: frameCacheID, events: applyChange(events, type, event.uid, event) };
+    {
+      select: (d) => {
+        const f = d.clusterDataEventsWatch;
+        return { type: f.type, entity: f.event, provenance: joinProvenance(f.cacheID) };
+      },
+      keyOf: (e) => e.uid,
+      currentProvenance: joinProvenance(cacheID ?? ''),
     },
   );
 
-  // Read only from a set tagged for the active cache — urql retains the previous cache's
-  // `data` across a swap, so reject anything not tagged for the active cache.
-  const events = useMemo(() => {
-    if (!data || !cacheID || data.cacheID !== cacheID) return [];
-    // Parse each lastSeen once (a decorate–sort–undecorate), not per comparison — a plain
-    // comparator would call Date.parse ~2·n·log n times, and a lexicographic string sort is
-    // unsafe here since RFC3339 millis timestamps mix fractional and whole-second forms.
-    // A null lastSeen (source Event with no timestamp) sorts oldest (last, descending).
-    return [...data.events.values()]
-      .map((e) => ({ e, ms: e.lastSeen ? Date.parse(e.lastSeen) : 0 }))
-      .sort((a, b) => b.ms - a.ms)
-      .map((x) => x.e);
-  }, [cacheID, data]);
+  // Newest first by lastSeen. Parse each lastSeen once (a decorate–sort–undecorate), not per
+  // comparison — a plain comparator would call Date.parse ~2·n·log n times, and a
+  // lexicographic string sort is unsafe here since RFC3339 millis timestamps mix fractional
+  // and whole-second forms. A null lastSeen (source Event with no timestamp) sorts oldest
+  // (last, descending).
+  const events = useMemo(
+    () =>
+      [...items]
+        .map((e) => ({ e, ms: e.lastSeen ? Date.parse(e.lastSeen) : 0 }))
+        .sort((a, b) => b.ms - a.ms)
+        .map((x) => x.e),
+    [items],
+  );
 
-  const active = !!(clusterID && cacheID);
-  const hasEvents = !!(data && cacheID && data.cacheID === cacheID);
-  const phase = watchPhase(hasEvents, connected);
   return { events, active, phase };
 }

@@ -682,12 +682,16 @@ func TestObjects(t *testing.T) {
 	insertCatalog("apps/v1", "Deployment", "deployments", "Namespaced", 0)
 	insertCatalog("v1", "Pod", "pods", "Namespaced", 0)
 
+	// raw_json is stored zlib-compressed (the write path always compresses), so
+	// Objects can decompress it back — seed compressed bodies, not raw bytes.
+	body, err := CompressRaw([]byte(`{}`))
+	require.NoError(t, err)
 	insertObj := func(uid, apiVersion, kind, namespace, name string, createdAt int64) {
 		_, err := cdb.Writer().ExecContext(ctx,
 			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
 			   created_at, updated_at, raw_json)
-			 VALUES (?, ?, ?, ?, ?, '1', ?, ?, x'7b7d')`,
-			uid, apiVersion, kind, namespace, name, createdAt, createdAt)
+			 VALUES (?, ?, ?, ?, ?, '1', ?, ?, ?)`,
+			uid, apiVersion, kind, namespace, name, createdAt, createdAt, body)
 		require.NoError(t, err)
 	}
 	// Two Deployments (out of (namespace, name) order on purpose) + an unrelated Pod.
@@ -710,6 +714,39 @@ func TestObjects(t *testing.T) {
 	require.Equal(t, "d2", rows[1].UID)
 	require.Equal(t, "kube-system", rows[1].Namespace)
 	require.Equal(t, "coredns", rows[1].Name)
+}
+
+// Objects returns each row's full native body, decompressed from the zlib-
+// compressed raw_json column (the write path always compresses), so the caller
+// gets the object JSON verbatim without re-reading the store.
+func TestObjectsReadsBody(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+		 VALUES('apps/v1', 'Deployment', 'deployments', 'Namespaced', 0, NULL)`)
+	require.NoError(t, err)
+
+	body := []byte(`{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"web"},"spec":{"replicas":3}}`)
+	compressed, err := CompressRaw(body)
+	require.NoError(t, err)
+
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+		   created_at, updated_at, raw_json)
+		 VALUES ('d1', 'apps/v1', 'Deployment', 'default', 'web', '1', 100, 100, ?)`,
+		compressed)
+	require.NoError(t, err)
+
+	rows, err := cdb.Objects(ctx, "apps/v1", "deployments")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.JSONEq(t, string(body), string(rows[0].RawJSON), "body decompressed and returned verbatim")
 }
 
 // The per-kind counts are maintained by triggers on the objects table (so

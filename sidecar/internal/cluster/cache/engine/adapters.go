@@ -76,12 +76,17 @@ func extractObject(u *unstructured.Unstructured) (ObjectRow, bool, error) {
 	}
 
 	// Secrets carry sensitive values in .data (base64) and .stringData. Redact on
-	// a deep copy before marshaling so raw_json never holds plaintext; keys are
-	// kept so the agent can still answer "does this Secret expose the expected keys?".
+	// a copy before marshaling so raw_json never holds plaintext; keys are kept so
+	// the agent can still answer "does this Secret expose the expected keys?".
 	source := u.Object
 	if kind == "Secret" && apiVersion == "v1" {
 		source = redactSecret(u.Object)
 	}
+	// Drop server-side bookkeeping a monitoring UI never surfaces (managedFields +
+	// the kubectl last-applied annotation) from every kind — see stripServerNoise.
+	// For a Secret this also deletes the last-applied manifest outright (which held
+	// the full applied Secret), so redactSecret no longer special-cases it.
+	source = stripServerNoise(source)
 
 	rawJSON, err := json.Marshal(source)
 	if err != nil {
@@ -384,12 +389,10 @@ const lastAppliedAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
 
 // redactSecret returns a copy of a Secret's raw map with .data/.stringData values
 // replaced by "<redacted>" (keys preserved — existence isn't sensitive). The input
-// is not mutated, so the caller's in-process object keeps its plaintext.
-//
-// It also scrubs metadata.annotations["kubectl.kubernetes.io/last-applied-
-// configuration"], where kubectl stores the entire applied Secret — a first-class
-// leak. It does not chase "secrets" hand-placed in ConfigMaps or other
-// annotations; the contract stays precise.
+// is not mutated, so the caller's in-process object keeps its plaintext. The kubectl
+// last-applied annotation — where kubectl stores the entire applied Secret, data and
+// all — is dropped universally by stripServerNoise (run after this), so it needs no
+// special-casing here.
 func redactSecret(obj map[string]any) map[string]any {
 	out := make(map[string]any, len(obj))
 	for k, v := range obj {
@@ -404,8 +407,6 @@ func redactSecret(obj map[string]any) map[string]any {
 				continue
 			}
 			out[k] = v
-		case "metadata":
-			out[k] = redactSecretMetadata(v)
 		default:
 			out[k] = v
 		}
@@ -413,32 +414,48 @@ func redactSecret(obj map[string]any) map[string]any {
 	return out
 }
 
-// redactSecretMetadata returns metadata with the kubectl last-applied annotation
-// scrubbed. It copies only when that annotation is present, so the common case
-// shares the original map and never mutates the caller's object.
-func redactSecretMetadata(v any) any {
-	meta, ok := v.(map[string]any)
+// stripServerNoise returns obj with server-side bookkeeping that a monitoring UI
+// never surfaces removed: metadata.managedFields (server-side-apply field ownership)
+// and metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"] (a
+// full duplicate of the applied manifest). Both are large and useless to us, so
+// dropping them at persist time roughly halves a typical object's stored bytes.
+//
+// Copy-on-write: the caller's live object is never mutated, and maps are copied only
+// along the path that actually changes — an object carrying neither is returned as-is.
+func stripServerNoise(obj map[string]any) map[string]any {
+	meta, ok := obj["metadata"].(map[string]any)
 	if !ok {
-		return v
+		return obj
 	}
-	anns, ok := meta["annotations"].(map[string]any)
-	if !ok {
-		return v
+	_, hasManaged := meta["managedFields"]
+	// A failed assertion leaves anns nil, and indexing a nil map is a miss — so
+	// hasLastApplied already implies the annotations map is present and non-nil.
+	anns, _ := meta["annotations"].(map[string]any)
+	_, hasLastApplied := anns[lastAppliedAnnotation]
+	if !hasManaged && !hasLastApplied {
+		return obj
 	}
-	if _, has := anns[lastAppliedAnnotation]; !has {
-		return v
-	}
-	annsCopy := make(map[string]any, len(anns))
-	for k, val := range anns {
-		annsCopy[k] = val
-	}
-	annsCopy[lastAppliedAnnotation] = "<redacted>"
+
 	metaCopy := make(map[string]any, len(meta))
-	for k, val := range meta {
-		metaCopy[k] = val
+	for k, v := range meta {
+		metaCopy[k] = v
 	}
-	metaCopy["annotations"] = annsCopy
-	return metaCopy
+	delete(metaCopy, "managedFields")
+	if hasLastApplied {
+		annsCopy := make(map[string]any, len(anns))
+		for k, v := range anns {
+			annsCopy[k] = v
+		}
+		delete(annsCopy, lastAppliedAnnotation)
+		metaCopy["annotations"] = annsCopy
+	}
+
+	out := make(map[string]any, len(obj))
+	for k, v := range obj {
+		out[k] = v
+	}
+	out["metadata"] = metaCopy
+	return out
 }
 
 // EventRow is the events-table equivalent of ObjectRow.

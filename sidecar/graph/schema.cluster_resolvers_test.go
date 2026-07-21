@@ -41,11 +41,12 @@ type fakeClusterService struct {
 	mu          sync.Mutex
 	order       []cluster.ClusterID
 	clusters    map[cluster.ClusterID]*cluster.Cluster
-	caches      []cluster.ClusterCache                           // one active cache per fixture, streamed via WatchCaches
-	events      map[cluster.ClusterID][]cluster.Event            // connection-event history, keyed by ClusterID
-	cacheEvents map[cluster.ClusterCacheID][]cluster.Event       // sync-event history, keyed by ClusterCacheID
-	kinds       map[cluster.ClusterID][]cluster.ClusterDataKind  // discovered kind catalog, keyed by ClusterID
-	dataEvents  map[cluster.ClusterID][]cluster.ClusterDataEvent // cached Kubernetes Events, keyed by ClusterID
+	caches      []cluster.ClusterCache                            // one active cache per fixture, streamed via WatchCaches
+	events      map[cluster.ClusterID][]cluster.Event             // connection-event history, keyed by ClusterID
+	cacheEvents map[cluster.ClusterCacheID][]cluster.Event        // sync-event history, keyed by ClusterCacheID
+	kinds       map[cluster.ClusterID][]cluster.ClusterDataKind   // discovered kind catalog, keyed by ClusterID
+	dataEvents  map[cluster.ClusterID][]cluster.ClusterDataEvent  // cached Kubernetes Events, keyed by ClusterID
+	dataObjects map[cluster.ClusterID][]cluster.ClusterDataObject // cached objects for one kind, keyed by ClusterID
 }
 
 var _ cluster.ClusterService = (*fakeClusterService)(nil)
@@ -177,8 +178,14 @@ func (f *fakeClusterService) ClusterDataEventsWatch(ctx context.Context, cluster
 	return ch, nil
 }
 
-func (f *fakeClusterService) ClusterDataObjectsWatch(ctx context.Context, _ cluster.ClusterID, _ cluster.ClusterCacheID, _, _ string) (<-chan cluster.ClusterDataObjectChange, error) {
-	ch := make(chan cluster.ClusterDataObjectChange)
+func (f *fakeClusterService) ClusterDataObjectsWatch(ctx context.Context, clusterID cluster.ClusterID, _ cluster.ClusterCacheID, _, _ string) (<-chan cluster.ClusterDataObjectChange, error) {
+	f.mu.Lock()
+	snap := append([]cluster.ClusterDataObject(nil), f.dataObjects[clusterID]...)
+	f.mu.Unlock()
+	ch := make(chan cluster.ClusterDataObjectChange, len(snap))
+	for _, o := range snap {
+		ch <- cluster.ClusterDataObjectChange{Type: cluster.ChangeAdded, Object: o}
+	}
 	go func() {
 		<-ctx.Done()
 		close(ch)
@@ -531,10 +538,9 @@ func TestClusterDataKindsResolver(t *testing.T) {
 	}
 }
 
-// clusterDataObjectsWatch wires the subscription resolver to the service: the fake stub
-// (like the sidecar's) opens an empty-until-ctx stream, so the SSE dial succeeds and the
-// stream stays open with no frames rather than erroring. Guards the schema/resolver
-// plumbing for the per-kind object tables ahead of the backend implementation.
+// clusterDataObjectsWatch wires the subscription resolver to the service: the fake with
+// no seeded objects opens an empty-until-ctx stream, so the SSE dial succeeds and the
+// stream stays open with no frames rather than erroring.
 func TestClusterDataObjectsWatchOpensWithoutError(t *testing.T) {
 	fix := clusterFixtures()
 	svc := newFakeClusterService(fix)
@@ -560,6 +566,74 @@ func TestClusterDataObjectsWatchOpensWithoutError(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		// No frame is the expected empty-until-ctx posture.
+	}
+}
+
+// The resolver-gated `object` field carries the full native body as the JSON scalar,
+// marshaled verbatim through gqlgen — a consumer selecting it gets the object JSON back
+// as a nested value (not a string), with the identity fields alongside.
+func TestClusterDataObjectsWatchServesNativeBody(t *testing.T) {
+	fix := clusterFixtures()
+	svc := newFakeClusterService(fix)
+	id := fix[0].id
+	svc.dataObjects = map[cluster.ClusterID][]cluster.ClusterDataObject{
+		id: {{
+			UID: "d1", APIVersion: "apps/v1", Kind: "Deployment", Namespace: "default", Name: "web",
+			RawJSON: cluster.RawJSON(`{"kind":"Deployment","spec":{"replicas":3}}`),
+		}},
+	}
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{
+		ClusterSvc: svc, Auth: newFakeAuth(auth.Identity{}),
+	}))
+	t.Cleanup(srv.Close)
+
+	idStr := strconv.FormatInt(int64(id), 10)
+	q := `subscription { clusterDataObjectsWatch(id: "` + idStr + `", cacheID: "` + idStr +
+		`", apiVersion: "apps/v1", resource: "deployments") { type object { uid name rawJSON } } }`
+	resp := openSSESubscription(t, srv.URL, "", q)
+	defer resp.Body.Close()
+	events := sseEvents(t, resp)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("stream closed before the snapshot frame")
+			}
+			if ev.event != "next" {
+				continue
+			}
+			var frame struct {
+				Data struct {
+					ClusterDataObjectsWatch struct {
+						Type   string `json:"type"`
+						Object struct {
+							UID     string         `json:"uid"`
+							Name    string         `json:"name"`
+							RawJSON map[string]any `json:"rawJSON"`
+						} `json:"object"`
+					} `json:"clusterDataObjectsWatch"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
+				t.Fatalf("decode frame %s: %v", ev.data, err)
+			}
+			got := frame.Data.ClusterDataObjectsWatch
+			if got.Object.UID != "d1" || got.Object.Name != "web" {
+				t.Fatalf("identity fields: got %+v", got.Object)
+			}
+			// The body decoded as a nested JSON object, not a string.
+			if got.Object.RawJSON["kind"] != "Deployment" {
+				t.Fatalf("native body not served as JSON: %s", ev.data)
+			}
+			if spec, _ := got.Object.RawJSON["spec"].(map[string]any); spec == nil || spec["replicas"] != float64(3) {
+				t.Fatalf("nested body fields missing: %s", ev.data)
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for the object snapshot frame")
+		}
 	}
 }
 

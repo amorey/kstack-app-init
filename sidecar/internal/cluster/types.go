@@ -668,13 +668,16 @@ type ClusterDataEventChange struct {
 	CacheID ClusterCacheID
 }
 
-// ClusterDataObject is one cached Kubernetes object projected for a table row (any
-// kind), read from the active cache. Only the universal identity is typed for now
-// (UID/APIVersion/Kind/Namespace/Name/CreationTimestamp) — enough to key the watch,
-// sort, and render a Name/Namespace/Age table. The nested object body (and kind-specific
-// columns computed from it) is deferred to a follow-up (see TODO.md). Distinct from
-// ClusterDataEvent (a specific kind with its own typed shape). Binds 1:1 to the GraphQL
-// ClusterDataObject.
+// ClusterDataObject is one cached Kubernetes object read from the active cache. It
+// carries the typed universal identity (UID/APIVersion/Kind/Namespace/Name/
+// CreationTimestamp) — enough to key the watch, sort, and render the Name/Namespace/Age
+// columns without parsing the body — plus RawJSON, the object's full native body. The
+// frontend derives kind-specific columns from the body client-side (a resolver-gated
+// field, so identity-only consumers skip the body cost). Because RawJSON is part of the
+// struct, an in-place edit (a resourceVersion/spec change) differs across two reads, so
+// the watch diff surfaces it as Modified. The string underlying RawJSON keeps the struct
+// comparable, which the delta-watch diff requires. Distinct from ClusterDataEvent (a
+// specific kind with its own typed shape). Binds 1:1 to the GraphQL ClusterDataObject.
 type ClusterDataObject struct {
 	// UID is the object's UID — the stable identity a watch keys on.
 	UID string
@@ -689,20 +692,28 @@ type ClusterDataObject struct {
 	// CreationTimestamp drives the universal Age column (zero when the source object
 	// carried none; the field resolver maps zero → null).
 	CreationTimestamp time.Time
+	// RawJSON is the object's full native body (JSON), forwarded verbatim from the cache
+	// (managedFields + the kubectl last-applied annotation stripped at write time). Empty
+	// only if the store held no body; the field resolver serves it as the JSON scalar.
+	RawJSON RawJSON
 }
 
 // ClusterDataObjectChange is one delta on a cache's per-kind objects watch: what happened
-// (Type) to which object (Object), from which cache (CacheID). On subscribe the current
-// object set for the kind arrives as Added (the snapshot); thereafter a new object is
-// Added, an object whose fields change is Modified, and one removed from the cache is
-// Deleted (carrying its last-known row). Consumers key on UID. CacheID is the frame's
-// provenance, mirroring ClusterDataKindChange: a client watching the active cache can
-// reject a late frame from a superseded cache. Binds 1:1 to the GraphQL
+// (Type) to which object (Object), from which cache (CacheID) and kind (APIVersion +
+// Resource). On subscribe the current object set for the kind arrives as Added (the
+// snapshot); thereafter a new object is Added, an object whose fields change is Modified,
+// and one removed from the cache is Deleted (carrying its last-known row). Consumers key
+// on UID. CacheID + (APIVersion, Resource) are the frame's provenance: unlike the kinds/
+// events watches (keyed only by cache), this watch is keyed by kind too, so a client
+// switching resources within one cache uses the kind to reject a straggler from the
+// previous kind's still-draining subscription. Binds 1:1 to the GraphQL
 // ClusterDataObjectChange.
 type ClusterDataObjectChange struct {
-	Type    ChangeType
-	Object  ClusterDataObject
-	CacheID ClusterCacheID
+	Type       ChangeType
+	Object     ClusterDataObject
+	CacheID    ClusterCacheID
+	APIVersion string
+	Resource   string
 }
 
 // --- Seed conditions ---

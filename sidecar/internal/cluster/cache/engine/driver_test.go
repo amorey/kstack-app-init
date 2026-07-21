@@ -190,13 +190,16 @@ func (f *fakeSource) Watch(ctx context.Context, opts metav1.ListOptions) (watch.
 	n := f.watchCalls
 	f.watchCalls++
 	blocks := f.watchBlocks
+	// Snapshot watchErr under the lock — setWatchErr may flip it from the test goroutine
+	// while this watcher goroutine is running.
+	watchErr := f.watchErr
 	f.mu.Unlock()
 	if blocks {
 		<-ctx.Done() // a wedged watch request: hangs until RetryWatcher (rw.Stop) cancels it
 		return nil, ctx.Err()
 	}
-	if f.watchErr != nil {
-		return nil, f.watchErr
+	if watchErr != nil {
+		return nil, watchErr
 	}
 	w := watch.NewFake()
 	if f.autoExpireFirst && n == 0 {
@@ -666,8 +669,7 @@ func TestDriverBookmarkMarksLiveAndPersistsRV(t *testing.T) {
 // let a restart skip those changes. onBookmark holds the cookie until deltaApplied
 // catches deltaSeen, while still marking liveness.
 func TestBookmarkHoldsRVUntilDeltasApplied(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cdb := migratedCDB(t)
 	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
 	at := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
@@ -1315,8 +1317,7 @@ func TestDriverClearsStuckOnRecovery(t *testing.T) {
 // that fires onWatch (a delta, a clean-resume grace, or a fresh-RV connect); a watch that
 // opens then errors before proving usable leaves the kind stuck.
 func TestStuckNotClearedByBareWatchOpen(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cdb := migratedCDB(t)
 	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
 
@@ -1397,6 +1398,55 @@ func TestListButNotWatchBecomesStuck(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// The recovery direction of TestListButNotWatchBecomesStuck: WATCH permission being restored
+// (an operator granting the missing RBAC) must un-stick the kind. The flag clears at the
+// usability proof — fireOnWatch — not the bare connect, and because recordFailure re-armed
+// sawWatch on the stuck transition, that fire also re-counts the kind's catch-up milestone
+// (a stuck driver's token was released by onStuck, so a recovery before the milestone fires
+// must re-report it, otherwise the engine undercounts caught-up kinds).
+func TestWatchRestoredClearsStuck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cdb := migratedCDB(t)
+	store := newObjectsStore(ctx, "c1", podGVK(), cdb.Writer(), cdb)
+
+	fs := &fakeSource{
+		metaErr:  fmt.Errorf("no metadata endpoint"), // keep every resync on the full-LIST path (LIST succeeds)
+		listObjs: []*unstructured.Unstructured{uObj("a", "v1", "Pod", "default", "a", "2")},
+		listRV:   "60",
+		watchErr: apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "", fmt.Errorf("cannot watch")),
+	}
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	var mu sync.Mutex
+	onWatchCalls := 0
+	d := newKindDriverWithOptions(fs, store, podGVK(), "", withSleep(noSleep), withStuckThreshold(3))
+	d.onWatch = func(bool, int) { mu.Lock(); onWatchCalls++; mu.Unlock() }
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = d.Run(ctx) }()
+
+	waitFor(t, func() bool { return d.isStuck() }, "list-but-not-watch surfaces as stuck")
+	require.Equal(t, CauseWatchFailed, d.stuckCause(), "stuck on the watch phase, not the list")
+	mu.Lock()
+	require.Zero(t, onWatchCalls, "no catch-up was reported while the watch was denied")
+	mu.Unlock()
+
+	// Grant the WATCH permission mid-run: the next attempt establishes. This is a cold-start
+	// driver (no seed RV), so each resync yields a fresh RV that cannot 410 — connecting is
+	// itself the usability proof, and fireOnWatch runs on establishment.
+	fs.setWatchErr(nil)
+
+	waitFor(t, func() bool { return !d.isStuck() }, "restored WATCH clears the stuck flag")
+	require.False(t, d.liveAt().IsZero(), "an established watch stamps liveness")
+
+	cancel()
+	<-done
+
+	mu.Lock()
+	require.Equal(t, 1, onWatchCalls, "the recovery re-fires the catch-up report exactly once")
+	mu.Unlock()
 }
 
 // Regression (P1): a cold-start driver (didResync path) whose LIST succeeds but WATCH is

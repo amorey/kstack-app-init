@@ -364,10 +364,6 @@ func withDiscoveryPoll(d time.Duration) engineOption {
 	return func(e *Engine) { e.discoveryPoll = d }
 }
 
-func withEngineResyncPeriod(d time.Duration) engineOption {
-	return func(e *Engine) { e.resyncPeriod = d }
-}
-
 func withDebounceTimer(fn func(time.Duration) resettableTimer) engineOption {
 	return func(e *Engine) { e.newDebounceTimer = fn }
 }

@@ -25,6 +25,13 @@ not construct or parse them.
 """
 scalar ObjectID
 
+"""
+An arbitrary JSON value carried verbatim. Backs a cached Kubernetes object's full
+native body: the sidecar forwards the stored, decompressed object JSON as-is (no
+per-field GraphQL typing), and the frontend casts it to a typed Kubernetes object.
+"""
+scalar JSON
+
 # --- Cluster (a tracked kube-context) ---
 
 """
@@ -388,6 +395,8 @@ type ClusterDataObject {
   name: String!
   "creationTimestamp — drives the universal Age column; null when the source object carried none."
   creationTimestamp: Time
+  "Full native body as JSON, verbatim from the cache (managedFields and the kubectl last-applied annotation stripped); resolver-gated, so an identity-only consumer skips the body cost."
+  rawJSON: JSON
 }
 
 # --- Delta watches ---
@@ -448,7 +457,7 @@ type ClusterDataEventChange {
   cacheID: ObjectID!
 }
 
-"One change on the `clusterDataObjectsWatch` stream: the affected object, what happened to it, and which cache it came from."
+"One change on the `clusterDataObjectsWatch` stream: the affected object, what happened to it, and the (cache, kind) this frame came from."
 type ClusterDataObjectChange {
   "Whether this object was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
@@ -460,6 +469,14 @@ type ClusterDataObjectChange {
   frame from a superseded cache by comparing this against the cache it subscribed for.
   """
   cacheID: ObjectID!
+  """
+  The kind this frame is for — the watch's `(apiVersion, resource)`. Unlike the kinds/
+  events watches (whose variables carry no kind, so `cacheID` is complete provenance),
+  this watch is keyed by kind too, so a client switching resources *within one cache*
+  uses these to reject a straggler from the previous kind's still-draining subscription.
+  """
+  apiVersion: String!
+  resource: String!
 }
 
 # --- Chat ---

@@ -798,8 +798,7 @@ func TestDebounceTriggersResetsWindowOnEachTrigger(t *testing.T) {
 // watching the now-removed endpoint, leaving the kind wedged with no live driver. It
 // must instead stop the stale-GVR driver and relaunch against the new endpoint (P2).
 func TestReconcileDiscoveryRepointsDriverOnGVRChange(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cdb := migratedCDB(t)
 
 	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
@@ -847,8 +846,7 @@ func TestReconcileDiscoveryRepointsDriverOnGVRChange(t *testing.T) {
 // the discovery poll re-walks and completes the set — correctness rides on the backstop,
 // not on any one pass being exact.
 func TestReconcileDiscoveryPartialPassLaunchesWithoutRemoving(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 
@@ -900,8 +898,7 @@ func TestReconcileDiscoveryPartialPassLaunchesWithoutRemoving(t *testing.T) {
 // is already gone, are still cleaned up rather than lingering until an engine restart
 // (P2). Here nothing is removed this pass, yet the pre-existing orphan is pruned.
 func TestReconcileDiscoveryPrunesOrphansOnEveryCompletePass(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 
@@ -942,8 +939,7 @@ func TestReconcileDiscoveryPrunesOrphansOnEveryCompletePass(t *testing.T) {
 // pruned: otherwise a removal that closes out the Syncing→Watching milestone would emit
 // the permanent catch-up event while the removed kind's rows are still present (P2).
 func TestReconcileDiscoveryRetiresRemovedDriverAfterPrune(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cdb := migratedCDB(t)
 	w := cdb.Writer()
 
@@ -993,8 +989,7 @@ func TestReconcileDiscoveryRetiresRemovedDriverAfterPrune(t *testing.T) {
 // would resume its watch from the stale RV and skip the initial LIST, leaving the cache
 // permanently empty for that kind. A live kind's cookie is preserved (P1).
 func TestReconcileDiscoveryPrunesOrphanedResumeCookies(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cdb := migratedCDB(t)
 
 	deploymentGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
@@ -1046,8 +1041,7 @@ func TestReconcileDiscoveryPrunesOrphanedResumeCookies(t *testing.T) {
 // and skip the initial LIST. forceCold keeps this run cold; the cookie delete makes it
 // durable across a restart (P2).
 func TestReconcileDiscoveryRepointInvalidatesCookieAndRelaunchesCold(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cdb := migratedCDB(t)
 
 	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
@@ -1090,8 +1084,7 @@ func TestReconcileDiscoveryRepointInvalidatesCookieAndRelaunchesCold(t *testing.
 // while the cache still holds the old endpoint's rows and the replacement's full LIST hasn't
 // finished (P2).
 func TestReconcileDiscoveryTransfersCatchUpTokenOnRepoint(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cdb := migratedCDB(t)
 
 	widgetGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}

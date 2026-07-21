@@ -136,13 +136,16 @@ type ComplexityRoot struct {
 		Kind              func(childComplexity int) int
 		Name              func(childComplexity int) int
 		Namespace         func(childComplexity int) int
+		RawJSON           func(childComplexity int) int
 		UID               func(childComplexity int) int
 	}
 
 	ClusterDataObjectChange struct {
-		CacheID func(childComplexity int) int
-		Object  func(childComplexity int) int
-		Type    func(childComplexity int) int
+		APIVersion func(childComplexity int) int
+		CacheID    func(childComplexity int) int
+		Object     func(childComplexity int) int
+		Resource   func(childComplexity int) int
+		Type       func(childComplexity int) int
 	}
 
 	ClusterPermissions struct {
@@ -653,6 +656,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterDataObject.Namespace(childComplexity), true
+	case "ClusterDataObject.rawJSON":
+		if e.ComplexityRoot.ClusterDataObject.RawJSON == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObject.RawJSON(childComplexity), true
 	case "ClusterDataObject.uid":
 		if e.ComplexityRoot.ClusterDataObject.UID == nil {
 			break
@@ -660,6 +669,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.ClusterDataObject.UID(childComplexity), true
 
+	case "ClusterDataObjectChange.apiVersion":
+		if e.ComplexityRoot.ClusterDataObjectChange.APIVersion == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObjectChange.APIVersion(childComplexity), true
 	case "ClusterDataObjectChange.cacheID":
 		if e.ComplexityRoot.ClusterDataObjectChange.CacheID == nil {
 			break
@@ -672,6 +687,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterDataObjectChange.Object(childComplexity), true
+	case "ClusterDataObjectChange.resource":
+		if e.ComplexityRoot.ClusterDataObjectChange.Resource == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterDataObjectChange.Resource(childComplexity), true
 	case "ClusterDataObjectChange.type":
 		if e.ComplexityRoot.ClusterDataObjectChange.Type == nil {
 			break
@@ -1515,6 +1536,8 @@ func (ec *executionContext) childFields_ClusterDataObject(ctx context.Context, f
 		return ec.fieldContext_ClusterDataObject_name(ctx, field)
 	case "creationTimestamp":
 		return ec.fieldContext_ClusterDataObject_creationTimestamp(ctx, field)
+	case "rawJSON":
+		return ec.fieldContext_ClusterDataObject_rawJSON(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterDataObject", field.Name)
 }
@@ -1527,6 +1550,10 @@ func (ec *executionContext) childFields_ClusterDataObjectChange(ctx context.Cont
 		return ec.fieldContext_ClusterDataObjectChange_object(ctx, field)
 	case "cacheID":
 		return ec.fieldContext_ClusterDataObjectChange_cacheID(ctx, field)
+	case "apiVersion":
+		return ec.fieldContext_ClusterDataObjectChange_apiVersion(ctx, field)
+	case "resource":
+		return ec.fieldContext_ClusterDataObjectChange_resource(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterDataObjectChange", field.Name)
 }
@@ -3572,6 +3599,29 @@ func (ec *executionContext) fieldContext_ClusterDataObject_creationTimestamp(_ c
 	return graphql.NewScalarFieldContext("ClusterDataObject", field, true, true, errors.New("field of type Time does not have child fields"))
 }
 
+func (ec *executionContext) _ClusterDataObject_rawJSON(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObject) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObject_rawJSON(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.RawJSON, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v cluster.RawJSON) graphql.Marshaler {
+			return ec.marshalOJSON2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐRawJSON(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObject_rawJSON(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObject", field, false, false, errors.New("field of type JSON does not have child fields"))
+}
+
 func (ec *executionContext) _ClusterDataObjectChange_type(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObjectChange) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -3648,6 +3698,52 @@ func (ec *executionContext) _ClusterDataObjectChange_cacheID(ctx context.Context
 }
 func (ec *executionContext) fieldContext_ClusterDataObjectChange_cacheID(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterDataObjectChange", field, false, false, errors.New("field of type ObjectID does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObjectChange_apiVersion(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObjectChange) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObjectChange_apiVersion(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.APIVersion, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObjectChange_apiVersion(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObjectChange", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterDataObjectChange_resource(ctx context.Context, field graphql.CollectedField, obj *cluster.ClusterDataObjectChange) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterDataObjectChange_resource(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Resource, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterDataObjectChange_resource(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterDataObjectChange", field, false, false, errors.New("field of type String does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterPermissions_namespace(ctx context.Context, field graphql.CollectedField, obj *model.ClusterPermissions) (ret graphql.Marshaler) {
@@ -7789,6 +7885,8 @@ func (ec *executionContext) _ClusterDataObject(ctx context.Context, sel ast.Sele
 			}
 
 			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+		case "rawJSON":
+			out.Values[i] = ec._ClusterDataObject_rawJSON(ctx, field, obj)
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -7835,6 +7933,16 @@ func (ec *executionContext) _ClusterDataObjectChange(ctx context.Context, sel as
 			}
 		case "cacheID":
 			out.Values[i] = ec._ClusterDataObjectChange_cacheID(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "apiVersion":
+			out.Values[i] = ec._ClusterDataObjectChange_apiVersion(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "resource":
+			out.Values[i] = ec._ClusterDataObjectChange_resource(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
@@ -10042,6 +10150,16 @@ func (ec *executionContext) marshalOInt2ᚖint(ctx context.Context, sel ast.Sele
 	_ = ctx
 	res := graphql.MarshalInt(*v)
 	return res
+}
+
+func (ec *executionContext) unmarshalOJSON2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐRawJSON(ctx context.Context, v any) (cluster.RawJSON, error) {
+	var res cluster.RawJSON
+	err := res.UnmarshalGQL(v)
+	return res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) marshalOJSON2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚐRawJSON(ctx context.Context, sel ast.SelectionSet, v cluster.RawJSON) graphql.Marshaler {
+	return v
 }
 
 func (ec *executionContext) unmarshalOString2ᚖstring(ctx context.Context, v any) (*string, error) {

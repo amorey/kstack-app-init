@@ -537,10 +537,10 @@ func (c *ClusterDB) Events(ctx context.Context, limit int) ([]EventRow, error) {
 // fixed window of the newest events, so this doubles as that window size.
 const defaultEventsLimit = 500
 
-// ObjectRow is one cached Kubernetes object projected for a table row (any kind),
-// read from the objects table. It is the universal-identity subset that backs the
-// dashboard's generic per-kind object tables — the nested body (the compressed
-// raw_json) is deliberately not read here (see TODO.md).
+// ObjectRow is one cached Kubernetes object read from the objects table (any kind),
+// backing the dashboard's generic per-kind object tables. It carries the universal
+// identity plus the object's full native body (RawJSON) — the frontend derives
+// kind-specific columns from the body client-side.
 type ObjectRow struct {
 	// UID is the object's UID (the stable identity a watch keys on).
 	UID string
@@ -555,6 +555,10 @@ type ObjectRow struct {
 	// CreatedAt is the object's creationTimestamp as unix-millis, 0 when the
 	// source object carried none.
 	CreatedAt int64
+	// RawJSON is the object's full native body as JSON, decompressed from the
+	// zlib-compressed raw_json column (managedFields + the kubectl last-applied
+	// annotation already stripped at write time).
+	RawJSON []byte
 }
 
 // Objects reads one kind's cached objects, filtered by (api_version, resource) and
@@ -562,10 +566,11 @@ type ObjectRow struct {
 // resource, but the objects table is keyed by kind, so the resource is translated to
 // its kind through kind_catalog (a point subquery) and the query then rides the
 // objects_kind_ns_name index. Unlike Events there is no window limit — a kind's whole
-// cached set is returned. Empty until the sync engine has populated the kind.
+// cached set is returned. Each row's raw_json is decompressed into RawJSON (the write
+// path always compresses). Empty until the sync engine has populated the kind.
 func (c *ClusterDB) Objects(ctx context.Context, apiVersion, resource string) ([]ObjectRow, error) {
 	rows, err := c.readDB.QueryContext(ctx,
-		`SELECT uid, api_version, kind, namespace, name, created_at
+		`SELECT uid, api_version, kind, namespace, name, created_at, raw_json
 		 FROM objects
 		 WHERE api_version = ?
 		   AND kind = (SELECT kind FROM kind_catalog WHERE api_version = ? AND resource = ?)
@@ -579,8 +584,12 @@ func (c *ClusterDB) Objects(ctx context.Context, apiVersion, resource string) ([
 	var out []ObjectRow
 	for rows.Next() {
 		var r ObjectRow
-		if err := rows.Scan(&r.UID, &r.APIVersion, &r.Kind, &r.Namespace, &r.Name, &r.CreatedAt); err != nil {
+		var raw []byte
+		if err := rows.Scan(&r.UID, &r.APIVersion, &r.Kind, &r.Namespace, &r.Name, &r.CreatedAt, &raw); err != nil {
 			return nil, err
+		}
+		if r.RawJSON, err = DecompressRaw(raw); err != nil {
+			return nil, fmt.Errorf("decompress raw_json for %s/%s: %w", r.Namespace, r.Name, err)
 		}
 		out = append(out, r)
 	}

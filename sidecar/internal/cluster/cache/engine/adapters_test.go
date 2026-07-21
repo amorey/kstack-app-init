@@ -63,8 +63,11 @@ func TestExtractObjectRedactsSecret(t *testing.T) {
 	require.True(t, hasKey, "data keys preserved (only values redacted)")
 	require.Equal(t, "<redacted>", decoded["stringData"].(map[string]any)["token"])
 
+	// The last-applied manifest (which for a Secret holds the full applied body) is
+	// dropped outright by stripServerNoise, not merely placeholdered.
 	anns := decoded["metadata"].(map[string]any)["annotations"].(map[string]any)
-	require.Equal(t, "<redacted>", anns[lastAppliedAnnotation], "last-applied manifest redacted")
+	_, hasLastApplied := anns[lastAppliedAnnotation]
+	require.False(t, hasLastApplied, "last-applied manifest stripped")
 	require.Equal(t, "keep-me", anns["unrelated"], "unrelated annotations preserved")
 
 	// The caller's in-memory object must be untouched — we only redact the
@@ -91,6 +94,77 @@ func TestExtractObjectRedactsSecretNoAnnotation(t *testing.T) {
 	require.NoError(t, json.Unmarshal(row.RawJSON, &decoded))
 	require.Equal(t, "<redacted>", decoded["data"].(map[string]any)["key"])
 	require.False(t, strings.Contains(string(row.RawJSON), "dmFsdWU="))
+}
+
+// Every object's raw_json must drop server-side bookkeeping a monitoring UI never
+// surfaces: metadata.managedFields (server-side-apply ownership) and the kubectl
+// last-applied-configuration annotation (a full duplicate of the applied manifest).
+// This runs for all kinds, not just Secrets, and roughly halves stored bytes.
+func TestExtractObjectStripsServerNoise(t *testing.T) {
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata": map[string]any{
+			"name":      "web",
+			"namespace": "default",
+			"uid":       "uid-dep",
+			"managedFields": []any{
+				map[string]any{"manager": "kubectl", "operation": "Apply"},
+			},
+			"annotations": map[string]any{
+				lastAppliedAnnotation: `{"apiVersion":"apps/v1","kind":"Deployment"}`,
+				"team":                "platform",
+			},
+		},
+		"spec": map[string]any{"replicas": int64(3)},
+	}}
+
+	row, isEvent, err := extractObject(u)
+	require.NoError(t, err)
+	require.False(t, isEvent)
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(row.RawJSON, &decoded))
+	meta := decoded["metadata"].(map[string]any)
+	_, hasManaged := meta["managedFields"]
+	require.False(t, hasManaged, "managedFields stripped")
+
+	anns := meta["annotations"].(map[string]any)
+	_, hasLastApplied := anns[lastAppliedAnnotation]
+	require.False(t, hasLastApplied, "last-applied annotation stripped")
+	require.Equal(t, "platform", anns["team"], "unrelated annotations preserved")
+
+	// Non-metadata fields survive untouched.
+	require.Equal(t, "web", meta["name"])
+	require.Equal(t, float64(3), decoded["spec"].(map[string]any)["replicas"])
+
+	// The caller's in-memory object must be untouched — we only strip the copy.
+	origMeta := u.Object["metadata"].(map[string]any)
+	require.Contains(t, origMeta, "managedFields", "source managedFields not mutated")
+	origAnns := origMeta["annotations"].(map[string]any)
+	require.Contains(t, origAnns, lastAppliedAnnotation, "source annotation not mutated")
+}
+
+// managedFields is stripped even when the object carries no annotations map (no
+// nil-map panic on the annotations path).
+func TestExtractObjectStripsManagedFieldsNoAnnotations(t *testing.T) {
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":          "cfg",
+			"uid":           "uid-cm",
+			"managedFields": []any{map[string]any{"manager": "kube-controller-manager"}},
+		},
+	}}
+
+	row, _, err := extractObject(u)
+	require.NoError(t, err)
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(row.RawJSON, &decoded))
+	_, hasManaged := decoded["metadata"].(map[string]any)["managedFields"]
+	require.False(t, hasManaged, "managedFields stripped")
 }
 
 // extractEvent must read count from whichever spelling is actually present

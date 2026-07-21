@@ -13,17 +13,19 @@
 // limitations under the License.
 
 // The dashboard's generic per-kind object table: one row per cached object of the selected
-// kind, fed by `useClusterDataObjects`. For now it shows the universal columns only —
-// Name (and Namespace for a namespaced kind) from the object's typed identity, and Age from
-// `creationTimestamp`. Kind-specific columns (Ready/Status/…) come with the nested object
-// body in a follow-up — see the "ClusterDataObject — native nested body" item in TODO.md.
-// The four watch phases render distinctly — not-synced note, connecting spinner, empty
-// snapshot, and the live table — mirroring `EventsTable`.
+// kind, fed by `useClusterDataObjects`. Every kind shows the universal columns — Name (and
+// Namespace for a namespaced kind) from the object's identity, and Age from
+// `creationTimestamp`; a built-in kind additionally shows the kubectl-style columns from its
+// `object-columns` registry entry (Ready/Status/…), computed from the native body. The four
+// watch phases render distinctly — not-synced note, connecting spinner, empty snapshot, and
+// the live table — mirroring `EventsTable`.
 import ReactTimeAgo from 'react-timeago';
 
 import { Spinner } from '@kubetail/ui/elements/spinner';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@kubetail/ui/elements/table';
+import { cn } from '@kubetail/ui/lib/utils';
 
+import { columnsForKind } from '@/components/widgets/object-columns';
 import { useClusterDataObjects } from '@/lib/cluster-data-objects';
 
 // The kind to show — its group/version + plural resource (streamed), its display Kind name
@@ -36,7 +38,11 @@ type ObjectsTableProps = {
 };
 
 export function ObjectsTable({ apiVersion, resource, kind, namespaced }: ObjectsTableProps) {
-  const { objects, active, phase } = useClusterDataObjects({ apiVersion, resource });
+  const gvr = { apiVersion, resource };
+  const { objects, active, phase } = useClusterDataObjects(gvr);
+  // Kind-specific columns (kubectl-style), inserted between Name and Age; [] for a kind with
+  // no registered columns (universal columns only).
+  const extraColumns = columnsForKind(gvr);
 
   // No active cache: an unsynced / sync-paused cluster streams nothing. Say so rather than
   // showing an eternal spinner (which would read as "connecting" forever).
@@ -70,6 +76,11 @@ export function ObjectsTable({ apiVersion, resource, kind, namespaced }: Objects
           <TableRow>
             {namespaced && <TableHead className="w-48">Namespace</TableHead>}
             <TableHead>Name</TableHead>
+            {extraColumns.map((c) => (
+              <TableHead key={c.header} className={c.className}>
+                {c.header}
+              </TableHead>
+            ))}
             <TableHead className="w-32">Age</TableHead>
           </TableRow>
         </TableHeader>
@@ -80,6 +91,11 @@ export function ObjectsTable({ apiVersion, resource, kind, namespaced }: Objects
               <TableRow key={o.uid}>
                 {namespaced && <TableCell className="align-top text-muted-foreground">{o.namespace || '—'}</TableCell>}
                 <TableCell className="align-top font-medium">{o.name}</TableCell>
+                {extraColumns.map((c) => (
+                  <TableCell key={c.header} className={cn('align-top', c.className)}>
+                    {c.cell(o)}
+                  </TableCell>
+                ))}
                 <TableCell className="align-top tabular-nums">
                   {Number.isNaN(createdMs) ? '—' : <ReactTimeAgo date={createdMs} component="span" maxPeriod={60} />}
                 </TableCell>

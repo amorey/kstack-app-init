@@ -17,10 +17,13 @@ const config: CodegenConfig = {
         // Custom scalars and their TS wire types. Time is an ISO-8601 UTC
         // string; ObjectID is an opaque decimal-string object id (an int64
         // server-side, a string on the wire) — the webview treats it as an
-        // opaque string.
+        // opaque string. JSON is an arbitrary decoded value (a cached object's
+        // native body) — typed `unknown`, cast to a typed Kubernetes object at
+        // the point of use (ObjectsTable's per-kind column registry).
         scalars: {
           Time: 'string',
           ObjectID: 'string',
+          JSON: 'unknown',
         },
       },
     },
