@@ -523,7 +523,15 @@ func (s *Service) ClusterDataEventsWatch(ctx context.Context, clusterID ClusterI
 func (s *Service) ClusterDataObjectsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterDataObjectChange, error) {
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheDeltaWatch(ctx, s.cacheManager, ref.CacheID, s.dataObjectsDebounce,
-		(*store.ClusterDB).ObjectsSubscribe,
+		// Subscribe keyed to this watch's (apiVersion, resource) so an unrelated resource's
+		// writes don't wake (and re-read) it. The broker routes object writes by the same
+		// plural resource, so no resolution is needed and — crucially — the key is stable
+		// across a CRD Kind remap: a CRD recreated with the same (apiVersion, resource) but a
+		// new Kind keeps this key, so the subscription tracks the replacement driver's writes
+		// (which notify by the same resource) rather than going stale against the dead Kind.
+		func(db *store.ClusterDB) (<-chan struct{}, func()) {
+			return db.ObjectsSubscribeResource(apiVersion, resource)
+		},
 		func(ctx context.Context, db *store.ClusterDB) ([]ClusterDataObject, error) {
 			rows, err := db.Objects(ctx, apiVersion, resource) // ordered by (namespace, name)
 			if err != nil {

@@ -19,6 +19,7 @@ package cluster
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -963,19 +964,20 @@ func TestServiceClusterDataObjectsWatchFiltersByKind(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "d1", recvObjectChange(t, ch).Object.UID) // snapshot
 
-	// A Pod write pings the object broker but must not appear on the deployments watch.
+	// A Pod write fires the object broker keyed to (v1, pods) — the real write path — which
+	// with resource-routing never even wakes the deployments watch, so no frame appears.
 	insertObject(t, ctx, cdb, "p1", "v1", "Pod", "default", "web-abc", "1", 200)
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("v1", "pods")
 	select {
 	case ev := <-ch:
-		t.Fatalf("a different kind's write must not surface on this watch, got %+v", ev)
+		t.Fatalf("a different resource's write must not surface on this watch, got %+v", ev)
 	case <-time.After(150 * time.Millisecond):
-		// Correct: no frame for an unrelated kind.
+		// Correct: no frame for an unrelated resource.
 	}
 
-	// A same-kind write does surface.
+	// A same-resource write does surface.
 	insertObject(t, ctx, cdb, "d2", "apps/v1", "Deployment", "default", "api", "1", 300)
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	add := recvObjectChange(t, ch)
 	assert.Equal(t, ChangeAdded, add.Type)
 	assert.Equal(t, "d2", add.Object.UID)
@@ -1007,6 +1009,128 @@ func TestServiceClusterDataObjectsWatchNoOpenCache(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("stream did not close on ctx cancel")
 	}
+}
+
+// Resource routing eliminates the wasted re-read, not just the wasted frame: with the
+// objects watch subscribed keyed to its (apiVersion, resource), an unrelated resource's
+// keyed write never wakes it, so its snapshot read never runs — proven with a counting
+// snapshot fn driving cacheDeltaWatch exactly as ClusterDataObjectsWatch does. A
+// matching-resource write does wake it and re-reads.
+func TestClusterDataObjectsWatchNoReReadForOtherKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := store.NewManager(t.TempDir())
+	t.Cleanup(func() { _ = mgr.Shutdown(context.Background()) })
+	const cacheID = int64(7)
+	cdb, err := mgr.Open(ctx, store.CacheRef{ClusterID: 1, CacheID: cacheID})
+	require.NoError(t, err)
+
+	var reads int32
+	ch := cacheDeltaWatch(ctx, mgr, cacheID, 20*time.Millisecond,
+		// The keyed subscribe ClusterDataObjectsWatch uses, verbatim.
+		func(db *store.ClusterDB) (<-chan struct{}, func()) {
+			return db.ObjectsSubscribeResource("apps/v1", "deployments")
+		},
+		func(context.Context, *store.ClusterDB) ([]string, error) {
+			atomic.AddInt32(&reads, 1)
+			return nil, nil
+		},
+		func(s string) string { return s },
+		func(_ ChangeType, s string) string { return s },
+	)
+	go func() { // drain so sends never block the watch goroutine
+		for range ch { //nolint:revive
+		}
+	}()
+
+	// Wait for the baseline read (on bind) to land.
+	require.Eventually(t, func() bool { return atomic.LoadInt32(&reads) == 1 },
+		2*time.Second, 5*time.Millisecond, "baseline snapshot must read once on bind")
+
+	// An unrelated resource's keyed write must not wake the watch — no re-read.
+	cdb.ObjectsNotifyResource("v1", "pods")
+	time.Sleep(100 * time.Millisecond) // longer than the debounce window
+	require.Equal(t, int32(1), atomic.LoadInt32(&reads), "an unrelated resource's write must not re-read")
+
+	// A matching-resource write wakes it — one more read after the debounce fires.
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
+	require.Eventually(t, func() bool { return atomic.LoadInt32(&reads) == 2 },
+		2*time.Second, 5*time.Millisecond, "a matching-resource write must re-read")
+}
+
+// A keyed object write still wakes the keyless kind-catalog watch: a kind's first-ever
+// object is a catalog Add, so ClusterDataKindsWatch (keyless) must wake on any write,
+// keyed or not. Pins that the routing doesn't starve the catalog watch.
+func TestClusterDataKindsWatchWakesOnKeyedWrite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+
+	// A brand-new kind's first object, announced via the real keyed (by-resource) write path.
+	insertObjectCatalog(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
+	insertObject(t, ctx, cdb, "d1", "apps/v1", "Deployment", "default", "web", "1", 100)
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
+
+	add := recvKindChange(t, ch)
+	assert.Equal(t, ChangeAdded, add.Type)
+	assert.Equal(t, "Deployment", add.Kind.Kind)
+	assert.Equal(t, 1, add.Kind.Count)
+}
+
+// Regression: a CRD deleted and recreated with the same (apiVersion, resource) but a
+// different Kind must keep the objects watch live. The watch subscribes on the resource
+// identity (stable across the remap), and the replacement (new-Kind) driver notifies by
+// that same resource — so the stream tracks the remap. Routing by Kind instead left the
+// subscription bound to the dead Kind, missing every write until the next keyless
+// discovery broadcast.
+func TestServiceClusterDataObjectsWatchSurvivesKindRemap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	// Original CRD: resource "widgets" backed by Kind "Widget".
+	insertObjectCatalog(t, ctx, cdb, "example.com/v1", "Widget", "widgets", "Namespaced")
+	insertObject(t, ctx, cdb, "w1", "example.com/v1", "Widget", "default", "one", "1", 100)
+
+	ch, err := s.ClusterDataObjectsWatch(ctx, id, ClusterCacheID(cacheID), "example.com/v1", "widgets")
+	require.NoError(t, err)
+	require.Equal(t, "w1", recvObjectChange(t, ch).Object.UID) // snapshot: the Widget object
+
+	// Remap: the CRD is recreated as Kind "Gadget" under the same (example.com/v1, widgets).
+	// The catalog row's kind flips, the old Widget rows are pruned, and the replacement
+	// driver writes a Gadget object — notifying by its resource identity (widgets).
+	_, err = cdb.Writer().ExecContext(ctx,
+		`UPDATE kind_catalog SET kind='Gadget' WHERE api_version='example.com/v1' AND resource='widgets'`)
+	require.NoError(t, err)
+	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM objects WHERE uid='w1'`)
+	require.NoError(t, err)
+	insertObject(t, ctx, cdb, "g1", "example.com/v1", "Gadget", "default", "one", "2", 200)
+	cdb.ObjectsNotifyResource("example.com/v1", "widgets")
+
+	// The watch (keyed on the resource) wakes and reconciles the remap: w1 gone, g1 present.
+	got := map[string]ChangeType{}
+	for len(got) < 2 {
+		ev := recvObjectChange(t, ch)
+		got[ev.Object.UID] = ev.Type
+	}
+	assert.Equal(t, ChangeDeleted, got["w1"], "the old Kind's object must be removed")
+	assert.Equal(t, ChangeAdded, got["g1"], "the replacement Kind's object must appear")
 }
 
 // cacheRef resolves the active cache's on-disk locator: the directory id is the

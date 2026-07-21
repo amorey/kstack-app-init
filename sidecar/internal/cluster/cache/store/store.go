@@ -332,52 +332,73 @@ type ClusterDB struct {
 }
 
 // notifyBroker is a coalescing pub/sub over cap-1 channels: each subscriber gets a
-// channel that receives a non-blocking ping on every notify, additional pings while
-// one is already buffered being coalesced (the subscriber re-queries and observes
+// channel that receives a non-blocking ping on every matching notify, additional pings
+// while one is already buffered being coalesced (the subscriber re-queries and observes
 // every change anyway). A ClusterDB holds one broker per independent write stream.
+//
+// Subscribers may register interest in one key (e.g. an object kind) or subscribe
+// keyless. A keyed notify wakes the matching-key subscribers PLUS every keyless
+// subscriber (a keyless subscriber, like the kind-catalog watch, must wake on any
+// write); a keyless notify ("" key) broadcasts to every subscriber (the fallback for a
+// write a caller can't attribute to one key — the discovery catalog rewrite, an orphan
+// prune). The events broker uses only the keyless forms (one consumer, no routing).
 type notifyBroker struct {
 	mu     sync.Mutex
-	subs   map[int]chan struct{}
+	subs   map[int]brokerSub
 	nextID int
 }
 
-func newNotifyBroker() *notifyBroker {
-	return &notifyBroker{subs: make(map[int]chan struct{})}
+// brokerSub is one subscriber's channel plus the key it filters on ("" = keyless, wakes
+// on every notify).
+type brokerSub struct {
+	ch  chan struct{}
+	key string
 }
 
-func (b *notifyBroker) subscribe() (<-chan struct{}, func()) {
+func newNotifyBroker() *notifyBroker {
+	return &notifyBroker{subs: make(map[int]brokerSub)}
+}
+
+func (b *notifyBroker) subscribe(key string) (<-chan struct{}, func()) {
 	ch := make(chan struct{}, 1)
 	b.mu.Lock()
 	id := b.nextID
 	b.nextID++
-	b.subs[id] = ch
+	b.subs[id] = brokerSub{ch: ch, key: key}
 	b.mu.Unlock()
 	return ch, func() {
 		b.mu.Lock()
 		if existing, ok := b.subs[id]; ok {
 			delete(b.subs, id)
-			close(existing)
+			close(existing.ch)
 		}
 		b.mu.Unlock()
 	}
 }
 
-func (b *notifyBroker) notify() {
+// notify wakes the subscribers a write concerns: a keyed notify (non-empty key) wakes the
+// subscribers registered for that key plus all keyless subscribers; a keyless notify ("")
+// broadcasts to every subscriber. Coalescing cap-1 semantics — a ping to a full slot is a
+// no-op (the buffered ping subsumes it).
+func (b *notifyBroker) notify(key string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, ch := range b.subs {
-		select {
-		case ch <- struct{}{}:
-		default:
+	for _, s := range b.subs {
+		// wake on a broadcast, a keyless subscriber, or a key match.
+		if key == "" || s.key == "" || s.key == key {
+			select {
+			case s.ch <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
 
 func (b *notifyBroker) close() {
 	b.mu.Lock()
-	for id, ch := range b.subs {
+	for id, s := range b.subs {
 		delete(b.subs, id)
-		close(ch)
+		close(s.ch)
 	}
 	b.mu.Unlock()
 }
@@ -643,23 +664,54 @@ func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterD
 // and long-lived readers (e.g. the sync engine's freshness tracker, the kind-catalog
 // and objects GraphQL subscriptions) block on the channel to know when to re-run
 // their query.
-func (c *ClusterDB) ObjectsSubscribe() (<-chan struct{}, func()) { return c.writes.subscribe() }
+func (c *ClusterDB) ObjectsSubscribe() (<-chan struct{}, func()) { return c.writes.subscribe("") }
 
-// ObjectsNotify wakes every active object-write subscriber. Non-blocking: if a
-// subscriber's channel slot is full, the existing buffered ping subsumes this one.
-// Object writers should call this after committing a batch.
-func (c *ClusterDB) ObjectsNotify() { c.writes.notify() }
+// ObjectsSubscribeResource is ObjectsSubscribe scoped to one resource: the returned
+// channel receives a signal only for an ObjectsNotifyResource of the same
+// (apiVersion, resource) — plus every keyless ObjectsNotify broadcast — so a per-kind
+// objects watch isn't woken (and doesn't re-read) for an unrelated resource's writes. The
+// returned cancel func unregisters the subscriber.
+//
+// The routing key is the plural resource, NOT the Kind, because that is the identity the
+// objects watch is opened on and it is stable across a CRD remap: a CRD deleted and
+// recreated with the same (apiVersion, resource) but a different Kind keeps this key, so a
+// subscription never goes stale against the replacement driver's writes (which notify by
+// the same resource). Keying by Kind instead would leave the subscription bound to the
+// dead Kind and miss those writes.
+func (c *ClusterDB) ObjectsSubscribeResource(apiVersion, resource string) (<-chan struct{}, func()) {
+	return c.writes.subscribe(objectKey(apiVersion, resource))
+}
+
+// ObjectsNotify wakes every active object-write subscriber (keyed and keyless). It's the
+// keyless broadcast — the fallback for a write that isn't attributable to one resource (a
+// discovery catalog rewrite, an orphan-kind prune). Non-blocking: if a subscriber's
+// channel slot is full, the existing buffered ping subsumes this one.
+func (c *ClusterDB) ObjectsNotify() { c.writes.notify("") }
+
+// ObjectsNotifyResource wakes the object-write subscribers registered for
+// (apiVersion, resource) plus every keyless subscriber (the kind-catalog watch), leaving
+// other-resource subscribers untouched. The per-kind object writers (which know their GVR)
+// call this after committing so a per-kind objects watch only wakes on its own resource's
+// writes. Non-blocking.
+func (c *ClusterDB) ObjectsNotifyResource(apiVersion, resource string) {
+	c.writes.notify(objectKey(apiVersion, resource))
+}
+
+// objectKey is the notify-broker routing key for an object write: (apiVersion, resource) —
+// the plural resource the objects watch names, chosen over the Kind because it survives a
+// CRD Kind remap under a stable resource (see ObjectsSubscribeResource).
+func objectKey(apiVersion, resource string) string { return apiVersion + "/" + resource }
 
 // EventsSubscribe is Subscribe for the events table: a channel that receives a
 // coalesced signal after every EventsNotify. Kept separate from Subscribe so an
 // event burst (which is high-volume) wakes only the events watch, never the
 // kind-catalog re-read. The returned cancel func unregisters the subscriber.
-func (c *ClusterDB) EventsSubscribe() (<-chan struct{}, func()) { return c.events.subscribe() }
+func (c *ClusterDB) EventsSubscribe() (<-chan struct{}, func()) { return c.events.subscribe("") }
 
 // EventsNotify wakes every active events subscriber. Non-blocking, like Notify.
 // The events-table write paths (incremental upsert/delete and the relist prune)
 // call it after committing.
-func (c *ClusterDB) EventsNotify() { c.events.notify() }
+func (c *ClusterDB) EventsNotify() { c.events.notify("") }
 
 // openPool opens a *sql.DB against path via the shared sqlitemigrate pool
 // opener. writer=true caps MaxOpenConns at 1 so write transactions serialize

@@ -211,6 +211,44 @@ func TestObjectsWritePageNotifiesPerPage(t *testing.T) {
 	require.Equal(t, 1, countObjectsByKind(t, cdb.Writer(), "Pod", "v1"))
 }
 
+// An object write routes its notify by the writer's plural resource: a subscriber keyed to
+// that (apiVersion, resource) wakes and a keyless subscriber (the kind-catalog watch) wakes,
+// but a subscriber keyed to a different resource does NOT — so an unrelated resource's write
+// costs a per-kind objects watch no re-read. Every objectsStore write path shares the one
+// notify chokepoint, so exercising upsert proves the routing for all of them.
+func TestObjectWritesFireKeyedNotify(t *testing.T) {
+	ctx := context.Background()
+	cdb := migratedCDB(t)
+
+	pods, cancelPods := cdb.ObjectsSubscribeResource("v1", "pods")
+	defer cancelPods()
+	deploys, cancelDeploys := cdb.ObjectsSubscribeResource("apps/v1", "deployments")
+	defer cancelDeploys()
+	keyless, cancelKeyless := cdb.ObjectsSubscribe()
+	defer cancelKeyless()
+
+	pinged := func(ch <-chan struct{}) bool {
+		select {
+		case <-ch:
+			return true
+		case <-time.After(2 * time.Second):
+			return false
+		}
+	}
+
+	s := newObjectsStore(ctx, "c1", schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, cdb.Writer(), cdb)
+	s.resource = "pods" // the engine sets this from the driver's GVR
+	require.NoError(t, s.upsert(uObj("p1", "v1", "Pod", "default", "p1", "10")))
+
+	require.True(t, pinged(pods), "a pods write must wake the pods-keyed subscriber")
+	require.True(t, pinged(keyless), "a pods write must wake the keyless kind-catalog subscriber")
+	select {
+	case <-deploys:
+		t.Fatal("a pods write must not wake a deployments-keyed subscriber")
+	default:
+	}
+}
+
 // raw_json is stored zlib-compressed, not as plaintext JSON: the stored cell
 // must be a zlib stream (first byte 0x78) that decompresses back to the exact
 // object JSON — never the readable plaintext. Both write paths (objects and

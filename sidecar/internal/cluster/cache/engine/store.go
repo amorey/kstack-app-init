@@ -44,13 +44,33 @@ import (
 type objectsStore struct {
 	clusterID string
 	gvk       schema.GroupVersionKind
-	writer    *sql.DB
-	cdb       *store.ClusterDB
-	ctx       context.Context
+	// resource is the kind's plural (the GVR's Resource). It is the object-write notify key
+	// — NOT the Kind — because that is the identity a ClusterDataObjectsWatch subscribes on,
+	// and it is stable across a CRD remap (a CRD recreated with the same apiVersion+resource
+	// but a new Kind keeps this key, so the watch never goes stale against the replacement
+	// driver's writes). Set by the engine from the driver's GVR; empty on a bare store (some
+	// tests), in which case notify falls back to a keyless broadcast (correct, unrouted).
+	resource string
+	writer   *sql.DB
+	cdb      *store.ClusterDB
+	ctx      context.Context
 }
 
 func newObjectsStore(ctx context.Context, clusterID string, gvk schema.GroupVersionKind, w *sql.DB, cdb *store.ClusterDB) *objectsStore {
 	return &objectsStore{clusterID: clusterID, gvk: gvk, writer: w, cdb: cdb, ctx: ctx}
+}
+
+// notify wakes the object-write subscribers this store's resource concerns — keyed by the
+// store's plural resource — so a per-kind ClusterDataObjectsWatch only re-reads on writes
+// to its resource (the keyless kind-catalog watch still wakes on any write). A store with
+// no resource (a bare test store) falls back to a keyless broadcast. Every objectsStore
+// write path (upsert, relist page, relist Commit, delete) fires this after committing.
+func (s *objectsStore) notify() {
+	if s.resource == "" {
+		s.cdb.ObjectsNotify()
+		return
+	}
+	s.cdb.ObjectsNotifyResource(s.gvk.GroupVersion().String(), s.resource)
 }
 
 func (s *objectsStore) upsert(u *unstructured.Unstructured) error {
@@ -75,7 +95,7 @@ func (s *objectsStore) upsert(u *unstructured.Unstructured) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.cdb.ObjectsNotify()
+	s.notify()
 	return nil
 }
 
@@ -167,7 +187,7 @@ func (r *objectsReplaceSession) WritePage(items []*unstructured.Unstructured) er
 		return err
 	}
 	r.cookieCleared = true
-	r.s.cdb.ObjectsNotify()
+	r.s.notify()
 	return nil
 }
 
@@ -213,7 +233,7 @@ func (r *objectsReplaceSession) Commit(resourceVersion string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.cdb.ObjectsNotify()
+	s.notify()
 	return nil
 }
 
@@ -280,7 +300,7 @@ func (s *objectsStore) DeleteByUID(ctx context.Context, uid string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.cdb.ObjectsNotify()
+	s.notify()
 	return nil
 }
 

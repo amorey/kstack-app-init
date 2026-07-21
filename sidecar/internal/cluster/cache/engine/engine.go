@@ -966,7 +966,12 @@ func (e *Engine) run(ctx context.Context, coldStart bool) error {
 		if isEventGVK(entry.GVK) {
 			kstore = newEventsStore(ctx, e.cdb.ID(), entry.GVK, writer, e.cdb)
 		} else {
-			kstore = newObjectsStore(ctx, e.cdb.ID(), entry.GVK, writer, e.cdb)
+			os := newObjectsStore(ctx, e.cdb.ID(), entry.GVK, writer, e.cdb)
+			// Route this store's object-write pings by its plural resource (the identity the
+			// objects watch subscribes on, stable across a CRD Kind remap). The driver's GVR
+			// carries it; production always has it, so notify is never keyless here.
+			os.resource = entry.GVR.Resource
+			kstore = os
 		}
 		// Seed the driver from the kind's persisted resourceVersion so a wake resumes
 		// instead of re-LISTing. It starts COLD (full LIST) when the caller forces it (a

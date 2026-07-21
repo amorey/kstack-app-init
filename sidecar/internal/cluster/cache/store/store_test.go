@@ -352,6 +352,67 @@ func TestSubscribeNotifyAndCoalesce(t *testing.T) {
 	}
 }
 
+// A keyed object-write notify routes by resource: ObjectsNotifyResource wakes the
+// subscriber registered for that (apiVersion, resource) AND every keyless subscriber (the
+// kind-catalog watch, which must wake on any write), but NOT a subscriber keyed to a
+// different resource — so an unrelated resource's writes cost a keyed objects watch no
+// re-read. A keyless ObjectsNotify() broadcast still wakes everyone (the discovery/prune
+// fallback).
+func TestObjectsBrokerKeyedNotify(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	pods, cancelPods := cdb.ObjectsSubscribeResource("v1", "pods")
+	defer cancelPods()
+	deploys, cancelDeploys := cdb.ObjectsSubscribeResource("apps/v1", "deployments")
+	defer cancelDeploys()
+	keyless, cancelKeyless := cdb.ObjectsSubscribe()
+	defer cancelKeyless()
+
+	pinged := func(ch <-chan struct{}) bool {
+		select {
+		case <-ch:
+			return true
+		case <-time.After(200 * time.Millisecond):
+			return false
+		}
+	}
+	// Drain any coalesced ping without waiting on the (slow) timeout.
+	drain := func(ch <-chan struct{}) {
+		select {
+		case <-ch:
+		default:
+		}
+	}
+
+	// A pods-keyed write wakes the pods subscriber + the keyless subscriber, never the
+	// deployments subscriber.
+	cdb.ObjectsNotifyResource("v1", "pods")
+	require.True(t, pinged(pods), "keyed notify must wake its matching subscriber")
+	require.True(t, pinged(keyless), "keyed notify must wake keyless subscribers")
+	require.False(t, pinged(deploys), "keyed notify must not wake an unrelated-resource subscriber")
+	drain(pods)
+	drain(keyless)
+
+	// A deployments-keyed write wakes the deployments subscriber + keyless, never pods.
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
+	require.True(t, pinged(deploys), "keyed notify must wake its matching subscriber")
+	require.True(t, pinged(keyless), "keyed notify must wake keyless subscribers")
+	require.False(t, pinged(pods), "keyed notify must not wake an unrelated-resource subscriber")
+	drain(deploys)
+	drain(keyless)
+
+	// A keyless broadcast wakes every subscriber (discovery/prune fallback).
+	cdb.ObjectsNotify()
+	require.True(t, pinged(pods), "keyless broadcast must wake keyed subscribers")
+	require.True(t, pinged(deploys), "keyless broadcast must wake keyed subscribers")
+	require.True(t, pinged(keyless), "keyless broadcast must wake keyless subscribers")
+}
+
 // Events reads the newest cached events (ordered by last_seen DESC), flattens the
 // involved-object identity, and honors the limit — the read that backs the dashboard
 // events table.
