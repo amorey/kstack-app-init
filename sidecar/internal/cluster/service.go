@@ -167,6 +167,11 @@ type Service struct {
 	// events window. Events are high-volume, so a burst of event-write pings is coalesced
 	// into one re-read per interval (trailing edge) rather than a re-read per event.
 	dataEventsDebounce time.Duration
+
+	// dataObjectsDebounce bounds how often ClusterDataObjectsWatch re-reads and diffs one
+	// kind's cached objects. Object writes share one broker, so a burst (a relist, a
+	// churny kind) is coalesced into one re-read per interval (trailing edge).
+	dataObjectsDebounce time.Duration
 }
 
 // defaultDataKindsDebounce floors the kind-catalog re-read interval — small enough
@@ -178,6 +183,11 @@ const defaultDataKindsDebounce = 250 * time.Millisecond
 // highest-volume stream, so this is a touch coarser than the kind-catalog debounce —
 // still live for a table, but collapsing an event storm into a bounded re-read rate.
 const defaultDataEventsDebounce = 500 * time.Millisecond
+
+// defaultDataObjectsDebounce floors the objects-watch re-read interval. Object writes
+// drive the same broker the kind catalog follows; a per-kind objects table wants a
+// live-but-bounded re-read, so it matches the kind-catalog cadence.
+const defaultDataObjectsDebounce = 250 * time.Millisecond
 
 var _ ClusterService = (*Service)(nil)
 
@@ -242,19 +252,20 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	cacheCtrl.SetControllerClient(cacheCC)
 
 	return &Service{
-		bh:                 bh,
-		bhStore:            bhStore,
-		watcher:            watcher,
-		coreClient:         coreClient,
-		cacheClient:        cacheClient,
-		cacheManager:       cacheManager,
-		connMgr:            connMgr,
-		coreCtrl:           coreCtrl,
-		cacheCtrl:          cacheCtrl,
-		importer:           NewKubeconfigImporter(watcher, coreClient),
-		pokeSvc:            pokeSvc,
-		dataKindsDebounce:  defaultDataKindsDebounce,
-		dataEventsDebounce: defaultDataEventsDebounce,
+		bh:                  bh,
+		bhStore:             bhStore,
+		watcher:             watcher,
+		coreClient:          coreClient,
+		cacheClient:         cacheClient,
+		cacheManager:        cacheManager,
+		connMgr:             connMgr,
+		coreCtrl:            coreCtrl,
+		cacheCtrl:           cacheCtrl,
+		importer:            NewKubeconfigImporter(watcher, coreClient),
+		pokeSvc:             pokeSvc,
+		dataKindsDebounce:   defaultDataKindsDebounce,
+		dataEventsDebounce:  defaultDataEventsDebounce,
+		dataObjectsDebounce: defaultDataObjectsDebounce,
 	}, nil
 }
 
@@ -499,23 +510,50 @@ func (s *Service) ClusterDataEventsWatch(ctx context.Context, clusterID ClusterI
 	), nil
 }
 
-// ClusterDataObjectsWatch implements ClusterService.
-//
-// TODO(next PR): stream the kind's cached objects. The real implementation mirrors
-// ClusterDataEventsWatch — a cacheDeltaWatch over the object-write broker
-// (ObjectsSubscribe), re-reading a new store.Objects(kind) reader on each debounced ping,
-// keyed by UID, projecting each row to a ClusterDataObject (its typed identity, with the
-// nested body deferred — see TODO.md). Until then it returns a channel that emits nothing
-// and closes on ctx.Done — exactly the empty posture of an unsynced cache, so the webview
-// shows its "connecting"/"no objects" states rather than erroring (which would
-// reconnect-loop).
+// ClusterDataObjectsWatch implements ClusterService. It streams one kind's cached objects
+// from a ClusterCache as a delta watch: the current object set for the kind as an Added
+// burst on subscribe, then Added/Modified/Deleted changes as the sync engine writes
+// objects. It mirrors ClusterDataEventsWatch's shape but follows the object-write broker
+// (ObjectsSubscribe) — the same broker the kind catalog watches — re-reading a new
+// store.Objects(apiVersion, resource) snapshot on each debounced ping, keyed by UID and
+// projecting each row to a ClusterDataObject (its universal identity; the nested body is
+// deferred — see TODO.md). cacheDeltaWatch owns the whole cache-lifecycle + coalescing
+// loop, so this matches ClusterDataKindsWatch's empty/rebind posture exactly (no open
+// cache → no frames until it opens or ctx ends).
 func (s *Service) ClusterDataObjectsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterDataObjectChange, error) {
-	ch := make(chan ClusterDataObjectChange)
-	go func() {
-		<-ctx.Done()
-		close(ch)
-	}()
-	return ch, nil
+	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
+	return cacheDeltaWatch(ctx, s.cacheManager, ref.CacheID, s.dataObjectsDebounce,
+		(*store.ClusterDB).ObjectsSubscribe,
+		func(ctx context.Context, db *store.ClusterDB) ([]ClusterDataObject, error) {
+			rows, err := db.Objects(ctx, apiVersion, resource) // ordered by (namespace, name)
+			if err != nil {
+				return nil, err
+			}
+			objects := make([]ClusterDataObject, len(rows))
+			for i, r := range rows {
+				objects[i] = toDataObject(r)
+			}
+			return objects, nil
+		},
+		func(o ClusterDataObject) string { return o.UID },
+		func(t ChangeType, o ClusterDataObject) ClusterDataObjectChange {
+			return ClusterDataObjectChange{Type: t, Object: o, CacheID: cacheID}
+		},
+	), nil
+}
+
+// toDataObject maps a store ObjectRow onto the domain ClusterDataObject 1:1, decoding the
+// stored unix-millis creationTimestamp (0 → zero time) consistently with the events read
+// so two reads of the same row compare equal in the watch diff.
+func toDataObject(r store.ObjectRow) ClusterDataObject {
+	return ClusterDataObject{
+		UID:               r.UID,
+		APIVersion:        r.APIVersion,
+		Kind:              r.Kind,
+		Namespace:         r.Namespace,
+		Name:              r.Name,
+		CreationTimestamp: millisToTime(r.CreatedAt),
+	}
 }
 
 // toDataEvent maps a store EventRow onto the domain ClusterDataEvent 1:1, decoding the

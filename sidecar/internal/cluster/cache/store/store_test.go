@@ -594,6 +594,63 @@ func TestKinds(t *testing.T) {
 	require.Equal(t, 0, rows[2].Count)
 }
 
+// Objects reads one kind's cached objects, filtered by (api_version, resource)
+// and ordered by (namespace, name). The watch args are the plural resource, but
+// the objects table is keyed by kind, so the reader must translate resource→kind
+// through kind_catalog and never leak another kind's rows.
+func TestObjects(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// Empty until the sync engine has written objects.
+	rows, err := cdb.Objects(ctx, "apps/v1", "deployments")
+	require.NoError(t, err)
+	require.Empty(t, rows)
+
+	insertCatalog := func(apiVersion, kind, resource, scope string, isCRD int) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+			 VALUES(?, ?, ?, ?, ?, NULL)`,
+			apiVersion, kind, resource, scope, isCRD)
+		require.NoError(t, err)
+	}
+	insertCatalog("apps/v1", "Deployment", "deployments", "Namespaced", 0)
+	insertCatalog("v1", "Pod", "pods", "Namespaced", 0)
+
+	insertObj := func(uid, apiVersion, kind, namespace, name string, createdAt int64) {
+		_, err := cdb.Writer().ExecContext(ctx,
+			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+			   created_at, updated_at, raw_json)
+			 VALUES (?, ?, ?, ?, ?, '1', ?, ?, x'7b7d')`,
+			uid, apiVersion, kind, namespace, name, createdAt, createdAt)
+		require.NoError(t, err)
+	}
+	// Two Deployments (out of (namespace, name) order on purpose) + an unrelated Pod.
+	insertObj("d2", "apps/v1", "Deployment", "kube-system", "coredns", 200)
+	insertObj("d1", "apps/v1", "Deployment", "default", "web", 100)
+	insertObj("p1", "v1", "Pod", "default", "web-abc", 300)
+
+	rows, err = cdb.Objects(ctx, "apps/v1", "deployments")
+	require.NoError(t, err)
+	require.Len(t, rows, 2, "only the deployments, not the pod")
+
+	// Ordered by (namespace, name): default/web before kube-system/coredns.
+	require.Equal(t, "d1", rows[0].UID)
+	require.Equal(t, "apps/v1", rows[0].APIVersion)
+	require.Equal(t, "Deployment", rows[0].Kind)
+	require.Equal(t, "default", rows[0].Namespace)
+	require.Equal(t, "web", rows[0].Name)
+	require.EqualValues(t, 100, rows[0].CreatedAt)
+
+	require.Equal(t, "d2", rows[1].UID)
+	require.Equal(t, "kube-system", rows[1].Namespace)
+	require.Equal(t, "coredns", rows[1].Name)
+}
+
 // The per-kind counts are maintained by triggers on the objects table (so
 // Kinds reads them without scanning objects). This pins the two properties
 // the trigger design relies on: a delete decrements the count, and an object

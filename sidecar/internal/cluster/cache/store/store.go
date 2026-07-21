@@ -516,6 +516,59 @@ func (c *ClusterDB) Events(ctx context.Context, limit int) ([]EventRow, error) {
 // fixed window of the newest events, so this doubles as that window size.
 const defaultEventsLimit = 500
 
+// ObjectRow is one cached Kubernetes object projected for a table row (any kind),
+// read from the objects table. It is the universal-identity subset that backs the
+// dashboard's generic per-kind object tables — the nested body (the compressed
+// raw_json) is deliberately not read here (see TODO.md).
+type ObjectRow struct {
+	// UID is the object's UID (the stable identity a watch keys on).
+	UID string
+	// APIVersion is the group/version, e.g. "apps/v1".
+	APIVersion string
+	// Kind is the Kind name, e.g. "Deployment".
+	Kind string
+	// Namespace is the object's namespace (empty for a cluster-scoped kind).
+	Namespace string
+	// Name is the object's name.
+	Name string
+	// CreatedAt is the object's creationTimestamp as unix-millis, 0 when the
+	// source object carried none.
+	CreatedAt int64
+}
+
+// Objects reads one kind's cached objects, filtered by (api_version, resource) and
+// ordered by (namespace, name) for a stable table. The watch is keyed by the plural
+// resource, but the objects table is keyed by kind, so the resource is translated to
+// its kind through kind_catalog (a point subquery) and the query then rides the
+// objects_kind_ns_name index. Unlike Events there is no window limit — a kind's whole
+// cached set is returned. Empty until the sync engine has populated the kind.
+func (c *ClusterDB) Objects(ctx context.Context, apiVersion, resource string) ([]ObjectRow, error) {
+	rows, err := c.readDB.QueryContext(ctx,
+		`SELECT uid, api_version, kind, namespace, name, created_at
+		 FROM objects
+		 WHERE api_version = ?
+		   AND kind = (SELECT kind FROM kind_catalog WHERE api_version = ? AND resource = ?)
+		 ORDER BY namespace, name`,
+		apiVersion, apiVersion, resource)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ObjectRow
+	for rows.Next() {
+		var r ObjectRow
+		if err := rows.Scan(&r.UID, &r.APIVersion, &r.Kind, &r.Namespace, &r.Name, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterDB, error) {
 	dir := clusterDir(dataDir, ref)
 	if err := os.MkdirAll(dir, 0o700); err != nil {

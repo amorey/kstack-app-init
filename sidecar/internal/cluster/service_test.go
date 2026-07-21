@@ -723,6 +723,47 @@ func insertEvent(t *testing.T, ctx context.Context, cdb *store.ClusterDB, uid, e
 	require.NoError(t, err)
 }
 
+// recvObjectChange reads one delta off a ClusterDataObjectsWatch stream, failing on
+// close or timeout.
+func recvObjectChange(t *testing.T, ch <-chan ClusterDataObjectChange) ClusterDataObjectChange {
+	t.Helper()
+	select {
+	case ev, ok := <-ch:
+		require.True(t, ok, "stream closed early")
+		return ev
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a ClusterDataObjectChange")
+		return ClusterDataObjectChange{}
+	}
+}
+
+// insertObject writes one row directly into the objects table (the universal-identity
+// columns the objects watch projects), standing in for what the sync engine's object
+// driver would persist. createdAt is the object's creationTimestamp as unix-millis.
+func insertObject(t *testing.T, ctx context.Context, cdb *store.ClusterDB, uid, apiVersion, kind, namespace, name, rv string, createdAt int64) {
+	t.Helper()
+	_, err := cdb.Writer().ExecContext(ctx,
+		`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+		   created_at, updated_at, raw_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, x'7b7d')
+		 ON CONFLICT(uid) DO UPDATE SET
+		   namespace=excluded.namespace, name=excluded.name,
+		   resource_version=excluded.resource_version, updated_at=excluded.updated_at`,
+		uid, apiVersion, kind, namespace, name, rv, createdAt, createdAt)
+	require.NoError(t, err)
+}
+
+// insertObjectCatalog writes one kind_catalog row so the objects reader can translate
+// the watch's plural resource to its kind.
+func insertObjectCatalog(t *testing.T, ctx context.Context, cdb *store.ClusterDB, apiVersion, kind, resource, scope string) {
+	t.Helper()
+	_, err := cdb.Writer().ExecContext(ctx,
+		`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd, schema_json)
+		 VALUES(?, ?, ?, ?, 0, NULL)`,
+		apiVersion, kind, resource, scope)
+	require.NoError(t, err)
+}
+
 // ClusterDataEventsWatch streams the active cache's cached Kubernetes Events as a delta
 // watch: the newest window as an Added burst, then Added/Modified/Deleted as the sync
 // engine writes events and pings the events-only store broker — what backs the dashboard
@@ -826,6 +867,146 @@ func TestServiceClusterDataEventsWatchIgnoresObjectWrites(t *testing.T) {
 	add := recvEventChange(t, ch)
 	assert.Equal(t, ChangeAdded, add.Type)
 	assert.Equal(t, "e2", add.Event.UID)
+}
+
+// ClusterDataObjectsWatch streams one kind's cached objects as a delta watch: the
+// current set for the kind as an Added burst, then Added/Modified/Deleted as the sync
+// engine writes objects and pings the object-write store broker — what backs the
+// dashboard's generic per-kind object tables. Keyed by (apiVersion, resource) on top of
+// the active cache.
+func TestServiceClusterDataObjectsWatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	// The catalog row lets the reader translate the plural resource to its kind; one
+	// object cached before subscribing forms the snapshot.
+	insertObjectCatalog(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
+	insertObject(t, ctx, cdb, "d1", "apps/v1", "Deployment", "default", "web", "1", 100)
+
+	ch, err := s.ClusterDataObjectsWatch(ctx, id, ClusterCacheID(cacheID), "apps/v1", "deployments")
+	require.NoError(t, err)
+
+	// Snapshot: an Added carrying the universal identity + provenance.
+	snap := recvObjectChange(t, ch)
+	assert.Equal(t, ChangeAdded, snap.Type)
+	assert.Equal(t, "d1", snap.Object.UID)
+	assert.Equal(t, "apps/v1", snap.Object.APIVersion)
+	assert.Equal(t, "Deployment", snap.Object.Kind)
+	assert.Equal(t, "default", snap.Object.Namespace)
+	assert.Equal(t, "web", snap.Object.Name)
+	assert.False(t, snap.Object.CreationTimestamp.IsZero())
+	assert.Equal(t, ClusterCacheID(cacheID), snap.CacheID)
+
+	// A brand-new object → Added.
+	insertObject(t, ctx, cdb, "d2", "apps/v1", "Deployment", "kube-system", "coredns", "2", 200)
+	cdb.ObjectsNotify()
+	add := recvObjectChange(t, ch)
+	assert.Equal(t, ChangeAdded, add.Type)
+	assert.Equal(t, "d2", add.Object.UID)
+
+	// ClusterDataObject projects only the object's immutable identity (uid/apiVersion/
+	// kind/namespace/name/creationTimestamp) for now — the nested body is deferred (see
+	// TODO.md). So a bare resourceVersion bump changes no projected field and must NOT
+	// produce a frame; a Modified only becomes observable once the body ships.
+	insertObject(t, ctx, cdb, "d1", "apps/v1", "Deployment", "default", "web", "9", 100)
+	cdb.ObjectsNotify()
+	select {
+	case ev := <-ch:
+		t.Fatalf("a non-identity change must not surface with the identity-only projection, got %+v", ev)
+	case <-time.After(150 * time.Millisecond):
+		// Correct: no frame — only identity is projected today.
+	}
+
+	// An object removed from the table → Deleted (carries the last-known row).
+	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM objects WHERE uid = 'd2'`)
+	require.NoError(t, err)
+	cdb.ObjectsNotify()
+	del := recvObjectChange(t, ch)
+	assert.Equal(t, ChangeDeleted, del.Type)
+	assert.Equal(t, "d2", del.Object.UID)
+
+	cancel()
+	select {
+	case _, ok := <-ch:
+		assert.False(t, ok, "stream must close on ctx cancel")
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not close on ctx cancel")
+	}
+}
+
+// The objects watch is keyed by (apiVersion, resource): a write of a different kind
+// pings the shared object-write broker but must not surface on a watch scoped to another
+// kind — the reader filters by the resource's kind.
+func TestServiceClusterDataObjectsWatchFiltersByKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	insertObjectCatalog(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
+	insertObjectCatalog(t, ctx, cdb, "v1", "Pod", "pods", "Namespaced")
+	insertObject(t, ctx, cdb, "d1", "apps/v1", "Deployment", "default", "web", "1", 100)
+
+	ch, err := s.ClusterDataObjectsWatch(ctx, id, ClusterCacheID(cacheID), "apps/v1", "deployments")
+	require.NoError(t, err)
+	require.Equal(t, "d1", recvObjectChange(t, ch).Object.UID) // snapshot
+
+	// A Pod write pings the object broker but must not appear on the deployments watch.
+	insertObject(t, ctx, cdb, "p1", "v1", "Pod", "default", "web-abc", "1", 200)
+	cdb.ObjectsNotify()
+	select {
+	case ev := <-ch:
+		t.Fatalf("a different kind's write must not surface on this watch, got %+v", ev)
+	case <-time.After(150 * time.Millisecond):
+		// Correct: no frame for an unrelated kind.
+	}
+
+	// A same-kind write does surface.
+	insertObject(t, ctx, cdb, "d2", "apps/v1", "Deployment", "default", "api", "1", 300)
+	cdb.ObjectsNotify()
+	add := recvObjectChange(t, ch)
+	assert.Equal(t, ChangeAdded, add.Type)
+	assert.Equal(t, "d2", add.Object.UID)
+}
+
+// With no open cache for the id, the objects watch mirrors the kinds/events empty
+// posture: it produces no frames and simply ends when ctx is cancelled (no error).
+func TestServiceClusterDataObjectsWatchNoOpenCache(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, _, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	ch, err := s.ClusterDataObjectsWatch(ctx, id, ClusterCacheID(999999), "apps/v1", "deployments")
+	require.NoError(t, err)
+
+	select {
+	case ev, ok := <-ch:
+		require.False(t, ok, "no frames without an open cache; channel only closes")
+		_ = ev
+	case <-time.After(150 * time.Millisecond):
+		// Correct: quiet until ctx ends.
+	}
+
+	cancel()
+	select {
+	case _, ok := <-ch:
+		assert.False(t, ok, "stream must close on ctx cancel")
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not close on ctx cancel")
+	}
 }
 
 // cacheRef resolves the active cache's on-disk locator: the directory id is the
