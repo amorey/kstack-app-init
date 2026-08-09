@@ -128,7 +128,11 @@ func newGVRDiscoveryFixture(t *testing.T) *gvrDiscoveryFixture {
 	bh := NewTestBeehiveUnstarted(t)
 
 	connMgr := NewConnectionManager()
-	rt := &controllerRuntime{bh: bh, connMgr: connMgr, cacheManager: store.NewManager(t.TempDir())}
+	// The pools must close before TempDir's RemoveAll: on Windows an open file can't
+	// be unlinked, so a leaked cache handle fails the cleanup.
+	cacheMgr := store.NewManager(t.TempDir())
+	t.Cleanup(func() { _ = cacheMgr.Shutdown(context.Background()) })
+	rt := &controllerRuntime{bh: bh, connMgr: connMgr, cacheManager: cacheMgr}
 
 	api := &fakeDiscovery{lists: defaultDiscoveryLists()}
 	ctrl := NewClusterCacheGVRDiscoveryController(rt)

@@ -67,7 +67,10 @@ func newCacheTestBeehivePresence(t *testing.T) (
 	gvrSyncClient := beehive.NewClient[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus](bh, ClusterCacheGVRSyncGroupKind)
 	discoveryClient := beehive.NewClient[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus](bh, ClusterCacheGVRDiscoveryGroupKind)
 
+	// The pools must close before TempDir's RemoveAll: on Windows an open file can't
+	// be unlinked, so a leaked cache handle fails the cleanup.
 	mgr := store.NewManager(t.TempDir())
+	t.Cleanup(func() { _ = mgr.Shutdown(context.Background()) })
 	rt := &controllerRuntime{bh: bh, cacheManager: mgr, connMgr: NewConnectionManager()}
 
 	ctrl := NewClusterCacheController(rt)

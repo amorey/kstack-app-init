@@ -167,7 +167,10 @@ func newGVRSyncFixture(t *testing.T) *gvrSyncFixture {
 	bh := NewTestBeehiveUnstarted(t)
 
 	connMgr := NewConnectionManager()
+	// The pools must close before TempDir's RemoveAll: on Windows an open file can't
+	// be unlinked, so a leaked cache handle fails the cleanup.
 	cacheMgr := store.NewManager(t.TempDir())
+	t.Cleanup(func() { _ = cacheMgr.Shutdown(context.Background()) })
 	rt := &controllerRuntime{bh: bh, connMgr: connMgr, cacheManager: cacheMgr}
 
 	ctrl := NewClusterCacheGVRSyncController(rt)

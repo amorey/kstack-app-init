@@ -919,12 +919,17 @@ func TestOpenRefusesACacheThatIsClosing(t *testing.T) {
 	cdb, err := m.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
 
-	realCancel := cdb.janitorCancel
+	// Stall the shutdown by hand: stop the real janitor, then neuter its cancel and hand
+	// shutdown a "done" channel this test closes when the stall should end. Both fields
+	// are swapped once, here, before any other goroutine can reach the handle — the
+	// refused Open below starts a retry driver that reads them from its own goroutine,
+	// so moving them again mid-test would be a data race on the handle.
+	cdb.janitorCancel()
+	<-cdb.janitorDone
+	stalled := make(chan struct{})
 	cdb.janitorCancel = func() {}
-	t.Cleanup(func() {
-		cdb.janitorCancel = realCancel
-		_ = m.Shutdown(ctx)
-	})
+	cdb.janitorDone = stalled
+	t.Cleanup(func() { _ = m.Shutdown(ctx) })
 
 	// Leave the cache mid-close: the shutdown could not finish, so its pools are still live.
 	expired, cancel := context.WithCancel(ctx)
@@ -935,8 +940,9 @@ func TestOpenRefusesACacheThatIsClosing(t *testing.T) {
 	require.Error(t, err, "a closing cache is not open")
 	require.Nil(t, got)
 
-	// Once it is really closed, opening works again.
-	cdb.janitorCancel = realCancel
+	// Once it is really closed, opening works again. Releasing the stall lets the retry
+	// driver Open started finish the close; our own Close waits out that attempt.
+	close(stalled)
 	require.NoError(t, m.Close(ctx, 1))
 	reopened, err := m.Open(ctx, ref(1, 1))
 	require.NoError(t, err)
