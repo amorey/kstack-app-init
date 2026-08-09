@@ -130,38 +130,16 @@ func TestClusterCoreControllerCapsConditionMessages(t *testing.T) {
 	assert.NotEmpty(t, healthy.Message, "the reading is still shown, just bounded")
 }
 
-// signalingProbe returns a successful ProbeFunc that signals every invocation on the
-// returned channel, so a test can wait on the probe event instead of polling. The send
-// is non-blocking, so a slow reader can't stall the controller's reconcile.
-func signalingProbe() (ProbeFunc, chan struct{}) {
-	ch := make(chan struct{}, 16)
+// signalingProbe returns a successful ProbeFunc announcing every invocation on the
+// returned probe, so a test can wait on the probe event instead of polling.
+func signalingProbe() (ProbeFunc, *testutil.Probe[struct{}]) {
+	fired := testutil.NewProbe[struct{}](16)
 	probe := func(context.Context, *rest.Config) (ClusterServer, ClusterPrincipal, error) {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
+		fired.Fire(struct{}{})
 		uid := "uid"
 		return ClusterServer{UID: &uid}, ClusterPrincipal{}, nil
 	}
-	return probe, ch
-}
-
-// awaitProbe blocks until the probe fires once, or fails on timeout.
-func awaitProbe(t *testing.T, ch <-chan struct{}) {
-	t.Helper()
-	testutil.Wait(t, ch, "a probe")
-}
-
-// drainProbes consumes any already-buffered probe signals so a following
-// awaitProbe observes only probes that fire after this point.
-func drainProbes(ch <-chan struct{}) {
-	for {
-		select {
-		case <-ch:
-		default:
-			return
-		}
-	}
+	return probe, fired
 }
 
 // newClusterTestBeehive builds a beehive with the real ClusterCoreController using
@@ -593,12 +571,12 @@ func TestClusterCoreControllerPokeReprobes(t *testing.T) {
 	require.NoError(t, err)
 
 	// The initial scheduled reconcile probes once (then requeues ~30s out).
-	awaitProbe(t, probeCh)
-	drainProbes(probeCh)
+	probeCh.Await(t, "a probe")
+	probeCh.Drain()
 
 	// A poke forces an immediate re-probe without waiting for the 30s cadence.
 	pk.Poke(poke.SourceHost)
-	awaitProbe(t, probeCh)
+	probeCh.Await(t, "a probe")
 }
 
 // TestClusterCoreControllerReprobeOne verifies the in-process retry bus: Reprobe
@@ -631,12 +609,12 @@ func TestClusterCoreControllerReprobeOne(t *testing.T) {
 	id := ClusterID(obj.ID)
 
 	// The initial scheduled reconcile probes once (then requeues ~30s out).
-	awaitProbe(t, probeCh)
-	drainProbes(probeCh)
+	probeCh.Await(t, "a probe")
+	probeCh.Drain()
 
 	// Reprobe forces an immediate re-probe of the targeted
 	ctrl.Reprobe(id)
-	awaitProbe(t, probeCh)
+	probeCh.Await(t, "a probe")
 }
 
 // The probe hub is a bounded broadcast shared by every cluster, so a subscriber that is
@@ -799,11 +777,11 @@ func TestTruncateMessage(t *testing.T) {
 // gatedProbe returns a successful ProbeFunc that blocks each call until release is
 // closed, announcing every entry on entered. It lets a test hold one cluster's probe
 // open and count how many other probes get to run meanwhile.
-func gatedProbe() (fn ProbeFunc, entered chan struct{}, release chan struct{}) {
-	entered = make(chan struct{}, 8)
+func gatedProbe() (fn ProbeFunc, entered *testutil.Probe[struct{}], release chan struct{}) {
+	entered = testutil.NewProbe[struct{}](8)
 	release = make(chan struct{})
 	fn = func(ctx context.Context, cfg *rest.Config) (ClusterServer, ClusterPrincipal, error) {
-		entered <- struct{}{}
+		entered.Fire(struct{}{})
 		select {
 		case <-release:
 		case <-ctx.Done():
@@ -847,7 +825,7 @@ func TestClusterCoreControllerReconcilesDistinctClustersInParallel(t *testing.T)
 	// Both probes must be in flight at once. Under a single shared lock only one
 	// entry ever arrives and this times out.
 	for i := range 2 {
-		testutil.Wait(t, entered, fmt.Sprintf("probe %d of 2 (distinct clusters must not serialize)", i+1))
+		entered.Await(t, fmt.Sprintf("probe %d of 2 (distinct clusters must not serialize)", i+1))
 	}
 }
 
@@ -876,9 +854,9 @@ func TestClusterCoreControllerSerializesSameClusterReconciles(t *testing.T) {
 	}
 
 	// One probe enters; the second must stay blocked on the first's lock.
-	testutil.Wait(t, entered, "the first probe")
+	entered.Await(t, "the first probe")
 	select {
-	case <-entered:
+	case <-entered.Chan():
 		t.Fatal("a second reconcile of the same cluster ran concurrently")
 	case <-time.After(200 * time.Millisecond):
 	}

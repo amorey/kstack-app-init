@@ -273,14 +273,14 @@ func staticList(rv string, items ...*unstructured.Unstructured) func(metav1.List
 type recordingSink struct {
 	mu   sync.Mutex
 	all  []Status
-	sigC chan struct{}
+	sigC *testutil.Probe[struct{}]
 	// beforeReport, when set, runs at the top of Report — a seam for a test that needs a
 	// report to still be in flight while it does something else.
 	beforeReport func(Status)
 }
 
 func newRecordingSink() *recordingSink {
-	return &recordingSink{sigC: make(chan struct{}, 64)}
+	return &recordingSink{sigC: testutil.NewProbe[struct{}](64)}
 }
 
 func (s *recordingSink) Report(st Status) {
@@ -290,10 +290,7 @@ func (s *recordingSink) Report(st Status) {
 	s.mu.Lock()
 	s.all = append(s.all, st)
 	s.mu.Unlock()
-	select {
-	case s.sigC <- struct{}{}:
-	default:
-	}
+	s.sigC.Fire(struct{}{})
 }
 
 // states returns the states of every recorded report, in arrival order.
@@ -322,7 +319,7 @@ func (s *recordingSink) await(t *testing.T, what string, pred func(Status) bool)
 		}
 		s.mu.Unlock()
 		select {
-		case <-s.sigC:
+		case <-s.sigC.Chan():
 		case <-deadline:
 			s.mu.Lock()
 			defer s.mu.Unlock()
@@ -346,7 +343,7 @@ func (s *recordingSink) awaitN(t *testing.T, n int) []Status {
 		}
 		s.mu.Unlock()
 		select {
-		case <-s.sigC:
+		case <-s.sigC.Chan():
 		case <-deadline:
 			s.mu.Lock()
 			defer s.mu.Unlock()
@@ -734,7 +731,7 @@ func TestWorkerOpenThenErrorWatchSpendsTheErrorBudget(t *testing.T) {
 	// sleep the driver asks for, with the real wait skipped so the test doesn't pay it.
 	var mu sync.Mutex
 	var slept []time.Duration
-	sleptC := make(chan struct{}, 64)
+	sleptC := testutil.NewProbe[struct{}](64)
 
 	sink := startWorker(t, src, fs, withDriverOptions(
 		withStuckThreshold(3),
@@ -742,10 +739,7 @@ func TestWorkerOpenThenErrorWatchSpendsTheErrorBudget(t *testing.T) {
 			mu.Lock()
 			slept = append(slept, d)
 			mu.Unlock()
-			select {
-			case sleptC <- struct{}{}:
-			default:
-			}
+			sleptC.Fire(struct{}{})
 			return nil
 		}),
 	))
@@ -766,7 +760,7 @@ func TestWorkerOpenThenErrorWatchSpendsTheErrorBudget(t *testing.T) {
 			return
 		}
 		select {
-		case <-sleptC:
+		case <-sleptC.Chan():
 		case <-deadline:
 			t.Fatalf("watch never dropped to the stuck retry cadence; it kept re-listing on backoff sleeps %v", seen)
 		}

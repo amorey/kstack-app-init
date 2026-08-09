@@ -106,11 +106,15 @@ func (f *failDrainUpstream) Update(context.Context, prefs.Settings) (prefs.Setti
 // signaling each entry on `entered` — to verify a Poke cancels in-flight
 // upstream work (not just an already-open watch).
 type blockSnapshotUpstream struct {
-	entered chan struct{}
+	entered *testutil.Probe[struct{}]
+}
+
+func newBlockSnapshotUpstream() *blockSnapshotUpstream {
+	return &blockSnapshotUpstream{entered: testutil.NewProbe[struct{}](4)}
 }
 
 func (u *blockSnapshotUpstream) Snapshot(ctx context.Context) (prefs.Settings, error) {
-	u.entered <- struct{}{}
+	u.entered.Fire(struct{}{})
 	<-ctx.Done()
 	return prefs.Settings{}, ctx.Err()
 }
@@ -212,17 +216,17 @@ func TestStreamErrorIsSurfaced(t *testing.T) {
 // can only happen if the first (blocked) call was cancelled.
 func TestPokeCancelsInFlightSnapshot(t *testing.T) {
 	store, q := newStoreQueue(t)
-	up := &blockSnapshotUpstream{entered: make(chan struct{}, 4)}
+	up := newBlockSnapshotUpstream()
 	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	runEngine(t, e)
 
-	testutil.Wait(t, up.entered, "the engine to enter Snapshot") // and block there
+	up.entered.Await(t, "the engine to enter Snapshot") // and block there
 
 	e.Poke() // must cancel the in-flight Snapshot
 
 	// re-entered Snapshot ⇒ the blocked one was cancelled
-	testutil.Wait(t, up.entered, "Poke to cancel the in-flight Snapshot")
+	up.entered.Await(t, "Poke to cancel the in-flight Snapshot")
 }
 
 // runEngine starts e.Run in the background and registers cleanup that cancels
@@ -695,17 +699,17 @@ func TestPendingPatchMergedOverSnapshot(t *testing.T) {
 // re-enters Snapshot with no LastError set.
 func TestPokeDuringConnectIsNotAFailure(t *testing.T) {
 	store, q := newStoreQueue(t)
-	up := &blockSnapshotUpstream{entered: make(chan struct{}, 4)}
+	up := newBlockSnapshotUpstream()
 	e := newWithOptions(up, store, q, nil, testOpts()...)
 
 	runEngine(t, e)
 
-	testutil.Wait(t, up.entered, "the engine to enter Snapshot") // and block there
+	up.entered.Await(t, "the engine to enter Snapshot") // and block there
 
 	e.Poke() // cancels the in-flight Snapshot — an intentional restart
 
 	// re-entered Snapshot ⇒ the attempt was abandoned, not failed
-	testutil.Wait(t, up.entered, "the engine to reconnect after a poke-cancel")
+	up.entered.Await(t, "the engine to reconnect after a poke-cancel")
 
 	// Parked back in Snapshot: a poke-cancel must not have recorded a failure.
 	if s := e.Status(); s.LastError != "" {
@@ -773,7 +777,7 @@ func TestDrainDoesNotAckAfterCancel(t *testing.T) {
 func TestEngine_NotifierSignalPokes(t *testing.T) {
 	store, q := newStoreQueue(t)
 	// Upstream always fails Snapshot so the engine parks in backoff.
-	up := &blockSnapshotUpstream{entered: make(chan struct{}, 4)}
+	up := newBlockSnapshotUpstream()
 
 	b := poke.New()
 	e := newWithOptions(up, store, q, b, testOpts()...)
@@ -781,12 +785,12 @@ func TestEngine_NotifierSignalPokes(t *testing.T) {
 	runEngine(t, e)
 
 	// Wait for the first Snapshot to block (engine is in connecting state).
-	testutil.Wait(t, up.entered, "the engine to enter Snapshot")
+	up.entered.Await(t, "the engine to enter Snapshot")
 
 	// Poke the broadcaster — the forwarding goroutine calls e.Poke(), which
 	// cancels the in-flight Snapshot and wakes any in-flight backoff.
 	b.Poke(poke.SourceHost)
 
 	// Engine should re-enter Snapshot promptly (proving the poke propagated).
-	testutil.Wait(t, up.entered, "the notifier poke to trigger a reconnect")
+	up.entered.Await(t, "the notifier poke to trigger a reconnect")
 }

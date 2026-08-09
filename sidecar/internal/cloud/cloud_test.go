@@ -125,8 +125,15 @@ func (s *signalUpstream) Update(_ context.Context, p prefs.Settings) (prefs.Sett
 // cancelWatchUpstream signals when each opened Watch's context is cancelled,
 // so a test can observe the live stream being torn down.
 type cancelWatchUpstream struct {
-	watchOpened chan struct{}
-	cancelled   chan struct{}
+	watchOpened *testutil.Probe[struct{}]
+	cancelled   *testutil.Probe[struct{}]
+}
+
+func newCancelWatchUpstream() *cancelWatchUpstream {
+	return &cancelWatchUpstream{
+		watchOpened: testutil.NewProbe[struct{}](8),
+		cancelled:   testutil.NewProbe[struct{}](8),
+	}
 }
 
 func (u *cancelWatchUpstream) Snapshot(context.Context) (prefs.Settings, error) {
@@ -135,16 +142,10 @@ func (u *cancelWatchUpstream) Snapshot(context.Context) (prefs.Settings, error) 
 
 func (u *cancelWatchUpstream) Watch(ctx context.Context) (<-chan prefs.Settings, <-chan error, error) {
 	ch := make(chan prefs.Settings)
-	select {
-	case u.watchOpened <- struct{}{}:
-	default:
-	}
+	u.watchOpened.Fire(struct{}{})
 	go func() {
 		<-ctx.Done()
-		select {
-		case u.cancelled <- struct{}{}:
-		default:
-		}
+		u.cancelled.Fire(struct{}{})
 		close(ch)
 	}()
 	return ch, nil, nil
@@ -161,10 +162,7 @@ func (u *cancelWatchUpstream) Update(_ context.Context, p prefs.Settings) (prefs
 func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 	authSvc := signedInFakeAuth()
 
-	up := &cancelWatchUpstream{
-		watchOpened: make(chan struct{}, 8),
-		cancelled:   make(chan struct{}, 8),
-	}
+	up := newCancelWatchUpstream()
 	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", authSvc, nil, withUpstream(up))
 	if err != nil {
 		t.Fatalf("cloud.New: %v", err)
@@ -177,7 +175,7 @@ func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	testutil.Wait(t, up.watchOpened, "the engine to open a watch")
+	up.watchOpened.Await(t, "the engine to open a watch")
 
 	// Sign out via auth → session change → cloud pokes its engine → the live,
 	// in-flight authenticated watch is cancelled.
@@ -186,7 +184,7 @@ func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 	}
 
 	// the live watch must be cancelled in response to the auth sign-out
-	testutil.Wait(t, up.cancelled, "the live watch to be torn down on auth sign-out")
+	up.cancelled.Await(t, "the live watch to be torn down on auth sign-out")
 
 	if err := stop(context.Background()); err != nil {
 		t.Fatalf("stop: %v", err)

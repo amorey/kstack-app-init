@@ -61,7 +61,7 @@ type fakeWorker struct {
 }
 
 func (w *fakeWorker) Start() {
-	w.factory.newC <- w
+	w.factory.newC.Fire(w)
 }
 
 func (w *fakeWorker) Stop(context.Context) error {
@@ -85,12 +85,12 @@ func (w *fakeWorker) isStopped() bool {
 type workerFactory struct {
 	mu      sync.Mutex
 	built   []*fakeWorker
-	newC    chan *fakeWorker
+	newC    *testutil.Probe[*fakeWorker]
 	stopErr error
 }
 
 func newWorkerFactory() *workerFactory {
-	return &workerFactory{newC: make(chan *fakeWorker, 8)}
+	return &workerFactory{newC: testutil.NewProbe[*fakeWorker](8)}
 }
 
 func (f *workerFactory) build(_ context.Context, _ *rest.Config, _ *store.ClusterDB, sink kubesync.Sink) (workerHandle, error) {
@@ -105,7 +105,7 @@ func (f *workerFactory) build(_ context.Context, _ *rest.Config, _ *store.Cluste
 // arrives.
 func (f *workerFactory) await(t *testing.T) *fakeWorker {
 	t.Helper()
-	return testutil.Recv(t, f.newC, "the controller to start a worker")
+	return f.newC.Await(t, "the controller to start a worker")
 }
 
 func (f *workerFactory) count() int {
@@ -118,35 +118,35 @@ func (f *workerFactory) count() int {
 // was built for so a test can check the spec reached the worker intact.
 type gvrWorkerFactory struct {
 	*workerFactory
-	kinds chan objectsync.Kind
+	kinds *testutil.Probe[objectsync.Kind]
 	// limiters records the LIST-phase budget each worker was built with, so a test can
 	// assert every kind of one cache shares one.
-	limiters chan kubesync.ListLimiter
+	limiters *testutil.Probe[kubesync.ListLimiter]
 }
 
 // awaitKind returns the kind the next worker was built for.
 func (f *gvrWorkerFactory) awaitKind(t *testing.T) objectsync.Kind {
 	t.Helper()
-	return testutil.Recv(t, f.kinds, "the kind a worker was built for")
+	return f.kinds.Await(t, "the kind a worker was built for")
 }
 
 // awaitLimiter returns the LIST budget the next worker was built with.
 func (f *gvrWorkerFactory) awaitLimiter(t *testing.T) kubesync.ListLimiter {
 	t.Helper()
-	return testutil.Recv(t, f.limiters, "the limiter a worker was built with")
+	return f.limiters.Await(t, "the limiter a worker was built with")
 }
 
 func newGVRWorkerFactory() *gvrWorkerFactory {
 	return &gvrWorkerFactory{
 		workerFactory: newWorkerFactory(),
-		kinds:         make(chan objectsync.Kind, 8),
-		limiters:      make(chan kubesync.ListLimiter, 8),
+		kinds:         testutil.NewProbe[objectsync.Kind](8),
+		limiters:      testutil.NewProbe[kubesync.ListLimiter](8),
 	}
 }
 
 func (f *gvrWorkerFactory) build(ctx context.Context, cfg *rest.Config, cdb *store.ClusterDB, kind objectsync.Kind, limiter kubesync.ListLimiter, sink kubesync.Sink) (workerHandle, error) {
-	f.kinds <- kind
-	f.limiters <- limiter
+	f.kinds.Fire(kind)
+	f.limiters.Fire(limiter)
 	return f.workerFactory.build(ctx, cfg, cdb, sink)
 }
 
@@ -333,14 +333,11 @@ func TestGVRSyncEnabledStartsWorker(t *testing.T) {
 
 	f.factory.await(t) // arriving here means built and started
 
-	select {
-	case kind := <-f.factory.kinds:
-		assert.Equal(t, objectsync.Kind{
-			APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Namespaced: true,
-		}, kind, "the spec's GVR identity must reach the worker verbatim")
-	default:
-		t.Fatal("no kind recorded")
-	}
+	kind, ok := f.factory.kinds.TryAwait()
+	require.True(t, ok, "no kind recorded")
+	assert.Equal(t, objectsync.Kind{
+		APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Namespaced: true,
+	}, kind, "the spec's GVR identity must reach the worker verbatim")
 }
 
 // TestGVRSyncWorkersOfOneCacheShareOneListLimiter pins the bound that keeps a cold sync's
@@ -684,7 +681,7 @@ func TestGVRSyncPokeDoesNotResurrectAStoppedWorker(t *testing.T) {
 	f.ctrl.restartWorker(context.Background(), entry)
 
 	select {
-	case <-f.factory.newC:
+	case <-f.factory.newC.Chan():
 		t.Fatal("the poke resurrected a worker the reconcile had stopped")
 	case <-time.After(200 * time.Millisecond):
 	}
@@ -759,7 +756,7 @@ func TestGVRSyncKeepsWorkerWhenNothingChanged(t *testing.T) {
 	require.NoError(t, err)
 
 	select {
-	case <-f.factory.newC:
+	case <-f.factory.newC.Chan():
 		t.Fatal("an unchanged spec must not rebuild the worker")
 	case <-time.After(200 * time.Millisecond):
 	}

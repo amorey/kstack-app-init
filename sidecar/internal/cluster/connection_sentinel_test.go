@@ -54,12 +54,6 @@ func liveSentinelWatch(context.Context, *rest.Config) (watch.Interface, error) {
 	return newFakeWatch(), nil
 }
 
-// awaitWatch blocks until a sentinel watch is established, or fails on timeout.
-func awaitWatch(t *testing.T, ch <-chan *fakeWatch) *fakeWatch {
-	t.Helper()
-	return testutil.Recv(t, ch, "a sentinel watch")
-}
-
 // TestClusterCoreControllerSentinelReprobesOnWatchBreak verifies the connection
 // sentinel: after a successful probe the controller holds a liveness watch open, and
 // when that watch closes it forces an out-of-band re-probe — fast detection owned by
@@ -76,13 +70,10 @@ func TestClusterCoreControllerSentinelReprobesOnWatchBreak(t *testing.T) {
 	ctrl := NewClusterCoreController(&controllerRuntime{bh: bh}, w, probe, staticCheck(HealthPhaseHealthy))
 
 	// Hand each established sentinel watch back to the test so it can break one.
-	watches := make(chan *fakeWatch, 8)
+	watches := testutil.NewProbe[*fakeWatch](8)
 	ctrl.SetSentinelWatcher(func(context.Context, *rest.Config) (watch.Interface, error) {
 		fw := newFakeWatch()
-		select {
-		case watches <- fw:
-		default:
-		}
+		watches.Fire(fw)
 		return fw, nil
 	})
 
@@ -100,13 +91,13 @@ func TestClusterCoreControllerSentinelReprobesOnWatchBreak(t *testing.T) {
 	require.NoError(t, err)
 
 	// The initial scheduled reconcile probes once and, on success, opens a sentinel.
-	awaitProbe(t, probeCh)
-	drainProbes(probeCh)
+	probeCh.Await(t, "a probe")
+	probeCh.Drain()
 
 	// Break the established liveness watch (simulating the connection dropping).
-	fw := awaitWatch(t, watches)
+	fw := watches.Await(t, "a sentinel watch")
 	fw.Stop()
 
 	// The break must force an out-of-band re-probe without waiting for the 30s poll.
-	awaitProbe(t, probeCh)
+	probeCh.Await(t, "a probe")
 }
