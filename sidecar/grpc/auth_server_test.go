@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amorey/gochan/watch"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -36,16 +37,23 @@ type fakeAuthSvc struct {
 
 	loginErr error // when set, StartLogin returns this error without signing in
 
-	subs   map[int]chan auth.State
-	nextID int
+	hub *watch.Hub[auth.State]
+	tx  *watch.Sender[auth.State]
 }
 
 func newFakeAuthSvc(loginAs auth.Identity) *fakeAuthSvc {
-	return &fakeAuthSvc{loginAs: loginAs, subs: map[int]chan auth.State{}}
+	return newFakeAuthSvcState(false, auth.Identity{}, loginAs)
 }
 
 func signedInFakeAuthSvc(id auth.Identity) *fakeAuthSvc {
-	return &fakeAuthSvc{signedIn: true, identity: id, loginAs: id, subs: map[int]chan auth.State{}}
+	return newFakeAuthSvcState(true, id, id)
+}
+
+func newFakeAuthSvcState(signedIn bool, identity, loginAs auth.Identity) *fakeAuthSvc {
+	f := &fakeAuthSvc{signedIn: signedIn, identity: identity, loginAs: loginAs}
+	f.hub = watch.New(f.stateLocked())
+	f.tx = f.hub.Sender()
+	return f
 }
 
 func (f *fakeAuthSvc) Current(context.Context) (auth.State, error) {
@@ -77,22 +85,11 @@ func (f *fakeAuthSvc) Logout(context.Context) error {
 
 func (f *fakeAuthSvc) TokenSource(context.Context) oauth2.TokenSource { return nil }
 
+// Subscribe streams session State (current-on-subscribe, then changes) plus a
+// cancel func — the same watch hub the real service publishes through.
 func (f *fakeAuthSvc) Subscribe() (<-chan auth.State, func()) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	id := f.nextID
-	f.nextID++
-	ch := make(chan auth.State, 8)
-	ch <- f.stateLocked() // current-on-subscribe
-	f.subs[id] = ch
-	return ch, func() {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if c, ok := f.subs[id]; ok {
-			delete(f.subs, id)
-			close(c)
-		}
-	}
+	rx := f.hub.Receiver()
+	return rx.Chan(), rx.Close
 }
 
 func (f *fakeAuthSvc) stateLocked() auth.State {
@@ -104,14 +101,9 @@ func (f *fakeAuthSvc) stateLocked() auth.State {
 	return st
 }
 
+// publishLocked publishes the current State to subscribers. Caller holds f.mu.
 func (f *fakeAuthSvc) publishLocked() {
-	st := f.stateLocked()
-	for _, ch := range f.subs {
-		select {
-		case ch <- st:
-		default:
-		}
-	}
+	f.tx.Send(f.stateLocked()) //nolint:errcheck // Send never blocks; a closed hub is a no-op
 }
 
 // grpcTestServer stands up an h2c HTTP server over the gRPC server and returns

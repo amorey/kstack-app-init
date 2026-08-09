@@ -31,7 +31,7 @@ func signedInFakeAuth() *fakeAuth {
 func (f *fakeAuth) Current(context.Context) (auth.State, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return auth.State{Authenticated: f.signedIn}, nil
+	return f.stateLocked(), nil
 }
 
 func (f *fakeAuth) StartLogin(context.Context) error {
@@ -54,16 +54,22 @@ func (f *fakeAuth) Logout(context.Context) error {
 // never builds the api client from a token source.
 func (f *fakeAuth) TokenSource(context.Context) oauth2.TokenSource { return nil }
 
-// Subscribe mirrors the real latest-value stream: it delivers the current State
-// on subscribe (so the consumer seeds its baseline without poking), then each
-// subsequent change.
+// Subscribe delivers the current State on subscribe (so the consumer seeds its
+// baseline without poking), then every subsequent change.
+//
+// Deliberately a lossless buffered fan-out rather than a gochan/watch hub, which
+// is what the real service publishes through: the consumer under test detects the
+// signed-in → signed-out EDGE, and a latest-value hub is free to coalesce the seed
+// with the change into one delivery, leaving the consumer with a single value it
+// reads as its baseline. The edge is the thing being tested, so the fake has to
+// deliver both sides of it.
 func (f *fakeAuth) Subscribe() (<-chan auth.State, func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	id := f.nextID
 	f.nextID++
 	ch := make(chan auth.State, 8)
-	ch <- auth.State{Authenticated: f.signedIn} // current-on-subscribe
+	ch <- f.stateLocked() // current-on-subscribe
 	f.subs[id] = ch
 	return ch, func() {
 		f.mu.Lock()
@@ -75,10 +81,14 @@ func (f *fakeAuth) Subscribe() (<-chan auth.State, func()) {
 	}
 }
 
+func (f *fakeAuth) stateLocked() auth.State {
+	return auth.State{Authenticated: f.signedIn}
+}
+
 // publishLocked publishes the current State to subscribers (non-blocking).
 // Caller holds f.mu.
 func (f *fakeAuth) publishLocked() {
-	st := auth.State{Authenticated: f.signedIn}
+	st := f.stateLocked()
 	for _, ch := range f.subs {
 		select {
 		case ch <- st:

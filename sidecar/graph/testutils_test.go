@@ -6,6 +6,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/amorey/gochan/watch"
 	"golang.org/x/oauth2"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
@@ -27,19 +28,26 @@ type fakeAuth struct {
 
 	loginErr error // when set, Login fails synchronously (setup error) without signing in
 
-	subs   map[int]chan auth.State
-	nextID int
+	hub *watch.Hub[auth.State]
+	tx  *watch.Sender[auth.State]
 }
 
 // newFakeAuth returns a signed-out fake whose Login signs in as loginAs (the
 // resolver's login flow).
 func newFakeAuth(loginAs auth.Identity) *fakeAuth {
-	return &fakeAuth{loginAs: loginAs, subs: map[int]chan auth.State{}}
+	return newFakeAuthState(false, auth.Identity{}, loginAs)
 }
 
 // signedInFakeAuth returns a fake already signed in as id.
 func signedInFakeAuth(id auth.Identity) *fakeAuth {
-	return &fakeAuth{signedIn: true, identity: id, loginAs: id, subs: map[int]chan auth.State{}}
+	return newFakeAuthState(true, id, id)
+}
+
+func newFakeAuthState(signedIn bool, identity, loginAs auth.Identity) *fakeAuth {
+	f := &fakeAuth{signedIn: signedIn, identity: identity, loginAs: loginAs}
+	f.hub = watch.New(f.stateLocked())
+	f.tx = f.hub.Sender()
+	return f
 }
 
 func (f *fakeAuth) Current(context.Context) (auth.State, error) {
@@ -73,24 +81,11 @@ func (f *fakeAuth) Logout(context.Context) error {
 // so the fake returns nil.
 func (f *fakeAuth) TokenSource(context.Context) oauth2.TokenSource { return nil }
 
-// Subscribe mirrors the real latest-value stream: it delivers the current State
-// on subscribe, then each subsequent change.
+// Subscribe streams session State (current-on-subscribe, then changes) plus a
+// cancel func — the same watch hub the real service publishes through.
 func (f *fakeAuth) Subscribe() (<-chan auth.State, func()) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	id := f.nextID
-	f.nextID++
-	ch := make(chan auth.State, 8)
-	ch <- f.stateLocked() // current-on-subscribe
-	f.subs[id] = ch
-	return ch, func() {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if c, ok := f.subs[id]; ok {
-			delete(f.subs, id)
-			close(c)
-		}
-	}
+	rx := f.hub.Receiver()
+	return rx.Chan(), rx.Close
 }
 
 // stateLocked derives the public State from the session, mirroring the real
@@ -105,14 +100,6 @@ func (f *fakeAuth) stateLocked() auth.State {
 }
 
 // publishLocked publishes the current State to subscribers. Caller holds f.mu.
-// The send is non-blocking (drops on a full buffer, like the real watch hub) so
-// a Login goroutine can't wedge on a slow reader.
 func (f *fakeAuth) publishLocked() {
-	st := f.stateLocked()
-	for _, ch := range f.subs {
-		select {
-		case ch <- st:
-		default:
-		}
-	}
+	f.tx.Send(f.stateLocked()) //nolint:errcheck // Send never blocks; a closed hub is a no-op
 }
