@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package engine
+package cluster
 
 import (
 	"context"
@@ -26,20 +26,21 @@ import (
 	"k8s.io/client-go/transport"
 )
 
-// defaultListIdleTimeout is the read-inactivity window for a resync request (a LIST
-// page, the metadata list, or a GET). It is NOT a wall-clock deadline: a request is
-// cancelled only when it makes NO read progress for this long — response headers, and
-// then every chunk of the body, count as progress. So a slow or large LIST that keeps
-// streaming completes no matter how long it takes in total (a consistently slow API
-// server, an expensive/huge kind), while a genuinely wedged request — nothing arriving
-// for the window — is cancelled so its driver errors, releases its shared listLimiter
-// slot (see listConcurrency), and Run backs off rather than one hung kind starving
-// every other driver's resync. Generous enough to cover an expensive query's
-// time-to-first-byte; only a real stall should hit it. Detection is coarse: the
-// watchdog ticks once per window and cancels only after a full tick with no progress,
-// so the effective idle-to-cancel time is in [timeout, 2*timeout] — fine for a stall
-// backstop.
-const defaultListIdleTimeout = 2 * time.Minute
+// cacheListIdleTimeout is the read-inactivity window for one of the cache's non-watch
+// requests (a LIST page, a discovery request, a per-object GET). It is NOT a wall-clock
+// deadline: a request is cancelled only when it makes NO read progress for this long —
+// response headers, and then every chunk of the body, count as progress. So a slow or
+// large LIST that keeps streaming completes no matter how long it takes in total (a
+// consistently slow API server, an expensive/huge kind), while a genuinely wedged request
+// — nothing arriving for the window — is cancelled so its driver errors, releases its
+// kubesync.ListLimiter slot (see cacheListConcurrency), and backs off, rather than one
+// hung kind holding a slot forever and starving every other kind's resync.
+//
+// Generous enough to cover an expensive query's time-to-first-byte; only a real stall
+// should hit it. Detection is coarse: the watchdog ticks once per window and cancels only
+// after a full tick with no progress, so the effective idle-to-cancel time is in
+// [timeout, 2*timeout] — fine for a stall backstop.
+const cacheListIdleTimeout = 2 * time.Minute
 
 // newIdleTimeoutWrapper returns a transport.WrapperFunc that installs an idle-read
 // timeout on a rest client's requests (see idleTimeoutRoundTripper). A non-positive

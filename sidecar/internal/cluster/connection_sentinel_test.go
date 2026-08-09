@@ -73,10 +73,9 @@ func TestClusterCoreControllerSentinelReprobesOnWatchBreak(t *testing.T) {
 
 	bh := NewTestBeehiveUnstarted(t)
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 	w := NewStaticWatcher(t, testKubeConfig("alpha"))
 
-	ctrl := NewClusterCoreController(w, coreClient, cacheClient, nil, nil, probe, staticCheck(HealthPhaseHealthy))
+	ctrl := NewClusterCoreController(&controllerRuntime{bh: bh}, w, probe, staticCheck(HealthPhaseHealthy))
 
 	// Hand each established sentinel watch back to the test so it can break one.
 	watches := make(chan *fakeWatch, 8)
@@ -99,7 +98,7 @@ func TestClusterCoreControllerSentinelReprobesOnWatchBreak(t *testing.T) {
 	ctrl.StartBackground()
 	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
 
-	_, err = coreClient.Create(ctx, eligibleSpec("alpha"))
+	_, err = coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 
 	// The initial scheduled reconcile probes once and, on success, opens a sentinel.

@@ -17,20 +17,30 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"time"
 )
 
 // Retention controls how long aging tables hold their rows.
 //
-// Events are deliberately NOT here: their retention is server-mirrored by the sync
-// engine (a relist prunes rows the cluster no longer has — see the engine's
-// eventsReplaceSession), so the cache reflects the server's current event set rather
-// than a locally-enforced window. The janitor only sweeps tables it alone owns.
+// Events are deliberately NOT here: their retention is server-mirrored by the Event
+// sync (its relist prunes rows the cluster no longer has), so the cache reflects the
+// server's current event set rather than a locally-enforced window. The janitor only
+// sweeps tables it alone owns.
+// vacuumPagesPerSweep bounds how many free pages one janitor pass hands back. The cache has
+// a single writer, so a vacuum holds every kind's sync behind it for as long as it runs —
+// and the freelist is biggest precisely when that hurts most, right after an events prune
+// or a CRD's Forget. At the default 4KiB page this is ~8MiB per pass, and a bigger backlog
+// simply drains over the next few.
+//
+// A var only so this package's tests can shrink it; production never assigns it.
+var vacuumPagesPerSweep int64 = 2048
+
 type Retention struct {
-	// StatusHistoryTTL caps how long the per-object status transition
-	// timeline is retained. Volume is tiny (only writes when a summary
-	// actually changes), so a week is cheap.
+	// StatusHistoryTTL caps how long the per-object status transition timeline is
+	// retained. Volume is small — objectsync appends only when an object's status summary
+	// actually changes, not on every write — so a week is cheap.
 	StatusHistoryTTL time.Duration
 	// Interval is the sweep cadence. Too frequent wastes write txns; too
 	// rare lets the DB grow past the intended bound between sweeps.
@@ -70,7 +80,6 @@ func runJanitor(ctx context.Context, id string, writer *sql.DB, ret Retention) {
 
 func sweep(ctx context.Context, id string, writer *sql.DB, ret Retention) {
 	now := time.Now().UnixMilli()
-	var totalDeleted int64
 
 	// status_history: keyed by the transition time `at`.
 	if res, err := writer.ExecContext(ctx,
@@ -80,15 +89,34 @@ func sweep(ctx context.Context, id string, writer *sql.DB, ret Retention) {
 		slog.Warn("janitor: status_history sweep failed", "id", id, "err", err)
 	} else if n, _ := res.RowsAffected(); n > 0 {
 		slog.Debug("janitor: trimmed status_history", "id", id, "rows", n)
-		totalDeleted += n
 	}
 
 	// Hand freed pages back to the OS. With auto_vacuum=INCREMENTAL this only walks
-	// the freelist, not the whole file. Skip it when nothing was deleted to save a
-	// write txn on idle clusters.
-	if totalDeleted > 0 {
-		if _, err := writer.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
-			slog.Warn("janitor: incremental_vacuum failed", "id", id, "err", err)
-		}
+	// the freelist, not the whole file.
+	//
+	// The FREELIST decides, not our own deletions. This sweep trims one small table, while
+	// the writers that actually free pages are elsewhere — an events relist prune, a kind's
+	// Forget, an object delete sweep — and none of them vacuum. Gating on totalDeleted meant
+	// uninstalling a CRD holding 50k objects freed every one of its pages and the file sat
+	// at its high-water mark until some unrelated status_history row happened to age out.
+	// The count is a page-header read, so asking costs nothing on an idle cluster.
+	var freePages int64
+	if err := writer.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&freePages); err != nil {
+		slog.Warn("janitor: freelist_count failed", "id", id, "err", err)
+		return
 	}
+	if freePages == 0 {
+		return
+	}
+	// Bounded, not the whole freelist. The argument-less form reclaims every free page in
+	// ONE statement, holding the cache's single writer for the duration — and the freelist
+	// is largest exactly after the events prune or a CRD's Forget frees tens of thousands
+	// of pages, so the unbounded form stalls every kind's sync at the worst moment. A
+	// backlog just takes a few sweeps.
+	pages := min(freePages, vacuumPagesPerSweep)
+	if _, err := writer.ExecContext(ctx, fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, pages)); err != nil {
+		slog.Warn("janitor: incremental_vacuum failed", "id", id, "err", err)
+		return
+	}
+	slog.Debug("janitor: reclaimed free pages", "id", id, "pages", pages, "remaining", freePages-pages)
 }

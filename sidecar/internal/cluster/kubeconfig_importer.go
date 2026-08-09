@@ -16,8 +16,13 @@ package cluster
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/amorey/beehive"
 	"k8s.io/client-go/tools/clientcmd/api"
@@ -27,10 +32,10 @@ import (
 
 // KubeconfigImporter watches the kubeconfig and is the sole creator of
 // kubeconfig-sourced Cluster beehive objects (one per kube-context). Creation-only:
-// on each snapshot it creates a Cluster — keyed by the deterministic slug
+// on each snapshot it creates a Cluster — keyed by the deterministic name
 // "kubeconfig/{context}" — for every context no Cluster yet references, writing only
 // the source reference (ClusterSpec.Source). It never updates, orphans, or deletes.
-// The deterministic slug means beehive's per-kind slug-uniqueness rules out a
+// The deterministic name means beehive's per-kind name-uniqueness rules out a
 // duplicate even under a concurrent create.
 //
 // Everything observed about the context (cluster/user names, presence, is-current)
@@ -90,6 +95,31 @@ func (im *KubeconfigImporter) Stop() {
 // watcher closes. An import failure is logged but not fatal: the loop stays up
 // and the level-triggered diff re-derives everything on the next snapshot.
 func (im *KubeconfigImporter) run(sub k8shelpers.KubeConfigSubscription) {
+	// The last snapshot, kept so a failed import can be retried against it. Nothing else
+	// would: this loop is driven by kubeconfig CHANGES, and the most common reason an
+	// import is incomplete — a context whose name is still held by a Cluster draining after
+	// a user deleted it — resolves on its own within seconds, with no kubeconfig write
+	// behind it. Without the retry that context stays missing from the app until the user
+	// edits their kubeconfig or restarts.
+	var last *api.Config
+	retry := time.NewTimer(importRetryInterval)
+	retry.Stop()
+	defer retry.Stop()
+
+	reconcile := func() {
+		err := im.ReconcileClusterSet(im.baseCtx, last)
+		switch {
+		case err == nil:
+		case errors.Is(err, errNameHeld):
+			slog.Debug("kubeconfig import incomplete, retrying", "err", err)
+		default:
+			slog.Error("kubeconfig import failed", "err", err)
+		}
+		if err != nil {
+			retry.Reset(importRetryInterval)
+		}
+	}
+
 	for {
 		select {
 		case <-im.baseCtx.Done():
@@ -98,12 +128,25 @@ func (im *KubeconfigImporter) run(sub k8shelpers.KubeConfigSubscription) {
 			if !ok {
 				return
 			}
-			if err := im.ReconcileClusterSet(im.baseCtx, cfg); err != nil {
-				slog.Error("kubeconfig import failed", "err", err)
+			last = cfg
+			reconcile()
+		case <-retry.C:
+			if last != nil {
+				reconcile()
 			}
 		}
 	}
 }
+
+// importRetryInterval paces the retry of an incomplete import. Sized for the case that
+// drives it: a name held by a Cluster whose deletion is draining, which clears as soon as
+// its cache workers stop and GC collects the row.
+const importRetryInterval = 2 * time.Second
+
+// errNameHeld reports that a context could not be imported yet because a Cluster still
+// draining holds its name. Distinct from a real failure: nothing is wrong, the import is
+// simply incomplete, and the caller should try the same snapshot again shortly.
+var errNameHeld = errors.New("a context's name is held by a Cluster still being deleted")
 
 // ReconcileClusterSet aligns the kubeconfig-sourced Cluster beehive objects
 // with one kubeconfig snapshot. It is safe to call at any time, any number of
@@ -130,26 +173,50 @@ func (im *KubeconfigImporter) ReconcileClusterSet(ctx context.Context, cfg *api.
 	// Create a Cluster for any context not yet tracked. Only the source reference
 	// is written; the ClusterCoreController observes presence/names/isDefault from
 	// the live kubeconfig and writes them to status.
+	//
+	// Each context is isolated: one failure must not abandon the rest of the snapshot.
+	// Contexts come out of a map, so an abort would skip an ARBITRARY subset — a set that
+	// changes run to run, which is the worst shape a partial import can have.
+	var errs []error
+	var held []string
 	for name := range cfg.Contexts {
 		if tracked[name] {
 			continue
 		}
-		if err := im.createCluster(ctx, name); err != nil {
-			return err
+		err := im.createCluster(ctx, name)
+		switch {
+		case err == nil:
+		case errors.Is(err, beehive.ErrNameTaken):
+			// The name belongs to a Cluster on its way out — tracked deliberately ignores
+			// deletion-pending objects (so a re-created context gets a fresh record), but
+			// the name is held until GC collects the row.
+			//
+			// Not a failure, but not finished either, and it must not be swallowed: this
+			// loop is driven by kubeconfig CHANGES, so "the next snapshot creates it" can
+			// mean never. A user deleting a cluster produces exactly this — the delete's
+			// drain window — and the context would then be missing from the app until they
+			// edited their kubeconfig or restarted. errNameHeld asks the caller to retry.
+			held = append(held, name)
+		default:
+			errs = append(errs, fmt.Errorf("create cluster for context %q: %w", name, err))
 		}
 	}
-	return nil
+	if len(held) > 0 {
+		slices.Sort(held) // map iteration order; a stable message is a readable log
+		errs = append(errs, fmt.Errorf("%w: %s", errNameHeld, strings.Join(held, ", ")))
+	}
+	return errors.Join(errs...)
 }
 
 // createCluster creates a kubeconfig-sourced Cluster keyed by the deterministic
-// slug "kubeconfig/{context}", writing only the source reference. The slug is the
+// name "kubeconfig/{context}", writing only the source reference. The name is the
 // context's natural key (the importer's reconcile/uniqueness key); the record's
-// identity is the ObjectID beehive assigns, not this slug.
+// identity is the ObjectID beehive assigns, not this name.
 func (im *KubeconfigImporter) createCluster(ctx context.Context, contextName string) error {
-	_, err := im.coreClient.Create(ctx, ClusterSpec{
+	_, err := im.coreClient.Create(ctx, kubeconfigName(contextName), ClusterSpec{
 		SyncEnabled: true,
 		Enabled:     true,
 		Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: contextName}},
-	}, beehive.WithSlug(kubeconfigSlug(contextName)))
+	})
 	return err
 }

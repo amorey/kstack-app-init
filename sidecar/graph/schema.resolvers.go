@@ -22,6 +22,18 @@ func (r *clusterCacheResolver) Stats(ctx context.Context, obj *cluster.ClusterCa
 	return r.ClusterSvc.CacheStats(ctx, obj.ClusterID, obj.ID)
 }
 
+// Stats is the resolver for the stats field — the discovery pass's gauges, sampled from
+// the controller on read rather than read off the object, because they are not stored
+// (the kind's status is empty by design). Null until a pass has run in this process.
+func (r *clusterCacheGVRDiscoveryResolver) Stats(ctx context.Context, obj *cluster.ClusterCacheGVRDiscovery) (*cluster.ClusterCacheGVRDiscoveryStats, error) {
+	return r.ClusterSvc.GVRDiscoveryStats(ctx, obj.ID)
+}
+
+// Stats is the resolver for the stats field.
+func (r *clusterCacheGVRSyncResolver) Stats(ctx context.Context, obj *cluster.ClusterCacheGVRSync) (*cluster.ClusterCacheGVRSyncStats, error) {
+	return r.ClusterSvc.GVRSyncStats(ctx, obj.ID)
+}
+
 // FirstSeen is the resolver for the firstSeen field: the domain carries a value
 // time.Time (kept comparable for the delta-watch diff), so the zero time — a source
 // Event with no timestamp — maps to null on the wire rather than 0001-01-01.
@@ -71,7 +83,8 @@ func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id cluste
 }
 
 // ClusterCacheClear is the resolver for the clusterCacheClear field: delete the
-// on-disk cache and bounce the sync engine (the returned cluster record stays);
+// on-disk cache and restart that cache's sync workers onto the emptied file (the returned
+// cluster record stays);
 // a still-eligible cluster re-syncs from scratch.
 func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id cluster.ObjectID) (*cluster.Cluster, error) {
 	return r.ClusterSvc.ClearCache(ctx, id)
@@ -139,6 +152,15 @@ func (r *queryResolver) ClusterCacheEvents(ctx context.Context, id cluster.Objec
 	return ptrSlice(evs), nil
 }
 
+// ClusterCacheGVRSyncEvents is the resolver for the clusterCacheGVRSyncEvents field.
+func (r *queryResolver) ClusterCacheGVRSyncEvents(ctx context.Context, id cluster.ObjectID, category *string, limit *int) ([]*cluster.Event, error) {
+	evs, err := r.ClusterSvc.ClusterCacheGVRSyncEvents(ctx, id, category, limit)
+	if err != nil {
+		return nil, err
+	}
+	return ptrSlice(evs), nil
+}
+
 // ClusterDataKinds is the resolver for the clusterDataKinds field — one
 // ClusterCache's discovered kind catalog (parent cluster id + cache id).
 // ptrSlice adapts to gqlgen's pointer slice.
@@ -163,92 +185,144 @@ func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
 
 // ClustersWatch is the resolver for the clustersWatch field — the cluster list as
 // a delta watch (Added snapshot, then per-cluster Added/Modified/Deleted). Cache
-// sync status rides clusterCachesWatch, joined client-side. mapStream adapts each
+// sync status rides clusterCachesWatch, joined client-side. ptrStream adapts each
 // value change to the pointer gqlgen wants.
 func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *cluster.ClusterChange, error) {
 	ch, err := r.ClusterSvc.Watch(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterChange) *cluster.ClusterChange { return &c }), nil
+	return ptrStream(ctx, ch), nil
 }
 
 // ClusterCachesWatch is the resolver for the clusterCachesWatch field — cache
 // records as a delta watch parallel to clustersWatch, joined to clusters
-// client-side by clusterID. mapStream adapts each change to a pointer.
+// client-side by clusterID. ptrStream adapts each change to a pointer.
 func (r *subscriptionResolver) ClusterCachesWatch(ctx context.Context) (<-chan *cluster.ClusterCacheChange, error) {
 	ch, err := r.ClusterSvc.WatchCaches(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterCacheChange) *cluster.ClusterCacheChange { return &c }), nil
+	return ptrStream(ctx, ch), nil
+}
+
+// ClusterCacheSyncHealthWatch is the resolver for the clusterCacheSyncHealthWatch field.
+func (r *subscriptionResolver) ClusterCacheSyncHealthWatch(ctx context.Context) (<-chan *cluster.ClusterCacheSyncHealth, error) {
+	ch, err := r.ClusterSvc.WatchCacheSyncHealth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return ptrStream(ctx, ch), nil
+}
+
+// ClusterCacheGVRDiscoveriesWatch is the resolver for the
+// clusterCacheGVRDiscoveriesWatch field — the caches' GVR-discovery records as a delta
+// watch parallel to clusterCachesWatch, joined to caches client-side by cacheID.
+// ptrStream adapts each change to a pointer.
+func (r *subscriptionResolver) ClusterCacheGVRDiscoveriesWatch(ctx context.Context) (<-chan *cluster.ClusterCacheGVRDiscoveryChange, error) {
+	ch, err := r.ClusterSvc.WatchGVRDiscoveries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return ptrStream(ctx, ch), nil
+}
+
+// ClusterCacheGVRSyncsWatch is the resolver for the clusterCacheGVRSyncsWatch field —
+// one cache's per-kind sync records as a delta watch. Cache-scoped, unlike the sibling
+// object watches: there is one record per synced kind.
+func (r *subscriptionResolver) ClusterCacheGVRSyncsWatch(ctx context.Context, cacheID cluster.ObjectID) (<-chan *cluster.ClusterCacheGVRSyncChange, error) {
+	ch, err := r.ClusterSvc.WatchGVRSyncs(ctx, cacheID)
+	if err != nil {
+		return nil, err
+	}
+	return ptrStream(ctx, ch), nil
+}
+
+// ClusterCacheStatsWatch is the resolver for the clusterCacheStatsWatch field — one
+// cache's contents as a live gauge, streamed rather than served as a field on
+// ClusterCache (whose record stops changing once its sync settles).
+func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterCacheStats, error) {
+	ch, err := r.ClusterSvc.ClusterCacheStatsWatch(ctx, id, cacheID)
+	if err != nil {
+		return nil, err
+	}
+	return ptrStream(ctx, ch), nil
 }
 
 // ClusterDataKindsWatch is the resolver for the clusterDataKindsWatch field — one
 // ClusterCache's kind catalog as a delta watch (the live counterpart of
 // clusterDataKinds), so the dashboard nav's kinds + counts track the cluster in
-// real time. mapStream adapts each change to a pointer.
+// real time. ptrStream adapts each change to a pointer.
 func (r *subscriptionResolver) ClusterDataKindsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataKindChange, error) {
 	ch, err := r.ClusterSvc.ClusterDataKindsWatch(ctx, id, cacheID)
 	if err != nil {
 		return nil, err
 	}
-	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterDataKindChange) *cluster.ClusterDataKindChange { return &c }), nil
+	return ptrStream(ctx, ch), nil
 }
 
 // ClusterDataEventsWatch is the resolver for the clusterDataEventsWatch field — one
 // ClusterCache's cached Kubernetes Events as a delta watch, backing the dashboard's
-// events table. mapStream adapts each change to a pointer.
+// events table. ptrStream adapts each change to a pointer.
 func (r *subscriptionResolver) ClusterDataEventsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataEventChange, error) {
 	ch, err := r.ClusterSvc.ClusterDataEventsWatch(ctx, id, cacheID)
 	if err != nil {
 		return nil, err
 	}
-	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterDataEventChange) *cluster.ClusterDataEventChange { return &c }), nil
+	return ptrStream(ctx, ch), nil
 }
 
 // ClusterDataObjectsWatch is the resolver for the clusterDataObjectsWatch field — one
 // kind's cached objects as a delta watch, backing the dashboard's per-kind tables.
-// mapStream adapts each change to a pointer.
+// ptrStream adapts each change to a pointer.
 func (r *subscriptionResolver) ClusterDataObjectsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID, apiVersion string, resource string) (<-chan *cluster.ClusterDataObjectChange, error) {
 	ch, err := r.ClusterSvc.ClusterDataObjectsWatch(ctx, id, cacheID, apiVersion, resource)
 	if err != nil {
 		return nil, err
 	}
-	return mapStream(ctx, ch, func() {}, func(c cluster.ClusterDataObjectChange) *cluster.ClusterDataObjectChange { return &c }), nil
+	return ptrStream(ctx, ch), nil
 }
 
 // ClusterEventsWatch is the resolver for the clusterEventsWatch field — the live
-// event tail for one cluster, decoupled from clustersWatch. mapStream adapts each
+// event tail for one cluster, decoupled from clustersWatch. ptrStream adapts each
 // bare run to a pointer.
 func (r *subscriptionResolver) ClusterEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error) {
 	ch, err := r.ClusterSvc.ClusterEventsWatch(ctx, id, category)
 	if err != nil {
 		return nil, err
 	}
-	return mapStream(ctx, ch, func() {}, func(e cluster.Event) *cluster.Event { return &e }), nil
+	return ptrStream(ctx, ch), nil
 }
 
 // ClusterCacheEventsWatch is the resolver for the clusterCacheEventsWatch field —
 // the live event tail for one ClusterCache, decoupled from clusterCachesWatch.
-// mapStream adapts each bare run to a pointer.
+// ptrStream adapts each bare run to a pointer.
 func (r *subscriptionResolver) ClusterCacheEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error) {
 	ch, err := r.ClusterSvc.ClusterCacheEventsWatch(ctx, id, category)
 	if err != nil {
 		return nil, err
 	}
-	return mapStream(ctx, ch, func() {}, func(e cluster.Event) *cluster.Event { return &e }), nil
+	return ptrStream(ctx, ch), nil
+}
+
+// ClusterCacheGVRSyncEventsWatch is the resolver for the clusterCacheGVRSyncEventsWatch field.
+func (r *subscriptionResolver) ClusterCacheGVRSyncEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error) {
+	ch, err := r.ClusterSvc.ClusterCacheGVRSyncEventsWatch(ctx, id, category)
+	if err != nil {
+		return nil, err
+	}
+	return ptrStream(ctx, ch), nil
 }
 
 // ClusterScheduleWatch is the resolver for the clusterScheduleWatch field — the
 // live reconcile-schedule gauge for one cluster (next-attempt countdown),
-// decoupled from clustersWatch. mapStream adapts each value to a pointer.
+// decoupled from clustersWatch. ptrStream adapts each value to a pointer.
 func (r *subscriptionResolver) ClusterScheduleWatch(ctx context.Context, id cluster.ObjectID) (<-chan *cluster.Schedule, error) {
 	ch, err := r.ClusterSvc.ClusterScheduleWatch(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return mapStream(ctx, ch, func() {}, func(s cluster.Schedule) *cluster.Schedule { return &s }), nil
+	return ptrStream(ctx, ch), nil
 }
 
 // ChatStream is the resolver for the chatStream field.
@@ -266,6 +340,16 @@ func (r *subscriptionResolver) AuthStateWatch(ctx context.Context) (<-chan *auth
 
 // ClusterCache returns ClusterCacheResolver implementation.
 func (r *Resolver) ClusterCache() ClusterCacheResolver { return &clusterCacheResolver{r} }
+
+// ClusterCacheGVRDiscovery returns ClusterCacheGVRDiscoveryResolver implementation.
+func (r *Resolver) ClusterCacheGVRDiscovery() ClusterCacheGVRDiscoveryResolver {
+	return &clusterCacheGVRDiscoveryResolver{r}
+}
+
+// ClusterCacheGVRSync returns ClusterCacheGVRSyncResolver implementation.
+func (r *Resolver) ClusterCacheGVRSync() ClusterCacheGVRSyncResolver {
+	return &clusterCacheGVRSyncResolver{r}
+}
 
 // ClusterDataEvent returns ClusterDataEventResolver implementation.
 func (r *Resolver) ClusterDataEvent() ClusterDataEventResolver { return &clusterDataEventResolver{r} }
@@ -288,6 +372,8 @@ func (r *Resolver) Query() QueryResolver { return &queryResolver{r} }
 func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionResolver{r} }
 
 type clusterCacheResolver struct{ *Resolver }
+type clusterCacheGVRDiscoveryResolver struct{ *Resolver }
+type clusterCacheGVRSyncResolver struct{ *Resolver }
 type clusterDataEventResolver struct{ *Resolver }
 type clusterDataObjectResolver struct{ *Resolver }
 type clusterPrincipalResolver struct{ *Resolver }

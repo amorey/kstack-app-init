@@ -16,6 +16,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strconv"
 	"sync"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/amorey/beehive"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
@@ -101,11 +103,123 @@ func clusterActiveUID(obj *beehive.Object[ClusterSpec, ClusterStatus]) string {
 // cacheIsActive reports whether a ClusterCache mirroring kube-system UID cacheUID
 // is its parent's currently-active identity (cacheUID == the cluster's active UID).
 // A cache for an empty/unknown identity is never active. This is the single
-// definition of "active cache" shared by the cache controller (engine gating) and
+// definition of "active cache" shared by the cache controller (sync gating) and
 // the service (domain join + active-cache resolution).
 func cacheIsActive(clusterObj *beehive.Object[ClusterSpec, ClusterStatus], cacheUID string) bool {
 	active := clusterActiveUID(clusterObj)
 	return active != "" && cacheUID == active
+}
+
+// ownerReader is the one method resolveCacheChain needs of its starting client. Both
+// beehive.Client and beehive.ControllerClient satisfy it, which is what lets the climb
+// start from either a controller's own reconcile client or a plain kind client (the GVR
+// sync starts one hop further down and climbs through its discovery anchor's).
+type ownerReader interface {
+	GetOwner(ctx context.Context, id beehive.ObjectID) (beehive.ObjectRef, bool, error)
+}
+
+// resolveCacheChain climbs a cache sync child's owner chain — the child → its
+// ClusterCache (which names the on-disk cache file) → the Cluster (whose id keys the
+// credentials in the ConnectionManager) — returning the on-disk cache locator and the
+// Cluster's ObjectID. Every child of a ClusterCache needs exactly this, so the climb and
+// its policy live here once rather than in each child's controller.
+//
+// **A zero cluster id with a nil error means the chain is broken** — an owner already
+// collected, which happens while a delete cascades. That is not an error: the caller is
+// being cleaned up too, so it should stop rather than retry.
+func resolveCacheChain(
+	ctx context.Context,
+	client ownerReader,
+	cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus],
+	objID beehive.ObjectID,
+) (store.CacheRef, beehive.ObjectID, error) {
+	cacheRef, ok, err := client.GetOwner(ctx, objID)
+	if err != nil || !ok {
+		return store.CacheRef{}, 0, err
+	}
+	clusterRef, ok, err := cacheClient.GetOwner(ctx, cacheRef.ID)
+	if err != nil {
+		if errors.Is(err, beehive.ErrNotFound) {
+			return store.CacheRef{}, 0, nil
+		}
+		return store.CacheRef{}, 0, err
+	}
+	if !ok {
+		return store.CacheRef{}, 0, nil
+	}
+	return newCacheRef(clusterRef.ID, cacheRef.ID), clusterRef.ID, nil
+}
+
+// reportCondition records a pass's conditions as a controller's whole report — no status
+// write, either because the pass observed nothing to store (a paused child, one waiting on
+// credentials, a failed probe) or because the kind keeps its gauges out of status
+// entirely. Variadic because a pass may report on several axes at once, and they must land
+// together.
+//
+// **It settles the generation explicitly**, which is the whole reason this is a helper: a
+// condition write does not advance beehive's handshake, so without the SetObservedGeneration
+// the object would sit unsettled and be re-enqueued by the owed pass forever. The two writes
+// land in one transaction so a watcher never sees half a pass, and folding into the object's
+// existing conditions keeps LastTransitionTime — and writes nothing at all — when the state
+// is unchanged, which is what makes a steady-state pass free.
+// maxMessageLen caps a message this package persists — on a condition or on an event run.
+// Both are read back on every frame of a whole-fleet watch, and their sources are
+// unbounded: a raw client-go error, or the body of a /readyz?verbose=true response, which
+// lists every check and routinely runs to kilobytes.
+const maxMessageLen = 200
+
+// truncateMessage caps s at maxMessageLen bytes, appending an ellipsis when it overflows.
+// (Byte-bounded; error strings are effectively ASCII.)
+func truncateMessage(s string) string {
+	if len(s) <= maxMessageLen {
+		return s
+	}
+	return s[:maxMessageLen] + "…"
+}
+
+func reportCondition[Status any](
+	ctx context.Context,
+	client beehive.ControllerClient[Status],
+	objID beehive.ObjectID,
+	generation int64,
+	conds ...Condition,
+) error {
+	// No truncation here: liveCondition caps every condition this package builds, which is
+	// what also covers the controllers that write conditions through SetConditions directly.
+	return client.Within(ctx, func(ctx context.Context) error {
+		if err := client.SetConditions(ctx, objID, conds); err != nil {
+			return err
+		}
+		return client.SetObservedGeneration(ctx, objID, generation)
+	})
+}
+
+// ownerObjectID reads an object's owner id off its eager-loaded owner edge, or 0 when it
+// has none. Best-effort by design: a hard-deleted child has no edge, but by then the
+// client has already dropped it on the soft-delete → Deleted change, so a zero id on the
+// trailing hard Deleted is harmless — consumers key removal on the object's own id.
+//
+// It reads the edge the watch loaded with WithLoads(LoadOwner()), which beehive resolves
+// once per batch. A per-object GetOwner here would be an N+1 against an edge written at
+// creation and never rewritten, re-run for every frame and every subscriber — which is
+// why every domain builder goes through this rather than calling the client.
+func ownerObjectID[Spec, Status any](obj *beehive.Object[Spec, Status]) ObjectID {
+	owner, ok, err := obj.Owner()
+	if err != nil || !ok {
+		return 0
+	}
+	return ObjectID(owner.ID)
+}
+
+// derefOrZero returns *p, or the zero value when p is nil. beehive leaves Status nil until
+// a controller first writes it, while the domain records serve status by value — an absent
+// status and a zeroed one are the same statement to a consumer.
+func derefOrZero[T any](p *T) T {
+	if p == nil {
+		var zero T
+		return zero
+	}
+	return *p
 }
 
 // ResolveRESTConfig materializes client credentials for one kube-context.
@@ -117,9 +231,9 @@ func ResolveRESTConfig(cfg *api.Config, contextName string) (*rest.Config, error
 
 // pokeSubscription runs a handler on every poke-bus signal until stopped. It owns the
 // subscription, the worker goroutine, and a base context cancelled on stop (so a
-// long-running handler is interrupted). The cache controller uses it (StartPoke/
-// StopPoke); the core controller folds the poke bus into its own multi-source worker
-// instead, so it doesn't.
+// long-running handler is interrupted). The per-kind sync controller uses it (StartPoke/
+// StopPoke) to restart its live workers; the core controller folds the poke bus into its
+// own multi-source worker instead, so it doesn't.
 type pokeSubscription struct {
 	cancel func()
 	wg     sync.WaitGroup

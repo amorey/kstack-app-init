@@ -18,7 +18,7 @@ import (
 // services.
 type Resolver struct {
 	// ClusterSvc is the boundary to the cluster backend: every cluster query,
-	// mutation, and subscription delegates to it. It hides beehive (slugs, the
+	// mutation, and subscription delegates to it. It hides beehive (names, the
 	// Cluster → ClusterCache owner chain, the spec/status split, the
 	// cache-status join, the watch merge) behind the domain Cluster type.
 	// (Named ClusterSvc, not Clusters, to avoid shadowing the generated

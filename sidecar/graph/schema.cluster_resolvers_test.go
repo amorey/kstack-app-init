@@ -27,10 +27,22 @@ import (
 // clusterFixture bundles all data for one test cluster record. id is the beehive
 // ObjectID; on the wire it is its decimal string ("1", "2", …).
 type clusterFixture struct {
-	id          cluster.ClusterID
-	spec        cluster.ClusterSpec
-	connStatus  cluster.ClusterStatus
-	cacheStatus cluster.ClusterCacheStatus
+	id         cluster.ClusterID
+	spec       cluster.ClusterSpec
+	connStatus cluster.ClusterStatus
+	// syncStats/syncConds belong to the fixture's per-kind sync child. Like the discovery
+	// gauges below, the stamps are NOT on the record — they are sampled from the
+	// controller through GVRSyncStats — so the fake serves them from here.
+	syncStats *cluster.ClusterCacheGVRSyncStats
+	// discStats/discConds belong to the fixture's GVR-discovery child. The gauges are NOT
+	// on the record — they are sampled from the controller through GVRDiscoveryStats — so
+	// the fake serves them from here to exercise that resolver path.
+	discStats *cluster.ClusterCacheGVRDiscoveryStats
+	// Conditions are beehive object rows now, not part of either status block.
+	connConds  []cluster.Condition
+	cacheConds []cluster.Condition
+	syncConds  []cluster.Condition
+	discConds  []cluster.Condition
 }
 
 // fakeClusterService implements cluster.ClusterService over an in-memory map
@@ -41,7 +53,13 @@ type fakeClusterService struct {
 	mu          sync.Mutex
 	order       []cluster.ClusterID
 	clusters    map[cluster.ClusterID]*cluster.Cluster
-	caches      []cluster.ClusterCache                            // one active cache per fixture, streamed via WatchCaches
+	caches      []cluster.ClusterCache             // one active cache per fixture, streamed via WatchCaches
+	discoveries []cluster.ClusterCacheGVRDiscovery // one GVR-discovery child per cache, streamed via WatchGVRDiscoveries
+	gvrSyncs    []cluster.ClusterCacheGVRSync      // per-kind sync records, streamed cache-scoped via WatchGVRSyncs
+	gvrStats    map[cluster.ClusterCacheGVRSyncID]*cluster.ClusterCacheGVRSyncStats
+	cacheStats  map[cluster.ClusterCacheID]cluster.ClusterCacheStats
+	discStats   map[cluster.ClusterCacheGVRDiscoveryID]*cluster.ClusterCacheGVRDiscoveryStats
+	syncEvents  map[cluster.ClusterCacheGVRSyncID][]cluster.Event
 	events      map[cluster.ClusterID][]cluster.Event             // connection-event history, keyed by ClusterID
 	cacheEvents map[cluster.ClusterCacheID][]cluster.Event        // sync-event history, keyed by ClusterCacheID
 	kinds       map[cluster.ClusterID][]cluster.ClusterDataKind   // discovered kind catalog, keyed by ClusterID
@@ -53,26 +71,56 @@ var _ cluster.ClusterService = (*fakeClusterService)(nil)
 
 func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 	f := &fakeClusterService{
-		clusters: map[cluster.ClusterID]*cluster.Cluster{},
-		events:   map[cluster.ClusterID][]cluster.Event{},
+		clusters:   map[cluster.ClusterID]*cluster.Cluster{},
+		events:     map[cluster.ClusterID][]cluster.Event{},
+		discStats:  map[cluster.ClusterCacheGVRDiscoveryID]*cluster.ClusterCacheGVRDiscoveryStats{},
+		gvrStats:   map[cluster.ClusterCacheGVRSyncID]*cluster.ClusterCacheGVRSyncStats{},
+		cacheStats: map[cluster.ClusterCacheID]cluster.ClusterCacheStats{},
 	}
 	for _, fx := range fixtures {
 		id := fx.id
 		f.order = append(f.order, id)
 		f.clusters[id] = &cluster.Cluster{
-			ID:     id,
-			Spec:   fx.spec,
-			Status: fx.connStatus,
+			ID:         id,
+			Spec:       fx.spec,
+			Status:     fx.connStatus,
+			Conditions: fx.connConds,
 		}
 		// Caches stream standalone via WatchCaches and are joined client-side.
 		// Give each fixture one cache whose ServerUID matches the cluster's
 		// identity (the client's active-cache rule).
 		f.caches = append(f.caches, cluster.ClusterCache{
-			ID:        cluster.ClusterCacheID(id),
-			ClusterID: id,
-			ServerUID: "uid-" + strconv.FormatInt(int64(id), 10),
-			Status:    fx.cacheStatus,
+			ID:         cluster.ClusterCacheID(id),
+			ClusterID:  id,
+			ServerUID:  "uid-" + strconv.FormatInt(int64(id), 10),
+			Conditions: fx.cacheConds,
 		})
+		// Each cache gets one per-kind sync child, keyed off the same id — the fixture's
+		// per-component sync state.
+		f.gvrStats[cluster.ClusterCacheGVRSyncID(id)] = fx.syncStats
+		// …and its GVR-discovery child, the anchor the per-kind syncs hang off.
+		f.discoveries = append(f.discoveries, cluster.ClusterCacheGVRDiscovery{
+			ID:         cluster.ClusterCacheGVRDiscoveryID(id),
+			CacheID:    cluster.ClusterCacheID(id),
+			Spec:       cluster.ClusterCacheGVRDiscoverySpec{Enabled: fx.spec.SyncEnabled},
+			Conditions: fx.discConds,
+		})
+		f.discStats[cluster.ClusterCacheGVRDiscoveryID(id)] = fx.discStats
+		// …and one per-kind sync record under that anchor, so the cache-scoped watch has
+		// something to scope. Deliberately one per cache so a leak across caches is
+		// visible as an extra frame.
+		f.gvrSyncs = append(f.gvrSyncs, cluster.ClusterCacheGVRSync{
+			ID:          cluster.ClusterCacheGVRSyncID(id),
+			DiscoveryID: cluster.ClusterCacheGVRDiscoveryID(id),
+			Spec: cluster.ClusterCacheGVRSyncSpec{
+				Enabled: fx.spec.SyncEnabled, APIVersion: "apps/v1",
+				Kind: "Deployment", Resource: "deployments", Namespaced: true,
+			},
+			Conditions: fx.syncConds,
+		})
+		f.cacheStats[cluster.ClusterCacheID(id)] = cluster.ClusterCacheStats{
+			Exists: true, Bytes: 4096, ObjectCount: 1386, KindCount: 62,
+		}
 	}
 	return f
 }
@@ -111,31 +159,152 @@ func (f *fakeClusterService) Get(_ context.Context, id cluster.ClusterID) (*clus
 	return &cp, nil
 }
 
-func (f *fakeClusterService) Watch(ctx context.Context) (<-chan cluster.ClusterChange, error) {
-	snap := f.snapshot()
-	ch := make(chan cluster.ClusterChange, len(snap))
-	for _, c := range snap {
-		ch <- cluster.ClusterChange{Type: cluster.ChangeAdded, Cluster: c}
+// snapshotChan models every object watch the service exposes: replay the current set as
+// Added changes, then hold the stream open until ctx ends (a real WatchList never
+// completes on its own, and several tests assert exactly that). Each watch differs only
+// in how it wraps an item into its Change struct.
+func snapshotChan[T, C any](ctx context.Context, items []T, wrap func(*T) C) <-chan C {
+	ch := make(chan C, len(items))
+	for i := range items {
+		item := items[i]
+		ch <- wrap(&item)
 	}
 	go func() {
 		<-ctx.Done()
 		close(ch)
 	}()
-	return ch, nil
+	return ch
+}
+
+// copySlice returns a copy of src taken under the fake's lock, so a watch's replay can't
+// race a concurrent mutation of the fixture.
+func copySlice[T any](f *fakeClusterService, src *[]T) []T {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]T(nil), *src...)
+}
+
+func (f *fakeClusterService) Watch(ctx context.Context) (<-chan cluster.ClusterChange, error) {
+	return snapshotChan(ctx, f.snapshot(), func(c **cluster.Cluster) cluster.ClusterChange {
+		return cluster.ClusterChange{Type: cluster.ChangeAdded, Cluster: *c}
+	}), nil
 }
 
 func (f *fakeClusterService) WatchCaches(ctx context.Context) (<-chan cluster.ClusterCacheChange, error) {
-	snap := f.cacheSnapshot()
-	ch := make(chan cluster.ClusterCacheChange, len(snap))
-	for i := range snap {
-		cc := snap[i]
-		ch <- cluster.ClusterCacheChange{Type: cluster.ChangeAdded, Cache: &cc}
+	return snapshotChan(ctx, f.cacheSnapshot(), func(c *cluster.ClusterCache) cluster.ClusterCacheChange {
+		return cluster.ClusterCacheChange{Type: cluster.ChangeAdded, Cache: c}
+	}), nil
+}
+
+func (f *fakeClusterService) WatchGVRDiscoveries(ctx context.Context) (<-chan cluster.ClusterCacheGVRDiscoveryChange, error) {
+	return snapshotChan(ctx, copySlice(f, &f.discoveries), func(d *cluster.ClusterCacheGVRDiscovery) cluster.ClusterCacheGVRDiscoveryChange {
+		return cluster.ClusterCacheGVRDiscoveryChange{Type: cluster.ChangeAdded, Discovery: d}
+	}), nil
+}
+
+// WatchCacheSyncHealth folds the fixture's per-kind records per cache, the same way the
+// real service does — enough to prove the wire shape and the join key.
+func (f *fakeClusterService) WatchCacheSyncHealth(ctx context.Context) (<-chan cluster.ClusterCacheSyncHealth, error) {
+	f.mu.Lock()
+	cacheOf := map[cluster.ClusterCacheGVRDiscoveryID]cluster.ClusterCacheID{}
+	for i := range f.discoveries {
+		cacheOf[f.discoveries[i].ID] = f.discoveries[i].CacheID
+	}
+	byCache := map[cluster.ClusterCacheID]*cluster.ClusterCacheSyncHealth{}
+	for i := range f.gvrSyncs {
+		cacheID := cacheOf[f.gvrSyncs[i].DiscoveryID]
+		h := byCache[cacheID]
+		if h == nil {
+			h = &cluster.ClusterCacheSyncHealth{CacheID: cacheID, Status: cluster.ConditionTrue, Reason: "Watching"}
+			byCache[cacheID] = h
+		}
+		h.TotalKinds++
+		for _, c := range f.gvrSyncs[i].Conditions {
+			if c.Type == string(cluster.ConditionSynced) && c.Reason != "Watching" {
+				h.Status, h.Reason = c.Status, c.Reason
+				h.UnhealthyKindRefs = append(h.UnhealthyKindRefs, cluster.SyncedKindRef{
+					APIVersion: f.gvrSyncs[i].Spec.APIVersion,
+					Resource:   f.gvrSyncs[i].Spec.Resource,
+				})
+				h.UnhealthyKinds++
+			}
+		}
+	}
+	f.mu.Unlock()
+	out := make(chan cluster.ClusterCacheSyncHealth, len(byCache)+1)
+	for _, h := range byCache {
+		out <- *h
 	}
 	go func() {
 		<-ctx.Done()
-		close(ch)
+		close(out)
 	}()
-	return ch, nil
+	return out, nil
+}
+
+// WatchGVRSyncs serves only the records whose discovery anchor matches the requested
+// cache's, standing in for the real service's owner-edge filter.
+func (f *fakeClusterService) WatchGVRSyncs(ctx context.Context, cacheID cluster.ClusterCacheID) (<-chan cluster.ClusterCacheGVRSyncChange, error) {
+	f.mu.Lock()
+	var want cluster.ClusterCacheGVRDiscoveryID
+	for i := range f.discoveries {
+		if f.discoveries[i].CacheID == cacheID {
+			want = f.discoveries[i].ID
+		}
+	}
+	var scoped []cluster.ClusterCacheGVRSync
+	for i := range f.gvrSyncs {
+		if f.gvrSyncs[i].DiscoveryID == want {
+			scoped = append(scoped, f.gvrSyncs[i])
+		}
+	}
+	f.mu.Unlock()
+	return snapshotChan(ctx, scoped, func(gs *cluster.ClusterCacheGVRSync) cluster.ClusterCacheGVRSyncChange {
+		return cluster.ClusterCacheGVRSyncChange{Type: cluster.ChangeAdded, Sync: gs}
+	}), nil
+}
+
+// ClusterCacheStatsWatch emits the fixture's single measurement and then holds the
+// stream open, as a gauge with nothing new to report does.
+func (f *fakeClusterService) ClusterCacheStatsWatch(ctx context.Context, _ cluster.ClusterID, cacheID cluster.ClusterCacheID) (<-chan cluster.ClusterCacheStats, error) {
+	f.mu.Lock()
+	st := f.cacheStats[cacheID]
+	f.mu.Unlock()
+	out := make(chan cluster.ClusterCacheStats, 1)
+	out <- st
+	go func() {
+		<-ctx.Done()
+		close(out)
+	}()
+	return out, nil
+}
+
+// GVRSyncStatsSnapshot is the whole-map read the rollup folds.
+func (f *fakeClusterService) GVRSyncStatsSnapshot() map[cluster.ClusterCacheGVRSyncID]cluster.ClusterCacheGVRSyncStats {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[cluster.ClusterCacheGVRSyncID]cluster.ClusterCacheGVRSyncStats{}
+	for id, st := range f.gvrStats {
+		if st != nil {
+			out[id] = *st
+		}
+	}
+	return out
+}
+
+// GVRSyncStats stands in for the per-kind controller's in-memory stamps.
+func (f *fakeClusterService) GVRSyncStats(_ context.Context, id cluster.ClusterCacheGVRSyncID) (*cluster.ClusterCacheGVRSyncStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gvrStats[id], nil
+}
+
+// GVRDiscoveryStats stands in for the controller's in-memory gauges: a record the
+// fixture gave no stats to reads as nil, the "no pass in this process yet" case.
+func (f *fakeClusterService) GVRDiscoveryStats(_ context.Context, id cluster.ClusterCacheGVRDiscoveryID) (*cluster.ClusterCacheGVRDiscoveryStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.discStats[id], nil
 }
 
 func (f *fakeClusterService) CacheStats(context.Context, cluster.ClusterID, cluster.ClusterCacheID) (*cluster.ClusterCacheStats, error) {
@@ -223,6 +392,21 @@ func (f *fakeClusterService) ClusterCacheEventsWatch(ctx context.Context, _ clus
 	return ch, nil
 }
 
+func (f *fakeClusterService) ClusterCacheGVRSyncEvents(_ context.Context, id cluster.ClusterCacheGVRSyncID, _ *string, _ *int) ([]cluster.Event, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.syncEvents[id], nil
+}
+
+func (f *fakeClusterService) ClusterCacheGVRSyncEventsWatch(ctx context.Context, _ cluster.ClusterCacheGVRSyncID, _ *string) (<-chan cluster.Event, error) {
+	ch := make(chan cluster.Event)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
+
 func (f *fakeClusterService) ClusterScheduleWatch(ctx context.Context, _ cluster.ClusterID) (<-chan cluster.Schedule, error) {
 	ch := make(chan cluster.Schedule)
 	go func() {
@@ -295,6 +479,7 @@ func clusterFixtures() []clusterFixture {
 	uid1 := "uid-1"
 	ver := "v1.29.3"
 	admin := "system:admin"
+	discoveredAt := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
 	return []clusterFixture{
 		{
 			id: 1,
@@ -311,6 +496,10 @@ func clusterFixtures() []clusterFixture {
 				}},
 				Server:    cluster.ClusterServer{UID: &uid1, Version: &ver},
 				Principal: cluster.ClusterPrincipal{Username: &admin},
+			},
+			discStats: &cluster.ClusterCacheGVRDiscoveryStats{LastDiscoveryAt: discoveredAt, ResourceCount: 42},
+			discConds: []cluster.Condition{
+				{Type: "Discovered", Status: cluster.ConditionTrue, Reason: "Discovered", Liveness: true},
 			},
 		},
 		{
@@ -713,53 +902,87 @@ func TestClusterDataKindsWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
 	}
 }
 
-// clusterCacheEvents is the ClusterCache-kind counterpart of clusterEvents: it
-// reads the cache's own event timeline (category "sync") keyed by the cache id and
-// maps the domain Events onto the same generic wire Event shape.
-func TestClusterCacheEventsResolver(t *testing.T) {
-	fix := clusterFixtures()
-	svc := newFakeClusterService(fix)
-	cacheID := cluster.ClusterCacheID(fix[0].id)
+// The two cache-side event timelines are the same generic reader keyed by a different
+// object: `clusterCacheEvents` reads the ClusterCache's own timeline (what the cache
+// layer records, e.g. SyncStopped), `clusterCacheGVRSyncEvents` one synced kind's
+// record's (where each worker report lands). One table because the wire mapping under
+// test — domain Event → the generic Event shape, enum included — is identical; only the
+// entrypoint and the object it keys on differ.
+func TestCacheEventTimelineResolvers(t *testing.T) {
 	now := time.Now().UTC()
-	svc.cacheEvents = map[cluster.ClusterCacheID][]cluster.Event{cacheID: {{
-		ID: cluster.ObjectID(cacheID), Category: "sync", Type: beehive.EventWarning,
-		Reason: "SyncFailed", Message: "boom", Count: 2, FirstAt: now, LastAt: now,
-	}}}
-	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{
-		ClusterSvc: svc, Auth: newFakeAuth(auth.Identity{}),
-	}))
-	t.Cleanup(srv.Close)
+	tests := []struct {
+		name     string
+		field    string
+		seed     func(*fakeClusterService, cluster.ObjectID, cluster.Event)
+		event    cluster.Event
+		wantEnum string
+	}{{
+		name:  "cache timeline",
+		field: "clusterCacheEvents",
+		seed: func(f *fakeClusterService, id cluster.ObjectID, ev cluster.Event) {
+			f.cacheEvents = map[cluster.ClusterCacheID][]cluster.Event{id: {ev}}
+		},
+		event: cluster.Event{
+			Category: "sync", Type: beehive.EventWarning, Reason: "SyncFailed",
+			Message: "boom", Count: 2, FirstAt: now, LastAt: now,
+		},
+		wantEnum: "Warning",
+	}, {
+		name:  "per-kind sync timeline",
+		field: "clusterCacheGVRSyncEvents",
+		seed: func(f *fakeClusterService, id cluster.ObjectID, ev cluster.Event) {
+			f.syncEvents = map[cluster.ClusterCacheGVRSyncID][]cluster.Event{id: {ev}}
+		},
+		event: cluster.Event{
+			Category: "sync", Type: beehive.EventNormal, Reason: "SyncComplete",
+			Message: "cached 12 events", Count: 2, FirstAt: now, LastAt: now,
+		},
+		wantEnum: "Normal",
+	}}
 
-	query := `{ clusterCacheEvents(id: "` + strconv.FormatInt(int64(cacheID), 10) + `", category: "sync") {
-		id category type reason message count firstAt lastAt
-	} }`
-	body, _ := json.Marshal(map[string]string{"query": query})
-	raw := postGQL(t, srv.URL, string(body))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fix := clusterFixtures()
+			svc := newFakeClusterService(fix)
+			id := cluster.ObjectID(fix[0].id)
+			ev := tt.event
+			ev.ID = id
+			tt.seed(svc, id, ev)
+			srv := httptest.NewServer(graph.NewServer(&graph.Resolver{
+				ClusterSvc: svc, Auth: newFakeAuth(auth.Identity{}),
+			}))
+			t.Cleanup(srv.Close)
 
-	var resp struct {
-		Data struct {
-			ClusterCacheEvents []map[string]any `json:"clusterCacheEvents"`
-		}
-		Errors []struct{ Message string }
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		t.Fatalf("decode %s: %v", raw, err)
-	}
-	if len(resp.Errors) > 0 {
-		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
-	}
-	if len(resp.Data.ClusterCacheEvents) != 1 {
-		t.Fatalf("want 1 event, got %d: %s", len(resp.Data.ClusterCacheEvents), raw)
-	}
-	ev := resp.Data.ClusterCacheEvents[0]
-	if ev["type"] != "Warning" {
-		t.Errorf("type: want Warning enum, got %v", ev["type"])
-	}
-	if ev["reason"] != "SyncFailed" || ev["category"] != "sync" {
-		t.Errorf("reason/category: %v", ev)
-	}
-	if ev["count"] != float64(2) {
-		t.Errorf("count: want 2, got %v", ev["count"])
+			query := `{ ` + tt.field + `(id: "` + strconv.FormatInt(int64(id), 10) + `", category: "sync") {
+				id category type reason message count firstAt lastAt
+			} }`
+			body, _ := json.Marshal(map[string]string{"query": query})
+			raw := postGQL(t, srv.URL, string(body))
+
+			var resp struct {
+				Data   map[string][]map[string]any
+				Errors []struct{ Message string }
+			}
+			if err := json.Unmarshal(raw, &resp); err != nil {
+				t.Fatalf("decode %s: %v", raw, err)
+			}
+			if len(resp.Errors) > 0 {
+				t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
+			}
+			got := resp.Data[tt.field]
+			if len(got) != 1 {
+				t.Fatalf("want 1 event, got %d: %s", len(got), raw)
+			}
+			if got[0]["type"] != tt.wantEnum {
+				t.Errorf("type: want %s enum, got %v", tt.wantEnum, got[0]["type"])
+			}
+			if got[0]["reason"] != tt.event.Reason || got[0]["category"] != "sync" {
+				t.Errorf("reason/category: %v", got[0])
+			}
+			if got[0]["count"] != float64(2) {
+				t.Errorf("count: want 2, got %v", got[0]["count"])
+			}
+		})
 	}
 }
 
@@ -839,6 +1062,69 @@ func TestClustersWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
 	}
 }
 
+// The GVR-discovery stream serves the record's identity + Discovered condition, keyed to
+// its cache by cacheID — the join the client makes — plus `stats`, which is resolved on
+// read from the controller rather than carried on the record. Asserted on the wire
+// because a resolver that isn't wired returns null rather than failing.
+func TestClusterCacheGVRDiscoveriesWatchServesRecord(t *testing.T) {
+	srv := newTestServer(t, clusterFixtures())
+
+	resp := openSSESubscription(t, srv.URL, "",
+		`subscription { clusterCacheGVRDiscoveriesWatch { type discovery { id cacheID `+
+			`stats { lastDiscoveryAt resourceCount } conditions { type status reason } } } }`)
+	defer resp.Body.Close()
+	events := sseEvents(t, resp)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		var frame struct {
+			Data struct {
+				Watch struct {
+					Type      string         `json:"type"`
+					Discovery map[string]any `json:"discovery"`
+				} `json:"clusterCacheGVRDiscoveriesWatch"`
+			} `json:"data"`
+		}
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("stream closed before a frame arrived")
+			}
+			if ev.event != "next" {
+				continue
+			}
+			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
+				t.Fatalf("decode discovery frame %s: %v", ev.data, err)
+			}
+			d := frame.Data.Watch.Discovery
+			if d["cacheID"] != "1" {
+				continue // fixture 2's record; it carries no discovery status
+			}
+			if frame.Data.Watch.Type != "Added" {
+				t.Fatalf("snapshot change should be Added, got %q", frame.Data.Watch.Type)
+			}
+			stats, _ := d["stats"].(map[string]any)
+			if got := stats["resourceCount"]; got != float64(42) {
+				t.Errorf("resourceCount = %v, want 42", got)
+			}
+			if got := stats["lastDiscoveryAt"]; got != "2026-02-03T04:05:06Z" {
+				t.Errorf("lastDiscoveryAt = %v", got)
+			}
+			conds, _ := d["conditions"].([]any)
+			if len(conds) != 1 {
+				t.Fatalf("conditions = %v, want the Discovered row", conds)
+			}
+			cond, _ := conds[0].(map[string]any)
+			if cond["type"] != "Discovered" || cond["reason"] != "Discovered" || cond["status"] != "True" {
+				t.Errorf("condition = %v, want a True/Discovered row", cond)
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for cluster 1's discovery frame")
+		}
+	}
+}
+
 // firstCacheFrame opens clusterCachesWatch and returns the `cache` payload of the
 // first Added frame for cluster "1", decoded to a generic map — the cache-side
 // analogue of clustersQueryData, used by the wire-shape tests; cache status is
@@ -847,7 +1133,7 @@ func firstCacheFrame(t *testing.T, srvURL string) map[string]any {
 	t.Helper()
 	resp := openSSESubscription(t, srvURL, "",
 		`subscription { clusterCachesWatch { type cache { id clusterID serverUid `+
-			`status { conditions { type status reason } lastSyncedAt } `+
+			`conditions { type status reason } `+
 			`stats { exists bytes objectCount kindCount } } } }`)
 	t.Cleanup(func() { resp.Body.Close() })
 	events := sseEvents(t, resp)
@@ -945,14 +1231,12 @@ func TestClusterEphemeralFields(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	// The cluster's own conditions are an empty list (never null).
-	body, _ := json.Marshal(map[string]string{"query": `{ cluster(id: 1) { status { conditions { type status reason } } } }`})
+	body, _ := json.Marshal(map[string]string{"query": `{ cluster(id: 1) { conditions { type status reason } } }`})
 	raw := postGQL(t, srv.URL, string(body))
 	var resp struct {
 		Data struct {
 			Cluster struct {
-				Status struct {
-					Conditions []any `json:"conditions"`
-				} `json:"status"`
+				Conditions []any `json:"conditions"`
 			} `json:"cluster"`
 		} `json:"data"`
 		Errors []struct{ Message string } `json:"errors"`
@@ -963,21 +1247,18 @@ func TestClusterEphemeralFields(t *testing.T) {
 	if len(resp.Errors) > 0 {
 		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
 	}
-	if resp.Data.Cluster.Status.Conditions == nil || len(resp.Data.Cluster.Status.Conditions) != 0 {
-		t.Errorf("conditions should be an empty list, got: %v", resp.Data.Cluster.Status.Conditions)
+	if resp.Data.Cluster.Conditions == nil || len(resp.Data.Cluster.Conditions) != 0 {
+		t.Errorf("conditions should be an empty list, got: %v", resp.Data.Cluster.Conditions)
 	}
 
-	// The cache resolves its status + on-disk stats on a bare fixture.
+	// The cache resolves its conditions + on-disk stats on a bare fixture. It has no status
+	// block: the kind measures nothing itself.
 	cache := firstCacheFrame(t, srv.URL)
 	if cache["serverUid"] != "uid-1" || cache["clusterID"] != "1" {
 		t.Errorf("cache identity: %v", cache)
 	}
-	cacheStatus := cache["status"].(map[string]any)
-	if conds, ok := cacheStatus["conditions"].([]any); !ok || len(conds) != 0 {
-		t.Errorf("sync conditions should be an empty list, got: %v", cacheStatus["conditions"])
-	}
-	if at := cacheStatus["lastSyncedAt"]; at != nil {
-		t.Errorf("never-synced lastSyncedAt should be null, got: %v", at)
+	if conds, ok := cache["conditions"].([]any); !ok || len(conds) != 0 {
+		t.Errorf("sync conditions should be an empty list, got: %v", cache["conditions"])
 	}
 	stats := cache["stats"].(map[string]any)
 	if stats["exists"] != false || stats["bytes"] != float64(0) {
@@ -988,46 +1269,43 @@ func TestClusterEphemeralFields(t *testing.T) {
 	}
 }
 
-// Live conditions (cluster + sync blocks) reach the wire with the correct
-// GraphQL shapes — type/status/reason/message/observedGeneration/timestamps.
+// Live conditions (cluster + cache) reach the wire with the correct GraphQL shapes —
+// type/status/reason/message/liveness/timestamps. Conditions sit beside status, not
+// inside it, since beehive stores them as their own object rows.
 func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 	at := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
 	fixtures := clusterFixtures()
-	fixtures[0].connStatus.Conditions = []cluster.Condition{{
-		Type: cluster.ConditionConnected, Status: cluster.ConditionFalse,
+	fixtures[0].connConds = []cluster.Condition{{
+		Type: string(cluster.ConditionConnected), Status: cluster.ConditionFalse,
 		Reason: "ProbeFailed", Message: "connection refused",
-		ObservedGeneration: 2, LastTransitionTime: at,
+		Liveness: true, TransitionedAt: at, UpdatedAt: at,
 	}}
-	fixtures[0].cacheStatus = cluster.ClusterCacheStatus{
-		Conditions: []cluster.Condition{{
-			Type: cluster.ConditionSynced, Status: cluster.ConditionTrue,
-			Reason: "Watching", LastTransitionTime: at,
-		}},
-		LastSyncedAt: &at,
-	}
+	fixtures[0].cacheConds = []cluster.Condition{{
+		Type: string(cluster.ConditionSynced), Status: cluster.ConditionTrue,
+		Reason: "Watching", Liveness: true, TransitionedAt: at, UpdatedAt: at,
+	}}
 
 	srv := newTestServer(t, fixtures)
 
 	// The cluster's own conditions ride the cluster query.
 	body, _ := json.Marshal(map[string]string{"query": `{ cluster(id: 1) {
-		status { conditions { type status reason message observedGeneration lastTransitionTime } }
+		conditions { type status reason message liveness transitionedAt updatedAt }
 	} }`})
 	raw := postGQL(t, srv.URL, string(body))
 
 	type wireCondition struct {
-		Type               string  `json:"type"`
-		Status             string  `json:"status"`
-		Reason             string  `json:"reason"`
-		Message            string  `json:"message"`
-		ObservedGeneration int     `json:"observedGeneration"`
-		LastTransitionTime *string `json:"lastTransitionTime"`
+		Type           string  `json:"type"`
+		Status         string  `json:"status"`
+		Reason         string  `json:"reason"`
+		Message        string  `json:"message"`
+		Liveness       bool    `json:"liveness"`
+		TransitionedAt *string `json:"transitionedAt"`
+		UpdatedAt      *string `json:"updatedAt"`
 	}
 	var resp struct {
 		Data struct {
 			Cluster struct {
-				Status struct {
-					Conditions []wireCondition `json:"conditions"`
-				} `json:"status"`
+				Conditions []wireCondition `json:"conditions"`
 			} `json:"cluster"`
 		} `json:"data"`
 		Errors []struct{ Message string } `json:"errors"`
@@ -1039,29 +1317,26 @@ func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
 	}
 
-	conds := resp.Data.Cluster.Status.Conditions
+	conds := resp.Data.Cluster.Conditions
 	if len(conds) != 1 {
 		t.Fatalf("conditions: %+v", conds)
 	}
 	if conds[0].Type != "Connected" || conds[0].Status != "False" ||
 		conds[0].Reason != "ProbeFailed" || conds[0].Message != "connection refused" ||
-		conds[0].ObservedGeneration != 2 || conds[0].LastTransitionTime == nil {
+		!conds[0].Liveness || conds[0].TransitionedAt == nil || conds[0].UpdatedAt == nil {
 		t.Errorf("Connected condition on the wire: %+v", conds[0])
 	}
 
-	// The cache's Synced condition + freshness + stats ride clusterCachesWatch.
+	// The cache's coarse Synced condition + stats ride clusterCachesWatch. Freshness does
+	// not: the sync children report it, out of band from the object graph.
 	cache := firstCacheFrame(t, srv.URL)
-	cacheStatus := cache["status"].(map[string]any)
-	syncConds, _ := cacheStatus["conditions"].([]any)
+	syncConds, _ := cache["conditions"].([]any)
 	if len(syncConds) != 1 {
-		t.Fatalf("Synced condition on the wire: %+v", cacheStatus["conditions"])
+		t.Fatalf("Synced condition on the wire: %+v", cache["conditions"])
 	}
 	c0 := syncConds[0].(map[string]any)
 	if c0["type"] != "Synced" || c0["status"] != "True" || c0["reason"] != "Watching" {
 		t.Errorf("Synced condition on the wire: %+v", c0)
-	}
-	if cacheStatus["lastSyncedAt"] == nil {
-		t.Error("lastSyncedAt should be set")
 	}
 
 	// Cache stats with no on-disk files: exists=false.
@@ -1085,5 +1360,101 @@ func TestClusterCacheClearMutation(t *testing.T) {
 	raw = postGQL(t, srv.URL, string(body))
 	if !strings.Contains(string(raw), "errors") {
 		t.Errorf("expected a GraphQL error for an unknown id, got %s", raw)
+	}
+}
+
+// TestClusterCacheGVRSyncsWatchIsCacheScoped pins the scoping on the wire: the stream is
+// opened for one cache and must carry only that cache's kinds. The fixture gives each
+// cache one record, so a leak shows up as a second frame.
+func TestClusterCacheGVRSyncsWatchIsCacheScoped(t *testing.T) {
+	srv := newTestServer(t, clusterFixtures())
+
+	resp := openSSESubscription(t, srv.URL, "",
+		`subscription { clusterCacheGVRSyncsWatch(cacheID: "1") { type sync { id discoveryID `+
+			`spec { enabled apiVersion kind resource namespaced } conditions { type status reason } } } }`)
+	defer resp.Body.Close()
+	events := sseEvents(t, resp)
+
+	seen := 0
+	deadline := time.After(time.Second)
+	for {
+		var frame struct {
+			Data struct {
+				Watch struct {
+					Type string         `json:"type"`
+					Sync map[string]any `json:"sync"`
+				} `json:"clusterCacheGVRSyncsWatch"`
+			} `json:"data"`
+		}
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				if seen == 0 {
+					t.Fatal("stream closed before a frame arrived")
+				}
+				return
+			}
+			if ev.event != "next" {
+				continue
+			}
+			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
+				t.Fatalf("decode gvr sync frame %s: %v", ev.data, err)
+			}
+			seen++
+			sync := frame.Data.Watch.Sync
+			if sync["discoveryID"] != "1" {
+				t.Fatalf("another cache's record leaked into the stream: %v", sync)
+			}
+			spec, _ := sync["spec"].(map[string]any)
+			if spec["resource"] != "deployments" {
+				t.Errorf("resource = %v, want deployments", spec["resource"])
+			}
+		case <-deadline:
+			if seen != 1 {
+				t.Fatalf("expected exactly this cache's one record, saw %d", seen)
+			}
+			return
+		}
+	}
+}
+
+// TestClusterCacheStatsWatchServesGauge pins that the cache summary is reachable as a
+// stream. It used to be a field on ClusterCache, which froze once that record settled.
+func TestClusterCacheStatsWatchServesGauge(t *testing.T) {
+	srv := newTestServer(t, clusterFixtures())
+
+	resp := openSSESubscription(t, srv.URL, "",
+		`subscription { clusterCacheStatsWatch(id: "1", cacheID: "1") { exists bytes objectCount kindCount } }`)
+	defer resp.Body.Close()
+	events := sseEvents(t, resp)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		var frame struct {
+			Data struct {
+				Stats map[string]any `json:"clusterCacheStatsWatch"`
+			} `json:"data"`
+		}
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("stream closed before a frame arrived")
+			}
+			if ev.event != "next" {
+				continue
+			}
+			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
+				t.Fatalf("decode stats frame %s: %v", ev.data, err)
+			}
+			if got := frame.Data.Stats["objectCount"]; got != float64(1386) {
+				t.Errorf("objectCount = %v, want 1386", got)
+			}
+			if got := frame.Data.Stats["kindCount"]; got != float64(62) {
+				t.Errorf("kindCount = %v, want 62", got)
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for a stats frame")
+		}
 	}
 }

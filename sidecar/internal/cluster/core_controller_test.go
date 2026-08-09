@@ -62,27 +62,32 @@ func mutableProbe(initial string) (ProbeFunc, func(string)) {
 	return probe, func(n string) { mu.Lock(); uid = n; mu.Unlock() }
 }
 
-// waitForCacheBySlug blocks until a ClusterCache with the given slug exists, then
-// returns it (or fails on timeout). Event-driven over WatchList, so it observes a cache
-// that exists already as well as one created after the subscribe, with no polling.
-func waitForCacheBySlug(t *testing.T, cl beehive.Client[ClusterCacheSpec, ClusterCacheStatus], slug string) *beehive.Object[ClusterCacheSpec, ClusterCacheStatus] {
+// waitForCacheByName blocks until a ClusterCache with the given name exists, then
+// returns it (or fails on timeout). Event-driven over WatchList — the snapshot covers a
+// cache that already exists, the stream one created after the subscribe — so no polling.
+func waitForCacheByName(t *testing.T, cl beehive.Client[ClusterCacheSpec, ClusterCacheStatus], name string) *beehive.Object[ClusterCacheSpec, ClusterCacheStatus] {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ch, err := cl.WatchList(ctx)
+	snap, ch, err := cl.WatchList(ctx)
 	require.NoError(t, err)
+	for _, obj := range snap.Objects {
+		if obj.Name == name {
+			return obj
+		}
+	}
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
 		case ev, ok := <-ch:
 			if !ok {
-				t.Fatalf("watch closed before ClusterCache %q appeared", slug)
+				t.Fatalf("watch closed before ClusterCache %q appeared", name)
 			}
-			if ev.Object != nil && ev.Object.Slug != nil && *ev.Object.Slug == slug {
+			if ev.Object != nil && ev.Object.Name == name {
 				return ev.Object
 			}
 		case <-timeout:
-			t.Fatalf("timed out waiting for ClusterCache %q", slug)
+			t.Fatalf("timed out waiting for ClusterCache %q", name)
 		}
 	}
 }
@@ -92,6 +97,35 @@ func staticCheck(phase HealthPhase) CheckFunc {
 	return func(context.Context, *rest.Config) (HealthPhase, *string) {
 		return phase, nil
 	}
+}
+
+// A /readyz?verbose=true listing runs to kilobytes, and a raw client-go error is
+// unbounded too. Both were being written verbatim into a condition Message — persisted,
+// and re-serialized to every clustersWatch subscriber on each cluster frame — while the
+// same text on the event surface was capped at 200 bytes. Every condition this package
+// builds is now capped at its constructor.
+func TestClusterCoreControllerCapsConditionMessages(t *testing.T) {
+	verbose := strings.Repeat("[+]etcd ok\n", 300)
+	w := NewStaticWatcher(t, testKubeConfig("alpha"))
+
+	uid, ver := "kube-system-uid", "v1.31.0"
+	coreClient, _ := newClusterTestBeehive(t, w,
+		staticProbe(ClusterServer{UID: &uid, Version: &ver}, ClusterPrincipal{}),
+		func(context.Context, *rest.Config) (HealthPhase, *string) {
+			return HealthPhaseDegraded, &verbose
+		},
+		nil,
+	)
+
+	obj, err := coreClient.Create(context.Background(), kubeconfigName("alpha"), eligibleSpec("alpha"))
+	require.NoError(t, err)
+
+	got := waitCondition(t, coreClient, obj.ID, ConditionHealthy)
+	healthy := findCondition(t, got.Conditions, ConditionHealthy)
+	require.Equal(t, ReasonReadyzFailed, healthy.Reason)
+	assert.LessOrEqual(t, len(healthy.Message), maxMessageLen+len("…"),
+		"an unbounded probe body must not be persisted and re-sent on every frame")
+	assert.NotEmpty(t, healthy.Message, "the reading is still shown, just bounded")
 }
 
 // signalingProbe returns a successful ProbeFunc that signals every invocation on the
@@ -141,7 +175,7 @@ func newClusterTestBeehive(t *testing.T, w KubeConfigSource, probe ProbeFunc, ch
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
-	ctrl := NewClusterCoreController(w, coreClient, cacheClient, connMgr, nil, probe, check)
+	ctrl := NewClusterCoreController(&controllerRuntime{bh: bh, connMgr: connMgr}, w, probe, check)
 	cc, err := beehive.Register(bh, ClusterGroupKind, ctrl)
 	require.NoError(t, err)
 	ctrl.SetControllerClient(cc)
@@ -160,52 +194,58 @@ func newClusterTestBeehive(t *testing.T, w KubeConfigSource, probe ProbeFunc, ch
 // no polling.
 func waitCondition(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus], id beehive.ObjectID, condType ConditionType) *beehive.Object[ClusterSpec, ClusterStatus] {
 	t.Helper()
-	return waitForStatus(t, cl, id, func(s *ClusterStatus) bool {
-		for _, c := range s.Conditions {
-			if c.Type == condType {
-				return true
-			}
-		}
-		return false
+	return waitForObject(t, cl, id, func(o *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+		return FindCondition(o.Conditions, condType) != nil
 	})
 }
 
 // waitForStatus blocks on the object's beehive watch until its status satisfies
-// pred, then returns the object. Event-driven (current-on-subscribe), no polling.
+// pred, then returns the object. Event-driven — the watch's snapshot carries current
+// state and the stream the changes above it — so no polling.
 func waitForStatus(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus], id beehive.ObjectID, pred func(*ClusterStatus) bool) *beehive.Object[ClusterSpec, ClusterStatus] {
+	t.Helper()
+	return waitForObject(t, cl, id, func(o *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+		return o.Status != nil && pred(o.Status)
+	})
+}
+
+// waitForObject is waitForStatus's primitive: it blocks on the object's beehive watch
+// until the whole object satisfies pred. Conditions live on the object rather than in
+// status, so a condition predicate needs this form.
+func waitForObject(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus], id beehive.ObjectID, pred func(*beehive.Object[ClusterSpec, ClusterStatus]) bool) *beehive.Object[ClusterSpec, ClusterStatus] {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ch, err := cl.Watch(ctx, id)
+	snap, ch, err := cl.Watch(ctx, id)
 	require.NoError(t, err)
+	if snap.Object != nil && pred(snap.Object) {
+		return snap.Object
+	}
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
 		case ev, ok := <-ch:
 			if !ok {
-				t.Fatal("watch closed before status predicate met")
+				t.Fatal("watch closed before object predicate met")
 			}
-			if ev.Object != nil && ev.Object.Status != nil && pred(ev.Object.Status) {
+			if ev.Object != nil && pred(ev.Object) {
 				return ev.Object
 			}
 		case <-timeout:
-			t.Fatal("timed out waiting for status predicate")
+			t.Fatal("timed out waiting for object predicate")
 		}
 	}
 }
 
-// waitForObservedGeneration blocks (event-driven) until the object's Connected
-// condition has been re-stamped by a reconcile that observed at least gen — i.e.
-// the reconcile triggered by the generation-bumping spec edit has written status.
+// waitForObservedGeneration blocks (event-driven) until a reconcile that observed at
+// least gen has settled — i.e. the pass triggered by the generation-bumping spec edit
+// has landed. It reads beehive's own handshake (Object.ObservedGeneration) rather than a
+// per-condition stamp, so it holds whether that pass reported status, conditions, or
+// only the handshake itself.
 func waitForObservedGeneration(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus], id beehive.ObjectID, gen int64) *beehive.Object[ClusterSpec, ClusterStatus] {
 	t.Helper()
-	return waitForStatus(t, cl, id, func(s *ClusterStatus) bool {
-		for _, c := range s.Conditions {
-			if c.Type == ConditionConnected && c.ObservedGeneration >= gen {
-				return true
-			}
-		}
-		return false
+	return waitForObject(t, cl, id, func(o *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+		return o.ObservedGeneration != nil && *o.ObservedGeneration >= gen
 	})
 }
 
@@ -238,24 +278,24 @@ func TestClusterCoreControllerSuccessfulProbeWritesConditions(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
 
 	got := waitCondition(t, coreClient, obj.ID, ConditionConnected)
 	require.NotNil(t, got.Status)
 
-	connected := findCondition(t, got.Status.Conditions, ConditionConnected)
+	connected := findCondition(t, got.Conditions, ConditionConnected)
 	assert.Equal(t, ConditionTrue, connected.Status)
 	assert.Equal(t, ReasonConnected, connected.Reason)
 
-	healthy := findCondition(t, got.Status.Conditions, ConditionHealthy)
+	healthy := findCondition(t, got.Conditions, ConditionHealthy)
 	assert.Equal(t, ConditionTrue, healthy.Status)
 
 	assert.NotNil(t, got.Status.LastConnectedAt)
 
 	// ClusterCache child must have been created, keyed by the probed kube-system UID.
-	cacheObj, err := cacheClient.GetBySlug(ctx, ClusterCacheSlug(id, uid))
+	cacheObj, err := cacheClient.GetByName(ctx, ClusterCacheName(id, uid))
 	require.NoError(t, err, "ClusterCache child must exist after successful reconcile")
 	assert.Equal(t, uid, cacheObj.Spec.ServerUID, "cache spec records the identity it mirrors")
 }
@@ -271,13 +311,13 @@ func TestClusterCoreControllerUIDSwitchPrunesSupersededCache(t *testing.T) {
 	coreClient, cacheClient := newClusterTestBeehive(t, w, probe, staticCheck(HealthPhaseHealthy), nil)
 	ctx := context.Background()
 
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
 
 	// First probe creates the cache for the original identity — carrying the finalizer
 	// that gates its deletion on file cleanup.
-	oldCache := waitForCacheBySlug(t, cacheClient, ClusterCacheSlug(id, "uid-old"))
+	oldCache := waitForCacheByName(t, cacheClient, ClusterCacheName(id, "uid-old"))
 	assert.Contains(t, oldCache.Finalizers, "kstack.io/cache-files",
 		"a created cache must carry the file-cleanup finalizer")
 
@@ -290,7 +330,7 @@ func TestClusterCoreControllerUIDSwitchPrunesSupersededCache(t *testing.T) {
 	require.NoError(t, err)
 
 	// A cache for the new identity is created...
-	newCache := waitForCacheBySlug(t, cacheClient, ClusterCacheSlug(id, "uid-new"))
+	newCache := waitForCacheByName(t, cacheClient, ClusterCacheName(id, "uid-new"))
 	assert.Equal(t, "uid-new", newCache.Spec.ServerUID)
 	assert.NotEqual(t, oldCache.ID, newCache.ID, "a migration mints a fresh cache, not a reuse")
 
@@ -313,11 +353,11 @@ func TestClusterCoreControllerProbeFailureSetsConnectedFalse(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 
 	got := waitCondition(t, coreClient, obj.ID, ConditionConnected)
-	connected := findCondition(t, got.Status.Conditions, ConditionConnected)
+	connected := findCondition(t, got.Conditions, ConditionConnected)
 	assert.Equal(t, ConditionFalse, connected.Status)
 	assert.Equal(t, ReasonProbeFailed, connected.Reason)
 }
@@ -335,11 +375,11 @@ func TestClusterCoreControllerIneligibleClusterDoesNotProbe(t *testing.T) {
 	// Enabled=false → ineligible.
 	spec := eligibleSpec("alpha")
 	spec.Enabled = false
-	obj, err := coreClient.Create(ctx, spec)
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), spec)
 	require.NoError(t, err)
 
 	got := waitCondition(t, coreClient, obj.ID, ConditionConnected)
-	connected := findCondition(t, got.Status.Conditions, ConditionConnected)
+	connected := findCondition(t, got.Conditions, ConditionConnected)
 	assert.Equal(t, ConditionFalse, connected.Status)
 	assert.Equal(t, ReasonInactive, connected.Reason)
 	assert.False(t, probeCalled, "probe must not be called for ineligible cluster")
@@ -358,7 +398,7 @@ func TestClusterCoreControllerRecordsAttemptOnSuccessfulProbe(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 
 	waitCondition(t, coreClient, obj.ID, ConditionConnected)
@@ -382,7 +422,7 @@ func TestClusterCoreControllerIneligibleClusterRecordsNoAttempt(t *testing.T) {
 	// Enabled=false → ineligible → no probe is attempted.
 	spec := eligibleSpec("alpha")
 	spec.Enabled = false
-	obj, err := coreClient.Create(ctx, spec)
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), spec)
 	require.NoError(t, err)
 
 	waitCondition(t, coreClient, obj.ID, ConditionConnected)
@@ -400,7 +440,7 @@ func TestClusterCoreControllerRecordsConnectionAttempts(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 
 	var evs []beehive.Event
@@ -432,14 +472,16 @@ func TestClusterCoreControllerSuccessfulProbePopulatesConnectionManager(t *testi
 		connMgr,
 	)
 
-	obj, err := coreClient.Create(context.Background(), eligibleSpec("alpha"))
+	obj, err := coreClient.Create(context.Background(), kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
 
 	waitCondition(t, coreClient, obj.ID, ConditionConnected)
 
-	got := connMgr.Get(id)
+	got, fingerprint := connMgr.Get(id)
 	assert.NotNil(t, got, "ConnectionManager must have a REST config after successful probe")
+	assert.NotEmpty(t, fingerprint,
+		"the probe must store the fingerprint too — only this controller can compute it, and the sync layer reads it back to detect a rotation")
 }
 
 func TestClusterCoreControllerProbeFailureDeletesFromConnectionManager(t *testing.T) {
@@ -453,7 +495,7 @@ func TestClusterCoreControllerProbeFailureDeletesFromConnectionManager(t *testin
 	)
 
 	ctx := context.Background()
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
 
@@ -463,7 +505,7 @@ func TestClusterCoreControllerProbeFailureDeletesFromConnectionManager(t *testin
 	// Pre-seed a stale entry, then force a fresh reconcile (a spec edit bumps generation)
 	// so the probe-failure path runs again with the seed in place — which is what makes
 	// the clear observable.
-	connMgr.Set(id, &rest.Config{Host: "https://stale"})
+	connMgr.Set(id, &rest.Config{Host: "https://stale"}, "fp")
 	renamed := eligibleSpec("alpha")
 	name := "renamed"
 	renamed.Name = &name
@@ -474,7 +516,8 @@ func TestClusterCoreControllerProbeFailureDeletesFromConnectionManager(t *testin
 	// same reconcile, so observing the second reconcile's status — its Connected
 	// condition stamped with the new generation — means the clear has landed.
 	waitForObservedGeneration(t, coreClient, obj.ID, updated.Generation)
-	assert.Nil(t, connMgr.Get(id), "ConnectionManager must not hold a config after probe failure")
+	failedCfg, _ := connMgr.Get(id)
+	assert.Nil(t, failedCfg, "ConnectionManager must not hold a config after probe failure")
 }
 
 func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.T) {
@@ -490,7 +533,7 @@ func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.
 	ctx := context.Background()
 	spec := eligibleSpec("alpha")
 	spec.Enabled = false
-	obj, err := coreClient.Create(ctx, spec)
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), spec)
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
 
@@ -499,7 +542,7 @@ func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.
 
 	// Pre-seed a stale entry, then force a fresh reconcile (a spec edit bumps
 	// generation, staying ineligible) so the teardown path runs with the seed in place.
-	connMgr.Set(id, &rest.Config{Host: "https://stale"})
+	connMgr.Set(id, &rest.Config{Host: "https://stale"}, "fp")
 	renamed := spec
 	name := "renamed"
 	renamed.Name = &name
@@ -510,15 +553,14 @@ func TestClusterCoreControllerIneligibleDeletesFromConnectionManager(t *testing.
 	// same reconcile, so observing the second reconcile's status — its Connected
 	// condition stamped with the new generation — means the clear has landed.
 	waitForObservedGeneration(t, coreClient, obj.ID, updated.Generation)
-	assert.Nil(t, connMgr.Get(id), "ConnectionManager must not hold a config for an ineligible cluster")
+	ineligibleCfg, _ := connMgr.Get(id)
+	assert.Nil(t, ineligibleCfg, "ConnectionManager must not hold a config for an ineligible cluster")
 }
 
 func findCondition(t *testing.T, conds []Condition, typ ConditionType) Condition {
 	t.Helper()
-	for _, c := range conds {
-		if c.Type == typ {
-			return c
-		}
+	if c := FindCondition(conds, typ); c != nil {
+		return *c
 	}
 	t.Fatalf("condition %s not found in %v", typ, conds)
 	return Condition{}
@@ -535,10 +577,9 @@ func TestClusterCoreControllerPokeReprobes(t *testing.T) {
 
 	bh := NewTestBeehiveUnstarted(t)
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 	w := NewStaticWatcher(t, testKubeConfig("alpha"))
 
-	ctrl := NewClusterCoreController(w, coreClient, cacheClient, nil, pk, probe, staticCheck(HealthPhaseHealthy))
+	ctrl := NewClusterCoreController(&controllerRuntime{bh: bh, pokeSvc: pk}, w, probe, staticCheck(HealthPhaseHealthy))
 	ctrl.SetSentinelWatcher(liveSentinelWatch)
 	cc, err := beehive.Register(bh, ClusterGroupKind, ctrl)
 	require.NoError(t, err)
@@ -550,7 +591,7 @@ func TestClusterCoreControllerPokeReprobes(t *testing.T) {
 	ctrl.StartBackground()
 	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
 
-	_, err = coreClient.Create(ctx, eligibleSpec("alpha"))
+	_, err = coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 
 	// The initial scheduled reconcile probes once (then requeues ~30s out).
@@ -572,11 +613,10 @@ func TestClusterCoreControllerReprobeOne(t *testing.T) {
 
 	bh := NewTestBeehiveUnstarted(t)
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 	w := NewStaticWatcher(t, testKubeConfig("alpha"))
 
 	// pokeSvc is nil — the retry bus is in-process, independent of the poke bus.
-	ctrl := NewClusterCoreController(w, coreClient, cacheClient, nil, nil, probe, staticCheck(HealthPhaseHealthy))
+	ctrl := NewClusterCoreController(&controllerRuntime{bh: bh}, w, probe, staticCheck(HealthPhaseHealthy))
 	ctrl.SetSentinelWatcher(liveSentinelWatch)
 	cc, err := beehive.Register(bh, ClusterGroupKind, ctrl)
 	require.NoError(t, err)
@@ -588,7 +628,7 @@ func TestClusterCoreControllerReprobeOne(t *testing.T) {
 	ctrl.StartBackground()
 	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
 
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
 
@@ -601,14 +641,59 @@ func TestClusterCoreControllerReprobeOne(t *testing.T) {
 	awaitProbe(t, probeCh)
 }
 
+// The probe hub is a bounded broadcast shared by every cluster, so a subscriber that is
+// slow — a window mid-render, a paused webview — can be overrun and see gochan's lagged
+// signal instead of the values it missed. Consuming the raw channel silently swallowed
+// that, and the values lost may have included this cluster's probe FINISHING: the row then
+// sat on "checking now" until some later probe happened to transition it.
+//
+// On a lag the stream must re-read the authoritative flag rather than infer anything.
+func TestClusterCoreControllerWatchProbeResyncsAfterLag(t *testing.T) {
+	ctrl := NewClusterCoreController(&controllerRuntime{}, nil, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const id = ClusterID(1)
+
+	// A probe is in flight, and the subscriber is about to miss its end.
+	ctrl.setProbing(id, true)
+	sub := ctrl.WatchProbe(ctx, id)
+	assert.True(t, recv(t, sub), "mid-probe subscriber sees checking now")
+
+	// Overrun the hub's buffer without the subscriber reading: the probe ends somewhere in
+	// here, and that transition is one of the ones overwritten.
+	ctrl.setProbing(id, false)
+	for range probeHubCapacity * 4 {
+		ctrl.setProbing(ClusterID(99), true)
+		ctrl.setProbing(ClusterID(99), false)
+	}
+
+	// The stream must converge on the truth — not-probing — rather than stay stuck.
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case v, ok := <-sub:
+			if !ok {
+				t.Fatal("probe stream closed")
+			}
+			if !v {
+				return // resynced to the authoritative flag
+			}
+		case <-deadline:
+			t.Fatal("a lagged probe stream never recovered the finished state")
+		}
+	}
+}
+
 // WatchProbe streams the in-flight probe state per cluster: current-on-subscribe (a
 // mid-probe subscriber sees true), then one value per transition, filtered to the
 // subscribed id. Exercises the hub directly via setProbing, so no beehive/network is
 // needed.
 func TestClusterCoreControllerWatchProbe(t *testing.T) {
-	var coreClient beehive.Client[ClusterSpec, ClusterStatus]
-	var cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
-	ctrl := NewClusterCoreController(nil, coreClient, cacheClient, nil, nil, nil, nil)
+	// No beehive/network is exercised — only the probe hub — so an empty runtime and nil
+	// clients are fine (the minted clients are never called).
+	ctrl := NewClusterCoreController(&controllerRuntime{}, nil, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -660,8 +745,7 @@ func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
 
 	bh := NewTestBeehiveUnstarted(t)
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
-	ctrl := NewClusterCoreController(w, coreClient, cacheClient, nil, nil,
+	ctrl := NewClusterCoreController(&controllerRuntime{bh: bh}, w,
 		staticProbe(ClusterServer{UID: &uid, Version: &ver}, ClusterPrincipal{Username: &user}),
 		staticCheck(HealthPhaseHealthy))
 	ctrl.SetSentinelWatcher(liveSentinelWatch)
@@ -675,7 +759,7 @@ func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
 	ctrl.StartBackground()
 	t.Cleanup(func() { ctrl.StopBackground(); _ = stop(ctx) })
 
-	obj, err := coreClient.Create(ctx, eligibleSpec("alpha"))
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
 	require.NoError(t, err)
 
 	// Present: the observation is written to status from the kubeconfig.
@@ -697,19 +781,115 @@ func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
 	assert.Equal(t, "alpha-cluster", kc.Cluster, "departed record keeps its last-known names")
 	assert.Equal(t, "alpha-user", kc.User)
 	assert.False(t, kc.IsDefault)
-	connected := findCondition(t, got.Status.Conditions, ConditionConnected)
+	connected := findCondition(t, got.Conditions, ConditionConnected)
 	assert.Equal(t, ConditionFalse, connected.Status)
 	assert.Equal(t, ReasonInactive, connected.Reason)
 }
 
 // Aggregation into runs and per-object retention are beehive's (RecordEvent +
 // WithEventRetention), covered by its own tests; here we only pin the local
-// message-truncation helper.
+// message-truncation helper the event and condition writes share.
 
 func TestTruncateMessage(t *testing.T) {
 	assert.Equal(t, "short", truncateMessage("short"))
-	long := strings.Repeat("x", maxAttemptMessageLen+50)
+	long := strings.Repeat("x", maxMessageLen+50)
 	got := truncateMessage(long)
-	assert.LessOrEqual(t, len(got), maxAttemptMessageLen+len("…"))
+	assert.LessOrEqual(t, len(got), maxMessageLen+len("…"))
 	assert.True(t, strings.HasSuffix(got, "…"))
+}
+
+// gatedProbe returns a successful ProbeFunc that blocks each call until release is
+// closed, announcing every entry on entered. It lets a test hold one cluster's probe
+// open and count how many other probes get to run meanwhile.
+func gatedProbe() (fn ProbeFunc, entered chan struct{}, release chan struct{}) {
+	entered = make(chan struct{}, 8)
+	release = make(chan struct{})
+	fn = func(ctx context.Context, cfg *rest.Config) (ClusterServer, ClusterPrincipal, error) {
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ClusterServer{}, ClusterPrincipal{}, ctx.Err()
+		}
+		uid := "uid"
+		return ClusterServer{UID: &uid}, ClusterPrincipal{}, nil
+	}
+	return fn, entered, release
+}
+
+// Reconciles of DIFFERENT clusters must run in parallel: the reconcile lock is per
+// cluster, so one cluster stuck in a slow (or timing-out) probe must not delay
+// another's. This is what keeps an unreachable cluster from serializing startup
+// behind it — with a single shared lock the second probe never starts.
+func TestClusterCoreControllerReconcilesDistinctClustersInParallel(t *testing.T) {
+	ctx := context.Background()
+	probe, entered, release := gatedProbe()
+	defer close(release)
+
+	bh := NewTestBeehiveUnstarted(t)
+	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
+	w := NewStaticWatcher(t, testKubeConfig("alpha", "beta"))
+
+	ctrl := NewClusterCoreController(&controllerRuntime{bh: bh}, w, probe, staticCheck(HealthPhaseHealthy))
+	cc, err := beehive.Register(bh, ClusterGroupKind, ctrl)
+	require.NoError(t, err)
+	ctrl.SetControllerClient(cc)
+
+	alpha, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
+	require.NoError(t, err)
+	beta, err := coreClient.Create(ctx, kubeconfigName("beta"), eligibleSpec("beta"))
+	require.NoError(t, err)
+
+	// Drive Reconcile directly (not through beehive's workers) so the test pins the
+	// controller's own locking rather than beehive's configured worker count.
+	for _, obj := range []*beehive.Object[ClusterSpec, ClusterStatus]{alpha, beta} {
+		go func() { _, _ = ctrl.Reconcile(ctx, cc, obj) }()
+	}
+
+	// Both probes must be in flight at once. Under a single shared lock only one
+	// entry ever arrives and this times out.
+	for i := range 2 {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of 2 probes started; distinct clusters are serialized", i)
+		}
+	}
+}
+
+// The other half of the invariant: reconciles of the SAME cluster must NOT overlap.
+// beehive status writes carry no resourceVersion guard, so an interleaved
+// read-modify-write would let a stale snapshot clobber a newer observation.
+func TestClusterCoreControllerSerializesSameClusterReconciles(t *testing.T) {
+	ctx := context.Background()
+	probe, entered, release := gatedProbe()
+	defer close(release)
+
+	bh := NewTestBeehiveUnstarted(t)
+	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
+	w := NewStaticWatcher(t, testKubeConfig("alpha"))
+
+	ctrl := NewClusterCoreController(&controllerRuntime{bh: bh}, w, probe, staticCheck(HealthPhaseHealthy))
+	cc, err := beehive.Register(bh, ClusterGroupKind, ctrl)
+	require.NoError(t, err)
+	ctrl.SetControllerClient(cc)
+
+	obj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleSpec("alpha"))
+	require.NoError(t, err)
+
+	for range 2 {
+		go func() { _, _ = ctrl.Reconcile(ctx, cc, obj) }()
+	}
+
+	// One probe enters; the second must stay blocked on the first's lock.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first probe")
+	}
+	select {
+	case <-entered:
+		t.Fatal("a second reconcile of the same cluster ran concurrently")
+	case <-time.After(200 * time.Millisecond):
+	}
 }

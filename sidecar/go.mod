@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/99designs/gqlgen v0.17.90
 	github.com/Microsoft/go-winio v0.6.2
-	github.com/amorey/beehive v0.16.0
+	github.com/amorey/beehive v0.22.0
 	github.com/amorey/gochan v0.2.0
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/fsnotify/fsnotify v1.10.1
@@ -21,7 +21,6 @@ require (
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.6.2
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	k8s.io/api v0.36.1
-	k8s.io/apiextensions-apiserver v0.36.1
 	k8s.io/apimachinery v0.36.1
 	k8s.io/client-go v0.36.1
 	modernc.org/sqlite v1.52.0
@@ -29,7 +28,7 @@ require (
 
 require (
 	github.com/agnivade/levenshtein v1.2.1 // indirect
-	github.com/amorey/gobus v0.1.0 // indirect
+	github.com/amorey/gobus v0.6.0 // indirect
 	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect

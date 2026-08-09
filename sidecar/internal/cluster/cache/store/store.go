@@ -15,8 +15,8 @@
 // Package store owns the sidecar's per-cluster on-disk caches: one SQLite file per
 // cache incarnation under the host-supplied data dir. It owns those files'
 // lifecycle (open/migrate/quarantine/delete) plus a per-cluster janitor goroutine;
-// it does NOT own syncing — the cluster package's ClusterCacheController starts an
-// engine (internal/cluster/cache/engine) that writes through the ClusterDB handed out.
+// it does NOT own syncing — the cluster package's sync workers write through the
+// ClusterDB handed out, and this package owns only the reads beside them.
 //
 // Concurrency: SQLite runs in WAL mode so readers don't block a writer. Two *sql.DB
 // handles share the same file — a single-connection writer pool (no SQLITE_BUSY
@@ -90,6 +90,11 @@ func clusterDBPath(dataDir string, ref CacheRef) string {
 // GraphQL resolvers running without serializing.
 const readerPoolSize = 4
 
+// finishCloseTimeout bounds the retry of a close whose first attempt missed its deadline
+// (see startFinishClose). Generous enough for a janitor sweep to finish, short enough that
+// a permanently-wedged one doesn't hold a goroutine for the life of the process.
+const finishCloseTimeout = 30 * time.Second
+
 // Manager owns one ClusterDB per open cache incarnation, keyed by CacheID (the
 // ClusterCache ObjectID — the precise incarnation; one is live per cluster at a
 // time). Safe for concurrent use.
@@ -105,6 +110,31 @@ type Manager struct {
 	// the first WatchDB for a CacheID and torn down when its last subscriber
 	// cancels (refs → 0), so it doesn't accumulate a hub per cache incarnation.
 	dbWatchers map[int64]*dbWatch
+	// closing holds handles that have left dbs but whose pools may still be live — see
+	// closingDB. An id here is neither open (Open must not hand it out, nor build a second
+	// pool over the same file) nor gone (Close must be able to find it again).
+	closing map[int64]*closingDB
+	// deleting holds the caches DeleteCacheFiles is working on, for the whole close +
+	// unlink sequence. Closing alone does not cover it: between the handle going away and
+	// the files being removed, an Open would CREATE the file it is about to unlink and
+	// register a handle onto an inode with no name — which every worker rebuilt afterwards
+	// would then write into, silently, forever.
+	deleting map[int64]bool
+	// finishing marks the caches whose failed close is being retried, so the retries don't
+	// stack up one per Open — see startFinishClose.
+	finishing map[int64]bool
+}
+
+// closingDB is a handle that has left m.dbs but is not yet fully closed. done is non-nil
+// while a shutdown attempt is running, so a second Close waits for it rather than tearing
+// the same pools down twice; an entry that outlives its attempt is one whose shutdown
+// failed, kept so the next Close re-waits on the SAME handle instead of finding nothing.
+type closingDB struct {
+	cdb  *ClusterDB
+	done chan struct{}
+	// err is the last attempt's outcome, written before done is closed so a waiter learns
+	// whether the pools actually went away or the handle still needs finishing off.
+	err error
 }
 
 // dbWatch is one CacheID's handle-change hub plus a refcount of live WatchDB
@@ -122,6 +152,9 @@ func NewManager(dataDir string) *Manager {
 		dataDir:    dataDir,
 		dbs:        make(map[int64]*ClusterDB),
 		dbWatchers: make(map[int64]*dbWatch),
+		closing:    make(map[int64]*closingDB),
+		deleting:   make(map[int64]bool),
+		finishing:  make(map[int64]bool),
 	}
 }
 
@@ -137,7 +170,7 @@ func (m *Manager) Open(ctx context.Context, ref CacheRef) (*ClusterDB, error) {
 	m.mu.RLock()
 	if m.close {
 		m.mu.RUnlock()
-		return nil, errors.New("cache is shut down")
+		return nil, ErrManagerShutDown
 	}
 	if cdb, ok := m.dbs[ref.CacheID]; ok {
 		m.mu.RUnlock()
@@ -148,10 +181,33 @@ func (m *Manager) Open(ctx context.Context, ref CacheRef) (*ClusterDB, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.close {
-		return nil, errors.New("cache is shut down")
+		return nil, ErrManagerShutDown
 	}
 	if cdb, ok := m.dbs[ref.CacheID]; ok {
 		return cdb, nil
+	}
+	// Mid-deletion: opening here would recreate the very file about to be unlinked.
+	if m.deleting[ref.CacheID] {
+		return nil, fmt.Errorf("cache %d is being deleted", ref.CacheID)
+	}
+	// A cache on its way down is neither: handing back the closing handle would let the
+	// pools close under the caller mid-query, and opening a second one over the same
+	// file would leave two writer pools racing for the .db a deletion is about to
+	// remove. The caller retries — a reconcile requeues, and by then the close has
+	// resolved either way.
+	//
+	// "Either way" needs someone to finish a close that FAILED, and nothing else ever
+	// does: Close is reachable only through DeleteCacheFiles, whose own caller (a cache
+	// clear) just surfaces the error. Left alone, one missed deadline wedged the cache
+	// for the life of the process — every later Open refused while the pools stayed live
+	// and every watcher had already been told the cache closed. So a stranded entry gets
+	// its retry driver here, off the caller's goroutine: Open must not block on a
+	// janitor that is wedged mid-write, which is the very thing that stranded it.
+	if entry, ok := m.closing[ref.CacheID]; ok {
+		if entry.done == nil {
+			m.startFinishClose(ref.CacheID)
+		}
+		return nil, fmt.Errorf("cache %d is closing", ref.CacheID)
 	}
 
 	cdb, err := openClusterDB(ctx, m.dataDir, ref)
@@ -162,6 +218,27 @@ func (m *Manager) Open(ctx context.Context, ref CacheRef) (*ClusterDB, error) {
 	m.dbs[ref.CacheID] = cdb
 	m.publishDBLocked(ref.CacheID, cdb)
 	return cdb, nil
+}
+
+// startFinishClose retries a close that failed and left its handle stranded in m.closing,
+// on its own goroutine so the caller that noticed the wedge doesn't wait on it. Called
+// under m.mu; at most one retry runs per cache, since a wedged janitor typically stays
+// wedged and a retry per Open would just pile up waiters on the same attempt.
+func (m *Manager) startFinishClose(cacheID int64) {
+	if m.finishing[cacheID] {
+		return
+	}
+	m.finishing[cacheID] = true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), finishCloseTimeout)
+		defer cancel()
+		if err := m.Close(ctx, cacheID); err != nil {
+			slog.Warn("clustercache: retry of a failed close did not finish", "cache", cacheID, "err", err)
+		}
+		m.mu.Lock()
+		delete(m.finishing, cacheID)
+		m.mu.Unlock()
+	}()
 }
 
 // WatchDB streams a CacheID's open ClusterDB handle as it changes over the cache's
@@ -244,15 +321,54 @@ func (m *Manager) CacheBytes(ref CacheRef) (int64, bool) {
 	return total, found
 }
 
+// ErrManagerShutDown is returned by every entry point once Shutdown has run: the manager
+// no longer holds the handles, so it can neither hand one out nor promise anything about
+// one. Close returns it rather than the "unknown id" nil, which is what makes
+// DeleteCacheFiles abort instead of unlinking files behind a handle Shutdown is still
+// closing.
+var ErrManagerShutDown = errors.New("cache manager is shut down")
+
 // DeleteCacheFiles closes the cluster (releasing the file handles — required on
 // Windows) and removes its cache files (main DB + sidecars). Safe for an
 // unknown/closed cluster. A later Open recreates a fresh, empty cache.
 func (m *Manager) DeleteCacheFiles(ctx context.Context, ref CacheRef) error {
+	return m.deleteCacheFilesWithHook(ctx, ref, nil)
+}
+
+// deleteCacheFilesWithHook is DeleteCacheFiles with a seam this package's tests use to
+// observe the window between the close and the unlink — the one an Open must not slip into.
+func (m *Manager) deleteCacheFilesWithHook(
+	ctx context.Context, ref CacheRef, betweenCloseAndUnlink func(),
+) error {
 	if !ref.valid() {
 		return fmt.Errorf("invalid cache ref %+v", ref)
 	}
+	// Hold the cache un-openable across the WHOLE sequence, not just the close. Open
+	// creates the file when it is missing, so a reconcile landing between the close and the
+	// unlink would recreate it — and the handle it registered would then be an open inode
+	// with no name, which the restart hands to every rebuilt worker.
+	m.mu.Lock()
+	if m.deleting[ref.CacheID] {
+		m.mu.Unlock()
+		return fmt.Errorf("cache %d is already being deleted", ref.CacheID)
+	}
+	if m.deleting == nil {
+		m.mu.Unlock()
+		return ErrManagerShutDown
+	}
+	m.deleting[ref.CacheID] = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.deleting, ref.CacheID)
+		m.mu.Unlock()
+	}()
+
 	if err := m.Close(ctx, ref.CacheID); err != nil {
 		return err
+	}
+	if betweenCloseAndUnlink != nil {
+		betweenCloseAndUnlink()
 	}
 	path := clusterDBPath(m.dataDir, ref)
 	for _, suffix := range dbSuffixes {
@@ -269,18 +385,76 @@ func (m *Manager) DeleteCacheFiles(ctx context.Context, ref CacheRef) error {
 
 // Close shuts down a single cache incarnation's DB and janitor goroutine,
 // addressed by CacheID. Safe to call for an unknown id (returns nil).
+//
+// The handle is forgotten only once shutdown has SUCCEEDED. A shutdown that misses its
+// deadline deliberately leaves the pools open (a janitor mid-write must not have its
+// connection closed underneath it), so the handle is still live — and forgetting it would
+// break the one caller that depends on this failing loudly: DeleteCacheFiles closes before
+// removing files, its error keeps the cache's finalizer, and the retry would then find
+// nothing registered, return nil, and os.Remove the .db out from under the live janitor and
+// pools. Keeping it registered makes the retry re-wait on the same handle.
 func (m *Manager) Close(ctx context.Context, cacheID int64) error {
-	m.mu.Lock()
-	cdb, ok := m.dbs[cacheID]
-	delete(m.dbs, cacheID)
-	if ok {
-		m.publishDBLocked(cacheID, nil)
+	for {
+		m.mu.Lock()
+		if m.close {
+			// Shutdown owns every handle now, including any this call would have found:
+			// it takes them out of dbs/closing before closing them, so "not registered"
+			// here does NOT mean "not live". Returning nil would tell DeleteCacheFiles the
+			// cache is closed and let it unlink the .db while Shutdown's own attempt is
+			// mid-write.
+			m.mu.Unlock()
+			return ErrManagerShutDown
+		}
+		entry, ok := m.closing[cacheID]
+		switch {
+		case ok && entry.done != nil:
+			// Another Close is tearing this handle down. Wait for its attempt rather than
+			// closing the same pools twice, then look again: it either finished the job
+			// (nothing left to do) or failed, and this call becomes the retry.
+			done := entry.done
+			m.mu.Unlock()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		case ok:
+			// A previous attempt failed and left the pools open — retry the same handle.
+			entry.done = make(chan struct{})
+		default:
+			cdb, open := m.dbs[cacheID]
+			if !open {
+				m.mu.Unlock()
+				return nil
+			}
+			// Out of dbs BEFORE the shutdown, so no Open can hand this handle out while
+			// its pools are going away; into closing, so this call's own retry can still
+			// find it if the shutdown fails.
+			delete(m.dbs, cacheID)
+			m.publishDBLocked(cacheID, nil)
+			entry = &closingDB{cdb: cdb, done: make(chan struct{})}
+			m.closing[cacheID] = entry
+		}
+		attempt := entry.done
+		m.mu.Unlock()
+
+		err := entry.cdb.shutdown(ctx)
+
+		m.mu.Lock()
+		entry.err = err
+		if err == nil {
+			delete(m.closing, cacheID)
+		}
+		// A failed shutdown deliberately leaves the pools open (a janitor mid-write must
+		// not lose its connection), so the entry stays: the handle is still live, and
+		// DeleteCacheFiles must not remove files behind it. Clearing done marks the attempt
+		// over, so the next Close retries it instead of waiting forever.
+		entry.done = nil
+		m.mu.Unlock()
+		close(attempt)
+		return err
 	}
-	m.mu.Unlock()
-	if !ok {
-		return nil
-	}
-	return cdb.shutdown(ctx)
 }
 
 // Shutdown closes every open cluster DB. Subsequent Opens return an error.
@@ -289,6 +463,21 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	m.close = true
 	dbs := m.dbs
 	m.dbs = nil
+	// Handles a per-cache Close took out of dbs but has not finished closing: their pools
+	// may still be live, so a process-wide shutdown owes them one more attempt. Each
+	// attempt's done channel is captured HERE, under the lock that guards it — Close nils
+	// the field when its attempt ends.
+	type pendingClose struct {
+		id    int64
+		entry *closingDB
+		done  chan struct{}
+	}
+	pending := make([]pendingClose, 0, len(m.closing))
+	for id, entry := range m.closing {
+		pending = append(pending, pendingClose{id: id, entry: entry, done: entry.done})
+	}
+	m.closing = nil
+	m.deleting = nil
 	// Hard-close every handle hub so each WatchDB subscriber's stream ends.
 	for _, w := range m.dbWatchers {
 		w.hub.Close()
@@ -297,10 +486,33 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Unlock()
 
 	var firstErr error
-	for id, cdb := range dbs {
+	shut := func(id int64, cdb *ClusterDB) {
 		if err := cdb.shutdown(ctx); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("close cache %d: %w", id, err)
 		}
+	}
+	for id, cdb := range dbs {
+		shut(id, cdb)
+	}
+	for _, p := range pending {
+		if p.done != nil {
+			// An attempt owns the handle right now. We must not report the process shut
+			// down while its pools may still be live, and we can no longer be reached
+			// through m.closing, so this is the last chance to finish the job: wait for the
+			// attempt, then take over if it failed.
+			select {
+			case <-p.done:
+			case <-ctx.Done():
+				if firstErr == nil {
+					firstErr = fmt.Errorf("close cache %d: %w", p.id, ctx.Err())
+				}
+				continue
+			}
+			if p.entry.err == nil {
+				continue // the concurrent Close finished it
+			}
+		}
+		shut(p.id, p.entry.cdb)
 	}
 	return firstErr
 }
@@ -417,6 +629,65 @@ func (c *ClusterDB) ID() string { return c.id }
 // Path returns the on-disk SQLite file path. Exposed for diagnostics.
 func (c *ClusterDB) Path() string { return c.path }
 
+// NullIfEmpty stores an absent string as SQL NULL rather than "". The two sync stores
+// share it because they share the convention: a reading a store could not produce is a
+// different fact from an empty one, and the columns are queried with IS NULL.
+func NullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// EnsureKindCatalog registers one kind in the cache's kind_catalog and wakes the
+// kind-catalog watch. Each synced kind's worker calls it on start; the upsert makes that a
+// no-op after the first, and refreshes the descriptive columns if the kind's shape moved
+// (a CRD re-registered under a different plural or scope).
+//
+// It lives here because kind_catalog is this package's table, and it is what makes a kind
+// readable at all: Objects translates the plural resource a watch subscribes on back to the
+// Kind the objects table is keyed by through this row, and Kinds is a kind_catalog LEFT
+// JOIN over the trigger-maintained kind_counts — so a kind with rows and no catalog entry
+// reads as empty and shows no count. Row.Count is ignored (the triggers own it).
+//
+// The ping is keyless: a catalog entry is news the dashboard nav's watch reads, and no
+// object write need follow it (an empty kind stays empty).
+//
+// A row naming the same plural under a DIFFERENT Kind is dropped first, so the unique index
+// on (api_version, resource) cannot refuse the insert. That row means a CRD's Kind was
+// renamed while the sidecar was down; dropping it here only keeps the write legal, and the
+// old Kind's objects, edges and cookie are purged by the caller that knows those tables (see
+// objectsync's forgetSupersededKind). Both statements ride one transaction: a delete that
+// landed without its insert would leave the kind unreadable.
+func EnsureKindCatalog(ctx context.Context, cdb *ClusterDB, row KindRow) error {
+	tx, err := cdb.Writer().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM kind_catalog WHERE api_version = ? AND resource = ? AND kind <> ?`,
+		row.APIVersion, row.Resource, row.Kind); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO kind_catalog (api_version, kind, resource, scope, is_crd)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(api_version, kind) DO UPDATE SET
+			resource=excluded.resource,
+			scope=excluded.scope,
+			is_crd=excluded.is_crd`,
+		row.APIVersion, row.Kind, row.Resource, row.Scope, row.IsCRD); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	cdb.ObjectsNotify()
+	return nil
+}
+
 // KindRow is one entry in the cache's kind_catalog: a kind the cluster's
 // API server advertises, recorded at sync time from /apis discovery.
 type KindRow struct {
@@ -440,7 +711,7 @@ type KindRow struct {
 // Each row's Count is the number of cached objects of that kind, read from the
 // trigger-maintained kind_counts aggregate (a point LEFT JOIN keyed by
 // api_version+kind, so an advertised-but-empty kind counts 0) — O(kinds), never a
-// scan of the objects table. Empty until the sync engine has populated it.
+// scan of the objects table.
 func (c *ClusterDB) Kinds(ctx context.Context) ([]KindRow, error) {
 	rows, err := c.readDB.QueryContext(ctx,
 		`SELECT kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd, COALESCE(knt.count, 0)
@@ -497,8 +768,15 @@ type EventRow struct {
 
 // Events reads the most recent cached events, newest first (ordered by last_seen,
 // riding the events_last_seen index), bounded by limit. A non-positive limit is
-// treated as defaultEventsLimit. Empty until the sync engine has populated the
+// treated as defaultEventsLimit. Empty until the Event sync has populated the
 // events table.
+//
+// uid breaks ties, and that is not cosmetic. lastTimestamp has one-second resolution, so a
+// busy cluster produces many rows sharing a last_seen — enough of them to straddle the
+// limit. Without a second key SQLite decides which of the tied rows falls inside the window
+// by rowid, and a relist prunes and re-inserts every row, so the same events come back with
+// different rowids: the delta watch then sees rows leave and re-enter a window nothing
+// actually moved in, and emits phantom Deleted/Added frames for them.
 func (c *ClusterDB) Events(ctx context.Context, limit int) ([]EventRow, error) {
 	if limit <= 0 {
 		limit = defaultEventsLimit
@@ -509,7 +787,7 @@ func (c *ClusterDB) Events(ctx context.Context, limit int) ([]EventRow, error) {
 		        COALESCE(count, 0), COALESCE(first_seen, 0), COALESCE(last_seen, 0),
 		        COALESCE(involved_kind, ''), COALESCE(involved_ns, ''), COALESCE(involved_name, '')
 		 FROM events
-		 ORDER BY last_seen DESC
+		 ORDER BY last_seen DESC, uid DESC
 		 LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -567,7 +845,7 @@ type ObjectRow struct {
 // its kind through kind_catalog (a point subquery) and the query then rides the
 // objects_kind_ns_name index. Unlike Events there is no window limit — a kind's whole
 // cached set is returned. Each row's raw_json is decompressed into RawJSON (the write
-// path always compresses). Empty until the sync engine has populated the kind.
+// path always compresses). Empty until that kind's sync has populated it.
 func (c *ClusterDB) Objects(ctx context.Context, apiVersion, resource string) ([]ObjectRow, error) {
 	rows, err := c.readDB.QueryContext(ctx,
 		`SELECT uid, api_version, kind, namespace, name, created_at, raw_json
@@ -669,10 +947,9 @@ func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterD
 // is already buffered are coalesced (the subscriber will re-query and observe every
 // change anyway). The returned cancel func unregisters the subscriber.
 //
-// Use this in place of polling: object-write paths call ObjectsNotify after commit,
-// and long-lived readers (e.g. the sync engine's freshness tracker, the kind-catalog
-// and objects GraphQL subscriptions) block on the channel to know when to re-run
-// their query.
+// Use this in place of polling: object-write paths call ObjectsNotify after commit, and
+// long-lived readers (the kind-catalog and cache-stats subscriptions) block on the channel
+// to know when to re-run their query.
 func (c *ClusterDB) ObjectsSubscribe() (<-chan struct{}, func()) { return c.writes.subscribe("") }
 
 // ObjectsSubscribeResource is ObjectsSubscribe scoped to one resource: the returned
@@ -684,7 +961,7 @@ func (c *ClusterDB) ObjectsSubscribe() (<-chan struct{}, func()) { return c.writ
 // The routing key is the plural resource, NOT the Kind, because that is the identity the
 // objects watch is opened on and it is stable across a CRD remap: a CRD deleted and
 // recreated with the same (apiVersion, resource) but a different Kind keeps this key, so a
-// subscription never goes stale against the replacement driver's writes (which notify by
+// subscription never goes stale against the replacement worker's writes (which notify by
 // the same resource). Keying by Kind instead would leave the subscription bound to the
 // dead Kind and miss those writes.
 func (c *ClusterDB) ObjectsSubscribeResource(apiVersion, resource string) (<-chan struct{}, func()) {
@@ -789,16 +1066,24 @@ func (c *ClusterDB) startJanitor() {
 func (c *ClusterDB) shutdown(ctx context.Context) error {
 	if c.janitorCancel != nil {
 		c.janitorCancel()
+		// A janitor that has ALREADY stopped is not a timeout, however long the caller's
+		// deadline has been gone: with both arms ready select picks at random, so an
+		// expired context turned a clean shutdown into a coin flip — and the loser left the
+		// pools open and the handle wedged in the Manager's closing set.
 		select {
 		case <-c.janitorDone:
-		case <-ctx.Done():
-			// The janitor is still executing — it may be mid-write. Closing
-			// writeDB now would close the connection out from under it, so bail
-			// without closing rather than risk a write into a closed DB. The
-			// handles leak, but a stuck goroutine plus a freed *sql.DB is worse;
-			// this is the rare timeout path (the process is usually going down).
-			slog.Warn("clustercache: janitor did not stop before deadline; leaving DBs open", "id", c.id)
-			return ctx.Err()
+		default:
+			select {
+			case <-c.janitorDone:
+			case <-ctx.Done():
+				// The janitor is still executing — it may be mid-write. Closing
+				// writeDB now would close the connection out from under it, so bail
+				// without closing rather than risk a write into a closed DB. The
+				// handles leak, but a stuck goroutine plus a freed *sql.DB is worse;
+				// this is the rare timeout path (the process is usually going down).
+				slog.Warn("clustercache: janitor did not stop before deadline; leaving DBs open", "id", c.id)
+				return ctx.Err()
+			}
 		}
 	}
 	// Close subscriber channels so any blocked select returns.

@@ -61,3 +61,11 @@ func ptrSlice[T any](items []T) []*T {
 	}
 	return out
 }
+
+// ptrStream maps a value stream onto a stream of pointers — the stream counterpart of
+// ptrSlice, and what nearly every cluster subscription resolver needs: the service hands
+// back a <-chan T while gqlgen's bindings want <-chan *T. The source is already
+// current-on-subscribe, so there is nothing to unsubscribe and no snapshot to prepend.
+func ptrStream[T any](ctx context.Context, sub <-chan T) <-chan *T {
+	return mapStream(ctx, sub, func() {}, func(v T) *T { return &v })
+}

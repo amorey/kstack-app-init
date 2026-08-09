@@ -17,7 +17,7 @@
 // Data and state come from the sidecar via useClusters(); mutations write through
 // and the resulting clustersWatch push updates the table.
 import { ChevronDown, Database, Pause, Play, Power, PowerOff, RotateCw, Slash, Trash2 } from 'lucide-react';
-import { type ReactNode, useEffect, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useState } from 'react';
 import ReactTimeAgo, { type Formatter } from 'react-timeago';
 import { useMutation } from 'urql';
 
@@ -27,9 +27,18 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 
 import { Dialog } from '@/components/widgets/dialog';
 import { graphql } from '@/gql';
-import { type Cluster, formatBytes, useClusters } from '@/lib/clusters';
+import type { ClusterCacheGvrDiscoveriesSubscription, ClusterCacheGvrSyncsSubscription } from '@/gql/graphql';
+import {
+  type Cluster,
+  type ClusterCacheSyncHealth,
+  type Keyed,
+  applyChange,
+  formatBytes,
+  useClusters,
+} from '@/lib/clusters';
 import { type AppDialogProps } from '@/lib/dialog';
 import { errorMessage, reportError } from '@/lib/error-bus';
+import { EVENTS_GVR, gvrKey } from '@/lib/gvr';
 import { useWatchSubscription, watchPhase } from '@/lib/graphql/use-watch-subscription';
 
 const ClusterEnabledSetMutation = graphql(`
@@ -132,12 +141,13 @@ function useConnectionAttempts(clusterId: string): EventRun[] {
   return data ?? [];
 }
 
-// Per-cache sync-event history: the cache controller records each engine state
-// (Watching / Syncing / SyncFailed) under category "sync" on the ClusterCache's
-// timeline. Keyed by the active cache's id; subscribed only while sync detail is open.
+// Sync-event history: each kind's worker records its transitions (SyncStart /
+// SyncComplete / SyncDegraded / SyncStale …) under category "sync" on its own
+// ClusterCacheGVRSync record's timeline — so this is keyed by that record's id, not the
+// cache's. Subscribed only while sync detail is open, and only for one kind at a time.
 const ClusterSyncEventsSubscription = graphql(`
   subscription ClusterSyncEvents($id: ObjectID!) {
-    clusterCacheEventsWatch(id: $id, category: "sync") {
+    clusterCacheGVRSyncEventsWatch(id: $id, category: "sync") {
       id
       type
       reason
@@ -149,12 +159,128 @@ const ClusterSyncEventsSubscription = graphql(`
   }
 `);
 
-function useSyncEvents(cacheId: string): EventRun[] {
-  const [{ data }] = useWatchSubscription<{ clusterCacheEventsWatch: RawEvent }, EventRun[]>(
-    { query: ClusterSyncEventsSubscription, variables: { id: cacheId } },
-    (prev, resp) => foldRun(prev, resp.clusterCacheEventsWatch),
+// One kind's sync-transition log. Paused until there is a kind to ask about — before the
+// per-kind stream delivers anything there is no id, and subscribing with a placeholder
+// would open a stream guaranteed to carry nothing.
+function useSyncEvents(syncId: string | undefined): EventRun[] {
+  const [{ data }] = useWatchSubscription<{ clusterCacheGVRSyncEventsWatch: RawEvent }, EventRun[]>(
+    { query: ClusterSyncEventsSubscription, variables: { id: syncId ?? '' }, pause: !syncId },
+    (prev, resp) => foldRun(prev, resp.clusterCacheGVRSyncEventsWatch),
   );
   return data ?? [];
+}
+
+// The cache's GVR-discovery record: which kinds the cluster serves and how current that
+// answer is. It rides the fleet-wide stream (one record per cache — small enough to be
+// unscoped), but is subscribed HERE rather than in ClustersProvider because this pane is
+// its only reader: mounting it app-wide would open a stream in every window, and rebuild
+// every joined Cluster identity on each discovery pass, for a row nobody has expanded.
+const ClusterCacheGVRDiscoveriesSubscription = graphql(`
+  subscription ClusterCacheGVRDiscoveries {
+    clusterCacheGVRDiscoveriesWatch {
+      type
+      discovery {
+        id
+        cacheID
+        stats {
+          lastDiscoveryAt
+          resourceCount
+        }
+        conditions {
+          type
+          reason
+          message
+          unconfirmed
+        }
+      }
+    }
+  }
+`);
+
+type GVRDiscovery = ClusterCacheGvrDiscoveriesSubscription['clusterCacheGVRDiscoveriesWatch']['discovery'];
+
+// The discovery record for one cache, or null until its frame lands. The stream carries
+// every cache's record, so the reducer keeps only the one asked for — the same id-keyed
+// fold the registry does, narrowed to a single key.
+function useGVRDiscoveries(): Keyed<GVRDiscovery> {
+  const [{ data }] = useWatchSubscription<
+    { clusterCacheGVRDiscoveriesWatch: { type: string; discovery: GVRDiscovery } },
+    Keyed<GVRDiscovery>
+  >({ query: ClusterCacheGVRDiscoveriesSubscription }, (prev, resp) => {
+    const { type, discovery } = resp.clusterCacheGVRDiscoveriesWatch;
+    // A Deleted is matched on the record's own id, not on cacheID. A hard delete carries
+    // only the id — the row is already collected, so there is no owner edge left to read a
+    // cacheID from, and it arrives as "0". Filtering those by cacheID dropped every one of
+    // them, and this anchor carries no finalizer, so a cascade can collect it with no
+    // deletion-pending frame ahead of it: the pane would keep showing a record that is gone.
+    if (type !== 'Deleted') return applyChange(prev, type, discovery.cacheID, discovery);
+    const gone = [...(prev ?? new Map())].find(([, d]) => d.id === discovery.id);
+    return gone ? applyChange(prev, 'Deleted', gone[0], discovery) : (prev ?? new Map());
+  });
+  return data ?? new Map();
+}
+
+// The cache's contents, streamed as a live gauge. NOT read off the ClusterCache record:
+// that object stops changing once its sync settles, so a field there froze at whatever
+// the cache held when the window subscribed — an early, tiny slice of a cold sync.
+const ClusterCacheStatsSubscription = graphql(`
+  subscription ClusterCacheStats($id: ObjectID!, $cacheID: ObjectID!) {
+    clusterCacheStatsWatch(id: $id, cacheID: $cacheID) {
+      exists
+      bytes
+      objectCount
+      kindCount
+    }
+  }
+`);
+
+type CacheContents = { exists: boolean; bytes: number; objectCount: number; kindCount: number };
+
+// The cache's current contents, or null until the first frame. A gauge, so each frame
+// replaces the last outright — there is nothing to accumulate.
+function useCacheContents(clusterId: string, cacheId: string, pause: boolean): CacheContents | null {
+  const [{ data }] = useWatchSubscription<{ clusterCacheStatsWatch: CacheContents }, CacheContents>(
+    { query: ClusterCacheStatsSubscription, variables: { id: clusterId, cacheID: cacheId }, pause },
+    (_prev, resp) => resp.clusterCacheStatsWatch,
+  );
+  return data ?? null;
+}
+
+// One cache's per-kind sync records. Cache-scoped on purpose: there is one per synced
+// kind, so a cluster-wide stream would be a hundred-plus records per cache.
+//
+// Identity only, no conditions: the row's verdict comes from the sidecar's rollup
+// (clusterCacheSyncHealthWatch), which is the one place health is decided — see statusOf.
+// All this stream is asked for is which record owns the timeline worth showing, so
+// selecting per-kind conditions would ship five more fields per record, per frame, for a
+// reading nothing here may make.
+const ClusterCacheGVRSyncsSubscription = graphql(`
+  subscription ClusterCacheGVRSyncs($cacheID: ObjectID!) {
+    clusterCacheGVRSyncsWatch(cacheID: $cacheID) {
+      type
+      sync {
+        id
+        spec {
+          apiVersion
+          resource
+        }
+      }
+    }
+  }
+`);
+
+type GVRSync = ClusterCacheGvrSyncsSubscription['clusterCacheGVRSyncsWatch']['sync'];
+
+// The cache's kind syncs, id-keyed through the registry's shared delta fold.
+function useGVRSyncs(cacheId: string): GVRSync[] {
+  const [{ data }] = useWatchSubscription<
+    { clusterCacheGVRSyncsWatch: { type: string; sync: GVRSync } },
+    Keyed<GVRSync>
+  >({ query: ClusterCacheGVRSyncsSubscription, variables: { cacheID: cacheId } }, (prev, resp) => {
+    const { type, sync } = resp.clusterCacheGVRSyncsWatch;
+    return applyChange(prev, type, sync.id, sync);
+  });
+  return useMemo(() => (data ? [...data.values()] : []), [data]);
 }
 
 // The next-reconcile time, streamed per-cluster (a scheduling change fires no list
@@ -243,7 +369,7 @@ function findCondition<T extends { type: string }>(conditions: T[], type: string
 // successful probe and never clears, so it would keep reading "Active" after a drop).
 function connectionStatus(c: Cluster, group: Group): { label: string; tone: Tone } {
   if (group === 'orphaned') return { label: 'Unavailable', tone: 'muted' };
-  const connected = findCondition(c.status.conditions, 'Connected');
+  const connected = findCondition(c.conditions, 'Connected');
   if (connected?.status === 'True') return { label: 'Active', tone: 'ok' };
   if (connected?.status === 'False') return { label: 'Disconnected', tone: 'error' };
   return { label: 'Connecting', tone: 'attention' };
@@ -257,16 +383,54 @@ function statusOf(c: Cluster, group: Group): { label: string; tone: Tone } {
   if (group === 'orphaned') return { label: 'Stopped', tone: 'muted' };
   if (isPending(c)) return { label: 'Not synced', tone: 'muted' };
   if (!c.spec.syncEnabled) return { label: 'Paused', tone: 'muted' };
-  const connected = findCondition(c.status.conditions, 'Connected');
+  const connected = findCondition(c.conditions, 'Connected');
   // Muted, not amber: the fault is in the connection axis, which carries the error
   // colour — graying the gated sync value keeps it reading as a downstream symptom.
   if (connected?.status === 'False') return { label: 'Stalled', tone: 'muted' };
-  const synced = findCondition(c.activeCache?.status.conditions ?? [], 'Synced');
-  if (synced?.reason === 'SyncFailed') return { label: 'Error', tone: 'error' };
-  // Connected but the watch went quiet past the freshness threshold: cache may be
-  // behind. Amber, not the hard error a SyncFailed is.
-  if (synced?.reason === 'Stale') return { label: 'Stale', tone: 'attention' };
-  return { label: 'Syncing', tone: 'ok' };
+  // The verdict, read off the cache's sync rollup — folded from every kind it syncs, and
+  // dominated by the worst of them. Neither the cache's own Synced condition (coarse:
+  // Syncing/Paused) nor any single kind's would do: a cache with ninety-nine healthy
+  // kinds and one forbidden CRD is not healthy, and one child's verdict picks a side at
+  // random. The sidecar's fold already ignores conditions a previous process wrote and
+  // this one hasn't re-confirmed, so nothing is asserted that nobody observed.
+  //
+  // The cache's `Discovered` axis deliberately does not participate: a partial or failed
+  // kind list doesn't stop the kinds already known from syncing, so it reads as a note in
+  // SyncDetail (discoveryWarning) rather than a verdict on this column.
+  const health = c.activeCache?.syncHealth;
+  // No rollup at all yet — nothing has been observed, so there is nothing to report but
+  // the work in progress.
+  if (!health) return { label: 'Syncing', tone: 'ok' };
+  switch (health.reason) {
+    case 'SyncFailed':
+      return { label: 'Error', tone: 'error' };
+    // Connected but a watch went quiet past the freshness threshold: cache may be behind.
+    // Amber, not the hard error a SyncFailed is.
+    case 'Stale':
+      return { label: 'Stale', tone: 'attention' };
+    // Every kind caught up and streaming deltas — the steady state, distinct from the
+    // catch-up work "Syncing" names.
+    case 'Watching':
+      return { label: 'Synced', tone: 'ok' };
+    // Waiting on credentials the connection hasn't produced yet. Muted for the same reason
+    // as Stalled: nothing is wrong with the sync itself.
+    case 'NoConnection':
+      return { label: 'Connecting', tone: 'muted' };
+    // Every kind is paused. Distinct from the spec.syncEnabled gate above, which flips the
+    // instant the user resumes: the kinds stay paused until their reconciles land, and
+    // painting that gap as healthy green claims a sync that is doing nothing.
+    case 'Paused':
+      return { label: 'Paused', tone: 'muted' };
+    // Catching up, or (with no kinds yet) the discovery pass hasn't landed — not a fault.
+    case 'Syncing':
+    case 'Unknown':
+      return { label: 'Syncing', tone: 'ok' };
+    // A reason this build doesn't know is DEGRADED, not healthy — the schema says to read
+    // it that way, and the sidecar's own fold does. Falling through to green here would
+    // silently paint every future verdict as healthy.
+    default:
+      return { label: 'Degraded', tone: 'attention' };
+  }
 }
 
 // The leading status circle: a rollup of both axes (tone = worst of the two) plus a
@@ -284,14 +448,23 @@ function parseTimeOrNull(iso: string | null | undefined): number | null {
 
 // Diagnostics behind a cluster's connection: whether it's up, and `stateSinceMs`
 // (the `Connected` condition's last transition — how long it's held that state).
+//
+// `unconfirmed` means the status is a downgrade of a previous sidecar process's write,
+// so neither half is knowable yet: the stamp predates this process (rendering it as
+// "up for 3h" would be a claim about a connection nobody has re-established), and the
+// not-True status isn't a real "down" either. Report both as unknown and let the caller
+// show its pending state.
 function connectionDetail(c: Cluster): {
   connected: boolean;
+  unconfirmed: boolean;
   stateSinceMs: number | null;
 } {
-  const cond = findCondition(c.status.conditions, 'Connected');
+  const cond = findCondition(c.conditions, 'Connected');
+  const unconfirmed = cond?.unconfirmed ?? false;
   return {
     connected: cond?.status === 'True',
-    stateSinceMs: parseTimeOrNull(cond?.lastTransitionTime),
+    unconfirmed,
+    stateSinceMs: unconfirmed ? null : parseTimeOrNull(cond?.transitionedAt),
   };
 }
 
@@ -344,15 +517,19 @@ function RelativeTime({ ms, formatter = relativeFormatter }: { ms: number; forma
 }
 
 // One label/value line of the connection diagnostics. A non-null `ms` ticks live; a
-// null `ms` shows `fallback`, or the row is omitted when there's none.
+// null `ms` shows `fallback`, or the row is omitted when there's none. `prefix` is static
+// text rendered ahead of the ticking value, for a reading that is a fact plus its age
+// ("137 kinds · 45s ago").
 function DetailRow({
   label,
   ms,
+  prefix,
   fallback,
   formatter,
 }: {
   label: string;
   ms: number | null;
+  prefix?: string;
   fallback?: ReactNode;
   formatter?: Formatter;
 }) {
@@ -360,7 +537,16 @@ function DetailRow({
   return (
     <div className="flex gap-2">
       <dt className="w-28 shrink-0">{label}</dt>
-      <dd className="tabular-nums">{ms !== null ? <RelativeTime ms={ms} formatter={formatter} /> : fallback}</dd>
+      <dd className="tabular-nums">
+        {ms !== null ? (
+          <>
+            {prefix}
+            <RelativeTime ms={ms} formatter={formatter} />
+          </>
+        ) : (
+          fallback
+        )}
+      </dd>
     </div>
   );
 }
@@ -462,7 +648,7 @@ function ConnectionDetail({
         <DetailRow
           label="Uptime"
           ms={detail.connected ? detail.stateSinceMs : null}
-          fallback="0m"
+          fallback={detail.unconfirmed ? '—' : '0m'}
           formatter={elapsedCoarseFormatter}
         />
         {/* While a probe is in flight (`probing`) show the "checking…" spinner in
@@ -505,68 +691,196 @@ function ConnectionDetail({
   );
 }
 
-// "2,203 objects across 120 kinds" — thousands-grouped and pluralised. Includes
-// cached events, matching the engine's own object/kind rollup.
-function cacheSummary(objectCount: number, kindCount: number): string {
-  const objects = `${objectCount.toLocaleString()} ${objectCount === 1 ? 'object' : 'objects'}`;
-  const kinds = `${kindCount.toLocaleString()} ${kindCount === 1 ? 'kind' : 'kinds'}`;
-  return `${objects} across ${kinds}`;
+// "120 kinds" / "1 kind" — thousands-grouped and pluralised by suffixing an "s", which
+// covers every noun this panel counts.
+function countLabel(n: number, noun: string): string {
+  return `${n.toLocaleString()} ${n === 1 ? noun : `${noun}s`}`;
 }
 
-// The expanded sync diagnostics: the recent cache-sync event history for a cluster's
-// active cache. Inline (not a popover) for the same modal-dialog inert reason as
-// ConnectionDetail, keyed by the active cache's id (the stream lives on ClusterCache).
+// The cache's on-disk size. Streamed rather than read off the cache record for the same
+// reason as the object counts: the size is a file stat that grows with every write, and
+// the record it used to hang off stops changing once the sync settles. Costs one
+// subscription per row, and this whole panel is a dialog — nothing is mounted while it
+// is closed.
+function CacheSizeCell({ contents }: { contents: CacheContents | null }) {
+  return <>{contents?.exists ? formatBytes(contents.bytes) : '—'}</>;
+}
+
+// "118 of 120 kinds — widgets, gateways not syncing" when some are struggling, plain
+// "120 kinds" when all are healthy. Read straight off the rollup: the sidecar already
+// decided which kinds count as unhealthy (and skipped any verdict a previous process
+// wrote), so re-folding the per-kind stream here would be a second definition of health
+// that can disagree with the badge above it mid-frame.
+function kindsSyncingLabel(health: ClusterCacheSyncHealth): string {
+  if (health.unhealthyKinds === 0) return countLabel(health.totalKinds, 'kind');
+  const syncing = `${health.totalKinds - health.unhealthyKinds} of ${countLabel(health.totalKinds, 'kind')}`;
+  // The two fields answer different questions: unhealthyKinds counts every kind that is
+  // not currently Watching, while unhealthyKindRefs names only the ones the fold ranked
+  // as offenders. A cache mid-pause has the count with no names, so there is nobody to put
+  // in the "… not syncing" clause — say how many are syncing and stop.
+  const offenders = offenderList(health);
+  if (!offenders) return `${syncing} syncing`;
+  return `${syncing} — ${offenders} not syncing`;
+}
+
+// The offending kinds as one phrase, capped so a cluster-wide outage doesn't produce an
+// unreadable line. The cap lives here, not in the sidecar: how many names fit is a layout
+// question, and the wire carries the full sorted list.
+const OFFENDER_CAP = 3;
+
+function offenderList(health: ClusterCacheSyncHealth): string {
+  // Rendered by plural alone: the api group each ref carries is for keying, not display.
+  const names = health.unhealthyKindRefs.map((k) => k.resource);
+  if (names.length <= OFFENDER_CAP) return names.join(', ');
+  return `${names.slice(0, OFFENDER_CAP).join(', ')} +${names.length - OFFENDER_CAP} more`;
+}
+
+// The per-kind record whose transition log to show. Deterministic and sticky: the rollup
+// names its offenders in sorted order, so following the first keeps the choice stable
+// while a hundred kinds stream in — picking "whichever unhealthy record arrived first"
+// would re-key the subscription on every frame and re-dial the stream each time.
+// Falls back to Events, the one kind always present.
+function timelineSyncFor(all: GVRSync[], health: ClusterCacheSyncHealth): GVRSync | null {
+  const firstOffender = health.unhealthyKindRefs[0];
+  if (firstOffender) {
+    // Matched on the whole kind, not the plural: a CRD may reuse a built-in's plural under
+    // its own api group (example.com/v1 gateways beside gateway.networking.k8s.io/v1
+    // gateways), and matching loosely would open the healthy kind's timeline under the
+    // failing kind's heading.
+    const match = all.find((s) => gvrKey(s.spec) === gvrKey(firstOffender));
+    if (match) return match;
+  }
+  return all.find((s) => gvrKey(s.spec) === gvrKey(EVENTS_GVR)) ?? null;
+}
+
+// "2,203 objects across 120 kinds". Includes cached events, matching the engine's own
+// object/kind rollup.
+function cacheSummary(objectCount: number, kindCount: number): string {
+  return `${countLabel(objectCount, 'object')} across ${countLabel(kindCount, 'kind')}`;
+}
+
+// The kind-discovery reading: how many kinds the cluster serves, and when that list was
+// last confirmed. Discovery cannot be watched (its document carries no resourceVersion),
+// so the list is refreshed by a poll and its currency is a real question — hence the
+// live timestamp beside the count rather than a bare number.
+//
+// null whenever a pass has yet to land — no record, or `stats` null because the sidecar
+// has run no pass since it started — so the caller omits the row rather than claiming a
+// count nobody has observed. The gauges are sampled per frame from the sidecar rather
+// than stored on the record, so a frame always carries the current reading.
+function discoveredKinds(discovery: GVRDiscovery | null): { prefix: string; ms: number } | null {
+  const lastMs = parseTimeOrNull(discovery?.stats?.lastDiscoveryAt ?? null);
+  if (!discovery?.stats || lastMs === null) return null;
+  return { prefix: `${countLabel(discovery.stats.resourceCount, 'kind')} · `, ms: lastMs };
+}
+
+// A warning about the kind list itself, distinct from whether the kinds are syncing: the
+// last pass either got a partial answer (some api group didn't respond, so the list is
+// known-incomplete — nothing was pruned from it) or failed outright (the list is simply
+// as old as `lastDiscoveryAt` says). Why this is a note and not a status — see statusOf.
+//
+// Unconfirmed conditions are skipped for the same reason as in statusOf: the reason
+// survives beehive's post-restart downgrade and describes a state this process has not
+// re-observed.
+function discoveryWarning(discovery: GVRDiscovery | null): string | null {
+  const cond = findCondition(discovery?.conditions ?? [], 'Discovered');
+  if (!cond || cond.unconfirmed) return null;
+  if (cond.reason === 'DiscoveryPartial') {
+    return cond.message || 'Some api groups did not respond — the kind list may be incomplete.';
+  }
+  if (cond.reason === 'DiscoveryFailed') {
+    return `Kind discovery is failing — ${cond.message || 'the cluster could not be asked which kinds it serves.'}`;
+  }
+  // The kind list is right but a kind the cluster still serves has no live child yet: an
+  // earlier prune's child is still draining and holds the name. Transient, but it means one
+  // kind is not being synced at all, so it must not render as nothing.
+  if (cond.reason === 'DiscoveryDraining') {
+    return cond.message || 'Waiting for replaced kinds to finish draining.';
+  }
+  return null;
+}
+
+// The expanded sync diagnostics: the cache's rolled-up freshness, its live contents,
+// per-kind sync health, and one kind's recent transition history. Inline (not a popover) for the
+// same modal-dialog inert reason as ConnectionDetail.
+//
+// Everything here is subscribed only while the row is expanded, which is what makes the
+// per-kind stream affordable — it is a hundred-plus records for the one cache being
+// looked at, not for every cache at once.
 function SyncDetail({
+  health,
   cacheId,
-  lastSyncedAt,
-  objectCount,
-  kindCount,
-  syncReason,
-  syncMessage,
+  contents,
+  discovery,
 }: {
+  health: ClusterCacheSyncHealth;
   cacheId: string;
-  lastSyncedAt: string | null;
-  objectCount: number;
-  kindCount: number;
-  syncReason?: string;
-  syncMessage?: string;
+  contents: CacheContents | null;
+  discovery: GVRDiscovery | null;
 }) {
-  const events = useSyncEvents(cacheId);
-  const lastSyncedMs = parseTimeOrNull(lastSyncedAt);
-  // Staleness is engine-derived (the Stale condition reason), never inferred from
-  // lastSyncedAt's age — a quiet-but-healthy cache legitimately has an old one.
-  const stale = syncReason === 'Stale';
+  const kindSyncs = useGVRSyncs(cacheId);
+  const timelineKind = timelineSyncFor(kindSyncs, health);
+  const events = useSyncEvents(timelineKind?.id);
+  // Rolled up across kinds: the newest write anywhere, beside the OLDEST proof — a cache
+  // is only as verified as its least-recently proven watch.
+  const lastUpdateMs = parseTimeOrNull(health.lastUpdateAt ?? null);
+  const lastLiveMs = parseTimeOrNull(health.lastLiveAt ?? null);
+  // Staleness is engine-derived (the Stale reason), never inferred from either stamp's
+  // age — a quiet-but-healthy cache legitimately has an old lastUpdateAt.
+  const stale = health.reason === 'Stale';
+  const discoveryNote = discoveryWarning(discovery);
   return (
     <div className="space-y-2 rounded-md border bg-muted/30 p-3">
       <p className="text-sm font-medium">Sync status</p>
       {stale ? (
         <p className={`text-xs ${TONE.attention.text}`}>
-          Possibly stale — {syncMessage || 'the watch may have stopped delivering updates.'}
+          Possibly stale —{' '}
+          {health.unhealthyKindRefs.length
+            ? `${offenderList(health)} not receiving updates.`
+            : 'the watch may have stopped delivering updates.'}
         </p>
       ) : null}
-      {/* Cache-content summary — shown only when the cache has objects (an empty one
-          is already covered by the freshness line's "No updates received yet."). */}
-      {objectCount > 0 ? (
-        <div className="flex gap-2 text-xs text-muted-foreground">
-          <span>Cached:</span>
-          <span className="tabular-nums">{cacheSummary(objectCount, kindCount)}</span>
-        </div>
-      ) : null}
-      {/* Freshness — when the cache last received data, as a live counter. Separate
-          from the sync-event history below (a transition log): "current now?" vs
-          "what happened?". */}
-      {lastSyncedMs !== null ? (
-        <div className="flex gap-2 text-xs text-muted-foreground">
-          <span>Last update received:</span>
-          <span className="tabular-nums">
-            <RelativeTime ms={lastSyncedMs} />
-          </span>
-        </div>
-      ) : (
-        <p className="text-xs text-muted-foreground">No updates received yet.</p>
-      )}
+      {discoveryNote ? <p className={`text-xs ${TONE.attention.text}`}>{discoveryNote}</p> : null}
+      <dl className="space-y-0.5 text-xs text-muted-foreground">
+        {/* Cache-content summary — shown only when the cache has objects (an empty one
+            is already covered by the freshness line's "No updates received yet."). */}
+        {contents && contents.objectCount > 0 ? (
+          <DetailRow label="Cached" ms={null} fallback={cacheSummary(contents.objectCount, contents.kindCount)} />
+        ) : null}
+        {/* Freshness, as two live counters. Separate from the sync-event history below
+            (a transition log): "current now?" vs "what happened?".
+
+            The two stamps answer different questions and must not be conflated. An update
+            is data actually written to the cache; on a quiet cluster none arrives for
+            hours, which is normal and not a fault. "Sync verified" is when the watch last
+            proved it's alive (a delta or an api-server bookmark), so it stays recent
+            throughout that quiet — it's what says the old update time is nothing to worry
+            about. Showing only the first would read as a stall; only the second would
+            claim updates that never came. */}
+        {/* What the cluster says it serves, and how current that answer is — the input
+            to the sync, as distinct from the "Cached" line above (what was mirrored)
+            and the freshness lines below (whether the mirroring is live). Omitted
+            entirely until the discovery record streams in. */}
+        <DetailRow label="Kinds discovered" {...(discoveredKinds(discovery) ?? { ms: null })} />
+        {/* Per-kind sync health — the axis neither the cache's coarse Synced condition
+            nor discovery's Discovered can report: a cache's kinds each sync on their own
+            worker and fail independently, so one forbidden CRD is invisible in every
+            other reading. Omitted until the stream has delivered something. */}
+        {health.totalKinds > 0 ? (
+          <DetailRow label="Kinds syncing" ms={null} fallback={kindsSyncingLabel(health)} />
+        ) : null}
+        <DetailRow label="Last update received" ms={lastUpdateMs} fallback="No updates received yet." />
+        {/* No fallback: before the first proof there is nothing honest to say, so the
+            row is omitted rather than asserting a verification that never happened. */}
+        <DetailRow label="Sync verified" ms={lastLiveMs} />
+      </dl>
       {events.length > 0 ? (
-        <EventRunList title="Recent sync events" runs={events} labelOf={(e) => e.reason} showDuration={false} />
+        <EventRunList
+          title={timelineKind ? `Recent sync events — ${timelineKind.spec.resource}` : 'Recent sync events'}
+          runs={events}
+          labelOf={(e) => e.reason}
+          showDuration={false}
+        />
       ) : (
         <p className="text-xs text-muted-foreground">No sync events yet.</p>
       )}
@@ -583,10 +897,41 @@ function ClearCacheIcon() {
     </span>
   );
 }
+// DetailPane is which of a row's two disclosures is open; only one may be at a time.
+type DetailPane = 'connection' | 'sync' | null;
+
+// DisclosureLabel is a status label that opens its detail row — the connection column's
+// toggle and the sync column's are the same control over the same piece of state, so they
+// are one component rather than two identical buttons whose styling has to be kept in step.
+function DisclosureLabel({
+  tone,
+  label,
+  expanded,
+  onToggle,
+}: {
+  tone: Tone;
+  label: string;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-expanded={expanded}
+      onClick={onToggle}
+      data-tone={tone}
+      className={`${TONE[tone].text} inline-flex cursor-pointer items-center gap-1 rounded-sm underline decoration-dotted underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring`}
+    >
+      {label}
+      <ChevronDown className={`size-3 transition-transform ${expanded ? 'rotate-180' : ''}`} aria-hidden />
+    </button>
+  );
+}
 
 function ClusterRow({
   cluster,
   group,
+  discovery,
   onSetEnabled,
   onToggle,
   onClearCache,
@@ -595,6 +940,7 @@ function ClusterRow({
 }: {
   cluster: Cluster;
   group: Group;
+  discovery: GVRDiscovery | null;
   onSetEnabled: (enabled: boolean) => void;
   onToggle: (enabled: boolean) => void;
   onClearCache: () => void;
@@ -602,22 +948,24 @@ function ClusterRow({
   onRetry: () => void;
 }) {
   const name = displayName(cluster);
+  // ONE subscription per row for the cache's contents, shared by the always-visible size
+  // cell and the expanded sync detail. They previously subscribed separately with identical
+  // variables, which urql resolves to the same operation — and a subscription's second
+  // subscriber joins mid-stream with no replay, so whichever mounted later (the detail)
+  // sat on null until the next frame and never rendered its "N objects across M kinds".
+  const { activeCache } = cluster;
+  const contents = useCacheContents(cluster.id, activeCache?.id ?? '', !activeCache);
   const connection = connectionStatus(cluster, group);
   const status = statusOf(cluster, group);
   const overall = overallStatus(connection, status);
   const orphaned = group === 'orphaned';
   const connFailed = connection.tone === 'error';
   // Only one detail row can be open at a time.
-  const [openDetail, setOpenDetail] = useState<'connection' | 'sync' | null>(null);
-  const showDetail = openDetail === 'connection';
-  const setShowDetail = (open: boolean) => setOpenDetail(open ? 'connection' : null);
-  // The sync label is a disclosure only when there's an active cache to stream sync
-  // events for (a pending/never-cached row has no timeline).
-  const cacheId = cluster.activeCache?.id;
-  // Drives the sync detail's stale banner.
-  const syncCond = findCondition(cluster.activeCache?.status.conditions ?? [], 'Synced');
-  const showSyncDetail = openDetail === 'sync';
-  const setShowSyncDetail = (open: boolean) => setOpenDetail(open ? 'sync' : null);
+  const [openDetail, setOpenDetail] = useState<DetailPane>(null);
+  const toggleDetail = (pane: Exclude<DetailPane, null>) => setOpenDetail(openDetail === pane ? null : pane);
+  // The sync label is a disclosure only once the cache's rollup has streamed in — a
+  // pending/never-synced row has no verdict and so nothing to open.
+  const sync = cluster.activeCache?.syncHealth;
   const pending = isPending(cluster);
   const { enabled } = cluster.spec;
   // Sync toggles only for an enabled, identified cluster still in the kubeconfig.
@@ -638,40 +986,29 @@ function ClusterRow({
         </TableCell>
         <TableCell className="max-w-0 truncate font-medium align-top">{name}</TableCell>
         <TableCell className="align-top">
-          <button
-            type="button"
-            aria-expanded={showDetail}
-            onClick={() => setShowDetail(!showDetail)}
-            data-tone={connection.tone}
-            className={`${TONE[connection.tone].text} inline-flex cursor-pointer items-center gap-1 rounded-sm underline decoration-dotted underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring`}
-          >
-            {connection.label}
-            <ChevronDown className={`size-3 transition-transform ${showDetail ? 'rotate-180' : ''}`} aria-hidden />
-          </button>
+          <DisclosureLabel
+            tone={connection.tone}
+            label={connection.label}
+            expanded={openDetail === 'connection'}
+            onToggle={() => toggleDetail('connection')}
+          />
         </TableCell>
         <TableCell className="align-top">
-          {/* A disclosure (sync-event history) when there's an active cache, else
-              plain text. Mirrors the connection column's toggle. */}
-          {cacheId ? (
-            <button
-              type="button"
-              aria-expanded={showSyncDetail}
-              onClick={() => setShowSyncDetail(!showSyncDetail)}
-              data-tone={status.tone}
-              className={`${TONE[status.tone].text} inline-flex cursor-pointer items-center gap-1 rounded-sm underline decoration-dotted underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring`}
-            >
-              {status.label}
-              <ChevronDown
-                className={`size-3 transition-transform ${showSyncDetail ? 'rotate-180' : ''}`}
-                aria-hidden
-              />
-            </button>
+          {/* A disclosure (sync-event history) once the sync child has streamed in,
+              else plain text. Mirrors the connection column's toggle. */}
+          {sync ? (
+            <DisclosureLabel
+              tone={status.tone}
+              label={status.label}
+              expanded={openDetail === 'sync'}
+              onToggle={() => toggleDetail('sync')}
+            />
           ) : (
             <ToneText tone={status.tone}>{status.label}</ToneText>
           )}
         </TableCell>
         <TableCell className="tabular-nums">
-          {cluster.activeCache?.stats.exists ? formatBytes(cluster.activeCache.stats.bytes) : '—'}
+          <CacheSizeCell contents={contents} />
         </TableCell>
         <TableCell>
           <div className="flex items-center justify-end gap-0.5">
@@ -702,7 +1039,7 @@ function ClusterRow({
               variant="ghost"
               size="icon-sm"
               aria-label={`Clear cache for ${name}`}
-              disabled={!cluster.activeCache?.stats.exists}
+              disabled={!contents?.exists}
               onClick={onClearCache}
             >
               <ClearCacheIcon />
@@ -724,7 +1061,7 @@ function ClusterRow({
           </div>
         </TableCell>
       </TableRow>
-      {showDetail ? (
+      {openDetail === 'connection' ? (
         <TableRow className="hover:bg-transparent">
           <TableCell className={STATUS_CELL_CLASS} />
           <TableCell colSpan={COLUMN_COUNT - 1} className="pt-0">
@@ -732,18 +1069,11 @@ function ClusterRow({
           </TableCell>
         </TableRow>
       ) : null}
-      {showSyncDetail && cacheId ? (
+      {openDetail === 'sync' && sync ? (
         <TableRow className="hover:bg-transparent">
           <TableCell className={STATUS_CELL_CLASS} />
           <TableCell colSpan={COLUMN_COUNT - 1} className="pt-0">
-            <SyncDetail
-              cacheId={cacheId}
-              lastSyncedAt={cluster.activeCache?.status.lastSyncedAt ?? null}
-              objectCount={cluster.activeCache?.stats.objectCount ?? 0}
-              kindCount={cluster.activeCache?.stats.kindCount ?? 0}
-              syncReason={syncCond?.reason}
-              syncMessage={syncCond?.message}
-            />
+            <SyncDetail health={sync} cacheId={sync.cacheID} contents={contents} discovery={discovery} />
           </TableCell>
         </TableRow>
       ) : null}
@@ -775,6 +1105,14 @@ const GROUPS: { key: Group; label: string; suffix: string; match: (c: Cluster) =
 // streams mount only when a row's diagnostics open.
 export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
   const { clusters, connected } = useClusters();
+  // ONE fleet-wide discovery subscription for the whole dialog, folded into a map by
+  // cacheID. Every expanded row wants this stream and it takes no variables, so per-row
+  // subscriptions all resolved to the same urql operation — and a subscription's second
+  // subscriber joins mid-stream with no replay, so the second row expanded saw nothing
+  // until the next 5-minute pass. It stays dialog-scoped (nothing subscribes while the
+  // panel is closed), which is the property that mattered; it is now open for the dialog's
+  // life rather than only while a row is expanded, which costs one record per cache.
+  const discoveries = useGVRDiscoveries();
   const rows = clusters ?? [];
   const groups = GROUPS.map((g) => ({ ...g, clusters: rows.filter(g.match) })).filter((g) => g.clusters.length > 0);
 
@@ -858,6 +1196,7 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
                   key={c.id}
                   cluster={c}
                   group={g.key}
+                  discovery={discoveries.get(c.activeCache?.id ?? '') ?? null}
                   onSetEnabled={(enabled) => run(clusterEnabledSetMut({ id: c.id, enabled }))}
                   onToggle={(syncEnabled) => run(clusterSyncEnabledSetMut({ id: c.id, syncEnabled }))}
                   onClearCache={() => run(clusterCacheClearMut({ id: c.id }))}

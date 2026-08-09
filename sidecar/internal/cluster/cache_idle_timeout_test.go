@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package engine
+package cluster
 
 import (
 	"context"
@@ -141,7 +141,7 @@ func TestIdleTimeoutCancelsBeforeHeaders(t *testing.T) {
 // cancel context — leaving RetryWatcher and HTTP/2 keepalive to govern them.
 func TestIdleTimeoutExemptsWatch(t *testing.T) {
 	base := roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(newFakeReader())}, nil
+		return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
 	})
 	rt := newIdleTimeoutWrapper(10 * time.Millisecond)(base)
 
@@ -159,6 +159,3 @@ func TestIdleTimeoutZeroDisabled(t *testing.T) {
 	_, wrapped := rt.(*idleTimeoutRoundTripper)
 	require.False(t, wrapped, "a non-positive timeout must return the transport unwrapped")
 }
-
-// newFakeReader returns an empty, always-EOF reader for the watch-exemption sentinel.
-func newFakeReader() io.Reader { return &chunkedBody{ctx: context.Background(), chunks: 0} }

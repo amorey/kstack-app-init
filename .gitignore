@@ -28,5 +28,12 @@ src-tauri/binaries/
 *.sln
 *.sw?
 
-# Agents
-.claude
+# Agents. Ignore the directory's contents rather than the directory itself, so
+# the shared team config below can be re-included — a negation cannot resurrect
+# a file whose parent directory is excluded. Personal settings
+# (settings.local.json), worktrees, and lock files stay ignored.
+.claude/*
+!.claude/settings.json
+
+# Linux build outputs when developing inside the sandbox (see scripts note).
+.sandbox-linux/

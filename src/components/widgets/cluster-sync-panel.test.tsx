@@ -38,12 +38,9 @@ type Row = {
   name: string;
   enabled: boolean;
   present: boolean;
-  cached: boolean;
   isCurrent?: boolean;
-  cacheBytes?: number;
-  objectCount?: number;
-  kindCount?: number;
-  lastSyncedAt?: string;
+  lastUpdateAt?: string;
+  lastLiveAt?: string;
   // The live `Connected` condition the connection column reads. Defaults to
   // 'True' (reachable); set 'False' to model a dropped connection (internet
   // off / probe failed), 'Unknown' for not-yet-probed.
@@ -54,25 +51,61 @@ type Row = {
   // Model a stalled-but-connected watch (Synced=False/Stale) — the cache may be
   // behind even though the connection is up.
   stale?: boolean;
+  // Model a cache whose kinds are all still paused (Synced=False/Paused) — what a
+  // just-resumed cluster reads as until its children reconcile.
+  kindsPaused?: boolean;
+  // Model a verdict this build doesn't recognise — a reason a newer sidecar emits.
+  unknownReason?: boolean;
+  // Model a sync waiting on credentials the connection hasn't produced yet
+  // (Synced=False/NoConnection) — a sync's normal startup state.
+  noConnection?: boolean;
+  // Model conditions left behind by a previous sidecar process: beehive downgrades a
+  // liveness condition it didn't write to Unknown, keeping the pre-restart reason and
+  // stamps, and flags it `unconfirmed`.
+  unconfirmed?: boolean;
   // Connection diagnostics surfaced in the Disconnected popover.
   connMessage?: string; // Connected condition's `message` (the probe error)
-  disconnectedSince?: string; // Connected condition's `lastTransitionTime` (ISO)
+  disconnectedSince?: string; // Connected condition's `transitionedAt` (ISO)
   lastConnectedAt?: string; // status.lastConnectedAt (ISO; null = never)
 };
 
-// The `Synced` condition a probed row's ClusterCache carries, keyed off the
-// row's modelled sync state (failed / stale / healthy).
-function syncedCondition(r: Row) {
-  if (r.syncFailed) return { type: 'Synced', status: 'False', reason: 'SyncFailed' };
-  if (r.stale) {
+// The cache's folded sync verdict for a row. The sidecar folds every kind's Synced into
+// one reading, ignoring any condition a previous process wrote that this one hasn't
+// re-confirmed — so an unconfirmed row rolls up as "nothing observed yet" rather than
+// asserting its last-known verdict.
+function syncHealthOf(r: Row): {
+  status: string;
+  reason: string;
+  unhealthyKindRefs: { apiVersion: string; resource: string }[];
+  unhealthyKinds: number;
+} {
+  if (r.unconfirmed) return { status: 'Unknown', reason: 'Syncing', unhealthyKindRefs: [], unhealthyKinds: 0 };
+  if (r.syncFailed)
     return {
-      type: 'Synced',
+      status: 'False',
+      reason: 'SyncFailed',
+      unhealthyKindRefs: [{ apiVersion: 'example.com/v1', resource: 'widgets' }],
+      unhealthyKinds: 1,
+    };
+  if (r.noConnection) {
+    return { status: 'False', reason: 'NoConnection', unhealthyKindRefs: [], unhealthyKinds: 1 };
+  }
+  if (r.stale)
+    return {
       status: 'False',
       reason: 'Stale',
-      message: 'No watch heartbeat for Pod — cache may be behind',
+      unhealthyKindRefs: [{ apiVersion: 'v1', resource: 'pods' }],
+      unhealthyKinds: 1,
     };
-  }
-  return { type: 'Synced', status: 'True', reason: 'Watching' };
+  if (r.kindsPaused) return { status: 'False', reason: 'Paused', unhealthyKindRefs: [], unhealthyKinds: 2 };
+  if (r.unknownReason)
+    return {
+      status: 'False',
+      reason: 'QuotaExceeded',
+      unhealthyKindRefs: [{ apiVersion: 'v1', resource: 'pods' }],
+      unhealthyKinds: 1,
+    };
+  return { status: 'True', reason: 'Watching', unhealthyKindRefs: [], unhealthyKinds: 0 };
 }
 
 // Deliver the `open` frame the host sends on each established connection (ahead of
@@ -81,15 +114,19 @@ function syncedCondition(r: Row) {
 function openStreams() {
   channelFor('clustersWatch').onmessage!(JSON.stringify({ type: 'open' }));
   channelFor('clusterCachesWatch').onmessage!(JSON.stringify({ type: 'open' }));
+  channelFor('clusterCacheSyncHealthWatch').onmessage!(JSON.stringify({ type: 'open' }));
 }
 
-// Push each row as an Added change on the two delta streams: a Cluster change on
+// Push each row as an Added change on the three delta streams: a Cluster change on
 // clustersWatch, plus (for a probed row) its ClusterCache change on
-// clusterCachesWatch. The provider joins them into the row's activeCache by
-// matching cache.serverUid to cluster.status.server.uid.
+// clusterCachesWatch and that cache's folded sync verdict on
+// clusterCacheEventsSyncsWatch. The provider joins them down the chain — cache onto
+// cluster by serverUid, sync onto cache by cacheID — which is what gives a row its
+// activeCache and its sync state.
 function pushClusters(rows: Row[]) {
   const clusterCh = channelFor('clustersWatch');
   const cacheCh = channelFor('clusterCachesWatch');
+  const healthCh = channelFor('clusterCacheSyncHealthWatch');
   rows.forEach((r, i) => {
     const id = r.uuid || `pending-${i}`;
     clusterCh.onmessage!(
@@ -118,16 +155,18 @@ function pushClusters(rows: Row[]) {
                   },
                   server: { uid: r.uuid || null },
                   lastConnectedAt: r.lastConnectedAt ?? null,
-                  conditions: [
-                    {
-                      type: 'Connected',
-                      status: r.connected ?? 'True',
-                      reason: '',
-                      message: r.connMessage ?? '',
-                      lastTransitionTime: r.disconnectedSince ?? null,
-                    },
-                  ],
                 },
+                conditions: [
+                  {
+                    type: 'Connected',
+                    status: r.unconfirmed ? 'Unknown' : (r.connected ?? 'True'),
+                    reason: '',
+                    message: r.connMessage ?? '',
+                    liveness: true,
+                    unconfirmed: r.unconfirmed ?? false,
+                    transitionedAt: r.disconnectedSince ?? null,
+                  },
+                ],
               },
             },
           },
@@ -146,17 +185,26 @@ function pushClusters(rows: Row[]) {
                 id: `cache-${r.uuid}`,
                 clusterID: id,
                 serverUid: r.uuid,
-                status: {
-                  conditions: [syncedCondition(r)],
-                  lastSyncedAt: r.lastSyncedAt ?? null,
-                },
-                stats: {
-                  exists: r.cached,
-                  bytes: r.cacheBytes ?? 0,
-                  objectCount: r.objectCount ?? 0,
-                  kindCount: r.kindCount ?? 0,
-                },
+                // No status/conditions/stats here: the panel reads freshness and the
+                // verdict off the sync record below, and the whole of the cache's
+                // contents (existence, size, counts) streams per row via
+                // clusterCacheStatsWatch. The query selects nothing else.
               },
+            },
+          },
+        },
+      }),
+    );
+    healthCh.onmessage!(
+      JSON.stringify({
+        type: 'next',
+        payload: {
+          data: {
+            clusterCacheSyncHealthWatch: {
+              cacheID: `cache-${r.uuid}`,
+              ...syncHealthOf(r),
+              lastUpdateAt: r.lastUpdateAt ?? null,
+              lastLiveAt: r.lastLiveAt ?? null,
             },
           },
         },
@@ -181,8 +229,9 @@ function pushConnectionEvent(ev: {
   );
 }
 
-// Push one frame on the per-cache clusterCacheEventsWatch stream (a bare Event).
-// Call after a row's sync diagnostics are open (mounts the sync-events subscription).
+// Push one frame on the clusterCacheGVRSyncEventsWatch stream (a bare Event) — the
+// one kind's transition timeline. Call after a row's sync diagnostics are open
+// (mounts the sync-events subscription).
 function pushSyncEvent(ev: {
   id: string;
   type: 'Normal' | 'Warning';
@@ -192,8 +241,130 @@ function pushSyncEvent(ev: {
   firstAt: string;
   lastAt: string;
 }) {
-  channelFor('clusterCacheEventsWatch').onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { clusterCacheEventsWatch: ev } } }),
+  channelFor('clusterCacheGVRSyncEventsWatch').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clusterCacheGVRSyncEventsWatch: ev } } }),
+  );
+}
+
+// Push a GVR-discovery record on the fleet-wide stream the expanded sync detail
+// subscribes to. Call after a row's sync detail is open — that is what mounts it, which
+// is the point of the placement: nothing subscribes while the dialog is closed.
+// The cache-contents gauge. It is a subscription, not a field on the cache record: the
+// record stops changing once the sync settles, so a field there froze at whatever the
+// cache held when the window subscribed.
+function pushCacheStats(objectCount: number, kindCount: number, bytes = 0) {
+  channelFor('clusterCacheStatsWatch').onmessage!(
+    JSON.stringify({
+      type: 'next',
+      payload: { data: { clusterCacheStatsWatch: { exists: true, bytes, objectCount, kindCount } } },
+    }),
+  );
+}
+
+// The gauge for ONE cache. Each row subscribes with its own cacheID, so a multi-cluster
+// test can't use channelFor (which takes the last match) — this matches on the
+// subscription's variables instead.
+function pushCacheStatsFor(cacheId: string, bytes: number) {
+  const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
+  const idx = subs.findIndex(([, arg]) => {
+    const a = arg as { query: string; variables?: Record<string, unknown> };
+    return a.query.includes('clusterCacheStatsWatch') && a.variables?.cacheID === cacheId;
+  });
+  if (idx < 0) throw new Error(`no stats subscription for ${cacheId}`);
+  channels[idx].onmessage!(
+    JSON.stringify({
+      type: 'next',
+      payload: { data: { clusterCacheStatsWatch: { exists: true, bytes, objectCount: 0, kindCount: 0 } } },
+    }),
+  );
+}
+
+// Push a cache's folded verdict directly, for the fields the row fixture doesn't vary.
+function pushSyncHealth(cacheId: string, over: Record<string, unknown>) {
+  channelFor('clusterCacheSyncHealthWatch').onmessage!(
+    JSON.stringify({
+      type: 'next',
+      payload: {
+        data: {
+          clusterCacheSyncHealthWatch: {
+            cacheID: cacheId,
+            status: 'True',
+            reason: 'Watching',
+            unhealthyKindRefs: [],
+            totalKinds: 0,
+            unhealthyKinds: 0,
+            lastUpdateAt: null,
+            lastLiveAt: null,
+            ...over,
+          },
+        },
+      },
+    }),
+  );
+}
+
+// One per-kind sync record on the cache-scoped stream.
+function pushGVRSync(id: string, resource: string, reason: string, apiVersion = 'v1') {
+  channelFor('clusterCacheGVRSyncsWatch').onmessage!(
+    JSON.stringify({
+      type: 'next',
+      payload: {
+        data: {
+          clusterCacheGVRSyncsWatch: {
+            type: 'Added',
+            sync: {
+              id,
+              spec: { apiVersion, resource },
+              conditions: [
+                {
+                  type: 'Synced',
+                  status: reason === 'Watching' ? 'True' : 'False',
+                  reason,
+                  message: '',
+                  unconfirmed: false,
+                },
+              ],
+            },
+          },
+        },
+      },
+    }),
+  );
+}
+
+function pushDiscovery(
+  cacheId: string,
+  d: { resourceCount: number; lastDiscoveryAt?: string; reason?: string; message?: string },
+) {
+  channelFor('clusterCacheGVRDiscoveriesWatch').onmessage!(
+    JSON.stringify({
+      type: 'next',
+      payload: {
+        data: {
+          clusterCacheGVRDiscoveriesWatch: {
+            type: 'Added',
+            discovery: {
+              id: `disc-${cacheId}`,
+              cacheID: cacheId,
+              // stats is resolved on read by the sidecar (never stored on the record),
+              // and is null until a pass has run in the current process.
+              stats:
+                d.lastDiscoveryAt === undefined
+                  ? null
+                  : { lastDiscoveryAt: d.lastDiscoveryAt, resourceCount: d.resourceCount },
+              conditions: [
+                {
+                  type: 'Discovered',
+                  reason: d.reason ?? 'Discovered',
+                  message: d.message ?? '',
+                  unconfirmed: false,
+                },
+              ],
+            },
+          },
+        },
+      },
+    }),
   );
 }
 
@@ -324,7 +495,7 @@ describe('ClusterSyncPanel', () => {
   });
 
   it('flags reconnecting but keeps the table when the transport drops after loading', async () => {
-    await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
+    await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true }]);
     expect(await screen.findByText('prod-us')).toBeInTheDocument();
     expect(screen.queryByText(/reconnecting…/i)).not.toBeInTheDocument();
 
@@ -338,7 +509,7 @@ describe('ClusterSyncPanel', () => {
   });
 
   it('renders the table columns', async () => {
-    await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
+    await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true }]);
     expect(await screen.findByRole('columnheader', { name: /^cluster$/i })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: /^connection$/i })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: /sync status/i })).toBeInTheDocument();
@@ -348,9 +519,9 @@ describe('ClusterSyncPanel', () => {
 
   it('splits clusters into active and orphaned row groups by kubeconfig presence', async () => {
     await openWith([
-      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, cacheBytes: 1_300_000 },
-      { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: true, cacheBytes: 524_288 },
-      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true, cacheBytes: 1024 },
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true },
+      { uuid: 'u-stg', name: 'staging', enabled: false, present: true },
+      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false },
     ]);
 
     const active = await screen.findByRole('rowgroup', { name: /active/i });
@@ -363,11 +534,16 @@ describe('ClusterSyncPanel', () => {
     expect(within(orphaned).getByText('old-cluster')).toBeInTheDocument();
     expect(within(orphaned).queryByText('prod-us')).not.toBeInTheDocument();
 
-    // Status + formatted cache sizes (binary units).
-    expect(within(active).getByText(/^syncing$/i)).toBeInTheDocument();
+    // Status + formatted cache sizes (binary units). The sizes stream per row — the
+    // cache record they used to ride stops changing once its sync settles.
+    expect(within(active).getByText(/^synced$/i)).toBeInTheDocument();
     expect(within(active).getByText(/^paused$/i)).toBeInTheDocument();
     expect(within(orphaned).getByText(/^stopped$/i)).toBeInTheDocument();
-    expect(screen.getByText(/1\.2 MB/)).toBeInTheDocument();
+    act(() => {
+      pushCacheStatsFor('cache-u-prod', 1_300_000);
+      pushCacheStatsFor('cache-u-stg', 524_288);
+    });
+    expect(await screen.findByText(/1\.2 MB/)).toBeInTheDocument();
     expect(screen.getByText(/512\.0 KB/)).toBeInTheDocument();
   });
 
@@ -378,15 +554,14 @@ describe('ClusterSyncPanel', () => {
         name: 'prod-us',
         enabled: true,
         present: true,
-        cached: true,
         isCurrent: true,
         connected: 'True',
       },
       // Previously reachable but now unreachable (e.g. internet off): the
       // Connected condition flips to False even though server.uid lingers.
-      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
-      { uuid: '', name: 'minikube', enabled: false, present: true, cached: false, connected: 'Unknown' },
-      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true },
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, connected: 'False' },
+      { uuid: '', name: 'minikube', enabled: false, present: true, connected: 'Unknown' },
+      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false },
     ]);
 
     // Scoped to cells so the group-header "Active" label doesn't collide.
@@ -401,40 +576,132 @@ describe('ClusterSyncPanel', () => {
 
   it('reflects the live sync state, not just the enabled toggle', async () => {
     await openWith([
-      // Enabled + connected + watching → Syncing.
-      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, connected: 'True' },
+      // Enabled + connected + watching → Synced.
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, connected: 'True' },
       // Enabled but disconnected: the engine keeps a stale Watching state, so
-      // gate on the connection — this is Stalled, not Syncing.
-      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+      // gate on the connection — this is Stalled, not Synced.
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, connected: 'False' },
       // Enabled + connected but the engine reported an engine-level failure.
       {
         uuid: 'u-broke',
         name: 'broke',
         enabled: true,
         present: true,
-        cached: true,
         connected: 'True',
         syncFailed: true,
       },
     ]);
 
     const active = await screen.findByRole('rowgroup', { name: /active/i });
-    expect(within(active).getByRole('cell', { name: 'Syncing' })).toBeInTheDocument();
+    expect(within(active).getByRole('cell', { name: 'Synced' })).toBeInTheDocument();
     expect(within(active).getByRole('cell', { name: 'Stalled' })).toBeInTheDocument();
     expect(within(active).getByRole('cell', { name: 'Error' })).toBeInTheDocument();
   });
 
+  // A sync waiting on credentials is not a fault and not progress: the connection axis
+  // owns that story, so this reads muted rather than claiming work is underway.
+  it('reads a sync waiting on the connection as Connecting, not Syncing', async () => {
+    await openWith([
+      {
+        uuid: 'u-cold',
+        name: 'prod-us',
+        enabled: true,
+        present: true,
+        connected: 'Unknown',
+        noConnection: true,
+      },
+    ]);
+
+    const active = await screen.findByRole('rowgroup', { name: /active/i });
+    // Two cells read "Connecting" — the connection axis and the sync one it gates.
+    expect(within(active).getAllByRole('cell', { name: 'Connecting' })).toHaveLength(2);
+    expect(screen.getAllByText('Connecting', { selector: '[data-tone]' }).at(-1)).toHaveAttribute('data-tone', 'muted');
+  });
+
+  // Resuming a paused cluster flips `spec.syncEnabled` at once, but its hundred sync
+  // children stay paused until their reconciles land. The row read healthy green
+  // "Syncing" for that whole gap — a cache doing nothing, painted as one catching up.
+  it('reads a cache whose kinds are all still paused as Paused', async () => {
+    await openWith([
+      { uuid: 'u-resumed', name: 'prod-us', enabled: true, present: true, connected: 'True', kindsPaused: true },
+    ]);
+
+    const active = await screen.findByRole('rowgroup', { name: /active/i });
+    expect(within(active).getByRole('cell', { name: 'Paused' })).toBeInTheDocument();
+    expect(screen.getByText('Paused', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'muted');
+  });
+
+  // A verdict this build doesn't know is degraded, not healthy. The schema says so and
+  // the sidecar's own fold ranks it that way; rendering it green would silently hide
+  // every reason a newer sidecar learns to emit.
+  it('reads an unrecognised sync verdict as degraded, not healthy', async () => {
+    await openWith([
+      { uuid: 'u-new', name: 'prod-us', enabled: true, present: true, connected: 'True', unknownReason: true },
+    ]);
+
+    const active = await screen.findByRole('rowgroup', { name: /active/i });
+    expect(within(active).getByRole('cell', { name: 'Degraded' })).toBeInTheDocument();
+    expect(screen.getByText('Degraded', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'attention');
+  });
+
+  // After a sidecar restart the conditions on disk were written by the previous
+  // process. beehive downgrades them to Unknown and flags them `unconfirmed`, but their
+  // reason survives and still names the pre-restart state. Reporting that reason would
+  // assert a failure this process has never observed.
+  it('does not report a pre-restart sync failure as current until it is re-confirmed', async () => {
+    await openWith([
+      {
+        uuid: 'u-broke',
+        name: 'broke',
+        enabled: true,
+        present: true,
+        syncFailed: true,
+        unconfirmed: true,
+      },
+    ]);
+
+    const active = await screen.findByRole('rowgroup', { name: /active/i });
+    // Not 'Error' — that reason is the last known state, not an observed one.
+    expect(within(active).queryByRole('cell', { name: 'Error' })).not.toBeInTheDocument();
+    expect(within(active).getByRole('cell', { name: 'Syncing' })).toBeInTheDocument();
+    // The connection axis reads Unknown, which already renders as the pending state.
+    expect(within(active).getByRole('cell', { name: 'Connecting' })).toBeInTheDocument();
+  });
+
+  // The stamps survive the downgrade too, so they predate this process. Rendering one
+  // as uptime would claim a connection nobody has re-established; "0m" would claim a
+  // definite outage. Neither is known yet.
+  it('shows uptime as unknown, not 0m, while the connection condition is unconfirmed', async () => {
+    await openWith([
+      {
+        uuid: 'u-prod',
+        name: 'prod-us',
+        enabled: true,
+        present: true,
+        unconfirmed: true,
+        disconnectedSince: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+      },
+    ]);
+
+    await userEvent.click(await screen.findByRole('button', { name: /Connecting/i }));
+    const uptime = await screen.findByText('Uptime');
+    const value = uptime.parentElement?.textContent ?? '';
+    expect(value).toContain('\u2014');
+    expect(value).not.toContain('0m');
+    expect(value).not.toMatch(/\dh/);
+  });
+
   it('shows one overall status indicator per row, rolled up to the most severe axis', async () => {
     await openWith([
-      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, connected: 'True' },
-      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
-      { uuid: '', name: 'minikube', enabled: false, present: true, cached: false, connected: 'Unknown' },
-      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true },
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, connected: 'True' },
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, connected: 'False' },
+      { uuid: '', name: 'minikube', enabled: false, present: true, connected: 'Unknown' },
+      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false },
     ]);
 
     // One indicator per row, named by both axes (the tooltip summary), tinted by
     // the most severe of the two.
-    expect(await screen.findByRole('img', { name: 'Active · Syncing' })).toHaveAttribute('data-tone', 'ok');
+    expect(await screen.findByRole('img', { name: 'Active · Synced' })).toHaveAttribute('data-tone', 'ok');
     expect(screen.getByRole('img', { name: 'Disconnected · Stalled' })).toHaveAttribute('data-tone', 'error');
     expect(screen.getByRole('img', { name: 'Connecting · Not synced' })).toHaveAttribute('data-tone', 'attention');
     expect(screen.getByRole('img', { name: 'Unavailable · Stopped' })).toHaveAttribute('data-tone', 'muted');
@@ -442,10 +709,10 @@ describe('ClusterSyncPanel', () => {
 
   it('color-codes the connection and sync text by their own tone, to explain the overall color', async () => {
     await openWith([
-      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, connected: 'True' },
-      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
-      { uuid: '', name: 'minikube', enabled: false, present: true, cached: false, connected: 'Unknown' },
-      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true },
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, connected: 'True' },
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, connected: 'False' },
+      { uuid: '', name: 'minikube', enabled: false, present: true, connected: 'Unknown' },
+      { uuid: 'u-old', name: 'old-cluster', enabled: true, present: false },
     ]);
 
     await screen.findByRole('rowgroup', { name: /active/i });
@@ -456,7 +723,7 @@ describe('ClusterSyncPanel', () => {
     expect(screen.getByText('Connecting', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'attention');
     expect(screen.getByText('Unavailable', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'muted');
     // Sync axis.
-    expect(screen.getByText('Syncing', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'ok');
+    expect(screen.getByText('Synced', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'ok');
     // Stalled is a *gated* value (its fault is the connection, not sync), so it
     // grays out rather than going amber — the red "Disconnected" carries the cause.
     expect(screen.getByText('Stalled', { selector: '[data-tone]' })).toHaveAttribute('data-tone', 'muted');
@@ -472,7 +739,7 @@ describe('ClusterSyncPanel', () => {
     )?.[1] as { query: string };
     expect(sub.query).toContain('lastConnectedAt');
     expect(sub.query).toContain('message');
-    expect(sub.query).toContain('lastTransitionTime');
+    expect(sub.query).toContain('transitionedAt');
     // The probe history and the next-attempt countdown are not inlined on
     // the list — they stream per-row via clusterEventsWatch / clusterScheduleWatch.
     expect(sub.query).not.toContain('connectionAttempts');
@@ -486,7 +753,6 @@ describe('ClusterSyncPanel', () => {
         name: 'remote',
         enabled: true,
         present: true,
-        cached: true,
         connected: 'False',
         connMessage: 'dial tcp 10.0.0.1:6443: connect: connection refused',
         disconnectedSince: new Date(Date.now() - 3 * 60_000).toISOString(),
@@ -543,14 +809,186 @@ describe('ClusterSyncPanel', () => {
     );
   });
 
-  it('reveals recent sync events when a cached cluster’s sync status is opened', async () => {
-    const user = await openWith([{ uuid: 'u-sync', name: 'prod', enabled: true, present: true, cached: true }]);
+  it('shows the discovered kind count and when it was last checked', async () => {
+    const user = await openWith([{ uuid: 'u-disc', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
 
-    // The sync-status label is a disclosure trigger for a row with an active cache
-    // (there's a cache to stream sync events for). A healthy cached row reads
-    // "Syncing". Opening it mounts the per-cache clusterCacheEventsWatch sub, keyed
-    // by the active cache's id — decoupled from clusterCachesWatch.
-    await user.click(await screen.findByRole('button', { name: /syncing/i }));
+    await act(async () => {
+      pushDiscovery('cache-u-disc', {
+        resourceCount: 137,
+        lastDiscoveryAt: new Date(Date.now() - 45_000).toISOString(),
+      });
+    });
+
+    // The count is the cluster's served kinds, paired with the age of that answer —
+    // discovery is a poll, so "how current is this?" is a real question.
+    expect(await screen.findByText(/kinds discovered/i)).toBeInTheDocument();
+    // The count and the live age share one value cell (the count is a text node, the
+    // age a ticking child), so match on the cell's combined text.
+    expect(
+      await screen.findByText((_, el) => el?.tagName === 'DD' && /137 kinds · 45s ago/.test(el.textContent ?? '')),
+    ).toBeInTheDocument();
+  });
+
+  // The discovery watch takes no variables, so every consumer of it resolves to ONE urql
+  // operation — and a subscription's second subscriber joins mid-stream with no replay. With
+  // a subscription per expanded row, the second row expanded saw nothing until the next
+  // 5-minute discovery pass. One subscription for the dialog, folded by cacheID, fixes it.
+  it('shows the discovery record in a second row expanded after the burst', async () => {
+    const user = await openWith([
+      { uuid: 'u-a', name: 'alpha', enabled: true, present: true },
+      { uuid: 'u-b', name: 'beta', enabled: true, present: true },
+    ]);
+
+    // The Added burst for both caches, delivered once.
+    await act(async () => {
+      pushDiscovery('cache-u-a', { resourceCount: 137, lastDiscoveryAt: new Date(Date.now() - 45_000).toISOString() });
+      pushDiscovery('cache-u-b', { resourceCount: 42, lastDiscoveryAt: new Date(Date.now() - 20_000).toISOString() });
+    });
+
+    const [firstSync, secondSync] = await screen.findAllByRole('button', { name: /synced/i });
+    await user.click(firstSync);
+    expect(
+      await screen.findByText((_, el) => el?.tagName === 'DD' && /137 kinds/.test(el.textContent ?? '')),
+    ).toBeInTheDocument();
+
+    // The second row must not need a fresh burst of its own.
+    await user.click(secondSync);
+    expect(
+      await screen.findByText((_, el) => el?.tagName === 'DD' && /42 kinds/.test(el.textContent ?? '')),
+    ).toBeInTheDocument();
+  });
+
+  it('clears the discovery record when it is hard-deleted (id only, no cacheID)', async () => {
+    const user = await openWith([{ uuid: 'u-gone', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    await act(async () => {
+      pushDiscovery('cache-u-gone', {
+        resourceCount: 137,
+        lastDiscoveryAt: new Date(Date.now() - 45_000).toISOString(),
+      });
+    });
+    expect(await screen.findByText(/kinds discovered/i)).toBeInTheDocument();
+
+    // A hard delete carries ONLY the id: the row is already collected, so there is no owner
+    // edge left to read a cacheID from and it arrives as "0". This anchor carries no
+    // finalizer, so a cascade can collect it with no deletion-pending frame ahead of it —
+    // filtering these by cacheID left the pane showing a record that no longer exists.
+    await act(async () => {
+      channelFor('clusterCacheGVRDiscoveriesWatch').onmessage!(
+        JSON.stringify({
+          type: 'next',
+          payload: {
+            data: {
+              clusterCacheGVRDiscoveriesWatch: {
+                type: 'Deleted',
+                discovery: { id: 'disc-cache-u-gone', cacheID: '0', stats: null, conditions: [] },
+              },
+            },
+          },
+        }),
+      );
+    });
+
+    expect(screen.queryByText(/kinds discovered/i)).not.toBeInTheDocument();
+  });
+
+  it('ignores a hard-deleted discovery record belonging to another cache', async () => {
+    const user = await openWith([{ uuid: 'u-keep', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    await act(async () => {
+      pushDiscovery('cache-u-keep', {
+        resourceCount: 12,
+        lastDiscoveryAt: new Date(Date.now() - 10_000).toISOString(),
+      });
+    });
+    expect(await screen.findByText(/kinds discovered/i)).toBeInTheDocument();
+
+    // Matching on the record id is what keeps this scoped now that cacheID is unusable.
+    await act(async () => {
+      channelFor('clusterCacheGVRDiscoveriesWatch').onmessage!(
+        JSON.stringify({
+          type: 'next',
+          payload: {
+            data: {
+              clusterCacheGVRDiscoveriesWatch: {
+                type: 'Deleted',
+                discovery: { id: 'disc-some-other-cache', cacheID: '0', stats: null, conditions: [] },
+              },
+            },
+          },
+        }),
+      );
+    });
+
+    expect(await screen.findByText(/kinds discovered/i)).toBeInTheDocument();
+  });
+
+  it('warns when the kind list is known-incomplete, without failing the row', async () => {
+    const user = await openWith([{ uuid: 'u-part', name: 'prod', enabled: true, present: true }]);
+    // The row's own status is unaffected: a partial answer doesn't stop the kinds
+    // already known from syncing, so the verdict stays the rollup's.
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    await act(async () => {
+      pushDiscovery('cache-u-part', {
+        resourceCount: 12,
+        lastDiscoveryAt: new Date().toISOString(),
+        reason: 'DiscoveryPartial',
+        // Deliberately not the component's fallback copy, so the assertion proves the
+        // condition's own message is what reaches the pane.
+        message: 'metrics.k8s.io did not respond',
+      });
+    });
+    expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
+  });
+
+  it('warns while a replaced kind is still draining', async () => {
+    const user = await openWith([{ uuid: 'u-drain', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    // The kind list is current but one kind the cluster serves has no live child: an
+    // earlier prune's child still holds the name. That kind is not syncing at all, so the
+    // pane must say so rather than render nothing — which is what a Synced-axis reason on
+    // this condition did.
+    await act(async () => {
+      pushDiscovery('cache-u-drain', {
+        resourceCount: 12,
+        lastDiscoveryAt: new Date().toISOString(),
+        reason: 'DiscoveryDraining',
+        message: 'Waiting for replaced kinds to finish draining',
+      });
+    });
+    expect(await screen.findByText(/still draining|finish draining/i)).toBeInTheDocument();
+  });
+
+  it('omits the discovered-kinds row until a pass has run in this sidecar process', async () => {
+    const user = await openWith([{ uuid: 'u-none', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    // The record exists but its gauges are null — the sidecar restarted and has not
+    // re-measured. Rendering a count off a durable kind list would claim an observation
+    // nobody in this process made.
+    await act(async () => {
+      pushDiscovery('cache-u-none', { resourceCount: 0 });
+    });
+
+    expect(await screen.findByText(/last update received/i)).toBeInTheDocument();
+    expect(screen.queryByText(/kinds discovered/i)).not.toBeInTheDocument();
+  });
+
+  it('reveals recent sync events when a cached cluster’s sync status is opened', async () => {
+    const user = await openWith([{ uuid: 'u-sync', name: 'prod', enabled: true, present: true }]);
+
+    // The sync-status label is a disclosure trigger for a row with an active cache (its
+    // verdict has streamed in). A healthy cached row reads "Synced".
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    // The transition log is per kind, so it stays paused until a kind record names one —
+    // subscribing before that would open a stream guaranteed to carry nothing.
+    await act(async () => pushGVRSync('g-events', 'events', 'Watching'));
 
     // The sync history streams in as bare runs (newest first by lastAt), with `ok`
     // derived from the generic event type (Normal = a healthy run).
@@ -585,47 +1023,150 @@ describe('ClusterSyncPanel', () => {
     expect(screen.getByText('SyncComplete')).toBeInTheDocument();
   });
 
-  it('shows a last-update freshness line in the sync detail, driven by lastSyncedAt', async () => {
-    const syncedAt = new Date(Date.now() - 30_000).toISOString();
-    const user = await openWith([
-      { uuid: 'u-fresh', name: 'prod', enabled: true, present: true, cached: true, lastSyncedAt: syncedAt },
-    ]);
-
-    // Open the sync-status disclosure (the row has an active cache).
-    await user.click(await screen.findByRole('button', { name: /syncing/i }));
-
-    // The freshness line answers "is my cache current?" directly from lastSyncedAt
-    // — a live relative counter, independent of the (separate) sync-event history.
-    expect(await screen.findByText(/last update received/i)).toBeInTheDocument();
-    expect(await screen.findByText(/\d+s ago/)).toBeInTheDocument();
-  });
-
-  it('summarises cache contents (objects across kinds) in the sync detail, thousands-grouped', async () => {
+  it('shows a last-update freshness line in the sync detail, driven by lastUpdateAt', async () => {
+    const updatedAt = new Date(Date.now() - 30_000).toISOString();
     const user = await openWith([
       {
-        uuid: 'u-big',
+        uuid: 'u-fresh',
         name: 'prod',
         enabled: true,
         present: true,
-        cached: true,
-        objectCount: 2203,
-        kindCount: 120,
+        lastUpdateAt: updatedAt,
+        lastLiveAt: new Date(Date.now() - 3_000).toISOString(),
       },
     ]);
 
-    await user.click(await screen.findByRole('button', { name: /syncing/i }));
+    // Open the sync-status disclosure (the row has an active cache).
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
 
-    // The summary is the static "how much do I hold?" counterpart to the
-    // freshness line — locale-grouped and pluralised.
+    // The freshness line answers "is my cache current?" directly from lastUpdateAt
+    // — a live relative counter, independent of the (separate) sync-event history.
+    expect(await screen.findByText(/last update received/i)).toBeInTheDocument();
+    expect(await screen.findByText('30s ago')).toBeInTheDocument();
+  });
+
+  it('reports liveness apart from updates, so a quiet cache does not read as stalled', async () => {
+    // The shape a quiet-but-healthy cluster produces: nothing has been written for an
+    // hour, but the watch proved itself alive seconds ago (an api-server bookmark).
+    // Showing only the update time would read as a stall that isn't happening.
+    const user = await openWith([
+      {
+        uuid: 'u-quiet',
+        name: 'prod',
+        enabled: true,
+        present: true,
+        lastUpdateAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+        lastLiveAt: new Date(Date.now() - 5_000).toISOString(),
+      },
+    ]);
+
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    expect(await screen.findByText(/last update received/i)).toBeInTheDocument();
+    expect(await screen.findByText('1h ago')).toBeInTheDocument();
+    expect(await screen.findByText(/sync verified/i)).toBeInTheDocument();
+    expect(await screen.findByText('5s ago')).toBeInTheDocument();
+    // Staleness is engine-derived; an old update stamp alone must not raise the banner.
+    expect(screen.queryByText(/possibly stale/i)).not.toBeInTheDocument();
+  });
+
+  it('summarises cache contents from the live gauge, thousands-grouped', async () => {
+    const user = await openWith([{ uuid: 'u-big', name: 'prod', enabled: true, present: true }]);
+
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    act(() => pushCacheStats(2203, 120));
+
+    // Locale-grouped and pluralised.
     expect(await screen.findByText('2,203 objects across 120 kinds')).toBeInTheDocument();
   });
 
-  it('omits the cache summary when the cache holds no objects', async () => {
-    const user = await openWith([
-      { uuid: 'u-empty', name: 'prod', enabled: true, present: true, cached: true, objectCount: 0 },
-    ]);
+  // The row's size cell and the expanded detail both want the cache's contents. They used
+  // to subscribe separately with identical variables, which urql resolves to ONE operation —
+  // and a subscription's second subscriber joins mid-stream with no replay. So a detail
+  // opened after the gauge had already delivered sat on null forever, and the "N objects
+  // across M kinds" row never appeared.
+  it('shows the cache summary when the detail is opened after the gauge has delivered', async () => {
+    const user = await openWith([{ uuid: 'u-late', name: 'prod', enabled: true, present: true }]);
 
-    await user.click(await screen.findByRole('button', { name: /syncing/i }));
+    // The gauge delivers while only the always-mounted size cell is listening.
+    act(() => pushCacheStats(2203, 120, 1_300_000));
+    expect(await screen.findByText('1.2 MB')).toBeInTheDocument();
+
+    // Expanding must not need a fresh frame to show the same numbers.
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    expect(await screen.findByText('2,203 objects across 120 kinds')).toBeInTheDocument();
+  });
+
+  // The regression this stream exists for. The cache summary used to be a field on the
+  // ClusterCache record, and that record stops changing once its sync settles — so the
+  // panel rendered whatever the cache held when the window subscribed (an early slice of
+  // a cold sync) and never moved, however much landed afterwards.
+  it('updates the cache summary as the sync fills, without the cache record changing', async () => {
+    const user = await openWith([{ uuid: 'u-grow', name: 'prod', enabled: true, present: true }]);
+
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    act(() => pushCacheStats(156, 12));
+    expect(await screen.findByText('156 objects across 12 kinds')).toBeInTheDocument();
+
+    act(() => pushCacheStats(1386, 62));
+    expect(await screen.findByText('1,386 objects across 62 kinds')).toBeInTheDocument();
+    expect(screen.queryByText('156 objects across 12 kinds')).not.toBeInTheDocument();
+  });
+
+  it('reports per-kind sync health from the rollup, naming the kinds that are not syncing', async () => {
+    const user = await openWith([{ uuid: 'u-kinds', name: 'prod', enabled: true, present: true }]);
+
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    // The fold is the sidecar's — it knows all hundred-plus kinds and already skipped any
+    // verdict a previous process wrote. The panel renders it, and must not re-derive it:
+    // a second definition of health here could disagree with the badge above it.
+    act(() =>
+      pushSyncHealth('cache-u-kinds', {
+        status: 'False',
+        reason: 'Stale',
+        unhealthyKindRefs: [{ apiVersion: 'example.com/v1', resource: 'widgets' }],
+        totalKinds: 3,
+        unhealthyKinds: 1,
+      }),
+    );
+
+    expect(await screen.findByText(/2 of 3 kinds — widgets not syncing/)).toBeInTheDocument();
+  });
+
+  // unhealthyKinds counts every kind that is not currently Watching; unhealthyKindRefs
+  // names only the ones the fold ranked as offenders. A cache mid-pause has the count with
+  // no names, which used to render an empty gap: "63 of 150 kinds —  not syncing".
+  it('names no offenders when the rollup counts unhealthy kinds without naming any', async () => {
+    const user = await openWith([{ uuid: 'u-pausing', name: 'prod', enabled: true, present: true }]);
+
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    act(() =>
+      pushSyncHealth('cache-u-pausing', {
+        status: 'False',
+        reason: 'Paused',
+        unhealthyKindRefs: [],
+        totalKinds: 150,
+        unhealthyKinds: 87,
+      }),
+    );
+
+    expect(await screen.findByText(/63 of 150 kinds syncing/)).toBeInTheDocument();
+    expect(screen.queryByText(/not syncing/)).not.toBeInTheDocument();
+  });
+
+  it('reports a plain kind count when every kind is healthy', async () => {
+    const user = await openWith([{ uuid: 'u-ok', name: 'prod', enabled: true, present: true }]);
+
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    act(() => pushSyncHealth('cache-u-ok', { totalKinds: 2 }));
+
+    expect(await screen.findByText('2 kinds')).toBeInTheDocument();
+  });
+
+  it('omits the cache summary when the cache holds no objects', async () => {
+    const user = await openWith([{ uuid: 'u-empty', name: 'prod', enabled: true, present: true }]);
+
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
 
     // An empty cache is already covered by the freshness line; no "0 objects" noise.
     expect(await screen.findByText(/no updates received yet/i)).toBeInTheDocument();
@@ -639,19 +1180,24 @@ describe('ClusterSyncPanel', () => {
         name: 'prod',
         enabled: true,
         present: true,
-        cached: true,
         stale: true,
-        lastSyncedAt: new Date(Date.now() - 6 * 60_000).toISOString(),
+        lastUpdateAt: new Date(Date.now() - 6 * 60_000).toISOString(),
+        lastLiveAt: new Date(Date.now() - 6 * 60_000).toISOString(),
       },
     ]);
 
-    // The sync column reflects the stalled state (not a healthy "Syncing").
+    // The sync column reflects the stalled state (not a healthy "Synced").
     const staleBtn = await screen.findByRole('button', { name: /stale/i });
     await user.click(staleBtn);
 
-    // The detail flags it and carries the condition's explanation.
+    // The detail flags it and names the kinds behind it. A rollup can't carry one kind's
+    // free-text message — the verdict spans a hundred of them — so what it reports is
+    // which ones are not keeping up.
     expect(await screen.findByText(/possibly stale/i)).toBeInTheDocument();
-    expect(screen.getByText(/no watch heartbeat for pod/i)).toBeInTheDocument();
+    expect(screen.getByText(/pods not receiving updates/i)).toBeInTheDocument();
+
+    // The log follows the kind behind the verdict, which the rollup names.
+    await act(async () => pushGVRSync('g-pods', 'pods', 'Stale'));
 
     // A SyncStale event renders by its raw reason code alongside its message.
     await act(async () => {
@@ -669,9 +1215,36 @@ describe('ClusterSyncPanel', () => {
     expect(screen.getByText(/pod watch went quiet/i)).toBeInTheDocument();
   });
 
+  // The rollup names its offenders by kind, and the timeline has to follow the exact one.
+  // A CRD may reuse a built-in's plural under its own api group, so matching on the plural
+  // alone opened whichever record happened to match first — rendering a healthy kind's
+  // history under the failing kind's heading.
+  it('opens the timeline of the offending kind, not another kind sharing its plural', async () => {
+    const user = await openWith([{ uuid: 'u-gw', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    await act(async () => {
+      pushGVRSync('g-builtin', 'gateways', 'Watching', 'gateway.networking.k8s.io/v1');
+      pushGVRSync('g-crd', 'gateways', 'SyncFailed', 'example.com/v1');
+      pushSyncHealth('cache-u-gw', {
+        status: 'False',
+        reason: 'SyncFailed',
+        unhealthyKindRefs: [{ apiVersion: 'example.com/v1', resource: 'gateways' }],
+        totalKinds: 2,
+        unhealthyKinds: 1,
+      });
+    });
+
+    const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
+    const events = subs
+      .map(([, arg]) => arg as { query: string; variables?: Record<string, unknown> })
+      .filter((a) => a.query.includes('clusterCacheGVRSyncEventsWatch'));
+    expect(events.at(-1)?.variables?.id).toBe('g-crd');
+  });
+
   it('holds the countdown across an in-flight probe, then clears it once the schedule is authoritatively empty', async () => {
     const user = await openWith([
-      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, connected: 'False' },
     ]);
     await user.click(await screen.findByRole('button', { name: /disconnected/i }));
 
@@ -695,7 +1268,7 @@ describe('ClusterSyncPanel', () => {
 
   it('shows the "checking…" spinner while a probe is in flight, even with a scheduled next attempt', async () => {
     const user = await openWith([
-      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, connected: 'False' },
     ]);
     await user.click(await screen.findByRole('button', { name: /disconnected/i }));
 
@@ -718,7 +1291,7 @@ describe('ClusterSyncPanel', () => {
 
   it('shows a "checking…" spinner only while a probe is actually in flight, not merely when nothing is scheduled', async () => {
     const user = await openWith([
-      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, cached: true, connected: 'False' },
+      { uuid: 'u-remote', name: 'remote', enabled: true, present: true, connected: 'False' },
     ]);
     await user.click(await screen.findByRole('button', { name: /disconnected/i }));
 
@@ -737,9 +1310,7 @@ describe('ClusterSyncPanel', () => {
   });
 
   it('expands connection diagnostics for a reachable cluster with the neutral (non-failed) header', async () => {
-    const user = await openWith([
-      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true, connected: 'True' },
-    ]);
+    const user = await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, connected: 'True' }]);
     await screen.findByRole('rowgroup', { name: /active/i });
     // The connection label is a disclosure toggle in every state, including Active.
     await user.click(screen.getByRole('button', { name: /^active$/i }));
@@ -751,13 +1322,13 @@ describe('ClusterSyncPanel', () => {
   });
 
   it('omits a row group that has no members', async () => {
-    await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
+    await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true }]);
     expect(await screen.findByRole('rowgroup', { name: /active/i })).toBeInTheDocument();
     expect(screen.queryByRole('rowgroup', { name: /orphaned/i })).not.toBeInTheDocument();
   });
 
   it('toggling sync fires the play/pause action via clusterSyncEnabledSet', async () => {
-    const user = await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true }]);
+    const user = await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true }]);
 
     // Enabled + active → a Pause button.
     await user.click(await screen.findByRole('button', { name: /pause sync for prod-us/i }));
@@ -768,7 +1339,7 @@ describe('ClusterSyncPanel', () => {
   });
 
   it('toggling enable fires clusterEnabledSet', async () => {
-    const user = await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: false }]);
+    const user = await openWith([{ uuid: 'u-prod', name: 'prod-us', enabled: true, present: true }]);
 
     // The row's spec.enabled defaults to true (see pushClusters) → a Disable button.
     await user.click(await screen.findByRole('button', { name: /disable prod-us/i }));
@@ -778,15 +1349,23 @@ describe('ClusterSyncPanel', () => {
     );
   });
 
-  it('clearing a cache fires clusterCacheClear, and is disabled when uncached', async () => {
+  // Whether there is anything to clear comes off the live contents gauge, not the cache
+  // record: the record settles and stops changing, so a file created after the window
+  // subscribed would leave a populated cache visible in the size cell but unclearable.
+  it('clearing a cache fires clusterCacheClear, and is disabled until a cache file exists', async () => {
     const user = await openWith([
-      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true, cached: true },
-      { uuid: 'u-stg', name: 'staging', enabled: false, present: true, cached: false },
+      { uuid: 'u-prod', name: 'prod-us', enabled: true, present: true },
+      { uuid: 'u-stg', name: 'staging', enabled: false, present: true },
     ]);
 
-    expect(await screen.findByRole('button', { name: /clear cache for staging/i })).toBeDisabled();
+    expect(await screen.findByRole('button', { name: /clear cache for prod-us/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /clear cache for staging/i })).toBeDisabled();
 
-    await user.click(screen.getByRole('button', { name: /clear cache for prod-us/i }));
+    // prod-us's cache file appears well after its (long-settled) record arrived.
+    act(() => pushCacheStatsFor('cache-u-prod', 1_300_000));
+
+    expect(screen.getByRole('button', { name: /clear cache for staging/i })).toBeDisabled();
+    await user.click(await screen.findByRole('button', { name: /clear cache for prod-us/i }));
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
       expect.objectContaining({ body: expect.stringContaining('clusterCacheClear') }),
@@ -794,7 +1373,7 @@ describe('ClusterSyncPanel', () => {
   });
 
   it('shows an unreachable kubeconfig context as a pending active row with disabled actions', async () => {
-    await openWith([{ uuid: '', name: 'minikube', enabled: false, present: true, cached: false }]);
+    await openWith([{ uuid: '', name: 'minikube', enabled: false, present: true }]);
 
     const active = await screen.findByRole('rowgroup', { name: /active/i });
     expect(within(active).getByText('minikube')).toBeInTheDocument();
@@ -807,7 +1386,7 @@ describe('ClusterSyncPanel', () => {
   });
 
   it('disables play/pause for orphaned rows and removes them via clusterDelete', async () => {
-    const user = await openWith([{ uuid: 'u-old', name: 'old-cluster', enabled: true, present: false, cached: true }]);
+    const user = await openWith([{ uuid: 'u-old', name: 'old-cluster', enabled: true, present: false }]);
 
     expect(await screen.findByRole('button', { name: /sync for old-cluster/i })).toBeDisabled();
 

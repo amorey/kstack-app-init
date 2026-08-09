@@ -112,8 +112,43 @@ models:
       stats:
         resolver: true
 
-  ClusterCacheStatus:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheStatus
+  # The sync children's served spec IS the stored beehive type (no projection layer).
+  # Their `stats` are NOT: those are resolver fields sampled from the controller, because
+  # status is a propagation channel and nothing in the object graph reads them.
+
+  # Likewise the GVR-discovery child: stored spec/status served as-is.
+  ClusterCacheGVRDiscovery:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRDiscovery
+    fields:
+      # Sampled from the controller on read, like ClusterCache.stats — it is not a field
+      # of the stored object (the kind's status is empty by design).
+      stats:
+        resolver: true
+  ClusterCacheGVRSync:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRSync
+    fields:
+      # Same shape as the discovery's: a controller-held gauge, not stored state.
+      stats:
+        resolver: true
+  ClusterCacheGVRSyncSpec:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRSyncSpec
+  ClusterCacheGVRSyncStats:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRSyncStats
+  ClusterCacheGVRSyncChange:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRSyncChange
+  ClusterCacheSyncHealth:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheSyncHealth
+  SyncedKindRef:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.SyncedKindRef
+
+  ClusterCacheGVRDiscoverySpec:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRDiscoverySpec
+
+  ClusterCacheGVRDiscoveryStats:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRDiscoveryStats
+
+  ClusterCacheGVRDiscoveryChange:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRDiscoveryChange
 
   ClusterCacheStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheStats

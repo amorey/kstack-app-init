@@ -63,6 +63,29 @@ function pushCacheChange(type: 'Added' | 'Modified' | 'Deleted', cache: object) 
   );
 }
 
+// Push one cache's folded sync verdict on the clusterCacheSyncHealthWatch stream. A
+// latest-value gauge, so there is no change type — each frame replaces the last.
+function pushSyncChange(_type: 'Added' | 'Modified' | 'Deleted', health: object) {
+  channelFor('clusterCacheSyncHealthWatch').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clusterCacheSyncHealthWatch: health } } }),
+  );
+}
+
+// The folded sync verdict of a row's cache — what the provider joins onto the cache by
+// cacheID.
+function syncOf(r: ClusterRow, reason = 'Watching') {
+  return {
+    cacheID: `cache-${r.id}`,
+    status: reason === 'Watching' ? 'True' : 'False',
+    reason,
+    message: '',
+    totalKinds: 1,
+    unhealthyKinds: reason === 'Watching' ? 0 : 1,
+    lastUpdateAt: null,
+    lastLiveAt: null,
+  };
+}
+
 // A cache mirroring a row's active identity (serverUid matches the cluster's uid),
 // so the provider joins it as that cluster's activeCache.
 function cacheOf(r: ClusterRow) {
@@ -70,7 +93,6 @@ function cacheOf(r: ClusterRow) {
     id: `cache-${r.id}`,
     clusterID: r.id,
     serverUid: `uid-${r.id}`,
-    status: { conditions: [], lastSyncedAt: null },
     stats: { exists: false, bytes: 0 },
   };
 }
@@ -79,6 +101,19 @@ function cacheOf(r: ClusterRow) {
 function Probe() {
   const { clusters } = useClusters();
   return <div data-testid="probe">{clusters === null ? 'null' : JSON.stringify(clusters.map((c) => c.spec.name))}</div>;
+}
+
+// A probe that reveals each cluster's active cache's sync verdict — the two-hop join
+// (cache onto cluster, verdict onto cache) the rollup surface needs.
+function SyncProbe() {
+  const { clusters } = useClusters();
+  return (
+    <div data-testid="probe">
+      {clusters === null
+        ? 'null'
+        : JSON.stringify(clusters.map((c) => `${c.spec.name}:${c.activeCache?.syncHealth?.reason ?? '-'}`))}
+    </div>
+  );
 }
 
 // A probe that also reveals each cluster's joined activeCache (id or '-').
@@ -158,7 +193,7 @@ describe('useClusters', () => {
     expect(screen.getByTestId('probe')).toHaveTextContent('null');
   });
 
-  it('subscribes to both the cluster and cache delta watches', async () => {
+  it('subscribes to the cluster, cache, and sync delta watches', async () => {
     renderProvider();
     await flush();
     expect(invokeMock).toHaveBeenCalledWith(
@@ -168,6 +203,10 @@ describe('useClusters', () => {
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_subscribe',
       expect.objectContaining({ query: expect.stringContaining('clusterCachesWatch') }),
+    );
+    expect(invokeMock).toHaveBeenCalledWith(
+      'graphql_subscribe',
+      expect.objectContaining({ query: expect.stringContaining('clusterCacheSyncHealthWatch') }),
     );
   });
 
@@ -217,6 +256,109 @@ describe('useClusters', () => {
       pushCacheChange('Added', cacheOf({ id: 'u-a', name: 'prod-us' }));
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:cache-u-a"]');
+  });
+
+  it('joins a cache\u2019s sync verdict onto it by cacheID', async () => {
+    renderProvider(<SyncProbe />);
+    await flush();
+
+    // Cluster + cache arrive; the verdict is its own stream, so it is
+    // simply not reported yet.
+    await act(async () => {
+      pushClusters(channelFor, [{ id: 'u-a', name: 'prod-us' }]);
+      pushCacheChange('Added', cacheOf({ id: 'u-a', name: 'prod-us' }));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:-"]');
+
+    // The record lands and its verdict reaches the cluster through the two-hop join.
+    await act(async () => {
+      pushSyncChange('Added', syncOf({ id: 'u-a', name: 'prod-us' }));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:Watching"]');
+
+    // Its own Modified re-emits only that record — the cache never moved.
+    await act(async () => {
+      pushSyncChange('Modified', syncOf({ id: 'u-a', name: 'prod-us' }, 'Stale'));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:Stale"]');
+  });
+
+  // The verdict stream is a latest-value gauge with no delete of its own, so a verdict's
+  // lifetime is its cache's — the sidecar drops a gone cache's verdict from its own
+  // snapshot the same way. Which verdicts are live is DERIVED from the cache stream, so a
+  // deletion takes effect on the frame that reports it: sweeping inside the verdict reducer
+  // instead meant a fleet that went quiet right after a deletion (no further verdict
+  // frames) never ran the sweep at all.
+  it("drops a cache's verdict on the frame that deletes the cache", async () => {
+    renderProvider(<SyncProbe />);
+    await flush();
+
+    const a = { id: 'u-a', name: 'prod-us' };
+    const b = { id: 'u-b', name: 'prod-eu' };
+    await act(async () => {
+      pushClusters(channelFor, [a, b]);
+      pushCacheChange('Added', cacheOf(a));
+      pushCacheChange('Added', cacheOf(b));
+      pushSyncChange('Added', syncOf(a));
+      pushSyncChange('Added', syncOf(b));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:Watching","prod-eu:Watching"]');
+
+    // A's cache is retired (a server-UID migration, or the cluster removed) and nothing
+    // else happens — no verdict frame follows. B's cache is live, so B is untouched.
+    await act(async () => {
+      pushCacheChange('Deleted', cacheOf(a));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:-","prod-eu:Watching"]');
+  });
+
+  // Whether a verdict survives must not depend on what else the fleet happened to be doing.
+  // A destructive sweep inside the verdict reducer made it: a verdict frame landing between
+  // a cache's Deleted and its re-Added threw that cache's reading away for good, while the
+  // same sequence with a quiet fleet kept it. Since cache ids are AUTOINCREMENT and never
+  // reused, a re-Added id IS the same cache, so its last reading is its own — and deriving
+  // liveness from the cache stream rather than evicting makes that hold either way.
+  it("keeps a cache's own verdict across a delete and re-add of that cache", async () => {
+    renderProvider(<SyncProbe />);
+    await flush();
+
+    const a = { id: 'u-a', name: 'prod-us' };
+    const b = { id: 'u-b', name: 'prod-eu' };
+    await act(async () => {
+      pushClusters(channelFor, [a, b]);
+      pushCacheChange('Added', cacheOf(a));
+      pushCacheChange('Added', cacheOf(b));
+      pushSyncChange('Added', syncOf(a));
+      pushSyncChange('Added', syncOf(b));
+    });
+
+    await act(async () => {
+      pushCacheChange('Deleted', cacheOf(a));
+      // Unrelated traffic on the gauge — the only thing that used to decide A's fate.
+      pushSyncChange('Modified', syncOf(b, 'Stale'));
+      pushCacheChange('Added', cacheOf(a));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:Watching","prod-eu:Stale"]');
+  });
+
+  // The streams carry no mutual ordering, so a verdict routinely arrives before its
+  // cache's frame. Eviction keys off an observed Deleted rather than "absent from the
+  // cache map" for exactly this reason: the latter cannot tell "not here yet" from "gone",
+  // and would drop the verdict of every cache whose frame is still in flight.
+  it('keeps a verdict that arrives before its cache', async () => {
+    renderProvider(<SyncProbe />);
+    await flush();
+
+    const a = { id: 'u-a', name: 'prod-us' };
+    await act(async () => {
+      pushClusters(channelFor, [a]);
+      pushSyncChange('Added', syncOf(a));
+    });
+    await act(async () => {
+      pushCacheChange('Added', cacheOf(a));
+    });
+
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us:Watching"]');
   });
 
   it('drops clusters and caches deleted during an outage once the transport reconnects', async () => {

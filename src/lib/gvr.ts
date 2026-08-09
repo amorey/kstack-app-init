@@ -26,3 +26,8 @@ export type GVR = { apiVersion: string; resource: string };
 export function gvrKey(g: GVR): string {
   return `${g.apiVersion}/${g.resource}`;
 }
+
+// The cluster's Event collection, in the canonical spelling the sidecar syncs it under.
+// The api server serves the same events as `events.k8s.io/v1` too, but exactly one of the
+// two is mirrored — see the sidecar's eventsKind constants.
+export const EVENTS_GVR: GVR = { apiVersion: 'v1', resource: 'events' };

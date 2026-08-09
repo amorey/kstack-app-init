@@ -17,122 +17,118 @@ package cluster
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/client-go/rest"
 
 	"github.com/amorey/beehive"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/engine"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
-// fakeEngine is a test sync engine that records Start/Stop calls. The flags are
-// atomic because the controller sets them from its own goroutines while tests
-// read them.
-type fakeEngine struct {
-	started atomic.Bool
-	stopped atomic.Bool
-	sink    engine.Sink
-}
+// These tests cover the ClusterCacheController's own responsibilities: eligibility +
+// active-identity gating (which Synced condition it writes) and the deletion/finalizer
+// teardown. The actual sync — workers, per-GVR status, the cache-level rollup — is the
+// ClusterCacheGVRSyncController's job and is exercised by its own tests as those phases
+// land; here it's a real controller whose EnsureCache/RemoveCache are no-ops, so converge
+// exercises the delegation without a fake.
 
-func (f *fakeEngine) Start() {
-	f.started.Store(true)
-	// Report asynchronously — Start runs while the controller holds writeMu, which
-	// Report also acquires, so a synchronous call would deadlock. Model a cold first
-	// sync (ColdStart + catch-up counts) so the recorded event is SyncComplete.
-	go f.sink.Report(engine.EngineStatus{
-		State: engine.EngineWatching, ColdStart: true,
-		SyncedObjects: 5, SyncedKinds: 3, CaughtUpIn: 2 * time.Second,
-	})
-}
-
-func (f *fakeEngine) Stop(_ context.Context) error {
-	f.stopped.Store(true)
-	return nil
-}
-
-// newCacheTestBeehive builds a beehive with the real ClusterCacheController
-// using a fake engine factory plus NoopControllers for the other kinds.
-// Returns the clients, the factory's engine slot (populated on first call),
-// and a pointer to a slot that holds the REST config passed to the engine factory.
-func newCacheTestBeehive(t *testing.T, connMgr *ConnectionManager) (
+// newCacheTestBeehive builds a beehive with the real ClusterCacheController wired to a real
+// (stub) ClusterCacheGVRSyncController, plus a presenceController stamping the parent
+// Cluster. Returns the Cluster and ClusterCache clients.
+func newCacheTestBeehive(t *testing.T) (
 	beehive.Client[ClusterSpec, ClusterStatus],
 	beehive.Client[ClusterCacheSpec, ClusterCacheStatus],
-	*fakeEngine,
-	*capturedCfgSlot,
+	beehive.Client[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus],
+	beehive.Client[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus],
+) {
+	t.Helper()
+	coreClient, cacheClient, gvrSyncClient, discoveryClient, _ := newCacheTestBeehivePresence(t)
+	return coreClient, cacheClient, gvrSyncClient, discoveryClient
+}
+
+// newCacheTestBeehivePresence is newCacheTestBeehive plus the presenceController itself, for
+// the tests that need to move the parent's identity (a migration) mid-run.
+func newCacheTestBeehivePresence(t *testing.T) (
+	beehive.Client[ClusterSpec, ClusterStatus],
+	beehive.Client[ClusterCacheSpec, ClusterCacheStatus],
+	beehive.Client[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus],
+	beehive.Client[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus],
+	*presenceController,
 ) {
 	t.Helper()
 	bh := NewTestBeehiveUnstarted(t)
 
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
+	gvrSyncClient := beehive.NewClient[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus](bh, ClusterCacheGVRSyncGroupKind)
+	discoveryClient := beehive.NewClient[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus](bh, ClusterCacheGVRDiscoveryGroupKind)
 
-	w := NewStaticWatcher(t, testKubeConfig("alpha"))
 	mgr := store.NewManager(t.TempDir())
+	rt := &controllerRuntime{bh: bh, cacheManager: mgr, connMgr: NewConnectionManager()}
 
-	ctrl := NewClusterCacheController(w, coreClient, mgr, connMgr, nil)
-	fakeEng := &fakeEngine{}
-	slot := &capturedCfgSlot{}
-	ctrl.SetNewEngine(func(cfg *rest.Config, id ClusterID, ref store.CacheRef, sink engine.Sink) EngineHandle {
-		slot.cfg = cfg
-		slot.ref = ref
-		fakeEng.sink = sink
-		return fakeEng
-	})
+	ctrl := NewClusterCacheController(rt)
 
-	_, err := beehive.Register(bh, ClusterGroupKind, &presenceController{})
+	presence := &presenceController{}
+	_, err := beehive.Register(bh, ClusterGroupKind, presence)
 	require.NoError(t, err)
-	cc, err := beehive.Register(bh, ClusterCacheGroupKind, ctrl)
+	_, err = beehive.Register(bh, ClusterCacheGroupKind, ctrl)
 	require.NoError(t, err)
-	ctrl.SetControllerClient(cc)
+	// The GVR-discovery child is the cache's sync anchor. Its real controller is registered
+	// (with no credentials in the ConnectionManager it only ever reports NoConnection,
+	// touching no network) so the child is reconciled and collected on delete — an
+	// unregistered kind would linger and wedge the cache's deletion barrier.
+	_, err = beehive.Register(bh, ClusterCacheGVRDiscoveryGroupKind, NewClusterCacheGVRDiscoveryController(rt))
+	require.NoError(t, err)
+	// The per-kind sync children carry a drain finalizer, so their controller must be
+	// registered for one to ever be collected. The cache seeds the Event child directly
+	// (see ensureEventsSync), so one exists here even with no discovery pass.
+	gvrSyncCtrl := NewClusterCacheGVRSyncController(rt)
+	gvrSyncCC, err := beehive.Register(bh, ClusterCacheGVRSyncGroupKind, gvrSyncCtrl)
+	require.NoError(t, err)
+	gvrSyncCtrl.SetControllerClient(gvrSyncCC)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = stop(context.Background()); _ = ctrl.StopEngines() })
+	t.Cleanup(func() { _ = stop(context.Background()) })
 
-	return coreClient, cacheClient, fakeEng, slot
+	return coreClient, cacheClient, gvrSyncClient, discoveryClient, presence
 }
 
-// capturedCfgSlot holds the REST config and cache ref passed to the engine factory.
-type capturedCfgSlot struct {
-	cfg *rest.Config
-	ref store.CacheRef
-}
-
-// awaitCacheSyncedStatus blocks on the ClusterCache object's beehive watch until its
-// Synced condition reaches want, then returns that condition (event-driven, no
-// polling). Waiting for a specific status matters because converge commits a transient
-// Synced=Syncing synchronously, then the engine's async Watching report flips it to
-// ConditionTrue — a test wanting the settled value must wait for it, not the first
-// write.
-func awaitCacheSyncedStatus(t *testing.T, cl beehive.Client[ClusterCacheSpec, ClusterCacheStatus], id beehive.ObjectID, want ConditionStatus) Condition {
+// awaitCacheSyncedReason blocks on the ClusterCache object's beehive watch until its Synced
+// condition reaches want (matching on Reason, since every current outcome is
+// ConditionFalse), then returns that condition. Matching on Reason — not Status — is what
+// distinguishes a transient Paused (parent not yet stamped active) from the settled Syncing
+// an eligible+active cache lands on.
+func awaitCacheSyncedReason(t *testing.T, cl beehive.Client[ClusterCacheSpec, ClusterCacheStatus], id beehive.ObjectID, want string) Condition {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ch, err := cl.Watch(ctx, id)
+	snap, ch, err := cl.Watch(ctx, id)
 	require.NoError(t, err)
+	if snap.Object != nil {
+		if c := findCacheConditionOK(snap.Object.Conditions, ConditionSynced); c != nil && c.Reason == want {
+			return *c
+		}
+	}
 
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
 		case ev, ok := <-ch:
 			if !ok {
-				t.Fatalf("watch closed before Synced=%s on ClusterCache", want)
+				t.Fatalf("watch closed before Synced reason=%s on ClusterCache", want)
 			}
-			if ev.Object == nil || ev.Object.Status == nil {
+			if ev.Object == nil {
 				continue
 			}
-			if c := findCacheConditionOK(ev.Object.Status.Conditions, ConditionSynced); c != nil && c.Status == want {
+			if c := findCacheConditionOK(ev.Object.Conditions, ConditionSynced); c != nil && c.Reason == want {
 				return *c
 			}
 		case <-timeout:
-			t.Fatalf("timed out waiting for Synced=%s on ClusterCache", want)
+			t.Fatalf("timed out waiting for Synced reason=%s on ClusterCache", want)
 		}
 	}
 }
@@ -148,20 +144,43 @@ func eligibleClusterSpec(contextName string) ClusterSpec {
 }
 
 // testCacheUID is the kube-system UID the cache tests' parent Cluster reports as its
-// connected identity. A ClusterCache is active (and runs an engine) only when its spec
-// UID matches the parent's Status.Server.UID, so the tests create their cache with this
-// UID and presenceController stamps it.
+// connected identity. A ClusterCache is active (and syncs) only when its spec UID matches
+// the parent's Status.Server.UID, so the tests create their cache with this UID and
+// presenceController stamps it.
 const testCacheUID = "kube-system-uid"
 
 // presenceController is the test stand-in for the Cluster kind's controller. The cache
-// controller gates on the parent's observed presence (Source.Kubeconfig.IsPresent) AND
-// on the cache being the active identity (its UID == Server.UID) — both written by the
-// real ClusterCoreController after a probe. This minimal controller stamps both (its
-// status write wakes the ClusterCache dependent, exercising the real trigger path)
-// without the probing machinery.
-type presenceController struct{}
+// controller gates on the parent's observed presence (Source.Kubeconfig.IsPresent) AND on
+// the cache being the active identity (its UID == Server.UID) — both written by the real
+// ClusterCoreController after a probe. This minimal controller stamps both (its status
+// write wakes the ClusterCache dependent, exercising the real trigger path) without the
+// probing machinery.
+type presenceController struct {
+	// uid overrides the kube-system UID stamped on the parent. Unset means testCacheUID.
+	// Swapping it mid-test is a physical-cluster migration — the one thing that flips an
+	// existing cache from active to inactive while the cluster stays sync-eligible.
+	uid atomic.Pointer[string]
+	// absent stamps IsPresent=false — the kubeconfig context momentarily gone, as a
+	// rewrite of ~/.kube/config by kubectx or a cloud CLI produces.
+	absent atomic.Bool
+}
 
-func (presenceController) Reconcile(
+// setUID makes the controller stamp a different identity from the next reconcile on. The
+// caller must still wake the Cluster (e.g. a spec write); changing the field alone doesn't.
+func (p *presenceController) setUID(uid string) { p.uid.Store(&uid) }
+
+// setPresent makes the controller stamp the context as present or gone from the next
+// reconcile on. Like setUID, the caller must still wake the Cluster.
+func (p *presenceController) setPresent(present bool) { p.absent.Store(!present) }
+
+func (p *presenceController) serverUID() string {
+	if v := p.uid.Load(); v != nil {
+		return *v
+	}
+	return testCacheUID
+}
+
+func (p *presenceController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterStatus],
 	obj *beehive.Object[ClusterSpec, ClusterStatus],
@@ -173,9 +192,9 @@ func (presenceController) Reconcile(
 	wantSrc := ClusterStatusSourceKubeconfig{
 		Cluster:   kc.Context + "-cluster",
 		User:      kc.Context + "-user",
-		IsPresent: true,
+		IsPresent: !p.absent.Load(),
 	}
-	uid := testCacheUID
+	uid := p.serverUID()
 	if obj.Status != nil && obj.Status.Source.Kubeconfig != nil &&
 		*obj.Status.Source.Kubeconfig == wantSrc &&
 		obj.Status.Server.UID != nil && *obj.Status.Server.UID == uid {
@@ -188,50 +207,391 @@ func (presenceController) Reconcile(
 	return beehive.Result{}, client.UpdateStatus(ctx, obj.ID, obj.Generation, status)
 }
 
-func TestCacheControllerEligibleClusterStartsEngine(t *testing.T) {
+// TestCacheControllerEligibleActiveCacheSyncs verifies that an eligible + active cache
+// converges to Synced=False/Syncing — the placeholder condition converge writes after
+// delegating to EnsureCache (until the P4 rollup replaces it with the real summary).
+func TestCacheControllerEligibleActiveCacheSyncs(t *testing.T) {
 	ctx := context.Background()
-	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
+	coreClient, cacheClient, _, _ := newCacheTestBeehive(t)
 
-	// Create parent Cluster.
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleClusterSpec("alpha"))
 	require.NoError(t, err)
 	id := ClusterID(clusterObj.ID)
 
-	// Create ClusterCache child.
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
 		beehive.WithOwner(clusterObj.ID))
 	require.NoError(t, err)
 
-	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-	assert.Equal(t, ConditionTrue, synced.Status,
-		"engine started and reported Watching → Synced=True")
-	assert.True(t, fakeEng.started.Load())
+	synced := awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonSyncing)
+	assert.Equal(t, ConditionFalse, synced.Status)
 }
 
-// TestCacheControllerDeletionStopsEngineAndClearsFinalizer verifies the cache teardown
-// path: deleting a ClusterCache that carries the file-cleanup finalizer stops its
-// engine, flushes the on-disk file, then clears the finalizer so GC collects the row
-// (without which the deletion-pending row would linger forever).
-func TestCacheControllerDeletionStopsEngineAndClearsFinalizer(t *testing.T) {
+// awaitEventsSyncEnabled polls the cache's Event sync child by its deterministic name until
+// it exists with Spec.Enabled == want, then returns it. Polling on the spec (not mere
+// existence) is the point: the child is created unconditionally and outlives every pause, so
+// a pause is observable only as the spec flipping. Any read error other than NotFound fails
+// the test.
+//
+// Events are an ordinary per-kind sync child, seeded by the cache controller so they don't
+// wait on a discovery pass — hence the name is keyed on the discovery anchor, not the cache.
+func awaitEventsSyncEnabled(
+	t *testing.T,
+	cl beehive.Client[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus],
+	dc beehive.Client[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus],
+	cacheID beehive.ObjectID,
+	want bool,
+) *beehive.Object[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus] {
+	t.Helper()
 	ctx := context.Background()
-	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
+	name := ""
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		// The anchor is created in the same pass that seeds the child, so resolve it here
+		// rather than up front — on the first tick it may not exist yet.
+		if name == "" {
+			anchor, err := dc.GetByName(ctx, ClusterCacheGVRDiscoveryName(cacheID))
+			if err != nil && !errors.Is(err, beehive.ErrNotFound) {
+				require.NoError(t, err)
+			}
+			if err == nil {
+				name = ClusterCacheGVRSyncName(anchor.ID, eventsAPIVersion, eventsResource)
+			}
+		}
+		if name != "" {
+			obj, err := cl.GetByName(ctx, name)
+			if err != nil && !errors.Is(err, beehive.ErrNotFound) {
+				require.NoError(t, err)
+			}
+			if err == nil && obj.Spec.Enabled == want {
+				return obj
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for Event sync child enabled=%v (cache %d)", want, cacheID)
+		case <-tick.C:
+		}
+	}
+}
 
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
+// TestCacheControllerEligibleActiveCreatesEventsSyncChild verifies that an eligible + active
+// cache gets an enabled Event sync child straight away, owned by the discovery anchor like
+// every other per-kind child.
+//
+// The cache seeds this one itself rather than waiting for a discovery pass: events are the
+// highest-value diagnostic data in the cache, and a pass has to reach the API server before
+// it can report a single kind.
+func TestCacheControllerEligibleActiveCreatesEventsSyncChild(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, gvrSyncClient, discoveryClient := newCacheTestBeehive(t)
+
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleClusterSpec("alpha"))
 	require.NoError(t, err)
 	id := ClusterID(clusterObj.ID)
 
-	// Create the cache as ensureClusterCache does: owned, slugged, and carrying the
-	// file-cleanup finalizer (the literal must match the package's cacheFilesFinalizer).
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	child := awaitEventsSyncEnabled(t, gvrSyncClient, discoveryClient, cacheObj.ID, true)
+	owner, ok, err := gvrSyncClient.GetOwner(ctx, child.ID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	anchor, err := discoveryClient.GetByName(ctx, ClusterCacheGVRDiscoveryName(cacheObj.ID))
+	require.NoError(t, err)
+	assert.Equal(t, anchor.ID, owner.ID, "per-kind children hang off the discovery anchor")
+}
+
+// TestCacheControllerPauseDisablesEventsSyncChild verifies that pausing sync (SyncEnabled
+// =false) flips the child's Spec.Enabled instead of deleting it — the child (and the status
+// and event history it will carry) survives the pause, and the worker stops because its own
+// controller obeys the spec.
+func TestCacheControllerPauseDisablesEventsSyncChild(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, gvrSyncClient, discoveryClient := newCacheTestBeehive(t)
+
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	created := awaitEventsSyncEnabled(t, gvrSyncClient, discoveryClient, cacheObj.ID, true)
+
+	// Pause sync — the child must be disabled, not removed.
+	pausedSpec := eligibleClusterSpec("alpha")
+	pausedSpec.SyncEnabled = false
+	_, err = coreClient.Update(ctx, clusterObj.ID, pausedSpec)
+	require.NoError(t, err)
+
+	paused := awaitEventsSyncEnabled(t, gvrSyncClient, discoveryClient, cacheObj.ID, false)
+	// Same incarnation, not a delete-and-recreate.
+	assert.Equal(t, created.ID, paused.ID)
+
+	// Unpause — the same object comes back enabled (no GC name-release wait).
+	_, err = coreClient.Update(ctx, clusterObj.ID, eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+
+	resumed := awaitEventsSyncEnabled(t, gvrSyncClient, discoveryClient, cacheObj.ID, true)
+	assert.Equal(t, created.ID, resumed.ID)
+}
+
+// TestCacheControllerIneligibleCreatesDisabledEventsSyncChild verifies the child is created
+// even for a cache that has never been eligible to sync — existence is unconditional, so the
+// anchor is there to carry status from the start rather than appearing on first sync.
+func TestCacheControllerIneligibleCreatesDisabledEventsSyncChild(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, gvrSyncClient, discoveryClient := newCacheTestBeehive(t)
+
+	spec := eligibleClusterSpec("alpha")
+	spec.SyncEnabled = false
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), spec)
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	awaitEventsSyncEnabled(t, gvrSyncClient, discoveryClient, cacheObj.ID, false)
+}
+
+// TestCacheControllerDeletionCascadesToEventsSyncChild verifies the one removal path: deleting
+// the cache GC-cascades to the child. The cache holds a live DependsOn edge to it (for the
+// coming health rollup), so this also pins down that the edge can't wedge the collection.
+func TestCacheControllerDeletionCascadesToEventsSyncChild(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, gvrSyncClient, discoveryClient := newCacheTestBeehive(t)
+
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
 		beehive.WithOwner(clusterObj.ID),
 		beehive.WithFinalizers("kstack.io/cache-files"))
 	require.NoError(t, err)
 
-	// Let the engine spin up so its stop is observable.
-	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-	require.True(t, fakeEng.started.Load())
+	child := awaitEventsSyncEnabled(t, gvrSyncClient, discoveryClient, cacheObj.ID, true)
+
+	require.NoError(t, cacheClient.Delete(ctx, cacheObj.ID))
+
+	require.Eventually(t, func() bool {
+		_, err := gvrSyncClient.Get(ctx, child.ID)
+		return errors.Is(err, beehive.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "the Event sync child must be GC'd with its owning cache")
+}
+
+// syncStoppedRuns returns the SyncStopped runs on a cache's own timeline — the timeline the
+// sync-detail panel subscribes to (clusterCacheEventsWatch).
+func syncStoppedRuns(t *testing.T, cl beehive.Client[ClusterCacheSpec, ClusterCacheStatus], id beehive.ObjectID) []beehive.Event {
+	t.Helper()
+	runs, err := cl.ListEvents(context.Background(), id, beehive.WithEventCategory(SyncEventCategory))
+	require.NoError(t, err)
+	var out []beehive.Event
+	for _, r := range runs {
+		if r.Reason == ReasonSyncStopped {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestCacheControllerPauseRecordsSyncStopped verifies a user-facing pause leaves a mark on the
+// cache's timeline. Without it the log just ends at the last sync event, which reads the same
+// as a healthy cluster that went quiet.
+func TestCacheControllerPauseRecordsSyncStopped(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, _, _ := newCacheTestBeehive(t)
+
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	// Must reach the running state first — SyncStopped marks a transition, not a state.
+	awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonSyncing)
+	require.Empty(t, syncStoppedRuns(t, cacheClient, cacheObj.ID))
+
+	pausedSpec := eligibleClusterSpec("alpha")
+	pausedSpec.SyncEnabled = false
+	_, err = coreClient.Update(ctx, clusterObj.ID, pausedSpec)
+	require.NoError(t, err)
+
+	awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonPaused)
+
+	runs := syncStoppedRuns(t, cacheClient, cacheObj.ID)
+	require.Len(t, runs, 1)
+	assert.Equal(t, beehive.EventNormal, runs[0].Type)
+	// One run, count 1: the cache keeps re-reconciling while paused, and the condition-read
+	// transition guard is what stops each of those passes from re-recording.
+	assert.Equal(t, 1, runs[0].Count)
+}
+
+// TestCacheControllerNeverSyncedRecordsNoSyncStopped verifies the transition guard's other
+// half: a cache that was never syncing has nothing to stop, so an ineligible cluster that
+// settles straight into Paused records no event.
+func TestCacheControllerNeverSyncedRecordsNoSyncStopped(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, _, _ := newCacheTestBeehive(t)
+
+	spec := eligibleClusterSpec("alpha")
+	spec.SyncEnabled = false
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), spec)
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonPaused)
+	assert.Empty(t, syncStoppedRuns(t, cacheClient, cacheObj.ID))
+}
+
+// TestCacheControllerMigrationRecordsNoSyncStopped verifies the distinction this event exists
+// to make: a cache stopped because the physical cluster moved on (a migration left it behind)
+// is an internal hand-over, not something the user did, so it records nothing — even though it
+// really was running and really did stop. The cluster stays sync-eligible throughout, which is
+// exactly what separates this from a pause.
+func TestCacheControllerMigrationRecordsNoSyncStopped(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, _, _, presence := newCacheTestBeehivePresence(t)
+
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonSyncing)
+
+	// The cluster now answers with a different kube-system UID: same context, different
+	// physical cluster. Our cache is no longer the active identity. The spec write is only
+	// there to wake the Cluster so presenceController re-stamps.
+	presence.setUID("migrated-uid")
+	renamed := eligibleClusterSpec("alpha")
+	newName := "alpha-renamed"
+	renamed.Name = &newName
+	_, err = coreClient.Update(ctx, clusterObj.ID, renamed)
+	require.NoError(t, err)
+
+	awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonPaused)
+	assert.Empty(t, syncStoppedRuns(t, cacheClient, cacheObj.ID))
+}
+
+// A kubeconfig rewrite is not a pause. kubectx and the cloud CLIs replace ~/.kube/config
+// rather than editing it, so a context briefly disappears and comes back — and the SyncStopped
+// guard, keyed on full sync eligibility, read that as the user pausing sync and appended a
+// run to the cache's timeline on every round trip. The event is about the two spec switches,
+// which nothing but the user touches.
+func TestCacheControllerKubeconfigBlipRecordsNoSyncStopped(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, _, _, presence := newCacheTestBeehivePresence(t)
+
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+	awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonSyncing)
+
+	// The context vanishes. The spec write is only there to wake the Cluster so the
+	// presence controller re-stamps; the user's switches are untouched throughout.
+	presence.setPresent(false)
+	wake := eligibleClusterSpec("alpha")
+	gone := "alpha-gone"
+	wake.Name = &gone
+	_, err = coreClient.Update(ctx, clusterObj.ID, wake)
+	require.NoError(t, err)
+	awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonPaused)
+
+	// And comes back one write later.
+	presence.setPresent(true)
+	back := eligibleClusterSpec("alpha")
+	backName := "alpha-back"
+	back.Name = &backName
+	_, err = coreClient.Update(ctx, clusterObj.ID, back)
+	require.NoError(t, err)
+	awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonSyncing)
+
+	assert.Empty(t, syncStoppedRuns(t, cacheClient, cacheObj.ID),
+		"nobody paused anything; the kubeconfig was just rewritten")
+}
+
+// TestCacheControllerIneligibleClusterPaused verifies that a sync-ineligible cluster
+// (SyncEnabled=false) converges to Synced=False/Paused.
+func TestCacheControllerIneligibleClusterPaused(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, _, _ := newCacheTestBeehive(t)
+
+	spec := eligibleClusterSpec("alpha")
+	spec.SyncEnabled = false
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), spec)
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	synced := awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonPaused)
+	assert.Equal(t, ConditionFalse, synced.Status)
+}
+
+// TestCacheControllerInactiveCachePaused verifies that a cache whose ServerUID does NOT
+// match the parent's connected identity (a migration left-behind) is paused, even though
+// the cluster is otherwise sync-eligible — so its workers never write the new cluster's
+// data into a stale identity's file.
+func TestCacheControllerInactiveCachePaused(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, _, _ := newCacheTestBeehive(t)
+
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	// Cache for a *different* identity than the one presenceController stamps.
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, "stale-uid"), ClusterCacheSpec{ServerUID: "stale-uid"},
+		beehive.WithOwner(clusterObj.ID))
+	require.NoError(t, err)
+
+	synced := awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonPaused)
+	assert.Equal(t, ConditionFalse, synced.Status)
+}
+
+// TestCacheControllerDeletionClearsFinalizerAndFiles verifies the cache teardown path:
+// deleting a ClusterCache that carries the file-cleanup finalizer flushes the on-disk file
+// and clears the finalizer so GC collects the row (without which the deletion-pending row
+// would linger forever).
+func TestCacheControllerDeletionClearsFinalizerAndFiles(t *testing.T) {
+	ctx := context.Background()
+	coreClient, cacheClient, _, _ := newCacheTestBeehive(t)
+
+	clusterObj, err := coreClient.Create(ctx, kubeconfigName("alpha"), eligibleClusterSpec("alpha"))
+	require.NoError(t, err)
+	id := ClusterID(clusterObj.ID)
+
+	// Create the cache as ensureClusterCache does: owned, named, and carrying the
+	// file-cleanup finalizer (the literal must match the package's cacheFilesFinalizer).
+	cacheObj, err := cacheClient.Create(ctx, ClusterCacheName(id, testCacheUID), ClusterCacheSpec{ServerUID: testCacheUID},
+		beehive.WithOwner(clusterObj.ID),
+		beehive.WithFinalizers("kstack.io/cache-files"))
+	require.NoError(t, err)
+
+	// Let it converge first so the object is fully live.
+	awaitCacheSyncedReason(t, cacheClient, cacheObj.ID, ReasonSyncing)
 
 	// Delete → controller flushes files + clears the finalizer → GC removes the row.
 	require.NoError(t, cacheClient.Delete(ctx, cacheObj.ID))
@@ -240,371 +600,8 @@ func TestCacheControllerDeletionStopsEngineAndClearsFinalizer(t *testing.T) {
 		_, err := cacheClient.Get(ctx, cacheObj.ID)
 		return errors.Is(err, beehive.ErrNotFound)
 	}, 2*time.Second, 10*time.Millisecond, "cache row must be GC'd once its finalizer is cleared")
-	assert.True(t, fakeEng.stopped.Load(), "engine must be stopped on deletion")
-}
-
-// TestCacheControllerRecordsSyncEvents verifies the cache controller records each
-// engine status report into the ClusterCache's beehive event log under the "sync"
-// category. A caught-up Watching → Normal/SyncComplete (cold) or ResyncComplete (warm),
-// Errored → Warning/SyncDegraded (with LastError), a warm Syncing → Normal/ResyncStart.
-// It records only on a transition (a change in (type, reason)), so the engine's
-// freshness heartbeat (a repeated catch-up report bumping only LastSyncedAt) does NOT
-// open or extend a run — keeping a healthy cluster from reading as "Watching ×27" while
-// LastSyncedAt still updates via the status write.
-func TestCacheControllerRecordsSyncEvents(t *testing.T) {
-	ctx := context.Background()
-	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
-
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
-	require.NoError(t, err)
-	id := ClusterID(clusterObj.ID)
-
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
-		beehive.WithOwner(clusterObj.ID))
-	require.NoError(t, err)
-
-	// Sync-point on the engine's first (async) catch-up report so the reports below run
-	// after it. Once the entry is live, sink.Report is synchronous from this goroutine,
-	// so no further awaits are needed to observe each recorded event.
-	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-
-	// A second catch-up report (the engine's freshness heartbeat, only bumping
-	// LastSyncedAt) is NOT a transition — it must not open/extend an event run.
-	now := time.Now()
-	fakeEng.sink.Report(engine.EngineStatus{
-		State: engine.EngineWatching, ColdStart: true,
-		SyncedObjects: 5, SyncedKinds: 3, CaughtUpIn: 2 * time.Second, LastSyncedAt: &now,
-	})
-	// Transition to Errored, then to a (warm) Syncing.
-	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineErrored, LastError: "boom"})
-	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineSyncing})
-
-	evs, err := cacheClient.ListEvents(ctx, cacheObj.ID, beehive.WithEventCategory(SyncEventCategory))
-	require.NoError(t, err)
-	require.Len(t, evs, 3, "one run per transition (the repeated catch-up heartbeat is not recorded)")
-
-	// ListEvents is newest-run-first.
-	assert.Equal(t, beehive.EventNormal, evs[0].Type)
-	assert.Equal(t, ReasonResyncStart, evs[0].Reason)
-
-	assert.Equal(t, beehive.EventWarning, evs[1].Type)
-	assert.Equal(t, ReasonSyncDegraded, evs[1].Reason)
-	assert.Equal(t, "boom", evs[1].Message)
-
-	assert.Equal(t, beehive.EventNormal, evs[2].Type)
-	assert.Equal(t, ReasonSyncComplete, evs[2].Reason)
-	assert.Equal(t, 1, evs[2].Count,
-		"the steady-state catch-up heartbeat is not recorded, so the run stays count 1")
-	assert.Equal(t, "Initial sync complete — cached 5 objects across 3 kinds in 2s", evs[2].Message)
-}
-
-// A cold Syncing report reads as SyncStart; a warm catch-up (an already-populated
-// cache resuming) reads as ResyncComplete, with a "Re-sync complete …" message —
-// the start/complete pairs that distinguish a first-ever build from a reconnect.
-func TestCacheControllerSyncEventVocabulary(t *testing.T) {
-	ctx := context.Background()
-	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
-
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
-	require.NoError(t, err)
-	id := ClusterID(clusterObj.ID)
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
-		beehive.WithOwner(clusterObj.ID))
-	require.NoError(t, err)
-
-	// Wait for the initial cold catch-up (SyncComplete) so the entry is live.
-	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-
-	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineSyncing, ColdStart: true})
-	fakeEng.sink.Report(engine.EngineStatus{
-		State: engine.EngineWatching, ColdStart: false,
-		SyncedObjects: 7, SyncedKinds: 4, CaughtUpIn: 1500 * time.Millisecond,
-	})
-
-	evs, err := cacheClient.ListEvents(ctx, cacheObj.ID, beehive.WithEventCategory(SyncEventCategory))
-	require.NoError(t, err)
-	require.Len(t, evs, 3) // newest-first: ResyncComplete, SyncStart, SyncComplete
-
-	assert.Equal(t, ReasonResyncComplete, evs[0].Reason)
-	assert.Equal(t, "Re-sync complete — resumed watches for 4 kinds in 1.5s", evs[0].Message)
-	assert.Equal(t, ReasonSyncStart, evs[1].Reason)
-	assert.Equal(t, ReasonSyncComplete, evs[2].Reason)
-}
-
-// resyncCompleteMessage has three shapes, keyed on the engine's aggregated facts:
-// a bare liveness recovery (no kinds caught up), a pure watch-reconnect (kinds
-// resumed but none re-listed), and a resume where some kinds fell back to a full
-// re-sync (reporting the re-pulled bodies and how many kinds did the work).
-func TestResyncCompleteMessage(t *testing.T) {
-	tests := []struct {
-		name string
-		st   engine.EngineStatus
-		want string
-	}{
-		{
-			name: "bare liveness recovery",
-			st:   engine.EngineStatus{SyncedKinds: 0},
-			want: "Re-sync complete — watch recovered, streaming updates again",
-		},
-		{
-			name: "pure reconnect — nothing re-listed",
-			st:   engine.EngineStatus{SyncedKinds: 120, CaughtUpIn: 0},
-			want: "Re-sync complete — resumed watches for 120 kinds in 0s",
-		},
-		{
-			name: "some kinds re-synced",
-			st: engine.EngineStatus{
-				SyncedKinds: 120, ResyncedKinds: 4, ResyncedObjects: 340,
-				CaughtUpIn: 8 * time.Second,
-			},
-			want: "Re-sync complete — resumed watches for 120 kinds — re-synced 340 objects in 4 of them — in 8s",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, resyncCompleteMessage(tt.st))
-		})
-	}
-}
-
-// An EngineStale report flips the Synced condition to False/Stale and records a
-// SyncStale warning naming the wedged kinds — a stalled watch surfaced as its own
-// state, distinct from a hard SyncFailed.
-func TestCacheControllerStaleReport(t *testing.T) {
-	ctx := context.Background()
-	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
-
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
-	require.NoError(t, err)
-	id := ClusterID(clusterObj.ID)
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
-		beehive.WithOwner(clusterObj.ID))
-	require.NoError(t, err)
-
-	// Live (cold catch-up), then the liveness monitor reports the watch stale.
-	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-	fakeEng.sink.Report(engine.EngineStatus{State: engine.EngineStale, StaleKinds: []engine.KindStatus{
-		{Kind: "Pod", Cause: engine.CauseWatchFailed},
-		{Kind: "Endpoints", Cause: engine.CauseWatchStalled},
-	}})
-
-	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionFalse)
-	assert.Equal(t, ReasonStale, synced.Reason)
-
-	evs, err := cacheClient.ListEvents(ctx, cacheObj.ID, beehive.WithEventCategory(SyncEventCategory))
-	require.NoError(t, err)
-	require.NotEmpty(t, evs)
-	assert.Equal(t, ReasonSyncStale, evs[0].Reason)
-	assert.Equal(t, beehive.EventWarning, evs[0].Type)
-	assert.Contains(t, evs[0].Message, "Pod (watch failed)", "the per-kind stuck cause is named")
-	assert.Contains(t, evs[0].Message, "Endpoints (watch stalled)")
-}
-
-// Pausing sync (SyncEnabled → false) stops the running engine and records a
-// SyncStopped event — but only on the actual running→stopped transition and only
-// for a user-facing pause (not a migration prune or a restart).
-func TestCacheControllerRecordsSyncStopped(t *testing.T) {
-	ctx := context.Background()
-	coreClient, cacheClient, _, _ := newCacheTestBeehive(t, nil)
-
-	spec := eligibleClusterSpec("alpha")
-	clusterObj, err := coreClient.Create(ctx, spec)
-	require.NoError(t, err)
-	id := ClusterID(clusterObj.ID)
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
-		beehive.WithOwner(clusterObj.ID))
-	require.NoError(t, err)
-
-	// Engine running (cold catch-up).
-	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-
-	// Pause sync → the cache re-reconciles (DependsOn the parent), stops the
-	// engine, and records SyncStopped before flipping the condition to Paused.
-	spec.SyncEnabled = false
-	_, err = coreClient.Update(ctx, clusterObj.ID, spec)
-	require.NoError(t, err)
-	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionFalse)
-	require.Equal(t, ReasonPaused, synced.Reason)
-
-	evs, err := cacheClient.ListEvents(ctx, cacheObj.ID, beehive.WithEventCategory(SyncEventCategory))
-	require.NoError(t, err)
-	require.NotEmpty(t, evs)
-	assert.Equal(t, ReasonSyncStopped, evs[0].Reason, "the newest sync event is SyncStopped")
-	assert.Equal(t, beehive.EventNormal, evs[0].Type)
-}
-
-func TestCacheControllerIneligibleClusterStopsEngine(t *testing.T) {
-	ctx := context.Background()
-	coreClient, cacheClient, _, _ := newCacheTestBeehive(t, nil)
-
-	// SyncEnabled=false → ineligible for sync.
-	spec := eligibleClusterSpec("alpha")
-	spec.SyncEnabled = false
-	clusterObj, err := coreClient.Create(ctx, spec)
-	require.NoError(t, err)
-	id := ClusterID(clusterObj.ID)
-
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
-		beehive.WithOwner(clusterObj.ID))
-	require.NoError(t, err)
-
-	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionFalse)
-	assert.Equal(t, ConditionFalse, synced.Status)
-	assert.Equal(t, ReasonPaused, synced.Reason)
-}
-
-// TestCacheControllerReportWithParentGenerationAhead reproduces the engine-sink
-// generation skew: the parent Cluster's generation runs ahead of the ClusterCache's
-// own. The sink must stamp UpdateStatus with the cache object's own generation, not the
-// parent's, or beehive rejects the write as a future generation and drops the report.
-func TestCacheControllerReportWithParentGenerationAhead(t *testing.T) {
-	ctx := context.Background()
-	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
-
-	// Create the parent Cluster, then advance its generation past 1 by editing
-	// its spec, before the ClusterCache child exists.
-	spec := eligibleClusterSpec("alpha")
-	clusterObj, err := coreClient.Create(ctx, spec)
-	require.NoError(t, err)
-	id := ClusterID(clusterObj.ID)
-	for _, name := range []string{"rename-1", "rename-2"} {
-		n := name
-		spec.Name = &n
-		clusterObj, err = coreClient.Update(ctx, clusterObj.ID, spec)
-		require.NoError(t, err)
-	}
-	require.Greater(t, clusterObj.Generation, int64(1),
-		"parent generation must be ahead of the cache object's gen 1")
-
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
-		beehive.WithOwner(clusterObj.ID))
-	require.NoError(t, err)
-
-	// The async engine report must land as Synced=True. With the parent's
-	// generation wrongly used as observedGeneration this write is rejected and
-	// the condition never flips past the synchronous Syncing state.
-	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-	assert.True(t, fakeEng.started.Load())
-}
-
-// TestCacheControllerUsesConnectionManagerConfig verifies that when a
-// ConnectionManager holds a REST config for a cluster, the cache controller
-// passes that config (not a freshly resolved one) to the engine factory.
-func TestCacheControllerUsesConnectionManagerConfig(t *testing.T) {
-	ctx := context.Background()
-	connMgr := NewConnectionManager()
-	injected := &rest.Config{Host: "https://from-conn-mgr:6443"}
-
-	coreClient, cacheClient, _, slot := newCacheTestBeehive(t, connMgr)
-
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
-	require.NoError(t, err)
-	id := ClusterID(clusterObj.ID)
-	connMgr.Set(id, injected)
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
-		beehive.WithOwner(clusterObj.ID))
-	require.NoError(t, err)
-
-	awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-
-	assert.Equal(t, injected, slot.cfg,
-		"engine must receive the REST config from ConnectionManager, not a freshly resolved one")
-	assert.Equal(t, store.CacheRef{ClusterID: int64(clusterObj.ID), CacheID: int64(cacheObj.ID)}, slot.ref,
-		"engine cache ref must be the parent Cluster + ClusterCache beehive ObjectIDs")
-}
-
-// TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager verifies that
-// the cache controller still works when no ConnectionManager is provided.
-func TestCacheControllerFallsBackToKubeconfigWhenNoConnectionManager(t *testing.T) {
-	ctx := context.Background()
-	coreClient, cacheClient, fakeEng, _ := newCacheTestBeehive(t, nil)
-
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
-	require.NoError(t, err)
-	id := ClusterID(clusterObj.ID)
-	cacheObj, err := cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)),
-		beehive.WithOwner(clusterObj.ID))
-	require.NoError(t, err)
-
-	synced := awaitCacheSyncedStatus(t, cacheClient, cacheObj.ID, ConditionTrue)
-	assert.Equal(t, ConditionTrue, synced.Status)
-	assert.True(t, fakeEng.started.Load())
-}
-
-// TestCacheControllerPokeRestartsLiveEngine verifies the controller subscribes
-// to the poke bus and, on a signal, stops each live engine and starts a fresh
-// one (so stale watch streams are dropped and re-resumed).
-func TestCacheControllerPokeRestartsLiveEngine(t *testing.T) {
-	ctx := context.Background()
-	pk := poke.New()
-
-	bh := NewTestBeehiveUnstarted(t)
-	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
-	w := NewStaticWatcher(t, testKubeConfig("alpha"))
-	mgr := store.NewManager(t.TempDir())
-
-	ctrl := NewClusterCacheController(w, coreClient, mgr, nil, pk)
-
-	// Factory records every engine it builds, so the test can see the restart
-	// (old engine stopped, a second engine created and started).
-	var mu sync.Mutex
-	var created []*fakeEngine
-	ctrl.SetNewEngine(func(_ *rest.Config, _ ClusterID, _ store.CacheRef, sink engine.Sink) EngineHandle {
-		e := &fakeEngine{sink: sink}
-		mu.Lock()
-		created = append(created, e)
-		mu.Unlock()
-		return e
-	})
-
-	_, err := beehive.Register(bh, ClusterGroupKind, &presenceController{})
-	require.NoError(t, err)
-	cc, err := beehive.Register(bh, ClusterCacheGroupKind, ctrl)
-	require.NoError(t, err)
-	ctrl.SetControllerClient(cc)
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	ctrl.StartPoke()
-	t.Cleanup(func() { ctrl.StopPoke(); _ = stop(ctx); _ = ctrl.StopEngines() })
-
-	clusterObj, err := coreClient.Create(ctx, eligibleClusterSpec("alpha"))
-	require.NoError(t, err)
-	id := ClusterID(clusterObj.ID)
-	_, err = cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: testCacheUID},
-		beehive.WithSlug(ClusterCacheSlug(id, testCacheUID)), beehive.WithOwner(clusterObj.ID))
-	require.NoError(t, err)
-
-	// The first engine starts for the eligible
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(created) == 1 && created[0].started.Load()
-	}, 2*time.Second, 10*time.Millisecond, "engine should start for eligible cluster")
-
-	// Poke → the live engine is stopped and a fresh one started.
-	pk.Poke(poke.SourceHost)
-
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(created) == 2 && created[0].stopped.Load() && created[1].started.Load()
-	}, 2*time.Second, 10*time.Millisecond, "poke should restart the live engine")
 }
 
 func findCacheConditionOK(conds []Condition, typ ConditionType) *Condition {
-	for i := range conds {
-		if conds[i].Type == typ {
-			return &conds[i]
-		}
-	}
-	return nil
+	return FindCondition(conds, typ)
 }

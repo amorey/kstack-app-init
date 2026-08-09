@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,9 +28,9 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/amorey/beehive"
+	"github.com/amorey/gochan"
 	"github.com/amorey/gochan/broadcast"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/engine"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
@@ -88,9 +87,10 @@ type CheckFunc func(ctx context.Context, cfg *rest.Config) (HealthPhase, *string
 //
 // It subscribes to the kubeconfig watcher (in StartBackground) and re-reconciles
 // all clusters on a change, so edits propagate promptly; the status write then
-// wakes each ClusterCache dependent. Reconciles serialize on writeMu and re-read
-// fresh (see Reconcile) so the status-owned observation can't be clobbered by a
-// stale snapshot.
+// wakes each ClusterCache dependent. Reconciles of one cluster serialize on that
+// cluster's own lock and re-read fresh under it (see Reconcile) so the status-owned
+// observation can't be clobbered by a stale snapshot; reconciles of different
+// clusters run in parallel (see reconcileMu).
 type ClusterCoreController struct {
 	cfgSource   KubeConfigSource
 	coreClient  beehive.Client[ClusterSpec, ClusterStatus]
@@ -126,12 +126,25 @@ type ClusterCoreController struct {
 	sentinelWG sync.WaitGroup
 	bgCtx      context.Context
 
-	// writeMu serializes reconciles. Both beehive-scheduled and out-of-band reconciles
-	// take it and re-read the object's status fresh under it, so a stale snapshot can't
-	// clobber a newer observation — beehive status writes carry no resourceVersion
-	// guard. Held across the probe; for a desktop app's handful of clusters the
-	// serialized probing is acceptable.
-	writeMu sync.Mutex
+	// reconcileMu guards the per-cluster reconcile locks in reconcileLocks. The
+	// invariant those locks enforce is per object: beehive status writes carry no
+	// resourceVersion guard, so two reconciles of the SAME cluster must not interleave
+	// their read-modify-write, or a stale snapshot clobbers a newer observation. Two
+	// reconciles of DIFFERENT clusters share nothing — each writes its own object, and
+	// every other piece of state converge touches is separately guarded (connMgr's own
+	// RWMutex, sentinels under sentinelMu, probing under probeMu) — so they run in
+	// parallel. That parallelism is what keeps one unreachable cluster's dial timeout
+	// from delaying every cluster behind it at startup, when the beehive startup pass
+	// and the kubeconfig watcher's first snapshot both enqueue every cluster at once.
+	//
+	// A cluster's lock is held across its own probe, which is intended: it is pointless
+	// to probe one cluster twice concurrently, and it keeps setProbing's true/false
+	// pairing (and so the webview's "checking now") correct. Entries are never removed —
+	// a deleted cluster leaks one mutex, and the map is bounded by the number of
+	// clusters this process has ever seen (a desktop app's kube-contexts, so tens) —
+	// which avoids the race of freeing a lock another goroutine is about to take.
+	reconcileMu    sync.Mutex
+	reconcileLocks map[ClusterID]*sync.Mutex
 
 	// probeMu guards the in-flight probe set and serializes hub publishes with a new
 	// subscriber's current-value read (WatchProbe), so a subscriber never misses a
@@ -156,10 +169,18 @@ type probeUpdate struct {
 	Active bool
 }
 
-// probeHubCapacity bounds the probe-transition fan-out buffer. Probes serialize
-// on writeMu (one in flight at a time) and are seconds apart, so a small buffer
-// is ample.
+// probeHubCapacity bounds the probe-transition fan-out buffer. At most
+// clusterProbeConcurrency probes run at once and each publishes two transitions, so
+// a small buffer is ample.
 const probeHubCapacity = 16
+
+// clusterProbeConcurrency caps how many clusters are probed at once — the beehive
+// worker count for the Cluster kind (see Service.New) and the size of reconcileAll's
+// pool, since both spend their time in the same place: one cluster's network probe +
+// health check. Bounded rather than unlimited so a laptop with many kube-contexts
+// doesn't open a TLS handshake per context at once; wide enough that a handful of
+// unreachable clusters can't stall the reachable ones behind them.
+const clusterProbeConcurrency = 8
 
 // retryBufferSize bounds the targeted-retry bus. A full buffer means a retry is
 // already queued, so further Reprobe calls are dropped (non-blocking).
@@ -169,16 +190,15 @@ const retryBufferSize = 64
 // health round-trips are separately capped inside probe/check).
 const pokeReprobeTimeout = connectionProbeTimeout + healthProbeTimeout
 
-// NewClusterCoreController builds the controller. coreClient lets it enumerate
-// clusters for a poke-driven re-probe; connMgr may be nil (no connection
-// tracking); pokeSvc may be nil (no poke-driven re-probe). probe and check
-// default to the real network implementations; tests inject fakes.
+// NewClusterCoreController builds the controller from the shared runtime plus its own
+// specifics. It mints the Cluster + ClusterCache clients from rt.bh (the former lets it
+// enumerate clusters for a poke-driven re-probe, the latter creates ClusterCache
+// children); rt.connMgr may be nil (no connection tracking) and rt.pokeSvc may be nil
+// (no poke-driven re-probe). cfgSource is the kubeconfig source; probe and check default
+// to the real network implementations, tests inject fakes.
 func NewClusterCoreController(
+	rt *controllerRuntime,
 	cfgSource KubeConfigSource,
-	coreClient beehive.Client[ClusterSpec, ClusterStatus],
-	cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus],
-	connMgr *ConnectionManager,
-	pokeSvc *poke.Service,
 	probe ProbeFunc,
 	check CheckFunc,
 ) *ClusterCoreController {
@@ -190,20 +210,34 @@ func NewClusterCoreController(
 	}
 	probeHub := broadcast.New[probeUpdate](probeHubCapacity)
 	return &ClusterCoreController{
-		cfgSource:     cfgSource,
-		coreClient:    coreClient,
-		cacheClient:   cacheClient,
-		connMgr:       connMgr,
-		pokeSvc:       pokeSvc,
-		retryCh:       make(chan ClusterID, retryBufferSize),
-		probe:         probe,
-		check:         check,
-		sentinelWatch: watchKubeSystem,
-		sentinels:     make(map[ClusterID]*connSentinel),
-		probing:       make(map[ClusterID]bool),
-		probeHub:      probeHub,
-		probeTx:       probeHub.Sender(),
+		cfgSource:      cfgSource,
+		coreClient:     beehive.NewClient[ClusterSpec, ClusterStatus](rt.bh, ClusterGroupKind),
+		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](rt.bh, ClusterCacheGroupKind),
+		connMgr:        rt.connMgr,
+		pokeSvc:        rt.pokeSvc,
+		retryCh:        make(chan ClusterID, retryBufferSize),
+		probe:          probe,
+		check:          check,
+		sentinelWatch:  watchKubeSystem,
+		sentinels:      make(map[ClusterID]*connSentinel),
+		reconcileLocks: make(map[ClusterID]*sync.Mutex),
+		probing:        make(map[ClusterID]bool),
+		probeHub:       probeHub,
+		probeTx:        probeHub.Sender(),
 	}
+}
+
+// reconcileLock returns id's reconcile lock, creating it on first use. See
+// reconcileMu for why the lock is per cluster and never reclaimed.
+func (c *ClusterCoreController) reconcileLock(id ClusterID) *sync.Mutex {
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+	mu, ok := c.reconcileLocks[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		c.reconcileLocks[id] = mu
+	}
+	return mu
 }
 
 // setProbing records (and fans out) whether id's network probe is in flight. The
@@ -243,29 +277,34 @@ func (c *ClusterCoreController) WatchProbe(ctx context.Context, id ClusterID) <-
 			return
 		}
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			case u, ok := <-rx.Chan():
-				if !ok {
-					return
-				}
+			u, err := rx.RecvContext(ctx)
+			if err == nil {
 				if u.ID != id {
 					continue
 				}
-				select {
-				case out <- u.Active:
-				case <-ctx.Done():
+				if !send(ctx, out, u.Active) {
 					return
 				}
+				continue
+			}
+			var lagged gochan.ErrLagged
+			if !errors.As(err, &lagged) {
+				return // ctx ended, or the hub closed
+			}
+			// A slow consumer missed transitions the hub overwrote. Re-read the
+			// authoritative flag instead of carrying on: the values we lost may have
+			// included this cluster's probe FINISHING, and inferring "still probing" from
+			// a gap would leave the row stuck on "checking now" until the next probe.
+			c.probeMu.Lock()
+			cur := c.probing[id]
+			c.probeMu.Unlock()
+			if !send(ctx, out, cur) {
+				return
 			}
 		}
 	}()
 	return out
 }
-
-// maxAttemptMessageLen caps a recorded event message's length.
-const maxAttemptMessageLen = 200
 
 // recordAttempt appends one probe outcome to the cluster's beehive event log
 // (category ConnectionEventCategory). beehive coalesces consecutive outcomes sharing
@@ -279,7 +318,7 @@ func (c *ClusterCoreController) recordAttempt(ctx context.Context, client beehiv
 	if ok {
 		typ = beehive.EventNormal
 	}
-	err := client.RecordEvent(ctx, id, beehive.EventSpec{
+	err := client.AddEvent(ctx, id, beehive.EventSpec{
 		Category: ConnectionEventCategory,
 		Type:     typ,
 		Reason:   reason,
@@ -288,15 +327,6 @@ func (c *ClusterCoreController) recordAttempt(ctx context.Context, client beehiv
 	if err != nil && ctx.Err() == nil {
 		slog.Warn("clustercontroller: record connection event", "cluster", id, "reason", reason, "err", err)
 	}
-}
-
-// truncateMessage caps s at maxAttemptMessageLen bytes, appending an ellipsis
-// when it overflows. (Byte-bounded; error strings are effectively ASCII.)
-func truncateMessage(s string) string {
-	if len(s) <= maxAttemptMessageLen {
-		return s
-	}
-	return s[:maxAttemptMessageLen] + "…"
 }
 
 // SetControllerClient injects the status-write client from beehive.Register. It
@@ -331,7 +361,7 @@ func (c *ClusterCoreController) StartBackground() {
 	}
 
 	// Subscribe to the kubeconfig watcher: on every change re-reconcile all clusters
-	// so presence/isDefault observations (and the engine start/stop the cache
+	// so presence/isDefault observations (and the sync start/stop the cache
 	// controller derives from them) update promptly. The stream is current-on-subscribe,
 	// so the first value reconciles everything at startup.
 	kcSub := c.cfgSource.Subscribe()
@@ -397,10 +427,16 @@ func (c *ClusterCoreController) Reprobe(id ClusterID) {
 
 // reconcileAll re-runs the reconcile for every (non-deleting) cluster. Driven by the
 // resync poke bus (OS resume / network-on) and the kubeconfig watcher (presence /
-// isDefault / name changes). Reconcile re-reads each object fresh, re-observes the
-// kubeconfig, and gates eligibility — so a now-ineligible (e.g. just-departed)
-// cluster still updates its observation and conditions, and the status write wakes
-// its ClusterCache dependent. The List snapshot only enumerates ids.
+// isDefault / name changes) — and, because that subscription is current-on-subscribe,
+// once at startup. Reconcile re-reads each object fresh, re-observes the kubeconfig,
+// and gates eligibility — so a now-ineligible (e.g. just-departed) cluster still
+// updates its observation and conditions, and the status write wakes its ClusterCache
+// dependent. The List snapshot only enumerates ids.
+//
+// Clusters are reconciled concurrently, clusterProbeConcurrency at a time: each one
+// spends its time in a network probe, and reconciling them in sequence would make a
+// single unreachable cluster's dial timeout delay every cluster behind it. Reconcile
+// locks per cluster, so the fan-out is safe.
 func (c *ClusterCoreController) reconcileAll(baseCtx context.Context) {
 	objs, err := c.coreClient.List(baseCtx)
 	if err != nil {
@@ -409,15 +445,24 @@ func (c *ClusterCoreController) reconcileAll(baseCtx context.Context) {
 		}
 		return
 	}
+	sem := make(chan struct{}, clusterProbeConcurrency)
+	var wg sync.WaitGroup
+dispatch:
 	for _, obj := range objs {
-		if baseCtx.Err() != nil {
-			return // shutting down
-		}
 		if obj.DeletionRequestedAt != nil {
 			continue
 		}
-		c.reprobeObj(baseCtx, obj)
+		select {
+		case sem <- struct{}{}:
+		case <-baseCtx.Done():
+			break dispatch // shutting down; drain what is already running
+		}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			c.reprobeObj(baseCtx, obj)
+		})
 	}
+	wg.Wait()
 }
 
 // reprobeOne re-runs the connection reconcile for one cluster by id, forcing an
@@ -453,16 +498,25 @@ func (c *ClusterCoreController) reprobeObj(baseCtx context.Context, obj *beehive
 // the first failure short-circuits (probe failure records an observation and
 // requests backoff, store errors return an error for the harness to retry).
 func (c *ClusterCoreController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) (beehive.Result, error) {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	mu := c.reconcileLock(ClusterID(obj.ID))
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Re-read fresh under the lock so this reconcile acts on the latest status, not the
 	// snapshot it was handed. Status writes have no resourceVersion guard, so a stale
 	// snapshot would otherwise clobber a newer source observation.
-	if fresh, err := c.coreClient.Get(ctx, obj.ID); err == nil {
+	fresh, err := c.coreClient.Get(ctx, obj.ID)
+	switch {
+	case err == nil:
 		obj = fresh
-	} else if errors.Is(err, beehive.ErrNotFound) {
+	case errors.Is(err, beehive.ErrNotFound):
 		return beehive.Result{}, nil
+	default:
+		// Any other read failure ends the pass. Falling through would converge on the
+		// snapshot this reconcile was handed and then UpdateStatus it — with no
+		// resourceVersion guard, that is precisely the clobber of a newer observation the
+		// lock and this re-read exist to prevent.
+		return beehive.Result{}, err
 	}
 
 	if obj.DeletionRequestedAt != nil {
@@ -483,18 +537,30 @@ func (c *ClusterCoreController) Reconcile(ctx context.Context, client beehive.Co
 		Server:          loaded.Server,
 		Principal:       loaded.Principal,
 		LastConnectedAt: loaded.LastConnectedAt,
-		Conditions:      slices.Clone(loaded.Conditions),
 	}
 
-	requeueAfter, convergeErr := c.converge(ctx, client, obj, &working)
+	var conds conditionSet
+	requeueAfter, convergeErr := c.converge(ctx, client, obj, &working, &conds)
 
-	// Persist observations before surfacing any failure — the status write must land
-	// even when the probe failed. The probe-outcome event was already recorded by
-	// converge.
-	if !ClusterStatusEqual(loaded, working) {
-		if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, working); err != nil {
-			return beehive.Result{}, err
+	// Persist observations before surfacing any failure — the write must land even when
+	// the probe failed. The probe-outcome event was already recorded by converge.
+	//
+	// One transaction for the whole pass: the conditions land together with the status
+	// they describe, so a watcher never sees Connected=True beside a stale Server, nor
+	// half of a Connected/Healthy pair. When the status is unchanged we still settle the
+	// generation — conditions are their own rows and don't advance the handshake, so a
+	// pass whose only output is a condition would otherwise leave the object unsettled
+	// and re-enqueued by the owed pass forever.
+	if err := client.Within(ctx, func(ctx context.Context) error {
+		if err := client.SetConditions(ctx, obj.ID, conds); err != nil {
+			return err
 		}
+		if ClusterStatusEqual(loaded, working) {
+			return client.SetObservedGeneration(ctx, obj.ID, obj.Generation)
+		}
+		return client.UpdateStatus(ctx, obj.ID, obj.Generation, working)
+	}); err != nil {
+		return beehive.Result{}, err
 	}
 	// A probe/resolve failure is returned as an error so beehive applies its
 	// exponential backoff; the status above is already recorded for the UI.
@@ -509,10 +575,7 @@ func (c *ClusterCoreController) Reconcile(ctx context.Context, client beehive.Co
 // failed probe returns a non-nil error so beehive applies exponential backoff; a
 // success returns the steady health-poll interval; an ineligible cluster returns
 // (0, nil) — nothing scheduled.
-func (c *ClusterCoreController) converge(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus], working *ClusterStatus) (time.Duration, error) {
-	gen := obj.Generation
-	conds := &working.Conditions
-
+func (c *ClusterCoreController) converge(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus], working *ClusterStatus, conds *conditionSet) (time.Duration, error) {
 	clusterID := clusterIDFromObj(obj)
 
 	// Observe the kubeconfig live and record it on status (a departed context keeps
@@ -522,18 +585,8 @@ func (c *ClusterCoreController) converge(ctx context.Context, client beehive.Con
 
 	if !connectionEligible(obj, present) {
 		c.teardownConnection(clusterID)
-		SetCondition(conds, Condition{
-			Type:               ConditionConnected,
-			Status:             ConditionFalse,
-			Reason:             ReasonInactive,
-			ObservedGeneration: gen,
-		})
-		SetCondition(conds, Condition{
-			Type:               ConditionHealthy,
-			Status:             ConditionUnknown,
-			Reason:             ReasonInactive,
-			ObservedGeneration: gen,
-		})
+		conds.set(liveCondition(ConditionConnected, ConditionFalse, ReasonInactive, ""))
+		conds.set(liveCondition(ConditionHealthy, ConditionUnknown, ReasonInactive, ""))
 		return 0, nil
 	}
 
@@ -552,35 +605,34 @@ func (c *ClusterCoreController) converge(ctx context.Context, client beehive.Con
 	if err != nil {
 		c.teardownConnection(clusterID)
 		c.recordAttempt(ctx, client, obj.ID, false, ReasonResolveFailed, err.Error())
-		return 0, c.observeConnectFailure(conds, gen, ReasonResolveFailed, err)
+		return 0, c.observeConnectFailure(conds, ReasonResolveFailed, err)
 	}
 
 	server, principal, err := c.probe(ctx, restCfg)
 	if err != nil {
 		c.teardownConnection(clusterID)
 		c.recordAttempt(ctx, client, obj.ID, false, ReasonProbeFailed, err.Error())
-		return 0, c.observeConnectFailure(conds, gen, ReasonProbeFailed, err)
+		return 0, c.observeConnectFailure(conds, ReasonProbeFailed, err)
 	}
 
+	// The fingerprint is computed once here and shared: this is the only place that can
+	// see the kubeconfig's raw proxy-url, which ConfigFingerprint needs and no downstream
+	// reader has. The sentinel keys its liveness watch on it, and the sync controllers
+	// read it back off the ConnectionManager to detect a credential rotation.
+	fingerprint := ConfigFingerprint(restCfg, ContextProxyURL(c.cfgSource.Get(), contextName))
 	if c.connMgr != nil {
-		c.connMgr.Set(clusterID, restCfg)
+		c.connMgr.Set(clusterID, restCfg, fingerprint)
 	}
 	// Connected: hold a liveness watch open so a dropped connection is detected
 	// fast (watch close → re-probe), regardless of whether this cluster syncs. Keyed
 	// by the connection-config fingerprint so a credential rotation restarts it.
-	c.ensureSentinel(clusterID, restCfg,
-		engine.ConfigFingerprint(restCfg, engine.ContextProxyURL(c.cfgSource.Get(), contextName)))
+	c.ensureSentinel(clusterID, restCfg, fingerprint)
 
 	working.Server = server
 	working.Principal = principal
 	working.LastConnectedAt = &now
 	c.recordAttempt(ctx, client, obj.ID, true, ReasonConnected, "")
-	SetCondition(conds, Condition{
-		Type:               ConditionConnected,
-		Status:             ConditionTrue,
-		Reason:             ReasonConnected,
-		ObservedGeneration: gen,
-	})
+	conds.set(liveCondition(ConditionConnected, ConditionTrue, ReasonConnected, ""))
 
 	// The probe confirmed the kube-system UID: ensure a ClusterCache exists for that
 	// identity, then delete any cache left behind by a migration (a superseded UID).
@@ -595,7 +647,7 @@ func (c *ClusterCoreController) converge(ctx context.Context, client beehive.Con
 	}
 
 	phase, msg := c.check(ctx, restCfg)
-	SetCondition(conds, healthCondition(phase, msg, gen))
+	conds.set(healthCondition(phase, msg))
 	// Connected — a nil error makes beehive reset any accumulated backoff; the
 	// steady cadence is the periodic health poll.
 	return healthProbeInterval, nil
@@ -638,79 +690,57 @@ func (c *ClusterCoreController) observeKubeconfig(obj *beehive.Object[ClusterSpe
 // (base 1s, ×2, capped by WithMaxRetryInterval) and resets it on the next success.
 // Out-of-band reprobes bypass beehive's worker, so their errors don't disturb the
 // scheduled cadence.
-func (c *ClusterCoreController) observeConnectFailure(conds *[]Condition, gen int64, reason string, err error) error {
-	SetCondition(conds, Condition{
-		Type: ConditionConnected, Status: ConditionFalse,
-		Reason: reason, Message: err.Error(), ObservedGeneration: gen,
-	})
-	SetCondition(conds, Condition{
-		Type: ConditionHealthy, Status: ConditionUnknown,
-		Reason: ReasonNoConnection, ObservedGeneration: gen,
-	})
+func (c *ClusterCoreController) observeConnectFailure(conds *conditionSet, reason string, err error) error {
+	conds.set(liveCondition(ConditionConnected, ConditionFalse, reason, err.Error()))
+	conds.set(liveCondition(ConditionHealthy, ConditionUnknown, ReasonNoConnection, ""))
 	return err
 }
 
 // ensureClusterCache creates the ClusterCache child for one identity (kube-system
-// UID) if it doesn't already exist. The slug ("{clusterID}/{uid}") keys beehive's
-// UNIQUE(slug) dedup, so concurrent reconciles racing the create converge on one
+// UID) if it doesn't already exist. The name ("{clusterID}/{uid}") keys beehive's
+// per-kind name uniqueness, so concurrent reconciles racing the create converge on one
 // cache per (cluster, UID). On a migration the new UID's cache is created here and
-// pruneSupersededCaches removes the old one.
+// pruneSupersededCaches removes the old one. GetOrCreate does the read-or-create
+// atomically and returns an existing row untouched, so a concurrent reconcile can't
+// duplicate the child. Unlike the cache's own deletion this has no wait-for-GC branch
+// on a deletion-pending row: this name is never deletion-pending during a successful
+// probe (pause keeps the cache row; a prune targets a different UID; a cluster-delete
+// cascade makes the cluster ineligible so converge never reaches here), so an existing
+// row — always finalizer-bearing since we created it that way — is simply success.
 func (c *ClusterCoreController) ensureClusterCache(ctx context.Context, clusterID ClusterID, ownerID beehive.ObjectID, uid string) error {
-	slug := ClusterCacheSlug(clusterID, uid)
-	_, err := c.cacheClient.GetBySlug(ctx, slug)
-	if err == nil {
-		return nil // already exists
-	}
-	if !errors.Is(err, beehive.ErrNotFound) {
-		return err
-	}
-	_, err = c.cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: uid},
-		beehive.WithSlug(slug),
+	name := ClusterCacheName(clusterID, uid)
+	_, _, err := c.cacheClient.GetOrCreate(ctx, name, ClusterCacheSpec{ServerUID: uid},
 		beehive.WithOwner(ownerID),
 		// Gate deletion on the cache controller flushing this cache's on-disk
 		// files (UID-switch prune or cluster-delete cascade): GC won't collect the
 		// row until the finalizer is cleared, so the .db file can't leak.
 		beehive.WithFinalizers(cacheFilesFinalizer),
 	)
-	if err != nil {
-		// A concurrent reconcile may have created the child between our Get and Create
-		// — treat an existing child as success.
-		if _, gerr := c.cacheClient.GetBySlug(ctx, slug); gerr == nil {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return err
 }
 
 // pruneSupersededCaches requests deletion of every ClusterCache owned by ownerID
 // whose ServerUID differs from activeUID — the caches left behind when the cluster's
 // physical identity changed. Deletion is a soft request; the ClusterCache's finalizer
-// holds the row until the cache controller has stopped its engine and deleted the
+// holds the row until the cache controller's subtree has drained and it has deleted the
 // on-disk file, so this never races the file cleanup. Only ever called with a
 // confirmed activeUID (post-probe). Errors are logged, not fatal: the next reconcile
 // retries.
 func (c *ClusterCoreController) pruneSupersededCaches(ctx context.Context, clusterID ClusterID, ownerID beehive.ObjectID, activeUID string) {
-	// ListOwned is scoped to the client's own kind, so run it on the owner's (Cluster)
-	// client; the children are then read/deleted through the cache client.
-	refs, err := c.coreClient.ListOwned(ctx, ownerID)
+	// ListOwnedObjects is kind-scoped to the cache client and returns the children
+	// decoded, so it enumerates ownerID's ClusterCaches directly — no untyped-ref
+	// kind filter and no per-child Get.
+	caches, err := c.cacheClient.ListOwnedObjects(ctx, ownerID)
 	if err != nil {
 		slog.Warn("clustercontroller: list caches for prune", "cluster", clusterID, "err", err)
 		return
 	}
-	for _, ref := range refs {
-		if ref.Kind != ClusterCacheGroupKind.Kind {
-			continue
-		}
-		cacheObj, err := c.cacheClient.Get(ctx, ref.ID)
-		if err != nil {
-			continue
-		}
+	for _, cacheObj := range caches {
 		if cacheObj.Spec.ServerUID == activeUID || cacheObj.DeletionRequestedAt != nil {
 			continue // the active cache, or one already being deleted
 		}
-		if err := c.cacheClient.Delete(ctx, ref.ID); err != nil {
-			slog.Warn("clustercontroller: delete superseded cache", "cluster", clusterID, "cache", ref.ID, "err", err)
+		if err := c.cacheClient.Delete(ctx, cacheObj.ID); err != nil {
+			slog.Warn("clustercontroller: delete superseded cache", "cluster", clusterID, "cache", cacheObj.ID, "err", err)
 		}
 	}
 }
@@ -722,22 +752,21 @@ func clusterIDFromObj(obj *beehive.Object[ClusterSpec, ClusterStatus]) ClusterID
 }
 
 // healthCondition maps one health-probe outcome onto the Healthy condition.
-func healthCondition(phase HealthPhase, msg *string, gen int64) Condition {
-	cond := Condition{Type: ConditionHealthy, ObservedGeneration: gen}
+func healthCondition(phase HealthPhase, msg *string) Condition {
+	var message string
 	if msg != nil {
-		cond.Message = *msg
+		message = *msg
 	}
 	switch phase {
 	case HealthPhaseHealthy:
-		cond.Status, cond.Reason = ConditionTrue, ReasonReady
+		return liveCondition(ConditionHealthy, ConditionTrue, ReasonReady, message)
 	case HealthPhaseDegraded:
-		cond.Status, cond.Reason = ConditionFalse, ReasonReadyzFailed
+		return liveCondition(ConditionHealthy, ConditionFalse, ReasonReadyzFailed, message)
 	case HealthPhaseUnreachable:
-		cond.Status, cond.Reason = ConditionFalse, ReasonUnreachable
+		return liveCondition(ConditionHealthy, ConditionFalse, ReasonUnreachable, message)
 	default:
-		cond.Status, cond.Reason = ConditionUnknown, ReasonNoConnection
+		return liveCondition(ConditionHealthy, ConditionUnknown, ReasonNoConnection, message)
 	}
-	return cond
 }
 
 // probeCluster dials the cluster and discovers server version, kube-system UID,

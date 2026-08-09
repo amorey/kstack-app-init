@@ -19,6 +19,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -66,18 +67,38 @@ func (f *fakeCoreController) WatchProbe(context.Context, ClusterID) <-chan bool 
 // controller-owned surfaces a white-box test stamps directly.
 func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterStatus], beehive.ControllerClient[ClusterCacheStatus]) {
 	t.Helper()
+	s, coreCC, cacheCC, _, _ := newServiceTestSync(t)
+	return s, coreCC, cacheCC
+}
+
+// newServiceTestSync is newServiceTest plus the sync children's controller client, for
+// the tests that write a child's status (the granular sync surface).
+func newServiceTestSync(t *testing.T) (
+	*Service,
+	beehive.ControllerClient[ClusterStatus],
+	beehive.ControllerClient[ClusterCacheStatus],
+	beehive.ControllerClient[ClusterCacheGVRSyncStatus],
+	beehive.ControllerClient[ClusterCacheGVRDiscoveryStatus],
+) {
+	t.Helper()
 	st, err := sqlite.OpenMemory()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bh, err := beehive.New(st, beehive.WithResyncInterval(0))
+	bh, err := beehive.New(st)
 	require.NoError(t, err)
 
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
+	gvrDiscoveryClient := beehive.NewClient[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus](bh, ClusterCacheGVRDiscoveryGroupKind)
+	gvrSyncClient := beehive.NewClient[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus](bh, ClusterCacheGVRSyncGroupKind)
 
 	coreCC, err := beehive.Register(bh, ClusterGroupKind, &noopController[ClusterSpec, ClusterStatus]{})
 	require.NoError(t, err)
 	cacheCC, err := beehive.Register(bh, ClusterCacheGroupKind, &noopController[ClusterCacheSpec, ClusterCacheStatus]{})
+	require.NoError(t, err)
+	gvrDiscoveryCC, err := beehive.Register(bh, ClusterCacheGVRDiscoveryGroupKind, &noopController[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus]{})
+	require.NoError(t, err)
+	gvrSyncCC, err := beehive.Register(bh, ClusterCacheGVRSyncGroupKind, &noopController[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus]{})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
@@ -91,29 +112,31 @@ func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[ClusterSta
 	t.Cleanup(func() { _ = cacheManager.Shutdown(context.Background()) })
 
 	return &Service{
-		coreClient:   coreClient,
-		cacheClient:  cacheClient,
-		cacheManager: cacheManager,
-		connMgr:      NewConnectionManager(),
-		coreCtrl:     &fakeCoreController{},
+		coreClient:         coreClient,
+		cacheClient:        cacheClient,
+		gvrDiscoveryClient: gvrDiscoveryClient,
+		gvrSyncClient:      gvrSyncClient,
+		cacheManager:       cacheManager,
+		connMgr:            NewConnectionManager(),
+		coreCtrl:           &fakeCoreController{},
 		// A short non-zero debounce keeps the watch tests fast while still exercising
 		// the coalescing path (the Coalesces test overrides it to a wider window).
 		dataKindsDebounce: 5 * time.Millisecond,
-	}, coreCC, cacheCC
+	}, coreCC, cacheCC, gvrSyncCC, gvrDiscoveryCC
 }
 
 // seedCluster creates a Cluster (as the importer would, with the kubeconfig
-// slug) and returns its ClusterID — the beehive ObjectID beehive assigned.
+// name) and returns its ClusterID — the beehive ObjectID beehive assigned.
 func seedCluster(t *testing.T, s *Service, ctxName string) ClusterID {
 	t.Helper()
 	ctx := context.Background()
 	name := ctxName
-	obj, err := s.coreClient.Create(ctx, ClusterSpec{
+	obj, err := s.coreClient.Create(ctx, kubeconfigName(ctxName), ClusterSpec{
 		Name:        &name,
 		SyncEnabled: true,
 		Enabled:     true,
 		Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: ctxName}},
-	}, beehive.WithSlug(kubeconfigSlug(ctxName)))
+	})
 	require.NoError(t, err)
 	return ClusterID(obj.ID)
 }
@@ -133,14 +156,14 @@ func stampActiveUID(t *testing.T, s *Service, coreCC beehive.ControllerClient[Cl
 }
 
 // seedActiveCache creates an active ClusterCache for a cluster: it stamps the
-// cluster's connected UID and creates a ClusterCache (owned, UID-keyed slug) for
+// cluster's connected UID and creates a ClusterCache (owned, UID-keyed name) for
 // that identity. Returns the cache's ObjectID.
 func seedActiveCache(t *testing.T, s *Service, coreCC beehive.ControllerClient[ClusterStatus], id ClusterID, uid string) beehive.ObjectID {
 	t.Helper()
 	ctx := context.Background()
 	stampActiveUID(t, s, coreCC, id, uid)
-	cacheObj, err := s.cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: uid},
-		beehive.WithSlug(ClusterCacheSlug(id, uid)), beehive.WithOwner(beehive.ObjectID(id)))
+	cacheObj, err := s.cacheClient.Create(ctx, ClusterCacheName(id, uid), ClusterCacheSpec{ServerUID: uid},
+		beehive.WithOwner(beehive.ObjectID(id)))
 	require.NoError(t, err)
 	return cacheObj.ID
 }
@@ -170,7 +193,8 @@ func TestServiceListAndGet(t *testing.T) {
 
 // WatchCaches streams each ClusterCache standalone: the snapshot carries an Added
 // change per cache with its parent ClusterID resolved from the owner edge, its
-// ServerUID, and its sync status. Active-ness is a client-side join, not asserted here.
+// ServerUID, and its conditions. The kind has no status (it measures nothing itself), and
+// active-ness is a client-side join, so neither is asserted here.
 func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -180,19 +204,18 @@ func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 	const uid = "kube-system-uid"
 	cacheID := seedActiveCache(t, s, coreCC, id, uid)
 
-	now := time.Now().UTC()
-	// Give the ClusterCache a Synced status to carry through.
+	// Give the ClusterCache its coarse Synced condition, as its controller would.
 	cacheObj, err := s.cacheClient.Get(ctx, cacheID)
 	require.NoError(t, err)
-	require.NoError(t, cacheCtl.UpdateStatus(ctx, cacheObj.ID, cacheObj.Generation, ClusterCacheStatus{
-		LastSyncedAt: &now,
+	require.NoError(t, cacheCtl.SetConditions(ctx, cacheObj.ID, []Condition{
+		liveCondition(ConditionSynced, ConditionFalse, ReasonSyncing, ""),
 	}))
 
 	ch, err := s.WatchCaches(ctx)
 	require.NoError(t, err)
 
 	// WatchList replays current state on subscribe (conflated per object), so drain
-	// Added changes until the synced status lands.
+	// Added changes until the condition lands.
 	deadline := time.After(2 * time.Second)
 	for {
 		ev := recvBy(t, ch, deadline)
@@ -201,8 +224,181 @@ func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 		assert.Equal(t, ClusterCacheID(cacheID), ev.Cache.ID)
 		assert.Equal(t, id, ev.Cache.ClusterID) // resolved from the owner edge
 		assert.Equal(t, uid, ev.Cache.ServerUID)
-		if ev.Cache.Status.LastSyncedAt != nil {
-			assert.WithinDuration(t, now, *ev.Cache.Status.LastSyncedAt, time.Second)
+		if cond := FindCondition(ev.Cache.Conditions, ConditionSynced); cond != nil {
+			assert.Equal(t, ReasonSyncing, cond.Reason)
+			return
+		}
+	}
+}
+
+// WatchCacheSyncHealth folds a cache's per-kind records into one verdict — the reading an
+// always-mounted consumer needs, since the per-kind stream is a hundred-plus records per
+// cache and no single child's verdict is the cache's.
+//
+// The fold must be dominated by the worst kind: ninety-nine healthy kinds and one whose
+// watch is wedged is not a healthy cache, and reading any one child would call it either
+// way at random.
+func TestServiceWatchCacheSyncHealthFoldsWorstKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _, syncCC, _ := newServiceTestSync(t)
+	id := seedCluster(t, s, "alpha")
+
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	discoveryID := seedGVRDiscovery(t, s, cacheID)
+	healthy := seedGVRSync(t, s, discoveryID, "apps/v1", "deployments")
+	wedged := seedGVRSync(t, s, discoveryID, "example.com/v1", "widgets")
+
+	require.NoError(t, syncCC.SetConditions(ctx, healthy, []Condition{
+		liveCondition(ConditionSynced, ConditionTrue, ReasonWatching, ""),
+	}))
+	require.NoError(t, syncCC.SetConditions(ctx, wedged, []Condition{
+		liveCondition(ConditionSynced, ConditionFalse, ReasonStale, "the watch has stalled"),
+	}))
+
+	ch, err := s.WatchCacheSyncHealth(ctx)
+	require.NoError(t, err)
+
+	deadline := time.After(3 * time.Second)
+	for {
+		h := recvBy(t, ch, deadline)
+		if h.CacheID != ClusterCacheID(cacheID) || h.Reason != ReasonStale {
+			continue // an earlier fold, before both verdicts had landed
+		}
+		assert.Equal(t, ConditionFalse, h.Status)
+		assert.Equal(t, 2, h.TotalKinds)
+		assert.Equal(t, 1, h.UnhealthyKinds)
+		require.Len(t, h.UnhealthyKindRefs, 1, "the verdict must name the kind behind it")
+		assert.Equal(t, "widgets", h.UnhealthyKindRefs[0].Resource)
+		assert.Equal(t, "example.com/v1", h.UnhealthyKindRefs[0].APIVersion,
+			"with its api group, since the plural alone doesn't identify a kind")
+		return
+	}
+}
+
+// A kind whose verdict nobody has observed yet keeps the whole cache out of Watching. The
+// end-to-end half of TestSyncHealthVerdict: a sync record exists but carries no Synced
+// condition, which is what every kind looks like between its record being created and its
+// worker's first report — and, after a restart, what every kind looks like at once.
+func TestServiceWatchCacheSyncHealthWaitsForEveryKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _, syncCC, _ := newServiceTestSync(t)
+	id := seedCluster(t, s, "alpha")
+
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	discoveryID := seedGVRDiscovery(t, s, cacheID)
+	reported := seedGVRSync(t, s, discoveryID, "apps/v1", "deployments")
+	silent := seedGVRSync(t, s, discoveryID, "v1", "pods")
+
+	// One kind reports healthy; the other has not reported at all.
+	require.NoError(t, syncCC.SetConditions(ctx, reported, []Condition{
+		liveCondition(ConditionSynced, ConditionTrue, ReasonWatching, ""),
+	}))
+
+	ch, err := s.WatchCacheSyncHealth(ctx)
+	require.NoError(t, err)
+
+	deadline := time.After(3 * time.Second)
+	for {
+		h := recvBy(t, ch, deadline)
+		if h.CacheID != ClusterCacheID(cacheID) || h.TotalKinds != 2 {
+			continue // an earlier fold, before both records had landed
+		}
+		require.Equal(t, ConditionUnknown, h.Status,
+			"one unobserved kind must keep the cache out of a healthy verdict")
+		assert.Equal(t, ReasonSyncing, h.Reason)
+		break
+	}
+
+	// Once the last kind reports, the cache is healthy.
+	require.NoError(t, syncCC.SetConditions(ctx, silent, []Condition{
+		liveCondition(ConditionSynced, ConditionTrue, ReasonWatching, ""),
+	}))
+	for {
+		h := recvBy(t, ch, deadline)
+		if h.CacheID != ClusterCacheID(cacheID) || h.Reason != ReasonWatching {
+			continue
+		}
+		assert.Equal(t, ConditionTrue, h.Status)
+		assert.Equal(t, 2, h.TotalKinds)
+		return
+	}
+}
+
+// A cache whose kinds are all healthy reports healthy, and one whose discovery has not
+// landed reports Unknown rather than either verdict — nobody has observed anything yet.
+func TestServiceWatchCacheSyncHealthHealthyAndUnknown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _, syncCC, _ := newServiceTestSync(t)
+	id := seedCluster(t, s, "alpha")
+
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	discoveryID := seedGVRDiscovery(t, s, cacheID)
+
+	ch, err := s.WatchCacheSyncHealth(ctx)
+	require.NoError(t, err)
+
+	first := recvBy(t, ch, time.After(3*time.Second))
+	assert.Equal(t, ConditionUnknown, first.Status, "no kinds yet is neither healthy nor broken")
+	assert.Zero(t, first.TotalKinds)
+
+	only := seedGVRSync(t, s, discoveryID, "apps/v1", "deployments")
+	require.NoError(t, syncCC.SetConditions(ctx, only, []Condition{
+		liveCondition(ConditionSynced, ConditionTrue, ReasonWatching, ""),
+	}))
+
+	deadline := time.After(3 * time.Second)
+	for {
+		h := recvBy(t, ch, deadline)
+		if h.Status != ConditionTrue {
+			continue
+		}
+		assert.Equal(t, ReasonWatching, h.Reason)
+		assert.Equal(t, 1, h.TotalKinds)
+		assert.Zero(t, h.UnhealthyKinds)
+		return
+	}
+}
+
+// The GVR-discovery watch is a standalone delta stream of
+// the cache's other sync child, with the parent CacheID resolved from the owner edge. It
+// carries identity, spec and conditions only — the pass's gauges are served out of band
+// (GVRDiscoveryStats), so there is no status on the record to assert.
+func TestServiceWatchGVRDiscoveriesEmitsChildren(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _, _, discCC := newServiceTestSync(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+
+	child, err := s.gvrDiscoveryClient.Create(ctx, ClusterCacheGVRDiscoveryName(cacheID),
+		ClusterCacheGVRDiscoverySpec{Enabled: true}, beehive.WithOwner(cacheID))
+	require.NoError(t, err)
+
+	require.NoError(t, discCC.SetConditions(ctx, child.ID, []Condition{
+		liveCondition(ConditionDiscovered, ConditionTrue, ReasonDiscovered, ""),
+	}))
+
+	ch, err := s.WatchGVRDiscoveries(ctx)
+	require.NoError(t, err)
+
+	// WatchList replays current state on subscribe (conflated per object), so drain
+	// Added changes until the child's verdict lands.
+	deadline := time.After(2 * time.Second)
+	for {
+		ev := recvBy(t, ch, deadline)
+		assert.Equal(t, ChangeAdded, ev.Type)
+		require.NotNil(t, ev.Discovery)
+		assert.Equal(t, ClusterCacheGVRDiscoveryID(child.ID), ev.Discovery.ID)
+		assert.Equal(t, ClusterCacheID(cacheID), ev.Discovery.CacheID) // resolved from the owner edge
+		assert.True(t, ev.Discovery.Spec.Enabled)
+		cond := FindCondition(ev.Discovery.Conditions, ConditionDiscovered)
+		if cond != nil {
+			assert.Equal(t, ReasonDiscovered, cond.Reason)
 			return
 		}
 	}
@@ -295,6 +491,56 @@ func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	stats, err := s.CacheStats(ctx, id, ClusterCacheID(cacheID))
 	require.NoError(t, err)
 	assert.False(t, stats.Exists)
+}
+
+// Clearing a cache is drain → delete → restart, and past the drain it must finish. A
+// client that abandons the mutation midway — a closed window, a navigation — would
+// otherwise leave the cache drained, its files deleted, and no workers rebuilt, with
+// nothing else that ever rebuilds them.
+func TestServiceClearCacheFinishesWhenTheRequestIsAbandoned(t *testing.T) {
+	ctx := context.Background()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+
+	// Open the cache so there is a file to delete, and confirm it is really there.
+	ref, found, err := s.cacheRef(ctx, id)
+	require.NoError(t, err)
+	require.True(t, found)
+	_, err = s.cacheManager.Open(ctx, ref)
+	require.NoError(t, err)
+	_, exists := s.cacheManager.CacheBytes(ref)
+	require.True(t, exists)
+
+	// Abandon the request at the last read before the destructive part — which is where a
+	// real client disappearing hurts, and the only place a cancellation can be delivered
+	// deterministically. Failing the reads themselves would prove nothing: nothing has
+	// happened yet at that point.
+	aborted, cancel := context.WithCancel(ctx)
+	s.cacheClient = &cancelOnLookupCacheClient{Client: s.cacheClient, cancel: cancel}
+
+	c, err := s.ClearCache(aborted, id)
+	require.NoError(t, err, "an abandoned request must not abort the clear")
+	require.NotNil(t, c)
+
+	stats, err := s.CacheStats(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+	assert.False(t, stats.Exists, "the cache files must have been deleted")
+}
+
+// cancelOnLookupCacheClient abandons the request the moment ClearCache resolves the cache
+// it is about to delete — the last read before the drain.
+type cancelOnLookupCacheClient struct {
+	beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnLookupCacheClient) GetByName(
+	ctx context.Context, name string, loads ...beehive.LoadOption,
+) (*beehive.Object[ClusterCacheSpec, ClusterCacheStatus], error) {
+	obj, err := c.Client.GetByName(ctx, name, loads...)
+	c.cancel()
+	return obj, err
 }
 
 // CacheStats rolls the kind catalog's per-kind counts up into ObjectCount/KindCount
@@ -1083,6 +1329,47 @@ func TestClusterDataObjectsWatchNoReReadForOtherKind(t *testing.T) {
 		2*time.Second, 5*time.Millisecond, "a matching-resource write must re-read")
 }
 
+// The kind catalog spans BOTH tables: every synced kind's count comes from the objects
+// triggers, and the Event kind's from the events triggers. Following only the object-write
+// broker froze the Events badge on a cluster that is event-busy but object-quiet — which is
+// exactly the cluster whose event count someone is watching.
+func TestClusterDataKindsWatchWakesOnEventWrites(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	// The Event kind's catalog row, as its sync worker registers it on start.
+	insertObjectCatalog(t, ctx, cdb, "v1", "Event", "events", "Namespaced")
+	cdb.ObjectsNotify()
+
+	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+
+	add := recvKindChange(t, ch)
+	require.Equal(t, "Event", add.Kind.Kind)
+	require.Zero(t, add.Kind.Count)
+
+	// An event write pings ONLY the events broker — the two are deliberately separate, so
+	// an event burst can't drive the expensive per-kind objects re-reads.
+	insertEvent(t, ctx, cdb, "ev-1", "Warning", "BackOff", "boom", 1, 100)
+	cdb.EventsNotify()
+
+	for {
+		ch2 := recvKindChange(t, ch)
+		if ch2.Kind.Kind != "Event" {
+			continue
+		}
+		assert.Equal(t, ChangeModified, ch2.Type)
+		assert.Equal(t, 1, ch2.Kind.Count, "the Events badge must track event writes")
+		return
+	}
+}
+
 // A keyed object write still wakes the keyless kind-catalog watch: a kind's first-ever
 // object is a catalog Add, so ClusterDataKindsWatch (keyless) must wake on any write,
 // keyed or not. Pins that the routing doesn't starve the catalog watch.
@@ -1101,8 +1388,15 @@ func TestClusterDataKindsWatchWakesOnKeyedWrite(t *testing.T) {
 	require.NoError(t, err)
 
 	// A brand-new kind's first object, announced via the real keyed (by-resource) write path.
-	insertObjectCatalog(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
+	//
+	// The object goes in BEFORE its catalog row on purpose. store.Kinds is a kind_catalog
+	// LEFT JOIN, so a kind is invisible until its catalog row exists — writing that row
+	// last means any read the watch happens to run mid-setup (its first one fires when
+	// WatchDB delivers the cache handle, which races these writes) either sees no kind at
+	// all or sees it with its count already correct. The reverse order lets an interim read
+	// emit an Added with count 0.
 	insertObject(t, ctx, cdb, "d1", "apps/v1", "Deployment", "default", "web", "1", 100)
+	insertObjectCatalog(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
 	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 
 	add := recvKindChange(t, ch)
@@ -1185,8 +1479,8 @@ func TestServiceCacheRefResolvesActiveCache(t *testing.T) {
 	// has no active cache.
 	id3 := seedCluster(t, s, "gamma")
 	stampActiveUID(t, s, coreCC, id3, "new-uid")
-	_, err = s.cacheClient.Create(ctx, ClusterCacheSpec{ServerUID: "old-uid"},
-		beehive.WithSlug(ClusterCacheSlug(id3, "old-uid")), beehive.WithOwner(beehive.ObjectID(id3)))
+	_, err = s.cacheClient.Create(ctx, ClusterCacheName(id3, "old-uid"), ClusterCacheSpec{ServerUID: "old-uid"},
+		beehive.WithOwner(beehive.ObjectID(id3)))
 	require.NoError(t, err)
 	_, found3, err := s.cacheRef(ctx, id3)
 	require.NoError(t, err)
@@ -1203,12 +1497,12 @@ func TestServiceDeleteTombstonesCluster(t *testing.T) {
 	// finalizer-less row on the reconcile Delete enqueues, and that physical delete
 	// races the Get below.
 	name := "alpha"
-	obj, err := s.coreClient.Create(ctx, ClusterSpec{
+	obj, err := s.coreClient.Create(ctx, kubeconfigName("alpha"), ClusterSpec{
 		Name:        &name,
 		SyncEnabled: true,
 		Enabled:     true,
 		Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: "alpha"}},
-	}, beehive.WithSlug(kubeconfigSlug("alpha")), beehive.WithFinalizers("test/hold"))
+	}, beehive.WithFinalizers("test/hold"))
 	require.NoError(t, err)
 	id := ClusterID(obj.ID)
 
@@ -1230,7 +1524,7 @@ func TestServiceGetConnection(t *testing.T) {
 	assert.Nil(t, s.GetConnection(id))
 
 	// After the connection manager is populated it is readable via the service.
-	s.connMgr.Set(id, cfg)
+	s.connMgr.Set(id, cfg, "fp")
 	assert.Equal(t, cfg, s.GetConnection(id))
 }
 
@@ -1388,12 +1682,12 @@ func TestServiceEventsReadsTimeline(t *testing.T) {
 	const cat = "test-timeline"
 	// run A (failure), repeated → one run, Count 2
 	for range 2 {
-		require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+		require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 			Category: cat, Type: beehive.EventWarning, Reason: "ReasonA", Message: "boom",
 		}))
 	}
 	// run B (success) → new run, Count 1
-	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+	require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 		Category: cat, Type: beehive.EventNormal, Reason: "ReasonB",
 	}))
 
@@ -1444,7 +1738,7 @@ func TestServiceWatchEventsStream(t *testing.T) {
 
 	const cat = "test-watch"
 	// one existing run before subscribe → replayed in the snapshot
-	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+	require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 		Category: cat, Type: beehive.EventWarning, Reason: "ReasonA", Message: "boom",
 	}))
 
@@ -1461,7 +1755,7 @@ func TestServiceWatchEventsStream(t *testing.T) {
 	assert.NotZero(t, runA)
 
 	// extend run A → re-delivered with the same id, count 2
-	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+	require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 		Category: cat, Type: beehive.EventWarning, Reason: "ReasonA", Message: "boom",
 	}))
 	e = recv(t, ch)
@@ -1469,7 +1763,7 @@ func TestServiceWatchEventsStream(t *testing.T) {
 	assert.Equal(t, 2, e.Count)
 
 	// changed reason → new run, distinct id
-	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+	require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 		Category: cat, Type: beehive.EventNormal, Reason: "ReasonB",
 	}))
 	e = recv(t, ch)
@@ -1499,7 +1793,7 @@ func TestClusterEventsPublicSurface(t *testing.T) {
 	oid := beehive.ObjectID(id)
 
 	const cat = "connection"
-	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+	require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 		Category: cat, Type: beehive.EventWarning, Reason: "ReasonA", Message: "boom",
 	}))
 
@@ -1517,7 +1811,7 @@ func TestClusterEventsPublicSurface(t *testing.T) {
 	e := recv(t, ch)
 	assert.Equal(t, "ReasonA", e.Reason)
 
-	require.NoError(t, coreCC.RecordEvent(ctx, oid, beehive.EventSpec{
+	require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 		Category: cat, Type: beehive.EventNormal, Reason: "ReasonB",
 	}))
 	e = recv(t, ch)
@@ -1536,7 +1830,7 @@ func TestClusterCacheEventsPublicSurface(t *testing.T) {
 	cacheOID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
 
 	const cat = "sync"
-	require.NoError(t, cacheCC.RecordEvent(ctx, cacheOID, beehive.EventSpec{
+	require.NoError(t, cacheCC.AddEvent(ctx, cacheOID, beehive.EventSpec{
 		Category: cat, Type: beehive.EventNormal, Reason: "Watching",
 	}))
 
@@ -1555,10 +1849,502 @@ func TestClusterCacheEventsPublicSurface(t *testing.T) {
 	e := recv(t, ch)
 	assert.Equal(t, "Watching", e.Reason)
 
-	require.NoError(t, cacheCC.RecordEvent(ctx, cacheOID, beehive.EventSpec{
+	require.NoError(t, cacheCC.AddEvent(ctx, cacheOID, beehive.EventSpec{
 		Category: cat, Type: beehive.EventWarning, Reason: "SyncFailed", Message: "boom",
 	}))
 	e = recv(t, ch)
 	assert.Equal(t, "SyncFailed", e.Reason)
 	assert.Equal(t, "boom", e.Message)
+}
+
+// recvStats takes the next value off a stats gauge, failing on timeout.
+func recvStats(t *testing.T, ch <-chan ClusterCacheStats) ClusterCacheStats {
+	t.Helper()
+	select {
+	case v, ok := <-ch:
+		require.True(t, ok, "stats stream closed")
+		return v
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for a stats frame")
+		return ClusterCacheStats{}
+	}
+}
+
+// TestClusterCacheStatsWatchTracksWrites is the regression for a frozen cache summary.
+// CacheStats is a live measurement, but it used to be readable only as a resolver field
+// on ClusterCache — and that object stops changing once its sync settles, so the webview
+// rendered whatever the cache held at subscribe time (an early, tiny snapshot of a sync
+// still in progress) forever. A gauge has to have its own stream.
+func TestClusterCacheStatsWatchTracksWrites(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	ch, err := s.ClusterCacheStatsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+
+	first := recvStats(t, ch)
+	assert.True(t, first.Exists)
+	assert.Zero(t, first.ObjectCount, "an empty cache reports nothing cached")
+
+	insertObjectCatalog(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
+	insertObject(t, ctx, cdb, "d1", "apps/v1", "Deployment", "default", "web", "1", 100)
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
+
+	got := recvStats(t, ch)
+	assert.Equal(t, 1, got.ObjectCount, "a write must move the gauge")
+	assert.Equal(t, 1, got.KindCount)
+}
+
+// A cache file with nobody holding it still EXISTS, and the gauge is the only thing that
+// says so — the webview drives its "Clear cache" action off this stream. Reporting a
+// closed cache as nonexistent disabled that action on precisely the rows that need it:
+// a cluster whose kube-context left the kubeconfig is never eligible, so no worker ever
+// opens its cache, and its whole reason for still being listed is to be reclaimed.
+func TestClusterCacheStatsWatchReportsAnUnopenedCacheOnDisk(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+
+	// Write the file, then close it: the cache exists on disk with no handle bound, which
+	// is the steady state of an orphaned or paused cluster.
+	ref := newCacheRef(beehive.ObjectID(id), cacheID)
+	_, err := s.cacheManager.Open(ctx, ref)
+	require.NoError(t, err)
+	require.NoError(t, s.cacheManager.Close(ctx, ref.CacheID))
+
+	ch, err := s.ClusterCacheStatsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+
+	got := recvStats(t, ch)
+	assert.True(t, got.Exists, "a cache file on disk exists whether or not anything is syncing it")
+	assert.Positive(t, got.Bytes, "and its size is a file stat, readable with no handle")
+	assert.Zero(t, got.ObjectCount, "the counts need an open handle, so they stay zero")
+}
+
+// A cache whose files are gone reports nothing — the same closed path as above, but with
+// no file behind it. This is what a Clear cache leaves behind between the delete and the
+// reopen, and what a removed cluster leaves for good.
+func TestClusterCacheStatsWatchReportsADeletedCacheAsGone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+
+	ch, err := s.ClusterCacheStatsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+
+	got := recvStats(t, ch)
+	assert.False(t, got.Exists, "no file, no cache")
+	assert.Zero(t, got.Bytes)
+}
+
+// TestClusterCacheStatsWatchSkipsUnchangedReads pins the dedupe that makes a per-write
+// gauge affordable: a busy cluster pings constantly, and a measurement that reads the
+// same twice must send nothing.
+func TestClusterCacheStatsWatchSkipsUnchangedReads(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
+	require.NoError(t, err)
+
+	ch, err := s.ClusterCacheStatsWatch(ctx, id, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+	recvStats(t, ch) // the opening read
+
+	// A ping that changed nothing.
+	cdb.ObjectsNotify()
+	select {
+	case v := <-ch:
+		t.Fatalf("an unchanged read must not emit, got %+v", v)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// TestWatchGVRSyncsIsScopedToOneCache pins the scoping that makes this stream usable. A
+// cache has one sync record per served kind — a hundred or more — so unlike the other
+// object watches this one is opened per cache, and must not leak another cache's kinds
+// into it.
+func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+
+	mine := seedCluster(t, s, "alpha")
+	other := seedCluster(t, s, "beta")
+	myCache := seedActiveCache(t, s, coreCC, mine, "uid-alpha")
+	otherCache := seedActiveCache(t, s, coreCC, other, "uid-beta")
+
+	myDiscovery := seedGVRDiscovery(t, s, myCache)
+	otherDiscovery := seedGVRDiscovery(t, s, otherCache)
+	seedGVRSync(t, s, myDiscovery, "apps/v1", "deployments")
+	seedGVRSync(t, s, otherDiscovery, "apps/v1", "deployments")
+
+	ch, err := s.WatchGVRSyncs(ctx, ClusterCacheID(myCache))
+	require.NoError(t, err)
+
+	got := recvGVRSyncChange(t, ch)
+	assert.Equal(t, ChangeAdded, got.Type)
+	assert.Equal(t, "deployments", got.Sync.Spec.Resource)
+	assert.Equal(t, ClusterCacheGVRDiscoveryID(myDiscovery), got.Sync.DiscoveryID,
+		"the record must carry its owning discovery anchor, the key a client joins on")
+
+	// The other cache's identically-named kind must not arrive.
+	select {
+	case extra := <-ch:
+		t.Fatalf("another cache's sync leaked into the stream: %+v", extra.Sync)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// A cache that has no discovery anchor yet is the normal state of one just created — it
+// gains one within a reconcile. Resolving the anchor once at subscribe latched an empty
+// stream for the subscription's whole life, so a sync dialog opened a moment too early
+// showed nothing until the user closed and reopened it.
+func TestWatchGVRSyncsResolvesAnAnchorCreatedAfterSubscribe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+
+	id := seedCluster(t, s, "alpha")
+	cacheID := seedActiveCache(t, s, coreCC, id, "uid-alpha")
+
+	// Subscribe BEFORE the cache has an anchor.
+	ch, err := s.WatchGVRSyncs(ctx, ClusterCacheID(cacheID))
+	require.NoError(t, err)
+
+	discoveryID := seedGVRDiscovery(t, s, cacheID)
+	seedGVRSync(t, s, discoveryID, "apps/v1", "deployments")
+
+	got := recvGVRSyncChange(t, ch)
+	assert.Equal(t, ChangeAdded, got.Type)
+	assert.Equal(t, "deployments", got.Sync.Spec.Resource)
+	assert.Equal(t, ClusterCacheGVRDiscoveryID(discoveryID), got.Sync.DiscoveryID)
+}
+
+func recvGVRSyncChange(t *testing.T, ch <-chan ClusterCacheGVRSyncChange) ClusterCacheGVRSyncChange {
+	t.Helper()
+	select {
+	case v, ok := <-ch:
+		require.True(t, ok, "gvr sync stream closed")
+		return v
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for a gvr sync frame")
+		return ClusterCacheGVRSyncChange{}
+	}
+}
+
+// seedGVRDiscovery creates the discovery anchor the cache controller would.
+// catalogSubscribe fans two brokers into one channel, so it owns a goroutine and two
+// registrations. Closing its output when both brokers close is how a caller learns through
+// the ping path that the db went away — the same signal a bare broker subscription gives —
+// and it is what lets the caller release the composite rather than dropping it on the floor.
+func TestCatalogSubscribeClosesWhenBothBrokersDo(t *testing.T) {
+	dir := t.TempDir()
+	mgr := store.NewManager(dir)
+	ctx := context.Background()
+	db, err := mgr.Open(ctx, store.CacheRef{ClusterID: 1, CacheID: 1})
+	require.NoError(t, err)
+
+	pings, cancel := catalogSubscribe(db)
+	defer cancel()
+
+	// A write on either broker still reaches the caller.
+	db.EventsNotify()
+	select {
+	case <-pings:
+	case <-time.After(2 * time.Second):
+		t.Fatal("an event write must wake the catalog watch")
+	}
+
+	// Shutting the db down closes both brokers, which must close the composite.
+	require.NoError(t, mgr.Shutdown(ctx))
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-pings:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("the composite must close once both brokers have")
+		}
+	}
+}
+
+// The per-kind watch is cache-scoped but rides a FLEET-wide stream, so its filter runs on
+// every sync record of every cache. While our own anchor is unresolved there is nothing
+// cached to compare against, so each of those frames cost its own point query — ~1500
+// lookups to drain a ten-cluster snapshot.
+//
+// One lookup per DISTINCT anchor is enough: a verdict never flips, and an anchor created
+// after we looked cannot be one we already rejected (ids are AUTOINCREMENT).
+func TestGVRSyncAnchorFilterLooksUpEachAnchorOnce(t *testing.T) {
+	var lookups int
+	var ours beehive.ObjectID // no anchor yet — the state that made every frame cost one
+	keep := gvrSyncAnchorFilter(func() (beehive.ObjectID, error) {
+		lookups++
+		return ours, nil
+	}, func(error) { t.Fatal("no read failed") })
+
+	// Another cache's kinds, streaming past us before we have an anchor of our own.
+	for range 50 {
+		require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+	}
+	require.Equal(t, 1, lookups, "one lookup decided the whole cache, not one per record")
+
+	// A second cache joins: one more lookup, then memoized too.
+	for range 50 {
+		require.Empty(t, keep(gvrSyncChangeOwnedBy(78)))
+	}
+	require.Equal(t, 2, lookups)
+
+	// Ours appears. It is a fresh id, so it cannot collide with anything ruled out.
+	ours = 91
+	require.Len(t, keep(gvrSyncChangeOwnedBy(91)), 1)
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)), "a rejected anchor stays rejected")
+}
+
+// A failed read is undecidable, not a rejection: memoizing it would drop that cache's
+// records for the stream's whole life on the strength of one transient error.
+//
+// Nor may the frame itself be dropped. beehive re-emits an object only when it changes, so
+// a kind whose one frame landed in a "database is locked" moment during cold start would
+// stay invisible to this subscription for as long as it lives. The frame is held and
+// released once a read can judge it.
+func TestGVRSyncAnchorFilterHoldsFramesUntilAReadSucceeds(t *testing.T) {
+	var fail bool
+	var errs int
+	keep := gvrSyncAnchorFilter(func() (beehive.ObjectID, error) {
+		if fail {
+			return 0, errors.New("read failed")
+		}
+		return 91, nil
+	}, func(error) { errs++ })
+
+	fail = true
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(91)), "undecidable, so nothing is emitted yet")
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(91)))
+	require.Equal(t, 2, errs)
+
+	// The read works: the two held frames come out ahead of the one being judged.
+	fail = false
+	require.Len(t, keep(gvrSyncChangeOwnedBy(91)), 3,
+		"frames held during the outage must be released, not lost")
+
+	// Nothing is held twice.
+	require.Len(t, keep(gvrSyncChangeOwnedBy(91)), 1)
+}
+
+// A frame held during an outage that turns out to belong to ANOTHER cache is dropped when
+// it is finally judged — holding it never made it ours.
+func TestGVRSyncAnchorFilterDropsHeldFramesOfOtherCaches(t *testing.T) {
+	var fail bool
+	keep := gvrSyncAnchorFilter(func() (beehive.ObjectID, error) {
+		if fail {
+			return 0, errors.New("read failed")
+		}
+		return 91, nil
+	}, func(error) {})
+
+	fail = true
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+
+	fail = false
+	require.Len(t, keep(gvrSyncChangeOwnedBy(91)), 1, "only our own frame comes out")
+}
+
+// The release of held frames must not depend on what the NEXT frame happens to be. On a
+// multi-cluster fleet almost every frame after the read recovers belongs to an anchor
+// already ruled out, and the memo answered those before the drain ran — so a kind whose one
+// frame landed in the error window stayed held for the subscription's whole life, invisible
+// in the sync panel, because beehive re-emits an object only when it changes.
+func TestGVRSyncAnchorFilterReleasesHeldFramesOnAnAlreadyRejectedAnchor(t *testing.T) {
+	var fail bool
+	keep := gvrSyncAnchorFilter(func() (beehive.ObjectID, error) {
+		if fail {
+			return 0, errors.New("read failed")
+		}
+		return 91, nil
+	}, func(error) {})
+
+	// Rule an anchor out while the read works — the steady state the memo exists for.
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+
+	// Our own kind's only frame lands during an outage.
+	fail = true
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(91)))
+
+	// The read recovers, but the fleet's next frame is one of the rejected cache's.
+	fail = false
+	require.Len(t, keep(gvrSyncChangeOwnedBy(77)), 1,
+		"the held frame must come out; nothing else will ever ask for it")
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)), "and only once")
+}
+
+// A frame from an already-rejected anchor that arrives DURING an outage is simply dropped:
+// it was decided before the read broke, so holding it would only grow the buffer.
+func TestGVRSyncAnchorFilterDoesNotHoldFramesItAlreadyRejected(t *testing.T) {
+	var fail bool
+	keep := gvrSyncAnchorFilter(func() (beehive.ObjectID, error) {
+		if fail {
+			return 0, errors.New("read failed")
+		}
+		return 91, nil
+	}, func(error) {})
+
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+	fail = true
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+
+	fail = false
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)), "nothing was held, so nothing is released")
+}
+
+// A hard Deleted carries no owner edge, so it can't be attributed — forwarded on its id
+// alone, which the client keys removal on.
+func TestGVRSyncAnchorFilterForwardsAnUnattributableDelete(t *testing.T) {
+	keep := gvrSyncAnchorFilter(
+		func() (beehive.ObjectID, error) { t.Fatal("must not need a lookup"); return 0, nil },
+		func(error) { t.Fatal("no read failed") },
+	)
+	require.Len(t, keep(gvrSyncChangeOwnedBy(0)), 1)
+}
+
+func gvrSyncChangeOwnedBy(discoveryID beehive.ObjectID) ClusterCacheGVRSyncChange {
+	return ClusterCacheGVRSyncChange{
+		Type: ChangeAdded,
+		Sync: &ClusterCacheGVRSync{DiscoveryID: ClusterCacheGVRDiscoveryID(discoveryID)},
+	}
+}
+
+func seedGVRDiscovery(t *testing.T, s *Service, cacheID beehive.ObjectID) beehive.ObjectID {
+	t.Helper()
+	obj, err := s.gvrDiscoveryClient.Create(context.Background(),
+		ClusterCacheGVRDiscoveryName(cacheID),
+		ClusterCacheGVRDiscoverySpec{Enabled: true},
+		beehive.WithOwner(cacheID))
+	require.NoError(t, err)
+	return obj.ID
+}
+
+// seedGVRSync creates one per-kind sync child the discovery controller would.
+func seedGVRSync(t *testing.T, s *Service, discoveryID beehive.ObjectID, apiVersion, resource string) beehive.ObjectID {
+	t.Helper()
+	obj, err := s.gvrSyncClient.Create(context.Background(),
+		ClusterCacheGVRSyncName(discoveryID, apiVersion, resource),
+		ClusterCacheGVRSyncSpec{Enabled: true, APIVersion: apiVersion, Resource: resource, Kind: "Widget"},
+		beehive.WithOwner(discoveryID))
+	require.NoError(t, err)
+	return obj.ID
+}
+
+// TestServiceWatchCacheSyncHealthSharesOneFold pins that the fold is process-wide, not
+// per-subscriber. Every window computes the same verdict from the same two watches, so a
+// second subscriber must attach to the running fold rather than start its own — otherwise
+// each open window costs two more beehive watches, another ticker, another copy of every
+// per-kind record, and another acquisition of the sync controller's writeMu per flush.
+func TestServiceWatchCacheSyncHealthSharesOneFold(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _, syncCC, _ := newServiceTestSync(t)
+	id := seedCluster(t, s, "alpha")
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	discoveryID := seedGVRDiscovery(t, s, cacheID)
+	only := seedGVRSync(t, s, discoveryID, "apps/v1", "deployments")
+	require.NoError(t, syncCC.SetConditions(ctx, only, []Condition{
+		liveCondition(ConditionSynced, ConditionTrue, ReasonWatching, ""),
+	}))
+
+	first, err := s.WatchCacheSyncHealth(ctx)
+	require.NoError(t, err)
+	awaitSyncHealth(t, first, ClusterCacheID(cacheID), ReasonWatching)
+
+	hub := s.syncHealth
+	require.NotNil(t, hub, "the first subscriber starts the fold")
+
+	// A second subscriber must reuse it AND be served the current verdict at once — a
+	// settled cache emits nothing, so a window that only saw future frames would render
+	// "not reported yet" forever.
+	second, err := s.WatchCacheSyncHealth(ctx)
+	require.NoError(t, err)
+	awaitSyncHealth(t, second, ClusterCacheID(cacheID), ReasonWatching)
+	assert.Same(t, hub, s.syncHealth, "a second subscriber must not start a second fold")
+}
+
+// awaitSyncHealth drains until the named cache reports want.
+func awaitSyncHealth(t *testing.T, ch <-chan ClusterCacheSyncHealth, cacheID ClusterCacheID, want string) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		h := recvBy(t, ch, deadline)
+		if h.CacheID == cacheID && h.Reason == want {
+			return
+		}
+	}
+}
+
+// TestServiceWatchCacheSyncHealthClosesOnShutdown pins the teardown. The fold outlives
+// every subscriber, so nothing a subscriber does can end it — only the service can, and
+// when it does every open stream has to close rather than hang on a hub nobody will
+// publish to again.
+func TestServiceWatchCacheSyncHealthClosesOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _, _, _ := newServiceTestSync(t)
+	id := seedCluster(t, s, "alpha")
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	seedGVRDiscovery(t, s, cacheID)
+
+	ch, err := s.WatchCacheSyncHealth(ctx)
+	require.NoError(t, err)
+	awaitSyncHealth(t, ch, ClusterCacheID(cacheID), ReasonSyncing) // no kinds yet
+
+	s.stopSyncHealthFold(context.Background())
+
+	require.Eventually(t, func() bool {
+		select {
+		case _, ok := <-ch:
+			return !ok
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond, "shutting the fold down must close its subscribers")
+}
+
+// Stopping the fold JOINS it. Cancelling alone only asks it to stop, and the two
+// fleet-wide WatchList leases it holds come back in its defers — so a stop that returned
+// early let beehive begin draining while the fold was still running, the interleaving
+// "the fold goes first" exists to prevent.
+func TestServiceStopSyncHealthFoldWaitsForIt(t *testing.T) {
+	s, coreCC, _, _, _ := newServiceTestSync(t)
+	id := seedCluster(t, s, "alpha")
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	seedGVRDiscovery(t, s, cacheID)
+
+	// A fold that takes a moment to unwind. Whether the stop waits is otherwise decided by
+	// goroutine scheduling, which would make either answer look right often enough.
+	var unwound atomic.Bool
+	s.syncHealthFoldExit = func() {
+		time.Sleep(50 * time.Millisecond)
+		unwound.Store(true)
+	}
+
+	_, err := s.syncHealthReceiver()
+	require.NoError(t, err)
+
+	s.stopSyncHealthFold(context.Background())
+	require.True(t, unwound.Load(), "stop returned while the fold was still unwinding")
 }

@@ -17,6 +17,7 @@ package cluster
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,11 +29,18 @@ import (
 // newTestImporter builds a KubeconfigImporter against a fresh beehive
 // (no-op controllers — the importer only writes Cluster specs).
 func newTestImporter(t *testing.T, cfg *api.Config) *KubeconfigImporter {
+	im, _ := newTestImporterWithCC(t, cfg)
+	return im
+}
+
+// newTestImporterWithCC also hands back the Cluster kind's ControllerClient, for a test
+// that needs to clear a finalizer the way a controller would.
+func newTestImporterWithCC(t *testing.T, cfg *api.Config) (*KubeconfigImporter, beehive.ControllerClient[ClusterStatus]) {
 	t.Helper()
-	bh := NewTestBeehive(t)
+	bh, cc := NewTestBeehiveWithClusterCC(t)
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	w := NewStaticWatcher(t, cfg)
-	return NewKubeconfigImporter(w, coreClient)
+	return NewKubeconfigImporter(w, coreClient), cc
 }
 
 // The importer creates a Cluster carrying only the source reference; the
@@ -50,15 +58,14 @@ func TestImporterNewContextCreatesCluster(t *testing.T) {
 	assert.Equal(t, "alpha", obj.Spec.Source.Kubeconfig.Context)
 	assert.True(t, obj.Spec.Enabled)
 	assert.True(t, obj.Spec.SyncEnabled)
-	// The slug is the source's natural key — the context name under the
+	// The name is the source's natural key — the context name under the
 	// kubeconfig source prefix. It is the importer's reconcile/uniqueness key, not
 	// the record's identity (that is the beehive ObjectID).
-	require.NotNil(t, obj.Slug)
-	assert.Equal(t, "kubeconfig/alpha", *obj.Slug)
+	assert.Equal(t, "kubeconfig/alpha", obj.Name)
 }
 
-// Distinct contexts get distinct, deterministic source-prefixed slugs.
-func TestImporterSlugIsDeterministicNaturalKey(t *testing.T) {
+// Distinct contexts get distinct, deterministic source-prefixed names.
+func TestImporterNameIsDeterministicNaturalKey(t *testing.T) {
 	ctx := context.Background()
 	cfg := testKubeConfig("alpha", "beta")
 	im := newTestImporter(t, cfg)
@@ -67,13 +74,12 @@ func TestImporterSlugIsDeterministicNaturalKey(t *testing.T) {
 
 	objs, err := im.ClusterClient().List(ctx)
 	require.NoError(t, err)
-	slugs := map[string]bool{}
+	names := map[string]bool{}
 	for _, o := range objs {
-		require.NotNil(t, o.Slug)
-		slugs[*o.Slug] = true
+		names[o.Name] = true
 	}
-	assert.True(t, slugs["kubeconfig/alpha"])
-	assert.True(t, slugs["kubeconfig/beta"])
+	assert.True(t, names["kubeconfig/alpha"])
+	assert.True(t, names["kubeconfig/beta"])
 }
 
 // A departed context is never deleted by the importer — the Cluster (and its
@@ -135,4 +141,108 @@ func mustSingleObj(t *testing.T, cl beehive.Client[ClusterSpec, ClusterStatus]) 
 	require.NoError(t, err)
 	require.Len(t, objs, 1)
 	return objs[0]
+}
+
+// The import loop is driven by kubeconfig CHANGES, so an incomplete import has nothing
+// behind it to finish the job. The case that matters is a user deleting a cluster: its
+// name is held while the record drains, and if the import that lands in that window just
+// gives up, the context is missing from the app until the user edits their kubeconfig or
+// restarts the process.
+func TestImporterRetriesAContextWhoseNameIsStillHeld(t *testing.T) {
+	ctx := context.Background()
+	cfg := testKubeConfig("alpha")
+	im, cc := newTestImporterWithCC(t, cfg)
+
+	// Occupy alpha's name with a record that is deletion-pending and staying that way.
+	blocker, err := im.ClusterClient().Create(ctx, kubeconfigName("alpha"),
+		ClusterSpec{Source: ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: "alpha"}}},
+		beehive.WithFinalizers("test.kstack.io/hold"))
+	require.NoError(t, err)
+	require.NoError(t, im.ClusterClient().Delete(ctx, blocker.ID))
+
+	im.Start()
+	t.Cleanup(im.Stop)
+
+	// The first import can't create alpha, and no kubeconfig change is coming.
+	require.Never(t, func() bool { return liveContexts(t, im)["alpha"] > 0 },
+		200*time.Millisecond, 20*time.Millisecond)
+
+	// Release the name. Only the retry can notice — nothing publishes a new snapshot.
+	require.NoError(t, cc.DeleteFinalizer(ctx, blocker.ID, "test.kstack.io/hold"))
+
+	require.Eventually(t, func() bool { return liveContexts(t, im)["alpha"] == 1 },
+		4*importRetryInterval, 20*time.Millisecond,
+		"the importer must retry a name it could not take, not wait for a kubeconfig edit")
+}
+
+// liveContexts counts the non-deleting Clusters per kubeconfig context.
+func liveContexts(t *testing.T, im *KubeconfigImporter) map[string]int {
+	t.Helper()
+	objs, err := im.ClusterClient().List(context.Background())
+	require.NoError(t, err)
+	live := map[string]int{}
+	for _, obj := range objs {
+		if obj.DeletionRequestedAt == nil && obj.Spec.Source.Kubeconfig != nil {
+			live[obj.Spec.Source.Kubeconfig.Context]++
+		}
+	}
+	return live
+}
+
+// A Cluster being deleted still HOLDS its name — tracked ignores deletion-pending objects
+// on purpose, so a re-created context gets a fresh record, but beehive rejects the create
+// with ErrNameTaken until GC collects the row.
+//
+// That must not abort the snapshot. Contexts are iterated out of a map, so returning on the
+// first error skipped an arbitrary, run-to-run-varying subset of the OTHER contexts: a
+// kubeconfig snapshot landing during a delete's drain window could leave whole clusters
+// unimported until something else triggered a reimport.
+func TestImporterSkipsADeletingContextWithoutAbandoningTheRest(t *testing.T) {
+	ctx := context.Background()
+	cfg := testKubeConfig("alpha", "beta", "gamma", "delta")
+	im := newTestImporter(t, cfg)
+
+	// Beta is created here rather than by the import below, so it can carry a finalizer
+	// nothing clears. Deleting an object with no finalizer is a race against GC: it may be
+	// collected before the second import, which then simply re-creates it and never
+	// exercises the ErrNameTaken branch this test is about.
+	beta, err := im.ClusterClient().Create(ctx, kubeconfigName("beta"),
+		ClusterSpec{
+			SyncEnabled: true,
+			Enabled:     true,
+			Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: "beta"}},
+		},
+		beehive.WithFinalizers("test.kstack.io/hold"))
+	require.NoError(t, err)
+
+	// Import the rest, then request beta's deletion — its name stays taken while it drains.
+	require.NoError(t, im.ReconcileClusterSet(ctx, cfg))
+	objs, err := im.ClusterClient().List(ctx)
+	require.NoError(t, err)
+	require.Len(t, objs, 4)
+
+	require.NoError(t, im.ClusterClient().Delete(ctx, beta.ID))
+	held, err := im.ClusterClient().Get(ctx, beta.ID)
+	require.NoError(t, err)
+	require.NotNil(t, held.DeletionRequestedAt, "beta must still be draining, holding its name")
+
+	// A fresh snapshot: beta is deletion-pending, so it is untracked and its create fails.
+	// Reported, not swallowed — the import is incomplete and this loop is driven by
+	// kubeconfig changes, so nothing else would ever finish it — but named apart from a
+	// real failure, since nothing is wrong.
+	err = im.ReconcileClusterSet(ctx, cfg)
+	require.ErrorIs(t, err, errNameHeld)
+	require.Contains(t, err.Error(), "beta")
+
+	// Every other context must still be tracked exactly once.
+	after, err := im.ClusterClient().List(ctx)
+	require.NoError(t, err)
+	live := map[string]int{}
+	for _, obj := range after {
+		if obj.DeletionRequestedAt == nil {
+			live[obj.Spec.Source.Kubeconfig.Context]++
+		}
+	}
+	assert.Equal(t, map[string]int{"alpha": 1, "gamma": 1, "delta": 1}, live,
+		"one deleting context must not cost the others their import")
 }

@@ -25,9 +25,15 @@ CREATE TABLE cluster_meta (
     value TEXT NOT NULL
 ) STRICT;
 
--- One row per Kubernetes object (built-in or CRD). The universal entry
--- point. status_summary and the four count/host fields are cross-kind
--- materialized values populated by the adapter at write time:
+-- One row per Kubernetes object (built-in or CRD). The universal entry point.
+--
+-- status_summary and the four count/host fields are cross-kind materialized values,
+-- written by objectsync at write time (see its status.go). They exist to make the cache
+-- QUERYABLE in SQL -- "which pods in this namespace are not ready", "which nodes are
+-- NotReady" -- without unpacking a blob per row. They are NOT what the dashboard renders:
+-- the frontend derives its per-kind cells client-side from raw_json, which is why the body
+-- is served verbatim. Every column is nullable, and a kind with no meaningful reading
+-- stores NULL rather than a zero that would read as "none ready". The per-kind meaning:
 --
 --   Pod         status: phase or container state ("Running",
 --                       "CrashLoopBackOff", "ImagePullBackOff")
@@ -152,10 +158,16 @@ CREATE TABLE status_history (
 ) STRICT;
 CREATE INDEX status_history_uid_at ON status_history(uid, at DESC);
 
--- Catalog of every Kind discovered on the cluster (built-ins + CRDs).
--- Populated at startup from /apis discovery. Lets the agent answer
--- "what kinds exist?" / "is there a CRD called Application?" without
--- re-doing discovery, and surfaces the CRD's OpenAPI schema if available.
+-- Catalog of the kinds this cache holds (built-ins + CRDs). Each kind's sync
+-- registers its own row when its worker starts and removes it when the kind stops
+-- being synced, so the catalog is "what is mirrored here", not "what the cluster
+-- advertises". Lets the agent answer "what kinds exist?" / "is there a CRD called
+-- Application?" without re-doing discovery, and surfaces the CRD's OpenAPI schema
+-- if available.
+--
+-- It is also load-bearing for reads: the objects table is keyed by kind, while a
+-- watch is opened on the plural resource, so store.Objects resolves one to the
+-- other through this table. A kind with rows and no catalog row reads as empty.
 CREATE TABLE kind_catalog (
     api_version  TEXT NOT NULL,
     kind         TEXT NOT NULL,
@@ -166,19 +178,29 @@ CREATE TABLE kind_catalog (
     PRIMARY KEY (api_version, kind)
 ) STRICT;
 
+-- The plural is the other direction of the same identity, and it must be unique too:
+-- store.Objects resolves (api_version, resource) back to a Kind with a scalar subquery,
+-- and two matching rows would have SQLite answer with an arbitrary index-first one — the
+-- kind's table then reads empty forever while its sync is perfectly healthy. Within one
+-- api group-version a plural names exactly one Kind, so this is the invariant, not a
+-- convenience: a CRD whose Kind is renamed while the sidecar is down would otherwise leave
+-- the old row beside the new (the in-process cleanup that drops it needs the previous
+-- worker running to know what it was). EnsureKindCatalog clears the loser as it registers.
+CREATE UNIQUE INDEX kind_catalog_api_resource ON kind_catalog(api_version, resource);
+
 -- Maintained per-kind object counts. The dashboard nav shows a per-kind object
 -- count; reading it as a grouped COUNT-join of kind_catalog against the whole
 -- objects table would be O(objects) and re-run on every write ping. This table
 -- holds the count per (api_version, kind) so that read is O(kinds): a point join,
 -- no object scan.
 --
--- It is kept SEPARATE from kind_catalog on purpose. The sync engine's discovery
--- pass truncate-and-rewrites kind_catalog every run, and objects can be written
--- before their catalog row exists (discovery and object sync are different code
--- paths). A count column on kind_catalog would be reset on every rewrite and miss
--- those early writes. kind_counts is keyed only by (api_version, kind) and is
--- maintained SOLELY by the triggers below, so it stays exactly consistent with the
--- objects table within each write transaction, independent of catalog churn.
+-- It is kept SEPARATE from kind_catalog on purpose: these counts are maintained
+-- SOLELY by the triggers below, which must work whether or not the kind has a
+-- catalog row at that moment. Dropping a kind deletes its catalog row in the same
+-- transaction as its objects, and the events triggers key on a hardcoded
+-- ('v1','Event') that only the Event sync's own registration puts in the catalog.
+-- Keying kind_counts on (api_version, kind) alone keeps it exactly consistent with
+-- the objects table within each write transaction, independent of catalog churn.
 CREATE TABLE kind_counts (
     api_version TEXT NOT NULL,
     kind        TEXT NOT NULL,
@@ -221,9 +243,11 @@ END;
 -- nav's "Events" kind would read 0 forever. These two triggers maintain its
 -- kind_counts row so the badge is accurate. The key is hardcoded ('v1','Event'):
 -- the events table conflates core v1 and events.k8s.io/v1 into one row shape (no
--- api_version column of the event itself), and both /apis discovery's catalog row
--- and the webview's curated leaf join on core ('v1','Event') — so all cached
--- events roll into that single key. There is no UPDATE trigger: an event's kind
+-- api_version column of the event itself), and both the Event sync's own
+-- kind_catalog row and the webview's curated leaf join on core ('v1','Event') —
+-- so all cached events roll into that single key. That catalog row is what makes
+-- this count reachable: store.Kinds is a kind_catalog LEFT JOIN, so a count with
+-- no catalog entry beside it is invisible. There is no UPDATE trigger: an event's kind
 -- never changes, and a re-observed event upserts via ON CONFLICT(uid) DO UPDATE,
 -- which fires the UPDATE trigger (absent here), so it correctly leaves the count
 -- untouched — only genuinely-new rows increment.

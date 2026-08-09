@@ -27,6 +27,7 @@ import (
 	"github.com/amorey/beehive"
 	"github.com/amorey/beehive/sqlite"
 	"github.com/amorey/gochan/watch"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd/api"
 
@@ -128,7 +129,7 @@ func NewTestBeehiveUnstarted(t *testing.T) *beehive.Beehive {
 	st, err := OpenMemoryStore()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bh, err := beehive.New(st, beehive.WithResyncInterval(0))
+	bh, err := beehive.New(st)
 	require.NoError(t, err)
 	return bh
 }
@@ -144,16 +145,23 @@ func (c *NoopController[Spec, Status]) Reconcile(_ context.Context, _ beehive.Co
 // no-ops and starts it. Use for tests that only exercise the importer or need a
 // fully-running beehive but don't care about controller behaviour.
 func NewTestBeehive(t *testing.T) *beehive.Beehive {
+	bh, _ := NewTestBeehiveWithClusterCC(t)
+	return bh
+}
+
+// NewTestBeehiveWithClusterCC is NewTestBeehive plus the Cluster kind's ControllerClient,
+// for tests that need to do what a controller does — clear a finalizer, say.
+func NewTestBeehiveWithClusterCC(t *testing.T) (*beehive.Beehive, beehive.ControllerClient[ClusterStatus]) {
 	t.Helper()
 	bh := NewTestBeehiveUnstarted(t)
-	_, err := beehive.Register(bh, ClusterGroupKind, &NoopController[ClusterSpec, ClusterStatus]{})
+	cc, err := beehive.Register(bh, ClusterGroupKind, &NoopController[ClusterSpec, ClusterStatus]{})
 	require.NoError(t, err)
 	_, err = beehive.Register(bh, ClusterCacheGroupKind, &NoopController[ClusterCacheSpec, ClusterCacheStatus]{})
 	require.NoError(t, err)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = stop(context.Background()) })
-	return bh
+	return bh, cc
 }
 
 // recv blocks for the next value on a stream channel, failing the test if the
@@ -180,4 +188,39 @@ func recvBy[T any](t *testing.T, ch <-chan T, deadline <-chan time.Time) T {
 		var zero T
 		return zero
 	}
+}
+
+// awaitConditionReason blocks until the object load returns a condition of condType whose
+// Reason is want, then returns it. Shared by the sync children's fixtures: each kind reports
+// its verdict on its own condition type (Synced, Discovered, …) but the wait — poll, find the
+// condition, report the last reason seen on timeout — is the same for all of them.
+func awaitConditionReason[Spec, Status any](
+	t *testing.T,
+	cl beehive.Client[Spec, Status],
+	id beehive.ObjectID,
+	condType ConditionType,
+	want string,
+) Condition {
+	t.Helper()
+	var last string
+	var cond Condition
+	ok := assert.Eventually(t, func() bool {
+		// No Status guard: a gate report writes conditions and settles the generation,
+		// deliberately leaving status untouched — so a never-run object has conditions
+		// and a nil Status.
+		obj, err := cl.Get(context.Background(), id)
+		if err != nil {
+			return false
+		}
+		c := FindCondition(obj.Conditions, condType)
+		if c == nil {
+			return false
+		}
+		last, cond = c.Reason, *c
+		return c.Reason == want
+	}, 2*time.Second, 10*time.Millisecond)
+	if !ok {
+		t.Fatalf("timed out waiting for %s reason=%s (last=%q)", condType, want, last)
+	}
+	return cond
 }

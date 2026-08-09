@@ -17,224 +17,167 @@ package cluster
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
-	"k8s.io/client-go/rest"
-
 	"github.com/amorey/beehive"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/engine"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 const (
-	// syncRecheckInterval paces the steady-state re-reconcile of a syncing
-	// cluster (for credential-rotation detection).
-	syncRecheckInterval = 30 * time.Second
+	// childRetryInterval is the short requeue converge asks for when a child-object op
+	// (ensuring the ClusterCacheGVRDiscovery anchor) failed — small so the subtree
+	// converges promptly.
+	//
+	// It is the ONLY requeue this controller asks for. There is no periodic re-reconcile,
+	// because every input converge reads is event-driven: the parent's spec and status
+	// both wake us through the DependsOn edge declared in Reconcile (which is what carries
+	// eligibility and the active-identity check), our own spec bumps our generation, and
+	// WithStartupFullPass covers a restart. Nothing here varies with time — this
+	// controller reads no credentials and runs no worker, so it has nothing to poll for.
+	childRetryInterval = time.Second
 
-	// engineStopTimeout bounds one engine teardown.
-	engineStopTimeout = 10 * time.Second
+	// cacheSyncConnectRetry is the requeue a cache sync child asks for while it waits on
+	// its cluster's first successful probe (credentials live in memory, so there is no
+	// object write to wait for). One constant for every child because they all wait on the
+	// same event.
+	//
+	// It is COARSE because the real wake is the DependsOn edge each child declares on the
+	// Cluster: a probe that fills the ConnectionManager writes in the same converge, and
+	// that write wakes every dependent — so this only has to catch a wake that never came,
+	// not to discover the connection. The cost of getting it wrong scales with the kind
+	// count: an offline cluster has one waiting child per served kind (100-150), each
+	// reconcile doing three owner reads and a dependency write against the shared beehive
+	// store, forever. At a few seconds that is tens of reconciles per second per offline
+	// cluster and it never stops.
+	cacheSyncConnectRetry = time.Minute
 )
 
-// EngineHandle is the controller's view of one running sync engine. The seam
-// allows tests to inject a fake without touching the network.
-type EngineHandle interface {
-	Start()
-	Stop(ctx context.Context) error
-}
-
-// NewEngineFunc constructs one sync engine. ref locates the on-disk cache by
-// beehive ObjectID (parent Cluster + ClusterCache); clusterID is the domain id,
-// kept for log labels. Tests inject a factory returning fake handles.
-type NewEngineFunc func(cfg *rest.Config, clusterID ClusterID, ref store.CacheRef, sink engine.Sink) EngineHandle
-
-// engineEntry is the controller's runtime state for one running engine. The
-// pointer guards the sink: reports from a stopped or replaced engine are dropped
-// by comparing pointer identity.
-type engineEntry struct {
-	handle EngineHandle
-	// restCfg is the config the engine was started with, kept so a poke-driven
-	// restart can respawn without re-resolving it.
-	restCfg     *rest.Config
-	fingerprint string
-	// clusterObjID is the parent Cluster's ObjectID; it names the on-disk cache
-	// directory (clusters/<clusterObjID>/).
-	clusterObjID beehive.ObjectID
-	// cacheObjID is this ClusterCache's ObjectID; it names the on-disk cache file
-	// (<cacheObjID>.db) and lets the sink call UpdateStatus without a lookup.
-	cacheObjID beehive.ObjectID
-	// cacheGen is the ClusterCache object's own generation, used as the
-	// observedGeneration in UpdateStatus — must be this object's, not the parent's,
-	// or beehive rejects the write as a future generation.
-	cacheGen int64
-	// parentGen is the parent Cluster's generation, recorded in the Synced
-	// condition's ObservedGeneration (the condition observes the parent's spec).
-	parentGen int64
-
-	// lastSyncReason is the reason of the most recent sync event recorded for this
-	// engine ("" before the first). recordSyncEvent records only on a change in it,
-	// so the engine's steady-state freshness heartbeat (a repeated Watching report)
-	// doesn't append a redundant "Watching ×N" run. Mutated only under writeMu.
-	lastSyncReason string
-}
-
-// cacheFilesFinalizer gates a ClusterCache's deletion on this controller deleting
-// its on-disk cache file. It is set at creation (ensureClusterCache) and cleared on
-// the deletion reconcile once the file is gone, so GC can't collect the row — and
-// orphan the file — before the cleanup runs.
+// cacheFilesFinalizer gates a ClusterCache's deletion on this controller deleting its
+// on-disk cache file. It is set at creation (ensureClusterCache) and cleared on the
+// deletion reconcile once the file is gone, so GC can't collect the row — and orphan the
+// file — before the cleanup runs.
 const cacheFilesFinalizer = "kstack.io/cache-files"
 
-// ClusterCacheController reconciles ClusterCache beehive objects: it manages
-// the sync engine lifecycle for each cluster cache, folding engine reports
-// back into ClusterCacheStatus as the Synced condition.
+// ClusterCacheController reconciles ClusterCache beehive objects: it owns the ClusterCache
+// lifecycle (eligibility + active-identity gating, the on-disk cache-file finalizer/
+// teardown) and the existence of the cache's sync children.
 //
-// It reads the parent Cluster to determine eligibility (connection-eligible +
-// SyncEnabled) and adds a DependsOn edge so beehive re-queues this cache when the
-// parent's spec changes (e.g. SyncEnabled toggled).
+// It reads the parent Cluster to determine eligibility (connection-eligible + SyncEnabled)
+// and adds a DependsOn edge so beehive re-queues this cache when the parent's spec changes
+// (e.g. SyncEnabled toggled).
 //
-// Resync pokes arrive out-of-band on the poke bus, not through beehive: the
-// controller subscribes in Start and, on each signal, restarts its live engines
-// in place (dropping stale watch streams; each driver re-resumes cheaply from its
-// persisted resourceVersion) — no spec write needed, since the engines are
-// in-memory state it already owns. See restartLiveEngines.
+// **Sync children exist for the cache's whole life; pausing is a spec write, not a delete.**
+// This controller is the one place that knows whether a cache should sync — its parent must
+// be sync-eligible AND this cache must be the parent's active identity — and it pushes that
+// intent *down* into each child's Spec.Enabled rather than expressing it through the child's
+// existence. Creation is idempotent and unconditional; the only removal is beehive's GC
+// cascade when the cache itself is deleted. That buys three things: a pause keeps the child's
+// status/conditions/event history (a deleted anchor takes its worker's history with it), a
+// pause/unpause never waits on a GC name release, and stopping a worker stays inside the
+// child's own controller instead of becoming a deletion another controller must order against.
+// It also mirrors the layer above — ClusterCoreController keeps a ClusterCache across a pause
+// and deletes one only on a UID switch. The children are coupled to their controllers only
+// through the object graph, not by direct calls.
+//
+// This kind's status is empty: the cache measures nothing itself, and the whole-cache
+// verdict a UI wants is folded from the per-kind records read-side
+// (Service.WatchCacheSyncHealth) rather than stored — nothing in the object graph acts on
+// it. What the cache reports is its own coarse Synced condition: did it decide to sync?
 type ClusterCacheController struct {
-	cfgSource    KubeConfigSource
-	coreClient   beehive.Client[ClusterSpec, ClusterStatus]
-	cacheManager *store.Manager
-	connMgr      *ConnectionManager
-	ctrlClient   beehive.ControllerClient[ClusterCacheStatus]
+	coreClient beehive.Client[ClusterSpec, ClusterStatus]
+	// gvrDiscoveryClient creates the ClusterCacheGVRDiscovery child that anchors this
+	// cache's sync subtree, and writes its Spec.Enabled pause switch. A full Client (not
+	// the status-write ControllerClient) because the cache controller creates and writes
+	// the spec of objects of another kind, mirroring how ClusterCoreController drives
+	// cacheClient.
+	gvrDiscoveryClient beehive.Client[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus]
+	cacheManager       *store.Manager
 
-	// pokeSvc is the resync bus; nil disables poke-driven restarts (tests).
-	pokeSvc *poke.Service
-	pokeSub *pokeSubscription
-
-	// newEngine constructs one sync engine. Overridable for tests.
-	newEngine NewEngineFunc
-
-	// writeMu serializes read-modify-write status updates from the reconcile
-	// worker and from the engines' sink goroutines.
+	// writeMu serializes read-modify-write status updates from the reconcile worker.
 	writeMu sync.Mutex
-	mu      sync.Mutex
-	// engines is keyed by the ClusterCache's own ObjectID, not its parent ClusterID:
-	// a cluster can own several ClusterCache records and the controller reconciles
-	// each independently. Only the active one (UID == parent's last-probed Server.UID)
-	// runs an engine, but keying by cache id keeps a migration's old/new caches from
-	// racing on a shared per-cluster slot during the hand-over.
-	engines map[beehive.ObjectID]*engineEntry
 }
 
-// NewClusterCacheController builds the controller. manager owns the per-cluster
-// SQLite cache files; it is shared with the resolver so both see the same open
-// DBs. connMgr may be nil (credentials are then resolved from the kubeconfig).
-func NewClusterCacheController(
-	cfgSource KubeConfigSource,
-	coreClient beehive.Client[ClusterSpec, ClusterStatus],
-	manager *store.Manager,
-	connMgr *ConnectionManager,
-	pokeSvc *poke.Service,
-) *ClusterCacheController {
-	c := &ClusterCacheController{
-		cfgSource:    cfgSource,
-		coreClient:   coreClient,
-		cacheManager: manager,
-		connMgr:      connMgr,
-		pokeSvc:      pokeSvc,
-		engines:      make(map[beehive.ObjectID]*engineEntry),
+// NewClusterCacheController builds the controller from the shared runtime. It mints the
+// Cluster client (to read the parent for eligibility) and the sync-anchor client (to
+// create the GVR-discovery child) from rt.bh; rt.cacheManager owns the
+// per-cluster SQLite cache files (shared with the resolver so both see the same open DBs)
+// .
+func NewClusterCacheController(rt *controllerRuntime) *ClusterCacheController {
+	return &ClusterCacheController{
+		coreClient:         beehive.NewClient[ClusterSpec, ClusterStatus](rt.bh, ClusterGroupKind),
+		gvrDiscoveryClient: beehive.NewClient[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus](rt.bh, ClusterCacheGVRDiscoveryGroupKind),
+		cacheManager:       rt.cacheManager,
 	}
-	cm := manager
-	c.newEngine = func(cfg *rest.Config, id ClusterID, ref store.CacheRef, sink engine.Sink) EngineHandle {
-		cdb, err := cm.Open(context.Background(), ref)
-		if err != nil {
-			slog.Warn("clustercachecontroller: open cache db", "cluster", id, "err", err)
-			return nil
-		}
-		return engine.NewEngine(cfg, cdb, sink)
-	}
-	return c
-}
-
-// SetNewEngine replaces the engine factory — for tests.
-func (c *ClusterCacheController) SetNewEngine(f NewEngineFunc) {
-	c.newEngine = f
-}
-
-// SetControllerClient injects the status-write client from beehive.Register. It
-// backs the out-of-band engine sink (applyEngineReport), which writes status from
-// engine goroutines; the reconcile path uses the client beehive passes into
-// Reconcile. Call once, before the control plane starts — an engine spawned by a
-// startup reconcile may report immediately.
-func (c *ClusterCacheController) SetControllerClient(cl beehive.ControllerClient[ClusterCacheStatus]) {
-	c.ctrlClient = cl
-}
-
-// StartPoke subscribes to the resync poke bus, restarting every live engine on
-// each signal. Call after the control plane has started; pair with StopPoke.
-func (c *ClusterCacheController) StartPoke() {
-	c.pokeSub = startPokeSubscription(c.pokeSvc, func(context.Context) { c.restartLiveEngines() })
-}
-
-// StopPoke halts the poke subscription and joins its goroutine. Call before
-// draining the reconcile loops so a resync restart can't race teardown.
-func (c *ClusterCacheController) StopPoke() {
-	c.pokeSub.stop()
-}
-
-// StopEngines tears down every running sync engine. Call after the reconcile
-// loops have drained (so no reconcile can spawn a fresh engine) and before the
-// per-cluster cache the engines write into is shut down.
-func (c *ClusterCacheController) StopEngines() error {
-	c.mu.Lock()
-	entries := c.engines
-	c.engines = make(map[beehive.ObjectID]*engineEntry)
-	c.mu.Unlock()
-	for cacheID, entry := range entries {
-		stopCtx, cancel := context.WithTimeout(context.Background(), engineStopTimeout)
-		if err := entry.handle.Stop(stopCtx); err != nil {
-			slog.Warn("clustercachecontroller: engine stop", "cluster", entry.clusterObjID, "cache", cacheID, "err", err)
-		}
-		cancel()
-	}
-	return nil
 }
 
 // Reconcile converges one ClusterCache object toward its parent Cluster's spec.
 func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) (beehive.Result, error) {
-	// The parent ClusterID is the ClusterCache's owner (its owned_by edge), read
-	// from beehive's object graph rather than re-parsed out of the slug.
-	owner, ok, err := client.GetOwner(ctx, obj.ID)
+	// The parent ClusterID is the ClusterCache's owner (its owned_by edge), read from
+	// beehive's object graph rather than re-parsed out of the name.
+	owner, ownerExists, err := client.GetOwner(ctx, obj.ID)
 	if err != nil {
 		return beehive.Result{}, err
 	}
 
-	// Deletion (a UID-switch prune or a cluster-delete cascade): stop the engine,
-	// delete the on-disk cache file, then clear the finalizer so GC can collect the
-	// row. The locator needs the owner's id (per-cluster dir) + this cache's id
-	// (file); if the owner is already gone we can't form that path, so clean up the
-	// engine and clear the finalizer best-effort rather than wedging GC forever. A
-	// file-delete error returns without clearing the finalizer, so the next reconcile
-	// retries — the file can't be orphaned.
+	// Deletion (a UID-switch prune or a cluster-delete cascade): wait for the sync children
+	// to be gone, then delete the on-disk cache file and clear the finalizer so GC can
+	// collect the row. This branch *is* the cacheFilesFinalizer's handler — beehive has no
+	// separate finalizer callback, so honoring one means doing the cleanup here and only
+	// then clearing it. A file-delete error returns without clearing, so the next reconcile
+	// retries and the file can't be orphaned.
+	//
+	// **The wait is the stop-before-delete barrier.** GC's cascade marks the children for
+	// deletion but does NOT order their teardown before this file delete, and a sync child's
+	// worker holds the cache's ClusterDB handle — so deleting the file under a mid-write
+	// worker could leave an orphaned .db behind it. Each sync child carries its own drain
+	// finalizer (gvrSyncDrainFinalizer), cleared only once its worker has stopped, so a
+	// child that is *gone* is a child whose worker has drained. Deletion is the only path
+	// needing this: a pause stops the worker inside the child's own controller, touching no
+	// object. The wait is unconditional — it needs no owner, and skipping it is what would
+	// release the row out from under a live writer.
+	//
+	// Only the file locator needs the owner (its id is the per-cluster dir, ours the file).
+	// A missing owner is unreachable in practice: owned_by runs child→owner, and gcCollect
+	// refuses to delete a row with incoming edges (it discounts only depends_on from a
+	// deleting source), so the parent outlives every child. The guard is cheap insurance
+	// against clearing the finalizer being blocked by an unformable path.
 	if obj.DeletionRequestedAt != nil {
-		c.stopEngine(obj.ID)
-		if ok {
-			if err := c.cacheManager.DeleteCacheFiles(ctx, newCacheRef(owner.ID, obj.ID)); err != nil {
-				return beehive.Result{}, err
-			}
+		children, err := client.ListOwned(ctx, obj.ID)
+		if err != nil {
+			return beehive.Result{}, err
+		}
+		if len(children) > 0 {
+			return beehive.Result{RequeueAfter: childRetryInterval}, nil
+		}
+		if !ownerExists {
+			// The file path is <dataDir>/clusters/<clusterID>/<cacheID>.db, so without the
+			// owner there is no path to delete — and clearing the finalizer here would let
+			// GC collect the row, leaving the .db (plus -wal/-shm) on disk with nothing left
+			// that knows where it is. Requeue instead: a stuck deletion is visible and
+			// recoverable, an orphaned file is neither.
+			//
+			// Unreachable in practice — owned_by runs child→owner and GC won't collect a row
+			// with incoming edges, so the parent outlives every child — which is why this
+			// logs rather than silently retrying.
+			slog.Warn("clustercachecontroller: cache deletion has no owner; retrying rather than orphaning its files",
+				"cache", obj.ID)
+			return beehive.Result{RequeueAfter: childRetryInterval}, nil
+		}
+		if err := c.cacheManager.DeleteCacheFiles(ctx, newCacheRef(owner.ID, obj.ID)); err != nil {
+			return beehive.Result{}, err
 		}
 		return beehive.Result{}, c.clearCacheFilesFinalizer(ctx, client, obj)
 	}
 
-	if !ok {
-		// No owner and not being deleted — the parent was GC'd; our object is being
-		// cleaned up too.
+	if !ownerExists {
+		// No owner and not being deleted — the parent was GC'd; our object is being cleaned
+		// up too.
 		return beehive.Result{}, nil
 	}
-	clusterID := ClusterID(owner.ID)
 
 	// Read the parent Cluster to determine eligibility.
 	clusterObj, err := c.coreClient.Get(ctx, owner.ID)
@@ -246,49 +189,42 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 		return beehive.Result{}, err
 	}
 
-	// Add the DependsOn edge so beehive re-queues us on parent changes — spec edits
-	// (e.g. SyncEnabled toggled) AND status writes (the core controller's live source
-	// observation, which drives presence-based eligibility). Then re-read the parent:
-	// establishing the edge first closes the race where the parent is stamped between
-	// our initial read and AddDependency, which would wake nothing and leave us stuck
-	// on a stale 'not yet observed' view.
+	// Add the DependsOn edge so beehive re-queues us on parent changes — spec edits (e.g.
+	// SyncEnabled toggled) AND status writes (the core controller's live source observation,
+	// which drives presence-based eligibility).
+	//
+	// The read above needs no re-read against a parent stamped mid-pass: beehive covers that
+	// race on both sides of this call. Creating the edge stamps a durable reconcile-owed for
+	// us atomically with the edge itself, so the pass that first declares the dependency is
+	// always followed by one that reads the parent fresh. Once the edge exists, beehive
+	// records our dependency watermark from the cursor taken at object *load* rather than at
+	// completion — so any target that moved while we were reading stays counted as owed, and
+	// the stale-dependents sweep re-queues us.
 	if err := client.AddDependency(ctx, obj.ID, clusterObj.ID); err != nil {
 		return beehive.Result{}, err
 	}
-	if fresh, err := c.coreClient.Get(ctx, beehive.ObjectID(clusterID)); err == nil {
-		clusterObj = fresh
-	}
 
-	// This cache is "active" when its UID matches the parent's last-probed kube-system
-	// UID. Only the active cache runs an engine — a cache left behind by a migration is
-	// paused, so the engine never writes the new cluster's data into the old file.
+	// This cache is "active" when its UID matches the parent's last-probed kube-system UID.
+	// Only the active cache syncs — a cache left behind by a migration is paused, so its
+	// discovery subtree never mirrors the new cluster's data into the old file.
 	active := cacheIsActive(clusterObj, obj.Spec.ServerUID)
-
-	// Load the working status copy.
-	var loaded ClusterCacheStatus
-	if obj.Status != nil {
-		loaded = *obj.Status
-	}
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	working := ClusterCacheStatus{
-		Conditions:   slices.Clone(loaded.Conditions),
-		LastSyncedAt: loaded.LastSyncedAt,
-	}
+	var conds conditionSet
+	requeueAfter := c.converge(ctx, client, obj.ID, active, clusterObj, &conds, obj.Conditions)
 
-	requeueAfter := c.converge(clusterID, obj.ID, obj.Generation, active, clusterObj, &working)
-
-	if ClusterCacheStatusEqual(loaded, working) {
-		return beehive.Result{RequeueAfter: requeueAfter}, nil
-	}
-	return beehive.Result{RequeueAfter: requeueAfter},
-		client.UpdateStatus(ctx, obj.ID, obj.Generation, working)
+	// The pass's whole report is its conditions: this kind's status is empty, because the
+	// cache measures nothing itself (its children do, out of band). Settling the generation
+	// explicitly is therefore mandatory rather than incidental — a condition write does not
+	// advance beehive's handshake, so an unchanged pass would leave the object unsettled and
+	// re-enqueued by the owed pass forever.
+	return beehive.Result{RequeueAfter: requeueAfter}, reportCondition(ctx, client, obj.ID, obj.Generation, conds...)
 }
 
-// clearCacheFilesFinalizer removes cacheFilesFinalizer so GC can collect the row.
-// A no-op when the finalizer is absent (e.g. a double reconcile of the deletion).
+// clearCacheFilesFinalizer removes cacheFilesFinalizer so GC can collect the row. A no-op
+// when the finalizer is absent (e.g. a double reconcile of the deletion).
 func (c *ClusterCacheController) clearCacheFilesFinalizer(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) error {
 	if !slices.Contains(obj.Finalizers, cacheFilesFinalizer) {
 		return nil
@@ -296,407 +232,168 @@ func (c *ClusterCacheController) clearCacheFilesFinalizer(ctx context.Context, c
 	return client.DeleteFinalizer(ctx, obj.ID, cacheFilesFinalizer)
 }
 
-// converge manages this ClusterCache's sync engine toward the parent Cluster's
-// spec. active reports whether this cache mirrors the cluster's currently-connected
-// identity; an inactive cache (a physical migration left it behind) is paused like
-// a sync-ineligible one, so the engine never writes the new cluster's data into a
-// stale identity's file.
+// converge decides whether this ClusterCache should sync, pushes that decision into its sync
+// children, and reflects it on the Synced condition. active reports whether this cache
+// mirrors the cluster's currently-connected identity; an inactive cache (a physical migration
+// left it behind) is paused like a sync-ineligible one.
+//
+// The children are ensured on both paths — only their Spec.Enabled differs. This is the sole
+// evaluation of the sync rule; the children never re-derive it.
 func (c *ClusterCacheController) converge(
-	clusterID ClusterID,
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCacheStatus],
 	cacheObjID beehive.ObjectID,
-	cacheGen int64,
 	active bool,
 	clusterObj *beehive.Object[ClusterSpec, ClusterStatus],
-	working *ClusterCacheStatus,
+	conds *conditionSet,
+	prev []Condition,
 ) time.Duration {
-	gen := clusterObj.Generation
-	conds := &working.Conditions
+	enabled := syncEligible(clusterObj) && active
 
-	if !syncEligible(clusterObj) || !active {
-		stopped := c.stopEngine(cacheObjID)
-		// Record SyncStopped only for a user-facing pause/ineligibility — not for a
-		// migration prune of a superseded cache (!active), an internal hand-over — and
-		// only on the running→stopped transition (stopped).
-		if stopped && !syncEligible(clusterObj) {
-			c.recordSyncStopped(context.Background(), cacheObjID)
-		}
-		SetCondition(conds, Condition{
-			Type: ConditionSynced, Status: ConditionFalse,
-			Reason: ReasonPaused, ObservedGeneration: gen,
-		})
-		return 0
-	}
+	// The sync anchor is ensured unconditionally and told whether this cache should sync;
+	// everything below it — one child per served kind, Events included — belongs to the
+	// discovery controller.
+	//
+	// This cache's own Synced condition stays coarse (Syncing/Paused) on purpose. The
+	// verdict a UI wants is folded from the per-kind records read-side
+	// (Service.WatchCacheSyncHealth); it is deliberately not stored here, since nothing in
+	// the object graph acts on it — see ClusterCacheSyncHealth.
+	retry := c.ensureGVRDiscovery(ctx, client, cacheObjID, enabled)
 
-	contextName := clusterObj.Spec.Source.Kubeconfig.Context
-	var restCfg *rest.Config
-	if c.connMgr != nil {
-		restCfg = c.connMgr.Get(clusterID)
-	}
-	if restCfg == nil {
-		var err error
-		restCfg, err = ResolveRESTConfig(c.cfgSource.Get(), contextName)
-		if err != nil {
-			c.stopEngine(cacheObjID)
-			SetCondition(conds, Condition{
-				Type: ConditionSynced, Status: ConditionFalse,
-				Reason: ReasonSyncFailed, Message: err.Error(), ObservedGeneration: gen,
-			})
-			return syncRecheckInterval
-		}
-	}
-	fingerprint := engine.ConfigFingerprint(restCfg, engine.ContextProxyURL(c.cfgSource.Get(), contextName))
-
-	c.mu.Lock()
-	entry, running := c.engines[cacheObjID]
-	c.mu.Unlock()
-
-	if running && entry.fingerprint == fingerprint {
-		return syncRecheckInterval
-	}
-
-	// Stop any running engine before starting a new one (credential change).
-	c.stopEngine(cacheObjID)
-	SetCondition(conds, Condition{
-		Type: ConditionSynced, Status: ConditionFalse,
-		Reason: ReasonSyncing, ObservedGeneration: gen,
-	})
-	c.spawnEngine(clusterID, restCfg, fingerprint, clusterObj.ID, cacheObjID, cacheGen, gen)
-	return syncRecheckInterval
-}
-
-// spawnEngine constructs, registers, and starts a sync engine for clusterID.
-// The caller is responsible for stopping any prior engine first and for holding
-// writeMu (so it serializes with Reconcile and the sink). A nil engine (cache
-// open failure) leaves no entry registered.
-func (c *ClusterCacheController) spawnEngine(
-	clusterID ClusterID,
-	restCfg *rest.Config,
-	fingerprint string,
-	clusterObjID, cacheObjID beehive.ObjectID,
-	cacheGen, parentGen int64,
-) {
-	newEntry := &engineEntry{
-		restCfg:      restCfg,
-		fingerprint:  fingerprint,
-		clusterObjID: clusterObjID,
-		cacheObjID:   cacheObjID,
-		cacheGen:     cacheGen,
-		parentGen:    parentGen,
-	}
-	sink := &engineSink{c: c, clusterID: clusterID, cacheID: cacheObjID, entry: newEntry}
-	ref := newCacheRef(clusterObjID, cacheObjID)
-	handle := c.newEngine(restCfg, clusterID, ref, sink)
-	if handle == nil {
-		return
-	}
-	newEntry.handle = handle
-	c.mu.Lock()
-	c.engines[cacheObjID] = newEntry
-	c.mu.Unlock()
-	handle.Start()
-}
-
-// restartLiveEngines stops and respawns every running engine, reusing each
-// engine's stored config. Driven by the poke bus on OS resume / network-on: the
-// restart drops watch streams that may have gone stale while the process was
-// frozen, and each driver re-resumes from its persisted resourceVersion (cheap
-// unless the RV expired). Holds writeMu for the whole pass so it serializes with
-// Reconcile and the engine sinks, like a converge-driven engine swap.
-func (c *ClusterCacheController) restartLiveEngines() {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	c.mu.Lock()
-	ids := make([]beehive.ObjectID, 0, len(c.engines))
-	for cacheID := range c.engines {
-		ids = append(ids, cacheID)
-	}
-	c.mu.Unlock()
-
-	for _, cacheID := range ids {
-		c.restartEngineLocked(cacheID)
-	}
-}
-
-// RestartEngine stops and respawns the running engine(s) for clusterID, reusing
-// the stored config. Used by Service.ClearCache to rebuild the cache after deleting
-// it on disk; a no-op when no engine is running. A cluster has at most one active
-// cache, but this restarts every live engine it owns, so a clear during a migration
-// hand-over rebuilds whichever is running.
-func (c *ClusterCacheController) RestartEngine(clusterID ClusterID) {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	c.mu.Lock()
-	var cacheIDs []beehive.ObjectID
-	for cacheID, entry := range c.engines {
-		if ClusterID(entry.clusterObjID) == clusterID {
-			cacheIDs = append(cacheIDs, cacheID)
+	// Record SyncStopped for a user-facing pause only — never for a migration prune of a
+	// superseded cache (!active), which is an internal hand-over the user didn't ask for and
+	// shouldn't see in the timeline. This layer is the one that can still tell the two apart:
+	// converge collapses both into the single Spec.Enabled bit it pushes down, so the child
+	// sees only "off" and could never make the distinction itself.
+	//
+	// The running→stopped transition is read off the condition we're about to overwrite,
+	// not a runtime flag — so it survives a restart and can't re-fire on every reconcile of
+	// an already-paused cache. A cache with no Synced condition yet has never run, so it
+	// can't have stopped.
+	if syncSwitchedOff(clusterObj) && syncWasRunning(prev) {
+		if !c.recordSyncStopped(ctx, client, cacheObjID) {
+			// The event didn't land. Do NOT advance the condition: the transition is read
+			// off it, so overwriting it now would erase the only evidence that this cache
+			// had been running, and the event would be lost for good rather than retried.
+			// Carry the previous condition forward (beehive suppresses the unchanged write)
+			// and come back.
+			if old := FindCondition(prev, ConditionSynced); old != nil {
+				conds.set(*old)
+			}
+			return childRetryInterval
 		}
 	}
-	c.mu.Unlock()
-	for _, cacheID := range cacheIDs {
-		c.restartEngineLocked(cacheID)
+
+	reason := ReasonSyncing
+	if !enabled {
+		reason = ReasonPaused
 	}
+	conds.set(liveCondition(ConditionSynced, ConditionFalse, reason, ""))
+
+	if retry {
+		return childRetryInterval
+	}
+	return 0
 }
 
-// restartEngineLocked stops the engine for cacheID and respawns it with the same
-// config and bookkeeping. Caller must hold writeMu.
-func (c *ClusterCacheController) restartEngineLocked(cacheID beehive.ObjectID) {
-	c.mu.Lock()
-	entry, ok := c.engines[cacheID]
-	c.mu.Unlock()
-	if !ok {
-		return
-	}
-	clusterID := ClusterID(entry.clusterObjID)
-	restCfg, fingerprint := entry.restCfg, entry.fingerprint
-	clusterObjID, cacheObjID := entry.clusterObjID, entry.cacheObjID
-	cacheGen, parentGen := entry.cacheGen, entry.parentGen
-	c.stopEngine(cacheID)
-	c.spawnEngine(clusterID, restCfg, fingerprint, clusterObjID, cacheObjID, cacheGen, parentGen)
+// syncWasRunning reports whether the Synced condition says this cache was syncing as of
+// the last pass — the "running" half of a running→stopped transition. Absent means the
+// cache has never synced, so it can't have stopped.
+//
+// It keys on Reason, not Status, which is what makes it survive a restart: beehive's
+// liveness downgrade rewrites a prior process's Status to Unknown but leaves Reason
+// alone, and a cache that was syncing when the process died really did stop.
+func syncWasRunning(conds []Condition) bool {
+	cond := FindCondition(conds, ConditionSynced)
+	return cond != nil && cond.Reason == ReasonSyncing
 }
 
-// stopEngine tears down a cache's engine if one is running, keyed by the
-// ClusterCache ObjectID. Returns whether an engine was actually running — a
-// running→stopped transition — so a caller can record a one-shot SyncStopped
-// event without re-recording it on every reconcile of an already-stopped cache.
-func (c *ClusterCacheController) stopEngine(cacheID beehive.ObjectID) bool {
-	c.mu.Lock()
-	entry, ok := c.engines[cacheID]
-	delete(c.engines, cacheID)
-	c.mu.Unlock()
-	if !ok {
-		return false
-	}
-	stopCtx, cancel := context.WithTimeout(context.Background(), engineStopTimeout)
-	defer cancel()
-	if err := entry.handle.Stop(stopCtx); err != nil {
-		slog.Warn("clustercachecontroller: engine stop", "cluster", entry.clusterObjID, "cache", cacheID, "err", err)
-	}
-	return true
-}
-
-// recordSyncStopped records the terminal SyncStopped event when a running engine
-// is torn down because the cluster became sync-ineligible. Recorded directly rather
-// than through recordSyncEvent's dedup — the caller invokes it only on an actual
-// running→stopped transition. Best-effort; a write failure is logged. Must hold
-// writeMu.
-func (c *ClusterCacheController) recordSyncStopped(ctx context.Context, cacheID beehive.ObjectID) {
-	err := c.ctrlClient.RecordEvent(ctx, cacheID, beehive.EventSpec{
+// recordSyncStopped appends the terminal SyncStopped event to this cache's own timeline —
+// the same timeline the sync-detail panel reads (clusterCacheEventsWatch), so a user pausing
+// sync sees it there rather than the log simply going quiet.
+//
+// Best-effort: a failure is logged and convergence continues. The retry is beehive's — a
+// failed status write leaves the condition on Syncing, so the next reconcile records again,
+// and beehive coalesces the repeat into the existing run's count rather than appending a
+// duplicate. Must hold writeMu.
+// recordSyncStopped appends the pause to the cache's timeline, reporting whether it landed.
+// The caller needs that answer: this event is recorded on a transition it can only detect
+// once, so a failure must hold the condition back rather than be logged and forgotten.
+func (c *ClusterCacheController) recordSyncStopped(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], cacheObjID beehive.ObjectID) bool {
+	err := client.AddEvent(ctx, cacheObjID, beehive.EventSpec{
 		Category: SyncEventCategory,
 		Type:     beehive.EventNormal,
 		Reason:   ReasonSyncStopped,
 		Message:  "Sync stopped",
 	})
-	if err != nil && ctx.Err() == nil {
-		slog.Warn("clustercachecontroller: record sync stopped", "cache", cacheID, "err", err)
+	if err == nil {
+		return true
 	}
+	if ctx.Err() == nil {
+		slog.Warn("clustercachecontroller: record sync stopped", "cache", cacheObjID, "err", err)
+	}
+	// A cancelled context is a shutdown, not a lost event: there is nothing to retry into.
+	return ctx.Err() != nil
 }
 
-// syncEligible reports whether a cluster should have a running sync engine.
+// ensureGVRDiscovery converges this cache's ClusterCacheGVRDiscovery child — the anchor for
+// the per-GVR sync subtree. It creates the anchor if absent, owned by the cache (so GC cascades
+// to it when the cache is deleted) and keyed by the deterministic name, and writes spec, whose
+// Enabled flag is how a pause reaches the workers below it. The anchor is never deleted here;
+// see the type comment. It needs no drain finalizer of its own: the discovery controller runs no
+// worker, and the workers below it belong to its own children, which GC cannot collect before
+// they have drained (so the cache's wait for its children covers the whole subtree).
+//
+// GetOrCreate does the read-or-create atomically, so a concurrent reconcile can't duplicate it,
+// but it never mutates an existing row — hence the follow-up Update, which is a no-op when the
+// marshalled spec already matches (so a steady re-apply writes nothing and wakes nobody) and
+// bumps Generation otherwise, requeuing the child to act on it.
+//
+// The DependsOn edge is the reverse direction: it makes the child's status writes requeue this
+// cache, which is what the pending health rollup needs (an owner is NOT woken by its children).
+// Since the child outlives every pause, the edge is added once and never removed — a live
+// dependent would otherwise pin a deletion-pending child under beehive's RESTRICT. On the
+// cache's own deletion GC drops the edge (DeleteFinalizingDependsOn) before collecting.
+//
+// It returns true to request a short requeue on any store error; the next reconcile retries.
+func (c *ClusterCacheController) ensureGVRDiscovery(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCacheStatus],
+	cacheObjID beehive.ObjectID,
+	enabled bool,
+) (retry bool) {
+	spec := ClusterCacheGVRDiscoverySpec{Enabled: enabled}
+	obj, created, err := c.gvrDiscoveryClient.GetOrCreate(ctx, ClusterCacheGVRDiscoveryName(cacheObjID), spec,
+		beehive.WithOwner(cacheObjID))
+	if err != nil {
+		slog.Warn("cachecontroller: ensure gvr discovery", "cache", cacheObjID, "err", err)
+		return true
+	}
+	if !created {
+		if _, err := c.gvrDiscoveryClient.Update(ctx, obj.ID, spec); err != nil {
+			slog.Warn("cachecontroller: update gvr discovery", "cache", cacheObjID, "err", err)
+			return true
+		}
+	}
+	if err := client.AddDependency(ctx, cacheObjID, obj.ID); err != nil {
+		slog.Warn("cachecontroller: depend on gvr discovery", "cache", cacheObjID, "err", err)
+		return true
+	}
+	return false
+}
+
+// syncEligible reports whether a cluster should have its cache synced.
 func syncEligible(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
 	return ConnectionEligible(obj) && obj.Spec.SyncEnabled
 }
 
-// engineSink delivers one engine's status reports into ClusterCacheStatus via the
-// controller's ControllerClient. It holds the entry pointer so reports from a
-// stopped or replaced engine are dropped; clusterID is kept only for log labels.
-type engineSink struct {
-	c         *ClusterCacheController
-	clusterID ClusterID
-	cacheID   beehive.ObjectID
-	entry     *engineEntry
-}
-
-func (s *engineSink) Report(st engine.EngineStatus) {
-	s.c.mu.Lock()
-	current := s.c.engines[s.cacheID] == s.entry
-	s.c.mu.Unlock()
-	if !current {
-		return
-	}
-
-	ctx := context.Background()
-	s.c.writeMu.Lock()
-	defer s.c.writeMu.Unlock()
-
-	// Re-check under writeMu to avoid a race between the engine lock release
-	// above and acquiring writeMu.
-	s.c.mu.Lock()
-	current = s.c.engines[s.cacheID] == s.entry
-	s.c.mu.Unlock()
-	if !current {
-		return
-	}
-
-	if err := s.c.applyEngineReport(ctx, s.entry, st); err != nil {
-		slog.Warn("clustercachecontroller: fold engine report", "cluster", s.clusterID, "cache", s.cacheID, "err", err)
-	}
-}
-
-// applyEngineReport performs the read-modify-write for one engine status report.
-// Must be called with writeMu held.
-func (c *ClusterCacheController) applyEngineReport(ctx context.Context, entry *engineEntry, st engine.EngineStatus) error {
-	cond := syncedCondition(st, entry.parentGen)
-	lastSyncedAt := st.LastSyncedAt
-
-	c.recordSyncEvent(ctx, entry, st)
-
-	status := ClusterCacheStatus{
-		Conditions:   []Condition{cond},
-		LastSyncedAt: lastSyncedAt,
-	}
-	return c.ctrlClient.UpdateStatus(ctx, entry.cacheObjID, entry.cacheGen, status)
-}
-
-// recordSyncEvent appends one engine status report to the ClusterCache's beehive
-// event log — the sync-side parallel of recordAttempt. It records only on a
-// transition (a change in (type, reason)); a report matching the last recorded one
-// is dropped. The engine re-reports its state on a ~30s freshness heartbeat, so
-// recording every report would grow a steady Watching run into a meaningless
-// "Watching ×27" — the heartbeat's only new info is LastSyncedAt, which lands on
-// the status write instead. Best-effort: a write failure is logged and does not
-// advance the last-recorded state (so the next report retries). Must hold writeMu.
-func (c *ClusterCacheController) recordSyncEvent(ctx context.Context, entry *engineEntry, st engine.EngineStatus) {
-	typ, reason, message := syncEvent(st)
-	if entry.lastSyncReason == reason {
-		return
-	}
-	err := c.ctrlClient.RecordEvent(ctx, entry.cacheObjID, beehive.EventSpec{
-		Category: SyncEventCategory,
-		Type:     typ,
-		Reason:   reason,
-		Message:  truncateMessage(message),
-	})
-	if err != nil {
-		if ctx.Err() == nil {
-			slog.Warn("clustercachecontroller: record sync event", "cache", entry.cacheObjID, "reason", reason, "err", err)
-		}
-		return
-	}
-	entry.lastSyncReason = reason
-}
-
-// syncEvent maps one engine status report onto a beehive event's (type, reason,
-// message) — the event log's transition vocabulary, distinct from syncedCondition
-// (which names the current state). Every phase splits on ColdStart into a
-// start/complete pair: a Syncing report is SyncStart (cold) or ResyncStart (warm),
-// and the caught-up milestone is SyncComplete (cold) or ResyncComplete (warm). A
-// failure is SyncDegraded and a wedged watch is SyncStale.
-func syncEvent(st engine.EngineStatus) (beehive.EventType, string, string) {
-	switch st.State {
-	case engine.EngineWatching:
-		if st.ColdStart {
-			return beehive.EventNormal, ReasonSyncComplete, syncCompleteMessage(st)
-		}
-		return beehive.EventNormal, ReasonResyncComplete, resyncCompleteMessage(st)
-	case engine.EngineErrored:
-		return beehive.EventWarning, ReasonSyncDegraded, st.LastError
-	case engine.EngineStale:
-		return beehive.EventWarning, ReasonSyncStale, staleMessage(st)
-	default: // EngineSyncing
-		if st.ColdStart {
-			return beehive.EventNormal, ReasonSyncStart, "Starting initial sync"
-		}
-		return beehive.EventNormal, ReasonResyncStart, resyncStartMessage(st)
-	}
-}
-
-// syncCompleteMessage describes a finished cold build: what it cached and how
-// long it took.
-func syncCompleteMessage(st engine.EngineStatus) string {
-	return fmt.Sprintf("Initial sync complete — cached %d objects across %d kinds in %s",
-		st.SyncedObjects, st.SyncedKinds, roundSyncDuration(st.CaughtUpIn))
-}
-
-// resyncStartMessage describes a warm resume as it begins: the size of the cache
-// it's resuming from. The per-kind resume cookies aren't a single resource-version,
-// so the resume point is described qualitatively, not as a bogus single number.
-func resyncStartMessage(st engine.EngineStatus) string {
-	return fmt.Sprintf("Starting re-sync from warm cache — %d objects across %d kinds, resuming watches from saved positions",
-		st.SyncedObjects, st.SyncedKinds)
-}
-
-// resyncCompleteMessage describes a finished warm resume. SyncedKinds == 0 uniquely
-// marks a bare liveness recovery (a stale watch resuming — the livenessMonitor
-// clears the catch-up facts, whereas a real catch-up reports a kind count ≥ 1), so
-// it reads as a recovery rather than a misleading "0 objects". The object count is
-// not a valid discriminator, since a real resume of an empty cluster can re-pull
-// zero objects.
-//
-// It deliberately does NOT report the cache's object total: a resume re-opens each
-// kind's watch and does not re-fetch objects (they stream in as deltas), so an
-// "N objects … in 0s" line would misread as "processed N objects instantly". The
-// honest fact is how many watches resumed and how long — near-zero on a clean
-// reconnect, real seconds when an expired resume cookie forces a re-list. When some
-// kinds DID re-list, it names the bodies actually re-pulled (scoped to that work,
-// not the whole-cache total) and how many kinds did it.
-func resyncCompleteMessage(st engine.EngineStatus) string {
-	if st.SyncedKinds == 0 {
-		return "Re-sync complete — watch recovered, streaming updates again"
-	}
-	// Most resumes just reopen every watch (no bodies re-fetched). When some kinds
-	// couldn't — an expired/missing resume cookie forced a re-list — name that work.
-	if st.ResyncedKinds > 0 {
-		return fmt.Sprintf("Re-sync complete — resumed watches for %d kinds — re-synced %d objects in %d of them — in %s",
-			st.SyncedKinds, st.ResyncedObjects, st.ResyncedKinds, roundSyncDuration(st.CaughtUpIn))
-	}
-	return fmt.Sprintf("Re-sync complete — resumed watches for %d kinds in %s",
-		st.SyncedKinds, roundSyncDuration(st.CaughtUpIn))
-}
-
-// roundSyncDuration rounds a catch-up duration to a tenth of a second so the
-// event message stays stable and readable (e.g. "in 4.2s").
-func roundSyncDuration(d time.Duration) time.Duration {
-	return d.Round(100 * time.Millisecond)
-}
-
-// staleMessage names the kinds that aren't current — each with its cause — for the
-// SyncStale event and Stale condition message. A kind lands here three ways (see
-// engine.staleLaggards): its watch went quiet (WatchStalled — was synced, now no
-// heartbeat), it can't LIST at all (ListFailed — forbidden, too large to paginate), or
-// it can LIST but not watch (WatchFailed — `watch` denied, aggregated API refuses watch).
-// Naming the per-kind cause makes the message actionable (e.g. grant `watch` on the
-// WatchFailed kinds) rather than a bare kind list.
-func staleMessage(st engine.EngineStatus) string {
-	if len(st.StaleKinds) == 0 {
-		return "Not receiving updates — cache may be behind"
-	}
-	parts := make([]string, len(st.StaleKinds))
-	for i, k := range st.StaleKinds {
-		parts[i] = fmt.Sprintf("%s (%s)", k.Kind, staleCausePhrase(k.Cause))
-	}
-	return fmt.Sprintf("Not receiving updates for %s — cache may be behind", strings.Join(parts, ", "))
-}
-
-// staleCausePhrase renders a StaleCause as a short human phrase for the Stale message.
-func staleCausePhrase(c engine.StaleCause) string {
-	switch c {
-	case engine.CauseListFailed:
-		return "list failed"
-	case engine.CauseWatchFailed:
-		return "watch failed"
-	case engine.CauseWatchStalled:
-		return "watch stalled"
-	default:
-		// Zero cause (no failure recorded) or a cause added to the engine without a
-		// phrase here — render honestly rather than leak a raw enum token.
-		return "unknown"
-	}
-}
-
-// syncedCondition maps one engine status report onto the Synced condition.
-func syncedCondition(st engine.EngineStatus, gen int64) Condition {
-	cond := Condition{Type: ConditionSynced, ObservedGeneration: gen}
-	switch st.State {
-	case engine.EngineWatching:
-		cond.Status, cond.Reason = ConditionTrue, ReasonWatching
-	case engine.EngineErrored:
-		cond.Status, cond.Reason, cond.Message = ConditionFalse, ReasonSyncFailed, st.LastError
-	case engine.EngineStale:
-		cond.Status, cond.Reason, cond.Message = ConditionFalse, ReasonStale, staleMessage(st)
-	default:
-		cond.Status, cond.Reason = ConditionFalse, ReasonSyncing
-	}
-	return cond
+// syncSwitchedOff reports the USER having turned sync off — the two spec switches and
+// nothing else. It is deliberately not !syncEligible, which also goes false whenever the
+// kubeconfig context is momentarily absent: kubectx or a cloud CLI rewriting ~/.kube/config
+// makes a context vanish and return within one write, and keying the SyncStopped event on
+// eligibility appended a "Sync stopped" run to the cache's timeline on every such round
+// trip, though nobody paused anything. A deletion cascade is excluded for the same reason
+// in reverse — the cache is going away, so its timeline has no reader left.
+func syncSwitchedOff(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+	return !obj.Spec.Enabled || !obj.Spec.SyncEnabled
 }

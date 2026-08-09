@@ -24,8 +24,9 @@ import (
 
 func TestConnectionManagerGetMissReturnsNil(t *testing.T) {
 	cm := NewConnectionManager()
-	got := cm.Get(ClusterID(999999))
-	assert.Nil(t, got)
+	cfg, fp := cm.Get(ClusterID(999999))
+	assert.Nil(t, cfg)
+	assert.Empty(t, fp)
 }
 
 func TestConnectionManagerSetThenGet(t *testing.T) {
@@ -33,10 +34,11 @@ func TestConnectionManagerSetThenGet(t *testing.T) {
 	id := ClusterID(1)
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
 
-	cm.Set(id, cfg)
+	cm.Set(id, cfg, "fp-1")
 
-	got := cm.Get(id)
-	assert.Equal(t, cfg, got)
+	gotCfg, gotFP := cm.Get(id)
+	assert.Equal(t, cfg, gotCfg)
+	assert.Equal(t, "fp-1", gotFP)
 }
 
 func TestConnectionManagerDeleteRemovesEntry(t *testing.T) {
@@ -44,11 +46,12 @@ func TestConnectionManagerDeleteRemovesEntry(t *testing.T) {
 	id := ClusterID(1)
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
 
-	cm.Set(id, cfg)
+	cm.Set(id, cfg, "fp-1")
 	cm.Delete(id)
 
-	got := cm.Get(id)
-	assert.Nil(t, got)
+	gotCfg, gotFP := cm.Get(id)
+	assert.Nil(t, gotCfg)
+	assert.Empty(t, gotFP, "a deleted entry must not leave its fingerprint behind")
 }
 
 func TestConnectionManagerDeleteMissingIsNoop(t *testing.T) {
@@ -63,11 +66,12 @@ func TestConnectionManagerSetOverwrites(t *testing.T) {
 	first := &rest.Config{Host: "https://first:6443"}
 	second := &rest.Config{Host: "https://second:6443"}
 
-	cm.Set(id, first)
-	cm.Set(id, second)
+	cm.Set(id, first, "fp-1")
+	cm.Set(id, second, "fp-2")
 
-	got := cm.Get(id)
-	assert.Equal(t, second, got)
+	gotCfg, gotFP := cm.Get(id)
+	assert.Equal(t, second, gotCfg)
+	assert.Equal(t, "fp-2", gotFP, "the config and its fingerprint must move together")
 }
 
 func TestConnectionManagerConcurrentAccess(t *testing.T) {
@@ -78,8 +82,8 @@ func TestConnectionManagerConcurrentAccess(t *testing.T) {
 	for i := range n {
 		id := ClusterID(1)
 		cfg := &rest.Config{Host: "https://host"}
-		go func() { defer wg.Done(); cm.Set(id, cfg) }()
-		go func() { defer wg.Done(); cm.Get(id) }()
+		go func() { defer wg.Done(); cm.Set(id, cfg, "fp") }()
+		go func() { defer wg.Done(); cm.Get(id) }() //nolint:errcheck // exercising the lock, not the value
 		go func() { defer wg.Done(); cm.Delete(id) }()
 		_ = i
 	}

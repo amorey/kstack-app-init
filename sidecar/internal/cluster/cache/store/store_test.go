@@ -16,8 +16,10 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -316,6 +318,109 @@ func TestJanitorLeavesEventsAlone(t *testing.T) {
 	var count int
 	require.NoError(t, cdb.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&count))
 	require.Equal(t, 1, count, "the janitor must not sweep events; retention is server-mirrored")
+}
+
+// The janitor sweeps one small table, but the writers that actually free pages are
+// elsewhere and none of them vacuum: an events relist prune, a kind's Forget, an object
+// delete sweep. Gating the vacuum on the janitor's OWN deletions meant uninstalling a CRD
+// holding tens of thousands of objects freed every one of its pages and the file stayed at
+// its high-water mark until an unrelated status_history row happened to age out.
+func TestJanitorReclaimsPagesFreedByOtherWriters(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// A kind's worth of objects, then the delete a Forget would do — no status_history row
+	// involved anywhere, so the janitor's own sweep finds nothing to trim.
+	body, err := CompressRaw([]byte(`{"spec":{"padding":"` + strings.Repeat("x", 4096) + `"}}`))
+	require.NoError(t, err)
+	for i := range 200 {
+		_, err = cdb.Writer().ExecContext(ctx,
+			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+			   created_at, updated_at, raw_json)
+			 VALUES (?, 'widgets.example.com/v1', 'Widget', 'default', ?, '1', 1, 1, ?)`,
+			fmt.Sprintf("uid-%d", i), fmt.Sprintf("w-%d", i), body)
+		require.NoError(t, err)
+	}
+	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM objects`)
+	require.NoError(t, err)
+
+	freelist := func() int64 {
+		var n int64
+		require.NoError(t, cdb.Writer().QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&n))
+		return n
+	}
+	require.NotZero(t, freelist(), "the delete must have freed pages for the sweep to reclaim")
+
+	sweep(ctx, "c", cdb.Writer(), Retention{
+		StatusHistoryTTL: 7 * 24 * time.Hour,
+		Interval:         time.Minute,
+	})
+
+	require.Zero(t, freelist(), "the janitor must hand back pages whoever freed them")
+}
+
+// The cache has a single writer, so a vacuum holds every kind's sync behind it while it
+// runs — and the freelist is biggest exactly when that hurts most, right after an events
+// prune or a CRD's Forget. One pass therefore reclaims a bounded number of pages; a bigger
+// backlog drains over the next few.
+func TestJanitorReclaimsPagesInBoundedChunks(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// A small budget, so the backlog below reliably exceeds it whatever the page size.
+	defer func(orig int64) { vacuumPagesPerSweep = orig }(vacuumPagesPerSweep)
+	vacuumPagesPerSweep = 64
+
+	// Free more pages than one sweep may reclaim. Incompressible bodies, so each row costs
+	// real pages rather than compressing to nothing.
+	body := make([]byte, 8192)
+	for i := range body {
+		body[i] = byte(i * 7)
+	}
+	blob, err := CompressRaw(body)
+	require.NoError(t, err)
+	for i := range 2000 {
+		_, err = cdb.Writer().ExecContext(ctx,
+			`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+			   created_at, updated_at, raw_json)
+			 VALUES (?, 'widgets.example.com/v1', 'Widget', 'default', ?, '1', 1, 1, ?)`,
+			fmt.Sprintf("uid-%d", i), fmt.Sprintf("w-%d", i), blob)
+		require.NoError(t, err)
+	}
+	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM objects`)
+	require.NoError(t, err)
+
+	freelist := func() int64 {
+		var n int64
+		require.NoError(t, cdb.Writer().QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&n))
+		return n
+	}
+	start := freelist()
+	require.Greater(t, start, int64(vacuumPagesPerSweep),
+		"the backlog must exceed one sweep's budget for this to mean anything")
+
+	ret := Retention{StatusHistoryTTL: 7 * 24 * time.Hour, Interval: time.Minute}
+	sweep(ctx, "c", cdb.Writer(), ret)
+
+	after := freelist()
+	require.Equal(t, start-vacuumPagesPerSweep, after, "one sweep reclaims exactly its budget")
+
+	// And the backlog does drain, a sweep at a time.
+	for range 200 {
+		if freelist() == 0 {
+			break
+		}
+		sweep(ctx, "c", cdb.Writer(), ret)
+	}
+	require.Zero(t, freelist(), "repeated sweeps must finish the job")
 }
 
 func TestSubscribeNotifyAndCoalesce(t *testing.T) {
@@ -655,6 +760,189 @@ func TestKinds(t *testing.T) {
 	require.Equal(t, 0, rows[2].Count)
 }
 
+// A shutdown that misses its deadline deliberately leaves the pools open — a janitor
+// mid-write must not have its connection closed underneath it — so the handle is still
+// live, and the close must both report that and stay retryable.
+//
+// DeleteCacheFiles is why: it closes before removing files, and its error keeps the cache's
+// finalizer so the controller retries. If Close forgot the handle, the retry would find
+// nothing to close, return nil, and os.Remove the .db out from under the live janitor and
+// pools — dropping the close-before-delete invariant on exactly the retry meant to preserve
+// it.
+func TestCloseStaysRetryableWhenShutdownFails(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := m.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+
+	// Withhold the janitor's stop signal, so the shutdown below can only end by deadline —
+	// the path that deliberately leaves the pools open. Restored via Cleanup rather than
+	// inline: a failed assertion below would otherwise leave the manager's own shutdown
+	// waiting on a janitor that is never asked to stop.
+	realCancel := cdb.janitorCancel
+	cdb.janitorCancel = func() {}
+	t.Cleanup(func() {
+		cdb.janitorCancel = realCancel
+		_ = m.Shutdown(ctx)
+	})
+
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	require.Error(t, m.Close(expired, 1), "a shutdown that could not close the pools must say so")
+
+	// Not open — Open must not hand back a handle whose pools are on their way out — but
+	// not gone either: the retry has to re-wait on the same one.
+	require.Nil(t, m.Lookup(1))
+	require.NoError(t, cdb.Writer().PingContext(ctx),
+		"the pools are still live, which is why the files must not be removed yet")
+
+	cdb.janitorCancel = realCancel
+	require.NoError(t, m.Close(ctx, 1), "the retry closes it for real")
+
+	// The retry must have closed THIS handle's pools, not silently no-opped on a forgotten
+	// entry and left a live janitor behind for DeleteCacheFiles to delete files under.
+	require.Error(t, cdb.Writer().PingContext(ctx), "the retry must close the same handle")
+
+	reopened, err := m.Open(ctx, ref(1, 1))
+	require.NoError(t, err, "a fully closed cache reopens")
+	require.NotSame(t, cdb, reopened)
+}
+
+// Shutdown owns the process teardown, so it must not report itself done while a cache's
+// pools may still be live. A per-cache Close mid-attempt is exactly that case: the handle
+// has left the open set, and once Shutdown has taken the closing set nothing can reach it
+// through the Manager again — so this is the last chance to account for it.
+func TestShutdownWaitsForAnInFlightClose(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := m.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+
+	// Hold the close inside its own shutdown: janitorCancel is called first, so blocking it
+	// parks the attempt at a known point, with the entry already out of the open set and in
+	// the closing one. The FIRST call (the racing Close) withholds the janitor's stop
+	// signal so that attempt can only end by deadline — leaving the pools open, which is
+	// what Shutdown then has to finish. The second call is Shutdown's own takeover.
+	realCancel := cdb.janitorCancel
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	racing := true
+	cdb.janitorCancel = func() {
+		if racing {
+			racing = false
+			close(entered)
+			<-release
+			return
+		}
+		realCancel()
+	}
+
+	closeCtx, cancelClose := context.WithCancel(ctx)
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- m.Close(closeCtx, 1) }()
+	<-entered
+
+	shutdownErr := make(chan error, 1)
+	go func() { shutdownErr <- m.Shutdown(ctx) }()
+
+	cancelClose() // the in-flight attempt fails, its pools still live
+	close(release)
+
+	require.Error(t, <-closeErr)
+	require.NoError(t, <-shutdownErr)
+	require.Error(t, cdb.Writer().PingContext(ctx),
+		"shutdown must not return while a cache's pools are still open")
+}
+
+// The other half: a close that already FAILED left its handle in the closing set, live
+// pools and all. Shutdown is the only remaining caller that can finish it — after Shutdown
+// takes that set, nothing reaches the handle through the Manager again.
+func TestShutdownFinishesAFailedClose(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := m.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+
+	realCancel := cdb.janitorCancel
+	cdb.janitorCancel = func() {}
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	require.Error(t, m.Close(expired, 1), "the close must fail with its pools still open")
+	require.NoError(t, cdb.Writer().PingContext(ctx))
+
+	cdb.janitorCancel = realCancel
+	require.NoError(t, m.Shutdown(ctx))
+	require.Error(t, cdb.Writer().PingContext(ctx),
+		"a handle no per-cache Close can reach any more must be closed by Shutdown")
+}
+
+// Deleting a cache is close-then-unlink, and Open CREATES a missing file — so a reconcile
+// landing between the two would recreate the .db, register a handle, and have that file
+// unlinked out from under it a moment later. Every worker rebuilt afterwards would then
+// write into an inode with no name, silently, for the rest of the process.
+func TestOpenRefusesACacheBeingDeleted(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	ctx := context.Background()
+	_, err := m.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Shutdown(ctx) })
+
+	// Observed from inside the sequence, after the handle is closed and before the unlink —
+	// exactly where the reconcile used to slip in.
+	var midDelete error
+	require.NoError(t, m.deleteCacheFilesWithHook(ctx, ref(1, 1), func() {
+		_, midDelete = m.Open(ctx, ref(1, 1))
+	}))
+	require.Error(t, midDelete, "a cache mid-deletion must not be openable")
+
+	// The file really is gone, and the cache opens again once the deletion is over.
+	_, exists := m.CacheBytes(ref(1, 1))
+	require.False(t, exists)
+	reopened, err := m.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	require.NotNil(t, reopened)
+}
+
+// Open must not hand out a handle that is being shut down. A reconcile opening the cache
+// while a clear or a deletion closes it would otherwise take the doomed handle and have the
+// pools close mid-query — and opening a SECOND pool over the same file is no better, since
+// the deletion is about to remove the .db under it. The caller retries; by then the close
+// has resolved one way or the other.
+func TestOpenRefusesACacheThatIsClosing(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := m.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+
+	realCancel := cdb.janitorCancel
+	cdb.janitorCancel = func() {}
+	t.Cleanup(func() {
+		cdb.janitorCancel = realCancel
+		_ = m.Shutdown(ctx)
+	})
+
+	// Leave the cache mid-close: the shutdown could not finish, so its pools are still live.
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	require.Error(t, m.Close(expired, 1))
+
+	got, err := m.Open(ctx, ref(1, 1))
+	require.Error(t, err, "a closing cache is not open")
+	require.Nil(t, got)
+
+	// Once it is really closed, opening works again.
+	cdb.janitorCancel = realCancel
+	require.NoError(t, m.Close(ctx, 1))
+	reopened, err := m.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	require.NotNil(t, reopened)
+}
+
 // Objects reads one kind's cached objects, filtered by (api_version, resource)
 // and ordered by (namespace, name). The watch args are the plural resource, but
 // the objects table is keyed by kind, so the reader must translate resource→kind
@@ -714,6 +1002,57 @@ func TestObjects(t *testing.T) {
 	require.Equal(t, "d2", rows[1].UID)
 	require.Equal(t, "kube-system", rows[1].Namespace)
 	require.Equal(t, "coredns", rows[1].Name)
+}
+
+// A plural resource names exactly one Kind within an api group-version, and the reader's
+// resource→kind translation is an unconstrained scalar subquery — two matching rows and
+// SQLite silently answers with an arbitrary one, so a fully-synced kind's table renders
+// empty forever.
+//
+// The collision is reachable: a CRD whose Kind is renamed while the sidecar is down leaves
+// the old catalog row behind, because the in-process cleanup that drops it needs the
+// previous worker still running to know what it was. So the registering worker clears any
+// row holding its plural under another Kind, and a unique index makes that the only
+// possible state.
+func TestEnsureKindCatalogReplacesARenamedKind(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+	cdb, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown(ctx) })
+
+	// The pre-rename registration, left behind by a previous process.
+	require.NoError(t, EnsureKindCatalog(ctx, cdb, KindRow{
+		APIVersion: "widgets.example.com/v1", Kind: "Widget",
+		Resource: "widgets", Scope: "Namespaced", IsCRD: true,
+	}))
+	// This process's worker registers the same plural under the new Kind. "Gadget" sorts
+	// before "Widget", so an index-first subquery would answer with it either way — the
+	// assertion below only means something because the stale row is gone.
+	require.NoError(t, EnsureKindCatalog(ctx, cdb, KindRow{
+		APIVersion: "widgets.example.com/v1", Kind: "Gadget",
+		Resource: "widgets", Scope: "Namespaced", IsCRD: true,
+	}))
+
+	var kinds int
+	require.NoError(t, cdb.Reader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM kind_catalog WHERE api_version = ? AND resource = ?`,
+		"widgets.example.com/v1", "widgets").Scan(&kinds))
+	require.Equal(t, 1, kinds, "one plural, one Kind")
+
+	body, err := CompressRaw([]byte(`{}`))
+	require.NoError(t, err)
+	_, err = cdb.Writer().ExecContext(ctx,
+		`INSERT INTO objects (uid, api_version, kind, namespace, name, resource_version,
+		   created_at, updated_at, raw_json)
+		 VALUES ('g1', 'widgets.example.com/v1', 'Gadget', 'default', 'one', '1', 1, 1, ?)`, body)
+	require.NoError(t, err)
+
+	rows, err := cdb.Objects(ctx, "widgets.example.com/v1", "widgets")
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "the plural must resolve to the Kind the live worker registered")
+	require.Equal(t, "Gadget", rows[0].Kind)
 }
 
 // Objects returns each row's full native body, decompressed from the zlib-
@@ -878,4 +1217,89 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(buf[pos:])
+}
+
+// Shutdown takes every handle out of dbs and closing BEFORE closing it, so afterwards a
+// per-cache Close finds nothing registered — which is NOT the same as "nothing is open".
+// Answering nil there told DeleteCacheFiles the cache was closed while Shutdown's own
+// attempt was still tearing the pools down, and it went on to unlink the .db/-wal/-shm out
+// from under a live janitor.
+func TestCloseAfterShutdownReportsTheShutdown(t *testing.T) {
+	dir := t.TempDir()
+	r := NewManager(dir)
+	ctx := context.Background()
+
+	_, err := r.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+	require.NoError(t, r.Shutdown(ctx))
+
+	require.ErrorIs(t, r.Close(ctx, 1), ErrManagerShutDown,
+		"a shut-down manager owns the handles; it must not answer 'nothing to close'")
+	// An id that was never open answers the same way, for the same reason: the manager
+	// can no longer tell.
+	require.ErrorIs(t, r.Close(ctx, 99), ErrManagerShutDown)
+
+	// Which is what keeps the file deletion honest — it closes first and gives up here.
+	require.ErrorIs(t, r.DeleteCacheFiles(ctx, ref(1, 1)), ErrManagerShutDown)
+	require.FileExists(t, clusterDBPath(dir, ref(1, 1)))
+}
+
+// A shutdown whose janitor has ALREADY stopped is a clean one, no matter how long the
+// caller's deadline has been gone. Both select arms were ready in that case, so Go picked
+// between them at random: half the time an expired context turned a completed teardown
+// into a timeout error — which leaves the pools open and the handle stranded in the
+// Manager's closing set, refusing every later Open for that cache.
+func TestShutdownWithAStoppedJanitorIgnoresAnExpiredDeadline(t *testing.T) {
+	dir := t.TempDir()
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// One run decides nothing when the outcome is a coin flip; a run of them does.
+	for i := range 25 {
+		m := NewManager(dir)
+		cdb, err := m.Open(context.Background(), ref(1, int64(i+1)))
+		require.NoError(t, err)
+
+		// Stop the janitor and wait for it, so the only thing left for shutdown to do is
+		// close the pools — the state where the deadline is irrelevant.
+		cdb.janitorCancel()
+		<-cdb.janitorDone
+
+		require.NoError(t, cdb.shutdown(expired),
+			"a teardown with nothing left to wait for must not report a timeout")
+	}
+}
+
+// A close that misses its deadline leaves the handle registered as closing on purpose, and
+// nothing else ever retried it: Close is reachable only through DeleteCacheFiles, and its
+// caller (a cache clear) just surfaces the error. Every later Open was then refused for the
+// life of the process, while the pools stayed live and every watcher had already been told
+// the cache closed. Open now drives the retry — off its own goroutine, since the thing that
+// stranded the handle is a janitor that would not stop.
+func TestOpenDrivesTheRetryOfAFailedClose(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir())
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+
+	cdb, err := m.Open(ctx, ref(1, 1))
+	require.NoError(t, err)
+
+	// Exactly what a failed close leaves behind: out of dbs, into closing, with no attempt
+	// in flight (done nil) because the attempt ended — unsuccessfully.
+	m.mu.Lock()
+	delete(m.dbs, 1)
+	m.closing[1] = &closingDB{cdb: cdb}
+	m.mu.Unlock()
+
+	// This Open still refuses — the handle's pools may be live, so it must — but it is what
+	// sets the retry going.
+	_, err = m.Open(ctx, ref(1, 1))
+	require.Error(t, err, "a closing cache is not open")
+
+	// The retry succeeds here (the janitor is long stopped), so the wedge clears and the
+	// caller's next attempt — the reconcile requeue the refusal assumes — gets a handle.
+	require.Eventually(t, func() bool {
+		reopened, err := m.Open(ctx, ref(1, 1))
+		return err == nil && reopened != nil
+	}, 2*time.Second, 10*time.Millisecond, "nothing ever finished the failed close")
 }

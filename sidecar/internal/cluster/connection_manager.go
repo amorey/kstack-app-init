@@ -15,39 +15,59 @@
 package cluster
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"sort"
+	"strconv"
 	"sync"
 
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd/api"
 )
 
-// ConnectionManager holds the live REST config for each connected cluster.
-// ClusterCoreController writes to it on probe success/failure; ClusterCacheController
-// and future agent callers read from it to obtain credentials without re-resolving
-// the kubeconfig on every reconcile.
+// ConnectionManager holds the live REST config for each connected cluster, alongside
+// the config's fingerprint. ClusterCoreController writes to it on probe success/failure;
+// the sync controllers and future agent callers read from it to obtain credentials
+// without re-resolving the kubeconfig on every reconcile.
 type ConnectionManager struct {
 	mu      sync.RWMutex
-	configs map[ClusterID]*rest.Config
+	configs map[ClusterID]connection
+}
+
+// connection is one cluster's stored credentials plus the fingerprint that identifies
+// them. The fingerprint is stored rather than recomputed by each reader because only the
+// core controller can compute it correctly — ConfigFingerprint needs the kubeconfig's
+// raw proxy-url (clientcmd compiles it into an unhashable rest.Config.Proxy func), which
+// no other controller reads. A reader recomputing it would silently miss a proxy change.
+type connection struct {
+	cfg         *rest.Config
+	fingerprint string
 }
 
 // NewConnectionManager returns an empty ConnectionManager.
 func NewConnectionManager() *ConnectionManager {
 	return &ConnectionManager{
-		configs: make(map[ClusterID]*rest.Config),
+		configs: make(map[ClusterID]connection),
 	}
 }
 
-// Set stores (or replaces) the REST config for id.
-func (m *ConnectionManager) Set(id ClusterID, cfg *rest.Config) {
+// Set stores (or replaces) the REST config for id and the fingerprint identifying it.
+func (m *ConnectionManager) Set(id ClusterID, cfg *rest.Config, fingerprint string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.configs[id] = cfg
+	m.configs[id] = connection{cfg: cfg, fingerprint: fingerprint}
 }
 
-// Get returns the REST config for id, or nil if none is stored.
-func (m *ConnectionManager) Get(id ClusterID) *rest.Config {
+// Get returns the REST config stored for id and the fingerprint identifying it, or
+// (nil, "") if none. The two are returned together, under one read, because they are one
+// value: a rotation landing between separate reads would pair the OLD config with the NEW
+// fingerprint, and a sync started that way records a fingerprint it isn't running — so
+// every later reconcile sees "unchanged" and never restarts it.
+func (m *ConnectionManager) Get(id ClusterID) (*rest.Config, string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.configs[id]
+	c := m.configs[id]
+	return c.cfg, c.fingerprint
 }
 
 // Delete removes the REST config for id. It is a no-op if id is not present.
@@ -55,4 +75,104 @@ func (m *ConnectionManager) Delete(id ClusterID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.configs, id)
+}
+
+// ConfigFingerprint hashes a rest.Config's connection/auth fields so a credential
+// rotation can be detected as a changed fingerprint (the trigger to restart a cluster's
+// sync). We hash the *static* exec/auth-provider config — runtime token minting is the
+// transport's job, but editing how tokens are obtained must invalidate it.
+//
+// proxyURL is the kubeconfig cluster's proxy-url. clientcmd compiles it into
+// rest.Config.Proxy (an opaque func we can't hash), so the caller passes the raw string
+// (ContextProxyURL): a changed proxy must restart sync even when every other field is
+// identical.
+//
+// Used by the connection sentinel (ClusterCoreController) and the sync layer.
+func ConfigFingerprint(cfg *rest.Config, proxyURL string) string {
+	if cfg == nil {
+		return ""
+	}
+	h := sha256.New()
+	// NUL-separate every field so boundaries can't be aliased by concatenation.
+	write := func(s string) { h.Write([]byte(s)); h.Write([]byte{0}) }
+	writeBytes := func(b []byte) { h.Write(b); h.Write([]byte{0}) }
+
+	write(proxyURL)
+
+	t := cfg.TLSClientConfig
+	for _, s := range []string{
+		cfg.Host, cfg.APIPath, cfg.Username, cfg.Password,
+		cfg.BearerToken, cfg.BearerTokenFile,
+		t.ServerName, t.CAFile, t.CertFile, t.KeyFile,
+		strconv.FormatBool(t.Insecure),
+	} {
+		write(s)
+	}
+	writeBytes(t.CAData)
+	writeBytes(t.CertData)
+	writeBytes(t.KeyData)
+
+	// Impersonation.
+	im := cfg.Impersonate
+	write(im.UserName)
+	write(im.UID)
+	for _, g := range im.Groups {
+		write(g)
+	}
+	for _, k := range sortedKeys(im.Extra) {
+		write(k)
+		for _, v := range im.Extra[k] {
+			write(v)
+		}
+	}
+
+	// Auth-provider plugin (name + static config).
+	if ap := cfg.AuthProvider; ap != nil {
+		write(ap.Name)
+		for _, k := range sortedKeys(ap.Config) {
+			write(k)
+			write(ap.Config[k])
+		}
+	}
+
+	// Exec credential plugin (command/args/env/apiVersion).
+	if ep := cfg.ExecProvider; ep != nil {
+		write(ep.Command)
+		write(ep.APIVersion)
+		for _, a := range ep.Args {
+			write(a)
+		}
+		for _, e := range ep.Env {
+			write(e.Name)
+			write(e.Value)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ContextProxyURL returns the proxy-url of the cluster a kubeconfig context points at,
+// or "" if the context, its cluster, or the field is absent. The sync layer folds it into
+// ConfigFingerprint because clientcmd compiles it into rest.Config.Proxy, an opaque func
+// the fingerprint can't otherwise see.
+func ContextProxyURL(cfg *api.Config, ctxName string) string {
+	ctx, ok := cfg.Contexts[ctxName]
+	if !ok || ctx == nil {
+		return ""
+	}
+	cluster, ok := cfg.Clusters[ctx.Cluster]
+	if !ok || cluster == nil {
+		return ""
+	}
+	return cluster.ProxyURL
+}
+
+// sortedKeys returns a map's keys in deterministic order, so hashing a map doesn't depend
+// on Go's randomized iteration order.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
