@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Chat/Dashboard switch at the top of the sidebar, styled as a segmented control.
-// Real router links (not local state), so each mode is a deep-linkable route.
-// The active link is highlighted via the router's `data-status`.
+// Chat/Dashboard switch. Router links, not local state, so each mode is a real
+// deep-linkable route; the active one is highlighted via `data-status`.
 import { Link } from '@tanstack/react-router';
 
-// Segmented-control pill styling: muted track, active link raised as a chip.
 const TRACK = 'inline-flex w-full items-center rounded-lg bg-muted p-[3px] text-muted-foreground';
 const ITEM =
   'flex-1 rounded-md px-2 py-1 text-center text-sm font-medium transition-colors hover:text-foreground ' +

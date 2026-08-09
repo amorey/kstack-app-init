@@ -18,7 +18,6 @@ import { Route as indexRoute } from '@/routes/index';
 import { Route as chatRoute } from '@/routes/chat';
 import { Route as dashboardRoute } from '@/routes/dashboard';
 
-// Chat (`/chat`) and Dashboard (`/dashboard`) are peer routes under the pathless
-// `_app` layout route, so they share the sidebar shell (`AppLayout`); `/`
-// (indexRoute) just redirects to the default view.
+// Chat and Dashboard are peers under the pathless `_app` layout route so they
+// share the sidebar shell; `/` only redirects to the default view.
 export const routeTree = rootRoute.addChildren([appRoute.addChildren([indexRoute, chatRoute, dashboardRoute])]);

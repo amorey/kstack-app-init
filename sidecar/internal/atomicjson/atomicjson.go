@@ -1,13 +1,9 @@
-// Package atomicjson reads and writes a JSON document as a single file,
-// crash-safe: writes go to a temp file in the same directory and are
-// atomically renamed into place, so a crash mid-write can never leave a
-// torn document for the next Load. A missing file is reported as the zero
-// value — callers treat "no file yet" as "nothing cached".
+// Package atomicjson reads and writes a JSON document crash-safely: writes go to a temp
+// file in the same directory and are renamed into place, so a crash mid-write can't leave
+// a torn document. A missing file reads as the zero value.
 //
-// The functions are not internally synchronized. Callers that allow
-// concurrent writers must serialize them (e.g. behind a sync.Mutex); the
-// temp+rename then guarantees every on-disk state is a complete document,
-// with last-writer-wins between racing Saves.
+// NOT internally synchronized — callers with concurrent writers must serialize them; the
+// temp+rename then makes every on-disk state a complete document, last writer winning.
 package atomicjson
 
 import (
@@ -18,13 +14,11 @@ import (
 	"path/filepath"
 )
 
-// Temp files share one prefix; the name is otherwise random per write, so
-// concurrent Saves never collide on the temp path before the rename.
+// Temp names are random per write, so concurrent Saves never collide before the rename.
 const tmpPattern = ".atomicjson-*.json"
 
-// Load reads path and unmarshals it into T. A missing file yields the zero
-// T and a nil error; a present-but-corrupt file yields the zero T and the
-// unmarshal error (never silently valid).
+// Load unmarshals path into T. A missing file yields the zero T and nil; a corrupt one
+// yields the zero T and the unmarshal error — never silently valid.
 func Load[T any](path string) (T, error) {
 	var zero T
 	data, err := os.ReadFile(path)
@@ -41,8 +35,7 @@ func Load[T any](path string) (T, error) {
 	return out, nil
 }
 
-// Save marshals v and writes it to path atomically. The parent directory
-// is created 0700 if absent; the file ends up 0600.
+// Save writes v to path atomically; the parent dir is created 0700, the file lands 0600.
 func Save[T any](path string, v T) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -58,7 +51,7 @@ func Save[T any](path string, v T) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	// Best-effort cleanup if anything below fails before the rename.
+	// Best-effort cleanup if anything below fails.
 	defer func() { _ = os.Remove(tmpName) }()
 
 	if _, err := tmp.Write(data); err != nil {

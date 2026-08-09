@@ -12,18 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The active cluster's discovered kind catalog as a live list of `ServerKind`s — the
-// shared source for both the dashboard nav (`useDashboardNav` builds its tree from these)
-// and the per-kind object tables (which resolve a selected nav id back to its full
-// `apiVersion`/`resource`/`scope` here — a curated id like "pods" carries no apiVersion on
-// its own). The active kube-context resolves to a cluster (via the registry's kubeconfig
-// source), and `clusterDataKindsWatch` streams that cache's catalog as a delta watch — an
-// `Added` burst on subscribe, then per-kind `Added`/`Modified`/`Deleted` (a per-kind
-// `count` is live, so an object write re-emits it as `Modified`).
-//
-// Reduction runs through the shared `useCacheDeltaWatch` (cache-aware provenance: a straggler
-// from a superseded cache is dropped and the active cache's first frame after a swap starts
-// fresh, so two caches' kinds never mix).
+// The active cluster's discovered kind catalog as a live `ServerKind[]` — shared by
+// the dashboard nav and the object tables (which resolve a curated nav id like "pods"
+// back to its full apiVersion/resource/scope here). `clusterDataKindsWatch` is a
+// per-cache delta watch; per-kind `count` is live (an object write re-emits as
+// `Modified`). Reduced via `useCacheDeltaWatch`, whose cacheID provenance guard keeps
+// two caches' kinds from mixing — see docs/adr/2026-08-09-delta-watch-protocol.md
 import { graphql } from '@/gql';
 import type { ClusterDataKindsWatchSubscription as ClusterDataKindsWatchSubscriptionType } from '@/gql/graphql';
 import { useActiveCluster } from '@/lib/active-cluster';
@@ -49,18 +43,13 @@ const ClusterDataKindsWatchSubscription = graphql(`
   }
 `);
 
-// One kind on the delta stream (the `kind` payload of a change) — structurally a
-// `ServerKind` (apiVersion/kind/resource/scope/isCRD/count).
+// The `kind` payload of a change — structurally a `ServerKind`.
 type KindRow = ClusterDataKindsWatchSubscriptionType['clusterDataKindsWatch']['kind'];
 
-// The active context's discovered kinds, updated live. `kinds` is empty while
-// clusters/kinds haven't loaded (no active cluster, or an unsynced one — it has no active
-// cache, so the subscription is paused). `active` = the subscription is live (a cluster +
-// active cache to stream from); `phase` classifies connecting vs. empty-snapshot for a
-// spinner, mirroring `useClusterDataEvents`. This watch's variables carry no kind, so its
-// provenance is just the cacheID (a cache swap under the same cluster moves the key and
-// re-subscribes). urql dedupes the subscription, so `useDashboardNav` and an object table
-// both consuming this share one transport. Kinds keep insertion order (no sort).
+// The active context's discovered kinds, live. Paused (empty) without an active
+// cache. Provenance is just the cacheID — the variables carry no kind — so a cache
+// swap moves the key and re-subscribes. urql dedupes: `useDashboardNav` and an object
+// table share one transport. Insertion order (no sort).
 export function useClusterDataKinds(): { kinds: ServerKind[]; active: boolean; phase: WatchPhase } {
   const { clusterID, cacheID, active } = useActiveCluster();
 

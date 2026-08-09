@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Picker for the window's active kubeconfig context. A thin control over
-// `useActiveKubeContext`: the resolved context drives the value and picking one
-// writes it to the `kubeContext` URL param, sharing the choice across chat and
-// dashboard. Selection is view-scope only — it doesn't rewrite the kubeconfig's
-// current-context. The trigger grows to fit a full FQDN context name up to a cap,
-// past which the value line-clamps.
+// Thin control over `useActiveKubeContext`. Selection is view-scope only — it
+// never rewrites the kubeconfig's current-context — and lives in the
+// `kubeContext` search param, not provider state;
+// see docs/adr/2026-08-09-url-params-as-window-state.md
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@kubetail/ui/elements/select';
 import { Spinner } from '@kubetail/ui/elements/spinner';
 
@@ -27,10 +25,8 @@ export function KubeContextPicker() {
   const { context, contexts, phase, setContext } = useActiveKubeContext();
 
   if (contexts.length === 0) {
-    // Nothing to switch between. Split the reason so a stalled initial dial reads
-    // as "connecting" rather than a permanent-looking "No kubeconfig": only the
-    // `connecting` phase (transport down, nothing reported) shows the spinner; a
-    // reported-but-empty kubeconfig (or a reconnect) is the genuine empty state.
+    // Split the reason so a stalled initial dial doesn't read as a permanent
+    // "No kubeconfig".
     if (phase === 'connecting') {
       return (
         <span className="flex items-center gap-1.5 text-xs text-muted-foreground" data-testid="kube-context-connecting">

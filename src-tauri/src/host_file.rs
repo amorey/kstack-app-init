@@ -12,25 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `host.json` — the host's persisted settings file (`app_config_dir()/host.json`)
-//! and the durable source of truth for what it holds; the webview keeps no copy.
+//! `host.json` (`app_config_dir()/host.json`) — the persisted-settings source
+//! of truth; the webview keeps no copy. See
+//! docs/adr/2026-08-09-host-json-settings.md.
 //!
-//! It reaches the webview two ways, both fed from one read in
-//! `window_manager::build_window`: [`init_script`] exposes the file as the
-//! `window.__KSTACK_HOST__` global before any page script runs (synchronous
-//! first-paint reads), and the [`UPDATED_EVENT`] broadcast after every write
-//! keeps already-open windows in step. The webview writes back through the
-//! general `update_host_file` command (see `commands.rs`).
+//! Reaches the webview two ways, both fed from one read in
+//! `window_manager::build_window`: [`init_script`] (`window.__KSTACK_HOST__`,
+//! injected before any page script) and the [`UPDATED_EVENT`] broadcast after
+//! every write. Writes come through the `update_host_file` command.
 //!
-//! It carries one value today: the color-scheme preference, which
-//! `window_manager` turns into a native window background so a freshly created
-//! window's first frame matches the app's scheme.
-//!
-//! The format is a single versioned JSON object with optional fields; updates
-//! are partial ([`HostFilePatch`]) and merge onto the current contents, so
-//! adding a setting is a new `Option` field, not a new command. Reads are
-//! defensive (missing or corrupt file → defaults) and writes are atomic (unique
-//! temp file + rename).
+//! Versioned JSON, all-`Option` fields, partial patches ([`HostFilePatch`]) —
+//! a new setting is a new `Option` field, not a new command. Defensive reads
+//! (missing/corrupt → defaults), atomic writes (temp + rename).
 
 use std::path::{Path, PathBuf};
 
@@ -40,22 +33,18 @@ use tauri::Manager;
 /// Schema version stamped into the file on every write, for future migrations.
 const CURRENT_SCHEMA_VERSION: u32 = 1;
 
-/// Event broadcast to every window after `host.json` changes, carrying the
-/// merged [`HostFile`] as its payload (same camelCase JSON as the file and the
-/// injected `window.__KSTACK_HOST__` global). This is how already-open windows
-/// track the source of truth live — the webview's `ThemeProvider` listens for
-/// it; the string is hand-mirrored there.
+/// Broadcast to every window after `host.json` changes, payload = merged
+/// [`HostFile`]. The string is hand-mirrored in the webview
+/// (`src/lib/host-file.ts`).
 pub const UPDATED_EVENT: &str = "host-file-updated";
 
-/// Absolute path of `host.json`: the app's config directory (created on demand
-/// by [`update`]) joined with the fixed filename.
+/// Absolute path of `host.json` (dir created on demand by [`update`]).
 pub fn path(app: &tauri::AppHandle) -> tauri::Result<PathBuf> {
     Ok(app.path().app_config_dir()?.join("host.json"))
 }
 
-/// The user's color-scheme choice, as the webview's `theme.tsx` defines it:
-/// `system` follows the OS; `light`/`dark` are explicit overrides. Serialized
-/// lowercase to match the webview's `ColorSchemePreference` strings.
+/// The user's color-scheme choice; serialized lowercase to match the webview's
+/// `ColorSchemePreference` strings (`theme.tsx`).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorSchemePreference {
@@ -64,9 +53,8 @@ pub enum ColorSchemePreference {
     Dark,
 }
 
-/// The parsed contents of `host.json`. All settings are `Option` so absent
-/// fields (older files, first run) fall back to their defaults at the point of
-/// use rather than failing the parse.
+/// Parsed `host.json`. Settings must stay `Option` so absent fields (older
+/// files, first run) default at the point of use rather than failing the parse.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HostFile {
@@ -84,19 +72,16 @@ impl Default for HostFile {
     }
 }
 
-/// A partial update to [`HostFile`]: `Some` fields overwrite, `None` fields
-/// leave the current value untouched. This is the argument shape of the
-/// `update_host_file` command, so it deserializes from the webview's camelCase
-/// JSON (e.g. `{ "colorSchemePreference": "dark" }`).
+/// Partial update to [`HostFile`]: `Some` overwrites, `None` leaves untouched.
+/// Argument shape of `update_host_file` (webview camelCase JSON).
 #[derive(Deserialize, Clone, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HostFilePatch {
     pub color_scheme_preference: Option<ColorSchemePreference>,
 }
 
-/// Read and parse `host.json`, falling back to defaults when the file is
-/// missing or unparseable — a corrupt file must never take the host down; the
-/// next write replaces it wholesale.
+/// Read `host.json`; missing or corrupt → defaults (a corrupt file must never
+/// take the host down — the next write replaces it wholesale).
 pub fn read(path: &Path) -> HostFile {
     std::fs::read_to_string(path)
         .ok()
@@ -104,11 +89,10 @@ pub fn read(path: &Path) -> HostFile {
         .unwrap_or_default()
 }
 
-/// Merge `patch` onto the current file contents, stamp [`CURRENT_SCHEMA_VERSION`],
-/// and persist. The write is atomic (unique temp file + rename) so concurrent
-/// writers — e.g. two windows saving settings — can't interleave into a torn
-/// file; last writer wins. Creates the parent directory if needed (the app
-/// config dir may not exist on first run). Returns the merged result.
+/// Merge `patch` onto the current contents, stamp [`CURRENT_SCHEMA_VERSION`],
+/// persist atomically (unique temp + rename; concurrent windows can't tear the
+/// file, last writer wins), and return the merged result. Creates the parent
+/// dir on first run.
 pub fn update(path: &Path, patch: HostFilePatch) -> std::io::Result<HostFile> {
     let mut file = read(path);
     if let Some(preference) = patch.color_scheme_preference {
@@ -121,12 +105,10 @@ pub fn update(path: &Path, patch: HostFilePatch) -> std::io::Result<HostFile> {
         .ok_or_else(|| std::io::Error::other("host file path has no parent directory"))?;
     std::fs::create_dir_all(parent)?;
 
-    // Serialization can't fail for this plain data struct, but route the error
-    // instead of unwrapping (crate-wide `clippy::unwrap_used`).
     let contents = serde_json::to_string_pretty(&file).map_err(std::io::Error::other)?;
 
-    // Unique temp name so concurrent writers never share a partially-written
-    // file; the rename is atomic, so readers see the old or the new contents.
+    // Unique temp name so concurrent writers never share a partial file; the
+    // rename is atomic.
     static WRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = path.with_extension(format!(
         "tmp-{}-{}",
@@ -139,15 +121,11 @@ pub fn update(path: &Path, patch: HostFilePatch) -> std::io::Result<HostFile> {
     Ok(file)
 }
 
-/// The initialization script exposing the file to a window's webview, as
-/// `window.__KSTACK_HOST__`. `build_window` injects it into every window it
-/// creates; Tauri runs it before any page script, so the webview's first-paint
-/// code (the inline script in `index.html`) reads the preference synchronously
-/// from the same source of truth the host painted the native background from.
+/// Initialization script exposing the file as `window.__KSTACK_HOST__`.
+/// `build_window` injects it into every window; Tauri runs it before any page
+/// script, so the webview's first-paint code reads it synchronously.
 pub fn init_script(file: &HostFile) -> String {
-    // Serializing this plain data struct can't fail; fall back to an empty
-    // object rather than unwrapping (crate-wide `clippy::unwrap_used`) — the
-    // inline script treats missing fields as defaults anyway.
+    // Fallback rather than unwrap; the inline script defaults missing fields.
     let json = serde_json::to_string(file).unwrap_or_else(|_| "{}".into());
     format!("window.__KSTACK_HOST__ = {json};")
 }

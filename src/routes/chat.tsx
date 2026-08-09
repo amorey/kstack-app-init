@@ -43,14 +43,12 @@ type Msg = { id: string; from: 'user' | 'assistant'; content: string };
 function Chat() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [draft, setDraft] = useState('');
-  // While `pending` is set the subscription is active and `streamed` holds the
-  // in-flight assistant text. On `done` we move the text into `messages` and clear
-  // `pending` in one handler call — React 18 batches both setStates into one
-  // commit, so the streaming and finalized bubbles never co-exist for a frame.
+  // `pending` set = subscription active, `streamed` = in-flight assistant text. On
+  // `done`, finalize + clear in one handler call — React batches the setStates, so
+  // the streaming and finalized bubbles never co-exist for a frame.
   const [pending, setPending] = useState<Msg[] | null>(null);
   const [streamed, setStreamed] = useState('');
-  // Guards against duplicate `done` deliveries (StrictMode double-mount in
-  // dev, late frames after the subscription is already paused, etc.).
+  // Guards duplicate `done` deliveries (StrictMode double-mount, late frames).
   const finishedRef = useRef(true);
 
   useWatchSubscription(
@@ -61,8 +59,7 @@ function Chat() {
       },
       pause: pending === null,
     },
-    // On a transport reconnect useWatchSubscription starts accumulation over —
-    // the re-established stream re-runs the request and streams from the top.
+    // On transport reconnect the accumulator resets and the stream restarts from the top.
     (prev: string | undefined, data) => {
       const chunk = data.chatStream;
       const next = (prev ?? '') + chunk.delta;

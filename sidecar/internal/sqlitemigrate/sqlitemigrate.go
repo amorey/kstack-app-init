@@ -1,16 +1,10 @@
-// Package sqlitemigrate is a tiny, forward-only SQL migration runner for the
-// sidecar's SQLite databases. Each caller embeds its own numbered `*.sql` files
-// and hands them to Apply; the runner records progress in a schema_migrations
-// table and brings the DB up to the latest version.
+// Package sqlitemigrate is a forward-only SQL migration runner: each caller embeds its
+// own numbered `*.sql` files, and Apply records progress in a schema_migrations table.
 //
-// It is deliberately minimal — no down-migrations (the app ships a binary to
-// user machines and never rolls back a fleet), no external dependency. Each
-// migration runs in its own transaction so a crash mid-upgrade leaves the DB at
-// the last committed version and the next start resumes from there. A DB written
-// by a newer binary is refused rather than truncated.
-//
-// Used by both internal/cluster (per-cluster caches) and internal/appdb (durable
-// app-level state).
+// Deliberately minimal — no down-migrations (a shipped binary never rolls back a fleet),
+// no dependencies. Each migration runs in its own transaction, so a crash mid-upgrade
+// leaves the DB at the last committed version. A DB written by a newer binary is refused
+// rather than truncated. Used by internal/cluster's caches and internal/appdb.
 package sqlitemigrate
 
 import (
@@ -26,16 +20,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// OpenPool opens a modernc-sqlite connection pool at path with the sidecar's
-// standard PRAGMAs baked into the DSN — WAL journal, 5s busy_timeout,
-// synchronous=NORMAL, foreign_keys on, and immediate txlock so writes grab the
-// lock up front. maxConns caps the pool: pass 1 for a writer pool (writes
-// serialize at the pool instead of fighting at the SQLite layer), or a larger
-// value for a WAL reader pool. This is the single home for the sidecar's SQLite
-// open contract.
+// OpenPool is the single home for the sidecar's SQLite open contract: the standard
+// PRAGMAs in the DSN (WAL, 5s busy_timeout, synchronous=NORMAL, foreign_keys, immediate
+// txlock). maxConns 1 gives a writer pool that serializes at the pool rather than
+// fighting at the SQLite layer; larger is a WAL reader pool.
 func OpenPool(path string, maxConns int) (*sql.DB, error) {
-	// _pragma values are URL-encoded; modernc parses them and applies on each
-	// new connection.
+	// modernc applies these _pragma values on each new connection.
 	dsn := "file:" + path +
 		"?_pragma=journal_mode(WAL)" +
 		"&_pragma=busy_timeout(5000)" +
@@ -51,17 +41,16 @@ func OpenPool(path string, maxConns int) (*sql.DB, error) {
 	return db, nil
 }
 
-// migration is one numbered SQL file. Version comes from the leading digits of
-// the filename (e.g. 0001_init.sql -> 1) and is used both for ordering and as
-// the row id in schema_migrations.
+// migration is one numbered SQL file; version comes from the filename's leading digits
+// (0001_init.sql → 1) and is both the sort key and the schema_migrations row id.
 type migration struct {
 	version int
 	name    string
 	sql     string
 }
 
-// loadMigrations reads and validates the numbered `*.sql` files under dir in
-// fsys, returning them in version order. Versions must be unique and gap-free.
+// loadMigrations returns dir's `*.sql` files in version order; versions must be unique
+// and gap-free.
 func loadMigrations(fsys fs.FS, dir string) ([]migration, error) {
 	entries, err := fs.ReadDir(fsys, dir)
 	if err != nil {
@@ -72,9 +61,8 @@ func loadMigrations(fsys fs.FS, dir string) ([]migration, error) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
-		// Filenames look like NNNN_description.sql. Pull the leading digits as
-		// the version; anything non-numeric is a packaging bug, not user input,
-		// so surface it loudly.
+		// NNNN_description.sql; a non-numeric prefix is a packaging bug, not user
+		// input, so surface it loudly.
 		base := e.Name()
 		underscore := strings.IndexByte(base, '_')
 		if underscore <= 0 {
@@ -91,8 +79,8 @@ func loadMigrations(fsys fs.FS, dir string) ([]migration, error) {
 		out = append(out, migration{version: v, name: base, sql: string(b)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].version < out[j].version })
-	// Versions must be unique and gap-free so a missing file in a release is
-	// caught at startup, not after the schema is half-applied.
+	// Gap-free, so a file missing from a release is caught at startup rather than
+	// after the schema is half-applied.
 	for i, m := range out {
 		if m.version != i+1 {
 			return nil, fmt.Errorf("migration version gap: expected %d, got %d (%s)", i+1, m.version, m.name)
@@ -101,11 +89,8 @@ func loadMigrations(fsys fs.FS, dir string) ([]migration, error) {
 	return out, nil
 }
 
-// Apply brings db up to the latest migration found in fsys under dir. Files are
-// NNNN_name.sql, applied in version order, each in its own transaction, recorded
-// in a schema_migrations(version, name, applied_at) table. Returns the highest
-// version present in the DB after the call. A DB recorded newer than the
-// embedded set is refused.
+// Apply brings db up to dir's latest migration, each in its own transaction, and returns
+// the resulting version. A DB recorded newer than the embedded set is refused.
 func Apply(ctx context.Context, db *sql.DB, fsys fs.FS, dir string) (int, error) {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    INTEGER PRIMARY KEY,
@@ -128,8 +113,8 @@ func Apply(ctx context.Context, db *sql.DB, fsys fs.FS, dir string) (int, error)
 		return current, nil
 	}
 
-	// Refuse to open a DB written by a newer binary. Downgrading would
-	// otherwise silently truncate columns the new schema relies on.
+	// A DB written by a newer binary must be refused: downgrading would silently
+	// truncate columns the newer schema relies on.
 	latest := migs[len(migs)-1].version
 	if current > latest {
 		return current, fmt.Errorf("database schema version %d is newer than binary supports (%d)", current, latest)

@@ -21,9 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// Kind identifies the collection one worker mirrors. It is the sync child's spec in the
-// terms this package needs: where to list/watch (APIVersion + Resource), and how to key
-// the rows (Kind).
+// Kind identifies the collection one worker mirrors: where to list/watch (APIVersion +
+// Resource) and how to key the rows (Kind).
 type Kind struct {
 	APIVersion string
 	Kind       string
@@ -42,14 +41,10 @@ func (k Kind) scope() string {
 // group returns the api group of the kind's APIVersion ("" for the core group).
 func (k Kind) group() string { return apiGroup(k.APIVersion) }
 
-// isCRD reports whether the kind is a custom resource, which the kind_catalog records so
-// the UI can group built-ins apart from a cluster's own kinds.
-//
-// Discovery doesn't say, and asking would mean a second request per kind against the
-// CRD API, so this is decided from the api group: Kubernetes ships the core group, a
-// fixed handful of legacy unsuffixed groups, and everything else under *.k8s.io. A CRD
-// group is a domain the cluster's operators own. It can be wrong for a CRD deliberately
-// installed under a k8s.io group, which is a display nuance, not a correctness one.
+// isCRD reports whether the kind is a custom resource, recorded so the UI can group
+// built-ins apart. Discovery doesn't say and asking costs a request per kind, so it's
+// inferred from the api group (built-ins are core, a few legacy groups, or *.k8s.io).
+// Wrong for a CRD installed under a k8s.io group — a display nuance, not correctness.
 func (k Kind) isCRD() bool {
 	g := k.group()
 	if g == "" || strings.HasSuffix(g, ".k8s.io") {
@@ -62,8 +57,7 @@ func (k Kind) isCRD() bool {
 	return true
 }
 
-// GVR resolves the kind to the endpoint the dynamic client addresses. The core group is
-// spelled as a bare version ("v1"), everything else as "group/version".
+// GVR resolves the kind to the dynamic client's endpoint (core group as a bare "v1").
 func (k Kind) GVR() (schema.GroupVersionResource, error) {
 	if k.APIVersion == "" || k.Resource == "" {
 		return schema.GroupVersionResource{}, fmt.Errorf("objectsync: incomplete kind %+v", k)

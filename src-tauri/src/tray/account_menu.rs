@@ -12,13 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Auth-session domain logic for the account tray feature.
-//!
-//! Pure, dependency-light helpers: stable menu-id constants, the account-state
-//! descriptor, and the converter from a gRPC `AuthState` snapshot. The
-//! tray/menu wiring that consumes these — and the gRPC watch RPCs that feed
-//! them — lives in the parent [`super`] module (`tray`). Everything here is
-//! unit-tested.
+//! Pure, unit-tested account-section logic: menu-id constants, the
+//! account-state descriptor, and the converter from a gRPC `AuthState`
+//! snapshot. Tray wiring lives in [`super`].
 
 use crate::services::sidecar::AuthState;
 

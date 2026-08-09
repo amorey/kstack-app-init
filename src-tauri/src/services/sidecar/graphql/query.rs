@@ -12,12 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! HTTP client the host uses to forward GraphQL queries to the sidecar.
-//!
-//! One fresh HTTP/1 connection per call (`Connection: close`). The sidecar
-//! listens on a UDS / named pipe, so connect cost is sub-millisecond —
-//! caching the connection isn't worth the reconnect-on-stale logic and the
-//! mutex held across each round-trip. hyper is kept only for the parser.
+//! Forwards GraphQL queries to the sidecar. One fresh HTTP/1 connection per
+//! call (`Connection: close`) — UDS/pipe connect is sub-ms, so pooling isn't
+//! worth the reconnect-on-stale logic. hyper is kept only for the parser.
 
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
@@ -29,15 +26,10 @@ use thiserror::Error;
 use super::super::ipc::{self, Endpoint};
 use crate::error::{AppError, Result};
 
-/// What went wrong on a single host↔sidecar HTTP call.
-///
-/// All variants collapse to `AppError::Io` at the command boundary, but the
-/// phase is kept for diagnostics:
-///
-///   * `Connect` — couldn't dial the endpoint; usually the sidecar isn't
-///     running or hasn't bound yet.
-///   * `Io` — connected, then the stream broke mid-request or mid-response.
-///   * `Protocol` — read bytes that didn't parse as valid HTTP/UTF-8/etc.
+/// Failure phase of one host↔sidecar HTTP call (`Connect` = couldn't dial,
+/// `Io` = stream broke mid-flight, `Protocol` = unparseable bytes). All
+/// collapse to `AppError::Io` at the command boundary; the phase survives in
+/// the `Display` text.
 #[derive(Debug, Error)]
 enum TransportError {
     #[error("connect: {0}")]
@@ -49,9 +41,8 @@ enum TransportError {
 }
 
 impl From<TransportError> for AppError {
-    /// All transport failures cross the boundary as `AppError::Io`, which the
-    /// frontend's `invokeFetch` adapter throws and urql turns into a retryable
-    /// `networkError`. The variant survives in the error `Display` for debugging.
+    /// `AppError::Io` → the frontend's `invokeFetch` throws → urql retries it
+    /// as a `networkError`.
     fn from(err: TransportError) -> Self {
         match err {
             TransportError::Connect(e) | TransportError::Io(e) => AppError::Io(e),
@@ -62,33 +53,25 @@ impl From<TransportError> for AppError {
     }
 }
 
-/// Defensive cap on the response body the host will collect: well above any
-/// realistic GraphQL payload, so a runaway or malicious sidecar can't drag the
-/// host's memory down with it. Anything larger errors out.
+/// Defensive response-body cap so a runaway sidecar can't drag the host's
+/// memory down.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Per-request wall-clock budget covering connect + write + read. Without it a
-/// sidecar that accepts the connection but stalls its handler would park
-/// `send_request`/the body collect forever, leaving the Tauri command unresolved
-/// and urql with no `networkError` to retry. Generous: anything exceeding it is
-/// stuck, not slow.
+/// Wall-clock budget for connect + write + read. Without it a stalled handler
+/// parks the Tauri command forever, leaving urql no `networkError` to retry.
+/// Generous: anything exceeding it is stuck, not slow.
 const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What [`QueryClient::query`] hands back. Status is separate from the body so
-/// the frontend's `invokeFetch` adapter can build a `Response` with the real HTTP
-/// status: `Err` is reserved for transport failures (urql retries those), while
-/// 4xx/5xx with valid GraphQL error bodies travel as `Ok` and reach urql as
-/// non-retryable server errors.
+/// Status is separate from body so `invokeFetch` can build a `Response` with
+/// the real HTTP status: `Err` is reserved for transport failures (urql
+/// retries those); 4xx/5xx travel as `Ok` — non-retryable server errors.
 #[derive(Debug, Serialize)]
 pub struct GraphqlResponse {
     pub status: u16,
     pub body: String,
 }
 
-/// Forwards GraphQL HTTP requests from the host to the sidecar.
-///
-/// Stateless: holds only the endpoint address, and each call opens, uses, and
-/// drops its own HTTP/1 connection.
+/// Stateless GraphQL forwarder: one owned HTTP/1 connection per call.
 pub struct QueryClient {
     path: Endpoint,
 }
@@ -98,17 +81,14 @@ impl QueryClient {
         Self { path }
     }
 
-    /// Forwards a GraphQL query/mutation body to the sidecar's `/graphql`
-    /// endpoint and returns the response body alongside its HTTP status.
-    ///
-    /// Transport errors map to [`AppError::Io`] (retryable `networkError` via
-    /// `invokeFetch`); HTTP non-2xx is not a transport error and travels through
-    /// as `Ok` with `status` set for the frontend to treat as a server error.
+    /// Forwards a query/mutation to `/graphql`. Transport errors →
+    /// [`AppError::Io`]; HTTP non-2xx is NOT an error — it travels as `Ok`
+    /// with the real status.
     pub async fn query(&self, body: String) -> Result<GraphqlResponse> {
         match tokio::time::timeout(REQUEST_BUDGET, self.try_query(body)).await {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(err)) => {
-                // Log the variant, which the `AppError::Io` at the boundary loses.
+                // Log the phase, which the boundary's `AppError::Io` loses.
                 tracing::warn!(target: "sidecar", %err, "query failed");
                 Err(err.into())
             }
@@ -126,9 +106,8 @@ impl QueryClient {
         &self,
         body: String,
     ) -> std::result::Result<GraphqlResponse, TransportError> {
-        // Open and own the connection for exactly this request. Hyper's
-        // connection-driver task ends when `sender` drops (after the body
-        // is collected below).
+        // Hyper's connection-driver task ends when `sender` drops (after the
+        // body collect).
         let stream = ipc::connect(&self.path).await.map_err(|e| match e {
             AppError::Io(io) => TransportError::Connect(io),
             other => TransportError::Protocol(other.to_string()),
@@ -145,13 +124,11 @@ impl QueryClient {
 
         let req = Request::builder()
             .method("POST")
-            // Sidecar exposes GraphQL at `/graphql` (server.go); that path is
-            // the contract.
+            // `/graphql` is the contract (sidecar server.go).
             .uri("/graphql")
             // hyper requires a Host header on HTTP/1.1, even over UDS.
             .header("host", "sidecar.local")
             .header("content-type", "application/json")
-            // We don't reuse the connection across calls.
             .header("connection", "close")
             .body(Full::new(Bytes::from(body)))
             .map_err(|e| TransportError::Protocol(format!("build request: {e}")))?;
@@ -161,8 +138,8 @@ impl QueryClient {
             .await
             .map_err(|e| TransportError::Io(std::io::Error::other(e)))?;
         let status = response.status();
-        // `Limited` short-circuits as soon as the running byte count
-        // would exceed the cap, regardless of what Content-Length claimed.
+        // `Limited` short-circuits once the running count exceeds the cap,
+        // regardless of Content-Length.
         let bytes = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
             .collect()
             .await

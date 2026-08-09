@@ -12,13 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Tracks whether the current window is maximized, so the frameless Linux/Windows
-// chrome (`WindowFrame`, `WindowResizeHandles`) can collapse its border/shadow
-// gutter and hide the resize grips when there's no off-window space to draw into
-// — matching how native apps drop their rounded corners + drop shadow while
-// maximized. The Tauri JS API has no dedicated maximize event, so we re-query
-// `isMaximized()` on every `onResized` (which fires on maximize/unmaximize/resize).
-// Always false on macOS, where the native decorations own this behavior.
+// Is the window maximized? Drives the frameless chrome's collapse (`WindowFrame`,
+// `WindowResizeHandles`). Tauri's JS API has no maximize event, so re-query
+// `isMaximized()` on every `onResized`. Always false on macOS (native decorations).
 import { useEffect, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 

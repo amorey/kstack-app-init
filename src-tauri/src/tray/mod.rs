@@ -12,15 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The system tray icon, its context menu, and the host-internal gRPC
-//! auth-state watch that keeps the account section live.
-//!
-//! The Tauri wiring lives here; the pure, unit-tested domain logic behind the
-//! account section (menu-id constants, descriptor building) lives in
-//! [`account_menu`]. [`build_tray`] and [`spawn_authstate_subscription`] are each
-//! called once during app setup (see `lib.rs`). The menu event handler routes
-//! user actions — opening or focusing windows, signing in/out, quitting —
-//! through the shared [`AppState`].
+//! System tray icon + context menu + the gRPC auth-state watch that keeps the
+//! account section live. Tauri wiring lives here; the pure account-section
+//! logic lives in [`account_menu`]. [`build_tray`] and
+//! [`spawn_authstate_subscription`] each run once during setup (`lib.rs`).
 
 pub mod account_menu;
 
@@ -37,12 +32,9 @@ use account_menu::{
     ACCOUNT_LOGOUT_ID, ACCOUNT_SETTINGS_ID,
 };
 
-/// Holds the latest gRPC snapshot for the tray's account watch stream so each
-/// rebuild sees the most-recent state. Starts as `None` and renders as its safe
-/// default (SignedOut) until the stream delivers. Protected by a plain
-/// `std::sync::Mutex`: the critical section is tiny and synchronous — no `.await`
-/// is ever held under the lock — so poisoning uses
-/// `unwrap_or_else(|p| p.into_inner())`.
+/// Latest account-watch snapshot; `None` renders as SignedOut until the stream
+/// delivers. Plain `std::sync::Mutex` — no `.await` is ever held under the
+/// lock.
 #[derive(Default)]
 pub(crate) struct TraySnapshots {
     account: Option<account_menu::AccountSnapshot>,
@@ -51,27 +43,15 @@ pub(crate) struct TraySnapshots {
 /// Base URL for the kstack cloud dashboard.
 const KSTACK_CLOUD_DASHBOARD_URL: &str = "https://app.kstack.sh";
 
-/// Stable id for the system tray icon, so the watch supervisor can look it up
-/// via [`Manager::tray_by_id`] and swap its menu without owning the handle.
+/// Stable tray id so the watch supervisor can swap the menu via
+/// [`Manager::tray_by_id`] without owning the handle.
 const TRAY_ID: &str = "main";
 
-/// Builds and installs the system tray icon and its context menu.
-///
-/// The menu offers "New Window", "Show Main Window", and "Quit", routed through
-/// the [`AppState`] `window_manager` (Quit exits via [`AppHandle::exit`]).
-/// Window-manager failures are logged rather than propagated, since menu
-/// callbacks cannot return errors.
-///
-/// # Errors
-///
-/// Returns an error if any menu item or the tray icon fails to build.
-///
-/// # Panics
-///
-/// Panics if the app has no default window icon.
+/// Builds and installs the system tray icon and menu. Menu callbacks can't
+/// return errors, so failures are logged. Panics if the app has no default
+/// window icon.
 pub fn build_tray(app: &AppHandle) -> Result<()> {
-    // Start signed-out; the account watch supervisor populates it on its first
-    // frame (see spawn_authstate_subscription below).
+    // Start signed-out; the account watch supervisor populates on first frame.
     let menu = build_tray_menu(app, AccountMenuDescriptor::SignedOut)?;
 
     TrayIconBuilder::with_id(TrayIconId::new(TRAY_ID))
@@ -84,9 +64,8 @@ pub fn build_tray(app: &AppHandle) -> Result<()> {
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
 
-            // Account auth actions — async RPCs, fire-and-forget; the result
-            // comes back through the auth-state watch stream and rebuilds the
-            // menu automatically.
+            // Auth actions: fire-and-forget RPCs; the result comes back through
+            // the watch stream and rebuilds the menu.
             match id {
                 ACCOUNT_LOGIN_ID => {
                     let app = app.clone();
@@ -125,12 +104,9 @@ pub fn build_tray(app: &AppHandle) -> Result<()> {
             }
 
             match id {
-                // Build off the main thread: a main-thread WebView2 build
-                // deadlocks on Windows (see `commands::new_window`). The tray
-                // menu event fires on the main thread, so hand the build to the
-                // blocking pool — `build()` parks its thread until the window
-                // exists, so it must not sit on an async worker — and let the
-                // event loop stay free to pump.
+                // Tray events fire on the main thread; window builds must go to
+                // the blocking pool — never the main thread (WebView2
+                // deadlock) or an async worker (see `commands::new_window`).
                 "tray_new_window" => {
                     let app = app.clone();
                     tauri::async_runtime::spawn_blocking(move || {
@@ -160,10 +136,8 @@ pub fn build_tray(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// Builds the full system-tray menu, including the account section. Used both
-/// for the initial tray build and for every rebuild triggered by the account
-/// watch stream, so the static items (New Window / Show Main Window / Quit) stay
-/// defined in one place.
+/// Builds the full tray menu (account section + static items) — used for the
+/// initial build and every watch-triggered rebuild.
 fn build_tray_menu(app: &AppHandle, account: AccountMenuDescriptor) -> tauri::Result<Menu<Wry>> {
     let new_window = MenuItem::with_id(app, "tray_new_window", "New Window", true, None::<&str>)?;
     let show_main = MenuItem::with_id(
@@ -219,15 +193,11 @@ fn build_tray_menu(app: &AppHandle, account: AccountMenuDescriptor) -> tauri::Re
     )
 }
 
-/// Rebuilds the full tray menu from the latest account snapshot stored in
-/// [`AppState::tray`]. The account watch supervisor calls this whenever its
-/// stream delivers a new frame.
-///
-/// muda requires menu mutation on the main thread, so the work is queued via
-/// [`AppHandle::run_on_main_thread`] rather than run on the stream-reader task.
+/// Rebuilds the tray menu from the snapshot in [`AppState::tray`]. muda
+/// requires menu mutation on the main thread, hence
+/// [`AppHandle::run_on_main_thread`].
 fn rebuild_tray_menu(app: &AppHandle) {
-    // Extract the account snapshot under the lock, release before the main-thread
-    // dispatch — no .await is ever held under this lock.
+    // Snapshot under the lock, release before the main-thread dispatch.
     let account_snap = {
         let state = app.state::<AppState>();
         let guard = state.tray.lock().unwrap_or_else(|p| p.into_inner());
@@ -256,23 +226,13 @@ fn rebuild_tray_menu(app: &AppHandle) {
     }
 }
 
-/// Starts the host-internal gRPC auth-state watch that keeps the tray's account
-/// section live, and supervises it for the app's lifetime.
-///
-/// The first frame (a full snapshot) populates the account section; subsequent
-/// frames track session changes (sign-in, sign-out, token refresh carrying the
-/// same `authenticated` bit). Resilience mirrors the renderer's GraphQL
-/// reconnect, which this host-internal stream doesn't get for free:
-/// failed opens retry with capped backoff; a stream that ends after delivering
-/// data reconnects promptly; one that ends without data backs off to avoid
-/// busy-looping.
-///
-/// The task only ends when the app exits.
+/// Supervises the gRPC auth-state watch for the app's lifetime. First frame is
+/// a full snapshot; failed opens retry with capped backoff; a stream that ends
+/// after delivering data reconnects promptly, one that ends without data backs
+/// off (no busy-loop).
 pub fn spawn_authstate_subscription(app: &AppHandle) {
     /// First retry delay; doubles each failure up to `MAX_BACKOFF`.
     const BASE_BACKOFF: Duration = Duration::from_millis(500);
-    /// Ceiling for the backoff so a sidecar that never comes up doesn't
-    /// stretch the retry interval unboundedly.
     const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
     let app = app.clone();
@@ -299,8 +259,6 @@ pub fn spawn_authstate_subscription(app: &AppHandle) {
                         match msg {
                             Ok(Some(auth_state)) => {
                                 saw_snapshot = true;
-                                // Store the new auth snapshot, then rebuild the
-                                // menu from it.
                                 {
                                     let app_state = app.state::<AppState>();
                                     app_state

@@ -36,137 +36,98 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
-// ClusterService is the boundary between the frontend (GraphQL today, gRPC
-// later) and the cluster backend. Every beehive detail — names, the
-// Cluster → ClusterCache owner chain, the spec/status split, the delta-watch
-// mapping — lives behind it, so callers deal only in the domain Cluster /
-// ClusterCache types.
+// ClusterService is the frontend-facing boundary of the cluster backend; every
+// beehive detail (names, owner chain, spec/status split, delta-watch mapping)
+// lives behind it. Delta watches follow docs/adr/2026-08-09-delta-watch-protocol.md;
+// watch channels close when ctx ends.
 type ClusterService interface {
-	// List returns every tracked cluster that is not deletion-pending. Cache sync
-	// status is not joined in — it is read via the cache watch and joined by the
-	// caller.
+	// List returns every tracked, non-deletion-pending cluster. Cache sync status
+	// is joined by the caller via WatchCaches.
 	List(ctx context.Context) ([]*Cluster, error)
-	// Get returns one cluster by id, or (nil, nil) when it is unknown or
-	// deletion-pending.
+	// Get returns one cluster by id, or (nil, nil) when unknown or deletion-pending.
 	Get(ctx context.Context, id ClusterID) (*Cluster, error)
-	// Watch streams the cluster list as a Kubernetes-style delta watch: the current
-	// set as Added changes on subscribe (the snapshot), then one Added/Modified/
-	// Deleted change per cluster. A deletion-pending cluster is surfaced as Deleted.
-	// The channel closes when ctx ends.
+	// Watch streams the cluster list as a delta watch; deletion-pending surfaces
+	// as Deleted.
 	Watch(ctx context.Context) (<-chan ClusterChange, error)
-	// WatchCaches streams cache records as a Kubernetes-style delta watch parallel to
-	// Watch — the current set as Added changes, then per-cache Added/Modified/Deleted.
-	// Standalone (no parent join); the caller joins caches onto clusters by
-	// ClusterID. The channel closes when ctx ends.
+	// WatchCaches streams cache records as a parallel delta watch; the caller
+	// joins caches onto clusters by ClusterID.
 	WatchCaches(ctx context.Context) (<-chan ClusterCacheChange, error)
-	// WatchGVRDiscoveries streams the caches' GVR-discovery children as a third
-	// independent delta watch — one per cache, joined onto caches by CacheID the
-	// same way, and one stream per child kind for the reason given on
-	// ClusterCacheGVRDiscovery. Unscoped because there is exactly one per cache.
+	// WatchGVRDiscoveries streams the caches' GVR-discovery children, joined onto
+	// caches by CacheID. Unscoped: exactly one per cache.
 	WatchGVRDiscoveries(ctx context.Context) (<-chan ClusterCacheGVRDiscoveryChange, error)
-	// WatchCacheSyncHealth streams every cache's sync verdict, folded from its per-kind
-	// records — the whole-cache rollup an always-mounted consumer can carry, since the
-	// per-kind stream is a hundred-plus records per cache.
+	// WatchCacheSyncHealth streams every cache's sync verdict folded from its
+	// per-kind records — the whole-cache rollup an always-mounted consumer carries.
 	WatchCacheSyncHealth(ctx context.Context) (<-chan ClusterCacheSyncHealth, error)
 	// ClusterCacheGVRSyncEvents returns one synced kind's beehive event timeline.
 	ClusterCacheGVRSyncEvents(ctx context.Context, id ClusterCacheGVRSyncID, category *string, limit *int) ([]Event, error)
 	// ClusterCacheGVRSyncEventsWatch streams one synced kind's event log as bare runs.
 	ClusterCacheGVRSyncEventsWatch(ctx context.Context, id ClusterCacheGVRSyncID, category *string) (<-chan Event, error)
-	// WatchGVRSyncs streams one cache's per-kind sync records as a delta stream. Scoped
-	// to a cache — unlike the watches above — because there is one record per served
-	// kind, so an unscoped stream would be a firehose for an always-mounted consumer.
+	// WatchGVRSyncs streams one cache's per-kind sync records. Cache-scoped: one
+	// record per served kind, so an unscoped stream would be a firehose.
 	WatchGVRSyncs(ctx context.Context, cacheID ClusterCacheID) (<-chan ClusterCacheGVRSyncChange, error)
-	// ClusterCacheStatsWatch streams one cache's contents as a live gauge — the current
-	// measurement on subscribe, then a fresh one whenever it changes. A stream rather
-	// than a field on ClusterCache because a settled cache's object never changes, so a
-	// field there would freeze at whatever the cache held when the client subscribed.
+	// ClusterCacheStatsWatch streams one cache's contents as a live gauge. A
+	// stream, not a ClusterCache field: a settled cache's object never changes,
+	// so a field would freeze at subscribe time.
 	ClusterCacheStatsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCacheStats, error)
-	// GVRSyncStats returns one synced kind's freshness stamps, out of band from the
-	// object watch for the reason on ClusterCacheGVRSyncStats.
+	// GVRSyncStats returns one synced kind's freshness stamps (out of band from
+	// the object watch; see ClusterCacheGVRSyncStats).
 	GVRSyncStats(ctx context.Context, id ClusterCacheGVRSyncID) (*ClusterCacheGVRSyncStats, error)
-	// GVRSyncStatsSnapshot returns every synced kind's stamps in one read — what the
-	// sync-health rollup folds, taken under a single lock.
+	// GVRSyncStatsSnapshot returns every synced kind's stamps under one lock —
+	// what the sync-health rollup folds.
 	GVRSyncStatsSnapshot() map[ClusterCacheGVRSyncID]ClusterCacheGVRSyncStats
-	// GVRDiscoveryStats returns one discovery record's live gauges — when its last pass
-	// reached the API server and how many kinds it saw — read on request from the
-	// controller's memory. nil when this process has run no pass for that record yet.
-	// Out of band from the object watch on purpose: nothing in the object graph reacts to
-	// these, so putting them in status would wake the record's dependents every pass to
-	// propagate a number only a UI reads (see ClusterCacheGVRDiscoveryStatus).
+	// GVRDiscoveryStats returns one discovery record's live gauges from controller
+	// memory; nil before this process's first pass. Out of status so a pass never
+	// wakes dependents for a UI-only number (see ClusterCacheGVRDiscoveryStatus).
 	GVRDiscoveryStats(ctx context.Context, id ClusterCacheGVRDiscoveryID) (*ClusterCacheGVRDiscoveryStats, error)
-	// CacheStats returns live on-disk statistics for one ClusterCache, located by
-	// its parent ClusterID (the cache directory) and its own ClusterCacheID (the
-	// cache file). A cluster can own several caches, so stats are per-cache, not
-	// per-cluster.
+	// CacheStats returns live on-disk statistics for one ClusterCache (per-cache,
+	// not per-cluster: a cluster can own several caches).
 	CacheStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*ClusterCacheStats, error)
-	// ClusterDataKinds returns the kinds a cluster's API server advertises, read from one
-	// ClusterCache's discovered catalog (by parent ClusterID + cache id, like
-	// CacheStats). Empty when that cache's db isn't open (never synced / sync paused).
-	// Read on demand (not streamed).
+	// ClusterDataKinds returns one cache's discovered kind catalog; empty when
+	// that cache's db isn't open.
 	ClusterDataKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) ([]ClusterDataKind, error)
-	// ClusterDataKindsWatch streams one ClusterCache's kind catalog as a delta watch:
-	// the current catalog as an Added burst on subscribe, then Added/Modified/Deleted
-	// changes as the syncs write objects (so per-kind counts update live). Empty
-	// (no frames) when that cache's db isn't open, mirroring ClusterDataKinds' posture.
+	// ClusterDataKindsWatch streams one cache's kind catalog as a delta watch
+	// (per-kind counts update live). No frames while the cache's db isn't open.
 	ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataKindChange, error)
-	// ClusterDataEventsWatch streams one ClusterCache's cached Kubernetes Events as a
-	// delta watch: the newest window of events as an Added burst on subscribe, then
-	// Added/Modified/Deleted changes as the Event sync writes. Empty (no
-	// frames) when that cache's db isn't open, mirroring ClusterDataKindsWatch's
-	// posture. Wakes on the events-only store broker, so an event burst never drives
-	// the kind-catalog re-read.
+	// ClusterDataEventsWatch streams one cache's cached Kubernetes Events (newest
+	// window) as a delta watch, keyed by event UID. Wakes on the events-only
+	// broker, so an event burst never drives the kind-catalog re-read. No frames
+	// while the db isn't open.
 	ClusterDataEventsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataEventChange, error)
-	// ClusterDataObjectsWatch streams one kind's cached objects from a ClusterCache as a
-	// delta watch (by parent ClusterID + cache id, plus apiVersion + resource): the
-	// current object set for the kind as an Added burst on subscribe, then
-	// Added/Modified/Deleted per object keyed by UID. Empty (no frames) when that cache's
-	// db isn't open or the kind hasn't synced, mirroring ClusterDataEventsWatch's posture.
+	// ClusterDataObjectsWatch streams one kind's cached objects as a delta watch
+	// keyed by UID. No frames while the db isn't open or the kind hasn't synced.
 	ClusterDataObjectsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterDataObjectChange, error)
 	// ClusterEvents returns a cluster's beehive event timeline (newest run first),
-	// optionally filtered to one category and bounded by limit. Decoupled from the
-	// cluster/list watch — event chatter never re-emits the cluster.
+	// optionally filtered by category and bounded by limit. Decoupled from Watch —
+	// event chatter never re-emits the cluster.
 	ClusterEvents(ctx context.Context, id ClusterID, category *string, limit *int) ([]Event, error)
-	// ClusterEventsWatch streams a cluster's event log as bare runs — the matching
-	// runs as a snapshot, then live runs, conflating per run id (the consumer
-	// upserts by Event.ID). Independent of Watch. The channel closes when ctx ends.
+	// ClusterEventsWatch streams a cluster's event log as bare runs (snapshot then
+	// live; the consumer upserts by Event.ID). Independent of Watch.
 	ClusterEventsWatch(ctx context.Context, id ClusterID, category *string) (<-chan Event, error)
-	// ClusterCacheEvents returns a ClusterCache's beehive event timeline (newest run
-	// first), the ClusterCache-kind counterpart of ClusterEvents — keyed by the
-	// cache's own ClusterCacheID (e.g. the sync-event history, category "sync").
+	// ClusterCacheEvents is the ClusterCache-kind counterpart of ClusterEvents.
 	ClusterCacheEvents(ctx context.Context, id ClusterCacheID, category *string, limit *int) ([]Event, error)
-	// ClusterCacheEventsWatch streams a ClusterCache's event log as bare runs, the
-	// ClusterCache-kind counterpart of ClusterEventsWatch. The channel closes when
-	// ctx ends.
+	// ClusterCacheEventsWatch is the ClusterCache-kind counterpart of ClusterEventsWatch.
 	ClusterCacheEventsWatch(ctx context.Context, id ClusterCacheID, category *string) (<-chan Event, error)
-	// ClusterScheduleWatch streams a cluster's reconcile-schedule gauge (the next
-	// requeue time), current-on-subscribe then on every (re)schedule. A scheduling
-	// change fires no object WatchList, so this is the live source for the UI's
-	// next-attempt countdown. The channel closes when ctx ends.
+	// ClusterScheduleWatch streams a cluster's reconcile-schedule gauge (next
+	// requeue time) — the live source for the UI's next-attempt countdown, since
+	// a scheduling change fires no object WatchList.
 	ClusterScheduleWatch(ctx context.Context, id ClusterID) (<-chan Schedule, error)
-	// SetEnabled enables or disables a cluster in the app (connection eligibility
-	// + visibility in pickers) and returns the updated record.
+	// SetEnabled enables or disables a cluster and returns the updated record.
 	SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)
 	// SetSyncEnabled toggles a cluster's sync and returns the updated record.
 	SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)
-	// RetryConnection forces an immediate out-of-band re-probe of the cluster's
-	// connection. The outcome lands on the record's conditions and reaches
-	// watchers through Watch.
+	// RetryConnection forces an immediate out-of-band re-probe; the outcome lands
+	// on the record's conditions and reaches watchers through Watch.
 	RetryConnection(ctx context.Context, id ClusterID) error
-	// ClearCache deletes the on-disk cache and bounces its syncs; the
-	// (returned) record stays.
+	// ClearCache deletes the on-disk cache and bounces its syncs; the record stays.
 	ClearCache(ctx context.Context, id ClusterID) (*Cluster, error)
-	// Delete removes the cluster by deleting the Cluster object so beehive GC
-	// cascades to ClusterCache.
+	// Delete deletes the Cluster object; beehive GC cascades to ClusterCache.
 	Delete(ctx context.Context, id ClusterID) error
-	// GetConnection returns the live REST config for id, or nil if the cluster
-	// is not currently connected.
+	// GetConnection returns the live REST config for id, or nil when not connected.
 	GetConnection(id ClusterID) *rest.Config
 }
 
-// coreController is the subset of *ClusterCoreController that Service drives: the
-// background-worker lifecycle and the targeted out-of-band re-probe entry point.
-// Holding it behind an interface lets the white-box service tests inject a fake
-// (so the dispatch path has no production nil-guard).
+// coreController is the subset of *ClusterCoreController that Service drives.
+// An interface so white-box service tests inject a fake (no production nil-guard).
 type coreController interface {
 	StartBackground()
 	StopBackground()
@@ -176,34 +137,24 @@ type coreController interface {
 	WatchProbe(ctx context.Context, id ClusterID) <-chan bool
 }
 
-// controllerRuntime is the cluster subsystem's shared controller environment — beehive's
-// Manager analogue. It bundles the singletons every controller draws from, so a
-// controller constructor takes one *controllerRuntime plus only its own specifics (a config
-// source, probe fakes, …) instead of threading the shared infra through each call,
-// and adding a new shared dep is a one-field change rather than a churn of every
-// constructor signature.
-//
-// It deliberately holds the beehive instance rather than a bag of every kind's typed
-// client: beehive.NewClient is a trivial {bh, gk} wrapper, so a controller mints
-// exactly the typed clients it needs from rt.bh — keeping the kinds a controller
-// touches explicit in its own constructor, instead of a shared struct that hides them
-// (and that every controller test would have to fully populate). connMgr / cacheManager
-// / pokeSvc are true singletons shared broadly, so they live here directly. Any field
-// may be nil in a test that doesn't exercise the paths using it.
+// controllerRuntime is the shared controller environment (beehive's Manager
+// analogue): controller constructors take one *controllerRuntime plus their own
+// specifics. It holds the beehive instance, not per-kind clients — each controller
+// mints the typed clients it needs from rt.bh, keeping its kinds explicit. Any
+// field may be nil in a test that doesn't exercise it.
 type controllerRuntime struct {
 	bh           *beehive.Beehive
 	connMgr      *ConnectionManager
 	cacheManager *store.Manager
 	pokeSvc      *poke.Service
-	// cachePolicies is the per-cache client budget (rate limiter + LIST semaphore), shared
-	// by the sync and discovery controllers because they talk to the same cluster on the
-	// same cache's behalf. Lazily created by whichever controller is built first, so a test
-	// that constructs a bare runtime still gets one.
+	// cachePolicies is the per-cache client budget (rate limiter + LIST semaphore),
+	// shared by the sync and discovery controllers; lazily created so a bare test
+	// runtime still gets one.
 	cachePolicies *cacheClientPolicies
 }
 
-// policies returns the runtime's per-cache client budgets, creating the registry on first
-// use so every controller built from one runtime shares it.
+// policies returns the runtime's per-cache client budgets, created on first use
+// so every controller built from one runtime shares them.
 func (rt *controllerRuntime) policies() *cacheClientPolicies {
 	if rt.cachePolicies == nil {
 		rt.cachePolicies = newCacheClientPolicies()
@@ -211,10 +162,9 @@ func (rt *controllerRuntime) policies() *cacheClientPolicies {
 	return rt.cachePolicies
 }
 
-// Service is the concrete ClusterService and the whole cluster control plane: it
-// owns the beehive store + instance, the kubeconfig watcher, the two beehive
-// clients, the two controllers (registered with beehive in New), the kubeconfig
-// importer, the connection manager, and the per-cluster cache manager.
+// Service is the concrete ClusterService and the whole cluster control plane:
+// beehive store + instance, kubeconfig watcher, beehive clients, controllers,
+// importer, connection manager, and per-cluster cache manager.
 type Service struct {
 	bh      *beehive.Beehive
 	bhStore beehive.Store
@@ -223,16 +173,15 @@ type Service struct {
 
 	coreClient  beehive.Client[ClusterSpec, ClusterStatus]
 	cacheClient beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
-	// gvrDiscoveryClient and gvrSyncClient read the cache's sync subtree for the watches
-	// below. Read-only here: their specs belong to the controllers that own them.
+	// gvrDiscoveryClient and gvrSyncClient are read-only here; their specs belong
+	// to the controllers that own them.
 	gvrDiscoveryClient beehive.Client[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus]
 	gvrSyncClient      beehive.Client[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus]
 	cacheManager       *store.Manager
 	connMgr            *ConnectionManager
 	coreCtrl           coreController
 	cacheCtrl          *ClusterCacheController
-	// gvrDiscoveryCtrl is read for its live gauges (GVRDiscoveryStats) — the controller
-	// owns them in memory, so the read goes through it rather than the store.
+	// gvrDiscoveryCtrl is read for its in-memory live gauges (GVRDiscoveryStats).
 	gvrDiscoveryCtrl *ClusterCacheGVRDiscoveryController
 	// gvrSyncCtrl is held for its worker drain at shutdown.
 	gvrSyncCtrl *ClusterCacheGVRSyncController
@@ -242,99 +191,63 @@ type Service struct {
 	syncHealthMu   sync.Mutex
 	syncHealth     *watch.Hub[syncHealthSnapshot]
 	syncHealthStop context.CancelFunc
-	// syncHealthDone closes when the fold goroutine has fully unwound, which is what makes
-	// "the fold goes first" at shutdown true: its two fleet-wide WatchList leases are
-	// released in its defers, so cancelling and moving on would let beehive begin draining
-	// while the fold was still inside a flush.
+	// syncHealthDone closes when the fold goroutine has fully unwound — its WatchList
+	// leases release in its defers, so shutdown must wait for it before beehive drains.
 	syncHealthDone chan struct{}
-	// syncHealthFoldExit is a test seam: when set it runs as the fold's last act, just
-	// before it signals that it has unwound. Nil in production.
+	// syncHealthFoldExit is a test seam run as the fold's last act; nil in production.
 	syncHealthFoldExit func()
-	// syncHealthClosed latches at shutdown. Without it the lazy start would treat "no hub"
-	// as "not started yet" and build a NEW fold for a subscriber that arrived between the
-	// stop and beehive's — one anchored to a fresh background context whose canceller had
-	// just been discarded, holding beehive watches while beehive is being torn down, with
-	// nothing left that would ever stop it.
+	// syncHealthClosed latches at shutdown so a late subscriber can't lazily start a
+	// new, unstoppable fold against a beehive being torn down.
 	syncHealthClosed bool
 
 	importer *KubeconfigImporter
 	pokeSvc  *poke.Service
 
-	// dataKindsDebounce bounds how often ClusterDataKindsWatch re-reads and diffs the
-	// kind catalog. A busy cluster pings the store on every object write; each re-read
-	// runs Kinds' count-join over the object index, so a burst of pings is
-	// coalesced into one re-read per interval (trailing edge) to keep the reader from
-	// aggregating continuously.
-	dataKindsDebounce time.Duration
-
-	// dataEventsDebounce bounds how often ClusterDataEventsWatch re-reads and diffs the
-	// events window. Events are high-volume, so a burst of event-write pings is coalesced
-	// into one re-read per interval (trailing edge) rather than a re-read per event.
-	dataEventsDebounce time.Duration
-
-	// dataObjectsDebounce bounds how often ClusterDataObjectsWatch re-reads and diffs one
-	// kind's cached objects. Object writes share one broker, so a burst (a relist, a
-	// churny kind) is coalesced into one re-read per interval (trailing edge).
+	// dataKindsDebounce / dataEventsDebounce / dataObjectsDebounce / cacheStatsDebounce
+	// bound each watch's trailing-edge re-read rate — a burst of write pings collapses
+	// into one re-read per interval.
+	dataKindsDebounce   time.Duration
+	dataEventsDebounce  time.Duration
 	dataObjectsDebounce time.Duration
-
-	// cacheStatsDebounce bounds how often ClusterCacheStatsWatch re-rolls the cache's
-	// whole-cache totals. It is the coarsest of the four: a summary line's freshness is
-	// worth far less than a table's, and during a cold sync every one of a cache's
-	// hundred workers is writing at once.
-	cacheStatsDebounce time.Duration
+	cacheStatsDebounce  time.Duration
 }
 
-// defaultDataKindsDebounce floors the kind-catalog re-read interval — small enough
-// that the dashboard nav's counts still read as live, large enough to collapse a
-// high-churn cluster's write pings into a bounded aggregation rate.
+// Floors the kind-catalog re-read interval: live enough for the nav's counts, coarse enough
+// to collapse a high-churn cluster's write pings.
 const defaultDataKindsDebounce = 250 * time.Millisecond
 
-// defaultDataEventsDebounce floors the events-watch re-read interval. Events are the
-// highest-volume stream, so this is a touch coarser than the kind-catalog debounce —
-// still live for a table, but collapsing an event storm into a bounded re-read rate.
+// Floors the events-watch re-read interval. Coarser than the catalog's, since events are the
+// highest-volume stream.
 const defaultDataEventsDebounce = 500 * time.Millisecond
 
-// defaultDataObjectsDebounce floors the objects-watch re-read interval. Object writes
-// drive the same broker the kind catalog follows; a per-kind objects table wants a
-// live-but-bounded re-read, so it matches the kind-catalog cadence.
+// Floors the objects-watch re-read interval; matches the kind-catalog cadence, since object
+// writes drive the same broker.
 const defaultDataObjectsDebounce = 250 * time.Millisecond
 
-// defaultCacheStatsDebounce floors the cache-summary re-read interval. Deliberately the
-// coarsest: it backs one "N objects across M kinds" line, and the whole point of the
-// gauge is to stop being stale, not to be instant.
+// Floors the cache-summary re-read interval. Deliberately coarsest — it backs one
+// "N objects across M kinds" line, and the gauge exists to stop being stale, not to be instant.
 const defaultCacheStatsDebounce = time.Second
 
 var _ ClusterService = (*Service)(nil)
 
-// New builds the cluster control plane: the kubeconfig watcher (over kubeconfigPath),
-// the beehive store + instance (at <dataDir>/beehive.db), the two beehive clients, the
-// two registered controllers, the kubeconfig importer, and the per-cluster cache
-// manager (rooted at <dataDir>/clusters/). The returned *Service is both the GraphQL
-// boundary and the control plane, owning the whole watcher + beehive + importer + cache
-// lifecycle via Start/Close. The watcher and beehive are cluster-only, so the service
-// owns them outright; if a non-cluster consumer ever needs either, hoist it up to the
-// composition root and inject it.
+// New builds the cluster control plane rooted at dataDir (beehive.db, clusters/).
+// The returned *Service owns the watcher + beehive + importer + cache lifecycle via
+// Start/Close; both are cluster-only, so the service owns them outright.
 func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error) {
-	// The kubeconfig watcher publishes *api.Config snapshots; the importer and
-	// ClusterCoreController consume it (through the KubeConfigSource interface).
+	// Publishes *api.Config snapshots; consumed by the importer and core controller.
 	watcher, err := k8shelpers.NewKubeConfigWatcher(kubeconfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("init kubeconfig watcher: %w", err)
 	}
 
-	// Open the beehive SQLite store at <dataDir>/beehive.db. The beehive instance
-	// owns the two resource kinds and drives their controllers level-triggered.
 	bhStore, err := beehivesqlite.Open(filepath.Join(dataDir, "beehive.db"))
 	if err != nil {
 		_ = watcher.Close()
 		return nil, fmt.Errorf("open beehive store: %w", err)
 	}
-	// WithEventRetention bounds each object's connection event timeline to the
-	// newest maxEventRuns runs per (object, category) timeline, GC-swept. The startup pass
-	// is declared per kind at Register, not here — see the registrations below.
-	// No kind runs a *periodic* full pass: once started, each controller re-arms
-	// itself with Result.RequeueAfter, and the out-of-band triggers (kubeconfig
-	// change, resync poke, retry bus) cover the rest.
+	// WithEventRetention bounds each (object, category) timeline to maxEventRuns runs.
+	// No kind runs a periodic full pass: controllers re-arm via RequeueAfter and the
+	// out-of-band buses cover the rest (see the Register calls for the startup pass).
 	bh, err := beehive.New(bhStore, beehive.WithEventRetention(maxEventRuns, 0))
 	if err != nil {
 		bhStore.Close()
@@ -342,56 +255,41 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	// The Service keeps its own clients for the GraphQL-facing reads/watches — one per
-	// kind it serves; the controllers mint whatever clients they need from the runtime's
-	// beehive instance.
+	// The Service's own clients back the GraphQL-facing reads/watches; controllers
+	// mint their own from the runtime.
 	coreClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 	gvrDiscoveryClient := beehive.NewClient[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus](bh, ClusterCacheGVRDiscoveryGroupKind)
 	gvrSyncClient := beehive.NewClient[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus](bh, ClusterCacheGVRSyncGroupKind)
 
-	// The cache manager owns the per-cluster SQLite cache files under
-	// <dataDir>/clusters/ — wholly a cluster concern, so the service owns it.
+	// Owns the per-cluster SQLite cache files under <dataDir>/clusters/.
 	cacheManager := store.NewManager(dataDir)
 
 	connMgr := NewConnectionManager()
 
-	// The shared controller environment (beehive's Manager analogue): every controller
-	// draws its clients + shared singletons from here.
 	rt := &controllerRuntime{bh: bh, connMgr: connMgr, cacheManager: cacheManager, pokeSvc: pokeSvc}
 
 	coreCtrl := NewClusterCoreController(rt, watcher, nil, nil)
 	cacheCtrl := NewClusterCacheController(rt)
-	// The cache-sync controllers reconcile the subtree of each cache: GVR discovery creates
-	// one ClusterCacheGVRSync per served kind — Events included, differing only in which
-	// store their worker writes to — and cacheGVRSyncCtrl runs one worker per record. Each
-	// carries a Spec.Enabled the cache controller pushes down, so pausing is that flag and
-	// never a deletion; a worker is only ever started and stopped by its own controller.
+	// GVR discovery creates one ClusterCacheGVRSync per served kind (Events included);
+	// the sync controller runs one worker per record. Pausing is Spec.Enabled, never
+	// a deletion; a worker is only ever started/stopped by its own controller.
 	cacheGVRDiscoveryCtrl := NewClusterCacheGVRDiscoveryController(rt)
 	cacheGVRSyncCtrl := NewClusterCacheGVRSyncController(rt)
 
-	// Register returns each kind's status-write ControllerClient. The reconcile path gets it
-	// as an argument, but the controllers also write status out-of-band (the connection
-	// controller's poke re-probe), so inject it now — before bh.Start, since a startup
-	// reconcile may write immediately. WithMaxRetryInterval caps the connection controller's
-	// exponential reconnect backoff at connectionMaxBackoff.
+	// Register returns each kind's status-write ControllerClient; inject it before
+	// bh.Start (a startup reconcile may write immediately) since controllers also
+	// write status out-of-band. WithMaxRetryInterval caps the reconnect backoff.
 	//
-	// WithStartupFullPass is declared per kind, not globally, so it says which controllers
-	// actually need it: Cluster and ClusterCache both own process-scoped state a restart
-	// invalidates and the store never recorded — live connections + liveness sentinels, and
-	// running sync workers — so beehive's owed pass (which sees only unconverged specs)
-	// would leave a settled cluster unreconciled and therefore unconnected. GVR discovery
-	// takes it for a related reason: its periodic re-discovery is a RequeueAfter, which is
-	// in-memory, so without the startup pass a settled discovery object would never look at
-	// the cluster again after a restart. ClusterCacheGVRSync owns a running worker per kind,
-	// which is process-scoped state a restart invalidates, so it takes the pass for the same
-	// reason the cache and cluster kinds do.
+	// WithStartupFullPass is per kind: each of the four owns process-scoped state a
+	// restart invalidates that the store never recorded (connections + sentinels,
+	// running workers, in-memory RequeueAfter re-discovery), so beehive's owed pass
+	// alone would leave settled objects unreconciled. See
+	// docs/adr/2026-08-09-beehive-control-plane.md.
 	//
-	// WithConcurrency lets beehive run clusterProbeConcurrency Cluster reconciles at once.
-	// A reconcile is mostly one cluster's network probe, and beehive's default of a single
-	// worker would let one unreachable cluster's dial timeout delay every cluster behind it
-	// in the startup pass. ClusterCoreController.Reconcile locks per cluster, so concurrent
-	// reconciles of distinct clusters are safe.
+	// WithConcurrency: a Cluster reconcile is mostly one network probe, so a single
+	// worker would serialize every cluster behind one dial timeout; per-cluster
+	// locks make concurrent reconciles of distinct clusters safe.
 	coreCC, errCluster := beehive.Register(bh, ClusterGroupKind, coreCtrl,
 		beehive.WithMaxRetryInterval(connectionMaxBackoff),
 		beehive.WithStartupFullPass(true),
@@ -400,17 +298,13 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (*Service, error
 	_, errCache := beehive.Register(bh, ClusterCacheGroupKind, cacheCtrl,
 		beehive.WithStartupFullPass(true),
 	)
-	// Discovery gets the same concurrency as the Cluster kind, and for the same reason: a
-	// pass is mostly one cluster's discovery request, so a single worker would let one
-	// unresponsive API server delay every other cache's discovery behind it.
+	// Same concurrency rationale as Cluster: a pass is mostly one discovery request.
 	_, errDiscovery := beehive.Register(bh, ClusterCacheGVRDiscoveryGroupKind, cacheGVRDiscoveryCtrl,
 		beehive.WithStartupFullPass(true),
 		beehive.WithConcurrency(clusterProbeConcurrency),
 	)
-	// The per-kind syncs are the one place the concurrency is about volume rather than
-	// latency: a cache has one of these per served kind — a hundred or more — and each
-	// reconcile opens the cache and starts a worker, so a single beehive worker would walk
-	// them one at a time on every startup pass.
+	// Here the concurrency is about volume: hundreds of per-kind records per cache
+	// on every startup pass.
 	gvrSyncCC, errGVRSync := beehive.Register(bh, ClusterCacheGVRSyncGroupKind, cacheGVRSyncCtrl,
 		beehive.WithStartupFullPass(true),
 		beehive.WithConcurrency(gvrSyncConcurrency),
@@ -456,16 +350,13 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 		return nil, fmt.Errorf("start beehive: %w", err)
 	}
 
-	// Start the controllers' background work now the control plane is running. The core
-	// controller's worker drives the targeted-retry bus (RetryConnection) and the poke bus;
-	// the per-kind sync controller reacts to pokes by restarting its live workers, which is
-	// where the watches that a resume invalidates actually live. Both write status, so they
-	// share the same start/drain window.
+	// Background work: the core controller drives the retry + poke buses; the sync
+	// controller restarts live workers on poke. Both write status, so they share
+	// the same start/drain window.
 	s.coreCtrl.StartBackground()
 	s.gvrSyncCtrl.StartPoke()
 
-	// Start the watcher (fsnotify loop) before the importer, which subscribes to
-	// its snapshots current-on-subscribe.
+	// Watcher before importer: the importer subscribes current-on-subscribe.
 	s.watcher.Start()
 	s.importer.Start()
 
@@ -473,20 +364,14 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 		s.watcher.Close()
 		s.importer.Stop()
 
-		// Stop out-of-band re-probe / resync work before draining so none
-		// of it races the teardown.
+		// Stop out-of-band re-probe/resync work before draining.
 		s.coreCtrl.StopBackground()
 		s.gvrSyncCtrl.StopPoke()
 
-		// Then drain the reconcile loops, stop the sync workers they started, and only
-		// then shut the cache those workers write into. The order is load-bearing: beehive
-		// must drain first so no reconcile can start another worker behind us, and the
-		// workers must stop before the cache manager closes their ClusterDB handles. One
-		// controller owns every worker — Events included — so one drain covers them.
-		//
-		// The sync-health fold goes first: it only reads, so nothing depends on it, and
-		// ending it before beehive stops means its watches close on our terms rather than
-		// under it.
+		// Order is load-bearing: the read-only sync-health fold first (its watches
+		// close on our terms), then beehive drains (no reconcile can start another
+		// worker behind us), then the workers stop, then the cache manager closes
+		// the ClusterDB handles they write into.
 		s.stopSyncHealthFold(ctx)
 		bhErr := bhStop(ctx)
 		workerErr := s.gvrSyncCtrl.StopWorkers(ctx)
@@ -506,9 +391,8 @@ func (s *Service) List(ctx context.Context) ([]*Cluster, error) {
 	return s.listClusters(ctx)
 }
 
-// listClusters reads every Cluster, drops the deletion-pending ones, and builds
-// each into a domain Cluster (joining its ClusterCache sync status). Shared by
-// List and Watch's seed + re-emit.
+// listClusters reads every non-deletion-pending Cluster as a domain Cluster.
+// Shared by List and Watch's seed + re-emit.
 func (s *Service) listClusters(ctx context.Context) ([]*Cluster, error) {
 	objs, err := s.coreClient.List(ctx)
 	if err != nil {
@@ -542,10 +426,8 @@ func (s *Service) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
 	return &c, nil
 }
 
-// CacheStats implements ClusterService. It stats one specific ClusterCache (by
-// parent ClusterID + cache id), so the live-stats resolver can report the cache it
-// was asked about — active or a migrated-away one — without re-resolving "the"
-// cache for a cluster.
+// CacheStats implements ClusterService. It stats the exact ClusterCache asked
+// about — active or migrated-away — never "the" cache for a cluster.
 func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*ClusterCacheStats, error) {
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	bytes, exists := s.cacheManager.CacheBytes(ref)
@@ -563,34 +445,24 @@ func (s *Service) CacheStats(ctx context.Context, clusterID ClusterID, cacheID C
 	return &st, nil
 }
 
-// ClusterCacheStatsWatch implements ClusterService — one cache's contents as a live
-// gauge: the current measurement on subscribe, then a fresh one whenever it changes.
-//
-// This exists because the measurement is NOT on the ClusterCache object. Serving it as a
-// resolver field there made its freshness depend on that object changing, and a settled
-// cache never changes — so a consumer rendered whatever the cache held the moment it
-// subscribed, which during a cold sync is a tiny fraction of what lands seconds later.
-// A gauge nothing propagates needs a stream of its own.
+// ClusterCacheStatsWatch implements ClusterService — one cache's contents as a
+// live gauge. Its own stream because a ClusterCache field would freeze at
+// subscribe time; see docs/adr/2026-08-09-status-propagation-gauges.md.
 func (s *Service) ClusterCacheStatsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCacheStats, error) {
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheGaugeWatch(ctx, s.cacheManager, ref.CacheID, s.cacheStatsDebounce,
-		// The object-write broker, keyless: every kind's writes move this total, and the
-		// catalog registrations that announce a new kind ping it too.
+		// Keyless object-write broker: every kind's writes move this total.
 		func(db *store.ClusterDB) (<-chan struct{}, func()) { return db.ObjectsSubscribe() },
 		func(ctx context.Context, db *store.ClusterDB) (ClusterCacheStats, error) {
-			// Re-stat the file each read: it grows with the rows, and nothing else would
-			// carry that change.
+			// Re-stat the file each read; nothing else carries its growth.
 			bytes, _ := s.cacheManager.CacheBytes(ref)
 			return readCacheStats(ctx, db, bytes)
 		},
-		// A closed cache reports what is on DISK, not zeroes. Whether a db handle is open
-		// says only whether something is syncing right now, and plenty of caches have a
-		// file with nobody holding it: a cluster whose kube-context left the kubeconfig
-		// (never eligible, so no worker ever opens it), a paused one, one whose workers are
-		// mid-restart. Reporting those as nonexistent is what disables Clear cache on the
-		// very rows the Orphaned group exists to let the user reclaim. The counts stay zero
-		// — they can only be read through an open handle — which is why exists is a
-		// separate field from them.
+		// A closed cache reports what is on DISK, not zeroes: an open handle only
+		// means something is syncing now, and reporting a closed file as
+		// nonexistent would disable Clear cache on the rows the Orphaned group
+		// exists to reclaim. Counts need an open handle, hence the separate
+		// Exists field.
 		func() ClusterCacheStats {
 			bytes, exists := s.cacheManager.CacheBytes(ref)
 			return ClusterCacheStats{Exists: exists, Bytes: bytes}
@@ -608,9 +480,8 @@ func readCacheStats(ctx context.Context, db *store.ClusterDB, bytes int64) (Clus
 	}
 	objectCount, kindCount := 0, 0
 	for _, r := range rows {
-		// Events carry a real kind_counts value (triggers on the events table maintain the
-		// ('v1','Event') row so the dashboard nav badge is accurate), but they live in
-		// their own table and are not objects — exclude them from the whole-cache totals.
+		// Events carry a real kind_counts value but live in their own table and are
+		// not objects — excluded from the whole-cache totals.
 		if r.APIVersion == eventsAPIVersion && r.Kind == eventsKind {
 			continue
 		}
@@ -627,12 +498,9 @@ func readCacheStats(ctx context.Context, db *store.ClusterDB, bytes int64) (Clus
 	}, nil
 }
 
-// ClusterDataKinds implements ClusterService. It reads the kind catalog from one
-// specific ClusterCache (by parent ClusterID + cache id), mirroring CacheStats — so
-// the caller names the exact cache whose catalog it wants (its active cache), and a
-// cache/identity swap under the same cluster reads the new cache's catalog rather
-// than "the" cluster's. Returns nil (empty) when that cache's db isn't open (never
-// synced / sync paused), matching CacheStats' degrade-to-empty posture.
+// ClusterDataKinds implements ClusterService. The caller names the exact cache
+// whose catalog it wants; nil when that cache's db isn't open (never synced /
+// sync paused), matching CacheStats' degrade-to-empty posture.
 func (s *Service) ClusterDataKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) ([]ClusterDataKind, error) {
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	db := s.cacheManager.Lookup(ref.CacheID)
@@ -646,10 +514,9 @@ func (s *Service) ClusterDataKinds(ctx context.Context, clusterID ClusterID, cac
 	return toDataKinds(rows), nil
 }
 
-// toDataKinds maps a catalog read onto the domain records, preserving the reader's order
-// ((api_version, kind)) — which the delta watch's Added burst relies on being stable. It is
-// shared by the query and its live counterpart: those two must never disagree about the
-// projection, so they must not each spell it out.
+// toDataKinds maps a catalog read onto the domain records, preserving the reader's
+// (api_version, kind) order the delta watch's Added burst relies on. Shared by the
+// query and its live counterpart so the projections can't disagree.
 func toDataKinds(rows []store.KindRow) []ClusterDataKind {
 	kinds := make([]ClusterDataKind, len(rows))
 	for i, r := range rows {
@@ -670,19 +537,14 @@ func toDataKind(r store.KindRow) ClusterDataKind {
 	}
 }
 
-// dataKindKey is a kind's identity within a catalog: APIVersion + Resource is unique
-// per cache (the group/version plus the plural resource name), so it keys the diff.
+// dataKindKey keys the diff: APIVersion + Resource is unique per cache.
 func dataKindKey(k ClusterDataKind) string {
 	return k.APIVersion + "/" + k.Resource
 }
 
-// ClusterDataKindsWatch implements ClusterService. It streams one ClusterCache's kind
-// catalog as a delta watch: the current catalog as an Added burst on subscribe, then
-// one Added/Modified/Deleted change per kind as the syncs write objects and
-// pings the store (Count is a live LEFT JOIN, so an object write that changes a count
-// re-emits its kind as Modified). It follows the object-write broker (ObjectsSubscribe)
-// and re-reads Kinds on each debounced ping, diffing against the last snapshot;
-// cacheDeltaWatch owns the whole cache-lifecycle + coalescing loop.
+// ClusterDataKindsWatch implements ClusterService: the kind catalog as a delta
+// watch (an object write that changes a count re-emits its kind as Modified).
+// cacheDeltaWatch owns the cache-lifecycle + coalescing loop.
 func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataKindChange, error) {
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheDeltaWatch(ctx, s.cacheManager, ref.CacheID, s.dataKindsDebounce,
@@ -701,15 +563,10 @@ func (s *Service) ClusterDataKindsWatch(ctx context.Context, clusterID ClusterID
 	), nil
 }
 
-// ClusterDataEventsWatch implements ClusterService. It streams one ClusterCache's cached
-// Kubernetes Events as a delta watch: the newest window of events (Events' default limit)
-// as an Added burst on subscribe, then Added/Modified/Deleted changes as the Event sync
-// writes events. It follows the events-only broker (EventsSubscribe) and re-reads Events
-// on each debounced ping, keyed by event UID — so an event burst never drives the
-// kind-catalog re-read. Because the read is a bounded window, an event aging out of the
-// window as newer ones arrive surfaces as Deleted even though its row may still exist;
-// that is acceptable for a "latest events" table. cacheDeltaWatch owns the cache-lifecycle
-// + coalescing loop, so this matches ClusterDataKindsWatch's empty/rebind posture exactly.
+// ClusterDataEventsWatch implements ClusterService: the newest events window as a
+// delta watch keyed by UID, on the events-only broker. The read is a bounded
+// window, so an event aging out surfaces as Deleted even though its row may still
+// exist — fine for a "latest events" table.
 func (s *Service) ClusterDataEventsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterDataEventChange, error) {
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheDeltaWatch(ctx, s.cacheManager, ref.CacheID, s.dataEventsDebounce,
@@ -732,25 +589,15 @@ func (s *Service) ClusterDataEventsWatch(ctx context.Context, clusterID ClusterI
 	), nil
 }
 
-// ClusterDataObjectsWatch implements ClusterService. It streams one kind's cached objects
-// from a ClusterCache as a delta watch: the current object set for the kind as an Added
-// burst on subscribe, then Added/Modified/Deleted changes as the kind's sync writes
-// objects. It mirrors ClusterDataEventsWatch's shape but follows the object-write broker
-// (ObjectsSubscribe) — the same broker the kind catalog watches — re-reading a new
-// store.Objects(apiVersion, resource) snapshot on each debounced ping, keyed by UID and
-// projecting each row to a ClusterDataObject (universal identity + the native body, so an
-// in-place edit surfaces as Modified). cacheDeltaWatch owns the whole cache-lifecycle + coalescing
-// loop, so this matches ClusterDataKindsWatch's empty/rebind posture exactly (no open
-// cache → no frames until it opens or ctx ends).
+// ClusterDataObjectsWatch implements ClusterService: one kind's cached objects as
+// a delta watch keyed by UID. Each row carries the native body, so an in-place
+// edit surfaces as Modified.
 func (s *Service) ClusterDataObjectsWatch(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterDataObjectChange, error) {
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheDeltaWatch(ctx, s.cacheManager, ref.CacheID, s.dataObjectsDebounce,
-		// Subscribe keyed to this watch's (apiVersion, resource) so an unrelated resource's
-		// writes don't wake (and re-read) it. The broker routes object writes by the same
-		// plural resource, so no resolution is needed and — crucially — the key is stable
-		// across a CRD Kind remap: a CRD recreated with the same (apiVersion, resource) but a
-		// new Kind keeps this key, so the subscription tracks the replacement driver's writes
-		// (which notify by the same resource) rather than going stale against the dead Kind.
+		// Keyed to (apiVersion, resource) so unrelated writes don't wake it. The
+		// broker routes by plural resource, not Kind, so the key stays valid across
+		// a CRD Kind remap; see docs/adr/2026-08-09-per-cluster-sqlite-cache.md.
 		func(db *store.ClusterDB) (<-chan struct{}, func()) {
 			return db.ObjectsSubscribeResource(apiVersion, resource)
 		},
@@ -772,11 +619,9 @@ func (s *Service) ClusterDataObjectsWatch(ctx context.Context, clusterID Cluster
 	), nil
 }
 
-// toDataObject maps a store ObjectRow onto the domain ClusterDataObject 1:1, decoding the
-// stored unix-millis creationTimestamp (0 → zero time) consistently with the events read
-// so two reads of the same row compare equal in the watch diff. RawJSON carries the
-// decompressed native body verbatim; because it's part of the struct, an in-place edit
-// (which rewrites the body) differs across reads and surfaces as Modified.
+// toDataObject maps a store ObjectRow onto ClusterDataObject 1:1 (unix-millis 0 →
+// zero time, consistent across reads so the watch diff compares equal). RawJSON is
+// part of the struct, so an in-place edit surfaces as Modified.
 func toDataObject(r store.ObjectRow) ClusterDataObject {
 	return ClusterDataObject{
 		UID:               r.UID,
@@ -789,8 +634,8 @@ func toDataObject(r store.ObjectRow) ClusterDataObject {
 	}
 }
 
-// toDataEvent maps a store EventRow onto the domain ClusterDataEvent 1:1, decoding the
-// stored unix-millis timestamps (0 → zero time).
+// toDataEvent maps a store EventRow onto ClusterDataEvent 1:1 (unix-millis 0 →
+// zero time).
 func toDataEvent(r store.EventRow) ClusterDataEvent {
 	return ClusterDataEvent{
 		UID:               r.UID,
@@ -806,9 +651,8 @@ func toDataEvent(r store.EventRow) ClusterDataEvent {
 	}
 }
 
-// millisToTime converts unix-millis to a time.Time, mapping 0 (no timestamp) to the
-// zero Time. Built consistently so two reads of the same row compare equal in the watch
-// diff (time.Time equality is stable for values with no monotonic reading).
+// millisToTime converts unix-millis to time.Time (0 → zero Time), built so two
+// reads of the same row compare equal in the watch diff.
 func millisToTime(ms int64) time.Time {
 	if ms == 0 {
 		return time.Time{}
@@ -816,17 +660,11 @@ func millisToTime(ms int64) time.Time {
 	return time.UnixMilli(ms).UTC()
 }
 
-// catalogSubscribe wakes on a write to EITHER table, because the kind catalog spans both:
-// every synced kind's count comes from the objects triggers, and the Event kind's from the
-// events triggers. Following only the object-write broker froze the Events badge on a
-// cluster that is event-busy but object-quiet — which is exactly the cluster whose event
-// count a user is watching.
-//
-// The two brokers stay separate, and this is not a hole in that. Their point is that an
-// event burst must not drive the EXPENSIVE re-reads — the per-kind objects watch, which
-// decompresses a whole collection. This read is the cheap one: Kinds is a point join over
-// the trigger-maintained aggregates, O(kinds) and never an object scan, and the caller
-// debounces it besides.
+// catalogSubscribe wakes on a write to EITHER broker: the catalog's counts span
+// both tables (object triggers + event triggers), and object-broker-only would
+// freeze the Events badge on an event-busy, object-quiet cluster. This doesn't
+// undercut the broker split — the split protects the EXPENSIVE per-kind object
+// re-reads; Kinds is O(kinds) and debounced besides.
 func catalogSubscribe(db *store.ClusterDB) (<-chan struct{}, func()) {
 	objects, stopObjects := db.ObjectsSubscribe()
 	events, stopEvents := db.EventsSubscribe()
@@ -834,9 +672,8 @@ func catalogSubscribe(db *store.ClusterDB) (<-chan struct{}, func()) {
 	out := make(chan struct{}, 1)
 	done := make(chan struct{})
 	go func() {
-		// Closing out is how a caller learns the db went away through the ping path, the
-		// same way a bare broker subscription tells it. Only when BOTH brokers have closed:
-		// one closing alone still leaves the other's writes worth reporting.
+		// Closing out signals the db went away — but only when BOTH brokers have
+		// closed; one alone still leaves the other's writes worth reporting.
 		defer close(out)
 		for {
 			select {
@@ -859,8 +696,7 @@ func catalogSubscribe(db *store.ClusterDB) (<-chan struct{}, func()) {
 					continue
 				}
 			}
-			// Coalescing, like the brokers themselves: a buffered ping already says
-			// "something changed", which is all this signal carries.
+			// Coalesce: a buffered ping already says "something changed".
 			select {
 			case out <- struct{}{}:
 			default:
@@ -874,20 +710,13 @@ func catalogSubscribe(db *store.ClusterDB) (<-chan struct{}, func()) {
 	}
 }
 
-// cacheDeltaWatch is the shared machinery behind ClusterDataKindsWatch, ClusterDataEventsWatch,
-// and ClusterDataObjectsWatch. It follows one ClusterCache's on-disk db across its whole
-// lifecycle via the store Manager's WatchDB (binding when the cache opens, rebinding on a
-// Clear-cache delete+reopen), coalesces the db's write pings on a trailing-edge debounce,
-// and on each fire re-reads a keyed snapshot and diffs it against the last one it emitted —
-// sending Added for a new key, Modified for a changed value, Deleted for a vanished key
-// (and Deleted for every held key when the cache closes, so a never-reopened cache doesn't
-// retain stale rows). `subscribe` selects which of the db's brokers to follow (object
-// writes vs event writes); `snapshot` reads the current rows as an **ordered** slice
-// (the reader's order is the emit order, so the on-subscribe Added burst is stable, e.g.
-// Kinds' (api_version, kind)); `keyOf` derives each value's identity (the diff and
-// map key); `mkChange` adapts one (ChangeType, value) into the caller's domain change. The
-// returned channel closes when ctx ends or the store shuts down. T must be comparable so a
-// changed value is detected by ==; the diff sends the last-known value on a Deleted.
+// cacheDeltaWatch is the shared machinery behind the three ClusterData*Watch
+// streams: it follows one cache's db across its lifecycle (WatchDB bind/rebind),
+// coalesces write pings on a trailing-edge debounce, and on each fire re-reads a
+// keyed snapshot and diffs it against the last — Added/Modified/Deleted per key,
+// and Deleted for every held key when the cache closes. `snapshot` must return an
+// ordered slice (its order is the Added-burst order); T must be comparable so a
+// changed value is detected by ==. Closes when ctx ends or the store shuts down.
 func cacheDeltaWatch[T comparable, C any](
 	ctx context.Context,
 	mgr *store.Manager,
@@ -901,18 +730,16 @@ func cacheDeltaWatch[T comparable, C any](
 	out := make(chan C, 1)
 	prev := map[string]T{}
 
-	// emit diffs db's freshly-read snapshot against prev, sending one change per
-	// difference (Added/Modified/Deleted) and updating prev. Added/Modified are emitted
-	// in the snapshot's slice order (stable, from the reader's ORDER BY); Deleted follows
-	// in map order (only vanished keys, unordered).
+	// emit diffs a fresh snapshot against prev: Added/Modified in snapshot order,
+	// then Deleted for vanished keys (map order).
 	emit := func(db *store.ClusterDB) (bool, bool) {
 		items, err := snapshot(ctx, db)
 		if err != nil {
 			if ctx.Err() != nil {
 				return false, false
 			}
-			// Keep the stream and ask for a retry. Silently waiting for the next write ping
-			// would strand the subscription on a kind that isn't being written to.
+			// Keep the stream and ask for a retry; waiting for the next write ping
+			// would strand a kind nobody writes to.
 			slog.Warn("clusterservice: cache watch read failed", "cache", cacheID, "err", err)
 			return true, true
 		}
@@ -943,9 +770,8 @@ func cacheDeltaWatch[T comparable, C any](
 		return true, false
 	}
 
-	// emitEmpty reconciles prev against an empty snapshot — one Deleted per held value,
-	// then clears prev. Called when the cache closes so a cache that never reopens doesn't
-	// leave stale rows.
+	// emitEmpty sends one Deleted per held value and clears prev — run when the
+	// cache closes so a never-reopened cache leaves no stale rows.
 	emitEmpty := func() bool {
 		for _, v := range prev {
 			if !send(ctx, out, mkChange(ChangeDeleted, v)) {
@@ -963,16 +789,11 @@ func cacheDeltaWatch[T comparable, C any](
 	return out
 }
 
-// cacheGaugeWatch streams one whole-cache measurement, re-read on the same cadence
-// cacheDeltaWatch uses and emitted only when it CHANGES.
-//
-// It is the gauge counterpart of the delta watch: a value the UI reads but no controller
-// acts on, so it belongs on its own stream rather than on an object's status — see the
-// status-is-propagation rule. The dedupe is what makes that affordable: a busy cluster
-// pings on every write, but a measurement that reads the same twice sends nothing.
-//
-// zero is what to emit when the cache closes, so a consumer isn't left rendering the
-// contents of a cache that is gone.
+// cacheGaugeWatch is cacheDeltaWatch's gauge counterpart: one whole-cache
+// measurement, re-read on the same cadence, emitted only when it CHANGES (the
+// dedupe is what makes per-write pings affordable). `closed` supplies the value
+// to emit when the cache goes away. See
+// docs/adr/2026-08-09-status-propagation-gauges.md.
 func cacheGaugeWatch[T comparable](
 	ctx context.Context,
 	mgr *store.Manager,
@@ -1008,8 +829,8 @@ func cacheGaugeWatch[T comparable](
 					if ctx.Err() != nil {
 						return false, false
 					}
-					// Keep the stream and retry: this gauge dedupes, so a failed read that
-					// waited for the next ping would freeze the value with no way to tell.
+					// Keep the stream and retry; a failed read that waited for the
+					// next ping would freeze the deduped value with no way to tell.
 					slog.Warn("clusterservice: cache gauge read failed", "cache", cacheID, "err", err)
 					return true, true
 				}
@@ -1021,17 +842,11 @@ func cacheGaugeWatch[T comparable](
 	return out
 }
 
-// cacheWatchLoop follows one ClusterCache's on-disk db across its whole lifecycle and
-// drives a caller's re-read from it. It is the shared half of every per-cache stream:
-// binding via the store Manager's WatchDB (so a subscriber that opens before the cache
-// does binds when it opens, and a Clear-cache delete+reopen rebinds), subscribing to the
-// db's write pings, and coalescing those pings on a trailing-edge debounce so a
-// high-churn cluster can't keep the read running back to back.
-//
-// onFire runs once per bind and once per debounced burst; onClosed runs when the cache
-// goes away. Either returning false ends the stream (the caller's send saw ctx end).
-// What is read and what is emitted is entirely the caller's business — cacheDeltaWatch
-// diffs a keyed snapshot, cacheGaugeWatch dedupes a single value.
+// cacheWatchLoop is the shared half of every per-cache stream: it binds to the
+// cache's db via WatchDB (binding when it opens, rebinding on delete+reopen) and
+// coalesces write pings on a trailing-edge debounce. onFire runs once per bind and
+// once per debounced burst; onClosed runs when the cache goes away; either
+// returning false ends the stream.
 func cacheWatchLoop(
 	ctx context.Context,
 	mgr *store.Manager,
@@ -1044,8 +859,7 @@ func cacheWatchLoop(
 	handles, cancelHandles := mgr.WatchDB(cacheID)
 	defer cancelHandles()
 
-	// db/pings track the currently-bound handle and its write-ping stream; both are nil
-	// while no cache is open.
+	// db/pings track the bound handle and its ping stream; nil while no cache is open.
 	var (
 		db        *store.ClusterDB
 		pings     <-chan struct{}
@@ -1057,16 +871,14 @@ func cacheWatchLoop(
 		}
 	}()
 
-	// `armed` tracks whether a re-read is pending; the timer starts disarmed. (Go's timer
-	// guarantees no stale tick after Stop/Reset, so the channel never needs a manual drain.)
+	// `armed` tracks a pending re-read; timer starts disarmed (Go timers deliver no
+	// stale tick after Stop/Reset, so no manual drain).
 	debounce := time.NewTimer(debounceDur)
 	debounce.Stop()
 	defer debounce.Stop()
-	// A failed read schedules its OWN retry rather than waiting for the next write ping.
-	// Since the object-write broker is resource-keyed, a static kind (Namespaces, an idle
-	// CRD) may not ping again for hours — so a transient read error would otherwise leave
-	// the subscription showing an empty table indefinitely, which a client cannot tell
-	// apart from a genuinely empty kind.
+	// A failed read schedules its OWN retry: the broker is resource-keyed, so a
+	// static kind may not ping for hours and a transient error would otherwise show
+	// an empty table indefinitely.
 	retry := time.NewTimer(cacheWatchRetryInterval)
 	retry.Stop()
 	defer retry.Stop()
@@ -1117,12 +929,9 @@ func cacheWatchLoop(
 			}
 		case _, ok := <-pings:
 			if !ok {
-				// The bound db closed out from under us (e.g. a Clear-cache delete); release
-				// the stale sub (and any pending re-read) and wait for WatchDB to deliver
-				// the new handle. Cancelling rather than merely dropping the func: a
-				// subscribe may be a composite (catalogSubscribe fans two brokers into one
-				// channel through a goroutine), so the func is what releases the
-				// registrations and stops that goroutine.
+				// The bound db closed under us (e.g. Clear-cache): release the stale
+				// sub and wait for WatchDB's new handle. Cancel, don't just drop —
+				// a composite subscribe (catalogSubscribe) needs its goroutine stopped.
 				disarm()
 				if cancelSub != nil {
 					cancelSub()
@@ -1141,8 +950,7 @@ func cacheWatchLoop(
 				return
 			}
 		case <-retry.C:
-			// A read failed. Nothing else is coming for a kind nobody writes to, so drive
-			// the re-read from here until it succeeds.
+			// A read failed; drive the re-read from here until it succeeds.
 			if db == nil {
 				continue
 			}
@@ -1197,14 +1005,10 @@ func (s *Service) SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool
 	return s.updateSpec(ctx, id, func(spec *ClusterSpec) { spec.SyncEnabled = enabled })
 }
 
-// RetryConnection implements ClusterService. It forces an immediate out-of-band
-// re-probe via the core controller's retry bus (Reprobe) — no spec write. Running
-// off-worker, the reprobe is backoff-neutral: a failed manual probe leaves beehive's
-// reconnect ladder untouched, so manual clicks don't perturb the automatic cadence.
-// (Routing through Client.Requeue would ride beehive's worker and participate in
-// backoff.) Dispatch is fire-and-forget, after a read-only existence check that
-// surfaces ErrNotFound for a just-deleted cluster. The outcome lands on the record's
-// conditions and reaches watchers through Watch.
+// RetryConnection implements ClusterService: fire-and-forget dispatch onto the
+// retry bus after an existence check — no spec write, and backoff-neutral (a
+// failed manual probe leaves beehive's reconnect ladder untouched); see
+// docs/adr/2026-08-09-connection-probing.md.
 func (s *Service) RetryConnection(ctx context.Context, id ClusterID) error {
 	if _, err := s.clusterByID(ctx, id); err != nil {
 		return err
@@ -1213,45 +1017,31 @@ func (s *Service) RetryConnection(ctx context.Context, id ClusterID) error {
 	return nil
 }
 
-// ClearCache implements ClusterService. It validates the cluster exists before
-// touching disk, deletes the on-disk cache, then restarts the cache's syncs so
-// it rebuilds.
-// clearCacheTimeout bounds the detached drain → delete → restart sequence. Generous: it
-// covers a whole cache's workers draining (each bounded by workerStopTimeout in turn), and
-// it exists to stop a wedged step running forever, not to pace anything.
+// clearCacheTimeout bounds ClearCache's detached drain → delete → restart
+// sequence — generous, there to stop a wedged step, not to pace anything.
 const clearCacheTimeout = 2 * time.Minute
+
+// ClearCache implements ClusterService: validate the cluster exists, delete the
+// on-disk cache, restart its syncs so it rebuilds.
 
 func (s *Service) ClearCache(ctx context.Context, id ClusterID) (*Cluster, error) {
 	obj, err := s.clusterByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	// Resolve the cache child to locate its on-disk files. If there is no
-	// ClusterCache object yet (cluster never became sync-eligible), there are no
-	// files to delete — skip straight to the restart (also a no-op).
+	// No ClusterCache object yet → no files to delete; skip to the (no-op) restart.
 	ref, found, err := s.cacheRef(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if found {
-		// Delete INSIDE the worker restart, not before it. DeleteCacheFiles closes the
-		// ClusterDB every one of this cache's workers holds, so they must be drained first
-		// (nothing may be mid-write when the file goes) and rebuilt afterwards on the
-		// handle the Manager hands back — a new one, since the old was closed with the
-		// file. Rebuilding them on the old handle would leave every worker failing every
-		// database operation while still registered, and a registered worker is exactly
-		// what stops a reconcile from replacing it: the cleared cache would never refill.
-		//
-		// Nothing else would rebuild them either — a reconcile leaves a running worker
-		// alone while its connection and kind are unchanged, so neither the 30s liveness
-		// recheck nor the 5-minute discovery pass revives one. Each comes back and
-		// cold-syncs its kind into the empty file, its resume cookie having gone with the
-		// old one.
-		// Detached from the request context, and deliberately. Once the drain has begun
-		// this sequence must run to its end: a client that abandons the mutation midway —
-		// a closed window, a navigation — would otherwise leave the cache drained, its
-		// files deleted, and not one worker rebuilt, with nothing else that ever would.
-		// Bounded, so a wedged step can't hold the goroutine for the process's life.
+		// Delete INSIDE the worker restart: DeleteCacheFiles closes the ClusterDB the
+		// workers hold, so they must drain first and rebuild on the Manager's new
+		// handle — a registered worker on the dead handle would block the reconcile
+		// from replacing it, and nothing else ever rebuilds workers (a reconcile
+		// leaves a running one alone). Detached from the request context: once the
+		// drain begins the sequence must run to its end, or an abandoned mutation
+		// leaves files deleted and no worker rebuilt. Bounded by clearCacheTimeout.
 		clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clearCacheTimeout)
 		defer cancel()
 
@@ -1268,10 +1058,9 @@ func (s *Service) ClearCache(ctx context.Context, id ClusterID) (*Cluster, error
 	return &c, nil
 }
 
-// Delete implements ClusterService. It deletes the Cluster object; beehive GC
-// cascades to its ClusterCache. If the kube-context still exists, the importer
-// will re-create the cluster on its next reconcile — with the same
-// "kubeconfig/{context}" name, since that is the context's natural key.
+// Delete implements ClusterService. Beehive GC cascades to the ClusterCache; a
+// still-present kube-context is re-created by the importer under the same
+// "kubeconfig/{context}" name.
 func (s *Service) Delete(ctx context.Context, id ClusterID) error {
 	obj, err := s.clusterByID(ctx, id)
 	if err != nil {
@@ -1280,17 +1069,12 @@ func (s *Service) Delete(ctx context.Context, id ClusterID) error {
 	return s.coreClient.Delete(ctx, obj.ID)
 }
 
-// watchListChan folds a beehive kind watch — a snapshot plus the change stream
-// strictly above it — into one Kubernetes-style delta stream: the snapshot replayed as
-// Added changes, then one change per object write. A deletion-pending object (a
-// Modified carrying a soft-delete tombstone) is collapsed to Deleted: callers treat a
-// tombstoned record as gone (List/Get hide it), so the watch removes it from the
-// client's view at once, and the trailing hard Deleted repeats idempotently. beehive's
-// terminal Failed change (retention passed the stream, or the beehive stopped) ends the
-// stream after a log line — it is always the last value. fn is handed the object's id
-// alongside the object, which is nil only on a Deleted whose final state could not be
-// decoded; the removal is still reported, keyed by id. Generic over both kinds. The out
-// channel is closed on exit.
+// watchListChan folds a beehive kind watch (snapshot + change stream) into one
+// Kubernetes-style delta stream. A deletion-pending object is collapsed to Deleted
+// (List/Get hide tombstones, so the watch removes it at once; the trailing hard
+// Deleted repeats idempotently). beehive's terminal Failed change ends the stream
+// after a log line. fn's obj is nil only on a Deleted whose final state could not
+// be decoded; the removal is still reported by id. Out closes on exit.
 func watchListChan[Spec, Status, Out any](
 	ctx context.Context,
 	kind string,
@@ -1301,8 +1085,7 @@ func watchListChan[Spec, Status, Out any](
 	out := make(chan Out, 1)
 	go func() {
 		defer close(out)
-		// beehive.ChangeType and ChangeType share their string values by construction,
-		// so the conversion below is value-preserving, not a remap.
+		// beehive.ChangeType and ChangeType share string values by construction.
 		domainType := func(t beehive.ChangeType, obj *beehive.Object[Spec, Status]) ChangeType {
 			if obj != nil && obj.DeletionRequestedAt != nil {
 				return ChangeDeleted
@@ -1337,14 +1120,11 @@ func watchListChan[Spec, Status, Out any](
 	return out
 }
 
-// Watch implements ClusterService. It forwards beehive's Cluster-kind WatchList as a
-// delta stream: the on-subscribe snapshot as Added changes, then one change per object
-// write. beehive conflates per object, so a slow client converges to each cluster's
-// latest state rather than lagging. Per-probe chatter and the next-attempt countdown
-// are deliberately NOT here — probe history streams via clusterEventsWatch and the
-// schedule gauge via clusterScheduleWatch — so a settled disconnected cluster produces
-// no churn. Cache sync status streams standalone via WatchCaches, so cache changes
-// never re-emit a cluster.
+// Watch implements ClusterService: beehive's Cluster-kind WatchList as a delta
+// stream (conflated per object, so a slow client converges). Per-probe chatter,
+// the countdown, and cache sync status deliberately stream elsewhere
+// (clusterEventsWatch / clusterScheduleWatch / WatchCaches), so a settled
+// disconnected cluster produces no churn here.
 func (s *Service) Watch(ctx context.Context) (<-chan ClusterChange, error) {
 	snap, src, err := s.coreClient.WatchList(ctx)
 	if err != nil {
@@ -1360,11 +1140,9 @@ func (s *Service) Watch(ctx context.Context) (<-chan ClusterChange, error) {
 		}), nil
 }
 
-// WatchCaches implements ClusterService. The ClusterCache-kind counterpart of Watch:
-// beehive's cache WatchList forwarded as a standalone delta stream (snapshot as Added,
-// then per-cache changes), each object built into a domain ClusterCache with its
-// parent ClusterID resolved from the owner edge. The caller joins these onto clusters
-// by ClusterID; deletion-pending caches are remapped to Deleted, same as Watch.
+// WatchCaches implements ClusterService — the ClusterCache-kind counterpart of
+// Watch, parent ClusterID resolved from the eager-loaded owner edge; the caller
+// joins by ClusterID.
 func (s *Service) WatchCaches(ctx context.Context) (<-chan ClusterCacheChange, error) {
 	snap, src, err := s.cacheClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
@@ -1380,10 +1158,8 @@ func (s *Service) WatchCaches(ctx context.Context) (<-chan ClusterCacheChange, e
 		}), nil
 }
 
-// WatchGVRDiscoveries implements ClusterService. The discovery counterpart of
-// WatchCaches: beehive's ClusterCacheGVRDiscovery WatchList forwarded as a
-// standalone delta stream, each object built into a domain ClusterCacheGVRDiscovery
-// with its parent CacheID resolved from the owner edge.
+// WatchGVRDiscoveries implements ClusterService — the discovery counterpart of
+// WatchCaches, parent CacheID resolved from the owner edge.
 func (s *Service) WatchGVRDiscoveries(ctx context.Context) (<-chan ClusterCacheGVRDiscoveryChange, error) {
 	snap, src, err := s.gvrDiscoveryClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
@@ -1399,72 +1175,49 @@ func (s *Service) WatchGVRDiscoveries(ctx context.Context) (<-chan ClusterCacheG
 		}), nil
 }
 
-// WatchGVRSyncs implements ClusterService — one cache's per-kind sync records as a delta
-// stream, so a consumer can see which of a cache's kinds are caught up and which are not.
-//
-// **Cache-scoped, unlike every other object watch here.** There is one of these per served
-// kind rather than one per cache, so an unscoped stream is a hundred-plus records that the
-// always-mounted cluster provider would carry for every cache at once; this one is opened
-// by whoever is actually looking at a cache.
-//
-// The scoping is done on the owner edge rather than by a store query, since beehive's
-// WatchList is per-kind: the cache's discovery anchor has a deterministic name, so its id
-// is one lookup, and each object's owner arrives eager-loaded (WithLoads(LoadOwner())) so
-// the filter is a field read rather than a query per object.
-// gvrSyncAnchorFilter keeps only the sync records owned by one cache's discovery anchor,
-// which resolve reports (0 = no anchor yet). onErr is called for the first failed read only.
-//
-// It memoizes the anchors it has RULED OUT, and that is what makes it affordable: the
-// underlying watch is fleet-wide, so this runs on every sync record of every cache — and
-// while our own anchor is unresolved there is nothing cached to compare against, so each of
-// those frames would cost its own point query (~1500 to drain a ten-cluster snapshot).
-//
-// A verdict never flips, which is what licenses the memo. An anchor that is not ours cannot
-// become ours; and an anchor seen while ours does not yet exist cannot be it either, since
-// the one created later gets a fresh id (they are AUTOINCREMENT and never reused). So one
-// lookup per DISTINCT anchor decides, and the set holds one entry per cache in the fleet.
+// gvrSyncAnchorFilter keeps only the sync records owned by one cache's discovery
+// anchor (resolve returns it; 0 = no anchor yet; onErr fires on failed reads).
+// The underlying watch is fleet-wide, so it memoizes the anchors it has RULED OUT —
+// otherwise each frame costs a point query while our anchor is unresolved. The memo
+// is licensed because a verdict never flips: anchor ids are AUTOINCREMENT and never
+// reused, so a not-ours anchor cannot become ours.
 func gvrSyncAnchorFilter(
 	resolve func() (beehive.ObjectID, error),
 	onErr func(error),
 ) func(ClusterCacheGVRSyncChange) []ClusterCacheGVRSyncChange {
 	notOurs := map[beehive.ObjectID]bool{}
-	// Frames received while the anchor could not be read. They are HELD, not dropped:
-	// beehive re-emits an object only when it changes, so a kind whose one frame fell in a
-	// "database is locked" moment during cold start would stay invisible to this
-	// subscription for its whole life. Released once a read succeeds and can judge them.
+	// Frames received while the anchor could not be read are HELD, not dropped:
+	// beehive re-emits an object only when it changes, so a frame lost in a
+	// transient read error would leave that kind invisible for the subscription's
+	// life. Released once a read succeeds.
 	var undecided []ClusterCacheGVRSyncChange
 
 	return func(c ClusterCacheGVRSyncChange) []ClusterCacheGVRSyncChange {
-		// A hard Deleted carries no owner edge, so it can't be attributed. Forwarded on its
-		// id alone: the client keys removal on that, and an id it never added is a no-op.
+		// A hard Deleted carries no owner edge; forward on id alone (removal of an
+		// id the client never added is a no-op).
 		if c.Sync.DiscoveryID == 0 {
 			return []ClusterCacheGVRSyncChange{c}
 		}
 		theirs := beehive.ObjectID(c.Sync.DiscoveryID)
-		// The memo already answers THIS frame, but held frames need an anchor to be judged
-		// against, and on a multi-cluster fleet the traffic after the read recovers is
-		// mostly ids already ruled out. Short-circuiting on the memo alone therefore left
-		// anything held during the error window held forever — and since beehive re-emits
-		// an object only when it changes, a kind whose one frame landed in that window
-		// stayed invisible for the subscription's life. So take the read when something is
-		// waiting on it; the memo still covers the steady state, where nothing is.
+		// Take the read whenever frames are held: held frames need an anchor to be
+		// judged against, and post-recovery traffic is mostly ruled-out ids, so
+		// short-circuiting on the memo alone would hold them forever.
 		if notOurs[theirs] && len(undecided) == 0 {
 			return nil
 		}
 		anchor, err := resolve()
 		if err != nil {
 			onErr(err)
-			// A failed read must not rule the id out, and must not lose the frame either —
-			// unless the frame is one we already know isn't ours.
+			// A failed read must not rule the id out, nor lose the frame — unless
+			// it's already known not-ours.
 			if !notOurs[theirs] && len(undecided) < maxUndecidedSyncFrames {
 				undecided = append(undecided, c)
 			}
 			return nil
 		}
 
-		// The read worked, so everything held can be judged now, oldest first — the
-		// consumer upserts by id, so replaying a superseded frame ahead of its successor
-		// is harmless.
+		// Judge everything held, oldest first — the consumer upserts by id, so a
+		// superseded frame ahead of its successor is harmless.
 		var out []ClusterCacheGVRSyncChange
 		for _, held := range undecided {
 			if beehive.ObjectID(held.Sync.DiscoveryID) == anchor {
@@ -1481,39 +1234,24 @@ func gvrSyncAnchorFilter(
 	}
 }
 
-// maxUndecidedSyncFrames bounds the frames held while a cache's anchor cannot be read. High
-// enough to cover a cold start's whole burst for a fleet of caches, low enough that a read
-// broken for the process's life costs a bounded amount of memory.
+// maxUndecidedSyncFrames bounds held frames: covers a cold start's burst, caps the
+// memory a permanently broken read can cost.
 const maxUndecidedSyncFrames = 4096
 
 func (s *Service) WatchGVRSyncs(ctx context.Context, cacheID ClusterCacheID) (<-chan ClusterCacheGVRSyncChange, error) {
-	// The anchor is resolved LAZILY and re-resolved as the stream runs, never latched at
-	// subscribe — see anchorResolver. A cache that has no anchor yet is the normal state of
-	// one just created (it gains one within a reconcile), so a subscribe-time miss must not
-	// make the stream permanently empty; the name is deterministic, so the lookup is a cheap
-	// idempotent point query.
-	//
-	// While unresolved every frame is dropped, which is correct: a cache with no anchor owns
-	// no sync records, so nothing that arrives can be ours.
-	//
-	// The lookup separates "no anchor yet" from "the read failed". Only the first is normal,
-	// and treating a read error the same way silently drops frames that will never be
-	// replayed — so it is surfaced: at subscribe by failing outright (the client can retry),
-	// and mid-stream by logging once rather than per frame.
+	// The anchor is resolved lazily and re-resolved as the stream runs — a
+	// subscribe-time miss (a just-created cache) must not leave the stream
+	// permanently empty; while unresolved, dropping frames is correct (an
+	// anchorless cache owns no sync records).
 	anchorName := ClusterCacheGVRDiscoveryName(beehive.ObjectID(cacheID))
 	var (
 		discoveryID beehive.ObjectID
 		loggedErr   bool
 	)
-	// resolveAnchor separates "no anchor yet" from "the read failed". Only the first is
-	// normal — a cache gains its anchor within a reconcile — and treating a read error the
-	// same way silently drops frames that will never be replayed, so it is surfaced: at
-	// subscribe by failing outright (the client can retry), and mid-stream by logging once
-	// rather than per frame.
-	//
-	// A resolved id is kept for the stream's life, which is safe because the anchor's name
-	// is derived from the cache id: an anchor lives as long as its cache, and collecting the
-	// cache takes the id with it (they are AUTOINCREMENT and never reused). There is no
+	// resolveAnchor separates "no anchor yet" (normal) from "the read failed"
+	// (surfaced: fail at subscribe, log once mid-stream — a silently dropped frame
+	// is never replayed). A resolved id is kept for the stream's life: an anchor
+	// lives as long as its cache and ids are never reused, so there is no
 	// "same cache, different anchor" to invalidate for.
 	resolveAnchor := func() (beehive.ObjectID, error) {
 		if discoveryID != 0 {
@@ -1541,9 +1279,8 @@ func (s *Service) WatchGVRSyncs(ctx context.Context, cacheID ClusterCacheID) (<-
 	return filterChan(ctx, watchListChan(ctx, "ClusterCacheGVRSync", snap, src,
 		func(t ChangeType, id beehive.ObjectID, obj *beehive.Object[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus]) ClusterCacheGVRSyncChange {
 			if obj == nil {
-				// A hard Deleted carries no object, so its owner can't be checked. It is
-				// forwarded rather than dropped: the client keys removal on the id, and a
-				// stray id it never added is a no-op.
+				// A hard Deleted carries no object; forwarded — a stray removal is a
+				// no-op for the client.
 				return ClusterCacheGVRSyncChange{Type: t, Sync: &ClusterCacheGVRSync{ID: ClusterCacheGVRSyncID(id)}}
 			}
 			gs := buildGVRSync(obj)
@@ -1557,38 +1294,26 @@ func (s *Service) WatchGVRSyncs(ctx context.Context, cacheID ClusterCacheID) (<-
 	})), nil
 }
 
-// cacheWatchRetryInterval paces a cache watch's re-read after a failed one. Slow enough
-// that a persistently broken read isn't a hot loop, quick enough that a transient one
-// (a busy writer, a moment of contention) is invisible. It exists because the write-ping
-// that would otherwise drive recovery is resource-keyed: a kind nobody writes to would
-// never send another.
+// cacheWatchRetryInterval paces re-reads after a failed one — needed because the
+// write-ping that would otherwise drive recovery is resource-keyed, so a kind
+// nobody writes to would never send another.
 const cacheWatchRetryInterval = 2 * time.Second
 
-// syncHealthTick paces the sync-health rollup's periodic recompute. The verdict moves on
-// watch frames, but the freshness stamps it folds live in controller memory and change
-// with no frame at all (a worker's ~30s heartbeat writes nothing by design) — so without
-// a tick the rollup would freeze exactly the way the cache stats field did. Emission is
-// still change-gated, so a quiet fleet sends nothing.
+// syncHealthTick paces the rollup's periodic recompute: the freshness stamps it
+// folds live in controller memory and move with no frame at all. Emission stays
+// change-gated, so a quiet fleet sends nothing.
 const syncHealthTick = 10 * time.Second
 
-// syncHealthSnapshot is every cache's current verdict, keyed by cache id — the whole
-// output of the fold, published as one latest value.
-//
-// A published snapshot is immutable: the fold builds a fresh map each time rather than
-// mutating the last, because subscribers read it concurrently.
+// syncHealthSnapshot is every cache's current verdict, keyed by cache id — the
+// fold's whole output as one latest value. Published snapshots are immutable
+// (fresh map per publish; subscribers read concurrently).
 type syncHealthSnapshot map[ClusterCacheID]ClusterCacheSyncHealth
 
-// WatchCacheSyncHealth implements ClusterService — every cache's sync verdict, folded from
-// its per-kind records, as a latest-value stream keyed by cache id.
-//
-// Unscoped and one record per cache, so the always-mounted cluster registry can carry it —
-// which is the whole point: the per-kind stream it folds is a hundred-plus records per
-// cache and is only ever opened for the cache being looked at.
-//
-// Subscribers share ONE fold (see syncHealthReceiver). This adapter is the per-subscriber
-// half: it turns the shared snapshot into the per-cache frames the wire speaks, sending
-// only what changed for THIS subscriber — which is what makes a late joiner's first read
-// deliver every cache rather than nothing.
+// WatchCacheSyncHealth implements ClusterService — every cache's sync verdict as a
+// latest-value stream. Subscribers share ONE fold (syncHealthReceiver); this
+// adapter is the per-subscriber half, sending only what changed for THIS
+// subscriber — which is what gives a late joiner every cache on its first read.
+// See docs/adr/2026-08-09-status-propagation-gauges.md.
 func (s *Service) WatchCacheSyncHealth(ctx context.Context) (<-chan ClusterCacheSyncHealth, error) {
 	rx, err := s.syncHealthReceiver()
 	if err != nil {
@@ -1604,11 +1329,9 @@ func (s *Service) WatchCacheSyncHealth(ctx context.Context) (<-chan ClusterCache
 			if err != nil {
 				return // ctx ended, or the hub closed at shutdown
 			}
-			// Forget the caches that left the snapshot, so a subscriber's memory tracks
-			// the live fleet rather than every cache this process has ever seen. There is
-			// no delete FRAME to send: this stream is a gauge keyed by cacheID, and the
-			// consumer drops a cache's verdict when the cache itself leaves
-			// clusterCachesWatch, which is the stream that owns that lifecycle.
+			// Forget caches that left the snapshot. No delete FRAME: this is a gauge;
+			// the consumer drops a verdict when the cache leaves clusterCachesWatch,
+			// which owns that lifecycle.
 			for cacheID := range sent {
 				if _, ok := snap[cacheID]; !ok {
 					delete(sent, cacheID)
@@ -1628,13 +1351,10 @@ func (s *Service) WatchCacheSyncHealth(ctx context.Context) (<-chan ClusterCache
 	return out, nil
 }
 
-// syncHealthReceiver returns a receiver on the shared fold, starting it on first use.
-//
-// Lazily rather than in Start for two reasons: a fleet nobody is watching should not be
-// folded at all, and the fold outlives any one subscriber so it cannot hang off a
-// subscriber's context. Once started it runs until Close — there is no refcount, which
-// would buy little and add a teardown race for a goroutine that is idle when nothing
-// changes.
+// syncHealthReceiver returns a receiver on the shared fold, starting it on first
+// use — lazy so an unwatched fleet isn't folded, and the fold outlives any one
+// subscriber. Once started it runs until Close (no refcount: little gain, a
+// teardown race).
 func (s *Service) syncHealthReceiver() (*watch.Receiver[syncHealthSnapshot], error) {
 	s.syncHealthMu.Lock()
 	defer s.syncHealthMu.Unlock()
@@ -1651,19 +1371,14 @@ func (s *Service) syncHealthReceiver() (*watch.Receiver[syncHealthSnapshot], err
 	return s.syncHealth.Receiver(), nil
 }
 
-// startSyncHealthFold opens the two watches the fold reads and runs it, publishing every
-// recomputed snapshot to a latest-value hub.
-//
-// The hub carries the whole map rather than per-cache deltas, and that is the load-bearing
-// choice. The fold's INPUT is large (a hundred-plus records per cache) but its OUTPUT is
-// tiny (one per cache), so publishing the whole output is cheap — and it buys two
-// properties a delta broadcast would have to reimplement. A new subscriber's first read
-// returns the current value, which is exactly the "every cache, right now" a window needs
-// on open. And a slow subscriber coalesces: it skips intermediate maps and gets the
-// newest, which is correct for a gauge, where a dropped delta would instead be lost state.
+// startSyncHealthFold opens the two watches the fold reads and runs it, publishing
+// each recomputed snapshot to a latest-value hub. The hub carries the whole map,
+// not deltas — the output is tiny (one per cache), a new subscriber's first read is
+// "every cache, right now", and a slow subscriber coalesces to the newest (correct
+// for a gauge, where a dropped delta would be lost state).
 func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context.CancelFunc, chan struct{}, error) {
-	// Background, not a caller's: the fold outlives every subscriber. It is cancelled by
-	// stopSyncHealthFold, and by the fold goroutine itself on any other exit.
+	// Background, not a caller's: the fold outlives every subscriber. Cancelled by
+	// stopSyncHealthFold, or by the fold itself on any other exit.
 	ctx, cancel := context.WithCancel(context.Background())
 	syncSnap, syncSrc, err := s.gvrSyncClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
@@ -1679,29 +1394,25 @@ func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context
 	hub := watch.New(syncHealthSnapshot{})
 	done := make(chan struct{})
 	go func() {
-		// Declared first so it runs LAST: done means every defer below has run, which is
-		// the whole point of waiting on it — see stopSyncHealthFold.
+		// Declared first so it runs LAST: done means every defer below has run —
+		// see stopSyncHealthFold.
 		defer close(done)
 		defer func() {
 			if s.syncHealthFoldExit != nil {
 				s.syncHealthFoldExit()
 			}
 		}()
-		// Cancel our OWN context on the way out, whatever ended us. A fold can end without
-		// anybody calling the stop func — beehive terminating a watch (ErrWatchTooOld during
-		// a cold-sync write storm), or either source channel closing — and the two
-		// fleet-wide WatchList subscribers are registered against this context alone. Since
-		// forgetSyncHealthFold then clears the cached stop func, nothing else would ever
-		// call it: each self-termination would strand another pair for the process's life.
+		// Cancel our OWN context on any exit: a fold can end with nobody calling the
+		// stop func (beehive terminating a watch, a source closing), and the two
+		// fleet-wide WatchList leases are registered against this context alone —
+		// forgetSyncHealthFold clears the cached stop func, so nothing else would
+		// ever release them.
 		defer cancel()
 		defer hub.Close()
-		// Forget this hub on the way out, so a fold that ended on its own — a watch that
-		// beehive terminated, not our Close — doesn't leave the cached hub in place. A
-		// closed hub hands every later subscriber a pre-closed receiver, so without this a
-		// single ErrWatchTooOld during a cold-sync write storm would silently end sync
-		// status for every window until the process restarts. Clearing it makes the next
-		// subscriber start a fresh fold, which is how the per-subscriber watches already
-		// recover.
+		// Forget this hub on the way out: a closed hub hands later subscribers
+		// pre-closed receivers, so a self-terminated fold (e.g. ErrWatchTooOld
+		// during a cold-sync write storm) would otherwise silently end sync status
+		// until restart. Clearing lets the next subscriber start a fresh fold.
 		defer s.forgetSyncHealthFold(hub)
 		f := &syncHealthFold{
 			syncs:         map[beehive.ObjectID]gvrSyncRec{},
@@ -1746,8 +1457,8 @@ func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context
 				}
 				f.applySync(ch)
 			case <-tick.C:
-				// The stamps live in controller memory and move with no frame behind them,
-				// so this is the only thing that refreshes freshness on a settled cache.
+				// The only thing that refreshes freshness on a settled cache — the
+				// stamps move with no frame behind them.
 				f.markAll()
 			}
 			f.flush()
@@ -1756,10 +1467,9 @@ func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context
 	return hub, cancel, done, nil
 }
 
-// endSyncHealthWatch reports whether a change frame is beehive's terminal one, logging why.
-// It must be checked before the frame is folded: a Failed carries no object, which
-// applyDiscovery/applySync would otherwise read as a deletion and silently drop every
-// record of that kind on the way out.
+// endSyncHealthWatch reports whether a change frame is beehive's terminal one.
+// Check BEFORE folding: a Failed carries no object, which apply* would read as a
+// deletion.
 func endSyncHealthWatch(ctx context.Context, kind string, t beehive.ChangeType, err error) bool {
 	if t != beehive.Failed {
 		return false
@@ -1770,10 +1480,8 @@ func endSyncHealthWatch(ctx context.Context, kind string, t beehive.ChangeType, 
 	return true
 }
 
-// forgetSyncHealthFold drops the cached hub when the fold that owns it has ended, so the
-// next subscriber starts a new one. It clears only if the cache still points at THIS hub —
-// a stop that already replaced or cleared it must not be undone — and leaves the shutdown
-// latch alone, since a fold ending after Close must stay ended.
+// forgetSyncHealthFold drops the cached hub when its fold has ended. It clears
+// only if the cache still points at THIS hub, and leaves the shutdown latch alone.
 func (s *Service) forgetSyncHealthFold(hub *watch.Hub[syncHealthSnapshot]) {
 	s.syncHealthMu.Lock()
 	defer s.syncHealthMu.Unlock()
@@ -1790,17 +1498,15 @@ func (s *Service) stopSyncHealthFold(ctx context.Context) {
 	s.syncHealthClosed = true
 	stop, done := s.syncHealthStop, s.syncHealthDone
 	s.syncHealth, s.syncHealthStop, s.syncHealthDone = nil, nil, nil
-	// Released BEFORE the wait: the fold's own teardown calls forgetSyncHealthFold, which
-	// takes this same lock, so holding it across the join would deadlock the shutdown.
+	// Unlock BEFORE the wait: the fold's teardown takes this same lock.
 	s.syncHealthMu.Unlock()
 	if stop == nil {
 		return
 	}
 	stop()
-	// Join it. Cancelling alone only asks it to stop — the two fleet-wide WatchList leases
-	// come back in its defers, so returning here would let beehive start draining while the
-	// fold was still mid-flush, which is exactly what going first is meant to avoid. Bounded
-	// by the caller's drain deadline so a wedged fold can't hold up the whole shutdown.
+	// Join it: the WatchList leases come back in its defers, so returning early
+	// would let beehive drain while the fold is mid-flush. Bounded by the caller's
+	// drain deadline.
 	select {
 	case <-done:
 	case <-ctx.Done():
@@ -1835,23 +1541,19 @@ func compareKindRefs(a, b SyncedKindRef) int {
 type syncHealthFold struct {
 	syncs   map[beehive.ObjectID]gvrSyncRec
 	cacheOf map[ClusterCacheGVRDiscoveryID]ClusterCacheID
-	// byDiscovery indexes the per-kind records by their anchor, and discoveriesOf the
-	// anchors by their cache — together the reverse of cacheOf, so a flush can walk just
-	// the dirty caches' records instead of the whole fleet's. Without them the dirty set
-	// would scope which verdicts get recomputed but not how much is read to recompute
-	// them, which is the quadratic part.
+	// byDiscovery / discoveriesOf are the reverse indexes of cacheOf, so a flush
+	// walks only the dirty caches' records — without them the dirty set scopes
+	// which verdicts recompute but not how much is read (the quadratic part).
 	byDiscovery   map[ClusterCacheGVRDiscoveryID]map[beehive.ObjectID]struct{}
 	discoveriesOf map[ClusterCacheID]map[ClusterCacheGVRDiscoveryID]struct{}
 	// published is the last value sent per cache, so an unchanged recompute sends nothing.
 	published map[ClusterCacheID]ClusterCacheSyncHealth
-	// dirty is the set of caches whose fold may have moved since the last flush. Scoping
-	// matters at cold start: each of a cache's hundred-plus kinds delivers its own frame,
-	// and recomputing every cache on each of them is quadratic in the kind count.
+	// dirty scopes recompute to caches that may have moved — at cold start each of a
+	// cache's hundred-plus kinds delivers its own frame.
 	dirty map[ClusterCacheID]struct{}
-	// stats reads every kind's freshness from the controller that measured them, in one
-	// lock acquisition — see StatsSnapshot.
+	// stats reads every kind's freshness in one lock acquisition — see StatsSnapshot.
 	stats func() map[ClusterCacheGVRSyncID]ClusterCacheGVRSyncStats
-	// out publishes each recomputed snapshot. Latest-value, so a burst collapses.
+	// out publishes each recomputed snapshot; latest-value, so a burst collapses.
 	out *watch.Sender[syncHealthSnapshot]
 }
 
@@ -1875,8 +1577,8 @@ func (f *syncHealthFold) markAll() {
 func (f *syncHealthFold) putDiscovery(obj *beehive.Object[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus]) {
 	id := ClusterCacheGVRDiscoveryID(obj.ID)
 	cacheID := ClusterCacheID(ownerObjectID(obj))
-	// An anchor that moved caches (not a thing today, but the map allows it) must leave
-	// the one it came from, or its records would count toward both.
+	// An anchor that moved caches must leave the one it came from, or its records
+	// would count toward both.
 	if prev, ok := f.cacheOf[id]; ok && prev != cacheID {
 		f.unlinkDiscovery(id, prev)
 	}
@@ -1900,9 +1602,8 @@ func (f *syncHealthFold) unlinkDiscovery(id ClusterCacheGVRDiscoveryID, cacheID 
 }
 
 func (f *syncHealthFold) applyDiscovery(ch beehive.ObjectChange[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus]) {
-	// A deletion-pending object is gone as far as a consumer is concerned, the same rule
-	// watchListChan applies — a child on its way out must not keep counting toward its
-	// cache's verdict while GC works through the finalizers.
+	// Deletion-pending counts as gone (same rule as watchListChan): a child on its
+	// way out must not keep counting toward its cache's verdict.
 	if ch.Object == nil || ch.Type == beehive.Deleted || ch.Object.DeletionRequestedAt != nil {
 		id := ClusterCacheGVRDiscoveryID(ch.ID)
 		f.unlinkDiscovery(id, f.cacheOf[id])
@@ -1959,25 +1660,16 @@ func (f *syncHealthFold) flush() {
 	if len(f.dirty) == 0 {
 		return
 	}
-	// One lock acquisition for the whole flush rather than one per record — see
-	// StatsSnapshot.
+	// One lock acquisition for the whole flush — see StatsSnapshot.
 	stats := f.stats()
 
-	// Only the dirty caches' own records are read: a record whose anchor hasn't streamed
-	// in yet is in no cache's index and simply waits for the frame that anchors it.
 	changed := false
 	for cacheID := range f.dirty {
 		anchors := f.discoveriesOf[cacheID]
-		// No discovery anchor left: the cache is gone (its subtree was collected, or the
-		// whole cluster was), so its verdict is DROPPED rather than recomputed. Recomputing
-		// would fold zero records into a permanent "no kinds yet" Unknown and republish it
-		// forever — every later subscriber would be told about caches that no longer exist,
-		// and a delete/recreate cycle would grow the fold and every snapshot without bound.
-		//
-		// A cache is only in this map because an anchor was once seen (putDiscovery is the
-		// sole entry point), and the cache controller ensures the anchor for a cache's whole
-		// life, so "no anchors" means gone rather than "not yet". Nothing is published for a
-		// cache that was never known.
+		// No anchor left ⇒ the cache is gone (the controller ensures the anchor for
+		// a cache's whole life), so its verdict is DROPPED, not recomputed —
+		// recomputing would republish a permanent "no kinds yet" Unknown forever and
+		// grow every snapshot without bound.
 		if len(anchors) == 0 {
 			if _, ok := f.published[cacheID]; ok {
 				delete(f.published, cacheID)
@@ -2004,7 +1696,7 @@ func (f *syncHealthFold) flush() {
 	if !changed {
 		return
 	}
-	// A fresh map: the published one is read concurrently by every subscriber.
+	// Fresh map: the published one is read concurrently.
 	next := make(syncHealthSnapshot, len(f.published))
 	maps.Copy(next, f.published)
 	_ = f.out.Send(next) // only fails once the hub is closed, which ends the fold anyway
@@ -2053,24 +1745,17 @@ func buildGVRSync(obj *beehive.Object[ClusterCacheGVRSyncSpec, ClusterCacheGVRSy
 	}
 }
 
-// filterChan forwards what decide returns for each value of in — nothing, that value, or
-// that value behind a backlog decide had been holding. Closes out when in closes or ctx
-// ends.
-//
-// Zero-or-MORE rather than a bool because a filter may not be able to decide a frame yet,
-// and a watch frame dropped is a frame gone: beehive re-emits an object only when it
-// changes, so a consumer that never sees it never sees it. Holding the undecided ones and
-// releasing them once the answer arrives is what keeps that from being permanent.
+// filterChan forwards what decide returns for each value of in — zero or MORE,
+// because a filter may not be able to decide a frame yet, and a dropped watch
+// frame is gone for good (beehive re-emits only on change); holding undecided
+// frames keeps that from being permanent. Closes out when in closes or ctx ends.
 func filterChan[T any](ctx context.Context, in <-chan T, decide func(T) []T) <-chan T {
 	out := make(chan T, 1)
 	go func() {
 		defer close(out)
 		for v := range in {
-			// send, not a bare channel write: the consumer is a subscription that stops
-			// draining the moment its client goes away (a closed sync dialog), and the
-			// upstream watch's own ctx teardown can't unblock a goroutine already parked
-			// in a send. Without this each open/close of a per-cache watch parks one
-			// goroutine forever holding the change it was mid-forward on.
+			// send, not a bare write: a consumer that stops draining (closed sync
+			// dialog) would otherwise park this goroutine forever.
 			for _, o := range decide(v) {
 				if !send(ctx, out, o) {
 					return
@@ -2102,17 +1787,15 @@ func (s *Service) GetConnection(id ClusterID) *rest.Config {
 	return cfg
 }
 
-// buildCluster assembles a domain Cluster from a single Cluster beehive object. It
-// does not join cache children — those stream standalone via WatchCaches and are
-// joined by the caller — so it needs no ctx-bound reads.
+// buildCluster assembles a domain Cluster from one beehive object. Cache children
+// are not joined (they stream standalone via WatchCaches), so no ctx-bound reads.
 func (s *Service) buildCluster(obj *beehive.Object[ClusterSpec, ClusterStatus]) Cluster {
 	c := Cluster{
 		ID:         ClusterID(obj.ID),
 		Generation: obj.Generation,
 		CreatedAt:  obj.CreatedAt,
 		Spec:       obj.Spec,
-		// Conditions are beehive object rows, read off the object rather than out of the
-		// status blob. Already liveness-downgraded by the store, so a previous process's
+		// Already liveness-downgraded by the store: a previous process's
 		// Connected=True arrives here as Unknown.
 		Conditions: obj.Conditions,
 	}
@@ -2124,9 +1807,8 @@ func (s *Service) buildCluster(obj *beehive.Object[ClusterSpec, ClusterStatus]) 
 	return c
 }
 
-// buildClusterCache assembles a domain ClusterCache from a single ClusterCache beehive
-// object. Its parent ClusterID comes off the eager-loaded owner edge — see ownerObjectID
-// for why that read is best-effort and why it must not hit the store.
+// buildClusterCache assembles a domain ClusterCache; parent ClusterID comes off
+// the eager-loaded owner edge (see ownerObjectID).
 func buildClusterCache(obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) ClusterCache {
 	return ClusterCache{
 		ID:         ClusterCacheID(obj.ID),
@@ -2136,8 +1818,8 @@ func buildClusterCache(obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]
 	}
 }
 
-// buildGVRDiscovery assembles a domain ClusterCacheGVRDiscovery from a single beehive
-// object, its parent CacheID read off the eager-loaded owner edge.
+// buildGVRDiscovery assembles a domain ClusterCacheGVRDiscovery; parent CacheID
+// comes off the eager-loaded owner edge.
 func buildGVRDiscovery(obj *beehive.Object[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus]) ClusterCacheGVRDiscovery {
 	return ClusterCacheGVRDiscovery{
 		ID:         ClusterCacheGVRDiscoveryID(obj.ID),
@@ -2147,16 +1829,14 @@ func buildGVRDiscovery(obj *beehive.Object[ClusterCacheGVRDiscoverySpec, Cluster
 	}
 }
 
-// eventClient is the slice of a beehive kind client that reads its objects'
-// event logs. Every kind client satisfies it (ListEvents/WatchEvents don't mention
-// Spec/Status), so one reader serves every kind's events surface.
+// eventClient is the event-log slice of a beehive kind client; every kind client
+// satisfies it, so one reader serves every kind's events surface.
 type eventClient interface {
 	ListEvents(ctx context.Context, id beehive.ObjectID, opts ...beehive.EventOption) ([]beehive.Event, error)
 	WatchEvents(ctx context.Context, id beehive.ObjectID, opts ...beehive.EventOption) (*beehive.EventStream, error)
 }
 
-// eventOpts builds the beehive read/watch options for an events query: an
-// optional category filter plus a limit bound.
+// eventOpts builds the beehive event options: optional category filter + limit.
 func eventOpts(category *string, limit int) []beehive.EventOption {
 	opts := []beehive.EventOption{beehive.WithEventLimit(limit)}
 	if category != nil {
@@ -2165,8 +1845,7 @@ func eventOpts(category *string, limit int) []beehive.EventOption {
 	return opts
 }
 
-// toDomainEvent maps one beehive run to the wire shape, kept trivial by reusing the
-// ObjectID scalar for the run id and binding Type straight to beehive.EventType.
+// toDomainEvent maps one beehive run to the wire shape.
 func toDomainEvent(e beehive.Event) Event {
 	return Event{
 		ID:       ObjectID(e.ID),
@@ -2180,10 +1859,9 @@ func toDomainEvent(e beehive.Event) Event {
 	}
 }
 
-// events reads one object's event timeline (newest run first) through the given
-// kind client, optionally filtered to one category and bounded by limit (nil or
-// <= 0 uses defaultEventLimit). A read error yields nil, not an error — a partial
-// status read beats none.
+// events reads one object's event timeline (newest first; nil/<=0 limit uses
+// defaultEventLimit). A read error yields nil, not an error — a partial status
+// read beats none.
 func (s *Service) events(ctx context.Context, c eventClient, id beehive.ObjectID, category *string, limit *int) ([]Event, error) {
 	n := defaultEventLimit
 	if limit != nil && *limit > 0 {
@@ -2203,14 +1881,12 @@ func (s *Service) events(ctx context.Context, c eventClient, id beehive.ObjectID
 	return out, nil
 }
 
-// scheduleClient is the slice of a beehive kind client the schedule watch needs —
-// the live reconcile-schedule gauge. The real coreClient satisfies it; tests fake it.
+// scheduleClient is the schedule-gauge slice of a beehive kind client; tests fake it.
 type scheduleClient interface {
 	WatchSchedule(ctx context.Context, id beehive.ObjectID) (<-chan beehive.Schedule, error)
 }
 
-// toSchedule maps the beehive Schedule gauge to the domain view: a non-zero
-// NextRequeueAt becomes a pointer, the zero time (nothing scheduled) becomes nil.
+// toSchedule maps the beehive Schedule gauge to the domain view (zero time → nil).
 func toSchedule(s beehive.Schedule) Schedule {
 	if s.NextRequeueAt.IsZero() {
 		return Schedule{}
@@ -2219,9 +1895,7 @@ func toSchedule(s beehive.Schedule) Schedule {
 	return Schedule{NextRequeueAt: &at}
 }
 
-// mapChan streams every value from src onto a fresh buffered channel, applying fn,
-// until src closes or ctx ends (out is closed on exit). The shared body of the
-// per-object gauge/log pumps (scheduleWatch, watchEvents).
+// mapChan streams src through fn until src closes or ctx ends (out closes on exit).
 func mapChan[A, B any](ctx context.Context, src <-chan A, fn func(A) B) <-chan B {
 	out := make(chan B, 1)
 	go func() {
@@ -2245,10 +1919,8 @@ func mapChan[A, B any](ctx context.Context, src <-chan A, fn func(A) B) <-chan B
 	return out
 }
 
-// scheduleWatch streams one object's reconcile-schedule gauge through the given
-// client, mapping each beehive.Schedule to the domain Schedule. A scheduling change
-// fires no object WatchList, so this is the live source for the next-attempt
-// countdown. The channel closes when the source closes or ctx ends.
+// scheduleWatch streams one object's reconcile-schedule gauge — the live source
+// for the next-attempt countdown, since a scheduling change fires no WatchList.
 func (s *Service) scheduleWatch(ctx context.Context, c scheduleClient, id beehive.ObjectID) (<-chan Schedule, error) {
 	src, err := c.WatchSchedule(ctx, id)
 	if err != nil {
@@ -2257,11 +1929,9 @@ func (s *Service) scheduleWatch(ctx context.Context, c scheduleClient, id beehiv
 	return mapChan(ctx, src, toSchedule), nil
 }
 
-// ClusterScheduleWatch implements ClusterService — the Cluster-kind entrypoint to the
-// reconcile-schedule gauge, merged with the controller's in-flight probe signal so one
-// subscription drives both the "Next check" countdown and the "checking now" state. The
-// scheduler owns NextRequeueAt, the core controller owns Probing; both sub-sources are
-// current-on-subscribe, so the merged stream emits a fresh Schedule as either moves.
+// ClusterScheduleWatch implements ClusterService: the schedule gauge merged with
+// the controller's in-flight probe signal — the scheduler owns NextRequeueAt, the
+// core controller owns Probing; both are current-on-subscribe.
 func (s *Service) ClusterScheduleWatch(ctx context.Context, id ClusterID) (<-chan Schedule, error) {
 	schedSrc, err := s.scheduleWatch(ctx, s.coreClient, beehive.ObjectID(id))
 	if err != nil {
@@ -2271,11 +1941,9 @@ func (s *Service) ClusterScheduleWatch(ctx context.Context, id ClusterID) (<-cha
 	return mergeSchedule(ctx, schedSrc, probeSrc), nil
 }
 
-// mergeSchedule folds the schedule gauge (NextRequeueAt) and the in-flight probe
-// signal (Probing) into one Schedule stream, re-emitting the combined latest each
-// time either side changes. A closed sub-source is dropped (nil'd) rather than
-// ending the stream, so the other keeps flowing; the goroutine exits when both
-// close or ctx ends. The out channel closes on exit.
+// mergeSchedule folds the schedule gauge and the probe signal into one Schedule
+// stream, re-emitting the combined latest as either side moves. A closed
+// sub-source is nil'd, not stream-ending; out closes when both close or ctx ends.
 func mergeSchedule(ctx context.Context, schedSrc <-chan Schedule, probeSrc <-chan bool) <-chan Schedule {
 	out := make(chan Schedule, 1)
 	go func() {
@@ -2334,10 +2002,8 @@ func (s *Service) ClusterCacheEventsWatch(ctx context.Context, id ClusterCacheID
 	return s.watchEvents(ctx, s.cacheClient, beehive.ObjectID(id), category)
 }
 
-// ClusterCacheGVRSyncEvents implements ClusterService — one synced kind's
-// entrypoint to the generic event reader. This is where the sync-transition history
-// lives: each worker report is recorded on its own child's timeline, so the caller keys
-// on the child's id, not its cache's.
+// ClusterCacheGVRSyncEvents implements ClusterService — the sync-transition
+// history lives on the per-kind child, so the caller keys on the child's id.
 func (s *Service) ClusterCacheGVRSyncEvents(ctx context.Context, id ClusterCacheGVRSyncID, category *string, limit *int) ([]Event, error) {
 	return s.events(ctx, s.gvrSyncClient, beehive.ObjectID(id), category, limit)
 }
@@ -2348,12 +2014,9 @@ func (s *Service) ClusterCacheGVRSyncEventsWatch(ctx context.Context, id Cluster
 	return s.watchEvents(ctx, s.gvrSyncClient, beehive.ObjectID(id), category)
 }
 
-// watchEvents streams one object's event log as bare runs through the given kind
-// client, mirroring beehive's WatchEvents: its snapshot runs first, then the runs the
-// log grows by. beehive conflates per run id, so the consumer upserts by Event.ID (a
-// re-delivered id is an updated run, a new id a new run) — no add/modify classification
-// needed. The channel closes when the source closes or ctx ends; the stream's terminal
-// error (retention passed it, the object was collected, the beehive stopped) is logged.
+// watchEvents streams one object's event log as bare runs: snapshot runs first,
+// then growth. beehive conflates per run id, so the consumer upserts by Event.ID —
+// no add/modify classification. The stream's terminal error is logged.
 func (s *Service) watchEvents(ctx context.Context, c eventClient, id beehive.ObjectID, category *string) (<-chan Event, error) {
 	stream, err := c.WatchEvents(ctx, id, eventOpts(category, defaultEventLimit)...)
 	if err != nil {
@@ -2398,12 +2061,9 @@ func (s *Service) clusterByID(ctx context.Context, id ClusterID) (*beehive.Objec
 	return obj, err
 }
 
-// cacheRef resolves the on-disk locator for a cluster's active cache: the beehive
-// ObjectIDs of the parent Cluster (directory) and the ClusterCache for its
-// currently-connected identity (file). found is false when there is no active cache
-// (never probed, or the cache for that UID is missing/torn-down), which callers treat
-// as "no cache" rather than an error. Resolving takes the parent read (for Server.UID)
-// plus a name lookup.
+// cacheRef resolves the on-disk locator for a cluster's active cache. found is
+// false when there is no active cache (never probed, or the UID's cache is
+// missing/torn-down) — "no cache", not an error.
 func (s *Service) cacheRef(ctx context.Context, id ClusterID) (store.CacheRef, bool, error) {
 	clusterObj, err := s.coreClient.Get(ctx, beehive.ObjectID(id))
 	if errors.Is(err, beehive.ErrNotFound) {
@@ -2429,35 +2089,28 @@ func (s *Service) cacheRef(ctx context.Context, id ClusterID) (store.CacheRef, b
 // syncHealthAcc folds one cache's per-kind records into a single verdict.
 type syncHealthAcc struct {
 	total int
-	// worstRank/worstReason track the most severe reason seen; offender names the kinds
-	// behind it. Rank exists only to compare — the reason itself is carried along rather
-	// than mapped back from an int, so there is one ordering to keep in step, not two.
+	// worstRank/worstReason track the most severe reason seen; offender names the
+	// kinds behind it (the reason is carried along, not mapped back from the rank).
 	worstRank   int
 	worstReason string
 	offender    []SyncedKindRef
-	// paused names the kinds observed Paused. Names, not a count, because a paused cache
-	// reports them as its unhealthy resources — a pause is relayed to a cache's
-	// hundred-plus children one at a time, so a partly-paused cache is a state a UI sees.
+	// paused names (not counts) the kinds observed Paused: a pause relays to a
+	// cache's children one at a time, so a partly-paused cache is a state a UI sees.
 	paused []SyncedKindRef
-	// notWatching counts every kind whose observed reason is not Watching — the ranked
-	// ones AND the paused. It is what UnhealthyKinds reports, per the schema's "how many
-	// of them are not currently Watching": the offender list can't answer that, since it
-	// resets to a single name whenever a worse rank appears (one SyncFailed beside twenty
-	// Stale would report one).
+	// notWatching counts every kind not observed Watching — ranked AND paused; the
+	// offender list can't answer this (it resets to one name when a worse rank appears).
 	notWatching int
-	// unconfirmed counts the kinds nobody in THIS process has observed yet — no Synced
-	// condition, or one a previous process wrote that beehive is serving downgraded. They
-	// are neither healthy nor broken, and the verdict must not round them to either.
+	// unconfirmed counts kinds nobody in THIS process has observed — neither healthy
+	// nor broken, and the verdict must not round them to either.
 	unconfirmed int
 
 	lastUpdateAt *time.Time
 	lastLiveAt   *time.Time
 }
 
-// syncReasonRank orders the per-kind reasons by how much they should dominate a cache's
-// verdict. A hard failure beats a stall beats a wait beats a catch-up. A pause is not in
-// the ladder at all — it is the mildest reading, and verdict reaches it only when nothing
-// ranked and nothing unobserved is left.
+// syncReasonRank orders per-kind reasons by how much they dominate a cache's
+// verdict: failure > stall > wait > catch-up. A pause is not in the ladder — it is
+// the mildest reading, reached only when nothing ranked or unobserved is left.
 func syncReasonRank(reason string) int {
 	switch reason {
 	case ReasonSyncFailed:
@@ -2469,15 +2122,12 @@ func syncReasonRank(reason string) int {
 	case ReasonSyncing:
 		return 1
 	case ReasonWatching, ReasonPaused:
-		// Not faults, and never reached: add handles both before it ranks anything. Named
-		// so the default below can mean "unrecognized" rather than "healthy or unknown".
+		// Not faults; never reached (add handles both first). Named so default
+		// means "unrecognized".
 		return 0
 	default:
-		// An unfamiliar spelling is DEGRADED, not healthy. The schema tells consumers to
-		// treat an unknown reason that way, and the fold is a consumer: ranking it 0 would
-		// have made it invisible here — counted toward the total, matching no branch, and
-		// so folding into a Watching verdict. Ranked at the bottom so it registers without
-		// masking a reason this process does understand.
+		// An unfamiliar spelling is DEGRADED, not healthy (per the schema); ranked
+		// at the bottom so it registers without masking a known reason.
 		return 1
 	}
 }
@@ -2495,19 +2145,16 @@ func (a *syncHealthAcc) add(rec gvrSyncRec, st ClusterCacheGVRSyncStats) {
 	}
 
 	cond := FindCondition(rec.conditions, ConditionSynced)
-	// Only an OBSERVED Watching is health. A kind with no condition yet, or one a previous
-	// process wrote that beehive is serving downgraded, has not been seen Watching by
-	// anybody here — so it belongs in notWatching along with the outright faults, which is
-	// what makes UnhealthyKinds mean what the schema says it means. Right after a restart
-	// every kind is in exactly this state, and reporting 0 unhealthy beside an Unknown
-	// verdict was a frame whose two halves disagreed.
+	// Only an OBSERVED Watching is health: an unconfirmed or absent condition
+	// counts toward notWatching, or UnhealthyKinds would disagree with an Unknown
+	// verdict right after a restart. See docs/adr/2026-08-09-liveness-conditions.md.
 	if cond != nil && !cond.Unconfirmed && cond.Reason == ReasonWatching {
 		return
 	}
 	a.notWatching++
 
-	// Neither healthy nor broken: asserting a pre-restart verdict is what the Unconfirmed
-	// flag exists to prevent, and so is asserting HEALTH on its absence. See verdict.
+	// Neither healthy nor broken — never assert a pre-restart verdict, nor health
+	// on its absence. See verdict.
 	if cond == nil || cond.Unconfirmed {
 		a.unconfirmed++
 		return
@@ -2537,31 +2184,22 @@ func (a *syncHealthAcc) verdict(cacheID ClusterCacheID) ClusterCacheSyncHealth {
 	}
 	switch {
 	case a.total == 0:
-		// No kinds yet — the discovery pass hasn't landed. Not a fault, and not health
-		// either: nobody has observed anything to report.
+		// No kinds yet (discovery hasn't landed) — neither fault nor health.
 		h.Status, h.Reason = ConditionUnknown, ReasonSyncing
 	case a.worstRank > 0:
 		h.Status = ConditionFalse
 		h.Reason = a.worstReason
-		// Sorted so a consumer following "the first offender" (to pick which kind's
-		// timeline to show) keeps that choice stable while a hundred kinds stream in.
+		// Sorted so "the first offender" stays stable while kinds stream in.
 		slices.SortFunc(a.offender, compareKindRefs)
 		h.UnhealthyKindRefs = a.offender
 	case a.unconfirmed > 0:
-		// Some kind's verdict is still unobserved in this process. Healthy is a claim about
-		// EVERY kind, so it can't be made yet — most visibly right after a restart, when
-		// beehive serves every liveness condition downgraded until its worker re-confirms
-		// it, and this branch is the difference between "still catching up" and a cache
-		// reported fully synced before a single worker has run. Ranked below a real
-		// failure: a kind observed to be broken is a fact worth surfacing even while others
-		// are still reporting in.
+		// Some kind is still unobserved in this process; Healthy is a claim about
+		// EVERY kind, so it can't be made yet. Ranked below a real failure — an
+		// observed fault is worth surfacing while others report in.
 		h.Status, h.Reason = ConditionUnknown, ReasonSyncing
 	case len(a.paused) > 0:
-		// Some kinds are paused and nothing worse is known. Partial counts: a pause travels
-		// down a cache's children one at a time, so the in-between frames are real, and
-		// calling them Watching published a healthy status beside a non-zero
-		// unhealthyKinds and no names to explain it. Naming the paused kinds keeps the
-		// count and the list saying the same thing.
+		// Partial pause counts: calling in-between frames Watching would publish a
+		// healthy status beside a non-zero unhealthyKinds with no names behind it.
 		h.Status, h.Reason = ConditionFalse, ReasonPaused
 		slices.SortFunc(a.paused, compareKindRefs)
 		h.UnhealthyKindRefs = a.paused

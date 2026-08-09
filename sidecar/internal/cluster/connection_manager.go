@@ -34,11 +34,10 @@ type ConnectionManager struct {
 	configs map[ClusterID]connection
 }
 
-// connection is one cluster's stored credentials plus the fingerprint that identifies
-// them. The fingerprint is stored rather than recomputed by each reader because only the
-// core controller can compute it correctly — ConfigFingerprint needs the kubeconfig's
-// raw proxy-url (clientcmd compiles it into an unhashable rest.Config.Proxy func), which
-// no other controller reads. A reader recomputing it would silently miss a proxy change.
+// connection is one cluster's credentials plus their fingerprint. The fingerprint is
+// stored, not recomputed by readers: only the core controller sees the kubeconfig's raw
+// proxy-url (clientcmd compiles it into an unhashable Proxy func), so a reader
+// recomputing it would silently miss a proxy change.
 type connection struct {
 	cfg         *rest.Config
 	fingerprint string
@@ -58,11 +57,9 @@ func (m *ConnectionManager) Set(id ClusterID, cfg *rest.Config, fingerprint stri
 	m.configs[id] = connection{cfg: cfg, fingerprint: fingerprint}
 }
 
-// Get returns the REST config stored for id and the fingerprint identifying it, or
-// (nil, "") if none. The two are returned together, under one read, because they are one
-// value: a rotation landing between separate reads would pair the OLD config with the NEW
-// fingerprint, and a sync started that way records a fingerprint it isn't running — so
-// every later reconcile sees "unchanged" and never restarts it.
+// Get returns the stored config and fingerprint for id, or (nil, "") if none. One value
+// under one read: separate reads could pair an OLD config with a NEW fingerprint, and a
+// sync started that way looks "unchanged" to every later reconcile and never restarts.
 func (m *ConnectionManager) Get(id ClusterID) (*rest.Config, string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -77,17 +74,11 @@ func (m *ConnectionManager) Delete(id ClusterID) {
 	delete(m.configs, id)
 }
 
-// ConfigFingerprint hashes a rest.Config's connection/auth fields so a credential
-// rotation can be detected as a changed fingerprint (the trigger to restart a cluster's
-// sync). We hash the *static* exec/auth-provider config — runtime token minting is the
-// transport's job, but editing how tokens are obtained must invalidate it.
-//
-// proxyURL is the kubeconfig cluster's proxy-url. clientcmd compiles it into
-// rest.Config.Proxy (an opaque func we can't hash), so the caller passes the raw string
-// (ContextProxyURL): a changed proxy must restart sync even when every other field is
-// identical.
-//
-// Used by the connection sentinel (ClusterCoreController) and the sync layer.
+// ConfigFingerprint hashes a rest.Config's connection/auth fields; a changed fingerprint
+// is the credential-rotation trigger that restarts a cluster's sync. Hashes the *static*
+// exec/auth-provider config — runtime token minting is the transport's job, but editing
+// how tokens are obtained must invalidate it. proxyURL is passed raw (ContextProxyURL)
+// because clientcmd compiles it into an unhashable rest.Config.Proxy func.
 func ConfigFingerprint(cfg *rest.Config, proxyURL string) string {
 	if cfg == nil {
 		return ""

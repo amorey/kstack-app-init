@@ -23,36 +23,31 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// SentinelWatchFunc establishes one long-lived liveness watch against cfg. The
-// returned watch's result channel staying open means the connection is alive; it
-// closing (or a re-establish failing) is the connection-loss signal the sentinel
-// reacts to. Tests inject a fake; production uses watchKubeSystem.
+// SentinelWatchFunc establishes one long-lived liveness watch against cfg; the result
+// channel closing (or establish failing) is the connection-loss signal. Tests inject a
+// fake; production uses watchKubeSystem.
 type SentinelWatchFunc func(ctx context.Context, cfg *rest.Config) (watch.Interface, error)
 
-// connSentinel is the controller's handle on one cluster's running liveness
-// watch: the cancel that tears its goroutine down, and the config fingerprint it
-// was started with so a credential rotation can restart it (vs. leaving a stale
-// one watching with expired creds).
+// connSentinel is the handle on one cluster's running liveness watch: the cancel for
+// its goroutine, and the fingerprint it started with so a credential rotation restarts
+// it rather than leaving a stale watch on expired creds.
 type connSentinel struct {
 	cancel      context.CancelFunc
 	fingerprint string
 }
 
-// SetSentinelWatcher overrides the connection-sentinel watch function — for tests
-// (production defaults to watchKubeSystem). Call once, before the control plane
-// starts.
+// SetSentinelWatcher overrides the sentinel watch function (tests only). Call once,
+// before the control plane starts.
 func (c *ClusterCoreController) SetSentinelWatcher(f SentinelWatchFunc) {
 	c.sentinelWatch = f
 }
 
-// ensureSentinel guarantees a liveness watch is running for a just-connected
-// cluster, started with the given config. A no-op when one is already running on the
-// same fingerprint; a fingerprint change (credential rotation) restarts it. Called
-// from converge after a successful probe, so the sentinel exists exactly while the
-// cluster is connected. A nil bgCtx skips the launch: before StartBackground there is
-// nowhere to anchor the goroutine (the next reconcile starts it), and after
-// StopBackground clears bgCtx it is the shutdown gate — a reconcile racing teardown
-// must not sentinelWG.Add after StopBackground's Wait has begun.
+// ensureSentinel guarantees a liveness watch runs for a just-connected cluster. No-op
+// on the same fingerprint; a fingerprint change (rotation) restarts it. Called from
+// converge after a successful probe, so the sentinel exists exactly while connected.
+// Nil bgCtx skips the launch — before StartBackground there's nowhere to anchor the
+// goroutine, and after StopBackground it's the shutdown gate: a reconcile racing
+// teardown must not sentinelWG.Add once StopBackground's Wait has begun.
 func (c *ClusterCoreController) ensureSentinel(id ClusterID, cfg *rest.Config, fingerprint string) {
 	c.sentinelMu.Lock()
 	defer c.sentinelMu.Unlock()
@@ -74,9 +69,8 @@ func (c *ClusterCoreController) ensureSentinel(id ClusterID, cfg *rest.Config, f
 	go c.runSentinel(ctx, id, s, cfg)
 }
 
-// stopSentinel cancels and forgets the liveness watch for id (if any). Called from
-// converge when a cluster becomes ineligible or its probe/resolve fails — the
-// connection is gone, so its sentinel must not linger and re-probe.
+// stopSentinel cancels and forgets id's liveness watch (if any) — the connection is
+// gone, so its sentinel must not linger and re-probe.
 func (c *ClusterCoreController) stopSentinel(id ClusterID) {
 	c.sentinelMu.Lock()
 	defer c.sentinelMu.Unlock()
@@ -86,10 +80,9 @@ func (c *ClusterCoreController) stopSentinel(id ClusterID) {
 	}
 }
 
-// teardownConnection drops the cluster's cached connection and stops its liveness
-// sentinel — the common cleanup every "no longer connected" path in converge runs
-// (ineligible, resolve-fail, probe-fail), kept in one place so the two steps can't
-// drift apart.
+// teardownConnection drops the cached connection and stops the sentinel — the common
+// cleanup for every disconnected path in converge (ineligible, resolve-fail,
+// probe-fail), kept in one place so the two steps can't drift apart.
 func (c *ClusterCoreController) teardownConnection(id ClusterID) {
 	if c.connMgr != nil {
 		c.connMgr.Delete(id)
@@ -97,31 +90,27 @@ func (c *ClusterCoreController) teardownConnection(id ClusterID) {
 	c.stopSentinel(id)
 }
 
-// runSentinel holds one long-lived watch open and, when it closes, fires a single
-// out-of-band re-probe. The channel closing is the earliest connection-loss signal —
-// the HTTP/2 keepalive tears a silently-dead connection down in ~15s, closing the
-// stream. The re-probe re-confirms the connection and, on success, converge starts a
-// fresh sentinel; on failure beehive's backoff owns the retry cadence and no sentinel
-// runs while disconnected. A benign server-side watch timeout also closes the stream —
-// the resulting re-probe is idempotent and cheap, not worth distinguishing. One-shot:
-// it exits after firing (or on ctx cancel / establish failure), so a persistently-down
-// cluster never spins here.
+// runSentinel holds one long-lived watch open and fires a single out-of-band re-probe
+// when it closes — the earliest loss signal (HTTP/2 keepalive tears a silently-dead
+// connection down in ~15s). On success converge starts a fresh sentinel; on failure
+// beehive's backoff owns the cadence and no sentinel runs while disconnected. A benign
+// server-side watch timeout also closes the stream; the idempotent re-probe is cheap.
+// One-shot — exits after firing, so a persistently-down cluster never spins here.
+// See docs/adr/2026-08-09-connection-probing.md.
 func (c *ClusterCoreController) runSentinel(ctx context.Context, id ClusterID, self *connSentinel, cfg *rest.Config) {
 	defer c.sentinelWG.Done()
 	defer c.sentinelExited(id, self)
 
 	w, err := c.sentinelWatch(ctx, cfg)
 	if err != nil {
-		// Could not even establish the watch — the connection is down (unless we are
-		// shutting down, in which case fireSentinelReprobe stays quiet).
+		// Establish failed — connection down (fireSentinelReprobe stays quiet on shutdown).
 		c.fireSentinelReprobe(ctx, id, self)
 		return
 	}
 	defer w.Stop()
 
-	// Drain (and ignore) events — we watch for the stream closing, not its contents.
-	// Selecting on ctx.Done() too means a deliberate stop (shutdown / stopSentinel)
-	// tears the goroutine down even if the watch implementation does not honor ctx.
+	// Drain and ignore events — only the stream closing matters. Selecting on ctx.Done()
+	// tears the goroutine down even if the watch implementation ignores ctx.
 	for {
 		select {
 		case <-ctx.Done():
@@ -135,11 +124,10 @@ func (c *ClusterCoreController) runSentinel(ctx context.Context, id ClusterID, s
 	}
 }
 
-// fireSentinelReprobe requests an out-of-band re-probe of id, unless the sentinel's
-// context has been cancelled (shutdown or a deliberate stopSentinel). It clears the
-// sentinel's map entry first so the re-probe's converge sees no live sentinel and
-// starts a fresh one on success (else ensureSentinel would treat the just-exited entry
-// as running and skip the restart).
+// fireSentinelReprobe requests an out-of-band re-probe of id, unless ctx is cancelled
+// (shutdown or deliberate stop). Clears the map entry first so the re-probe's converge
+// sees no live sentinel — else ensureSentinel would treat the just-exited entry as
+// running and skip the restart.
 func (c *ClusterCoreController) fireSentinelReprobe(ctx context.Context, id ClusterID, self *connSentinel) {
 	if ctx.Err() != nil {
 		return
@@ -148,10 +136,8 @@ func (c *ClusterCoreController) fireSentinelReprobe(ctx context.Context, id Clus
 	c.Reprobe(id)
 }
 
-// sentinelExited removes self from the sentinels map if it is still the current
-// entry (pointer identity), so a sentinel replaced by ensureSentinel or cleared by
-// stopSentinel does not delete its successor. Idempotent — safe to call from both
-// fireSentinelReprobe and the run goroutine's defer.
+// sentinelExited removes self from the map only if still current (pointer identity),
+// so a replaced/cleared sentinel never deletes its successor. Idempotent.
 func (c *ClusterCoreController) sentinelExited(id ClusterID, self *connSentinel) {
 	c.sentinelMu.Lock()
 	defer c.sentinelMu.Unlock()
@@ -160,11 +146,9 @@ func (c *ClusterCoreController) sentinelExited(id ClusterID, self *connSentinel)
 	}
 }
 
-// watchKubeSystem opens a long-lived watch on the kube-system namespace — present on
-// every cluster — purely as a connection-liveness probe: the controller reacts to the
-// stream closing, never to its contents. The per-request timeout is cleared so the
-// watch isn't torn down on a timer; liveness is left to the HTTP/2 keepalive. The
-// production SentinelWatchFunc.
+// watchKubeSystem (the production SentinelWatchFunc) opens a long-lived watch on the
+// kube-system namespace — present on every cluster — purely as a liveness probe. The
+// per-request timeout is cleared; liveness is left to the HTTP/2 keepalive.
 func watchKubeSystem(ctx context.Context, cfg *rest.Config) (watch.Interface, error) {
 	wcfg := rest.CopyConfig(cfg)
 	wcfg.Timeout = 0 // long-lived stream; rely on HTTP/2 keepalive for liveness

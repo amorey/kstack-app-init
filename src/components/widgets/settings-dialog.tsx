@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The app's settings dialog. Opened from the sidebar account menu via
-// `openDialog('settings')` and rendered above the sidebar by `AppDialogs`, so it
-// outlives the sidebar card unmounting on auto-collapse. Each setting is a `Field`
-// row inside a `FieldGroup`; today the only one is Appearance (the theme picker).
+// The app's settings dialog: one `Field` row per setting. Rendered by
+// `AppDialogs`, not inline in the account menu that opens it, so it outlives the
+// sidebar card unmounting on auto-collapse. Settings persist to the host's
+// host.json; see docs/adr/2026-08-09-host-json-settings.md
 import { Monitor, Moon, Sun } from 'lucide-react';
 import type { ComponentType } from 'react';
 
@@ -26,16 +26,14 @@ import { Dialog } from '@/components/widgets/dialog';
 import { type AppDialogProps } from '@/lib/dialog';
 import { type ColorSchemePreference, useColorScheme } from '@/lib/theme';
 
-// The three color-scheme choices, in reading order. "System" leads because it's
-// the default (follow the OS).
+// "System" leads because it's the default.
 const COLOR_SCHEME_OPTIONS: { value: ColorSchemePreference; label: string; icon: ComponentType }[] = [
   { value: 'system', label: 'System', icon: Monitor },
   { value: 'light', label: 'Light', icon: Sun },
   { value: 'dark', label: 'Dark', icon: Moon },
 ];
 
-// Segmented single-choice control for the color scheme: the library's `Tabs`
-// strip used as a picker, no panels.
+// `Tabs` used as a segmented picker — no panels.
 function ColorSchemePicker() {
   const { preference, setPreference } = useColorScheme();
   return (

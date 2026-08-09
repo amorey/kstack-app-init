@@ -26,17 +26,12 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// dynamicSource is the production Source: cluster-wide list/watch of one GVR over the
-// dynamic client, so one worker mirrors every namespace (a cluster-scoped kind lists the
-// same way — the dynamic client's unnamespaced form covers both).
-//
-// It lives here rather than in each specialization because "list/watch one GVR" is the
-// only production source shape there is: the specializations differ in WHICH GVR, which
-// is an argument, not a different implementation.
+// dynamicSource is the production Source: cluster-wide list/watch of one GVR, so one
+// worker mirrors every namespace (the unnamespaced form covers cluster-scoped kinds too).
+// The specializations differ only in WHICH GVR, which is an argument.
 type dynamicSource struct {
 	dyn dynamic.Interface
-	// meta serves metadata-only lists — the cheap identity read the diff resync compares
-	// against the cache before deciding which bodies to fetch.
+	// meta serves metadata-only lists — the diff resync's cheap identity read.
 	meta metadata.Interface
 	gvr  schema.GroupVersionResource
 }
@@ -72,9 +67,8 @@ func (s *dynamicSource) Watch(ctx context.Context, opts metav1.ListOptions) (wat
 	return s.dyn.Resource(s.gvr).Watch(ctx, opts)
 }
 
-// ListMetadata lists this collection's identities only — no spec, no status. The API
-// server serves it from the same store as a full LIST, but the response is a small
-// fraction of the bytes, which is what makes the diff resync worth doing.
+// ListMetadata lists identities only — same server-side store as a full LIST, a fraction
+// of the bytes, which is what makes the diff resync worth doing.
 func (s *dynamicSource) ListMetadata(ctx context.Context, opts metav1.ListOptions) ([]ObjectMeta, string, string, error) {
 	ml, err := s.meta.Resource(s.gvr).List(ctx, opts)
 	if err != nil {
@@ -93,9 +87,8 @@ func (s *dynamicSource) ListMetadata(ctx context.Context, opts metav1.ListOption
 	return out, ml.GetContinue(), ml.GetResourceVersion(), nil
 }
 
-// Get fetches one full object. An empty namespace addresses a cluster-scoped kind.
+// Get fetches one full object; an empty namespace needs no branch, since the dynamic
+// client emits the namespaces/<ns> segment only for a non-empty one.
 func (s *dynamicSource) Get(ctx context.Context, namespace, name string) (*unstructured.Unstructured, error) {
-	// An empty namespace needs no branch: the dynamic client emits the namespaces/<ns>
-	// URL segment only for a non-empty one, so this IS the cluster-scoped path.
 	return s.dyn.Resource(s.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 }

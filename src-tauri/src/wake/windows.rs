@@ -12,19 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Windows native event sources for the wake/network-return → `Poke` driver.
-//!
-//! Both use callback-based notifications, so there's no hidden window or message
-//! pump:
-//!
-//! - **Wake**: `PowerRegisterSuspendResumeNotification` (`DEVICE_NOTIFY_CALLBACK`)
-//!   forwards a [`RawEvent::Resumed`] on the `PBT_APMRESUME*` codes.
-//! - **Network**: `NotifyNetworkConnectivityHintChange` (initial notification
-//!   primes the baseline) maps the hint's `ConnectivityLevel` via
-//!   [`core::win_connectivity_is_online`] into a [`RawEvent::NetworkChanged`].
-//!
-//! Both callbacks fire on system threads and forward through the [`WIN_TX`] global
-//! with best-effort `try_send`. A shutdown task unregisters both on app Quit.
+//! Windows wake/network sources — callback-based, no hidden window or message
+//! pump. **Wake**: `PowerRegisterSuspendResumeNotification` on the
+//! `PBT_APMRESUME*` codes. **Network**: `NotifyNetworkConnectivityHintChange`
+//! (initial notification primes the baseline) via
+//! [`core::win_connectivity_is_online`]. Callbacks fire on system threads and
+//! forward through [`WIN_TX`] with best-effort `try_send`; a shutdown task
+//! unregisters both on Quit.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};

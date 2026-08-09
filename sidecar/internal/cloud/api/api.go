@@ -1,11 +1,7 @@
-// Package api is a minimal GraphQL-over-HTTP client for the kstack cloud
-// API. It covers the Settings surface (get / update / watch); profile and
-// AI-model routing land here later.
-//
-// The client holds a token-source factory and pulls a fresh bearer for every
-// request, so auth lives in-process and callers never thread tokens through.
-// Three operations, one transport shape: GetSettings (POST), UpdateSettings
-// (POST), WatchSettings (SSE stream of `next` events).
+// Package api is a minimal GraphQL-over-HTTP client for the kstack cloud API, covering
+// the Settings surface. It holds a token-source factory and pulls a fresh bearer per
+// request, so callers never thread tokens through. GetSettings/UpdateSettings are POSTs;
+// WatchSettings is an SSE stream of `next` events.
 package api
 
 import (
@@ -24,8 +20,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefs"
 )
 
-// Settings is the cloud-synced preferences payload (alias of prefs.Settings,
-// re-exported for callers that only import this package).
+// Settings re-exports prefs.Settings for callers importing only this package.
 type Settings = prefs.Settings
 
 const (
@@ -35,49 +30,38 @@ const (
 	subWatchSettings = `subscription { settingsWatch { theme locale } }`
 )
 
-// Client talks to the kstack cloud GraphQL endpoint, authenticating every
-// request from a fresh oauth2.TokenSource built per request from the request
-// context (so the bounded token-fetch timeout governs each refresh).
+// Client talks to the cloud GraphQL endpoint, authenticating each request from a fresh
+// per-request TokenSource.
 type Client struct {
 	endpoint    string
 	tokenSource func(context.Context) oauth2.TokenSource
-	// Separate clients: the POST client has a sane timeout; the SSE client
-	// must not, because the stream is intentionally long-lived.
+	// Separate clients: post has a timeout; sse must not, its stream being
+	// intentionally long-lived.
 	post *http.Client
 	sse  *http.Client
 }
 
-// sseHeaderTimeout bounds the SSE open handshake (the wait for response headers).
-// It must NOT be a whole-request timeout — the stream body is long-lived — it only
-// stops a cloud/proxy that accepts the connection then stalls before replying from
-// hanging the engine's open call forever.
+// sseHeaderTimeout bounds the SSE open handshake ONLY (the wait for headers) — a
+// whole-request timeout would cap the long-lived stream body.
 var sseHeaderTimeout = 30 * time.Second
 
-// tokenFetchTimeout bounds acquiring the bearer token for a request (which may
-// trigger an OAuth refresh). The engine drives requests with long-lived
-// contexts, so without this a stalled token endpoint would hang sync (and
-// sign-out) indefinitely.
+// tokenFetchTimeout bounds acquiring the bearer (which may trigger a refresh); the engine
+// drives requests with long-lived contexts, so a stalled token endpoint would otherwise
+// hang sync and sign-out.
 var tokenFetchTimeout = 15 * time.Second
 
-// maxErrBody caps how much of a non-2xx response body we read for the error
-// message — enough for diagnostics, bounded so a huge/stalled body can't blow
-// memory or hang.
+// maxErrBody caps the diagnostic read of a non-2xx body.
 const maxErrBody = 4 << 10
 
-// maxRespBody caps a successful (2xx) response body. Settings payloads are tiny;
-// the cap exists only so a misconfigured cloud URL or proxy returning a huge 200
-// can't allocate unbounded memory.
+// maxRespBody caps a 2xx body, so a misconfigured URL returning a huge 200 can't allocate
+// unbounded memory.
 const maxRespBody = 1 << 20
 
-// New returns a Client bound to the cloud API's base URL (e.g.
-// https://api.kstack.sh); the /graphql path is appended here. A trailing
-// slash on the base is tolerated. tokenSource builds an oauth2.TokenSource
-// bound to the given (per-request) context — in production auth.Service's
-// TokenSource method.
+// New binds a Client to the cloud API base URL (trailing slash tolerated; /graphql is
+// appended). tokenSource builds a TokenSource bound to a per-request context.
 func New(baseURL string, tokenSource func(context.Context) oauth2.TokenSource) *Client {
-	// Clone the default transport (preserving proxy/dial settings) and add a
-	// response-header deadline for the SSE open handshake. No Client.Timeout —
-	// that would cap the long-lived stream body.
+	// Clone the default transport (keeping proxy/dial settings) and add only a
+	// response-header deadline — no Client.Timeout, which would cap the stream body.
 	sseTransport := http.DefaultTransport.(*http.Transport).Clone()
 	sseTransport.ResponseHeaderTimeout = sseHeaderTimeout
 
@@ -100,8 +84,7 @@ func (c *Client) GetSettings(ctx context.Context) (Settings, error) {
 	return resp.Settings, nil
 }
 
-// UpdateSettings posts the deep-merge mutation and returns the cloud's view
-// of the merged Settings.
+// UpdateSettings posts the deep-merge mutation and returns the merged Settings.
 func (c *Client) UpdateSettings(ctx context.Context, input Settings) (Settings, error) {
 	var resp struct {
 		UpdateSettings Settings `json:"updateSettings"`
@@ -121,8 +104,7 @@ type gqlEnvelope struct {
 	} `json:"errors"`
 }
 
-// token fetches the bearer under a bounded context so a stalled token/refresh
-// endpoint can't hang a request driven by a long-lived caller context.
+// token fetches the bearer under a bounded context — see tokenFetchTimeout.
 func (c *Client) token(ctx context.Context) (string, error) {
 	tctx, cancel := context.WithTimeout(ctx, tokenFetchTimeout)
 	defer cancel()
@@ -133,8 +115,7 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	return tok.AccessToken, nil
 }
 
-// newRequest builds an authenticated JSON POST to the GraphQL endpoint, fetching
-// the bearer under a bounded context.
+// newRequest builds an authenticated JSON POST to the GraphQL endpoint.
 func (c *Client) newRequest(ctx context.Context, body []byte) (*http.Request, error) {
 	token, err := c.token(ctx)
 	if err != nil {
@@ -165,14 +146,12 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 	}
 	defer resp.Body.Close()
 
-	// Check the status before reading: a non-2xx (mis)configured cloud/proxy can
-	// return an arbitrarily large error body, so cap the diagnostic read.
 	if resp.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBody))
 		return fmt.Errorf("cloud responded %d: %s", resp.StatusCode, body)
 	}
-	// Cap the successful body too. Read one byte past the cap so an over-limit
-	// body is detected rather than silently truncated into a decode error.
+	// One byte past the cap, so an over-limit body is detected rather than silently
+	// truncated into a decode error.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBody+1))
 	if err != nil {
 		return err
@@ -195,12 +174,10 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 	return nil
 }
 
-// WatchSettings opens a gqlgen-style SSE subscription. It returns a channel of
-// Settings events, a buffered channel carrying the stream's terminal error
-// (nil for a clean `event: complete` / ctx cancel, non-nil for a read failure),
-// and a synchronous error if the stream couldn't be opened. The events channel
-// closes when ctx is cancelled, the server sends `event: complete`, or the
-// connection errors.
+// WatchSettings opens a gqlgen-style SSE subscription, returning the events channel, a
+// buffered channel with the stream's terminal error (nil for a clean complete/cancel),
+// and a synchronous open error. The events channel closes on cancel, `complete`, or a
+// connection error.
 func (c *Client) WatchSettings(ctx context.Context) (<-chan Settings, <-chan error, error) {
 	body, err := json.Marshal(map[string]any{"query": subWatchSettings})
 	if err != nil {
@@ -227,19 +204,17 @@ func (c *Client) WatchSettings(ctx context.Context) (<-chan Settings, <-chan err
 	go func() {
 		err := parseSSE(ctx, resp.Body, "settingsWatch", out)
 		resp.Body.Close()
-		// Publish the terminal error before closing out (errCh is buffered, so
-		// this never blocks), so a reader observing the close can read it.
+		// Publish before closing out (errCh is buffered), so a reader observing the
+		// close can still read the terminal error.
 		errCh <- err
 		close(out)
 	}()
 	return out, errCh, nil
 }
 
-// readErrBody reads up to maxErrBody bytes of a non-2xx response body for an
-// error message, bounded by a deadline so a server that returns headers then
-// stalls the body can't hang the no-overall-timeout SSE client. The read runs in
-// a goroutine; the caller closes the body right after, unblocking a stalled read
-// so the goroutine can't leak (the buffered channel's send never blocks).
+// readErrBody reads a bounded, deadlined slice of a non-2xx body, so a server that sends
+// headers then stalls can't hang the timeout-less SSE client. The read runs in a
+// goroutine the caller unblocks by closing the body; the buffered send never blocks.
 func readErrBody(body io.Reader) string {
 	ch := make(chan []byte, 1)
 	go func() {
@@ -254,12 +229,9 @@ func readErrBody(body io.Reader) string {
 	}
 }
 
-// parseSSE reads a gqlgen SSE stream and pushes decoded `next` events onto
-// out. Frame format: lines of `field: value`, frames separated by blank
-// lines. Recognized events: `next` (data envelope) and `complete` (end). It
-// returns nil on a clean end (`complete` or ctx cancel); a non-nil error
-// (surfaced to the engine as Status.LastError) when the stream ends on a
-// GraphQL error frame or a read/transport failure.
+// parseSSE pushes decoded `next` events onto out (frames are `field: value` lines
+// separated by blank lines; `complete` ends the stream). Returns nil on a clean end,
+// else the error the engine surfaces as Status.LastError.
 func parseSSE(ctx context.Context, r io.Reader, dataField string, out chan<- Settings) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -269,9 +241,8 @@ func parseSSE(ctx context.Context, r io.Reader, dataField string, out chan<- Set
 		dataBuf   strings.Builder
 		streamErr error // set by a GraphQL error frame; returned as terminal error
 	)
-	// flush processes a completed frame and reports whether to keep reading.
-	// Returning false ends the stream: cleanly (`complete`/ctx cancel, streamErr
-	// nil) or on a GraphQL error frame (streamErr set).
+	// flush processes one frame; false ends the stream, cleanly or (streamErr set) on
+	// a GraphQL error frame.
 	flush := func() bool {
 		defer func() {
 			eventType = ""
@@ -283,11 +254,9 @@ func parseSSE(ctx context.Context, r io.Reader, dataField string, out chan<- Set
 			if err := json.Unmarshal([]byte(dataBuf.String()), &env); err != nil {
 				return true // skip malformed frame; keep stream open
 			}
-			// An error frame (typically data:null) is not a settings update. End the
-			// stream with the error rather than skipping it: never publish a (zero)
-			// Settings that could wipe local prefs, but surface the failure in
-			// Status.LastError so it backs off + reconnects instead of staying silently
-			// live.
+			// An error frame (typically data:null) must never publish a zero Settings
+			// that would wipe local prefs, and must not be silently skipped either —
+			// end the stream so the engine backs off and reconnects.
 			if len(env.Errors) > 0 {
 				streamErr = fmt.Errorf("graphql error: %s", env.Errors[0].Message)
 				return false
@@ -298,7 +267,7 @@ func parseSSE(ctx context.Context, r io.Reader, dataField string, out chan<- Set
 			}
 			s, ok := payload[dataField]
 			if !ok {
-				return true // no settingsWatch field present; nothing to publish
+				return true // nothing to publish
 			}
 			select {
 			case out <- s:
@@ -332,9 +301,8 @@ func parseSSE(ctx context.Context, r io.Reader, dataField string, out chan<- Set
 		}
 	}
 	flush() // trailing frame without a blank-line terminator
-	// A cancelled ctx is a clean shutdown (Poke/sign-out), not a failure — it
-	// wins over both a captured GraphQL error and the context.Canceled the
-	// blocked body read surfaces via scanner.Err().
+	// A cancelled ctx is a clean shutdown, winning over both a captured GraphQL error
+	// and the context.Canceled scanner.Err() surfaces.
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -344,10 +312,8 @@ func parseSSE(ctx context.Context, r io.Reader, dataField string, out chan<- Set
 	return scanner.Err()
 }
 
-// terminalErr resolves the terminal error for a frame-driven stop (`complete`,
-// ctx cancel, or a GraphQL error frame). A cancelled ctx is a clean shutdown
-// (Poke/sign-out), not a failure, so it wins over any captured error; otherwise
-// a GraphQL error frame's error (streamErr) is returned.
+// terminalErr resolves a frame-driven stop: a cancelled ctx is a clean shutdown and wins
+// over any captured error.
 func terminalErr(ctx context.Context, streamErr error) error {
 	if ctx.Err() != nil {
 		return nil

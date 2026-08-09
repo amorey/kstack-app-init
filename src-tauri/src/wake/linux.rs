@@ -12,17 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Linux native event sources for the wake/network-return → `Poke` driver. Both
-//! ride the system D-Bus bus via `zbus`:
-//!
-//! - **Wake**: systemd-logind's `PrepareForSleep(b)` — the `false` (resume) edge
-//!   forwards a [`RawEvent::Resumed`].
-//! - **Network**: NetworkManager's `StateChanged(u32)` (plus a one-time `State`
-//!   read to prime the baseline), mapped via [`core::nm_state_is_online`].
-//!
-//! Each source is a tokio task that selects on `shutdown` for clean Quit. On bus
-//! or service unavailability it logs and exits — the other source and the
-//! sidecar's wall-clock detector still function.
+//! Linux wake/network sources over the system D-Bus (`zbus`). **Wake**:
+//! logind's `PrepareForSleep(false)` = resume. **Network**: NetworkManager's
+//! `StateChanged` (plus a one-time `State` read to prime the baseline) via
+//! [`core::nm_state_is_online`]. Each source is a tokio task selecting on
+//! `shutdown`; on bus/service unavailability it logs and exits — the other
+//! source and the wall-clock detector still function.
 
 use futures_util::StreamExt;
 use tauri::AppHandle;

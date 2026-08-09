@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// React-side auth state, sourced entirely from the sidecar over GraphQL. The
-// renderer never holds tokens: the sidecar owns the OAuth flow + OS keychain and
-// publishes auth state on `authStateWatch` (snapshot first, then deltas on
-// sign-in/sign-out/refresh). `login`/`logout` are thin `authLoginStart`/`authLogout`
-// mutations whose resulting state change arrives back over the same subscription,
-// so there's one source of truth. Sign-in is non-blocking: the mutation returns
-// once the sidecar opens the browser; the signed-in state lands later via the
-// subscription (or not at all if the user abandons the flow).
+// Auth state from the sidecar over GraphQL. The renderer never holds tokens — the
+// sidecar owns OAuth + keychain and publishes `authStateWatch` (snapshot, then
+// deltas); `login`/`logout` are thin mutations whose result arrives back over the
+// same subscription. Sign-in is non-blocking: the mutation returns once the browser
+// opens; signed-in state lands later (or never, if abandoned).
 import { createContext, useCallback, useContext, useMemo } from 'react';
 import { useMutation } from 'urql';
 
@@ -27,9 +24,7 @@ import { graphql } from '@/gql';
 import type { AuthStateWatchSubscription } from '@/gql/graphql';
 import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 
-// AuthState mirrors the sidecar's GraphQL shape: `authenticated` is the explicit
-// sign-in signal; `identity` carries the verified claims and is non-null only
-// when authenticated.
+// Mirrors the sidecar's GraphQL shape; `identity` is non-null only when authenticated.
 export type Identity = {
   sub: string;
   email: string;
@@ -77,8 +72,6 @@ type AuthStateContextValue = {
 
 const AuthStateContext = createContext<AuthStateContextValue | null>(null);
 
-// Adapt the GraphQL shape to the renderer's AuthState. Identity is null while
-// signed out, so an absent identity reads as anonymous regardless of the boolean.
 function toAuthState(s: AuthStateWatchSubscription['authStateWatch']): AuthState {
   return {
     authenticated: s.authenticated,
@@ -87,8 +80,8 @@ function toAuthState(s: AuthStateWatchSubscription['authStateWatch']): AuthState
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  // Last-value semantics; useWatchSubscription returns to "no frame yet" (→
-  // loading) on a transport reconnect, until the stream replays its snapshot.
+  // Last-value semantics; reverts to "no frame yet" (→ loading) on a transport
+  // reconnect until the snapshot replays.
   const [{ data }] = useWatchSubscription<AuthStateWatchSubscription, AuthStateWatchSubscription>(
     { query: AuthStateWatchSubscription },
     (_prev, next) => next,
@@ -96,16 +89,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [, runStartLogin] = useMutation(AuthLoginStartMutation);
   const [, runLogout] = useMutation(AuthLogoutMutation);
 
-  // No frame yet → still loading, anonymous. Once the first snapshot lands the
-  // state reflects it (the sidecar always emits a current snapshot first).
+  // No frame yet → loading, anonymous; the sidecar always emits a snapshot first.
   const authState = data ? toAuthState(data.authStateWatch) : SIGNED_OUT;
   const loading = data === undefined;
 
-  // login/logout just fire the mutations; the resulting state arrives over the
-  // subscription. The GraphQL error exchange reports mutation/transport errors to
-  // the error bus; here we only surface them to callers (ProfileMenu swallows
-  // them). The async browser sign-in's outcome isn't a mutation error — it shows
-  // up as an auth-state change (or stays signed-out).
+  // Resulting state arrives over the subscription; mutation errors go to the error
+  // bus and are rethrown to callers. A browser sign-in's outcome is never a
+  // mutation error — it shows up as an auth-state change (or stays signed-out).
   const login = useCallback(async () => {
     const res = await runStartLogin({});
     if (res.error) throw res.error;

@@ -20,27 +20,20 @@ use crate::host_file::{self, HostFile, HostFilePatch};
 use crate::services::sidecar::GraphqlResponse;
 use crate::state::AppState;
 
-/// Probes the sidecar's IPC listener. Returns once the listener accepts a
-/// connection, or `Err` (as `networkError` on the frontend) once the
-/// connect budget elapses. Frontend uses it as a startup gate so the
-/// first real GraphQL call doesn't absorb the bind-wait latency silently.
+/// Probes the sidecar's IPC listener; the frontend's startup gate. `Err`
+/// (frontend `networkError`) once the connect budget elapses.
 #[tauri::command]
 pub async fn ready(state: State<'_, AppState>) -> Result<()> {
     state.sidecar.ready().await
 }
 
-/// Opens a new application window. Backs the webview `AppMenu`'s "New Window"
-/// item and `Ctrl+N` on Linux/Windows; macOS drives the same action through its
-/// native menu (`app_menu.rs`). Delegates to the shared `WindowManager`.
+/// Opens a new application window (webview `AppMenu` "New Window" / `Ctrl+N`
+/// on Linux/Windows; macOS uses its native menu, `app_menu.rs`).
 ///
-/// `async` + `spawn_blocking` on purpose. `build()` parks its calling thread
-/// until the webview exists; on the main thread that deadlocks on Windows,
-/// where the WebView2 controller is created asynchronously by the main-thread
-/// event loop, which can't pump while blocked in `build()`. And the blocking
-/// pool rather than an async worker, since parking a worker would hold a thread
-/// that serves [`graphql_query`] for the whole build. `AppState` is resolved
-/// inside the closure because a borrow of `app` can't cross into a `'static`
-/// task.
+/// Must stay `spawn_blocking`, never `spawn` or the main thread: `build()`
+/// parks its thread until the webview exists — a main-thread build deadlocks
+/// Windows (WebView2's controller is created by the main-thread event loop),
+/// and parking an async worker would starve [`graphql_query`].
 #[tauri::command]
 pub async fn new_window(app: AppHandle) -> Result<()> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -51,13 +44,10 @@ pub async fn new_window(app: AppHandle) -> Result<()> {
     .map_err(|err| std::io::Error::other(format!("window build task failed: {err}")))?
 }
 
-/// Applies a partial update to `host.json`, the host's persisted settings file
-/// (see the `host_file` module). Deliberately general — the webview sends just
-/// the fields it wants to change (e.g. `{ colorSchemePreference: "dark" }`), so
-/// adding a setting extends `HostFilePatch` rather than the command list. On
-/// success the merged file is broadcast to every window as a
-/// `host_file::UPDATED_EVENT` (how all open windows track it live) and also
-/// returned to the caller.
+/// Applies a partial update to `host.json` (see `host_file`); adding a setting
+/// extends `HostFilePatch`, not the command list. Broadcasts the merged file to
+/// every window as `host_file::UPDATED_EVENT` and returns it. See
+/// docs/adr/2026-08-09-host-json-settings.md.
 #[tauri::command]
 pub fn update_host_file(app: AppHandle, patch: HostFilePatch) -> Result<HostFile> {
     let file = host_file::update(&host_file::path(&app)?, patch)?;
@@ -65,29 +55,23 @@ pub fn update_host_file(app: AppHandle, patch: HostFilePatch) -> Result<HostFile
     Ok(file)
 }
 
-/// Quits the app. Routes through [`AppHandle::exit`] — the same
-/// graceful-shutdown path as the tray and macOS-menu "Quit" — so the
-/// `RunEvent::ExitRequested` teardown runs. Backs the `AppMenu` "Quit" item
-/// and `Ctrl+Q` on Linux/Windows.
+/// Quits via [`AppHandle::exit`] so the `RunEvent::ExitRequested` teardown
+/// runs — the same path as the tray and macOS-menu "Quit".
 #[tauri::command]
 pub fn quit(app: AppHandle) {
     app.exit(0);
 }
 
-/// Forwards a GraphQL query/mutation body to the sidecar over its UDS HTTP
-/// endpoint. Returns the raw response body alongside the HTTP status so the
-/// frontend can construct a `Response` with the real status — the only
-/// case that surfaces as `Err` (and hence as `networkError`/retry on the
-/// frontend) is a transport failure. The body argument shape matches
-/// `src/lib/graphql/invoke-fetch.ts`.
+/// Forwards a GraphQL query/mutation to the sidecar over UDS HTTP. Returns
+/// body + real HTTP status; only a transport failure is `Err` (frontend
+/// `networkError`/retry). Shape matches `src/lib/graphql/invoke-fetch.ts`.
 #[tauri::command]
 pub async fn graphql_query(state: State<'_, AppState>, body: String) -> Result<GraphqlResponse> {
     state.sidecar.query(body).await
 }
 
-/// Registers a new GraphQL subscription, which the host streams over its own
-/// SSE connection to the sidecar. Returns the op id urql will pass to
-/// [`graphql_unsubscribe`] on teardown. Argument shape matches
+/// Registers a GraphQL subscription (one SSE connection to the sidecar).
+/// Returns the op id for [`graphql_unsubscribe`]. Shape matches
 /// `src/lib/graphql/subscribe-exchange.ts`.
 #[tauri::command]
 pub async fn graphql_subscribe(
@@ -99,9 +83,8 @@ pub async fn graphql_subscribe(
     state.sidecar.subscribe(query, variables, channel).await
 }
 
-/// Cancels a previously registered subscription. Tolerant of unknown ids:
-/// the frontend can race teardown with the subscribe resolve
-/// (subscribe-exchange.ts:129) and pass an id the registry never minted.
+/// Cancels a subscription. Tolerant of unknown ids — the frontend can race
+/// teardown with the subscribe resolve (subscribe-exchange.ts).
 #[tauri::command]
 pub async fn graphql_unsubscribe(state: State<'_, AppState>, id: u64) -> Result<()> {
     state.sidecar.unsubscribe(id).await;

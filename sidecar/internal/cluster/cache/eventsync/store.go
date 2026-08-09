@@ -27,9 +27,8 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
-// resumeKeyPrefix names this collection's cluster_meta resume-cookie pair. It is the
-// "<apiVersion>/<Kind>" shape every synced collection keys its cookie under, so the events
-// pair sits in the same namespace as every per-GVR sync's.
+// resumeKeyPrefix names this collection's cluster_meta cookie pair, in the
+// "<apiVersion>/<Kind>" namespace every synced collection shares.
 const resumeKeyPrefix = "v1/Event"
 
 // eventRow is one row of the cache's events table, flattened from an Event body.
@@ -48,18 +47,13 @@ type eventRow struct {
 	RawJSON      []byte
 }
 
-// eventStore is the write path into one cache's events table — the kubesync.Store the
-// events worker lands its pulls in. Reads live on store.ClusterDB (Events, consumed by
-// ClusterDataEventsWatch); this is the only writer, so the two stay on opposite sides of
-// the same handle.
+// eventStore is the only writer into one cache's events table; reads live on
+// store.ClusterDB.Events.
 type eventStore struct {
-	cdb *store.ClusterDB
-	// resume is this collection's list/watch position in cluster_meta — the shared
-	// protocol, since the key prefix is the only thing that differs per collection.
+	cdb    *store.ClusterDB
 	resume *store.ResumeCookie
-	// now supplies the updated_at stamp. A seam only so this package's tests can freeze it
-	// and pin the relist sweep's boundary, which is otherwise decided by whether the
-	// millisecond happened to tick between a write and the relist that follows it.
+	// now supplies the updated_at stamp; a seam so tests can freeze it and pin the relist
+	// sweep's boundary.
 	now func() int64
 }
 
@@ -67,26 +61,18 @@ var _ kubesync.Store = (*eventStore)(nil)
 
 func newEventStore(cdb *store.ClusterDB) *eventStore {
 	s := &eventStore{cdb: cdb, now: func() int64 { return time.Now().UnixMilli() }}
-	// The cookie reads the clock through s, not a copy of it, so a test that freezes
-	// s.now freezes the cookie's stamp too.
+	// Read the clock through s, not a copy, so freezing s.now freezes the cookie too.
 	s.resume = store.NewResumeCookie(cdb, resumeKeyPrefix, func() int64 { return s.now() })
 	return s
 }
 
-// EnsureCatalog registers the Event kind in the cache's kind_catalog. The worker calls it
-// on every start; the upsert makes that a no-op after the first.
+// EnsureCatalog registers the Event kind in kind_catalog. Events are excluded from the
+// per-GVR object sync, so no objectsync worker writes this row — and without it the
+// ('v1','Event') tally kept by the events triggers is unreachable (store.Kinds joins
+// counts onto the catalog), leaving the dashboard's Events row countless.
 //
-// Events are excluded from the per-GVR object sync (one uid-keyed table, two api
-// spellings — see eventsGVR), so no objectsync worker writes this row and it has to come
-// from here. It matters because the catalog is what makes a kind's count reachable:
-// store.Kinds is a kind_catalog LEFT JOIN over the trigger-maintained kind_counts, so
-// without a catalog row the ('v1','Event') tally the events triggers keep exact is
-// invisible, and the dashboard's curated Events row shows no count.
-//
-// There is no counterpart removal. Unlike a per-GVR sync — whose kind can stop being
-// served, taking its rows and catalog entry with it — the events child exists for its
-// cache's whole life, so the only thing that ends this row is the cache file being
-// deleted outright.
+// No counterpart removal: the events child lives as long as its cache, so only deleting
+// the cache file ends this row.
 func (s *eventStore) EnsureCatalog(ctx context.Context) error {
 	return store.EnsureKindCatalog(ctx, s.cdb, store.KindRow{
 		APIVersion: "v1",
@@ -96,8 +82,8 @@ func (s *eventStore) EnsureCatalog(ctx context.Context) error {
 	})
 }
 
-// insertRow upserts one event, compressing raw_json. The single write chokepoint for
-// the events table — both write paths (watch delta, relist page) route through it.
+// insertRow upserts one event, compressing raw_json — the single write chokepoint both
+// the watch-delta and relist-page paths route through.
 func (s *eventStore) insertRow(ctx context.Context, ex store.Execer, row eventRow, now int64) error {
 	rawJSON, err := store.CompressRaw(row.RawJSON)
 	if err != nil {
@@ -146,9 +132,8 @@ func (s *eventStore) upsert(ctx context.Context, u *unstructured.Unstructured) e
 	if err != nil {
 		return err
 	}
-	// The row and the cookie land together — see kubesync.Store.ApplyChange. One
-	// transaction is also one acquisition of the cache's single-connection writer pool,
-	// which every kind's worker shares.
+	// Row + cookie together (see kubesync.Store.ApplyChange); one transaction is also one
+	// acquisition of the cache's single-connection writer pool.
 	tx, err := s.cdb.Writer().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -163,19 +148,14 @@ func (s *eventStore) upsert(ctx context.Context, u *unstructured.Unstructured) e
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// Wake the events watch on the dedicated events broker — not the object-write
-	// broker — so an event burst never triggers the (unrelated) kind-catalog re-read.
-	// The events watch coalesces + debounces these pings, so a burst still collapses
-	// into one re-read.
+	// The dedicated events broker, so a burst never drives the object watches.
 	s.cdb.EventsNotify()
 	return nil
 }
 
 func (s *eventStore) remove(ctx context.Context, u *unstructured.Unstructured) error {
-	// An unkeyable delete is an ERROR, not a quiet no-op — as it is on the write path. nil
-	// reported success for a delta whose cookie was never advanced, so the driver booked
-	// progress and a crash in that window resumed the watch from an older position and
-	// replayed. Ending the phase re-lists instead.
+	// An unkeyable delete errors rather than no-opping: nil would book progress for a
+	// delta whose cookie never advanced, so a crash there would resume older and replay.
 	uid := string(u.GetUID())
 	if uid == "" {
 		return fmt.Errorf("eventsync: event delete has empty UID")
@@ -198,60 +178,48 @@ func (s *eventStore) remove(ctx context.Context, u *unstructured.Unstructured) e
 	return nil
 }
 
-// Count returns how many events the cache currently holds — the warm-cache size the
-// resume report describes itself with.
+// Count returns the cached event count — the warm-cache size a resume reports.
 func (s *eventStore) Count(ctx context.Context) (int, error) {
 	var n int
 	err := s.cdb.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&n)
 	return n, err
 }
 
-// BeginReplace opens a streaming full-LIST reconcile of the events table. It prunes
-// (in Commit): a row absent from the LIST is gone from the server, so the cache mirrors
-// the server's current event set and retention is whatever the server enforces
-// (--event-ttl). Every row's exit is a relist prune, an explicit watch Deleted, or both.
+// BeginReplace opens a streaming full-LIST reconcile. Commit prunes: a row absent from
+// the LIST is gone from the server, so retention is whatever the server enforces
+// (--event-ttl).
 //
-// Clearing the resume cookie is DEFERRED to the first WritePage rather than done here,
-// so a pass that fails before writing anything leaves the untouched snapshot's cookie
-// intact and the next start still resumes cheaply. Because a relist prunes, that clear
-// is load-bearing: a pass that fails after writing pages but before Commit leaves no
-// cookie, so the next start cold-LISTs and its prune reconciles the leftover rows
-// instead of resuming past them.
+// Clearing the resume cookie is DEFERRED to the first WritePage, so a pass failing before
+// any write keeps the intact snapshot's cookie, while one failing after writing leaves no
+// cookie and the next start cold-LISTs and prunes the leftovers.
+// See docs/adr/2026-08-09-kubesync-watch-poll.md.
 func (s *eventStore) BeginReplace() kubesync.ReplaceSession {
 	return &replaceSession{s: s, mark: s.now() + 1}
 }
 
-// replaceSession streams a paginated event relist into the events table and reconciles the
-// table to what the LIST returned. The prune isn't scoped by kind — Event owns this table
-// outright, so every row is in scope.
+// replaceSession streams a paginated relist into the events table (Event owns the table
+// outright, so the prune is unscoped).
 //
-// It reconciles by **mark and sweep** rather than by remembering what it saw: every
-// WritePage stamps `updated_at`, and Commit deletes the rows still older than the session's
-// start, in one statement with no read-back. A keep-set of every uid in the collection
-// would defeat the point of paginating, and a per-stale-row DELETE would hold the cache's
-// single writer connection across thousands of statements.
+// It reconciles by MARK AND SWEEP, not a keep-set: every WritePage stamps updated_at and
+// Commit deletes what's still older, in one statement. A keep-set of every uid would
+// defeat pagination, and per-row DELETEs would hold the single writer for thousands of
+// statements. The mark is 1ms PAST the session start, since updated_at has millisecond
+// resolution and a same-tick row would otherwise look like one this pass wrote.
 //
-// The mark is one millisecond PAST the session start, because updated_at has millisecond
-// resolution and a row written in the same tick would otherwise masquerade as one this pass
-// wrote.
-//
-// Per-page commits trade the single-transaction atomicity of the whole pass for a memory
-// bound (one page of bodies at a time): a pass that fails mid-pagination leaves its
-// committed pages visible until the next pass's prune reconciles them. An abandoned
-// session needs no teardown — just drop it.
+// Per-page commits trade whole-pass atomicity for a one-page memory bound: a pass failing
+// mid-pagination leaves committed pages visible until the next pass prunes them.
+// See docs/adr/2026-08-09-kubesync-watch-poll.md.
 type replaceSession struct {
 	s *eventStore
 	// mark is the updated_at boundary Commit sweeps below.
 	mark int64
-	// cookieCleared records whether the first WritePage has durably cleared the resume
-	// cookie, so the clear happens once per session.
+	// cookieCleared makes the first WritePage's cookie clear happen once per session.
 	cookieCleared bool
 }
 
 // WritePage lands one page in its own transaction, clearing the resume cookie alongside
-// the first page's rows (see BeginReplace) so partial durable state and a "sync
-// completed" cookie can never coexist. An event body that won't project (no UID) is
-// skipped rather than failing the page — one malformed row must not wedge the pass.
+// the first page's rows (see BeginReplace) so partial rows and a "sync completed" cookie
+// can never coexist. A body that won't project (no UID) is skipped, not fatal.
 func (r *replaceSession) WritePage(ctx context.Context, items []*unstructured.Unstructured) error {
 	if len(items) == 0 {
 		return nil
@@ -266,8 +234,8 @@ func (r *replaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 			return err
 		}
 	}
-	// Stamp at or after the mark, never below it, so this page's rows survive the sweep
-	// even when the whole pass runs inside one millisecond.
+	// Never below the mark, so this page survives the sweep even if the whole pass runs
+	// inside one millisecond.
 	now := max(r.s.now(), r.mark)
 	for _, u := range items {
 		row, err := extractEvent(u)
@@ -282,18 +250,16 @@ func (r *replaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 		return err
 	}
 	r.cookieCleared = true
-	// Notify per committed page, not only at Commit, so durable rows always reach the
-	// events watch — a relist that commits pages then fails would otherwise leave them
-	// durable-but-unannounced until some later write.
+	// Per committed page, not only at Commit: a relist that commits pages then fails
+	// would otherwise leave durable rows unannounced until some later write.
 	r.s.cdb.EventsNotify()
 	return nil
 }
 
-// Commit sweeps the rows no page rewrote, then persists the resume cookie. The deletes
-// fire the events_kind_count triggers, keeping the kind_counts Event tally exact. Both
-// cookie writes (last_list_rv + last_list_at) share the sweep's transaction, so a failed
-// persist can't leave last_list_rv durably advanced — which would resume the next watch
-// from a newer RV and skip the events before it.
+// Commit sweeps the rows no page rewrote, then persists the cookie in the same
+// transaction — a failed persist must not leave last_list_rv durably advanced, which
+// would resume the next watch past the events before it. The deletes fire the
+// events_kind_count triggers, keeping the Event tally exact.
 func (r *replaceSession) Commit(ctx context.Context, resourceVersion string) (int, error) {
 	tx, err := r.s.cdb.Writer().BeginTx(ctx, nil)
 	if err != nil {
@@ -320,22 +286,18 @@ func (r *replaceSession) Commit(ctx context.Context, resourceVersion string) (in
 	return int(pruned), nil
 }
 
-// PersistRV advances the resume cookie without touching event rows — called on every
-// watch delta so a wake resumes from the latest position.
+// PersistRV advances the resume cookie without touching rows — the bookmark path.
 func (s *eventStore) PersistRV(ctx context.Context, rv string) error {
 	return s.resume.Persist(ctx, s.cdb.Writer(), rv)
 }
 
-// ResumeRV returns the resume cookie to seed a watch from, or "" to force a cold
-// full-LIST.
+// ResumeRV returns the cookie to seed a watch from, or "" to force a cold full LIST.
 func (s *eventStore) ResumeRV(ctx context.Context) (string, error) {
 	return s.resume.Get(ctx)
 }
 
-// extractEvent flattens an Event body into the events table's columns. It normalises
-// both core/v1 Event and events.k8s.io/v1 Event, which carry the same data under
-// different field names: the worker lists core/v1 (the api server serves every event
-// there), but a body reaching us through either spelling projects the same.
+// extractEvent flattens an Event body into the events columns, normalising both core/v1
+// and events.k8s.io/v1 spellings of the same data into one row.
 func extractEvent(u *unstructured.Unstructured) (eventRow, error) {
 	rawJSON, err := json.Marshal(u.Object)
 	if err != nil {
@@ -349,10 +311,8 @@ func extractEvent(u *unstructured.Unstructured) (eventRow, error) {
 		return eventRow{}, fmt.Errorf("eventsync: event has empty UID")
 	}
 
-	// Branch on which field group is present, not on whether the UID is set:
-	// involvedObject.uid is optional (name-only references are valid), so a missing UID
-	// must not be mistaken for the events.k8s.io `regarding` spelling and clobber a real
-	// involvedObject identity.
+	// Branch on which field group is present, not on the UID: involvedObject.uid is
+	// optional, so a missing one must not be read as the `regarding` spelling.
 	if _, ok := u.Object["involvedObject"]; ok {
 		row.InvolvedUID, _, _ = unstructured.NestedString(u.Object, "involvedObject", "uid")
 		row.InvolvedKind, _, _ = unstructured.NestedString(u.Object, "involvedObject", "kind")
@@ -371,8 +331,8 @@ func extractEvent(u *unstructured.Unstructured) (eventRow, error) {
 	if row.Message == "" {
 		row.Message, _, _ = unstructured.NestedString(u.Object, "note")
 	}
-	// Read count from whichever spelling is present rather than treating a genuine 0 as
-	// "field absent"; default to 1 only when no spelling carries it.
+	// Take the first spelling PRESENT, so a genuine 0 isn't read as absent; default to 1
+	// only when none carries it.
 	count, found, _ := unstructured.NestedInt64(u.Object, "count")
 	if !found {
 		count, found, _ = unstructured.NestedInt64(u.Object, "series", "count")
@@ -398,18 +358,11 @@ func extractEvent(u *unstructured.Unstructured) (eventRow, error) {
 	return row, nil
 }
 
-// firstParsedTime reads the given fields in order and returns the first that both is
-// present AND parses, as epoch millis; 0 when none does.
-//
-// Both halves matter. The api server spells an Event's time four ways across its two
-// versions, so the chain has to try each; and it must advance on a value it cannot READ,
-// not merely on an absent one. Branching on presence alone meant a malformed
-// series.lastObservedTime ended the chain: last_seen stored NULL, and since the events
-// read orders by last_seen DESC, the newest event in the cluster sorted below every
-// timestamped row and never appeared in the dashboard's window.
-//
-// RFC3339Nano is the one layout — it accepts a plain RFC3339 stamp too, so the
-// second-precision spellings need no separate pass.
+// firstParsedTime returns the first of the given fields that is present AND parses, as
+// epoch millis (0 if none). Advancing on unparseable — not merely absent — values is
+// load-bearing: a malformed series.lastObservedTime would otherwise store NULL last_seen
+// and sort the cluster's newest event below every timestamped row. RFC3339Nano also
+// accepts plain RFC3339, so second-precision spellings need no extra pass.
 func firstParsedTime(u *unstructured.Unstructured, paths ...[]string) int64 {
 	for _, path := range paths {
 		s, _, _ := unstructured.NestedString(u.Object, path...)
@@ -423,9 +376,8 @@ func firstParsedTime(u *unstructured.Unstructured, paths ...[]string) int64 {
 	return 0
 }
 
-// nullableInt64 writes NULL for a zero timestamp so a missing time reads as absence, not
-// a bogus 1970 instant: an event with no lastTimestamp/eventTime stores NULL, which the
-// read side surfaces as a null wire timestamp.
+// nullableInt64 writes NULL for a zero timestamp, so a missing time reads as absence
+// rather than a bogus 1970 instant.
 func nullableInt64(n int64) any {
 	if n == 0 {
 		return nil

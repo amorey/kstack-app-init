@@ -12,13 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Top-level React error boundary. Catches render-time exceptions that would
-// otherwise blank the webview. The reload button forces a full reload of the
-// current window — cheaper than trying to reset arbitrary state, and matches
-// what users expect when "something is broken" in a desktop app.
-//
-// Note: error boundaries don't catch async errors (event handlers, effects,
-// urql subscriptions); those flow through the error bus instead.
+// Top-level error boundary; the reload button is cheaper than resetting arbitrary
+// state. Async errors (handlers, effects, subscriptions) aren't caught here — they
+// flow through the error bus.
 
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 
@@ -40,9 +36,8 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
-    // Mirror to the bus so step 5's Sentry adapter sees render errors too.
-    // `info.componentStack` is logged here only — we don't surface it to the
-    // user; it's noisy and the reload button is what they care about.
+    // Mirror to the bus so future reporters see render errors; componentStack is
+    // logged only, never surfaced.
     console.error('ErrorBoundary caught:', error, info.componentStack);
     reportError({ source: 'render', message: error.message, cause: error });
   }

@@ -1,21 +1,11 @@
-// Package appdb owns the sidecar's single app-level SQLite database,
-// <data-dir>/app.db. It is the one place that opens the file, holds the one
-// forward-only migration sequence for it (embedded migrations/*.sql, applied by
-// the shared internal/sqlitemigrate runner), and hands the resulting *sql.DB to
-// the feature packages that store app-level data in it.
+// Package appdb owns <data-dir>/app.db: the only place that opens the file, holding its
+// single forward-only migration sequence and handing the *sql.DB to consumers.
 //
-// Why a dedicated owner: a SQLite file has exactly one schema_migrations table
-// with a single monotonic version sequence, so its schema cannot be co-owned by
-// several feature packages each embedding their own migrations. appdb holds that
-// sequence centrally; consumers are pure data-access layers over the shared
-// handle and add their tables as new numbered migrations here. The per-cluster caches under clusters/
-// are a different story — one file per cluster, each its own sequence — and stay
-// owned by internal/cluster.
-//
-// app.db deliberately lives outside the clusters/ dir so the per-cluster cache
-// scan never mistakes it for a <uuid>.db cache. The pool is a single-connection
-// WAL writer (the app-level tables are tiny and low-traffic, so one connection
-// sidesteps SQLITE_BUSY entirely).
+// A SQLite file has ONE schema_migrations sequence, so its schema can't be co-owned by
+// packages each embedding their own migrations — consumers add tables as new numbered
+// migrations here. (The per-cluster caches are a different story: one file each, owned by
+// internal/cluster.) app.db lives outside clusters/ so the cache scan never mistakes it
+// for one.
 package appdb
 
 import (
@@ -32,14 +22,13 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// Open opens (creating + migrating as needed) app.db at path. A missing parent
-// dir is created; a missing file yields an empty, freshly-migrated database.
+// Open opens app.db, creating the parent dir and migrating as needed.
 func Open(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
 	}
-	// Single-connection pool: the app-level tables are low-traffic and
-	// single-writer, so one connection avoids SQLITE_BUSY entirely.
+	// One connection: the app-level tables are tiny and single-writer, so this
+	// sidesteps SQLITE_BUSY entirely.
 	db, err := sqlitemigrate.OpenPool(path, 1)
 	if err != nil {
 		return nil, err

@@ -23,33 +23,21 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// This file is the ONLY kind-specific code in the write path, and it exists for the
-// materialized columns on the objects table — status_summary plus ready/total/restart
-// counts and host.
+// The only kind-specific code in the write path, feeding the materialized objects columns
+// (status_summary, ready/total/restart, host). Those exist to make the cache QUERYABLE in
+// SQL ("which pods are not ready") without unpacking a blob per row — the dashboard does
+// NOT render them; it derives cells client-side from the verbatim body. Being wrong here
+// is a query nuance, never correctness: every column is nullable, the body is
+// authoritative, and an unknown kind falls back to the conditions convention.
 //
-// Those columns are not what the dashboard renders: the frontend derives its per-kind
-// cells client-side from the object's own body (which is why raw_json is served verbatim),
-// and nothing here feeds that. They exist to make the cache QUERYABLE in SQL — "which pods
-// in this namespace are not ready", "which nodes are NotReady" — without unpacking a blob
-// per row, which is the shape an agent asking questions about a cluster needs.
-//
-// Being wrong here is a display/query nuance, never a correctness problem: every column is
-// nullable, the body beside it is authoritative, and an unrecognized kind falls back to the
-// conventional conditions form rather than guessing.
-//
-// **It runs on the hot write path** — every watch delta and every relist page item, across
-// a cache's hundred-plus kind workers — so it reads the body through NestedFieldNoCopy
-// rather than the Nested{Slice,Map} helpers, which deep-copy what they return. Nothing here
-// mutates what it reads.
+// It runs per object write across a cache's hundred-plus workers, so it reads through
+// NestedFieldNoCopy rather than the deep-copying Nested{Slice,Map} helpers, and mutates
+// nothing it reads.
 
-// statusReading is what one object's status projects to. A struct rather than five return
-// values because five of the readings below produce only a summary: as a tuple they each
-// had to spell out three nil counts and an empty host, and adding a column meant editing
-// every signature.
-//
-// The counts are NullInt64 rather than *int: the columns are nullable (a count that does
-// not apply to a kind must stay NULL, not become a 0 that reads as "none ready"), and a
-// value type keeps this allocation-free on a path that runs per object.
+// statusReading is one object's status projection. A struct, not five return values, since
+// most readings produce only a summary. The counts are NullInt64: the columns are nullable
+// (a count that doesn't apply must stay NULL, not read as "none ready") and a value type
+// keeps the per-object path allocation-free.
 type statusReading struct {
 	Summary string
 	Ready   sql.NullInt64
@@ -63,8 +51,7 @@ func count(n int64) sql.NullInt64 { return sql.NullInt64{Int64: n, Valid: true} 
 // summaryOnly is the reading for a kind whose status has no count worth materializing.
 func summaryOnly(summary string) statusReading { return statusReading{Summary: summary} }
 
-// readyOverTotal is the shared shape of the workload kinds: an "x/y" summary carrying a
-// verdict, plus the two counts behind it.
+// readyOverTotal is the workload kinds' shape: a "verdict x/y" summary plus its counts.
 func readyOverTotal(verdict string, ready, total int64) statusReading {
 	return statusReading{
 		Summary: verdict + " " + strconv.FormatInt(ready, 10) + "/" + strconv.FormatInt(total, 10),
@@ -73,9 +60,8 @@ func readyOverTotal(verdict string, ready, total int64) statusReading {
 	}
 }
 
-// boolReading is the shape of the kinds whose readiness is one bit (a Node, a PVC): the
-// summary the caller computed, counted as 0-or-1 of 1 so the same "not ready" query spans
-// them and the workload kinds.
+// boolReading is the shape for one-bit readiness (Node, PVC), counted 0-or-1 of 1 so one
+// "not ready" query spans them and the workload kinds.
 func boolReading(summary string, ok bool) statusReading {
 	ready := int64(0)
 	if ok {
@@ -84,11 +70,9 @@ func boolReading(summary string, ok bool) statusReading {
 	return statusReading{Summary: summary, Ready: count(ready), Total: count(1)}
 }
 
-// statusReaders maps a built-in's identity to its reading. Keyed on the api GROUP and the
-// Kind, never the Kind alone: "Pod", "Job" and "Node" are not reserved words, and a CRD
-// carrying one of those names in its own group is that user's kind — it must reach the
-// conditions fallback rather than have a built-in's reader look for fields it doesn't have.
-// (Same rule as the Secret check in the write path, and as isEventsKind in the controller.)
+// statusReaders maps a built-in's identity to its reading, keyed on api GROUP and Kind —
+// never Kind alone: a CRD named "Pod" in its own group is that user's kind and must reach
+// the conditions fallback, not a built-in reader hunting fields it lacks.
 var statusReaders = map[struct{ group, kind string }]func(*unstructured.Unstructured) statusReading{
 	{"", "Pod"}:                   statusPod,
 	{"", "Service"}:               statusService,
@@ -103,12 +87,9 @@ var statusReaders = map[struct{ group, kind string }]func(*unstructured.Unstruct
 	{"batch", "CronJob"}:          statusCronJob,
 }
 
-// extractStatus projects one object's status. For a kind with no reader — most CRDs — it
-// falls back to the conventional .status.conditions[].type+status form, which covers the
-// large majority of operator CRDs (ArgoCD, Cert-Manager, Crossplane, Knative all follow it).
-//
-// The identity comes from the BODY, not from the worker's configured kind, so how a
-// collection was addressed can't change how its objects are read.
+// extractStatus projects one object's status, falling back for a kind with no reader
+// (most CRDs) to the conventional .status.conditions[] form. The identity comes from the
+// BODY, so how a collection was addressed can't change how its objects are read.
 func extractStatus(u *unstructured.Unstructured) statusReading {
 	if read, ok := statusReaders[struct{ group, kind string }{apiGroup(u.GetAPIVersion()), u.GetKind()}]; ok {
 		return read(u)
@@ -116,8 +97,7 @@ func extractStatus(u *unstructured.Unstructured) statusReading {
 	return summaryOnly(statusFromConditions(u))
 }
 
-// apiGroup returns the group half of an apiVersion ("apps/v1" → "apps"); the core group's
-// unqualified "v1" has none.
+// apiGroup returns the group half of an apiVersion ("apps/v1" → "apps"; core "v1" → "").
 func apiGroup(apiVersion string) string {
 	group, _, ok := strings.Cut(apiVersion, "/")
 	if !ok {
@@ -126,8 +106,8 @@ func apiGroup(apiVersion string) string {
 	return group
 }
 
-// nestedSlice reads a slice without apimachinery's deep copy. The callers below only read
-// strings, bools and ints out of the elements, so the shared view is safe.
+// nestedSlice reads a slice without apimachinery's deep copy; callers only read scalars
+// out of the elements, so the shared view is safe.
 func nestedSlice(obj map[string]any, fields ...string) []any {
 	v, found, err := unstructured.NestedFieldNoCopy(obj, fields...)
 	if !found || err != nil {
@@ -142,16 +122,13 @@ type containerScan struct {
 	ready    int64
 	total    int64
 	restarts int64
-	// reason is the first waiting/terminated reason found, which is what the summary
-	// surfaces — "CrashLoopBackOff" is far more useful than "Running" for a pod whose only
-	// container is crashing.
+	// reason is the first waiting/terminated reason found, which the summary surfaces —
+	// "CrashLoopBackOff" beats "Running" for a pod whose only container is crashing.
 	reason string
 }
 
-// scanContainers reads one containerStatuses-shaped list. Shared by the app and init
-// passes, which differ only in what their caller does with the result — the
-// waiting-then-terminated-unless-Completed precedence is subtle enough that two copies
-// would drift.
+// scanContainers reads one containerStatuses-shaped list, shared by the app and init
+// passes so the waiting-then-terminated-unless-Completed precedence can't drift.
 func scanContainers(list []any) containerScan {
 	out := containerScan{total: int64(len(list))}
 	for _, c := range list {
@@ -168,8 +145,8 @@ func scanContainers(list []any) containerScan {
 		if out.reason != "" {
 			continue
 		}
-		// state carries at most one of waiting/running/terminated; one lookup of it serves
-		// both reason probes. A terminated "Completed" is a normal exit, not a reason.
+		// state carries at most one of waiting/running/terminated, so one lookup serves
+		// both probes. A terminated "Completed" is a normal exit, not a reason.
 		state, _, _ := unstructured.NestedFieldNoCopy(m, "state")
 		sm, _ := state.(map[string]any)
 		if reason, _, _ := unstructured.NestedString(sm, "waiting", "reason"); reason != "" {
@@ -186,10 +163,8 @@ func statusPod(u *unstructured.Unstructured) statusReading {
 	host, _, _ := unstructured.NestedString(u.Object, "spec", "nodeName")
 
 	app := scanContainers(nestedSlice(u.Object, "status", "containerStatuses"))
-	// A pod blocked in init reports its real reason under initContainerStatuses while
-	// containerStatuses still looks plain Pending. An init failure takes priority over any
-	// app-container reason and is prefixed "Init:" to match kubectl; a completed init
-	// container is normal and skipped, but its restarts still count.
+	// A pod blocked in init reports its real reason here while containerStatuses still
+	// looks Pending, so an init reason wins and is prefixed "Init:" to match kubectl.
 	init := scanContainers(nestedSlice(u.Object, "status", "initContainerStatuses"))
 
 	worstReason := app.reason
@@ -210,9 +185,8 @@ func statusPod(u *unstructured.Unstructured) statusReading {
 }
 
 func statusReplicaController(u *unstructured.Unstructured) statusReading {
-	// Use desired (spec.replicas), not status.replicas: the observed count lags desired
-	// during scale-up, so a desired-3 workload would otherwise render as "ScaledToZero
-	// 0/0". spec.replicas defaults to 1 when omitted.
+	// spec.replicas, not status.replicas: the observed count lags during scale-up, so a
+	// desired-3 workload would read "ScaledToZero 0/0". Omitted defaults to 1.
 	desired, found, _ := unstructured.NestedInt64(u.Object, "spec", "replicas")
 	if !found {
 		desired = 1
@@ -319,10 +293,8 @@ func statusCronJob(u *unstructured.Unstructured) statusReading {
 	return summaryOnly(active + " active")
 }
 
-// statusFromConditions is the CRD fallback. Most operator CRDs put their state in
-// .status.conditions[] using the Kubernetes condition convention. We surface the type of
-// the most-recently-true condition, optionally suffixed with reason if the condition is
-// False (e.g. "Synced (OutOfSync)").
+// statusFromConditions is the CRD fallback: the type of the most-recently-True condition,
+// else the first False one suffixed with its reason (e.g. "Synced (OutOfSync)").
 func statusFromConditions(u *unstructured.Unstructured) string {
 	var lastTrue, lastTrueAt, lastFalseType, lastFalseReason string
 	haveTrue := false
@@ -335,16 +307,11 @@ func statusFromConditions(u *unstructured.Unstructured) string {
 		s, _, _ := unstructured.NestedString(m, "status")
 		switch s {
 		case string(corev1.ConditionTrue):
-			// Take the first True condition unconditionally, then prefer any later one
-			// with a newer timestamp. Without the haveTrue guard a True condition that
-			// omits (or malforms) lastTransitionTime would never beat the empty
-			// lastTrueAt and would be dropped — falling through to a False/empty summary
-			// despite being True.
-			//
-			// Compared as a STRING, not a parsed time: Kubernetes serializes
-			// lastTransitionTime as fixed-width RFC3339 in UTC, which orders
-			// lexicographically, and this runs per condition per object on the fallback
-			// path every non-built-in kind takes.
+			// The haveTrue guard is load-bearing: a True condition with a missing or
+			// malformed lastTransitionTime would never beat the empty lastTrueAt and
+			// would be dropped for a False/empty summary. Compared as a STRING —
+			// lastTransitionTime is fixed-width UTC RFC3339, which orders
+			// lexicographically, and this runs per condition per object.
 			lt, _, _ := unstructured.NestedString(m, "lastTransitionTime")
 			if !haveTrue || lt > lastTrueAt {
 				haveTrue = true

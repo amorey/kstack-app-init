@@ -1,7 +1,7 @@
-// Package poke is a cross-subsystem resync broadcaster. It owns a wall-clock
-// gap detector (the backstop for machine sleep/resume) and fans poke Signals
-// out to all subscribers via a gochan broadcast hub. Callers subscribe or
-// call Poke directly.
+// Package poke is a cross-subsystem resync broadcaster: a wall-clock gap detector (the
+// sleep/resume backstop) fanning Signals to all subscribers. A poke is a FAN-OUT, never a
+// cascade through spec counters or conditions.
+// See docs/adr/2026-08-09-poke-resync-fanout.md.
 package poke
 
 import (
@@ -17,11 +17,9 @@ const hubCapacity = 2
 type Source string
 
 const (
-	// SourceWallClock is set by the built-in gap detector when it infers a
-	// machine sleep/resume from a wall-clock jump.
+	// SourceWallClock: the gap detector inferred a sleep/resume from a clock jump.
 	SourceWallClock Source = "wallclock"
-	// SourceHost is set by the gRPC resync handler when the Tauri host
-	// forwards an OS wake or network-on event.
+	// SourceHost: the Tauri host forwarded an OS wake or network-on event.
 	SourceHost Source = "host"
 )
 
@@ -31,10 +29,8 @@ type Signal struct {
 	At     time.Time
 }
 
-// options configures a Service: the gap-detector tuning plus the clock and
-// ticker seams. Zero values get defaults via applyDefaults. Unexported because
-// production tunes nothing — only white-box tests inject seams via
-// newWithOptions.
+// options configures a Service; zero values get defaults. Unexported because production
+// tunes nothing — only white-box tests inject seams.
 type options struct {
 	tick      time.Duration // gap-detector heartbeat (default 15s)
 	gapFactor float64       // wall gap > tick*gapFactor ⇒ treat as resume (default 2.0)
@@ -60,8 +56,7 @@ func (o *options) applyDefaults() {
 	}
 }
 
-// option is an unexported build seam for newWithOptions, so only white-box
-// tests can construct one; production New takes no seams.
+// option is an unexported build seam; production New takes none.
 type option func(*options)
 
 // withTick overrides the gap-detector heartbeat (default 15s).
@@ -78,23 +73,20 @@ func withTicker(f func(time.Duration) (<-chan time.Time, func())) option {
 	return func(o *options) { o.newTicker = f }
 }
 
-// Service fans resync pokes to all subscribers. Construct with New, then
-// call Start (or Run) to launch the wall-clock gap detector. Poke may be
-// called at any time from any goroutine.
+// Service fans resync pokes to all subscribers; Start (or Run) launches the gap detector.
+// Poke is safe from any goroutine at any time.
 type Service struct {
 	hub *broadcast.Hub[Signal]
 	tx  *broadcast.Sender[Signal]
 	opt options
 }
 
-// New builds a Service with production defaults. It does not start anything;
-// call Start (or Run).
+// New builds a Service with production defaults; it starts nothing — call Start or Run.
 func New() *Service {
 	return newWithOptions()
 }
 
-// newWithOptions is the build entry point that also accepts the unexported test
-// seams; New is the production wrapper (no options).
+// newWithOptions is New plus the unexported test seams.
 func newWithOptions(opts ...option) *Service {
 	var o options
 	for _, opt := range opts {
@@ -109,27 +101,22 @@ func newWithOptions(opts ...option) *Service {
 	}
 }
 
-// Poke broadcasts a Signal to all active subscribers. Never blocks; idempotent.
-// The entry point for the gRPC resync handler and any in-process caller that
-// detects a wake or network-return event.
+// Poke broadcasts a Signal to all subscribers; never blocks.
 func (s *Service) Poke(src Source) {
 	_ = s.tx.Send(Signal{Source: src, At: s.opt.now()})
 }
 
-// Subscribe returns a channel that receives Signals and a cancel function.
-// The channel is closed when the subscription is cancelled or Run's context
-// ends. Calling cancel when done is required — abandoning the channel without
-// cancelling leaks the feeder goroutine.
+// Subscribe returns a Signal channel and its cancel func; the channel closes on cancel or
+// when Run's context ends. Cancel is REQUIRED — abandoning the channel leaks the feeder
+// goroutine.
 func (s *Service) Subscribe() (<-chan Signal, func()) {
 	rx := s.hub.Receiver()
 	return rx.Chan(), rx.Close
 }
 
-// Start launches Run in a goroutine bound to a context derived from ctx. ctx
-// scopes initialization only; the returned stop func cancels the detector and
-// blocks until it exits (which closes the hub and all subscriber channels),
-// honoring its own drain-deadline context. Mirrors cluster.Service/cloud.Service
-// so the composition root can own the lifecycle uniformly. Call once.
+// Start runs the detector in a goroutine; the returned stop cancels it and blocks until
+// it exits (closing the hub and every subscriber channel), bounded by its own context.
+// Call once.
 func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -150,9 +137,8 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 	return stop, nil
 }
 
-// Run starts the wall-clock gap detector and blocks until ctx is cancelled.
-// On exit it closes the hub so all subscriber channels are closed. Call once
-// per Service (Start wraps this in a goroutine).
+// Run blocks on the gap detector until ctx is cancelled, closing the hub on exit. Call
+// once per Service (Start wraps it).
 func (s *Service) Run(ctx context.Context) {
 	tickC, stop := s.opt.newTicker(s.opt.tick)
 	defer stop()

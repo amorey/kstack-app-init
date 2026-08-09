@@ -12,34 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Tiny in-process pub/sub for surfacing transient runtime errors — network
-// failures, GraphQL errors, dropped subscriptions, render-time exceptions
-// caught by the error boundary — to a single global UI surface (see
-// `ConnectionStatus`). Decoupling the producer from the surface means step
-// 5 (Sentry) can tap the same bus without touching producers.
-//
-// Backed by `EventTarget` so listeners are GC-friendly and order is FIFO.
+// Tiny in-process pub/sub for transient runtime errors, surfaced by
+// `ConnectionStatus`. Decoupled so a future reporter (e.g. Sentry) taps the same
+// bus without touching producers.
 
 export type AppErrorSource = 'graphql' | 'subscription' | 'network' | 'render' | 'auth';
 
 export type AppError = {
   source: AppErrorSource;
   message: string;
-  // Original Error / CombinedError, kept for upstream reporters that want
-  // stack traces. Not rendered in the UI.
+  // Original Error / CombinedError for reporters; not rendered.
   cause?: unknown;
 };
 
-// Coerce an unknown thrown/rejected value into an Error. Pass-through if
-// it already is one (preserves the original stack); otherwise wrap
-// String(x). `catch` and rejected-promise values are `unknown` in TS, so
-// this is the one place that narrowing lives.
+// Coerce an unknown thrown value into an Error (pass-through preserves the stack).
+// The one place `catch`-value narrowing lives.
 export function toError(x: unknown): Error {
   return x instanceof Error ? x : new Error(String(x));
 }
 
-// The human-readable message of an unknown thrown value — an Error's
-// `.message` (not its `"Error: …"` toString), or String(x) otherwise.
+// An Error's `.message` (not its `"Error: …"` toString), or String(x).
 export function errorMessage(x: unknown): string {
   return toError(x).message;
 }

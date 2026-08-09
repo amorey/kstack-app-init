@@ -28,13 +28,10 @@ import {
 import type { DashboardResource } from '@/lib/dashboard-resources';
 import { Route as appRoute } from '@/routes/_app';
 
-// The focused resource kind lives in the `resource` search param, so a selection
-// is deep-linkable and each change is its own history entry. It's optional (absent
-// resolves to the default in the component, so a bare `/dashboard` isn't rewritten
-// on load) and may be a curated or dynamic kind's id, so it's validated leniently
-// (any non-empty string) rather than against a closed union. The picker is
-// `DashboardResourceNav` (mounted by `AppLayout`); this route reads the param back
-// and renders the matching panel.
+// The focused kind lives in the `resource` search param (deep-linkable, each change
+// a history entry — see docs/adr/2026-08-09-url-params-as-window-state.md). Optional
+// (absent resolves to the default without rewriting a bare `/dashboard`) and
+// validated leniently — it may name a dynamic kind, not a closed union.
 type DashboardSearch = { resource?: DashboardResource };
 
 export const Route = createRoute({
@@ -45,19 +42,15 @@ export const Route = createRoute({
   component: Dashboard,
 });
 
-// The panel reflects the resource kind chosen in the sidebar. `events` has a bespoke
-// typed table; every other discovered kind renders the generic `ObjectsTable` (resolved
-// from the live catalog to its apiVersion/resource/scope); a selection that names no kind
-// (a group/overview row, or a not-yet-loaded catalog) shows a placeholder. The label and
-// kind both resolve against the same live catalog the sidebar uses, so dynamic kinds name
-// and render themselves too.
+// Panel pick: `events` → bespoke `EventsTable`; any resolved discovered kind →
+// generic `ObjectsTable`; no kind (group/overview row, unloaded catalog) →
+// placeholder. Label and kind resolve against the same live catalog the sidebar uses.
 function Dashboard() {
   const { resource } = Route.useSearch();
   const { kinds } = useClusterDataKinds();
   const resolved = resolveDashboardResource(resource);
-  // Both the label (needs the built tree so dynamic kinds name themselves) and the selected
-  // kind derive from the live catalog, which re-emits on count churn — memoize so a Modified
-  // frame doesn't rebuild the tree / rescan the catalog on every render.
+  // The catalog re-emits on count churn — memoize so a Modified frame doesn't
+  // rebuild the tree / rescan the catalog every render.
   const label = useMemo(() => dashboardResourceLabel(buildDashboardNav(kinds), resolved), [kinds, resolved]);
   const serverKind = useMemo(() => serverKindForResource(kinds, resolved), [kinds, resolved]);
 

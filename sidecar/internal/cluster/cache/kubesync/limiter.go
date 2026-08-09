@@ -16,21 +16,16 @@ package kubesync
 
 import "context"
 
-// ListLimiter bounds how many workers may be inside their LIST phase at once. One is
-// shared by every worker that should compete for the same budget — in this app, all of
-// one cache's kinds.
+// ListLimiter bounds how many workers are inside their LIST phase at once, shared by
+// every worker competing for one budget (in this app, all of one cache's kinds).
 //
-// It exists because a worker's cost is wildly uneven across its own lifetime: the watch
-// phase is indefinite but nearly free (one idle connection), while the LIST phase holds a
-// page of decoded bodies and hammers the API server. A cache has one worker per served
-// kind — a hundred or more — and they all start at once on a cold sync or after a resume
-// poke, so without a bound the peak memory and API burst scale with the kind count rather
-// than staying flat.
+// A worker's cost is uneven over its life: the watch phase is indefinite but nearly free,
+// while a LIST holds a page of decoded bodies and hammers the API server — and a cache's
+// hundred-plus workers all start at once on a cold sync or resume poke.
 //
-// The slot is held across the list-heavy work ONLY and released before the worker re-enters
-// its watch — holding it across the watch would deadlock the whole cache behind its first
-// N kinds. A nil ListLimiter imposes no bound, which is what a driver built directly in a
-// unit test gets.
+// The slot covers the list-heavy work ONLY, released before re-entering the watch;
+// holding it across the watch would deadlock the cache behind its first N kinds. A nil
+// limiter is unbounded.
 type ListLimiter chan struct{}
 
 // NewListLimiter returns a limiter admitting n concurrent LIST phases. A non-positive n
@@ -42,9 +37,9 @@ func NewListLimiter(n int) ListLimiter {
 	return make(ListLimiter, n)
 }
 
-// acquire takes a slot, blocking until one frees or ctx ends. The returned release func is
-// safe to call unconditionally — it is a no-op on a nil limiter or a cancelled acquire —
-// so callers can `defer release()` before checking the error.
+// acquire takes a slot, blocking until one frees or ctx ends. release is safe to call
+// unconditionally (a no-op on a nil limiter or cancelled acquire), so callers can
+// `defer release()` before checking the error.
 func (l ListLimiter) acquire(ctx context.Context) (release func(), err error) {
 	if l == nil {
 		return func() {}, nil

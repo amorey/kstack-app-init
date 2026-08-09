@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The window's active kubeconfig context, shared by every mode under the `_app`
-// layout route. Source of truth is the `kubeContext` URL search param (see
-// `_app.tsx`), so selection is per-window, deep-linkable, and survives the mode
-// switch without a provider. It's a frontend view-scope only; it never rewrites
-// the kubeconfig's current-context.
+// The window's active kubeconfig context. Source of truth is the `kubeContext` URL
+// search param on `_app` (per-window, deep-linkable; see
+// docs/adr/2026-08-09-url-params-as-window-state.md). Frontend view-scope only —
+// never rewrites the kubeconfig's current-context.
 import { useNavigate, useSearch } from '@tanstack/react-router';
 
 import { watchPhase } from '@/lib/graphql/use-watch-subscription';
@@ -25,34 +24,30 @@ import { useKubeConfig } from '@/lib/kube-config';
 import type { KubeContextInfo } from '@/lib/kube-config';
 
 type ActiveKubeContext = {
-  // The resolved context name: the URL param when it names a present context,
-  // else the kubeconfig's current context, else '' (clusters not reported yet).
+  // Resolved name: the URL param when it names a present context, else the
+  // kubeconfig's current context, else '' (clusters not reported yet).
   context: string;
-  // The resolved context's full record (cluster/user), or undefined when
-  // nothing resolves yet — the context bar reads its metadata from here.
+  // The resolved context's full record (cluster/user); undefined until resolved.
   active: KubeContextInfo | undefined;
-  // Available contexts to switch between (enabled, present kubeconfig clusters).
   contexts: KubeContextInfo[];
-  // The registry watch's UI phase, so the picker can show "connecting" (still
-  // dialing, nothing reported) distinctly from "connected, empty kubeconfig".
+  // Distinguishes "connecting" from "connected, empty kubeconfig" for the picker.
   phase: WatchPhase;
-  // Persist a choice by writing it to the URL search param.
+  // Writes the URL search param.
   setContext: (name: string) => void;
 };
 
 export function useActiveKubeContext(): ActiveKubeContext {
-  // `strict: false` decouples the hook from the owning route's id — it reads the
-  // merged search of whatever `_app` descendant renders it.
+  // `strict: false`: read the merged search of whatever `_app` descendant renders this.
   const { kubeContext: param } = useSearch({ strict: false });
   const navigate = useNavigate();
   const { kubeConfig, connected } = useKubeConfig();
 
-  // `kubeConfig === null` is exactly "the registry hasn't reported" (an empty
-  // snapshot never lands a frame), so it's the `hasData` signal `watchPhase` wants.
+  // `kubeConfig === null` is exactly "registry hasn't reported" — the `hasData`
+  // signal `watchPhase` wants.
   const phase = watchPhase(kubeConfig !== null, connected);
   const contexts = kubeConfig?.contexts ?? [];
-  // A param naming a context that's since disappeared silently yields to the
-  // default, so a stale deep link never points at nothing.
+  // A param naming a gone context yields to the default — a stale deep link
+  // never points at nothing.
   const valid = param && contexts.some((c) => c.name === param) ? param : undefined;
   const context = valid ?? kubeConfig?.currentContext ?? '';
   const active = contexts.find((c) => c.name === context);

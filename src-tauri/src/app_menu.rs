@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The application menu bar. Built once during app setup (see `lib.rs`); its
-//! menu-event handler routes user actions through the shared [`AppState`] and
-//! its `window_manager`.
+//! The application menu bar (macOS-only), built once during app setup.
 
 use tauri::AppHandle;
 
@@ -27,27 +25,14 @@ use tauri::menu::{MenuBuilder, MenuItem, SubmenuBuilder};
 #[cfg(target_os = "macos")]
 use tauri::Manager;
 
-/// Builds and installs the application menu bar (macOS only).
+/// Builds and installs the macOS menu bar (File → New Window / Quit). No-op on
+/// Linux/Windows, where a native menu would render inside each window — the
+/// webview's `AppMenu` provides the same actions via `new_window` / `quit`.
 ///
-/// On macOS this builds a "File" submenu with "New Window" (`CmdOrCtrl+N`) and
-/// "Quit" (`CmdOrCtrl+Q`), sets it as the global menu bar, and registers a
-/// menu-event handler.
-///
-/// On Linux/Windows this is a no-op: the native menu would render as a bar
-/// *inside* each window, so the webview's `AppMenu` provides the same New
-/// Window / Quit affordances via the `new_window` / `quit` commands instead.
-///
-/// "Quit" is a custom item rather than [`SubmenuBuilder::quit`] on purpose: the
-/// predefined quit terminates the process natively (macOS `terminate:`), which
-/// skips Tauri's `RunEvent::ExitRequested` graceful-shutdown hook. Routing it
-/// through [`AppHandle::exit`] takes the same path as the tray's "Quit".
-///
-/// # Errors
-///
-/// Returns an error if any menu item or submenu fails to build, or if setting
-/// the menu fails.
+/// "Quit" must stay a custom item routed through [`AppHandle::exit`]:
+/// [`SubmenuBuilder::quit`] terminates natively (`terminate:`) and skips the
+/// `RunEvent::ExitRequested` graceful-shutdown hook.
 pub fn build_app_menu(app: &AppHandle) -> Result<()> {
-    // Linux/Windows: nothing to install; the webview's `AppMenu` stands in.
     #[cfg(not(target_os = "macos"))]
     {
         let _ = app;

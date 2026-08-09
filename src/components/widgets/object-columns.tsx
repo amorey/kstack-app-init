@@ -12,32 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The per-kind column registry for ObjectsTable. Every kind gets the universal
-// Namespace?/Name/Age columns; a built-in kind additionally gets the kubectl-style columns
-// registered here (Ready/Status/…), computed client-side from the object's native body
-// (`rawJSON`). Unregistered kinds — CRDs, less-common built-ins — fall back to the universal
-// columns alone (an empty extra-column list).
+// Per-kind extra columns for ObjectsTable, derived client-side from the object's
+// native `rawJSON` body; unregistered kinds (CRDs, rarer built-ins) get [] and
+// keep only the universal columns.
+// See docs/adr/2026-08-09-rawjson-comparable-scalar.md
 //
-// Accessors read `rawJSON` (typed `unknown` off the wire) by casting to a narrow local shape
-// naming only the fields they touch — the server does no per-field typing. A missing/partial
-// body degrades to "—" rather than throwing, so a Deleted row's last-known body or an
-// as-yet-unpopulated field never breaks a cell.
+// `rawJSON` is `unknown` off the wire — the server does no per-field typing — so
+// accessors cast to a narrow local shape and must degrade to "—" rather than
+// throw on a partial body (e.g. a Deleted row's last-known state).
 import type { ReactNode } from 'react';
 
 import type { ClusterDataObject } from '@/lib/cluster-data-objects';
 import { gvrKey } from '@/lib/gvr';
 import type { GVR } from '@/lib/gvr';
 
-// One kind-specific column: a header and a cell derived from an object's body.
 export type ObjectColumn = {
   header: string;
   cell: (o: ClusterDataObject) => ReactNode;
-  // Extra classes for both the header and cells (e.g. width, tabular-nums).
+  // Applied to both the header and its cells.
   className?: string;
 };
 
-// The object's native body as a narrow shape (only the fields a cell reads), defaulting to
-// {} so a missing body flows through the optional chains to "—".
+// Defaults to {} so a missing body flows through the optional chains to "—".
 function body<T>(o: ClusterDataObject): T {
   return (o.rawJSON ?? {}) as T;
 }
@@ -72,16 +68,15 @@ function hasCondition(b: PodBody, type: string): boolean {
   return (b.status?.conditions ?? []).some((c) => c.type === type && c.status === 'True');
 }
 
-// A native sidecar: an init container whose restartPolicy is Always. It keeps running past
+// A native sidecar (init container with restartPolicy Always) keeps running past
 // initialization, so a started one doesn't hold the pod in an Init: state.
 function isRestartableInit(b: PodBody, c: ContainerStatus): boolean {
   return (b.spec?.initContainers ?? []).some((s) => s.name === c.name && s.restartPolicy === 'Always');
 }
 
-// Mirrors kubectl's `printPod` status derivation. `status.phase` is only the starting point —
-// the actionable status lives in container state: a crash-looping pod is phase=Running but
-// should read CrashLoopBackOff, an initializing pod should read its init progress, and a pod
-// being deleted should read Terminating. Reporting the bare phase misreads all three.
+// Mirrors kubectl's `printPod`. The bare `status.phase` misreads a crash-looping
+// pod (phase=Running), an initializing one, and a terminating one — the
+// actionable status lives in container state.
 function podStatus(b: PodBody): string {
   const st = b.status;
   let reason = st?.reason || st?.phase || '';
@@ -94,7 +89,7 @@ function podStatus(b: PodBody): string {
     const c = initStatuses[i];
     const term = c.state?.terminated;
     const waiting = c.state?.waiting;
-    // Skip past init containers that finished cleanly, and sidecars that are already up.
+    // Skip init containers that finished cleanly, and sidecars already up.
     const settled = (term && term.exitCode === 0) || (isRestartableInit(b, c) && c.started);
     if (!settled) {
       if (term) {
@@ -111,7 +106,7 @@ function podStatus(b: PodBody): string {
     }
   }
 
-  // Regular containers (last wins, as kubectl scans in reverse) once init is done.
+  // Regular containers: last wins, as kubectl scans in reverse.
   if (!initializing || hasCondition(b, 'Initialized')) {
     let hasRunning = false;
     const cs = st?.containerStatuses ?? [];
@@ -148,8 +143,8 @@ const podColumns: ObjectColumn[] = [
     cell: (o) => {
       const b = body<PodBody>(o);
       const cs = b.status?.containerStatuses ?? [];
-      // Denominator is the spec's container count (kubectl's), so a pod whose statuses
-      // haven't all landed yet still reads against the expected total.
+      // Denominator is the spec count (kubectl's), so a pod whose statuses
+      // haven't all landed still reads against the expected total.
       const total = b.spec?.containers?.length ?? cs.length;
       if (!total) return DASH;
       return `${cs.filter((c) => c.ready).length}/${total}`;
@@ -164,9 +159,8 @@ const podColumns: ObjectColumn[] = [
     className: 'tabular-nums',
     cell: (o) => {
       const st = body<PodBody>(o).status;
-      // Init-container retries count too: while a pod initializes they're the only restarts
-      // recorded (containerStatuses is still empty), and a restartable init container
-      // (sidecar) keeps accruing them afterwards.
+      // Init-container retries count too: during init they're the only restarts
+      // recorded, and a sidecar keeps accruing them afterwards.
       const all = [...(st?.initContainerStatuses ?? []), ...(st?.containerStatuses ?? [])];
       if (all.length === 0) return DASH;
       return all.reduce((n, c) => n + (c.restartCount ?? 0), 0);
@@ -195,13 +189,14 @@ const workloadColumns: ObjectColumn[] = [
   },
 ];
 
-// Keyed by gvrKey — the same canonical kind key the watch provenance and kinds catalog use.
+// Keyed by gvrKey — the canonical kind key the watch provenance and kinds
+// catalog share.
 const OBJECT_COLUMNS: Record<string, ObjectColumn[]> = {
   [gvrKey({ apiVersion: 'v1', resource: 'pods' })]: podColumns,
   [gvrKey({ apiVersion: 'apps/v1', resource: 'deployments' })]: workloadColumns,
 };
 
-// The kind-specific columns for a GVR, or [] for an unregistered kind (universal columns only).
+// [] for an unregistered kind (universal columns only).
 export function columnsForKind(gvr: GVR): ObjectColumn[] {
   return OBJECT_COLUMNS[gvrKey(gvr)] ?? [];
 }

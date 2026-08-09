@@ -12,15 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Pathless layout route for the main window's shell. It adds no path segment;
-// it just wraps its children (chat, dashboard) in `AppLayout` so they share the
-// sidebar. Secondary windows (log tail, exec) will nest under their own
-// sidebar-less layout route instead.
-//
-// It also owns the `kubeContext` search param: the window's active kubeconfig
-// context (see `@/lib/active-kube-context`). `retainSearchParams` carries it across
-// the chat<->dashboard navigation, so the choice is shared by both modes and
-// stays deep-linkable, without any provider.
+// Pathless layout route: wraps chat/dashboard in `AppLayout` so they share the
+// sidebar (secondary windows will nest under their own layout route). Owns the
+// `kubeContext` search param; `retainSearchParams` carries it across the mode
+// switch. See docs/adr/2026-08-09-url-params-as-window-state.md
 import { createRoute, retainSearchParams } from '@tanstack/react-router';
 
 import { AppLayout } from '@/layouts/app-layout';

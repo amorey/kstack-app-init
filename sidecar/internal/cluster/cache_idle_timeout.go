@@ -26,19 +26,13 @@ import (
 	"k8s.io/client-go/transport"
 )
 
-// cacheListIdleTimeout is the read-inactivity window for one of the cache's non-watch
-// requests (a LIST page, a discovery request, a per-object GET). It is NOT a wall-clock
-// deadline: a request is cancelled only when it makes NO read progress for this long —
-// response headers, and then every chunk of the body, count as progress. So a slow or
-// large LIST that keeps streaming completes no matter how long it takes in total (a
-// consistently slow API server, an expensive/huge kind), while a genuinely wedged request
-// — nothing arriving for the window — is cancelled so its driver errors, releases its
-// kubesync.ListLimiter slot (see cacheListConcurrency), and backs off, rather than one
-// hung kind holding a slot forever and starving every other kind's resync.
+// Read-inactivity window for one non-watch request (a LIST page, a discovery request, a
+// GET). NOT a wall-clock deadline: headers and every body chunk count as progress, so a slow
+// but streaming LIST always completes, while a wedged request is cancelled — releasing its
+// kubesync.ListLimiter slot, which one hung kind would otherwise hold forever, starving
+// every other kind's resync.
 //
-// Generous enough to cover an expensive query's time-to-first-byte; only a real stall
-// should hit it. Detection is coarse: the watchdog ticks once per window and cancels only
-// after a full tick with no progress, so the effective idle-to-cancel time is in
+// Detection is coarse: the watchdog ticks once per window, so idle-to-cancel lands in
 // [timeout, 2*timeout] — fine for a stall backstop.
 const cacheListIdleTimeout = 2 * time.Minute
 
@@ -54,28 +48,22 @@ func newIdleTimeoutWrapper(timeout time.Duration) transport.WrapperFunc {
 	}
 }
 
-// idleTimeoutRoundTripper cancels a request whose response makes no read progress for
-// `timeout`. Unlike a wall-clock deadline it never cancels a slow-but-progressing
-// transfer: the arming covers time-to-first-byte (a server that never sends headers),
-// then each body read counts as progress, so only a true stall trips it. WATCH requests
-// are left untouched — they are long-lived and legitimately quiet between the server's
-// periodic bookmarks, so an inactivity bound would wrongly kill a healthy watch.
+// idleTimeoutRoundTripper cancels a request making no read progress for `timeout`; a
+// slow-but-progressing transfer never trips it. WATCH requests are left untouched — they are
+// legitimately quiet between bookmarks, so an inactivity bound would kill a healthy watch.
 type idleTimeoutRoundTripper struct {
 	base    http.RoundTripper
 	timeout time.Duration
 }
 
 func (t *idleTimeoutRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Substring-match the raw query rather than parsing it: this runs on every
-	// non-watch LIST page and per-object GET in a resync, so parsing the whole
-	// query string + allocating a url.Values map just to read one param would be
-	// wasted work on a hot path.
+	// Substring-match rather than parse: this runs on every LIST page and GET in a resync,
+	// so allocating a url.Values map to read one param is wasted work on a hot path.
 	if strings.Contains(req.URL.RawQuery, "watch=true") {
 		return t.base.RoundTrip(req)
 	}
-	// A private cancellable context scoped to THIS request: the watchdog cancels only
-	// this request on a stall, never the caller's run context. Armed before dialing so a
-	// server that hangs before sending headers is cancelled too.
+	// Scoped to THIS request, so a stall never cancels the caller's run context. Armed
+	// before dialing, so a server that hangs before sending headers is cancelled too.
 	ctx, cancel := context.WithCancel(req.Context())
 	w := newIdleWatchdog(t.timeout, cancel)
 	resp, err := t.base.RoundTrip(req.WithContext(ctx))

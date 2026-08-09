@@ -24,32 +24,25 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// Execer is the subset of *sql.DB / *sql.Tx a write helper needs, so a caller's
-// incremental upsert (direct on the writer) and its relist page (inside a transaction)
-// can share one statement.
+// Execer is the *sql.DB / *sql.Tx subset a write helper needs, so an incremental upsert
+// (direct on the writer) and a relist page (in a transaction) share one statement.
 type Execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-// ResumeCookie is one synced collection's list/watch resume position — the
-// resourceVersion to seed the next watch from, and when it was written — held as a pair
-// of cluster_meta rows. It lives here because cluster_meta is this package's table; the
-// sync stores above it (events, per-kind objects) differ only in the key prefix they
-// address their pair under, so they share this type rather than the protocol.
-//
-// Every collection's keys share the "<apiVersion>/<Kind>.<suffix>" namespace.
+// ResumeCookie is one synced collection's list/watch resume position (resourceVersion +
+// write stamp) as a pair of cluster_meta rows keyed under
+// "<apiVersion>/<Kind>.<suffix>". The sync stores above differ only in that prefix, so
+// they share this type rather than the protocol.
 type ResumeCookie struct {
 	cdb   *ClusterDB
 	rvKey string
 	atKey string
-	// now supplies the "written at" stamp in unix milliseconds. A seam only so a caller's
-	// tests can freeze it.
-	now func() int64
+	now   func() int64 // unix-millis stamp; a seam so callers' tests can freeze it
 }
 
-// NewResumeCookie builds the cookie for one collection, keyed under prefix (the
-// "<apiVersion>/<Kind>" the collection describes itself with). A nil now uses the wall
-// clock.
+// NewResumeCookie builds one collection's cookie under prefix ("<apiVersion>/<Kind>");
+// a nil now uses the wall clock.
 func NewResumeCookie(cdb *ClusterDB, prefix string, now func() int64) *ResumeCookie {
 	if now == nil {
 		now = func() int64 { return time.Now().UnixMilli() }
@@ -63,9 +56,10 @@ func NewResumeCookie(cdb *ClusterDB, prefix string, now func() int64) *ResumeCoo
 }
 
 // Get returns the cookie to seed a watch from, or "" to force a cold full LIST. A
-// completed relist's cookie validly resumes even against an empty table — the relist is
-// what reconciled it — and a partial pass cleared the cookie on its first written page, so
-// a cookie always means "a full LIST completed on disk".
+// present cookie always means "a full LIST completed on disk" — a partial pass cleared
+// it on its first written page, and only Commit rewrites it, so a completed relist
+// resumes validly even against an empty table.
+// See docs/adr/2026-08-09-kubesync-watch-poll.md.
 func (c *ResumeCookie) Get(ctx context.Context) (string, error) {
 	var v string
 	err := c.cdb.Reader().QueryRowContext(ctx,
@@ -79,13 +73,10 @@ func (c *ResumeCookie) Get(ctx context.Context) (string, error) {
 	return v, nil
 }
 
-// Persist writes the cookie (rv + timestamp). It takes an Execer so it works both inside a
-// relist's commit transaction and directly on the writer for the per-delta advance.
-//
-// Both rows go in ONE statement, not two upserts. On the commit path that keeps them
-// atomic without relying on the caller's transaction; on the per-delta path — which runs
-// once per Kubernetes event, beside the row write, on a writer pool with a single
-// connection — it halves the statements in the hot loop.
+// Persist writes the cookie (rv + timestamp) via an Execer, so it serves both a relist's
+// commit transaction and the per-delta advance on the writer. Both rows go in ONE
+// statement: atomic without the caller's transaction, and half the statements in the
+// per-delta hot loop.
 func (c *ResumeCookie) Persist(ctx context.Context, ex Execer, rv string) error {
 	_, err := ex.ExecContext(ctx,
 		`INSERT INTO cluster_meta(key, value) VALUES(?, ?), (?, ?)
@@ -95,8 +86,8 @@ func (c *ResumeCookie) Persist(ctx context.Context, ex Execer, rv string) error 
 	return err
 }
 
-// Advance moves the cookie to an object's own resourceVersion, if it has one. This is what
-// lets a row and the position that would replay it land in the same transaction.
+// Advance moves the cookie to an object's own resourceVersion, letting a row and the
+// position that would replay it land in one transaction.
 func (c *ResumeCookie) Advance(ctx context.Context, ex Execer, u *unstructured.Unstructured) error {
 	rv := u.GetResourceVersion()
 	if rv == "" {

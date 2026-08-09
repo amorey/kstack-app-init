@@ -12,40 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// App-level dialog controller. Overlay screens are opened from the sidebar's
-// account menu, but the sidebar card unmounts when the window auto-collapses below
-// the md breakpoint (see `app-sidebar.tsx`), so a dialog rendered inside it would
-// vanish mid-view. So the *trigger* (a menu item) stays in the sidebar and only
-// calls `openDialog(id)` through this context, while the dialog *render* lives above
-// the sidebar (the `AppDialogs` host in AppLayout), surviving the card unmounting.
-//
-// The controller also owns the mount lifecycle, so the host stays a dumb renderer:
-// `mountedDialog` trails `activeDialog` — opening sets both; closing clears only
-// `activeDialog` (driving the dialog's `open` to false) and leaves `mountedDialog`
-// set so the dialog lingers for its exit animation. The shared `Dialog` wrapper calls
-// `notifyClosed` once base-ui reports the close settled, which clears `mountedDialog`
-// and unmounts. Only one dialog is open at a time.
+// App-level dialog controller. Triggers live in the sidebar but the render lives
+// above it (`AppDialogs` in AppLayout) — the sidebar card unmounts when the window
+// collapses below md, so a dialog rendered inside it would vanish mid-view.
+// `mountedDialog` trails `activeDialog` through the exit animation: closing clears
+// only `activeDialog`; the shared `Dialog` wrapper calls `notifyClosed` once the
+// close settles, which unmounts. One dialog open at a time.
 import type { ReactNode } from 'react';
 import { createContext, useContext, useMemo, useState } from 'react';
 
-// The overlay screens this controller can open. Add a dialog by extending this
-// union and rendering it in the `AppDialogs` host.
+// Add a dialog by extending this union and rendering it in the `AppDialogs` host.
 export type DialogId = 'clusters' | 'settings';
 
 type DialogContextValue = {
   activeDialog: DialogId | null;
-  // The dialog currently mounted; trails `activeDialog` through the exit animation.
+  // Trails `activeDialog` through the exit animation.
   mountedDialog: DialogId | null;
   openDialog: (id: DialogId) => void;
   closeDialog: () => void;
-  // Reports that the mounted dialog's close transition has settled, so it can be
-  // unmounted. Called by the shared `Dialog` wrapper, not by dialog components.
+  // Close transition settled → unmount. Called by the shared `Dialog` wrapper only.
   notifyClosed: () => void;
 };
 
-// The controlled props every overlay dialog accepts. `AppDialogs` supplies these
-// and each dialog forwards them to the shared `Dialog` wrapper. Close-completion
-// is handled by the wrapper via context, so dialogs never see it.
+// Controlled props every overlay dialog forwards to the shared `Dialog` wrapper;
+// close-completion is handled by the wrapper via context.
 export type AppDialogProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -78,9 +68,8 @@ export function useDialog(): DialogContextValue {
   return ctx;
 }
 
-// Non-throwing read for the shared `Dialog` wrapper, which reports its close-
-// completion to the host when there is one. A `Dialog` rendered outside the host
-// (no provider) still works — it simply has no host to notify.
+// Non-throwing read for the shared `Dialog` wrapper — a `Dialog` outside the
+// provider still works, it just has no host to notify.
 export function useDialogHost(): DialogContextValue | null {
   return useContext(DialogContext);
 }

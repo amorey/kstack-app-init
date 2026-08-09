@@ -35,8 +35,8 @@ const TanStackRouterDevtools =
       )
     : () => null;
 
-// Single client for the app's lifetime. Created at module load so tests
-// that mount via routeTree get the Provider transitively without extra wiring.
+// One client for the app's lifetime; module-load creation gives routeTree-mounted
+// tests the Provider transitively.
 const gqlClient = createGraphqlClient();
 
 export const Route = createRootRoute({
@@ -53,12 +53,11 @@ export function NotFound() {
   );
 }
 
-// Providers only — the visual shell lives in the `_app` layout route
-// (`AppLayout`), which `Outlet` resolves to. `WindowFrame` wraps everything
-// (including loading/error states) so the frameless Linux/Windows window gets its
-// border and outer shadow; passthrough on macOS. `WindowResizeHandles` is a
-// sibling, not a child, so its `position: fixed` grips anchor to the window edge:
-// `WindowFrame`'s `contain: paint` would otherwise re-anchor and clip them.
+// Providers only — the visual shell lives in the `_app` layout route (`AppLayout`).
+// `WindowFrame` wraps everything, loading/error states included.
+// `WindowResizeHandles` must stay a sibling, not a child: `WindowFrame`'s
+// `contain: paint` would re-anchor and clip its fixed grips.
+// See docs/adr/2026-08-09-per-platform-window-chrome.md
 function RootComponent() {
   return (
     <>

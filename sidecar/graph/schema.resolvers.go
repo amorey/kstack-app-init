@@ -15,16 +15,14 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
 )
 
-// Stats is the resolver for the cache.stats field: live stats from this cache,
-// as a resolver so a query only pays the stat cost when it selects them. The
-// child carries its parent cluster id and its own id for the lookup.
+// Stats is the resolver for the cache.stats field — a resolver so a query pays the stat
+// cost only when it selects them.
 func (r *clusterCacheResolver) Stats(ctx context.Context, obj *cluster.ClusterCache) (*cluster.ClusterCacheStats, error) {
 	return r.ClusterSvc.CacheStats(ctx, obj.ClusterID, obj.ID)
 }
 
 // Stats is the resolver for the stats field — the discovery pass's gauges, sampled from
-// the controller on read rather than read off the object, because they are not stored
-// (the kind's status is empty by design). Null until a pass has run in this process.
+// the controller because status deliberately stores none. Null until a pass has run.
 func (r *clusterCacheGVRDiscoveryResolver) Stats(ctx context.Context, obj *cluster.ClusterCacheGVRDiscovery) (*cluster.ClusterCacheGVRDiscoveryStats, error) {
 	return r.ClusterSvc.GVRDiscoveryStats(ctx, obj.ID)
 }
@@ -34,22 +32,17 @@ func (r *clusterCacheGVRSyncResolver) Stats(ctx context.Context, obj *cluster.Cl
 	return r.ClusterSvc.GVRSyncStats(ctx, obj.ID)
 }
 
-// FirstSeen is the resolver for the firstSeen field: the domain carries a value
-// time.Time (kept comparable for the delta-watch diff), so the zero time — a source
-// Event with no timestamp — maps to null on the wire rather than 0001-01-01.
+// FirstSeen is the resolver for the firstSeen field — see nilIfZeroTime.
 func (r *clusterDataEventResolver) FirstSeen(ctx context.Context, obj *cluster.ClusterDataEvent) (*time.Time, error) {
 	return nilIfZeroTime(obj.FirstSeen), nil
 }
 
-// LastSeen is the resolver for the lastSeen field — same zero-time-to-null mapping as
-// FirstSeen.
+// LastSeen is the resolver for the lastSeen field — see nilIfZeroTime.
 func (r *clusterDataEventResolver) LastSeen(ctx context.Context, obj *cluster.ClusterDataEvent) (*time.Time, error) {
 	return nilIfZeroTime(obj.LastSeen), nil
 }
 
-// CreationTimestamp is the resolver for the creationTimestamp field — the same
-// zero-time-to-null mapping as the ClusterDataEvent timestamp resolvers (the domain
-// keeps a value time.Time for the delta-watch diff).
+// CreationTimestamp is the resolver for the creationTimestamp field — see nilIfZeroTime.
 func (r *clusterDataObjectResolver) CreationTimestamp(ctx context.Context, obj *cluster.ClusterDataObject) (*time.Time, error) {
 	return nilIfZeroTime(obj.CreationTimestamp), nil
 }
@@ -82,10 +75,9 @@ func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id cluste
 	return true, nil
 }
 
-// ClusterCacheClear is the resolver for the clusterCacheClear field: delete the
-// on-disk cache and restart that cache's sync workers onto the emptied file (the returned
-// cluster record stays);
-// a still-eligible cluster re-syncs from scratch.
+// ClusterCacheClear is the resolver for the clusterCacheClear field: delete the on-disk
+// cache and restart that cache's workers onto the emptied file — nothing else would
+// rebuild them. The cluster record stays and re-syncs from scratch.
 func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id cluster.ObjectID) (*cluster.Cluster, error) {
 	return r.ClusterSvc.ClearCache(ctx, id)
 }
@@ -99,10 +91,9 @@ func (r *mutationResolver) ClusterDelete(ctx context.Context, id cluster.ObjectI
 	return true, nil
 }
 
-// AuthLoginStart is the resolver for the authLoginStart field. It runs the
-// flow's setup phase (loopback bind + browser open) synchronously, surfacing any
-// setup error as a GraphQL error, then finishes the browser round-trip in the
-// background; the signed-in state arrives via authStateWatch.
+// AuthLoginStart is the resolver for the authLoginStart field: setup runs synchronously
+// (its error surfaces here), the browser round-trip in the background, with the signed-in
+// state arriving via authStateWatch.
 func (r *mutationResolver) AuthLoginStart(ctx context.Context) (bool, error) {
 	if err := r.Auth.StartLogin(ctx); err != nil {
 		return false, err
@@ -110,9 +101,8 @@ func (r *mutationResolver) AuthLoginStart(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// AuthLogout is the resolver for the authLogout field. The auth service clears
-// local credentials, broadcasts signed-out, and revokes the token server-side
-// (best-effort).
+// AuthLogout is the resolver for the authLogout field: clear locally, broadcast
+// signed-out, revoke best-effort.
 func (r *mutationResolver) AuthLogout(ctx context.Context) (bool, error) {
 	if err := r.Auth.Logout(ctx); err != nil {
 		return false, err
@@ -133,7 +123,7 @@ func (r *queryResolver) Clusters(ctx context.Context) ([]*cluster.Cluster, error
 }
 
 // ClusterEvents is the resolver for the clusterEvents field — a cluster's event
-// timeline. ptrSlice adapts the value results to the pointer slice gqlgen wants.
+// timeline.
 func (r *queryResolver) ClusterEvents(ctx context.Context, id cluster.ObjectID, category *string, limit *int) ([]*cluster.Event, error) {
 	evs, err := r.ClusterSvc.ClusterEvents(ctx, id, category, limit)
 	if err != nil {
@@ -143,7 +133,7 @@ func (r *queryResolver) ClusterEvents(ctx context.Context, id cluster.ObjectID, 
 }
 
 // ClusterCacheEvents is the resolver for the clusterCacheEvents field — a
-// ClusterCache's event timeline. ptrSlice adapts to gqlgen's pointer slice.
+// ClusterCache's event timeline.
 func (r *queryResolver) ClusterCacheEvents(ctx context.Context, id cluster.ObjectID, category *string, limit *int) ([]*cluster.Event, error) {
 	evs, err := r.ClusterSvc.ClusterCacheEvents(ctx, id, category, limit)
 	if err != nil {
@@ -163,7 +153,6 @@ func (r *queryResolver) ClusterCacheGVRSyncEvents(ctx context.Context, id cluste
 
 // ClusterDataKinds is the resolver for the clusterDataKinds field — one
 // ClusterCache's discovered kind catalog (parent cluster id + cache id).
-// ptrSlice adapts to gqlgen's pointer slice.
 func (r *queryResolver) ClusterDataKinds(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) ([]*cluster.ClusterDataKind, error) {
 	kinds, err := r.ClusterSvc.ClusterDataKinds(ctx, id, cacheID)
 	if err != nil {
@@ -172,9 +161,8 @@ func (r *queryResolver) ClusterDataKinds(ctx context.Context, id cluster.ObjectI
 	return ptrSlice(kinds), nil
 }
 
-// AuthState is the resolver for the authState field. auth.State binds directly
-// to the GraphQL AuthState type (gqlgen.yml), so only the schema fields are
-// exposed — State.Tokens never reaches the wire.
+// AuthState is the resolver for the authState field. auth.State binds directly to the
+// GraphQL type, so only schema fields are exposed — State.Tokens never reaches the wire.
 func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
 	state, err := r.Auth.Current(ctx)
 	if err != nil {
@@ -185,8 +173,7 @@ func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
 
 // ClustersWatch is the resolver for the clustersWatch field — the cluster list as
 // a delta watch (Added snapshot, then per-cluster Added/Modified/Deleted). Cache
-// sync status rides clusterCachesWatch, joined client-side. ptrStream adapts each
-// value change to the pointer gqlgen wants.
+// sync status rides clusterCachesWatch, joined client-side.
 func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *cluster.ClusterChange, error) {
 	ch, err := r.ClusterSvc.Watch(ctx)
 	if err != nil {
@@ -197,7 +184,7 @@ func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *clust
 
 // ClusterCachesWatch is the resolver for the clusterCachesWatch field — cache
 // records as a delta watch parallel to clustersWatch, joined to clusters
-// client-side by clusterID. ptrStream adapts each change to a pointer.
+// client-side by clusterID.
 func (r *subscriptionResolver) ClusterCachesWatch(ctx context.Context) (<-chan *cluster.ClusterCacheChange, error) {
 	ch, err := r.ClusterSvc.WatchCaches(ctx)
 	if err != nil {
@@ -218,7 +205,6 @@ func (r *subscriptionResolver) ClusterCacheSyncHealthWatch(ctx context.Context) 
 // ClusterCacheGVRDiscoveriesWatch is the resolver for the
 // clusterCacheGVRDiscoveriesWatch field — the caches' GVR-discovery records as a delta
 // watch parallel to clusterCachesWatch, joined to caches client-side by cacheID.
-// ptrStream adapts each change to a pointer.
 func (r *subscriptionResolver) ClusterCacheGVRDiscoveriesWatch(ctx context.Context) (<-chan *cluster.ClusterCacheGVRDiscoveryChange, error) {
 	ch, err := r.ClusterSvc.WatchGVRDiscoveries(ctx)
 	if err != nil {
@@ -239,8 +225,8 @@ func (r *subscriptionResolver) ClusterCacheGVRSyncsWatch(ctx context.Context, ca
 }
 
 // ClusterCacheStatsWatch is the resolver for the clusterCacheStatsWatch field — one
-// cache's contents as a live gauge, streamed rather than served as a field on
-// ClusterCache (whose record stops changing once its sync settles).
+// cache's contents as a live gauge, streamed because the ClusterCache.stats field freezes
+// once its record stops changing.
 func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterCacheStats, error) {
 	ch, err := r.ClusterSvc.ClusterCacheStatsWatch(ctx, id, cacheID)
 	if err != nil {
@@ -252,7 +238,7 @@ func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id cl
 // ClusterDataKindsWatch is the resolver for the clusterDataKindsWatch field — one
 // ClusterCache's kind catalog as a delta watch (the live counterpart of
 // clusterDataKinds), so the dashboard nav's kinds + counts track the cluster in
-// real time. ptrStream adapts each change to a pointer.
+// real time.
 func (r *subscriptionResolver) ClusterDataKindsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataKindChange, error) {
 	ch, err := r.ClusterSvc.ClusterDataKindsWatch(ctx, id, cacheID)
 	if err != nil {
@@ -263,7 +249,7 @@ func (r *subscriptionResolver) ClusterDataKindsWatch(ctx context.Context, id clu
 
 // ClusterDataEventsWatch is the resolver for the clusterDataEventsWatch field — one
 // ClusterCache's cached Kubernetes Events as a delta watch, backing the dashboard's
-// events table. ptrStream adapts each change to a pointer.
+// events table.
 func (r *subscriptionResolver) ClusterDataEventsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID) (<-chan *cluster.ClusterDataEventChange, error) {
 	ch, err := r.ClusterSvc.ClusterDataEventsWatch(ctx, id, cacheID)
 	if err != nil {
@@ -274,7 +260,6 @@ func (r *subscriptionResolver) ClusterDataEventsWatch(ctx context.Context, id cl
 
 // ClusterDataObjectsWatch is the resolver for the clusterDataObjectsWatch field — one
 // kind's cached objects as a delta watch, backing the dashboard's per-kind tables.
-// ptrStream adapts each change to a pointer.
 func (r *subscriptionResolver) ClusterDataObjectsWatch(ctx context.Context, id cluster.ObjectID, cacheID cluster.ObjectID, apiVersion string, resource string) (<-chan *cluster.ClusterDataObjectChange, error) {
 	ch, err := r.ClusterSvc.ClusterDataObjectsWatch(ctx, id, cacheID, apiVersion, resource)
 	if err != nil {
@@ -284,8 +269,7 @@ func (r *subscriptionResolver) ClusterDataObjectsWatch(ctx context.Context, id c
 }
 
 // ClusterEventsWatch is the resolver for the clusterEventsWatch field — the live
-// event tail for one cluster, decoupled from clustersWatch. ptrStream adapts each
-// bare run to a pointer.
+// event tail for one cluster, decoupled from clustersWatch.
 func (r *subscriptionResolver) ClusterEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error) {
 	ch, err := r.ClusterSvc.ClusterEventsWatch(ctx, id, category)
 	if err != nil {
@@ -296,7 +280,6 @@ func (r *subscriptionResolver) ClusterEventsWatch(ctx context.Context, id cluste
 
 // ClusterCacheEventsWatch is the resolver for the clusterCacheEventsWatch field —
 // the live event tail for one ClusterCache, decoupled from clusterCachesWatch.
-// ptrStream adapts each bare run to a pointer.
 func (r *subscriptionResolver) ClusterCacheEventsWatch(ctx context.Context, id cluster.ObjectID, category *string) (<-chan *cluster.Event, error) {
 	ch, err := r.ClusterSvc.ClusterCacheEventsWatch(ctx, id, category)
 	if err != nil {
@@ -316,7 +299,7 @@ func (r *subscriptionResolver) ClusterCacheGVRSyncEventsWatch(ctx context.Contex
 
 // ClusterScheduleWatch is the resolver for the clusterScheduleWatch field — the
 // live reconcile-schedule gauge for one cluster (next-attempt countdown),
-// decoupled from clustersWatch. ptrStream adapts each value to a pointer.
+// decoupled from clustersWatch.
 func (r *subscriptionResolver) ClusterScheduleWatch(ctx context.Context, id cluster.ObjectID) (<-chan *cluster.Schedule, error) {
 	ch, err := r.ClusterSvc.ClusterScheduleWatch(ctx, id)
 	if err != nil {
@@ -330,9 +313,8 @@ func (r *subscriptionResolver) ChatStream(ctx context.Context, input model.ChatI
 	panic(fmt.Errorf("not implemented: ChatStream - chatStream"))
 }
 
-// AuthStateWatch is the resolver for the authStateWatch field. The auth-state
-// stream is latest-value (current-on-subscribe), so its first value seeds the
-// current snapshot; each State is then mapped through.
+// AuthStateWatch is the resolver for the authStateWatch field; the stream is
+// current-on-subscribe, so its first value IS the snapshot.
 func (r *subscriptionResolver) AuthStateWatch(ctx context.Context) (<-chan *auth.State, error) {
 	states, cancel := r.Auth.Subscribe()
 	return mapStream(ctx, states, cancel, func(s auth.State) *auth.State { return &s }), nil

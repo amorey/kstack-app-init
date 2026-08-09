@@ -26,14 +26,10 @@ pub struct AppState {
     /// Latest-state holder for the tray's account watch stream, written by
     /// `spawn_authstate_subscription`.
     pub tray: Arc<Mutex<TraySnapshots>>,
-    /// App-wide graceful-shutdown signal. Cancelled once on Quit (see
-    /// `lib.rs`'s `RunEvent::ExitRequested`), which is *before* the sidecar is
-    /// torn down. The long-lived background tasks spawned at setup — the tray
-    /// auth-state supervisor (`tray::spawn_authstate_subscription`), the wake/
-    /// network-return supervisor (`wake::spawn_wake_poke_supervisor`), and the
-    /// Unix signal handler (`lib::spawn_signal_handler`) — select on
-    /// [`CancellationToken::cancelled`] so they stop their reconnect/retry
-    /// loops and pending sleeps instead of churning against a sidecar that's
-    /// going away. Cheap to clone; each task holds its own clone.
+    /// App-wide graceful-shutdown signal, cancelled once on Quit *before* the
+    /// sidecar is torn down. Every app-lifetime background task (tray/wake
+    /// supervisors, signal handler) must hold a clone and select on
+    /// [`CancellationToken::cancelled`] so it doesn't retry against a dying
+    /// sidecar.
     pub shutdown: CancellationToken,
 }

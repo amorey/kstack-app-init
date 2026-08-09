@@ -12,19 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The kubeconfig's context list surfaced to the renderer, derived from the
-// cluster registry stream (each present cluster record carries its context
-// name and the current-context flag) — so this provider must be mounted
-// inside <ClustersProvider>. The sidecar exposes no dedicated
-// kubeConfigWatch subscription; if a consumer ever needs the raw kubeconfig
-// (auth-infos, server URLs), grow the Cluster type instead.
+// The kubeconfig's context list, derived from the cluster registry stream — must
+// mount inside <ClustersProvider>. There is no dedicated kubeConfigWatch; a
+// consumer needing the raw kubeconfig should grow the Cluster type instead.
 import { createContext, useContext, useMemo } from 'react';
 
 import { useClusters } from '@/lib/clusters';
 
-// One switchable kubeconfig context: its name plus the cluster and user it
-// binds to (both kubeconfig-sourced). The picker shows the name; the context
-// bar surfaces the cluster/user the narrow name alone can't convey.
+// One switchable context: name plus the kubeconfig cluster/user it binds to
+// (the context bar surfaces the latter).
 export type KubeContextInfo = {
   name: string;
   cluster: string;
@@ -37,11 +33,10 @@ export type KubeConfig = {
 };
 
 type KubeConfigContextValue = {
-  // null = clusters not reported yet (first frame not landed).
+  // null = clusters not reported yet.
   kubeConfig: KubeConfig | null;
-  // Is the registry's transport up right now? Passed straight through from the
-  // cluster registry, so a consumer can pair it with `kubeConfig === null` (via
-  // `watchPhase`) to tell "connecting" from "connected, empty kubeconfig".
+  // Registry transport up? Pair with `kubeConfig === null` via `watchPhase` to
+  // tell "connecting" from "connected, empty kubeconfig".
   connected: boolean;
 };
 
@@ -51,10 +46,8 @@ export function KubeConfigProvider({ children }: { children: React.ReactNode }) 
   const { clusters, connected } = useClusters();
   const value = useMemo<KubeConfigContextValue>(() => {
     if (clusters === null) return { kubeConfig: null, connected };
-    // The context picker shows only clusters the user has enabled in the app and
-    // that are still present in the kubeconfig. Disabled records stay tracked but
-    // hidden; orphaned ones (context gone) have nothing to switch to. Only
-    // kubeconfig-sourced records carry a context.
+    // Only enabled, kubeconfig-present, kubeconfig-sourced records are switchable;
+    // disabled ones stay tracked but hidden, orphaned ones have nothing to switch to.
     const present = clusters.filter(
       (c) => c.spec.enabled && c.status.source.kubeconfig?.isPresent && c.spec.source.kubeconfig,
     );

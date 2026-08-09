@@ -29,73 +29,51 @@ use super::grpc::{AuthStateStream, GrpcClient};
 use super::ipc::{Endpoint, DEFAULT_CONNECT_BUDGET};
 use super::logs::{forward_sidecar_line, Severity};
 
-/// First-token marker the sidecar prints on stdout once `net.Listen` returns and
-/// `Serve` is running (`sidecar/main.go:116`). The drain task matches it to flip
-/// the readiness watch; the rest of the line is the socket path the host already
-/// knows.
+/// First-token marker the sidecar prints on stdout once its listener is up
+/// (`sidecar/main.go`); the drain task matches it to flip the readiness watch.
 const READY_MARKER: &[u8] = b"READY ";
 
-/// Mutable lifecycle state of the sidecar child, guarded by a single mutex.
-///
-/// [`SidecarService::graceful_shutdown`] *takes* `child` (dropping it to close
-/// stdin) but records `pid` first, so a later [`SidecarService::kill`] can still
-/// force-terminate a process that ignored the graceful request. `exited` (set by
-/// the drain task on termination) makes `kill` skip the pid fallback once the
-/// process is gone — the number may have been reused.
+/// Sidecar child lifecycle state. `graceful_shutdown` takes `child` (dropping
+/// it closes stdin) but keeps `pid` so `kill` can still force-terminate;
+/// `exited` makes `kill` skip the pid fallback — the number may be reused.
 struct State {
     /// The running child, or `None` once graceful_shutdown/kill has run.
     child: Option<CommandChild>,
-    /// The child's pid, retained after `child` is dropped so a forced kill
-    /// is still possible. `None` once the process has been force-killed.
+    /// Retained after `child` is dropped; `None` once force-killed.
     pid: Option<u32>,
-    /// `true` once the process has been observed to exit. Once set, the
-    /// pid is no longer safe to kill (it may have been reused).
+    /// Set by the drain task; once true the pid is not safe to kill.
     exited: bool,
 }
 
-/// Owns the bundled sidecar child process and the IPC bridges that talk to it
-/// (query client, SSE reader, gRPC channel), all built around the same
-/// [`Endpoint`] picked at spawn time. Construct via [`SidecarService::spawn`].
-///
-/// Lifecycle state is held behind a [`Mutex`] shared with the drain task via
-/// [`Arc`], so shutdown can be driven from any thread.
+/// Owns the bundled sidecar child process and its IPC bridges (query client,
+/// SSE reader, gRPC channel), all on the [`Endpoint`] picked at spawn time.
+/// Construct via [`SidecarService::spawn`]. Shutdown can be driven from any
+/// thread (state behind `Arc<Mutex>`).
 pub struct SidecarService {
     state: Arc<Mutex<State>>,
     exit_rx: Mutex<Receiver<()>>,
-    /// Cloned per call by [`SidecarService::ready`] so concurrent callers don't
-    /// contend. The drain task's sender flips it to `true` on [`READY_MARKER`];
-    /// on process exit the sender drops, surfacing to any in-flight `wait_for` as
-    /// a recv error — the "exited before ready" signal.
+    /// Flipped true on [`READY_MARKER`]; on process exit the sender drops,
+    /// surfacing to `wait_for` as a recv error ("exited before ready").
     ready_rx: watch::Receiver<bool>,
     query_client: QueryClient,
     subscription_client: SubscriptionClient,
-    /// gRPC channel to the sidecar's host-internal control surface (auth-state
-    /// watch + login/logout, resync poke), multiplexed over the same socket as
-    /// GraphQL via h2c.
+    /// Host-internal control surface (auth watch/login/logout, poke), h2c over
+    /// the same socket as GraphQL. See docs/adr/2026-08-09-single-socket-h2c.md.
     grpc_client: GrpcClient,
 }
 
 impl SidecarService {
-    /// Spawns the `kstack-sidecar` binary and begins forwarding its output.
-    ///
-    /// A background task drains the process's event stream, re-emitting each
-    /// sidecar log line through `tracing` (see [`forward_sidecar_line`]) and
-    /// reporting termination. The returned [`SidecarService`] retains
-    /// ownership of the child so it can be shut down later.
+    /// Spawns the `kstack-sidecar` binary; a background task drains its event
+    /// stream (log forwarding + termination reporting).
     pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<Self> {
         let endpoint = Endpoint::pick(&std::env::temp_dir())?;
 
-        // Per-machine, non-roaming app data dir for the per-cluster SQLite cache
-        // and cloud settings/queue. We join a human-readable name onto the OS base
-        // (`local_data_dir`) rather than Tauri's `app_local_data_dir`, which
-        // derives the leaf from the reverse-DNS bundle id (`sh.kstack.app`); the
-        // convention under ~/Library/Application Support is a display name. The
-        // base maps to ~/Library/Application Support (macOS), %LOCALAPPDATA%
-        // (Windows), ~/.local/share (Linux).
-        //
-        // A debug build (`tauri dev`) uses a separate "Kstack-dev" sibling so its
-        // cache/queue can't collide with an installed release's "Kstack". Created
-        // up front so the sidecar can mkdir subdirs under it.
+        // Per-machine app data dir for the sidecar's SQLite cache and cloud
+        // settings/queue. Human-readable leaf on `local_data_dir`, not Tauri's
+        // bundle-id `app_local_data_dir` (Application Support convention is a
+        // display name). Debug builds use a "Kstack-dev" sibling so dev can't
+        // collide with an installed release. Created up front so the sidecar
+        // can mkdir subdirs.
         let dir_name = if cfg!(debug_assertions) {
             "Kstack-dev"
         } else {
@@ -116,9 +94,8 @@ impl SidecarService {
             .shell()
             .sidecar("kstack-sidecar")?
             .args(cmd_args(&endpoint, &data_dir));
-        // Point the sidecar's keychain at a dev-specific service name in debug
-        // builds so a dev run's stored sign-in doesn't share (and clobber) the
-        // installed release's entry.
+        // Dev-specific keychain service name so a dev run's stored sign-in
+        // doesn't clobber the installed release's entry.
         if cfg!(debug_assertions) {
             command = command.env("KSTACK_KEYCHAIN_SERVICE", dir_name);
         }
@@ -131,12 +108,9 @@ impl SidecarService {
             exited: false,
         }));
 
-        // Capacity 1 so the drain task never blocks delivering the exit: the slot
-        // holds the message even if no one is waiting yet.
+        // Capacity 1 so the drain task never blocks delivering the exit.
         let (exit_tx, exit_rx) = sync_channel::<()>(1);
 
-        // `false` = not ready yet; the drain task flips it to `true` on the READY
-        // stdout line.
         let (ready_tx, ready_rx) = watch::channel(false);
 
         let drain_state = Arc::clone(&state);
@@ -144,10 +118,9 @@ impl SidecarService {
             while let Some(ev) = rx.recv().await {
                 match ev {
                     CommandEvent::Stdout(line) => {
-                        // Detect readiness before forwarding, so the line still
-                        // appears as a normal sidecar info entry in the host logs.
+                        // Detect readiness, then still forward the line as a
+                        // normal log entry.
                         if line.starts_with(READY_MARKER) {
-                            // Err only if every receiver dropped — nothing to notify.
                             let _ = ready_tx.send(true);
                         }
                         forward_sidecar_line(&line, Severity::Info);
@@ -156,15 +129,14 @@ impl SidecarService {
                     CommandEvent::Terminated(payload) => {
                         tracing::info!(?payload, "sidecar exited");
 
-                        // Record the exit so `kill` skips the pid fallback (the
-                        // pid may already be reused).
+                        // `kill` must skip the pid fallback after this (pid may
+                        // be reused).
                         drain_state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .exited = true;
 
-                        // Wake any thread blocked in graceful_shutdown. try_send:
-                        // a full slot or absent receiver is fine.
+                        // Wake any thread blocked in graceful_shutdown.
                         let _ = exit_tx.try_send(());
                     }
                     _ => {}
@@ -186,25 +158,17 @@ impl SidecarService {
         })
     }
 
-    /// Waits for the sidecar to announce readiness on stdout ([`READY_MARKER`]).
-    /// Resolves the moment the marker arrives, or errors if the sidecar exits
-    /// first / the budget elapses.
-    ///
-    /// A proactive startup gate: without it the frontend's first GraphQL call
-    /// absorbs the lazy-dial retry budget while the sidecar is still binding, and
-    /// the user perceives it as latency. Event-driven rather than dial-and-retry,
-    /// so it resolves in about one tracing hop. Errors:
-    /// - `TimedOut` if the marker doesn't arrive within [`DEFAULT_CONNECT_BUDGET`].
-    /// - generic `Io` if the drain task ended (process exited) before sending —
-    ///   the dropped watch sender surfaces as a recv error.
+    /// Waits for the sidecar's [`READY_MARKER`]; errors if the sidecar exits
+    /// first (`Io`) or [`DEFAULT_CONNECT_BUDGET`] elapses (`TimedOut`). The
+    /// frontend's startup gate — without it the first GraphQL call silently
+    /// absorbs the bind-wait latency.
     pub async fn ready(&self) -> Result<()> {
         let mut rx = self.ready_rx.clone();
-        // Fast path: marker already arrived, skip the timeout future.
         if *rx.borrow() {
             return Ok(());
         }
-        // `.map(|_| ())` drops the `watch::Ref<'_, bool>` before the match arm —
-        // its borrow on `rx` would otherwise trip the borrow checker.
+        // `.map(|_| ())` drops the `watch::Ref` before the match arm — its
+        // borrow on `rx` would otherwise trip the borrow checker.
         let waited = tokio::time::timeout(DEFAULT_CONNECT_BUDGET, rx.wait_for(|ready| *ready))
             .await
             .map(|res| res.map(|_| ()));
@@ -220,15 +184,13 @@ impl SidecarService {
         }
     }
 
-    /// Forwards a GraphQL query/mutation to the sidecar over its UDS HTTP
-    /// endpoint. Stateless per-call; see [`QueryClient`].
+    /// Forwards a GraphQL query/mutation over UDS HTTP; see [`QueryClient`].
     pub async fn query(&self, body: String) -> Result<GraphqlResponse> {
         self.query_client.query(body).await
     }
 
-    /// Registers a new GraphQL subscription, opening a dedicated SSE
-    /// connection to the sidecar for it. Forwards every inbound envelope to
-    /// `channel`. Returns the host-side op id to pass to
+    /// Registers a GraphQL subscription on its own SSE connection, forwarding
+    /// envelopes to `channel`. Returns the op id for
     /// [`SidecarService::unsubscribe`].
     pub async fn subscribe(
         &self,
@@ -236,66 +198,50 @@ impl SidecarService {
         variables: serde_json::Value,
         channel: Channel<String>,
     ) -> Result<u64> {
-        // `subscribe` takes an `Arc<dyn FrameSink>`, keeping the seam open for any
-        // host-internal consumer; the webview wraps its `Channel` in `TauriChannelSink`.
+        // `FrameSink` is the delivery seam; the webview's `Channel` is wrapped
+        // in `TauriChannelSink`.
         self.subscription_client
             .subscribe(query, variables, Arc::new(TauriChannelSink(channel)))
             .await
     }
 
-    /// Cancels a previously registered subscription. Tolerant of unknown
-    /// ids — see [`SubscriptionClient::unsubscribe`].
+    /// Cancels a subscription; tolerant of unknown ids — see
+    /// [`SubscriptionClient::unsubscribe`].
     pub async fn unsubscribe(&self, id: u64) {
         self.subscription_client.unsubscribe(id).await;
     }
 
-    /// Runs the synchronous login setup phase on the sidecar (loopback bind +
-    /// browser open). Returns once setup succeeds or fails; the resulting session
-    /// change is delivered via [`Self::watch_auth_state`].
+    /// Runs the sidecar's synchronous login setup (loopback bind + browser
+    /// open); the resulting session change arrives via
+    /// [`Self::watch_auth_state`].
     pub async fn start_login(&self) -> Result<()> {
         self.grpc_client.start_login().await
     }
 
-    /// Clears local credentials and revokes the refresh token (fire-and-forget
-    /// revocation on the sidecar).
+    /// Clears local credentials and revokes the refresh token.
     pub async fn logout(&self) -> Result<()> {
         self.grpc_client.logout().await
     }
 
-    /// Opens the host-internal auth-state watch stream over gRPC: the current
-    /// snapshot first (latest-value), then a fresh snapshot on every session
-    /// change. Drives the tray's account submenu. The caller pulls frames with
-    /// `stream.message().await`; an error / end-of-stream means the connection
-    /// dropped and the supervisor should re-open it.
+    /// Opens the auth-state watch stream (current snapshot first, then one per
+    /// session change). Error / end-of-stream means the connection dropped —
+    /// the supervisor re-opens it.
     pub async fn watch_auth_state(&self) -> Result<AuthStateStream> {
         self.grpc_client.watch_auth_state().await
     }
 
-    /// Nudges the sidecar to resync over gRPC (best-effort). Driven by the
-    /// host's wake / network-return supervisor ([`crate::wake`]); the sidecar
-    /// broadcasts a `SourceHost` resync to its cluster-sync and settings-sync
-    /// engines. Failures are the caller's to swallow — the sidecar's wall-clock
-    /// detector is the backstop.
+    /// Best-effort resync nudge, driven by [`crate::wake`]; failures are the
+    /// caller's to swallow. See docs/adr/2026-08-09-poke-resync-fanout.md.
     pub async fn poke(&self) -> Result<()> {
         self.grpc_client.poke().await
     }
 
-    /// Asks the sidecar to shut down gracefully, blocking until it exits or
-    /// `timeout` elapses.
-    ///
-    /// The sidecar treats stdin EOF as a "parent gone" signal and runs its own
-    /// clean shutdown (HTTP drain, SSE completion, sync-engine join). We trigger
-    /// the EOF by dropping the [`CommandChild`], which drops the stdin pipe —
-    /// working identically on every platform, unlike POSIX signals Windows lacks.
-    ///
-    /// Synchronous: returns only once the process actually exited (per the drain
-    /// task) or `timeout` runs out, so it's safe to call from a blocking context
-    /// like the `RunEvent` handler.
-    ///
-    /// Returns `true` on a clean exit within `timeout`, `false` if the grace
-    /// period lapsed first — then the caller should follow up with
-    /// [`SidecarService::kill`] (the pid is retained so that fallback works). A
-    /// no-op returning `true` if already shut down.
+    /// Graceful shutdown: dropping the [`CommandChild`] closes stdin, and the
+    /// sidecar treats stdin EOF as "parent gone" (cross-platform, unlike POSIX
+    /// signals). Blocks until the process exits or `timeout` lapses — safe from
+    /// the `RunEvent` handler. Returns `false` on timeout (follow up with
+    /// [`SidecarService::kill`]; the pid is retained for that). No-op → `true`
+    /// if already shut down.
     pub fn graceful_shutdown(&self, timeout: Duration) -> bool {
         {
             let mut state = self
@@ -306,15 +252,13 @@ impl SidecarService {
                 return true;
             }
 
-            // Dropping the CommandChild drops its stdin PipeWriter, delivering
-            // EOF to the sidecar. `pid` is left intact. The guard is released
-            // here, before blocking below, so the drain task can set `exited`.
+            // Drops stdin → EOF. `pid` stays. Guard released before blocking so
+            // the drain task can set `exited`.
             drop(state.child.take());
         }
 
-        // Block until the drain task reports the exit, or the grace period ends.
-        // recv_timeout returns Err on both timeout and a dropped sender; either
-        // way the process is not known to have exited.
+        // recv_timeout errs on both timeout and a dropped sender; either way
+        // the process is not known to have exited.
         let exit_rx = self
             .exit_rx
             .lock()
@@ -322,17 +266,10 @@ impl SidecarService {
         exit_rx.recv_timeout(timeout).is_ok()
     }
 
-    /// Force-terminates the sidecar process if it is still running.
-    ///
-    /// If the live child handle is still held this kills through it directly.
-    /// Otherwise — e.g. after [`SidecarService::graceful_shutdown`] dropped the
-    /// handle — it falls back to terminating by pid via the platform API, but
-    /// *only* if the process has not already been observed to exit: once it
-    /// has, the pid may belong to an unrelated process and must not be killed.
-    ///
-    /// Best-effort: failures are ignored (a stale pid simply means the process
-    /// already exited), and the call is a no-op once it has run. Safe to call
-    /// more than once. This is immediate; for a clean exit call
+    /// Force-terminates the sidecar. Kills through the live child handle if
+    /// held, else by retained pid — but only if the process hasn't been
+    /// observed to exit (a reused pid must not be killed). Best-effort and
+    /// idempotent; for a clean exit call
     /// [`SidecarService::graceful_shutdown`] first.
     pub fn kill(&self) {
         let mut state = self
@@ -340,16 +277,15 @@ impl SidecarService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Prefer the live handle: it reaps the child and avoids a pid-reuse race.
-        // `pid` is cleared regardless so a repeat call is a no-op.
+        // Prefer the live handle: reaps the child, no pid-reuse race.
         if let Some(child) = state.child.take() {
             let _ = child.kill();
             state.pid = None;
             return;
         }
 
-        // Handle gone (graceful_shutdown ran): fall back to the pid, but skip it
-        // if the process already exited (the kernel may have reused the number).
+        // Handle gone: pid fallback, unless the process already exited (the
+        // kernel may have reused the number).
         if state.exited {
             state.pid = None;
             return;
@@ -361,8 +297,8 @@ impl SidecarService {
     }
 }
 
-/// Returns the CLI flags the sidecar binary expects at spawn time. Factored out
-/// so the argument contract is unit-testable without the Tauri runtime.
+/// CLI flags for the sidecar; a free function so the contract is unit-testable
+/// without the Tauri runtime.
 fn cmd_args(socket: &Endpoint, data_dir: &std::path::Path) -> Vec<String> {
     vec![
         "--socket".to_string(),
@@ -372,15 +308,11 @@ fn cmd_args(socket: &Endpoint, data_dir: &std::path::Path) -> Vec<String> {
     ]
 }
 
-/// Terminates a process by pid using the platform's native API.
-///
-/// Best-effort: a stale pid (process already gone) is ignored on both
-/// platforms. Used only as the fallback once the [`CommandChild`] handle has
-/// been dropped by [`SidecarService::graceful_shutdown`].
+/// Best-effort kill by pid — the fallback once [`SidecarService::graceful_shutdown`]
+/// dropped the child handle. Stale pids are ignored.
 #[cfg(unix)]
 fn force_kill_by_pid(pid: u32) {
-    // SAFETY: `kill(2)` with a valid pid and signal has no memory effects;
-    // a stale pid simply returns ESRCH, which we ignore.
+    // SAFETY: kill(2) has no memory effects; a stale pid returns ESRCH.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
@@ -391,9 +323,8 @@ fn force_kill_by_pid(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
-    // SAFETY: OpenProcess returns null on failure (e.g. the process already
-    // exited), which we check before use; TerminateProcess and CloseHandle
-    // are sound on the handle OpenProcess hands back.
+    // SAFETY: OpenProcess returns null on failure (checked); TerminateProcess
+    // and CloseHandle are sound on the handle it returns.
     unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
         if handle.is_null() {
@@ -404,9 +335,8 @@ fn force_kill_by_pid(pid: u32) {
     }
 }
 
-/// Adapts Tauri's `Channel<String>` to the [`FrameSink`] trait so `subscribe`
-/// needn't know about the Tauri runtime. `Channel::send` errors only if the
-/// webview is gone, in which case the frame is safely dropped.
+/// Adapts Tauri's `Channel<String>` to [`FrameSink`]. `send` errors only if
+/// the webview is gone; the frame is safely dropped.
 struct TauriChannelSink(Channel<String>);
 
 impl FrameSink for TauriChannelSink {
@@ -419,11 +349,9 @@ impl FrameSink for TauriChannelSink {
 mod tests {
     use super::*;
 
-    /// Locks the host↔sidecar CLI contract: the host hands the sidecar the
-    /// listen address via `--socket <path>` and the app data dir via
-    /// `--data-dir <path>`. Changing this shape without updating the sidecar
-    /// would silently leave the cluster cache pointed at the wrong location (or
-    /// the sockets binding to different paths).
+    /// Pins the host↔sidecar CLI contract (`--socket`, `--data-dir`);
+    /// changing it without updating the sidecar silently misroutes the cache
+    /// or the socket.
     #[test]
     fn cmd_args_passes_socket_and_data_dir() {
         let base = std::env::temp_dir();

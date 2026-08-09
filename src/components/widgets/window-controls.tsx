@@ -12,12 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Custom window controls (minimize / maximize / close) for the frameless
-// Linux/Windows window, at the right of the custom title bar. With
-// `decorations(false)` there are no OS caption buttons, so these HTML buttons are
-// styled to read as native (including the Windows-style red close hover). macOS
-// keeps its native traffic lights, so this renders nothing there. Actions cross
-// into the host via the `@tauri-apps/api/window` core API.
+// Minimize/maximize/close for the frameless Linux/Windows window — no OS caption
+// buttons there, so these are styled to read as native (Windows-style red close
+// hover). Renders nothing on macOS (native traffic lights).
 import { Minus, Square, X } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
@@ -62,7 +59,6 @@ const CONTROLS = [
 ] as const;
 
 export function WindowControls() {
-  // macOS surfaces the native traffic lights; render only on Linux/Windows.
   if (isMacOS()) return null;
   return (
     <div className="flex items-center">

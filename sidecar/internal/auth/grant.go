@@ -13,38 +13,33 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth/oauth"
 )
 
-// ErrSignedOut means there is no usable credential to authenticate with — the
-// store is empty or has been cleared, so there's nothing to refresh. Callers
-// should treat this as "signed out" and fail locally rather than retrying.
+// ErrSignedOut means there's no usable credential — nothing to refresh, so callers fail
+// locally rather than retrying.
 var ErrSignedOut = errors.New("auth: signed out")
 
-// CredentialsStore persists the Token. Implemented by keyringStore over the OS
-// keyring in production; an in-memory fake in tests. Load on an empty store
-// returns the zero Token (signed-out), not an error.
+// CredentialsStore persists the Token (keyringStore in production, a fake in tests). Load
+// on an empty store returns the zero Token, not an error.
 type CredentialsStore interface {
 	Load() (Token, error)
 	Save(Token) error
 }
 
-// RefreshFunc exchanges a (static) refresh token for a fresh Token. In
-// production this is the oauth client's Refresh; tests inject a stub.
+// RefreshFunc exchanges a (static) refresh token for a fresh Token — the oauth client's
+// Refresh in production.
 type RefreshFunc func(ctx context.Context, refreshToken string) (Token, error)
 
 // grantOption configures a grant.
 type grantOption func(*grant)
 
-// withNow injects the clock (test seam). Defaults to time.Now.
+// withNow injects the clock (test seam).
 func withNow(now func() time.Time) grantOption {
 	return func(s *grant) { s.now = now }
 }
 
-// grant is the auth subsystem's OAuth grant aggregate. It owns the stored token
-// set (the source of truth for "am I signed in") plus the cached identity, vends
-// a valid access token (refreshing lazily), and publishes the current session
-// State to subscribers via a latest-value watch hub.
-//
-// Authenticated and Identity are DERIVED from the token set, never stored
-// alongside it, so the credential state and the published State cannot drift.
+// grant is the OAuth grant aggregate: it owns the stored token set plus cached identity,
+// vends a valid access token (refreshing lazily), and publishes session State to a
+// latest-value hub. Authenticated and Identity are DERIVED from the token set, never
+// stored alongside, so credential state and published State can't drift.
 type grant struct {
 	store   CredentialsStore
 	refresh RefreshFunc
@@ -59,43 +54,33 @@ type grant struct {
 	loaded   bool
 }
 
-// newGrant builds the grant aggregate over a CredentialsStore + refresh func
-// and RESTORES persisted state: if the store holds a token with a refresh token,
-// the grant starts signed in, with the identity decoded (unverified) from the
-// stored ID token — so a restart isn't signed-out while a consumer
-// re-authenticates from the stored token.
-//
-// A nil store yields a degraded grant: signed-out, validToken returns
-// ErrSignedOut, set errors, clear is a no-op.
+// newGrant builds the aggregate and RESTORES persisted state: a stored refresh token
+// starts the grant signed in, identity decoded (unverified) from the stored ID token. A
+// nil store yields a degraded grant (signed-out, validToken errors, clear a no-op).
 func newGrant(store CredentialsStore, refresh RefreshFunc, opts ...grantOption) *grant {
 	s := &grant{store: store, refresh: refresh, now: time.Now}
 	for _, o := range opts {
 		o(s)
 	}
-	// Restore persisted state. ensureLoaded degrades a store read failure (e.g.
-	// an unavailable OS keyring on a headless Linux box) to signed-out, so a
-	// missing keyring backend doesn't break every later state read.
+	// ensureLoaded degrades an unreadable store (a headless box with no keyring) to
+	// signed-out rather than failing every later state read.
 	_ = s.ensureLoaded()
-	// Seed the hub with the restored State so a current-on-subscribe delivery
-	// hands a new subscriber the live session, not a zero value.
+	// Seed the hub so current-on-subscribe hands the live session, not a zero value.
 	s.hub = watch.New(s.stateLocked())
 	s.tx = s.hub.Sender()
 	return s
 }
 
-// subscribe returns a latest-value stream of session State plus a cancel func.
-// The first receive yields the current State (current-on-subscribe), then each
-// change — so a consumer needs no separate state() read to seed itself. A
-// consumer that falls behind catches up to the newest State rather than seeing
-// every intermediate one (fine here: consumers care about the resulting state,
-// not the path taken).
+// subscribe streams session State (current-on-subscribe, then changes) plus a cancel
+// func. Latest-value: a slow consumer catches up to the newest State, which is all
+// consumers care about here.
 func (s *grant) subscribe() (<-chan State, func()) {
 	rx := s.hub.Receiver()
 	return rx.Chan(), rx.Close
 }
 
-// state returns the current public State (no forced refresh). It loads the store
-// on first use.
+// state returns the current State without forcing a refresh, loading the store on first
+// use.
 func (s *grant) state(context.Context) (State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,8 +90,8 @@ func (s *grant) state(context.Context) (State, error) {
 	return s.stateLocked(), nil
 }
 
-// stateLocked computes the current State. Caller must hold s.mu. Identity and
-// Tokens are nil while signed out so a consumer can't read stale material.
+// stateLocked computes the current State (s.mu held); Identity and Tokens stay nil while
+// signed out, so no consumer reads stale material.
 func (s *grant) stateLocked() State {
 	st := State{Authenticated: s.tok.RefreshToken != ""}
 	if st.Authenticated {
@@ -121,9 +106,8 @@ func (s *grant) stateLocked() State {
 	return st
 }
 
-// validToken returns a valid token, refreshing if the cached one has expired.
-// The mutex serializes concurrent callers, so a burst against an expired token
-// triggers exactly one refresh. A successful refresh republishes the State.
+// validToken returns a valid token, lazily refreshing an expired one. The mutex
+// serializes callers, so a burst against an expired token triggers exactly one refresh.
 func (s *grant) validToken(ctx context.Context) (Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -134,8 +118,7 @@ func (s *grant) validToken(ctx context.Context) (Token, error) {
 	if s.tok.Valid(s.now()) {
 		return s.tok, nil
 	}
-	// No refresh token (empty/cleared store) means we're signed out — fail
-	// locally instead of hammering the refresh endpoint with an empty token.
+	// No refresh token means signed out — fail locally rather than hammer the endpoint.
 	if s.tok.RefreshToken == "" {
 		return Token{}, ErrSignedOut
 	}
@@ -144,22 +127,21 @@ func (s *grant) validToken(ctx context.Context) (Token, error) {
 	if err != nil {
 		return Token{}, err
 	}
-	// Persist before caching: a store write failure must not leave a
-	// fresh-but-unpersisted token in memory that later calls serve as valid.
+	// Persist before caching: a write failure must not leave a fresh-but-unpersisted
+	// token in memory that later calls serve as valid.
 	if err := s.store.Save(tok); err != nil {
 		return Token{}, err
 	}
 	s.tok = tok
 	s.loaded = true
-	// Identity is unchanged by a refresh, so the published State keeps the same
-	// Authenticated bit + Identity; only the Tokens projection changes. Consumers
-	// that key off the sign-in bit (the settings-sync poke) see no transition.
+	// A refresh changes only the Tokens projection, so consumers keying off the sign-in
+	// bit (the settings-sync poke) see no transition.
 	s.publishLocked()
 	return s.tok, nil
 }
 
-// current returns the cached token as-is (no refresh) — for callers that need
-// the stored token itself, e.g. revoking the refresh token on sign-out.
+// current returns the cached token as-is, for callers needing the stored token itself
+// (e.g. revoking on sign-out).
 func (s *grant) current() (Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -169,10 +151,9 @@ func (s *grant) current() (Token, error) {
 	return s.tok, nil
 }
 
-// set records a freshly-minted token + its verified identity (sign-in) and
-// persists it. It persists before caching, so a store failure leaves the grant
-// signed-out rather than reporting signed-in over a credential that never
-// landed. On success it publishes the new signed-in State.
+// set records a freshly-minted token + verified identity, persisting BEFORE caching so a
+// store failure leaves the grant signed-out rather than reporting a credential that never
+// landed.
 func (s *grant) set(tok Token, id Identity) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -189,11 +170,8 @@ func (s *grant) set(tok Token, id Identity) error {
 	return nil
 }
 
-// clear erases the persisted token and publishes the signed-out State. It erases
-// durable storage BEFORE dropping the cache: if the store write fails, the cache
-// is left intact (still signed in) so the process and a restart agree, instead
-// of the process appearing signed out while a restart would re-authenticate from
-// the leftover token.
+// clear erases durable storage BEFORE dropping the cache, so a failed write leaves the
+// process still signed in and agreeing with what a restart would find.
 func (s *grant) clear() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -210,15 +188,12 @@ func (s *grant) clear() error {
 	return nil
 }
 
-// publishLocked publishes the current State to subscribers. Caller must hold
-// s.mu. watch.Send never blocks; a slow receiver just catches up to the latest
-// State on its next read.
+// publishLocked publishes the current State (s.mu held); Send never blocks.
 func (s *grant) publishLocked() {
 	s.tx.Send(s.stateLocked()) //nolint:errcheck // Send never blocks; closed hub is a no-op
 }
 
-// ensureLoaded loads the token from the store into the cache on first use.
-// Caller must hold s.mu.
+// ensureLoaded loads the token into the cache on first use (s.mu held).
 func (s *grant) ensureLoaded() error {
 	if s.loaded {
 		return nil
@@ -229,9 +204,8 @@ func (s *grant) ensureLoaded() error {
 	}
 	tok, err := s.store.Load()
 	if err != nil {
-		// A keyring that can't be read (locked, or no Secret Service backend)
-		// degrades to signed-out rather than failing every state read — the user
-		// can sign in again. Mark loaded so we don't re-hit the store each call.
+		// An unreadable keyring degrades to signed-out (the user can sign in again)
+		// rather than failing every state read. Mark loaded so we don't re-hit it.
 		slog.Warn("auth: could not read stored credentials; treating as signed out", "err", err)
 		s.loaded = true
 		return nil
@@ -240,9 +214,8 @@ func (s *grant) ensureLoaded() error {
 	return nil
 }
 
-// applyToken caches a token loaded from the store and decodes its display
-// identity. Identity is display-only — the cloud re-verifies the access token
-// per request, so an unverified decode of our own stored ID token is safe here.
+// applyToken caches a loaded token and decodes its identity. The unverified decode is
+// safe because Identity is display-only — the cloud re-verifies per request.
 func (s *grant) applyToken(tok Token) {
 	s.tok = tok
 	s.loaded = true
@@ -251,20 +224,16 @@ func (s *grant) applyToken(tok Token) {
 	}
 }
 
-// grantTokenSource adapts the grant aggregate to oauth2.TokenSource. The ctx
-// is captured at construction (Service.TokenSource(ctx)) — matching x/oauth2's
-// model, where the refresh exchange runs under the construction context. The
-// cloud api client constructs one per request from the request context, so the
-// bounded per-request timeout still governs a refresh.
+// grantTokenSource adapts the grant to oauth2.TokenSource. ctx is captured at
+// construction, matching x/oauth2's model; the api client builds one per request, so the
+// per-request timeout still governs a refresh.
 type grantTokenSource struct {
 	ctx   context.Context
 	grant *grant
 }
 
-// Token returns a valid oauth2 token, lazily refreshing the cached one if it has
-// expired. The refresh token rides along (Hydra's is static) so a caller that
-// wants the whole grant has it; callers that only need the bearer read
-// AccessToken.
+// Token returns a valid oauth2 token, lazily refreshing. The refresh token rides along
+// (Hydra's is static); bearer-only callers read AccessToken.
 func (t grantTokenSource) Token() (*oauth2.Token, error) {
 	tok, err := t.grant.validToken(t.ctx)
 	if err != nil {

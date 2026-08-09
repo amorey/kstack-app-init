@@ -36,21 +36,16 @@ func main() {
 
 	sockPath := flag.String("socket", ipc.DefaultSocketPath(), "path to the IPC endpoint (Unix domain socket on Unix, named pipe on Windows) to listen on")
 	kubeconfigPath := flag.String("kubeconfig", "", "explicit kubeconfig path; empty uses the clientcmd default-loading rules ($KUBECONFIG / ~/.kube/config)")
-	// The Tauri host passes its app_local_data_dir() here so app.db and the
-	// per-cluster SQLite caches land in the OS-correct location. Required —
-	// app.New errors when empty, so a standalone run must supply one.
+	// The host passes its app_local_data_dir(); required — app.New errors when empty.
 	dataDir := flag.String("data-dir", envOr("KSTACK_DATA_DIR", ""), "app data dir for app.db and the per-cluster caches (defaults to KSTACK_DATA_DIR; required)")
 	flag.Parse()
 
-	// Per-OS binding: AF_UNIX socket on Unix, named pipe on Windows.
-	// Both endpoints are restricted to the current user (chmod 0600 / DACL).
 	ln, err := ipc.Listen(*sockPath)
 	if err != nil {
 		slog.Error("listen", "socket", *sockPath, "err", err)
 		os.Exit(1)
 	}
-	// Named pipes vanish with their listener; only the UDS file needs explicit
-	// cleanup. Remove is a no-op for non-existent paths so unconditional is fine.
+	// Named pipes vanish with their listener; only the UDS file needs cleanup.
 	defer os.Remove(*sockPath)
 
 	slog.Info("sidecar starting",
@@ -59,20 +54,17 @@ func main() {
 		"data_dir", *dataDir,
 	)
 
-	// Cloud account config. CloudURL and the OAuth issuer default to the kstack
-	// production endpoints (env-overridable for dev/staging). The OAuth client is
-	// a public PKCE/loopback client (no secret) and the endpoints are public, so
-	// baking the defaults into the binary leaks nothing. auth derives Hydra's
-	// standard endpoint paths from the issuer base.
+	// Cloud/OAuth defaults are the kstack production endpoints (env-overridable).
+	// The OAuth client is public (PKCE/loopback, no secret), so baking the
+	// defaults into the binary leaks nothing.
 	application, err := app.New(app.Config{
 		KubeconfigPath: *kubeconfigPath,
 		DataDir:        *dataDir,
 		CloudURL:       envOr("KSTACK_CLOUD_API_URL", "https://api.kstack.sh"),
 		OAuthIssuerURL: envOr("KSTACK_OAUTH_ISSUER", "https://oauth.kstack.sh"),
 		OAuthClientID:  envOr("KSTACK_OAUTH_CLIENT_ID", "kstack-desktop"),
-		// Empty in a normal release run ⇒ the "Kstack" default. The host sets
-		// this to a dev-specific name in development so a dev sign-in and an
-		// installed release don't share one keychain entry.
+		// Empty ⇒ the "Kstack" default; the host sets a dev-specific name so
+		// dev and release runs don't share one keychain entry.
 		KeychainService: os.Getenv("KSTACK_KEYCHAIN_SERVICE"),
 	})
 	if err != nil {
@@ -86,17 +78,13 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	// Fire the app's shutdown signal the instant Shutdown begins: gRPC Watch
-	// handlers return (OK trailers flush) and SSE subscriptions flush their
-	// terminal frame, so Shutdown's wait for in-flight GraphQL requests can
-	// complete. The hijacked h2c gRPC streams it does not track are drained
-	// afterwards by DrainWithContext.
+	// Fired as Shutdown begins so long-lived streams end and Shutdown's wait for
+	// in-flight requests can complete; hijacked h2c gRPC streams (which Shutdown
+	// can't see) are drained afterwards by DrainWithContext.
 	srv.RegisterOnShutdown(application.NotifyShutdown)
 
-	// Announce. The host matches the `READY ` prefix to know the listener
-	// is up; the scheme + path are for human-readable logs (the host
-	// already knows the path — it picked it pre-spawn and passed it via
-	// --socket).
+	// The host matches the `READY ` prefix; scheme+path are informational (the
+	// host picked the path and passed it via --socket).
 	fmt.Printf("READY %s:%s\n", ipc.Scheme, *sockPath)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -130,11 +118,9 @@ func main() {
 
 	slog.Info("sidecar shutting down", "reason", reason)
 
-	// Shutdown stops accepting and fires RegisterOnShutdown (app.NotifyShutdown),
-	// signaling both transports' long-lived streams, then waits for the
-	// non-hijacked GraphQL requests. DrainWithContext additionally waits for the
-	// hijacked h2c gRPC streams; only then does Close stop the transports and
-	// tear down the services.
+	// Order matters: Shutdown (fires NotifyShutdown, waits for non-hijacked
+	// GraphQL requests) → DrainWithContext (waits for hijacked h2c gRPC streams)
+	// → stop → Close. See docs/adr/2026-08-09-single-socket-h2c.md.
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancelShutdown()
 	_ = srv.Shutdown(shutdownCtx)
@@ -149,9 +135,7 @@ func main() {
 	_ = application.Close()
 }
 
-// envOr returns the value of env var `key`, or `fallback` if unset/empty.
-// Used to give flags a "production default that env can override" shape
-// without each call site spelling out the lookup.
+// envOr returns env var `key`, or `fallback` if unset/empty.
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

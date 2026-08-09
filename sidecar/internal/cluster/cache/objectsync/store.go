@@ -30,8 +30,8 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
-// redactedValue replaces every Secret data value before the body is stored. The keys are
-// kept so a UI can still list what a Secret holds.
+// redactedValue replaces every Secret data value at write time; keys are kept so a UI can
+// list what a Secret holds. See docs/adr/2026-08-09-rawjson-comparable-scalar.md.
 const redactedValue = "[redacted]"
 
 // objectRow is one row of the cache's objects table, flattened from an object body.
@@ -54,23 +54,17 @@ type ownerRef struct {
 	IsController bool
 }
 
-// objectStore is the write path into one KIND's slice of the cache's objects table — the
-// kubesync.Store one ClusterCacheGVRSync worker lands its pulls in. Reads live on
-// store.ClusterDB (Objects, consumed by ClusterDataObjectsWatch).
+// objectStore is one KIND's write path into the cache's objects table; reads live on
+// store.ClusterDB.Objects.
 //
-// Unlike the events table, which one worker owns outright, the objects table is SHARED by
-// every synced kind. So every statement here is kind-scoped: the prune deletes only this
-// kind's rows, the count counts only this kind's, and the resume cookie is keyed by the
-// kind. Two workers writing the same table concurrently is fine — they touch disjoint rows.
+// The objects table is SHARED by every synced kind, so every statement here is
+// kind-scoped (prune, count, resume cookie). Concurrent workers touch disjoint rows.
 type objectStore struct {
-	cdb  *store.ClusterDB
-	kind Kind
-	// resume is THIS kind's list/watch position in cluster_meta — the shared protocol,
-	// since the key prefix is the only thing that differs per collection.
+	cdb    *store.ClusterDB
+	kind   Kind
 	resume *store.ResumeCookie
-	// now supplies the updated_at stamp. A seam only so this package's tests can freeze it
-	// and pin the relist sweep's boundary, which is otherwise decided by whether the
-	// millisecond happened to tick between a write and the relist that follows it.
+	// now supplies the updated_at stamp; a seam so tests can freeze it and pin the relist
+	// sweep's boundary.
 	now func() int64
 }
 
@@ -85,8 +79,7 @@ func newObjectStore(cdb *store.ClusterDB, kind Kind) *objectStore {
 		kind: kind,
 		now:  func() int64 { return time.Now().UnixMilli() },
 	}
-	// The cookie reads the clock through s, not a copy of it, so a test that freezes
-	// s.now freezes the cookie's stamp too.
+	// Read the clock through s, not a copy, so freezing s.now freezes the cookie too.
 	s.resume = store.NewResumeCookie(cdb, kind.APIVersion+"/"+kind.Kind, func() int64 { return s.now() })
 	return s
 }
@@ -107,29 +100,25 @@ func (s *objectStore) upsert(ctx context.Context, u *unstructured.Unstructured) 
 	return s.write(ctx, u, true)
 }
 
-// ApplyDiff lands one object the diff resync fetched, WITHOUT advancing the resume cookie.
-//
-// A watch delta carries its own position, so applying it and advancing the cookie together
-// is exactly right. A diff's objects do not: they are fetched by GET in whatever order the
-// metadata list happened to name them, each carrying its own current resourceVersion. Moving
-// the cookie to one of them would leave it AHEAD of changes the pass has not applied yet, so
-// a crash mid-pass would resume the next watch past them and lose them for good. The pass
-// clears the cookie before its first write and persists the list's position once it has
-// reconciled everything — the same "a cookie means a completed pass" invariant the full LIST
-// keeps.
+// ApplyDiff lands one object the diff resync fetched, WITHOUT advancing the resume cookie:
+// diff objects arrive by GET in arbitrary RV order, so advancing on one would put the
+// cookie ahead of changes the pass hasn't applied and a crash would resume past them. The
+// pass clears the cookie before its first write and persists the list's position at the
+// end — keeping "a cookie means a completed pass".
+// See docs/adr/2026-08-09-kubesync-watch-poll.md.
 func (s *objectStore) ApplyDiff(ctx context.Context, u *unstructured.Unstructured) error {
 	return s.write(ctx, u, false)
 }
 
-// ClearRV drops the resume cookie, so an interrupted pass leaves no position at all rather
-// than one its rows don't back. See ApplyDiff.
+// ClearRV drops the resume cookie, so an interrupted pass leaves no position rather than
+// one its rows don't back. See ApplyDiff.
 func (s *objectStore) ClearRV(ctx context.Context) error {
 	return s.resume.Delete(ctx, s.cdb.Writer())
 }
 
-// write lands one object and its edges, optionally advancing the resume cookie in the same
-// transaction: a reader must never see an object beside the labels it had before the
-// update, and a restart must never resume from a position the rows don't back.
+// write lands one object and its edges, optionally advancing the cookie, in one
+// transaction: no reader may see an object beside its pre-update labels, and no restart
+// may resume from a position the rows don't back.
 func (s *objectStore) write(ctx context.Context, u *unstructured.Unstructured, advanceRV bool) error {
 	row, err := s.project(u)
 	if err != nil {
@@ -156,14 +145,12 @@ func (s *objectStore) write(ctx context.Context, u *unstructured.Unstructured, a
 }
 
 func (s *objectStore) remove(ctx context.Context, u *unstructured.Unstructured) error {
-	// Same guard as project's, for the same reason: the delete path never reaches it.
+	// Same guard as project's; the delete path never reaches it.
 	if u == nil || u.Object == nil {
 		return fmt.Errorf("objectsync: %s delete carries an empty object", s.kind.Kind)
 	}
-	// An unkeyable delete is an ERROR, not a quiet no-op — the same answer the upsert path
-	// gives an empty uid. Returning nil reported success for a delta whose cookie was never
-	// advanced, so the driver booked progress and a crash in that window resumed the watch
-	// from an older position and replayed. Ending the phase re-lists instead.
+	// An unkeyable delete errors rather than no-opping: nil would book progress for a
+	// delta whose cookie never advanced, so a crash there would resume older and replay.
 	uid := string(u.GetUID())
 	if uid == "" {
 		return fmt.Errorf("objectsync: %s delete has empty UID", s.kind.Kind)
@@ -186,19 +173,17 @@ func (s *objectStore) remove(ctx context.Context, u *unstructured.Unstructured) 
 	return nil
 }
 
-// notify wakes this kind's objects watch. Keyed by the plural resource — the identity a
-// ClusterDataObjectsWatch subscribes on — so an unrelated kind's write costs it nothing.
-// Keyless subscribers (the kind-catalog watch) are woken by the same call.
+// notify wakes this kind's objects watch, keyed by the plural resource (plus every
+// keyless subscriber), so an unrelated kind's write costs it nothing.
 func (s *objectStore) notify() {
 	s.cdb.ObjectsNotifyResource(s.kind.APIVersion, s.kind.Resource)
 }
 
-// insertRow upserts one object and rewrites its edges. The single write chokepoint for
-// this kind's rows — both write paths (watch delta, relist page) route through it.
+// insertRow upserts one object and rewrites its edges — the single write chokepoint both
+// the watch-delta and relist-page paths route through.
 //
-// The edges are DELETEd before being re-inserted rather than upserted: an object that
-// lost a label or an ownerReference must lose the row too, and only a delete-then-insert
-// expresses that. Both tables are keyed by uid, so the delete is a point lookup.
+// Edges are DELETEd then re-inserted, not upserted: an object that lost a label or
+// ownerReference must lose the row too. Both tables are uid-keyed, so it's a point lookup.
 func (s *objectStore) insertRow(ctx context.Context, ex store.Execer, row objectRow, now int64) error {
 	if err := s.recordStatusTransition(ctx, ex, row, now); err != nil {
 		return err
@@ -220,16 +205,8 @@ func (s *objectStore) insertRow(ctx context.Context, ex store.Execer, row object
 			name=excluded.name,
 			resource_version=excluded.resource_version,
 			generation=excluded.generation,
-			-- Keep the recorded creation time when the incoming body has none. It is
-			-- immutable in Kubernetes, so a later write without it (a partial body, a
-			-- projection that dropped it) carries no news — and project leaves it 0, which
-			-- would otherwise overwrite a good value with the epoch and make the Age column
-			-- read 56 years.
-			-- Keep the recorded creation time when the incoming body has none. It is
-			-- immutable in Kubernetes, so a later write without it (a partial body, a
-			-- projection that dropped it) carries no news — and project leaves it 0, which
-			-- would otherwise overwrite a good value with the epoch and make the Age column
-			-- read 56 years.
+			-- creationTimestamp is immutable, so a body without it carries no news; project
+			-- leaves it 0, which would otherwise overwrite a good value with the epoch.
 			created_at=CASE WHEN excluded.created_at > 0 THEN excluded.created_at ELSE created_at END,
 			updated_at=excluded.updated_at,
 			raw_json=excluded.raw_json,
@@ -247,10 +224,9 @@ func (s *objectStore) insertRow(ctx context.Context, ex store.Execer, row object
 		return err
 	}
 
-	// Each edge table costs at most two statements — one DELETE, one multi-row INSERT —
-	// rather than one per row. A pod carries a handful of labels, and a relist page holds
-	// 500 of them inside a single transaction on a writer pool the whole cache shares, so
-	// per-row statements are the difference between hundreds and thousands per page.
+	// At most two statements per edge table (one DELETE, one multi-row INSERT), not one
+	// per row: a 500-object relist page runs in one transaction on the cache's shared
+	// writer, where per-row statements would mean thousands.
 	if _, err := ex.ExecContext(ctx, `DELETE FROM owner_refs WHERE child_uid=?`, row.UID); err != nil {
 		return err
 	}
@@ -284,8 +260,7 @@ func (s *objectStore) insertRow(ctx context.Context, ex store.Execer, row object
 	return nil
 }
 
-// valuesPlaceholders builds "(?,?,?),(?,?,?),…" for a multi-row INSERT of rows tuples of
-// cols columns each.
+// valuesPlaceholders builds "(?,?,?),(?,?,?),…" — rows tuples of cols columns.
 func valuesPlaceholders(rows, cols int) string {
 	tuple := "(" + strings.Repeat("?,", cols-1) + "?)"
 	var b strings.Builder
@@ -299,17 +274,11 @@ func valuesPlaceholders(rows, cols int) string {
 	return b.String()
 }
 
-// recordStatusTransition appends to the object's status timeline, but only when its summary
-// actually CHANGED — the point of the table is transitions, and a relist rewrites every row
-// whether or not anything moved, so an unconditional insert would bury the real changes
-// under a copy of the whole collection every resync period.
-//
-// One statement, not a read then an insert: the guard is a NOT EXISTS against the row's
-// current summary, evaluated on the caller's transaction. That keeps it consistent with the
-// upsert that follows (a separate read would run on the reader pool, outside this
-// transaction) and halves the statements on the hottest path in the system — this runs per
-// object write, including every item of every relist page. A row with no summary (a kind
-// this package can't read, which is most CRDs) records nothing rather than a run of empties.
+// recordStatusTransition appends to the status timeline only when the summary CHANGED —
+// a relist rewrites every row, so an unconditional insert would bury real transitions
+// under a copy of the collection each resync period. The guard is a NOT EXISTS on the
+// caller's transaction, not a separate read (which would run on the reader pool, outside
+// it) — this is the system's hottest path. A summaryless kind records nothing.
 func (s *objectStore) recordStatusTransition(ctx context.Context, ex store.Execer, row objectRow, now int64) error {
 	if row.status.Summary == "" {
 		return nil
@@ -322,17 +291,13 @@ func (s *objectStore) recordStatusTransition(ctx context.Context, ex store.Exece
 	return err
 }
 
-// deleteOne removes a single object and its edges. The objects delete fires the
-// kind_counts trigger, keeping the dashboard's per-kind tally exact.
-// cascadeTables are the per-object side tables and the uid column in each. Every deleter
-// below clears these before the objects row, so the list lives here once: a new uid-keyed
-// table (or a missed column) can't be added to one deleter and silently skipped by another,
-// which is exactly how owner_refs.owner_uid came to be dropped from all three.
+// cascadeTables are the per-object side tables and their uid column. Every deleter clears
+// these before the objects row, so the list lives here once and no deleter can silently
+// skip a table.
 //
-// owner_refs appears TWICE on purpose. A deleted object is both a child (its own references
-// out) and an owner (its children's references in), and only the first is obvious. With
-// --cascade=orphan the children outlive their owner, so leaving the inbound edges behind
-// leaves rows pointing at a uid that no longer exists.
+// owner_refs appears TWICE on purpose: a deleted object is both a child (references out)
+// and an owner (its children's references in), and with --cascade=orphan the children
+// outlive it, so inbound edges left behind point at a uid that no longer exists.
 var cascadeTables = []struct{ table, uidCol string }{
 	{"labels", "uid"},
 	{"owner_refs", "child_uid"},
@@ -340,6 +305,8 @@ var cascadeTables = []struct{ table, uidCol string }{
 	{"status_history", "uid"},
 }
 
+// deleteOne removes one object and its edges; the objects delete fires the kind_counts
+// trigger, keeping the per-kind tally exact.
 func deleteOne(ctx context.Context, ex store.Execer, uid string) error {
 	for _, c := range cascadeTables {
 		if _, err := ex.ExecContext(ctx, `DELETE FROM `+c.table+` WHERE `+c.uidCol+`=?`, uid); err != nil {
@@ -350,13 +317,10 @@ func deleteOne(ctx context.Context, ex store.Execer, uid string) error {
 	return err
 }
 
-// sweep deletes every object of this kind matching an extra WHERE predicate, along with
-// its edges — three statements regardless of how many rows match.
-//
-// The edges are deleted through a subquery against the same predicate, so nothing is read
-// back into Go. That matters at both call sites: a relist of a 20k-object kind would
-// otherwise materialize 20k uids and issue 60k statements, all while holding the writer
-// lock the whole cache shares.
+// sweep deletes this kind's objects matching an extra predicate plus their edges, in a
+// fixed number of statements: the edges go through a subquery on the same predicate, so
+// nothing is read back into Go (a 20k-object relist would otherwise issue 60k statements
+// while holding the cache's shared writer).
 func (s *objectStore) sweep(ctx context.Context, ex store.Execer, extraWhere string, extraArgs ...any) (int, error) {
 	where := `api_version=? AND kind=?`
 	if extraWhere != "" {
@@ -381,13 +345,9 @@ func (s *objectStore) sweep(ctx context.Context, ex store.Execer, extraWhere str
 	return int(n), nil
 }
 
-// Count returns how many rows this kind holds — the warm-cache size the resume report
-// describes itself with.
-//
-// It reads the trigger-maintained kind_counts aggregate rather than counting the objects
-// table: this runs at every worker start, and a cache warm-resuming its hundred kinds
-// would otherwise scan the shared table a hundred times. A kind with no row yet has
-// written nothing, so absent reads as 0.
+// Count returns this kind's row count — the warm-cache size a resume reports. It reads
+// the trigger-maintained kind_counts rather than scanning the shared objects table once
+// per kind at every start; an absent row means nothing written, so 0.
 func (s *objectStore) Count(ctx context.Context) (int, error) {
 	var n int
 	err := s.cdb.Reader().QueryRowContext(ctx,
@@ -399,11 +359,8 @@ func (s *objectStore) Count(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// SnapshotRVs returns this kind's cached uid -> resourceVersion — what the driver's diff
-// resync compares the cluster's metadata list against to decide which bodies to fetch.
-//
-// Kind-scoped like every other statement here: the objects table is shared, and another
-// kind's rows belong to another worker's resync.
+// SnapshotRVs returns this kind's cached uid -> resourceVersion, which the diff resync
+// compares the cluster's metadata list against. Kind-scoped like everything here.
 func (s *objectStore) SnapshotRVs(ctx context.Context) (map[string]string, error) {
 	rows, err := s.cdb.Reader().QueryContext(ctx,
 		`SELECT uid, resource_version FROM objects WHERE api_version=? AND kind=?`,
@@ -426,16 +383,12 @@ func (s *objectStore) SnapshotRVs(ctx context.Context) (map[string]string, error
 }
 
 // DeleteByUIDs removes the named objects and their edges — the diff resync's counterpart
-// to the relist's sweep, for the objects the cluster no longer has.
+// to the relist's sweep. One transaction and one notify for the whole set, in chunked
+// IN (…) statements, so a kind that lost thousands of objects doesn't take thousands of
+// commits on the cache's shared writer (and thousands of watch pings) for one reconcile.
 //
-// One transaction and one notify for the whole set, in chunked IN (…) statements, for the
-// same reason sweep exists: these land on the writer connection the WHOLE cache shares, so
-// a kind that lost thousands of objects between resyncs would otherwise take thousands of
-// commits with every other kind's worker queued behind them — and ping the debounced
-// watches thousands of times to describe one reconcile.
-//
-// It does not touch the resume cookie: a deletion carries no resourceVersion of its own,
-// and the pass persists the list's RV once it has reconciled everything.
+// It leaves the cookie alone: a deletion carries no resourceVersion, and the pass
+// persists the list's RV at the end.
 func (s *objectStore) DeleteByUIDs(ctx context.Context, uids []string) error {
 	if len(uids) == 0 {
 		return nil
@@ -446,7 +399,7 @@ func (s *objectStore) DeleteByUIDs(ctx context.Context, uids []string) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // committed below; rollback is the error path
 
-	// Chunked well under SQLite's default 999-variable statement limit.
+	// Well under SQLite's default 999-variable statement limit.
 	const chunk = 500
 	for start := 0; start < len(uids); start += chunk {
 		batch := uids[start:min(start+chunk, len(uids))]
@@ -472,29 +425,23 @@ func (s *objectStore) DeleteByUIDs(ctx context.Context, uids []string) error {
 	return nil
 }
 
-// PersistRV advances this kind's resume cookie without touching rows — called on every
-// watch delta so a wake resumes from the latest position.
+// PersistRV advances this kind's cookie without touching rows — the bookmark path.
 func (s *objectStore) PersistRV(ctx context.Context, rv string) error {
 	return s.resume.Persist(ctx, s.cdb.Writer(), rv)
 }
 
-// ResumeRV returns the resume cookie to seed a watch from, or "" to force a cold full
-// LIST. A partial relist cleared it on its first WritePage, so a cookie means a completed
-// LIST landed on disk.
+// ResumeRV returns the cookie to seed a watch from, or "" to force a cold full LIST. A
+// partial relist cleared it on its first WritePage, so a cookie means a completed LIST
+// landed on disk.
 func (s *objectStore) ResumeRV(ctx context.Context) (string, error) {
 	return s.resume.Get(ctx)
 }
 
-// EnsureCatalog registers this kind in the cache's kind_catalog. The worker calls it on
-// every start; the upsert makes that a no-op after the first.
-//
-// It is load-bearing for reads, not just for the nav: store.Objects translates the plural
-// resource a watch subscribes on back to the Kind the objects table is keyed by through
-// this table, so a kind with rows and no catalog entry reads as empty.
-//
-// Each kind's row is written by the worker that syncs it and removed by Forget when that
-// worker's object is deleted, so the catalog says exactly "what this cache holds" — which
-// is why the discovery controller writes no cache rows of its own.
+// EnsureCatalog registers this kind in kind_catalog. Load-bearing for reads, not just the
+// nav: store.Objects translates the plural resource back to its Kind through this table,
+// so a kind with rows and no catalog entry reads as empty. Written by the syncing worker
+// and removed by Forget, so the catalog says exactly what this cache holds — which is why
+// the discovery controller writes no cache rows of its own.
 func (s *objectStore) EnsureCatalog(ctx context.Context) error {
 	if err := s.forgetSupersededKind(ctx); err != nil {
 		return err
@@ -508,18 +455,11 @@ func (s *objectStore) EnsureCatalog(ctx context.Context) error {
 	})
 }
 
-// forgetSupersededKind purges any OTHER Kind holding this kind's plural — the whole of it,
-// not just its catalog row.
-//
-// Within one api group-version a plural names exactly one Kind, so a catalog row with our
-// (api_version, resource) under a different Kind describes a rename we slept through: a CRD
-// whose Kind changed while the sidecar was down, so no running worker was there to clean up
-// after it. Everything that Kind wrote is now unreachable — nothing will ever name it
-// again, so its objects and edges, its kind_counts row and its resume cookie are dead
-// weight the cache file carries forever.
-//
-// Reusing Forget is the point: it is already the "this kind is gone" purge, so the two
-// paths cannot drift over which tables a kind owns.
+// forgetSupersededKind purges any OTHER Kind holding this kind's plural — all of it, not
+// just its catalog row. A plural names one Kind per group-version, so such a row is a CRD
+// Kind rename the sidecar slept through, and everything that Kind wrote is now unreachable
+// dead weight. It reuses Forget so the two purges can't drift over which tables a kind
+// owns.
 func (s *objectStore) forgetSupersededKind(ctx context.Context) error {
 	rows, err := s.cdb.Reader().QueryContext(ctx,
 		`SELECT kind FROM kind_catalog WHERE api_version=? AND resource=? AND kind<>?`,
@@ -542,8 +482,7 @@ func (s *objectStore) forgetSupersededKind(ctx context.Context) error {
 	}
 
 	for _, kind := range stale {
-		// Only the identity fields matter to a purge: everything Forget deletes is keyed by
-		// (api_version, kind), and the resume cookie by the same pair.
+		// Only identity matters: everything Forget deletes is keyed by (api_version, kind).
 		old := newObjectStore(s.cdb, Kind{
 			APIVersion: s.kind.APIVersion,
 			Kind:       kind,
@@ -557,10 +496,9 @@ func (s *objectStore) forgetSupersededKind(ctx context.Context) error {
 	return nil
 }
 
-// Forget removes every trace of this kind from the cache — its rows and their edges, its
-// catalog entry, and its resume cookie. The controller calls it when the sync child is
-// deleted (the kind is no longer served, or the cache is going away), so the cache never
-// advertises a kind whose contents are frozen at whenever its worker stopped.
+// Forget removes every trace of this kind — rows, edges, catalog entry, resume cookie —
+// when its sync child is deleted, so the cache never advertises a kind whose contents are
+// frozen at whenever its worker stopped.
 func (s *objectStore) Forget(ctx context.Context) error {
 	tx, err := s.cdb.Writer().BeginTx(ctx, nil)
 	if err != nil {
@@ -575,9 +513,8 @@ func (s *objectStore) Forget(ctx context.Context) error {
 		s.kind.APIVersion, s.kind.Kind); err != nil {
 		return err
 	}
-	// The sweep's deletes only decrement the tally — the trigger leaves the row at 0, since
-	// a still-advertised-but-empty kind must read 0 rather than vanish. A forgotten kind is
-	// not that: nothing will name it again, so its row goes with it.
+	// The sweep only decrements the tally to 0 (an advertised-but-empty kind must read 0,
+	// not vanish). A forgotten kind is different: nothing will name it again.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM kind_counts WHERE api_version=? AND kind=?`,
 		s.kind.APIVersion, s.kind.Kind); err != nil {
 		return err
@@ -592,51 +529,41 @@ func (s *objectStore) Forget(ctx context.Context) error {
 	return nil
 }
 
-// BeginReplace opens a streaming full-LIST reconcile of this kind's rows. It prunes (in
-// Commit): a row absent from the LIST is gone from the server.
+// BeginReplace opens a streaming full-LIST reconcile of this kind's rows; Commit prunes
+// what the LIST didn't carry.
 //
-// Clearing the resume cookie is DEFERRED to the first WritePage rather than done here, so
-// a pass that fails before writing anything leaves the untouched snapshot's cookie intact
-// and the next start still resumes cheaply. Because a relist prunes, that clear is
-// load-bearing: a pass that fails after writing pages but before Commit leaves no cookie,
-// so the next start cold-LISTs and its prune reconciles the leftover rows instead of
-// resuming past them.
+// Clearing the resume cookie is DEFERRED to the first WritePage, so a pass failing before
+// any write keeps the intact snapshot's cookie, while one failing after writing leaves no
+// cookie and the next start cold-LISTs and prunes the leftovers.
+// See docs/adr/2026-08-09-kubesync-watch-poll.md.
 func (s *objectStore) BeginReplace() kubesync.ReplaceSession {
 	return &replaceSession{s: s, mark: s.now() + 1}
 }
 
-// replaceSession streams a paginated relist into the objects table and reconciles THIS
-// KIND's rows to what the LIST returned. The prune is kind-scoped because the table is
-// shared — every other kind's rows belong to another worker's relist, not this one's.
+// replaceSession streams a paginated relist into the shared objects table, reconciling
+// THIS KIND's rows only (every other kind belongs to another worker's relist).
 //
-// It reconciles by **mark and sweep** rather than by remembering what it saw: every
-// WritePage stamps `updated_at`, and Commit deletes this kind's rows still older than the
-// session's start. That keeps the pass genuinely O(one page) in memory — a keep-set of
-// every uid in the collection would defeat the whole point of paginating — and turns the
-// prune into three statements instead of a full read-back plus three per stale row.
+// It reconciles by MARK AND SWEEP, not a keep-set: every WritePage stamps updated_at and
+// Commit deletes this kind's rows still older. That keeps the pass O(one page) in memory —
+// a keep-set of every uid would defeat pagination — and prunes in a few statements rather
+// than a read-back plus three per stale row.
 //
-// Per-page commits trade the single-transaction atomicity of the whole pass for that
-// memory bound: a pass that fails mid-pagination leaves its committed pages visible until
-// the next pass's prune reconciles them.
+// Per-page commits trade whole-pass atomicity for that memory bound: a pass failing
+// mid-pagination leaves committed pages visible until the next pass prunes them.
+// See docs/adr/2026-08-09-kubesync-watch-poll.md.
 type replaceSession struct {
 	s *objectStore
-	// mark is the sweep boundary: rows this pass writes get an updated_at >= mark, and
-	// Commit deletes this kind's rows still below it.
-	//
-	// It is one millisecond PAST the session's start, not the start itself. updated_at has
-	// millisecond resolution, so a row written in the same millisecond the session began
-	// carries the start stamp exactly — with an inclusive boundary such a row would look
-	// like one this pass wrote and survive a prune it deserved. Pushing the mark past it
-	// makes "written by this pass" strictly distinguishable from "already there".
+	// mark is the sweep boundary, one millisecond PAST the session start: updated_at has
+	// millisecond resolution, so an inclusive boundary would let a row written in the
+	// start's own tick masquerade as one this pass wrote and survive a prune it deserved.
 	mark int64
-	// cookieCleared records whether the first WritePage has durably cleared the resume
-	// cookie, so the clear happens once per session.
+	// cookieCleared makes the first WritePage's cookie clear happen once per session.
 	cookieCleared bool
 }
 
 // WritePage lands one page in its own transaction, clearing the resume cookie alongside
-// the first page's rows (see BeginReplace). A body that won't project (no UID) is skipped
-// rather than failing the page — one malformed object must not wedge the pass.
+// the first page's rows (see BeginReplace). A body that won't project (no UID) is skipped,
+// not fatal.
 func (r *replaceSession) WritePage(ctx context.Context, items []*unstructured.Unstructured) error {
 	if len(items) == 0 {
 		return nil
@@ -651,8 +578,8 @@ func (r *replaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 			return err
 		}
 	}
-	// Stamp at or after the mark, never below it, so this page's rows survive the sweep
-	// even when the whole pass runs inside one millisecond.
+	// Never below the mark, so this page survives the sweep even if the whole pass runs
+	// inside one millisecond.
 	now := max(r.s.now(), r.mark)
 	for _, u := range items {
 		row, err := r.s.project(u)
@@ -667,16 +594,15 @@ func (r *replaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 		return err
 	}
 	r.cookieCleared = true
-	// Notify per committed page, not only at Commit, so durable rows always reach the
-	// objects watch — a relist that commits pages then fails would otherwise leave them
-	// durable-but-unannounced until some later write.
+	// Per committed page, not only at Commit: a relist that commits pages then fails
+	// would otherwise leave durable rows unannounced until some later write.
 	r.s.notify()
 	return nil
 }
 
-// Commit sweeps this kind's rows that no page rewrote, then persists the resume cookie.
-// Both share one transaction, so a failed persist can't leave the cookie durably advanced
-// — which would resume the next watch past the objects before it.
+// Commit sweeps this kind's rows no page rewrote, then persists the cookie in the same
+// transaction — a failed persist must not leave the cookie durably advanced, which would
+// resume the next watch past the objects before it.
 func (r *replaceSession) Commit(ctx context.Context, resourceVersion string) (int, error) {
 	tx, err := r.s.cdb.Writer().BeginTx(ctx, nil)
 	if err != nil {
@@ -698,14 +624,11 @@ func (r *replaceSession) Commit(ctx context.Context, resourceVersion string) (in
 	return pruned, nil
 }
 
-// project flattens an object body into the objects table's columns, redacting and
-// stripping the body along the way.
+// project flattens an object body into the objects columns, redacting and stripping the
+// body along the way.
 func (s *objectStore) project(u *unstructured.Unstructured) (objectRow, error) {
-	// A nil body, or one wrapping a nil map, would panic on GetUID — inside a worker
-	// goroutine, taking the process with it. Today's driver never produces one (the watch
-	// path type-asserts and the dynamic source builds from a decoded list), but the items
-	// reaching WritePage/ApplyChange come from a pluggable Source, so the guard belongs on
-	// the receiving side rather than in each producer.
+	// A nil body would panic on GetUID inside a worker goroutine, taking the process with
+	// it. Items come from a pluggable Source, so the guard belongs on the receiving side.
 	if u == nil || u.Object == nil {
 		return objectRow{}, fmt.Errorf("objectsync: %s object is empty", s.kind.Kind)
 	}
@@ -732,9 +655,8 @@ func (s *objectStore) project(u *unstructured.Unstructured) (objectRow, error) {
 	if ts := u.GetCreationTimestamp(); !ts.IsZero() {
 		row.CreatedAt = ts.UnixMilli()
 	}
-	// Read from the ORIGINAL body, not the sanitized copy: sanitize redacts a Secret's
-	// values, and a future strip could drop a field a reading depends on. Nothing here
-	// touches the values it reads.
+	// Read the ORIGINAL body, not the sanitized copy, whose redaction/strips could drop a
+	// field a reading depends on.
 	row.status = extractStatus(u)
 	for _, ref := range u.GetOwnerReferences() {
 		if ref.UID == "" {
@@ -748,20 +670,19 @@ func (s *objectStore) project(u *unstructured.Unstructured) (objectRow, error) {
 	return row, nil
 }
 
-// sanitize returns a copy of the body as it should be stored: server noise removed and,
-// for Secrets, values redacted. It deep-copies because the caller's body is the live
-// watch object and the driver may still be reading it.
+// sanitize returns the body as it should be stored: server noise removed, Secret values
+// redacted. It deep-copies because the caller's body is the live watch object.
 //
-// Stripping is a real saving, not tidiness — managedFields and the last-applied
-// annotation together are roughly half of a typical object's bytes, and nothing reads
-// them (the frontend renders columns off the rest of the body). Reads are then a pure
-// pass-through, which is what lets ClusterDataObject serve raw_json verbatim.
+// Stripping is a real saving — managedFields plus the last-applied annotation are roughly
+// half a typical object's bytes and nothing reads them. Reads are then pure pass-through,
+// which is what lets ClusterDataObject serve raw_json verbatim.
+// See docs/adr/2026-08-09-rawjson-comparable-scalar.md.
 func sanitize(u *unstructured.Unstructured) *unstructured.Unstructured {
 	out := u.DeepCopy()
 	unstructured.RemoveNestedField(out.Object, "metadata", "managedFields")
 	unstructured.RemoveNestedField(out.Object, "metadata", "annotations",
 		"kubectl.kubernetes.io/last-applied-configuration")
-	// An annotations map emptied by that removal is noise of its own; drop it.
+	// An annotations map emptied by that removal is noise of its own.
 	if ann, ok, _ := unstructured.NestedMap(out.Object, "metadata", "annotations"); ok && len(ann) == 0 {
 		unstructured.RemoveNestedField(out.Object, "metadata", "annotations")
 	}
@@ -771,16 +692,14 @@ func sanitize(u *unstructured.Unstructured) *unstructured.Unstructured {
 	return out
 }
 
-// isSecret reports whether a body is a core/v1 Secret. It reads the BODY's own kind
-// rather than the worker's configured one, so a Secret arriving through some other
-// collection is redacted too — the check must not be bypassable by how we asked for it.
+// isSecret reads the BODY's own kind, not the worker's configured one, so redaction can't
+// be bypassed by how the object was addressed.
 func isSecret(u *unstructured.Unstructured) bool {
 	return u.GetKind() == "Secret" && u.GetAPIVersion() == "v1"
 }
 
-// redactSecret strips a Secret's values while keeping its keys, so a UI can show what a
-// Secret holds without the cache file holding every credential in the cluster. stringData
-// is write-only on the api server and never round-trips, so it is dropped outright.
+// redactSecret strips a Secret's values, keeping its keys, so the cache file never holds
+// the cluster's credentials. stringData is write-only server-side, so it's dropped.
 func redactSecret(u *unstructured.Unstructured) {
 	unstructured.RemoveNestedField(u.Object, "stringData")
 	data, ok, _ := unstructured.NestedMap(u.Object, "data")

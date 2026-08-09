@@ -19,25 +19,21 @@ import { vi } from 'vitest';
 
 export type FakeChannel = { onmessage?: (raw: string) => void };
 
-// Shared fake for '@tauri-apps/api/core' — the webview never reaches the
-// real Tauri bridge under test. Usage:
+// Shared fake for '@tauri-apps/api/core'. Usage:
 //
 //   const { invokeMock, channels, liveChannel, factory } = mockTauriCore();
 //   vi.mock('@tauri-apps/api/core', () => factory());
 //
-// `vi.mock` is hoisted, but its factory runs lazily (when the unit under
-// test is dynamically `await import`-ed), by which point this helper has
-// initialised — same contract the call sites already relied on.
+// `vi.mock` is hoisted, but its factory runs lazily (at the dynamic `await
+// import` of the unit under test), by which point this helper has initialised.
 export function mockTauriCore() {
   const invokeMock = vi.fn();
   const channels: FakeChannel[] = [];
-  // Resolve the live fake Channel for the subscription whose query contains
-  // `queryPart`. subscribe-exchange news one Channel per `graphql_subscribe` in
-  // call order, so the Nth matching subscribe maps to `channels[N]`. The *last*
-  // match is the live one: a reconnect opens a fresh subscription (and channel)
-  // for the same query, so `lastIndexOf` skips the dead ones. (`lastIndexOf`
-  // keeps this ES2022-compatible; `findLastIndex` is ES2023, outside the app's
-  // configured TS lib.) Closes over `invokeMock`/`channels`, hence it lives here.
+  // The live fake Channel for the subscription whose query contains `queryPart`.
+  // subscribe-exchange news one Channel per `graphql_subscribe` in call order,
+  // so the Nth matching subscribe maps to `channels[N]`; the *last* match is the
+  // live one, since a reconnect opens a fresh subscription for the same query.
+  // `findLastIndex` is ES2023, outside the app's TS lib — hence `lastIndexOf`.
   const channelFor = (queryPart: string): FakeChannel => {
     const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
     const idx = subs.map(([, arg]) => (arg as { query: string }).query.includes(queryPart)).lastIndexOf(true);
@@ -60,13 +56,11 @@ export function mockTauriCore() {
 
 // Cluster-delta test helpers ------------------------------------------
 //
-// The `clustersWatch` delta stream carries Cluster objects; several suites seed
-// the ClustersProvider by pushing `Added` frames for a list of rows. `clusterOf`
-// is the shared row→Cluster builder and `pushClusters` seeds them onto the stream.
+// Seed the ClustersProvider by pushing `Added` frames onto the `clustersWatch`
+// delta stream.
 
-// A minimal cluster fixture. Cluster/user metadata derive from `name` so a
-// resolved context has predictable fields to assert on; the optional flags model
-// the sync toggle, the disabled state, and kubeconfig presence/current-context.
+// Cluster/user metadata derive from `name` so a resolved context has predictable
+// fields to assert on.
 export type ClusterRow = {
   id: string;
   name: string;
@@ -76,7 +70,6 @@ export type ClusterRow = {
   isDefault?: boolean;
 };
 
-// Build the Cluster object a `clustersWatch` delta carries for a row.
 export function clusterOf(r: ClusterRow) {
   return {
     id: r.id,
@@ -102,8 +95,7 @@ export function clusterOf(r: ClusterRow) {
   };
 }
 
-// Seed each row as an `Added` cluster delta on the `clustersWatch` stream. Pass
-// the `channelFor` from `mockTauriCore()`.
+// Pass the `channelFor` from `mockTauriCore()`.
 export function pushClusters(channelFor: (queryPart: string) => FakeChannel, rows: ClusterRow[]) {
   const ch = channelFor('clustersWatch');
   rows.forEach((r) => {
@@ -113,15 +105,11 @@ export function pushClusters(channelFor: (queryPart: string) => FakeChannel, row
   });
 }
 
-// Shared fake for '@tauri-apps/api/window' — components that drive the native
-// window (e.g. `WindowControls`, `AppSidebar`) reach it through `getCurrentWindow`.
+// Shared fake for '@tauri-apps/api/window', reached via `getCurrentWindow`.
 // Usage mirrors `mockTauriCore`:
 //
 //   const { windowMock, factory } = mockTauriWindow();
 //   vi.mock('@tauri-apps/api/window', () => factory());
-//
-// `windowMock` exposes the spied methods for asserting calls; callers that only
-// need the module to resolve can ignore it.
 export function mockTauriWindow() {
   const windowMock = {
     minimize: vi.fn(() => Promise.resolve()),
@@ -137,10 +125,10 @@ export function mockTauriWindow() {
   };
 }
 
-// User-agent strings and overrides for exercising platform-branched UI (`isMacOS`
-// / `isLinux`). The WebView's UA is fixed per-OS, so tests flip it to pick a
-// platform. `NON_MAC_USER_AGENT` is a Linux UA (the frameless+transparent
-// window); `WINDOWS_USER_AGENT` is frameless-but-opaque.
+// Platform-branched UI (`isMacOS`/`isLinux`) keys off the WebView's per-OS UA,
+// so tests flip it to pick a platform. `NON_MAC_USER_AGENT` is Linux
+// (frameless + transparent); `WINDOWS_USER_AGENT` is frameless but opaque.
+// See docs/adr/2026-08-09-per-platform-window-chrome.md
 export const MAC_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15';
 export const NON_MAC_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36';
 export const WINDOWS_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
@@ -155,9 +143,8 @@ export function restoreUserAgent() {
   setUserAgent(originalUserAgent);
 }
 
-// Shared fake for '@tauri-apps/api/event' — captures `listen` registrations and
-// lets a test fire an event to them (wrapped in `act`). Usage mirrors
-// `mockTauriCore`:
+// Shared fake for '@tauri-apps/api/event': captures `listen` registrations and
+// fires events to them wrapped in `act`. Usage mirrors `mockTauriCore`:
 //
 //   const { emitEvent, factory } = mockTauriEvent();
 //   vi.mock('@tauri-apps/api/event', () => factory());
@@ -185,12 +172,11 @@ export function mockTauriEvent() {
   };
 }
 
-// Installs a controllable `window.matchMedia` whose `matches` can be flipped,
-// firing a `change` event (wrapped in `act`) to registered listeners exactly like
-// the browser. Returns a `setMatches(next)` to drive media-query crossings — used
-// for both the color-scheme query (`prefers-color-scheme: dark`) and the sidebar
-// breakpoint. `matches` is a live getter so a captured `MediaQueryList` reflects
-// later flips. jsdom's default (non-controllable) stub lives in `vitest.setup.ts`.
+// Controllable `window.matchMedia`, returning a `setMatches(next)` that flips
+// `matches` and fires `change` (in `act`) like the browser — for the
+// color-scheme query and the sidebar breakpoint. `matches` is a live getter so a
+// captured `MediaQueryList` reflects later flips. jsdom's default,
+// non-controllable stub lives in `vitest.setup.ts`.
 export function mockMatchMedia(initialMatches = false) {
   let matches = initialMatches;
   const listeners = new Set<(e: MediaQueryListEvent) => void>();

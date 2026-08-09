@@ -19,13 +19,10 @@ import { errorReportExchange } from './error-exchange';
 import { invokeFetch } from './invoke-fetch';
 import { tauriSubscriptionExchange } from './subscribe-exchange';
 
-// Retries only `networkError` failures (the package default `retryIf`) — transport
-// blips while the local sidecar restarts. GraphQL errors are deterministic and must
-// NOT be retried. Bounded so a hard-down sidecar fails fast rather than hanging the
-// UI; the always-on engine + subscription reconnect own long-term recovery.
-// `randomDelay` de-correlates the several queries a route fires at once so they
-// don't re-hit the sidecar in lockstep — unlike subscribe-exchange, which omits
-// jitter (a single long-lived client, no herd).
+// Retries only `networkError` failures (package default `retryIf`) — GraphQL
+// errors are deterministic and must NOT be retried. Bounded so a hard-down
+// sidecar fails fast; subscription reconnect owns long-term recovery.
+// `randomDelay` de-correlates the several queries a route fires at once.
 const networkRetryExchange = retryExchange({
   initialDelayMs: 500,
   maxDelayMs: 5_000,
@@ -35,17 +32,15 @@ const networkRetryExchange = retryExchange({
 
 export function createGraphqlClient() {
   return new Client({
-    // The URL is unused — invokeFetch ignores it — but urql requires one.
+    // Unused (invokeFetch ignores it) but urql requires one.
     url: 'tauri://graphql',
-    // Order matters: the subscription exchange must precede fetchExchange (which
-    // discards subscription operations). errorReportExchange sits after the cache
-    // (so cache hits don't fire it) and before retry (so it reports only the final,
-    // post-retry error). Retry never fights the subscription auto-reconnect —
-    // subscribe-exchange never surfaces an error result to retry.
+    // Order matters: subscriptions before fetchExchange (which discards them);
+    // errorReport after cache (no cache-hit reports) and before retry (final
+    // post-retry error only). Retry never fights the subscription auto-reconnect
+    // — subscribe-exchange never surfaces an error result to it.
     exchanges: [cacheExchange, errorReportExchange, networkRetryExchange, tauriSubscriptionExchange, fetchExchange],
     fetch: invokeFetch,
-    // urql defaults to GET for short queries (query in the URL); the Tauri
-    // bridge only handles POST bodies, so pin every operation to POST.
+    // The Tauri bridge only handles POST bodies; urql defaults short queries to GET.
     preferGetMethod: false,
   });
 }

@@ -1,15 +1,10 @@
-// Package oauth is the OAuth2 / OIDC protocol layer for the auth subsystem's
-// sign-in flow against kstack-cloud's Hydra server: PKCE (S256 challenge), the
-// code→token exchange, refresh-token renewal, RFC 7009 revocation, and ID-token
-// verification. It is a leaf with no dependency on the parent auth package — auth
-// builds a Client from resolved endpoint URLs and drives it — so it owns the
-// value types the protocol produces (Token, Identity), which the parent
-// re-exports via type aliases.
+// Package oauth is the OAuth2/OIDC protocol layer for the sign-in flow: PKCE (S256), the
+// code→token exchange, refresh, RFC 7009 revocation, ID-token verification. A LEAF —
+// it must not import the parent auth package, so it owns the value types the protocol
+// produces (Token, Identity), which the parent re-exports as aliases.
 //
-// The Client takes resolved endpoint URLs (it is Hydra-agnostic; the parent
-// derives Hydra's path layout). The loopback redirect listener that catches the
-// callback, and the verifier/state generation that feed AuthCodeURL, live in the
-// parent auth package — they aren't OAuth-protocol concerns.
+// The Client takes resolved endpoint URLs and is Hydra-agnostic. The loopback listener
+// and the verifier/state generation live in the parent — not protocol concerns.
 package oauth
 
 import (
@@ -27,14 +22,13 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// expiryLeeway treats a token as expired slightly before its real expiry so a
-// token handed out is still valid through the request that uses it.
+// expiryLeeway expires a token early, so one handed out stays valid through the request
+// that uses it.
 const expiryLeeway = 30 * time.Second
 
-// Token is the user's stored cloud credential. The refresh token is static
-// (Hydra does not rotate it); the access and id tokens are short-lived and
-// renewed via Refresh. It keeps the id token (needed to restore display
-// identity at startup) and so is distinct from the tokenless public TokenSet.
+// Token is the stored cloud credential. The refresh token is static (Hydra doesn't rotate
+// it); access/id tokens are short-lived and renewed via Refresh. It keeps the id token —
+// needed to restore display identity at startup — unlike the public TokenSet.
 type Token struct {
 	AccessToken  string    `json:"accessToken"`
 	RefreshToken string    `json:"refreshToken"`
@@ -42,25 +36,21 @@ type Token struct {
 	Expiry       time.Time `json:"expiry"`
 }
 
-// Valid reports whether the access token is present and not within the leeway
-// window of expiry.
+// Valid reports an access token present and outside the leeway window of expiry.
 func (t Token) Valid(now time.Time) bool {
 	return t.AccessToken != "" && now.Before(t.Expiry.Add(-expiryLeeway))
 }
 
-// Identity is the subset of the verified ID-token claims the app cares about.
-// The JSON tags decode straight from the OIDC claims (`sub` → UserID), so Verify
-// and the unverified startup decode unmarshal into this type directly.
+// Identity is the ID-token claims the app cares about; the JSON tags decode straight from
+// the OIDC claims, so both Verify and the startup decode unmarshal into it.
 type Identity struct {
 	UserID string `json:"sub"`
 	Email  string `json:"email"`
 	Name   string `json:"name"`
 }
 
-// Config is the static configuration for the OAuth client. Endpoint URLs are
-// explicit (rather than discovered) so the flow is deterministic and testable —
-// tests point them at httptest servers. In production the parent auth package
-// builds it from just an issuer + client id via newHydraOAuthConfig.
+// Config is the OAuth client's static configuration. Endpoints are explicit rather than
+// discovered, so the flow is deterministic and tests can point them at httptest servers.
 type Config struct {
 	ClientID      string
 	AuthURL       string
@@ -79,12 +69,9 @@ type Client struct {
 	httpc         *http.Client
 }
 
-// NewClient builds a Client. The ID-token verifier fetches Hydra's JWKS from
-// cfg.JWKSURL lazily (on first Verify), so construction does no network I/O. That
-// fetch reuses the client's own 15s-timeout HTTP client (via oidc.ClientContext),
-// so a slow/hung JWKS endpoint can't block Verify unbounded — go-oidc ignores
-// context cancellation for the key set, so the client timeout, not a context,
-// bounds the fetch.
+// NewClient does no network I/O — the JWKS fetch is lazy, on first Verify. That fetch
+// reuses the 15s-timeout HTTP client, because go-oidc ignores context cancellation for
+// the key set, so only the client timeout bounds it.
 func NewClient(cfg Config) *Client {
 	oc := &oauth2.Config{
 		ClientID: cfg.ClientID,
@@ -100,21 +87,20 @@ func NewClient(cfg Config) *Client {
 		httpc:         &http.Client{Timeout: 15 * time.Second},
 	}
 	if cfg.JWKSURL != "" {
-		// oidc.ClientContext carries our timeout-bounded client to the (lazy) JWKS
-		// fetch; the base context is irrelevant since go-oidc ignores its cancel.
+		// The base context is irrelevant — go-oidc ignores its cancel; ClientContext
+		// is only how the timeout-bounded client reaches the lazy fetch.
 		keySet := oidc.NewRemoteKeySet(oidc.ClientContext(context.Background(), c.httpc), cfg.JWKSURL)
 		c.verifier = oidc.NewVerifier(cfg.Issuer, keySet, &oidc.Config{ClientID: cfg.ClientID})
 	}
 	return c
 }
 
-// Revoke asks Hydra to revoke a token (RFC 7009). For the desktop public client
-// this needs only client_id (no secret). Revoking the refresh token also
-// invalidates the access tokens issued from the same grant, so sign-out passes
-// the refresh token here. The server reports success even for an already-invalid
-// token, so a nil error means "the token is not usable anymore".
+// Revoke revokes a token (RFC 7009); the desktop public client needs only client_id.
+// Revoking the REFRESH token also invalidates its grant's access tokens, which is what
+// sign-out passes. A nil error means "no longer usable" — the server also reports success
+// for an already-invalid token.
 func (c *Client) Revoke(ctx context.Context, token string) error {
-	// maxErrBody caps how much of a non-2xx body we read for the error message.
+	// Cap of the non-2xx body read for the error message.
 	const maxErrBody = 4 << 10
 	if c.revocationURL == "" {
 		return fmt.Errorf("oauth: no revocation endpoint configured")
@@ -141,10 +127,8 @@ func (c *Client) Revoke(ctx context.Context, token string) error {
 	return nil
 }
 
-// AuthCodeURL builds the authorize URL with PKCE (S256). The sidecar opens this
-// in the system browser. redirect is the per-flow redirect_uri — the loopback
-// listener's ephemeral 127.0.0.1 address — and MUST match the redirect passed
-// to Exchange.
+// AuthCodeURL builds the PKCE (S256) authorize URL. redirect is the loopback listener's
+// ephemeral address and MUST match the one passed to Exchange.
 func (c *Client) AuthCodeURL(state, verifier, redirect string) string {
 	return c.oc.AuthCodeURL(state,
 		oauth2.S256ChallengeOption(verifier),
@@ -152,9 +136,8 @@ func (c *Client) AuthCodeURL(state, verifier, redirect string) string {
 	)
 }
 
-// Exchange trades an authorization code (+ PKCE verifier) for a Token. redirect
-// must be the same redirect_uri sent to AuthCodeURL (OAuth requires the token
-// request to echo it).
+// Exchange trades an authorization code + PKCE verifier for a Token; redirect must echo
+// the one sent to AuthCodeURL, as OAuth requires.
 func (c *Client) Exchange(ctx context.Context, code, verifier, redirect string) (Token, error) {
 	tok, err := c.oc.Exchange(ctx, code,
 		oauth2.VerifierOption(verifier),
@@ -174,16 +157,16 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (Token, error
 		return Token{}, err
 	}
 	t := toToken(tok)
-	// oauth2 carries the prior refresh token forward when the server omits one;
-	// guard anyway so a static refresh token is never lost.
+	// oauth2 already carries the prior refresh token forward; belt-and-braces so a
+	// static refresh token is never lost.
 	if t.RefreshToken == "" {
 		t.RefreshToken = refreshToken
 	}
 	return t, nil
 }
 
-// Verify validates an ID token against Hydra's JWKS (signature, issuer,
-// audience, expiry) and returns the identity claims.
+// Verify validates an ID token against the JWKS (signature, issuer, audience, expiry) and
+// returns its identity claims.
 func (c *Client) Verify(ctx context.Context, rawIDToken string) (Identity, error) {
 	if c.verifier == nil {
 		return Identity{}, fmt.Errorf("oauth: no verifier configured (missing JWKSURL)")
@@ -199,12 +182,10 @@ func (c *Client) Verify(ctx context.Context, rawIDToken string) (Identity, error
 	return id, nil
 }
 
-// ParseIdentityUnverified decodes the identity claims from an ID token WITHOUT
-// verifying its signature. It exists only to restore display identity from a
-// token already held in our own trusted storage (the keychain) at startup. It
-// grants no access: the cloud re-verifies the access token on every request, so
-// a tampered local token would simply fail those calls. Never use this to make
-// an authorization decision — use Verify for that.
+// ParseIdentityUnverified decodes an ID token's claims WITHOUT verifying its signature —
+// only to restore display identity at startup from our own keychain. Never use it for an
+// authorization decision (use Verify); it grants no access, since the cloud re-verifies
+// the access token per request.
 func ParseIdentityUnverified(rawIDToken string) (Identity, error) {
 	parts := strings.Split(rawIDToken, ".")
 	if len(parts) != 3 {
@@ -221,8 +202,7 @@ func ParseIdentityUnverified(rawIDToken string) (Identity, error) {
 	return id, nil
 }
 
-// toToken maps an oauth2.Token to our Token, lifting the OIDC id_token out of
-// the token's extra fields.
+// toToken maps an oauth2.Token to ours, lifting id_token out of the extra fields.
 func toToken(t *oauth2.Token) Token {
 	idToken, _ := t.Extra("id_token").(string)
 	return Token{

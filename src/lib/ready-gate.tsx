@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Startup gate: blocks the app tree until the host's `ready` command
-// resolves (sidecar IPC listener accepting connections). Without this
-// gate the first GraphQL call silently absorbs the bind-wait latency;
-// with it, the renderer shows an explicit "Starting…" state and any
-// failure surfaces with a retry instead of a stuck spinner downstream.
+// Blocks the app tree until the host's `ready` command resolves (sidecar IPC
+// accepting connections) — otherwise the first GraphQL call silently absorbs the
+// bind-wait and failures become stuck spinners instead of an explicit retry.
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useState } from 'react';

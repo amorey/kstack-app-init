@@ -52,78 +52,53 @@ import (
 // is tracked.
 var ErrNotFound = errors.New("controllers: cluster not found")
 
-// Name prefixes. The name is a per-kind reconcile/uniqueness key, NOT the identity
-// surfaced to consumers (that is the ClusterID, the beehive ObjectID).
-//
-//   - A kubeconfig-sourced Cluster's name is "kubeconfig/{context}" — the source's
-//     natural key, used by the importer so beehive's per-kind name-uniqueness rules out
-//     a duplicate for a context. Future sources add their own prefix ("cloud/",
-//     "manual/"). Nothing reads a Cluster back by this name.
-//   - A ClusterCache's name is "{ClusterID}/{serverUID}": its parent's ObjectID plus
-//     the kube-system UID it mirrors. beehive's per-kind name uniqueness then means
-//     "one cache per identity per cluster", so a migration to a new UID yields a second, coexisting
-//     cache rather than colliding on a one-per-cluster name. Children are enumerated
-//     via the owner edge (Client.ListOwned), so the UID need not be known to list a
-//     cluster's caches. No "caches/" prefix is needed: ClusterCache is its own kind, so
-//     its names already sit in a namespace disjoint from Cluster's.
+// Names are per-kind reconcile/uniqueness keys, NOT identities (identity is the
+// beehive ObjectID); each source prefixes its own namespace ("kubeconfig/", future
+// "cloud/"). Nothing reads a Cluster back by name.
+// See docs/adr/2026-08-09-beehive-control-plane.md.
 const namePrefixKubeconfig = "kubeconfig/"
 
-// kubeconfigName returns the beehive name a kubeconfig-sourced Cluster is created
-// with: the importer's natural key for one kube-context. It is not an identity —
-// see ClusterID.
+// kubeconfigName returns a kubeconfig-sourced Cluster's beehive name — the
+// importer's natural key for one kube-context, not an identity (see ClusterID).
 func kubeconfigName(contextName string) string {
 	return namePrefixKubeconfig + contextName
 }
 
-// ClusterCacheName returns the name a ClusterCache is created with:
-// "{ClusterID}/{serverUID}". The parent-ObjectID segment scopes the UID to one cluster
-// (two clusters probing the same identity keep distinct caches); the serverUID segment
-// is the migration-turnover key backing beehive's name-uniqueness dedup in
-// ensureClusterCache. A creation/dedup key only — caches are enumerated through the
-// owner edge, so callers lacking a serverUID can still list them.
+// ClusterCacheName returns a ClusterCache's name, "{ClusterID}/{serverUID}":
+// one cache per identity per cluster, so a UID migration yields a second
+// coexisting cache. A creation/dedup key only — caches are enumerated through the
+// owner edge.
 func ClusterCacheName(clusterID ClusterID, serverUID string) string {
 	return strconv.FormatInt(int64(clusterID), 10) + "/" + serverUID
 }
 
-// newCacheRef builds the on-disk cache locator from the parent Cluster and
-// ClusterCache beehive ObjectIDs. It is the single place the beehive
-// ObjectID→int64 conversion happens, so the leaf store package stays
-// beehive-free.
+// newCacheRef builds the on-disk cache locator — the single beehive
+// ObjectID→int64 conversion point, keeping the store package beehive-free.
 func newCacheRef(clusterObjID, cacheObjID beehive.ObjectID) store.CacheRef {
 	return store.CacheRef{ClusterID: int64(clusterObjID), CacheID: int64(cacheObjID)}
 }
 
 // --- Identity ---
 
-// ObjectID is the identity of a persisted object — the beehive ObjectID of any kind
-// (a Cluster, a ClusterCache, …). It is opaque on the wire (a decimal string) and
-// binds to the one GraphQL `ObjectID` scalar; its MarshalGQL/UnmarshalGQL are the
-// single id (un)marshalling path every kind reuses. Per-kind aliases (ClusterID,
-// ClusterCacheID) name the same type purely to document which kind an id refers to.
+// ObjectID is the identity of a persisted object — the beehive ObjectID of any
+// kind, opaque on the wire (a decimal string) and bound to the one GraphQL
+// ObjectID scalar. The per-kind aliases below name the same type purely to
+// document which kind an id refers to.
 type ObjectID int64
 
-// ClusterID uniquely identifies a cluster record: the beehive ObjectID of its Cluster
-// object. It is opaque and stable for the record's life (a departed kube-context is
-// orphaned, not deleted, so its id survives a return; it changes only on an explicit
-// Delete) and source-agnostic. The source's natural key (e.g. a kube-context name)
-// lives only on the beehive name, never surfaced here. An alias of [ObjectID] — a
-// documentation name — so it shares the one GraphQL scalar and (un)marshalling.
+// ClusterID identifies a cluster record: the beehive ObjectID of its Cluster
+// object — opaque, source-agnostic, stable for the record's life (changes only on
+// an explicit Delete). The source's natural key lives only on the beehive name.
 type ClusterID = ObjectID
 
-// ClusterCacheID identifies one ClusterCache record: the beehive ObjectID of its
-// ClusterCache object. Like [ClusterID], an alias of [ObjectID] naming the cache's own
-// id (distinct from its parent ClusterID). A cluster can own several ClusterCache
-// records, so the cache id is not derivable from the cluster id.
+// ClusterCacheID identifies one ClusterCache record. A cluster can own several,
+// so the cache id is not derivable from the cluster id.
 type ClusterCacheID = ObjectID
 
-// ClusterCacheGVRDiscoveryID identifies one cache's GVR-discovery child: the beehive
-// ObjectID of its ClusterCacheGVRDiscovery object. Like [ClusterID], an alias of
-// [ObjectID] naming which kind an id refers to.
+// ClusterCacheGVRDiscoveryID identifies one cache's GVR-discovery child.
 type ClusterCacheGVRDiscoveryID = ObjectID
 
-// ClusterCacheGVRSyncID identifies one synced kind: the beehive ObjectID of its
-// ClusterCacheGVRSync object. Like [ClusterID], an alias of [ObjectID] naming which kind
-// an id refers to.
+// ClusterCacheGVRSyncID identifies one synced kind's ClusterCacheGVRSync object.
 type ClusterCacheGVRSyncID = ObjectID
 
 // parseObjectID parses an ObjectID from its decimal-string wire form; a
@@ -142,11 +117,8 @@ func (id ObjectID) MarshalGQL(w io.Writer) {
 	io.WriteString(w, strconv.Quote(strconv.FormatInt(int64(id), 10)))
 }
 
-// UnmarshalGQL parses the GraphQL ObjectID scalar into a typed ObjectID, so
-// gqlgen hands resolvers the typed id with no per-resolver parsing. The scalar
-// accepts a string or an integer literal: gqlgen delivers a quoted literal /
-// JSON string as string, an inline integer literal as int64, and a JSON-variable
-// number as json.Number.
+// UnmarshalGQL parses the GraphQL ObjectID scalar into a typed ObjectID. Accepts
+// string, json.Number (JSON-variable number), and int64/int (inline literal).
 func (id *ObjectID) UnmarshalGQL(v any) error {
 	switch t := v.(type) {
 	case string:
@@ -234,10 +206,8 @@ const (
 	// reasonPaused: nothing is syncing — the record is sync-disabled, deactivated,
 	// orphaned, or archived.
 	ReasonPaused = "Paused"
-	// reasonSyncing: the sync is starting or catching up (listing, pre-first-watch).
-	// Condition-only — the event vocabulary names the start
-	// transitions SyncStart/ResyncStart instead, so a same-named event reason can't
-	// read ambiguously against this condition state.
+	// reasonSyncing: the sync is starting or catching up. Condition-only — the
+	// event vocabulary uses SyncStart/ResyncStart instead.
 	ReasonSyncing = "Syncing"
 	// reasonWatching: the watch is established and proven live — caught up and
 	// streaming deltas.
@@ -248,42 +218,34 @@ const (
 	// reasonDiscovered: the last discovery pass enumerated every group the API
 	// server serves, and the per-GVR sync children match it.
 	ReasonDiscovered = "Discovered"
-	// reasonDiscoveryPartial: some groups answered and others did not (typically an
-	// unavailable aggregated APIService). The kinds that were seen are still synced,
-	// but the list is known-incomplete — so the pass adds children without pruning,
-	// since a group that failed to answer has not been shown to be gone.
+	// reasonDiscoveryPartial: some groups answered, others didn't — the pass adds
+	// children without pruning (a group that failed to answer is not shown gone).
 	ReasonDiscoveryPartial = "DiscoveryPartial"
 	// reasonDiscoveryFailed: the discovery request itself failed, so nothing is
 	// known about the served kinds this pass. The existing children are left alone.
 	ReasonDiscoveryFailed = "DiscoveryFailed"
-	// reasonDiscoveryDraining: the kind list is current, but a kind the cluster still
-	// serves has no live child yet — an earlier prune's child is still draining and holds
-	// its name. Its own axis reason rather than the Synced-axis Syncing, so the Discovered
-	// condition speaks one vocabulary and the frontend can render this state at all.
+	// reasonDiscoveryDraining: the kind list is current but a still-served kind has
+	// no live child yet — an earlier prune's child is draining and holds its name.
 	ReasonDiscoveryDraining = "DiscoveryDraining"
 	// reasonStale: caught up, but the watch stopped proving itself alive past the
 	// threshold — the cache may be behind (a Synced=False state distinct from
 	// SyncFailed, which is a hard worker failure).
 	ReasonStale = "Stale"
 
-	// The following are sync-EVENT reasons (the ClusterCache event log's transition
-	// vocabulary), distinct from the Synced-condition reasons above (which name the
-	// current state). They come in start/complete pairs, cold and warm:
-	// SyncStart→SyncComplete for a first-ever build, ResyncStart→ResyncComplete for a
-	// resume. A healthy steady state records no event at all.
+	// Sync-EVENT reasons (the event log's transition vocabulary, distinct from the
+	// Synced-condition reasons above): start/complete pairs, cold and warm. A
+	// healthy steady state records no event.
 	//
 	// reasonSyncStart: a cold cache began its first-ever build.
 	ReasonSyncStart = "SyncStart"
-	// reasonSyncComplete: a cold build reached the caught-up milestone — the
-	// local copy is now complete.
+	// reasonSyncComplete: a cold build reached the caught-up milestone.
 	ReasonSyncComplete = "SyncComplete"
 	// reasonResyncStart: an already-populated cache began resuming (poke,
 	// reconnect, credential restart) — its message reports the warm cache size.
 	ReasonResyncStart = "ResyncStart"
-	// reasonResyncComplete: a resume re-reached the caught-up milestone. Its
-	// message disambiguates the two shapes a resume can take — a real catch-up
-	// (carrying counts) vs a bare liveness recovery (a stale watch resuming, no
-	// counts) — so no separate reason is needed for the recovery case.
+	// reasonResyncComplete: a resume re-reached the caught-up milestone; its
+	// message disambiguates a real catch-up (counts) from a bare liveness
+	// recovery (no counts).
 	ReasonResyncComplete = "ResyncComplete"
 	// reasonSyncDegraded: the worker failed and is retrying with backoff. The
 	// event-log parallel of the SyncFailed condition reason.
@@ -296,16 +258,14 @@ const (
 	ReasonSyncStale = "SyncStale"
 )
 
-// Condition is beehive's status condition, re-exported so the rest of the package and
-// external consumers name it cluster.Condition. Conditions are stored by beehive as
-// their own rows on the object (not inside our status blob), so the store owns the
-// TransitionedAt stamping, the no-op suppression, and the liveness downgrade.
+// Condition aliases beehive's status condition. Conditions are beehive object
+// rows (not inside our status blob); the store owns TransitionedAt stamping,
+// no-op suppression, and the liveness downgrade.
 type Condition = beehive.Condition
 
-// conditionSet accumulates the conditions one reconcile pass will report, upserting by
-// type so a later observation in the same pass replaces an earlier one. The whole set is
-// written once via ControllerClient.SetConditions, under a single version bump, so a
-// watcher never sees half a pass.
+// conditionSet accumulates one reconcile pass's conditions, upserting by type;
+// the whole set is written once via SetConditions under a single version bump, so
+// a watcher never sees half a pass.
 type conditionSet []Condition
 
 func (s *conditionSet) set(c Condition) {
@@ -318,15 +278,12 @@ func (s *conditionSet) set(c Condition) {
 	*s = append(*s, c)
 }
 
-// liveCondition builds a Liveness condition. Every condition this package reports
-// describes process-scoped state — a live connection, a live API-server observation, a
-// running sync worker — none of which survives a restart. Marking them Liveness is what
-// makes beehive downgrade a previous process's write to Unknown until this one
-// re-confirms it, instead of serving a stale True.
-// The message is capped here, at the one place every condition is built, rather than at
-// each write: a condition is persisted and then re-serialized to every fleet-wide watcher
-// on each frame, and the messages come from unbounded sources — a raw client-go error, or
-// the body of a verbose /readyz listing, which routinely runs to kilobytes.
+// liveCondition is the sole condition constructor. Every condition here describes
+// process-scoped state, so Liveness makes beehive downgrade a previous process's
+// write to Unknown until re-confirmed (docs/adr/2026-08-09-liveness-conditions.md).
+// The message is capped here — the one place every condition is built — because
+// messages come from unbounded sources (raw client-go errors, kilobyte /readyz
+// bodies) and are re-serialized to every watcher per frame.
 func liveCondition(t ConditionType, status ConditionStatus, reason, message string) Condition {
 	return Condition{
 		Type: string(t), Status: status, Reason: reason, Message: truncateMessage(message), Liveness: true,
@@ -387,29 +344,22 @@ type ClusterPrincipal struct {
 	Username *string `json:"username,omitempty"`
 }
 
-// ClusterSpec is a cluster record's desired state: the user/API-owned fields.
-// Field names are declarative (no "is" prefix) — spec states the desired
-// condition, it does not ask a question. There is no spec-level trigger
-// counter — RetryConnection forces an immediate re-probe out-of-band via the
-// controller's in-process retry bus, and resync pokes likewise drive the
-// controllers directly, so neither writes the spec.
+// ClusterSpec is a cluster record's desired state (user/API-owned; declarative
+// field names). No spec-level trigger counters — retries and resync pokes ride
+// out-of-band buses, never spec writes.
 type ClusterSpec struct {
 	Name        *string `json:"name,omitempty"`
 	Enabled     bool    `json:"enabled"`
 	SyncEnabled bool    `json:"syncEnabled"`
-	// Source is the reference: where this record comes from and how its
-	// credentials resolve (GraphQL `spec.source`). The matching *observation*
-	// (cluster/user entry names, presence, default flag) is not stored here — the
-	// ClusterCoreController observes it live from the kubeconfig each reconcile and
-	// writes it to ClusterStatus.Source (see ClusterStatusSource).
+	// Source is the reference (where this record comes from, how credentials
+	// resolve). The matching observation lives on ClusterStatus.Source, written
+	// live by the core controller each reconcile.
 	Source ClusterSpecSource `json:"source"`
 }
 
-// ClusterStatus is the Cluster beehive kind's stored status AND the domain
-// status surfaced to the GraphQL layer: connection/health observations written
-// by the ClusterCoreController. Sync status lives separately on the ClusterCache
-// child (see ClusterCacheStatus), mirroring the beehive owner chain, so there is
-// no merge type — this one struct is both stored and served.
+// ClusterStatus is both the stored status and the domain status served to
+// GraphQL: connection/health observations written by the core controller. Sync
+// status lives on the ClusterCache child; no merge type.
 type ClusterStatus struct {
 	Source          ClusterStatusSource `json:"source"`
 	Server          ClusterServer       `json:"server"`
@@ -417,27 +367,18 @@ type ClusterStatus struct {
 	LastConnectedAt *time.Time          `json:"lastConnectedAt,omitempty"`
 }
 
-// Connection-probe outcomes are not stored on ClusterStatus: the ClusterCoreController
-// records them into beehive's event log (category ConnectionEventCategory), exposed
-// through the cluster events surface. This keeps per-probe chatter off the status
-// watch — a repeated identical failure doesn't rewrite status — while beehive
-// aggregates same-outcome probes into runs and bounds retention.
+// Probe outcomes are not stored on ClusterStatus — they ride beehive's event log,
+// keeping per-probe chatter off the status watch (a repeated failure bumps a run's
+// Count, no status rewrite).
 const (
-	// ConnectionEventCategory is the beehive event category the connection
-	// controller records probe outcomes under (its own object timeline).
+	// ConnectionEventCategory is the connection controller's probe-outcome category.
 	ConnectionEventCategory = "connection"
-	// SyncEventCategory is the beehive event category the cache controller records
-	// sync transitions under, on each record's own timeline —
-	// the sync-side parallel of ConnectionEventCategory, exposed generically through
-	// the events surface (clusterCacheEvents / clusterCacheEventsWatch, category
-	// "sync").
+	// SyncEventCategory is the sync-transition category, the sync-side parallel of
+	// ConnectionEventCategory.
 	SyncEventCategory = "sync"
-	// maxEventRuns bounds beehive's event-retention ring. beehive keeps the newest N
-	// per (object, category) timeline and counts aggregated RUNS, not occurrences — a
-	// cluster that has been failing all day is one run with a high Count, not N rows —
-	// so this is N state transitions of history, per timeline. It is global (set at
-	// beehive.New), so it bounds the ClusterCache's "sync" timeline as well as the
-	// Cluster's "connection" one.
+	// maxEventRuns bounds retention per (object, category) timeline — counted in
+	// aggregated RUNS (state transitions), not occurrences. Global (set at
+	// beehive.New).
 	maxEventRuns = 20
 )
 
@@ -445,32 +386,22 @@ const (
 // gives no explicit limit.
 const defaultEventLimit = 50
 
-// Schedule is the generic domain projection of a beehive object's reconcile schedule
-// (a gauge): when the control plane has queued the object's next reconcile. It is
-// kind-agnostic like Event — the entrypoints are kind-scoped (ClusterScheduleWatch),
-// the value shape isn't. Served live via the schedule watch — a scheduling change
-// fires no object WatchList, so this is the only way to observe the countdown move for
-// an otherwise-idle object.
+// Schedule is the kind-agnostic projection of a beehive object's reconcile
+// schedule (a gauge), served live via the schedule watch — a scheduling change
+// fires no object WatchList.
 type Schedule struct {
-	// NextRequeueAt is the scheduled time of the object's next reconcile (for a
-	// disconnected cluster, its next backoff retry), or nil when nothing is scheduled.
+	// NextRequeueAt is the next reconcile time, or nil when nothing is scheduled.
 	NextRequeueAt *time.Time `json:"nextRequeueAt"`
-	// Probing reports whether a reconcile is actively running its network probe right
-	// now (between "eligible, about to connect" and the probe/health round-trips
-	// returning). Asserted by the ClusterCoreController itself, so the webview can show
-	// a definite "checking now" rather than inferring it from an absent next-attempt
-	// time. Merged into this gauge (not the list watch) because a probe start/end fires
-	// no object WatchList.
+	// Probing reports whether a reconcile's network probe is in flight, asserted
+	// by the core controller so the webview can show a definite "checking now".
+	// Merged into this gauge because a probe start/end fires no WatchList.
 	Probing bool `json:"probing"`
 }
 
-// Event is the generic domain projection of one coalesced run from a beehive object's
-// event timeline, served under every kind's events surface. It drops beehive.Event's
-// ObjectID (the addressed object is the surface's subject) and Detail. ID is the run's
-// identity on the shared ObjectID scalar — a client's upsert key on a watch, since a
-// reason can repeat across a change-and-back while the run id does not. A repeated
-// same-outcome occurrence bumps Count rather than adding a run; [FirstAt, LastAt] is
-// the run's window.
+// Event is one coalesced run from a beehive object's event timeline, served under
+// every kind's events surface. ID is the client's upsert key (a reason can repeat;
+// a run id cannot); a repeated same-outcome occurrence bumps Count, and
+// [FirstAt, LastAt] is the run's window.
 type Event struct {
 	ID       ObjectID          `json:"id"`
 	Category string            `json:"category"`
@@ -487,38 +418,24 @@ type Event struct {
 // ClusterCacheGroupKind identifies the ClusterCache beehive resource kind.
 var ClusterCacheGroupKind = beehive.GroupKind{Kind: "ClusterCache"}
 
-// ClusterCacheSpec is the ClusterCache kind's spec. It carries no user-facing fields;
-// the parent ClusterID is the owner edge, and ServerUID is the kube-system UID this
-// cache mirrors — the identity a migration turns over (named to match the
-// ClusterStatus.Server.UID it's compared against). The ClusterCoreController writes it
-// at creation (once a probe confirms it); the ClusterCacheController reads it to decide
-// whether this cache is the parent's active one (ServerUID == parent's last-probed
-// Server.UID) and so should sync. It also rides the name so beehive's
-// name uniqueness dedups a per-identity create, but the controller reads spec.ServerUID,
-// not the name.
+// ClusterCacheSpec: ServerUID is the kube-system UID this cache mirrors — the
+// identity a migration turns over. Written at creation by the core controller;
+// the cache controller compares it against the parent's last-probed Server.UID to
+// decide active-ness (it reads spec.ServerUID, never the name).
 type ClusterCacheSpec struct {
 	ServerUID string `json:"serverUid"`
 }
 
-// ClusterCacheStatus is empty — this kind reports through its conditions alone.
-//
-// The cache owns no measurement of its own: the sync work happens in its children, and
-// each child's freshness is that child's to report (out of band, see
-// ClusterCacheGVRSyncStats). The cache-level rollup a UI wants is served read-side by
-// Service.WatchCacheSyncHealth rather than stored here — nothing in the object graph acts
-// on it. Status is a propagation channel; see ClusterCacheGVRDiscoveryStatus for the rule.
+// ClusterCacheStatus is empty — this kind reports through its conditions alone;
+// the rollup a UI wants is served read-side by Service.WatchCacheSyncHealth.
+// See docs/adr/2026-08-09-status-propagation-gauges.md.
 type ClusterCacheStatus struct{}
 
-// eventsKind / eventsAPIVersion / eventsResource identify the cluster's Event collection,
-// which the sync machinery treats like any other kind but writes to its own table (see
-// eventsync).
-//
-// The api server serves the same events under two spellings — core `v1` and
-// `events.k8s.io/v1` — and they are one underlying store, so exactly one of them may be
-// synced or the two workers would fight over the same uid-keyed rows. `v1` is the
-// canonical choice: it exists on every supported cluster, and it is the key the cache's
-// events table and its kind_counts row are written under.
-// eventsAltGroup is that other spelling's api group, which the discovery filter drops.
+// eventsKind / eventsAPIVersion / eventsResource identify the Event collection —
+// an ordinary synced kind writing to its own table (eventsync). The server serves
+// the same events under two spellings backed by one store, so exactly one may be
+// synced: canonical `v1`; the discovery filter drops eventsAltGroup. See
+// docs/adr/2026-08-09-kubesync-watch-poll.md.
 const (
 	eventsKind       = "Event"
 	eventsAPIVersion = "v1"
@@ -526,10 +443,8 @@ const (
 	eventsAltGroup   = "events.k8s.io"
 )
 
-// eventsSyncSpec is the Event kind's sync spec. It has one home because two paths produce
-// it — the discovery pass, from the API server's answer, and the seed that creates the
-// child before any pass has run — and a field they disagreed on would have each pass
-// overwrite the other's.
+// eventsSyncSpec is the Event kind's sync spec — one home, because the discovery
+// pass and the pre-pass seed both produce it and must not disagree.
 func eventsSyncSpec(enabled bool) ClusterCacheGVRSyncSpec {
 	return ClusterCacheGVRSyncSpec{
 		Enabled:    enabled,
@@ -542,96 +457,63 @@ func eventsSyncSpec(enabled bool) ClusterCacheGVRSyncSpec {
 
 // --- ClusterCacheGVRDiscovery kind types ---
 
-// ClusterCacheGVRDiscoveryGroupKind identifies the ClusterCacheGVRDiscovery beehive resource
-// kind: one object per ClusterCache, owned by it. It is
-// the discovery layer's anchor — ClusterCacheGVRDiscoveryController reconciles it by asking
-// the cluster API which GVRs it serves and maintaining one ClusterCacheGVRSync child per GVR.
+// ClusterCacheGVRDiscoveryGroupKind identifies the discovery anchor kind: one
+// object per ClusterCache, owned by it; its controller maintains one
+// ClusterCacheGVRSync child per served GVR.
 var ClusterCacheGVRDiscoveryGroupKind = beehive.GroupKind{Kind: "ClusterCacheGVRDiscovery"}
 
-// ClusterCacheGVRDiscoveryName returns the name a ClusterCacheGVRDiscovery is created with:
-// "gvrdiscovery/{cacheObjID}". There is exactly one per ClusterCache, so keying the name on
-// the owning cache's ObjectID makes creation idempotent under beehive's name-uniqueness dedup
-// (ClusterCacheController.converge). A creation/dedup key only — the child is enumerated
-// through the owner edge.
+// ClusterCacheGVRDiscoveryName returns "gvrdiscovery/{cacheObjID}" — exactly one
+// per cache, so creation is idempotent under name-uniqueness dedup. A
+// creation/dedup key only; the child is enumerated through the owner edge.
 func ClusterCacheGVRDiscoveryName(cacheID beehive.ObjectID) string {
 	return "gvrdiscovery/" + strconv.FormatInt(int64(cacheID), 10)
 }
 
-// ClusterCacheGVRDiscoverySpec is the desired discovery for one cache.
-//
-// Enabled is the pause switch, written by ClusterCacheController from the one place that
-// knows whether this cache should sync, and relayed by this controller into each
-// ClusterCacheGVRSync child. Existence means "this cache has a discovery anchor", NOT "it is
-// discovering" — the object lives as long as the cache does, so its children, status and
-// conditions survive a pause.
+// ClusterCacheGVRDiscoverySpec is the desired discovery for one cache. Enabled is
+// the pause switch, written by ClusterCacheController (the one evaluator of the
+// sync rule) and relayed into each child. Existence means "has an anchor", NOT
+// "is discovering" — the object lives as long as the cache, so its subtree
+// survives a pause.
 type ClusterCacheGVRDiscoverySpec struct {
 	Enabled bool `json:"enabled"`
 }
 
-// ClusterCacheGVRDiscoveryStatus is empty, deliberately.
-//
-// **Status is a propagation channel**: a status write bumps resource_version, which wakes
-// every dependent and pushes a frame to every watcher. So it is for state a *dependent*
-// must react to — not for gauges about a pass. What this controller observes (when it last
-// reached the API server, how many kinds it saw) is read by a UI and by nothing else in
-// the object graph, so storing it here would wake the parent cache every pass to propagate
-// something no controller reads. Those gauges live out of band, served on request from the
-// controller's own memory — see ClusterCacheGVRDiscoveryStats.
-//
-// What remains here is the Discovered *condition* (a beehive object row, not a status
-// field), which is the one part a dependent could legitimately act on.
+// ClusterCacheGVRDiscoveryStatus is empty, deliberately: status is a propagation
+// channel — for state a dependent reacts to, not for pass gauges, which nothing
+// in the object graph reads. The gauges live in controller memory (see
+// ClusterCacheGVRDiscoveryStats); the Discovered condition (a beehive object row)
+// is what remains. See docs/adr/2026-08-09-status-propagation-gauges.md.
 type ClusterCacheGVRDiscoveryStatus struct{}
 
-// ClusterCacheGVRDiscoveryStats is one cache's live discovery gauges, held in the
-// controller's memory and read on request — never stored. The Kubernetes metrics-server
-// relationship to the API server: current-on-read, absent when nobody has measured yet,
-// and no part of the object graph's change propagation.
-//
-// Absent (nil at the service boundary) means this process has run no pass for that cache
-// yet — after a restart, before the first pass. That is the honest reading: the kind list
-// it would describe is durable and still there, but *when it was confirmed* is an
-// observation, and this process has not made it.
+// ClusterCacheGVRDiscoveryStats is one cache's live discovery gauges, held in
+// controller memory and read on request — never stored. Absent (nil at the
+// service boundary) means this process has run no pass for that cache yet.
 type ClusterCacheGVRDiscoveryStats struct {
-	// LastDiscoveryAt is when the last pass reached the API server (including one that
-	// got a partial answer).
+	// LastDiscoveryAt is when the last pass reached the API server (partial included).
 	LastDiscoveryAt time.Time
-	// ResourceCount is how many syncable GVRs that pass saw. Deliberately not "how many
-	// children exist": on a partial pass the un-pruned survivors of the groups that
-	// failed to answer are still there, and conflating the two would report a drop that
-	// didn't happen.
+	// ResourceCount is how many syncable GVRs that pass saw — deliberately not
+	// "how many children exist" (a partial pass leaves un-pruned survivors).
 	ResourceCount int
 }
 
 // --- ClusterCacheGVRSync kind types ---
 
-// ClusterCacheGVRSyncGroupKind identifies the ClusterCacheGVRSync beehive resource kind:
-// one object per served GVR, owned by its ClusterCacheGVRDiscovery. It is created by
-// ClusterCacheGVRDiscoveryController (one per GVR the API server advertises, Events
-// excluded) and reconciled here.
+// ClusterCacheGVRSyncGroupKind identifies the per-GVR sync kind: one object per
+// served GVR, owned by its ClusterCacheGVRDiscovery.
 var ClusterCacheGVRSyncGroupKind = beehive.GroupKind{Kind: "ClusterCacheGVRSync"}
 
-// ClusterCacheGVRSyncName returns the name a ClusterCacheGVRSync is created with:
-// "gvrsync/{discoveryObjID}/{apiVersion}/{resource}". The owning discovery object's id
-// scopes it (names are unique per kind across every cache), and the GVR identity makes it
-// deterministic — which is what lets a discovery pass be a set reconcile: the desired
-// names are computed from the API server's answer and compared against the children that
-// exist, with no per-child bookkeeping to keep in step.
-//
-// (apiVersion, resource) rather than the Kind because the resource plural is what the
-// sync worker's REST path needs, and it is the discriminator the API server itself
-// guarantees unique within a group-version.
+// ClusterCacheGVRSyncName returns "gvrsync/{discoveryObjID}/{apiVersion}/{resource}" —
+// deterministic, so a discovery pass is a set reconcile with no per-child
+// bookkeeping. (apiVersion, resource) rather than Kind: the plural is what the
+// worker's REST path needs and what the server guarantees unique per group-version.
 func ClusterCacheGVRSyncName(discoveryID beehive.ObjectID, apiVersion, resource string) string {
 	return "gvrsync/" + strconv.FormatInt(int64(discoveryID), 10) + "/" + apiVersion + "/" + resource
 }
 
-// ClusterCacheGVRSyncSpec is the desired sync for one GVR, written wholly by
-// ClusterCacheGVRDiscoveryController from one entry of the API server's discovery answer.
-//
-// Enabled is the pause switch, pushed down the chain exactly as the discovery anchor's
-// is: the cache controller decides whether this cache syncs, the discovery controller relays
-// that to each child, and the child never re-derives it. The identity fields are refreshed on
-// every discovery pass, so a kind that changes shape (e.g. becomes cluster-scoped across an
-// upgrade) converges without the object being recreated.
+// ClusterCacheGVRSyncSpec is the desired sync for one GVR, written wholly by the
+// discovery controller. Enabled is the pause switch relayed down the chain (the
+// child never re-derives it); identity fields refresh each discovery pass, so a
+// kind that changes shape converges without recreation.
 type ClusterCacheGVRSyncSpec struct {
 	Enabled bool `json:"enabled"`
 	// APIVersion is the group/version this kind is served at, e.g. "apps/v1" — or a bare

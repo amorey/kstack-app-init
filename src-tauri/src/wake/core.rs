@@ -12,22 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The platform-agnostic heart of the wake/network-return → `Poke` driver.
-//!
-//! Platform sources (`macos`/`windows`/`linux`) translate native OS callbacks
-//! into [`RawEvent`]s and push them down one `mpsc` channel. This module turns
-//! that raw stream into *at most one* poke per burst:
-//!
-//! 1. [`classify`] derives the **rising edge** — a resume is already an edge, a
-//!    network change fires only on offline→online (an `Option<bool>` tracks the
-//!    last-known state, so an unknown→online at startup is *not* an edge).
-//! 2. [`run_coalescer`] **debounces**: a triggering edge (re)arms a trailing
-//!    timer, and the poke fires `window` after the *last* trigger in a burst —
-//!    so a wake immediately followed by network-return collapses to one poke.
-//!
-//! Everything here is pure/injectable: the poke action is a closure and time is
-//! driven through `tokio::time`, so the whole surface is unit-testable with a
-//! fake clock and a counting sink — no Tauri, no OS, no real sockets.
+//! Platform-agnostic heart of the wake → `Poke` driver: at most one poke per
+//! burst. [`classify`] derives the rising edge (resume always; network only on
+//! offline→online — unknown→online at startup is *not* an edge);
+//! [`run_coalescer`] trailing-edge-debounces, firing `window` after the last
+//! trigger. Pure/injectable (closure poke, `tokio::time`) so it unit-tests
+//! with a fake clock.
 
 use std::future::Future;
 use std::time::Duration;
@@ -36,11 +26,8 @@ use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-/// A raw signal from a platform source, before edge detection.
-///
-/// `Resumed` is already an edge (a resume only ever happens once per sleep).
-/// `NetworkChanged` carries the *observed level* — the core derives the
-/// offline→online edge itself so sources can stay dumb (just report state).
+/// Raw signal from a platform source. `NetworkChanged` carries the observed
+/// *level*; the core derives the edge so sources stay dumb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawEvent {
     /// The machine woke from sleep/suspend.
@@ -49,20 +36,14 @@ pub enum RawEvent {
     NetworkChanged { online: bool },
 }
 
-/// Tracks the last-known network state so [`classify`] can turn level-signals
-/// into rising edges. `None` until the first network observation.
+/// Last-known network state for edge derivation; `None` until first observed.
 #[derive(Default)]
 pub struct EdgeState {
     last_online: Option<bool>,
 }
 
-/// Returns whether `ev` is a *trigger* — an edge that should (subject to
-/// debounce) cause a poke. Mutates `state` to remember the latest network level.
-///
-/// - `Resumed` always triggers.
-/// - `NetworkChanged { online: true }` triggers only on a `false → true`
-///   transition. An unknown (`None`) → `true` at startup is **not** a trigger,
-///   and any `→ false` transition is not a trigger.
+/// Whether `ev` is a trigger. `Resumed` always; `NetworkChanged` only on
+/// `false → true` (unknown → true at startup is not a trigger).
 pub fn classify(state: &mut EdgeState, ev: RawEvent) -> bool {
     match ev {
         RawEvent::Resumed => true,
@@ -74,43 +55,29 @@ pub fn classify(state: &mut EdgeState, ev: RawEvent) -> bool {
     }
 }
 
-/// Maps a NetworkManager `NMState` to a simple online bool (Linux source).
-///
-/// Online once connectivity reaches `NM_STATE_CONNECTED_LOCAL` (50) or better —
-/// the permissive "there is connectivity" reading that suits a best-effort
-/// resync nudge (the core still only pokes on the offline→online *edge*). Values
-/// per the NetworkManager D-Bus API (`DISCONNECTED` 20, `CONNECTING` 40,
-/// `CONNECTED_LOCAL` 50, `CONNECTED_SITE` 60, `CONNECTED_GLOBAL` 70).
-// Used by the Linux source + tests; dead on other platforms' lib builds.
+/// NetworkManager `NMState` → online bool (Linux source): online at
+/// `CONNECTED_LOCAL` (50) or better — the permissive reading that suits a
+/// best-effort nudge. Values per the NM D-Bus API.
+// Used by the Linux source + tests; dead elsewhere.
 #[allow(dead_code)]
 pub fn nm_state_is_online(state: u32) -> bool {
     const NM_STATE_CONNECTED_LOCAL: u32 = 50;
     state >= NM_STATE_CONNECTED_LOCAL
 }
 
-/// Maps a Windows `NL_NETWORK_CONNECTIVITY_LEVEL_HINT` to a simple online bool
-/// (Windows source).
-///
-/// Online at `LocalAccess` (2) or better — i.e. an interface can route. Offline
-/// for `Unknown` (0) and `None` (1). Same permissive reading as
-/// [`nm_state_is_online`]; the edge is derived by [`classify`].
-// Used by the Windows source + tests; dead on other platforms' lib builds.
+/// Windows `NL_NETWORK_CONNECTIVITY_LEVEL_HINT` → online bool: online at
+/// `LocalAccess` (2) or better; `Unknown` (0) / `None` (1) are offline.
+// Used by the Windows source + tests; dead elsewhere.
 #[allow(dead_code)]
 pub fn win_connectivity_is_online(level: i32) -> bool {
     const LOCAL_ACCESS: i32 = 2;
     level >= LOCAL_ACCESS
 }
 
-/// Consumes raw events from `rx`, applies edge detection + trailing-edge
-/// debounce, and calls `poke` once per burst.
-///
-/// A triggering edge (re)arms the trailing timer to `window` from now; when it
-/// elapses with no further trigger, `poke().await` runs once. Triggers inside the
-/// window collapse into the single pending poke.
-///
-/// Returns when `shutdown` is cancelled (a pending poke is dropped — the
-/// sidecar's wall-clock detector is the backstop) or when every sender drops
-/// (`rx` closed). `poke` is a closure, so the core needs no `async-trait`.
+/// Edge detection + trailing-edge debounce: a trigger (re)arms the timer to
+/// `window` from now; on expiry `poke().await` runs once per burst. Returns on
+/// `shutdown` (pending poke dropped — the wall-clock detector is the backstop)
+/// or when every sender drops.
 pub async fn run_coalescer<F, Fut>(
     mut rx: Receiver<RawEvent>,
     window: Duration,
@@ -125,8 +92,7 @@ pub async fn run_coalescer<F, Fut>(
     let mut deadline: Option<Instant> = None;
 
     loop {
-        // When idle, wait forever (never-completing future) so the select only
-        // wakes on a new event or shutdown; when armed, race the deadline.
+        // Idle: wait forever; armed: race the deadline.
         let timer = async {
             match deadline {
                 Some(at) => tokio::time::sleep_until(at).await,

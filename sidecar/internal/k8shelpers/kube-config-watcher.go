@@ -26,13 +26,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
-// HOMEPATH_TILDE is the leading "~" that denotes the user's home directory in
-// a kubeconfig path before expansion.
+// HOMEPATH_TILDE is the unexpanded leading "~" in a kubeconfig path.
 const HOMEPATH_TILDE = "~"
 
-// KubeConfigSubscription is a handle to an active subscription on a
-// KubeConfigWatcher, delivering each new *api.Config and cancellable via the
-// receiver's own close.
+// KubeConfigSubscription delivers each new *api.Config; cancel via its own Close.
 type KubeConfigSubscription = *watch.Receiver[*api.Config]
 
 // KubeConfigWatcher loads the user's kubeconfig and watches its precedence
@@ -43,20 +40,17 @@ type KubeConfigWatcher struct {
 	watcher      *fsnotify.Watcher
 	hub          *watch.Hub[*api.Config]
 	tx           *watch.Sender[*api.Config]
-	// Canonicalized precedence paths. Used to filter fsnotify events down
-	// to relevant files when we're watching parent directories (which
-	// emit events for every child).
+	// Canonicalized precedence paths, used to filter the parent-directory watches'
+	// events down to the files we care about.
 	watchedPaths map[string]struct{}
 	mu           sync.RWMutex
-	// wg tracks the event-loop goroutine Start launches, so Close can join it.
+	// wg tracks the event-loop goroutine, so Close can join it.
 	wg sync.WaitGroup
 }
 
-// NewKubeConfigWatcher constructs a watcher that always returns a usable
-// instance. Missing kubeconfig paths are skipped (logged, not fatal) so
-// the sidecar can start on a fresh machine with no cluster wired up. Only
-// a kernel-level fsnotify.NewWatcher failure (ENOMEM, ulimit, /proc not
-// mounted) is fatal, since without an inotify handle nothing can be watched.
+// NewKubeConfigWatcher always returns a usable instance: missing kubeconfig paths are
+// logged and skipped, so the sidecar starts on a machine with no cluster wired up. Only a
+// kernel-level fsnotify failure is fatal — without an inotify handle nothing is watchable.
 func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	loadingRules.ExplicitPath = kubeconfigPath
@@ -66,16 +60,10 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 		return nil, err
 	}
 
-	// Always watch the parent directory of each precedence path, never the
-	// file itself:
-	//
-	//   1. inotify detaches a file-level watch the moment the inode is
-	//      unlinked or renamed (the editor/clientcmd atomic-replace pattern);
-	//      parent-dir watches keep firing across rename-over-write cycles.
-	//   2. It uniformly handles "file exists" and "file absent at startup" —
-	//      the same parent watch surfaces a later CREATE.
-	//
-	// The eventLoop filter trims dir-level noise down to our precedence paths.
+	// Watch each precedence path's PARENT DIR, never the file: inotify detaches a
+	// file-level watch the moment the inode is replaced (the atomic-replace pattern
+	// every editor and clientcmd uses), and a parent watch also surfaces a later
+	// CREATE for a file absent at startup. eventLoop trims the dir-level noise.
 	watchedPaths := make(map[string]struct{}, len(loadingRules.GetLoadingPrecedence()))
 	watchedDirs := make(map[string]struct{})
 	for _, pathname := range loadingRules.GetLoadingPrecedence() {
@@ -87,8 +75,7 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 			continue
 		}
 		if err := watcher.Add(dir); err != nil {
-			// Parent dir doesn't exist (or is unwatchable). Skip; the
-			// watcher stays usable, just blind to this path.
+			// The watcher stays usable, just blind to this path.
 			slog.Info("kubeconfig parent dir unwatchable, skipping",
 				"path", pathname, "parent", dir, "err", err)
 			continue
@@ -96,13 +83,11 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 		watchedDirs[dir] = struct{}{}
 	}
 
-	// clientcmd returns an empty *api.Config (not an error) when no file is
-	// found — the state to seed: subscribers get a real pointer and the
-	// picker renders the empty state.
+	// clientcmd returns an empty *api.Config, not an error, when no file is found —
+	// the right seed, since subscribers get a real pointer.
 	cfg, err := loadingRules.Load()
 	if err != nil {
-		// Load only errors on a malformed file, not on absence. Degrade to
-		// an empty config so the rest of the sidecar stays up.
+		// Load errors only on a malformed file; degrade so the sidecar stays up.
 		slog.Warn("kubeconfig load failed, starting with empty config", "err", err)
 		cfg = &api.Config{}
 	}
@@ -120,8 +105,7 @@ func NewKubeConfigWatcher(kubeconfigPath string) (*KubeConfigWatcher, error) {
 	return w, nil
 }
 
-// Get returns the most recently loaded kubeconfig, or an empty *api.Config if
-// none has been loaded yet (never nil).
+// Get returns the most recently loaded kubeconfig; never nil.
 func (w *KubeConfigWatcher) Get() *api.Config {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -133,8 +117,7 @@ func (w *KubeConfigWatcher) Get() *api.Config {
 	return w.current
 }
 
-// Subscribe registers a new subscriber and returns its handle. The subscriber
-// receives the current config immediately, then each reload thereafter.
+// Subscribe returns a current-on-subscribe handle, then each reload.
 func (w *KubeConfigWatcher) Subscribe() KubeConfigSubscription {
 	return w.hub.Receiver()
 }
@@ -144,8 +127,8 @@ func (w *KubeConfigWatcher) Start() {
 	w.wg.Go(w.eventLoop)
 }
 
-// Close stops the fsnotify watcher (which ends the event loop), waits for the
-// loop to exit, and tears down the publish hub, ending all subscriptions.
+// Close stops the fsnotify watcher (ending the event loop), joins it, and closes the hub,
+// ending all subscriptions.
 func (w *KubeConfigWatcher) Close() error {
 	err := w.watcher.Close()
 	w.wg.Wait()
@@ -153,9 +136,8 @@ func (w *KubeConfigWatcher) Close() error {
 	return err
 }
 
-// eventLoop drains fsnotify events, filters them down to the watched
-// precedence paths, debounces bursts, and reloads + republishes the config on
-// each settled change. It returns when the fsnotify watcher is closed.
+// eventLoop filters fsnotify events to the watched precedence paths, debounces bursts,
+// and republishes the reloaded config. Returns when the watcher is closed.
 func (w *KubeConfigWatcher) eventLoop() {
 	var debounceTimer *time.Timer
 	var debounceDelay = 100 * time.Millisecond
@@ -172,8 +154,7 @@ func (w *KubeConfigWatcher) eventLoop() {
 				return
 			}
 
-			// A watched parent dir delivers events for every child; keep
-			// only our precedence paths.
+			// A parent dir delivers events for every child.
 			if _, ok := w.watchedPaths[filepath.Clean(fsEv.Name)]; !ok {
 				continue
 			}
@@ -195,8 +176,7 @@ func (w *KubeConfigWatcher) eventLoop() {
 	}
 }
 
-// reloadConfig re-resolves the kubeconfig from the loading rules and stores it
-// as the current config, returning the freshly loaded value.
+// reloadConfig re-resolves the kubeconfig and stores it as current.
 func (w *KubeConfigWatcher) reloadConfig() (*api.Config, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

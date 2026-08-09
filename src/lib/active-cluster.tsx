@@ -12,16 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Resolves the window's active kube-context down to its cluster record and active cache —
-// the "active kube-context → cluster → active cache" join every cluster-data hook needs
-// (`useClusterDataKinds`, `useClusterDataEvents`, `useClusterDataObjects`), and future
-// consumers like chat context. One definition of "the active cluster" instead of the same
-// find + id reads copied per hook.
-//
-// Only kubeconfig-sourced records carry a context, so the match is on
-// `spec.source.kubeconfig.context`. The returned `clusterID`/`cacheID` are primitives
-// (stable across renders), so a caller can key a subscription on them without re-subscribing
-// each render; `cluster` is memoized. `active` is true only when both ids resolve — a
+// The one home for the "active kube-context → cluster → active cache" join used by
+// every cluster-data hook. Only kubeconfig-sourced records carry a context, so the
+// match is on `spec.source.kubeconfig.context`. `clusterID`/`cacheID` are stable
+// primitives (safe subscription keys); `active` is true only when both resolve — a
 // never-synced/paused cluster has no active cache, so its data watches stay paused.
 import { useMemo } from 'react';
 

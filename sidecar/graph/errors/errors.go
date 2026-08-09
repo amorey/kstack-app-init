@@ -16,7 +16,7 @@ package errors
 
 import "github.com/vektah/gqlparser/v2/gqlerror"
 
-// custom errors
+// Custom GraphQL errors, each carrying a stable `code` extension.
 var (
 	ErrValidationError     = NewError("KSTACK_VALIDATION_ERROR", "Validation error")
 	ErrRecordNotFound      = NewError("KSTACK_RECORD_NOT_FOUND", "Record not found")
@@ -27,7 +27,7 @@ var (
 	ErrInternalServerError = NewError("INTERNAL_SERVER_ERROR", "Internal server error")
 )
 
-// Initialize custom GraphQL errors
+// NewError builds a gqlerror carrying a `code` extension.
 func NewError(code string, message string) *gqlerror.Error {
 	return &gqlerror.Error{
 		Message: message,
@@ -37,7 +37,7 @@ func NewError(code string, message string) *gqlerror.Error {
 	}
 }
 
-// New validation error
+// NewValidationError is a validation error naming the rule that failed.
 func NewValidationError(rule string, message string) *gqlerror.Error {
 	return &gqlerror.Error{
 		Message: message,

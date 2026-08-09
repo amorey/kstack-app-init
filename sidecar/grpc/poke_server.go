@@ -10,16 +10,16 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
-// pokeServer implements pokepb.PokeServiceServer over the shared resync
-// broadcaster. A nil broadcaster degrades safely (Unavailable).
+// pokeServer implements pokepb.PokeServiceServer; a nil broadcaster degrades to
+// Unavailable.
 type pokeServer struct {
 	pokepb.UnimplementedPokeServiceServer
 	pokeSvc *poke.Service
 }
 
-// Poke broadcasts a SourceHost resync to every in-process subscriber. Unary and
-// best-effort: poke.Service.Poke never blocks, so the response returns as soon
-// as the signal is queued. The host calls this on OS resume / network-on.
+// Poke fans a SourceHost resync out to every in-process subscriber — the host calls it on
+// OS resume / network-on. Best-effort: Poke never blocks, so the response returns as soon
+// as the signal is queued.
 func (s *pokeServer) Poke(_ context.Context, _ *pokepb.PokeRequest) (*pokepb.PokeResponse, error) {
 	if s.pokeSvc == nil {
 		return nil, status.Error(codes.Unavailable, "no poke service")

@@ -11,25 +11,23 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 )
 
-// authServer implements authpb.AuthServiceServer over the shared auth.Service.
-// A nil auth degrades safely (Unavailable / empty stream).
+// authServer implements authpb.AuthServiceServer; a nil auth degrades safely
+// (Unavailable / empty stream).
 type authServer struct {
 	authpb.UnimplementedAuthServiceServer
 	auth auth.Service
 	// servingCtx is cancelled at shutdown to end long-lived streams cleanly.
 	servingCtx context.Context
-	// streams tracks in-flight AuthStateWatch handlers so shutdown can wait for
-	// them to unwind before the HTTP server tears the h2c connections down.
+	// streams tracks in-flight handlers, so shutdown waits for them before the HTTP
+	// server tears the h2c connections down.
 	streams *sync.WaitGroup
 }
 
-// AuthStateWatch streams the current AuthState immediately (current-on-subscribe),
-// then a fresh snapshot on every session change. Returns when the client cancels
-// or the sidecar shuts down.
+// AuthStateWatch streams the AuthState current-on-subscribe, then on every session
+// change, returning when the client cancels or the sidecar shuts down.
 func (s *authServer) AuthStateWatch(_ *authpb.AuthStateWatchRequest, stream authpb.AuthService_AuthStateWatchServer) error {
 	if s.auth == nil {
-		// Nil-tolerant: end immediately with a clean OK status.
-		return nil
+		return nil // clean OK
 	}
 
 	s.streams.Add(1)
@@ -44,8 +42,7 @@ func (s *authServer) AuthStateWatch(_ *authpb.AuthStateWatchRequest, stream auth
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-s.servingCtx.Done():
-			// Sidecar is shutting down: end the stream cleanly.
-			return nil
+			return nil // shutting down; end cleanly
 		case st, ok := <-ch:
 			if !ok {
 				return nil
@@ -57,9 +54,8 @@ func (s *authServer) AuthStateWatch(_ *authpb.AuthStateWatchRequest, stream auth
 	}
 }
 
-// StartLogin runs the synchronous login setup (loopback bind + browser open)
-// and returns its result. The async sign-in tail runs in a bounded background
-// goroutine; its completion is delivered via AuthStateWatch.
+// StartLogin runs the synchronous login setup; the sign-in tail completes in the
+// background and is delivered via AuthStateWatch.
 func (s *authServer) StartLogin(ctx context.Context, _ *authpb.StartLoginRequest) (*authpb.StartLoginResponse, error) {
 	if s.auth == nil {
 		return nil, status.Error(codes.Unavailable, "no auth service")
@@ -70,8 +66,8 @@ func (s *authServer) StartLogin(ctx context.Context, _ *authpb.StartLoginRequest
 	return &authpb.StartLoginResponse{}, nil
 }
 
-// Logout clears local credentials and revokes the refresh token (fire-and-forget
-// revocation). Returns an error only on keychain write failure.
+// Logout clears local credentials and revokes fire-and-forget; errors only on a keychain
+// write failure.
 func (s *authServer) Logout(ctx context.Context, _ *authpb.LogoutRequest) (*authpb.LogoutResponse, error) {
 	if s.auth == nil {
 		return nil, status.Error(codes.Unavailable, "no auth service")
@@ -82,8 +78,7 @@ func (s *authServer) Logout(ctx context.Context, _ *authpb.LogoutRequest) (*auth
 	return &authpb.LogoutResponse{}, nil
 }
 
-// toAuthState projects an auth.State to the wire snapshot. Identity is only set
-// while signed in.
+// toAuthState projects an auth.State to the wire; Identity is set only while signed in.
 func toAuthState(s auth.State) *authpb.AuthState {
 	out := &authpb.AuthState{Authenticated: s.Authenticated}
 	if s.Identity != nil {

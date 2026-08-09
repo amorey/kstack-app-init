@@ -12,13 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The dashboard's generic per-kind object table: one row per cached object of the selected
-// kind, fed by `useClusterDataObjects`. Every kind shows the universal columns — Name (and
-// Namespace for a namespaced kind) from the object's identity, and Age from
-// `creationTimestamp`; a built-in kind additionally shows the kubectl-style columns from its
-// `object-columns` registry entry (Ready/Status/…), computed from the native body. The four
-// watch phases render distinctly — not-synced note, connecting spinner, empty snapshot, and
-// the live table — mirroring `EventsTable`.
+// Generic per-kind object table, fed by `useClusterDataObjects`. Universal columns
+// (Namespace?/Name/Age) plus kubectl-style extras from the `object-columns`
+// registry. The four watch phases render distinctly — not-synced note, connecting
+// spinner, empty snapshot, live table — mirroring `EventsTable`.
 import ReactTimeAgo from 'react-timeago';
 
 import { Spinner } from '@kubetail/ui/elements/spinner';
@@ -28,8 +25,6 @@ import { cn } from '@kubetail/ui/lib/utils';
 import { columnsForKind } from '@/components/widgets/object-columns';
 import { useClusterDataObjects } from '@/lib/cluster-data-objects';
 
-// The kind to show — its group/version + plural resource (streamed), its display Kind name
-// (empty states), and whether it's namespaced (whether to show the Namespace column).
 type ObjectsTableProps = {
   apiVersion: string;
   resource: string;
@@ -40,12 +35,10 @@ type ObjectsTableProps = {
 export function ObjectsTable({ apiVersion, resource, kind, namespaced }: ObjectsTableProps) {
   const gvr = { apiVersion, resource };
   const { objects, active, phase } = useClusterDataObjects(gvr);
-  // Kind-specific columns (kubectl-style), inserted between Name and Age; [] for a kind with
-  // no registered columns (universal columns only).
+  // Kind-specific columns between Name and Age; [] when none registered.
   const extraColumns = columnsForKind(gvr);
 
-  // No active cache: an unsynced / sync-paused cluster streams nothing. Say so rather than
-  // showing an eternal spinner (which would read as "connecting" forever).
+  // No active cache streams nothing — say so rather than spin forever.
   if (!active) {
     return (
       <p className="text-sm text-muted-foreground">
@@ -54,8 +47,7 @@ export function ObjectsTable({ apiVersion, resource, kind, namespaced }: Objects
     );
   }
 
-  // First frame not yet in from this connection: distinguish connecting (spinner) from a
-  // genuinely empty snapshot (below).
+  // Connecting (spinner) is distinct from a genuinely empty snapshot (below).
   if (phase === 'connecting') {
     return (
       <div className="flex items-center gap-2 text-sm text-muted-foreground">

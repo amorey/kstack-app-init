@@ -34,147 +34,115 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
-// This file holds the machinery for running kubesync workers on behalf of beehive
-// objects: the worker registry, the drain-before-forget rule, the out-of-band report
-// guard, and the translation from a kubesync.Status into a condition and an event-log
-// entry. ClusterCacheGVRSyncController is its only caller.
-//
-// It is a separate file because it is a separate concern from the reconcile — the
-// controller decides WHETHER a kind's worker should run, this decides what running one
-// entails — and because the shape generalises: a future worker-owning kind reuses it by
-// supplying its own build func and its own noun.
+// Machinery for running kubesync workers on behalf of beehive objects: the registry, the
+// drain-before-forget rule, the out-of-band report guard, and Status → condition/event
+// translation. ClusterCacheGVRSyncController is its only caller; the shape generalises to
+// any future worker-owning kind.
 
 const (
-	// workerStopTimeout bounds one worker teardown, so a wedged drain can't block a
-	// reconcile worker (or shutdown) indefinitely.
+	// Bounds one teardown so a wedged drain can't block a reconcile worker or shutdown.
 	workerStopTimeout = 10 * time.Second
 
-	// workerRecheckInterval paces the steady-state re-reconcile of a running worker, which
-	// is what detects a credential rotation (a changed connection fingerprint).
+	// Steady-state re-reconcile cadence; detects a credential rotation.
 	workerRecheckInterval = 30 * time.Second
 
-	// gvrSyncConcurrency bounds how many per-kind sync reconciles beehive runs at once.
-	// Unlike clusterProbeConcurrency this isn't about one slow cluster blocking others —
-	// it's about count: a cache has one ClusterCacheGVRSync per served kind, so a startup
-	// pass has hundreds of objects to walk, each opening the cache and starting a worker.
+	// Bounds concurrent per-kind sync reconciles. Sized for count, not latency: a cache has
+	// one object per served kind, so a startup pass walks hundreds.
 	gvrSyncConcurrency = 8
 )
 
-// workerHandle is a controller's view of one running sync worker — satisfied by
-// *kubesync.Worker. The seam lets tests drive the lifecycle and the report path without
-// touching the network.
+// workerHandle is a controller's view of one running sync worker (*kubesync.Worker in
+// production; a seam so tests drive the lifecycle without the network).
 type workerHandle interface {
 	Start()
 	Stop(ctx context.Context) error
 }
 
-// syncEntry is a controller's runtime state for one running worker. The pointer is the
-// sink's guard: a report from a stopped or replaced worker is dropped by comparing
-// pointer identity against the set.
+// syncEntry is the runtime state for one running worker. Its pointer identity is the
+// sink's guard: a report from a stopped or replaced worker is dropped by comparing it
+// against the set.
 type syncEntry struct {
 	worker workerHandle
-	// fingerprint of the connection config the worker was started with; a change is a
-	// credential rotation and restarts it.
+	// Connection-config fingerprint the worker started with; a change is a credential
+	// rotation and restarts it.
 	fingerprint string
 	objID       beehive.ObjectID
-	// gen is the object's generation when the worker started, used as the
-	// observedGeneration on its condition writes.
+	// Object generation at worker start, used as observedGeneration on condition writes.
 	gen int64
-	// The inputs this worker was built from, kept so a resync poke can rebuild it without
-	// a reconcile. Copied fields rather than a closure: a closure would pin whatever else
-	// happened to be in scope at ensureWorker for the worker's whole life.
-	//
-	// cdb is the handle the worker HOLDS, recorded rather than reused: a restart re-opens
-	// (the handle may have been closed since — see startEntry), so this is what the worker
-	// is writing through, not what the next one will.
+	// Build inputs, kept so a resync poke can rebuild without a reconcile. Copied fields,
+	// not a closure, which would pin everything else in scope for the worker's life.
+	// cdb is the handle this worker HOLDS — a restart re-opens, so it is not what the next
+	// worker will write through.
 	cfg  *rest.Config
 	cdb  *store.ClusterDB
 	kind objectsync.Kind
-	// ref locates the cache this worker writes into. Kept so a restart can rebuild against
-	// the same cache — and so a cache-scoped restart can tell which workers are its own.
+	// Locates the cache written into, so a restart rebuilds against the same one and a
+	// cache-scoped restart can tell which workers are its own.
 	ref store.CacheRef
 
-	// draining is set the moment a stop begins, so reports from a worker on its way out
-	// are dropped even while its entry is still in the set (it stays until the drain
-	// succeeds — see stop). Read from the sink's goroutine, hence atomic.
+	// Set the moment a stop begins, so reports from a worker on its way out are dropped
+	// while its entry is still registered (it stays until the drain succeeds — see stop).
+	// Read from the sink's goroutine, hence atomic.
 	draining atomic.Bool
 
-	// lastState/lastCause are the last reported (state, cause) pair. The event log records
-	// only a change in it, so the worker's 30s freshness heartbeat refreshes the stamps
-	// without appending a redundant "Watching ×27" run. Mutated only under the owner's
-	// writeMu.
+	// Last reported (state, cause). The event log records only a change in it, so the ~30s
+	// heartbeat refreshes stamps without appending "Watching ×27". Mutated under writeMu.
 	lastState kubesync.State
 	lastCause kubesync.Cause
 }
 
-// noun is what this object's messages call what it syncs ("events", "deployments") — the
-// plural resource, so it needs no separate field to fall out of step with the kind.
+// noun names what this object syncs ("events", "deployments") — the plural resource, so it
+// can't fall out of step with the kind.
 func (e *syncEntry) noun() string { return e.kind.Resource }
 
 // workerSet is a controller's registry of running workers, keyed by object id.
 type workerSet struct {
-	// mu guards workers/lifecycle. Held only around map access, never across a worker
-	// start/stop.
+	// Guards workers/lifecycle. Held only around map access, never across a start/stop.
 	mu      sync.Mutex
 	workers map[beehive.ObjectID]*syncEntry
-	// lifecycle holds one lock per object, taken across a whole stop-then-start SEQUENCE
-	// rather than around each half.
+	// One lock per object, held across a whole stop-then-start SEQUENCE, not each half.
+	// putIfAbsent alone is not enough: the gap between a stop and its start is a moment
+	// when the object legitimately has no worker, and a pause or deletion landing there
+	// reports itself done — clearing the drain finalizer, releasing the cache controller's
+	// barrier — while the restart puts a worker back for an object that is paused or gone,
+	// writing into a .db being deleted. See docs/adr/2026-08-09-beehive-control-plane.md.
 	//
-	// putIfAbsent alone is not enough. It stops a restart from displacing a newer worker,
-	// but the window between a stop and the start that follows it is a moment when the
-	// object legitimately has no worker — and a reconcile landing there reads that as "no
-	// worker to stop" and proceeds: a pause reports Paused, and a deletion clears the drain
-	// finalizer, which releases the cache controller's barrier and lets the .db file be
-	// removed. The restart then puts a worker back for an object that is paused or gone,
-	// writing into a file being deleted, with nothing left to reconcile it away.
-	//
-	// Per object, not one shared lock: distinct kinds' lifecycles are independent, and a
-	// startup pass walks hundreds of them. Reclaimed on the deletion path only — see
-	// forgetLifecycle. Unlike the core controller's per-cluster map (bounded by the
-	// kube-contexts ever seen, so tens), this one is keyed by ClusterCacheGVRSync ids,
-	// which are AUTOINCREMENT and never reused: every server-UID migration, cluster
-	// delete/recreate or CRD churn mints a fresh set of ~150.
+	// Per object, not shared: a startup pass walks hundreds independently. Reclaimed only
+	// on the deletion path (forgetLifecycle) — ids are AUTOINCREMENT and never reused, so
+	// every migration or CRD churn mints a fresh ~150.
 	lifecycle map[beehive.ObjectID]*sync.Mutex
-	// restarting counts the RestartCacheWorkers sequences in flight per CacheID. The
-	// per-object lifecycle locks cannot cover this on their own: they are taken from a
-	// SNAPSHOT of the running workers, so a reconcile that has opened the cache but not yet
-	// registered its worker owns a lock nobody knows to wait for. Registration checks this
-	// under the same mutex the snapshot is taken under, which is what makes "every worker of
-	// this cache is either drained or refused" true.
+	// Counts in-flight RestartCacheWorkers sequences per CacheID. The lifecycle locks can't
+	// cover this alone: they come from a SNAPSHOT, so a reconcile that opened the cache but
+	// hasn't registered its worker holds a lock nobody knows to wait for. Registration
+	// checks this under the same mutex the snapshot is taken under, which is what makes
+	// "every worker of this cache is either drained or refused" true.
 	//
-	// A COUNT, not a flag: begin/end pairs nest, so an inner hold can't be dropped by an
-	// outer one finishing first. Whole sequences are serialized per cache by restartGates,
-	// so in practice this is 0 or 1.
+	// A count, not a flag: begin/end pairs nest.
 	restarting map[int64]int
-	// restartGates serializes whole RestartCacheWorkers sequences per cache — see
-	// cacheRestartGate.
+	// Serializes whole restart sequences per cache — see cacheRestartGate.
 	restartGates map[int64]*cacheRestartGate
 }
 
 // cacheRestartGate is a context-aware mutex for one cache's restart sequences, held from
 // the snapshot through the restarts.
 //
-// Serializing them is what keeps the sequence's two halves consistent. Two overlapping
-// sequences take their per-object lifecycle locks from separate snapshots, in map-iteration
-// order, and hold them all to the end — so they can deadlock outright (each waiting on a
-// lock the other holds), and sync.Mutex has no timeout, so a deadlock is permanent. Even
-// when the orders happen to agree, the second sequence's snapshot is stale by the time it
-// runs: every entry in it was already drained and replaced, holds() rejects them all, and
-// it deletes the cache file with the first sequence's fresh workers writing to it.
+// Serializing them keeps the sequence's two halves consistent. Overlapping sequences take
+// lifecycle locks from separate snapshots and hold them to the end, so they can deadlock
+// permanently (sync.Mutex has no timeout); and even when they don't, the second's snapshot
+// is stale — holds() rejects every entry, and it deletes the cache file while the first's
+// fresh workers write to it.
 //
-// A channel rather than a sync.Mutex because the wait must honour the caller's context:
-// ClearCache runs under a timeout, and blocking past it is the failure this replaces.
+// A channel rather than a sync.Mutex because the wait must honour the caller's context
+// (ClearCache runs under a timeout).
 type cacheRestartGate struct {
-	// ch is a buffered-1 semaphore; holding its one token means holding the gate.
+	// Buffered-1 semaphore; holding its token means holding the gate.
 	ch chan struct{}
-	// waiters counts the holder plus everyone blocked on it, so the map entry is dropped
-	// only once nobody is using it.
+	// Holder plus everyone blocked on it, so the map entry drops only when unused.
 	waiters int
 }
 
-// errCacheRestarting refuses a worker registration while its cache is mid-restart. The
-// handle it was built on is the one about to be closed, so the caller must drop the worker
-// and let the next reconcile rebuild it against whatever handle the restart leaves behind.
+// errCacheRestarting refuses a registration whose handle the in-flight restart is about to
+// close; the caller drops the worker and lets the next reconcile rebuild it.
 var errCacheRestarting = errors.New("cache is restarting its workers")
 
 func newWorkerSet() *workerSet {
@@ -186,9 +154,8 @@ func newWorkerSet() *workerSet {
 	}
 }
 
-// acquireCacheRestart takes cacheID's restart gate, blocking until the sequence holding it
-// finishes or ctx ends. It returns the release, which is idempotent and must be called on
-// every path out.
+// acquireCacheRestart takes cacheID's restart gate, blocking until the holding sequence
+// finishes or ctx ends. The returned release is idempotent and must be called on every path.
 func (s *workerSet) acquireCacheRestart(ctx context.Context, cacheID int64) (func(), error) {
 	s.mu.Lock()
 	g, ok := s.restartGates[cacheID]
@@ -214,10 +181,8 @@ func (s *workerSet) acquireCacheRestart(ctx context.Context, cacheID int64) (fun
 	}
 }
 
-// dropCacheRestartWaiter drops one reference to cacheID's gate, reclaiming it once the last
-// holder or waiter is gone. Reclaiming matters for the same reason lifecycle does: cache ids
-// are AUTOINCREMENT and never reused, so a long-lived process would otherwise accumulate one
-// gate per cache it ever cleared.
+// dropCacheRestartWaiter drops one reference, reclaiming the gate once unused — cache ids
+// are never reused, so otherwise a long-lived process accumulates one gate per clear.
 func (s *workerSet) dropCacheRestartWaiter(cacheID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -230,13 +195,10 @@ func (s *workerSet) dropCacheRestartWaiter(cacheID int64) {
 	}
 }
 
-// beginCacheRestart marks cacheID as restarting AND snapshots that cache's running workers,
-// in one critical section. The atomicity is the point: a worker registered before this call
-// is in the returned snapshot (so the caller drains it), and one registering after is
-// refused by putIfAbsent — with no third case in between. Pair with endCacheRestart.
-//
-// The snapshot is ordered by object id rather than left in map order, so every sequence
-// takes the lifecycle locks in the same order.
+// beginCacheRestart marks cacheID restarting AND snapshots its workers in one critical
+// section. The atomicity is the point: a worker registered before is in the snapshot (so the
+// caller drains it), one registering after is refused — no third case. Pair with
+// endCacheRestart. Ordered by object id so every sequence takes lifecycle locks alike.
 func (s *workerSet) beginCacheRestart(cacheID int64) []*syncEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -251,9 +213,7 @@ func (s *workerSet) beginCacheRestart(cacheID int64) []*syncEntry {
 	return mine
 }
 
-// endCacheRestart ends ONE sequence's hold. Call it exactly once per beginCacheRestart —
-// the caller's release func is what guarantees that, since the barrier is lifted before the
-// restarts and again on the way out.
+// endCacheRestart ends ONE sequence's hold; call exactly once per beginCacheRestart.
 func (s *workerSet) endCacheRestart(cacheID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -264,8 +224,8 @@ func (s *workerSet) endCacheRestart(cacheID int64) {
 	}
 }
 
-// lifecycleLock returns objID's lifecycle lock, creating it on first use. A caller holds it
-// across every stop/start it means to be atomic — see the field comment.
+// lifecycleLock returns objID's lock, creating it on first use. Hold it across every
+// stop/start meant to be atomic — see the field comment.
 func (s *workerSet) lifecycleLock(objID beehive.ObjectID) *sync.Mutex {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -277,12 +237,10 @@ func (s *workerSet) lifecycleLock(objID beehive.ObjectID) *sync.Mutex {
 	return mu
 }
 
-// forgetLifecycle drops objID's lifecycle lock. Callable ONLY from the finalize path, by
-// the holder of that very lock, once the object has been collected — which is what makes
-// it safe. A goroutine already blocked on the lock holds its own reference and still runs
-// to completion after we release it; the danger is only that a LATER caller would mint a
-// fresh mutex and so fail to exclude that one, and after collection there is no later
-// caller (nothing enumerates a gone object, and the set holds no worker for it).
+// forgetLifecycle drops objID's lock. Callable ONLY from the finalize path, by that lock's
+// holder, once the object is collected: a later caller would otherwise mint a fresh mutex
+// and fail to exclude a goroutine still blocked on the old one — and after collection there
+// is no later caller.
 func (s *workerSet) forgetLifecycle(objID beehive.ObjectID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -295,17 +253,10 @@ func (s *workerSet) get(objID beehive.ObjectID) *syncEntry {
 	return s.workers[objID]
 }
 
-// putIfAbsent registers entry, reporting whether it did. It refuses two ways, and the
-// difference matters to the caller.
-//
-// A false with no error means the object already HAS a worker — how an out-of-band restart
-// hands back to a reconcile that raced it: the poke drains the old worker, and if a
-// reconcile started a replacement in the gap, the poke drops the one it built rather than
-// displacing a newer one. Nothing is wrong, so nothing retries.
-//
-// errCacheRestarting means the cache is mid-restart and this worker was built on the handle
-// that restart is about to close. That IS an error: the caller must not start the worker,
-// and the object needs another reconcile to get one.
+// putIfAbsent registers entry, reporting whether it did. The two refusals differ:
+// (false, nil) means the object already has a worker — a raced restart drops the one it
+// built rather than displacing a newer one, so nothing retries. errCacheRestarting means
+// the worker was built on a handle about to close: don't start it; another reconcile must.
 func (s *workerSet) putIfAbsent(entry *syncEntry) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -326,9 +277,8 @@ func (s *workerSet) entries() []*syncEntry {
 	return slices.Collect(maps.Values(s.workers))
 }
 
-// isCurrent reports whether entry is still its object's live worker — neither replaced by
-// a newer one nor already draining. The out-of-band restart (a resync poke) uses it to skip
-// work somebody else has taken over.
+// isCurrent reports whether entry is still its object's live worker — neither replaced nor
+// draining. Out-of-band restarts use it to skip work somebody else took over.
 func (s *workerSet) isCurrent(entry *syncEntry) bool {
 	if entry.draining.Load() {
 		return false
@@ -336,38 +286,30 @@ func (s *workerSet) isCurrent(entry *syncEntry) bool {
 	return s.holds(entry)
 }
 
-// holds reports whether entry is still the set's registered worker for its object, WITHOUT
-// isCurrent's draining test. The two differ for exactly one entry: a worker whose stop
-// timed out, which stays registered and flagged draining.
-//
-// A caller that must know "is this worker gone" needs this one, not isCurrent. A draining
-// entry is not gone — its goroutine may still be writing — so reading isCurrent's false as
-// "somebody else handled it" is how a live writer gets skipped. See RestartCacheWorkers.
+// holds reports whether entry is still registered, WITHOUT isCurrent's draining test. They
+// differ for one case: a worker whose stop timed out stays registered and draining. Asking
+// "is this worker gone" needs this one — a draining entry may still be writing, so reading
+// isCurrent's false as "somebody else handled it" skips a live writer.
 func (s *workerSet) holds(entry *syncEntry) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.workers[entry.objID] == entry
 }
 
-// stopBounded is stop under workerStopTimeout — the form every reconcile path wants, so a
-// wedged drain can't hold a reconcile worker indefinitely.
+// stopBounded is stop under workerStopTimeout — the form every reconcile path wants.
 func (s *workerSet) stopBounded(ctx context.Context, objID beehive.ObjectID) error {
 	stopCtx, cancel := context.WithTimeout(ctx, workerStopTimeout)
 	defer cancel()
 	return s.stop(stopCtx, objID) //nolint:contextcheck // stopCtx is ctx plus a bound
 }
 
-// stop drains the worker for objID, if any, and forgets it — but ONLY once the drain has
-// actually succeeded.
+// stop drains objID's worker and forgets it — but ONLY once the drain actually succeeded.
 //
-// Marking the entry draining (rather than deleting it up front) does two jobs. It drops
-// in-flight reports immediately, so a draining worker can't write status behind us; and it
-// keeps a FAILED drain visible, which is what makes the deletion barrier real. If a
-// timed-out drain forgot its worker, the next deletion reconcile would find nothing to
-// stop, report success, and clear the drain finalizer — releasing the cache controller's
-// wait while the wedged goroutine still holds the ClusterDB handle and writes to a .db
-// that is about to be deleted. Keeping the entry means the next attempt re-waits on the
-// same worker instead.
+// Marking draining rather than deleting up front does two jobs: it drops in-flight reports
+// immediately, and it keeps a FAILED drain visible, which is what makes the deletion
+// barrier real. A timed-out drain that forgot its worker would let the next reconcile clear
+// the drain finalizer while the wedged goroutine still writes to a .db about to be deleted.
+// See docs/adr/2026-08-09-beehive-control-plane.md.
 func (s *workerSet) stop(ctx context.Context, objID beehive.ObjectID) error {
 	entry := s.get(objID)
 	if entry == nil {
@@ -386,9 +328,8 @@ func (s *workerSet) stop(ctx context.Context, objID beehive.ObjectID) error {
 	return nil
 }
 
-// stopAll stops every running worker and waits for them to unwind. The service calls it
-// during shutdown AFTER beehive has drained (so no reconcile can start another) and
-// BEFORE the cache manager shuts down, since a worker writes into the cache it holds.
+// stopAll stops every worker and waits. Called at shutdown AFTER beehive drains (so no
+// reconcile starts another) and BEFORE the cache manager, since workers write into it.
 func (s *workerSet) stopAll(ctx context.Context) error {
 	s.mu.Lock()
 	ids := make([]beehive.ObjectID, 0, len(s.workers))
@@ -406,18 +347,16 @@ func (s *workerSet) stopAll(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// syncSink folds one worker's reports into its object, out of band from the reconcile
-// path. It holds the entry pointer so reports from a stopped or replaced worker are
-// dropped, and takes the owning controller's writeMu so a report serializes against the
-// reconcile path's own writes to the same object.
+// syncSink folds one worker's reports into its object, out of band from the reconcile path.
+// The entry pointer drops reports from a stopped or replaced worker; writeMu serializes
+// against the reconcile path's writes to the same object.
 type syncSink struct {
 	set     *workerSet
 	entry   *syncEntry
 	writeMu *sync.Mutex
-	// apply folds one report into the object. Called under writeMu, and only for a report
-	// from the object's live worker.
+	// Called under writeMu, only for the object's live worker.
 	apply func(ctx context.Context, entry *syncEntry, st kubesync.Status) error
-	// name labels a failed fold in the log (the controller this sink belongs to).
+	// Labels a failed fold in the log.
 	name string
 }
 
@@ -427,8 +366,8 @@ func (s *syncSink) Report(st kubesync.Status) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	// Re-check under writeMu: the worker could have been replaced between the check above
-	// and acquiring the lock, and a stale report must not clobber the new one's status.
+	// Re-check under writeMu: the worker may have been replaced since, and a stale report
+	// must not clobber the new one's status.
 	if !s.set.isCurrent(s.entry) {
 		return
 	}
@@ -438,10 +377,8 @@ func (s *syncSink) Report(st kubesync.Status) {
 }
 
 // writeSyncGate records a reconcile-level (not worker-level) Synced condition — paused, or
-// waiting on a connection. A gate report is conditions and nothing else: the freshness
-// stamps are not ours to touch when we aren't running. It takes the owning controller's
-// writeMu because it serializes against the worker sinks, which write the same object out
-// of band.
+// waiting on a connection. Conditions only: freshness stamps aren't ours to touch when we
+// aren't running. Takes writeMu to serialize against the worker sinks.
 func writeSyncGate[Status any](
 	ctx context.Context,
 	client beehive.ControllerClient[Status],
@@ -456,8 +393,7 @@ func writeSyncGate[Status any](
 		liveCondition(ConditionSynced, ConditionFalse, reason, message))
 }
 
-// syncedCondition maps one worker report onto the Synced condition. noun is what is being
-// synced, which only a Stale report's message needs.
+// syncedCondition maps one report onto the Synced condition; noun is needed only by Stale.
 func syncedCondition(st kubesync.Status, noun string) Condition {
 	switch st.State {
 	case kubesync.StateWatching:
@@ -471,13 +407,11 @@ func syncedCondition(st kubesync.Status, noun string) Condition {
 	}
 }
 
-// recordSyncTransition appends one report to the object's beehive event log — the
-// sync-side parallel of the connection controller's attempt log. It records only on a
-// TRANSITION (a change in the reported (state, cause) pair): a worker re-reports its state
-// on a ~30s freshness heartbeat, and recording every one would grow a steady Watching run
-// into a meaningless "Watching ×27" while its only new information — the stamps — is
-// served out of band anyway. Best-effort: a failure is logged and does not advance the
-// recorded state, so the next report retries. Must hold the caller's writeMu.
+// recordSyncTransition appends one report to the object's beehive event log, ONLY on a
+// change in the (state, cause) pair — the ~30s heartbeat would otherwise grow a steady run
+// into "Watching ×27", and its only new information (the stamps) is served out of band.
+// Best-effort: a failure doesn't advance the recorded state, so the next report retries.
+// Must hold the caller's writeMu.
 func recordSyncTransition[Status any](
 	ctx context.Context,
 	client beehive.ControllerClient[Status],
@@ -503,13 +437,10 @@ func recordSyncTransition[Status any](
 	entry.lastState, entry.lastCause = st.State, st.Cause
 }
 
-// syncEvent maps one report onto a beehive event's (type, reason, message) — the event
-// log's transition vocabulary, distinct from syncedCondition (which names the current
-// state). Each phase splits on ColdStart into a start/complete pair: a Syncing report is
-// SyncStart (cold) or ResyncStart (warm), and catching up is SyncComplete (cold) or
-// ResyncComplete (warm). prev is the state we're transitioning FROM, which is what
-// distinguishes a first catch-up from a recovery out of Stale. noun is what is being
-// synced ("events", "deployments") — the one thing these messages need to know.
+// syncEvent maps one report onto an event's (type, reason, message) — the transition
+// vocabulary, distinct from syncedCondition's current-state naming. Each phase splits on
+// ColdStart into a start/complete pair; prev is the state transitioned FROM, which
+// distinguishes a first catch-up from a recovery out of Stale.
 func syncEvent(st kubesync.Status, prev kubesync.State, noun string) (beehive.EventType, string, string) {
 	switch st.State {
 	case kubesync.StateWatching:
@@ -537,10 +468,8 @@ func syncEvent(st kubesync.Status, prev kubesync.State, noun string) (beehive.Ev
 	}
 }
 
-// resyncCompleteMessage describes a finished warm resume. It deliberately does NOT report
-// the cache's total: a clean resume re-opens the watch and re-fetches nothing (items
-// stream in as deltas), so an "N in 0s" line would misread as "processed N instantly". The
-// honest fact is whether the resume was clean or had to re-list, and how long it took.
+// resyncCompleteMessage describes a finished warm resume. Deliberately omits the cache
+// total: a clean resume re-fetches nothing, so "N in 0s" would misread as instant work.
 func resyncCompleteMessage(st kubesync.Status, noun string) string {
 	if st.Resynced {
 		return fmt.Sprintf("Re-sync complete — saved position expired, re-synced %d %s in %s",
@@ -549,8 +478,7 @@ func resyncCompleteMessage(st kubesync.Status, noun string) string {
 	return fmt.Sprintf("Re-sync complete — resumed the watch in %s", roundSyncDuration(st.CaughtUpIn))
 }
 
-// staleMessage explains a stale report by naming its cause, so the message is actionable
-// (e.g. grant `watch` on the resource) rather than a bare "not receiving updates".
+// staleMessage names the cause so the message is actionable (e.g. grant `watch`).
 func staleMessage(cause kubesync.Cause, noun string) string {
 	switch cause {
 	case kubesync.CauseListFailed:
@@ -566,15 +494,13 @@ func staleMessage(cause kubesync.Cause, noun string) string {
 	}
 }
 
-// roundSyncDuration rounds a catch-up duration to a tenth of a second so the event
-// message stays stable and readable (e.g. "in 4.2s").
+// roundSyncDuration rounds to a tenth of a second so messages read as "in 4.2s".
 func roundSyncDuration(d time.Duration) time.Duration {
 	return d.Round(100 * time.Millisecond)
 }
 
-// keepStamp returns next when the report advanced the stamp, else the value already held.
-// A worker's opening report carries neither stamp, and a quiet collection's reports carry
-// no LastUpdateAt for hours — neither should blank what a previous run earned.
+// keepStamp carries a stamp forward when a report doesn't advance it: an opening report
+// carries neither, and a quiet collection carries no LastUpdateAt for hours.
 func keepStamp(next, prev *time.Time) *time.Time {
 	if next != nil {
 		return next

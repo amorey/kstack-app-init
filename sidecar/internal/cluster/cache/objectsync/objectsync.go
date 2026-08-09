@@ -12,16 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package objectsync writes ONE Kubernetes kind's objects into a cluster's cache. Like
-// eventsync it is a kubesync.Store and nothing more (plus Kind, the identity a caller
-// addresses a collection by); the source and the worker are composed by
-// ClusterCacheGVRSyncController, which is what lets Events ride the same machinery with a
-// different store.
+// Package objectsync writes ONE Kubernetes kind's objects into a cluster's cache: a
+// kubesync.Store plus Kind, with source and worker composed by
+// ClusterCacheGVRSyncController.
 //
-// One store per kind, not one per cluster, because that is the granularity the object
-// graph already has: the discovery pass creates a sync child per served GVR, so a CRD
-// appearing or a single kind's watch being forbidden is isolated to its own worker, its
-// own conditions, and its own slice of the objects table.
+// One store per kind, matching the object graph's granularity — the discovery pass
+// creates a sync child per served GVR, so a new CRD or a forbidden watch is isolated to
+// its own worker, conditions, and slice of the objects table.
 package objectsync
 
 import (
@@ -32,9 +29,8 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
-// NewStore is where one kind's objects land: its slice of the cache's shared objects
-// table. The caller composes it with a source into a kubesync.Worker — see the root
-// package's worker factory, which picks this or eventsync's store by kind.
+// NewStore returns the Store for one kind's slice of the shared objects table; the root
+// package's worker factory picks this or eventsync's by kind.
 func NewStore(cdb *store.ClusterDB, kind Kind) (kubesync.Store, error) {
 	if cdb == nil {
 		return nil, errors.New("objectsync: nil cache handle")
@@ -42,12 +38,9 @@ func NewStore(cdb *store.ClusterDB, kind Kind) (kubesync.Store, error) {
 	return newObjectStore(cdb, kind), nil
 }
 
-// Forget removes every trace of one kind from a cache — its objects and their edges, its
-// catalog entry, and its resume cookie. The controller calls it when a sync child is
-// deleted, which happens when the cluster stops serving the kind (an uninstalled CRD).
-//
-// It is a package function rather than a method on the worker because it runs when there
-// is no worker: the child is being collected, so its worker has already drained.
+// Forget removes every trace of one kind — objects, edges, catalog entry, resume cookie —
+// when its sync child is deleted (the cluster stopped serving the kind). A package
+// function, not a method, because by then the worker has drained and is gone.
 func Forget(ctx context.Context, cdb *store.ClusterDB, kind Kind) error {
 	return newObjectStore(cdb, kind).Forget(ctx)
 }

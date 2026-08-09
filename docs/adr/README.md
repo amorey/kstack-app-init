@@ -56,3 +56,22 @@ usually just documentation in the wrong place.
 | Date | ADR | Scope | Status |
 | --- | --- | --- | --- |
 | 2026-08-09 | [Record architecture decisions](2026-08-09-record-architecture-decisions.md) | repo | Accepted |
+| 2026-08-09 | [Multiplex GraphQL and gRPC over one socket with h2c](2026-08-09-single-socket-h2c.md) | cross-cutting | Accepted |
+| 2026-08-09 | [Route all webview GraphQL through Tauri IPC](2026-08-09-graphql-over-tauri-ipc.md) | cross-cutting | Accepted |
+| 2026-08-09 | [Stream each kind as its own delta watch, joined client-side](2026-08-09-delta-watch-protocol.md) | cross-cutting | Accepted |
+| 2026-08-09 | [Transport status keyed to the host's open frame](2026-08-09-transport-status-generation.md) | frontend | Accepted |
+| 2026-08-09 | [host.json as settings source of truth](2026-08-09-host-json-settings.md) | cross-cutting | Accepted |
+| 2026-08-09 | [First-paint theming: inline script + native background](2026-08-09-first-paint-theming.md) | cross-cutting | Accepted |
+| 2026-08-09 | [Per-platform window chrome](2026-08-09-per-platform-window-chrome.md) | host | Accepted |
+| 2026-08-09 | [URL search params as window state](2026-08-09-url-params-as-window-state.md) | frontend | Accepted |
+| 2026-08-09 | [Dashboard nav: curated tree merged with discovered kinds](2026-08-09-dashboard-nav-merge.md) | frontend | Accepted |
+| 2026-08-09 | [Comparable RawJSON scalar; client-side columns](2026-08-09-rawjson-comparable-scalar.md) | cross-cutting | Accepted |
+| 2026-08-09 | [Beehive owner chain with ObjectID identity](2026-08-09-beehive-control-plane.md) | sidecar | Accepted |
+| 2026-08-09 | [Status is propagation; gauges ride streams](2026-08-09-status-propagation-gauges.md) | sidecar | Accepted |
+| 2026-08-09 | [Every condition is a liveness condition](2026-08-09-liveness-conditions.md) | sidecar | Accepted |
+| 2026-08-09 | [Sync: watch-for-latency, poll-for-correctness](2026-08-09-kubesync-watch-poll.md) | sidecar | Accepted |
+| 2026-08-09 | [One SQLite file per cache incarnation](2026-08-09-per-cluster-sqlite-cache.md) | sidecar | Accepted |
+| 2026-08-09 | [Local-first auth; settings sync depends on auth](2026-08-09-local-first-auth-settings.md) | sidecar | Accepted |
+| 2026-08-09 | [Resync via fan-out poke, not cascade](2026-08-09-poke-resync-fanout.md) | cross-cutting | Accepted |
+| 2026-08-09 | [Per-cluster parallel probing, sentinel, backoff-neutral retries](2026-08-09-connection-probing.md) | sidecar | Accepted |
+| 2026-08-09 | [Sandbox build-output isolation](2026-08-09-sandbox-build-separation.md) | repo | Accepted |

@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `/` owns no view of its own — chat and dashboard are peer, named routes
-// (`/chat`, `/dashboard`). This route just redirects `/` to the landing view, so
-// changing the default (or the New Window / secondary-window entry point, which
-// open at `/`) is a one-line change to `DEFAULT_ROUTE`.
+// `/` owns no view — it redirects to `DEFAULT_ROUTE`, the one place the default
+// lives (New Window / secondary windows open at `/`).
 import { createRoute, redirect } from '@tanstack/react-router';
 
 import { Route as appRoute } from '@/routes/_app';

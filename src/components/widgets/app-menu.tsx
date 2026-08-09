@@ -12,12 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The application menu for Linux/Windows. macOS keeps its native, global menu
-// bar (built in the Rust host); off macOS the native bar is suppressed and this
-// hamburger button — sitting at the left of the custom title bar — stands in for
-// the whole menu bar. It surfaces the app-wide actions (New Window and Quit) and
-// owns the matching keyboard shortcuts there, since with no native menu nothing
-// else registers them. Actions cross into the host via Tauri commands.
+// Linux/Windows hamburger standing in for the menu bar (macOS keeps its native
+// global one — see `src-tauri/app_menu.rs`). Owns the app-wide actions and their
+// shortcuts, since with no native menu nothing else registers them.
 import { useEffect } from 'react';
 
 import {
@@ -46,16 +43,13 @@ function quit() {
 }
 
 export function AppMenu() {
-  // macOS already has the native menu bar (and its accelerators); a hamburger
-  // would be redundant there. Render only on Linux/Windows.
   if (isMacOS()) return null;
   return <AppMenuImpl />;
 }
 
 function AppMenuImpl() {
-  // The native menu is gone here, so nothing else binds these accelerators —
-  // this menu owns them. Window-scoped (only while a webview window is
-  // focused), matching the macOS menu's CmdOrCtrl semantics.
+  // No native menu here, so this menu owns the accelerators. Window-scoped,
+  // matching the macOS menu's CmdOrCtrl semantics.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (!e.ctrlKey && !e.metaKey) return;

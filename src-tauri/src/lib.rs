@@ -12,28 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Tauri host crate.
-//!
-//! This crate is the desktop app's native host: it owns windows, the tray and
-//! menus, and the Go sidecar's lifecycle, and it bridges GraphQL operations
-//! from the webview to the sidecar over an AF_UNIX socket.
+//! The Tauri host crate: windows, tray/menus, the Go sidecar's lifecycle, and
+//! the webview→sidecar GraphQL bridge over an AF_UNIX socket.
 //!
 //! [`run`] is the single entry point — `main.rs` (and the mobile entry point)
-//! call it to build, configure, and run the Tauri application. The module
-//! layout:
-//!
-//! - [`app_menu`] — the application menu bar.
-//! - [`commands`] — `#[tauri::command]` handlers invoked from the webview.
-//! - `dock_menu` — custom macOS Dock menu (macOS only).
-//! - [`error`] — the host-wide [`AppError`](error::AppError) type.
-//! - [`services`] — long-lived services: the [`SidecarService`].
-//! - [`state`] — the Tauri-managed [`AppState`].
-//! - [`tray`] — the system tray icon, menu, and live context subscription.
-//! - [`window_manager`] — window creation and focus.
+//! call it. Module map: [`app_menu`], [`commands`], `dock_menu` (macOS),
+//! [`error`], [`services`] ([`SidecarService`]), [`state`] ([`AppState`]),
+//! [`tray`], [`window_manager`].
 
 #![warn(clippy::unwrap_used)]
-// `unwrap()` is idiomatic in tests; the lint above exists to keep
-// production code unwrap-free, so silence it under `cfg(test)`.
+// `unwrap()` is idiomatic in tests.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 mod app_menu;
@@ -42,8 +30,7 @@ mod commands;
 mod dock_menu;
 mod error;
 mod host_file;
-// Only the opaque platforms paint a native window background; Linux is
-// transparent (see `window_manager`), so it never queries the OS scheme.
+// Opaque platforms only; Linux windows are transparent (see `window_manager`).
 #[cfg(not(target_os = "linux"))]
 mod os_theme;
 mod services;
@@ -62,16 +49,12 @@ use crate::services::sidecar::SidecarService;
 use crate::state::AppState;
 use crate::window_manager::WindowManager;
 
-/// How long the quit path waits for the sidecar to exit cleanly before the
-/// `RunEvent::Exit` handler force-kills it. The sidecar's own shutdown is
-/// bounded at ~5s (3s HTTP drain + 2s sync-engine join — see sidecar
-/// `main.go`); this allows for that plus a margin.
+/// Quit-path wait before `RunEvent::Exit` force-kills the sidecar. Sidecar's
+/// own shutdown is bounded at ~5s (see sidecar `main.go`); this adds margin.
 const SIDECAR_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
 
-/// Process-global setup: logging.
-///
-/// Run once at the very start of [`run`], before the Tauri builder. Kept here
-/// (rather than in `main`) so it also covers the mobile entry point.
+/// Process-global setup: logging. Lives here (not `main`) so it also covers
+/// the mobile entry point.
 fn init_process() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -82,38 +65,25 @@ fn init_process() {
         .init();
 }
 
-/// Routes Unix termination signals into the same graceful-exit path as an
-/// explicit "Quit".
+/// Routes Unix termination signals (`SIGTERM`/`SIGINT`/`SIGHUP`) through
+/// [`AppHandle::exit`] — the same graceful path as menu/tray "Quit". Tao
+/// installs no signal handlers, so without this a signal skips the `RunEvent`
+/// shutdown hooks.
 ///
-/// Tao installs no signal handlers, so without this a `SIGTERM` / `SIGINT` /
-/// `SIGHUP` would kill the process outright — bypassing the `RunEvent`
-/// shutdown hooks entirely. Funneling through [`AppHandle::exit`] produces the
-/// same sequence as the menu/tray "Quit": `ExitRequested { code: Some(0) }`
-/// followed by `Exit`. `SIGKILL` remains uncatchable by design.
-///
-/// Spawned onto Tauri's async runtime; the task lives until a signal arrives
-/// or the process exits.
-///
-/// Unix-only, and deliberately so:
-/// - **Windows** has no POSIX signals. Its real session-end (logout / restart
-///   / shutdown) arrives as a `WM_ENDSESSION` window message, which tao already
-///   handles by firing `RunEvent::Exit` — so it lands in the event loop's
-///   shutdown arm with no handler needed here.
-/// - **macOS** system shutdown is caught earlier, in `applicationShouldTerminate:`
-///   (see the `dock_menu` module).
+/// Unix-only by design: Windows session-end arrives as `WM_ENDSESSION`, which
+/// tao already routes to `RunEvent::Exit`; macOS system shutdown is caught in
+/// `applicationShouldTerminate:` (see `dock_menu`).
 #[cfg(all(desktop, unix))]
 fn spawn_signal_handler(app: &tauri::AppHandle) {
     use tokio::signal::unix::{signal, SignalKind};
 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        // If Quit happens through another path (menu/tray), the shutdown
-        // signal fires and this task exits instead of lingering for a signal
-        // that will never come.
+        // A Quit via another path cancels `shutdown`, ending this task.
         let shutdown = app.state::<AppState>().shutdown.clone();
 
-        // A failed registration is logged and abandons signal handling
-        // entirely rather than leaving a partial set wired up.
+        // A failed registration abandons signal handling entirely rather than
+        // leaving a partial set wired up.
         let mut streams = match (
             signal(SignalKind::terminate()),
             signal(SignalKind::interrupt()),
@@ -139,38 +109,27 @@ fn spawn_signal_handler(app: &tauri::AppHandle) {
     });
 }
 
-/// Builds, configures, and runs the Tauri application.
+/// Builds, configures, and runs the Tauri application (the host's entry
+/// point).
 ///
-/// This is the host's entry point. It initializes tracing, registers plugins
-/// (single-instance first — see the note below), wires the webview command
-/// handlers, runs the `setup` hook to spawn the sidecar and build the menu and
-/// tray, then enters the event loop.
-///
-/// The event loop intercepts shutdown: closing the last window does **not**
-/// exit the process (the app stays alive in the background); only an explicit
-/// Quit triggers a real exit, at which point the sidecar is shut down. OS
-/// termination signals are funneled into that same path — see
-/// [`spawn_signal_handler`].
-///
-/// `tauri_plugin_single_instance` must be registered before all other plugins
-/// so a second launch is forwarded into the original process rather than
-/// starting a new one.
+/// The event loop intercepts shutdown: closing the last window keeps the app
+/// alive in the background; only an explicit Quit (or a Unix signal — see
+/// [`spawn_signal_handler`]) exits and tears down the sidecar.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_process();
 
     let mut builder = tauri::Builder::default();
 
-    // Single-instance must be registered before all other plugins.
+    // Single-instance must be registered before all other plugins so a second
+    // launch forwards into this process.
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            // Bring the main window forward or create it if it was closed.
-            // Spawn off the main thread: this callback runs on it, and a
-            // main-thread WebView2 build deadlocks on Windows (see
-            // `commands::new_window`) — recreating the closed window here
-            // would otherwise freeze the app. The blocking pool, not an async
-            // worker: the build parks its thread until the window exists.
+            // Show/recreate the main window. Must be `spawn_blocking`, not the
+            // main thread (WebView2 main-thread build deadlocks — see
+            // `commands::new_window`) and not `spawn` (the build parks its
+            // thread until the window exists).
             let app = app.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 if let Err(err) = app
@@ -200,13 +159,10 @@ pub fn run() {
             let sidecar = SidecarService::spawn(app.handle())?;
             let window_manager = WindowManager::new();
 
-            // Create the main window. All windows are built in code —
-            // `tauri.conf.json` declares none — so `build_window` is the single
-            // place that defines window chrome (per-platform title bar,
-            // transparency) and the pre-paint state read from `host.json`. It
-            // is visible from creation, its native background already painted
-            // with the resolved color scheme, so its first frame is themed and
-            // nothing has to reveal it.
+            // Create the main window. All windows are built in code
+            // (`tauri.conf.json` declares none); `build_window` owns chrome and
+            // pre-paint theming — visible from creation, no reveal step. See
+            // docs/adr/2026-08-09-first-paint-theming.md.
             window_manager.show_main_window(app.handle())?;
 
             app.manage(AppState {
@@ -221,21 +177,17 @@ pub fn run() {
             tray::build_tray(app.handle())?;
 
             // Keep the tray's account section live off the sidecar's
-            // AuthStateWatch stream (populates on the first frame).
+            // AuthStateWatch stream.
             tray::spawn_authstate_subscription(app.handle());
 
-            // Fire the sidecar's Poke on OS wake / network-return so long-lived
-            // connections resync promptly (accelerates the sidecar's wall-clock
-            // detector and covers network-return without sleep).
+            // Poke the sidecar on OS wake / network-return; see
+            // docs/adr/2026-08-09-poke-resync-fanout.md.
             wake::spawn_wake_poke_supervisor(app.handle());
 
             // Custom macOS Dock menu (no Tauri API — see dock_menu module).
             #[cfg(target_os = "macos")]
             dock_menu::install(app.handle());
 
-            // Route Unix termination signals into the graceful-exit path.
-            // (Windows session-end arrives as WM_ENDSESSION, which tao already
-            // routes to RunEvent::Exit — see spawn_signal_handler.)
             #[cfg(all(desktop, unix))]
             spawn_signal_handler(app.handle());
 
@@ -272,10 +224,8 @@ pub fn run() {
                         tracing::info!(code, "exit requested; initiating graceful shutdown");
 
                         let state = app_handle.state::<AppState>();
-                        // Stop the app-lifetime background tasks first (tray
-                        // supervisor, signal handler) so they don't reconnect
-                        // or sit in a backoff sleep while we tear the sidecar
-                        // down. Cancelling is idempotent.
+                        // Cancel app-lifetime background tasks first so they
+                        // don't retry against a dying sidecar. Idempotent.
                         state.shutdown.cancel();
                         if !state.sidecar.graceful_shutdown(SIDECAR_SHUTDOWN_GRACE) {
                             tracing::warn!("sidecar did not exit within grace period");

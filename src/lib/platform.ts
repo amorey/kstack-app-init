@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Lightweight, synchronous platform detection for the webview. We avoid the
-// async `@tauri-apps/plugin-os` round-trip because callers (e.g. the app
-// menu) need to decide layout at first render. The webview's user agent is
-// fixed per-OS by the system WebView, so sniffing it is reliable here.
+// Synchronous platform detection — callers decide layout at first render, so no
+// async `@tauri-apps/plugin-os` round-trip. The system WebView's UA is fixed
+// per-OS, so sniffing is reliable here.
 
 /** True when running inside the macOS system WebView. */
 export function isMacOS(): boolean {
@@ -23,10 +22,9 @@ export function isMacOS(): boolean {
 }
 
 /**
- * True when running inside the Linux system WebView (WebKitGTK) — the only
- * window that is frameless *and* transparent, so it paints its own border and
- * shadow (see `WindowFrame`). A positive sniff (rather than "not macOS and not
- * Windows") keeps any unrecognized platform on the safe opaque, full-bleed path.
+ * True inside the Linux system WebView — the only frameless *and* transparent
+ * window (see `WindowFrame`). A positive sniff keeps unrecognized platforms on
+ * the safe opaque, full-bleed path.
  */
 export function isLinux(): boolean {
   return /Linux/i.test(window.navigator.userAgent);

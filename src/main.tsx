@@ -22,17 +22,14 @@ import { isLinux } from '@/lib/platform';
 import '@/index.css';
 import 'unfonts.css';
 
-// The Linux window is frameless *and* transparent (see `WindowFrame`); tag the
-// document so the base stylesheet can make it transparent and let the frame's
-// outer shadow show through. macOS keeps its native decorations, and Windows is
-// frameless but opaque (DWM draws its own shadow), so both stay opaque and
-// full-bleed — no `frameless` tag.
+// Linux only: the window is frameless *and* transparent, so tag the document to
+// make its background transparent (macOS/Windows stay opaque, full-bleed).
+// See docs/adr/2026-08-09-per-platform-window-chrome.md
 if (isLinux()) document.documentElement.classList.add('frameless');
 
-// The color scheme's `.dark` class is applied pre-paint by the inline script in
-// `index.html`, reading the host-injected `window.__KSTACK_HOST__` (the contents
-// of host.json, the source of truth) before this bundle loads. `ThemeProvider`
-// re-applies it on mount and owns changes thereafter.
+// The `.dark` class is applied pre-paint by the `index.html` inline script;
+// `ThemeProvider` re-applies on mount and owns changes thereafter.
+// See docs/adr/2026-08-09-first-paint-theming.md
 
 const router = createRouter({ routeTree });
 

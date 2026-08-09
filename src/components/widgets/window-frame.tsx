@@ -12,32 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The window's outer frame, for the frameless Linux window only. That window is
-// `decorations(false)` *and* `transparent`, so the OS draws no border or shadow —
-// against a same-color desktop the edge is invisible. This wraps the whole app in a
-// surface inset a few px from the window edge, clipped to rounded corners, with a
-// thin border and soft outer shadow painted into the transparent gutter, so the
-// window reads as a distinct floating surface.
+// Border + shadow supplier for the frameless *transparent* Linux window; macOS and
+// Windows are passthroughs (the OS draws their chrome).
+// See docs/adr/2026-08-09-per-platform-window-chrome.md
 //
-// macOS and Windows are passthroughs (full-bleed). macOS keeps native decorations;
-// Windows is frameless but opaque, so DWM draws the borderless window's own shadow
-// (and Win11 corners) — a second custom shadow would just double-stack.
-//
-// The gutter (`inset-4`) must be at least as wide as the shadow's reach (blur +
-// offset): the OS window rectangle ends at the gutter's outer edge and clips
-// anything beyond it, so a shadow reaching farther gets cut into a hard band.
-//
-// `contain: paint` makes this the containing block for the app's `position: fixed`
-// chrome (title bar, sidebar), so it anchors to the inset box rather than the
-// window edge — without promoting the app to a GPU layer (disturbing subpixel text)
-// the way `transform` would. `overflow-hidden` then clips that chrome to the corners.
-//
-// It wraps the app at the outermost level so loading and error states get the same
-// frame and opaque background as the mounted app.
-//
-// When maximized there's no off-window space to paint into, so we collapse to a
-// full-bleed `inset-0` surface (no inset, corners, border, or shadow), and
-// `WindowResizeHandles` hides its grips to match.
+// Traps: the gutter (`inset-4`) must be at least as wide as the shadow's reach —
+// the OS window rectangle clips anything beyond it into a hard band. `contain:
+// paint` makes this the containing block for the app's `position: fixed` chrome
+// without a GPU-layer promotion (a `transform` would disturb subpixel text).
+// While maximized there's no off-window space, so collapse to full-bleed `inset-0`
+// (and `WindowResizeHandles` hides its grips to match).
 import type { ReactNode } from 'react';
 import { useEffect } from 'react';
 
@@ -47,11 +31,9 @@ import { useWindowMaximized } from '@/lib/window-maximized';
 export function WindowFrame({ children }: { children?: ReactNode }) {
   const maximized = useWindowMaximized();
 
-  // Mirror the maximized state onto <html> so portaled chrome that can't reach into
-  // the frame — chiefly the dialog scrim, base-ui-portaled to <body> outside it —
-  // can match the frame's geometry from CSS (the `[data-slot='dialog-overlay']` rule
-  // in `index.css`). Only meaningful on frameless Linux; the scrim rules key off
-  // `html.frameless`, which macOS and Windows don't set.
+  // Mirror maximized onto <html> so chrome portaled outside the frame (the dialog
+  // scrim) can match its geometry from CSS. Only meaningful on frameless Linux —
+  // the scrim rules key off `html.frameless`.
   useEffect(() => {
     document.documentElement.classList.toggle('frame-maximized', maximized);
   }, [maximized]);

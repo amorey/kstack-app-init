@@ -12,12 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Transient banner driven by the error bus. Shown when a GraphQL operation,
-// subscription, or network call fails; auto-dismisses after a few seconds so
-// a brief reconnect doesn't leave a stale banner around.
-//
-// Deliberately minimal styling — no toast lib for one surface. Revisit if
-// more transient UI shows up (then a `sonner`-style provider earns its keep).
+// Transient error-bus banner; auto-dismisses so a brief reconnect doesn't leave it
+// stale. Deliberately no toast lib for one surface — revisit if more transient UI appears.
 
 import { useEffect, useState } from 'react';
 
@@ -43,9 +39,7 @@ export function ConnectionStatus() {
 
   if (!latest) return null;
 
-  // Subscriptions get a softer message because the urql subscriptionExchange
-  // will re-issue the operation when components re-mount; framing it as
-  // "reconnecting" is honest about what the user can expect to happen next.
+  // Softer message for subscriptions — they auto-reconnect, so "reconnecting" is honest.
   const text = latest.source === 'subscription' ? 'Subscription dropped — reconnecting…' : `Error: ${latest.message}`;
 
   return (

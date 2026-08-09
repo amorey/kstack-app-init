@@ -12,22 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! macOS native event sources for the wake/network-return → `Poke` driver.
+//! macOS wake/network sources. **Wake**: an `NSObject` observer for
+//! `NSWorkspaceDidWakeNotification` (same `define_class` idiom as
+//! [`dock_menu`](crate::dock_menu)), registered on the main thread.
+//! **Network**: `SCNetworkReachability` on the default route, callback on a
+//! dedicated `CFRunLoop` thread; the core derives the edge.
 //!
-//! - **Wake**: `NSWorkspace` posts `NSWorkspaceDidWakeNotification` on resume
-//!   from sleep. We register a small `NSObject` observer (the same `define_class`
-//!   approach as [`dock_menu`](crate::dock_menu)) whose selector forwards a
-//!   [`RawEvent::Resumed`]. Registration happens on the main thread (AppKit's
-//!   notification center is delivered there).
-//! - **Network**: `SCNetworkReachability` against the default route reports
-//!   connectivity transitions. Its callback runs on a dedicated thread's
-//!   `CFRunLoop` and forwards [`RawEvent::NetworkChanged`]; the core derives the
-//!   offline→online edge.
-//!
-//! Both sources are passive once installed; we don't tear them down on shutdown
-//! — the observer and run-loop thread are leaked for the process lifetime,
-//! mirroring `dock_menu`'s leaked statics. Once the supervisor's receiver drops,
-//! their `try_send`s simply no-op.
+//! Both are passive and leaked for the process lifetime (no shutdown
+//! teardown); once the supervisor's receiver drops, `try_send`s no-op.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::OnceLock;
@@ -52,13 +44,10 @@ struct MainThreadStatic<T>(#[allow(dead_code)] T);
 unsafe impl<T> Send for MainThreadStatic<T> {}
 unsafe impl<T> Sync for MainThreadStatic<T> {}
 
-/// The channel the wake observer forwards into. A global because the
-/// selector callback carries no user context (unlike the reachability closure,
-/// which captures its sender directly).
+/// A global because the selector callback carries no user context.
 static WAKE_TX: OnceLock<Sender<RawEvent>> = OnceLock::new();
 
-/// Keeps the wake observer alive for the process lifetime — the notification
-/// center holds it only weakly.
+/// Keeps the observer alive — the notification center holds it only weakly.
 static WAKE_OBSERVER: OnceLock<MainThreadStatic<Retained<WakeObserver>>> = OnceLock::new();
 
 define_class!(
@@ -80,17 +69,14 @@ define_class!(
     }
 );
 
-/// Spawns the macOS wake + network sources.
-///
-/// `shutdown` is unused: both sources are passive and torn down with the process
-/// (see the module docs). It is accepted to match the cross-platform
-/// `spawn_sources` shape.
+/// Spawns the macOS wake + network sources. `shutdown` unused — both sources
+/// die with the process (module docs); accepted to match the cross-platform
+/// shape.
 pub fn spawn_sources(app: &AppHandle, tx: Sender<RawEvent>, _shutdown: CancellationToken) {
-    // Reachability runs on its own CFRunLoop thread; no main thread needed.
     spawn_network_source(tx.clone());
 
-    // The wake observer must be registered on the main thread. Storing the
-    // sender is the idempotency gate — a second call is a no-op.
+    // Wake observer must register on the main thread. Storing the sender is
+    // the idempotency gate.
     if WAKE_TX.set(tx).is_err() {
         return;
     }
@@ -120,11 +106,9 @@ fn register_wake_observer() {
     let _ = WAKE_OBSERVER.set(MainThreadStatic(observer));
 }
 
-/// Starts the SCNetworkReachability monitor on a dedicated CFRunLoop thread.
-///
-/// Primes the edge detector with the current connectivity, then forwards every
-/// subsequent transition. The thread blocks in `CFRunLoop::run` for the process
-/// lifetime; we never unschedule (it's idle and dies with the process).
+/// Starts the SCNetworkReachability monitor on a dedicated CFRunLoop thread:
+/// primes the baseline, then forwards every transition. Never unscheduled —
+/// idle, dies with the process.
 fn spawn_network_source(tx: Sender<RawEvent>) {
     let spawned = std::thread::Builder::new()
         .name("kstack-net-reachability".into())
@@ -171,9 +155,8 @@ fn spawn_network_source(tx: Sender<RawEvent>) {
     }
 }
 
-/// Maps reachability flags to a simple online/offline bool: the network is
-/// "online" when the target is reachable and reaching it needs no user
-/// intervention (no on-demand connection / VPN dial).
+/// Online = reachable and needing no user intervention (no on-demand
+/// connection / VPN dial).
 fn is_online(flags: ReachabilityFlags) -> bool {
     flags.contains(ReachabilityFlags::REACHABLE)
         && !flags.contains(ReachabilityFlags::CONNECTION_REQUIRED)

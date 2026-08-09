@@ -12,23 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Per-subscription Server-Sent Events (SSE) reader.
-//!
-//! Each GraphQL subscription the webview opens gets its own short-lived HTTP/1
-//! connection to the sidecar (UDS / named pipe) — exactly like a query
-//! (`query.rs`), except we POST with `Accept: text/event-stream` and stream the
-//! sidecar's gqlgen SSE frames instead of collecting a single response body.
-//!
-//! gqlgen's SSE wire format (distinct-connection mode):
-//! ```text
-//!   :\n\n                                       initial comment (ignored)
-//!   : ping\n\n                                  keep-alive comment (ignored)
-//!   event: next\ndata: <graphql.Response>\n\n   one per emitted value
-//!   event: complete\n\n                         terminal, sent once
-//! ```
-//!
-//! We translate that into the webview channel envelope the frontend speaks
-//! (`subscribe-exchange.ts`):
+//! Per-subscription SSE reader: one HTTP/1 connection per subscription (like
+//! `query.rs`, but `Accept: text/event-stream`), translating gqlgen's SSE
+//! frames into the webview channel envelope (`subscribe-exchange.ts`):
 //! ```text
 //!   open     → {"type":"open"}    once, on 200, before any `next`
 //!   next     → {"type":"next","payload":<graphql.Response>}
@@ -36,24 +22,18 @@
 //!   closed   → {"type":"closed"}     abnormal end (mid-stream read failure)
 //!   error    → {"type":"error","payload":<message>}  (transport-level only)
 //! ```
-//! `complete` vs `closed` is the "was this the server's decision?" split: both
-//! make the frontend reconnect, but only `closed` is an abnormal end worth
-//! reporting to the user; a graceful `complete` reconnects silently.
+//! Two load-bearing rules:
+//! - **`complete` vs `closed` is read off body framing**, not the `complete`
+//!   SSE event: gqlgen's `event: complete` is data-less and SSE dispatch
+//!   discards it, so graceful = clean chunked terminator, abnormal = truncated
+//!   body (read error). Both reconnect; only `closed` is reported.
+//! - **`open` fires only after a successful dial (200)** — never on the ack or
+//!   a failed dial (that emits `error`); the frontend keys its accumulator
+//!   resets on it. See docs/adr/2026-08-09-transport-status-generation.md.
 //!
-//! The split is read at the *body* level, not from the `complete` SSE event:
-//! gqlgen's `event: complete` carries no `data:` line, and the SSE spec discards
-//! data-less events, so the parser never yields it. A graceful completion ends
-//! with the server's chunked terminator (clean end-of-body); a crash/sleep/drop
-//! truncates the chunked body and surfaces as a read error.
-//!
-//! `open` fires only after the dial succeeds (200 received), so the frontend can
-//! reset its per-subscription accumulators on a reconnect without clearing them
-//! on a failed dial (which emits `error`).
-//!
-//! There's no shared session, `connection_init`/`ack`, or demultiplexing: a
-//! dropped connection ends one subscription, and the frontend's capped-backoff
-//! reconnect just opens a fresh connection here. The only state kept is a table
-//! of cancel handles so `unsubscribe` can drop the right connection.
+//! No shared session or demultiplexing — a drop ends one subscription and the
+//! frontend reconnects. The only state is the cancel-handle table for
+//! `unsubscribe`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,44 +51,33 @@ use tokio::sync::{oneshot, Mutex};
 use super::super::ipc::{self, Endpoint, DEFAULT_CONNECT_BUDGET};
 use crate::error::{AppError, Result};
 
-/// Where the host sends each subscription envelope. Production wraps a Tauri
-/// `Channel<String>`; tests use an mpsc adapter so they don't have to stand up
-/// a Tauri runtime.
+/// Envelope delivery seam. Production wraps a Tauri `Channel<String>`; tests
+/// use an mpsc adapter.
 pub trait FrameSink: Send + Sync {
-    /// Forwards one `SubMessage`-shaped JSON envelope to the consumer.
-    /// Best-effort: a closed sink simply drops the message — the consumer has
-    /// already torn down.
+    /// Best-effort: a closed sink drops the message — the consumer is gone.
     fn send_frame(&self, frame: String);
 }
 
-/// Graceful-end envelope: the server finished on its own terms (clean
-/// end-of-body). The frontend reconnects but doesn't report an error.
+/// Graceful end (clean end-of-body): the frontend reconnects silently.
 const COMPLETE_FRAME: &str = r#"{"type":"complete"}"#;
 
-/// Abnormal-end envelope: the connection died mid-stream (truncated chunked body
-/// — sidecar crash, sleep, network loss). The frontend reconnects and, unlike
-/// `complete`, reports the drop.
+/// Abnormal end (truncated body — crash, sleep, network loss): the frontend
+/// reconnects and reports the drop.
 const CLOSED_FRAME: &str = r#"{"type":"closed"}"#;
 
-/// "Connection established" envelope. Sent once, before any `next`, after the
-/// dial succeeds (200) — never on a failed dial (that emits `error`). The
-/// frontend resets its per-subscription accumulators on it so a reconnect's
-/// snapshot replaces rather than merges.
+/// Sent once, before any `next`, only after a successful dial (200) — never on
+/// a failed dial. The frontend resets accumulators on it; see module docs.
 const OPEN_FRAME: &str = r#"{"type":"open"}"#;
 
 /// Opens one SSE connection per subscription and tracks a cancel handle for
 /// each so [`SubscriptionClient::unsubscribe`] can tear it down.
 pub struct SubscriptionClient {
     path: Endpoint,
-    /// Cancel handles keyed by host-side op id (the `u64` returned to Tauri).
-    /// Dropping/firing the sender ends the matching streaming task.
+    /// Cancel handles by host-side op id; dropping the sender ends the task.
     subs: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>>,
-    /// Host-side op id counter. Monotonic for the process lifetime so the
-    /// frontend can rely on distinct ids across reconnects.
+    /// Monotonic for the process lifetime — distinct ids across reconnects.
     next_id: AtomicU64,
-    /// How long the initial dial may take before the subscription gives up and
-    /// emits an `error` frame. Tests shrink this; production uses
-    /// [`DEFAULT_CONNECT_BUDGET`].
+    /// Dial budget before emitting an `error` frame; tests shrink it.
     connect_budget: Duration,
 }
 
@@ -117,9 +86,8 @@ impl SubscriptionClient {
         Self::new_with_budget(path, DEFAULT_CONNECT_BUDGET)
     }
 
-    /// Same as [`SubscriptionClient::new`] but with a caller-supplied connect
-    /// budget. Not part of the public surface — only `new` and tests (which
-    /// pass a short budget so a dead-socket case fails fast) construct with it.
+    /// [`SubscriptionClient::new`] with a caller-supplied connect budget
+    /// (tests pass a short one).
     fn new_with_budget(path: Endpoint, connect_budget: Duration) -> Self {
         Self {
             path,
@@ -129,13 +97,9 @@ impl SubscriptionClient {
         }
     }
 
-    /// Registers a subscription: opens its own SSE connection and streams frames
-    /// to `sink` until the server completes, the connection drops, or
-    /// [`Self::unsubscribe`] is called. Returns the host-side op id.
-    ///
-    /// Returns `Ok` as soon as the streaming task is spawned — connection and
-    /// stream failures surface on the sink (`error`/`closed`), the frontend's
-    /// reconnect path, so nothing bubbles up synchronously.
+    /// Registers a subscription and returns its op id. `Ok` as soon as the
+    /// streaming task is spawned — connect/stream failures surface on the sink
+    /// (`error`/`closed`), never synchronously.
     pub async fn subscribe(
         &self,
         query: String,
@@ -146,8 +110,8 @@ impl SubscriptionClient {
         let body = serde_json::json!({ "query": query, "variables": variables }).to_string();
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        // Register before spawning. The frontend only learns `id` once this
-        // returns, so no `unsubscribe(id)` can race ahead of the insert.
+        // Register before spawning — the frontend only learns `id` after this
+        // returns, so `unsubscribe(id)` can't race ahead of the insert.
         self.subs.lock().await.insert(id, cancel_tx);
 
         let path = self.path.clone();
@@ -159,21 +123,16 @@ impl SubscriptionClient {
         Ok(id)
     }
 
-    /// Cancels a subscription by host-side op id, dropping its connection.
-    ///
-    /// Tolerant of unknown ids — urql's subscribe-exchange can race teardown with
-    /// the `graphql_subscribe` resolve and call this with an already-completed id.
+    /// Cancels a subscription, dropping its connection. Tolerant of unknown
+    /// ids — urql can race teardown with the subscribe resolve.
     pub async fn unsubscribe(&self, id: u64) {
-        // Removing drops the cancel sender, which fires the streaming task's
-        // cancel future → it stops and drops the connection. A no-op if the task
-        // already finished.
+        // Removing drops the cancel sender → the task's cancel future fires.
         let _ = self.subs.lock().await.remove(&id);
     }
 }
 
-/// Drives one subscription end-to-end: connect, stream, clean up. Always
-/// removes `id` from `subs` on the way out (a no-op if `unsubscribe` got there
-/// first), so the table never leaks completed subscriptions.
+/// Drives one subscription end-to-end. Always removes `id` from `subs` on the
+/// way out, so the table never leaks completed subscriptions.
 async fn run_subscription(
     path: Endpoint,
     budget: Duration,
@@ -192,15 +151,14 @@ async fn run_subscription(
 
     match opened {
         Ok(resp) => {
-            // Signal the live connection before the snapshot, so the frontend
-            // resets accumulators here (and only here — a failed dial takes the
-            // `Err` arm and emits no `open`).
+            // `open` before the snapshot, and only on a successful dial — a
+            // failed dial takes the `Err` arm and emits no `open`.
             sink.send_frame(OPEN_FRAME.to_string());
             stream_to_sink(resp, &sink, cancel_rx).await
         }
         Err(err) => {
-            // Connect / handshake / non-200: report as a transport error, which
-            // the frontend treats like a drop and reconnects.
+            // Connect / handshake / non-200: the frontend treats it like a
+            // drop and reconnects.
             sink.send_frame(error_frame(&err.to_string()));
         }
     }
@@ -209,8 +167,7 @@ async fn run_subscription(
 }
 
 /// Dials the sidecar and issues the SSE `POST /graphql`, returning the live
-/// streaming response. Mirrors `query.rs`'s per-call connect, but asks for
-/// `text/event-stream` and keeps the body for incremental reads.
+/// streaming response.
 async fn open_stream(
     path: &Endpoint,
     budget: Duration,
@@ -221,8 +178,7 @@ async fn open_stream(
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
         .map_err(|e| AppError::Io(std::io::Error::other(e)))?;
-    // Drive the connection in the background: it must keep running for the
-    // streaming body to receive bytes, and ends when the body is dropped.
+    // Drive the connection in the background; it ends when the body drops.
     tokio::spawn(async move {
         if let Err(err) = conn.await {
             tracing::debug!(target: "sidecar", %err, "sse connection ended");
@@ -260,41 +216,36 @@ async fn stream_to_sink(
     sink: &Arc<dyn FrameSink>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) {
-    // Let `eventsource-stream` own the SSE wire parsing: line framing, the
-    // leading-space strip, multi-line `data:`, comment/keep-alive lines, and
-    // events split across chunk boundaries.
+    // `eventsource-stream` owns the SSE wire parsing (line framing, comments,
+    // chunk-boundary splits).
     let mut events = resp.into_body().into_data_stream().eventsource();
     loop {
         tokio::select! {
             biased;
-            // Consumer torn down: drop the stream (closes the connection, which
-            // cancels the sidecar resolver) and emit nothing — they're gone.
+            // Consumer torn down: drop the stream (cancels the sidecar
+            // resolver), emit nothing.
             _ = &mut cancel_rx => return,
             next = events.next() => {
                 match next {
                     Some(Ok(event)) => {
                         if event.event == "complete" {
                             // Only reachable if a `complete` carries data;
-                            // gqlgen's is data-less, so the graceful end normally
-                            // surfaces as the clean EOF below. Means the same thing.
+                            // gqlgen's is data-less and lands at the EOF arm.
                             sink.send_frame(COMPLETE_FRAME.to_string());
                             return;
                         } else if !event.data.is_empty() {
-                            // Any non-empty data frame carries a `graphql.Response`.
-                            // Empty dispatches (e.g. the initial `:` comment) never
-                            // reach here.
+                            // Non-empty data = a `graphql.Response`.
                             sink.send_frame(next_frame(&event.data));
                         }
                     }
-                    // Clean end-of-body: the graceful completion (gqlgen's
-                    // data-less `event: complete` lands here). Reconnects silently.
+                    // Clean end-of-body: graceful completion (where gqlgen's
+                    // data-less `event: complete` lands).
                     None => {
                         sink.send_frame(COMPLETE_FRAME.to_string());
                         return;
                     }
-                    // Mid-stream read/parse failure (truncated body — crash,
-                    // sleep, network loss): emit `closed` so the frontend
-                    // reconnects and reports the drop.
+                    // Truncated body (crash, sleep, network loss): `closed` so
+                    // the frontend reconnects and reports.
                     Some(Err(_)) => {
                         sink.send_frame(CLOSED_FRAME.to_string());
                         return;
@@ -305,8 +256,8 @@ async fn stream_to_sink(
     }
 }
 
-/// Wraps a gqlgen `graphql.Response` (already valid JSON off the wire) in the
-/// `next` envelope, embedding it verbatim without a parse round-trip.
+/// Wraps a `graphql.Response` (already valid JSON) in the `next` envelope —
+/// no parse round-trip.
 fn next_frame(data: &str) -> String {
     format!(r#"{{"type":"next","payload":{data}}}"#)
 }

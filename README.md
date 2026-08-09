@@ -1,56 +1,23 @@
-# Tauri + React + Typescript
+# Kstack
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+Kstack is an AI-native monitoring and troubleshooting app for Kubernetes.
 
-## Dev Environment
+## Architecture
 
-Start sandbox:
+- **`src/`** — the React webview (React 19, TanStack Router, urql, Tailwind v4).
+- **`src-tauri/`** — the Tauri 2 / Rust native host: windows, tray, menus, and the sidecar's
+  lifecycle. It bridges all webview GraphQL over a Unix socket — the webview has no network
+  access.
+- **`sidecar/`** — a Go binary owning the GraphQL API and all Kubernetes/cloud logic. It
+  mirrors each cluster into a per-cluster SQLite cache and streams changes to the UI.
+- **`proto/`** — the shared host↔sidecar gRPC contract.
 
-```
-# Build template image
-docker build -f Dockerfile.sbx -t claude-kstack-app .
+Design rationale lives in [`docs/adr/`](docs/adr/README.md). Working conventions live in the
+per-area `CLAUDE.md` files.
 
-# Save your locally-built image to a tar
-docker image save claude-kstack-app -o .sbx/claude-kstack-app.tar
+## Toolchain
 
-# Load it into the sandbox runtime's image store
-sbx template load .sbx/claude-kstack-app.tar
-
-# Now you can use it as a template
-sbx run claude --template claude-kstack-app
-```
-
-Start server inside sandbox:
-
-```
-sbx exec -it claude-kstack-app bash
-```
-
-Port forward:
-
-```
-./scripts/expose-dev.sh
-```
-
-### Building inside the sandbox (Linux) with a macOS host
-
-The sandbox bind-mounts the repo from the macOS host, so both platforms share
-every build-output path. Run this once per sandbox boot to keep the Linux
-artifacts off the host's:
-
-```
-./scripts/sandbox-dev-setup.sh
-```
-
-It points the relocatable outputs (`CARGO_TARGET_DIR`, the pnpm store) at
-`.sandbox-linux/` via `/etc/sandbox-persistent.sh`, and bind-mounts
-`.sandbox-linux/{node_modules,dist}` over the fixed paths that tooling can't
-relocate. A bind mount is sandbox-only: the host's macOS `node_modules` sits
-untouched underneath. Go's caches need no handling — they default to `$HOME`,
-which isn't shared. Neither does `src-tauri/binaries/`, since the sidecar's
-filename carries the target triple, so the two platforms' builds coexist.
-
-The sandbox needs the Linux toolchain the host doesn't have:
+Rust (rustup), Go, Node + `pnpm`. On Linux, Tauri needs the usual native deps:
 
 ```
 sudo apt-get install -y build-essential pkg-config libssl-dev \
@@ -60,6 +27,36 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 npm install -g pnpm@11.0.8   # corepack can't run pnpm 11 on the bundled Node
 ```
 
-## Recommended IDE Setup
+## Develop
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+```
+pnpm install
+pnpm tauri dev      # full app (or `pnpm dev` for the webview alone)
+```
+
+The `Makefile` is the polyglot entry point:
+
+```
+make test    # JS + Rust + Go
+make lint
+make vet
+make proto   # regenerate the gRPC bindings after editing proto/
+```
+
+If you develop inside a Linux sandbox against a macOS host checkout, run
+`./scripts/sandbox-dev-setup.sh` first — see the root `CLAUDE.md` for details.
+
+### Sandbox environment (optional)
+
+```
+docker build -f Dockerfile.sbx -t claude-kstack-app .
+docker image save claude-kstack-app -o .sbx/claude-kstack-app.tar
+sbx template load .sbx/claude-kstack-app.tar
+sbx run claude --template claude-kstack-app
+sbx exec -it claude-kstack-app bash     # shell inside
+./scripts/expose-dev.sh                 # port forward
+```
+
+## Recommended IDE setup
+
+[VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)

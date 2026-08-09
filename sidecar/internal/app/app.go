@@ -22,11 +22,8 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
-// defaultKeychainService is the OS-keychain service name the auth token is stored
-// under when Config.KeychainService is empty. It's a product-level, frontend-
-// neutral name so any frontend (e.g. a TUI) reads the one credential through the
-// sidecar under it. The host overrides it (via env) to a dev-specific name so dev
-// and release runs don't share — and clobber — the same stored sign-in.
+// defaultKeychainService is the OS-keychain service name used when
+// Config.KeychainService is empty; deliberately frontend-neutral.
 const defaultKeychainService = "Kstack"
 
 // Config is the subset of process configuration the composition root needs.
@@ -35,24 +32,21 @@ type Config struct {
 	// KubeconfigPath is an explicit kubeconfig path; empty uses clientcmd's
 	// default-loading rules.
 	KubeconfigPath string
-	// DataDir is the host-supplied per-machine app data dir: it holds the
-	// beehive SQLite store, the per-cluster SQLite caches, and the cloud
-	// settings-sync file/queue. Required — New errors when empty, so the store
-	// can never be created relative to an arbitrary working directory.
+	// DataDir holds the beehive store, per-cluster caches, and cloud settings
+	// file/queue. Required — New errors when empty, so stores are never created
+	// relative to an arbitrary working directory.
 	DataDir string
-	// CloudURL is the kstack-cloud API base URL. Empty disables the cloud account
-	// subsystem (standalone/dev/test runs ⇒ signed-out, no network).
-	// Configured via KSTACK_CLOUD_API_URL.
+	// CloudURL is the kstack-cloud API base URL. Empty disables the cloud
+	// subsystem (signed-out, no network).
 	CloudURL string
-	// OAuthIssuerURL is the Hydra OAuth issuer base URL. The auth service derives
-	// every endpoint (authorize/token/jwks/revocation) from it, baking in Hydra's
-	// standard path layout, so only the issuer + client id need to be configured.
+	// OAuthIssuerURL is the Hydra OAuth issuer base URL; auth derives every
+	// endpoint from it via Hydra's standard path layout.
 	OAuthIssuerURL string
 	// OAuthClientID is the public (PKCE/loopback) OAuth client id.
 	OAuthClientID string
-	// KeychainService is the OS-keychain service name the auth token is stored
-	// under. Empty uses defaultKeychainService; the host sets a dev-specific name
-	// in development so dev and release runs don't share the same keychain entry.
+	// KeychainService is the OS-keychain service name for the auth token. Empty
+	// uses defaultKeychainService; dev runs set a distinct name so dev and
+	// release don't share a keychain entry.
 	KeychainService string
 }
 
@@ -78,30 +72,22 @@ func New(cfg Config) (*App, error) {
 	}
 
 	// Tighten client-go's HTTP/2 keepalive so a silently-dropped API-server
-	// connection is detected in ~15s instead of client-go's ~45s default — the
-	// connection controller's liveness sentinel then sees its watch close promptly
-	// and re-probes the cluster's connection. Set once, before any kube client is
+	// connection is detected in ~15s (vs client-go's ~45s default) and the
+	// liveness sentinel re-probes promptly. Must run before any kube client is
 	// built.
 	cluster.ConfigureKubeHTTP2Keepalive()
 
-	// The resync broadcaster is the shared, cross-subsystem poke bus. It owns the
-	// wall-clock gap detector (machine sleep/resume backstop) and accepts pokes
-	// from the host via the gRPC PokeService. Built before the cluster service so
-	// it can be handed to both it and cloud.
+	// Shared cross-subsystem poke bus (wall-clock gap detector + host pokes via
+	// gRPC PokeService); see docs/adr/2026-08-09-poke-resync-fanout.md.
 	pokeSvc := poke.New()
 
-	// The cluster service is the whole cluster control plane behind one boundary:
-	// it owns the kubeconfig watcher, the beehive store + instance (at
-	// <data-dir>/beehive.db), the two controllers (which subscribe to the poke
-	// bus for resync), the kubeconfig importer, and the per-cluster cache
-	// manager. app hands it the data dir, the kubeconfig path, and the poke bus,
-	// then drives Start/Close.
+	// The whole cluster control plane behind one boundary (kubeconfig watcher,
+	// beehive store, controllers, importer, cache manager).
 	clusterSvc, err := cluster.New(cfg.DataDir, cfg.KubeconfigPath, pokeSvc)
 	if err != nil {
 		return nil, err
 	}
 
-	// The local-first auth/identity service.
 	keychainService := cfg.KeychainService
 	if keychainService == "" {
 		keychainService = defaultKeychainService
@@ -115,7 +101,8 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 
-	// The cloud-synced settings service depends on auth.
+	// cloud depends on auth, never the reverse; see
+	// docs/adr/2026-08-09-local-first-auth-settings.md.
 	cloudSvc, err := cloud.New(cfg.DataDir, cfg.CloudURL, authSvc, pokeSvc)
 	if err != nil {
 		return nil, err
@@ -128,14 +115,12 @@ func New(cfg Config) (*App, error) {
 
 	grpcServer := grpcserver.NewServer(authSvc, pokeSvc)
 
-	// Routing: the GraphQL server at /graphql.
 	mux := http.NewServeMux()
 	mux.Handle("/graphql", graphqlServer)
 
-	// gRPC (host-internal control channel) shares the socket with GraphQL via
-	// h2c. The dispatcher routes requests matching grpcserver.IsGRPCRequest
-	// (HTTP/2 application/grpc) to the gRPC server and everything else (HTTP/1.1
-	// GraphQL POST/SSE, /control/*) to the mux above.
+	// gRPC shares the socket with GraphQL via h2c: HTTP/2 application/grpc goes
+	// to the gRPC server, everything else to the mux. See
+	// docs/adr/2026-08-09-single-socket-h2c.md.
 	handler := h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if grpcserver.IsGRPCRequest(r) {
 			grpcServer.GRPC().ServeHTTP(w, r)
@@ -169,10 +154,6 @@ func (a *App) Start(ctx context.Context) (func(context.Context) error, error) {
 		return nil, fmt.Errorf("start poke service: %w", err)
 	}
 
-	// Start the cluster service: it starts beehive (the controller harness) and
-	// the kubeconfig watcher, then the kubeconfig importer (creates one Cluster
-	// per kube-context). The controllers subscribe to the poke bus themselves for
-	// resync (connection re-probe + sync-engine restart).
 	clusterSvcStop, err := a.clusterSvc.Start(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("start cluster service: %w", err)
@@ -184,6 +165,7 @@ func (a *App) Start(ctx context.Context) (func(context.Context) error, error) {
 	}
 
 	stop := func(ctx context.Context) error {
+		// Left-to-right evaluation stops poke's hub last, after its subscribers.
 		return errors.Join(clusterSvcStop(ctx), cloudSvcStop(ctx), pokeSvcStop(ctx))
 	}
 	return stop, nil

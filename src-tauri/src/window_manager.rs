@@ -12,34 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Window lifecycle for the Tauri host.
+//! Window lifecycle. Every window is built in code by [`WindowManager`]
+//! (`tauri.conf.json` declares none — a test pins this), so all chrome lives in
+//! `build_window`; new windows cascade down-right of their anchor
+//! ([`cascade_position`]). See
+//! docs/adr/2026-08-09-per-platform-window-chrome.md.
 //!
-//! Every window — including the first `"main"` window, created in `lib.rs`'s
-//! `setup` hook — is built in code by [`WindowManager`], so all window chrome
-//! lives in one place (`build_window`); `tauri.conf.json` declares no windows.
-//! [`WindowManager`] recreates `"main"` if the user closed it and creates
-//! additional windows with unique labels, cascading each down-right of the
-//! window it was opened from (see [`cascade_position`]).
+//! Windows are visible from creation, painted with the resolved scheme at t0
+//! ([`background_color_for`]) — **no reveal step**; do not add one. On macOS
+//! this depends on `tauri/macos-private-api` (clears `WKWebView`'s opaque white
+//! backing), which in turn requires the *document* to stay opaque. See
+//! docs/adr/2026-08-09-first-paint-theming.md.
 //!
-//! Windows are visible from creation and painted with the app's color scheme at
-//! t0: the native surface carries the resolved `--background` color (see
-//! [`background_color_for`]) before the webview draws, so the first frame is
-//! themed. There is no reveal step — the webview must not drive when its window
-//! appears.
-//!
-//! What makes that work is `tauri/macos-private-api`, which enables
-//! `wry/transparent` and so clears `WKWebView`'s opaque white backing (the
-//! private `drawsBackground` key). Without it the webview paints white over the
-//! window background until its first frame — the launch flash — regardless of
-//! the native layer. Because that backing is cleared, the *document* must be
-//! opaque: `index.css` paints `html` from the same `--background` token on the
-//! opaque platforms, and `index.html`'s inline script applies the scheme before
-//! any page script runs, so the webview's first paint lands on the color the
-//! native surface already shows.
-//!
-//! Closing the last window does not exit the process (see `lib.rs`), so the
-//! main window may be absent while the app runs — every entry point here
-//! recreates it on demand.
+//! Closing the last window does not exit the process (see `lib.rs`), so every
+//! entry point here recreates `"main"` on demand.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -60,41 +46,28 @@ const WINDOW_TITLE: &str = "kstack";
 const WINDOW_WIDTH: f64 = 800.0;
 const WINDOW_HEIGHT: f64 = 600.0;
 
-// The traffic-light geometry below is only *used* on macOS (via `build_window`),
-// but is compiled and unit-tested on every platform — only the native builder
-// call is `#[cfg]`-gated — so the arithmetic stays covered on CI. `allow(dead_code)`
-// silences the off-macOS "unused" warning without dropping the items.
+// Traffic-light geometry: used only on macOS, but compiled and unit-tested on
+// every platform so CI covers the arithmetic (hence `allow(dead_code)`).
 
-/// Logical-pixel gap the webview's floating sidebar leaves between its card and
-/// the window edge (Tailwind `p-2`), i.e. the card's uniform offset from both
-/// the top and left window edges. Kept in sync with the sidebar's spacing in
+/// Sidebar card's gap from the window edges (Tailwind `p-2`). Kept in sync with
 /// `src/components/widgets/app-sidebar.tsx`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const SIDEBAR_GAP: f64 = 8.0;
 
-/// Height (logical px) of the sidebar's title-bar header row (`h-11`), the strip
-/// the macOS traffic lights sit in. Kept in sync with `app-sidebar.tsx`.
+/// Sidebar title-bar header height (`h-11`), the strip the macOS traffic lights
+/// sit in. Kept in sync with `app-sidebar.tsx`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const TITLE_BAR_HEIGHT: f64 = 44.0;
 
-/// Horizontal inset (logical px) from the sidebar card's left edge to the first
-/// traffic-light button. The webview derives `MAC_TOGGLE_LEFT` (in
-/// `app-sidebar.tsx`) from this and `SIDEBAR_GAP` to place the sidebar toggle
-/// just past the lights — bump this and check that offset still clears them.
+/// Inset from the sidebar card's left edge to the first traffic light. The
+/// webview derives `MAC_TOGGLE_LEFT` (`app-sidebar.tsx`) from this and
+/// `SIDEBAR_GAP` — bump this and check the toggle still clears the lights.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const TRAFFIC_LIGHT_LEFT_INSET: f64 = 12.0;
 
-/// Logical `(x, y)` position for the macOS traffic lights so they sit inside the
-/// sidebar's title-bar header instead of the window's default top-left corner.
-///
-/// `gap` is the sidebar card's uniform offset from the window edges and
-/// `header_height` is the title-bar row height. The lights are inset from the
-/// card's left edge and centered vertically in the header. This is the pure
-/// arithmetic behind the `traffic_light_position` builder call in
-/// [`build_window`]; the exact insets track the webview sizing in
-/// `app-sidebar.tsx` and may want visual tuning on macOS.
-///
-/// [`build_window`]: WindowManager::build_window
+/// Logical `(x, y)` for the macOS traffic lights: inset from the sidebar card's
+/// left edge, centered vertically in its title-bar header. Insets track
+/// `app-sidebar.tsx`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn traffic_light_position(gap: f64, header_height: f64) -> (f64, f64) {
     /// macOS traffic-light button diameter (logical px).
@@ -104,34 +77,21 @@ fn traffic_light_position(gap: f64, header_height: f64) -> (f64, f64) {
     (x, y)
 }
 
-/// The `--background` token color for each resolved scheme, as `@kubetail/ui`
-/// defines it (`color-white` / `color-zinc-950`) and `index.css` paints `html`
-/// with. Nothing pins these to that package's tokens — the values live in its
-/// shipped CSS, not in this repo — but the webview paints the exact token over
-/// this the moment it draws, so they only ever need to match to the eye.
+/// `@kubetail/ui`'s `--background` token per scheme, tracked by eye — nothing
+/// pins them, but the webview paints the real token over this on first frame.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 const LIGHT_BACKGROUND: Color = Color(255, 255, 255, 255);
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 const DARK_BACKGROUND: Color = Color(9, 9, 11, 255);
 
-/// The native window background for a persisted color-scheme preference.
+/// Native window background for a persisted preference — the anti-launch-flash
+/// color on screen until the webview's first paint (and during live resize).
 ///
-/// This prevents the launch flash: it's the color on screen from the moment the
-/// window appears until the webview's first paint, and whenever the native
-/// surface is visible on its own thereafter (chiefly live resize).
-///
-/// Always a concrete color, never "leave it to the OS": `background_color`
-/// drives both the window and webview layers, and wry only clears the webview's
-/// opaque white backing when a color is set, so passing nothing would reinstate
-/// the flash. Hence `system` resolves against `os_prefers_dark` (from
-/// `os_theme`) rather than opting out — the cost being that a scheme change
-/// while the app is closed is only picked up at the next launch.
-///
-/// Only *called* on the opaque platforms ([`build_window`] skips it on
-/// transparent Linux), but compiled and unit-tested everywhere so the mapping
-/// stays covered on CI.
-///
-/// [`build_window`]: WindowManager::build_window
+/// Must always return a concrete color: wry only clears the webview's opaque
+/// white backing when one is set, so `system` resolves against
+/// `os_prefers_dark` rather than opting out. See
+/// docs/adr/2026-08-09-first-paint-theming.md. Called only on opaque platforms,
+/// but compiled/tested everywhere.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 fn background_color_for(preference: Option<ColorSchemePreference>, os_prefers_dark: bool) -> Color {
     let dark = match preference {
@@ -147,28 +107,18 @@ fn background_color_for(preference: Option<ColorSchemePreference>, os_prefers_da
     }
 }
 
-/// Logical-pixel step between a window and the one it cascades from, down and
-/// to the right — roughly a title bar's worth, so the window beneath stays
-/// grabbable.
+/// Down-right step per cascade — about a title bar, so the window beneath
+/// stays grabbable.
 const CASCADE_STEP: f64 = 28.0;
 
-/// Logical `(x, y)` for a new window of size `window`, cascading off `anchor`
-/// (the position of the window it opens from) within `work_area` — the monitor
-/// minus its taskbar / dock / menu bar, as `(x, y, width, height)` logical px.
+/// Logical `(x, y)` for a new window: one [`CASCADE_STEP`] down-right of
+/// `anchor` within `work_area` (`(x, y, w, h)` logical px, monitor minus
+/// taskbar/dock); no anchor → centered.
 ///
-/// The new window sits one [`CASCADE_STEP`] down-right of the anchor, so a run
-/// of New Windows walks diagonally from wherever the user last had one, even if
-/// they dragged it. With no anchor — the first window of the session — it
-/// centers.
-///
-/// The step is taken only if the result still fits entirely inside the work
-/// area; otherwise the cascade restarts from the centered position. That single
-/// fit check is what bounds the walk (no step cap needed) and it also absorbs a
-/// pathological anchor: a window the user dragged mostly off-screen, or onto
-/// another monitor, can't drag the new window off with it.
-///
-/// A window larger than the work area pins to its top-left corner and never
-/// steps — nowhere to cascade into.
+/// The step is taken only if the result fits entirely inside the work area,
+/// else the cascade restarts from center. That single fit check bounds the walk
+/// (no step cap) and absorbs a pathological anchor (dragged off-screen or onto
+/// another monitor). A window larger than the work area pins to its top-left.
 fn cascade_position(
     anchor: Option<(f64, f64)>,
     window: (f64, f64),
@@ -200,9 +150,8 @@ fn cascade_position(
     }
 }
 
-/// A monitor's work area — the screen minus its taskbar / dock / menu bar — as
-/// logical `(x, y, width, height)`, which is what [`cascade_position`] measures
-/// against. Tauri only exposes it in physical pixels.
+/// A monitor's work area as logical `(x, y, width, height)` — Tauri only
+/// exposes it in physical pixels.
 fn logical_work_area(monitor: &Monitor) -> (f64, f64, f64, f64) {
     let scale = monitor.scale_factor();
     let area = monitor.work_area();
@@ -214,19 +163,12 @@ fn logical_work_area(monitor: &Monitor) -> (f64, f64, f64, f64) {
 /// Owns window creation and focus for the host.
 #[derive(Default)]
 pub struct WindowManager {
-    /// Monotonic counter feeding unique labels for windows created via
-    /// [`new_window`].
-    ///
-    /// [`new_window`]: WindowManager::new_window
+    /// Monotonic counter feeding unique window labels.
     next_id: AtomicU64,
 
-    /// Label of the most recently built window, the cascade's fallback anchor
-    /// when no window is focused — the tray and Dock menus can both open one
-    /// while another app holds focus (see [`anchor_window`]). Holds a label
-    /// rather than a `WebviewWindow` so a closed window drops normally and is
-    /// simply not found on the next lookup.
-    ///
-    /// [`anchor_window`]: WindowManager::anchor_window
+    /// Most recently built window — the cascade's fallback anchor when no
+    /// window is focused (tray/Dock menus). A label, not a `WebviewWindow`, so
+    /// a closed window drops normally and is simply not found next lookup.
     last_built: Mutex<Option<String>>,
 }
 
@@ -235,34 +177,23 @@ impl WindowManager {
         Self::default()
     }
 
-    /// Create a fresh window with a unique label (`window-1`, `window-2`, …).
-    ///
-    /// Always creates a new window — it never reuses an existing one. The
-    /// unique label keeps Tauri's window registry unambiguous; the OS-visible
-    /// title is the same [`WINDOW_TITLE`] for every window.
+    /// Create a fresh window with a unique label (`window-1`, `window-2`, …) —
+    /// never reuses an existing one.
     pub fn new_window(&self, app: &AppHandle) -> Result<WebviewWindow> {
         let label = self.next_label();
         self.build_window(app, &label)
     }
 
-    /// Produce the next unique window label (`window-1`, `window-2`, …).
-    ///
-    /// Each call advances a monotonic counter, so a label is never reused for
-    /// the lifetime of the process, even across concurrent callers.
+    /// Next unique window label; never reused for the process lifetime, even
+    /// across concurrent callers.
     fn next_label(&self) -> String {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         format!("window-{id}")
     }
 
-    /// The window a new one should cascade off: the focused window, else the
-    /// last one built if still open.
-    ///
-    /// Focus is the right anchor for the common paths (New Window, `Cmd/Ctrl+N`,
-    /// the webview's `AppMenu`). The tray and Dock menus are the case focus
-    /// can't answer — both can be clicked while another application holds focus —
-    /// so they fall back to the last window built rather than centering on top
-    /// of an existing window. `None` only when no windows are open (the
-    /// session's first).
+    /// The cascade anchor: the focused window, else the last one built (the
+    /// tray/Dock menus can be clicked while another app holds focus). `None`
+    /// only when no windows are open.
     fn anchor_window(&self, app: &AppHandle) -> Option<WebviewWindow> {
         let focused = app
             .webview_windows()
@@ -295,30 +226,14 @@ impl WindowManager {
         Ok(())
     }
 
-    /// Build a webview window pointing at the app's frontend entry point.
+    /// Build a webview window. Per-platform chrome: macOS keeps decorations
+    /// (Overlay title bar, hidden title, repositioned traffic lights —
+    /// `traffic_light_position` requires decorations on); Linux/Windows are
+    /// frameless, Linux additionally transparent. See
+    /// docs/adr/2026-08-09-per-platform-window-chrome.md.
     ///
-    /// The webview's floating sidebar doubles as the window title bar. On macOS
-    /// that means an Overlay title bar (native traffic lights kept, title text
-    /// hidden) with the lights repositioned into the sidebar header; on
-    /// Linux/Windows the window is frameless and the webview draws its own
-    /// controls (`WindowControls`). `traffic_light_position` requires the
-    /// Overlay style with decorations left on, so macOS keeps decorations.
-    ///
-    /// Linux additionally makes the window transparent so the webview's
-    /// `WindowFrame` can paint its own border + shadow into a gutter; Windows
-    /// stays opaque and lets DWM draw the borderless window's native shadow.
-    ///
-    /// On the opaque platforms the window is painted with the app's resolved
-    /// color scheme at creation (see [`background_color_for`]), so its first
-    /// frame is themed without ever being hidden.
-    ///
-    /// The window cascades one step down-right of the window it opens from (see
-    /// [`anchor_window`] and [`cascade_position`]) instead of stacking exactly
-    /// on it. The position is set on every platform: leaving it to the OS
-    /// staggers on macOS (AppKit cascades an unpositioned window) but piles up
-    /// on Linux/Windows.
-    ///
-    /// [`anchor_window`]: WindowManager::anchor_window
+    /// Positioned explicitly on every platform: AppKit auto-cascades an
+    /// unpositioned window, Linux/Windows pile up.
     fn build_window(&self, app: &AppHandle, label: &str) -> Result<WebviewWindow> {
         let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::default())
             .title(WINDOW_TITLE)
@@ -326,14 +241,9 @@ impl WindowManager {
             // Floor the window so the layout never renders below its narrowest design.
             .min_inner_size(600.0, 400.0);
 
-        // Cascade off the window the user is working in, measured on that
-        // window's own monitor. The two are resolved together: an anchor whose
-        // monitor can't be read is no anchor at all, rather than one measured
-        // against some other display. Anything unreadable here (a window
-        // closing as we measure it) degrades to a centered window, never to a
-        // failed build. `Monitor::scale_factor` is a cached field, so reusing
-        // it to convert the anchor's physical position costs no extra hop to
-        // the main thread.
+        // Anchor and its monitor resolve together — an anchor whose monitor
+        // can't be read is no anchor at all. Anything unreadable degrades to a
+        // centered window, never a failed build.
         let anchored = self.anchor_window(app).and_then(|window| {
             let monitor = window.current_monitor().ok().flatten()?;
             let position = window
@@ -349,9 +259,7 @@ impl WindowManager {
             None => (app.primary_monitor().ok().flatten(), None),
         };
 
-        // No monitor to measure against (headless, or a display unplugged
-        // mid-call) — let the OS place the window rather than guess at
-        // coordinates that may be off-screen.
+        // No monitor to measure against — let the OS place the window.
         if let Some(monitor) = monitor {
             let work_area = logical_work_area(&monitor);
             let (x, y) =
@@ -368,42 +276,33 @@ impl WindowManager {
                 .traffic_light_position(tauri::LogicalPosition::new(x, y));
         }
 
-        // Both non-macOS platforms are frameless — the webview's sidebar is the
-        // title bar and draws its own `WindowControls`.
+        // Non-macOS is frameless — the webview draws its own `WindowControls`.
         #[cfg(not(target_os = "macos"))]
         {
             builder = builder.decorations(false);
         }
 
-        // Linux additionally goes transparent so the webview's `WindowFrame` can
-        // paint its own rounded border + outer shadow into a gutter at the window
-        // edge (the OS draws neither for a decoration-less window). Windows stays
-        // opaque: DWM already draws a borderless window's own shadow (and rounds
-        // the corners on Win11), so a second custom one would double-stack.
+        // Linux goes transparent so the webview's `WindowFrame` paints its own
+        // border + shadow; Windows stays opaque (DWM already draws a borderless
+        // window's shadow — a custom one would double-stack).
         #[cfg(target_os = "linux")]
         {
             builder = builder.transparent(true);
         }
 
-        // `host.json` (the persisted host settings, source of truth for the
-        // color-scheme preference) feeds the window's pre-paint state two ways.
-        // A failed config-dir lookup degrades to defaults rather than failing
-        // window creation — worst case is the one-frame flash this prevents.
+        // One `host.json` read feeds both pre-paint paths below. A failed
+        // config-dir lookup degrades to defaults, never a failed build.
         let host_file = host_file::path(app)
             .map(|path| host_file::read(&path))
             .unwrap_or_default();
 
-        // 1. Expose the file to the webview (`window.__KSTACK_HOST__`) before
-        //    any page script runs, so the first-paint inline script in
-        //    `index.html` reads the preference synchronously from the same
-        //    source the native background below is painted from.
+        // 1. Expose the file as `window.__KSTACK_HOST__` before any page
+        //    script runs.
         builder = builder.initialization_script(host_file::init_script(&host_file));
 
-        // 2. On the opaque platforms, paint the native surface with the resolved
-        //    scheme so the window is themed from its very first frame. This also
-        //    clears the webview's opaque white backing (see the module docs), so
-        //    it must be set unconditionally — `system` resolves against the OS
-        //    rather than opting out. Linux is transparent, so its background
+        // 2. Opaque platforms: paint the native surface with the resolved
+        //    scheme. Must be set unconditionally — it also clears the webview's
+        //    white backing (see module docs). Linux is transparent: background
         //    must stay unset.
         #[cfg(not(target_os = "linux"))]
         {
@@ -416,13 +315,12 @@ impl WindowManager {
 
         let window = builder.build()?;
 
-        // Anchor the next cascade step here, for the paths where no window is
-        // focused when it is asked for (the tray's New Window).
+        // Anchor the next cascade step (for paths with no focused window).
         *self.last_built.lock().unwrap_or_else(|p| p.into_inner()) = Some(label.to_string());
 
-        // The `debug-prod` feature compiles the inspector into a release build
-        // so production behavior (e.g. the bundled CSP) can be examined. Never
-        // enabled in shipped builds — see the feature note in `Cargo.toml`.
+        // `debug-prod` compiles the inspector into a release build for
+        // examining production behavior; never enabled in shipped builds — see
+        // `Cargo.toml`.
         #[cfg(feature = "debug-prod")]
         window.open_devtools();
 

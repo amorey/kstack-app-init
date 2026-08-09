@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// A centered, readable-width content column that grows to fill its parent. Opt
-// in per page for the narrow chat/dashboard reading layout; a full-bleed page
-// (or a chrome-less window's own layout) simply doesn't use it. The window frame
-// itself — background, height, title-bar band reservation — lives in the layout
-// (`src/layouts/app-layout.tsx`), not here.
+// Opt-in per page: a full-bleed page simply doesn't use it. Window-frame
+// concerns (background, height, title-bar band) belong to
+// `src/layouts/app-layout.tsx`, not here.
 import type { ReactNode } from 'react';
 
 export function CenteredColumn({ children }: { children?: ReactNode }) {

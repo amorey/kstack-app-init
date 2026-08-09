@@ -12,21 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The render site for the app's overlay dialogs. Mounted once in AppLayout, above
-// the sidebar, so an open dialog survives the sidebar card unmounting when the
-// window auto-collapses below the md breakpoint. Only the *mounted* dialog is
-// rendered — each dialog's hooks and subscriptions cost nothing until opened. The
-// mount lifecycle (open, linger for the exit animation, then unmount) lives in
-// `DialogProvider`; this host just renders whatever it says is mounted. Register a
-// dialog by adding a line to `DIALOGS` (and a `DialogId` variant).
+// Render site for the app's overlay dialogs. Must stay mounted above the sidebar
+// in AppLayout so an open dialog survives the sidebar card unmounting on
+// auto-collapse. Only the mounted dialog renders, so a closed dialog's hooks and
+// subscriptions cost nothing; the mount lifecycle lives in `DialogProvider`.
+// Register a dialog by adding a `DIALOGS` line (and a `DialogId` variant).
 import type { ComponentType } from 'react';
 
 import { ClusterSyncPanel } from '@/components/widgets/cluster-sync-panel';
 import { SettingsDialog } from '@/components/widgets/settings-dialog';
 import { useDialog, type AppDialogProps, type DialogId } from '@/lib/dialog';
 
-// Each overlay dialog is a controlled component taking `AppDialogProps`. Partial
-// because a `DialogId` may be reserved before its dialog is built.
+// Partial: a `DialogId` may be reserved before its dialog is built.
 const DIALOGS: Partial<Record<DialogId, ComponentType<AppDialogProps>>> = {
   clusters: ClusterSyncPanel,
   settings: SettingsDialog,
@@ -39,8 +36,8 @@ export function AppDialogs() {
 
   return (
     <Mounted
-      // Open while this is the active dialog; false once dismissed, which drives
-      // the exit animation before the provider unmounts it (via `notifyClosed`).
+      // False once dismissed, driving the exit animation before the provider
+      // unmounts it (via `notifyClosed`).
       open={activeDialog === mountedDialog}
       onOpenChange={(open) => {
         if (!open) closeDialog();

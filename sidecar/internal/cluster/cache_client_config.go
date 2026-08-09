@@ -24,38 +24,25 @@ import (
 )
 
 const (
-	// cacheClientQPS/cacheClientBurst bound the request rate of ONE cache's own traffic —
-	// its per-kind syncs and its discovery pass — across every client it builds.
-	//
-	// client-go defaults to 5 QPS / 10 burst when a config leaves QPS at zero, which every
-	// kubeconfig-derived config does. That default is sized for a controller watching a
-	// handful of kinds, and it throttles this cache's shape of work badly: a cold start
-	// issues at least one LIST per discovered kind — a hundred or more, each paginated into
-	// further requests — behind one discovery walk, so the limiter, not the API server,
-	// becomes what a first sync waits on (and client-go logs a "Waited for …" warning per
-	// throttled request while it happens).
-	//
-	// The ceiling sits deliberately ABOVE cacheListConcurrency, so the LIST semaphore is
-	// what shapes the cold-start burst and this only catches a genuine runaway. The two
-	// live in one file for that reason — raise them together or that stops being true.
+	// cacheClientQPS/cacheClientBurst bound ONE cache's total request rate (per-kind
+	// syncs + discovery). client-go's zero-QPS default of 5/10 would throttle a cold
+	// start's one-LIST-per-kind burst. Deliberately ABOVE cacheListConcurrency so the
+	// LIST semaphore shapes the burst and this only catches a runaway — raise them
+	// together or that stops being true.
 	cacheClientQPS   = 50
 	cacheClientBurst = 100
 
-	// cacheListConcurrency bounds how many of ONE cache's kinds may be inside their LIST
-	// phase at once (kubesync.ListLimiter). It is a different axis from gvrSyncConcurrency,
-	// which bounds reconciles: a reconcile only starts a worker and returns, so after the
-	// startup pass every kind's worker runs concurrently and all of them go straight to a
-	// full LIST on a cold cache. Without this bound the peak page-decoding memory and the
-	// API-server burst scale with the kind count.
+	// cacheListConcurrency bounds how many of ONE cache's kinds may be in their LIST
+	// phase at once (kubesync.ListLimiter). A different axis from gvrSyncConcurrency
+	// (which bounds reconciles; a reconcile only starts a worker): without this, peak
+	// page-decoding memory and API-server burst scale with the kind count.
 	cacheListConcurrency = 16
 )
 
-// cacheClientPolicy is the budget one cache's traffic shares: the token bucket every
-// client it builds draws from, and the LIST-phase semaphore its workers contend for.
-//
-// Both are per cache rather than process-wide so one unresponsive cluster can't starve
-// another's, and both are shared across that cache's ~150 kind workers plus its discovery
-// pass — which is the only reason either is a bound at all.
+// cacheClientPolicy is one cache's shared traffic budget: the token bucket every client
+// it builds draws from, and the LIST-phase semaphore its workers contend for. Per cache
+// (not process-wide) so one unresponsive cluster can't starve another; shared across the
+// cache's ~150 kind workers plus discovery — the only reason either is a bound at all.
 type cacheClientPolicy struct {
 	rateLimiter flowcontrol.RateLimiter
 	listLimiter kubesync.ListLimiter
@@ -71,26 +58,13 @@ func newCacheClientPolicy() *cacheClientPolicy {
 // config returns the rest config a client for this cache is built from: the cluster's
 // credentials, this cache's shared rate limiter, and the idle-read watchdog.
 //
-// It sets RateLimiter rather than QPS/Burst, and that distinction is the whole point:
-// client-go builds a FRESH token bucket per REST client whenever RateLimiter is nil, so
-// QPS fields would hand each of a cache's clients — two per kind worker (dynamic +
-// metadata), plus discovery, so ~300 of them — its own private budget and bound nothing in
-// aggregate. Handing every client the same limiter is what makes this a per-cache ceiling.
-//
-// It COPIES rather than mutating, because the config it is handed is the
-// ConnectionManager's, shared with the connection controller's probe/health path and its
-// liveness sentinel — a few requests per cluster per cadence plus one long-lived watch,
-// which has no reason to draw on the sync's budget. The copy costs nothing extra: client-go
-// keys its transport cache on the TLS/auth fields, which the copy leaves untouched, so the
-// copy itself never splits a pool. Neither does the Wrap below — wrapping happens around
-// whatever transport the cache returned.
-//
-// Pool sharing is NOT universal, though, and it is a property of the kubeconfig rather than
-// of anything here: client-go cannot compare proxy funcs, so a config carrying a Proxy (a
-// context with proxy-url) is uncacheable and every client built from it gets its own
-// transport. For such a cluster a cache's ~300 clients mean ~300 pools. The rate limiter
-// above still bounds the REQUEST rate, which is what protects the API server; what is lost
-// is connection reuse.
+// Sets RateLimiter, NOT QPS/Burst: nil RateLimiter gives each of a cache's ~300 REST
+// clients its own token bucket, bounding nothing in aggregate. COPIES rather than
+// mutating — the input is the ConnectionManager's config, shared with the probe path and
+// sentinel, which must not draw on the sync budget; the copy leaves the TLS/auth fields
+// client-go keys its transport cache on untouched, so it never splits a pool (a
+// proxy-carrying kubeconfig is uncacheable regardless — its clients get private
+// transports either way). See docs/adr/2026-08-09-connection-probing.md.
 func (p *cacheClientPolicy) config(cfg *rest.Config) *rest.Config {
 	out := rest.CopyConfig(cfg)
 	out.RateLimiter = p.rateLimiter
@@ -102,15 +76,12 @@ func (p *cacheClientPolicy) config(cfg *rest.Config) *rest.Config {
 	return out
 }
 
-// cacheClientPolicies hands out one policy per cache, shared by every controller that
-// talks to that cache's cluster on its behalf — the per-kind sync workers and the
-// discovery pass. It lives on the controllerRuntime because those are two different
-// controllers that must draw on ONE budget.
+// cacheClientPolicies hands out one policy per cache. Lives on the controllerRuntime
+// because sync workers and discovery are two controllers that must draw on ONE budget.
 //
-// Entries are never reclaimed. They are bounded by the caches this process has opened
-// (tens), each holds two small structs, and dropping one while a worker was about to take
-// its slot would hand that worker a private budget — the same reasoning as the core
-// controller's per-cluster lock map.
+// Entries are never reclaimed: bounded (tens of caches, two small structs each), and
+// dropping one under a worker about to take its slot would hand it a private budget —
+// same reasoning as the core controller's per-cluster lock map.
 type cacheClientPolicies struct {
 	mu      sync.Mutex
 	byCache map[int64]*cacheClientPolicy

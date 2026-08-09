@@ -1,14 +1,10 @@
-// Package cloud is the composition + lifecycle owner for the cloud-synced
-// settings feature (prefs, mutationqueue, api, prefsync). It mirrors
-// internal/cluster's Service shape — New wires the pieces, Start launches the
-// background sync, Close tears it down — and degrades gracefully when the host
-// hasn't configured a cloud URL / data dir (then it's a no-op with no settings
-// store).
+// Package cloud is the composition + lifecycle owner for cloud-synced settings (prefs,
+// mutationqueue, api, prefsync): New wires the pieces, Start launches the background
+// sync. Degrades to a no-op without a cloud URL / data dir.
 //
-// It depends on the local-first internal/auth subsystem (not the reverse): it
-// authenticates the api client from auth's oauth2.TokenSource, and wakes its
-// sync engine by observing auth's session-change Events. auth knows nothing
-// about settings sync.
+// **cloud depends on auth, never the reverse**: it authenticates the api client from
+// auth's TokenSource and wakes its engine off auth's session stream.
+// See docs/adr/2026-08-09-local-first-auth-settings.md.
 package cloud
 
 import (
@@ -23,21 +19,18 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
-// option is an unexported build seam for New. Because the type is unexported,
-// only in-package (test) code can pass one — production callers pass dataDir +
-// cloudURL alone and cannot inject a fake upstream. This mirrors the auth
-// subsystem's white-box option pattern.
+// option is an unexported build seam for New, so only in-package tests can pass one —
+// production callers can't inject a fake upstream. Same pattern as internal/auth.
 type option func(*buildOpts)
 
 // buildOpts collects the seam overrides applied before New resolves the upstream.
 type buildOpts struct {
-	// upstream overrides the api-backed sync upstream with a fake; when set it
-	// also bypasses the CloudURL + token-source requirement.
+	// upstream replaces the api-backed upstream, also bypassing the cloudURL +
+	// token-source requirement.
 	upstream prefsync.Upstream
 }
 
-// withUpstream injects a fake prefsync.Upstream instead of the api client, so a
-// white-box test can drive the engine without a real cloud endpoint or auth.
+// withUpstream drives the engine without a real cloud endpoint or auth.
 func withUpstream(up prefsync.Upstream) option {
 	return func(o *buildOpts) { o.upstream = up }
 }
@@ -52,19 +45,14 @@ type Service struct {
 	started bool
 }
 
-// New builds the cloud settings service over the given auth subsystem. dataDir is
-// the per-machine app data dir for the settings file + write queue; cloudURL is the
-// kstack cloud API base URL (e.g. https://api.kstack.sh); pokeSvc is the shared
-// resync broadcaster (nil disables external wake signals). It degrades (no engine,
-// no prefs store) unless dataDir is set and an upstream is available — the api
-// client needs cloudURL plus an oauth2.TokenSource from a configured auth service.
+// New builds the cloud settings service. dataDir holds the settings file + write queue;
+// cloudURL is the API base; pokeSvc is the shared resync broadcaster (nil disables
+// external wakes). Degrades unless dataDir is set and an upstream is available.
 func New(dataDir, cloudURL string, authSvc auth.Service, pokeSvc *poke.Service) (*Service, error) {
 	return newWithOptions(dataDir, cloudURL, authSvc, pokeSvc)
 }
 
-// newWithOptions is the build entry point that also accepts the unexported test
-// seams. New is the production wrapper (no options); in-package white-box tests
-// call this directly to inject a fake upstream.
+// newWithOptions is New plus the unexported test seams.
 func newWithOptions(dataDir, cloudURL string, authSvc auth.Service, pokeSvc *poke.Service, opts ...option) (*Service, error) {
 	var o buildOpts
 	for _, opt := range opts {
@@ -79,11 +67,10 @@ func newWithOptions(dataDir, cloudURL string, authSvc auth.Service, pokeSvc *pok
 
 	up := o.upstream
 	if up == nil {
-		// A degraded auth service (no credentials store) exposes a nil token
-		// source; without one there's nothing to authenticate the api client with,
-		// so the settings subsystem stays degraded.
+		// A degraded auth service exposes a nil token source, leaving nothing to
+		// authenticate the api client with.
 		if cloudURL == "" || authSvc == nil || authSvc.TokenSource(context.Background()) == nil {
-			return s, nil // no upstream available ⇒ degraded
+			return s, nil
 		}
 		up = apiUpstream{c: api.New(cloudURL, authSvc.TokenSource)}
 	}
@@ -105,12 +92,10 @@ func newWithOptions(dataDir, cloudURL string, authSvc auth.Service, pokeSvc *pok
 // Prefs returns the settings store, or nil when the service is degraded.
 func (s *Service) Prefs() *prefs.Store { return s.prefs }
 
-// Start launches the settings-sync engine bound to a context derived from ctx,
-// plus a goroutine that wakes the engine on every auth session change. ctx scopes
-// initialization only; the returned stop func cancels both goroutines and blocks
-// until they unwind, honoring its own drain-deadline context. It returns a no-op
-// stop when degraded or already started — a second call must not leak a second
-// engine goroutine.
+// Start launches the sync engine plus a goroutine waking it on auth session changes. The
+// returned stop cancels both and blocks until they unwind, bounded by its own context.
+// Returns a no-op stop when degraded or already started, so a second call can't leak a
+// second engine goroutine.
 func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
 	noop := func(context.Context) error { return nil }
 	if s.engine == nil || s.started {
@@ -120,16 +105,9 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 
-	// Wake the engine on every auth sign-in / sign-out: cloud (the dependent)
-	// observes auth's session state stream, and auth knows nothing of the engine. A
-	// sign-in pokes the idle engine so it authenticates and syncs now instead of
-	// waiting out its backoff; a sign-out pokes it to cancel the in-flight
-	// authenticated watch (which then reconnects as signed-out and idles).
-	//
-	// The stream is latest-value session State (current-on-subscribe). We track only
-	// the Authenticated bit and poke when it flips: the first receive seeds the
-	// baseline without poking, and a routine token refresh leaves Authenticated
-	// unchanged, so it doesn't wake the engine.
+	// Wake the engine on sign-in/sign-out: cloud observes auth's stream, never the
+	// reverse. Only the Authenticated BIT is tracked — the first receive seeds the
+	// baseline without poking, and a routine token refresh is a non-event.
 	var pokeDone chan struct{}
 	if s.auth != nil {
 		states, cancelSub := s.auth.Subscribe()
@@ -164,8 +142,6 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 		s.engine.Run(runCtx)
 	}()
 
-	// stop cancels the engine (and the session-poke goroutine) and waits for both
-	// to unwind, bounded by the drain-deadline ctx.
 	stop := func(ctx context.Context) error {
 		cancel()
 		for _, ch := range []chan struct{}{done, pokeDone} {

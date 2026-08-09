@@ -12,19 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Reads the OS's current color scheme, to resolve the `system` color-scheme
-//! preference (see [`crate::host_file::ColorSchemePreference`]) into a concrete
-//! light/dark background *before* the first window exists — Tauri only exposes a
-//! theme on an already-built window. Compiled only on the opaque platforms (Linux
-//! windows are transparent). Every failure path degrades to light: a wrong answer
-//! costs one frame of the wrong — but never white — background.
+//! Reads the OS color scheme to resolve the `system` preference *before* the
+//! first window exists — Tauri only exposes a theme on an already-built window.
+//! Opaque platforms only (Linux windows are transparent). Every failure path
+//! must degrade to light: a wrong answer costs one frame of the wrong — but
+//! never white — background.
 
 /// Whether the OS is currently in dark mode.
 ///
-/// The global-domain `AppleInterfaceStyle` default is absent in light mode and
-/// `"Dark"` in dark mode. Read via `NSUserDefaults` rather than `NSAppearance` so
-/// it works before `NSApp` exists (when the first window is built). A `None` from
-/// `stringForKey` — key absent, domain unreadable, or non-string — reads as light.
+/// `AppleInterfaceStyle` is absent in light mode, `"Dark"` in dark. Read via
+/// `NSUserDefaults` (not `NSAppearance`) so it works before `NSApp` exists.
+/// Any `None` reads as light.
 #[cfg(target_os = "macos")]
 pub fn prefers_dark() -> bool {
     use objc2_foundation::{NSString, NSUserDefaults};

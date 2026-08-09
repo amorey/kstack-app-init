@@ -34,63 +34,47 @@ import (
 	toolswatch "k8s.io/client-go/tools/watch"
 )
 
-// The driver is one collection's sync state machine. Unlike a client-go Reflector —
-// which can't be seeded with a stored resourceVersion and so re-lists every body on
-// every wake — it RESUMES from the persisted cookie via a RetryWatcher: on a wake the
-// server usually still holds that RV, so only deltas apply, no LIST. On a 410 (RV too
-// old) or a cold cache it falls back to a paginated full LIST that prunes.
+// The driver is one collection's sync state machine: it resumes from the persisted
+// cookie via a RetryWatcher (no LIST on a warm wake, unlike a client-go Reflector) and
+// falls back to a paginated, pruning full LIST on a 410 or a cold cache.
 //
-// The shape is watch-for-latency, poll-for-correctness: the watch path makes the steady
-// state cheap and is allowed to be lossy, while two pull-based backstops guarantee
-// correctness — the periodic resync (a watch alive that long ends itself and re-lists)
-// and the re-list any watch failure falls back to. Known edge cases (a dropped delta, a
-// stale cookie) are permitted to slip through and self-heal within one interval rather
-// than being closed by exact, stateful edge-handling.
+// Shape: watch-for-latency, poll-for-correctness — the lossy watch path is backstopped
+// by the periodic resync and the re-list on failure; edge cases self-heal within one
+// interval. See docs/adr/2026-08-09-kubesync-watch-poll.md.
 //
 // RetryWatcher owns the watch-phase reconnect/backoff; the explicit backoff here guards
 // the LIST.
 
 const (
-	// listPageSize bounds one LIST page, so a whole collection never sits in
-	// memory at once — it bounds the metadata pages of a diff resync too. maxListRestarts
-	// bounds how many times an expiring continue token may restart the paginated pass
-	// before it's declared un-paginatable.
+	// listPageSize bounds one LIST (or diff-metadata) page so a whole collection never
+	// sits in memory; maxListRestarts bounds continue-token-expiry restarts before the
+	// pass is declared un-paginatable.
 	listPageSize    = 500
 	maxListRestarts = 3
 
-	// defaultDiffThreshold caps how many objects the metadata diff will fetch one at a
-	// time before abandoning it for one paginated LIST. A GET is a round trip and a LIST
-	// page carries listPageSize objects, so past a few hundred changes the diff is
-	// strictly slower — and the crossover is where a "diff" stops describing the work
-	// anyway.
+	// defaultDiffThreshold caps how many objects the metadata diff GETs one-by-one before
+	// falling back to one paginated LIST — past a few hundred, N round trips lose to a LIST.
 	defaultDiffThreshold = 200
 
-	// defaultResumeGrace is how long a watch seeded from the saved cookie waits to prove
-	// usable before the driver reports a clean resume. A stale-cookie 410 arrives within
-	// a round trip, so this need only clear network/tail latency; it's the one-time delay
-	// a warm resume's Syncing→Watching flip pays.
+	// defaultResumeGrace is how long a cookie-seeded watch must run 410-free before the
+	// driver reports a clean resume; a stale-cookie 410 arrives within a round trip.
 	defaultResumeGrace = 2 * time.Second
 
-	// defaultEstablishTimeout bounds how long one watch phase waits for the watch to
-	// actually CONNECT. RetryWatcher retries retriable errors (5xx, EOF, timeout)
-	// internally without ever closing its ResultChan, and a hung watch request (headers
-	// never arrive) never returns — so without this bound a watch that can't connect
-	// would block the phase forever: never returning, never spending the error budget,
-	// and leaving the worker wedged in Syncing. Generous, so a brief API-server blip
-	// isn't mistaken for a broken watch.
+	// defaultEstablishTimeout bounds the wait for a watch to CONNECT. RetryWatcher never
+	// closes its ResultChan on retriable errors and a hung request never returns, so
+	// without this a never-connecting watch wedges the phase in Syncing forever, spending
+	// no error budget.
 	defaultEstablishTimeout = 30 * time.Second
 
-	// defaultStuckThreshold is how many consecutive sync failures mark the worker stuck —
-	// enough to ride out a transient blip, few enough that a genuinely broken sync
-	// (forbidden, un-paginatable) surfaces to the user in seconds instead of sitting
-	// silently in Syncing. defaultStuckRetryInterval is the slow cadence it then drops to,
-	// so a permanently-broken sync stops hammering the API server every backoff step.
+	// defaultStuckThreshold: consecutive sync failures before the worker is stuck —
+	// riding out a blip, but surfacing a broken sync in seconds. Once stuck, retries drop
+	// to defaultStuckRetryInterval so a permanently-broken sync stops hammering the server.
 	defaultStuckThreshold     = 5
 	defaultStuckRetryInterval = 3 * time.Minute
 
 	// defaultResyncPeriod is the pull-based backstop: a watch alive this long ends itself
-	// so the driver re-lists, reconciling drift the best-effort watch silently missed.
-	// Jittered per cache (see jitterFraction) so many clusters don't re-list in lockstep.
+	// so the driver re-lists, reconciling drift the watch missed. Jittered per cache
+	// (see jitterFraction) so caches don't re-list in lockstep.
 	defaultResyncPeriod = 30 * time.Minute
 
 	backoffInit = 1 * time.Second
@@ -102,14 +86,13 @@ const (
 var errExpired = errors.New("kubesync: watch resourceVersion expired")
 
 // errWatchNotEstablished means the watch phase gave up waiting for the watch to connect
-// (see defaultEstablishTimeout). Run charges it against the error budget like any other
-// watch failure, so a never-connecting watch surfaces as stuck instead of wedging Syncing.
+// (defaultEstablishTimeout). Charged against the error budget so a never-connecting
+// watch surfaces as stuck instead of wedging Syncing.
 var errWatchNotEstablished = errors.New("kubesync: watch failed to establish within timeout")
 
 // errListRestartBudget means the paginated LIST couldn't finish inside the continue
-// token's lifetime. We return it rather than falling back to a single unpaginated LIST:
-// that would load every item body into memory at once — the exact blow-up pagination
-// exists to avoid. The error budget then surfaces the sync as stuck.
+// token's lifetime. Returned rather than falling back to one unpaginated LIST — that
+// would load every body at once, the exact blow-up pagination avoids.
 var errListRestartBudget = errors.New("kubesync: continue token kept expiring; too many items to paginate within its lifetime")
 
 // realTimer is the production timer seam: a time.Timer's channel plus its Stop.
@@ -123,25 +106,22 @@ type driver struct {
 	src   Source
 	store Store
 
-	// onCaughtUp fires when the watch first proves live, reporting whether this pass fell
-	// back to a full LIST and how many items it pulled. The worker turns it into the
-	// Syncing→Watching flip. Guarded to once per catch-up episode by sawWatch, which
-	// recordFailure re-arms on a stuck transition so a recovery re-reports.
+	// onCaughtUp fires when the watch first proves live (the Syncing→Watching flip),
+	// reporting whether the pass re-listed and how many items it pulled. Once per
+	// episode via sawWatch, which recordFailure re-arms so a recovery re-reports.
 	onCaughtUp func(resynced bool, items int)
 	sawWatch   bool
 	// onStuck fires on the exact error-budget threshold crossing (once per stuck
-	// episode), so the worker can surface a sync that can't get going without waiting
-	// for the liveness monitor's next tick.
+	// episode), so a stuck sync surfaces without waiting for the monitor's next tick.
 	onStuck func(cause Cause)
 
-	// stuck is set when the error budget is spent and cleared when the watch next proves
-	// usable — NOT on a bare connect, so an open-then-error stream can't clear it. Read
-	// by the worker's liveness monitor from another goroutine, hence atomic; the
-	// consecutive-failure count that trips it is a Run-goroutine local.
+	// stuck is set when the error budget is spent, cleared when the watch next proves
+	// usable — NOT on a bare connect, so an open-then-error stream can't clear it.
+	// Atomic: read by the monitor goroutine; the failure count that trips it is
+	// Run-goroutine local.
 	stuck atomic.Bool
-	// failCause records the most recent failure's cause so a stuck driver can report WHY.
-	// Written on every recordFailure, so by the time stuck flips it holds the failure that
-	// spent the budget.
+	// failCause is the most recent failure's cause; by the time stuck flips it holds the
+	// failure that spent the budget.
 	failCause atomic.Value // Cause
 
 	seedRV             string

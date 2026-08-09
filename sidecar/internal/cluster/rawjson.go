@@ -20,18 +20,13 @@ import (
 	"io"
 )
 
-// RawJSON is the Go binding for the GraphQL `JSON` scalar — a full JSON value that
-// crosses the wire verbatim. Its underlying type is a string holding already-
-// serialized JSON, deliberately: it stays comparable (so a projection carrying a
-// RawJSON body still satisfies cacheDeltaWatch's `T comparable` diff, which is what
-// makes an in-place object edit surface as Modified), while MarshalGQL writes the
-// stored bytes straight to the response. So the sidecar forwards a cached object's
-// decompressed raw_json as-is instead of re-marshaling a parsed map — the behavior
-// is explicit and byte-preserving. The empty value is the absent body → null.
+// RawJSON binds the GraphQL `JSON` scalar: already-serialized JSON in a string, written
+// verbatim by MarshalGQL. A string (not a map) so it stays comparable — cacheDeltaWatch's
+// `T comparable` diff is what makes an in-place object edit surface as Modified. Empty
+// value = absent body → null.
 type RawJSON string
 
-// MarshalGQL writes the stored JSON bytes verbatim (the value is already serialized
-// JSON), or `null` for the empty/absent body.
+// MarshalGQL writes the stored JSON bytes verbatim, or `null` for the absent body.
 func (r RawJSON) MarshalGQL(w io.Writer) {
 	if r == "" {
 		io.WriteString(w, "null")
@@ -40,10 +35,9 @@ func (r RawJSON) MarshalGQL(w io.Writer) {
 	io.WriteString(w, string(r))
 }
 
-// UnmarshalGQL re-serializes a decoded GraphQL/JSON value back to its JSON bytes so
-// RawJSON also works as an input scalar. A nil value is the absent body (empty
-// RawJSON). RawJSON is output-only in the current schema, so this exists to satisfy
-// gqlgen's scalar contract (a scalar's model must be both Marshaler and Unmarshaler).
+// UnmarshalGQL re-serializes a decoded value back to JSON bytes (nil → absent body).
+// The schema uses RawJSON as output only; this exists to satisfy gqlgen's scalar
+// contract (Marshaler and Unmarshaler both required).
 func (r *RawJSON) UnmarshalGQL(v any) error {
 	if v == nil {
 		*r = ""

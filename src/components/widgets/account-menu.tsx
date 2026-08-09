@@ -12,13 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The account affordance at the foot of the sidebar: a full-width button reading
-// "Guest" when signed out or the user's identity when signed in, opening a menu
-// that rises above it. A session is an add-on, not a gate — the app loads
-// regardless and the user can sign in/out at will. The menu also hosts entry
-// points to the cluster-sync panel and Settings; it only requests them open
-// through `useDialog`, and the dialogs render above the sidebar (see `AppDialogs`)
-// so they outlive this menu when the sidebar card unmounts on auto-collapse.
+// Account affordance at the foot of the sidebar. A session is an add-on, not a
+// gate — the app loads signed out. Dialogs are only *requested* here via
+// `useDialog`; they render in `AppDialogs` so they outlive the sidebar card
+// unmounting on auto-collapse.
 import { ChevronUp, Database, LogOut, Settings, User } from 'lucide-react';
 
 import { Avatar, AvatarFallback } from '@kubetail/ui/elements/avatar';
@@ -34,8 +31,7 @@ import { useAuthState } from '@/lib/auth';
 import { useDialog } from '@/lib/dialog';
 
 function initials(s: string): string {
-  // Two letters max. Splits on whitespace and common separators so an email like
-  // `andres.morey@…` yields `AM`, not `AN`.
+  // Split on separators too, so `andres.morey@…` yields `AM`, not `AN`.
   const trimmed = s.trim();
   if (!trimmed) return '?';
   const parts = trimmed.split(/[\s._-]+/).filter(Boolean);
@@ -46,11 +42,9 @@ function initials(s: string): string {
 export function AccountMenu() {
   const { authState, loading, login, logout } = useAuthState();
   const { authenticated, identity } = authState;
-  // Identity.email/name are non-null strings (empty = absent), so fall back with
-  // `||` rather than `??`.
+  // email/name are non-null strings (empty = absent), so `||`, not `??`.
   const email = identity?.email || null;
   const name = identity?.name || null;
-  // The trigger's accessible label: the signed-in identity, or "Guest".
   const account = authenticated ? email || name || 'Signed in' : 'Guest';
 
   const { openDialog } = useDialog();
@@ -78,12 +72,9 @@ export function AccountMenu() {
         </span>
         <ChevronUp className="size-4 shrink-0 text-muted-foreground" aria-hidden />
       </DropdownMenuTrigger>
-      {/* Rises above the button; min-width keeps it from collapsing narrower than
-            the trigger. */}
       <DropdownMenuContent align="start" side="top" sideOffset={6} className="min-w-56">
         {!authenticated && (
           <>
-            {/* A prominent primary call-to-action. */}
             <DropdownMenuItem
               disabled={loading}
               onClick={() => login().catch(() => {})}

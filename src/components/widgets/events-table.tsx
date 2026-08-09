@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The dashboard's raw events view: a simple table of the active cluster's cached
-// Kubernetes Events (newest first), fed by `useClusterDataEvents`. Filtering comes later;
-// for now every cached event is shown. The four watch phases render distinctly —
-// curated-only fallback (no active cache), connecting spinner, empty snapshot, and the
-// live table — mirroring how a whole-screen watch is expected to gate on `active`/`phase`.
+// The dashboard's cached Kubernetes Events table (newest first), fed by
+// `useClusterDataEvents`. Unfiltered for now. Gates on `active`/`phase` — the
+// pattern every whole-screen watch view follows.
+// See docs/adr/2026-08-09-delta-watch-protocol.md
 import ReactTimeAgo from 'react-timeago';
 
 import { Spinner } from '@kubetail/ui/elements/spinner';
@@ -25,16 +24,15 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { useClusterDataEvents } from '@/lib/cluster-data-events';
 import type { ClusterDataEvent } from '@/lib/cluster-data-events';
 
-// The involved object as "Kind namespace/name" (kubectl-style), tolerating any part
-// being absent (a cluster-scoped or name-only reference).
+// kubectl-style "Kind namespace/name"; any part may be absent (cluster-scoped or
+// name-only reference).
 function involvedRef(e: ClusterDataEvent): string {
   const path = e.involvedNamespace ? `${e.involvedNamespace}/${e.involvedName}` : e.involvedName;
   return [e.involvedKind, path].filter(Boolean).join(' ');
 }
 
-// A severity pill. `type` is an open Kubernetes string (usually Normal/Warning, but a
-// cluster may omit it or supply a custom value): Warning stands out amber, anything else
-// — including an empty type, shown as "Unknown" — stays muted.
+// `type` is an open Kubernetes string — a cluster may omit it or supply a custom
+// value, so everything but Warning stays muted (empty renders "Unknown").
 function TypeBadge({ type }: { type: ClusterDataEvent['type'] }) {
   const warning = type === 'Warning';
   return (
@@ -51,8 +49,8 @@ function TypeBadge({ type }: { type: ClusterDataEvent['type'] }) {
 export function EventsTable() {
   const { events, active, phase } = useClusterDataEvents();
 
-  // No active cache: an unsynced / sync-paused cluster streams nothing. Say so rather
-  // than showing an eternal spinner (which would read as "connecting" forever).
+  // No active cache: an unsynced/paused cluster streams nothing — say so rather
+  // than spin forever.
   if (!active) {
     return (
       <p className="text-sm text-muted-foreground">
@@ -61,8 +59,7 @@ export function EventsTable() {
     );
   }
 
-  // First frame not yet in from this connection: distinguish connecting (spinner) from a
-  // genuinely empty snapshot (below).
+  // Distinct from a genuinely empty snapshot (below).
   if (phase === 'connecting') {
     return (
       <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -91,7 +88,7 @@ export function EventsTable() {
         </TableHeader>
         <TableBody>
           {events.map((e) => {
-            // lastSeen is null when the source Event carried no timestamp → render "—".
+            // lastSeen is null when the source Event carried no timestamp.
             const lastSeenMs = e.lastSeen ? Date.parse(e.lastSeen) : NaN;
             const ref = involvedRef(e);
             return (

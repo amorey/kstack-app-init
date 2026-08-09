@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Host-side driver that fires the sidecar's `Poke` on OS wake-from-sleep and
-//! network-return, so long-lived connections resync promptly instead of waiting
-//! on the sidecar's ~30s wall-clock backstop.
+//! Fires the sidecar's `Poke` on OS wake-from-sleep and network-return, so
+//! long-lived connections resync ahead of the sidecar's ~30s wall-clock
+//! backstop. See docs/adr/2026-08-09-poke-resync-fanout.md.
 //!
-//! - [`core`] is the platform-agnostic, unit-tested heart: edge detection +
-//!   trailing-edge debounce ([`core::classify`], [`core::run_coalescer`]).
-//! - `supervisor` wires it to Tauri (channel, sources, coalescer, poke).
-//! - `macos` / `windows` / `linux` are the `#[cfg]`-gated native sources that
-//!   translate OS callbacks into [`core::RawEvent`]s.
+//! [`core`] is the platform-agnostic, unit-tested heart (edge detection +
+//! debounce); `supervisor` wires it to Tauri; `macos`/`windows`/`linux` are the
+//! `#[cfg]`-gated native sources emitting [`core::RawEvent`]s.
 
 mod core;
 mod supervisor;
@@ -42,8 +40,8 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux as platform;
 
-// Other targets (e.g. the BSDs) get no native sources — the coalescer never
-// fires and the sidecar's wall-clock detector remains the backstop.
+// Other targets get no native sources — the sidecar's wall-clock detector is
+// the backstop.
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod platform {
     use tauri::AppHandle;

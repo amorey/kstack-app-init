@@ -12,21 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! gRPC client the host uses for the sidecar's host-internal control channel
-//! (today: the auth-state watch + login/logout that drives the tray's account
-//! section, and the resync poke).
-//!
-//! gRPC needs HTTP/2; GraphQL stays HTTP/1.1. Both share the one socket via
-//! **h2c** — the sidecar's `NewH2CHandler` routes HTTP/2 `application/grpc` to
-//! its gRPC server and everything else to GraphQL. tonic dials our cross-platform
-//! [`ipc::Stream`] (UDS / named pipe, not TCP) through a custom
-//! [`tower::service_fn`] connector, speaking HTTP/2 with prior knowledge (no
-//! TLS/ALPN — the socket is user-restricted). The connector reuses
-//! [`ipc::connect`], inheriting its capped-backoff dial retry.
-//!
-//! A tonic [`Channel`] is cheap to clone and multiplexes many RPCs over one h2
-//! connection, so [`GrpcClient`] holds a lazily-established channel and re-dials
-//! only if it's lost.
+//! gRPC client for the sidecar's host-internal control channel (auth-state
+//! watch + login/logout, resync poke). Shares the one socket with GraphQL via
+//! h2c — tonic dials [`ipc::Stream`] with HTTP/2 prior knowledge (no TLS/ALPN;
+//! the socket is user-restricted) through a `tower::service_fn` connector that
+//! reuses [`ipc::connect`]'s retry. One cached [`Channel`], re-dialed on loss.
+//! See docs/adr/2026-08-09-single-socket-h2c.md.
 
 use hyper_util::rt::TokioIo;
 use tokio::sync::Mutex;
@@ -56,17 +47,15 @@ use auth::{AuthStateWatchRequest, LogoutRequest, StartLoginRequest};
 use poke::poke_service_client::PokeServiceClient;
 use poke::PokeRequest;
 
-/// A server-streamed `AuthStateWatch` response: each item is a full auth-state
-/// snapshot, or a transport error that ends the stream.
+/// Server-streamed `AuthStateWatch`: each item a full snapshot, or a transport
+/// error ending the stream.
 pub type AuthStateStream = tonic::Streaming<AuthState>;
 
-/// Holds the sidecar's gRPC channel, dialing lazily on first use and re-dialing
-/// if the connection was lost (e.g. a sidecar restart). Construct via
-/// [`GrpcClient::new`]; reach the RPCs through [`SidecarService`](super::SidecarService).
+/// Lazily-dialed, cached gRPC channel; re-dials if lost (sidecar restart).
+/// Reach the RPCs through [`SidecarService`](super::SidecarService).
 pub struct GrpcClient {
     endpoint: Endpoint,
-    // `None` until the first successful dial. Guarded so concurrent callers share
-    // one channel instead of each opening their own.
+    // Guarded so concurrent callers share one channel.
     channel: Mutex<Option<Channel>>,
 }
 
@@ -78,8 +67,7 @@ impl GrpcClient {
         }
     }
 
-    /// Returns a cloned, ready channel — reusing the cached one when present,
-    /// otherwise dialing a fresh connection over the IPC socket.
+    /// Cached channel, or a fresh dial over the IPC socket.
     async fn channel(&self) -> Result<Channel> {
         let mut guard = self.channel.lock().await;
         if let Some(ch) = guard.as_ref() {
@@ -90,16 +78,14 @@ impl GrpcClient {
         Ok(ch)
     }
 
-    /// Drops the cached channel so the next call re-dials. Called when an RPC
-    /// fails at the transport level — the h2 connection is likely dead (sidecar
-    /// restart) and a stale `Channel` would keep failing.
+    /// Drops the cached channel so the next call re-dials — a stale `Channel`
+    /// after a transport failure would keep failing.
     async fn reset(&self) {
         *self.channel.lock().await = None;
     }
 
-    /// Runs the synchronous login setup (loopback bind + browser open) on the
-    /// sidecar. Returns once setup succeeds or fails; the async sign-in tail
-    /// delivers its result via [`Self::watch_auth_state`].
+    /// Runs the sidecar's synchronous login setup (loopback bind + browser
+    /// open); the async sign-in tail reports via [`Self::watch_auth_state`].
     pub async fn start_login(&self) -> Result<()> {
         let mut client = AuthServiceClient::new(self.channel().await?);
         match client.start_login(StartLoginRequest {}).await {
@@ -111,8 +97,7 @@ impl GrpcClient {
         }
     }
 
-    /// Clears local credentials and revokes the refresh token (fire-and-forget
-    /// revocation). Returns once the local teardown is complete.
+    /// Clears local credentials, revokes the refresh token (fire-and-forget).
     pub async fn logout(&self) -> Result<()> {
         let mut client = AuthServiceClient::new(self.channel().await?);
         match client.logout(LogoutRequest {}).await {
@@ -124,11 +109,8 @@ impl GrpcClient {
         }
     }
 
-    /// Best-effort resync nudge (unary RPC): asks the sidecar to broadcast a
-    /// `SourceHost` resync to its in-process subscribers (cluster-sync, settings-
-    /// sync). Driven by the host's wake / network-return supervisor (see
-    /// [`crate::wake`]). On a transport failure the cached channel is reset so the
-    /// next attempt re-dials — mirroring [`Self::logout`].
+    /// Best-effort resync nudge (unary), driven by [`crate::wake`]. See
+    /// docs/adr/2026-08-09-poke-resync-fanout.md.
     pub async fn poke(&self) -> Result<()> {
         let mut client = PokeServiceClient::new(self.channel().await?);
         match client.poke(PokeRequest {}).await {
@@ -140,10 +122,8 @@ impl GrpcClient {
         }
     }
 
-    /// Opens the auth-state watch stream: the current snapshot first (latest-
-    /// value), then a fresh snapshot on every session change. The caller drives
-    /// it with `stream.message().await`; a returned error / `None` ends the
-    /// stream and the cached channel is reset so the next attempt re-dials.
+    /// Opens the auth-state watch stream (current snapshot first, then one per
+    /// session change); an error resets the cached channel.
     pub async fn watch_auth_state(&self) -> Result<AuthStateStream> {
         let mut client = AuthServiceClient::new(self.channel().await?);
         match client.auth_state_watch(AuthStateWatchRequest {}).await {
@@ -156,12 +136,9 @@ impl GrpcClient {
     }
 }
 
-/// Dials the sidecar over its IPC socket and completes the HTTP/2 (h2c)
-/// handshake, returning a multiplexing [`Channel`].
-///
-/// The `http://` origin is a placeholder: tonic needs a syntactically valid
-/// URI to form the `:authority` pseudo-header, but the connector ignores it and
-/// dials the real socket via [`ipc::connect`].
+/// Dials the IPC socket and completes the h2c handshake. The `http://` origin
+/// is a placeholder — tonic needs a valid URI for `:authority`, but the
+/// connector ignores it and dials via [`ipc::connect`].
 async fn connect(endpoint: Endpoint) -> Result<Channel> {
     TonicEndpoint::from_static("http://kstack.local")
         .connect_with_connector(service_fn(move |_: Uri| {
@@ -177,9 +154,8 @@ async fn connect(endpoint: Endpoint) -> Result<Channel> {
         .map_err(|err| AppError::Io(std::io::Error::other(err.to_string())))
 }
 
-/// Maps a gRPC `Status` to the host's `AppError::Io`, matching how the GraphQL
-/// transport surfaces failures across the command boundary. The status code +
-/// message are preserved in the `Io` error's text for diagnostics.
+/// Maps a gRPC `Status` to `AppError::Io` (matching the GraphQL transport's
+/// error shape), preserving code + message in the text.
 fn status_to_err(status: tonic::Status) -> AppError {
     AppError::Io(std::io::Error::other(format!(
         "grpc {}: {}",

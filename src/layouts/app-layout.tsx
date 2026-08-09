@@ -12,17 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The main window's layout: the floating sidebar (Chat/Dashboard nav at the
-// top, account chrome in the footer) plus the routed page beside it. Mounted as
-// a pathless layout route (`src/routes/_app.tsx`) that the chat and dashboard
-// routes nest under, so the shell is rendered once and the page swaps in the
-// inset. Secondary windows (log tail, container exec) will get their own
-// sidebar-less layout alongside this one.
+// The main window's layout: floating sidebar plus the routed page, mounted once by
+// the pathless `_app` route (the page swaps in the inset). Secondary windows get
+// their own sidebar-less layout alongside this one.
 //
-// The `main` frame is this window's page chrome — background, full height, and
-// the top padding that reserves the title-bar band (see `app-sidebar.tsx`) so no
-// page slides content under the window drag strip. Pages emit only their content
-// and opt into a narrow reading width with `CenteredColumn`.
+// The `main` frame owns background, full height, and the top padding that reserves
+// the title-bar band (see `app-sidebar.tsx`) so no page slides under the drag strip.
 import { Outlet, useLocation } from '@tanstack/react-router';
 
 import { AccountMenu } from '@/components/widgets/account-menu';
@@ -35,17 +30,15 @@ import { ConnectionStatus } from '@/lib/connection-status';
 import { DialogProvider } from '@/lib/dialog';
 
 export function AppLayout() {
-  // The resource nav mounts in the sidebar only in dashboard mode. This layout
-  // stays mounted across the chat<->dashboard switch (only the `Outlet` swaps), so
-  // it subscribes to the location via `useLocation` (re-renders on every
-  // navigation) rather than `useMatchRoute` (would read stale until a reload).
+  // Resource nav mounts only in dashboard mode. This layout stays mounted across
+  // the mode switch, so subscribe via `useLocation` (re-renders per navigation) —
+  // `useMatchRoute` would read stale until a reload.
   const pathname = useLocation({ select: (location) => location.pathname });
   const onDashboard = pathname === '/dashboard' || pathname.startsWith('/dashboard/');
 
   return (
-    // The dialogs host lives outside the sidebar so an open dialog survives the
-    // card unmounting when the window auto-collapses below the md breakpoint —
-    // the account menu (in the sidebar footer) only requests opens via context.
+    // Dialogs host lives outside the sidebar so an open dialog survives the card
+    // unmounting below the md breakpoint; the account menu only requests opens.
     <DialogProvider>
       <ConnectionStatus />
       <AppSidebar
@@ -57,9 +50,8 @@ export function AppLayout() {
         }
         footer={<AccountMenu />}
       >
-        {/* The context bar spans the top of the content area (not the sidebar),
-            so the active context is one window-wide choice shared by chat and
-            dashboard, with room for the full context name plus its metadata. */}
+        {/* Context bar spans the content area (not the sidebar): one window-wide
+            choice shared by both modes, with room for the full context name. */}
         <main className="flex min-h-(--app-min-h) flex-col bg-background pt-16">
           <KubeContextBar />
           <Outlet />

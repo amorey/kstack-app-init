@@ -33,78 +33,63 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
-// gvrSyncDrainFinalizer gates one kind's sync object deletion on its worker having
-// stopped. A running worker holds the cache's ClusterDB handle, so without the barrier the
-// cache controller could delete the .db file while a mid-write worker re-materializes it
-// (GC's cascade marks a child for deletion but does not order its teardown). The chain is
-// transitive: the cache waits for its own children to be collected, GC won't collect the
-// discovery anchor while it still owns sync children, and this finalizer is what makes
-// "the sync children are gone" mean "their workers have drained".
+// gvrSyncDrainFinalizer gates a sync object's deletion on its worker having stopped — a
+// running worker holds the cache's ClusterDB handle, and GC's cascade marks children for
+// deletion without ordering their teardown. This is what makes "the sync children are gone"
+// mean "their workers have drained". See docs/adr/2026-08-09-beehive-control-plane.md.
 const gvrSyncDrainFinalizer = "kstack.io/gvrsync-drain"
 
-// ClusterCacheGVRSyncController reconciles ClusterCacheGVRSync objects: it owns the
-// worker that mirrors ONE Kubernetes kind's objects into the cache's shared objects table
-// (plus the owner_refs/labels edges and the kind's catalog entry).
+// ClusterCacheGVRSyncController owns the worker mirroring ONE Kubernetes kind into the
+// cache's shared objects table (plus its edges and catalog entry).
 //
-// It runs one worker per kind the discovery controller found — so a hundred workers per
-// cache is the normal case, Events among them (they differ only in which store their
-// worker writes to; see newSyncStore). Two things follow from that count. The steady state must write nothing (it does: an
-// unchanged condition is suppressed and there is no status to rewrite, so a cache's
-// hundred heartbeats wake nobody), and the per-kind isolation is the point — a CRD whose
-// watch is forbidden reports on its own object and leaves every other kind syncing.
+// One worker per discovered kind, so a hundred per cache is normal — Events included, which
+// differ only in which store their worker writes to (see newSyncStore). Hence two
+// properties: the steady state must write nothing (an unchanged condition is suppressed and
+// there is no status), and per-kind isolation means a forbidden CRD reports on its own
+// object while every other kind keeps syncing.
 //
-// The lifecycle machinery lives in cache_sync_workers.go: the worker registry, the
-// drain-before-forget rule, the out-of-band report guard, and the condition/event
-// vocabulary. What is specific here is the kind identity carried in the spec, and that a
-// deletion must take the kind's cached rows with it.
+// The lifecycle machinery lives in cache_sync_workers.go. Specific here: the kind identity
+// in the spec, and that a deletion takes the kind's cached rows with it.
 type ClusterCacheGVRSyncController struct {
-	// discoveryClient is the extra hop in this kind's owner climb: it hangs off the
-	// discovery anchor, not the cache, so the climb is one hop longer than a direct child's
-	// (this object → its discovery anchor → the cache → the cluster).
+	// The extra hop in this kind's owner climb — it hangs off the discovery anchor, not the
+	// cache (this object → anchor → cache → cluster).
 	discoveryClient beehive.Client[ClusterCacheGVRDiscoverySpec, ClusterCacheGVRDiscoveryStatus]
-	// cacheClient reads the parent ClusterCache's owner edge (the last hop of the climb).
+	// Reads the parent ClusterCache's owner edge (the last hop).
 	cacheClient  beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
 	connMgr      *ConnectionManager
 	cacheManager *store.Manager
-	// pokeSvc is the resync bus; nil disables poke-driven restarts (tests drive
-	// restartWorkers directly).
+	// Resync bus; nil disables poke-driven restarts (tests drive restartWorkers directly).
 	pokeSvc *poke.Service
 	pokeSub *pokeSubscription
 
-	// ctrlClient is this kind's status-write client, used by the worker sinks — which
-	// report out-of-band, off the reconcile path. Injected before the control plane starts.
+	// Status-write client for the worker sinks, which report off the reconcile path.
+	// Injected before the control plane starts.
 	ctrlClient beehive.ControllerClient[ClusterCacheGVRSyncStatus]
 
-	// newWorker builds a worker; the package's own tests swap in a fake so the
-	// controller's lifecycle and report folding are exercised without a cluster.
+	// Swapped for a fake in tests so lifecycle and report folding run without a cluster.
 	newWorker newGVRWorkerFunc
 
 	workers *workerSet
 
-	// writeMu serializes the condition/stats read-modify-writes between the reconcile path
-	// and the worker sinks.
+	// Serializes condition/stats read-modify-writes between the reconcile path and sinks.
 	writeMu sync.Mutex
-	// policies hands out each cache's shared client budget — the rate limiter its clients
-	// draw from and the LIST semaphore its workers contend for. Shared with the discovery
-	// controller via the runtime, since both talk to one cluster on one cache's behalf.
+	// Each cache's shared client budget (rate limiter + LIST semaphore). Shared with the
+	// discovery controller, since both talk to one cluster on one cache's behalf.
 	policies *cacheClientPolicies
 
-	// stats holds each kind's freshness stamps, keyed by its record id, guarded by writeMu.
-	// In memory rather than in the object's status because nothing in the object graph
-	// reacts to them — see ClusterCacheGVRSyncStats.
+	// Per-kind freshness stamps, guarded by writeMu. In memory, not status — nothing in the
+	// object graph reacts; see docs/adr/2026-08-09-status-propagation-gauges.md.
 	stats map[ClusterCacheGVRSyncID]ClusterCacheGVRSyncStats
 }
 
 // newGVRWorkerFunc constructs one kind's sync worker over an open cache handle.
 type newGVRWorkerFunc func(ctx context.Context, cfg *rest.Config, cdb *store.ClusterDB, kind objectsync.Kind, limiter kubesync.ListLimiter, sink kubesync.Sink) (workerHandle, error)
 
-// newLiveGVRWorker is the production constructor, and the one place that knows a kind
-// can want a different store. Everything else — the controller, the worker, the list/watch
-// state machine — treats Events like any other kind.
+// newLiveGVRWorker is the production constructor, and the one place that knows a kind can
+// want a different store; everything else treats Events like any other kind.
 //
-// The jitter seed carries the kind as well as the cache, so a cache's hundred workers
-// spread their periodic re-lists across the interval instead of re-listing the whole
-// cluster at one instant.
+// The jitter seed carries the kind as well as the cache, so a cache's hundred workers spread
+// their re-lists across the interval instead of re-listing the cluster at one instant.
 func newLiveGVRWorker(ctx context.Context, cfg *rest.Config, cdb *store.ClusterDB, kind objectsync.Kind, limiter kubesync.ListLimiter, sink kubesync.Sink) (workerHandle, error) {
 	gvr, err := kind.GVR()
 	if err != nil {
@@ -118,15 +103,14 @@ func newLiveGVRWorker(ctx context.Context, cfg *rest.Config, cdb *store.ClusterD
 	if err != nil {
 		return nil, err
 	}
-	// Register the kind in the cache catalog before the first row lands: it is what makes
-	// the kind readable at all (store.Objects resolves the plural resource through it) and
-	// what puts the kind in the dashboard nav.
+	// Before the first row lands: the catalog entry is what makes the kind readable at all
+	// (store.Objects resolves the plural through it) and what puts it in the dashboard nav.
 	if err := st.EnsureCatalog(ctx); err != nil {
 		return nil, err
 	}
 	opts := []kubesync.Option{kubesync.WithListLimiter(limiter)}
-	// The api server serves Events without its watch cache, so their watches carry no
-	// bookmarks and a quiet cluster's Event stream legitimately goes silent for hours.
+	// Events are served without the watch cache, so their watches carry no bookmarks and a
+	// quiet cluster's Event stream legitimately goes silent for hours.
 	if isEventsKind(kind) {
 		opts = append(opts, kubesync.WithoutBookmarks())
 	}
@@ -142,14 +126,11 @@ func newSyncStore(cdb *store.ClusterDB, kind objectsync.Kind) (kubesync.Store, e
 	return objectsync.NewStore(cdb, kind)
 }
 
-// forgetKindRows drops one kind's cached rows, edges, catalog entry and resume cookie.
-//
-// It is the reap counterpart of newSyncStore, and lives beside it for the same reason: which
-// store a kind writes to is one decision, so where its rows are reaped from is too. Events
-// are the exemption — their rows live in a table of their own, and the collection is always
-// served, so the only thing that ends them is the cache file going away. Routing that here
-// keeps the three callers (a child deleted, a kind remapped, an orphan swept) free of any
-// per-kind knowledge; each used to repeat the check and its rationale.
+// forgetKindRows drops one kind's cached rows, edges, catalog entry and resume cookie — the
+// reap counterpart of newSyncStore, beside it because which store a kind writes to and where
+// its rows are reaped from are one decision. Events are exempt: their rows live in their own
+// table and the collection is always served, so only the cache file going away ends them.
+// Routing it here keeps the three callers free of per-kind knowledge.
 func forgetKindRows(ctx context.Context, cdb *store.ClusterDB, kind objectsync.Kind) error {
 	if isEventsKind(kind) {
 		return nil
@@ -157,12 +138,9 @@ func forgetKindRows(ctx context.Context, cdb *store.ClusterDB, kind objectsync.K
 	return objectsync.Forget(ctx, cdb, kind)
 }
 
-// isEventsKind reports whether a kind is the cluster's Event collection.
-//
-// Keyed on the api group and plural, NOT on the Kind name: "Event" is not reserved, so a
-// CRD named Event in somebody's own group would otherwise have its objects routed into
-// the events table and be exempted from the deletion sweep. The discovery filter checks
-// the same pair.
+// isEventsKind reports whether a kind is the cluster's Event collection. Keyed on api group
+// and plural, NOT the Kind name: "Event" is not reserved, so a CRD named Event in somebody's
+// own group would otherwise be routed into the events table and exempted from the sweep.
 func isEventsKind(kind objectsync.Kind) bool {
 	return kind.APIVersion == eventsAPIVersion && kind.Resource == eventsResource
 }
@@ -208,12 +186,9 @@ func (c *ClusterCacheGVRSyncController) Stats(objID beehive.ObjectID) (ClusterCa
 	return st, ok
 }
 
-// StatsSnapshot copies every kind's stamps under ONE lock.
-//
-// The rollup reads a whole cache's worth at a time, and writeMu is held by the condition
-// writers across a beehive write — so a per-record Stats() call would take that lock a
-// hundred times per fold, contending hardest exactly during a cold start when the writers
-// are busiest.
+// StatsSnapshot copies every kind's stamps under ONE lock: the rollup reads a whole cache at
+// a time, and per-record Stats() calls would take writeMu a hundred times per fold —
+// contending hardest during a cold start, when the condition writers are busiest.
 func (c *ClusterCacheGVRSyncController) StatsSnapshot() map[ClusterCacheGVRSyncID]ClusterCacheGVRSyncStats {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -244,36 +219,29 @@ func (c *ClusterCacheGVRSyncController) StopPoke() {
 	c.pokeSub.stop()
 }
 
-// restartWorkers rebuilds every running worker in place — the resync poke's handler.
+// restartWorkers rebuilds every running worker in place — the resync poke's handler. A poke
+// means every long-lived watch is probably on a dead connection, and the point is not to
+// wait out the client's own detection. Each worker resumes from its persisted
+// resourceVersion, so this is cheap. See docs/adr/2026-08-09-poke-resync-fanout.md.
 //
-// A poke means the machine just woke or the network just came back, so every long-lived
-// watch is probably talking to a dead connection. The client can take a while to work that
-// out on its own (the HTTP/2 keepalive detects a silently-dropped connection in ~15s, and
-// a watch that merely stopped delivering ages out on kubesync's stale threshold), so the
-// point of this is to not wait: drop the streams and re-establish now. Each worker resumes
-// from its persisted resourceVersion, so a restart is cheap — deltas, not a re-list.
-//
-// It only touches what is RUNNING. A paused kind or one waiting on credentials has no
-// worker, and starting one here would be this path deciding something that is the
-// reconcile's to decide.
+// Only touches what is RUNNING: starting a worker for a paused kind would be this path
+// deciding what is the reconcile's to decide.
 func (c *ClusterCacheGVRSyncController) restartWorkers(ctx context.Context) {
 	for _, entry := range c.workers.entries() {
 		c.restartWorker(ctx, entry)
 	}
 }
 
-// restartWorker bounces one entry, holding its object's lifecycle lock across the whole
-// stop-then-start so a reconcile can't act on the gap between them. Without it a pause or a
-// deletion landing in that window sees no worker to stop, reports itself done — and for a
-// deletion, clears the drain finalizer that is holding the cache file open — while this
-// pass puts a worker back for an object that is paused or already gone.
+// restartWorker bounces one entry, holding its lifecycle lock across the WHOLE
+// stop-then-start so a reconcile can't act on the gap — a pause or deletion landing there
+// would report itself done (clearing the drain finalizer holding the cache file open) while
+// this pass puts a worker back for an object that is paused or gone.
 func (c *ClusterCacheGVRSyncController) restartWorker(ctx context.Context, entry *syncEntry) {
 	mu := c.workers.lifecycleLock(entry.objID)
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Re-check under the lock: a reconcile may have stopped or replaced this worker while
-	// we waited, and resurrecting the entry we sampled before the lock is the same bug.
+	// Re-check under the lock: resurrecting an entry sampled before it is the same bug.
 	if !c.workers.isCurrent(entry) {
 		return
 	}
@@ -284,12 +252,11 @@ func (c *ClusterCacheGVRSyncController) restartWorker(ctx context.Context, entry
 	c.startEntry(ctx, entry)
 }
 
-// startEntry rebuilds a drained entry's worker. It RE-RESOLVES the cache handle rather than
-// reusing entry.cdb: the handle a worker was built with may have been closed since — clearing
-// a cache shuts it along with the file — and a worker rebuilt on a closed database fails
-// every operation while staying registered, which is worse than not restarting at all, since
-// a registered worker is exactly what stops a reconcile from replacing it. Open is
-// idempotent, so on the ordinary poke path this hands back the very same handle.
+// startEntry rebuilds a drained entry's worker, RE-RESOLVING the cache handle rather than
+// reusing entry.cdb: that handle may have been closed since (clearing a cache shuts it with
+// the file), and a worker on a closed database fails everything while staying registered —
+// worse than not restarting, since being registered is what stops a reconcile replacing it.
+// Open is idempotent, so the ordinary poke path gets the same handle back.
 //
 // The caller holds the object's lifecycle lock.
 func (c *ClusterCacheGVRSyncController) startEntry(ctx context.Context, entry *syncEntry) {
@@ -303,47 +270,37 @@ func (c *ClusterCacheGVRSyncController) startEntry(ctx context.Context, entry *s
 	}
 }
 
-// RestartCacheWorkers drains every running worker of ONE cache, runs between, and starts
-// them again on a freshly opened handle. It is what makes "clear cache" work: nothing else
-// would rebuild those workers, since a reconcile leaves a running worker alone while its
-// connection and kind are unchanged, so neither the 30s liveness recheck nor the 5-minute
-// discovery pass revives one.
+// RestartCacheWorkers drains every running worker of ONE cache, runs between, and restarts
+// them on a freshly opened handle. It is what makes "clear cache" work — a reconcile leaves
+// a running worker alone while its connection and kind are unchanged, so nothing else would
+// rebuild them.
 //
-// The ORDER is the whole point, and it is why the caller's teardown runs inside this rather
-// than before it. The workers are drained first, so the cache file is not removed under a
-// live writer; between then does the teardown; and each worker is rebuilt afterwards
-// against whatever handle the store Manager hands back — a NEW one, since the old was
-// closed along with the file. Every affected object's lifecycle lock is held across the
-// whole sequence, so no reconcile can slip in and start a worker on the doomed handle.
+// The ORDER is the point, and why the caller's teardown runs INSIDE this: drain first, so
+// the file isn't removed under a live writer; then between; then rebuild against the new
+// handle the Manager hands back. Every affected object's lifecycle lock is held across the
+// whole sequence, so no reconcile can start a worker on the doomed handle.
 //
-// A worker that will NOT drain aborts the sequence: between is the caller's teardown, and
-// running it with a writer still live is the exact thing the drain exists to prevent. The
-// workers that did drain are restarted anyway and the drain error returned, so the caller
-// (ClearCache) reports the failure and the cache is left running rather than empty.
-//
-// between's OWN error, by contrast, does not skip the restart: the workers are already
-// drained, and leaving a cache with no workers at all is the one outcome nothing would
-// recover from.
+// A worker that will NOT drain aborts the sequence — running between with a live writer is
+// exactly what the drain prevents. The drained workers restart anyway and the error is
+// returned, so the caller reports it and the cache is left running rather than empty.
+// between's OWN error does not skip the restart: leaving a cache with no workers at all is
+// the one outcome nothing recovers from.
 func (c *ClusterCacheGVRSyncController) RestartCacheWorkers(ctx context.Context, ref store.CacheRef, between func() error) error {
-	// One sequence per cache at a time. Overlapping ones deadlock on the lifecycle locks
-	// they hold to the end, and the later one's snapshot is stale before it runs — see
-	// cacheRestartGate. Waiting honours ctx, so a caller under a timeout still gives up.
+	// One sequence per cache: overlapping ones deadlock on the lifecycle locks they hold to
+	// the end, and the later's snapshot is stale before it runs — see cacheRestartGate.
 	releaseGate, err := c.workers.acquireCacheRestart(ctx, ref.CacheID)
 	if err != nil {
 		return fmt.Errorf("await cache restart %d: %w", ref.CacheID, err)
 	}
 	defer releaseGate()
 
-	// Mark the cache restarting and snapshot its workers in one step. From here until
-	// endCacheRestart no worker of this cache can register, so a reconcile that opened the
-	// handle but had not yet registered — invisible to any snapshot, and holding a
-	// lifecycle lock nobody knows to wait for — is refused rather than left running on the
-	// handle between() is about to close.
+	// Mark restarting and snapshot in one step: from here until endCacheRestart no worker of
+	// this cache can register, so a reconcile that opened the handle but hadn't registered —
+	// invisible to any snapshot — is refused rather than left on the handle between() closes.
 	running := c.workers.beginCacheRestart(ref.CacheID)
-	// One release per begin, however the sequence ends. The barrier is lifted before the
-	// restarts (they register through the very putIfAbsent it refuses) and the deferred
-	// call is the safety net for every path that doesn't get that far — so the release has
-	// to be idempotent, or an overlapping sequence's hold would be dropped along with ours.
+	// One release per begin, however the sequence ends. Lifted before the restarts (which
+	// register through the very putIfAbsent it refuses); the defer covers every earlier exit,
+	// so it must be idempotent or an overlapping sequence's hold would drop with ours.
 	released := false
 	release := func() {
 		if !released {
@@ -502,24 +459,19 @@ func (c *ClusterCacheGVRSyncController) finalize(
 	if err := client.DeleteFinalizer(ctx, obj.ID, gvrSyncDrainFinalizer); err != nil {
 		return err
 	}
-	// The object is collected: nothing will reconcile it again, so its lifecycle lock has
-	// no further callers. Dropping it here is the only reclamation — the ids are
-	// AUTOINCREMENT, so a cluster whose kinds churn would otherwise leak a mutex per kind
-	// per incarnation, forever.
+	// Collected, so the lifecycle lock has no further callers. The only reclamation: ids are
+	// AUTOINCREMENT, so churning kinds would otherwise leak a mutex per kind per incarnation.
 	c.workers.forgetLifecycle(obj.ID)
 	return nil
 }
 
-// forgetKind removes the kind's rows, edges, catalog entry and resume cookie from the
-// cache — the cleanup that keeps the dashboard from listing a kind whose contents are
-// frozen at whenever its sync stopped.
+// forgetKind removes the kind's rows, edges, catalog entry and cookie, so the dashboard
+// can't list a kind frozen at whenever its sync stopped.
 //
-// It is BEST EFFORT, and deliberately not part of the deletion barrier. The finalizer
-// exists to prove the worker has drained, nothing more; blocking on this cleanup would
-// deadlock the common case where the whole cache is being deleted, since the rows are
-// about to go with the file anyway. For the same reason it looks the cache up rather than
-// opening it: a closed cache has nothing to clean, and re-opening one mid-teardown would
-// re-materialize the very file the cache controller is about to remove.
+// BEST EFFORT and deliberately OUTSIDE the deletion barrier: the finalizer exists to prove
+// the worker drained, and blocking here would deadlock the common case where the whole cache
+// file is going anyway. Lookup, never Open, for the same reason — re-opening mid-teardown
+// re-materializes the file the cache controller is about to remove.
 func (c *ClusterCacheGVRSyncController) forgetKind(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCacheGVRSyncStatus],
@@ -538,22 +490,18 @@ func (c *ClusterCacheGVRSyncController) forgetKind(
 	}
 }
 
-// ensureWorker starts the worker if none is running, restarts it when what the worker was
-// built from has changed, and otherwise leaves the running one alone.
+// ensureWorker starts a worker if none runs, restarts it when its build inputs moved, and
+// otherwise leaves it alone.
 //
 // **A worker's identity is its connection fingerprint AND its kind.** The fingerprint
-// catches a credential rotation; the kind catches a discovery pass rewriting this child's
-// spec. That second case is real because a child is named for its (apiVersion, resource)
-// only — deliberately, since that pair is what the REST path needs and what the API server
-// guarantees unique — so a CRD deleted and recreated with the same plural but a different
-// Kind or scope keeps the SAME child, which discovery updates in place. Comparing only the
-// fingerprint would leave the old worker running: it would keep listing the right REST path
-// while writing rows under the obsolete Kind (the objects table is keyed by kind), holding a
-// stale catalog entry, naming the old noun in its messages, and reporting conditions against
-// a generation that has moved on.
+// catches a credential rotation; the kind catches a discovery pass respecifying this child,
+// which is real because a child is named for its (apiVersion, resource) alone — so a CRD
+// recreated with the same plural but a different Kind keeps the SAME child. Comparing only
+// the fingerprint would leave the old worker writing rows under the obsolete Kind (the
+// objects table is keyed by kind) against a generation that has moved on.
 //
-// Spec.Enabled is deliberately NOT part of the identity: pausing is not a restart, and the
-// converge above stops the worker before this is reached.
+// Spec.Enabled is deliberately NOT part of the identity: pausing is not a restart, and
+// converge stops the worker before this is reached.
 func (c *ClusterCacheGVRSyncController) ensureWorker(
 	ctx context.Context,
 	obj *beehive.Object[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus],
@@ -563,11 +511,10 @@ func (c *ClusterCacheGVRSyncController) ensureWorker(
 ) error {
 	kind := syncKind(obj.Spec)
 	entry := c.workers.get(obj.ID)
-	// A DRAINING entry is not a running worker, however well its identity matches: it is
-	// one whose stop timed out and stayed in the set (which is what keeps the deletion
-	// barrier honest). Its sink drops every report, so leaving it alone would silently end
-	// this kind's syncing for the process lifetime — every later reconcile no-opping on a
-	// dead entry. Fall through instead, so the drain is retried and a worker rebuilt.
+	// A DRAINING entry is not a running worker however well its identity matches — its stop
+	// timed out and it stayed registered (which keeps the deletion barrier honest), and its
+	// sink drops every report. Leaving it alone would end this kind's syncing for the process
+	// lifetime, so fall through: retry the drain and rebuild.
 	if entry != nil && !entry.draining.Load() && entry.fingerprint == fingerprint && entry.kind == kind {
 		return nil
 	}
@@ -577,19 +524,15 @@ func (c *ClusterCacheGVRSyncController) ensureWorker(
 		}
 	}
 
-	// Opening is idempotent, so a cache's many sync children converge on one handle; the
-	// store Manager owns closing it (cache deletion / shutdown).
+	// Idempotent, so a cache's many children converge on one handle; the Manager owns closing.
 	cdb, err := c.cacheManager.Open(ctx, ref)
 	if err != nil {
 		return fmt.Errorf("open cache for gvr sync: %w", err)
 	}
 
-	// A kind remap leaves the previous Kind's rows, edges, catalog entry and resume cookie
-	// behind — nothing else will ever collect them, since the child that owned them is this
-	// one and it now describes something different. Without this the cache would keep
-	// serving a kind the cluster no longer has (a phantom row in the dashboard's nav) beside
-	// the real one. Best effort, like the deletion path's forget: the worker below is what
-	// matters, and a failure here retries on the next reconcile.
+	// Nothing else would ever collect the previous Kind's rows — the child that owned them is
+	// this one, and it now describes something else — so the cache would serve a phantom kind
+	// beside the real one. Best effort; a failure retries on the next reconcile.
 	if entry != nil && entry.kind != kind {
 		c.forgetSupersededKind(ctx, obj.ID, cdb, entry.kind)
 	}
@@ -611,13 +554,13 @@ func (c *ClusterCacheGVRSyncController) forgetSupersededKind(
 	}
 }
 
-// startWorker builds a worker for one object and registers it, then starts it. Shared by
-// the reconcile and the resync poke, which differ only in where their inputs come from.
+// startWorker builds, registers, then starts a worker. Shared by the reconcile and the
+// resync poke.
 //
-// It registers BEFORE starting and only if the object has no worker: a poke that drained
-// the old one can be raced by a reconcile starting a replacement in the gap, and the loser
-// must drop the worker it built rather than displace a newer one. Dropping is safe here
-// precisely because nothing has been started yet.
+// Registers BEFORE starting, and only if the object has no worker: two builders can race,
+// and the loser must drop what it built rather than displace a newer worker — safe precisely
+// because nothing has been started yet. kubesync.Worker.Stop has the matching latch, so a
+// stop landing in that window makes the later Start a no-op.
 func (c *ClusterCacheGVRSyncController) startWorker(
 	ctx context.Context,
 	objID beehive.ObjectID,

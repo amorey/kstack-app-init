@@ -12,19 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! IPC endpoint between the host and the sidecar.
+//! Host↔sidecar IPC endpoint. Two responsibilities:
+//!   1. **Addressing.** [`Endpoint::pick`] — a per-instance UDS path (Unix) or
+//!      `\\.\pipe\` name (Windows), picked *before* spawn and passed via
+//!      `--socket`, so the sidecar never negotiates where to listen. Pure,
+//!      I/O-free value.
+//!   2. **Dialing.** [`connect`] / [`connect_with_budget`] — capped-backoff
+//!      retry, returning a [`Stream`] hyper consumes identically on both
+//!      platforms.
 //!
-//! Two responsibilities, split so neither pulls in the other's concerns:
-//!   1. **Addressing.** [`Endpoint::pick`] generates a per-instance name — a UDS
-//!      path under a private runtime dir on Unix, a `\\.\pipe\` name on Windows.
-//!      The host picks it *before* spawning the sidecar and passes it via the
-//!      `--socket` CLI flag, so the sidecar never negotiates where to listen.
-//!      `Endpoint` is a pure, I/O-free value.
-//!   2. **Dialing.** [`connect`] / [`connect_with_budget`] open a [`Stream`]
-//!      (with capped-backoff retry) impl'ing `AsyncRead + AsyncWrite + Unpin`,
-//!      which hyper consumes identically on both platforms.
-//!
-//! `ipc` is the platform-neutral name; "socket" would exclude Windows named pipes.
+//! "ipc", not "socket" — the latter would exclude Windows named pipes.
 
 use std::path::Path;
 #[cfg(unix)]
@@ -32,40 +29,31 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-// The retry deadline uses tokio's clock (real time in production, virtual under
-// tokio::time::pause) so connect_with_budget's budget/backoff is testable with a
-// paused clock instead of real sleeps. tokio::time::Instant is a drop-in for the
-// now()/+Duration/saturating_duration_since API std::time::Instant offered here.
+// tokio's clock (virtual under tokio::time::pause) so the budget/backoff is
+// testable without real sleeps.
 use tokio::time::Instant;
 
 use crate::error::{AppError, Result};
 
-/// Maximum byte length the kernel accepts for the `sun_path` field of an
-/// AF_UNIX address on Apple platforms. Linux is more generous (108) but we
-/// take the tighter bound so a path that fits on one Unix fits on all.
+/// Apple's `sun_path` cap (Linux allows 108); the tighter bound so a path that
+/// fits on one Unix fits on all.
 #[cfg(unix)]
 const UNIX_SUN_PATH_MAX: usize = 104;
 
-/// Monotonic per-process counter ensuring two `pick` calls within the same
-/// process never collide on filename — important for parallel test runs.
+/// Per-process counter so two `pick` calls never collide on filename
+/// (parallel test runs).
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Default time the host keeps retrying `connect` before giving up. Covers the
-/// sidecar's normal startup (exec + listener bind) with margin, without dragging
-/// out app launch when the sidecar is never going to come up.
+/// Default connect-retry budget: covers sidecar startup with margin without
+/// dragging out launch when it's never coming up.
 pub const DEFAULT_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 
-/// Initial delay between connect retries, doubling up to [`MAX_RETRY_DELAY`].
-/// Small enough to reach a fast-start sidecar on the first or second poll, large
-/// enough not to busy-loop on a hard-down socket.
+/// Initial retry delay, doubling up to [`MAX_RETRY_DELAY`].
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// Concrete stream type [`Endpoint::connect`] returns.
-///
-/// The [`interprocess`] crate hides the platform split: this resolves to
-/// a UDS stream on Unix and a named-pipe stream on Windows, both behind
-/// the same `AsyncRead + AsyncWrite + Unpin` surface that hyper consumes.
+/// UDS stream on Unix, named-pipe stream on Windows — one
+/// `AsyncRead + AsyncWrite + Unpin` surface via [`interprocess`].
 pub type Stream = interprocess::local_socket::tokio::Stream;
 
 /// The address the sidecar listens on and the host dials.
@@ -78,18 +66,14 @@ impl Endpoint {
         &self.0
     }
 
-    /// Picks an unused per-instance address under `base`.
-    ///
-    /// On Unix, `base` is the directory the IPC endpoint file lives in
-    /// (e.g. `$XDG_RUNTIME_DIR`). On Windows, `base` is ignored — named
-    /// pipes live in a flat namespace under `\\.\pipe\`.
+    /// Picks an unused per-instance address under `base` (ignored on Windows —
+    /// pipes live in a flat `\\.\pipe\` namespace).
     #[cfg(unix)]
     pub fn pick(base: &Path) -> Result<Endpoint> {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         // `kstack-sidecar-` matches the sidecar's own default name
-        // (sidecar/listen_unix.go:16), so both halves of the contract are
-        // recognizable on disk at a glance.
+        // (sidecar/listen_unix.go).
         let filename = format!("kstack-sidecar-{pid}-{n}.sock");
         let path: PathBuf = base.join(&filename);
 
@@ -121,8 +105,7 @@ impl Endpoint {
     pub fn pick(_base: &Path) -> Result<Endpoint> {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        // Aligns with sidecar/listen_windows.go:17 (`kstack-sidecar-<pid>`)
-        // so anyone inspecting `\\.\pipe\` can identify the endpoint by name.
+        // Aligns with sidecar/listen_windows.go (`kstack-sidecar-<pid>`).
         Ok(Endpoint(format!(r"\\.\pipe\kstack-sidecar-{pid}-{n}")))
     }
 }
@@ -133,30 +116,22 @@ pub async fn connect(endpoint: &Endpoint) -> Result<Stream> {
     connect_with_budget(endpoint, DEFAULT_CONNECT_BUDGET).await
 }
 
-/// Retries [`interprocess::local_socket::tokio::Stream::connect`] with
-/// capped exponential backoff until either the endpoint accepts or
-/// `budget` is exhausted.
+/// Retries `Stream::connect` with capped exponential backoff until the
+/// endpoint accepts or `budget` is exhausted.
 ///
-/// Retryable error kinds (treated as "not ready yet" rather than fatal):
-///   - `NotFound` — Unix: no socket file; Windows: pipe instance not
-///     created yet. Either way, the sidecar hasn't finished binding.
-///   - `WouldBlock`/`ERROR_PIPE_BUSY` (Windows raw OS error 231) — all
-///     pipe instances are currently serving clients; the next must wait.
-///
-/// Any other error (e.g. access denied) is surfaced immediately rather
-/// than burning the budget on a failure that won't self-correct. The
-/// budget is wall-clock — once it elapses, the most recent error is
-/// returned verbatim so log diagnostics show *why* (e.g. `ENOENT`).
+/// Retryable ("not ready yet"): `NotFound` (sidecar hasn't bound) and
+/// `WouldBlock`/`ERROR_PIPE_BUSY` (all pipe instances busy). Anything else
+/// (e.g. access denied) surfaces immediately — it won't self-correct. On
+/// budget exhaustion the most recent error is returned verbatim so logs show
+/// *why*.
 pub async fn connect_with_budget(endpoint: &Endpoint, budget: Duration) -> Result<Stream> {
-    /// Documented OS error code for Windows `ERROR_PIPE_BUSY`, used by
-    /// the idiomatic example in tokio's named-pipe docs for retrying
-    /// connects.
+    /// Windows `ERROR_PIPE_BUSY` (see tokio's named-pipe docs).
     const ERROR_PIPE_BUSY: i32 = 231;
 
     use interprocess::local_socket::{traits::tokio::Stream as _, GenericFilePath, ToFsName};
 
-    // `to_fs_name::<GenericFilePath>()` accepts both Unix paths and Windows
-    // `\\.\pipe\…` strings verbatim, so no platform cfg-branch here.
+    // `GenericFilePath` accepts both Unix paths and `\\.\pipe\…` strings —
+    // no cfg-branch.
     let name = endpoint
         .as_arg()
         .to_fs_name::<GenericFilePath>()

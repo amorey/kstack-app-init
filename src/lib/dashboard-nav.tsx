@@ -12,13 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The live dashboard resource tree: the curated base (`DASHBOARD_NAV`) merged with the
-// active cluster's discovered kinds. It's a thin builder over `useClusterDataKinds` (the
-// shared live catalog) — `buildDashboardNav` buckets the discovered kinds into groups and
-// joins per-kind counts, so the sidebar nav's kinds *and* counts track the cluster in real
-// time. The catalog is filled by the sync engine's discovery pass, which may land after
-// this subscribes (an unsynced cluster has no active cache → curated-only). Both the
-// sidebar nav and the dashboard panel consume this and agree on the tree.
+// The live dashboard resource tree: curated base merged with the active cluster's
+// discovered kinds (thin builder over `useClusterDataKinds`). Unsynced cluster →
+// curated-only. See docs/adr/2026-08-09-dashboard-nav-merge.md
 import { useMemo } from 'react';
 
 import { useClusterDataKinds } from '@/lib/cluster-data-kinds';
@@ -26,13 +22,8 @@ import { buildDashboardNav } from '@/lib/dashboard-resources';
 import type { DashboardNavNode } from '@/lib/dashboard-resources';
 import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
 
-// The rendered dashboard nav for the active context: curated + the cluster's discovered
-// kinds, updated live. Falls back to the curated-only tree while clusters/kinds haven't
-// loaded (no active cluster, or an unsynced one — the catalog subscription is paused).
-//
-// `active` = the catalog subscription is live (there's a cluster + active cache to stream
-// from). It's `false` while paused, where `phase`'s `connected` is meaninglessly `false` —
-// so a "reconnecting/loading" affordance must gate on `active`, not on `phase` alone, to
+// While paused (`active` false), `phase`'s `connected` is meaninglessly false — a
+// "reconnecting/loading" affordance must gate on `active`, not `phase` alone, to
 // stay silent on the curated-only fallback.
 export function useDashboardNav(): { nav: DashboardNavNode[]; active: boolean; phase: WatchPhase } {
   const { kinds, active, phase } = useClusterDataKinds();

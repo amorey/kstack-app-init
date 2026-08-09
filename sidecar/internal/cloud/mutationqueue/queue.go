@@ -1,11 +1,8 @@
-// Package mutationqueue is the durable FIFO write queue behind the local-first
-// settings path. A local edit applies to prefs immediately and is enqueued here;
-// the sync engine drains it to the cloud when online and Acks each entry once
-// accepted. Persisted (crash-safe, via internal/atomicjson), so offline edits
-// survive a restart and still reach the cloud on reconnect.
-//
-// Entry ids come from a persisted monotonic counter (not wall-clock/random), so
-// the queue is deterministic.
+// Package mutationqueue is the durable FIFO write queue behind local-first settings: an
+// edit applies to prefs immediately and enqueues here, and the sync engine drains and
+// Acks it when online. Crash-safe via internal/atomicjson, so offline edits survive a
+// restart. Entry ids come from a persisted monotonic counter, so the queue is
+// deterministic.
 package mutationqueue
 
 import (
@@ -22,8 +19,7 @@ type Entry struct {
 	Patch prefs.Settings `json:"patch"`
 }
 
-// state is the on-disk shape: the pending entries plus the id counter, so a
-// reload never reissues an already-used id.
+// state is the on-disk shape; the counter persists so a reload never reissues an id.
 type state struct {
 	Seq     int     `json:"seq"`
 	Entries []Entry `json:"entries"`
@@ -37,8 +33,7 @@ type Queue struct {
 	st   state
 }
 
-// New opens (or lazily creates) the queue file at path, loading any
-// previously persisted entries.
+// New opens (or lazily creates) the queue file, loading persisted entries.
 func New(path string) (*Queue, error) {
 	st, err := atomicjson.Load[state](path)
 	if err != nil {
@@ -54,8 +49,8 @@ func (q *Queue) Enqueue(p prefs.Settings) (Entry, error) {
 	defer q.mu.Unlock()
 
 	q.st.Seq++
-	// Clone so we own the patch: a caller mutating what it passed in can't change
-	// the queued payload.
+	// Clone in and out, so a caller mutating either side can't change the queued
+	// payload.
 	e := Entry{ID: strconv.Itoa(q.st.Seq), Patch: prefs.Clone(p)}
 	q.st.Entries = append(q.st.Entries, e)
 	if err := q.save(); err != nil {
@@ -64,13 +59,11 @@ func (q *Queue) Enqueue(p prefs.Settings) (Entry, error) {
 		q.st.Seq--
 		return Entry{}, err
 	}
-	// Return a clone so a caller mutating the returned Patch can't change the
-	// queued payload.
 	return Entry{ID: e.ID, Patch: prefs.Clone(e.Patch)}, nil
 }
 
-// Pending returns a deep copy of the queued entries in FIFO order, so a caller
-// can't mutate the queued payload via the returned pointers.
+// Pending deep-copies the queued entries in FIFO order, so the caller can't mutate the
+// queued payloads.
 func (q *Queue) Pending() []Entry {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -81,8 +74,8 @@ func (q *Queue) Pending() []Entry {
 	return out
 }
 
-// Ack removes the entry with the given id and persists the removal. An unknown id
-// is a no-op (it may already be gone after a crash between push and ack).
+// Ack removes an entry and persists the removal; an unknown id is a no-op (it may already
+// be gone after a crash between push and ack).
 func (q *Queue) Ack(id string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -101,7 +94,7 @@ func (q *Queue) Ack(id string) error {
 	q.st.Entries = append(q.st.Entries[:idx], q.st.Entries[idx+1:]...)
 	if err := q.save(); err != nil {
 		// Roll back so a failed persist doesn't drop the entry from Pending() while
-		// it's still durably queued on disk.
+		// it's still durable on disk.
 		q.st.Entries = append(q.st.Entries, Entry{})
 		copy(q.st.Entries[idx+1:], q.st.Entries[idx:])
 		q.st.Entries[idx] = removed
