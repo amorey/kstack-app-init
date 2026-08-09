@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -437,11 +438,7 @@ func TestSubscribeNotifyAndCoalesce(t *testing.T) {
 	// Two notifies with no consumer in between coalesce into one ping.
 	cdb.ObjectsNotify()
 	cdb.ObjectsNotify()
-	select {
-	case <-ch:
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected a ping after Notify")
-	}
+	testutil.Wait(t, ch, "a ping after Notify")
 	select {
 	case <-ch:
 		t.Fatal("coalesced pings must not deliver twice")
@@ -450,11 +447,7 @@ func TestSubscribeNotifyAndCoalesce(t *testing.T) {
 
 	// A notify after draining delivers again.
 	cdb.ObjectsNotify()
-	select {
-	case <-ch:
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected a ping after re-Notify")
-	}
+	testutil.Wait(t, ch, "a ping after re-Notify")
 }
 
 // A keyed object-write notify routes by resource: ObjectsNotifyResource wakes the
@@ -579,11 +572,7 @@ func TestEventsBrokerIsSeparateFromWrites(t *testing.T) {
 
 	// EventsNotify pings only the events subscriber.
 	cdb.EventsNotify()
-	select {
-	case <-events:
-	case <-time.After(2 * time.Second):
-		t.Fatal("EventsNotify must ping an events subscriber")
-	}
+	testutil.Wait(t, events, "EventsNotify to ping an events subscriber")
 	select {
 	case <-writes:
 		t.Fatal("EventsNotify must not ping the object-write subscriber")
@@ -592,11 +581,7 @@ func TestEventsBrokerIsSeparateFromWrites(t *testing.T) {
 
 	// Notify pings only the object-write subscriber.
 	cdb.ObjectsNotify()
-	select {
-	case <-writes:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Notify must ping a write subscriber")
-	}
+	testutil.Wait(t, writes, "Notify to ping a write subscriber")
 	select {
 	case <-events:
 		t.Fatal("Notify must not ping the events subscriber")
@@ -615,26 +600,14 @@ func TestShutdownClosesSubscribers(t *testing.T) {
 	defer cancel()
 	require.NoError(t, r.Shutdown(ctx))
 
-	select {
-	case _, ok := <-ch:
-		require.False(t, ok, "shutdown must close subscriber channels")
-	case <-time.After(2 * time.Second):
-		t.Fatal("subscriber channel not closed on shutdown")
-	}
+	testutil.RecvClosed(t, ch, "the subscriber channel on shutdown")
 }
 
 // recvDB reads one handle off a WatchDB stream, failing on timeout or an
 // unexpected close.
 func recvDB(t *testing.T, ch <-chan *ClusterDB) *ClusterDB {
 	t.Helper()
-	select {
-	case db, ok := <-ch:
-		require.True(t, ok, "WatchDB stream closed early")
-		return db
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for a WatchDB handle")
-		return nil
-	}
+	return testutil.Recv(t, ch, "a WatchDB handle")
 }
 
 // WatchDB is a latest-value stream of a CacheID's open handle across its
@@ -693,12 +666,7 @@ func TestWatchDBClosedOnShutdown(t *testing.T) {
 	require.Nil(t, recvDB(t, ch))
 
 	require.NoError(t, r.Shutdown(ctx))
-	select {
-	case _, ok := <-ch:
-		require.False(t, ok, "shutdown must close WatchDB channels")
-	case <-time.After(2 * time.Second):
-		t.Fatal("WatchDB channel not closed on shutdown")
-	}
+	testutil.RecvClosed(t, ch, "the WatchDB channel on shutdown")
 }
 
 func TestKinds(t *testing.T) {
@@ -842,7 +810,7 @@ func TestShutdownWaitsForAnInFlightClose(t *testing.T) {
 	closeCtx, cancelClose := context.WithCancel(ctx)
 	closeErr := make(chan error, 1)
 	go func() { closeErr <- m.Close(closeCtx, 1) }()
-	<-entered
+	testutil.Wait(t, entered, "Close to reach the janitor cancel")
 
 	shutdownErr := make(chan error, 1)
 	go func() { shutdownErr <- m.Shutdown(ctx) }()
@@ -925,7 +893,7 @@ func TestOpenRefusesACacheThatIsClosing(t *testing.T) {
 	// refused Open below starts a retry driver that reads them from its own goroutine,
 	// so moving them again mid-test would be a data race on the handle.
 	cdb.janitorCancel()
-	<-cdb.janitorDone
+	testutil.Wait(t, cdb.janitorDone, "the janitor to stop")
 	stalled := make(chan struct{})
 	cdb.janitorCancel = func() {}
 	cdb.janitorDone = stalled
@@ -1269,7 +1237,7 @@ func TestShutdownWithAStoppedJanitorIgnoresAnExpiredDeadline(t *testing.T) {
 		// Stop the janitor and wait for it, so the only thing left for shutdown to do is
 		// close the pools — the state where the deadline is irrelevant.
 		cdb.janitorCancel()
-		<-cdb.janitorDone
+		testutil.Wait(t, cdb.janitorDone, "the janitor to stop")
 
 		require.NoError(t, cdb.shutdown(expired),
 			"a teardown with nothing left to wait for must not report a timeout")

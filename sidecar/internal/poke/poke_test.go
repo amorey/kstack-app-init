@@ -7,7 +7,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 var epoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -15,14 +16,7 @@ var epoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 // mustRecv reads exactly one Signal from ch within 2s or fails the test.
 func mustRecv(t *testing.T, ch <-chan Signal) Signal {
 	t.Helper()
-	select {
-	case s, ok := <-ch:
-		require.True(t, ok, "channel closed unexpectedly")
-		return s
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Signal")
-		return Signal{}
-	}
+	return testutil.Recv(t, ch, "a Signal")
 }
 
 // mustNotRecv asserts no Signal arrives within 50ms.
@@ -127,10 +121,5 @@ func TestRun_CtxCancel_ClosesSubscribers(t *testing.T) {
 
 	cancelCtx()
 
-	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "expected subscriber channel to be closed")
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for subscriber channel to close")
-	}
+	testutil.RecvClosed(t, ch, "the subscriber channel")
 }

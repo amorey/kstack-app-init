@@ -3,7 +3,6 @@ package grpcserver_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -12,6 +11,7 @@ import (
 	grpcserver "github.com/kubetail-org/kstack-app/sidecar/grpc"
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/pokepb"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // A PokeService.Poke RPC must broadcast a SourceHost resync to every in-process
@@ -31,12 +31,8 @@ func TestPokeServiceBroadcastsSourceHost(t *testing.T) {
 	_, err := client.Poke(context.Background(), &pokepb.PokeRequest{})
 	require.NoError(t, err)
 
-	select {
-	case sig := <-sigs:
-		require.Equal(t, poke.SourceHost, sig.Source)
-	case <-time.After(2 * time.Second):
-		t.Fatal("Poke RPC did not broadcast a signal")
-	}
+	sig := testutil.Recv(t, sigs, "the Poke RPC to broadcast a signal")
+	require.Equal(t, poke.SourceHost, sig.Source)
 }
 
 // A nil broadcaster (degraded run) keeps the method safe: Poke returns

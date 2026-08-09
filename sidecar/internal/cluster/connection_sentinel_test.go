@@ -18,29 +18,33 @@ package cluster
 
 import (
 	"context"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
 
 	"github.com/amorey/beehive"
+	"github.com/amorey/gochan/oneshot"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // fakeWatch is a controllable watch.Interface: its result channel stays open until Stop
-// closes it (idempotent via sync.Once, so the sentinel's own deferred Stop is harmless).
-// Closing the channel simulates the cluster's liveness watch breaking.
+// closes it. Closing the channel simulates the cluster's liveness watch breaking. The
+// oneshot pair makes Stop idempotent by contract, so the sentinel's own deferred Stop is
+// harmless.
 type fakeWatch struct {
-	ch   chan watch.Event
-	once sync.Once
+	tx *oneshot.Sender[watch.Event]
+	rx *oneshot.Receiver[watch.Event]
 }
 
-func newFakeWatch() *fakeWatch { return &fakeWatch{ch: make(chan watch.Event)} }
+func newFakeWatch() *fakeWatch {
+	tx, rx := oneshot.New[watch.Event]()
+	return &fakeWatch{tx: tx, rx: rx}
+}
 
-func (w *fakeWatch) Stop()                          { w.once.Do(func() { close(w.ch) }) }
-func (w *fakeWatch) ResultChan() <-chan watch.Event { return w.ch }
+func (w *fakeWatch) Stop()                          { w.tx.Close() }
+func (w *fakeWatch) ResultChan() <-chan watch.Event { return w.rx.Chan() }
 
 // liveSentinelWatch is a SentinelWatchFunc that always returns a fresh, never-closing
 // watch, so converge's sentinel stays open and never re-probes. Tests exercising the
@@ -53,13 +57,7 @@ func liveSentinelWatch(context.Context, *rest.Config) (watch.Interface, error) {
 // awaitWatch blocks until a sentinel watch is established, or fails on timeout.
 func awaitWatch(t *testing.T, ch <-chan *fakeWatch) *fakeWatch {
 	t.Helper()
-	select {
-	case w := <-ch:
-		return w
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for sentinel watch")
-		return nil
-	}
+	return testutil.Recv(t, ch, "a sentinel watch")
 }
 
 // TestClusterCoreControllerSentinelReprobesOnWatchBreak verifies the connection

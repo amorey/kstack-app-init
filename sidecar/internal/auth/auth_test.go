@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth/oauth"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // memStore is an in-memory CredentialsStore (host keychain stand-in).
@@ -207,13 +208,8 @@ func TestLogoutRevokesToken(t *testing.T) {
 	if err := svc.Logout(context.Background()); err != nil {
 		t.Fatalf("Logout: %v", err)
 	}
-	select {
-	case tok := <-revoked:
-		if tok != "r" {
-			t.Fatalf("revoked token = %q, want the refresh token \"r\"", tok)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("sign-out did not revoke the token")
+	if tok := testutil.Recv(t, revoked, "sign-out to revoke the token"); tok != "r" {
+		t.Fatalf("revoked token = %q, want the refresh token \"r\"", tok)
 	}
 	// And the local credentials were still cleared.
 	if saved, _ := store.Load(); saved.RefreshToken != "" {
@@ -250,13 +246,8 @@ func TestLogoutDoesNotBlockOnRevoke(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- svc.Logout(context.Background()) }()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Logout: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Logout blocked on token revocation")
+	if err := testutil.Recv(t, done, "Logout to return without blocking on token revocation"); err != nil {
+		t.Fatalf("Logout: %v", err)
 	}
 
 	// Local teardown happened even though revocation is still blocked.

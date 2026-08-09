@@ -17,6 +17,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -30,6 +31,7 @@ import (
 	"github.com/amorey/beehive"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // staticProbe returns a ProbeFunc that always yields the given server/principal.
@@ -147,11 +149,7 @@ func signalingProbe() (ProbeFunc, chan struct{}) {
 // awaitProbe blocks until the probe fires once, or fails on timeout.
 func awaitProbe(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for probe")
-	}
+	testutil.Wait(t, ch, "a probe")
 }
 
 // drainProbes consumes any already-buffered probe signals so a following
@@ -849,11 +847,7 @@ func TestClusterCoreControllerReconcilesDistinctClustersInParallel(t *testing.T)
 	// Both probes must be in flight at once. Under a single shared lock only one
 	// entry ever arrives and this times out.
 	for i := range 2 {
-		select {
-		case <-entered:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("only %d of 2 probes started; distinct clusters are serialized", i)
-		}
+		testutil.Wait(t, entered, fmt.Sprintf("probe %d of 2 (distinct clusters must not serialize)", i+1))
 	}
 }
 
@@ -882,11 +876,7 @@ func TestClusterCoreControllerSerializesSameClusterReconciles(t *testing.T) {
 	}
 
 	// One probe enters; the second must stay blocked on the first's lock.
-	select {
-	case <-entered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the first probe")
-	}
+	testutil.Wait(t, entered, "the first probe")
 	select {
 	case <-entered:
 		t.Fatal("a second reconcile of the same cluster ran concurrently")

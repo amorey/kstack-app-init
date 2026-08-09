@@ -19,12 +19,13 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/amorey/beehive"
 	"github.com/amorey/gochan/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // testKindAPIVersion is the api group-version these records claim. The fold reports it
@@ -374,17 +375,13 @@ func TestSyncHealthFoldCancelsItsWatchesWhenItEndsOnItsOwn(t *testing.T) {
 	s.syncHealth, s.syncHealthStop, s.syncHealthDone = hub, stop, done
 	s.syncHealthMu.Unlock()
 
-	watchCtx := <-fake.ctx
+	watchCtx := testutil.Recv(t, fake.ctx, "the fold to open its watches")
 	require.NoError(t, watchCtx.Err(), "the watches are live while the fold runs")
 
 	// End the fold the way beehive would, without going through the stop func.
 	close(fake.src)
 
-	select {
-	case <-watchCtx.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("a fold that ended on its own must cancel the watches it opened")
-	}
+	testutil.Wait(t, watchCtx.Done(), "a fold that ended on its own to cancel the watches it opened")
 }
 
 // The fold is stopped before beehive at shutdown. A subscriber arriving in that window must

@@ -19,6 +19,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/logging"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // TestAuthStateQuery is the canary: a fresh server (signed-out fake auth)
@@ -233,14 +234,5 @@ func isExpectedStreamClose(err error) bool {
 // test instead of hanging.
 func nextSSE(t *testing.T, ch <-chan sseEvent) sseEvent {
 	t.Helper()
-	select {
-	case ev, ok := <-ch:
-		if !ok {
-			t.Fatal("SSE stream closed before next event")
-		}
-		return ev
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for SSE event")
-		return sseEvent{}
-	}
+	return testutil.Recv(t, ch, "an SSE event")
 }

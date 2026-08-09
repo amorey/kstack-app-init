@@ -12,7 +12,7 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 - `internal/app/` — **composition root**: builds `poke.Service`, `cluster.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start(ctx)` returns a drain-func; the stop chain is `clusterSvcStop → cloudSvcStop → pokeSvcStop` — poke's hub closes **last**, after its subscribers drain (the left-to-right arg evaluation in the `errors.Join` enforces it).
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
-- `internal/` — `ipc` (per-OS user-only endpoint), `k8shelpers` (`KubeConfigWatcher`), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, plus the subsystems below.
+- `internal/` — `ipc` (per-OS user-only endpoint), `k8shelpers` (`KubeConfigWatcher`), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
@@ -133,7 +133,9 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
 
 - testify + `httptest`. Resolver-level tests stand up `graph.NewServer(&graph.Resolver{...})` + `POST /graphql`; h2c/lifecycle tests stand up `app.New(...)`. Filesystem via `t.TempDir()`.
 - **White-box tests by default** (`package foo`, not `foo_test`) — boundaries are kept by discipline, not the compiler. Escape hatch: external `package foo_test` only when pinning the public contract is the test's purpose — then say so in a comment.
-- **Avoid magic sleeps.** Block on the actual event (`<-sub.Chan()` under a `select` with a `time.After` deadline) — never a fixed `time.Sleep`.
+- **Avoid magic sleeps.** Block on the actual event, never a fixed `time.Sleep`.
+- **Waiting on a channel goes through `internal/testutil`**, which owns the one failsafe bound (`testutil.Timeout`): `Wait` (a done/ready channel), `Recv[T]` (the next value), `RecvClosed[T]` (the next receive must be a close), `WaitClosed[T]` (drain until close). Don't hand-roll a `select` with a `time.After` deadline. The exception is a **negative** assertion — "no frame arrived" — which needs its own short window, not the failsafe.
+- **A fake that signals the test uses `testutil.Signal`** (a `gochan/oneshot` pair): `Fire` is idempotent by contract, so a callback that runs many times needs no `sync.Once` and no `select`/`default` guard, and `Fire`'s bool tells the first call from the rest.
 - `make test-go` (`cd sidecar && go test ./...`); `make lint-go` (gofmt); `make vet-go` (`go vet`). Run `gofmt -w` before committing.
 
 When you change the sidecar's schema workflow, wiring, or conventions, update this `CLAUDE.md` in the same change.

@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -105,12 +107,8 @@ func TestIdleTimeoutCancelsStalledBody(t *testing.T) {
 	// than hanging the suite.
 	done := make(chan error, 1)
 	go func() { _, rerr := io.ReadAll(resp.Body); done <- rerr }()
-	select {
-	case rerr := <-done:
-		require.Error(t, rerr, "a body that never delivers must be cancelled by the idle timeout")
-	case <-time.After(2 * time.Second):
-		t.Fatal("stalled body was not cancelled by the idle timeout")
-	}
+	rerr := testutil.Recv(t, done, "the stalled body to be cancelled by the idle timeout")
+	require.Error(t, rerr, "a body that never delivers must be cancelled by the idle timeout")
 	_ = resp.Body.Close()
 }
 
@@ -128,12 +126,8 @@ func TestIdleTimeoutCancelsBeforeHeaders(t *testing.T) {
 	// fails the test fast instead of deadlocking (the base blocks until cancelled).
 	done := make(chan error, 1)
 	go func() { _, rerr := rt.RoundTrip(req); done <- rerr }()
-	select {
-	case rerr := <-done:
-		require.Error(t, rerr, "a request stalled before headers must be cancelled")
-	case <-time.After(2 * time.Second):
-		t.Fatal("request stalled before headers was not cancelled")
-	}
+	rerr := testutil.Recv(t, done, "the request stalled before headers to be cancelled")
+	require.Error(t, rerr, "a request stalled before headers must be cancelled")
 }
 
 // Watch requests are exempt: they're long-lived and legitimately quiet between

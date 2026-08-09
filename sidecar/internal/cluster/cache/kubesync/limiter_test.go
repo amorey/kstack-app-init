@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -50,11 +51,7 @@ func TestListLimiterAdmitsUpToItsBound(t *testing.T) {
 	// Releasing one lets it through, which is what keeps a cold sync progressing rather
 	// than deadlocking behind its first N kinds.
 	r1()
-	select {
-	case <-admitted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("releasing a slot did not admit the waiter")
-	}
+	testutil.Wait(t, admitted, "releasing a slot to admit the waiter")
 	r2()
 }
 

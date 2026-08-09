@@ -18,6 +18,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/authpb"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/app"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // newTestApp builds an App backed by a kubeconfig with two contexts, then serves
@@ -128,10 +129,5 @@ func TestAppShutdownDrainsBothTransports(t *testing.T) {
 	require.NoError(t, a.DrainWithContext(ctx))
 
 	// The gRPC stream ended cleanly (OK trailers → EOF), not cut mid-flight.
-	select {
-	case err := <-grpcRecvErr:
-		assert.ErrorIs(t, err, io.EOF)
-	case <-time.After(2 * time.Second):
-		t.Fatal("gRPC Watch did not drain")
-	}
+	assert.ErrorIs(t, testutil.Recv(t, grpcRecvErr, "the gRPC Watch to drain"), io.EOF)
 }

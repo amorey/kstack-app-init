@@ -20,13 +20,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientcmd "k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 func generateUniquePathname(dirname string) string {
@@ -160,13 +161,13 @@ func TestKubeConfigWatcherSubscribeModified(t *testing.T) {
 	defer sub.Close()
 
 	// Drain the seeded initial value.
-	<-sub.Chan()
+	testutil.Recv(t, sub.Chan(), "the initial seeded value")
 
 	// Modify one of the files.
 	cfg2, err := createKubeConfig(p2)
 	require.NoError(t, err)
 
-	cfgActual := <-sub.Chan()
+	cfgActual := testutil.Recv(t, sub.Chan(), "the reload published after the second file changed")
 
 	expectedClusters := mergeMaps(cfg1.Clusters, cfg2.Clusters)
 	compareMaps(t, expectedClusters, cfgActual.Clusters)
@@ -241,22 +242,15 @@ func TestKubeConfigWatcher_HandlesRepeatedAtomicWrites(t *testing.T) {
 	defer sub.Close()
 
 	// Drain the seeded initial value.
-	select {
-	case <-sub.Chan():
-	case <-time.After(time.Second):
-		t.Fatal("expected initial seeded value")
-	}
+	testutil.Recv(t, sub.Chan(), "the initial seeded value")
 
 	for i := 0; i < 2; i++ {
 		cfgExpected := atomicReplaceKubeConfig(t, kubeconfigPath)
 
-		select {
-		case cfgActual := <-sub.Chan():
-			compareMaps(t, cfgExpected.Clusters, cfgActual.Clusters)
-			assert.Equal(t, cfgExpected.CurrentContext, cfgActual.CurrentContext)
-		case <-time.After(2 * time.Second):
-			t.Fatalf("reload %d did not arrive — file watch likely detached after the first atomic write", i+1)
-		}
+		cfgActual := testutil.Recv(t, sub.Chan(),
+			fmt.Sprintf("reload %d (a file watch that detached after the first atomic write never delivers it)", i+1))
+		compareMaps(t, cfgExpected.Clusters, cfgActual.Clusters)
+		assert.Equal(t, cfgExpected.CurrentContext, cfgActual.CurrentContext)
 	}
 }
 
@@ -279,22 +273,14 @@ func TestKubeConfigWatcher_PicksUpFileCreatedAfterStart(t *testing.T) {
 	defer sub.Close()
 
 	// Drain the empty seed so the next Chan read is the post-create reload.
-	select {
-	case <-sub.Chan():
-	case <-time.After(time.Second):
-		t.Fatal("expected initial seeded value")
-	}
+	testutil.Recv(t, sub.Chan(), "the initial seeded value")
 
 	cfgExpected, err := createKubeConfig(kubeconfigPath)
 	require.NoError(t, err)
 
-	select {
-	case cfgActual := <-sub.Chan():
-		compareMaps(t, cfgExpected.Clusters, cfgActual.Clusters)
-		compareMaps(t, cfgExpected.AuthInfos, cfgActual.AuthInfos)
-		compareMaps(t, cfgExpected.Contexts, cfgActual.Contexts)
-		assert.Equal(t, cfgExpected.CurrentContext, cfgActual.CurrentContext)
-	case <-time.After(2 * time.Second):
-		t.Fatal("watcher did not publish reload after kubeconfig was created")
-	}
+	cfgActual := testutil.Recv(t, sub.Chan(), "the reload published after the kubeconfig was created")
+	compareMaps(t, cfgExpected.Clusters, cfgActual.Clusters)
+	compareMaps(t, cfgExpected.AuthInfos, cfgActual.AuthInfos)
+	compareMaps(t, cfgExpected.Contexts, cfgActual.Contexts)
+	assert.Equal(t, cfgExpected.CurrentContext, cfgActual.CurrentContext)
 }

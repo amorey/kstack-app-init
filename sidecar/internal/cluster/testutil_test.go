@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/k8shelpers"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // StaticWatcher is a KubeConfigSource pinned to one config: Get always returns
@@ -164,13 +165,12 @@ func NewTestBeehiveWithClusterCC(t *testing.T) (*beehive.Beehive, beehive.Contro
 	return bh, cc
 }
 
-// recv blocks for the next value on a stream channel, failing the test if the
-// channel closes first or nothing arrives within 2s. Shared by the per-object
+// recv blocks for the next value on a stream channel. Shared by the per-object
 // stream tests (schedule/event/probe watches) and the delta watches, which differ
 // only in element type.
 func recv[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()
-	return recvBy(t, ch, time.After(2*time.Second))
+	return testutil.Recv(t, ch, "a stream value")
 }
 
 // recvBy is recv with a caller-supplied deadline, so a drain loop can share one

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"golang.org/x/oauth2"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // SetSSEHeaderTimeoutForTest overrides the SSE open-handshake timeout (used when
@@ -116,13 +118,8 @@ func TestWatchSettingsBoundsOpenHandshake(t *testing.T) {
 		done <- err
 	}()
 
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("want error when the open handshake stalls, got nil")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("WatchSettings did not bound the stalled open handshake")
+	if err := testutil.Recv(t, done, "WatchSettings to bound the stalled open handshake"); err == nil {
+		t.Fatal("want error when the open handshake stalls, got nil")
 	}
 }
 
@@ -145,13 +142,8 @@ func TestTokenFetchBounded(t *testing.T) {
 		_, err := c.GetSettings(context.Background())
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("want error when token fetch stalls, got nil")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("GetSettings did not bound the token fetch")
+	if err := testutil.Recv(t, done, "GetSettings to bound the token fetch"); err == nil {
+		t.Fatal("want error when token fetch stalls, got nil")
 	}
 }
 
@@ -186,13 +178,8 @@ func TestWatchSettingsBoundsErrorBody(t *testing.T) {
 		_, _, err := c.WatchSettings(context.Background())
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("want error on non-200 SSE open, got nil")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("WatchSettings hung reading a stalled error body")
+	if err := testutil.Recv(t, done, "WatchSettings to stop reading a stalled error body"); err == nil {
+		t.Fatal("want error on non-200 SSE open, got nil")
 	}
 }
 
@@ -261,16 +248,8 @@ func TestWatchSettingsEmitsNext(t *testing.T) {
 	}
 	emit <- "event: next\ndata: {\"data\":{\"settingsWatch\":{\"theme\":\"blue\"}}}\n\n"
 
-	select {
-	case got, ok := <-ch:
-		if !ok {
-			t.Fatal("channel closed early")
-		}
-		if got.Theme == nil || *got.Theme != "blue" {
-			t.Fatalf("got %+v", got)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for next event")
+	if got := testutil.Recv(t, ch, "the next event"); got.Theme == nil || *got.Theme != "blue" {
+		t.Fatalf("got %+v", got)
 	}
 }
 
@@ -295,21 +274,9 @@ func TestWatchSettingsSurfacesErrorFrame(t *testing.T) {
 	// Error frame (data:null): no Settings is published, and the channel closes.
 	emit <- "event: next\ndata: {\"errors\":[{\"message\":\"boom\"}],\"data\":null}\n\n"
 
-	select {
-	case got, ok := <-ch:
-		if ok {
-			t.Fatalf("error frame published a Settings value: %+v", got)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("stream did not close on the error frame")
-	}
-	select {
-	case e := <-errCh:
-		if e == nil || !strings.Contains(e.Error(), "boom") {
-			t.Fatalf("terminal error = %v, want one carrying the GraphQL error \"boom\"", e)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no terminal error published for the error frame")
+	testutil.RecvClosed(t, ch, "the stream on the error frame")
+	if e := testutil.Recv(t, errCh, "a terminal error for the error frame"); e == nil || !strings.Contains(e.Error(), "boom") {
+		t.Fatalf("terminal error = %v, want one carrying the GraphQL error \"boom\"", e)
 	}
 }
 
@@ -344,14 +311,7 @@ func TestWatchSettingsCompleteCloses(t *testing.T) {
 	}
 	close(emit) // server sends `complete`
 
-	select {
-	case _, ok := <-ch:
-		if ok {
-			t.Fatal("want closed channel on complete")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for close")
-	}
+	testutil.RecvClosed(t, ch, "the stream on complete")
 }
 
 // C24b: cancelling the context closes the channel.
@@ -368,14 +328,7 @@ func TestWatchSettingsContextCancelCloses(t *testing.T) {
 	}
 	cancel()
 
-	select {
-	case _, ok := <-ch:
-		if ok {
-			t.Fatal("want closed channel on ctx cancel")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for close")
-	}
+	testutil.RecvClosed(t, ch, "the stream on ctx cancel")
 }
 
 // Cancelling the context is a CLEAN shutdown (Poke/sign-out), so the terminal
@@ -395,12 +348,7 @@ func TestWatchSettingsContextCancelIsCleanError(t *testing.T) {
 
 	for range ch { // drain until close
 	}
-	select {
-	case e := <-errCh:
-		if e != nil {
-			t.Fatalf("ctx cancel must be a clean close, got terminal error %v", e)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no terminal error published")
+	if e := testutil.Recv(t, errCh, "the terminal error"); e != nil {
+		t.Fatalf("ctx cancel must be a clean close, got terminal error %v", e)
 	}
 }

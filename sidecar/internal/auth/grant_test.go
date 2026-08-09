@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // memCredStore is an in-memory CredentialsStore fake standing in for the host
@@ -59,13 +61,7 @@ func noRefresh(context.Context, string) (Token, error) {
 // recvState blocks for the next published State, failing on timeout.
 func recvState(t *testing.T, ch <-chan State) State {
 	t.Helper()
-	select {
-	case st := <-ch:
-		return st
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for state")
-		return State{}
-	}
+	return testutil.Recv(t, ch, "a published State")
 }
 
 // --- token / refresh behavior ---

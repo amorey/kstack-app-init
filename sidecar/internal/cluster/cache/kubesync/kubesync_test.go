@@ -29,6 +29,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/watch"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // These tests drive the worker end to end against a fake upstream and a fake store, so
@@ -37,7 +39,7 @@ import (
 // each concrete store writes is that store's own business, tested beside it (see
 // eventsync/store_test.go and objectsync/store_test.go).
 
-const testTimeout = 5 * time.Second
+const testTimeout = testutil.Timeout
 
 // fakeStore is an in-memory kubesync.Store: a uid-keyed set plus the resume cookie, with
 // the same prune-on-replace semantics a real store has.
@@ -444,7 +446,7 @@ func TestWorkerExpiredWatchRelistsAndPrunes(t *testing.T) {
 
 	// Expire the watch: RetryWatcher forwards the Status and closes, which the driver reads
 	// as errExpired and answers with a fresh LIST.
-	fw := <-fws
+	fw := testutil.Recv(t, fws, "the established watch")
 	fw.Error(&metav1.Status{Status: metav1.StatusFailure, Code: 410, Reason: metav1.StatusReasonExpired})
 
 	require.Eventually(t, func() bool {
@@ -1071,12 +1073,12 @@ func TestWorkerReportsArriveInTheOrderTheyWereBuilt(t *testing.T) {
 	// The first report is in flight — built, and inside the sink's write — for as long as
 	// this holds. A real Report writes the object through the controller, so blocking here
 	// is only a slow one.
-	inReport := make(chan struct{})
+	inReport := testutil.NewSignal()
 	releaseReport := make(chan struct{})
 	// Stand in for the sink's write by holding the first delivery open.
 	sink.beforeReport = func(st Status) {
 		if st.State == StateStale {
-			close(inReport)
+			inReport.Fire()
 			<-releaseReport
 		}
 	}
@@ -1090,7 +1092,7 @@ func TestWorkerReportsArriveInTheOrderTheyWereBuilt(t *testing.T) {
 		})
 	}()
 	go func() {
-		<-inReport
+		<-inReport.Chan()
 		note("report:stale")
 		close(releaseReport)
 	}()
@@ -1098,15 +1100,15 @@ func TestWorkerReportsArriveInTheOrderTheyWereBuilt(t *testing.T) {
 	secondDone := make(chan struct{})
 	go func() {
 		defer close(secondDone)
-		<-inReport // the recovery is computed while the stale report is still in flight
+		<-inReport.Chan() // the recovery is computed while the stale report is still in flight
 		w.emit(func() (Status, bool) {
 			note("build:watching")
 			return Status{State: StateWatching}, true
 		})
 	}()
 
-	<-firstDone
-	<-secondDone
+	testutil.Wait(t, firstDone, "the first emit to return")
+	testutil.Wait(t, secondDone, "the second emit to return")
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -1188,12 +1190,8 @@ func TestWorkerRetainedRVDoesNotShortCircuitTheCatchUpProof(t *testing.T) {
 		withSleep(func(context.Context, time.Duration) error { return nil }),
 	))
 
-	var handed []*watch.RaceFreeFakeWatcher
-	select {
-	case fw := <-watchers: // a watch request has been answered, so the retry connected
-		handed = append(handed, fw)
-	case <-time.After(2 * time.Second):
-		t.Fatal("the retained RV was never retried")
+	handed := []*watch.RaceFreeFakeWatcher{
+		testutil.Recv(t, watchers, "the retained RV to be retried"),
 	}
 
 	require.Never(t, func() bool { return slices.Contains(sink.states(), StateWatching) },

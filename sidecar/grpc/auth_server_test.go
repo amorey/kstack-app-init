@@ -21,6 +21,7 @@ import (
 	grpcserver "github.com/kubetail-org/kstack-app/sidecar/grpc"
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/authpb"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // fakeAuthSvc is a hand-written auth.Service for the grpc server tests:
@@ -241,12 +242,7 @@ func TestAuthStateWatchDrainsOnShutdown(t *testing.T) {
 	defer cancel()
 	require.NoError(t, grpcSrv.DrainWithContext(ctx))
 
-	select {
-	case err := <-recvErr:
-		require.ErrorIs(t, err, io.EOF)
-	case <-time.After(3 * time.Second):
-		t.Fatal("AuthStateWatch stream did not drain after NotifyShutdown")
-	}
+	require.ErrorIs(t, testutil.Recv(t, recvErr, "the AuthStateWatch stream to drain after NotifyShutdown"), io.EOF)
 
 	grpcSrv.Stop()
 }

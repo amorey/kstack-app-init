@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // A read that fails must schedule its OWN re-read. Recovery cannot depend on the next write
@@ -41,7 +42,7 @@ func TestCacheWatchLoopRetriesAFailedRead(t *testing.T) {
 	require.NoError(t, err)
 
 	var fires atomic.Int32
-	succeeded := make(chan struct{})
+	succeeded := testutil.NewSignal()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -56,30 +57,18 @@ func TestCacheWatchLoopRetriesAFailedRead(t *testing.T) {
 				if fires.Add(1) == 1 {
 					return true, true
 				}
-				select {
-				case <-succeeded:
-				default:
-					close(succeeded)
-				}
+				succeeded.Fire()
 				return true, false
 			},
 			func() bool { return true },
 		)
 	}()
 
-	select {
-	case <-succeeded:
-	case <-time.After(cacheWatchRetryInterval + 3*time.Second):
-		t.Fatal("a failed read was never retried")
-	}
+	succeeded.Wait(t, "a failed read to be retried")
 	assert.GreaterOrEqual(t, fires.Load(), int32(2))
 
 	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the loop did not unwind")
-	}
+	testutil.Wait(t, done, "the loop to unwind")
 }
 
 // The retry must stop once a read succeeds, or a healthy watch would re-read on a timer

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefs"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 //go:fix inline
@@ -77,13 +78,8 @@ func TestStoreSubscribeDeliversCurrentSnapshot(t *testing.T) {
 
 	sub := s.Subscribe()
 	defer sub.Close()
-	select {
-	case got := <-sub.Chan():
-		if got.Theme == nil || *got.Theme != "light" {
-			t.Fatalf("snapshot: want light, got %+v", got)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for current snapshot")
+	if got := testutil.Recv(t, sub.Chan(), "the current snapshot"); got.Theme == nil || *got.Theme != "light" {
+		t.Fatalf("snapshot: want light, got %+v", got)
 	}
 }
 

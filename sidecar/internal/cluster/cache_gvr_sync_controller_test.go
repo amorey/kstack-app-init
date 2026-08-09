@@ -31,6 +31,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/objectsync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // These tests cover the controller's own responsibilities — when a kind's worker runs,
@@ -104,13 +105,7 @@ func (f *workerFactory) build(_ context.Context, _ *rest.Config, _ *store.Cluste
 // arrives.
 func (f *workerFactory) await(t *testing.T) *fakeWorker {
 	t.Helper()
-	select {
-	case w := <-f.newC:
-		return w
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the controller to start a worker")
-		return nil
-	}
+	return testutil.Recv(t, f.newC, "the controller to start a worker")
 }
 
 func (f *workerFactory) count() int {
@@ -127,6 +122,18 @@ type gvrWorkerFactory struct {
 	// limiters records the LIST-phase budget each worker was built with, so a test can
 	// assert every kind of one cache shares one.
 	limiters chan kubesync.ListLimiter
+}
+
+// awaitKind returns the kind the next worker was built for.
+func (f *gvrWorkerFactory) awaitKind(t *testing.T) objectsync.Kind {
+	t.Helper()
+	return testutil.Recv(t, f.kinds, "the kind a worker was built for")
+}
+
+// awaitLimiter returns the LIST budget the next worker was built with.
+func (f *gvrWorkerFactory) awaitLimiter(t *testing.T) kubesync.ListLimiter {
+	t.Helper()
+	return testutil.Recv(t, f.limiters, "the limiter a worker was built with")
 }
 
 func newGVRWorkerFactory() *gvrWorkerFactory {
@@ -351,8 +358,8 @@ func TestGVRSyncWorkersOfOneCacheShareOneListLimiter(t *testing.T) {
 	})
 	f.factory.await(t)
 
-	first := <-f.factory.limiters
-	second := <-f.factory.limiters
+	first := f.factory.awaitLimiter(t)
+	second := f.factory.awaitLimiter(t)
 	require.NotNil(t, first, "workers must be built with a real limiter, not an unbounded nil")
 	assert.Equal(t, cacheListConcurrency, cap(first))
 	assert.Equal(t, first, second, "both kinds of one cache must share one LIST budget")
@@ -370,7 +377,7 @@ func TestGVRSyncRestartCacheWorkersIsScopedToOneCache(t *testing.T) {
 	f.createChild(t, testGVRSyncSpec)
 
 	mine := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 	entry := f.ctrl.workers.entries()[0]
 
 	// A worker belonging to some other cache, registered directly: this fixture drives one
@@ -396,7 +403,7 @@ func TestGVRSyncRestartCacheWorkersIsScopedToOneCache(t *testing.T) {
 	assert.True(t, deletedWhileStopped, "the cache file must not be deleted under a live worker")
 
 	rebuilt := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 	assert.NotSame(t, mine, rebuilt, "the cleared cache's worker must be rebuilt")
 	assert.True(t, mine.isStopped())
 	assert.False(t, other.worker.(*fakeWorker).isStopped(), "another cache's worker must be left alone")
@@ -424,7 +431,7 @@ func TestGVRSyncRestartCacheWorkersAbortsOnAnAlreadyDrainingWorker(t *testing.T)
 	f.createChild(t, testGVRSyncSpec)
 
 	stuck := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 	entry := f.ctrl.workers.entries()[0]
 
 	// An earlier stop that timed out: the entry stays in the set, marked draining.
@@ -458,7 +465,7 @@ func TestGVRSyncRestartCacheWorkersRefusesARegistrationMidSequence(t *testing.T)
 	f.createChild(t, testGVRSyncSpec)
 
 	f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 	entry := f.ctrl.workers.entries()[0]
 
 	// Stand in for the reconcile caught between Open and registration: it built its worker
@@ -496,7 +503,7 @@ func TestGVRSyncOverlappingCacheRestartsHoldTheBarrier(t *testing.T) {
 	f.connect("fp-1")
 	f.createChild(t, testGVRSyncSpec)
 	f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 	entry := f.ctrl.workers.entries()[0]
 
 	// A second sequence takes its hold while the first is inside between(), and keeps it
@@ -541,7 +548,7 @@ func TestGVRSyncOverlappingCacheRestartsAreSerialized(t *testing.T) {
 	f.connect("fp-1")
 	f.createChild(t, testGVRSyncSpec)
 	first := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 	entry := f.ctrl.workers.entries()[0]
 
 	// The second sequence starts while the first is inside its teardown, and must wait
@@ -589,7 +596,7 @@ func TestGVRSyncRestartCacheWorkersSkipsTeardownWhenADrainFails(t *testing.T) {
 	f.createChild(t, testGVRSyncSpec)
 
 	stuck := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 	entry := f.ctrl.workers.entries()[0]
 
 	stuck.mu.Lock()
@@ -623,7 +630,7 @@ func TestGVRSyncRebuildsAfterAWedgedDrain(t *testing.T) {
 
 	obj := f.createChild(t, testGVRSyncSpec)
 	first := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 
 	// Wedge the drain: the stop fails, so the entry stays behind marked draining.
 	first.mu.Lock()
@@ -664,7 +671,7 @@ func TestGVRSyncPokeDoesNotResurrectAStoppedWorker(t *testing.T) {
 	obj := f.createChild(t, testGVRSyncSpec)
 
 	worker := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 	entry := f.ctrl.workers.get(obj.ID)
 	require.NotNil(t, entry)
 
@@ -692,12 +699,12 @@ func TestGVRSyncPokeRestartsARunningWorker(t *testing.T) {
 	obj := f.createChild(t, testGVRSyncSpec)
 
 	first := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 
 	f.ctrl.restartWorkers(context.Background())
 
 	second := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 	assert.NotSame(t, first, second, "the poke must rebuild the running worker")
 	assert.True(t, first.isStopped(), "the superseded worker must be drained")
 	assert.NotNil(t, f.ctrl.workers.get(obj.ID))
@@ -717,7 +724,7 @@ func TestGVRSyncRestartsWorkerWhenTheKindChanges(t *testing.T) {
 	first := f.factory.await(t)
 	require.Equal(t, objectsync.Kind{
 		APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Namespaced: true,
-	}, <-f.factory.kinds)
+	}, f.factory.awaitKind(t))
 
 	// The CRD comes back under the same apiVersion/resource with a different Kind — the
 	// same child, respecified. The connection is untouched.
@@ -732,7 +739,7 @@ func TestGVRSyncRestartsWorkerWhenTheKindChanges(t *testing.T) {
 		"the worker built from the superseded kind must be drained")
 	assert.Equal(t, objectsync.Kind{
 		APIVersion: "apps/v1", Kind: "Rollout", Resource: "deployments", Namespaced: true,
-	}, <-f.factory.kinds, "the replacement must carry the new identity")
+	}, f.factory.awaitKind(t), "the replacement must carry the new identity")
 }
 
 // A steady re-reconcile — the 30s liveness recheck, a poke, an unchanged spec re-apply —
@@ -744,7 +751,7 @@ func TestGVRSyncKeepsWorkerWhenNothingChanged(t *testing.T) {
 	obj := f.createChild(t, testGVRSyncSpec)
 
 	first := f.factory.await(t)
-	<-f.factory.kinds
+	f.factory.awaitKind(t)
 
 	// Re-apply the identical spec: beehive suppresses the write, and an out-of-band
 	// reconcile re-runs converge against the same connection.

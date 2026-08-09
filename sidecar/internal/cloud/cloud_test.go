@@ -4,12 +4,12 @@ import (
 	"context"
 	"sync"
 	"testing"
-	"time"
 
 	"golang.org/x/oauth2"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefs"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // fakeAuth is a hand-written auth.Service for the poke-inversion test. cloud
@@ -90,14 +90,15 @@ func (f *fakeAuth) publishLocked() {
 // signalUpstream is a fake prefsync.Upstream whose Snapshot signals that the
 // engine has started running.
 type signalUpstream struct {
-	started chan struct{}
+	started *testutil.Signal
+}
+
+func newSignalUpstream() *signalUpstream {
+	return &signalUpstream{started: testutil.NewSignal()}
 }
 
 func (s *signalUpstream) Snapshot(context.Context) (prefs.Settings, error) {
-	select {
-	case s.started <- struct{}{}:
-	default:
-	}
+	s.started.Fire()
 	return prefs.Settings{}, nil
 }
 
@@ -166,11 +167,7 @@ func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	select {
-	case <-up.watchOpened:
-	case <-time.After(2 * time.Second):
-		t.Fatal("engine never opened a watch")
-	}
+	testutil.Wait(t, up.watchOpened, "the engine to open a watch")
 
 	// Sign out via auth → session change → cloud pokes its engine → the live,
 	// in-flight authenticated watch is cancelled.
@@ -178,12 +175,8 @@ func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 		t.Fatalf("Logout: %v", err)
 	}
 
-	select {
-	case <-up.cancelled:
-		// good: the live watch was cancelled in response to the auth sign-out
-	case <-time.After(2 * time.Second):
-		t.Fatal("live watch was not torn down on auth sign-out")
-	}
+	// the live watch must be cancelled in response to the auth sign-out
+	testutil.Wait(t, up.cancelled, "the live watch to be torn down on auth sign-out")
 
 	if err := stop(context.Background()); err != nil {
 		t.Fatalf("stop: %v", err)
@@ -194,7 +187,7 @@ func TestWatchTornDownOnAuthSignOut(t *testing.T) {
 // goroutine, and stop still unwinds cleanly.
 func TestStartIsIdempotent(t *testing.T) {
 	authSvc, _ := auth.New(auth.Config{})
-	up := &signalUpstream{started: make(chan struct{}, 1)}
+	up := newSignalUpstream()
 	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", authSvc, nil, withUpstream(up))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -209,11 +202,7 @@ func TestStartIsIdempotent(t *testing.T) {
 		t.Fatalf("second Start: %v", err)
 	}
 
-	select {
-	case <-up.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("engine did not start")
-	}
+	up.started.Wait(t, "the engine to start")
 	if err := stop(context.Background()); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
@@ -249,7 +238,7 @@ func TestDegradedLifecycleNoop(t *testing.T) {
 // A fully-configured Service starts the engine on Start and stops it on Close.
 func TestConfiguredStartStop(t *testing.T) {
 	authSvc, _ := auth.New(auth.Config{})
-	up := &signalUpstream{started: make(chan struct{}, 1)}
+	up := newSignalUpstream()
 	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", authSvc, nil, withUpstream(up)) // test seam: inject fake instead of the api client
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -265,12 +254,8 @@ func TestConfiguredStartStop(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	select {
-	case <-up.started:
-		// engine reached Snapshot → it's running
-	case <-time.After(2 * time.Second):
-		t.Fatal("engine did not start")
-	}
+	// the engine reached Snapshot → it's running
+	up.started.Wait(t, "the engine to start")
 
 	if err := stop(context.Background()); err != nil {
 		t.Fatalf("stop: %v", err)

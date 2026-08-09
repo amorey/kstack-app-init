@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // noopController satisfies beehive.Controller without reconciling. A test gets a
@@ -645,14 +646,7 @@ func TestServiceCacheStatsExcludesEventKind(t *testing.T) {
 // timeout or an unexpected close.
 func recvKindChange(t *testing.T, ch <-chan ClusterDataKindChange) ClusterDataKindChange {
 	t.Helper()
-	select {
-	case ev, ok := <-ch:
-		require.True(t, ok, "stream closed early")
-		return ev
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for a ClusterDataKindChange")
-		return ClusterDataKindChange{}
-	}
+	return testutil.Recv(t, ch, "a ClusterDataKindChange")
 }
 
 // ClusterDataKindsWatch streams the active cache's kind catalog as a delta watch: the
@@ -735,12 +729,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 
 	// ctx cancel ends the stream.
 	cancel()
-	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "stream must close on ctx cancel")
-	case <-time.After(2 * time.Second):
-		t.Fatal("stream did not close on ctx cancel")
-	}
+	testutil.RecvClosed(t, ch, "the stream on ctx cancel")
 }
 
 // A burst of write pings within one debounce window collapses into a single catalog
@@ -820,12 +809,7 @@ func TestServiceClusterDataKindsWatchNoOpenCache(t *testing.T) {
 		// No frame yet, as expected; cancel and require close.
 	}
 	cancel()
-	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "stream must close on ctx cancel")
-	case <-time.After(2 * time.Second):
-		t.Fatal("stream did not close on ctx cancel")
-	}
+	testutil.RecvClosed(t, ch, "the stream on ctx cancel")
 }
 
 // insertCatalogKind inserts one kind_catalog row into a cache db (test helper for
@@ -946,14 +930,7 @@ func TestServiceClusterDataKindsWatchEmitsDeletesOnCloseWithoutReopen(t *testing
 
 func recvEventChange(t *testing.T, ch <-chan ClusterDataEventChange) ClusterDataEventChange {
 	t.Helper()
-	select {
-	case ev, ok := <-ch:
-		require.True(t, ok, "stream closed early")
-		return ev
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for a ClusterDataEventChange")
-		return ClusterDataEventChange{}
-	}
+	return testutil.Recv(t, ch, "a ClusterDataEventChange")
 }
 
 // insertEvent writes one row directly into the events table (uid + the display columns),
@@ -975,14 +952,7 @@ func insertEvent(t *testing.T, ctx context.Context, cdb *store.ClusterDB, uid, e
 // close or timeout.
 func recvObjectChange(t *testing.T, ch <-chan ClusterDataObjectChange) ClusterDataObjectChange {
 	t.Helper()
-	select {
-	case ev, ok := <-ch:
-		require.True(t, ok, "stream closed early")
-		return ev
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for a ClusterDataObjectChange")
-		return ClusterDataObjectChange{}
-	}
+	return testutil.Recv(t, ch, "a ClusterDataObjectChange")
 }
 
 // insertObject writes one row directly into the objects table (the universal-identity
@@ -1086,12 +1056,7 @@ func TestServiceClusterDataEventsWatch(t *testing.T) {
 	assert.Equal(t, "e2", del.Event.UID)
 
 	cancel()
-	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "stream must close on ctx cancel")
-	case <-time.After(2 * time.Second):
-		t.Fatal("stream did not close on ctx cancel")
-	}
+	testutil.RecvClosed(t, ch, "the stream on ctx cancel")
 }
 
 // An object write pings the object-write broker, not the events broker, so it must NOT
@@ -1204,12 +1169,7 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 	assert.Equal(t, "d2", del.Object.UID)
 
 	cancel()
-	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "stream must close on ctx cancel")
-	case <-time.After(2 * time.Second):
-		t.Fatal("stream did not close on ctx cancel")
-	}
+	testutil.RecvClosed(t, ch, "the stream on ctx cancel")
 }
 
 // The objects watch is keyed by (apiVersion, resource): a write of a different kind
@@ -1273,12 +1233,7 @@ func TestServiceClusterDataObjectsWatchNoOpenCache(t *testing.T) {
 	}
 
 	cancel()
-	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "stream must close on ctx cancel")
-	case <-time.After(2 * time.Second):
-		t.Fatal("stream did not close on ctx cancel")
-	}
+	testutil.RecvClosed(t, ch, "the stream on ctx cancel")
 }
 
 // Resource routing eliminates the wasted re-read, not just the wasted frame: with the
@@ -1594,8 +1549,7 @@ func TestServiceScheduleWatchMapsGauge(t *testing.T) {
 
 	// source close → out closes
 	close(fake.ch)
-	_, ok := <-out
-	assert.False(t, ok, "out must close when the schedule source closes")
+	testutil.RecvClosed(t, out, "out when the schedule source closes")
 }
 
 // mergeSchedule folds the schedule gauge (NextRequeueAt) and the in-flight probe
@@ -1639,8 +1593,7 @@ func TestMergeScheduleCombinesGaugeAndProbe(t *testing.T) {
 
 	// Closing both → out closes.
 	close(schedCh)
-	_, ok := <-out
-	assert.False(t, ok, "out must close when both sub-sources close")
+	testutil.RecvClosed(t, out, "out when both sub-sources close")
 }
 
 // ClusterScheduleWatch, through the ClusterService interface, streams the real
@@ -1860,14 +1813,7 @@ func TestClusterCacheEventsPublicSurface(t *testing.T) {
 // recvStats takes the next value off a stats gauge, failing on timeout.
 func recvStats(t *testing.T, ch <-chan ClusterCacheStats) ClusterCacheStats {
 	t.Helper()
-	select {
-	case v, ok := <-ch:
-		require.True(t, ok, "stats stream closed")
-		return v
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for a stats frame")
-		return ClusterCacheStats{}
-	}
+	return testutil.Recv(t, ch, "a stats frame")
 }
 
 // TestClusterCacheStatsWatchTracksWrites is the regression for a frozen cache summary.
@@ -2036,14 +1982,7 @@ func TestWatchGVRSyncsResolvesAnAnchorCreatedAfterSubscribe(t *testing.T) {
 
 func recvGVRSyncChange(t *testing.T, ch <-chan ClusterCacheGVRSyncChange) ClusterCacheGVRSyncChange {
 	t.Helper()
-	select {
-	case v, ok := <-ch:
-		require.True(t, ok, "gvr sync stream closed")
-		return v
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for a gvr sync frame")
-		return ClusterCacheGVRSyncChange{}
-	}
+	return testutil.Recv(t, ch, "a gvr sync frame")
 }
 
 // seedGVRDiscovery creates the discovery anchor the cache controller would.
@@ -2063,25 +2002,11 @@ func TestCatalogSubscribeClosesWhenBothBrokersDo(t *testing.T) {
 
 	// A write on either broker still reaches the caller.
 	db.EventsNotify()
-	select {
-	case <-pings:
-	case <-time.After(2 * time.Second):
-		t.Fatal("an event write must wake the catalog watch")
-	}
+	testutil.Wait(t, pings, "an event write to wake the catalog watch")
 
 	// Shutting the db down closes both brokers, which must close the composite.
 	require.NoError(t, mgr.Shutdown(ctx))
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case _, ok := <-pings:
-			if !ok {
-				return
-			}
-		case <-deadline:
-			t.Fatal("the composite must close once both brokers have")
-		}
-	}
+	testutil.WaitClosed(t, pings, "the composite")
 }
 
 // The per-kind watch is cache-scoped but rides a FLEET-wide stream, so its filter runs on

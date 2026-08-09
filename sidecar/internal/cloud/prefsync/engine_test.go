@@ -13,6 +13,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/mutationqueue"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefs"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 var epoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -216,19 +217,12 @@ func TestPokeCancelsInFlightSnapshot(t *testing.T) {
 
 	runEngine(t, e)
 
-	select {
-	case <-up.entered: // first Snapshot is now blocking
-	case <-time.After(2 * time.Second):
-		t.Fatal("engine never entered Snapshot")
-	}
+	testutil.Wait(t, up.entered, "the engine to enter Snapshot") // and block there
 
 	e.Poke() // must cancel the in-flight Snapshot
 
-	select {
-	case <-up.entered: // re-entered Snapshot ⇒ the blocked one was cancelled
-	case <-time.After(2 * time.Second):
-		t.Fatal("Poke did not cancel the in-flight Snapshot")
-	}
+	// re-entered Snapshot ⇒ the blocked one was cancelled
+	testutil.Wait(t, up.entered, "Poke to cancel the in-flight Snapshot")
 }
 
 // runEngine starts e.Run in the background and registers cleanup that cancels
@@ -529,13 +523,8 @@ func TestQueueDrainedOnConnect(t *testing.T) {
 
 	runEngine(t, e)
 
-	select {
-	case p := <-up.updates:
-		if p.Theme == nil || *p.Theme != "dark" {
-			t.Fatalf("Update got %+v", p)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for queue drain Update")
+	if p := testutil.Recv(t, up.updates, "the queue drain Update"); p.Theme == nil || *p.Theme != "dark" {
+		t.Fatalf("Update got %+v", p)
 	}
 	waitFor(t, func() bool { return len(q.Pending()) == 0 }, "queue not drained")
 }
@@ -711,19 +700,12 @@ func TestPokeDuringConnectIsNotAFailure(t *testing.T) {
 
 	runEngine(t, e)
 
-	select {
-	case <-up.entered: // first Snapshot is now blocking
-	case <-time.After(2 * time.Second):
-		t.Fatal("engine never entered Snapshot")
-	}
+	testutil.Wait(t, up.entered, "the engine to enter Snapshot") // and block there
 
 	e.Poke() // cancels the in-flight Snapshot — an intentional restart
 
-	select {
-	case <-up.entered: // re-entered Snapshot ⇒ the attempt was abandoned, not failed
-	case <-time.After(2 * time.Second):
-		t.Fatal("engine did not reconnect after a poke-cancel")
-	}
+	// re-entered Snapshot ⇒ the attempt was abandoned, not failed
+	testutil.Wait(t, up.entered, "the engine to reconnect after a poke-cancel")
 
 	// Parked back in Snapshot: a poke-cancel must not have recorded a failure.
 	if s := e.Status(); s.LastError != "" {
@@ -735,7 +717,7 @@ func TestPokeDuringConnectIsNotAFailure(t *testing.T) {
 // returning success — letting a test inject a cancellation into the window
 // between a successful Update and its Ack.
 type cancelOnUpdateUpstream struct {
-	updated  chan struct{}
+	updated  *testutil.Signal
 	onUpdate func()
 }
 
@@ -750,10 +732,7 @@ func (u *cancelOnUpdateUpstream) Watch(ctx context.Context) (<-chan prefs.Settin
 }
 
 func (u *cancelOnUpdateUpstream) Update(context.Context, prefs.Settings) (prefs.Settings, error) {
-	select {
-	case u.updated <- struct{}{}:
-	default:
-	}
+	u.updated.Fire()
 	if u.onUpdate != nil {
 		u.onUpdate()
 	}
@@ -769,7 +748,7 @@ func TestDrainDoesNotAckAfterCancel(t *testing.T) {
 	store, q := newStoreQueue(t)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	up := &cancelOnUpdateUpstream{updated: make(chan struct{}, 1)}
+	up := &cancelOnUpdateUpstream{updated: testutil.NewSignal()}
 	// Cancel between Update succeeding and the Ack — the engine then exits.
 	up.onUpdate = cancel
 	e := newWithOptions(up, store, q, nil, testOpts()...)
@@ -781,16 +760,8 @@ func TestDrainDoesNotAckAfterCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); e.Run(ctx) }()
 
-	select {
-	case <-up.updated:
-	case <-time.After(2 * time.Second):
-		t.Fatal("drain never pushed the queued patch")
-	}
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("engine did not exit after the context was cancelled")
-	}
+	up.updated.Wait(t, "the drain to push the queued patch")
+	testutil.Wait(t, done, "the engine to exit after the context was cancelled")
 
 	if n := len(q.Pending()); n != 1 {
 		t.Fatalf("want the pushed-but-unacked patch still queued, got %d pending", n)
@@ -810,20 +781,12 @@ func TestEngine_NotifierSignalPokes(t *testing.T) {
 	runEngine(t, e)
 
 	// Wait for the first Snapshot to block (engine is in connecting state).
-	select {
-	case <-up.entered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("engine never entered Snapshot")
-	}
+	testutil.Wait(t, up.entered, "the engine to enter Snapshot")
 
 	// Poke the broadcaster — the forwarding goroutine calls e.Poke(), which
 	// cancels the in-flight Snapshot and wakes any in-flight backoff.
 	b.Poke(poke.SourceHost)
 
 	// Engine should re-enter Snapshot promptly (proving the poke propagated).
-	select {
-	case <-up.entered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("notifier poke did not trigger a reconnect")
-	}
+	testutil.Wait(t, up.entered, "the notifier poke to trigger a reconnect")
 }
