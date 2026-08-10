@@ -436,9 +436,9 @@ func TestSubscribeNotifyAndCoalesce(t *testing.T) {
 	defer cancel()
 
 	// Two notifies with no consumer in between coalesce into one ping.
-	cdb.ObjectsNotify()
-	cdb.ObjectsNotify()
-	testutil.Wait(t, ch, "a ping after Notify")
+	cdb.ObjectsNotifyResource("v1", "pods")
+	cdb.ObjectsNotifyResource("v1", "pods")
+	testutil.Recv(t, ch, "a ping after Notify")
 	select {
 	case <-ch:
 		t.Fatal("coalesced pings must not deliver twice")
@@ -446,16 +446,15 @@ func TestSubscribeNotifyAndCoalesce(t *testing.T) {
 	}
 
 	// A notify after draining delivers again.
-	cdb.ObjectsNotify()
-	testutil.Wait(t, ch, "a ping after re-Notify")
+	cdb.ObjectsNotifyResource("v1", "pods")
+	testutil.Recv(t, ch, "a ping after re-Notify")
 }
 
 // A keyed object-write notify routes by resource: ObjectsNotifyResource wakes the
 // subscriber registered for that (apiVersion, resource) AND every keyless subscriber (the
 // kind-catalog watch, which must wake on any write), but NOT a subscriber keyed to a
 // different resource — so an unrelated resource's writes cost a keyed objects watch no
-// re-read. A keyless ObjectsNotify() broadcast still wakes everyone (the discovery/prune
-// fallback).
+// re-read. A catalog upsert routes by its own resource for the same reason.
 func TestObjectsBrokerKeyedNotify(t *testing.T) {
 	dir := t.TempDir()
 	r := NewManager(dir)
@@ -471,7 +470,7 @@ func TestObjectsBrokerKeyedNotify(t *testing.T) {
 	keyless, cancelKeyless := cdb.ObjectsSubscribe()
 	defer cancelKeyless()
 
-	pinged := func(ch <-chan struct{}) bool {
+	pinged := func(ch <-chan WriteWake) bool {
 		select {
 		case <-ch:
 			return true
@@ -480,7 +479,7 @@ func TestObjectsBrokerKeyedNotify(t *testing.T) {
 		}
 	}
 	// Drain any coalesced ping without waiting on the (slow) timeout.
-	drain := func(ch <-chan struct{}) {
+	drain := func(ch <-chan WriteWake) {
 		select {
 		case <-ch:
 		default:
@@ -504,11 +503,15 @@ func TestObjectsBrokerKeyedNotify(t *testing.T) {
 	drain(deploys)
 	drain(keyless)
 
-	// A keyless broadcast wakes every subscriber (discovery/prune fallback).
-	cdb.ObjectsNotify()
-	require.True(t, pinged(pods), "keyless broadcast must wake keyed subscribers")
-	require.True(t, pinged(deploys), "keyless broadcast must wake keyed subscribers")
-	require.True(t, pinged(keyless), "keyless broadcast must wake keyless subscribers")
+	// A catalog upsert routes the same way: it names one resource, so it reaches that
+	// resource's watch and the kind-catalog watches, and costs an unrelated kind's watch
+	// nothing. There is no wake-everyone publish for it to use.
+	require.NoError(t, EnsureKindCatalog(context.Background(), cdb, KindRow{
+		APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Scope: "Namespaced",
+	}))
+	require.True(t, pinged(deploys), "a catalog upsert must wake its own resource's watch")
+	require.True(t, pinged(keyless), "a catalog upsert must wake the kind-catalog watches")
+	require.False(t, pinged(pods), "a catalog upsert must not wake an unrelated resource's watch")
 }
 
 // Events reads the newest cached events (ordered by last_seen DESC), flattens the
@@ -572,7 +575,7 @@ func TestEventsBrokerIsSeparateFromWrites(t *testing.T) {
 
 	// EventsNotify pings only the events subscriber.
 	cdb.EventsNotify()
-	testutil.Wait(t, events, "EventsNotify to ping an events subscriber")
+	testutil.Recv(t, events, "EventsNotify to ping an events subscriber")
 	select {
 	case <-writes:
 		t.Fatal("EventsNotify must not ping the object-write subscriber")
@@ -580,8 +583,8 @@ func TestEventsBrokerIsSeparateFromWrites(t *testing.T) {
 	}
 
 	// Notify pings only the object-write subscriber.
-	cdb.ObjectsNotify()
-	testutil.Wait(t, writes, "Notify to ping a write subscriber")
+	cdb.ObjectsNotifyResource("v1", "pods")
+	testutil.Recv(t, writes, "Notify to ping a write subscriber")
 	select {
 	case <-events:
 		t.Fatal("Notify must not ping the events subscriber")

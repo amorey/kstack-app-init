@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -354,13 +355,15 @@ func TestWriteNotifiesOnlyItsResource(t *testing.T) {
 	assert.False(t, notified(podsC), "an unrelated kind's watch must not re-read")
 }
 
-// notified reports whether a write ping is already pending on ch. The brokers coalesce
-// into a buffered channel, so the ping is there by the time the write returns.
-func notified(ch <-chan struct{}) bool {
+// notified reports whether a write ping arrives on ch. The bus delivers a Chan
+// subscriber through a feeder goroutine, so a ping is NOT already pending when the
+// write returns — a select/default here would report false for every subscriber and
+// the routing assertions would all pass vacuously.
+func notified(ch <-chan store.WriteWake) bool {
 	select {
 	case <-ch:
 		return true
-	default:
+	case <-time.After(200 * time.Millisecond):
 		return false
 	}
 }

@@ -47,9 +47,9 @@ func TestCacheWatchLoopRetriesAFailedRead(t *testing.T) {
 	go func() {
 		defer close(done)
 		cacheWatchLoop(ctx, mgr, ref.CacheID, time.Millisecond,
-			func(*store.ClusterDB) (<-chan struct{}, func()) {
-				// A broker that never pings — the static-kind case.
-				return make(chan struct{}), func() {}
+			func(*store.ClusterDB) (<-chan store.WriteWake, func()) {
+				// A bus that never pings — the static-kind case.
+				return make(chan store.WriteWake), func() {}
 			},
 			func(*store.ClusterDB) (bool, bool) {
 				// Fail the first read, then succeed. No ping ever arrives, so only the
@@ -85,7 +85,7 @@ func TestCacheWatchLoopStopsRetryingOnceItSucceeds(t *testing.T) {
 
 	var fires atomic.Int32
 	go cacheWatchLoop(ctx, mgr, ref.CacheID, time.Millisecond,
-		func(*store.ClusterDB) (<-chan struct{}, func()) { return make(chan struct{}), func() {} },
+		func(*store.ClusterDB) (<-chan store.WriteWake, func()) { return make(chan store.WriteWake), func() {} },
 		func(*store.ClusterDB) (bool, bool) {
 			fires.Add(1)
 			return true, false // always succeeds

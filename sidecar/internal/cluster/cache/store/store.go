@@ -36,6 +36,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/amorey/gobus"
+	buswatch "github.com/amorey/gobus/watch"
 	"github.com/amorey/gochan/watch"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/sqlitemigrate"
@@ -478,76 +480,60 @@ type ClusterDB struct {
 	janitorCancel context.CancelFunc
 	janitorDone   chan struct{}
 
-	// Two independent coalescing write-notify brokers: writes (objects — drives both
+	// Two independent coalescing write-notify buses: writes (objects — drives both
 	// the kind-catalog and objects watches) and events. Separate so an event burst
 	// never wakes the unrelated object re-reads.
-	writes *notifyBroker
-	events *notifyBroker
+	writes *writeBus
+	events *writeBus
 }
 
-// notifyBroker is a coalescing pub/sub over cap-1 channels: pings while one is already
-// buffered are dropped (the subscriber re-queries and sees every change anyway).
+// WriteWake is one wake from a write bus. It carries no value — the key names
+// what moved and the subscriber re-reads the db — so consumers select on the
+// channel and ignore what arrives.
+type WriteWake = gobus.Event[string, struct{}]
+
+// writeBus is a coalescing write-notify bus over gobus/watch: a subscriber
+// registers for one routing key or across every key, and each publish leaves one
+// pending wake in a matching subscriber's slot. A burst under one key collapses
+// into that single slot, which is the coalescing the readers rely on — they
+// re-query and see every change anyway.
 //
-// A subscriber registers one key or subscribes keyless. A keyed notify wakes matching
-// subscribers plus all keyless ones (the kind-catalog watch must wake on any write); a
-// keyless notify broadcasts to everyone (writes not attributable to one key). The
-// events broker uses only the keyless forms.
-type notifyBroker struct {
-	mu     sync.Mutex
-	subs   map[int]brokerSub
-	nextID int
+// A keyed publish reaches that key's subscribers plus every across subscriber
+// (the kind-catalog watch must wake on any write). There is deliberately no
+// wake-everyone publish: every write path knows the resource it wrote.
+type writeBus struct {
+	hub *buswatch.Hub[string, struct{}]
+	tx  *buswatch.Sender[string, struct{}]
 }
 
-// brokerSub is one subscriber's channel plus its filter key ("" = keyless).
-type brokerSub struct {
-	ch  chan struct{}
-	key string
+func newWriteBus() *writeBus {
+	hub := buswatch.New[string, struct{}]()
+	return &writeBus{hub: hub, tx: hub.Sender()}
 }
 
-func newNotifyBroker() *notifyBroker {
-	return &notifyBroker{subs: make(map[int]brokerSub)}
-}
-
-func (b *notifyBroker) subscribe(key string) (<-chan struct{}, func()) {
-	ch := make(chan struct{}, 1)
-	b.mu.Lock()
-	id := b.nextID
-	b.nextID++
-	b.subs[id] = brokerSub{ch: ch, key: key}
-	b.mu.Unlock()
-	return ch, func() {
-		b.mu.Lock()
-		if existing, ok := b.subs[id]; ok {
-			delete(b.subs, id)
-			close(existing.ch)
-		}
-		b.mu.Unlock()
+// subscribe registers for key, or across every key when key is "". Registration
+// is the baseline and the bus never delivers it back, so a subscriber is woken
+// only by writes that follow it.
+func (b *writeBus) subscribe(key string) (<-chan WriteWake, func()) {
+	var rx *buswatch.Receiver[string, struct{}]
+	if key == "" {
+		rx = b.hub.WatchAcross(struct{}{})
+	} else {
+		rx = b.hub.Watch(key, struct{}{})
 	}
+	return rx.Chan(), rx.Close
 }
 
-// notify wakes a key's subscribers plus all keyless ones; a keyless notify ("")
-// broadcasts. A ping to a full slot is a no-op.
-func (b *notifyBroker) notify(key string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, s := range b.subs {
-		if key == "" || s.key == "" || s.key == key {
-			select {
-			case s.ch <- struct{}{}:
-			default:
-			}
-		}
-	}
+// notify publishes a wake under key. Never blocks.
+func (b *writeBus) notify(key string) {
+	_ = b.tx.Send(key, struct{}{}) //nolint:errcheck // a closed bus is a no-op
 }
 
-func (b *notifyBroker) close() {
-	b.mu.Lock()
-	for id, s := range b.subs {
-		delete(b.subs, id)
-		close(s.ch)
-	}
-	b.mu.Unlock()
-}
+// close ends every subscription. Closes the SENDER, not the hub: Hub.Close is a
+// hard tear-down with no drain, so a subscriber could lose a wake it had already
+// been sent, and Sender.Close is the one the bus permits to run concurrently
+// with a Send — nothing fences the writers against a db closing.
+func (b *writeBus) close() { b.tx.Close() }
 
 // Reader returns the multi-connection SELECT pool. Lock-free under WAL.
 func (c *ClusterDB) Reader() *sql.DB { return c.readDB }
@@ -609,7 +595,9 @@ func EnsureKindCatalog(ctx context.Context, cdb *ClusterDB, row KindRow) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	cdb.ObjectsNotify()
+	// Under the kind's own key: a catalog row names one resource, so the keyless
+	// kind-catalog watches wake and unrelated resources' watches do not.
+	cdb.ObjectsNotifyResource(row.APIVersion, row.Resource)
 	return nil
 }
 
@@ -826,15 +814,15 @@ func openClusterDB(ctx context.Context, dataDir string, ref CacheRef) (*ClusterD
 		path:    dbPath,
 		writeDB: writeDB,
 		readDB:  readDB,
-		writes:  newNotifyBroker(),
-		events:  newNotifyBroker(),
+		writes:  newWriteBus(),
+		events:  newWriteBus(),
 	}, nil
 }
 
 // ObjectsSubscribe returns a keyless coalesced ping channel woken by every object write,
 // plus its unsubscribe func. Use in place of polling: writers notify after commit, and
 // long-lived readers block here to know when to re-query.
-func (c *ClusterDB) ObjectsSubscribe() (<-chan struct{}, func()) { return c.writes.subscribe("") }
+func (c *ClusterDB) ObjectsSubscribe() (<-chan WriteWake, func()) { return c.writes.subscribe("") }
 
 // ObjectsSubscribeResource is ObjectsSubscribe scoped to one (apiVersion, resource) —
 // plus every keyless broadcast — so a per-kind watch isn't woken by unrelated writes.
@@ -843,16 +831,16 @@ func (c *ClusterDB) ObjectsSubscribe() (<-chan struct{}, func()) { return c.writ
 // recreated under the same resource with a different Kind, where a Kind-keyed
 // subscription would stay bound to the dead Kind and miss the replacement's writes.
 // See docs/adr/2026-08-09-per-cluster-sqlite-cache.md.
-func (c *ClusterDB) ObjectsSubscribeResource(apiVersion, resource string) (<-chan struct{}, func()) {
+func (c *ClusterDB) ObjectsSubscribeResource(apiVersion, resource string) (<-chan WriteWake, func()) {
 	return c.writes.subscribe(objectKey(apiVersion, resource))
 }
 
-// ObjectsNotify broadcasts to every object-write subscriber — the fallback for a write
-// not attributable to one resource (catalog rewrite, orphan prune). Non-blocking.
-func (c *ClusterDB) ObjectsNotify() { c.writes.notify("") }
-
 // ObjectsNotifyResource wakes the (apiVersion, resource) subscribers plus every keyless
 // one, leaving other resources untouched. Per-kind writers call it after commit.
+//
+// This is the only object-write notify: there is no wake-everyone form, because every
+// write path knows the resource it wrote and an unrelated resource's watch should not
+// pay a re-read for it.
 func (c *ClusterDB) ObjectsNotifyResource(apiVersion, resource string) {
 	c.writes.notify(objectKey(apiVersion, resource))
 }
@@ -863,11 +851,15 @@ func objectKey(apiVersion, resource string) string { return apiVersion + "/" + r
 
 // EventsSubscribe is the events table's coalesced ping channel, on its own broker so a
 // high-volume event burst never wakes the object re-reads.
-func (c *ClusterDB) EventsSubscribe() (<-chan struct{}, func()) { return c.events.subscribe("") }
+func (c *ClusterDB) EventsSubscribe() (<-chan WriteWake, func()) { return c.events.subscribe("") }
 
 // EventsNotify wakes every events subscriber; the events write paths call it after
-// commit. Non-blocking.
-func (c *ClusterDB) EventsNotify() { c.events.notify("") }
+// commit. Non-blocking. The events bus has one key — every subscriber is keyless —
+// so eventsKey is a label, not a route.
+func (c *ClusterDB) EventsNotify() { c.events.notify(eventsKey) }
+
+// eventsKey is the single key the events bus publishes under; see EventsNotify.
+const eventsKey = "events"
 
 // openPool opens a *sql.DB via sqlitemigrate. writer=true caps MaxOpenConns at 1 so
 // writes serialize at the pool instead of fighting at the SQLite layer.

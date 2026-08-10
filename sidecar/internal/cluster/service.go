@@ -452,7 +452,7 @@ func (s *Service) ClusterCacheStatsWatch(ctx context.Context, clusterID ClusterI
 	ref := newCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheGaugeWatch(ctx, s.cacheManager, ref.CacheID, s.cacheStatsDebounce,
 		// Keyless object-write broker: every kind's writes move this total.
-		func(db *store.ClusterDB) (<-chan struct{}, func()) { return db.ObjectsSubscribe() },
+		func(db *store.ClusterDB) (<-chan store.WriteWake, func()) { return db.ObjectsSubscribe() },
 		func(ctx context.Context, db *store.ClusterDB) (ClusterCacheStats, error) {
 			// Re-stat the file each read; nothing else carries its growth.
 			bytes, _ := s.cacheManager.CacheBytes(ref)
@@ -598,7 +598,7 @@ func (s *Service) ClusterDataObjectsWatch(ctx context.Context, clusterID Cluster
 		// Keyed to (apiVersion, resource) so unrelated writes don't wake it. The
 		// broker routes by plural resource, not Kind, so the key stays valid across
 		// a CRD Kind remap; see docs/adr/2026-08-09-per-cluster-sqlite-cache.md.
-		func(db *store.ClusterDB) (<-chan struct{}, func()) {
+		func(db *store.ClusterDB) (<-chan store.WriteWake, func()) {
 			return db.ObjectsSubscribeResource(apiVersion, resource)
 		},
 		func(ctx context.Context, db *store.ClusterDB) ([]ClusterDataObject, error) {
@@ -665,11 +665,11 @@ func millisToTime(ms int64) time.Time {
 // freeze the Events badge on an event-busy, object-quiet cluster. This doesn't
 // undercut the broker split — the split protects the EXPENSIVE per-kind object
 // re-reads; Kinds is O(kinds) and debounced besides.
-func catalogSubscribe(db *store.ClusterDB) (<-chan struct{}, func()) {
+func catalogSubscribe(db *store.ClusterDB) (<-chan store.WriteWake, func()) {
 	objects, stopObjects := db.ObjectsSubscribe()
 	events, stopEvents := db.EventsSubscribe()
 
-	out := make(chan struct{}, 1)
+	out := make(chan store.WriteWake, 1)
 	done := make(chan struct{})
 	go func() {
 		// Closing out signals the db went away — but only when BOTH brokers have
@@ -698,7 +698,7 @@ func catalogSubscribe(db *store.ClusterDB) (<-chan struct{}, func()) {
 			}
 			// Coalesce: a buffered ping already says "something changed".
 			select {
-			case out <- struct{}{}:
+			case out <- store.WriteWake{}:
 			default:
 			}
 		}
@@ -722,7 +722,7 @@ func cacheDeltaWatch[T comparable, C any](
 	mgr *store.Manager,
 	cacheID int64,
 	debounceDur time.Duration,
-	subscribe func(*store.ClusterDB) (<-chan struct{}, func()),
+	subscribe func(*store.ClusterDB) (<-chan store.WriteWake, func()),
 	snapshot func(context.Context, *store.ClusterDB) ([]T, error),
 	keyOf func(T) string,
 	mkChange func(ChangeType, T) C,
@@ -799,7 +799,7 @@ func cacheGaugeWatch[T comparable](
 	mgr *store.Manager,
 	cacheID int64,
 	debounceDur time.Duration,
-	subscribe func(*store.ClusterDB) (<-chan struct{}, func()),
+	subscribe func(*store.ClusterDB) (<-chan store.WriteWake, func()),
 	read func(context.Context, *store.ClusterDB) (T, error),
 	closed func() T,
 ) <-chan T {
@@ -852,7 +852,7 @@ func cacheWatchLoop(
 	mgr *store.Manager,
 	cacheID int64,
 	debounceDur time.Duration,
-	subscribe func(*store.ClusterDB) (<-chan struct{}, func()),
+	subscribe func(*store.ClusterDB) (<-chan store.WriteWake, func()),
 	onFire func(*store.ClusterDB) (keep bool, retry bool),
 	onClosed func() bool,
 ) {
@@ -862,7 +862,7 @@ func cacheWatchLoop(
 	// db/pings track the bound handle and its ping stream; nil while no cache is open.
 	var (
 		db        *store.ClusterDB
-		pings     <-chan struct{}
+		pings     <-chan store.WriteWake
 		cancelSub func()
 	)
 	defer func() {

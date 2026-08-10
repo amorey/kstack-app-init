@@ -704,7 +704,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 
 	// A new object of an existing kind bumps its count → Modified.
 	insertObj("d2", "apps/v1", "Deployment")
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	mod := recvKindChange(t, ch)
 	assert.Equal(t, ChangeModified, mod.Type)
 	assert.Equal(t, "Deployment", mod.Kind.Kind)
@@ -712,7 +712,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 
 	// A newly-discovered kind → Added.
 	insertKind("batch/v1", "Job", "jobs", "Namespaced", 0)
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("batch/v1", "jobs")
 	add := recvKindChange(t, ch)
 	assert.Equal(t, ChangeAdded, add.Type)
 	assert.Equal(t, "Job", add.Kind.Kind)
@@ -722,7 +722,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 	_, err = cdb.Writer().ExecContext(ctx,
 		`DELETE FROM kind_catalog WHERE kind = 'Node'`)
 	require.NoError(t, err)
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("v1", "nodes")
 	del := recvKindChange(t, ch)
 	assert.Equal(t, ChangeDeleted, del.Type)
 	assert.Equal(t, "Node", del.Kind.Kind)
@@ -776,11 +776,11 @@ func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
 	// Three writes + pings back-to-back inside the 100ms window; the store's cap-1
 	// Subscribe channel plus the debounce collapse them into one re-read.
 	insertObj("d2")
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	insertObj("d3")
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	insertObj("d4")
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 
 	// The single coalesced re-read reports the final count (4), never an intermediate.
 	mod := recvKindChange(t, ch)
@@ -849,7 +849,7 @@ func TestServiceClusterDataKindsWatchBindsCacheOpenedAfterSubscribe(t *testing.T
 	cdb, err := s.cacheManager.Open(ctx, newCacheRef(beehive.ObjectID(id), cacheID))
 	require.NoError(t, err)
 	insertCatalogKind(t, ctx, cdb, "apps/v1", "Deployment", "deployments", "Namespaced")
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 
 	ev := recvKindChange(t, ch)
 	assert.Equal(t, ChangeAdded, ev.Type)
@@ -891,7 +891,7 @@ func TestServiceClusterDataKindsWatchRebindsAfterCacheReplaced(t *testing.T) {
 
 	// A write into the rebuilt cache streams through the rebound handle.
 	insertCatalogKind(t, ctx, cdb2, "v1", "Node", "nodes", "Cluster")
-	cdb2.ObjectsNotify()
+	cdb2.ObjectsNotifyResource("v1", "nodes")
 	add := recvKindChange(t, ch)
 	assert.Equal(t, ChangeAdded, add.Type)
 	assert.Equal(t, "Node", add.Kind.Kind)
@@ -1084,7 +1084,7 @@ func TestServiceClusterDataEventsWatchIgnoresObjectWrites(t *testing.T) {
 		   created_at, updated_at, raw_json)
 		 VALUES ('o1', 'v1', 'Pod', 'default', 'o1', '1', 1, 1, x'7b7d')`)
 	require.NoError(t, err)
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("v1", "pods")
 	select {
 	case ev := <-ch:
 		t.Fatalf("object write must not wake the events watch, got %+v", ev)
@@ -1144,7 +1144,7 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 
 	// A brand-new object → Added.
 	insertObject(t, ctx, cdb, "d2", "apps/v1", "Deployment", "kube-system", "coredns", "2", 200)
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	add := recvObjectChange(t, ch)
 	assert.Equal(t, ChangeAdded, add.Type)
 	assert.Equal(t, "d2", add.Object.UID)
@@ -1153,7 +1153,7 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 	// bump that rewrites raw_json under a stable uid/identity — now differs across reads and
 	// surfaces as Modified (the closed gap the identity-only projection couldn't observe).
 	insertObject(t, ctx, cdb, "d1", "apps/v1", "Deployment", "default", "web", "9", 100)
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	mod := recvObjectChange(t, ch)
 	assert.Equal(t, ChangeModified, mod.Type)
 	assert.Equal(t, "d1", mod.Object.UID)
@@ -1163,7 +1163,7 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 	// An object removed from the table → Deleted (carries the last-known row).
 	_, err = cdb.Writer().ExecContext(ctx, `DELETE FROM objects WHERE uid = 'd2'`)
 	require.NoError(t, err)
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	del := recvObjectChange(t, ch)
 	assert.Equal(t, ChangeDeleted, del.Type)
 	assert.Equal(t, "d2", del.Object.UID)
@@ -1254,7 +1254,7 @@ func TestClusterDataObjectsWatchNoReReadForOtherKind(t *testing.T) {
 	var reads int32
 	ch := cacheDeltaWatch(ctx, mgr, cacheID, 20*time.Millisecond,
 		// The keyed subscribe ClusterDataObjectsWatch uses, verbatim.
-		func(db *store.ClusterDB) (<-chan struct{}, func()) {
+		func(db *store.ClusterDB) (<-chan store.WriteWake, func()) {
 			return db.ObjectsSubscribeResource("apps/v1", "deployments")
 		},
 		func(context.Context, *store.ClusterDB) ([]string, error) {
@@ -1300,7 +1300,7 @@ func TestClusterDataKindsWatchWakesOnEventWrites(t *testing.T) {
 
 	// The Event kind's catalog row, as its sync worker registers it on start.
 	insertObjectCatalog(t, ctx, cdb, "v1", "Event", "events", "Namespaced")
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("v1", "events")
 
 	ch, err := s.ClusterDataKindsWatch(ctx, id, ClusterCacheID(cacheID))
 	require.NoError(t, err)
@@ -1911,7 +1911,7 @@ func TestClusterCacheStatsWatchSkipsUnchangedReads(t *testing.T) {
 	recvStats(t, ch) // the opening read
 
 	// A ping that changed nothing.
-	cdb.ObjectsNotify()
+	cdb.ObjectsNotifyResource("v1", "pods")
 	select {
 	case v := <-ch:
 		t.Fatalf("an unchanged read must not emit, got %+v", v)
@@ -2002,7 +2002,7 @@ func TestCatalogSubscribeClosesWhenBothBrokersDo(t *testing.T) {
 
 	// A write on either broker still reaches the caller.
 	db.EventsNotify()
-	testutil.Wait(t, pings, "an event write to wake the catalog watch")
+	testutil.Recv(t, pings, "an event write to wake the catalog watch")
 
 	// Shutting the db down closes both brokers, which must close the composite.
 	require.NoError(t, mgr.Shutdown(ctx))
