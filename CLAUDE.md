@@ -23,6 +23,37 @@ Cluster data streams as **Kubernetes-style delta watches** (an `Added` snapshot,
 >
 > **Keep comments current — describe the present, not the past.** Code comments (and these docs) must describe only the *current* state of the code. **`docs/adr/` is the sole exemption** — ADRs are an append-only historical record and are meant to say what we rejected, replaced, and believed at the time. When you change something, update the comments around it instead of layering on history: don't leave notes about how the code *used to* work, what a field was *renamed from*, what machinery was *removed*, or which past refactor got you here. A reader should never have to reason about a prior version. State current design and rationale directly; drop "used to", "no longer", "formerly", "superseded", and similar backward-looking framing. (Contrasts with *external* systems — e.g. "unlike apimachinery's default" — are fine; they describe present behavior.)
 
+## Writing standards
+
+Applies to every hand-written file in the repo — Go, Rust, TypeScript, Markdown. Not to generated output (`src/gql/`, `sidecar/graph/generated*`, lockfiles), which is nobody's to hand-tune.
+
+1. **Code — simple, idiomatic, easy for a human to follow.** Prefer the boring construction. Match the idiom of the file you are in over the one you would pick on a blank page. Cleverness that needs a comment to survive review is usually the wrong trade.
+2. **Comments — terse, necessary, easy for a human to read.** Say what the code cannot: the *why*, the invariant, the trap that made this shape necessary. Never restate what the line already says. A comment justifying a choice the code no longer contains is dead weight — state the current design, don't argue against the alternatives you rejected (that is what `docs/adr/` is for).
+3. **Documentation — simple, concise, easy for a human to read.** Lead with what is true now. One idea per sentence.
+
+The failure mode to watch for is a comment addressed to a *reviewer* — someone who just watched the reasoning — rather than to a reader opening the file cold. The tell is a comment that spends its length on the option **not** taken.
+
+A `UserPromptSubmit` hook (`scripts/writing-standards-hook.sh`, wired in `.claude/settings.json`) restates this at the start of every turn, since the rule has to be in mind *before* anything is composed. Keep the script's short form in sync with this section.
+
+## Testing conventions (all three languages)
+
+These apply to `src/`, `sidecar/`, and `src-tauri/` alike; each area's `CLAUDE.md` adds its own tooling on top.
+
+**Every test file sits beside the file it covers.** `foo_test.go` / `foo.test.ts` tests `foo.go` / `foo.ts`. A test file with no counterpart means the unit under test is buried in a larger file — split the *implementation* out to match the test's name rather than renaming the test to match the monolith. The one exception is a file that exists solely to hold shared fixtures (`testutil_test.go`), which tests nothing.
+
+**No magic sleeps — never block on the wall clock to let something happen.** A real delay is flaky under load and slow in aggregate, and it fails at the *end* of the wait rather than the moment the invariant breaks. Per language:
+
+- **TypeScript** — `vi.useFakeTimers()` + `advanceTimersByTimeAsync`, `await waitFor(...)`, or a `flush()`/`act` helper. Never a bare `setTimeout` wait.
+- **Go** — wait on a channel, not a duration: `testutil.Probe`/`Signal`, `testutil.Recv`/`Wait`, or `require.Eventually`. Never `time.Sleep`.
+- **Rust** — `#[tokio::test(start_paused = true)]`, which auto-advances virtual time between parked timers. `src-tauri/src/services/sidecar/ipc.rs` (`connect_retries_until_endpoint_appears`) is the reference.
+
+**Pace a timing-dependent unit by parameter, not by constant.** A production constant a test must outwait (a retry cadence, a poll interval) becomes an argument, and production passes the constant — see `cacheWatchLoop`'s `retryDur`. Shrinking it in a test is then free, and the test never encodes the production number.
+
+Two shapes are *not* magic sleeps, and both must say so in a comment:
+
+- **A negative assertion** ("must NOT happen") has no event to wait for, so it needs a bounded window. Write it as a `select` on the tripwire channel versus `time.After` — it fails the instant the thing happens rather than at the end — and size the window as a multiple of the (shrunk) cadence, never a bare guess. Sample the baseline off the same channel, not by polling a counter, or the baseline read races the bug and swallows it.
+- **Latency injected into the code under test** — a fake that takes a moment on purpose so a join-vs-no-join race has a determinate answer. The test's own assertion path stays immediate.
+
 ## Frontend (`src/`)
 
 React 19 + TanStack Router + [urql] (GraphQL) + Vite + Tailwind v4. UI primitives from `@kubetail/ui`. Package manager is **pnpm**. Path alias: **`@/*` → `src/*`**.
@@ -70,7 +101,7 @@ Connection lifecycle is published out of band on the per-operation **transport-s
 
 Vitest + `@testing-library/react` (jsdom), co-located (`*.test.ts[x]`). Mock the Tauri bridge with **`mockTauriCore()` from `@/test-utils`** (+ `vi.mock('@tauri-apps/api/core', …)` and dynamic import of the module under test). For GraphQL-driven components, push frames via `liveChannel().onmessage!(...)` — see `src/components/widgets/sync-health-badge.test.tsx`.
 
-- **No magic sleeps.** Don't wait on wall-clock delays — use `vi.useFakeTimers()` + `advanceTimersByTimeAsync`, `await waitFor(...)`, or a `flush()`/`act` helper. Real `setTimeout` waits are flaky and slow.
+- The repo-wide rules above (co-located test files, no magic sleeps) apply here — `vi.useFakeTimers()` + `advanceTimersByTimeAsync`, `await waitFor(...)`, or a `flush()`/`act` helper, never a bare `setTimeout` wait.
 - Run: `pnpm test --run` (or `make test-js`). Watch: `pnpm test`.
 
 ### Lint / build

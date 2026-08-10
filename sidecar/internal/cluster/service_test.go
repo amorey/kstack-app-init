@@ -1251,14 +1251,15 @@ func TestClusterDataObjectsWatchNoReReadForOtherKind(t *testing.T) {
 	cdb, err := mgr.Open(ctx, store.CacheRef{ClusterID: 1, CacheID: cacheID})
 	require.NoError(t, err)
 
-	var reads int32
-	ch := cacheDeltaWatch(ctx, mgr, cacheID, 20*time.Millisecond,
+	const debounce = 20 * time.Millisecond
+	reads := testutil.NewProbe[struct{}](8)
+	ch := cacheDeltaWatch(ctx, mgr, cacheID, debounce,
 		// The keyed subscribe ClusterDataObjectsWatch uses, verbatim.
 		func(db *store.ClusterDB) (<-chan store.WriteWake, func()) {
 			return db.ObjectsSubscribeResource("apps/v1", "deployments")
 		},
 		func(context.Context, *store.ClusterDB) ([]string, error) {
-			atomic.AddInt32(&reads, 1)
+			reads.Fire(struct{}{})
 			return nil, nil
 		},
 		func(s string) string { return s },
@@ -1269,19 +1270,21 @@ func TestClusterDataObjectsWatchNoReReadForOtherKind(t *testing.T) {
 		}
 	}()
 
-	// Wait for the baseline read (on bind) to land.
-	require.Eventually(t, func() bool { return atomic.LoadInt32(&reads) == 1 },
-		2*time.Second, 5*time.Millisecond, "baseline snapshot must read once on bind")
+	// Off the probe, not a sampled count that could already include a re-read.
+	reads.Await(t, "the baseline snapshot read on bind")
 
-	// An unrelated resource's keyed write must not wake the watch — no re-read.
+	// An unrelated resource's keyed write must not wake the watch. A negative, so it needs a
+	// window: several debounces, tripping the instant a read lands.
 	cdb.ObjectsNotifyResource("v1", "pods")
-	time.Sleep(100 * time.Millisecond) // longer than the debounce window
-	require.Equal(t, int32(1), atomic.LoadInt32(&reads), "an unrelated resource's write must not re-read")
+	select {
+	case <-reads.Chan():
+		t.Fatal("an unrelated resource's write must not re-read")
+	case <-time.After(5 * debounce):
+	}
 
 	// A matching-resource write wakes it — one more read after the debounce fires.
 	cdb.ObjectsNotifyResource("apps/v1", "deployments")
-	require.Eventually(t, func() bool { return atomic.LoadInt32(&reads) == 2 },
-		2*time.Second, 5*time.Millisecond, "a matching-resource write must re-read")
+	reads.Await(t, "a matching-resource write to re-read")
 }
 
 // The kind catalog spans BOTH tables: every synced kind's count comes from the objects
@@ -2261,6 +2264,8 @@ func TestServiceStopSyncHealthFoldWaitsForIt(t *testing.T) {
 
 	// A fold that takes a moment to unwind. Whether the stop waits is otherwise decided by
 	// goroutine scheduling, which would make either answer look right often enough.
+	// Latency injected INTO the code under test, not the test waiting before it asserts —
+	// the one shape no-magic-sleeps permits (root CLAUDE.md).
 	var unwound atomic.Bool
 	s.syncHealthFoldExit = func() {
 		time.Sleep(50 * time.Millisecond)

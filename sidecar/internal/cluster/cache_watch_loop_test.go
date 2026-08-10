@@ -27,6 +27,10 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
+// testRetryInterval runs the retry timer far faster than production's 2s. The assertions
+// below are about ordering, not the interval, so shrinking it costs nothing.
+const testRetryInterval = 10 * time.Millisecond
+
 // A read that fails must schedule its OWN re-read. Recovery cannot depend on the next write
 // ping: the object-write broker is resource-keyed, so a kind nobody writes to — Namespaces,
 // an idle CRD — may not ping again for hours, and the subscription would sit showing an
@@ -46,7 +50,7 @@ func TestCacheWatchLoopRetriesAFailedRead(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		cacheWatchLoop(ctx, mgr, ref.CacheID, time.Millisecond,
+		cacheWatchLoop(ctx, mgr, ref.CacheID, time.Millisecond, testRetryInterval,
 			func(*store.ClusterDB) (<-chan store.WriteWake, func()) {
 				// A bus that never pings — the static-kind case.
 				return make(chan store.WriteWake), func() {}
@@ -83,19 +87,26 @@ func TestCacheWatchLoopStopsRetryingOnceItSucceeds(t *testing.T) {
 	_, err := mgr.Open(ctx, ref)
 	require.NoError(t, err)
 
-	var fires atomic.Int32
-	go cacheWatchLoop(ctx, mgr, ref.CacheID, time.Millisecond,
+	// A probe, not a polled counter: the bind read and a wrongly-armed retry are one
+	// testRetryInterval apart, so a sampled baseline would swallow both and the bug would
+	// pass. Taking the bind read off the probe pins the baseline to that event.
+	fires := testutil.NewProbe[struct{}](8)
+	go cacheWatchLoop(ctx, mgr, ref.CacheID, time.Millisecond, testRetryInterval,
 		func(*store.ClusterDB) (<-chan store.WriteWake, func()) { return make(chan store.WriteWake), func() {} },
 		func(*store.ClusterDB) (bool, bool) {
-			fires.Add(1)
+			fires.Fire(struct{}{})
 			return true, false // always succeeds
 		},
 		func() bool { return true },
 	)
 
-	require.Eventually(t, func() bool { return fires.Load() >= 1 }, 2*time.Second, 10*time.Millisecond)
-	settled := fires.Load()
+	fires.Await(t, "the read on bind")
 
-	time.Sleep(cacheWatchRetryInterval + 500*time.Millisecond)
-	assert.Equal(t, settled, fires.Load(), "a successful read must not leave a retry armed")
+	// No ping ever arrives, so a second read could only come from an armed retry. The window
+	// spans many testRetryIntervals and trips the instant one lands.
+	select {
+	case <-fires.Chan():
+		t.Fatal("a successful read must not leave a retry armed")
+	case <-time.After(20 * testRetryInterval):
+	}
 }

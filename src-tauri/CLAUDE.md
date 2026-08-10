@@ -53,7 +53,7 @@ Quit cancels the app-wide `CancellationToken` before `SidecarService::graceful_s
 ## Tests & checks
 
 - Inline `#[cfg(test)] mod tests` with `#[tokio::test]`; UDS/pipe fixtures via `interprocess`. Factor pure logic into free functions to unit-test it.
-- **Avoid magic sleeps.** Synchronize on the actual signal (`watch`/`mpsc`, `wait_for`, polling a condition) or `tokio::time::pause()` + `advance` — never `tokio::time::sleep` to let work settle.
+- **No magic sleeps** (repo-wide — see the root `CLAUDE.md` for the rule and its two carve-outs). Synchronize on the actual signal (`watch`/`mpsc`, `wait_for`, polling a condition), or run the test on a paused clock — `#[tokio::test(start_paused = true)]` auto-advances virtual time between parked timers, so a `tokio::time::sleep` inside it costs nothing real (`ipc.rs`'s `connect_retries_until_endpoint_appears` is the reference). Never a real `sleep` to let work settle.
 - `make test-rust` — **builds the sidecar first** (an integration test spawns the real binary).
 - `make lint-rust` = `cargo fmt --check`; `make vet-rust` = `cargo clippy --all-targets -- -D warnings` (enforced in CI).
 

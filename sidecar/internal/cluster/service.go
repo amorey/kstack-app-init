@@ -784,7 +784,7 @@ func cacheDeltaWatch[T comparable, C any](
 
 	go func() {
 		defer close(out)
-		cacheWatchLoop(ctx, mgr, cacheID, debounceDur, subscribe, emit, emitEmpty)
+		cacheWatchLoop(ctx, mgr, cacheID, debounceDur, cacheWatchRetryInterval, subscribe, emit, emitEmpty)
 	}()
 	return out
 }
@@ -822,7 +822,7 @@ func cacheGaugeWatch[T comparable](
 
 	go func() {
 		defer close(out)
-		cacheWatchLoop(ctx, mgr, cacheID, debounceDur, subscribe,
+		cacheWatchLoop(ctx, mgr, cacheID, debounceDur, cacheWatchRetryInterval, subscribe,
 			func(db *store.ClusterDB) (bool, bool) {
 				v, err := read(ctx, db)
 				if err != nil {
@@ -840,129 +840,6 @@ func cacheGaugeWatch[T comparable](
 		)
 	}()
 	return out
-}
-
-// cacheWatchLoop is the shared half of every per-cache stream: it binds to the
-// cache's db via WatchDB (binding when it opens, rebinding on delete+reopen) and
-// coalesces write pings on a trailing-edge debounce. onFire runs once per bind and
-// once per debounced burst; onClosed runs when the cache goes away; either
-// returning false ends the stream.
-func cacheWatchLoop(
-	ctx context.Context,
-	mgr *store.Manager,
-	cacheID int64,
-	debounceDur time.Duration,
-	subscribe func(*store.ClusterDB) (<-chan store.WriteWake, func()),
-	onFire func(*store.ClusterDB) (keep bool, retry bool),
-	onClosed func() bool,
-) {
-	handles, cancelHandles := mgr.WatchDB(cacheID)
-	defer cancelHandles()
-
-	// db/pings track the bound handle and its ping stream; nil while no cache is open.
-	var (
-		db        *store.ClusterDB
-		pings     <-chan store.WriteWake
-		cancelSub func()
-	)
-	defer func() {
-		if cancelSub != nil {
-			cancelSub()
-		}
-	}()
-
-	// `armed` tracks a pending re-read; timer starts disarmed (Go timers deliver no
-	// stale tick after Stop/Reset, so no manual drain).
-	debounce := time.NewTimer(debounceDur)
-	debounce.Stop()
-	defer debounce.Stop()
-	// A failed read schedules its OWN retry: the broker is resource-keyed, so a
-	// static kind may not ping for hours and a transient error would otherwise show
-	// an empty table indefinitely.
-	retry := time.NewTimer(cacheWatchRetryInterval)
-	retry.Stop()
-	defer retry.Stop()
-	armRetry := func() { retry.Reset(cacheWatchRetryInterval) }
-	armed := false
-	arm := func() {
-		if !armed {
-			debounce.Reset(debounceDur)
-			armed = true
-		}
-	}
-	disarm := func() {
-		if armed {
-			debounce.Stop()
-			armed = false
-		}
-	}
-
-	bind := func(next *store.ClusterDB) bool {
-		disarm() // a fresh read happens below; drop any re-read pending for the old handle
-		if cancelSub != nil {
-			cancelSub()
-			cancelSub = nil
-			pings = nil
-		}
-		db = next
-		if db == nil {
-			return onClosed()
-		}
-		pings, cancelSub = subscribe(db)
-		keep, again := onFire(db)
-		if again {
-			armRetry()
-		}
-		return keep
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case h, ok := <-handles:
-			if !ok {
-				return // store shutting down
-			}
-			if !bind(h) {
-				return
-			}
-		case _, ok := <-pings:
-			if !ok {
-				// The bound db closed under us (e.g. Clear-cache): release the stale
-				// sub and wait for WatchDB's new handle. Cancel, don't just drop —
-				// a composite subscribe (catalogSubscribe) needs its goroutine stopped.
-				disarm()
-				if cancelSub != nil {
-					cancelSub()
-				}
-				pings, cancelSub, db = nil, nil, nil
-				continue
-			}
-			arm() // coalesce; the debounce fire runs the actual re-read
-		case <-debounce.C:
-			armed = false
-			keep, again := onFire(db)
-			if again {
-				armRetry()
-			}
-			if !keep {
-				return
-			}
-		case <-retry.C:
-			// A read failed; drive the re-read from here until it succeeds.
-			if db == nil {
-				continue
-			}
-			keep, again := onFire(db)
-			if again {
-				armRetry()
-			}
-			if !keep {
-				return
-			}
-		}
-	}
 }
 
 // send delivers one value on out, honoring ctx cancellation. Returns false if ctx
@@ -1293,11 +1170,6 @@ func (s *Service) WatchGVRSyncs(ctx context.Context, cacheID ClusterCacheID) (<-
 		slog.Warn("clusterservice: resolve cache discovery anchor", "cache", cacheID, "err", err)
 	})), nil
 }
-
-// cacheWatchRetryInterval paces re-reads after a failed one — needed because the
-// write-ping that would otherwise drive recovery is resource-keyed, so a kind
-// nobody writes to would never send another.
-const cacheWatchRetryInterval = 2 * time.Second
 
 // syncHealthTick paces the rollup's periodic recompute: the freshness stamps it
 // folds live in controller memory and move with no frame at all. Emission stays
@@ -1745,27 +1617,6 @@ func buildGVRSync(obj *beehive.Object[ClusterCacheGVRSyncSpec, ClusterCacheGVRSy
 	}
 }
 
-// filterChan forwards what decide returns for each value of in — zero or MORE,
-// because a filter may not be able to decide a frame yet, and a dropped watch
-// frame is gone for good (beehive re-emits only on change); holding undecided
-// frames keeps that from being permanent. Closes out when in closes or ctx ends.
-func filterChan[T any](ctx context.Context, in <-chan T, decide func(T) []T) <-chan T {
-	out := make(chan T, 1)
-	go func() {
-		defer close(out)
-		for v := range in {
-			// send, not a bare write: a consumer that stops draining (closed sync
-			// dialog) would otherwise park this goroutine forever.
-			for _, o := range decide(v) {
-				if !send(ctx, out, o) {
-					return
-				}
-			}
-		}
-	}()
-	return out
-}
-
 // GVRDiscoveryStats implements ClusterService — the discovery record's live gauges, read
 // straight from the controller that measured them. A nil controller (a test service with
 // no control plane) reads as "nothing measured", the same as a record whose first pass
@@ -2084,127 +1935,4 @@ func (s *Service) cacheRef(ctx context.Context, id ClusterID) (store.CacheRef, b
 		return store.CacheRef{}, false, err
 	}
 	return newCacheRef(beehive.ObjectID(id), cacheObj.ID), true, nil
-}
-
-// syncHealthAcc folds one cache's per-kind records into a single verdict.
-type syncHealthAcc struct {
-	total int
-	// worstRank/worstReason track the most severe reason seen; offender names the
-	// kinds behind it (the reason is carried along, not mapped back from the rank).
-	worstRank   int
-	worstReason string
-	offender    []SyncedKindRef
-	// paused names (not counts) the kinds observed Paused: a pause relays to a
-	// cache's children one at a time, so a partly-paused cache is a state a UI sees.
-	paused []SyncedKindRef
-	// notWatching counts every kind not observed Watching — ranked AND paused; the
-	// offender list can't answer this (it resets to one name when a worse rank appears).
-	notWatching int
-	// unconfirmed counts kinds nobody in THIS process has observed — neither healthy
-	// nor broken, and the verdict must not round them to either.
-	unconfirmed int
-
-	lastUpdateAt *time.Time
-	lastLiveAt   *time.Time
-}
-
-// syncReasonRank orders per-kind reasons by how much they dominate a cache's
-// verdict: failure > stall > wait > catch-up. A pause is not in the ladder — it is
-// the mildest reading, reached only when nothing ranked or unobserved is left.
-func syncReasonRank(reason string) int {
-	switch reason {
-	case ReasonSyncFailed:
-		return 4
-	case ReasonStale:
-		return 3
-	case ReasonNoConnection:
-		return 2
-	case ReasonSyncing:
-		return 1
-	case ReasonWatching, ReasonPaused:
-		// Not faults; never reached (add handles both first). Named so default
-		// means "unrecognized".
-		return 0
-	default:
-		// An unfamiliar spelling is DEGRADED, not healthy (per the schema); ranked
-		// at the bottom so it registers without masking a known reason.
-		return 1
-	}
-}
-
-func (a *syncHealthAcc) add(rec gvrSyncRec, st ClusterCacheGVRSyncStats) {
-	a.total++
-	{
-		// Newest write anywhere in the cache; oldest proof among the kinds that have one.
-		if st.LastUpdateAt != nil && (a.lastUpdateAt == nil || st.LastUpdateAt.After(*a.lastUpdateAt)) {
-			a.lastUpdateAt = st.LastUpdateAt
-		}
-		if st.LastLiveAt != nil && (a.lastLiveAt == nil || st.LastLiveAt.Before(*a.lastLiveAt)) {
-			a.lastLiveAt = st.LastLiveAt
-		}
-	}
-
-	cond := FindCondition(rec.conditions, ConditionSynced)
-	// Only an OBSERVED Watching is health: an unconfirmed or absent condition
-	// counts toward notWatching, or UnhealthyKinds would disagree with an Unknown
-	// verdict right after a restart. See docs/adr/2026-08-09-liveness-conditions.md.
-	if cond != nil && !cond.Unconfirmed && cond.Reason == ReasonWatching {
-		return
-	}
-	a.notWatching++
-
-	// Neither healthy nor broken — never assert a pre-restart verdict, nor health
-	// on its absence. See verdict.
-	if cond == nil || cond.Unconfirmed {
-		a.unconfirmed++
-		return
-	}
-	if cond.Reason == ReasonPaused {
-		a.paused = append(a.paused, rec.kindRef())
-		return
-	}
-	rank := syncReasonRank(cond.Reason)
-	switch {
-	case rank > a.worstRank:
-		a.worstRank, a.worstReason, a.offender = rank, cond.Reason, []SyncedKindRef{rec.kindRef()}
-	case rank == a.worstRank && rank > 0:
-		a.offender = append(a.offender, rec.kindRef())
-	}
-}
-
-// verdict renders the fold. It reads like a per-kind condition on purpose, so a consumer
-// renders a cache exactly as it renders one kind.
-func (a *syncHealthAcc) verdict(cacheID ClusterCacheID) ClusterCacheSyncHealth {
-	h := ClusterCacheSyncHealth{
-		CacheID:        cacheID,
-		TotalKinds:     a.total,
-		UnhealthyKinds: a.notWatching,
-		LastUpdateAt:   a.lastUpdateAt,
-		LastLiveAt:     a.lastLiveAt,
-	}
-	switch {
-	case a.total == 0:
-		// No kinds yet (discovery hasn't landed) — neither fault nor health.
-		h.Status, h.Reason = ConditionUnknown, ReasonSyncing
-	case a.worstRank > 0:
-		h.Status = ConditionFalse
-		h.Reason = a.worstReason
-		// Sorted so "the first offender" stays stable while kinds stream in.
-		slices.SortFunc(a.offender, compareKindRefs)
-		h.UnhealthyKindRefs = a.offender
-	case a.unconfirmed > 0:
-		// Some kind is still unobserved in this process; Healthy is a claim about
-		// EVERY kind, so it can't be made yet. Ranked below a real failure — an
-		// observed fault is worth surfacing while others report in.
-		h.Status, h.Reason = ConditionUnknown, ReasonSyncing
-	case len(a.paused) > 0:
-		// Partial pause counts: calling in-between frames Watching would publish a
-		// healthy status beside a non-zero unhealthyKinds with no names behind it.
-		h.Status, h.Reason = ConditionFalse, ReasonPaused
-		slices.SortFunc(a.paused, compareKindRefs)
-		h.UnhealthyKindRefs = a.paused
-	default:
-		h.Status, h.Reason = ConditionTrue, ReasonWatching
-	}
-	return h
 }

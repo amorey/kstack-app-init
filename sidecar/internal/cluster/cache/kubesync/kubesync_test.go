@@ -981,13 +981,15 @@ func TestWorkerStopBeforeStartPreventsTheRun(t *testing.T) {
 	require.NoError(t, w.Stop(context.Background()))
 	w.Start()
 
+	// A negative, so it needs a window rather than a wait: a run that started would report,
+	// and the probe trips the instant it does.
+	select {
+	case <-sink.sigC.Chan():
+		t.Fatal("a stopped worker must report nothing")
+	case <-time.After(50 * time.Millisecond):
+	}
 	// The run goroutine performs a LIST first, so no list means it never ran.
-	time.Sleep(50 * time.Millisecond)
 	assert.Zero(t, src.lists(), "a stopped worker must not start")
-	sink.mu.Lock()
-	got := len(sink.all)
-	sink.mu.Unlock()
-	assert.Zero(t, got, "a stopped worker must report nothing")
 
 	// And a second Stop stays clean rather than blocking on a done channel that was
 	// never created.
