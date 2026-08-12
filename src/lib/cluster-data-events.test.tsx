@@ -224,6 +224,23 @@ describe('useClusterDataEvents', () => {
     expect(uids(result.current.events)).toEqual(['a']);
   });
 
+  // A change whose entity is null is a server-side field error (a nested non-null
+  // field erroring nulls its parent), not the snapshot boundary. Folding it as one
+  // would report a still-loading table as live and empty.
+  it('does not treat a change with no entity as the Bookmark', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
+    const { result, rerender } = renderHook(() => useClusterDataEvents());
+
+    pushFrame('Added', null);
+    rerender();
+    expect(result.current.phase).toBe('connecting');
+    expect(result.current.events).toEqual([]);
+
+    pushBookmark();
+    rerender();
+    expect(result.current.phase).toBe('live');
+  });
+
   // An empty snapshot is a real answer, not a missing one — the whole point of the
   // Bookmark. Reported as live with no rows, so a table renders its empty state.
   it('reports live with no items on an empty snapshot', () => {

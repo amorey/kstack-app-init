@@ -202,8 +202,9 @@ function useGVRDiscoveries(): Keyed<GVRDiscovery> {
   >({ query: ClusterCacheGVRDiscoveriesSubscription }, (prev, resp) => {
     const { type, discovery } = resp.clusterCacheGVRDiscoveriesWatch;
     // The Bookmark carries no record. This pane reads the fold as a lookup table, so
-    // it needs no snapshot-complete gate of its own.
-    if (!discovery) return prev ?? new Map();
+    // it needs no snapshot-complete gate of its own. A change with no record is a
+    // server-side field error — equally unfoldable.
+    if (type === 'Bookmark' || !discovery) return prev ?? new Map();
     // A Deleted must match on the record's own id, not cacheID: a hard delete's
     // frame carries cacheID "0" (the owner edge is already collected), so keying it
     // by cacheID would drop every delete and the pane would show gone records.
@@ -269,8 +270,9 @@ function useGVRSyncs(cacheId: string): GVRSync[] {
   >({ query: ClusterCacheGVRSyncsSubscription, variables: { cacheID: cacheId } }, (prev, resp) => {
     const { type, sync } = resp.clusterCacheGVRSyncsWatch;
     // The Bookmark carries no record; the row renders per-kind detail, not an
-    // empty state, so it needs no snapshot-complete gate.
-    if (!sync) return prev ?? new Map();
+    // empty state, so it needs no snapshot-complete gate. A change with no record is
+    // a server-side field error — equally unfoldable.
+    if (type === 'Bookmark' || !sync) return prev ?? new Map();
     return applyChange(prev, type, sync.id, sync);
   });
   return useMemo(() => (data ? [...data.values()] : []), [data]);

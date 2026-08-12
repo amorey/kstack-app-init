@@ -193,6 +193,24 @@ describe('useClusters', () => {
     expect(screen.getByTestId('probe')).toHaveTextContent('null');
   });
 
+  // A change whose cluster is null is a server-side field error (a nested non-null
+  // field erroring nulls its parent), not the snapshot boundary. Folding it as one
+  // would publish a half-listed fleet as the whole fleet.
+  it('keeps the list null on a change carrying no cluster', async () => {
+    renderProvider();
+    await flush();
+
+    await act(async () => {
+      pushClusterChange('Added', null as unknown as object);
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('null');
+
+    await act(async () => {
+      pushWatchBookmark(channelFor, 'clustersWatch');
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('[]');
+  });
+
   it('subscribes to the cluster, cache, and sync delta watches', async () => {
     renderProvider();
     await flush();

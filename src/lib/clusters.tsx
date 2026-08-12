@@ -165,8 +165,11 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
     (prev: DeltaState<ClusterRow> | undefined, data) => {
       const { type, cluster } = data.clustersWatch;
       const base = prev ?? { items: new Map<string, ClusterRow>(), synced: false };
-      // The Bookmark closes the snapshot and is the only frame carrying no cluster.
-      if (!cluster) return { ...base, synced: true };
+      // The Bookmark closes the snapshot. Keyed on `type`, never on a missing cluster:
+      // a nested non-null field erroring nulls its parent, and reading that as the
+      // snapshot boundary would show a half-listed fleet as the whole fleet.
+      if (type === 'Bookmark') return { ...base, synced: true };
+      if (!cluster) return base;
       return { ...base, items: applyChange(base.items, type, cluster.id, cluster) };
     },
   );
@@ -178,8 +181,9 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
     (prev: Keyed<CacheRow> | undefined, data) => {
       const { type, cache } = data.clusterCachesWatch;
       // The Bookmark carries no cache; the caches join in as they arrive (the streams
-      // carry no mutual ordering), so it needs no gate of its own here.
-      if (!cache) return prev ?? new Map();
+      // carry no mutual ordering), so it needs no gate of its own here. A change with
+      // no cache is a server-side field error — equally unfoldable.
+      if (type === 'Bookmark' || !cache) return prev ?? new Map();
       return applyChange(prev, type, cache.id, cache);
     },
   );
