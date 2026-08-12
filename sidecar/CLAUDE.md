@@ -130,7 +130,7 @@ A cross-subsystem **leaf**: a wall-clock gap detector (15s tick, 2× factor — 
 
 `graph/*.graphqls` is authoritative — also consumed by the frontend's codegen (`codegen.ts`).
 
-**The schema is split one file per noun**: `common.graphqls` (scalars + the kind-agnostic `Condition`/`Event`/`Schedule`/`ChangeType` projections), then `cluster`, `cluster_cache`, `cluster_data`, `auth`, `chat`. Each noun file declares its own types and adds root fields with `extend type Query` / `Mutation` / `Subscription`; **no file defines the bare root types** — gqlparser assembles them from the extensions. A new noun is a new pair of files, not an edit to a shared root block. Resolver layout is `follow-schema`, so `cluster_cache.graphqls` generates `cluster_cache.resolvers.go`; the `Resolver` root methods and the `*Resolver` struct types land in whichever file sorts first (`auth.resolvers.go`) — generated placement, not a home to reason about.
+**The schema is split one file per noun**: `shared.graphqls` (scalars + the kind-agnostic `Condition`/`Event`/`Schedule`/`ChangeType` projections), then `cluster`, `cluster_cache`, `cluster_data`, `auth`, `chat`. Each noun file declares its own types and adds root fields with `extend type Query` / `Mutation` / `Subscription`; **no file defines the bare root types** — gqlparser assembles them from the extensions. A new noun is a new pair of files, not an edit to a shared root block. Resolver layout is `follow-schema`, so `cluster_cache.graphqls` generates `cluster_cache.resolvers.go`; the `Resolver` root methods and the `*Resolver` struct types land in whichever file sorts first (`auth.resolvers.go`) — generated placement, not a home to reason about.
 
 After editing:
 

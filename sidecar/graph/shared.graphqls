@@ -13,8 +13,10 @@
 # limitations under the License.
 
 # Vocabulary shared by every noun: the scalars, and the kind-agnostic projections
-# (Condition, Event, Schedule, ChangeType) each noun's surface reuses. The root
-# operation types are assembled from the per-noun files, which all `extend` them.
+# (Condition, Event, Schedule, ChangeType) each noun's surface reuses. Nothing here
+# declares a root field, and a type only one noun uses belongs in that noun's file
+# however generic its name reads. The root operation types are assembled from the
+# per-noun files, which all `extend` them.
 
 "An ISO-8601 encoded UTC date string."
 scalar Time

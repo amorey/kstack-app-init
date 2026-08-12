@@ -1686,7 +1686,7 @@ func newExecutionContext(
 	}
 }
 
-//go:embed "auth.graphqls" "chat.graphqls" "cluster.graphqls" "cluster_cache.graphqls" "cluster_data.graphqls" "common.graphqls"
+//go:embed "auth.graphqls" "chat.graphqls" "cluster.graphqls" "cluster_cache.graphqls" "cluster_data.graphqls" "shared.graphqls"
 var sourcesFS embed.FS
 
 func sourceData(filename string) string {
@@ -1703,7 +1703,7 @@ var sources = []*ast.Source{
 	{Name: "cluster.graphqls", Input: sourceData("cluster.graphqls"), BuiltIn: false},
 	{Name: "cluster_cache.graphqls", Input: sourceData("cluster_cache.graphqls"), BuiltIn: false},
 	{Name: "cluster_data.graphqls", Input: sourceData("cluster_data.graphqls"), BuiltIn: false},
-	{Name: "common.graphqls", Input: sourceData("common.graphqls"), BuiltIn: false},
+	{Name: "shared.graphqls", Input: sourceData("shared.graphqls"), BuiltIn: false},
 }
 var parsedSchema = gqlparser.MustLoadSchema(sources...)
 
