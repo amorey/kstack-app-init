@@ -14,7 +14,7 @@
 
 // What a ClusterCache holds: the discovered kind catalog and the cached Kubernetes
 // objects and Events read back out of it, each paired with its delta-watch change.
-// Mirrors graph/cluster_data.graphqls.
+// Mirrors the cluster-data section of graph/schema.graphqls.
 package domain
 
 import (

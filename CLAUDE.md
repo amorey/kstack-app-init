@@ -92,7 +92,7 @@ Connection lifecycle is published out of band on the per-operation **transport-s
 
 ### Codegen — generated types, don't hand-write
 
-`pnpm codegen` (`codegen.ts`) reads the **sidecar's** schema (`sidecar/graph/*.graphqls` — one file per noun, single source of truth) and emits `src/gql/`.
+`pnpm codegen` (`codegen.ts`) reads the **sidecar's** schema (`sidecar/graph/schema.graphqls` — single source of truth) and emits `src/gql/`.
 
 - Write operations with the **`graphql()` tagged template from `@/gql`**.
 - **`src/gql/` is generated — never edit it.** After changing a query or the sidecar schema, run `pnpm codegen` (or `pnpm codegen:watch`).

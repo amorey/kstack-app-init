@@ -4,9 +4,7 @@
 import type { CodegenConfig } from '@graphql-codegen/cli';
 
 const config: CodegenConfig = {
-  // One file per noun, assembled by graphql-codegen exactly as gqlgen assembles
-  // them: each extends the shared root operation types.
-  schema: 'sidecar/graph/*.graphqls',
+  schema: 'sidecar/graph/schema.graphqls',
   // Tests are excluded: they don't define typed documents, and transport-level
   // tests use raw gql tags with schema-less placeholder operations.
   documents: ['src/**/*.{ts,tsx}', '!src/gql/**', '!src/**/*.test.{ts,tsx}'],

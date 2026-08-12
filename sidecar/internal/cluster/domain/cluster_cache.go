@@ -15,7 +15,7 @@
 // The ClusterCache kind and the two child kinds beneath it (ClusterCacheGVRDiscovery,
 // ClusterCacheGVRSync): each kind's beehive shapes, the domain record served to
 // resolvers, and its delta-watch change, plus the whole-cache sync verdict folded from
-// the per-kind children. Mirrors graph/cluster_cache.graphqls.
+// the per-kind children. Mirrors the ClusterCache section of graph/schema.graphqls.
 package domain
 
 import (

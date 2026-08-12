@@ -15,7 +15,8 @@
 // Vocabulary every noun reuses: identity, conditions, the kind-agnostic Event and
 // Schedule projections, and the delta-watch change type. Nothing here belongs to one
 // kind — a type only one kind uses lives in that kind's file, however generic its name
-// reads. Mirrors graph/shared.graphqls, which these types bind to.
+// reads. Mirrors the shared-vocabulary section of graph/schema.graphqls, which these
+// types bind to.
 package domain
 
 import (

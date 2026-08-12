@@ -13,7 +13,8 @@
 // limitations under the License.
 
 // The Cluster kind: a tracked kube-context. Its beehive spec/status shapes, the domain
-// record served to resolvers, and its delta-watch change. Mirrors graph/cluster.graphqls.
+// record served to resolvers, and its delta-watch change. Mirrors the Cluster section
+// of graph/schema.graphqls.
 package domain
 
 import (
