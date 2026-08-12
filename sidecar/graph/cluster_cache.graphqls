@@ -1,0 +1,365 @@
+# Copyright 2026 The Kstack Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ClusterCache — a cluster's on-disk mirror and the sync machinery under it: the
+# cache record, its GVR-discovery anchor, the per-kind sync children, and the
+# whole-cache verdict folded from them. The data these caches hold is cluster_data.
+
+"""
+A cache record, mirroring the beehive ClusterCache kind: a mirror of one physical
+cluster identity. Streamed independently of its parent Cluster via
+`clusterCachesWatch` and joined to it client-side by `clusterID`. Carries its
+identity (`id`, `clusterID`, `serverUid`), observed sync `status`, and live on-disk
+`stats` (a nested object so a consumer fetches the stat-querying stats only when it
+selects them). A cluster owns one per identity it has mirrored; the *active* cache
+— the one a sync engine runs for and a UI shows for the row — is the one whose
+`serverUid` matches the cluster's last-probed `status.server.uid`, a join the
+client derives (it is not a field here, because it depends on the parent's status,
+which changes with no cache event and so cannot be kept fresh on this stream).
+"""
+type ClusterCache {
+  "Unique identifier for this cache record (distinct from its parent cluster's id)."
+  id: ObjectID!
+  "The id of the Cluster this cache belongs to (its beehive owner). The client joins caches onto clusters by this id."
+  clusterID: ObjectID!
+  "The kube-system namespace UID of the physical cluster this cache mirrors — the identity a physical migration turns over. Matches the parent cluster's `status.server.uid` while this is the active cache."
+  serverUid: String!
+  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's sync children (`clusterCacheGVRSyncsWatch`, `clusterCacheGVRDiscoveriesWatch`) or their rollup (`clusterCacheSyncHealthWatch`), which is also why this record carries no status block of its own."
+  conditions: [Condition!]!
+  "Live on-disk cache statistics, queried on demand."
+  stats: ClusterCacheStats!
+}
+
+"Live on-disk cache statistics for a single cluster."
+type ClusterCacheStats {
+  "True when a local cache exists on disk."
+  exists: Boolean!
+  "On-disk cache size (sqlite + WAL/shm) in bytes; 0 when not cached."
+  bytes: Int!
+  "Total number of cached objects across every kind (the sum of the kind catalog's per-kind counts; excludes cached events). 0 when not cached."
+  objectCount: Int!
+  "Number of distinct kinds with at least one cached object. 0 when not cached."
+  kindCount: Int!
+}
+
+"One change on the `clusterCachesWatch` stream: the affected cache and what happened to it."
+type ClusterCacheChange {
+  "Whether this cache was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: ChangeType!
+  "The affected cache. On `Deleted`, its last-known state; the client removes it by `id`."
+  cache: ClusterCache!
+}
+
+"""
+A ClusterCache's GVR-discovery child: the record anchoring the pass that asks the
+cluster which kinds it serves and maintains one per-GVR sync record for each. It is the
+granular answer to "does this cache know what to sync?" — distinct from the per-kind
+records below it, which answer "is each kind's mirror current?". Streamed independently via
+`clusterCacheGVRDiscoveriesWatch` and joined to its cache client-side by `cacheID`.
+
+Discovery has no watch API — the served-kinds document carries no resourceVersion — so
+this record is refreshed by a poll (every few minutes) and `status.lastDiscoveryAt` is
+how a consumer judges its currency.
+
+The record lives as long as its cache: pausing writes `spec.enabled = false` rather than
+deleting it, so the last-known kind list survives a pause.
+"""
+type ClusterCacheGVRDiscovery {
+  "Unique identifier for this record."
+  id: ObjectID!
+  "The id of the ClusterCache this belongs to. The client joins the discovery onto its cache by this id."
+  cacheID: ObjectID!
+  spec: ClusterCacheGVRDiscoverySpec!
+  """
+  What the last discovery pass measured, read live from the sidecar when you ask for it
+  — a metrics-server-style gauge, not stored state. Null until a pass has run in the
+  current sidecar process (so: null right after a restart, even though the kind list it
+  would describe is durable and still there — *when it was confirmed* is an observation,
+  and this process has not made it).
+
+  It is deliberately not part of `status`: a status write propagates to the record's
+  dependents, and nothing in the object graph reacts to these numbers. Being a resolved
+  field, it also costs nothing on a frame that doesn't select it.
+  """
+  stats: ClusterCacheGVRDiscoveryStats
+  """
+  This record's `Discovered` condition — the per-component verdict (reasons
+  Discovered/DiscoveryPartial/DiscoveryFailed/Paused/NoConnection). `DiscoveryPartial`
+  is not a failure: the kinds that answered are synced, but some api group did not
+  respond, so the list is known-incomplete and nothing was pruned from it.
+  """
+  conditions: [Condition!]!
+}
+
+"A GVR discovery's desired state: the pause switch its cache pushes down."
+type ClusterCacheGVRDiscoverySpec {
+  "Whether discovery should be running. False means its per-GVR children are switched off — the records stay, holding the last-known kind list."
+  enabled: Boolean!
+}
+
+"What a GVR-discovery pass measured, sampled on read."
+type ClusterCacheGVRDiscoveryStats {
+  "When the last pass reached the API server (including one that got a partial answer). The currency of the kind list."
+  lastDiscoveryAt: Time!
+  """
+  How many syncable GVRs that pass saw. Deliberately not the number of per-GVR records
+  that exist: after a partial pass the un-pruned survivors of the groups that did not
+  answer are still there, and reporting them here would claim a drop that did not happen.
+  """
+  resourceCount: Int!
+}
+
+"One change on the `clusterCacheGVRDiscoveriesWatch` stream: the affected record and what happened to it."
+type ClusterCacheGVRDiscoveryChange {
+  "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: ChangeType!
+  "The affected record. On `Deleted`, its last-known state; the client removes it by `id`."
+  discovery: ClusterCacheGVRDiscovery!
+}
+
+"""
+One Kubernetes kind being mirrored into a cache — one record per kind the discovery
+pass found, so a cache has a hundred or more. Streamed by `clusterCacheGVRSyncsWatch`,
+which is **cache-scoped** for exactly that reason, and joined onto its cache through
+`discoveryID` (the discovery anchor the client already streams).
+
+This is where per-kind sync health lives. The cache's own `Synced` condition is
+coarse and its discovery's `Discovered` says only whether the kind LIST is current;
+neither can tell you that one CRD's watch is forbidden while the other ninety-nine
+kinds are caught up.
+"""
+type ClusterCacheGVRSync {
+  "Unique identifier for this record."
+  id: ObjectID!
+  "The id of the ClusterCacheGVRDiscovery that owns this kind — the client's join key."
+  discoveryID: ObjectID!
+  spec: ClusterCacheGVRSyncSpec!
+  """
+  This kind's sync freshness, read live from the sidecar when you ask for it — a
+  metrics-server-style gauge, not stored state. Null until this kind's worker has
+  reported in the current sidecar process.
+
+  Deliberately not part of `status`: a status write propagates to dependents, and with
+  a hundred of these per cache a stored stamp would wake the parent cache a hundred
+  times every heartbeat.
+  """
+  stats: ClusterCacheGVRSyncStats
+  """
+  This record's `Synced` condition — this kind's own verdict (reasons
+  Watching/Syncing/Stale/SyncFailed/Paused/NoConnection), independent of every other
+  kind's.
+  """
+  conditions: [Condition!]!
+}
+
+"Which kind a per-kind sync mirrors, and whether it should be running."
+type ClusterCacheGVRSyncSpec {
+  "Whether this kind should be syncing. False means paused — the cached rows stay, so an unpause resumes rather than re-listing."
+  enabled: Boolean!
+  "Group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
+  apiVersion: String!
+  "Kind name, e.g. \"Deployment\"."
+  kind: String!
+  "Plural lowercase resource, e.g. \"deployments\" — the identity the objects watch is opened on."
+  resource: String!
+  "Whether objects of this kind are namespaced."
+  namespaced: Boolean!
+}
+
+"One synced kind's freshness, sampled on read."
+type ClusterCacheGVRSyncStats {
+  "When an object of this kind was last written to the cache. Null if none ever has — which on a quiet kind is normal, not a fault."
+  lastUpdateAt: Time
+  "When this kind's watch last proved itself live (a delta or a bookmark). Null before the first proof. This, not `lastUpdateAt`, is what staleness is judged on."
+  lastLiveAt: Time
+}
+
+"One change on the `clusterCacheGVRSyncsWatch` stream: the affected record and what happened to it."
+type ClusterCacheGVRSyncChange {
+  "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: ChangeType!
+  "The affected record. On `Deleted`, its last-known state; the client removes it by `id`."
+  sync: ClusterCacheGVRSync!
+}
+
+"""
+One synced kind, identified exactly. `resource` is what a UI renders, but it does not
+identify a kind on its own: a CRD may reuse a built-in's plural under another api group,
+so anything keying on a kind — looking its sync record up, opening its timeline — needs
+the pair.
+"""
+type SyncedKindRef {
+  apiVersion: String!
+  resource: String!
+}
+
+"""
+One cache's sync verdict, folded from every kind it syncs. Shaped like a `Condition` on
+purpose — same `status`/`reason`/`message` vocabulary as a per-kind record — so a client
+renders a cache exactly as it renders one kind.
+"""
+type ClusterCacheSyncHealth {
+  "The cache this verdict is for. The client keys its map on this and joins onto the cache by it."
+  cacheID: ObjectID!
+  status: ConditionStatus!
+  """
+  The dominant per-kind reason: a hard failure beats a stall beats a wait beats a
+  catch-up, and `Paused` speaks only when every kind is paused. `Unknown`/`Syncing` with
+  `totalKinds: 0` means the discovery pass has not landed yet — not a fault, and not
+  health either.
+  """
+  reason: String!
+  """
+  The kinds behind a non-Watching verdict, sorted by plural resource. Empty when healthy.
+  A list rather than a rendered phrase: truncation ("+N more") is a layout decision, and a
+  client that keys a subscription on the first offender must not have to parse it back out
+  of prose — which is also why each entry carries its `apiVersion`, since the plural alone
+  does not identify a kind.
+  """
+  unhealthyKindRefs: [SyncedKindRef!]!
+  "How many kinds this cache syncs."
+  totalKinds: Int!
+  "How many of them are not currently Watching."
+  unhealthyKinds: Int!
+  """
+  The most recent write across every kind — when data last arrived anywhere in this
+  cache. Null until some kind has written. On a quiet cluster this legitimately reads
+  hours old; `lastLiveAt` is what says that is fine.
+  """
+  lastUpdateAt: Time
+  """
+  The OLDEST proof among the kinds that have one — the weakest link, since a cache is
+  only as verified as its least-recently proven watch. Null before any kind has proved
+  itself.
+  """
+  lastLiveAt: Time
+}
+
+extend type Query {
+  """
+  A ClusterCache's control-plane event timeline (newest run first), the
+  ClusterCache-kind counterpart of `clusterEvents` — keyed by the cache's own `id`
+  and optionally filtered to one `category` (e.g. `"sync"`, the cache-sync history).
+  Empty for an unknown cache or one with no events. Decoupled from the cache/list
+  watch.
+  """
+  clusterCacheEvents(id: ObjectID!, category: String, limit: Int): [Event!]!
+
+  """
+  One synced kind's control-plane event timeline (newest run first) — the
+  sync-transition history (`SyncStart`/`SyncComplete`/`SyncDegraded`/`SyncStale`/…,
+  category `"sync"`) its worker records, keyed by that record's own `id`. This is where
+  the history lives; the parent cache's timeline carries only what the cache itself
+  records.
+  """
+  clusterCacheGVRSyncEvents(id: ObjectID!, category: String, limit: Int): [Event!]!
+}
+
+extend type Mutation {
+  "Clear a cluster's on-disk cache but keep its registry record. The cache's sync workers are restarted onto the emptied file, so a present, enabled cluster re-syncs from scratch. Returns the updated cluster."
+  clusterCacheClear(id: ObjectID!): Cluster!
+}
+
+extend type Subscription {
+  """
+  Streams cache records as a Kubernetes-style delta watch, parallel to
+  `clustersWatch`: the current set as an `Added` burst, then one
+  `Added`/`Modified`/`Deleted` change per cache. The client maintains a map keyed by
+  `cache.id` and joins each cache onto its cluster by `cache.clusterID`, treating the
+  cache whose `serverUid` matches the cluster's `status.server.uid` as the active
+  one. Independent of `clustersWatch` (the two streams carry no mutual ordering
+  guarantee, so the client tolerates a cache whose cluster has not arrived yet, and
+  drops caches orphaned by a cluster deletion).
+  """
+  clusterCachesWatch: ClusterCacheChange!
+
+  """
+  Streams every cache's sync verdict, folded from all the kinds it syncs, as a
+  latest-value stream keyed by `cacheID` (the client upserts by that id, exactly as it
+  does for `Event` runs). There is no delete: a verdict's lifetime is its cache's, so a
+  client evicts it when that cache leaves `clusterCachesWatch` — which is also when the
+  server drops it from its own snapshot.
+
+  Unscoped and one record per cache, so an always-mounted consumer can carry it. That is
+  the point: the per-kind records it folds are a hundred-plus per cache and ride a
+  cache-scoped watch, and no single kind's verdict is the cache's — a cache with
+  ninety-nine healthy kinds and one forbidden CRD is not healthy.
+
+  It is a read-side projection rather than a condition on the cache: nothing in the
+  object graph reacts to it, and storing it would wake the cache and every watcher each
+  time any child changed verdict.
+  """
+  clusterCacheSyncHealthWatch: ClusterCacheSyncHealth!
+
+  """
+  Streams the caches' GVR-discovery records as a Kubernetes-style delta watch, the
+  third of the parallel object streams (clusters, caches, GVR discoveries): the current set as an `Added` burst, then one
+  `Added`/`Modified`/`Deleted` change per record. The client maintains a map keyed by
+  `discovery.id` and joins each onto its cache by `discovery.cacheID`. Independent of
+  the other three (no mutual ordering guarantee). Unscoped because there is exactly one
+  per cache — the per-GVR sync records below it are one per synced kind and will ride
+  their own cache-scoped watch.
+  """
+  clusterCacheGVRDiscoveriesWatch: ClusterCacheGVRDiscoveryChange!
+
+  """
+  Streams one ClusterCache's per-kind sync records as a Kubernetes-style delta watch:
+  the current set as an `Added` burst, then one `Added`/`Modified`/`Deleted` change per
+  record. The client keys on `sync.id`.
+
+  **Cache-scoped, unlike the four watches above**, and deliberately so: there is one
+  record per synced kind rather than one per cache, so an unscoped stream would hand an
+  always-mounted consumer a hundred-plus records for every cache at once. Open it for
+  the cache you are actually looking at.
+
+  Empty (no frames) for a cache whose discovery pass has never run — it owns no sync
+  records yet.
+  """
+  clusterCacheGVRSyncsWatch(cacheID: ObjectID!): ClusterCacheGVRSyncChange!
+
+  """
+  Streams one ClusterCache's on-disk contents as a live gauge: the current measurement
+  on subscribe, then a fresh one whenever it changes (never a repeat of an unchanged
+  read). A deleted cache reports zeroed stats rather than its last-known contents; a
+  cache whose file is on disk but not open (never eligible, paused, mid-restart)
+  reports `exists` and `bytes` from that file, with the counts zero — they can only be
+  read through an open handle.
+
+  This is a subscription rather than a field on `ClusterCache` because the measurement
+  is not part of that object: a settled cache's record never changes, so a field there
+  would freeze at whatever the cache held when the client subscribed — which during a
+  cold sync is a small fraction of what lands seconds later.
+  """
+  clusterCacheStatsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheStats!
+
+  """
+  Streams a ClusterCache's event timeline, the ClusterCache-kind counterpart of
+  `clusterEventsWatch`: the matching runs as a snapshot, then live runs (a
+  re-delivered run bumps its count under the same `id`), keyed by the cache's own
+  `id` and optionally filtered to one `category` (e.g. `"sync"`). Independent of
+  `clusterCachesWatch`, so sync chatter never re-emits the cache. The client upserts
+  by `id`.
+  """
+  clusterCacheEventsWatch(id: ObjectID!, category: String): Event!
+
+  """
+  Streams one synced kind's event timeline, the live counterpart of
+  `clusterCacheGVRSyncEvents`: the matching runs as a snapshot, then live runs (a
+  re-delivered run bumps its count under the same `id`), keyed by that record's own
+  `id` and optionally filtered to one `category` (e.g. `"sync"`). Independent of
+  `clusterCacheGVRSyncsWatch`, so sync chatter never re-emits the record. The client
+  upserts by `id`.
+  """
+  clusterCacheGVRSyncEventsWatch(id: ObjectID!, category: String): Event!
+}

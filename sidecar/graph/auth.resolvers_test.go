@@ -1,7 +1,7 @@
 package graph_test
 
-// Behavioral tests for the resolvers in schema.resolvers.go, exercised over a
-// real gqlgen HTTP server (POST for queries/mutations, SSE for subscriptions).
+// Behavioral tests for the cloud-account resolvers, exercised over a real gqlgen
+// HTTP server (POST for queries/mutations, SSE for subscriptions).
 // The SSE plumbing helpers (openSSESubscription/sseEvents/nextSSE) live in
 // server_test.go alongside the transport canaries — they're shared within this
 // package.

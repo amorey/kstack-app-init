@@ -10,7 +10,7 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 
 - `main.go` — parse flags, bind socket, build `*app.App`, serve, drive graceful shutdown (`srv.Shutdown` → `app.DrainWithContext` → `stop(ctx)` → `app.Close`).
 - `internal/app/` — **composition root**: builds `poke.Service`, `cluster.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start(ctx)` returns a drain-func; the stop chain is `clusterSvcStop → cloudSvcStop → pokeSvcStop` — poke's hub closes **last**, after its subscribers drain (the left-to-right arg evaluation in the `errors.Join` enforces it).
-- `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
+- `graph/` — the per-noun `*.graphqls` schema files, generated code, the matching `<noun>.resolvers.go`, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
 - `internal/` — `ipc` (per-OS user-only endpoint), `k8shelpers` (`KubeConfigWatcher`), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
@@ -127,13 +127,19 @@ A cross-subsystem **leaf**: a wall-clock gap detector (15s tick, 2× factor — 
 
 ## GraphQL via gqlgen — the schema is the source of truth
 
-`graph/schema.graphqls` is authoritative — also consumed by the frontend's codegen (`codegen.ts`). After editing:
+`graph/*.graphqls` is authoritative — also consumed by the frontend's codegen (`codegen.ts`).
+
+**The schema is split one file per noun**: `common.graphqls` (scalars + the kind-agnostic `Condition`/`Event`/`Schedule`/`ChangeType` projections), then `cluster`, `cluster_cache`, `cluster_data`, `auth`, `chat`. Each noun file declares its own types and adds root fields with `extend type Query` / `Mutation` / `Subscription`; **no file defines the bare root types** — gqlparser assembles them from the extensions. A new noun is a new pair of files, not an edit to a shared root block. Resolver layout is `follow-schema`, so `cluster_cache.graphqls` generates `cluster_cache.resolvers.go`; the `Resolver` root methods and the `*Resolver` struct types land in whichever file sorts first (`auth.resolvers.go`) — generated placement, not a home to reason about.
+
+After editing:
 
 ```sh
 cd sidecar && go run github.com/99designs/gqlgen generate
 ```
 
-This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends panicking resolver stubs to `graph/schema.resolvers.go` — implement those. **Never hand-edit `generated.go`/`models_gen.go`.** `tools.go` pins gqlgen. Also re-run the frontend `pnpm codegen`. `graph/model/models.go` is a permanent stub keeping the package non-empty across regen.
+This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends panicking resolver stubs to the matching `graph/<noun>.resolvers.go` — implement those. **Never hand-edit `generated.go`/`models_gen.go`.** `tools.go` pins gqlgen. Also re-run the frontend `pnpm codegen`. `graph/model/models.go` is a permanent stub keeping the package non-empty across regen.
+
+**Renaming or splitting a schema file is a two-pass regen**: the first pass copies each resolver body into its new file but leaves the old `*.resolvers.go` in place, so the package has duplicate declarations until you delete it and regenerate. Verify no body came through as `panic("not implemented")` before committing.
 
 ## Patterns
 
