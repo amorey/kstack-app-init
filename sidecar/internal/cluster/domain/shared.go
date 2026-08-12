@@ -1,0 +1,322 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Vocabulary every noun reuses: identity, conditions, the kind-agnostic Event and
+// Schedule projections, and the delta-watch change type. Nothing here belongs to one
+// kind — a type only one kind uses lives in that kind's file, however generic its name
+// reads. Mirrors graph/shared.graphqls, which these types bind to.
+package domain
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"time"
+
+	"github.com/amorey/beehive"
+)
+
+// ErrNotFound is returned by client helpers when no cluster with the given id
+// is tracked.
+var ErrNotFound = errors.New("controllers: cluster not found")
+
+// --- Identity ---
+
+// ObjectID is the identity of a persisted object — the beehive ObjectID of any
+// kind, opaque on the wire (a decimal string) and bound to the one GraphQL
+// ObjectID scalar. The per-kind aliases below name the same type purely to
+// document which kind an id refers to.
+type ObjectID int64
+
+// ClusterID identifies a cluster record: the beehive ObjectID of its Cluster
+// object — opaque, source-agnostic, stable for the record's life (changes only on
+// an explicit Delete). The source's natural key lives only on the beehive name.
+type ClusterID = ObjectID
+
+// ClusterCacheID identifies one ClusterCache record. A cluster can own several,
+// so the cache id is not derivable from the cluster id.
+type ClusterCacheID = ObjectID
+
+// ClusterCacheGVRDiscoveryID identifies one cache's GVR-discovery child.
+type ClusterCacheGVRDiscoveryID = ObjectID
+
+// ClusterCacheGVRSyncID identifies one synced kind's ClusterCacheGVRSync object.
+type ClusterCacheGVRSyncID = ObjectID
+
+// parseObjectID parses an ObjectID from its decimal-string wire form; a
+// malformed value is a client error surfaced through UnmarshalGQL.
+func parseObjectID(s string) (ObjectID, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid object id %q: %w", s, err)
+	}
+	return ObjectID(n), nil
+}
+
+// MarshalGQL writes the ObjectID to the GraphQL ObjectID scalar as a quoted
+// decimal string (its wire form).
+func (id ObjectID) MarshalGQL(w io.Writer) {
+	io.WriteString(w, strconv.Quote(strconv.FormatInt(int64(id), 10)))
+}
+
+// UnmarshalGQL parses the GraphQL ObjectID scalar into a typed ObjectID. Accepts
+// string, json.Number (JSON-variable number), and int64/int (inline literal).
+func (id *ObjectID) UnmarshalGQL(v any) error {
+	switch t := v.(type) {
+	case string:
+		n, err := parseObjectID(t)
+		if err != nil {
+			return err
+		}
+		*id = n
+	case json.Number:
+		n, err := parseObjectID(t.String())
+		if err != nil {
+			return err
+		}
+		*id = n
+	case int64:
+		*id = ObjectID(t)
+	case int:
+		*id = ObjectID(t)
+	default:
+		return fmt.Errorf("ObjectID must be a string or integer, got %T", v)
+	}
+	return nil
+}
+
+// --- Conditions ---
+
+// ConditionStatus is a condition's three-valued verdict, Kubernetes-style.
+type ConditionStatus = beehive.ConditionStatus
+
+const (
+	ConditionTrue    = beehive.ConditionTrue
+	ConditionFalse   = beehive.ConditionFalse
+	ConditionUnknown = beehive.ConditionUnknown
+)
+
+// ConditionType names one independently-tracked aspect of a cluster
+// record's observed state. Each type is owned by exactly one controller.
+type ConditionType string
+
+const (
+	// ConditionConnected reports whether the last connection probe
+	// reached the cluster's API server and resolved its identity facts.
+	ConditionConnected ConditionType = "Connected"
+	// ConditionHealthy reports the API server's own condition (its
+	// readiness checks), as distinct from our ability to reach it.
+	ConditionHealthy ConditionType = "Healthy"
+	// ConditionSynced reports the state of a sync. It is reported at two levels: coarse
+	// on the ClusterCache (did this cache decide to sync?) and per kind on each
+	// ClusterCacheGVRSync, which is the verdict a UI wants.
+	ConditionSynced ConditionType = "Synced"
+	// ConditionDiscovered reports whether the cache's GVR discovery pass reached the
+	// API server and enumerated the kinds it serves. A separate axis from Synced: a
+	// cache can have a complete, current kind list while its per-kind workers are
+	// still catching up, and a discovery outage says nothing about the workers
+	// already running. Owned by ClusterCacheGVRDiscoveryController.
+	ConditionDiscovered ConditionType = "Discovered"
+)
+
+// Condition reason constants — CamelCase machine-readable explanations for a
+// condition's status, Kubernetes-style. Human detail goes in Message.
+const (
+	// reasonInactive: no connection is maintained — the record is orphaned,
+	// archived, deactivated, or its source has no resolvable credentials.
+	ReasonInactive = "Inactive"
+	// reasonConnecting: a probe is owed but none has succeeded or failed yet
+	// (a freshly-minted record awaiting its first pass).
+	ReasonConnecting = "Connecting"
+	// reasonConnected: the last connection probe succeeded.
+	ReasonConnected = "Connected"
+	// reasonResolveFailed: credentials could not be resolved from the
+	// record's source (e.g. the kube-context vanished from the kubeconfig).
+	ReasonResolveFailed = "ResolveFailed"
+	// reasonProbeFailed: credentials resolved but the dial/identity probe
+	// failed.
+	ReasonProbeFailed = "ProbeFailed"
+	// reasonReady: the API server reports its readiness checks passing.
+	ReasonReady = "Ready"
+	// reasonReadyzFailed: the API server responded but named failing checks.
+	ReasonReadyzFailed = "ReadyzFailed"
+	// reasonUnreachable: the health probe's transport failed outright.
+	ReasonUnreachable = "Unreachable"
+	// reasonNoConnection: health cannot be assessed without a live
+	// connection this pass.
+	ReasonNoConnection = "NoConnection"
+	// reasonPaused: nothing is syncing — the record is sync-disabled, deactivated,
+	// orphaned, or archived.
+	ReasonPaused = "Paused"
+	// reasonSyncing: the sync is starting or catching up. Condition-only — the
+	// event vocabulary uses SyncStart/ResyncStart instead.
+	ReasonSyncing = "Syncing"
+	// reasonWatching: the watch is established and proven live — caught up and
+	// streaming deltas.
+	ReasonWatching = "Watching"
+	// reasonSyncFailed: the worker itself failed (it could not start, or its run loop
+	// exited) and is retrying with backoff.
+	ReasonSyncFailed = "SyncFailed"
+	// reasonDiscovered: the last discovery pass enumerated every group the API
+	// server serves, and the per-GVR sync children match it.
+	ReasonDiscovered = "Discovered"
+	// reasonDiscoveryPartial: some groups answered, others didn't — the pass adds
+	// children without pruning (a group that failed to answer is not shown gone).
+	ReasonDiscoveryPartial = "DiscoveryPartial"
+	// reasonDiscoveryFailed: the discovery request itself failed, so nothing is
+	// known about the served kinds this pass. The existing children are left alone.
+	ReasonDiscoveryFailed = "DiscoveryFailed"
+	// reasonDiscoveryDraining: the kind list is current but a still-served kind has
+	// no live child yet — an earlier prune's child is draining and holds its name.
+	ReasonDiscoveryDraining = "DiscoveryDraining"
+	// reasonStale: caught up, but the watch stopped proving itself alive past the
+	// threshold — the cache may be behind (a Synced=False state distinct from
+	// SyncFailed, which is a hard worker failure).
+	ReasonStale = "Stale"
+
+	// Sync-EVENT reasons (the event log's transition vocabulary, distinct from the
+	// Synced-condition reasons above): start/complete pairs, cold and warm. A
+	// healthy steady state records no event.
+	//
+	// reasonSyncStart: a cold cache began its first-ever build.
+	ReasonSyncStart = "SyncStart"
+	// reasonSyncComplete: a cold build reached the caught-up milestone.
+	ReasonSyncComplete = "SyncComplete"
+	// reasonResyncStart: an already-populated cache began resuming (poke,
+	// reconnect, credential restart) — its message reports the warm cache size.
+	ReasonResyncStart = "ResyncStart"
+	// reasonResyncComplete: a resume re-reached the caught-up milestone; its
+	// message disambiguates a real catch-up (counts) from a bare liveness
+	// recovery (no counts).
+	ReasonResyncComplete = "ResyncComplete"
+	// reasonSyncDegraded: the worker failed and is retrying with backoff. The
+	// event-log parallel of the SyncFailed condition reason.
+	ReasonSyncDegraded = "SyncDegraded"
+	// reasonSyncStopped: the cache's syncs were stopped because the cluster became
+	// sync-ineligible (sync paused/disabled, or the context departed).
+	ReasonSyncStopped = "SyncStopped"
+	// reasonSyncStale: a caught-up watch stopped delivering updates past the
+	// threshold — the event-log parallel of the Stale condition reason.
+	ReasonSyncStale = "SyncStale"
+)
+
+// Condition aliases beehive's status condition. Conditions are beehive object
+// rows (not inside our status blob); the store owns TransitionedAt stamping,
+// no-op suppression, and the liveness downgrade.
+type Condition = beehive.Condition
+
+// LiveCondition is the sole condition constructor. Every condition here describes
+// process-scoped state, so Liveness makes beehive downgrade a previous process's
+// write to Unknown until re-confirmed (docs/adr/2026-08-09-liveness-conditions.md).
+// The message is capped here — the one place every condition is built — because
+// messages come from unbounded sources (raw client-go errors, kilobyte /readyz
+// bodies) and are re-serialized to every watcher per frame.
+func LiveCondition(t ConditionType, status ConditionStatus, reason, message string) Condition {
+	return Condition{
+		Type: string(t), Status: status, Reason: reason, Message: TruncateMessage(message), Liveness: true,
+	}
+}
+
+// FindCondition returns a pointer to the condition of the given type, or nil.
+func FindCondition(conds []Condition, t ConditionType) *Condition {
+	for i := range conds {
+		if conds[i].Type == string(t) {
+			return &conds[i]
+		}
+	}
+	return nil
+}
+
+// MaxMessageLen caps a persisted message (on a condition or an event run). Both are read
+// back on every frame of a whole-fleet watch, and their sources are unbounded: a raw
+// client-go error, or a /readyz?verbose=true body, which routinely runs to kilobytes.
+const MaxMessageLen = 200
+
+// TruncateMessage caps s at MaxMessageLen bytes, appending an ellipsis when it overflows.
+// (Byte-bounded; error strings are effectively ASCII.)
+func TruncateMessage(s string) string {
+	if len(s) <= MaxMessageLen {
+		return s
+	}
+	return s[:MaxMessageLen] + "…"
+}
+
+// Probe outcomes are not stored on ClusterStatus — they ride beehive's event log,
+// keeping per-probe chatter off the status watch (a repeated failure bumps a run's
+// Count, no status rewrite).
+const (
+	// ConnectionEventCategory is the connection controller's probe-outcome category.
+	ConnectionEventCategory = "connection"
+	// SyncEventCategory is the sync-transition category, the sync-side parallel of
+	// ConnectionEventCategory.
+	SyncEventCategory = "sync"
+)
+
+// Event is one coalesced run from a beehive object's event timeline, served under
+// every kind's events surface. ID is the client's upsert key (a reason can repeat;
+// a run id cannot); a repeated same-outcome occurrence bumps Count, and
+// [FirstAt, LastAt] is the run's window.
+type Event struct {
+	ID       ObjectID          `json:"id"`
+	Category string            `json:"category"`
+	Type     beehive.EventType `json:"type"`
+	Reason   string            `json:"reason"`
+	Message  string            `json:"message"`
+	Count    int               `json:"count"`
+	FirstAt  time.Time         `json:"firstAt"`
+	LastAt   time.Time         `json:"lastAt"`
+}
+
+// Schedule is the kind-agnostic projection of a beehive object's reconcile
+// schedule (a gauge), served live via the schedule watch — a scheduling change
+// fires no object WatchList.
+type Schedule struct {
+	// NextRequeueAt is the next reconcile time, or nil when nothing is scheduled.
+	NextRequeueAt *time.Time `json:"nextRequeueAt"`
+	// Probing reports whether a reconcile's network probe is in flight, asserted
+	// by the core controller so the webview can show a definite "checking now".
+	// Merged into this gauge because a probe start/end fires no WatchList.
+	Probing bool `json:"probing"`
+}
+
+// ChangeType classifies a delta-watch change, mirroring a Kubernetes watch event. The
+// Added/Modified/Deleted string values are identical to beehive's, so the watch pumps map
+// beehive→domain with a plain conversion; it is a defined type (not an alias of
+// beehive.ChangeType, which aliases into an internal package gqlgen can't import) so the
+// GraphQL ChangeType enum binds straight to it — the external-enum pattern used for
+// EventType/ConditionStatus.
+type ChangeType string
+
+const (
+	ChangeAdded    ChangeType = "Added"
+	ChangeModified ChangeType = "Modified"
+	ChangeDeleted  ChangeType = "Deleted"
+	// ChangeBookmark closes the on-subscribe snapshot: exactly one per stream, after the
+	// last snapshot object and before the first live change. It carries no object — the
+	// one case for which every change wrapper's entity is a pointer — so a consumer must
+	// skip it rather than key on it.
+	// See docs/adr/2026-08-09-delta-watch-protocol.md.
+	ChangeBookmark ChangeType = "Bookmark"
+)
+
+// TimePtrEqual compares two optional timestamps: both nil is equal, and a present
+// pair compares by instant, so two readings of the same stamp never look changed.
+func TimePtrEqual(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
+}

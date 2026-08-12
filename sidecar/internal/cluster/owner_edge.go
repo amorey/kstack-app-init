@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Helpers used only by the ClusterService boundary: owner-edge reads for the domain
-// builders, and the limits its event surface applies.
+// Reading the beehive owner edge, shared by every domain builder at the ClusterService
+// boundary — the child kinds all carry their parent's id as their client-side join key.
 package cluster
 
 import (
@@ -36,21 +36,3 @@ func ownerObjectID[Spec, Status any](obj *beehive.Object[Spec, Status]) domain.O
 	}
 	return domain.ObjectID(owner.ID)
 }
-
-// derefOrZero returns *p, or the zero value when nil. beehive leaves Status nil until first
-// written, while domain records serve it by value — absent and zeroed say the same thing.
-func derefOrZero[T any](p *T) T {
-	if p == nil {
-		var zero T
-		return zero
-	}
-	return *p
-}
-
-// defaultEventLimit bounds an events read (or watch snapshot) when the caller
-// gives no explicit limit.
-const defaultEventLimit = 50
-
-// maxEventRuns bounds retention per (object, category) timeline — counted in
-// aggregated RUNS (state transitions), not occurrences. Global (set at beehive.New).
-const maxEventRuns = 20

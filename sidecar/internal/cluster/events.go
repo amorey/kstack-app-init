@@ -23,6 +23,10 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain"
 )
 
+// defaultEventLimit bounds an events read (or watch snapshot) when the caller
+// gives no explicit limit.
+const defaultEventLimit = 50
+
 // eventClient is the event-log slice of a beehive kind client; every kind client
 // satisfies it, so one reader serves every kind's events surface.
 type eventClient interface {

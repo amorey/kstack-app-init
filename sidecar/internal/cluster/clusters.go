@@ -230,3 +230,37 @@ func (s *Service) buildCluster(obj *beehive.Object[domain.ClusterSpec, domain.Cl
 	c.Status = derefOrZero(obj.Status)
 	return c
 }
+
+// derefOrZero returns *p, or the zero value when nil. beehive leaves Status nil until first
+// written, while domain records serve it by value — absent and zeroed say the same thing.
+func derefOrZero[T any](p *T) T {
+	if p == nil {
+		var zero T
+		return zero
+	}
+	return *p
+}
+
+// mapChan streams src through fn until src closes or ctx ends (out closes on exit).
+func mapChan[A, B any](ctx context.Context, src <-chan A, fn func(A) B) <-chan B {
+	out := make(chan B, 1)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case v, ok := <-src:
+				if !ok {
+					return
+				}
+				select {
+				case out <- fn(v):
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out
+}

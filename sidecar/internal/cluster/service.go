@@ -437,3 +437,7 @@ func (s *Service) cacheRef(ctx context.Context, id domain.ClusterID) (store.Cach
 	}
 	return domain.NewCacheRef(beehive.ObjectID(id), cacheObj.ID), true, nil
 }
+
+// maxEventRuns bounds retention per (object, category) timeline — counted in
+// aggregated RUNS (state transitions), not occurrences. Global (set at beehive.New).
+const maxEventRuns = 20
