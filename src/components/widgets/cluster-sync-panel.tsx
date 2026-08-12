@@ -191,15 +191,19 @@ const ClusterCacheGVRDiscoveriesSubscription = graphql(`
   }
 `);
 
-type GVRDiscovery = ClusterCacheGvrDiscoveriesSubscription['clusterCacheGVRDiscoveriesWatch']['discovery'];
+// NonNullable: null only on a Bookmark, folded away in the reducer below.
+type GVRDiscovery = NonNullable<ClusterCacheGvrDiscoveriesSubscription['clusterCacheGVRDiscoveriesWatch']['discovery']>;
 
 // Every cache's discovery record, folded by cacheID.
 function useGVRDiscoveries(): Keyed<GVRDiscovery> {
   const [{ data }] = useWatchSubscription<
-    { clusterCacheGVRDiscoveriesWatch: { type: string; discovery: GVRDiscovery } },
+    { clusterCacheGVRDiscoveriesWatch: { type: string; discovery: GVRDiscovery | null } },
     Keyed<GVRDiscovery>
   >({ query: ClusterCacheGVRDiscoveriesSubscription }, (prev, resp) => {
     const { type, discovery } = resp.clusterCacheGVRDiscoveriesWatch;
+    // The Bookmark carries no record. This pane reads the fold as a lookup table, so
+    // it needs no snapshot-complete gate of its own.
+    if (!discovery) return prev ?? new Map();
     // A Deleted must match on the record's own id, not cacheID: a hard delete's
     // frame carries cacheID "0" (the owner edge is already collected), so keying it
     // by cacheID would drop every delete and the pane would show gone records.
@@ -254,15 +258,19 @@ const ClusterCacheGVRSyncsSubscription = graphql(`
   }
 `);
 
-type GVRSync = ClusterCacheGvrSyncsSubscription['clusterCacheGVRSyncsWatch']['sync'];
+// NonNullable: null only on a Bookmark, folded away in the reducer below.
+type GVRSync = NonNullable<ClusterCacheGvrSyncsSubscription['clusterCacheGVRSyncsWatch']['sync']>;
 
 // The cache's kind syncs, id-keyed through the registry's shared delta fold.
 function useGVRSyncs(cacheId: string): GVRSync[] {
   const [{ data }] = useWatchSubscription<
-    { clusterCacheGVRSyncsWatch: { type: string; sync: GVRSync } },
+    { clusterCacheGVRSyncsWatch: { type: string; sync: GVRSync | null } },
     Keyed<GVRSync>
   >({ query: ClusterCacheGVRSyncsSubscription, variables: { cacheID: cacheId } }, (prev, resp) => {
     const { type, sync } = resp.clusterCacheGVRSyncsWatch;
+    // The Bookmark carries no record; the row renders per-kind detail, not an
+    // empty state, so it needs no snapshot-complete gate.
+    if (!sync) return prev ?? new Map();
     return applyChange(prev, type, sync.id, sync);
   });
   return useMemo(() => (data ? [...data.values()] : []), [data]);
@@ -1009,8 +1017,9 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
   const rows = clusters ?? [];
   const groups = GROUPS.map((g) => ({ ...g, clusters: rows.filter(g.match) })).filter((g) => g.clusters.length > 0);
 
-  // Transport phase: "connecting" (no report, transport down) vs "empty" (up, no
-  // clusters) vs "reconnecting" (drop with the registry loaded — keep the table, flag it).
+  // `clusters !== null` IS the snapshot-complete signal watchPhase wants (the provider
+  // holds the list back until the Bookmark), so "No clusters yet." below can only be
+  // reached once the fleet is genuinely known.
   const phase = watchPhase(clusters !== null, connected);
 
   // Actions write through; the clustersWatch push is the source of truth. urql's

@@ -34,6 +34,9 @@ func (a cachesAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheChange,
 	}
 	return watchListChan(ctx, "ClusterCache", snap, src,
 		func(t domain.ChangeType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheSpec, domain.ClusterCacheStatus]) domain.ClusterCacheChange {
+			if t == domain.ChangeBookmark {
+				return domain.ClusterCacheChange{Type: t}
+			}
 			if obj == nil {
 				return domain.ClusterCacheChange{Type: t, Cache: &domain.ClusterCache{ID: domain.ClusterCacheID(id)}}
 			}

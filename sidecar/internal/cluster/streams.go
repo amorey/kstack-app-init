@@ -26,11 +26,15 @@ import (
 )
 
 // watchListChan folds a beehive kind watch (snapshot + change stream) into one
-// Kubernetes-style delta stream. A deletion-pending object is collapsed to Deleted
-// (List/Get hide tombstones, so the watch removes it at once; the trailing hard
-// Deleted repeats idempotently). beehive's terminal Failed change ends the stream
-// after a log line. fn's obj is nil only on a Deleted whose final state could not
-// be decoded; the removal is still reported by id. Out closes on exit.
+// Kubernetes-style delta stream, closing the snapshot with a single Bookmark so a
+// consumer can tell an empty collection from one still arriving. A deletion-pending
+// object is collapsed to Deleted (List/Get hide tombstones, so the watch removes it
+// at once; the trailing hard Deleted repeats idempotently). beehive's terminal Failed
+// change ends the stream after a log line. Out closes on exit.
+//
+// fn is called with a nil obj two ways, and must tell them apart: on ChangeBookmark
+// (once, between snapshot and deltas) it must return a change carrying NO entity; on a
+// Deleted whose final state could not be decoded it returns the removal by id alone.
 func watchListChan[Spec, Status, Out any](
 	ctx context.Context,
 	kind string,
@@ -52,6 +56,10 @@ func watchListChan[Spec, Status, Out any](
 			if !send(ctx, out, fn(domainType(beehive.Added, obj), obj.ID, obj)) {
 				return
 			}
+		}
+		// Everything from here is a live change, not initial state.
+		if !send(ctx, out, fn(domain.ChangeBookmark, 0, nil)) {
+			return
 		}
 		for {
 			select {
@@ -83,6 +91,9 @@ func watchListChan[Spec, Status, Out any](
 // and Deleted for every held key when the cache closes. `snapshot` must return an
 // ordered slice (its order is the Added-burst order); T must be comparable so a
 // changed value is detected by ==. Closes when ctx ends or the store shuts down.
+//
+// mkChange is called with a nil entity for the single Bookmark closing the initial
+// state, and must return a change carrying none.
 func cacheDeltaWatch[T comparable, C any](
 	ctx context.Context,
 	mgr *store.Manager,
@@ -91,10 +102,23 @@ func cacheDeltaWatch[T comparable, C any](
 	subscribe func(*store.ClusterDB) (<-chan store.WriteWake, func()),
 	snapshot func(context.Context, *store.ClusterDB) ([]T, error),
 	keyOf func(T) string,
-	mkChange func(domain.ChangeType, T) C,
+	mkChange func(domain.ChangeType, *T) C,
 ) <-chan C {
 	out := make(chan C, 1)
 	prev := map[string]T{}
+
+	// The initial state is complete after the first successful read — or after the
+	// first bind that found no open cache, whose initial state is legitimately empty
+	// (a never-synced or paused cache would otherwise spin forever). A failed read is
+	// not initial state, so it waits for the retry.
+	bookmarked := false
+	markBookmarked := func() bool {
+		if bookmarked {
+			return true
+		}
+		bookmarked = true
+		return send(ctx, out, mkChange(domain.ChangeBookmark, nil))
+	}
 
 	// emit diffs a fresh snapshot against prev: Added/Modified in snapshot order,
 	// then Deleted for vanished keys (map order).
@@ -116,36 +140,36 @@ func cacheDeltaWatch[T comparable, C any](
 			old, existed := prev[key]
 			switch {
 			case !existed:
-				if !send(ctx, out, mkChange(domain.ChangeAdded, v)) {
+				if !send(ctx, out, mkChange(domain.ChangeAdded, &v)) {
 					return false, false
 				}
 			case old != v:
-				if !send(ctx, out, mkChange(domain.ChangeModified, v)) {
+				if !send(ctx, out, mkChange(domain.ChangeModified, &v)) {
 					return false, false
 				}
 			}
 		}
 		for key, v := range prev {
 			if _, ok := next[key]; !ok {
-				if !send(ctx, out, mkChange(domain.ChangeDeleted, v)) {
+				if !send(ctx, out, mkChange(domain.ChangeDeleted, &v)) {
 					return false, false
 				}
 			}
 		}
 		prev = next
-		return true, false
+		return markBookmarked(), false
 	}
 
 	// emitEmpty sends one Deleted per held value and clears prev — run when the
 	// cache closes so a never-reopened cache leaves no stale rows.
 	emitEmpty := func() bool {
 		for _, v := range prev {
-			if !send(ctx, out, mkChange(domain.ChangeDeleted, v)) {
+			if !send(ctx, out, mkChange(domain.ChangeDeleted, &v)) {
 				return false
 			}
 		}
 		prev = map[string]T{}
-		return true
+		return markBookmarked()
 	}
 
 	go func() {

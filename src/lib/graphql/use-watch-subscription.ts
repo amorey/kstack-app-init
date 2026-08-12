@@ -65,12 +65,17 @@ export function useWatchSubscription<Data, Result, Variables extends AnyVariable
   return [{ ...result, data, connected: status.connected }, executeSubscription];
 }
 
-// Crosses `hasData` × `connected` to separate what a bare `data === undefined`
-// check conflates: connecting (spinner) vs empty (connected, real empty state)
-// vs reconnecting (drop with last-known data held) vs live.
-export type WatchPhase = 'connecting' | 'empty' | 'reconnecting' | 'live';
+// A watch's rendering state. `connecting` covers everything before the collection
+// is known — transport still dialing, or its snapshot still arriving — so a
+// consumer renders an empty state only from `live`/`reconnecting`, where empty
+// means empty. `reconnecting` is a drop with last-known data held.
+export type WatchPhase = 'connecting' | 'reconnecting' | 'live';
 
-export function watchPhase(hasData: boolean, connected: boolean): WatchPhase {
-  if (!hasData) return connected ? 'empty' : 'connecting';
+// `synced` means the snapshot's Bookmark has landed. Deriving it from "any data
+// yet" instead would report a populated collection as empty for the whole time the
+// server spends listing it — `connected` flips on the transport's open frame, which
+// precedes the first row.
+export function watchPhase(synced: boolean, connected: boolean): WatchPhase {
+  if (!synced) return 'connecting';
   return connected ? 'live' : 'reconnecting';
 }

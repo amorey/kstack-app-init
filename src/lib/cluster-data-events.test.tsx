@@ -83,6 +83,11 @@ function pushFrame(type: string, event: unknown, cacheID = lastArgs?.variables?.
   acc = lastReducer!(acc, { clusterDataEventsWatch: { type, cacheID, event } });
 }
 
+// The Bookmark closing the snapshot: what flips the watch from connecting to live.
+function pushBookmark(cacheID = lastArgs?.variables?.cacheID) {
+  acc = lastReducer!(acc, { clusterDataEventsWatch: { type: 'Bookmark', cacheID, event: null } });
+}
+
 function pushReset() {
   statusState.snapshot = { connected: true, generation: statusState.snapshot.generation + 1 };
 }
@@ -208,6 +213,30 @@ describe('useClusterDataEvents', () => {
     expect(lastArgs?.pause).toBe(true);
   });
 
+  // The Bookmark carries no entity. Keying it would put a phantom row in every table.
+  it('folds the Bookmark away instead of keying it as a row', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
+    const { result, rerender } = renderHook(() => useClusterDataEvents());
+
+    pushFrame('Added', evt('a'));
+    pushBookmark();
+    rerender();
+    expect(uids(result.current.events)).toEqual(['a']);
+  });
+
+  // An empty snapshot is a real answer, not a missing one — the whole point of the
+  // Bookmark. Reported as live with no rows, so a table renders its empty state.
+  it('reports live with no items on an empty snapshot', () => {
+    useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
+    const { result, rerender } = renderHook(() => useClusterDataEvents());
+    expect(result.current.phase).toBe('connecting');
+
+    pushBookmark();
+    rerender();
+    expect(result.current.phase).toBe('live');
+    expect(result.current.events).toEqual([]);
+  });
+
   it('reports connecting → live across the first frame, and reconnecting on a drop', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
     statusState.snapshot = { connected: false, generation: 0 };
@@ -217,6 +246,11 @@ describe('useClusterDataEvents', () => {
 
     statusState.snapshot = { connected: true, generation: 0 };
     pushFrame('Added', evt('a'));
+    rerender();
+    // A frame is not the whole snapshot: still connecting until the Bookmark.
+    expect(result.current.phase).toBe('connecting');
+
+    pushBookmark();
     rerender();
     expect(result.current.phase).toBe('live');
 

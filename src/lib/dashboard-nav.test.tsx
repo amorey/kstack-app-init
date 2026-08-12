@@ -100,6 +100,11 @@ function pushFrame(type: string, kind: unknown, cacheID = lastArgs?.variables?.c
   acc = lastReducer!(acc, { clusterDataKindsWatch: { type, cacheID, kind } });
 }
 
+// The Bookmark closing the snapshot: what flips the watch from connecting to live.
+function pushBookmark(cacheID = lastArgs?.variables?.cacheID) {
+  acc = lastReducer!(acc, { clusterDataKindsWatch: { type: 'Bookmark', cacheID, kind: null } });
+}
+
 // A transport reconnect: the exchange bumps the op's generation on the new
 // connection's `open`, which is what makes useWatchSubscription reset its
 // accumulator (fold onto a clean slate, and mask any not-yet-refolded state).
@@ -326,6 +331,7 @@ describe('useDashboardNav', () => {
     expect(result.current.active).toBe(true);
 
     pushFrame('Added', REPLICASET);
+    pushBookmark();
     rerender();
     expect(result.current.phase).toBe('live');
   });
@@ -334,6 +340,7 @@ describe('useDashboardNav', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture({ status: 'True', reason: 'Watching' })] });
     const { result, rerender } = renderHook(() => useDashboardNav());
     pushFrame('Added', REPLICASET);
+    pushBookmark();
     rerender();
     expect(result.current.phase).toBe('live');
 

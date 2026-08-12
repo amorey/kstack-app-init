@@ -42,8 +42,8 @@ export function useActiveKubeContext(): ActiveKubeContext {
   const navigate = useNavigate();
   const { kubeConfig, connected } = useKubeConfig();
 
-  // `kubeConfig === null` is exactly "registry hasn't reported" — the `hasData`
-  // signal `watchPhase` wants.
+  // `kubeConfig === null` is exactly "the registry's snapshot is not complete" — it
+  // is derived from `clusters`, which the provider holds back until the Bookmark.
   const phase = watchPhase(kubeConfig !== null, connected);
   const contexts = kubeConfig?.contexts ?? [];
   // A param naming a gone context yields to the default — a stale deep link

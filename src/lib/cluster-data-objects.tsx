@@ -51,7 +51,9 @@ const ClusterDataObjectsWatchSubscription = graphql(`
 `);
 
 // One cached object (the `object` payload of a change), as the table renders a row from.
-export type ClusterDataObject = ClusterDataObjectsWatchSubscriptionType['clusterDataObjectsWatch']['object'];
+export type ClusterDataObject = NonNullable<
+  ClusterDataObjectsWatchSubscriptionType['clusterDataObjectsWatch']['object']
+>;
 
 // Hoisted: the list re-sorts on every delta frame, and per-call `localeCompare`
 // re-derives a collator each time.

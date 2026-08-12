@@ -58,6 +58,8 @@ func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {
 	assert.Equal(t, "deployments", got.Sync.Spec.Resource)
 	assert.Equal(t, domain.ClusterCacheGVRDiscoveryID(myDiscovery), got.Sync.DiscoveryID,
 		"the record must carry its owning discovery anchor, the key a client joins on")
+	bm := recvGVRSyncChange(t, ch)
+	requireBookmark(t, bm.Type, bm.Sync)
 
 	// The other cache's identically-named kind must not arrive.
 	select {
@@ -84,9 +86,12 @@ func TestWatchGVRSyncsResolvesAnAnchorCreatedAfterSubscribe(t *testing.T) {
 	id := seedCluster(t, s, "alpha")
 	cacheID := seedActiveCache(t, s, coreCC, id, "uid-alpha")
 
-	// Subscribe BEFORE the cache has an anchor.
+	// Subscribe BEFORE the cache has an anchor. Nothing exists yet, so the initial state
+	// is empty and its Bookmark arrives at once.
 	ch, err := s.Syncs().Watch(ctx, domain.ClusterCacheID(cacheID))
 	require.NoError(t, err)
+	bm := recvGVRSyncChange(t, ch)
+	requireBookmark(t, bm.Type, bm.Sync)
 
 	discoveryID := seedGVRDiscovery(t, s, cacheID)
 	seedGVRSync(t, s, discoveryID, "apps/v1", "deployments")
@@ -268,6 +273,43 @@ func TestGVRSyncAnchorFilterForwardsAnUnattributableDelete(t *testing.T) {
 		func(error) { t.Fatal("no read failed") },
 	)
 	require.Len(t, keep(gvrSyncChangeOwnedBy(0)), 1)
+}
+
+// The Bookmark needs no anchor, so with nothing held it passes straight through.
+func TestGVRSyncAnchorFilterForwardsTheBookmark(t *testing.T) {
+	keep := gvrSyncAnchorFilter(
+		func() (beehive.ObjectID, error) { t.Fatal("must not need a lookup"); return 0, nil },
+		func(error) { t.Fatal("no read failed") },
+	)
+	out := keep(domain.ClusterCacheGVRSyncChange{Type: domain.ChangeBookmark})
+	require.Len(t, out, 1)
+	require.Equal(t, domain.ChangeBookmark, out[0].Type)
+}
+
+// The Bookmark must never overtake frames held during a read outage: it says the initial
+// state is complete, which is false while part of that state is still undecided. It queues
+// behind them and is released in order.
+func TestGVRSyncAnchorFilterHoldsTheBookmarkBehindUndecidedFrames(t *testing.T) {
+	var fail bool
+	keep := gvrSyncAnchorFilter(func() (beehive.ObjectID, error) {
+		if fail {
+			return 0, errors.New("read failed")
+		}
+		return 91, nil
+	}, func(error) {})
+
+	fail = true
+	require.Empty(t, keep(gvrSyncChangeOwnedBy(91)), "undecidable, so held")
+	require.Empty(t, keep(domain.ClusterCacheGVRSyncChange{Type: domain.ChangeBookmark}),
+		"the Bookmark waits behind the snapshot frame it would otherwise close over")
+
+	// The read recovers: the held frame comes out first, its Bookmark behind it.
+	fail = false
+	out := keep(gvrSyncChangeOwnedBy(91))
+	require.Len(t, out, 3)
+	require.Equal(t, domain.ChangeAdded, out[0].Type)
+	require.Equal(t, domain.ChangeBookmark, out[1].Type)
+	require.Equal(t, domain.ChangeAdded, out[2].Type)
 }
 
 func gvrSyncChangeOwnedBy(discoveryID beehive.ObjectID) domain.ClusterCacheGVRSyncChange {

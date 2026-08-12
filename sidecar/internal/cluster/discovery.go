@@ -31,6 +31,9 @@ func (a discoveryAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRD
 	}
 	return watchListChan(ctx, "ClusterCacheGVRDiscovery", snap, src,
 		func(t domain.ChangeType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRDiscoverySpec, domain.ClusterCacheGVRDiscoveryStatus]) domain.ClusterCacheGVRDiscoveryChange {
+			if t == domain.ChangeBookmark {
+				return domain.ClusterCacheGVRDiscoveryChange{Type: t}
+			}
 			if obj == nil {
 				return domain.ClusterCacheGVRDiscoveryChange{Type: t, Discovery: &domain.ClusterCacheGVRDiscovery{ID: domain.ClusterCacheGVRDiscoveryID(id)}}
 			}

@@ -227,15 +227,17 @@ describe('watchPhase', () => {
     expect(watchPhase(false, false)).toBe('connecting');
   });
 
-  it('reads no-data-yet as empty when the transport is up (an empty snapshot)', () => {
-    expect(watchPhase(false, true)).toBe('empty');
+  it('reads an incomplete snapshot as connecting even with the transport up', () => {
+    // The case the Bookmark exists for: reporting this as an empty collection is
+    // what showed "nothing here" over a set the server was still listing.
+    expect(watchPhase(false, true)).toBe('connecting');
   });
 
-  it('reads held data through an outage as reconnecting', () => {
+  it('reads a synced watch through an outage as reconnecting', () => {
     expect(watchPhase(true, false)).toBe('reconnecting');
   });
 
-  it('reads data on a live connection as live', () => {
+  it('reads a synced watch on a live connection as live', () => {
     expect(watchPhase(true, true)).toBe('live');
   });
 });

@@ -102,8 +102,8 @@ type ClusterDataObject {
 type ClusterDataKindChange {
   "Whether this kind was added (incl. the on-subscribe snapshot), modified (chiefly a `count` change), or deleted."
   type: ChangeType!
-  "The affected kind. On `Deleted`, its last-known row; the client keys on `apiVersion` + `resource`."
-  kind: ClusterDataKind!
+  "The affected kind. On `Deleted`, its last-known row; the client keys on `apiVersion` + `resource`. Null on `Bookmark`."
+  kind: ClusterDataKind
   """
   The cache this frame came from — the frame's provenance. A client watching the
   active cache rejects a late frame from a superseded cache (one still draining
@@ -116,8 +116,8 @@ type ClusterDataKindChange {
 type ClusterDataEventChange {
   "Whether this event was added (incl. the on-subscribe snapshot), modified (chiefly a `count`/`lastSeen` change as it re-fires), or deleted."
   type: ChangeType!
-  "The affected event. On `Deleted`, its last-known row; the client keys on `uid`."
-  event: ClusterDataEvent!
+  "The affected event. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
+  event: ClusterDataEvent
   """
   The cache this frame came from — the frame's provenance, mirroring
   `ClusterDataKindChange.cacheID`. A client watching the active cache rejects a late
@@ -130,8 +130,8 @@ type ClusterDataEventChange {
 type ClusterDataObjectChange {
   "Whether this object was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
-  "The affected object. On `Deleted`, its last-known row; the client keys on `uid`."
-  object: ClusterDataObject!
+  "The affected object. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
+  object: ClusterDataObject
   """
   The cache this frame came from — the frame's provenance, mirroring
   `ClusterDataKindChange.cacheID`. A client watching the active cache rejects a late
@@ -163,7 +163,7 @@ extend type Subscription {
   Streams one ClusterCache's discovered kind catalog as a Kubernetes-style delta
   watch (the live counterpart of `clusterDataKinds`, keyed the same way — parent
   cluster `id` + `cacheID`): the current catalog as an `Added` burst on subscribe,
-  then one `Added`/`Modified`/`Deleted` change per kind as the sync engine writes
+  closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted` change per kind as the sync engine writes
   objects — a kind's per-object `count` is live, so an object write re-emits it as
   `Modified`. The client keys each kind by `apiVersion` + `resource` and rebuilds the
   dashboard resource nav from the accumulated set, so the nav (kinds + counts) tracks
@@ -175,7 +175,7 @@ extend type Subscription {
   """
   Streams one ClusterCache's cached Kubernetes Events as a Kubernetes-style delta watch,
   keyed like `clusterDataKindsWatch` (parent cluster `id` + `cacheID`): the newest window
-  of events as an `Added` burst on subscribe, then one `Added`/`Modified`/`Deleted` change
+  of events as an `Added` burst on subscribe, closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted` change
   per event as the sync engine writes events (a re-firing event bumps its `count`/`lastSeen`
   → `Modified`). The client keys each event by `uid` and maintains the table from the
   accumulated set. Because the window is bounded, an event aging out of it as newer events
@@ -189,7 +189,7 @@ extend type Subscription {
   Streams one kind's cached objects from a ClusterCache as a Kubernetes-style delta
   watch, keyed like `clusterDataEventsWatch` plus the target kind (`apiVersion` +
   `resource`, e.g. `"apps/v1"` + `"deployments"`): the current object set for the kind
-  as an `Added` burst on subscribe (the snapshot), then one `Added`/`Modified`/`Deleted`
+  as an `Added` burst on subscribe (the snapshot), closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted`
   change per object as the sync engine writes it, each frame carrying its `cacheID`
   provenance. The client keys each object by `uid` and maintains the table from the
   accumulated set. Empty (no frames) until that cache's db is open and the kind has

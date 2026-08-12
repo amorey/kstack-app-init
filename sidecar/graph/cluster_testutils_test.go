@@ -346,7 +346,7 @@ func (f fakeData) WatchKinds(ctx context.Context, clusterID domain.ClusterID, _ 
 	f.s.mu.Unlock()
 	ch := make(chan domain.ClusterDataKindChange, len(snap))
 	for _, k := range snap {
-		ch <- domain.ClusterDataKindChange{Type: domain.ChangeAdded, Kind: k}
+		ch <- domain.ClusterDataKindChange{Type: domain.ChangeAdded, Kind: &k}
 	}
 	go func() {
 		<-ctx.Done()
@@ -361,7 +361,7 @@ func (f fakeData) WatchEvents(ctx context.Context, clusterID domain.ClusterID, _
 	f.s.mu.Unlock()
 	ch := make(chan domain.ClusterDataEventChange, len(snap))
 	for _, e := range snap {
-		ch <- domain.ClusterDataEventChange{Type: domain.ChangeAdded, Event: e}
+		ch <- domain.ClusterDataEventChange{Type: domain.ChangeAdded, Event: &e}
 	}
 	go func() {
 		<-ctx.Done()
@@ -376,7 +376,7 @@ func (f fakeData) WatchObjects(ctx context.Context, clusterID domain.ClusterID, 
 	f.s.mu.Unlock()
 	ch := make(chan domain.ClusterDataObjectChange, len(snap))
 	for _, o := range snap {
-		ch <- domain.ClusterDataObjectChange{Type: domain.ChangeAdded, Object: o}
+		ch <- domain.ClusterDataObjectChange{Type: domain.ChangeAdded, Object: &o}
 	}
 	go func() {
 		<-ctx.Done()

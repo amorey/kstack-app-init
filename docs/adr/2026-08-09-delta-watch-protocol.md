@@ -18,11 +18,21 @@ than its cluster. The frontend needs current state on subscribe plus every chang
 ## Decision
 
 Each kind streams **independently** as a Kubernetes-style delta watch: an `Added` snapshot
-burst, then per-object `Added`/`Modified`/`Deleted` (`clustersWatch`, `clusterCachesWatch`,
-`clusterCacheGVRDiscoveriesWatch`, `clusterCacheSyncHealthWatch`, and the cache-scoped
-`clusterCacheGVRSyncsWatch`). The sidecar folds beehive's per-kind `WatchList` into this shape
-in `service.go`'s `watchListChan` pump; subscription resolvers emit the current snapshot
-first, then deltas (`mapStream` in `graph/util.go` for hub-backed sources).
+burst, one `Bookmark` closing it, then per-object `Added`/`Modified`/`Deleted`
+(`clustersWatch`, `clusterCachesWatch`, `clusterCacheGVRDiscoveriesWatch`,
+`clusterCacheSyncHealthWatch`, and the cache-scoped `clusterCacheGVRSyncsWatch`). The sidecar
+folds beehive's per-kind `WatchList` into this shape in `streams.go`'s `watchListChan` pump;
+subscription resolvers emit the current snapshot first, then deltas (`mapStream` in
+`graph/util.go` for hub-backed sources).
+
+The **`Bookmark`** is what makes an empty collection distinguishable from one still arriving:
+sent exactly once per stream, carrying no entity (the only frame that doesn't — which is why
+every change wrapper's entity field is nullable). Until it lands a consumer is in
+`watchPhase`'s `connecting`; a client must never render an empty state before it. Kubernetes'
+`initial-events-end` bookmark, in this protocol's vocabulary. The cache-data watches
+(`cacheDeltaWatch`) send theirs after the first successful read — or after the first bind that
+finds no open cache, whose initial state is legitimately empty, so a never-synced or paused
+cache reports "empty" rather than spinning forever.
 
 The webview keys each stream into an id-keyed map and **joins client-side, down the chain**:
 caches onto clusters by `clusterID`, verdicts and discovery records onto their cache by
@@ -48,14 +58,29 @@ join against the current cluster status is correct.
 **Query + poll instead of watches.** Rejected: the data is exactly what Kubernetes-style
 watches were designed for, and polling either lags or hammers.
 
+**Returning `(snapshot, channel)` on the wire, as beehive's Go watches do.** The tuple is the
+right shape in-process — `watchListChan` takes it, and it is what makes the initial-state
+boundary explicit and race-free — but a GraphQL subscription has one root field emitting N
+payloads of one type, so there is nowhere to put a snapshot that isn't another frame. A
+snapshot query paired with a delta subscription would restore the tuple at the cost of the gap
+between the two operations, which the `Added` burst exists to close. The `Bookmark` buys the
+boundary without reopening it.
+
+**A first frame carrying the whole list, then per-object frames.** Rejected: it restructures
+every reducer around a union, and hands a large snapshot over as one frame instead of
+streaming it.
+
 **Single merged stream of typed union frames.** Rejected: consumers would demultiplex by kind
 anyway, and per-kind subscriptions let urql dedupe one shared operation per interested
 component and let the sync-panel streams mount lazily.
 
 ## Consequences
 
-The frontend owns the joins, which means reducers must guard **provenance**: a re-subscribe
-after a cache swap can replay a superseded cache's retained rows, so cache-keyed streams carry
+Every reducer must fold the `Bookmark` away rather than key it — a keyed one would put a
+phantom row in every table — and a consumer that renders an empty state must gate on
+`watchPhase`, never on "no data yet". The frontend owns the joins, which means reducers must
+also guard **provenance**: a re-subscribe after a cache swap can replay a superseded cache's
+retained rows, so cache-keyed streams carry
 `cacheID` (objects also `apiVersion`/`resource`) on every frame, and the shared
 `useCacheDeltaWatch` (`src/lib/graphql/use-cache-delta-watch.ts`) rejects frames not from the
 active key. Do not "simplify" that guard away — it is what keeps a stale cache's rows from

@@ -57,8 +57,8 @@ type ClusterCacheStats {
 type ClusterCacheChange {
   "Whether this cache was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
-  "The affected cache. On `Deleted`, its last-known state; the client removes it by `id`."
-  cache: ClusterCache!
+  "The affected cache. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
+  cache: ClusterCache
 }
 
 """
@@ -124,8 +124,8 @@ type ClusterCacheGVRDiscoveryStats {
 type ClusterCacheGVRDiscoveryChange {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
-  "The affected record. On `Deleted`, its last-known state; the client removes it by `id`."
-  discovery: ClusterCacheGVRDiscovery!
+  "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
+  discovery: ClusterCacheGVRDiscovery
 }
 
 """
@@ -189,8 +189,8 @@ type ClusterCacheGVRSyncStats {
 type ClusterCacheGVRSyncChange {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
-  "The affected record. On `Deleted`, its last-known state; the client removes it by `id`."
-  sync: ClusterCacheGVRSync!
+  "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
+  sync: ClusterCacheGVRSync
 }
 
 """
@@ -274,7 +274,7 @@ extend type Mutation {
 extend type Subscription {
   """
   Streams cache records as a Kubernetes-style delta watch, parallel to
-  `clustersWatch`: the current set as an `Added` burst, then one
+  `clustersWatch`: the current set as an `Added` burst, closed by one `Bookmark`; then one
   `Added`/`Modified`/`Deleted` change per cache. The client maintains a map keyed by
   `cache.id` and joins each cache onto its cluster by `cache.clusterID`, treating the
   cache whose `serverUid` matches the cluster's `status.server.uid` as the active
@@ -304,7 +304,7 @@ extend type Subscription {
 
   """
   Streams the caches' GVR-discovery records as a Kubernetes-style delta watch, the
-  third of the parallel object streams (clusters, caches, GVR discoveries): the current set as an `Added` burst, then one
+  third of the parallel object streams (clusters, caches, GVR discoveries): the current set as an `Added` burst, closed by one `Bookmark`; then one
   `Added`/`Modified`/`Deleted` change per record. The client maintains a map keyed by
   `discovery.id` and joins each onto its cache by `discovery.cacheID`. Independent of
   the other three (no mutual ordering guarantee). Unscoped because there is exactly one
@@ -315,7 +315,7 @@ extend type Subscription {
 
   """
   Streams one ClusterCache's per-kind sync records as a Kubernetes-style delta watch:
-  the current set as an `Added` burst, then one `Added`/`Modified`/`Deleted` change per
+  the current set as an `Added` burst, closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted` change per
   record. The client keys on `sync.id`.
 
   **Cache-scoped, unlike the four watches above**, and deliberately so: there is one

@@ -211,6 +211,16 @@ function pushClusters(rows: Row[]) {
       }),
     );
   });
+  // Close both delta snapshots. The provider holds the cluster list back until the
+  // clustersWatch Bookmark, so without this the panel stays in its connecting state.
+  // (clusterCacheSyncHealthWatch is a latest-value gauge, not a delta watch — no
+  // Bookmark rides it.)
+  clusterCh.onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clustersWatch: { type: 'Bookmark', cluster: null } } } }),
+  );
+  cacheCh.onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clusterCachesWatch: { type: 'Bookmark', cache: null } } } }),
+  );
 }
 
 // Push one frame on the per-cluster clusterEventsWatch stream (a bare Event).

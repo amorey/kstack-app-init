@@ -33,10 +33,10 @@ export type KubeConfig = {
 };
 
 type KubeConfigContextValue = {
-  // null = clusters not reported yet.
+  // null until the cluster snapshot is complete; a present value with no contexts
+  // means a genuinely empty kubeconfig.
   kubeConfig: KubeConfig | null;
-  // Registry transport up? Pair with `kubeConfig === null` via `watchPhase` to
-  // tell "connecting" from "connected, empty kubeconfig".
+  // Registry transport up? Pair with `kubeConfig === null` via `watchPhase`.
   connected: boolean;
 };
 

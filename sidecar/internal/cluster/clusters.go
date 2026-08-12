@@ -75,6 +75,9 @@ func (a clustersAPI) Watch(ctx context.Context) (<-chan domain.ClusterChange, er
 	}
 	return watchListChan(ctx, "Cluster", snap, src,
 		func(t domain.ChangeType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterSpec, domain.ClusterStatus]) domain.ClusterChange {
+			if t == domain.ChangeBookmark {
+				return domain.ClusterChange{Type: t}
+			}
 			if obj == nil {
 				return domain.ClusterChange{Type: t, Cluster: &domain.Cluster{ID: domain.ClusterID(id)}}
 			}

@@ -6,12 +6,21 @@ export type Incremental<T> = T | { [P in keyof T]?: P extends ' $fragmentName' |
 import type { TypedDocumentNode as DocumentNode } from '@graphql-typed-document-node/core';
 /**
  * Classifies a delta-watch change, mirroring a Kubernetes watch event. On subscribe a
- * watch replays the current set as `Added` changes (the snapshot), then streams live
- * changes. A `Deleted` change carries the object's last-known state; the client keys
- * on its `id`.
+ * watch replays the current set as `Added` changes (the snapshot), closes it with one
+ * `Bookmark`, then streams live changes. A `Deleted` change carries the object's
+ * last-known state; the client keys on its `id`.
  */
 export type ChangeType =
   | 'Added'
+  /**
+   * Closes the on-subscribe snapshot: sent exactly once per stream, after the last
+   * snapshot object and before the first live change. It carries **no object** — the
+   * change's entity field is null, the only case in which it is — so skip it rather
+   * than key on it. It is also what makes the collection fully known: a client must
+   * not render an empty state before it arrives. Kubernetes' `initial-events-end`
+   * bookmark, in this protocol's vocabulary.
+   */
+  | 'Bookmark'
   | 'Deleted'
   | 'Modified';
 
@@ -92,7 +101,7 @@ export type ClusterSyncEventsSubscription = { clusterCacheGVRSyncEventsWatch: { 
 export type ClusterCacheGvrDiscoveriesSubscriptionVariables = Exact<{ [key: string]: never; }>;
 
 
-export type ClusterCacheGvrDiscoveriesSubscription = { clusterCacheGVRDiscoveriesWatch: { type: ChangeType, discovery: { id: string, cacheID: string, stats: { lastDiscoveryAt: string, resourceCount: number } | null, conditions: Array<{ type: string, reason: string, message: string, unconfirmed: boolean }> } } };
+export type ClusterCacheGvrDiscoveriesSubscription = { clusterCacheGVRDiscoveriesWatch: { type: ChangeType, discovery: { id: string, cacheID: string, stats: { lastDiscoveryAt: string, resourceCount: number } | null, conditions: Array<{ type: string, reason: string, message: string, unconfirmed: boolean }> } | null } };
 
 export type ClusterCacheStatsSubscriptionVariables = Exact<{
   id: string;
@@ -107,7 +116,7 @@ export type ClusterCacheGvrSyncsSubscriptionVariables = Exact<{
 }>;
 
 
-export type ClusterCacheGvrSyncsSubscription = { clusterCacheGVRSyncsWatch: { type: ChangeType, sync: { id: string, spec: { apiVersion: string, resource: string } } } };
+export type ClusterCacheGvrSyncsSubscription = { clusterCacheGVRSyncsWatch: { type: ChangeType, sync: { id: string, spec: { apiVersion: string, resource: string } } | null } };
 
 export type ClusterScheduleSubscriptionVariables = Exact<{
   id: string;
@@ -137,7 +146,7 @@ export type ClusterDataEventsWatchSubscriptionVariables = Exact<{
 }>;
 
 
-export type ClusterDataEventsWatchSubscription = { clusterDataEventsWatch: { type: ChangeType, cacheID: string, event: { uid: string, type: string, reason: string, message: string, count: number, firstSeen: string | null, lastSeen: string | null, involvedKind: string, involvedNamespace: string, involvedName: string } } };
+export type ClusterDataEventsWatchSubscription = { clusterDataEventsWatch: { type: ChangeType, cacheID: string, event: { uid: string, type: string, reason: string, message: string, count: number, firstSeen: string | null, lastSeen: string | null, involvedKind: string, involvedNamespace: string, involvedName: string } | null } };
 
 export type ClusterDataKindsWatchSubscriptionVariables = Exact<{
   id: string;
@@ -145,7 +154,7 @@ export type ClusterDataKindsWatchSubscriptionVariables = Exact<{
 }>;
 
 
-export type ClusterDataKindsWatchSubscription = { clusterDataKindsWatch: { type: ChangeType, cacheID: string, kind: { apiVersion: string, kind: string, resource: string, scope: string, isCRD: boolean, count: number } } };
+export type ClusterDataKindsWatchSubscription = { clusterDataKindsWatch: { type: ChangeType, cacheID: string, kind: { apiVersion: string, kind: string, resource: string, scope: string, isCRD: boolean, count: number } | null } };
 
 export type ClusterDataObjectsWatchSubscriptionVariables = Exact<{
   id: string;
@@ -155,17 +164,17 @@ export type ClusterDataObjectsWatchSubscriptionVariables = Exact<{
 }>;
 
 
-export type ClusterDataObjectsWatchSubscription = { clusterDataObjectsWatch: { type: ChangeType, cacheID: string, apiVersion: string, resource: string, object: { uid: string, apiVersion: string, kind: string, namespace: string, name: string, creationTimestamp: string | null, rawJSON: unknown } } };
+export type ClusterDataObjectsWatchSubscription = { clusterDataObjectsWatch: { type: ChangeType, cacheID: string, apiVersion: string, resource: string, object: { uid: string, apiVersion: string, kind: string, namespace: string, name: string, creationTimestamp: string | null, rawJSON: unknown } | null } };
 
 export type ClustersWatchSubscriptionVariables = Exact<{ [key: string]: never; }>;
 
 
-export type ClustersWatchSubscription = { clustersWatch: { type: ChangeType, cluster: { id: string, spec: { name: string | null, syncEnabled: boolean, enabled: boolean, source: { kubeconfig: { context: string } | null } }, status: { lastConnectedAt: string | null, source: { kubeconfig: { cluster: string, user: string, isPresent: boolean, isDefault: boolean } | null }, server: { uid: string | null } }, conditions: Array<{ type: string, status: ConditionStatus, reason: string, message: string, liveness: boolean, unconfirmed: boolean, transitionedAt: string }> } } };
+export type ClustersWatchSubscription = { clustersWatch: { type: ChangeType, cluster: { id: string, spec: { name: string | null, syncEnabled: boolean, enabled: boolean, source: { kubeconfig: { context: string } | null } }, status: { lastConnectedAt: string | null, source: { kubeconfig: { cluster: string, user: string, isPresent: boolean, isDefault: boolean } | null }, server: { uid: string | null } }, conditions: Array<{ type: string, status: ConditionStatus, reason: string, message: string, liveness: boolean, unconfirmed: boolean, transitionedAt: string }> } | null } };
 
 export type ClusterCachesWatchSubscriptionVariables = Exact<{ [key: string]: never; }>;
 
 
-export type ClusterCachesWatchSubscription = { clusterCachesWatch: { type: ChangeType, cache: { id: string, clusterID: string, serverUid: string } } };
+export type ClusterCachesWatchSubscription = { clusterCachesWatch: { type: ChangeType, cache: { id: string, clusterID: string, serverUid: string } | null } };
 
 export type ClusterCacheSyncHealthWatchSubscriptionVariables = Exact<{ [key: string]: never; }>;
 

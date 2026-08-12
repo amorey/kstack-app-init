@@ -3313,10 +3313,10 @@ func (ec *executionContext) _ClusterCacheChange_cache(ctx context.Context, field
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *domain.ClusterCache) graphql.Marshaler {
-			return ec.marshalNClusterCache2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCache(ctx, selections, v)
+			return ec.marshalOClusterCache2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCache(ctx, selections, v)
 		},
 		true,
-		true,
+		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheChange_cache(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
@@ -3510,10 +3510,10 @@ func (ec *executionContext) _ClusterCacheGVRDiscoveryChange_discovery(ctx contex
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *domain.ClusterCacheGVRDiscovery) graphql.Marshaler {
-			return ec.marshalNClusterCacheGVRDiscovery2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRDiscovery(ctx, selections, v)
+			return ec.marshalOClusterCacheGVRDiscovery2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRDiscovery(ctx, selections, v)
 		},
 		true,
-		true,
+		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheGVRDiscoveryChange_discovery(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
@@ -3776,10 +3776,10 @@ func (ec *executionContext) _ClusterCacheGVRSyncChange_sync(ctx context.Context,
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *domain.ClusterCacheGVRSync) graphql.Marshaler {
-			return ec.marshalNClusterCacheGVRSync2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSync(ctx, selections, v)
+			return ec.marshalOClusterCacheGVRSync2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSync(ctx, selections, v)
 		},
 		true,
-		true,
+		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheGVRSyncChange_sync(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
@@ -4277,10 +4277,10 @@ func (ec *executionContext) _ClusterChange_cluster(ctx context.Context, field gr
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *domain.Cluster) graphql.Marshaler {
-			return ec.marshalNCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐCluster(ctx, selections, v)
+			return ec.marshalOCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐCluster(ctx, selections, v)
 		},
 		true,
-		true,
+		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterChange_cluster(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
@@ -4561,11 +4561,11 @@ func (ec *executionContext) _ClusterDataEventChange_event(ctx context.Context, f
 			return obj.Event, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ClusterDataEvent) graphql.Marshaler {
-			return ec.marshalNClusterDataEvent2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataEvent(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v *domain.ClusterDataEvent) graphql.Marshaler {
+			return ec.marshalOClusterDataEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataEvent(ctx, selections, v)
 		},
 		true,
-		true,
+		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterDataEventChange_event(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
@@ -4777,11 +4777,11 @@ func (ec *executionContext) _ClusterDataKindChange_kind(ctx context.Context, fie
 			return obj.Kind, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ClusterDataKind) graphql.Marshaler {
-			return ec.marshalNClusterDataKind2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataKind(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v *domain.ClusterDataKind) graphql.Marshaler {
+			return ec.marshalOClusterDataKind2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataKind(ctx, selections, v)
 		},
 		true,
-		true,
+		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterDataKindChange_kind(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
@@ -5016,11 +5016,11 @@ func (ec *executionContext) _ClusterDataObjectChange_object(ctx context.Context,
 			return obj.Object, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ClusterDataObject) graphql.Marshaler {
-			return ec.marshalNClusterDataObject2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataObject(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v *domain.ClusterDataObject) graphql.Marshaler {
+			return ec.marshalOClusterDataObject2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataObject(ctx, selections, v)
 		},
 		true,
-		true,
+		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterDataObjectChange_object(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
@@ -9013,9 +9013,6 @@ func (ec *executionContext) _ClusterCacheChange(ctx context.Context, sel ast.Sel
 			}
 		case "cache":
 			out.Values[i] = ec._ClusterCacheChange_cache(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -9144,9 +9141,6 @@ func (ec *executionContext) _ClusterCacheGVRDiscoveryChange(ctx context.Context,
 			}
 		case "discovery":
 			out.Values[i] = ec._ClusterCacheGVRDiscoveryChange_discovery(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -9358,9 +9352,6 @@ func (ec *executionContext) _ClusterCacheGVRSyncChange(ctx context.Context, sel 
 			}
 		case "sync":
 			out.Values[i] = ec._ClusterCacheGVRSyncChange_sync(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -9621,9 +9612,6 @@ func (ec *executionContext) _ClusterChange(ctx context.Context, sel ast.Selectio
 			}
 		case "cluster":
 			out.Values[i] = ec._ClusterChange_cluster(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -9805,9 +9793,6 @@ func (ec *executionContext) _ClusterDataEventChange(ctx context.Context, sel ast
 			}
 		case "event":
 			out.Values[i] = ec._ClusterDataEventChange_event(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		case "cacheID":
 			out.Values[i] = ec._ClusterDataEventChange_cacheID(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
@@ -9918,9 +9903,6 @@ func (ec *executionContext) _ClusterDataKindChange(ctx context.Context, sel ast.
 			}
 		case "kind":
 			out.Values[i] = ec._ClusterDataKindChange_kind(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		case "cacheID":
 			out.Values[i] = ec._ClusterDataKindChange_cacheID(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
@@ -10061,9 +10043,6 @@ func (ec *executionContext) _ClusterDataObjectChange(ctx context.Context, sel as
 			}
 		case "object":
 			out.Values[i] = ec._ClusterDataObjectChange_object(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		case "cacheID":
 			out.Values[i] = ec._ClusterDataObjectChange_cacheID(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
@@ -11704,16 +11683,6 @@ func (ec *executionContext) marshalNCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋk
 	return ec._Cluster(ctx, sel, v)
 }
 
-func (ec *executionContext) marshalNClusterCache2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCache(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterCache) graphql.Marshaler {
-	if v == nil {
-		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
-			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
-		}
-		return graphql.Null
-	}
-	return ec._ClusterCache(ctx, sel, v)
-}
-
 func (ec *executionContext) marshalNClusterCacheChange2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheChange(ctx context.Context, sel ast.SelectionSet, v domain.ClusterCacheChange) graphql.Marshaler {
 	return ec._ClusterCacheChange(ctx, sel, &v)
 }
@@ -11726,16 +11695,6 @@ func (ec *executionContext) marshalNClusterCacheChange2ᚖgithubᚗcomᚋkubetai
 		return graphql.Null
 	}
 	return ec._ClusterCacheChange(ctx, sel, v)
-}
-
-func (ec *executionContext) marshalNClusterCacheGVRDiscovery2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRDiscovery(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterCacheGVRDiscovery) graphql.Marshaler {
-	if v == nil {
-		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
-			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
-		}
-		return graphql.Null
-	}
-	return ec._ClusterCacheGVRDiscovery(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalNClusterCacheGVRDiscoveryChange2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRDiscoveryChange(ctx context.Context, sel ast.SelectionSet, v domain.ClusterCacheGVRDiscoveryChange) graphql.Marshaler {
@@ -11754,16 +11713,6 @@ func (ec *executionContext) marshalNClusterCacheGVRDiscoveryChange2ᚖgithubᚗc
 
 func (ec *executionContext) marshalNClusterCacheGVRDiscoverySpec2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRDiscoverySpec(ctx context.Context, sel ast.SelectionSet, v domain.ClusterCacheGVRDiscoverySpec) graphql.Marshaler {
 	return ec._ClusterCacheGVRDiscoverySpec(ctx, sel, &v)
-}
-
-func (ec *executionContext) marshalNClusterCacheGVRSync2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSync(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterCacheGVRSync) graphql.Marshaler {
-	if v == nil {
-		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
-			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
-		}
-		return graphql.Null
-	}
-	return ec._ClusterCacheGVRSync(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalNClusterCacheGVRSyncChange2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSyncChange(ctx context.Context, sel ast.SelectionSet, v domain.ClusterCacheGVRSyncChange) graphql.Marshaler {
@@ -11826,10 +11775,6 @@ func (ec *executionContext) marshalNClusterChange2ᚖgithubᚗcomᚋkubetailᚑo
 	return ec._ClusterChange(ctx, sel, v)
 }
 
-func (ec *executionContext) marshalNClusterDataEvent2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataEvent(ctx context.Context, sel ast.SelectionSet, v domain.ClusterDataEvent) graphql.Marshaler {
-	return ec._ClusterDataEvent(ctx, sel, &v)
-}
-
 func (ec *executionContext) marshalNClusterDataEventChange2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataEventChange(ctx context.Context, sel ast.SelectionSet, v domain.ClusterDataEventChange) graphql.Marshaler {
 	return ec._ClusterDataEventChange(ctx, sel, &v)
 }
@@ -11842,10 +11787,6 @@ func (ec *executionContext) marshalNClusterDataEventChange2ᚖgithubᚗcomᚋkub
 		return graphql.Null
 	}
 	return ec._ClusterDataEventChange(ctx, sel, v)
-}
-
-func (ec *executionContext) marshalNClusterDataKind2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataKind(ctx context.Context, sel ast.SelectionSet, v domain.ClusterDataKind) graphql.Marshaler {
-	return ec._ClusterDataKind(ctx, sel, &v)
 }
 
 func (ec *executionContext) marshalNClusterDataKind2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataKindᚄ(ctx context.Context, sel ast.SelectionSet, v []*domain.ClusterDataKind) graphql.Marshaler {
@@ -11886,10 +11827,6 @@ func (ec *executionContext) marshalNClusterDataKindChange2ᚖgithubᚗcomᚋkube
 		return graphql.Null
 	}
 	return ec._ClusterDataKindChange(ctx, sel, v)
-}
-
-func (ec *executionContext) marshalNClusterDataObject2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataObject(ctx context.Context, sel ast.SelectionSet, v domain.ClusterDataObject) graphql.Marshaler {
-	return ec._ClusterDataObject(ctx, sel, &v)
 }
 
 func (ec *executionContext) marshalNClusterDataObjectChange2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataObjectChange(ctx context.Context, sel ast.SelectionSet, v domain.ClusterDataObjectChange) graphql.Marshaler {
@@ -12396,6 +12333,20 @@ func (ec *executionContext) marshalOCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋk
 	return ec._Cluster(ctx, sel, v)
 }
 
+func (ec *executionContext) marshalOClusterCache2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCache(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterCache) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return ec._ClusterCache(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalOClusterCacheGVRDiscovery2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRDiscovery(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterCacheGVRDiscovery) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return ec._ClusterCacheGVRDiscovery(ctx, sel, v)
+}
+
 func (ec *executionContext) marshalOClusterCacheGVRDiscoveryStats2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRDiscoveryStats(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterCacheGVRDiscoveryStats) graphql.Marshaler {
 	if v == nil {
 		return graphql.Null
@@ -12403,11 +12354,39 @@ func (ec *executionContext) marshalOClusterCacheGVRDiscoveryStats2ᚖgithubᚗco
 	return ec._ClusterCacheGVRDiscoveryStats(ctx, sel, v)
 }
 
+func (ec *executionContext) marshalOClusterCacheGVRSync2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSync(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterCacheGVRSync) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return ec._ClusterCacheGVRSync(ctx, sel, v)
+}
+
 func (ec *executionContext) marshalOClusterCacheGVRSyncStats2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSyncStats(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterCacheGVRSyncStats) graphql.Marshaler {
 	if v == nil {
 		return graphql.Null
 	}
 	return ec._ClusterCacheGVRSyncStats(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalOClusterDataEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataEvent(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterDataEvent) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return ec._ClusterDataEvent(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalOClusterDataKind2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataKind(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterDataKind) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return ec._ClusterDataKind(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalOClusterDataObject2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterDataObject(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterDataObject) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return ec._ClusterDataObject(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalOClusterSpecSourceKubeconfig2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterSpecSourceKubeconfig(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterSpecSourceKubeconfig) graphql.Marshaler {

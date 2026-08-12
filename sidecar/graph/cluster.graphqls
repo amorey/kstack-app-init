@@ -171,8 +171,8 @@ type NonResourceRule {
 type ClusterChange {
   "Whether this cluster was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
-  "The affected cluster. On `Deleted`, its last-known state; the client removes it by `id`."
-  cluster: Cluster!
+  "The affected cluster. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
+  cluster: Cluster
 }
 
 extend type Query {
@@ -208,7 +208,7 @@ extend type Mutation {
 extend type Subscription {
   """
   Streams the cluster list as a Kubernetes-style delta watch: the current set as an
-  `Added` burst on subscribe (the snapshot), then one `Added`/`Modified`/`Deleted`
+  `Added` burst on subscribe (the snapshot), closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted`
   change per cluster as the registry changes. The client maintains a map keyed by
   `cluster.id`, applying each change (a deletion-pending cluster arrives as
   `Deleted`). Cache sync status is *not* here — it streams separately via

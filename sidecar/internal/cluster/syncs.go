@@ -42,6 +42,17 @@ func gvrSyncAnchorFilter(
 	var undecided []domain.ClusterCacheGVRSyncChange
 
 	return func(c domain.ClusterCacheGVRSyncChange) []domain.ClusterCacheGVRSyncChange {
+		// The Bookmark carries no record to judge, but it must not overtake held
+		// frames — it would declare the snapshot complete while part of it is still
+		// undecided. Queued behind them (past the cap too: losing it would leave the
+		// client loading forever, which is worse than one frame over budget).
+		if c.Type == domain.ChangeBookmark {
+			if len(undecided) > 0 {
+				undecided = append(undecided, c)
+				return nil
+			}
+			return []domain.ClusterCacheGVRSyncChange{c}
+		}
 		// A hard Deleted carries no owner edge; forward on id alone (removal of an
 		// id the client never added is a no-op).
 		if c.Sync.DiscoveryID == 0 {
@@ -69,7 +80,7 @@ func gvrSyncAnchorFilter(
 		// superseded frame ahead of its successor is harmless.
 		var out []domain.ClusterCacheGVRSyncChange
 		for _, held := range undecided {
-			if beehive.ObjectID(held.Sync.DiscoveryID) == anchor {
+			if held.Type == domain.ChangeBookmark || beehive.ObjectID(held.Sync.DiscoveryID) == anchor {
 				out = append(out, held)
 			}
 		}
@@ -127,6 +138,9 @@ func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-c
 	}
 	return filterChan(ctx, watchListChan(ctx, "ClusterCacheGVRSync", snap, src,
 		func(t domain.ChangeType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]) domain.ClusterCacheGVRSyncChange {
+			if t == domain.ChangeBookmark {
+				return domain.ClusterCacheGVRSyncChange{Type: t}
+			}
 			if obj == nil {
 				// A hard Deleted carries no object; forwarded — a stray removal is a
 				// no-op for the client.

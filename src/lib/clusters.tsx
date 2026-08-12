@@ -34,8 +34,10 @@ import type {
 import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 
 // One object on each delta stream (the `cluster` / `cache` / `sync` payload of a change).
-type ClusterRow = ClustersWatchSubscription['clustersWatch']['cluster'];
-type CacheRow = ClusterCachesWatchSubscription['clusterCachesWatch']['cache'];
+// NonNullable: the entity is null only on a Bookmark, which the reducers fold away,
+// so nothing downstream of them ever sees one.
+type ClusterRow = NonNullable<ClustersWatchSubscription['clustersWatch']['cluster']>;
+type CacheRow = NonNullable<ClusterCachesWatchSubscription['clusterCachesWatch']['cache']>;
 export type ClusterCacheSyncHealth = ClusterCacheSyncHealthWatchSubscription['clusterCacheSyncHealthWatch'];
 
 // A cache joined with its sync verdict (null until that frame lands). The selection
@@ -128,10 +130,11 @@ const ClusterCacheSyncHealthWatchSubscription = graphql(`
 `);
 
 type ClustersContextValue = {
-  // null = not reported yet; [] = no known clusters.
+  // null until the cluster snapshot's Bookmark lands; [] = no known clusters. The
+  // two are distinct on purpose — [] renders "no clusters", null renders a spinner.
   clusters: Cluster[] | null;
   // Transport up? Sourced from the backbone `clustersWatch` stream; pair with
-  // `clusters` via `watchPhase` to tell "connecting" from "connected, empty".
+  // `clusters` via `watchPhase` to tell "reconnecting" from "live".
   connected: boolean;
 };
 
@@ -139,6 +142,11 @@ const ClustersContext = createContext<ClustersContextValue | null>(null);
 
 // A map keyed by object id, accumulated from a delta stream.
 export type Keyed<T> = ReadonlyMap<string, T>;
+
+// A delta stream's accumulator: the id-keyed map plus whether its snapshot is
+// complete. Reading `items` before `synced` shows a partial snapshot as the whole
+// collection.
+type DeltaState<T> = { items: Keyed<T>; synced: boolean };
 
 // Apply one delta-watch change: Added/Modified upsert, Deleted removes. Returns a
 // fresh map (new identity so React re-renders). Shared by every delta-watch reducer.
@@ -152,17 +160,26 @@ export function applyChange<T>(prev: Keyed<T> | undefined, type: string, id: str
 export function ClustersProvider({ children }: { children: React.ReactNode }) {
   // Each stream reduces into its own id-keyed map; useWatchSubscription resets it
   // to `undefined` on a transport reconnect.
-  const [{ data: clusterMap, connected }] = useWatchSubscription(
+  const [{ data: clusterState, connected }] = useWatchSubscription(
     { query: ClustersWatchSubscription },
-    (prev: Keyed<ClusterRow> | undefined, data) => {
+    (prev: DeltaState<ClusterRow> | undefined, data) => {
       const { type, cluster } = data.clustersWatch;
-      return applyChange(prev, type, cluster.id, cluster);
+      const base = prev ?? { items: new Map<string, ClusterRow>(), synced: false };
+      // The Bookmark closes the snapshot and is the only frame carrying no cluster.
+      if (!cluster) return { ...base, synced: true };
+      return { ...base, items: applyChange(base.items, type, cluster.id, cluster) };
     },
   );
+  // Held back until the snapshot is complete, so a half-listed fleet never reads as
+  // the whole fleet.
+  const clusterMap = clusterState?.synced ? clusterState.items : undefined;
   const [{ data: cacheMap }] = useWatchSubscription(
     { query: ClusterCachesWatchSubscription },
     (prev: Keyed<CacheRow> | undefined, data) => {
       const { type, cache } = data.clusterCachesWatch;
+      // The Bookmark carries no cache; the caches join in as they arrive (the streams
+      // carry no mutual ordering), so it needs no gate of its own here.
+      if (!cache) return prev ?? new Map();
       return applyChange(prev, type, cache.id, cache);
     },
   );

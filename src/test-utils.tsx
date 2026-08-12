@@ -95,7 +95,17 @@ export function clusterOf(r: ClusterRow) {
   };
 }
 
-// Pass the `channelFor` from `mockTauriCore()`.
+// Close a delta watch's snapshot the way the server does: one Bookmark carrying no
+// entity. A consumer treats the stream as still loading until it lands, so a test
+// asserting a loaded state — an empty one especially — has to send it.
+export function pushWatchBookmark(channelFor: (queryPart: string) => FakeChannel, watchField: string) {
+  channelFor(watchField).onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { [watchField]: { type: 'Bookmark', cluster: null } } } }),
+  );
+}
+
+// Pass the `channelFor` from `mockTauriCore()`. Sends the rows as the snapshot and
+// closes it, so the registry reads as loaded.
 export function pushClusters(channelFor: (queryPart: string) => FakeChannel, rows: ClusterRow[]) {
   const ch = channelFor('clustersWatch');
   rows.forEach((r) => {
@@ -103,6 +113,7 @@ export function pushClusters(channelFor: (queryPart: string) => FakeChannel, row
       JSON.stringify({ type: 'next', payload: { data: { clustersWatch: { type: 'Added', cluster: clusterOf(r) } } } }),
     );
   });
+  pushWatchBookmark(channelFor, 'clustersWatch');
 }
 
 // Shared fake for '@tauri-apps/api/window', reached via `getCurrentWindow`.

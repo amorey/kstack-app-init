@@ -16,7 +16,7 @@ import { render, screen, act } from '@testing-library/react';
 import { Provider as UrqlProvider } from 'urql';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { clusterOf, mockTauriCore, pushClusters } from '@/test-utils';
+import { clusterOf, mockTauriCore, pushClusters, pushWatchBookmark } from '@/test-utils';
 import type { ClusterRow } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
@@ -381,6 +381,7 @@ describe('useClusters', () => {
     await reconnectBothStreams();
     await act(async () => {
       pushClusterChange('Added', clusterOf({ id: 'u-b', name: 'staging' }));
+      pushWatchBookmark(channelFor, 'clustersWatch');
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('["staging:-"]');
   });

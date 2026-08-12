@@ -48,7 +48,7 @@ const ClusterDataEventsWatchSubscription = graphql(`
 `);
 
 // One cached event (the `event` payload of a change), as the table renders it.
-export type ClusterDataEvent = ClusterDataEventsWatchSubscriptionType['clusterDataEventsWatch']['event'];
+export type ClusterDataEvent = NonNullable<ClusterDataEventsWatchSubscriptionType['clusterDataEventsWatch']['event']>;
 
 // The active context's cached events, newest first (by lastSeen), live. Paused
 // (empty) without an active cache. Provenance is just the cacheID — the variables

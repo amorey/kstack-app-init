@@ -44,7 +44,7 @@ const ClusterDataKindsWatchSubscription = graphql(`
 `);
 
 // The `kind` payload of a change — structurally a `ServerKind`.
-type KindRow = ClusterDataKindsWatchSubscriptionType['clusterDataKindsWatch']['kind'];
+type KindRow = NonNullable<ClusterDataKindsWatchSubscriptionType['clusterDataKindsWatch']['kind']>;
 
 // The active context's discovered kinds, live. Paused (empty) without an active
 // cache. Provenance is just the cacheID — the variables carry no kind — so a cache

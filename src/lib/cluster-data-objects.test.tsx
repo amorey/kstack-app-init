@@ -85,6 +85,17 @@ function pushFrame(
   acc = lastReducer!(acc, { clusterDataObjectsWatch: { type, cacheID, apiVersion, resource, object } });
 }
 
+// The Bookmark closing the snapshot: what flips the watch from connecting to live.
+function pushBookmark(
+  cacheID = lastArgs?.variables?.cacheID,
+  apiVersion = lastArgs?.variables?.apiVersion,
+  resource = lastArgs?.variables?.resource,
+) {
+  acc = lastReducer!(acc, {
+    clusterDataObjectsWatch: { type: 'Bookmark', cacheID, apiVersion, resource, object: null },
+  });
+}
+
 function pushReset() {
   statusState.snapshot = { connected: true, generation: statusState.snapshot.generation + 1 };
 }
@@ -242,6 +253,11 @@ describe('useClusterDataObjects', () => {
 
     statusState.snapshot = { connected: true, generation: 0 };
     pushFrame('Added', obj('a'));
+    rerender();
+    // A frame is not the whole snapshot: still connecting until the Bookmark.
+    expect(result.current.phase).toBe('connecting');
+
+    pushBookmark();
     rerender();
     expect(result.current.phase).toBe('live');
 

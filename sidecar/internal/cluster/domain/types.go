@@ -574,19 +574,24 @@ type Cluster struct {
 	// surface.
 }
 
-// ChangeType classifies a delta-watch change, mirroring a Kubernetes watch event. Its
-// string values are identical to beehive.Added/Modified/Deleted, so the watch pumps map
+// ChangeType classifies a delta-watch change, mirroring a Kubernetes watch event. The
+// Added/Modified/Deleted string values are identical to beehive's, so the watch pumps map
 // beehive→domain with a plain conversion; it is a defined type (not an alias of
 // beehive.ChangeType, which aliases into an internal package gqlgen can't import) so the
 // GraphQL ChangeType enum binds straight to it — the external-enum pattern used for
-// EventType/ConditionStatus. Values: Added (incl. the on-subscribe snapshot), Modified,
-// Deleted.
+// EventType/ConditionStatus.
 type ChangeType string
 
 const (
 	ChangeAdded    ChangeType = "Added"
 	ChangeModified ChangeType = "Modified"
 	ChangeDeleted  ChangeType = "Deleted"
+	// ChangeBookmark closes the on-subscribe snapshot: exactly one per stream, after the
+	// last snapshot object and before the first live change. It carries no object — the
+	// one case for which every change wrapper's entity is a pointer — so a consumer must
+	// skip it rather than key on it.
+	// See docs/adr/2026-08-09-delta-watch-protocol.md.
+	ChangeBookmark ChangeType = "Bookmark"
 )
 
 // ClusterChange is one delta on the cluster list watch: what happened (Type) to
@@ -677,8 +682,9 @@ type ClusterCacheGVRDiscoveryChange struct {
 // late frame from a superseded cache (one still draining after a cache/context switch).
 // Binds 1:1 to the GraphQL ClusterDataKindChange.
 type ClusterDataKindChange struct {
-	Type    ChangeType
-	Kind    ClusterDataKind
+	Type ChangeType
+	// Kind is nil on a Bookmark.
+	Kind    *ClusterDataKind
 	CacheID ClusterCacheID
 }
 
@@ -756,8 +762,9 @@ type ClusterDataEvent struct {
 // watching the active cache can reject a late frame from a superseded cache. Binds 1:1
 // to the GraphQL ClusterDataEventChange.
 type ClusterDataEventChange struct {
-	Type    ChangeType
-	Event   ClusterDataEvent
+	Type ChangeType
+	// Event is nil on a Bookmark.
+	Event   *ClusterDataEvent
 	CacheID ClusterCacheID
 }
 
@@ -802,8 +809,9 @@ type ClusterDataObject struct {
 // previous kind's still-draining subscription. Binds 1:1 to the GraphQL
 // ClusterDataObjectChange.
 type ClusterDataObjectChange struct {
-	Type       ChangeType
-	Object     ClusterDataObject
+	Type ChangeType
+	// Object is nil on a Bookmark.
+	Object     *ClusterDataObject
 	CacheID    ClusterCacheID
 	APIVersion string
 	Resource   string

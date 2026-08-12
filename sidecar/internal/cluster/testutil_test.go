@@ -42,6 +42,16 @@ func recv[T any](t *testing.T, ch <-chan T) T {
 	return testutil.Recv(t, ch, "a stream value")
 }
 
+// requireBookmark asserts a change is the one that closes a delta watch's snapshot:
+// every such watch sends exactly one, after the last snapshot object and before the
+// first live change. `entity` is the change's entity field — the caller reads it,
+// since its name differs per kind — and must be nil.
+func requireBookmark(t *testing.T, typ domain.ChangeType, entity any) {
+	t.Helper()
+	require.Equal(t, domain.ChangeBookmark, typ)
+	require.Nil(t, entity)
+}
+
 // recvBy is recv with a caller-supplied deadline, so a drain loop can share one
 // deadline across iterations instead of resetting it each receive.
 func recvBy[T any](t *testing.T, ch <-chan T, deadline <-chan time.Time) T {

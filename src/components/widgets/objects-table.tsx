@@ -14,8 +14,8 @@
 
 // Generic per-kind object table, fed by `useClusterDataObjects`. Universal columns
 // (Namespace?/Name/Age) plus kubectl-style extras from the `object-columns`
-// registry. The four watch phases render distinctly — not-synced note, connecting
-// spinner, empty snapshot, live table — mirroring `EventsTable`.
+// registry. The states render distinctly — not-synced note, connecting spinner,
+// empty snapshot, live table — mirroring `EventsTable`.
 import ReactTimeAgo from 'react-timeago';
 
 import { Spinner } from '@kubetail/ui/elements/spinner';
@@ -47,7 +47,8 @@ export function ObjectsTable({ apiVersion, resource, kind, namespaced }: Objects
     );
   }
 
-  // Connecting (spinner) is distinct from a genuinely empty snapshot (below).
+  // Held until the snapshot's Bookmark lands, so the empty state below can only be
+  // reached once the kind is genuinely known to have no objects.
   if (phase === 'connecting') {
     return (
       <div className="flex items-center gap-2 text-sm text-muted-foreground">

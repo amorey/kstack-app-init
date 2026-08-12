@@ -143,11 +143,13 @@ func TestServiceWatchEmitsSnapshotThenDeltas(t *testing.T) {
 	ch, err := s.Clusters().Watch(ctx)
 	require.NoError(t, err)
 
-	// Snapshot: one Added change for the seeded cluster.
+	// Snapshot: one Added change for the seeded cluster, closed by the Bookmark.
 	seed := recv(t, ch)
 	assert.Equal(t, domain.ChangeAdded, seed.Type)
 	require.NotNil(t, seed.Cluster)
 	assert.Equal(t, id, seed.Cluster.ID)
+	bm := recv(t, ch)
+	requireBookmark(t, bm.Type, bm.Cluster)
 
 	// A spec change emits a Modified change carrying the new state. WatchList replays
 	// current state on subscribe, so drain until the change lands.

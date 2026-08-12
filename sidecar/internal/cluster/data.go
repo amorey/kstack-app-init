@@ -83,7 +83,7 @@ func (a dataAPI) WatchKinds(ctx context.Context, clusterID domain.ClusterID, cac
 			return toDataKinds(rows), nil
 		},
 		dataKindKey,
-		func(t domain.ChangeType, k domain.ClusterDataKind) domain.ClusterDataKindChange {
+		func(t domain.ChangeType, k *domain.ClusterDataKind) domain.ClusterDataKindChange {
 			return domain.ClusterDataKindChange{Type: t, Kind: k, CacheID: cacheID}
 		},
 	), nil
@@ -159,7 +159,7 @@ func (a dataAPI) WatchEvents(ctx context.Context, clusterID domain.ClusterID, ca
 			return events, nil
 		},
 		func(e domain.ClusterDataEvent) string { return e.UID },
-		func(t domain.ChangeType, e domain.ClusterDataEvent) domain.ClusterDataEventChange {
+		func(t domain.ChangeType, e *domain.ClusterDataEvent) domain.ClusterDataEventChange {
 			return domain.ClusterDataEventChange{Type: t, Event: e, CacheID: cacheID}
 		},
 	), nil
@@ -189,7 +189,7 @@ func (a dataAPI) WatchObjects(ctx context.Context, clusterID domain.ClusterID, c
 			return objects, nil
 		},
 		func(o domain.ClusterDataObject) string { return o.UID },
-		func(t domain.ChangeType, o domain.ClusterDataObject) domain.ClusterDataObjectChange {
+		func(t domain.ChangeType, o *domain.ClusterDataObject) domain.ClusterDataObjectChange {
 			return domain.ClusterDataObjectChange{Type: t, Object: o, CacheID: cacheID, APIVersion: apiVersion, Resource: resource}
 		},
 	), nil

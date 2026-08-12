@@ -18,7 +18,7 @@ import { createRootRoute, createRoute, Outlet, retainSearchParams } from '@tanst
 import { Provider as UrqlProvider } from 'urql';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore, pushClusters, renderWithRouter } from '@/test-utils';
+import { mockTauriCore, pushClusters, pushWatchBookmark, renderWithRouter } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
 
@@ -147,7 +147,10 @@ describe('KubeContextPicker', () => {
   it('renders "No kubeconfig" on a connected but empty registry snapshot', async () => {
     await renderWithRouter(buildTree(), '/chat');
     await act(async () => {
-      openStream(); // connection up, but the snapshot carries no clusters
+      openStream();
+      // The Bookmark over an empty snapshot: what makes "no clusters" a fact rather
+      // than a not-yet. Without it the picker must keep showing Connecting….
+      pushWatchBookmark(channelFor, 'clustersWatch');
     });
     expect(screen.getByTestId('kube-context-empty')).toBeInTheDocument();
     expect(screen.queryByTestId('kube-context-connecting')).not.toBeInTheDocument();

@@ -145,12 +145,21 @@ type Schedule {
 
 """
 Classifies a delta-watch change, mirroring a Kubernetes watch event. On subscribe a
-watch replays the current set as `Added` changes (the snapshot), then streams live
-changes. A `Deleted` change carries the object's last-known state; the client keys
-on its `id`.
+watch replays the current set as `Added` changes (the snapshot), closes it with one
+`Bookmark`, then streams live changes. A `Deleted` change carries the object's
+last-known state; the client keys on its `id`.
 """
 enum ChangeType {
   Added
   Modified
   Deleted
+  """
+  Closes the on-subscribe snapshot: sent exactly once per stream, after the last
+  snapshot object and before the first live change. It carries **no object** — the
+  change's entity field is null, the only case in which it is — so skip it rather
+  than key on it. It is also what makes the collection fully known: a client must
+  not render an empty state before it arrives. Kubernetes' `initial-events-end`
+  bookmark, in this protocol's vocabulary.
+  """
+  Bookmark
 }
