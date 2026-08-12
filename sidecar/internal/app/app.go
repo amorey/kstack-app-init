@@ -19,6 +19,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/controllers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
@@ -75,7 +76,7 @@ func New(cfg Config) (*App, error) {
 	// connection is detected in ~15s (vs client-go's ~45s default) and the
 	// liveness sentinel re-probes promptly. Must run before any kube client is
 	// built.
-	cluster.ConfigureKubeHTTP2Keepalive()
+	controllers.ConfigureKubeHTTP2Keepalive()
 
 	// Shared cross-subsystem poke bus (wall-clock gap detector + host pokes via
 	// gRPC PokeService); see docs/adr/2026-08-09-poke-resync-fanout.md.

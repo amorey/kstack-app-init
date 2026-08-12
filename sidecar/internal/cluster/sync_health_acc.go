@@ -17,6 +17,8 @@ package cluster
 import (
 	"slices"
 	"time"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain"
 )
 
 // syncHealthAcc folds one cache's per-kind records into a single verdict.
@@ -26,10 +28,10 @@ type syncHealthAcc struct {
 	// kinds behind it (the reason is carried along, not mapped back from the rank).
 	worstRank   int
 	worstReason string
-	offender    []SyncedKindRef
+	offender    []domain.SyncedKindRef
 	// paused names (not counts) the kinds observed Paused: a pause relays to a
 	// cache's children one at a time, so a partly-paused cache is a state a UI sees.
-	paused []SyncedKindRef
+	paused []domain.SyncedKindRef
 	// notWatching counts every kind not observed Watching — ranked AND paused; the
 	// offender list can't answer this (it resets to one name when a worse rank appears).
 	notWatching int
@@ -46,15 +48,15 @@ type syncHealthAcc struct {
 // the mildest reading, reached only when nothing ranked or unobserved is left.
 func syncReasonRank(reason string) int {
 	switch reason {
-	case ReasonSyncFailed:
+	case domain.ReasonSyncFailed:
 		return 4
-	case ReasonStale:
+	case domain.ReasonStale:
 		return 3
-	case ReasonNoConnection:
+	case domain.ReasonNoConnection:
 		return 2
-	case ReasonSyncing:
+	case domain.ReasonSyncing:
 		return 1
-	case ReasonWatching, ReasonPaused:
+	case domain.ReasonWatching, domain.ReasonPaused:
 		// Not faults; never reached (add handles both first). Named so default
 		// means "unrecognized".
 		return 0
@@ -65,7 +67,7 @@ func syncReasonRank(reason string) int {
 	}
 }
 
-func (a *syncHealthAcc) add(rec gvrSyncRec, st ClusterCacheGVRSyncStats) {
+func (a *syncHealthAcc) add(rec gvrSyncRec, st domain.ClusterCacheGVRSyncStats) {
 	a.total++
 	{
 		// Newest write anywhere in the cache; oldest proof among the kinds that have one.
@@ -77,11 +79,11 @@ func (a *syncHealthAcc) add(rec gvrSyncRec, st ClusterCacheGVRSyncStats) {
 		}
 	}
 
-	cond := FindCondition(rec.conditions, ConditionSynced)
+	cond := domain.FindCondition(rec.conditions, domain.ConditionSynced)
 	// Only an OBSERVED Watching is health: an unconfirmed or absent condition
 	// counts toward notWatching, or UnhealthyKinds would disagree with an Unknown
 	// verdict right after a restart. See docs/adr/2026-08-09-liveness-conditions.md.
-	if cond != nil && !cond.Unconfirmed && cond.Reason == ReasonWatching {
+	if cond != nil && !cond.Unconfirmed && cond.Reason == domain.ReasonWatching {
 		return
 	}
 	a.notWatching++
@@ -92,14 +94,14 @@ func (a *syncHealthAcc) add(rec gvrSyncRec, st ClusterCacheGVRSyncStats) {
 		a.unconfirmed++
 		return
 	}
-	if cond.Reason == ReasonPaused {
+	if cond.Reason == domain.ReasonPaused {
 		a.paused = append(a.paused, rec.kindRef())
 		return
 	}
 	rank := syncReasonRank(cond.Reason)
 	switch {
 	case rank > a.worstRank:
-		a.worstRank, a.worstReason, a.offender = rank, cond.Reason, []SyncedKindRef{rec.kindRef()}
+		a.worstRank, a.worstReason, a.offender = rank, cond.Reason, []domain.SyncedKindRef{rec.kindRef()}
 	case rank == a.worstRank && rank > 0:
 		a.offender = append(a.offender, rec.kindRef())
 	}
@@ -107,8 +109,8 @@ func (a *syncHealthAcc) add(rec gvrSyncRec, st ClusterCacheGVRSyncStats) {
 
 // verdict renders the fold. It reads like a per-kind condition on purpose, so a consumer
 // renders a cache exactly as it renders one kind.
-func (a *syncHealthAcc) verdict(cacheID ClusterCacheID) ClusterCacheSyncHealth {
-	h := ClusterCacheSyncHealth{
+func (a *syncHealthAcc) verdict(cacheID domain.ClusterCacheID) domain.ClusterCacheSyncHealth {
+	h := domain.ClusterCacheSyncHealth{
 		CacheID:        cacheID,
 		TotalKinds:     a.total,
 		UnhealthyKinds: a.notWatching,
@@ -118,9 +120,9 @@ func (a *syncHealthAcc) verdict(cacheID ClusterCacheID) ClusterCacheSyncHealth {
 	switch {
 	case a.total == 0:
 		// No kinds yet (discovery hasn't landed) — neither fault nor health.
-		h.Status, h.Reason = ConditionUnknown, ReasonSyncing
+		h.Status, h.Reason = domain.ConditionUnknown, domain.ReasonSyncing
 	case a.worstRank > 0:
-		h.Status = ConditionFalse
+		h.Status = domain.ConditionFalse
 		h.Reason = a.worstReason
 		// Sorted so "the first offender" stays stable while kinds stream in.
 		slices.SortFunc(a.offender, compareKindRefs)
@@ -129,15 +131,15 @@ func (a *syncHealthAcc) verdict(cacheID ClusterCacheID) ClusterCacheSyncHealth {
 		// Some kind is still unobserved in this process; Healthy is a claim about
 		// EVERY kind, so it can't be made yet. Ranked below a real failure — an
 		// observed fault is worth surfacing while others report in.
-		h.Status, h.Reason = ConditionUnknown, ReasonSyncing
+		h.Status, h.Reason = domain.ConditionUnknown, domain.ReasonSyncing
 	case len(a.paused) > 0:
 		// Partial pause counts: calling in-between frames Watching would publish a
 		// healthy status beside a non-zero unhealthyKinds with no names behind it.
-		h.Status, h.Reason = ConditionFalse, ReasonPaused
+		h.Status, h.Reason = domain.ConditionFalse, domain.ReasonPaused
 		slices.SortFunc(a.paused, compareKindRefs)
 		h.UnhealthyKindRefs = a.paused
 	default:
-		h.Status, h.Reason = ConditionTrue, ReasonWatching
+		h.Status, h.Reason = domain.ConditionTrue, domain.ReasonWatching
 	}
 	return h
 }

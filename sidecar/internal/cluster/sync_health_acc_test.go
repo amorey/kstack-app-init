@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -33,17 +34,17 @@ import (
 const testKindAPIVersion = "apps/v1"
 
 // syncedRec builds one kind's record carrying a Synced condition.
-func syncedRec(resource, reason string, status ConditionStatus) gvrSyncRec {
+func syncedRec(resource, reason string, status domain.ConditionStatus) gvrSyncRec {
 	return gvrSyncRec{
 		apiVersion: testKindAPIVersion,
 		resource:   resource,
-		conditions: []Condition{liveCondition(ConditionSynced, status, reason, "")},
+		conditions: []domain.Condition{domain.LiveCondition(domain.ConditionSynced, status, reason, "")},
 	}
 }
 
 // resourcesOf reduces a verdict's kind refs to their plurals, which is what most of these
 // cases are about; the refs' api groups have their own test below.
-func resourcesOf(refs []SyncedKindRef) []string {
+func resourcesOf(refs []domain.SyncedKindRef) []string {
 	if refs == nil {
 		return nil
 	}
@@ -58,9 +59,9 @@ func resourcesOf(refs []SyncedKindRef) []string {
 // process wrote: the reason and stamps survive, but the status is downgraded to Unknown
 // and the record is flagged so nobody asserts it.
 func unconfirmedRec(resource, reason string) gvrSyncRec {
-	c := liveCondition(ConditionSynced, ConditionUnknown, reason, "")
+	c := domain.LiveCondition(domain.ConditionSynced, domain.ConditionUnknown, reason, "")
 	c.Unconfirmed = true
-	return gvrSyncRec{apiVersion: testKindAPIVersion, resource: resource, conditions: []Condition{c}}
+	return gvrSyncRec{apiVersion: testKindAPIVersion, resource: resource, conditions: []domain.Condition{c}}
 }
 
 // The rollup is the reading every cluster row shows, so "healthy" has to mean every kind
@@ -73,46 +74,46 @@ func TestSyncHealthVerdict(t *testing.T) {
 	tests := []struct {
 		name    string
 		recs    []gvrSyncRec
-		status  ConditionStatus
+		status  domain.ConditionStatus
 		reason  string
 		offends []string
 	}{
 		{
 			name:   "no kinds at all — discovery hasn't landed",
-			status: ConditionUnknown, reason: ReasonSyncing,
+			status: domain.ConditionUnknown, reason: domain.ReasonSyncing,
 		},
 		{
 			name:   "every kind confirmed watching",
-			recs:   []gvrSyncRec{syncedRec("pods", ReasonWatching, ConditionTrue), syncedRec("deployments", ReasonWatching, ConditionTrue)},
-			status: ConditionTrue, reason: ReasonWatching,
+			recs:   []gvrSyncRec{syncedRec("pods", domain.ReasonWatching, domain.ConditionTrue), syncedRec("deployments", domain.ReasonWatching, domain.ConditionTrue)},
+			status: domain.ConditionTrue, reason: domain.ReasonWatching,
 		},
 		{
 			name:   "every kind unconfirmed — the post-restart case",
-			recs:   []gvrSyncRec{unconfirmedRec("pods", ReasonWatching), unconfirmedRec("deployments", ReasonWatching)},
-			status: ConditionUnknown, reason: ReasonSyncing,
+			recs:   []gvrSyncRec{unconfirmedRec("pods", domain.ReasonWatching), unconfirmedRec("deployments", domain.ReasonWatching)},
+			status: domain.ConditionUnknown, reason: domain.ReasonSyncing,
 		},
 		{
 			name:   "one kind still unconfirmed among healthy ones",
-			recs:   []gvrSyncRec{syncedRec("pods", ReasonWatching, ConditionTrue), unconfirmedRec("deployments", ReasonWatching)},
-			status: ConditionUnknown, reason: ReasonSyncing,
+			recs:   []gvrSyncRec{syncedRec("pods", domain.ReasonWatching, domain.ConditionTrue), unconfirmedRec("deployments", domain.ReasonWatching)},
+			status: domain.ConditionUnknown, reason: domain.ReasonSyncing,
 		},
 		{
 			name:   "a kind with no condition yet is not health either",
-			recs:   []gvrSyncRec{syncedRec("pods", ReasonWatching, ConditionTrue), {resource: "deployments"}},
-			status: ConditionUnknown, reason: ReasonSyncing,
+			recs:   []gvrSyncRec{syncedRec("pods", domain.ReasonWatching, domain.ConditionTrue), {resource: "deployments"}},
+			status: domain.ConditionUnknown, reason: domain.ReasonSyncing,
 		},
 		{
 			name: "an observed failure outranks the unobserved rest",
 			recs: []gvrSyncRec{
-				unconfirmedRec("pods", ReasonWatching),
-				syncedRec("widgets", ReasonSyncFailed, ConditionFalse),
+				unconfirmedRec("pods", domain.ReasonWatching),
+				syncedRec("widgets", domain.ReasonSyncFailed, domain.ConditionFalse),
 			},
-			status: ConditionFalse, reason: ReasonSyncFailed, offends: []string{"widgets"},
+			status: domain.ConditionFalse, reason: domain.ReasonSyncFailed, offends: []string{"widgets"},
 		},
 		{
 			name:   "every kind paused",
-			recs:   []gvrSyncRec{syncedRec("pods", ReasonPaused, ConditionFalse), syncedRec("deployments", ReasonPaused, ConditionFalse)},
-			status: ConditionFalse, reason: ReasonPaused, offends: []string{"deployments", "pods"},
+			recs:   []gvrSyncRec{syncedRec("pods", domain.ReasonPaused, domain.ConditionFalse), syncedRec("deployments", domain.ReasonPaused, domain.ConditionFalse)},
+			status: domain.ConditionFalse, reason: domain.ReasonPaused, offends: []string{"deployments", "pods"},
 		},
 		{
 			// A pause is relayed down a cache's hundred-plus children one at a time, so
@@ -120,24 +121,24 @@ func TestSyncHealthVerdict(t *testing.T) {
 			// health beside a non-zero unhealthyKinds and no names to explain it.
 			name: "some kinds paused, the rest watching",
 			recs: []gvrSyncRec{
-				syncedRec("pods", ReasonPaused, ConditionFalse),
-				syncedRec("deployments", ReasonWatching, ConditionTrue),
+				syncedRec("pods", domain.ReasonPaused, domain.ConditionFalse),
+				syncedRec("deployments", domain.ReasonWatching, domain.ConditionTrue),
 			},
-			status: ConditionFalse, reason: ReasonPaused, offends: []string{"pods"},
+			status: domain.ConditionFalse, reason: domain.ReasonPaused, offends: []string{"pods"},
 		},
 		{
 			// A real fault still outranks a pause: the ladder is checked first.
 			name: "a failure among the paused",
 			recs: []gvrSyncRec{
-				syncedRec("pods", ReasonPaused, ConditionFalse),
-				syncedRec("widgets", ReasonSyncFailed, ConditionFalse),
+				syncedRec("pods", domain.ReasonPaused, domain.ConditionFalse),
+				syncedRec("widgets", domain.ReasonSyncFailed, domain.ConditionFalse),
 			},
-			status: ConditionFalse, reason: ReasonSyncFailed, offends: []string{"widgets"},
+			status: domain.ConditionFalse, reason: domain.ReasonSyncFailed, offends: []string{"widgets"},
 		},
 		{
 			name:   "paused beside unconfirmed is not a paused cache",
-			recs:   []gvrSyncRec{syncedRec("pods", ReasonPaused, ConditionFalse), unconfirmedRec("deployments", ReasonWatching)},
-			status: ConditionUnknown, reason: ReasonSyncing,
+			recs:   []gvrSyncRec{syncedRec("pods", domain.ReasonPaused, domain.ConditionFalse), unconfirmedRec("deployments", domain.ReasonWatching)},
+			status: domain.ConditionUnknown, reason: domain.ReasonSyncing,
 		},
 	}
 
@@ -145,10 +146,10 @@ func TestSyncHealthVerdict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var acc syncHealthAcc
 			for _, r := range tc.recs {
-				acc.add(r, ClusterCacheGVRSyncStats{})
+				acc.add(r, domain.ClusterCacheGVRSyncStats{})
 			}
 
-			got := acc.verdict(ClusterCacheID(7))
+			got := acc.verdict(domain.ClusterCacheID(7))
 
 			assert.Equal(t, tc.status, got.Status)
 			assert.Equal(t, tc.reason, got.Reason)
@@ -163,15 +164,15 @@ func TestSyncHealthVerdict(t *testing.T) {
 // rank appears, so one SyncFailed beside twenty Stale reported one.
 func TestSyncHealthVerdictCountsEveryKindNotWatching(t *testing.T) {
 	var acc syncHealthAcc
-	acc.add(syncedRec("widgets", ReasonSyncFailed, ConditionFalse), ClusterCacheGVRSyncStats{})
+	acc.add(syncedRec("widgets", domain.ReasonSyncFailed, domain.ConditionFalse), domain.ClusterCacheGVRSyncStats{})
 	for i := range 20 {
-		acc.add(syncedRec(fmt.Sprintf("stale-%d", i), ReasonStale, ConditionFalse), ClusterCacheGVRSyncStats{})
+		acc.add(syncedRec(fmt.Sprintf("stale-%d", i), domain.ReasonStale, domain.ConditionFalse), domain.ClusterCacheGVRSyncStats{})
 	}
-	acc.add(syncedRec("pods", ReasonWatching, ConditionTrue), ClusterCacheGVRSyncStats{})
+	acc.add(syncedRec("pods", domain.ReasonWatching, domain.ConditionTrue), domain.ClusterCacheGVRSyncStats{})
 
-	got := acc.verdict(ClusterCacheID(7))
+	got := acc.verdict(domain.ClusterCacheID(7))
 
-	assert.Equal(t, ReasonSyncFailed, got.Reason, "the worst reason still dominates")
+	assert.Equal(t, domain.ReasonSyncFailed, got.Reason, "the worst reason still dominates")
 	assert.Equal(t, []string{"widgets"}, resourcesOf(got.UnhealthyKindRefs), "which still names only the worst")
 	assert.Equal(t, 21, got.UnhealthyKinds, "but the COUNT is every kind not watching")
 	assert.Equal(t, 22, got.TotalKinds)
@@ -181,12 +182,12 @@ func TestSyncHealthVerdictCountsEveryKindNotWatching(t *testing.T) {
 // reading of a fully paused cache.
 func TestSyncHealthVerdictCountsPausedAsNotWatching(t *testing.T) {
 	var acc syncHealthAcc
-	acc.add(syncedRec("pods", ReasonPaused, ConditionFalse), ClusterCacheGVRSyncStats{})
-	acc.add(syncedRec("deployments", ReasonPaused, ConditionFalse), ClusterCacheGVRSyncStats{})
+	acc.add(syncedRec("pods", domain.ReasonPaused, domain.ConditionFalse), domain.ClusterCacheGVRSyncStats{})
+	acc.add(syncedRec("deployments", domain.ReasonPaused, domain.ConditionFalse), domain.ClusterCacheGVRSyncStats{})
 
-	got := acc.verdict(ClusterCacheID(7))
+	got := acc.verdict(domain.ClusterCacheID(7))
 
-	assert.Equal(t, ReasonPaused, got.Reason)
+	assert.Equal(t, domain.ReasonPaused, got.Reason)
 	assert.Equal(t, 2, got.UnhealthyKinds)
 	assert.Equal(t, []string{"deployments", "pods"}, resourcesOf(got.UnhealthyKindRefs),
 		"the count and the names must describe the same set")
@@ -199,14 +200,14 @@ func TestSyncHealthVerdictCountsPausedAsNotWatching(t *testing.T) {
 // count is "how many of them are not currently Watching", and none of them were.
 func TestSyncHealthVerdictCountsUnconfirmedAsNotWatching(t *testing.T) {
 	var acc syncHealthAcc
-	acc.add(unconfirmedRec("pods", ReasonWatching), ClusterCacheGVRSyncStats{})
-	acc.add(unconfirmedRec("deployments", ReasonWatching), ClusterCacheGVRSyncStats{})
-	acc.add(gvrSyncRec{resource: "widgets"}, ClusterCacheGVRSyncStats{}) // never reported at all
+	acc.add(unconfirmedRec("pods", domain.ReasonWatching), domain.ClusterCacheGVRSyncStats{})
+	acc.add(unconfirmedRec("deployments", domain.ReasonWatching), domain.ClusterCacheGVRSyncStats{})
+	acc.add(gvrSyncRec{resource: "widgets"}, domain.ClusterCacheGVRSyncStats{}) // never reported at all
 
-	got := acc.verdict(ClusterCacheID(7))
+	got := acc.verdict(domain.ClusterCacheID(7))
 
-	assert.Equal(t, ConditionUnknown, got.Status)
-	assert.Equal(t, ReasonSyncing, got.Reason)
+	assert.Equal(t, domain.ConditionUnknown, got.Status)
+	assert.Equal(t, domain.ReasonSyncing, got.Reason)
 	assert.Equal(t, 3, got.TotalKinds)
 	assert.Equal(t, 3, got.UnhealthyKinds, "nothing has been observed watching")
 	assert.Empty(t, got.UnhealthyKindRefs, "unobserved is not the same as at fault")
@@ -217,12 +218,12 @@ func TestSyncHealthVerdictCountsUnconfirmedAsNotWatching(t *testing.T) {
 // branch, and so folding into a healthy Watching verdict.
 func TestSyncHealthVerdictTreatsUnknownReasonsAsDegraded(t *testing.T) {
 	var acc syncHealthAcc
-	acc.add(syncedRec("pods", ReasonWatching, ConditionTrue), ClusterCacheGVRSyncStats{})
-	acc.add(syncedRec("widgets", "SomeFutureReason", ConditionFalse), ClusterCacheGVRSyncStats{})
+	acc.add(syncedRec("pods", domain.ReasonWatching, domain.ConditionTrue), domain.ClusterCacheGVRSyncStats{})
+	acc.add(syncedRec("widgets", "SomeFutureReason", domain.ConditionFalse), domain.ClusterCacheGVRSyncStats{})
 
-	got := acc.verdict(ClusterCacheID(7))
+	got := acc.verdict(domain.ClusterCacheID(7))
 
-	assert.Equal(t, ConditionFalse, got.Status, "an unrecognized reason must not read as healthy")
+	assert.Equal(t, domain.ConditionFalse, got.Status, "an unrecognized reason must not read as healthy")
 	assert.Equal(t, "SomeFutureReason", got.Reason, "and it is reported verbatim")
 	assert.Equal(t, []string{"widgets"}, resourcesOf(got.UnhealthyKindRefs))
 	assert.Equal(t, 1, got.UnhealthyKinds)
@@ -237,16 +238,16 @@ func TestSyncHealthVerdictNamesOffendersByExactKind(t *testing.T) {
 	var acc syncHealthAcc
 	acc.add(gvrSyncRec{
 		apiVersion: "gateway.networking.k8s.io/v1", resource: "gateways",
-		conditions: []Condition{liveCondition(ConditionSynced, ConditionTrue, ReasonWatching, "")},
-	}, ClusterCacheGVRSyncStats{})
+		conditions: []domain.Condition{domain.LiveCondition(domain.ConditionSynced, domain.ConditionTrue, domain.ReasonWatching, "")},
+	}, domain.ClusterCacheGVRSyncStats{})
 	acc.add(gvrSyncRec{
 		apiVersion: "example.com/v1", resource: "gateways",
-		conditions: []Condition{liveCondition(ConditionSynced, ConditionFalse, ReasonSyncFailed, "")},
-	}, ClusterCacheGVRSyncStats{})
+		conditions: []domain.Condition{domain.LiveCondition(domain.ConditionSynced, domain.ConditionFalse, domain.ReasonSyncFailed, "")},
+	}, domain.ClusterCacheGVRSyncStats{})
 
-	got := acc.verdict(ClusterCacheID(7))
+	got := acc.verdict(domain.ClusterCacheID(7))
 
-	assert.Equal(t, []SyncedKindRef{{APIVersion: "example.com/v1", Resource: "gateways"}},
+	assert.Equal(t, []domain.SyncedKindRef{{APIVersion: "example.com/v1", Resource: "gateways"}},
 		got.UnhealthyKindRefs, "only the CRD is failing, and the ref says which one it is")
 }
 
@@ -254,12 +255,12 @@ func TestSyncHealthVerdictNamesOffendersByExactKind(t *testing.T) {
 // dominates the verdict.
 func TestSyncHealthVerdictUnknownReasonDoesNotMaskAKnownFailure(t *testing.T) {
 	var acc syncHealthAcc
-	acc.add(syncedRec("widgets", "SomeFutureReason", ConditionFalse), ClusterCacheGVRSyncStats{})
-	acc.add(syncedRec("pods", ReasonSyncFailed, ConditionFalse), ClusterCacheGVRSyncStats{})
+	acc.add(syncedRec("widgets", "SomeFutureReason", domain.ConditionFalse), domain.ClusterCacheGVRSyncStats{})
+	acc.add(syncedRec("pods", domain.ReasonSyncFailed, domain.ConditionFalse), domain.ClusterCacheGVRSyncStats{})
 
-	got := acc.verdict(ClusterCacheID(7))
+	got := acc.verdict(domain.ClusterCacheID(7))
 
-	assert.Equal(t, ReasonSyncFailed, got.Reason)
+	assert.Equal(t, domain.ReasonSyncFailed, got.Reason)
 	assert.Equal(t, []string{"pods"}, resourcesOf(got.UnhealthyKindRefs))
 }
 
@@ -273,25 +274,25 @@ func TestSyncHealthFoldDropsCachesWithNoAnchor(t *testing.T) {
 	hub := watch.New(syncHealthSnapshot{})
 	defer hub.Close()
 
-	const cacheID = ClusterCacheID(7)
-	const discoveryID = ClusterCacheGVRDiscoveryID(70)
+	const cacheID = domain.ClusterCacheID(7)
+	const discoveryID = domain.ClusterCacheGVRDiscoveryID(70)
 	f := &syncHealthFold{
 		syncs:       map[beehive.ObjectID]gvrSyncRec{},
-		cacheOf:     map[ClusterCacheGVRDiscoveryID]ClusterCacheID{discoveryID: cacheID},
-		byDiscovery: map[ClusterCacheGVRDiscoveryID]map[beehive.ObjectID]struct{}{},
-		discoveriesOf: map[ClusterCacheID]map[ClusterCacheGVRDiscoveryID]struct{}{
+		cacheOf:     map[domain.ClusterCacheGVRDiscoveryID]domain.ClusterCacheID{discoveryID: cacheID},
+		byDiscovery: map[domain.ClusterCacheGVRDiscoveryID]map[beehive.ObjectID]struct{}{},
+		discoveriesOf: map[domain.ClusterCacheID]map[domain.ClusterCacheGVRDiscoveryID]struct{}{
 			cacheID: {discoveryID: {}},
 		},
 		published: syncHealthSnapshot{},
-		dirty:     map[ClusterCacheID]struct{}{},
-		stats: func() map[ClusterCacheGVRSyncID]ClusterCacheGVRSyncStats {
-			return map[ClusterCacheGVRSyncID]ClusterCacheGVRSyncStats{}
+		dirty:     map[domain.ClusterCacheID]struct{}{},
+		stats: func() map[domain.ClusterCacheGVRSyncID]domain.ClusterCacheGVRSyncStats {
+			return map[domain.ClusterCacheGVRSyncID]domain.ClusterCacheGVRSyncStats{}
 		},
 		out: hub.Sender(),
 	}
 
 	// A cache with one healthy kind publishes a verdict.
-	f.syncs[1] = syncedRec("pods", ReasonWatching, ConditionTrue)
+	f.syncs[1] = syncedRec("pods", domain.ReasonWatching, domain.ConditionTrue)
 	f.byDiscovery[discoveryID] = map[beehive.ObjectID]struct{}{1: {}}
 	f.mark(cacheID)
 	f.flush()
@@ -317,13 +318,13 @@ func TestSyncHealthFoldTickDoesNotResurrectDroppedCaches(t *testing.T) {
 
 	f := &syncHealthFold{
 		syncs:         map[beehive.ObjectID]gvrSyncRec{},
-		cacheOf:       map[ClusterCacheGVRDiscoveryID]ClusterCacheID{},
-		byDiscovery:   map[ClusterCacheGVRDiscoveryID]map[beehive.ObjectID]struct{}{},
-		discoveriesOf: map[ClusterCacheID]map[ClusterCacheGVRDiscoveryID]struct{}{},
+		cacheOf:       map[domain.ClusterCacheGVRDiscoveryID]domain.ClusterCacheID{},
+		byDiscovery:   map[domain.ClusterCacheGVRDiscoveryID]map[beehive.ObjectID]struct{}{},
+		discoveriesOf: map[domain.ClusterCacheID]map[domain.ClusterCacheGVRDiscoveryID]struct{}{},
 		published:     syncHealthSnapshot{},
-		dirty:         map[ClusterCacheID]struct{}{},
-		stats: func() map[ClusterCacheGVRSyncID]ClusterCacheGVRSyncStats {
-			return map[ClusterCacheGVRSyncID]ClusterCacheGVRSyncStats{}
+		dirty:         map[domain.ClusterCacheID]struct{}{},
+		stats: func() map[domain.ClusterCacheGVRSyncID]domain.ClusterCacheGVRSyncStats {
+			return map[domain.ClusterCacheGVRSyncID]domain.ClusterCacheGVRSyncStats{}
 		},
 		out: hub.Sender(),
 	}
@@ -338,18 +339,18 @@ func TestSyncHealthFoldTickDoesNotResurrectDroppedCaches(t *testing.T) {
 // the fold registered its watch under — the two things needed to observe what happens when
 // the fold ends on its own rather than by our stop func.
 type syncSrcClient struct {
-	beehive.Client[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus]
+	beehive.Client[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]
 	ctx chan context.Context
-	src chan beehive.ObjectChange[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus]
+	src chan beehive.ObjectChange[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]
 }
 
 func (c *syncSrcClient) WatchList(ctx context.Context, _ ...beehive.WatchOption) (
-	beehive.ObjectListSnapshot[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus],
-	<-chan beehive.ObjectChange[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus],
+	beehive.ObjectListSnapshot[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus],
+	<-chan beehive.ObjectChange[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus],
 	error,
 ) {
 	c.ctx <- ctx
-	return beehive.ObjectListSnapshot[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus]{}, c.src, nil
+	return beehive.ObjectListSnapshot[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]{}, c.src, nil
 }
 
 // A fold can end without anybody calling its stop func: beehive terminates a watch
@@ -364,7 +365,7 @@ func TestSyncHealthFoldCancelsItsWatchesWhenItEndsOnItsOwn(t *testing.T) {
 	fake := &syncSrcClient{
 		Client: s.gvrSyncClient,
 		ctx:    make(chan context.Context, 1),
-		src:    make(chan beehive.ObjectChange[ClusterCacheGVRSyncSpec, ClusterCacheGVRSyncStatus]),
+		src:    make(chan beehive.ObjectChange[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]),
 	}
 	s.gvrSyncClient = fake
 

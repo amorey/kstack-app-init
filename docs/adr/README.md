@@ -75,3 +75,5 @@ usually just documentation in the wrong place.
 | 2026-08-09 | [Resync via fan-out poke, not cascade](2026-08-09-poke-resync-fanout.md) | cross-cutting | Accepted |
 | 2026-08-09 | [Per-cluster parallel probing, sentinel, backoff-neutral retries](2026-08-09-connection-probing.md) | sidecar | Accepted |
 | 2026-08-09 | [Sandbox build-output isolation](2026-08-09-sandbox-build-separation.md) | repo | Accepted |
+| 2026-08-10 | [ClusterService as record-family sub-APIs](2026-08-10-cluster-service-sub-apis.md) | sidecar | Accepted |
+| 2026-08-10 | [Split internal/cluster into boundary, controllers, and domain](2026-08-10-cluster-package-split.md) | sidecar | Accepted |

@@ -20,38 +20,38 @@ autobind:
 
 models:
   # --- Cluster ---
-  # The GraphQL Cluster types bind 1:1 (same name) to the internal/cluster
-  # domain types — gqlgen autobinds with no wrapper. The schema mirrors beehive's
+  # The GraphQL Cluster types bind 1:1 (same name) to the internal/cluster/domain
+  # types — gqlgen autobinds with no wrapper. The schema mirrors beehive's
   # owner chain: Cluster.status is the Cluster kind's stored status, and the
   # ClusterCache child carries the ClusterCache kind's sync status (`status`) plus
   # live on-disk `stats` (a resolver, so a query pays the stat cost only when it
   # selects them). The ClusterCache child carries the cluster ID for that resolver.
   Cluster:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.Cluster
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.Cluster
 
   ClusterSpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSpec
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterSpec
 
   ClusterSpecSource:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSpecSource
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterSpecSource
 
   ClusterSpecSourceKubeconfig:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterSpecSourceKubeconfig
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterSpecSourceKubeconfig
 
   ClusterStatusSource:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterStatusSource
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterStatusSource
 
   ClusterStatus:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterStatus
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterStatus
 
   ClusterServer:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterServer
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterServer
 
   ClusterStatusSourceKubeconfig:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterStatusSourceKubeconfig
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterStatusSourceKubeconfig
 
   ClusterPrincipal:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterPrincipal
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterPrincipal
     fields:
       permissions:
         resolver: true
@@ -71,14 +71,14 @@ models:
   # sidecar/CLAUDE.md. Until that second consumer exists, a shared package would be
   # a one-importer abstraction, so they stay here.
   Condition:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.Condition
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.Condition
 
   # The generic event surface. Event binds 1:1 to the domain type; its run id
   # rides the shared ObjectID scalar (no dedicated Event id scalar), and EventType
   # binds straight to beehive.EventType (values Normal/Warning match), the same
   # external-enum pattern as ConditionStatus.
   Event:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.Event
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.Event
 
   EventType:
     model: github.com/amorey/beehive.EventType
@@ -86,7 +86,7 @@ models:
   # The generic reconcile-schedule gauge (next-requeue countdown), decoupled from
   # the cluster/list watch. Binds 1:1 to the domain type.
   Schedule:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.Schedule
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.Schedule
 
   ConditionStatus:
     model: github.com/amorey/beehive.ConditionStatus
@@ -98,16 +98,16 @@ models:
   # gqlgen can't import). The two change wrappers bind 1:1 to the domain types the watch
   # pumps emit.
   ChangeType:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ChangeType
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ChangeType
 
   ClusterChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterChange
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterChange
 
   ClusterCacheChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheChange
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheChange
 
   ClusterCache:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCache
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCache
     fields:
       stats:
         resolver: true
@@ -118,52 +118,52 @@ models:
 
   # Likewise the GVR-discovery child: stored spec/status served as-is.
   ClusterCacheGVRDiscovery:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRDiscovery
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRDiscovery
     fields:
       # Sampled from the controller on read, like ClusterCache.stats — it is not a field
       # of the stored object (the kind's status is empty by design).
       stats:
         resolver: true
   ClusterCacheGVRSync:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRSync
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRSync
     fields:
       # Same shape as the discovery's: a controller-held gauge, not stored state.
       stats:
         resolver: true
   ClusterCacheGVRSyncSpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRSyncSpec
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRSyncSpec
   ClusterCacheGVRSyncStats:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRSyncStats
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRSyncStats
   ClusterCacheGVRSyncChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRSyncChange
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRSyncChange
   ClusterCacheSyncHealth:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheSyncHealth
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheSyncHealth
   SyncedKindRef:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.SyncedKindRef
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.SyncedKindRef
 
   ClusterCacheGVRDiscoverySpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRDiscoverySpec
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRDiscoverySpec
 
   ClusterCacheGVRDiscoveryStats:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRDiscoveryStats
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRDiscoveryStats
 
   ClusterCacheGVRDiscoveryChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheGVRDiscoveryChange
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRDiscoveryChange
 
   ClusterCacheStats:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheStats
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheStats
 
   ClusterCacheResourceStats:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterCacheResourceStats
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheResourceStats
 
   ClusterDataKind:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataKind
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataKind
 
   ClusterDataKindChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataKindChange
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataKindChange
 
   ClusterDataEvent:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataEvent
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataEvent
     # The domain carries value time.Time (must stay comparable for the delta-watch diff),
     # so resolvers map the zero time to null instead of serializing 0001-01-01.
     fields:
@@ -173,10 +173,10 @@ models:
         resolver: true
 
   ClusterDataEventChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataEventChange
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataEventChange
 
   ClusterDataObject:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataObject
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataObject
     # The domain carries value time.Time (parallel to ClusterDataEvent), so the resolver
     # maps the zero creationTimestamp to null instead of serializing 0001-01-01. rawJSON
     # autobinds to the RawJSON field (no resolver): the watch already reads the body for
@@ -188,7 +188,7 @@ models:
         resolver: true
 
   ClusterDataObjectChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ClusterDataObjectChange
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataObjectChange
 
   # --- Auth ---
   # Bind the GraphQL auth types straight to the auth domain types so the
@@ -209,13 +209,13 @@ models:
   # arguments arrive already typed — no per-resolver parsing. ClusterID (and
   # future per-kind ids) are aliases of this one type, sharing its machinery.
   ObjectID:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ObjectID
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ObjectID
 
   # The JSON scalar binds to cluster.RawJSON — a comparable string carrying already-
   # serialized JSON, marshaled verbatim (see rawjson.go). It backs a cached object's
   # full native body on ClusterDataObject.
   JSON:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster.RawJSON
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.RawJSON
 
   # --- gqlgen ---
   ID:
@@ -232,4 +232,4 @@ models:
   String:
     model:
       - github.com/99designs/gqlgen/graphql.String
-      - github.com/kubetail-org/kstack-app/sidecar/internal/cluster.ConditionType
+      - github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ConditionType

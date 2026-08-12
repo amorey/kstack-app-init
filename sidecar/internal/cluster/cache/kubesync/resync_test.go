@@ -519,3 +519,51 @@ func TestCatchUpFactsDescribeThePassThatEarnedThem(t *testing.T) {
 
 	assert.Equal(t, []report{{resynced: true, items: 1000}, {resynced: false, items: 0}}, got)
 }
+
+// A continue token can expire mid-pagination. The pass restarts from the top with a fresh
+// session, and the half-written one is discarded wholesale — so an object that only the
+// abandoned pass listed is pruned rather than surviving on the strength of a pass that
+// never completed.
+func TestFullListRestartsWhenTheContinueTokenExpires(t *testing.T) {
+	st := newFakeStore()
+	calls := 0
+	src := &fakeSource{listFn: func(metav1.ListOptions) ([]*unstructured.Unstructured, string, string, error) {
+		calls++
+		switch calls {
+		case 1:
+			return []*unstructured.Unstructured{newTestItem("uid-a", "a", "1")}, "tok", "", nil
+		case 2:
+			return nil, "", "", apierrors.NewResourceExpired("continue token expired")
+		default:
+			return []*unstructured.Unstructured{newTestItem("uid-b", "b", "2")}, "", "9", nil
+		}
+	}}
+
+	d := newTestDriver(src, st, "")
+	rv, err := d.fullList(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, "9", rv)
+	assert.ElementsMatch(t, []string{"uid-b"}, st.uids(), "the abandoned session's page must not survive the prune")
+}
+
+// A collection too large to paginate within its continue token's lifetime gives up with
+// errListRestartBudget rather than falling back to one unpaginated LIST, which would load
+// every body at once — the exact blow-up pagination exists to avoid.
+func TestFullListGivesUpAfterTooManyContinueTokenExpiries(t *testing.T) {
+	st := newFakeStore()
+	src := &fakeSource{listFn: func(opts metav1.ListOptions) ([]*unstructured.Unstructured, string, string, error) {
+		if opts.Continue == "" {
+			return []*unstructured.Unstructured{newTestItem("uid-a", "a", "1")}, "tok", "", nil
+		}
+		return nil, "", "", apierrors.NewResourceExpired("continue token expired")
+	}}
+
+	d := newTestDriver(src, st, "")
+	_, err := d.fullList(context.Background())
+	require.ErrorIs(t, err, errListRestartBudget)
+
+	// Bounded, not a hot loop: one first page plus one expiring follow-up per attempt,
+	// across the initial pass and maxListRestarts retries.
+	assert.Equal(t, 2*(maxListRestarts+1), src.lists())
+}

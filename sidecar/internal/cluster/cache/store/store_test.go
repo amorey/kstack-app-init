@@ -24,8 +24,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 	"github.com/stretchr/testify/require"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // ref builds a CacheRef from a parent-cluster and cache ObjectID. Most tests use
