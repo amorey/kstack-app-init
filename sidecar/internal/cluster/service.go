@@ -99,6 +99,10 @@ type Clusters interface {
 type Caches interface {
 	// Get returns one cache by id, or (nil, nil) when unknown or deletion-pending.
 	Get(ctx context.Context, id domain.ClusterCacheID) (*domain.ClusterCache, error)
+	// List returns one cluster's caches, non-deletion-pending. Usually one; a UID
+	// migration leaves the superseded cache until its subtree drains. Which is active
+	// is the caller's live join (domain.CacheIsActive), not a property of the list.
+	List(ctx context.Context, clusterID domain.ClusterID) ([]*domain.ClusterCache, error)
 	// Watch streams cache records as a delta watch parallel to Clusters().Watch;
 	// the caller joins caches onto clusters by ClusterID.
 	Watch(ctx context.Context) (<-chan domain.ClusterCacheChange, error)

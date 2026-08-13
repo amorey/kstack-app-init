@@ -424,6 +424,16 @@ func (f fakeCaches) Get(_ context.Context, id domain.ClusterCacheID) (*domain.Cl
 	return nil, nil
 }
 
+func (f fakeCaches) List(_ context.Context, clusterID domain.ClusterID) ([]*domain.ClusterCache, error) {
+	var out []*domain.ClusterCache
+	for _, c := range f.s.cacheSnapshot() {
+		if c.ClusterID == clusterID {
+			out = append(out, &c)
+		}
+	}
+	return out, nil
+}
+
 func (f fakeCaches) ListEvents(_ context.Context, id domain.ClusterCacheID, _ *string, _ *int) ([]domain.Event, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()

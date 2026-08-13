@@ -15,6 +15,12 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain"
 )
 
+// Caches is the resolver for the caches field — the caches this cluster owns. A
+// separate beehive read, so it runs only when selected.
+func (r *clusterResolver) Caches(ctx context.Context, obj *domain.Cluster) ([]*domain.ClusterCache, error) {
+	return r.ClusterSvc.Caches().List(ctx, obj.ID)
+}
+
 // Events is the resolver for the events field — this cluster's event timeline. A
 // separate beehive read, so it runs only when selected.
 func (r *clusterResolver) Events(ctx context.Context, obj *domain.Cluster, category *string, limit *int) ([]*domain.Event, error) {

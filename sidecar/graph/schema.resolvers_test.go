@@ -390,6 +390,47 @@ func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 
 // --- ClusterCache ---
 
+// Cluster.caches is the navigable path down the owner chain — the only way into a
+// cache by query without already holding its id. Asserted on the wire because a
+// resolver that isn't wired returns an empty list rather than failing.
+func TestClusterCachesResolver(t *testing.T) {
+	fix := clusterFixtures()
+	srv := newTestServer(t, fix)
+	id := fix[0].id
+
+	query := `{ cluster(id: "` + strconv.FormatInt(int64(id), 10) + `") {
+		caches { id clusterID serverUid }
+	} }`
+	body, _ := json.Marshal(map[string]string{"query": query})
+	raw := postGQL(t, srv.URL, string(body))
+
+	var resp struct {
+		Data struct {
+			Cluster struct {
+				Caches []map[string]any `json:"caches"`
+			} `json:"cluster"`
+		}
+		Errors []struct{ Message string }
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if len(resp.Errors) > 0 {
+		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
+	}
+	got := resp.Data.Cluster.Caches
+	if len(got) != 1 {
+		t.Fatalf("want this cluster's one cache, got %d: %s", len(got), raw)
+	}
+	// Its own id, not its cluster's — the two differ in the fixture on purpose.
+	if got[0]["id"] != strconv.FormatInt(int64(fixtureCacheID(id)), 10) {
+		t.Errorf("id: want the cache's own id, got %v", got[0]["id"])
+	}
+	if got[0]["clusterID"] != strconv.FormatInt(int64(id), 10) {
+		t.Errorf("clusterID: want the parent's id, got %v", got[0]["clusterID"])
+	}
+}
+
 // The two cache-side event timelines are the same generic reader hung off a different
 // record: `ClusterCache.events` reads the cache's own timeline (what the cache layer
 // records, e.g. SyncStopped), `ClusterCacheGVRSync.events` one synced kind's (where

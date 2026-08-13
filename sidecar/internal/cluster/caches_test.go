@@ -59,6 +59,44 @@ func TestCachesGet(t *testing.T) {
 	assert.Nil(t, missing)
 }
 
+// List is the query path from a cluster down to its caches (the GraphQL
+// Cluster.caches field). A UID migration leaves the superseded cache in place until
+// its subtree drains, so the list is genuinely plural — and it must stay scoped to
+// the owner, since the underlying watch is fleet-wide.
+func TestCachesList(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+
+	mine := seedCluster(t, s, "alpha")
+	other := seedCluster(t, s, "beta")
+	first := seedActiveCache(t, s, coreCC, mine, "uid-old")
+	// A second identity for the same cluster: the migration case, both caches present.
+	second := seedActiveCache(t, s, coreCC, mine, "uid-new")
+	seedActiveCache(t, s, coreCC, other, "uid-beta")
+
+	got, err := s.Caches().List(ctx, mine)
+	require.NoError(t, err)
+	require.Len(t, got, 2, "both of this cluster's identities, and no other cluster's")
+
+	byID := map[domain.ClusterCacheID]*domain.ClusterCache{}
+	for _, c := range got {
+		assert.Equal(t, mine, c.ClusterID) // resolved from the owner edge
+		byID[c.ID] = c
+	}
+	require.Contains(t, byID, domain.ClusterCacheID(first))
+	require.Contains(t, byID, domain.ClusterCacheID(second))
+	assert.Equal(t, "uid-old", byID[domain.ClusterCacheID(first)].ServerUID)
+	assert.Equal(t, "uid-new", byID[domain.ClusterCacheID(second)].ServerUID)
+
+	// Activeness is not a property of the list — it is the join against the parent's
+	// last-probed UID, which seedActiveCache stamped to the newest identity.
+	cluster, err := s.Clusters().Get(ctx, mine)
+	require.NoError(t, err)
+	require.NotNil(t, cluster.Status.Server.UID)
+	assert.Equal(t, "uid-new", *cluster.Status.Server.UID)
+}
+
 func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

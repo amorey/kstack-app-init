@@ -201,6 +201,19 @@ type Cluster {
   conditions: [Condition!]!
 
   """
+  Every cache this cluster has mirrored. Usually one; a UID migration leaves the
+  superseded cache in place until its subtree drains, which is why this is a list.
+
+  **None of them is marked active.** The active cache is the one whose `serverUid`
+  matches this cluster's `status.server.uid` — a comparison the caller makes, and
+  must keep making: the parent's UID is rewritten by a probe, which fires no cache
+  event, so an answer computed once goes stale silently. A consumer that needs to
+  follow that over time reads `clustersWatch` and `clusterCachesWatch` and joins
+  them live rather than reading this field.
+  """
+  caches: [ClusterCache!]!
+
+  """
   This cluster's control-plane event timeline (newest run first), optionally
   filtered to one `category` (e.g. `"connection"`) and bounded by `limit`. Empty
   for a cluster with no events. Resolved on selection and decoupled from the

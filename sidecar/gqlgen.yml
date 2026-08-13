@@ -29,8 +29,11 @@ models:
   Cluster:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.Cluster
     fields:
-      # The event timeline is read on selection, not carried on the record: it is a
-      # separate beehive read, and event chatter must not ride the cluster watch.
+      # Both are separate beehive reads, kept off the record and run only when
+      # selected: event chatter must not ride the cluster watch, and the owned
+      # caches stream standalone so cache churn never re-emits a cluster.
+      caches:
+        resolver: true
       events:
         resolver: true
 
