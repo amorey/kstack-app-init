@@ -92,6 +92,21 @@ var (
 	_ cluster.Data           = fakeData{}
 )
 
+// Fixture ids are distinct per kind. Beehive draws every kind from one
+// AUTOINCREMENT sequence, so a cache never shares its cluster's id — and a fixture
+// that reused one would let a resolver read the wrong id and still pass.
+func fixtureCacheID(id domain.ClusterID) domain.ClusterCacheID {
+	return domain.ClusterCacheID(id + 100)
+}
+
+func fixtureDiscoveryID(id domain.ClusterID) domain.ClusterCacheGVRDiscoveryID {
+	return domain.ClusterCacheGVRDiscoveryID(id + 200)
+}
+
+func fixtureSyncID(id domain.ClusterID) domain.ClusterCacheGVRSyncID {
+	return domain.ClusterCacheGVRSyncID(id + 300)
+}
+
 func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 	f := &fakeClusterService{
 		clusters:   map[domain.ClusterID]*domain.Cluster{},
@@ -113,35 +128,35 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 		// Give each fixture one cache whose ServerUID matches the cluster's
 		// identity (the client's active-cache rule).
 		f.caches = append(f.caches, domain.ClusterCache{
-			ID:         domain.ClusterCacheID(id),
+			ID:         fixtureCacheID(id),
 			ClusterID:  id,
 			ServerUID:  "uid-" + strconv.FormatInt(int64(id), 10),
 			Conditions: fx.cacheConds,
 		})
 		// Each cache gets one per-kind sync child, keyed off the same id — the fixture's
 		// per-component sync state.
-		f.gvrStats[domain.ClusterCacheGVRSyncID(id)] = fx.syncStats
+		f.gvrStats[fixtureSyncID(id)] = fx.syncStats
 		// …and its GVR-discovery child, the anchor the per-kind syncs hang off.
 		f.discoveries = append(f.discoveries, domain.ClusterCacheGVRDiscovery{
-			ID:         domain.ClusterCacheGVRDiscoveryID(id),
-			CacheID:    domain.ClusterCacheID(id),
+			ID:         fixtureDiscoveryID(id),
+			CacheID:    fixtureCacheID(id),
 			Spec:       domain.ClusterCacheGVRDiscoverySpec{Enabled: fx.spec.SyncEnabled},
 			Conditions: fx.discConds,
 		})
-		f.discStats[domain.ClusterCacheGVRDiscoveryID(id)] = fx.discStats
+		f.discStats[fixtureDiscoveryID(id)] = fx.discStats
 		// …and one per-kind sync record under that anchor, so the cache-scoped watch has
 		// something to scope. Deliberately one per cache so a leak across caches is
 		// visible as an extra frame.
 		f.gvrSyncs = append(f.gvrSyncs, domain.ClusterCacheGVRSync{
-			ID:          domain.ClusterCacheGVRSyncID(id),
-			DiscoveryID: domain.ClusterCacheGVRDiscoveryID(id),
+			ID:          fixtureSyncID(id),
+			DiscoveryID: fixtureDiscoveryID(id),
 			Spec: domain.ClusterCacheGVRSyncSpec{
 				Enabled: fx.spec.SyncEnabled, APIVersion: "apps/v1",
 				Kind: "Deployment", Resource: "deployments", Namespaced: true,
 			},
 			Conditions: fx.syncConds,
 		})
-		f.cacheStats[domain.ClusterCacheID(id)] = domain.ClusterCacheStats{
+		f.cacheStats[fixtureCacheID(id)] = domain.ClusterCacheStats{
 			Exists: true, Bytes: 4096, ObjectCount: 1386, KindCount: 62,
 		}
 	}

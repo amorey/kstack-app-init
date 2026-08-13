@@ -400,16 +400,20 @@ func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 func TestCacheEventTimelineResolvers(t *testing.T) {
 	now := time.Now().UTC()
 	tests := []struct {
-		name     string
+		name string
+		// field is the root lookup; lookupID derives the record's own id from its
+		// cluster's, since the two are deliberately different in the fixture.
 		field    string
-		seed     func(*fakeClusterService, domain.ObjectID, domain.Event)
+		lookupID func(domain.ClusterID) domain.ObjectID
+		seed     func(*fakeClusterService, domain.ClusterID, domain.Event)
 		event    domain.Event
 		wantEnum string
 	}{{
-		name:  "cache timeline",
-		field: "clusterCache",
-		seed: func(f *fakeClusterService, id domain.ObjectID, ev domain.Event) {
-			f.cacheEvents = map[domain.ClusterCacheID][]domain.Event{id: {ev}}
+		name:     "cache timeline",
+		field:    "clusterCache",
+		lookupID: func(id domain.ClusterID) domain.ObjectID { return domain.ObjectID(fixtureCacheID(id)) },
+		seed: func(f *fakeClusterService, id domain.ClusterID, ev domain.Event) {
+			f.cacheEvents = map[domain.ClusterCacheID][]domain.Event{fixtureCacheID(id): {ev}}
 		},
 		event: domain.Event{
 			Category: "sync", Type: beehive.EventWarning, Reason: "SyncFailed",
@@ -417,10 +421,11 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 		},
 		wantEnum: "Warning",
 	}, {
-		name:  "per-kind sync timeline",
-		field: "clusterCacheGVRSync",
-		seed: func(f *fakeClusterService, id domain.ObjectID, ev domain.Event) {
-			f.syncEvents = map[domain.ClusterCacheGVRSyncID][]domain.Event{id: {ev}}
+		name:     "per-kind sync timeline",
+		field:    "clusterCacheGVRSync",
+		lookupID: func(id domain.ClusterID) domain.ObjectID { return domain.ObjectID(fixtureSyncID(id)) },
+		seed: func(f *fakeClusterService, id domain.ClusterID, ev domain.Event) {
+			f.syncEvents = map[domain.ClusterCacheGVRSyncID][]domain.Event{fixtureSyncID(id): {ev}}
 		},
 		event: domain.Event{
 			Category: "sync", Type: beehive.EventNormal, Reason: "SyncComplete",
@@ -433,10 +438,10 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fix := clusterFixtures()
 			svc := newFakeClusterService(fix)
-			id := domain.ObjectID(fix[0].id)
+			id := tt.lookupID(fix[0].id)
 			ev := tt.event
 			ev.ID = id
-			tt.seed(svc, id, ev)
+			tt.seed(svc, fix[0].id, ev)
 			srv := httptest.NewServer(graph.NewServer(&graph.Resolver{
 				ClusterSvc: svc, Auth: newFakeAuth(auth.Identity{}),
 			}))
@@ -512,7 +517,7 @@ func TestClusterCacheGVRDiscoveriesWatchServesRecord(t *testing.T) {
 				t.Fatalf("decode discovery frame %s: %v", ev.data, err)
 			}
 			d := frame.Data.Watch.Discovery
-			if d["cacheID"] != "1" {
+			if d["cacheID"] != strconv.FormatInt(int64(fixtureCacheID(1)), 10) {
 				continue // fixture 2's record; it carries no discovery status
 			}
 			if frame.Data.Watch.Type != "Added" {
@@ -565,7 +570,7 @@ func TestClusterCacheGVRSyncsWatchIsCacheScoped(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	resp := openSSESubscription(t, srv.URL, "",
-		`subscription { clusterCacheGVRSyncsWatch(cacheID: "1") { type sync { id discoveryID `+
+		`subscription { clusterCacheGVRSyncsWatch(cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { type sync { id discoveryID `+
 			`spec { enabled apiVersion kind resource namespaced } conditions { type status reason } } } }`)
 	defer resp.Body.Close()
 	events := sseEvents(t, resp)
@@ -597,7 +602,7 @@ func TestClusterCacheGVRSyncsWatchIsCacheScoped(t *testing.T) {
 			}
 			seen++
 			sync := frame.Data.Watch.Sync
-			if sync["discoveryID"] != "1" {
+			if sync["discoveryID"] != strconv.FormatInt(int64(fixtureDiscoveryID(1)), 10) {
 				t.Fatalf("another cache's record leaked into the stream: %v", sync)
 			}
 			spec, _ := sync["spec"].(map[string]any)
@@ -619,7 +624,7 @@ func TestClusterCacheStatsWatchServesGauge(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	resp := openSSESubscription(t, srv.URL, "",
-		`subscription { clusterCacheStatsWatch(id: "1", cacheID: "1") { exists bytes objectCount kindCount } }`)
+		`subscription { clusterCacheStatsWatch(id: "1", cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { exists bytes objectCount kindCount } }`)
 	defer resp.Body.Close()
 	events := sseEvents(t, resp)
 
@@ -675,7 +680,7 @@ func TestClusterDataKindsResolver(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	query := `{ clusterCache(id: "` + strconv.FormatInt(int64(id), 10) + `") {
+	query := `{ clusterCache(id: "` + strconv.FormatInt(int64(fixtureCacheID(id)), 10) + `") {
 		kinds { apiVersion kind resource scope isCRD }
 	} }`
 	body, _ := json.Marshal(map[string]string{"query": query})

@@ -788,12 +788,21 @@ type Query {
 
   # --- ClusterCache ---
   """
-  A single cache by id; null if unknown. The entry point for a cache's own
-  fields — chiefly `events` — since caches otherwise arrive by subscription.
+  A single cache by **its own** id — the `ClusterCache.id` its watch frames carry,
+  not the parent cluster's. The entry point for a cache's own fields (`kinds`,
+  `events`), since caches otherwise arrive only by subscription.
+
+  Null when no cache has that id. An id belonging to another kind reads the same
+  way rather than erroring: every kind draws from one id sequence, so ids never
+  collide and a mismatched one is simply not a cache.
   """
   clusterCache(id: ObjectID!): ClusterCache
 
-  "A single synced-kind record by id; null if unknown. The entry point for its `events`."
+  """
+  A single synced-kind record by **its own** id — the `ClusterCacheGVRSync.id`, not
+  its cache's or its cluster's. The entry point for its `events`. Null when no
+  record has that id, on the same terms as `clusterCache`.
+  """
   clusterCacheGVRSync(id: ObjectID!): ClusterCacheGVRSync
 
   # --- Cluster data ---
