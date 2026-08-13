@@ -199,6 +199,15 @@ type Cluster {
   status: ClusterStatus!
   "The connection controller's conditions (`Connected`, `Healthy`)."
   conditions: [Condition!]!
+
+  """
+  This cluster's control-plane event timeline (newest run first), optionally
+  filtered to one `category` (e.g. `"connection"`) and bounded by `limit`. Empty
+  for a cluster with no events. Resolved on selection and decoupled from the
+  cluster/list watch, so event chatter never re-emits the cluster — and a query
+  that doesn't select it pays nothing.
+  """
+  events(category: String, limit: Int): [Event!]!
 }
 
 "A cluster record's desired state. Every field is user/API-owned; nothing here is observed."
@@ -751,18 +760,10 @@ type Query {
   "Every tracked cluster — those in the kubeconfig plus any with a leftover cache. Sorted by name."
   clusters: [Cluster!]!
 
-  """
-  A cluster's control-plane event timeline (newest run first), optionally filtered
-  to one `category` (e.g. `"connection"`) and bounded by `limit`. Empty for an
-  unknown cluster or one with no events. Decoupled from the cluster/list watch —
-  event chatter never re-emits the cluster.
-  """
-  clusterEvents(id: ObjectID!, category: String, limit: Int): [Event!]!
-
   # --- ClusterCache ---
   """
   A ClusterCache's control-plane event timeline (newest run first), the
-  ClusterCache-kind counterpart of `clusterEvents` — keyed by the cache's own `id`
+  ClusterCache-kind counterpart of `Cluster.events` — keyed by the cache's own `id`
   and optionally filtered to one `category` (e.g. `"sync"`, the cache-sync history).
   Empty for an unknown cache or one with no events. Decoupled from the cache/list
   watch.

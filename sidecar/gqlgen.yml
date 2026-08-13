@@ -28,6 +28,11 @@ models:
   # selects them). The ClusterCache child carries the cluster ID for that resolver.
   Cluster:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.Cluster
+    fields:
+      # The event timeline is read on selection, not carried on the record: it is a
+      # separate beehive read, and event chatter must not ride the cluster watch.
+      events:
+        resolver: true
 
   ClusterSpec:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterSpec

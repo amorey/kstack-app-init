@@ -15,6 +15,16 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain"
 )
 
+// Events is the resolver for the events field — this cluster's event timeline. A
+// separate beehive read, so it runs only when selected.
+func (r *clusterResolver) Events(ctx context.Context, obj *domain.Cluster, category *string, limit *int) ([]*domain.Event, error) {
+	evs, err := r.ClusterSvc.Clusters().ListEvents(ctx, obj.ID, category, limit)
+	if err != nil {
+		return nil, err
+	}
+	return ptrSlice(evs), nil
+}
+
 // Stats is the resolver for the cache.stats field — a resolver so a query pays the stat
 // cost only when it selects them.
 func (r *clusterCacheResolver) Stats(ctx context.Context, obj *domain.ClusterCache) (*domain.ClusterCacheStats, error) {
@@ -120,16 +130,6 @@ func (r *queryResolver) Cluster(ctx context.Context, id domain.ObjectID) (*domai
 // per-selection.
 func (r *queryResolver) Clusters(ctx context.Context) ([]*domain.Cluster, error) {
 	return r.ClusterSvc.Clusters().List(ctx)
-}
-
-// ClusterEvents is the resolver for the clusterEvents field — a cluster's event
-// timeline.
-func (r *queryResolver) ClusterEvents(ctx context.Context, id domain.ObjectID, category *string, limit *int) ([]*domain.Event, error) {
-	evs, err := r.ClusterSvc.Clusters().ListEvents(ctx, id, category, limit)
-	if err != nil {
-		return nil, err
-	}
-	return ptrSlice(evs), nil
 }
 
 // ClusterCacheEvents is the resolver for the clusterCacheEvents field — a
@@ -320,6 +320,9 @@ func (r *subscriptionResolver) AuthStateWatch(ctx context.Context) (<-chan *auth
 	return mapStream(ctx, states, cancel, func(s auth.State) *auth.State { return &s }), nil
 }
 
+// Cluster returns ClusterResolver implementation.
+func (r *Resolver) Cluster() ClusterResolver { return &clusterResolver{r} }
+
 // ClusterCache returns ClusterCacheResolver implementation.
 func (r *Resolver) ClusterCache() ClusterCacheResolver { return &clusterCacheResolver{r} }
 
@@ -353,6 +356,7 @@ func (r *Resolver) Query() QueryResolver { return &queryResolver{r} }
 // Subscription returns SubscriptionResolver implementation.
 func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionResolver{r} }
 
+type clusterResolver struct{ *Resolver }
 type clusterCacheResolver struct{ *Resolver }
 type clusterCacheGVRDiscoveryResolver struct{ *Resolver }
 type clusterCacheGVRSyncResolver struct{ *Resolver }

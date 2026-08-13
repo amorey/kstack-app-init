@@ -79,7 +79,7 @@ func TestClustersQuery(t *testing.T) {
 	}
 }
 
-// clusterEvents maps the service's domain Events onto the wire: the run id rides
+// Cluster.events maps the service's domain Events onto the wire: the run id rides
 // the ObjectID scalar (decimal string), the type binds to the EventType enum
 // (Normal/Warning), and the value slice is adapted to gqlgen's pointer slice.
 func TestClusterEventsResolver(t *testing.T) {
@@ -96,15 +96,17 @@ func TestClusterEventsResolver(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	query := `{ clusterEvents(id: "` + strconv.FormatInt(int64(id), 10) + `", category: "connection") {
-		id category type reason message count firstAt lastAt
+	query := `{ cluster(id: "` + strconv.FormatInt(int64(id), 10) + `") {
+		events(category: "connection") { id category type reason message count firstAt lastAt }
 	} }`
 	body, _ := json.Marshal(map[string]string{"query": query})
 	raw := postGQL(t, srv.URL, string(body))
 
 	var resp struct {
 		Data struct {
-			ClusterEvents []map[string]any `json:"clusterEvents"`
+			Cluster struct {
+				Events []map[string]any `json:"events"`
+			} `json:"cluster"`
 		}
 		Errors []struct{ Message string }
 	}
@@ -114,10 +116,10 @@ func TestClusterEventsResolver(t *testing.T) {
 	if len(resp.Errors) > 0 {
 		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
 	}
-	if len(resp.Data.ClusterEvents) != 1 {
-		t.Fatalf("want 1 event, got %d: %s", len(resp.Data.ClusterEvents), raw)
+	if len(resp.Data.Cluster.Events) != 1 {
+		t.Fatalf("want 1 event, got %d: %s", len(resp.Data.Cluster.Events), raw)
 	}
-	ev := resp.Data.ClusterEvents[0]
+	ev := resp.Data.Cluster.Events[0]
 	if ev["id"] != strconv.FormatInt(int64(id), 10) {
 		t.Errorf("id: want decimal-string %d, got %v", id, ev["id"])
 	}
