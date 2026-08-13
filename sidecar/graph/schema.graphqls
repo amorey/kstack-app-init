@@ -162,14 +162,6 @@ enum ChangeType {
   Added
   Modified
   Deleted
-  """
-  Closes the on-subscribe snapshot: sent exactly once per stream, after the last
-  snapshot object and before the first live change. It carries **no object** — the
-  change's entity field is null, the only case in which it is — so skip it rather
-  than key on it. It is also what makes the collection fully known: a client must
-  not render an empty state before it arrives. Kubernetes' `initial-events-end`
-  bookmark, in this protocol's vocabulary.
-  """
   Bookmark
 }
 
@@ -864,165 +856,57 @@ type Mutation {
 
 type Subscription {
   # --- Cluster ---
-  """
-  Streams the cluster list as a Kubernetes-style delta watch: the current set as an
-  `Added` burst on subscribe (the snapshot), closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted`
-  change per cluster as the registry changes. The client maintains a map keyed by
-  `cluster.id`, applying each change (a deletion-pending cluster arrives as
-  `Deleted`). Cache sync status is *not* here — it streams separately via
-  `clusterCachesWatch` and is joined client-side — so cache churn never re-emits a
-  cluster, and a consumer that only needs the cluster list (e.g. a context picker)
-  is undisturbed by it.
-  """
+  "The cluster list as a delta watch, keyed by `cluster.id`. Cache sync status is not here — it streams on `clusterCachesWatch`."
   clustersWatch: ClusterChange!
 
-  """
-  Streams a cluster's event timeline: the matching runs as a snapshot, then live
-  runs (a re-delivered run bumps its count under the same `id`). Optionally
-  filtered to one `category`. Independent of clustersWatch, so probe chatter never
-  re-emits the cluster (or the list). The client upserts by `id`.
-  """
+  "A cluster's event timeline, upserted by `id`; optionally one `category`. Independent of `clustersWatch`."
   clusterEventsWatch(id: ObjectID!, category: String): Event!
 
-  """
-  Streams a cluster's reconcile-schedule gauge: the current next-attempt time on
-  subscribe, then a fresh value on every (re)schedule (backoff step, retry, poke).
-  Independent of clustersWatch — a scheduling change fires no cluster/list watch —
-  so this is what keeps a disconnected cluster's "next attempt" countdown live.
-  """
+  "A cluster's next-reconcile gauge — what keeps a disconnected cluster's countdown live, since scheduling fires no object watch."
   clusterScheduleWatch(id: ObjectID!): Schedule!
 
   # --- ClusterCache ---
-  """
-  Streams cache records as a Kubernetes-style delta watch, parallel to
-  `clustersWatch`: the current set as an `Added` burst, closed by one `Bookmark`; then one
-  `Added`/`Modified`/`Deleted` change per cache. The client maintains a map keyed by
-  `cache.id` and joins each cache onto its cluster by `cache.clusterID`, treating the
-  cache whose `serverUid` matches the cluster's `status.server.uid` as the active
-  one. Independent of `clustersWatch` (the two streams carry no mutual ordering
-  guarantee, so the client tolerates a cache whose cluster has not arrived yet, and
-  drops caches orphaned by a cluster deletion).
-  """
+  "Cache records as a delta watch, keyed by `cache.id` and joined onto clusters by `clusterID`. Carries no ordering guarantee against `clustersWatch`."
   clusterCachesWatch: ClusterCacheChange!
 
-  """
-  Streams every cache's sync verdict, folded from all the kinds it syncs, as a
-  latest-value stream keyed by `cacheID` (the client upserts by that id, exactly as it
-  does for `Event` runs). There is no delete: a verdict's lifetime is its cache's, so a
-  client evicts it when that cache leaves `clusterCachesWatch` — which is also when the
-  server drops it from its own snapshot.
-
-  Unscoped and one record per cache, so an always-mounted consumer can carry it. That is
-  the point: the per-kind records it folds are a hundred-plus per cache and ride a
-  cache-scoped watch, and no single kind's verdict is the cache's — a cache with
-  ninety-nine healthy kinds and one forbidden CRD is not healthy.
-
-  It is a read-side projection rather than a condition on the cache: nothing in the
-  object graph reacts to it, and storing it would wake the cache and every watcher each
-  time any child changed verdict.
-  """
+  "Every cache's folded sync verdict as a latest-value stream keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's."
   clusterCacheSyncHealthWatch: ClusterCacheSyncHealth!
 
-  """
-  Streams the caches' GVR-discovery records as a Kubernetes-style delta watch, the
-  third of the parallel object streams (clusters, caches, GVR discoveries): the current set as an `Added` burst, closed by one `Bookmark`; then one
-  `Added`/`Modified`/`Deleted` change per record. The client maintains a map keyed by
-  `discovery.id` and joins each onto its cache by `discovery.cacheID`. Independent of
-  the other three (no mutual ordering guarantee). Unscoped because there is exactly one
-  per cache — the per-GVR sync records below it are one per synced kind and will ride
-  their own cache-scoped watch.
-  """
+  "The caches' GVR-discovery records as a delta watch, joined onto caches by `cacheID`. Unscoped: one record per cache."
   clusterCacheGVRDiscoveriesWatch: ClusterCacheGVRDiscoveryChange!
 
-  """
-  Streams one ClusterCache's per-kind sync records as a Kubernetes-style delta watch:
-  the current set as an `Added` burst, closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted` change per
-  record. The client keys on `sync.id`.
-
-  **Cache-scoped, unlike the four watches above**, and deliberately so: there is one
-  record per synced kind rather than one per cache, so an unscoped stream would hand an
-  always-mounted consumer a hundred-plus records for every cache at once. Open it for
-  the cache you are actually looking at.
-
-  Empty (no frames) for a cache whose discovery pass has never run — it owns no sync
-  records yet.
-  """
+  "One cache's per-kind sync records as a delta watch, keyed by `sync.id`. Cache-scoped, since there is one record per synced kind."
   clusterCacheGVRSyncsWatch(cacheID: ObjectID!): ClusterCacheGVRSyncChange!
 
-  """
-  Streams one ClusterCache's on-disk contents as a live gauge: the current measurement
-  on subscribe, then a fresh one whenever it changes (never a repeat of an unchanged
-  read). A deleted cache reports zeroed stats rather than its last-known contents; a
-  cache whose file is on disk but not open (never eligible, paused, mid-restart)
-  reports `exists` and `bytes` from that file, with the counts zero — they can only be
-  read through an open handle.
-
-  This is a subscription rather than a field on `ClusterCache` because the measurement
-  is not part of that object: a settled cache's record never changes, so a field there
-  would freeze at whatever the cache held when the client subscribed — which during a
-  cold sync is a small fraction of what lands seconds later.
-  """
+  "One cache's on-disk contents as a live gauge. A stream, not a `ClusterCache` field, which would freeze at subscribe time."
   clusterCacheStatsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheStats!
 
-  """
-  Streams a ClusterCache's event timeline, the ClusterCache-kind counterpart of
-  `clusterEventsWatch`: the matching runs as a snapshot, then live runs (a
-  re-delivered run bumps its count under the same `id`), keyed by the cache's own
-  `id` and optionally filtered to one `category` (e.g. `"sync"`). Independent of
-  `clusterCachesWatch`, so sync chatter never re-emits the cache. The client upserts
-  by `id`.
-  """
+  "A cache's event timeline, upserted by `id`; optionally one `category`. The `ClusterCache` counterpart of `clusterEventsWatch`."
   clusterCacheEventsWatch(id: ObjectID!, category: String): Event!
 
-  """
-  Streams one synced kind's event timeline, the live counterpart of
-  `clusterCacheGVRSyncEvents`: the matching runs as a snapshot, then live runs (a
-  re-delivered run bumps its count under the same `id`), keyed by that record's own
-  `id` and optionally filtered to one `category` (e.g. `"sync"`). Independent of
-  `clusterCacheGVRSyncsWatch`, so sync chatter never re-emits the record. The client
-  upserts by `id`.
-  """
+  "One synced kind's transition history, upserted by `id`; optionally one `category`. Where the per-kind sync history lives."
   clusterCacheGVRSyncEventsWatch(id: ObjectID!, category: String): Event!
 
   # --- Cluster data ---
-  """
-  Streams one ClusterCache's discovered kind catalog as a Kubernetes-style delta
-  watch (the live counterpart of `ClusterCache.kinds`, keyed by parent
-  cluster `id` + `cacheID`): the current catalog as an `Added` burst on subscribe,
-  closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted` change per kind as the sync engine writes
-  objects — a kind's per-object `count` is live, so an object write re-emits it as
-  `Modified`. The client keys each kind by `apiVersion` + `resource` and rebuilds the
-  dashboard resource nav from the accumulated set, so the nav (kinds + counts) tracks
-  the cluster in real time. Empty (no frames) until that cache's db is open (a
-  never-synced / paused cache streams nothing until it syncs).
-  """
-  clusterDataKindsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterDataKindChange!
+  "One cache's discovered kind catalog as a delta watch, keyed by `apiVersion` + `resource`. Counts are live, so an object write re-emits its kind. The live counterpart of `ClusterCache.kinds`."
+  clusterDataKindsWatch(
+    id: ObjectID!
+    cacheID: ObjectID!
+  ): ClusterDataKindChange!
 
-  """
-  Streams one ClusterCache's cached Kubernetes Events as a Kubernetes-style delta watch,
-  keyed like `clusterDataKindsWatch` (parent cluster `id` + `cacheID`): the newest window
-  of events as an `Added` burst on subscribe, closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted` change
-  per event as the sync engine writes events (a re-firing event bumps its `count`/`lastSeen`
-  → `Modified`). The client keys each event by `uid` and maintains the table from the
-  accumulated set. Because the window is bounded, an event aging out of it as newer events
-  arrive surfaces as `Deleted`. Empty (no frames) until that cache's db is open (a
-  never-synced / paused cache streams nothing until it syncs). Distinct from
-  `clusterEventsWatch`, which streams kstack's own control-plane timeline.
-  """
-  clusterDataEventsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterDataEventChange!
+  "One cache's newest window of cached Kubernetes Events as a delta watch, keyed by `uid`; an event aging out of the window surfaces as `Deleted`. Distinct from `clusterEventsWatch`, which streams kstack's own timeline."
+  clusterDataEventsWatch(
+    id: ObjectID!
+    cacheID: ObjectID!
+  ): ClusterDataEventChange!
 
-  """
-  Streams one kind's cached objects from a ClusterCache as a Kubernetes-style delta
-  watch, keyed like `clusterDataEventsWatch` plus the target kind (`apiVersion` +
-  `resource`, e.g. `"apps/v1"` + `"deployments"`): the current object set for the kind
-  as an `Added` burst on subscribe (the snapshot), closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted`
-  change per object as the sync engine writes it, each frame carrying its `cacheID`
-  provenance. The client keys each object by `uid` and maintains the table from the
-  accumulated set. Empty (no frames) until that cache's db is open and the kind has
-  synced (a never-synced / paused cache streams nothing until it syncs), mirroring
-  `clusterDataEventsWatch`'s posture.
-  """
-  clusterDataObjectsWatch(id: ObjectID!, cacheID: ObjectID!, apiVersion: String!, resource: String!): ClusterDataObjectChange!
+  "One kind's cached objects from a cache as a delta watch, keyed by `uid`. Scoped by `apiVersion` + `resource`, e.g. `\"apps/v1\"` + `\"deployments\"`."
+  clusterDataObjectsWatch(
+    id: ObjectID!
+    cacheID: ObjectID!
+    apiVersion: String!
+    resource: String!
+  ): ClusterDataObjectChange!
 
   # --- Chat ---
   "Streams the assistant's reply token-by-token. Completes after a frame with `done: true`."

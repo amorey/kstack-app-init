@@ -12,14 +12,6 @@ import type { TypedDocumentNode as DocumentNode } from '@graphql-typed-document-
  */
 export type ChangeType =
   | 'Added'
-  /**
-   * Closes the on-subscribe snapshot: sent exactly once per stream, after the last
-   * snapshot object and before the first live change. It carries **no object** — the
-   * change's entity field is null, the only case in which it is — so skip it rather
-   * than key on it. It is also what makes the collection fully known: a client must
-   * not render an empty state before it arrives. Kubernetes' `initial-events-end`
-   * bookmark, in this protocol's vocabulary.
-   */
   | 'Bookmark'
   | 'Deleted'
   | 'Modified';
