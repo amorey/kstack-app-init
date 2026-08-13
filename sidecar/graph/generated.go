@@ -345,7 +345,7 @@ type ComplexityRoot struct {
 		ClusterDataObjectsWatch         func(childComplexity int, id domain.ObjectID, cacheID domain.ObjectID, apiVersion string, resource string) int
 		ClusterScheduleWatch            func(childComplexity int, id domain.ObjectID) int
 		ClustersWatch                   func(childComplexity int) int
-		ObjectEventsWatch               func(childComplexity int, id domain.ObjectID, category *string) int
+		EventsWatch                     func(childComplexity int, id domain.ObjectID, category *string) int
 	}
 
 	SyncedKindRef struct {
@@ -401,7 +401,7 @@ type QueryResolver interface {
 	AuthState(ctx context.Context) (*auth.State, error)
 }
 type SubscriptionResolver interface {
-	ObjectEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error)
+	EventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error)
 	ClustersWatch(ctx context.Context) (<-chan *domain.ClusterWatchFrame, error)
 	ClusterScheduleWatch(ctx context.Context, id domain.ObjectID) (<-chan *domain.Schedule, error)
 	ClusterCachesWatch(ctx context.Context) (<-chan *domain.ClusterCacheWatchFrame, error)
@@ -1619,17 +1619,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Subscription.ClustersWatch(childComplexity), true
-	case "Subscription.objectEventsWatch":
-		if e.ComplexityRoot.Subscription.ObjectEventsWatch == nil {
+	case "Subscription.eventsWatch":
+		if e.ComplexityRoot.Subscription.EventsWatch == nil {
 			break
 		}
 
-		args, err := ec.field_Subscription_objectEventsWatch_args(ctx, rawArgs)
+		args, err := ec.field_Subscription_eventsWatch_args(ctx, rawArgs)
 		if err != nil {
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Subscription.ObjectEventsWatch(childComplexity, args["id"].(domain.ObjectID), args["category"].(*string)), true
+		return e.ComplexityRoot.Subscription.EventsWatch(childComplexity, args["id"].(domain.ObjectID), args["category"].(*string)), true
 
 	case "SyncedKindRef.apiVersion":
 		if e.ComplexityRoot.SyncedKindRef.APIVersion == nil {
@@ -2811,7 +2811,7 @@ func (ec *executionContext) field_Subscription_clusterScheduleWatch_args(ctx con
 	return args, nil
 }
 
-func (ec *executionContext) field_Subscription_objectEventsWatch_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+func (ec *executionContext) field_Subscription_eventsWatch_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
@@ -7299,17 +7299,17 @@ func (ec *executionContext) fieldContext_Schedule_probing(_ context.Context, fie
 	return graphql.NewScalarFieldContext("Schedule", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
-func (ec *executionContext) _Subscription_objectEventsWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
+func (ec *executionContext) _Subscription_eventsWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
 	return graphql.ResolveFieldStream(
 		ctx,
 		ec.OperationContext,
 		field,
 		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_Subscription_objectEventsWatch(ctx, field)
+			return ec.fieldContext_Subscription_eventsWatch(ctx, field)
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Subscription().ObjectEventsWatch(ctx, fc.Args["id"].(domain.ObjectID), fc.Args["category"].(*string))
+			return ec.Resolvers.Subscription().EventsWatch(ctx, fc.Args["id"].(domain.ObjectID), fc.Args["category"].(*string))
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *domain.EventWatchFrame) graphql.Marshaler {
@@ -7319,7 +7319,7 @@ func (ec *executionContext) _Subscription_objectEventsWatch(ctx context.Context,
 		true,
 	)
 }
-func (ec *executionContext) fieldContext_Subscription_objectEventsWatch(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+func (ec *executionContext) fieldContext_Subscription_eventsWatch(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	fc = &graphql.FieldContext{
 		Object:     "Subscription",
 		Field:      field,
@@ -7336,7 +7336,7 @@ func (ec *executionContext) fieldContext_Subscription_objectEventsWatch(ctx cont
 		}
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
-	if fc.Args, err = ec.field_Subscription_objectEventsWatch_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+	if fc.Args, err = ec.field_Subscription_eventsWatch_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -11641,8 +11641,8 @@ func (ec *executionContext) _Subscription(ctx context.Context, sel ast.Selection
 	}
 
 	switch fields[0].Name {
-	case "objectEventsWatch":
-		return ec._Subscription_objectEventsWatch(ctx, fields[0])
+	case "eventsWatch":
+		return ec._Subscription_eventsWatch(ctx, fields[0])
 	case "clustersWatch":
 		return ec._Subscription_clustersWatch(ctx, fields[0])
 	case "clusterScheduleWatch":

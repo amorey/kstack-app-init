@@ -224,7 +224,7 @@ function pushClusters(rows: Row[]) {
 }
 
 // Push one run on the cluster's connection timeline. Both event subscriptions select
-// objectEventsWatch now, so the channel is picked by operation name, not field.
+// eventsWatch now, so the channel is picked by operation name, not field.
 // diagnostics are open (mounts the events subscription).
 function pushConnectionEvent(ev: {
   id: string;
@@ -236,7 +236,7 @@ function pushConnectionEvent(ev: {
   lastAt: string;
 }) {
   channelFor('ClusterConnectionEvents').onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { objectEventsWatch: { type: 'Run', event: ev } } } }),
+    JSON.stringify({ type: 'next', payload: { data: { eventsWatch: { type: 'Run', event: ev } } } }),
   );
 }
 
@@ -244,7 +244,7 @@ function pushConnectionEvent(ev: {
 // arriving, so a consumer must not render its empty state.
 function pushEventBookmark(operation: string) {
   channelFor(operation).onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { objectEventsWatch: { type: 'Bookmark', event: null } } } }),
+    JSON.stringify({ type: 'next', payload: { data: { eventsWatch: { type: 'Bookmark', event: null } } } }),
   );
 }
 
@@ -263,7 +263,7 @@ function pushSyncEvent(ev: {
   channelFor('ClusterSyncEvents').onmessage!(
     JSON.stringify({
       type: 'next',
-      payload: { data: { objectEventsWatch: { type: 'Run', event: ev } } },
+      payload: { data: { eventsWatch: { type: 'Run', event: ev } } },
     }),
   );
 }
@@ -763,7 +763,7 @@ describe('ClusterSyncPanel', () => {
     expect(sub.query).toContain('message');
     expect(sub.query).toContain('transitionedAt');
     // The probe history and the next-attempt countdown are not inlined on
-    // the list — they stream per-row via objectEventsWatch / clusterScheduleWatch.
+    // the list — they stream per-row via eventsWatch / clusterScheduleWatch.
     expect(sub.query).not.toContain('connectionAttempts');
     expect(sub.query).not.toContain('nextAttemptAt');
   });
@@ -783,7 +783,7 @@ describe('ClusterSyncPanel', () => {
     ]);
 
     // The Disconnected label is an interactive trigger (only the error state is).
-    // Opening it mounts the per-row objectEventsWatch + clusterScheduleWatch subs.
+    // Opening it mounts the per-row eventsWatch + clusterScheduleWatch subs.
     await user.click(await screen.findByRole('button', { name: /disconnected/i }));
 
     // The next-attempt countdown streams in on the schedule gauge (decoupled from

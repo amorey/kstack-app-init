@@ -885,7 +885,7 @@ type Mutation {
 type Subscription {
   # --- Any object ---
   "Any record's event timeline — `Cluster`, `ClusterCache`, `ClusterCacheGVRSync` — upserted by `id`; optionally one `category`. The point read is that record's own `events` field."
-  objectEventsWatch(id: ObjectID!, category: String): EventWatchFrame!
+  eventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   # --- Cluster ---
   "The cluster list as a delta watch, keyed by `cluster.id`. Cache sync status is not here — it streams on `clusterCachesWatch`."

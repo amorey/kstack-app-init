@@ -208,9 +208,9 @@ func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
 	return &state, nil
 }
 
-// ObjectEventsWatch is the resolver for the objectEventsWatch field — the live event
-// tail for any record with a timeline, decoupled from that record's own watch.
-func (r *subscriptionResolver) ObjectEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
+// EventsWatch is the resolver for the eventsWatch field — the live event tail for any
+// record with a timeline, decoupled from that record's own watch.
+func (r *subscriptionResolver) EventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
 	ch, err := r.ClusterSvc.WatchObjectEvents(ctx, id, category)
 	if err != nil {
 		return nil, err

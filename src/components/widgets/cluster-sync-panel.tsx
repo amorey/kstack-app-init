@@ -87,7 +87,7 @@ const ClusterConnectionRetryMutation = graphql(`
 // while a row's diagnostics are open.
 const ClusterConnectionEventsSubscription = graphql(`
   subscription ClusterConnectionEvents($id: ObjectID!) {
-    objectEventsWatch(id: $id, category: "connection") {
+    eventsWatch(id: $id, category: "connection") {
       type
       event {
         id
@@ -152,9 +152,9 @@ function foldFrame(prev: Timeline | undefined, frame: RawEventFrame): Timeline {
 const EMPTY_TIMELINE: Timeline = { runs: [], synced: false };
 
 function useConnectionAttempts(clusterId: string): EventRun[] {
-  const [{ data }] = useWatchSubscription<{ objectEventsWatch: RawEventFrame }, Timeline>(
+  const [{ data }] = useWatchSubscription<{ eventsWatch: RawEventFrame }, Timeline>(
     { query: ClusterConnectionEventsSubscription, variables: { id: clusterId } },
-    (prev, resp) => foldFrame(prev, resp.objectEventsWatch),
+    (prev, resp) => foldFrame(prev, resp.eventsWatch),
   );
   return data?.runs ?? [];
 }
@@ -164,7 +164,7 @@ function useConnectionAttempts(clusterId: string): EventRun[] {
 // detail is open, one kind at a time.
 const ClusterSyncEventsSubscription = graphql(`
   subscription ClusterSyncEvents($id: ObjectID!) {
-    objectEventsWatch(id: $id, category: "sync") {
+    eventsWatch(id: $id, category: "sync") {
       type
       event {
         id
@@ -183,9 +183,9 @@ const ClusterSyncEventsSubscription = graphql(`
 // subscription would carry nothing). Returns the timeline, not bare runs: the empty
 // state must not render before the bookmark says the history really is empty.
 function useSyncEvents(syncId: string | undefined): Timeline {
-  const [{ data }] = useWatchSubscription<{ objectEventsWatch: RawEventFrame }, Timeline>(
+  const [{ data }] = useWatchSubscription<{ eventsWatch: RawEventFrame }, Timeline>(
     { query: ClusterSyncEventsSubscription, variables: { id: syncId ?? '' }, pause: !syncId },
-    (prev, resp) => foldFrame(prev, resp.objectEventsWatch),
+    (prev, resp) => foldFrame(prev, resp.eventsWatch),
   );
   return data ?? EMPTY_TIMELINE;
 }
