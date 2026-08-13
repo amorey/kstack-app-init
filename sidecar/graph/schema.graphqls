@@ -884,13 +884,7 @@ type Mutation {
 
 type Subscription {
   # --- Any object ---
-  """
-  Any object's event timeline, upserted by `id` and optionally filtered to one
-  `category`. One field for every record that has a timeline (`Cluster`,
-  `ClusterCache`, `ClusterCacheGVRSync`): an event carries no kind of its own, and
-  ids are unique across kinds, so the id alone says whose log to read. The matching
-  point read is each record's own `events` field.
-  """
+  "Any record's event timeline — `Cluster`, `ClusterCache`, `ClusterCacheGVRSync` — upserted by `id`; optionally one `category`. The point read is that record's own `events` field."
   objectEventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   # --- Cluster ---
