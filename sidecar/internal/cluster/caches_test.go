@@ -126,7 +126,7 @@ func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		ev := recvBy(t, ch, deadline)
-		assert.Equal(t, domain.FrameAdded, ev.Type)
+		assert.Equal(t, domain.DeltaFrameAdded, ev.Type)
 		require.NotNil(t, ev.Cache)
 		assert.Equal(t, domain.ClusterCacheID(cacheID), ev.Cache.ID)
 		assert.Equal(t, id, ev.Cache.ClusterID) // resolved from the owner edge

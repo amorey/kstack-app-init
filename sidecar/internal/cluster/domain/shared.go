@@ -293,30 +293,30 @@ type Schedule struct {
 	Probing bool `json:"probing"`
 }
 
-// FrameType classifies one frame on a delta watch, mirroring a Kubernetes watch event.
-// Named for the frame rather than the change because Bookmark is not a change: the
-// values are what a frame can BE, and only three of the four carry an entity. The
+// DeltaFrameType classifies one frame on a delta watch, mirroring a Kubernetes watch
+// event. Named for the frame rather than the change because Bookmark is not a change:
+// the values are what a frame can BE, and only three of the four carry an entity. The
 // Added/Modified/Deleted string values are identical to beehive's, so the watch pumps map
 // beehive→domain with a plain conversion; it is a defined type (not an alias of
 // beehive.ChangeType, which aliases into an internal package gqlgen can't import) so the
-// GraphQL FrameType enum binds straight to it — the external-enum pattern used for
+// GraphQL DeltaFrameType enum binds straight to it — the external-enum pattern used for
 // EventType/ConditionStatus.
-type FrameType string
+type DeltaFrameType string
 
 const (
-	FrameAdded    FrameType = "Added"
-	FrameModified FrameType = "Modified"
-	FrameDeleted  FrameType = "Deleted"
-	// FrameBookmark closes the on-subscribe snapshot: exactly one per stream, after the
-	// last snapshot object and before the first live change. It carries no object — the
-	// one case for which every frame's entity is a pointer — so a consumer must skip it
-	// rather than key on it.
+	DeltaFrameAdded    DeltaFrameType = "Added"
+	DeltaFrameModified DeltaFrameType = "Modified"
+	DeltaFrameDeleted  DeltaFrameType = "Deleted"
+	// DeltaFrameBookmark closes the on-subscribe snapshot: exactly one per stream, after
+	// the last snapshot object and before the first live change. It carries no object —
+	// the one case for which every frame's entity is a pointer — so a consumer must skip
+	// it rather than key on it.
 	// See docs/adr/2026-08-09-delta-watch-protocol.md.
-	FrameBookmark FrameType = "Bookmark"
+	DeltaFrameBookmark DeltaFrameType = "Bookmark"
 )
 
 // EventFrameType classifies one frame on an event-timeline watch. Two values where
-// FrameType has four, because an event log is a positioned log rather than a mirrored
+// DeltaFrameType has four, because an event log is a positioned log rather than a mirrored
 // set: beehive delivers the snapshot plus what grows above it and never reports a
 // prune, so a run is only ever upserted and there is no Deleted to forward.
 type EventFrameType string

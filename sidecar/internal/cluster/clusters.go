@@ -74,8 +74,8 @@ func (a clustersAPI) Watch(ctx context.Context) (<-chan domain.ClusterWatchFrame
 		return nil, err
 	}
 	return watchListChan(ctx, "Cluster", stream,
-		func(t domain.FrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterSpec, domain.ClusterStatus]) domain.ClusterWatchFrame {
-			if t == domain.FrameBookmark {
+		func(t domain.DeltaFrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterSpec, domain.ClusterStatus]) domain.ClusterWatchFrame {
+			if t == domain.DeltaFrameBookmark {
 				return domain.ClusterWatchFrame{Type: t}
 			}
 			if obj == nil {

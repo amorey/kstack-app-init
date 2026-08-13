@@ -34,8 +34,8 @@ func (a cachesAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheWatchFr
 		return nil, err
 	}
 	return watchListChan(ctx, "ClusterCache", stream,
-		func(t domain.FrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheSpec, domain.ClusterCacheStatus]) domain.ClusterCacheWatchFrame {
-			if t == domain.FrameBookmark {
+		func(t domain.DeltaFrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheSpec, domain.ClusterCacheStatus]) domain.ClusterCacheWatchFrame {
+			if t == domain.DeltaFrameBookmark {
 				return domain.ClusterCacheWatchFrame{Type: t}
 			}
 			if obj == nil {

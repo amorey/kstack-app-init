@@ -18,7 +18,7 @@
 #
 # --- Shared vocabulary ---
 # The scalars and the kind-agnostic projections (Condition, Event, Schedule,
-# FrameType) every noun's surface reuses. A type only one noun uses belongs in that
+# DeltaFrameType) every noun's surface reuses. A type only one noun uses belongs in that
 # noun's section, however generic its name reads.
 
 "An ISO-8601 encoded UTC date string."
@@ -153,12 +153,12 @@ type Schedule {
 }
 
 """
-Classifies a delta-watch change, mirroring a Kubernetes watch event. On subscribe a
-watch replays the current set as `Added` changes (the snapshot), closes it with one
-`Bookmark`, then streams live changes. A `Deleted` change carries the object's
+Classifies one frame on a delta watch, mirroring a Kubernetes watch event. On
+subscribe a watch replays the current set as `Added` frames (the snapshot), closes it
+with one `Bookmark`, then streams live changes. A `Deleted` carries the object's
 last-known state; the client keys on its `id`.
 """
-enum FrameType {
+enum DeltaFrameType {
   Added
   Modified
   Deleted
@@ -166,7 +166,7 @@ enum FrameType {
 }
 
 """
-Classifies one frame on an event-timeline watch. Two values where `FrameType` has
+Classifies one frame on an event-timeline watch. Two values where `DeltaFrameType` has
 four: an event log is a positioned log, not a mirrored set. The server delivers the
 snapshot plus what grows above it and never reports a prune, so a run is only ever
 upserted and there is no `Deleted`.
@@ -374,7 +374,7 @@ type NonResourceRule {
 "One frame on the `clustersWatch` stream: a change and the cluster it affected, or the `Bookmark` closing the snapshot."
 type ClusterWatchFrame {
   "Whether this cluster was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: FrameType!
+  type: DeltaFrameType!
   "The affected cluster. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
   cluster: Cluster
 }
@@ -456,7 +456,7 @@ type ClusterCacheStats {
 "One frame on the `clusterCachesWatch` stream: a change and the cache it affected, or the `Bookmark` closing the snapshot."
 type ClusterCacheWatchFrame {
   "Whether this cache was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: FrameType!
+  type: DeltaFrameType!
   "The affected cache. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
   cache: ClusterCache
 }
@@ -523,7 +523,7 @@ type ClusterCacheGVRDiscoveryStats {
 "One frame on the `clusterCacheGVRDiscoveriesWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
 type ClusterCacheGVRDiscoveryWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: FrameType!
+  type: DeltaFrameType!
   "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
   discovery: ClusterCacheGVRDiscovery
 }
@@ -597,7 +597,7 @@ type ClusterCacheGVRSyncStats {
 "One frame on the `clusterCacheGVRSyncsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
 type ClusterCacheGVRSyncWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: FrameType!
+  type: DeltaFrameType!
   "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
   sync: ClusterCacheGVRSync
 }
@@ -745,7 +745,7 @@ type ClusterDataObject {
 "One frame on the `clusterDataKindsWatch` stream: a change and the kind it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
 type ClusterDataKindWatchFrame {
   "Whether this kind was added (incl. the on-subscribe snapshot), modified (chiefly a `count` change), or deleted."
-  type: FrameType!
+  type: DeltaFrameType!
   "The affected kind. On `Deleted`, its last-known row; the client keys on `apiVersion` + `resource`. Null on `Bookmark`."
   kind: ClusterDataKind
   """
@@ -759,7 +759,7 @@ type ClusterDataKindWatchFrame {
 "One frame on the `clusterDataEventsWatch` stream: a change and the event it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
 type ClusterDataEventWatchFrame {
   "Whether this event was added (incl. the on-subscribe snapshot), modified (chiefly a `count`/`lastSeen` change as it re-fires), or deleted."
-  type: FrameType!
+  type: DeltaFrameType!
   "The affected event. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
   event: ClusterDataEvent
   """
@@ -773,7 +773,7 @@ type ClusterDataEventWatchFrame {
 "One frame on the `clusterDataObjectsWatch` stream: a change and the object it affected, or the `Bookmark` closing the snapshot. Either way it carries its (cache, kind) provenance."
 type ClusterDataObjectWatchFrame {
   "Whether this object was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: FrameType!
+  type: DeltaFrameType!
   "The affected object. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
   object: ClusterDataObject
   """

@@ -41,7 +41,7 @@ func cacheDeltaWatch[T comparable, C any](
 	subscribe func(*store.ClusterDB) (<-chan store.WriteWake, func()),
 	snapshot func(context.Context, *store.ClusterDB) ([]T, error),
 	keyOf func(T) string,
-	mkChange func(domain.FrameType, *T) C,
+	mkChange func(domain.DeltaFrameType, *T) C,
 ) <-chan C {
 	out := make(chan C, 1)
 	prev := map[string]T{}
@@ -56,7 +56,7 @@ func cacheDeltaWatch[T comparable, C any](
 			return true
 		}
 		bookmarked = true
-		return send(ctx, out, mkChange(domain.FrameBookmark, nil))
+		return send(ctx, out, mkChange(domain.DeltaFrameBookmark, nil))
 	}
 
 	// emit diffs a fresh snapshot against prev: Added/Modified in snapshot order,
@@ -79,18 +79,18 @@ func cacheDeltaWatch[T comparable, C any](
 			old, existed := prev[key]
 			switch {
 			case !existed:
-				if !send(ctx, out, mkChange(domain.FrameAdded, &v)) {
+				if !send(ctx, out, mkChange(domain.DeltaFrameAdded, &v)) {
 					return false, false
 				}
 			case old != v:
-				if !send(ctx, out, mkChange(domain.FrameModified, &v)) {
+				if !send(ctx, out, mkChange(domain.DeltaFrameModified, &v)) {
 					return false, false
 				}
 			}
 		}
 		for key, v := range prev {
 			if _, ok := next[key]; !ok {
-				if !send(ctx, out, mkChange(domain.FrameDeleted, &v)) {
+				if !send(ctx, out, mkChange(domain.DeltaFrameDeleted, &v)) {
 					return false, false
 				}
 			}
@@ -103,7 +103,7 @@ func cacheDeltaWatch[T comparable, C any](
 	// cache closes so a never-reopened cache leaves no stale rows.
 	emitEmpty := func() bool {
 		for _, v := range prev {
-			if !send(ctx, out, mkChange(domain.FrameDeleted, &v)) {
+			if !send(ctx, out, mkChange(domain.DeltaFrameDeleted, &v)) {
 				return false
 			}
 		}

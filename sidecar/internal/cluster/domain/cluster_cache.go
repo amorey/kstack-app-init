@@ -89,7 +89,7 @@ type ClusterCache struct {
 // ClusterCacheWatchFrame is the ClusterCache-kind counterpart of ClusterWatchFrame, carried
 // on the standalone cache watch. Binds 1:1 to the GraphQL ClusterCacheWatchFrame.
 type ClusterCacheWatchFrame struct {
-	Type  FrameType
+	Type  DeltaFrameType
 	Cache *ClusterCache
 }
 
@@ -168,7 +168,7 @@ type ClusterCacheGVRDiscovery struct {
 // the parallel object streams (clusters, caches, gvr-discoveries). Binds
 // 1:1 to the GraphQL ClusterCacheGVRDiscoveryWatchFrame; consumers key on Discovery.ID.
 type ClusterCacheGVRDiscoveryWatchFrame struct {
-	Type      FrameType
+	Type      DeltaFrameType
 	Discovery *ClusterCacheGVRDiscovery
 }
 
@@ -227,7 +227,7 @@ type ClusterCacheGVRSync struct {
 // ClusterCacheGVRSyncWatchFrame is one frame on the cache-scoped per-kind sync watch.
 // Consumers key on Sync.ID.
 type ClusterCacheGVRSyncWatchFrame struct {
-	Type FrameType
+	Type DeltaFrameType
 	Sync *ClusterCacheGVRSync
 }
 

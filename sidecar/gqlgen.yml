@@ -88,7 +88,7 @@ models:
   Event:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.Event
 
-  # The event watches' envelope. Its own two-value enum rather than FrameType: the
+  # The event watches' envelope. Its own two-value enum rather than DeltaFrameType: the
   # log is append-only, so Added/Modified/Deleted would advertise transitions that
   # can never arrive.
   EventWatchFrame:
@@ -108,14 +108,13 @@ models:
   ConditionStatus:
     model: github.com/amorey/beehive.ConditionStatus
 
-  # The delta watches (clustersWatch / clusterCachesWatch). FrameType binds to the
-  # domain cluster.FrameType (values Added/Modified/Deleted match the enum), the same
-  # external-enum pattern as EventType/ConditionStatus — a defined type mirroring
-  # beehive's, not beehive.FrameType itself (that is an alias into an internal package
-  # gqlgen can't import). The two change wrappers bind 1:1 to the domain types the watch
-  # pumps emit.
-  FrameType:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.FrameType
+  # The delta watches. DeltaFrameType binds to domain.DeltaFrameType (values
+  # Added/Modified/Deleted match the enum), the same external-enum pattern as
+  # EventType/ConditionStatus — a defined type mirroring beehive's ChangeType, not that
+  # type itself (it aliases into an internal package gqlgen can't import). The frame
+  # wrappers bind 1:1 to the domain types the watch pumps emit.
+  DeltaFrameType:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.DeltaFrameType
 
   ClusterWatchFrame:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterWatchFrame

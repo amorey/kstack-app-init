@@ -85,14 +85,14 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 
 	// Snapshot: an Added per kind, ordered by (api_version, kind) like Kinds.
 	snap1 := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, snap1.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, snap1.Type)
 	assert.Equal(t, "Deployment", snap1.Kind.Kind)
 	assert.Equal(t, 1, snap1.Kind.Count)
 	// Every frame carries its cache's id as provenance, so a client can reject a late
 	// frame from a superseded cache after a cache/context switch.
 	assert.Equal(t, domain.ClusterCacheID(cacheID), snap1.CacheID)
 	snap2 := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, snap2.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, snap2.Type)
 	assert.Equal(t, "Node", snap2.Kind.Kind)
 	assert.Equal(t, 0, snap2.Kind.Count)
 	// …then the Bookmark closing it: everything after this is a live change.
@@ -104,7 +104,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 	insertObj("d2", "apps/v1", "Deployment")
 	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	mod := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameModified, mod.Type)
+	assert.Equal(t, domain.DeltaFrameModified, mod.Type)
 	assert.Equal(t, "Deployment", mod.Kind.Kind)
 	assert.Equal(t, 2, mod.Kind.Count)
 
@@ -112,7 +112,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 	insertKind("batch/v1", "Job", "jobs", "Namespaced", 0)
 	cdb.ObjectsNotifyResource("batch/v1", "jobs")
 	add := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, add.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, add.Type)
 	assert.Equal(t, "Job", add.Kind.Kind)
 	assert.Equal(t, "jobs", add.Kind.Resource)
 
@@ -122,7 +122,7 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 	require.NoError(t, err)
 	cdb.ObjectsNotifyResource("v1", "nodes")
 	del := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameDeleted, del.Type)
+	assert.Equal(t, domain.DeltaFrameDeleted, del.Type)
 	assert.Equal(t, "Node", del.Kind.Kind)
 
 	// ctx cancel ends the stream.
@@ -173,7 +173,7 @@ func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
 
 	// Snapshot: Deployment at count 1.
 	snap := recvKindFrame(t, ch)
-	require.Equal(t, domain.FrameAdded, snap.Type)
+	require.Equal(t, domain.DeltaFrameAdded, snap.Type)
 	require.Equal(t, 1, snap.Kind.Count)
 	bm := recvKindFrame(t, ch)
 	requireBookmark(t, bm.Type, bm.Kind)
@@ -189,7 +189,7 @@ func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
 
 	// The single coalesced re-read reports the final count (4), never an intermediate.
 	mod := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameModified, mod.Type)
+	assert.Equal(t, domain.DeltaFrameModified, mod.Type)
 	assert.Equal(t, 4, mod.Kind.Count)
 }
 
@@ -261,7 +261,7 @@ func TestServiceClusterDataKindsWatchBindsCacheOpenedAfterSubscribe(t *testing.T
 	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 
 	ev := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, ev.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, ev.Type)
 	assert.Equal(t, "Deployment", ev.Kind.Kind)
 }
 
@@ -291,7 +291,7 @@ func TestServiceClusterDataKindsWatchRebindsAfterCacheReplaced(t *testing.T) {
 	ch, err := s.Data().WatchKinds(ctx, id, domain.ClusterCacheID(cacheID))
 	require.NoError(t, err)
 	snap := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, snap.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, snap.Type)
 	assert.Equal(t, "Deployment", snap.Kind.Kind)
 	bm := recvKindFrame(t, ch)
 	requireBookmark(t, bm.Type, bm.Kind)
@@ -302,14 +302,14 @@ func TestServiceClusterDataKindsWatchRebindsAfterCacheReplaced(t *testing.T) {
 	cdb2, err := s.cacheManager.Open(ctx, ref)
 	require.NoError(t, err)
 	del := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameDeleted, del.Type)
+	assert.Equal(t, domain.DeltaFrameDeleted, del.Type)
 	assert.Equal(t, "Deployment", del.Kind.Kind)
 
 	// A write into the rebuilt cache streams through the rebound handle.
 	insertCatalogKind(t, ctx, cdb2, "v1", "Node", "nodes", "Cluster")
 	cdb2.ObjectsNotifyResource("v1", "nodes")
 	add := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, add.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, add.Type)
 	assert.Equal(t, "Node", add.Kind.Kind)
 }
 
@@ -339,7 +339,7 @@ func TestServiceClusterDataKindsWatchEmitsDeletesOnCloseWithoutReopen(t *testing
 	ch, err := s.Data().WatchKinds(ctx, id, domain.ClusterCacheID(cacheID))
 	require.NoError(t, err)
 	snap := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, snap.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, snap.Type)
 	assert.Equal(t, "Deployment", snap.Kind.Kind)
 	// The Bookmark is sent once per stream, so the later close emits only the Delete.
 	bm := recvKindFrame(t, ch)
@@ -348,7 +348,7 @@ func TestServiceClusterDataKindsWatchEmitsDeletesOnCloseWithoutReopen(t *testing
 	// Close the cache without reopening: the held kind must surface as a Delete.
 	require.NoError(t, s.cacheManager.Close(ctx, int64(cacheID)))
 	del := recvKindFrame(t, ch)
-	assert.Equal(t, domain.FrameDeleted, del.Type)
+	assert.Equal(t, domain.DeltaFrameDeleted, del.Type)
 	assert.Equal(t, "Deployment", del.Kind.Kind)
 }
 
@@ -394,7 +394,7 @@ func TestServiceClusterDataEventsWatch(t *testing.T) {
 
 	// Snapshot: an Added carrying the flattened involved-object identity + provenance.
 	snap := recvEventFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, snap.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, snap.Type)
 	assert.Equal(t, "e1", snap.Event.UID)
 	assert.EqualValues(t, "Warning", snap.Event.Type)
 	assert.Equal(t, "BackOff", snap.Event.Reason)
@@ -409,14 +409,14 @@ func TestServiceClusterDataEventsWatch(t *testing.T) {
 	insertEvent(t, ctx, cdb, "e2", "Normal", "Scheduled", "Successfully assigned", 1, 200)
 	cdb.EventsNotify()
 	add := recvEventFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, add.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, add.Type)
 	assert.Equal(t, "e2", add.Event.UID)
 
 	// The same event re-firing (count/last_seen bump) → Modified under the same uid.
 	insertEvent(t, ctx, cdb, "e1", "Warning", "BackOff", "Back-off restarting", 5, 300)
 	cdb.EventsNotify()
 	mod := recvEventFrame(t, ch)
-	assert.Equal(t, domain.FrameModified, mod.Type)
+	assert.Equal(t, domain.DeltaFrameModified, mod.Type)
 	assert.Equal(t, "e1", mod.Event.UID)
 	assert.Equal(t, 5, mod.Event.Count)
 
@@ -425,7 +425,7 @@ func TestServiceClusterDataEventsWatch(t *testing.T) {
 	require.NoError(t, err)
 	cdb.EventsNotify()
 	del := recvEventFrame(t, ch)
-	assert.Equal(t, domain.FrameDeleted, del.Type)
+	assert.Equal(t, domain.DeltaFrameDeleted, del.Type)
 	assert.Equal(t, "e2", del.Event.UID)
 
 	cancel()
@@ -475,7 +475,7 @@ func TestServiceClusterDataEventsWatchIgnoresObjectWrites(t *testing.T) {
 	insertEvent(t, ctx, cdb, "e2", "Warning", "Failed", "Error", 1, 200)
 	cdb.EventsNotify()
 	add := recvEventFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, add.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, add.Type)
 	assert.Equal(t, "e2", add.Event.UID)
 }
 
@@ -511,7 +511,7 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 
 	// Snapshot: an Added carrying the universal identity + provenance.
 	snap := recvObjectFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, snap.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, snap.Type)
 	assert.Equal(t, "d1", snap.Object.UID)
 	assert.Equal(t, "apps/v1", snap.Object.APIVersion)
 	assert.Equal(t, "Deployment", snap.Object.Kind)
@@ -534,7 +534,7 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 	insertObject(t, ctx, cdb, "d2", "apps/v1", "Deployment", "kube-system", "coredns", "2", 200)
 	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	add := recvObjectFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, add.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, add.Type)
 	assert.Equal(t, "d2", add.Object.UID)
 
 	// The projection carries the native body, so an in-place edit — a bare resourceVersion
@@ -543,7 +543,7 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 	insertObject(t, ctx, cdb, "d1", "apps/v1", "Deployment", "default", "web", "9", 100)
 	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	mod := recvObjectFrame(t, ch)
-	assert.Equal(t, domain.FrameModified, mod.Type)
+	assert.Equal(t, domain.DeltaFrameModified, mod.Type)
 	assert.Equal(t, "d1", mod.Object.UID)
 	assert.JSONEq(t, `{"metadata":{"namespace":"default","name":"web","resourceVersion":"9"}}`,
 		string(mod.Object.RawJSON))
@@ -553,7 +553,7 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 	require.NoError(t, err)
 	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	del := recvObjectFrame(t, ch)
-	assert.Equal(t, domain.FrameDeleted, del.Type)
+	assert.Equal(t, domain.DeltaFrameDeleted, del.Type)
 	assert.Equal(t, "d2", del.Object.UID)
 
 	cancel()
@@ -603,7 +603,7 @@ func TestServiceClusterDataObjectsWatchFiltersByKind(t *testing.T) {
 	insertObject(t, ctx, cdb, "d2", "apps/v1", "Deployment", "default", "api", "1", 300)
 	cdb.ObjectsNotifyResource("apps/v1", "deployments")
 	add := recvObjectFrame(t, ch)
-	assert.Equal(t, domain.FrameAdded, add.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, add.Type)
 	assert.Equal(t, "d2", add.Object.UID)
 }
 
@@ -678,7 +678,7 @@ func TestClusterDataKindsWatchWakesOnEventWrites(t *testing.T) {
 		if ch2.Kind.Kind != "Event" {
 			continue
 		}
-		assert.Equal(t, domain.FrameModified, ch2.Type)
+		assert.Equal(t, domain.DeltaFrameModified, ch2.Type)
 		assert.Equal(t, 1, ch2.Kind.Count, "the Events badge must track event writes")
 		return
 	}
@@ -720,10 +720,10 @@ func TestClusterDataKindsWatchWakesOnKeyedWrite(t *testing.T) {
 	// The Bookmark may land either side of the writes above (the bind-time read races
 	// them, as the comment explains), so skip it wherever it falls.
 	add := recvKindFrame(t, ch)
-	if add.Type == domain.FrameBookmark {
+	if add.Type == domain.DeltaFrameBookmark {
 		add = recvKindFrame(t, ch)
 	}
-	assert.Equal(t, domain.FrameAdded, add.Type)
+	assert.Equal(t, domain.DeltaFrameAdded, add.Type)
 	assert.Equal(t, "Deployment", add.Kind.Kind)
 	assert.Equal(t, 1, add.Kind.Count)
 }
@@ -774,13 +774,13 @@ func TestServiceClusterDataObjectsWatchSurvivesKindRemap(t *testing.T) {
 	cdb.ObjectsNotifyResource("example.com/v1", "widgets")
 
 	// The watch (keyed on the resource) wakes and reconciles the remap: w1 gone, g1 present.
-	got := map[string]domain.FrameType{}
+	got := map[string]domain.DeltaFrameType{}
 	for len(got) < 2 {
 		ev := recvObjectFrame(t, ch)
 		got[ev.Object.UID] = ev.Type
 	}
-	assert.Equal(t, domain.FrameDeleted, got["w1"], "the old Kind's object must be removed")
-	assert.Equal(t, domain.FrameAdded, got["g1"], "the replacement Kind's object must appear")
+	assert.Equal(t, domain.DeltaFrameDeleted, got["w1"], "the old Kind's object must be removed")
+	assert.Equal(t, domain.DeltaFrameAdded, got["g1"], "the replacement Kind's object must appear")
 }
 
 // cacheRef resolves the active cache's on-disk locator: the directory id is the

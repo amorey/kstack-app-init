@@ -144,6 +144,6 @@ type Cluster struct {
 // cluster. On a Deleted change Cluster holds the last-known state; consumers key on
 // Cluster.ID. Binds 1:1 to the GraphQL ClusterWatchFrame.
 type ClusterWatchFrame struct {
-	Type    FrameType
+	Type    DeltaFrameType
 	Cluster *Cluster
 }

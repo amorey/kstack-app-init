@@ -23,7 +23,19 @@ export type ConditionStatus =
   | 'Unknown';
 
 /**
- * Classifies one frame on an event-timeline watch. Two values where `FrameType` has
+ * Classifies one frame on a delta watch, mirroring a Kubernetes watch event. On
+ * subscribe a watch replays the current set as `Added` frames (the snapshot), closes it
+ * with one `Bookmark`, then streams live changes. A `Deleted` carries the object's
+ * last-known state; the client keys on its `id`.
+ */
+export type DeltaFrameType =
+  | 'Added'
+  | 'Bookmark'
+  | 'Deleted'
+  | 'Modified';
+
+/**
+ * Classifies one frame on an event-timeline watch. Two values where `DeltaFrameType` has
  * four: an event log is a positioned log, not a mirrored set. The server delivers the
  * snapshot plus what grows above it and never reports a prune, so a run is only ever
  * upserted and there is no `Deleted`.
@@ -38,18 +50,6 @@ export type EventFrameType =
 export type EventType =
   | 'Normal'
   | 'Warning';
-
-/**
- * Classifies a delta-watch change, mirroring a Kubernetes watch event. On subscribe a
- * watch replays the current set as `Added` changes (the snapshot), closes it with one
- * `Bookmark`, then streams live changes. A `Deleted` change carries the object's
- * last-known state; the client keys on its `id`.
- */
-export type FrameType =
-  | 'Added'
-  | 'Bookmark'
-  | 'Deleted'
-  | 'Modified';
 
 export type ClusterEnabledSetMutationVariables = Exact<{
   id: string;
@@ -105,7 +105,7 @@ export type ClusterSyncEventsSubscription = { eventsWatch: { type: EventFrameTyp
 export type ClusterCacheGvrDiscoveriesSubscriptionVariables = Exact<{ [key: string]: never; }>;
 
 
-export type ClusterCacheGvrDiscoveriesSubscription = { clusterCacheGVRDiscoveriesWatch: { type: FrameType, discovery: { id: string, cacheID: string, stats: { lastDiscoveryAt: string, resourceCount: number } | null, conditions: Array<{ type: string, reason: string, message: string, unconfirmed: boolean }> } | null } };
+export type ClusterCacheGvrDiscoveriesSubscription = { clusterCacheGVRDiscoveriesWatch: { type: DeltaFrameType, discovery: { id: string, cacheID: string, stats: { lastDiscoveryAt: string, resourceCount: number } | null, conditions: Array<{ type: string, reason: string, message: string, unconfirmed: boolean }> } | null } };
 
 export type ClusterCacheStatsSubscriptionVariables = Exact<{
   id: string;
@@ -120,7 +120,7 @@ export type ClusterCacheGvrSyncsSubscriptionVariables = Exact<{
 }>;
 
 
-export type ClusterCacheGvrSyncsSubscription = { clusterCacheGVRSyncsWatch: { type: FrameType, sync: { id: string, spec: { apiVersion: string, resource: string } } | null } };
+export type ClusterCacheGvrSyncsSubscription = { clusterCacheGVRSyncsWatch: { type: DeltaFrameType, sync: { id: string, spec: { apiVersion: string, resource: string } } | null } };
 
 export type ClusterScheduleSubscriptionVariables = Exact<{
   id: string;
@@ -150,7 +150,7 @@ export type ClusterDataEventsWatchSubscriptionVariables = Exact<{
 }>;
 
 
-export type ClusterDataEventsWatchSubscription = { clusterDataEventsWatch: { type: FrameType, cacheID: string, event: { uid: string, type: string, reason: string, message: string, count: number, firstSeen: string | null, lastSeen: string | null, involvedKind: string, involvedNamespace: string, involvedName: string } | null } };
+export type ClusterDataEventsWatchSubscription = { clusterDataEventsWatch: { type: DeltaFrameType, cacheID: string, event: { uid: string, type: string, reason: string, message: string, count: number, firstSeen: string | null, lastSeen: string | null, involvedKind: string, involvedNamespace: string, involvedName: string } | null } };
 
 export type ClusterDataKindsWatchSubscriptionVariables = Exact<{
   id: string;
@@ -158,7 +158,7 @@ export type ClusterDataKindsWatchSubscriptionVariables = Exact<{
 }>;
 
 
-export type ClusterDataKindsWatchSubscription = { clusterDataKindsWatch: { type: FrameType, cacheID: string, kind: { apiVersion: string, kind: string, resource: string, scope: string, isCRD: boolean, count: number } | null } };
+export type ClusterDataKindsWatchSubscription = { clusterDataKindsWatch: { type: DeltaFrameType, cacheID: string, kind: { apiVersion: string, kind: string, resource: string, scope: string, isCRD: boolean, count: number } | null } };
 
 export type ClusterDataObjectsWatchSubscriptionVariables = Exact<{
   id: string;
@@ -168,17 +168,17 @@ export type ClusterDataObjectsWatchSubscriptionVariables = Exact<{
 }>;
 
 
-export type ClusterDataObjectsWatchSubscription = { clusterDataObjectsWatch: { type: FrameType, cacheID: string, apiVersion: string, resource: string, object: { uid: string, apiVersion: string, kind: string, namespace: string, name: string, creationTimestamp: string | null, rawJSON: unknown } | null } };
+export type ClusterDataObjectsWatchSubscription = { clusterDataObjectsWatch: { type: DeltaFrameType, cacheID: string, apiVersion: string, resource: string, object: { uid: string, apiVersion: string, kind: string, namespace: string, name: string, creationTimestamp: string | null, rawJSON: unknown } | null } };
 
 export type ClustersWatchSubscriptionVariables = Exact<{ [key: string]: never; }>;
 
 
-export type ClustersWatchSubscription = { clustersWatch: { type: FrameType, cluster: { id: string, spec: { name: string | null, syncEnabled: boolean, enabled: boolean, source: { kubeconfig: { context: string } | null } }, status: { lastConnectedAt: string | null, source: { kubeconfig: { cluster: string, user: string, isPresent: boolean, isDefault: boolean } | null }, server: { uid: string | null } }, conditions: Array<{ type: string, status: ConditionStatus, reason: string, message: string, liveness: boolean, unconfirmed: boolean, transitionedAt: string }> } | null } };
+export type ClustersWatchSubscription = { clustersWatch: { type: DeltaFrameType, cluster: { id: string, spec: { name: string | null, syncEnabled: boolean, enabled: boolean, source: { kubeconfig: { context: string } | null } }, status: { lastConnectedAt: string | null, source: { kubeconfig: { cluster: string, user: string, isPresent: boolean, isDefault: boolean } | null }, server: { uid: string | null } }, conditions: Array<{ type: string, status: ConditionStatus, reason: string, message: string, liveness: boolean, unconfirmed: boolean, transitionedAt: string }> } | null } };
 
 export type ClusterCachesWatchSubscriptionVariables = Exact<{ [key: string]: never; }>;
 
 
-export type ClusterCachesWatchSubscription = { clusterCachesWatch: { type: FrameType, cache: { id: string, clusterID: string, serverUid: string } | null } };
+export type ClusterCachesWatchSubscription = { clusterCachesWatch: { type: DeltaFrameType, cache: { id: string, clusterID: string, serverUid: string } | null } };
 
 export type ClusterCacheSyncHealthWatchSubscriptionVariables = Exact<{ [key: string]: never; }>;
 

@@ -83,7 +83,7 @@ func (a dataAPI) WatchKinds(ctx context.Context, clusterID domain.ClusterID, cac
 			return toDataKinds(rows), nil
 		},
 		dataKindKey,
-		func(t domain.FrameType, k *domain.ClusterDataKind) domain.ClusterDataKindWatchFrame {
+		func(t domain.DeltaFrameType, k *domain.ClusterDataKind) domain.ClusterDataKindWatchFrame {
 			return domain.ClusterDataKindWatchFrame{Type: t, Kind: k, CacheID: cacheID}
 		},
 	), nil
@@ -159,7 +159,7 @@ func (a dataAPI) WatchEvents(ctx context.Context, clusterID domain.ClusterID, ca
 			return events, nil
 		},
 		func(e domain.ClusterDataEvent) string { return e.UID },
-		func(t domain.FrameType, e *domain.ClusterDataEvent) domain.ClusterDataEventWatchFrame {
+		func(t domain.DeltaFrameType, e *domain.ClusterDataEvent) domain.ClusterDataEventWatchFrame {
 			return domain.ClusterDataEventWatchFrame{Type: t, Event: e, CacheID: cacheID}
 		},
 	), nil
@@ -189,7 +189,7 @@ func (a dataAPI) WatchObjects(ctx context.Context, clusterID domain.ClusterID, c
 			return objects, nil
 		},
 		func(o domain.ClusterDataObject) string { return o.UID },
-		func(t domain.FrameType, o *domain.ClusterDataObject) domain.ClusterDataObjectWatchFrame {
+		func(t domain.DeltaFrameType, o *domain.ClusterDataObject) domain.ClusterDataObjectWatchFrame {
 			return domain.ClusterDataObjectWatchFrame{Type: t, Object: o, CacheID: cacheID, APIVersion: apiVersion, Resource: resource}
 		},
 	), nil

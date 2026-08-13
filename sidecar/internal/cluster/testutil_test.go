@@ -64,9 +64,9 @@ func recvEventBookmark(t *testing.T, ch <-chan domain.EventWatchFrame) {
 // every such watch sends exactly one, after the last snapshot object and before the
 // first live change. `entity` is the change's entity field — the caller reads it,
 // since its name differs per kind — and must be nil.
-func requireBookmark(t *testing.T, typ domain.FrameType, entity any) {
+func requireBookmark(t *testing.T, typ domain.DeltaFrameType, entity any) {
 	t.Helper()
-	require.Equal(t, domain.FrameBookmark, typ)
+	require.Equal(t, domain.DeltaFrameBookmark, typ)
 	require.Nil(t, entity)
 }
 

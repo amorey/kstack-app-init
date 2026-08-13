@@ -30,8 +30,8 @@ func (a discoveryAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRD
 		return nil, err
 	}
 	return watchListChan(ctx, "ClusterCacheGVRDiscovery", stream,
-		func(t domain.FrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRDiscoverySpec, domain.ClusterCacheGVRDiscoveryStatus]) domain.ClusterCacheGVRDiscoveryWatchFrame {
-			if t == domain.FrameBookmark {
+		func(t domain.DeltaFrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRDiscoverySpec, domain.ClusterCacheGVRDiscoveryStatus]) domain.ClusterCacheGVRDiscoveryWatchFrame {
+			if t == domain.DeltaFrameBookmark {
 				return domain.ClusterCacheGVRDiscoveryWatchFrame{Type: t}
 			}
 			if obj == nil {
