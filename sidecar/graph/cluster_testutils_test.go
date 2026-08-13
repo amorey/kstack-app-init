@@ -461,6 +461,26 @@ func (f fakeSyncs) Get(_ context.Context, id domain.ClusterCacheGVRSyncID) (*dom
 	return nil, nil
 }
 
+// List mirrors Watch's scoping: the records whose anchor belongs to this cache.
+func (f fakeSyncs) List(_ context.Context, cacheID domain.ClusterCacheID) ([]*domain.ClusterCacheGVRSync, error) {
+	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
+	var want domain.ClusterCacheGVRDiscoveryID
+	for i := range f.s.discoveries {
+		if f.s.discoveries[i].CacheID == cacheID {
+			want = f.s.discoveries[i].ID
+		}
+	}
+	var out []*domain.ClusterCacheGVRSync
+	for i := range f.s.gvrSyncs {
+		if f.s.gvrSyncs[i].DiscoveryID == want {
+			gs := f.s.gvrSyncs[i]
+			out = append(out, &gs)
+		}
+	}
+	return out, nil
+}
+
 func (f fakeSyncs) ListEvents(_ context.Context, id domain.ClusterCacheGVRSyncID, _ *string, _ *int) ([]domain.Event, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()

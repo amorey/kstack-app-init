@@ -175,6 +175,35 @@ func (a syncsAPI) Get(ctx context.Context, id domain.ClusterCacheGVRSyncID) (*do
 	return &gs, nil
 }
 
+// List implements Syncs — one cache's per-kind records, in creation order. Keyed by
+// the cache, not its discovery anchor: there is exactly one anchor per cache and its
+// name is derived from the cache id, so the hop is an implementation detail the
+// caller never supplies (Watch keys the same way). A cache whose discovery pass has
+// never run has no anchor and therefore no records — empty, not an error.
+func (a syncsAPI) List(ctx context.Context, cacheID domain.ClusterCacheID) ([]*domain.ClusterCacheGVRSync, error) {
+	anchorName := domain.ClusterCacheGVRDiscoveryName(beehive.ObjectID(cacheID))
+	anchor, err := a.s.gvrDiscoveryClient.GetByName(ctx, anchorName)
+	if errors.Is(err, beehive.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	objs, err := a.s.gvrSyncClient.ListOwnedObjects(ctx, anchor.ID, beehive.LoadOwner())
+	if err != nil {
+		return nil, err
+	}
+	syncs := make([]*domain.ClusterCacheGVRSync, 0, len(objs))
+	for _, obj := range objs {
+		if obj.DeletionRequestedAt != nil {
+			continue
+		}
+		gs := buildGVRSync(obj)
+		syncs = append(syncs, &gs)
+	}
+	return syncs, nil
+}
+
 // buildGVRSync assembles a domain ClusterCacheGVRSync from a single beehive object, its
 // owning discovery anchor read off the eager-loaded owner edge.
 func buildGVRSync(obj *beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]) domain.ClusterCacheGVRSync {

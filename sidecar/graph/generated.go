@@ -80,6 +80,7 @@ type ComplexityRoot struct {
 		Kinds      func(childComplexity int) int
 		ServerUID  func(childComplexity int) int
 		Stats      func(childComplexity int) int
+		Syncs      func(childComplexity int) int
 	}
 
 	ClusterCacheChange struct {
@@ -355,6 +356,7 @@ type ClusterResolver interface {
 type ClusterCacheResolver interface {
 	Stats(ctx context.Context, obj *domain.ClusterCache) (*domain.ClusterCacheStats, error)
 	Kinds(ctx context.Context, obj *domain.ClusterCache) ([]*domain.ClusterDataKind, error)
+	Syncs(ctx context.Context, obj *domain.ClusterCache) ([]*domain.ClusterCacheGVRSync, error)
 	Events(ctx context.Context, obj *domain.ClusterCache, category *string, limit *int) ([]*domain.Event, error)
 }
 type ClusterCacheGVRDiscoveryResolver interface {
@@ -556,6 +558,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCache.Stats(childComplexity), true
+	case "ClusterCache.syncs":
+		if e.ComplexityRoot.ClusterCache.Syncs == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCache.Syncs(childComplexity), true
 
 	case "ClusterCacheChange.cache":
 		if e.ComplexityRoot.ClusterCacheChange.Cache == nil {
@@ -1797,6 +1805,8 @@ func (ec *executionContext) childFields_ClusterCache(ctx context.Context, field 
 		return ec.fieldContext_ClusterCache_stats(ctx, field)
 	case "kinds":
 		return ec.fieldContext_ClusterCache_kinds(ctx, field)
+	case "syncs":
+		return ec.fieldContext_ClusterCache_syncs(ctx, field)
 	case "events":
 		return ec.fieldContext_ClusterCache_events(ctx, field)
 	}
@@ -3400,6 +3410,38 @@ func (ec *executionContext) fieldContext_ClusterCache_kinds(_ context.Context, f
 		IsResolver: true,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 			return ec.childFields_ClusterDataKind(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _ClusterCache_syncs(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterCache) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCache_syncs(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return ec.Resolvers.ClusterCache().Syncs(ctx, obj)
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v []*domain.ClusterCacheGVRSync) graphql.Marshaler {
+			return ec.marshalNClusterCacheGVRSync2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSyncᚄ(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCache_syncs(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "ClusterCache",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterCacheGVRSync(ctx, field)
 		},
 	}
 	return fc, nil
@@ -9208,6 +9250,42 @@ func (ec *executionContext) _ClusterCache(ctx context.Context, sel ast.Selection
 			}
 
 			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+		case "syncs":
+			field := field
+
+			innerFunc := func(ctx context.Context, fs *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._ClusterCache_syncs(ctx, field, obj)
+				if res == graphql.Null {
+					atomic.AddUint32(&fs.Invalids, 1)
+				}
+				return res
+			}
+
+			if field.Deferrable != nil {
+				dfs, ok := deferred[field.Deferrable.Label]
+				di := 0
+				if ok {
+					dfs.AddField(field)
+					di = len(dfs.Values) - 1
+				} else {
+					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
+					deferred[field.Deferrable.Label] = dfs
+				}
+				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
+					return innerFunc(ctx, dfs)
+				})
+
+				// don't run the out.Concurrently() call below
+				out.Values[i] = graphql.Null
+				continue
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
 		case "events":
 			field := field
 
@@ -11997,6 +12075,32 @@ func (ec *executionContext) marshalNClusterCacheGVRDiscoveryChange2ᚖgithubᚗc
 
 func (ec *executionContext) marshalNClusterCacheGVRDiscoverySpec2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRDiscoverySpec(ctx context.Context, sel ast.SelectionSet, v domain.ClusterCacheGVRDiscoverySpec) graphql.Marshaler {
 	return ec._ClusterCacheGVRDiscoverySpec(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNClusterCacheGVRSync2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSyncᚄ(ctx context.Context, sel ast.SelectionSet, v []*domain.ClusterCacheGVRSync) graphql.Marshaler {
+	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
+		fc := graphql.GetFieldContext(ctx)
+		fc.Result = &v[i]
+		return ec.marshalNClusterCacheGVRSync2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSync(ctx, sel, v[i])
+	})
+
+	for _, e := range ret {
+		if e == graphql.Null {
+			return graphql.Null
+		}
+	}
+
+	return ret
+}
+
+func (ec *executionContext) marshalNClusterCacheGVRSync2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSync(ctx context.Context, sel ast.SelectionSet, v *domain.ClusterCacheGVRSync) graphql.Marshaler {
+	if v == nil {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+		return graphql.Null
+	}
+	return ec._ClusterCacheGVRSync(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalNClusterCacheGVRSyncChange2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSyncChange(ctx context.Context, sel ast.SelectionSet, v domain.ClusterCacheGVRSyncChange) graphql.Marshaler {

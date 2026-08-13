@@ -393,6 +393,21 @@ type ClusterCache {
   kinds: [ClusterDataKind!]!
 
   """
+  This cache's per-kind sync records, one per kind it mirrors — so hundreds on a
+  real cluster — in creation order. Empty until the cache's discovery pass has run.
+
+  The `ClusterCacheGVRDiscovery` that owns these records is deliberately not a step
+  in the path: there is exactly one per cache and its identity is derived from the
+  cache's, so it is an implementation detail rather than a branch to navigate. The
+  anchor's own state (when the kind list was last confirmed, whether the pass is
+  degraded) streams on `clusterCacheGVRDiscoveriesWatch`.
+
+  Resolved on selection; the live counterpart is `clusterCacheGVRSyncsWatch(cacheID)`,
+  which is what a consumer following per-kind health should read.
+  """
+  syncs: [ClusterCacheGVRSync!]!
+
+  """
   This cache's control-plane event timeline (newest run first), optionally
   filtered to one `category` (e.g. `"sync"`, the cache-sync history) and bounded
   by `limit`. Carries only what the cache itself records — the per-kind sync

@@ -142,6 +142,10 @@ type Syncs interface {
 	// Get returns one sync record by id, or (nil, nil) when unknown or
 	// deletion-pending.
 	Get(ctx context.Context, id domain.ClusterCacheGVRSyncID) (*domain.ClusterCacheGVRSync, error)
+	// List returns one cache's per-kind sync records in creation order, keyed by the
+	// CACHE — the discovery anchor between them is resolved here, as Watch does. A
+	// cache with no anchor yet owns none, which is empty rather than an error.
+	List(ctx context.Context, cacheID domain.ClusterCacheID) ([]*domain.ClusterCacheGVRSync, error)
 	// Watch streams one cache's per-kind sync records. Cache-scoped: one record per
 	// served kind, so an unscoped stream would be a firehose.
 	Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheGVRSyncChange, error)

@@ -47,6 +47,12 @@ func (r *clusterCacheResolver) Kinds(ctx context.Context, obj *domain.ClusterCac
 	return ptrSlice(kinds), nil
 }
 
+// Syncs is the resolver for the syncs field — this cache's per-kind sync records.
+// Keyed by the cache; the discovery anchor between them is resolved in the service.
+func (r *clusterCacheResolver) Syncs(ctx context.Context, obj *domain.ClusterCache) ([]*domain.ClusterCacheGVRSync, error) {
+	return r.ClusterSvc.Syncs().List(ctx, obj.ID)
+}
+
 // Events is the resolver for the events field — this cache's own event timeline.
 // A separate beehive read, so it runs only when selected.
 func (r *clusterCacheResolver) Events(ctx context.Context, obj *domain.ClusterCache, category *string, limit *int) ([]*domain.Event, error) {

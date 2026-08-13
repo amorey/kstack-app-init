@@ -60,6 +60,42 @@ func TestSyncsGet(t *testing.T) {
 	assert.Nil(t, missing)
 }
 
+// List is the query path down to a cache's per-kind records (the GraphQL
+// ClusterCache.syncs field). It is keyed by the CACHE, resolving the discovery
+// anchor itself exactly as Watch does — the anchor is one per cache and never a
+// caller's argument. The underlying store is fleet-wide, so scoping is the contract.
+func TestSyncsList(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+
+	mine := seedCluster(t, s, "alpha")
+	other := seedCluster(t, s, "beta")
+	myCache := seedActiveCache(t, s, coreCC, mine, "uid-alpha")
+	otherCache := seedActiveCache(t, s, coreCC, other, "uid-beta")
+
+	// A cache whose discovery pass has never run owns no records — empty, not an error.
+	empty, err := s.Syncs().List(ctx, domain.ClusterCacheID(myCache))
+	require.NoError(t, err)
+	assert.Empty(t, empty, "no anchor yet means no records")
+
+	myDiscovery := seedGVRDiscovery(t, s, myCache)
+	otherDiscovery := seedGVRDiscovery(t, s, otherCache)
+	seedGVRSync(t, s, myDiscovery, "apps/v1", "deployments")
+	seedGVRSync(t, s, myDiscovery, "v1", "pods")
+	seedGVRSync(t, s, otherDiscovery, "apps/v1", "deployments")
+
+	got, err := s.Syncs().List(ctx, domain.ClusterCacheID(myCache))
+	require.NoError(t, err)
+	require.Len(t, got, 2, "this cache's kinds only")
+
+	resources := []string{got[0].Spec.Resource, got[1].Spec.Resource}
+	assert.ElementsMatch(t, []string{"deployments", "pods"}, resources)
+	for _, gs := range got {
+		assert.EqualValues(t, myDiscovery, gs.DiscoveryID) // resolved from the owner edge
+	}
+}
+
 func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

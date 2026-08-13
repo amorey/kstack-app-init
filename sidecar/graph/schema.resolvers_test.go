@@ -390,6 +390,46 @@ func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 
 // --- ClusterCache ---
 
+// ClusterCache.syncs completes the navigable path Cluster → caches → syncs. The
+// discovery anchor that owns the records is NOT a step in it: exactly one exists per
+// cache, so the service resolves it and the query never names it.
+func TestClusterCacheSyncsResolver(t *testing.T) {
+	fix := clusterFixtures()
+	srv := newTestServer(t, fix)
+	cacheID := fixtureCacheID(fix[0].id)
+
+	query := `{ clusterCache(id: "` + strconv.FormatInt(int64(cacheID), 10) + `") {
+		syncs { id discoveryID spec { apiVersion resource } }
+	} }`
+	body, _ := json.Marshal(map[string]string{"query": query})
+	raw := postGQL(t, srv.URL, string(body))
+
+	var resp struct {
+		Data struct {
+			ClusterCache struct {
+				Syncs []map[string]any `json:"syncs"`
+			} `json:"clusterCache"`
+		}
+		Errors []struct{ Message string }
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if len(resp.Errors) > 0 {
+		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
+	}
+	got := resp.Data.ClusterCache.Syncs
+	if len(got) != 1 {
+		t.Fatalf("want this cache's one record, got %d: %s", len(got), raw)
+	}
+	if got[0]["id"] != strconv.FormatInt(int64(fixtureSyncID(fix[0].id)), 10) {
+		t.Errorf("id: want the sync record's own id, got %v", got[0]["id"])
+	}
+	if got[0]["discoveryID"] != strconv.FormatInt(int64(fixtureDiscoveryID(fix[0].id)), 10) {
+		t.Errorf("discoveryID: want the anchor's id, got %v", got[0]["discoveryID"])
+	}
+}
+
 // Cluster.caches is the navigable path down the owner chain — the only way into a
 // cache by query without already holding its id. Asserted on the wire because a
 // resolver that isn't wired returns an empty list rather than failing.

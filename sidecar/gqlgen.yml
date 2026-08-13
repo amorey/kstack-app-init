@@ -123,6 +123,8 @@ models:
       # event log), so both stay off the record and run only when selected.
       kinds:
         resolver: true
+      syncs:
+        resolver: true
       events:
         resolver: true
 
