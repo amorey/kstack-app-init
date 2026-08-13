@@ -74,8 +74,10 @@ func TestSyncsList(t *testing.T) {
 	myCache := seedActiveCache(t, s, coreCC, mine, "uid-alpha")
 	otherCache := seedActiveCache(t, s, coreCC, other, "uid-beta")
 
+	myCacheID := domain.ClusterCacheID(myCache)
+
 	// A cache whose discovery pass has never run owns no records — empty, not an error.
-	empty, err := s.Syncs().List(ctx, domain.ClusterCacheID(myCache))
+	empty, err := s.Syncs().List(ctx, &myCacheID)
 	require.NoError(t, err)
 	assert.Empty(t, empty, "no anchor yet means no records")
 
@@ -85,7 +87,7 @@ func TestSyncsList(t *testing.T) {
 	seedGVRSync(t, s, myDiscovery, "v1", "pods")
 	seedGVRSync(t, s, otherDiscovery, "apps/v1", "deployments")
 
-	got, err := s.Syncs().List(ctx, domain.ClusterCacheID(myCache))
+	got, err := s.Syncs().List(ctx, &myCacheID)
 	require.NoError(t, err)
 	require.Len(t, got, 2, "this cache's kinds only")
 
@@ -94,6 +96,11 @@ func TestSyncsList(t *testing.T) {
 	for _, gs := range got {
 		assert.EqualValues(t, myDiscovery, gs.DiscoveryID) // resolved from the owner edge
 	}
+
+	// Unscoped: every cache's records, which is what the plural root field serves.
+	all, err := s.Syncs().List(ctx, nil)
+	require.NoError(t, err)
+	assert.Len(t, all, 3, "this cache's two plus the other cache's one")
 }
 
 func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {

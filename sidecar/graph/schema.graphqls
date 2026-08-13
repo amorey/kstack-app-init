@@ -827,13 +827,33 @@ type Query {
   clusterCache(id: ObjectID!): ClusterCache
 
   """
+  Caches in creation order: every tracked one, or a single cluster's when
+  `clusterID` is given. The plural counterpart of `clusterCache`, and the same set
+  `Cluster.caches` serves when scoped.
+
+  None of them is marked active — see `Cluster.caches` for why that stays a live
+  join against the parent's `status.server.uid`.
+  """
+  clusterCaches(clusterID: ObjectID): [ClusterCache!]!
+
+  """
   A single synced-kind record by **its own** id — the `ClusterCacheGVRSync.id`, not
   its cache's or its cluster's. The entry point for its `events`. Null when no
   record has that id, on the same terms as `clusterCache`.
   """
   clusterCacheGVRSync(id: ObjectID!): ClusterCacheGVRSync
 
-  # --- Cluster data ---
+  """
+  Per-kind sync records in creation order: every tracked one, or a single cache's
+  when `cacheID` is given. The plural counterpart of `clusterCacheGVRSync`, and the
+  same set `ClusterCache.syncs` serves when scoped.
+
+  There is one record per kind per cache, so the unscoped form is hundreds of rows
+  on a real fleet — scope it, or follow `clusterCacheGVRSyncsWatch(cacheID)` for
+  live per-kind health.
+  """
+  clusterCacheGVRSyncs(cacheID: ObjectID): [ClusterCacheGVRSync!]!
+
   # --- Cloud account ---
   "Current authentication state. Signed-out when no cloud account is configured; live updates via authStateWatch."
   authState: AuthState!

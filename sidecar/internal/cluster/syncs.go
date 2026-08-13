@@ -175,21 +175,30 @@ func (a syncsAPI) Get(ctx context.Context, id domain.ClusterCacheGVRSyncID) (*do
 	return &gs, nil
 }
 
-// List implements Syncs — one cache's per-kind records, in creation order. Keyed by
-// the cache, not its discovery anchor: there is exactly one anchor per cache and its
-// name is derived from the cache id, so the hop is an implementation detail the
-// caller never supplies (Watch keys the same way). A cache whose discovery pass has
-// never run has no anchor and therefore no records — empty, not an error.
-func (a syncsAPI) List(ctx context.Context, cacheID domain.ClusterCacheID) ([]*domain.ClusterCacheGVRSync, error) {
-	anchorName := domain.ClusterCacheGVRDiscoveryName(beehive.ObjectID(cacheID))
-	anchor, err := a.s.gvrDiscoveryClient.GetByName(ctx, anchorName)
-	if errors.Is(err, beehive.ErrNotFound) {
-		return nil, nil
+// List implements Syncs — one cache's per-kind records in creation order, or every
+// tracked record when cacheID is nil. Scoped by the cache, not its discovery anchor:
+// there is exactly one anchor per cache and its name is derived from the cache id, so
+// the hop is an implementation detail the caller never supplies (Watch keys the same
+// way). A cache whose discovery pass has never run has no anchor and therefore no
+// records — empty, not an error.
+func (a syncsAPI) List(ctx context.Context, cacheID *domain.ClusterCacheID) ([]*domain.ClusterCacheGVRSync, error) {
+	var (
+		objs []*beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]
+		err  error
+	)
+	if cacheID != nil {
+		anchorName := domain.ClusterCacheGVRDiscoveryName(beehive.ObjectID(*cacheID))
+		anchor, anchorErr := a.s.gvrDiscoveryClient.GetByName(ctx, anchorName)
+		if errors.Is(anchorErr, beehive.ErrNotFound) {
+			return nil, nil
+		}
+		if anchorErr != nil {
+			return nil, anchorErr
+		}
+		objs, err = a.s.gvrSyncClient.ListOwnedObjects(ctx, anchor.ID, beehive.LoadOwner())
+	} else {
+		objs, err = a.s.gvrSyncClient.List(ctx, beehive.LoadOwner())
 	}
-	if err != nil {
-		return nil, err
-	}
-	objs, err := a.s.gvrSyncClient.ListOwnedObjects(ctx, anchor.ID, beehive.LoadOwner())
 	if err != nil {
 		return nil, err
 	}

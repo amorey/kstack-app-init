@@ -390,6 +390,50 @@ func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 
 // --- ClusterCache ---
 
+// The plural root fields serve the same records as the nested ones, scoped by an
+// OPTIONAL parent id: omit it for the whole fleet, pass it for one parent. The fixture
+// gives each cluster one cache and each cache one sync record, so the two forms are
+// distinguishable by count.
+func TestPluralRootFieldsScopeOptionally(t *testing.T) {
+	fix := clusterFixtures()
+	srv := newTestServer(t, fix)
+	clusterID := strconv.FormatInt(int64(fix[0].id), 10)
+	cacheID := strconv.FormatInt(int64(fixtureCacheID(fix[0].id)), 10)
+
+	tests := []struct {
+		name      string
+		query     string
+		field     string
+		wantCount int
+	}{
+		{"caches unscoped", `{ clusterCaches { id } }`, "clusterCaches", len(fix)},
+		{"caches scoped", `{ clusterCaches(clusterID: "` + clusterID + `") { id } }`, "clusterCaches", 1},
+		{"syncs unscoped", `{ clusterCacheGVRSyncs { id } }`, "clusterCacheGVRSyncs", len(fix)},
+		{"syncs scoped", `{ clusterCacheGVRSyncs(cacheID: "` + cacheID + `") { id } }`, "clusterCacheGVRSyncs", 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]string{"query": tt.query})
+			raw := postGQL(t, srv.URL, string(body))
+
+			var resp struct {
+				Data   map[string][]map[string]any
+				Errors []struct{ Message string }
+			}
+			if err := json.Unmarshal(raw, &resp); err != nil {
+				t.Fatalf("decode %s: %v", raw, err)
+			}
+			if len(resp.Errors) > 0 {
+				t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
+			}
+			if got := len(resp.Data[tt.field]); got != tt.wantCount {
+				t.Fatalf("want %d records, got %d: %s", tt.wantCount, got, raw)
+			}
+		})
+	}
+}
+
 // ClusterCache.syncs completes the navigable path Cluster → caches → syncs. The
 // discovery anchor that owns the records is NOT a step in it: exactly one exists per
 // cache, so the service resolves it and the query never names it.

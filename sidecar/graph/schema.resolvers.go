@@ -18,7 +18,7 @@ import (
 // Caches is the resolver for the caches field — the caches this cluster owns. A
 // separate beehive read, so it runs only when selected.
 func (r *clusterResolver) Caches(ctx context.Context, obj *domain.Cluster) ([]*domain.ClusterCache, error) {
-	return r.ClusterSvc.Caches().List(ctx, obj.ID)
+	return r.ClusterSvc.Caches().List(ctx, &obj.ID)
 }
 
 // Events is the resolver for the events field — this cluster's event timeline. A
@@ -50,7 +50,7 @@ func (r *clusterCacheResolver) Kinds(ctx context.Context, obj *domain.ClusterCac
 // Syncs is the resolver for the syncs field — this cache's per-kind sync records.
 // Keyed by the cache; the discovery anchor between them is resolved in the service.
 func (r *clusterCacheResolver) Syncs(ctx context.Context, obj *domain.ClusterCache) ([]*domain.ClusterCacheGVRSync, error) {
-	return r.ClusterSvc.Syncs().List(ctx, obj.ID)
+	return r.ClusterSvc.Syncs().List(ctx, &obj.ID)
 }
 
 // Events is the resolver for the events field — this cache's own event timeline.
@@ -180,10 +180,22 @@ func (r *queryResolver) ClusterCache(ctx context.Context, id domain.ObjectID) (*
 	return r.ClusterSvc.Caches().Get(ctx, id)
 }
 
+// ClusterCaches is the resolver for the clusterCaches field — every cache, or one
+// cluster's when scoped. A nil clusterID is the unscoped read, not a missing argument.
+func (r *queryResolver) ClusterCaches(ctx context.Context, clusterID *domain.ObjectID) ([]*domain.ClusterCache, error) {
+	return r.ClusterSvc.Caches().List(ctx, clusterID)
+}
+
 // ClusterCacheGVRSync is the resolver for the clusterCacheGVRSync field. An
 // unknown or deletion-pending id is null per the schema, not an error.
 func (r *queryResolver) ClusterCacheGVRSync(ctx context.Context, id domain.ObjectID) (*domain.ClusterCacheGVRSync, error) {
 	return r.ClusterSvc.Syncs().Get(ctx, id)
+}
+
+// ClusterCacheGVRSyncs is the resolver for the clusterCacheGVRSyncs field — every
+// per-kind record, or one cache's when scoped.
+func (r *queryResolver) ClusterCacheGVRSyncs(ctx context.Context, cacheID *domain.ObjectID) ([]*domain.ClusterCacheGVRSync, error) {
+	return r.ClusterSvc.Syncs().List(ctx, cacheID)
 }
 
 // AuthState is the resolver for the authState field. auth.State binds directly to the

@@ -75,7 +75,7 @@ func TestCachesList(t *testing.T) {
 	second := seedActiveCache(t, s, coreCC, mine, "uid-new")
 	seedActiveCache(t, s, coreCC, other, "uid-beta")
 
-	got, err := s.Caches().List(ctx, mine)
+	got, err := s.Caches().List(ctx, &mine)
 	require.NoError(t, err)
 	require.Len(t, got, 2, "both of this cluster's identities, and no other cluster's")
 
@@ -88,6 +88,11 @@ func TestCachesList(t *testing.T) {
 	require.Contains(t, byID, domain.ClusterCacheID(second))
 	assert.Equal(t, "uid-old", byID[domain.ClusterCacheID(first)].ServerUID)
 	assert.Equal(t, "uid-new", byID[domain.ClusterCacheID(second)].ServerUID)
+
+	// Unscoped: every cluster's caches, which is what the plural root field serves.
+	all, err := s.Caches().List(ctx, nil)
+	require.NoError(t, err)
+	assert.Len(t, all, 3, "both of this cluster's plus the other cluster's")
 
 	// Activeness is not a property of the list — it is the join against the parent's
 	// last-probed UID, which seedActiveCache stamped to the newest identity.

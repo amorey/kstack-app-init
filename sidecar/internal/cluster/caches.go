@@ -64,12 +64,20 @@ func (a cachesAPI) Get(ctx context.Context, id domain.ClusterCacheID) (*domain.C
 	return &cc, nil
 }
 
-// List implements Caches — the caches owned by one cluster, listed off the owner
-// edge. A cluster usually has one; a UID migration leaves the superseded cache in
-// place until its subtree drains, which is why this is a list. Deletion-pending
-// records are omitted, matching Clusters().List.
-func (a cachesAPI) List(ctx context.Context, clusterID domain.ClusterID) ([]*domain.ClusterCache, error) {
-	objs, err := a.s.cacheClient.ListOwnedObjects(ctx, beehive.ObjectID(clusterID), beehive.LoadOwner())
+// List implements Caches — one cluster's caches off the owner edge, or every tracked
+// cache when clusterID is nil. A cluster usually has one; a UID migration leaves the
+// superseded cache in place until its subtree drains, which is why this is a list.
+// Deletion-pending records are omitted, matching Clusters().List.
+func (a cachesAPI) List(ctx context.Context, clusterID *domain.ClusterID) ([]*domain.ClusterCache, error) {
+	var (
+		objs []*beehive.Object[domain.ClusterCacheSpec, domain.ClusterCacheStatus]
+		err  error
+	)
+	if clusterID != nil {
+		objs, err = a.s.cacheClient.ListOwnedObjects(ctx, beehive.ObjectID(*clusterID), beehive.LoadOwner())
+	} else {
+		objs, err = a.s.cacheClient.List(ctx, beehive.LoadOwner())
+	}
 	if err != nil {
 		return nil, err
 	}

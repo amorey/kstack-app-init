@@ -424,10 +424,10 @@ func (f fakeCaches) Get(_ context.Context, id domain.ClusterCacheID) (*domain.Cl
 	return nil, nil
 }
 
-func (f fakeCaches) List(_ context.Context, clusterID domain.ClusterID) ([]*domain.ClusterCache, error) {
+func (f fakeCaches) List(_ context.Context, clusterID *domain.ClusterID) ([]*domain.ClusterCache, error) {
 	var out []*domain.ClusterCache
 	for _, c := range f.s.cacheSnapshot() {
-		if c.ClusterID == clusterID {
+		if clusterID == nil || c.ClusterID == *clusterID {
 			out = append(out, &c)
 		}
 	}
@@ -461,19 +461,20 @@ func (f fakeSyncs) Get(_ context.Context, id domain.ClusterCacheGVRSyncID) (*dom
 	return nil, nil
 }
 
-// List mirrors Watch's scoping: the records whose anchor belongs to this cache.
-func (f fakeSyncs) List(_ context.Context, cacheID domain.ClusterCacheID) ([]*domain.ClusterCacheGVRSync, error) {
+// List mirrors Watch's scoping: the records whose anchor belongs to this cache, or
+// every record when unscoped.
+func (f fakeSyncs) List(_ context.Context, cacheID *domain.ClusterCacheID) ([]*domain.ClusterCacheGVRSync, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
 	var want domain.ClusterCacheGVRDiscoveryID
 	for i := range f.s.discoveries {
-		if f.s.discoveries[i].CacheID == cacheID {
+		if cacheID != nil && f.s.discoveries[i].CacheID == *cacheID {
 			want = f.s.discoveries[i].ID
 		}
 	}
 	var out []*domain.ClusterCacheGVRSync
 	for i := range f.s.gvrSyncs {
-		if f.s.gvrSyncs[i].DiscoveryID == want {
+		if cacheID == nil || f.s.gvrSyncs[i].DiscoveryID == want {
 			gs := f.s.gvrSyncs[i]
 			out = append(out, &gs)
 		}
