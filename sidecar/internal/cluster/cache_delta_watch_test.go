@@ -59,7 +59,7 @@ func TestClusterDataObjectsWatchNoReReadForOtherKind(t *testing.T) {
 			return nil, nil
 		},
 		func(s string) string { return s },
-		func(_ domain.ChangeType, s *string) string {
+		func(_ domain.FrameType, s *string) string {
 			if s == nil {
 				return "" // the Bookmark; this test only counts reads
 			}
@@ -110,7 +110,7 @@ func TestCacheDeltaWatchBookmarksOnceAcrossReReads(t *testing.T) {
 		},
 		func(context.Context, *store.ClusterDB) ([]string, error) { return items, nil },
 		func(s string) string { return s },
-		func(t domain.ChangeType, s *string) change {
+		func(t domain.FrameType, s *string) change {
 			if s == nil {
 				return change{typ: t}
 			}
@@ -119,18 +119,18 @@ func TestCacheDeltaWatchBookmarksOnceAcrossReReads(t *testing.T) {
 	)
 
 	// Initial state: the one item, then the Bookmark closing it.
-	require.Equal(t, change{typ: domain.ChangeAdded, key: "a"}, testutil.Recv(t, ch, "the snapshot item"))
-	require.Equal(t, change{typ: domain.ChangeBookmark}, testutil.Recv(t, ch, "the Bookmark"))
+	require.Equal(t, change{typ: domain.FrameAdded, key: "a"}, testutil.Recv(t, ch, "the snapshot item"))
+	require.Equal(t, change{typ: domain.FrameBookmark}, testutil.Recv(t, ch, "the Bookmark"))
 
 	// A second read delivers a plain Added — no second Bookmark ahead of it.
 	items = []string{"a", "b"}
 	cdb.ObjectsNotifyResource("apps/v1", "deployments")
-	require.Equal(t, change{typ: domain.ChangeAdded, key: "b"}, testutil.Recv(t, ch, "the live change"))
+	require.Equal(t, change{typ: domain.FrameAdded, key: "b"}, testutil.Recv(t, ch, "the live change"))
 }
 
 // change is a minimal stand-in for the ClusterData*Change wrappers: the type plus the
 // entity's key, or an empty key for the entity-less Bookmark.
 type change struct {
-	typ domain.ChangeType
+	typ domain.FrameType
 	key string
 }

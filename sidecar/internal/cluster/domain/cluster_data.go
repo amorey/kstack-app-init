@@ -51,7 +51,7 @@ type ClusterDataKind struct {
 // late frame from a superseded cache (one still draining after a cache/context switch).
 // Binds 1:1 to the GraphQL ClusterDataKindWatchFrame.
 type ClusterDataKindWatchFrame struct {
-	Type ChangeType
+	Type FrameType
 	// Kind is nil on a Bookmark.
 	Kind    *ClusterDataKind
 	CacheID ClusterCacheID
@@ -96,7 +96,7 @@ type ClusterDataEvent struct {
 // watching the active cache can reject a late frame from a superseded cache. Binds 1:1
 // to the GraphQL ClusterDataEventWatchFrame.
 type ClusterDataEventWatchFrame struct {
-	Type ChangeType
+	Type FrameType
 	// Event is nil on a Bookmark.
 	Event   *ClusterDataEvent
 	CacheID ClusterCacheID
@@ -143,7 +143,7 @@ type ClusterDataObject struct {
 // previous kind's still-draining subscription. Binds 1:1 to the GraphQL
 // ClusterDataObjectWatchFrame.
 type ClusterDataObjectWatchFrame struct {
-	Type ChangeType
+	Type FrameType
 	// Object is nil on a Bookmark.
 	Object     *ClusterDataObject
 	CacheID    ClusterCacheID

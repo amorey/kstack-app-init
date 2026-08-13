@@ -46,7 +46,7 @@ func gvrSyncAnchorFilter(
 		// frames — it would declare the snapshot complete while part of it is still
 		// undecided. Queued behind them (past the cap too: losing it would leave the
 		// client loading forever, which is worse than one frame over budget).
-		if c.Type == domain.ChangeBookmark {
+		if c.Type == domain.FrameBookmark {
 			if len(undecided) > 0 {
 				undecided = append(undecided, c)
 				return nil
@@ -80,7 +80,7 @@ func gvrSyncAnchorFilter(
 		// superseded frame ahead of its successor is harmless.
 		var out []domain.ClusterCacheGVRSyncWatchFrame
 		for _, held := range undecided {
-			if held.Type == domain.ChangeBookmark || beehive.ObjectID(held.Sync.DiscoveryID) == anchor {
+			if held.Type == domain.FrameBookmark || beehive.ObjectID(held.Sync.DiscoveryID) == anchor {
 				out = append(out, held)
 			}
 		}
@@ -137,8 +137,8 @@ func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-c
 		return nil, err
 	}
 	return filterChan(ctx, watchListChan(ctx, "ClusterCacheGVRSync", snap, src,
-		func(t domain.ChangeType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]) domain.ClusterCacheGVRSyncWatchFrame {
-			if t == domain.ChangeBookmark {
+		func(t domain.FrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]) domain.ClusterCacheGVRSyncWatchFrame {
+			if t == domain.FrameBookmark {
 				return domain.ClusterCacheGVRSyncWatchFrame{Type: t}
 			}
 			if obj == nil {

@@ -145,7 +145,7 @@ func TestServiceWatchEmitsSnapshotThenDeltas(t *testing.T) {
 
 	// Snapshot: one Added change for the seeded cluster, closed by the Bookmark.
 	seed := recv(t, ch)
-	assert.Equal(t, domain.ChangeAdded, seed.Type)
+	assert.Equal(t, domain.FrameAdded, seed.Type)
 	require.NotNil(t, seed.Cluster)
 	assert.Equal(t, id, seed.Cluster.ID)
 	bm := recv(t, ch)
@@ -161,7 +161,7 @@ func TestServiceWatchEmitsSnapshotThenDeltas(t *testing.T) {
 		ev := recvBy(t, ch, deadline)
 		require.NotNil(t, ev.Cluster)
 		if !ev.Cluster.Spec.SyncEnabled {
-			assert.Equal(t, domain.ChangeModified, ev.Type)
+			assert.Equal(t, domain.FrameModified, ev.Type)
 			return
 		}
 	}

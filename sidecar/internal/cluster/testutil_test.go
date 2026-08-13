@@ -46,9 +46,9 @@ func recv[T any](t *testing.T, ch <-chan T) T {
 // every such watch sends exactly one, after the last snapshot object and before the
 // first live change. `entity` is the change's entity field — the caller reads it,
 // since its name differs per kind — and must be nil.
-func requireBookmark(t *testing.T, typ domain.ChangeType, entity any) {
+func requireBookmark(t *testing.T, typ domain.FrameType, entity any) {
 	t.Helper()
-	require.Equal(t, domain.ChangeBookmark, typ)
+	require.Equal(t, domain.FrameBookmark, typ)
 	require.Nil(t, entity)
 }
 

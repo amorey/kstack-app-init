@@ -18,7 +18,7 @@
 #
 # --- Shared vocabulary ---
 # The scalars and the kind-agnostic projections (Condition, Event, Schedule,
-# ChangeType) every noun's surface reuses. A type only one noun uses belongs in that
+# FrameType) every noun's surface reuses. A type only one noun uses belongs in that
 # noun's section, however generic its name reads.
 
 "An ISO-8601 encoded UTC date string."
@@ -158,7 +158,7 @@ watch replays the current set as `Added` changes (the snapshot), closes it with 
 `Bookmark`, then streams live changes. A `Deleted` change carries the object's
 last-known state; the client keys on its `id`.
 """
-enum ChangeType {
+enum FrameType {
   Added
   Modified
   Deleted
@@ -346,7 +346,7 @@ type NonResourceRule {
 "One frame on the `clustersWatch` stream: a change and the cluster it affected, or the `Bookmark` closing the snapshot."
 type ClusterWatchFrame {
   "Whether this cluster was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: ChangeType!
+  type: FrameType!
   "The affected cluster. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
   cluster: Cluster
 }
@@ -428,7 +428,7 @@ type ClusterCacheStats {
 "One frame on the `clusterCachesWatch` stream: a change and the cache it affected, or the `Bookmark` closing the snapshot."
 type ClusterCacheWatchFrame {
   "Whether this cache was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: ChangeType!
+  type: FrameType!
   "The affected cache. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
   cache: ClusterCache
 }
@@ -495,7 +495,7 @@ type ClusterCacheGVRDiscoveryStats {
 "One frame on the `clusterCacheGVRDiscoveriesWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
 type ClusterCacheGVRDiscoveryWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: ChangeType!
+  type: FrameType!
   "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
   discovery: ClusterCacheGVRDiscovery
 }
@@ -569,7 +569,7 @@ type ClusterCacheGVRSyncStats {
 "One frame on the `clusterCacheGVRSyncsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
 type ClusterCacheGVRSyncWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: ChangeType!
+  type: FrameType!
   "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
   sync: ClusterCacheGVRSync
 }
@@ -717,7 +717,7 @@ type ClusterDataObject {
 "One frame on the `clusterDataKindsWatch` stream: a change and the kind it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
 type ClusterDataKindWatchFrame {
   "Whether this kind was added (incl. the on-subscribe snapshot), modified (chiefly a `count` change), or deleted."
-  type: ChangeType!
+  type: FrameType!
   "The affected kind. On `Deleted`, its last-known row; the client keys on `apiVersion` + `resource`. Null on `Bookmark`."
   kind: ClusterDataKind
   """
@@ -731,7 +731,7 @@ type ClusterDataKindWatchFrame {
 "One frame on the `clusterDataEventsWatch` stream: a change and the event it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
 type ClusterDataEventWatchFrame {
   "Whether this event was added (incl. the on-subscribe snapshot), modified (chiefly a `count`/`lastSeen` change as it re-fires), or deleted."
-  type: ChangeType!
+  type: FrameType!
   "The affected event. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
   event: ClusterDataEvent
   """
@@ -745,7 +745,7 @@ type ClusterDataEventWatchFrame {
 "One frame on the `clusterDataObjectsWatch` stream: a change and the object it affected, or the `Bookmark` closing the snapshot. Either way it carries its (cache, kind) provenance."
 type ClusterDataObjectWatchFrame {
   "Whether this object was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: ChangeType!
+  type: FrameType!
   "The affected object. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
   object: ClusterDataObject
   """

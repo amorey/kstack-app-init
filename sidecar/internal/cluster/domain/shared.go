@@ -293,24 +293,26 @@ type Schedule struct {
 	Probing bool `json:"probing"`
 }
 
-// ChangeType classifies a delta-watch change, mirroring a Kubernetes watch event. The
+// FrameType classifies one frame on a delta watch, mirroring a Kubernetes watch event.
+// Named for the frame rather than the change because Bookmark is not a change: the
+// values are what a frame can BE, and only three of the four carry an entity. The
 // Added/Modified/Deleted string values are identical to beehive's, so the watch pumps map
 // beehive→domain with a plain conversion; it is a defined type (not an alias of
 // beehive.ChangeType, which aliases into an internal package gqlgen can't import) so the
-// GraphQL ChangeType enum binds straight to it — the external-enum pattern used for
+// GraphQL FrameType enum binds straight to it — the external-enum pattern used for
 // EventType/ConditionStatus.
-type ChangeType string
+type FrameType string
 
 const (
-	ChangeAdded    ChangeType = "Added"
-	ChangeModified ChangeType = "Modified"
-	ChangeDeleted  ChangeType = "Deleted"
-	// ChangeBookmark closes the on-subscribe snapshot: exactly one per stream, after the
+	FrameAdded    FrameType = "Added"
+	FrameModified FrameType = "Modified"
+	FrameDeleted  FrameType = "Deleted"
+	// FrameBookmark closes the on-subscribe snapshot: exactly one per stream, after the
 	// last snapshot object and before the first live change. It carries no object — the
-	// one case for which every change wrapper's entity is a pointer — so a consumer must
-	// skip it rather than key on it.
+	// one case for which every frame's entity is a pointer — so a consumer must skip it
+	// rather than key on it.
 	// See docs/adr/2026-08-09-delta-watch-protocol.md.
-	ChangeBookmark ChangeType = "Bookmark"
+	FrameBookmark FrameType = "Bookmark"
 )
 
 // TimePtrEqual compares two optional timestamps: both nil is equal, and a present

@@ -58,7 +58,7 @@ func TestServiceWatchGVRDiscoveriesEmitsChildren(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		ev := recvBy(t, ch, deadline)
-		assert.Equal(t, domain.ChangeAdded, ev.Type)
+		assert.Equal(t, domain.FrameAdded, ev.Type)
 		require.NotNil(t, ev.Discovery)
 		assert.Equal(t, domain.ClusterCacheGVRDiscoveryID(child.ID), ev.Discovery.ID)
 		assert.Equal(t, domain.ClusterCacheID(cacheID), ev.Discovery.CacheID) // resolved from the owner edge

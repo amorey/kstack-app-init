@@ -30,25 +30,25 @@ import (
 // at once; the trailing hard Deleted repeats idempotently). beehive's terminal Failed
 // change ends the stream after a log line. Out closes on exit.
 //
-// fn is called with a nil obj two ways, and must tell them apart: on ChangeBookmark
-// (once, between snapshot and deltas) it must return a change carrying NO entity; on a
+// fn is called with a nil obj two ways, and must tell them apart: on FrameBookmark
+// (once, between snapshot and deltas) it must return a frame carrying NO entity; on a
 // Deleted whose final state could not be decoded it returns the removal by id alone.
 func watchListChan[Spec, Status, Out any](
 	ctx context.Context,
 	kind string,
 	snap beehive.ObjectListSnapshot[Spec, Status],
 	src <-chan beehive.ObjectChange[Spec, Status],
-	fn func(domain.ChangeType, beehive.ObjectID, *beehive.Object[Spec, Status]) Out,
+	fn func(domain.FrameType, beehive.ObjectID, *beehive.Object[Spec, Status]) Out,
 ) <-chan Out {
 	out := make(chan Out, 1)
 	go func() {
 		defer close(out)
-		// beehive.ChangeType and ChangeType share string values by construction.
-		domainType := func(t beehive.ChangeType, obj *beehive.Object[Spec, Status]) domain.ChangeType {
+		// beehive.ChangeType and domain.FrameType share string values by construction.
+		domainType := func(t beehive.ChangeType, obj *beehive.Object[Spec, Status]) domain.FrameType {
 			if obj != nil && obj.DeletionRequestedAt != nil {
-				return domain.ChangeDeleted
+				return domain.FrameDeleted
 			}
-			return domain.ChangeType(t)
+			return domain.FrameType(t)
 		}
 		for _, obj := range snap.Objects {
 			if !send(ctx, out, fn(domainType(beehive.Added, obj), obj.ID, obj)) {
@@ -56,7 +56,7 @@ func watchListChan[Spec, Status, Out any](
 			}
 		}
 		// Everything from here is a live change, not initial state.
-		if !send(ctx, out, fn(domain.ChangeBookmark, 0, nil)) {
+		if !send(ctx, out, fn(domain.FrameBookmark, 0, nil)) {
 			return
 		}
 		for {

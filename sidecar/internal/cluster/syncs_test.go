@@ -122,7 +122,7 @@ func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {
 	require.NoError(t, err)
 
 	got := recvGVRSyncFrame(t, ch)
-	assert.Equal(t, domain.ChangeAdded, got.Type)
+	assert.Equal(t, domain.FrameAdded, got.Type)
 	assert.Equal(t, "deployments", got.Sync.Spec.Resource)
 	assert.Equal(t, domain.ClusterCacheGVRDiscoveryID(myDiscovery), got.Sync.DiscoveryID,
 		"the record must carry its owning discovery anchor, the key a client joins on")
@@ -165,7 +165,7 @@ func TestWatchGVRSyncsResolvesAnAnchorCreatedAfterSubscribe(t *testing.T) {
 	seedGVRSync(t, s, discoveryID, "apps/v1", "deployments")
 
 	got := recvGVRSyncFrame(t, ch)
-	assert.Equal(t, domain.ChangeAdded, got.Type)
+	assert.Equal(t, domain.FrameAdded, got.Type)
 	assert.Equal(t, "deployments", got.Sync.Spec.Resource)
 	assert.Equal(t, domain.ClusterCacheGVRDiscoveryID(discoveryID), got.Sync.DiscoveryID)
 }
@@ -349,9 +349,9 @@ func TestGVRSyncAnchorFilterForwardsTheBookmark(t *testing.T) {
 		func() (beehive.ObjectID, error) { t.Fatal("must not need a lookup"); return 0, nil },
 		func(error) { t.Fatal("no read failed") },
 	)
-	out := keep(domain.ClusterCacheGVRSyncWatchFrame{Type: domain.ChangeBookmark})
+	out := keep(domain.ClusterCacheGVRSyncWatchFrame{Type: domain.FrameBookmark})
 	require.Len(t, out, 1)
-	require.Equal(t, domain.ChangeBookmark, out[0].Type)
+	require.Equal(t, domain.FrameBookmark, out[0].Type)
 }
 
 // The Bookmark must never overtake frames held during a read outage: it says the initial
@@ -368,21 +368,21 @@ func TestGVRSyncAnchorFilterHoldsTheBookmarkBehindUndecidedFrames(t *testing.T) 
 
 	fail = true
 	require.Empty(t, keep(gvrSyncFrameOwnedBy(91)), "undecidable, so held")
-	require.Empty(t, keep(domain.ClusterCacheGVRSyncWatchFrame{Type: domain.ChangeBookmark}),
+	require.Empty(t, keep(domain.ClusterCacheGVRSyncWatchFrame{Type: domain.FrameBookmark}),
 		"the Bookmark waits behind the snapshot frame it would otherwise close over")
 
 	// The read recovers: the held frame comes out first, its Bookmark behind it.
 	fail = false
 	out := keep(gvrSyncFrameOwnedBy(91))
 	require.Len(t, out, 3)
-	require.Equal(t, domain.ChangeAdded, out[0].Type)
-	require.Equal(t, domain.ChangeBookmark, out[1].Type)
-	require.Equal(t, domain.ChangeAdded, out[2].Type)
+	require.Equal(t, domain.FrameAdded, out[0].Type)
+	require.Equal(t, domain.FrameBookmark, out[1].Type)
+	require.Equal(t, domain.FrameAdded, out[2].Type)
 }
 
 func gvrSyncFrameOwnedBy(discoveryID beehive.ObjectID) domain.ClusterCacheGVRSyncWatchFrame {
 	return domain.ClusterCacheGVRSyncWatchFrame{
-		Type: domain.ChangeAdded,
+		Type: domain.FrameAdded,
 		Sync: &domain.ClusterCacheGVRSync{DiscoveryID: domain.ClusterCacheGVRDiscoveryID(discoveryID)},
 	}
 }

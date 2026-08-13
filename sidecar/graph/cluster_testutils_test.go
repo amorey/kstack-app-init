@@ -224,19 +224,19 @@ func copySlice[T any](f *fakeClusterService, src *[]T) []T {
 
 func (f fakeClusters) Watch(ctx context.Context) (<-chan domain.ClusterWatchFrame, error) {
 	return snapshotChan(ctx, f.s.snapshot(), func(c **domain.Cluster) domain.ClusterWatchFrame {
-		return domain.ClusterWatchFrame{Type: domain.ChangeAdded, Cluster: *c}
+		return domain.ClusterWatchFrame{Type: domain.FrameAdded, Cluster: *c}
 	}), nil
 }
 
 func (f fakeCaches) Watch(ctx context.Context) (<-chan domain.ClusterCacheWatchFrame, error) {
 	return snapshotChan(ctx, f.s.cacheSnapshot(), func(c *domain.ClusterCache) domain.ClusterCacheWatchFrame {
-		return domain.ClusterCacheWatchFrame{Type: domain.ChangeAdded, Cache: c}
+		return domain.ClusterCacheWatchFrame{Type: domain.FrameAdded, Cache: c}
 	}), nil
 }
 
 func (f fakeDiscovery) Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRDiscoveryWatchFrame, error) {
 	return snapshotChan(ctx, copySlice(f.s, &f.s.discoveries), func(d *domain.ClusterCacheGVRDiscovery) domain.ClusterCacheGVRDiscoveryWatchFrame {
-		return domain.ClusterCacheGVRDiscoveryWatchFrame{Type: domain.ChangeAdded, Discovery: d}
+		return domain.ClusterCacheGVRDiscoveryWatchFrame{Type: domain.FrameAdded, Discovery: d}
 	}), nil
 }
 
@@ -298,7 +298,7 @@ func (f fakeSyncs) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-
 	}
 	f.s.mu.Unlock()
 	return snapshotChan(ctx, scoped, func(gs *domain.ClusterCacheGVRSync) domain.ClusterCacheGVRSyncWatchFrame {
-		return domain.ClusterCacheGVRSyncWatchFrame{Type: domain.ChangeAdded, Sync: gs}
+		return domain.ClusterCacheGVRSyncWatchFrame{Type: domain.FrameAdded, Sync: gs}
 	}), nil
 }
 
@@ -361,7 +361,7 @@ func (f fakeData) WatchKinds(ctx context.Context, clusterID domain.ClusterID, _ 
 	f.s.mu.Unlock()
 	ch := make(chan domain.ClusterDataKindWatchFrame, len(snap))
 	for _, k := range snap {
-		ch <- domain.ClusterDataKindWatchFrame{Type: domain.ChangeAdded, Kind: &k}
+		ch <- domain.ClusterDataKindWatchFrame{Type: domain.FrameAdded, Kind: &k}
 	}
 	go func() {
 		<-ctx.Done()
@@ -376,7 +376,7 @@ func (f fakeData) WatchEvents(ctx context.Context, clusterID domain.ClusterID, _
 	f.s.mu.Unlock()
 	ch := make(chan domain.ClusterDataEventWatchFrame, len(snap))
 	for _, e := range snap {
-		ch <- domain.ClusterDataEventWatchFrame{Type: domain.ChangeAdded, Event: &e}
+		ch <- domain.ClusterDataEventWatchFrame{Type: domain.FrameAdded, Event: &e}
 	}
 	go func() {
 		<-ctx.Done()
@@ -391,7 +391,7 @@ func (f fakeData) WatchObjects(ctx context.Context, clusterID domain.ClusterID, 
 	f.s.mu.Unlock()
 	ch := make(chan domain.ClusterDataObjectWatchFrame, len(snap))
 	for _, o := range snap {
-		ch <- domain.ClusterDataObjectWatchFrame{Type: domain.ChangeAdded, Object: &o}
+		ch <- domain.ClusterDataObjectWatchFrame{Type: domain.FrameAdded, Object: &o}
 	}
 	go func() {
 		<-ctx.Done()

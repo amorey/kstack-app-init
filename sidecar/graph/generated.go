@@ -3768,15 +3768,15 @@ func (ec *executionContext) _ClusterCacheGVRDiscoveryWatchFrame_type(ctx context
 			return obj.Type, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ChangeType) graphql.Marshaler {
-			return ec.marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐChangeType(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v domain.FrameType) graphql.Marshaler {
+			return ec.marshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheGVRDiscoveryWatchFrame_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCacheGVRDiscoveryWatchFrame", field, false, false, errors.New("field of type ChangeType does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterCacheGVRDiscoveryWatchFrame", field, false, false, errors.New("field of type FrameType does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCacheGVRDiscoveryWatchFrame_discovery(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterCacheGVRDiscoveryWatchFrame) (ret graphql.Marshaler) {
@@ -4170,15 +4170,15 @@ func (ec *executionContext) _ClusterCacheGVRSyncWatchFrame_type(ctx context.Cont
 			return obj.Type, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ChangeType) graphql.Marshaler {
-			return ec.marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐChangeType(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v domain.FrameType) graphql.Marshaler {
+			return ec.marshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheGVRSyncWatchFrame_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCacheGVRSyncWatchFrame", field, false, false, errors.New("field of type ChangeType does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterCacheGVRSyncWatchFrame", field, false, false, errors.New("field of type FrameType does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCacheGVRSyncWatchFrame_sync(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterCacheGVRSyncWatchFrame) (ret graphql.Marshaler) {
@@ -4510,15 +4510,15 @@ func (ec *executionContext) _ClusterCacheWatchFrame_type(ctx context.Context, fi
 			return obj.Type, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ChangeType) graphql.Marshaler {
-			return ec.marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐChangeType(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v domain.FrameType) graphql.Marshaler {
+			return ec.marshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheWatchFrame_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCacheWatchFrame", field, false, false, errors.New("field of type ChangeType does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterCacheWatchFrame", field, false, false, errors.New("field of type FrameType does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCacheWatchFrame_cache(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterCacheWatchFrame) (ret graphql.Marshaler) {
@@ -4795,15 +4795,15 @@ func (ec *executionContext) _ClusterDataEventWatchFrame_type(ctx context.Context
 			return obj.Type, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ChangeType) graphql.Marshaler {
-			return ec.marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐChangeType(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v domain.FrameType) graphql.Marshaler {
+			return ec.marshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterDataEventWatchFrame_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterDataEventWatchFrame", field, false, false, errors.New("field of type ChangeType does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterDataEventWatchFrame", field, false, false, errors.New("field of type FrameType does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterDataEventWatchFrame_event(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterDataEventWatchFrame) (ret graphql.Marshaler) {
@@ -5011,15 +5011,15 @@ func (ec *executionContext) _ClusterDataKindWatchFrame_type(ctx context.Context,
 			return obj.Type, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ChangeType) graphql.Marshaler {
-			return ec.marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐChangeType(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v domain.FrameType) graphql.Marshaler {
+			return ec.marshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterDataKindWatchFrame_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterDataKindWatchFrame", field, false, false, errors.New("field of type ChangeType does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterDataKindWatchFrame", field, false, false, errors.New("field of type FrameType does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterDataKindWatchFrame_kind(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterDataKindWatchFrame) (ret graphql.Marshaler) {
@@ -5250,15 +5250,15 @@ func (ec *executionContext) _ClusterDataObjectWatchFrame_type(ctx context.Contex
 			return obj.Type, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ChangeType) graphql.Marshaler {
-			return ec.marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐChangeType(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v domain.FrameType) graphql.Marshaler {
+			return ec.marshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterDataObjectWatchFrame_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterDataObjectWatchFrame", field, false, false, errors.New("field of type ChangeType does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterDataObjectWatchFrame", field, false, false, errors.New("field of type FrameType does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterDataObjectWatchFrame_object(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterDataObjectWatchFrame) (ret graphql.Marshaler) {
@@ -5996,15 +5996,15 @@ func (ec *executionContext) _ClusterWatchFrame_type(ctx context.Context, field g
 			return obj.Type, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v domain.ChangeType) graphql.Marshaler {
-			return ec.marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐChangeType(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v domain.FrameType) graphql.Marshaler {
+			return ec.marshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterWatchFrame_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterWatchFrame", field, false, false, errors.New("field of type ChangeType does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterWatchFrame", field, false, false, errors.New("field of type FrameType does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterWatchFrame_cluster(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterWatchFrame) (ret graphql.Marshaler) {
@@ -12119,23 +12119,6 @@ func (ec *executionContext) marshalNBoolean2bool(ctx context.Context, sel ast.Se
 	return res
 }
 
-func (ec *executionContext) unmarshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐChangeType(ctx context.Context, v any) (domain.ChangeType, error) {
-	tmp, err := graphql.UnmarshalString(v)
-	res := domain.ChangeType(tmp)
-	return res, graphql.ErrorOnPath(ctx, err)
-}
-
-func (ec *executionContext) marshalNChangeType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐChangeType(ctx context.Context, sel ast.SelectionSet, v domain.ChangeType) graphql.Marshaler {
-	_ = sel
-	res := graphql.MarshalString(string(v))
-	if res == graphql.Null {
-		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
-			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
-		}
-	}
-	return res
-}
-
 func (ec *executionContext) marshalNChatChunk2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatChunk(ctx context.Context, sel ast.SelectionSet, v model.ChatChunk) graphql.Marshaler {
 	return ec._ChatChunk(ctx, sel, &v)
 }
@@ -12529,6 +12512,23 @@ func (ec *executionContext) unmarshalNEventType2githubᚗcomᚋamoreyᚋbeehive�
 }
 
 func (ec *executionContext) marshalNEventType2githubᚗcomᚋamoreyᚋbeehiveᚐEventType(ctx context.Context, sel ast.SelectionSet, v beehive.EventType) graphql.Marshaler {
+	_ = sel
+	res := graphql.MarshalString(string(v))
+	if res == graphql.Null {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+	}
+	return res
+}
+
+func (ec *executionContext) unmarshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx context.Context, v any) (domain.FrameType, error) {
+	tmp, err := graphql.UnmarshalString(v)
+	res := domain.FrameType(tmp)
+	return res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) marshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx context.Context, sel ast.SelectionSet, v domain.FrameType) graphql.Marshaler {
 	_ = sel
 	res := graphql.MarshalString(string(v))
 	if res == graphql.Null {

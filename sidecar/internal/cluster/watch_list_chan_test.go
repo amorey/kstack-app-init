@@ -31,7 +31,7 @@ import (
 // frame is what the tests fold each change into: the type plus the id, so a
 // Bookmark (which carries no object) is distinguishable from an object change.
 type frame struct {
-	typ domain.ChangeType
+	typ domain.FrameType
 	id  beehive.ObjectID
 }
 
@@ -54,7 +54,7 @@ func runWatchList(
 		snap.Objects = append(snap.Objects, &beehive.Object[testSpec, testStatus]{ID: id})
 	}
 	return watchListChan(ctx, "Test", snap, src,
-		func(t domain.ChangeType, id beehive.ObjectID, _ *beehive.Object[testSpec, testStatus]) frame {
+		func(t domain.FrameType, id beehive.ObjectID, _ *beehive.Object[testSpec, testStatus]) frame {
 			return frame{typ: t, id: id}
 		})
 }
@@ -70,14 +70,14 @@ func TestWatchListChanBookmarksBetweenSnapshotAndDeltas(t *testing.T) {
 	src := make(chan beehive.ObjectChange[testSpec, testStatus])
 	out := runWatchList(ctx, []beehive.ObjectID{1, 2}, src)
 
-	assert.Equal(t, frame{domain.ChangeAdded, 1}, recv(t, out))
-	assert.Equal(t, frame{domain.ChangeAdded, 2}, recv(t, out))
-	assert.Equal(t, frame{typ: domain.ChangeBookmark}, recv(t, out), "the snapshot is closed before any delta")
+	assert.Equal(t, frame{domain.FrameAdded, 1}, recv(t, out))
+	assert.Equal(t, frame{domain.FrameAdded, 2}, recv(t, out))
+	assert.Equal(t, frame{typ: domain.FrameBookmark}, recv(t, out), "the snapshot is closed before any delta")
 
 	src <- beehive.ObjectChange[testSpec, testStatus]{
 		Type: beehive.Modified, ID: 2, Object: &beehive.Object[testSpec, testStatus]{ID: 2},
 	}
-	assert.Equal(t, frame{domain.ChangeModified, 2}, recv(t, out))
+	assert.Equal(t, frame{domain.FrameModified, 2}, recv(t, out))
 }
 
 // An empty collection is the case the Bookmark exists for: with nothing to replay it
@@ -88,7 +88,7 @@ func TestWatchListChanBookmarksAnEmptySnapshotImmediately(t *testing.T) {
 	defer cancel()
 
 	out := runWatchList(ctx, nil, make(chan beehive.ObjectChange[testSpec, testStatus]))
-	assert.Equal(t, frame{typ: domain.ChangeBookmark}, recv(t, out))
+	assert.Equal(t, frame{typ: domain.FrameBookmark}, recv(t, out))
 }
 
 // A deletion-pending object is collapsed to Deleted: List/Get hide tombstones, so the
@@ -99,14 +99,14 @@ func TestWatchListChanCollapsesDeletionPendingToDeleted(t *testing.T) {
 
 	src := make(chan beehive.ObjectChange[testSpec, testStatus])
 	out := runWatchList(ctx, nil, src)
-	require.Equal(t, frame{typ: domain.ChangeBookmark}, recv(t, out))
+	require.Equal(t, frame{typ: domain.FrameBookmark}, recv(t, out))
 
 	at := time.Now()
 	src <- beehive.ObjectChange[testSpec, testStatus]{
 		Type: beehive.Modified, ID: 5,
 		Object: &beehive.Object[testSpec, testStatus]{ID: 5, DeletionRequestedAt: &at},
 	}
-	assert.Equal(t, frame{domain.ChangeDeleted, 5}, recv(t, out),
+	assert.Equal(t, frame{domain.FrameDeleted, 5}, recv(t, out),
 		"a soft-delete reads as Modified upstream but must reach the client as Deleted")
 }
 
@@ -118,7 +118,7 @@ func TestWatchListChanEndsOnFailed(t *testing.T) {
 
 	src := make(chan beehive.ObjectChange[testSpec, testStatus])
 	out := runWatchList(ctx, nil, src)
-	require.Equal(t, frame{typ: domain.ChangeBookmark}, recv(t, out))
+	require.Equal(t, frame{typ: domain.FrameBookmark}, recv(t, out))
 
 	src <- beehive.ObjectChange[testSpec, testStatus]{Type: beehive.Failed, Err: errors.New("watch too old")}
 	testutil.RecvClosed(t, out, "the stream on a terminal Failed change")
@@ -128,7 +128,7 @@ func TestWatchListChanEndsOnFailed(t *testing.T) {
 func TestWatchListChanClosesOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	out := runWatchList(ctx, nil, make(chan beehive.ObjectChange[testSpec, testStatus]))
-	require.Equal(t, frame{typ: domain.ChangeBookmark}, recv(t, out))
+	require.Equal(t, frame{typ: domain.FrameBookmark}, recv(t, out))
 
 	cancel()
 	testutil.RecvClosed(t, out, "the stream on ctx cancel")
