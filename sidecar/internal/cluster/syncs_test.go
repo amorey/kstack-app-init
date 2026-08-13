@@ -121,12 +121,12 @@ func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {
 	ch, err := s.Syncs().Watch(ctx, domain.ClusterCacheID(myCache))
 	require.NoError(t, err)
 
-	got := recvGVRSyncChange(t, ch)
+	got := recvGVRSyncFrame(t, ch)
 	assert.Equal(t, domain.ChangeAdded, got.Type)
 	assert.Equal(t, "deployments", got.Sync.Spec.Resource)
 	assert.Equal(t, domain.ClusterCacheGVRDiscoveryID(myDiscovery), got.Sync.DiscoveryID,
 		"the record must carry its owning discovery anchor, the key a client joins on")
-	bm := recvGVRSyncChange(t, ch)
+	bm := recvGVRSyncFrame(t, ch)
 	requireBookmark(t, bm.Type, bm.Sync)
 
 	// The other cache's identically-named kind must not arrive.
@@ -158,19 +158,19 @@ func TestWatchGVRSyncsResolvesAnAnchorCreatedAfterSubscribe(t *testing.T) {
 	// is empty and its Bookmark arrives at once.
 	ch, err := s.Syncs().Watch(ctx, domain.ClusterCacheID(cacheID))
 	require.NoError(t, err)
-	bm := recvGVRSyncChange(t, ch)
+	bm := recvGVRSyncFrame(t, ch)
 	requireBookmark(t, bm.Type, bm.Sync)
 
 	discoveryID := seedGVRDiscovery(t, s, cacheID)
 	seedGVRSync(t, s, discoveryID, "apps/v1", "deployments")
 
-	got := recvGVRSyncChange(t, ch)
+	got := recvGVRSyncFrame(t, ch)
 	assert.Equal(t, domain.ChangeAdded, got.Type)
 	assert.Equal(t, "deployments", got.Sync.Spec.Resource)
 	assert.Equal(t, domain.ClusterCacheGVRDiscoveryID(discoveryID), got.Sync.DiscoveryID)
 }
 
-func recvGVRSyncChange(t *testing.T, ch <-chan domain.ClusterCacheGVRSyncChange) domain.ClusterCacheGVRSyncChange {
+func recvGVRSyncFrame(t *testing.T, ch <-chan domain.ClusterCacheGVRSyncWatchFrame) domain.ClusterCacheGVRSyncWatchFrame {
 	t.Helper()
 	return testutil.Recv(t, ch, "a gvr sync frame")
 }
@@ -198,20 +198,20 @@ func TestGVRSyncAnchorFilterLooksUpEachAnchorOnce(t *testing.T) {
 
 	// Another cache's kinds, streaming past us before we have an anchor of our own.
 	for range 50 {
-		require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+		require.Empty(t, keep(gvrSyncFrameOwnedBy(77)))
 	}
 	require.Equal(t, 1, lookups, "one lookup decided the whole cache, not one per record")
 
 	// A second cache joins: one more lookup, then memoized too.
 	for range 50 {
-		require.Empty(t, keep(gvrSyncChangeOwnedBy(78)))
+		require.Empty(t, keep(gvrSyncFrameOwnedBy(78)))
 	}
 	require.Equal(t, 2, lookups)
 
 	// Ours appears. It is a fresh id, so it cannot collide with anything ruled out.
 	ours = 91
-	require.Len(t, keep(gvrSyncChangeOwnedBy(91)), 1)
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)), "a rejected anchor stays rejected")
+	require.Len(t, keep(gvrSyncFrameOwnedBy(91)), 1)
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(77)), "a rejected anchor stays rejected")
 }
 
 // A failed read is undecidable, not a rejection: memoizing it would drop that cache's
@@ -240,17 +240,17 @@ func TestGVRSyncAnchorFilterHoldsFramesUntilAReadSucceeds(t *testing.T) {
 	}, func(error) { errs++ })
 
 	fail = true
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(91)), "undecidable, so nothing is emitted yet")
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(91)))
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(91)), "undecidable, so nothing is emitted yet")
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(91)))
 	require.Equal(t, 2, errs)
 
 	// The read works: the two held frames come out ahead of the one being judged.
 	fail = false
-	require.Len(t, keep(gvrSyncChangeOwnedBy(91)), 3,
+	require.Len(t, keep(gvrSyncFrameOwnedBy(91)), 3,
 		"frames held during the outage must be released, not lost")
 
 	// Nothing is held twice.
-	require.Len(t, keep(gvrSyncChangeOwnedBy(91)), 1)
+	require.Len(t, keep(gvrSyncFrameOwnedBy(91)), 1)
 }
 
 // A frame held during an outage that turns out to belong to ANOTHER cache is dropped when
@@ -268,10 +268,10 @@ func TestGVRSyncAnchorFilterDropsHeldFramesOfOtherCaches(t *testing.T) {
 	}, func(error) {})
 
 	fail = true
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(77)))
 
 	fail = false
-	require.Len(t, keep(gvrSyncChangeOwnedBy(91)), 1, "only our own frame comes out")
+	require.Len(t, keep(gvrSyncFrameOwnedBy(91)), 1, "only our own frame comes out")
 }
 
 // The release of held frames must not depend on what the NEXT frame happens to be. On a
@@ -295,17 +295,17 @@ func TestGVRSyncAnchorFilterReleasesHeldFramesOnAnAlreadyRejectedAnchor(t *testi
 	}, func(error) {})
 
 	// Rule an anchor out while the read works — the steady state the memo exists for.
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(77)))
 
 	// Our own kind's only frame lands during an outage.
 	fail = true
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(91)))
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(91)))
 
 	// The read recovers, but the fleet's next frame is one of the rejected cache's.
 	fail = false
-	require.Len(t, keep(gvrSyncChangeOwnedBy(77)), 1,
+	require.Len(t, keep(gvrSyncFrameOwnedBy(77)), 1,
 		"the held frame must come out; nothing else will ever ask for it")
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)), "and only once")
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(77)), "and only once")
 }
 
 // A frame from an already-rejected anchor that arrives DURING an outage is simply dropped:
@@ -322,12 +322,12 @@ func TestGVRSyncAnchorFilterDoesNotHoldFramesItAlreadyRejected(t *testing.T) {
 		return 91, nil
 	}, func(error) {})
 
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(77)))
 	fail = true
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)))
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(77)))
 
 	fail = false
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(77)), "nothing was held, so nothing is released")
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(77)), "nothing was held, so nothing is released")
 }
 
 // A hard Deleted carries no owner edge, so it can't be attributed — forwarded on its id
@@ -340,7 +340,7 @@ func TestGVRSyncAnchorFilterForwardsAnUnattributableDelete(t *testing.T) {
 		func() (beehive.ObjectID, error) { t.Fatal("must not need a lookup"); return 0, nil },
 		func(error) { t.Fatal("no read failed") },
 	)
-	require.Len(t, keep(gvrSyncChangeOwnedBy(0)), 1)
+	require.Len(t, keep(gvrSyncFrameOwnedBy(0)), 1)
 }
 
 // The Bookmark needs no anchor, so with nothing held it passes straight through.
@@ -349,7 +349,7 @@ func TestGVRSyncAnchorFilterForwardsTheBookmark(t *testing.T) {
 		func() (beehive.ObjectID, error) { t.Fatal("must not need a lookup"); return 0, nil },
 		func(error) { t.Fatal("no read failed") },
 	)
-	out := keep(domain.ClusterCacheGVRSyncChange{Type: domain.ChangeBookmark})
+	out := keep(domain.ClusterCacheGVRSyncWatchFrame{Type: domain.ChangeBookmark})
 	require.Len(t, out, 1)
 	require.Equal(t, domain.ChangeBookmark, out[0].Type)
 }
@@ -367,21 +367,21 @@ func TestGVRSyncAnchorFilterHoldsTheBookmarkBehindUndecidedFrames(t *testing.T) 
 	}, func(error) {})
 
 	fail = true
-	require.Empty(t, keep(gvrSyncChangeOwnedBy(91)), "undecidable, so held")
-	require.Empty(t, keep(domain.ClusterCacheGVRSyncChange{Type: domain.ChangeBookmark}),
+	require.Empty(t, keep(gvrSyncFrameOwnedBy(91)), "undecidable, so held")
+	require.Empty(t, keep(domain.ClusterCacheGVRSyncWatchFrame{Type: domain.ChangeBookmark}),
 		"the Bookmark waits behind the snapshot frame it would otherwise close over")
 
 	// The read recovers: the held frame comes out first, its Bookmark behind it.
 	fail = false
-	out := keep(gvrSyncChangeOwnedBy(91))
+	out := keep(gvrSyncFrameOwnedBy(91))
 	require.Len(t, out, 3)
 	require.Equal(t, domain.ChangeAdded, out[0].Type)
 	require.Equal(t, domain.ChangeBookmark, out[1].Type)
 	require.Equal(t, domain.ChangeAdded, out[2].Type)
 }
 
-func gvrSyncChangeOwnedBy(discoveryID beehive.ObjectID) domain.ClusterCacheGVRSyncChange {
-	return domain.ClusterCacheGVRSyncChange{
+func gvrSyncFrameOwnedBy(discoveryID beehive.ObjectID) domain.ClusterCacheGVRSyncWatchFrame {
+	return domain.ClusterCacheGVRSyncWatchFrame{
 		Type: domain.ChangeAdded,
 		Sync: &domain.ClusterCacheGVRSync{DiscoveryID: domain.ClusterCacheGVRDiscoveryID(discoveryID)},
 	}

@@ -960,7 +960,7 @@ func TestClusterDataObjectsWatchServesNativeBody(t *testing.T) {
 }
 
 // clusterDataKindsWatch streams the kind catalog as a delta watch: the resolver
-// adapts the service's ClusterDataKindChange stream to the wire 1:1, so the snapshot
+// adapts the service's ClusterDataKindWatchFrame stream to the wire 1:1, so the snapshot
 // arrives as Added changes carrying the kind's fields (incl. the live count) and the
 // stream stays open for live updates.
 func TestClusterDataKindsWatchEmitsSnapshotAndStaysOpen(t *testing.T) {

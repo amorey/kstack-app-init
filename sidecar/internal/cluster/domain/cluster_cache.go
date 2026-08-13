@@ -86,9 +86,9 @@ type ClusterCache struct {
 	Conditions []Condition
 }
 
-// ClusterCacheChange is the ClusterCache-kind counterpart of ClusterChange, carried
-// on the standalone cache watch. Binds 1:1 to the GraphQL ClusterCacheChange.
-type ClusterCacheChange struct {
+// ClusterCacheWatchFrame is the ClusterCache-kind counterpart of ClusterWatchFrame, carried
+// on the standalone cache watch. Binds 1:1 to the GraphQL ClusterCacheWatchFrame.
+type ClusterCacheWatchFrame struct {
 	Type  ChangeType
 	Cache *ClusterCache
 }
@@ -164,10 +164,10 @@ type ClusterCacheGVRDiscovery struct {
 	Conditions []Condition
 }
 
-// ClusterCacheGVRDiscoveryChange is one delta on the GVR-discovery watch, the third of
+// ClusterCacheGVRDiscoveryWatchFrame is one frame on the GVR-discovery watch, the third of
 // the parallel object streams (clusters, caches, gvr-discoveries). Binds
-// 1:1 to the GraphQL ClusterCacheGVRDiscoveryChange; consumers key on Discovery.ID.
-type ClusterCacheGVRDiscoveryChange struct {
+// 1:1 to the GraphQL ClusterCacheGVRDiscoveryWatchFrame; consumers key on Discovery.ID.
+type ClusterCacheGVRDiscoveryWatchFrame struct {
 	Type      ChangeType
 	Discovery *ClusterCacheGVRDiscovery
 }
@@ -224,9 +224,9 @@ type ClusterCacheGVRSync struct {
 	Conditions []Condition
 }
 
-// ClusterCacheGVRSyncChange is one delta on the cache-scoped per-kind sync watch.
+// ClusterCacheGVRSyncWatchFrame is one frame on the cache-scoped per-kind sync watch.
 // Consumers key on Sync.ID.
-type ClusterCacheGVRSyncChange struct {
+type ClusterCacheGVRSyncWatchFrame struct {
 	Type ChangeType
 	Sync *ClusterCacheGVRSync
 }

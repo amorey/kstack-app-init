@@ -108,11 +108,11 @@ models:
   ChangeType:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ChangeType
 
-  ClusterChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterChange
+  ClusterWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterWatchFrame
 
-  ClusterCacheChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheChange
+  ClusterCacheWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheWatchFrame
 
   ClusterCache:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCache
@@ -152,8 +152,8 @@ models:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRSyncSpec
   ClusterCacheGVRSyncStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRSyncStats
-  ClusterCacheGVRSyncChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRSyncChange
+  ClusterCacheGVRSyncWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRSyncWatchFrame
   ClusterCacheSyncHealth:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheSyncHealth
   SyncedKindRef:
@@ -165,8 +165,8 @@ models:
   ClusterCacheGVRDiscoveryStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRDiscoveryStats
 
-  ClusterCacheGVRDiscoveryChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRDiscoveryChange
+  ClusterCacheGVRDiscoveryWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRDiscoveryWatchFrame
 
   ClusterCacheStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheStats
@@ -177,8 +177,8 @@ models:
   ClusterDataKind:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataKind
 
-  ClusterDataKindChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataKindChange
+  ClusterDataKindWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataKindWatchFrame
 
   ClusterDataEvent:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataEvent
@@ -190,8 +190,8 @@ models:
       lastSeen:
         resolver: true
 
-  ClusterDataEventChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataEventChange
+  ClusterDataEventWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataEventWatchFrame
 
   ClusterDataObject:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataObject
@@ -205,8 +205,8 @@ models:
       creationTimestamp:
         resolver: true
 
-  ClusterDataObjectChange:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataObjectChange
+  ClusterDataObjectWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterDataObjectWatchFrame
 
   # --- Auth ---
   # Bind the GraphQL auth types straight to the auth domain types so the

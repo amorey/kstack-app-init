@@ -71,7 +71,7 @@ func dataKindKey(k domain.ClusterDataKind) string {
 // WatchKinds implements Data: the kind catalog as a delta watch (an object
 // write that changes a count re-emits its kind as Modified). cacheDeltaWatch
 // owns the cache-lifecycle + coalescing loop.
-func (a dataAPI) WatchKinds(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (<-chan domain.ClusterDataKindChange, error) {
+func (a dataAPI) WatchKinds(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (<-chan domain.ClusterDataKindWatchFrame, error) {
 	ref := domain.NewCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheDeltaWatch(ctx, a.s.cacheManager, ref.CacheID, a.s.dataKindsDebounce,
 		catalogSubscribe,
@@ -83,8 +83,8 @@ func (a dataAPI) WatchKinds(ctx context.Context, clusterID domain.ClusterID, cac
 			return toDataKinds(rows), nil
 		},
 		dataKindKey,
-		func(t domain.ChangeType, k *domain.ClusterDataKind) domain.ClusterDataKindChange {
-			return domain.ClusterDataKindChange{Type: t, Kind: k, CacheID: cacheID}
+		func(t domain.ChangeType, k *domain.ClusterDataKind) domain.ClusterDataKindWatchFrame {
+			return domain.ClusterDataKindWatchFrame{Type: t, Kind: k, CacheID: cacheID}
 		},
 	), nil
 }
@@ -143,7 +143,7 @@ func catalogSubscribe(db *store.ClusterDB) (<-chan store.WriteWake, func()) {
 // by UID, on the events-only broker. The read is a bounded window, so an event
 // aging out surfaces as Deleted even though its row may still exist — fine for
 // a "latest events" table.
-func (a dataAPI) WatchEvents(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (<-chan domain.ClusterDataEventChange, error) {
+func (a dataAPI) WatchEvents(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (<-chan domain.ClusterDataEventWatchFrame, error) {
 	ref := domain.NewCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheDeltaWatch(ctx, a.s.cacheManager, ref.CacheID, a.s.dataEventsDebounce,
 		(*store.ClusterDB).EventsSubscribe,
@@ -159,8 +159,8 @@ func (a dataAPI) WatchEvents(ctx context.Context, clusterID domain.ClusterID, ca
 			return events, nil
 		},
 		func(e domain.ClusterDataEvent) string { return e.UID },
-		func(t domain.ChangeType, e *domain.ClusterDataEvent) domain.ClusterDataEventChange {
-			return domain.ClusterDataEventChange{Type: t, Event: e, CacheID: cacheID}
+		func(t domain.ChangeType, e *domain.ClusterDataEvent) domain.ClusterDataEventWatchFrame {
+			return domain.ClusterDataEventWatchFrame{Type: t, Event: e, CacheID: cacheID}
 		},
 	), nil
 }
@@ -168,7 +168,7 @@ func (a dataAPI) WatchEvents(ctx context.Context, clusterID domain.ClusterID, ca
 // WatchObjects implements Data: one kind's cached objects as a delta watch
 // keyed by UID. Each row carries the native body, so an in-place edit surfaces
 // as Modified.
-func (a dataAPI) WatchObjects(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID, apiVersion, resource string) (<-chan domain.ClusterDataObjectChange, error) {
+func (a dataAPI) WatchObjects(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID, apiVersion, resource string) (<-chan domain.ClusterDataObjectWatchFrame, error) {
 	ref := domain.NewCacheRef(beehive.ObjectID(clusterID), beehive.ObjectID(cacheID))
 	return cacheDeltaWatch(ctx, a.s.cacheManager, ref.CacheID, a.s.dataObjectsDebounce,
 		// Keyed to (apiVersion, resource) so unrelated writes don't wake it. The
@@ -189,8 +189,8 @@ func (a dataAPI) WatchObjects(ctx context.Context, clusterID domain.ClusterID, c
 			return objects, nil
 		},
 		func(o domain.ClusterDataObject) string { return o.UID },
-		func(t domain.ChangeType, o *domain.ClusterDataObject) domain.ClusterDataObjectChange {
-			return domain.ClusterDataObjectChange{Type: t, Object: o, CacheID: cacheID, APIVersion: apiVersion, Resource: resource}
+		func(t domain.ChangeType, o *domain.ClusterDataObject) domain.ClusterDataObjectWatchFrame {
+			return domain.ClusterDataObjectWatchFrame{Type: t, Object: o, CacheID: cacheID, APIVersion: apiVersion, Resource: resource}
 		},
 	), nil
 }

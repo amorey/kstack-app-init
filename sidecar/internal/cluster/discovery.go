@@ -24,21 +24,21 @@ import (
 
 // Watch implements Discovery — the discovery counterpart of Caches().Watch,
 // parent CacheID resolved from the owner edge.
-func (a discoveryAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRDiscoveryChange, error) {
+func (a discoveryAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRDiscoveryWatchFrame, error) {
 	snap, src, err := a.s.gvrDiscoveryClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
 		return nil, err
 	}
 	return watchListChan(ctx, "ClusterCacheGVRDiscovery", snap, src,
-		func(t domain.ChangeType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRDiscoverySpec, domain.ClusterCacheGVRDiscoveryStatus]) domain.ClusterCacheGVRDiscoveryChange {
+		func(t domain.ChangeType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRDiscoverySpec, domain.ClusterCacheGVRDiscoveryStatus]) domain.ClusterCacheGVRDiscoveryWatchFrame {
 			if t == domain.ChangeBookmark {
-				return domain.ClusterCacheGVRDiscoveryChange{Type: t}
+				return domain.ClusterCacheGVRDiscoveryWatchFrame{Type: t}
 			}
 			if obj == nil {
-				return domain.ClusterCacheGVRDiscoveryChange{Type: t, Discovery: &domain.ClusterCacheGVRDiscovery{ID: domain.ClusterCacheGVRDiscoveryID(id)}}
+				return domain.ClusterCacheGVRDiscoveryWatchFrame{Type: t, Discovery: &domain.ClusterCacheGVRDiscovery{ID: domain.ClusterCacheGVRDiscoveryID(id)}}
 			}
 			d := buildGVRDiscovery(obj)
-			return domain.ClusterCacheGVRDiscoveryChange{Type: t, Discovery: &d}
+			return domain.ClusterCacheGVRDiscoveryWatchFrame{Type: t, Discovery: &d}
 		}), nil
 }
 

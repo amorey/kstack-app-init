@@ -343,8 +343,8 @@ type NonResourceRule {
   nonResourceUrls: [String!]!
 }
 
-"One change on the `clustersWatch` stream: the affected cluster and what happened to it."
-type ClusterChange {
+"One frame on the `clustersWatch` stream: a change and the cluster it affected, or the `Bookmark` closing the snapshot."
+type ClusterWatchFrame {
   "Whether this cluster was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
   "The affected cluster. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
@@ -425,8 +425,8 @@ type ClusterCacheStats {
   kindCount: Int!
 }
 
-"One change on the `clusterCachesWatch` stream: the affected cache and what happened to it."
-type ClusterCacheChange {
+"One frame on the `clusterCachesWatch` stream: a change and the cache it affected, or the `Bookmark` closing the snapshot."
+type ClusterCacheWatchFrame {
   "Whether this cache was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
   "The affected cache. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
@@ -492,8 +492,8 @@ type ClusterCacheGVRDiscoveryStats {
   resourceCount: Int!
 }
 
-"One change on the `clusterCacheGVRDiscoveriesWatch` stream: the affected record and what happened to it."
-type ClusterCacheGVRDiscoveryChange {
+"One frame on the `clusterCacheGVRDiscoveriesWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
+type ClusterCacheGVRDiscoveryWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
   "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
@@ -566,8 +566,8 @@ type ClusterCacheGVRSyncStats {
   lastLiveAt: Time
 }
 
-"One change on the `clusterCacheGVRSyncsWatch` stream: the affected record and what happened to it."
-type ClusterCacheGVRSyncChange {
+"One frame on the `clusterCacheGVRSyncsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
+type ClusterCacheGVRSyncWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
   "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
@@ -714,8 +714,8 @@ type ClusterDataObject {
   rawJSON: JSON
 }
 
-"One change on the `clusterDataKindsWatch` stream: the affected kind, what happened to it, and which cache it came from."
-type ClusterDataKindChange {
+"One frame on the `clusterDataKindsWatch` stream: a change and the kind it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
+type ClusterDataKindWatchFrame {
   "Whether this kind was added (incl. the on-subscribe snapshot), modified (chiefly a `count` change), or deleted."
   type: ChangeType!
   "The affected kind. On `Deleted`, its last-known row; the client keys on `apiVersion` + `resource`. Null on `Bookmark`."
@@ -728,29 +728,29 @@ type ClusterDataKindChange {
   cacheID: ObjectID!
 }
 
-"One change on the `clusterDataEventsWatch` stream: the affected event, what happened to it, and which cache it came from."
-type ClusterDataEventChange {
+"One frame on the `clusterDataEventsWatch` stream: a change and the event it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
+type ClusterDataEventWatchFrame {
   "Whether this event was added (incl. the on-subscribe snapshot), modified (chiefly a `count`/`lastSeen` change as it re-fires), or deleted."
   type: ChangeType!
   "The affected event. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
   event: ClusterDataEvent
   """
   The cache this frame came from — the frame's provenance, mirroring
-  `ClusterDataKindChange.cacheID`. A client watching the active cache rejects a late
+  `ClusterDataKindWatchFrame.cacheID`. A client watching the active cache rejects a late
   frame from a superseded cache by comparing this against the cache it subscribed for.
   """
   cacheID: ObjectID!
 }
 
-"One change on the `clusterDataObjectsWatch` stream: the affected object, what happened to it, and the (cache, kind) this frame came from."
-type ClusterDataObjectChange {
+"One frame on the `clusterDataObjectsWatch` stream: a change and the object it affected, or the `Bookmark` closing the snapshot. Either way it carries its (cache, kind) provenance."
+type ClusterDataObjectWatchFrame {
   "Whether this object was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: ChangeType!
   "The affected object. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
   object: ClusterDataObject
   """
   The cache this frame came from — the frame's provenance, mirroring
-  `ClusterDataKindChange.cacheID`. A client watching the active cache rejects a late
+  `ClusterDataKindWatchFrame.cacheID`. A client watching the active cache rejects a late
   frame from a superseded cache by comparing this against the cache it subscribed for.
   """
   cacheID: ObjectID!
@@ -857,7 +857,7 @@ type Mutation {
 type Subscription {
   # --- Cluster ---
   "The cluster list as a delta watch, keyed by `cluster.id`. Cache sync status is not here — it streams on `clusterCachesWatch`."
-  clustersWatch: ClusterChange!
+  clustersWatch: ClusterWatchFrame!
 
   "A cluster's event timeline, upserted by `id`; optionally one `category`. Independent of `clustersWatch`."
   clusterEventsWatch(id: ObjectID!, category: String): Event!
@@ -867,16 +867,16 @@ type Subscription {
 
   # --- ClusterCache ---
   "Cache records as a delta watch, keyed by `cache.id` and joined onto clusters by `clusterID`. Carries no ordering guarantee against `clustersWatch`."
-  clusterCachesWatch: ClusterCacheChange!
+  clusterCachesWatch: ClusterCacheWatchFrame!
 
   "Every cache's folded sync verdict as a latest-value stream keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's."
   clusterCacheSyncHealthWatch: ClusterCacheSyncHealth!
 
   "The caches' GVR-discovery records as a delta watch, joined onto caches by `cacheID`. Unscoped: one record per cache."
-  clusterCacheGVRDiscoveriesWatch: ClusterCacheGVRDiscoveryChange!
+  clusterCacheGVRDiscoveriesWatch: ClusterCacheGVRDiscoveryWatchFrame!
 
   "One cache's per-kind sync records as a delta watch, keyed by `sync.id`. Cache-scoped, since there is one record per synced kind."
-  clusterCacheGVRSyncsWatch(cacheID: ObjectID!): ClusterCacheGVRSyncChange!
+  clusterCacheGVRSyncsWatch(cacheID: ObjectID!): ClusterCacheGVRSyncWatchFrame!
 
   "One cache's on-disk contents as a live gauge. A stream, not a `ClusterCache` field, which would freeze at subscribe time."
   clusterCacheStatsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheStats!
@@ -892,13 +892,13 @@ type Subscription {
   clusterDataKindsWatch(
     id: ObjectID!
     cacheID: ObjectID!
-  ): ClusterDataKindChange!
+  ): ClusterDataKindWatchFrame!
 
   "One cache's newest window of cached Kubernetes Events as a delta watch, keyed by `uid`; an event aging out of the window surfaces as `Deleted`. Distinct from `clusterEventsWatch`, which streams kstack's own timeline."
   clusterDataEventsWatch(
     id: ObjectID!
     cacheID: ObjectID!
-  ): ClusterDataEventChange!
+  ): ClusterDataEventWatchFrame!
 
   "One kind's cached objects from a cache as a delta watch, keyed by `uid`. Scoped by `apiVersion` + `resource`, e.g. `\"apps/v1\"` + `\"deployments\"`."
   clusterDataObjectsWatch(
@@ -906,7 +906,7 @@ type Subscription {
     cacheID: ObjectID!
     apiVersion: String!
     resource: String!
-  ): ClusterDataObjectChange!
+  ): ClusterDataObjectWatchFrame!
 
   # --- Chat ---
   "Streams the assistant's reply token-by-token. Completes after a frame with `done: true`."

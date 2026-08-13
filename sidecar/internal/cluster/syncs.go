@@ -33,15 +33,15 @@ import (
 func gvrSyncAnchorFilter(
 	resolve func() (beehive.ObjectID, error),
 	onErr func(error),
-) func(domain.ClusterCacheGVRSyncChange) []domain.ClusterCacheGVRSyncChange {
+) func(domain.ClusterCacheGVRSyncWatchFrame) []domain.ClusterCacheGVRSyncWatchFrame {
 	notOurs := map[beehive.ObjectID]bool{}
 	// Frames received while the anchor could not be read are HELD, not dropped:
 	// beehive re-emits an object only when it changes, so a frame lost in a
 	// transient read error would leave that kind invisible for the subscription's
 	// life. Released once a read succeeds.
-	var undecided []domain.ClusterCacheGVRSyncChange
+	var undecided []domain.ClusterCacheGVRSyncWatchFrame
 
-	return func(c domain.ClusterCacheGVRSyncChange) []domain.ClusterCacheGVRSyncChange {
+	return func(c domain.ClusterCacheGVRSyncWatchFrame) []domain.ClusterCacheGVRSyncWatchFrame {
 		// The Bookmark carries no record to judge, but it must not overtake held
 		// frames — it would declare the snapshot complete while part of it is still
 		// undecided. Queued behind them (past the cap too: losing it would leave the
@@ -51,12 +51,12 @@ func gvrSyncAnchorFilter(
 				undecided = append(undecided, c)
 				return nil
 			}
-			return []domain.ClusterCacheGVRSyncChange{c}
+			return []domain.ClusterCacheGVRSyncWatchFrame{c}
 		}
 		// A hard Deleted carries no owner edge; forward on id alone (removal of an
 		// id the client never added is a no-op).
 		if c.Sync.DiscoveryID == 0 {
-			return []domain.ClusterCacheGVRSyncChange{c}
+			return []domain.ClusterCacheGVRSyncWatchFrame{c}
 		}
 		theirs := beehive.ObjectID(c.Sync.DiscoveryID)
 		// Take the read whenever frames are held: held frames need an anchor to be
@@ -78,7 +78,7 @@ func gvrSyncAnchorFilter(
 
 		// Judge everything held, oldest first — the consumer upserts by id, so a
 		// superseded frame ahead of its successor is harmless.
-		var out []domain.ClusterCacheGVRSyncChange
+		var out []domain.ClusterCacheGVRSyncWatchFrame
 		for _, held := range undecided {
 			if held.Type == domain.ChangeBookmark || beehive.ObjectID(held.Sync.DiscoveryID) == anchor {
 				out = append(out, held)
@@ -98,7 +98,7 @@ func gvrSyncAnchorFilter(
 // memory a permanently broken read can cost.
 const maxUndecidedSyncFrames = 4096
 
-func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheGVRSyncChange, error) {
+func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheGVRSyncWatchFrame, error) {
 	// The anchor is resolved lazily and re-resolved as the stream runs — a
 	// subscribe-time miss (a just-created cache) must not leave the stream
 	// permanently empty; while unresolved, dropping frames is correct (an
@@ -137,17 +137,17 @@ func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-c
 		return nil, err
 	}
 	return filterChan(ctx, watchListChan(ctx, "ClusterCacheGVRSync", snap, src,
-		func(t domain.ChangeType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]) domain.ClusterCacheGVRSyncChange {
+		func(t domain.ChangeType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]) domain.ClusterCacheGVRSyncWatchFrame {
 			if t == domain.ChangeBookmark {
-				return domain.ClusterCacheGVRSyncChange{Type: t}
+				return domain.ClusterCacheGVRSyncWatchFrame{Type: t}
 			}
 			if obj == nil {
 				// A hard Deleted carries no object; forwarded — a stray removal is a
 				// no-op for the client.
-				return domain.ClusterCacheGVRSyncChange{Type: t, Sync: &domain.ClusterCacheGVRSync{ID: domain.ClusterCacheGVRSyncID(id)}}
+				return domain.ClusterCacheGVRSyncWatchFrame{Type: t, Sync: &domain.ClusterCacheGVRSync{ID: domain.ClusterCacheGVRSyncID(id)}}
 			}
 			gs := buildGVRSync(obj)
-			return domain.ClusterCacheGVRSyncChange{Type: t, Sync: &gs}
+			return domain.ClusterCacheGVRSyncWatchFrame{Type: t, Sync: &gs}
 		}), gvrSyncAnchorFilter(resolveAnchor, func(err error) {
 		if loggedErr {
 			return

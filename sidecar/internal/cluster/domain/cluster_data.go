@@ -42,15 +42,15 @@ type ClusterDataKind struct {
 	Count int
 }
 
-// ClusterDataKindChange is one delta on a cache's kind-catalog watch: what happened
+// ClusterDataKindWatchFrame is one frame on a cache's kind-catalog watch: what happened
 // (Type) to which kind (Kind), from which cache (CacheID). On subscribe every catalog
 // row arrives as Added (the snapshot); thereafter a new kind is Added, a kind whose
 // fields change (chiefly its live Count) is Modified, and a kind leaving the catalog is
 // Deleted (carrying its last-known row). Consumers key on APIVersion + Resource.
 // CacheID is the frame's provenance: a client watching the active cache can reject a
 // late frame from a superseded cache (one still draining after a cache/context switch).
-// Binds 1:1 to the GraphQL ClusterDataKindChange.
-type ClusterDataKindChange struct {
+// Binds 1:1 to the GraphQL ClusterDataKindWatchFrame.
+type ClusterDataKindWatchFrame struct {
 	Type ChangeType
 	// Kind is nil on a Bookmark.
 	Kind    *ClusterDataKind
@@ -86,16 +86,16 @@ type ClusterDataEvent struct {
 	InvolvedName      string
 }
 
-// ClusterDataEventChange is one delta on a cache's events watch: what happened
+// ClusterDataEventWatchFrame is one frame on a cache's events watch: what happened
 // (Type) to which event (Event), from which cache (CacheID). On subscribe the newest
 // window of events arrives as Added (the snapshot); thereafter a new event is Added, an
 // event whose fields change (chiefly its Count/LastSeen as it re-fires) is Modified, and
 // an event leaving the watched window — dropped from the cache, or aged past the window
 // as newer events arrive — is Deleted (carrying its last-known row). Consumers key on
-// UID. CacheID is the frame's provenance, mirroring ClusterDataKindChange: a client
+// UID. CacheID is the frame's provenance, mirroring ClusterDataKindWatchFrame: a client
 // watching the active cache can reject a late frame from a superseded cache. Binds 1:1
-// to the GraphQL ClusterDataEventChange.
-type ClusterDataEventChange struct {
+// to the GraphQL ClusterDataEventWatchFrame.
+type ClusterDataEventWatchFrame struct {
 	Type ChangeType
 	// Event is nil on a Bookmark.
 	Event   *ClusterDataEvent
@@ -132,7 +132,7 @@ type ClusterDataObject struct {
 	RawJSON RawJSON
 }
 
-// ClusterDataObjectChange is one delta on a cache's per-kind objects watch: what happened
+// ClusterDataObjectWatchFrame is one frame on a cache's per-kind objects watch: what happened
 // (Type) to which object (Object), from which cache (CacheID) and kind (APIVersion +
 // Resource). On subscribe the current object set for the kind arrives as Added (the
 // snapshot); thereafter a new object is Added, an object whose fields change is Modified,
@@ -141,8 +141,8 @@ type ClusterDataObject struct {
 // events watches (keyed only by cache), this watch is keyed by kind too, so a client
 // switching resources within one cache uses the kind to reject a straggler from the
 // previous kind's still-draining subscription. Binds 1:1 to the GraphQL
-// ClusterDataObjectChange.
-type ClusterDataObjectChange struct {
+// ClusterDataObjectWatchFrame.
+type ClusterDataObjectWatchFrame struct {
 	Type ChangeType
 	// Object is nil on a Bookmark.
 	Object     *ClusterDataObject

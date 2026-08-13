@@ -73,7 +73,7 @@ type Clusters interface {
 	Get(ctx context.Context, id domain.ClusterID) (*domain.Cluster, error)
 	// Watch streams the cluster list as a delta watch; deletion-pending surfaces
 	// as Deleted.
-	Watch(ctx context.Context) (<-chan domain.ClusterChange, error)
+	Watch(ctx context.Context) (<-chan domain.ClusterWatchFrame, error)
 	// ListEvents returns a cluster's beehive event timeline (newest run first),
 	// optionally filtered by category and bounded by limit. Decoupled from Watch —
 	// event chatter never re-emits the cluster.
@@ -106,7 +106,7 @@ type Caches interface {
 	List(ctx context.Context, clusterID *domain.ClusterID) ([]*domain.ClusterCache, error)
 	// Watch streams cache records as a delta watch parallel to Clusters().Watch;
 	// the caller joins caches onto clusters by ClusterID.
-	Watch(ctx context.Context) (<-chan domain.ClusterCacheChange, error)
+	Watch(ctx context.Context) (<-chan domain.ClusterCacheWatchFrame, error)
 	// GetStats returns live on-disk statistics for one ClusterCache.
 	GetStats(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (*domain.ClusterCacheStats, error)
 	// WatchStats streams one cache's contents as a live gauge. A stream, not a
@@ -129,7 +129,7 @@ type Caches interface {
 // the kinds that cache's cluster serves.
 type Discovery interface {
 	// Watch streams the caches' discovery anchors, joined onto caches by CacheID.
-	Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRDiscoveryChange, error)
+	Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRDiscoveryWatchFrame, error)
 	// GetStats returns one anchor's live gauges from controller memory; nil before
 	// this process's first pass. Out of status so a pass never wakes dependents for
 	// a UI-only number (see ClusterCacheGVRDiscoveryStatus).
@@ -150,7 +150,7 @@ type Syncs interface {
 	List(ctx context.Context, cacheID *domain.ClusterCacheID) ([]*domain.ClusterCacheGVRSync, error)
 	// Watch streams one cache's per-kind sync records. Cache-scoped: one record per
 	// served kind, so an unscoped stream would be a firehose.
-	Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheGVRSyncChange, error)
+	Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheGVRSyncWatchFrame, error)
 	// GetStats returns one synced kind's freshness stamps (out of band from the
 	// object watch; see ClusterCacheGVRSyncStats).
 	GetStats(ctx context.Context, id domain.ClusterCacheGVRSyncID) (*domain.ClusterCacheGVRSyncStats, error)
@@ -171,14 +171,14 @@ type Data interface {
 	ListKinds(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) ([]domain.ClusterDataKind, error)
 	// WatchKinds streams one cache's kind catalog as a delta watch (per-kind counts
 	// update live).
-	WatchKinds(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (<-chan domain.ClusterDataKindChange, error)
+	WatchKinds(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (<-chan domain.ClusterDataKindWatchFrame, error)
 	// WatchEvents streams one cache's cached Kubernetes Events (newest window) as a
 	// delta watch, keyed by event UID. Wakes on the events-only broker, so an event
 	// burst never drives the kind-catalog re-read.
-	WatchEvents(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (<-chan domain.ClusterDataEventChange, error)
+	WatchEvents(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (<-chan domain.ClusterDataEventWatchFrame, error)
 	// WatchObjects streams one kind's cached objects as a delta watch keyed by UID.
 	// No frames while that kind hasn't synced.
-	WatchObjects(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID, apiVersion, resource string) (<-chan domain.ClusterDataObjectChange, error)
+	WatchObjects(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID, apiVersion, resource string) (<-chan domain.ClusterDataObjectWatchFrame, error)
 }
 
 // The family accessors are stateless views onto the one *Service: the split is

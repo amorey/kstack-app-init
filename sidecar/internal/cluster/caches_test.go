@@ -335,9 +335,6 @@ func TestServiceCacheStatsExcludesEventKind(t *testing.T) {
 	assert.Equal(t, 1, stats.ObjectCount, "only the Deployment; the 2 events are excluded")
 }
 
-// recvKindChange reads one delta off the ClusterDataKindsWatch stream, failing on
-// timeout or an unexpected close.
-
 // ClusterCacheEvents / ClusterCacheEventsWatch are the ClusterCache-kind counterparts:
 // same generic reader/watch, but against the cache client and keyed by the
 // ClusterCache's own ObjectID (the sync-event timeline under category "sync"). Asserting

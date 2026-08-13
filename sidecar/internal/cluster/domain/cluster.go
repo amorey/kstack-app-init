@@ -139,10 +139,11 @@ type Cluster struct {
 	// surface.
 }
 
-// ClusterChange is one delta on the cluster list watch: what happened (Type) to
-// which cluster (Cluster). On a Deleted change Cluster carries the last-known state;
-// consumers key on Cluster.ID. Binds 1:1 to the GraphQL ClusterChange.
-type ClusterChange struct {
+// ClusterWatchFrame is one frame on the cluster list watch: what happened (Type) to
+// which cluster (Cluster), or the Bookmark closing the snapshot, which carries no
+// cluster. On a Deleted change Cluster holds the last-known state; consumers key on
+// Cluster.ID. Binds 1:1 to the GraphQL ClusterWatchFrame.
+type ClusterWatchFrame struct {
 	Type    ChangeType
 	Cluster *Cluster
 }
