@@ -29,6 +29,10 @@ The identity of a persisted object (a cluster, a cluster's cache, …), opaque t
 clients (a decimal-string id on the wire). One scalar for every object kind so
 the same id machinery is reused. Use values returned by the server verbatim; do
 not construct or parse them.
+
+Ids are unique across kinds, not just within one, so they never collide — which
+is why a lookup handed another kind's id answers null rather than erroring or
+returning the wrong record.
 """
 scalar ObjectID
 
@@ -815,43 +819,16 @@ type Query {
   clusters: [Cluster!]!
 
   # --- ClusterCache ---
-  """
-  A single cache by **its own** id — the `ClusterCache.id` its watch frames carry,
-  not the parent cluster's. The entry point for a cache's own fields (`kinds`,
-  `events`), since caches otherwise arrive only by subscription.
-
-  Null when no cache has that id. An id belonging to another kind reads the same
-  way rather than erroring: every kind draws from one id sequence, so ids never
-  collide and a mismatched one is simply not a cache.
-  """
+  "A single cache by its own id, not its cluster's; null if unknown."
   clusterCache(id: ObjectID!): ClusterCache
 
-  """
-  Caches in creation order: every tracked one, or a single cluster's when
-  `clusterID` is given. The plural counterpart of `clusterCache`, and the same set
-  `Cluster.caches` serves when scoped.
-
-  None of them is marked active — see `Cluster.caches` for why that stays a live
-  join against the parent's `status.server.uid`.
-  """
+  "Every cache, or one cluster's when `clusterID` is given — the set `Cluster.caches` serves."
   clusterCaches(clusterID: ObjectID): [ClusterCache!]!
 
-  """
-  A single synced-kind record by **its own** id — the `ClusterCacheGVRSync.id`, not
-  its cache's or its cluster's. The entry point for its `events`. Null when no
-  record has that id, on the same terms as `clusterCache`.
-  """
+  "A single synced-kind record by its own id, not its cache's; null if unknown."
   clusterCacheGVRSync(id: ObjectID!): ClusterCacheGVRSync
 
-  """
-  Per-kind sync records in creation order: every tracked one, or a single cache's
-  when `cacheID` is given. The plural counterpart of `clusterCacheGVRSync`, and the
-  same set `ClusterCache.syncs` serves when scoped.
-
-  There is one record per kind per cache, so the unscoped form is hundreds of rows
-  on a real fleet — scope it, or follow `clusterCacheGVRSyncsWatch(cacheID)` for
-  live per-kind health.
-  """
+  "Every per-kind sync record — hundreds unscoped — or one cache's when `cacheID` is given; the set `ClusterCache.syncs` serves."
   clusterCacheGVRSyncs(cacheID: ObjectID): [ClusterCacheGVRSync!]!
 
   # --- Cloud account ---
