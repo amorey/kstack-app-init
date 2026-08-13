@@ -400,6 +400,15 @@ func (f fakeClusters) WatchEvents(ctx context.Context, _ domain.ClusterID, _ *st
 	return ch, nil
 }
 
+func (f fakeCaches) Get(_ context.Context, id domain.ClusterCacheID) (*domain.ClusterCache, error) {
+	for _, c := range f.s.cacheSnapshot() {
+		if c.ID == id {
+			return &c, nil
+		}
+	}
+	return nil, nil
+}
+
 func (f fakeCaches) ListEvents(_ context.Context, id domain.ClusterCacheID, _ *string, _ *int) ([]domain.Event, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
@@ -413,6 +422,18 @@ func (f fakeCaches) WatchEvents(ctx context.Context, _ domain.ClusterCacheID, _ 
 		close(ch)
 	}()
 	return ch, nil
+}
+
+func (f fakeSyncs) Get(_ context.Context, id domain.ClusterCacheGVRSyncID) (*domain.ClusterCacheGVRSync, error) {
+	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
+	for i := range f.s.gvrSyncs {
+		if f.s.gvrSyncs[i].ID == id {
+			gs := f.s.gvrSyncs[i]
+			return &gs, nil
+		}
+	}
+	return nil, nil
 }
 
 func (f fakeSyncs) ListEvents(_ context.Context, id domain.ClusterCacheGVRSyncID, _ *string, _ *int) ([]domain.Event, error) {

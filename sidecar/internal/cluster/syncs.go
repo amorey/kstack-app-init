@@ -157,6 +157,24 @@ func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-c
 	})), nil
 }
 
+// Get implements Syncs. An unknown or deletion-pending id is (nil, nil), not an
+// error — the same posture as Clusters().Get. The owner edge is eager-loaded so
+// the record carries its DiscoveryID.
+func (a syncsAPI) Get(ctx context.Context, id domain.ClusterCacheGVRSyncID) (*domain.ClusterCacheGVRSync, error) {
+	obj, err := a.s.gvrSyncClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
+	if errors.Is(err, beehive.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if obj.DeletionRequestedAt != nil {
+		return nil, nil
+	}
+	gs := buildGVRSync(obj)
+	return &gs, nil
+}
+
 // buildGVRSync assembles a domain ClusterCacheGVRSync from a single beehive object, its
 // owning discovery anchor read off the eager-loaded owner edge.
 func buildGVRSync(obj *beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]) domain.ClusterCacheGVRSync {

@@ -35,6 +35,31 @@ import (
 // cache has one sync record per served kind — a hundred or more — so unlike the other
 // object watches this one is opened per cache, and must not leak another cache's kinds
 // into it.
+// Get is the query entrypoint into one synced kind's record (the GraphQL
+// clusterCacheGVRSync field), so it must resolve the owner edge the watch relies on —
+// DiscoveryID is what ties the record to its cache. An unknown id is (nil, nil).
+func TestSyncsGet(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+
+	id := seedCluster(t, s, "alpha")
+	cacheID := seedActiveCache(t, s, coreCC, id, "uid-alpha")
+	discoveryID := seedGVRDiscovery(t, s, cacheID)
+	syncID := seedGVRSync(t, s, discoveryID, "apps/v1", "deployments")
+
+	got, err := s.Syncs().Get(ctx, domain.ClusterCacheGVRSyncID(syncID))
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, domain.ClusterCacheGVRSyncID(syncID), got.ID)
+	assert.EqualValues(t, discoveryID, got.DiscoveryID) // resolved from the owner edge
+	assert.Equal(t, "deployments", got.Spec.Resource)
+
+	missing, err := s.Syncs().Get(ctx, domain.ClusterCacheGVRSyncID(syncID+9999))
+	require.NoError(t, err)
+	assert.Nil(t, missing)
+}
+
 func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

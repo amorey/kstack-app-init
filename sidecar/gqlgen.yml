@@ -116,6 +116,8 @@ models:
     fields:
       stats:
         resolver: true
+      events:
+        resolver: true
 
   # The sync children's served spec IS the stored beehive type (no projection layer).
   # Their `stats` are NOT: those are resolver fields sampled from the controller, because
@@ -134,6 +136,8 @@ models:
     fields:
       # Same shape as the discovery's: a controller-held gauge, not stored state.
       stats:
+        resolver: true
+      events:
         resolver: true
   ClusterCacheGVRSyncSpec:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.ClusterCacheGVRSyncSpec

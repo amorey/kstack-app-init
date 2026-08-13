@@ -97,6 +97,8 @@ type Clusters interface {
 // steady state, but a UID migration leaves the old one behind — so every
 // per-cache read names the exact cache it means, never "the" cache of a cluster.
 type Caches interface {
+	// Get returns one cache by id, or (nil, nil) when unknown or deletion-pending.
+	Get(ctx context.Context, id domain.ClusterCacheID) (*domain.ClusterCache, error)
 	// Watch streams cache records as a delta watch parallel to Clusters().Watch;
 	// the caller joins caches onto clusters by ClusterID.
 	Watch(ctx context.Context) (<-chan domain.ClusterCacheChange, error)
@@ -133,6 +135,9 @@ type Discovery interface {
 // which is why Watch is cache-scoped where its siblings in other families are
 // fleet-wide.
 type Syncs interface {
+	// Get returns one sync record by id, or (nil, nil) when unknown or
+	// deletion-pending.
+	Get(ctx context.Context, id domain.ClusterCacheGVRSyncID) (*domain.ClusterCacheGVRSync, error)
 	// Watch streams one cache's per-kind sync records. Cache-scoped: one record per
 	// served kind, so an unscoped stream would be a firehose.
 	Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheGVRSyncChange, error)

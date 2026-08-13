@@ -34,6 +34,31 @@ import (
 // change per cache with its parent ClusterID resolved from the owner edge, its
 // ServerUID, and its conditions. The kind has no status (it measures nothing itself), and
 // active-ness is a client-side join, so neither is asserted here.
+// Get is the query entrypoint into a cache record (the GraphQL clusterCache field),
+// so it must resolve the owner edge the same way the watch does — a record without
+// its ClusterID cannot be joined to its cluster. An unknown id is (nil, nil): the
+// schema types the field nullable, and a stale id from a closed window is not an error.
+func TestCachesGet(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _ := newServiceTest(t)
+	id := seedCluster(t, s, "alpha")
+
+	const uid = "kube-system-uid"
+	cacheID := seedActiveCache(t, s, coreCC, id, uid)
+
+	got, err := s.Caches().Get(ctx, domain.ClusterCacheID(cacheID))
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, domain.ClusterCacheID(cacheID), got.ID)
+	assert.Equal(t, id, got.ClusterID) // resolved from the owner edge
+	assert.Equal(t, uid, got.ServerUID)
+
+	missing, err := s.Caches().Get(ctx, domain.ClusterCacheID(cacheID+9999))
+	require.NoError(t, err)
+	assert.Nil(t, missing)
+}
+
 func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

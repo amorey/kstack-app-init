@@ -370,6 +370,15 @@ type ClusterCache {
   conditions: [Condition!]!
   "Live on-disk cache statistics, queried on demand."
   stats: ClusterCacheStats!
+
+  """
+  This cache's control-plane event timeline (newest run first), optionally
+  filtered to one `category` (e.g. `"sync"`, the cache-sync history) and bounded
+  by `limit`. Carries only what the cache itself records — the per-kind sync
+  history lives on `ClusterCacheGVRSync.events`. Resolved on selection and
+  decoupled from the cache/list watch.
+  """
+  events(category: String, limit: Int): [Event!]!
 }
 
 "Live on-disk cache statistics for a single cluster."
@@ -492,6 +501,15 @@ type ClusterCacheGVRSync {
   kind's.
   """
   conditions: [Condition!]!
+
+  """
+  This kind's sync-transition history (newest run first) — the
+  `SyncStart`/`SyncComplete`/`SyncDegraded`/`SyncStale`/… runs its worker records,
+  optionally filtered to one `category` (e.g. `"sync"`) and bounded by `limit`.
+  This is where the per-kind history lives; the parent cache's timeline carries
+  only what the cache itself records. Resolved on selection.
+  """
+  events(category: String, limit: Int): [Event!]!
 }
 
 "Which kind a per-kind sync mirrors, and whether it should be running."
@@ -762,22 +780,13 @@ type Query {
 
   # --- ClusterCache ---
   """
-  A ClusterCache's control-plane event timeline (newest run first), the
-  ClusterCache-kind counterpart of `Cluster.events` — keyed by the cache's own `id`
-  and optionally filtered to one `category` (e.g. `"sync"`, the cache-sync history).
-  Empty for an unknown cache or one with no events. Decoupled from the cache/list
-  watch.
+  A single cache by id; null if unknown. The entry point for a cache's own
+  fields — chiefly `events` — since caches otherwise arrive by subscription.
   """
-  clusterCacheEvents(id: ObjectID!, category: String, limit: Int): [Event!]!
+  clusterCache(id: ObjectID!): ClusterCache
 
-  """
-  One synced kind's control-plane event timeline (newest run first) — the
-  sync-transition history (`SyncStart`/`SyncComplete`/`SyncDegraded`/`SyncStale`/…,
-  category `"sync"`) its worker records, keyed by that record's own `id`. This is where
-  the history lives; the parent cache's timeline carries only what the cache itself
-  records.
-  """
-  clusterCacheGVRSyncEvents(id: ObjectID!, category: String, limit: Int): [Event!]!
+  "A single synced-kind record by id; null if unknown. The entry point for its `events`."
+  clusterCacheGVRSync(id: ObjectID!): ClusterCacheGVRSync
 
   # --- Cluster data ---
   """

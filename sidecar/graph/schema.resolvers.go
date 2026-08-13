@@ -31,6 +31,16 @@ func (r *clusterCacheResolver) Stats(ctx context.Context, obj *domain.ClusterCac
 	return r.ClusterSvc.Caches().GetStats(ctx, obj.ClusterID, obj.ID)
 }
 
+// Events is the resolver for the events field — this cache's own event timeline.
+// A separate beehive read, so it runs only when selected.
+func (r *clusterCacheResolver) Events(ctx context.Context, obj *domain.ClusterCache, category *string, limit *int) ([]*domain.Event, error) {
+	evs, err := r.ClusterSvc.Caches().ListEvents(ctx, obj.ID, category, limit)
+	if err != nil {
+		return nil, err
+	}
+	return ptrSlice(evs), nil
+}
+
 // Stats is the resolver for the stats field — the discovery pass's gauges, sampled from
 // the controller because status deliberately stores none. Null until a pass has run.
 func (r *clusterCacheGVRDiscoveryResolver) Stats(ctx context.Context, obj *domain.ClusterCacheGVRDiscovery) (*domain.ClusterCacheGVRDiscoveryStats, error) {
@@ -40,6 +50,16 @@ func (r *clusterCacheGVRDiscoveryResolver) Stats(ctx context.Context, obj *domai
 // Stats is the resolver for the stats field.
 func (r *clusterCacheGVRSyncResolver) Stats(ctx context.Context, obj *domain.ClusterCacheGVRSync) (*domain.ClusterCacheGVRSyncStats, error) {
 	return r.ClusterSvc.Syncs().GetStats(ctx, obj.ID)
+}
+
+// Events is the resolver for the events field — this kind's sync-transition
+// history. A separate beehive read, so it runs only when selected.
+func (r *clusterCacheGVRSyncResolver) Events(ctx context.Context, obj *domain.ClusterCacheGVRSync, category *string, limit *int) ([]*domain.Event, error) {
+	evs, err := r.ClusterSvc.Syncs().ListEvents(ctx, obj.ID, category, limit)
+	if err != nil {
+		return nil, err
+	}
+	return ptrSlice(evs), nil
 }
 
 // FirstSeen is the resolver for the firstSeen field — see nilIfZeroTime.
@@ -132,23 +152,16 @@ func (r *queryResolver) Clusters(ctx context.Context) ([]*domain.Cluster, error)
 	return r.ClusterSvc.Clusters().List(ctx)
 }
 
-// ClusterCacheEvents is the resolver for the clusterCacheEvents field — a
-// ClusterCache's event timeline.
-func (r *queryResolver) ClusterCacheEvents(ctx context.Context, id domain.ObjectID, category *string, limit *int) ([]*domain.Event, error) {
-	evs, err := r.ClusterSvc.Caches().ListEvents(ctx, id, category, limit)
-	if err != nil {
-		return nil, err
-	}
-	return ptrSlice(evs), nil
+// ClusterCache is the resolver for the clusterCache field. An unknown or
+// deletion-pending id is null per the schema, not an error.
+func (r *queryResolver) ClusterCache(ctx context.Context, id domain.ObjectID) (*domain.ClusterCache, error) {
+	return r.ClusterSvc.Caches().Get(ctx, id)
 }
 
-// ClusterCacheGVRSyncEvents is the resolver for the clusterCacheGVRSyncEvents field.
-func (r *queryResolver) ClusterCacheGVRSyncEvents(ctx context.Context, id domain.ObjectID, category *string, limit *int) ([]*domain.Event, error) {
-	evs, err := r.ClusterSvc.Syncs().ListEvents(ctx, id, category, limit)
-	if err != nil {
-		return nil, err
-	}
-	return ptrSlice(evs), nil
+// ClusterCacheGVRSync is the resolver for the clusterCacheGVRSync field. An
+// unknown or deletion-pending id is null per the schema, not an error.
+func (r *queryResolver) ClusterCacheGVRSync(ctx context.Context, id domain.ObjectID) (*domain.ClusterCacheGVRSync, error) {
+	return r.ClusterSvc.Syncs().Get(ctx, id)
 }
 
 // ClusterDataKinds is the resolver for the clusterDataKinds field — one

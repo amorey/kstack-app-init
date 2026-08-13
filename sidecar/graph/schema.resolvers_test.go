@@ -390,12 +390,13 @@ func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 
 // --- ClusterCache ---
 
-// The two cache-side event timelines are the same generic reader keyed by a different
-// object: `clusterCacheEvents` reads the ClusterCache's own timeline (what the cache
-// layer records, e.g. SyncStopped), `clusterCacheGVRSyncEvents` one synced kind's
-// record's (where each worker report lands). One table because the wire mapping under
-// test — domain Event → the generic Event shape, enum included — is identical; only the
-// entrypoint and the object it keys on differ.
+// The two cache-side event timelines are the same generic reader hung off a different
+// record: `ClusterCache.events` reads the cache's own timeline (what the cache layer
+// records, e.g. SyncStopped), `ClusterCacheGVRSync.events` one synced kind's (where
+// each worker report lands). One table because the wire mapping under test — domain
+// Event → the generic Event shape, enum included — is identical; only the record it
+// hangs off differs. Reaching either also exercises its root lookup, which is the only
+// way into these records by query.
 func TestCacheEventTimelineResolvers(t *testing.T) {
 	now := time.Now().UTC()
 	tests := []struct {
@@ -406,7 +407,7 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 		wantEnum string
 	}{{
 		name:  "cache timeline",
-		field: "clusterCacheEvents",
+		field: "clusterCache",
 		seed: func(f *fakeClusterService, id domain.ObjectID, ev domain.Event) {
 			f.cacheEvents = map[domain.ClusterCacheID][]domain.Event{id: {ev}}
 		},
@@ -417,7 +418,7 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 		wantEnum: "Warning",
 	}, {
 		name:  "per-kind sync timeline",
-		field: "clusterCacheGVRSyncEvents",
+		field: "clusterCacheGVRSync",
 		seed: func(f *fakeClusterService, id domain.ObjectID, ev domain.Event) {
 			f.syncEvents = map[domain.ClusterCacheGVRSyncID][]domain.Event{id: {ev}}
 		},
@@ -441,14 +442,16 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 
-			query := `{ ` + tt.field + `(id: "` + strconv.FormatInt(int64(id), 10) + `", category: "sync") {
-				id category type reason message count firstAt lastAt
+			query := `{ ` + tt.field + `(id: "` + strconv.FormatInt(int64(id), 10) + `") {
+				events(category: "sync") { id category type reason message count firstAt lastAt }
 			} }`
 			body, _ := json.Marshal(map[string]string{"query": query})
 			raw := postGQL(t, srv.URL, string(body))
 
 			var resp struct {
-				Data   map[string][]map[string]any
+				Data map[string]struct {
+					Events []map[string]any `json:"events"`
+				}
 				Errors []struct{ Message string }
 			}
 			if err := json.Unmarshal(raw, &resp); err != nil {
@@ -457,7 +460,7 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 			if len(resp.Errors) > 0 {
 				t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
 			}
-			got := resp.Data[tt.field]
+			got := resp.Data[tt.field].Events
 			if len(got) != 1 {
 				t.Fatalf("want 1 event, got %d: %s", len(got), raw)
 			}

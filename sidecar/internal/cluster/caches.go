@@ -16,6 +16,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/amorey/beehive"
@@ -43,6 +44,24 @@ func (a cachesAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheChange,
 			cc := buildClusterCache(obj)
 			return domain.ClusterCacheChange{Type: t, Cache: &cc}
 		}), nil
+}
+
+// Get implements Caches. An unknown or deletion-pending id is (nil, nil), not an
+// error — the same posture as Clusters().Get. The owner edge is eager-loaded so
+// the record carries its ClusterID.
+func (a cachesAPI) Get(ctx context.Context, id domain.ClusterCacheID) (*domain.ClusterCache, error) {
+	obj, err := a.s.cacheClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
+	if errors.Is(err, beehive.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if obj.DeletionRequestedAt != nil {
+		return nil, nil
+	}
+	cc := buildClusterCache(obj)
+	return &cc, nil
 }
 
 // buildClusterCache assembles a domain ClusterCache; parent ClusterID comes off

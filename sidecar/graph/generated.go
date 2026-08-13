@@ -74,6 +74,7 @@ type ComplexityRoot struct {
 	ClusterCache struct {
 		ClusterID  func(childComplexity int) int
 		Conditions func(childComplexity int) int
+		Events     func(childComplexity int, category *string, limit *int) int
 		ID         func(childComplexity int) int
 		ServerUID  func(childComplexity int) int
 		Stats      func(childComplexity int) int
@@ -109,6 +110,7 @@ type ComplexityRoot struct {
 	ClusterCacheGVRSync struct {
 		Conditions  func(childComplexity int) int
 		DiscoveryID func(childComplexity int) int
+		Events      func(childComplexity int, category *string, limit *int) int
 		ID          func(childComplexity int) int
 		Spec        func(childComplexity int) int
 		Stats       func(childComplexity int) int
@@ -301,12 +303,12 @@ type ComplexityRoot struct {
 	}
 
 	Query struct {
-		AuthState                 func(childComplexity int) int
-		Cluster                   func(childComplexity int, id domain.ObjectID) int
-		ClusterCacheEvents        func(childComplexity int, id domain.ObjectID, category *string, limit *int) int
-		ClusterCacheGVRSyncEvents func(childComplexity int, id domain.ObjectID, category *string, limit *int) int
-		ClusterDataKinds          func(childComplexity int, id domain.ObjectID, cacheID domain.ObjectID) int
-		Clusters                  func(childComplexity int) int
+		AuthState           func(childComplexity int) int
+		Cluster             func(childComplexity int, id domain.ObjectID) int
+		ClusterCache        func(childComplexity int, id domain.ObjectID) int
+		ClusterCacheGVRSync func(childComplexity int, id domain.ObjectID) int
+		ClusterDataKinds    func(childComplexity int, id domain.ObjectID, cacheID domain.ObjectID) int
+		Clusters            func(childComplexity int) int
 	}
 
 	ResourceRule struct {
@@ -350,12 +352,15 @@ type ClusterResolver interface {
 }
 type ClusterCacheResolver interface {
 	Stats(ctx context.Context, obj *domain.ClusterCache) (*domain.ClusterCacheStats, error)
+	Events(ctx context.Context, obj *domain.ClusterCache, category *string, limit *int) ([]*domain.Event, error)
 }
 type ClusterCacheGVRDiscoveryResolver interface {
 	Stats(ctx context.Context, obj *domain.ClusterCacheGVRDiscovery) (*domain.ClusterCacheGVRDiscoveryStats, error)
 }
 type ClusterCacheGVRSyncResolver interface {
 	Stats(ctx context.Context, obj *domain.ClusterCacheGVRSync) (*domain.ClusterCacheGVRSyncStats, error)
+
+	Events(ctx context.Context, obj *domain.ClusterCacheGVRSync, category *string, limit *int) ([]*domain.Event, error)
 }
 type ClusterDataEventResolver interface {
 	FirstSeen(ctx context.Context, obj *domain.ClusterDataEvent) (*time.Time, error)
@@ -379,8 +384,8 @@ type MutationResolver interface {
 type QueryResolver interface {
 	Cluster(ctx context.Context, id domain.ObjectID) (*domain.Cluster, error)
 	Clusters(ctx context.Context) ([]*domain.Cluster, error)
-	ClusterCacheEvents(ctx context.Context, id domain.ObjectID, category *string, limit *int) ([]*domain.Event, error)
-	ClusterCacheGVRSyncEvents(ctx context.Context, id domain.ObjectID, category *string, limit *int) ([]*domain.Event, error)
+	ClusterCache(ctx context.Context, id domain.ObjectID) (*domain.ClusterCache, error)
+	ClusterCacheGVRSync(ctx context.Context, id domain.ObjectID) (*domain.ClusterCacheGVRSync, error)
 	ClusterDataKinds(ctx context.Context, id domain.ObjectID, cacheID domain.ObjectID) ([]*domain.ClusterDataKind, error)
 	AuthState(ctx context.Context) (*auth.State, error)
 }
@@ -508,6 +513,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCache.Conditions(childComplexity), true
+	case "ClusterCache.events":
+		if e.ComplexityRoot.ClusterCache.Events == nil {
+			break
+		}
+
+		args, err := ec.field_ClusterCache_events_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.ComplexityRoot.ClusterCache.Events(childComplexity, args["category"].(*string), args["limit"].(*int)), true
 	case "ClusterCache.id":
 		if e.ComplexityRoot.ClusterCache.ID == nil {
 			break
@@ -616,6 +632,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCacheGVRSync.DiscoveryID(childComplexity), true
+	case "ClusterCacheGVRSync.events":
+		if e.ComplexityRoot.ClusterCacheGVRSync.Events == nil {
+			break
+		}
+
+		args, err := ec.field_ClusterCacheGVRSync_events_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.ComplexityRoot.ClusterCacheGVRSync.Events(childComplexity, args["category"].(*string), args["limit"].(*int)), true
 	case "ClusterCacheGVRSync.id":
 		if e.ComplexityRoot.ClusterCacheGVRSync.ID == nil {
 			break
@@ -1356,28 +1383,28 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Query.Cluster(childComplexity, args["id"].(domain.ObjectID)), true
-	case "Query.clusterCacheEvents":
-		if e.ComplexityRoot.Query.ClusterCacheEvents == nil {
+	case "Query.clusterCache":
+		if e.ComplexityRoot.Query.ClusterCache == nil {
 			break
 		}
 
-		args, err := ec.field_Query_clusterCacheEvents_args(ctx, rawArgs)
+		args, err := ec.field_Query_clusterCache_args(ctx, rawArgs)
 		if err != nil {
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Query.ClusterCacheEvents(childComplexity, args["id"].(domain.ObjectID), args["category"].(*string), args["limit"].(*int)), true
-	case "Query.clusterCacheGVRSyncEvents":
-		if e.ComplexityRoot.Query.ClusterCacheGVRSyncEvents == nil {
+		return e.ComplexityRoot.Query.ClusterCache(childComplexity, args["id"].(domain.ObjectID)), true
+	case "Query.clusterCacheGVRSync":
+		if e.ComplexityRoot.Query.ClusterCacheGVRSync == nil {
 			break
 		}
 
-		args, err := ec.field_Query_clusterCacheGVRSyncEvents_args(ctx, rawArgs)
+		args, err := ec.field_Query_clusterCacheGVRSync_args(ctx, rawArgs)
 		if err != nil {
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Query.ClusterCacheGVRSyncEvents(childComplexity, args["id"].(domain.ObjectID), args["category"].(*string), args["limit"].(*int)), true
+		return e.ComplexityRoot.Query.ClusterCacheGVRSync(childComplexity, args["id"].(domain.ObjectID)), true
 	case "Query.clusterDataKinds":
 		if e.ComplexityRoot.Query.ClusterDataKinds == nil {
 			break
@@ -1763,6 +1790,8 @@ func (ec *executionContext) childFields_ClusterCache(ctx context.Context, field 
 		return ec.fieldContext_ClusterCache_conditions(ctx, field)
 	case "stats":
 		return ec.fieldContext_ClusterCache_stats(ctx, field)
+	case "events":
+		return ec.fieldContext_ClusterCache_events(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterCache", field.Name)
 }
@@ -1833,6 +1862,8 @@ func (ec *executionContext) childFields_ClusterCacheGVRSync(ctx context.Context,
 		return ec.fieldContext_ClusterCacheGVRSync_stats(ctx, field)
 	case "conditions":
 		return ec.fieldContext_ClusterCacheGVRSync_conditions(ctx, field)
+	case "events":
+		return ec.fieldContext_ClusterCacheGVRSync_events(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterCacheGVRSync", field.Name)
 }
@@ -2339,6 +2370,50 @@ func (ec *executionContext) childFields___Type(ctx context.Context, field graphq
 
 // region    ***************************** args.gotpl *****************************
 
+func (ec *executionContext) field_ClusterCacheGVRSync_events_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "category",
+		func(ctx context.Context, v any) (*string, error) {
+			return ec.unmarshalOString2ᚖstring(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["category"] = arg0
+	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "limit",
+		func(ctx context.Context, v any) (*int, error) {
+			return ec.unmarshalOInt2ᚖint(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["limit"] = arg1
+	return args, nil
+}
+
+func (ec *executionContext) field_ClusterCache_events_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "category",
+		func(ctx context.Context, v any) (*string, error) {
+			return ec.unmarshalOString2ᚖstring(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["category"] = arg0
+	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "limit",
+		func(ctx context.Context, v any) (*int, error) {
+			return ec.unmarshalOInt2ᚖint(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["limit"] = arg1
+	return args, nil
+}
+
 func (ec *executionContext) field_ClusterPrincipal_permissions_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
 	var err error
 	args := map[string]any{}
@@ -2475,7 +2550,7 @@ func (ec *executionContext) field_Query___type_args(ctx context.Context, rawArgs
 	return args, nil
 }
 
-func (ec *executionContext) field_Query_clusterCacheEvents_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+func (ec *executionContext) field_Query_clusterCacheGVRSync_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
@@ -2486,26 +2561,10 @@ func (ec *executionContext) field_Query_clusterCacheEvents_args(ctx context.Cont
 		return nil, err
 	}
 	args["id"] = arg0
-	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "category",
-		func(ctx context.Context, v any) (*string, error) {
-			return ec.unmarshalOString2ᚖstring(ctx, v)
-		})
-	if err != nil {
-		return nil, err
-	}
-	args["category"] = arg1
-	arg2, err := graphql.ProcessArgField(ctx, rawArgs, "limit",
-		func(ctx context.Context, v any) (*int, error) {
-			return ec.unmarshalOInt2ᚖint(ctx, v)
-		})
-	if err != nil {
-		return nil, err
-	}
-	args["limit"] = arg2
 	return args, nil
 }
 
-func (ec *executionContext) field_Query_clusterCacheGVRSyncEvents_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+func (ec *executionContext) field_Query_clusterCache_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
 	var err error
 	args := map[string]any{}
 	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
@@ -2516,22 +2575,6 @@ func (ec *executionContext) field_Query_clusterCacheGVRSyncEvents_args(ctx conte
 		return nil, err
 	}
 	args["id"] = arg0
-	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "category",
-		func(ctx context.Context, v any) (*string, error) {
-			return ec.unmarshalOString2ᚖstring(ctx, v)
-		})
-	if err != nil {
-		return nil, err
-	}
-	args["category"] = arg1
-	arg2, err := graphql.ProcessArgField(ctx, rawArgs, "limit",
-		func(ctx context.Context, v any) (*int, error) {
-			return ec.unmarshalOInt2ᚖint(ctx, v)
-		})
-	if err != nil {
-		return nil, err
-	}
-	args["limit"] = arg2
 	return args, nil
 }
 
@@ -3313,6 +3356,50 @@ func (ec *executionContext) fieldContext_ClusterCache_stats(_ context.Context, f
 	return fc, nil
 }
 
+func (ec *executionContext) _ClusterCache_events(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterCache) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCache_events(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.Resolvers.ClusterCache().Events(ctx, obj, fc.Args["category"].(*string), fc.Args["limit"].(*int))
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v []*domain.Event) graphql.Marshaler {
+			return ec.marshalNEvent2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventᚄ(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCache_events(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "ClusterCache",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_Event(ctx, field)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_ClusterCache_events_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
 func (ec *executionContext) _ClusterCacheChange_type(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterCacheChange) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -3772,6 +3859,50 @@ func (ec *executionContext) fieldContext_ClusterCacheGVRSync_conditions(_ contex
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 			return ec.childFields_Condition(ctx, field)
 		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _ClusterCacheGVRSync_events(ctx context.Context, field graphql.CollectedField, obj *domain.ClusterCacheGVRSync) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCacheGVRSync_events(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.Resolvers.ClusterCacheGVRSync().Events(ctx, obj, fc.Args["category"].(*string), fc.Args["limit"].(*int))
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v []*domain.Event) graphql.Marshaler {
+			return ec.marshalNEvent2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventᚄ(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCacheGVRSync_events(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "ClusterCacheGVRSync",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_Event(ctx, field)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_ClusterCacheGVRSync_events_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
 	}
 	return fc, nil
 }
@@ -6588,34 +6719,34 @@ func (ec *executionContext) fieldContext_Query_clusters(_ context.Context, field
 	return fc, nil
 }
 
-func (ec *executionContext) _Query_clusterCacheEvents(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+func (ec *executionContext) _Query_clusterCache(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
 		ec.OperationContext,
 		field,
 		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_Query_clusterCacheEvents(ctx, field)
+			return ec.fieldContext_Query_clusterCache(ctx, field)
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Query().ClusterCacheEvents(ctx, fc.Args["id"].(domain.ObjectID), fc.Args["category"].(*string), fc.Args["limit"].(*int))
+			return ec.Resolvers.Query().ClusterCache(ctx, fc.Args["id"].(domain.ObjectID))
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v []*domain.Event) graphql.Marshaler {
-			return ec.marshalNEvent2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventᚄ(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v *domain.ClusterCache) graphql.Marshaler {
+			return ec.marshalOClusterCache2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCache(ctx, selections, v)
 		},
 		true,
-		true,
+		false,
 	)
 }
-func (ec *executionContext) fieldContext_Query_clusterCacheEvents(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+func (ec *executionContext) fieldContext_Query_clusterCache(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	fc = &graphql.FieldContext{
 		Object:     "Query",
 		Field:      field,
 		IsMethod:   true,
 		IsResolver: true,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_Event(ctx, field)
+			return ec.childFields_ClusterCache(ctx, field)
 		},
 	}
 	defer func() {
@@ -6625,41 +6756,41 @@ func (ec *executionContext) fieldContext_Query_clusterCacheEvents(ctx context.Co
 		}
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
-	if fc.Args, err = ec.field_Query_clusterCacheEvents_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+	if fc.Args, err = ec.field_Query_clusterCache_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
 	return fc, nil
 }
 
-func (ec *executionContext) _Query_clusterCacheGVRSyncEvents(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+func (ec *executionContext) _Query_clusterCacheGVRSync(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
 		ec.OperationContext,
 		field,
 		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_Query_clusterCacheGVRSyncEvents(ctx, field)
+			return ec.fieldContext_Query_clusterCacheGVRSync(ctx, field)
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Query().ClusterCacheGVRSyncEvents(ctx, fc.Args["id"].(domain.ObjectID), fc.Args["category"].(*string), fc.Args["limit"].(*int))
+			return ec.Resolvers.Query().ClusterCacheGVRSync(ctx, fc.Args["id"].(domain.ObjectID))
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v []*domain.Event) graphql.Marshaler {
-			return ec.marshalNEvent2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventᚄ(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v *domain.ClusterCacheGVRSync) graphql.Marshaler {
+			return ec.marshalOClusterCacheGVRSync2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐClusterCacheGVRSync(ctx, selections, v)
 		},
 		true,
-		true,
+		false,
 	)
 }
-func (ec *executionContext) fieldContext_Query_clusterCacheGVRSyncEvents(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+func (ec *executionContext) fieldContext_Query_clusterCacheGVRSync(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	fc = &graphql.FieldContext{
 		Object:     "Query",
 		Field:      field,
 		IsMethod:   true,
 		IsResolver: true,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_Event(ctx, field)
+			return ec.childFields_ClusterCacheGVRSync(ctx, field)
 		},
 	}
 	defer func() {
@@ -6669,7 +6800,7 @@ func (ec *executionContext) fieldContext_Query_clusterCacheGVRSyncEvents(ctx con
 		}
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
-	if fc.Args, err = ec.field_Query_clusterCacheGVRSyncEvents_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+	if fc.Args, err = ec.field_Query_clusterCacheGVRSync_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -9000,6 +9131,42 @@ func (ec *executionContext) _ClusterCache(ctx context.Context, sel ast.Selection
 			}
 
 			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+		case "events":
+			field := field
+
+			innerFunc := func(ctx context.Context, fs *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._ClusterCache_events(ctx, field, obj)
+				if res == graphql.Null {
+					atomic.AddUint32(&fs.Invalids, 1)
+				}
+				return res
+			}
+
+			if field.Deferrable != nil {
+				dfs, ok := deferred[field.Deferrable.Label]
+				di := 0
+				if ok {
+					dfs.AddField(field)
+					di = len(dfs.Values) - 1
+				} else {
+					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
+					deferred[field.Deferrable.Label] = dfs
+				}
+				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
+					return innerFunc(ctx, dfs)
+				})
+
+				// don't run the out.Concurrently() call below
+				out.Values[i] = graphql.Null
+				continue
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -9339,6 +9506,42 @@ func (ec *executionContext) _ClusterCacheGVRSync(ctx context.Context, sel ast.Se
 			if out.Values[i] == graphql.Null {
 				atomic.AddUint32(&out.Invalids, 1)
 			}
+		case "events":
+			field := field
+
+			innerFunc := func(ctx context.Context, fs *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._ClusterCacheGVRSync_events(ctx, field, obj)
+				if res == graphql.Null {
+					atomic.AddUint32(&fs.Invalids, 1)
+				}
+				return res
+			}
+
+			if field.Deferrable != nil {
+				dfs, ok := deferred[field.Deferrable.Label]
+				di := 0
+				if ok {
+					dfs.AddField(field)
+					di = len(dfs.Values) - 1
+				} else {
+					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
+					deferred[field.Deferrable.Label] = dfs
+				}
+				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
+					return innerFunc(ctx, dfs)
+				})
+
+				// don't run the out.Concurrently() call below
+				out.Values[i] = graphql.Null
+				continue
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -10932,19 +11135,16 @@ func (ec *executionContext) _Query(ctx context.Context, sel ast.SelectionSet) gr
 			}
 
 			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return rrm(innerCtx) })
-		case "clusterCacheEvents":
+		case "clusterCache":
 			field := field
 
-			innerFunc := func(ctx context.Context, fs *graphql.FieldSet) (res graphql.Marshaler) {
+			innerFunc := func(ctx context.Context, _ *graphql.FieldSet) (res graphql.Marshaler) {
 				defer func() {
 					if r := recover(); r != nil {
 						ec.Error(ctx, ec.Recover(ctx, r))
 					}
 				}()
-				res = ec._Query_clusterCacheEvents(ctx, field)
-				if res == graphql.Null {
-					atomic.AddUint32(&fs.Invalids, 1)
-				}
+				res = ec._Query_clusterCache(ctx, field)
 				return res
 			}
 
@@ -10954,19 +11154,16 @@ func (ec *executionContext) _Query(ctx context.Context, sel ast.SelectionSet) gr
 			}
 
 			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return rrm(innerCtx) })
-		case "clusterCacheGVRSyncEvents":
+		case "clusterCacheGVRSync":
 			field := field
 
-			innerFunc := func(ctx context.Context, fs *graphql.FieldSet) (res graphql.Marshaler) {
+			innerFunc := func(ctx context.Context, _ *graphql.FieldSet) (res graphql.Marshaler) {
 				defer func() {
 					if r := recover(); r != nil {
 						ec.Error(ctx, ec.Recover(ctx, r))
 					}
 				}()
-				res = ec._Query_clusterCacheGVRSyncEvents(ctx, field)
-				if res == graphql.Null {
-					atomic.AddUint32(&fs.Invalids, 1)
-				}
+				res = ec._Query_clusterCacheGVRSync(ctx, field)
 				return res
 			}
 
