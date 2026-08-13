@@ -322,13 +322,14 @@ func TestClusterEventsPublicSurface(t *testing.T) {
 	ch, err := svc.Clusters().WatchEvents(ctx, id, &category)
 	require.NoError(t, err)
 
-	e := recv(t, ch)
+	e := recvRun(t, ch)
 	assert.Equal(t, "ReasonA", e.Reason)
+	recvEventBookmark(t, ch)
 
 	require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 		Category: cat, Type: beehive.EventNormal, Reason: "ReasonB",
 	}))
-	e = recv(t, ch)
+	e = recvRun(t, ch)
 	assert.Equal(t, "ReasonB", e.Reason)
 }
 

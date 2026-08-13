@@ -79,22 +79,31 @@ func (s *Service) events(ctx context.Context, c eventClient, id beehive.ObjectID
 	return out, nil
 }
 
-// watchEvents streams one object's event log as bare runs: snapshot runs first,
-// then growth. beehive conflates per run id, so the consumer upserts by Event.ID —
-// no add/modify classification. The stream's terminal error is logged.
-func (s *Service) watchEvents(ctx context.Context, c eventClient, id beehive.ObjectID, category *string) (<-chan domain.Event, error) {
+// watchEvents streams one object's event log: the snapshot runs, one bookmark, then
+// growth. beehive conflates per run id, so the consumer upserts by Event.ID — no
+// add/modify classification, and no deletes (a prune is never delivered). The
+// stream's terminal error is logged.
+func (s *Service) watchEvents(ctx context.Context, c eventClient, id beehive.ObjectID, category *string) (<-chan domain.EventWatchFrame, error) {
 	stream, err := c.WatchEvents(ctx, id, eventOpts(category, defaultEventLimit)...)
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan domain.Event, 1)
+	out := make(chan domain.EventWatchFrame, 1)
 	go func() {
 		defer close(out)
-		emit := func(e beehive.Event) bool { return send(ctx, out, toDomainEvent(e)) }
+		emit := func(e beehive.Event) bool {
+			ev := toDomainEvent(e)
+			return send(ctx, out, domain.EventWatchFrame{Type: domain.EventFrameRun, Event: &ev})
+		}
 		for _, e := range stream.Runs {
 			if !emit(e) {
 				return
 			}
+		}
+		// Unconditionally correct here: beehive reads the snapshot before returning and
+		// streams only what grew above it, so this boundary needs no latch.
+		if !send(ctx, out, domain.EventWatchFrame{Type: domain.EventFrameBookmark}) {
+			return
 		}
 		for {
 			select {

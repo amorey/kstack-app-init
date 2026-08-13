@@ -315,6 +315,26 @@ const (
 	FrameBookmark FrameType = "Bookmark"
 )
 
+// EventFrameType classifies one frame on an event-timeline watch. Two values where
+// FrameType has four, because an event log is a positioned log rather than a mirrored
+// set: beehive delivers the snapshot plus what grows above it and never reports a
+// prune, so a run is only ever upserted and there is no Deleted to forward.
+type EventFrameType string
+
+const (
+	EventFrameRun EventFrameType = "Run"
+	// EventFrameBookmark closes the on-subscribe snapshot, exactly once per stream, so
+	// a consumer can tell an empty timeline from one still arriving.
+	EventFrameBookmark EventFrameType = "Bookmark"
+)
+
+// EventWatchFrame is one frame on an event-timeline watch: a run to upsert by
+// Event.ID, or the bookmark closing the snapshot, which carries no run.
+type EventWatchFrame struct {
+	Type  EventFrameType
+	Event *Event
+}
+
 // TimePtrEqual compares two optional timestamps: both nil is equal, and a present
 // pair compares by instant, so two readings of the same stamp never look changed.
 func TimePtrEqual(a, b *time.Time) bool {

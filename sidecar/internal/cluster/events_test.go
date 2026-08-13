@@ -83,15 +83,10 @@ func TestServiceEventsReadsTimeline(t *testing.T) {
 	assert.Equal(t, "ReasonB", limited[0].Reason)
 }
 
-// watchEvents streams bare runs (mirroring beehive's WatchEvents): the snapshot replays
-// existing runs, a repeated same-outcome occurrence re-delivers the run with a bumped
-// count under the same id (the consumer upserts), and a changed reason delivers a fresh
-// run with a distinct id.
-
-// watchEvents streams bare runs (mirroring beehive's WatchEvents): the snapshot replays
-// existing runs, a repeated same-outcome occurrence re-delivers the run with a bumped
-// count under the same id (the consumer upserts), and a changed reason delivers a fresh
-// run with a distinct id.
+// watchEvents streams runs closed by one bookmark (mirroring beehive's WatchEvents):
+// the snapshot replays existing runs, a repeated same-outcome occurrence re-delivers the
+// run with a bumped count under the same id (the consumer upserts), and a changed reason
+// delivers a fresh run with a distinct id.
 func TestServiceWatchEventsStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -109,19 +104,20 @@ func TestServiceWatchEventsStream(t *testing.T) {
 	ch, err := s.watchEvents(ctx, s.coreClient, oid, &category)
 	require.NoError(t, err)
 
-	// snapshot: run A
-	e := recv(t, ch)
+	// snapshot: run A, then the bookmark closing it
+	e := recvRun(t, ch)
 	assert.Equal(t, "ReasonA", e.Reason)
 	assert.Equal(t, beehive.EventWarning, e.Type)
 	assert.Equal(t, 1, e.Count)
 	runA := e.ID
 	assert.NotZero(t, runA)
+	recvEventBookmark(t, ch)
 
 	// extend run A → re-delivered with the same id, count 2
 	require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 		Category: cat, Type: beehive.EventWarning, Reason: "ReasonA", Message: "boom",
 	}))
-	e = recv(t, ch)
+	e = recvRun(t, ch)
 	assert.Equal(t, runA, e.ID)
 	assert.Equal(t, 2, e.Count)
 
@@ -129,7 +125,7 @@ func TestServiceWatchEventsStream(t *testing.T) {
 	require.NoError(t, coreCC.AddEvent(ctx, oid, beehive.EventSpec{
 		Category: cat, Type: beehive.EventNormal, Reason: "ReasonB",
 	}))
-	e = recv(t, ch)
+	e = recvRun(t, ch)
 	assert.Equal(t, "ReasonB", e.Reason)
 	assert.NotEqual(t, runA, e.ID)
 

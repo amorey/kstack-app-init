@@ -88,13 +88,16 @@ const ClusterConnectionRetryMutation = graphql(`
 const ClusterConnectionEventsSubscription = graphql(`
   subscription ClusterConnectionEvents($id: ObjectID!) {
     clusterEventsWatch(id: $id, category: "connection") {
-      id
       type
-      reason
-      message
-      count
-      firstAt
-      lastAt
+      event {
+        id
+        type
+        reason
+        message
+        count
+        firstAt
+        lastAt
+      }
     }
   }
 `);
@@ -110,11 +113,27 @@ type EventRun = {
   lastAt: string;
 };
 
-// A raw Event frame off a *EventsWatch subscription, before `ok` is derived.
+// A raw Event off a *EventsWatch subscription, before `ok` is derived.
 type RawEvent = Omit<EventRun, 'ok'> & { type: string };
 
-// Upsert by run id, newest-first by lastAt.
-function foldRun(prev: EventRun[] | undefined, ev: RawEvent): EventRun[] {
+// One frame: a run, or the bookmark closing the snapshot (which carries none).
+type RawEventFrame = { type: string; event: RawEvent | null };
+
+// A timeline plus whether its snapshot is complete. Reading `runs` before `synced`
+// shows a still-arriving history as the whole of it — an empty one especially.
+type Timeline = { runs: EventRun[]; synced: boolean };
+
+// The server prunes each timeline past this many runs. The stream is append-only —
+// a prune is never announced — so a long-lived subscription would otherwise keep
+// runs the server has already dropped. Mirrors maxEventRuns in the sidecar.
+const MAX_EVENT_RUNS = 20;
+
+// Upsert by run id, newest-first by lastAt, oldest beyond the retention bound dropped.
+function foldFrame(prev: Timeline | undefined, frame: RawEventFrame): Timeline {
+  const base = prev ?? { runs: [], synced: false };
+  if (frame.type === 'Bookmark') return { ...base, synced: true };
+  if (!frame.event) return base;
+  const ev = frame.event;
   const run: EventRun = {
     id: ev.id,
     ok: ev.type === 'Normal',
@@ -124,18 +143,20 @@ function foldRun(prev: EventRun[] | undefined, ev: RawEvent): EventRun[] {
     firstAt: ev.firstAt,
     lastAt: ev.lastAt,
   };
-  const next = (prev ?? []).filter((a) => a.id !== run.id);
+  const next = base.runs.filter((a) => a.id !== run.id);
   next.push(run);
   next.sort((a, b) => (a.lastAt < b.lastAt ? 1 : -1));
-  return next;
+  return { ...base, runs: next.slice(0, MAX_EVENT_RUNS) };
 }
 
+const EMPTY_TIMELINE: Timeline = { runs: [], synced: false };
+
 function useConnectionAttempts(clusterId: string): EventRun[] {
-  const [{ data }] = useWatchSubscription<{ clusterEventsWatch: RawEvent }, EventRun[]>(
+  const [{ data }] = useWatchSubscription<{ clusterEventsWatch: RawEventFrame }, Timeline>(
     { query: ClusterConnectionEventsSubscription, variables: { id: clusterId } },
-    (prev, resp) => foldRun(prev, resp.clusterEventsWatch),
+    (prev, resp) => foldFrame(prev, resp.clusterEventsWatch),
   );
-  return data ?? [];
+  return data?.runs ?? [];
 }
 
 // Sync-event history, keyed by a ClusterCacheGVRSync record's id (each kind's
@@ -144,25 +165,29 @@ function useConnectionAttempts(clusterId: string): EventRun[] {
 const ClusterSyncEventsSubscription = graphql(`
   subscription ClusterSyncEvents($id: ObjectID!) {
     clusterCacheGVRSyncEventsWatch(id: $id, category: "sync") {
-      id
       type
-      reason
-      message
-      count
-      firstAt
-      lastAt
+      event {
+        id
+        type
+        reason
+        message
+        count
+        firstAt
+        lastAt
+      }
     }
   }
 `);
 
 // One kind's sync-transition log; paused until there's an id (a placeholder
-// subscription would carry nothing).
-function useSyncEvents(syncId: string | undefined): EventRun[] {
-  const [{ data }] = useWatchSubscription<{ clusterCacheGVRSyncEventsWatch: RawEvent }, EventRun[]>(
+// subscription would carry nothing). Returns the timeline, not bare runs: the empty
+// state must not render before the bookmark says the history really is empty.
+function useSyncEvents(syncId: string | undefined): Timeline {
+  const [{ data }] = useWatchSubscription<{ clusterCacheGVRSyncEventsWatch: RawEventFrame }, Timeline>(
     { query: ClusterSyncEventsSubscription, variables: { id: syncId ?? '' }, pause: !syncId },
-    (prev, resp) => foldRun(prev, resp.clusterCacheGVRSyncEventsWatch),
+    (prev, resp) => foldFrame(prev, resp.clusterCacheGVRSyncEventsWatch),
   );
-  return data ?? [];
+  return data ?? EMPTY_TIMELINE;
 }
 
 // The cache's GVR-discovery record (which kinds the cluster serves, and how current
@@ -788,15 +813,17 @@ function SyncDetail({
         {/* No fallback: omit rather than assert a verification that never happened. */}
         <DetailRow label="Sync verified" ms={lastLiveMs} />
       </dl>
-      {events.length > 0 ? (
+      {events.runs.length > 0 ? (
         <EventRunList
           title={timelineKind ? `Recent sync events — ${timelineKind.spec.resource}` : 'Recent sync events'}
-          runs={events}
+          runs={events.runs}
           labelOf={(e) => e.reason}
           showDuration={false}
         />
       ) : (
-        <p className="text-xs text-muted-foreground">No sync events yet.</p>
+        // Only once the bookmark says the history really is empty — before that a
+        // still-arriving timeline would read as "none".
+        events.synced && <p className="text-xs text-muted-foreground">No sync events yet.</p>
       )}
     </div>
   );

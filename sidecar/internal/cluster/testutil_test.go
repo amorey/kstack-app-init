@@ -42,6 +42,24 @@ func recv[T any](t *testing.T, ch <-chan T) T {
 	return testutil.Recv(t, ch, "a stream value")
 }
 
+// recvRun receives the next event frame and asserts it carries a run.
+func recvRun(t *testing.T, ch <-chan domain.EventWatchFrame) domain.Event {
+	t.Helper()
+	f := recv(t, ch)
+	require.Equal(t, domain.EventFrameRun, f.Type)
+	require.NotNil(t, f.Event)
+	return *f.Event
+}
+
+// recvEventBookmark receives the next event frame and asserts it is the bookmark
+// closing the snapshot.
+func recvEventBookmark(t *testing.T, ch <-chan domain.EventWatchFrame) {
+	t.Helper()
+	f := recv(t, ch)
+	require.Equal(t, domain.EventFrameBookmark, f.Type)
+	require.Nil(t, f.Event)
+}
+
 // requireBookmark asserts a change is the one that closes a delta watch's snapshot:
 // every such watch sends exactly one, after the last snapshot object and before the
 // first live change. `entity` is the change's entity field — the caller reads it,

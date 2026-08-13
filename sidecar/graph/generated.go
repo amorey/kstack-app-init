@@ -284,6 +284,11 @@ type ComplexityRoot struct {
 		Type     func(childComplexity int) int
 	}
 
+	EventWatchFrame struct {
+		Event func(childComplexity int) int
+		Type  func(childComplexity int) int
+	}
+
 	Identity struct {
 		Email  func(childComplexity int) int
 		Name   func(childComplexity int) int
@@ -399,15 +404,15 @@ type QueryResolver interface {
 }
 type SubscriptionResolver interface {
 	ClustersWatch(ctx context.Context) (<-chan *domain.ClusterWatchFrame, error)
-	ClusterEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.Event, error)
+	ClusterEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error)
 	ClusterScheduleWatch(ctx context.Context, id domain.ObjectID) (<-chan *domain.Schedule, error)
 	ClusterCachesWatch(ctx context.Context) (<-chan *domain.ClusterCacheWatchFrame, error)
 	ClusterCacheSyncHealthWatch(ctx context.Context) (<-chan *domain.ClusterCacheSyncHealth, error)
 	ClusterCacheGVRDiscoveriesWatch(ctx context.Context) (<-chan *domain.ClusterCacheGVRDiscoveryWatchFrame, error)
 	ClusterCacheGVRSyncsWatch(ctx context.Context, cacheID domain.ObjectID) (<-chan *domain.ClusterCacheGVRSyncWatchFrame, error)
 	ClusterCacheStatsWatch(ctx context.Context, id domain.ObjectID, cacheID domain.ObjectID) (<-chan *domain.ClusterCacheStats, error)
-	ClusterCacheEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.Event, error)
-	ClusterCacheGVRSyncEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.Event, error)
+	ClusterCacheEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error)
+	ClusterCacheGVRSyncEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error)
 	ClusterDataKindsWatch(ctx context.Context, id domain.ObjectID, cacheID domain.ObjectID) (<-chan *domain.ClusterDataKindWatchFrame, error)
 	ClusterDataEventsWatch(ctx context.Context, id domain.ObjectID, cacheID domain.ObjectID) (<-chan *domain.ClusterDataEventWatchFrame, error)
 	ClusterDataObjectsWatch(ctx context.Context, id domain.ObjectID, cacheID domain.ObjectID, apiVersion string, resource string) (<-chan *domain.ClusterDataObjectWatchFrame, error)
@@ -1291,6 +1296,19 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Event.Type(childComplexity), true
+
+	case "EventWatchFrame.event":
+		if e.ComplexityRoot.EventWatchFrame.Event == nil {
+			break
+		}
+
+		return e.ComplexityRoot.EventWatchFrame.Event(childComplexity), true
+	case "EventWatchFrame.type":
+		if e.ComplexityRoot.EventWatchFrame.Type == nil {
+			break
+		}
+
+		return e.ComplexityRoot.EventWatchFrame.Type(childComplexity), true
 
 	case "Identity.email":
 		if e.ComplexityRoot.Identity.Email == nil {
@@ -2239,6 +2257,16 @@ func (ec *executionContext) childFields_Event(ctx context.Context, field graphql
 		return ec.fieldContext_Event_lastAt(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type Event", field.Name)
+}
+
+func (ec *executionContext) childFields_EventWatchFrame(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "type":
+		return ec.fieldContext_EventWatchFrame_type(ctx, field)
+	case "event":
+		return ec.fieldContext_EventWatchFrame_event(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type EventWatchFrame", field.Name)
 }
 
 func (ec *executionContext) childFields_Identity(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -6407,6 +6435,61 @@ func (ec *executionContext) fieldContext_Event_lastAt(_ context.Context, field g
 	return graphql.NewScalarFieldContext("Event", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
+func (ec *executionContext) _EventWatchFrame_type(ctx context.Context, field graphql.CollectedField, obj *domain.EventWatchFrame) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_EventWatchFrame_type(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Type, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v domain.EventFrameType) graphql.Marshaler {
+			return ec.marshalNEventFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventFrameType(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_EventWatchFrame_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("EventWatchFrame", field, false, false, errors.New("field of type EventFrameType does not have child fields"))
+}
+
+func (ec *executionContext) _EventWatchFrame_event(ctx context.Context, field graphql.CollectedField, obj *domain.EventWatchFrame) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_EventWatchFrame_event(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Event, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *domain.Event) graphql.Marshaler {
+			return ec.marshalOEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEvent(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_EventWatchFrame_event(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "EventWatchFrame",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_Event(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
 func (ec *executionContext) _Identity_sub(ctx context.Context, field graphql.CollectedField, obj *oauth.Identity) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -7331,8 +7414,8 @@ func (ec *executionContext) _Subscription_clusterEventsWatch(ctx context.Context
 			return ec.Resolvers.Subscription().ClusterEventsWatch(ctx, fc.Args["id"].(domain.ObjectID), fc.Args["category"].(*string))
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *domain.Event) graphql.Marshaler {
-			return ec.marshalNEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEvent(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v *domain.EventWatchFrame) graphql.Marshaler {
+			return ec.marshalNEventWatchFrame2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventWatchFrame(ctx, selections, v)
 		},
 		true,
 		true,
@@ -7345,7 +7428,7 @@ func (ec *executionContext) fieldContext_Subscription_clusterEventsWatch(ctx con
 		IsMethod:   true,
 		IsResolver: true,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_Event(ctx, field)
+			return ec.childFields_EventWatchFrame(ctx, field)
 		},
 	}
 	defer func() {
@@ -7603,8 +7686,8 @@ func (ec *executionContext) _Subscription_clusterCacheEventsWatch(ctx context.Co
 			return ec.Resolvers.Subscription().ClusterCacheEventsWatch(ctx, fc.Args["id"].(domain.ObjectID), fc.Args["category"].(*string))
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *domain.Event) graphql.Marshaler {
-			return ec.marshalNEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEvent(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v *domain.EventWatchFrame) graphql.Marshaler {
+			return ec.marshalNEventWatchFrame2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventWatchFrame(ctx, selections, v)
 		},
 		true,
 		true,
@@ -7617,7 +7700,7 @@ func (ec *executionContext) fieldContext_Subscription_clusterCacheEventsWatch(ct
 		IsMethod:   true,
 		IsResolver: true,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_Event(ctx, field)
+			return ec.childFields_EventWatchFrame(ctx, field)
 		},
 	}
 	defer func() {
@@ -7647,8 +7730,8 @@ func (ec *executionContext) _Subscription_clusterCacheGVRSyncEventsWatch(ctx con
 			return ec.Resolvers.Subscription().ClusterCacheGVRSyncEventsWatch(ctx, fc.Args["id"].(domain.ObjectID), fc.Args["category"].(*string))
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *domain.Event) graphql.Marshaler {
-			return ec.marshalNEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEvent(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v *domain.EventWatchFrame) graphql.Marshaler {
+			return ec.marshalNEventWatchFrame2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventWatchFrame(ctx, selections, v)
 		},
 		true,
 		true,
@@ -7661,7 +7744,7 @@ func (ec *executionContext) fieldContext_Subscription_clusterCacheGVRSyncEventsW
 		IsMethod:   true,
 		IsResolver: true,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_Event(ctx, field)
+			return ec.childFields_EventWatchFrame(ctx, field)
 		},
 	}
 	defer func() {
@@ -11188,6 +11271,47 @@ func (ec *executionContext) _Event(ctx context.Context, sel ast.SelectionSet, ob
 	return out
 }
 
+var eventWatchFrameImplementors = []string{"EventWatchFrame"}
+
+func (ec *executionContext) _EventWatchFrame(ctx context.Context, sel ast.SelectionSet, obj *domain.EventWatchFrame) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, eventWatchFrameImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("EventWatchFrame")
+		case "type":
+			out.Values[i] = ec._EventWatchFrame_type(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "event":
+			out.Values[i] = ec._EventWatchFrame_event(ctx, field, obj)
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
 var identityImplementors = []string{"Identity"}
 
 func (ec *executionContext) _Identity(ctx context.Context, sel ast.SelectionSet, obj *oauth.Identity) graphql.Marshaler {
@@ -12475,10 +12599,6 @@ func (ec *executionContext) marshalNConditionStatus2githubᚗcomᚋamoreyᚋbeeh
 	return res
 }
 
-func (ec *executionContext) marshalNEvent2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEvent(ctx context.Context, sel ast.SelectionSet, v domain.Event) graphql.Marshaler {
-	return ec._Event(ctx, sel, &v)
-}
-
 func (ec *executionContext) marshalNEvent2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventᚄ(ctx context.Context, sel ast.SelectionSet, v []*domain.Event) graphql.Marshaler {
 	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
 		fc := graphql.GetFieldContext(ctx)
@@ -12505,6 +12625,23 @@ func (ec *executionContext) marshalNEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkst
 	return ec._Event(ctx, sel, v)
 }
 
+func (ec *executionContext) unmarshalNEventFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventFrameType(ctx context.Context, v any) (domain.EventFrameType, error) {
+	tmp, err := graphql.UnmarshalString(v)
+	res := domain.EventFrameType(tmp)
+	return res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) marshalNEventFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventFrameType(ctx context.Context, sel ast.SelectionSet, v domain.EventFrameType) graphql.Marshaler {
+	_ = sel
+	res := graphql.MarshalString(string(v))
+	if res == graphql.Null {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+	}
+	return res
+}
+
 func (ec *executionContext) unmarshalNEventType2githubᚗcomᚋamoreyᚋbeehiveᚐEventType(ctx context.Context, v any) (beehive.EventType, error) {
 	tmp, err := graphql.UnmarshalString(v)
 	res := beehive.EventType(tmp)
@@ -12520,6 +12657,20 @@ func (ec *executionContext) marshalNEventType2githubᚗcomᚋamoreyᚋbeehiveᚐ
 		}
 	}
 	return res
+}
+
+func (ec *executionContext) marshalNEventWatchFrame2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventWatchFrame(ctx context.Context, sel ast.SelectionSet, v domain.EventWatchFrame) graphql.Marshaler {
+	return ec._EventWatchFrame(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNEventWatchFrame2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEventWatchFrame(ctx context.Context, sel ast.SelectionSet, v *domain.EventWatchFrame) graphql.Marshaler {
+	if v == nil {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+		return graphql.Null
+	}
+	return ec._EventWatchFrame(ctx, sel, v)
 }
 
 func (ec *executionContext) unmarshalNFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐFrameType(ctx context.Context, v any) (domain.FrameType, error) {
@@ -12975,6 +13126,13 @@ func (ec *executionContext) marshalOClusterStatusSourceKubeconfig2ᚖgithubᚗco
 		return graphql.Null
 	}
 	return ec._ClusterStatusSourceKubeconfig(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalOEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclusterᚋdomainᚐEvent(ctx context.Context, sel ast.SelectionSet, v *domain.Event) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return ec._Event(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalOIdentity2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋauthᚋoauthᚐIdentity(ctx context.Context, sel ast.SelectionSet, v *oauth.Identity) graphql.Marshaler {

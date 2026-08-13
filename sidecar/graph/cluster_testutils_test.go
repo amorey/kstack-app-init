@@ -406,8 +406,8 @@ func (f fakeClusters) ListEvents(_ context.Context, id domain.ClusterID, _ *stri
 	return f.s.events[id], nil
 }
 
-func (f fakeClusters) WatchEvents(ctx context.Context, _ domain.ClusterID, _ *string) (<-chan domain.Event, error) {
-	ch := make(chan domain.Event)
+func (f fakeClusters) WatchEvents(ctx context.Context, _ domain.ClusterID, _ *string) (<-chan domain.EventWatchFrame, error) {
+	ch := make(chan domain.EventWatchFrame)
 	go func() {
 		<-ctx.Done()
 		close(ch)
@@ -440,8 +440,8 @@ func (f fakeCaches) ListEvents(_ context.Context, id domain.ClusterCacheID, _ *s
 	return f.s.cacheEvents[id], nil
 }
 
-func (f fakeCaches) WatchEvents(ctx context.Context, _ domain.ClusterCacheID, _ *string) (<-chan domain.Event, error) {
-	ch := make(chan domain.Event)
+func (f fakeCaches) WatchEvents(ctx context.Context, _ domain.ClusterCacheID, _ *string) (<-chan domain.EventWatchFrame, error) {
+	ch := make(chan domain.EventWatchFrame)
 	go func() {
 		<-ctx.Done()
 		close(ch)
@@ -488,8 +488,8 @@ func (f fakeSyncs) ListEvents(_ context.Context, id domain.ClusterCacheGVRSyncID
 	return f.s.syncEvents[id], nil
 }
 
-func (f fakeSyncs) WatchEvents(ctx context.Context, _ domain.ClusterCacheGVRSyncID, _ *string) (<-chan domain.Event, error) {
-	ch := make(chan domain.Event)
+func (f fakeSyncs) WatchEvents(ctx context.Context, _ domain.ClusterCacheGVRSyncID, _ *string) (<-chan domain.EventWatchFrame, error) {
+	ch := make(chan domain.EventWatchFrame)
 	go func() {
 		<-ctx.Done()
 		close(ch)

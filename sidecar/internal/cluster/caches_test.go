@@ -363,18 +363,17 @@ func TestClusterCacheEventsPublicSurface(t *testing.T) {
 	ch, err := svc.Caches().WatchEvents(ctx, domain.ClusterCacheID(cacheOID), &category)
 	require.NoError(t, err)
 
-	e := recv(t, ch)
+	e := recvRun(t, ch)
 	assert.Equal(t, "Watching", e.Reason)
+	recvEventBookmark(t, ch)
 
 	require.NoError(t, cacheCC.AddEvent(ctx, cacheOID, beehive.EventSpec{
 		Category: cat, Type: beehive.EventWarning, Reason: "SyncFailed", Message: "boom",
 	}))
-	e = recv(t, ch)
+	e = recvRun(t, ch)
 	assert.Equal(t, "SyncFailed", e.Reason)
 	assert.Equal(t, "boom", e.Message)
 }
-
-// recvStats takes the next value off a stats gauge, failing on timeout.
 
 // recvStats takes the next value off a stats gauge, failing on timeout.
 func recvStats(t *testing.T, ch <-chan domain.ClusterCacheStats) domain.ClusterCacheStats {

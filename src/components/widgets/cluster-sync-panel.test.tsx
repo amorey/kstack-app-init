@@ -223,8 +223,8 @@ function pushClusters(rows: Row[]) {
   );
 }
 
-// Push one frame on the per-cluster clusterEventsWatch stream (a bare Event).
-// Call after a row's diagnostics are open (mounts the events subscription).
+// Push one run on the per-cluster clusterEventsWatch stream. Call after a row's
+// diagnostics are open (mounts the events subscription).
 function pushConnectionEvent(ev: {
   id: string;
   type: 'Normal' | 'Warning';
@@ -235,13 +235,21 @@ function pushConnectionEvent(ev: {
   lastAt: string;
 }) {
   channelFor('clusterEventsWatch').onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { clusterEventsWatch: ev } } }),
+    JSON.stringify({ type: 'next', payload: { data: { clusterEventsWatch: { type: 'Run', event: ev } } } }),
   );
 }
 
-// Push one frame on the clusterCacheGVRSyncEventsWatch stream (a bare Event) — the
-// one kind's transition timeline. Call after a row's sync diagnostics are open
-// (mounts the sync-events subscription).
+// Close an event timeline's snapshot. Until this lands the timeline is still
+// arriving, so a consumer must not render its empty state.
+function pushEventBookmark(watchField: string) {
+  channelFor(watchField).onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { [watchField]: { type: 'Bookmark', event: null } } } }),
+  );
+}
+
+// Push one run on the clusterCacheGVRSyncEventsWatch stream — the one kind's
+// transition timeline. Call after a row's sync diagnostics are open (mounts the
+// sync-events subscription).
 function pushSyncEvent(ev: {
   id: string;
   type: 'Normal' | 'Warning';
@@ -252,7 +260,10 @@ function pushSyncEvent(ev: {
   lastAt: string;
 }) {
   channelFor('clusterCacheGVRSyncEventsWatch').onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { clusterCacheGVRSyncEventsWatch: ev } } }),
+    JSON.stringify({
+      type: 'next',
+      payload: { data: { clusterCacheGVRSyncEventsWatch: { type: 'Run', event: ev } } },
+    }),
   );
 }
 
@@ -1031,6 +1042,23 @@ describe('ClusterSyncPanel', () => {
     // Raw reason codes, with the run's ×count multiplier when > 1.
     expect(screen.getByText(/SyncDegraded ×3/i)).toBeInTheDocument();
     expect(screen.getByText('SyncComplete')).toBeInTheDocument();
+  });
+
+  // A timeline with no runs yet is indistinguishable from one still arriving until the
+  // bookmark lands, so the empty state waits for it. Without the gate a kind with a
+  // long history reads "No sync events yet." until its first run arrives.
+  it('withholds the empty sync-event state until the snapshot closes', async () => {
+    const user = await openWith([{ uuid: 'u-sync', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    await act(async () => pushGVRSync('g-events', 'events', 'Watching'));
+
+    // Subscribed, nothing delivered: still loading, so no verdict either way.
+    expect(screen.queryByText(/no sync events yet/i)).not.toBeInTheDocument();
+
+    await act(async () => pushEventBookmark('clusterCacheGVRSyncEventsWatch'));
+
+    // Now the emptiness is a real answer.
+    expect(await screen.findByText(/no sync events yet/i)).toBeInTheDocument();
   });
 
   it('shows a last-update freshness line in the sync detail, driven by lastUpdateAt', async () => {

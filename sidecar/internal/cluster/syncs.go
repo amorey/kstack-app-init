@@ -255,6 +255,6 @@ func (a syncsAPI) ListEvents(ctx context.Context, id domain.ClusterCacheGVRSyncI
 
 // WatchEvents implements Syncs — one synced kind's entrypoint to the generic
 // event watch.
-func (a syncsAPI) WatchEvents(ctx context.Context, id domain.ClusterCacheGVRSyncID, category *string) (<-chan domain.Event, error) {
+func (a syncsAPI) WatchEvents(ctx context.Context, id domain.ClusterCacheGVRSyncID, category *string) (<-chan domain.EventWatchFrame, error) {
 	return a.s.watchEvents(ctx, a.s.gvrSyncClient, beehive.ObjectID(id), category)
 }

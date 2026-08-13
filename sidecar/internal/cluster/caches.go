@@ -183,7 +183,7 @@ func (a cachesAPI) ListEvents(ctx context.Context, id domain.ClusterCacheID, cat
 
 // WatchEvents implements Caches — the ClusterCache-kind entrypoint to the
 // generic event watch (over the cache client).
-func (a cachesAPI) WatchEvents(ctx context.Context, id domain.ClusterCacheID, category *string) (<-chan domain.Event, error) {
+func (a cachesAPI) WatchEvents(ctx context.Context, id domain.ClusterCacheID, category *string) (<-chan domain.EventWatchFrame, error) {
 	return a.s.watchEvents(ctx, a.s.cacheClient, beehive.ObjectID(id), category)
 }
 

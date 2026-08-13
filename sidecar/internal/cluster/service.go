@@ -80,7 +80,7 @@ type Clusters interface {
 	ListEvents(ctx context.Context, id domain.ClusterID, category *string, limit *int) ([]domain.Event, error)
 	// WatchEvents streams a cluster's event log as bare runs (snapshot then live;
 	// the consumer upserts by Event.ID). Independent of Watch.
-	WatchEvents(ctx context.Context, id domain.ClusterID, category *string) (<-chan domain.Event, error)
+	WatchEvents(ctx context.Context, id domain.ClusterID, category *string) (<-chan domain.EventWatchFrame, error)
 	// WatchSchedule streams a cluster's reconcile-schedule gauge (next requeue
 	// time) — the live source for the UI's next-attempt countdown, since a
 	// scheduling change fires no object WatchList.
@@ -116,7 +116,7 @@ type Caches interface {
 	// ListEvents is the ClusterCache-kind counterpart of Clusters().ListEvents.
 	ListEvents(ctx context.Context, id domain.ClusterCacheID, category *string, limit *int) ([]domain.Event, error)
 	// WatchEvents is the ClusterCache-kind counterpart of Clusters().WatchEvents.
-	WatchEvents(ctx context.Context, id domain.ClusterCacheID, category *string) (<-chan domain.Event, error)
+	WatchEvents(ctx context.Context, id domain.ClusterCacheID, category *string) (<-chan domain.EventWatchFrame, error)
 	// Clear deletes the on-disk cache and bounces its syncs; the record stays.
 	Clear(ctx context.Context, id domain.ClusterID) (*domain.Cluster, error)
 	// WatchSyncHealth streams every cache's sync verdict folded from its per-kind
@@ -160,7 +160,7 @@ type Syncs interface {
 	// ListEvents returns one synced kind's beehive event timeline.
 	ListEvents(ctx context.Context, id domain.ClusterCacheGVRSyncID, category *string, limit *int) ([]domain.Event, error)
 	// WatchEvents streams one synced kind's event log as bare runs.
-	WatchEvents(ctx context.Context, id domain.ClusterCacheGVRSyncID, category *string) (<-chan domain.Event, error)
+	WatchEvents(ctx context.Context, id domain.ClusterCacheGVRSyncID, category *string) (<-chan domain.EventWatchFrame, error)
 }
 
 // Data is the cached Kubernetes content in one cache's db — the only family whose

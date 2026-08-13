@@ -165,6 +165,34 @@ enum FrameType {
   Bookmark
 }
 
+"""
+Classifies one frame on an event-timeline watch. Two values where `FrameType` has
+four: an event log is a positioned log, not a mirrored set. The server delivers the
+snapshot plus what grows above it and never reports a prune, so a run is only ever
+upserted and there is no `Deleted`.
+"""
+enum EventFrameType {
+  "A run to upsert by `Event.id`."
+  Run
+  "Closes the on-subscribe snapshot; sent once, carrying no run."
+  Bookmark
+}
+
+"""
+One frame on an event-timeline watch (`clusterEventsWatch` and its ClusterCache /
+ClusterCacheGVRSync counterparts).
+
+The accumulated set is append-only and can outgrow the server's: retention bounds
+each timeline to a fixed number of runs, and a pruned run is not announced. A
+long-lived consumer should cap what it keeps rather than expect the server to
+evict for it.
+"""
+type EventWatchFrame {
+  type: EventFrameType!
+  "The run. Null on `Bookmark`."
+  event: Event
+}
+
 # --- Cluster ---
 # A tracked kube-context: its record, its connection observations, and its own
 # event/schedule surfaces. The cache mirror beneath it is ClusterCache; the data
@@ -860,7 +888,7 @@ type Subscription {
   clustersWatch: ClusterWatchFrame!
 
   "A cluster's event timeline, upserted by `id`; optionally one `category`. Independent of `clustersWatch`."
-  clusterEventsWatch(id: ObjectID!, category: String): Event!
+  clusterEventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   "A cluster's next-reconcile gauge — what keeps a disconnected cluster's countdown live, since scheduling fires no object watch."
   clusterScheduleWatch(id: ObjectID!): Schedule!
@@ -882,10 +910,10 @@ type Subscription {
   clusterCacheStatsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheStats!
 
   "A cache's event timeline, upserted by `id`; optionally one `category`. The `ClusterCache` counterpart of `clusterEventsWatch`."
-  clusterCacheEventsWatch(id: ObjectID!, category: String): Event!
+  clusterCacheEventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   "One synced kind's transition history, upserted by `id`; optionally one `category`. Where the per-kind sync history lives."
-  clusterCacheGVRSyncEventsWatch(id: ObjectID!, category: String): Event!
+  clusterCacheGVRSyncEventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   # --- Cluster data ---
   "One cache's discovered kind catalog as a delta watch, keyed by `apiVersion` + `resource`. Counts are live, so an object write re-emits its kind. The live counterpart of `ClusterCache.kinds`."

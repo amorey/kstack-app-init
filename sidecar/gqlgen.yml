@@ -88,6 +88,15 @@ models:
   Event:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.Event
 
+  # The event watches' envelope. Its own two-value enum rather than FrameType: the
+  # log is append-only, so Added/Modified/Deleted would advertise transitions that
+  # can never arrive.
+  EventWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.EventWatchFrame
+
+  EventFrameType:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain.EventFrameType
+
   EventType:
     model: github.com/amorey/beehive.EventType
 

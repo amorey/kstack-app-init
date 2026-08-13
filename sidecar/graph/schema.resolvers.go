@@ -221,7 +221,7 @@ func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *domai
 
 // ClusterEventsWatch is the resolver for the clusterEventsWatch field — the live
 // event tail for one cluster, decoupled from clustersWatch.
-func (r *subscriptionResolver) ClusterEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.Event, error) {
+func (r *subscriptionResolver) ClusterEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
 	ch, err := r.ClusterSvc.Clusters().WatchEvents(ctx, id, category)
 	if err != nil {
 		return nil, err
@@ -295,7 +295,7 @@ func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id do
 
 // ClusterCacheEventsWatch is the resolver for the clusterCacheEventsWatch field —
 // the live event tail for one ClusterCache, decoupled from clusterCachesWatch.
-func (r *subscriptionResolver) ClusterCacheEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.Event, error) {
+func (r *subscriptionResolver) ClusterCacheEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
 	ch, err := r.ClusterSvc.Caches().WatchEvents(ctx, id, category)
 	if err != nil {
 		return nil, err
@@ -304,7 +304,7 @@ func (r *subscriptionResolver) ClusterCacheEventsWatch(ctx context.Context, id d
 }
 
 // ClusterCacheGVRSyncEventsWatch is the resolver for the clusterCacheGVRSyncEventsWatch field.
-func (r *subscriptionResolver) ClusterCacheGVRSyncEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.Event, error) {
+func (r *subscriptionResolver) ClusterCacheGVRSyncEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
 	ch, err := r.ClusterSvc.Syncs().WatchEvents(ctx, id, category)
 	if err != nil {
 		return nil, err

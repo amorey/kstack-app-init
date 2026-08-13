@@ -94,7 +94,7 @@ func (a clustersAPI) ListEvents(ctx context.Context, id domain.ClusterID, catego
 
 // WatchEvents implements Clusters — the Cluster-kind entrypoint to the generic
 // event watch.
-func (a clustersAPI) WatchEvents(ctx context.Context, id domain.ClusterID, category *string) (<-chan domain.Event, error) {
+func (a clustersAPI) WatchEvents(ctx context.Context, id domain.ClusterID, category *string) (<-chan domain.EventWatchFrame, error) {
 	return a.s.watchEvents(ctx, a.s.coreClient, beehive.ObjectID(id), category)
 }
 
