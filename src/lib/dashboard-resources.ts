@@ -89,7 +89,7 @@ export type DashboardNavNode = {
   readonly moreChildren?: readonly DashboardNavNode[];
 };
 
-// A `clusterDataKinds` row. Declared here, not imported from `@/gql`, so this
+// A `ClusterDataKind` row. Declared here, not imported from `@/gql`, so this
 // module stays pure and testable.
 export type ServerKind = {
   apiVersion: string;

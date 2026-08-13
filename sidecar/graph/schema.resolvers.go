@@ -31,6 +31,16 @@ func (r *clusterCacheResolver) Stats(ctx context.Context, obj *domain.ClusterCac
 	return r.ClusterSvc.Caches().GetStats(ctx, obj.ClusterID, obj.ID)
 }
 
+// Kinds is the resolver for the kinds field — this cache's discovered kind catalog.
+// Both ids come off the record, so they cannot name different caches.
+func (r *clusterCacheResolver) Kinds(ctx context.Context, obj *domain.ClusterCache) ([]*domain.ClusterDataKind, error) {
+	kinds, err := r.ClusterSvc.Data().ListKinds(ctx, obj.ClusterID, obj.ID)
+	if err != nil {
+		return nil, err
+	}
+	return ptrSlice(kinds), nil
+}
+
 // Events is the resolver for the events field — this cache's own event timeline.
 // A separate beehive read, so it runs only when selected.
 func (r *clusterCacheResolver) Events(ctx context.Context, obj *domain.ClusterCache, category *string, limit *int) ([]*domain.Event, error) {
@@ -162,16 +172,6 @@ func (r *queryResolver) ClusterCache(ctx context.Context, id domain.ObjectID) (*
 // unknown or deletion-pending id is null per the schema, not an error.
 func (r *queryResolver) ClusterCacheGVRSync(ctx context.Context, id domain.ObjectID) (*domain.ClusterCacheGVRSync, error) {
 	return r.ClusterSvc.Syncs().Get(ctx, id)
-}
-
-// ClusterDataKinds is the resolver for the clusterDataKinds field — one
-// ClusterCache's discovered kind catalog (parent cluster id + cache id).
-func (r *queryResolver) ClusterDataKinds(ctx context.Context, id domain.ObjectID, cacheID domain.ObjectID) ([]*domain.ClusterDataKind, error) {
-	kinds, err := r.ClusterSvc.Data().ListKinds(ctx, id, cacheID)
-	if err != nil {
-		return nil, err
-	}
-	return ptrSlice(kinds), nil
 }
 
 // AuthState is the resolver for the authState field. auth.State binds directly to the

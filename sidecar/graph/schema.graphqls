@@ -372,6 +372,14 @@ type ClusterCache {
   stats: ClusterCacheStats!
 
   """
+  The kinds this cache's API server advertises (from `/apis` discovery), read
+  from this cache's catalog — the read behind the dashboard's dynamic resource
+  nav. Empty for a cache that has not synced yet. Resolved on selection; the live
+  counterpart is `clusterDataKindsWatch`.
+  """
+  kinds: [ClusterDataKind!]!
+
+  """
   This cache's control-plane event timeline (newest run first), optionally
   filtered to one `category` (e.g. `"sync"`, the cache-sync history) and bounded
   by `limit`. Carries only what the cache itself records — the per-kind sync
@@ -789,14 +797,6 @@ type Query {
   clusterCacheGVRSync(id: ObjectID!): ClusterCacheGVRSync
 
   # --- Cluster data ---
-  """
-  The kinds a cluster's API server advertises (from `/apis` discovery), read from one
-  ClusterCache's catalog (`id` = parent cluster, `cacheID` = the cache — typically the
-  active one). Used to build the dashboard's dynamic resource nav. Empty for a cache
-  that has not synced yet. Read on demand (per active cache), not streamed.
-  """
-  clusterDataKinds(id: ObjectID!, cacheID: ObjectID!): [ClusterDataKind!]!
-
   # --- Cloud account ---
   "Current authentication state. Signed-out when no cloud account is configured; live updates via authStateWatch."
   authState: AuthState!
@@ -953,7 +953,7 @@ type Subscription {
   # --- Cluster data ---
   """
   Streams one ClusterCache's discovered kind catalog as a Kubernetes-style delta
-  watch (the live counterpart of `clusterDataKinds`, keyed the same way — parent
+  watch (the live counterpart of `ClusterCache.kinds`, keyed by parent
   cluster `id` + `cacheID`): the current catalog as an `Added` burst on subscribe,
   closed by one `Bookmark`; then one `Added`/`Modified`/`Deleted` change per kind as the sync engine writes
   objects — a kind's per-object `count` is live, so an object write re-emits it as

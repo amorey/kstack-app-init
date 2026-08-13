@@ -655,11 +655,11 @@ func TestClusterCacheStatsWatchServesGauge(t *testing.T) {
 }
 
 // --- Cluster data ---
-// and the cached objects read out of a ClusterCache. Fixtures and the
-// fakeClusterService live in cluster_testutils_test.go ---
+// The discovered kind catalog and the cached objects read out of a ClusterCache.
 
-// clusterDataKinds maps the service's domain ClusterDataKinds onto the wire 1:1 (bound
-// via gqlgen.yml), so the resolver just adapts the value slice to a pointer slice.
+// ClusterCache.kinds maps the service's domain ClusterDataKinds onto the wire 1:1
+// (bound via gqlgen.yml), so the resolver just adapts the value slice to a pointer
+// slice. Both ids it reads with come off the record, so the pair cannot disagree.
 func TestClusterDataKindsResolver(t *testing.T) {
 	fix := clusterFixtures()
 	svc := newFakeClusterService(fix)
@@ -675,15 +675,17 @@ func TestClusterDataKindsResolver(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	query := `{ clusterDataKinds(id: "` + strconv.FormatInt(int64(id), 10) + `", cacheID: "` + strconv.FormatInt(int64(id), 10) + `") {
-		apiVersion kind resource scope isCRD
+	query := `{ clusterCache(id: "` + strconv.FormatInt(int64(id), 10) + `") {
+		kinds { apiVersion kind resource scope isCRD }
 	} }`
 	body, _ := json.Marshal(map[string]string{"query": query})
 	raw := postGQL(t, srv.URL, string(body))
 
 	var resp struct {
 		Data struct {
-			ClusterDataKinds []map[string]any `json:"clusterDataKinds"`
+			ClusterCache struct {
+				Kinds []map[string]any `json:"kinds"`
+			} `json:"clusterCache"`
 		}
 		Errors []struct{ Message string }
 	}
@@ -693,35 +695,38 @@ func TestClusterDataKindsResolver(t *testing.T) {
 	if len(resp.Errors) > 0 {
 		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
 	}
-	if len(resp.Data.ClusterDataKinds) != 2 {
-		t.Fatalf("want 2 kinds, got %d: %s", len(resp.Data.ClusterDataKinds), raw)
+	if len(resp.Data.ClusterCache.Kinds) != 2 {
+		t.Fatalf("want 2 kinds, got %d: %s", len(resp.Data.ClusterCache.Kinds), raw)
 	}
-	k := resp.Data.ClusterDataKinds[0]
+	k := resp.Data.ClusterCache.Kinds[0]
 	if k["apiVersion"] != "apps/v1" || k["kind"] != "Deployment" || k["resource"] != "deployments" {
 		t.Errorf("first kind: %v", k)
 	}
 	if k["scope"] != "Namespaced" || k["isCRD"] != false {
 		t.Errorf("first kind scope/isCRD: %v", k)
 	}
-	if resp.Data.ClusterDataKinds[1]["isCRD"] != true {
-		t.Errorf("second kind should be a CRD: %v", resp.Data.ClusterDataKinds[1])
+	if resp.Data.ClusterCache.Kinds[1]["isCRD"] != true {
+		t.Errorf("second kind should be a CRD: %v", resp.Data.ClusterCache.Kinds[1])
 	}
 
-	// Unknown cluster → empty list, not an error.
-	q2 := `{ clusterDataKinds(id: "99999", cacheID: "99999") { kind } }`
+	// An unknown id resolves the record to null rather than erroring, so the catalog
+	// is never reached — where the root field used to answer with an empty list.
+	q2 := `{ clusterCache(id: "99999") { kinds { kind } } }`
 	b2, _ := json.Marshal(map[string]string{"query": q2})
 	raw2 := postGQL(t, srv.URL, string(b2))
 	var resp2 struct {
 		Data struct {
-			ClusterDataKinds []map[string]any `json:"clusterDataKinds"`
+			ClusterCache *struct {
+				Kinds []map[string]any `json:"kinds"`
+			} `json:"clusterCache"`
 		}
 		Errors []struct{ Message string }
 	}
 	if err := json.Unmarshal(raw2, &resp2); err != nil {
 		t.Fatalf("decode %s: %v", raw2, err)
 	}
-	if len(resp2.Errors) > 0 || len(resp2.Data.ClusterDataKinds) != 0 {
-		t.Fatalf("unknown cluster should yield empty kinds, got %s", raw2)
+	if len(resp2.Errors) > 0 || resp2.Data.ClusterCache != nil {
+		t.Fatalf("unknown cache should resolve to null, got %s", raw2)
 	}
 }
 
