@@ -87,7 +87,7 @@ const ClusterConnectionRetryMutation = graphql(`
 // while a row's diagnostics are open.
 const ClusterConnectionEventsSubscription = graphql(`
   subscription ClusterConnectionEvents($id: ObjectID!) {
-    clusterEventsWatch(id: $id, category: "connection") {
+    objectEventsWatch(id: $id, category: "connection") {
       type
       event {
         id
@@ -152,9 +152,9 @@ function foldFrame(prev: Timeline | undefined, frame: RawEventFrame): Timeline {
 const EMPTY_TIMELINE: Timeline = { runs: [], synced: false };
 
 function useConnectionAttempts(clusterId: string): EventRun[] {
-  const [{ data }] = useWatchSubscription<{ clusterEventsWatch: RawEventFrame }, Timeline>(
+  const [{ data }] = useWatchSubscription<{ objectEventsWatch: RawEventFrame }, Timeline>(
     { query: ClusterConnectionEventsSubscription, variables: { id: clusterId } },
-    (prev, resp) => foldFrame(prev, resp.clusterEventsWatch),
+    (prev, resp) => foldFrame(prev, resp.objectEventsWatch),
   );
   return data?.runs ?? [];
 }
@@ -164,7 +164,7 @@ function useConnectionAttempts(clusterId: string): EventRun[] {
 // detail is open, one kind at a time.
 const ClusterSyncEventsSubscription = graphql(`
   subscription ClusterSyncEvents($id: ObjectID!) {
-    clusterCacheGVRSyncEventsWatch(id: $id, category: "sync") {
+    objectEventsWatch(id: $id, category: "sync") {
       type
       event {
         id
@@ -183,9 +183,9 @@ const ClusterSyncEventsSubscription = graphql(`
 // subscription would carry nothing). Returns the timeline, not bare runs: the empty
 // state must not render before the bookmark says the history really is empty.
 function useSyncEvents(syncId: string | undefined): Timeline {
-  const [{ data }] = useWatchSubscription<{ clusterCacheGVRSyncEventsWatch: RawEventFrame }, Timeline>(
+  const [{ data }] = useWatchSubscription<{ objectEventsWatch: RawEventFrame }, Timeline>(
     { query: ClusterSyncEventsSubscription, variables: { id: syncId ?? '' }, pause: !syncId },
-    (prev, resp) => foldFrame(prev, resp.clusterCacheGVRSyncEventsWatch),
+    (prev, resp) => foldFrame(prev, resp.objectEventsWatch),
   );
   return data ?? EMPTY_TIMELINE;
 }

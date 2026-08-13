@@ -60,6 +60,13 @@ type ClusterService interface {
 	RetryConnection(ctx context.Context, id domain.ClusterID) error
 	// GetConnection returns the live REST config for id, or nil when not connected.
 	GetConnection(id domain.ClusterID) *rest.Config
+
+	// WatchObjectEvents streams any object's event timeline — the snapshot runs, one
+	// bookmark, then growth — whatever kind the id names. Top-level rather than per
+	// family because an event carries no kind of its own: one reader serves every
+	// record that has a timeline. The per-record point reads stay on their families
+	// (Clusters().ListEvents and siblings), which is what the `events` fields use.
+	WatchObjectEvents(ctx context.Context, id domain.ObjectID, category *string) (<-chan domain.EventWatchFrame, error)
 }
 
 // Clusters is the Cluster record surface: the tracked clusters, their spec
@@ -78,9 +85,6 @@ type Clusters interface {
 	// optionally filtered by category and bounded by limit. Decoupled from Watch —
 	// event chatter never re-emits the cluster.
 	ListEvents(ctx context.Context, id domain.ClusterID, category *string, limit *int) ([]domain.Event, error)
-	// WatchEvents streams a cluster's event log as bare runs (snapshot then live;
-	// the consumer upserts by Event.ID). Independent of Watch.
-	WatchEvents(ctx context.Context, id domain.ClusterID, category *string) (<-chan domain.EventWatchFrame, error)
 	// WatchSchedule streams a cluster's reconcile-schedule gauge (next requeue
 	// time) — the live source for the UI's next-attempt countdown, since a
 	// scheduling change fires no object WatchList.
@@ -115,8 +119,6 @@ type Caches interface {
 	WatchStats(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheStats, error)
 	// ListEvents is the ClusterCache-kind counterpart of Clusters().ListEvents.
 	ListEvents(ctx context.Context, id domain.ClusterCacheID, category *string, limit *int) ([]domain.Event, error)
-	// WatchEvents is the ClusterCache-kind counterpart of Clusters().WatchEvents.
-	WatchEvents(ctx context.Context, id domain.ClusterCacheID, category *string) (<-chan domain.EventWatchFrame, error)
 	// Clear deletes the on-disk cache and bounces its syncs; the record stays.
 	Clear(ctx context.Context, id domain.ClusterID) (*domain.Cluster, error)
 	// WatchSyncHealth streams every cache's sync verdict folded from its per-kind
@@ -159,8 +161,6 @@ type Syncs interface {
 	SnapshotStats() map[domain.ClusterCacheGVRSyncID]domain.ClusterCacheGVRSyncStats
 	// ListEvents returns one synced kind's beehive event timeline.
 	ListEvents(ctx context.Context, id domain.ClusterCacheGVRSyncID, category *string, limit *int) ([]domain.Event, error)
-	// WatchEvents streams one synced kind's event log as bare runs.
-	WatchEvents(ctx context.Context, id domain.ClusterCacheGVRSyncID, category *string) (<-chan domain.EventWatchFrame, error)
 }
 
 // Data is the cached Kubernetes content in one cache's db — the only family whose

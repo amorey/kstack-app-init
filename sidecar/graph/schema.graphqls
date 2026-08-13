@@ -883,12 +883,19 @@ type Mutation {
 }
 
 type Subscription {
+  # --- Any object ---
+  """
+  Any object's event timeline, upserted by `id` and optionally filtered to one
+  `category`. One field for every record that has a timeline (`Cluster`,
+  `ClusterCache`, `ClusterCacheGVRSync`): an event carries no kind of its own, and
+  ids are unique across kinds, so the id alone says whose log to read. The matching
+  point read is each record's own `events` field.
+  """
+  objectEventsWatch(id: ObjectID!, category: String): EventWatchFrame!
+
   # --- Cluster ---
   "The cluster list as a delta watch, keyed by `cluster.id`. Cache sync status is not here — it streams on `clusterCachesWatch`."
   clustersWatch: ClusterWatchFrame!
-
-  "A cluster's event timeline, upserted by `id`; optionally one `category`. Independent of `clustersWatch`."
-  clusterEventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   "A cluster's next-reconcile gauge — what keeps a disconnected cluster's countdown live, since scheduling fires no object watch."
   clusterScheduleWatch(id: ObjectID!): Schedule!
@@ -908,12 +915,6 @@ type Subscription {
 
   "One cache's on-disk contents as a live gauge. A stream, not a `ClusterCache` field, which would freeze at subscribe time."
   clusterCacheStatsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheStats!
-
-  "A cache's event timeline, upserted by `id`; optionally one `category`. The `ClusterCache` counterpart of `clusterEventsWatch`."
-  clusterCacheEventsWatch(id: ObjectID!, category: String): EventWatchFrame!
-
-  "One synced kind's transition history, upserted by `id`; optionally one `category`. Where the per-kind sync history lives."
-  clusterCacheGVRSyncEventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   # --- Cluster data ---
   "One cache's discovered kind catalog as a delta watch, keyed by `apiVersion` + `resource`. Counts are live, so an object write re-emits its kind. The live counterpart of `ClusterCache.kinds`."

@@ -79,6 +79,14 @@ func (s *Service) events(ctx context.Context, c eventClient, id beehive.ObjectID
 	return out, nil
 }
 
+// WatchObjectEvents implements ClusterService — any object's timeline, whatever kind
+// its id names. The client passed below only has to be one whose kind has a registered
+// controller; that is a property of the caller, not a filter on the target, because an
+// event carries no kind of its own.
+func (s *Service) WatchObjectEvents(ctx context.Context, id domain.ObjectID, category *string) (<-chan domain.EventWatchFrame, error) {
+	return s.watchEvents(ctx, s.coreClient, beehive.ObjectID(id), category)
+}
+
 // watchEvents streams one object's event log: the snapshot runs, one bookmark, then
 // growth. beehive conflates per run id, so the consumer upserts by Event.ID — no
 // add/modify classification, and no deletes (a prune is never delivered). The

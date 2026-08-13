@@ -406,7 +406,9 @@ func (f fakeClusters) ListEvents(_ context.Context, id domain.ClusterID, _ *stri
 	return f.s.events[id], nil
 }
 
-func (f fakeClusters) WatchEvents(ctx context.Context, _ domain.ClusterID, _ *string) (<-chan domain.EventWatchFrame, error) {
+// WatchObjectEvents serves every record's timeline, as the real service does — one
+// reader, whatever kind the id names.
+func (f *fakeClusterService) WatchObjectEvents(ctx context.Context, _ domain.ObjectID, _ *string) (<-chan domain.EventWatchFrame, error) {
 	ch := make(chan domain.EventWatchFrame)
 	go func() {
 		<-ctx.Done()
@@ -438,15 +440,6 @@ func (f fakeCaches) ListEvents(_ context.Context, id domain.ClusterCacheID, _ *s
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
 	return f.s.cacheEvents[id], nil
-}
-
-func (f fakeCaches) WatchEvents(ctx context.Context, _ domain.ClusterCacheID, _ *string) (<-chan domain.EventWatchFrame, error) {
-	ch := make(chan domain.EventWatchFrame)
-	go func() {
-		<-ctx.Done()
-		close(ch)
-	}()
-	return ch, nil
 }
 
 func (f fakeSyncs) Get(_ context.Context, id domain.ClusterCacheGVRSyncID) (*domain.ClusterCacheGVRSync, error) {
@@ -486,15 +479,6 @@ func (f fakeSyncs) ListEvents(_ context.Context, id domain.ClusterCacheGVRSyncID
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
 	return f.s.syncEvents[id], nil
-}
-
-func (f fakeSyncs) WatchEvents(ctx context.Context, _ domain.ClusterCacheGVRSyncID, _ *string) (<-chan domain.EventWatchFrame, error) {
-	ch := make(chan domain.EventWatchFrame)
-	go func() {
-		<-ctx.Done()
-		close(ch)
-	}()
-	return ch, nil
 }
 
 func (f fakeClusters) WatchSchedule(ctx context.Context, _ domain.ClusterID) (<-chan domain.Schedule, error) {

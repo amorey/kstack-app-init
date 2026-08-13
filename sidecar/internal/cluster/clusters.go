@@ -92,12 +92,6 @@ func (a clustersAPI) ListEvents(ctx context.Context, id domain.ClusterID, catego
 	return a.s.events(ctx, a.s.coreClient, beehive.ObjectID(id), category, limit)
 }
 
-// WatchEvents implements Clusters — the Cluster-kind entrypoint to the generic
-// event watch.
-func (a clustersAPI) WatchEvents(ctx context.Context, id domain.ClusterID, category *string) (<-chan domain.EventWatchFrame, error) {
-	return a.s.watchEvents(ctx, a.s.coreClient, beehive.ObjectID(id), category)
-}
-
 // scheduleClient is the schedule-gauge slice of a beehive kind client; tests fake it.
 type scheduleClient interface {
 	WatchSchedule(ctx context.Context, id beehive.ObjectID) (<-chan beehive.Schedule, error)

@@ -181,12 +181,6 @@ func (a cachesAPI) ListEvents(ctx context.Context, id domain.ClusterCacheID, cat
 	return a.s.events(ctx, a.s.cacheClient, beehive.ObjectID(id), category, limit)
 }
 
-// WatchEvents implements Caches — the ClusterCache-kind entrypoint to the
-// generic event watch (over the cache client).
-func (a cachesAPI) WatchEvents(ctx context.Context, id domain.ClusterCacheID, category *string) (<-chan domain.EventWatchFrame, error) {
-	return a.s.watchEvents(ctx, a.s.cacheClient, beehive.ObjectID(id), category)
-}
-
 // clearCacheTimeout bounds Clear's detached drain → delete → restart sequence —
 // generous, there to stop a wedged step, not to pace anything.
 const clearCacheTimeout = 2 * time.Minute

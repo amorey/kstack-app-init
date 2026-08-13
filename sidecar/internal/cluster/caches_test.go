@@ -360,7 +360,7 @@ func TestClusterCacheEventsPublicSurface(t *testing.T) {
 	assert.Equal(t, beehive.EventNormal, evs[0].Type)
 
 	// ClusterCacheEventsWatch: snapshot replays the existing run, then a live run.
-	ch, err := svc.Caches().WatchEvents(ctx, domain.ClusterCacheID(cacheOID), &category)
+	ch, err := svc.WatchObjectEvents(ctx, domain.ObjectID(cacheOID), &category)
 	require.NoError(t, err)
 
 	e := recvRun(t, ch)

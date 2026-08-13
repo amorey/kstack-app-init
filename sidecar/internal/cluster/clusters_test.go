@@ -319,7 +319,7 @@ func TestClusterEventsPublicSurface(t *testing.T) {
 	assert.Equal(t, "ReasonA", evs[0].Reason)
 
 	// ClusterEventsWatch: snapshot replays the existing run, then a live run arrives
-	ch, err := svc.Clusters().WatchEvents(ctx, id, &category)
+	ch, err := svc.WatchObjectEvents(ctx, domain.ObjectID(id), &category)
 	require.NoError(t, err)
 
 	e := recvRun(t, ch)

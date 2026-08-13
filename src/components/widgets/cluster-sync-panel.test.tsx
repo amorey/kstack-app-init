@@ -223,7 +223,8 @@ function pushClusters(rows: Row[]) {
   );
 }
 
-// Push one run on the per-cluster clusterEventsWatch stream. Call after a row's
+// Push one run on the cluster's connection timeline. Both event subscriptions select
+// objectEventsWatch now, so the channel is picked by operation name, not field.
 // diagnostics are open (mounts the events subscription).
 function pushConnectionEvent(ev: {
   id: string;
@@ -234,20 +235,20 @@ function pushConnectionEvent(ev: {
   firstAt: string;
   lastAt: string;
 }) {
-  channelFor('clusterEventsWatch').onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { clusterEventsWatch: { type: 'Run', event: ev } } } }),
+  channelFor('ClusterConnectionEvents').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { objectEventsWatch: { type: 'Run', event: ev } } } }),
   );
 }
 
 // Close an event timeline's snapshot. Until this lands the timeline is still
 // arriving, so a consumer must not render its empty state.
-function pushEventBookmark(watchField: string) {
-  channelFor(watchField).onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { [watchField]: { type: 'Bookmark', event: null } } } }),
+function pushEventBookmark(operation: string) {
+  channelFor(operation).onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { objectEventsWatch: { type: 'Bookmark', event: null } } } }),
   );
 }
 
-// Push one run on the clusterCacheGVRSyncEventsWatch stream — the one kind's
+// Push one run on the one kind's
 // transition timeline. Call after a row's sync diagnostics are open (mounts the
 // sync-events subscription).
 function pushSyncEvent(ev: {
@@ -259,10 +260,10 @@ function pushSyncEvent(ev: {
   firstAt: string;
   lastAt: string;
 }) {
-  channelFor('clusterCacheGVRSyncEventsWatch').onmessage!(
+  channelFor('ClusterSyncEvents').onmessage!(
     JSON.stringify({
       type: 'next',
-      payload: { data: { clusterCacheGVRSyncEventsWatch: { type: 'Run', event: ev } } },
+      payload: { data: { objectEventsWatch: { type: 'Run', event: ev } } },
     }),
   );
 }
@@ -762,7 +763,7 @@ describe('ClusterSyncPanel', () => {
     expect(sub.query).toContain('message');
     expect(sub.query).toContain('transitionedAt');
     // The probe history and the next-attempt countdown are not inlined on
-    // the list — they stream per-row via clusterEventsWatch / clusterScheduleWatch.
+    // the list — they stream per-row via objectEventsWatch / clusterScheduleWatch.
     expect(sub.query).not.toContain('connectionAttempts');
     expect(sub.query).not.toContain('nextAttemptAt');
   });
@@ -782,7 +783,7 @@ describe('ClusterSyncPanel', () => {
     ]);
 
     // The Disconnected label is an interactive trigger (only the error state is).
-    // Opening it mounts the per-row clusterEventsWatch + clusterScheduleWatch subs.
+    // Opening it mounts the per-row objectEventsWatch + clusterScheduleWatch subs.
     await user.click(await screen.findByRole('button', { name: /disconnected/i }));
 
     // The next-attempt countdown streams in on the schedule gauge (decoupled from
@@ -1055,7 +1056,7 @@ describe('ClusterSyncPanel', () => {
     // Subscribed, nothing delivered: still loading, so no verdict either way.
     expect(screen.queryByText(/no sync events yet/i)).not.toBeInTheDocument();
 
-    await act(async () => pushEventBookmark('clusterCacheGVRSyncEventsWatch'));
+    await act(async () => pushEventBookmark('ClusterSyncEvents'));
 
     // Now the emptiness is a real answer.
     expect(await screen.findByText(/no sync events yet/i)).toBeInTheDocument();
@@ -1276,7 +1277,7 @@ describe('ClusterSyncPanel', () => {
     const subs = invokeMock.mock.calls.filter(([cmd]) => cmd === 'graphql_subscribe');
     const events = subs
       .map(([, arg]) => arg as { query: string; variables?: Record<string, unknown> })
-      .filter((a) => a.query.includes('clusterCacheGVRSyncEventsWatch'));
+      .filter((a) => a.query.includes('ClusterSyncEvents'));
     expect(events.at(-1)?.variables?.id).toBe('g-crd');
   });
 

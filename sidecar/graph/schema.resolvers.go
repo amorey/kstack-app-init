@@ -208,21 +208,21 @@ func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
 	return &state, nil
 }
 
-// ClustersWatch is the resolver for the clustersWatch field — the cluster list as
-// a delta watch (Added snapshot, then per-cluster Added/Modified/Deleted). Cache
-// sync status rides clusterCachesWatch, joined client-side.
-func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *domain.ClusterWatchFrame, error) {
-	ch, err := r.ClusterSvc.Clusters().Watch(ctx)
+// ObjectEventsWatch is the resolver for the objectEventsWatch field — the live event
+// tail for any record with a timeline, decoupled from that record's own watch.
+func (r *subscriptionResolver) ObjectEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
+	ch, err := r.ClusterSvc.WatchObjectEvents(ctx, id, category)
 	if err != nil {
 		return nil, err
 	}
 	return ptrStream(ctx, ch), nil
 }
 
-// ClusterEventsWatch is the resolver for the clusterEventsWatch field — the live
-// event tail for one cluster, decoupled from clustersWatch.
-func (r *subscriptionResolver) ClusterEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
-	ch, err := r.ClusterSvc.Clusters().WatchEvents(ctx, id, category)
+// ClustersWatch is the resolver for the clustersWatch field — the cluster list as
+// a delta watch (Added snapshot, then per-cluster Added/Modified/Deleted). Cache
+// sync status rides clusterCachesWatch, joined client-side.
+func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *domain.ClusterWatchFrame, error) {
+	ch, err := r.ClusterSvc.Clusters().Watch(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -287,25 +287,6 @@ func (r *subscriptionResolver) ClusterCacheGVRSyncsWatch(ctx context.Context, ca
 // once its record stops changing.
 func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id domain.ObjectID, cacheID domain.ObjectID) (<-chan *domain.ClusterCacheStats, error) {
 	ch, err := r.ClusterSvc.Caches().WatchStats(ctx, id, cacheID)
-	if err != nil {
-		return nil, err
-	}
-	return ptrStream(ctx, ch), nil
-}
-
-// ClusterCacheEventsWatch is the resolver for the clusterCacheEventsWatch field —
-// the live event tail for one ClusterCache, decoupled from clusterCachesWatch.
-func (r *subscriptionResolver) ClusterCacheEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
-	ch, err := r.ClusterSvc.Caches().WatchEvents(ctx, id, category)
-	if err != nil {
-		return nil, err
-	}
-	return ptrStream(ctx, ch), nil
-}
-
-// ClusterCacheGVRSyncEventsWatch is the resolver for the clusterCacheGVRSyncEventsWatch field.
-func (r *subscriptionResolver) ClusterCacheGVRSyncEventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
-	ch, err := r.ClusterSvc.Syncs().WatchEvents(ctx, id, category)
 	if err != nil {
 		return nil, err
 	}
