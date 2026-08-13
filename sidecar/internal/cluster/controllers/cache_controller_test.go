@@ -110,10 +110,10 @@ func awaitCacheSyncedReason(t *testing.T, cl beehive.Client[domain.ClusterCacheS
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	snap, ch, err := cl.Watch(ctx, id)
+	stream, err := cl.Watch(ctx, id)
 	require.NoError(t, err)
-	if snap.Object != nil {
-		if c := findCacheConditionOK(snap.Object.Conditions, domain.ConditionSynced); c != nil && c.Reason == want {
+	if stream.Object != nil {
+		if c := findCacheConditionOK(stream.Object.Conditions, domain.ConditionSynced); c != nil && c.Reason == want {
 			return *c
 		}
 	}
@@ -121,7 +121,7 @@ func awaitCacheSyncedReason(t *testing.T, cl beehive.Client[domain.ClusterCacheS
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
-		case ev, ok := <-ch:
+		case ev, ok := <-stream.Changes:
 			if !ok {
 				t.Fatalf("watch closed before Synced reason=%s on ClusterCache", want)
 			}

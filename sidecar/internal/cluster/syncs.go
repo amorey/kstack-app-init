@@ -132,11 +132,11 @@ func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-c
 		return nil, err
 	}
 
-	snap, src, err := a.s.gvrSyncClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
+	stream, err := a.s.gvrSyncClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
 		return nil, err
 	}
-	return filterChan(ctx, watchListChan(ctx, "ClusterCacheGVRSync", snap, src,
+	return filterChan(ctx, watchListChan(ctx, "ClusterCacheGVRSync", stream,
 		func(t domain.FrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]) domain.ClusterCacheGVRSyncWatchFrame {
 			if t == domain.FrameBookmark {
 				return domain.ClusterCacheGVRSyncWatchFrame{Type: t}

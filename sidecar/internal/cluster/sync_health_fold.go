@@ -110,12 +110,12 @@ func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context
 	// Background, not a caller's: the fold outlives every subscriber. Cancelled by
 	// stopSyncHealthFold, or by the fold itself on any other exit.
 	ctx, cancel := context.WithCancel(context.Background())
-	syncSnap, syncSrc, err := s.gvrSyncClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
+	syncStream, err := s.gvrSyncClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
 		cancel()
 		return nil, nil, nil, err
 	}
-	discSnap, discSrc, err := s.gvrDiscoveryClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
+	discStream, err := s.gvrDiscoveryClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
 		cancel()
 		return nil, nil, nil, err
@@ -154,10 +154,10 @@ func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context
 			stats:         s.Syncs().SnapshotStats,
 			out:           hub.Sender(),
 		}
-		for _, obj := range discSnap.Objects {
+		for _, obj := range discStream.Objects {
 			f.putDiscovery(obj)
 		}
-		for _, obj := range syncSnap.Objects {
+		for _, obj := range syncStream.Objects {
 			f.putSync(obj)
 		}
 		// A cache with an anchor but no kinds still needs its "nothing observed" verdict.
@@ -170,19 +170,15 @@ func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context
 			select {
 			case <-ctx.Done():
 				return
-			case ch, ok := <-discSrc:
+			case ch, ok := <-discStream.Changes:
 				if !ok {
-					return
-				}
-				if endSyncHealthWatch(ctx, "ClusterCacheGVRDiscovery", ch.Type, ch.Err) {
+					logSyncHealthWatchEnd(ctx, "ClusterCacheGVRDiscovery", discStream.Err())
 					return
 				}
 				f.applyDiscovery(ch)
-			case ch, ok := <-syncSrc:
+			case ch, ok := <-syncStream.Changes:
 				if !ok {
-					return
-				}
-				if endSyncHealthWatch(ctx, "ClusterCacheGVRSync", ch.Type, ch.Err) {
+					logSyncHealthWatchEnd(ctx, "ClusterCacheGVRSync", syncStream.Err())
 					return
 				}
 				f.applySync(ch)
@@ -197,17 +193,12 @@ func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context
 	return hub, cancel, done, nil
 }
 
-// endSyncHealthWatch reports whether a change frame is beehive's terminal one.
-// Check BEFORE folding: a Failed carries no object, which apply* would read as a
-// deletion.
-func endSyncHealthWatch(ctx context.Context, kind string, t beehive.ChangeType, err error) bool {
-	if t != beehive.Failed {
-		return false
-	}
-	if ctx.Err() == nil {
+// logSyncHealthWatchEnd reports why a fold watch stopped, once its stream closed.
+// A nil Err is the fold's own context ending, which is not a fault.
+func logSyncHealthWatchEnd(ctx context.Context, kind string, err error) {
+	if err != nil && ctx.Err() == nil {
 		slog.Warn("clusterservice: sync-health watch ended", "kind", kind, "err", err)
 	}
-	return true
 }
 
 // forgetSyncHealthFold drops the cached hub when its fold has ended. It clears

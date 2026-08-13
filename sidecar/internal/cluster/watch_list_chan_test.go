@@ -16,7 +16,6 @@ package cluster
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -42,18 +41,18 @@ type (
 	testStatus struct{}
 )
 
-// runWatchList pumps a snapshot and a change stream through watchListChan, folding
-// each change to a frame. The returned channel is the stream under test.
+// runWatchList pumps a beehive stream through watchListChan, folding each change to a
+// frame. The returned channel is the stream under test.
 func runWatchList(
 	ctx context.Context,
 	snapIDs []beehive.ObjectID,
 	src <-chan beehive.ObjectChange[testSpec, testStatus],
 ) <-chan frame {
-	snap := beehive.ObjectListSnapshot[testSpec, testStatus]{}
+	stream := &beehive.ObjectListStream[testSpec, testStatus]{Changes: src}
 	for _, id := range snapIDs {
-		snap.Objects = append(snap.Objects, &beehive.Object[testSpec, testStatus]{ID: id})
+		stream.Objects = append(stream.Objects, &beehive.Object[testSpec, testStatus]{ID: id})
 	}
-	return watchListChan(ctx, "Test", snap, src,
+	return watchListChan(ctx, "Test", stream,
 		func(t domain.FrameType, id beehive.ObjectID, _ *beehive.Object[testSpec, testStatus]) frame {
 			return frame{typ: t, id: id}
 		})
@@ -110,9 +109,10 @@ func TestWatchListChanCollapsesDeletionPendingToDeleted(t *testing.T) {
 		"a soft-delete reads as Modified upstream but must reach the client as Deleted")
 }
 
-// beehive's Failed change is terminal, so the stream ends rather than forwarding it —
-// a Failed frame has no object and would key as a phantom removal.
-func TestWatchListChanEndsOnFailed(t *testing.T) {
+// A beehive stream that fails closes its change channel and reports the reason from
+// Err(), so the pump ends with it rather than hanging on a source that will never
+// deliver again.
+func TestWatchListChanEndsWhenTheSourceCloses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -120,8 +120,8 @@ func TestWatchListChanEndsOnFailed(t *testing.T) {
 	out := runWatchList(ctx, nil, src)
 	require.Equal(t, frame{typ: domain.FrameBookmark}, recv(t, out))
 
-	src <- beehive.ObjectChange[testSpec, testStatus]{Type: beehive.Failed, Err: errors.New("watch too old")}
-	testutil.RecvClosed(t, out, "the stream on a terminal Failed change")
+	close(src)
+	testutil.RecvClosed(t, out, "the stream when its source closes")
 }
 
 // The stream closes when the subscriber goes away, whatever the source is doing.

@@ -69,11 +69,11 @@ func (a clustersAPI) Get(ctx context.Context, id domain.ClusterID) (*domain.Clus
 // WatchSchedule / Caches().Watch), so a settled disconnected cluster produces
 // no churn here.
 func (a clustersAPI) Watch(ctx context.Context) (<-chan domain.ClusterWatchFrame, error) {
-	snap, src, err := a.s.coreClient.WatchList(ctx)
+	stream, err := a.s.coreClient.WatchList(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return watchListChan(ctx, "Cluster", snap, src,
+	return watchListChan(ctx, "Cluster", stream,
 		func(t domain.FrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterSpec, domain.ClusterStatus]) domain.ClusterWatchFrame {
 			if t == domain.FrameBookmark {
 				return domain.ClusterWatchFrame{Type: t}

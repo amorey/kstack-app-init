@@ -72,9 +72,9 @@ func waitForCacheByName(t *testing.T, cl beehive.Client[domain.ClusterCacheSpec,
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	snap, ch, err := cl.WatchList(ctx)
+	stream, err := cl.WatchList(ctx)
 	require.NoError(t, err)
-	for _, obj := range snap.Objects {
+	for _, obj := range stream.Objects {
 		if obj.Name == name {
 			return obj
 		}
@@ -82,7 +82,7 @@ func waitForCacheByName(t *testing.T, cl beehive.Client[domain.ClusterCacheSpec,
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
-		case ev, ok := <-ch:
+		case ev, ok := <-stream.Changes:
 			if !ok {
 				t.Fatalf("watch closed before ClusterCache %q appeared", name)
 			}
@@ -193,15 +193,15 @@ func waitForObject(t *testing.T, cl beehive.Client[domain.ClusterSpec, domain.Cl
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	snap, ch, err := cl.Watch(ctx, id)
+	stream, err := cl.Watch(ctx, id)
 	require.NoError(t, err)
-	if snap.Object != nil && pred(snap.Object) {
-		return snap.Object
+	if stream.Object != nil && pred(stream.Object) {
+		return stream.Object
 	}
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
-		case ev, ok := <-ch:
+		case ev, ok := <-stream.Changes:
 			if !ok {
 				t.Fatal("watch closed before object predicate met")
 			}

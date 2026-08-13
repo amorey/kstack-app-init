@@ -25,11 +25,11 @@ import (
 // Watch implements Discovery — the discovery counterpart of Caches().Watch,
 // parent CacheID resolved from the owner edge.
 func (a discoveryAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRDiscoveryWatchFrame, error) {
-	snap, src, err := a.s.gvrDiscoveryClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
+	stream, err := a.s.gvrDiscoveryClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
 		return nil, err
 	}
-	return watchListChan(ctx, "ClusterCacheGVRDiscovery", snap, src,
+	return watchListChan(ctx, "ClusterCacheGVRDiscovery", stream,
 		func(t domain.FrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRDiscoverySpec, domain.ClusterCacheGVRDiscoveryStatus]) domain.ClusterCacheGVRDiscoveryWatchFrame {
 			if t == domain.FrameBookmark {
 				return domain.ClusterCacheGVRDiscoveryWatchFrame{Type: t}

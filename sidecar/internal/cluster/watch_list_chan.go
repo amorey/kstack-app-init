@@ -27,8 +27,8 @@ import (
 // Kubernetes-style delta stream, closing the snapshot with a single Bookmark so a
 // consumer can tell an empty collection from one still arriving. A deletion-pending
 // object is collapsed to Deleted (List/Get hide tombstones, so the watch removes it
-// at once; the trailing hard Deleted repeats idempotently). beehive's terminal Failed
-// change ends the stream after a log line. Out closes on exit.
+// at once; the trailing hard Deleted repeats idempotently). A stream that fails ends
+// after a log line, its reason read off stream.Err(). Out closes on exit.
 //
 // fn is called with a nil obj two ways, and must tell them apart: on FrameBookmark
 // (once, between snapshot and deltas) it must return a frame carrying NO entity; on a
@@ -36,8 +36,7 @@ import (
 func watchListChan[Spec, Status, Out any](
 	ctx context.Context,
 	kind string,
-	snap beehive.ObjectListSnapshot[Spec, Status],
-	src <-chan beehive.ObjectChange[Spec, Status],
+	stream *beehive.ObjectListStream[Spec, Status],
 	fn func(domain.FrameType, beehive.ObjectID, *beehive.Object[Spec, Status]) Out,
 ) <-chan Out {
 	out := make(chan Out, 1)
@@ -50,7 +49,7 @@ func watchListChan[Spec, Status, Out any](
 			}
 			return domain.FrameType(t)
 		}
-		for _, obj := range snap.Objects {
+		for _, obj := range stream.Objects {
 			if !send(ctx, out, fn(domainType(beehive.Added, obj), obj.ID, obj)) {
 				return
 			}
@@ -63,13 +62,10 @@ func watchListChan[Spec, Status, Out any](
 			select {
 			case <-ctx.Done():
 				return
-			case ev, ok := <-src:
+			case ev, ok := <-stream.Changes:
 				if !ok {
-					return
-				}
-				if ev.Type == beehive.Failed {
-					if ctx.Err() == nil {
-						slog.Warn("clusterservice: object watch ended", "kind", kind, "err", ev.Err)
+					if err := stream.Err(); err != nil && ctx.Err() == nil {
+						slog.Warn("clusterservice: object watch ended", "kind", kind, "err", err)
 					}
 					return
 				}

@@ -16,7 +16,6 @@ package cluster
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 
@@ -345,12 +344,13 @@ type syncSrcClient struct {
 }
 
 func (c *syncSrcClient) WatchList(ctx context.Context, _ ...beehive.WatchOption) (
-	beehive.ObjectListSnapshot[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus],
-	<-chan beehive.ObjectChange[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus],
+	*beehive.ObjectListStream[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus],
 	error,
 ) {
 	c.ctx <- ctx
-	return beehive.ObjectListSnapshot[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]{}, c.src, nil
+	return &beehive.ObjectListStream[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]{
+		Changes: c.src,
+	}, nil
 }
 
 // A fold can end without anybody calling its stop func: beehive terminates a watch
@@ -432,13 +432,4 @@ func TestSyncHealthFoldForgetOnlyClearsItsOwnHub(t *testing.T) {
 	s.forgetSyncHealthFold(old)
 
 	assert.Same(t, current, s.syncHealth, "a newer fold's hub must survive an older one ending")
-}
-
-// beehive's terminal frame carries no object. Folding it would read as a deletion and drop
-// the record on the way out, so it must be recognized before it reaches the reducer.
-func TestEndSyncHealthWatchRecognizesTheTerminalFrame(t *testing.T) {
-	ctx := context.Background()
-	assert.True(t, endSyncHealthWatch(ctx, "ClusterCacheGVRSync", beehive.Failed, errors.New("watch too old")))
-	assert.False(t, endSyncHealthWatch(ctx, "ClusterCacheGVRSync", beehive.Added, nil))
-	assert.False(t, endSyncHealthWatch(ctx, "ClusterCacheGVRSync", beehive.Deleted, nil))
 }

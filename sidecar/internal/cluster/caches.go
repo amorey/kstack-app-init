@@ -29,11 +29,11 @@ import (
 // Clusters().Watch, parent ClusterID resolved from the eager-loaded owner edge;
 // the caller joins by ClusterID.
 func (a cachesAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheWatchFrame, error) {
-	snap, src, err := a.s.cacheClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
+	stream, err := a.s.cacheClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
 		return nil, err
 	}
-	return watchListChan(ctx, "ClusterCache", snap, src,
+	return watchListChan(ctx, "ClusterCache", stream,
 		func(t domain.FrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheSpec, domain.ClusterCacheStatus]) domain.ClusterCacheWatchFrame {
 			if t == domain.FrameBookmark {
 				return domain.ClusterCacheWatchFrame{Type: t}
