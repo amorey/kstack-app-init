@@ -35,7 +35,7 @@ func TestStreamRecordsTheReasonBeforeClosingFrames(t *testing.T) {
 		return boom
 	})
 
-	require.Equal(t, 1, recv(t, s.Frames))
+	require.Equal(t, 1, testutil.Recv(t, s.Frames, "a stream value"))
 	testutil.WaitClosed(t, s.Frames, "the stream")
 	assert.Equal(t, boom, s.Err())
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/controllers"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
@@ -52,9 +51,9 @@ type Config struct {
 }
 
 // App owns the composed sidecar: one h2c handler fronting the GraphQL and gRPC
-// servers, plus the cluster service (which owns the beehive control plane and
-// the kube-config watcher), the auth and cloud services, and the poke bus they
-// share. It is an http.Handler; main() mounts it on the listener.
+// servers, plus the cluster service (a shell pending its rebuild), the auth and
+// cloud services, and the poke bus they share. It is an http.Handler; main()
+// mounts it on the listener.
 type App struct {
 	handler       http.Handler
 	graphqlServer *graph.Server
@@ -72,18 +71,12 @@ func New(cfg Config) (*App, error) {
 		return nil, fmt.Errorf("data dir is required (--data-dir / KSTACK_DATA_DIR)")
 	}
 
-	// Tighten client-go's HTTP/2 keepalive so a silently-dropped API-server
-	// connection is detected in ~15s (vs client-go's ~45s default) and the
-	// liveness sentinel re-probes promptly. Must run before any kube client is
-	// built.
-	controllers.ConfigureKubeHTTP2Keepalive()
-
 	// Shared cross-subsystem poke bus (wall-clock gap detector + host pokes via
 	// gRPC PokeService); see docs/adr/2026-08-09-poke-resync-fanout.md.
 	pokeSvc := poke.New()
 
-	// The whole cluster control plane behind one boundary (kubeconfig watcher,
-	// beehive store, controllers, importer, cache manager).
+	// The cluster backend behind one boundary. Stripped to a shell pending its
+	// rebuild — the wiring stands, every call panics.
 	clusterSvc, err := cluster.New(cfg.DataDir, cfg.KubeconfigPath, pokeSvc)
 	if err != nil {
 		return nil, err

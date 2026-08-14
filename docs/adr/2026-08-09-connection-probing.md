@@ -13,8 +13,7 @@ status: Accepted
 clusters that may be unreachable; at startup, beehive's full pass and the kubeconfig
 watcher's first snapshot enqueue every cluster at once. Users need fast connection-loss
 detection, an honest "retry now" button, and probe failures that don't spam the status watch
-(see [ADR: status propagation](2026-08-09-status-propagation-gauges.md) for where the history
-and countdown live instead).
+(the history and countdown ride their own streams instead).
 
 ## Decision
 

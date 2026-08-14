@@ -37,6 +37,12 @@ Superseding is a normal change, not a failure. Write a new ADR, flip the old one
 **update every `CLAUDE.md` link in the same commit** — a live doc pointing at a superseded ADR is
 the one way this system rots.
 
+**A torn-out subsystem's ADRs are deleted, not superseded.** Superseding says "we decided
+differently"; a teardown ahead of a rebuild has decided nothing yet, and a Superseded entry with no
+successor to point at is worse than no entry. Remove the files, their index rows, and every inbound
+link in the same commit — git history keeps them — and write the replacements as the new design
+lands. Superseding remains the rule everywhere else.
+
 ## Exemption from the "describe the present" rule
 
 The repo rule (root `CLAUDE.md`) is that code comments and docs describe only the current state —
@@ -65,12 +71,8 @@ usually just documentation in the wrong place.
 | 2026-08-09 | [Per-platform window chrome](2026-08-09-per-platform-window-chrome.md) | host | Accepted |
 | 2026-08-09 | [URL search params as window state](2026-08-09-url-params-as-window-state.md) | frontend | Accepted |
 | 2026-08-09 | [Dashboard nav: curated tree merged with discovered kinds](2026-08-09-dashboard-nav-merge.md) | frontend | Accepted |
-| 2026-08-09 | [Comparable RawJSON scalar; client-side columns](2026-08-09-rawjson-comparable-scalar.md) | cross-cutting | Accepted |
 | 2026-08-09 | [Beehive owner chain with ObjectID identity](2026-08-09-beehive-control-plane.md) | sidecar | Accepted |
-| 2026-08-09 | [Status is propagation; gauges ride streams](2026-08-09-status-propagation-gauges.md) | sidecar | Accepted |
 | 2026-08-09 | [Every condition is a liveness condition](2026-08-09-liveness-conditions.md) | sidecar | Accepted |
-| 2026-08-09 | [Sync: watch-for-latency, poll-for-correctness](2026-08-09-kubesync-watch-poll.md) | sidecar | Accepted |
-| 2026-08-09 | [One SQLite file per cache incarnation](2026-08-09-per-cluster-sqlite-cache.md) | sidecar | Accepted |
 | 2026-08-09 | [Local-first auth; settings sync depends on auth](2026-08-09-local-first-auth-settings.md) | sidecar | Accepted |
 | 2026-08-09 | [Resync via fan-out poke, not cascade](2026-08-09-poke-resync-fanout.md) | cross-cutting | Accepted |
 | 2026-08-09 | [Per-cluster parallel probing, sentinel, backoff-neutral retries](2026-08-09-connection-probing.md) | sidecar | Accepted |

@@ -78,8 +78,7 @@ a family missing a method would otherwise go uncaught until a call site broke.
 Two pre-existing inconsistencies are now visible in the family tables, and are deliberately
 left alone here: `Caches().GetStats` and everything in `Data()` take `(clusterID, cacheID)`
 while `Caches().ListEvents` takes only `cacheID`; and `Caches().WatchSyncHealth` is fleet-wide
-where the rest of its family is per-cache (one fold serves everyone — see
-[ADR: status propagation & gauges](2026-08-09-status-propagation-gauges.md)). Normalizing the
+where the rest of its family is per-cache (one fold serves everyone). Normalizing the
 first is a separate change; the second is intended and stated in the interface doc.
 
 `service_streams.go` has no test file of its own: it holds generic channel plumbing exercised

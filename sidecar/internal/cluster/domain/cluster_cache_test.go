@@ -18,8 +18,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
 // One cache per identity per cluster: the name is the creation/dedup key beehive's
@@ -52,10 +50,4 @@ func TestClusterCacheGVRSyncName(t *testing.T) {
 		ClusterCacheGVRSyncName(3, "apps/v1", "deployments"),
 		ClusterCacheGVRSyncName(4, "apps/v1", "deployments"),
 		"the same kind under another cache's anchor")
-}
-
-// The one beehive.ObjectID→int64 conversion point, which is what keeps the store
-// package beehive-free. The pair addresses one cache incarnation on disk.
-func TestNewCacheRef(t *testing.T) {
-	assert.Equal(t, store.CacheRef{ClusterID: 7, CacheID: 42}, NewCacheRef(7, 42))
 }

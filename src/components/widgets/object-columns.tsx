@@ -15,7 +15,6 @@
 // Per-kind extra columns for ObjectsTable, derived client-side from the object's
 // native `rawJSON` body; unregistered kinds (CRDs, rarer built-ins) get [] and
 // keep only the universal columns.
-// See docs/adr/2026-08-09-rawjson-comparable-scalar.md
 //
 // `rawJSON` is `unknown` off the wire — the server does no per-field typing — so
 // accessors cast to a narrow local shape and must degrade to "—" rather than

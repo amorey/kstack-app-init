@@ -23,8 +23,6 @@ import (
 	"time"
 
 	"github.com/amorey/beehive"
-
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/cache/store"
 )
 
 // ClusterCacheName returns a ClusterCache's name, "{ClusterID}/{serverUID}":
@@ -33,12 +31,6 @@ import (
 // owner edge.
 func ClusterCacheName(clusterID ClusterID, serverUID string) string {
 	return strconv.FormatInt(int64(clusterID), 10) + "/" + serverUID
-}
-
-// NewCacheRef builds the on-disk cache locator — the single beehive
-// ObjectID→int64 conversion point, keeping the store package beehive-free.
-func NewCacheRef(clusterObjID, cacheObjID beehive.ObjectID) store.CacheRef {
-	return store.CacheRef{ClusterID: int64(clusterObjID), CacheID: int64(cacheObjID)}
 }
 
 // ClusterCacheGroupKind identifies the ClusterCache beehive resource kind.
@@ -54,14 +46,12 @@ type ClusterCacheSpec struct {
 
 // ClusterCacheStatus is empty — this kind reports through its conditions alone;
 // the rollup a UI wants is served read-side by Caches().WatchSyncHealth.
-// See docs/adr/2026-08-09-status-propagation-gauges.md.
 type ClusterCacheStatus struct{}
 
 // EventsKind / EventsAPIVersion / EventsResource identify the Event collection —
 // an ordinary synced kind writing to its own table (eventsync). The server serves
 // the same events under two spellings backed by one store, so exactly one may be
-// synced: canonical `v1`; the discovery filter drops EventsAltGroup. See
-// docs/adr/2026-08-09-kubesync-watch-poll.md.
+// synced: canonical `v1`; the discovery filter drops EventsAltGroup.
 const (
 	EventsKind       = "Event"
 	EventsAPIVersion = "v1"
@@ -132,7 +122,7 @@ type ClusterCacheGVRDiscoverySpec struct {
 // channel — for state a dependent reacts to, not for pass gauges, which nothing
 // in the object graph reads. The gauges live in controller memory (see
 // ClusterCacheGVRDiscoveryStats); the Discovered condition (a beehive object row)
-// is what remains. See docs/adr/2026-08-09-status-propagation-gauges.md.
+// is what remains.
 type ClusterCacheGVRDiscoveryStatus struct{}
 
 // ClusterCacheGVRDiscoveryStats is one cache's live discovery gauges, held in
