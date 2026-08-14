@@ -19,8 +19,9 @@ than its cluster. The frontend needs current state on subscribe plus every chang
 
 Each kind streams **independently** as a Kubernetes-style delta watch: an `Added` snapshot
 burst, one `Bookmark` closing it, then per-object `Added`/`Modified`/`Deleted`
-(`clustersWatch`, `clusterCachesWatch`, `clusterCacheGVRDiscoveriesWatch`,
-`clusterCacheSyncHealthWatch`, and the cache-scoped `clusterCacheGVRSyncsWatch`). The sidecar
+(`clustersWatch`, `clusterCachesWatch`, `clusterCacheGVRDiscoveriesWatch`, and the
+cache-scoped `clusterCacheGVRSyncsWatch`; the sync verdict rides `clusterCacheSyncHealthWatch`,
+which is a gauge rather than a delta watch and carries no `Bookmark`). The sidecar
 folds beehive's per-kind `WatchList` into this shape in the `watchListStream` pump;
 subscription resolvers emit the current snapshot first, then deltas (`mapStream` in
 `graph/util.go` for hub-backed sources).

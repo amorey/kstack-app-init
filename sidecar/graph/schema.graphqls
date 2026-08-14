@@ -179,8 +179,7 @@ enum EventFrameType {
 }
 
 """
-One frame on an event-timeline watch (`clusterEventsWatch` and its ClusterCache /
-ClusterCacheGVRSync counterparts).
+One frame on an event-timeline watch (`eventsWatch`, whatever record's id it is given).
 
 The accumulated set is append-only and can outgrow the server's: retention bounds
 each timeline to a fixed number of runs, and a pruned run is not announced. A
@@ -883,22 +882,28 @@ type Mutation {
 }
 
 type Subscription {
+  # Two live shapes, named in every description below. A DELTA WATCH replays the current
+  # set, closes that snapshot with one Bookmark, then streams changes (DeltaFrameType) —
+  # so a consumer renders an empty state only after the Bookmark. A GAUGE is
+  # current-on-subscribe: its first value IS the snapshot, and no Bookmark rides it.
+  # Every subscription here is endless; chatStream alone completes.
+
   # --- Any object ---
-  "Any record's event timeline — `Cluster`, `ClusterCache`, `ClusterCacheGVRSync` — upserted by `id`; optionally one `category`. The point read is that record's own `events` field."
+  "Any record's event timeline — `Cluster`, `ClusterCache`, `ClusterCacheGVRSync` — as an event log: runs upserted by `Event.id`, the snapshot closed by one `Bookmark` (`EventFrameType`). Optionally one `category`. The point read is that record's own `events` field."
   eventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   # --- Cluster ---
   "The cluster list as a delta watch, keyed by `cluster.id`. Cache sync status is not here — it streams on `clusterCachesWatch`."
   clustersWatch: ClusterWatchFrame!
 
-  "A cluster's next-reconcile gauge — what keeps a disconnected cluster's countdown live, since scheduling fires no object watch."
+  "A cluster's next reconcile as a gauge — what keeps a disconnected cluster's countdown live, since scheduling fires no object watch."
   clusterScheduleWatch(id: ObjectID!): Schedule!
 
   # --- ClusterCache ---
   "Cache records as a delta watch, keyed by `cache.id` and joined onto clusters by `clusterID`. Carries no ordering guarantee against `clustersWatch`."
   clusterCachesWatch: ClusterCacheWatchFrame!
 
-  "Every cache's folded sync verdict as a latest-value stream keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's."
+  "Every cache's folded sync verdict as a gauge, keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's, so the client drops one when its cache leaves `clusterCachesWatch`."
   clusterCacheSyncHealthWatch: ClusterCacheSyncHealth!
 
   "The caches' GVR-discovery records as a delta watch, joined onto caches by `cacheID`. Unscoped: one record per cache."
@@ -907,7 +912,7 @@ type Subscription {
   "One cache's per-kind sync records as a delta watch, keyed by `sync.id`. Cache-scoped, since there is one record per synced kind."
   clusterCacheGVRSyncsWatch(cacheID: ObjectID!): ClusterCacheGVRSyncWatchFrame!
 
-  "One cache's on-disk contents as a live gauge. A stream, not a `ClusterCache` field, which would freeze at subscribe time."
+  "One cache's on-disk contents as a gauge. A subscription, not a `ClusterCache` field, which would freeze at subscribe time."
   clusterCacheStatsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheStats!
 
   # --- Cluster data ---
@@ -917,7 +922,7 @@ type Subscription {
     cacheID: ObjectID!
   ): ClusterDataKindWatchFrame!
 
-  "One cache's newest window of cached Kubernetes Events as a delta watch, keyed by `uid`; an event aging out of the window surfaces as `Deleted`. Distinct from `clusterEventsWatch`, which streams kstack's own timeline."
+  "One cache's newest window of cached Kubernetes Events as a delta watch, keyed by `uid`; an event aging out of the window surfaces as `Deleted`. Distinct from `eventsWatch`, which streams kstack's own timeline."
   clusterDataEventsWatch(
     id: ObjectID!
     cacheID: ObjectID!
@@ -936,6 +941,6 @@ type Subscription {
   chatStream(input: ChatInput!): ChatChunk!
 
   # --- Cloud account ---
-  "Streams authentication state: the current snapshot, then a fresh one on every sign-in / sign-out / refresh-failure change."
+  "Authentication state as a gauge: a fresh snapshot on every sign-in, sign-out, and refresh failure."
   authStateWatch: AuthState!
 }
