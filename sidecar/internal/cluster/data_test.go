@@ -42,11 +42,6 @@ func recvKindFrame(t *testing.T, ch <-chan domain.ClusterDataKindWatchFrame) dom
 // current catalog as an Added burst on subscribe, then Added/Modified/Deleted per kind
 // as the sync engine writes objects and pings the store — what makes the dashboard
 // resource nav (kinds + live counts) update in real time.
-
-// ClusterDataKindsWatch streams the active cache's kind catalog as a delta watch: the
-// current catalog as an Added burst on subscribe, then Added/Modified/Deleted per kind
-// as the sync engine writes objects and pings the store — what makes the dashboard
-// resource nav (kinds + live counts) update in real time.
 func TestServiceClusterDataKindsWatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -134,11 +129,6 @@ func TestServiceClusterDataKindsWatch(t *testing.T) {
 // re-read, so a high-churn cluster doesn't re-run the count-join per object event.
 // Un-coalesced, the first post-burst frame would carry an intermediate count; coalesced,
 // it jumps straight to the final one.
-
-// A burst of write pings within one debounce window collapses into a single catalog
-// re-read, so a high-churn cluster doesn't re-run the count-join per object event.
-// Un-coalesced, the first post-burst frame would carry an intermediate count; coalesced,
-// it jumps straight to the final one.
 func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -196,10 +186,6 @@ func TestServiceClusterDataKindsWatchCoalesces(t *testing.T) {
 // A cache whose on-disk db isn't open (never synced / sync paused) yields a stream
 // that emits no frames and closes when ctx ends — mirroring ClusterDataKinds' empty
 // posture without leaking a goroutine.
-
-// A cache whose on-disk db isn't open (never synced / sync paused) yields a stream
-// that emits no frames and closes when ctx ends — mirroring ClusterDataKinds' empty
-// posture without leaking a goroutine.
 func TestServiceClusterDataKindsWatchNoOpenCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -224,9 +210,6 @@ func TestServiceClusterDataKindsWatchNoOpenCache(t *testing.T) {
 	cancel()
 	testutil.RecvClosed(t, ch, "the stream on ctx cancel")
 }
-
-// insertCatalogKind inserts one kind_catalog row into a cache db (test helper for
-// the ClusterDataKindsWatch lifecycle tests).
 
 // A subscriber that opens the stream before the cache db is opened (the common
 // unsynced-cluster case) must bind to the cache when it opens and start streaming its
@@ -264,11 +247,6 @@ func TestServiceClusterDataKindsWatchBindsCacheOpenedAfterSubscribe(t *testing.T
 	assert.Equal(t, domain.DeltaFrameAdded, ev.Type)
 	assert.Equal(t, "Deployment", ev.Kind.Kind)
 }
-
-// Clearing a cache closes the on-disk db and reopens a fresh one under the same CacheID.
-// The stream must rebind to the new handle and keep diffing — the emptied catalog
-// surfacing as Deletes, the rebuild as Adds — instead of ending silently (which, with an
-// unchanged cache id, the client would never resubscribe from).
 
 // Clearing a cache closes the on-disk db and reopens a fresh one under the same CacheID.
 // The stream must rebind to the new handle and keep diffing — the emptied catalog
@@ -317,11 +295,6 @@ func TestServiceClusterDataKindsWatchRebindsAfterCacheReplaced(t *testing.T) {
 // restart) must reconcile the stream against an empty catalog — one Delete per held kind
 // — so the dashboard doesn't retain the closed cache's stale kinds waiting for a reopen
 // that never comes.
-
-// A cache that closes and never reopens (a paused/cleared cache whose engine doesn't
-// restart) must reconcile the stream against an empty catalog — one Delete per held kind
-// — so the dashboard doesn't retain the closed cache's stale kinds waiting for a reopen
-// that never comes.
 func TestServiceClusterDataKindsWatchEmitsDeletesOnCloseWithoutReopen(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -357,19 +330,12 @@ func recvEventFrame(t *testing.T, ch <-chan domain.ClusterDataEventWatchFrame) d
 	return testutil.Recv(t, ch, "a ClusterDataEventWatchFrame")
 }
 
-// insertEvent writes one row directly into the events table (uid + the display columns),
-// standing in for what the sync engine's event driver would persist.
-
 // recvObjectFrame reads one delta off a ClusterDataObjectsWatch stream, failing on
 // close or timeout.
 func recvObjectFrame(t *testing.T, ch <-chan domain.ClusterDataObjectWatchFrame) domain.ClusterDataObjectWatchFrame {
 	t.Helper()
 	return testutil.Recv(t, ch, "a ClusterDataObjectWatchFrame")
 }
-
-// insertObject writes one row directly into the objects table (the universal-identity
-// columns the objects watch projects), standing in for what the sync engine's object
-// driver would persist. createdAt is the object's creationTimestamp as unix-millis.
 
 // ClusterDataEventsWatch streams the active cache's cached Kubernetes Events as a delta
 // watch: the newest window as an Added burst, then Added/Modified/Deleted as the sync
@@ -435,10 +401,6 @@ func TestServiceClusterDataEventsWatch(t *testing.T) {
 // An object write pings the object-write broker, not the events broker, so it must NOT
 // wake the events watch — the whole reason events use a dedicated broker. Conversely an
 // event write wakes it. This pins that separation.
-
-// An object write pings the object-write broker, not the events broker, so it must NOT
-// wake the events watch — the whole reason events use a dedicated broker. Conversely an
-// event write wakes it. This pins that separation.
 func TestServiceClusterDataEventsWatchIgnoresObjectWrites(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -478,12 +440,6 @@ func TestServiceClusterDataEventsWatchIgnoresObjectWrites(t *testing.T) {
 	assert.Equal(t, domain.DeltaFrameAdded, add.Type)
 	assert.Equal(t, "e2", add.Event.UID)
 }
-
-// ClusterDataObjectsWatch streams one kind's cached objects as a delta watch: the
-// current set for the kind as an Added burst, then Added/Modified/Deleted as the sync
-// engine writes objects and pings the object-write store broker — what backs the
-// dashboard's generic per-kind object tables. Keyed by (apiVersion, resource) on top of
-// the active cache.
 
 // ClusterDataObjectsWatch streams one kind's cached objects as a delta watch: the
 // current set for the kind as an Added burst, then Added/Modified/Deleted as the sync
@@ -563,10 +519,6 @@ func TestServiceClusterDataObjectsWatch(t *testing.T) {
 // The objects watch is keyed by (apiVersion, resource): a write of a different kind
 // pings the shared object-write broker but must not surface on a watch scoped to another
 // kind — the reader filters by the resource's kind.
-
-// The objects watch is keyed by (apiVersion, resource): a write of a different kind
-// pings the shared object-write broker but must not surface on a watch scoped to another
-// kind — the reader filters by the resource's kind.
 func TestServiceClusterDataObjectsWatchFiltersByKind(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -609,9 +561,6 @@ func TestServiceClusterDataObjectsWatchFiltersByKind(t *testing.T) {
 
 // With no open cache for the id, the objects watch mirrors the kinds/events empty
 // posture: it produces no frames and simply ends when ctx is cancelled (no error).
-
-// With no open cache for the id, the objects watch mirrors the kinds/events empty
-// posture: it produces no frames and simply ends when ctx is cancelled (no error).
 func TestServiceClusterDataObjectsWatchNoOpenCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -635,11 +584,6 @@ func TestServiceClusterDataObjectsWatchNoOpenCache(t *testing.T) {
 	cancel()
 	testutil.RecvClosed(t, ch, "the stream on ctx cancel")
 }
-
-// The kind catalog spans BOTH tables: every synced kind's count comes from the objects
-// triggers, and the Event kind's from the events triggers. Following only the object-write
-// broker froze the Events badge on a cluster that is event-busy but object-quiet — which is
-// exactly the cluster whose event count someone is watching.
 
 // The kind catalog spans BOTH tables: every synced kind's count comes from the objects
 // triggers, and the Event kind's from the events triggers. Following only the object-write
@@ -687,10 +631,6 @@ func TestClusterDataKindsWatchWakesOnEventWrites(t *testing.T) {
 // A keyed object write still wakes the keyless kind-catalog watch: a kind's first-ever
 // object is a catalog Add, so ClusterDataKindsWatch (keyless) must wake on any write,
 // keyed or not. Pins that the routing doesn't starve the catalog watch.
-
-// A keyed object write still wakes the keyless kind-catalog watch: a kind's first-ever
-// object is a catalog Add, so ClusterDataKindsWatch (keyless) must wake on any write,
-// keyed or not. Pins that the routing doesn't starve the catalog watch.
 func TestClusterDataKindsWatchWakesOnKeyedWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -727,13 +667,6 @@ func TestClusterDataKindsWatchWakesOnKeyedWrite(t *testing.T) {
 	assert.Equal(t, "Deployment", add.Kind.Kind)
 	assert.Equal(t, 1, add.Kind.Count)
 }
-
-// Regression: a CRD deleted and recreated with the same (apiVersion, resource) but a
-// different Kind must keep the objects watch live. The watch subscribes on the resource
-// identity (stable across the remap), and the replacement (new-Kind) driver notifies by
-// that same resource — so the stream tracks the remap. Routing by Kind instead left the
-// subscription bound to the dead Kind, missing every write until the next keyless
-// discovery broadcast.
 
 // Regression: a CRD deleted and recreated with the same (apiVersion, resource) but a
 // different Kind must keep the objects watch live. The watch subscribes on the resource
@@ -783,12 +716,6 @@ func TestServiceClusterDataObjectsWatchSurvivesKindRemap(t *testing.T) {
 	assert.Equal(t, domain.DeltaFrameAdded, got["g1"], "the replacement Kind's object must appear")
 }
 
-// cacheRef resolves the active cache's on-disk locator: the directory id is the
-// ClusterID, the file id is the ClusterCache for the cluster's currently-connected
-// identity (UID matches Status.Server.UID). A cluster with no active cache resolves to
-// found=false.
-
-// seedGVRDiscovery creates the discovery anchor the cache controller would.
 // catalogSubscribe fans two brokers into one channel, so it owns a goroutine and two
 // registrations. Closing its output when both brokers close is how a caller learns through
 // the ping path that the db went away — the same signal a bare broker subscription gives —
@@ -811,11 +738,3 @@ func TestCatalogSubscribeClosesWhenBothBrokersDo(t *testing.T) {
 	require.NoError(t, mgr.Shutdown(ctx))
 	testutil.WaitClosed(t, pings, "the composite")
 }
-
-// The per-kind watch is cache-scoped but rides a FLEET-wide stream, so its filter runs on
-// every sync record of every cache. While our own anchor is unresolved there is nothing
-// cached to compare against, so each of those frames cost its own point query — ~1500
-// lookups to drain a ten-cluster snapshot.
-//
-// One lookup per DISTINCT anchor is enough: a verdict never flips, and an anchor created
-// after we looked cannot be one we already rejected (ids are AUTOINCREMENT).

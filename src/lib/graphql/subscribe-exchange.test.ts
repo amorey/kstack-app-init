@@ -171,6 +171,72 @@ describe('tauriSubscriptionExchange', () => {
     unsubscribe();
   });
 
+  // The sidecar ends a subscription whose watch died with one data-less frame
+  // carrying the reason (WatchFailureExtension). That is a drop that can explain
+  // itself, so it takes the drop path — report, mark disconnected, reconnect —
+  // and must NOT reach the sink: urql merges each frame into the previous result,
+  // so an errors-only frame would re-deliver the last frame's data and fold it
+  // twice.
+  it('reports and reconnects on a terminal-failure frame, without pushing it to the sink', async () => {
+    vi.useFakeTimers();
+    const { seen, unsubscribe } = start();
+    await flush();
+    liveChannel().onmessage!(OPEN);
+    liveChannel().onmessage!(NEXT(1));
+
+    liveChannel().onmessage!(
+      JSON.stringify({
+        type: 'next',
+        payload: { errors: [{ message: 'Cluster watch ended: watch too old' }], extensions: { watchFailed: true } },
+      }),
+    );
+    expect(seen).toEqual([1]); // the failure frame delivered no data of its own
+    expect(reportErrorMock).toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'subscription', message: 'Cluster watch ended: watch too old' }),
+    );
+    expect(markDisconnectedMock).toHaveBeenCalledWith(KEY);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(subscribeCalls()).toBe(2);
+
+    unsubscribe();
+  });
+
+  // A frame that carries data is live state, whatever else rides with it: its
+  // errors are ordinary field errors and belong to the sink and the error
+  // exchange, not to the stream-death path.
+  it('still forwards a frame that carries both data and errors', async () => {
+    const { seen, unsubscribe } = start();
+    await flush();
+    liveChannel().onmessage!(OPEN);
+
+    liveChannel().onmessage!(
+      JSON.stringify({ type: 'next', payload: { data: { tick: 3 }, errors: [{ message: 'stats unavailable' }] } }),
+    );
+    expect(seen).toEqual([3]);
+    expect(markDisconnectedMock).not.toHaveBeenCalled();
+
+    unsubscribe();
+  });
+
+  // The reason the marker exists rather than a shape check: a non-null field that
+  // errors nulls its parent, so a live frame whose `stats` failed arrives with no
+  // data and an error — byte-identical to a dead watch. Tearing the subscription
+  // down for it would make one bad field a reconnect loop.
+  it('does not treat an unmarked data-less error frame as a dead watch', async () => {
+    const { unsubscribe } = start();
+    await flush();
+    liveChannel().onmessage!(OPEN);
+
+    liveChannel().onmessage!(
+      JSON.stringify({ type: 'next', payload: { data: null, errors: [{ message: 'stats unavailable' }] } }),
+    );
+    expect(markDisconnectedMock).not.toHaveBeenCalled();
+    expect(subscribeCalls()).toBe(1);
+
+    unsubscribe();
+  });
+
   it('reconnects silently on the server’s own `complete` (no error report)', async () => {
     vi.useFakeTimers();
     const { unsubscribe } = start();

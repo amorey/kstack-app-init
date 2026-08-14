@@ -126,6 +126,34 @@ describe('useWatchSubscription', () => {
     expect(state(r).data).toEqual([1, 2]); // still shown through the outage
   });
 
+  // The sidecar ends a subscription whose watch died with one errors-only frame
+  // (WatchFailureExtension) before the transport completes. That is a drop with a
+  // reason: the rows already sent are still the last thing that was true, so they
+  // must survive it exactly as they survive a transport drop, and must not be
+  // folded a second time — the reconnect that follows brings a fresh snapshot.
+  it('keeps last-known data once, when a watch reports its terminal error', async () => {
+    vi.useFakeTimers();
+    const r = renderWatch();
+    await vi.waitFor(() => expect(channels.length).toBeGreaterThan(0));
+
+    await emit(OPEN);
+    await emit(NEXT(1));
+    await emit(NEXT(2));
+
+    await emit(
+      JSON.stringify({
+        type: 'next',
+        payload: {
+          errors: [{ message: 'Cluster watch ended: watch too old' }],
+          data: null,
+          extensions: { watchFailed: true },
+        },
+      }),
+    );
+    expect(state(r).data).toEqual([1, 2]);
+    expect(state(r).connected).toBe(false);
+  });
+
   it('rebuilds from scratch on reconnect — prior-connection state cannot linger', async () => {
     vi.useFakeTimers();
     const r = renderWatch();

@@ -53,11 +53,6 @@ func TestServiceListAndGet(t *testing.T) {
 	assert.Nil(t, missing)
 }
 
-// WatchCaches streams each ClusterCache standalone: the snapshot carries an Added
-// change per cache with its parent ClusterID resolved from the owner edge, its
-// ServerUID, and its conditions. The kind has no status (it measures nothing itself), and
-// active-ness is a client-side join, so neither is asserted here.
-
 func TestServiceGetDeletionPendingIsNil(t *testing.T) {
 	ctx := context.Background()
 	s, _, _ := newServiceTest(t)
@@ -102,10 +97,6 @@ func TestServiceSetSyncEnabled(t *testing.T) {
 	assert.False(t, obj.Spec.SyncEnabled)
 }
 
-// RetryConnection dispatches an out-of-band re-probe without mutating the spec. Via the
-// fakeCoreController we pin that the dispatch reaches Reprobe and the spec is untouched;
-// an unknown id errors before any dispatch.
-
 func TestServiceDeleteTombstonesCluster(t *testing.T) {
 	ctx := context.Background()
 	s, _, _ := newServiceTest(t)
@@ -140,8 +131,9 @@ func TestServiceWatchEmitsSnapshotThenDeltas(t *testing.T) {
 	s, _, _ := newServiceTest(t)
 	id := seedCluster(t, s, "alpha")
 
-	ch, err := s.Clusters().Watch(ctx)
+	st, err := s.Clusters().Watch(ctx)
 	require.NoError(t, err)
+	ch := st.Frames
 
 	// Snapshot: one Added change for the seeded cluster, closed by the Bookmark.
 	seed := recv(t, ch)
@@ -170,19 +162,11 @@ func TestServiceWatchEmitsSnapshotThenDeltas(t *testing.T) {
 // fakeScheduleClient drives the schedule-watch wrapper with a test-controlled channel,
 // so the mapping (beehive.Schedule → Schedule, zero → nil) and the ctx lifecycle are
 // exercised deterministically — beehive's own tests cover the queue/gauge semantics.
-
-// fakeScheduleClient drives the schedule-watch wrapper with a test-controlled channel,
-// so the mapping (beehive.Schedule → Schedule, zero → nil) and the ctx lifecycle are
-// exercised deterministically — beehive's own tests cover the queue/gauge semantics.
 type fakeScheduleClient struct{ ch chan beehive.Schedule }
 
 func (f *fakeScheduleClient) WatchSchedule(context.Context, beehive.ObjectID) (<-chan beehive.Schedule, error) {
 	return f.ch, nil
 }
-
-// scheduleWatch maps the beehive Schedule gauge to the domain Schedule: a
-// non-zero NextRequeueAt becomes a NextRequeueAt pointer, the zero time becomes
-// nil (nothing scheduled). The out channel closes when the source closes.
 
 // scheduleWatch maps the beehive Schedule gauge to the domain Schedule: a
 // non-zero NextRequeueAt becomes a NextRequeueAt pointer, the zero time becomes
@@ -212,11 +196,6 @@ func TestServiceScheduleWatchMapsGauge(t *testing.T) {
 	close(fake.ch)
 	testutil.RecvClosed(t, out, "out when the schedule source closes")
 }
-
-// mergeSchedule folds the schedule gauge (NextRequeueAt) and the in-flight probe
-// signal (Probing) into one Schedule stream, re-emitting the combined latest as
-// either side moves; a closed sub-source is dropped without ending the stream,
-// and the out channel closes only when both close.
 
 // mergeSchedule folds the schedule gauge (NextRequeueAt) and the in-flight probe
 // signal (Probing) into one Schedule stream, re-emitting the combined latest as
@@ -264,9 +243,6 @@ func TestMergeScheduleCombinesGaugeAndProbe(t *testing.T) {
 
 // ClusterScheduleWatch, through the ClusterService interface, streams the real
 // beehive schedule gauge for a cluster (snapshot on subscribe, then live).
-
-// ClusterScheduleWatch, through the ClusterService interface, streams the real
-// beehive schedule gauge for a cluster (snapshot on subscribe, then live).
 func TestClusterScheduleWatchPublicSurface(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -291,11 +267,6 @@ func TestClusterScheduleWatchPublicSurface(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "stream should close on ctx cancel")
 }
 
-// The generic event reader maps beehive's coalesced runs to the domain Event wire
-// shape, newest-run-first, honoring the category filter and limit. beehive coalesces
-// same-(category,type,reason) occurrences into one run, so a repeated reason bumps
-// Count and a changed reason starts a new run.
-
 // The kind-scoped public surface (ClusterEvents / ClusterEventsWatch), reached through
 // the ClusterService interface, delegates to the generic reader/watch against the
 // Cluster kind client. Asserting via the interface value locks the public API shape.
@@ -319,8 +290,9 @@ func TestClusterEventsPublicSurface(t *testing.T) {
 	assert.Equal(t, "ReasonA", evs[0].Reason)
 
 	// ClusterEventsWatch: snapshot replays the existing run, then a live run arrives
-	ch, err := svc.WatchObjectEvents(ctx, domain.ObjectID(id), &category)
+	st, err := svc.WatchObjectEvents(ctx, domain.ObjectID(id), &category)
 	require.NoError(t, err)
+	ch := st.Frames
 
 	e := recvRun(t, ch)
 	assert.Equal(t, "ReasonA", e.Reason)
@@ -332,8 +304,3 @@ func TestClusterEventsPublicSurface(t *testing.T) {
 	e = recvRun(t, ch)
 	assert.Equal(t, "ReasonB", e.Reason)
 }
-
-// ClusterCacheEvents / ClusterCacheEventsWatch are the ClusterCache-kind counterparts:
-// same generic reader/watch, but against the cache client and keyed by the
-// ClusterCache's own ObjectID (the sync-event timeline under category "sync"). Asserting
-// via the interface value locks the public API shape.

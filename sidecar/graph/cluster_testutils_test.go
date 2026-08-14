@@ -64,6 +64,7 @@ type fakeClusterService struct {
 	kinds       map[domain.ClusterID][]domain.ClusterDataKind   // discovered kind catalog, keyed by ClusterID
 	dataEvents  map[domain.ClusterID][]domain.ClusterDataEvent  // cached Kubernetes Events, keyed by ClusterID
 	dataObjects map[domain.ClusterID][]domain.ClusterDataObject // cached objects for one kind, keyed by ClusterID
+	watchFail   error                                           // when set, every watch ends with it after its snapshot
 }
 
 // The fake mirrors production's shape: one shared state struct, five accessor
@@ -197,21 +198,40 @@ func (f fakeClusters) Get(_ context.Context, id domain.ClusterID) (*domain.Clust
 	return &cp, nil
 }
 
-// snapshotChan models every object watch the service exposes: replay the current set as
-// Added changes, then hold the stream open until ctx ends (a real WatchList never
+// snapshotStream models every object watch the service exposes: replay the current set
+// as Added changes, then hold the stream open until ctx ends (a real WatchList never
 // completes on its own, and several tests assert exactly that). Each watch differs only
 // in how it wraps an item into its Change struct.
-func snapshotChan[T, C any](ctx context.Context, items []T, wrap func(*T) C) <-chan C {
-	ch := make(chan C, len(items))
+//
+// A fixture with watchFail set ends every watch with it instead, standing in for a
+// source that died mid-stream.
+func snapshotStream[T, C any](ctx context.Context, f *fakeClusterService, items []T, wrap func(*T) C) *cluster.Stream[C] {
+	snap := make([]C, 0, len(items))
 	for i := range items {
 		item := items[i]
-		ch <- wrap(&item)
+		snap = append(snap, wrap(&item))
 	}
-	go func() {
+	return cluster.NewStream(func(out chan<- C) error {
+		for _, c := range snap {
+			select {
+			case out <- c:
+			case <-ctx.Done():
+				return nil
+			}
+		}
+		if err := f.failure(); err != nil {
+			return err
+		}
 		<-ctx.Done()
-		close(ch)
-	}()
-	return ch
+		return nil
+	})
+}
+
+// failure is the injected terminal reason, nil unless a test set one.
+func (f *fakeClusterService) failure() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.watchFail
 }
 
 // copySlice returns a copy of src taken under the fake's lock, so a watch's replay can't
@@ -222,27 +242,27 @@ func copySlice[T any](f *fakeClusterService, src *[]T) []T {
 	return append([]T(nil), *src...)
 }
 
-func (f fakeClusters) Watch(ctx context.Context) (<-chan domain.ClusterWatchFrame, error) {
-	return snapshotChan(ctx, f.s.snapshot(), func(c **domain.Cluster) domain.ClusterWatchFrame {
+func (f fakeClusters) Watch(ctx context.Context) (*cluster.Stream[domain.ClusterWatchFrame], error) {
+	return snapshotStream(ctx, f.s, f.s.snapshot(), func(c **domain.Cluster) domain.ClusterWatchFrame {
 		return domain.ClusterWatchFrame{Type: domain.DeltaFrameAdded, Cluster: *c}
 	}), nil
 }
 
-func (f fakeCaches) Watch(ctx context.Context) (<-chan domain.ClusterCacheWatchFrame, error) {
-	return snapshotChan(ctx, f.s.cacheSnapshot(), func(c *domain.ClusterCache) domain.ClusterCacheWatchFrame {
+func (f fakeCaches) Watch(ctx context.Context) (*cluster.Stream[domain.ClusterCacheWatchFrame], error) {
+	return snapshotStream(ctx, f.s, f.s.cacheSnapshot(), func(c *domain.ClusterCache) domain.ClusterCacheWatchFrame {
 		return domain.ClusterCacheWatchFrame{Type: domain.DeltaFrameAdded, Cache: c}
 	}), nil
 }
 
-func (f fakeDiscovery) Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRDiscoveryWatchFrame, error) {
-	return snapshotChan(ctx, copySlice(f.s, &f.s.discoveries), func(d *domain.ClusterCacheGVRDiscovery) domain.ClusterCacheGVRDiscoveryWatchFrame {
+func (f fakeDiscovery) Watch(ctx context.Context) (*cluster.Stream[domain.ClusterCacheGVRDiscoveryWatchFrame], error) {
+	return snapshotStream(ctx, f.s, copySlice(f.s, &f.s.discoveries), func(d *domain.ClusterCacheGVRDiscovery) domain.ClusterCacheGVRDiscoveryWatchFrame {
 		return domain.ClusterCacheGVRDiscoveryWatchFrame{Type: domain.DeltaFrameAdded, Discovery: d}
 	}), nil
 }
 
 // WatchSyncHealth folds the fixture's per-kind records per cache, the same way the
 // real service does — enough to prove the wire shape and the join key.
-func (f fakeCaches) WatchSyncHealth(ctx context.Context) (<-chan domain.ClusterCacheSyncHealth, error) {
+func (f fakeCaches) WatchSyncHealth(ctx context.Context) (*cluster.Stream[domain.ClusterCacheSyncHealth], error) {
 	f.s.mu.Lock()
 	cacheOf := map[domain.ClusterCacheGVRDiscoveryID]domain.ClusterCacheID{}
 	for i := range f.s.discoveries {
@@ -269,20 +289,18 @@ func (f fakeCaches) WatchSyncHealth(ctx context.Context) (<-chan domain.ClusterC
 		}
 	}
 	f.s.mu.Unlock()
-	out := make(chan domain.ClusterCacheSyncHealth, len(byCache)+1)
+	verdicts := make([]domain.ClusterCacheSyncHealth, 0, len(byCache))
 	for _, h := range byCache {
-		out <- *h
+		verdicts = append(verdicts, *h)
 	}
-	go func() {
-		<-ctx.Done()
-		close(out)
-	}()
-	return out, nil
+	return snapshotStream(ctx, f.s, verdicts, func(h *domain.ClusterCacheSyncHealth) domain.ClusterCacheSyncHealth {
+		return *h
+	}), nil
 }
 
 // Watch serves only the records whose discovery anchor matches the requested
 // cache's, standing in for the real service's owner-edge filter.
-func (f fakeSyncs) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheGVRSyncWatchFrame, error) {
+func (f fakeSyncs) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (*cluster.Stream[domain.ClusterCacheGVRSyncWatchFrame], error) {
 	f.s.mu.Lock()
 	var want domain.ClusterCacheGVRDiscoveryID
 	for i := range f.s.discoveries {
@@ -297,7 +315,7 @@ func (f fakeSyncs) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-
 		}
 	}
 	f.s.mu.Unlock()
-	return snapshotChan(ctx, scoped, func(gs *domain.ClusterCacheGVRSync) domain.ClusterCacheGVRSyncWatchFrame {
+	return snapshotStream(ctx, f.s, scoped, func(gs *domain.ClusterCacheGVRSync) domain.ClusterCacheGVRSyncWatchFrame {
 		return domain.ClusterCacheGVRSyncWatchFrame{Type: domain.DeltaFrameAdded, Sync: gs}
 	}), nil
 }
@@ -408,13 +426,10 @@ func (f fakeClusters) ListEvents(_ context.Context, id domain.ClusterID, _ *stri
 
 // WatchObjectEvents serves every record's timeline, as the real service does — one
 // reader, whatever kind the id names.
-func (f *fakeClusterService) WatchObjectEvents(ctx context.Context, _ domain.ObjectID, _ *string) (<-chan domain.EventWatchFrame, error) {
-	ch := make(chan domain.EventWatchFrame)
-	go func() {
-		<-ctx.Done()
-		close(ch)
-	}()
-	return ch, nil
+func (f *fakeClusterService) WatchObjectEvents(ctx context.Context, _ domain.ObjectID, _ *string) (*cluster.Stream[domain.EventWatchFrame], error) {
+	return snapshotStream(ctx, f, nil, func(e *domain.Event) domain.EventWatchFrame {
+		return domain.EventWatchFrame{Type: domain.EventFrameRun, Event: e}
+	}), nil
 }
 
 func (f fakeCaches) Get(_ context.Context, id domain.ClusterCacheID) (*domain.ClusterCache, error) {

@@ -16,32 +16,31 @@ package cluster
 
 import (
 	"context"
-	"log/slog"
+	"fmt"
 
 	"github.com/amorey/beehive"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain"
 )
 
-// watchListChan folds a beehive kind watch (snapshot + change stream) into one
+// watchListStream folds a beehive kind watch (snapshot + change stream) into one
 // Kubernetes-style delta stream, closing the snapshot with a single Bookmark so a
 // consumer can tell an empty collection from one still arriving. A deletion-pending
 // object is collapsed to Deleted (List/Get hide tombstones, so the watch removes it
 // at once; the trailing hard Deleted repeats idempotently). A stream that fails ends
-// after a log line, its reason read off stream.Err(). Out closes on exit.
+// carrying stream.Err(), which the resolver turns into a GraphQL error; kind names it
+// in the wrapped message, the only place the caller's identity survives.
 //
 // fn is called with a nil obj two ways, and must tell them apart: on DeltaFrameBookmark
 // (once, between snapshot and deltas) it must return a frame carrying NO entity; on a
 // Deleted whose final state could not be decoded it returns the removal by id alone.
-func watchListChan[Spec, Status, Out any](
+func watchListStream[Spec, Status, Out any](
 	ctx context.Context,
 	kind string,
 	stream *beehive.ObjectListStream[Spec, Status],
 	fn func(domain.DeltaFrameType, beehive.ObjectID, *beehive.Object[Spec, Status]) Out,
-) <-chan Out {
-	out := make(chan Out, 1)
-	go func() {
-		defer close(out)
+) *Stream[Out] {
+	return NewStream(func(out chan<- Out) error {
 		// beehive.ChangeType and domain.DeltaFrameType share string values by construction.
 		domainType := func(t beehive.ChangeType, obj *beehive.Object[Spec, Status]) domain.DeltaFrameType {
 			if obj != nil && obj.DeletionRequestedAt != nil {
@@ -51,29 +50,30 @@ func watchListChan[Spec, Status, Out any](
 		}
 		for _, obj := range stream.Objects {
 			if !send(ctx, out, fn(domainType(beehive.Added, obj), obj.ID, obj)) {
-				return
+				return nil
 			}
 		}
 		// Everything from here is a live change, not initial state.
 		if !send(ctx, out, fn(domain.DeltaFrameBookmark, 0, nil)) {
-			return
+			return nil
 		}
 		for {
 			select {
 			case <-ctx.Done():
-				return
+				return nil
 			case ev, ok := <-stream.Changes:
 				if !ok {
+					// A cancelled ctx races the source's own teardown; that is our own
+					// doing, not a failure worth reporting.
 					if err := stream.Err(); err != nil && ctx.Err() == nil {
-						slog.Warn("clusterservice: object watch ended", "kind", kind, "err", err)
+						return fmt.Errorf("%s watch ended: %w", kind, err)
 					}
-					return
+					return nil
 				}
 				if !send(ctx, out, fn(domainType(ev.Type, ev.Object), ev.ID, ev.Object)) {
-					return
+					return nil
 				}
 			}
 		}
-	}()
-	return out
+	})
 }

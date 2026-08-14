@@ -68,12 +68,12 @@ func (a clustersAPI) Get(ctx context.Context, id domain.ClusterID) (*domain.Clus
 // countdown, and cache sync status deliberately stream elsewhere (WatchEvents /
 // WatchSchedule / Caches().Watch), so a settled disconnected cluster produces
 // no churn here.
-func (a clustersAPI) Watch(ctx context.Context) (<-chan domain.ClusterWatchFrame, error) {
+func (a clustersAPI) Watch(ctx context.Context) (*Stream[domain.ClusterWatchFrame], error) {
 	stream, err := a.s.coreClient.WatchList(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return watchListChan(ctx, "Cluster", stream,
+	return watchListStream(ctx, "Cluster", stream,
 		func(t domain.DeltaFrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterSpec, domain.ClusterStatus]) domain.ClusterWatchFrame {
 			if t == domain.DeltaFrameBookmark {
 				return domain.ClusterWatchFrame{Type: t}

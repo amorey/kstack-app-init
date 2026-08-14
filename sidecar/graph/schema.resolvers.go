@@ -211,22 +211,22 @@ func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
 // EventsWatch is the resolver for the eventsWatch field — the live event tail for any
 // record with a timeline, decoupled from that record's own watch.
 func (r *subscriptionResolver) EventsWatch(ctx context.Context, id domain.ObjectID, category *string) (<-chan *domain.EventWatchFrame, error) {
-	ch, err := r.ClusterSvc.WatchObjectEvents(ctx, id, category)
+	st, err := r.ClusterSvc.WatchObjectEvents(ctx, id, category)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, st), nil
 }
 
 // ClustersWatch is the resolver for the clustersWatch field — the cluster list as
 // a delta watch (Added snapshot, then per-cluster Added/Modified/Deleted). Cache
 // sync status rides clusterCachesWatch, joined client-side.
 func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *domain.ClusterWatchFrame, error) {
-	ch, err := r.ClusterSvc.Clusters().Watch(ctx)
+	st, err := r.ClusterSvc.Clusters().Watch(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, st), nil
 }
 
 // ClusterScheduleWatch is the resolver for the clusterScheduleWatch field — the
@@ -244,42 +244,42 @@ func (r *subscriptionResolver) ClusterScheduleWatch(ctx context.Context, id doma
 // records as a delta watch parallel to clustersWatch, joined to clusters
 // client-side by clusterID.
 func (r *subscriptionResolver) ClusterCachesWatch(ctx context.Context) (<-chan *domain.ClusterCacheWatchFrame, error) {
-	ch, err := r.ClusterSvc.Caches().Watch(ctx)
+	st, err := r.ClusterSvc.Caches().Watch(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, st), nil
 }
 
 // ClusterCacheSyncHealthWatch is the resolver for the clusterCacheSyncHealthWatch field.
 func (r *subscriptionResolver) ClusterCacheSyncHealthWatch(ctx context.Context) (<-chan *domain.ClusterCacheSyncHealth, error) {
-	ch, err := r.ClusterSvc.Caches().WatchSyncHealth(ctx)
+	st, err := r.ClusterSvc.Caches().WatchSyncHealth(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, st), nil
 }
 
 // ClusterCacheGVRDiscoveriesWatch is the resolver for the
 // clusterCacheGVRDiscoveriesWatch field — the caches' GVR-discovery records as a delta
 // watch parallel to clusterCachesWatch, joined to caches client-side by cacheID.
 func (r *subscriptionResolver) ClusterCacheGVRDiscoveriesWatch(ctx context.Context) (<-chan *domain.ClusterCacheGVRDiscoveryWatchFrame, error) {
-	ch, err := r.ClusterSvc.Discovery().Watch(ctx)
+	st, err := r.ClusterSvc.Discovery().Watch(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, st), nil
 }
 
 // ClusterCacheGVRSyncsWatch is the resolver for the clusterCacheGVRSyncsWatch field —
 // one cache's per-kind sync records as a delta watch. Cache-scoped, unlike the sibling
 // object watches: there is one record per synced kind.
 func (r *subscriptionResolver) ClusterCacheGVRSyncsWatch(ctx context.Context, cacheID domain.ObjectID) (<-chan *domain.ClusterCacheGVRSyncWatchFrame, error) {
-	ch, err := r.ClusterSvc.Syncs().Watch(ctx, cacheID)
+	st, err := r.ClusterSvc.Syncs().Watch(ctx, cacheID)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, st), nil
 }
 
 // ClusterCacheStatsWatch is the resolver for the clusterCacheStatsWatch field — one

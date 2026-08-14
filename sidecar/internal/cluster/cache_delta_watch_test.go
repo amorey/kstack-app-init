@@ -31,12 +31,6 @@ import (
 // keyed write never wakes it, so its snapshot read never runs — proven with a counting
 // snapshot fn driving cacheDeltaWatch exactly as ClusterDataObjectsWatch does. A
 // matching-resource write does wake it and re-reads.
-
-// Resource routing eliminates the wasted re-read, not just the wasted frame: with the
-// objects watch subscribed keyed to its (apiVersion, resource), an unrelated resource's
-// keyed write never wakes it, so its snapshot read never runs — proven with a counting
-// snapshot fn driving cacheDeltaWatch exactly as ClusterDataObjectsWatch does. A
-// matching-resource write does wake it and re-reads.
 func TestClusterDataObjectsWatchNoReReadForOtherKind(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

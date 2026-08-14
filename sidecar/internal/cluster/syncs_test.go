@@ -31,10 +31,6 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
-// TestWatchGVRSyncsIsScopedToOneCache pins the scoping that makes this stream usable. A
-// cache has one sync record per served kind — a hundred or more — so unlike the other
-// object watches this one is opened per cache, and must not leak another cache's kinds
-// into it.
 // Get is the query entrypoint into one synced kind's record (the GraphQL
 // clusterCacheGVRSync field), so it must resolve the owner edge the watch relies on —
 // DiscoveryID is what ties the record to its cache. An unknown id is (nil, nil).
@@ -103,6 +99,10 @@ func TestSyncsList(t *testing.T) {
 	assert.Len(t, all, 3, "this cache's two plus the other cache's one")
 }
 
+// TestWatchGVRSyncsIsScopedToOneCache pins the scoping that makes this stream usable. A
+// cache has one sync record per served kind — a hundred or more — so unlike the other
+// object watches this one is opened per cache, and must not leak another cache's kinds
+// into it.
 func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -118,8 +118,9 @@ func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {
 	seedGVRSync(t, s, myDiscovery, "apps/v1", "deployments")
 	seedGVRSync(t, s, otherDiscovery, "apps/v1", "deployments")
 
-	ch, err := s.Syncs().Watch(ctx, domain.ClusterCacheID(myCache))
+	st, err := s.Syncs().Watch(ctx, domain.ClusterCacheID(myCache))
 	require.NoError(t, err)
+	ch := st.Frames
 
 	got := recvGVRSyncFrame(t, ch)
 	assert.Equal(t, domain.DeltaFrameAdded, got.Type)
@@ -141,11 +142,6 @@ func TestWatchGVRSyncsIsScopedToOneCache(t *testing.T) {
 // gains one within a reconcile. Resolving the anchor once at subscribe latched an empty
 // stream for the subscription's whole life, so a sync dialog opened a moment too early
 // showed nothing until the user closed and reopened it.
-
-// A cache that has no discovery anchor yet is the normal state of one just created — it
-// gains one within a reconcile. Resolving the anchor once at subscribe latched an empty
-// stream for the subscription's whole life, so a sync dialog opened a moment too early
-// showed nothing until the user closed and reopened it.
 func TestWatchGVRSyncsResolvesAnAnchorCreatedAfterSubscribe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -156,8 +152,9 @@ func TestWatchGVRSyncsResolvesAnAnchorCreatedAfterSubscribe(t *testing.T) {
 
 	// Subscribe BEFORE the cache has an anchor. Nothing exists yet, so the initial state
 	// is empty and its Bookmark arrives at once.
-	ch, err := s.Syncs().Watch(ctx, domain.ClusterCacheID(cacheID))
+	st, err := s.Syncs().Watch(ctx, domain.ClusterCacheID(cacheID))
 	require.NoError(t, err)
+	ch := st.Frames
 	bm := recvGVRSyncFrame(t, ch)
 	requireBookmark(t, bm.Type, bm.Sync)
 
@@ -174,12 +171,6 @@ func recvGVRSyncFrame(t *testing.T, ch <-chan domain.ClusterCacheGVRSyncWatchFra
 	t.Helper()
 	return testutil.Recv(t, ch, "a gvr sync frame")
 }
-
-// seedGVRDiscovery creates the discovery anchor the cache controller would.
-// catalogSubscribe fans two brokers into one channel, so it owns a goroutine and two
-// registrations. Closing its output when both brokers close is how a caller learns through
-// the ping path that the db went away — the same signal a bare broker subscription gives —
-// and it is what lets the caller release the composite rather than dropping it on the floor.
 
 // The per-kind watch is cache-scoped but rides a FLEET-wide stream, so its filter runs on
 // every sync record of every cache. While our own anchor is unresolved there is nothing
@@ -221,14 +212,6 @@ func TestGVRSyncAnchorFilterLooksUpEachAnchorOnce(t *testing.T) {
 // a kind whose one frame landed in a "database is locked" moment during cold start would
 // stay invisible to this subscription for as long as it lives. The frame is held and
 // released once a read can judge it.
-
-// A failed read is undecidable, not a rejection: memoizing it would drop that cache's
-// records for the stream's whole life on the strength of one transient error.
-//
-// Nor may the frame itself be dropped. beehive re-emits an object only when it changes, so
-// a kind whose one frame landed in a "database is locked" moment during cold start would
-// stay invisible to this subscription for as long as it lives. The frame is held and
-// released once a read can judge it.
 func TestGVRSyncAnchorFilterHoldsFramesUntilAReadSucceeds(t *testing.T) {
 	var fail bool
 	var errs int
@@ -255,9 +238,6 @@ func TestGVRSyncAnchorFilterHoldsFramesUntilAReadSucceeds(t *testing.T) {
 
 // A frame held during an outage that turns out to belong to ANOTHER cache is dropped when
 // it is finally judged — holding it never made it ours.
-
-// A frame held during an outage that turns out to belong to ANOTHER cache is dropped when
-// it is finally judged — holding it never made it ours.
 func TestGVRSyncAnchorFilterDropsHeldFramesOfOtherCaches(t *testing.T) {
 	var fail bool
 	keep := gvrSyncAnchorFilter(func() (beehive.ObjectID, error) {
@@ -273,12 +253,6 @@ func TestGVRSyncAnchorFilterDropsHeldFramesOfOtherCaches(t *testing.T) {
 	fail = false
 	require.Len(t, keep(gvrSyncFrameOwnedBy(91)), 1, "only our own frame comes out")
 }
-
-// The release of held frames must not depend on what the NEXT frame happens to be. On a
-// multi-cluster fleet almost every frame after the read recovers belongs to an anchor
-// already ruled out, and the memo answered those before the drain ran — so a kind whose one
-// frame landed in the error window stayed held for the subscription's whole life, invisible
-// in the sync panel, because beehive re-emits an object only when it changes.
 
 // The release of held frames must not depend on what the NEXT frame happens to be. On a
 // multi-cluster fleet almost every frame after the read recovers belongs to an anchor
@@ -310,9 +284,6 @@ func TestGVRSyncAnchorFilterReleasesHeldFramesOnAnAlreadyRejectedAnchor(t *testi
 
 // A frame from an already-rejected anchor that arrives DURING an outage is simply dropped:
 // it was decided before the read broke, so holding it would only grow the buffer.
-
-// A frame from an already-rejected anchor that arrives DURING an outage is simply dropped:
-// it was decided before the read broke, so holding it would only grow the buffer.
 func TestGVRSyncAnchorFilterDoesNotHoldFramesItAlreadyRejected(t *testing.T) {
 	var fail bool
 	keep := gvrSyncAnchorFilter(func() (beehive.ObjectID, error) {
@@ -329,9 +300,6 @@ func TestGVRSyncAnchorFilterDoesNotHoldFramesItAlreadyRejected(t *testing.T) {
 	fail = false
 	require.Empty(t, keep(gvrSyncFrameOwnedBy(77)), "nothing was held, so nothing is released")
 }
-
-// A hard Deleted carries no owner edge, so it can't be attributed — forwarded on its id
-// alone, which the client keys removal on.
 
 // A hard Deleted carries no owner edge, so it can't be attributed — forwarded on its id
 // alone, which the client keys removal on.

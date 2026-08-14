@@ -44,6 +44,9 @@ func NewServer(r *Resolver) *Server {
 	srv.AddTransport(transport.POST{})
 	srv.AddTransport(transport.GET{})
 
+	// Lets a subscription report WHY it ended; see WatchFailureExtension.
+	srv.Use(WatchFailureExtension{})
+
 	// One seam for resolver/parse errors. Log the operation and path but NEVER
 	// `variables` — they can carry auth tokens or PII.
 	srv.SetErrorPresenter(func(ctx context.Context, e error) *gqlerror.Error {

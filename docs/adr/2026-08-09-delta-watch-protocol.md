@@ -21,7 +21,7 @@ Each kind streams **independently** as a Kubernetes-style delta watch: an `Added
 burst, one `Bookmark` closing it, then per-object `Added`/`Modified`/`Deleted`
 (`clustersWatch`, `clusterCachesWatch`, `clusterCacheGVRDiscoveriesWatch`,
 `clusterCacheSyncHealthWatch`, and the cache-scoped `clusterCacheGVRSyncsWatch`). The sidecar
-folds beehive's per-kind `WatchList` into this shape in `streams.go`'s `watchListChan` pump;
+folds beehive's per-kind `WatchList` into this shape in the `watchListStream` pump;
 subscription resolvers emit the current snapshot first, then deltas (`mapStream` in
 `graph/util.go` for hub-backed sources).
 
@@ -59,7 +59,7 @@ join against the current cluster status is correct.
 watches were designed for, and polling either lags or hammers.
 
 **Returning `(snapshot, channel)` on the wire, as beehive's Go watches do.** The tuple is the
-right shape in-process — `watchListChan` takes it, and it is what makes the initial-state
+right shape in-process — `watchListStream` takes it, and it is what makes the initial-state
 boundary explicit and race-free — but a GraphQL subscription has one root field emitting N
 payloads of one type, so there is nowhere to put a snapshot that isn't another frame. A
 snapshot query paired with a delta subscription would restore the tuple at the cost of the gap

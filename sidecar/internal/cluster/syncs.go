@@ -98,7 +98,7 @@ func gvrSyncAnchorFilter(
 // memory a permanently broken read can cost.
 const maxUndecidedSyncFrames = 4096
 
-func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheGVRSyncWatchFrame, error) {
+func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (*Stream[domain.ClusterCacheGVRSyncWatchFrame], error) {
 	// The anchor is resolved lazily and re-resolved as the stream runs — a
 	// subscribe-time miss (a just-created cache) must not leave the stream
 	// permanently empty; while unresolved, dropping frames is correct (an
@@ -136,7 +136,7 @@ func (a syncsAPI) Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-c
 	if err != nil {
 		return nil, err
 	}
-	return filterChan(ctx, watchListChan(ctx, "ClusterCacheGVRSync", stream,
+	return filterStream(ctx, watchListStream(ctx, "ClusterCacheGVRSync", stream,
 		func(t domain.DeltaFrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheGVRSyncSpec, domain.ClusterCacheGVRSyncStatus]) domain.ClusterCacheGVRSyncWatchFrame {
 			if t == domain.DeltaFrameBookmark {
 				return domain.ClusterCacheGVRSyncWatchFrame{Type: t}

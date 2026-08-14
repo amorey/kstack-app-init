@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amorey/beehive"
@@ -66,7 +67,7 @@ type ClusterService interface {
 	// family because an event carries no kind of its own: one reader serves every
 	// record that has a timeline. The per-record point reads stay on their families
 	// (Clusters().ListEvents and siblings), which is what the `events` fields use.
-	WatchObjectEvents(ctx context.Context, id domain.ObjectID, category *string) (<-chan domain.EventWatchFrame, error)
+	WatchObjectEvents(ctx context.Context, id domain.ObjectID, category *string) (*Stream[domain.EventWatchFrame], error)
 }
 
 // Clusters is the Cluster record surface: the tracked clusters, their spec
@@ -80,7 +81,7 @@ type Clusters interface {
 	Get(ctx context.Context, id domain.ClusterID) (*domain.Cluster, error)
 	// Watch streams the cluster list as a delta watch; deletion-pending surfaces
 	// as Deleted.
-	Watch(ctx context.Context) (<-chan domain.ClusterWatchFrame, error)
+	Watch(ctx context.Context) (*Stream[domain.ClusterWatchFrame], error)
 	// ListEvents returns a cluster's beehive event timeline (newest run first),
 	// optionally filtered by category and bounded by limit. Decoupled from Watch —
 	// event chatter never re-emits the cluster.
@@ -110,7 +111,7 @@ type Caches interface {
 	List(ctx context.Context, clusterID *domain.ClusterID) ([]*domain.ClusterCache, error)
 	// Watch streams cache records as a delta watch parallel to Clusters().Watch;
 	// the caller joins caches onto clusters by ClusterID.
-	Watch(ctx context.Context) (<-chan domain.ClusterCacheWatchFrame, error)
+	Watch(ctx context.Context) (*Stream[domain.ClusterCacheWatchFrame], error)
 	// GetStats returns live on-disk statistics for one ClusterCache.
 	GetStats(ctx context.Context, clusterID domain.ClusterID, cacheID domain.ClusterCacheID) (*domain.ClusterCacheStats, error)
 	// WatchStats streams one cache's contents as a live gauge. A stream, not a
@@ -124,14 +125,15 @@ type Caches interface {
 	// WatchSyncHealth streams every cache's sync verdict folded from its per-kind
 	// records — the whole-cache rollup an always-mounted consumer carries. Unscoped
 	// where the rest of this family is per-cache: one fold serves the whole fleet.
-	WatchSyncHealth(ctx context.Context) (<-chan domain.ClusterCacheSyncHealth, error)
+	// A gauge, but a failable one: the fold reads two beehive watches of its own.
+	WatchSyncHealth(ctx context.Context) (*Stream[domain.ClusterCacheSyncHealth], error)
 }
 
 // Discovery is the per-cache GVR-discovery anchor: exactly one per cache, naming
 // the kinds that cache's cluster serves.
 type Discovery interface {
 	// Watch streams the caches' discovery anchors, joined onto caches by CacheID.
-	Watch(ctx context.Context) (<-chan domain.ClusterCacheGVRDiscoveryWatchFrame, error)
+	Watch(ctx context.Context) (*Stream[domain.ClusterCacheGVRDiscoveryWatchFrame], error)
 	// GetStats returns one anchor's live gauges from controller memory; nil before
 	// this process's first pass. Out of status so a pass never wakes dependents for
 	// a UI-only number (see ClusterCacheGVRDiscoveryStatus).
@@ -152,7 +154,7 @@ type Syncs interface {
 	List(ctx context.Context, cacheID *domain.ClusterCacheID) ([]*domain.ClusterCacheGVRSync, error)
 	// Watch streams one cache's per-kind sync records. Cache-scoped: one record per
 	// served kind, so an unscoped stream would be a firehose.
-	Watch(ctx context.Context, cacheID domain.ClusterCacheID) (<-chan domain.ClusterCacheGVRSyncWatchFrame, error)
+	Watch(ctx context.Context, cacheID domain.ClusterCacheID) (*Stream[domain.ClusterCacheGVRSyncWatchFrame], error)
 	// GetStats returns one synced kind's freshness stamps (out of band from the
 	// object watch; see ClusterCacheGVRSyncStats).
 	GetStats(ctx context.Context, id domain.ClusterCacheGVRSyncID) (*domain.ClusterCacheGVRSyncStats, error)
@@ -248,8 +250,11 @@ type Service struct {
 
 	// syncHealth is the shared sync-verdict fold, started on first subscriber and running
 	// until Close. Guarded by syncHealthMu, which covers the lazy start only.
-	syncHealthMu   sync.Mutex
-	syncHealth     *watch.Hub[syncHealthSnapshot]
+	syncHealthMu sync.Mutex
+	syncHealth   *watch.Hub[syncHealthSnapshot]
+	// syncHealthErr carries why THIS fold stopped, to subscribers whose receiver just
+	// closed. Replaced per fold, so a restarted one never serves the old reason.
+	syncHealthErr  *atomic.Pointer[error]
 	syncHealthStop context.CancelFunc
 	// syncHealthDone closes when the fold goroutine has fully unwound — its WatchList
 	// leases release in its defers, so shutdown must wait for it before beehive drains.

@@ -18,23 +18,22 @@ import (
 	"context"
 )
 
-// filterChan forwards what decide returns for each value of in — zero or MORE,
+// filterStream forwards what decide returns for each frame of in — zero or MORE,
 // because a filter may not be able to decide a frame yet, and a dropped watch
 // frame is gone for good (beehive re-emits only on change); holding undecided
-// frames keeps that from being permanent. Closes out when in closes or ctx ends.
-func filterChan[T any](ctx context.Context, in <-chan T, decide func(T) []T) <-chan T {
-	out := make(chan T, 1)
-	go func() {
-		defer close(out)
-		for v := range in {
+// frames keeps that from being permanent. in's terminal error passes through
+// untouched: a filter narrows frames, never the reason the source died.
+func filterStream[T any](ctx context.Context, in *Stream[T], decide func(T) []T) *Stream[T] {
+	return NewStream(func(out chan<- T) error {
+		for v := range in.Frames {
 			// send, not a bare write: a consumer that stops draining (closed sync
 			// dialog) would otherwise park this goroutine forever.
 			for _, o := range decide(v) {
 				if !send(ctx, out, o) {
-					return
+					return nil
 				}
 			}
 		}
-	}()
-	return out
+		return in.Err()
+	})
 }

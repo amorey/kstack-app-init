@@ -19,6 +19,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster/domain"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // WatchCacheSyncHealth folds a cache's per-kind records into one verdict — the reading an
@@ -54,8 +56,9 @@ func TestServiceWatchCacheSyncHealthFoldsWorstKind(t *testing.T) {
 		domain.LiveCondition(domain.ConditionSynced, domain.ConditionFalse, domain.ReasonStale, "the watch has stalled"),
 	}))
 
-	ch, err := s.Caches().WatchSyncHealth(ctx)
+	st, err := s.Caches().WatchSyncHealth(ctx)
 	require.NoError(t, err)
+	ch := st.Frames
 
 	deadline := time.After(3 * time.Second)
 	for {
@@ -78,11 +81,6 @@ func TestServiceWatchCacheSyncHealthFoldsWorstKind(t *testing.T) {
 // end-to-end half of TestSyncHealthVerdict: a sync record exists but carries no Synced
 // condition, which is what every kind looks like between its record being created and its
 // worker's first report — and, after a restart, what every kind looks like at once.
-
-// A kind whose verdict nobody has observed yet keeps the whole cache out of Watching. The
-// end-to-end half of TestSyncHealthVerdict: a sync record exists but carries no Synced
-// condition, which is what every kind looks like between its record being created and its
-// worker's first report — and, after a restart, what every kind looks like at once.
 func TestServiceWatchCacheSyncHealthWaitsForEveryKind(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -99,8 +97,9 @@ func TestServiceWatchCacheSyncHealthWaitsForEveryKind(t *testing.T) {
 		domain.LiveCondition(domain.ConditionSynced, domain.ConditionTrue, domain.ReasonWatching, ""),
 	}))
 
-	ch, err := s.Caches().WatchSyncHealth(ctx)
+	st, err := s.Caches().WatchSyncHealth(ctx)
 	require.NoError(t, err)
+	ch := st.Frames
 
 	deadline := time.After(3 * time.Second)
 	for {
@@ -131,9 +130,6 @@ func TestServiceWatchCacheSyncHealthWaitsForEveryKind(t *testing.T) {
 
 // A cache whose kinds are all healthy reports healthy, and one whose discovery has not
 // landed reports Unknown rather than either verdict — nobody has observed anything yet.
-
-// A cache whose kinds are all healthy reports healthy, and one whose discovery has not
-// landed reports Unknown rather than either verdict — nobody has observed anything yet.
 func TestServiceWatchCacheSyncHealthHealthyAndUnknown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -143,8 +139,9 @@ func TestServiceWatchCacheSyncHealthHealthyAndUnknown(t *testing.T) {
 	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
 	discoveryID := seedGVRDiscovery(t, s, cacheID)
 
-	ch, err := s.Caches().WatchSyncHealth(ctx)
+	st, err := s.Caches().WatchSyncHealth(ctx)
 	require.NoError(t, err)
+	ch := st.Frames
 
 	first := recvBy(t, ch, time.After(3*time.Second))
 	assert.Equal(t, domain.ConditionUnknown, first.Status, "no kinds yet is neither healthy nor broken")
@@ -168,11 +165,6 @@ func TestServiceWatchCacheSyncHealthHealthyAndUnknown(t *testing.T) {
 	}
 }
 
-// The GVR-discovery watch is a standalone delta stream of
-// the cache's other sync child, with the parent CacheID resolved from the owner edge. It
-// carries identity, spec and conditions only — the pass's gauges are served out of band
-// (GVRDiscoveryStats), so there is no status on the record to assert.
-
 // TestServiceWatchCacheSyncHealthSharesOneFold pins that the fold is process-wide, not
 // per-subscriber. Every window computes the same verdict from the same two watches, so a
 // second subscriber must attach to the running fold rather than start its own — otherwise
@@ -190,8 +182,9 @@ func TestServiceWatchCacheSyncHealthSharesOneFold(t *testing.T) {
 		domain.LiveCondition(domain.ConditionSynced, domain.ConditionTrue, domain.ReasonWatching, ""),
 	}))
 
-	first, err := s.Caches().WatchSyncHealth(ctx)
+	firstSt, err := s.Caches().WatchSyncHealth(ctx)
 	require.NoError(t, err)
+	first := firstSt.Frames
 	awaitSyncHealth(t, first, domain.ClusterCacheID(cacheID), domain.ReasonWatching)
 
 	hub := s.syncHealth
@@ -200,13 +193,12 @@ func TestServiceWatchCacheSyncHealthSharesOneFold(t *testing.T) {
 	// A second subscriber must reuse it AND be served the current verdict at once — a
 	// settled cache emits nothing, so a window that only saw future frames would render
 	// "not reported yet" forever.
-	second, err := s.Caches().WatchSyncHealth(ctx)
+	secondSt, err := s.Caches().WatchSyncHealth(ctx)
 	require.NoError(t, err)
+	second := secondSt.Frames
 	awaitSyncHealth(t, second, domain.ClusterCacheID(cacheID), domain.ReasonWatching)
 	assert.Same(t, hub, s.syncHealth, "a second subscriber must not start a second fold")
 }
-
-// awaitSyncHealth drains until the named cache reports want.
 
 // TestServiceWatchCacheSyncHealthClosesOnShutdown pins the teardown. The fold outlives
 // every subscriber, so nothing a subscriber does can end it — only the service can, and
@@ -220,8 +212,9 @@ func TestServiceWatchCacheSyncHealthClosesOnShutdown(t *testing.T) {
 	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
 	seedGVRDiscovery(t, s, cacheID)
 
-	ch, err := s.Caches().WatchSyncHealth(ctx)
+	st, err := s.Caches().WatchSyncHealth(ctx)
 	require.NoError(t, err)
+	ch := st.Frames
 	awaitSyncHealth(t, ch, domain.ClusterCacheID(cacheID), domain.ReasonSyncing) // no kinds yet
 
 	s.stopSyncHealthFold(context.Background())
@@ -234,12 +227,60 @@ func TestServiceWatchCacheSyncHealthClosesOnShutdown(t *testing.T) {
 			return false
 		}
 	}, 2*time.Second, 10*time.Millisecond, "shutting the fold down must close its subscribers")
+
+	assert.NoError(t, st.Err(), "an orderly shutdown is not a fault")
 }
 
-// Stopping the fold JOINS it. Cancelling alone only asks it to stop, and the two
-// fleet-wide WatchList leases it holds come back in its defers — so a stop that returned
-// early let beehive begin draining while the fold was still running, the interleaving
-// "the fold goes first" exists to prevent.
+// The verdict is a gauge, but a failable one — the fold reads two beehive watches of its
+// own, and they die for the same reasons their sibling delta watches do. A subscriber
+// whose receiver just closed must be able to tell that from an orderly shutdown, or the
+// always-mounted stream reconnect-loops with nothing shown.
+//
+// The reason is planted in the fold's slot rather than provoked from a real watch:
+// beehive's streamFail is unexported, so a fake source cannot fail. What is under test is
+// the half that is ours — slot to subscriber. recordFoldWatchEnd covers the other half.
+func TestServiceWatchCacheSyncHealthReportsAFoldWatchThatDied(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, coreCC, _, _, _ := newServiceTestSync(t)
+	id := seedCluster(t, s, "alpha")
+	cacheID := seedActiveCache(t, s, coreCC, id, "kube-system-uid")
+	seedGVRDiscovery(t, s, cacheID)
+
+	st, err := s.Caches().WatchSyncHealth(ctx)
+	require.NoError(t, err)
+	awaitSyncHealth(t, st.Frames, domain.ClusterCacheID(cacheID), domain.ReasonSyncing)
+
+	boom := errors.New("sync-health ClusterCacheGVRSync watch ended: watch too old")
+	s.syncHealthMu.Lock()
+	s.syncHealthErr.Store(&boom)
+	s.syncHealthMu.Unlock()
+	s.stopSyncHealthFold(context.Background())
+
+	testutil.WaitClosed(t, st.Frames, "the subscriber's stream once the fold ended")
+	assert.Equal(t, boom, st.Err(), "a dead fold watch must reach the subscriber as a reason")
+}
+
+// The guard on the way in: only a real fault is recorded. A nil Err, or the fold's own
+// context ending, is an orderly stop — recording either would report every shutdown as a
+// broken watch.
+func TestRecordFoldWatchEndOnlyRecordsARealFault(t *testing.T) {
+	live := context.Background()
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var slot atomic.Pointer[error]
+	recordFoldWatchEnd(live, &slot, "ClusterCacheGVRSync", nil)
+	assert.Nil(t, slot.Load(), "a clean end is not a fault")
+
+	recordFoldWatchEnd(dead, &slot, "ClusterCacheGVRSync", errors.New("watch too old"))
+	assert.Nil(t, slot.Load(), "our own teardown races the source's; that is not a fault")
+
+	recordFoldWatchEnd(live, &slot, "ClusterCacheGVRSync", errors.New("watch too old"))
+	require.NotNil(t, slot.Load())
+	assert.Contains(t, (*slot.Load()).Error(), "ClusterCacheGVRSync",
+		"the reason must name which of the fold's two watches died")
+}
 
 // Stopping the fold JOINS it. Cancelling alone only asks it to stop, and the two
 // fleet-wide WatchList leases it holds come back in its defers — so a stop that returned
@@ -261,7 +302,7 @@ func TestServiceStopSyncHealthFoldWaitsForIt(t *testing.T) {
 		unwound.Store(true)
 	}
 
-	_, err := s.syncHealthReceiver()
+	_, _, err := s.syncHealthReceiver()
 	require.NoError(t, err)
 
 	s.stopSyncHealthFold(context.Background())

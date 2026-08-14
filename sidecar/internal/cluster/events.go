@@ -16,6 +16,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/amorey/beehive"
@@ -83,52 +84,50 @@ func (s *Service) events(ctx context.Context, c eventClient, id beehive.ObjectID
 // its id names. The client passed below only has to be one whose kind has a registered
 // controller; that is a property of the caller, not a filter on the target, because an
 // event carries no kind of its own.
-func (s *Service) WatchObjectEvents(ctx context.Context, id domain.ObjectID, category *string) (<-chan domain.EventWatchFrame, error) {
+func (s *Service) WatchObjectEvents(ctx context.Context, id domain.ObjectID, category *string) (*Stream[domain.EventWatchFrame], error) {
 	return s.watchEvents(ctx, s.coreClient, beehive.ObjectID(id), category)
 }
 
 // watchEvents streams one object's event log: the snapshot runs, one bookmark, then
 // growth. beehive conflates per run id, so the consumer upserts by Event.ID — no
-// add/modify classification, and no deletes (a prune is never delivered). The
-// stream's terminal error is logged.
-func (s *Service) watchEvents(ctx context.Context, c eventClient, id beehive.ObjectID, category *string) (<-chan domain.EventWatchFrame, error) {
+// add/modify classification, and no deletes (a prune is never delivered).
+func (s *Service) watchEvents(ctx context.Context, c eventClient, id beehive.ObjectID, category *string) (*Stream[domain.EventWatchFrame], error) {
 	stream, err := c.WatchEvents(ctx, id, eventOpts(category, defaultEventLimit)...)
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan domain.EventWatchFrame, 1)
-	go func() {
-		defer close(out)
+	return NewStream(func(out chan<- domain.EventWatchFrame) error {
 		emit := func(e beehive.Event) bool {
 			ev := toDomainEvent(e)
 			return send(ctx, out, domain.EventWatchFrame{Type: domain.EventFrameRun, Event: &ev})
 		}
 		for _, e := range stream.Runs {
 			if !emit(e) {
-				return
+				return nil
 			}
 		}
 		// Unconditionally correct here: beehive reads the snapshot before returning and
 		// streams only what grew above it, so this boundary needs no latch.
 		if !send(ctx, out, domain.EventWatchFrame{Type: domain.EventFrameBookmark}) {
-			return
+			return nil
 		}
 		for {
 			select {
 			case <-ctx.Done():
-				return
+				return nil
 			case e, ok := <-stream.Events:
 				if !ok {
+					// A cancelled ctx races the source's own teardown; that is our own
+					// doing, not a failure worth reporting.
 					if err := stream.Err(); err != nil && ctx.Err() == nil {
-						slog.Warn("clusterservice: event watch ended", "object", id, "err", err)
+						return fmt.Errorf("event watch ended for object %d: %w", id, err)
 					}
-					return
+					return nil
 				}
 				if !emit(e) {
-					return
+					return nil
 				}
 			}
 		}
-	}()
-	return out, nil
+	}), nil
 }

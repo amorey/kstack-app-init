@@ -22,12 +22,28 @@ import { clearStatus, markConnected, markDisconnected } from './transport-status
 // connection, before any `next`. `complete` is the server's graceful end;
 // `closed` is host-synthesized for an ungraceful one. Both reconnect, but only
 // `closed` reports.
+type SubPayload = { data?: unknown; errors?: unknown; extensions?: Record<string, unknown> };
+
 type SubMessage =
   | { type: 'open' }
-  | { type: 'next'; payload: { data?: unknown; errors?: unknown } }
+  | { type: 'next'; payload: SubPayload }
   | { type: 'error'; payload: unknown }
   | { type: 'complete' }
   | { type: 'closed' };
+
+// The sidecar's marker for "this watch died, here is why" — set by its
+// WatchFailureExtension; keep in step with sidecar/graph/watch_failure.go.
+const WATCH_FAILED = 'watchFailed';
+
+// The message from a terminal-failure frame — the sidecar's reason a watch died —
+// or null if payload isn't one. Keyed on the marker the sidecar's
+// WatchFailureExtension sets, never on shape: a non-null field erroring nulls its
+// parent, so an ordinary frame carrying a field error is shape-identical.
+function terminalError(payload: SubPayload): string | null {
+  if (payload.extensions?.[WATCH_FAILED] !== true) return null;
+  const first = Array.isArray(payload.errors) ? (payload.errors[0] as { message?: unknown }) : undefined;
+  return typeof first?.message === 'string' ? first.message : 'the server ended the subscription';
+}
 
 const BASE_DELAY_MS = 1_000;
 const MAX_DELAY_MS = 30_000;
@@ -127,6 +143,15 @@ export const tauriSubscriptionExchange = subscriptionExchange({
               attempt = 0;
               markConnected(key);
             } else if (msg.type === 'next') {
+              const reason = terminalError(msg.payload);
+              if (reason !== null) {
+                // The stream is over, so take the ordinary drop path: report, hold
+                // last-known data, reconnect. Never the sink — urql merges each frame
+                // into the previous result, so an errors-only frame would re-deliver
+                // the last frame's data and fold it a second time.
+                end(reason, msg.payload);
+                return;
+              }
               // Healthy frame: outage over; next abnormal drop reports fresh.
               attempt = 0;
               reportedOutage = false;

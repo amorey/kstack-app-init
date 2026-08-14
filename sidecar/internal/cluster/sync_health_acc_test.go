@@ -369,11 +369,11 @@ func TestSyncHealthFoldCancelsItsWatchesWhenItEndsOnItsOwn(t *testing.T) {
 	}
 	s.gvrSyncClient = fake
 
-	hub, stop, done, err := s.startSyncHealthFold()
+	hub, foldErr, stop, done, err := s.startSyncHealthFold()
 	require.NoError(t, err)
 	t.Cleanup(stop)
 	s.syncHealthMu.Lock()
-	s.syncHealth, s.syncHealthStop, s.syncHealthDone = hub, stop, done
+	s.syncHealth, s.syncHealthErr, s.syncHealthStop, s.syncHealthDone = hub, foldErr, stop, done
 	s.syncHealthMu.Unlock()
 
 	watchCtx := testutil.Recv(t, fake.ctx, "the fold to open its watches")
@@ -394,7 +394,7 @@ func TestSyncHealthReceiverDoesNotRestartAfterShutdown(t *testing.T) {
 
 	s.stopSyncHealthFold(context.Background())
 
-	rx, err := s.syncHealthReceiver()
+	rx, _, err := s.syncHealthReceiver()
 	require.Error(t, err, "a post-shutdown subscribe must fail rather than resurrect the fold")
 	assert.Nil(t, rx)
 	assert.Nil(t, s.syncHealth, "and must leave no hub behind")

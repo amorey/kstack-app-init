@@ -77,3 +77,4 @@ usually just documentation in the wrong place.
 | 2026-08-09 | [Sandbox build-output isolation](2026-08-09-sandbox-build-separation.md) | repo | Accepted |
 | 2026-08-10 | [ClusterService as record-family sub-APIs](2026-08-10-cluster-service-sub-apis.md) | sidecar | Accepted |
 | 2026-08-10 | [Split internal/cluster into boundary, controllers, and domain](2026-08-10-cluster-package-split.md) | sidecar | Accepted |
+| 2026-08-14 | [Report a dead watch as a terminal GraphQL error](2026-08-14-watch-failure-reporting.md) | cross-cutting | Accepted |

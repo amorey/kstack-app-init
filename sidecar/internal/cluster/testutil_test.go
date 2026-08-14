@@ -100,11 +100,6 @@ func (c *noopController[Spec, Status]) Reconcile(context.Context, beehive.Contro
 // the out-of-band dispatch (RetryConnection → Reprobe) without a network-touching
 // ClusterCoreController. StartBackground/StopBackground are no-ops; Reprobe records the
 // ids it was handed.
-
-// fakeCoreController satisfies the coreController seam so the service test can assert
-// the out-of-band dispatch (RetryConnection → Reprobe) without a network-touching
-// ClusterCoreController. StartBackground/StopBackground are no-ops; Reprobe records the
-// ids it was handed.
 type fakeCoreController struct{ reprobed []domain.ClusterID }
 
 func (f *fakeCoreController) StartBackground() {}
@@ -112,9 +107,6 @@ func (f *fakeCoreController) StartBackground() {}
 func (f *fakeCoreController) StopBackground() {}
 
 func (f *fakeCoreController) Reprobe(id domain.ClusterID) { f.reprobed = append(f.reprobed, id) }
-
-// WatchProbe returns a closed channel: this fake never probes, so the interface
-// is satisfied without a live in-flight signal.
 
 // WatchProbe returns a closed channel: this fake never probes, so the interface
 // is satisfied without a live in-flight signal.
@@ -128,19 +120,11 @@ func (f *fakeCoreController) WatchProbe(context.Context, domain.ClusterID) <-cha
 // service wired to its clients plus a temp cache manager. The returned
 // ControllerClients write Cluster status (core) and ClusterCache status — the
 // controller-owned surfaces a white-box test stamps directly.
-
-// newServiceTest builds a started beehive with no-op controllers and returns a
-// service wired to its clients plus a temp cache manager. The returned
-// ControllerClients write Cluster status (core) and ClusterCache status — the
-// controller-owned surfaces a white-box test stamps directly.
 func newServiceTest(t *testing.T) (*Service, beehive.ControllerClient[domain.ClusterStatus], beehive.ControllerClient[domain.ClusterCacheStatus]) {
 	t.Helper()
 	s, coreCC, cacheCC, _, _ := newServiceTestSync(t)
 	return s, coreCC, cacheCC
 }
-
-// newServiceTestSync is newServiceTest plus the sync children's controller client, for
-// the tests that write a child's status (the granular sync surface).
 
 // newServiceTestSync is newServiceTest plus the sync children's controller client, for
 // the tests that write a child's status (the granular sync surface).
@@ -198,9 +182,6 @@ func newServiceTestSync(t *testing.T) (
 
 // seedCluster creates a Cluster (as the importer would, with the kubeconfig
 // name) and returns its ClusterID — the beehive ObjectID beehive assigned.
-
-// seedCluster creates a Cluster (as the importer would, with the kubeconfig
-// name) and returns its ClusterID — the beehive ObjectID beehive assigned.
 func seedCluster(t *testing.T, s *Service, ctxName string) domain.ClusterID {
 	t.Helper()
 	ctx := context.Background()
@@ -219,11 +200,6 @@ func seedCluster(t *testing.T, s *Service, ctxName string) domain.ClusterID {
 // writing it to Status.Server.UID (as the ClusterCoreController would after a
 // probe). A ClusterCache for the same uid then resolves as the cluster's active
 // cache.
-
-// stampActiveUID records uid as a cluster's last-probed kube-system identity by
-// writing it to Status.Server.UID (as the ClusterCoreController would after a
-// probe). A ClusterCache for the same uid then resolves as the cluster's active
-// cache.
 func stampActiveUID(t *testing.T, s *Service, coreCC beehive.ControllerClient[domain.ClusterStatus], id domain.ClusterID, uid string) {
 	t.Helper()
 	ctx := context.Background()
@@ -233,10 +209,6 @@ func stampActiveUID(t *testing.T, s *Service, coreCC beehive.ControllerClient[do
 		Server: domain.ClusterServer{UID: &uid},
 	}))
 }
-
-// seedActiveCache creates an active ClusterCache for a cluster: it stamps the
-// cluster's connected UID and creates a ClusterCache (owned, UID-keyed name) for
-// that identity. Returns the cache's ObjectID.
 
 // seedActiveCache creates an active ClusterCache for a cluster: it stamps the
 // cluster's connected UID and creates a ClusterCache (owned, UID-keyed name) for
@@ -260,10 +232,6 @@ func insertCatalogKind(t *testing.T, ctx context.Context, cdb *store.ClusterDB, 
 		 VALUES(?, ?, ?, ?, 0, NULL)`, apiVersion, kind, resource, scope)
 	require.NoError(t, err)
 }
-
-// A subscriber that opens the stream before the cache db is opened (the common
-// unsynced-cluster case) must bind to the cache when it opens and start streaming its
-// catalog — not miss it forever by binding once to the initial (nil) Lookup.
 
 // insertEvent writes one row directly into the events table (uid + the display columns),
 // standing in for what the sync engine's event driver would persist.
@@ -310,20 +278,12 @@ func insertObject(t *testing.T, ctx context.Context, cdb *store.ClusterDB, uid, 
 // (which never decompress): store.Objects decompresses raw_json, so a seed on that read
 // path must be compressed like the engine write path. (Event rows aren't decompressed by
 // store.Events, so those seeds stay raw.)
-
-// emptyRawJSON is a zlib-compressed "{}" for object seeds read only via CacheStats/Kinds
-// (which never decompress): store.Objects decompresses raw_json, so a seed on that read
-// path must be compressed like the engine write path. (Event rows aren't decompressed by
-// store.Events, so those seeds stay raw.)
 func emptyRawJSON(t *testing.T) []byte {
 	t.Helper()
 	b, err := store.CompressRaw([]byte(`{}`))
 	require.NoError(t, err)
 	return b
 }
-
-// insertObjectCatalog writes one kind_catalog row so the objects reader can translate
-// the watch's plural resource to its kind.
 
 // insertObjectCatalog writes one kind_catalog row so the objects reader can translate
 // the watch's plural resource to its kind.
@@ -336,11 +296,7 @@ func insertObjectCatalog(t *testing.T, ctx context.Context, cdb *store.ClusterDB
 	require.NoError(t, err)
 }
 
-// ClusterDataEventsWatch streams the active cache's cached Kubernetes Events as a delta
-// watch: the newest window as an Added burst, then Added/Modified/Deleted as the sync
-// engine writes events and pings the events-only store broker — what backs the dashboard
-// events table.
-
+// seedGVRDiscovery creates the discovery anchor the cache controller would.
 func seedGVRDiscovery(t *testing.T, s *Service, cacheID beehive.ObjectID) beehive.ObjectID {
 	t.Helper()
 	obj, err := s.gvrDiscoveryClient.Create(context.Background(),
@@ -350,8 +306,6 @@ func seedGVRDiscovery(t *testing.T, s *Service, cacheID beehive.ObjectID) beehiv
 	require.NoError(t, err)
 	return obj.ID
 }
-
-// seedGVRSync creates one per-kind sync child the discovery controller would.
 
 // seedGVRSync creates one per-kind sync child the discovery controller would.
 func seedGVRSync(t *testing.T, s *Service, discoveryID beehive.ObjectID, apiVersion, resource string) beehive.ObjectID {
@@ -364,12 +318,6 @@ func seedGVRSync(t *testing.T, s *Service, discoveryID beehive.ObjectID, apiVers
 	return obj.ID
 }
 
-// TestServiceWatchCacheSyncHealthSharesOneFold pins that the fold is process-wide, not
-// per-subscriber. Every window computes the same verdict from the same two watches, so a
-// second subscriber must attach to the running fold rather than start its own — otherwise
-// each open window costs two more beehive watches, another ticker, another copy of every
-// per-kind record, and another acquisition of the sync controller's writeMu per flush.
-
 // awaitSyncHealth drains until the named cache reports want.
 func awaitSyncHealth(t *testing.T, ch <-chan domain.ClusterCacheSyncHealth, cacheID domain.ClusterCacheID, want string) {
 	t.Helper()
@@ -381,8 +329,3 @@ func awaitSyncHealth(t *testing.T, ch <-chan domain.ClusterCacheSyncHealth, cach
 		}
 	}
 }
-
-// TestServiceWatchCacheSyncHealthClosesOnShutdown pins the teardown. The fold outlives
-// every subscriber, so nothing a subscriber does can end it — only the service can, and
-// when it does every open stream has to close rather than hang on a hub nobody will
-// publish to again.

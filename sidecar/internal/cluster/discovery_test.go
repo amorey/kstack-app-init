@@ -50,8 +50,9 @@ func TestServiceWatchGVRDiscoveriesEmitsChildren(t *testing.T) {
 		domain.LiveCondition(domain.ConditionDiscovered, domain.ConditionTrue, domain.ReasonDiscovered, ""),
 	}))
 
-	ch, err := s.Discovery().Watch(ctx)
+	st, err := s.Discovery().Watch(ctx)
 	require.NoError(t, err)
+	ch := st.Frames
 
 	// WatchList replays current state on subscribe (conflated per object), so drain
 	// Added changes until the child's verdict lands.

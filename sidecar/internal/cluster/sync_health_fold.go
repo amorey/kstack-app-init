@@ -18,9 +18,11 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/amorey/beehive"
@@ -44,20 +46,23 @@ type syncHealthSnapshot map[domain.ClusterCacheID]domain.ClusterCacheSyncHealth
 // adapter is the per-subscriber half, sending only what changed for THIS
 // subscriber — which is what gives a late joiner every cache on its first read.
 // See docs/adr/2026-08-09-status-propagation-gauges.md.
-func (a cachesAPI) WatchSyncHealth(ctx context.Context) (<-chan domain.ClusterCacheSyncHealth, error) {
-	rx, err := a.s.syncHealthReceiver()
+func (a cachesAPI) WatchSyncHealth(ctx context.Context) (*Stream[domain.ClusterCacheSyncHealth], error) {
+	rx, foldErr, err := a.s.syncHealthReceiver()
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan domain.ClusterCacheSyncHealth, 1)
-	go func() {
-		defer close(out)
+	return NewStream(func(out chan<- domain.ClusterCacheSyncHealth) error {
 		defer rx.Close()
 		sent := syncHealthSnapshot{}
 		for {
 			snap, err := rx.RecvContext(ctx)
 			if err != nil {
-				return // ctx ended, or the hub closed at shutdown
+				// ctx ended, or the hub closed — which is shutdown, or the fold's two
+				// beehive watches dying. Only the last of those has a reason.
+				if p := foldErr.Load(); p != nil && ctx.Err() == nil {
+					return *p
+				}
+				return nil
 			}
 			// Forget caches that left the snapshot. No delete FRAME: this is a gauge;
 			// the consumer drops a verdict when the cache leaves clusterCachesWatch,
@@ -73,32 +78,31 @@ func (a cachesAPI) WatchSyncHealth(ctx context.Context) (<-chan domain.ClusterCa
 				}
 				sent[cacheID] = health
 				if !send(ctx, out, health) {
-					return
+					return nil
 				}
 			}
 		}
-	}()
-	return out, nil
+	}), nil
 }
 
-// syncHealthReceiver returns a receiver on the shared fold, starting it on first
-// use — lazy so an unwatched fleet isn't folded, and the fold outlives any one
-// subscriber. Once started it runs until Close (no refcount: little gain, a
-// teardown race).
-func (s *Service) syncHealthReceiver() (*watch.Receiver[syncHealthSnapshot], error) {
+// syncHealthReceiver returns a receiver on the shared fold and the slot carrying why
+// that fold stopped, starting it on first use — lazy so an unwatched fleet isn't
+// folded, and the fold outlives any one subscriber. Once started it runs until Close
+// (no refcount: little gain, a teardown race).
+func (s *Service) syncHealthReceiver() (*watch.Receiver[syncHealthSnapshot], *atomic.Pointer[error], error) {
 	s.syncHealthMu.Lock()
 	defer s.syncHealthMu.Unlock()
 	if s.syncHealthClosed {
-		return nil, errors.New("cluster: sync-health fold is shut down")
+		return nil, nil, errors.New("cluster: sync-health fold is shut down")
 	}
 	if s.syncHealth == nil {
-		hub, stop, done, err := s.startSyncHealthFold()
+		hub, foldErr, stop, done, err := s.startSyncHealthFold()
 		if err != nil {
-			return nil, err // nothing cached: the next subscriber retries
+			return nil, nil, err // nothing cached: the next subscriber retries
 		}
-		s.syncHealth, s.syncHealthStop, s.syncHealthDone = hub, stop, done
+		s.syncHealth, s.syncHealthErr, s.syncHealthStop, s.syncHealthDone = hub, foldErr, stop, done
 	}
-	return s.syncHealth.Receiver(), nil
+	return s.syncHealth.Receiver(), s.syncHealthErr, nil
 }
 
 // startSyncHealthFold opens the two watches the fold reads and runs it, publishing
@@ -106,22 +110,24 @@ func (s *Service) syncHealthReceiver() (*watch.Receiver[syncHealthSnapshot], err
 // not deltas — the output is tiny (one per cache), a new subscriber's first read is
 // "every cache, right now", and a slow subscriber coalesces to the newest (correct
 // for a gauge, where a dropped delta would be lost state).
-func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context.CancelFunc, chan struct{}, error) {
+func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], *atomic.Pointer[error], context.CancelFunc, chan struct{}, error) {
 	// Background, not a caller's: the fold outlives every subscriber. Cancelled by
 	// stopSyncHealthFold, or by the fold itself on any other exit.
 	ctx, cancel := context.WithCancel(context.Background())
 	syncStream, err := s.gvrSyncClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
 		cancel()
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	discStream, err := s.gvrDiscoveryClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
 		cancel()
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	hub := watch.New(syncHealthSnapshot{})
+	// Written before hub.Close, which is what wakes the subscribers that read it.
+	foldErr := &atomic.Pointer[error]{}
 	done := make(chan struct{})
 	go func() {
 		// Declared first so it runs LAST: done means every defer below has run —
@@ -172,13 +178,13 @@ func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context
 				return
 			case ch, ok := <-discStream.Changes:
 				if !ok {
-					logSyncHealthWatchEnd(ctx, "ClusterCacheGVRDiscovery", discStream.Err())
+					recordFoldWatchEnd(ctx, foldErr, "ClusterCacheGVRDiscovery", discStream.Err())
 					return
 				}
 				f.applyDiscovery(ch)
 			case ch, ok := <-syncStream.Changes:
 				if !ok {
-					logSyncHealthWatchEnd(ctx, "ClusterCacheGVRSync", syncStream.Err())
+					recordFoldWatchEnd(ctx, foldErr, "ClusterCacheGVRSync", syncStream.Err())
 					return
 				}
 				f.applySync(ch)
@@ -190,15 +196,18 @@ func (s *Service) startSyncHealthFold() (*watch.Hub[syncHealthSnapshot], context
 			f.flush()
 		}
 	}()
-	return hub, cancel, done, nil
+	return hub, foldErr, cancel, done, nil
 }
 
-// logSyncHealthWatchEnd reports why a fold watch stopped, once its stream closed.
-// A nil Err is the fold's own context ending, which is not a fault.
-func logSyncHealthWatchEnd(ctx context.Context, kind string, err error) {
-	if err != nil && ctx.Err() == nil {
-		slog.Warn("clusterservice: sync-health watch ended", "kind", kind, "err", err)
+// recordFoldWatchEnd parks why a fold watch stopped, for the subscribers that are
+// about to see their receiver close. A nil Err is the fold's own context ending,
+// which is not a fault.
+func recordFoldWatchEnd(ctx context.Context, slot *atomic.Pointer[error], kind string, err error) {
+	if err == nil || ctx.Err() != nil {
+		return
 	}
+	wrapped := fmt.Errorf("sync-health %s watch ended: %w", kind, err)
+	slot.Store(&wrapped)
 }
 
 // forgetSyncHealthFold drops the cached hub when its fold has ended. It clears
@@ -323,7 +332,7 @@ func (f *syncHealthFold) unlinkDiscovery(id domain.ClusterCacheGVRDiscoveryID, c
 }
 
 func (f *syncHealthFold) applyDiscovery(ch beehive.ObjectChange[domain.ClusterCacheGVRDiscoverySpec, domain.ClusterCacheGVRDiscoveryStatus]) {
-	// Deletion-pending counts as gone (same rule as watchListChan): a child on its
+	// Deletion-pending counts as gone (same rule as watchListStream): a child on its
 	// way out must not keep counting toward its cache's verdict.
 	if ch.Object == nil || ch.Type == beehive.Deleted || ch.Object.DeletionRequestedAt != nil {
 		id := domain.ClusterCacheGVRDiscoveryID(ch.ID)

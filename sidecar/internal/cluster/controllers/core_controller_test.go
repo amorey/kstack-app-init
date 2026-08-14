@@ -766,7 +766,6 @@ func TestClusterCoreControllerObservesKubeconfigAndDeparture(t *testing.T) {
 // Aggregation into runs and per-object retention are beehive's (RecordEvent +
 // WithEventRetention), covered by its own tests; here we only pin the local
 // message-truncation helper the event and condition writes share.
-
 func TestTruncateMessage(t *testing.T) {
 	assert.Equal(t, "short", domain.TruncateMessage("short"))
 	long := strings.Repeat("x", domain.MaxMessageLen+50)

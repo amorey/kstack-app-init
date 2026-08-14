@@ -16,24 +16,32 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
-func TestFilterChanForwardsOnlyKept(t *testing.T) {
+// staticStream is an upstream that replays vals and then ends with err — the shape
+// filterStream sits on top of.
+func staticStream(vals []int, err error) *Stream[int] {
+	return NewStream(func(out chan<- int) error {
+		for _, v := range vals {
+			out <- v
+		}
+		return err
+	})
+}
+
+func TestFilterStreamForwardsOnlyKept(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	in := make(chan int, 4)
-	for _, v := range []int{1, 2, 3, 4} {
-		in <- v
-	}
-	close(in)
-
-	out := filterChan(ctx, in, func(v int) []int {
+	out := filterStream(ctx, staticStream([]int{1, 2, 3, 4}, nil), func(v int) []int {
 		if v%2 == 0 {
 			return []int{v}
 		}
@@ -41,30 +49,47 @@ func TestFilterChanForwardsOnlyKept(t *testing.T) {
 	})
 
 	var got []int
-	for v := range out {
+	for v := range out.Frames {
 		got = append(got, v)
 	}
 	assert.Equal(t, []int{2, 4}, got)
+	assert.NoError(t, out.Err())
+}
+
+// The filter narrows frames, never the reason the source died: a consumer of the
+// filtered stream must still be able to tell a failure from a clean end, or the
+// resolver above it reports a broken watch as a graceful one.
+func TestFilterStreamCarriesTheUpstreamFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	boom := errors.New("watch ended: too old")
+	out := filterStream(ctx, staticStream([]int{1}, boom), func(v int) []int { return []int{v} })
+
+	testutil.WaitClosed(t, out.Frames, "the filtered stream")
+	assert.Equal(t, boom, out.Err())
 }
 
 // The consumer of a per-cache watch stops draining the moment its client goes away — a
 // closed sync dialog — and only then is the stream's ctx cancelled. A bare channel send
 // cannot be unblocked by that cancel, so the goroutine would park forever holding the value
 // it was mid-forward on: one leak per open/close of the dialog, for the process lifetime.
-func TestFilterChanUnblocksAParkedSendOnContextEnd(t *testing.T) {
+func TestFilterStreamUnblocksAParkedSendOnContextEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	in := make(chan int)
-	out := filterChan(ctx, in, func(v int) []int { return []int{v} })
+	upstream := &Stream[int]{Frames: in}
+	out := filterStream(ctx, upstream, func(v int) []int { return []int{v} })
 
 	// Fill the single slot, then leave another value parked in the send with nobody
 	// draining — exactly the shape of an abandoned subscription.
 	in <- 1
 	in <- 2
-	require.Eventually(t, func() bool { return len(out) == 1 }, time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return len(out.Frames) == 1 }, time.Second, 5*time.Millisecond)
 
-	// The upstream watch unwinds on the same ctx, so close in as watchListChan does. What
-	// is under test is the goroutine parked in the SEND: closing the input cannot reach it.
+	// The upstream watch unwinds on the same ctx, so close in as watchListStream does.
+	// What is under test is the goroutine parked in the SEND: closing the input cannot
+	// reach it.
 	close(in)
 	cancel()
 
@@ -75,12 +100,12 @@ func TestFilterChanUnblocksAParkedSendOnContextEnd(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case _, ok := <-out:
+		case _, ok := <-out.Frames:
 			if !ok {
 				return // closed: the goroutine unwound
 			}
 		case <-deadline:
-			t.Fatal("filterChan leaked a goroutine parked in a send")
+			t.Fatal("filterStream leaked a goroutine parked in a send")
 		}
 	}
 }

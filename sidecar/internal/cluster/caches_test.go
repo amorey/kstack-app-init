@@ -30,10 +30,6 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
-// WatchCaches streams each ClusterCache standalone: the snapshot carries an Added
-// change per cache with its parent ClusterID resolved from the owner edge, its
-// ServerUID, and its conditions. The kind has no status (it measures nothing itself), and
-// active-ness is a client-side join, so neither is asserted here.
 // Get is the query entrypoint into a cache record (the GraphQL clusterCache field),
 // so it must resolve the owner edge the same way the watch does — a record without
 // its ClusterID cannot be joined to its cluster. An unknown id is (nil, nil): the
@@ -102,6 +98,10 @@ func TestCachesList(t *testing.T) {
 	assert.Equal(t, "uid-new", *cluster.Status.Server.UID)
 }
 
+// WatchCaches streams each ClusterCache standalone: the snapshot carries an Added
+// change per cache with its parent ClusterID resolved from the owner edge, its
+// ServerUID, and its conditions. The kind has no status (it measures nothing itself), and
+// active-ness is a client-side join, so neither is asserted here.
 func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -118,8 +118,9 @@ func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 		domain.LiveCondition(domain.ConditionSynced, domain.ConditionFalse, domain.ReasonSyncing, ""),
 	}))
 
-	ch, err := s.Caches().Watch(ctx)
+	st, err := s.Caches().Watch(ctx)
 	require.NoError(t, err)
+	ch := st.Frames
 
 	// WatchList replays current state on subscribe (conflated per object), so drain
 	// Added changes until the condition lands.
@@ -137,14 +138,6 @@ func TestServiceWatchCachesEmitsCaches(t *testing.T) {
 		}
 	}
 }
-
-// WatchCacheSyncHealth folds a cache's per-kind records into one verdict — the reading an
-// always-mounted consumer needs, since the per-kind stream is a hundred-plus records per
-// cache and no single child's verdict is the cache's.
-//
-// The fold must be dominated by the worst kind: ninety-nine healthy kinds and one whose
-// watch is wedged is not a healthy cache, and reading any one child would call it either
-// way at random.
 
 func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	ctx := context.Background()
@@ -166,11 +159,6 @@ func TestServiceClearCacheDeletesCacheAndReturnsCluster(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, stats.Exists)
 }
-
-// Clearing a cache is drain → delete → restart, and past the drain it must finish. A
-// client that abandons the mutation midway — a closed window, a navigation — would
-// otherwise leave the cache drained, its files deleted, and no workers rebuilt, with
-// nothing else that ever rebuilds them.
 
 // Clearing a cache is drain → delete → restart, and past the drain it must finish. A
 // client that abandons the mutation midway — a closed window, a navigation — would
@@ -209,9 +197,6 @@ func TestServiceClearCacheFinishesWhenTheRequestIsAbandoned(t *testing.T) {
 
 // cancelOnLookupCacheClient abandons the request the moment ClearCache resolves the cache
 // it is about to delete — the last read before the drain.
-
-// cancelOnLookupCacheClient abandons the request the moment ClearCache resolves the cache
-// it is about to delete — the last read before the drain.
 type cancelOnLookupCacheClient struct {
 	beehive.Client[domain.ClusterCacheSpec, domain.ClusterCacheStatus]
 	cancel context.CancelFunc
@@ -224,10 +209,6 @@ func (c *cancelOnLookupCacheClient) GetByName(
 	c.cancel()
 	return obj, err
 }
-
-// CacheStats rolls the kind catalog's per-kind counts up into ObjectCount/KindCount
-// (the whole-cache totals the sync-status summary shows): only kinds with at least
-// one cached object count, and events are excluded (not a catalog kind).
 
 // CacheStats rolls the kind catalog's per-kind counts up into ObjectCount/KindCount
 // (the whole-cache totals the sync-status summary shows): only kinds with at least
@@ -279,14 +260,6 @@ func TestServiceCacheStatsRollup(t *testing.T) {
 	assert.Equal(t, 2, stats.KindCount, "Pod and Deployment; the empty Node kind and events excluded")
 	assert.Equal(t, 3, stats.ObjectCount, "2 Pods + 1 Deployment; the event is excluded")
 }
-
-// The Events kind now carries a real count in kind_counts (maintained by triggers
-// on the events table), and /apis discovery advertises it in kind_catalog — so it
-// appears in Kinds with a non-zero count. CacheStats must still exclude it
-// from the whole-cache object totals: events aren't objects, and ObjectCount is
-// documented to leave them out. (TestServiceCacheStatsRollup above is insulated
-// only because it inserts no Event catalog row; this one adds it to exercise the
-// exclusion.)
 
 // The Events kind now carries a real count in kind_counts (maintained by triggers
 // on the events table), and /apis discovery advertises it in kind_catalog — so it
@@ -360,8 +333,9 @@ func TestClusterCacheEventsPublicSurface(t *testing.T) {
 	assert.Equal(t, beehive.EventNormal, evs[0].Type)
 
 	// ClusterCacheEventsWatch: snapshot replays the existing run, then a live run.
-	ch, err := svc.WatchObjectEvents(ctx, domain.ObjectID(cacheOID), &category)
+	st, err := svc.WatchObjectEvents(ctx, domain.ObjectID(cacheOID), &category)
 	require.NoError(t, err)
+	ch := st.Frames
 
 	e := recvRun(t, ch)
 	assert.Equal(t, "Watching", e.Reason)
@@ -380,12 +354,6 @@ func recvStats(t *testing.T, ch <-chan domain.ClusterCacheStats) domain.ClusterC
 	t.Helper()
 	return testutil.Recv(t, ch, "a stats frame")
 }
-
-// TestClusterCacheStatsWatchTracksWrites is the regression for a frozen cache summary.
-// CacheStats is a live measurement, but it used to be readable only as a resolver field
-// on ClusterCache — and that object stops changing once its sync settles, so the webview
-// rendered whatever the cache held at subscribe time (an early, tiny snapshot of a sync
-// still in progress) forever. A gauge has to have its own stream.
 
 // TestClusterCacheStatsWatchTracksWrites is the regression for a frozen cache summary.
 // CacheStats is a live measurement, but it used to be readable only as a resolver field
@@ -423,12 +391,6 @@ func TestClusterCacheStatsWatchTracksWrites(t *testing.T) {
 // closed cache as nonexistent disabled that action on precisely the rows that need it:
 // a cluster whose kube-context left the kubeconfig is never eligible, so no worker ever
 // opens its cache, and its whole reason for still being listed is to be reclaimed.
-
-// A cache file with nobody holding it still EXISTS, and the gauge is the only thing that
-// says so — the webview drives its "Clear cache" action off this stream. Reporting a
-// closed cache as nonexistent disabled that action on precisely the rows that need it:
-// a cluster whose kube-context left the kubeconfig is never eligible, so no worker ever
-// opens its cache, and its whole reason for still being listed is to be reclaimed.
 func TestClusterCacheStatsWatchReportsAnUnopenedCacheOnDisk(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -455,10 +417,6 @@ func TestClusterCacheStatsWatchReportsAnUnopenedCacheOnDisk(t *testing.T) {
 // A cache whose files are gone reports nothing — the same closed path as above, but with
 // no file behind it. This is what a Clear cache leaves behind between the delete and the
 // reopen, and what a removed cluster leaves for good.
-
-// A cache whose files are gone reports nothing — the same closed path as above, but with
-// no file behind it. This is what a Clear cache leaves behind between the delete and the
-// reopen, and what a removed cluster leaves for good.
 func TestClusterCacheStatsWatchReportsADeletedCacheAsGone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -473,10 +431,6 @@ func TestClusterCacheStatsWatchReportsADeletedCacheAsGone(t *testing.T) {
 	assert.False(t, got.Exists, "no file, no cache")
 	assert.Zero(t, got.Bytes)
 }
-
-// TestClusterCacheStatsWatchSkipsUnchangedReads pins the dedupe that makes a per-write
-// gauge affordable: a busy cluster pings constantly, and a measurement that reads the
-// same twice must send nothing.
 
 // TestClusterCacheStatsWatchSkipsUnchangedReads pins the dedupe that makes a per-write
 // gauge affordable: a busy cluster pings constantly, and a measurement that reads the
@@ -503,8 +457,3 @@ func TestClusterCacheStatsWatchSkipsUnchangedReads(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 }
-
-// TestWatchGVRSyncsIsScopedToOneCache pins the scoping that makes this stream usable. A
-// cache has one sync record per served kind — a hundred or more — so unlike the other
-// object watches this one is opened per cache, and must not leak another cache's kinds
-// into it.

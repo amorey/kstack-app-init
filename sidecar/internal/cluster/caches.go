@@ -28,12 +28,12 @@ import (
 // Watch implements Caches — the ClusterCache-kind counterpart of
 // Clusters().Watch, parent ClusterID resolved from the eager-loaded owner edge;
 // the caller joins by ClusterID.
-func (a cachesAPI) Watch(ctx context.Context) (<-chan domain.ClusterCacheWatchFrame, error) {
+func (a cachesAPI) Watch(ctx context.Context) (*Stream[domain.ClusterCacheWatchFrame], error) {
 	stream, err := a.s.cacheClient.WatchList(ctx, beehive.WithLoads(beehive.LoadOwner()))
 	if err != nil {
 		return nil, err
 	}
-	return watchListChan(ctx, "ClusterCache", stream,
+	return watchListStream(ctx, "ClusterCache", stream,
 		func(t domain.DeltaFrameType, id beehive.ObjectID, obj *beehive.Object[domain.ClusterCacheSpec, domain.ClusterCacheStatus]) domain.ClusterCacheWatchFrame {
 			if t == domain.DeltaFrameBookmark {
 				return domain.ClusterCacheWatchFrame{Type: t}

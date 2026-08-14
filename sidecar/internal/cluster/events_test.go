@@ -101,8 +101,9 @@ func TestServiceWatchEventsStream(t *testing.T) {
 	}))
 
 	category := cat
-	ch, err := s.watchEvents(ctx, s.coreClient, oid, &category)
+	st, err := s.watchEvents(ctx, s.coreClient, oid, &category)
 	require.NoError(t, err)
+	ch := st.Frames
 
 	// snapshot: run A, then the bookmark closing it
 	e := recvRun(t, ch)
@@ -140,7 +141,3 @@ func TestServiceWatchEventsStream(t *testing.T) {
 		}
 	}, 2*time.Second, 10*time.Millisecond, "stream should close on ctx cancel")
 }
-
-// The kind-scoped public surface (ClusterEvents / ClusterEventsWatch), reached through
-// the ClusterService interface, delegates to the generic reader/watch against the
-// Cluster kind client. Asserting via the interface value locks the public API shape.
