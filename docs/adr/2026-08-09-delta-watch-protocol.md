@@ -19,19 +19,19 @@ than its cluster. The frontend needs current state on subscribe plus every chang
 
 Each kind streams **independently** as a Kubernetes-style delta watch: an `Added` snapshot
 burst, one `Bookmark` closing it, then per-object `Added`/`Modified`/`Deleted`
-(`clustersWatch`, `clusterCachesWatch`, `clusterCacheGVRDiscoveriesWatch`, and the
-cache-scoped `clusterCacheGVRSyncsWatch`; the sync verdict rides `clusterCacheSyncHealthWatch`,
+(`clustersWatch`, `clusterCachesWatch`, `clusterCachedCatalogsWatch`, and the
+cache-scoped `clusterCachedResourcesWatch`; the sync verdict rides `clusterCacheHealthWatch`,
 which is a gauge rather than a delta watch and carries no `Bookmark`). The sidecar
-folds beehive's per-kind `WatchList` into this shape in the `watchListStream` pump;
-subscription resolvers emit the current snapshot first, then deltas (`mapStream` in
-`graph/util.go` for hub-backed sources).
+folds beehive's per-kind `WatchList` into this shape behind `clustersvc`'s family
+`Watch`/`WatchList` methods; subscription resolvers emit the current snapshot first, then
+deltas (`mapStream` in `graph/util.go` for hub-backed sources).
 
 The **`Bookmark`** is what makes an empty collection distinguishable from one still arriving:
 sent exactly once per stream, carrying no entity (the only frame that doesn't — which is why
 every change wrapper's entity field is nullable). Until it lands a consumer is in
 `watchPhase`'s `connecting`; a client must never render an empty state before it. Kubernetes'
 `initial-events-end` bookmark, in this protocol's vocabulary. The cache-data watches
-(`cacheDeltaWatch`) send theirs after the first successful read — or after the first bind that
+(`CachedData().Watch*`) send theirs after the first successful read — or after the first bind that
 finds no open cache, whose initial state is legitimately empty, so a never-synced or paused
 cache reports "empty" rather than spinning forever.
 
@@ -60,7 +60,7 @@ join against the current cluster status is correct.
 watches were designed for, and polling either lags or hammers.
 
 **Returning `(snapshot, channel)` on the wire, as beehive's Go watches do.** The tuple is the
-right shape in-process — `watchListStream` takes it, and it is what makes the initial-state
+right shape in-process — the sidecar's own pump takes it, and it is what makes the initial-state
 boundary explicit and race-free — but a GraphQL subscription has one root field emitting N
 payloads of one type, so there is nowhere to put a snapshot that isn't another frame. A
 snapshot query paired with a delta subscription would restore the tuple at the cost of the gap
