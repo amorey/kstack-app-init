@@ -326,15 +326,15 @@ function pushSyncHealth(cacheId: string, over: Record<string, unknown>) {
 }
 
 // One per-kind sync record on the cache-scoped stream.
-function pushGVRSync(id: string, resource: string, reason: string, apiVersion = 'v1') {
-  channelFor('clusterCacheGVRSyncsWatch').onmessage!(
+function pushCachedResource(id: string, resource: string, reason: string, apiVersion = 'v1') {
+  channelFor('clusterCachedResourcesWatch').onmessage!(
     JSON.stringify({
       type: 'next',
       payload: {
         data: {
-          clusterCacheGVRSyncsWatch: {
+          clusterCachedResourcesWatch: {
             type: 'Added',
-            sync: {
+            resource: {
               id,
               spec: { apiVersion, resource },
               conditions: [
@@ -358,14 +358,14 @@ function pushDiscovery(
   cacheId: string,
   d: { resourceCount: number; lastDiscoveryAt?: string; reason?: string; message?: string },
 ) {
-  channelFor('clusterCacheGVRDiscoveriesWatch').onmessage!(
+  channelFor('clusterCachedCatalogsWatch').onmessage!(
     JSON.stringify({
       type: 'next',
       payload: {
         data: {
-          clusterCacheGVRDiscoveriesWatch: {
+          clusterCachedCatalogsWatch: {
             type: 'Added',
-            discovery: {
+            catalog: {
               id: `disc-${cacheId}`,
               cacheID: cacheId,
               // stats is resolved on read by the sidecar (never stored on the record),
@@ -898,14 +898,14 @@ describe('ClusterSyncPanel', () => {
     // finalizer, so a cascade can collect it with no deletion-pending frame ahead of it —
     // filtering these by cacheID left the pane showing a record that no longer exists.
     await act(async () => {
-      channelFor('clusterCacheGVRDiscoveriesWatch').onmessage!(
+      channelFor('clusterCachedCatalogsWatch').onmessage!(
         JSON.stringify({
           type: 'next',
           payload: {
             data: {
-              clusterCacheGVRDiscoveriesWatch: {
+              clusterCachedCatalogsWatch: {
                 type: 'Deleted',
-                discovery: { id: 'disc-cache-u-gone', cacheID: '0', stats: null, conditions: [] },
+                catalog: { id: 'disc-cache-u-gone', cacheID: '0', stats: null, conditions: [] },
               },
             },
           },
@@ -930,14 +930,14 @@ describe('ClusterSyncPanel', () => {
 
     // Matching on the record id is what keeps this scoped now that cacheID is unusable.
     await act(async () => {
-      channelFor('clusterCacheGVRDiscoveriesWatch').onmessage!(
+      channelFor('clusterCachedCatalogsWatch').onmessage!(
         JSON.stringify({
           type: 'next',
           payload: {
             data: {
-              clusterCacheGVRDiscoveriesWatch: {
+              clusterCachedCatalogsWatch: {
                 type: 'Deleted',
-                discovery: { id: 'disc-some-other-cache', cacheID: '0', stats: null, conditions: [] },
+                catalog: { id: 'disc-some-other-cache', cacheID: '0', stats: null, conditions: [] },
               },
             },
           },
@@ -1010,7 +1010,7 @@ describe('ClusterSyncPanel', () => {
 
     // The transition log is per kind, so it stays paused until a kind record names one —
     // subscribing before that would open a stream guaranteed to carry nothing.
-    await act(async () => pushGVRSync('g-events', 'events', 'Watching'));
+    await act(async () => pushCachedResource('g-events', 'events', 'Watching'));
 
     // The sync history streams in as bare runs (newest first by lastAt), with `ok`
     // derived from the generic event type (Normal = a healthy run).
@@ -1051,7 +1051,7 @@ describe('ClusterSyncPanel', () => {
   it('withholds the empty sync-event state until the snapshot closes', async () => {
     const user = await openWith([{ uuid: 'u-sync', name: 'prod', enabled: true, present: true }]);
     await user.click(await screen.findByRole('button', { name: /synced/i }));
-    await act(async () => pushGVRSync('g-events', 'events', 'Watching'));
+    await act(async () => pushCachedResource('g-events', 'events', 'Watching'));
 
     // Subscribed, nothing delivered: still loading, so no verdict either way.
     expect(screen.queryByText(/no sync events yet/i)).not.toBeInTheDocument();
@@ -1236,7 +1236,7 @@ describe('ClusterSyncPanel', () => {
     expect(screen.getByText(/pods not receiving updates/i)).toBeInTheDocument();
 
     // The log follows the kind behind the verdict, which the rollup names.
-    await act(async () => pushGVRSync('g-pods', 'pods', 'Stale'));
+    await act(async () => pushCachedResource('g-pods', 'pods', 'Stale'));
 
     // A SyncStale event renders by its raw reason code alongside its message.
     await act(async () => {
@@ -1263,8 +1263,8 @@ describe('ClusterSyncPanel', () => {
     await user.click(await screen.findByRole('button', { name: /synced/i }));
 
     await act(async () => {
-      pushGVRSync('g-builtin', 'gateways', 'Watching', 'gateway.networking.k8s.io/v1');
-      pushGVRSync('g-crd', 'gateways', 'SyncFailed', 'example.com/v1');
+      pushCachedResource('g-builtin', 'gateways', 'Watching', 'gateway.networking.k8s.io/v1');
+      pushCachedResource('g-crd', 'gateways', 'SyncFailed', 'example.com/v1');
       pushSyncHealth('cache-u-gw', {
         status: 'False',
         reason: 'SyncFailed',

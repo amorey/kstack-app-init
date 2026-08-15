@@ -14,21 +14,21 @@
 
 // The active cluster's cached Kubernetes Events (the synced `events.k8s.io`/core Event
 // rows, not kstack's own control-plane `Event` timeline) as a live list.
-// `clusterDataEventsWatch` is a per-cache delta watch (a re-firing event bumps
+// `clusterCachedDataEventsWatch` is a per-cache delta watch (a re-firing event bumps
 // count/lastSeen → `Modified`). Reduced via `useCacheDeltaWatch`, keyed by `uid` with
 // cacheID provenance so two caches' events never mix —
 // see docs/adr/2026-08-09-delta-watch-protocol.md
 import { useMemo } from 'react';
 
 import { graphql } from '@/gql';
-import type { ClusterDataEventsWatchSubscription as ClusterDataEventsWatchSubscriptionType } from '@/gql/graphql';
+import type { ClusterCachedDataEventsWatchSubscription as ClusterCachedDataEventsWatchSubscriptionType } from '@/gql/graphql';
 import { useActiveCluster } from '@/lib/active-cluster';
 import { useCacheDeltaWatch, joinProvenance } from '@/lib/graphql/use-cache-delta-watch';
 import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
 
-const ClusterDataEventsWatchSubscription = graphql(`
-  subscription ClusterDataEventsWatch($id: ObjectID!, $cacheID: ObjectID!) {
-    clusterDataEventsWatch(id: $id, cacheID: $cacheID) {
+const ClusterCachedDataEventsWatchSubscription = graphql(`
+  subscription ClusterCachedDataEventsWatch($id: ObjectID!, $cacheID: ObjectID!) {
+    clusterCachedDataEventsWatch(id: $id, cacheID: $cacheID) {
       type
       cacheID
       event {
@@ -48,23 +48,25 @@ const ClusterDataEventsWatchSubscription = graphql(`
 `);
 
 // One cached event (the `event` payload of a change), as the table renders it.
-export type ClusterDataEvent = NonNullable<ClusterDataEventsWatchSubscriptionType['clusterDataEventsWatch']['event']>;
+export type ClusterCachedDataEvent = NonNullable<
+  ClusterCachedDataEventsWatchSubscriptionType['clusterCachedDataEventsWatch']['event']
+>;
 
 // The active context's cached events, newest first (by lastSeen), live. Paused
 // (empty) without an active cache. Provenance is just the cacheID — the variables
 // carry no kind.
-export function useClusterDataEvents(): { events: ClusterDataEvent[]; active: boolean; phase: WatchPhase } {
+export function useClusterCachedDataEvents(): { events: ClusterCachedDataEvent[]; active: boolean; phase: WatchPhase } {
   const { clusterID, cacheID, active } = useActiveCluster();
 
-  const { items, phase } = useCacheDeltaWatch<ClusterDataEventsWatchSubscriptionType, ClusterDataEvent>(
+  const { items, phase } = useCacheDeltaWatch<ClusterCachedDataEventsWatchSubscriptionType, ClusterCachedDataEvent>(
     {
-      query: ClusterDataEventsWatchSubscription,
+      query: ClusterCachedDataEventsWatchSubscription,
       variables: { id: clusterID ?? '', cacheID: cacheID ?? '' },
       pause: !active,
     },
     {
       select: (d) => {
-        const f = d.clusterDataEventsWatch;
+        const f = d.clusterCachedDataEventsWatch;
         return { type: f.type, entity: f.event, provenance: joinProvenance(f.cacheID) };
       },
       keyOf: (e) => e.uid,

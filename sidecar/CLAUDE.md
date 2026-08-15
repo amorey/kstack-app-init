@@ -23,8 +23,9 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 ## Cluster subsystem (`internal/clustersvc`)
 
 **Stripped to a shell, pending a rebuild.** The package is three files — `service.go` (the
-`ClusterService` interface, its five family sub-interfaces, the accessors, and a stateless `Service`
-whose every method panics), `stream.go` (`Stream[T]`, which appears in those signatures), and
+`Service` interface, its five family sub-interfaces, the accessors, and the stateless unexported
+`service` whose every method but `Start`/`Close` panics), `stream.go` (`Stream[T]`, which appears in
+those signatures), and
 `types/` (the record structs the GraphQL schema binds by name). Nothing else survives: there is no
 beehive control plane, no controllers, no kubeconfig watcher, no connection manager, and no on-disk
 cache.
@@ -32,18 +33,27 @@ cache.
 **The point of the shell is that the surfaces above it did not move.** `graph/`, `grpc/`, and
 `internal/app` compile and are wired exactly as before; `clustersvc.New(dataDir, kubeconfigPath,
 pokeSvc)`, `Start`, and `Close` keep their signatures so reconnecting a real implementation is not a
-change to the composition root. `New` returns an empty `Service`, `Start` returns a no-op stop func,
-and every API call panics. **The sidecar therefore serves no cluster data at all** — the app starts,
+change to the composition root. `New` returns an empty `service` as a `Service`, `Start` returns a
+no-op stop func, and every API call panics. **The sidecar therefore serves no cluster data at all** — the app starts,
 the socket comes up, auth and cloud settings work, and any cluster query or subscription panics.
 
+The five families are `Clusters()`, `Caches()`, `CachedCatalogs()`, `CachedResources()`, and
+`CachedData()`. **The `Cached*` prefix marks the cache subtree** — what a `ClusterCache` catalogs,
+the per-kind records under that catalog, and the mirrored content itself — so the grouping is visible
+in the accessor list rather than something you have to know. Keep it when adding a family there.
+
 Rebuilding a family means writing its implementation in its own file (`clusters.go`, `caches.go`,
-`discovery.go`, `syncs.go`, `data.go` — one per family, each with a test beside it) and deleting its
-stub from `service.go`. Keep the method naming rule when you do: **VerbNoun with the noun elided when
-it equals the family's subject**, so `Caches().Watch()` watches caches and `Caches().ListEvents()`
-reads a cache's event log. `RetryConnection`/`GetConnection` stay top-level — they answer about a
-connection, not a record. Every family is asserted separately (`var _ Caches = cachesAPI{}`), in the
-resolver tests' fake too: satisfying `ClusterService` only proves the accessors exist.
-→ [ADR: ClusterService sub-APIs](../docs/adr/2026-08-10-cluster-service-sub-apis.md).
+`cachedcatalogs.go`, `cachedresources.go`, `cacheddata.go` — one per family, each with a test beside
+it) and deleting its stub from `service.go`. Keep the method naming rule when you do: **VerbNoun with the noun elided when
+it equals the family's subject**, so `Caches().Watch()` watches caches and `Caches().GetStats()` reads
+one cache's stats. **A family owns a read only when the read differs per record type.**
+`RetryConnection`/`GetConnection` stay top-level (they answer about a connection, not a record), and
+so do `ListEvents`/`WatchEvents`: an event carries no kind, every id is the same `ObjectID`, and only
+three of the five families have a timeline at all — scoping them would be three copies of one method
+plus an unanswerable question about the other two. Every family is asserted separately
+(`var _ Caches = cachesAPI{}`), in the resolver tests' fake too: satisfying `Service` only proves the
+accessors exist.
+→ [ADR: record-family sub-APIs](../docs/adr/2026-08-10-cluster-service-sub-apis.md).
 
 **A watch whose source can die returns `*Stream[T]`** (`Frames` + `Err()`), not a bare channel:
 `Frames` closes on every exit, so `Err` is the only thing separating a failure from an ordinary
@@ -82,17 +92,17 @@ Unexported helpers live with their only consumer (a callee follows its caller �
 
 ### GraphQL surface (cluster)
 
-The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc/types` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.Data().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers — but **every field reaches the stubbed boundary and panics**, so this section is the contract the rebuild must satisfy, not a description of what answers today. Key entry points:
+The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc/types` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers — but **every field reaches the stubbed boundary and panics**, so this section is the contract the rebuild must satisfy, not a description of what answers today. Key entry points:
 
-- Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCacheGVRDiscoveriesWatch` (unscoped, one per cache), `clusterCacheGVRSyncsWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheSyncHealthWatch` (the fold — a latest-value gauge, **not** a delta watch, so no `Bookmark` rides it).
+- Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedCatalogsWatch` (unscoped, one per cache), `clusterCachedResourcesWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheSyncHealthWatch` (the fold — a latest-value gauge, **not** a delta watch, so no `Bookmark` rides it).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).
-- Cache-data watches (all keyed by cluster id + cache id; frames carry `cacheID` provenance — objects additionally `apiVersion`/`resource` — so the client rejects stale frames after a swap): `clusterDataKindsWatch` (kind catalog + counts; subscribes to **both** brokers via `catalogSubscribe`, since Event counts come from event triggers), `clusterDataEventsWatch` (newest window, `Deleted` when aging out), `clusterDataObjectsWatch` (per-kind rows incl. `rawJSON`; resource-keyed broker subscription). Unopened cache → the `Bookmark` alone.
-- Point reads hang off the record that owns them, resolved on selection: every event timeline is an `events(category, limit)` field (`Cluster.events`, `ClusterCache.events`, `ClusterCacheGVRSync.events`), the discovered kind catalog is `ClusterCache.kinds` (no arguments — both ids it reads with come off the record), and `Cluster.caches` / `ClusterCache.syncs` walk the owner chain down (`Caches().List`, `Syncs().List`). So there are no root `cluster*Events` or `clusterDataKinds` fields. The lookups `clusterCache(id)` and `clusterCacheGVRSync(id)` (over `Caches().Get`/`Syncs().Get`) address a record by **its own** id, which a caller holding one from a watch frame uses directly.
-- **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCacheGVRSync`/`clusterCacheGVRSyncs(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.syncs`). One boundary method backs both — `Caches().List`/`Syncs().List` take a nilable scope, nil meaning fleet-wide. Keep that shape when adding a noun.
-- **The query path skips `ClusterCacheGVRDiscovery`.** `ClusterCache.syncs` is keyed by the cache and resolves the anchor itself (`Syncs().List`, like `Syncs().Watch`): exactly one anchor exists per cache and its name is derived from the cache id (`types.ClusterCacheGVRDiscoveryName`), so it is an implementation detail, not a branch to navigate. The anchor's own state still streams on `clusterCacheGVRDiscoveriesWatch`.
+- Cache-data watches (all keyed by cluster id + cache id; frames carry `cacheID` provenance — objects additionally `apiVersion`/`resource` — so the client rejects stale frames after a swap): `clusterCachedDataKindsWatch` (kind catalog + counts; subscribes to **both** brokers via `catalogSubscribe`, since Event counts come from event triggers), `clusterCachedDataEventsWatch` (newest window, `Deleted` when aging out), `clusterCachedDataObjectsWatch` (per-kind rows incl. `rawJSON`; resource-keyed broker subscription). Unopened cache → the `Bookmark` alone.
+- Point reads hang off the record that owns them, resolved on selection: every event timeline is an `events(category, limit)` field (`Cluster.events`, `ClusterCache.events`, `ClusterCachedResource.events`), the discovered kind catalog is `ClusterCache.kinds` (no arguments — both ids it reads with come off the record), and `Cluster.caches` / `ClusterCache.cachedResources` walk the owner chain down (`Caches().List`, `CachedResources().List`). So there are no root `cluster*Events` or `clusterCachedDataKinds` fields. The lookups `clusterCache(id)` and `clusterCachedResource(id)` (over `Caches().Get`/`CachedResources().Get`) address a record by **its own** id, which a caller holding one from a watch frame uses directly.
+- **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCachedResource`/`clusterCachedResources(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.cachedResources`). One boundary method backs both — `Caches().List`/`CachedResources().List` take a nilable scope, nil meaning fleet-wide. Keep that shape when adding a noun.
+- **The query path skips `ClusterCachedCatalog`.** `ClusterCache.cachedResources` is keyed by the cache and resolves the catalog itself (`CachedResources().List`, like `CachedResources().Watch`): exactly one catalog exists per cache and its name is derived from the cache id (`types.ClusterCachedCatalogName`), so it is an implementation detail, not a branch to navigate. The catalog's own state still streams on `clusterCachedCatalogsWatch`.
 - **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`types.CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
 - Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (delete files then **bounce that cache's workers** — nothing else would rebuild them; they cold-sync, the cookie died with the file), `clusterDelete` (GC cascades; a still-present context is re-imported under a fresh id).
-- `ClusterDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the record keeps value `time.Time` for comparability.
+- `ClusterCachedDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the record keeps value `time.Time` for comparability.
 - **A watch that dies reports why** (`graph/watch_failure.go`). gqlgen builds each subscription frame as data alone and stops the instant the resolver's channel closes, so a failed watch is otherwise byte-identical to a graceful end and the webview reconnects forever with nothing shown. `WatchFailureExtension` bridges that in two halves — the resolver and the frame that would carry the reason never share a response context: `InterceptOperation` hangs a slot on the operation ctx (gqlgen threads it into the resolvers *and* every later frame), `watchStream` files `Stream.Err()` into it as the frames run out, and `InterceptResponse` claims it once the stream is spent, emitting one errors-only `graphql.Response` before the transport completes. Claimed once, so the next poll ends the subscription instead of looping. The reason goes through `AddError`, so the server's error presenter logs it. The client treats that frame as a drop with a reason — reported, last-known data held, reconnect — see the root `CLAUDE.md`. → [ADR: watch-failure reporting](../docs/adr/2026-08-14-watch-failure-reporting.md).
 
 Frontend join: `src/lib/clusters.tsx` (`ClustersProvider`/`useClusters`) reduces the three unscoped streams and joins `activeCache` + `syncHealth` client-side; `cluster-sync-panel.tsx` renders it (per-row detail streams subscribe only while a row is expanded; the sync column reads the rollup's reason, never the cache's coarse `Synced`).

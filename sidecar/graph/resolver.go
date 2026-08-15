@@ -16,7 +16,7 @@ type Resolver struct {
 	// ClusterSvc is the boundary to the cluster backend, hiding beehive behind the
 	// cluster types. (Named ClusterSvc to avoid shadowing the generated
 	// queryResolver.Clusters method.)
-	ClusterSvc clustersvc.ClusterService
+	ClusterSvc clustersvc.Service
 	// Auth backs the authState query/watch and the login/logout mutations; it degrades
 	// internally when no cloud account is configured.
 	Auth auth.Service

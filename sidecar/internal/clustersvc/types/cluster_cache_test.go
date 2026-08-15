@@ -31,23 +31,23 @@ func TestClusterCacheName(t *testing.T) {
 
 // Exactly one discovery anchor per cache, so creation is idempotent under
 // name-uniqueness dedup.
-func TestClusterCacheGVRDiscoveryName(t *testing.T) {
-	assert.Equal(t, "gvrdiscovery/7", ClusterCacheGVRDiscoveryName(7))
-	assert.Equal(t, ClusterCacheGVRDiscoveryName(7), ClusterCacheGVRDiscoveryName(7))
+func TestClusterCachedCatalogName(t *testing.T) {
+	assert.Equal(t, "cachedcatalog/7", ClusterCachedCatalogName(7))
+	assert.Equal(t, ClusterCachedCatalogName(7), ClusterCachedCatalogName(7))
 }
 
 // Deterministic per (anchor, apiVersion, resource), which is what lets a discovery
 // pass reconcile its children as a set with no per-child bookkeeping. Keyed on the
 // plural, not the Kind: a CRD may reuse a built-in's plural under another group, so
 // the group-version has to be in the name too.
-func TestClusterCacheGVRSyncName(t *testing.T) {
-	assert.Equal(t, "gvrsync/3/apps/v1/deployments", ClusterCacheGVRSyncName(3, "apps/v1", "deployments"))
+func TestClusterCachedResourceName(t *testing.T) {
+	assert.Equal(t, "cachedresource/3/apps/v1/deployments", ClusterCachedResourceName(3, "apps/v1", "deployments"))
 	assert.NotEqual(t,
-		ClusterCacheGVRSyncName(3, "apps/v1", "deployments"),
-		ClusterCacheGVRSyncName(3, "example.com/v1", "deployments"),
+		ClusterCachedResourceName(3, "apps/v1", "deployments"),
+		ClusterCachedResourceName(3, "example.com/v1", "deployments"),
 		"the same plural under another group is a different kind")
 	assert.NotEqual(t,
-		ClusterCacheGVRSyncName(3, "apps/v1", "deployments"),
-		ClusterCacheGVRSyncName(4, "apps/v1", "deployments"),
+		ClusterCachedResourceName(3, "apps/v1", "deployments"),
+		ClusterCachedResourceName(4, "apps/v1", "deployments"),
 		"the same kind under another cache's anchor")
 }

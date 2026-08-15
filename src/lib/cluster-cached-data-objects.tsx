@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // The active cluster's cached objects of one kind as a live table feed.
-// `clusterDataObjectsWatch` is keyed by the active cache plus the kind
+// `clusterCachedDataObjectsWatch` is keyed by the active cache plus the kind
 // (apiVersion + resource); each object carries its typed universal identity plus
 // `rawJSON`, the full native body (kind-specific columns derive from it — see
 // ObjectsTable). Provenance is the FULL triple cacheID + apiVersion + resource —
@@ -23,16 +23,21 @@
 import { useMemo } from 'react';
 
 import { graphql } from '@/gql';
-import type { ClusterDataObjectsWatchSubscription as ClusterDataObjectsWatchSubscriptionType } from '@/gql/graphql';
+import type { ClusterCachedDataObjectsWatchSubscription as ClusterCachedDataObjectsWatchSubscriptionType } from '@/gql/graphql';
 import { useActiveCluster } from '@/lib/active-cluster';
 import { useCacheDeltaWatch, joinProvenance } from '@/lib/graphql/use-cache-delta-watch';
 import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
 import { gvrKey } from '@/lib/gvr';
 import type { GVR } from '@/lib/gvr';
 
-const ClusterDataObjectsWatchSubscription = graphql(`
-  subscription ClusterDataObjectsWatch($id: ObjectID!, $cacheID: ObjectID!, $apiVersion: String!, $resource: String!) {
-    clusterDataObjectsWatch(id: $id, cacheID: $cacheID, apiVersion: $apiVersion, resource: $resource) {
+const ClusterCachedDataObjectsWatchSubscription = graphql(`
+  subscription ClusterCachedDataObjectsWatch(
+    $id: ObjectID!
+    $cacheID: ObjectID!
+    $apiVersion: String!
+    $resource: String!
+  ) {
+    clusterCachedDataObjectsWatch(id: $id, cacheID: $cacheID, apiVersion: $apiVersion, resource: $resource) {
       type
       cacheID
       apiVersion
@@ -51,8 +56,8 @@ const ClusterDataObjectsWatchSubscription = graphql(`
 `);
 
 // One cached object (the `object` payload of a change), as the table renders a row from.
-export type ClusterDataObject = NonNullable<
-  ClusterDataObjectsWatchSubscriptionType['clusterDataObjectsWatch']['object']
+export type ClusterCachedDataObject = NonNullable<
+  ClusterCachedDataObjectsWatchSubscriptionType['clusterCachedDataObjectsWatch']['object']
 >;
 
 // Hoisted: the list re-sorts on every delta frame, and per-call `localeCompare`
@@ -62,22 +67,22 @@ const COLLATOR = new Intl.Collator();
 // The active context's cached objects of `kind`, live. Paused (empty) without an
 // active cache. Provenance must carry the full cacheID + apiVersion + resource key
 // (see file header).
-export function useClusterDataObjects(kind: GVR): {
-  objects: ClusterDataObject[];
+export function useClusterCachedDataObjects(kind: GVR): {
+  objects: ClusterCachedDataObject[];
   active: boolean;
   phase: WatchPhase;
 } {
   const { clusterID, cacheID, active } = useActiveCluster();
 
-  const { items, phase } = useCacheDeltaWatch<ClusterDataObjectsWatchSubscriptionType, ClusterDataObject>(
+  const { items, phase } = useCacheDeltaWatch<ClusterCachedDataObjectsWatchSubscriptionType, ClusterCachedDataObject>(
     {
-      query: ClusterDataObjectsWatchSubscription,
+      query: ClusterCachedDataObjectsWatchSubscription,
       variables: { id: clusterID ?? '', cacheID: cacheID ?? '', apiVersion: kind.apiVersion, resource: kind.resource },
       pause: !active,
     },
     {
       select: (d) => {
-        const f = d.clusterDataObjectsWatch;
+        const f = d.clusterCachedDataObjectsWatch;
         return { type: f.type, entity: f.object, provenance: joinProvenance(f.cacheID, gvrKey(f)) };
       },
       keyOf: (o) => o.uid,

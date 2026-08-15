@@ -408,8 +408,8 @@ func TestPluralRootFieldsScopeOptionally(t *testing.T) {
 	}{
 		{"caches unscoped", `{ clusterCaches { id } }`, "clusterCaches", len(fix)},
 		{"caches scoped", `{ clusterCaches(clusterID: "` + clusterID + `") { id } }`, "clusterCaches", 1},
-		{"syncs unscoped", `{ clusterCacheGVRSyncs { id } }`, "clusterCacheGVRSyncs", len(fix)},
-		{"syncs scoped", `{ clusterCacheGVRSyncs(cacheID: "` + cacheID + `") { id } }`, "clusterCacheGVRSyncs", 1},
+		{"syncs unscoped", `{ clusterCachedResources { id } }`, "clusterCachedResources", len(fix)},
+		{"syncs scoped", `{ clusterCachedResources(cacheID: "` + cacheID + `") { id } }`, "clusterCachedResources", 1},
 	}
 
 	for _, tt := range tests {
@@ -435,7 +435,7 @@ func TestPluralRootFieldsScopeOptionally(t *testing.T) {
 }
 
 // ClusterCache.syncs completes the navigable path Cluster → caches → syncs. The
-// discovery anchor that owns the records is NOT a step in it: exactly one exists per
+// resource catalog that owns the records is NOT a step in it: exactly one exists per
 // cache, so the service resolves it and the query never names it.
 func TestClusterCacheSyncsResolver(t *testing.T) {
 	fix := clusterFixtures()
@@ -443,7 +443,7 @@ func TestClusterCacheSyncsResolver(t *testing.T) {
 	cacheID := fixtureCacheID(fix[0].id)
 
 	query := `{ clusterCache(id: "` + strconv.FormatInt(int64(cacheID), 10) + `") {
-		syncs { id discoveryID spec { apiVersion resource } }
+		cachedResources { id catalogID spec { apiVersion resource } }
 	} }`
 	body, _ := json.Marshal(map[string]string{"query": query})
 	raw := postGQL(t, srv.URL, string(body))
@@ -451,7 +451,7 @@ func TestClusterCacheSyncsResolver(t *testing.T) {
 	var resp struct {
 		Data struct {
 			ClusterCache struct {
-				Syncs []map[string]any `json:"syncs"`
+				CachedResources []map[string]any `json:"cachedResources"`
 			} `json:"clusterCache"`
 		}
 		Errors []struct{ Message string }
@@ -462,15 +462,15 @@ func TestClusterCacheSyncsResolver(t *testing.T) {
 	if len(resp.Errors) > 0 {
 		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
 	}
-	got := resp.Data.ClusterCache.Syncs
+	got := resp.Data.ClusterCache.CachedResources
 	if len(got) != 1 {
 		t.Fatalf("want this cache's one record, got %d: %s", len(got), raw)
 	}
-	if got[0]["id"] != strconv.FormatInt(int64(fixtureSyncID(fix[0].id)), 10) {
+	if got[0]["id"] != strconv.FormatInt(int64(fixtureResourceID(fix[0].id)), 10) {
 		t.Errorf("id: want the sync record's own id, got %v", got[0]["id"])
 	}
-	if got[0]["discoveryID"] != strconv.FormatInt(int64(fixtureDiscoveryID(fix[0].id)), 10) {
-		t.Errorf("discoveryID: want the anchor's id, got %v", got[0]["discoveryID"])
+	if got[0]["catalogID"] != strconv.FormatInt(int64(fixtureCatalogID(fix[0].id)), 10) {
+		t.Errorf("catalogID: want the anchor's id, got %v", got[0]["catalogID"])
 	}
 }
 
@@ -517,7 +517,7 @@ func TestClusterCachesResolver(t *testing.T) {
 
 // The two cache-side event timelines are the same generic reader hung off a different
 // record: `ClusterCache.events` reads the cache's own timeline (what the cache layer
-// records, e.g. SyncStopped), `ClusterCacheGVRSync.events` one synced kind's (where
+// records, e.g. SyncStopped), `ClusterCachedResource.events` one synced kind's (where
 // each worker report lands). One table because the wire mapping under test —
 // types.Event → the generic Event shape, enum included — is identical; only the record it
 // hangs off differs. Reaching either also exercises its root lookup, which is the only
@@ -547,10 +547,10 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 		wantEnum: "Warning",
 	}, {
 		name:     "per-kind sync timeline",
-		field:    "clusterCacheGVRSync",
-		lookupID: func(id types.ClusterID) types.ObjectID { return types.ObjectID(fixtureSyncID(id)) },
+		field:    "clusterCachedResource",
+		lookupID: func(id types.ClusterID) types.ObjectID { return types.ObjectID(fixtureResourceID(id)) },
 		seed: func(f *fakeClusterService, id types.ClusterID, ev types.Event) {
-			f.syncEvents = map[types.ClusterCacheGVRSyncID][]types.Event{fixtureSyncID(id): {ev}}
+			f.syncEvents = map[types.ClusterCachedResourceID][]types.Event{fixtureResourceID(id): {ev}}
 		},
 		event: types.Event{
 			Category: "sync", Type: beehive.EventNormal, Reason: "SyncComplete",
@@ -607,15 +607,15 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 	}
 }
 
-// The GVR-discovery stream serves the record's identity + Discovered condition, keyed to
+// The resource-catalog stream serves the record's identity + Discovered condition, keyed to
 // its cache by cacheID — the join the client makes — plus `stats`, which is resolved on
 // read from the controller rather than carried on the record. Asserted on the wire
 // because a resolver that isn't wired returns null rather than failing.
-func TestClusterCacheGVRDiscoveriesWatchServesRecord(t *testing.T) {
+func TestClusterCachedCatalogsWatchServesRecord(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	resp := openSSESubscription(t, srv.URL, "",
-		`subscription { clusterCacheGVRDiscoveriesWatch { type discovery { id cacheID `+
+		`subscription { clusterCachedCatalogsWatch { type catalog { id cacheID `+
 			`stats { lastDiscoveryAt resourceCount } conditions { type status reason } } } }`)
 	defer resp.Body.Close()
 	events := sseEvents(t, resp)
@@ -625,9 +625,9 @@ func TestClusterCacheGVRDiscoveriesWatchServesRecord(t *testing.T) {
 		var frame struct {
 			Data struct {
 				Watch struct {
-					Type      string         `json:"type"`
-					Discovery map[string]any `json:"discovery"`
-				} `json:"clusterCacheGVRDiscoveriesWatch"`
+					Type    string         `json:"type"`
+					Catalog map[string]any `json:"catalog"`
+				} `json:"clusterCachedCatalogsWatch"`
 			} `json:"data"`
 		}
 		select {
@@ -641,7 +641,7 @@ func TestClusterCacheGVRDiscoveriesWatchServesRecord(t *testing.T) {
 			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
 				t.Fatalf("decode discovery frame %s: %v", ev.data, err)
 			}
-			d := frame.Data.Watch.Discovery
+			d := frame.Data.Watch.Catalog
 			if d["cacheID"] != strconv.FormatInt(int64(fixtureCacheID(1)), 10) {
 				continue // fixture 2's record; it carries no discovery status
 			}
@@ -688,14 +688,14 @@ func TestClusterCacheClearMutation(t *testing.T) {
 	}
 }
 
-// TestClusterCacheGVRSyncsWatchIsCacheScoped pins the scoping on the wire: the stream is
+// TestClusterCachedResourcesWatchIsCacheScoped pins the scoping on the wire: the stream is
 // opened for one cache and must carry only that cache's kinds. The fixture gives each
 // cache one record, so a leak shows up as a second frame.
-func TestClusterCacheGVRSyncsWatchIsCacheScoped(t *testing.T) {
+func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	resp := openSSESubscription(t, srv.URL, "",
-		`subscription { clusterCacheGVRSyncsWatch(cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { type sync { id discoveryID `+
+		`subscription { clusterCachedResourcesWatch(cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { type resource { id catalogID `+
 			`spec { enabled apiVersion kind resource namespaced } conditions { type status reason } } } }`)
 	defer resp.Body.Close()
 	events := sseEvents(t, resp)
@@ -706,9 +706,9 @@ func TestClusterCacheGVRSyncsWatchIsCacheScoped(t *testing.T) {
 		var frame struct {
 			Data struct {
 				Watch struct {
-					Type string         `json:"type"`
-					Sync map[string]any `json:"sync"`
-				} `json:"clusterCacheGVRSyncsWatch"`
+					Type     string         `json:"type"`
+					Resource map[string]any `json:"resource"`
+				} `json:"clusterCachedResourcesWatch"`
 			} `json:"data"`
 		}
 		select {
@@ -726,8 +726,8 @@ func TestClusterCacheGVRSyncsWatchIsCacheScoped(t *testing.T) {
 				t.Fatalf("decode gvr sync frame %s: %v", ev.data, err)
 			}
 			seen++
-			sync := frame.Data.Watch.Sync
-			if sync["discoveryID"] != strconv.FormatInt(int64(fixtureDiscoveryID(1)), 10) {
+			sync := frame.Data.Watch.Resource
+			if sync["catalogID"] != strconv.FormatInt(int64(fixtureCatalogID(1)), 10) {
 				t.Fatalf("another cache's record leaked into the stream: %v", sync)
 			}
 			spec, _ := sync["spec"].(map[string]any)
@@ -787,14 +787,14 @@ func TestClusterCacheStatsWatchServesGauge(t *testing.T) {
 // --- Cluster data ---
 // The discovered kind catalog and the cached objects read out of a ClusterCache.
 
-// ClusterCache.kinds maps the service's ClusterDataKinds onto the wire 1:1
+// ClusterCache.kinds maps the service's ClusterCachedDataKinds onto the wire 1:1
 // (bound via gqlgen.yml), so the resolver just adapts the value slice to a pointer
 // slice. Both ids it reads with come off the record, so the pair cannot disagree.
-func TestClusterDataKindsResolver(t *testing.T) {
+func TestClusterCachedDataKindsResolver(t *testing.T) {
 	fix := clusterFixtures()
 	svc := newFakeClusterService(fix)
 	id := fix[0].id
-	svc.kinds = map[types.ClusterID][]types.ClusterDataKind{
+	svc.kinds = map[types.ClusterID][]types.ClusterCachedDataKind{
 		id: {
 			{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Scope: "Namespaced", IsCRD: false},
 			{APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: "Namespaced", IsCRD: true},
@@ -860,10 +860,10 @@ func TestClusterDataKindsResolver(t *testing.T) {
 	}
 }
 
-// clusterDataObjectsWatch wires the subscription resolver to the service: the fake with
+// clusterCachedDataObjectsWatch wires the subscription resolver to the service: the fake with
 // no seeded objects opens an empty-until-ctx stream, so the SSE dial succeeds and the
 // stream stays open with no frames rather than erroring.
-func TestClusterDataObjectsWatchOpensWithoutError(t *testing.T) {
+func TestClusterCachedDataObjectsWatchOpensWithoutError(t *testing.T) {
 	fix := clusterFixtures()
 	svc := newFakeClusterService(fix)
 	id := fix[0].id
@@ -873,7 +873,7 @@ func TestClusterDataObjectsWatchOpensWithoutError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	idStr := strconv.FormatInt(int64(id), 10)
-	q := `subscription { clusterDataObjectsWatch(id: "` + idStr + `", cacheID: "` + idStr +
+	q := `subscription { clusterCachedDataObjectsWatch(id: "` + idStr + `", cacheID: "` + idStr +
 		`", apiVersion: "apps/v1", resource: "deployments") { type object { uid name } } }`
 	resp := openSSESubscription(t, srv.URL, "", q)
 	defer resp.Body.Close()
@@ -894,11 +894,11 @@ func TestClusterDataObjectsWatchOpensWithoutError(t *testing.T) {
 // The resolver-gated `object` field carries the full native body as the JSON scalar,
 // marshaled verbatim through gqlgen — a consumer selecting it gets the object JSON back
 // as a nested value (not a string), with the identity fields alongside.
-func TestClusterDataObjectsWatchServesNativeBody(t *testing.T) {
+func TestClusterCachedDataObjectsWatchServesNativeBody(t *testing.T) {
 	fix := clusterFixtures()
 	svc := newFakeClusterService(fix)
 	id := fix[0].id
-	svc.dataObjects = map[types.ClusterID][]types.ClusterDataObject{
+	svc.dataObjects = map[types.ClusterID][]types.ClusterCachedDataObject{
 		id: {{
 			UID: "d1", APIVersion: "apps/v1", Kind: "Deployment", Namespace: "default", Name: "web",
 			RawJSON: types.RawJSON(`{"kind":"Deployment","spec":{"replicas":3}}`),
@@ -910,7 +910,7 @@ func TestClusterDataObjectsWatchServesNativeBody(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	idStr := strconv.FormatInt(int64(id), 10)
-	q := `subscription { clusterDataObjectsWatch(id: "` + idStr + `", cacheID: "` + idStr +
+	q := `subscription { clusterCachedDataObjectsWatch(id: "` + idStr + `", cacheID: "` + idStr +
 		`", apiVersion: "apps/v1", resource: "deployments") { type object { uid name rawJSON } } }`
 	resp := openSSESubscription(t, srv.URL, "", q)
 	defer resp.Body.Close()
@@ -928,20 +928,20 @@ func TestClusterDataObjectsWatchServesNativeBody(t *testing.T) {
 			}
 			var frame struct {
 				Data struct {
-					ClusterDataObjectsWatch struct {
+					ClusterCachedDataObjectsWatch struct {
 						Type   string `json:"type"`
 						Object struct {
 							UID     string         `json:"uid"`
 							Name    string         `json:"name"`
 							RawJSON map[string]any `json:"rawJSON"`
 						} `json:"object"`
-					} `json:"clusterDataObjectsWatch"`
+					} `json:"clusterCachedDataObjectsWatch"`
 				} `json:"data"`
 			}
 			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
 				t.Fatalf("decode frame %s: %v", ev.data, err)
 			}
-			got := frame.Data.ClusterDataObjectsWatch
+			got := frame.Data.ClusterCachedDataObjectsWatch
 			if got.Object.UID != "d1" || got.Object.Name != "web" {
 				t.Fatalf("identity fields: got %+v", got.Object)
 			}
@@ -959,15 +959,15 @@ func TestClusterDataObjectsWatchServesNativeBody(t *testing.T) {
 	}
 }
 
-// clusterDataKindsWatch streams the kind catalog as a delta watch: the resolver
-// adapts the service's ClusterDataKindWatchFrame stream to the wire 1:1, so the snapshot
+// clusterCachedDataKindsWatch streams the kind catalog as a delta watch: the resolver
+// adapts the service's ClusterCachedDataKindWatchFrame stream to the wire 1:1, so the snapshot
 // arrives as Added changes carrying the kind's fields (incl. the live count) and the
 // stream stays open for live updates.
-func TestClusterDataKindsWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
+func TestClusterCachedDataKindsWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
 	fix := clusterFixtures()
 	svc := newFakeClusterService(fix)
 	id := fix[0].id
-	svc.kinds = map[types.ClusterID][]types.ClusterDataKind{
+	svc.kinds = map[types.ClusterID][]types.ClusterCachedDataKind{
 		id: {
 			{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Scope: "Namespaced", IsCRD: false, Count: 3},
 			{APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: "Namespaced", IsCRD: true, Count: 0},
@@ -978,7 +978,7 @@ func TestClusterDataKindsWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	q := `subscription { clusterDataKindsWatch(id: "` + strconv.FormatInt(int64(id), 10) +
+	q := `subscription { clusterCachedDataKindsWatch(id: "` + strconv.FormatInt(int64(id), 10) +
 		`", cacheID: "` + strconv.FormatInt(int64(id), 10) + `") { type kind { apiVersion kind resource count } } }`
 	resp := openSSESubscription(t, srv.URL, "", q)
 	defer resp.Body.Close()
@@ -1000,19 +1000,19 @@ func TestClusterDataKindsWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
 			}
 			var frame struct {
 				Data struct {
-					ClusterDataKindsWatch struct {
+					ClusterCachedDataKindsWatch struct {
 						Type string `json:"type"`
 						Kind struct {
 							Kind  string `json:"kind"`
 							Count int    `json:"count"`
 						} `json:"kind"`
-					} `json:"clusterDataKindsWatch"`
+					} `json:"clusterCachedDataKindsWatch"`
 				} `json:"data"`
 			}
 			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
 				t.Fatalf("decode frame %s: %v", ev.data, err)
 			}
-			seen[frame.Data.ClusterDataKindsWatch.Kind.Kind] = frame.Data.ClusterDataKindsWatch.Kind.Count
+			seen[frame.Data.ClusterCachedDataKindsWatch.Kind.Kind] = frame.Data.ClusterCachedDataKindsWatch.Kind.Count
 		case <-deadline:
 			t.Fatalf("timed out waiting for snapshot; saw %v", seen)
 		}

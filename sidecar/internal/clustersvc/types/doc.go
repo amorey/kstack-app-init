@@ -17,26 +17,30 @@
 // delta-watch change types, and the records mirrored into a per-cluster cache.
 // Every type the GraphQL schema binds lives here.
 //
-// It is a leaf, and must stay one: the ClusterService boundary and everything
-// beneath it depend on it, and it depends on neither. Anything that would make it
-// import a sibling belongs in that sibling instead.
+// It is a leaf, and must stay one: the boundary and everything beneath it depend on
+// it, and it depends on neither. Anything that would make it import a sibling belongs
+// in that sibling instead.
 //
 // The four beehive kinds and their ownership chain:
 //
-//	Cluster                   (name: "{source}/{naturalKey}", e.g. "kubeconfig/{context}")
+//	Cluster                      (name: "{source}/{naturalKey}", e.g. "kubeconfig/{context}")
 //	    ↓ owns
-//	ClusterCache              (name: "{ClusterID}/{serverUID}")
+//	ClusterCache                 (name: "{ClusterID}/{serverUID}")
 //	    ↓ owns
-//	ClusterCacheGVRDiscovery  (one per cache)
+//	ClusterCachedCatalog    (name: "cachedcatalog/{CacheID}" — one per cache)
 //	    ↓ owns
-//	ClusterCacheGVRSync       (one per served kind)
+//	ClusterCachedResource   (name: "cachedresource/{CatalogID}/{apiVersion}/{resource}")
 //
 // A name is a per-kind reconcile key, never an identity. There is one Cluster kind
 // and each source owns a disjoint name namespace inside it, so a source reconciles by
 // name under beehive's name-uniqueness; the on-disk cache is keyed by ObjectID
 // instead, so a name's arbitrary text never reaches the filesystem.
 //
+// A kind's GroupKind.Kind string is its Go type name, and both the Kind and the name
+// prefixes above are persisted. Renaming one is a store migration the moment anything
+// writes — free only while the backend is a shell.
+//
 // Cluster carries connection status (Connected, Healthy conditions + server/principal
 // facts); its ClusterCache child carries sync status, folded per kind from the
-// ClusterCacheGVRSync records below it.
+// ClusterCachedResource records below it.
 package types

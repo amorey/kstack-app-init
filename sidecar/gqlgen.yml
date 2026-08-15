@@ -141,40 +141,40 @@ models:
   # status is a propagation channel and nothing in the object graph reads them.
 
   # Likewise the GVR-discovery child: stored spec/status served as-is.
-  ClusterCacheGVRDiscovery:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheGVRDiscovery
+  ClusterCachedCatalog:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedCatalog
     fields:
       # Sampled from the controller on read, like ClusterCache.stats — it is not a field
       # of the stored object (the kind's status is empty by design).
       stats:
         resolver: true
-  ClusterCacheGVRSync:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheGVRSync
+  ClusterCachedResource:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedResource
     fields:
       # Same shape as the discovery's: a controller-held gauge, not stored state.
       stats:
         resolver: true
       events:
         resolver: true
-  ClusterCacheGVRSyncSpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheGVRSyncSpec
-  ClusterCacheGVRSyncStats:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheGVRSyncStats
-  ClusterCacheGVRSyncWatchFrame:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheGVRSyncWatchFrame
+  ClusterCachedResourceSpec:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedResourceSpec
+  ClusterCachedResourceStats:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedResourceStats
+  ClusterCachedResourceWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedResourceWatchFrame
   ClusterCacheSyncHealth:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheSyncHealth
   SyncedKindRef:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.SyncedKindRef
 
-  ClusterCacheGVRDiscoverySpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheGVRDiscoverySpec
+  ClusterCachedCatalogSpec:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedCatalogSpec
 
-  ClusterCacheGVRDiscoveryStats:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheGVRDiscoveryStats
+  ClusterCachedCatalogStats:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedCatalogStats
 
-  ClusterCacheGVRDiscoveryWatchFrame:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheGVRDiscoveryWatchFrame
+  ClusterCachedCatalogWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedCatalogWatchFrame
 
   ClusterCacheStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheStats
@@ -182,14 +182,14 @@ models:
   ClusterCacheResourceStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheResourceStats
 
-  ClusterDataKind:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterDataKind
+  ClusterCachedDataKind:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedDataKind
 
-  ClusterDataKindWatchFrame:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterDataKindWatchFrame
+  ClusterCachedDataKindWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedDataKindWatchFrame
 
-  ClusterDataEvent:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterDataEvent
+  ClusterCachedDataEvent:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedDataEvent
     # The record carries value time.Time (must stay comparable for the delta-watch diff),
     # so resolvers map the zero time to null instead of serializing 0001-01-01.
     fields:
@@ -198,12 +198,12 @@ models:
       lastSeen:
         resolver: true
 
-  ClusterDataEventWatchFrame:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterDataEventWatchFrame
+  ClusterCachedDataEventWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedDataEventWatchFrame
 
-  ClusterDataObject:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterDataObject
-    # The record carries value time.Time (parallel to ClusterDataEvent), so the resolver
+  ClusterCachedDataObject:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedDataObject
+    # The record carries value time.Time (parallel to ClusterCachedDataEvent), so the resolver
     # maps the zero creationTimestamp to null instead of serializing 0001-01-01. rawJSON
     # autobinds to the RawJSON field (no resolver): the watch already reads the body for
     # every row — the delta-diff needs it in the comparable struct — so gating its marshal
@@ -213,8 +213,8 @@ models:
       creationTimestamp:
         resolver: true
 
-  ClusterDataObjectWatchFrame:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterDataObjectWatchFrame
+  ClusterCachedDataObjectWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedDataObjectWatchFrame
 
   # --- Auth ---
   # Bind the GraphQL auth types straight to the auth domain types so the
@@ -239,7 +239,7 @@ models:
 
   # The JSON scalar binds to clustersvc.RawJSON — a comparable string carrying already-
   # serialized JSON, marshaled verbatim (see rawjson.go). It backs a cached object's
-  # full native body on ClusterDataObject.
+  # full native body on ClusterCachedDataObject.
   JSON:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.RawJSON
 

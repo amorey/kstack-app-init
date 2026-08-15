@@ -21,19 +21,19 @@
 // throw on a partial body (e.g. a Deleted row's last-known state).
 import type { ReactNode } from 'react';
 
-import type { ClusterDataObject } from '@/lib/cluster-data-objects';
+import type { ClusterCachedDataObject } from '@/lib/cluster-cached-data-objects';
 import { gvrKey } from '@/lib/gvr';
 import type { GVR } from '@/lib/gvr';
 
 export type ObjectColumn = {
   header: string;
-  cell: (o: ClusterDataObject) => ReactNode;
+  cell: (o: ClusterCachedDataObject) => ReactNode;
   // Applied to both the header and its cells.
   className?: string;
 };
 
 // Defaults to {} so a missing body flows through the optional chains to "—".
-function body<T>(o: ClusterDataObject): T {
+function body<T>(o: ClusterCachedDataObject): T {
   return (o.rawJSON ?? {}) as T;
 }
 

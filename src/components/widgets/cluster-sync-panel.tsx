@@ -26,7 +26,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 
 import { Dialog } from '@/components/widgets/dialog';
 import { graphql } from '@/gql';
-import type { ClusterCacheGvrDiscoveriesSubscription, ClusterCacheGvrSyncsSubscription } from '@/gql/graphql';
+import type { ClusterCachedCatalogsSubscription, ClusterCachedResourcesSubscription } from '@/gql/graphql';
 import {
   type Cluster,
   type ClusterCacheSyncHealth,
@@ -159,7 +159,7 @@ function useConnectionAttempts(clusterId: string): EventRun[] {
   return data?.runs ?? [];
 }
 
-// Sync-event history, keyed by a ClusterCacheGVRSync record's id (each kind's
+// Sync-event history, keyed by a ClusterCachedResource record's id (each kind's
 // worker logs to its own record), not the cache's. Subscribed only while sync
 // detail is open, one kind at a time.
 const ClusterSyncEventsSubscription = graphql(`
@@ -194,11 +194,11 @@ function useSyncEvents(syncId: string | undefined): Timeline {
 // that answer is). Fleet-wide stream, but subscribed HERE, not in ClustersProvider:
 // this pane is its only reader, and an app-wide mount would stream + rebuild joined
 // identities in every window for a row nobody expanded.
-const ClusterCacheGVRDiscoveriesSubscription = graphql(`
-  subscription ClusterCacheGVRDiscoveries {
-    clusterCacheGVRDiscoveriesWatch {
+const ClusterCachedCatalogsSubscription = graphql(`
+  subscription ClusterCachedCatalogs {
+    clusterCachedCatalogsWatch {
       type
-      discovery {
+      catalog {
         id
         cacheID
         stats {
@@ -217,25 +217,25 @@ const ClusterCacheGVRDiscoveriesSubscription = graphql(`
 `);
 
 // NonNullable: null only on a Bookmark, folded away in the reducer below.
-type GVRDiscovery = NonNullable<ClusterCacheGvrDiscoveriesSubscription['clusterCacheGVRDiscoveriesWatch']['discovery']>;
+type CachedCatalog = NonNullable<ClusterCachedCatalogsSubscription['clusterCachedCatalogsWatch']['catalog']>;
 
 // Every cache's discovery record, folded by cacheID.
-function useGVRDiscoveries(): Keyed<GVRDiscovery> {
+function useCachedCatalogs(): Keyed<CachedCatalog> {
   const [{ data }] = useWatchSubscription<
-    { clusterCacheGVRDiscoveriesWatch: { type: string; discovery: GVRDiscovery | null } },
-    Keyed<GVRDiscovery>
-  >({ query: ClusterCacheGVRDiscoveriesSubscription }, (prev, resp) => {
-    const { type, discovery } = resp.clusterCacheGVRDiscoveriesWatch;
+    { clusterCachedCatalogsWatch: { type: string; catalog: CachedCatalog | null } },
+    Keyed<CachedCatalog>
+  >({ query: ClusterCachedCatalogsSubscription }, (prev, resp) => {
+    const { type, catalog } = resp.clusterCachedCatalogsWatch;
     // The Bookmark carries no record. This pane reads the fold as a lookup table, so
     // it needs no snapshot-complete gate of its own. A change with no record is a
     // server-side field error — equally unfoldable.
-    if (type === 'Bookmark' || !discovery) return prev ?? new Map();
+    if (type === 'Bookmark' || !catalog) return prev ?? new Map();
     // A Deleted must match on the record's own id, not cacheID: a hard delete's
     // frame carries cacheID "0" (the owner edge is already collected), so keying it
     // by cacheID would drop every delete and the pane would show gone records.
-    if (type !== 'Deleted') return applyChange(prev, type, discovery.cacheID, discovery);
-    const gone = [...(prev ?? new Map())].find(([, d]) => d.id === discovery.id);
-    return gone ? applyChange(prev, 'Deleted', gone[0], discovery) : (prev ?? new Map());
+    if (type !== 'Deleted') return applyChange(prev, type, catalog.cacheID, catalog);
+    const gone = [...(prev ?? new Map())].find(([, c]) => c.id === catalog.id);
+    return gone ? applyChange(prev, 'Deleted', gone[0], catalog) : (prev ?? new Map());
   });
   return data ?? new Map();
 }
@@ -269,11 +269,11 @@ function useCacheContents(clusterId: string, cacheId: string, pause: boolean): C
 // cluster-wide stream would be a hundred-plus records per cache). Identity only,
 // no conditions: the verdict comes from the sidecar's rollup (see statusOf), and
 // this stream is only asked which record owns the timeline worth showing.
-const ClusterCacheGVRSyncsSubscription = graphql(`
-  subscription ClusterCacheGVRSyncs($cacheID: ObjectID!) {
-    clusterCacheGVRSyncsWatch(cacheID: $cacheID) {
+const ClusterCachedResourcesSubscription = graphql(`
+  subscription ClusterCachedResources($cacheID: ObjectID!) {
+    clusterCachedResourcesWatch(cacheID: $cacheID) {
       type
-      sync {
+      resource {
         id
         spec {
           apiVersion
@@ -285,20 +285,20 @@ const ClusterCacheGVRSyncsSubscription = graphql(`
 `);
 
 // NonNullable: null only on a Bookmark, folded away in the reducer below.
-type GVRSync = NonNullable<ClusterCacheGvrSyncsSubscription['clusterCacheGVRSyncsWatch']['sync']>;
+type CachedResource = NonNullable<ClusterCachedResourcesSubscription['clusterCachedResourcesWatch']['resource']>;
 
 // The cache's kind syncs, id-keyed through the registry's shared delta fold.
-function useGVRSyncs(cacheId: string): GVRSync[] {
+function useCachedResources(cacheId: string): CachedResource[] {
   const [{ data }] = useWatchSubscription<
-    { clusterCacheGVRSyncsWatch: { type: string; sync: GVRSync | null } },
-    Keyed<GVRSync>
-  >({ query: ClusterCacheGVRSyncsSubscription, variables: { cacheID: cacheId } }, (prev, resp) => {
-    const { type, sync } = resp.clusterCacheGVRSyncsWatch;
+    { clusterCachedResourcesWatch: { type: string; resource: CachedResource | null } },
+    Keyed<CachedResource>
+  >({ query: ClusterCachedResourcesSubscription, variables: { cacheID: cacheId } }, (prev, resp) => {
+    const { type, resource } = resp.clusterCachedResourcesWatch;
     // The Bookmark carries no record; the row renders per-kind detail, not an
     // empty state, so it needs no snapshot-complete gate. A change with no record is
     // a server-side field error — equally unfoldable.
-    if (type === 'Bookmark' || !sync) return prev ?? new Map();
-    return applyChange(prev, type, sync.id, sync);
+    if (type === 'Bookmark' || !resource) return prev ?? new Map();
+    return applyChange(prev, type, resource.id, resource);
   });
   return useMemo(() => (data ? [...data.values()] : []), [data]);
 }
@@ -709,7 +709,7 @@ function offenderList(health: ClusterCacheSyncHealth): string {
 // Which per-kind record's transition log to show. Deterministic and sticky (first
 // sorted offender) — picking "whichever unhealthy record arrived first" would
 // re-key the subscription per frame. Falls back to Events, always present.
-function timelineSyncFor(all: GVRSync[], health: ClusterCacheSyncHealth): GVRSync | null {
+function timelineSyncFor(all: CachedResource[], health: ClusterCacheSyncHealth): CachedResource | null {
   const firstOffender = health.unhealthyKindRefs[0];
   if (firstOffender) {
     // Match the whole kind, not the plural: a CRD may reuse a built-in's plural
@@ -729,7 +729,7 @@ function cacheSummary(objectCount: number, kindCount: number): string {
 // (no resourceVersion to watch), so its currency is a real question — hence the
 // live timestamp beside the count. null until a pass lands, so the caller omits
 // the row rather than claiming a count nobody observed.
-function discoveredKinds(discovery: GVRDiscovery | null): { prefix: string; ms: number } | null {
+function discoveredKinds(discovery: CachedCatalog | null): { prefix: string; ms: number } | null {
   const lastMs = parseTimeOrNull(discovery?.stats?.lastDiscoveryAt ?? null);
   if (!discovery?.stats || lastMs === null) return null;
   return { prefix: `${countLabel(discovery.stats.resourceCount, 'kind')} · `, ms: lastMs };
@@ -738,7 +738,7 @@ function discoveredKinds(discovery: GVRDiscovery | null): { prefix: string; ms: 
 // Warning about the kind list itself, distinct from whether kinds are syncing (a
 // note, not a status — see statusOf). Unconfirmed conditions are skipped: they
 // describe a state this process hasn't re-observed.
-function discoveryWarning(discovery: GVRDiscovery | null): string | null {
+function discoveryWarning(discovery: CachedCatalog | null): string | null {
   const cond = findCondition(discovery?.conditions ?? [], 'Discovered');
   if (!cond || cond.unconfirmed) return null;
   if (cond.reason === 'DiscoveryPartial') {
@@ -767,9 +767,9 @@ function SyncDetail({
   health: ClusterCacheSyncHealth;
   cacheId: string;
   contents: CacheContents | null;
-  discovery: GVRDiscovery | null;
+  discovery: CachedCatalog | null;
 }) {
-  const kindSyncs = useGVRSyncs(cacheId);
+  const kindSyncs = useCachedResources(cacheId);
   const timelineKind = timelineSyncFor(kindSyncs, health);
   const events = useSyncEvents(timelineKind?.id);
   // Newest write anywhere, beside the OLDEST proof — a cache is only as verified
@@ -880,7 +880,7 @@ function ClusterRow({
 }: {
   cluster: Cluster;
   group: Group;
-  discovery: GVRDiscovery | null;
+  discovery: CachedCatalog | null;
   onSetEnabled: (enabled: boolean) => void;
   onToggle: (enabled: boolean) => void;
   onClearCache: () => void;
@@ -1042,7 +1042,7 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
   // joins mid-stream with no replay — a second expanded row would see nothing until
   // the next 5-minute pass. Dialog-scoped (nothing subscribes while closed), open
   // for the dialog's life at a cost of one record per cache.
-  const discoveries = useGVRDiscoveries();
+  const discoveries = useCachedCatalogs();
   const rows = clusters ?? [];
   const groups = GROUPS.map((g) => ({ ...g, clusters: rows.filter(g.match) })).filter((g) => g.clusters.length > 0);
 

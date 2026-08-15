@@ -21,11 +21,11 @@ import (
 	"time"
 )
 
-// ClusterDataKind is one entry in a cluster's discovered kind catalog — a kind the API
+// ClusterCachedDataKind is one entry in a cluster's discovered kind catalog — a kind the API
 // server advertises, built-in or CRD. It powers the dashboard's dynamic resource nav,
 // which is why it carries the plural resource name (to dedupe against the curated
 // catalog) and the api group via APIVersion (to bucket the kind into a nav group).
-type ClusterDataKind struct {
+type ClusterCachedDataKind struct {
 	// APIVersion is the group/version, e.g. "apps/v1" or "v1" for the core group.
 	APIVersion string
 	// Kind is the Kind name, e.g. "Deployment".
@@ -41,22 +41,22 @@ type ClusterDataKind struct {
 	Count int
 }
 
-// ClusterDataKindWatchFrame is one frame on a cache's kind-catalog watch. Consumers
+// ClusterCachedDataKindWatchFrame is one frame on a cache's kind-catalog watch. Consumers
 // key on APIVersion + Resource; a kind whose Count changes arrives as Modified.
 // CacheID is provenance: a client watching the active cache uses it to reject a late
 // frame from a superseded one still draining after a switch.
-type ClusterDataKindWatchFrame struct {
+type ClusterCachedDataKindWatchFrame struct {
 	Type DeltaFrameType
 	// Kind is nil on a Bookmark.
-	Kind    *ClusterDataKind
+	Kind    *ClusterCachedDataKind
 	CacheID ClusterCacheID
 }
 
-// ClusterDataEvent is one cached Kubernetes Event from a cluster's synced data,
+// ClusterCachedDataEvent is one cached Kubernetes Event from a cluster's synced data,
 // powering the dashboard's events table. The involved-object identity is flattened
 // onto the record and any field of it may be empty (a name-only reference carries no
 // namespace); the raw event body is not exposed.
-type ClusterDataEvent struct {
+type ClusterCachedDataEvent struct {
 	// UID is the Event's own object UID — the stable identity a watch keys on.
 	UID string
 	// Type is the event severity — conventionally Normal or Warning, but an open string
@@ -80,24 +80,24 @@ type ClusterDataEvent struct {
 	InvolvedName      string
 }
 
-// ClusterDataEventWatchFrame is one frame on a cache's events watch. Consumers key on
+// ClusterCachedDataEventWatchFrame is one frame on a cache's events watch. Consumers key on
 // UID; a re-firing event arrives as Modified (its Count/LastSeen move), and one that
 // ages out of the newest-window snapshot arrives as Deleted carrying its last-known
-// row. CacheID is provenance, as on ClusterDataKindWatchFrame.
-type ClusterDataEventWatchFrame struct {
+// row. CacheID is provenance, as on ClusterCachedDataKindWatchFrame.
+type ClusterCachedDataEventWatchFrame struct {
 	Type DeltaFrameType
 	// Event is nil on a Bookmark.
-	Event   *ClusterDataEvent
+	Event   *ClusterCachedDataEvent
 	CacheID ClusterCacheID
 }
 
-// ClusterDataObject is one cached Kubernetes object read from the active cache. The
+// ClusterCachedDataObject is one cached Kubernetes object read from the active cache. The
 // typed identity fields are enough to key the watch, sort, and render Name/Namespace/
 // Age without parsing the body; RawJSON carries the full native body, from which the
 // frontend derives kind-specific columns. Keeping RawJSON in the struct is what makes
 // an in-place edit differ across two reads and surface as Modified — and its string
 // underlying type is what keeps the struct comparable for that diff.
-type ClusterDataObject struct {
+type ClusterCachedDataObject struct {
 	// UID is the object's UID — the stable identity a watch keys on.
 	UID string
 	// APIVersion is the group/version, e.g. "apps/v1".
@@ -117,14 +117,14 @@ type ClusterDataObject struct {
 	RawJSON RawJSON
 }
 
-// ClusterDataObjectWatchFrame is one frame on a cache's per-kind objects watch.
+// ClusterCachedDataObjectWatchFrame is one frame on a cache's per-kind objects watch.
 // Consumers key on UID. Provenance is CacheID *plus* (APIVersion, Resource): this
 // watch is keyed by kind as well as cache, so a client switching resources within one
 // cache needs the kind to reject a straggler from the previous subscription.
-type ClusterDataObjectWatchFrame struct {
+type ClusterCachedDataObjectWatchFrame struct {
 	Type DeltaFrameType
 	// Object is nil on a Bookmark.
-	Object     *ClusterDataObject
+	Object     *ClusterCachedDataObject
 	CacheID    ClusterCacheID
 	APIVersion string
 	Resource   string

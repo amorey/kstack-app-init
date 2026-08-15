@@ -62,10 +62,10 @@ readiness; reasons Ready/ReadyzFailed/Unreachable/NoConnection/Inactive).
 Sync-controller conditions: `Synced`, reported at two levels. On
 `ClusterCache.conditions` it is coarse (reasons Syncing/Paused) — the cache states
 only whether it decided to sync. The verdict a UI wants is the one on the cache's
-sync children — the per-kind `ClusterCacheGVRSync` records (reasons
+sync children — the per-kind `ClusterCachedResource` records (reasons
 Syncing/Watching/Paused/NoConnection/SyncFailed/Stale), or their whole-cache rollup
 `clusterCacheSyncHealthWatch`, which speaks the same vocabulary.
-`ClusterCacheGVRDiscovery` reports its own axis on its own type: `Discovered` (reasons
+`ClusterCachedCatalog` reports its own axis on its own type: `Discovered` (reasons
 Discovered/DiscoveryPartial/DiscoveryFailed/Paused/NoConnection). New types/reasons may appear; consumers should
 treat unknown spellings as a degraded/unknown display state.
 """
@@ -380,7 +380,7 @@ type ClusterWatchFrame {
 
 # --- ClusterCache ---
 # A cluster's on-disk mirror and the sync machinery under it: the cache record, its
-# GVR-discovery anchor, the per-kind sync children, and the whole-cache verdict
+# resource catalog, the per-kind sync children, and the whole-cache verdict
 # folded from them. The data these caches hold is the cluster-data section.
 
 """
@@ -402,7 +402,7 @@ type ClusterCache {
   clusterID: ObjectID!
   "The kube-system namespace UID of the physical cluster this cache mirrors — the identity a physical migration turns over. Matches the parent cluster's `status.server.uid` while this is the active cache."
   serverUid: String!
-  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's sync children (`clusterCacheGVRSyncsWatch`, `clusterCacheGVRDiscoveriesWatch`) or their rollup (`clusterCacheSyncHealthWatch`), which is also why this record carries no status block of its own."
+  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's sync children (`clusterCachedResourcesWatch`, `clusterCachedCatalogsWatch`) or their rollup (`clusterCacheSyncHealthWatch`), which is also why this record carries no status block of its own."
   conditions: [Condition!]!
   "Live on-disk cache statistics, queried on demand."
   stats: ClusterCacheStats!
@@ -411,30 +411,30 @@ type ClusterCache {
   The kinds this cache's API server advertises (from `/apis` discovery), read
   from this cache's catalog — the read behind the dashboard's dynamic resource
   nav. Empty for a cache that has not synced yet. Resolved on selection; the live
-  counterpart is `clusterDataKindsWatch`.
+  counterpart is `clusterCachedDataKindsWatch`.
   """
-  kinds: [ClusterDataKind!]!
+  kinds: [ClusterCachedDataKind!]!
 
   """
   This cache's per-kind sync records, one per kind it mirrors — so hundreds on a
   real cluster — in creation order. Empty until the cache's discovery pass has run.
 
-  The `ClusterCacheGVRDiscovery` that owns these records is deliberately not a step
+  The `ClusterCachedCatalog` that owns these records is deliberately not a step
   in the path: there is exactly one per cache and its identity is derived from the
   cache's, so it is an implementation detail rather than a branch to navigate. The
   anchor's own state (when the kind list was last confirmed, whether the pass is
-  degraded) streams on `clusterCacheGVRDiscoveriesWatch`.
+  degraded) streams on `clusterCachedCatalogsWatch`.
 
-  Resolved on selection; the live counterpart is `clusterCacheGVRSyncsWatch(cacheID)`,
+  Resolved on selection; the live counterpart is `clusterCachedResourcesWatch(cacheID)`,
   which is what a consumer following per-kind health should read.
   """
-  syncs: [ClusterCacheGVRSync!]!
+  cachedResources: [ClusterCachedResource!]!
 
   """
   This cache's control-plane event timeline (newest run first), optionally
   filtered to one `category` (e.g. `"sync"`, the cache-sync history) and bounded
   by `limit`. Carries only what the cache itself records — the per-kind sync
-  history lives on `ClusterCacheGVRSync.events`. Resolved on selection and
+  history lives on `ClusterCachedResource.events`. Resolved on selection and
   decoupled from the cache/list watch.
   """
   events(category: String, limit: Int): [Event!]!
@@ -461,11 +461,11 @@ type ClusterCacheWatchFrame {
 }
 
 """
-A ClusterCache's GVR-discovery child: the record anchoring the pass that asks the
+A ClusterCache's resource catalog: the record anchoring the pass that asks the
 cluster which kinds it serves and maintains one per-GVR sync record for each. It is the
 granular answer to "does this cache know what to sync?" — distinct from the per-kind
 records below it, which answer "is each kind's mirror current?". Streamed independently via
-`clusterCacheGVRDiscoveriesWatch` and joined to its cache client-side by `cacheID`.
+`clusterCachedCatalogsWatch` and joined to its cache client-side by `cacheID`.
 
 Discovery has no watch API — the served-kinds document carries no resourceVersion — so
 this record is refreshed by a poll (every few minutes) and `status.lastDiscoveryAt` is
@@ -474,12 +474,12 @@ how a consumer judges its currency.
 The record lives as long as its cache: pausing writes `spec.enabled = false` rather than
 deleting it, so the last-known kind list survives a pause.
 """
-type ClusterCacheGVRDiscovery {
+type ClusterCachedCatalog {
   "Unique identifier for this record."
   id: ObjectID!
   "The id of the ClusterCache this belongs to. The client joins the discovery onto its cache by this id."
   cacheID: ObjectID!
-  spec: ClusterCacheGVRDiscoverySpec!
+  spec: ClusterCachedCatalogSpec!
   """
   What the last discovery pass measured, read live from the sidecar when you ask for it
   — a metrics-server-style gauge, not stored state. Null until a pass has run in the
@@ -491,7 +491,7 @@ type ClusterCacheGVRDiscovery {
   dependents, and nothing in the object graph reacts to these numbers. Being a resolved
   field, it also costs nothing on a frame that doesn't select it.
   """
-  stats: ClusterCacheGVRDiscoveryStats
+  stats: ClusterCachedCatalogStats
   """
   This record's `Discovered` condition — the per-component verdict (reasons
   Discovered/DiscoveryPartial/DiscoveryFailed/Paused/NoConnection). `DiscoveryPartial`
@@ -501,14 +501,14 @@ type ClusterCacheGVRDiscovery {
   conditions: [Condition!]!
 }
 
-"A GVR discovery's desired state: the pause switch its cache pushes down."
-type ClusterCacheGVRDiscoverySpec {
+"A resource catalog's desired state: the pause switch its cache pushes down."
+type ClusterCachedCatalogSpec {
   "Whether discovery should be running. False means its per-GVR children are switched off — the records stay, holding the last-known kind list."
   enabled: Boolean!
 }
 
-"What a GVR-discovery pass measured, sampled on read."
-type ClusterCacheGVRDiscoveryStats {
+"What a discovery pass measured, sampled on read."
+type ClusterCachedCatalogStats {
   "When the last pass reached the API server (including one that got a partial answer). The currency of the kind list."
   lastDiscoveryAt: Time!
   """
@@ -519,31 +519,31 @@ type ClusterCacheGVRDiscoveryStats {
   resourceCount: Int!
 }
 
-"One frame on the `clusterCacheGVRDiscoveriesWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
-type ClusterCacheGVRDiscoveryWatchFrame {
+"One frame on the `clusterCachedCatalogsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
+type ClusterCachedCatalogWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: DeltaFrameType!
   "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
-  discovery: ClusterCacheGVRDiscovery
+  catalog: ClusterCachedCatalog
 }
 
 """
 One Kubernetes kind being mirrored into a cache — one record per kind the discovery
-pass found, so a cache has a hundred or more. Streamed by `clusterCacheGVRSyncsWatch`,
+pass found, so a cache has a hundred or more. Streamed by `clusterCachedResourcesWatch`,
 which is **cache-scoped** for exactly that reason, and joined onto its cache through
-`discoveryID` (the discovery anchor the client already streams).
+`catalogID` (the resource catalog the client already streams).
 
 This is where per-kind sync health lives. The cache's own `Synced` condition is
 coarse and its discovery's `Discovered` says only whether the kind LIST is current;
 neither can tell you that one CRD's watch is forbidden while the other ninety-nine
 kinds are caught up.
 """
-type ClusterCacheGVRSync {
+type ClusterCachedResource {
   "Unique identifier for this record."
   id: ObjectID!
-  "The id of the ClusterCacheGVRDiscovery that owns this kind — the client's join key."
-  discoveryID: ObjectID!
-  spec: ClusterCacheGVRSyncSpec!
+  "The id of the ClusterCachedCatalog that owns this kind — the client's join key."
+  catalogID: ObjectID!
+  spec: ClusterCachedResourceSpec!
   """
   This kind's sync freshness, read live from the sidecar when you ask for it — a
   metrics-server-style gauge, not stored state. Null until this kind's worker has
@@ -553,7 +553,7 @@ type ClusterCacheGVRSync {
   a hundred of these per cache a stored stamp would wake the parent cache a hundred
   times every heartbeat.
   """
-  stats: ClusterCacheGVRSyncStats
+  stats: ClusterCachedResourceStats
   """
   This record's `Synced` condition — this kind's own verdict (reasons
   Watching/Syncing/Stale/SyncFailed/Paused/NoConnection), independent of every other
@@ -572,7 +572,7 @@ type ClusterCacheGVRSync {
 }
 
 "Which kind a per-kind sync mirrors, and whether it should be running."
-type ClusterCacheGVRSyncSpec {
+type ClusterCachedResourceSpec {
   "Whether this kind should be syncing. False means paused — the cached rows stay, so an unpause resumes rather than re-listing."
   enabled: Boolean!
   "Group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
@@ -586,19 +586,19 @@ type ClusterCacheGVRSyncSpec {
 }
 
 "One synced kind's freshness, sampled on read."
-type ClusterCacheGVRSyncStats {
+type ClusterCachedResourceStats {
   "When an object of this kind was last written to the cache. Null if none ever has — which on a quiet kind is normal, not a fault."
   lastUpdateAt: Time
   "When this kind's watch last proved itself live (a delta or a bookmark). Null before the first proof. This, not `lastUpdateAt`, is what staleness is judged on."
   lastLiveAt: Time
 }
 
-"One frame on the `clusterCacheGVRSyncsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
-type ClusterCacheGVRSyncWatchFrame {
+"One frame on the `clusterCachedResourcesWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
+type ClusterCachedResourceWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: DeltaFrameType!
   "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
-  sync: ClusterCacheGVRSync
+  resource: ClusterCachedResource
 }
 
 """
@@ -666,7 +666,7 @@ CRDs). The dashboard builds its dynamic resource nav from these: `resource` dedu
 against the curated catalog and `apiVersion`'s group buckets the kind into a nav
 group.
 """
-type ClusterDataKind {
+type ClusterCachedDataKind {
   "Group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
   apiVersion: String!
   "Kind name, e.g. \"Deployment\"."
@@ -688,7 +688,7 @@ Event, read from the active cache). Powers the dashboard's events table. Distinc
 is data synced *from* the cluster. The involved-object identity is flattened onto the
 record; the raw event body is not exposed.
 """
-type ClusterDataEvent {
+type ClusterCachedDataEvent {
   "The Event's own object UID — the stable identity the watch keys on."
   uid: String!
   """
@@ -720,11 +720,11 @@ One cached Kubernetes object projected for a table row (any kind), read from the
 active cache. Only the universal identity is typed for now (`uid`/`apiVersion`/`kind`/
 `namespace`/`name`/`creationTimestamp`) — enough to key the watch, sort, and render a
 Name/Namespace/Age table. The nested object body (and kind-specific columns computed
-from it) is deferred to a follow-up: see the "ClusterDataObject — native nested body"
-item in `TODO.md`. Distinct from `ClusterDataEvent`, which is one specific kind with its
+from it) is deferred to a follow-up: see the "ClusterCachedDataObject — native nested body"
+item in `TODO.md`. Distinct from `ClusterCachedDataEvent`, which is one specific kind with its
 own fully-typed shape.
 """
-type ClusterDataObject {
+type ClusterCachedDataObject {
   "The object's UID — the stable identity the watch keys on."
   uid: String!
   "The object's group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
@@ -741,12 +741,12 @@ type ClusterDataObject {
   rawJSON: JSON
 }
 
-"One frame on the `clusterDataKindsWatch` stream: a change and the kind it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
-type ClusterDataKindWatchFrame {
+"One frame on the `clusterCachedDataKindsWatch` stream: a change and the kind it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
+type ClusterCachedDataKindWatchFrame {
   "Whether this kind was added (incl. the on-subscribe snapshot), modified (chiefly a `count` change), or deleted."
   type: DeltaFrameType!
   "The affected kind. On `Deleted`, its last-known row; the client keys on `apiVersion` + `resource`. Null on `Bookmark`."
-  kind: ClusterDataKind
+  kind: ClusterCachedDataKind
   """
   The cache this frame came from — the frame's provenance. A client watching the
   active cache rejects a late frame from a superseded cache (one still draining
@@ -755,29 +755,29 @@ type ClusterDataKindWatchFrame {
   cacheID: ObjectID!
 }
 
-"One frame on the `clusterDataEventsWatch` stream: a change and the event it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
-type ClusterDataEventWatchFrame {
+"One frame on the `clusterCachedDataEventsWatch` stream: a change and the event it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
+type ClusterCachedDataEventWatchFrame {
   "Whether this event was added (incl. the on-subscribe snapshot), modified (chiefly a `count`/`lastSeen` change as it re-fires), or deleted."
   type: DeltaFrameType!
   "The affected event. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
-  event: ClusterDataEvent
+  event: ClusterCachedDataEvent
   """
   The cache this frame came from — the frame's provenance, mirroring
-  `ClusterDataKindWatchFrame.cacheID`. A client watching the active cache rejects a late
+  `ClusterCachedDataKindWatchFrame.cacheID`. A client watching the active cache rejects a late
   frame from a superseded cache by comparing this against the cache it subscribed for.
   """
   cacheID: ObjectID!
 }
 
-"One frame on the `clusterDataObjectsWatch` stream: a change and the object it affected, or the `Bookmark` closing the snapshot. Either way it carries its (cache, kind) provenance."
-type ClusterDataObjectWatchFrame {
+"One frame on the `clusterCachedDataObjectsWatch` stream: a change and the object it affected, or the `Bookmark` closing the snapshot. Either way it carries its (cache, kind) provenance."
+type ClusterCachedDataObjectWatchFrame {
   "Whether this object was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: DeltaFrameType!
   "The affected object. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
-  object: ClusterDataObject
+  object: ClusterCachedDataObject
   """
   The cache this frame came from — the frame's provenance, mirroring
-  `ClusterDataKindWatchFrame.cacheID`. A client watching the active cache rejects a late
+  `ClusterCachedDataKindWatchFrame.cacheID`. A client watching the active cache rejects a late
   frame from a superseded cache by comparing this against the cache it subscribed for.
   """
   cacheID: ObjectID!
@@ -845,10 +845,10 @@ type Query {
   clusterCaches(clusterID: ObjectID): [ClusterCache!]!
 
   "A single synced-kind record by its own id, not its cache's; null if unknown."
-  clusterCacheGVRSync(id: ObjectID!): ClusterCacheGVRSync
+  clusterCachedResource(id: ObjectID!): ClusterCachedResource
 
   "Every per-kind sync record — hundreds unscoped — or one cache's when `cacheID` is given; the set `ClusterCache.syncs` serves."
-  clusterCacheGVRSyncs(cacheID: ObjectID): [ClusterCacheGVRSync!]!
+  clusterCachedResources(cacheID: ObjectID): [ClusterCachedResource!]!
 
   # --- Cloud account ---
   "Current authentication state. Signed-out when no cloud account is configured; live updates via authStateWatch."
@@ -889,7 +889,7 @@ type Subscription {
   # Every subscription here is endless; chatStream alone completes.
 
   # --- Any object ---
-  "Any record's event timeline — `Cluster`, `ClusterCache`, `ClusterCacheGVRSync` — as an event log: runs upserted by `Event.id`, the snapshot closed by one `Bookmark` (`EventFrameType`). Optionally one `category`. The point read is that record's own `events` field."
+  "Any record's event timeline — `Cluster`, `ClusterCache`, `ClusterCachedResource` — as an event log: runs upserted by `Event.id`, the snapshot closed by one `Bookmark` (`EventFrameType`). Optionally one `category`. The point read is that record's own `events` field."
   eventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   # --- Cluster ---
@@ -906,35 +906,35 @@ type Subscription {
   "Every cache's folded sync verdict as a gauge, keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's, so the client drops one when its cache leaves `clusterCachesWatch`."
   clusterCacheSyncHealthWatch: ClusterCacheSyncHealth!
 
-  "The caches' GVR-discovery records as a delta watch, joined onto caches by `cacheID`. Unscoped: one record per cache."
-  clusterCacheGVRDiscoveriesWatch: ClusterCacheGVRDiscoveryWatchFrame!
+  "The caches' resource catalogs as a delta watch, joined onto caches by `cacheID`. Unscoped: one record per cache."
+  clusterCachedCatalogsWatch: ClusterCachedCatalogWatchFrame!
 
   "One cache's per-kind sync records as a delta watch, keyed by `sync.id`. Cache-scoped, since there is one record per synced kind."
-  clusterCacheGVRSyncsWatch(cacheID: ObjectID!): ClusterCacheGVRSyncWatchFrame!
+  clusterCachedResourcesWatch(cacheID: ObjectID!): ClusterCachedResourceWatchFrame!
 
   "One cache's on-disk contents as a gauge. A subscription, not a `ClusterCache` field, which would freeze at subscribe time."
   clusterCacheStatsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheStats!
 
   # --- Cluster data ---
   "One cache's discovered kind catalog as a delta watch, keyed by `apiVersion` + `resource`. Counts are live, so an object write re-emits its kind. The live counterpart of `ClusterCache.kinds`."
-  clusterDataKindsWatch(
+  clusterCachedDataKindsWatch(
     id: ObjectID!
     cacheID: ObjectID!
-  ): ClusterDataKindWatchFrame!
+  ): ClusterCachedDataKindWatchFrame!
 
   "One cache's newest window of cached Kubernetes Events as a delta watch, keyed by `uid`; an event aging out of the window surfaces as `Deleted`. Distinct from `eventsWatch`, which streams kstack's own timeline."
-  clusterDataEventsWatch(
+  clusterCachedDataEventsWatch(
     id: ObjectID!
     cacheID: ObjectID!
-  ): ClusterDataEventWatchFrame!
+  ): ClusterCachedDataEventWatchFrame!
 
   "One kind's cached objects from a cache as a delta watch, keyed by `uid`. Scoped by `apiVersion` + `resource`, e.g. `\"apps/v1\"` + `\"deployments\"`."
-  clusterDataObjectsWatch(
+  clusterCachedDataObjectsWatch(
     id: ObjectID!
     cacheID: ObjectID!
     apiVersion: String!
     resource: String!
-  ): ClusterDataObjectWatchFrame!
+  ): ClusterCachedDataObjectWatchFrame!
 
   # --- Chat ---
   "Streams the assistant's reply token-by-token. Completes after a frame with `done: true`."

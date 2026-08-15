@@ -58,7 +58,7 @@ type App struct {
 	handler       http.Handler
 	graphqlServer *graph.Server
 	grpcServer    *grpcserver.Server
-	clusterSvc    *clustersvc.Service
+	clusterSvc    clustersvc.Service
 	authSvc       auth.Service
 	cloudSvc      *cloud.Service
 	pokeSvc       *poke.Service

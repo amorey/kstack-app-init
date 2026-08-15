@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generic per-kind object table, fed by `useClusterDataObjects`. Universal columns
+// Generic per-kind object table, fed by `useClusterCachedDataObjects`. Universal columns
 // (Namespace?/Name/Age) plus kubectl-style extras from the `object-columns`
 // registry. The states render distinctly — not-synced note, connecting spinner,
 // empty snapshot, live table — mirroring `EventsTable`.
@@ -23,7 +23,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { cn } from '@kubetail/ui/lib/utils';
 
 import { columnsForKind } from '@/components/widgets/object-columns';
-import { useClusterDataObjects } from '@/lib/cluster-data-objects';
+import { useClusterCachedDataObjects } from '@/lib/cluster-cached-data-objects';
 
 type ObjectsTableProps = {
   apiVersion: string;
@@ -34,7 +34,7 @@ type ObjectsTableProps = {
 
 export function ObjectsTable({ apiVersion, resource, kind, namespaced }: ObjectsTableProps) {
   const gvr = { apiVersion, resource };
-  const { objects, active, phase } = useClusterDataObjects(gvr);
+  const { objects, active, phase } = useClusterCachedDataObjects(gvr);
   // Kind-specific columns between Name and Age; [] when none registered.
   const extraColumns = columnsForKind(gvr);
 

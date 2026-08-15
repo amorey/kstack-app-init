@@ -97,12 +97,12 @@ let lastArgs: { variables?: { cacheID?: string }; pause?: boolean } | undefined;
 let lastReducer: ((prev: unknown, res: unknown) => unknown) | undefined;
 
 function pushFrame(type: string, kind: unknown, cacheID = lastArgs?.variables?.cacheID) {
-  acc = lastReducer!(acc, { clusterDataKindsWatch: { type, cacheID, kind } });
+  acc = lastReducer!(acc, { clusterCachedDataKindsWatch: { type, cacheID, kind } });
 }
 
 // The Bookmark closing the snapshot: what flips the watch from connecting to live.
 function pushBookmark(cacheID = lastArgs?.variables?.cacheID) {
-  acc = lastReducer!(acc, { clusterDataKindsWatch: { type: 'Bookmark', cacheID, kind: null } });
+  acc = lastReducer!(acc, { clusterCachedDataKindsWatch: { type: 'Bookmark', cacheID, kind: null } });
 }
 
 // A transport reconnect: the exchange bumps the op's generation on the new

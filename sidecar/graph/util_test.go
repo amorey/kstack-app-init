@@ -71,13 +71,13 @@ func TestMapStreamStopsOnContextCancelDuringSend(t *testing.T) {
 // to null on the wire rather than serializing 0001-01-01, while a real timestamp passes
 // through as a pointer. The record keeps value time.Time (comparable for the delta-watch
 // diff), so this resolver mapping is where absence becomes null.
-func TestClusterDataEventTimestampResolversMapZeroToNil(t *testing.T) {
+func TestClusterCachedDataEventTimestampResolversMapZeroToNil(t *testing.T) {
 	ctx := context.Background()
-	r := &clusterDataEventResolver{&Resolver{}}
+	r := &clusterCachedDataEventResolver{&Resolver{}}
 	ts := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
 
 	// A real timestamp resolves to a non-nil pointer to that time.
-	present := &types.ClusterDataEvent{FirstSeen: ts, LastSeen: ts}
+	present := &types.ClusterCachedDataEvent{FirstSeen: ts, LastSeen: ts}
 	first, err := r.FirstSeen(ctx, present)
 	if err != nil || first == nil || !first.Equal(ts) {
 		t.Fatalf("FirstSeen(present) = %v, %v; want %v", first, err, ts)
@@ -88,7 +88,7 @@ func TestClusterDataEventTimestampResolversMapZeroToNil(t *testing.T) {
 	}
 
 	// The zero time (no source timestamp) resolves to nil → null on the wire.
-	absent := &types.ClusterDataEvent{}
+	absent := &types.ClusterCachedDataEvent{}
 	if got, err := r.FirstSeen(ctx, absent); err != nil || got != nil {
 		t.Fatalf("FirstSeen(absent) = %v, %v; want nil", got, err)
 	}

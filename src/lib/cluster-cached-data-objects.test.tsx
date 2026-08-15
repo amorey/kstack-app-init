@@ -15,7 +15,7 @@
 import { renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Same seams as cluster-data-events.test.tsx: mock urql's useSubscription (a delta
+// Same seams as cluster-cached-data-events.test.tsx: mock urql's useSubscription (a delta
 // accumulator), the transport-status registry (so `pushReset` bumps the generation), the
 // clusters provider (keeping the real applyChange reducer), and the active-context hook.
 const { useSubscriptionMock } = vi.hoisted(() => ({ useSubscriptionMock: vi.fn() }));
@@ -43,7 +43,7 @@ vi.mock('@/lib/clusters', () => ({
 }));
 vi.mock('@/lib/active-kube-context', () => ({ useActiveKubeContext: useActiveKubeContextMock }));
 
-const { useClusterDataObjects } = await import('./cluster-data-objects');
+const { useClusterCachedDataObjects } = await import('./cluster-cached-data-objects');
 
 const PODS = { apiVersion: 'v1', resource: 'pods' };
 
@@ -82,7 +82,7 @@ function pushFrame(
   apiVersion = lastArgs?.variables?.apiVersion,
   resource = lastArgs?.variables?.resource,
 ) {
-  acc = lastReducer!(acc, { clusterDataObjectsWatch: { type, cacheID, apiVersion, resource, object } });
+  acc = lastReducer!(acc, { clusterCachedDataObjectsWatch: { type, cacheID, apiVersion, resource, object } });
 }
 
 // The Bookmark closing the snapshot: what flips the watch from connecting to live.
@@ -92,7 +92,7 @@ function pushBookmark(
   resource = lastArgs?.variables?.resource,
 ) {
   acc = lastReducer!(acc, {
-    clusterDataObjectsWatch: { type: 'Bookmark', cacheID, apiVersion, resource, object: null },
+    clusterCachedDataObjectsWatch: { type: 'Bookmark', cacheID, apiVersion, resource, object: null },
   });
 }
 
@@ -114,10 +114,10 @@ beforeEach(() => {
   });
 });
 
-describe('useClusterDataObjects', () => {
+describe('useClusterCachedDataObjects', () => {
   it('accumulates the snapshot burst and returns objects sorted by (namespace, name)', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
-    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    const { result, rerender } = renderHook(() => useClusterCachedDataObjects(PODS));
     expect(result.current.objects).toEqual([]);
 
     pushFrame('Added', obj('b', { namespace: 'kube-system', name: 'b' }));
@@ -130,7 +130,7 @@ describe('useClusterDataObjects', () => {
 
   it('updates an object in place on a Modified frame', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
-    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    const { result, rerender } = renderHook(() => useClusterCachedDataObjects(PODS));
     pushFrame('Added', obj('a', { name: 'pod-a' }));
     rerender();
     expect(result.current.objects[0].name).toBe('pod-a');
@@ -143,7 +143,7 @@ describe('useClusterDataObjects', () => {
 
   it('adds an object on Added and removes it on Deleted', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
-    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    const { result, rerender } = renderHook(() => useClusterCachedDataObjects(PODS));
     pushFrame('Added', obj('a', { name: 'a' }));
     pushFrame('Added', obj('b', { name: 'b' }));
     rerender();
@@ -156,7 +156,7 @@ describe('useClusterDataObjects', () => {
 
   it('drops the old cache’s objects on a cache swap until the new cache streams', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(true, 'c1', 'uid-1')] });
-    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    const { result, rerender } = renderHook(() => useClusterCachedDataObjects(PODS));
     expect(lastArgs?.variables?.cacheID).toBe('c1');
     pushFrame('Added', obj('a'));
     rerender();
@@ -174,7 +174,7 @@ describe('useClusterDataObjects', () => {
 
   it('preserves the active cache’s objects when a late old-cache straggler arrives', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(true, 'c1', 'uid-1')] });
-    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    const { result, rerender } = renderHook(() => useClusterCachedDataObjects(PODS));
     pushFrame('Added', obj('a'));
     rerender();
 
@@ -197,7 +197,7 @@ describe('useClusterDataObjects', () => {
     const deployments = { apiVersion: 'apps/v1', resource: 'deployments' };
     const daemonsets = { apiVersion: 'apps/v1', resource: 'daemonsets' };
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(true, 'c1', 'uid-1')] });
-    const { result, rerender } = renderHook((k: typeof deployments) => useClusterDataObjects(k), {
+    const { result, rerender } = renderHook((k: typeof deployments) => useClusterCachedDataObjects(k), {
       initialProps: deployments,
     });
     expect(lastArgs?.variables?.resource).toBe('deployments');
@@ -224,7 +224,7 @@ describe('useClusterDataObjects', () => {
 
   it('resets on a transport reconnect so an object deleted during the outage is gone after replay', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
-    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    const { result, rerender } = renderHook(() => useClusterCachedDataObjects(PODS));
     pushFrame('Added', obj('a', { name: 'a' }));
     pushFrame('Added', obj('b', { name: 'b' }));
     rerender();
@@ -238,7 +238,7 @@ describe('useClusterDataObjects', () => {
 
   it('pauses the watch and reports active=false when there is no active cache', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(false)] });
-    const { result } = renderHook(() => useClusterDataObjects(PODS));
+    const { result } = renderHook(() => useClusterCachedDataObjects(PODS));
     expect(result.current.active).toBe(false);
     expect(result.current.objects).toEqual([]);
     expect(lastArgs?.pause).toBe(true);
@@ -247,7 +247,7 @@ describe('useClusterDataObjects', () => {
   it('reports connecting → live across the first frame, and reconnecting on a drop', () => {
     useClustersMock.mockReturnValue({ clusters: [clusterFixture(true)] });
     statusState.snapshot = { connected: false, generation: 0 };
-    const { result, rerender } = renderHook(() => useClusterDataObjects(PODS));
+    const { result, rerender } = renderHook(() => useClusterCachedDataObjects(PODS));
     expect(result.current.active).toBe(true);
     expect(result.current.phase).toBe('connecting');
 

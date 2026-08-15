@@ -51,11 +51,11 @@ type ClusterID = ObjectID
 // so the cache id is not derivable from the cluster id.
 type ClusterCacheID = ObjectID
 
-// ClusterCacheGVRDiscoveryID identifies one cache's GVR-discovery child.
-type ClusterCacheGVRDiscoveryID = ObjectID
+// ClusterCachedCatalogID identifies one cache's GVR-discovery child.
+type ClusterCachedCatalogID = ObjectID
 
-// ClusterCacheGVRSyncID identifies one synced kind's ClusterCacheGVRSync object.
-type ClusterCacheGVRSyncID = ObjectID
+// ClusterCachedResourceID identifies one synced kind's ClusterCachedResource object.
+type ClusterCachedResourceID = ObjectID
 
 // parseObjectID parses an ObjectID from its decimal-string wire form; a
 // malformed value is a client error surfaced through UnmarshalGQL.
@@ -123,7 +123,7 @@ const (
 	ConditionHealthy ConditionType = "Healthy"
 	// ConditionSynced reports the state of a sync. It is reported at two levels: coarse
 	// on the ClusterCache (did this cache decide to sync?) and per kind on each
-	// ClusterCacheGVRSync, which is the verdict a UI wants.
+	// ClusterCachedResource, which is the verdict a UI wants.
 	ConditionSynced ConditionType = "Synced"
 	// ConditionDiscovered reports whether the cache's GVR discovery pass reached the
 	// API server and enumerated the kinds it serves. A separate axis from Synced: a

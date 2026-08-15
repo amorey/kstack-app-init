@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The ClusterCache kind and the two child kinds beneath it (ClusterCacheGVRDiscovery,
-// ClusterCacheGVRSync): each kind's beehive shapes, the record served to
+// The ClusterCache kind and the two child kinds beneath it (ClusterCachedCatalog,
+// ClusterCachedResource): each kind's beehive shapes, the record served to
 // resolvers, and its delta-watch change, plus the whole-cache sync verdict folded from
 // the per-kind children. Mirrors the ClusterCache section of graph/schema.graphqls.
 package types
@@ -91,38 +91,38 @@ type ClusterCacheStats struct {
 	KindCount   int
 }
 
-// --- ClusterCacheGVRDiscovery kind types ---
+// --- ClusterCachedCatalog kind types ---
 
-// ClusterCacheGVRDiscoveryGroupKind identifies the discovery anchor kind: one
+// ClusterCachedCatalogGroupKind identifies the discovery anchor kind: one
 // object per ClusterCache, owned by it; its controller maintains one
-// ClusterCacheGVRSync child per served GVR.
-var ClusterCacheGVRDiscoveryGroupKind = beehive.GroupKind{Kind: "ClusterCacheGVRDiscovery"}
+// ClusterCachedResource child per served GVR.
+var ClusterCachedCatalogGroupKind = beehive.GroupKind{Kind: "ClusterCachedCatalog"}
 
-// ClusterCacheGVRDiscoveryName returns "gvrdiscovery/{cacheObjID}" — exactly one
+// ClusterCachedCatalogName returns "cachedcatalog/{cacheObjID}" — exactly one
 // per cache, so creation is idempotent under name-uniqueness dedup. A
 // creation/dedup key only; the child is enumerated through the owner edge.
-func ClusterCacheGVRDiscoveryName(cacheID beehive.ObjectID) string {
-	return "gvrdiscovery/" + strconv.FormatInt(int64(cacheID), 10)
+func ClusterCachedCatalogName(cacheID beehive.ObjectID) string {
+	return "cachedcatalog/" + strconv.FormatInt(int64(cacheID), 10)
 }
 
-// ClusterCacheGVRDiscoverySpec is the desired discovery for one cache. Enabled is
+// ClusterCachedCatalogSpec is the desired discovery for one cache. Enabled is
 // the pause switch, evaluated once above and relayed into each child. Existence
 // means "has an anchor", NOT "is discovering" — the object lives as long as the
 // cache, so its subtree survives a pause.
-type ClusterCacheGVRDiscoverySpec struct {
+type ClusterCachedCatalogSpec struct {
 	Enabled bool `json:"enabled"`
 }
 
-// ClusterCacheGVRDiscoveryStatus is empty, deliberately: status is a propagation
+// ClusterCachedCatalogStatus is empty, deliberately: status is a propagation
 // channel — for state a dependent reacts to, not for pass gauges, which nothing in
 // the object graph reads. The gauges are served out of band
-// (ClusterCacheGVRDiscoveryStats); the Discovered condition is what remains.
-type ClusterCacheGVRDiscoveryStatus struct{}
+// (ClusterCachedCatalogStats); the Discovered condition is what remains.
+type ClusterCachedCatalogStatus struct{}
 
-// ClusterCacheGVRDiscoveryStats is one cache's live discovery gauges, held in memory
+// ClusterCachedCatalogStats is one cache's live discovery gauges, held in memory
 // and read on request — never stored. Nil means this process has run no pass for
 // that cache yet.
-type ClusterCacheGVRDiscoveryStats struct {
+type ClusterCachedCatalogStats struct {
 	// LastDiscoveryAt is when the last pass reached the API server (partial included).
 	LastDiscoveryAt time.Time
 	// ResourceCount is how many syncable GVRs that pass saw — deliberately not
@@ -130,49 +130,49 @@ type ClusterCacheGVRDiscoveryStats struct {
 	ResourceCount int
 }
 
-// ClusterCacheGVRDiscovery is the view of one ClusterCacheGVRDiscovery beehive
+// ClusterCachedCatalog is the view of one ClusterCachedCatalog beehive
 // object: a cache's kind-catalog record — which kinds the cluster serves, when that
 // was last confirmed, and whether the confirmation was complete. Streamed standalone
-// via Discovery().Watch and joined onto its cache client-side by CacheID. Spec is the
+// via CachedCatalogs().Watch and joined onto its cache client-side by CacheID. Spec is the
 // stored value served as-is, no projection.
-type ClusterCacheGVRDiscovery struct {
-	ID      ClusterCacheGVRDiscoveryID
+type ClusterCachedCatalog struct {
+	ID      ClusterCachedCatalogID
 	CacheID ClusterCacheID
-	Spec    ClusterCacheGVRDiscoverySpec
+	Spec    ClusterCachedCatalogSpec
 	// Conditions are beehive object conditions, read off the object rather than out of
 	// the status blob — `Discovered`, carrying this component's own verdict. There is no
 	// Status field: the kind's status is empty by design, and the pass's gauges are
-	// served out of band (ClusterCacheGVRDiscoveryStats).
+	// served out of band (ClusterCachedCatalogStats).
 	Conditions []Condition
 }
 
-// ClusterCacheGVRDiscoveryWatchFrame is one frame on the GVR-discovery watch, the third of
+// ClusterCachedCatalogWatchFrame is one frame on the GVR-discovery watch, the third of
 // the parallel object streams (clusters, caches, gvr-discoveries). Binds
-// 1:1 to the GraphQL ClusterCacheGVRDiscoveryWatchFrame; consumers key on Discovery.ID.
-type ClusterCacheGVRDiscoveryWatchFrame struct {
-	Type      DeltaFrameType
-	Discovery *ClusterCacheGVRDiscovery
+// 1:1 to the GraphQL ClusterCachedCatalogWatchFrame; consumers key on Discovery.ID.
+type ClusterCachedCatalogWatchFrame struct {
+	Type    DeltaFrameType
+	Catalog *ClusterCachedCatalog
 }
 
-// --- ClusterCacheGVRSync kind types ---
+// --- ClusterCachedResource kind types ---
 
-// ClusterCacheGVRSyncGroupKind identifies the per-GVR sync kind: one object per
-// served GVR, owned by its ClusterCacheGVRDiscovery.
-var ClusterCacheGVRSyncGroupKind = beehive.GroupKind{Kind: "ClusterCacheGVRSync"}
+// ClusterCachedResourceGroupKind identifies the per-GVR sync kind: one object per
+// served GVR, owned by its ClusterCachedCatalog.
+var ClusterCachedResourceGroupKind = beehive.GroupKind{Kind: "ClusterCachedResource"}
 
-// ClusterCacheGVRSyncName returns "gvrsync/{discoveryObjID}/{apiVersion}/{resource}" —
+// ClusterCachedResourceName returns "cachedresource/{catalogObjID}/{apiVersion}/{resource}" —
 // deterministic, so a discovery pass is a set reconcile with no per-child
 // bookkeeping. (apiVersion, resource) rather than Kind: the plural is what the
 // worker's REST path needs and what the server guarantees unique per group-version.
-func ClusterCacheGVRSyncName(discoveryID beehive.ObjectID, apiVersion, resource string) string {
-	return "gvrsync/" + strconv.FormatInt(int64(discoveryID), 10) + "/" + apiVersion + "/" + resource
+func ClusterCachedResourceName(catalogID beehive.ObjectID, apiVersion, resource string) string {
+	return "cachedresource/" + strconv.FormatInt(int64(catalogID), 10) + "/" + apiVersion + "/" + resource
 }
 
-// ClusterCacheGVRSyncSpec is the desired sync for one GVR, written wholly from
+// ClusterCachedResourceSpec is the desired sync for one GVR, written wholly from
 // above. Enabled is the pause switch relayed down the chain (the child never
 // re-derives it); identity fields refresh each discovery pass, so a kind that
 // changes shape converges without recreation.
-type ClusterCacheGVRSyncSpec struct {
+type ClusterCachedResourceSpec struct {
 	Enabled bool `json:"enabled"`
 	// APIVersion is the group/version this kind is served at, e.g. "apps/v1" — or a bare
 	// version ("v1") for the core group, matching the wire form Kubernetes uses.
@@ -185,39 +185,39 @@ type ClusterCacheGVRSyncSpec struct {
 	Namespaced bool `json:"namespaced"`
 }
 
-// ClusterCacheGVRSyncStatus is the observed sync state for one GVR. Empty placeholder.
-type ClusterCacheGVRSyncStatus struct{}
+// ClusterCachedResourceStatus is the observed sync state for one GVR. Empty placeholder.
+type ClusterCachedResourceStatus struct{}
 
-// ClusterCacheGVRSync is the view of one ClusterCacheGVRSync beehive object: one
+// ClusterCachedResource is the view of one ClusterCachedResource beehive object: one
 // Kubernetes kind being mirrored into a cache. Shaped like its sibling sync records —
 // {ID, owner, Spec, Conditions} — but streamed **cache-scoped**, because there is one per
 // served kind rather than one per cache and an unscoped stream of a hundred-plus records
 // would be a firehose.
-type ClusterCacheGVRSync struct {
-	ID ClusterCacheGVRSyncID
-	// DiscoveryID is the owning ClusterCacheGVRDiscovery — this kind hangs off the
+type ClusterCachedResource struct {
+	ID ClusterCachedResourceID
+	// CatalogID is the owning ClusterCachedCatalog — this kind hangs off the
 	// discovery anchor, not the cache directly, so this is the join key a client already
 	// has from the discovery stream.
-	DiscoveryID ClusterCacheGVRDiscoveryID
-	Spec        ClusterCacheGVRSyncSpec
+	CatalogID ClusterCachedCatalogID
+	Spec      ClusterCachedResourceSpec
 	// Conditions carry `Synced` — this kind's own verdict, which is the whole reason the
 	// record is served: a cache's hundred kinds fail independently, and the coarse
 	// cache-level condition can't say which.
 	Conditions []Condition
 }
 
-// ClusterCacheGVRSyncWatchFrame is one frame on the cache-scoped per-kind sync watch.
+// ClusterCachedResourceWatchFrame is one frame on the cache-scoped per-kind sync watch.
 // Consumers key on Sync.ID.
-type ClusterCacheGVRSyncWatchFrame struct {
-	Type DeltaFrameType
-	Sync *ClusterCacheGVRSync
+type ClusterCachedResourceWatchFrame struct {
+	Type     DeltaFrameType
+	Resource *ClusterCachedResource
 }
 
-// ClusterCacheGVRSyncStats are one kind's sync freshness stamps — measured by its
+// ClusterCachedResourceStats are one kind's sync freshness stamps — measured by its
 // worker, held in memory, served on request. Out of status for the usual reason, with
 // extra force here: with a hundred of these per cache a stored stamp would mean a
 // hundred parent wakes every heartbeat.
-type ClusterCacheGVRSyncStats struct {
+type ClusterCachedResourceStats struct {
 	// LastUpdateAt is when an object of this kind was last written to the cache; nil if
 	// never.
 	LastUpdateAt *time.Time

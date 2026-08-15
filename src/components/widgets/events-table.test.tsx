@@ -15,10 +15,10 @@
 import { render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// EventsTable is pure presentation over useClusterDataEvents — mock the hook to drive each
+// EventsTable is pure presentation over useClusterCachedDataEvents — mock the hook to drive each
 // of the four states (no active cache, connecting, empty, live rows) directly.
-const { useClusterDataEventsMock } = vi.hoisted(() => ({ useClusterDataEventsMock: vi.fn() }));
-vi.mock('@/lib/cluster-data-events', () => ({ useClusterDataEvents: useClusterDataEventsMock }));
+const { useClusterCachedDataEventsMock } = vi.hoisted(() => ({ useClusterCachedDataEventsMock: vi.fn() }));
+vi.mock('@/lib/cluster-cached-data-events', () => ({ useClusterCachedDataEvents: useClusterCachedDataEventsMock }));
 
 const { EventsTable } = await import('./events-table');
 
@@ -42,25 +42,25 @@ beforeEach(() => vi.clearAllMocks());
 
 describe('EventsTable', () => {
   it('explains the unsynced state when there is no active cache', () => {
-    useClusterDataEventsMock.mockReturnValue({ events: [], active: false, phase: 'connecting' });
+    useClusterCachedDataEventsMock.mockReturnValue({ events: [], active: false, phase: 'connecting' });
     render(<EventsTable />);
     expect(screen.getByText(/No synced cache/i)).toBeInTheDocument();
   });
 
   it('shows a spinner while connecting', () => {
-    useClusterDataEventsMock.mockReturnValue({ events: [], active: true, phase: 'connecting' });
+    useClusterCachedDataEventsMock.mockReturnValue({ events: [], active: true, phase: 'connecting' });
     render(<EventsTable />);
     expect(screen.getByText(/Loading events/i)).toBeInTheDocument();
   });
 
   it('shows an empty state on a connected empty snapshot', () => {
-    useClusterDataEventsMock.mockReturnValue({ events: [], active: true, phase: 'empty' });
+    useClusterCachedDataEventsMock.mockReturnValue({ events: [], active: true, phase: 'empty' });
     render(<EventsTable />);
     expect(screen.getByText('No events.')).toBeInTheDocument();
   });
 
   it('renders a row with the event fields and a kubectl-style involved reference', () => {
-    useClusterDataEventsMock.mockReturnValue({ events: [evt()], active: true, phase: 'live' });
+    useClusterCachedDataEventsMock.mockReturnValue({ events: [evt()], active: true, phase: 'live' });
     render(<EventsTable />);
     expect(screen.getByText('Warning')).toBeInTheDocument();
     expect(screen.getByText('BackOff')).toBeInTheDocument();
@@ -70,7 +70,7 @@ describe('EventsTable', () => {
   });
 
   it('omits the namespace from the involved reference for a name-only object', () => {
-    useClusterDataEventsMock.mockReturnValue({
+    useClusterCachedDataEventsMock.mockReturnValue({
       events: [evt({ involvedKind: 'Node', involvedNamespace: '', involvedName: 'node-1' })],
       active: true,
       phase: 'live',
@@ -80,13 +80,13 @@ describe('EventsTable', () => {
   });
 
   it('labels an event with an empty type (open Kubernetes field) as Unknown', () => {
-    useClusterDataEventsMock.mockReturnValue({ events: [evt({ type: '' })], active: true, phase: 'live' });
+    useClusterCachedDataEventsMock.mockReturnValue({ events: [evt({ type: '' })], active: true, phase: 'live' });
     render(<EventsTable />);
     expect(screen.getByText('Unknown')).toBeInTheDocument();
   });
 
   it('renders "—" for a null lastSeen instead of an ancient date', () => {
-    useClusterDataEventsMock.mockReturnValue({ events: [evt({ lastSeen: null })], active: true, phase: 'live' });
+    useClusterCachedDataEventsMock.mockReturnValue({ events: [evt({ lastSeen: null })], active: true, phase: 'live' });
     render(<EventsTable />);
     // The Last Seen cell falls back to the em dash; no year-0001 date leaks through.
     expect(screen.getByText('—')).toBeInTheDocument();

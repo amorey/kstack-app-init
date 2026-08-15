@@ -18,7 +18,7 @@ import { createRoute } from '@tanstack/react-router';
 
 import { EventsTable } from '@/components/widgets/events-table';
 import { ObjectsTable } from '@/components/widgets/objects-table';
-import { useClusterDataKinds } from '@/lib/cluster-data-kinds';
+import { useClusterCachedDataKinds } from '@/lib/cluster-cached-data-kinds';
 import {
   buildDashboardNav,
   dashboardResourceLabel,
@@ -47,7 +47,7 @@ export const Route = createRoute({
 // placeholder. Label and kind resolve against the same live catalog the sidebar uses.
 function Dashboard() {
   const { resource } = Route.useSearch();
-  const { kinds } = useClusterDataKinds();
+  const { kinds } = useClusterCachedDataKinds();
   const resolved = resolveDashboardResource(resource);
   // The catalog re-emits on count churn — memoize so a Modified frame doesn't
   // rebuild the tree / rescan the catalog every render.

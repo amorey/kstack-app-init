@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // The dashboard's cached Kubernetes Events table (newest first), fed by
-// `useClusterDataEvents`. Unfiltered for now. Gates on `active`/`phase` — the
+// `useClusterCachedDataEvents`. Unfiltered for now. Gates on `active`/`phase` — the
 // pattern every whole-screen watch view follows.
 // See docs/adr/2026-08-09-delta-watch-protocol.md
 import ReactTimeAgo from 'react-timeago';
@@ -21,19 +21,19 @@ import ReactTimeAgo from 'react-timeago';
 import { Spinner } from '@kubetail/ui/elements/spinner';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@kubetail/ui/elements/table';
 
-import { useClusterDataEvents } from '@/lib/cluster-data-events';
-import type { ClusterDataEvent } from '@/lib/cluster-data-events';
+import { useClusterCachedDataEvents } from '@/lib/cluster-cached-data-events';
+import type { ClusterCachedDataEvent } from '@/lib/cluster-cached-data-events';
 
 // kubectl-style "Kind namespace/name"; any part may be absent (cluster-scoped or
 // name-only reference).
-function involvedRef(e: ClusterDataEvent): string {
+function involvedRef(e: ClusterCachedDataEvent): string {
   const path = e.involvedNamespace ? `${e.involvedNamespace}/${e.involvedName}` : e.involvedName;
   return [e.involvedKind, path].filter(Boolean).join(' ');
 }
 
 // `type` is an open Kubernetes string — a cluster may omit it or supply a custom
 // value, so everything but Warning stays muted (empty renders "Unknown").
-function TypeBadge({ type }: { type: ClusterDataEvent['type'] }) {
+function TypeBadge({ type }: { type: ClusterCachedDataEvent['type'] }) {
   const warning = type === 'Warning';
   return (
     <span
@@ -47,7 +47,7 @@ function TypeBadge({ type }: { type: ClusterDataEvent['type'] }) {
 }
 
 export function EventsTable() {
-  const { events, active, phase } = useClusterDataEvents();
+  const { events, active, phase } = useClusterCachedDataEvents();
 
   // No active cache: an unsynced/paused cluster streams nothing — say so rather
   // than spin forever.

@@ -13,11 +13,11 @@
 // limitations under the License.
 
 // The live dashboard resource tree: curated base merged with the active cluster's
-// discovered kinds (thin builder over `useClusterDataKinds`). Unsynced cluster →
+// discovered kinds (thin builder over `useClusterCachedDataKinds`). Unsynced cluster →
 // curated-only. See docs/adr/2026-08-09-dashboard-nav-merge.md
 import { useMemo } from 'react';
 
-import { useClusterDataKinds } from '@/lib/cluster-data-kinds';
+import { useClusterCachedDataKinds } from '@/lib/cluster-cached-data-kinds';
 import { buildDashboardNav } from '@/lib/dashboard-resources';
 import type { DashboardNavNode } from '@/lib/dashboard-resources';
 import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
@@ -26,7 +26,7 @@ import type { WatchPhase } from '@/lib/graphql/use-watch-subscription';
 // "reconnecting/loading" affordance must gate on `active`, not `phase` alone, to
 // stay silent on the curated-only fallback.
 export function useDashboardNav(): { nav: DashboardNavNode[]; active: boolean; phase: WatchPhase } {
-  const { kinds, active, phase } = useClusterDataKinds();
+  const { kinds, active, phase } = useClusterCachedDataKinds();
   const nav = useMemo(() => buildDashboardNav(kinds), [kinds]);
   return { nav, active, phase };
 }
