@@ -36,7 +36,7 @@ internal/clustersvc/
   shared.go           vocabulary every family reuses, and the two GraphQL scalars
   stream.go           Stream[T]
   internal/           the mechanisms the controllers drive — private by compiler rule
-    kubeconfig/       polls the kubeconfig, publishes each reload
+    kubeconfig/       reloads the kubeconfig, publishes each change
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -47,10 +47,10 @@ are the subsystem's concurrency and retry budget, which only reads as a budget i
 
 `New` opens the beehive store under `dataDir` and registers all four controllers; `Start` runs
 beehive, then each controller's background work. **The controllers reconcile to a no-op, the
-kubeconfig watcher's poll and the importer's set-reconcile are hollow, and every family method
-panics** — so the app starts, the socket comes up, auth and cloud settings work, and any cluster
-query or subscription panics. The wiring and lifecycles are real; the business logic inside them is
-not. There is no connection manager, discovery pass, sync worker, or on-disk cache yet.
+importer's set-reconcile is hollow, and every family method panics** — so the app starts, the socket
+comes up, auth and cloud settings work, and any cluster query or subscription panics. The kubeconfig
+watcher is the one piece that is fully built. There is no connection manager, discovery pass, sync
+worker, or on-disk cache yet.
 
 **A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
 lifecycle — `clusterController` owns the kubeconfig watcher and importer, and the leaves each other
@@ -76,8 +76,15 @@ importer by the source discriminant (`Spec.Source.Kubeconfig != nil`), not by th
 Manual creation will have no importer at all, so *"every Cluster has an importer behind it"* is not
 an invariant to lean on.
 
-**Watches are pull-first** — correctness comes from the poll, and push is only latency. Applies to
-every watch, not just `kubeconfig.Watcher`, whose godoc has the worked reasoning.
+**Watches are pull-first** — correctness comes from the poll, and push only makes it prompt.
+`kubeconfig.Watcher` is the worked example (its godoc has the reasoning): a 30-minute backstop tick
+under fsnotify wakes, notifications optional and allowed to fail. Applies to every watch. **Keep the
+tick under a new push layer rather than replacing it** — it is what covers what events cannot see.
+
+The watcher watches **directories, and follows symlinks**: a save replaces the inode (so a
+file-level watch goes deaf), and a dotfiles-managed kubeconfig is a link whose target lives in a
+directory nobody would otherwise watch. The resolved set is recomputed per reload, so a re-pointed
+link follows to its new directory. Reach for `resolvePaths` before adding anything here.
 
 `clustersvc.New(dataDir, kubeconfigPath, pokeSvc)`, `Start`, and `Close` keep their signatures, so
 filling the shell in is never a change to the composition root.

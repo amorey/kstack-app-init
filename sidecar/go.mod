@@ -8,6 +8,7 @@ require (
 	github.com/amorey/beehive v0.23.0
 	github.com/amorey/gochan v0.2.0
 	github.com/coreos/go-oidc/v3 v3.18.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/stretchr/testify v1.11.1
 	github.com/vektah/gqlparser/v2 v2.5.33
