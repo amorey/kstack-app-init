@@ -75,6 +75,19 @@ func Wait(t testing.TB, ch <-chan struct{}, what string) {
 	}
 }
 
+// WaitReturn runs fn on its own goroutine and fails the test if it has not
+// returned within the failsafe timeout. For the blocking half of a lifecycle — a
+// stop func or a WaitGroup join — where the claim is that it returns at all.
+func WaitReturn(t testing.TB, fn func(), what string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	Wait(t, done, what)
+}
+
 // Recv returns the next value from ch, failing the test if ch closes first or
 // nothing arrives within the failsafe timeout.
 func Recv[T any](t testing.TB, ch <-chan T, what string) T {

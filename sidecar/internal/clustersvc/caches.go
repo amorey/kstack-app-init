@@ -155,7 +155,7 @@ func (a cachesAPI) Clear(ctx context.Context, id ClusterID) (*Cluster, error) {
 // clusterCacheController reconciles one cache: provision its mirror, gate it on the
 // cluster's connection and sync toggles, and own the catalog beneath it. A
 // placeholder that reconciles to a no-op.
-type clusterCacheController struct{}
+type clusterCacheController struct{ noBackground }
 
 func (c *clusterCacheController) Reconcile(
 	ctx context.Context,

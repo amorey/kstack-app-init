@@ -47,7 +47,7 @@ func TestObjectIDUnmarshalsEveryWireForm(t *testing.T) {
 // A malformed id is a client error, not a zero id: silently reading garbage as 0
 // would resolve to "not found" instead of saying what was wrong.
 func TestObjectIDUnmarshalRejectsMalformedInput(t *testing.T) {
-	for _, v := range []any{"not-a-number", "", true, 1.5} {
+	for _, v := range []any{"not-a-number", "", json.Number("nope"), true, 1.5} {
 		var id ObjectID
 		assert.Error(t, id.UnmarshalGQL(v), "%#v should not parse", v)
 	}
@@ -93,6 +93,14 @@ func TestRawJSONUnmarshalGQLNil(t *testing.T) {
 	var r RawJSON
 	require.NoError(t, r.UnmarshalGQL(nil))
 	assert.Equal(t, RawJSON(""), r)
+}
+
+// A value JSON cannot represent is an error rather than a silently empty body,
+// which would read downstream as the absent-body case.
+func TestRawJSONUnmarshalGQLRejectsUnserializableInput(t *testing.T) {
+	var r RawJSON
+	assert.Error(t, r.UnmarshalGQL(make(chan int)))
+	assert.Equal(t, RawJSON(""), r, "a rejected value must not be stored")
 }
 
 // Messages come from unbounded sources (raw client-go errors, kilobyte /readyz

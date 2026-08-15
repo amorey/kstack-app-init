@@ -100,7 +100,7 @@ func (a cachedCatalogsAPI) WatchByCache(ctx context.Context, cacheID ClusterCach
 // clusterCachedCatalogController reconciles one cache's kind catalog: run the
 // discovery pass and maintain a ClusterCachedResource child per served kind. A
 // placeholder that reconciles to a no-op.
-type clusterCachedCatalogController struct{}
+type clusterCachedCatalogController struct{ noBackground }
 
 func (c *clusterCachedCatalogController) Reconcile(
 	ctx context.Context,

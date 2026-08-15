@@ -132,7 +132,7 @@ func (a cachedResourcesAPI) Clear(ctx context.Context, id ClusterCachedResourceI
 // clusterCachedResourceController reconciles one synced kind: start, stop, and
 // resume the worker mirroring it into the cache. A placeholder that reconciles to a
 // no-op.
-type clusterCachedResourceController struct{}
+type clusterCachedResourceController struct{ noBackground }
 
 func (c *clusterCachedResourceController) Reconcile(
 	ctx context.Context,

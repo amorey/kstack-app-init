@@ -61,8 +61,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
@@ -294,15 +296,112 @@ var (
 	_ CachedData      = cachedDataAPI{}
 )
 
+// startCloser is the three-phase shape every layer here shares, Service included, and
+// it means the same thing at each: Start bounds startup with ctx and returns the func
+// that drains the background work, taking a drain deadline; Close releases what the
+// drain left. Two methods, three phases — stop is Start's return value, so it cannot
+// be called before there is anything to stop. Identical from the leaves up, so
+// composing a level is startAll + stopAll + closeAll rather than a hand-written stop
+// per owner.
+//
+// Separate from beehive.Controller, which is generic per kind and so cannot be held
+// in one slice.
+type startCloser interface {
+	Start(ctx context.Context) (func(context.Context) error, error)
+	io.Closer
+}
+
+// noBackground supplies the lifecycle for a kind whose controller owns no machinery.
+// Embed it, and override either method when the kind grows some.
+type noBackground struct{}
+
+func (noBackground) Start(context.Context) (func(context.Context) error, error) {
+	return func(context.Context) error { return nil }, nil
+}
+
+func (noBackground) Close() error { return nil }
+
+// startAll starts each in order and returns their stop funcs. A failure stops
+// whatever already started: the caller gets an error and no stop funcs, so nothing
+// else can reach them.
+func startAll(ctx context.Context, ls []startCloser) (func(context.Context) error, error) {
+	stops := make([]func(context.Context) error, 0, len(ls))
+	for _, l := range ls {
+		stop, err := l.Start(ctx)
+		if err != nil {
+			return nil, errors.Join(err, unwind(ctx, stops))
+		}
+		stops = append(stops, stop)
+	}
+	return func(ctx context.Context) error { return stopAll(ctx, stops) }, nil
+}
+
+// unwindTimeout bounds the unwind of a failed start. A budget of its own because the
+// caller never receives a stop func in that case, so there is no drain deadline to
+// inherit.
+const unwindTimeout = 10 * time.Second
+
+// unwind drains what already started, on a context detached from the startup one.
+// The usual reason a start fails is that ctx died, and draining on a dead context
+// returns the instant it is asked to wait — signalling the background work to stop
+// and reporting it drained while it is still running, just as the caller is free to
+// close what it is using.
+func unwind(ctx context.Context, stops []func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unwindTimeout)
+	defer cancel()
+	return stopAll(ctx, stops)
+}
+
+// stopAll runs stops in reverse, joining every error rather than returning at the
+// first: a stop that fails must not leave the rest running.
+func stopAll(ctx context.Context, stops []func(context.Context) error) error {
+	var errs []error
+	for i := len(stops) - 1; i >= 0; i-- {
+		errs = append(errs, stops[i](ctx))
+	}
+	return errors.Join(errs...)
+}
+
+// closeAll closes in reverse, mirroring stopAll.
+func closeAll(ls []startCloser) error {
+	var errs []error
+	for i := len(ls) - 1; i >= 0; i-- {
+		errs = append(errs, ls[i].Close())
+	}
+	return errors.Join(errs...)
+}
+
 // service is the concrete Service: the beehive instance every family reads and every
 // controller writes, plus the inputs the rebuild's leaves still need.
 type service struct {
-	bh      *beehive.Beehive
-	bhStore beehive.Store
+	bh *beehive.Beehive
 
-	kubeconfigPath string
-	pokeSvc        *poke.Service
+	// beehive first, then the controllers in registration order — held for their
+	// lifecycle alone, since reads go through bh rather than through them. Order is
+	// the whole contract: beehive starts before any controller and, being last to
+	// stop and close, outlives every reconcile that could still touch the store.
+	parts []startCloser
+
+	pokeSvc *poke.Service
 }
+
+// beehiveRuntime gives beehive the startCloser shape. Start already matches; the
+// only thing missing is Close, because what closes is the store rather than the
+// runtime on top of it.
+type beehiveRuntime struct {
+	bh    *beehive.Beehive
+	store beehive.Store
+}
+
+func (r beehiveRuntime) Start(ctx context.Context) (func(context.Context) error, error) {
+	stop, err := r.bh.Start(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("start beehive: %w", err)
+	}
+	return stop, nil
+}
+
+func (r beehiveRuntime) Close() error { return r.store.Close() }
 
 // maxEventRuns bounds retention per (object, category) timeline — counted in
 // aggregated RUNS (state transitions), not occurrences. Global (set at beehive.New).
@@ -329,40 +428,54 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	s := &service{bh: bh, bhStore: bhStore, kubeconfigPath: kubeconfigPath, pokeSvc: pokeSvc}
-	if err := registerControllers(bh); err != nil {
+	clusterClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
+	clusterCtrl := newClusterController(kubeconfigPath, clusterClient)
+
+	controllers, err := registerControllers(bh, clusterCtrl)
+	if err != nil {
 		bhStore.Close()
 		return nil, fmt.Errorf("register cluster controllers: %w", err)
 	}
-	return s, nil
+	return &service{
+		bh:      bh,
+		parts:   append([]startCloser{beehiveRuntime{bh: bh, store: bhStore}}, controllers...),
+		pokeSvc: pokeSvc,
+	}, nil
 }
 
 // registerControllers registers each kind's controller, which lives in that kind's
-// file. Together here rather than four calls spread across those files: the options
-// are the whole subsystem's concurrency and retry budget, and it only reads as a
-// budget in one place.
-func registerControllers(bh *beehive.Beehive) error {
-	_, errCluster := beehive.Register(bh, ClusterGroupKind, &clusterController{})
-	_, errCache := beehive.Register(bh, ClusterCacheGroupKind, &clusterCacheController{})
-	_, errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, &clusterCachedCatalogController{})
-	_, errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, &clusterCachedResourceController{})
-	return errors.Join(errCluster, errCache, errCatalog, errResource)
-}
+// file, and returns them in registration order. Together here rather than four calls
+// spread across those files: the options are the whole subsystem's concurrency and
+// retry budget, and it only reads as a budget in one place. A controller with
+// machinery of its own is built by the caller and passed in; the rest have nothing to
+// configure.
+func registerControllers(bh *beehive.Beehive, cluster *clusterController) ([]startCloser, error) {
+	cache := &clusterCacheController{}
+	catalog := &clusterCachedCatalogController{}
+	resource := &clusterCachedResourceController{}
 
-// Start launches beehive (the controller harness + store subscription loop). ctx
-// bounds startup only; the returned stop func takes a drain deadline and blocks
-// until the background work finishes. Call stop before Close.
-func (s *service) Start(ctx context.Context) (func(context.Context) error, error) {
-	bhStop, err := s.bh.Start(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("start beehive: %w", err)
+	_, errCluster := beehive.Register(bh, ClusterGroupKind, cluster)
+	_, errCache := beehive.Register(bh, ClusterCacheGroupKind, cache)
+	_, errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog)
+	_, errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource)
+	if err := errors.Join(errCluster, errCache, errCatalog, errResource); err != nil {
+		return nil, err
 	}
-	return bhStop, nil
+	return []startCloser{cluster, cache, catalog, resource}, nil
 }
 
-// Close releases the beehive store. Call after the stop func returns.
+// Start launches beehive (the controller harness + store subscription loop), then
+// each controller's own background work. ctx bounds startup only; the returned stop
+// func takes a drain deadline and blocks until the background work finishes. Call
+// stop before Close.
+func (s *service) Start(ctx context.Context) (func(context.Context) error, error) {
+	return startAll(ctx, s.parts)
+}
+
+// Close releases the controllers' resources and the beehive store. Call after the
+// stop func returns.
 func (s *service) Close() error {
-	return s.bhStore.Close()
+	return closeAll(s.parts)
 }
 
 func (s *service) GetConnection(id ClusterID) *rest.Config {

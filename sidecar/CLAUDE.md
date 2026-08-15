@@ -30,12 +30,13 @@ internal/clustersvc/
                       accessors, beehive bootstrap, and registerControllers
   clusters.go         ┐ one per family, implementing its interface and holding
   caches.go           │ everything else about that kind: its beehive shapes, the
-  cachedcatalogs.go   │ record GraphQL binds, its *WatchFrame, and its controller
-  cachedresources.go  │
+  cachedcatalogs.go   │ record GraphQL binds, its *WatchFrame, its controller, and
+  cachedresources.go  │ the machinery that controller owns
   cacheddata.go       ┘ (no controller — the one family that isn't a beehive kind)
   shared.go           vocabulary every family reuses, and the two GraphQL scalars
   stream.go           Stream[T]
   internal/           the mechanisms the controllers drive — private by compiler rule
+    kubeconfig/       polls the kubeconfig, publishes each reload
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -44,11 +45,39 @@ side and hides when they don't. Everything else slices by kind, so one file teac
 `registerControllers` stays whole in `service.go` for the same reason the interfaces do: its options
 are the subsystem's concurrency and retry budget, which only reads as a budget in one place.
 
-`New` opens the beehive store under `dataDir` and registers all four controllers;
-`Start` runs beehive. **The controllers are placeholders that reconcile to a no-op, and every
-family method panics** — so the app starts, the socket comes up, auth and cloud settings work,
-and any cluster query or subscription panics. There is no kubeconfig watcher, connection manager,
-discovery pass, sync worker, or on-disk cache yet.
+`New` opens the beehive store under `dataDir` and registers all four controllers; `Start` runs
+beehive, then each controller's background work. **The controllers reconcile to a no-op, the
+kubeconfig watcher's poll and the importer's set-reconcile are hollow, and every family method
+panics** — so the app starts, the socket comes up, auth and cloud settings work, and any cluster
+query or subscription panics. The wiring and lifecycles are real; the business logic inside them is
+not. There is no connection manager, discovery pass, sync worker, or on-disk cache yet.
+
+**A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
+lifecycle — `clusterController` owns the kubeconfig watcher and importer, and the leaves each other
+controller grows land the same way. Otherwise the composition root accumulates every kind's detail.
+A controller built with machinery is constructed in `New` and passed to `registerControllers`, which
+returns all four in registration order; the rest are built at the call.
+
+**One lifecycle shape at every level** — `startCloser` in `service.go`, which carries the contract.
+Beehive included: it is wrapped as a `startCloser` and sits at the head of `service.parts`, so
+`Start`/`Close` are one `startAll`/`closeAll` call and nothing composes by hand. **Add a participant
+by putting it in the slice, never by writing another stop closure**, and honor the drain deadline
+with `drain.WithContext` — `startCloser` promises it, and a leaf that blocks on a bare `wg.Wait()`
+quietly breaks the promise for everything above it. A kind with no machinery embeds `noBackground`.
+
+**Importers create Cluster records; controllers reconcile them.** An importer runs *outside* beehive
+because it decides which objects exist — which means running when there are none, and a controller
+reconciles one object that already does. (It hangs off the controller for lifecycle ownership only;
+`Reconcile` never touches it.) Each importer covers one `ClusterSpecSource` variant and is
+**creation-only**: it creates a record for every context nothing yet references and never updates,
+orphans, or deletes. A departed context is orphaned by `clusterController` observing it absent
+(`IsPresent=false`), which keeps set membership and per-object observation from fighting. Scope an
+importer by the source discriminant (`Spec.Source.Kubeconfig != nil`), not by the name prefix.
+Manual creation will have no importer at all, so *"every Cluster has an importer behind it"* is not
+an invariant to lean on.
+
+**Watches are pull-first** — correctness comes from the poll, and push is only latency. Applies to
+every watch, not just `kubeconfig.Watcher`, whose godoc has the worked reasoning.
 
 `clustersvc.New(dataDir, kubeconfigPath, pokeSvc)`, `Start`, and `Close` keep their signatures, so
 filling the shell in is never a change to the composition root.
