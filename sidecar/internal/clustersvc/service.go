@@ -55,11 +55,11 @@ type Service interface {
 	CachedResources() CachedResources
 	CachedData() CachedData
 
+	// GetConnection returns the live REST config for id, or nil when not connected.
+	GetConnection(id types.ClusterID) *rest.Config
 	// RetryConnection forces an out-of-band re-probe. The outcome lands on the
 	// record's conditions and reaches watchers through Clusters().Watch, not here.
 	RetryConnection(ctx context.Context, id types.ClusterID) error
-	// GetConnection returns the live REST config for id, or nil when not connected.
-	GetConnection(id types.ClusterID) *rest.Config
 
 	// The event timeline of any record that has one — Cluster, ClusterCache,
 	// ClusterCachedResource today. Top-level, not per family: an event carries no kind
