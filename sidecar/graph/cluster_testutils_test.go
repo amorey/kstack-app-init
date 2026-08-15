@@ -227,7 +227,7 @@ func gaugeStream[T, C any](ctx context.Context, f *fakeClusterService, items []T
 }
 
 func streamOf[C any](ctx context.Context, f *fakeClusterService, frames []C) *clustersvc.Stream[C] {
-	return clustersvc.NewStream(func(out chan<- C) error {
+	return clustersvc.NewStream(ctx, func(ctx context.Context, out chan<- C) error {
 		for _, c := range frames {
 			select {
 			case out <- c:

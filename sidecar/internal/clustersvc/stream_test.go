@@ -15,6 +15,7 @@
 package clustersvc
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -30,7 +31,7 @@ import (
 // broken watch as a graceful end — the exact failure this type exists to prevent.
 func TestStreamRecordsTheReasonBeforeClosingFrames(t *testing.T) {
 	boom := errors.New("watch ended: too old")
-	s := NewStream(func(out chan<- int) error {
+	s := NewStream(context.Background(), func(_ context.Context, out chan<- int) error {
 		out <- 1
 		return boom
 	})
@@ -41,8 +42,33 @@ func TestStreamRecordsTheReasonBeforeClosingFrames(t *testing.T) {
 }
 
 func TestStreamReportsNoErrorOnACleanEnd(t *testing.T) {
-	s := NewStream(func(chan<- int) error { return nil })
+	s := NewStream(context.Background(), func(context.Context, chan<- int) error { return nil })
 
 	testutil.WaitClosed(t, s.Frames, "the stream")
 	assert.NoError(t, s.Err())
+}
+
+// The shape every pump owes its consumer: the reader stops draining Frames when ctx
+// ends, so a pump that does not select on it blocks forever on its next send. A
+// cancelled watch is a teardown, not a failure, so Err stays nil.
+func TestStreamPumpEndsOnACancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := NewStream(ctx, func(ctx context.Context, out chan<- int) error {
+		for {
+			select {
+			case out <- 1:
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	})
+
+	// Fill the buffer and leave a send parked, so cancellation has to be what
+	// releases the pump rather than an empty channel.
+	require.Equal(t, 1, testutil.Recv(t, s.Frames, "a stream value"))
+	cancel()
+
+	testutil.WaitClosed(t, s.Frames, "the stream")
+	assert.NoError(t, s.Err(), "a cancelled watch is a teardown, not a failure")
 }

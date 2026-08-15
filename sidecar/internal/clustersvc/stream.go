@@ -15,6 +15,7 @@
 package clustersvc
 
 import (
+	"context"
 	"sync/atomic"
 )
 
@@ -44,14 +45,23 @@ func (s *Stream[T]) Err() error {
 // terminal error. Frames closes only after that error is recorded, which is what
 // makes "Frames closed" a safe cue to read Err.
 //
+// pump must select on ctx around every send. The consumer stops draining Frames the
+// moment ctx is done, so a send that blocks on the channel alone blocks forever —
+// leaking the goroutine and the upstream watch behind it, once per client
+// disconnect. ctx is a parameter rather than a closed-over variable so that the
+// requirement is visible in every pump's own signature.
+//
+// Cancellation is an ordinary teardown: return nil for it. A non-nil error is
+// reported to the client as the reason its watch died.
+//
 // Exported because Stream sits in the family interfaces: an implementation outside
 // this package — a fake in the resolver tests — has to be able to build one.
-func NewStream[T any](pump func(out chan<- T) error) *Stream[T] {
+func NewStream[T any](ctx context.Context, pump func(ctx context.Context, out chan<- T) error) *Stream[T] {
 	ch := make(chan T, 1)
 	s := &Stream[T]{Frames: ch}
 	go func() {
 		defer close(ch)
-		if err := pump(ch); err != nil {
+		if err := pump(ctx, ch); err != nil {
 			s.err.Store(&err)
 		}
 	}()
