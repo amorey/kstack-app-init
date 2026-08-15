@@ -13,10 +13,10 @@
 // limitations under the License.
 
 // The ClusterCache kind and the two child kinds beneath it (ClusterCacheGVRDiscovery,
-// ClusterCacheGVRSync): each kind's beehive shapes, the domain record served to
+// ClusterCacheGVRSync): each kind's beehive shapes, the record served to
 // resolvers, and its delta-watch change, plus the whole-cache sync verdict folded from
 // the per-kind children. Mirrors the ClusterCache section of graph/schema.graphqls.
-package domain
+package types
 
 import (
 	"strconv"
@@ -37,9 +37,8 @@ func ClusterCacheName(clusterID ClusterID, serverUID string) string {
 var ClusterCacheGroupKind = beehive.GroupKind{Kind: "ClusterCache"}
 
 // ClusterCacheSpec: ServerUID is the kube-system UID this cache mirrors — the
-// identity a migration turns over. Written at creation by the core controller;
-// the cache controller compares it against the parent's last-probed Server.UID to
-// decide active-ness (it reads spec.ServerUID, never the name).
+// identity a migration turns over. Active-ness is decided by comparing it against
+// the parent's last-probed Server.UID; read spec.ServerUID for that, never the name.
 type ClusterCacheSpec struct {
 	ServerUID string `json:"serverUid"`
 }
@@ -48,10 +47,10 @@ type ClusterCacheSpec struct {
 // the rollup a UI wants is served read-side by Caches().WatchSyncHealth.
 type ClusterCacheStatus struct{}
 
-// EventsKind / EventsAPIVersion / EventsResource identify the Event collection —
-// an ordinary synced kind writing to its own table (eventsync). The server serves
-// the same events under two spellings backed by one store, so exactly one may be
-// synced: canonical `v1`; the discovery filter drops EventsAltGroup.
+// EventsKind / EventsAPIVersion / EventsResource identify the Event collection — an
+// ordinary synced kind, written to its own table. The server serves the same events
+// under two spellings backed by one store, so exactly one may be synced: canonical
+// `v1`; discovery drops EventsAltGroup.
 const (
 	EventsKind       = "Event"
 	EventsAPIVersion = "v1"
@@ -59,14 +58,11 @@ const (
 	EventsAltGroup   = "events.k8s.io"
 )
 
-// ClusterCache is the domain view of one ClusterCache beehive object, streamed
-// standalone via Caches().Watch and joined to its parent client-side. ID is the cache's
-// own ObjectID and ClusterID its parent's — together they locate the on-disk cache and
-// let the client join the cache onto its cluster. ServerUID is the kube-system UID this
-// cache mirrors; the client treats the cache whose ServerUID matches the cluster's
-// last-probed Server.UID as active. Active-ness is deliberately not a field: it depends
-// on the parent's status, which changes with no cache event, so only the client's live
-// join is correct.
+// ClusterCache is the view of one ClusterCache beehive object, streamed standalone
+// via Caches().Watch and joined to its parent client-side. ID and ClusterID together
+// locate the on-disk cache and carry that join. Active-ness is deliberately not a
+// field: it is ServerUID matching the parent's last-probed Server.UID, which changes
+// with no cache event, so only the client's live join is correct.
 type ClusterCache struct {
 	ID        ClusterCacheID
 	ClusterID ClusterID
@@ -110,24 +106,22 @@ func ClusterCacheGVRDiscoveryName(cacheID beehive.ObjectID) string {
 }
 
 // ClusterCacheGVRDiscoverySpec is the desired discovery for one cache. Enabled is
-// the pause switch, written by ClusterCacheController (the one evaluator of the
-// sync rule) and relayed into each child. Existence means "has an anchor", NOT
-// "is discovering" — the object lives as long as the cache, so its subtree
-// survives a pause.
+// the pause switch, evaluated once above and relayed into each child. Existence
+// means "has an anchor", NOT "is discovering" — the object lives as long as the
+// cache, so its subtree survives a pause.
 type ClusterCacheGVRDiscoverySpec struct {
 	Enabled bool `json:"enabled"`
 }
 
 // ClusterCacheGVRDiscoveryStatus is empty, deliberately: status is a propagation
-// channel — for state a dependent reacts to, not for pass gauges, which nothing
-// in the object graph reads. The gauges live in controller memory (see
-// ClusterCacheGVRDiscoveryStats); the Discovered condition (a beehive object row)
-// is what remains.
+// channel — for state a dependent reacts to, not for pass gauges, which nothing in
+// the object graph reads. The gauges are served out of band
+// (ClusterCacheGVRDiscoveryStats); the Discovered condition is what remains.
 type ClusterCacheGVRDiscoveryStatus struct{}
 
-// ClusterCacheGVRDiscoveryStats is one cache's live discovery gauges, held in
-// controller memory and read on request — never stored. Absent (nil at the
-// service boundary) means this process has run no pass for that cache yet.
+// ClusterCacheGVRDiscoveryStats is one cache's live discovery gauges, held in memory
+// and read on request — never stored. Nil means this process has run no pass for
+// that cache yet.
 type ClusterCacheGVRDiscoveryStats struct {
 	// LastDiscoveryAt is when the last pass reached the API server (partial included).
 	LastDiscoveryAt time.Time
@@ -136,13 +130,11 @@ type ClusterCacheGVRDiscoveryStats struct {
 	ResourceCount int
 }
 
-// ClusterCacheGVRDiscovery is the domain view of one ClusterCacheGVRDiscovery beehive
-// object: a cache's kind-catalog record — which kinds the cluster serves, when that was
-// last confirmed, and whether the confirmation was complete. Streamed standalone via
-// Discovery().Watch and joined onto its cache client-side by CacheID, exactly as
-// its sibling sync records are; why the discovery anchor is its own kind is in the
-// sync-surface note in CLAUDE.md. Spec and Status are the stored values served as-is —
-// no projection, the ClusterCacheStatus precedent.
+// ClusterCacheGVRDiscovery is the view of one ClusterCacheGVRDiscovery beehive
+// object: a cache's kind-catalog record — which kinds the cluster serves, when that
+// was last confirmed, and whether the confirmation was complete. Streamed standalone
+// via Discovery().Watch and joined onto its cache client-side by CacheID. Spec is the
+// stored value served as-is, no projection.
 type ClusterCacheGVRDiscovery struct {
 	ID      ClusterCacheGVRDiscoveryID
 	CacheID ClusterCacheID
@@ -176,10 +168,10 @@ func ClusterCacheGVRSyncName(discoveryID beehive.ObjectID, apiVersion, resource 
 	return "gvrsync/" + strconv.FormatInt(int64(discoveryID), 10) + "/" + apiVersion + "/" + resource
 }
 
-// ClusterCacheGVRSyncSpec is the desired sync for one GVR, written wholly by the
-// discovery controller. Enabled is the pause switch relayed down the chain (the
-// child never re-derives it); identity fields refresh each discovery pass, so a
-// kind that changes shape converges without recreation.
+// ClusterCacheGVRSyncSpec is the desired sync for one GVR, written wholly from
+// above. Enabled is the pause switch relayed down the chain (the child never
+// re-derives it); identity fields refresh each discovery pass, so a kind that
+// changes shape converges without recreation.
 type ClusterCacheGVRSyncSpec struct {
 	Enabled bool `json:"enabled"`
 	// APIVersion is the group/version this kind is served at, e.g. "apps/v1" — or a bare
@@ -196,7 +188,7 @@ type ClusterCacheGVRSyncSpec struct {
 // ClusterCacheGVRSyncStatus is the observed sync state for one GVR. Empty placeholder.
 type ClusterCacheGVRSyncStatus struct{}
 
-// ClusterCacheGVRSync is the domain view of one ClusterCacheGVRSync beehive object: one
+// ClusterCacheGVRSync is the view of one ClusterCacheGVRSync beehive object: one
 // Kubernetes kind being mirrored into a cache. Shaped like its sibling sync records —
 // {ID, owner, Spec, Conditions} — but streamed **cache-scoped**, because there is one per
 // served kind rather than one per cache and an unscoped stream of a hundred-plus records
@@ -221,10 +213,10 @@ type ClusterCacheGVRSyncWatchFrame struct {
 	Sync *ClusterCacheGVRSync
 }
 
-// ClusterCacheGVRSyncStats are one kind's sync freshness stamps — measured by its worker,
-// held in ClusterCacheGVRSyncController's memory, and served on request. Out of status
-// for the usual reason: nothing in the object graph reacts to them, and with a hundred of
-// these per cache a stored stamp would mean a hundred parent wakes every heartbeat.
+// ClusterCacheGVRSyncStats are one kind's sync freshness stamps — measured by its
+// worker, held in memory, served on request. Out of status for the usual reason, with
+// extra force here: with a hundred of these per cache a stored stamp would mean a
+// hundred parent wakes every heartbeat.
 type ClusterCacheGVRSyncStats struct {
 	// LastUpdateAt is when an object of this kind was last written to the cache; nil if
 	// never.
@@ -234,28 +226,25 @@ type ClusterCacheGVRSyncStats struct {
 	LastLiveAt *time.Time
 }
 
-// ClusterCacheSyncHealth is one cache's sync verdict, folded from every kind it syncs.
-//
-// It is a READ-SIDE projection, not a stored condition, and that is deliberate. The
-// status-is-propagation rule cuts both ways: a value belongs on an object when a
-// dependent reacts to it, and nothing in the object graph reacts to this — only a UI
-// does. Storing it would mean waking the cache (and every watcher) each time any of its
-// hundred-plus children changed verdict, to publish a number no controller reads.
-//
-// It exists because the per-kind records can't serve this consumer: there is one per
-// synced kind, so the always-mounted cluster registry can't carry them, and no single
-// child's verdict is the cache's — a cache with ninety-nine healthy kinds and one
-// forbidden CRD is not healthy, and reading any one child would call it either way at
-// random.
 // SyncedKindRef identifies one synced kind exactly. The plural alone is what a UI
-// renders, but it does not IDENTIFY a kind — a CRD may reuse a built-in's plural under
-// another api group — so anything that keys on a kind (looking its sync record up, opening
-// its timeline) needs the pair.
+// renders, but it does not IDENTIFY a kind — a CRD may reuse a built-in's plural
+// under another api group — so anything that keys on a kind needs the pair.
 type SyncedKindRef struct {
 	APIVersion string
 	Resource   string
 }
 
+// ClusterCacheSyncHealth is one cache's sync verdict, folded from every kind it syncs.
+//
+// A READ-SIDE projection, not a stored condition: status is for state a dependent
+// reacts to, and nothing in the object graph reacts to this — only a UI does. Storing
+// it would wake the cache and every watcher each time any of its hundred-plus children
+// changed verdict, to publish a number no controller reads.
+//
+// The per-kind records can't serve that consumer themselves: there is one per synced
+// kind, and no single child's verdict is the cache's — ninety-nine healthy kinds and
+// one forbidden CRD is not healthy, and reading any one child would call it either way
+// at random.
 type ClusterCacheSyncHealth struct {
 	CacheID ClusterCacheID
 	// Status/Reason mirror a Condition's shape (and its reason vocabulary), so a consumer

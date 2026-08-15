@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cluster
+package clustersvc
 
 import (
 	"sync/atomic"
@@ -23,10 +23,9 @@ import (
 // failed — so Err is the only thing that tells a failure apart from an ordinary
 // teardown, and a consumer that ignores it turns a broken watch into a silent one.
 //
-// The rule is the SOURCE, not the shape: anything reading a beehive watch returns a
-// Stream, gauges included (WatchSyncHealth folds two of its own). The Data watches
-// are the only ones that don't, because they read the local cache and retry forever
-// — cacheWatchLoop has no terminal failure to report.
+// The rule is the SOURCE, not the shape: a watch over a fallible upstream returns a
+// Stream, gauges included. One that retries forever and has no terminal failure to
+// report may stay a plain channel — which is why the Data family does.
 type Stream[T any] struct {
 	Frames <-chan T
 	err    atomic.Pointer[error]
@@ -42,11 +41,11 @@ func (s *Stream[T]) Err() error {
 }
 
 // NewStream runs pump on its own goroutine, publishing what it returns as the
-// terminal error. The frame channel closes only after that error is recorded,
-// which is what makes "Frames closed" a safe cue to read Err.
+// terminal error. Frames closes only after that error is recorded, which is what
+// makes "Frames closed" a safe cue to read Err.
 //
-// Exported because Stream sits in the family interfaces: anything implementing
-// them — a fake in the resolver tests, say — has to be able to build one.
+// Exported because Stream sits in the family interfaces: an implementation outside
+// this package — a fake in the resolver tests — has to be able to build one.
 func NewStream[T any](pump func(out chan<- T) error) *Stream[T] {
 	ch := make(chan T, 1)
 	s := &Stream[T]{Frames: ch}

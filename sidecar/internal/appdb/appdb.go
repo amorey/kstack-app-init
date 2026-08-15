@@ -3,8 +3,8 @@
 //
 // A SQLite file has ONE schema_migrations sequence, so its schema can't be co-owned by
 // packages each embedding their own migrations — consumers add tables as new numbered
-// migrations here. (The per-cluster caches are a different story: one file each, owned by
-// internal/cluster.) app.db lives outside clusters/ so the cache scan never mistakes it
+// migrations here. app.db lives outside clusters/, which is reserved for the per-cluster
+// cache files (one each, owned by internal/clustersvc), so a cache scan never mistakes it
 // for one.
 package appdb
 

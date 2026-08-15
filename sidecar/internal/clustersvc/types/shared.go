@@ -17,7 +17,7 @@
 // kind — a type only one kind uses lives in that kind's file, however generic its name
 // reads. Mirrors the shared-vocabulary section of graph/schema.graphqls, which these
 // types bind to.
-package domain
+package types
 
 import (
 	"encoding/json"
@@ -30,9 +30,9 @@ import (
 	"github.com/amorey/beehive"
 )
 
-// ErrNotFound is returned by client helpers when no cluster with the given id
-// is tracked.
-var ErrNotFound = errors.New("controllers: cluster not found")
+// ErrNotFound is the boundary's sentinel for an id that names no tracked record.
+// Callers match it with errors.Is; graph maps it to the ErrRecordNotFound wire error.
+var ErrNotFound = errors.New("clustersvc: cluster not found")
 
 // --- Identity ---
 
@@ -110,8 +110,8 @@ const (
 	ConditionUnknown = beehive.ConditionUnknown
 )
 
-// ConditionType names one independently-tracked aspect of a cluster
-// record's observed state. Each type is owned by exactly one controller.
+// ConditionType names one independently-tracked aspect of a record's observed
+// state. Each type has exactly one writer.
 type ConditionType string
 
 const (
@@ -128,62 +128,62 @@ const (
 	// ConditionDiscovered reports whether the cache's GVR discovery pass reached the
 	// API server and enumerated the kinds it serves. A separate axis from Synced: a
 	// cache can have a complete, current kind list while its per-kind workers are
-	// still catching up, and a discovery outage says nothing about the workers
-	// already running. Owned by ClusterCacheGVRDiscoveryController.
+	// still catching up, and a discovery outage says nothing about workers already
+	// running.
 	ConditionDiscovered ConditionType = "Discovered"
 )
 
 // Condition reason constants — CamelCase machine-readable explanations for a
 // condition's status, Kubernetes-style. Human detail goes in Message.
 const (
-	// reasonInactive: no connection is maintained — the record is orphaned,
+	// ReasonInactive: no connection is maintained — the record is orphaned,
 	// archived, deactivated, or its source has no resolvable credentials.
 	ReasonInactive = "Inactive"
-	// reasonConnecting: a probe is owed but none has succeeded or failed yet
+	// ReasonConnecting: a probe is owed but none has succeeded or failed yet
 	// (a freshly-minted record awaiting its first pass).
 	ReasonConnecting = "Connecting"
-	// reasonConnected: the last connection probe succeeded.
+	// ReasonConnected: the last connection probe succeeded.
 	ReasonConnected = "Connected"
-	// reasonResolveFailed: credentials could not be resolved from the
+	// ReasonResolveFailed: credentials could not be resolved from the
 	// record's source (e.g. the kube-context vanished from the kubeconfig).
 	ReasonResolveFailed = "ResolveFailed"
-	// reasonProbeFailed: credentials resolved but the dial/identity probe
+	// ReasonProbeFailed: credentials resolved but the dial/identity probe
 	// failed.
 	ReasonProbeFailed = "ProbeFailed"
-	// reasonReady: the API server reports its readiness checks passing.
+	// ReasonReady: the API server reports its readiness checks passing.
 	ReasonReady = "Ready"
-	// reasonReadyzFailed: the API server responded but named failing checks.
+	// ReasonReadyzFailed: the API server responded but named failing checks.
 	ReasonReadyzFailed = "ReadyzFailed"
-	// reasonUnreachable: the health probe's transport failed outright.
+	// ReasonUnreachable: the health probe's transport failed outright.
 	ReasonUnreachable = "Unreachable"
-	// reasonNoConnection: health cannot be assessed without a live
+	// ReasonNoConnection: health cannot be assessed without a live
 	// connection this pass.
 	ReasonNoConnection = "NoConnection"
-	// reasonPaused: nothing is syncing — the record is sync-disabled, deactivated,
+	// ReasonPaused: nothing is syncing — the record is sync-disabled, deactivated,
 	// orphaned, or archived.
 	ReasonPaused = "Paused"
-	// reasonSyncing: the sync is starting or catching up. Condition-only — the
+	// ReasonSyncing: the sync is starting or catching up. Condition-only — the
 	// event vocabulary uses SyncStart/ResyncStart instead.
 	ReasonSyncing = "Syncing"
-	// reasonWatching: the watch is established and proven live — caught up and
+	// ReasonWatching: the watch is established and proven live — caught up and
 	// streaming deltas.
 	ReasonWatching = "Watching"
-	// reasonSyncFailed: the worker itself failed (it could not start, or its run loop
+	// ReasonSyncFailed: the worker itself failed (it could not start, or its run loop
 	// exited) and is retrying with backoff.
 	ReasonSyncFailed = "SyncFailed"
-	// reasonDiscovered: the last discovery pass enumerated every group the API
+	// ReasonDiscovered: the last discovery pass enumerated every group the API
 	// server serves, and the per-GVR sync children match it.
 	ReasonDiscovered = "Discovered"
-	// reasonDiscoveryPartial: some groups answered, others didn't — the pass adds
+	// ReasonDiscoveryPartial: some groups answered, others didn't — the pass adds
 	// children without pruning (a group that failed to answer is not shown gone).
 	ReasonDiscoveryPartial = "DiscoveryPartial"
-	// reasonDiscoveryFailed: the discovery request itself failed, so nothing is
+	// ReasonDiscoveryFailed: the discovery request itself failed, so nothing is
 	// known about the served kinds this pass. The existing children are left alone.
 	ReasonDiscoveryFailed = "DiscoveryFailed"
-	// reasonDiscoveryDraining: the kind list is current but a still-served kind has
+	// ReasonDiscoveryDraining: the kind list is current but a still-served kind has
 	// no live child yet — an earlier prune's child is draining and holds its name.
 	ReasonDiscoveryDraining = "DiscoveryDraining"
-	// reasonStale: caught up, but the watch stopped proving itself alive past the
+	// ReasonStale: caught up, but the watch stopped proving itself alive past the
 	// threshold — the cache may be behind (a Synced=False state distinct from
 	// SyncFailed, which is a hard worker failure).
 	ReasonStale = "Stale"
@@ -192,24 +192,24 @@ const (
 	// Synced-condition reasons above): start/complete pairs, cold and warm. A
 	// healthy steady state records no event.
 	//
-	// reasonSyncStart: a cold cache began its first-ever build.
+	// ReasonSyncStart: a cold cache began its first-ever build.
 	ReasonSyncStart = "SyncStart"
-	// reasonSyncComplete: a cold build reached the caught-up milestone.
+	// ReasonSyncComplete: a cold build reached the caught-up milestone.
 	ReasonSyncComplete = "SyncComplete"
-	// reasonResyncStart: an already-populated cache began resuming (poke,
+	// ReasonResyncStart: an already-populated cache began resuming (poke,
 	// reconnect, credential restart) — its message reports the warm cache size.
 	ReasonResyncStart = "ResyncStart"
-	// reasonResyncComplete: a resume re-reached the caught-up milestone; its
+	// ReasonResyncComplete: a resume re-reached the caught-up milestone; its
 	// message disambiguates a real catch-up (counts) from a bare liveness
 	// recovery (no counts).
 	ReasonResyncComplete = "ResyncComplete"
-	// reasonSyncDegraded: the worker failed and is retrying with backoff. The
+	// ReasonSyncDegraded: the worker failed and is retrying with backoff. The
 	// event-log parallel of the SyncFailed condition reason.
 	ReasonSyncDegraded = "SyncDegraded"
-	// reasonSyncStopped: the cache's syncs were stopped because the cluster became
+	// ReasonSyncStopped: the cache's syncs were stopped because the cluster became
 	// sync-ineligible (sync paused/disabled, or the context departed).
 	ReasonSyncStopped = "SyncStopped"
-	// reasonSyncStale: a caught-up watch stopped delivering updates past the
+	// ReasonSyncStale: a caught-up watch stopped delivering updates past the
 	// threshold — the event-log parallel of the Stale condition reason.
 	ReasonSyncStale = "SyncStale"
 )
@@ -222,9 +222,8 @@ type Condition = beehive.Condition
 // LiveCondition is the sole condition constructor. Every condition here describes
 // process-scoped state, so Liveness makes beehive downgrade a previous process's
 // write to Unknown until re-confirmed (docs/adr/2026-08-09-liveness-conditions.md).
-// The message is capped here — the one place every condition is built — because
-// messages come from unbounded sources (raw client-go errors, kilobyte /readyz
-// bodies) and are re-serialized to every watcher per frame.
+// Capping the message here — the one place every condition is built — is what keeps
+// an unbounded source out of a frame re-serialized to every watcher.
 func LiveCondition(t ConditionType, status ConditionStatus, reason, message string) Condition {
 	return Condition{
 		Type: string(t), Status: status, Reason: reason, Message: TruncateMessage(message), Liveness: true,
@@ -295,12 +294,10 @@ type Schedule struct {
 
 // DeltaFrameType classifies one frame on a delta watch, mirroring a Kubernetes watch
 // event. Named for the frame rather than the change because Bookmark is not a change:
-// the values are what a frame can BE, and only three of the four carry an entity. The
-// Added/Modified/Deleted string values are identical to beehive's, so the watch pumps map
-// beehive→domain with a plain conversion; it is a defined type (not an alias of
-// beehive.ChangeType, which aliases into an internal package gqlgen can't import) so the
-// GraphQL DeltaFrameType enum binds straight to it — the external-enum pattern used for
-// EventType/ConditionStatus.
+// the values are what a frame can BE, and only three of the four carry an entity.
+// Added/Modified/Deleted match beehive's strings, so a watch pump converts plainly. A
+// defined type rather than an alias of beehive.ChangeType — that aliases into an
+// internal package gqlgen can't import — so the GraphQL enum binds straight to it.
 type DeltaFrameType string
 
 const (

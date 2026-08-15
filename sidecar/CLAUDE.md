@@ -9,7 +9,7 @@ The data dir (`--data-dir` / `KSTACK_DATA_DIR`) is **required** — `app.New` er
 Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the composition root + routing, GraphQL lives in `graph/`. There is no `server` package.
 
 - `main.go` — parse flags, bind socket, build `*app.App`, serve, drive graceful shutdown (`srv.Shutdown` → `app.DrainWithContext` → `stop(ctx)` → `app.Close`).
-- `internal/app/` — **composition root**: builds `poke.Service`, `cluster.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start(ctx)` returns a drain-func; the stop chain is `clusterSvcStop → cloudSvcStop → pokeSvcStop` — poke's hub closes **last**, after its subscribers drain (the left-to-right arg evaluation in the `errors.Join` enforces it).
+- `internal/app/` — **composition root**: builds `poke.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start(ctx)` returns a drain-func; the stop chain is `clusterSvcStop → cloudSvcStop → pokeSvcStop` — poke's hub closes **last**, after its subscribers drain (the left-to-right arg evaluation in the `errors.Join` enforces it).
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
 - `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `drain`, `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
@@ -20,17 +20,17 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 
 **Shutdown order** (from `main.go`): `app.NotifyShutdown()` (gRPC streams end on their serving context; each SSE request's context is cancelled per-request) → `srv.Shutdown` → `app.DrainWithContext` (waits both sub-servers' WaitGroups — essential for hijacked h2c gRPC streams `srv.Shutdown` can't see) → `stop(ctx)` → `app.Close()` (`grpcServer.Stop()`, `clusterSvc.Close()`). Traps: grpc-go's `GracefulStop` **panics** on the h2c path — `Stop` only runs after the drain; never cancel via `http.Server.BaseContext` — it would tear down the shared h2c connection carrying gRPC mid-stream.
 
-## Cluster subsystem (`internal/cluster`)
+## Cluster subsystem (`internal/clustersvc`)
 
 **Stripped to a shell, pending a rebuild.** The package is three files — `service.go` (the
 `ClusterService` interface, its five family sub-interfaces, the accessors, and a stateless `Service`
 whose every method panics), `stream.go` (`Stream[T]`, which appears in those signatures), and
-`domain/` (the record structs the GraphQL schema binds by name). Nothing else survives: there is no
+`types/` (the record structs the GraphQL schema binds by name). Nothing else survives: there is no
 beehive control plane, no controllers, no kubeconfig watcher, no connection manager, and no on-disk
 cache.
 
 **The point of the shell is that the surfaces above it did not move.** `graph/`, `grpc/`, and
-`internal/app` compile and are wired exactly as before; `cluster.New(dataDir, kubeconfigPath,
+`internal/app` compile and are wired exactly as before; `clustersvc.New(dataDir, kubeconfigPath,
 pokeSvc)`, `Start`, and `Close` keep their signatures so reconnecting a real implementation is not a
 change to the composition root. `New` returns an empty `Service`, `Start` returns a no-op stop func,
 and every API call panics. **The sidecar therefore serves no cluster data at all** — the app starts,
@@ -52,16 +52,16 @@ cue to read `Err`. `NewStream` is exported so a fake implementing these interfac
 rule is the source, not the shape: anything reading a fallible upstream returns a `Stream`, gauges
 included; a watch that cannot fail terminally may stay a plain channel.
 
-### Domain types
+### Types
 
-`domain` is a leaf and the one part of the subsystem that is fully intact — the four kinds' spec/
+`types` is a leaf and the one part of the subsystem that is fully intact — the four kinds' spec/
 status/record structs, identity, conditions, change types, and the cached-data records, split one
 file per noun to match the schema's sections. **The schema binds these by name, which is why they
 survive a teardown that removed everything that produced them.** Placement rule when adding
-something: types the schema binds and the identity/condition vocabulary go to `domain`; within it, a
+something: types the schema binds and the identity/condition vocabulary go to `types`; within it, a
 type follows the schema section it binds to, and anything kind-agnostic goes to `shared.go`.
 Unexported helpers live with their only consumer (a callee follows its caller — `LiveCondition` needs
-`TruncateMessage`, so both are in `domain/shared.go`).
+`TruncateMessage`, so both are in `types/shared.go`).
 
 - `ClusterID` **is** the beehive ObjectID — opaque, source-agnostic, stable for the record's life;
   never the remote UID or the context name. One shared GraphQL `ObjectID` scalar (decimal string)
@@ -71,28 +71,28 @@ Unexported helpers live with their only consumer (a callee follows its caller �
   The spec carries **no trigger/counter fields** — retries and resyncs ride out-of-band buses.
 - `ClusterCache.Spec.ServerUID` names the physical identity a cache mirrors. **Active-ness is
   deliberately not a field** — it is the live join against the cluster's `status.server.uid`
-  (`domain.CacheIsActive`). → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md).
-- Every condition is a **liveness** condition (`domain.LiveCondition` is the only constructor);
+  (`types.CacheIsActive`). → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md).
+- Every condition is a **liveness** condition (`types.LiveCondition` is the only constructor);
   beehive serves a previous process's write as `Unknown`+`Unconfirmed` until re-confirmed.
   **`Unconfirmed` is load-bearing on the wire**: the surviving reason/stamps describe *last-known*
   state, and a consumer must not render a pre-restart reason as current.
   → [ADR: liveness conditions](../docs/adr/2026-08-09-liveness-conditions.md).
-- `domain.Condition` aliases `beehive.Condition`, so `domain` still depends on beehive even though
+- `types.Condition` aliases `beehive.Condition`, so `types` still depends on beehive even though
   nothing here runs it. That is the seam a rebuild on a different control plane would cut.
 
 ### GraphQL surface (cluster)
 
-The schema **is** the domain shape — every GraphQL type binds 1:1 by name to its `internal/cluster/domain` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.Data().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers — but **every field reaches the stubbed boundary and panics**, so this section is the contract the rebuild must satisfy, not a description of what answers today. Key entry points:
+The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc/types` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.Data().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers — but **every field reaches the stubbed boundary and panics**, so this section is the contract the rebuild must satisfy, not a description of what answers today. Key entry points:
 
 - Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCacheGVRDiscoveriesWatch` (unscoped, one per cache), `clusterCacheGVRSyncsWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheSyncHealthWatch` (the fold — a latest-value gauge, **not** a delta watch, so no `Bookmark` rides it).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).
 - Cache-data watches (all keyed by cluster id + cache id; frames carry `cacheID` provenance — objects additionally `apiVersion`/`resource` — so the client rejects stale frames after a swap): `clusterDataKindsWatch` (kind catalog + counts; subscribes to **both** brokers via `catalogSubscribe`, since Event counts come from event triggers), `clusterDataEventsWatch` (newest window, `Deleted` when aging out), `clusterDataObjectsWatch` (per-kind rows incl. `rawJSON`; resource-keyed broker subscription). Unopened cache → the `Bookmark` alone.
 - Point reads hang off the record that owns them, resolved on selection: every event timeline is an `events(category, limit)` field (`Cluster.events`, `ClusterCache.events`, `ClusterCacheGVRSync.events`), the discovered kind catalog is `ClusterCache.kinds` (no arguments — both ids it reads with come off the record), and `Cluster.caches` / `ClusterCache.syncs` walk the owner chain down (`Caches().List`, `Syncs().List`). So there are no root `cluster*Events` or `clusterDataKinds` fields. The lookups `clusterCache(id)` and `clusterCacheGVRSync(id)` (over `Caches().Get`/`Syncs().Get`) address a record by **its own** id, which a caller holding one from a watch frame uses directly.
 - **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCacheGVRSync`/`clusterCacheGVRSyncs(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.syncs`). One boundary method backs both — `Caches().List`/`Syncs().List` take a nilable scope, nil meaning fleet-wide. Keep that shape when adding a noun.
-- **The query path skips `ClusterCacheGVRDiscovery`.** `ClusterCache.syncs` is keyed by the cache and resolves the anchor itself (`Syncs().List`, like `Syncs().Watch`): exactly one anchor exists per cache and its name is derived from the cache id (`domain.ClusterCacheGVRDiscoveryName`), so it is an implementation detail, not a branch to navigate. The anchor's own state still streams on `clusterCacheGVRDiscoveriesWatch`.
-- **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`domain.CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
+- **The query path skips `ClusterCacheGVRDiscovery`.** `ClusterCache.syncs` is keyed by the cache and resolves the anchor itself (`Syncs().List`, like `Syncs().Watch`): exactly one anchor exists per cache and its name is derived from the cache id (`types.ClusterCacheGVRDiscoveryName`), so it is an implementation detail, not a branch to navigate. The anchor's own state still streams on `clusterCacheGVRDiscoveriesWatch`.
+- **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`types.CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
 - Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (delete files then **bounce that cache's workers** — nothing else would rebuild them; they cold-sync, the cookie died with the file), `clusterDelete` (GC cascades; a still-present context is re-imported under a fresh id).
-- `ClusterDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the domain keeps value `time.Time` for comparability.
+- `ClusterDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the record keeps value `time.Time` for comparability.
 - **A watch that dies reports why** (`graph/watch_failure.go`). gqlgen builds each subscription frame as data alone and stops the instant the resolver's channel closes, so a failed watch is otherwise byte-identical to a graceful end and the webview reconnects forever with nothing shown. `WatchFailureExtension` bridges that in two halves — the resolver and the frame that would carry the reason never share a response context: `InterceptOperation` hangs a slot on the operation ctx (gqlgen threads it into the resolvers *and* every later frame), `watchStream` files `Stream.Err()` into it as the frames run out, and `InterceptResponse` claims it once the stream is spent, emitting one errors-only `graphql.Response` before the transport completes. Claimed once, so the next poll ends the subscription instead of looping. The reason goes through `AddError`, so the server's error presenter logs it. The client treats that frame as a drop with a reason — reported, last-known data held, reconnect — see the root `CLAUDE.md`. → [ADR: watch-failure reporting](../docs/adr/2026-08-14-watch-failure-reporting.md).
 
 Frontend join: `src/lib/clusters.tsx` (`ClustersProvider`/`useClusters`) reduces the three unscoped streams and joins `activeCache` + `syncHealth` client-side; `cluster-sync-panel.tsx` renders it (per-row detail streams subscribe only while a row is expanded; the sync column reads the rollup's reason, never the cache's coarse `Synced`).
@@ -134,7 +134,7 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
 
 - **Resolver deps are always non-nil** — the composition root wires every field; tests use fakes.
 - **Pub/sub**: two modules, split on whether delivery is **keyed**. Unkeyed → `github.com/amorey/gochan`: `watch` for latest-value current-state streams (current snapshot on subscribe: auth `State`), `broadcast` for fan-out where subscribers supply their own snapshot (poke). Keyed → `github.com/amorey/gobus`: `watch` for a keyed latest-value bus. Note the two `watch` packages differ on registration — gochan's hub holds a seed and delivers it, gobus's takes the caller's already-read value as a baseline and never delivers it back. Never hand-roll a subscriber map.
-- **Subscription resolvers** return a channel emitting the current snapshot first, then deltas (`mapStream` in `graph/util.go`). Honor `ctx.Done()`. A resolver over a `*cluster.Stream` goes through **`watchStream`** (`graph/watch_failure.go`), never `ptrStream` — see below.
+- **Subscription resolvers** return a channel emitting the current snapshot first, then deltas (`mapStream` in `graph/util.go`). Honor `ctx.Done()`. A resolver over a `*clustersvc.Stream` goes through **`watchStream`** (`graph/watch_failure.go`), never `ptrStream` — see below.
 - **Unexported functional options** for test seams (`auth`/`cloud`/`prefsync`/`poke`): exported `New` takes production knobs only; `newWithOptions(cfg, opts...)` is reachable only from white-box tests.
 
 ## Tests & checks

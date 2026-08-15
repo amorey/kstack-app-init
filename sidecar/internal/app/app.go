@@ -18,7 +18,7 @@ import (
 	grpcserver "github.com/kubetail-org/kstack-app/sidecar/grpc"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
@@ -58,7 +58,7 @@ type App struct {
 	handler       http.Handler
 	graphqlServer *graph.Server
 	grpcServer    *grpcserver.Server
-	clusterSvc    *cluster.Service
+	clusterSvc    *clustersvc.Service
 	authSvc       auth.Service
 	cloudSvc      *cloud.Service
 	pokeSvc       *poke.Service
@@ -77,7 +77,7 @@ func New(cfg Config) (*App, error) {
 
 	// The cluster backend behind one boundary. Stripped to a shell pending its
 	// rebuild — the wiring stands, every call panics.
-	clusterSvc, err := cluster.New(cfg.DataDir, cfg.KubeconfigPath, pokeSvc)
+	clusterSvc, err := clustersvc.New(cfg.DataDir, cfg.KubeconfigPath, pokeSvc)
 	if err != nil {
 		return nil, err
 	}

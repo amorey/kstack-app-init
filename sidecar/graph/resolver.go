@@ -6,7 +6,7 @@ package graph
 
 import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
 )
 
 // Resolver carries every operation's dependencies. Each field MUST be non-nil — the
@@ -14,9 +14,9 @@ import (
 // degraded behavior lives inside the services.
 type Resolver struct {
 	// ClusterSvc is the boundary to the cluster backend, hiding beehive behind the
-	// domain types. (Named ClusterSvc to avoid shadowing the generated
+	// cluster types. (Named ClusterSvc to avoid shadowing the generated
 	// queryResolver.Clusters method.)
-	ClusterSvc cluster.ClusterService
+	ClusterSvc clustersvc.ClusterService
 	// Auth backs the authState query/watch and the login/logout mutations; it degrades
 	// internally when no cloud account is configured.
 	Auth auth.Service

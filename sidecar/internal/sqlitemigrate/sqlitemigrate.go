@@ -4,7 +4,7 @@
 // Deliberately minimal — no down-migrations (a shipped binary never rolls back a fleet),
 // no dependencies. Each migration runs in its own transaction, so a crash mid-upgrade
 // leaves the DB at the last committed version. A DB written by a newer binary is refused
-// rather than truncated. Used by internal/cluster's caches and internal/appdb.
+// rather than truncated. Used by internal/appdb.
 package sqlitemigrate
 
 import (

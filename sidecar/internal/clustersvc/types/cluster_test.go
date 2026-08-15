@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package domain
+package types
 
 import (
 	"testing"
@@ -39,7 +39,7 @@ func TestClusterActiveUID(t *testing.T) {
 }
 
 // The single definition of "active cache", read by both the cache controller's sync
-// gate and the service's domain join. The unprobed case is the one that matters: an
+// gate and the service's join. The unprobed case is the one that matters: an
 // unknown identity must match nothing, or a disconnected cluster would sync every
 // cache it has ever owned.
 func TestCacheIsActive(t *testing.T) {

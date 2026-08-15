@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package domain is the cluster subsystem's shared vocabulary: the four beehive
+// Package types is the cluster subsystem's shared vocabulary: the four beehive
 // kinds with their spec/status shapes, identity (ObjectID), conditions, the
 // delta-watch change types, and the records mirrored into a per-cluster cache.
 // Every type the GraphQL schema binds lives here.
 //
-// It is a leaf: the ClusterService boundary and the controllers beneath it both
-// depend on it, and it depends on neither.
+// It is a leaf, and must stay one: the ClusterService boundary and everything
+// beneath it depend on it, and it depends on neither. Anything that would make it
+// import a sibling belongs in that sibling instead.
 //
 // The four beehive kinds and their ownership chain:
 //
@@ -30,14 +31,12 @@
 //	    ↓ owns
 //	ClusterCacheGVRSync       (one per served kind)
 //
-// Cluster objects are created directly by the kubeconfig importer (one per
-// kube-context); there is no separate intake kind. Each source owns a disjoint name
-// namespace within the one Cluster kind, so the importer reconciles by name
-// (beehive's per-kind name-uniqueness rules out duplicates), and the on-disk cache is
-// keyed separately by beehive ObjectIDs so the name's arbitrary text never reaches
-// the filesystem.
+// A name is a per-kind reconcile key, never an identity. There is one Cluster kind
+// and each source owns a disjoint name namespace inside it, so a source reconciles by
+// name under beehive's name-uniqueness; the on-disk cache is keyed by ObjectID
+// instead, so a name's arbitrary text never reaches the filesystem.
 //
 // Cluster carries connection status (Connected, Healthy conditions + server/principal
 // facts); its ClusterCache child carries sync status, folded per kind from the
 // ClusterCacheGVRSync records below it.
-package domain
+package types

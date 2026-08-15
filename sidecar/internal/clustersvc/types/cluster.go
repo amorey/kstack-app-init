@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The Cluster kind: a tracked kube-context. Its beehive spec/status shapes, the domain
+// The Cluster kind: a tracked kube-context. Its beehive spec/status shapes, the
 // record served to resolvers, and its delta-watch change. Mirrors the Cluster section
 // of graph/schema.graphqls.
-package domain
+package types
 
 import (
 	"time"
@@ -38,9 +38,9 @@ func KubeconfigName(contextName string) string {
 	return namePrefixKubeconfig + contextName
 }
 
-// ClusterStatusSourceKubeconfig is the kubeconfig-sourced record's last-known kubeconfig
-// observation: the cluster/user entry names and presence. Cached from the
-// last time the context was present so it survives orphaning.
+// ClusterStatusSourceKubeconfig is the kubeconfig-sourced record's last-known
+// kubeconfig observation: the cluster/user entry names and presence. Cached from the
+// last time the context was present, so it survives orphaning.
 type ClusterStatusSourceKubeconfig struct {
 	Cluster   string `json:"cluster"`
 	User      string `json:"user"`
@@ -77,22 +77,20 @@ type ClusterPrincipal struct {
 	Username *string `json:"username,omitempty"`
 }
 
-// ClusterSpec is a cluster record's desired state (user/API-owned; declarative
-// field names). No spec-level trigger counters — retries and resync pokes ride
-// out-of-band buses, never spec writes.
+// ClusterSpec is a cluster record's desired state (user/API-owned). No trigger
+// counters — retries and resync pokes ride out-of-band buses, never spec writes.
 type ClusterSpec struct {
 	Name        *string `json:"name,omitempty"`
 	Enabled     bool    `json:"enabled"`
 	SyncEnabled bool    `json:"syncEnabled"`
-	// Source is the reference (where this record comes from, how credentials
-	// resolve). The matching observation lives on ClusterStatus.Source, written
-	// live by the core controller each reconcile.
+	// Source says where this record comes from and how credentials resolve; the
+	// matching observation lives on ClusterStatus.Source, rewritten each reconcile.
 	Source ClusterSpecSource `json:"source"`
 }
 
-// ClusterStatus is both the stored status and the domain status served to
-// GraphQL: connection/health observations written by the core controller. Sync
-// status lives on the ClusterCache child; no merge type.
+// ClusterStatus is both the stored status and the one served to GraphQL:
+// connection/health observations. Sync status lives on the ClusterCache child, so
+// there is no merge type.
 type ClusterStatus struct {
 	Source          ClusterStatusSource `json:"source"`
 	Server          ClusterServer       `json:"server"`
@@ -109,19 +107,19 @@ func ClusterActiveUID(obj *beehive.Object[ClusterSpec, ClusterStatus]) string {
 	return ""
 }
 
-// CacheIsActive reports whether a cache mirrors its parent's currently-active identity; one
-// for an unknown identity never is. The single definition of "active cache", shared by the
-// cache controller's sync gating and the service's domain join.
+// CacheIsActive reports whether a cache mirrors its parent's currently-active
+// identity; one for an unknown identity never is. The single definition of "active
+// cache" — sync gating and the read-side join must not disagree.
 func CacheIsActive(clusterObj *beehive.Object[ClusterSpec, ClusterStatus], cacheUID string) bool {
 	active := ClusterActiveUID(clusterObj)
 	return active != "" && cacheUID == active
 }
 
-// Cluster is the domain record for one tracked cluster connection (one kube-context).
-// Built from a single Cluster beehive object; Status binds directly to the stored
-// Cluster-kind status. Owned ClusterCache records are not joined in here — they stream
-// standalone via Caches().Watch and are joined client-side, so cache churn never re-emits
-// a cluster.
+// Cluster is the record for one tracked cluster connection (one kube-context), built
+// from a single Cluster beehive object. Owned ClusterCache records are not joined in
+// here — they stream standalone via Caches().Watch, so cache churn never re-emits a
+// cluster. Nor is the next-reconcile time: a scheduling change fires no WatchList, so
+// it is a gauge on Clusters().WatchSchedule instead.
 type Cluster struct {
 	ID                  ClusterID
 	Generation          int64
@@ -130,13 +128,9 @@ type Cluster struct {
 
 	Spec   ClusterSpec
 	Status ClusterStatus
-	// Conditions are beehive object conditions, not part of Status — read off the
-	// object rather than out of the status blob.
+	// Conditions are beehive object rows, not part of Status — read off the object
+	// rather than out of the status blob.
 	Conditions []Condition
-	// The cluster's next-reconcile time is not a field here — it is a gauge served
-	// live via Clusters().WatchSchedule (a scheduling change fires no object WatchList,
-	// so it can't ride this record's watch), and its probe history via the events
-	// surface.
 }
 
 // ClusterWatchFrame is one frame on the cluster list watch: what happened (Type) to

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package domain
+package types
 
 import (
 	"encoding/json"
@@ -20,10 +20,10 @@ import (
 	"io"
 )
 
-// RawJSON binds the GraphQL `JSON` scalar: already-serialized JSON in a string, written
-// verbatim by MarshalGQL. A string (not a map) so it stays comparable — cacheDeltaWatch's
-// `T comparable` diff is what makes an in-place object edit surface as Modified. Empty
-// value = absent body → null.
+// RawJSON binds the GraphQL `JSON` scalar: already-serialized JSON in a string,
+// written verbatim by MarshalGQL. A string (not a map) so the enclosing record stays
+// comparable — the delta watches diff frames with ==, which is what makes an in-place
+// object edit surface as Modified. Empty value = absent body → null.
 type RawJSON string
 
 // MarshalGQL writes the stored JSON bytes verbatim, or `null` for the absent body.

@@ -6,7 +6,7 @@ import (
 
 	"github.com/99designs/gqlgen/graphql"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/cluster"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
 )
 
 // watchFailure is one operation's terminal-reason slot.
@@ -19,7 +19,7 @@ type watchFailureKey struct{}
 // src/lib/graphql/subscribe-exchange.ts.
 const watchFailedExtension = "watchFailed"
 
-// watchStream is ptrStream over a cluster.Stream: the same pointer mapping, plus the
+// watchStream is ptrStream over a clustersvc.Stream: the same pointer mapping, plus the
 // source's terminal reason filed where InterceptResponse will find it. Every resolver
 // over a failable watch must go through here — a bare ptrStream would drop the reason
 // and the failure would reach the client as a graceful end.
@@ -27,7 +27,7 @@ const watchFailedExtension = "watchFailed"
 // The reason is filed from mapStream's teardown hook, which runs before the returned
 // channel closes; that ordering is the contract, since it is the close that sends
 // gqlgen looking for it.
-func watchStream[T any](ctx context.Context, s *cluster.Stream[T]) <-chan *T {
+func watchStream[T any](ctx context.Context, s *clustersvc.Stream[T]) <-chan *T {
 	return mapStream(ctx, s.Frames, func() { recordWatchFailure(ctx, s.Err()) }, func(v T) *T { return &v })
 }
 

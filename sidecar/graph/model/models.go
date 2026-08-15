@@ -16,6 +16,6 @@
 //
 // This hand-written file exists ONLY to keep the package non-empty: gqlgen rewrites
 // models_gen.go on every run, and a package with no Go files can't be loaded for
-// autobinding. Types bind directly to the domain types (see gqlgen.yml), so there are no
+// autobinding. Types bind directly to the cluster types (see gqlgen.yml), so there are no
 // hand-written models.
 package model
