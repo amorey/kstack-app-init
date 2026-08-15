@@ -13,11 +13,12 @@
 // limitations under the License.
 
 // The Cluster kind: a tracked kube-context. Its beehive spec/status shapes, the
-// record served to resolvers, and its delta-watch change. Mirrors the Cluster section
-// of graph/schema.graphqls.
-package types
+// record served to resolvers, its delta-watch frame, the Clusters implementation,
+// and its controller. Mirrors the Cluster section of graph/schema.graphqls.
+package clustersvc
 
 import (
+	"context"
 	"time"
 
 	"github.com/amorey/beehive"
@@ -140,4 +141,49 @@ type Cluster struct {
 type ClusterWatchFrame struct {
 	Type    DeltaFrameType
 	Cluster *Cluster
+}
+
+func (a clustersAPI) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
+	panic("not implemented")
+}
+
+func (a clustersAPI) List(ctx context.Context) ([]*Cluster, error) {
+	panic("not implemented")
+}
+
+func (a clustersAPI) Watch(ctx context.Context, id ClusterID) (*Stream[ClusterWatchFrame], error) {
+	panic("not implemented")
+}
+
+func (a clustersAPI) WatchList(ctx context.Context) (*Stream[ClusterWatchFrame], error) {
+	panic("not implemented")
+}
+
+func (a clustersAPI) WatchSchedule(ctx context.Context, id ClusterID) (<-chan Schedule, error) {
+	panic("not implemented")
+}
+
+func (a clustersAPI) SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error) {
+	panic("not implemented")
+}
+
+func (a clustersAPI) SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error) {
+	panic("not implemented")
+}
+
+func (a clustersAPI) Delete(ctx context.Context, id ClusterID) error {
+	panic("not implemented")
+}
+
+// clusterController reconciles a tracked cluster: resolve its credentials, probe the
+// API server, and own the ClusterCache for the identity it finds. A placeholder that
+// reconciles to a no-op.
+type clusterController struct{}
+
+func (c *clusterController) Reconcile(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterStatus],
+	obj *beehive.Object[ClusterSpec, ClusterStatus],
+) (beehive.Result, error) {
+	return beehive.Result{}, nil
 }

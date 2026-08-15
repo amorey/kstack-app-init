@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -77,7 +77,7 @@ func TestClusterCachedDataEventTimestampResolversMapZeroToNil(t *testing.T) {
 	ts := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
 
 	// A real timestamp resolves to a non-nil pointer to that time.
-	present := &types.ClusterCachedDataEvent{FirstSeen: ts, LastSeen: ts}
+	present := &clustersvc.ClusterCachedDataEvent{FirstSeen: ts, LastSeen: ts}
 	first, err := r.FirstSeen(ctx, present)
 	if err != nil || first == nil || !first.Equal(ts) {
 		t.Fatalf("FirstSeen(present) = %v, %v; want %v", first, err, ts)
@@ -88,7 +88,7 @@ func TestClusterCachedDataEventTimestampResolversMapZeroToNil(t *testing.T) {
 	}
 
 	// The zero time (no source timestamp) resolves to nil → null on the wire.
-	absent := &types.ClusterCachedDataEvent{}
+	absent := &clustersvc.ClusterCachedDataEvent{}
 	if got, err := r.FirstSeen(ctx, absent); err != nil || got != nil {
 		t.Fatalf("FirstSeen(absent) = %v, %v; want nil", got, err)
 	}

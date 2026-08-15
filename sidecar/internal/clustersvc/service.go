@@ -13,21 +13,61 @@
 // limitations under the License.
 
 // Package clustersvc is the sidecar's Kubernetes boundary: Service and its five
-// record families (Clusters, Caches, CachedCatalogs, CachedResources, Data).
+// record families (Clusters, Caches, CachedCatalogs, CachedResources, CachedData).
 //
-// Stripped to a shell pending a rebuild: these interfaces and the types they carry
-// are the whole package, and every method but the lifecycle pair panics. They hold
-// the GraphQL and gRPC surfaces steady meanwhile. Rebuilding a family means
-// implementing it in its own file (clusters.go, caches.go, …) and deleting its stub
-// below.
+// This file specifies the whole API — Service and the five family interfaces — and
+// bootstraps beehive. One file per family implements it and holds everything else
+// about that kind: its beehive shapes, the record served to GraphQL, its delta-watch
+// frame, and the controller that writes it. shared.go holds the vocabulary every
+// family reuses. Every beehive detail lives behind the Service interface.
+//
+// Layering: a controller holds policy only, and the mechanisms it drives are leaves
+// under internal/ — private to this package by compiler rule. The leaves speak native
+// vocabulary (GVRs, a rest.Config, cache rows) and never the records above; the
+// controllers translate. A leaf that reaches for one of these types gets an import
+// cycle, which is the enforcement. Mechanism growing in a controller instead is the
+// signal to extract another leaf: this package's tests stay fast only while the
+// controllers do no I/O of their own.
+//
+// The four beehive kinds and their ownership chain:
+//
+//	Cluster                 (name: "{source}/{naturalKey}", e.g. "kubeconfig/{context}")
+//	    ↓ owns
+//	ClusterCache            (name: "{ClusterID}/{serverUID}")
+//	    ↓ owns
+//	ClusterCachedCatalog    (name: "cachedcatalog/{CacheID}" — one per cache)
+//	    ↓ owns
+//	ClusterCachedResource   (name: "cachedresource/{CatalogID}/{apiVersion}/{resource}")
+//
+// A name is a per-kind reconcile key, never an identity. There is one Cluster kind
+// and each source owns a disjoint name namespace inside it, so a source reconciles by
+// name under beehive's name-uniqueness; the on-disk cache is keyed by ObjectID
+// instead, so a name's arbitrary text never reaches the filesystem.
+//
+// A kind's GroupKind.Kind string is its Go type name, and both the Kind and the name
+// prefixes above are persisted. Renaming one is a store migration the moment anything
+// writes.
+//
+// Cluster carries connection status (Connected, Healthy conditions + server/principal
+// facts); its ClusterCache child carries sync status, folded per kind from the
+// ClusterCachedResource records below it.
+//
+// The read side is a shell pending a rebuild: every family method panics, and the
+// controllers reconcile to a no-op. The interfaces and the types they carry hold the
+// GraphQL and gRPC surfaces steady meanwhile.
 package clustersvc
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 
+	"github.com/amorey/beehive"
+	beehivesqlite "github.com/amorey/beehive/sqlite"
 	"k8s.io/client-go/rest"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
@@ -56,10 +96,10 @@ type Service interface {
 	CachedData() CachedData
 
 	// GetConnection returns the live REST config for id, or nil when not connected.
-	GetConnection(id types.ClusterID) *rest.Config
+	GetConnection(id ClusterID) *rest.Config
 	// RetryConnection forces an out-of-band re-probe. The outcome lands on the
 	// record's conditions and reaches watchers through Clusters().Watch, not here.
-	RetryConnection(ctx context.Context, id types.ClusterID) error
+	RetryConnection(ctx context.Context, id ClusterID) error
 
 	// The event timeline of any record that has one — Cluster, ClusterCache,
 	// ClusterCachedResource today. Top-level, not per family: an event carries no kind
@@ -70,38 +110,44 @@ type Service interface {
 	// bounded by limit. WatchEvents streams the same log — snapshot, one Bookmark,
 	// then growth. Distinct from CachedData().WatchEvents, which streams the *cluster's*
 	// cached Kubernetes Events rather than kstack's own log.
-	ListEvents(ctx context.Context, id types.ObjectID, category *string, limit *int) ([]types.Event, error)
-	WatchEvents(ctx context.Context, id types.ObjectID, category *string) (*Stream[types.EventWatchFrame], error)
+	ListEvents(ctx context.Context, id ObjectID, category *string, limit *int) ([]Event, error)
+	WatchEvents(ctx context.Context, id ObjectID, category *string) (*Stream[EventWatchFrame], error)
 }
+
+// The five families are specified together, apart from the kinds implementing them,
+// because their rules are rules ACROSS the set: VerbNoun with the noun elided when it
+// equals the family's subject, one method per scope rather than a scope argument, and
+// By* naming the scope the caller passes. A violation is visible when the five read
+// side by side and invisible when they don't.
 
 // Clusters is the Cluster record surface: the tracked clusters, their spec
 // toggles, and the per-cluster streams that deliberately do not ride the record
 // watch.
 type Clusters interface {
 	// Get returns one cluster by id, or (nil, nil) when unknown or deletion-pending.
-	Get(ctx context.Context, id types.ClusterID) (*types.Cluster, error)
+	Get(ctx context.Context, id ClusterID) (*Cluster, error)
 	// List returns every tracked, non-deletion-pending cluster. Cache sync status is
 	// the caller's join from Caches().WatchList.
-	List(ctx context.Context) ([]*types.Cluster, error)
+	List(ctx context.Context) ([]*Cluster, error)
 
 	// Watch streams one cluster as a delta watch. Bookmark-only while the id names
 	// no tracked cluster — one dropped from the kubeconfig and re-added streams
 	// Deleted then Added on the same subscription.
-	Watch(ctx context.Context, id types.ClusterID) (*Stream[types.ClusterWatchFrame], error)
+	Watch(ctx context.Context, id ClusterID) (*Stream[ClusterWatchFrame], error)
 	// WatchList streams every cluster as a delta watch; deletion-pending surfaces
 	// as Deleted.
-	WatchList(ctx context.Context) (*Stream[types.ClusterWatchFrame], error)
+	WatchList(ctx context.Context) (*Stream[ClusterWatchFrame], error)
 
 	// WatchSchedule streams a cluster's next-requeue gauge. A stream because a
 	// scheduling change fires no object WatchList, so it cannot ride Watch.
-	WatchSchedule(ctx context.Context, id types.ClusterID) (<-chan types.Schedule, error)
+	WatchSchedule(ctx context.Context, id ClusterID) (<-chan Schedule, error)
 	// SetEnabled enables or disables a cluster and returns the updated record.
-	SetEnabled(ctx context.Context, id types.ClusterID, enabled bool) (*types.Cluster, error)
+	SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)
 	// SetSyncEnabled toggles a cluster's sync and returns the updated record.
-	SetSyncEnabled(ctx context.Context, id types.ClusterID, enabled bool) (*types.Cluster, error)
+	SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)
 
 	// Delete deletes the Cluster object; beehive GC cascades to ClusterCache.
-	Delete(ctx context.Context, id types.ClusterID) error
+	Delete(ctx context.Context, id ClusterID) error
 }
 
 // Caches is the ClusterCache record surface. A cluster owns zero or one cache at
@@ -109,64 +155,64 @@ type Clusters interface {
 // per-cache read names the exact cache it means, never "the" cache of a cluster.
 type Caches interface {
 	// Get returns one cache by id, or (nil, nil) when unknown or deletion-pending.
-	Get(ctx context.Context, id types.ClusterCacheID) (*types.ClusterCache, error)
+	Get(ctx context.Context, id ClusterCacheID) (*ClusterCache, error)
 	// List returns every cache in creation order, non-deletion-pending. Which one is
-	// active is the caller's live join (types.CacheIsActive), not a property here.
-	List(ctx context.Context) ([]*types.ClusterCache, error)
+	// active is the caller's live join (CacheIsActive), not a property here.
+	List(ctx context.Context) ([]*ClusterCache, error)
 
 	// Watch streams one cache as a delta watch. Bookmark-only until the cluster has
 	// been probed and its cache created, so a caller may open this on a cache a
 	// migration has not produced yet.
-	Watch(ctx context.Context, id types.ClusterCacheID) (*Stream[types.ClusterCacheWatchFrame], error)
+	Watch(ctx context.Context, id ClusterCacheID) (*Stream[ClusterCacheWatchFrame], error)
 	// WatchList streams every cache as a delta watch parallel to
 	// Clusters().WatchList; the caller joins caches onto clusters by ClusterID.
-	WatchList(ctx context.Context) (*Stream[types.ClusterCacheWatchFrame], error)
+	WatchList(ctx context.Context) (*Stream[ClusterCacheWatchFrame], error)
 
 	// ListByCluster returns one cluster's caches, in the same order.
-	ListByCluster(ctx context.Context, clusterID types.ClusterID) ([]*types.ClusterCache, error)
+	ListByCluster(ctx context.Context, clusterID ClusterID) ([]*ClusterCache, error)
 	// WatchByCluster streams one cluster's caches as a delta watch — what a view
 	// scoped to a single cluster opens instead of filtering WatchList.
-	WatchByCluster(ctx context.Context, clusterID types.ClusterID) (*Stream[types.ClusterCacheWatchFrame], error)
+	WatchByCluster(ctx context.Context, clusterID ClusterID) (*Stream[ClusterCacheWatchFrame], error)
 
 	// WatchStats streams one cache's contents as a live gauge. A stream, not a
 	// ClusterCache field: a settled cache's object never changes, so a field would
 	// freeze at subscribe time.
-	WatchStats(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID) (<-chan types.ClusterCacheStats, error)
+	WatchStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCacheStats, error)
 	// WatchHealth streams every cache's sync verdict, folded from its per-kind
 	// records. Unscoped where the rest of this family is per-cache: one fold serves
 	// the fleet. A gauge, but a failable one — the fold reads watches of its own.
-	WatchHealth(ctx context.Context) (*Stream[types.ClusterCacheHealth], error)
+	WatchHealth(ctx context.Context) (*Stream[ClusterCacheHealth], error)
 
 	// Clear deletes the on-disk cache and bounces its syncs; the record stays.
-	Clear(ctx context.Context, id types.ClusterID) (*types.Cluster, error)
+	Clear(ctx context.Context, id ClusterID) (*Cluster, error)
 }
 
 // CachedCatalogs is the ClusterCachedCatalog surface: one catalog per cache,
 // listing the kinds that cache's cluster serves and owning a CachedResource per kind.
 type CachedCatalogs interface {
 	// Get returns one catalog by id, or (nil, nil) when unknown or deletion-pending.
-	Get(ctx context.Context, id types.ClusterCachedCatalogID) (*types.ClusterCachedCatalog, error)
+	Get(ctx context.Context, id ClusterCachedCatalogID) (*ClusterCachedCatalog, error)
 	// List returns every catalog in creation order, non-deletion-pending. A cache
 	// gets its catalog only once discovery lands, so an empty result is a wait, not
 	// an error.
-	List(ctx context.Context) ([]*types.ClusterCachedCatalog, error)
+	List(ctx context.Context) ([]*ClusterCachedCatalog, error)
 
 	// Watch streams one catalog as a delta watch. Bookmark-only until the cache's
 	// first discovery pass lands, which is the wait List describes.
-	Watch(ctx context.Context, id types.ClusterCachedCatalogID) (*Stream[types.ClusterCachedCatalogWatchFrame], error)
+	Watch(ctx context.Context, id ClusterCachedCatalogID) (*Stream[ClusterCachedCatalogWatchFrame], error)
 	// WatchList streams every cache's catalog, joined onto caches by CacheID.
-	WatchList(ctx context.Context) (*Stream[types.ClusterCachedCatalogWatchFrame], error)
+	WatchList(ctx context.Context) (*Stream[ClusterCachedCatalogWatchFrame], error)
 
 	// ListByCache returns one cache's catalog — at most one record, as a slice so it
 	// reads like its siblings.
-	ListByCache(ctx context.Context, cacheID types.ClusterCacheID) ([]*types.ClusterCachedCatalog, error)
+	ListByCache(ctx context.Context, cacheID ClusterCacheID) ([]*ClusterCachedCatalog, error)
 	// WatchByCache streams one cache's catalog as a delta watch — what a view scoped
 	// to a single cache opens instead of filtering WatchList.
-	WatchByCache(ctx context.Context, cacheID types.ClusterCacheID) (*Stream[types.ClusterCachedCatalogWatchFrame], error)
+	WatchByCache(ctx context.Context, cacheID ClusterCacheID) (*Stream[ClusterCachedCatalogWatchFrame], error)
 }
 
 // CachedResources is the ClusterCachedResource surface — one record per kind a
-// cache mirrors. Distinct from Data, which serves the mirrored content itself;
+// cache mirrors. Distinct from CachedData, which serves the mirrored content itself;
 // these are the control-plane records describing what is mirrored.
 //
 // This family is the fleet's largest by an order of magnitude: a record per served
@@ -174,29 +220,29 @@ type CachedCatalogs interface {
 type CachedResources interface {
 	// Get returns one record by id, or (nil, nil) when unknown or
 	// deletion-pending.
-	Get(ctx context.Context, id types.ClusterCachedResourceID) (*types.ClusterCachedResource, error)
+	Get(ctx context.Context, id ClusterCachedResourceID) (*ClusterCachedResource, error)
 	// List returns every per-kind sync record in creation order.
-	List(ctx context.Context) ([]*types.ClusterCachedResource, error)
+	List(ctx context.Context) ([]*ClusterCachedResource, error)
 
 	// Watch streams one per-kind record as a delta watch. Bookmark-only until the
 	// kind enters its cache's catalog; a kind the cluster stops serving is Deleted.
-	Watch(ctx context.Context, id types.ClusterCachedResourceID) (*Stream[types.ClusterCachedResourceWatchFrame], error)
+	Watch(ctx context.Context, id ClusterCachedResourceID) (*Stream[ClusterCachedResourceWatchFrame], error)
 	// WatchList streams every per-kind record across every cache — the fleet's
 	// widest stream, and one a view scoped to a cache wants WatchByCache for
 	// instead. For a reader that genuinely spans caches: the sync-health rollup.
-	WatchList(ctx context.Context) (*Stream[types.ClusterCachedResourceWatchFrame], error)
+	WatchList(ctx context.Context) (*Stream[ClusterCachedResourceWatchFrame], error)
 
 	// ListByCache returns one cache's per-kind records. Scoped by the CACHE — the
 	// catalog between them is resolved here. A cache with no catalog yet owns none,
 	// which is empty rather than an error.
-	ListByCache(ctx context.Context, cacheID types.ClusterCacheID) ([]*types.ClusterCachedResource, error)
+	ListByCache(ctx context.Context, cacheID ClusterCacheID) ([]*ClusterCachedResource, error)
 	// WatchByCache streams one cache's per-kind records, resolving the catalog the
 	// same way ListByCache does.
-	WatchByCache(ctx context.Context, cacheID types.ClusterCacheID) (*Stream[types.ClusterCachedResourceWatchFrame], error)
+	WatchByCache(ctx context.Context, cacheID ClusterCacheID) (*Stream[ClusterCachedResourceWatchFrame], error)
 
 	// Clear drops one kind's cached objects and restarts its sync from an empty
 	// mirror; the record stays and resyncs. Caches().Clear is the whole-cache form.
-	Clear(ctx context.Context, id types.ClusterCachedResourceID) (*types.ClusterCachedResource, error)
+	Clear(ctx context.Context, id ClusterCachedResourceID) (*ClusterCachedResource, error)
 }
 
 // CachedData is the cached Kubernetes content in one cache's db — the only family whose
@@ -204,17 +250,17 @@ type CachedResources interface {
 // frames) while that cache's db isn't open: never synced, or sync paused.
 type CachedData interface {
 	// ListKinds returns one cache's discovered kind catalog.
-	ListKinds(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID) ([]types.ClusterCachedDataKind, error)
+	ListKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) ([]ClusterCachedDataKind, error)
 	// WatchKinds streams one cache's kind catalog as a delta watch (per-kind counts
 	// update live).
-	WatchKinds(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID) (<-chan types.ClusterCachedDataKindWatchFrame, error)
+	WatchKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCachedDataKindWatchFrame, error)
 	// WatchObjects streams one kind's cached objects as a delta watch keyed by UID.
 	// No frames while that kind hasn't synced.
-	WatchObjects(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID, apiVersion, resource string) (<-chan types.ClusterCachedDataObjectWatchFrame, error)
+	WatchObjects(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterCachedDataObjectWatchFrame, error)
 	// WatchEvents streams one cache's cached Kubernetes Events (newest window) as a
 	// delta watch keyed by event UID. Woken separately from WatchKinds, so an event
 	// burst never drives the kind-catalog re-read.
-	WatchEvents(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID) (<-chan types.ClusterCachedDataEventWatchFrame, error)
+	WatchEvents(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCachedDataEventWatchFrame, error)
 }
 
 // The family accessors are stateless views onto the one *service: the split is
@@ -248,173 +294,89 @@ var (
 	_ CachedData      = cachedDataAPI{}
 )
 
-// service is the concrete Service. It holds no state; the rebuild decides what
-// control plane sits behind it.
-type service struct{}
+// service is the concrete Service: the beehive instance every family reads and every
+// controller writes, plus the inputs the rebuild's leaves still need.
+type service struct {
+	bh      *beehive.Beehive
+	bhStore beehive.Store
 
-// New builds the cluster boundary. The arguments are what a real control plane
-// needs — where its state lives, which kubeconfig it follows, the resync bus it
-// listens on — and are kept so wiring one up is not a change to internal/app.
+	kubeconfigPath string
+	pokeSvc        *poke.Service
+}
+
+// maxEventRuns bounds retention per (object, category) timeline — counted in
+// aggregated RUNS (state transitions), not occurrences. Global (set at beehive.New).
+const maxEventRuns = 20
+
+// New builds the cluster boundary rooted at dataDir (beehive.db, clusters/): it opens
+// the store, registers the controllers, and leaves everything stopped until Start.
 func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error) {
-	return &service{}, nil
+	// Self-sufficient rather than order-dependent: this is the first thing the
+	// composition root builds, so nothing else has made dataDir yet.
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	bhStore, err := beehivesqlite.Open(filepath.Join(dataDir, "beehive.db"))
+	if err != nil {
+		return nil, fmt.Errorf("open beehive store: %w", err)
+	}
+	// WithEventRetention bounds each (object, category) timeline to maxEventRuns runs.
+	// No kind runs a periodic full pass: controllers re-arm via RequeueAfter and the
+	// out-of-band buses cover the rest (see registerControllers for the startup pass).
+	bh, err := beehive.New(bhStore, beehive.WithEventRetention(maxEventRuns, 0))
+	if err != nil {
+		bhStore.Close()
+		return nil, fmt.Errorf("init beehive: %w", err)
+	}
+
+	s := &service{bh: bh, bhStore: bhStore, kubeconfigPath: kubeconfigPath, pokeSvc: pokeSvc}
+	if err := registerControllers(bh); err != nil {
+		bhStore.Close()
+		return nil, fmt.Errorf("register cluster controllers: %w", err)
+	}
+	return s, nil
 }
 
+// registerControllers registers each kind's controller, which lives in that kind's
+// file. Together here rather than four calls spread across those files: the options
+// are the whole subsystem's concurrency and retry budget, and it only reads as a
+// budget in one place.
+func registerControllers(bh *beehive.Beehive) error {
+	_, errCluster := beehive.Register(bh, ClusterGroupKind, &clusterController{})
+	_, errCache := beehive.Register(bh, ClusterCacheGroupKind, &clusterCacheController{})
+	_, errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, &clusterCachedCatalogController{})
+	_, errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, &clusterCachedResourceController{})
+	return errors.Join(errCluster, errCache, errCatalog, errResource)
+}
+
+// Start launches beehive (the controller harness + store subscription loop). ctx
+// bounds startup only; the returned stop func takes a drain deadline and blocks
+// until the background work finishes. Call stop before Close.
 func (s *service) Start(ctx context.Context) (func(context.Context) error, error) {
-	return func(context.Context) error { return nil }, nil
+	bhStop, err := s.bh.Start(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("start beehive: %w", err)
+	}
+	return bhStop, nil
 }
 
+// Close releases the beehive store. Call after the stop func returns.
 func (s *service) Close() error {
-	return nil
+	return s.bhStore.Close()
 }
 
-func (s *service) RetryConnection(ctx context.Context, id types.ClusterID) error {
+func (s *service) GetConnection(id ClusterID) *rest.Config {
 	panic("not implemented")
 }
 
-func (s *service) GetConnection(id types.ClusterID) *rest.Config {
+func (s *service) RetryConnection(ctx context.Context, id ClusterID) error {
 	panic("not implemented")
 }
 
-func (s *service) ListEvents(ctx context.Context, id types.ObjectID, category *string, limit *int) ([]types.Event, error) {
+func (s *service) ListEvents(ctx context.Context, id ObjectID, category *string, limit *int) ([]Event, error) {
 	panic("not implemented")
 }
 
-func (s *service) WatchEvents(ctx context.Context, id types.ObjectID, category *string) (*Stream[types.EventWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a clustersAPI) List(ctx context.Context) ([]*types.Cluster, error) {
-	panic("not implemented")
-}
-
-func (a clustersAPI) Get(ctx context.Context, id types.ClusterID) (*types.Cluster, error) {
-	panic("not implemented")
-}
-
-func (a clustersAPI) Watch(ctx context.Context, id types.ClusterID) (*Stream[types.ClusterWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a clustersAPI) WatchList(ctx context.Context) (*Stream[types.ClusterWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a clustersAPI) WatchSchedule(ctx context.Context, id types.ClusterID) (<-chan types.Schedule, error) {
-	panic("not implemented")
-}
-
-func (a clustersAPI) SetEnabled(ctx context.Context, id types.ClusterID, enabled bool) (*types.Cluster, error) {
-	panic("not implemented")
-}
-
-func (a clustersAPI) SetSyncEnabled(ctx context.Context, id types.ClusterID, enabled bool) (*types.Cluster, error) {
-	panic("not implemented")
-}
-
-func (a clustersAPI) Delete(ctx context.Context, id types.ClusterID) error {
-	panic("not implemented")
-}
-
-func (a cachesAPI) Get(ctx context.Context, id types.ClusterCacheID) (*types.ClusterCache, error) {
-	panic("not implemented")
-}
-
-func (a cachesAPI) List(ctx context.Context) ([]*types.ClusterCache, error) {
-	panic("not implemented")
-}
-
-func (a cachesAPI) ListByCluster(ctx context.Context, clusterID types.ClusterID) ([]*types.ClusterCache, error) {
-	panic("not implemented")
-}
-
-func (a cachesAPI) WatchByCluster(ctx context.Context, clusterID types.ClusterID) (*Stream[types.ClusterCacheWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a cachesAPI) Watch(ctx context.Context, id types.ClusterCacheID) (*Stream[types.ClusterCacheWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a cachesAPI) WatchList(ctx context.Context) (*Stream[types.ClusterCacheWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a cachesAPI) WatchStats(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID) (<-chan types.ClusterCacheStats, error) {
-	panic("not implemented")
-}
-
-func (a cachesAPI) Clear(ctx context.Context, id types.ClusterID) (*types.Cluster, error) {
-	panic("not implemented")
-}
-
-func (a cachesAPI) WatchHealth(ctx context.Context) (*Stream[types.ClusterCacheHealth], error) {
-	panic("not implemented")
-}
-
-func (a cachedCatalogsAPI) Get(ctx context.Context, id types.ClusterCachedCatalogID) (*types.ClusterCachedCatalog, error) {
-	panic("not implemented")
-}
-
-func (a cachedCatalogsAPI) List(ctx context.Context) ([]*types.ClusterCachedCatalog, error) {
-	panic("not implemented")
-}
-
-func (a cachedCatalogsAPI) ListByCache(ctx context.Context, cacheID types.ClusterCacheID) ([]*types.ClusterCachedCatalog, error) {
-	panic("not implemented")
-}
-
-func (a cachedCatalogsAPI) WatchByCache(ctx context.Context, cacheID types.ClusterCacheID) (*Stream[types.ClusterCachedCatalogWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a cachedCatalogsAPI) Watch(ctx context.Context, id types.ClusterCachedCatalogID) (*Stream[types.ClusterCachedCatalogWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a cachedCatalogsAPI) WatchList(ctx context.Context) (*Stream[types.ClusterCachedCatalogWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a cachedResourcesAPI) Get(ctx context.Context, id types.ClusterCachedResourceID) (*types.ClusterCachedResource, error) {
-	panic("not implemented")
-}
-
-func (a cachedResourcesAPI) List(ctx context.Context) ([]*types.ClusterCachedResource, error) {
-	panic("not implemented")
-}
-
-func (a cachedResourcesAPI) ListByCache(ctx context.Context, cacheID types.ClusterCacheID) ([]*types.ClusterCachedResource, error) {
-	panic("not implemented")
-}
-
-func (a cachedResourcesAPI) Watch(ctx context.Context, id types.ClusterCachedResourceID) (*Stream[types.ClusterCachedResourceWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a cachedResourcesAPI) WatchList(ctx context.Context) (*Stream[types.ClusterCachedResourceWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a cachedResourcesAPI) WatchByCache(ctx context.Context, cacheID types.ClusterCacheID) (*Stream[types.ClusterCachedResourceWatchFrame], error) {
-	panic("not implemented")
-}
-
-func (a cachedResourcesAPI) Clear(ctx context.Context, id types.ClusterCachedResourceID) (*types.ClusterCachedResource, error) {
-	panic("not implemented")
-}
-
-func (a cachedDataAPI) ListKinds(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID) ([]types.ClusterCachedDataKind, error) {
-	panic("not implemented")
-}
-
-func (a cachedDataAPI) WatchKinds(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID) (<-chan types.ClusterCachedDataKindWatchFrame, error) {
-	panic("not implemented")
-}
-
-func (a cachedDataAPI) WatchEvents(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID) (<-chan types.ClusterCachedDataEventWatchFrame, error) {
-	panic("not implemented")
-}
-
-func (a cachedDataAPI) WatchObjects(ctx context.Context, clusterID types.ClusterID, cacheID types.ClusterCacheID, apiVersion, resource string) (<-chan types.ClusterCachedDataObjectWatchFrame, error) {
+func (s *service) WatchEvents(ctx context.Context, id ObjectID, category *string) (*Stream[EventWatchFrame], error) {
 	panic("not implemented")
 }

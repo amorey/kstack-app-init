@@ -12,18 +12,18 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
 )
 
 // Caches is the resolver for the caches field — the caches this cluster owns. A
 // separate beehive read, so it runs only when selected.
-func (r *clusterResolver) Caches(ctx context.Context, obj *types.Cluster) ([]*types.ClusterCache, error) {
+func (r *clusterResolver) Caches(ctx context.Context, obj *clustersvc.Cluster) ([]*clustersvc.ClusterCache, error) {
 	return r.ClusterSvc.Caches().ListByCluster(ctx, obj.ID)
 }
 
 // Events is the resolver for the events field — this cluster's event timeline. A
 // separate beehive read, so it runs only when selected.
-func (r *clusterResolver) Events(ctx context.Context, obj *types.Cluster, category *string, limit *int) ([]*types.Event, error) {
+func (r *clusterResolver) Events(ctx context.Context, obj *clustersvc.Cluster, category *string, limit *int) ([]*clustersvc.Event, error) {
 	evs, err := r.ClusterSvc.ListEvents(ctx, obj.ID, category, limit)
 	if err != nil {
 		return nil, err
@@ -33,7 +33,7 @@ func (r *clusterResolver) Events(ctx context.Context, obj *types.Cluster, catego
 
 // Kinds is the resolver for the kinds field — this cache's discovered kind catalog.
 // Both ids come off the record, so they cannot name different caches.
-func (r *clusterCacheResolver) Kinds(ctx context.Context, obj *types.ClusterCache) ([]*types.ClusterCachedDataKind, error) {
+func (r *clusterCacheResolver) Kinds(ctx context.Context, obj *clustersvc.ClusterCache) ([]*clustersvc.ClusterCachedDataKind, error) {
 	kinds, err := r.ClusterSvc.CachedData().ListKinds(ctx, obj.ClusterID, obj.ID)
 	if err != nil {
 		return nil, err
@@ -43,13 +43,13 @@ func (r *clusterCacheResolver) Kinds(ctx context.Context, obj *types.ClusterCach
 
 // CachedResources is the resolver for the cachedResources field — the kinds this cache
 // mirrors. Keyed by the cache; the catalog between them is resolved in the service.
-func (r *clusterCacheResolver) CachedResources(ctx context.Context, obj *types.ClusterCache) ([]*types.ClusterCachedResource, error) {
+func (r *clusterCacheResolver) CachedResources(ctx context.Context, obj *clustersvc.ClusterCache) ([]*clustersvc.ClusterCachedResource, error) {
 	return r.ClusterSvc.CachedResources().ListByCache(ctx, obj.ID)
 }
 
 // Events is the resolver for the events field — this cache's own event timeline.
 // A separate beehive read, so it runs only when selected.
-func (r *clusterCacheResolver) Events(ctx context.Context, obj *types.ClusterCache, category *string, limit *int) ([]*types.Event, error) {
+func (r *clusterCacheResolver) Events(ctx context.Context, obj *clustersvc.ClusterCache, category *string, limit *int) ([]*clustersvc.Event, error) {
 	evs, err := r.ClusterSvc.ListEvents(ctx, obj.ID, category, limit)
 	if err != nil {
 		return nil, err
@@ -58,23 +58,23 @@ func (r *clusterCacheResolver) Events(ctx context.Context, obj *types.ClusterCac
 }
 
 // FirstSeen is the resolver for the firstSeen field — see nilIfZeroTime.
-func (r *clusterCachedDataEventResolver) FirstSeen(ctx context.Context, obj *types.ClusterCachedDataEvent) (*time.Time, error) {
+func (r *clusterCachedDataEventResolver) FirstSeen(ctx context.Context, obj *clustersvc.ClusterCachedDataEvent) (*time.Time, error) {
 	return nilIfZeroTime(obj.FirstSeen), nil
 }
 
 // LastSeen is the resolver for the lastSeen field — see nilIfZeroTime.
-func (r *clusterCachedDataEventResolver) LastSeen(ctx context.Context, obj *types.ClusterCachedDataEvent) (*time.Time, error) {
+func (r *clusterCachedDataEventResolver) LastSeen(ctx context.Context, obj *clustersvc.ClusterCachedDataEvent) (*time.Time, error) {
 	return nilIfZeroTime(obj.LastSeen), nil
 }
 
 // CreationTimestamp is the resolver for the creationTimestamp field — see nilIfZeroTime.
-func (r *clusterCachedDataObjectResolver) CreationTimestamp(ctx context.Context, obj *types.ClusterCachedDataObject) (*time.Time, error) {
+func (r *clusterCachedDataObjectResolver) CreationTimestamp(ctx context.Context, obj *clustersvc.ClusterCachedDataObject) (*time.Time, error) {
 	return nilIfZeroTime(obj.CreationTimestamp), nil
 }
 
 // Events is the resolver for the events field — this kind's sync-transition
 // history. A separate beehive read, so it runs only when selected.
-func (r *clusterCachedResourceResolver) Events(ctx context.Context, obj *types.ClusterCachedResource, category *string, limit *int) ([]*types.Event, error) {
+func (r *clusterCachedResourceResolver) Events(ctx context.Context, obj *clustersvc.ClusterCachedResource, category *string, limit *int) ([]*clustersvc.Event, error) {
 	evs, err := r.ClusterSvc.ListEvents(ctx, obj.ID, category, limit)
 	if err != nil {
 		return nil, err
@@ -85,25 +85,25 @@ func (r *clusterCachedResourceResolver) Events(ctx context.Context, obj *types.C
 // Permissions is the resolver for the permissions field — the one live cluster
 // call on the Cluster surface, so it runs only when explicitly selected.
 // TODO: run a SelfSubjectRulesReview; errors until implemented.
-func (r *clusterPrincipalResolver) Permissions(ctx context.Context, obj *types.ClusterPrincipal, namespace string) (*model.ClusterPermissions, error) {
+func (r *clusterPrincipalResolver) Permissions(ctx context.Context, obj *clustersvc.ClusterPrincipal, namespace string) (*model.ClusterPermissions, error) {
 	return nil, fmt.Errorf("not implemented: permissions")
 }
 
 // ClusterEnabledSet is the resolver for the clusterEnabledSet field. The change
 // reaches the webview through the cluster watch.
-func (r *mutationResolver) ClusterEnabledSet(ctx context.Context, id types.ObjectID, enabled bool) (*types.Cluster, error) {
+func (r *mutationResolver) ClusterEnabledSet(ctx context.Context, id clustersvc.ObjectID, enabled bool) (*clustersvc.Cluster, error) {
 	return r.ClusterSvc.Clusters().SetEnabled(ctx, id, enabled)
 }
 
 // ClusterSyncEnabledSet is the resolver for the clusterSyncEnabledSet field.
-func (r *mutationResolver) ClusterSyncEnabledSet(ctx context.Context, id types.ObjectID, syncEnabled bool) (*types.Cluster, error) {
+func (r *mutationResolver) ClusterSyncEnabledSet(ctx context.Context, id clustersvc.ObjectID, syncEnabled bool) (*clustersvc.Cluster, error) {
 	return r.ClusterSvc.Clusters().SetSyncEnabled(ctx, id, syncEnabled)
 }
 
 // ClusterConnectionRetry is the resolver for the clusterConnectionRetry field.
 // The retry's outcome lands on the record's conditions and reaches the webview
 // through the cluster watch, not here.
-func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id types.ObjectID) (bool, error) {
+func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id clustersvc.ObjectID) (bool, error) {
 	if err := r.ClusterSvc.RetryConnection(ctx, id); err != nil {
 		return false, err
 	}
@@ -112,7 +112,7 @@ func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id types.
 
 // ClusterDelete is the resolver for the clusterDelete field. Deleting the
 // Cluster cascades (beehive GC) to its ClusterCache child.
-func (r *mutationResolver) ClusterDelete(ctx context.Context, id types.ObjectID) (bool, error) {
+func (r *mutationResolver) ClusterDelete(ctx context.Context, id clustersvc.ObjectID) (bool, error) {
 	if err := r.ClusterSvc.Clusters().Delete(ctx, id); err != nil {
 		return false, err
 	}
@@ -122,7 +122,7 @@ func (r *mutationResolver) ClusterDelete(ctx context.Context, id types.ObjectID)
 // ClusterCacheClear is the resolver for the clusterCacheClear field: delete the on-disk
 // cache and restart that cache's workers onto the emptied file — nothing else would
 // rebuild them. The cluster record stays and re-syncs from scratch.
-func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id types.ObjectID) (*types.Cluster, error) {
+func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.Cluster, error) {
 	return r.ClusterSvc.Caches().Clear(ctx, id)
 }
 
@@ -147,25 +147,25 @@ func (r *mutationResolver) AuthLogout(ctx context.Context) (bool, error) {
 
 // Cluster is the resolver for the cluster field. An untracked or
 // deletion-pending id is null per the schema, not an error.
-func (r *queryResolver) Cluster(ctx context.Context, id types.ObjectID) (*types.Cluster, error) {
+func (r *queryResolver) Cluster(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.Cluster, error) {
 	return r.ClusterSvc.Clusters().Get(ctx, id)
 }
 
 // Clusters is the resolver for the clusters field. Nested objects resolve lazily
 // per-selection.
-func (r *queryResolver) Clusters(ctx context.Context) ([]*types.Cluster, error) {
+func (r *queryResolver) Clusters(ctx context.Context) ([]*clustersvc.Cluster, error) {
 	return r.ClusterSvc.Clusters().List(ctx)
 }
 
 // ClusterCache is the resolver for the clusterCache field. An unknown or
 // deletion-pending id is null per the schema, not an error.
-func (r *queryResolver) ClusterCache(ctx context.Context, id types.ObjectID) (*types.ClusterCache, error) {
+func (r *queryResolver) ClusterCache(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCache, error) {
 	return r.ClusterSvc.Caches().Get(ctx, id)
 }
 
 // ClusterCaches is the resolver for the clusterCaches field — every cache, or one
 // cluster's when scoped. A nil clusterID is the unscoped read, not a missing argument.
-func (r *queryResolver) ClusterCaches(ctx context.Context, clusterID *types.ObjectID) ([]*types.ClusterCache, error) {
+func (r *queryResolver) ClusterCaches(ctx context.Context, clusterID *clustersvc.ObjectID) ([]*clustersvc.ClusterCache, error) {
 	if clusterID != nil {
 		return r.ClusterSvc.Caches().ListByCluster(ctx, *clusterID)
 	}
@@ -174,13 +174,13 @@ func (r *queryResolver) ClusterCaches(ctx context.Context, clusterID *types.Obje
 
 // ClusterCachedResource is the resolver for the clusterCachedResource field. An
 // unknown or deletion-pending id is null per the schema, not an error.
-func (r *queryResolver) ClusterCachedResource(ctx context.Context, id types.ObjectID) (*types.ClusterCachedResource, error) {
+func (r *queryResolver) ClusterCachedResource(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCachedResource, error) {
 	return r.ClusterSvc.CachedResources().Get(ctx, id)
 }
 
 // ClusterCachedResources is the resolver for the clusterCachedResources field — every
 // per-kind record, or one cache's when scoped.
-func (r *queryResolver) ClusterCachedResources(ctx context.Context, cacheID *types.ObjectID) ([]*types.ClusterCachedResource, error) {
+func (r *queryResolver) ClusterCachedResources(ctx context.Context, cacheID *clustersvc.ObjectID) ([]*clustersvc.ClusterCachedResource, error) {
 	if cacheID != nil {
 		return r.ClusterSvc.CachedResources().ListByCache(ctx, *cacheID)
 	}
@@ -199,7 +199,7 @@ func (r *queryResolver) AuthState(ctx context.Context) (*auth.State, error) {
 
 // EventsWatch is the resolver for the eventsWatch field — the live event tail for any
 // record with a timeline, decoupled from that record's own watch.
-func (r *subscriptionResolver) EventsWatch(ctx context.Context, id types.ObjectID, category *string) (<-chan *types.EventWatchFrame, error) {
+func (r *subscriptionResolver) EventsWatch(ctx context.Context, id clustersvc.ObjectID, category *string) (<-chan *clustersvc.EventWatchFrame, error) {
 	st, err := r.ClusterSvc.WatchEvents(ctx, id, category)
 	if err != nil {
 		return nil, err
@@ -210,7 +210,7 @@ func (r *subscriptionResolver) EventsWatch(ctx context.Context, id types.ObjectI
 // ClustersWatch is the resolver for the clustersWatch field — the cluster list as
 // a delta watch (Added snapshot, then per-cluster Added/Modified/Deleted). Cache
 // sync status rides clusterCachesWatch, joined client-side.
-func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *types.ClusterWatchFrame, error) {
+func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *clustersvc.ClusterWatchFrame, error) {
 	st, err := r.ClusterSvc.Clusters().WatchList(ctx)
 	if err != nil {
 		return nil, err
@@ -221,7 +221,7 @@ func (r *subscriptionResolver) ClustersWatch(ctx context.Context) (<-chan *types
 // ClusterScheduleWatch is the resolver for the clusterScheduleWatch field — the
 // live reconcile-schedule gauge for one cluster (next-attempt countdown),
 // decoupled from clustersWatch.
-func (r *subscriptionResolver) ClusterScheduleWatch(ctx context.Context, id types.ObjectID) (<-chan *types.Schedule, error) {
+func (r *subscriptionResolver) ClusterScheduleWatch(ctx context.Context, id clustersvc.ObjectID) (<-chan *clustersvc.Schedule, error) {
 	ch, err := r.ClusterSvc.Clusters().WatchSchedule(ctx, id)
 	if err != nil {
 		return nil, err
@@ -232,7 +232,7 @@ func (r *subscriptionResolver) ClusterScheduleWatch(ctx context.Context, id type
 // ClusterCachesWatch is the resolver for the clusterCachesWatch field — cache
 // records as a delta watch parallel to clustersWatch, joined to clusters
 // client-side by clusterID.
-func (r *subscriptionResolver) ClusterCachesWatch(ctx context.Context) (<-chan *types.ClusterCacheWatchFrame, error) {
+func (r *subscriptionResolver) ClusterCachesWatch(ctx context.Context) (<-chan *clustersvc.ClusterCacheWatchFrame, error) {
 	st, err := r.ClusterSvc.Caches().WatchList(ctx)
 	if err != nil {
 		return nil, err
@@ -241,7 +241,7 @@ func (r *subscriptionResolver) ClusterCachesWatch(ctx context.Context) (<-chan *
 }
 
 // ClusterCacheHealthWatch is the resolver for the clusterCacheHealthWatch field.
-func (r *subscriptionResolver) ClusterCacheHealthWatch(ctx context.Context) (<-chan *types.ClusterCacheHealth, error) {
+func (r *subscriptionResolver) ClusterCacheHealthWatch(ctx context.Context) (<-chan *clustersvc.ClusterCacheHealth, error) {
 	st, err := r.ClusterSvc.Caches().WatchHealth(ctx)
 	if err != nil {
 		return nil, err
@@ -252,7 +252,7 @@ func (r *subscriptionResolver) ClusterCacheHealthWatch(ctx context.Context) (<-c
 // ClusterCachedCatalogsWatch is the resolver for the
 // clusterCachedCatalogsWatch field — the caches' resource catalogs as a delta
 // watch parallel to clusterCachesWatch, joined to caches client-side by cacheID.
-func (r *subscriptionResolver) ClusterCachedCatalogsWatch(ctx context.Context) (<-chan *types.ClusterCachedCatalogWatchFrame, error) {
+func (r *subscriptionResolver) ClusterCachedCatalogsWatch(ctx context.Context) (<-chan *clustersvc.ClusterCachedCatalogWatchFrame, error) {
 	st, err := r.ClusterSvc.CachedCatalogs().WatchList(ctx)
 	if err != nil {
 		return nil, err
@@ -263,7 +263,7 @@ func (r *subscriptionResolver) ClusterCachedCatalogsWatch(ctx context.Context) (
 // ClusterCachedResourcesWatch is the resolver for the clusterCachedResourcesWatch field —
 // one cache's per-kind sync records as a delta watch. Cache-scoped, unlike the sibling
 // object watches: there is one record per synced kind.
-func (r *subscriptionResolver) ClusterCachedResourcesWatch(ctx context.Context, cacheID types.ObjectID) (<-chan *types.ClusterCachedResourceWatchFrame, error) {
+func (r *subscriptionResolver) ClusterCachedResourcesWatch(ctx context.Context, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedResourceWatchFrame, error) {
 	st, err := r.ClusterSvc.CachedResources().WatchByCache(ctx, cacheID)
 	if err != nil {
 		return nil, err
@@ -274,7 +274,7 @@ func (r *subscriptionResolver) ClusterCachedResourcesWatch(ctx context.Context, 
 // ClusterCacheStatsWatch is the resolver for the clusterCacheStatsWatch field — one
 // cache's contents as a live gauge, streamed because the ClusterCache.stats field freezes
 // once its record stops changing.
-func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id types.ObjectID, cacheID types.ObjectID) (<-chan *types.ClusterCacheStats, error) {
+func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCacheStats, error) {
 	ch, err := r.ClusterSvc.Caches().WatchStats(ctx, id, cacheID)
 	if err != nil {
 		return nil, err
@@ -286,7 +286,7 @@ func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id ty
 // ClusterCache's kind catalog as a delta watch (the live counterpart of
 // clusterCachedDataKinds), so the dashboard nav's kinds + counts track the cluster in
 // real time.
-func (r *subscriptionResolver) ClusterCachedDataKindsWatch(ctx context.Context, id types.ObjectID, cacheID types.ObjectID) (<-chan *types.ClusterCachedDataKindWatchFrame, error) {
+func (r *subscriptionResolver) ClusterCachedDataKindsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedDataKindWatchFrame, error) {
 	ch, err := r.ClusterSvc.CachedData().WatchKinds(ctx, id, cacheID)
 	if err != nil {
 		return nil, err
@@ -297,7 +297,7 @@ func (r *subscriptionResolver) ClusterCachedDataKindsWatch(ctx context.Context, 
 // ClusterCachedDataEventsWatch is the resolver for the clusterCachedDataEventsWatch field — one
 // ClusterCache's cached Kubernetes Events as a delta watch, backing the dashboard's
 // events table.
-func (r *subscriptionResolver) ClusterCachedDataEventsWatch(ctx context.Context, id types.ObjectID, cacheID types.ObjectID) (<-chan *types.ClusterCachedDataEventWatchFrame, error) {
+func (r *subscriptionResolver) ClusterCachedDataEventsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedDataEventWatchFrame, error) {
 	ch, err := r.ClusterSvc.CachedData().WatchEvents(ctx, id, cacheID)
 	if err != nil {
 		return nil, err
@@ -307,7 +307,7 @@ func (r *subscriptionResolver) ClusterCachedDataEventsWatch(ctx context.Context,
 
 // ClusterCachedDataObjectsWatch is the resolver for the clusterCachedDataObjectsWatch field — one
 // kind's cached objects as a delta watch, backing the dashboard's per-kind tables.
-func (r *subscriptionResolver) ClusterCachedDataObjectsWatch(ctx context.Context, id types.ObjectID, cacheID types.ObjectID, apiVersion string, resource string) (<-chan *types.ClusterCachedDataObjectWatchFrame, error) {
+func (r *subscriptionResolver) ClusterCachedDataObjectsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID, apiVersion string, resource string) (<-chan *clustersvc.ClusterCachedDataObjectWatchFrame, error) {
 	ch, err := r.ClusterSvc.CachedData().WatchObjects(ctx, id, cacheID, apiVersion, resource)
 	if err != nil {
 		return nil, err

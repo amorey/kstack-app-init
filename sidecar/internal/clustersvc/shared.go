@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Vocabulary every noun reuses: identity, conditions, the kind-agnostic Event and
-// Schedule projections, and the delta-watch change type. Nothing here belongs to one
-// kind — a type only one kind uses lives in that kind's file, however generic its name
-// reads. Mirrors the shared-vocabulary section of graph/schema.graphqls, which these
-// types bind to.
-package types
+// Vocabulary every family reuses: identity, conditions, the kind-agnostic Event and
+// Schedule projections, and the delta-watch frame type. Nothing here belongs to one
+// kind — a type only one family uses lives in that family's file, however generic its
+// name reads. Mirrors the shared-vocabulary section of graph/schema.graphqls, which
+// these types bind to.
+package clustersvc
 
 import (
 	"encoding/json"
@@ -96,6 +96,39 @@ func (id *ObjectID) UnmarshalGQL(v any) error {
 	default:
 		return fmt.Errorf("ObjectID must be a string or integer, got %T", v)
 	}
+	return nil
+}
+
+// --- Raw JSON ---
+
+// RawJSON binds the GraphQL `JSON` scalar: already-serialized JSON in a string,
+// written verbatim by MarshalGQL. A string (not a map) so the enclosing record stays
+// comparable — the delta watches diff frames with ==, which is what makes an in-place
+// object edit surface as Modified. Empty value = absent body → null.
+type RawJSON string
+
+// MarshalGQL writes the stored JSON bytes verbatim, or `null` for the absent body.
+func (r RawJSON) MarshalGQL(w io.Writer) {
+	if r == "" {
+		io.WriteString(w, "null")
+		return
+	}
+	io.WriteString(w, string(r))
+}
+
+// UnmarshalGQL re-serializes a decoded value back to JSON bytes (nil → absent body).
+// The schema uses RawJSON as output only; this exists to satisfy gqlgen's scalar
+// contract (Marshaler and Unmarshaler both required).
+func (r *RawJSON) UnmarshalGQL(v any) error {
+	if v == nil {
+		*r = ""
+		return nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("invalid JSON scalar: %w", err)
+	}
+	*r = RawJSON(b)
 	return nil
 }
 

@@ -12,29 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package types
+package clustersvc
 
 import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
-
-// One cache per identity per cluster: the name is the creation/dedup key beehive's
-// name-uniqueness enforces, so a UID migration must yield a second, distinct name
-// rather than colliding with the cache it supersedes.
-func TestClusterCacheName(t *testing.T) {
-	assert.Equal(t, "7/uid-1", ClusterCacheName(7, "uid-1"))
-	assert.NotEqual(t, ClusterCacheName(7, "uid-1"), ClusterCacheName(7, "uid-2"))
-	assert.NotEqual(t, ClusterCacheName(7, "uid-1"), ClusterCacheName(8, "uid-1"))
-}
-
-// Exactly one discovery anchor per cache, so creation is idempotent under
-// name-uniqueness dedup.
-func TestClusterCachedCatalogName(t *testing.T) {
-	assert.Equal(t, "cachedcatalog/7", ClusterCachedCatalogName(7))
-	assert.Equal(t, ClusterCachedCatalogName(7), ClusterCachedCatalogName(7))
-}
 
 // Deterministic per (anchor, apiVersion, resource), which is what lets a discovery
 // pass reconcile its children as a set with no per-child bookkeeping. Keyed on the

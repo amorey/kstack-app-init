@@ -13,11 +13,13 @@
 // limitations under the License.
 
 // What a ClusterCache holds: the discovered kind catalog and the cached Kubernetes
-// objects and Events read back out of it, each paired with its delta-watch change.
-// Mirrors the cluster-data section of graph/schema.graphqls.
-package types
+// objects and Events read back out of it, each paired with its delta-watch frame,
+// plus the CachedData implementation. Mirrors the cluster-data section of
+// graph/schema.graphqls.
+package clustersvc
 
 import (
+	"context"
 	"time"
 )
 
@@ -128,4 +130,20 @@ type ClusterCachedDataObjectWatchFrame struct {
 	CacheID    ClusterCacheID
 	APIVersion string
 	Resource   string
+}
+
+func (a cachedDataAPI) ListKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) ([]ClusterCachedDataKind, error) {
+	panic("not implemented")
+}
+
+func (a cachedDataAPI) WatchKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCachedDataKindWatchFrame, error) {
+	panic("not implemented")
+}
+
+func (a cachedDataAPI) WatchObjects(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterCachedDataObjectWatchFrame, error) {
+	panic("not implemented")
+}
+
+func (a cachedDataAPI) WatchEvents(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCachedDataEventWatchFrame, error) {
+	panic("not implemented")
 }

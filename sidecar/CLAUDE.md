@@ -22,31 +22,51 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 
 ## Cluster subsystem (`internal/clustersvc`)
 
-**Stripped to a shell, pending a rebuild.** The package is three files — `service.go` (the
-`Service` interface, its five family sub-interfaces, the accessors, and the stateless unexported
-`service` whose every method but `Start`/`Close` panics), `stream.go` (`Stream[T]`, which appears in
-those signatures), and
-`types/` (the record structs the GraphQL schema binds by name). Nothing else survives: there is no
-beehive control plane, no controllers, no kubeconfig watcher, no connection manager, and no on-disk
-cache.
+**Mid-rebuild.** The layout:
 
-**The point of the shell is that the surfaces above it did not move.** `graph/`, `grpc/`, and
-`internal/app` compile and are wired exactly as before; `clustersvc.New(dataDir, kubeconfigPath,
-pokeSvc)`, `Start`, and `Close` keep their signatures so reconnecting a real implementation is not a
-change to the composition root. `New` returns an empty `service` as a `Service`, `Start` returns a
-no-op stop func, and every API call panics. **The sidecar therefore serves no cluster data at all** — the app starts,
-the socket comes up, auth and cloud settings work, and any cluster query or subscription panics.
+```
+internal/clustersvc/
+  service.go          the whole API — Service + the five family interfaces — plus the
+                      accessors, beehive bootstrap, and registerControllers
+  clusters.go         ┐ one per family, implementing its interface and holding
+  caches.go           │ everything else about that kind: its beehive shapes, the
+  cachedcatalogs.go   │ record GraphQL binds, its *WatchFrame, and its controller
+  cachedresources.go  │
+  cacheddata.go       ┘ (no controller — the one family that isn't a beehive kind)
+  shared.go           vocabulary every family reuses, and the two GraphQL scalars
+  stream.go           Stream[T]
+  internal/           the mechanisms the controllers drive — private by compiler rule
+```
+
+**The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
+rules below are rules *across* the five, checked by eye — a violation shows when they read side by
+side and hides when they don't. Everything else slices by kind, so one file teaches you one kind.
+`registerControllers` stays whole in `service.go` for the same reason the interfaces do: its options
+are the subsystem's concurrency and retry budget, which only reads as a budget in one place.
+
+`New` opens the beehive store under `dataDir` and registers all four controllers;
+`Start` runs beehive. **The controllers are placeholders that reconcile to a no-op, and every
+family method panics** — so the app starts, the socket comes up, auth and cloud settings work,
+and any cluster query or subscription panics. There is no kubeconfig watcher, connection manager,
+discovery pass, sync worker, or on-disk cache yet.
+
+`clustersvc.New(dataDir, kubeconfigPath, pokeSvc)`, `Start`, and `Close` keep their signatures, so
+filling the shell in is never a change to the composition root.
+
+**Leaves under `internal/` speak native vocabulary** — GVRs, a `rest.Config`, cache rows — never the
+records above; the controllers translate. A leaf reaching for one of this package's types gets an
+import cycle, which is what enforces the direction. Put a mechanism in a leaf, never in a
+controller: **if `go test ./internal/clustersvc` stops being fast, one has leaked back in.**
 
 The five families are `Clusters()`, `Caches()`, `CachedCatalogs()`, `CachedResources()`, and
 `CachedData()`. **The `Cached*` prefix marks the cache subtree** — what a `ClusterCache` catalogs,
 the per-kind records under that catalog, and the mirrored content itself — so the grouping is visible
 in the accessor list rather than something you have to know. Keep it when adding a family there.
 
-Rebuilding a family means writing its implementation in its own file (`clusters.go`, `caches.go`,
-`cachedcatalogs.go`, `cachedresources.go`, `cacheddata.go` — one per family, each with a test beside
-it) and deleting its stub from `service.go`. Keep the method naming rule when you do: **VerbNoun with the noun elided when
-it equals the family's subject**, so `Caches().WatchList()` watches caches and `Caches().WatchStats()` streams
-one cache's stats. **A family owns a read only when the read differs per record type.**
+Rebuilding a family means replacing the panics in that family's file. Keep the method naming rule
+when you do: **VerbNoun with the noun elided when it equals the family's subject**, so
+`Caches().WatchList()` watches caches and `Caches().WatchStats()` streams one cache's stats.
+**A family owns a read only when the read differs per record type.**
 `RetryConnection`/`GetConnection` stay top-level (they answer about a connection, not a record), and
 so do `ListEvents`/`WatchEvents`: an event carries no kind, every id is the same `ObjectID`, and only
 three of the five families have a timeline at all — scoping them would be three copies of one method
@@ -82,14 +102,12 @@ included; a watch that cannot fail terminally may stay a plain channel.
 
 ### Types
 
-`types` is a leaf and the one part of the subsystem that is fully intact — the four kinds' spec/
-status/record structs, identity, conditions, change types, and the cached-data records, split one
-file per noun to match the schema's sections. **The schema binds these by name, which is why they
-survive a teardown that removed everything that produced them.** Placement rule when adding
-something: types the schema binds and the identity/condition vocabulary go to `types`; within it, a
-type follows the schema section it binds to, and anything kind-agnostic goes to `shared.go`.
-Unexported helpers live with their only consumer (a callee follows its caller — `LiveCondition` needs
-`TruncateMessage`, so both are in `types/shared.go`).
+The four kinds' spec/status/record structs, identity, conditions, frame types, and the cached-data
+records are fully intact — **the schema binds them by name, which is why they survived a teardown
+that removed everything that produced them.** Each lives in its family's file, beside the methods
+that serve it; anything kind-agnostic goes to `shared.go`. Unexported helpers live with their only
+consumer (a callee follows its caller — `LiveCondition` needs `TruncateMessage`, so both are in
+`shared.go`).
 
 - `ClusterID` **is** the beehive ObjectID — opaque, source-agnostic, stable for the record's life;
   never the remote UID or the context name. One shared GraphQL `ObjectID` scalar (decimal string)
@@ -99,18 +117,18 @@ Unexported helpers live with their only consumer (a callee follows its caller �
   The spec carries **no trigger/counter fields** — retries and resyncs ride out-of-band buses.
 - `ClusterCache.Spec.ServerUID` names the physical identity a cache mirrors. **Active-ness is
   deliberately not a field** — it is the live join against the cluster's `status.server.uid`
-  (`types.CacheIsActive`). → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md).
-- Every condition is a **liveness** condition (`types.LiveCondition` is the only constructor);
+  (`CacheIsActive`). → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md).
+- Every condition is a **liveness** condition (`LiveCondition` is the only constructor);
   beehive serves a previous process's write as `Unknown`+`Unconfirmed` until re-confirmed.
   **`Unconfirmed` is load-bearing on the wire**: the surviving reason/stamps describe *last-known*
   state, and a consumer must not render a pre-restart reason as current.
   → [ADR: liveness conditions](../docs/adr/2026-08-09-liveness-conditions.md).
-- `types.Condition` aliases `beehive.Condition`, so `types` still depends on beehive even though
-  nothing here runs it. That is the seam a rebuild on a different control plane would cut.
+- `Condition` aliases `beehive.Condition`, so the record vocabulary depends on beehive directly.
+  That is the seam a rebuild on a different control plane would cut.
 
 ### GraphQL surface (cluster)
 
-The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc/types` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers — but **every field reaches the stubbed boundary and panics**, so this section is the contract the rebuild must satisfy, not a description of what answers today. Key entry points:
+The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers — but **every field reaches the stubbed boundary and panics**, so this section is the contract the rebuild must satisfy, not a description of what answers today. Key entry points:
 
 - Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedCatalogsWatch` (unscoped, one per cache), `clusterCachedResourcesWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).
@@ -118,8 +136,8 @@ The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `
 - Cache-data watches (all keyed by cluster id + cache id; frames carry `cacheID` provenance — objects additionally `apiVersion`/`resource` — so the client rejects stale frames after a swap): `clusterCachedDataKindsWatch` (kind catalog + counts; subscribes to **both** brokers via `catalogSubscribe`, since Event counts come from event triggers), `clusterCachedDataEventsWatch` (newest window, `Deleted` when aging out), `clusterCachedDataObjectsWatch` (per-kind rows incl. `rawJSON`; resource-keyed broker subscription). Unopened cache → the `Bookmark` alone.
 - Point reads hang off the record that owns them, resolved on selection: every event timeline is an `events(category, limit)` field (`Cluster.events`, `ClusterCache.events`, `ClusterCachedResource.events`), the discovered kind catalog is `ClusterCache.kinds` (no arguments — both ids it reads with come off the record), and `Cluster.caches` / `ClusterCache.cachedResources` walk the owner chain down (`Caches().List`, `CachedResources().List`). So there are no root `cluster*Events` or `clusterCachedDataKinds` fields. The lookups `clusterCache(id)` and `clusterCachedResource(id)` (over `Caches().Get`/`CachedResources().Get`) address a record by **its own** id, which a caller holding one from a watch frame uses directly.
 - **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCachedResource`/`clusterCachedResources(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.cachedResources`). The resolver picks the boundary method the argument implies — `Caches().List` when nil, `Caches().ListByCluster` when set. Keep that shape when adding a noun.
-- **The query path skips `ClusterCachedCatalog`.** `ClusterCache.cachedResources` is keyed by the cache and resolves the catalog itself (`CachedResources().List`, like `CachedResources().Watch`): exactly one catalog exists per cache and its name is derived from the cache id (`types.ClusterCachedCatalogName`), so it is an implementation detail, not a branch to navigate. The catalog's own state still streams on `clusterCachedCatalogsWatch`.
-- **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`types.CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
+- **The query path skips `ClusterCachedCatalog`.** `ClusterCache.cachedResources` is keyed by the cache and resolves the catalog itself (`CachedResources().List`, like `CachedResources().Watch`): exactly one catalog exists per cache and its name is derived from the cache id (`ClusterCachedCatalogName`), so it is an implementation detail, not a branch to navigate. The catalog's own state still streams on `clusterCachedCatalogsWatch`.
+- **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
 - Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (delete files then **bounce that cache's workers** — nothing else would rebuild them; they cold-sync, the cookie died with the file), `clusterDelete` (GC cascades; a still-present context is re-imported under a fresh id).
 - `ClusterCachedDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the record keeps value `time.Time` for comparability.
 - **A watch that dies reports why** (`graph/watch_failure.go`). gqlgen builds each subscription frame as data alone and stops the instant the resolver's channel closes, so a failed watch is otherwise byte-identical to a graceful end and the webview reconnects forever with nothing shown. `WatchFailureExtension` bridges that in two halves — the resolver and the frame that would carry the reason never share a response context: `InterceptOperation` hangs a slot on the operation ctx (gqlgen threads it into the resolvers *and* every later frame), `watchStream` files `Stream.Err()` into it as the frames run out, and `InterceptResponse` claims it once the stream is spent, emitting one errors-only `graphql.Response` before the transport completes. Claimed once, so the next poll ends the subscription instead of looping. The reason goes through `AddError`, so the server's error presenter logs it. The client treats that frame as a drop with a reason — reported, last-known data held, reconnect — see the root `CLAUDE.md`. → [ADR: watch-failure reporting](../docs/adr/2026-08-14-watch-failure-reporting.md).

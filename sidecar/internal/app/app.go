@@ -75,8 +75,9 @@ func New(cfg Config) (*App, error) {
 	// gRPC PokeService); see docs/adr/2026-08-09-poke-resync-fanout.md.
 	pokeSvc := poke.New()
 
-	// The cluster backend behind one boundary. Stripped to a shell pending its
-	// rebuild — the wiring stands, every call panics.
+	// The cluster backend behind one boundary. Mid-rebuild: beehive and the four
+	// controllers are wired, but the controllers are placeholders and every read
+	// panics.
 	clusterSvc, err := clustersvc.New(cfg.DataDir, cfg.KubeconfigPath, pokeSvc)
 	if err != nil {
 		return nil, err

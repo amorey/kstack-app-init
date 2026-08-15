@@ -19,7 +19,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
 )
 
 // --- Cluster ---
@@ -87,7 +87,7 @@ func TestClusterEventsResolver(t *testing.T) {
 	svc := newFakeClusterService(fix)
 	id := fix[0].id
 	now := time.Now().UTC()
-	svc.events[id] = []types.Event{{
+	svc.events[id] = []clustersvc.Event{{
 		ID: id, Category: "connection", Type: beehive.EventWarning,
 		Reason: "ProbeFailed", Message: "boom", Count: 3, FirstAt: now, LastAt: now,
 	}}
@@ -311,13 +311,13 @@ func TestClusterEphemeralFields(t *testing.T) {
 func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 	at := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
 	fixtures := clusterFixtures()
-	fixtures[0].connConds = []types.Condition{{
-		Type: string(types.ConditionConnected), Status: types.ConditionFalse,
+	fixtures[0].connConds = []clustersvc.Condition{{
+		Type: string(clustersvc.ConditionConnected), Status: clustersvc.ConditionFalse,
 		Reason: "ProbeFailed", Message: "connection refused",
 		Liveness: true, TransitionedAt: at, UpdatedAt: at,
 	}}
-	fixtures[0].cacheConds = []types.Condition{{
-		Type: string(types.ConditionSynced), Status: types.ConditionTrue,
+	fixtures[0].cacheConds = []clustersvc.Condition{{
+		Type: string(clustersvc.ConditionSynced), Status: clustersvc.ConditionTrue,
 		Reason: "Watching", Liveness: true, TransitionedAt: at, UpdatedAt: at,
 	}}
 
@@ -507,7 +507,7 @@ func TestClusterCachesResolver(t *testing.T) {
 // record: `ClusterCache.events` reads the cache's own timeline (what the cache layer
 // records, e.g. SyncStopped), `ClusterCachedResource.events` one synced kind's (where
 // each worker report lands). One table because the wire mapping under test —
-// types.Event → the generic Event shape, enum included — is identical; only the record it
+// clustersvc.Event → the generic Event shape, enum included — is identical; only the record it
 // hangs off differs. Reaching either also exercises its root lookup, which is the only
 // way into these records by query.
 func TestCacheEventTimelineResolvers(t *testing.T) {
@@ -517,18 +517,18 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 		// field is the root lookup; lookupID derives the record's own id from its
 		// cluster's, since the two are deliberately different in the fixture.
 		field    string
-		lookupID func(types.ClusterID) types.ObjectID
-		seed     func(*fakeClusterService, types.ClusterID, types.Event)
-		event    types.Event
+		lookupID func(clustersvc.ClusterID) clustersvc.ObjectID
+		seed     func(*fakeClusterService, clustersvc.ClusterID, clustersvc.Event)
+		event    clustersvc.Event
 		wantEnum string
 	}{{
 		name:     "cache timeline",
 		field:    "clusterCache",
-		lookupID: func(id types.ClusterID) types.ObjectID { return types.ObjectID(fixtureCacheID(id)) },
-		seed: func(f *fakeClusterService, id types.ClusterID, ev types.Event) {
-			f.cacheEvents = map[types.ClusterCacheID][]types.Event{fixtureCacheID(id): {ev}}
+		lookupID: func(id clustersvc.ClusterID) clustersvc.ObjectID { return clustersvc.ObjectID(fixtureCacheID(id)) },
+		seed: func(f *fakeClusterService, id clustersvc.ClusterID, ev clustersvc.Event) {
+			f.cacheEvents = map[clustersvc.ClusterCacheID][]clustersvc.Event{fixtureCacheID(id): {ev}}
 		},
-		event: types.Event{
+		event: clustersvc.Event{
 			Category: "sync", Type: beehive.EventWarning, Reason: "SyncFailed",
 			Message: "boom", Count: 2, FirstAt: now, LastAt: now,
 		},
@@ -536,11 +536,11 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 	}, {
 		name:     "per-kind sync timeline",
 		field:    "clusterCachedResource",
-		lookupID: func(id types.ClusterID) types.ObjectID { return types.ObjectID(fixtureResourceID(id)) },
-		seed: func(f *fakeClusterService, id types.ClusterID, ev types.Event) {
-			f.syncEvents = map[types.ClusterCachedResourceID][]types.Event{fixtureResourceID(id): {ev}}
+		lookupID: func(id clustersvc.ClusterID) clustersvc.ObjectID { return clustersvc.ObjectID(fixtureResourceID(id)) },
+		seed: func(f *fakeClusterService, id clustersvc.ClusterID, ev clustersvc.Event) {
+			f.syncEvents = map[clustersvc.ClusterCachedResourceID][]clustersvc.Event{fixtureResourceID(id): {ev}}
 		},
-		event: types.Event{
+		event: clustersvc.Event{
 			Category: "sync", Type: beehive.EventNormal, Reason: "SyncComplete",
 			Message: "cached 12 events", Count: 2, FirstAt: now, LastAt: now,
 		},
@@ -707,7 +707,7 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 			// Detect the snapshot boundary by type, never by a missing entity: an
 			// errored non-null field nulls its parent, so a null entity also rides
 			// ordinary frames.
-			if frame.Data.Watch.Type == string(types.DeltaFrameBookmark) {
+			if frame.Data.Watch.Type == string(clustersvc.DeltaFrameBookmark) {
 				continue
 			}
 			seen++
@@ -762,7 +762,7 @@ func TestDeltaWatchClosesSnapshotWithBookmark(t *testing.T) {
 				t.Fatalf("decode cache frame %s: %v", ev.data, err)
 			}
 			switch frame.Data.Watch.Type {
-			case string(types.DeltaFrameBookmark):
+			case string(clustersvc.DeltaFrameBookmark):
 				bookmarks++
 				if frame.Data.Watch.Cache != nil {
 					t.Errorf("the bookmark carries no entity, got: %v", frame.Data.Watch.Cache)
@@ -770,7 +770,7 @@ func TestDeltaWatchClosesSnapshotWithBookmark(t *testing.T) {
 				if bookmarks == 1 && added != len(clusterFixtures()) {
 					t.Errorf("bookmark closed the snapshot after %d of %d records", added, len(clusterFixtures()))
 				}
-			case string(types.DeltaFrameAdded):
+			case string(clustersvc.DeltaFrameAdded):
 				if bookmarks > 0 {
 					t.Error("an Added frame arrived after the snapshot closed")
 				}
@@ -836,7 +836,7 @@ func TestClusterCachedDataKindsResolver(t *testing.T) {
 	fix := clusterFixtures()
 	svc := newFakeClusterService(fix)
 	id := fix[0].id
-	svc.kinds = map[types.ClusterID][]types.ClusterCachedDataKind{
+	svc.kinds = map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataKind{
 		id: {
 			{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Scope: "Namespaced", IsCRD: false},
 			{APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: "Namespaced", IsCRD: true},
@@ -940,10 +940,10 @@ func TestClusterCachedDataObjectsWatchServesNativeBody(t *testing.T) {
 	fix := clusterFixtures()
 	svc := newFakeClusterService(fix)
 	id := fix[0].id
-	svc.dataObjects = map[types.ClusterID][]types.ClusterCachedDataObject{
+	svc.dataObjects = map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataObject{
 		id: {{
 			UID: "d1", APIVersion: "apps/v1", Kind: "Deployment", Namespace: "default", Name: "web",
-			RawJSON: types.RawJSON(`{"kind":"Deployment","spec":{"replicas":3}}`),
+			RawJSON: clustersvc.RawJSON(`{"kind":"Deployment","spec":{"replicas":3}}`),
 		}},
 	}
 	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{
@@ -1009,7 +1009,7 @@ func TestClusterCachedDataKindsWatchEmitsSnapshotAndStaysOpen(t *testing.T) {
 	fix := clusterFixtures()
 	svc := newFakeClusterService(fix)
 	id := fix[0].id
-	svc.kinds = map[types.ClusterID][]types.ClusterCachedDataKind{
+	svc.kinds = map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataKind{
 		id: {
 			{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Scope: "Namespaced", IsCRD: false, Count: 3},
 			{APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: "Namespaced", IsCRD: true, Count: 0},
