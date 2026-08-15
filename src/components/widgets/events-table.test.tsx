@@ -17,7 +17,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // EventsTable is pure presentation over useClusterCachedDataEvents — mock the hook to drive each
 // of the four states (no active cache, connecting, empty, live rows) directly.
-const { useClusterCachedDataEventsMock } = vi.hoisted(() => ({ useClusterCachedDataEventsMock: vi.fn() }));
+const { useClusterCachedDataEventsMock } = vi.hoisted(() => ({
+  useClusterCachedDataEventsMock: vi.fn<typeof import('@/lib/cluster-cached-data-events').useClusterCachedDataEvents>(),
+}));
 vi.mock('@/lib/cluster-cached-data-events', () => ({ useClusterCachedDataEvents: useClusterCachedDataEventsMock }));
 
 const { EventsTable } = await import('./events-table');
@@ -54,7 +56,7 @@ describe('EventsTable', () => {
   });
 
   it('shows an empty state on a connected empty snapshot', () => {
-    useClusterCachedDataEventsMock.mockReturnValue({ events: [], active: true, phase: 'empty' });
+    useClusterCachedDataEventsMock.mockReturnValue({ events: [], active: true, phase: 'live' });
     render(<EventsTable />);
     expect(screen.getByText('No events.')).toBeInTheDocument();
   });

@@ -17,7 +17,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ObjectsTable is pure presentation over useClusterCachedDataObjects — mock the hook to drive
 // each of the four states and the column/cell alignment directly.
-const { useClusterCachedDataObjectsMock } = vi.hoisted(() => ({ useClusterCachedDataObjectsMock: vi.fn() }));
+const { useClusterCachedDataObjectsMock } = vi.hoisted(() => ({
+  useClusterCachedDataObjectsMock:
+    vi.fn<typeof import('@/lib/cluster-cached-data-objects').useClusterCachedDataObjects>(),
+}));
 vi.mock('@/lib/cluster-cached-data-objects', () => ({ useClusterCachedDataObjects: useClusterCachedDataObjectsMock }));
 
 const { ObjectsTable } = await import('./objects-table');
@@ -55,7 +58,7 @@ describe('ObjectsTable', () => {
   });
 
   it('shows an empty state on a connected empty snapshot', () => {
-    useClusterCachedDataObjectsMock.mockReturnValue({ objects: [], active: true, phase: 'empty' });
+    useClusterCachedDataObjectsMock.mockReturnValue({ objects: [], active: true, phase: 'live' });
     render(<ObjectsTable {...PODS} />);
     expect(screen.getByText('No pod objects.')).toBeInTheDocument();
   });
