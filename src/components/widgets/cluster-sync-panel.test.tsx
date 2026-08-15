@@ -73,7 +73,7 @@ type Row = {
 // one reading, ignoring any condition a previous process wrote that this one hasn't
 // re-confirmed — so an unconfirmed row rolls up as "nothing observed yet" rather than
 // asserting its last-known verdict.
-function syncHealthOf(r: Row): {
+function healthOf(r: Row): {
   status: string;
   reason: string;
   unhealthyKindRefs: { apiVersion: string; resource: string }[];
@@ -114,7 +114,7 @@ function syncHealthOf(r: Row): {
 function openStreams() {
   channelFor('clustersWatch').onmessage!(JSON.stringify({ type: 'open' }));
   channelFor('clusterCachesWatch').onmessage!(JSON.stringify({ type: 'open' }));
-  channelFor('clusterCacheSyncHealthWatch').onmessage!(JSON.stringify({ type: 'open' }));
+  channelFor('clusterCacheHealthWatch').onmessage!(JSON.stringify({ type: 'open' }));
 }
 
 // Push each row as an Added change on the three delta streams: a Cluster change on
@@ -126,7 +126,7 @@ function openStreams() {
 function pushClusters(rows: Row[]) {
   const clusterCh = channelFor('clustersWatch');
   const cacheCh = channelFor('clusterCachesWatch');
-  const healthCh = channelFor('clusterCacheSyncHealthWatch');
+  const healthCh = channelFor('clusterCacheHealthWatch');
   rows.forEach((r, i) => {
     const id = r.uuid || `pending-${i}`;
     clusterCh.onmessage!(
@@ -200,9 +200,9 @@ function pushClusters(rows: Row[]) {
         type: 'next',
         payload: {
           data: {
-            clusterCacheSyncHealthWatch: {
+            clusterCacheHealthWatch: {
               cacheID: `cache-${r.uuid}`,
-              ...syncHealthOf(r),
+              ...healthOf(r),
               lastUpdateAt: r.lastUpdateAt ?? null,
               lastLiveAt: r.lastLiveAt ?? null,
             },
@@ -213,7 +213,7 @@ function pushClusters(rows: Row[]) {
   });
   // Close both delta snapshots. The provider holds the cluster list back until the
   // clustersWatch Bookmark, so without this the panel stays in its connecting state.
-  // (clusterCacheSyncHealthWatch is a latest-value gauge, not a delta watch — no
+  // (clusterCacheHealthWatch is a latest-value gauge, not a delta watch — no
   // Bookmark rides it.)
   clusterCh.onmessage!(
     JSON.stringify({ type: 'next', payload: { data: { clustersWatch: { type: 'Bookmark', cluster: null } } } }),
@@ -302,13 +302,13 @@ function pushCacheStatsFor(cacheId: string, bytes: number) {
 }
 
 // Push a cache's folded verdict directly, for the fields the row fixture doesn't vary.
-function pushSyncHealth(cacheId: string, over: Record<string, unknown>) {
-  channelFor('clusterCacheSyncHealthWatch').onmessage!(
+function pushHealth(cacheId: string, over: Record<string, unknown>) {
+  channelFor('clusterCacheHealthWatch').onmessage!(
     JSON.stringify({
       type: 'next',
       payload: {
         data: {
-          clusterCacheSyncHealthWatch: {
+          clusterCacheHealthWatch: {
             cacheID: cacheId,
             status: 'True',
             reason: 'Watching',
@@ -354,10 +354,7 @@ function pushCachedResource(id: string, resource: string, reason: string, apiVer
   );
 }
 
-function pushDiscovery(
-  cacheId: string,
-  d: { resourceCount: number; lastDiscoveryAt?: string; reason?: string; message?: string },
-) {
+function pushDiscovery(cacheId: string, d: { reason?: string; message?: string } = {}) {
   channelFor('clusterCachedCatalogsWatch').onmessage!(
     JSON.stringify({
       type: 'next',
@@ -368,12 +365,6 @@ function pushDiscovery(
             catalog: {
               id: `disc-${cacheId}`,
               cacheID: cacheId,
-              // stats is resolved on read by the sidecar (never stored on the record),
-              // and is null until a pass has run in the current process.
-              stats:
-                d.lastDiscoveryAt === undefined
-                  ? null
-                  : { lastDiscoveryAt: d.lastDiscoveryAt, resourceCount: d.resourceCount },
               conditions: [
                 {
                   type: 'Discovered',
@@ -831,27 +822,6 @@ describe('ClusterSyncPanel', () => {
     );
   });
 
-  it('shows the discovered kind count and when it was last checked', async () => {
-    const user = await openWith([{ uuid: 'u-disc', name: 'prod', enabled: true, present: true }]);
-    await user.click(await screen.findByRole('button', { name: /synced/i }));
-
-    await act(async () => {
-      pushDiscovery('cache-u-disc', {
-        resourceCount: 137,
-        lastDiscoveryAt: new Date(Date.now() - 45_000).toISOString(),
-      });
-    });
-
-    // The count is the cluster's served kinds, paired with the age of that answer —
-    // discovery is a poll, so "how current is this?" is a real question.
-    expect(await screen.findByText(/kinds discovered/i)).toBeInTheDocument();
-    // The count and the live age share one value cell (the count is a text node, the
-    // age a ticking child), so match on the cell's combined text.
-    expect(
-      await screen.findByText((_, el) => el?.tagName === 'DD' && /137 kinds · 45s ago/.test(el.textContent ?? '')),
-    ).toBeInTheDocument();
-  });
-
   // The discovery watch takes no variables, so every consumer of it resolves to ONE urql
   // operation — and a subscription's second subscriber joins mid-stream with no replay. With
   // a subscription per expanded row, the second row expanded saw nothing until the next
@@ -862,36 +832,30 @@ describe('ClusterSyncPanel', () => {
       { uuid: 'u-b', name: 'beta', enabled: true, present: true },
     ]);
 
-    // The Added burst for both caches, delivered once.
+    // The Added burst for both caches, delivered once. Distinct messages so each row's
+    // assertion can only pass on its own record.
     await act(async () => {
-      pushDiscovery('cache-u-a', { resourceCount: 137, lastDiscoveryAt: new Date(Date.now() - 45_000).toISOString() });
-      pushDiscovery('cache-u-b', { resourceCount: 42, lastDiscoveryAt: new Date(Date.now() - 20_000).toISOString() });
+      pushDiscovery('cache-u-a', { reason: 'DiscoveryPartial', message: 'alpha group did not respond' });
+      pushDiscovery('cache-u-b', { reason: 'DiscoveryPartial', message: 'beta group did not respond' });
     });
 
     const [firstSync, secondSync] = await screen.findAllByRole('button', { name: /synced/i });
     await user.click(firstSync);
-    expect(
-      await screen.findByText((_, el) => el?.tagName === 'DD' && /137 kinds/.test(el.textContent ?? '')),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/alpha group did not respond/i)).toBeInTheDocument();
 
     // The second row must not need a fresh burst of its own.
     await user.click(secondSync);
-    expect(
-      await screen.findByText((_, el) => el?.tagName === 'DD' && /42 kinds/.test(el.textContent ?? '')),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/beta group did not respond/i)).toBeInTheDocument();
   });
 
   it('clears the discovery record when it is hard-deleted (id only, no cacheID)', async () => {
     const user = await openWith([{ uuid: 'u-gone', name: 'prod', enabled: true, present: true }]);
     await user.click(await screen.findByRole('button', { name: /synced/i }));
 
-    await act(async () => {
-      pushDiscovery('cache-u-gone', {
-        resourceCount: 137,
-        lastDiscoveryAt: new Date(Date.now() - 45_000).toISOString(),
-      });
-    });
-    expect(await screen.findByText(/kinds discovered/i)).toBeInTheDocument();
+    await act(async () =>
+      pushDiscovery('cache-u-gone', { reason: 'DiscoveryPartial', message: 'metrics.k8s.io did not respond' }),
+    );
+    expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
 
     // A hard delete carries ONLY the id: the row is already collected, so there is no owner
     // edge left to read a cacheID from and it arrives as "0". This anchor carries no
@@ -905,7 +869,7 @@ describe('ClusterSyncPanel', () => {
             data: {
               clusterCachedCatalogsWatch: {
                 type: 'Deleted',
-                catalog: { id: 'disc-cache-u-gone', cacheID: '0', stats: null, conditions: [] },
+                catalog: { id: 'disc-cache-u-gone', cacheID: '0', conditions: [] },
               },
             },
           },
@@ -913,20 +877,17 @@ describe('ClusterSyncPanel', () => {
       );
     });
 
-    expect(screen.queryByText(/kinds discovered/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/metrics\.k8s\.io did not respond/i)).not.toBeInTheDocument();
   });
 
   it('ignores a hard-deleted discovery record belonging to another cache', async () => {
     const user = await openWith([{ uuid: 'u-keep', name: 'prod', enabled: true, present: true }]);
     await user.click(await screen.findByRole('button', { name: /synced/i }));
 
-    await act(async () => {
-      pushDiscovery('cache-u-keep', {
-        resourceCount: 12,
-        lastDiscoveryAt: new Date(Date.now() - 10_000).toISOString(),
-      });
-    });
-    expect(await screen.findByText(/kinds discovered/i)).toBeInTheDocument();
+    await act(async () =>
+      pushDiscovery('cache-u-keep', { reason: 'DiscoveryPartial', message: 'metrics.k8s.io did not respond' }),
+    );
+    expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
 
     // Matching on the record id is what keeps this scoped now that cacheID is unusable.
     await act(async () => {
@@ -937,7 +898,7 @@ describe('ClusterSyncPanel', () => {
             data: {
               clusterCachedCatalogsWatch: {
                 type: 'Deleted',
-                catalog: { id: 'disc-some-other-cache', cacheID: '0', stats: null, conditions: [] },
+                catalog: { id: 'disc-some-other-cache', cacheID: '0', conditions: [] },
               },
             },
           },
@@ -945,7 +906,7 @@ describe('ClusterSyncPanel', () => {
       );
     });
 
-    expect(await screen.findByText(/kinds discovered/i)).toBeInTheDocument();
+    expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
   });
 
   it('warns when the kind list is known-incomplete, without failing the row', async () => {
@@ -956,8 +917,6 @@ describe('ClusterSyncPanel', () => {
 
     await act(async () => {
       pushDiscovery('cache-u-part', {
-        resourceCount: 12,
-        lastDiscoveryAt: new Date().toISOString(),
         reason: 'DiscoveryPartial',
         // Deliberately not the component's fallback copy, so the assertion proves the
         // condition's own message is what reaches the pane.
@@ -977,28 +936,11 @@ describe('ClusterSyncPanel', () => {
     // this condition did.
     await act(async () => {
       pushDiscovery('cache-u-drain', {
-        resourceCount: 12,
-        lastDiscoveryAt: new Date().toISOString(),
         reason: 'DiscoveryDraining',
         message: 'Waiting for replaced kinds to finish draining',
       });
     });
     expect(await screen.findByText(/still draining|finish draining/i)).toBeInTheDocument();
-  });
-
-  it('omits the discovered-kinds row until a pass has run in this sidecar process', async () => {
-    const user = await openWith([{ uuid: 'u-none', name: 'prod', enabled: true, present: true }]);
-    await user.click(await screen.findByRole('button', { name: /synced/i }));
-
-    // The record exists but its gauges are null — the sidecar restarted and has not
-    // re-measured. Rendering a count off a durable kind list would claim an observation
-    // nobody in this process made.
-    await act(async () => {
-      pushDiscovery('cache-u-none', { resourceCount: 0 });
-    });
-
-    expect(await screen.findByText(/last update received/i)).toBeInTheDocument();
-    expect(screen.queryByText(/kinds discovered/i)).not.toBeInTheDocument();
   });
 
   it('reveals recent sync events when a cached cluster’s sync status is opened', async () => {
@@ -1160,7 +1102,7 @@ describe('ClusterSyncPanel', () => {
     // verdict a previous process wrote. The panel renders it, and must not re-derive it:
     // a second definition of health here could disagree with the badge above it.
     act(() =>
-      pushSyncHealth('cache-u-kinds', {
+      pushHealth('cache-u-kinds', {
         status: 'False',
         reason: 'Stale',
         unhealthyKindRefs: [{ apiVersion: 'example.com/v1', resource: 'widgets' }],
@@ -1180,7 +1122,7 @@ describe('ClusterSyncPanel', () => {
 
     await user.click(await screen.findByRole('button', { name: /synced/i }));
     act(() =>
-      pushSyncHealth('cache-u-pausing', {
+      pushHealth('cache-u-pausing', {
         status: 'False',
         reason: 'Paused',
         unhealthyKindRefs: [],
@@ -1197,7 +1139,7 @@ describe('ClusterSyncPanel', () => {
     const user = await openWith([{ uuid: 'u-ok', name: 'prod', enabled: true, present: true }]);
 
     await user.click(await screen.findByRole('button', { name: /synced/i }));
-    act(() => pushSyncHealth('cache-u-ok', { totalKinds: 2 }));
+    act(() => pushHealth('cache-u-ok', { totalKinds: 2 }));
 
     expect(await screen.findByText('2 kinds')).toBeInTheDocument();
   });
@@ -1265,7 +1207,7 @@ describe('ClusterSyncPanel', () => {
     await act(async () => {
       pushCachedResource('g-builtin', 'gateways', 'Watching', 'gateway.networking.k8s.io/v1');
       pushCachedResource('g-crd', 'gateways', 'SyncFailed', 'example.com/v1');
-      pushSyncHealth('cache-u-gw', {
+      pushHealth('cache-u-gw', {
         status: 'False',
         reason: 'SyncFailed',
         unhealthyKindRefs: [{ apiVersion: 'example.com/v1', resource: 'gateways' }],

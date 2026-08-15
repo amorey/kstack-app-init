@@ -294,21 +294,14 @@ func TestClusterEphemeralFields(t *testing.T) {
 		t.Errorf("conditions should be an empty list, got: %v", resp.Data.Cluster.Conditions)
 	}
 
-	// The cache resolves its conditions + on-disk stats on a bare fixture. It has no status
-	// block: the kind measures nothing itself.
+	// The cache resolves its conditions on a bare fixture. It has no status block: the
+	// kind measures nothing itself.
 	cache := firstCacheFrame(t, srv.URL)
 	if cache["serverUid"] != "uid-1" || cache["clusterID"] != "1" {
 		t.Errorf("cache identity: %v", cache)
 	}
 	if conds, ok := cache["conditions"].([]any); !ok || len(conds) != 0 {
 		t.Errorf("sync conditions should be an empty list, got: %v", cache["conditions"])
-	}
-	stats := cache["stats"].(map[string]any)
-	if stats["exists"] != false || stats["bytes"] != float64(0) {
-		t.Errorf("cache stats placeholder: %v", stats)
-	}
-	if stats["objectCount"] != float64(0) || stats["kindCount"] != float64(0) {
-		t.Errorf("never-cached counts should be 0, got: %v", stats)
 	}
 }
 
@@ -370,8 +363,8 @@ func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 		t.Errorf("Connected condition on the wire: %+v", conds[0])
 	}
 
-	// The cache's coarse Synced condition + stats ride clusterCachesWatch. Freshness does
-	// not: the sync children report it, out of band from the object graph.
+	// The cache's coarse Synced condition rides clusterCachesWatch. Freshness does not:
+	// the sync children report it, out of band from the object graph.
 	cache := firstCacheFrame(t, srv.URL)
 	syncConds, _ := cache["conditions"].([]any)
 	if len(syncConds) != 1 {
@@ -380,11 +373,6 @@ func TestConditionsAndSyncStatusOnWire(t *testing.T) {
 	c0 := syncConds[0].(map[string]any)
 	if c0["type"] != "Synced" || c0["status"] != "True" || c0["reason"] != "Watching" {
 		t.Errorf("Synced condition on the wire: %+v", c0)
-	}
-
-	// Cache stats with no on-disk files: exists=false.
-	if stats := cache["stats"].(map[string]any); stats["exists"] != false {
-		t.Errorf("cache without files should report exists=false")
 	}
 }
 
@@ -607,16 +595,14 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 	}
 }
 
-// The resource-catalog stream serves the record's identity + Discovered condition, keyed to
-// its cache by cacheID — the join the client makes — plus `stats`, which is resolved on
-// read from the controller rather than carried on the record. Asserted on the wire
-// because a resolver that isn't wired returns null rather than failing.
+// The resource-catalog stream serves the record's identity + Discovered condition, keyed
+// to its cache by cacheID — the join the client makes.
 func TestClusterCachedCatalogsWatchServesRecord(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	resp := openSSESubscription(t, srv.URL, "",
 		`subscription { clusterCachedCatalogsWatch { type catalog { id cacheID `+
-			`stats { lastDiscoveryAt resourceCount } conditions { type status reason } } } }`)
+			`conditions { type status reason } } } }`)
 	defer resp.Body.Close()
 	events := sseEvents(t, resp)
 
@@ -647,13 +633,6 @@ func TestClusterCachedCatalogsWatchServesRecord(t *testing.T) {
 			}
 			if frame.Data.Watch.Type != "Added" {
 				t.Fatalf("snapshot change should be Added, got %q", frame.Data.Watch.Type)
-			}
-			stats, _ := d["stats"].(map[string]any)
-			if got := stats["resourceCount"]; got != float64(42) {
-				t.Errorf("resourceCount = %v, want 42", got)
-			}
-			if got := stats["lastDiscoveryAt"]; got != "2026-02-03T04:05:06Z" {
-				t.Errorf("lastDiscoveryAt = %v", got)
 			}
 			conds, _ := d["conditions"].([]any)
 			if len(conds) != 1 {
@@ -725,6 +704,12 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
 				t.Fatalf("decode gvr sync frame %s: %v", ev.data, err)
 			}
+			// Detect the snapshot boundary by type, never by a missing entity: an
+			// errored non-null field nulls its parent, so a null entity also rides
+			// ordinary frames.
+			if frame.Data.Watch.Type == string(types.DeltaFrameBookmark) {
+				continue
+			}
 			seen++
 			sync := frame.Data.Watch.Resource
 			if sync["catalogID"] != strconv.FormatInt(int64(fixtureCatalogID(1)), 10) {
@@ -737,6 +722,63 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 		case <-deadline:
 			if seen != 1 {
 				t.Fatalf("expected exactly this cache's one record, saw %d", seen)
+			}
+			return
+		}
+	}
+}
+
+// TestDeltaWatchClosesSnapshotWithBookmark pins the boundary a consumer waits on before
+// rendering an empty state: exactly one Bookmark, after the Added frames, carrying no
+// entity. Without it a still-listing collection is indistinguishable from an empty one.
+func TestDeltaWatchClosesSnapshotWithBookmark(t *testing.T) {
+	srv := newTestServer(t, clusterFixtures())
+
+	resp := openSSESubscription(t, srv.URL, "",
+		`subscription { clusterCachesWatch { type cache { id } } }`)
+	defer resp.Body.Close()
+	events := sseEvents(t, resp)
+
+	added, bookmarks := 0, 0
+	deadline := time.After(time.Second)
+	for {
+		var frame struct {
+			Data struct {
+				Watch struct {
+					Type  string         `json:"type"`
+					Cache map[string]any `json:"cache"`
+				} `json:"clusterCachesWatch"`
+			} `json:"data"`
+		}
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("stream closed before the bookmark arrived")
+			}
+			if ev.event != "next" {
+				continue
+			}
+			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
+				t.Fatalf("decode cache frame %s: %v", ev.data, err)
+			}
+			switch frame.Data.Watch.Type {
+			case string(types.DeltaFrameBookmark):
+				bookmarks++
+				if frame.Data.Watch.Cache != nil {
+					t.Errorf("the bookmark carries no entity, got: %v", frame.Data.Watch.Cache)
+				}
+				if bookmarks == 1 && added != len(clusterFixtures()) {
+					t.Errorf("bookmark closed the snapshot after %d of %d records", added, len(clusterFixtures()))
+				}
+			case string(types.DeltaFrameAdded):
+				if bookmarks > 0 {
+					t.Error("an Added frame arrived after the snapshot closed")
+				}
+				added++
+			}
+		case <-deadline:
+			if bookmarks != 1 {
+				t.Fatalf("expected exactly one bookmark, saw %d", bookmarks)
 			}
 			return
 		}

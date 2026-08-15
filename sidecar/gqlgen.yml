@@ -23,9 +23,8 @@ models:
   # The GraphQL Cluster types bind 1:1 (same name) into internal/clustersvc/types —
   # gqlgen autobinds with no wrapper. The schema mirrors beehive's
   # owner chain: Cluster.status is the Cluster kind's stored status, and the
-  # ClusterCache child carries the ClusterCache kind's sync status (`status`) plus
-  # live on-disk `stats` (a resolver, so a query pays the stat cost only when it
-  # selects them). The ClusterCache child carries the cluster ID for that resolver.
+  # ClusterCache child carries the ClusterCache kind's sync status (`status`) plus the
+  # cluster ID its resolvers read with.
   Cluster:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.Cluster
     fields:
@@ -125,62 +124,40 @@ models:
   ClusterCache:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCache
     fields:
-      stats:
-        resolver: true
       # kinds and events are separate reads (the cache's SQLite catalog, the beehive
       # event log), so both stay off the record and run only when selected.
       kinds:
         resolver: true
-      syncs:
+      cachedResources:
         resolver: true
       events:
         resolver: true
 
   # The sync children's served spec IS the stored beehive type (no projection layer).
-  # Their `stats` are NOT: those are resolver fields sampled from the controller, because
-  # status is a propagation channel and nothing in the object graph reads them.
-
-  # Likewise the GVR-discovery child: stored spec/status served as-is.
   ClusterCachedCatalog:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedCatalog
-    fields:
-      # Sampled from the controller on read, like ClusterCache.stats — it is not a field
-      # of the stored object (the kind's status is empty by design).
-      stats:
-        resolver: true
   ClusterCachedResource:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedResource
     fields:
-      # Same shape as the discovery's: a controller-held gauge, not stored state.
-      stats:
-        resolver: true
       events:
         resolver: true
   ClusterCachedResourceSpec:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedResourceSpec
-  ClusterCachedResourceStats:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedResourceStats
   ClusterCachedResourceWatchFrame:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedResourceWatchFrame
-  ClusterCacheSyncHealth:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheSyncHealth
+  ClusterCacheHealth:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheHealth
   SyncedKindRef:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.SyncedKindRef
 
   ClusterCachedCatalogSpec:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedCatalogSpec
 
-  ClusterCachedCatalogStats:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedCatalogStats
-
   ClusterCachedCatalogWatchFrame:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedCatalogWatchFrame
 
   ClusterCacheStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheStats
-
-  ClusterCacheResourceStats:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCacheResourceStats
 
   ClusterCachedDataKind:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/types.ClusterCachedDataKind

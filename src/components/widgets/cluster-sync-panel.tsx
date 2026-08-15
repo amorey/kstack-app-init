@@ -29,7 +29,7 @@ import { graphql } from '@/gql';
 import type { ClusterCachedCatalogsSubscription, ClusterCachedResourcesSubscription } from '@/gql/graphql';
 import {
   type Cluster,
-  type ClusterCacheSyncHealth,
+  type ClusterCacheHealth,
   type Keyed,
   applyChange,
   formatBytes,
@@ -201,10 +201,6 @@ const ClusterCachedCatalogsSubscription = graphql(`
       catalog {
         id
         cacheID
-        stats {
-          lastDiscoveryAt
-          resourceCount
-        }
         conditions {
           type
           reason
@@ -405,7 +401,7 @@ function statusOf(c: Cluster, group: Group): { label: string; tone: Tone } {
   // the cache's coarse Synced condition nor any single kind's would do. The
   // `Discovered` axis deliberately doesn't participate (a partial kind list doesn't
   // stop known kinds from syncing) — it's a note in SyncDetail instead.
-  const health = c.activeCache?.syncHealth;
+  const health = c.activeCache?.health;
   // No rollup yet — nothing observed, only work in progress.
   if (!health) return { label: 'Syncing', tone: 'ok' };
   switch (health.reason) {
@@ -684,7 +680,7 @@ function CacheSizeCell({ contents }: { contents: CacheContents | null }) {
 // "118 of 120 kinds — widgets, gateways not syncing", or plain "120 kinds". Read
 // straight off the rollup — re-folding the per-kind stream here would be a second
 // definition of health that can disagree with the badge above it mid-frame.
-function kindsSyncingLabel(health: ClusterCacheSyncHealth): string {
+function kindsSyncingLabel(health: ClusterCacheHealth): string {
   if (health.unhealthyKinds === 0) return countLabel(health.totalKinds, 'kind');
   const syncing = `${health.totalKinds - health.unhealthyKinds} of ${countLabel(health.totalKinds, 'kind')}`;
   // unhealthyKinds counts every non-Watching kind; unhealthyKindRefs names only the
@@ -699,7 +695,7 @@ function kindsSyncingLabel(health: ClusterCacheSyncHealth): string {
 // wire carries the full sorted list.
 const OFFENDER_CAP = 3;
 
-function offenderList(health: ClusterCacheSyncHealth): string {
+function offenderList(health: ClusterCacheHealth): string {
   // Plural alone; the ref's api group is for keying, not display.
   const names = health.unhealthyKindRefs.map((k) => k.resource);
   if (names.length <= OFFENDER_CAP) return names.join(', ');
@@ -709,7 +705,7 @@ function offenderList(health: ClusterCacheSyncHealth): string {
 // Which per-kind record's transition log to show. Deterministic and sticky (first
 // sorted offender) — picking "whichever unhealthy record arrived first" would
 // re-key the subscription per frame. Falls back to Events, always present.
-function timelineSyncFor(all: CachedResource[], health: ClusterCacheSyncHealth): CachedResource | null {
+function timelineSyncFor(all: CachedResource[], health: ClusterCacheHealth): CachedResource | null {
   const firstOffender = health.unhealthyKindRefs[0];
   if (firstOffender) {
     // Match the whole kind, not the plural: a CRD may reuse a built-in's plural
@@ -723,16 +719,6 @@ function timelineSyncFor(all: CachedResource[], health: ClusterCacheSyncHealth):
 // "2,203 objects across 120 kinds" (includes cached events, matching the engine's rollup).
 function cacheSummary(objectCount: number, kindCount: number): string {
   return `${countLabel(objectCount, 'object')} across ${countLabel(kindCount, 'kind')}`;
-}
-
-// Kind-discovery reading: count + when last confirmed. Discovery is poll-refreshed
-// (no resourceVersion to watch), so its currency is a real question — hence the
-// live timestamp beside the count. null until a pass lands, so the caller omits
-// the row rather than claiming a count nobody observed.
-function discoveredKinds(discovery: CachedCatalog | null): { prefix: string; ms: number } | null {
-  const lastMs = parseTimeOrNull(discovery?.stats?.lastDiscoveryAt ?? null);
-  if (!discovery?.stats || lastMs === null) return null;
-  return { prefix: `${countLabel(discovery.stats.resourceCount, 'kind')} · `, ms: lastMs };
 }
 
 // Warning about the kind list itself, distinct from whether kinds are syncing (a
@@ -764,7 +750,7 @@ function SyncDetail({
   contents,
   discovery,
 }: {
-  health: ClusterCacheSyncHealth;
+  health: ClusterCacheHealth;
   cacheId: string;
   contents: CacheContents | null;
   discovery: CachedCatalog | null;
@@ -801,9 +787,6 @@ function SyncDetail({
             written (a quiet cluster legitimately goes hours without), "Sync verified"
             is the watch's last proof of life (delta or bookmark) — only the pair says
             an old update time is fine. */}
-        {/* What the cluster serves, and how current that answer is; omitted until
-            the discovery record streams in. */}
-        <DetailRow label="Kinds discovered" {...(discoveredKinds(discovery) ?? { ms: null })} />
         {/* Per-kind sync health — kinds fail independently, so one forbidden CRD is
             invisible in every other reading. Omitted until something has streamed in. */}
         {health.totalKinds > 0 ? (
@@ -903,7 +886,7 @@ function ClusterRow({
   const toggleDetail = (pane: Exclude<DetailPane, null>) => setOpenDetail(openDetail === pane ? null : pane);
   // Sync label is a disclosure only once the rollup has streamed in — a
   // pending/never-synced row has nothing to open.
-  const sync = cluster.activeCache?.syncHealth;
+  const health = cluster.activeCache?.health;
   const pending = isPending(cluster);
   const { enabled } = cluster.spec;
   // Sync toggles only for an enabled, identified cluster still in the kubeconfig.
@@ -932,8 +915,8 @@ function ClusterRow({
           />
         </TableCell>
         <TableCell className="align-top">
-          {/* Disclosure once the sync child has streamed in, else plain text. */}
-          {sync ? (
+          {/* Disclosure once the rollup has streamed in, else plain text. */}
+          {health ? (
             <DisclosureLabel
               tone={status.tone}
               label={status.label}
@@ -1004,11 +987,11 @@ function ClusterRow({
           </TableCell>
         </TableRow>
       ) : null}
-      {openDetail === 'sync' && sync ? (
+      {openDetail === 'sync' && health ? (
         <TableRow className="hover:bg-transparent">
           <TableCell className={STATUS_CELL_CLASS} />
           <TableCell colSpan={COLUMN_COUNT - 1} className="pt-0">
-            <SyncDetail health={sync} cacheId={sync.cacheID} contents={contents} discovery={discovery} />
+            <SyncDetail health={health} cacheId={health.cacheID} contents={contents} discovery={discovery} />
           </TableCell>
         </TableRow>
       ) : null}

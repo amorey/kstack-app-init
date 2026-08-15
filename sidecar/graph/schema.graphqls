@@ -64,7 +64,7 @@ Sync-controller conditions: `Synced`, reported at two levels. On
 only whether it decided to sync. The verdict a UI wants is the one on the cache's
 sync children — the per-kind `ClusterCachedResource` records (reasons
 Syncing/Watching/Paused/NoConnection/SyncFailed/Stale), or their whole-cache rollup
-`clusterCacheSyncHealthWatch`, which speaks the same vocabulary.
+`clusterCacheHealthWatch`, which speaks the same vocabulary.
 `ClusterCachedCatalog` reports its own axis on its own type: `Discovered` (reasons
 Discovered/DiscoveryPartial/DiscoveryFailed/Paused/NoConnection). New types/reasons may appear; consumers should
 treat unknown spellings as a degraded/unknown display state.
@@ -387,9 +387,9 @@ type ClusterWatchFrame {
 A cache record, mirroring the beehive ClusterCache kind: a mirror of one physical
 cluster identity. Streamed independently of its parent Cluster via
 `clusterCachesWatch` and joined to it client-side by `clusterID`. Carries its
-identity (`id`, `clusterID`, `serverUid`), observed sync `status`, and live on-disk
-`stats` (a nested object so a consumer fetches the stat-querying stats only when it
-selects them). A cluster owns one per identity it has mirrored; the *active* cache
+identity (`id`, `clusterID`, `serverUid`) and observed sync `status`; its live
+on-disk stats ride `clusterCacheStatsWatch`, which stays current where a field here
+would freeze at subscribe time. A cluster owns one per identity it has mirrored; the *active* cache
 — the one a sync engine runs for and a UI shows for the row — is the one whose
 `serverUid` matches the cluster's last-probed `status.server.uid`, a join the
 client derives (it is not a field here, because it depends on the parent's status,
@@ -402,10 +402,8 @@ type ClusterCache {
   clusterID: ObjectID!
   "The kube-system namespace UID of the physical cluster this cache mirrors — the identity a physical migration turns over. Matches the parent cluster's `status.server.uid` while this is the active cache."
   serverUid: String!
-  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's sync children (`clusterCachedResourcesWatch`, `clusterCachedCatalogsWatch`) or their rollup (`clusterCacheSyncHealthWatch`), which is also why this record carries no status block of its own."
+  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's sync children (`clusterCachedResourcesWatch`, `clusterCachedCatalogsWatch`) or their rollup (`clusterCacheHealthWatch`), which is also why this record carries no status block of its own."
   conditions: [Condition!]!
-  "Live on-disk cache statistics, queried on demand."
-  stats: ClusterCacheStats!
 
   """
   The kinds this cache's API server advertises (from `/apis` discovery), read
@@ -468,8 +466,8 @@ records below it, which answer "is each kind's mirror current?". Streamed indepe
 `clusterCachedCatalogsWatch` and joined to its cache client-side by `cacheID`.
 
 Discovery has no watch API — the served-kinds document carries no resourceVersion — so
-this record is refreshed by a poll (every few minutes) and `status.lastDiscoveryAt` is
-how a consumer judges its currency.
+this record is refreshed by a poll (every few minutes). How current its answer is has no
+field here and no stream of its own: the pass's gauges are not served yet.
 
 The record lives as long as its cache: pausing writes `spec.enabled = false` rather than
 deleting it, so the last-known kind list survives a pause.
@@ -480,18 +478,6 @@ type ClusterCachedCatalog {
   "The id of the ClusterCache this belongs to. The client joins the discovery onto its cache by this id."
   cacheID: ObjectID!
   spec: ClusterCachedCatalogSpec!
-  """
-  What the last discovery pass measured, read live from the sidecar when you ask for it
-  — a metrics-server-style gauge, not stored state. Null until a pass has run in the
-  current sidecar process (so: null right after a restart, even though the kind list it
-  would describe is durable and still there — *when it was confirmed* is an observation,
-  and this process has not made it).
-
-  It is deliberately not part of `status`: a status write propagates to the record's
-  dependents, and nothing in the object graph reacts to these numbers. Being a resolved
-  field, it also costs nothing on a frame that doesn't select it.
-  """
-  stats: ClusterCachedCatalogStats
   """
   This record's `Discovered` condition — the per-component verdict (reasons
   Discovered/DiscoveryPartial/DiscoveryFailed/Paused/NoConnection). `DiscoveryPartial`
@@ -505,18 +491,6 @@ type ClusterCachedCatalog {
 type ClusterCachedCatalogSpec {
   "Whether discovery should be running. False means its per-GVR children are switched off — the records stay, holding the last-known kind list."
   enabled: Boolean!
-}
-
-"What a discovery pass measured, sampled on read."
-type ClusterCachedCatalogStats {
-  "When the last pass reached the API server (including one that got a partial answer). The currency of the kind list."
-  lastDiscoveryAt: Time!
-  """
-  How many syncable GVRs that pass saw. Deliberately not the number of per-GVR records
-  that exist: after a partial pass the un-pruned survivors of the groups that did not
-  answer are still there, and reporting them here would claim a drop that did not happen.
-  """
-  resourceCount: Int!
 }
 
 "One frame on the `clusterCachedCatalogsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
@@ -544,16 +518,6 @@ type ClusterCachedResource {
   "The id of the ClusterCachedCatalog that owns this kind — the client's join key."
   catalogID: ObjectID!
   spec: ClusterCachedResourceSpec!
-  """
-  This kind's sync freshness, read live from the sidecar when you ask for it — a
-  metrics-server-style gauge, not stored state. Null until this kind's worker has
-  reported in the current sidecar process.
-
-  Deliberately not part of `status`: a status write propagates to dependents, and with
-  a hundred of these per cache a stored stamp would wake the parent cache a hundred
-  times every heartbeat.
-  """
-  stats: ClusterCachedResourceStats
   """
   This record's `Synced` condition — this kind's own verdict (reasons
   Watching/Syncing/Stale/SyncFailed/Paused/NoConnection), independent of every other
@@ -585,14 +549,6 @@ type ClusterCachedResourceSpec {
   namespaced: Boolean!
 }
 
-"One synced kind's freshness, sampled on read."
-type ClusterCachedResourceStats {
-  "When an object of this kind was last written to the cache. Null if none ever has — which on a quiet kind is normal, not a fault."
-  lastUpdateAt: Time
-  "When this kind's watch last proved itself live (a delta or a bookmark). Null before the first proof. This, not `lastUpdateAt`, is what staleness is judged on."
-  lastLiveAt: Time
-}
-
 "One frame on the `clusterCachedResourcesWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
 type ClusterCachedResourceWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
@@ -617,7 +573,7 @@ One cache's sync verdict, folded from every kind it syncs. Shaped like a `Condit
 purpose — same `status`/`reason`/`message` vocabulary as a per-kind record — so a client
 renders a cache exactly as it renders one kind.
 """
-type ClusterCacheSyncHealth {
+type ClusterCacheHealth {
   "The cache this verdict is for. The client keys its map on this and joins onto the cache by it."
   cacheID: ObjectID!
   status: ConditionStatus!
@@ -904,7 +860,7 @@ type Subscription {
   clusterCachesWatch: ClusterCacheWatchFrame!
 
   "Every cache's folded sync verdict as a gauge, keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's, so the client drops one when its cache leaves `clusterCachesWatch`."
-  clusterCacheSyncHealthWatch: ClusterCacheSyncHealth!
+  clusterCacheHealthWatch: ClusterCacheHealth!
 
   "The caches' resource catalogs as a delta watch, joined onto caches by `cacheID`. Unscoped: one record per cache."
   clusterCachedCatalogsWatch: ClusterCachedCatalogWatchFrame!

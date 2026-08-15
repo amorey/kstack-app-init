@@ -63,11 +63,11 @@ function pushCacheChange(type: 'Added' | 'Modified' | 'Deleted', cache: object) 
   );
 }
 
-// Push one cache's folded sync verdict on the clusterCacheSyncHealthWatch stream. A
+// Push one cache's folded sync verdict on the clusterCacheHealthWatch stream. A
 // latest-value gauge, so there is no change type — each frame replaces the last.
 function pushSyncChange(_type: 'Added' | 'Modified' | 'Deleted', health: object) {
-  channelFor('clusterCacheSyncHealthWatch').onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { clusterCacheSyncHealthWatch: health } } }),
+  channelFor('clusterCacheHealthWatch').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { clusterCacheHealthWatch: health } } }),
   );
 }
 
@@ -111,7 +111,7 @@ function SyncProbe() {
     <div data-testid="probe">
       {clusters === null
         ? 'null'
-        : JSON.stringify(clusters.map((c) => `${c.spec.name}:${c.activeCache?.syncHealth?.reason ?? '-'}`))}
+        : JSON.stringify(clusters.map((c) => `${c.spec.name}:${c.activeCache?.health?.reason ?? '-'}`))}
     </div>
   );
 }
@@ -224,7 +224,7 @@ describe('useClusters', () => {
     );
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_subscribe',
-      expect.objectContaining({ query: expect.stringContaining('clusterCacheSyncHealthWatch') }),
+      expect.objectContaining({ query: expect.stringContaining('clusterCacheHealthWatch') }),
     );
   });
 

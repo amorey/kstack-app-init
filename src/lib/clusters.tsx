@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // The app's cluster registry: reduces the three per-kind delta watches
-// (`clustersWatch`, `clusterCachesWatch`, `clusterCacheSyncHealthWatch`) into
+// (`clustersWatch`, `clusterCachesWatch`, `clusterCacheHealthWatch`) into
 // id-keyed maps, then joins client-side — caches onto clusters (active cache =
 // `serverUid` matches `status.server.uid`), the folded sync verdict onto that cache
 // by `cacheID`. Why per-kind streams + client joins:
@@ -29,7 +29,7 @@ import { graphql } from '@/gql';
 import type {
   ClustersWatchSubscription,
   ClusterCachesWatchSubscription,
-  ClusterCacheSyncHealthWatchSubscription,
+  ClusterCacheHealthWatchSubscription,
 } from '@/gql/graphql';
 import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 
@@ -38,12 +38,12 @@ import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 // so nothing downstream of them ever sees one.
 type ClusterRow = NonNullable<ClustersWatchSubscription['clustersWatch']['cluster']>;
 type CacheRow = NonNullable<ClusterCachesWatchSubscription['clusterCachesWatch']['cache']>;
-export type ClusterCacheSyncHealth = ClusterCacheSyncHealthWatchSubscription['clusterCacheSyncHealthWatch'];
+export type ClusterCacheHealth = ClusterCacheHealthWatchSubscription['clusterCacheHealthWatch'];
 
 // A cache joined with its sync verdict (null until that frame lands). The selection
 // is deliberately thin — omitting the coarse `Synced` condition from the query
 // enforces "the UI doesn't read it" at the schema level.
-type JoinedCache = CacheRow & { syncHealth: ClusterCacheSyncHealth | null };
+type JoinedCache = CacheRow & { health: ClusterCacheHealth | null };
 
 // A cluster joined with its active cache (`serverUid` matches `status.server.uid`);
 // null when never probed or mid-migration.
@@ -101,19 +101,15 @@ const ClusterCachesWatchSubscription = graphql(`
         id
         clusterID
         serverUid
-        # No stats: whether a cache file exists, its size and its object/kind counts all
-        # ride clusterCacheStatsWatch, since a settled cache's record stops changing and a
-        # field here would freeze at whatever the cache held when the window subscribed.
-        # Each stats field is also a resolver call (a filesystem stat plus a kind_counts
-        # read) per cache on every frame of this always-mounted stream.
+        # On-disk stats ride clusterCacheStatsWatch, subscribed per expanded row.
       }
     }
   }
 `);
 
-const ClusterCacheSyncHealthWatchSubscription = graphql(`
-  subscription ClusterCacheSyncHealthWatch {
-    clusterCacheSyncHealthWatch {
+const ClusterCacheHealthWatchSubscription = graphql(`
+  subscription ClusterCacheHealthWatch {
+    clusterCacheHealthWatch {
       cacheID
       status
       reason
@@ -190,9 +186,9 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
   // A latest-value gauge, not a delta stream: each frame replaces that cache's
   // reading outright. Which verdicts are LIVE is decided below, against the cache stream.
   const [{ data: verdictMap }] = useWatchSubscription(
-    { query: ClusterCacheSyncHealthWatchSubscription },
-    (prev: Keyed<ClusterCacheSyncHealth> | undefined, data) => {
-      const h = data.clusterCacheSyncHealthWatch;
+    { query: ClusterCacheHealthWatchSubscription },
+    (prev: Keyed<ClusterCacheHealth> | undefined, data) => {
+      const h = data.clusterCacheHealthWatch;
       return applyChange(prev, 'Added', h.cacheID, h);
     },
   );
@@ -201,10 +197,10 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
   // sweep gated on verdict traffic never runs once the fleet goes quiet. And since
   // the streams carry no mutual ordering, an early verdict is only HIDDEN until its
   // cache lands — eviction would lose it for good.
-  const healthMap = useMemo<Keyed<ClusterCacheSyncHealth> | undefined>(() => {
+  const healthMap = useMemo<Keyed<ClusterCacheHealth> | undefined>(() => {
     if (!verdictMap) return undefined;
     if (!cacheMap) return new Map();
-    const live = new Map<string, ClusterCacheSyncHealth>();
+    const live = new Map<string, ClusterCacheHealth>();
     verdictMap.forEach((h, cacheID) => {
       if (cacheMap.has(cacheID)) live.set(cacheID, h);
     });
@@ -222,7 +218,7 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
       const active = caches.find((cache) => cache.clusterID === c.id && cache.serverUid === c.status.server.uid);
       return {
         ...c,
-        activeCache: active ? { ...active, syncHealth: healthMap?.get(active.id) ?? null } : null,
+        activeCache: active ? { ...active, health: healthMap?.get(active.id) ?? null } : null,
       };
     });
   }, [clusterMap, cacheMap, healthMap]);

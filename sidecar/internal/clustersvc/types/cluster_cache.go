@@ -44,7 +44,7 @@ type ClusterCacheSpec struct {
 }
 
 // ClusterCacheStatus is empty — this kind reports through its conditions alone;
-// the rollup a UI wants is served read-side by Caches().WatchSyncHealth.
+// the rollup a UI wants is served read-side by Caches().WatchHealth.
 type ClusterCacheStatus struct{}
 
 // EventsKind / EventsAPIVersion / EventsResource identify the Event collection — an
@@ -114,21 +114,9 @@ type ClusterCachedCatalogSpec struct {
 }
 
 // ClusterCachedCatalogStatus is empty, deliberately: status is a propagation
-// channel — for state a dependent reacts to, not for pass gauges, which nothing in
-// the object graph reads. The gauges are served out of band
-// (ClusterCachedCatalogStats); the Discovered condition is what remains.
+// channel — for state a dependent reacts to, not for a discovery pass's gauges,
+// which nothing in the object graph reads. The Discovered condition is what remains.
 type ClusterCachedCatalogStatus struct{}
-
-// ClusterCachedCatalogStats is one cache's live discovery gauges, held in memory
-// and read on request — never stored. Nil means this process has run no pass for
-// that cache yet.
-type ClusterCachedCatalogStats struct {
-	// LastDiscoveryAt is when the last pass reached the API server (partial included).
-	LastDiscoveryAt time.Time
-	// ResourceCount is how many syncable GVRs that pass saw — deliberately not
-	// "how many children exist" (a partial pass leaves un-pruned survivors).
-	ResourceCount int
-}
 
 // ClusterCachedCatalog is the view of one ClusterCachedCatalog beehive
 // object: a cache's kind-catalog record — which kinds the cluster serves, when that
@@ -141,8 +129,7 @@ type ClusterCachedCatalog struct {
 	Spec    ClusterCachedCatalogSpec
 	// Conditions are beehive object conditions, read off the object rather than out of
 	// the status blob — `Discovered`, carrying this component's own verdict. There is no
-	// Status field: the kind's status is empty by design, and the pass's gauges are
-	// served out of band (ClusterCachedCatalogStats).
+	// Status field: the kind's status is empty by design.
 	Conditions []Condition
 }
 
@@ -213,19 +200,6 @@ type ClusterCachedResourceWatchFrame struct {
 	Resource *ClusterCachedResource
 }
 
-// ClusterCachedResourceStats are one kind's sync freshness stamps — measured by its
-// worker, held in memory, served on request. Out of status for the usual reason, with
-// extra force here: with a hundred of these per cache a stored stamp would mean a
-// hundred parent wakes every heartbeat.
-type ClusterCachedResourceStats struct {
-	// LastUpdateAt is when an object of this kind was last written to the cache; nil if
-	// never.
-	LastUpdateAt *time.Time
-	// LastLiveAt is when the worker's watch last proved live (a delta or a bookmark);
-	// nil if never.
-	LastLiveAt *time.Time
-}
-
 // SyncedKindRef identifies one synced kind exactly. The plural alone is what a UI
 // renders, but it does not IDENTIFY a kind — a CRD may reuse a built-in's plural
 // under another api group — so anything that keys on a kind needs the pair.
@@ -234,7 +208,7 @@ type SyncedKindRef struct {
 	Resource   string
 }
 
-// ClusterCacheSyncHealth is one cache's sync verdict, folded from every kind it syncs.
+// ClusterCacheHealth is one cache's sync verdict, folded from every kind it syncs.
 //
 // A READ-SIDE projection, not a stored condition: status is for state a dependent
 // reacts to, and nothing in the object graph reacts to this — only a UI does. Storing
@@ -245,7 +219,7 @@ type SyncedKindRef struct {
 // kind, and no single child's verdict is the cache's — ninety-nine healthy kinds and
 // one forbidden CRD is not healthy, and reading any one child would call it either way
 // at random.
-type ClusterCacheSyncHealth struct {
+type ClusterCacheHealth struct {
 	CacheID ClusterCacheID
 	// Status/Reason mirror a Condition's shape (and its reason vocabulary), so a consumer
 	// renders this exactly as it renders a per-kind verdict.
