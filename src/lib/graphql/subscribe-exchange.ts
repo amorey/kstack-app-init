@@ -90,6 +90,10 @@ export const tauriSubscriptionExchange = subscriptionExchange({
         // report gate only on `next` — else a server that 200s then drops
         // would re-report every cycle.
         let reportedOutage = false;
+        // Set when a connection died of a terminal watch failure, cleared by the
+        // next healthy frame. Such a connection opens and dies immediately, so
+        // `open` is not evidence the watch works.
+        let watchFailed = false;
         let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
         // `report: false` is the graceful `complete` — reconnect silently.
@@ -139,8 +143,11 @@ export const tauriSubscriptionExchange = subscriptionExchange({
             }
             if (msg.type === 'open') {
               // Bump the generation before the snapshot folds in. Reset backoff
-              // here too: an empty-snapshot recovery never sends a `next`.
-              attempt = 0;
+              // here too: an empty-snapshot recovery never sends a `next`. Not
+              // after a watch failure, though — the server accepts the
+              // subscription and kills it again, so resetting on each open would
+              // pin the retry at the base delay forever.
+              if (!watchFailed) attempt = 0;
               markConnected(key);
             } else if (msg.type === 'next') {
               const reason = terminalError(msg.payload);
@@ -149,11 +156,13 @@ export const tauriSubscriptionExchange = subscriptionExchange({
                 // last-known data, reconnect. Never the sink — urql merges each frame
                 // into the previous result, so an errors-only frame would re-deliver
                 // the last frame's data and fold it a second time.
+                watchFailed = true;
                 end(reason, msg.payload);
                 return;
               }
               // Healthy frame: outage over; next abnormal drop reports fresh.
               attempt = 0;
+              watchFailed = false;
               reportedOutage = false;
               sink.next(msg.payload as never);
             } else if (msg.type === 'error') {

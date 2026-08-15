@@ -292,6 +292,46 @@ describe('tauriSubscriptionExchange', () => {
     unsubscribe();
   });
 
+  // A watch the server rejects on every subscribe opens cleanly each time and dies
+  // immediately after. If `open` reset the backoff, that pins the retry at the base
+  // delay forever — a permanent failure re-subscribing once a second, each `open`
+  // bumping the generation and blanking the view's last-known data.
+  it('keeps growing backoff when every retry dies of the same watch failure', async () => {
+    vi.useFakeTimers();
+    const { unsubscribe } = start();
+    await flush();
+
+    const failWatch = () =>
+      liveChannel().onmessage!(
+        JSON.stringify({
+          type: 'next',
+          payload: { errors: [{ message: 'permissions revoked' }], extensions: { watchFailed: true } },
+        }),
+      );
+
+    liveChannel().onmessage!(OPEN);
+    failWatch();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(subscribeCalls()).toBe(2);
+
+    // Second cycle: the open must not undo the first failure's backoff step.
+    liveChannel().onmessage!(OPEN);
+    failWatch();
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(subscribeCalls()).toBe(2); // still waiting — proves it is the 2s step…
+    await vi.advanceTimersByTimeAsync(1);
+    expect(subscribeCalls()).toBe(3); // …not another 1s
+
+    // A healthy frame ends the failure run, so the next drop starts over.
+    liveChannel().onmessage!(OPEN);
+    liveChannel().onmessage!(NEXT(1));
+    liveChannel().onmessage!(CLOSED);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(subscribeCalls()).toBe(4);
+
+    unsubscribe();
+  });
+
   it('resets backoff on `open`, so a drop after an empty-snapshot recovery retries promptly', async () => {
     vi.useFakeTimers();
     const { unsubscribe } = start();
