@@ -462,8 +462,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 		return nil, fmt.Errorf("open beehive store: %w", err)
 	}
 	// WithEventRetention bounds each (object, category) timeline to maxEventRuns runs.
-	// No kind runs a periodic full pass: controllers re-arm via RequeueAfter and the
-	// out-of-band buses cover the rest (see registerControllers for the startup pass).
+	// The pass cadences are declared per kind at registration; see startupPass.
 	bh, err := beehive.New(bhStore, beehive.WithEventRetention(maxEventRuns, 0))
 	if err != nil {
 		bhStore.Close()
@@ -491,16 +490,25 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 // The cluster's is returned on its own as well, since New holds it for its machinery.
 // kubeconfigPath is that controller's own configuration, which is why it is a parameter
 // while everything else the four need travels in deps.
+// startupPass reconciles every object of a kind once per process. Each of these four
+// owns state a restart invalidates and the store cannot report as owed: a live
+// connection, a running worker, an in-memory schedule. The store reads settled, because
+// the generation was observed by a process that is gone.
+//
+// There is deliberately no periodic full pass behind it — controllers re-arm with
+// RequeueAfter, and the out-of-band buses cover the rest.
+var startupPass = beehive.WithStartupFullPass(true)
+
 func registerControllers(bh *beehive.Beehive, d deps, kubeconfigPath string) (*clusterController, []startCloser, error) {
 	cluster := newClusterController(kubeconfigPath, d)
 	cache := &clusterCacheController{deps: d}
 	catalog := &clusterCachedCatalogController{}
 	resource := &clusterCachedResourceController{}
 
-	_, errCluster := beehive.Register(bh, ClusterGroupKind, cluster)
-	_, errCache := beehive.Register(bh, ClusterCacheGroupKind, cache)
-	_, errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog)
-	_, errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource)
+	_, errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass)
+	_, errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
+	_, errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
+	_, errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
 	if err := errors.Join(errCluster, errCache, errCatalog, errResource); err != nil {
 		return nil, nil, err
 	}

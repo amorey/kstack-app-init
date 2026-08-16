@@ -85,7 +85,11 @@ lifecycle — read `clusterController.machinery()` for what the Cluster kind own
 other controller grows land the same way. Otherwise the composition root accumulates every kind's
 detail.
 `registerControllers` builds and registers all four, returning them in registration order plus the
-cluster's on its own, which is the one `New` keeps a reference to.
+cluster's on its own, which is the one `New` keeps a reference to. All four register with
+`startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
+reads as settled, since the generation was observed by a process that is gone. **No periodic full
+pass** — controllers re-arm with `RequeueAfter` and the out-of-band buses cover the rest.
+→ [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
 
 **Shared dependencies travel in `deps`** — one beehive client per kind plus the process-wide services
 (`poke` today), built once by `newDeps(bh, pokeSvc)` and **embedded** by `service` and by each
@@ -123,6 +127,13 @@ is still the active identity), so a flip on the cluster has to reach the cache �
 wakes nothing. `clusterCacheController.Reconcile` therefore declares `AddDependency(cache, cluster)`;
 re-asserting an existing edge records nothing, so every later pass is free. A relay written without
 one sits stale until something unrelated wakes the child.
+
+**The rest of the chain needs no edge, because the relay lands in the child's own spec.** A parent
+writes `Enabled` onto the catalog, and the catalog onto each resource — a spec write bumps the
+generation, which is already a wake. The cache is the exception precisely because
+`ClusterCacheSpec` is identity-only (`serverUID`): its switch is never written to it, so it has to
+read the cluster, and reading another object is what an edge pays for. Adding a `depends_on` where a
+spec write already carries the value buys nothing and doubles the wakes.
 
 **Importers create Cluster records; controllers reconcile them.** An importer runs *outside* beehive
 because it decides which objects exist — which means running when there are none, and a controller
