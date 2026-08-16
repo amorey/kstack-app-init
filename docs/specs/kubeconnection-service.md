@@ -72,10 +72,9 @@ key fingerprints credentials only, so two callers under one key with different t
 otherwise silently share whichever connection built first. Callers supply credentials; the service
 supplies the tuning.
 
-Two fields are deliberately *not* stamped. **`WrapTransport` is composed, not owned** — clientcmd
-adds an auth provider's wrapper to it (`rest/transport.go:144`), so overwriting it breaks
-authentication for exactly the gcp/oidc contexts that need it; wrap with `cfg.Wrap` if anything is
-ever added. And **`ContentType` must stay JSON**: the dynamic client decodes unstructured, so
+Two fields are deliberately *not* stamped. **`WrapTransport` is composed, not owned** — it is a
+chain, and `cfg.Wrap` is how you add to one; assigning it would silently drop whatever a caller had
+already put there. And **`ContentType` must stay JSON**: the dynamic client decodes unstructured, so
 stamping protobuf would break it.
 
 Keying on credentials rather than on a cluster id means two records aimed at the same cluster
@@ -95,7 +94,9 @@ type Identity struct {
     Username      string
     // UIDErr is why ServerUID is empty, when a response came back saying so. The
     // caller renders it, so it must survive as an error rather than as a bool: a 403
-    // (no RBAC on kube-system) and a 404 are different things to tell a user.
+    // (no RBAC on kube-system) and a 404 are different things to tell a user. It also
+    // makes Identity uncomparable — == on an error panics for a dynamic type that is
+    // itself uncomparable, so compare the fields.
     UIDErr error
 }
 
@@ -124,11 +125,38 @@ common on shared clusters, so it is a state to report rather than one to leave l
 **Reporting it pulls one condition write into this pass.** The vocabulary is already built and
 already on the wire: `LiveCondition(ConditionConnected, …)`, the reasons in `shared.go`, and
 `Cluster.conditions` — which are beehive object rows, written with `client.SetCondition`, not part
-of the status blob. So the controller writes `Connected` after each fold: `ReasonConnected` on a
-clean probe, `ReasonProbeFailed` on a transport failure, and a new `ReasonIdentityUnavailable` —
-status still **True**, since the connection works — carrying `UIDErr` as its message. Amend
-`ConditionConnected`'s doc comment in the same commit: it currently promises the probe "resolved
-its identity facts", which this makes untrue. The rest of the conditions stay out of scope.
+of the status blob. So the controller writes `Connected` after each pass, over the whole state
+space rather than the happy path:
+
+| State | Status | Reason |
+| --- | --- | --- |
+| Ineligible — untracked this pass | False | `ReasonInactive` |
+| Tracked, no result yet | Unknown | `ReasonConnecting` |
+| Context would not resolve (`ErrContextNotFound`, `ErrNotRead`) | False | `ReasonResolveFailed` |
+| Probe failed at the transport | False | `ReasonProbeFailed` |
+| Probed, UID unreadable | True | `ReasonIdentityUnavailable` (new) |
+| Probed clean | True | `ReasonConnected` |
+
+The two states with no obvious reason are the ones that need naming most. **Never probed** is the
+normal state at boot — the same case rule 3 handles for status — and `ReasonProbeFailed` would be a
+lie while silence leaves the condition absent; `ReasonConnecting` at `shared.go:211` is written for
+exactly it. **Untracked** is the one that rots: liveness only downgrades across a process restart,
+so an orphaned cluster would otherwise wear `Connected: True` for the whole session.
+`ReasonResolveFailed` likewise exists to keep a vanished kube-context distinct from a cluster that
+would not answer — folding it into `ProbeFailed` throws away the distinction the constant was made
+for.
+
+**The message must be stable across identical outcomes.** beehive suppresses an unchanged condition
+(`conditionUnchanged`, which compares status, reason **and message**), and that suppression is what
+makes a write-every-pass condition free. A raw `err.Error()` defeats it: Go's net errors carry the
+ephemeral port, and a cluster behind a rotating IP carries the address, so the message differs every
+probe — a version bump per cluster per probe, and a frame to every webview, since
+`src/lib/clusters.tsx` selects `{ type status reason message lastTransitionedAt }`. Normalize to the
+classified reason plus a canonical detail; never pass a transport error through verbatim.
+
+Amend `ConditionConnected`'s doc comment in the same commit: it currently promises the probe
+"resolved its identity facts", which `ReasonIdentityUnavailable` makes untrue. The rest of the
+conditions stay out of scope.
 
 Plain HTTP means `httptest` covers this without a cluster — including the 403 and 404 paths, which
 are the ones worth writing.
@@ -196,6 +224,12 @@ while the identity every cluster needs still costs one dial.
 A cluster whose one probe failed reports the failure and does not retry until asked — which is what
 `RetryConnection` is for, and what the failure ladder covers for a cluster under demand.
 
+**The first probes are bounded.** The startup full pass tracks every enabled cluster at once, so
+without a cap a 30-context kubeconfig dials 30 servers and runs 30 credential helpers inside the
+first second — a burst of keychain prompts, and a different thing for the machine than the same
+work spread out. The probes go through a small semaphore (a buffered channel, a handful wide);
+whether a cluster waits for a slot changes nothing about the record it eventually writes.
+
 The loop re-resolves the context on every pass, so a credential rotation that keeps the context
 name is picked up on the next probe without anything telling the prober — within one cadence for a
 cluster under demand, and on the next `Connection` for a parked one, which is the moment it
@@ -215,8 +249,9 @@ beehive replaces whole, with no version guard, would clobber each other.
 
 ### clusterController
 
-`Reconcile` gains two steps and no I/O. The order matters more than the steps do — both early
-returns already in the function are traps for one of them:
+`Reconcile` gains the tracking call, the fold, and the condition write, and makes no network call.
+The order matters more than the steps do — both early returns already in the function are traps for
+one of them:
 
 1. **Deleting → `prober.Untrack(id)`, then return.** Ahead of the existing early return, not
    behind it. A record on its way out is the one transition that must reach `Untrack`, and it is
@@ -234,7 +269,9 @@ returns already in the function are traps for one of them:
 5. `ensureCache` off the folded UID, still **ahead of the settle fast-path** where it sits today.
    It reads this pass's status rather than the stored one, so a first UID creates its cache in the
    same pass that learns it.
-6. The existing fast-path and status write, unchanged.
+6. The `Connected` condition write — **after** the cache write, never between it and the fold. It
+   is store I/O that can fail and return, which is exactly what the invariant below forbids there.
+7. The existing fast-path and status write, unchanged but for a widened equality check.
 
 The invariant that ties 3 and 5 together: **nothing between the fold and the cache write may
 return.** `ensureCache` is ahead of the fast-path for a reason the existing comment states — a
@@ -247,6 +284,10 @@ re-read are needed.
 
 **The fold writes `Server` and `Principal`, and nothing else.** It compares against the stored
 status as the pass already does, so a probe that confirms an unchanged identity writes nothing.
+**By value, not by `==`**: both are structs of `*string`, so the obvious comparison is pointer
+identity, every probe allocates fresh strings, and every pass would write and push a frame. This is
+the trap `sameKubeconfigObservation` already dereferences around (`clusters.go:513`), and the
+fast-path at `clusters.go:478` has to widen past it to cover the folded fields too.
 Stamping a time on every probe would mean a status write per cluster per cadence forever — a
 `Modified` frame per cluster to every open webview, and behind each one a cache reconcile and a
 catalog pass, since `clusterCacheController` watches the cluster record. That is the trap the gauge
@@ -280,9 +321,17 @@ returns the pooled connection, and errors immediately for a cluster that is unkn
 absent from the kubeconfig. A consumer that already knows a context can use the two services
 directly instead.
 
-For a cluster with no result yet it waits for **that probe's result** — not for a successful one,
-which would hang a log tail against a down cluster until the request context died, with nothing
-explaining why. It returns the probe's error if it failed.
+**The last result decides whether it waits, and only a success short-circuits.**
+
+- Last probe succeeded → return the pooled connection immediately. No wait, no probe.
+- Last probe failed, or there is none → `Reprobe` and wait for **that probe's** result, returning
+  its error if it fails too.
+
+Returning a stored failure would break the model: `Connection` is the demand signal, so the one
+call that should restart a parked cluster's probing would be short-circuited by the very failure it
+exists to retry — a cluster that was down at boot would stay unreachable for the process's life,
+retry button included. Waiting for a *successful* result instead is the opposite failure: a log
+tail against a genuinely down cluster would hang until its request context died.
 
 The wait is `Await` first, then `Reprobe`, then select on the channel or `ctx.Done()` — in that
 order. `Await` hands back the last result and the next-result channel under one lock, so a probe
@@ -341,8 +390,9 @@ Each step is one red/green cycle and one commit.
 10. `ensureCache` runs off the probed UID — a fake probe now produces `Cluster` → `ClusterCache`
     → `ClusterCachedCatalog` end to end. Running the app against a real cluster produces the same
     chain, since step 4 probes on `Track`.
-11. The `Connected` condition write, including `ReasonIdentityUnavailable` from a 403 on
-    `kube-system`.
+11. The `Connected` condition write across the whole table, including
+    `ReasonIdentityUnavailable` from a 403 on `kube-system`, and a repeated identical outcome
+    writing no new version.
 12. `Service.Connection` and `Service.RetryConnection`, replacing `GetConnection`. That signature
     change also touches `graph/cluster_testutils_test.go`'s `fakeClusterService` and the
     `TestUnimplementedBoundaryPanics` inventory in `service_test.go`.
