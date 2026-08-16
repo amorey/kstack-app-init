@@ -366,9 +366,9 @@ func TestCachesWatchListCancellationIsQuiet(t *testing.T) {
 func cacheControllerDeps(t *testing.T) (deps, beehive.ControllerClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, nil)
+	d := newDeps(bh, newTestKubeconfig(t), nil)
 
-	client, err := beehive.Register(bh, ClusterGroupKind, newClusterController(t.TempDir()+"/config", d))
+	client, err := beehive.Register(bh, ClusterGroupKind, newClusterController(d))
 	require.NoError(t, err)
 	return d, client
 }

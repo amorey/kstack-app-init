@@ -319,15 +319,17 @@ type deps struct {
 	catalogClient  beehive.Client[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]
 	resourceClient beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
 
-	pokeSvc *poke.Service
+	kubeconfigSvc kubeconfigService
+	pokeSvc       *poke.Service
 }
 
-func newDeps(bh *beehive.Beehive, pokeSvc *poke.Service) deps {
+func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service) deps {
 	return deps{
 		clusterClient:  beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
 		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
 		catalogClient:  beehive.NewClient[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus](bh, ClusterCachedCatalogGroupKind),
 		resourceClient: beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
+		kubeconfigSvc:  kubeconfigSvc,
 		pokeSvc:        pokeSvc,
 	}
 }
@@ -371,7 +373,7 @@ const maxEventRuns = 20
 
 // New builds the cluster boundary rooted at dataDir (beehive.db, clusters/): it opens
 // the store, registers the controllers, and leaves everything stopped until Start.
-func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error) {
+func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service) (Service, error) {
 	// Self-sufficient rather than order-dependent: this is the first thing the
 	// composition root builds, so nothing else has made dataDir yet.
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -389,8 +391,8 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	d := newDeps(bh, pokeSvc)
-	clusterCtrl, controllers, err := registerControllers(bh, d, kubeconfigPath)
+	d := newDeps(bh, kubeconfigSvc, pokeSvc)
+	clusterCtrl, controllers, err := registerControllers(bh, d)
 	if err != nil {
 		bhStore.Close()
 		return nil, fmt.Errorf("register cluster controllers: %w", err)
@@ -402,14 +404,6 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 	}, nil
 }
 
-// registerControllers builds and registers each kind's controller, which lives in that
-// kind's file, and returns them in registration order. Together here rather than four
-// calls spread across those files: the options are the whole subsystem's concurrency
-// and retry budget, and it only reads as a budget in one place.
-//
-// The cluster's is returned on its own as well, since New holds it for its machinery.
-// kubeconfigPath is that controller's own configuration, which is why it is a parameter
-// while everything else the four need travels in deps.
 // startupPass reconciles every object of a kind once per process. Each of these four
 // owns state a restart invalidates and the store cannot report as owed: a live
 // connection, a running worker, an in-memory schedule. The store reads settled, because
@@ -419,8 +413,14 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 // RequeueAfter, and the out-of-band buses cover the rest.
 var startupPass = beehive.WithStartupFullPass(true)
 
-func registerControllers(bh *beehive.Beehive, d deps, kubeconfigPath string) (*clusterController, []lifecycle.Part, error) {
-	cluster := newClusterController(kubeconfigPath, d)
+// registerControllers builds and registers each kind's controller, which lives in that
+// kind's file, and returns them in registration order. Together here rather than four
+// calls spread across those files: the options are the whole subsystem's concurrency
+// and retry budget, and it only reads as a budget in one place.
+//
+// The cluster's is returned on its own as well, since New holds it for its machinery.
+func registerControllers(bh *beehive.Beehive, d deps) (*clusterController, []lifecycle.Part, error) {
+	cluster := newClusterController(d)
 	cache := &clusterCacheController{deps: d}
 	catalog := &clusterCachedCatalogController{}
 	resource := &clusterCachedResourceController{}

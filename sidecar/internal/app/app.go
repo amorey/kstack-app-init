@@ -19,6 +19,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
@@ -78,7 +79,11 @@ func New(cfg Config) (*App, error) {
 	// The cluster backend behind one boundary. Mid-rebuild: beehive, the four
 	// controllers, and the kubeconfig watcher/importer are wired and run, but they
 	// reconcile to no-ops and every read panics.
-	clusterSvc, err := clustersvc.New(cfg.DataDir, cfg.KubeconfigPath, pokeSvc)
+	// One reader of the user's kubeconfig, shared by everything that resolves a
+	// context. Closing it ends every subscription, so it is the app's alone.
+	kubeconfigSvc := kubeconfig.New(cfg.KubeconfigPath, pokeSvc)
+
+	clusterSvc, err := clustersvc.New(cfg.DataDir, kubeconfigSvc, pokeSvc)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +135,7 @@ func New(cfg Config) (*App, error) {
 		grpcServer:    grpcServer,
 		parts: []lifecycle.Part{
 			{Name: "poke service", StartCloser: lifecycle.StartFunc(pokeSvc.Start)},
+			{Name: "kubeconfig service", StartCloser: kubeconfigSvc},
 			{Name: "cluster service", StartCloser: clusterSvc},
 			{Name: "cloud service", StartCloser: lifecycle.StartFunc(cloudSvc.Start)},
 		},

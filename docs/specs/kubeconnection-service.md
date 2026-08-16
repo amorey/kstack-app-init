@@ -18,7 +18,7 @@ Its first consumer is the connection probe, which fills in `Cluster.status.serve
 writes that today, so no `ClusterCache` records are created and the whole cache subtree stays
 empty. This spec unblocks it.
 
-Depends on [Kubeconfig service](kubeconfig-service.md) for resolved credentials.
+Credentials and their key come from `kubeconfig.Service.RESTConfig`, which has landed.
 
 ## The service
 
@@ -188,8 +188,7 @@ credentials after a rotation.
 
 ## Build order
 
-Each step is one red/green cycle and one commit. [Kubeconfig service](kubeconfig-service.md)
-lands first.
+Each step is one red/green cycle and one commit.
 
 1. `kubeconnect.Connection` + `Service.Get`, including two concurrent calls for one key getting
    one connection.

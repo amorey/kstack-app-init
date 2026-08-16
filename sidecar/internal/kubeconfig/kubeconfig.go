@@ -51,7 +51,7 @@ const defaultPollInterval = 30 * time.Minute
 // (microseconds) and well below what a person notices.
 const defaultSettle = 50 * time.Millisecond
 
-// Watcher reloads the kubeconfig and publishes it only when it changed, so an
+// Service reloads the kubeconfig and publishes it only when it changed, so an
 // unchanged file writes nothing downstream.
 //
 // Polling is what makes it correct; notifications only make it prompt. Filesystem
@@ -69,7 +69,7 @@ const defaultSettle = 50 * time.Millisecond
 // which is why the watch is on the directory; clientcmd (so `kubectl config
 // use-context`) rewrites IN PLACE, truncating first, which is why an event settles
 // before it is acted on.
-type Watcher struct {
+type Service struct {
 	loadingRules *clientcmd.ClientConfigLoadingRules
 	// interval paces the reload; tests shrink it before Start rather than outwait it.
 	interval time.Duration
@@ -81,13 +81,16 @@ type Watcher struct {
 	// pokeSvc wakes the loop on a resume. Nil is ordinary — the poll covers what it
 	// would have caught, a period later.
 	pokeSvc *poke.Service
+	// newFSWatcher builds the notification layer; a build seam, since the case worth
+	// testing is the kernel refusing one, which a test cannot ask for.
+	newFSWatcher func() (*fsnotify.Watcher, error)
 
 	hub *watch.Hub[*api.Config]
 
 	mu      sync.RWMutex
 	current *api.Config
 	// read records that a poll has been attempted. It separates "there is no
-	// kubeconfig here" from "the watcher has not gotten to it yet" — both are the
+	// kubeconfig here" from "the service has not gotten to it yet" — both are the
 	// empty config, so the value alone cannot say which. Set even when the load
 	// failed: an unreadable kubeconfig is an answer, and the last good config (here,
 	// the empty seed) is what stands.
@@ -96,64 +99,65 @@ type Watcher struct {
 	wg sync.WaitGroup
 }
 
-// New returns a watcher for kubeconfigPath, or the standard precedence chain when
+// New returns a service for kubeconfigPath, or the standard precedence chain when
 // it is empty. Nothing is read until Start: a subscriber attaching before then sees
 // an empty config rather than a nil one. pokeSvc may be nil.
-func New(kubeconfigPath string, pokeSvc *poke.Service) *Watcher {
+func New(kubeconfigPath string, pokeSvc *poke.Service) *Service {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	loadingRules.ExplicitPath = kubeconfigPath
 
 	current := &api.Config{}
-	return &Watcher{
+	return &Service{
 		loadingRules: loadingRules,
 		interval:     defaultPollInterval,
 		settle:       defaultSettle,
 		pokeSvc:      pokeSvc,
+		newFSWatcher: fsnotify.NewWatcher,
 		hub:          watch.New(current),
 		current:      current,
 	}
 }
 
-// Get returns the most recently loaded config — never nil — and whether the watcher
+// Get returns the most recently loaded config — never nil — and whether the service
 // has read yet. Before the first read the config is the empty seed, which a caller
 // must not observe: it would report every context absent.
-func (w *Watcher) Get() (*api.Config, bool) {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return w.current, w.read
+func (s *Service) Get() (*api.Config, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.current, s.read
 }
 
 // Subscribe returns a handle carrying the current config, then each reload.
-func (w *Watcher) Subscribe() Subscription {
-	return w.hub.Receiver()
+func (s *Service) Subscribe() Subscription {
+	return s.hub.Receiver()
 }
 
 // Start reloads once, then launches the poll loop and returns the func that ends it.
 // The first reload is synchronous so that whoever subscribes after Start sees real
 // state: on the empty seed an importer would reconcile a config known to hold
 // nothing. Nothing here can fail.
-func (w *Watcher) Start(context.Context) (func(context.Context) error, error) {
+func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 	// Watches before the first read, so the two overlap instead of leaving a gap: a
 	// change after this is queued as an event, one before it lands in the read below,
 	// and one in between arrives twice — which publishes once, since the second
 	// reload finds nothing changed. Reading first would drop anything written in
 	// that window until the backstop tick, half an hour later.
-	paths := w.resolvePaths()
-	fsw := newNotifier(paths)
+	paths := s.resolvePaths()
+	fsw := s.newNotifier(paths)
 
 	// Subscribed before the first read for the same reason the watch is: a poke in the
 	// gap would otherwise wake nothing.
 	var pokes <-chan poke.Signal
 	cancelPokes := func() {}
-	if w.pokeSvc != nil {
-		pokes, cancelPokes = w.pokeSvc.Subscribe()
+	if s.pokeSvc != nil {
+		pokes, cancelPokes = s.pokeSvc.Subscribe()
 	}
 
-	w.poll()
+	s.poll()
 
 	stop := make(chan struct{})
-	w.wg.Go(func() {
-		ticker := time.NewTicker(w.interval)
+	s.wg.Go(func() {
+		ticker := time.NewTicker(s.interval)
 		defer ticker.Stop()
 		defer cancelPokes()
 		if fsw != nil {
@@ -170,18 +174,18 @@ func (w *Watcher) Start(context.Context) (func(context.Context) error, error) {
 		}
 
 		// Armed by an event or a poke, drained by the reload it triggers.
-		settle := time.NewTimer(w.settle)
+		settle := time.NewTimer(s.settle)
 		settle.Stop()
 		defer settle.Stop()
 
 		// Re-resolving before each reload is what follows a re-pointed symlink onto
 		// its new directory. Only this goroutine touches paths.
 		reload := func() {
-			paths = w.resolvePaths()
+			paths = s.resolvePaths()
 			if fsw != nil {
 				syncDirs(fsw, paths)
 			}
-			w.poll()
+			s.poll()
 		}
 
 		for {
@@ -194,7 +198,7 @@ func (w *Watcher) Start(context.Context) (func(context.Context) error, error) {
 				// Deferred rather than acted on: a writer emits several events for one
 				// save, and the first of them can arrive with the file still truncated.
 				if _, ok := paths[filepath.Clean(ev.Name)]; ok {
-					settle.Reset(w.settle)
+					settle.Reset(s.settle)
 				}
 			case <-settle.C:
 				reload()
@@ -207,7 +211,7 @@ func (w *Watcher) Start(context.Context) (func(context.Context) error, error) {
 				// Through the settle timer rather than straight to reload: a poke is
 				// correlated with host events, so it can land inside a writer's
 				// truncate-then-rewrite gap the same way an fsnotify event can.
-				settle.Reset(w.settle)
+				settle.Reset(s.settle)
 			case err := <-errs:
 				slog.Debug("kubeconfig watch error", "err", err)
 			}
@@ -219,15 +223,15 @@ func (w *Watcher) Start(context.Context) (func(context.Context) error, error) {
 	var once sync.Once
 	return func(ctx context.Context) error {
 		once.Do(func() { close(stop) })
-		return drain.WithContext(ctx, w.wg.Wait)
+		return drain.WithContext(ctx, s.wg.Wait)
 	}, nil
 }
 
 // Close ends every outstanding Subscription. Separate from the stop func, and after
 // it: subscribers must keep reading until the poll loop is joined, or a reload in
 // flight is lost rather than delivered.
-func (w *Watcher) Close() error {
-	w.hub.Close()
+func (s *Service) Close() error {
+	s.hub.Close()
 	return nil
 }
 
@@ -239,10 +243,10 @@ func (w *Watcher) Close() error {
 // Discarding it there would mean discovering the config on a tick and then staying
 // blind to every edit after it.
 //
-// nil is an ordinary outcome, not a failure: the poll is what makes the watcher
+// nil is an ordinary outcome, not a failure: the poll is what makes the service
 // correct, so losing notifications costs latency and nothing else.
-func newNotifier(paths watchedPaths) *fsnotify.Watcher {
-	fsw, err := fsnotify.NewWatcher()
+func (s *Service) newNotifier(paths watchedPaths) *fsnotify.Watcher {
+	fsw, err := s.newFSWatcher()
 	if err != nil {
 		slog.Info("kubeconfig notifications unavailable, polling only", "err", err)
 		return nil
@@ -263,9 +267,9 @@ type watchedPaths map[string]struct{}
 //
 // Recomputed per reload rather than once, so re-pointing the link is picked up: the
 // replacement is itself an event on the link, which is already watched.
-func (w *Watcher) resolvePaths() watchedPaths {
+func (s *Service) resolvePaths() watchedPaths {
 	paths := watchedPaths{}
-	for _, pathname := range w.loadingRules.GetLoadingPrecedence() {
+	for _, pathname := range s.loadingRules.GetLoadingPrecedence() {
 		clean := filepath.Clean(pathname)
 		paths[clean] = struct{}{}
 		if target, ok := linkTarget(clean); ok {
@@ -327,39 +331,39 @@ func syncDirs(fsw *fsnotify.Watcher, paths watchedPaths) {
 
 // poll reloads the kubeconfig and publishes it if it differs from the last snapshot.
 // markRead records the read a failed load still made.
-func (w *Watcher) markRead() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.read = true
+func (s *Service) markRead() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.read = true
 }
 
-func (w *Watcher) poll() {
+func (s *Service) poll() {
 	// clientcmd returns an empty config rather than an error when no file is found,
 	// which is the right reading: a machine with no kubeconfig tracks no clusters.
-	cfg, err := w.loadingRules.Load()
+	cfg, err := s.loadingRules.Load()
 	if err != nil {
 		// Debug, not warn: a hand-edited file is unparseable in the middle of an edit
 		// as a matter of course, and the last good config carries on serving. But
-		// silence would leave a permanently broken kubeconfig looking like a watcher
+		// silence would leave a permanently broken kubeconfig looking like a service
 		// that simply stopped noticing.
 		slog.Debug("kubeconfig load failed, keeping the last good config", "err", err)
-		w.markRead()
+		s.markRead()
 		return
 	}
 
 	// Compared whole rather than by a projection: the contexts drive the importer,
 	// and the cluster and user entries behind them resolve credentials, so every
 	// field reaches someone.
-	w.mu.Lock()
-	w.read = true
-	unchanged := reflect.DeepEqual(w.current, cfg)
+	s.mu.Lock()
+	s.read = true
+	unchanged := reflect.DeepEqual(s.current, cfg)
 	if !unchanged {
-		w.current = cfg
+		s.current = cfg
 	}
-	w.mu.Unlock()
+	s.mu.Unlock()
 
 	if unchanged {
 		return
 	}
-	w.hub.Sender().Send(cfg)
+	s.hub.Sender().Send(cfg)
 }

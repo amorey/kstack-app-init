@@ -28,7 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconfig"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -609,21 +609,27 @@ func (c *stubControllerClient) SetObservedGeneration(_ context.Context, _ beehiv
 }
 
 // controllerOver returns a controller over an empty kubeconfig, so every context is
-// absent. The watcher is started because Reconcile defers until it has read, and its
-// first read is synchronous in Start.
-// Its clients are promoted from the embedded deps, so a test reading back what a
-// reconcile wrote goes through c.clusterClient / c.cacheClient.
+// absent. Its clients are promoted from the embedded deps, so a test reading back what
+// a reconcile wrote goes through c.clusterClient / c.cacheClient.
 func controllerOver(t *testing.T) *clusterController {
 	t.Helper()
-	c := newClusterController(t.TempDir()+"/config", newTestDeps(t))
+	return newClusterController(newTestDeps(t))
+}
 
-	stop, err := c.kubeconfigWatcher.Start(context.Background())
+// The app owns the kubeconfig service and hands it to every reader, so the
+// controller must not close it: Close ends every subscription the process holds, not
+// just this controller's.
+func TestControllerCloseLeavesTheKubeconfigServiceOpen(t *testing.T) {
+	c := controllerOver(t)
+
+	stop, err := c.Start(context.Background())
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		assert.NoError(t, stop(context.Background()))
-		assert.NoError(t, c.kubeconfigWatcher.Close())
-	})
-	return c
+	require.NoError(t, stop(context.Background()))
+	require.NoError(t, c.Close())
+
+	sub := c.kubeconfigSvc.Subscribe()
+	defer sub.Close()
+	testutil.Recv(t, sub.Chan(), "the current config from a service still open")
 }
 
 // --- ClusterCache creation ---
@@ -748,10 +754,11 @@ func TestReconcileReportsAFailedCacheCreate(t *testing.T) {
 }
 
 // beehive starts ahead of the controllers, so an owed pass can reach a record before
-// the watcher's first read. Observing the pre-read config would report a present
+// the kubeconfig's first read. Observing the pre-read config would report a present
 // context absent and wake the kind's watches for a flap.
 func TestReconcileDefersUntilTheKubeconfigIsRead(t *testing.T) {
-	c := newClusterController(t.TempDir()+"/config", deps{})
+	// Unstarted, which is the only way to hold a service that has not read yet.
+	c := newClusterController(deps{kubeconfigSvc: kubeconfig.New(t.TempDir()+"/config", nil)})
 
 	client := &stubControllerClient{}
 	res, err := c.Reconcile(context.Background(), client, kubeconfigObj("prod", nil))
@@ -934,7 +941,7 @@ func serviceOver(t *testing.T, d deps) *service {
 	t.Helper()
 	return &service{
 		deps:        d,
-		clusterCtrl: newClusterController(t.TempDir()+"/config", d),
+		clusterCtrl: newClusterController(d),
 	}
 }
 
@@ -1406,11 +1413,11 @@ func TestClustersDeleteIsIdempotent(t *testing.T) {
 
 // --- clusterController ---
 
-// The controller owns the watcher and importer, so its stop closure is what takes
-// them both down; a leaked one would outlive the service.
+// The controller owns the importer, so its stop closure is what takes it down; a
+// leaked one would outlive the service.
 func TestClusterControllerStartStop(t *testing.T) {
 	// A real client, not nil: the importer runs its first import as soon as it starts.
-	c := newClusterController(t.TempDir()+"/config", newTestDeps(t))
+	c := newClusterController(newTestDeps(t))
 
 	stop, err := c.Start(context.Background())
 	require.NoError(t, err)

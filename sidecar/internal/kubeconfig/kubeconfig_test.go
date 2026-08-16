@@ -16,11 +16,13 @@ package kubeconfig
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd"
@@ -37,18 +39,18 @@ const testInterval = 5 * time.Millisecond
 // testSettle shrinks the quiet period an edit must go through before a reload.
 const testSettle = 2 * time.Millisecond
 
-// newTestConfigWatcher returns an unstarted watcher and the kubeconfig path it
+// newTestService returns an unstarted service and the kubeconfig path it
 // reads, inside a temp dir. The path need not exist: an absent kubeconfig is an
 // ordinary state.
-func newTestConfigWatcher(t *testing.T, interval time.Duration) (*Watcher, string) {
+func newTestService(t *testing.T, interval time.Duration) (*Service, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config")
-	return newWatcherAt(t, path, interval), path
+	return newServiceAt(t, path, interval), path
 }
 
-// newWatcherAt is newTestConfigWatcher over a path the caller chose. Both cadences
+// newServiceAt is newTestService over a path the caller chose. Both cadences
 // are shrunk here so no test has to outwait a production one.
-func newWatcherAt(t *testing.T, path string, interval time.Duration) *Watcher {
+func newServiceAt(t *testing.T, path string, interval time.Duration) *Service {
 	t.Helper()
 	w := New(path, nil)
 	w.interval = interval
@@ -56,8 +58,8 @@ func newWatcherAt(t *testing.T, path string, interval time.Duration) *Watcher {
 	return w
 }
 
-// start runs the watcher, stopping and closing it on cleanup.
-func start(t *testing.T, w *Watcher) {
+// start runs the service, stopping and closing it on cleanup.
+func start(t *testing.T, w *Service) {
 	t.Helper()
 	stop, err := w.Start(context.Background())
 	require.NoError(t, err)
@@ -67,10 +69,10 @@ func start(t *testing.T, w *Watcher) {
 	})
 }
 
-// newTestWatcher returns a started watcher over a path inside a temp dir.
-func newTestWatcher(t *testing.T) *Watcher {
+// newStartedService returns a started service over a path inside a temp dir.
+func newStartedService(t *testing.T) *Service {
 	t.Helper()
-	w, _ := newTestConfigWatcher(t, testInterval)
+	w, _ := newTestService(t, testInterval)
 	start(t, w)
 	return w
 }
@@ -88,12 +90,12 @@ func writeKubeconfig(t *testing.T, path string, contexts ...string) {
 	require.NoError(t, clientcmd.WriteToFile(*cfg, path))
 }
 
-// The watcher's whole job starts here: a poll that never reads the file leaves every
+// The service's whole job starts here: a poll that never reads the file leaves every
 // consumer looking at the empty seed.
 func TestPollLoadsTheConfig(t *testing.T) {
 	// An interval far longer than the test, so only Start's own first poll can
 	// explain a loaded config.
-	w, path := newTestConfigWatcher(t, time.Hour)
+	w, path := newTestService(t, time.Hour)
 	writeKubeconfig(t, path, "prod")
 
 	start(t, w)
@@ -107,7 +109,7 @@ func TestPollLoadsTheConfig(t *testing.T) {
 // value cannot tell them apart — which is the whole reason Get reports the read. A
 // consumer that waits for one it never gets would never observe anything.
 func TestAnAbsentKubeconfigStillCountsAsRead(t *testing.T) {
-	w, _ := newTestConfigWatcher(t, time.Hour)
+	w, _ := newTestService(t, time.Hour)
 
 	start(t, w)
 
@@ -141,7 +143,7 @@ func TestSubscribeIsCurrentOnSubscribe(t *testing.T) {
 
 // The reason subscribers exist: an edit has to reach them without anyone asking.
 func TestChangedConfigIsPublished(t *testing.T) {
-	w, path := newTestConfigWatcher(t, testInterval)
+	w, path := newTestService(t, testInterval)
 	writeKubeconfig(t, path, "prod")
 	start(t, w)
 
@@ -160,7 +162,7 @@ func TestChangedConfigIsPublished(t *testing.T) {
 // at an hour for that reason: there is no timing margin to tune, because the poll
 // cannot fire at all.
 func TestWriteWakesThePoll(t *testing.T) {
-	w, path := newTestConfigWatcher(t, time.Hour)
+	w, path := newTestService(t, time.Hour)
 	writeKubeconfig(t, path, "prod")
 	start(t, w)
 
@@ -178,7 +180,7 @@ func TestWriteWakesThePoll(t *testing.T) {
 // so it fires once and then goes deaf. `kubectl config` and most editors save this
 // way, which makes it the common path rather than an edge case.
 func TestAtomicReplaceWakesThePoll(t *testing.T) {
-	w, path := newTestConfigWatcher(t, time.Hour)
+	w, path := newTestService(t, time.Hour)
 	writeKubeconfig(t, path, "prod")
 	start(t, w)
 
@@ -208,7 +210,7 @@ func TestAtomicReplaceWakesThePoll(t *testing.T) {
 // sees the file appear; a watch on a path that does not exist could not be
 // established at all.
 func TestKubeconfigCreatedAfterStartWakesThePoll(t *testing.T) {
-	w, path := newTestConfigWatcher(t, time.Hour)
+	w, path := newTestService(t, time.Hour)
 	start(t, w)
 
 	sub := w.Subscribe()
@@ -220,9 +222,9 @@ func TestKubeconfigCreatedAfterStartWakesThePoll(t *testing.T) {
 	assert.Contains(t, testutil.Recv(t, sub.Chan(), "the config after creation").Contexts, "prod")
 }
 
-// newSymlinkedWatcher returns an unstarted watcher whose kubeconfig path is a
+// newSymlinkedService returns an unstarted service whose kubeconfig path is a
 // symlink into a second directory — how a dotfiles manager lays it out.
-func newSymlinkedWatcher(t *testing.T, interval time.Duration) (*Watcher, string, string) {
+func newSymlinkedService(t *testing.T, interval time.Duration) (*Service, string, string) {
 	t.Helper()
 	root := t.TempDir()
 	kubeDir, dotfiles := filepath.Join(root, "kube"), filepath.Join(root, "dotfiles")
@@ -233,7 +235,7 @@ func newSymlinkedWatcher(t *testing.T, interval time.Duration) (*Watcher, string
 	writeKubeconfig(t, target, "prod")
 	require.NoError(t, os.Symlink(target, link))
 
-	return newWatcherAt(t, link, interval), link, target
+	return newServiceAt(t, link, interval), link, target
 }
 
 // A dotfiles-managed kubeconfig is a symlink, and its target lives in a directory
@@ -241,7 +243,7 @@ func newSymlinkedWatcher(t *testing.T, interval time.Duration) (*Watcher, string
 // fires no event. `kubectl config use-context` writes through the link exactly this
 // way, which makes it the routine case for those machines, not an edge.
 func TestSymlinkTargetEditWakesThePoll(t *testing.T) {
-	w, _, target := newSymlinkedWatcher(t, time.Hour)
+	w, _, target := newSymlinkedService(t, time.Hour)
 	start(t, w)
 
 	sub := w.Subscribe()
@@ -254,11 +256,11 @@ func TestSymlinkTargetEditWakesThePoll(t *testing.T) {
 }
 
 // Switching a dotfiles profile re-points the link at a different file, in a
-// directory that was not watched when the watcher started. The resolution is
+// directory that was not watched when the service started. The resolution is
 // recomputed per reload rather than captured once, so the new target's directory is
 // picked up — otherwise edits to it would be invisible until the backstop.
 func TestRepointedSymlinkFollowsToTheNewTarget(t *testing.T) {
-	w, link, target := newSymlinkedWatcher(t, time.Hour)
+	w, link, target := newSymlinkedService(t, time.Hour)
 	start(t, w)
 
 	sub := w.Subscribe()
@@ -293,7 +295,7 @@ func TestDanglingSymlinkStillSeesItsTargetAppear(t *testing.T) {
 	link := filepath.Join(kubeDir, "config")
 	require.NoError(t, os.Symlink(filepath.Join(kubeDir, "absent"), link))
 
-	w := newWatcherAt(t, link, time.Hour)
+	w := newServiceAt(t, link, time.Hour)
 	start(t, w)
 
 	sub := w.Subscribe()
@@ -303,6 +305,82 @@ func TestDanglingSymlinkStillSeesItsTargetAppear(t *testing.T) {
 	writeKubeconfig(t, filepath.Join(kubeDir, "absent"), "prod")
 
 	assert.Contains(t, testutil.Recv(t, sub.Chan(), "the config once the target appeared").Contexts, "prod")
+}
+
+// A reload that finds nothing changed must publish nothing: every subscriber treats a
+// snapshot as news, and the importer re-lists every Cluster on one. Driven by calling
+// poll directly, since the silence in the middle is what is under test — the third
+// frame being the edited config is what proves the second poll stayed quiet.
+func TestPollDoesNotRepublishAnUnchangedConfig(t *testing.T) {
+	w, path := newTestService(t, time.Hour)
+	writeKubeconfig(t, path, "prod")
+
+	sub := w.Subscribe()
+	defer sub.Close()
+	require.Empty(t, testutil.Recv(t, sub.Chan(), "the empty seed").Contexts)
+
+	w.poll()
+	require.Contains(t, testutil.Recv(t, sub.Chan(), "the first read").Contexts, "prod")
+
+	w.poll()
+
+	writeKubeconfig(t, path, "prod", "staging")
+	w.poll()
+	assert.Contains(t, testutil.Recv(t, sub.Chan(), "the config after the edit").Contexts, "staging")
+}
+
+// A dotfiles manager links to a target beside the link rather than by absolute path.
+// Readlink hands back what the link literally holds, so a relative one has to be
+// joined onto the link's own directory or the watch lands on a path relative to the
+// process's working directory.
+func TestDanglingRelativeSymlinkResolvesAgainstItsOwnDirectory(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "config")
+	require.NoError(t, os.Symlink("actual", link))
+
+	target, ok := linkTarget(link)
+
+	require.True(t, ok)
+	assert.Equal(t, filepath.Join(dir, "actual"), target)
+}
+
+// The notification layer is optional by design, so the kernel refusing one must leave
+// a service that still works — the poll is what makes it correct.
+func TestNotificationsUnavailableLeavesThePollWorking(t *testing.T) {
+	w, path := newTestService(t, testInterval)
+	w.newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("no watchers left") }
+	start(t, w)
+
+	sub := w.Subscribe()
+	defer sub.Close()
+	require.Empty(t, testutil.Recv(t, sub.Chan(), "the empty seed").Contexts)
+
+	writeKubeconfig(t, path, "prod")
+
+	assert.Contains(t, testutil.Recv(t, sub.Chan(), "the config the tick found").Contexts, "prod")
+}
+
+// Watch errors are reported by the kernel for reasons that pass — a queue overflow, a
+// directory going away mid-scan. The loop logs and carries on; ending it would trade a
+// transient error for a service that never notices anything again.
+func TestAWatchErrorDoesNotEndTheLoop(t *testing.T) {
+	w, path := newTestService(t, time.Hour)
+	fsw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	w.newFSWatcher = func() (*fsnotify.Watcher, error) { return fsw, nil }
+	start(t, w)
+
+	sub := w.Subscribe()
+	defer sub.Close()
+	require.Empty(t, testutil.Recv(t, sub.Chan(), "the empty seed").Contexts)
+
+	// An unbuffered send, so it returns only once the loop has taken the error — no
+	// window to size, and the reload below then proves the loop is still running.
+	fsw.Errors <- errors.New("watch overflow")
+
+	writeKubeconfig(t, path, "prod")
+
+	assert.Contains(t, testutil.Recv(t, sub.Chan(), "the config after the error").Contexts, "prod")
 }
 
 // KUBECONFIG may name several files, which kubectl merges in order — a shared team
@@ -321,7 +399,7 @@ func TestKubeconfigEnvChainIsMergedAndWatched(t *testing.T) {
 
 	// No explicit path: an explicit one overrides the chain, as kubectl's
 	// --kubeconfig does.
-	w := newWatcherAt(t, "", time.Hour)
+	w := newServiceAt(t, "", time.Hour)
 	start(t, w)
 
 	sub := w.Subscribe()
@@ -346,7 +424,7 @@ func TestNotifierSurvivesHavingNothingToWatchYet(t *testing.T) {
 	dir := filepath.Join(root, "kube")
 	w := New(filepath.Join(dir, "config"), nil)
 
-	fsw := newNotifier(w.resolvePaths())
+	fsw := w.newNotifier(w.resolvePaths())
 	require.NotNil(t, fsw, "keep the notifier: a later reload is what adds the directory")
 	defer func() { assert.NoError(t, fsw.Close()) }()
 	require.Empty(t, fsw.WatchList(), "nothing is watchable yet")
@@ -364,7 +442,7 @@ func TestNotifierSurvivesHavingNothingToWatchYet(t *testing.T) {
 // as IsPresent=false, so a flap there orphans every Cluster record and restores it
 // microseconds later.
 func TestTruncateWindowIsNotPublished(t *testing.T) {
-	w, path := newTestConfigWatcher(t, time.Hour)
+	w, path := newTestService(t, time.Hour)
 	w.settle = 100 * time.Millisecond
 	writeKubeconfig(t, path, "prod")
 	start(t, w)
@@ -388,9 +466,9 @@ func TestTruncateWindowIsNotPublished(t *testing.T) {
 // it stays watched for the life of the process — waking the loop on every unrelated
 // write in it, and on macOS holding an fd per file it contains.
 func TestRepointedSymlinkDropsTheOldDirectory(t *testing.T) {
-	w, link, target := newSymlinkedWatcher(t, time.Hour)
+	w, link, target := newSymlinkedService(t, time.Hour)
 
-	fsw := newNotifier(w.resolvePaths())
+	fsw := w.newNotifier(w.resolvePaths())
 	require.NotNil(t, fsw)
 	defer func() { assert.NoError(t, fsw.Close()) }()
 	require.Contains(t, fsw.WatchList(), filepath.Dir(target), "the original target's directory")
@@ -409,12 +487,12 @@ func TestRepointedSymlinkDropsTheOldDirectory(t *testing.T) {
 }
 
 // The claim pull-first buys: notifications are allowed to fail. A kubeconfig whose
-// directory does not exist yet cannot be watched at all, and the watcher still has
+// directory does not exist yet cannot be watched at all, and the service still has
 // to converge — on the tick, which is the thing that makes it correct.
 func TestUnwatchableDirStillPolls(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "absent")
 	path := filepath.Join(dir, "config")
-	w := newWatcherAt(t, path, testInterval)
+	w := newServiceAt(t, path, testInterval)
 	start(t, w)
 
 	sub := w.Subscribe()
@@ -431,7 +509,7 @@ func TestUnwatchableDirStillPolls(t *testing.T) {
 // config is unchanged), so the only way to observe one from outside would be to
 // instrument the poll for the test's benefit.
 func TestOnlyPrecedencePathsWakeThePoll(t *testing.T) {
-	w, path := newTestConfigWatcher(t, time.Hour)
+	w, path := newTestService(t, time.Hour)
 	dir := filepath.Dir(path)
 	paths := w.resolvePaths()
 
@@ -442,7 +520,7 @@ func TestOnlyPrecedencePathsWakeThePoll(t *testing.T) {
 
 // The link and its target are both watched, so an edit through either path is seen.
 func TestResolvePathsFollowsASymlink(t *testing.T) {
-	w, link, target := newSymlinkedWatcher(t, time.Hour)
+	w, link, target := newSymlinkedService(t, time.Hour)
 
 	paths := w.resolvePaths()
 	assert.Contains(t, paths, link, "the kubeconfig path itself")
@@ -453,7 +531,7 @@ func TestResolvePathsFollowsASymlink(t *testing.T) {
 // invalid. Treating that as "no clusters" would tear down every connection over a
 // typo, so the last good config stands until a readable one replaces it.
 func TestUnparseableConfigKeepsTheLastGoodOne(t *testing.T) {
-	w, path := newTestConfigWatcher(t, testInterval)
+	w, path := newTestService(t, testInterval)
 	writeKubeconfig(t, path, "prod")
 	start(t, w)
 
@@ -475,7 +553,7 @@ func TestUnparseableConfigKeepsTheLastGoodOne(t *testing.T) {
 }
 
 func TestUnchangedConfigPublishesNothing(t *testing.T) {
-	w := newTestWatcher(t)
+	w := newStartedService(t)
 	sub := w.Subscribe()
 	defer sub.Close()
 
@@ -495,7 +573,7 @@ func TestUnchangedConfigPublishesNothing(t *testing.T) {
 // Stopping is not closing: a subscriber must still be able to read what the last
 // poll published after the loop is joined.
 func TestStopLeavesSubscriptionsOpen(t *testing.T) {
-	w, _ := newTestConfigWatcher(t, testInterval)
+	w, _ := newTestService(t, testInterval)
 	sub := w.Subscribe()
 	defer sub.Close()
 	stop, err := w.Start(context.Background())
@@ -519,7 +597,7 @@ func TestStopLeavesSubscriptionsOpen(t *testing.T) {
 // lifecycle.StartCloser requires an idempotent stop, so a retry or a double drain above
 // must find this one idempotent rather than panicking on a closed channel.
 func TestStopIsIdempotent(t *testing.T) {
-	w, _ := newTestConfigWatcher(t, testInterval)
+	w, _ := newTestService(t, testInterval)
 	stop, err := w.Start(context.Background())
 	require.NoError(t, err)
 
@@ -540,7 +618,7 @@ func TestStopJoinsPollLoop(t *testing.T) {
 	// A stop that returned while the loop still ran would let a poll publish after
 	// the owner considers it drained. The interval is far longer than the test, so
 	// the claim is that stop selects on the stop channel rather than waiting a tick.
-	w, _ := newTestConfigWatcher(t, time.Hour)
+	w, _ := newTestService(t, time.Hour)
 	stop, err := w.Start(context.Background())
 	require.NoError(t, err)
 
@@ -557,7 +635,7 @@ func TestPokeWakesThePoll(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "kube", "config")
 	pokeSvc := poke.New()
 
-	w := newWatcherAt(t, path, time.Hour)
+	w := newServiceAt(t, path, time.Hour)
 	w.pokeSvc = pokeSvc
 	start(t, w)
 
@@ -581,7 +659,7 @@ func TestClosedPokeBusLeavesTheLoopServing(t *testing.T) {
 	stopPoke, err := pokeSvc.Start(context.Background())
 	require.NoError(t, err)
 
-	w, path := newTestConfigWatcher(t, testInterval)
+	w, path := newTestService(t, testInterval)
 	w.pokeSvc = pokeSvc
 	start(t, w)
 

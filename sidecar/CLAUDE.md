@@ -9,10 +9,10 @@ The data dir (`--data-dir` / `KSTACK_DATA_DIR`) is **required** — `app.New` er
 Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the composition root + routing, GraphQL lives in `graph/`. There is no `server` package.
 
 - `main.go` — parse flags, bind socket, build `*app.App`, serve, drive graceful shutdown (`srv.Shutdown` → `app.DrainWithContext` → `stop(ctx)` → `app.Close`).
-- `internal/app/` — **composition root**: builds `poke.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
+- `internal/app/` — **composition root**: builds `poke.Service`, `kubeconfig.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → kubeconfig → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
-- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
+- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
@@ -35,8 +35,6 @@ internal/clustersvc/
   cacheddata.go       ┘ (no controller — the one family that isn't a beehive kind)
   shared.go           vocabulary every family reuses, and the two GraphQL scalars
   stream.go           Stream[T]
-  internal/           the mechanisms the controllers drive — private by compiler rule
-    kubeconfig/       reloads the kubeconfig, publishes each change
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -51,7 +49,7 @@ and most family methods still panic** — `TestUnimplementedBoundaryPanics` is t
 is left, and an entry must be deleted as its method lands, since the test fails when a stub stops
 panicking.
 
-Built so far, produced: the kubeconfig watcher, the importer that creates `Cluster` records,
+Built so far, produced: the importer that creates `Cluster` records,
 `clusterController.Reconcile` observing what the kubeconfig says about each one
 (`status.source.kubeconfig`), and that same pass creating the `ClusterCache` for the identity a
 probe recorded, and `clusterCacheController.Reconcile` creating the `ClusterCachedCatalog` beneath
@@ -98,8 +96,8 @@ suffix is load-bearing: the fields are promoted into both, and `a.s.cacheClient`
 the `Caches` family it is reached through. **A new kind or a new
 shared service is a field, never another constructor parameter** — the alternative threads each one
 through the constructors that don't use it, which is what the parameter list was doing at two kinds.
-What stays an argument is a single owner's own *configuration*: `newClusterController(kubeconfigPath,
-deps)`, since the path belongs to that controller alone. Tests build the same struct (`newTestDeps` /
+What stays an argument is a single owner's own *configuration*, which nothing has today —
+every controller takes `deps` alone. Tests build the same struct (`newTestDeps` /
 `newRunningDeps` in `testutil_test.go`) rather than assembling clients of their own: the owner edges
 need every kind in one store, which beehive enforces.
 
@@ -159,9 +157,9 @@ unchanged kubeconfig republishes nothing, so the record keeps a stale observatio
 changes. The one wake error that is not retried is a record collected since the `List`, which no
 later pass would find.
 
-**`Reconcile` defers until the watcher has read.** beehive sits at the head of `service.parts`, so
-its first owed pass can reach a record left unsettled by a previous process before
-`clusterController.Start` has read the file. `Watcher.Get` reports the read alongside the config
+**`Reconcile` defers until the kubeconfig has been read.** beehive sits at the head of
+`service.parts`, so its first owed pass can reach a record left unsettled by a previous process
+before the app's kubeconfig service has read the file. `Service.Get` reports the read alongside the config
 precisely because the two states are the same value — an empty config — and observing the pre-read
 one would mark every present context absent and wake the kind's watches for a flap. Unread is a
 `RequeueAfter`, not a write.
@@ -171,28 +169,34 @@ Manual creation will have no importer at all, so *"every Cluster has an importer
 an invariant to lean on.
 
 **Watches are pull-first** — correctness comes from the poll, and push only makes it prompt.
-`kubeconfig.Watcher` is the worked example (its godoc has the reasoning): a 30-minute backstop tick
+`kubeconfig.Service` is the worked example (its godoc has the reasoning): a 30-minute backstop tick
 under fsnotify wakes and a poke subscription, both optional and allowed to fail. Applies to every
 watch. **Keep the tick under a new push layer rather than replacing it** — it is what covers what
 events cannot see, including the resume the poke subscription is there for.
 `kubeconfigImporter` has no tick and no poke of its own: its triggers are a kubeconfig snapshot and
 `Resync`, and a failed pass re-levels on the backoff retry. Whatever changes the record set out of
 band has to call `Resync` — `Clusters().Delete` does, since deleting a `Cluster` whose context is
-still in the file frees that context without changing anything the watcher would republish. That
-pass fails while the drained record still holds the name, and the retry ladder covers the tail.
+still in the file frees that context without changing anything the kubeconfig service would
+republish. That pass fails while the drained record still holds the name, and the retry ladder
+covers the tail.
 
-The watcher watches **directories, and follows symlinks**: a save replaces the inode (so a
+The service watches **directories, and follows symlinks**: a save replaces the inode (so a
 file-level watch goes deaf), and a dotfiles-managed kubeconfig is a link whose target lives in a
 directory nobody would otherwise watch. The resolved set is recomputed per reload, so a re-pointed
 link follows to its new directory. Reach for `resolvePaths` before adding anything here.
 
-`clustersvc.New(dataDir, kubeconfigPath, pokeSvc)`, `Start`, and `Close` keep their signatures, so
+`clustersvc.New(dataDir, kubeconfigSvc, pokeSvc)`, `Start`, and `Close` keep their signatures, so
 filling the shell in is never a change to the composition root.
 
-**Leaves under `internal/` speak native vocabulary** — GVRs, a `rest.Config`, cache rows — never the
-records above; the controllers translate. A leaf reaching for one of this package's types gets an
-import cycle, which is what enforces the direction. Put a mechanism in a leaf, never in a
+**The leaves this package drives speak native vocabulary** — GVRs, a `rest.Config`, cache rows —
+never the records above; the controllers translate. A leaf reaching for one of this package's types
+gets an import cycle, which is what enforces the direction. Put a mechanism in a leaf, never in a
 controller: **if `go test ./internal/clustersvc` stops being fast, one has leaked back in.**
+
+**A process-wide service is the app's, and this package only reads it.** `kubeconfig.Service`
+arrives through `deps` behind the narrow `kubeconfigService`, so `clusterController` neither starts
+nor closes it — its `Close` ends every subscription in the process, including other packages'.
+Only the importer is the controller's own machinery.
 
 The five families are `Clusters()`, `Caches()`, `CachedCatalogs()`, `CachedResources()`, and
 `CachedData()`. **The `Cached*` prefix marks the cache subtree** — what a `ClusterCache` catalogs,
@@ -294,6 +298,39 @@ Local-first accounts against kstack-cloud's Hydra (`https://oauth.kstack.sh/`). 
 Local-first settings: an edit applies to a local JSON file immediately and queues durably for the cloud. **`cloud` depends on `auth`, never the reverse** — it authenticates from `authSvc.TokenSource` and wakes on `authSvc.Subscribe()`, tracking only the `Authenticated` bit (a token refresh is a non-event). Degrades without a data dir or cloud URL. `Start` is idempotent; its `stop` replaces `Close`.
 
 Sub-packages (leaf-first): `syncstore` (generic `Envelope[T]` + `Store[T]` over `atomicjson`), `prefs` (`Settings` — pointer fields + omitempty so absent ≠ cleared; `Merge`; store deep-copies at boundaries), `mutationqueue` (durable FIFO, survives restart), `api` (GraphQL-over-HTTP client, per-request `TokenSource`), `prefsync` (the reconcile `Engine`: supervised connection with backoff + poke; `Watch` returns data + a buffered terminal-error channel so an errored close keeps escalating backoff; on Live drains the queue, and incoming snapshots get pending patches re-layered via `prefs.Merge`). Test seams: unexported functional options, same pattern as `auth`.
+
+## Kubeconfig (`internal/kubeconfig`)
+
+**The one reader of the user's kubeconfig.** App-owned, in `App.parts` between poke and the cluster
+service. Nothing else in the sidecar watches the file, calls `clientcmd`, or builds a `rest.Config`
+— a package that wants to know about a context reads the cluster records. `Get()` returns the last
+snapshot plus whether a read has happened; `Subscribe()` is current-on-subscribe; `Close()` ends
+every subscription in the process, which is why only the app calls it.
+
+`RESTConfig(contextName)` resolves one context to credentials **and** the key a connection pool
+caches them under (`restconfig.go`). Three things it holds to:
+
+- **One snapshot per call.** The credentials and the proxy URL come from the same `Get`; two reads
+  would let a reload key one snapshot's proxy onto another's credentials, and the key is the pool's
+  identity.
+- **Only a config the loading rules produced.** Loading is what resolves `certificate-authority:
+  ca.crt` against the kubeconfig's own directory. A hand-built `api.Config` silently yields CA and
+  client-cert paths that cannot be opened.
+- **The key excludes the context name**, so two contexts aimed at one cluster share a connection. It
+  covers the *static* exec/auth-provider config — minting a token is the transport's job, but
+  editing how one is obtained must redial, including what the plugin is *handed*
+  (`ProvideClusterInfo`, and the cluster's own exec extension, which is how one user entry serves
+  several clusters under different audiences) — and carries `proxy-url` alongside the `rest.Config`,
+  which compiles it into an unhashable func. **Every value is length-prefixed and every list and
+  optional block carries its length**: hashed as a bare run of values, an auth provider and an exec
+  plugin collide, and the pool serves one context a transport built for another's credentials.
+
+Two sentinels, both acted on rather than logged: `ErrContextNotFound` (the record is orphaned —
+also what an empty context name gets, since `clientcmd` would otherwise fall back to the current
+context) and `ErrNotRead` (nothing read yet, which looks identical to "every context absent").
+
+Resolution is **not memoized**: each call re-copies the config and rebuilds TLS and auth material.
+Add a per-context memo invalidated on publish when a caller's cadence makes it show.
 
 ## Resync broadcaster (`internal/poke`)
 

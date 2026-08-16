@@ -18,12 +18,15 @@ package clustersvc
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
 // newTestBeehive returns a beehive over an in-memory store, closed on cleanup. The
@@ -50,11 +53,27 @@ func newTestBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 func newTestDeps(t *testing.T) deps {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, nil)
+	d := newDeps(bh, newTestKubeconfig(t), nil)
 
-	_, _, err := registerControllers(bh, d, t.TempDir()+"/config")
+	_, _, err := registerControllers(bh, d)
 	require.NoError(t, err)
 	return d
+}
+
+// newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
+// it has read and every context is absent. Started because a reconcile defers until
+// the first read, which Start does synchronously.
+func newTestKubeconfig(t *testing.T) *kubeconfig.Service {
+	t.Helper()
+	svc := kubeconfig.New(filepath.Join(t.TempDir(), "config"), nil)
+
+	stop, err := svc.Start(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, stop(context.Background()))
+		assert.NoError(t, svc.Close())
+	})
+	return svc
 }
 
 // newRunningBeehive is newTestBeehive started, so a watch's tail is live. No
@@ -75,5 +94,5 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil)
 }

@@ -29,10 +29,11 @@ import (
 	"time"
 
 	"github.com/amorey/beehive"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -382,35 +383,41 @@ func (a clustersAPI) Delete(ctx context.Context, id ClusterID) error {
 // out by the window between beehive starting and the controllers starting.
 const kubeconfigUnreadRequeue = time.Second
 
+// kubeconfigService is the app's kubeconfig service as this package uses it, narrow
+// so a test hands the controller a static config instead of writing files. RESTConfig
+// is the connection probe's seam; Reconcile reads Get and the importer subscribes.
+type kubeconfigService interface {
+	Get() (*api.Config, bool)
+	RESTConfig(contextName string) (*rest.Config, string, error)
+	Subscribe() kubeconfig.Subscription
+}
+
 // clusterController reconciles a tracked cluster: today it observes what the
 // kubeconfig says about the record's context, and creates the ClusterCache for the
 // identity a probe has recorded. Resolving credentials and probing the API server are
 // still to come.
 //
 // It owns the Cluster kind's machinery too, so per-kind detail stays out of the
-// service struct: the kubeconfig watcher, which Reconcile reads to observe a
-// context's presence, and the importer that creates the records it reconciles and
-// wakes them when the file changes. Reconcile never touches the importer.
+// service struct: the importer that creates the records it reconciles and wakes them
+// when the file changes. Reconcile never touches the importer. The kubeconfig service
+// it reads to observe a context's presence is the app's, shared with every other
+// reader, so it is a dependency rather than machinery.
 type clusterController struct {
 	// Every kind's client, not just this one's: a cluster creates the ClusterCache
 	// children it owns.
 	deps
 
-	kubeconfigWatcher  *kubeconfig.Watcher
 	kubeconfigImporter *kubeconfigImporter
 }
 
-func newClusterController(kubeconfigPath string, d deps) *clusterController {
-	watcher := kubeconfig.New(kubeconfigPath, d.pokeSvc)
+func newClusterController(d deps) *clusterController {
 	return &clusterController{
 		deps:               d,
-		kubeconfigWatcher:  watcher,
-		kubeconfigImporter: newKubeconfigImporter(watcher, d.clusterClient),
+		kubeconfigImporter: newKubeconfigImporter(d.kubeconfigSvc, d.clusterClient),
 	}
 }
 
-// Start launches the kind's background work. Watcher before importer: the importer
-// subscribes current-on-subscribe, so it must have something to subscribe to.
+// Start launches the kind's background work.
 func (c *clusterController) Start(ctx context.Context) (func(context.Context) error, error) {
 	return lifecycle.StartAll(ctx, c.machinery())
 }
@@ -423,7 +430,6 @@ func (c *clusterController) Close() error {
 // machinery lists the kind's leaves in start order.
 func (c *clusterController) machinery() []lifecycle.Part {
 	return []lifecycle.Part{
-		{Name: "kubeconfig watcher", StartCloser: c.kubeconfigWatcher},
 		{Name: "kubeconfig importer", StartCloser: c.kubeconfigImporter},
 	}
 }
@@ -443,11 +449,11 @@ func (c *clusterController) Reconcile(
 	}
 
 	// beehive starts ahead of the controllers, so its first owed pass can reach a
-	// record left unsettled by a previous process before the watcher's first read.
+	// record left unsettled by a previous process before the kubeconfig's first read.
 	// Observing the pre-read config would report every present context absent and wake
 	// the kind's watches for a flap. The importer's first pass wakes every record once
-	// the watcher loads; the requeue is the backstop for a pass that failed.
-	cfg, loaded := c.kubeconfigWatcher.Get()
+	// the service loads; the requeue is the backstop for a pass that failed.
+	cfg, loaded := c.kubeconfigSvc.Get()
 	if !loaded {
 		return beehive.Result{RequeueAfter: kubeconfigUnreadRequeue}, nil
 	}
@@ -553,8 +559,8 @@ func observeKubeconfig(cfg *api.Config, src *ClusterSpecSourceKubeconfig, prev *
 // running when there are none, and a controller reconciles one object that already
 // does.
 
-// kubeconfigSource is the kubeconfig watcher as its subscribers see it, narrow so a
-// test can substitute a hand-driven one. Reconcile reads the watcher directly instead.
+// kubeconfigSource is the subscribe half of kubeconfigService, all the importer
+// needs, narrow so a test can substitute a hand-driven hub.
 type kubeconfigSource interface {
 	Subscribe() kubeconfig.Subscription
 }
