@@ -21,8 +21,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/amorey/beehive"
-	beehivesqlite "github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -250,15 +248,10 @@ func TestNewRejectsAnUnopenableStore(t *testing.T) {
 // beehive rejects a second controller for a kind, and that error has to reach New's
 // caller rather than leaving a kind silently unreconciled.
 func TestRegisterControllersRejectsADuplicateKind(t *testing.T) {
-	store, err := beehivesqlite.Open(filepath.Join(t.TempDir(), "beehive.db"))
-	require.NoError(t, err)
-	defer func() { assert.NoError(t, store.Close()) }()
+	bh := newTestBeehive(t)
+	ctrl := newClusterController(filepath.Join(t.TempDir(), "config"), nil, nil)
 
-	bh, err := beehive.New(store)
-	require.NoError(t, err)
-	ctrl := newClusterController(filepath.Join(t.TempDir(), "config"), nil)
-
-	_, err = registerControllers(bh, ctrl)
+	_, err := registerControllers(bh, ctrl)
 	require.NoError(t, err)
 
 	_, err = registerControllers(bh, ctrl)
@@ -293,4 +286,58 @@ func TestStartDrainsBeehiveWhenAControllerFails(t *testing.T) {
 	// told apart from one still running.
 	_, err = svc.Start(context.Background())
 	assert.ErrorContains(t, err, "already stopped")
+}
+
+// The rebuild's remaining surface, called through the boundary the resolvers use.
+// Every entry must be deleted as its method lands: a stub that stops panicking fails
+// here, which is what keeps this list honest about what is left.
+func TestUnimplementedBoundaryPanics(t *testing.T) {
+	svc := newTestService(t)
+	ctx := context.Background()
+	var id ObjectID = 1
+
+	calls := map[string]func(){
+		"Clusters().Get":                 func() { svc.Clusters().Get(ctx, id) },
+		"Clusters().List":                func() { svc.Clusters().List(ctx) },
+		"Clusters().Watch":               func() { svc.Clusters().Watch(ctx, id) },
+		"Clusters().WatchList":           func() { svc.Clusters().WatchList(ctx) },
+		"Clusters().WatchSchedule":       func() { svc.Clusters().WatchSchedule(ctx, id) },
+		"Clusters().SetEnabled":          func() { svc.Clusters().SetEnabled(ctx, id, true) },
+		"Clusters().SetSyncEnabled":      func() { svc.Clusters().SetSyncEnabled(ctx, id, true) },
+		"Clusters().Delete":              func() { svc.Clusters().Delete(ctx, id) },
+		"Caches().Get":                   func() { svc.Caches().Get(ctx, id) },
+		"Caches().List":                  func() { svc.Caches().List(ctx) },
+		"Caches().Watch":                 func() { svc.Caches().Watch(ctx, id) },
+		"Caches().WatchList":             func() { svc.Caches().WatchList(ctx) },
+		"Caches().ListByCluster":         func() { svc.Caches().ListByCluster(ctx, id) },
+		"Caches().WatchByCluster":        func() { svc.Caches().WatchByCluster(ctx, id) },
+		"Caches().WatchStats":            func() { svc.Caches().WatchStats(ctx, id, id) },
+		"Caches().WatchHealth":           func() { svc.Caches().WatchHealth(ctx) },
+		"Caches().Clear":                 func() { svc.Caches().Clear(ctx, id) },
+		"CachedCatalogs().Get":           func() { svc.CachedCatalogs().Get(ctx, id) },
+		"CachedCatalogs().List":          func() { svc.CachedCatalogs().List(ctx) },
+		"CachedCatalogs().Watch":         func() { svc.CachedCatalogs().Watch(ctx, id) },
+		"CachedCatalogs().WatchList":     func() { svc.CachedCatalogs().WatchList(ctx) },
+		"CachedCatalogs().ListByCache":   func() { svc.CachedCatalogs().ListByCache(ctx, id) },
+		"CachedCatalogs().WatchByCache":  func() { svc.CachedCatalogs().WatchByCache(ctx, id) },
+		"CachedResources().Get":          func() { svc.CachedResources().Get(ctx, id) },
+		"CachedResources().List":         func() { svc.CachedResources().List(ctx) },
+		"CachedResources().Watch":        func() { svc.CachedResources().Watch(ctx, id) },
+		"CachedResources().WatchList":    func() { svc.CachedResources().WatchList(ctx) },
+		"CachedResources().ListByCache":  func() { svc.CachedResources().ListByCache(ctx, id) },
+		"CachedResources().WatchByCache": func() { svc.CachedResources().WatchByCache(ctx, id) },
+		"CachedResources().Clear":        func() { svc.CachedResources().Clear(ctx, id) },
+		"CachedData().ListKinds":         func() { svc.CachedData().ListKinds(ctx, id, id) },
+		"CachedData().WatchKinds":        func() { svc.CachedData().WatchKinds(ctx, id, id) },
+		"CachedData().WatchObjects":      func() { svc.CachedData().WatchObjects(ctx, id, id, "v1", "pods") },
+		"CachedData().WatchEvents":       func() { svc.CachedData().WatchEvents(ctx, id, id) },
+		"GetConnection":                  func() { svc.GetConnection(id) },
+		"RetryConnection":                func() { svc.RetryConnection(ctx, id) },
+		"ListEvents":                     func() { svc.ListEvents(ctx, id, nil, nil) },
+		"WatchEvents":                    func() { svc.WatchEvents(ctx, id, nil) },
+	}
+
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) { assert.Panics(t, call) })
+	}
 }

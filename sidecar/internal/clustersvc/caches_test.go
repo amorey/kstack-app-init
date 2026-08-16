@@ -15,9 +15,12 @@
 package clustersvc
 
 import (
+	"context"
 	"testing"
 
+	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // One cache per identity per cluster: the name is the creation/dedup key beehive's
@@ -27,4 +30,13 @@ func TestClusterCacheName(t *testing.T) {
 	assert.Equal(t, "7/uid-1", ClusterCacheName(7, "uid-1"))
 	assert.NotEqual(t, ClusterCacheName(7, "uid-1"), ClusterCacheName(7, "uid-2"))
 	assert.NotEqual(t, ClusterCacheName(7, "uid-1"), ClusterCacheName(8, "uid-1"))
+}
+
+// A placeholder until the kind is rebuilt: it must settle the object rather than
+// requeue it, or beehive would spin on a kind nothing reconciles yet.
+func TestCacheControllerReconcilesToANoOp(t *testing.T) {
+	res, err := (&clusterCacheController{}).Reconcile(context.Background(), nil, &beehive.Object[ClusterCacheSpec, ClusterCacheStatus]{ID: 1})
+
+	require.NoError(t, err)
+	assert.Equal(t, beehive.Result{}, res)
 }

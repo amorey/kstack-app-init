@@ -26,6 +26,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -49,7 +50,7 @@ func newTestConfigWatcher(t *testing.T, interval time.Duration) (*Watcher, strin
 // are shrunk here so no test has to outwait a production one.
 func newWatcherAt(t *testing.T, path string, interval time.Duration) *Watcher {
 	t.Helper()
-	w := New(path)
+	w := New(path, nil)
 	w.interval = interval
 	w.settle = testSettle
 	return w
@@ -97,16 +98,32 @@ func TestPollLoadsTheConfig(t *testing.T) {
 
 	start(t, w)
 
-	assert.Contains(t, w.Get().Contexts, "prod")
+	cfg, read := w.Get()
+	assert.True(t, read)
+	assert.Contains(t, cfg.Contexts, "prod")
+}
+
+// An absent kubeconfig reads as the same empty config as the pre-read seed, so the
+// value cannot tell them apart — which is the whole reason Get reports the read. A
+// consumer that waits for one it never gets would never observe anything.
+func TestAnAbsentKubeconfigStillCountsAsRead(t *testing.T) {
+	w, _ := newTestConfigWatcher(t, time.Hour)
+
+	start(t, w)
+
+	cfg, read := w.Get()
+	assert.True(t, read, "an absent kubeconfig is an answer, not a pending read")
+	assert.Empty(t, cfg.Contexts)
 }
 
 func TestNewReadsNothing(t *testing.T) {
 	// Constructing must not touch the filesystem — the machine running this has its
 	// own kubeconfig, and picking it up would make every other test host-dependent.
-	w := New(filepath.Join(t.TempDir(), "config"))
+	w := New(filepath.Join(t.TempDir(), "config"), nil)
 
-	cfg := w.Get()
+	cfg, read := w.Get()
 	require.NotNil(t, cfg, "Get before Start")
+	assert.False(t, read, "nothing has been read yet")
 	assert.Empty(t, cfg.Contexts)
 	assert.Equal(t, defaultPollInterval, w.interval, "New paces itself; only tests override")
 }
@@ -114,7 +131,7 @@ func TestNewReadsNothing(t *testing.T) {
 func TestSubscribeIsCurrentOnSubscribe(t *testing.T) {
 	// The importer subscribes at startup and must not wait out a poll interval for
 	// its first snapshot.
-	w := New(filepath.Join(t.TempDir(), "config"))
+	w := New(filepath.Join(t.TempDir(), "config"), nil)
 	sub := w.Subscribe()
 	defer sub.Close()
 
@@ -327,7 +344,7 @@ func TestKubeconfigEnvChainIsMergedAndWatched(t *testing.T) {
 func TestNotifierSurvivesHavingNothingToWatchYet(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "kube")
-	w := New(filepath.Join(dir, "config"))
+	w := New(filepath.Join(dir, "config"), nil)
 
 	fsw := newNotifier(w.resolvePaths())
 	require.NotNil(t, fsw, "keep the notifier: a later reload is what adds the directory")
@@ -453,7 +470,8 @@ func TestUnparseableConfigKeepsTheLastGoodOne(t *testing.T) {
 		t.Fatalf("published %v for an unparseable kubeconfig", cfg)
 	case <-time.After(10 * testInterval):
 	}
-	assert.Contains(t, w.Get().Contexts, "prod", "the last good config must stand")
+	cfg, _ := w.Get()
+	assert.Contains(t, cfg.Contexts, "prod", "the last good config must stand")
 }
 
 func TestUnchangedConfigPublishesNothing(t *testing.T) {
@@ -514,7 +532,7 @@ func TestStopIsIdempotent(t *testing.T) {
 func TestCloseWithoutStart(t *testing.T) {
 	// New is called in clustersvc.New and Close in service.Close, with Start only in
 	// between — a failure between the two must not deadlock on a loop never launched.
-	w := New(filepath.Join(t.TempDir(), "config"))
+	w := New(filepath.Join(t.TempDir(), "config"), nil)
 	assert.NoError(t, w.Close())
 }
 
@@ -529,4 +547,51 @@ func TestStopJoinsPollLoop(t *testing.T) {
 	testutil.WaitReturn(t, func() { assert.NoError(t, stop(context.Background())) }, "stop to return")
 
 	assert.NoError(t, w.Close())
+}
+
+// A poke is what makes a resume prompt. The kubeconfig lands in a directory that did
+// not exist at Start, so nothing is watching it and no event can be mistaken for the
+// poke's own wake — which is also the shape the poke is for, a change the notifier
+// never saw.
+func TestPokeWakesThePoll(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kube", "config")
+	pokeSvc := poke.New()
+
+	w := newWatcherAt(t, path, time.Hour)
+	w.pokeSvc = pokeSvc
+	start(t, w)
+
+	sub := w.Subscribe()
+	defer sub.Close()
+	testutil.Recv(t, sub.Chan(), "the seed")
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	writeKubeconfig(t, path, "prod")
+
+	pokeSvc.Poke(poke.SourceHost)
+
+	cfg := testutil.Recv(t, sub.Chan(), "the reload the poke woke")
+	assert.Contains(t, cfg.Contexts, "prod")
+}
+
+// A closed poke bus must not spin the loop: a receive on a closed channel returns
+// immediately, forever. The tick and the notifier carry on without it.
+func TestClosedPokeBusLeavesTheLoopServing(t *testing.T) {
+	pokeSvc := poke.New()
+	stopPoke, err := pokeSvc.Start(context.Background())
+	require.NoError(t, err)
+
+	w, path := newTestConfigWatcher(t, testInterval)
+	w.pokeSvc = pokeSvc
+	start(t, w)
+
+	sub := w.Subscribe()
+	defer sub.Close()
+	testutil.Recv(t, sub.Chan(), "the seed")
+
+	require.NoError(t, stopPoke(context.Background()))
+
+	writeKubeconfig(t, path, "prod")
+	cfg := testutil.Recv(t, sub.Chan(), "a reload after the bus closed")
+	assert.Contains(t, cfg.Contexts, "prod")
 }

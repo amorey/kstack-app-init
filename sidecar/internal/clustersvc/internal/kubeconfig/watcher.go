@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // Subscription is current-on-subscribe and delivers each reload after that.
@@ -59,6 +60,11 @@ const defaultSettle = 50 * time.Millisecond
 // of those, and losing notifications costs latency alone. Subscribers cannot tell
 // which source woke a reload, which keeps the whole arrangement inside this file.
 //
+// A resume is the third input. Timers run on the monotonic clock, which does not
+// advance while the host is suspended, so waking can leave the tick most of a period
+// still to run — and the events it would have covered are exactly the ones a
+// suspended process is most likely to have dropped.
+//
 // The writers differ, and both shapes matter here: an editor replaces the inode,
 // which is why the watch is on the directory; clientcmd (so `kubectl config
 // use-context`) rewrites IN PLACE, truncating first, which is why an event settles
@@ -72,19 +78,28 @@ type Watcher struct {
 	// config with no contexts, and publishing that reads downstream as "every cluster
 	// is gone". Waiting out the writer's own gap is what keeps that off the wire.
 	settle time.Duration
+	// pokeSvc wakes the loop on a resume. Nil is ordinary — the poll covers what it
+	// would have caught, a period later.
+	pokeSvc *poke.Service
 
 	hub *watch.Hub[*api.Config]
 
 	mu      sync.RWMutex
 	current *api.Config
+	// read records that a poll has been attempted. It separates "there is no
+	// kubeconfig here" from "the watcher has not gotten to it yet" — both are the
+	// empty config, so the value alone cannot say which. Set even when the load
+	// failed: an unreadable kubeconfig is an answer, and the last good config (here,
+	// the empty seed) is what stands.
+	read bool
 
 	wg sync.WaitGroup
 }
 
 // New returns a watcher for kubeconfigPath, or the standard precedence chain when
 // it is empty. Nothing is read until Start: a subscriber attaching before then sees
-// an empty config rather than a nil one.
-func New(kubeconfigPath string) *Watcher {
+// an empty config rather than a nil one. pokeSvc may be nil.
+func New(kubeconfigPath string, pokeSvc *poke.Service) *Watcher {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	loadingRules.ExplicitPath = kubeconfigPath
 
@@ -93,16 +108,19 @@ func New(kubeconfigPath string) *Watcher {
 		loadingRules: loadingRules,
 		interval:     defaultPollInterval,
 		settle:       defaultSettle,
+		pokeSvc:      pokeSvc,
 		hub:          watch.New(current),
 		current:      current,
 	}
 }
 
-// Get returns the most recently loaded config; never nil.
-func (w *Watcher) Get() *api.Config {
+// Get returns the most recently loaded config — never nil — and whether the watcher
+// has read yet. Before the first read the config is the empty seed, which a caller
+// must not observe: it would report every context absent.
+func (w *Watcher) Get() (*api.Config, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return w.current
+	return w.current, w.read
 }
 
 // Subscribe returns a handle carrying the current config, then each reload.
@@ -123,12 +141,21 @@ func (w *Watcher) Start(context.Context) (func(context.Context) error, error) {
 	paths := w.resolvePaths()
 	fsw := newNotifier(paths)
 
+	// Subscribed before the first read for the same reason the watch is: a poke in the
+	// gap would otherwise wake nothing.
+	var pokes <-chan poke.Signal
+	cancelPokes := func() {}
+	if w.pokeSvc != nil {
+		pokes, cancelPokes = w.pokeSvc.Subscribe()
+	}
+
 	w.poll()
 
 	stop := make(chan struct{})
 	w.wg.Go(func() {
 		ticker := time.NewTicker(w.interval)
 		defer ticker.Stop()
+		defer cancelPokes()
 		if fsw != nil {
 			defer fsw.Close()
 		}
@@ -142,7 +169,7 @@ func (w *Watcher) Start(context.Context) (func(context.Context) error, error) {
 			events, errs = fsw.Events, fsw.Errors
 		}
 
-		// Armed by an event, drained by the reload it triggers.
+		// Armed by an event or a poke, drained by the reload it triggers.
 		settle := time.NewTimer(w.settle)
 		settle.Stop()
 		defer settle.Stop()
@@ -171,6 +198,16 @@ func (w *Watcher) Start(context.Context) (func(context.Context) error, error) {
 				}
 			case <-settle.C:
 				reload()
+			case _, ok := <-pokes:
+				if !ok {
+					// The bus closed ahead of us; the ticker still covers everything.
+					pokes = nil
+					continue
+				}
+				// Through the settle timer rather than straight to reload: a poke is
+				// correlated with host events, so it can land inside a writer's
+				// truncate-then-rewrite gap the same way an fsnotify event can.
+				settle.Reset(w.settle)
 			case err := <-errs:
 				slog.Debug("kubeconfig watch error", "err", err)
 			}
@@ -290,6 +327,13 @@ func syncDirs(fsw *fsnotify.Watcher, paths watchedPaths) {
 }
 
 // poll reloads the kubeconfig and publishes it if it differs from the last snapshot.
+// markRead records the read a failed load still made.
+func (w *Watcher) markRead() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.read = true
+}
+
 func (w *Watcher) poll() {
 	// clientcmd returns an empty config rather than an error when no file is found,
 	// which is the right reading: a machine with no kubeconfig tracks no clusters.
@@ -300,6 +344,7 @@ func (w *Watcher) poll() {
 		// silence would leave a permanently broken kubeconfig looking like a watcher
 		// that simply stopped noticing.
 		slog.Debug("kubeconfig load failed, keeping the last good config", "err", err)
+		w.markRead()
 		return
 	}
 
@@ -307,6 +352,7 @@ func (w *Watcher) poll() {
 	// and the cluster and user entries behind them resolve credentials, so every
 	// field reaches someone.
 	w.mu.Lock()
+	w.read = true
 	unchanged := reflect.DeepEqual(w.current, cfg)
 	if !unchanged {
 		w.current = cfg

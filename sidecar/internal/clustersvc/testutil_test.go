@@ -12,29 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Fixtures shared across this package's test files. Anything used by one file lives
+// beside it instead.
 package clustersvc
 
 import (
-	"context"
 	"testing"
 
 	"github.com/amorey/beehive"
+	beehivesqlite "github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// Exactly one discovery anchor per cache, so creation is idempotent under
-// name-uniqueness dedup.
-func TestClusterCachedCatalogName(t *testing.T) {
-	assert.Equal(t, "cachedcatalog/7", ClusterCachedCatalogName(7))
-	assert.Equal(t, ClusterCachedCatalogName(7), ClusterCachedCatalogName(7))
-}
-
-// A placeholder until the kind is rebuilt: it must settle the object rather than
-// requeue it, or beehive would spin on a kind nothing reconciles yet.
-func TestCachedCatalogControllerReconcilesToANoOp(t *testing.T) {
-	res, err := (&clusterCachedCatalogController{}).Reconcile(context.Background(), nil, &beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]{ID: 1})
-
+// newTestBeehive returns a beehive over an in-memory store, closed on cleanup. The
+// bootstrap New does, minus the disk.
+func newTestBeehive(t *testing.T) *beehive.Beehive {
+	t.Helper()
+	store, err := beehivesqlite.OpenMemory()
 	require.NoError(t, err)
-	assert.Equal(t, beehive.Result{}, res)
+	t.Cleanup(func() { assert.NoError(t, store.Close()) })
+
+	bh, err := beehive.New(store)
+	require.NoError(t, err)
+	return bh
 }

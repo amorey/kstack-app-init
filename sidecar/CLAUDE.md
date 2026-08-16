@@ -46,15 +46,17 @@ side and hides when they don't. Everything else slices by kind, so one file teac
 are the subsystem's concurrency and retry budget, which only reads as a budget in one place.
 
 `New` opens the beehive store under `dataDir` and registers all four controllers; `Start` runs
-beehive, then each controller's background work. **The controllers reconcile to a no-op, the
-importer's set-reconcile is hollow, and every family method panics** — so the app starts, the socket
-comes up, auth and cloud settings work, and any cluster query or subscription panics. The kubeconfig
-watcher is the one piece that is fully built. There is no connection manager, discovery pass, sync
-worker, or on-disk cache yet.
+beehive, then each controller's background work. **The three cache controllers reconcile to a no-op
+and every family method panics** — so the app starts, the socket comes up, auth and cloud settings
+work, and any cluster query or subscription panics. Built so far: the kubeconfig watcher, the
+importer that creates `Cluster` records, and `clusterController.Reconcile` observing what the
+kubeconfig says about each one (`status.source.kubeconfig`). There is no connection manager,
+discovery pass, sync worker, or on-disk cache yet, and nothing reads any of it back out.
 
 **A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
-lifecycle — `clusterController` owns the kubeconfig watcher and importer, and the leaves each other
-controller grows land the same way. Otherwise the composition root accumulates every kind's detail.
+lifecycle — read `clusterController.machinery()` for what the Cluster kind owns, and the leaves each
+other controller grows land the same way. Otherwise the composition root accumulates every kind's
+detail.
 A controller built with machinery is constructed in `New` and passed to `registerControllers`, which
 returns all four in registration order; the rest are built at the call.
 
@@ -71,15 +73,40 @@ reconciles one object that already does. (It hangs off the controller for lifecy
 `Reconcile` never touches it.) Each importer covers one `ClusterSpecSource` variant and is
 **creation-only**: it creates a record for every context nothing yet references and never updates,
 orphans, or deletes. A departed context is orphaned by `clusterController` observing it absent
-(`IsPresent=false`), which keeps set membership and per-object observation from fighting. Scope an
-importer by the source discriminant (`Spec.Source.Kubeconfig != nil`), not by the name prefix.
+(`IsPresent=false`), which keeps set membership and per-object observation from fighting. It is also
+why status is unreachable from an importer at all: `UpdateStatus` lives on beehive's
+`ControllerClient`, which only a registered controller is handed.
+
+**One pass creates and wakes.** The observation reads the watcher rather than the object, so beehive
+cannot know it went stale; the same pass that creates the missing records therefore `Requeue`s the
+ones that already existed. They share a trigger and a `List`, and a requeue is a wake rather than a
+write, so creation-only still holds. A departure is absent from the snapshot the create loop walks —
+the wake is the only thing that reaches it. Creates and wakes share one retry ladder — a doubling
+delay capped at `importRetryMax` — because a lost wake is the failure nothing else re-levels: an
+unchanged kubeconfig republishes nothing, so the record keeps a stale observation until the file next
+changes. The one wake error that is not retried is a record collected since the `List`, which no
+later pass would find.
+
+**`Reconcile` defers until the watcher has read.** beehive sits at the head of `service.parts`, so
+its first owed pass can reach a record left unsettled by a previous process before
+`clusterController.Start` has read the file. `Watcher.Get` reports the read alongside the config
+precisely because the two states are the same value — an empty config — and observing the pre-read
+one would mark every present context absent and wake the kind's watches for a flap. Unread is a
+`RequeueAfter`, not a write.
+
+Scope an importer by the source discriminant (`Spec.Source.Kubeconfig != nil`), not by the name prefix.
 Manual creation will have no importer at all, so *"every Cluster has an importer behind it"* is not
 an invariant to lean on.
 
 **Watches are pull-first** — correctness comes from the poll, and push only makes it prompt.
 `kubeconfig.Watcher` is the worked example (its godoc has the reasoning): a 30-minute backstop tick
-under fsnotify wakes, notifications optional and allowed to fail. Applies to every watch. **Keep the
-tick under a new push layer rather than replacing it** — it is what covers what events cannot see.
+under fsnotify wakes and a poke subscription, both optional and allowed to fail. Applies to every
+watch. **Keep the tick under a new push layer rather than replacing it** — it is what covers what
+events cannot see, including the resume the poke subscription is there for.
+`kubeconfigImporter` has no tick and no poke of its own: its only trigger is a kubeconfig snapshot,
+and a failed pass re-levels on the backoff retry. So whatever changes the record set out of band — a
+mutation deleting a `Cluster` whose context is still present — has to reach the importer directly.
+Poking the watcher does not: it republishes only when the file's contents differ.
 
 The watcher watches **directories, and follows symlinks**: a save replaces the inode (so a
 file-level watch goes deaf), and a dotfiles-managed kubeconfig is a link whose target lives in a

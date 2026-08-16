@@ -15,9 +15,12 @@
 package clustersvc
 
 import (
+	"context"
 	"testing"
 
+	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Deterministic per (anchor, apiVersion, resource), which is what lets a discovery
@@ -34,4 +37,13 @@ func TestClusterCachedResourceName(t *testing.T) {
 		ClusterCachedResourceName(3, "apps/v1", "deployments"),
 		ClusterCachedResourceName(4, "apps/v1", "deployments"),
 		"the same kind under another cache's anchor")
+}
+
+// A placeholder until the kind is rebuilt: it must settle the object rather than
+// requeue it, or beehive would spin on a kind nothing reconciles yet.
+func TestCachedResourceControllerReconcilesToANoOp(t *testing.T) {
+	res, err := (&clusterCachedResourceController{}).Reconcile(context.Background(), nil, &beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]{ID: 1})
+
+	require.NoError(t, err)
+	assert.Equal(t, beehive.Result{}, res)
 }

@@ -429,7 +429,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 	}
 
 	clusterClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-	clusterCtrl := newClusterController(kubeconfigPath, clusterClient)
+	clusterCtrl := newClusterController(kubeconfigPath, pokeSvc, clusterClient)
 
 	controllers, err := registerControllers(bh, clusterCtrl)
 	if err != nil {
