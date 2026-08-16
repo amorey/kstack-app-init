@@ -19,6 +19,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
@@ -51,17 +52,16 @@ type Config struct {
 }
 
 // App owns the composed sidecar: one h2c handler fronting the GraphQL and gRPC
-// servers, plus the cluster service (a shell pending its rebuild), the auth and
-// cloud services, and the poke bus they share. It is an http.Handler; main()
-// mounts it on the listener.
+// servers, over the services in parts. It is an http.Handler; main() mounts it on
+// the listener.
 type App struct {
 	handler       http.Handler
 	graphqlServer *graph.Server
 	grpcServer    *grpcserver.Server
-	clusterSvc    clustersvc.Service
-	authSvc       auth.Service
-	cloudSvc      *cloud.Service
-	pokeSvc       *poke.Service
+
+	// parts is start order; stop and close run in reverse, which is what keeps poke's
+	// hub open until its subscribers have drained.
+	parts []lifecycle.Part
 }
 
 // New builds the composition root, wiring the beehive control-plane, auth, and
@@ -128,10 +128,11 @@ func New(cfg Config) (*App, error) {
 		handler:       handler,
 		graphqlServer: graphqlServer,
 		grpcServer:    grpcServer,
-		clusterSvc:    clusterSvc,
-		authSvc:       authSvc,
-		cloudSvc:      cloudSvc,
-		pokeSvc:       pokeSvc,
+		parts: []lifecycle.Part{
+			{Name: "poke service", StartCloser: lifecycle.StartFunc(pokeSvc.Start)},
+			{Name: "cluster service", StartCloser: clusterSvc},
+			{Name: "cloud service", StartCloser: lifecycle.StartFunc(cloudSvc.Start)},
+		},
 	}, nil
 }
 
@@ -144,26 +145,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // returned stop func accepts a drain-deadline context, blocks until all
 // background work finishes, and must be called before Close.
 func (a *App) Start(ctx context.Context) (func(context.Context) error, error) {
-	pokeSvcStop, err := a.pokeSvc.Start(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("start poke service: %w", err)
-	}
-
-	clusterSvcStop, err := a.clusterSvc.Start(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("start cluster service: %w", err)
-	}
-
-	cloudSvcStop, err := a.cloudSvc.Start(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("start cloud service: %w", err)
-	}
-
-	stop := func(ctx context.Context) error {
-		// Left-to-right evaluation stops poke's hub last, after its subscribers.
-		return errors.Join(clusterSvcStop(ctx), cloudSvcStop(ctx), pokeSvcStop(ctx))
-	}
-	return stop, nil
+	return lifecycle.StartAll(ctx, a.parts)
 }
 
 // NotifyShutdown signals both transports' long-lived streams to close cleanly:
@@ -183,10 +165,10 @@ func (a *App) DrainWithContext(ctx context.Context) error {
 	return errors.Join(<-errs, <-errs)
 }
 
-// Close releases OS resources after Stop returns: stops the gRPC transports and
-// closes the cluster store. The poke broadcaster and cloud engine are already
-// drained by the stop func returned from Start.
+// Close releases OS resources after the stop func returns. The gRPC transports go
+// first, outside the composed parts: GracefulStop panics on the h2c path, so Stop only
+// ever runs here, after the drain.
 func (a *App) Close() error {
 	a.grpcServer.Stop()
-	return a.clusterSvc.Close()
+	return lifecycle.CloseAll(a.parts)
 }

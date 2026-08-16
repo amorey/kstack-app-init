@@ -33,6 +33,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
 // ClusterGroupKind identifies the Cluster beehive resource kind.
@@ -411,17 +412,20 @@ func newClusterController(kubeconfigPath string, d deps) *clusterController {
 // Start launches the kind's background work. Watcher before importer: the importer
 // subscribes current-on-subscribe, so it must have something to subscribe to.
 func (c *clusterController) Start(ctx context.Context) (func(context.Context) error, error) {
-	return startAll(ctx, c.machinery())
+	return lifecycle.StartAll(ctx, c.machinery())
 }
 
 // Close releases what the stop func left, in the same reverse order.
 func (c *clusterController) Close() error {
-	return closeAll(c.machinery())
+	return lifecycle.CloseAll(c.machinery())
 }
 
 // machinery lists the kind's leaves in start order.
-func (c *clusterController) machinery() []startCloser {
-	return []startCloser{c.kubeconfigWatcher, c.kubeconfigImporter}
+func (c *clusterController) machinery() []lifecycle.Part {
+	return []lifecycle.Part{
+		{Name: "kubeconfig watcher", StartCloser: c.kubeconfigWatcher},
+		{Name: "kubeconfig importer", StartCloser: c.kubeconfigImporter},
+	}
 }
 
 // resyncImports asks the importer for a pass; see kubeconfigImporter.Resync.

@@ -9,16 +9,16 @@ The data dir (`--data-dir` / `KSTACK_DATA_DIR`) is **required** — `app.New` er
 Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the composition root + routing, GraphQL lives in `graph/`. There is no `server` package.
 
 - `main.go` — parse flags, bind socket, build `*app.App`, serve, drive graceful shutdown (`srv.Shutdown` → `app.DrainWithContext` → `stop(ctx)` → `app.Close`).
-- `internal/app/` — **composition root**: builds `poke.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start(ctx)` returns a drain-func; the stop chain is `clusterSvcStop → cloudSvcStop → pokeSvcStop` — poke's hub closes **last**, after its subscribers drain (the left-to-right arg evaluation in the `errors.Join` enforces it).
+- `internal/app/` — **composition root**: builds `poke.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
-- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `drain`, `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
+- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
 `internal/app` owns the topology (that two surfaces share one socket); `grpc/` owns the predicate. HTTP/1.1 GraphQL POST + SSE are untouched. An idle `AuthStateWatch` survives the 60s `IdleTimeout` via gRPC keepalive pings. The cluster surface is **GraphQL-only**. → [ADR: single-socket h2c](../docs/adr/2026-08-09-single-socket-h2c.md).
 
-**Shutdown order** (from `main.go`): `app.NotifyShutdown()` (gRPC streams end on their serving context; each SSE request's context is cancelled per-request) → `srv.Shutdown` → `app.DrainWithContext` (waits both sub-servers' WaitGroups — essential for hijacked h2c gRPC streams `srv.Shutdown` can't see) → `stop(ctx)` → `app.Close()` (`grpcServer.Stop()`, `clusterSvc.Close()`). Traps: grpc-go's `GracefulStop` **panics** on the h2c path — `Stop` only runs after the drain; never cancel via `http.Server.BaseContext` — it would tear down the shared h2c connection carrying gRPC mid-stream.
+**Shutdown order** (from `main.go`): `app.NotifyShutdown()` (gRPC streams end on their serving context; each SSE request's context is cancelled per-request) → `srv.Shutdown` → `app.DrainWithContext` (waits both sub-servers' WaitGroups — essential for hijacked h2c gRPC streams `srv.Shutdown` can't see) → `stop(ctx)` → `app.Close()` (`grpcServer.Stop()`, then `lifecycle.CloseAll(a.parts)`). Traps: grpc-go's `GracefulStop` **panics** on the h2c path — `Stop` only runs after the drain; never cancel via `http.Server.BaseContext` — it would tear down the shared h2c connection carrying gRPC mid-stream.
 
 ## Cluster subsystem (`internal/clustersvc`)
 
@@ -103,12 +103,16 @@ deps)`, since the path belongs to that controller alone. Tests build the same st
 `newRunningDeps` in `testutil_test.go`) rather than assembling clients of their own: the owner edges
 need every kind in one store, which beehive enforces.
 
-**One lifecycle shape at every level** — `startCloser` in `service.go`, which carries the contract.
-Beehive included: it is wrapped as a `startCloser` and sits at the head of `service.parts`, so
-`Start`/`Close` are one `startAll`/`closeAll` call and nothing composes by hand. **Add a participant
-by putting it in the slice, never by writing another stop closure**, and honor the drain deadline
-with `drain.WithContext` — `startCloser` promises it, and a leaf that blocks on a bare `wg.Wait()`
-quietly breaks the promise for everything above it. A kind with no machinery embeds `noBackground`.
+**One lifecycle shape at every level** — `lifecycle.StartCloser`. Beehive included: it is wrapped
+as one and sits at the head of `service.parts`, so `Start`/`Close` are one
+`lifecycle.StartAll`/`CloseAll` call. **Add a participant by putting it in the slice as a named
+`lifecycle.Part`, never by writing another stop closure** — every phase reports failures under
+that name, so a participant must not wrap its own. Slice order is start order; stop and close
+reverse it. `ctx` bounds
+startup alone — background work ends via the stop func, which must be idempotent and must wait with
+`drain.WithContext`. A kind with no machinery embeds `lifecycle.None`; something whose stop func
+already releases everything enters as a `lifecycle.StartFunc`. → [ADR: lifecycle
+composition](../docs/adr/2026-08-16-lifecycle-composition.md).
 
 **A parent controller creates the child kinds it owns.** A cache's identity is discovered by the
 cluster's probe, and a controller only ever reconciles an object that already exists — so

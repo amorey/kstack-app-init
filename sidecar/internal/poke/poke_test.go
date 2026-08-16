@@ -123,3 +123,32 @@ func TestRun_CtxCancel_ClosesSubscribers(t *testing.T) {
 
 	testutil.RecvClosed(t, ch, "the subscriber channel")
 }
+
+// A5: Start's ctx bounds startup alone, so cancelling it must leave the detector
+// running. Without that, an owner timing out startup would silently lose the bus for
+// every subscriber; the stop func is the only teardown.
+func TestStart_StartupCtxCancel_KeepsDetectorRunning(t *testing.T) {
+	b := newWithOptions(withNow(func() time.Time { return epoch }))
+
+	ch, cancelSub := b.Subscribe()
+	defer cancelSub()
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	stop, err := b.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cancelCtx()
+
+	// Run exiting on that cancel would close the hub, which lands here as a closed
+	// channel rather than as silence.
+	mustNotRecv(t, ch)
+
+	b.Poke(SourceHost)
+	assert.Equal(t, SourceHost, mustRecv(t, ch).Source)
+
+	if err := stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	testutil.RecvClosed(t, ch, "the subscriber channel after stop")
+}

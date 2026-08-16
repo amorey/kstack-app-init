@@ -117,8 +117,11 @@ func (s *Service) Subscribe() (<-chan Signal, func()) {
 // Start runs the detector in a goroutine; the returned stop cancels it and blocks until
 // it exits (closing the hub and every subscriber channel), bounded by its own context.
 // Call once.
+//
+// ctx bounds startup alone, as lifecycle.StartCloser requires: the detector runs on a
+// context detached from it, so a caller can time-limit startup without killing the bus.
 func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

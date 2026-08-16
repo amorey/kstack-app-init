@@ -214,9 +214,8 @@ func (w *Watcher) Start(context.Context) (func(context.Context) error, error) {
 		}
 	})
 
-	// Idempotent, like every other stop func the composition calls: startAll/stopAll
-	// treat them uniformly, so a retry or a double drain anywhere above must not turn
-	// shutdown into a close of a closed channel.
+	// Idempotent, as lifecycle.StartCloser requires: a retry or a double drain anywhere
+	// above must not turn shutdown into a close of a closed channel.
 	var once sync.Once
 	return func(ctx context.Context) error {
 		once.Do(func() { close(stop) })

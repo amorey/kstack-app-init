@@ -24,6 +24,5 @@ A spec left behind after the code ships is a second source of truth.
 
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [Lifecycle package](lifecycle-package.md) | sidecar | In progress |
 | [Kubeconfig service](kubeconfig-service.md) | sidecar | In progress |
 | [Kubeconnection service](kubeconnection-service.md) | sidecar | In progress |

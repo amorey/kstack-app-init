@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/amorey/beehive"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
 // ClusterCacheGroupKind identifies the ClusterCache beehive resource kind.
@@ -347,7 +348,7 @@ func (a cachesAPI) Clear(ctx context.Context, id ClusterID) (*Cluster, error) {
 // beneath it, carrying the pause switch its cluster decides. Provisioning the mirror
 // itself is still to come.
 type clusterCacheController struct {
-	noBackground
+	lifecycle.None
 	// Every kind's client, not just this one's: a cache reads the cluster it hangs off
 	// and writes the catalog it owns.
 	deps

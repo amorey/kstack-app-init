@@ -25,6 +25,7 @@ import (
 	"strconv"
 
 	"github.com/amorey/beehive"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
 // ClusterCachedCatalogGroupKind identifies the discovery anchor kind: one
@@ -138,7 +139,7 @@ func (a cachedCatalogsAPI) WatchByCache(ctx context.Context, cacheID ClusterCach
 // clusterCachedCatalogController reconciles one cache's kind catalog: run the
 // discovery pass and maintain a ClusterCachedResource child per served kind. A
 // placeholder that reconciles to a no-op.
-type clusterCachedCatalogController struct{ noBackground }
+type clusterCachedCatalogController struct{ lifecycle.None }
 
 func (c *clusterCachedCatalogController) Reconcile(
 	ctx context.Context,

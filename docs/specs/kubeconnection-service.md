@@ -25,9 +25,9 @@ Depends on [Kubeconfig service](kubeconfig-service.md) for resolved credentials.
 App-owned, a peer of `poke` and `kubeconfig`. It holds pooled connections and nothing else: it
 never decides which clusters exist, when to dial, or when to probe.
 
-It satisfies `lifecycle.StartCloser` (see [Lifecycle package](lifecycle-package.md)) by embedding
-`lifecycle.None`, since it has no background work yet, and overriding `Close` to close the pooled
-connections. The idle sweep below fills in `Start` when it lands.
+It satisfies `lifecycle.StartCloser` by embedding `lifecycle.None`, since it has no background
+work yet, and overriding `Close` to close the pooled connections. The idle sweep below fills in
+`Start` when it lands.
 
 ```go
 // package internal/kubeconnect
@@ -188,8 +188,8 @@ credentials after a rotation.
 
 ## Build order
 
-Each step is one red/green cycle and one commit. [Lifecycle package](lifecycle-package.md) and
-[Kubeconfig service](kubeconfig-service.md) land first.
+Each step is one red/green cycle and one commit. [Kubeconfig service](kubeconfig-service.md)
+lands first.
 
 1. `kubeconnect.Connection` + `Service.Get`, including two concurrent calls for one key getting
    one connection.

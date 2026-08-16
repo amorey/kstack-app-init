@@ -18,9 +18,8 @@ The watcher already exists and works — this is a move plus one new method. It 
 ### The move
 
 `clustersvc/internal/kubeconfig` becomes `sidecar/internal/kubeconfig`, a peer of `poke` and
-`drain`. `Watcher` becomes `Service`, matching `poke.Service`. It satisfies
-`lifecycle.StartCloser` already, which is how the app composes it — see
-[Lifecycle package](lifecycle-package.md). Its existing surface is unchanged:
+`drain`. `Watcher` becomes `Service`, matching `poke.Service`. It satisfies `lifecycle.StartCloser`
+already, which is how the app composes it. Its existing surface is unchanged:
 
 ```go
 func New(kubeconfigPath string, pokeSvc *poke.Service) *Service

@@ -24,7 +24,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -85,155 +85,6 @@ func TestStartStopClose(t *testing.T) {
 	assert.NoError(t, svc.Close())
 }
 
-// stubStartCloser records each phase it goes through into a shared log, and refuses to
-// start when startErr is set.
-type stubStartCloser struct {
-	name     string
-	startErr error
-	log      *[]string
-}
-
-func (s *stubStartCloser) Start(context.Context) (func(context.Context) error, error) {
-	if s.startErr != nil {
-		return nil, s.startErr
-	}
-	*s.log = append(*s.log, "start:"+s.name)
-	return func(context.Context) error {
-		*s.log = append(*s.log, "stop:"+s.name)
-		return nil
-	}, nil
-}
-
-func (s *stubStartCloser) Close() error {
-	*s.log = append(*s.log, "close:"+s.name)
-	return nil
-}
-
-func TestStartAllStartsInOrderAndStopsInReverse(t *testing.T) {
-	var log []string
-	ls := []startCloser{
-		&stubStartCloser{name: "a", log: &log},
-		&stubStartCloser{name: "b", log: &log},
-	}
-
-	stop, err := startAll(context.Background(), ls)
-	require.NoError(t, err)
-	require.NoError(t, stop(context.Background()))
-
-	assert.Equal(t, []string{"start:a", "start:b", "stop:b", "stop:a"}, log)
-}
-
-// A failed start leaves the caller no stop func, so whatever already runs is
-// unreachable — startAll has to take it down itself, and must not start what comes
-// after.
-func TestStartAllUnwindsWhenOneFails(t *testing.T) {
-	boom := errors.New("boom")
-	var log []string
-	ls := []startCloser{
-		&stubStartCloser{name: "a", log: &log},
-		&stubStartCloser{name: "b", startErr: boom, log: &log},
-		&stubStartCloser{name: "c", log: &log},
-	}
-
-	stop, err := startAll(context.Background(), ls)
-
-	assert.Nil(t, stop)
-	assert.ErrorIs(t, err, boom)
-	assert.Equal(t, []string{"start:a", "stop:a"}, log)
-}
-
-// stopWaiter's stop blocks until release is closed, so a test can tell a stop that
-// really drained from one that gave up on a dead context.
-type stopWaiter struct {
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (s *stopWaiter) Start(context.Context) (func(context.Context) error, error) {
-	return func(ctx context.Context) error {
-		close(s.entered)
-		return drain.WithContext(ctx, func() { <-s.release })
-	}, nil
-}
-
-func (s *stopWaiter) Close() error { return nil }
-
-// A start most often fails because the startup context died. Unwinding on that same
-// context would signal the already-started parts and report them drained without
-// waiting, leaving them running while the caller is free to close what they use.
-func TestStartAllUnwindDoesNotInheritADeadContext(t *testing.T) {
-	boom := errors.New("boom")
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	waiter := &stopWaiter{entered: make(chan struct{}), release: make(chan struct{})}
-	var log []string
-	ls := []startCloser{waiter, &stubStartCloser{name: "b", startErr: boom, log: &log}}
-
-	errs := make(chan error, 1)
-	go func() {
-		_, err := startAll(ctx, ls)
-		errs <- err
-	}()
-
-	testutil.Wait(t, waiter.entered, "the unwind to reach the started part's stop")
-	close(waiter.release)
-
-	err := testutil.Recv(t, errs, "startAll to return")
-	assert.ErrorIs(t, err, boom)
-	assert.NotErrorIs(t, err, context.Canceled, "the unwind must wait, not adopt the dead startup context")
-}
-
-func TestCloseAllRunsInReverse(t *testing.T) {
-	var log []string
-	ls := []startCloser{
-		&stubStartCloser{name: "a", log: &log},
-		&stubStartCloser{name: "b", log: &log},
-	}
-
-	require.NoError(t, closeAll(ls))
-	assert.Equal(t, []string{"close:b", "close:a"}, log)
-}
-
-// Stopping in reverse of registration order is what takes a child's machinery down
-// before its owner's.
-func TestStopAllRunsInReverse(t *testing.T) {
-	var order []int
-	stops := make([]func(context.Context) error, 3)
-	for i := range stops {
-		stops[i] = func(context.Context) error {
-			order = append(order, i)
-			return nil
-		}
-	}
-
-	require.NoError(t, stopAll(context.Background(), stops))
-	assert.Equal(t, []int{2, 1, 0}, order)
-}
-
-// One failing stop must not skip the rest: a controller left running because an
-// earlier one errored would outlive the service that owns it.
-func TestStopAllRunsEveryStopAndJoinsErrors(t *testing.T) {
-	first := errors.New("first")
-	last := errors.New("last")
-
-	var ran int
-	stops := []func(context.Context) error{
-		func(context.Context) error { ran++; return first },
-		func(context.Context) error { ran++; return nil },
-		func(context.Context) error { ran++; return last },
-	}
-
-	err := stopAll(context.Background(), stops)
-	assert.Equal(t, 3, ran)
-	assert.ErrorIs(t, err, first)
-	assert.ErrorIs(t, err, last)
-}
-
-func TestStopAllWithNoStops(t *testing.T) {
-	assert.NoError(t, stopAll(context.Background(), nil))
-}
-
 // A dataDir that exists but cannot hold the store is a startup failure, not a
 // service running against a database it never opened.
 func TestNewRejectsAnUnopenableStore(t *testing.T) {
@@ -270,14 +121,22 @@ func TestStartRejectsASecondStart(t *testing.T) {
 	assert.ErrorContains(t, err, "start beehive")
 }
 
+// failingPart refuses to start, so a test can drive the unwind path.
+type failingPart struct{ err error }
+
+func (f failingPart) Start(context.Context) (func(context.Context) error, error) {
+	return nil, f.err
+}
+
+func (failingPart) Close() error { return nil }
+
 // beehive starts before the controllers, so a controller that fails to start leaves
 // it running with no stop func to reach it. Start has to drain it on the way out.
 func TestStartDrainsBeehiveWhenAControllerFails(t *testing.T) {
 	boom := errors.New("boom")
 	svc := newTestService(t).(*service)
-	var log []string
 	// Keep beehive at the head, where New puts it, and fail the part after it.
-	svc.parts = []startCloser{svc.parts[0], &stubStartCloser{name: "a", startErr: boom, log: &log}}
+	svc.parts = []lifecycle.Part{svc.parts[0], {Name: "a", StartCloser: failingPart{err: boom}}}
 
 	_, err := svc.Start(context.Background())
 	require.ErrorIs(t, err, boom)

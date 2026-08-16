@@ -96,13 +96,16 @@ func (s *Service) Prefs() *prefs.Store { return s.prefs }
 // returned stop cancels both and blocks until they unwind, bounded by its own context.
 // Returns a no-op stop when degraded or already started, so a second call can't leak a
 // second engine goroutine.
+//
+// ctx bounds startup alone, as lifecycle.StartCloser requires: the engine runs on a
+// context detached from it, so a caller can time-limit startup without killing the sync.
 func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
 	noop := func(context.Context) error { return nil }
 	if s.engine == nil || s.started {
 		return noop, nil
 	}
 	s.started = true
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	done := make(chan struct{})
 
 	// Wake the engine on sign-in/sign-out: cloud observes auth's stream, never the

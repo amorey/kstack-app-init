@@ -516,8 +516,8 @@ func TestStopLeavesSubscriptionsOpen(t *testing.T) {
 	testutil.WaitClosed(t, sub.Chan(), "subscription after Close")
 }
 
-// startAll/stopAll compose every part's stop uniformly, so a retry or a double drain
-// above must find this one idempotent rather than panicking on a closed channel.
+// lifecycle.StartCloser requires an idempotent stop, so a retry or a double drain above
+// must find this one idempotent rather than panicking on a closed channel.
 func TestStopIsIdempotent(t *testing.T) {
 	w, _ := newTestConfigWatcher(t, testInterval)
 	stop, err := w.Start(context.Background())

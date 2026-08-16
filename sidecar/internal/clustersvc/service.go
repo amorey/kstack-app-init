@@ -62,16 +62,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
 	"k8s.io/client-go/rest"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
@@ -309,81 +308,6 @@ var (
 	_ CachedData      = cachedDataAPI{}
 )
 
-// startCloser is the three-phase shape every layer here shares, Service included, and
-// it means the same thing at each: Start bounds startup with ctx and returns the func
-// that drains the background work, taking a drain deadline; Close releases what the
-// drain left. Two methods, three phases — stop is Start's return value, so it cannot
-// be called before there is anything to stop. Identical from the leaves up, so
-// composing a level is startAll + stopAll + closeAll rather than a hand-written stop
-// per owner.
-//
-// Separate from beehive.Controller, which is generic per kind and so cannot be held
-// in one slice.
-type startCloser interface {
-	Start(ctx context.Context) (func(context.Context) error, error)
-	io.Closer
-}
-
-// noBackground supplies the lifecycle for a kind whose controller owns no machinery.
-// Embed it, and override either method when the kind grows some.
-type noBackground struct{}
-
-func (noBackground) Start(context.Context) (func(context.Context) error, error) {
-	return func(context.Context) error { return nil }, nil
-}
-
-func (noBackground) Close() error { return nil }
-
-// startAll starts each in order and returns their stop funcs. A failure stops
-// whatever already started: the caller gets an error and no stop funcs, so nothing
-// else can reach them.
-func startAll(ctx context.Context, ls []startCloser) (func(context.Context) error, error) {
-	stops := make([]func(context.Context) error, 0, len(ls))
-	for _, l := range ls {
-		stop, err := l.Start(ctx)
-		if err != nil {
-			return nil, errors.Join(err, unwind(ctx, stops))
-		}
-		stops = append(stops, stop)
-	}
-	return func(ctx context.Context) error { return stopAll(ctx, stops) }, nil
-}
-
-// unwindTimeout bounds the unwind of a failed start. A budget of its own because the
-// caller never receives a stop func in that case, so there is no drain deadline to
-// inherit.
-const unwindTimeout = 10 * time.Second
-
-// unwind drains what already started, on a context detached from the startup one.
-// The usual reason a start fails is that ctx died, and draining on a dead context
-// returns the instant it is asked to wait — signalling the background work to stop
-// and reporting it drained while it is still running, just as the caller is free to
-// close what it is using.
-func unwind(ctx context.Context, stops []func(context.Context) error) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unwindTimeout)
-	defer cancel()
-	return stopAll(ctx, stops)
-}
-
-// stopAll runs stops in reverse, joining every error rather than returning at the
-// first: a stop that fails must not leave the rest running.
-func stopAll(ctx context.Context, stops []func(context.Context) error) error {
-	var errs []error
-	for i := len(stops) - 1; i >= 0; i-- {
-		errs = append(errs, stops[i](ctx))
-	}
-	return errors.Join(errs...)
-}
-
-// closeAll closes in reverse, mirroring stopAll.
-func closeAll(ls []startCloser) error {
-	var errs []error
-	for i := len(ls) - 1; i >= 0; i-- {
-		errs = append(errs, ls[i].Close())
-	}
-	return errors.Join(errs...)
-}
-
 // deps is what everything in this package draws from: one beehive client per kind, and
 // the process-wide services. Built once in New and embedded by each owner, so a family
 // reads through its own kind's client and a controller writing a kind it owns takes
@@ -424,10 +348,10 @@ type service struct {
 	// lifecycle alone, since nothing reads through them. Order is the whole contract:
 	// beehive starts before any controller and, being last to stop and close,
 	// outlives every reconcile that could still touch the store.
-	parts []startCloser
+	parts []lifecycle.Part
 }
 
-// beehiveRuntime gives beehive the startCloser shape. Start already matches; the
+// beehiveRuntime gives beehive the lifecycle.StartCloser shape. Start already matches; the
 // only thing missing is Close, because what closes is the store rather than the
 // runtime on top of it.
 type beehiveRuntime struct {
@@ -436,11 +360,7 @@ type beehiveRuntime struct {
 }
 
 func (r beehiveRuntime) Start(ctx context.Context) (func(context.Context) error, error) {
-	stop, err := r.bh.Start(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("start beehive: %w", err)
-	}
-	return stop, nil
+	return r.bh.Start(ctx)
 }
 
 func (r beehiveRuntime) Close() error { return r.store.Close() }
@@ -478,7 +398,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 	return &service{
 		deps:        d,
 		clusterCtrl: clusterCtrl,
-		parts:       append([]startCloser{beehiveRuntime{bh: bh, store: bhStore}}, controllers...),
+		parts:       append([]lifecycle.Part{{Name: "beehive", StartCloser: beehiveRuntime{bh: bh, store: bhStore}}}, controllers...),
 	}, nil
 }
 
@@ -499,7 +419,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 // RequeueAfter, and the out-of-band buses cover the rest.
 var startupPass = beehive.WithStartupFullPass(true)
 
-func registerControllers(bh *beehive.Beehive, d deps, kubeconfigPath string) (*clusterController, []startCloser, error) {
+func registerControllers(bh *beehive.Beehive, d deps, kubeconfigPath string) (*clusterController, []lifecycle.Part, error) {
 	cluster := newClusterController(kubeconfigPath, d)
 	cache := &clusterCacheController{deps: d}
 	catalog := &clusterCachedCatalogController{}
@@ -512,7 +432,12 @@ func registerControllers(bh *beehive.Beehive, d deps, kubeconfigPath string) (*c
 	if err := errors.Join(errCluster, errCache, errCatalog, errResource); err != nil {
 		return nil, nil, err
 	}
-	return cluster, []startCloser{cluster, cache, catalog, resource}, nil
+	return cluster, []lifecycle.Part{
+		{Name: "cluster controller", StartCloser: cluster},
+		{Name: "cache controller", StartCloser: cache},
+		{Name: "cached-catalog controller", StartCloser: catalog},
+		{Name: "cached-resource controller", StartCloser: resource},
+	}, nil
 }
 
 // Start launches beehive (the controller harness + store subscription loop), then
@@ -520,13 +445,13 @@ func registerControllers(bh *beehive.Beehive, d deps, kubeconfigPath string) (*c
 // func takes a drain deadline and blocks until the background work finishes. Call
 // stop before Close.
 func (s *service) Start(ctx context.Context) (func(context.Context) error, error) {
-	return startAll(ctx, s.parts)
+	return lifecycle.StartAll(ctx, s.parts)
 }
 
 // Close releases the controllers' resources and the beehive store. Call after the
 // stop func returns.
 func (s *service) Close() error {
-	return closeAll(s.parts)
+	return lifecycle.CloseAll(s.parts)
 }
 
 func (s *service) GetConnection(id ClusterID) *rest.Config {

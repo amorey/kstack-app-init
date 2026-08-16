@@ -23,6 +23,7 @@ import (
 	"strconv"
 
 	"github.com/amorey/beehive"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
 // ClusterCachedResourceGroupKind identifies the per-GVR sync kind: one object per
@@ -132,7 +133,7 @@ func (a cachedResourcesAPI) Clear(ctx context.Context, id ClusterCachedResourceI
 // clusterCachedResourceController reconciles one synced kind: start, stop, and
 // resume the worker mirroring it into the cache. A placeholder that reconciles to a
 // no-op.
-type clusterCachedResourceController struct{ noBackground }
+type clusterCachedResourceController struct{ lifecycle.None }
 
 func (c *clusterCachedResourceController) Reconcile(
 	ctx context.Context,
