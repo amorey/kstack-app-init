@@ -52,9 +52,10 @@
 // facts); its ClusterCache child carries sync status, folded per kind from the
 // ClusterCachedResource records below it.
 //
-// The read side is mid-rebuild: the Cluster kind is served, every other family method
-// panics, and the three cache controllers reconcile to a no-op. The interfaces and the
-// types they carry hold the GraphQL and gRPC surfaces steady meanwhile.
+// The read side is mid-rebuild: the Cluster kind is served, ClusterCache is served for
+// its point reads (Get, List, ListByCluster), every other family method panics, and the
+// three cache controllers reconcile to a no-op. The interfaces and the types they carry
+// hold the GraphQL and gRPC surfaces steady meanwhile.
 package clustersvc
 
 import (
@@ -181,7 +182,7 @@ type Caches interface {
 	// migration has not produced yet.
 	Watch(ctx context.Context, id ClusterCacheID) (*Stream[ClusterCacheWatchFrame], error)
 	// WatchList streams every cache as a delta watch parallel to
-	// Clusters().WatchList; the caller joins caches onto clusters by ClusterID.
+	// Clusters().WatchList; the caller joins caches onto clusters by Owner.ID.
 	WatchList(ctx context.Context) (*Stream[ClusterCacheWatchFrame], error)
 
 	// ListByCluster returns one cluster's caches, in the same order.
@@ -215,7 +216,7 @@ type CachedCatalogs interface {
 	// Watch streams one catalog as a delta watch. Bookmark-only until the cache's
 	// first discovery pass lands, which is the wait List describes.
 	Watch(ctx context.Context, id ClusterCachedCatalogID) (*Stream[ClusterCachedCatalogWatchFrame], error)
-	// WatchList streams every cache's catalog, joined onto caches by CacheID.
+	// WatchList streams every cache's catalog, joined onto caches by Owner.ID.
 	WatchList(ctx context.Context) (*Stream[ClusterCachedCatalogWatchFrame], error)
 
 	// ListByCache returns one cache's catalog — at most one record, as a slice so it
@@ -383,12 +384,34 @@ func closeAll(ls []startCloser) error {
 	return errors.Join(errs...)
 }
 
-// service is the concrete Service: a beehive client per kind, plus the inputs the
-// rebuild's leaves still need.
+// deps is what everything in this package draws from: one beehive client per kind, and
+// the process-wide services. Built once in New and embedded by each owner, so a family
+// reads through its own kind's client and a controller writing a kind it owns takes
+// that kind's from here. A new kind or a new shared service is a field here, never
+// another constructor parameter.
+type deps struct {
+	clusterClient  beehive.Client[ClusterSpec, ClusterStatus]
+	cacheClient    beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	catalogClient  beehive.Client[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]
+	resourceClient beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
+
+	pokeSvc *poke.Service
+}
+
+func newDeps(bh *beehive.Beehive, pokeSvc *poke.Service) deps {
+	return deps{
+		clusterClient:  beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
+		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
+		catalogClient:  beehive.NewClient[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus](bh, ClusterCachedCatalogGroupKind),
+		resourceClient: beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
+		pokeSvc:        pokeSvc,
+	}
+}
+
+// service is the concrete Service: the shared deps, plus what the boundary owns on
+// top of them.
 type service struct {
-	// A family reads through its own kind's client. Each kind adds one here as it is
-	// rebuilt.
-	clusterClient beehive.Client[ClusterSpec, ClusterStatus]
+	deps
 	// clusterCtrl is held for its machinery as well as its lifecycle: a mutation that
 	// frees a kube-context has to reach the importer, which no store write would.
 	clusterCtrl *clusterController
@@ -402,8 +425,6 @@ type service struct {
 	// beehive starts before any controller and, being last to stop and close,
 	// outlives every reconcile that could still touch the store.
 	parts []startCloser
-
-	pokeSvc *poke.Service
 }
 
 // beehiveRuntime gives beehive the startCloser shape. Start already matches; the
@@ -449,8 +470,8 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	clusterClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-	clusterCtrl := newClusterController(kubeconfigPath, pokeSvc, clusterClient)
+	d := newDeps(bh, pokeSvc)
+	clusterCtrl := newClusterController(kubeconfigPath, d)
 
 	controllers, err := registerControllers(bh, clusterCtrl)
 	if err != nil {
@@ -458,10 +479,9 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 		return nil, fmt.Errorf("register cluster controllers: %w", err)
 	}
 	return &service{
-		clusterClient: clusterClient,
-		clusterCtrl:   clusterCtrl,
-		parts:         append([]startCloser{beehiveRuntime{bh: bh, store: bhStore}}, controllers...),
-		pokeSvc:       pokeSvc,
+		deps:        d,
+		clusterCtrl: clusterCtrl,
+		parts:       append([]startCloser{beehiveRuntime{bh: bh, store: bhStore}}, controllers...),
 	}, nil
 }
 

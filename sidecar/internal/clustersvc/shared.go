@@ -100,6 +100,40 @@ func (id *ObjectID) UnmarshalGQL(v any) error {
 	return nil
 }
 
+// ObjectRef points at another record — today always the beehive owner every child
+// kind hangs off, which is the join key a client folds on. Kind-agnostic, so one type
+// serves the whole ownership chain rather than a differently-named id per kind.
+//
+// A defined type rather than beehive.ObjectRef, which aliases into an internal package
+// gqlgen cannot import. Group is left off: every kind here is in the empty group, so
+// the field would always be "".
+type ObjectRef struct {
+	ID   ObjectID
+	Kind string
+}
+
+// toOwnerRef reads the owner edge a child record's join key comes from. The read must
+// have loaded it (beehive.LoadOwner) — the beehive name embeds the same id, but it is
+// a reconcile key rather than a field, and parsing it back would let the two disagree
+// the moment either moves. A read that forgot the load is a caller bug, so it errors.
+//
+// **No edge is the zero ref, not an error.** A collected object's outgoing edges go with
+// it (ON DELETE CASCADE), so the departure frame on a delta watch has none by
+// construction — erroring there would null the frame's entity and the consumer would
+// drop the removal, leaving a deleted record on screen forever. A live record with no
+// owner is corruption reading the same way; the client's join drops it, which is the
+// same outcome as any record whose owner it cannot find.
+func toOwnerRef[Spec, Status any](obj *beehive.Object[Spec, Status]) (ObjectRef, error) {
+	owner, ok, err := obj.Owner()
+	if err != nil {
+		return ObjectRef{}, fmt.Errorf("read %s %d owner: %w", obj.Kind, obj.ID, err)
+	}
+	if !ok {
+		return ObjectRef{}, nil
+	}
+	return ObjectRef{ID: ObjectID(owner.ID), Kind: owner.Kind}, nil
+}
+
 // --- Raw JSON ---
 
 // RawJSON binds the GraphQL `JSON` scalar: already-serialized JSON in a string,

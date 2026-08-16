@@ -51,12 +51,15 @@ and most family methods still panic** — `TestUnimplementedBoundaryPanics` is t
 is left, and an entry must be deleted as its method lands, since the test fails when a stub stops
 panicking.
 
-Built so far, produced: the kubeconfig watcher, the importer that creates `Cluster` records, and
+Built so far, produced: the kubeconfig watcher, the importer that creates `Cluster` records,
 `clusterController.Reconcile` observing what the kubeconfig says about each one
-(`status.source.kubeconfig`). Served: the whole `Clusters()` family except `WatchSchedule`. That is
-enough for the kube-context picker, which reads `clustersWatch` alone. There is no connection
-manager, discovery pass, sync worker, or on-disk cache yet, and no kind below `Cluster` has a
-producer — so the other four families stay unserved until the controller that fills them lands.
+(`status.source.kubeconfig`), and that same pass creating the `ClusterCache` for the identity a
+probe recorded. Served: the whole `Clusters()` family except `WatchSchedule`, plus `Caches()`'
+point reads (`Get`/`List`/`ListByCluster`). That is enough for the kube-context picker, which reads
+`clustersWatch` alone. **No cache exists at runtime yet**: creation keys off `status.server.uid` and
+nothing writes it until the connection probe lands, so those reads answer empty. There is no
+connection manager, discovery pass, sync worker, or on-disk cache, and the three families below
+`ClusterCache` have no producer at all.
 
 **A read reports the store as it is, and never filters.** A record awaiting deletion is served like
 any other, carrying the tombstone (`deletionRequestedAt`) the consumer decides on — rendering it
@@ -80,12 +83,32 @@ detail.
 A controller built with machinery is constructed in `New` and passed to `registerControllers`, which
 returns all four in registration order; the rest are built at the call.
 
+**Shared dependencies travel in `deps`** — one beehive client per kind plus the process-wide services
+(`poke` today), built once by `newDeps(bh, pokeSvc)` and **embedded** by `service` and by each
+controller, so a family reads `a.s.cacheClient` and a controller reads `c.cacheClient`. The `Client`
+suffix is load-bearing: the fields are promoted into both, and `a.s.cacheClient` must not read like
+the `Caches` family it is reached through. **A new kind or a new
+shared service is a field, never another constructor parameter** — the alternative threads each one
+through the constructors that don't use it, which is what the parameter list was doing at two kinds.
+What stays an argument is a single owner's own *configuration*: `newClusterController(kubeconfigPath,
+deps)`, since the path belongs to that controller alone. Tests build the same struct (`newTestDeps` /
+`newRunningDeps` in `testutil_test.go`) rather than assembling clients of their own: the owner edges
+need every kind in one store, which beehive enforces.
+
 **One lifecycle shape at every level** — `startCloser` in `service.go`, which carries the contract.
 Beehive included: it is wrapped as a `startCloser` and sits at the head of `service.parts`, so
 `Start`/`Close` are one `startAll`/`closeAll` call and nothing composes by hand. **Add a participant
 by putting it in the slice, never by writing another stop closure**, and honor the drain deadline
 with `drain.WithContext` — `startCloser` promises it, and a leaf that blocks on a bare `wg.Wait()`
 quietly breaks the promise for everything above it. A kind with no machinery embeds `noBackground`.
+
+**A parent controller creates the child kinds it owns.** A cache's identity is discovered by the
+cluster's probe, and a controller only ever reconciles an object that already exists — so
+`clusterController.Reconcile` creates the `ClusterCache` (via `ensureClusterCache`), and the same
+shape will carry down the chain. Distinct from an importer, which decides which objects exist
+*including when there are none*. **The writes live in the child kind's file**, not the parent's: the
+name, spec and owner edge are that kind's vocabulary, and the parent supplies only the policy —
+when, and for which identity.
 
 **Importers create Cluster records; controllers reconcile them.** An importer runs *outside* beehive
 because it decides which objects exist — which means running when there are none, and a controller
@@ -212,7 +235,7 @@ consumer (a callee follows its caller — `LiveCondition` needs `TruncateMessage
 
 ### GraphQL surface (cluster)
 
-The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the root `Cluster` reads answer** — `cluster`, `clusters`, `clustersWatch`, and the enable/sync/delete mutations. `Cluster`'s own nested fields do not: `caches` and `events` reach `Caches().ListByCluster` and `ListEvents`, which still panic, so a query selecting them panics with the rest. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
+The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the `Cluster` reads and the `ClusterCache` point reads answer** — `cluster`, `clusters`, `clustersWatch`, the enable/sync/delete mutations, and `clusterCache`/`clusterCaches` (with `Cluster.caches` alongside them). `Cluster.events` does not: it reaches `ListEvents`, which still panics, so a query selecting it panics with the rest. Neither does any cache watch — `clusterCachesWatch` and the gauges are unbuilt. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
 
 - Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedCatalogsWatch` (unscoped, one per cache), `clusterCachedResourcesWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).

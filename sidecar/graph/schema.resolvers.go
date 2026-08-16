@@ -34,7 +34,7 @@ func (r *clusterResolver) Events(ctx context.Context, obj *clustersvc.Cluster, c
 // Kinds is the resolver for the kinds field — this cache's discovered kind catalog.
 // Both ids come off the record, so they cannot name different caches.
 func (r *clusterCacheResolver) Kinds(ctx context.Context, obj *clustersvc.ClusterCache) ([]*clustersvc.ClusterCachedDataKind, error) {
-	kinds, err := r.ClusterSvc.CachedData().ListKinds(ctx, obj.ClusterID, obj.ID)
+	kinds, err := r.ClusterSvc.CachedData().ListKinds(ctx, obj.Owner.ID, obj.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +232,7 @@ func (r *subscriptionResolver) ClusterScheduleWatch(ctx context.Context, id clus
 
 // ClusterCachesWatch is the resolver for the clusterCachesWatch field — cache
 // records as a delta watch parallel to clustersWatch, joined to clusters
-// client-side by clusterID.
+// client-side by owner.id.
 func (r *subscriptionResolver) ClusterCachesWatch(ctx context.Context) (<-chan *clustersvc.ClusterCacheWatchFrame, error) {
 	st, err := r.ClusterSvc.Caches().WatchList(ctx)
 	if err != nil {
@@ -252,7 +252,7 @@ func (r *subscriptionResolver) ClusterCacheHealthWatch(ctx context.Context) (<-c
 
 // ClusterCachedCatalogsWatch is the resolver for the
 // clusterCachedCatalogsWatch field — the caches' resource catalogs as a delta
-// watch parallel to clusterCachesWatch, joined to caches client-side by cacheID.
+// watch parallel to clusterCachesWatch, joined to caches client-side by owner.id.
 func (r *subscriptionResolver) ClusterCachedCatalogsWatch(ctx context.Context) (<-chan *clustersvc.ClusterCachedCatalogWatchFrame, error) {
 	st, err := r.ClusterSvc.CachedCatalogs().WatchList(ctx)
 	if err != nil {

@@ -62,7 +62,7 @@ function clusterFixture(hasCache: boolean, cacheId = 'c1', serverUid = 'uid-1') 
   return {
     id: '1',
     spec: { source: { kubeconfig: { context: 'prod' } } },
-    activeCache: hasCache ? { id: cacheId, serverUid, status: { conditions: [] } } : null,
+    activeCache: hasCache ? { id: cacheId, spec: { serverUid }, status: { conditions: [] } } : null,
   };
 }
 

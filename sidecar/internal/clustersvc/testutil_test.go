@@ -39,6 +39,23 @@ func newTestBeehive(t *testing.T) *beehive.Beehive {
 	return bh
 }
 
+// newTestDeps returns the shared set over a test beehive — the same newDeps the
+// composition root calls, so a test never assembles its own. The controllers are
+// registered so a requeue reaches a real reconciler, but beehive is never run, so
+// nothing reconciles or collects behind these tests.
+//
+// One store for every kind, which the owner edges need: beehive refuses an owner in
+// another store.
+func newTestDeps(t *testing.T) deps {
+	t.Helper()
+	bh := newTestBeehive(t)
+	d := newDeps(bh, nil)
+
+	_, err := registerControllers(bh, newClusterController(t.TempDir()+"/config", d))
+	require.NoError(t, err)
+	return d
+}
+
 // newRunningBeehive is newTestBeehive started, so a watch's tail is live. No
 // controller is registered: a reconcile writing status would put frames on a watch
 // that the test never asked for.
@@ -50,4 +67,12 @@ func newRunningBeehive(t *testing.T) *beehive.Beehive {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 	return bh
+}
+
+// newRunningDeps is the shared set over a running beehive, for the watch tests:
+// without one the tail is dead and no change is ever reported. Nothing reconciles, so
+// every frame is the test's own doing.
+func newRunningDeps(t *testing.T) deps {
+	t.Helper()
+	return newDeps(newRunningBeehive(t), nil)
 }

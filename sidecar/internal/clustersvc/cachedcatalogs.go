@@ -53,12 +53,13 @@ type ClusterCachedCatalogStatus struct{}
 // ClusterCachedCatalog is the view of one ClusterCachedCatalog beehive
 // object: a cache's kind-catalog record — which kinds the cluster serves, when that
 // was last confirmed, and whether the confirmation was complete. Streamed standalone
-// via CachedCatalogs().Watch and joined onto its cache client-side by CacheID. Spec is the
+// via CachedCatalogs().Watch and joined onto its cache client-side by Owner.ID. Spec is the
 // stored value served as-is, no projection.
 type ClusterCachedCatalog struct {
-	ID      ClusterCachedCatalogID
-	CacheID ClusterCacheID
-	Spec    ClusterCachedCatalogSpec
+	ID ClusterCachedCatalogID
+	// Owner is the ClusterCache this catalog belongs to.
+	Owner ObjectRef
+	Spec  ClusterCachedCatalogSpec
 	// Conditions are beehive object conditions, read off the object rather than out of
 	// the status blob — `Discovered`, carrying this component's own verdict. There is no
 	// Status field: the kind's status is empty by design.

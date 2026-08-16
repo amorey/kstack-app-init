@@ -36,10 +36,11 @@ finds no open cache, whose initial state is legitimately empty, so a never-synce
 cache reports "empty" rather than spinning forever.
 
 The webview keys each stream into an id-keyed map and **joins client-side, down the chain**:
-caches onto clusters by `clusterID`, verdicts and discovery records onto their cache by
-`cacheID` (`src/lib/clusters.tsx`). Derivations that depend on two kinds — notably which cache
-is *active* (its `serverUid` matching the cluster's `status.server.uid`) — are the client's,
-never a stored field.
+every owned record carries an `owner { id kind }` ref, so caches join onto clusters and discovery
+records onto their cache by `owner.id`, while the verdict gauge keys on its own `cacheID` — it is a
+read-side projection, not an owned record (`src/lib/clusters.tsx`). Derivations that depend on two
+kinds — notably which cache is *active* (its `spec.serverUid` matching the cluster's
+`status.server.uid`) — are the client's, never a stored field.
 
 High-volume streams are scoped so the always-mounted registry never carries them: the
 per-GVR sync watch is cache-scoped (~100 records per cache), subscribed only while a sync

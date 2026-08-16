@@ -70,16 +70,16 @@ type ClusterCachedResourceStatus struct{}
 
 // ClusterCachedResource is the view of one ClusterCachedResource beehive object: one
 // Kubernetes kind being mirrored into a cache. Shaped like its sibling sync records —
-// {ID, owner, Spec, Conditions} — but streamed **cache-scoped**, because there is one per
+// {ID, Owner, Spec, Conditions} — but streamed **cache-scoped**, because there is one per
 // served kind rather than one per cache and an unscoped stream of a hundred-plus records
 // would be a firehose.
 type ClusterCachedResource struct {
 	ID ClusterCachedResourceID
-	// CatalogID is the owning ClusterCachedCatalog — this kind hangs off the
-	// discovery anchor, not the cache directly, so this is the join key a client already
-	// has from the discovery stream.
-	CatalogID ClusterCachedCatalogID
-	Spec      ClusterCachedResourceSpec
+	// Owner is the ClusterCachedCatalog this kind hangs off — the discovery anchor, not
+	// the cache directly, so it is the join key a client already has from the discovery
+	// stream.
+	Owner ObjectRef
+	Spec  ClusterCachedResourceSpec
 	// Conditions carry `Synced` — this kind's own verdict, which is the whole reason the
 	// record is served: a cache's hundred kinds fail independently, and the coarse
 	// cache-level condition can't say which.

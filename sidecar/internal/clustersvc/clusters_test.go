@@ -315,25 +315,6 @@ func TestNextRetryDelay(t *testing.T) {
 
 // --- syncClusterSet ---
 
-// newRunningClusterClient is a Cluster client over a running beehive, for the watch
-// tests: without one the tail is dead and no change is ever reported. Nothing
-// reconciles — no controller is registered — so every frame is the test's own doing.
-func newRunningClusterClient(t *testing.T) beehive.Client[ClusterSpec, ClusterStatus] {
-	t.Helper()
-	return beehive.NewClient[ClusterSpec, ClusterStatus](newRunningBeehive(t), ClusterGroupKind)
-}
-
-// newTestClusterClient returns a Cluster client over a test beehive. The controllers
-// are registered so a requeue reaches a real reconciler, but beehive is never run, so
-// nothing reconciles or collects behind these tests.
-func newTestClusterClient(t *testing.T) beehive.Client[ClusterSpec, ClusterStatus] {
-	t.Helper()
-	bh := newTestBeehive(t)
-	_, err := registerControllers(bh, newClusterController(t.TempDir()+"/config", nil, nil))
-	require.NoError(t, err)
-	return beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-}
-
 // importerOver returns an importer writing through client, with no kubeconfig source:
 // these tests call the import step directly.
 func importerOver(client beehive.Client[ClusterSpec, ClusterStatus]) *kubeconfigImporter {
@@ -356,10 +337,10 @@ func liveClusters(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatus
 }
 
 func TestImportCreatesOneClusterPerContext(t *testing.T) {
-	client := newTestClusterClient(t)
-	require.NoError(t, importerOver(client).syncClusterSet(context.Background(), cfgWith("prod", "staging")))
+	d := newTestDeps(t)
+	require.NoError(t, importerOver(d.clusterClient).syncClusterSet(context.Background(), cfgWith("prod", "staging")))
 
-	live := liveClusters(t, client)
+	live := liveClusters(t, d.clusterClient)
 	require.Len(t, live, 2)
 	assert.Contains(t, live, "staging")
 
@@ -373,15 +354,15 @@ func TestImportCreatesOneClusterPerContext(t *testing.T) {
 // unchanged kubeconfig has to be a no-op down to the record ids: a new id would
 // orphan whatever the old one owned.
 func TestImportIsIdempotent(t *testing.T) {
-	client := newTestClusterClient(t)
-	im := importerOver(client)
+	d := newTestDeps(t)
+	im := importerOver(d.clusterClient)
 	cfg := cfgWith("prod")
 
 	require.NoError(t, im.syncClusterSet(context.Background(), cfg))
-	first := liveClusters(t, client)["prod"]
+	first := liveClusters(t, d.clusterClient)["prod"]
 	require.NoError(t, im.syncClusterSet(context.Background(), cfg))
 
-	second := liveClusters(t, client)["prod"]
+	second := liveClusters(t, d.clusterClient)["prod"]
 	require.NotNil(t, second)
 	assert.Equal(t, first.ID, second.ID, "the second pass must not create a second record")
 }
@@ -389,13 +370,13 @@ func TestImportIsIdempotent(t *testing.T) {
 // The referenced set is scoped by the source discriminant, not by the name prefix: a
 // record from another source names its own things and claims no kube-context.
 func TestImportIgnoresRecordsFromAnotherSource(t *testing.T) {
-	client := newTestClusterClient(t)
+	d := newTestDeps(t)
 	ctx := context.Background()
-	_, err := client.Create(ctx, "cloud/prod", ClusterSpec{})
+	_, err := d.clusterClient.Create(ctx, "cloud/prod", ClusterSpec{})
 	require.NoError(t, err)
 
-	require.NoError(t, importerOver(client).syncClusterSet(ctx, cfgWith("prod")))
-	assert.Contains(t, liveClusters(t, client), "prod")
+	require.NoError(t, importerOver(d.clusterClient).syncClusterSet(ctx, cfgWith("prod")))
+	assert.Contains(t, liveClusters(t, d.clusterClient), "prod")
 }
 
 // The pass wakes the records that predate it, which is how a departed context — absent
@@ -630,9 +611,11 @@ func (c *stubControllerClient) SetObservedGeneration(_ context.Context, _ beehiv
 // controllerOver returns a controller over an empty kubeconfig, so every context is
 // absent. The watcher is started because Reconcile defers until it has read, and its
 // first read is synchronous in Start.
+// Its clients are promoted from the embedded deps, so a test reading back what a
+// reconcile wrote goes through c.clusterClient / c.cacheClient.
 func controllerOver(t *testing.T) *clusterController {
 	t.Helper()
-	c := newClusterController(t.TempDir()+"/config", nil, nil)
+	c := newClusterController(t.TempDir()+"/config", newTestDeps(t))
 
 	stop, err := c.kubeconfigWatcher.Start(context.Background())
 	require.NoError(t, err)
@@ -643,11 +626,132 @@ func controllerOver(t *testing.T) *clusterController {
 	return c
 }
 
+// --- ClusterCache creation ---
+
+// probedCluster stores a cluster record and hands back the object a reconcile would
+// be given, carrying the UID a probe recorded. Status is set in memory: nothing has
+// written one yet, which is exactly the state the probe will leave behind.
+func probedCluster(t *testing.T, clusters beehive.Client[ClusterSpec, ClusterStatus], uid string) *beehive.Object[ClusterSpec, ClusterStatus] {
+	t.Helper()
+	obj := createCluster(t, clusters, "prod")
+	obj.Status = &ClusterStatus{Server: ClusterServer{UID: &uid}}
+	return obj
+}
+
+// liveCaches returns every cache the reconcile wrote, owner edge loaded.
+func liveCaches(t *testing.T, caches beehive.Client[ClusterCacheSpec, ClusterCacheStatus]) []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus] {
+	t.Helper()
+	objs, err := caches.List(context.Background(), beehive.LoadOwner())
+	require.NoError(t, err)
+	return objs
+}
+
+// A cluster owns a mirror slot per identity it has been probed at, so the pass that
+// knows the identity is the one that creates it.
+func TestReconcileCreatesACacheForTheProbedIdentity(t *testing.T) {
+	c := controllerOver(t)
+	obj := probedCluster(t, c.clusterClient, "uid-1")
+
+	_, err := c.Reconcile(context.Background(), &stubControllerClient{}, obj)
+	require.NoError(t, err)
+
+	objs := liveCaches(t, c.cacheClient)
+	require.Len(t, objs, 1)
+	assert.Equal(t, ClusterCacheName(ClusterID(obj.ID), "uid-1"), objs[0].Name)
+	assert.Equal(t, "uid-1", objs[0].Spec.ServerUID)
+
+	// The owner edge is what carries the cluster join AND what beehive's GC cascades
+	// on, so a cache created without one outlives the cluster it mirrors.
+	owner, ok, err := objs[0].Owner()
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, obj.ID, owner.ID)
+}
+
+// Every pass ensures the cache, and the importer wakes every record on every
+// kubeconfig snapshot — so the second pass is the common case, not the edge.
+func TestReconcileCreatesTheCacheOnlyOnce(t *testing.T) {
+	c := controllerOver(t)
+	obj := probedCluster(t, c.clusterClient, "uid-1")
+
+	for range 2 {
+		_, err := c.Reconcile(context.Background(), &stubControllerClient{}, obj)
+		require.NoError(t, err)
+	}
+
+	assert.Len(t, liveCaches(t, c.cacheClient), 1)
+}
+
+// A cluster that has never connected has no identity to mirror. Creating one anyway
+// would name it after the empty UID — a cache CacheIsActive matches against nothing,
+// so it could never sync and never be superseded either.
+func TestReconcileCreatesNoCacheBeforeTheFirstProbe(t *testing.T) {
+	c := controllerOver(t)
+
+	_, err := c.Reconcile(context.Background(), &stubControllerClient{}, probedCluster(t, c.clusterClient, ""))
+	require.NoError(t, err)
+
+	assert.Empty(t, liveCaches(t, c.cacheClient))
+}
+
+// A rebuilt cluster reuses its record under a new kube-system UID. The mirror cannot
+// be reused with it, so the pass adds a second cache and leaves the first in place to
+// drain — which is why Cluster.caches is a list.
+func TestReconcileAddsACacheForAMigratedIdentity(t *testing.T) {
+	c := controllerOver(t)
+	obj := probedCluster(t, c.clusterClient, "uid-1")
+
+	_, err := c.Reconcile(context.Background(), &stubControllerClient{}, obj)
+	require.NoError(t, err)
+
+	migrated := "uid-2"
+	obj.Status.Server.UID = &migrated
+	_, err = c.Reconcile(context.Background(), &stubControllerClient{}, obj)
+	require.NoError(t, err)
+
+	uids := make([]string, 0, 2)
+	for _, cache := range liveCaches(t, c.cacheClient) {
+		uids = append(uids, cache.Spec.ServerUID)
+	}
+	assert.Equal(t, []string{"uid-1", "uid-2"}, uids, "the superseded cache stays until its subtree drains")
+}
+
+// stubCacheClient reports every cache absent and fails the create that follows. The
+// embedded interface is nil: the ensure calls nothing else on it.
+type stubCacheClient struct {
+	beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	err error
+}
+
+func (c stubCacheClient) GetByName(context.Context, string, ...beehive.LoadOption) (*beehive.Object[ClusterCacheSpec, ClusterCacheStatus], error) {
+	return nil, beehive.ErrNotFound
+}
+
+func (c stubCacheClient) GetOrCreate(context.Context, string, ClusterCacheSpec, ...beehive.Option) (*beehive.Object[ClusterCacheSpec, ClusterCacheStatus], bool, error) {
+	return nil, false, c.err
+}
+
+// The cache is part of the pass, so failing to ensure it fails the reconcile — and
+// nothing downstream runs. Settling the generation here instead would leave a cluster
+// holding an identity with no mirror and nothing left to re-level it.
+func TestReconcileReportsAFailedCacheCreate(t *testing.T) {
+	boom := errors.New("boom")
+	c := controllerOver(t)
+	c.cacheClient = stubCacheClient{err: boom}
+
+	client := &stubControllerClient{}
+	_, err := c.Reconcile(context.Background(), client, probedCluster(t, c.clusterClient, "uid-1"))
+
+	require.ErrorIs(t, err, boom)
+	assert.Nil(t, client.updated)
+	assert.Nil(t, client.observed, "an unsettled generation is what brings the pass back")
+}
+
 // beehive starts ahead of the controllers, so an owed pass can reach a record before
 // the watcher's first read. Observing the pre-read config would report a present
 // context absent and wake the kind's watches for a flap.
 func TestReconcileDefersUntilTheKubeconfigIsRead(t *testing.T) {
-	c := newClusterController(t.TempDir()+"/config", nil, nil)
+	c := newClusterController(t.TempDir()+"/config", deps{})
 
 	client := &stubControllerClient{}
 	res, err := c.Reconcile(context.Background(), client, kubeconfigObj("prod", nil))
@@ -823,14 +927,14 @@ func TestToClusterCarriesTheDeletionTombstone(t *testing.T) {
 
 // --- Clusters() reads ---
 
-// serviceOver returns a service reading through client, with no background work: these
+// serviceOver returns a service reading through d, with no background work: these
 // tests drive the store directly. The controller is real but unstarted, because Delete
 // reaches its importer.
-func serviceOver(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatus]) *service {
+func serviceOver(t *testing.T, d deps) *service {
 	t.Helper()
 	return &service{
-		clusterClient: client,
-		clusterCtrl:   newClusterController(t.TempDir()+"/config", nil, client),
+		deps:        d,
+		clusterCtrl: newClusterController(t.TempDir()+"/config", d),
 	}
 }
 
@@ -846,10 +950,10 @@ func createCluster(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatu
 }
 
 func TestClustersGet(t *testing.T) {
-	client := newTestClusterClient(t)
-	obj := createCluster(t, client, "prod")
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
 
-	got, err := serviceOver(t, client).Clusters().Get(context.Background(), ClusterID(obj.ID))
+	got, err := serviceOver(t, d).Clusters().Get(context.Background(), ClusterID(obj.ID))
 
 	require.NoError(t, err)
 	require.NotNil(t, got)
@@ -860,7 +964,7 @@ func TestClustersGet(t *testing.T) {
 // An unknown id is not an error: the caller holds an id from a watch frame, and a
 // record collected in between is an ordinary race rather than a bad request.
 func TestClustersGetUnknownIsNotAnError(t *testing.T) {
-	got, err := serviceOver(t, newTestClusterClient(t)).Clusters().Get(context.Background(), 404)
+	got, err := serviceOver(t, newTestDeps(t)).Clusters().Get(context.Background(), 404)
 
 	require.NoError(t, err)
 	assert.Nil(t, got)
@@ -869,11 +973,11 @@ func TestClustersGetUnknownIsNotAnError(t *testing.T) {
 // A record on its way out is served like any other, wearing its tombstone: only the
 // consumer knows whether to render it or hide it.
 func TestClustersGetCarriesADeletingRecord(t *testing.T) {
-	client := newTestClusterClient(t)
-	obj := createCluster(t, client, "prod")
-	require.NoError(t, client.Delete(context.Background(), obj.ID))
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	require.NoError(t, d.clusterClient.Delete(context.Background(), obj.ID))
 
-	got, err := serviceOver(t, client).Clusters().Get(context.Background(), ClusterID(obj.ID))
+	got, err := serviceOver(t, d).Clusters().Get(context.Background(), ClusterID(obj.ID))
 
 	require.NoError(t, err)
 	require.NotNil(t, got)
@@ -881,11 +985,11 @@ func TestClustersGetCarriesADeletingRecord(t *testing.T) {
 }
 
 func TestClustersList(t *testing.T) {
-	client := newTestClusterClient(t)
-	createCluster(t, client, "prod")
-	createCluster(t, client, "staging")
+	d := newTestDeps(t)
+	createCluster(t, d.clusterClient, "prod")
+	createCluster(t, d.clusterClient, "staging")
 
-	got, err := serviceOver(t, client).Clusters().List(context.Background())
+	got, err := serviceOver(t, d).Clusters().List(context.Background())
 
 	require.NoError(t, err)
 	require.Len(t, got, 2)
@@ -895,12 +999,12 @@ func TestClustersList(t *testing.T) {
 
 // The collection a reader sees matches what Get would answer for each id.
 func TestClustersListCarriesADeletingRecord(t *testing.T) {
-	client := newTestClusterClient(t)
-	createCluster(t, client, "prod")
-	deleting := createCluster(t, client, "staging")
-	require.NoError(t, client.Delete(context.Background(), deleting.ID))
+	d := newTestDeps(t)
+	createCluster(t, d.clusterClient, "prod")
+	deleting := createCluster(t, d.clusterClient, "staging")
+	require.NoError(t, d.clusterClient.Delete(context.Background(), deleting.ID))
 
-	got, err := serviceOver(t, client).Clusters().List(context.Background())
+	got, err := serviceOver(t, d).Clusters().List(context.Background())
 
 	require.NoError(t, err)
 	assert.Len(t, got, 2, "the store as it is, tombstones and all")
@@ -929,47 +1033,47 @@ func deref(s *string) string {
 // The schema promises name order, and beehive lists in storage order — so a caller
 // paging or diffing the list would otherwise see it shuffle between reads.
 func TestClustersListIsSortedByName(t *testing.T) {
-	client := newTestClusterClient(t)
+	d := newTestDeps(t)
 	for _, name := range []string{"staging", "alpha", "prod"} {
-		createCluster(t, client, name)
+		createCluster(t, d.clusterClient, name)
 	}
 
-	assert.Equal(t, []string{"alpha", "prod", "staging"}, sortKeysOf(t, serviceOver(t, client)))
+	assert.Equal(t, []string{"alpha", "prod", "staging"}, sortKeysOf(t, serviceOver(t, d)))
 }
 
 // The order is over what a view renders, so renaming a cluster moves it — the
 // kube-context it happens to track is not what a reader is scanning.
 func TestClustersListSortsByDisplayNameWhenSet(t *testing.T) {
-	client := newTestClusterClient(t)
-	svc := serviceOver(t, client)
+	d := newTestDeps(t)
+	svc := serviceOver(t, d)
 	for _, name := range []string{"alpha", "prod"} {
-		createCluster(t, client, name)
+		createCluster(t, d.clusterClient, name)
 	}
 	// "alpha" renamed to sort last, against its context's own order.
-	obj, err := client.GetByName(context.Background(), KubeconfigName("alpha"))
+	obj, err := d.clusterClient.GetByName(context.Background(), KubeconfigName("alpha"))
 	require.NoError(t, err)
 	renamed := "zulu"
 	obj.Spec.Name = &renamed
-	_, err = client.Update(context.Background(), obj.ID, obj.Spec)
+	_, err = d.clusterClient.Update(context.Background(), obj.ID, obj.Spec)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"prod", "zulu"}, sortKeysOf(t, svc))
 }
 
 func TestClustersListIsEmptyWithNoRecords(t *testing.T) {
-	got, err := serviceOver(t, newTestClusterClient(t)).Clusters().List(context.Background())
+	got, err := serviceOver(t, newTestDeps(t)).Clusters().List(context.Background())
 
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }
 
 // watchClusters opens a cluster list watch bounded by the test.
-func watchClusters(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatus]) *Stream[ClusterWatchFrame] {
+func watchClusters(t *testing.T, d deps) *Stream[ClusterWatchFrame] {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	stream, err := serviceOver(t, client).Clusters().WatchList(ctx)
+	stream, err := serviceOver(t, d).Clusters().WatchList(ctx)
 	require.NoError(t, err)
 	return stream
 }
@@ -977,11 +1081,11 @@ func watchClusters(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatu
 // The snapshot arrives as Added frames closed by exactly one Bookmark — the frame a
 // consumer renders its empty state on, and never before.
 func TestClustersWatchListEmitsTheSnapshotThenABookmark(t *testing.T) {
-	client := newRunningClusterClient(t)
-	createCluster(t, client, "prod")
-	createCluster(t, client, "staging")
+	d := newRunningDeps(t)
+	createCluster(t, d.clusterClient, "prod")
+	createCluster(t, d.clusterClient, "staging")
 
-	stream := watchClusters(t, client)
+	stream := watchClusters(t, d)
 
 	// The snapshot's order is the store's, which no consumer relies on.
 	var contexts []string
@@ -1001,7 +1105,7 @@ func TestClustersWatchListEmitsTheSnapshotThenABookmark(t *testing.T) {
 // An empty collection is definitively empty rather than pending, so the bookmark
 // still lands: without it a populated table and an empty one look alike.
 func TestClustersWatchListBookmarksAnEmptyCollection(t *testing.T) {
-	stream := watchClusters(t, newRunningClusterClient(t))
+	stream := watchClusters(t, newRunningDeps(t))
 
 	first := testutil.Recv(t, stream.Frames, "the bookmark")
 	assert.Equal(t, DeltaFrameBookmark, first.Type)
@@ -1018,11 +1122,11 @@ func awaitBookmark(t *testing.T, stream *Stream[ClusterWatchFrame]) {
 }
 
 func TestClustersWatchListReportsACreate(t *testing.T) {
-	client := newRunningClusterClient(t)
-	stream := watchClusters(t, client)
+	d := newRunningDeps(t)
+	stream := watchClusters(t, d)
 	awaitBookmark(t, stream)
 
-	createCluster(t, client, "prod")
+	createCluster(t, d.clusterClient, "prod")
 
 	f := testutil.Recv(t, stream.Frames, "the create")
 	assert.Equal(t, DeltaFrameAdded, f.Type)
@@ -1031,12 +1135,12 @@ func TestClustersWatchListReportsACreate(t *testing.T) {
 }
 
 func TestClustersWatchListReportsAnUpdate(t *testing.T) {
-	client := newRunningClusterClient(t)
-	obj := createCluster(t, client, "prod")
-	stream := watchClusters(t, client)
+	d := newRunningDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	stream := watchClusters(t, d)
 	awaitBookmark(t, stream)
 
-	_, err := client.Update(context.Background(), obj.ID, ClusterSpec{
+	_, err := d.clusterClient.Update(context.Background(), obj.ID, ClusterSpec{
 		Enabled: false,
 		Source:  ClusterSpecSource{Kubeconfig: kubeconfigSrc("prod")},
 	})
@@ -1054,12 +1158,12 @@ func TestClustersWatchListReportsAnUpdate(t *testing.T) {
 // when both land in a single tail page. TestClustersWatchListReportsTheMarkAsModified
 // pins the type over a change stream nothing else can reorder.
 func TestClustersWatchListReportsADeletionMark(t *testing.T) {
-	client := newRunningClusterClient(t)
-	obj := createCluster(t, client, "prod")
-	stream := watchClusters(t, client)
+	d := newRunningDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	stream := watchClusters(t, d)
 	awaitBookmark(t, stream)
 
-	require.NoError(t, client.Delete(context.Background(), obj.ID))
+	require.NoError(t, d.clusterClient.Delete(context.Background(), obj.ID))
 
 	f := testutil.Recv(t, stream.Frames, "the deletion mark")
 	require.NotNil(t, f.Cluster)
@@ -1140,10 +1244,10 @@ func TestClustersWatchListSnapshotCarriesADeletingRecord(t *testing.T) {
 // Cancellation is an ordinary teardown, so Frames closes with nothing to report: a
 // consumer reads Err on close, and a reason there is rendered as a dead watch.
 func TestClustersWatchListCancellationIsQuiet(t *testing.T) {
-	client := newRunningClusterClient(t)
+	d := newRunningDeps(t)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	stream, err := serviceOver(t, client).Clusters().WatchList(ctx)
+	stream, err := serviceOver(t, d).Clusters().WatchList(ctx)
 	require.NoError(t, err)
 	awaitBookmark(t, stream)
 
@@ -1154,21 +1258,21 @@ func TestClustersWatchListCancellationIsQuiet(t *testing.T) {
 }
 
 // watchCluster opens a single-record watch bounded by the test.
-func watchCluster(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatus], id ClusterID) *Stream[ClusterWatchFrame] {
+func watchCluster(t *testing.T, d deps, id ClusterID) *Stream[ClusterWatchFrame] {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	stream, err := serviceOver(t, client).Clusters().Watch(ctx, id)
+	stream, err := serviceOver(t, d).Clusters().Watch(ctx, id)
 	require.NoError(t, err)
 	return stream
 }
 
 func TestClustersWatchEmitsTheRecordThenABookmark(t *testing.T) {
-	client := newRunningClusterClient(t)
-	obj := createCluster(t, client, "prod")
+	d := newRunningDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
 
-	stream := watchCluster(t, client, ClusterID(obj.ID))
+	stream := watchCluster(t, d, ClusterID(obj.ID))
 
 	first := testutil.Recv(t, stream.Frames, "the record")
 	assert.Equal(t, DeltaFrameAdded, first.Type)
@@ -1181,18 +1285,18 @@ func TestClustersWatchEmitsTheRecordThenABookmark(t *testing.T) {
 // An id naming nothing is bookmark-only rather than an error: the record may not
 // exist yet, and the same subscription reports it arriving.
 func TestClustersWatchBookmarksAnUnknownID(t *testing.T) {
-	stream := watchCluster(t, newRunningClusterClient(t), 404)
+	stream := watchCluster(t, newRunningDeps(t), 404)
 
 	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
 }
 
 func TestClustersWatchReportsChangesToItsRecord(t *testing.T) {
-	client := newRunningClusterClient(t)
-	obj := createCluster(t, client, "prod")
-	stream := watchCluster(t, client, ClusterID(obj.ID))
+	d := newRunningDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	stream := watchCluster(t, d, ClusterID(obj.ID))
 	awaitBookmark(t, stream)
 
-	require.NoError(t, client.Delete(context.Background(), obj.ID))
+	require.NoError(t, d.clusterClient.Delete(context.Background(), obj.ID))
 
 	// Type unpinned for the same reason as the list watch: GC may collect the row
 	// first, and beehive folds the pair into one Deleted when it does.
@@ -1203,10 +1307,10 @@ func TestClustersWatchReportsChangesToItsRecord(t *testing.T) {
 }
 
 func TestClustersSetEnabled(t *testing.T) {
-	client := newTestClusterClient(t)
-	obj := createCluster(t, client, "prod")
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
 
-	got, err := serviceOver(t, client).Clusters().SetEnabled(context.Background(), ClusterID(obj.ID), false)
+	got, err := serviceOver(t, d).Clusters().SetEnabled(context.Background(), ClusterID(obj.ID), false)
 
 	require.NoError(t, err)
 	require.NotNil(t, got)
@@ -1215,10 +1319,10 @@ func TestClustersSetEnabled(t *testing.T) {
 }
 
 func TestClustersSetSyncEnabled(t *testing.T) {
-	client := newTestClusterClient(t)
-	obj := createCluster(t, client, "prod")
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
 
-	got, err := serviceOver(t, client).Clusters().SetSyncEnabled(context.Background(), ClusterID(obj.ID), true)
+	got, err := serviceOver(t, d).Clusters().SetSyncEnabled(context.Background(), ClusterID(obj.ID), true)
 
 	require.NoError(t, err)
 	require.NotNil(t, got)
@@ -1229,9 +1333,9 @@ func TestClustersSetSyncEnabled(t *testing.T) {
 // The two setters read, edit one field, and write the whole spec, so without
 // serialization the later write restores what the earlier one changed.
 func TestClustersSettersDoNotLoseConcurrentUpdates(t *testing.T) {
-	client := newTestClusterClient(t)
-	obj := createCluster(t, client, "prod")
-	clusters := serviceOver(t, client).Clusters()
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	clusters := serviceOver(t, d).Clusters()
 	id := ClusterID(obj.ID)
 
 	var wg sync.WaitGroup
@@ -1256,16 +1360,16 @@ func TestClustersSettersDoNotLoseConcurrentUpdates(t *testing.T) {
 // asked for a change that did not happen. It reports the boundary's own sentinel —
 // graph matches that one, and beehive is not supposed to be visible through here.
 func TestClustersSetEnabledReportsAnUnknownID(t *testing.T) {
-	_, err := serviceOver(t, newTestClusterClient(t)).Clusters().SetEnabled(context.Background(), 404, false)
+	_, err := serviceOver(t, newTestDeps(t)).Clusters().SetEnabled(context.Background(), 404, false)
 
 	assert.ErrorIs(t, err, ErrNotFound)
 	assert.NotErrorIs(t, err, beehive.ErrNotFound, "the store's sentinel must not leak")
 }
 
 func TestClustersDelete(t *testing.T) {
-	client := newTestClusterClient(t)
-	obj := createCluster(t, client, "prod")
-	clusters := serviceOver(t, client).Clusters()
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	clusters := serviceOver(t, d).Clusters()
 
 	require.NoError(t, clusters.Delete(context.Background(), ClusterID(obj.ID)))
 
@@ -1279,9 +1383,9 @@ func TestClustersDelete(t *testing.T) {
 // nothing in the kubeconfig changed — so without this the importer, whose only other
 // trigger is a snapshot, would not re-import until the user next edits the file.
 func TestClustersDeleteAsksTheImporterForAPass(t *testing.T) {
-	client := newTestClusterClient(t)
-	svc := serviceOver(t, client)
-	obj := createCluster(t, client, "prod")
+	d := newTestDeps(t)
+	svc := serviceOver(t, d)
+	obj := createCluster(t, d.clusterClient, "prod")
 
 	require.NoError(t, svc.Clusters().Delete(context.Background(), ClusterID(obj.ID)))
 
@@ -1291,9 +1395,9 @@ func TestClustersDeleteAsksTheImporterForAPass(t *testing.T) {
 // Deleting a record that is already gone is the outcome the caller asked for, and
 // beehive answers the same way whether the id was ever alive.
 func TestClustersDeleteIsIdempotent(t *testing.T) {
-	client := newTestClusterClient(t)
-	obj := createCluster(t, client, "prod")
-	clusters := serviceOver(t, client).Clusters()
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	clusters := serviceOver(t, d).Clusters()
 	require.NoError(t, clusters.Delete(context.Background(), ClusterID(obj.ID)))
 
 	assert.NoError(t, clusters.Delete(context.Background(), ClusterID(obj.ID)), "a second delete")
@@ -1306,7 +1410,7 @@ func TestClustersDeleteIsIdempotent(t *testing.T) {
 // them both down; a leaked one would outlive the service.
 func TestClusterControllerStartStop(t *testing.T) {
 	// A real client, not nil: the importer runs its first import as soon as it starts.
-	c := newClusterController(t.TempDir()+"/config", nil, newTestClusterClient(t))
+	c := newClusterController(t.TempDir()+"/config", newTestDeps(t))
 
 	stop, err := c.Start(context.Background())
 	require.NoError(t, err)

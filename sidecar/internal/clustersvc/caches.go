@@ -20,6 +20,8 @@ package clustersvc
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -49,14 +51,18 @@ type ClusterCacheSpec struct {
 type ClusterCacheStatus struct{}
 
 // ClusterCache is the view of one ClusterCache beehive object, streamed standalone
-// via Caches().Watch and joined to its parent client-side. ID and ClusterID together
+// via Caches().Watch and joined to its parent client-side. ID and Owner together
 // locate the on-disk cache and carry that join. Active-ness is deliberately not a
-// field: it is ServerUID matching the parent's last-probed Server.UID, which changes
-// with no cache event, so only the client's live join is correct.
+// field: it is spec.ServerUID matching the parent's last-probed Server.UID, which
+// changes with no cache event, so only the client's live join is correct.
+//
+// Shaped like its sync siblings — {ID, Owner, Spec, Conditions} — with the stored spec
+// served as-is, no projection.
 type ClusterCache struct {
-	ID        ClusterCacheID
-	ClusterID ClusterID
-	ServerUID string
+	ID ClusterCacheID
+	// Owner is the Cluster this cache belongs to.
+	Owner ObjectRef
+	Spec  ClusterCacheSpec
 	// Conditions are beehive object conditions, not part of Status — read off the
 	// object rather than out of the status blob.
 	Conditions []Condition
@@ -116,12 +122,82 @@ type ClusterCacheHealth struct {
 	LastLiveAt   *time.Time
 }
 
+// ensureClusterCache creates the mirror slot for one probed identity, owned by the
+// cluster so beehive's GC cascades to it. Idempotent: the name is the dedup key, and a
+// later pass has nothing to update — ServerUID *is* the identity.
+//
+// Called by the parent's reconcile, since a controller only ever reconciles an object
+// that already exists and the identity is the parent's to discover. The writes live
+// here so the kind's vocabulary stays in the kind's file.
+//
+// The GetByName probe keeps the steady state off the write path: GetOrCreate opens a
+// transaction even on the found branch, and the store is single-connection, so each one
+// serializes every other reader for its duration. GetOrCreate still closes the
+// create-path race.
+func ensureClusterCache(ctx context.Context, client beehive.Client[ClusterCacheSpec, ClusterCacheStatus], clusterID ClusterID, serverUID string) error {
+	name := ClusterCacheName(clusterID, serverUID)
+	_, err := client.GetByName(ctx, name)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, beehive.ErrNotFound) {
+		return fmt.Errorf("look up cluster cache %s: %w", name, err)
+	}
+
+	spec := ClusterCacheSpec{ServerUID: serverUID}
+	if _, _, err := client.GetOrCreate(ctx, name, spec, beehive.WithOwner(beehive.ObjectID(clusterID))); err != nil {
+		return fmt.Errorf("create cluster cache %s: %w", name, err)
+	}
+	return nil
+}
+
+// toClusterCache builds the served record from the stored object.
+func toClusterCache(obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) (*ClusterCache, error) {
+	owner, err := toOwnerRef(obj)
+	if err != nil {
+		return nil, err
+	}
+	return &ClusterCache{
+		ID:         ClusterCacheID(obj.ID),
+		Owner:      owner,
+		Spec:       obj.Spec,
+		Conditions: obj.Conditions,
+	}, nil
+}
+
 func (a cachesAPI) Get(ctx context.Context, id ClusterCacheID) (*ClusterCache, error) {
-	panic("not implemented")
+	obj, err := a.s.cacheClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
+	if err != nil {
+		// A caller holds ids from watch frames, so a record collected in between is an
+		// ordinary race rather than a bad request.
+		if errors.Is(err, beehive.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get cluster cache %d: %w", id, err)
+	}
+	return toClusterCache(obj)
 }
 
 func (a cachesAPI) List(ctx context.Context) ([]*ClusterCache, error) {
-	panic("not implemented")
+	objs, err := a.s.cacheClient.List(ctx, beehive.LoadOwner())
+	if err != nil {
+		return nil, fmt.Errorf("list cluster caches: %w", err)
+	}
+	return toClusterCaches(objs)
+}
+
+// toClusterCaches projects a whole read. beehive lists by id, which is creation order,
+// and that is the order this family promises — so nothing here sorts.
+func toClusterCaches(objs []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) ([]*ClusterCache, error) {
+	caches := make([]*ClusterCache, 0, len(objs))
+	for _, obj := range objs {
+		cache, err := toClusterCache(obj)
+		if err != nil {
+			return nil, err
+		}
+		caches = append(caches, cache)
+	}
+	return caches, nil
 }
 
 func (a cachesAPI) Watch(ctx context.Context, id ClusterCacheID) (*Stream[ClusterCacheWatchFrame], error) {
@@ -133,7 +209,14 @@ func (a cachesAPI) WatchList(ctx context.Context) (*Stream[ClusterCacheWatchFram
 }
 
 func (a cachesAPI) ListByCluster(ctx context.Context, clusterID ClusterID) ([]*ClusterCache, error) {
-	panic("not implemented")
+	// One query rather than a Get per child, and a cluster owning none reads empty:
+	// beehive does not existence-check the owner, so an unprobed cluster and an unknown
+	// id answer alike.
+	objs, err := a.s.cacheClient.ListOwnedObjects(ctx, beehive.ObjectID(clusterID), beehive.LoadOwner())
+	if err != nil {
+		return nil, fmt.Errorf("list cluster %d caches: %w", clusterID, err)
+	}
+	return toClusterCaches(objs)
 }
 
 func (a cachesAPI) WatchByCluster(ctx context.Context, clusterID ClusterID) (*Stream[ClusterCacheWatchFrame], error) {

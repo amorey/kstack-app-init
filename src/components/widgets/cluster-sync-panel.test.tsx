@@ -121,7 +121,7 @@ function openStreams() {
 // clustersWatch, plus (for a probed row) its ClusterCache change on
 // clusterCachesWatch and that cache's folded sync verdict on
 // clusterCacheEventsSyncsWatch. The provider joins them down the chain — cache onto
-// cluster by serverUid, sync onto cache by cacheID — which is what gives a row its
+// cluster by spec.serverUid, sync onto cache by its owner — which is what gives a row its
 // activeCache and its sync state.
 function pushClusters(rows: Row[]) {
   const clusterCh = channelFor('clustersWatch');
@@ -183,8 +183,8 @@ function pushClusters(rows: Row[]) {
               type: 'Added',
               cache: {
                 id: `cache-${r.uuid}`,
-                clusterID: id,
-                serverUid: r.uuid,
+                owner: { id },
+                spec: { serverUid: r.uuid },
                 // No status/conditions/stats here: the panel reads freshness and the
                 // verdict off the sync record below, and the whole of the cache's
                 // contents (existence, size, counts) streams per row via
@@ -364,7 +364,7 @@ function pushDiscovery(cacheId: string, d: { reason?: string; message?: string }
             type: 'Added',
             catalog: {
               id: `disc-${cacheId}`,
-              cacheID: cacheId,
+              owner: { id: cacheId },
               conditions: [
                 {
                   type: 'Discovered',
@@ -848,7 +848,7 @@ describe('ClusterSyncPanel', () => {
     expect(await screen.findByText(/beta group did not respond/i)).toBeInTheDocument();
   });
 
-  it('clears the discovery record when it is hard-deleted (id only, no cacheID)', async () => {
+  it('clears the discovery record when it is hard-deleted (id only, no owner)', async () => {
     const user = await openWith([{ uuid: 'u-gone', name: 'prod', enabled: true, present: true }]);
     await user.click(await screen.findByRole('button', { name: /synced/i }));
 
@@ -858,9 +858,9 @@ describe('ClusterSyncPanel', () => {
     expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
 
     // A hard delete carries ONLY the id: the row is already collected, so there is no owner
-    // edge left to read a cacheID from and it arrives as "0". This anchor carries no
+    // edge left to read an owner from and it arrives as "0". This anchor carries no
     // finalizer, so a cascade can collect it with no deletion-pending frame ahead of it —
-    // filtering these by cacheID left the pane showing a record that no longer exists.
+    // filtering these by the owner left the pane showing a record that no longer exists.
     await act(async () => {
       channelFor('clusterCachedCatalogsWatch').onmessage!(
         JSON.stringify({
@@ -869,7 +869,7 @@ describe('ClusterSyncPanel', () => {
             data: {
               clusterCachedCatalogsWatch: {
                 type: 'Deleted',
-                catalog: { id: 'disc-cache-u-gone', cacheID: '0', conditions: [] },
+                catalog: { id: 'disc-cache-u-gone', owner: { id: '0' }, conditions: [] },
               },
             },
           },
@@ -889,7 +889,7 @@ describe('ClusterSyncPanel', () => {
     );
     expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
 
-    // Matching on the record id is what keeps this scoped now that cacheID is unusable.
+    // Matching on the record id is what keeps this scoped now that the owner is unusable.
     await act(async () => {
       channelFor('clusterCachedCatalogsWatch').onmessage!(
         JSON.stringify({
@@ -898,7 +898,7 @@ describe('ClusterSyncPanel', () => {
             data: {
               clusterCachedCatalogsWatch: {
                 type: 'Deleted',
-                catalog: { id: 'disc-some-other-cache', cacheID: '0', conditions: [] },
+                catalog: { id: 'disc-some-other-cache', owner: { id: '0' }, conditions: [] },
               },
             },
           },

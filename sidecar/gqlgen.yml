@@ -80,6 +80,9 @@ models:
   Condition:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.Condition
 
+  ObjectRef:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ObjectRef
+
   # The generic event surface. Event binds 1:1 to the Go type; its run id
   # rides the shared ObjectID scalar (no dedicated Event id scalar), and EventType
   # binds straight to beehive.EventType (values Normal/Warning match), the same
@@ -133,7 +136,9 @@ models:
       events:
         resolver: true
 
-  # The sync children's served spec IS the stored beehive type (no projection layer).
+  # The cache subtree's served spec IS the stored beehive type (no projection layer).
+  ClusterCacheSpec:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheSpec
   ClusterCachedCatalog:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedCatalog
   ClusterCachedResource:

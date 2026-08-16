@@ -200,7 +200,9 @@ const ClusterCachedCatalogsSubscription = graphql(`
       type
       catalog {
         id
-        cacheID
+        owner {
+          id
+        }
         conditions {
           type
           reason
@@ -215,7 +217,7 @@ const ClusterCachedCatalogsSubscription = graphql(`
 // NonNullable: null only on a Bookmark, folded away in the reducer below.
 type CachedCatalog = NonNullable<ClusterCachedCatalogsSubscription['clusterCachedCatalogsWatch']['catalog']>;
 
-// Every cache's discovery record, folded by cacheID.
+// Every cache's discovery record, folded by the cache it belongs to.
 function useCachedCatalogs(): Keyed<CachedCatalog> {
   const [{ data }] = useWatchSubscription<
     { clusterCachedCatalogsWatch: { type: string; catalog: CachedCatalog | null } },
@@ -226,10 +228,10 @@ function useCachedCatalogs(): Keyed<CachedCatalog> {
     // it needs no snapshot-complete gate of its own. A change with no record is a
     // server-side field error — equally unfoldable.
     if (type === 'Bookmark' || !catalog) return prev ?? new Map();
-    // A Deleted must match on the record's own id, not cacheID: a hard delete's
-    // frame carries cacheID "0" (the owner edge is already collected), so keying it
-    // by cacheID would drop every delete and the pane would show gone records.
-    if (type !== 'Deleted') return applyChange(prev, type, catalog.cacheID, catalog);
+    // A Deleted must match on the record's own id, not its owner: a hard delete's
+    // frame carries owner id "0" (the edge is already collected), so keying it by the
+    // owner would drop every delete and the pane would show gone records.
+    if (type !== 'Deleted') return applyChange(prev, type, catalog.owner.id, catalog);
     const gone = [...(prev ?? new Map())].find(([, c]) => c.id === catalog.id);
     return gone ? applyChange(prev, 'Deleted', gone[0], catalog) : (prev ?? new Map());
   });

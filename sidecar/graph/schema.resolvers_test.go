@@ -297,7 +297,8 @@ func TestClusterEphemeralFields(t *testing.T) {
 	// The cache resolves its conditions on a bare fixture. It has no status block: the
 	// kind measures nothing itself.
 	cache := firstCacheFrame(t, srv.URL)
-	if cache["serverUid"] != "uid-1" || cache["clusterID"] != "1" {
+	spec, _ := cache["spec"].(map[string]any)
+	if spec["serverUid"] != "uid-1" || ownerOf(cache)["id"] != "1" {
 		t.Errorf("cache identity: %v", cache)
 	}
 	if conds, ok := cache["conditions"].([]any); !ok || len(conds) != 0 {
@@ -431,7 +432,7 @@ func TestClusterCacheSyncsResolver(t *testing.T) {
 	cacheID := fixtureCacheID(fix[0].id)
 
 	query := `{ clusterCache(id: "` + strconv.FormatInt(int64(cacheID), 10) + `") {
-		cachedResources { id catalogID spec { apiVersion resource } }
+		cachedResources { id owner { id kind } spec { apiVersion resource } }
 	} }`
 	body, _ := json.Marshal(map[string]string{"query": query})
 	raw := postGQL(t, srv.URL, string(body))
@@ -457,8 +458,8 @@ func TestClusterCacheSyncsResolver(t *testing.T) {
 	if got[0]["id"] != strconv.FormatInt(int64(fixtureResourceID(fix[0].id)), 10) {
 		t.Errorf("id: want the sync record's own id, got %v", got[0]["id"])
 	}
-	if got[0]["catalogID"] != strconv.FormatInt(int64(fixtureCatalogID(fix[0].id)), 10) {
-		t.Errorf("catalogID: want the anchor's id, got %v", got[0]["catalogID"])
+	if ownerOf(got[0])["id"] != strconv.FormatInt(int64(fixtureCatalogID(fix[0].id)), 10) {
+		t.Errorf("owner: want the anchor's id, got %v", ownerOf(got[0]))
 	}
 }
 
@@ -471,7 +472,7 @@ func TestClusterCachesResolver(t *testing.T) {
 	id := fix[0].id
 
 	query := `{ cluster(id: "` + strconv.FormatInt(int64(id), 10) + `") {
-		caches { id clusterID serverUid }
+		caches { id owner { id kind } spec { serverUid } }
 	} }`
 	body, _ := json.Marshal(map[string]string{"query": query})
 	raw := postGQL(t, srv.URL, string(body))
@@ -498,8 +499,8 @@ func TestClusterCachesResolver(t *testing.T) {
 	if got[0]["id"] != strconv.FormatInt(int64(fixtureCacheID(id)), 10) {
 		t.Errorf("id: want the cache's own id, got %v", got[0]["id"])
 	}
-	if got[0]["clusterID"] != strconv.FormatInt(int64(id), 10) {
-		t.Errorf("clusterID: want the parent's id, got %v", got[0]["clusterID"])
+	if ownerOf(got[0])["id"] != strconv.FormatInt(int64(id), 10) {
+		t.Errorf("owner: want the parent's id, got %v", ownerOf(got[0]))
 	}
 }
 
@@ -601,7 +602,7 @@ func TestClusterCachedCatalogsWatchServesRecord(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	resp := openSSESubscription(t, srv.URL, "",
-		`subscription { clusterCachedCatalogsWatch { type catalog { id cacheID `+
+		`subscription { clusterCachedCatalogsWatch { type catalog { id owner { id kind } `+
 			`conditions { type status reason } } } }`)
 	defer resp.Body.Close()
 	events := sseEvents(t, resp)
@@ -628,7 +629,7 @@ func TestClusterCachedCatalogsWatchServesRecord(t *testing.T) {
 				t.Fatalf("decode discovery frame %s: %v", ev.data, err)
 			}
 			d := frame.Data.Watch.Catalog
-			if d["cacheID"] != strconv.FormatInt(int64(fixtureCacheID(1)), 10) {
+			if ownerOf(d)["id"] != strconv.FormatInt(int64(fixtureCacheID(1)), 10) {
 				continue // fixture 2's record; it carries no discovery status
 			}
 			if frame.Data.Watch.Type != "Added" {
@@ -674,7 +675,7 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	resp := openSSESubscription(t, srv.URL, "",
-		`subscription { clusterCachedResourcesWatch(cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { type resource { id catalogID `+
+		`subscription { clusterCachedResourcesWatch(cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { type resource { id owner { id kind } `+
 			`spec { enabled apiVersion kind resource namespaced } conditions { type status reason } } } }`)
 	defer resp.Body.Close()
 	events := sseEvents(t, resp)
@@ -712,7 +713,7 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 			}
 			seen++
 			sync := frame.Data.Watch.Resource
-			if sync["catalogID"] != strconv.FormatInt(int64(fixtureCatalogID(1)), 10) {
+			if ownerOf(sync)["id"] != strconv.FormatInt(int64(fixtureCatalogID(1)), 10) {
 				t.Fatalf("another cache's record leaked into the stream: %v", sync)
 			}
 			spec, _ := sync["spec"].(map[string]any)

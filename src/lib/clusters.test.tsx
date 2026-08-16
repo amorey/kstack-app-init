@@ -86,13 +86,13 @@ function syncOf(r: ClusterRow, reason = 'Watching') {
   };
 }
 
-// A cache mirroring a row's active identity (serverUid matches the cluster's uid),
+// A cache mirroring a row's active identity (spec.serverUid matches the cluster's uid),
 // so the provider joins it as that cluster's activeCache.
 function cacheOf(r: ClusterRow) {
   return {
     id: `cache-${r.id}`,
-    clusterID: r.id,
-    serverUid: `uid-${r.id}`,
+    owner: { id: r.id },
+    spec: { serverUid: `uid-${r.id}` },
     stats: { exists: false, bytes: 0 },
   };
 }
@@ -294,7 +294,7 @@ describe('useClusters', () => {
     expect(screen.getByTestId('probe')).toHaveTextContent('["staging"]');
   });
 
-  it('joins a cache onto its cluster by matching serverUid', async () => {
+  it('joins a cache onto its cluster by matching spec.serverUid', async () => {
     renderProvider(<JoinProbe />);
     await flush();
 

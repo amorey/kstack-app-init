@@ -16,11 +16,13 @@ package clustersvc
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -157,4 +159,34 @@ func TestTimePtrEqual(t *testing.T) {
 	assert.False(t, TimePtrEqual(&at, &later))
 	assert.False(t, TimePtrEqual(&at, nil))
 	assert.False(t, TimePtrEqual(nil, &at))
+}
+
+// --- toOwnerRef ---
+
+// A collected object's outgoing edges go with it, so a departure frame carries no
+// owner. The zero ref is what lets that frame reach a consumer at all: an error would
+// null the entity, and a change with no entity is dropped rather than folded — so the
+// removal would never land and the record would sit on screen for the life of the
+// subscription.
+func TestToOwnerRefWithNoOwnerIsTheZeroRef(t *testing.T) {
+	ctx := context.Background()
+	client := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](newTestBeehive(t), ClusterCacheGroupKind)
+	_, err := client.Create(ctx, "orphan", ClusterCacheSpec{})
+	require.NoError(t, err)
+
+	obj, err := client.GetByName(ctx, "orphan", beehive.LoadOwner())
+	require.NoError(t, err)
+
+	ref, err := toOwnerRef(obj)
+
+	require.NoError(t, err)
+	assert.Equal(t, ObjectRef{}, ref)
+}
+
+// Forgetting beehive.LoadOwner is a caller bug, not a state the store can be in, so it
+// stays an error rather than reading as an absent owner.
+func TestToOwnerRefReportsAnUnloadedEdge(t *testing.T) {
+	_, err := toOwnerRef(&beehive.Object[ClusterCacheSpec, ClusterCacheStatus]{ID: 7, Kind: "ClusterCache"})
+
+	assert.ErrorIs(t, err, beehive.ErrNotLoaded)
 }

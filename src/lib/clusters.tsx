@@ -15,7 +15,7 @@
 // The app's cluster registry: reduces the three per-kind delta watches
 // (`clustersWatch`, `clusterCachesWatch`, `clusterCacheHealthWatch`) into
 // id-keyed maps, then joins client-side — caches onto clusters (active cache =
-// `serverUid` matches `status.server.uid`), the folded sync verdict onto that cache
+// `spec.serverUid` matches `status.server.uid`), the folded sync verdict onto that cache
 // by `cacheID`. Why per-kind streams + client joins:
 // see docs/adr/2026-08-09-delta-watch-protocol.md
 //
@@ -45,7 +45,7 @@ export type ClusterCacheHealth = ClusterCacheHealthWatchSubscription['clusterCac
 // enforces "the UI doesn't read it" at the schema level.
 type JoinedCache = CacheRow & { health: ClusterCacheHealth | null };
 
-// A cluster joined with its active cache (`serverUid` matches `status.server.uid`);
+// A cluster joined with its active cache (`spec.serverUid` matches `status.server.uid`);
 // null when never probed or mid-migration.
 export type Cluster = ClusterRow & { activeCache: JoinedCache | null };
 
@@ -100,8 +100,12 @@ const ClusterCachesWatchSubscription = graphql(`
       type
       cache {
         id
-        clusterID
-        serverUid
+        owner {
+          id
+        }
+        spec {
+          serverUid
+        }
         # On-disk stats ride clusterCacheStatsWatch, subscribed per expanded row.
       }
     }
@@ -221,7 +225,7 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
     const caches = cacheMap ? [...cacheMap.values()] : [];
 
     return [...clusterMap.values()].map((c) => {
-      const active = caches.find((cache) => cache.clusterID === c.id && cache.serverUid === c.status.server.uid);
+      const active = caches.find((cache) => cache.owner.id === c.id && cache.spec.serverUid === c.status.server.uid);
       return {
         ...c,
         activeCache: active ? { ...active, health: healthMap?.get(active.id) ?? null } : null,

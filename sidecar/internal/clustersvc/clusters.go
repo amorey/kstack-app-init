@@ -33,7 +33,6 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
 
 // ClusterGroupKind identifies the Cluster beehive resource kind.
@@ -393,23 +392,29 @@ func (a clustersAPI) Delete(ctx context.Context, id ClusterID) error {
 const kubeconfigUnreadRequeue = time.Second
 
 // clusterController reconciles a tracked cluster: today it observes what the
-// kubeconfig says about the record's context. Resolving credentials, probing the API
-// server, and owning the ClusterCache for the identity it finds are still to come.
+// kubeconfig says about the record's context, and creates the ClusterCache for the
+// identity a probe has recorded. Resolving credentials and probing the API server are
+// still to come.
 //
 // It owns the Cluster kind's machinery too, so per-kind detail stays out of the
 // service struct: the kubeconfig watcher, which Reconcile reads to observe a
 // context's presence, and the importer that creates the records it reconciles and
 // wakes them when the file changes. Reconcile never touches the importer.
 type clusterController struct {
+	// Every kind's client, not just this one's: a cluster creates the ClusterCache
+	// children it owns.
+	deps
+
 	kubeconfigWatcher  *kubeconfig.Watcher
 	kubeconfigImporter *kubeconfigImporter
 }
 
-func newClusterController(kubeconfigPath string, pokeSvc *poke.Service, clusterClient beehive.Client[ClusterSpec, ClusterStatus]) *clusterController {
-	watcher := kubeconfig.New(kubeconfigPath, pokeSvc)
+func newClusterController(kubeconfigPath string, d deps) *clusterController {
+	watcher := kubeconfig.New(kubeconfigPath, d.pokeSvc)
 	return &clusterController{
+		deps:               d,
 		kubeconfigWatcher:  watcher,
-		kubeconfigImporter: newKubeconfigImporter(watcher, clusterClient),
+		kubeconfigImporter: newKubeconfigImporter(watcher, d.clusterClient),
 	}
 }
 
@@ -453,6 +458,13 @@ func (c *clusterController) Reconcile(
 		return beehive.Result{RequeueAfter: kubeconfigUnreadRequeue}, nil
 	}
 
+	// Ahead of the settle fast-path below: a record whose generation is already
+	// settled can still be missing the cache its identity calls for, and the pass that
+	// returns early there would never create it.
+	if err := c.ensureCache(ctx, obj); err != nil {
+		return beehive.Result{}, err
+	}
+
 	status := clusterStatus(obj)
 	prev := status.Source.Kubeconfig
 	status.Source.Kubeconfig = observeKubeconfig(cfg, obj.Spec.Source.Kubeconfig, prev)
@@ -477,6 +489,17 @@ func (c *clusterController) Reconcile(
 		return beehive.Result{}, fmt.Errorf("update cluster status: %w", err)
 	}
 	return beehive.Result{}, nil
+}
+
+// ensureCache gives the cluster a mirror slot for the identity its last probe
+// recorded. A cluster that has never connected has none to mirror, and a cache named
+// for the empty UID is one CacheIsActive matches against nothing.
+func (c *clusterController) ensureCache(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus]) error {
+	uid := ClusterActiveUID(obj)
+	if uid == "" {
+		return nil
+	}
+	return ensureClusterCache(ctx, c.cacheClient, ClusterID(obj.ID), uid)
 }
 
 // generationSettled reports whether the generation this reconcile was handed is already

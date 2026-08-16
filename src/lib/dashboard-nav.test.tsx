@@ -73,13 +73,15 @@ const CONTROLLER_REVISION = {
   count: 2,
 };
 
-// A cluster fixture for context "prod" whose active cache has the given id/serverUid
+// A cluster fixture for context "prod" whose active cache has the given id/spec.serverUid
 // and Synced condition — or no active cache when `synced` is null.
 function clusterFixture(synced: { status: string; reason: string } | null, cacheId = 'c1', serverUid = 'uid-1') {
   return {
     id: '1',
     spec: { source: { kubeconfig: { context: 'prod' } } },
-    activeCache: synced ? { id: cacheId, serverUid, status: { conditions: [{ type: 'Synced', ...synced }] } } : null,
+    activeCache: synced
+      ? { id: cacheId, spec: { serverUid }, status: { conditions: [{ type: 'Synced', ...synced }] } }
+      : null,
   };
 }
 

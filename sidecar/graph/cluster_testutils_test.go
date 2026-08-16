@@ -21,6 +21,12 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
 )
 
+// ownerOf reads a record's owner ref out of a decoded JSON response.
+func ownerOf(record map[string]any) map[string]any {
+	owner, _ := record["owner"].(map[string]any)
+	return owner
+}
+
 // clusterFixture bundles all data for one test cluster record. id is the beehive
 // ObjectID; on the wire it is its decimal string ("1", "2", …).
 type clusterFixture struct {
@@ -129,8 +135,8 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 		// identity (the client's active-cache rule).
 		f.caches = append(f.caches, clustersvc.ClusterCache{
 			ID:         fixtureCacheID(id),
-			ClusterID:  id,
-			ServerUID:  "uid-" + strconv.FormatInt(int64(id), 10),
+			Owner:      clustersvc.ObjectRef{ID: id, Kind: "Cluster"},
+			Spec:       clustersvc.ClusterCacheSpec{ServerUID: "uid-" + strconv.FormatInt(int64(id), 10)},
 			Conditions: fx.cacheConds,
 		})
 		// Each cache gets one per-kind sync child, keyed off the same id — the fixture's
@@ -138,7 +144,7 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 		// …and its resource catalog, the anchor the per-kind syncs hang off.
 		f.discoveries = append(f.discoveries, clustersvc.ClusterCachedCatalog{
 			ID:         fixtureCatalogID(id),
-			CacheID:    fixtureCacheID(id),
+			Owner:      clustersvc.ObjectRef{ID: fixtureCacheID(id), Kind: "ClusterCache"},
 			Spec:       clustersvc.ClusterCachedCatalogSpec{Enabled: fx.spec.SyncEnabled},
 			Conditions: fx.discConds,
 		})
@@ -146,8 +152,8 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 		// something to scope. Deliberately one per cache so a leak across caches is
 		// visible as an extra frame.
 		f.cachedResources = append(f.cachedResources, clustersvc.ClusterCachedResource{
-			ID:        fixtureResourceID(id),
-			CatalogID: fixtureCatalogID(id),
+			ID:    fixtureResourceID(id),
+			Owner: clustersvc.ObjectRef{ID: fixtureCatalogID(id), Kind: "ClusterCachedCatalog"},
 			Spec: clustersvc.ClusterCachedResourceSpec{
 				Enabled: fx.spec.SyncEnabled, APIVersion: "apps/v1",
 				Kind: "Deployment", Resource: "deployments", Namespaced: true,
@@ -285,7 +291,7 @@ func (f fakeCaches) WatchList(ctx context.Context) (*clustersvc.Stream[clustersv
 func (f fakeCaches) WatchByCluster(ctx context.Context, clusterID clustersvc.ClusterID) (*clustersvc.Stream[clustersvc.ClusterCacheWatchFrame], error) {
 	var rows []clustersvc.ClusterCache
 	for _, c := range f.s.cacheSnapshot() {
-		if c.ClusterID == clusterID {
+		if c.Owner.ID == clusterID {
 			rows = append(rows, c)
 		}
 	}
@@ -315,7 +321,7 @@ func (f fakeCachedCatalogs) WatchList(ctx context.Context) (*clustersvc.Stream[c
 func (f fakeCachedCatalogs) WatchByCache(ctx context.Context, cacheID clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCachedCatalogWatchFrame], error) {
 	var rows []clustersvc.ClusterCachedCatalog
 	for _, d := range copySlice(f.s, &f.s.discoveries) {
-		if d.CacheID == cacheID {
+		if d.Owner.ID == cacheID {
 			rows = append(rows, d)
 		}
 	}
@@ -342,11 +348,11 @@ func (f fakeCaches) WatchHealth(ctx context.Context) (*clustersvc.Stream[cluster
 	f.s.mu.Lock()
 	cacheOf := map[clustersvc.ClusterCachedCatalogID]clustersvc.ClusterCacheID{}
 	for i := range f.s.discoveries {
-		cacheOf[f.s.discoveries[i].ID] = f.s.discoveries[i].CacheID
+		cacheOf[f.s.discoveries[i].ID] = f.s.discoveries[i].Owner.ID
 	}
 	byCache := map[clustersvc.ClusterCacheID]*clustersvc.ClusterCacheHealth{}
 	for i := range f.s.cachedResources {
-		cacheID := cacheOf[f.s.cachedResources[i].CatalogID]
+		cacheID := cacheOf[f.s.cachedResources[i].Owner.ID]
 		h := byCache[cacheID]
 		if h == nil {
 			h = &clustersvc.ClusterCacheHealth{CacheID: cacheID, Status: clustersvc.ConditionTrue, Reason: "Watching"}
@@ -380,13 +386,13 @@ func (f fakeCachedResources) WatchByCache(ctx context.Context, cacheID clustersv
 	f.s.mu.Lock()
 	var want clustersvc.ClusterCachedCatalogID
 	for i := range f.s.discoveries {
-		if f.s.discoveries[i].CacheID == cacheID {
+		if f.s.discoveries[i].Owner.ID == cacheID {
 			want = f.s.discoveries[i].ID
 		}
 	}
 	var scoped []clustersvc.ClusterCachedResource
 	for i := range f.s.cachedResources {
-		if f.s.cachedResources[i].CatalogID == want {
+		if f.s.cachedResources[i].Owner.ID == want {
 			scoped = append(scoped, f.s.cachedResources[i])
 		}
 	}
@@ -523,7 +529,7 @@ func (f fakeCaches) List(context.Context) ([]*clustersvc.ClusterCache, error) {
 func (f fakeCaches) ListByCluster(_ context.Context, clusterID clustersvc.ClusterID) ([]*clustersvc.ClusterCache, error) {
 	var out []*clustersvc.ClusterCache
 	for _, c := range f.s.cacheSnapshot() {
-		if c.ClusterID == clusterID {
+		if c.Owner.ID == clusterID {
 			out = append(out, &c)
 		}
 	}
@@ -558,7 +564,7 @@ func (f fakeCachedCatalogs) ListByCache(_ context.Context, cacheID clustersvc.Cl
 	defer f.s.mu.Unlock()
 	var out []*clustersvc.ClusterCachedCatalog
 	for i := range f.s.discoveries {
-		if f.s.discoveries[i].CacheID == cacheID {
+		if f.s.discoveries[i].Owner.ID == cacheID {
 			d := f.s.discoveries[i]
 			out = append(out, &d)
 		}
@@ -596,13 +602,13 @@ func (f fakeCachedResources) ListByCache(_ context.Context, cacheID clustersvc.C
 	defer f.s.mu.Unlock()
 	var want clustersvc.ClusterCachedCatalogID
 	for i := range f.s.discoveries {
-		if f.s.discoveries[i].CacheID == cacheID {
+		if f.s.discoveries[i].Owner.ID == cacheID {
 			want = f.s.discoveries[i].ID
 		}
 	}
 	var out []*clustersvc.ClusterCachedResource
 	for i := range f.s.cachedResources {
-		if f.s.cachedResources[i].CatalogID == want {
+		if f.s.cachedResources[i].Owner.ID == want {
 			gs := f.s.cachedResources[i]
 			out = append(out, &gs)
 		}
@@ -771,7 +777,7 @@ func clustersQueryData(t *testing.T, query string) map[string]any {
 func firstCacheFrame(t *testing.T, srvURL string) map[string]any {
 	t.Helper()
 	resp := openSSESubscription(t, srvURL, "",
-		`subscription { clusterCachesWatch { type cache { id clusterID serverUid `+
+		`subscription { clusterCachesWatch { type cache { id owner { id kind } spec { serverUid } `+
 			`conditions { type status reason } } } }`)
 	t.Cleanup(func() { resp.Body.Close() })
 	events := sseEvents(t, resp)
@@ -797,7 +803,7 @@ func firstCacheFrame(t *testing.T, srvURL string) map[string]any {
 			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
 				t.Fatalf("decode cache frame %s: %v", ev.data, err)
 			}
-			if frame.Data.ClusterCachesWatch.Cache["clusterID"] == "1" {
+			if ownerOf(frame.Data.ClusterCachesWatch.Cache)["id"] == "1" {
 				return frame.Data.ClusterCachesWatch.Cache
 			}
 		case <-deadline:

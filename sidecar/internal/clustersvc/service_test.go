@@ -249,7 +249,7 @@ func TestNewRejectsAnUnopenableStore(t *testing.T) {
 // caller rather than leaving a kind silently unreconciled.
 func TestRegisterControllersRejectsADuplicateKind(t *testing.T) {
 	bh := newTestBeehive(t)
-	ctrl := newClusterController(filepath.Join(t.TempDir(), "config"), nil, nil)
+	ctrl := newClusterController(filepath.Join(t.TempDir(), "config"), deps{})
 
 	_, err := registerControllers(bh, ctrl)
 	require.NoError(t, err)
@@ -298,11 +298,8 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 
 	calls := map[string]func(){
 		"Clusters().WatchSchedule":       func() { svc.Clusters().WatchSchedule(ctx, id) },
-		"Caches().Get":                   func() { svc.Caches().Get(ctx, id) },
-		"Caches().List":                  func() { svc.Caches().List(ctx) },
 		"Caches().Watch":                 func() { svc.Caches().Watch(ctx, id) },
 		"Caches().WatchList":             func() { svc.Caches().WatchList(ctx) },
-		"Caches().ListByCluster":         func() { svc.Caches().ListByCluster(ctx, id) },
 		"Caches().WatchByCluster":        func() { svc.Caches().WatchByCluster(ctx, id) },
 		"Caches().WatchStats":            func() { svc.Caches().WatchStats(ctx, id, id) },
 		"Caches().WatchHealth":           func() { svc.Caches().WatchHealth(ctx) },

@@ -99,6 +99,19 @@ type Condition {
   updatedAt: Time!
 }
 
+"""
+A pointer to another record — today always the owner a child record hangs off, which
+is the key the client folds its streams together on. Kind-agnostic, so the whole
+ownership chain reads the same way rather than naming a differently-spelled id per
+kind.
+"""
+type ObjectRef {
+  "The referenced record's id."
+  id: ObjectID!
+  "Its kind, e.g. `\"Cluster\"` — for a consumer that has to tell owners apart."
+  kind: String!
+}
+
 "An event's severity, mirroring the control plane's event type: Normal (✓) or Warning (✗)."
 enum EventType {
   Normal
@@ -227,7 +240,7 @@ type Cluster {
   Every cache this cluster has mirrored. Usually one; a UID migration leaves the
   superseded cache in place until its subtree drains, which is why this is a list.
 
-  **None of them is marked active.** The active cache is the one whose `serverUid`
+  **None of them is marked active.** The active cache is the one whose `spec.serverUid`
   matches this cluster's `status.server.uid` — a comparison the caller makes, and
   must keep making: the parent's UID is rewritten by a probe, which fires no cache
   event, so an answer computed once goes stale silently. A consumer that needs to
@@ -386,22 +399,22 @@ type ClusterWatchFrame {
 """
 A cache record, mirroring the beehive ClusterCache kind: a mirror of one physical
 cluster identity. Streamed independently of its parent Cluster via
-`clusterCachesWatch` and joined to it client-side by `clusterID`. Carries its
-identity (`id`, `clusterID`, `serverUid`) and observed sync `status`; its live
-on-disk stats ride `clusterCacheStatsWatch`, which stays current where a field here
-would freeze at subscribe time. A cluster owns one per identity it has mirrored; the *active* cache
+`clusterCachesWatch` and joined to it client-side by `owner.id`. Carries its
+identity (`id`, `owner`, `spec.serverUid`) and its coarse `Synced` condition — there
+is no status block, for the reason `conditions` gives below. Its live on-disk stats
+ride `clusterCacheStatsWatch`, which stays current where a field here would freeze at
+subscribe time. A cluster owns one per identity it has mirrored; the *active* cache
 — the one a sync engine runs for and a UI shows for the row — is the one whose
-`serverUid` matches the cluster's last-probed `status.server.uid`, a join the
+`spec.serverUid` matches the cluster's last-probed `status.server.uid`, a join the
 client derives (it is not a field here, because it depends on the parent's status,
 which changes with no cache event and so cannot be kept fresh on this stream).
 """
 type ClusterCache {
   "Unique identifier for this cache record (distinct from its parent cluster's id)."
   id: ObjectID!
-  "The id of the Cluster this cache belongs to (its beehive owner). The client joins caches onto clusters by this id."
-  clusterID: ObjectID!
-  "The kube-system namespace UID of the physical cluster this cache mirrors — the identity a physical migration turns over. Matches the parent cluster's `status.server.uid` while this is the active cache."
-  serverUid: String!
+  "The Cluster this cache belongs to. The client joins caches onto clusters by `owner.id`."
+  owner: ObjectRef!
+  spec: ClusterCacheSpec!
   "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's sync children (`clusterCachedResourcesWatch`, `clusterCachedCatalogsWatch`) or their rollup (`clusterCacheHealthWatch`), which is also why this record carries no status block of its own."
   conditions: [Condition!]!
 
@@ -438,6 +451,16 @@ type ClusterCache {
   events(category: String, limit: Int): [Event!]!
 }
 
+"""
+A cache's desired state. The identity it mirrors, and nothing else: a cache is
+created for one physical cluster and never repointed, so there is no field here a
+client writes.
+"""
+type ClusterCacheSpec {
+  "The kube-system namespace UID of the physical cluster this cache mirrors — the identity a physical migration turns over. Matches the parent cluster's `status.server.uid` while this is the active cache."
+  serverUid: String!
+}
+
 "Live on-disk cache statistics for a single cluster."
 type ClusterCacheStats {
   "True when a local cache exists on disk."
@@ -463,7 +486,7 @@ A ClusterCache's resource catalog: the record anchoring the pass that asks the
 cluster which kinds it serves and maintains one per-GVR sync record for each. It is the
 granular answer to "does this cache know what to sync?" — distinct from the per-kind
 records below it, which answer "is each kind's mirror current?". Streamed independently via
-`clusterCachedCatalogsWatch` and joined to its cache client-side by `cacheID`.
+`clusterCachedCatalogsWatch` and joined to its cache client-side by `owner.id`.
 
 Discovery has no watch API — the served-kinds document carries no resourceVersion — so
 this record is refreshed by a poll (every few minutes). How current its answer is has no
@@ -475,8 +498,8 @@ deleting it, so the last-known kind list survives a pause.
 type ClusterCachedCatalog {
   "Unique identifier for this record."
   id: ObjectID!
-  "The id of the ClusterCache this belongs to. The client joins the discovery onto its cache by this id."
-  cacheID: ObjectID!
+  "The ClusterCache this belongs to. The client joins the discovery onto its cache by `owner.id`."
+  owner: ObjectRef!
   spec: ClusterCachedCatalogSpec!
   """
   This record's `Discovered` condition — the per-component verdict (reasons
@@ -505,7 +528,7 @@ type ClusterCachedCatalogWatchFrame {
 One Kubernetes kind being mirrored into a cache — one record per kind the discovery
 pass found, so a cache has a hundred or more. Streamed by `clusterCachedResourcesWatch`,
 which is **cache-scoped** for exactly that reason, and joined onto its cache through
-`catalogID` (the resource catalog the client already streams).
+`owner.id` (the resource catalog the client already streams).
 
 This is where per-kind sync health lives. The cache's own `Synced` condition is
 coarse and its discovery's `Discovered` says only whether the kind LIST is current;
@@ -515,8 +538,8 @@ kinds are caught up.
 type ClusterCachedResource {
   "Unique identifier for this record."
   id: ObjectID!
-  "The id of the ClusterCachedCatalog that owns this kind — the client's join key."
-  catalogID: ObjectID!
+  "The ClusterCachedCatalog that owns this kind — the client's join key."
+  owner: ObjectRef!
   spec: ClusterCachedResourceSpec!
   """
   This record's `Synced` condition — this kind's own verdict (reasons
@@ -856,13 +879,13 @@ type Subscription {
   clusterScheduleWatch(id: ObjectID!): Schedule!
 
   # --- ClusterCache ---
-  "Cache records as a delta watch, keyed by `cache.id` and joined onto clusters by `clusterID`. Carries no ordering guarantee against `clustersWatch`."
+  "Cache records as a delta watch, keyed by `cache.id` and joined onto clusters by `owner.id`. Carries no ordering guarantee against `clustersWatch`."
   clusterCachesWatch: ClusterCacheWatchFrame!
 
   "Every cache's folded sync verdict as a gauge, keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's, so the client drops one when its cache leaves `clusterCachesWatch`."
   clusterCacheHealthWatch: ClusterCacheHealth!
 
-  "The caches' resource catalogs as a delta watch, joined onto caches by `cacheID`. Unscoped: one record per cache."
+  "The caches' resource catalogs as a delta watch, joined onto caches by `owner.id`. Unscoped: one record per cache."
   clusterCachedCatalogsWatch: ClusterCachedCatalogWatchFrame!
 
   "One cache's per-kind sync records as a delta watch, keyed by `sync.id`. Cache-scoped, since there is one record per synced kind."
