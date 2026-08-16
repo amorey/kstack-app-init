@@ -288,7 +288,7 @@ func pumpClusterWatch(
 		if change.Object == nil {
 			continue
 		}
-		frame := ClusterWatchFrame{Type: clusterFrameType(change), Cluster: toCluster(change.Object)}
+		frame := ClusterWatchFrame{Type: deltaFrameType(change), Cluster: toCluster(change.Object)}
 		if !sendFrame(ctx, out, frame) {
 			return nil
 		}
@@ -307,16 +307,6 @@ func clusterDeparture(change beehive.ObjectChange[ClusterSpec, ClusterStatus]) C
 		cluster = toCluster(change.Object)
 	}
 	return ClusterWatchFrame{Type: DeltaFrameDeleted, Cluster: cluster}
-}
-
-// clusterFrameType classifies a change that is not a removal. The soft-delete mark is
-// one of them: the row is still there, wearing a tombstone the record carries through,
-// so it is a Modified like any other field moving.
-func clusterFrameType(change beehive.ObjectChange[ClusterSpec, ClusterStatus]) DeltaFrameType {
-	if change.Type == beehive.Added {
-		return DeltaFrameAdded
-	}
-	return DeltaFrameModified
 }
 
 func (a clustersAPI) WatchSchedule(ctx context.Context, id ClusterID) (<-chan Schedule, error) {

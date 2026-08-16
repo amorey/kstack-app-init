@@ -298,8 +298,6 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 
 	calls := map[string]func(){
 		"Clusters().WatchSchedule":       func() { svc.Clusters().WatchSchedule(ctx, id) },
-		"Caches().Watch":                 func() { svc.Caches().Watch(ctx, id) },
-		"Caches().WatchList":             func() { svc.Caches().WatchList(ctx) },
 		"Caches().WatchByCluster":        func() { svc.Caches().WatchByCluster(ctx, id) },
 		"Caches().WatchStats":            func() { svc.Caches().WatchStats(ctx, id, id) },
 		"Caches().WatchHealth":           func() { svc.Caches().WatchHealth(ctx) },

@@ -117,12 +117,11 @@ type ObjectRef struct {
 // a reconcile key rather than a field, and parsing it back would let the two disagree
 // the moment either moves. A read that forgot the load is a caller bug, so it errors.
 //
-// **No edge is the zero ref, not an error.** A collected object's outgoing edges go with
-// it (ON DELETE CASCADE), so the departure frame on a delta watch has none by
-// construction — erroring there would null the frame's entity and the consumer would
-// drop the removal, leaving a deleted record on screen forever. A live record with no
-// owner is corruption reading the same way; the client's join drops it, which is the
-// same outcome as any record whose owner it cannot find.
+// **No edge is the zero ref, not an error.** A live record with no owner is corruption,
+// and the client's join drops it — the same outcome as any record whose owner it cannot
+// find, and better than failing a whole read over one row. A collected record never
+// reaches here at all: its edges went with it (ON DELETE CASCADE) and beehive loads none
+// for the removal, so a watch builds that frame without an owner (see cacheDeparture).
 func toOwnerRef[Spec, Status any](obj *beehive.Object[Spec, Status]) (ObjectRef, error) {
 	owner, ok, err := obj.Owner()
 	if err != nil {
@@ -379,6 +378,16 @@ const (
 	// See docs/adr/2026-08-09-delta-watch-protocol.md.
 	DeltaFrameBookmark DeltaFrameType = "Bookmark"
 )
+
+// deltaFrameType classifies a change that is not a removal, for any kind's watch pump.
+// The soft-delete mark is one of them: the row is still there, wearing a tombstone the
+// record carries through, so it is a Modified like any other field moving.
+func deltaFrameType[Spec, Status any](change beehive.ObjectChange[Spec, Status]) DeltaFrameType {
+	if change.Type == beehive.Added {
+		return DeltaFrameAdded
+	}
+	return DeltaFrameModified
+}
 
 // EventFrameType classifies one frame on an event-timeline watch. Two values where
 // DeltaFrameType has four, because an event log is a positioned log rather than a mirrored

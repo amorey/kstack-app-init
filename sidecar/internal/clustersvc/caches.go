@@ -201,11 +201,111 @@ func toClusterCaches(objs []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus
 }
 
 func (a cachesAPI) Watch(ctx context.Context, id ClusterCacheID) (*Stream[ClusterCacheWatchFrame], error) {
-	panic("not implemented")
+	src, err := a.s.cacheClient.Watch(ctx, beehive.ObjectID(id), loadCacheOwner)
+	if err != nil {
+		return nil, fmt.Errorf("watch cluster cache %d: %w", id, err)
+	}
+
+	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterCacheWatchFrame) error {
+		// Nil when the id holds nothing yet, which is a snapshot of none rather than a
+		// failure: the record may still arrive, and this subscription reports it.
+		var snapshot []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus]
+		if src.Object != nil {
+			snapshot = append(snapshot, src.Object)
+		}
+		return pumpCacheWatch(ctx, out, snapshot, src.Changes, src.Err)
+	}), nil
 }
 
 func (a cachesAPI) WatchList(ctx context.Context) (*Stream[ClusterCacheWatchFrame], error) {
-	panic("not implemented")
+	src, err := a.s.cacheClient.WatchList(ctx, loadCacheOwner)
+	if err != nil {
+		return nil, fmt.Errorf("watch cluster caches: %w", err)
+	}
+
+	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterCacheWatchFrame) error {
+		return pumpCacheWatch(ctx, out, src.Objects, src.Changes, src.Err)
+	}), nil
+}
+
+// loadCacheOwner eager-loads the owner edge every cache frame carries as its join key;
+// beehive batches the lookup per change batch, so a watch does not become an N+1.
+var loadCacheOwner = beehive.WithLoads(beehive.LoadOwner())
+
+// pumpCacheWatch streams a snapshot, the bookmark closing it, then every change above
+// it. The two cache watches differ only in what the snapshot holds.
+//
+// beehive hands the snapshot complete as of a resource version, with Changes carrying
+// everything above it, so the bookmark lands between the two without holding any frame
+// back. srcErr is the upstream's terminal reason, read once its changes run out.
+func pumpCacheWatch(
+	ctx context.Context,
+	out chan<- ClusterCacheWatchFrame,
+	snapshot []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
+	changes <-chan beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus],
+	srcErr func() error,
+) error {
+	for _, obj := range snapshot {
+		frame, err := cacheFrame(DeltaFrameAdded, obj)
+		if err != nil {
+			return err
+		}
+		if !sendFrame(ctx, out, frame) {
+			return nil
+		}
+	}
+	if !sendFrame(ctx, out, ClusterCacheWatchFrame{Type: DeltaFrameBookmark}) {
+		return nil
+	}
+
+	for change := range changes {
+		if change.Type == beehive.Deleted {
+			if !sendFrame(ctx, out, cacheDeparture(change)) {
+				return nil
+			}
+			continue
+		}
+
+		// Only a removal arrives without an object.
+		if change.Object == nil {
+			continue
+		}
+		frame, err := cacheFrame(deltaFrameType(change), change.Object)
+		if err != nil {
+			return err
+		}
+		if !sendFrame(ctx, out, frame) {
+			return nil
+		}
+	}
+	return srcErr()
+}
+
+// cacheFrame projects one object into a frame of the given type.
+func cacheFrame(t DeltaFrameType, obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) (ClusterCacheWatchFrame, error) {
+	cache, err := toClusterCache(obj)
+	if err != nil {
+		return ClusterCacheWatchFrame{}, err
+	}
+	return ClusterCacheWatchFrame{Type: t, Cache: cache}, nil
+}
+
+// cacheDeparture builds the frame for a removal, which is the one frame built without
+// toClusterCache: the row is gone, so beehive loads no owner edge for it and reading one
+// would fail the whole stream. The join key is moot on a removal — a consumer keys the
+// record it is dropping by id.
+//
+// The id is what the frame must carry above all: beehive reports a removal whose final
+// row it could not decode with no object at all, nothing later in the log mentions a
+// deleted id, and a consumer drops a change with no entity rather than folding it — so a
+// dropped frame strands the record in its map for the life of the subscription.
+func cacheDeparture(change beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]) ClusterCacheWatchFrame {
+	cache := &ClusterCache{ID: ClusterCacheID(change.ID)}
+	if obj := change.Object; obj != nil {
+		cache.Spec = obj.Spec
+		cache.Conditions = obj.Conditions
+	}
+	return ClusterCacheWatchFrame{Type: DeltaFrameDeleted, Cache: cache}
 }
 
 func (a cachesAPI) ListByCluster(ctx context.Context, clusterID ClusterID) ([]*ClusterCache, error) {

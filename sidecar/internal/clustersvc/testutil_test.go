@@ -27,14 +27,15 @@ import (
 )
 
 // newTestBeehive returns a beehive over an in-memory store, closed on cleanup. The
-// bootstrap New does, minus the disk.
-func newTestBeehive(t *testing.T) *beehive.Beehive {
+// bootstrap New does, minus the disk. opts let a test shrink a cadence it would
+// otherwise have to outwait.
+func newTestBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 	t.Helper()
 	store, err := beehivesqlite.OpenMemory()
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 
-	bh, err := beehive.New(store)
+	bh, err := beehive.New(store, opts...)
 	require.NoError(t, err)
 	return bh
 }
@@ -59,9 +60,9 @@ func newTestDeps(t *testing.T) deps {
 // newRunningBeehive is newTestBeehive started, so a watch's tail is live. No
 // controller is registered: a reconcile writing status would put frames on a watch
 // that the test never asked for.
-func newRunningBeehive(t *testing.T) *beehive.Beehive {
+func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 	t.Helper()
-	bh := newTestBeehive(t)
+	bh := newTestBeehive(t, opts...)
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
@@ -72,7 +73,7 @@ func newRunningBeehive(t *testing.T) *beehive.Beehive {
 // newRunningDeps is the shared set over a running beehive, for the watch tests:
 // without one the tail is dead and no change is ever reported. Nothing reconciles, so
 // every frame is the test's own doing.
-func newRunningDeps(t *testing.T) deps {
+func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t), nil)
+	return newDeps(newRunningBeehive(t, opts...), nil)
 }

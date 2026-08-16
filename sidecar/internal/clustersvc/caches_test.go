@@ -17,10 +17,13 @@ package clustersvc
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // One cache per identity per cluster: the name is the creation/dedup key beehive's
@@ -127,6 +130,214 @@ func TestCachesListByClusterWithNone(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+// --- Caches() watches ---
+
+// watchCaches opens a cache list watch bounded by the test.
+func watchCaches(t *testing.T, d deps) *Stream[ClusterCacheWatchFrame] {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stream, err := serviceOver(t, d).Caches().WatchList(ctx)
+	require.NoError(t, err)
+	return stream
+}
+
+// awaitCacheBookmark drains the snapshot up to and including the bookmark.
+func awaitCacheBookmark(t *testing.T, stream *Stream[ClusterCacheWatchFrame]) {
+	t.Helper()
+	for {
+		if testutil.Recv(t, stream.Frames, "the bookmark").Type == DeltaFrameBookmark {
+			return
+		}
+	}
+}
+
+// The snapshot arrives as Added frames closed by exactly one Bookmark — the frame a
+// consumer renders its empty state on, and never before. Each frame carries the owner
+// edge the client joins onto its cluster.
+func TestCachesWatchListEmitsTheSnapshotThenABookmark(t *testing.T) {
+	d := newRunningDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-2")
+
+	stream := watchCaches(t, d)
+
+	// The snapshot's order is the store's, which no consumer relies on.
+	var uids []string
+	for range 2 {
+		f := testutil.Recv(t, stream.Frames, "a snapshot frame")
+		require.Equal(t, DeltaFrameAdded, f.Type)
+		require.NotNil(t, f.Cache)
+		assert.Equal(t, ObjectRef{ID: ObjectID(cluster.ID), Kind: "Cluster"}, f.Cache.Owner)
+		uids = append(uids, f.Cache.Spec.ServerUID)
+	}
+	assert.ElementsMatch(t, []string{"uid-1", "uid-2"}, uids)
+
+	bookmark := testutil.Recv(t, stream.Frames, "the bookmark closing the snapshot")
+	assert.Equal(t, DeltaFrameBookmark, bookmark.Type)
+	assert.Nil(t, bookmark.Cache, "the bookmark carries no entity")
+}
+
+// An empty collection is definitively empty rather than pending, so the bookmark
+// still lands: without it a populated table and an empty one look alike.
+func TestCachesWatchListBookmarksAnEmptyCollection(t *testing.T) {
+	stream := watchCaches(t, newRunningDeps(t))
+
+	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+}
+
+// A cache created after the snapshot — how a client learns of the identity a probe
+// just recorded.
+func TestCachesWatchListReportsACreate(t *testing.T) {
+	d := newRunningDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	stream := watchCaches(t, d)
+	awaitCacheBookmark(t, stream)
+
+	createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+
+	f := testutil.Recv(t, stream.Frames, "the create")
+	assert.Equal(t, DeltaFrameAdded, f.Type)
+	require.NotNil(t, f.Cache)
+	assert.Equal(t, "uid-1", f.Cache.Spec.ServerUID)
+	assert.Equal(t, ObjectRef{ID: ObjectID(cluster.ID), Kind: "Cluster"}, f.Cache.Owner)
+}
+
+// pumpCacheFrames runs the watch pump over a snapshot and a hand-driven change stream,
+// and collects what it produced. A departure spans two log entries whose grouping is
+// beehive's to decide, so driving the pump directly is the only way to pin both shapes.
+func pumpCacheFrames(t *testing.T, snapshot []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus], changes ...beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]) []ClusterCacheWatchFrame {
+	t.Helper()
+	src := make(chan beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus], len(changes))
+	for _, c := range changes {
+		src <- c
+	}
+	close(src)
+
+	out := make(chan ClusterCacheWatchFrame, len(snapshot)+len(changes)+1)
+	require.NoError(t, pumpCacheWatch(context.Background(), out, snapshot, src, func() error { return nil }))
+	close(out)
+
+	var frames []ClusterCacheWatchFrame
+	for f := range out {
+		frames = append(frames, f)
+	}
+	return frames
+}
+
+// A removal whose final row beehive could not decode carries no object, and nothing
+// later in the log mentions the id. The frame still has to name it: a consumer drops a
+// change with no entity, so the record would sit in its map until the subscription ends.
+func TestCachesWatchListReportsAnUndecodableDeparture(t *testing.T) {
+	frames := pumpCacheFrames(t, nil,
+		beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]{Type: beehive.Deleted, ID: 7, Object: nil},
+	)
+
+	require.Len(t, frames, 2)
+	assert.Equal(t, DeltaFrameDeleted, frames[1].Type)
+	require.NotNil(t, frames[1].Cache, "the bookmark is the only frame that carries no entity")
+	assert.Equal(t, ClusterCacheID(7), frames[1].Cache.ID)
+}
+
+// A removal reaches the subscriber carrying the row's final state and no owner: beehive
+// loads no edges for a collected row, and a frame that failed over that would kill the
+// stream and strand the record in the client's map. Driven through the store because
+// that load is beehive's to do — a hand-built object proves nothing about it.
+//
+// The GC interval is shrunk rather than waited out: a cache is client-only here (no
+// controller is registered), so its removal costs one sweep.
+func TestCachesWatchListReportsADeparture(t *testing.T) {
+	d := newRunningDeps(t, beehive.WithGCInterval(time.Millisecond))
+	cluster := createCluster(t, d.clusterClient, "prod")
+	obj := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	stream := watchCaches(t, d)
+	awaitCacheBookmark(t, stream)
+
+	require.NoError(t, d.cacheClient.Delete(context.Background(), obj.ID))
+
+	// The mark and the removal are separate frames unless beehive folds them into one
+	// Deleted, which it does when both land in a single tail page.
+	for {
+		f := testutil.Recv(t, stream.Frames, "the departure")
+		require.NotNil(t, f.Cache)
+		assert.Equal(t, ClusterCacheID(obj.ID), f.Cache.ID)
+		if f.Type == DeltaFrameDeleted {
+			assert.Equal(t, "uid-1", f.Cache.Spec.ServerUID, "the removal carries the row's final state")
+			assert.Equal(t, ObjectRef{}, f.Cache.Owner, "the owner edge went with the collected row")
+			return
+		}
+	}
+}
+
+// watchCache opens a single-record watch bounded by the test.
+func watchCache(t *testing.T, d deps, id ClusterCacheID) *Stream[ClusterCacheWatchFrame] {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stream, err := serviceOver(t, d).Caches().Watch(ctx, id)
+	require.NoError(t, err)
+	return stream
+}
+
+func TestCachesWatchEmitsTheRecordThenABookmark(t *testing.T) {
+	d := newRunningDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	obj := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+
+	stream := watchCache(t, d, ClusterCacheID(obj.ID))
+
+	first := testutil.Recv(t, stream.Frames, "the record")
+	assert.Equal(t, DeltaFrameAdded, first.Type)
+	require.NotNil(t, first.Cache)
+	assert.Equal(t, ClusterCacheID(obj.ID), first.Cache.ID)
+	assert.Equal(t, ObjectRef{ID: ObjectID(cluster.ID), Kind: "Cluster"}, first.Cache.Owner)
+
+	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+}
+
+// An id naming nothing is bookmark-only rather than an error: the record may not
+// exist yet, and the same subscription reports it arriving.
+func TestCachesWatchBookmarksAnUnknownID(t *testing.T) {
+	stream := watchCache(t, newRunningDeps(t), 404)
+
+	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+}
+
+func TestCachesWatchReportsChangesToItsRecord(t *testing.T) {
+	d := newRunningDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	obj := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	stream := watchCache(t, d, ClusterCacheID(obj.ID))
+	awaitCacheBookmark(t, stream)
+
+	require.NoError(t, d.cacheClient.Delete(context.Background(), obj.ID))
+
+	// The type is unpinned: GC can collect the row before this reads, and beehive folds
+	// the mark and the removal into one Deleted when both land in a single tail page.
+	f := testutil.Recv(t, stream.Frames, "the deletion")
+	require.NotNil(t, f.Cache)
+	assert.Equal(t, ClusterCacheID(obj.ID), f.Cache.ID)
+}
+
+// Cancellation is an ordinary teardown, so Frames closes with nothing to report: a
+// consumer reads Err on close, and a reason there is rendered as a dead watch.
+func TestCachesWatchListCancellationIsQuiet(t *testing.T) {
+	d := newRunningDeps(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	stream, err := serviceOver(t, d).Caches().WatchList(ctx)
+	require.NoError(t, err)
+	awaitCacheBookmark(t, stream)
+
+	cancel()
+
+	testutil.WaitClosed(t, stream.Frames, "the frames to close on cancellation")
+	assert.NoError(t, stream.Err())
 }
 
 // A placeholder until the kind is rebuilt: it must settle the object rather than
