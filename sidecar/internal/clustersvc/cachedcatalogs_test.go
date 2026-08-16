@@ -30,6 +30,68 @@ func TestClusterCachedCatalogName(t *testing.T) {
 	assert.Equal(t, ClusterCachedCatalogName(7), ClusterCachedCatalogName(7))
 }
 
+// --- ClusterCachedCatalog creation ---
+
+// catalogs returns every stored catalog, owner edge loaded — what a write is read
+// back through.
+func catalogs(t *testing.T, client beehive.Client[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]) []*beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus] {
+	t.Helper()
+	objs, err := client.List(context.Background(), beehive.LoadOwner())
+	require.NoError(t, err)
+	return objs
+}
+
+// A cache's catalog hangs off the cache, which is the join key its consumers have and
+// the edge beehive's GC cascades on.
+func TestEnsureClusterCachedCatalogCreatesOnePerCache(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+
+	require.NoError(t, ensureClusterCachedCatalog(context.Background(), d.catalogClient, ClusterCacheID(cache.ID), true))
+
+	objs := catalogs(t, d.catalogClient)
+	require.Len(t, objs, 1)
+	assert.Equal(t, ClusterCachedCatalogName(cache.ID), objs[0].Name)
+	assert.True(t, objs[0].Spec.Enabled, "the pause switch is relayed in at creation")
+
+	owner, ok, err := objs[0].Owner()
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, cache.ID, owner.ID)
+}
+
+// Every cache pass ensures the catalog, so the second call is the common case.
+func TestEnsureClusterCachedCatalogCreatesItOnlyOnce(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+
+	for range 2 {
+		require.NoError(t, ensureClusterCachedCatalog(context.Background(), d.catalogClient, ClusterCacheID(cache.ID), true))
+	}
+
+	assert.Len(t, catalogs(t, d.catalogClient), 1)
+}
+
+// The pause switch is relayed from above on every pass, so a flip has to reach the
+// stored spec — the anchor outlives the pause, and the children read Enabled off it.
+func TestEnsureClusterCachedCatalogRelaysAFlip(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	ctx := context.Background()
+	require.NoError(t, ensureClusterCachedCatalog(ctx, d.catalogClient, ClusterCacheID(cache.ID), true))
+	created := catalogs(t, d.catalogClient)[0]
+
+	require.NoError(t, ensureClusterCachedCatalog(ctx, d.catalogClient, ClusterCacheID(cache.ID), false))
+
+	objs := catalogs(t, d.catalogClient)
+	require.Len(t, objs, 1)
+	assert.Equal(t, created.ID, objs[0].ID, "the anchor survives the pause")
+	assert.False(t, objs[0].Spec.Enabled)
+}
+
 // A placeholder until the kind is rebuilt: it must settle the object rather than
 // requeue it, or beehive would spin on a kind nothing reconciles yet.
 func TestCachedCatalogControllerReconcilesToANoOp(t *testing.T) {

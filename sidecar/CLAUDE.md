@@ -54,13 +54,16 @@ panicking.
 Built so far, produced: the kubeconfig watcher, the importer that creates `Cluster` records,
 `clusterController.Reconcile` observing what the kubeconfig says about each one
 (`status.source.kubeconfig`), and that same pass creating the `ClusterCache` for the identity a
-probe recorded. Served: the whole `Clusters()` family except `WatchSchedule`, plus `Caches()`'
-point reads (`Get`/`List`/`ListByCluster`) and its unscoped watches (`Watch`/`WatchList`). That is
-enough for the kube-context picker, which reads
+probe recorded, and `clusterCacheController.Reconcile` creating the `ClusterCachedCatalog` beneath
+each cache, carrying the pause switch (`cacheSyncEnabled`: the cluster's toggles, and whether the
+cache is still the active identity). Served: the whole `Clusters()` family except `WatchSchedule`,
+plus `Caches()`' point reads (`Get`/`List`/`ListByCluster`) and its unscoped watches
+(`Watch`/`WatchList`). That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **No cache exists at runtime yet**: creation keys off `status.server.uid` and
-nothing writes it until the connection probe lands, so those reads answer empty. There is no
-connection manager, discovery pass, sync worker, or on-disk cache, and the three families below
-`ClusterCache` have no producer at all.
+nothing writes it until the connection probe lands, so those reads answer empty — and no catalog
+either, since one is only written for a cache. There is no connection manager, discovery pass, sync
+worker, or on-disk cache; `CachedCatalogs()` serves nothing yet, and the two families below it have
+no producer at all.
 
 **A read reports the store as it is, and never filters.** A record awaiting deletion is served like
 any other, carrying the tombstone (`deletionRequestedAt`) the consumer decides on — rendering it
@@ -81,8 +84,8 @@ goroutine and the beehive watch behind it.
 lifecycle — read `clusterController.machinery()` for what the Cluster kind owns, and the leaves each
 other controller grows land the same way. Otherwise the composition root accumulates every kind's
 detail.
-A controller built with machinery is constructed in `New` and passed to `registerControllers`, which
-returns all four in registration order; the rest are built at the call.
+`registerControllers` builds and registers all four, returning them in registration order plus the
+cluster's on its own, which is the one `New` keeps a reference to.
 
 **Shared dependencies travel in `deps`** — one beehive client per kind plus the process-wide services
 (`poke` today), built once by `newDeps(bh, pokeSvc)` and **embedded** by `service` and by each
@@ -105,11 +108,21 @@ quietly breaks the promise for everything above it. A kind with no machinery emb
 
 **A parent controller creates the child kinds it owns.** A cache's identity is discovered by the
 cluster's probe, and a controller only ever reconciles an object that already exists — so
-`clusterController.Reconcile` creates the `ClusterCache` (via `ensureClusterCache`), and the same
-shape will carry down the chain. Distinct from an importer, which decides which objects exist
-*including when there are none*. **The writes live in the child kind's file**, not the parent's: the
-name, spec and owner edge are that kind's vocabulary, and the parent supplies only the policy —
-when, and for which identity.
+`clusterController.Reconcile` creates the `ClusterCache` (via `ensureClusterCache`) and
+`clusterCacheController.Reconcile` the `ClusterCachedCatalog` beneath it (via
+`ensureClusterCachedCatalog`), and the same shape carries on down the chain. Distinct from an
+importer, which decides which objects exist *including when there are none*. **The writes live in the
+child kind's file**, not the parent's: the name, spec and owner edge are that kind's vocabulary, and
+the parent supplies only the policy — when, and with which switch. A teardown stops the chain: a
+pass whose object, or whose owner, is deletion-pending or already collected writes nothing, since the
+cascade is coming for the subtree either way.
+
+**A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
+the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache
+is still the active identity), so a flip on the cluster has to reach the cache — and owning a child
+wakes nothing. `clusterCacheController.Reconcile` therefore declares `AddDependency(cache, cluster)`;
+re-asserting an existing edge records nothing, so every later pass is free. A relay written without
+one sits stale until something unrelated wakes the child.
 
 **Importers create Cluster records; controllers reconcile them.** An importer runs *outside* beehive
 because it decides which objects exist — which means running when there are none, and a controller

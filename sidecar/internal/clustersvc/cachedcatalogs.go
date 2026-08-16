@@ -20,6 +20,8 @@ package clustersvc
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/amorey/beehive"
@@ -72,6 +74,41 @@ type ClusterCachedCatalog struct {
 type ClusterCachedCatalogWatchFrame struct {
 	Type    DeltaFrameType
 	Catalog *ClusterCachedCatalog
+}
+
+// ensureClusterCachedCatalog gives one cache its discovery anchor, owned by the cache
+// so beehive's GC cascades to it, and converges the pause switch onto it. Idempotent:
+// the name is the dedup key, and a spec already in the desired state writes nothing.
+//
+// Called by the cache's reconcile, which is where the pause switch is evaluated; the
+// writes live here so the kind's vocabulary stays in the kind's file.
+//
+// The GetByName probe keeps the steady state off the write path: GetOrCreate opens a
+// transaction even on the found branch, and the store is single-connection, so each one
+// serializes every other reader for its duration. GetOrCreate still closes the
+// create-path race.
+func ensureClusterCachedCatalog(ctx context.Context, client beehive.Client[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus], cacheID ClusterCacheID, enabled bool) error {
+	name := ClusterCachedCatalogName(beehive.ObjectID(cacheID))
+	spec := ClusterCachedCatalogSpec{Enabled: enabled}
+
+	obj, err := client.GetByName(ctx, name)
+	if err == nil {
+		if obj.Spec == spec {
+			return nil
+		}
+		if _, err := client.Update(ctx, obj.ID, spec); err != nil {
+			return fmt.Errorf("update cached catalog %s: %w", name, err)
+		}
+		return nil
+	}
+	if !errors.Is(err, beehive.ErrNotFound) {
+		return fmt.Errorf("look up cached catalog %s: %w", name, err)
+	}
+
+	if _, _, err := client.GetOrCreate(ctx, name, spec, beehive.WithOwner(beehive.ObjectID(cacheID))); err != nil {
+		return fmt.Errorf("create cached catalog %s: %w", name, err)
+	}
+	return nil
 }
 
 func (a cachedCatalogsAPI) Get(ctx context.Context, id ClusterCachedCatalogID) (*ClusterCachedCatalog, error) {

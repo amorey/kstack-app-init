@@ -249,12 +249,12 @@ func TestNewRejectsAnUnopenableStore(t *testing.T) {
 // caller rather than leaving a kind silently unreconciled.
 func TestRegisterControllersRejectsADuplicateKind(t *testing.T) {
 	bh := newTestBeehive(t)
-	ctrl := newClusterController(filepath.Join(t.TempDir(), "config"), deps{})
+	path := filepath.Join(t.TempDir(), "config")
 
-	_, err := registerControllers(bh, ctrl)
+	_, _, err := registerControllers(bh, deps{}, path)
 	require.NoError(t, err)
 
-	_, err = registerControllers(bh, ctrl)
+	_, _, err = registerControllers(bh, deps{}, path)
 	assert.Error(t, err)
 }
 

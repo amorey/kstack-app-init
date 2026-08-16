@@ -122,6 +122,14 @@ type ClusterCacheHealth struct {
 	LastLiveAt   *time.Time
 }
 
+// cacheSyncEnabled is the pause switch one cache relays into the subtree it owns: the
+// cluster's own toggles, and whether this cache still mirrors the identity the cluster
+// is probed at. Evaluated once here rather than re-derived per child, so a paused
+// subtree cannot disagree with itself.
+func cacheSyncEnabled(clusterObj *beehive.Object[ClusterSpec, ClusterStatus], cacheUID string) bool {
+	return clusterObj.Spec.Enabled && clusterObj.Spec.SyncEnabled && CacheIsActive(clusterObj, cacheUID)
+}
+
 // ensureClusterCache creates the mirror slot for one probed identity, owned by the
 // cluster so beehive's GC cascades to it. Idempotent: the name is the dedup key, and a
 // later pass has nothing to update — ServerUID *is* the identity.
@@ -335,15 +343,60 @@ func (a cachesAPI) Clear(ctx context.Context, id ClusterID) (*Cluster, error) {
 	panic("not implemented")
 }
 
-// clusterCacheController reconciles one cache: provision its mirror, gate it on the
-// cluster's connection and sync toggles, and own the catalog beneath it. A
-// placeholder that reconciles to a no-op.
-type clusterCacheController struct{ noBackground }
+// clusterCacheController reconciles one cache: today it creates the discovery anchor
+// beneath it, carrying the pause switch its cluster decides. Provisioning the mirror
+// itself is still to come.
+type clusterCacheController struct {
+	noBackground
+	// Every kind's client, not just this one's: a cache reads the cluster it hangs off
+	// and writes the catalog it owns.
+	deps
+}
 
 func (c *clusterCacheController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCacheStatus],
 	obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
 ) (beehive.Result, error) {
+	// A cache on its way out is about to be collected with the subtree it owns, and
+	// beehive collects it with no finalizer to clear.
+	if obj.DeletionRequestedAt != nil {
+		return beehive.Result{}, nil
+	}
+
+	// The reconcile load carries no edges, so the owner is a lookup rather than a field.
+	owner, ok, err := client.GetOwner(ctx, obj.ID)
+	if err != nil {
+		return beehive.Result{}, fmt.Errorf("read cluster cache %d owner: %w", obj.ID, err)
+	}
+	if !ok {
+		return beehive.Result{}, nil
+	}
+
+	clusterObj, err := c.clusterClient.Get(ctx, owner.ID)
+	// The cascade that takes this cache next may have collected the cluster already,
+	// which is a race rather than a failure worth retrying under backoff.
+	if errors.Is(err, beehive.ErrNotFound) {
+		return beehive.Result{}, nil
+	}
+	if err != nil {
+		return beehive.Result{}, fmt.Errorf("read cluster %d: %w", owner.ID, err)
+	}
+	// A cluster being torn down cascades here, so its subtree is not worth growing.
+	if clusterObj.DeletionRequestedAt != nil {
+		return beehive.Result{}, nil
+	}
+
+	// The switch below is the cluster's, and an owner edge wakes nothing: without this,
+	// a toggle flip would sit unrelayed until something else woke the cache. Beehive
+	// records nothing when the edge is already there, so every later pass is free.
+	if err := client.AddDependency(ctx, obj.ID, owner.ID); err != nil {
+		return beehive.Result{}, fmt.Errorf("depend cluster cache %d on its cluster: %w", obj.ID, err)
+	}
+
+	enabled := cacheSyncEnabled(clusterObj, obj.Spec.ServerUID)
+	if err := ensureClusterCachedCatalog(ctx, c.catalogClient, ClusterCacheID(obj.ID), enabled); err != nil {
+		return beehive.Result{}, err
+	}
 	return beehive.Result{}, nil
 }

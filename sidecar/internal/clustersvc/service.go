@@ -471,9 +471,7 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 	}
 
 	d := newDeps(bh, pokeSvc)
-	clusterCtrl := newClusterController(kubeconfigPath, d)
-
-	controllers, err := registerControllers(bh, clusterCtrl)
+	clusterCtrl, controllers, err := registerControllers(bh, d, kubeconfigPath)
 	if err != nil {
 		bhStore.Close()
 		return nil, fmt.Errorf("register cluster controllers: %w", err)
@@ -485,14 +483,17 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 	}, nil
 }
 
-// registerControllers registers each kind's controller, which lives in that kind's
-// file, and returns them in registration order. Together here rather than four calls
-// spread across those files: the options are the whole subsystem's concurrency and
-// retry budget, and it only reads as a budget in one place. A controller with
-// machinery of its own is built by the caller and passed in; the rest have nothing to
-// configure.
-func registerControllers(bh *beehive.Beehive, cluster *clusterController) ([]startCloser, error) {
-	cache := &clusterCacheController{}
+// registerControllers builds and registers each kind's controller, which lives in that
+// kind's file, and returns them in registration order. Together here rather than four
+// calls spread across those files: the options are the whole subsystem's concurrency
+// and retry budget, and it only reads as a budget in one place.
+//
+// The cluster's is returned on its own as well, since New holds it for its machinery.
+// kubeconfigPath is that controller's own configuration, which is why it is a parameter
+// while everything else the four need travels in deps.
+func registerControllers(bh *beehive.Beehive, d deps, kubeconfigPath string) (*clusterController, []startCloser, error) {
+	cluster := newClusterController(kubeconfigPath, d)
+	cache := &clusterCacheController{deps: d}
 	catalog := &clusterCachedCatalogController{}
 	resource := &clusterCachedResourceController{}
 
@@ -501,9 +502,9 @@ func registerControllers(bh *beehive.Beehive, cluster *clusterController) ([]sta
 	_, errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog)
 	_, errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource)
 	if err := errors.Join(errCluster, errCache, errCatalog, errResource); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return []startCloser{cluster, cache, catalog, resource}, nil
+	return cluster, []startCloser{cluster, cache, catalog, resource}, nil
 }
 
 // Start launches beehive (the controller harness + store subscription loop), then

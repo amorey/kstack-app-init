@@ -52,7 +52,7 @@ func newTestDeps(t *testing.T) deps {
 	bh := newTestBeehive(t)
 	d := newDeps(bh, nil)
 
-	_, err := registerControllers(bh, newClusterController(t.TempDir()+"/config", d))
+	_, _, err := registerControllers(bh, d, t.TempDir()+"/config")
 	require.NoError(t, err)
 	return d
 }
