@@ -19,10 +19,12 @@
 package clustersvc
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -109,11 +111,20 @@ type ClusterStatus struct {
 	LastConnectedAt *time.Time          `json:"lastConnectedAt,omitempty"`
 }
 
+// clusterStatus returns the stored status, or the zero value: beehive leaves Status
+// nil until a controller first writes one.
+func clusterStatus(obj *beehive.Object[ClusterSpec, ClusterStatus]) ClusterStatus {
+	if obj.Status == nil {
+		return ClusterStatus{}
+	}
+	return *obj.Status
+}
+
 // ClusterActiveUID returns the last-probed kube-system UID, or "" if never probed. It
 // selects which owned ClusterCache is active.
 func ClusterActiveUID(obj *beehive.Object[ClusterSpec, ClusterStatus]) string {
-	if obj.Status != nil && obj.Status.Server.UID != nil {
-		return *obj.Status.Server.UID
+	if uid := clusterStatus(obj).Server.UID; uid != nil {
+		return *uid
 	}
 	return ""
 }
@@ -153,20 +164,160 @@ type ClusterWatchFrame struct {
 	Cluster *Cluster
 }
 
+// toCluster builds the served record from the stored object. Conditions come off the
+// object rows rather than the status blob, which is where beehive keeps them.
+func toCluster(obj *beehive.Object[ClusterSpec, ClusterStatus]) *Cluster {
+	return &Cluster{
+		ID:                  ClusterID(obj.ID),
+		Generation:          obj.Generation,
+		CreatedAt:           obj.CreatedAt,
+		DeletionRequestedAt: obj.DeletionRequestedAt,
+		Spec:                obj.Spec,
+		Status:              clusterStatus(obj),
+		Conditions:          obj.Conditions,
+	}
+}
+
 func (a clustersAPI) Get(ctx context.Context, id ClusterID) (*Cluster, error) {
-	panic("not implemented")
+	obj, err := a.s.clusterClient.Get(ctx, beehive.ObjectID(id))
+	if err != nil {
+		// A caller holds ids from watch frames, so a record collected in between is an
+		// ordinary race rather than a bad request.
+		if errors.Is(err, beehive.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get cluster %d: %w", id, err)
+	}
+	return toCluster(obj), nil
+}
+
+// clusterSortKey is the label a list is ordered by: the display name the user set, or
+// the kube-context a view renders in its place. The beehive name is the last resort —
+// it is a reconcile key rather than anything a caller sees, so it orders only a record
+// whose source has no natural name yet.
+func clusterSortKey(obj *beehive.Object[ClusterSpec, ClusterStatus]) string {
+	if name := obj.Spec.Name; name != nil && *name != "" {
+		return *name
+	}
+	if src := obj.Spec.Source.Kubeconfig; src != nil {
+		return src.Context
+	}
+	return obj.Name
 }
 
 func (a clustersAPI) List(ctx context.Context) ([]*Cluster, error) {
-	panic("not implemented")
+	objs, err := a.s.clusterClient.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list clusters: %w", err)
+	}
+
+	// The schema promises name order; beehive lists in storage order.
+	slices.SortFunc(objs, func(a, b *beehive.Object[ClusterSpec, ClusterStatus]) int {
+		return cmp.Or(
+			cmp.Compare(clusterSortKey(a), clusterSortKey(b)),
+			// Display names are not unique, so a total order needs one that is.
+			cmp.Compare(a.Name, b.Name),
+		)
+	})
+
+	clusters := make([]*Cluster, 0, len(objs))
+	for _, obj := range objs {
+		clusters = append(clusters, toCluster(obj))
+	}
+	return clusters, nil
 }
 
 func (a clustersAPI) Watch(ctx context.Context, id ClusterID) (*Stream[ClusterWatchFrame], error) {
-	panic("not implemented")
+	src, err := a.s.clusterClient.Watch(ctx, beehive.ObjectID(id))
+	if err != nil {
+		return nil, fmt.Errorf("watch cluster %d: %w", id, err)
+	}
+
+	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterWatchFrame) error {
+		// Nil when the id holds nothing yet, which is a snapshot of none rather than a
+		// failure: the record may still arrive, and this subscription reports it.
+		var snapshot []*beehive.Object[ClusterSpec, ClusterStatus]
+		if src.Object != nil {
+			snapshot = append(snapshot, src.Object)
+		}
+		return pumpClusterWatch(ctx, out, snapshot, src.Changes, src.Err)
+	}), nil
 }
 
 func (a clustersAPI) WatchList(ctx context.Context) (*Stream[ClusterWatchFrame], error) {
-	panic("not implemented")
+	src, err := a.s.clusterClient.WatchList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("watch clusters: %w", err)
+	}
+
+	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterWatchFrame) error {
+		return pumpClusterWatch(ctx, out, src.Objects, src.Changes, src.Err)
+	}), nil
+}
+
+// pumpClusterWatch streams a snapshot, the bookmark closing it, then every change
+// above it. The two cluster watches differ only in what the snapshot holds.
+//
+// beehive hands the snapshot complete as of a resource version, with Changes carrying
+// everything above it, so the bookmark lands between the two without holding any frame
+// back. srcErr is the upstream's terminal reason, read once its changes run out.
+func pumpClusterWatch(
+	ctx context.Context,
+	out chan<- ClusterWatchFrame,
+	snapshot []*beehive.Object[ClusterSpec, ClusterStatus],
+	changes <-chan beehive.ObjectChange[ClusterSpec, ClusterStatus],
+	srcErr func() error,
+) error {
+	for _, obj := range snapshot {
+		if !sendFrame(ctx, out, ClusterWatchFrame{Type: DeltaFrameAdded, Cluster: toCluster(obj)}) {
+			return nil
+		}
+	}
+	if !sendFrame(ctx, out, ClusterWatchFrame{Type: DeltaFrameBookmark}) {
+		return nil
+	}
+
+	for change := range changes {
+		if change.Type == beehive.Deleted {
+			if !sendFrame(ctx, out, clusterDeparture(change)) {
+				return nil
+			}
+			continue
+		}
+
+		// Only a removal arrives without an object.
+		if change.Object == nil {
+			continue
+		}
+		frame := ClusterWatchFrame{Type: clusterFrameType(change), Cluster: toCluster(change.Object)}
+		if !sendFrame(ctx, out, frame) {
+			return nil
+		}
+	}
+	return srcErr()
+}
+
+// clusterDeparture builds the frame for a removal. beehive reports one whose final row
+// it could not decode with no object at all, and the frame still has to carry the id:
+// nothing later in the log mentions a deleted id, and a consumer drops a change with no
+// entity rather than folding it — so a dropped frame strands the record in its map for
+// the life of the subscription.
+func clusterDeparture(change beehive.ObjectChange[ClusterSpec, ClusterStatus]) ClusterWatchFrame {
+	cluster := &Cluster{ID: ClusterID(change.ID)}
+	if change.Object != nil {
+		cluster = toCluster(change.Object)
+	}
+	return ClusterWatchFrame{Type: DeltaFrameDeleted, Cluster: cluster}
+}
+
+// clusterFrameType classifies a change that is not a removal. The soft-delete mark is
+// one of them: the row is still there, wearing a tombstone the record carries through,
+// so it is a Modified like any other field moving.
+func clusterFrameType(change beehive.ObjectChange[ClusterSpec, ClusterStatus]) DeltaFrameType {
+	if change.Type == beehive.Added {
+		return DeltaFrameAdded
+	}
+	return DeltaFrameModified
 }
 
 func (a clustersAPI) WatchSchedule(ctx context.Context, id ClusterID) (<-chan Schedule, error) {
@@ -174,15 +325,66 @@ func (a clustersAPI) WatchSchedule(ctx context.Context, id ClusterID) (<-chan Sc
 }
 
 func (a clustersAPI) SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error) {
-	panic("not implemented")
+	return a.updateSpec(ctx, id, func(spec *ClusterSpec) { spec.Enabled = enabled })
 }
 
 func (a clustersAPI) SetSyncEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error) {
-	panic("not implemented")
+	return a.updateSpec(ctx, id, func(spec *ClusterSpec) { spec.SyncEnabled = enabled })
 }
 
+// updateSpec reads the spec, applies edit, and writes it back. Read-modify-write
+// because beehive takes the whole spec: a setter that built one from its argument
+// alone would clear every field it does not name.
+//
+// Serialized because that read and write are not atomic and beehive's Update has no
+// compare-and-swap: two setters editing different fields would each write a whole spec
+// built from the same read, and the later write would silently restore what the
+// earlier one changed. One lock for the kind is enough — the sidecar is beehive's sole
+// writer, and these are user-driven.
+func (a clustersAPI) updateSpec(ctx context.Context, id ClusterID, edit func(*ClusterSpec)) (*Cluster, error) {
+	a.s.clusterSpecMu.Lock()
+	defer a.s.clusterSpecMu.Unlock()
+
+	obj, err := a.s.clusterClient.Get(ctx, beehive.ObjectID(id))
+	if err != nil {
+		return nil, wrapClusterErr("get", id, err)
+	}
+	spec := obj.Spec
+	edit(&spec)
+	// The record can be collected between the read and the write, so this reports a
+	// missing record too.
+	updated, err := a.s.clusterClient.Update(ctx, beehive.ObjectID(id), spec)
+	if err != nil {
+		return nil, wrapClusterErr("update", id, err)
+	}
+	return toCluster(updated), nil
+}
+
+// wrapClusterErr annotates a store error, mapping beehive's missing-record sentinel
+// onto the boundary's own: a caller matches clustersvc.ErrNotFound without having to
+// know which store is underneath.
+func wrapClusterErr(verb string, id ClusterID, err error) error {
+	if errors.Is(err, beehive.ErrNotFound) {
+		return fmt.Errorf("%s cluster %d: %w", verb, id, ErrNotFound)
+	}
+	return fmt.Errorf("%s cluster %d: %w", verb, id, err)
+}
+
+// Delete requests deletion; beehive's GC collects the record and cascades to what it
+// owns. A record already gone is the outcome the caller asked for, so a missing one is
+// not an error. A context still present in the kubeconfig is re-imported under a fresh
+// id — see TODO.md for the trigger that has to reach the importer for that to be prompt.
 func (a clustersAPI) Delete(ctx context.Context, id ClusterID) error {
-	panic("not implemented")
+	if err := a.s.clusterClient.Delete(ctx, beehive.ObjectID(id)); err != nil && !errors.Is(err, beehive.ErrNotFound) {
+		return fmt.Errorf("delete cluster %d: %w", id, err)
+	}
+
+	// Deleting a record whose context is still in the file changes nothing the importer
+	// watches, so without this the context is not re-imported until the user next edits
+	// the kubeconfig. The name is held until the row drains, so this pass fails and the
+	// importer's retry ladder covers the tail.
+	a.s.clusterCtrl.resyncImports()
+	return nil
 }
 
 // kubeconfigUnreadRequeue paces a reconcile that arrived before the watcher's first
@@ -227,6 +429,9 @@ func (c *clusterController) machinery() []startCloser {
 	return []startCloser{c.kubeconfigWatcher, c.kubeconfigImporter}
 }
 
+// resyncImports asks the importer for a pass; see kubeconfigImporter.Resync.
+func (c *clusterController) resyncImports() { c.kubeconfigImporter.Resync() }
+
 func (c *clusterController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterStatus],
@@ -248,10 +453,7 @@ func (c *clusterController) Reconcile(
 		return beehive.Result{RequeueAfter: kubeconfigUnreadRequeue}, nil
 	}
 
-	status := ClusterStatus{}
-	if obj.Status != nil {
-		status = *obj.Status
-	}
+	status := clusterStatus(obj)
 	prev := status.Source.Kubeconfig
 	status.Source.Kubeconfig = observeKubeconfig(cfg, obj.Spec.Source.Kubeconfig, prev)
 
@@ -372,6 +574,11 @@ type kubeconfigImporter struct {
 	retryBase time.Duration
 	retryMax  time.Duration
 
+	// resync requests a pass with no new snapshot behind it. Buffered by one and sent
+	// without blocking: the request is only ever "run again", so a second while one is
+	// pending adds nothing.
+	resync chan struct{}
+
 	wg sync.WaitGroup
 }
 
@@ -381,6 +588,7 @@ func newKubeconfigImporter(cfgSource kubeconfigSource, clusterClient beehive.Cli
 		clusterClient: clusterClient,
 		retryBase:     importRetryBase,
 		retryMax:      importRetryMax,
+		resync:        make(chan struct{}, 1),
 	}
 	im.sync = im.syncClusterSet
 	return im
@@ -404,6 +612,16 @@ func (im *kubeconfigImporter) Start(context.Context) (func(context.Context) erro
 		stopLoop()
 		return drain.WithContext(ctx, im.wg.Wait)
 	}, nil
+}
+
+// Resync asks for a pass against the last snapshot. The loop's only other trigger is a
+// kubeconfig change, so whatever frees a context out of band — a Cluster deleted while
+// its context is still in the file — has to say so, or nothing re-imports it.
+func (im *kubeconfigImporter) Resync() {
+	select {
+	case im.resync <- struct{}{}:
+	default:
+	}
 }
 
 // Close is a no-op: the loop releases its subscription as it exits.
@@ -456,6 +674,11 @@ func (im *kubeconfigImporter) run(ctx context.Context, sub kubeconfig.Subscripti
 		case <-retry.C:
 			// last is always set here: the timer is armed only inside attempt.
 			attempt()
+		case <-im.resync:
+			// Nothing to run against before the first snapshot, which is on its way.
+			if last != nil {
+				attempt()
+			}
 		}
 	}
 }

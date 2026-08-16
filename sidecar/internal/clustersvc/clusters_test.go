@@ -15,8 +15,10 @@
 package clustersvc
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,6 +257,27 @@ func TestImporterTreatsShutdownAsQuiet(t *testing.T) {
 		"stop to return with an import in flight")
 }
 
+// A resync runs the pass again against the snapshot already in hand, which is what
+// reaches a context freed with no kubeconfig edit behind it.
+func TestImporterResyncRunsAPass(t *testing.T) {
+	src := newFakeKubeconfigSource(cfgWith("prod"))
+	im, _, seen := startImporter(t, src)
+	seen.Await(t, "startup reconcile")
+
+	im.Resync()
+
+	assert.Contains(t, seen.Await(t, "the resync pass").Contexts, "prod")
+}
+
+// A resync before the first snapshot has nothing to run against, and the snapshot is
+// on its way regardless.
+func TestImporterResyncBeforeTheFirstSnapshotIsQuiet(t *testing.T) {
+	im, _ := newTestImporter(newFakeKubeconfigSource(nil), func(context.Context, *api.Config) error { return nil })
+	im.Resync()
+
+	startTestImporter(t, im)
+}
+
 // The watcher closing is an ordinary shutdown: the loop ends rather than spinning on
 // a closed channel.
 func TestImporterStopsWhenTheSourceCloses(t *testing.T) {
@@ -291,6 +314,14 @@ func TestNextRetryDelay(t *testing.T) {
 }
 
 // --- syncClusterSet ---
+
+// newRunningClusterClient is a Cluster client over a running beehive, for the watch
+// tests: without one the tail is dead and no change is ever reported. Nothing
+// reconciles — no controller is registered — so every frame is the test's own doing.
+func newRunningClusterClient(t *testing.T) beehive.Client[ClusterSpec, ClusterStatus] {
+	t.Helper()
+	return beehive.NewClient[ClusterSpec, ClusterStatus](newRunningBeehive(t), ClusterGroupKind)
+}
 
 // newTestClusterClient returns a Cluster client over a test beehive. The controllers
 // are registered so a requeue reaches a real reconciler, but beehive is never run, so
@@ -740,6 +771,533 @@ func TestReconcileSkipsADeletingRecord(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Nil(t, client.updated)
+}
+
+// --- toCluster ---
+
+func TestToCluster(t *testing.T) {
+	now := time.Now()
+	uid := "uid-1"
+	obj := &beehive.Object[ClusterSpec, ClusterStatus]{
+		ID:         7,
+		Generation: 3,
+		CreatedAt:  now,
+		Spec:       ClusterSpec{Enabled: true, SyncEnabled: true, Source: ClusterSpecSource{Kubeconfig: kubeconfigSrc("prod")}},
+		Status:     &ClusterStatus{Server: ClusterServer{UID: &uid}},
+		Conditions: []Condition{LiveCondition(ConditionConnected, beehive.ConditionTrue, "Reachable", "")},
+	}
+
+	c := toCluster(obj)
+
+	assert.Equal(t, ClusterID(7), c.ID)
+	assert.Equal(t, int64(3), c.Generation)
+	assert.Equal(t, now, c.CreatedAt)
+	assert.Nil(t, c.DeletionRequestedAt)
+	assert.True(t, c.Spec.Enabled)
+	assert.Equal(t, "prod", c.Spec.Source.Kubeconfig.Context)
+	require.NotNil(t, c.Status.Server.UID)
+	assert.Equal(t, uid, *c.Status.Server.UID)
+	require.Len(t, c.Conditions, 1, "conditions are object rows, not part of the status blob")
+	assert.Equal(t, string(ConditionConnected), c.Conditions[0].Type)
+}
+
+// beehive leaves Status nil until a controller first writes it, so every record
+// built before that would carry a nil deref rather than a zero status.
+func TestToClusterWithNoStatus(t *testing.T) {
+	c := toCluster(&beehive.Object[ClusterSpec, ClusterStatus]{ID: 7})
+
+	assert.Equal(t, ClusterStatus{}, c.Status)
+}
+
+// The tombstone is surfaced as-is: a consumer that renders a record on its way out
+// has no other way to know.
+func TestToClusterCarriesTheDeletionTombstone(t *testing.T) {
+	now := time.Now()
+	obj := &beehive.Object[ClusterSpec, ClusterStatus]{ID: 7, DeletionRequestedAt: &now}
+
+	c := toCluster(obj)
+
+	require.NotNil(t, c.DeletionRequestedAt)
+	assert.Equal(t, now, *c.DeletionRequestedAt)
+}
+
+// --- Clusters() reads ---
+
+// serviceOver returns a service reading through client, with no background work: these
+// tests drive the store directly. The controller is real but unstarted, because Delete
+// reaches its importer.
+func serviceOver(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatus]) *service {
+	t.Helper()
+	return &service{
+		clusterClient: client,
+		clusterCtrl:   newClusterController(t.TempDir()+"/config", nil, client),
+	}
+}
+
+// createCluster creates a kubeconfig-sourced record for contextName.
+func createCluster(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatus], contextName string) *beehive.Object[ClusterSpec, ClusterStatus] {
+	t.Helper()
+	obj, err := client.Create(context.Background(), KubeconfigName(contextName), ClusterSpec{
+		Enabled: true,
+		Source:  ClusterSpecSource{Kubeconfig: kubeconfigSrc(contextName)},
+	})
+	require.NoError(t, err)
+	return obj
+}
+
+func TestClustersGet(t *testing.T) {
+	client := newTestClusterClient(t)
+	obj := createCluster(t, client, "prod")
+
+	got, err := serviceOver(t, client).Clusters().Get(context.Background(), ClusterID(obj.ID))
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, ClusterID(obj.ID), got.ID)
+	assert.Equal(t, "prod", got.Spec.Source.Kubeconfig.Context)
+}
+
+// An unknown id is not an error: the caller holds an id from a watch frame, and a
+// record collected in between is an ordinary race rather than a bad request.
+func TestClustersGetUnknownIsNotAnError(t *testing.T) {
+	got, err := serviceOver(t, newTestClusterClient(t)).Clusters().Get(context.Background(), 404)
+
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+// A record on its way out is served like any other, wearing its tombstone: only the
+// consumer knows whether to render it or hide it.
+func TestClustersGetCarriesADeletingRecord(t *testing.T) {
+	client := newTestClusterClient(t)
+	obj := createCluster(t, client, "prod")
+	require.NoError(t, client.Delete(context.Background(), obj.ID))
+
+	got, err := serviceOver(t, client).Clusters().Get(context.Background(), ClusterID(obj.ID))
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.NotNil(t, got.DeletionRequestedAt, "the tombstone is what the consumer decides on")
+}
+
+func TestClustersList(t *testing.T) {
+	client := newTestClusterClient(t)
+	createCluster(t, client, "prod")
+	createCluster(t, client, "staging")
+
+	got, err := serviceOver(t, client).Clusters().List(context.Background())
+
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	contexts := []string{got[0].Spec.Source.Kubeconfig.Context, got[1].Spec.Source.Kubeconfig.Context}
+	assert.ElementsMatch(t, []string{"prod", "staging"}, contexts)
+}
+
+// The collection a reader sees matches what Get would answer for each id.
+func TestClustersListCarriesADeletingRecord(t *testing.T) {
+	client := newTestClusterClient(t)
+	createCluster(t, client, "prod")
+	deleting := createCluster(t, client, "staging")
+	require.NoError(t, client.Delete(context.Background(), deleting.ID))
+
+	got, err := serviceOver(t, client).Clusters().List(context.Background())
+
+	require.NoError(t, err)
+	assert.Len(t, got, 2, "the store as it is, tombstones and all")
+}
+
+// sortKeysOf returns each listed cluster's display label, in the order served.
+func sortKeysOf(t *testing.T, svc *service) []string {
+	t.Helper()
+	got, err := svc.Clusters().List(context.Background())
+	require.NoError(t, err)
+
+	keys := make([]string, len(got))
+	for i, c := range got {
+		keys[i] = cmp.Or(deref(c.Spec.Name), c.Spec.Source.Kubeconfig.Context)
+	}
+	return keys
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// The schema promises name order, and beehive lists in storage order — so a caller
+// paging or diffing the list would otherwise see it shuffle between reads.
+func TestClustersListIsSortedByName(t *testing.T) {
+	client := newTestClusterClient(t)
+	for _, name := range []string{"staging", "alpha", "prod"} {
+		createCluster(t, client, name)
+	}
+
+	assert.Equal(t, []string{"alpha", "prod", "staging"}, sortKeysOf(t, serviceOver(t, client)))
+}
+
+// The order is over what a view renders, so renaming a cluster moves it — the
+// kube-context it happens to track is not what a reader is scanning.
+func TestClustersListSortsByDisplayNameWhenSet(t *testing.T) {
+	client := newTestClusterClient(t)
+	svc := serviceOver(t, client)
+	for _, name := range []string{"alpha", "prod"} {
+		createCluster(t, client, name)
+	}
+	// "alpha" renamed to sort last, against its context's own order.
+	obj, err := client.GetByName(context.Background(), KubeconfigName("alpha"))
+	require.NoError(t, err)
+	renamed := "zulu"
+	obj.Spec.Name = &renamed
+	_, err = client.Update(context.Background(), obj.ID, obj.Spec)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"prod", "zulu"}, sortKeysOf(t, svc))
+}
+
+func TestClustersListIsEmptyWithNoRecords(t *testing.T) {
+	got, err := serviceOver(t, newTestClusterClient(t)).Clusters().List(context.Background())
+
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+// watchClusters opens a cluster list watch bounded by the test.
+func watchClusters(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatus]) *Stream[ClusterWatchFrame] {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stream, err := serviceOver(t, client).Clusters().WatchList(ctx)
+	require.NoError(t, err)
+	return stream
+}
+
+// The snapshot arrives as Added frames closed by exactly one Bookmark — the frame a
+// consumer renders its empty state on, and never before.
+func TestClustersWatchListEmitsTheSnapshotThenABookmark(t *testing.T) {
+	client := newRunningClusterClient(t)
+	createCluster(t, client, "prod")
+	createCluster(t, client, "staging")
+
+	stream := watchClusters(t, client)
+
+	// The snapshot's order is the store's, which no consumer relies on.
+	var contexts []string
+	for range 2 {
+		f := testutil.Recv(t, stream.Frames, "a snapshot frame")
+		require.Equal(t, DeltaFrameAdded, f.Type)
+		require.NotNil(t, f.Cluster)
+		contexts = append(contexts, f.Cluster.Spec.Source.Kubeconfig.Context)
+	}
+	assert.ElementsMatch(t, []string{"prod", "staging"}, contexts)
+
+	bookmark := testutil.Recv(t, stream.Frames, "the bookmark closing the snapshot")
+	assert.Equal(t, DeltaFrameBookmark, bookmark.Type)
+	assert.Nil(t, bookmark.Cluster, "the bookmark carries no entity")
+}
+
+// An empty collection is definitively empty rather than pending, so the bookmark
+// still lands: without it a populated table and an empty one look alike.
+func TestClustersWatchListBookmarksAnEmptyCollection(t *testing.T) {
+	stream := watchClusters(t, newRunningClusterClient(t))
+
+	first := testutil.Recv(t, stream.Frames, "the bookmark")
+	assert.Equal(t, DeltaFrameBookmark, first.Type)
+}
+
+// awaitBookmark drains the snapshot up to and including the bookmark.
+func awaitBookmark(t *testing.T, stream *Stream[ClusterWatchFrame]) {
+	t.Helper()
+	for {
+		if testutil.Recv(t, stream.Frames, "the bookmark").Type == DeltaFrameBookmark {
+			return
+		}
+	}
+}
+
+func TestClustersWatchListReportsACreate(t *testing.T) {
+	client := newRunningClusterClient(t)
+	stream := watchClusters(t, client)
+	awaitBookmark(t, stream)
+
+	createCluster(t, client, "prod")
+
+	f := testutil.Recv(t, stream.Frames, "the create")
+	assert.Equal(t, DeltaFrameAdded, f.Type)
+	require.NotNil(t, f.Cluster)
+	assert.Equal(t, "prod", f.Cluster.Spec.Source.Kubeconfig.Context)
+}
+
+func TestClustersWatchListReportsAnUpdate(t *testing.T) {
+	client := newRunningClusterClient(t)
+	obj := createCluster(t, client, "prod")
+	stream := watchClusters(t, client)
+	awaitBookmark(t, stream)
+
+	_, err := client.Update(context.Background(), obj.ID, ClusterSpec{
+		Enabled: false,
+		Source:  ClusterSpecSource{Kubeconfig: kubeconfigSrc("prod")},
+	})
+	require.NoError(t, err)
+
+	f := testutil.Recv(t, stream.Frames, "the update")
+	assert.Equal(t, DeltaFrameModified, f.Type)
+	require.NotNil(t, f.Cluster)
+	assert.False(t, f.Cluster.Spec.Enabled)
+}
+
+// The soft-delete mark reaches a subscriber carrying the tombstone, which is what a
+// consumer renders or hides on. The frame TYPE is not pinned here: GC can collect the
+// row before this reads, and beehive folds the mark and the removal into one Deleted
+// when both land in a single tail page. TestClustersWatchListReportsTheMarkAsModified
+// pins the type over a change stream nothing else can reorder.
+func TestClustersWatchListReportsADeletionMark(t *testing.T) {
+	client := newRunningClusterClient(t)
+	obj := createCluster(t, client, "prod")
+	stream := watchClusters(t, client)
+	awaitBookmark(t, stream)
+
+	require.NoError(t, client.Delete(context.Background(), obj.ID))
+
+	f := testutil.Recv(t, stream.Frames, "the deletion mark")
+	require.NotNil(t, f.Cluster)
+	assert.Equal(t, ClusterID(obj.ID), f.Cluster.ID)
+	assert.NotNil(t, f.Cluster.DeletionRequestedAt)
+}
+
+// pumpFrames runs the watch pump over a snapshot and a hand-driven change stream, and
+// collects what it produced. A departure spans two log entries whose grouping is beehive's to decide, so
+// driving the pump directly is the only way to pin both shapes.
+func pumpFrames(t *testing.T, snapshot []*beehive.Object[ClusterSpec, ClusterStatus], changes ...beehive.ObjectChange[ClusterSpec, ClusterStatus]) []ClusterWatchFrame {
+	t.Helper()
+	src := make(chan beehive.ObjectChange[ClusterSpec, ClusterStatus], len(changes))
+	for _, c := range changes {
+		src <- c
+	}
+	close(src)
+
+	out := make(chan ClusterWatchFrame, len(snapshot)+len(changes)+1)
+	require.NoError(t, pumpClusterWatch(context.Background(), out, snapshot, src, func() error { return nil }))
+	close(out)
+
+	var frames []ClusterWatchFrame
+	for f := range out {
+		frames = append(frames, f)
+	}
+	return frames
+}
+
+// deletingCluster is a tombstoned row: what both halves of a departure carry.
+func deletingCluster(id beehive.ObjectID) *beehive.Object[ClusterSpec, ClusterStatus] {
+	now := time.Now()
+	return &beehive.Object[ClusterSpec, ClusterStatus]{ID: id, DeletionRequestedAt: &now}
+}
+
+// A removal whose final row beehive could not decode carries no object, and nothing
+// later in the log mentions the id. The frame still has to name it: a consumer drops a
+// change with no entity, so the record would sit in its map until the subscription ends.
+func TestClustersWatchListReportsAnUndecodableDeparture(t *testing.T) {
+	frames := pumpFrames(t, nil,
+		beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Deleted, ID: 7, Object: nil},
+	)
+
+	require.Len(t, frames, 2)
+	assert.Equal(t, DeltaFrameDeleted, frames[1].Type)
+	require.NotNil(t, frames[1].Cluster, "the bookmark is the only frame that carries no entity")
+	assert.Equal(t, ClusterID(7), frames[1].Cluster.ID)
+}
+
+// The tombstone mark is an ordinary field change on a row that is still there, so it
+// arrives as Modified; Deleted is the row's removal alone.
+func TestClustersWatchListReportsTheMarkAsModified(t *testing.T) {
+	obj := deletingCluster(7)
+
+	frames := pumpFrames(t, nil,
+		beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Modified, ID: 7, Object: obj},
+		beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Deleted, ID: 7, Object: obj},
+	)
+
+	require.Len(t, frames, 3)
+	assert.Equal(t, DeltaFrameModified, frames[1].Type)
+	require.NotNil(t, frames[1].Cluster)
+	assert.NotNil(t, frames[1].Cluster.DeletionRequestedAt, "the mark the consumer decides on")
+	assert.Equal(t, DeltaFrameDeleted, frames[2].Type)
+}
+
+// A record already tombstoned when the snapshot is taken is in it, like any other row.
+func TestClustersWatchListSnapshotCarriesADeletingRecord(t *testing.T) {
+	frames := pumpFrames(t, []*beehive.Object[ClusterSpec, ClusterStatus]{deletingCluster(7)})
+
+	require.Len(t, frames, 2)
+	assert.Equal(t, DeltaFrameAdded, frames[0].Type)
+	require.NotNil(t, frames[0].Cluster)
+	assert.NotNil(t, frames[0].Cluster.DeletionRequestedAt)
+	assert.Equal(t, DeltaFrameBookmark, frames[1].Type)
+}
+
+// Cancellation is an ordinary teardown, so Frames closes with nothing to report: a
+// consumer reads Err on close, and a reason there is rendered as a dead watch.
+func TestClustersWatchListCancellationIsQuiet(t *testing.T) {
+	client := newRunningClusterClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	stream, err := serviceOver(t, client).Clusters().WatchList(ctx)
+	require.NoError(t, err)
+	awaitBookmark(t, stream)
+
+	cancel()
+
+	testutil.WaitClosed(t, stream.Frames, "the frames to close on cancellation")
+	assert.NoError(t, stream.Err())
+}
+
+// watchCluster opens a single-record watch bounded by the test.
+func watchCluster(t *testing.T, client beehive.Client[ClusterSpec, ClusterStatus], id ClusterID) *Stream[ClusterWatchFrame] {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stream, err := serviceOver(t, client).Clusters().Watch(ctx, id)
+	require.NoError(t, err)
+	return stream
+}
+
+func TestClustersWatchEmitsTheRecordThenABookmark(t *testing.T) {
+	client := newRunningClusterClient(t)
+	obj := createCluster(t, client, "prod")
+
+	stream := watchCluster(t, client, ClusterID(obj.ID))
+
+	first := testutil.Recv(t, stream.Frames, "the record")
+	assert.Equal(t, DeltaFrameAdded, first.Type)
+	require.NotNil(t, first.Cluster)
+	assert.Equal(t, ClusterID(obj.ID), first.Cluster.ID)
+
+	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+}
+
+// An id naming nothing is bookmark-only rather than an error: the record may not
+// exist yet, and the same subscription reports it arriving.
+func TestClustersWatchBookmarksAnUnknownID(t *testing.T) {
+	stream := watchCluster(t, newRunningClusterClient(t), 404)
+
+	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+}
+
+func TestClustersWatchReportsChangesToItsRecord(t *testing.T) {
+	client := newRunningClusterClient(t)
+	obj := createCluster(t, client, "prod")
+	stream := watchCluster(t, client, ClusterID(obj.ID))
+	awaitBookmark(t, stream)
+
+	require.NoError(t, client.Delete(context.Background(), obj.ID))
+
+	// Type unpinned for the same reason as the list watch: GC may collect the row
+	// first, and beehive folds the pair into one Deleted when it does.
+	f := testutil.Recv(t, stream.Frames, "the deletion mark")
+	require.NotNil(t, f.Cluster)
+	assert.Equal(t, ClusterID(obj.ID), f.Cluster.ID)
+	assert.NotNil(t, f.Cluster.DeletionRequestedAt)
+}
+
+func TestClustersSetEnabled(t *testing.T) {
+	client := newTestClusterClient(t)
+	obj := createCluster(t, client, "prod")
+
+	got, err := serviceOver(t, client).Clusters().SetEnabled(context.Background(), ClusterID(obj.ID), false)
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.False(t, got.Spec.Enabled)
+	assert.Equal(t, "prod", got.Spec.Source.Kubeconfig.Context, "the rest of the spec is untouched")
+}
+
+func TestClustersSetSyncEnabled(t *testing.T) {
+	client := newTestClusterClient(t)
+	obj := createCluster(t, client, "prod")
+
+	got, err := serviceOver(t, client).Clusters().SetSyncEnabled(context.Background(), ClusterID(obj.ID), true)
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.True(t, got.Spec.SyncEnabled)
+	assert.True(t, got.Spec.Enabled, "the other axis is untouched")
+}
+
+// The two setters read, edit one field, and write the whole spec, so without
+// serialization the later write restores what the earlier one changed.
+func TestClustersSettersDoNotLoseConcurrentUpdates(t *testing.T) {
+	client := newTestClusterClient(t)
+	obj := createCluster(t, client, "prod")
+	clusters := serviceOver(t, client).Clusters()
+	id := ClusterID(obj.ID)
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, err := clusters.SetEnabled(context.Background(), id, false)
+		assert.NoError(t, err)
+	})
+	wg.Go(func() {
+		_, err := clusters.SetSyncEnabled(context.Background(), id, true)
+		assert.NoError(t, err)
+	})
+	wg.Wait()
+
+	got, err := clusters.Get(context.Background(), id)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.False(t, got.Spec.Enabled, "SetEnabled's write survived")
+	assert.True(t, got.Spec.SyncEnabled, "SetSyncEnabled's write survived")
+}
+
+// A mutation against a record that is gone is the caller's to see: unlike a read, it
+// asked for a change that did not happen. It reports the boundary's own sentinel —
+// graph matches that one, and beehive is not supposed to be visible through here.
+func TestClustersSetEnabledReportsAnUnknownID(t *testing.T) {
+	_, err := serviceOver(t, newTestClusterClient(t)).Clusters().SetEnabled(context.Background(), 404, false)
+
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.NotErrorIs(t, err, beehive.ErrNotFound, "the store's sentinel must not leak")
+}
+
+func TestClustersDelete(t *testing.T) {
+	client := newTestClusterClient(t)
+	obj := createCluster(t, client, "prod")
+	clusters := serviceOver(t, client).Clusters()
+
+	require.NoError(t, clusters.Delete(context.Background(), ClusterID(obj.ID)))
+
+	got, err := clusters.Get(context.Background(), ClusterID(obj.ID))
+	require.NoError(t, err)
+	require.NotNil(t, got, "the row is still there until beehive collects it")
+	assert.NotNil(t, got.DeletionRequestedAt, "wearing the tombstone Delete asked for")
+}
+
+// Deleting a record whose kube-context is still in the file frees that context, and
+// nothing in the kubeconfig changed — so without this the importer, whose only other
+// trigger is a snapshot, would not re-import until the user next edits the file.
+func TestClustersDeleteAsksTheImporterForAPass(t *testing.T) {
+	client := newTestClusterClient(t)
+	svc := serviceOver(t, client)
+	obj := createCluster(t, client, "prod")
+
+	require.NoError(t, svc.Clusters().Delete(context.Background(), ClusterID(obj.ID)))
+
+	assert.Len(t, svc.clusterCtrl.kubeconfigImporter.resync, 1, "a pass is pending")
+}
+
+// Deleting a record that is already gone is the outcome the caller asked for, and
+// beehive answers the same way whether the id was ever alive.
+func TestClustersDeleteIsIdempotent(t *testing.T) {
+	client := newTestClusterClient(t)
+	obj := createCluster(t, client, "prod")
+	clusters := serviceOver(t, client).Clusters()
+	require.NoError(t, clusters.Delete(context.Background(), ClusterID(obj.ID)))
+
+	assert.NoError(t, clusters.Delete(context.Background(), ClusterID(obj.ID)), "a second delete")
+	assert.NoError(t, clusters.Delete(context.Background(), 404), "an id that never existed")
 }
 
 // --- clusterController ---

@@ -297,14 +297,7 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 	var id ObjectID = 1
 
 	calls := map[string]func(){
-		"Clusters().Get":                 func() { svc.Clusters().Get(ctx, id) },
-		"Clusters().List":                func() { svc.Clusters().List(ctx) },
-		"Clusters().Watch":               func() { svc.Clusters().Watch(ctx, id) },
-		"Clusters().WatchList":           func() { svc.Clusters().WatchList(ctx) },
 		"Clusters().WatchSchedule":       func() { svc.Clusters().WatchSchedule(ctx, id) },
-		"Clusters().SetEnabled":          func() { svc.Clusters().SetEnabled(ctx, id, true) },
-		"Clusters().SetSyncEnabled":      func() { svc.Clusters().SetSyncEnabled(ctx, id, true) },
-		"Clusters().Delete":              func() { svc.Clusters().Delete(ctx, id) },
 		"Caches().Get":                   func() { svc.Caches().Get(ctx, id) },
 		"Caches().List":                  func() { svc.Caches().List(ctx) },
 		"Caches().Watch":                 func() { svc.Caches().Watch(ctx, id) },

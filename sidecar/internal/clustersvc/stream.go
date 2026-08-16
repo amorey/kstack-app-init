@@ -41,6 +41,18 @@ func (s *Stream[T]) Err() error {
 	return nil
 }
 
+// sendFrame delivers one frame, reporting false when the consumer is gone. It is how
+// a pump keeps NewStream's requirement below: a bare channel send blocks forever once
+// the consumer stops draining, leaking the goroutine and the watch behind it.
+func sendFrame[T any](ctx context.Context, out chan<- T, frame T) bool {
+	select {
+	case out <- frame:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // NewStream runs pump on its own goroutine, publishing what it returns as the
 // terminal error. Frames closes only after that error is recorded, which is what
 // makes "Frames closed" a safe cue to read Err.

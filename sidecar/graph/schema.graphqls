@@ -790,7 +790,7 @@ type Query {
   "A single cluster by id; null if not tracked."
   cluster(id: ObjectID!): Cluster
 
-  "Every tracked cluster — those in the kubeconfig plus any with a leftover cache. Sorted by name."
+  "Every tracked cluster — those in the kubeconfig plus any with a leftover cache. Sorted by `spec.name`, falling back to the kube-context for a cluster the user has not named."
   clusters: [Cluster!]!
 
   # --- ClusterCache ---

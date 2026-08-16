@@ -46,12 +46,32 @@ side and hides when they don't. Everything else slices by kind, so one file teac
 are the subsystem's concurrency and retry budget, which only reads as a budget in one place.
 
 `New` opens the beehive store under `dataDir` and registers all four controllers; `Start` runs
-beehive, then each controller's background work. **The three cache controllers reconcile to a no-op
-and every family method panics** — so the app starts, the socket comes up, auth and cloud settings
-work, and any cluster query or subscription panics. Built so far: the kubeconfig watcher, the
-importer that creates `Cluster` records, and `clusterController.Reconcile` observing what the
-kubeconfig says about each one (`status.source.kubeconfig`). There is no connection manager,
-discovery pass, sync worker, or on-disk cache yet, and nothing reads any of it back out.
+beehive, then each controller's background work. **The three cache controllers reconcile to a no-op,
+and most family methods still panic** — `TestUnimplementedBoundaryPanics` is the inventory of what
+is left, and an entry must be deleted as its method lands, since the test fails when a stub stops
+panicking.
+
+Built so far, produced: the kubeconfig watcher, the importer that creates `Cluster` records, and
+`clusterController.Reconcile` observing what the kubeconfig says about each one
+(`status.source.kubeconfig`). Served: the whole `Clusters()` family except `WatchSchedule`. That is
+enough for the kube-context picker, which reads `clustersWatch` alone. There is no connection
+manager, discovery pass, sync worker, or on-disk cache yet, and no kind below `Cluster` has a
+producer — so the other four families stay unserved until the controller that fills them lands.
+
+**A read reports the store as it is, and never filters.** A record awaiting deletion is served like
+any other, carrying the tombstone (`deletionRequestedAt`) the consumer decides on — rendering it
+"Deleting…" is as valid as hiding it, and only the consumer knows which. So `Deleted` means what
+beehive means by it, the row is gone, and the soft-delete mark is an ordinary `Modified`: the row is
+still there, wearing a tombstone. The frontend drops those rows once, in `ClustersProvider`'s fold.
+
+Filtering in the boundary is what this replaced, and the reason is worth keeping: "invisible to a
+reader" was an invariant every read, every watch, and every mutation had to maintain *in agreement*,
+it needed per-subscription state to suppress the duplicate departure it created, and four
+consecutive reviews found a different place that had forgotten it.
+
+**Every send goes through `sendFrame`** (`stream.go`), which is how a pump keeps the promise
+`NewStream` states: a bare channel send blocks forever once the consumer stops draining, leaking the
+goroutine and the beehive watch behind it.
 
 **A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
 lifecycle — read `clusterController.machinery()` for what the Cluster kind owns, and the leaves each
@@ -103,10 +123,11 @@ an invariant to lean on.
 under fsnotify wakes and a poke subscription, both optional and allowed to fail. Applies to every
 watch. **Keep the tick under a new push layer rather than replacing it** — it is what covers what
 events cannot see, including the resume the poke subscription is there for.
-`kubeconfigImporter` has no tick and no poke of its own: its only trigger is a kubeconfig snapshot,
-and a failed pass re-levels on the backoff retry. So whatever changes the record set out of band — a
-mutation deleting a `Cluster` whose context is still present — has to reach the importer directly.
-Poking the watcher does not: it republishes only when the file's contents differ.
+`kubeconfigImporter` has no tick and no poke of its own: its triggers are a kubeconfig snapshot and
+`Resync`, and a failed pass re-levels on the backoff retry. Whatever changes the record set out of
+band has to call `Resync` — `Clusters().Delete` does, since deleting a `Cluster` whose context is
+still in the file frees that context without changing anything the watcher would republish. That
+pass fails while the drained record still holds the name, and the retry ladder covers the tail.
 
 The watcher watches **directories, and follows symlinks**: a save replaces the inode (so a
 file-level watch goes deaf), and a dotfiles-managed kubeconfig is a link whose target lives in a
@@ -191,7 +212,7 @@ consumer (a callee follows its caller — `LiveCondition` needs `TruncateMessage
 
 ### GraphQL surface (cluster)
 
-The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers — but **every field reaches the stubbed boundary and panics**, so this section is the contract the rebuild must satisfy, not a description of what answers today. Key entry points:
+The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the root `Cluster` reads answer** — `cluster`, `clusters`, `clustersWatch`, and the enable/sync/delete mutations. `Cluster`'s own nested fields do not: `caches` and `events` reach `Caches().ListByCluster` and `ListEvents`, which still panic, so a query selecting them panics with the rest. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
 
 - Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedCatalogsWatch` (unscoped, one per cache), `clusterCachedResourcesWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).

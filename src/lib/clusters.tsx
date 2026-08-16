@@ -55,6 +55,7 @@ const ClustersWatchSubscription = graphql(`
       type
       cluster {
         id
+        deletionRequestedAt
         spec {
           name
           syncEnabled
@@ -166,7 +167,12 @@ export function ClustersProvider({ children }: { children: React.ReactNode }) {
       // snapshot boundary would show a half-listed fleet as the whole fleet.
       if (type === 'Bookmark') return { ...base, synced: true };
       if (!cluster) return base;
-      return { ...base, items: applyChange(base.items, type, cluster.id, cluster) };
+      // The boundary reports the store as it is, tombstones included, and leaves the
+      // choice here. One place, at the edge: a per-view filter is one a view forgets.
+      // A record being torn down is dropped rather than rendered mid-teardown — the
+      // window is microseconds unless children are draining.
+      const change = cluster.deletionRequestedAt ? 'Deleted' : type;
+      return { ...base, items: applyChange(base.items, change, cluster.id, cluster) };
     },
   );
   // Held back until the snapshot is complete, so a half-listed fleet never reads as

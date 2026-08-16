@@ -17,6 +17,7 @@
 package clustersvc
 
 import (
+	"context"
 	"testing"
 
 	"github.com/amorey/beehive"
@@ -35,5 +36,18 @@ func newTestBeehive(t *testing.T) *beehive.Beehive {
 
 	bh, err := beehive.New(store)
 	require.NoError(t, err)
+	return bh
+}
+
+// newRunningBeehive is newTestBeehive started, so a watch's tail is live. No
+// controller is registered: a reconcile writing status would put frames on a watch
+// that the test never asked for.
+func newRunningBeehive(t *testing.T) *beehive.Beehive {
+	t.Helper()
+	bh := newTestBeehive(t)
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 	return bh
 }

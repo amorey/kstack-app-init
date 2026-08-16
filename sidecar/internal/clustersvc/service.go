@@ -52,9 +52,9 @@
 // facts); its ClusterCache child carries sync status, folded per kind from the
 // ClusterCachedResource records below it.
 //
-// The read side is a shell pending a rebuild: every family method panics, and the
-// controllers reconcile to a no-op. The interfaces and the types they carry hold the
-// GraphQL and gRPC surfaces steady meanwhile.
+// The read side is mid-rebuild: the Cluster kind is served, every other family method
+// panics, and the three cache controllers reconcile to a no-op. The interfaces and the
+// types they carry hold the GraphQL and gRPC surfaces steady meanwhile.
 package clustersvc
 
 import (
@@ -64,6 +64,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/amorey/beehive"
@@ -80,10 +81,10 @@ import (
 // docs/adr/2026-08-09-delta-watch-protocol.md and close when ctx ends.
 //
 // A single-object Watch runs the same protocol as its WatchList, over one id:
-// snapshot, one Bookmark, then deltas. An id holding nothing yet gets the Bookmark
-// alone and streams Added if it appears; a removal is Deleted and does not end the
-// stream. Absence is never an error — watching a record before it exists is an
-// ordinary subscription, which is what lets a view open one on an id it expects.
+// snapshot, one Bookmark, then deltas. Absence is never an error — an id holding
+// nothing gets the Bookmark alone, which is what lets a view open a subscription on an
+// id it expects to be filled. A removal is Deleted; it does not end the stream, but it
+// is the last frame that id will carry, because an id is never reused.
 type Service interface {
 	// Start launches the background work and returns the func that drains it. ctx
 	// bounds startup; the stop func takes a drain deadline. Call stop before Close.
@@ -121,23 +122,36 @@ type Service interface {
 // equals the family's subject, one method per scope rather than a scope argument, and
 // By* naming the scope the caller passes. A violation is visible when the five read
 // side by side and invisible when they don't.
+//
+// **A read reports the store as it is, and never filters.** A record awaiting deletion
+// is served like any other, carrying the tombstone the consumer decides what to do
+// with — a UI that renders it "Deleting…" is as valid as one that hides it, and only
+// the consumer knows which. Deleted therefore means what beehive means by it: the row
+// is gone. Filtering here instead cost an invariant every read, every watch, and every
+// mutation had to maintain in agreement, and each place that forgot was a bug the
+// types could not catch.
 
 // Clusters is the Cluster record surface: the tracked clusters, their spec
 // toggles, and the per-cluster streams that deliberately do not ride the record
 // watch.
 type Clusters interface {
-	// Get returns one cluster by id, or (nil, nil) when unknown or deletion-pending.
+	// Get returns one cluster by id, or (nil, nil) when the id names nothing.
 	Get(ctx context.Context, id ClusterID) (*Cluster, error)
-	// List returns every tracked, non-deletion-pending cluster. Cache sync status is
-	// the caller's join from Caches().WatchList.
+	// List returns every tracked cluster. Cache sync status is the caller's join from
+	// Caches().WatchList.
 	List(ctx context.Context) ([]*Cluster, error)
 
-	// Watch streams one cluster as a delta watch. Bookmark-only while the id names
-	// no tracked cluster — one dropped from the kubeconfig and re-added streams
-	// Deleted then Added on the same subscription.
+	// Watch streams one cluster as a delta watch, scoped to the record's id.
+	// Bookmark-only while the id names no tracked cluster.
+	//
+	// Deleted is terminal for the id, since an id is never reused: a context still in
+	// the kubeconfig is re-imported under a fresh one, which a caller has to watch
+	// itself. A context merely dropped from the kubeconfig is not a deletion at all —
+	// the record is orphaned in place (IsPresent=false), which arrives as Modified.
 	Watch(ctx context.Context, id ClusterID) (*Stream[ClusterWatchFrame], error)
-	// WatchList streams every cluster as a delta watch; deletion-pending surfaces
-	// as Deleted.
+	// WatchList streams every cluster as a delta watch. The mark that starts a record's
+	// deletion is an ordinary Modified — the row is still there, wearing a tombstone —
+	// and Deleted follows when it is collected.
 	WatchList(ctx context.Context) (*Stream[ClusterWatchFrame], error)
 
 	// WatchSchedule streams a cluster's next-requeue gauge. A stream because a
@@ -156,10 +170,10 @@ type Clusters interface {
 // steady state, but a UID migration leaves the old one behind — so every
 // per-cache read names the exact cache it means, never "the" cache of a cluster.
 type Caches interface {
-	// Get returns one cache by id, or (nil, nil) when unknown or deletion-pending.
+	// Get returns one cache by id, or (nil, nil) when the id names nothing.
 	Get(ctx context.Context, id ClusterCacheID) (*ClusterCache, error)
-	// List returns every cache in creation order, non-deletion-pending. Which one is
-	// active is the caller's live join (CacheIsActive), not a property here.
+	// List returns every cache in creation order. Which one is active is the caller's
+	// live join (CacheIsActive), not a property here.
 	List(ctx context.Context) ([]*ClusterCache, error)
 
 	// Watch streams one cache as a delta watch. Bookmark-only until the cluster has
@@ -192,11 +206,10 @@ type Caches interface {
 // CachedCatalogs is the ClusterCachedCatalog surface: one catalog per cache,
 // listing the kinds that cache's cluster serves and owning a CachedResource per kind.
 type CachedCatalogs interface {
-	// Get returns one catalog by id, or (nil, nil) when unknown or deletion-pending.
+	// Get returns one catalog by id, or (nil, nil) when the id names nothing.
 	Get(ctx context.Context, id ClusterCachedCatalogID) (*ClusterCachedCatalog, error)
-	// List returns every catalog in creation order, non-deletion-pending. A cache
-	// gets its catalog only once discovery lands, so an empty result is a wait, not
-	// an error.
+	// List returns every catalog in creation order. A cache gets its catalog only once
+	// discovery lands, so an empty result is a wait, not an error.
 	List(ctx context.Context) ([]*ClusterCachedCatalog, error)
 
 	// Watch streams one catalog as a delta watch. Bookmark-only until the cache's
@@ -220,8 +233,7 @@ type CachedCatalogs interface {
 // This family is the fleet's largest by an order of magnitude: a record per served
 // kind per cache, so hundreds per cluster. Scope every read that can be scoped.
 type CachedResources interface {
-	// Get returns one record by id, or (nil, nil) when unknown or
-	// deletion-pending.
+	// Get returns one record by id, or (nil, nil) when the id names nothing.
 	Get(ctx context.Context, id ClusterCachedResourceID) (*ClusterCachedResource, error)
 	// List returns every per-kind sync record in creation order.
 	List(ctx context.Context) ([]*ClusterCachedResource, error)
@@ -371,15 +383,24 @@ func closeAll(ls []startCloser) error {
 	return errors.Join(errs...)
 }
 
-// service is the concrete Service: the beehive instance every family reads and every
-// controller writes, plus the inputs the rebuild's leaves still need.
+// service is the concrete Service: a beehive client per kind, plus the inputs the
+// rebuild's leaves still need.
 type service struct {
-	bh *beehive.Beehive
+	// A family reads through its own kind's client. Each kind adds one here as it is
+	// rebuilt.
+	clusterClient beehive.Client[ClusterSpec, ClusterStatus]
+	// clusterCtrl is held for its machinery as well as its lifecycle: a mutation that
+	// frees a kube-context has to reach the importer, which no store write would.
+	clusterCtrl *clusterController
+	// clusterSpecMu serializes the spec read-modify-write behind the Cluster setters,
+	// which beehive cannot do for them: Update takes a whole spec and offers no
+	// compare-and-swap.
+	clusterSpecMu sync.Mutex
 
 	// beehive first, then the controllers in registration order — held for their
-	// lifecycle alone, since reads go through bh rather than through them. Order is
-	// the whole contract: beehive starts before any controller and, being last to
-	// stop and close, outlives every reconcile that could still touch the store.
+	// lifecycle alone, since nothing reads through them. Order is the whole contract:
+	// beehive starts before any controller and, being last to stop and close,
+	// outlives every reconcile that could still touch the store.
 	parts []startCloser
 
 	pokeSvc *poke.Service
@@ -437,9 +458,10 @@ func New(dataDir, kubeconfigPath string, pokeSvc *poke.Service) (Service, error)
 		return nil, fmt.Errorf("register cluster controllers: %w", err)
 	}
 	return &service{
-		bh:      bh,
-		parts:   append([]startCloser{beehiveRuntime{bh: bh, store: bhStore}}, controllers...),
-		pokeSvc: pokeSvc,
+		clusterClient: clusterClient,
+		clusterCtrl:   clusterCtrl,
+		parts:         append([]startCloser{beehiveRuntime{bh: bh, store: bhStore}}, controllers...),
+		pokeSvc:       pokeSvc,
 	}, nil
 }
 

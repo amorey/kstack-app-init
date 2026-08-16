@@ -145,8 +145,9 @@ func (r *mutationResolver) AuthLogout(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// Cluster is the resolver for the cluster field. An untracked or
-// deletion-pending id is null per the schema, not an error.
+// Cluster is the resolver for the cluster field. An id naming nothing is null per the
+// schema, not an error; one still being torn down resolves like any other, carrying
+// its deletionRequestedAt.
 func (r *queryResolver) Cluster(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.Cluster, error) {
 	return r.ClusterSvc.Clusters().Get(ctx, id)
 }
@@ -157,8 +158,8 @@ func (r *queryResolver) Clusters(ctx context.Context) ([]*clustersvc.Cluster, er
 	return r.ClusterSvc.Clusters().List(ctx)
 }
 
-// ClusterCache is the resolver for the clusterCache field. An unknown or
-// deletion-pending id is null per the schema, not an error.
+// ClusterCache is the resolver for the clusterCache field. An id naming nothing is
+// null per the schema, not an error.
 func (r *queryResolver) ClusterCache(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCache, error) {
 	return r.ClusterSvc.Caches().Get(ctx, id)
 }
@@ -172,8 +173,8 @@ func (r *queryResolver) ClusterCaches(ctx context.Context, clusterID *clustersvc
 	return r.ClusterSvc.Caches().List(ctx)
 }
 
-// ClusterCachedResource is the resolver for the clusterCachedResource field. An
-// unknown or deletion-pending id is null per the schema, not an error.
+// ClusterCachedResource is the resolver for the clusterCachedResource field. An id
+// naming nothing is null per the schema, not an error.
 func (r *queryResolver) ClusterCachedResource(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCachedResource, error) {
 	return r.ClusterSvc.CachedResources().Get(ctx, id)
 }

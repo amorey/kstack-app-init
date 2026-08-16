@@ -68,11 +68,14 @@ export type ClusterRow = {
   enabled?: boolean;
   present?: boolean;
   isDefault?: boolean;
+  // Set to mark the record as being torn down; the boundary streams these through.
+  deleting?: boolean;
 };
 
 export function clusterOf(r: ClusterRow) {
   return {
     id: r.id,
+    deletionRequestedAt: r.deleting ? '2026-08-16T00:00:00Z' : null,
     spec: {
       name: r.name,
       syncEnabled: r.syncEnabled ?? true,

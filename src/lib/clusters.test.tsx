@@ -259,6 +259,41 @@ describe('useClusters', () => {
     expect(screen.getByTestId('probe')).toHaveTextContent('["staging"]');
   });
 
+  // The boundary streams a record being torn down rather than filtering it, so this
+  // fold is the only thing keeping a dying cluster out of every view.
+  it('drops a cluster whose record is marked for deletion', async () => {
+    renderProvider();
+    await flush();
+
+    await act(async () => {
+      pushClusters(channelFor, [
+        { id: 'u-a', name: 'prod-us' },
+        { id: 'u-b', name: 'staging' },
+      ]);
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["prod-us","staging"]');
+
+    // A Modified, not a Deleted: the row is still there, wearing a tombstone.
+    await act(async () => {
+      pushClusterChange('Modified', clusterOf({ id: 'u-a', name: 'prod-us', deleting: true }));
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["staging"]');
+  });
+
+  // A tombstoned record in the snapshot never enters the list to begin with.
+  it('drops a deletion-marked cluster arriving in the snapshot', async () => {
+    renderProvider();
+    await flush();
+
+    await act(async () => {
+      pushClusters(channelFor, [
+        { id: 'u-a', name: 'prod-us', deleting: true },
+        { id: 'u-b', name: 'staging' },
+      ]);
+    });
+    expect(screen.getByTestId('probe')).toHaveTextContent('["staging"]');
+  });
+
   it('joins a cache onto its cluster by matching serverUid', async () => {
     renderProvider(<JoinProbe />);
     await flush();

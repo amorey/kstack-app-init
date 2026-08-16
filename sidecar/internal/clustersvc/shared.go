@@ -30,8 +30,9 @@ import (
 	"github.com/amorey/beehive"
 )
 
-// ErrNotFound is the boundary's sentinel for an id that names no tracked record.
-// Callers match it with errors.Is; graph maps it to the ErrRecordNotFound wire error.
+// ErrNotFound is the boundary's sentinel for an id that names no tracked record,
+// matched with errors.Is. Nothing in graph maps it to errors.ErrRecordNotFound yet, so
+// a mutation's failure still reaches the webview as an internal string — see TODO.md.
 var ErrNotFound = errors.New("clustersvc: cluster not found")
 
 // --- Identity ---
