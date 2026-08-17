@@ -6,6 +6,7 @@ require (
 	github.com/99designs/gqlgen v0.17.90
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/amorey/beehive v0.23.0
+	github.com/amorey/gobus v0.6.0
 	github.com/amorey/gochan v0.2.0
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/fsnotify/fsnotify v1.10.1
@@ -19,13 +20,13 @@ require (
 	google.golang.org/grpc v1.81.1
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.6.2
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
+	k8s.io/apimachinery v0.36.1
 	k8s.io/client-go v0.36.1
 	modernc.org/sqlite v1.52.0
 )
 
 require (
 	github.com/agnivade/levenshtein v1.2.1 // indirect
-	github.com/amorey/gobus v0.6.0 // indirect
 	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -61,7 +62,6 @@ require (
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/apimachinery v0.36.1 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260317180543-43fb72c5454a // indirect
 	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2 // indirect

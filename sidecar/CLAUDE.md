@@ -12,7 +12,7 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 - `internal/app/` — **composition root**: builds `poke.Service`, `kubeconfig.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → kubeconfig → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
-- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
+- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `kubeconn` (one validated connection per set of credentials — **built, not yet wired to anything**), `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
@@ -331,6 +331,91 @@ context) and `ErrNotRead` (nothing read yet, which looks identical to "every con
 
 Resolution is **not memoized**: each call re-copies the config and rebuilds TLS and auth material.
 Add a per-context memo invalidated on publish when a caller's cadence makes it show.
+
+## Kube connections (`internal/kubeconn`)
+
+**Nothing calls this yet.** It is built and tested standalone: no consumer, and not in
+`App.parts`, so its `Start`/`Close` run only under its own tests. The subsystem that maps
+clusters onto it is not written.
+
+**Credentials are the unit, not clusters.** One entry per credential *key* holds the connection
+and the probe that keeps it validated, so two kube-contexts aimed at one server as one user are
+one socket and **one probe** — the identity they would each learn is the same answer. The caller
+computes the key; this package never reads a kubeconfig and never learns what a cluster is.
+
+A connection is built on first use for a key and shared by every later caller under it; `Close`
+drops them all, and only idle sockets close, so a stream in flight is never cut. **There is no way
+to obtain one without a `Lease`** — that is what lets the pool know when nothing needs a connection
+any more, which reclaiming idle ones will depend on. **The build runs outside the pool's lock** (one `sync.Once` per key): it reads TLS material from
+disk, and holding the lock across that would queue every other key — and every cache hit — behind
+it, flattening the probe fan-out.
+
+- **The caller supplies credentials; the pool supplies the tuning.** The build stamps `QPS`/`Burst`/
+  `UserAgent` onto its own copy, because the key fingerprints credentials only — two callers under
+  one key with different tuning would otherwise share whichever built first. `WrapTransport` is a
+  chain (add with `cfg.Wrap`, never assign) and `ContentType` stays JSON, or the dynamic client
+  cannot decode.
+- **`QPS`/`Burst` reach the dynamic client alone.** The bucket lives in `rest.RESTClient`, not the
+  transport, so every raw path on `Connection.HTTPClient` — the probe included — is unthrottled.
+- **`BaseURL` comes from `rest.DefaultServerUrlFor`**, which derives the scheme from whether the
+  config carries CA/client-cert data. `DefaultServerURL` with a hardcoded `defaultTLS` turns a
+  plain-HTTP port-forward into `https://` and fails at the handshake.
+- **`New(budget)` tightens the HTTP/2 keepalive** (`keepalive.go`, 10s/5s, only where unset). Here
+  rather than in the composition root because the vars are read when a transport is built, and this
+  builds them — a call the root has to remember is one that goes missing.
+
+`Probe(ctx, conn)` reads a cluster's identity with three **concurrent** requests: `/version`, the
+`kube-system` UID, and a `SelfSubjectReview`. **A refused request leaves its field empty rather than
+failing the probe** — it reached the API server, which is the thing being probed — so a
+namespace-scoped user's missing RBAC (403 on `kube-system`) does not read as a cluster that is down;
+`Identity.UIDErr` carries why, and makes `Identity` uncomparable, so compare its fields rather than
+the struct. **Two things do fail it**: a transport failure, and *every* request being refused, which
+is credentials that no longer work (401 across the board) rather than a user who may not read much —
+an identity with nothing in it is what a caller cannot tell from a healthy cluster.
+
+### Demand keeps a connection validated (`lease.go`, `loop.go`)
+
+Nothing dials or probes until something asks. `lease.go` is what a caller asks and reads;
+`loop.go` is the engine behind it. Both asks name credentials:
+
+- **`Acquire(cfg, key)`** returns a `Lease` — "I am using these credentials." A held claim arms the
+  cadence; `Lease.Conn` is the connection and `Release` gives the claim back. Releasing the last one
+  ends the loop after at most the probe it is on. The connection stays pooled; `Close` drops those.
+- **`ProbeNow(cfg, key)`** asks for one probe and claims nothing, so unheld credentials are probed
+  once and the loop ends again.
+- **`State(key)`** is what is known: the last `Result`, and whether a probe is asked-for-and-unanswered.
+- **`Subscribe(key)`** is a `gobus/conflate` receiver of one key's news, for a reader holding no
+  claim; `Close` is the unsubscribe. The bus keeps a slot per key and coalesces, so a fleet probing
+  at once neither blocks a probe loop nor loses a key behind a busier one. A probe publishes when it
+  **starts and nothing is known yet** — the one stretch a reader cannot infer — and otherwise only
+  when the answer **changed**, so nobody is woken every cadence to conclude nothing moved. The value
+  is empty: it says `State` is worth re-reading, not what `State` now says, so a reader acts on what
+  is current rather than a snapshot from when the probe landed.
+
+- **The loop belongs to demand, not to pooling** (`loop.go`). Building costs a map entry; `demand` starts the
+  goroutine and the loop ends itself once no claim and no queued ask remain. The exit decision and
+  the flag that records it are taken under the same mutex `demand` takes, so a claim arriving as a
+  loop winds down either keeps it or starts a fresh one — never neither, which would leave a caller
+  parked in `Conn` with nothing left to answer it. The shutdown exits take `endLoop` instead, which
+  is safe only there: `stopped` is set before the loops are cancelled, so no demand can start
+  another.
+- **A `Result` names no credentials of its own.** It is stored under the key it ran against, so a
+  rotation cannot be told the wrong cluster's news — new credentials are a different key with their
+  own entry and their own result. `Conn` hands back the entry's connection for the same reason.
+- **`Probing` is asked-for, not running-now.** Set when the request is made, so a caller that asks
+  and then reads `State` is not told nothing is happening while its request sits behind the
+  semaphore (`Budget.Concurrency`, which stops a first install running a credential helper per
+  cluster in the same second).
+- **`Conn` reads and registers in one critical section.** Results ride a **`gobus/watch` hub keyed
+  by credential key**, and the receiver's baseline is the result just read — so a probe landing
+  between the read and the registration is delivered rather than missed. `watch.Watch` calls no
+  caller code, which is what makes registering under the service's own mutex legal. The **wake**
+  (`entry.wake`) stays a 1-buffered channel: a single-consumer, coalescing "run again", not state to
+  distribute.
+- **`Conn` waits out a failure rather than returning it from the store**, taking *that* probe's
+  result rather than a successful one. Returning a stored failure would leave credentials that were
+  down at boot unreachable for the life of the process. It does not kick: the claim already has the
+  loop probing, on the backoff ladder, and kicking per call would flatten it.
 
 ## Resync broadcaster (`internal/poke`)
 

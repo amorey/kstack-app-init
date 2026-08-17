@@ -105,6 +105,20 @@ func Recv[T any](t testing.TB, ch <-chan T, what string) T {
 	}
 }
 
+// NoRecv asserts that nothing arrives on ch within window, and fails naming what did.
+//
+// A negative assertion has no event to wait for, so it needs a bound of its own rather
+// than Timeout — and it fails the instant the thing happens rather than at the end of the
+// wait. Size window off whatever cadence the code under test runs at, never as a guess.
+func NoRecv[T any](t testing.TB, ch <-chan T, window time.Duration, what string) {
+	t.Helper()
+	select {
+	case v := <-ch:
+		t.Fatalf("%s: received %v", what, v)
+	case <-time.After(window):
+	}
+}
+
 // RecvClosed asserts that the next receive on ch is a close, failing the test
 // if a value arrives first or nothing happens within the failsafe timeout. Use
 // it where "the stream ended here, with nothing after it" is the claim;
