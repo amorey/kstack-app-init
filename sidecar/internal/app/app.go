@@ -20,6 +20,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
@@ -83,7 +84,12 @@ func New(cfg Config) (*App, error) {
 	// context. Closing it ends every subscription, so it is the app's alone.
 	kubeconfigSvc := kubeconfig.New(cfg.KubeconfigPath, pokeSvc)
 
-	clusterSvc, err := clustersvc.New(cfg.DataDir, kubeconfigSvc, pokeSvc)
+	// One connection per set of credentials, shared by everything that talks to a
+	// cluster. Keyed on credentials rather than on a cluster, so two contexts aimed at
+	// one server as one user are one socket.
+	kubeconnSvc := kubeconn.New(kubeconn.DefaultBudget)
+
+	clusterSvc, err := clustersvc.New(cfg.DataDir, kubeconfigSvc, kubeconnSvc, pokeSvc)
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +142,7 @@ func New(cfg Config) (*App, error) {
 		parts: []lifecycle.Part{
 			{Name: "poke service", StartCloser: lifecycle.StartFunc(pokeSvc.Start)},
 			{Name: "kubeconfig service", StartCloser: kubeconfigSvc},
+			{Name: "kubeconn service", StartCloser: kubeconnSvc},
 			{Name: "cluster service", StartCloser: clusterSvc},
 			{Name: "cloud service", StartCloser: lifecycle.StartFunc(cloudSvc.Start)},
 		},

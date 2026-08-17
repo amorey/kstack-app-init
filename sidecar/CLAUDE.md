@@ -9,10 +9,10 @@ The data dir (`--data-dir` / `KSTACK_DATA_DIR`) is **required** — `app.New` er
 Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the composition root + routing, GraphQL lives in `graph/`. There is no `server` package.
 
 - `main.go` — parse flags, bind socket, build `*app.App`, serve, drive graceful shutdown (`srv.Shutdown` → `app.DrainWithContext` → `stop(ctx)` → `app.Close`).
-- `internal/app/` — **composition root**: builds `poke.Service`, `kubeconfig.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → kubeconfig → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
+- `internal/app/` — **composition root**: builds `poke.Service`, `kubeconfig.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → kubeconfig → kubeconn → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain, and the connection pool outlives the cluster service probing on it. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
-- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `kubeconn` (one validated connection per set of credentials — **built, not yet wired to anything**), `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
+- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `kubeconn` (one validated connection per set of credentials), `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
@@ -33,7 +33,8 @@ internal/clustersvc/
   cachedcatalogs.go   │ record GraphQL binds, its *WatchFrame, its controller, and
   cachedresources.go  │ the machinery that controller owns
   cacheddata.go       ┘ (no controller — the one family that isn't a beehive kind)
-  shared.go           vocabulary every family reuses, and the two GraphQL scalars
+  shared.go           vocabulary every family reuses, the app's services as this
+                      package sees them, and the two GraphQL scalars
   stream.go           Stream[T]
 ```
 
@@ -90,7 +91,7 @@ pass** — controllers re-arm with `RequeueAfter` and the out-of-band buses cove
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
 
 **Shared dependencies travel in `deps`** — one beehive client per kind plus the process-wide services
-(`poke` today), built once by `newDeps(bh, pokeSvc)` and **embedded** by `service` and by each
+(`kubeconfig`, `kubeconn`, `poke`), built once by `newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)` and **embedded** by `service` and by each
 controller, so a family reads `a.s.cacheClient` and a controller reads `c.cacheClient`. The `Client`
 suffix is load-bearing: the fields are promoted into both, and `a.s.cacheClient` must not read like
 the `Caches` family it is reached through. **A new kind or a new
@@ -185,18 +186,20 @@ file-level watch goes deaf), and a dotfiles-managed kubeconfig is a link whose t
 directory nobody would otherwise watch. The resolved set is recomputed per reload, so a re-pointed
 link follows to its new directory. Reach for `resolvePaths` before adding anything here.
 
-`clustersvc.New(dataDir, kubeconfigSvc, pokeSvc)`, `Start`, and `Close` keep their signatures, so
-filling the shell in is never a change to the composition root.
+`clustersvc.New(dataDir, kubeconfigSvc, kubeconnSvc, pokeSvc)`, `Start`, and `Close` are what the
+composition root calls. `New` grows a parameter only for a new process-wide service; filling in a
+family or a controller never touches it.
 
 **The leaves this package drives speak native vocabulary** — GVRs, a `rest.Config`, cache rows —
 never the records above; the controllers translate. A leaf reaching for one of this package's types
 gets an import cycle, which is what enforces the direction. Put a mechanism in a leaf, never in a
 controller: **if `go test ./internal/clustersvc` stops being fast, one has leaked back in.**
 
-**A process-wide service is the app's, and this package only reads it.** `kubeconfig.Service`
-arrives through `deps` behind the narrow `kubeconfigService`, so `clusterController` neither starts
-nor closes it — its `Close` ends every subscription in the process, including other packages'.
-Only the importer is the controller's own machinery.
+**A process-wide service is the app's, and this package only reads it.** `kubeconfig.Service` and
+`kubeconn.Service` arrive through `deps` behind the narrow `kubeconfigService`/`kubeconnService`
+(both in `shared.go`), so `clusterController` neither starts nor closes them — the kubeconfig's
+`Close` ends every subscription in the process, including other packages'. Only the importer is the
+controller's own machinery.
 
 The five families are `Clusters()`, `Caches()`, `CachedCatalogs()`, `CachedResources()`, and
 `CachedData()`. **The `Cached*` prefix marks the cache subtree** — what a `ClusterCache` catalogs,
@@ -334,9 +337,9 @@ Add a per-context memo invalidated on publish when a caller's cadence makes it s
 
 ## Kube connections (`internal/kubeconn`)
 
-**Nothing calls this yet.** It is built and tested standalone: no consumer, and not in
-`App.parts`, so its `Start`/`Close` run only under its own tests. The subsystem that maps
-clusters onto it is not written.
+**Nothing takes a connection from it yet.** The composition root builds it and `clustersvc`
+holds it as `deps.kubeconnSvc`, behind the narrow `kubeconnService` in `shared.go`, but no
+code path acquires a lease — the prober that maps clusters onto credentials is not written.
 
 **Credentials are the unit, not clusters.** One entry per credential *key* holds the connection
 and the probe that keeps it validated, so two kube-contexts aimed at one server as one user are

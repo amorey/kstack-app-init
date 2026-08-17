@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/amorey/beehive"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
@@ -382,15 +381,6 @@ func (a clustersAPI) Delete(ctx context.Context, id ClusterID) error {
 // read. The read is synchronous in the watcher's Start, so this is only ever waited
 // out by the window between beehive starting and the controllers starting.
 const kubeconfigUnreadRequeue = time.Second
-
-// kubeconfigService is the app's kubeconfig service as this package uses it, narrow
-// so a test hands the controller a static config instead of writing files. RESTConfig
-// is the connection probe's seam; Reconcile reads Get and the importer subscribes.
-type kubeconfigService interface {
-	Get() (*api.Config, bool)
-	RESTConfig(contextName string) (*rest.Config, string, error)
-	Subscribe() kubeconfig.Subscription
-}
 
 // clusterController reconciles a tracked cluster: today it observes what the
 // kubeconfig says about the record's context, and creates the ClusterCache for the

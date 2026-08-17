@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Vocabulary every family reuses: identity, conditions, the kind-agnostic Event and
-// Schedule projections, and the delta-watch frame type. Nothing here belongs to one
-// kind — a type only one family uses lives in that family's file, however generic its
-// name reads. Mirrors the shared-vocabulary section of graph/schema.graphqls, which
-// these types bind to.
+// Vocabulary every family reuses: the app's services as this package sees them,
+// identity, conditions, the kind-agnostic Event and Schedule projections, and the
+// delta-watch frame type. Nothing here belongs to one kind — a type only one family
+// uses lives in that family's file, however generic its name reads. The projections
+// mirror the shared-vocabulary section of graph/schema.graphqls, which they bind to.
 package clustersvc
 
 import (
@@ -28,12 +28,52 @@ import (
 	"time"
 
 	"github.com/amorey/beehive"
+	"github.com/amorey/gobus/conflate"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd/api"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconn"
 )
 
 // ErrNotFound is the boundary's sentinel for an id that names no tracked record,
 // matched with errors.Is. Nothing in graph maps it to errors.ErrRecordNotFound yet, so
 // a mutation's failure still reaches the webview as an internal string — see TODO.md.
 var ErrNotFound = errors.New("clustersvc: cluster not found")
+
+// --- Process-wide services ---
+//
+// The app's own services as this package uses them: narrow, so a test hands a
+// controller a static config or stands in for a live cluster without the network.
+// Together here rather than beside the kind that reads one, because they travel
+// together in deps and reach every kind through it.
+
+// kubeconfigService is the one reader of the user's kubeconfig. RESTConfig is the
+// connection probe's seam; Reconcile reads Get and the importer subscribes.
+type kubeconfigService interface {
+	Get() (*api.Config, bool)
+	RESTConfig(contextName string) (*rest.Config, string, error)
+	Subscribe() kubeconfig.Subscription
+}
+
+// kubeconnService is the connection pool: a claim on one set of credentials, an
+// out-of-band probe, and the news either produces.
+//
+// Everything about pacing — the cadence a held claim re-probes on, the backoff a
+// failing one follows, how many probe at once — belongs to that package. What this one
+// decides is which clusters are worth connecting, which is the whole of its half.
+type kubeconnService interface {
+	// Acquire claims the connection for these credentials and arms their cadence.
+	Acquire(cfg *rest.Config, key string) (kubeconn.Lease, error)
+	// ProbeNow asks for one probe and does not wait for the outcome.
+	ProbeNow(cfg *rest.Config, key string) error
+	// State is what the pool knows about these credentials: the last outcome, and
+	// whether a probe is asked for and unanswered.
+	State(key string) kubeconn.State
+	// Subscribe reports that these credentials moved, so State is worth re-reading.
+	// Close the receiver when done.
+	Subscribe(key string) *conflate.Receiver[string, struct{}]
+}
 
 // --- Identity ---
 

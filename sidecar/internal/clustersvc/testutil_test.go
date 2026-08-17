@@ -53,7 +53,7 @@ func newTestBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 func newTestDeps(t *testing.T) deps {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), nil)
+	d := newDeps(bh, newTestKubeconfig(t), nil, nil)
 
 	_, _, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -94,7 +94,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil, nil)
 }
 
 // settleRecorder captures the generation a reconcile settles, for a controller whose

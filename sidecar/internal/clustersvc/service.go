@@ -320,16 +320,18 @@ type deps struct {
 	resourceClient beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
 
 	kubeconfigSvc kubeconfigService
+	kubeconnSvc   kubeconnService
 	pokeSvc       *poke.Service
 }
 
-func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service) deps {
+func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, pokeSvc *poke.Service) deps {
 	return deps{
 		clusterClient:  beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
 		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
 		catalogClient:  beehive.NewClient[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus](bh, ClusterCachedCatalogGroupKind),
 		resourceClient: beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
 		kubeconfigSvc:  kubeconfigSvc,
+		kubeconnSvc:    kubeconnSvc,
 		pokeSvc:        pokeSvc,
 	}
 }
@@ -373,7 +375,7 @@ const maxEventRuns = 20
 
 // New builds the cluster boundary rooted at dataDir (beehive.db, clusters/): it opens
 // the store, registers the controllers, and leaves everything stopped until Start.
-func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service) (Service, error) {
+func New(dataDir string, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, pokeSvc *poke.Service) (Service, error) {
 	// Self-sufficient rather than order-dependent: this is the first thing the
 	// composition root builds, so nothing else has made dataDir yet.
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -391,7 +393,7 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	d := newDeps(bh, kubeconfigSvc, pokeSvc)
+	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)
 	clusterCtrl, controllers, err := registerControllers(bh, d)
 	if err != nil {
 		bhStore.Close()
