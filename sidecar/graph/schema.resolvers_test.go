@@ -650,15 +650,23 @@ func TestClusterCachedCatalogsWatchServesRecord(t *testing.T) {
 	}
 }
 
-// clusterCacheClear deletes the on-disk cache and returns the (still-tracked)
-// record; an unknown id surfaces the not-found error.
+// clusterCacheClear empties one cache's file and returns the (still-tracked) record.
+// The id it takes is the cache's own — a cluster id names no single cache once a UID
+// migration has left two — so the fixture's cluster id must not resolve. An unknown id
+// surfaces the not-found error.
 func TestClusterCacheClearMutation(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
-	body, _ := json.Marshal(map[string]string{"query": `mutation { clusterCacheClear(id: 1) { id } }`})
+	body, _ := json.Marshal(map[string]string{"query": `mutation { clusterCacheClear(id: 101) { id } }`})
 	raw := postGQL(t, srv.URL, string(body))
-	if !strings.Contains(string(raw), `"id":"1"`) {
-		t.Errorf("expected the cleared cluster back, got %s", raw)
+	if !strings.Contains(string(raw), `"id":"101"`) {
+		t.Errorf("expected the cleared cache back, got %s", raw)
+	}
+
+	body, _ = json.Marshal(map[string]string{"query": `mutation { clusterCacheClear(id: 1) { id } }`})
+	raw = postGQL(t, srv.URL, string(body))
+	if !strings.Contains(string(raw), "errors") {
+		t.Errorf("expected a GraphQL error for a cluster id, got %s", raw)
 	}
 
 	body, _ = json.Marshal(map[string]string{"query": `mutation { clusterCacheClear(id: "999") { id } }`})

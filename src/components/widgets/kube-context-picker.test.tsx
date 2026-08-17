@@ -150,7 +150,7 @@ describe('KubeContextPicker', () => {
       openStream();
       // The Bookmark over an empty snapshot: what makes "no clusters" a fact rather
       // than a not-yet. Without it the picker must keep showing Connecting….
-      pushWatchBookmark(channelFor, 'clustersWatch');
+      pushWatchBookmark(channelFor, 'clustersWatch', 'cluster');
     });
     expect(screen.getByTestId('kube-context-empty')).toBeInTheDocument();
     expect(screen.queryByTestId('kube-context-connecting')).not.toBeInTheDocument();

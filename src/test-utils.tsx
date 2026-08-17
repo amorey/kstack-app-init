@@ -101,9 +101,17 @@ export function clusterOf(r: ClusterRow) {
 // Close a delta watch's snapshot the way the server does: one Bookmark carrying no
 // entity. A consumer treats the stream as still loading until it lands, so a test
 // asserting a loaded state — an empty one especially — has to send it.
-export function pushWatchBookmark(channelFor: (queryPart: string) => FakeChannel, watchField: string) {
+//
+// entityField is the frame's own entity selection (`cluster` on clustersWatch, `cache`
+// on clusterCachesWatch): it is null on this frame alone, and each watch names it
+// differently, so the caller says which.
+export function pushWatchBookmark(
+  channelFor: (queryPart: string) => FakeChannel,
+  watchField: string,
+  entityField: string,
+) {
   channelFor(watchField).onmessage!(
-    JSON.stringify({ type: 'next', payload: { data: { [watchField]: { type: 'Bookmark', cluster: null } } } }),
+    JSON.stringify({ type: 'next', payload: { data: { [watchField]: { type: 'Bookmark', [entityField]: null } } } }),
   );
 }
 
@@ -116,7 +124,7 @@ export function pushClusters(channelFor: (queryPart: string) => FakeChannel, row
       JSON.stringify({ type: 'next', payload: { data: { clustersWatch: { type: 'Added', cluster: clusterOf(r) } } } }),
     );
   });
-  pushWatchBookmark(channelFor, 'clustersWatch');
+  pushWatchBookmark(channelFor, 'clustersWatch', 'cluster');
 }
 
 // Shared fake for '@tauri-apps/api/window', reached via `getCurrentWindow`.

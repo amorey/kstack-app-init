@@ -206,7 +206,7 @@ describe('useClusters', () => {
     expect(screen.getByTestId('probe')).toHaveTextContent('null');
 
     await act(async () => {
-      pushWatchBookmark(channelFor, 'clustersWatch');
+      pushWatchBookmark(channelFor, 'clustersWatch', 'cluster');
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('[]');
   });
@@ -434,7 +434,7 @@ describe('useClusters', () => {
     await reconnectBothStreams();
     await act(async () => {
       pushClusterChange('Added', clusterOf({ id: 'u-b', name: 'staging' }));
-      pushWatchBookmark(channelFor, 'clustersWatch');
+      pushWatchBookmark(channelFor, 'clustersWatch', 'cluster');
     });
     expect(screen.getByTestId('probe')).toHaveTextContent('["staging:-"]');
   });

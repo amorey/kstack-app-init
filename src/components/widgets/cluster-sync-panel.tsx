@@ -1109,7 +1109,12 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
                   discovery={discoveries.get(c.activeCache?.id ?? '') ?? null}
                   onSetEnabled={(enabled) => run(clusterEnabledSetMut({ id: c.id, enabled }))}
                   onToggle={(syncEnabled) => run(clusterSyncEnabledSetMut({ id: c.id, syncEnabled }))}
-                  onClearCache={() => run(clusterCacheClearMut({ id: c.id }))}
+                  // The cache's own id, not the cluster's: a UID migration leaves the
+                  // cluster owning more than one. The button is disabled until the
+                  // active cache reports a file, so the guard never fires in practice.
+                  onClearCache={() => {
+                    if (c.activeCache) run(clusterCacheClearMut({ id: c.activeCache.id }));
+                  }}
                   onRemove={() => run(clusterDeleteMut({ id: c.id }))}
                   onRetry={() => run(clusterConnectionRetryMut({ id: c.id }))}
                 />

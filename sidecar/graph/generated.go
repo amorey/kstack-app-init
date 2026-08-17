@@ -376,7 +376,7 @@ type MutationResolver interface {
 	ClusterSyncEnabledSet(ctx context.Context, id clustersvc.ObjectID, syncEnabled bool) (*clustersvc.Cluster, error)
 	ClusterConnectionRetry(ctx context.Context, id clustersvc.ObjectID) (bool, error)
 	ClusterDelete(ctx context.Context, id clustersvc.ObjectID) (bool, error)
-	ClusterCacheClear(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.Cluster, error)
+	ClusterCacheClear(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCache, error)
 	AuthLoginStart(ctx context.Context) (bool, error)
 	AuthLogout(ctx context.Context) (bool, error)
 }
@@ -6506,8 +6506,8 @@ func (ec *executionContext) _Mutation_clusterCacheClear(ctx context.Context, fie
 			return ec.Resolvers.Mutation().ClusterCacheClear(ctx, fc.Args["id"].(clustersvc.ObjectID))
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *clustersvc.Cluster) graphql.Marshaler {
-			return ec.marshalNCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐCluster(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v *clustersvc.ClusterCache) graphql.Marshaler {
+			return ec.marshalNClusterCache2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCache(ctx, selections, v)
 		},
 		true,
 		true,
@@ -6520,7 +6520,7 @@ func (ec *executionContext) fieldContext_Mutation_clusterCacheClear(ctx context.
 		IsMethod:   true,
 		IsResolver: true,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_Cluster(ctx, field)
+			return ec.childFields_ClusterCache(ctx, field)
 		},
 	}
 	defer func() {
@@ -11921,6 +11921,10 @@ func (ec *executionContext) marshalNCluster2ᚖgithubᚗcomᚋkubetailᚑorgᚋk
 		return graphql.Null
 	}
 	return ec._Cluster(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalNClusterCache2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCache(ctx context.Context, sel ast.SelectionSet, v clustersvc.ClusterCache) graphql.Marshaler {
+	return ec._ClusterCache(ctx, sel, &v)
 }
 
 func (ec *executionContext) marshalNClusterCache2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCacheᚄ(ctx context.Context, sel ast.SelectionSet, v []*clustersvc.ClusterCache) graphql.Marshaler {

@@ -340,7 +340,7 @@ func (a cachesAPI) WatchHealth(ctx context.Context) (*Stream[ClusterCacheHealth]
 	panic("not implemented")
 }
 
-func (a cachesAPI) Clear(ctx context.Context, id ClusterID) (*Cluster, error) {
+func (a cachesAPI) Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache, error) {
 	panic("not implemented")
 }
 
@@ -399,5 +399,7 @@ func (c *clusterCacheController) Reconcile(
 	if err := ensureClusterCachedCatalog(ctx, c.catalogClient, ClusterCacheID(obj.ID), enabled); err != nil {
 		return beehive.Result{}, err
 	}
-	return beehive.Result{}, nil
+	// This pass writes no status of its own, so nothing else reports it converged, and
+	// the owed pass would re-dispatch every cache — four store reads apiece — forever.
+	return beehive.Result{}, settleGeneration(ctx, client, obj.ID, obj.Generation)
 }

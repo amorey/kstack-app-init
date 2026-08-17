@@ -40,10 +40,15 @@ func TestClusterCachedResourceName(t *testing.T) {
 }
 
 // A placeholder until the kind is rebuilt: it must settle the object rather than
-// requeue it, or beehive would spin on a kind nothing reconciles yet.
+// requeue it, or beehive's owed pass would re-dispatch every synced kind forever.
 func TestCachedResourceControllerReconcilesToANoOp(t *testing.T) {
-	res, err := (&clusterCachedResourceController{}).Reconcile(context.Background(), nil, &beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]{ID: 1})
+	client := &settleRecorder[ClusterCachedResourceStatus]{}
+	obj := &beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]{ID: 1, Generation: 3}
+
+	res, err := (&clusterCachedResourceController{}).Reconcile(context.Background(), client, obj)
 
 	require.NoError(t, err)
 	assert.Equal(t, beehive.Result{}, res)
+	require.NotNil(t, client.observed)
+	assert.Equal(t, obj.Generation, *client.observed)
 }

@@ -388,13 +388,19 @@ func storedCluster(t *testing.T, d deps, status beehive.ControllerClient[Cluster
 
 // cacheControllerClient answers the owner lookup a cache reconcile makes, from the
 // store, so the edge a fixture wrote is the one the reconcile reads. ownerID overrides
-// it, for a race the store cannot be held in. The embedded interface is nil: Reconcile
-// calls nothing else on it.
+// it, for a race the store cannot be held in. It also captures the generation the pass
+// settles. The embedded interface is nil: Reconcile calls nothing else on it.
 type cacheControllerClient struct {
 	beehive.ControllerClient[ClusterCacheStatus]
 	caches       beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
 	ownerID      *beehive.ObjectID
 	dependencies []dependency
+	observed     *int64
+}
+
+func (c *cacheControllerClient) SetObservedGeneration(_ context.Context, _ beehive.ObjectID, generation int64) error {
+	c.observed = &generation
+	return nil
 }
 
 // dependency is one edge a reconcile declared.
@@ -432,6 +438,22 @@ func TestCacheReconcileCreatesTheCatalog(t *testing.T) {
 	require.Len(t, objs, 1)
 	assert.Equal(t, ClusterCachedCatalogName(cache.ID), objs[0].Name)
 	assert.True(t, objs[0].Spec.Enabled)
+}
+
+// The pass writes no status, so the handshake is the only thing that reports it
+// converged. Without it the store keeps every cache unsettled and beehive's owed pass
+// re-runs this reconcile, store reads and all, every interval forever.
+func TestCacheReconcileSettlesTheGeneration(t *testing.T) {
+	d, status := cacheControllerDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	client := &cacheControllerClient{caches: d.cacheClient}
+
+	_, err := (&clusterCacheController{deps: d}).Reconcile(context.Background(), client, cache)
+	require.NoError(t, err)
+
+	require.NotNil(t, client.observed)
+	assert.Equal(t, cache.Generation, *client.observed)
 }
 
 // The relayed switch is the cluster's, and a write there wakes nothing here on its

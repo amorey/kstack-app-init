@@ -199,8 +199,8 @@ type Caches interface {
 	// the fleet. A gauge, but a failable one — the fold reads watches of its own.
 	WatchHealth(ctx context.Context) (*Stream[ClusterCacheHealth], error)
 
-	// Clear deletes the on-disk cache and bounces its syncs; the record stays.
-	Clear(ctx context.Context, id ClusterID) (*Cluster, error)
+	// Clear deletes one cache's on-disk file and bounces its syncs; the record stays.
+	Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache, error)
 }
 
 // CachedCatalogs is the ClusterCachedCatalog surface: one catalog per cache,
@@ -412,6 +412,24 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 // There is deliberately no periodic full pass behind it — controllers re-arm with
 // RequeueAfter, and the out-of-band buses cover the rest.
 var startupPass = beehive.WithStartupFullPass(true)
+
+// settleGeneration records the generation a pass observed, for a pass that wrote no
+// status. beehive settles a record on an explicit report alone, and its owed pass
+// re-dispatches an unsettled one every interval — so a controller that reports nothing
+// reconciles every object of its kind forever, and the store's unsettled list never
+// converges. A repeat report at the same generation writes nothing, which is what makes
+// this safe on every pass.
+func settleGeneration[Status any](
+	ctx context.Context,
+	client beehive.ControllerClient[Status],
+	id beehive.ObjectID,
+	generation int64,
+) error {
+	if err := client.SetObservedGeneration(ctx, id, generation); err != nil {
+		return fmt.Errorf("record observed generation: %w", err)
+	}
+	return nil
+}
 
 // registerControllers builds and registers each kind's controller, which lives in that
 // kind's file, and returns them in registration order. Together here rather than four

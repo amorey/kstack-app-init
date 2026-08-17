@@ -173,7 +173,11 @@ func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 			events, errs = fsw.Events, fsw.Errors
 		}
 
-		// Armed by an event or a poke, drained by the reload it triggers.
+		// Every trigger arms this, and only its expiry reads: a save arrives as several
+		// events and the first can find the file still truncated, which parses as a
+		// config with no contexts at all — and a tick or a poke can land in that same
+		// gap. Waiting for quiet is what keeps a rewrite in progress from publishing as
+		// an emptied kubeconfig.
 		settle := time.NewTimer(s.settle)
 		settle.Stop()
 		defer settle.Stop()
@@ -193,10 +197,9 @@ func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				reload()
+				// A quiet period is nothing against the backstop cadence.
+				settle.Reset(s.settle)
 			case ev := <-events:
-				// Deferred rather than acted on: a writer emits several events for one
-				// save, and the first of them can arrive with the file still truncated.
 				if _, ok := paths[filepath.Clean(ev.Name)]; ok {
 					settle.Reset(s.settle)
 				}
@@ -208,9 +211,6 @@ func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 					pokes = nil
 					continue
 				}
-				// Through the settle timer rather than straight to reload: a poke is
-				// correlated with host events, so it can land inside a writer's
-				// truncate-then-rewrite gap the same way an fsnotify event can.
 				settle.Reset(s.settle)
 			case err := <-errs:
 				slog.Debug("kubeconfig watch error", "err", err)

@@ -119,10 +119,10 @@ func (r *mutationResolver) ClusterDelete(ctx context.Context, id clustersvc.Obje
 	return true, nil
 }
 
-// ClusterCacheClear is the resolver for the clusterCacheClear field: delete the on-disk
-// cache and restart that cache's workers onto the emptied file — nothing else would
-// rebuild them. The cluster record stays and re-syncs from scratch.
-func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.Cluster, error) {
+// ClusterCacheClear is the resolver for the clusterCacheClear field: delete one cache's
+// on-disk file and restart its workers onto the emptied one — nothing else would rebuild
+// them. The record stays and re-syncs from scratch. The id is the cache's own.
+func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCache, error) {
 	return r.ClusterSvc.Caches().Clear(ctx, id)
 }
 

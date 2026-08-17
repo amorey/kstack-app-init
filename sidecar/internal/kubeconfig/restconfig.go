@@ -79,8 +79,13 @@ func resolve(cfg *api.Config, contextName string) (*rest.Config, error) {
 		return nil, fmt.Errorf("%w: %q", ErrContextNotFound, contextName)
 	}
 
+	// Deep-copied because clientcmd writes back through it: the merge takes the user's
+	// *api.ExecConfig by pointer and then stamps InstallHint and the cluster's exec
+	// extension onto it. Handed the service's snapshot, that would edit the config every
+	// other reader shares — one user entry serving two clusters would end up with the
+	// second one's audience under the first one's key.
 	restCfg, err := clientcmd.NewNonInteractiveClientConfig(
-		*cfg, contextName, &clientcmd.ConfigOverrides{}, nil,
+		*cfg.DeepCopy(), contextName, &clientcmd.ConfigOverrides{}, nil,
 	).ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("resolve kube-context %q: %w", contextName, err)

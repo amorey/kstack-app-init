@@ -96,3 +96,15 @@ func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
 	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil)
 }
+
+// settleRecorder captures the generation a reconcile settles, for a controller whose
+// only report is that handshake. The embedded interface is nil: nothing else is called.
+type settleRecorder[Status any] struct {
+	beehive.ControllerClient[Status]
+	observed *int64
+}
+
+func (c *settleRecorder[Status]) SetObservedGeneration(_ context.Context, _ beehive.ObjectID, generation int64) error {
+	c.observed = &generation
+	return nil
+}

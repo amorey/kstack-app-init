@@ -69,15 +69,17 @@ type Part struct {
 	StartCloser
 }
 
-// StartAll starts each in order and returns their stop funcs. A failure stops
-// whatever already started: the caller gets an error and no stop funcs, so nothing
-// else can reach them. Closing stays the caller's either way.
+// StartAll starts each in order and returns their stop funcs. A failure unwinds
+// whatever already started, and the stop func it returns is then a no-op — truthful,
+// since the unwind already drained them, and it spares every caller from having to
+// know that a `defer stop(ctx)` written above the error check would be nil. Closing
+// stays the caller's either way.
 func StartAll(ctx context.Context, parts []Part) (func(context.Context) error, error) {
 	stops := make([]func(context.Context) error, 0, len(parts))
 	for _, p := range parts {
 		stop, err := p.Start(ctx)
 		if err != nil {
-			return nil, errors.Join(fmt.Errorf("start %s: %w", p.Name, err), unwind(ctx, stops))
+			return noStop, errors.Join(fmt.Errorf("start %s: %w", p.Name, err), unwind(ctx, stops))
 		}
 		stops = append(stops, func(ctx context.Context) error {
 			if err := stop(ctx); err != nil {
@@ -88,6 +90,9 @@ func StartAll(ctx context.Context, parts []Part) (func(context.Context) error, e
 	}
 	return func(ctx context.Context) error { return stopAll(ctx, stops) }, nil
 }
+
+// noStop is what a failed StartAll hands back in place of nil.
+func noStop(context.Context) error { return nil }
 
 // unwindTimeout bounds the unwind of a failed start. A budget of its own because the
 // caller never receives a stop func in that case, so there is no drain deadline to

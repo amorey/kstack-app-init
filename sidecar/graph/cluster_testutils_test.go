@@ -670,15 +670,13 @@ func (f fakeCachedResources) Clear(_ context.Context, id clustersvc.ClusterCache
 	return nil, clustersvc.ErrNotFound
 }
 
-func (f fakeCaches) Clear(_ context.Context, id clustersvc.ClusterID) (*clustersvc.Cluster, error) {
-	f.s.mu.Lock()
-	defer f.s.mu.Unlock()
-	c, ok := f.s.clusters[id]
-	if !ok {
-		return nil, clustersvc.ErrNotFound
+func (f fakeCaches) Clear(_ context.Context, id clustersvc.ClusterCacheID) (*clustersvc.ClusterCache, error) {
+	for _, c := range f.s.cacheSnapshot() {
+		if c.ID == id {
+			return &c, nil
+		}
 	}
-	cp := *c
-	return &cp, nil
+	return nil, clustersvc.ErrNotFound
 }
 
 func (f fakeClusters) Delete(_ context.Context, id clustersvc.ClusterID) error {

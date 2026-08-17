@@ -466,7 +466,7 @@ describe('ClusterSyncPanel', () => {
             data: {
               clusterEnabledSet: { __typename: 'Cluster', id: 'u', spec: { enabled: false } },
               clusterSyncEnabledSet: { __typename: 'Cluster', id: 'u', spec: { syncEnabled: false } },
-              clusterCacheClear: { __typename: 'Cluster', id: 'u' },
+              clusterCacheClear: { __typename: 'ClusterCache', id: 'cache-u' },
               clusterDelete: true,
               clusterConnectionRetry: true,
             },
@@ -1347,9 +1347,11 @@ describe('ClusterSyncPanel', () => {
 
     expect(screen.getByRole('button', { name: /clear cache for staging/i })).toBeDisabled();
     await user.click(await screen.findByRole('button', { name: /clear cache for prod-us/i }));
+    // The cache's own id, not the cluster's: a UID migration leaves a cluster owning
+    // more than one, and the mutation clears exactly the one it is handed.
     expect(invokeMock).toHaveBeenCalledWith(
       'graphql_query',
-      expect.objectContaining({ body: expect.stringContaining('clusterCacheClear') }),
+      expect.objectContaining({ body: expect.stringContaining('cache-u-prod') }),
     );
   });
 

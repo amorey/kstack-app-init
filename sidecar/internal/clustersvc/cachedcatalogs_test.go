@@ -93,10 +93,15 @@ func TestEnsureClusterCachedCatalogRelaysAFlip(t *testing.T) {
 }
 
 // A placeholder until the kind is rebuilt: it must settle the object rather than
-// requeue it, or beehive would spin on a kind nothing reconciles yet.
+// requeue it, or beehive's owed pass would re-dispatch every catalog forever.
 func TestCachedCatalogControllerReconcilesToANoOp(t *testing.T) {
-	res, err := (&clusterCachedCatalogController{}).Reconcile(context.Background(), nil, &beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]{ID: 1})
+	client := &settleRecorder[ClusterCachedCatalogStatus]{}
+	obj := &beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]{ID: 1, Generation: 3}
+
+	res, err := (&clusterCachedCatalogController{}).Reconcile(context.Background(), client, obj)
 
 	require.NoError(t, err)
 	assert.Equal(t, beehive.Result{}, res)
+	require.NotNil(t, client.observed)
+	assert.Equal(t, obj.Generation, *client.observed)
 }

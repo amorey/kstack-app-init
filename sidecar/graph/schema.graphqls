@@ -849,8 +849,8 @@ type Mutation {
   clusterDelete(id: ObjectID!): Boolean!
 
   # --- ClusterCache ---
-  "Clear a cluster's on-disk cache but keep its registry record. The cache's sync workers are restarted onto the emptied file, so a present, enabled cluster re-syncs from scratch. Returns the updated cluster."
-  clusterCacheClear(id: ObjectID!): Cluster!
+  "Clear one cache's on-disk file but keep its record. Its sync workers are restarted onto the emptied file, so a present, enabled cluster re-syncs from scratch. Takes the cache's own id, not its cluster's: a UID migration leaves a cluster owning more than one. Returns the cleared cache."
+  clusterCacheClear(id: ObjectID!): ClusterCache!
 
   # --- Cloud account ---
   "Start the sidecar-owned browser sign-in (OAuth). Setup (loopback bind + browser open) runs synchronously, so a setup failure — or no cloud account — returns an error. Returns true once the browser opens; the token exchange then completes in the background, with the signed-in state delivered via authStateWatch."

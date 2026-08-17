@@ -198,6 +198,33 @@ func TestRESTConfigKeySplitsOnThePerClusterExecConfig(t *testing.T) {
 	assert.NotEqual(t, prod, staging)
 }
 
+// clientcmd's merge takes the user's *api.ExecConfig by pointer and then writes the
+// cluster's exec extension through it, so resolving against the service's snapshot
+// edits what every other reader — and the poll loop's unchanged check — sees. A user
+// entry shared by two clusters is where it surfaces: the second resolve would leave
+// the first one's credentials describing the other cluster's audience.
+func TestResolveLeavesTheSnapshotAlone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	require.NoError(t, os.WriteFile(path, []byte(execKubeconfig), 0o600))
+	svc := newServiceAt(t, path, testInterval)
+	start(t, svc)
+
+	cfg, read := svc.Get()
+	require.True(t, read)
+	before := cfg.DeepCopy()
+
+	prod, err := resolve(cfg, "prod")
+	require.NoError(t, err)
+	_, err = resolve(cfg, "staging")
+	require.NoError(t, err)
+
+	assert.Equal(t, before, cfg, "the snapshot every other reader shares")
+
+	ext, ok := prod.ExecProvider.Config.(*runtime.Unknown)
+	require.True(t, ok)
+	assert.Contains(t, string(ext.Raw), "prod", "prod's credentials must not pick up staging's audience")
+}
+
 // --- fingerprint ---
 
 func TestFingerprintIsStableForUnchangedCredentials(t *testing.T) {

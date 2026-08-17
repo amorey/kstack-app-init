@@ -78,8 +78,12 @@ func TestStartAllUnwindsWhenOneFails(t *testing.T) {
 
 	stop, err := StartAll(context.Background(), parts)
 
-	assert.Nil(t, stop)
 	assert.ErrorIs(t, err, boom)
+	assert.Equal(t, []string{"start:a", "stop:a"}, log)
+	// Callable rather than nil, so a deferred stop written above the error check is
+	// safe. It stops nothing more: the unwind above it already drained "a".
+	require.NotNil(t, stop)
+	assert.NoError(t, stop(context.Background()))
 	assert.Equal(t, []string{"start:a", "stop:a"}, log)
 }
 

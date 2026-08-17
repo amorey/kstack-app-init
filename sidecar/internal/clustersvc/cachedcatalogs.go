@@ -146,5 +146,7 @@ func (c *clusterCachedCatalogController) Reconcile(
 	client beehive.ControllerClient[ClusterCachedCatalogStatus],
 	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
 ) (beehive.Result, error) {
-	return beehive.Result{}, nil
+	// A no-op still settles: unsettled, every catalog is re-dispatched — and re-read —
+	// on each owed pass for the life of the process.
+	return beehive.Result{}, settleGeneration(ctx, client, obj.ID, obj.Generation)
 }
