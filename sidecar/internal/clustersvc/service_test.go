@@ -101,10 +101,10 @@ func TestNewRejectsAnUnopenableStore(t *testing.T) {
 func TestRegisterControllersRejectsADuplicateKind(t *testing.T) {
 	bh := newTestBeehive(t)
 
-	_, _, err := registerControllers(bh, deps{})
+	_, err := registerControllers(bh, deps{})
 	require.NoError(t, err)
 
-	_, _, err = registerControllers(bh, deps{})
+	_, err = registerControllers(bh, deps{})
 	assert.Error(t, err)
 }
 
@@ -186,4 +186,13 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 	for name, call := range calls {
 		t.Run(name, func(t *testing.T) { assert.Panics(t, call) })
 	}
+}
+
+// The bootstrap is a Part, so a store that cannot hold the anchors fails the start
+// rather than leaving a service whose discovery pass has nothing to run against.
+func TestStartFailsWhenTheAnchorsCannotBeCreated(t *testing.T) {
+	part := clusterSourceBootstrap(deps{sourceClient: &stubSourceClient{createErr: errors.New("boom")}})
+
+	_, err := lifecycle.StartAll(context.Background(), []lifecycle.Part{part})
+	assert.ErrorContains(t, err, "cluster source records")
 }

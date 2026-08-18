@@ -164,12 +164,13 @@ are the ones worth writing.
 ## First consumer: the cluster prober
 
 Connecting is background work on its own clock, not part of converging a record. So it runs
-beside the controller, not inside it, in the shape `clustersvc` already uses twice: a leaf does
-the I/O on its own schedule, and `Reconcile` reads its latest answer and writes it to the record.
+beside the controller, not inside it, in the shape `clustersvc` already uses for the kubeconfig:
+a leaf does the I/O on its own schedule, and `Reconcile` reads its latest answer and writes it to
+the record.
 
-The prober lives in `clusters.go` beside the kubeconfig importer — both are the Cluster kind's
-machinery, and both run outside beehive. It decides membership and cadence; the two app-owned
-services supply credentials and connections.
+The prober lives in `clusters.go` as the Cluster kind's own machinery, running outside beehive —
+a controller reconciles one object that already exists, and this decides membership and cadence.
+The two app-owned services supply credentials and connections.
 
 ```go
 // Track declares that a cluster should be connected, at contextName. Idempotent; a

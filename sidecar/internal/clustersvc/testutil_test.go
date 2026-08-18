@@ -23,8 +23,10 @@ import (
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
+	"github.com/amorey/gochan/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -55,9 +57,26 @@ func newTestDeps(t *testing.T) deps {
 	bh := newTestBeehive(t)
 	d := newDeps(bh, newTestKubeconfig(t), nil, nil)
 
-	_, _, err := registerControllers(bh, d)
+	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
+
+	// The anchors the real service creates at startup: clusterController.Reconcile
+	// reads one to declare its dependency edge.
+	require.NoError(t, ensureClusterSources(context.Background(), d.sourceClient))
 	return d
+}
+
+// newClusterStatusDeps is newTestDeps plus the Cluster kind's ControllerClient, which
+// only Register hands out — a test that needs a stored Cluster status has no other way
+// to write one. Registers that kind alone, so it does not run the anchor bootstrap.
+func newClusterStatusDeps(t *testing.T) (deps, beehive.ControllerClient[ClusterStatus]) {
+	t.Helper()
+	bh := newTestBeehive(t)
+	d := newDeps(bh, newTestKubeconfig(t), nil, nil)
+
+	client, err := beehive.Register(bh, ClusterGroupKind, &clusterController{deps: d})
+	require.NoError(t, err)
+	return d, client
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -107,4 +126,37 @@ type settleRecorder[Status any] struct {
 func (c *settleRecorder[Status]) SetObservedGeneration(_ context.Context, _ beehive.ObjectID, generation int64) error {
 	c.observed = &generation
 	return nil
+}
+
+// fakeKubeconfigSource is a hub the test publishes into, standing in for the
+// watcher: same current-on-subscribe contract, driven by hand.
+type fakeKubeconfigSource struct{ hub *watch.Hub[*api.Config] }
+
+func newFakeKubeconfigSource(initial *api.Config) *fakeKubeconfigSource {
+	return &fakeKubeconfigSource{hub: watch.New(initial)}
+}
+
+func (f *fakeKubeconfigSource) Subscribe() kubeconfig.Subscription { return f.hub.Receiver() }
+
+// publish pushes a new snapshot to every subscriber.
+func (f *fakeKubeconfigSource) publish(cfg *api.Config) { f.hub.Sender().Send(cfg) }
+
+// close ends every subscription, standing in for the watcher shutting down.
+func (f *fakeKubeconfigSource) close() { f.hub.Close() }
+
+// cfgWith builds a snapshot holding one context per name, each naming its own cluster
+// and user entry.
+func cfgWith(names ...string) *api.Config {
+	cfg := &api.Config{Contexts: map[string]*api.Context{}}
+	for _, n := range names {
+		cfg.Contexts[n] = &api.Context{Cluster: n + "-cluster", AuthInfo: n + "-user"}
+	}
+	return cfg
+}
+
+// cfgCurrent is cfgWith with one of the contexts marked current.
+func cfgCurrent(current string, names ...string) *api.Config {
+	cfg := cfgWith(names...)
+	cfg.CurrentContext = current
+	return cfg
 }

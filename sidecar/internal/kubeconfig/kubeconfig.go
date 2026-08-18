@@ -134,7 +134,7 @@ func (s *Service) Subscribe() Subscription {
 
 // Start reloads once, then launches the poll loop and returns the func that ends it.
 // The first reload is synchronous so that whoever subscribes after Start sees real
-// state: on the empty seed an importer would reconcile a config known to hold
+// state: on the empty seed a consumer would reconcile a config known to hold
 // nothing. Nothing here can fail.
 func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 	// Watches before the first read, so the two overlap instead of leaving a gap: a
@@ -351,7 +351,7 @@ func (s *Service) poll() {
 		return
 	}
 
-	// Compared whole rather than by a projection: the contexts drive the importer,
+	// Compared whole rather than by a projection: the contexts drive cluster discovery,
 	// and the cluster and user entries behind them resolve credentials, so every
 	// field reaches someone.
 	s.mu.Lock()

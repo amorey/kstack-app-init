@@ -22,7 +22,7 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 
 ## Cluster subsystem (`internal/clustersvc`)
 
-**Mid-rebuild.** The layout:
+**Mid-rebuild.** The layout — five beehive kinds, four of which are GraphQL families:
 
 ```
 internal/clustersvc/
@@ -33,6 +33,10 @@ internal/clustersvc/
   cachedcatalogs.go   │ record GraphQL binds, its *WatchFrame, its controller, and
   cachedresources.go  │ the machinery that controller owns
   cacheddata.go       ┘ (no controller — the one family that isn't a beehive kind)
+  clustersources.go   the ClusterSource kind: one discovery anchor per source variant.
+                      A beehive kind with no GraphQL type behind it — internal
+  notifiers.go        the source-feed→control-plane bridge, the one thing outside
+                      beehive. Generic over the feed; one constructor per source
   shared.go           vocabulary every family reuses, the app's services as this
                       package sees them, and the two GraphQL scalars
   stream.go           Stream[T]
@@ -50,7 +54,7 @@ and most family methods still panic** — `TestUnimplementedBoundaryPanics` is t
 is left, and an entry must be deleted as its method lands, since the test fails when a stub stops
 panicking.
 
-Built so far, produced: the importer that creates `Cluster` records,
+Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` records,
 `clusterController.Reconcile` observing what the kubeconfig says about each one
 (`status.source.kubeconfig`), and that same pass creating the `ClusterCache` for the identity a
 probe recorded, and `clusterCacheController.Reconcile` creating the `ClusterCachedCatalog` beneath
@@ -80,11 +84,9 @@ consecutive reviews found a different place that had forgotten it.
 goroutine and the beehive watch behind it.
 
 **A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
-lifecycle — read `clusterController.machinery()` for what the Cluster kind owns, and the leaves each
-other controller grows land the same way. Otherwise the composition root accumulates every kind's
-detail.
-`registerControllers` builds and registers all four, returning them in registration order plus the
-cluster's on its own, which is the one `New` keeps a reference to. All four register with
+lifecycle. No kind has any yet — all five embed `lifecycle.None` — but the leaves a controller grows
+land there rather than on `service`, or the composition root accumulates every kind's detail.
+`registerControllers` builds and registers all five, returning them in registration order. All register with
 `startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
 reads as settled, since the generation was observed by a process that is gone. **No periodic full
 pass** — controllers re-arm with `RequeueAfter` and the out-of-band buses cover the rest.
@@ -117,8 +119,9 @@ composition](../docs/adr/2026-08-16-lifecycle-composition.md).
 cluster's probe, and a controller only ever reconciles an object that already exists — so
 `clusterController.Reconcile` creates the `ClusterCache` (via `ensureClusterCache`) and
 `clusterCacheController.Reconcile` the `ClusterCachedCatalog` beneath it (via
-`ensureClusterCachedCatalog`), and the same shape carries on down the chain. Distinct from an
-importer, which decides which objects exist *including when there are none*. **The writes live in the
+`ensureClusterCachedCatalog`), and the same shape carries on down the chain. Distinct from a
+discovery pass, which decides which objects exist *including when there are none*, and so needs an
+anchor object of its own to run against. **The writes live in the
 child kind's file**, not the parent's: the name, spec and owner edge are that kind's vocabulary, and
 the parent supplies only the policy — when, and with which switch. A teardown stops the chain: a
 pass whose object, or whose owner, is deletion-pending or already collected writes nothing, since the
@@ -138,48 +141,74 @@ generation, which is already a wake. The cache is the exception precisely becaus
 read the cluster, and reading another object is what an edge pays for. Adding a `depends_on` where a
 spec write already carries the value buys nothing and doubles the wakes.
 
-**Importers create Cluster records; controllers reconcile them.** An importer runs *outside* beehive
-because it decides which objects exist — which means running when there are none, and a controller
-reconciles one object that already does. (It hangs off the controller for lifecycle ownership only;
-`Reconcile` never touches it.) Each importer covers one `ClusterSpecSource` variant and is
-**creation-only**: it creates a record for every context nothing yet references and never updates,
-orphans, or deletes. A departed context is orphaned by `clusterController` observing it absent
-(`IsPresent=false`), which keeps set membership and per-object observation from fighting. It is also
-why status is unreachable from an importer at all: `UpdateStatus` lives on beehive's
-`ControllerClient`, which only a registered controller is handed.
+**Discovery is a beehive kind, not a loop beside one.** `ClusterSource` is one anchor object per
+`ClusterSpecSource` variant (today `clustersource/kubeconfig`), and its controller runs the pass that
+keeps the record set in step with that source. It is a kind precisely so the pass gets what a loop
+would have to hand-roll: beehive's backoff ladder on a failed pass, `startupPass` for the boot
+import, `Requeue` as the out-of-band kick, an observed generation, and an events timeline. The one
+piece outside beehive is a `notifier` (`notifiers.go`), which subscribes to the source's own change
+feed and `Requeue`s that source's anchor — a source of truth is not an object, so nothing else could
+span that gap. It is generic over the feed's element type (`feed[T]`, satisfied by any
+`Chan()`/`Close()` pair) because **the value is dropped**: a poke asks for a pass, and the pass reads
+current state. A second source is `newNotifier(name, subscribe, client)` and nothing else. It carries
+**no retry**: a lost poke costs latency, since the anchor re-arms on `clusterSourceResyncInterval`.
 
-**One pass creates and wakes.** The observation reads the watcher rather than the object, so beehive
-cannot know it went stale; the same pass that creates the missing records therefore `Requeue`s the
-ones that already existed. They share a trigger and a `List`, and a requeue is a wake rather than a
-write, so creation-only still holds. A departure is absent from the snapshot the create loop walks —
-the wake is the only thing that reaches it. Creates and wakes share one retry ladder — a doubling
-delay capped at `importRetryMax` — because a lost wake is the failure nothing else re-levels: an
-unchanged kubeconfig republishes nothing, so the record keeps a stale observation until the file next
-changes. The one wake error that is not retried is a record collected since the `List`, which no
-later pass would find.
+The pass is **creation-only** (`ensureKubeconfigClusters`, which lives in `clusters.go` because the
+name and spec are the Cluster kind's vocabulary): it creates a record for every context nothing yet
+references and never updates, orphans, or deletes. A departed context is orphaned by
+`clusterController` observing it absent (`IsPresent=false`), which keeps set membership and
+per-object observation from fighting, and lets a returning context reuse its record **with the
+user's toggles intact**. It is also why status is unreachable from the pass: `UpdateStatus` is
+per-kind on beehive's `ControllerClient`, so the anchor's controller cannot write a Cluster's status
+even though it creates the record.
 
-**`Reconcile` defers until the kubeconfig has been read.** beehive sits at the head of
+**The anchor's status is a wake signal, not a report.** It carries one field — a fingerprint of what
+the pass observed — and every `Cluster` declares `AddDependency(cluster, anchor)` from its own
+reconcile, so one status write there wakes all of them through beehive's dependency waker, with the
+stale-dependents pass as the guarantee behind it. The observation reads `kubeconfigSvc.Get()` rather
+than the object, so beehive cannot know it went stale; the edge is the only thing that reaches it,
+and a departed context — absent from every snapshot the create pass walks — is reachable *no other
+way*. **A stamp that moved every pass would wake every record every pass** — that is the trap the
+fingerprint exists to avoid, and any new field on `ClusterSourceStatus` inherits it.
+
+`kubeconfigFingerprint` is **computed by running `observeKubeconfig`**, not by naming the config
+fields it happens to read. That is the whole point: a digest that listed the fields itself would
+silently stop tracking the day the fold reads one more, and no record would be woken to observe it —
+a divergence no test would catch, since every unit test stubs the write. Keep the derivation if you
+touch it.
+
+The wake is deliberately broad rather than targeted: to know which records a change affects you must
+compare each one's stored observation against the snapshot, which is the per-object work the Cluster
+controller already does. An unaffected pass is a map lookup, a struct compare, and a no-op settle.
+Narrowing it means assuming stored state matches the last event, which is the assumption
+level-triggered reconciliation exists not to make. Revisit only when a pass becomes expensive — at
+which point the fix is to gate the expense inside `Reconcile`, or to give discovery its own
+per-context kind whose spec the anchor writes (the shape `ClusterCachedResource` already uses).
+→ [ADR: discovery as a beehive kind](../docs/adr/2026-08-18-discovery-as-a-beehive-kind.md).
+
+**Both reconciles defer until the kubeconfig has been read.** beehive sits at the head of
 `service.parts`, so its first owed pass can reach a record left unsettled by a previous process
-before the app's kubeconfig service has read the file. `Service.Get` reports the read alongside the config
+before the app's kubeconfig service has read the file. For the anchor the stake is higher than a
+flap: importing against the pre-read config would fingerprint an empty set. `Service.Get` reports the read alongside the config
 precisely because the two states are the same value — an empty config — and observing the pre-read
 one would mark every present context absent and wake the kind's watches for a flap. Unread is a
 `RequeueAfter`, not a write.
 
-Scope an importer by the source discriminant (`Spec.Source.Kubeconfig != nil`), not by the name prefix.
-Manual creation will have no importer at all, so *"every Cluster has an importer behind it"* is not
-an invariant to lean on.
+Scope a discovery pass by the source discriminant (`Spec.Source.Kubeconfig != nil`), not by the name
+prefix. Manual creation will have no source at all, so *"every Cluster has an anchor behind it"* is
+not an invariant to lean on — the dependency edge is declared only for records that have one.
 
 **Watches are pull-first** — correctness comes from the poll, and push only makes it prompt.
 `kubeconfig.Service` is the worked example (its godoc has the reasoning): a 30-minute backstop tick
 under fsnotify wakes and a poke subscription, both optional and allowed to fail. Applies to every
 watch. **Keep the tick under a new push layer rather than replacing it** — it is what covers what
 events cannot see, including the resume the poke subscription is there for.
-`kubeconfigImporter` has no tick and no poke of its own: its triggers are a kubeconfig snapshot and
-`Resync`, and a failed pass re-levels on the backoff retry. Whatever changes the record set out of
-band has to call `Resync` — `Clusters().Delete` does, since deleting a `Cluster` whose context is
-still in the file frees that context without changing anything the kubeconfig service would
-republish. That pass fails while the drained record still holds the name, and the retry ladder
-covers the tail.
+The `ClusterSource` anchor follows it: `clusterSourceResyncInterval` is the poll, and the notifier
+only makes it prompt. **Nothing changes the record set out of band**, which is what lets the anchor
+have no other trigger: `Clusters().Delete` refuses a record its source still declares, so a delete
+can never free a natural key the source would want back. **The create pass still runs ahead of the
+fingerprint gate** — a failed create is retried against the snapshot that failed, so a pass that
+returned early there would skip the retry.
 
 The service watches **directories, and follows symlinks**: a save replaces the inode (so a
 file-level watch goes deaf), and a dotfiles-managed kubeconfig is a link whose target lives in a
@@ -197,9 +226,9 @@ controller: **if `go test ./internal/clustersvc` stops being fast, one has leake
 
 **A process-wide service is the app's, and this package only reads it.** `kubeconfig.Service` and
 `kubeconn.Service` arrive through `deps` behind the narrow `kubeconfigService`/`kubeconnService`
-(both in `shared.go`), so `clusterController` neither starts nor closes them — the kubeconfig's
-`Close` ends every subscription in the process, including other packages'. Only the importer is the
-controller's own machinery.
+(both in `shared.go`), so nothing in this package starts or closes them — the kubeconfig's
+`Close` ends every subscription in the process, including other packages'. The notifier subscribes
+to it and releases only its own subscription.
 
 The five families are `Clusters()`, `Caches()`, `CachedCatalogs()`, `CachedResources()`, and
 `CachedData()`. **The `Cached*` prefix marks the cache subtree** — what a `ClusterCache` catalogs,
@@ -281,7 +310,7 @@ The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `
 - **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCachedResource`/`clusterCachedResources(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.cachedResources`). The resolver picks the boundary method the argument implies — `Caches().List` when nil, `Caches().ListByCluster` when set. Keep that shape when adding a noun.
 - **The query path skips `ClusterCachedCatalog`.** `ClusterCache.cachedResources` is keyed by the cache and resolves the catalog itself (`CachedResources().List`, like `CachedResources().Watch`): exactly one catalog exists per cache and its name is derived from the cache id (`ClusterCachedCatalogName`), so it is an implementation detail, not a branch to navigate. The catalog's own state still streams on `clusterCachedCatalogsWatch`.
 - **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
-- Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (takes the **cache's own id**, since a UID migration leaves a cluster owning more than one: delete files then **bounce that cache's workers** — nothing else would rebuild them; they cold-sync, the cookie died with the file), `clusterDelete` (GC cascades; a still-present context is re-imported under a fresh id).
+- Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (takes the **cache's own id**, since a UID migration leaves a cluster owning more than one: delete files then **bounce that cache's workers** — nothing else would rebuild them; they cold-sync, the cookie died with the file), `clusterDelete` (GC cascades to the cache; **refused with `ErrDeclaredBySource` for a record its source still declares**, since the discovery pass would re-import it under a fresh id and the new record would carry defaults rather than the user's toggles . **The guard reads the kubeconfig, not the record's observation**, which is only a cached view of it: status is nil for exactly as long as a just-imported record has not reconciled, and the webview renders such a record as orphaned (`isPresent ?? false`) — so its Remove button is live in precisely the window a status-only check would wave through. Status is the fallback while the file is unread, and a record with neither is refused, since refusing is recoverable and allowing is not).
 - `ClusterCachedDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the record keeps value `time.Time` for comparability.
 - **A watch that dies reports why** (`graph/watch_failure.go`). gqlgen builds each subscription frame as data alone and stops the instant the resolver's channel closes, so a failed watch is otherwise byte-identical to a graceful end and the webview reconnects forever with nothing shown. `WatchFailureExtension` bridges that in two halves — the resolver and the frame that would carry the reason never share a response context: `InterceptOperation` hangs a slot on the operation ctx (gqlgen threads it into the resolvers *and* every later frame), `watchStream` files `Stream.Err()` into it as the frames run out, and `InterceptResponse` claims it once the stream is spent, emitting one errors-only `graphql.Response` before the transport completes. Claimed once, so the next poll ends the subscription instead of looping. The reason goes through `AddError`, so the server's error presenter logs it. The client treats that frame as a drop with a reason — reported, last-known data held, reconnect — see the root `CLAUDE.md`. → [ADR: watch-failure reporting](../docs/adr/2026-08-14-watch-failure-reporting.md).
 

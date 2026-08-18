@@ -360,19 +360,6 @@ func TestCachesWatchListCancellationIsQuiet(t *testing.T) {
 
 // --- ClusterCachedCatalog creation ---
 
-// cacheControllerDeps is newTestDeps plus the Cluster kind's ControllerClient, which
-// only Register hands out: a cache reconcile reads its cluster's probed identity, and
-// nothing but a controller can write one.
-func cacheControllerDeps(t *testing.T) (deps, beehive.ControllerClient[ClusterStatus]) {
-	t.Helper()
-	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), nil, nil)
-
-	client, err := beehive.Register(bh, ClusterGroupKind, newClusterController(d))
-	require.NoError(t, err)
-	return d, client
-}
-
 // storedCluster writes a tracked cluster with syncing set as asked, probed at uid.
 // Both halves are stored, because the reconcile under test re-reads them.
 func storedCluster(t *testing.T, d deps, status beehive.ControllerClient[ClusterStatus], syncEnabled bool, uid string) *beehive.Object[ClusterSpec, ClusterStatus] {
@@ -428,7 +415,7 @@ func reconcileCache(t *testing.T, d deps, obj *beehive.Object[ClusterCacheSpec, 
 // A cache owns the discovery anchor beneath it, so the pass that knows the cluster's
 // toggles is the one that creates it.
 func TestCacheReconcileCreatesTheCatalog(t *testing.T) {
-	d, status := cacheControllerDeps(t)
+	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, true, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 
@@ -444,7 +431,7 @@ func TestCacheReconcileCreatesTheCatalog(t *testing.T) {
 // converged. Without it the store keeps every cache unsettled and beehive's owed pass
 // re-runs this reconcile, store reads and all, every interval forever.
 func TestCacheReconcileSettlesTheGeneration(t *testing.T) {
-	d, status := cacheControllerDeps(t)
+	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, true, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	client := &cacheControllerClient{caches: d.cacheClient}
@@ -459,7 +446,7 @@ func TestCacheReconcileSettlesTheGeneration(t *testing.T) {
 // The relayed switch is the cluster's, and a write there wakes nothing here on its
 // own — so the pass declares the dependency that makes the next relay certain.
 func TestCacheReconcileDependsOnItsCluster(t *testing.T) {
-	d, status := cacheControllerDeps(t)
+	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, true, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	client := &cacheControllerClient{caches: d.cacheClient}
@@ -473,7 +460,7 @@ func TestCacheReconcileDependsOnItsCluster(t *testing.T) {
 // A cache on its way out is about to be collected with everything it owns, so a pass
 // that recreated its anchor would only make work for the GC.
 func TestCacheReconcileWritesNothingForADyingCache(t *testing.T) {
-	d, status := cacheControllerDeps(t)
+	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, true, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
@@ -489,7 +476,7 @@ func TestCacheReconcileWritesNothingForADyingCache(t *testing.T) {
 // A cluster on its way out cascades to this cache next, so its subtree is not worth
 // growing.
 func TestCacheReconcileWritesNothingForADyingCluster(t *testing.T) {
-	d, status := cacheControllerDeps(t)
+	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, true, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	require.NoError(t, d.clusterClient.Delete(context.Background(), cluster.ID))
@@ -502,7 +489,7 @@ func TestCacheReconcileWritesNothingForADyingCluster(t *testing.T) {
 // The cascade can also finish first, collecting the cluster between the owner lookup
 // and the read of it — an ordinary race, not a failure to retry under backoff.
 func TestCacheReconcileWritesNothingWhenItsClusterIsCollected(t *testing.T) {
-	d, status := cacheControllerDeps(t)
+	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, true, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	gone := beehive.ObjectID(9999)
@@ -520,7 +507,7 @@ func TestCacheReconcileWritesNothingWhenItsClusterIsCollected(t *testing.T) {
 // An owner edge is what a cache is reconciled against, so one without it has nothing
 // to relay.
 func TestCacheReconcileWritesNothingWithoutAnOwner(t *testing.T) {
-	d, _ := cacheControllerDeps(t)
+	d, _ := newClusterStatusDeps(t)
 
 	reconcileCache(t, d, &beehive.Object[ClusterCacheSpec, ClusterCacheStatus]{ID: 1})
 
@@ -530,7 +517,7 @@ func TestCacheReconcileWritesNothingWithoutAnOwner(t *testing.T) {
 // The switch is the cluster's, read off the record rather than the cache's own spec —
 // which is why the pass reads its owner at all.
 func TestCacheReconcileRelaysThePauseFromItsCluster(t *testing.T) {
-	d, status := cacheControllerDeps(t)
+	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, false, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 

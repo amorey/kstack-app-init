@@ -13,9 +13,9 @@
 // limitations under the License.
 
 // The Cluster kind: a tracked kube-context. Its beehive spec/status shapes, the
-// record served to resolvers, its delta-watch frame, the Clusters implementation,
-// its controller, and the importers that create the records. Mirrors the Cluster
-// section of graph/schema.graphqls.
+// record served to resolvers, its delta-watch frame, the Clusters implementation, and
+// its controller. Mirrors the Cluster section of graph/schema.graphqls. The discovery
+// pass that creates the records is driven from clustersources.go.
 package clustersvc
 
 import (
@@ -23,16 +23,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/amorey/beehive"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -46,7 +42,7 @@ var ClusterGroupKind = beehive.GroupKind{Kind: "Cluster"}
 const namePrefixKubeconfig = "kubeconfig/"
 
 // KubeconfigName returns a kubeconfig-sourced Cluster's beehive name — the
-// importer's natural key for one kube-context, not an identity (see ClusterID).
+// discovery pass's natural key for one kube-context, not an identity (see ClusterID).
 func KubeconfigName(contextName string) string {
 	return namePrefixKubeconfig + contextName
 }
@@ -360,72 +356,77 @@ func wrapClusterErr(verb string, id ClusterID, err error) error {
 	return fmt.Errorf("%s cluster %d: %w", verb, id, err)
 }
 
-// Delete requests deletion; beehive's GC collects the record and cascades to what it
-// owns. A record already gone is the outcome the caller asked for, so a missing one is
-// not an error. A context still present in the kubeconfig is re-imported under a fresh
-// id — see TODO.md for the trigger that has to reach the importer for that to be prompt.
+// Delete forgets a record its source no longer declares: beehive's GC collects it and
+// cascades to the cache it owns. A record already gone is the outcome the caller asked
+// for, so a missing one is not an error.
+//
+// A record its source still declares is refused with ErrDeclaredBySource rather than
+// deleted, because the discovery pass would re-import it under a fresh id — the delete
+// would read as succeeding and then undo itself.
 func (a clustersAPI) Delete(ctx context.Context, id ClusterID) error {
+	obj, err := a.s.clusterClient.Get(ctx, beehive.ObjectID(id))
+	if errors.Is(err, beehive.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read cluster %d: %w", id, err)
+	}
+	if sourceDeclares(a.s.kubeconfigSvc, obj) {
+		return fmt.Errorf("delete cluster %d: %w", id, ErrDeclaredBySource)
+	}
+
 	if err := a.s.clusterClient.Delete(ctx, beehive.ObjectID(id)); err != nil && !errors.Is(err, beehive.ErrNotFound) {
 		return fmt.Errorf("delete cluster %d: %w", id, err)
 	}
-
-	// Deleting a record whose context is still in the file changes nothing the importer
-	// watches, so without this the context is not re-imported until the user next edits
-	// the kubeconfig. The name is held until the row drains, so this pass fails and the
-	// importer's retry ladder covers the tail.
-	a.s.clusterCtrl.resyncImports()
 	return nil
 }
 
-// kubeconfigUnreadRequeue paces a reconcile that arrived before the watcher's first
-// read. The read is synchronous in the watcher's Start, so this is only ever waited
-// out by the window between beehive starting and the controllers starting.
-const kubeconfigUnreadRequeue = time.Second
+// sourceDeclares reports whether the record's source still lists it. A record from no
+// source is nobody's to declare.
+//
+// The kubeconfig itself is the answer whenever it has been read — the record's own
+// observation is a cached view of that file, and it is nil for exactly as long as a
+// just-imported record has not reconciled yet, which is the window a delete must not
+// slip through. The stored observation is the fallback while the file is unread, and a
+// record with neither is refused: refusing is recoverable, since the caller retries a
+// moment later, where allowing is not — the discovery pass re-imports the context under
+// a fresh id and the user's toggles are gone with the old one.
+func sourceDeclares(cfgSvc kubeconfigService, obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+	src := obj.Spec.Source.Kubeconfig
+	if src == nil {
+		return false
+	}
+	if cfg, loaded := cfgSvc.Get(); loaded {
+		_, ok := cfg.Contexts[src.Context]
+		return ok
+	}
+	if observed := clusterStatus(obj).Source.Kubeconfig; observed != nil {
+		return observed.IsPresent
+	}
+	return true
+}
+
+// startupRequeue paces a reconcile that arrived inside a startup ordering window:
+// before the kubeconfig's first read, or before the discovery anchors exist. beehive
+// heads service.parts and dispatches its startup pass asynchronously, so a record
+// stored by a previous process can reach a reconcile before either has happened. Both
+// windows are bounded by the app's own startup, never by anything a user does.
+const startupRequeue = time.Second
 
 // clusterController reconciles a tracked cluster: today it observes what the
 // kubeconfig says about the record's context, and creates the ClusterCache for the
 // identity a probe has recorded. Resolving credentials and probing the API server are
 // still to come.
 //
-// It owns the Cluster kind's machinery too, so per-kind detail stays out of the
-// service struct: the importer that creates the records it reconciles and wakes them
-// when the file changes. Reconcile never touches the importer. The kubeconfig service
-// it reads to observe a context's presence is the app's, shared with every other
-// reader, so it is a dependency rather than machinery.
+// The kubeconfig service it reads to observe a context's presence is the app's,
+// shared with every other reader, so it is a dependency rather than machinery.
 type clusterController struct {
+	lifecycle.None
+
 	// Every kind's client, not just this one's: a cluster creates the ClusterCache
 	// children it owns.
 	deps
-
-	kubeconfigImporter *kubeconfigImporter
 }
-
-func newClusterController(d deps) *clusterController {
-	return &clusterController{
-		deps:               d,
-		kubeconfigImporter: newKubeconfigImporter(d.kubeconfigSvc, d.clusterClient),
-	}
-}
-
-// Start launches the kind's background work.
-func (c *clusterController) Start(ctx context.Context) (func(context.Context) error, error) {
-	return lifecycle.StartAll(ctx, c.machinery())
-}
-
-// Close releases what the stop func left, in the same reverse order.
-func (c *clusterController) Close() error {
-	return lifecycle.CloseAll(c.machinery())
-}
-
-// machinery lists the kind's leaves in start order.
-func (c *clusterController) machinery() []lifecycle.Part {
-	return []lifecycle.Part{
-		{Name: "kubeconfig importer", StartCloser: c.kubeconfigImporter},
-	}
-}
-
-// resyncImports asks the importer for a pass; see kubeconfigImporter.Resync.
-func (c *clusterController) resyncImports() { c.kubeconfigImporter.Resync() }
 
 func (c *clusterController) Reconcile(
 	ctx context.Context,
@@ -441,11 +442,31 @@ func (c *clusterController) Reconcile(
 	// beehive starts ahead of the controllers, so its first owed pass can reach a
 	// record left unsettled by a previous process before the kubeconfig's first read.
 	// Observing the pre-read config would report every present context absent and wake
-	// the kind's watches for a flap. The importer's first pass wakes every record once
-	// the service loads; the requeue is the backstop for a pass that failed.
+	// the kind's watches for a flap. The requeue is the backstop until the read lands.
 	cfg, loaded := c.kubeconfigSvc.Get()
 	if !loaded {
-		return beehive.Result{RequeueAfter: kubeconfigUnreadRequeue}, nil
+		return beehive.Result{RequeueAfter: startupRequeue}, nil
+	}
+
+	// The observation below reads the kubeconfig service rather than this object, so
+	// beehive cannot know when it goes stale. The edge onto the source anchor is what
+	// turns one status write there into a pass here; without it a departed context
+	// stays marked present until something unrelated wakes the record. Beehive records
+	// nothing when the edge is already there, so every later pass is free.
+	if obj.Spec.Source.Kubeconfig != nil {
+		src, err := c.sourceClient.GetByName(ctx, ClusterSourceNameKubeconfig)
+		if errors.Is(err, beehive.ErrNotFound) {
+			// Not a failure: the bootstrap creates the anchors after beehive starts, and
+			// this record predates the process. Failing here would drop every stored
+			// record into backoff on every boot, and skip the observation with it.
+			return beehive.Result{RequeueAfter: startupRequeue}, nil
+		}
+		if err != nil {
+			return beehive.Result{}, fmt.Errorf("read kubeconfig cluster source: %w", err)
+		}
+		if err := client.AddDependency(ctx, obj.ID, src.ID); err != nil {
+			return beehive.Result{}, fmt.Errorf("depend cluster %d on its source: %w", obj.ID, err)
+		}
 	}
 
 	// Ahead of the settle fast-path below: a record whose generation is already
@@ -459,8 +480,8 @@ func (c *clusterController) Reconcile(
 	prev := status.Source.Kubeconfig
 	status.Source.Kubeconfig = observeKubeconfig(cfg, obj.Spec.Source.Kubeconfig, prev)
 
-	// The importer wakes every record on every kubeconfig snapshot, so most passes
-	// observe nothing new, and UpdateStatus would marshal the status and open a
+	// A source's status write wakes every record it declares, so most passes observe
+	// nothing new, and UpdateStatus would marshal the status and open a
 	// transaction only to find the stored bytes equal. The generation is then all
 	// there is left to report — and only while it is unsettled, which a spec write
 	// this observation does not depend on (SetEnabled) is what leaves it. An object
@@ -494,8 +515,62 @@ func (c *clusterController) ensureCache(ctx context.Context, obj *beehive.Object
 
 // generationSettled reports whether the generation this reconcile was handed is already
 // recorded, which is beehive's own gate for dropping a repeat report.
-func generationSettled(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+func generationSettled[Spec, Status any](obj *beehive.Object[Spec, Status]) bool {
 	return obj.ObservedGeneration != nil && *obj.ObservedGeneration >= obj.Generation
+}
+
+// ensureKubeconfigClusters gives every context in cfg a Cluster record. Called by the
+// source's discovery pass; the writes live here so the kind's name and spec stay in
+// the kind's file.
+//
+// CREATION-ONLY: it writes nothing but the source reference on a new record, and
+// never updates, orphans, or deletes. A departed context is orphaned by
+// clusterController observing it absent (IsPresent=false), and a returning one reuses
+// its never-deleted record — which is what preserves the user's toggles across a
+// context that comes and goes.
+//
+// The deterministic name KubeconfigName(context) is the reconcile key, so beehive's
+// name-uniqueness rules out a duplicate under a concurrent create.
+//
+// No single context aborts the pass. Contexts come out of a map, so stopping at the
+// first failure would import an arbitrary subset that differs run to run — the worst
+// shape a partial import has.
+func ensureKubeconfigClusters(ctx context.Context, client beehive.Client[ClusterSpec, ClusterStatus], cfg *api.Config) error {
+	objs, err := client.List(ctx)
+	if err != nil {
+		return fmt.Errorf("listing clusters: %w", err)
+	}
+
+	// A record awaiting deletion leaves its context unclaimed and owed a fresh one.
+	// Creating it fails while the draining row still holds the name, which is why this
+	// pass reports the failure rather than skipping it: beehive's backoff is the retry.
+	claimed := make(map[string]struct{}, len(objs))
+	for _, obj := range objs {
+		if obj.DeletionRequestedAt != nil {
+			continue
+		}
+		if src := obj.Spec.Source.Kubeconfig; src != nil {
+			claimed[src.Context] = struct{}{}
+		}
+	}
+
+	var errs []error
+	for contextName := range cfg.Contexts {
+		if _, ok := claimed[contextName]; ok {
+			continue
+		}
+		// Enabled on arrival, both axes: a tracked context the user has to switch on
+		// before it appears in the picker reads as a broken import, not a default.
+		spec := ClusterSpec{
+			Enabled:     true,
+			SyncEnabled: true,
+			Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: contextName}},
+		}
+		if _, err := client.Create(ctx, KubeconfigName(contextName), spec); err != nil {
+			errs = append(errs, fmt.Errorf("creating cluster for context %q: %w", contextName, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // sameKubeconfigObservation compares two observations by value, nil included: a record
@@ -535,237 +610,4 @@ func observeKubeconfig(cfg *api.Config, src *ClusterSpecSourceKubeconfig, prev *
 	observed.IsPresent = false
 	observed.IsDefault = false
 	return &observed
-}
-
-// --- Importers ---
-//
-// An importer keeps the Cluster records for one ClusterSpecSource variant in step
-// with that source; today only the kubeconfig, with cloud accounts joining as a peer.
-// Manual creation has no importer — a mutation creates the record and a mutation
-// removes it — so "every Cluster has an importer behind it" is not an invariant to
-// lean on.
-//
-// An importer runs outside beehive: it decides which objects exist, which means
-// running when there are none, and a controller reconciles one object that already
-// does.
-
-// kubeconfigSource is the subscribe half of kubeconfigService, all the importer
-// needs, narrow so a test can substitute a hand-driven hub.
-type kubeconfigSource interface {
-	Subscribe() kubeconfig.Subscription
-}
-
-// A failed pass is retried on a doubling delay from importRetryBase, capped at
-// importRetryMax. Nothing else re-runs it: the loop is driven by kubeconfig CHANGES,
-// so "the next snapshot fixes it" can mean never. The cap is what keeps a lasting
-// failure — a store that stays unwritable, a name held by a record that never drains —
-// re-leveling at a sane cadence instead of every couple of seconds forever.
-const (
-	importRetryBase = 2 * time.Second
-	importRetryMax  = 5 * time.Minute
-)
-
-// kubeconfigImporter keeps the Cluster records in step with the kubeconfig. Each pass
-// creates a record for every context none yet references, then wakes every live
-// record's reconcile so it re-observes the snapshot.
-//
-// It is CREATION-ONLY: it writes nothing but the source reference on a new record,
-// and never updates, orphans, or deletes. A departed context is orphaned by
-// clusterController observing it absent (IsPresent=false), and a returning one reuses
-// its never-deleted record. The wake is not an exception — a requeue asks for a
-// reconcile, it does not write.
-//
-// The deterministic name KubeconfigName(context) is the reconcile key, so beehive's
-// name-uniqueness rules out a duplicate under a concurrent create.
-type kubeconfigImporter struct {
-	cfgSource     kubeconfigSource
-	clusterClient beehive.Client[ClusterSpec, ClusterStatus]
-
-	// Build seams, defaulted by newKubeconfigImporter and overridden only by this
-	// package's tests: the pass itself, and the cadence a test must not outwait.
-	sync      func(ctx context.Context, cfg *api.Config) error
-	retryBase time.Duration
-	retryMax  time.Duration
-
-	// resync requests a pass with no new snapshot behind it. Buffered by one and sent
-	// without blocking: the request is only ever "run again", so a second while one is
-	// pending adds nothing.
-	resync chan struct{}
-
-	wg sync.WaitGroup
-}
-
-func newKubeconfigImporter(cfgSource kubeconfigSource, clusterClient beehive.Client[ClusterSpec, ClusterStatus]) *kubeconfigImporter {
-	im := &kubeconfigImporter{
-		cfgSource:     cfgSource,
-		clusterClient: clusterClient,
-		retryBase:     importRetryBase,
-		retryMax:      importRetryMax,
-		resync:        make(chan struct{}, 1),
-	}
-	im.sync = im.syncClusterSet
-	return im
-}
-
-// Start launches the loop and returns the func that ends it. The subscription is
-// established before Start returns and is current-on-subscribe, so startup state is
-// imported immediately. Nothing here can fail.
-func (im *kubeconfigImporter) Start(context.Context) (func(context.Context) error, error) {
-	// Not Start's context, which bounds startup: this one bounds the loop and the pass
-	// in flight, so it lives until the stop func cancels it.
-	loopCtx, stopLoop := context.WithCancel(context.Background())
-
-	sub := im.cfgSource.Subscribe()
-	im.wg.Go(func() {
-		defer sub.Close()
-		im.run(loopCtx, sub)
-	})
-
-	return func(ctx context.Context) error {
-		stopLoop()
-		return drain.WithContext(ctx, im.wg.Wait)
-	}, nil
-}
-
-// Resync asks for a pass against the last snapshot. The loop's only other trigger is a
-// kubeconfig change, so whatever frees a context out of band — a Cluster deleted while
-// its context is still in the file — has to say so, or nothing re-imports it.
-func (im *kubeconfigImporter) Resync() {
-	select {
-	case im.resync <- struct{}{}:
-	default:
-	}
-}
-
-// Close is a no-op: the loop releases its subscription as it exits.
-func (im *kubeconfigImporter) Close() error { return nil }
-
-// nextRetryDelay returns the delay to follow one of d: doubled, then held at max.
-func nextRetryDelay(d, max time.Duration) time.Duration {
-	return min(2*d, max)
-}
-
-// run passes each kubeconfig snapshot through sync until stopped or the watcher
-// closes, retrying a failed pass against the snapshot that failed.
-func (im *kubeconfigImporter) run(ctx context.Context, sub kubeconfig.Subscription) {
-	// Kept so the retry has a snapshot to run against: it fires without one arriving.
-	var last *api.Config
-
-	delay := im.retryBase
-	retry := time.NewTimer(delay)
-	retry.Stop()
-	defer retry.Stop()
-
-	attempt := func() {
-		err := im.sync(ctx, last)
-		switch {
-		case err == nil:
-			// A newer snapshot can arrive and pass cleanly while an earlier failure's
-			// retry is still armed. Leaving it armed fires it against work already done.
-			retry.Stop()
-			delay = im.retryBase
-		case ctx.Err() != nil:
-			// The store call was cancelled with the loop, so the error describes the
-			// shutdown, not the pass. Nothing to retry: the next select exits.
-		default:
-			slog.Error("kubeconfig sync failed", "retryIn", delay, "err", err)
-			retry.Reset(delay)
-			delay = nextRetryDelay(delay, im.retryMax)
-		}
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case cfg, ok := <-sub.Chan():
-			if !ok {
-				return
-			}
-			last = cfg
-			attempt()
-		case <-retry.C:
-			// last is always set here: the timer is armed only inside attempt.
-			attempt()
-		case <-im.resync:
-			// Nothing to run against before the first snapshot, which is on its way.
-			if last != nil {
-				attempt()
-			}
-		}
-	}
-}
-
-// syncClusterSet creates a Cluster for every context in cfg that no record references
-// yet, then requeues the records that already existed — one pass, because both need
-// the same trigger and the same List. Safe to call any number of times: an unchanged
-// snapshot creates nothing, and a requeue whose reconcile observes no change writes
-// nothing.
-//
-// No single context aborts the pass. Contexts come out of a map, so stopping at the
-// first failure would import an arbitrary subset that differs run to run — the worst
-// shape a partial import has.
-func (im *kubeconfigImporter) syncClusterSet(ctx context.Context, cfg *api.Config) error {
-	objs, err := im.clusterClient.List(ctx)
-	if err != nil {
-		return fmt.Errorf("listing clusters: %w", err)
-	}
-
-	// A record awaiting deletion counts for neither pass: its context is unclaimed
-	// again and owed a fresh record (creating it fails while the name is still held,
-	// which the retry covers), and it owes no observation.
-	live := make([]*beehive.Object[ClusterSpec, ClusterStatus], 0, len(objs))
-	imported := make(map[string]struct{}, len(objs))
-	for _, obj := range objs {
-		if obj.DeletionRequestedAt != nil {
-			continue
-		}
-		live = append(live, obj)
-		if src := obj.Spec.Source.Kubeconfig; src != nil {
-			imported[src.Context] = struct{}{}
-		}
-	}
-
-	var errs []error
-	for contextName := range cfg.Contexts {
-		if _, ok := imported[contextName]; ok {
-			continue
-		}
-		// Enabled on arrival, both axes: a tracked context the user has to switch on
-		// before it appears in the picker reads as a broken import, not a default.
-		spec := ClusterSpec{
-			Enabled:     true,
-			SyncEnabled: true,
-			Source:      ClusterSpecSource{Kubeconfig: &ClusterSpecSourceKubeconfig{Context: contextName}},
-		}
-		if _, err := im.clusterClient.Create(ctx, KubeconfigName(contextName), spec); err != nil {
-			errs = append(errs, fmt.Errorf("creating cluster for context %q: %w", contextName, err))
-		}
-	}
-
-	// Only the records that predate this pass: beehive already owes a first reconcile
-	// to everything created above.
-	errs = append(errs, im.wakeAll(ctx, live))
-	return errors.Join(errs...)
-}
-
-// wakeAll asks beehive to reconcile each record, which is how a departed context is
-// observed absent: Reconcile reads the watcher rather than the object, and beehive
-// cannot know that read went stale. A departure is by definition absent from the
-// snapshot the create loop walks, so nothing else would reach it.
-//
-// A lost wake is the failure nothing else re-levels: the watcher republishes only when
-// the file's contents differ, so an unchanged backstop tick re-runs no pass, and the
-// record keeps a stale observation — a departed context still marked present — until
-// the user next edits the file. So a failed wake rides the retry ladder with the
-// creates. A record collected since the List is the exception: it owes no observation,
-// and no later pass would find it to wake.
-func (im *kubeconfigImporter) wakeAll(ctx context.Context, objs []*beehive.Object[ClusterSpec, ClusterStatus]) error {
-	var errs []error
-	for _, obj := range objs {
-		if err := im.clusterClient.Requeue(ctx, obj.ID); err != nil && !errors.Is(err, beehive.ErrNotFound) {
-			errs = append(errs, fmt.Errorf("waking cluster %d: %w", obj.ID, err))
-		}
-	}
-	return errors.Join(errs...)
 }

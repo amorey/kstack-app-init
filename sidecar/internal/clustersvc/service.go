@@ -318,6 +318,7 @@ type deps struct {
 	cacheClient    beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
 	catalogClient  beehive.Client[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]
 	resourceClient beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
+	sourceClient   beehive.Client[ClusterSourceSpec, ClusterSourceStatus]
 
 	kubeconfigSvc kubeconfigService
 	kubeconnSvc   kubeconnService
@@ -330,6 +331,7 @@ func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc k
 		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
 		catalogClient:  beehive.NewClient[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus](bh, ClusterCachedCatalogGroupKind),
 		resourceClient: beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
+		sourceClient:   beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
 		kubeconfigSvc:  kubeconfigSvc,
 		kubeconnSvc:    kubeconnSvc,
 		pokeSvc:        pokeSvc,
@@ -340,18 +342,15 @@ func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc k
 // top of them.
 type service struct {
 	deps
-	// clusterCtrl is held for its machinery as well as its lifecycle: a mutation that
-	// frees a kube-context has to reach the importer, which no store write would.
-	clusterCtrl *clusterController
 	// clusterSpecMu serializes the spec read-modify-write behind the Cluster setters,
 	// which beehive cannot do for them: Update takes a whole spec and offers no
 	// compare-and-swap.
 	clusterSpecMu sync.Mutex
 
-	// beehive first, then the controllers in registration order — held for their
-	// lifecycle alone, since nothing reads through them. Order is the whole contract:
-	// beehive starts before any controller and, being last to stop and close,
-	// outlives every reconcile that could still touch the store.
+	// beehive, the anchors it must be up to create, the controllers in registration
+	// order, then the notifier. Order is the whole contract: beehive starts before
+	// anything that reaches the store and, being last to stop and close, outlives
+	// every reconcile and every poke that could still touch it.
 	parts []lifecycle.Part
 }
 
@@ -394,16 +393,35 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnSe
 	}
 
 	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)
-	clusterCtrl, controllers, err := registerControllers(bh, d)
+	controllers, err := registerControllers(bh, d)
 	if err != nil {
 		bhStore.Close()
 		return nil, fmt.Errorf("register cluster controllers: %w", err)
 	}
-	return &service{
-		deps:        d,
-		clusterCtrl: clusterCtrl,
-		parts:       append([]lifecycle.Part{{Name: "beehive", StartCloser: beehiveRuntime{bh: bh, store: bhStore}}}, controllers...),
-	}, nil
+
+	parts := []lifecycle.Part{
+		{Name: "beehive", StartCloser: beehiveRuntime{bh: bh, store: bhStore}},
+		clusterSourceBootstrap(d),
+	}
+	parts = append(parts, controllers...)
+	parts = append(parts, lifecycle.Part{
+		Name:        "kubeconfig notifier",
+		StartCloser: newKubeconfigNotifier(d.kubeconfigSvc, d.sourceClient),
+	})
+
+	return &service{deps: d, parts: parts}, nil
+}
+
+// clusterSourceBootstrap creates the discovery anchors once beehive is up. A Part
+// rather than a step inside Start so a failure unwinds through StartAll and reports
+// under a name, like every other participant; it has no background work to stop.
+func clusterSourceBootstrap(d deps) lifecycle.Part {
+	return lifecycle.Part{
+		Name: "cluster source records",
+		StartCloser: lifecycle.StartFunc(func(ctx context.Context) (func(context.Context) error, error) {
+			return func(context.Context) error { return nil }, ensureClusterSources(ctx, d.sourceClient)
+		}),
+	}
 }
 
 // startupPass reconciles every object of a kind once per process. Each of these four
@@ -437,22 +455,23 @@ func settleGeneration[Status any](
 // kind's file, and returns them in registration order. Together here rather than four
 // calls spread across those files: the options are the whole subsystem's concurrency
 // and retry budget, and it only reads as a budget in one place.
-//
-// The cluster's is returned on its own as well, since New holds it for its machinery.
-func registerControllers(bh *beehive.Beehive, d deps) (*clusterController, []lifecycle.Part, error) {
-	cluster := newClusterController(d)
+func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) {
+	source := &clusterSourceController{deps: d}
+	cluster := &clusterController{deps: d}
 	cache := &clusterCacheController{deps: d}
 	catalog := &clusterCachedCatalogController{}
 	resource := &clusterCachedResourceController{}
 
+	_, errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass)
 	_, errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass)
 	_, errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
 	_, errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
 	_, errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
-	if err := errors.Join(errCluster, errCache, errCatalog, errResource); err != nil {
-		return nil, nil, err
+	if err := errors.Join(errSource, errCluster, errCache, errCatalog, errResource); err != nil {
+		return nil, err
 	}
-	return cluster, []lifecycle.Part{
+	return []lifecycle.Part{
+		{Name: "cluster source controller", StartCloser: source},
 		{Name: "cluster controller", StartCloser: cluster},
 		{Name: "cache controller", StartCloser: cache},
 		{Name: "cached-catalog controller", StartCloser: catalog},

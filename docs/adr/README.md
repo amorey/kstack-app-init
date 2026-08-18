@@ -81,3 +81,4 @@ usually just documentation in the wrong place.
 | 2026-08-10 | [Split internal/cluster into boundary, controllers, and domain](2026-08-10-cluster-package-split.md) | sidecar | Accepted |
 | 2026-08-14 | [Report a dead watch as a terminal GraphQL error](2026-08-14-watch-failure-reporting.md) | cross-cutting | Accepted |
 | 2026-08-16 | [Compose start/stop/close as one shape](2026-08-16-lifecycle-composition.md) | sidecar | Accepted |
+| 2026-08-18 | [Run cluster discovery as a beehive kind](2026-08-18-discovery-as-a-beehive-kind.md) | sidecar | Accepted |

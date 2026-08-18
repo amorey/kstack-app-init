@@ -39,6 +39,10 @@ controller), never deleted — so its id survives a return. A future creator (ma
 a new `ClusterSpecSource` variant plus a sibling importer, not a new kind: reintroduce a
 separate intake kind only if two sources must dedup into one Cluster.
 
+*Replaced by [Run cluster discovery as a beehive kind](2026-08-18-discovery-as-a-beehive-kind.md):
+discovery runs against a `ClusterSource` anchor object, and a new source is a new anchor. The
+creation-only rule and the orphan-never-delete rule carry over unchanged.*
+
 `WithStartupFullPass(true)` is declared per kind on the four kinds that own process-scoped
 state (live connections, sentinels, running workers, in-memory `RequeueAfter` schedules) — a
 restart invalidates state beehive's owed pass can't know about, since it was never written.

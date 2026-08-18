@@ -131,7 +131,7 @@ func TestNewReadsNothing(t *testing.T) {
 }
 
 func TestSubscribeIsCurrentOnSubscribe(t *testing.T) {
-	// The importer subscribes at startup and must not wait out a poll interval for
+	// A consumer subscribes at startup and must not wait out a poll interval for
 	// its first snapshot.
 	w := New(filepath.Join(t.TempDir(), "config"), nil)
 	sub := w.Subscribe()
@@ -308,7 +308,7 @@ func TestDanglingSymlinkStillSeesItsTargetAppear(t *testing.T) {
 }
 
 // A reload that finds nothing changed must publish nothing: every subscriber treats a
-// snapshot as news, and the importer re-lists every Cluster on one. Driven by calling
+// snapshot as news, and a discovery pass re-lists every Cluster on one. Driven by calling
 // poll directly, since the silence in the middle is what is under test — the third
 // frame being the edited config is what proves the second poll stayed quiet.
 func TestPollDoesNotRepublishAnUnchangedConfig(t *testing.T) {

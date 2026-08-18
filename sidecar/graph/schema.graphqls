@@ -273,7 +273,7 @@ type ClusterSpec {
 
 """
 The discriminated union naming a cluster record's origin: exactly one variant
-is set. Each variant is owned by exactly one creator (the kubeconfig importer
+is set. Each variant is owned by exactly one creator (the kubeconfig source
 today; manual creation and kstack-cloud sync are future variants).
 """
 type ClusterSpecSource {
@@ -845,7 +845,7 @@ type Mutation {
   "Force an immediate reconnection attempt, resetting any backoff. Returns true once scheduled."
   clusterConnectionRetry(id: ObjectID!): Boolean!
 
-  "Forget a cluster: delete its cache and its registry record. A still-present context is re-discovered on the next kubeconfig reconcile. Returns true."
+  "Forget an orphaned cluster: delete its cache and its registry record. Refused for a cluster its source still declares — the discovery pass would re-import it under a fresh id, losing the user's toggles to the new record's defaults; stop tracking it at the source, or disable it. Deleting a record already gone is not an error. Returns true."
   clusterDelete(id: ObjectID!): Boolean!
 
   # --- ClusterCache ---

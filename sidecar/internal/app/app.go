@@ -78,7 +78,7 @@ func New(cfg Config) (*App, error) {
 	pokeSvc := poke.New()
 
 	// The cluster backend behind one boundary. Mid-rebuild: beehive, the four
-	// controllers, and the kubeconfig watcher/importer are wired and run, but they
+	// controllers, and the kubeconfig watcher/notifier are wired and run, but they
 	// reconcile to no-ops and every read panics.
 	// One reader of the user's kubeconfig, shared by everything that resolves a
 	// context. Closing it ends every subscription, so it is the app's alone.

@@ -41,6 +41,14 @@ import (
 // a mutation's failure still reaches the webview as an internal string — see TODO.md.
 var ErrNotFound = errors.New("clustersvc: cluster not found")
 
+// ErrDeclaredBySource is the sentinel for deleting a record its source still declares,
+// matched with errors.Is. The source decides which records exist, so deleting one it
+// still lists would only re-import it under a fresh id — losing the user's toggles to
+// the new record's defaults, and every id a client was holding. Stop tracking such a
+// cluster at the source, or disable it. Unmapped on the wire, like ErrNotFound above —
+// see TODO.md.
+var ErrDeclaredBySource = errors.New("clustersvc: cluster is still declared by its source")
+
 // --- Process-wide services ---
 //
 // The app's own services as this package uses them: narrow, so a test hands a
@@ -49,7 +57,7 @@ var ErrNotFound = errors.New("clustersvc: cluster not found")
 // together in deps and reach every kind through it.
 
 // kubeconfigService is the one reader of the user's kubeconfig. RESTConfig is the
-// connection probe's seam; Reconcile reads Get and the importer subscribes.
+// connection probe's seam; the reconciles read Get and the notifier subscribes.
 type kubeconfigService interface {
 	Get() (*api.Config, bool)
 	RESTConfig(contextName string) (*rest.Config, string, error)
