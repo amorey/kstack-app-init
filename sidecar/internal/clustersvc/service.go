@@ -429,27 +429,9 @@ func clusterSourceBootstrap(d deps) lifecycle.Part {
 // connection, a running worker, an in-memory schedule. The store reads settled, because
 // the generation was observed by a process that is gone.
 //
-// There is deliberately no periodic full pass behind it — controllers re-arm with
-// RequeueAfter, and the out-of-band buses cover the rest.
+// There is deliberately no periodic full pass behind it — controllers re-arm with the requeue
+// delay on the result they return, and the out-of-band buses cover the rest.
 var startupPass = beehive.WithStartupFullPass(true)
-
-// settleGeneration records the generation a pass observed, for a pass that wrote no
-// status. beehive settles a record on an explicit report alone, and its owed pass
-// re-dispatches an unsettled one every interval — so a controller that reports nothing
-// reconciles every object of its kind forever, and the store's unsettled list never
-// converges. A repeat report at the same generation writes nothing, which is what makes
-// this safe on every pass.
-func settleGeneration[Status any](
-	ctx context.Context,
-	client beehive.ControllerClient[Status],
-	id beehive.ObjectID,
-	generation int64,
-) error {
-	if err := client.SetObservedGeneration(ctx, id, generation); err != nil {
-		return fmt.Errorf("record observed generation: %w", err)
-	}
-	return nil
-}
 
 // registerControllers builds and registers each kind's controller, which lives in that
 // kind's file, and returns them in registration order. Together here rather than four
@@ -462,11 +444,11 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	catalog := &clusterCachedCatalogController{}
 	resource := &clusterCachedResourceController{}
 
-	_, errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass)
-	_, errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass)
-	_, errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
-	_, errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
-	_, errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
+	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass)
+	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass)
+	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
+	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
+	errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
 	if err := errors.Join(errSource, errCluster, errCache, errCatalog, errResource); err != nil {
 		return nil, err
 	}

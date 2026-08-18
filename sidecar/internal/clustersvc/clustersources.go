@@ -85,11 +85,11 @@ func (c *clusterSourceController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterSourceStatus],
 	obj *beehive.Object[ClusterSourceSpec, ClusterSourceStatus],
-) (beehive.Result, error) {
+) beehive.ReconcileResult {
 	// An anchor on its way out has no set to maintain, and beehive collects it either
 	// way. Nothing deletes one today.
 	if obj.DeletionRequestedAt != nil {
-		return beehive.Result{}, nil
+		return beehive.Settled(0)
 	}
 
 	// beehive starts ahead of this, so an owed pass can arrive before the kubeconfig's
@@ -98,10 +98,8 @@ func (c *clusterSourceController) Reconcile(
 	// every record to observe its context absent.
 	cfg, loaded := c.kubeconfigSvc.Get()
 	if !loaded {
-		return beehive.Result{RequeueAfter: startupRequeue}, nil
+		return beehive.Unsettled(startupRequeue)
 	}
-
-	result := beehive.Result{RequeueAfter: clusterSourceResyncInterval}
 
 	// Runs unconditionally, not behind the fingerprint gate: a create that failed is
 	// retried against the snapshot that failed, so a pass returning early on an
@@ -117,25 +115,23 @@ func (c *clusterSourceController) Reconcile(
 
 	fingerprint, err := kubeconfigFingerprint(cfg)
 	if err != nil {
-		return beehive.Result{}, errors.Join(createErr, err)
+		return beehive.Fail(errors.Join(createErr, err))
 	}
 
-	if obj.Status != nil && obj.Status.Fingerprint == fingerprint {
-		if !generationSettled(obj) {
-			if err := client.SetObservedGeneration(ctx, obj.ID, obj.Generation); err != nil {
-				return beehive.Result{}, errors.Join(createErr, fmt.Errorf("record cluster source observed generation: %w", err))
-			}
+	// A repeat write would only marshal the same bytes and open a transaction to find
+	// them equal; the settle below is what a pass that observed nothing new reports.
+	if obj.Status == nil || obj.Status.Fingerprint != fingerprint {
+		if err := client.UpdateStatus(ctx, obj.ID, ClusterSourceStatus{Fingerprint: fingerprint}); err != nil {
+			return beehive.Fail(errors.Join(createErr, fmt.Errorf("update cluster source status: %w", err)))
 		}
-	} else if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterSourceStatus{Fingerprint: fingerprint}); err != nil {
-		return beehive.Result{}, errors.Join(createErr, fmt.Errorf("update cluster source status: %w", err))
 	}
 
 	if createErr != nil {
-		// beehive drops Result when an error comes back, so the re-arm below is not
-		// this pass's to keep — its backoff ladder is what retries the stuck create.
-		return beehive.Result{}, createErr
+		// The re-arm below is not this pass's to keep — beehive's backoff ladder is
+		// what retries the stuck create.
+		return beehive.Fail(createErr)
 	}
-	return result, nil
+	return beehive.Settled(clusterSourceResyncInterval)
 }
 
 // ensureClusterSources gives every variant its anchor. The one creation in this

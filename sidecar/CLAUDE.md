@@ -89,8 +89,14 @@ land there rather than on `service`, or the composition root accumulates every k
 `registerControllers` builds and registers all five, returning them in registration order. All register with
 `startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
 reads as settled, since the generation was observed by a process that is gone. **No periodic full
-pass** — controllers re-arm with `RequeueAfter` and the out-of-band buses cover the rest.
+pass** — controllers re-arm with a requeue delay on the result they return, and the out-of-band
+buses cover the rest.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
+
+**A pass returns a verdict, never an error**: `beehive.Settled(d)` (the pass observed the object's
+current generation, which beehive records), `beehive.Unsettled(d)` (a real pass that is not caught
+up — the deferred kubeconfig read), or `beehive.Fail(err)` (the backoff ladder). **A no-op pass
+still settles**: unsettled, beehive's owed pass re-dispatches every object of the kind, forever.
 
 **Shared dependencies travel in `deps`** — one beehive client per kind plus the process-wide services
 (`kubeconfig`, `kubeconn`, `poke`), built once by `newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)` and **embedded** by `service` and by each
@@ -191,8 +197,8 @@ per-context kind whose spec the anchor writes (the shape `ClusterCachedResource`
 before the app's kubeconfig service has read the file. For the anchor the stake is higher than a
 flap: importing against the pre-read config would fingerprint an empty set. `Service.Get` reports the read alongside the config
 precisely because the two states are the same value — an empty config — and observing the pre-read
-one would mark every present context absent and wake the kind's watches for a flap. Unread is a
-`RequeueAfter`, not a write.
+one would mark every present context absent and wake the kind's watches for a flap. Unread is an
+`Unsettled` requeue, not a write.
 
 Scope a discovery pass by the source discriminant (`Spec.Source.Kubeconfig != nil`), not by the name
 prefix. Manual creation will have no source at all, so *"every Cluster has an anchor behind it"* is

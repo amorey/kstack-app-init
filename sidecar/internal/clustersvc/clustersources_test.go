@@ -189,22 +189,16 @@ func sourceControllerOver(t *testing.T, d deps) (*clusterSourceController, *beeh
 	return &clusterSourceController{deps: d}, obj
 }
 
-// stubSourceController captures what the pass reports.
+// stubSourceController captures what the pass writes.
 type stubSourceController struct {
 	beehive.ControllerClient[ClusterSourceStatus]
 	updated   *ClusterSourceStatus
 	updateErr error
-	observed  *int64
 }
 
-func (c *stubSourceController) UpdateStatus(_ context.Context, _ beehive.ObjectID, _ int64, status ClusterSourceStatus) error {
+func (c *stubSourceController) UpdateStatus(_ context.Context, _ beehive.ObjectID, status ClusterSourceStatus) error {
 	c.updated = &status
 	return c.updateErr
-}
-
-func (c *stubSourceController) SetObservedGeneration(_ context.Context, _ beehive.ObjectID, generation int64) error {
-	c.observed = &generation
-	return nil
 }
 
 // The pass creates the records and publishes what it observed for them to wake on.
@@ -214,13 +208,13 @@ func TestSourceReconcileImportsAndPublishes(t *testing.T) {
 	c, obj := sourceControllerOver(t, d)
 
 	client := &stubSourceController{}
-	res, err := c.Reconcile(context.Background(), client, obj)
-	require.NoError(t, err)
+	res := c.Reconcile(context.Background(), client, obj)
 
 	assert.Len(t, liveClusters(t, d.clusterClient), 2)
 	require.NotNil(t, client.updated)
 	assert.Equal(t, fingerprintOf(t, cfgWith("prod", "staging")), client.updated.Fingerprint)
-	assert.Positive(t, res.RequeueAfter, "the pass re-arms as the backstop for a lost poke")
+	assert.Equal(t, beehive.Settled(clusterSourceResyncInterval), res,
+		"the pass re-arms as the backstop for a lost poke")
 }
 
 // The status write is what wakes every Cluster, so an unchanged snapshot must not
@@ -233,11 +227,10 @@ func TestSourceReconcileWritesNothingWhenTheSnapshotIsUnchanged(t *testing.T) {
 
 	obj.Status = &ClusterSourceStatus{Fingerprint: fingerprintOf(t, cfg)}
 	client := &stubSourceController{}
-	_, err := c.Reconcile(context.Background(), client, obj)
+	res := c.Reconcile(context.Background(), client, obj)
 
-	require.NoError(t, err)
 	assert.Nil(t, client.updated, "nothing a dependent would observe moved")
-	assert.NotNil(t, client.observed, "but the generation still has to settle")
+	assert.Equal(t, beehive.Settled(clusterSourceResyncInterval), res, "but the pass still settles")
 }
 
 // A failed create is retried against the snapshot that failed, so the create pass has
@@ -250,29 +243,10 @@ func TestSourceReconcileImportsEvenWhenTheSnapshotIsUnchanged(t *testing.T) {
 	c, obj := sourceControllerOver(t, d)
 
 	obj.Status = &ClusterSourceStatus{Fingerprint: fingerprintOf(t, cfg)}
-	_, err := c.Reconcile(context.Background(), &stubSourceController{}, obj)
+	res := c.Reconcile(context.Background(), &stubSourceController{}, obj)
 
-	require.NoError(t, err)
+	require.Equal(t, beehive.Settled(clusterSourceResyncInterval), res)
 	assert.Contains(t, liveClusters(t, d.clusterClient), "prod")
-}
-
-// A settled generation and an unchanged snapshot leave nothing at all to report.
-func TestSourceReconcileWritesNothingWhenAlreadySettled(t *testing.T) {
-	d := newTestDeps(t)
-	cfg := cfgWith("prod")
-	d.kubeconfigSvc = fakeKubeconfigService{cfg: cfg, loaded: true}
-	c, obj := sourceControllerOver(t, d)
-
-	obj.Status = &ClusterSourceStatus{Fingerprint: fingerprintOf(t, cfg)}
-	settled := obj.Generation
-	obj.ObservedGeneration = &settled
-
-	client := &stubSourceController{}
-	_, err := c.Reconcile(context.Background(), client, obj)
-
-	require.NoError(t, err)
-	assert.Nil(t, client.updated)
-	assert.Nil(t, client.observed)
 }
 
 // The pre-read config is an empty one, so importing against it would fingerprint an
@@ -283,12 +257,11 @@ func TestSourceReconcileDefersUntilTheKubeconfigIsRead(t *testing.T) {
 	c, obj := sourceControllerOver(t, d)
 
 	client := &stubSourceController{}
-	res, err := c.Reconcile(context.Background(), client, obj)
+	res := c.Reconcile(context.Background(), client, obj)
 
-	require.NoError(t, err)
 	assert.Nil(t, client.updated)
 	assert.Empty(t, liveClusters(t, d.clusterClient), "nothing imported against a config nobody read")
-	assert.Equal(t, startupRequeue, res.RequeueAfter)
+	assert.Equal(t, beehive.Unsettled(startupRequeue), res)
 }
 
 // The publish is the only thing that wakes a dependent, and the fingerprint says what
@@ -308,9 +281,9 @@ func TestSourceReconcilePublishesDespiteAFailedImport(t *testing.T) {
 	c, obj := sourceControllerOver(t, d)
 
 	client := &stubSourceController{}
-	_, err := c.Reconcile(context.Background(), client, obj)
+	res := c.Reconcile(context.Background(), client, obj)
 
-	require.ErrorIs(t, err, boom, "the stuck create still has to be retried")
+	assertFailedWith(t, fmt.Errorf("listing clusters: %w", boom), res)
 	require.NotNil(t, client.updated, "and the wake still has to reach every other record")
 	assert.Equal(t, fingerprintOf(t, cfg), client.updated.Fingerprint)
 }
@@ -326,9 +299,9 @@ func TestSourceReconcileReportsAFailedImportOnAnUnchangedSnapshot(t *testing.T) 
 	c, obj := sourceControllerOver(t, d)
 
 	obj.Status = &ClusterSourceStatus{Fingerprint: fingerprintOf(t, cfg)}
-	_, err := c.Reconcile(context.Background(), &stubSourceController{}, obj)
+	res := c.Reconcile(context.Background(), &stubSourceController{}, obj)
 
-	require.ErrorIs(t, err, boom)
+	assertFailedWith(t, fmt.Errorf("listing clusters: %w", boom), res)
 }
 
 // An anchor on its way out has no set to maintain.
@@ -340,9 +313,9 @@ func TestSourceReconcileSkipsADeletingAnchor(t *testing.T) {
 	now := time.Now()
 	obj.DeletionRequestedAt = &now
 	client := &stubSourceController{}
-	_, err := c.Reconcile(context.Background(), client, obj)
+	res := c.Reconcile(context.Background(), client, obj)
 
-	require.NoError(t, err)
+	assert.Equal(t, beehive.Settled(0), res)
 	assert.Nil(t, client.updated)
 	assert.Empty(t, liveClusters(t, d.clusterClient))
 }

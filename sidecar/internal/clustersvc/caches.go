@@ -358,48 +358,48 @@ func (c *clusterCacheController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCacheStatus],
 	obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
-) (beehive.Result, error) {
+) beehive.ReconcileResult {
 	// A cache on its way out is about to be collected with the subtree it owns, and
 	// beehive collects it with no finalizer to clear.
 	if obj.DeletionRequestedAt != nil {
-		return beehive.Result{}, nil
+		return beehive.Settled(0)
 	}
 
 	// The reconcile load carries no edges, so the owner is a lookup rather than a field.
 	owner, ok, err := client.GetOwner(ctx, obj.ID)
 	if err != nil {
-		return beehive.Result{}, fmt.Errorf("read cluster cache %d owner: %w", obj.ID, err)
+		return beehive.Fail(fmt.Errorf("read cluster cache %d owner: %w", obj.ID, err))
 	}
 	if !ok {
-		return beehive.Result{}, nil
+		return beehive.Settled(0)
 	}
 
 	clusterObj, err := c.clusterClient.Get(ctx, owner.ID)
 	// The cascade that takes this cache next may have collected the cluster already,
 	// which is a race rather than a failure worth retrying under backoff.
 	if errors.Is(err, beehive.ErrNotFound) {
-		return beehive.Result{}, nil
+		return beehive.Settled(0)
 	}
 	if err != nil {
-		return beehive.Result{}, fmt.Errorf("read cluster %d: %w", owner.ID, err)
+		return beehive.Fail(fmt.Errorf("read cluster %d: %w", owner.ID, err))
 	}
 	// A cluster being torn down cascades here, so its subtree is not worth growing.
 	if clusterObj.DeletionRequestedAt != nil {
-		return beehive.Result{}, nil
+		return beehive.Settled(0)
 	}
 
 	// The switch below is the cluster's, and an owner edge wakes nothing: without this,
 	// a toggle flip would sit unrelayed until something else woke the cache. Beehive
 	// records nothing when the edge is already there, so every later pass is free.
 	if err := client.AddDependency(ctx, obj.ID, owner.ID); err != nil {
-		return beehive.Result{}, fmt.Errorf("depend cluster cache %d on its cluster: %w", obj.ID, err)
+		return beehive.Fail(fmt.Errorf("depend cluster cache %d on its cluster: %w", obj.ID, err))
 	}
 
 	enabled := cacheSyncEnabled(clusterObj, obj.Spec.ServerUID)
 	if err := ensureClusterCachedCatalog(ctx, c.catalogClient, ClusterCacheID(obj.ID), enabled); err != nil {
-		return beehive.Result{}, err
+		return beehive.Fail(err)
 	}
 	// This pass writes no status of its own, so nothing else reports it converged, and
 	// the owed pass would re-dispatch every cache — four store reads apiece — forever.
-	return beehive.Result{}, settleGeneration(ctx, client, obj.ID, obj.Generation)
+	return beehive.Settled(0)
 }

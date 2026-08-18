@@ -432,11 +432,11 @@ func (c *clusterController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterStatus],
 	obj *beehive.Object[ClusterSpec, ClusterStatus],
-) (beehive.Result, error) {
+) beehive.ReconcileResult {
 	// Nothing to observe for a record on its way out, and no finalizer to clear:
 	// beehive collects it either way.
 	if obj.DeletionRequestedAt != nil {
-		return beehive.Result{}, nil
+		return beehive.Settled(0)
 	}
 
 	// beehive starts ahead of the controllers, so its first owed pass can reach a
@@ -445,7 +445,7 @@ func (c *clusterController) Reconcile(
 	// the kind's watches for a flap. The requeue is the backstop until the read lands.
 	cfg, loaded := c.kubeconfigSvc.Get()
 	if !loaded {
-		return beehive.Result{RequeueAfter: startupRequeue}, nil
+		return beehive.Unsettled(startupRequeue)
 	}
 
 	// The observation below reads the kubeconfig service rather than this object, so
@@ -459,21 +459,21 @@ func (c *clusterController) Reconcile(
 			// Not a failure: the bootstrap creates the anchors after beehive starts, and
 			// this record predates the process. Failing here would drop every stored
 			// record into backoff on every boot, and skip the observation with it.
-			return beehive.Result{RequeueAfter: startupRequeue}, nil
+			return beehive.Unsettled(startupRequeue)
 		}
 		if err != nil {
-			return beehive.Result{}, fmt.Errorf("read kubeconfig cluster source: %w", err)
+			return beehive.Fail(fmt.Errorf("read kubeconfig cluster source: %w", err))
 		}
 		if err := client.AddDependency(ctx, obj.ID, src.ID); err != nil {
-			return beehive.Result{}, fmt.Errorf("depend cluster %d on its source: %w", obj.ID, err)
+			return beehive.Fail(fmt.Errorf("depend cluster %d on its source: %w", obj.ID, err))
 		}
 	}
 
-	// Ahead of the settle fast-path below: a record whose generation is already
-	// settled can still be missing the cache its identity calls for, and the pass that
-	// returns early there would never create it.
+	// Ahead of the fast path below: a record that observes nothing new can still be
+	// missing the cache its identity calls for, and the pass that returns early there
+	// would never create it.
 	if err := c.ensureCache(ctx, obj); err != nil {
-		return beehive.Result{}, err
+		return beehive.Fail(err)
 	}
 
 	status := clusterStatus(obj)
@@ -481,25 +481,17 @@ func (c *clusterController) Reconcile(
 	status.Source.Kubeconfig = observeKubeconfig(cfg, obj.Spec.Source.Kubeconfig, prev)
 
 	// A source's status write wakes every record it declares, so most passes observe
-	// nothing new, and UpdateStatus would marshal the status and open a
-	// transaction only to find the stored bytes equal. The generation is then all
-	// there is left to report — and only while it is unsettled, which a spec write
-	// this observation does not depend on (SetEnabled) is what leaves it. An object
-	// that stays unsettled is re-dispatched by beehive's owed pass forever.
+	// nothing new, and UpdateStatus would marshal the status and open a transaction
+	// only to find the stored bytes equal. Settling is still this pass's to report:
+	// an object left unsettled is re-dispatched by beehive's owed pass forever.
 	if obj.Status != nil && sameKubeconfigObservation(prev, status.Source.Kubeconfig) {
-		if generationSettled(obj) {
-			return beehive.Result{}, nil
-		}
-		if err := client.SetObservedGeneration(ctx, obj.ID, obj.Generation); err != nil {
-			return beehive.Result{}, fmt.Errorf("record cluster observed generation: %w", err)
-		}
-		return beehive.Result{}, nil
+		return beehive.Settled(0)
 	}
 
-	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, status); err != nil {
-		return beehive.Result{}, fmt.Errorf("update cluster status: %w", err)
+	if err := client.UpdateStatus(ctx, obj.ID, status); err != nil {
+		return beehive.Fail(fmt.Errorf("update cluster status: %w", err))
 	}
-	return beehive.Result{}, nil
+	return beehive.Settled(0)
 }
 
 // ensureCache gives the cluster a mirror slot for the identity its last probe
@@ -511,12 +503,6 @@ func (c *clusterController) ensureCache(ctx context.Context, obj *beehive.Object
 		return nil
 	}
 	return ensureClusterCache(ctx, c.cacheClient, ClusterID(obj.ID), uid)
-}
-
-// generationSettled reports whether the generation this reconcile was handed is already
-// recorded, which is beehive's own gate for dropping a repeat report.
-func generationSettled[Spec, Status any](obj *beehive.Object[Spec, Status]) bool {
-	return obj.ObservedGeneration != nil && *obj.ObservedGeneration >= obj.Generation
 }
 
 // ensureKubeconfigClusters gives every context in cfg a Cluster record. Called by the

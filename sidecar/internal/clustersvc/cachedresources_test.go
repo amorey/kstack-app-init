@@ -20,7 +20,6 @@ import (
 
 	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // Deterministic per (anchor, apiVersion, resource), which is what lets a discovery
@@ -42,13 +41,10 @@ func TestClusterCachedResourceName(t *testing.T) {
 // A placeholder until the kind is rebuilt: it must settle the object rather than
 // requeue it, or beehive's owed pass would re-dispatch every synced kind forever.
 func TestCachedResourceControllerReconcilesToANoOp(t *testing.T) {
-	client := &settleRecorder[ClusterCachedResourceStatus]{}
 	obj := &beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]{ID: 1, Generation: 3}
 
-	res, err := (&clusterCachedResourceController{}).Reconcile(context.Background(), client, obj)
+	// The pass writes nothing, so the client is never touched.
+	res := (&clusterCachedResourceController{}).Reconcile(context.Background(), nil, obj)
 
-	require.NoError(t, err)
-	assert.Equal(t, beehive.Result{}, res)
-	require.NotNil(t, client.observed)
-	assert.Equal(t, obj.Generation, *client.observed)
+	assert.Equal(t, beehive.Settled(0), res)
 }

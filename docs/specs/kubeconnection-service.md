@@ -267,7 +267,8 @@ one of them:
 4. Eligible — enabled, context present — → `prober.Track(id, contextName)`, otherwise
    `prober.Untrack(id)`. Note this is `Enabled`, not `SyncEnabled`: someone tailing logs on an
    unsynced cluster still needs a connection.
-5. `ensureCache` off the folded UID, still **ahead of the settle fast-path** where it sits today.
+5. `ensureCache` off the folded UID, still **ahead of the unchanged-observation fast path** where it
+   sits today.
    It reads this pass's status rather than the stored one, so a first UID creates its cache in the
    same pass that learns it.
 6. The `Connected` condition write — **after** the cache write, never between it and the fold. It
@@ -275,11 +276,11 @@ one of them:
 7. The existing fast-path and status write, unchanged but for a widened equality check.
 
 The invariant that ties 3 and 5 together: **nothing between the fold and the cache write may
-return.** `ensureCache` is ahead of the fast-path for a reason the existing comment states — a
-record whose generation is already settled can still be missing its cache — and a restart where the
+return.** `ensureCache` is ahead of the fast path for a reason the existing comment states — a
+record that observes nothing new can still be missing its cache — and a restart where the
 identity is already stored is exactly the startup full pass that would hit it.
 
-No `RequeueAfter` cadence and no error return for an unreachable cluster. Beehive already
+No requeue cadence and no error return for an unreachable cluster. Beehive already
 serializes reconciles per object, and the controller is the only status writer, so no lock and no
 re-read are needed.
 

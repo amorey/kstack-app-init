@@ -19,6 +19,7 @@ package clustersvc
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/amorey/beehive"
@@ -29,6 +30,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // newTestBeehive returns a beehive over an in-memory store, closed on cleanup. The
@@ -66,17 +68,77 @@ func newTestDeps(t *testing.T) deps {
 	return d
 }
 
-// newClusterStatusDeps is newTestDeps plus the Cluster kind's ControllerClient, which
-// only Register hands out — a test that needs a stored Cluster status has no other way
-// to write one. Registers that kind alone, so it does not run the anchor bootstrap.
-func newClusterStatusDeps(t *testing.T) (deps, beehive.ControllerClient[ClusterStatus]) {
+// newClusterStatusDeps returns the shared set plus a writer for the Cluster kind's
+// status. A status write is reachable only from inside a reconcile, so the writer is
+// the registered controller for that kind — and the only one, so nothing else
+// reconciles behind these tests.
+func newClusterStatusDeps(t *testing.T) (deps, *clusterStatusWriter) {
 	t.Helper()
 	bh := newTestBeehive(t)
 	d := newDeps(bh, newTestKubeconfig(t), nil, nil)
 
-	client, err := beehive.Register(bh, ClusterGroupKind, &clusterController{deps: d})
+	w := &clusterStatusWriter{
+		clusters: d.clusterClient,
+		pending:  map[beehive.ObjectID]ClusterStatus{},
+		wrote:    testutil.NewProbe[beehive.ObjectID](4),
+	}
+	require.NoError(t, beehive.Register(bh, ClusterGroupKind, w))
+
+	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
-	return d, client
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+	return d, w
+}
+
+// clusterStatusWriter is a Cluster controller that writes the status a test parks for
+// an object, standing in for the connection probe. A fixture needs a stored status —
+// the reconciles under test re-read it — and beehive admits a status write from
+// nowhere else.
+type clusterStatusWriter struct {
+	clusters beehive.Client[ClusterSpec, ClusterStatus]
+	wrote    *testutil.Probe[beehive.ObjectID]
+
+	mu      sync.Mutex
+	pending map[beehive.ObjectID]ClusterStatus
+}
+
+func (w *clusterStatusWriter) Reconcile(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterStatus],
+	obj *beehive.Object[ClusterSpec, ClusterStatus],
+) beehive.ReconcileResult {
+	w.mu.Lock()
+	status, ok := w.pending[obj.ID]
+	w.mu.Unlock()
+	if !ok {
+		return beehive.Settled(0)
+	}
+	if err := client.UpdateStatus(ctx, obj.ID, status); err != nil {
+		return beehive.Fail(err)
+	}
+	w.wrote.Fire(obj.ID)
+	return beehive.Settled(0)
+}
+
+// Set parks status for id and returns once the pass that wrote it has run. The drain
+// is what makes a second Set wait for its own pass rather than an earlier one's.
+func (w *clusterStatusWriter) Set(t *testing.T, id beehive.ObjectID, status ClusterStatus) {
+	t.Helper()
+	w.mu.Lock()
+	w.pending[id] = status
+	w.mu.Unlock()
+
+	w.wrote.Drain()
+	require.NoError(t, w.clusters.Requeue(context.Background(), id))
+	assert.Equal(t, id, w.wrote.Await(t, "the cluster status write"))
+}
+
+// assertFailedWith asserts a pass failed carrying want. A ReconcileResult keeps its
+// error unexported, so equality against the Fail the controller built is the only read
+// there is — which pins the wrapping the failure carries too.
+func assertFailedWith(t *testing.T, want error, res beehive.ReconcileResult) {
+	t.Helper()
+	assert.Equal(t, beehive.Fail(want), res)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -114,18 +176,6 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
 	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil, nil)
-}
-
-// settleRecorder captures the generation a reconcile settles, for a controller whose
-// only report is that handshake. The embedded interface is nil: nothing else is called.
-type settleRecorder[Status any] struct {
-	beehive.ControllerClient[Status]
-	observed *int64
-}
-
-func (c *settleRecorder[Status]) SetObservedGeneration(_ context.Context, _ beehive.ObjectID, generation int64) error {
-	c.observed = &generation
-	return nil
 }
 
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the
