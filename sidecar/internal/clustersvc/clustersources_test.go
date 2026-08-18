@@ -196,7 +196,7 @@ type stubSourceController struct {
 	updateErr error
 }
 
-func (c *stubSourceController) UpdateStatus(_ context.Context, _ beehive.ObjectID, status ClusterSourceStatus) error {
+func (c *stubSourceController) UpdateStatus(_ context.Context, status ClusterSourceStatus) error {
 	c.updated = &status
 	return c.updateErr
 }
@@ -213,7 +213,7 @@ func TestSourceReconcileImportsAndPublishes(t *testing.T) {
 	assert.Len(t, liveClusters(t, d.clusterClient), 2)
 	require.NotNil(t, client.updated)
 	assert.Equal(t, fingerprintOf(t, cfgWith("prod", "staging")), client.updated.Fingerprint)
-	assert.Equal(t, beehive.Settled(clusterSourceResyncInterval), res,
+	assert.Equal(t, beehive.Settled().RequeueAfter(clusterSourceResyncInterval), res,
 		"the pass re-arms as the backstop for a lost poke")
 }
 
@@ -230,7 +230,7 @@ func TestSourceReconcileWritesNothingWhenTheSnapshotIsUnchanged(t *testing.T) {
 	res := c.Reconcile(context.Background(), client, obj)
 
 	assert.Nil(t, client.updated, "nothing a dependent would observe moved")
-	assert.Equal(t, beehive.Settled(clusterSourceResyncInterval), res, "but the pass still settles")
+	assert.Equal(t, beehive.Settled().RequeueAfter(clusterSourceResyncInterval), res, "but the pass still settles")
 }
 
 // A failed create is retried against the snapshot that failed, so the create pass has
@@ -245,7 +245,7 @@ func TestSourceReconcileImportsEvenWhenTheSnapshotIsUnchanged(t *testing.T) {
 	obj.Status = &ClusterSourceStatus{Fingerprint: fingerprintOf(t, cfg)}
 	res := c.Reconcile(context.Background(), &stubSourceController{}, obj)
 
-	require.Equal(t, beehive.Settled(clusterSourceResyncInterval), res)
+	require.Equal(t, beehive.Settled().RequeueAfter(clusterSourceResyncInterval), res)
 	assert.Contains(t, liveClusters(t, d.clusterClient), "prod")
 }
 
@@ -261,7 +261,7 @@ func TestSourceReconcileDefersUntilTheKubeconfigIsRead(t *testing.T) {
 
 	assert.Nil(t, client.updated)
 	assert.Empty(t, liveClusters(t, d.clusterClient), "nothing imported against a config nobody read")
-	assert.Equal(t, beehive.Unsettled(startupRequeue), res)
+	assert.Equal(t, beehive.Unsettled().RequeueAfter(startupRequeue), res)
 }
 
 // The publish is the only thing that wakes a dependent, and the fingerprint says what
@@ -315,7 +315,7 @@ func TestSourceReconcileSkipsADeletingAnchor(t *testing.T) {
 	client := &stubSourceController{}
 	res := c.Reconcile(context.Background(), client, obj)
 
-	assert.Equal(t, beehive.Settled(0), res)
+	assert.Equal(t, beehive.Settled(), res)
 	assert.Nil(t, client.updated)
 	assert.Empty(t, liveClusters(t, d.clusterClient))
 }
@@ -342,8 +342,8 @@ func (f fakeKubeconfigService) RESTConfig(string) (*rest.Config, string, error) 
 // The one test here that runs the whole chain: a file on disk, the notifier, the
 // anchor's pass, beehive's dependency waker, and the per-record observation. Every
 // other test in this package stubs the ControllerClient, so AddDependency is recorded
-// rather than exercised — reverse its arguments and they all still pass while nothing
-// is ever woken.
+// rather than exercised — point it at the wrong object and they all still pass while
+// nothing is ever woken.
 //
 // Departure is what it asserts, because that is the case reachable no other way: a
 // context removed from the file appears in no snapshot the create pass walks, so only

@@ -140,12 +140,12 @@ type stubControllerClient struct {
 	dependErr error
 }
 
-func (c *stubControllerClient) UpdateStatus(_ context.Context, _ beehive.ObjectID, status ClusterStatus) error {
+func (c *stubControllerClient) UpdateStatus(_ context.Context, status ClusterStatus) error {
 	c.updated = &status
 	return c.updateErr
 }
 
-func (c *stubControllerClient) AddDependency(_ context.Context, _, toID beehive.ObjectID) error {
+func (c *stubControllerClient) AddDependency(_ context.Context, toID beehive.ObjectID) error {
 	c.dependsOn = &toID
 	return c.dependErr
 }
@@ -154,7 +154,7 @@ func (c *stubControllerClient) AddDependency(_ context.Context, _, toID beehive.
 // over a read kubeconfig does.
 func reconcileCluster(t *testing.T, c *clusterController, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) {
 	t.Helper()
-	require.Equal(t, beehive.Settled(0), c.Reconcile(context.Background(), client, obj))
+	require.Equal(t, beehive.Settled(), c.Reconcile(context.Background(), client, obj))
 }
 
 // controllerOver returns a controller over an empty kubeconfig, so every context is
@@ -293,7 +293,7 @@ func TestReconcileDefersUntilTheKubeconfigIsRead(t *testing.T) {
 	res := c.Reconcile(context.Background(), client, kubeconfigObj("prod", nil))
 
 	assert.Nil(t, client.updated, "nothing observed, so nothing to write")
-	assert.Equal(t, beehive.Unsettled(startupRequeue), res,
+	assert.Equal(t, beehive.Unsettled().RequeueAfter(startupRequeue), res,
 		"nothing settled, and it has to be revisited once the watcher has read")
 }
 
@@ -302,7 +302,7 @@ func TestReconcileWritesTheObservation(t *testing.T) {
 
 	res := controllerOver(t).Reconcile(context.Background(), client, kubeconfigObj("prod", nil))
 
-	assert.Equal(t, beehive.Settled(0), res)
+	assert.Equal(t, beehive.Settled(), res)
 	require.NotNil(t, client.updated)
 	require.NotNil(t, client.updated.Source.Kubeconfig)
 	assert.False(t, client.updated.Source.Kubeconfig.IsPresent, "the seed config holds no contexts")
@@ -345,7 +345,7 @@ func TestReconcileSettlesWhenNothingMoved(t *testing.T) {
 	res := controllerOver(t).Reconcile(context.Background(), client, obj)
 
 	assert.Nil(t, client.updated, "an unchanged observation must not write status")
-	assert.Equal(t, beehive.Settled(0), res)
+	assert.Equal(t, beehive.Settled(), res)
 }
 
 // A record from another source has no observation of its own, and two of those are as
@@ -358,7 +358,7 @@ func TestReconcileSettlesForAnotherSource(t *testing.T) {
 	res := controllerOver(t).Reconcile(context.Background(), client, obj)
 
 	assert.Nil(t, client.updated)
-	assert.Equal(t, beehive.Settled(0), res)
+	assert.Equal(t, beehive.Settled(), res)
 }
 
 // A record on its way out has nothing to observe, and writing status to it would be a
@@ -1178,7 +1178,7 @@ func TestReconcileWaitsForAMissingSourceAnchor(t *testing.T) {
 	client := &stubControllerClient{}
 	res := c.Reconcile(context.Background(), client, obj)
 
-	assert.Equal(t, beehive.Unsettled(startupRequeue), res)
+	assert.Equal(t, beehive.Unsettled().RequeueAfter(startupRequeue), res)
 	assert.Nil(t, client.updated, "nothing observed until the record can be woken again")
 }
 
@@ -1197,11 +1197,11 @@ func TestReconcileReportsAFailedSourceLookup(t *testing.T) {
 }
 
 // observePresence writes the observation Delete gates on, the way a reconcile does.
-func observePresence(t *testing.T, status *clusterStatusWriter, obj *beehive.Object[ClusterSpec, ClusterStatus], present bool) {
+func observePresence(t *testing.T, status *beehive.AdminClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus], present bool) {
 	t.Helper()
-	status.Set(t, obj.ID, ClusterStatus{
+	require.NoError(t, status.UpdateStatus(context.Background(), obj.ID, ClusterStatus{
 		Source: ClusterStatusSource{Kubeconfig: &ClusterStatusSourceKubeconfig{
 			Cluster: "prod-cluster", User: "prod-user", IsPresent: present,
 		}},
-	})
+	}))
 }

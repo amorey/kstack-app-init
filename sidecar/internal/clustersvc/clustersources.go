@@ -89,7 +89,7 @@ func (c *clusterSourceController) Reconcile(
 	// An anchor on its way out has no set to maintain, and beehive collects it either
 	// way. Nothing deletes one today.
 	if obj.DeletionRequestedAt != nil {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 
 	// beehive starts ahead of this, so an owed pass can arrive before the kubeconfig's
@@ -98,7 +98,7 @@ func (c *clusterSourceController) Reconcile(
 	// every record to observe its context absent.
 	cfg, loaded := c.kubeconfigSvc.Get()
 	if !loaded {
-		return beehive.Unsettled(startupRequeue)
+		return beehive.Unsettled().RequeueAfter(startupRequeue)
 	}
 
 	// Runs unconditionally, not behind the fingerprint gate: a create that failed is
@@ -121,7 +121,7 @@ func (c *clusterSourceController) Reconcile(
 	// A repeat write would only marshal the same bytes and open a transaction to find
 	// them equal; the settle below is what a pass that observed nothing new reports.
 	if obj.Status == nil || obj.Status.Fingerprint != fingerprint {
-		if err := client.UpdateStatus(ctx, obj.ID, ClusterSourceStatus{Fingerprint: fingerprint}); err != nil {
+		if err := client.UpdateStatus(ctx, ClusterSourceStatus{Fingerprint: fingerprint}); err != nil {
 			return beehive.Fail(errors.Join(createErr, fmt.Errorf("update cluster source status: %w", err)))
 		}
 	}
@@ -131,7 +131,7 @@ func (c *clusterSourceController) Reconcile(
 		// what retries the stuck create.
 		return beehive.Fail(createErr)
 	}
-	return beehive.Settled(clusterSourceResyncInterval)
+	return beehive.Settled().RequeueAfter(clusterSourceResyncInterval)
 }
 
 // ensureClusterSources gives every variant its anchor. The one creation in this

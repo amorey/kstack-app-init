@@ -46,5 +46,5 @@ func TestCachedResourceControllerReconcilesToANoOp(t *testing.T) {
 	// The pass writes nothing, so the client is never touched.
 	res := (&clusterCachedResourceController{}).Reconcile(context.Background(), nil, obj)
 
-	assert.Equal(t, beehive.Settled(0), res)
+	assert.Equal(t, beehive.Settled(), res)
 }

@@ -362,48 +362,48 @@ func TestCachesWatchListCancellationIsQuiet(t *testing.T) {
 
 // storedCluster writes a tracked cluster with syncing set as asked, probed at uid.
 // Both halves are stored, because the reconcile under test re-reads them.
-func storedCluster(t *testing.T, d deps, status *clusterStatusWriter, syncEnabled bool, uid string) *beehive.Object[ClusterSpec, ClusterStatus] {
+func storedCluster(t *testing.T, d deps, status *beehive.AdminClient[ClusterStatus], syncEnabled bool, uid string) *beehive.Object[ClusterSpec, ClusterStatus] {
 	t.Helper()
 	ctx := context.Background()
 	obj := createCluster(t, d.clusterClient, "prod")
 
 	obj, err := d.clusterClient.Update(ctx, obj.ID, ClusterSpec{Enabled: true, SyncEnabled: syncEnabled, Source: obj.Spec.Source})
 	require.NoError(t, err)
-	status.Set(t, obj.ID, ClusterStatus{Server: ClusterServer{UID: &uid}})
+	require.NoError(t, status.UpdateStatus(ctx, obj.ID, ClusterStatus{Server: ClusterServer{UID: &uid}}))
 	return obj
 }
 
 // cacheControllerClient answers the owner lookup a cache reconcile makes, from the
-// store, so the edge a fixture wrote is the one the reconcile reads. ownerID overrides
-// it, for a race the store cannot be held in. The embedded interface is nil: Reconcile
-// calls nothing else on it.
+// store, so the edge a fixture wrote is the one the reconcile reads. It is bound to
+// the cache being reconciled, the way beehive binds the real one. ownerID overrides
+// the lookup, for a race the store cannot be held in. The embedded interface is nil:
+// Reconcile calls nothing else on it.
 type cacheControllerClient struct {
 	beehive.ControllerClient[ClusterCacheStatus]
-	caches       beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
-	ownerID      *beehive.ObjectID
-	dependencies []dependency
+	caches    beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	id        beehive.ObjectID
+	ownerID   *beehive.ObjectID
+	dependsOn []beehive.ObjectID
 }
 
-// dependency is one edge a reconcile declared.
-type dependency struct{ from, to beehive.ObjectID }
-
-func (c *cacheControllerClient) AddDependency(_ context.Context, fromID, toID beehive.ObjectID) error {
-	c.dependencies = append(c.dependencies, dependency{from: fromID, to: toID})
+func (c *cacheControllerClient) AddDependency(_ context.Context, toID beehive.ObjectID) error {
+	c.dependsOn = append(c.dependsOn, toID)
 	return nil
 }
 
-func (c *cacheControllerClient) GetOwner(ctx context.Context, id beehive.ObjectID) (beehive.ObjectRef, bool, error) {
+func (c *cacheControllerClient) GetOwner(ctx context.Context) (beehive.ObjectRef, bool, error) {
 	if c.ownerID != nil {
 		return beehive.ObjectRef{ID: *c.ownerID, Kind: ClusterGroupKind.Kind}, true, nil
 	}
-	return c.caches.GetOwner(ctx, id)
+	return c.caches.GetOwner(ctx, c.id)
 }
 
 // reconcileCache runs one cache pass the way beehive would.
 func reconcileCache(t *testing.T, d deps, obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) {
 	t.Helper()
-	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), &cacheControllerClient{caches: d.cacheClient}, obj)
-	require.Equal(t, beehive.Settled(0), res)
+	client := &cacheControllerClient{caches: d.cacheClient, id: obj.ID}
+	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), client, obj)
+	require.Equal(t, beehive.Settled(), res)
 }
 
 // A cache owns the discovery anchor beneath it, so the pass that knows the cluster's
@@ -428,11 +428,11 @@ func TestCacheReconcileSettlesTheGeneration(t *testing.T) {
 	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, true, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	client := &cacheControllerClient{caches: d.cacheClient}
+	client := &cacheControllerClient{caches: d.cacheClient, id: cache.ID}
 
 	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), client, cache)
 
-	assert.Equal(t, beehive.Settled(0), res)
+	assert.Equal(t, beehive.Settled(), res)
 }
 
 // The relayed switch is the cluster's, and a write there wakes nothing here on its
@@ -441,11 +441,11 @@ func TestCacheReconcileDependsOnItsCluster(t *testing.T) {
 	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, true, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	client := &cacheControllerClient{caches: d.cacheClient}
+	client := &cacheControllerClient{caches: d.cacheClient, id: cache.ID}
 
 	(&clusterCacheController{deps: d}).Reconcile(context.Background(), client, cache)
 
-	assert.Equal(t, []dependency{{from: cache.ID, to: cluster.ID}}, client.dependencies)
+	assert.Equal(t, []beehive.ObjectID{cluster.ID}, client.dependsOn)
 }
 
 // A cache on its way out is about to be collected with everything it owns, so a pass
@@ -487,11 +487,11 @@ func TestCacheReconcileWritesNothingWhenItsClusterIsCollected(t *testing.T) {
 
 	res := (&clusterCacheController{deps: d}).Reconcile(
 		context.Background(),
-		&cacheControllerClient{caches: d.cacheClient, ownerID: &gone},
+		&cacheControllerClient{caches: d.cacheClient, id: cache.ID, ownerID: &gone},
 		cache,
 	)
 
-	require.Equal(t, beehive.Settled(0), res)
+	require.Equal(t, beehive.Settled(), res)
 	assert.Empty(t, catalogs(t, d.catalogClient))
 }
 

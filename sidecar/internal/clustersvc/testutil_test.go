@@ -19,7 +19,6 @@ package clustersvc
 import (
 	"context"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/amorey/beehive"
@@ -30,7 +29,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // newTestBeehive returns a beehive over an in-memory store, closed on cleanup. The
@@ -68,69 +66,15 @@ func newTestDeps(t *testing.T) deps {
 	return d
 }
 
-// newClusterStatusDeps returns the shared set plus a writer for the Cluster kind's
-// status. A status write is reachable only from inside a reconcile, so the writer is
-// the registered controller for that kind — and the only one, so nothing else
-// reconciles behind these tests.
-func newClusterStatusDeps(t *testing.T) (deps, *clusterStatusWriter) {
+// newClusterStatusDeps returns the shared set plus the client that stores a Cluster
+// status from outside a pass, standing in for the connection probe: a fixture needs a
+// stored status because the reconciles under test re-read it. Beehive is never run, so
+// nothing reconciles behind these tests — which is also the only state an admin write
+// is safe in.
+func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), nil, nil)
-
-	w := &clusterStatusWriter{
-		clusters: d.clusterClient,
-		pending:  map[beehive.ObjectID]ClusterStatus{},
-		wrote:    testutil.NewProbe[beehive.ObjectID](4),
-	}
-	require.NoError(t, beehive.Register(bh, ClusterGroupKind, w))
-
-	stop, err := bh.Start(context.Background())
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
-	return d, w
-}
-
-// clusterStatusWriter is a Cluster controller that writes the status a test parks for
-// an object, standing in for the connection probe. A fixture needs a stored status —
-// the reconciles under test re-read it — and beehive admits a status write from
-// nowhere else.
-type clusterStatusWriter struct {
-	clusters beehive.Client[ClusterSpec, ClusterStatus]
-	wrote    *testutil.Probe[beehive.ObjectID]
-
-	mu      sync.Mutex
-	pending map[beehive.ObjectID]ClusterStatus
-}
-
-func (w *clusterStatusWriter) Reconcile(
-	ctx context.Context,
-	client beehive.ControllerClient[ClusterStatus],
-	obj *beehive.Object[ClusterSpec, ClusterStatus],
-) beehive.ReconcileResult {
-	w.mu.Lock()
-	status, ok := w.pending[obj.ID]
-	w.mu.Unlock()
-	if !ok {
-		return beehive.Settled(0)
-	}
-	if err := client.UpdateStatus(ctx, obj.ID, status); err != nil {
-		return beehive.Fail(err)
-	}
-	w.wrote.Fire(obj.ID)
-	return beehive.Settled(0)
-}
-
-// Set parks status for id and returns once the pass that wrote it has run. The drain
-// is what makes a second Set wait for its own pass rather than an earlier one's.
-func (w *clusterStatusWriter) Set(t *testing.T, id beehive.ObjectID, status ClusterStatus) {
-	t.Helper()
-	w.mu.Lock()
-	w.pending[id] = status
-	w.mu.Unlock()
-
-	w.wrote.Drain()
-	require.NoError(t, w.clusters.Requeue(context.Background(), id))
-	assert.Equal(t, id, w.wrote.Await(t, "the cluster status write"))
+	return newDeps(bh, newTestKubeconfig(t), nil, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // assertFailedWith asserts a pass failed carrying want. A ReconcileResult keeps its

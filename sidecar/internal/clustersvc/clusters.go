@@ -436,7 +436,7 @@ func (c *clusterController) Reconcile(
 	// Nothing to observe for a record on its way out, and no finalizer to clear:
 	// beehive collects it either way.
 	if obj.DeletionRequestedAt != nil {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 
 	// beehive starts ahead of the controllers, so its first owed pass can reach a
@@ -445,7 +445,7 @@ func (c *clusterController) Reconcile(
 	// the kind's watches for a flap. The requeue is the backstop until the read lands.
 	cfg, loaded := c.kubeconfigSvc.Get()
 	if !loaded {
-		return beehive.Unsettled(startupRequeue)
+		return beehive.Unsettled().RequeueAfter(startupRequeue)
 	}
 
 	// The observation below reads the kubeconfig service rather than this object, so
@@ -459,12 +459,12 @@ func (c *clusterController) Reconcile(
 			// Not a failure: the bootstrap creates the anchors after beehive starts, and
 			// this record predates the process. Failing here would drop every stored
 			// record into backoff on every boot, and skip the observation with it.
-			return beehive.Unsettled(startupRequeue)
+			return beehive.Unsettled().RequeueAfter(startupRequeue)
 		}
 		if err != nil {
 			return beehive.Fail(fmt.Errorf("read kubeconfig cluster source: %w", err))
 		}
-		if err := client.AddDependency(ctx, obj.ID, src.ID); err != nil {
+		if err := client.AddDependency(ctx, src.ID); err != nil {
 			return beehive.Fail(fmt.Errorf("depend cluster %d on its source: %w", obj.ID, err))
 		}
 	}
@@ -485,13 +485,13 @@ func (c *clusterController) Reconcile(
 	// only to find the stored bytes equal. Settling is still this pass's to report:
 	// an object left unsettled is re-dispatched by beehive's owed pass forever.
 	if obj.Status != nil && sameKubeconfigObservation(prev, status.Source.Kubeconfig) {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 
-	if err := client.UpdateStatus(ctx, obj.ID, status); err != nil {
+	if err := client.UpdateStatus(ctx, status); err != nil {
 		return beehive.Fail(fmt.Errorf("update cluster status: %w", err))
 	}
-	return beehive.Settled(0)
+	return beehive.Settled()
 }
 
 // ensureCache gives the cluster a mirror slot for the identity its last probe

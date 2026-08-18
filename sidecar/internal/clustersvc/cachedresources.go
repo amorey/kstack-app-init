@@ -142,5 +142,5 @@ func (c *clusterCachedResourceController) Reconcile(
 ) beehive.ReconcileResult {
 	// A no-op still settles: unsettled, every synced kind is re-dispatched on each owed
 	// pass — ~100 per cache — for the life of the process.
-	return beehive.Settled(0)
+	return beehive.Settled()
 }

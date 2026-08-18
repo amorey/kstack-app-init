@@ -93,10 +93,12 @@ pass** — controllers re-arm with a requeue delay on the result they return, an
 buses cover the rest.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
 
-**A pass returns a verdict, never an error**: `beehive.Settled(d)` (the pass observed the object's
-current generation, which beehive records), `beehive.Unsettled(d)` (a real pass that is not caught
-up — the deferred kubeconfig read), or `beehive.Fail(err)` (the backoff ladder). **A no-op pass
-still settles**: unsettled, beehive's owed pass re-dispatches every object of the kind, forever.
+**A pass returns a verdict, never an error**: `beehive.Settled()` (the pass observed the object's
+current generation, which beehive records), `beehive.Unsettled()` (a real pass that is not caught
+up — the deferred kubeconfig read), or `beehive.Fail(err)` (the backoff ladder). `.RequeueAfter(d)`
+on the first two is what schedules the next pass — the anchor's backstop resync, the startup
+window's retry. **A no-op pass still settles**: unsettled, every object of the kind comes back on
+the owed pass's cadence, forever.
 
 **Shared dependencies travel in `deps`** — one beehive client per kind plus the process-wide services
 (`kubeconfig`, `kubeconn`, `poke`), built once by `newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)` and **embedded** by `service` and by each
@@ -136,7 +138,8 @@ cascade is coming for the subtree either way.
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache
 is still the active identity), so a flip on the cluster has to reach the cache — and owning a child
-wakes nothing. `clusterCacheController.Reconcile` therefore declares `AddDependency(cache, cluster)`;
+wakes nothing. `clusterCacheController.Reconcile` therefore declares `AddDependency(cluster)`, the
+edge running from the cache its pass was handed (a client only ever declares its own edges);
 re-asserting an existing edge records nothing, so every later pass is free. A relay written without
 one sits stale until something unrelated wakes the child.
 
@@ -164,12 +167,12 @@ name and spec are the Cluster kind's vocabulary): it creates a record for every 
 references and never updates, orphans, or deletes. A departed context is orphaned by
 `clusterController` observing it absent (`IsPresent=false`), which keeps set membership and
 per-object observation from fighting, and lets a returning context reuse its record **with the
-user's toggles intact**. It is also why status is unreachable from the pass: `UpdateStatus` is
-per-kind on beehive's `ControllerClient`, so the anchor's controller cannot write a Cluster's status
-even though it creates the record.
+user's toggles intact**. It is also why status is unreachable from the pass: beehive's
+`ControllerClient` is bound to the object the pass was handed, so `UpdateStatus` writes the anchor
+and nothing else, even though the pass creates the records.
 
 **The anchor's status is a wake signal, not a report.** It carries one field — a fingerprint of what
-the pass observed — and every `Cluster` declares `AddDependency(cluster, anchor)` from its own
+the pass observed — and every `Cluster` declares `AddDependency(anchor)` from its own
 reconcile, so one status write there wakes all of them through beehive's dependency waker, with the
 stale-dependents pass as the guarantee behind it. The observation reads `kubeconfigSvc.Get()` rather
 than the object, so beehive cannot know it went stale; the edge is the only thing that reaches it,
@@ -483,6 +486,7 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
 ## Tests & checks
 
 - testify + `httptest`. Resolver-level tests stand up `graph.NewServer(&graph.Resolver{...})` + `POST /graphql`; h2c/lifecycle tests stand up `app.New(...)`. Filesystem via `t.TempDir()`.
+- **A fixture that needs a stored status writes it with `beehive.NewAdminClient`**, never by registering a controller to do it: `clustersvc`'s `newClusterStatusDeps` stands in for the connection probe that way, and beehive stays stopped, so nothing reconciles behind the test. A controller's *own* status writes are asserted by calling `Reconcile` against a stubbed `ControllerClient` instead.
 - **White-box tests by default** (`package foo`, not `foo_test`) — boundaries are kept by discipline, not the compiler. Escape hatch: external `package foo_test` only when pinning the public contract is the test's purpose — then say so in a comment.
 - **No magic sleeps** (repo-wide — see the root `CLAUDE.md` for the rule and its two carve-outs). Block on the actual event, never a fixed `time.Sleep`. A cadence a test would otherwise have to outwait becomes a **parameter** whose production value is the constant — `prefsync`'s `withBackoff` takes `base`/`max` for exactly this — so a test picks its own timescale and never encodes the production number.
 - **Waiting on a channel goes through `internal/testutil`**, which owns the one failsafe bound (`testutil.Timeout`): `Wait` (a done/ready channel), `Recv[T]` (the next value), `RecvClosed[T]` (the next receive must be a close), `WaitClosed[T]` (drain until close). Don't hand-roll a `select` with a `time.After` deadline. The exception is a **negative** assertion — "no frame arrived" — which needs its own short window, not the failsafe.

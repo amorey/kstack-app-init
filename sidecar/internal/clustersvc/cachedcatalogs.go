@@ -148,5 +148,5 @@ func (c *clusterCachedCatalogController) Reconcile(
 ) beehive.ReconcileResult {
 	// A no-op still settles: unsettled, every catalog is re-dispatched — and re-read —
 	// on each owed pass for the life of the process.
-	return beehive.Settled(0)
+	return beehive.Settled()
 }

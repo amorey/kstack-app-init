@@ -362,36 +362,36 @@ func (c *clusterCacheController) Reconcile(
 	// A cache on its way out is about to be collected with the subtree it owns, and
 	// beehive collects it with no finalizer to clear.
 	if obj.DeletionRequestedAt != nil {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 
 	// The reconcile load carries no edges, so the owner is a lookup rather than a field.
-	owner, ok, err := client.GetOwner(ctx, obj.ID)
+	owner, ok, err := client.GetOwner(ctx)
 	if err != nil {
 		return beehive.Fail(fmt.Errorf("read cluster cache %d owner: %w", obj.ID, err))
 	}
 	if !ok {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 
 	clusterObj, err := c.clusterClient.Get(ctx, owner.ID)
 	// The cascade that takes this cache next may have collected the cluster already,
 	// which is a race rather than a failure worth retrying under backoff.
 	if errors.Is(err, beehive.ErrNotFound) {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 	if err != nil {
 		return beehive.Fail(fmt.Errorf("read cluster %d: %w", owner.ID, err))
 	}
 	// A cluster being torn down cascades here, so its subtree is not worth growing.
 	if clusterObj.DeletionRequestedAt != nil {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 
 	// The switch below is the cluster's, and an owner edge wakes nothing: without this,
 	// a toggle flip would sit unrelayed until something else woke the cache. Beehive
 	// records nothing when the edge is already there, so every later pass is free.
-	if err := client.AddDependency(ctx, obj.ID, owner.ID); err != nil {
+	if err := client.AddDependency(ctx, owner.ID); err != nil {
 		return beehive.Fail(fmt.Errorf("depend cluster cache %d on its cluster: %w", obj.ID, err))
 	}
 
@@ -401,5 +401,5 @@ func (c *clusterCacheController) Reconcile(
 	}
 	// This pass writes no status of its own, so nothing else reports it converged, and
 	// the owed pass would re-dispatch every cache — four store reads apiece — forever.
-	return beehive.Settled(0)
+	return beehive.Settled()
 }

@@ -4,8 +4,8 @@ github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERo
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/agnivade/levenshtein v1.2.1 h1:EHBY3UOn1gwdy/VbFwgo4cxecRznFk7fKWN1KOX7eoM=
 github.com/agnivade/levenshtein v1.2.1/go.mod h1:QVVI16kDrtSuwcpd0p1+xMC6Z/VfhtCyDIjcwga4/DU=
-github.com/amorey/beehive v0.24.0 h1:GcqwLn4pn4WLgwxUYKjwvN52PqKrDW+TaD2is6tDefY=
-github.com/amorey/beehive v0.24.0/go.mod h1:lDwrTtmnRpvYXiHgfb5yf7SfMrzX5GY6E+XutGJH0AE=
+github.com/amorey/beehive v0.26.0 h1:k8bs7THXHmihHns599X6KSkfmEKL86bFFxTwFJQAAOE=
+github.com/amorey/beehive v0.26.0/go.mod h1:lDwrTtmnRpvYXiHgfb5yf7SfMrzX5GY6E+XutGJH0AE=
 github.com/amorey/gobus v0.6.0 h1:ndxBW0yAb0sL1PqW+Xt3T+2nuPlfrfN1N71LJed+BY4=
 github.com/amorey/gobus v0.6.0/go.mod h1:fwUvrpmOKEiCjEKkGGmkOL9mLIyqDKIil2xpvc9NdWA=
 github.com/amorey/gochan v0.2.0 h1:/U76z9dZdrMbQRUDjl1AIOkFd5RH8DvAxPdFWQoBe1U=
