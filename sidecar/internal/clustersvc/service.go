@@ -428,10 +428,15 @@ func clusterSourceBootstrap(d deps) lifecycle.Part {
 // owns state a restart invalidates and the store cannot report as owed: a live
 // connection, a running worker, an in-memory schedule. The store reads settled, because
 // the generation was observed by a process that is gone.
-//
-// There is deliberately no periodic full pass behind it — controllers re-arm with the requeue
-// delay on the result they return, and the out-of-band buses cover the rest.
 var startupPass = beehive.WithStartupFullPass(true)
+
+// sourceSweep re-runs the discovery pass on a cadence. Only ClusterSource takes one:
+// it is the one kind whose correctness rests on a poll, and it holds one object per
+// source variant, so a sweep of the kind is a single reconcile. A sweep enqueues the
+// whole kind at once on a fixed tick, so on a populous kind — ~100 cached resources
+// per cache — it is a burst that re-derives what nothing reported as changed. Every
+// other kind is woken by a spec write or a dependency edge instead.
+var sourceSweep = beehive.WithFullPassInterval(clusterSourceResyncInterval)
 
 // registerControllers builds and registers each kind's controller, which lives in that
 // kind's file, and returns them in registration order. Together here rather than four
@@ -444,7 +449,7 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	catalog := &clusterCachedCatalogController{}
 	resource := &clusterCachedResourceController{}
 
-	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass)
+	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceSweep)
 	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass)
 	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
 	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)

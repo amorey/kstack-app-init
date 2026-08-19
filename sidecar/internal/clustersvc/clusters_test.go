@@ -278,7 +278,7 @@ func TestReconcileReportsAFailedCacheCreate(t *testing.T) {
 	res := c.Reconcile(context.Background(), client, obj)
 
 	name := ClusterCacheName(ClusterID(obj.ID), "uid-1")
-	assertFailedWith(t, fmt.Errorf("create cluster cache %s: %w", name, boom), res)
+	assert.Equal(t, fmt.Errorf("create cluster cache %s: %w", name, boom), res.Err())
 	assert.Nil(t, client.updated)
 }
 
@@ -328,7 +328,7 @@ func TestReconcileReportsAFailedStatusWrite(t *testing.T) {
 
 	res := controllerOver(t).Reconcile(context.Background(), &stubControllerClient{updateErr: boom}, kubeconfigObj("prod", nil))
 
-	assertFailedWith(t, fmt.Errorf("update cluster status: %w", boom), res)
+	assert.Equal(t, fmt.Errorf("update cluster status: %w", boom), res.Err())
 }
 
 // A spec write this observation does not depend on still bumps the generation, and an
@@ -1162,7 +1162,7 @@ func TestReconcileReportsAFailedSourceEdge(t *testing.T) {
 	boom := errors.New("boom")
 	res := c.Reconcile(context.Background(), &stubControllerClient{dependErr: boom}, obj)
 
-	assertFailedWith(t, fmt.Errorf("depend cluster %d on its source: %w", obj.ID, boom), res)
+	assert.Equal(t, fmt.Errorf("depend cluster %d on its source: %w", obj.ID, boom), res.Err())
 }
 
 // beehive heads service.parts and dispatches its startup pass asynchronously, so a
@@ -1193,7 +1193,7 @@ func TestReconcileReportsAFailedSourceLookup(t *testing.T) {
 
 	res := c.Reconcile(context.Background(), &stubControllerClient{}, obj)
 
-	assertFailedWith(t, fmt.Errorf("read kubeconfig cluster source: %w", boom), res)
+	assert.Equal(t, fmt.Errorf("read kubeconfig cluster source: %w", boom), res.Err())
 }
 
 // observePresence writes the observation Delete gates on, the way a reconcile does.

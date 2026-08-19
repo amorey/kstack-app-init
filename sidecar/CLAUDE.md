@@ -88,17 +88,20 @@ lifecycle. No kind has any yet — all five embed `lifecycle.None` — but the l
 land there rather than on `service`, or the composition root accumulates every kind's detail.
 `registerControllers` builds and registers all five, returning them in registration order. All register with
 `startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
-reads as settled, since the generation was observed by a process that is gone. **No periodic full
-pass** — controllers re-arm with a requeue delay on the result they return, and the out-of-band
-buses cover the rest.
+reads as settled, since the generation was observed by a process that is gone. **`ClusterSource`
+alone also registers `sourceSweep`** (`WithFullPassInterval(clusterSourceResyncInterval)`), the poll
+its correctness rests on. No other kind takes one: a sweep enqueues the whole kind at once on a
+fixed tick, and the rest are woken by a spec write or a dependency edge, with the out-of-band buses
+covering what neither reaches.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
 
 **A pass returns a verdict, never an error**: `beehive.Settled()` (the pass observed the object's
 current generation, which beehive records), `beehive.Unsettled()` (a real pass that is not caught
 up — the deferred kubeconfig read), or `beehive.Fail(err)` (the backoff ladder). `.RequeueAfter(d)`
-on the first two is what schedules the next pass — the anchor's backstop resync, the startup
-window's retry. **A no-op pass still settles**: unsettled, every object of the kind comes back on
-the owed pass's cadence, forever.
+on the first two schedules the next pass, for a wait this pass knows the length of — the startup
+window's 1s retry. **A cadence a kind depends on belongs at registration instead**, where no return
+path can forget it. **A no-op pass still settles**: unsettled, every object of the kind comes back
+on the owed pass's cadence, forever.
 
 **Shared dependencies travel in `deps`** — one beehive client per kind plus the process-wide services
 (`kubeconfig`, `kubeconn`, `poke`), built once by `newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)` and **embedded** by `service` and by each
@@ -160,7 +163,7 @@ feed and `Requeue`s that source's anchor — a source of truth is not an object,
 span that gap. It is generic over the feed's element type (`feed[T]`, satisfied by any
 `Chan()`/`Close()` pair) because **the value is dropped**: a poke asks for a pass, and the pass reads
 current state. A second source is `newNotifier(name, subscribe, client)` and nothing else. It carries
-**no retry**: a lost poke costs latency, since the anchor re-arms on `clusterSourceResyncInterval`.
+**no retry**: a lost poke costs latency, since the kind's sweep runs the pass anyway.
 
 The pass is **creation-only** (`ensureKubeconfigClusters`, which lives in `clusters.go` because the
 name and spec are the Cluster kind's vocabulary): it creates a record for every context nothing yet

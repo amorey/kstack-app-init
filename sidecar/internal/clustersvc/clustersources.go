@@ -47,10 +47,15 @@ const ClusterSourceNameKubeconfig = "clustersource/kubeconfig"
 // entry here, plus the controller branch that reads it.
 var clusterSourceNames = []string{ClusterSourceNameKubeconfig}
 
-// clusterSourceResyncInterval re-arms the discovery pass. A backstop, not the
-// mechanism: kubeconfigNotifier is what makes a file change prompt, and this is what
-// covers a kick that was never delivered. A pass observing an unchanged snapshot
-// writes nothing, so the tick wakes no dependent.
+// clusterSourceResyncInterval paces the discovery pass, as the kind's full-pass sweep
+// (registered in service.go). A backstop, not the mechanism: kubeconfigNotifier is
+// what makes a file change prompt, and this is what covers a kick that was never
+// delivered. A pass observing an unchanged snapshot writes nothing, so the tick wakes
+// no dependent.
+//
+// A sweep rather than a requeue on the result, because the poll is the anchor's
+// correctness: every return path would otherwise have to re-arm it, and the one that
+// forgot would stop discovery for the life of the process.
 const clusterSourceResyncInterval = 10 * time.Minute
 
 // ClusterSourceSpec is empty. An anchor's identity is its name and a source has
@@ -127,11 +132,11 @@ func (c *clusterSourceController) Reconcile(
 	}
 
 	if createErr != nil {
-		// The re-arm below is not this pass's to keep — beehive's backoff ladder is
-		// what retries the stuck create.
+		// A stuck create is retried by beehive's backoff ladder, which is tighter than
+		// the sweep pacing this kind.
 		return beehive.Fail(createErr)
 	}
-	return beehive.Settled().RequeueAfter(clusterSourceResyncInterval)
+	return beehive.Settled()
 }
 
 // ensureClusterSources gives every variant its anchor. The one creation in this

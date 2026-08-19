@@ -213,8 +213,7 @@ func TestSourceReconcileImportsAndPublishes(t *testing.T) {
 	assert.Len(t, liveClusters(t, d.clusterClient), 2)
 	require.NotNil(t, client.updated)
 	assert.Equal(t, fingerprintOf(t, cfgWith("prod", "staging")), client.updated.Fingerprint)
-	assert.Equal(t, beehive.Settled().RequeueAfter(clusterSourceResyncInterval), res,
-		"the pass re-arms as the backstop for a lost poke")
+	assert.Equal(t, beehive.Settled(), res, "the sweep paces the next pass, not the result")
 }
 
 // The status write is what wakes every Cluster, so an unchanged snapshot must not
@@ -230,7 +229,7 @@ func TestSourceReconcileWritesNothingWhenTheSnapshotIsUnchanged(t *testing.T) {
 	res := c.Reconcile(context.Background(), client, obj)
 
 	assert.Nil(t, client.updated, "nothing a dependent would observe moved")
-	assert.Equal(t, beehive.Settled().RequeueAfter(clusterSourceResyncInterval), res, "but the pass still settles")
+	assert.Equal(t, beehive.Settled(), res, "but the pass still settles")
 }
 
 // A failed create is retried against the snapshot that failed, so the create pass has
@@ -245,7 +244,7 @@ func TestSourceReconcileImportsEvenWhenTheSnapshotIsUnchanged(t *testing.T) {
 	obj.Status = &ClusterSourceStatus{Fingerprint: fingerprintOf(t, cfg)}
 	res := c.Reconcile(context.Background(), &stubSourceController{}, obj)
 
-	require.Equal(t, beehive.Settled().RequeueAfter(clusterSourceResyncInterval), res)
+	require.Equal(t, beehive.Settled(), res)
 	assert.Contains(t, liveClusters(t, d.clusterClient), "prod")
 }
 
@@ -283,7 +282,7 @@ func TestSourceReconcilePublishesDespiteAFailedImport(t *testing.T) {
 	client := &stubSourceController{}
 	res := c.Reconcile(context.Background(), client, obj)
 
-	assertFailedWith(t, fmt.Errorf("listing clusters: %w", boom), res)
+	assert.Equal(t, fmt.Errorf("listing clusters: %w", boom), res.Err())
 	require.NotNil(t, client.updated, "and the wake still has to reach every other record")
 	assert.Equal(t, fingerprintOf(t, cfg), client.updated.Fingerprint)
 }
@@ -301,7 +300,7 @@ func TestSourceReconcileReportsAFailedImportOnAnUnchangedSnapshot(t *testing.T) 
 	obj.Status = &ClusterSourceStatus{Fingerprint: fingerprintOf(t, cfg)}
 	res := c.Reconcile(context.Background(), &stubSourceController{}, obj)
 
-	assertFailedWith(t, fmt.Errorf("listing clusters: %w", boom), res)
+	assert.Equal(t, fmt.Errorf("listing clusters: %w", boom), res.Err())
 }
 
 // An anchor on its way out has no set to maintain.

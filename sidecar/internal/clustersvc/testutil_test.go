@@ -77,14 +77,6 @@ func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatu
 	return newDeps(bh, newTestKubeconfig(t), nil, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
-// assertFailedWith asserts a pass failed carrying want. A ReconcileResult keeps its
-// error unexported, so equality against the Fail the controller built is the only read
-// there is — which pins the wrapping the failure carries too.
-func assertFailedWith(t *testing.T, want error, res beehive.ReconcileResult) {
-	t.Helper()
-	assert.Equal(t, beehive.Fail(want), res)
-}
-
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
 // it has read and every context is absent. Started because a reconcile defers until
 // the first read, which Start does synchronously.
