@@ -82,7 +82,7 @@ func TestTriggerClosesItsChannelWhenTheSourceCloses(t *testing.T) {
 }
 
 // The stop func must join the loop even mid-send, so service.Close never races one.
-// Nothing reads Names here, so the loop is parked on exactly that send.
+// Nothing reads Wakes here, so the loop is parked on exactly that send.
 func TestTriggerStopJoinsTheLoop(t *testing.T) {
 	tr := newKubeconfigTrigger(newFakeKubeconfigSource(cfgWith("prod")))
 	stop, err := tr.Start(context.Background())
@@ -91,16 +91,16 @@ func TestTriggerStopJoinsTheLoop(t *testing.T) {
 	testutil.WaitReturn(t, func() { assert.NoError(t, stop(context.Background())) }, "stop to return")
 }
 
-// The app owns the kubeconfig service and hands it to every reader, so the trigger must
-// not close it: Close ends every subscription the process holds.
-func TestTriggerCloseLeavesTheKubeconfigServiceOpen(t *testing.T) {
+// The app owns the kubeconfig service and hands it to every reader, so stopping the
+// trigger must release only its own subscription: the service's Close ends every
+// subscription the process holds.
+func TestTriggerStopLeavesTheKubeconfigServiceOpen(t *testing.T) {
 	d := newTestDeps(t)
 	tr := newKubeconfigTrigger(d.kubeconfigSvc)
 
 	stop, err := tr.Start(context.Background())
 	require.NoError(t, err)
 	require.NoError(t, stop(context.Background()))
-	require.NoError(t, tr.Close())
 
 	sub := d.kubeconfigSvc.Subscribe()
 	defer sub.Close()

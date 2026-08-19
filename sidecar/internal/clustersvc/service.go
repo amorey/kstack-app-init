@@ -486,8 +486,8 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 		{Name: "cache controller", StartCloser: cache},
 		{Name: "cached-catalog controller", StartCloser: catalog},
 		{Name: "cached-resource controller", StartCloser: resource},
-		{Name: "kubeconfig trigger", StartCloser: kubeconfigTrigger},
-		{Name: "kubeidentity trigger", StartCloser: identityTrigger},
+		{Name: "kubeconfig trigger", StartCloser: lifecycle.StartFunc(kubeconfigTrigger.Start)},
+		{Name: "kubeidentity trigger", StartCloser: lifecycle.StartFunc(identityTrigger.Start)},
 	}, nil
 }
 

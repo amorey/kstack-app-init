@@ -81,7 +81,9 @@ func (t *trigger[T]) Start(context.Context) (func(context.Context) error, error)
 	sub := t.subscribe()
 	t.wg.Go(func() {
 		// Closing the channel is what ends beehive's read of it, after it drains what this
-		// loop already sent.
+		// loop already sent. Releasing the subscription is all this trigger owns — the
+		// service behind it is the app's, and closing that would end every subscription in
+		// the process.
 		defer close(t.wakes)
 		defer sub.Close()
 		t.run(loopCtx, sub)
@@ -93,10 +95,9 @@ func (t *trigger[T]) Start(context.Context) (func(context.Context) error, error)
 	}, nil
 }
 
-// Close is a no-op: the loop releases its subscription as it exits.
-func (t *trigger[T]) Close() error { return nil }
-
-// run forwards one name per change until stopped or the feed closes.
+// run forwards one name per change until stopped or the feed closes. Cancellation ends
+// both waits: a feed is not required to close its channel when released, so the receive
+// needs the same escape the send does.
 func (t *trigger[T]) run(ctx context.Context, sub feed[T]) {
 	for {
 		select {
@@ -115,8 +116,6 @@ func (t *trigger[T]) run(ctx context.Context, sub feed[T]) {
 	}
 }
 
-// --- kubeconfig ---
-
 // kubeconfigSource is the subscribe half of kubeconfigService, all a trigger needs,
 // narrow so a test can substitute a hand-driven hub.
 type kubeconfigSource interface {
@@ -131,8 +130,6 @@ func newKubeconfigTrigger(cfgSource kubeconfigSource) *trigger[*api.Config] {
 		func(*api.Config) string { return ClusterSourceNameKubeconfig },
 	)
 }
-
-// --- kubeidentity ---
 
 // kubeidentitySource is the subscribe half of kubeidentityService, all a trigger needs,
 // narrow so a test can substitute a hand-driven hub.
