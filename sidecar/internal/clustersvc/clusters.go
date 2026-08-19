@@ -407,10 +407,10 @@ func sourceDeclares(cfgSvc kubeconfigService, obj *beehive.Object[ClusterSpec, C
 }
 
 // startupRequeue paces a reconcile that arrived inside a startup ordering window:
-// before the kubeconfig's first read, or before the discovery anchors exist. beehive
-// heads service.parts and dispatches its startup pass asynchronously, so a record
-// stored by a previous process can reach a reconcile before either has happened. Both
-// windows are bounded by the app's own startup, never by anything a user does.
+// before the discovery anchors exist, since the bootstrap that creates them follows
+// beehive in service.parts and its startup pass dispatches asynchronously, so a record
+// stored by a previous process can reach a reconcile first. It paces the unread-config
+// guards below too. Bounded by the app's own startup, never by anything a user does.
 const startupRequeue = time.Second
 
 // clusterController reconciles a tracked cluster: today it observes what the
@@ -439,10 +439,11 @@ func (c *clusterController) Reconcile(
 		return beehive.Settled()
 	}
 
-	// beehive starts ahead of the controllers, so its first owed pass can reach a
-	// record left unsettled by a previous process before the kubeconfig's first read.
-	// Observing the pre-read config would report every present context absent and wake
-	// the kind's watches for a flap. The requeue is the backstop until the read lands.
+	// Unreachable through the composition root, which starts the kubeconfig service
+	// ahead of this one and reads synchronously. It stays because the pre-read config
+	// is empty: observing it would report every present context absent and wake the
+	// kind's watches for a flap, so the guard is what keeps the pass correct if that
+	// ordering ever stops holding.
 	cfg, loaded := c.kubeconfigSvc.Get()
 	if !loaded {
 		return beehive.Unsettled().RequeueAfter(startupRequeue)

@@ -97,10 +97,12 @@ func (c *clusterSourceController) Reconcile(
 		return beehive.Settled()
 	}
 
-	// beehive starts ahead of this, so an owed pass can arrive before the kubeconfig's
-	// first read. The pre-read config is empty and indistinguishable from a file with
-	// no contexts, so importing against it would fingerprint an empty set and wake
-	// every record to observe its context absent.
+	// Unreachable through the composition root, which starts the kubeconfig service
+	// ahead of this one and reads synchronously. It stays because the pre-read config
+	// is empty and indistinguishable from a file with no contexts: importing against
+	// it would fingerprint an empty set and wake every record to observe its context
+	// absent, so the guard is what keeps the pass correct if that ordering ever stops
+	// holding.
 	cfg, loaded := c.kubeconfigSvc.Get()
 	if !loaded {
 		return beehive.Unsettled().RequeueAfter(startupRequeue)

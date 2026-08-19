@@ -198,13 +198,15 @@ which point the fix is to gate the expense inside `Reconcile`, or to give discov
 per-context kind whose spec the anchor writes (the shape `ClusterCachedResource` already uses).
 → [ADR: discovery as a beehive kind](../docs/adr/2026-08-18-discovery-as-a-beehive-kind.md).
 
-**Both reconciles defer until the kubeconfig has been read.** beehive sits at the head of
-`service.parts`, so its first owed pass can reach a record left unsettled by a previous process
-before the app's kubeconfig service has read the file. For the anchor the stake is higher than a
-flap: importing against the pre-read config would fingerprint an empty set. `Service.Get` reports the read alongside the config
-precisely because the two states are the same value — an empty config — and observing the pre-read
-one would mark every present context absent and wake the kind's watches for a flap. Unread is an
-`Unsettled` requeue, not a write.
+**Both reconciles defer until the kubeconfig has been read**, though neither reaches that branch
+today: the app starts `kubeconfig.Service` ahead of the cluster service and its first read is
+synchronous, so `Get` reports read before beehive dispatches anything. The guards stay because the
+pre-read config is empty and indistinguishable from a file with no contexts — `Service.Get` reports
+the read alongside the config precisely because the two states are the same value. Observing the
+pre-read one would mark every present context absent and wake the kind's watches for a flap, and for
+the anchor the stake is higher: it would fingerprint an empty set. Unread is an `Unsettled` requeue,
+not a write. **Keep them if you reorder startup** — that is the only thing standing between a
+reordering and a silent mass-orphaning.
 
 Scope a discovery pass by the source discriminant (`Spec.Source.Kubeconfig != nil`), not by the name
 prefix. Manual creation will have no source at all, so *"every Cluster has an anchor behind it"* is
