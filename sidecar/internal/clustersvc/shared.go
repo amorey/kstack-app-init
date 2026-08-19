@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconn"
 )
@@ -62,6 +63,17 @@ type kubeconfigService interface {
 	Get() (*api.Config, bool)
 	RESTConfig(contextName string) (*rest.Config, string, error)
 	Subscribe() kubeconfig.Subscription
+}
+
+// kubeidentityService answers which server a kube-context reaches, from a cache its own
+// workers keep fresh. Read-only and non-blocking by contract: a pass reports a cluster's
+// identity without the dial entering the pass.
+type kubeidentityService interface {
+	// Get is what the last probe learned, and whether anything is known at all. Asking
+	// is also what keeps the context probed — see the package.
+	Get(contextName string) (kubeidentity.State, bool)
+	// Subscribe reports the contexts whose answer moved.
+	Subscribe() kubeidentity.Subscription
 }
 
 // kubeconnService is the connection pool: a claim on one set of credentials, an

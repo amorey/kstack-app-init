@@ -29,10 +29,12 @@
 // signal to extract another leaf: this package's tests stay fast only while the
 // controllers do no I/O of their own.
 //
-// The four beehive kinds and their ownership chain:
+// The beehive kinds and their ownership chain:
 //
 //	Cluster                 (name: "{source}/{naturalKey}", e.g. "kubeconfig/{context}")
 //	    ↓ owns
+//	ClusterIdentity         (name: "kubeconfig/{context}" — one per set of credentials)
+//	    and owns
 //	ClusterCache            (name: "{ClusterID}/{serverUID}")
 //	    ↓ owns
 //	ClusterCachedCatalog    (name: "cachedcatalog/{CacheID}" — one per cache)
@@ -70,6 +72,7 @@ import (
 	beehivesqlite "github.com/amorey/beehive/sqlite"
 	"k8s.io/client-go/rest"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
@@ -319,22 +322,26 @@ type deps struct {
 	catalogClient  beehive.Client[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]
 	resourceClient beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
 	sourceClient   beehive.Client[ClusterSourceSpec, ClusterSourceStatus]
+	identityClient beehive.Client[ClusterIdentitySpec, ClusterIdentityStatus]
 
-	kubeconfigSvc kubeconfigService
-	kubeconnSvc   kubeconnService
-	pokeSvc       *poke.Service
+	kubeconfigSvc   kubeconfigService
+	kubeconnSvc     kubeconnService
+	kubeidentitySvc kubeidentityService
+	pokeSvc         *poke.Service
 }
 
-func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, pokeSvc *poke.Service) deps {
+func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, kubeidentitySvc kubeidentityService, pokeSvc *poke.Service) deps {
 	return deps{
-		clusterClient:  beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
-		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
-		catalogClient:  beehive.NewClient[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus](bh, ClusterCachedCatalogGroupKind),
-		resourceClient: beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
-		sourceClient:   beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
-		kubeconfigSvc:  kubeconfigSvc,
-		kubeconnSvc:    kubeconnSvc,
-		pokeSvc:        pokeSvc,
+		clusterClient:   beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
+		cacheClient:     beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
+		catalogClient:   beehive.NewClient[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus](bh, ClusterCachedCatalogGroupKind),
+		resourceClient:  beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
+		sourceClient:    beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
+		identityClient:  beehive.NewClient[ClusterIdentitySpec, ClusterIdentityStatus](bh, ClusterIdentityGroupKind),
+		kubeconfigSvc:   kubeconfigSvc,
+		kubeconnSvc:     kubeconnSvc,
+		kubeidentitySvc: kubeidentitySvc,
+		pokeSvc:         pokeSvc,
 	}
 }
 
@@ -347,10 +354,11 @@ type service struct {
 	// compare-and-swap.
 	clusterSpecMu sync.Mutex
 
-	// beehive, the anchors it must be up to create, the controllers in registration
-	// order, then the notifier. Order is the whole contract: beehive starts before
-	// anything that reaches the store and, being last to stop and close, outlives
-	// every reconcile and every poke that could still touch it.
+	// The server cache a reconcile reads, beehive, the anchors it must be up to create,
+	// the controllers in registration order, then the notifier. Order is the whole
+	// contract: beehive starts before anything that reaches the store and, being last
+	// to stop and close among them, outlives every reconcile and every poke that could
+	// still touch it.
 	parts []lifecycle.Part
 }
 
@@ -392,7 +400,9 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnSe
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)
+	kubeidentitySvc := kubeidentity.New()
+	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, kubeidentitySvc, pokeSvc)
+
 	controllers, err := registerControllers(bh, d)
 	if err != nil {
 		bhStore.Close()
@@ -400,14 +410,13 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnSe
 	}
 
 	parts := []lifecycle.Part{
+		// Ahead of beehive, so a pass never reads an identity cache that is not up yet,
+		// and so its workers stop only once the passes reading them have.
+		{Name: "kubeidentity", StartCloser: kubeidentitySvc},
 		{Name: "beehive", StartCloser: beehiveRuntime{bh: bh, store: bhStore}},
 		clusterSourceBootstrap(d),
 	}
 	parts = append(parts, controllers...)
-	parts = append(parts, lifecycle.Part{
-		Name:        "kubeconfig notifier",
-		StartCloser: newKubeconfigNotifier(d.kubeconfigSvc, d.sourceClient),
-	})
 
 	return &service{deps: d, parts: parts}, nil
 }
@@ -437,31 +446,48 @@ var startupPass = beehive.WithStartupFullPass(true)
 // dependency edge, which is what a pass here would be re-deriving.
 var sourceResync = beehive.WithIndividualPassInterval(clusterSourceResyncInterval)
 
+// identityResync re-probes each identity, timed from the end of its own last pass. The
+// second kind whose correctness rests on a poll: what it reports is a remote server's,
+// so nothing in the store moves when the answer does. Per object rather than a sweep of
+// the kind, which is what keeps a fleet from dialing in one burst.
+var identityResync = beehive.WithIndividualPassInterval(identityProbeInterval)
+
 // registerControllers builds and registers each kind's controller, which lives in that
 // kind's file, and returns them in registration order. Together here rather than four
 // calls spread across those files: the options are the whole subsystem's concurrency
 // and retry budget, and it only reads as a budget in one place.
 func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) {
+	// Built here because a trigger is a registration option like any other, and its feed
+	// is what makes the option mean anything. Each returns below as a Part after the
+	// controllers, so nothing pokes a kind before there is something to poke.
+	kubeconfigNotifier := newKubeconfigNotifier(d.kubeconfigSvc)
+	identityNotifier := newKubeidentityNotifier(d.kubeidentitySvc)
+
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
+	identity := &clusterIdentityController{deps: d}
 	cache := &clusterCacheController{deps: d}
 	catalog := &clusterCachedCatalogController{}
 	resource := &clusterCachedResourceController{}
 
-	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync)
+	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigNotifier.Names()))
 	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass)
+	errIdentity := beehive.Register(bh, ClusterIdentityGroupKind, identity, startupPass, identityResync, beehive.WithTriggerByName(identityNotifier.Names()))
 	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
 	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
 	errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
-	if err := errors.Join(errSource, errCluster, errCache, errCatalog, errResource); err != nil {
+	if err := errors.Join(errSource, errCluster, errIdentity, errCache, errCatalog, errResource); err != nil {
 		return nil, err
 	}
 	return []lifecycle.Part{
 		{Name: "cluster source controller", StartCloser: source},
 		{Name: "cluster controller", StartCloser: cluster},
+		{Name: "cluster identity controller", StartCloser: identity},
 		{Name: "cache controller", StartCloser: cache},
 		{Name: "cached-catalog controller", StartCloser: catalog},
 		{Name: "cached-resource controller", StartCloser: resource},
+		{Name: "kubeconfig notifier", StartCloser: kubeconfigNotifier},
+		{Name: "kubeidentity notifier", StartCloser: identityNotifier},
 	}, nil
 }
 

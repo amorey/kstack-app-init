@@ -19,6 +19,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -120,6 +121,14 @@ func TestStartRejectsASecondStart(t *testing.T) {
 	assert.ErrorContains(t, err, "start beehive")
 }
 
+// partNamed returns the service's part with that name.
+func partNamed(t *testing.T, svc *service, name string) lifecycle.Part {
+	t.Helper()
+	i := slices.IndexFunc(svc.parts, func(p lifecycle.Part) bool { return p.Name == name })
+	require.GreaterOrEqual(t, i, 0, "no part named %q", name)
+	return svc.parts[i]
+}
+
 // failingPart refuses to start, so a test can drive the unwind path.
 type failingPart struct{ err error }
 
@@ -134,8 +143,9 @@ func (failingPart) Close() error { return nil }
 func TestStartDrainsBeehiveWhenAControllerFails(t *testing.T) {
 	boom := errors.New("boom")
 	svc := newTestService(t).(*service)
-	// Keep beehive at the head, where New puts it, and fail the part after it.
-	svc.parts = []lifecycle.Part{svc.parts[0], {Name: "a", StartCloser: failingPart{err: boom}}}
+	// Beehive first, then a part that fails: by name, since a position moves whenever
+	// something is added ahead of it.
+	svc.parts = []lifecycle.Part{partNamed(t, svc, "beehive"), {Name: "a", StartCloser: failingPart{err: boom}}}
 
 	_, err := svc.Start(context.Background())
 	require.ErrorIs(t, err, boom)

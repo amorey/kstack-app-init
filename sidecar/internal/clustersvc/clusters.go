@@ -21,6 +21,9 @@ package clustersvc
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -470,40 +473,118 @@ func (c *clusterController) Reconcile(
 		}
 	}
 
-	// Ahead of the fast path below: a record that observes nothing new can still be
-	// missing the cache its identity calls for, and the pass that returns early there
-	// would never create it.
-	if err := c.ensureCache(ctx, obj); err != nil {
+	// The identity record is this cluster's probe: created here because a controller
+	// only reconciles an object that already exists, and depended on because what it
+	// reports comes from a server rather than from this record — so only that edge
+	// turns a probe result into a pass here. Ahead of the read below, which is what the
+	// first pass would otherwise find missing.
+	identity, err := c.observeIdentity(ctx, client, obj, cfg)
+	if err != nil {
 		return beehive.Fail(err)
 	}
 
-	status := clusterStatus(obj)
-	prev := status.Source.Kubeconfig
-	status.Source.Kubeconfig = observeKubeconfig(cfg, obj.Spec.Source.Kubeconfig, prev)
+	stored := clusterStatus(obj)
+	status := stored
+	status.Source.Kubeconfig = observeKubeconfig(cfg, obj.Spec.Source.Kubeconfig, stored.Source.Kubeconfig)
+	status = projectIdentity(status, identity)
 
-	// A source's status write wakes every record it declares, so most passes observe
-	// nothing new, and UpdateStatus would marshal the status and open a transaction
-	// only to find the stored bytes equal. Settling is still this pass's to report:
-	// an object left unsettled is re-dispatched by beehive's owed pass forever.
-	if obj.Status != nil && sameKubeconfigObservation(prev, status.Source.Kubeconfig) {
-		return beehive.Settled()
-	}
-
+	// Unconditional: beehive compares this against the status the pass was handed and
+	// reaches the store only when it differs, so a pass that observed nothing new costs
+	// a marshal rather than a transaction.
 	if err := client.UpdateStatus(ctx, status); err != nil {
 		return beehive.Fail(fmt.Errorf("update cluster status: %w", err))
 	}
+
+	// After the write and outside the skip above, both deliberately: this pass may have
+	// just learned the identity the cache is named for, and a record that observes
+	// nothing new can still be missing the cache it already calls for.
+	if err := ensureCache(ctx, c.cacheClient, ClusterID(obj.ID), status); err != nil {
+		return beehive.Fail(err)
+	}
+	// Settling is this pass's to report: an object left unsettled is re-dispatched by
+	// beehive's owed pass forever.
 	return beehive.Settled()
 }
 
-// ensureCache gives the cluster a mirror slot for the identity its last probe
-// recorded. A cluster that has never connected has none to mirror, and a cache named
-// for the empty UID is one CacheIsActive matches against nothing.
-func (c *clusterController) ensureCache(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus]) error {
-	uid := ClusterActiveUID(obj)
-	if uid == "" {
+// observeIdentity keeps this record's identity child in step and hands back what it
+// last learned, nil when there is none to read.
+//
+// Only a kubeconfig-sourced record has credentials to probe; another source's are not
+// this pass's to guess at, so it declares no child and no edge.
+func (c *clusterController) observeIdentity(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterStatus],
+	obj *beehive.Object[ClusterSpec, ClusterStatus],
+	cfg *api.Config,
+) (*beehive.Object[ClusterIdentitySpec, ClusterIdentityStatus], error) {
+	src := obj.Spec.Source.Kubeconfig
+	if src == nil {
+		return nil, nil
+	}
+
+	// Digested here rather than by the probe, which reads the file too late to know it
+	// moved: this pass is the one the anchor wakes when it does.
+	digest, err := credentialsDigest(cfg, src.Context)
+	if err != nil {
+		return nil, err
+	}
+	id, err := ensureClusterIdentity(ctx, c.identityClient, obj, digest)
+	if err != nil {
+		return nil, err
+	}
+	// Refused: the record is draining and its replacement waits for the name. Nothing to
+	// depend on, and the cluster keeps the identity it last projected.
+	if id == 0 {
+		return nil, nil
+	}
+	// Owning the record wakes nothing, so the edge is what carries a probe result back
+	// here. Beehive records nothing when it is already there, so every later pass is
+	// free.
+	if err := client.AddDependency(ctx, id); err != nil {
+		return nil, fmt.Errorf("depend cluster %d on its identity: %w", obj.ID, err)
+	}
+
+	obj2, err := c.identityClient.Get(ctx, id)
+	// Collected between the write above and this read: an ordinary race, and a pass
+	// with nothing to project reports what it already had.
+	if errors.Is(err, beehive.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cluster identity %d: %w", id, err)
+	}
+	return obj2, nil
+}
+
+// projectIdentity folds a probed identity into the cluster status that serves it. The
+// cluster's copy is a cached projection, the way its kubeconfig observation is: the
+// record above is the source of truth, and the dependency edge is what refreshes this.
+//
+// A field the probe never reached leaves the cluster's last-known value alone.
+func projectIdentity(status ClusterStatus, obj *beehive.Object[ClusterIdentitySpec, ClusterIdentityStatus]) ClusterStatus {
+	if obj == nil || obj.Status == nil {
+		return status
+	}
+	if uid := obj.Status.ServerUID; uid != nil {
+		status.Server.UID = uid
+	}
+	if version := obj.Status.ServerVersion; version != nil {
+		status.Server.Version = version
+	}
+	if username := obj.Status.Username; username != nil {
+		status.Principal.Username = username
+	}
+	return status
+}
+
+// ensureCache gives the cluster a mirror slot for the identity this pass observed. A
+// cluster that has never connected has none to mirror, and a cache named for the empty
+// UID is one CacheIsActive matches against nothing.
+func ensureCache(ctx context.Context, caches beehive.Client[ClusterCacheSpec, ClusterCacheStatus], id ClusterID, status ClusterStatus) error {
+	if status.Server.UID == nil || *status.Server.UID == "" {
 		return nil
 	}
-	return ensureClusterCache(ctx, c.cacheClient, ClusterID(obj.ID), uid)
+	return ensureClusterCache(ctx, caches, id, *status.Server.UID)
 }
 
 // ensureKubeconfigClusters gives every context in cfg a Cluster record. Called by the
@@ -560,15 +641,6 @@ func ensureKubeconfigClusters(ctx context.Context, client beehive.Client[Cluster
 	return errors.Join(errs...)
 }
 
-// sameKubeconfigObservation compares two observations by value, nil included: a record
-// from another source never has one, and two of those are equally unchanged.
-func sameKubeconfigObservation(a, b *ClusterStatusSourceKubeconfig) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
-}
-
 // observeKubeconfig returns what cfg says about the record src comes from, folded over
 // the previous observation. A nil src is any other source, whose observation is this
 // one's to return unchanged.
@@ -597,4 +669,33 @@ func observeKubeconfig(cfg *api.Config, src *ClusterSpecSourceKubeconfig, prev *
 	observed.IsPresent = false
 	observed.IsDefault = false
 	return &observed
+}
+
+// credentialsDigest digests the cluster and user entries a context resolves through,
+// which is what decides whether a probe reaches the same server as whom. Empty for a
+// context cfg does not hold: an orphaned record has nothing to resolve.
+//
+// A digest, never the values: an entry carries bearer tokens and client keys, and this
+// is written into a spec the store persists. It is compared, never read back.
+//
+// Whole entries rather than named fields, for the reason kubeconfigFingerprint gives
+// about the fold it digests: a list of fields silently stops covering the one added
+// next, and nothing would be woken to notice.
+func credentialsDigest(cfg *api.Config, contextName string) (string, error) {
+	kctx := cfg.Contexts[contextName]
+	if kctx == nil {
+		return "", nil
+	}
+	b, err := json.Marshal(struct {
+		Cluster  *api.Cluster  `json:"cluster"`
+		AuthInfo *api.AuthInfo `json:"authInfo"`
+	}{
+		Cluster:  cfg.Clusters[kctx.Cluster],
+		AuthInfo: cfg.AuthInfos[kctx.AuthInfo],
+	})
+	if err != nil {
+		return "", fmt.Errorf("digest credentials for context %q: %w", contextName, err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
 }

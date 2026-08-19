@@ -54,8 +54,16 @@ func newTestBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // another store.
 func newTestDeps(t *testing.T) deps {
 	t.Helper()
+	d, _ := newTestDepsAndBeehive(t)
+	return d
+}
+
+// newTestDepsAndBeehive is newTestDeps plus the beehive behind it, for a test that has
+// to write what only a pass can — see newClusterStatusDeps.
+func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
+	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), nil, nil)
+	d := newDeps(bh, newTestKubeconfig(t), nil, nil, nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -63,7 +71,7 @@ func newTestDeps(t *testing.T) deps {
 	// The anchors the real service creates at startup: clusterController.Reconcile
 	// reads one to declare its dependency edge.
 	require.NoError(t, ensureClusterSources(context.Background(), d.sourceClient))
-	return d
+	return d, bh
 }
 
 // newClusterStatusDeps returns the shared set plus the client that stores a Cluster
@@ -74,7 +82,7 @@ func newTestDeps(t *testing.T) deps {
 func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	return newDeps(bh, newTestKubeconfig(t), nil, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(bh, newTestKubeconfig(t), nil, nil, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -111,7 +119,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil, nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil, nil, nil)
 }
 
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the

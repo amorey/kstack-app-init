@@ -22,7 +22,7 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 
 ## Cluster subsystem (`internal/clustersvc`)
 
-**Mid-rebuild.** The layout — five beehive kinds, four of which are GraphQL families:
+**Mid-rebuild.** The layout — six beehive kinds, four of which are GraphQL families:
 
 ```
 internal/clustersvc/
@@ -35,11 +35,16 @@ internal/clustersvc/
   cacheddata.go       ┘ (no controller — the one family that isn't a beehive kind)
   clustersources.go   the ClusterSource kind: one discovery anchor per source variant.
                       A beehive kind with no GraphQL type behind it — internal
-  notifiers.go        the source-feed→control-plane bridge, the one thing outside
-                      beehive. Generic over the feed; one constructor per source
+  clusteridentities.go the ClusterIdentity kind: one probe per set of credentials a
+                      cluster connects with. Internal too
+  notifiers.go        the feed→name bridge: maps a source's vocabulary onto beehive
+                      names for the trigger declared at registration
   shared.go           vocabulary every family reuses, the app's services as this
                       package sees them, and the two GraphQL scalars
   stream.go           Stream[T]
+  internal/kubeidentity/ the probe itself — dial, read the server's identity. This
+                      package's own leaf, under internal/ so the compiler keeps it
+                      that way
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -84,16 +89,22 @@ consecutive reviews found a different place that had forgotten it.
 goroutine and the beehive watch behind it.
 
 **A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
-lifecycle. No kind has any yet — all five embed `lifecycle.None` — but the leaves a controller grows
+lifecycle. No kind has any yet — all six embed `lifecycle.None` — but the leaves a controller grows
 land there rather than on `service`, or the composition root accumulates every kind's detail.
-`registerControllers` builds and registers all five, returning them in registration order. All register with
+`registerControllers` builds and registers all six, returning them in registration order. All register with
 `startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
 reads as settled, since the generation was observed by a process that is gone. **`ClusterSource`
 alone also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResyncInterval)`),
 the poll its correctness rests on: it reads a file the store cannot see, so a lost notifier poke is
-a change nothing else would report. The other kinds are woken by a spec write or a dependency edge,
-with the out-of-band buses covering what neither reaches.
+a change nothing else would report. **`ClusterIdentity` takes `identityResync`** for the same reason
+— what it reports is a remote server's, so nothing in the store moves when the answer does. The
+other kinds are woken by a spec write or a dependency edge.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
+
+**A status write is unconditional.** Beehive compares what a pass writes against the status it handed
+that pass and reaches the store only for a difference, so an observation that moved nothing costs a
+marshal rather than a transaction — a guard in the pass would only duplicate it, and would drift from
+what the pass actually writes.
 
 **A pass returns a verdict, never an error**: `beehive.Settled()` (the pass observed the object's
 current generation, which beehive records), `beehive.Unsettled()` (a real pass that is not caught
@@ -103,8 +114,9 @@ window's 1s retry. **A cadence a kind depends on belongs at registration instead
 path can forget it. **A no-op pass still settles**: unsettled, every object of the kind comes back
 on the owed pass's cadence, forever.
 
-**Shared dependencies travel in `deps`** — one beehive client per kind plus the process-wide services
-(`kubeconfig`, `kubeconn`, `poke`), built once by `newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)` and **embedded** by `service` and by each
+**Shared dependencies travel in `deps`** — one beehive client per kind, the process-wide services
+(`kubeconfig`, `kubeconn`, `poke`), built once by
+`newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)` and **embedded** by `service` and by each
 controller, so a family reads `a.s.cacheClient` and a controller reads `c.cacheClient`. The `Client`
 suffix is load-bearing: the fields are promoted into both, and `a.s.cacheClient` must not read like
 the `Caches` family it is reached through. **A new kind or a new
@@ -138,6 +150,51 @@ the parent supplies only the policy — when, and with which switch. A teardown 
 pass whose object, or whose owner, is deletion-pending or already collected writes nothing, since the
 cascade is coming for the subtree either way.
 
+**Each of those writes is one call, with no read in front of it.** A relay is
+`CreateOrUpdate(name, spec, WithOwner(parent))` — resolve and write in one transaction; a
+create-only child whose spec *is* its identity (`ClusterCache`) is `GetOrCreate`. Both refuse a
+deletion-pending row rather than rewriting it: `GetOrCreate` returns it as-is, `CreateOrUpdate`
+returns `ErrDeletionPending`, which the caller treats as "nothing to relay and nothing to depend on"
+rather than as a failed pass. **Don't put a `GetByName` probe in front of one to keep the converged
+case off the write path** — beehive measured it, and the transaction it saves costs more than it
+saves below roughly four converged writes per changed one. What the pass must still hold to is a
+spec that marshals identically when nothing moved, since beehive's no-op suppression is what keeps a
+converged relay from waking every dependent.
+
+**The probe is a kind, so a pass may dial.** `ClusterIdentity` (`clusteridentities.go`) holds one
+record per set of credentials a cluster connects with — today one per kube-context — and its
+controller is the prober. It exists as a kind rather than as fields on `Cluster` because a pass that
+dials blocks a worker of its kind for as long as the network takes: here that worker belongs to the
+kind whose whole job is dialing, and its `WithConcurrency` is the fleet's dial budget. The probe
+carries a deadline of its own, or one hung dial holds a worker past it.
+
+Its pass resolves the context to credentials and reports `Connected` — `Inactive` when the cluster is
+switched off **or its context left the kubeconfig** (both are states the user chose, with nothing to
+connect to until they undo it), `ResolveFailed` when the context is there and its entries will not
+resolve (a broken file, reported on the record rather than failing the pass, since beehive's backoff
+cannot fix a file), `Connecting` while credentials resolve and nothing has dialed. **The dial is not written yet**; what lands there writes the status a
+cluster projects, plus `Connected` true or `ProbeFailed`.
+
+`clusterController.Reconcile` creates the record (`ensureClusterIdentity`), relays `Enabled` and a
+per-context `credentialsDigest` into its spec, declares `AddDependency` onto it, and **projects** its
+status into `status.server` /
+`status.principal` — a cached view of the record above, exactly as `status.source.kubeconfig` is a
+cached view of the file, which is what leaves the GraphQL surface and `CacheIsActive` untouched. The
+edge is the whole path a probe result takes back: owning a child wakes nothing.
+
+**The relays are how the file reaches a probe.** `ClusterIdentity` declares no edge onto the source
+anchor — an anchor's status moves on the fingerprint, and what a probe needs to hear is the entries a
+context resolves *through*. Instead the cluster's pass, which the anchor does wake, writes the
+digest into the child's spec: a spec write is itself the wake, and it reaches the one identity whose
+credentials moved rather than every record the file mentions. A digest, never the values — an entry
+carries tokens and client keys, and the spec is persisted.
+
+**Its steady state must be silent.** Every write to an identity record wakes every cluster that
+depends on it, so the pass reports only what it observed and lets beehive's no-op suppression (equal
+status bytes, unchanged conditions) do the rest. A timestamp in that status — or in a condition the
+pass writes unconditionally — would wake the fleet on every probe, which is the same trap
+`ClusterSourceStatus` carries and the reason a sweep-driven wake was replaced by this edge.
+
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache
 is still the active identity), so a flip on the cluster has to reach the cache — and owning a child
@@ -162,8 +219,13 @@ piece outside beehive is a `notifier` (`notifiers.go`), which subscribes to the 
 feed and `Requeue`s that source's anchor — a source of truth is not an object, so nothing else could
 span that gap. It is generic over the feed's element type (`feed[T]`, satisfied by any
 `Chan()`/`Close()` pair) because **the value is dropped**: a poke asks for a pass, and the pass reads
-current state. A second source is `newNotifier(name, subscribe, client)` and nothing else. It carries
-**no retry**: a lost poke costs latency, since the kind's sweep runs the pass anyway.
+current state. **Beehive owns the receive loop** — a feed is declared at registration with
+`WithTriggerByName`, which resolves each name within the kind and requeues it, along with its rate
+against the store and its place in the shutdown order. What is left here is translation, which
+beehive cannot do: only this package knows that the kube-context "prod" is the record
+`kubeconfig/prod`. A second feed is `newNotifier(subscribe, name)` plus the option, and nothing else.
+It carries **no retry**: a lost poke costs latency, since the kind's own cadence runs the pass
+anyway.
 
 The pass is **creation-only** (`ensureKubeconfigClusters`, which lives in `clusters.go` because the
 name and spec are the Cluster kind's vocabulary): it creates a record for every context nothing yet
@@ -183,11 +245,12 @@ and a departed context — absent from every snapshot the create pass walks — 
 way*. **A stamp that moved every pass would wake every record every pass** — that is the trap the
 fingerprint exists to avoid, and any new field on `ClusterSourceStatus` inherits it.
 
-`kubeconfigFingerprint` is **computed by running `observeKubeconfig`**, not by naming the config
-fields it happens to read. That is the whole point: a digest that listed the fields itself would
-silently stop tracking the day the fold reads one more, and no record would be woken to observe it —
-a divergence no test would catch, since every unit test stubs the write. Keep the derivation if you
-touch it.
+`kubeconfigFingerprint` is **a hash of the whole snapshot**, deliberately coarser than what any
+record observes. A digest built from the folds instead would wake nobody the day one of them starts
+reading another field, and keeping the two in step is a coupling nothing enforces — so this covers
+everything and pays in false positives: an edit no record cares about wakes them all, each to
+compare, find nothing moved, and settle. A kubeconfig save is a human-paced event and a pass that
+observes nothing is a map lookup.
 
 The wake is deliberately broad rather than targeted: to know which records a change affects you must
 compare each one's stored observation against the snapshot, which is the per-object work the Cluster

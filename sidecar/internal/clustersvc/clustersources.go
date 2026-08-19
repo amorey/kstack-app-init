@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/amorey/beehive"
@@ -154,42 +153,18 @@ func ensureClusterSources(ctx context.Context, client beehive.Client[ClusterSour
 	return nil
 }
 
-// kubeconfigObservation pairs a context with what the fold makes of it. Marshalled as
-// the digest's input, so the context name is part of what is hashed.
-type kubeconfigObservation struct {
-	Context  string                         `json:"context"`
-	Observed *ClusterStatusSourceKubeconfig `json:"observed"`
-}
-
-// kubeconfigFingerprint digests what every record's own reconcile will observe, by
-// running the same fold this pass's dependents run. Derived from observeKubeconfig
-// rather than from the config's fields on purpose: a digest that named the fields
-// itself would silently stop tracking the day the fold reads one more, and no record
-// would ever be woken to observe it.
+// kubeconfigFingerprint digests the whole snapshot: every field of every entry, whether
+// or not a dependent reads it today.
 //
-// A departed context is absent from cfg, so it contributes nothing — but its
-// departure changes the name set, which moves the digest and wakes it to re-observe
-// against its own last-known state.
+// Deliberately coarser than what the records observe. A digest built from the folds
+// themselves would wake nobody for a field the next fold starts reading, and keeping
+// the two in step is a coupling nothing enforces — so this covers everything and pays
+// for it in false positives instead. An edit no record cares about wakes them all, each
+// to compare, find nothing moved, and settle.
 func kubeconfigFingerprint(cfg *api.Config) (string, error) {
-	names := make([]string, 0, len(cfg.Contexts))
-	for name := range cfg.Contexts {
-		names = append(names, name)
-	}
-	slices.Sort(names)
-
-	// Sorted, because contexts come out of a map and the digest must not depend on
-	// range order. JSON delimits its own values, so no two field boundaries collide.
-	observed := make([]kubeconfigObservation, 0, len(names))
-	for _, name := range names {
-		observed = append(observed, kubeconfigObservation{
-			Context:  name,
-			Observed: observeKubeconfig(cfg, &ClusterSpecSourceKubeconfig{Context: name}, nil),
-		})
-	}
-
-	b, err := json.Marshal(observed)
+	b, err := json.Marshal(cfg)
 	if err != nil {
-		return "", fmt.Errorf("digest kubeconfig observations: %w", err)
+		return "", fmt.Errorf("digest kubeconfig: %w", err)
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:]), nil

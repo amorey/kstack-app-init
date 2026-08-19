@@ -92,6 +92,27 @@ func TestEnsureClusterCachedCatalogRelaysAFlip(t *testing.T) {
 	assert.False(t, objs[0].Spec.Enabled)
 }
 
+// A record the GC is coming for keeps the spec it has: rewriting it would land the relay
+// on an incarnation about to go, and the replacement cannot be created until the name is
+// released with it. The same rule ensureClusterIdentity keeps.
+func TestEnsureClusterCachedCatalogRewritesNoDrainingRecord(t *testing.T) {
+	d := newTestDeps(t)
+	ctx := context.Background()
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	require.NoError(t, ensureClusterCachedCatalog(ctx, d.catalogClient, ClusterCacheID(cache.ID), true))
+
+	created := catalogs(t, d.catalogClient)[0]
+	require.NoError(t, d.catalogClient.Delete(ctx, created.ID))
+
+	require.NoError(t, ensureClusterCachedCatalog(ctx, d.catalogClient, ClusterCacheID(cache.ID), false))
+
+	draining, err := d.catalogClient.GetByName(ctx, ClusterCachedCatalogName(cache.ID))
+	require.NoError(t, err)
+	require.NotNil(t, draining.DeletionRequestedAt, "still awaiting collection")
+	assert.True(t, draining.Spec.Enabled, "left as it was")
+}
+
 // A placeholder until the kind is rebuilt: it must settle the object rather than
 // requeue it, or beehive's owed pass would re-dispatch every catalog forever.
 func TestCachedCatalogControllerReconcilesToANoOp(t *testing.T) {

@@ -139,20 +139,11 @@ func cacheSyncEnabled(clusterObj *beehive.Object[ClusterSpec, ClusterStatus], ca
 // that already exists and the identity is the parent's to discover. The writes live
 // here so the kind's vocabulary stays in the kind's file.
 //
-// The GetByName probe keeps the steady state off the write path: GetOrCreate opens a
-// transaction even on the found branch, and the store is single-connection, so each one
-// serializes every other reader for its duration. GetOrCreate still closes the
-// create-path race.
+// GetOrCreate rather than CreateOrUpdate: a found row is returned as-is, which is the
+// whole contract here — ServerUID *is* the identity, so a later pass has nothing to
+// write, and a row awaiting collection holds its name until GC releases it.
 func ensureClusterCache(ctx context.Context, client beehive.Client[ClusterCacheSpec, ClusterCacheStatus], clusterID ClusterID, serverUID string) error {
 	name := ClusterCacheName(clusterID, serverUID)
-	_, err := client.GetByName(ctx, name)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, beehive.ErrNotFound) {
-		return fmt.Errorf("look up cluster cache %s: %w", name, err)
-	}
-
 	spec := ClusterCacheSpec{ServerUID: serverUID}
 	if _, _, err := client.GetOrCreate(ctx, name, spec, beehive.WithOwner(beehive.ObjectID(clusterID))); err != nil {
 		return fmt.Errorf("create cluster cache %s: %w", name, err)

@@ -137,20 +137,41 @@ func TestKubeconfigFingerprintSeparatesAdjacentValues(t *testing.T) {
 	assert.NotEqual(t, fingerprintOf(t, a), fingerprintOf(t, b))
 }
 
-// The digest is derived from observeKubeconfig, not from the config's fields, so a
-// part of the file the fold never reads must not wake a single record.
-func TestKubeconfigFingerprintIgnoresWhatTheObservationDoesNotRead(t *testing.T) {
+// Editing what a context resolves through leaves every entry name untouched, so the
+// observation cannot see it. The credentials fold is what makes it wake anything: the
+// record it reaches relays the change to the probe that would otherwise dial the old
+// server until its next poll.
+func TestKubeconfigFingerprintMovesWhenCredentialsChange(t *testing.T) {
 	cfg := cfgWith("prod")
+	cfg.Clusters = map[string]*api.Cluster{"prod-cluster": {Server: "https://one.example"}}
 	base := fingerprintOf(t, cfg)
+	baseFold := observedFold(t, cfg)
 
-	cfg.Clusters = map[string]*api.Cluster{"prod-cluster": {Server: "https://example"}}
-	assert.Equal(t, base, fingerprintOf(t, cfg))
+	cfg.Clusters["prod-cluster"] = &api.Cluster{Server: "https://two.example"}
+
+	assert.Equal(t, baseFold, observedFold(t, cfg), "the observation cannot tell them apart")
+	assert.NotEqual(t, base, fingerprintOf(t, cfg), "the credentials fold can")
 }
 
-// Two configs the fold cannot tell apart must digest the same, and two it can must
-// not. This is the coupling the digest exists to hold: it is computed by running
-// observeKubeconfig, so a field added to that fold is tracked without anyone
-// remembering to add it here.
+// The digest covers the whole snapshot, so an edit no record observes still wakes them
+// all. The cost the coarse digest is chosen for: every one of those passes compares,
+// finds nothing moved, and settles.
+func TestKubeconfigFingerprintMovesForWhatNoRecordObserves(t *testing.T) {
+	cfg := cfgWith("prod")
+	base := fingerprintOf(t, cfg)
+	baseFold := observedFold(t, cfg)
+
+	// An entry no context references, and a preferences block nothing here reads.
+	cfg.Clusters = map[string]*api.Cluster{"unreferenced": {Server: "https://example"}}
+	cfg.Preferences = api.Preferences{Colors: true}
+
+	assert.Equal(t, baseFold, observedFold(t, cfg), "no record observes any of it")
+	assert.NotEqual(t, base, fingerprintOf(t, cfg), "and the digest moves anyway")
+}
+
+// Whatever a record can observe, the digest must move for — the guarantee that makes it
+// a wake signal. It holds by covering everything: the folds read a subset of the
+// snapshot, so a change either of them can see is a change to the bytes hashed here.
 func TestKubeconfigFingerprintFollowsTheObservation(t *testing.T) {
 	same := func(a, b *api.Config) bool {
 		return observedFold(t, a) == observedFold(t, b) &&
@@ -324,6 +345,9 @@ func TestSourceReconcileSkipsADeletingAnchor(t *testing.T) {
 type fakeKubeconfigService struct {
 	cfg    *api.Config
 	loaded bool
+	// restErr is what RESTConfig reports; nil resolves to an empty config, which is all
+	// a caller that does not dial can tell apart.
+	restErr error
 }
 
 func (f fakeKubeconfigService) Get() (*api.Config, bool) { return f.cfg, f.loaded }
@@ -332,8 +356,11 @@ func (f fakeKubeconfigService) Subscribe() kubeconfig.Subscription {
 	panic("the source controller does not subscribe")
 }
 
-func (f fakeKubeconfigService) RESTConfig(string) (*rest.Config, string, error) {
-	panic("the source controller resolves no credentials")
+func (f fakeKubeconfigService) RESTConfig(contextName string) (*rest.Config, string, error) {
+	if f.restErr != nil {
+		return nil, "", f.restErr
+	}
+	return &rest.Config{}, contextName, nil
 }
 
 // --- the wake, over a real beehive ---
