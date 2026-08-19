@@ -1,4 +1,4 @@
-package app_test
+package app
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/authpb"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/app"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -25,7 +26,7 @@ import (
 // it over httptest (HTTP/1.1 for GraphQL/SSE, h2c upgrade for gRPC — exactly the
 // production split). It does NOT call Start(), so the cluster-cache coordinator
 // never runs; the lifecycle surface is what's under test.
-func newTestApp(t *testing.T) (*app.App, string) {
+func newTestApp(t *testing.T) (*App, string) {
 	t.Helper()
 	dir := t.TempDir()
 	kubeconfig := filepath.Join(dir, "kubeconfig")
@@ -46,10 +47,10 @@ users:
   user: {}
 `), 0o600))
 
-	a, err := app.New(app.Config{
+	a, err := New(Config{
 		KubeconfigPath: kubeconfig,
 		// A real data dir so app.db lands in the per-test temp dir — with an
-		// empty DataDir app.New would create app.db relative to the test's
+		// empty DataDir New would create app.db relative to the test's
 		// working directory (the package dir).
 		DataDir: t.TempDir(),
 	})
@@ -62,8 +63,30 @@ users:
 // DataDir is required: with an empty one New must error rather than create
 // app.db relative to whatever the process working directory happens to be.
 func TestAppRequiresDataDir(t *testing.T) {
-	_, err := app.New(app.Config{})
+	_, err := New(Config{})
 	require.ErrorContains(t, err, "data dir")
+}
+
+// The cluster reconciles read the kubeconfig on their first pass and defer while it
+// reports unread, which is a state only this ordering keeps them out of: Start reads
+// synchronously, so a service started after it always observes a read. Reversed, every
+// record would observe its context absent and orphan itself — a mass write, not a
+// pause — and the guards in clustersvc are the only thing that would stand between the
+// reordering and that.
+func TestAppStartsKubeconfigBeforeTheClusterService(t *testing.T) {
+	a, err := New(Config{DataDir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, a.Close()) })
+
+	assert.Less(t, partIndex(t, a, "kubeconfig service"), partIndex(t, a, "cluster service"))
+}
+
+// partIndex returns where the named part sits in start order.
+func partIndex(t *testing.T, a *App, name string) int {
+	t.Helper()
+	i := slices.IndexFunc(a.parts, func(p lifecycle.Part) bool { return p.Name == name })
+	require.GreaterOrEqual(t, i, 0, "no part named %q", name)
+	return i
 }
 
 // With no cloud config (the standalone/test default), the account surface is

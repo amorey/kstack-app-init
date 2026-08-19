@@ -1,4 +1,4 @@
-package app_test
+package app
 
 import (
 	"bufio"
@@ -15,7 +15,6 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/kubetail-org/kstack-app/sidecar/grpc/authpb"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/app"
 )
 
 // h2cGRPCClient dials the httptest server with insecure credentials — i.e. h2c
@@ -29,7 +28,7 @@ func h2cGRPCClient(t *testing.T, ts *httptest.Server) authpb.AuthServiceClient {
 	return authpb.NewAuthServiceClient(conn)
 }
 
-func serveApp(t *testing.T, a *app.App) *httptest.Server {
+func serveApp(t *testing.T, a *App) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(a)
 	t.Cleanup(ts.Close)
