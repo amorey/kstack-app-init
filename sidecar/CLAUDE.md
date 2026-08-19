@@ -37,8 +37,8 @@ internal/clustersvc/
                       A beehive kind with no GraphQL type behind it — internal
   clusteridentities.go the ClusterIdentity kind: one probe per set of credentials a
                       cluster connects with. Internal too
-  notifiers.go        the feed→name bridge: maps a source's vocabulary onto beehive
-                      names for the trigger declared at registration
+  triggers.go         the feed→wake bridge: maps a source's vocabulary onto the beehive
+                      names the trigger declared at registration requeues
   shared.go           vocabulary every family reuses, the app's services as this
                       package sees them, and the two GraphQL scalars
   stream.go           Stream[T]
@@ -95,7 +95,7 @@ land there rather than on `service`, or the composition root accumulates every k
 `startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
 reads as settled, since the generation was observed by a process that is gone. **`ClusterSource`
 alone also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResyncInterval)`),
-the poll its correctness rests on: it reads a file the store cannot see, so a lost notifier poke is
+the poll its correctness rests on: it reads a file the store cannot see, so a lost trigger poke is
 a change nothing else would report. **`ClusterIdentity` takes `identityResync`** for the same reason
 — what it reports is a remote server's, so nothing in the store moves when the answer does. The
 other kinds are woken by a spec write or a dependency edge.
@@ -215,7 +215,7 @@ spec write already carries the value buys nothing and doubles the wakes.
 keeps the record set in step with that source. It is a kind precisely so the pass gets what a loop
 would have to hand-roll: beehive's backoff ladder on a failed pass, `startupPass` for the boot
 import, `Requeue` as the out-of-band kick, an observed generation, and an events timeline. The one
-piece outside beehive is a `notifier` (`notifiers.go`), which subscribes to the source's own change
+piece outside beehive is a `trigger` (`triggers.go`), which subscribes to the source's own change
 feed and `Requeue`s that source's anchor — a source of truth is not an object, so nothing else could
 span that gap. It is generic over the feed's element type (`feed[T]`, satisfied by any
 `Chan()`/`Close()` pair) because **the value is dropped**: a poke asks for a pass, and the pass reads
@@ -223,7 +223,7 @@ current state. **Beehive owns the receive loop** — a feed is declared at regis
 `WithTriggerByName`, which resolves each name within the kind and requeues it, along with its rate
 against the store and its place in the shutdown order. What is left here is translation, which
 beehive cannot do: only this package knows that the kube-context "prod" is the record
-`kubeconfig/prod`. A second feed is `newNotifier(subscribe, name)` plus the option, and nothing else.
+`kubeconfig/prod`. A second feed is `newTrigger(subscribe, name)` plus the option, and nothing else.
 It carries **no retry**: a lost poke costs latency, since the kind's own cadence runs the pass
 anyway.
 
@@ -280,9 +280,9 @@ not an invariant to lean on — the dependency edge is declared only for records
 under fsnotify wakes and a poke subscription, both optional and allowed to fail. Applies to every
 watch. **Keep the tick under a new push layer rather than replacing it** — it is what covers what
 events cannot see, including the resume the poke subscription is there for.
-The `ClusterSource` anchor follows it: `clusterSourceResyncInterval` is the poll, and the notifier
+The `ClusterSource` anchor follows it: `clusterSourceResyncInterval` is the poll, and the trigger
 only makes it prompt. **Nothing changes the record set out of band**, which is what lets the anchor
-have no other trigger: `Clusters().Delete` refuses a record its source still declares, so a delete
+need nothing else to wake it: `Clusters().Delete` refuses a record its source still declares, so a delete
 can never free a natural key the source would want back. **The create pass still runs ahead of the
 fingerprint gate** — a failed create is retried against the snapshot that failed, so a pass that
 returned early there would skip the retry.
@@ -304,7 +304,7 @@ controller: **if `go test ./internal/clustersvc` stops being fast, one has leake
 **A process-wide service is the app's, and this package only reads it.** `kubeconfig.Service` and
 `kubeconn.Service` arrive through `deps` behind the narrow `kubeconfigService`/`kubeconnService`
 (both in `shared.go`), so nothing in this package starts or closes them — the kubeconfig's
-`Close` ends every subscription in the process, including other packages'. The notifier subscribes
+`Close` ends every subscription in the process, including other packages'. The trigger subscribes
 to it and releases only its own subscription.
 
 The five families are `Clusters()`, `Caches()`, `CachedCatalogs()`, `CachedResources()`, and

@@ -355,7 +355,7 @@ type service struct {
 	clusterSpecMu sync.Mutex
 
 	// The server cache a reconcile reads, beehive, the anchors it must be up to create,
-	// the controllers in registration order, then the notifier. Order is the whole
+	// the controllers in registration order, then the triggers. Order is the whole
 	// contract: beehive starts before anything that reaches the store and, being last
 	// to stop and close among them, outlives every reconcile and every poke that could
 	// still touch it.
@@ -441,7 +441,7 @@ var startupPass = beehive.WithStartupFullPass(true)
 
 // sourceResync re-runs the discovery pass, each anchor timed from the end of its own
 // last pass. Only ClusterSource takes one: it is the kind whose correctness rests on a
-// poll, since what it reads is a file the store cannot see and a lost notifier poke is
+// poll, since what it reads is a file the store cannot see and a lost trigger poke is
 // a change nothing else would report. Every other kind is woken by a spec write or a
 // dependency edge, which is what a pass here would be re-deriving.
 var sourceResync = beehive.WithIndividualPassInterval(clusterSourceResyncInterval)
@@ -460,8 +460,8 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	// Built here because a trigger is a registration option like any other, and its feed
 	// is what makes the option mean anything. Each returns below as a Part after the
 	// controllers, so nothing pokes a kind before there is something to poke.
-	kubeconfigNotifier := newKubeconfigNotifier(d.kubeconfigSvc)
-	identityNotifier := newKubeidentityNotifier(d.kubeidentitySvc)
+	kubeconfigTrigger := newKubeconfigTrigger(d.kubeconfigSvc)
+	identityTrigger := newKubeidentityTrigger(d.kubeidentitySvc)
 
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
@@ -470,9 +470,9 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	catalog := &clusterCachedCatalogController{}
 	resource := &clusterCachedResourceController{}
 
-	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigNotifier.Names()))
+	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigTrigger.Wakes()))
 	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass)
-	errIdentity := beehive.Register(bh, ClusterIdentityGroupKind, identity, startupPass, identityResync, beehive.WithTriggerByName(identityNotifier.Names()))
+	errIdentity := beehive.Register(bh, ClusterIdentityGroupKind, identity, startupPass, identityResync, beehive.WithTriggerByName(identityTrigger.Wakes()))
 	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
 	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
 	errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
@@ -486,8 +486,8 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 		{Name: "cache controller", StartCloser: cache},
 		{Name: "cached-catalog controller", StartCloser: catalog},
 		{Name: "cached-resource controller", StartCloser: resource},
-		{Name: "kubeconfig notifier", StartCloser: kubeconfigNotifier},
-		{Name: "kubeidentity notifier", StartCloser: identityNotifier},
+		{Name: "kubeconfig trigger", StartCloser: kubeconfigTrigger},
+		{Name: "kubeidentity trigger", StartCloser: identityTrigger},
 	}, nil
 }
 

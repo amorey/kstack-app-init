@@ -26,81 +26,81 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
-// startNotifier starts n and joins it on cleanup.
-func startNotifier[T any](t *testing.T, n *notifier[T]) {
+// startTrigger starts tr and joins it on cleanup.
+func startTrigger[T any](t *testing.T, tr *trigger[T]) {
 	t.Helper()
-	stop, err := n.Start(context.Background())
+	stop, err := tr.Start(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 }
 
 // The subscription is current-on-subscribe, so whatever the file already held names the
 // anchor at startup rather than waiting for the user to edit it.
-func TestKubeconfigNotifierNamesTheAnchorForTheStartupSnapshot(t *testing.T) {
-	n := newKubeconfigNotifier(newFakeKubeconfigSource(cfgWith("prod")))
-	startNotifier(t, n)
+func TestKubeconfigTriggerWakesTheAnchorForTheStartupSnapshot(t *testing.T) {
+	tr := newKubeconfigTrigger(newFakeKubeconfigSource(cfgWith("prod")))
+	startTrigger(t, tr)
 
-	assert.Equal(t, ClusterSourceNameKubeconfig, testutil.Recv(t, n.Names(), "the startup poke"))
+	assert.Equal(t, ClusterSourceNameKubeconfig, testutil.Recv(t, tr.Wakes(), "the startup poke"))
 }
 
 // Every change names the same record: which contexts moved is the anchor's pass to work
-// out, so the notifier translates rather than deciding.
-func TestKubeconfigNotifierNamesTheAnchorForEachSnapshot(t *testing.T) {
+// out, so the trigger translates rather than deciding.
+func TestKubeconfigTriggerWakesTheAnchorForEachSnapshot(t *testing.T) {
 	src := newFakeKubeconfigSource(cfgWith("prod"))
-	n := newKubeconfigNotifier(src)
-	startNotifier(t, n)
-	testutil.Recv(t, n.Names(), "the startup poke")
+	tr := newKubeconfigTrigger(src)
+	startTrigger(t, tr)
+	testutil.Recv(t, tr.Wakes(), "the startup poke")
 
 	src.publish(cfgWith("prod", "staging"))
 
-	assert.Equal(t, ClusterSourceNameKubeconfig, testutil.Recv(t, n.Names(), "the second poke"))
+	assert.Equal(t, ClusterSourceNameKubeconfig, testutil.Recv(t, tr.Wakes(), "the second poke"))
 }
 
 // The context that answered is the record that moved, and mapping the two is the one
 // thing beehive cannot do: only this package knows the record's name.
-func TestKubeidentityNotifierNamesTheContextsRecord(t *testing.T) {
+func TestKubeidentityTriggerWakesTheContextsRecord(t *testing.T) {
 	src := newFakeIdentitySource()
-	n := newKubeidentityNotifier(src)
-	startNotifier(t, n)
+	tr := newKubeidentityTrigger(src)
+	startTrigger(t, tr)
 
 	src.publish("staging")
 
-	assert.Equal(t, ClusterIdentityName("staging"), testutil.Recv(t, n.Names(), "the poke"))
+	assert.Equal(t, ClusterIdentityName("staging"), testutil.Recv(t, tr.Wakes(), "the poke"))
 }
 
-// The watcher shutting down ends the loop, and closing the channel is what ends the
-// trigger reading it — beehive drains what was already sent and stops.
-func TestNotifierClosesItsChannelWhenTheSourceCloses(t *testing.T) {
+// The watcher shutting down ends the loop, and closing the channel is what ends
+// beehive's read of it — it drains what was already sent and stops.
+func TestTriggerClosesItsChannelWhenTheSourceCloses(t *testing.T) {
 	src := newFakeKubeconfigSource(cfgWith("prod"))
-	n := newKubeconfigNotifier(src)
-	startNotifier(t, n)
-	testutil.Recv(t, n.Names(), "the startup poke")
+	tr := newKubeconfigTrigger(src)
+	startTrigger(t, tr)
+	testutil.Recv(t, tr.Wakes(), "the startup poke")
 
 	src.close()
 
-	testutil.WaitClosed(t, n.Names(), "the names channel to close with the feed")
+	testutil.WaitClosed(t, tr.Wakes(), "the wake channel to close with the feed")
 }
 
 // The stop func must join the loop even mid-send, so service.Close never races one.
 // Nothing reads Names here, so the loop is parked on exactly that send.
-func TestNotifierStopJoinsTheLoop(t *testing.T) {
-	n := newKubeconfigNotifier(newFakeKubeconfigSource(cfgWith("prod")))
-	stop, err := n.Start(context.Background())
+func TestTriggerStopJoinsTheLoop(t *testing.T) {
+	tr := newKubeconfigTrigger(newFakeKubeconfigSource(cfgWith("prod")))
+	stop, err := tr.Start(context.Background())
 	require.NoError(t, err)
 
 	testutil.WaitReturn(t, func() { assert.NoError(t, stop(context.Background())) }, "stop to return")
 }
 
-// The app owns the kubeconfig service and hands it to every reader, so the notifier must
+// The app owns the kubeconfig service and hands it to every reader, so the trigger must
 // not close it: Close ends every subscription the process holds.
-func TestNotifierCloseLeavesTheKubeconfigServiceOpen(t *testing.T) {
+func TestTriggerCloseLeavesTheKubeconfigServiceOpen(t *testing.T) {
 	d := newTestDeps(t)
-	n := newKubeconfigNotifier(d.kubeconfigSvc)
+	tr := newKubeconfigTrigger(d.kubeconfigSvc)
 
-	stop, err := n.Start(context.Background())
+	stop, err := tr.Start(context.Background())
 	require.NoError(t, err)
 	require.NoError(t, stop(context.Background()))
-	require.NoError(t, n.Close())
+	require.NoError(t, tr.Close())
 
 	sub := d.kubeconfigSvc.Subscribe()
 	defer sub.Close()
@@ -138,29 +138,29 @@ type stringFeed struct {
 func (f stringFeed) Chan() <-chan string { return f.ch }
 func (f stringFeed) Close()              { f.closed.Fire() }
 
-// A notifier forwards the name its mapper builds, over whatever feed it was given.
-func TestNotifierForwardsTheNameItsMapperBuilds(t *testing.T) {
+// A trigger forwards the name its mapper builds, over whatever feed it was given.
+func TestTriggerForwardsTheNameItsMapperBuilds(t *testing.T) {
 	ch := make(chan string, 1)
 	closed := testutil.NewSignal()
 
-	n := newNotifier(
+	tr := newTrigger(
 		func() feed[string] { return stringFeed{ch: ch, closed: closed} },
 		func(v string) string { return "mapped/" + v },
 	)
-	startNotifier(t, n)
+	startTrigger(t, tr)
 
 	ch <- "changed"
-	assert.Equal(t, "mapped/changed", testutil.Recv(t, n.Names(), "the poke"))
+	assert.Equal(t, "mapped/changed", testutil.Recv(t, tr.Wakes(), "the poke"))
 }
 
 // The loop owns the subscription, so stopping it is what releases the feed.
-func TestNotifierReleasesItsFeedOnExit(t *testing.T) {
+func TestTriggerReleasesItsFeedOnExit(t *testing.T) {
 	closed := testutil.NewSignal()
-	n := newNotifier(
+	tr := newTrigger(
 		func() feed[string] { return stringFeed{ch: make(chan string), closed: closed} },
 		func(v string) string { return v },
 	)
-	stop, err := n.Start(context.Background())
+	stop, err := tr.Start(context.Background())
 	require.NoError(t, err)
 
 	require.NoError(t, stop(context.Background()))

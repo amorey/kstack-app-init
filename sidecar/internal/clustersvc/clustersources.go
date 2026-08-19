@@ -47,7 +47,7 @@ const ClusterSourceNameKubeconfig = "clustersource/kubeconfig"
 var clusterSourceNames = []string{ClusterSourceNameKubeconfig}
 
 // clusterSourceResyncInterval paces the discovery pass, as the kind's individual pass
-// (registered in service.go). A backstop, not the mechanism: kubeconfigNotifier is
+// (registered in service.go). A backstop, not the mechanism: kubeconfigTrigger is
 // what makes a file change prompt, and this is what covers a kick that was never
 // delivered. A pass observing an unchanged snapshot writes nothing, so the tick wakes
 // no dependent.

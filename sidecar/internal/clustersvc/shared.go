@@ -58,7 +58,7 @@ var ErrDeclaredBySource = errors.New("clustersvc: cluster is still declared by i
 // together in deps and reach every kind through it.
 
 // kubeconfigService is the one reader of the user's kubeconfig. RESTConfig is the
-// connection probe's seam; the reconciles read Get and the notifier subscribes.
+// connection probe's seam; the reconciles read Get and the trigger subscribes.
 type kubeconfigService interface {
 	Get() (*api.Config, bool)
 	RESTConfig(contextName string) (*rest.Config, string, error)

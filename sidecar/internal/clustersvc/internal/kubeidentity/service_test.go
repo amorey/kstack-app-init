@@ -52,7 +52,7 @@ func TestGetAnswersBeforeStart(t *testing.T) {
 	assert.NoError(t, s.Close())
 }
 
-// The notifier subscribes at startup and parks on this, so it has to hand back a usable
+// The trigger subscribes at startup and parks on this, so it has to hand back a usable
 // receiver long before anything sends.
 func TestSubscribeIsUsableBeforeAnythingSends(t *testing.T) {
 	sub := New().Subscribe()

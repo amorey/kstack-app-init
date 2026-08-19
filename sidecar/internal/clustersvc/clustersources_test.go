@@ -341,7 +341,7 @@ func TestSourceReconcileSkipsADeletingAnchor(t *testing.T) {
 }
 
 // fakeKubeconfigService hands the pass a snapshot without a file behind it. Subscribe
-// is unused here — the notifier is what subscribes.
+// is unused here — the trigger is what subscribes.
 type fakeKubeconfigService struct {
 	cfg    *api.Config
 	loaded bool
@@ -365,7 +365,7 @@ func (f fakeKubeconfigService) RESTConfig(contextName string) (*rest.Config, str
 
 // --- the wake, over a real beehive ---
 
-// The one test here that runs the whole chain: a file on disk, the notifier, the
+// The one test here that runs the whole chain: a file on disk, the trigger, the
 // anchor's pass, beehive's dependency waker, and the per-record observation. Every
 // other test in this package stubs the ControllerClient, so AddDependency is recorded
 // rather than exercised — point it at the wrong object and they all still pass while
