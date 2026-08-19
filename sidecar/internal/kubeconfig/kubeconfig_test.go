@@ -259,8 +259,14 @@ func TestSymlinkTargetEditWakesThePoll(t *testing.T) {
 // directory that was not watched when the service started. The resolution is
 // recomputed per reload rather than captured once, so the new target's directory is
 // picked up — otherwise edits to it would be invisible until the backstop.
+//
+// The poll drives this one, not the notifier: replacing a symlink is invisible to
+// kqueue. It registers a directory's entries with O_EVTONLY, which follows the link, so
+// unlinking it leaves that descriptor's inode alive and fires no delete — and the
+// directory diff behind the watch synthesizes Create alone. This is the case pull-first
+// exists for, and the only mechanism that covers it on every platform.
 func TestRepointedSymlinkFollowsToTheNewTarget(t *testing.T) {
-	w, link, target := newSymlinkedService(t, time.Hour)
+	w, link, target := newSymlinkedService(t, testInterval)
 	start(t, w)
 
 	sub := w.Subscribe()
@@ -273,12 +279,12 @@ func TestRepointedSymlinkFollowsToTheNewTarget(t *testing.T) {
 	moved := filepath.Join(elsewhere, "config")
 	writeKubeconfig(t, moved, "work")
 
-	// Re-point: the replacement is an event on the link itself, which is watched.
 	require.NoError(t, os.Remove(link))
 	require.NoError(t, os.Symlink(moved, link))
 	require.Contains(t, testutil.Recv(t, sub.Chan(), "the config after re-pointing").Contexts, "work")
 
-	// The claim: the NEW target's directory is now watched too.
+	// The claim: the new target is followed from here on, not just at the moment of the
+	// switch. Which directories that left watched is TestRepointedSymlinkDropsTheOldDirectory's.
 	writeKubeconfig(t, moved, "work", "staging")
 
 	assert.Contains(t, testutil.Recv(t, sub.Chan(), "the config after editing the new target").Contexts, "staging")

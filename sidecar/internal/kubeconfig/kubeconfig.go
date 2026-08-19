@@ -279,14 +279,18 @@ func (s *Service) resolvePaths() watchedPaths {
 	return paths
 }
 
-// linkTarget resolves pathname's symlink, falling back to the raw link contents when
-// the target does not exist. The fallback is what covers a dangling link — a
-// half-finished dotfiles checkout, a profile not yet materialized — where the
-// target APPEARING is the event worth seeing and EvalSymlinks cannot name it.
+// linkTarget names the file pathname points at, from the link's own contents. Reports
+// false when pathname is not a symlink. A dangling link still resolves — a half-finished
+// dotfiles checkout, a profile not yet materialized — because the target APPEARING is
+// the event worth seeing.
+//
+// The link's contents rather than filepath.EvalSymlinks, which resolves every component:
+// on macOS a temp path under /var comes back rooted at /private/var, putting the target
+// in a different namespace from the precedence path beside it. Everything here is
+// compared by string — syncDirs against the watch list, the loop against an event's name
+// — so one path answering to two spellings goes quietly unmatched. The cost is that only
+// the first hop of a link chain is followed.
 func linkTarget(pathname string) (string, bool) {
-	if target, err := filepath.EvalSymlinks(pathname); err == nil {
-		return target, true
-	}
 	target, err := os.Readlink(pathname)
 	if err != nil {
 		return "", false

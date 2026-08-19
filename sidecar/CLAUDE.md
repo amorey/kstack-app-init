@@ -290,7 +290,11 @@ returned early there would skip the retry.
 The service watches **directories, and follows symlinks**: a save replaces the inode (so a
 file-level watch goes deaf), and a dotfiles-managed kubeconfig is a link whose target lives in a
 directory nobody would otherwise watch. The resolved set is recomputed per reload, so a re-pointed
-link follows to its new directory. Reach for `resolvePaths` before adding anything here.
+link follows to its new directory. Reach for `resolvePaths` before adding anything here, and keep
+every path it yields in **one namespace** — the watch list and each event's name are matched against
+that set by string, so resolving a path further than the link itself (`filepath.EvalSymlinks` rewrites
+every component, and macOS answers `/var` with `/private/var`) leaves a path that quietly matches
+nothing.
 
 `clustersvc.New(dataDir, kubeconfigSvc, kubeconnSvc, pokeSvc)`, `Start`, and `Close` are what the
 composition root calls. `New` grows a parameter only for a new process-wide service; filling in a
