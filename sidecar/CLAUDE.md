@@ -89,10 +89,10 @@ land there rather than on `service`, or the composition root accumulates every k
 `registerControllers` builds and registers all five, returning them in registration order. All register with
 `startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
 reads as settled, since the generation was observed by a process that is gone. **`ClusterSource`
-alone also registers `sourceSweep`** (`WithFullPassInterval(clusterSourceResyncInterval)`), the poll
-its correctness rests on. No other kind takes one: a sweep enqueues the whole kind at once on a
-fixed tick, and the rest are woken by a spec write or a dependency edge, with the out-of-band buses
-covering what neither reaches.
+alone also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResyncInterval)`),
+the poll its correctness rests on: it reads a file the store cannot see, so a lost notifier poke is
+a change nothing else would report. The other kinds are woken by a spec write or a dependency edge,
+with the out-of-band buses covering what neither reaches.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
 
 **A pass returns a verdict, never an error**: `beehive.Settled()` (the pass observed the object's

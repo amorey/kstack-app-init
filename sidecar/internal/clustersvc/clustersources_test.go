@@ -213,7 +213,7 @@ func TestSourceReconcileImportsAndPublishes(t *testing.T) {
 	assert.Len(t, liveClusters(t, d.clusterClient), 2)
 	require.NotNil(t, client.updated)
 	assert.Equal(t, fingerprintOf(t, cfgWith("prod", "staging")), client.updated.Fingerprint)
-	assert.Equal(t, beehive.Settled(), res, "the sweep paces the next pass, not the result")
+	assert.Equal(t, beehive.Settled(), res, "the registered resync paces the next pass, not the result")
 }
 
 // The status write is what wakes every Cluster, so an unchanged snapshot must not
