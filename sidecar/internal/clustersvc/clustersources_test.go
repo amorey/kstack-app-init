@@ -415,7 +415,7 @@ func startService(t *testing.T, path string) Service {
 		assert.NoError(t, cfgSvc.Close())
 	})
 
-	svc, err := New(filepath.Join(t.TempDir(), "data"), cfgSvc, nil, nil)
+	svc, err := New(filepath.Join(t.TempDir(), "data"), cfgSvc, nil)
 	require.NoError(t, err)
 
 	stop, err := svc.Start(context.Background())

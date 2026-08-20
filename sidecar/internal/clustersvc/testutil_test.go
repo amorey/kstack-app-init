@@ -63,7 +63,7 @@ func newTestDeps(t *testing.T) deps {
 func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), nil, nil, nil)
+	d := newDeps(bh, newTestKubeconfig(t), nil, nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -82,7 +82,7 @@ func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	return newDeps(bh, newTestKubeconfig(t), nil, nil, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(bh, newTestKubeconfig(t), nil, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -119,7 +119,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil, nil, nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil, nil)
 }
 
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the

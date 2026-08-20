@@ -28,13 +28,11 @@ import (
 	"time"
 
 	"github.com/amorey/beehive"
-	"github.com/amorey/gobus/conflate"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconn"
 )
 
 // ErrNotFound is the boundary's sentinel for an id that names no tracked record,
@@ -65,37 +63,13 @@ type kubeconfigService interface {
 	Subscribe() kubeconfig.Subscription
 }
 
-// kubeidentityService answers which server a kube-context reaches, from a cache its own
-// workers keep fresh. Non-blocking by contract: a pass reports a cluster's identity, and
-// says when to stop probing one, without the dial entering the pass.
+// kubeidentityService answers which server a kube-context reaches. Non-blocking by
+// contract: a pass reports a cluster's identity without the dial entering the pass.
 type kubeidentityService interface {
-	// Get is what the last probe learned, and whether anything is known at all. Asking
-	// is also what starts the probe — see the package.
+	// Get is what the last probe learned, and whether anything is known at all.
 	Get(contextName string) (kubeidentity.State, bool)
-	// Forget says this context will not be asked about again, ending the work asking
-	// started. Idempotent.
-	Forget(contextName string)
 	// Subscribe reports the contexts whose answer moved.
 	Subscribe() kubeidentity.Subscription
-}
-
-// kubeconnService is the connection pool: a claim on one set of credentials, an
-// out-of-band probe, and the news either produces.
-//
-// Everything about pacing — the cadence a held claim re-probes on, the backoff a
-// failing one follows, how many probe at once — belongs to that package. What this one
-// decides is which clusters are worth connecting, which is the whole of its half.
-type kubeconnService interface {
-	// Acquire claims the connection for these credentials and arms their cadence.
-	Acquire(cfg *rest.Config, key string) (kubeconn.Lease, error)
-	// ProbeNow asks for one probe and does not wait for the outcome.
-	ProbeNow(cfg *rest.Config, key string) error
-	// State is what the pool knows about these credentials: the last outcome, and
-	// whether a probe is asked for and unanswered.
-	State(key string) kubeconn.State
-	// Subscribe reports that these credentials moved, so State is worth re-reading.
-	// Close the receiver when done.
-	Subscribe(key string) *conflate.Receiver[string, struct{}]
 }
 
 // --- Identity ---

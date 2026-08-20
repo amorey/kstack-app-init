@@ -42,9 +42,9 @@ internal/clustersvc/
   shared.go           vocabulary every family reuses, the app's services as this
                       package sees them, and the two GraphQL scalars
   stream.go           Stream[T]
-  internal/kubeidentity/ the probe itself — dial, read the server's identity. This
-                      package's own leaf, under internal/ so the compiler keeps it
-                      that way
+  internal/kubeidentity/ which credentials each kube-context resolves to, and what a
+                      probe of them found. This package's own leaf, under internal/
+                      so the compiler keeps it that way
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -115,8 +115,8 @@ path can forget it. **A no-op pass still settles**: unsettled, every object of t
 on the owed pass's cadence, forever.
 
 **Shared dependencies travel in `deps`** — one beehive client per kind, the process-wide services
-(`kubeconfig`, `kubeconn`, `poke`), built once by
-`newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)` and **embedded** by `service` and by each
+(`kubeconfig`, `kubeidentity`, `poke`), built once by
+`newDeps(bh, kubeconfigSvc, kubeidentitySvc, pokeSvc)` and **embedded** by `service` and by each
 controller, so a family reads `a.s.cacheClient` and a controller reads `c.cacheClient`. The `Client`
 suffix is load-bearing: the fields are promoted into both, and `a.s.cacheClient` must not read like
 the `Caches` family it is reached through. **A new kind or a new
@@ -161,19 +161,19 @@ saves below roughly four converged writes per changed one. What the pass must st
 spec that marshals identically when nothing moved, since beehive's no-op suppression is what keeps a
 converged relay from waking every dependent.
 
-**The probe is a kind, so a pass may dial.** `ClusterIdentity` (`clusteridentities.go`) holds one
-record per set of credentials a cluster connects with — today one per kube-context — and its
-controller is the prober. It exists as a kind rather than as fields on `Cluster` because a pass that
-dials blocks a worker of its kind for as long as the network takes: here that worker belongs to the
-kind whose whole job is dialing, and its `WithConcurrency` is the fleet's dial budget. The probe
-carries a deadline of its own, or one hung dial holds a worker past it.
+**The probe is a kind of its own.** `ClusterIdentity` (`clusteridentities.go`) holds one record per
+kube-context, and its controller is what reports the probe. A kind rather than fields on `Cluster`
+because it carries the probe's own conditions and its own cadence (`identityResync`), which beehive
+paces per kind. **No pass dials**: `kubeidentity` answers from memory, and whatever comes to
+dial must stay off every reconcile goroutine.
 
-Its pass resolves the context to credentials and reports `Connected` — `Inactive` when the cluster is
-switched off **or its context left the kubeconfig** (both are states the user chose, with nothing to
-connect to until they undo it), `ResolveFailed` when the context is there and its entries will not
-resolve (a broken file, reported on the record rather than failing the pass, since beehive's backoff
-cannot fix a file), `Connecting` while credentials resolve and nothing has dialed. **The dial is not written yet**; what lands there writes the status a
-cluster projects, plus `Connected` true or `ProbeFailed`.
+Its pass reads `kubeidentity` and reports `Connected` — `Inactive` when the cluster is switched off
+**or its context left the kubeconfig** (both are states the user chose, with nothing to connect to
+until they undo it), `ResolveFailed` when the context is there and its entries will not resolve (a
+broken file, reported on the record rather than failing the pass, since beehive's backoff cannot fix
+a file), and `Connecting` while nothing has dialed — which is every context that resolves, until the
+probe lands. `ReasonProbeFailed` has no writer until then, and neither does the status a cluster
+projects.
 
 `clusterController.Reconcile` creates the record (`ensureClusterIdentity`), relays `Enabled` and a
 per-context `credentialsDigest` into its spec, declares `AddDependency` onto it, and **projects** its
@@ -197,31 +197,28 @@ pass writes unconditionally — would wake the fleet on every probe, which is th
 
 ### The probe cache (`internal/clustersvc/internal/kubeidentity`)
 
-**`Get` is the whole trigger.** The first one registers the context and starts a loop that probes it
-on `Budget.Interval` (plus jitter, so a fleet registered by one startup pass does not dial in
-lockstep from then on); every later `Get` is a pure read. That is what leaves the policy — which
-clusters are worth connecting — with the caller and off a declaration API here.
-**An entry and its loop are the same fact**, so nothing tracks whether one is running. The first
-probe fires immediately rather than after an interval, since registering is a `Get` that got nothing
-back.
+**The split `kubeconfig.Service` keeps**: `Get` reads memory, the network happens elsewhere.
 
-**`Get` registers and `Forget` unregisters — nothing else does either.** A registered context is
-probed until it is forgotten or the service stops. `Forget` is explicit rather than a TTL because
-the caller is what *knows* the work is over, where a TTL only guesses from how long ago someone
-last asked. `clusterIdentityController.Reconcile` calls it on the two paths where nothing will ask again:
-the record is deletion-pending, or its cluster is switched off. Not asking is not enough on the
-second — a cluster disabled after it was on has a loop the passes that *did* ask left running.
+**It holds nothing.** Every `Get` resolves the context afresh, so a context re-pointed at
+another server is described correctly by the next ask — no cached credential to invalidate, and
+no window in which one is stale. It is also why **nothing here subscribes to the kubeconfig**: a
+notification would have nothing to update, and promptness already arrives from above, since the
+pass that asks is itself woken when the file moves (trigger → anchor → cluster →
+`credentialsDigest` relay → identity). → the relays, above. If the resolve cost ever shows, the
+memo goes here keyed on **snapshot pointer identity** (`Get()` returns a `*api.Config` replaced
+wholesale on reload), never on a new notification.
 
-**A probe publishes only when the answer moved.** A signal wakes the identity pass, which wakes
-every cluster depending on it, so an unchanged answer would cost the fleet a round of work per
-context per interval — the same silence `ClusterIdentityStatus` above is written for. `State.Err`
-makes `State` uncomparable, so `sameAs` compares it by text: connection-refused becoming a 401 is a
-different answer.
+**The probe is not written**, and nothing stands in for it: no registry, no cadence, no cache.
+`Get` reports whether a context resolves and nothing beyond that, so one that does reads as
+"nothing known" and `Subscribe` never fires — the state callers already render.
 
-**The dial is not written** — a loop runs the cadence and probes nothing, so `Get` answers "nothing
-known" for every context and `Subscribe` never fires. Callers see a fleet awaiting its first probe,
-which is the state they already render. Resolving credentials and dialing them is what lands next;
-**it must stay off the caller's goroutine**, which is the split the package exists for.
+What lands next is the probe. Two things it owes, both of them reasons this package exists:
+**it must stay off the caller's goroutine**, which is the split; and it must publish **only when
+the answer moved**, since a signal wakes the identity pass, which wakes every cluster depending
+on it — an unchanged answer would cost the fleet a round of work per context per interval, the
+same silence `ClusterIdentityStatus` above is written for. Probing belongs keyed by
+**credentials**, not by context: the key `RESTConfig` hands back excludes the context name, so
+two contexts aimed at one server as one user are one probe's worth of work.
 
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache
@@ -324,7 +321,7 @@ that set by string, so resolving a path further than the link itself (`filepath.
 every component, and macOS answers `/var` with `/private/var`) leaves a path that quietly matches
 nothing.
 
-`clustersvc.New(dataDir, kubeconfigSvc, kubeconnSvc, pokeSvc)`, `Start`, and `Close` are what the
+`clustersvc.New(dataDir, kubeconfigSvc, pokeSvc)`, `Start`, and `Close` are what the
 composition root calls. `New` grows a parameter only for a new process-wide service; filling in a
 family or a controller never touches it.
 
@@ -333,9 +330,9 @@ never the records above; the controllers translate. A leaf reaching for one of t
 gets an import cycle, which is what enforces the direction. Put a mechanism in a leaf, never in a
 controller: **if `go test ./internal/clustersvc` stops being fast, one has leaked back in.**
 
-**A process-wide service is the app's, and this package only reads it.** `kubeconfig.Service` and
-`kubeconn.Service` arrive through `deps` behind the narrow `kubeconfigService`/`kubeconnService`
-(both in `shared.go`), so nothing in this package starts or closes them — the kubeconfig's
+**A process-wide service is the app's, and this package only reads it.** `kubeconfig.Service`
+arrives through `deps` behind the narrow `kubeconfigService` (`shared.go`), so nothing in this
+package starts or closes it — the kubeconfig's
 `Close` ends every subscription in the process, including other packages'. The trigger subscribes
 to it and releases only its own subscription.
 
@@ -475,9 +472,9 @@ Add a per-context memo invalidated on publish when a caller's cadence makes it s
 
 ## Kube connections (`internal/kubeconn`)
 
-**Nothing takes a connection from it yet.** The composition root builds it and `clustersvc`
-holds it as `deps.kubeconnSvc`, behind the narrow `kubeconnService` in `shared.go`, but no
-code path acquires a lease — the prober that maps clusters onto credentials is not written.
+**Nothing takes a connection from it yet.** The composition root builds it and drives its
+lifecycle, but no code path acquires a lease, and `clustersvc` does not hold it — what will
+dial a cluster's credentials is still to come.
 
 **Credentials are the unit, not clusters.** One entry per credential *key* holds the connection
 and the probe that keeps it validated, so two kube-contexts aimed at one server as one user are

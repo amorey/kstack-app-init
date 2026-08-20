@@ -32,7 +32,7 @@ import (
 // newTestService builds a service over a temp dir, closed on cleanup.
 func newTestService(t *testing.T) Service {
 	t.Helper()
-	svc, err := New(filepath.Join(t.TempDir(), "data"), newTestKubeconfig(t), nil, nil)
+	svc, err := New(filepath.Join(t.TempDir(), "data"), newTestKubeconfig(t), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, svc.Close()) })
 	return svc
@@ -42,7 +42,7 @@ func newTestService(t *testing.T) Service {
 // dataDir yet — it has to create it rather than assume it.
 func TestNewCreatesDataDir(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "nested", "data")
-	svc, err := New(dataDir, newTestKubeconfig(t), nil, nil)
+	svc, err := New(dataDir, newTestKubeconfig(t), nil)
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, svc.Close()) }()
 
@@ -56,7 +56,7 @@ func TestNewRejectsAnUnusableDataDir(t *testing.T) {
 	blocked := filepath.Join(t.TempDir(), "file")
 	require.NoError(t, os.WriteFile(blocked, nil, 0o600))
 
-	_, err := New(filepath.Join(blocked, "data"), newTestKubeconfig(t), nil, nil)
+	_, err := New(filepath.Join(blocked, "data"), newTestKubeconfig(t), nil)
 	assert.Error(t, err)
 }
 
@@ -75,7 +75,7 @@ func TestFamilyAccessors(t *testing.T) {
 // The full lifecycle the composition root drives: Start, the stop func it returns,
 // then Close. Anything left running here would outlive the process's drain.
 func TestStartStopClose(t *testing.T) {
-	svc, err := New(filepath.Join(t.TempDir(), "data"), newTestKubeconfig(t), nil, nil)
+	svc, err := New(filepath.Join(t.TempDir(), "data"), newTestKubeconfig(t), nil)
 	require.NoError(t, err)
 
 	stop, err := svc.Start(context.Background())
@@ -93,7 +93,7 @@ func TestNewRejectsAnUnopenableStore(t *testing.T) {
 	// A directory where the database file goes: sqlite cannot open it.
 	require.NoError(t, os.MkdirAll(filepath.Join(dataDir, "beehive.db"), 0o700))
 
-	_, err := New(dataDir, newTestKubeconfig(t), nil, nil)
+	_, err := New(dataDir, newTestKubeconfig(t), nil)
 	assert.ErrorContains(t, err, "open beehive store")
 }
 

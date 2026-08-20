@@ -89,7 +89,7 @@ func New(cfg Config) (*App, error) {
 	// one server as one user are one socket.
 	kubeconnSvc := kubeconn.New(kubeconn.DefaultBudget)
 
-	clusterSvc, err := clustersvc.New(cfg.DataDir, kubeconfigSvc, kubeconnSvc, pokeSvc)
+	clusterSvc, err := clustersvc.New(cfg.DataDir, kubeconfigSvc, pokeSvc)
 	if err != nil {
 		return nil, err
 	}

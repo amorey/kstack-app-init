@@ -325,12 +325,11 @@ type deps struct {
 	identityClient beehive.Client[ClusterIdentitySpec, ClusterIdentityStatus]
 
 	kubeconfigSvc   kubeconfigService
-	kubeconnSvc     kubeconnService
 	kubeidentitySvc kubeidentityService
 	pokeSvc         *poke.Service
 }
 
-func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, kubeidentitySvc kubeidentityService, pokeSvc *poke.Service) deps {
+func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeidentitySvc kubeidentityService, pokeSvc *poke.Service) deps {
 	return deps{
 		clusterClient:   beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
 		cacheClient:     beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
@@ -339,7 +338,6 @@ func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc k
 		sourceClient:    beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
 		identityClient:  beehive.NewClient[ClusterIdentitySpec, ClusterIdentityStatus](bh, ClusterIdentityGroupKind),
 		kubeconfigSvc:   kubeconfigSvc,
-		kubeconnSvc:     kubeconnSvc,
 		kubeidentitySvc: kubeidentitySvc,
 		pokeSvc:         pokeSvc,
 	}
@@ -382,7 +380,7 @@ const maxEventRuns = 20
 
 // New builds the cluster boundary rooted at dataDir (beehive.db, clusters/): it opens
 // the store, registers the controllers, and leaves everything stopped until Start.
-func New(dataDir string, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, pokeSvc *poke.Service) (Service, error) {
+func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service) (Service, error) {
 	// Self-sufficient rather than order-dependent: this is the first thing the
 	// composition root builds, so nothing else has made dataDir yet.
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -400,8 +398,10 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnSe
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	kubeidentitySvc := kubeidentity.New(kubeidentity.DefaultBudget)
-	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, kubeidentitySvc, pokeSvc)
+	// The one thing here that names credentials: everything above it asks about a
+	// kube-context, and this is what turns one into the credentials a probe runs against.
+	kubeidentitySvc := kubeidentity.New(kubeconfigSvc)
+	d := newDeps(bh, kubeconfigSvc, kubeidentitySvc, pokeSvc)
 
 	controllers, err := registerControllers(bh, d)
 	if err != nil {

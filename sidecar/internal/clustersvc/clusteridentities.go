@@ -26,6 +26,7 @@ import (
 	"github.com/amorey/beehive"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -35,7 +36,7 @@ import (
 //
 // A kind of its own rather than fields on Cluster: it carries the probe's own status,
 // conditions and cadence, and the edge that wakes every cluster reading it. The dial is
-// not here — kubeidentity's workers own that, so no pass blocks on a network.
+// not here — kubeconn's loops own that, so no pass blocks on a network.
 var ClusterIdentityGroupKind = beehive.GroupKind{Kind: "ClusterIdentity"}
 
 // namePrefixIdentityKubeconfig namespaces the kubeconfig-sourced identities inside this
@@ -138,7 +139,7 @@ func ensureClusterIdentity(
 }
 
 // clusterIdentityController reports what the probe of one context's credentials found.
-// The dial itself is kubeidentity's, off this pass's goroutine.
+// The dial itself happens on kubeconn's loops, off this pass's goroutine.
 type clusterIdentityController struct {
 	lifecycle.None
 	deps
@@ -153,36 +154,34 @@ func (c *clusterIdentityController) Reconcile(
 	// collects it with no finalizer to clear. Reporting on it would only write a
 	// condition the GC is coming for.
 	if obj.DeletionRequestedAt != nil {
-		// Nothing will ask about this context again, and asking is the only thing that
-		// started the probe — so ending it is this pass's to say. The record is going;
-		// the work behind it would not.
-		c.kubeidentitySvc.Forget(obj.Spec.Context)
 		return beehive.Settled()
 	}
 
-	// A disabled cluster is not probed at all. The toggle is relayed into this spec, so
-	// the pass answers without reading its owner. Forgetting is what makes that true of a
-	// cluster switched off after it was on: the pass stops asking either way, but the
-	// loop an earlier one started keeps dialing until it is told.
+	// A disabled cluster is not probed at all. The toggle is relayed into this spec, so the
+	// pass answers without reading its owner.
 	if !obj.Spec.Enabled {
-		c.kubeidentitySvc.Forget(obj.Spec.Context)
 		return c.report(ctx, client, ConditionFalse, ReasonInactive, "cluster is disabled")
 	}
 
 	state, known := c.kubeidentitySvc.Get(obj.Spec.Context)
 	if !known {
-		// Asked for, not answered. The read above queued the probe, and the signal it
-		// publishes is what brings this record back — the resync behind it covers a
-		// signal that went missing.
+		// Asked and not answered. The signal a probe publishes is what will bring this record
+		// back, with the resync behind it covering a signal that went missing.
 		return c.report(ctx, client, ConditionUnknown, ReasonConnecting, "probe pending")
 	}
 
+	if errors.Is(state.Err, kubeconfig.ErrContextNotFound) {
+		// The context left the file. Told apart from a probe that failed because they are
+		// different news: this one the user did on purpose, and there is nothing to
+		// connect to until they undo it.
+		return c.report(ctx, client, ConditionFalse, ReasonInactive,
+			"kube-context is no longer in the kubeconfig")
+	}
 	if state.Err != nil {
-		// A cluster that is down is not this pass's failure. Reporting it settles the
-		// generation and leaves the retry to this kind's cadence, rather than to
-		// beehive's backoff, which would climb for a cluster that is simply switched off
-		// at the other end.
-		return c.report(ctx, client, ConditionFalse, ReasonProbeFailed, state.Err.Error())
+		// The context is there and its entries do not resolve — a file the user has to fix,
+		// which beehive's backoff cannot. Reported on the record rather than failing the
+		// pass, and left to this kind's cadence to retry.
+		return c.report(ctx, client, ConditionFalse, ReasonResolveFailed, state.Err.Error())
 	}
 
 	if err := client.Within(ctx, func(ctx context.Context) error {

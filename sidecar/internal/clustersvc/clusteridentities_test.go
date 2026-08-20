@@ -23,6 +23,7 @@ import (
 
 	"github.com/amorey/beehive"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -62,12 +63,10 @@ func identityObj(contextName string, enabled bool) *beehive.Object[ClusterIdenti
 	}
 }
 
-// fakeKubeidentity answers per context from a map, and records who was asked for and
-// who was forgotten.
+// fakeKubeidentity answers per context from a map, and records who was asked for.
 type fakeKubeidentity struct {
-	states    map[string]answer
-	asked     []string
-	forgotten []string
+	states map[string]answer
+	asked  []string
 }
 
 // answer pairs what the service knows with whether it knows anything, so a test can
@@ -81,10 +80,6 @@ func (f *fakeKubeidentity) Get(contextName string) (kubeidentity.State, bool) {
 	f.asked = append(f.asked, contextName)
 	s := f.states[contextName]
 	return s.state, s.known
-}
-
-func (f *fakeKubeidentity) Forget(contextName string) {
-	f.forgotten = append(f.forgotten, contextName)
 }
 
 func (f *fakeKubeidentity) Subscribe() kubeidentity.Subscription {
@@ -166,20 +161,19 @@ func TestIdentityReconcileWritesNoFieldTheProbeMissed(t *testing.T) {
 	assert.Equal(t, ConditionTrue, reportedCondition(t, client).Status)
 }
 
-// A cluster that is down is not this pass's failure. Settling leaves the retry to the
-// cadence this kind is registered with, rather than to a backoff ladder climbing for a
-// server that is simply switched off.
-func TestIdentityReconcileReportsAFailedProbe(t *testing.T) {
+// The context is there and its entries do not resolve — a file the user has to fix. The
+// record reports it rather than failing the pass, and carries what went wrong.
+func TestIdentityReconcileReportsAFailedResolve(t *testing.T) {
 	c := identityControllerOver(t, answering(kubeidentity.Identity{},
-		fmt.Errorf("%w: connection refused", kubeidentity.ErrProbe)))
+		errors.New("no such certificate authority file")))
 	client := &stubIdentityClient{}
 
 	res := c.Reconcile(context.Background(), client, identityObj("prod", true))
 
 	cond := reportedCondition(t, client)
 	assert.Equal(t, ConditionFalse, cond.Status)
-	assert.Equal(t, ReasonProbeFailed, cond.Reason)
-	assert.Contains(t, cond.Message, "connection refused")
+	assert.Equal(t, ReasonResolveFailed, cond.Reason)
+	assert.Contains(t, cond.Message, "certificate authority")
 	assert.Nil(t, client.updated, "a failed probe improves on nothing")
 	assert.Equal(t, beehive.Settled(), res)
 }
@@ -204,10 +198,22 @@ func TestIdentityReconcileReportsInactiveWhenDisabled(t *testing.T) {
 
 	res := c.Reconcile(context.Background(), client, identityObj("prod", false))
 
-	assert.Empty(t, svc.asked, "asking is what starts a probe, so a disabled one is not asked for")
-	// Not asking is not enough: a cluster switched off after it was on has a loop running
-	// from the passes that did ask, and only this ends it.
-	assert.Equal(t, []string{"prod"}, svc.forgotten)
+	assert.Empty(t, svc.asked, "a disabled cluster is not asked about at all")
+
+	cond := reportedCondition(t, client)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonInactive, cond.Reason)
+	assert.Equal(t, beehive.Settled(), res)
+}
+
+// A context the user removed is not a broken one: there is nothing to connect to until
+// they put it back, which reads differently from a cluster that would not answer.
+func TestIdentityReconcileReportsInactiveForADepartedContext(t *testing.T) {
+	c := identityControllerOver(t, answering(kubeidentity.Identity{},
+		fmt.Errorf("%w: %q", kubeconfig.ErrContextNotFound, "prod")))
+	client := &stubIdentityClient{}
+
+	res := c.Reconcile(context.Background(), client, identityObj("prod", true))
 
 	cond := reportedCondition(t, client)
 	assert.Equal(t, ConditionFalse, cond.Status)
@@ -245,9 +251,7 @@ func TestIdentityReconcileReportsNothingForADyingRecord(t *testing.T) {
 	res := c.Reconcile(context.Background(), client, obj)
 
 	assert.Empty(t, client.conditions)
-	// The record is going and the probe behind it would not: the GC collects rows, not
-	// the work a pass asked for.
-	assert.Equal(t, []string{"prod"}, svc.forgotten)
+	assert.Empty(t, svc.asked, "a record the GC is coming for is not asked about")
 	assert.Equal(t, beehive.Settled(), res)
 }
 
