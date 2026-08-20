@@ -66,12 +66,15 @@ type kubeconfigService interface {
 }
 
 // kubeidentityService answers which server a kube-context reaches, from a cache its own
-// workers keep fresh. Read-only and non-blocking by contract: a pass reports a cluster's
-// identity without the dial entering the pass.
+// workers keep fresh. Non-blocking by contract: a pass reports a cluster's identity, and
+// says when to stop probing one, without the dial entering the pass.
 type kubeidentityService interface {
 	// Get is what the last probe learned, and whether anything is known at all. Asking
-	// is also what keeps the context probed — see the package.
+	// is also what starts the probe — see the package.
 	Get(contextName string) (kubeidentity.State, bool)
+	// Forget says this context will not be asked about again, ending the work asking
+	// started. Idempotent.
+	Forget(contextName string)
 	// Subscribe reports the contexts whose answer moved.
 	Subscribe() kubeidentity.Subscription
 }

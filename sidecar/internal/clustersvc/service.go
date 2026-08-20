@@ -400,7 +400,7 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnSe
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	kubeidentitySvc := kubeidentity.New()
+	kubeidentitySvc := kubeidentity.New(kubeidentity.DefaultBudget)
 	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, kubeidentitySvc, pokeSvc)
 
 	controllers, err := registerControllers(bh, d)

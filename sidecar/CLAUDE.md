@@ -195,6 +195,34 @@ status bytes, unchanged conditions) do the rest. A timestamp in that status — 
 pass writes unconditionally — would wake the fleet on every probe, which is the same trap
 `ClusterSourceStatus` carries and the reason a sweep-driven wake was replaced by this edge.
 
+### The probe cache (`internal/clustersvc/internal/kubeidentity`)
+
+**`Get` is the whole trigger.** The first one registers the context and starts a loop that probes it
+on `Budget.Interval` (plus jitter, so a fleet registered by one startup pass does not dial in
+lockstep from then on); every later `Get` is a pure read. That is what leaves the policy — which
+clusters are worth connecting — with the caller and off a declaration API here.
+**An entry and its loop are the same fact**, so nothing tracks whether one is running. The first
+probe fires immediately rather than after an interval, since registering is a `Get` that got nothing
+back.
+
+**`Get` registers and `Forget` unregisters — nothing else does either.** A registered context is
+probed until it is forgotten or the service stops. `Forget` is explicit rather than a TTL because
+the caller is what *knows* the work is over, where a TTL only guesses from how long ago someone
+last asked. `clusterIdentityController.Reconcile` calls it on the two paths where nothing will ask again:
+the record is deletion-pending, or its cluster is switched off. Not asking is not enough on the
+second — a cluster disabled after it was on has a loop the passes that *did* ask left running.
+
+**A probe publishes only when the answer moved.** A signal wakes the identity pass, which wakes
+every cluster depending on it, so an unchanged answer would cost the fleet a round of work per
+context per interval — the same silence `ClusterIdentityStatus` above is written for. `State.Err`
+makes `State` uncomparable, so `sameAs` compares it by text: connection-refused becoming a 401 is a
+different answer.
+
+**The dial is not written** — a loop runs the cadence and probes nothing, so `Get` answers "nothing
+known" for every context and `Subscribe` never fires. Callers see a fleet awaiting its first probe,
+which is the state they already render. Resolving credentials and dialing them is what lands next;
+**it must stay off the caller's goroutine**, which is the split the package exists for.
+
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache
 is still the active identity), so a flip on the cluster has to reach the cache — and owning a child

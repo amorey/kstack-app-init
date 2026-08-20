@@ -63,10 +63,12 @@ func identityObj(contextName string, enabled bool) *beehive.Object[ClusterIdenti
 	}
 }
 
-// fakeKubeidentity answers per context from a map, and records who was asked for.
+// fakeKubeidentity answers per context from a map, and records who was asked for and
+// who was forgotten.
 type fakeKubeidentity struct {
-	states map[string]answer
-	asked  []string
+	states    map[string]answer
+	asked     []string
+	forgotten []string
 }
 
 // answer pairs what the service knows with whether it knows anything, so a test can
@@ -80,6 +82,10 @@ func (f *fakeKubeidentity) Get(contextName string) (kubeidentity.State, bool) {
 	f.asked = append(f.asked, contextName)
 	s := f.states[contextName]
 	return s.state, s.known
+}
+
+func (f *fakeKubeidentity) Forget(contextName string) {
+	f.forgotten = append(f.forgotten, contextName)
 }
 
 func (f *fakeKubeidentity) Subscribe() kubeidentity.Subscription {
@@ -147,7 +153,8 @@ func TestIdentityReconcileWritesWhatTheProbeFound(t *testing.T) {
 }
 
 // A fact the probe could not read stays nil rather than empty: nil is what a cluster's
-// projection reads as "no better answer than the one I have".
+// projection reads as "no better answer than the one I have". Connected stays true
+// through it — a user refused kube-system reached a cluster that is up.
 func TestIdentityReconcileWritesNoFieldTheProbeMissed(t *testing.T) {
 	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerVersion: "v1.29.3"}, nil))
 	client := &stubIdentityClient{}
@@ -157,22 +164,7 @@ func TestIdentityReconcileWritesNoFieldTheProbeMissed(t *testing.T) {
 	require.NotNil(t, client.updated)
 	assert.Nil(t, client.updated.ServerUID)
 	assert.Nil(t, client.updated.Username)
-}
-
-// A user refused kube-system is connected to a cluster that is up — Connected stays
-// true, and why the identity is missing rides along as the reason's message.
-func TestIdentityReconcileStaysConnectedWhenTheIdentityReadIsRefused(t *testing.T) {
-	c := identityControllerOver(t, answering(kubeidentity.Identity{
-		ServerVersion: "v1.29.3",
-		UIDErr:        errors.New("namespaces/kube-system: 403 Forbidden"),
-	}, nil))
-	client := &stubIdentityClient{}
-
-	c.Reconcile(context.Background(), client, identityObj("prod", true))
-
-	cond := reportedCondition(t, client)
-	assert.Equal(t, ConditionTrue, cond.Status)
-	assert.Contains(t, cond.Message, "403")
+	assert.Equal(t, ConditionTrue, reportedCondition(t, client).Status)
 }
 
 // A cluster that is down is not this pass's failure. Settling leaves the retry to the
@@ -213,7 +205,10 @@ func TestIdentityReconcileReportsInactiveWhenDisabled(t *testing.T) {
 
 	res := c.Reconcile(context.Background(), client, identityObj("prod", false))
 
-	assert.Empty(t, svc.asked, "asking is what keeps a context probed, so a disabled one is not asked for")
+	assert.Empty(t, svc.asked, "asking is what starts a probe, so a disabled one is not asked for")
+	// Not asking is not enough: a cluster switched off after it was on has a loop running
+	// from the passes that did ask, and only this ends it.
+	assert.Equal(t, []string{"prod"}, svc.forgotten)
 
 	cond := reportedCondition(t, client)
 	assert.Equal(t, ConditionFalse, cond.Status)
@@ -270,7 +265,8 @@ func TestIdentityReconcileReportsConnectingUntilAnswered(t *testing.T) {
 // A record on its way out is collected with its owner, so a condition written here is
 // one the GC is already coming for.
 func TestIdentityReconcileReportsNothingForADyingRecord(t *testing.T) {
-	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil))
+	svc := answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil)
+	c := identityControllerOver(t, svc)
 	obj := identityObj("prod", true)
 	now := time.Now()
 	obj.DeletionRequestedAt = &now
@@ -279,6 +275,9 @@ func TestIdentityReconcileReportsNothingForADyingRecord(t *testing.T) {
 	res := c.Reconcile(context.Background(), client, obj)
 
 	assert.Empty(t, client.conditions)
+	// The record is going and the probe behind it would not: the GC collects rows, not
+	// the work a pass asked for.
+	assert.Equal(t, []string{"prod"}, svc.forgotten)
 	assert.Equal(t, beehive.Settled(), res)
 }
 

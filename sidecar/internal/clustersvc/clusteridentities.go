@@ -154,12 +154,19 @@ func (c *clusterIdentityController) Reconcile(
 	// collects it with no finalizer to clear. Reporting on it would only write a
 	// condition the GC is coming for.
 	if obj.DeletionRequestedAt != nil {
+		// Nothing will ask about this context again, and asking is the only thing that
+		// started the probe — so ending it is this pass's to say. The record is going;
+		// the work behind it would not.
+		c.kubeidentitySvc.Forget(obj.Spec.Context)
 		return beehive.Settled()
 	}
 
 	// A disabled cluster is not probed at all. The toggle is relayed into this spec, so
-	// the pass answers without reading its owner.
+	// the pass answers without reading its owner. Forgetting is what makes that true of a
+	// cluster switched off after it was on: the pass stops asking either way, but the
+	// loop an earlier one started keeps dialing until it is told.
 	if !obj.Spec.Enabled {
+		c.kubeidentitySvc.Forget(obj.Spec.Context)
 		return c.report(ctx, client, ConditionFalse, ReasonInactive, "cluster is disabled")
 	}
 
@@ -194,7 +201,7 @@ func (c *clusterIdentityController) Reconcile(
 		if err := client.UpdateStatus(ctx, identityStatus(state.Identity)); err != nil {
 			return err
 		}
-		return client.SetCondition(ctx, connectedCondition(state.Identity))
+		return client.SetCondition(ctx, connectedCondition())
 	}); err != nil {
 		return beehive.Fail(fmt.Errorf("report cluster identity: %w", err))
 	}
@@ -218,13 +225,8 @@ func identityStatus(id kubeidentity.Identity) ClusterIdentityStatus {
 	return status
 }
 
-// connectedCondition reports a probe that reached the server. Connected is true either
-// way — it answered — and a refused identity read is the reason beside it, since a
-// namespace-scoped user is connected to a cluster whose UID they may not read.
-func connectedCondition(id kubeidentity.Identity) Condition {
-	if id.UIDErr != nil {
-		return LiveCondition(ConditionConnected, ConditionTrue, ReasonConnected, id.UIDErr.Error())
-	}
+// connectedCondition reports a probe that reached the server.
+func connectedCondition() Condition {
 	return LiveCondition(ConditionConnected, ConditionTrue, ReasonConnected, "")
 }
 
