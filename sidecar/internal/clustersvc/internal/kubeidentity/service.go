@@ -52,9 +52,9 @@ var DefaultBudget = Budget{
 	Jitter:   15 * time.Second,
 }
 
-// ErrProbe marks a failure to reach the server, as opposed to one resolving the
-// credentials to reach it with. A caller reports the two differently — one is a cluster
-// that is down, the other a kubeconfig that needs fixing.
+// ErrProbe marks a failure to reach the server. The only class State.Err carries: this
+// package is handed a context to dial and reports what it reached, so a kubeconfig that
+// does not resolve is the caller's to detect before it ever asks.
 var ErrProbe = errors.New("probe failed")
 
 // Identity is what one probe learned: which cluster answered, and as whom.
@@ -72,9 +72,8 @@ type Identity struct {
 // or why there is none.
 type State struct {
 	Identity Identity
-	// Err is why the last attempt produced nothing new — the context would not resolve,
-	// or the server would not answer. Wrapped so a caller can tell those apart with
-	// errors.Is, against kubeconfig's sentinels or ErrProbe.
+	// Err is why the last probe produced nothing new: the server would not answer.
+	// Always wraps ErrProbe.
 	Err error
 }
 
@@ -83,15 +82,9 @@ type State struct {
 //
 // Err compares by its text: connection-refused becoming a 401 is a different answer, and
 // a caller left reporting the old reason indefinitely is the failure that hides. Error
-// identity cannot stand in for it — two separately built wraps of one sentinel are not
-// errors.Is each other, so a cluster that stays down would publish every interval.
-//
-// **Whoever builds these errors owes the text one thing**: a change of class must show in
-// it. A caller tells the classes apart with errors.Is (a context that left the file, a
-// server that would not answer, a file that would not resolve) and acts differently on
-// each, so two classes sharing a message would leave it on the wrong one until its own
-// resync. Naming the sentinels here instead would put that caller's switch in this leaf,
-// where nothing keeps the two in step.
+// identity cannot stand in for it — every Err wraps the one sentinel, and two separately
+// built wraps of it are not errors.Is each other, so a cluster that stays down would
+// publish every interval.
 func (s State) sameAs(other State) bool {
 	return s.Identity == other.Identity && errText(s.Err) == errText(other.Err)
 }

@@ -26,7 +26,6 @@ import (
 	"github.com/amorey/beehive"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -178,23 +177,12 @@ func (c *clusterIdentityController) Reconcile(
 		return c.report(ctx, client, ConditionUnknown, ReasonConnecting, "probe pending")
 	}
 
-	switch {
-	case errors.Is(state.Err, kubeconfig.ErrContextNotFound):
-		// The context left the file. Told apart from the case below because they are
-		// different news: this one the user did on purpose, and there is nothing to
-		// connect to until they undo it.
-		return c.report(ctx, client, ConditionFalse, ReasonInactive,
-			"kube-context is no longer in the kubeconfig")
-	case errors.Is(state.Err, kubeidentity.ErrProbe):
+	if state.Err != nil {
 		// A cluster that is down is not this pass's failure. Reporting it settles the
 		// generation and leaves the retry to this kind's cadence, rather than to
 		// beehive's backoff, which would climb for a cluster that is simply switched off
 		// at the other end.
 		return c.report(ctx, client, ConditionFalse, ReasonProbeFailed, state.Err.Error())
-	case state.Err != nil:
-		// The context is there and its entries do not resolve — a file the user has to
-		// fix, which beehive's backoff cannot.
-		return c.report(ctx, client, ConditionFalse, ReasonResolveFailed, state.Err.Error())
 	}
 
 	if err := client.Within(ctx, func(ctx context.Context) error {
