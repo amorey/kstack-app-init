@@ -117,7 +117,7 @@ type fakeIdentitySource struct {
 
 func newFakeIdentitySource() *fakeIdentitySource {
 	return &fakeIdentitySource{
-		hub: conflate.New[string, struct{}](func(_, next struct{}) (struct{}, bool) { return next, true }),
+		hub: conflate.New[string](func(_, next struct{}) (struct{}, bool) { return next, true }),
 	}
 }
 
