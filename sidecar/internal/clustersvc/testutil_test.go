@@ -28,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
@@ -58,12 +59,44 @@ func newTestDeps(t *testing.T) deps {
 	return d
 }
 
+// fakeKubeidentity answers per context from a map, and records who was asked for. The
+// zero value has nothing to say about anything, which is the state before a probe has
+// answered — what a cluster pass finds unless a test says otherwise.
+type fakeKubeidentity struct {
+	states map[string]identityAnswer
+	asked  []string
+}
+
+// identityAnswer pairs what the service knows with whether it knows anything, so a test
+// can hand back "asked, unanswered" as easily as an answer.
+type identityAnswer struct {
+	state kubeidentity.State
+	known bool
+}
+
+func (f *fakeKubeidentity) Get(contextName string) (kubeidentity.State, bool) {
+	f.asked = append(f.asked, contextName)
+	s := f.states[contextName]
+	return s.state, s.known
+}
+
+func (f *fakeKubeidentity) Subscribe() kubeidentity.Subscription {
+	panic("a cluster pass reads, it does not subscribe")
+}
+
+// answering is a service that answers for "prod" with an identity and an error.
+func answering(id kubeidentity.Identity, err error) *fakeKubeidentity {
+	return &fakeKubeidentity{states: map[string]identityAnswer{
+		"prod": {state: kubeidentity.State{Identity: id, Err: err}, known: true},
+	}}
+}
+
 // newTestDepsAndBeehive is newTestDeps plus the beehive behind it, for a test that has
 // to write what only a pass can — see newClusterStatusDeps.
 func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), nil, nil)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeidentity{}, nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -82,7 +115,7 @@ func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	return newDeps(bh, newTestKubeconfig(t), nil, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(bh, newTestKubeconfig(t), &fakeKubeidentity{}, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -119,7 +152,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), nil, nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeidentity{}, nil)
 }
 
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the

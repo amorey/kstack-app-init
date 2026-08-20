@@ -48,6 +48,16 @@ func TestStreamReportsNoErrorOnACleanEnd(t *testing.T) {
 	assert.NoError(t, s.Err())
 }
 
+// The whole of what sendFrame is for. A bare channel send would park here forever,
+// leaking the pump goroutine and the store watch behind it once per client disconnect —
+// and reporting nothing, since Frames never closes.
+func TestSendFrameGivesUpWhenTheConsumerIsGone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.False(t, sendFrame(ctx, make(chan int), 1), "nothing is draining out")
+}
+
 // The shape every pump owes its consumer: the reader stops draining Frames when ctx
 // ends, so a pump that does not select on it blocks forever on its next send. A
 // cancelled watch is a teardown, not a failure, so Err stays nil.

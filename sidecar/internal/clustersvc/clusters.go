@@ -21,9 +21,6 @@ package clustersvc
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -32,6 +29,8 @@ import (
 	"github.com/amorey/beehive"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -416,10 +415,18 @@ func sourceDeclares(cfgSvc kubeconfigService, obj *beehive.Object[ClusterSpec, C
 // guards below too. Bounded by the app's own startup, never by anything a user does.
 const startupRequeue = time.Second
 
-// clusterController reconciles a tracked cluster: today it observes what the
-// kubeconfig says about the record's context, and creates the ClusterCache for the
-// identity a probe has recorded. Resolving credentials and probing the API server are
-// still to come.
+// clusterProbeInterval paces the re-probe, registered as the kind's individual pass so
+// each record is timed from the end of its own last one and a fleet spreads itself out
+// rather than dialing in one burst.
+const clusterProbeInterval = 5 * time.Minute
+
+// clusterController reconciles a tracked cluster: it observes what the kubeconfig says
+// about the record's context, reports what connecting with that context's credentials
+// revealed, and creates the ClusterCache for the identity it found.
+//
+// The dial is not in the pass. kubeidentity answers from what it already knows, so a
+// record whose probe is still owed reports Connecting and comes back when the probe
+// publishes rather than blocking here.
 //
 // The kubeconfig service it reads to observe a context's presence is the app's,
 // shared with every other reader, so it is a dependency rather than machinery.
@@ -473,26 +480,30 @@ func (c *clusterController) Reconcile(
 		}
 	}
 
-	// The identity record is this cluster's probe: created here because a controller
-	// only reconciles an object that already exists, and depended on because what it
-	// reports comes from a server rather than from this record — so only that edge
-	// turns a probe result into a pass here. Ahead of the read below, which is what the
-	// first pass would otherwise find missing.
-	identity, err := c.observeIdentity(ctx, client, obj, cfg)
-	if err != nil {
-		return beehive.Fail(err)
-	}
-
 	stored := clusterStatus(obj)
 	status := stored
 	status.Source.Kubeconfig = observeKubeconfig(cfg, obj.Spec.Source.Kubeconfig, stored.Source.Kubeconfig)
-	status = projectIdentity(status, identity)
 
-	// Unconditional: beehive compares this against the status the pass was handed and
-	// reaches the store only when it differs, so a pass that observed nothing new costs
-	// a marshal rather than a transaction.
-	if err := client.UpdateStatus(ctx, status); err != nil {
-		return beehive.Fail(fmt.Errorf("update cluster status: %w", err))
+	cond, identity := c.observeIdentity(obj)
+	status = foldIdentity(status, identity)
+
+	// Grouped so a watcher never sees the status without the condition that explains it.
+	// Both writes are unconditional: beehive compares each against what is stored and
+	// reaches it only when it differs, so a pass that observed nothing new costs a
+	// marshal rather than a transaction.
+	if err := client.Within(ctx, func(ctx context.Context) error {
+		if err := client.UpdateStatus(ctx, status); err != nil {
+			return fmt.Errorf("update status: %w", err)
+		}
+		if cond == nil {
+			return nil
+		}
+		if err := client.SetCondition(ctx, *cond); err != nil {
+			return fmt.Errorf("set condition: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return beehive.Fail(fmt.Errorf("report cluster %d: %w", obj.ID, err))
 	}
 
 	// After the write and outside the skip above, both deliberately: this pass may have
@@ -506,73 +517,71 @@ func (c *clusterController) Reconcile(
 	return beehive.Settled()
 }
 
-// observeIdentity keeps this record's identity child in step and hands back what it
-// last learned, nil when there is none to read.
+// observeIdentity reports what is known about the server this record's credentials
+// reach: the Connected condition, and the identity behind it when there is one.
 //
-// Only a kubeconfig-sourced record has credentials to probe; another source's are not
-// this pass's to guess at, so it declares no child and no edge.
+// Only a kubeconfig-sourced record has credentials to resolve. Another source's are not
+// this pass's to guess at, so it reports no condition at all rather than one claiming a
+// verdict nothing produced.
 func (c *clusterController) observeIdentity(
-	ctx context.Context,
-	client beehive.ControllerClient[ClusterStatus],
 	obj *beehive.Object[ClusterSpec, ClusterStatus],
-	cfg *api.Config,
-) (*beehive.Object[ClusterIdentitySpec, ClusterIdentityStatus], error) {
+) (*Condition, *kubeidentity.Identity) {
 	src := obj.Spec.Source.Kubeconfig
 	if src == nil {
 		return nil, nil
 	}
 
-	// Digested here rather than by the probe, which reads the file too late to know it
-	// moved: this pass is the one the anchor wakes when it does.
-	digest, err := credentialsDigest(cfg, src.Context)
-	if err != nil {
-		return nil, err
-	}
-	id, err := ensureClusterIdentity(ctx, c.identityClient, obj, digest)
-	if err != nil {
-		return nil, err
-	}
-	// Refused: the record is draining and its replacement waits for the name. Nothing to
-	// depend on, and the cluster keeps the identity it last projected.
-	if id == 0 {
-		return nil, nil
-	}
-	// Owning the record wakes nothing, so the edge is what carries a probe result back
-	// here. Beehive records nothing when it is already there, so every later pass is
-	// free.
-	if err := client.AddDependency(ctx, id); err != nil {
-		return nil, fmt.Errorf("depend cluster %d on its identity: %w", obj.ID, err)
+	if !obj.Spec.Enabled {
+		return connectedCondition(ConditionFalse, ReasonInactive, "cluster is disabled"), nil
 	}
 
-	obj2, err := c.identityClient.Get(ctx, id)
-	// Collected between the write above and this read: an ordinary race, and a pass
-	// with nothing to project reports what it already had.
-	if errors.Is(err, beehive.ErrNotFound) {
-		return nil, nil
+	state, known := c.kubeidentitySvc.Get(src.Context)
+	if !known {
+		// Asked and not answered. The signal a probe publishes is what brings this record
+		// back, with the kind's cadence behind it covering a signal that went missing.
+		return connectedCondition(ConditionUnknown, ReasonConnecting, "probe pending"), nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf("read cluster identity %d: %w", id, err)
+
+	if errors.Is(state.Err, kubeconfig.ErrContextNotFound) {
+		// The context left the file. Told apart from a probe that failed because they are
+		// different news: this one the user did on purpose, and there is nothing to
+		// connect to until they undo it.
+		return connectedCondition(ConditionFalse, ReasonInactive,
+			"kube-context is no longer in the kubeconfig"), nil
 	}
-	return obj2, nil
+	if state.Err != nil {
+		// The context is there and its entries do not resolve — a file the user has to fix,
+		// which beehive's backoff cannot. Reported on the record rather than failing the
+		// pass, and left to this kind's cadence to retry.
+		return connectedCondition(ConditionFalse, ReasonResolveFailed, state.Err.Error()), nil
+	}
+	return connectedCondition(ConditionTrue, ReasonConnected, ""), &state.Identity
 }
 
-// projectIdentity folds a probed identity into the cluster status that serves it. The
-// cluster's copy is a cached projection, the way its kubeconfig observation is: the
-// record above is the source of truth, and the dependency edge is what refreshes this.
+// connectedCondition is the Connected verdict this pass reports, which is the only
+// condition it writes.
+func connectedCondition(status ConditionStatus, reason, message string) *Condition {
+	cond := LiveCondition(ConditionConnected, status, reason, message)
+	return &cond
+}
+
+// foldIdentity folds what a probe read into the status that serves it.
 //
-// A field the probe never reached leaves the cluster's last-known value alone.
-func projectIdentity(status ClusterStatus, obj *beehive.Object[ClusterIdentitySpec, ClusterIdentityStatus]) ClusterStatus {
-	if obj == nil || obj.Status == nil {
+// A fact the probe could not reach leaves the last-known value alone: that is what keeps
+// a server gone unreachable identifiable, and what stops an unanswered probe from
+// deactivating a live cache by clearing the UID it is named for.
+func foldIdentity(status ClusterStatus, id *kubeidentity.Identity) ClusterStatus {
+	if id == nil {
 		return status
 	}
-	if uid := obj.Status.ServerUID; uid != nil {
-		status.Server.UID = uid
+	if uid := id.ServerUID; uid != "" {
+		status.Server.UID = &uid
 	}
-	if version := obj.Status.ServerVersion; version != nil {
-		status.Server.Version = version
+	if version := id.ServerVersion; version != "" {
+		status.Server.Version = &version
 	}
-	if username := obj.Status.Username; username != nil {
-		status.Principal.Username = username
+	if username := id.Username; username != "" {
+		status.Principal.Username = &username
 	}
 	return status
 }
@@ -669,33 +678,4 @@ func observeKubeconfig(cfg *api.Config, src *ClusterSpecSourceKubeconfig, prev *
 	observed.IsPresent = false
 	observed.IsDefault = false
 	return &observed
-}
-
-// credentialsDigest digests the cluster and user entries a context resolves through,
-// which is what decides whether a probe reaches the same server as whom. Empty for a
-// context cfg does not hold: an orphaned record has nothing to resolve.
-//
-// A digest, never the values: an entry carries bearer tokens and client keys, and this
-// is written into a spec the store persists. It is compared, never read back.
-//
-// Whole entries rather than named fields, for the reason kubeconfigFingerprint gives
-// about the fold it digests: a list of fields silently stops covering the one added
-// next, and nothing would be woken to notice.
-func credentialsDigest(cfg *api.Config, contextName string) (string, error) {
-	kctx := cfg.Contexts[contextName]
-	if kctx == nil {
-		return "", nil
-	}
-	b, err := json.Marshal(struct {
-		Cluster  *api.Cluster  `json:"cluster"`
-		AuthInfo *api.AuthInfo `json:"authInfo"`
-	}{
-		Cluster:  cfg.Clusters[kctx.Cluster],
-		AuthInfo: cfg.AuthInfos[kctx.AuthInfo],
-	})
-	if err != nil {
-		return "", fmt.Errorf("digest credentials for context %q: %w", contextName, err)
-	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:]), nil
 }

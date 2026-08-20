@@ -58,14 +58,14 @@ func TestKubeconfigTriggerWakesTheAnchorForEachSnapshot(t *testing.T) {
 
 // The context that answered is the record that moved, and mapping the two is the one
 // thing beehive cannot do: only this package knows the record's name.
-func TestKubeidentityTriggerWakesTheContextsRecord(t *testing.T) {
+func TestKubeidentityTriggerWakesTheContextsCluster(t *testing.T) {
 	src := newFakeIdentitySource()
 	tr := newKubeidentityTrigger(src)
 	startTrigger(t, tr)
 
 	src.publish("staging")
 
-	assert.Equal(t, ClusterIdentityName("staging"), testutil.Recv(t, tr.Wakes(), "the poke"))
+	assert.Equal(t, KubeconfigName("staging"), testutil.Recv(t, tr.Wakes(), "the poke"))
 }
 
 // The watcher shutting down ends the loop, and closing the channel is what ends

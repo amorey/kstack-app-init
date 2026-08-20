@@ -35,8 +35,6 @@ internal/clustersvc/
   cacheddata.go       ┘ (no controller — the one family that isn't a beehive kind)
   clustersources.go   the ClusterSource kind: one discovery anchor per source variant.
                       A beehive kind with no GraphQL type behind it — internal
-  clusteridentities.go the ClusterIdentity kind: one probe per set of credentials a
-                      cluster connects with. Internal too
   triggers.go         the feed→wake bridge: maps a source's vocabulary onto the beehive
                       names the trigger declared at registration requeues
   shared.go           vocabulary every family reuses, the app's services as this
@@ -89,16 +87,16 @@ consecutive reviews found a different place that had forgotten it.
 goroutine and the beehive watch behind it.
 
 **A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
-lifecycle. No kind has any yet — all six embed `lifecycle.None` — but the leaves a controller grows
+lifecycle. No kind has any yet — all five embed `lifecycle.None` — but the leaves a controller grows
 land there rather than on `service`, or the composition root accumulates every kind's detail.
-`registerControllers` builds and registers all six, returning them in registration order. All register with
+`registerControllers` builds and registers all five, returning them in registration order. All register with
 `startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
 reads as settled, since the generation was observed by a process that is gone. **`ClusterSource`
-alone also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResyncInterval)`),
+also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResyncInterval)`),
 the poll its correctness rests on: it reads a file the store cannot see, so a lost trigger poke is
-a change nothing else would report. **`ClusterIdentity` takes `identityResync`** for the same reason
-— what it reports is a remote server's, so nothing in the store moves when the answer does. The
-other kinds are woken by a spec write or a dependency edge.
+a change nothing else would report. **`Cluster` takes `clusterResync`** for the same reason
+— what its probe reports is a remote server's, so nothing in the store moves when the answer does.
+The other kinds are woken by a spec write or a dependency edge.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
 
 **A status write is unconditional.** Beehive compares what a pass writes against the status it handed
@@ -161,39 +159,31 @@ saves below roughly four converged writes per changed one. What the pass must st
 spec that marshals identically when nothing moved, since beehive's no-op suppression is what keeps a
 converged relay from waking every dependent.
 
-**The probe is a kind of its own.** `ClusterIdentity` (`clusteridentities.go`) holds one record per
-kube-context, and its controller is what reports the probe. A kind rather than fields on `Cluster`
-because it carries the probe's own conditions and its own cadence (`identityResync`), which beehive
-paces per kind. **No pass dials**: `kubeidentity` answers from memory, and whatever comes to
-dial must stay off every reconcile goroutine.
+**The probe rides the `Cluster` pass.** `clusterController.Reconcile` observes the kubeconfig, reads
+`kubeidentity` for what connecting with that context's credentials revealed, and folds both into one
+grouped write (`Within`) so a watcher never sees the status without the condition explaining it.
+**No pass dials**: `kubeidentity` answers from what it already knows, and whatever comes to dial must
+stay off every reconcile goroutine. `clusterResync` re-probes each record on its own timer;
+`kubeidentity`'s signal is what makes an answer prompt, and the resync covers one that went missing.
 
-Its pass reads `kubeidentity` and reports `Connected` — `Inactive` when the cluster is switched off
-**or its context left the kubeconfig** (both are states the user chose, with nothing to connect to
-until they undo it), `ResolveFailed` when the context is there and its entries will not resolve (a
-broken file, reported on the record rather than failing the pass, since beehive's backoff cannot fix
-a file), and `Connecting` while nothing has dialed — which is every context that resolves, until the
-probe lands. `ReasonProbeFailed` has no writer until then, and neither does the status a cluster
-projects.
+`observeIdentity` reports `Connected` — `Inactive` when the cluster is switched off **or its context
+left the kubeconfig** (both are states the user chose, with nothing to connect to until they undo
+it), `ResolveFailed` when the context is there and its entries will not resolve (a broken file,
+reported on the record rather than failing the pass, since beehive's backoff cannot fix a file), and
+`Connecting` while nothing has dialed — which is every context that resolves, until the probe lands.
+`ReasonProbeFailed` has no writer until then. A record from a source with no credentials to resolve
+gets **no condition at all**, rather than a verdict no probe produced.
 
-`clusterController.Reconcile` creates the record (`ensureClusterIdentity`), relays `Enabled` and a
-per-context `credentialsDigest` into its spec, declares `AddDependency` onto it, and **projects** its
-status into `status.server` /
-`status.principal` — a cached view of the record above, exactly as `status.source.kubeconfig` is a
-cached view of the file, which is what leaves the GraphQL surface and `CacheIsActive` untouched. The
-edge is the whole path a probe result takes back: owning a child wakes nothing.
+`foldIdentity` writes what the probe read into `status.server` / `status.principal`, leaving a fact
+it could not reach at its last-known value — which is what keeps an unreachable server identifiable,
+and what stops an unanswered probe from deactivating a live cache by clearing the UID it is named
+for.
 
-**The relays are how the file reaches a probe.** `ClusterIdentity` declares no edge onto the source
-anchor — an anchor's status moves on the fingerprint, and what a probe needs to hear is the entries a
-context resolves *through*. Instead the cluster's pass, which the anchor does wake, writes the
-digest into the child's spec: a spec write is itself the wake, and it reaches the one identity whose
-credentials moved rather than every record the file mentions. A digest, never the values — an entry
-carries tokens and client keys, and the spec is persisted.
-
-**Its steady state must be silent.** Every write to an identity record wakes every cluster that
-depends on it, so the pass reports only what it observed and lets beehive's no-op suppression (equal
-status bytes, unchanged conditions) do the rest. A timestamp in that status — or in a condition the
-pass writes unconditionally — would wake the fleet on every probe, which is the same trap
-`ClusterSourceStatus` carries and the reason a sweep-driven wake was replaced by this edge.
+**Its steady state must be silent.** A cluster record is what every watcher streams, so the pass
+reports only what it observed and lets beehive's no-op suppression (equal status bytes, unchanged
+conditions) do the rest. A timestamp in that status — or in a condition the pass writes
+unconditionally — would re-emit the record on every probe, which is the same trap
+`ClusterSourceStatus` carries.
 
 ### The probe cache (`internal/clustersvc/internal/kubeidentity`)
 
@@ -203,10 +193,9 @@ pass writes unconditionally — would wake the fleet on every probe, which is th
 another server is described correctly by the next ask — no cached credential to invalidate, and
 no window in which one is stale. It is also why **nothing here subscribes to the kubeconfig**: a
 notification would have nothing to update, and promptness already arrives from above, since the
-pass that asks is itself woken when the file moves (trigger → anchor → cluster →
-`credentialsDigest` relay → identity). → the relays, above. If the resolve cost ever shows, the
-memo goes here keyed on **snapshot pointer identity** (`Get()` returns a `*api.Config` replaced
-wholesale on reload), never on a new notification.
+pass that asks is itself woken when the file moves (kubeconfig trigger → source anchor → every
+cluster). If the resolve cost ever shows, the memo goes here keyed on **snapshot pointer identity**
+(`Get()` returns a `*api.Config` replaced wholesale on reload), never on a new notification.
 
 **The probe is not written**, and nothing stands in for it: no registry, no cadence, no cache.
 `Get` reports whether a context resolves and nothing beyond that, so one that does reads as
@@ -214,9 +203,9 @@ wholesale on reload), never on a new notification.
 
 What lands next is the probe. Two things it owes, both of them reasons this package exists:
 **it must stay off the caller's goroutine**, which is the split; and it must publish **only when
-the answer moved**, since a signal wakes the identity pass, which wakes every cluster depending
-on it — an unchanged answer would cost the fleet a round of work per context per interval, the
-same silence `ClusterIdentityStatus` above is written for. Probing belongs keyed by
+the answer moved**, since a signal wakes the cluster's pass and re-emits its record to every
+watcher — an unchanged answer would cost the fleet a round of work per context per interval, the
+same silence `ClusterStatus` above is written for. Probing belongs keyed by
 **credentials**, not by context: the key `RESTConfig` hands back excludes the context name, so
 two contexts aimed at one server as one user are one probe's worth of work.
 

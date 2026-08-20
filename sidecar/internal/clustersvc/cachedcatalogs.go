@@ -89,7 +89,7 @@ func ensureClusterCachedCatalog(ctx context.Context, client beehive.Client[Clust
 
 	// One transaction resolves the name and writes; a row awaiting collection is refused
 	// rather than rewritten, and its replacement waits for GC to release the name. Same
-	// shape as ensureClusterIdentity's relay.
+	// shape as ensureClusterCache's relay.
 	_, _, err := client.CreateOrUpdate(ctx, name, spec, beehive.WithOwner(beehive.ObjectID(cacheID)))
 	if err != nil && !errors.Is(err, beehive.ErrDeletionPending) {
 		return fmt.Errorf("apply cached catalog %s: %w", name, err)

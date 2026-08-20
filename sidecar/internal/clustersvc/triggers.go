@@ -137,7 +137,7 @@ type kubeidentitySource interface {
 	Subscribe() kubeidentity.Subscription
 }
 
-// newKubeidentityTrigger wakes the identity record for a context whose probe answered
+// newKubeidentityTrigger wakes the cluster record for a context whose probe answered
 // differently. A record reads what is known from kubeidentity rather than from the
 // store, so beehive cannot know when that observation went stale; this is the only thing
 // that reaches it, and the kind's own resync is what covers a signal that went missing.
@@ -146,6 +146,6 @@ func newKubeidentityTrigger(idSource kubeidentitySource) *trigger[gobus.Event[st
 		func() feed[gobus.Event[string, struct{}]] { return idSource.Subscribe() },
 		// The event's key is the context that moved; its value carries nothing, since
 		// what it now says is the pass's to read.
-		func(ev gobus.Event[string, struct{}]) string { return ClusterIdentityName(ev.Key) },
+		func(ev gobus.Event[string, struct{}]) string { return KubeconfigName(ev.Key) },
 	)
 }

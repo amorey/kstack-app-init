@@ -33,8 +33,6 @@
 //
 //	Cluster                 (name: "{source}/{naturalKey}", e.g. "kubeconfig/{context}")
 //	    ↓ owns
-//	ClusterIdentity         (name: "kubeconfig/{context}" — one per set of credentials)
-//	    and owns
 //	ClusterCache            (name: "{ClusterID}/{serverUID}")
 //	    ↓ owns
 //	ClusterCachedCatalog    (name: "cachedcatalog/{CacheID}" — one per cache)
@@ -322,7 +320,6 @@ type deps struct {
 	catalogClient  beehive.Client[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]
 	resourceClient beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
 	sourceClient   beehive.Client[ClusterSourceSpec, ClusterSourceStatus]
-	identityClient beehive.Client[ClusterIdentitySpec, ClusterIdentityStatus]
 
 	kubeconfigSvc   kubeconfigService
 	kubeidentitySvc kubeidentityService
@@ -336,7 +333,6 @@ func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeidentityS
 		catalogClient:   beehive.NewClient[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus](bh, ClusterCachedCatalogGroupKind),
 		resourceClient:  beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
 		sourceClient:    beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
-		identityClient:  beehive.NewClient[ClusterIdentitySpec, ClusterIdentityStatus](bh, ClusterIdentityGroupKind),
 		kubeconfigSvc:   kubeconfigSvc,
 		kubeidentitySvc: kubeidentitySvc,
 		pokeSvc:         pokeSvc,
@@ -446,11 +442,11 @@ var startupPass = beehive.WithStartupFullPass(true)
 // dependency edge, which is what a pass here would be re-deriving.
 var sourceResync = beehive.WithIndividualPassInterval(clusterSourceResyncInterval)
 
-// identityResync re-probes each identity, timed from the end of its own last pass. The
+// clusterResync re-probes each cluster, timed from the end of its own last pass. The
 // second kind whose correctness rests on a poll: what it reports is a remote server's,
 // so nothing in the store moves when the answer does. Per object rather than a sweep of
 // the kind, which is what keeps a fleet from dialing in one burst.
-var identityResync = beehive.WithIndividualPassInterval(identityProbeInterval)
+var clusterResync = beehive.WithIndividualPassInterval(clusterProbeInterval)
 
 // registerControllers builds and registers each kind's controller, which lives in that
 // kind's file, and returns them in registration order. Together here rather than four
@@ -465,24 +461,21 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
-	identity := &clusterIdentityController{deps: d}
 	cache := &clusterCacheController{deps: d}
 	catalog := &clusterCachedCatalogController{}
 	resource := &clusterCachedResourceController{}
 
 	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigTrigger.Wakes()))
-	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass)
-	errIdentity := beehive.Register(bh, ClusterIdentityGroupKind, identity, startupPass, identityResync, beehive.WithTriggerByName(identityTrigger.Wakes()))
+	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync, beehive.WithTriggerByName(identityTrigger.Wakes()))
 	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
 	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
 	errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
-	if err := errors.Join(errSource, errCluster, errIdentity, errCache, errCatalog, errResource); err != nil {
+	if err := errors.Join(errSource, errCluster, errCache, errCatalog, errResource); err != nil {
 		return nil, err
 	}
 	return []lifecycle.Part{
 		{Name: "cluster source controller", StartCloser: source},
 		{Name: "cluster controller", StartCloser: cluster},
-		{Name: "cluster identity controller", StartCloser: identity},
 		{Name: "cache controller", StartCloser: cache},
 		{Name: "cached-catalog controller", StartCloser: catalog},
 		{Name: "cached-resource controller", StartCloser: resource},

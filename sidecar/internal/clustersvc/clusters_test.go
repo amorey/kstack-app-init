@@ -27,8 +27,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"k8s.io/client-go/tools/clientcmd/api"
-
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
@@ -136,15 +135,28 @@ func TestObserveKubeconfigLeavesAnotherSourceAlone(t *testing.T) {
 // nil: Reconcile calls nothing else on it.
 type stubControllerClient struct {
 	beehive.ControllerClient[ClusterStatus]
-	updated   *ClusterStatus
-	updateErr error
-	dependsOn []beehive.ObjectID
-	dependErr error
+	updated    *ClusterStatus
+	updateErr  error
+	conditions []Condition
+	setErr     error
+	dependsOn  []beehive.ObjectID
+	dependErr  error
 }
 
 func (c *stubControllerClient) UpdateStatus(_ context.Context, status ClusterStatus) error {
 	c.updated = &status
 	return c.updateErr
+}
+
+func (c *stubControllerClient) SetCondition(_ context.Context, cond Condition) error {
+	c.conditions = append(c.conditions, cond)
+	return c.setErr
+}
+
+// Within runs fn inline: the pass groups its writes so a watcher never sees half of
+// them, and what this stub records is that each was attempted.
+func (c *stubControllerClient) Within(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
 }
 
 func (c *stubControllerClient) AddDependency(_ context.Context, toID beehive.ObjectID) error {
@@ -187,217 +199,136 @@ func liveCaches(t *testing.T, caches beehive.Client[ClusterCacheSpec, ClusterCac
 	return objs
 }
 
-// --- ClusterIdentity ---
-
-// identityController returns a controller plus the client that writes what a probe
-// would have found, which only the identity kind's own pass can otherwise write.
-func identityController(t *testing.T) (*clusterController, *beehive.AdminClient[ClusterIdentityStatus]) {
-	t.Helper()
-	d, bh := newTestDepsAndBeehive(t)
-	return &clusterController{deps: d}, beehive.NewAdminClient[ClusterIdentityStatus](bh, ClusterIdentityGroupKind)
-}
-
-// probed runs the pass that creates the identity record, then stores what a probe of
-// that context would have found. Two passes, because the record has to exist before its
-// status can: the second is the one that projects it.
-func probed(
-	t *testing.T,
-	c *clusterController,
-	admin *beehive.AdminClient[ClusterIdentityStatus],
-	obj *beehive.Object[ClusterSpec, ClusterStatus],
-	status ClusterIdentityStatus,
-) {
-	t.Helper()
-	ctx := context.Background()
-	reconcileCluster(t, c, &stubControllerClient{}, obj)
-
-	id, err := c.identityClient.GetByName(ctx, ClusterIdentityName(obj.Spec.Source.Kubeconfig.Context))
-	require.NoError(t, err)
-	require.NoError(t, admin.UpdateStatus(ctx, id.ID, status))
-}
+// --- the identity a probe found ---
 
 func strPtr(s string) *string { return &s }
 
-// The pass creates the record its probe writes, owned by the cluster so GC cascades to
-// it, carrying the toggle that decides whether it is probed at all.
-func TestReconcileCreatesItsIdentityRecord(t *testing.T) {
-	c := controllerOver(t)
-	obj := createCluster(t, c.clusterClient, "prod")
-
-	reconcileCluster(t, c, &stubControllerClient{}, obj)
-
-	objs, err := c.identityClient.List(context.Background(), beehive.LoadOwner())
-	require.NoError(t, err)
-	require.Len(t, objs, 1)
-	assert.Equal(t, ClusterIdentityName("prod"), objs[0].Name)
-	assert.True(t, objs[0].Spec.Enabled)
-
-	owner, ok, err := objs[0].Owner()
-	require.NoError(t, err)
-	require.True(t, ok)
-	assert.Equal(t, obj.ID, owner.ID)
-}
-
-// Every write to an identity record wakes every cluster depending on it, so a pass that
-// relays the same values must leave the generation where it found it. The relay hands
-// beehive a spec that marshals identically, which is what its no-op suppression needs; a
-// field that serialized differently each pass would bump the generation and wake the
-// fleet on a cadence.
-func TestReconcileRewritesNoIdentitySpecWhenNothingMoved(t *testing.T) {
-	ctx := context.Background()
-	c := controllerOver(t)
-	obj := createCluster(t, c.clusterClient, "prod")
-
-	reconcileCluster(t, c, &stubControllerClient{}, obj)
-	created, err := c.identityClient.GetByName(ctx, ClusterIdentityName("prod"))
-	require.NoError(t, err)
-
-	reconcileCluster(t, c, &stubControllerClient{}, obj)
-
-	after, err := c.identityClient.GetByName(ctx, ClusterIdentityName("prod"))
-	require.NoError(t, err)
-	assert.Equal(t, created.Generation, after.Generation, "nothing moved, so nothing is written")
-}
-
-// A record the GC is coming for keeps the spec it has: rewriting it would land the relay
-// on an incarnation about to go, and the replacement cannot be created until the name is
-// released with it.
-func TestReconcileRewritesNoDrainingIdentityRecord(t *testing.T) {
-	ctx := context.Background()
-	c := controllerOver(t)
-	obj := createCluster(t, c.clusterClient, "prod")
-	reconcileCluster(t, c, &stubControllerClient{}, obj)
-
-	id, err := c.identityClient.GetByName(ctx, ClusterIdentityName("prod"))
-	require.NoError(t, err)
-	require.NoError(t, c.identityClient.Delete(ctx, id.ID))
-
-	// The toggle moves, which on a live record would be written through.
-	obj, err = c.clusterClient.Update(ctx, obj.ID, ClusterSpec{Source: obj.Spec.Source})
-	require.NoError(t, err)
-	client := &stubControllerClient{}
-	reconcileCluster(t, c, client, obj)
-
-	draining, err := c.identityClient.GetByName(ctx, ClusterIdentityName("prod"))
-	require.NoError(t, err)
-	require.NotNil(t, draining.DeletionRequestedAt, "still awaiting collection")
-	assert.True(t, draining.Spec.Enabled, "left as it was")
-	// A refusal hands back no id, so the only edge this pass declares is the anchor's.
-	// Depending on the zero id would be an edge onto nothing.
-	assert.NotContains(t, client.dependsOn, beehive.ObjectID(0))
-	assert.NotContains(t, client.dependsOn, id.ID)
-}
-
-// The toggle is relayed into the child's spec rather than read back through an edge, so
-// a flip has to reach it as a spec write — which is itself the wake.
-func TestReconcileRelaysTheToggleToItsIdentityRecord(t *testing.T) {
-	c := controllerOver(t)
-	obj := createCluster(t, c.clusterClient, "prod")
-	reconcileCluster(t, c, &stubControllerClient{}, obj)
-
-	obj, err := c.clusterClient.Update(context.Background(), obj.ID, ClusterSpec{Source: obj.Spec.Source})
-	require.NoError(t, err)
-	reconcileCluster(t, c, &stubControllerClient{}, obj)
-
-	id, err := c.identityClient.GetByName(context.Background(), ClusterIdentityName("prod"))
-	require.NoError(t, err)
-	assert.False(t, id.Spec.Enabled)
-}
-
-// Owning the record wakes nothing, so the edge is the whole path a probe result takes
-// back to this record.
-func TestReconcileDependsOnItsIdentityRecord(t *testing.T) {
-	c := controllerOver(t)
-	obj := createCluster(t, c.clusterClient, "prod")
-
-	client := &stubControllerClient{}
-	reconcileCluster(t, c, client, obj)
-
-	id, err := c.identityClient.GetByName(context.Background(), ClusterIdentityName("prod"))
-	require.NoError(t, err)
-	assert.Contains(t, client.dependsOn, id.ID)
-}
-
-// --- credentialsDigest ---
-
-// The digest is what tells a probe its credentials moved, so it has to cover the
-// entries a context resolves through — none of which the entry names it references
-// would reveal.
-func TestCredentialsDigestCoversTheResolvedEntries(t *testing.T) {
-	cfg := cfgWith("prod")
-	cfg.Clusters = map[string]*api.Cluster{"prod-cluster": {Server: "https://one.example"}}
-	cfg.AuthInfos = map[string]*api.AuthInfo{"prod-user": {Token: "one"}}
-	base := digestOf(t, cfg, "prod")
-
-	assert.Equal(t, base, digestOf(t, cfg, "prod"), "the same file digests the same")
-
-	cfg.Clusters["prod-cluster"] = &api.Cluster{Server: "https://two.example"}
-	moved := digestOf(t, cfg, "prod")
-	assert.NotEqual(t, base, moved, "a re-pointed server")
-
-	cfg.AuthInfos["prod-user"] = &api.AuthInfo{Token: "two"}
-	assert.NotEqual(t, moved, digestOf(t, cfg, "prod"), "rotated credentials")
-}
-
-// A context another one's entries have nothing to do with must digest independently,
-// or one cluster's edit would wake every probe.
-func TestCredentialsDigestIsPerContext(t *testing.T) {
-	cfg := cfgWith("prod", "staging")
-	cfg.Clusters = map[string]*api.Cluster{
-		"prod-cluster":    {Server: "https://prod.example"},
-		"staging-cluster": {Server: "https://staging.example"},
-	}
-	base := digestOf(t, cfg, "prod")
-
-	cfg.Clusters["staging-cluster"] = &api.Cluster{Server: "https://moved.example"}
-
-	assert.Equal(t, base, digestOf(t, cfg, "prod"))
-}
-
-// An orphaned record has nothing to resolve, and an empty digest is what its identity
-// record carries until the context comes back.
-func TestCredentialsDigestIsEmptyForAnAbsentContext(t *testing.T) {
-	assert.Empty(t, digestOf(t, cfgWith("staging"), "prod"))
-}
-
-func digestOf(t *testing.T, cfg *api.Config, contextName string) string {
+// identityControllerOver returns a controller whose identity service answers with what.
+func identityControllerOver(t *testing.T, what *fakeKubeidentity) *clusterController {
 	t.Helper()
-	d, err := credentialsDigest(cfg, contextName)
-	require.NoError(t, err)
-	return d
+	d := newTestDeps(t)
+	d.kubeidentitySvc = what
+	return &clusterController{deps: d}
 }
 
-// The pass relays the digest into the child's spec, which is the write that wakes the
-// probe: nothing else reaches it when a context is re-pointed at another server.
-func TestReconcileRelaysTheCredentialsDigest(t *testing.T) {
-	d := newTestDeps(t)
-	cfg := cfgWith("prod")
-	cfg.Clusters = map[string]*api.Cluster{"prod-cluster": {Server: "https://one.example"}}
-	d.kubeconfigSvc = fakeKubeconfigService{cfg: cfg, loaded: true}
-	c := &clusterController{deps: d}
+// reportedCondition is the one condition a pass wrote, or a failure when it wrote none.
+func reportedCondition(t *testing.T, client *stubControllerClient) Condition {
+	t.Helper()
+	require.Len(t, client.conditions, 1, "a pass reports once")
+	return client.conditions[0]
+}
+
+// Every condition here describes process-scoped state, so a previous process's write
+// must read as Unknown until this one re-confirms it.
+func TestReconcileReportsLiveness(t *testing.T) {
+	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
 
-	reconcileCluster(t, c, &stubControllerClient{}, obj)
-	first, err := c.identityClient.GetByName(context.Background(), ClusterIdentityName("prod"))
-	require.NoError(t, err)
-	require.Equal(t, digestOf(t, cfg, "prod"), first.Spec.CredentialsDigest)
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
 
-	// The file is re-pointed at another server, which leaves every entry name alone.
-	cfg.Clusters["prod-cluster"] = &api.Cluster{Server: "https://two.example"}
-	reconcileCluster(t, c, &stubControllerClient{}, obj)
+	assert.True(t, reportedCondition(t, client).Liveness)
+}
 
-	second, err := c.identityClient.GetByName(context.Background(), ClusterIdentityName("prod"))
+// A cluster the user switched off is not probed, and says so rather than looking like
+// one that failed to connect.
+func TestReconcileReportsInactiveWhenDisabled(t *testing.T) {
+	svc := answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil)
+	c := identityControllerOver(t, svc)
+	obj := createCluster(t, c.clusterClient, "prod")
+	obj.Spec.Enabled = false
+
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
+
+	assert.Empty(t, svc.asked, "a disabled cluster is not asked about at all")
+	cond := reportedCondition(t, client)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonInactive, cond.Reason)
+}
+
+// A context the user removed is not a broken one: there is nothing to connect to until
+// they put it back, which reads differently from a cluster that would not answer.
+func TestReconcileReportsInactiveForADepartedContext(t *testing.T) {
+	c := identityControllerOver(t, answering(kubeidentity.Identity{},
+		fmt.Errorf("%w: %q", kubeconfig.ErrContextNotFound, "prod")))
+	obj := createCluster(t, c.clusterClient, "prod")
+
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
+
+	cond := reportedCondition(t, client)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonInactive, cond.Reason)
+}
+
+// The context is there and its entries do not resolve — a file the user has to fix. The
+// record reports it rather than failing the pass, and carries what went wrong.
+func TestReconcileReportsAFailedResolve(t *testing.T) {
+	c := identityControllerOver(t, answering(kubeidentity.Identity{},
+		errors.New("no such certificate authority file")))
+	obj := createCluster(t, c.clusterClient, "prod")
+
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
+
+	cond := reportedCondition(t, client)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonResolveFailed, cond.Reason)
+	assert.Contains(t, cond.Message, "certificate authority")
+	assert.Nil(t, client.updated.Server.UID, "a failed probe improves on nothing")
+}
+
+// The read asks for the probe and returns whatever is known, which on the first pass is
+// nothing. Neither connected nor failed, and the signal the probe publishes is what
+// brings this record back.
+func TestReconcileReportsConnectingUntilAnswered(t *testing.T) {
+	svc := &fakeKubeidentity{}
+	c := identityControllerOver(t, svc)
+	obj := createCluster(t, c.clusterClient, "prod")
+
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
+
+	assert.Equal(t, []string{"prod"}, svc.asked, "asking is what queues the probe")
+	cond := reportedCondition(t, client)
+	assert.Equal(t, ConditionUnknown, cond.Status)
+	assert.Equal(t, ReasonConnecting, cond.Reason)
+}
+
+// A record from another source names no context to resolve, so a verdict about reaching
+// its server is one no pass here produced.
+func TestReconcileReportsNoConditionForAnotherSource(t *testing.T) {
+	svc := answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil)
+	c := identityControllerOver(t, svc)
+	obj, err := c.clusterClient.Create(context.Background(), "cloud/prod", ClusterSpec{})
 	require.NoError(t, err)
-	assert.Equal(t, digestOf(t, cfg, "prod"), second.Spec.CredentialsDigest)
-	assert.Greater(t, second.Generation, first.Generation, "a spec write, which is the wake")
+
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
+
+	assert.Empty(t, client.conditions)
+	assert.Empty(t, svc.asked)
+	assert.Nil(t, client.updated.Server.UID)
+}
+
+// A condition the store refuses is this pass's failure, not the cluster's: settling
+// would report a verdict nothing recorded.
+func TestReconcileReportsAFailedConditionWrite(t *testing.T) {
+	boom := errors.New("boom")
+	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil))
+	obj := createCluster(t, c.clusterClient, "prod")
+
+	res := c.Reconcile(context.Background(), &stubControllerClient{setErr: boom}, obj)
+
+	assert.ErrorIs(t, res.Err(), boom)
 }
 
 // The identity comes from the probe, not from the record: this is the write that turns
 // a tracked context into one with a mirror.
 func TestReconcileWritesTheProbedUID(t *testing.T) {
-	c, admin := identityController(t)
+	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
-	probed(t, c, admin, obj, ClusterIdentityStatus{ServerUID: strPtr("uid-1")})
 
 	client := &stubControllerClient{}
 	reconcileCluster(t, c, client, obj)
@@ -410,13 +341,10 @@ func TestReconcileWritesTheProbedUID(t *testing.T) {
 // One probe answers three questions, and dropping two would throw away requests it
 // already paid for. The version and the principal have their own status homes.
 func TestReconcileWritesTheWholeIdentity(t *testing.T) {
-	c, admin := identityController(t)
+	c := identityControllerOver(t, answering(kubeidentity.Identity{
+		ServerUID: "uid-1", ServerVersion: "v1.29.3", Username: "admin@example",
+	}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
-	probed(t, c, admin, obj, ClusterIdentityStatus{
-		ServerUID:     strPtr("uid-1"),
-		ServerVersion: strPtr("v1.29.3"),
-		Username:      strPtr("admin@example"),
-	})
 
 	client := &stubControllerClient{}
 	reconcileCluster(t, c, client, obj)
@@ -432,12 +360,10 @@ func TestReconcileWritesTheWholeIdentity(t *testing.T) {
 // connected as and not what it connected to. Each fact stands on its own: reporting
 // none of them would hide a cluster that is up.
 func TestReconcileWritesThePartOfTheIdentityAProbeReached(t *testing.T) {
-	c, admin := identityController(t)
+	c := identityControllerOver(t, answering(kubeidentity.Identity{
+		ServerVersion: "v1.29.3", Username: "reader@example",
+	}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
-	probed(t, c, admin, obj, ClusterIdentityStatus{
-		ServerVersion: strPtr("v1.29.3"),
-		Username:      strPtr("reader@example"),
-	})
 
 	client := &stubControllerClient{}
 	reconcileCluster(t, c, client, obj)
@@ -447,15 +373,16 @@ func TestReconcileWritesThePartOfTheIdentityAProbeReached(t *testing.T) {
 	require.NotNil(t, client.updated.Principal.Username)
 	assert.Equal(t, "reader@example", *client.updated.Principal.Username)
 	assert.Empty(t, liveCaches(t, c.cacheClient), "and no cache, since none is named yet")
+	assert.Equal(t, ConditionTrue, reportedCondition(t, client).Status,
+		"a user refused kube-system still reached a cluster that is up")
 }
 
-// The pass that projects an identity is the one that creates its cache. Nothing else
+// The pass that learns an identity is the one that creates its cache. Nothing else
 // would: a status write moves no generation, so no owed pass lists this record again,
 // and the cache that would be its dependent is the thing that does not exist yet.
 func TestReconcileCreatesTheCacheInTheSamePassThatLearnsTheUID(t *testing.T) {
-	c, admin := identityController(t)
+	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
-	probed(t, c, admin, obj, ClusterIdentityStatus{ServerUID: strPtr("uid-1")})
 
 	reconcileCluster(t, c, &stubControllerClient{}, obj)
 
@@ -476,22 +403,6 @@ func TestReconcileKeepsTheLastKnownUIDWhileNothingIsProbed(t *testing.T) {
 	require.NotNil(t, client.updated.Server.UID, "an unanswered probe must not clear it")
 	assert.Equal(t, "uid-1", *client.updated.Server.UID)
 	assert.Len(t, liveCaches(t, c.cacheClient), 1, "and the cache it already calls for stands")
-}
-
-// A record from another source names no context to probe, so it gets no identity record
-// and reports no server.
-func TestReconcileCreatesNoIdentityForAnotherSource(t *testing.T) {
-	c := controllerOver(t)
-	obj, err := c.clusterClient.Create(context.Background(), "cloud/prod", ClusterSpec{})
-	require.NoError(t, err)
-
-	client := &stubControllerClient{}
-	reconcileCluster(t, c, client, obj)
-
-	assert.Nil(t, client.updated.Server.UID)
-	objs, err := c.identityClient.List(context.Background())
-	require.NoError(t, err)
-	assert.Empty(t, objs)
 }
 
 // A cluster owns a mirror slot per identity it has been probed at, so the pass that
@@ -639,7 +550,7 @@ func TestReconcileReportsAFailedStatusWrite(t *testing.T) {
 
 	res := controllerOver(t).Reconcile(context.Background(), &stubControllerClient{updateErr: boom}, kubeconfigObj("prod", nil))
 
-	assert.Equal(t, fmt.Errorf("update cluster status: %w", boom), res.Err())
+	assert.ErrorIs(t, res.Err(), boom)
 }
 
 // A spec write this observation does not depend on still bumps the generation, and an
@@ -1001,6 +912,111 @@ func pumpFrames(t *testing.T, snapshot []*beehive.Object[ClusterSpec, ClusterSta
 		frames = append(frames, f)
 	}
 	return frames
+}
+
+// Only a removal arrives without an object, so anything else that does is dropped
+// rather than folded: a frame with no entity is one a consumer discards anyway, and
+// building it would dereference the object that is missing.
+func TestClustersWatchListDropsAChangeWithNoObject(t *testing.T) {
+	frames := pumpFrames(t, nil,
+		beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Modified, ID: 7, Object: nil},
+	)
+
+	require.Len(t, frames, 1)
+	assert.Equal(t, DeltaFrameBookmark, frames[0].Type)
+}
+
+// The pump ends by reporting why its source did, which is the only thing telling a dead
+// watch from a drained one — Frames closes either way.
+func TestClustersWatchListReportsWhyTheSourceDied(t *testing.T) {
+	boom := errors.New("watch ended: resource version too old")
+	changes := make(chan beehive.ObjectChange[ClusterSpec, ClusterStatus])
+	close(changes)
+
+	err := pumpClusterWatch(context.Background(), make(chan ClusterWatchFrame, 1), nil, changes,
+		func() error { return boom })
+
+	assert.Equal(t, boom, err)
+}
+
+// parkedClusterPump is the pump running against a channel nothing drains, so it parks
+// on its next send exactly as it would against a client that stopped reading.
+type parkedClusterPump struct {
+	out     chan ClusterWatchFrame
+	changes chan beehive.ObjectChange[ClusterSpec, ClusterStatus]
+	done    chan error
+	cancel  context.CancelFunc
+}
+
+func startClusterPump(t *testing.T, snapshot []*beehive.Object[ClusterSpec, ClusterStatus]) *parkedClusterPump {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	p := &parkedClusterPump{
+		out:     make(chan ClusterWatchFrame),
+		changes: make(chan beehive.ObjectChange[ClusterSpec, ClusterStatus]),
+		done:    make(chan error, 1),
+		cancel:  cancel,
+	}
+	go func() {
+		p.done <- pumpClusterWatch(ctx, p.out, snapshot, p.changes, func() error { return nil })
+	}()
+	return p
+}
+
+// takeBookmark drains the snapshot's closing frame, which puts the pump in its change
+// loop. The unbuffered handoff is the synchronization: the send below cannot complete
+// until the pump has taken the change and gone on to send its frame.
+func takeBookmark(t *testing.T, p *parkedClusterPump) {
+	t.Helper()
+	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, p.out, "the bookmark").Type)
+}
+
+// Every send point owes the same thing: a consumer that stopped draining must end the
+// pump rather than park it. A missed one leaks the goroutine and the store watch behind
+// it once per client disconnect, and says nothing about it — Frames never closes, so
+// there is no Err for anyone to read.
+func TestPumpClusterWatchEndsWhereverTheConsumerStopped(t *testing.T) {
+	tests := map[string]struct {
+		snapshot []*beehive.Object[ClusterSpec, ClusterStatus]
+		// reach parks the pump on the send under test, taking every frame before it.
+		reach func(t *testing.T, p *parkedClusterPump)
+	}{
+		"a snapshot frame": {
+			snapshot: []*beehive.Object[ClusterSpec, ClusterStatus]{{ID: 1}},
+			reach:    func(*testing.T, *parkedClusterPump) {},
+		},
+		"the bookmark": {
+			reach: func(*testing.T, *parkedClusterPump) {},
+		},
+		"an ordinary change": {
+			reach: func(t *testing.T, p *parkedClusterPump) {
+				takeBookmark(t, p)
+				p.changes <- beehive.ObjectChange[ClusterSpec, ClusterStatus]{
+					Type: beehive.Modified, ID: 1, Object: &beehive.Object[ClusterSpec, ClusterStatus]{ID: 1},
+				}
+			},
+		},
+		"a departure": {
+			reach: func(t *testing.T, p *parkedClusterPump) {
+				takeBookmark(t, p)
+				p.changes <- beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Deleted, ID: 1}
+			},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			p := startClusterPump(t, tt.snapshot)
+			tt.reach(t, p)
+
+			p.cancel()
+
+			assert.NoError(t, testutil.Recv(t, p.done, "the pump to end"),
+				"cancellation is a teardown, not a failure")
+		})
+	}
 }
 
 // deletingCluster is a tombstoned row: what both halves of a departure carry.

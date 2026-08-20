@@ -94,7 +94,7 @@ func TestEnsureClusterCachedCatalogRelaysAFlip(t *testing.T) {
 
 // A record the GC is coming for keeps the spec it has: rewriting it would land the relay
 // on an incarnation about to go, and the replacement cannot be created until the name is
-// released with it. The same rule ensureClusterIdentity keeps.
+// released with it. The same rule ensureClusterCache keeps.
 func TestEnsureClusterCachedCatalogRewritesNoDrainingRecord(t *testing.T) {
 	d := newTestDeps(t)
 	ctx := context.Background()
