@@ -16,19 +16,25 @@
 //
 // The split kubeconfig.Service keeps: Get reads memory, the network happens elsewhere.
 //
-// **It holds nothing.** Every Get resolves the context afresh, so a context re-pointed at
-// another server is described correctly by the next ask — there is no cached credential to
-// invalidate, and no window in which one is stale. It is also why nothing here subscribes to
-// the kubeconfig: a notification would have nothing to update.
+// **What it holds is keyed by credentials.** Every Get re-resolves the context and compares
+// the key against the one the stored answer was learned under, so an edit that re-points a
+// context or rotates its token makes that answer unreadable at the instant it lands rather
+// than at the next probe. The caller reads "nothing known" and reports connecting — never a
+// stale identity as a current one. Nothing here subscribes to the kubeconfig: the key check
+// is what keeps the answer honest, and promptness already arrives from above, since the pass
+// that asks is itself woken when the file moves.
 //
-// **The probe is not written.** Get reports whether a context resolves and nothing beyond
-// that, so one that does reads as "nothing known" and Subscribe never fires — a caller sees a
-// fleet awaiting its first probe, which is the state it already renders.
+// **The probe is not written.** Nothing fills the store, so every context that resolves reads
+// as nothing known and Subscribe never fires — a caller sees a fleet awaiting its first probe,
+// which is the state it already renders. What lands is a dialer calling record, and the
+// cadence it re-dials on: a server whose identity changes under unchanged credentials moves
+// nothing in the kubeconfig, so that cadence is the only thing that can detect it.
 package kubeidentity
 
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/amorey/gobus/conflate"
 	"k8s.io/client-go/rest"
@@ -73,10 +79,21 @@ type kubeconfigService interface {
 	RESTConfig(contextName string) (*rest.Config, string, error)
 }
 
+// entry is one probe's answer and the credentials it was learned under. The key is what
+// makes the answer refutable: without it a stored identity outlives the credentials that
+// produced it, and nothing in the process could tell.
+type entry struct {
+	key   string
+	state State
+}
+
 // Service answers what is known about each context's server.
 type Service struct {
 	kubecfg kubeconfigService
 	hub     *conflate.Hub[string, struct{}]
+
+	mu    sync.Mutex
+	known map[string]entry
 }
 
 // New returns a Service over the one reader of the user's kubeconfig.
@@ -85,25 +102,71 @@ func New(kubecfg kubeconfigService) *Service {
 		kubecfg: kubecfg,
 		// Nothing to merge: two signals for one context say the same thing, which is that Get
 		// is worth re-reading.
-		hub: conflate.New[string](func(_, next struct{}) (struct{}, bool) { return next, true }),
+		hub:   conflate.New[string](func(_, next struct{}) (struct{}, bool) { return next, true }),
+		known: map[string]entry{},
 	}
 }
 
 // Get returns what is known about the context's server, and whether anything is known at all.
 // It never dials.
 //
-// A context that resolves reads as nothing known: what would fill that in is the probe, and
-// there is none yet. So does one whose kubeconfig has not been read — the unread config is
-// empty, so every context looks departed, and reporting that would record a live cluster as
+// The resolve is what makes the answer current: it yields the credentials the context names
+// *now*, and a stored answer is returned only if it was learned under those. Credentials that
+// moved therefore read as nothing known, which is the same thing a context nobody has probed
+// reads as — both are "connecting", and neither is a claim about a server.
+//
+// A context whose kubeconfig has not been read reads as nothing known too. The unread config
+// is empty, so every context looks departed, and reporting that would record a live cluster as
 // gone.
 func (s *Service) Get(contextName string) (State, bool) {
-	// Only the error is read. What the credentials are is the probe's question, and it is the
-	// probe that is missing.
-	_, _, err := s.kubecfg.RESTConfig(contextName)
-	if err != nil && !errors.Is(err, kubeconfig.ErrNotRead) {
+	_, key, err := s.kubecfg.RESTConfig(contextName)
+	if err != nil {
+		if errors.Is(err, kubeconfig.ErrNotRead) {
+			return State{}, false
+		}
 		return State{Err: err}, true
 	}
-	return State{}, false
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.known[contextName]
+	if !ok || e.key != key {
+		return State{}, false
+	}
+	return e.state, true
+}
+
+// record stores what a probe learned, publishing the context when the answer moved. key is
+// the credentials fingerprint the probe resolved before dialing — passed in rather than
+// re-resolved here, so what is stored is what was actually dialed even if the file moved
+// while the probe was in flight.
+//
+// The publish is conditional because a signal wakes the cluster's pass and re-emits its
+// record to every watcher: sending on an unchanged answer would cost the fleet a round of
+// work per context per cadence.
+func (s *Service) record(contextName, key string, state State) {
+	s.mu.Lock()
+	prev, had := s.known[contextName]
+	s.known[contextName] = entry{key: key, state: state}
+	s.mu.Unlock()
+
+	if had && prev.key == key && sameState(prev.state, state) {
+		return
+	}
+	s.hub.Sender().Send(contextName, struct{}{}) //nolint:errcheck // a closed bus means shutdown
+}
+
+// sameState compares two answers for the purpose of suppressing a publish. Errors compare by
+// message rather than by value: a probe failure is built afresh on every attempt, so two
+// attempts that failed the same way are never equal and would publish every cadence.
+func sameState(a, b State) bool {
+	if a.Identity != b.Identity {
+		return false
+	}
+	if (a.Err == nil) != (b.Err == nil) {
+		return false
+	}
+	return a.Err == nil || a.Err.Error() == b.Err.Error()
 }
 
 // Subscribe reports the contexts whose State moved. Close the subscription when done. Nothing

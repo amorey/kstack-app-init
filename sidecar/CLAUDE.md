@@ -189,25 +189,38 @@ unconditionally — would re-emit the record on every probe, which is the same t
 
 **The split `kubeconfig.Service` keeps**: `Get` reads memory, the network happens elsewhere.
 
-**It holds nothing.** Every `Get` resolves the context afresh, so a context re-pointed at
-another server is described correctly by the next ask — no cached credential to invalidate, and
-no window in which one is stale. It is also why **nothing here subscribes to the kubeconfig**: a
-notification would have nothing to update, and promptness already arrives from above, since the
-pass that asks is itself woken when the file moves (kubeconfig trigger → source anchor → every
-cluster). If the resolve cost ever shows, the memo goes here keyed on **snapshot pointer identity**
-(`Get()` returns a `*api.Config` replaced wholesale on reload), never on a new notification.
+**What it holds is keyed by credentials.** An `entry` is one probe's answer plus the key
+`RESTConfig` returned for the credentials that probe dialed, and every `Get` re-resolves the
+context and returns the answer **only if it was learned under the key the context names now**.
+That is what makes a stored identity refutable: a kubeconfig edit rotating a token or
+re-pointing the server would otherwise leave an answer describing a connection nobody would
+make again, with nothing in the process able to tell. Credentials that moved read as "nothing
+known" — the same thing an unprobed context reads as, and the right one, since neither is a
+claim about a server. **So the resolve is never memoized**: it *is* the check.
 
-**The probe is not written**, and nothing stands in for it: no registry, no cadence, no cache.
-`Get` reports whether a context resolves and nothing beyond that, so one that does reads as
+**Nothing here subscribes to the kubeconfig.** The key check keeps the answer honest without
+one, and promptness arrives from above — the pass that asks is itself woken when the file moves
+(kubeconfig trigger → source anchor → every cluster). A per-context subscription here would
+make that wake precise rather than fleet-wide; it is the same change as dropping `Cluster`'s
+edge onto the anchor, and belongs with it.
+
+**The probe is not written**: nothing calls `record`, so every context that resolves reads as
 "nothing known" and `Subscribe` never fires — the state callers already render.
 
-What lands next is the probe. Two things it owes, both of them reasons this package exists:
-**it must stay off the caller's goroutine**, which is the split; and it must publish **only when
-the answer moved**, since a signal wakes the cluster's pass and re-emits its record to every
-watcher — an unchanged answer would cost the fleet a round of work per context per interval, the
-same silence `ClusterStatus` above is written for. Probing belongs keyed by
-**credentials**, not by context: the key `RESTConfig` hands back excludes the context name, so
+What lands next is the probe, and `record(contextName, key, state)` is the seam it calls. Three
+things it owes, all of them reasons this package exists. **It must stay off the caller's
+goroutine**, which is the split. **It must pass the key it resolved before dialing**, not one
+re-read after, so a file that moves mid-probe cannot make the answer look current. And **it
+must re-dial on a cadence of its own**: a server that changes identity under unchanged
+credentials moves nothing in the kubeconfig, so no push signal anywhere can report it and the
+cadence is the only detector — `clusterResync` is not it, since no reconcile pass dials.
+Probing belongs keyed by **credentials**, not by context: the key excludes the context name, so
 two contexts aimed at one server as one user are one probe's worth of work.
+
+`record` publishes only when the answer moved, since a signal wakes the cluster's pass and
+re-emits its record to every watcher — the same silence `ClusterStatus` above is written for.
+`sameState` compares errors **by message**, because a probe failure is rebuilt per attempt and
+comparing by value would publish every cadence for a cluster that is steadily down.
 
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache
