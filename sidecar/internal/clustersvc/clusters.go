@@ -24,11 +24,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/amorey/beehive"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
@@ -436,6 +438,51 @@ type clusterController struct {
 	// Every kind's client, not just this one's: a cluster creates the ClusterCache
 	// children it owns.
 	deps
+
+	// leases is this controller's own: a claim is held across passes, so it cannot live
+	// in deps beside the services every kind shares.
+	leases clusterLeases
+}
+
+// clusterLeases is the claims this controller holds, one per cluster it keeps connected.
+// A claim is what arms the probe behind a cluster, so what this holds is which clusters
+// are probed at all — and it outlives the pass that took it, which is why the controller
+// owns it and a pass only ensures it.
+//
+// Keyed by ClusterID, since the lifetime being modelled is the record's: enabled,
+// disabled, deleted. Storage only, with a usable zero value; the methods are the
+// controller's, so the pool is reached through deps like every other service and there is
+// one place it can be wired wrong.
+//
+// These are the controller's own claims, not every claim on a cluster. A caller reaching
+// the boundary takes one of its own and releases it when done — the pool refcounts, so a
+// log tail ending must not drop the claim keeping this cluster probed. The claims are
+// process state a restart invalidates and the store cannot report as owed, which is what
+// the Cluster kind's startup pass is for.
+type clusterLeases struct {
+	// Passes run per object and concurrently, and Close races whatever is mid-pass.
+	mu   sync.Mutex
+	held map[ClusterID]heldLease
+}
+
+// heldLease is one cluster's claim and the context it was taken for. The context is what
+// makes the claim refutable: a record re-pointed at another one is a different claim, and
+// handing back the old one would report a server these credentials no longer reach.
+type heldLease struct {
+	contextName string
+	lease       kubeconn.Lease
+}
+
+// ensureLease returns the cluster's claim, taking one if it has none and replacing it if
+// the context moved.
+func (c *clusterController) ensureLease(id ClusterID, contextName string) (kubeconn.Lease, error) {
+	panic("not implemented")
+}
+
+// dropLease releases the cluster's claim, if it holds one. Idempotent: a pass that finds a
+// cluster disabled calls it without knowing whether one was ever taken.
+func (c *clusterController) dropLease(id ClusterID) {
+	panic("not implemented")
 }
 
 func (c *clusterController) Reconcile(

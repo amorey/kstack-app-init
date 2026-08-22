@@ -31,6 +31,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -61,6 +62,13 @@ type kubeconfigService interface {
 	Get() (*api.Config, bool)
 	RESTConfig(contextName string) (*rest.Config, string, error)
 	Subscribe() kubeconfig.Subscription
+}
+
+// kubeconnService is the pool a cluster is talked to over. Acquire names a context and
+// claims its connection, which is also what arms the probe behind it; a claim outlives
+// the pass that took it, so the caller holds and releases rather than asking per pass.
+type kubeconnService interface {
+	Acquire(contextName string) (kubeconn.Lease, error)
 }
 
 // kubeidentityService answers which server a kube-context reaches. Non-blocking by

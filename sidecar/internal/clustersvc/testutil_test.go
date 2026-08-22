@@ -28,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -84,6 +85,14 @@ func (f *fakeKubeidentity) Subscribe() kubeidentity.Subscription {
 	panic("a cluster pass reads, it does not subscribe")
 }
 
+// fakeKubeconn stands in for the pool. Nothing claims a connection yet, so a test that
+// reaches it has found a pass doing something it is not meant to.
+type fakeKubeconn struct{}
+
+func (fakeKubeconn) Acquire(string) (kubeconn.Lease, error) {
+	panic("no pass claims a connection yet")
+}
+
 // answering is a service that answers for "prod" with an identity and an error.
 func answering(id kubeidentity.Identity, err error) *fakeKubeidentity {
 	return &fakeKubeidentity{states: map[string]identityAnswer{
@@ -96,7 +105,7 @@ func answering(id kubeidentity.Identity, err error) *fakeKubeidentity {
 func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeidentity{}, nil)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeidentity{}, fakeKubeconn{}, nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -115,7 +124,7 @@ func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	return newDeps(bh, newTestKubeconfig(t), &fakeKubeidentity{}, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(bh, newTestKubeconfig(t), &fakeKubeidentity{}, fakeKubeconn{}, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -152,7 +161,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeidentity{}, nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeidentity{}, fakeKubeconn{}, nil)
 }
 
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the

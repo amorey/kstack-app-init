@@ -344,10 +344,11 @@ type deps struct {
 
 	kubeconfigSvc   kubeconfigService
 	kubeidentitySvc kubeidentityService
+	kubeconnSvc     kubeconnService
 	pokeSvc         *poke.Service
 }
 
-func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeidentitySvc kubeidentityService, pokeSvc *poke.Service) deps {
+func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeidentitySvc kubeidentityService, kubeconnSvc kubeconnService, pokeSvc *poke.Service) deps {
 	return deps{
 		clusterClient:   beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
 		cacheClient:     beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
@@ -356,6 +357,7 @@ func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeidentityS
 		sourceClient:    beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
 		kubeconfigSvc:   kubeconfigSvc,
 		kubeidentitySvc: kubeidentitySvc,
+		kubeconnSvc:     kubeconnSvc,
 		pokeSvc:         pokeSvc,
 	}
 }
@@ -420,7 +422,7 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 	// its answer is filed under.
 	kubeidentitySvc := kubeidentity.New(kubeconfigSvc)
 	kubeconnSvc := kubeconn.New(kubeconfigSvc)
-	d := newDeps(bh, kubeconfigSvc, kubeidentitySvc, pokeSvc)
+	d := newDeps(bh, kubeconfigSvc, kubeidentitySvc, kubeconnSvc, pokeSvc)
 
 	controllers, err := registerControllers(bh, d)
 	if err != nil {
