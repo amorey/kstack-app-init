@@ -9,10 +9,10 @@ The data dir (`--data-dir` / `KSTACK_DATA_DIR`) is **required** — `app.New` er
 Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the composition root + routing, GraphQL lives in `graph/`. There is no `server` package.
 
 - `main.go` — parse flags, bind socket, build `*app.App`, serve, drive graceful shutdown (`srv.Shutdown` → `app.DrainWithContext` → `stop(ctx)` → `app.Close`).
-- `internal/app/` — **composition root**: builds `poke.Service`, `kubeconfig.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → kubeconfig → kubeconn → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain, and the connection pool outlives the cluster service probing on it. **kubeconfig before cluster is load-bearing** — `kubeconfig.Service.Start` reads synchronously, so every cluster reconcile observes a read config, and `app_test.go` pins it. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
+- `internal/app/` — **composition root**: builds `poke.Service`, `kubeconfig.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → kubeconfig → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain. **kubeconfig before cluster is load-bearing** — `kubeconfig.Service.Start` reads synchronously, so every cluster reconcile observes a read config, and `app_test.go` pins it. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
-- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `kubeconn` (one validated connection per set of credentials), `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
+- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `kubeconn` (a pool nothing builds — see below), `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
@@ -41,8 +41,9 @@ internal/clustersvc/
                       package sees them, and the two GraphQL scalars
   stream.go           Stream[T]
   internal/kubeidentity/ which credentials each kube-context resolves to, and what a
-                      probe of them found. This package's own leaf, under internal/
-                      so the compiler keeps it that way
+                      probe of them found
+  internal/kubeconn/  the connections a cluster is talked to over. Both leaves live
+                      under internal/ so the compiler keeps them this package's own
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -184,6 +185,23 @@ reports only what it observed and lets beehive's no-op suppression (equal status
 conditions) do the rest. A timestamp in that status — or in a condition the pass writes
 unconditionally — would re-emit the record on every probe, which is the same trap
 `ClusterSourceStatus` carries.
+
+### The connection pool (`internal/clustersvc/internal/kubeconn`)
+
+**A cluster is the only way to address a connection**, so the pool sits behind this boundary and
+nothing outside it can import one. → [ADR: connections are addressed by
+ClusterID](../docs/adr/2026-08-22-connections-addressed-by-cluster-id.md).
+
+**Nothing dials yet.** `clustersvc.New` builds it and carries it as a `lifecycle.Part` ahead of
+beehive — closing drops sockets, so a connection has to outlive every pass that could still be
+dialing on it. The pool, the leases, and the probe are what land next, drawn from the worked-out
+`internal/kubeconn`.
+
+**What is pooled is keyed by credentials, not by clusters** — two kube-contexts aimed at one
+server as one user are one socket and one probe. Nothing in the vocabulary of a cluster record
+says so, which is why the package doc leads with it: do not read the location as one entry per
+cluster. The resolve belongs here rather than at the caller, so what a connection was built from
+and what it is stored under cannot disagree.
 
 ### The probe cache (`internal/clustersvc/internal/kubeidentity`)
 
@@ -474,9 +492,11 @@ Add a per-context memo invalidated on publish when a caller's cadence makes it s
 
 ## Kube connections (`internal/kubeconn`)
 
-**Nothing takes a connection from it yet.** The composition root builds it and drives its
-lifecycle, but no code path acquires a lease, and `clustersvc` does not hold it — what will
-dial a cluster's credentials is still to come.
+**Nothing builds this package.** No composition root constructs it and no code path acquires a
+lease; it is the worked-out pool, kept here to be drawn from as
+`internal/clustersvc/internal/kubeconn` fills in. A cluster is the only useful way to address a
+connection, so the pool a caller reaches belongs behind that boundary — see [ADR: connections are
+addressed by ClusterID](../docs/adr/2026-08-22-connections-addressed-by-cluster-id.md).
 
 **Credentials are the unit, not clusters.** One entry per credential *key* holds the connection
 and the probe that keeps it validated, so two kube-contexts aimed at one server as one user are

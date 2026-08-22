@@ -70,6 +70,7 @@ import (
 	beehivesqlite "github.com/amorey/beehive/sqlite"
 	"k8s.io/client-go/rest"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
@@ -394,9 +395,11 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	// The one thing here that names credentials: everything above it asks about a
-	// kube-context, and this is what turns one into the credentials a probe runs against.
+	// The two that name credentials: everything above them asks about a kube-context or a
+	// cluster, and these are what turn one into the credentials a probe dials and the key
+	// its answer is filed under.
 	kubeidentitySvc := kubeidentity.New(kubeconfigSvc)
+	kubeconnSvc := kubeconn.New(kubeconfigSvc)
 	d := newDeps(bh, kubeconfigSvc, kubeidentitySvc, pokeSvc)
 
 	controllers, err := registerControllers(bh, d)
@@ -409,6 +412,9 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 		// Ahead of beehive, so a pass never reads an identity cache that is not up yet,
 		// and so its workers stop only once the passes reading them have.
 		{Name: "kubeidentity", StartCloser: kubeidentitySvc},
+		// Ahead of beehive for the same reason: closing drops sockets, and a connection has
+		// to outlive every pass that could still be dialing on it.
+		{Name: "kubeconn", StartCloser: kubeconnSvc},
 		{Name: "beehive", StartCloser: beehiveRuntime{bh: bh, store: bhStore}},
 		clusterSourceBootstrap(d),
 	}

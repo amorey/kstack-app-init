@@ -89,19 +89,19 @@ type entry struct {
 
 // Service answers what is known about each context's server.
 type Service struct {
-	kubecfg kubeconfigService
-	hub     *conflate.Hub[string, struct{}]
+	kubecfgSvc kubeconfigService
+	hub        *conflate.Hub[string, struct{}]
 
 	mu    sync.Mutex
 	known map[string]entry
 }
 
 // New returns a Service over the one reader of the user's kubeconfig.
-func New(kubecfg kubeconfigService) *Service {
+func New(kubecfgSvc kubeconfigService) *Service {
 	return &Service{
-		kubecfg: kubecfg,
-		hub:     conflate.New[string, struct{}](),
-		known:   map[string]entry{},
+		kubecfgSvc: kubecfgSvc,
+		hub:        conflate.New[string, struct{}](),
+		known:      map[string]entry{},
 	}
 }
 
@@ -117,7 +117,7 @@ func New(kubecfg kubeconfigService) *Service {
 // is empty, so every context looks departed, and reporting that would record a live cluster as
 // gone.
 func (s *Service) Get(contextName string) (State, bool) {
-	_, key, err := s.kubecfg.RESTConfig(contextName)
+	_, key, err := s.kubecfgSvc.RESTConfig(contextName)
 	if err != nil {
 		if errors.Is(err, kubeconfig.ErrNotRead) {
 			return State{}, false
