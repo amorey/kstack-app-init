@@ -90,9 +90,9 @@ type Service struct {
 	// and each first probe may run a credential helper.
 	slots chan struct{}
 
-	// resultsHub wakes whoever is parked in Lease.Conn: a caller registers with the
-	// result it has just read, under the mutex, and hears only about newer ones. It
-	// carries results and stores none — the store is entry.result.
+	// resultsHub wakes whoever is parked in Lease.Conn: a caller registers under the
+	// mutex, having just read the current result, and hears the next one. It carries
+	// results and stores none — the store is entry.result.
 	resultsHub *watch.Hub[string, *Result]
 
 	// newsHub carries which credentials moved, for a reader that holds no claim. Separate
@@ -164,13 +164,10 @@ func New(budget Budget) *Service {
 		budget:     budget,
 		slots:      make(chan struct{}, budget.Concurrency),
 		resultsHub: watch.New[string, *Result](),
-		// The value is empty, so merging one into another says nothing; what this decides is
-		// the second return, and it must be true. False annihilates the slot, and a
-		// subscriber one behind would then hear about neither of the two probes that
-		// coalesced into it.
-		newsHub: conflate.New[string](func(_, next struct{}) (struct{}, bool) {
-			return next, true
-		}),
+		// Latest-wins, the default: the value is empty, so two probes coalescing must leave
+		// the slot pending. A merge that annihilated it would leave a subscriber one behind
+		// hearing about neither.
+		newsHub:   conflate.New[string, struct{}](),
 		ctx:       ctx,
 		stopLoops: stopLoops,
 		probe:     Probe,

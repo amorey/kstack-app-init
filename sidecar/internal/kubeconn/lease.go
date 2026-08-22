@@ -145,15 +145,15 @@ func (l *lease) Release() {
 // claim already has the loop probing, on the backoff ladder while the cluster is down,
 // and kicking per call would flatten it.
 func (l *lease) Conn(ctx context.Context) (*Connection, error) {
-	// Read and register in one critical section, with the result just read as the
-	// receiver's baseline: a probe landing in between is then delivered rather than
-	// missed. watch.Watch calls no caller code, which is what makes it safe here.
+	// Read and register in one critical section, so a probe landing in between is
+	// delivered rather than missed. watch.Watch calls no caller code, which is what
+	// makes it safe here.
 	s := l.svc
 	s.mu.Lock()
 	res := l.e.result
 	var next *watch.Receiver[string, *Result]
 	if res == nil || res.Failed() {
-		next = s.resultsHub.Watch(l.key, res)
+		next = s.resultsHub.Watch(l.key)
 	}
 	s.mu.Unlock()
 

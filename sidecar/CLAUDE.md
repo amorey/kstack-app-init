@@ -547,8 +547,8 @@ Nothing dials or probes until something asks. `lease.go` is what a caller asks a
   semaphore (`Budget.Concurrency`, which stops a first install running a credential helper per
   cluster in the same second).
 - **`Conn` reads and registers in one critical section.** Results ride a **`gobus/watch` hub keyed
-  by credential key**, and the receiver's baseline is the result just read — so a probe landing
-  between the read and the registration is delivered rather than missed. `watch.Watch` calls no
+  by credential key**, so a probe landing between the read and the registration is delivered
+  rather than missed. `watch.Watch` calls no
   caller code, which is what makes registering under the service's own mutex legal. The **wake**
   (`entry.wake`) stays a 1-buffered channel: a single-consumer, coalescing "run again", not state to
   distribute.
@@ -578,7 +578,7 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
 ## Patterns
 
 - **Resolver deps are always non-nil** — the composition root wires every field; tests use fakes.
-- **Pub/sub**: two modules, split on whether delivery is **keyed**. Unkeyed → `github.com/amorey/gochan`: `watch` for latest-value current-state streams (current snapshot on subscribe: auth `State`), `broadcast` for fan-out where subscribers supply their own snapshot (poke). Keyed → `github.com/amorey/gobus`: `watch` for a keyed latest-value bus. Note the two `watch` packages differ on registration — gochan's hub holds a seed and delivers it, gobus's takes the caller's already-read value as a baseline and never delivers it back. Never hand-roll a subscriber map.
+- **Pub/sub**: two modules, split on whether delivery is **keyed**. Unkeyed → `github.com/amorey/gochan`: `watch` for latest-value current-state streams (current snapshot on subscribe: auth `State`), `broadcast` for fan-out where subscribers supply their own snapshot (poke). Keyed → `github.com/amorey/gobus`: `watch` for a keyed latest-value bus. Note the two `watch` packages differ on registration — gochan's hub holds a seed and delivers it, gobus's delivers nothing until the next send (a subscriber that has already read the current value can pass it as a baseline, which is measured against and never delivered back). Never hand-roll a subscriber map.
 - **Subscription resolvers** return a channel emitting the current snapshot first, then deltas (`mapStream` in `graph/util.go`). Honor `ctx.Done()`. A resolver over a `*clustersvc.Stream` goes through **`watchStream`** (`graph/watch_failure.go`), never `ptrStream` — see below.
 - **Unexported functional options** for test seams (`auth`/`cloud`/`prefsync`/`poke`): exported `New` takes production knobs only; `newWithOptions(cfg, opts...)` is reachable only from white-box tests.
 

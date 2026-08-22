@@ -100,10 +100,8 @@ type Service struct {
 func New(kubecfg kubeconfigService) *Service {
 	return &Service{
 		kubecfg: kubecfg,
-		// Nothing to merge: two signals for one context say the same thing, which is that Get
-		// is worth re-reading.
-		hub:   conflate.New[string](func(_, next struct{}) (struct{}, bool) { return next, true }),
-		known: map[string]entry{},
+		hub:     conflate.New[string, struct{}](),
+		known:   map[string]entry{},
 	}
 }
 
