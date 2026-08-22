@@ -205,10 +205,15 @@ resolver tests' fake. The layering exception is in `service.go`'s package doc.
 **A connection is scoped to one `Identity`**, so any of its three fields moving — server, version,
 user — retires it and builds another, and the field is stable for the connection's life. Comparing
 is the holder's (`Identity` is comparable); the pool's key is credentials, which do not move when a
-cluster is rebuilt behind them. Two traps: `UIDErr` sits on `Result`, not `Identity`, because it
-says what the probe could *read* and it flaps under a grant and revoke; and a username change is
-**not** an RBAC change — ordinary edits leave it identical, so permissions need the
-`SelfSubjectRulesReview` behind `ClusterPermissions`.
+cluster is rebuilt behind them. Two traps: neither `UIDErr` nor `ReadyErr` belongs on `Identity` —
+both flap over one identity, and retiring the connection for a readiness blip would drop every
+socket; and a username change is **not** an RBAC change, since ordinary edits leave it identical,
+so permissions need the `SelfSubjectRulesReview` behind `ClusterPermissions`.
+
+**One probe answers both `Cluster` conditions.** `Result.Err` is whether the server answered at
+all (`Connected`); `Result.ReadyErr` is what `/readyz` said (`Healthy`), so readiness is
+`Err == nil && ReadyErr == nil`. Keeping them apart is what lets a reachable-but-unready server
+report as such instead of as a connection failure; `Inactive` is the boundary's, off the record.
 
 **Everything a holder learns comes through its `Lease`** — `Conn`, `State()`, `WatchState()` — so
 the pool needs no index from a credential key back out to the contexts sharing it. `WatchState` is

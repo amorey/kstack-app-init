@@ -65,8 +65,12 @@ type Identity struct {
 	Username      string
 }
 
-// Result is one probe's outcome. It names no credentials of its own: it is stored under the
-// key it ran against, so a rotation cannot be told the wrong cluster's news.
+// Result is one probe's outcome — which server answered, whether it is serving, and what could
+// not be read. It names no credentials of its own: it is stored under the key it ran against, so
+// a rotation cannot be told the wrong cluster's news.
+//
+// Reaching the server and the server being ready are separate answers, which is what lets the
+// boundary report Connected and Healthy apart.
 type Result struct {
 	Identity Identity
 	// UIDErr is why Identity.ServerUID is empty, when a response came back saying so. An error
@@ -74,6 +78,14 @@ type Result struct {
 	// different news. Here rather than on Identity: it flaps under a grant and revoke, and what
 	// a probe could read is not who answered.
 	UIDErr error
+	// ReadyErr is why /readyz did not say the server is serving. Nil on a probe that reached
+	// the server and got an ok, so readiness is Err == nil && ReadyErr == nil — a probe that
+	// failed outright learned nothing about it.
+	//
+	// Readiness is the far end's, not the connection's, which is why it is not on Identity: a
+	// server flaps ready and back many times over one identity, and retiring the connection
+	// for it would drop every socket each time.
+	ReadyErr error
 	// Err is why the server would not answer at all. A single refused request leaves its
 	// Identity field empty instead — the probe reached the API server, which is the thing
 	// being probed.
