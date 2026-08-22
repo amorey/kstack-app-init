@@ -25,9 +25,11 @@
 // under internal/ — private to this package by compiler rule. The leaves speak native
 // vocabulary (GVRs, a rest.Config, cache rows) and never the records above; the
 // controllers translate. A leaf that reaches for one of these types gets an import
-// cycle, which is the enforcement. Mechanism growing in a controller instead is the
-// signal to extract another leaf: this package's tests stay fast only while the
-// controllers do no I/O of their own.
+// cycle, which is the enforcement. The connection surface is the exception: it reads no
+// beehive object, so its types alias straight through and the leaf's exported shape is
+// the boundary's. Mechanism growing in a controller instead is the signal to extract
+// another leaf: this package's tests stay fast only while the controllers do no I/O of
+// their own.
 //
 // The beehive kinds and their ownership chain:
 //
@@ -68,7 +70,6 @@ import (
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
-	"k8s.io/client-go/rest"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
@@ -100,8 +101,13 @@ type Service interface {
 	CachedResources() CachedResources
 	CachedData() CachedData
 
-	// GetConnection returns the live REST config for id, or nil when not connected.
-	GetConnection(id ClusterID) *rest.Config
+	// AcquireConnection claims id's connection and arms its probe cadence. It does not
+	// dial — Lease.Conn waits — so a caller may hold a claim across a cluster being
+	// down without a retry loop of its own. Release the claim.
+	//
+	// Where the record gates a dial: an id naming nothing, a disabled cluster, and one
+	// awaiting deletion are refused here rather than handed a connection.
+	AcquireConnection(ctx context.Context, id ClusterID) (Lease, error)
 	// RetryConnection forces an out-of-band re-probe. The outcome lands on the
 	// record's conditions and reaches watchers through Clusters().Watch, not here.
 	RetryConnection(ctx context.Context, id ClusterID) error
@@ -118,6 +124,20 @@ type Service interface {
 	ListEvents(ctx context.Context, id ObjectID, category *string, limit *int) ([]Event, error)
 	WatchEvents(ctx context.Context, id ObjectID, category *string) (*Stream[EventWatchFrame], error)
 }
+
+// The connection vocabulary is the leaf's, aliased rather than copied: a connection is native
+// vocabulary all the way down, so there is nothing here to translate. Aliases and not plain
+// return types because an internal package's type cannot be named by the packages implementing
+// this interface — the resolver tests' fake among them. The Conn prefix belongs to this level,
+// where a bare State or Identity would read as a record's.
+type (
+	Lease                 = kubeconn.Lease
+	Connection            = kubeconn.Connection
+	ConnIdentity          = kubeconn.Identity
+	ConnProbe             = kubeconn.Result
+	ConnState             = kubeconn.State
+	ConnStateSubscription = kubeconn.StateSubscription
+)
 
 // The five families are specified together, apart from the kinds implementing them,
 // because their rules are rules ACROSS the set: VerbNoun with the noun elided when it
@@ -504,7 +524,7 @@ func (s *service) Close() error {
 	return lifecycle.CloseAll(s.parts)
 }
 
-func (s *service) GetConnection(id ClusterID) *rest.Config {
+func (s *service) AcquireConnection(ctx context.Context, id ClusterID) (Lease, error) {
 	panic("not implemented")
 }
 

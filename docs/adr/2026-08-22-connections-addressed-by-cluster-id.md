@@ -43,6 +43,31 @@ on it. The composition root no longer knows the pool exists.
 The pool still keys on credentials, not on clusters: two kube-contexts aimed at one server as one
 user are one socket and one probe. Only the *address a caller uses* is a cluster.
 
+`Service.AcquireConnection(ctx, id)` returns a `Lease`; `Lease.Conn` a `*Connection`. Both are the
+leaf's types, re-exported as **aliases** — a connection is native vocabulary all the way down
+(`rest.Config`, `dynamic.Interface`, `http.Client`), so a boundary struct would be a field-for-field
+copy that drifts, and a plain `internal/` return type could not be *named* by the resolver tests'
+fake implementing `Service`.
+
+A connection is scoped to one **identity** — `{ServerUID, ServerVersion, Username}`, comparable by
+value — so a probe reading a different one retires it and builds another, exactly as moved
+credentials do under a new key. All three retire: a version change invalidates what was discovered
+against the old one, and a username change means a different principal. That matches the rest of
+the system, where `ClusterCache` is named `{ClusterID}/{serverUID}` and a UID change is a cache
+migration. `UIDErr` stays on `Result` instead — it reports what the probe could read rather than
+who answered, it flaps as a kube-system grant comes and goes, and keeping it off `Identity` is what
+keeps the comparison a `==`. Comparing is the caller's, since the pool keys on credentials, which
+do not move when a cluster is rebuilt behind them; and a long-lived stream cannot see a field it is
+not re-reading, so a retired connection closes `Connection.Done()`.
+
+Everything a holder learns comes through its `Lease` — `Conn`, `State`, `WatchState` — which is
+what removes the index from a credential key back out to the contexts resolving to it: signalling
+every claim on an entry is the whole fan-out. `WatchState` returns a `gobus/watch` receiver of
+`State`, current on attach, over the hub `Conn` already parks on. One hub rather than a value hub
+beside a ping bus, and current-on-attach removes the attach-before-read ordering a ping leaves each
+watcher to remember. Its values are levels: the hub keeps the latest, so a reader that falls behind
+skips what came between.
+
 `internal/kubeconn` stays in the tree, built by nothing, as the worked-out implementation the new
 package draws from as it fills in.
 
@@ -69,11 +94,20 @@ key exists to remove.
 The composition root gets smaller and the pool's lifecycle is enforced by position in
 `clustersvc`'s slice rather than by a comment in `app.go`.
 
-`kubeconn` and `kubeidentity` become siblings, which exposes how much they overlap:
-`kubeconn.Identity` is `kubeidentity.Identity` plus `UIDErr`, and both carry a `State` and a
-conflate-keyed `Subscribe` differing only in key — credentials versus context name.
-`kubeidentity`'s probe is unwritten, so the two are likely to collapse into one package with two
+`kubeconn` and `kubeidentity` become siblings, which exposes how much they overlap: the two
+`Identity` types are now the same three comparable fields, both pair a `State` read with a feed of
+it, and `kubeidentity`'s central mechanism — storing the credential key beside each answer so a
+stored identity is refutable — is what credential-keying gives `kubeconn` for free. Its probe is
+unwritten and `kubeconn`'s is not, so the two are likely to collapse into one package with two
 views rather than staying separate.
+
+Two limits this leaves. Permission changes are **not** connection events: an ordinary RBAC edit
+leaves `Username` identical, so surfacing them needs the `SelfSubjectRulesReview` already planned
+for `ClusterPermissions` and a digest to diff. And nothing counts transitions off `WatchState` —
+flaps and history come from the record's conditions and event timeline.
+
+Waking a beehive pass per cluster becomes a goroutine per claim rather than one reader over a
+fleet-wide bus.
 
 The obligation the new location creates: the pool's unit is credentials, shared *across* clusters,
 and nothing in the vocabulary of a cluster record says so. The package doc has to lead with it, or

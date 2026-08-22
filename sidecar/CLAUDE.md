@@ -194,8 +194,29 @@ ClusterID](../docs/adr/2026-08-22-connections-addressed-by-cluster-id.md).
 
 **Nothing dials yet.** `clustersvc.New` builds it and carries it as a `lifecycle.Part` ahead of
 beehive — closing drops sockets, so a connection has to outlive every pass that could still be
-dialing on it. The pool, the leases, and the probe are what land next, drawn from the worked-out
-`internal/kubeconn`.
+dialing on it. `Acquire` panics; the pool and the probe behind it land next, drawn from the
+worked-out `internal/kubeconn`.
+
+**The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
+`Connection`, `ConnIdentity`, `ConnProbe`, `ConnState`, `ConnStateSubscription`. Aliases because an
+`internal/` type cannot be *named* outside, which would leave `Service` unimplementable by the
+resolver tests' fake. The layering exception is in `service.go`'s package doc.
+
+**A connection is scoped to one `Identity`**, so any of its three fields moving — server, version,
+user — retires it and builds another, and the field is stable for the connection's life. Comparing
+is the holder's (`Identity` is comparable); the pool's key is credentials, which do not move when a
+cluster is rebuilt behind them. Two traps: `UIDErr` sits on `Result`, not `Identity`, because it
+says what the probe could *read* and it flaps under a grant and revoke; and a username change is
+**not** an RBAC change — ordinary edits leave it identical, so permissions need the
+`SelfSubjectRulesReview` behind `ClusterPermissions`.
+
+**Everything a holder learns comes through its `Lease`** — `Conn`, `State()`, `WatchState()` — so
+the pool needs no index from a credential key back out to the contexts sharing it. `WatchState` is
+a `gobus/watch` receiver current on attach, over the hub `Conn` parks on: one mechanism, and no
+attach-before-read ordering left to each watcher. **Every value is a level, never an edge** — the
+hub keeps the latest, so a reader that falls behind skips what came between, and transitions come
+from the record's conditions and event timeline. A long-lived reader cannot see a field it is not
+re-reading, so a retired connection closes `Connection.Done()` — retirement, not the replacement.
 
 **What is pooled is keyed by credentials, not by clusters** — two kube-contexts aimed at one
 server as one user are one socket and one probe. Nothing in the vocabulary of a cluster record
@@ -365,8 +386,8 @@ Rebuilding a family means replacing the panics in that family's file. Keep the m
 when you do: **VerbNoun with the noun elided when it equals the family's subject**, so
 `Caches().WatchList()` watches caches and `Caches().WatchStats()` streams one cache's stats.
 **A family owns a read only when the read differs per record type.**
-`RetryConnection`/`GetConnection` stay top-level (they answer about a connection, not a record), and
-so do `ListEvents`/`WatchEvents`: an event carries no kind, every id is the same `ObjectID`, and only
+`RetryConnection`/`AcquireConnection` stay top-level (they answer about a connection, not a
+record), and so do `ListEvents`/`WatchEvents`: an event carries no kind, every id is the same `ObjectID`, and only
 three of the five families have a timeline at all — scoping them would be three copies of one method
 plus an unanswerable question about the other two. Every family is asserted separately
 (`var _ Caches = cachesAPI{}`), in the resolver tests' fake too: satisfying `Service` only proves the

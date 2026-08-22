@@ -187,7 +187,7 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 		"CachedData().WatchKinds":        func() { svc.CachedData().WatchKinds(ctx, id, id) },
 		"CachedData().WatchObjects":      func() { svc.CachedData().WatchObjects(ctx, id, id, "v1", "pods") },
 		"CachedData().WatchEvents":       func() { svc.CachedData().WatchEvents(ctx, id, id) },
-		"GetConnection":                  func() { svc.GetConnection(id) },
+		"AcquireConnection":              func() { svc.AcquireConnection(ctx, id) },
 		"RetryConnection":                func() { svc.RetryConnection(ctx, id) },
 		"ListEvents":                     func() { svc.ListEvents(ctx, id, nil, nil) },
 		"WatchEvents":                    func() { svc.WatchEvents(ctx, id, nil) },

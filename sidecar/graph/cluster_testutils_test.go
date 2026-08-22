@@ -14,8 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/client-go/rest"
-
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
@@ -689,7 +687,9 @@ func (f fakeClusters) Delete(_ context.Context, id clustersvc.ClusterID) error {
 	return nil
 }
 
-func (f *fakeClusterService) GetConnection(clustersvc.ClusterID) *rest.Config { return nil }
+func (f *fakeClusterService) AcquireConnection(context.Context, clustersvc.ClusterID) (clustersvc.Lease, error) {
+	return nil, nil
+}
 
 // clusterFixtures returns two records: one fully-probed/present (1) and
 // one never-probed/orphaned (2), so nullable fields exercise both arms.
