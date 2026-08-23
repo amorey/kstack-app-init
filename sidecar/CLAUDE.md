@@ -249,8 +249,27 @@ ClusterID](../docs/adr/2026-08-22-connections-addressed-by-cluster-id.md).
 
 **Nothing dials yet.** `clustersvc.New` builds it and carries it as a `lifecycle.Part` ahead of
 beehive — closing drops sockets, so a connection has to outlive every pass that could still be
-dialing on it. `Acquire` panics; the pool and the probe behind it land next, drawn from the
-worked-out `internal/kubeconn`.
+dialing on it. `Acquire` resolves and hands back a claim nothing probes; the pool and the probe
+behind it land next, drawn from the worked-out `internal/kubeconn`.
+
+**A claim is on the context, not on the key it resolved to.** Credentials move under a context
+that never does, so the pool subscribes to the kubeconfig itself (`Start` → `rekey`) and points
+each claim at the entry its context resolves to *now*; an entry nothing claims stops probing and
+its connection retires. **The signal, not the probe cycle** — a claim on a down cluster is deep in
+the backoff ladder, so a user who just fixed their kubeconfig would otherwise wait it out, and
+landing on a different entry starts a fresh ladder. The config is the signal and never the source:
+re-resolving goes back through `RESTConfig`, which is the only thing that computes a key. One call
+is one snapshot; resolving a context twice can key one snapshot's proxy URL onto another's
+credentials, so a re-key reads each context once and lets the next signal fix a straggler.
+
+**`ErrNotRead` is not a refusal.** The pre-read config is empty, so every context looks departed —
+`Acquire` takes the claim anyway, or every record would report `ResolveFailed` for as long as the
+first read takes. A context that genuinely will not resolve is still refused with the reader's own
+error.
+
+The kubeconfig trigger reads this same feed independently, so a pass can run before the pool has
+re-keyed and read the old entry. It converges: the re-key publishes on the pool's bus and wakes the
+record again.
 
 **The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
 `Connection`, `ConnIdentity`, `ConnState`, `ConnStateSubscription`. Aliases because an

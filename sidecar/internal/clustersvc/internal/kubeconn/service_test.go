@@ -15,13 +15,41 @@
 package kubeconn
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/amorey/gochan/watch"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd/api"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
 var runAt = time.Date(2026, 8, 23, 10, 5, 0, 0, time.UTC)
+
+// fakeKubeconfig resolves one context to a fixed answer, standing in for the user's file.
+type fakeKubeconfig struct {
+	key string
+	err error
+	hub *watch.Hub[*api.Config]
+}
+
+func (f *fakeKubeconfig) RESTConfig(string) (*rest.Config, string, error) {
+	if f.err != nil {
+		return nil, "", f.err
+	}
+	return &rest.Config{Host: "https://prod.example:6443"}, f.key, nil
+}
+
+func (f *fakeKubeconfig) Subscribe() kubeconfig.Subscription {
+	if f.hub == nil {
+		f.hub = watch.New[*api.Config](nil)
+	}
+	return f.hub.Receiver()
+}
 
 // A check the prober records without dispatching has no duration: subtracting a zero
 // StartedAt would report the time since the zero year.
@@ -85,4 +113,40 @@ func TestIdentityLeavesAnUnreadPartEmpty(t *testing.T) {
 		ServerUID: Observation[string]{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonUnsupported}},
 		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
 	}.Identity(), "why the UID is missing is the observation's, not the identity's")
+}
+
+// The pre-read kubeconfig is empty, so every context looks departed. Refusing the claim
+// would report a live cluster's credentials broken for as long as the first read takes.
+func TestAcquireClaimsAContextTheKubeconfigHasNotReadYet(t *testing.T) {
+	s := New(&fakeKubeconfig{err: kubeconfig.ErrNotRead})
+
+	lease, err := s.Acquire("prod")
+
+	require.NoError(t, err)
+	assert.NotNil(t, lease)
+}
+
+// A context the file genuinely does not resolve is refused with the reader's own error,
+// rather than becoming a claim on credentials nobody could build.
+func TestAcquireRefusesAContextThatWillNotResolve(t *testing.T) {
+	boom := errors.New("no such certificate authority file")
+	s := New(&fakeKubeconfig{err: boom})
+
+	_, err := s.Acquire("prod")
+
+	assert.ErrorIs(t, err, boom)
+}
+
+// The subscription is established before Start returns, so a config sent straight after it
+// is read rather than dropped, and stop joins the loop instead of leaving it running.
+func TestStartWatchesTheKubeconfigUntilStopped(t *testing.T) {
+	cfg := &fakeKubeconfig{key: "key-1"}
+	s := New(cfg)
+
+	stop, err := s.Start(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, cfg.hub, "Start subscribes before it returns")
+	cfg.hub.Sender().Send(&api.Config{})
+
+	require.NoError(t, stop(t.Context()))
 }

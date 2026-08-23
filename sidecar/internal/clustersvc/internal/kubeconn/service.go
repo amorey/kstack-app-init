@@ -39,20 +39,31 @@ package kubeconn
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gobus/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
-// kubeconfigService resolves one context to credentials and the key naming them. The key
-// excludes the context name, so two contexts aimed at one server as one user share an entry.
+// kubeconfigService resolves one context to credentials and the key naming them, and reports
+// when the file behind them changed. The key excludes the context name, so two contexts aimed
+// at one server as one user share an entry.
+//
+// One RESTConfig call is one snapshot. Resolving a context twice can key one snapshot's proxy
+// URL onto another's credentials, so a re-key reads each context once and lets the next signal
+// correct a straggler.
 type kubeconfigService interface {
 	RESTConfig(contextName string) (*rest.Config, string, error)
+	Subscribe() kubeconfig.Subscription
 }
 
 // Reason classifies the most recent attempt at one check. Ours, in the style of a Kubernetes
@@ -386,6 +397,8 @@ func (c *Connection) Done() <-chan struct{} { return c.done }
 type Service struct {
 	kubecfgSvc kubeconfigService
 	hub        *conflate.Hub[string, struct{}]
+
+	wg sync.WaitGroup
 }
 
 // New returns a Service over the one reader of the user's kubeconfig.
@@ -414,12 +427,31 @@ func (s *Service) Subscribe() Subscription { return s.hub.Receiver() }
 // A claim is on the context, not on the key it resolved to. Credentials rotate under a context
 // that never moves, so a claim pinned to one key would report the server it used to reach for
 // as long as it is held — re-resolving is this package's, since it is the one that resolves.
+//
+// A kubeconfig that has not been read yet is not a refusal: the pre-read config is empty, so
+// every context looks departed, and refusing would report a live cluster's credentials broken.
+// The claim is taken and resolves when the file lands.
 func (s *Service) Acquire(contextName string) (Lease, error) {
-	if _, _, err := s.kubecfgSvc.RESTConfig(contextName); err != nil {
+	if _, _, err := s.kubecfgSvc.RESTConfig(contextName); err != nil && !errors.Is(err, kubeconfig.ErrNotRead) {
 		return nil, err
 	}
 	return pendingLease{}, nil
 }
+
+// rekey points every claim at the entry for the credentials its context resolves to now, and
+// is what makes a claim outlive the credentials it was taken against. A claim whose key moved
+// leaves its old entry; an entry nothing claims stops probing, and the connection it built
+// retires so a stream on it learns rather than reading from a server the caller no longer means.
+//
+// The signal and not the probe cycle, because a claim on a down cluster is deep in the backoff
+// ladder: a user who just fixed their kubeconfig would otherwise wait it out, which is the one
+// moment they want the retry now. Landing on a different entry starts a fresh ladder.
+//
+// The config is the signal, never the source: resolving goes back through RESTConfig, which
+// is what computes a key at all.
+//
+// Nothing is keyed yet, so there is nothing to move.
+func (s *Service) rekey() {}
 
 // pendingLease is a claim on credentials nothing probes yet: it reports nothing known, which is
 // what a claim whose first probe is still owed reports once there is one.
@@ -434,10 +466,40 @@ func (pendingLease) WatchState() StateSubscription { return nil }
 
 func (pendingLease) Release() {}
 
-// Start is the lifecycle shape this wears for the cluster service. Nothing runs in the
-// background, so its stop func has nothing to end.
+// Start watches the kubeconfig until stopped, re-keying claims as the file moves under them.
+// The subscription is established before Start returns, so a config already read is applied
+// once rather than waited for.
 func (s *Service) Start(context.Context) (func(context.Context) error, error) {
-	return func(context.Context) error { return nil }, nil
+	// Not Start's context, which bounds startup: this one bounds the loop, so it lives until
+	// the stop func cancels it.
+	loopCtx, stopLoop := context.WithCancel(context.Background())
+
+	sub := s.kubecfgSvc.Subscribe()
+	s.wg.Go(func() {
+		defer sub.Close()
+		s.watchKubeconfig(loopCtx, sub)
+	})
+
+	return func(ctx context.Context) error {
+		stopLoop()
+		return drain.WithContext(ctx, s.wg.Wait)
+	}, nil
+}
+
+// watchKubeconfig re-keys on every config until stopped. Cancellation ends the wait: the
+// service behind the feed is the app's and is not required to close its channel when released.
+func (s *Service) watchKubeconfig(ctx context.Context, sub kubeconfig.Subscription) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-sub.Chan():
+			if !ok {
+				return
+			}
+			s.rekey()
+		}
+	}
 }
 
 // Close releases the pool. Nothing is held yet.
