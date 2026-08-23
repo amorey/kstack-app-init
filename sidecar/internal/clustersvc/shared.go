@@ -67,7 +67,7 @@ type kubeconfigService interface {
 // claims its connection, which is also what arms the probe behind it; a claim outlives
 // the pass that took it, so the caller holds and releases rather than asking per pass.
 type kubeconnService interface {
-	Acquire(contextName string) (kubeconn.Lease, error)
+	Acquire(contextName string) kubeconn.Lease
 	Subscribe() kubeconn.Subscription
 }
 
@@ -250,9 +250,6 @@ const (
 	ReasonConnecting = "Connecting"
 	// ReasonConnected: the last connection probe succeeded.
 	ReasonConnected = "Connected"
-	// ReasonResolveFailed: credentials could not be resolved from the
-	// record's source (e.g. the kube-context vanished from the kubeconfig).
-	ReasonResolveFailed = "ResolveFailed"
 	// ReasonProbeFailed: credentials resolved but the dial/identity probe
 	// failed.
 	ReasonProbeFailed = "ProbeFailed"

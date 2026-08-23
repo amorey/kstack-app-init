@@ -31,7 +31,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -478,23 +477,20 @@ type clusterLeases struct {
 }
 
 // ensureLease returns the cluster's claim, taking one if it has none.
-func (c *clusterController) ensureLease(id ClusterID, contextName string) (kubeconn.Lease, error) {
+func (c *clusterController) ensureLease(id ClusterID, contextName string) kubeconn.Lease {
 	c.leases.mu.Lock()
 	defer c.leases.mu.Unlock()
 
 	if held, ok := c.leases.held[id]; ok {
-		return held, nil
+		return held
 	}
 
-	lease, err := c.kubeconnSvc.Acquire(contextName)
-	if err != nil {
-		return nil, err
-	}
+	lease := c.kubeconnSvc.Acquire(contextName)
 	if c.leases.held == nil {
 		c.leases.held = map[ClusterID]kubeconn.Lease{}
 	}
 	c.leases.held[id] = lease
-	return lease, nil
+	return lease
 }
 
 // dropLease releases the cluster's claim, if it holds one. Idempotent: a pass that finds a
@@ -637,24 +633,11 @@ func (c *clusterController) reconcileConnection(obj *beehive.Object[ClusterSpec,
 		return &connectionFinding{inactive: true, reason: ReasonInactive, message: "cluster is disabled"}
 	}
 
-	// The claim is what arms the probe behind this context. Held across passes, so
-	// ensuring it is all a pass does; what the probe found is read off it below.
-	lease, err := c.ensureLease(id, src.Context)
-	if errors.Is(err, kubeconfig.ErrContextNotFound) {
-		// The context left the file. Told apart from a probe that failed because they are
-		// different news: this one the user did on purpose, and there is nothing to
-		// connect to until they undo it.
-		return &connectionFinding{inactive: true, reason: ReasonInactive,
-			message: "kube-context is no longer in the kubeconfig"}
-	}
-	if err != nil {
-		// The context is there and its entries do not resolve — a file the user has to fix,
-		// which beehive's backoff cannot. Reported on the record rather than failing the
-		// pass, and left to this kind's cadence to retry.
-		return &connectionFinding{reason: ReasonResolveFailed, message: err.Error()}
-	}
-
-	observed := lease.State()
+	// The claim is what arms the probe behind this context. Held across passes, so ensuring
+	// it is all a pass does; what the probe found is read off it below. Claiming cannot fail:
+	// whether the context resolves, and to what, is the pool's to find out and report through
+	// State rather than a reason to refuse.
+	observed := c.ensureLease(id, src.Context).State()
 	finding := &connectionFinding{observed: &observed}
 	switch observed.Phase() {
 	case kubeconn.PhasePending:

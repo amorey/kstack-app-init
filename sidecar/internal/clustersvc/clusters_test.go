@@ -286,37 +286,6 @@ func TestReconcileReleasesTheClaimWhenTheSourceStopsNamingIt(t *testing.T) {
 	assert.Equal(t, []string{"prod"}, svc.released)
 }
 
-// A context the user removed is not a broken one: there is nothing to connect to until
-// they put it back, which reads differently from a cluster that would not answer.
-func TestReconcileReportsInactiveForADepartedContext(t *testing.T) {
-	c := identityControllerOver(t, refusing(
-		fmt.Errorf("%w: %q", kubeconfig.ErrContextNotFound, "prod")))
-	obj := createCluster(t, c.clusterClient, "prod")
-
-	client := &stubControllerClient{}
-	reconcileCluster(t, c, client, obj)
-
-	cond := reportedCondition(t, client)
-	assert.Equal(t, ConditionFalse, cond.Status)
-	assert.Equal(t, ReasonInactive, cond.Reason)
-}
-
-// The context is there and its entries do not resolve — a file the user has to fix. The
-// record reports it rather than failing the pass, and carries what went wrong.
-func TestReconcileReportsAFailedResolve(t *testing.T) {
-	c := identityControllerOver(t, refusing(errors.New("no such certificate authority file")))
-	obj := createCluster(t, c.clusterClient, "prod")
-
-	client := &stubControllerClient{}
-	reconcileCluster(t, c, client, obj)
-
-	cond := reportedCondition(t, client)
-	assert.Equal(t, ConditionFalse, cond.Status)
-	assert.Equal(t, ReasonResolveFailed, cond.Reason)
-	assert.Contains(t, cond.Message, "certificate authority")
-	assert.Nil(t, client.updated.Server.UID, "a failed probe improves on nothing")
-}
-
 // The read asks for the probe and returns whatever is known, which on the first pass is
 // nothing. Neither connected nor failed, and the signal the probe publishes is what
 // brings this record back.

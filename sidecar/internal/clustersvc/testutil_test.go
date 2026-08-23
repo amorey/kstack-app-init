@@ -70,22 +70,16 @@ type fakeKubeconn struct {
 	states map[string]kubeconn.State
 	// hub is the fleet feed, keyed by context the way the pool keys it. Built on demand so
 	// the zero value stays usable.
-	once sync.Once
-	hub  *conflate.Hub[string, struct{}]
-	// refuse is what Acquire returns for a context, standing in for a kubeconfig that
-	// cannot resolve it.
-	refuse map[string]error
-	asked  []string
+	once  sync.Once
+	hub   *conflate.Hub[string, struct{}]
+	asked []string
 
 	released []string
 }
 
-func (f *fakeKubeconn) Acquire(contextName string) (kubeconn.Lease, error) {
+func (f *fakeKubeconn) Acquire(contextName string) kubeconn.Lease {
 	f.asked = append(f.asked, contextName)
-	if err := f.refuse[contextName]; err != nil {
-		return nil, err
-	}
-	return &fakeLease{svc: f, contextName: contextName, state: f.states[contextName]}, nil
+	return &fakeLease{svc: f, contextName: contextName, state: f.states[contextName]}
 }
 
 // Subscribe is the fleet feed the trigger reads. publish is the probe landing on it.
@@ -181,12 +175,6 @@ func finished(reason kubeconn.Reason, msg string) kubeconn.Attempt {
 // knowing is a pool whose "prod" claim holds exactly this state.
 func knowing(state kubeconn.State) *fakeKubeconn {
 	return &fakeKubeconn{states: map[string]kubeconn.State{"prod": state}}
-}
-
-// refusing is a pool that will not claim "prod", standing in for a context the kubeconfig
-// cannot resolve.
-func refusing(err error) *fakeKubeconn {
-	return &fakeKubeconn{refuse: map[string]error{"prod": err}}
 }
 
 // newTestDepsAndBeehive is newTestDeps plus the beehive behind it, for a test that has

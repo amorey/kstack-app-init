@@ -351,9 +351,13 @@ off `Connection` (the trap it exists for — no attempt yet is not an attempt th
 stay above: condition types, reasons, and `Inactive` are the record's vocabulary, not the pool's.
 
 **Everything a holder learns comes through its `Lease`** — `Conn`, `State()`, `WatchState()` — so
-the pool signals per context and never asks a holder to know the fingerprint behind it. `WatchState` is
-a `gobus/watch` receiver current on attach, over the hub `Conn` parks on: one mechanism, and no
-attach-before-read ordering left to each watcher. **Every value is a level, never an edge** — the
+the pool signals per context and never asks a holder to know the fingerprint behind it.
+`WatchState` is a `gobus/watch` receiver over the hub `Conn` parks on, so a watcher and a parked
+caller cannot disagree. **It delivers nothing on attach** — gobus's baseline is a comparison
+value, not a delivery — so a watcher pairs it with `State()` for what is known now. Reading and
+registering under one lock (`Hub.WithBaseline`, which needs an `Accept` to mean anything) is what
+closes the gap between the two, and is worth having once a probe can land at all. **Every value is
+a level, never an edge** — the
 hub keeps the latest, so a reader that falls behind skips what came between, and transitions come
 from the record's conditions and event timeline. A long-lived reader cannot see a field it is not
 re-reading, so a retired connection closes `Connection.Done()` — retirement, not the replacement.
@@ -368,7 +372,11 @@ The fingerprint stays in the entry, not in the key. It is `kubeconfig`'s hash of
 resolved `rest.Config` — server, TLS, auth, proxy, impersonation, the full exec block — and
 comparing it is how `rekey` tells a rotation from a kubeconfig write that changed nothing:
 unchanged keeps the connection and its ladder, changed builds a new one and **forgets the old
-`State`**, since the server behind new credentials has yet to say anything. Empty means the
+`State`**, since the server behind new credentials has yet to say anything. **A rebuild or a drop
+is announced, an unchanged resolve is not** — `publish` sends the new state on `stateHub` and then
+pokes `signalHub`, in that order so a reader the poke wakes finds the value that replaced the old
+one. Without the "moved" check every kubeconfig save would wake every cluster in the fleet, and a
+departed context would be re-announced for as long as its claim is held. Empty means the
 context does not resolve — the pre-read kubeconfig, or one the user deleted — and a claim on it
 reads as nothing known. The resolve belongs here rather than at the caller, so what a connection
 was built from and what it is stored under cannot disagree.

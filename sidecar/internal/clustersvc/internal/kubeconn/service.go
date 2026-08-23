@@ -34,18 +34,15 @@
 // **Everything a holder learns comes through its Lease**, which is the context it named. Both
 // hubs publish under that same context.
 //
-// **Nothing dials yet.** Acquire resolves the context and hands back a claim, but no connection
-// is built and no probe runs behind it, so every claim reads as nothing known. The connections
-// and the probe are what land next.
+// **Nothing dials yet.** Acquire hands back a claim, but no connection is built and no probe
+// runs behind it, so every claim reads as nothing known. The connections and the probe are what
+// land next.
 package kubeconn
 
 import (
 	"context"
-	"errors"
-	"maps"
 	"net/http"
 	"net/url"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -320,16 +317,16 @@ func (s State) Identity() Identity {
 // the claim for what it now says.
 type Subscription = *conflate.Receiver[string, struct{}]
 
-// StateSubscription carries a claim's State: the current one on attach, then each one that says
-// something new. Close it when done — an abandoned one keeps its slot.
+// StateSubscription carries each State a probe publishes for one claim. Close it when done —
+// an abandoned one keeps its slot.
+//
+// **Nothing is delivered on attach.** A watcher reads Lease.State for what is known now and
+// this for what comes after; the bus hands back no current value, so a watcher that only
+// attaches learns nothing until the next probe lands.
 //
 // Keyed by context, not by the credentials behind it. A receiver is bound to its key for life,
-// and credentials move under a context that never does — so keying on the entry would strand a
-// watcher on the entry its claim just left.
-//
-// Current-on-attach is what makes it race-free: a watcher that read State separately would owe an
-// ordering nothing enforces, and a probe landing between the two calls is the one it never hears
-// about.
+// and credentials move under a context that never does — so keying on the connection would
+// strand a watcher on the one its claim just left.
 //
 // **Every value is a level, never an edge.** The hub keeps the latest per key, so a reader that
 // falls behind skips what came between — a gap means it missed some, not that nothing happened.
@@ -353,8 +350,9 @@ type Lease interface {
 	// What the prober reads: it wants the answers themselves rather than a connection, and a
 	// failed check carries a reason no connection could.
 	State() State
-	// WatchState carries this claim's State, current on attach and again whenever a probe says
-	// something new — including a failure whose reason changed. Release ends it.
+	// WatchState carries every State a probe publishes for this claim — including a failure
+	// whose reason changed. It delivers nothing on attach, so a watcher pairs it with State
+	// for what is known now. Release ends it.
 	//
 	// The same hub Conn parks on, so a watcher and a parked caller cannot disagree, keyed by
 	// the context this claim named.
@@ -419,19 +417,12 @@ type Service struct {
 	wg sync.WaitGroup
 }
 
-// entry is one context's connection: how many hold it, what it was built from, and what the
-// probe last read.
-//
-// An entry with no fingerprint is a context nobody could resolve — the pre-read kubeconfig,
-// until it lands. holders and the connection are one record because a context has exactly one
-// of each, which is what keeps the pool a single map.
+// entry is what the pool holds for one claimed context: how many hold it, and what the probe
+// last read. holders and the state are one record because a context has exactly one of each,
+// which is what keeps the pool a single map.
 type entry struct {
 	holders int
-	// fingerprint is what this connection was built from, empty until the context resolves.
-	// Held so a rotation is a different connection rather than a live one changing under its
-	// claim: the old retires and the backoff ladder starts fresh.
-	fingerprint string
-	state       State
+	state   State
 }
 
 // New returns a Service over the one reader of the user's kubeconfig.
@@ -447,31 +438,31 @@ func New(kubecfgSvc kubeconfigService) *Service {
 // Subscribe reports every context whose State moves, for a reader whose reaction to any of
 // them is the same. A holder that cares about one claim watches that claim instead.
 //
-// Nothing probes yet, so nothing is ever sent.
+// Nothing probes yet, so the only thing that moves is the kubeconfig: a context whose
+// credentials rotated, or that stopped resolving.
 func (s *Service) Subscribe() Subscription { return s.signalHub.Receiver() }
 
-// Acquire claims the connection for contextName's credentials and arms their probe cadence,
-// building the connection if this is the first caller. It does not dial — Lease.Conn is what
-// waits — so a caller may hold a claim across a cluster being down without a retry loop of
-// its own. Release the claim.
+// Acquire claims contextName's connection and arms its probe cadence. It does not dial, and it
+// does not resolve — Lease.Conn is what waits, so a caller may hold a claim across a cluster
+// being down, a kubeconfig that has not been read, or a context that does not exist yet.
+// Release the claim.
 //
-// Resolving here is what makes a claim answerable: a context the kubeconfig does not name, or
-// whose entries do not resolve, is refused with the reader's own error rather than becoming a
-// claim on credentials nobody could build.
+// **A claim is answerable before it is answerable-with-anything.** Whether the context resolves,
+// and to what, is the pool's to find out on its own schedule and report through Lease.State —
+// never a reason to refuse the claim, since every one of those answers can change without the
+// holder doing anything.
 //
 // A claim is on the context, not on the credentials it resolved to. Credentials rotate under a
-// context that never moves, so a claim pinned to a fingerprint would report the server it used
-// to reach for as long as it is held — re-resolving is this package's, since it resolves.
-//
-// A kubeconfig that has not been read yet is not a refusal: the pre-read config is empty, so
-// every context looks departed, and refusing would report a live cluster's credentials broken.
-// The claim is taken and resolves when the file lands.
-func (s *Service) Acquire(contextName string) (Lease, error) {
-	_, fingerprint, err := s.kubecfgSvc.RESTConfig(contextName)
-	if err != nil && !errors.Is(err, kubeconfig.ErrNotRead) {
-		return nil, err
-	}
+// context that never moves, so a claim pinned to them would report the server it used to reach
+// for as long as it is held.
+func (s *Service) Acquire(contextName string) Lease {
+	s.claimContext(contextName)
+	return &claim{svc: s, contextName: contextName}
+}
 
+// claimContext counts a holder on contextName, building its entry if this is the first. The
+// only thing that creates one.
+func (s *Service) claimContext(contextName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -481,33 +472,6 @@ func (s *Service) Acquire(contextName string) (Lease, error) {
 		s.claimed[contextName] = e
 	}
 	e.holders++
-	if err == nil {
-		s.buildLocked(contextName, fingerprint)
-	}
-	return &claim{svc: s, contextName: contextName}, nil
-}
-
-// buildLocked gives contextName the connection its credentials now name, replacing one built
-// from credentials that have moved. Unchanged credentials keep the connection they built, so a
-// resolve that found nothing new costs nothing.
-func (s *Service) buildLocked(contextName, fingerprint string) {
-	e := s.claimed[contextName]
-	if e == nil || e.fingerprint == fingerprint {
-		return
-	}
-	e.fingerprint = fingerprint
-	e.state = State{}
-}
-
-// dropLocked takes the connection off contextName, leaving the claim on a context that reads
-// as nothing known. What a departed context reports, and what an unresolved one has yet to be.
-func (s *Service) dropLocked(contextName string) {
-	e := s.claimed[contextName]
-	if e == nil {
-		return
-	}
-	e.fingerprint = ""
-	e.state = State{}
 }
 
 // stateOf is what the claim on contextName reads. A context with no connection has nothing read
@@ -522,9 +486,12 @@ func (s *Service) stateOf(contextName string) State {
 	return State{}
 }
 
-// release drops one claim on contextName, dropping the entry once the last one goes. An entry
-// nobody holds is one nothing probes.
-func (s *Service) release(contextName string) {
+// releaseContext gives back one holder's claim on contextName, dropping the context once the
+// last one goes. An entry nobody holds is one nothing probes.
+//
+// The decrement and the drop are one critical section: a claim taken between them would be on
+// an entry this call then deletes, and would read as nothing known for as long as it is held.
+func (s *Service) releaseContext(contextName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -552,13 +519,17 @@ func (c *claim) Conn(context.Context) (*Connection, error) { panic("nothing dial
 
 func (c *claim) State() State { return c.svc.stateOf(c.contextName) }
 
+// WatchState takes no baseline: the hub compares against one only through an Accept, and this
+// one has none, so every value is delivered. What a baseline is for — reading and registering
+// in one critical section, so a probe landing between the two is not skipped — is worth having
+// once a probe can land at all.
 func (c *claim) WatchState() StateSubscription {
-	return c.svc.stateHub.Watch(c.contextName, c.svc.stateHub.WithBaseline(c.State()))
+	return c.svc.stateHub.Watch(c.contextName)
 }
 
 func (c *claim) Release() {
 	if c.released.CompareAndSwap(false, true) {
-		c.svc.release(c.contextName)
+		c.svc.releaseContext(c.contextName)
 	}
 }
 
@@ -575,34 +546,9 @@ func (c *claim) Release() {
 // The config is the signal, never the source: resolving goes back through RESTConfig, which
 // is what computes a fingerprint at all.
 func (s *Service) rekey() {
-	// Resolved outside the lock, one call per context: RESTConfig reads the shared config,
-	// and holding the pool's lock across it would order this loop against that reader.
-	for _, contextName := range s.claimedContexts() {
-		_, fingerprint, err := s.kubecfgSvc.RESTConfig(contextName)
-
-		s.mu.Lock()
-		switch {
-		case err != nil:
-			// The context left the file, or its entries stopped resolving. Dropped rather
-			// than left on stale credentials, so the claim reports nothing known instead of
-			// the server it used to reach.
-			s.dropLocked(contextName)
-		default:
-			// Both ignore a context nobody claims, which is what stops a claim released
-			// while this resolved from resurrecting the entry its release dropped.
-			s.buildLocked(contextName, fingerprint)
-		}
-		s.mu.Unlock()
-	}
-}
-
-// claimedContexts is the contexts to re-resolve, snapshotted so the loop above holds no lock
-// while it resolves.
-func (s *Service) claimedContexts() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return slices.Sorted(maps.Keys(s.claimed))
+	// Nothing to record yet. What a context resolves to now is the probe's to read and
+	// report; a claim is held whether or not the file still names it, and dropping one here
+	// would orphan a holder that is still holding.
 }
 
 // Start watches the kubeconfig until stopped, re-keying claims as the file moves under them.
@@ -648,7 +594,6 @@ func (s *Service) Close() error {
 	defer s.mu.Unlock()
 
 	for _, e := range s.claimed {
-		e.fingerprint = ""
 		e.state = State{}
 	}
 	return nil

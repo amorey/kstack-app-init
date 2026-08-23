@@ -15,7 +15,7 @@
 package kubeconn
 
 import (
-	"errors"
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -147,26 +147,17 @@ func TestIdentityLeavesAnUnreadPartEmpty(t *testing.T) {
 	}.Identity(), "why the UID is missing is the observation's, not the identity's")
 }
 
-// The pre-read kubeconfig is empty, so every context looks departed. Refusing the claim
-// would report a live cluster's credentials broken for as long as the first read takes.
-func TestAcquireClaimsAContextTheKubeconfigHasNotReadYet(t *testing.T) {
+// A claim is taken whatever the file says. Whether the context resolves, and to what, is the
+// pool's to find out on its own schedule — refusing would make a transient fact permanent for
+// the holder.
+func TestAcquireClaimsAContextTheKubeconfigDoesNotName(t *testing.T) {
 	s := New(&fakeKubeconfig{err: kubeconfig.ErrNotRead})
 
-	lease, err := s.Acquire("prod")
+	lease := s.Acquire("prod")
 
-	require.NoError(t, err)
-	assert.NotNil(t, lease)
-}
-
-// A context the file genuinely does not resolve is refused with the reader's own error,
-// rather than becoming a claim on credentials nobody could build.
-func TestAcquireRefusesAContextThatWillNotResolve(t *testing.T) {
-	boom := errors.New("no such certificate authority file")
-	s := New(&fakeKubeconfig{err: boom})
-
-	_, err := s.Acquire("prod")
-
-	assert.ErrorIs(t, err, boom)
+	require.NotNil(t, lease)
+	assert.Len(t, s.claimed, 1)
+	assert.Equal(t, State{}, lease.State(), "and it knows nothing until something reads")
 }
 
 // The subscription is established before Start returns, so a config sent straight after it
@@ -190,8 +181,8 @@ func TestStartWatchesTheKubeconfigUntilStopped(t *testing.T) {
 func TestAcquireBuildsAConnectionPerContext(t *testing.T) {
 	s := New(resolving("prod", "key-1", "prod-admin", "key-1"))
 
-	defer must(s.Acquire("prod")).Release()
-	defer must(s.Acquire("prod-admin")).Release()
+	defer s.Acquire("prod").Release()
+	defer s.Acquire("prod-admin").Release()
 
 	assert.Len(t, s.claimed, 2)
 	assert.NotSame(t, s.claimed["prod"], s.claimed["prod-admin"])
@@ -201,7 +192,7 @@ func TestAcquireBuildsAConnectionPerContext(t *testing.T) {
 func TestReleaseDropsTheEntryTheLastHolderHeld(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 
-	must(s.Acquire("prod")).Release()
+	s.Acquire("prod").Release()
 
 	assert.Empty(t, s.claimed)
 }
@@ -210,8 +201,8 @@ func TestReleaseDropsTheEntryTheLastHolderHeld(t *testing.T) {
 // finish must not stop the other's probe.
 func TestReleaseKeepsTheEntryWhileAnotherHolderHoldsIt(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
-	pass := must(s.Acquire("prod"))
-	tail := must(s.Acquire("prod"))
+	pass := s.Acquire("prod")
+	tail := s.Acquire("prod")
 
 	pass.Release()
 	assert.Len(t, s.claimed, 1)
@@ -223,8 +214,8 @@ func TestReleaseKeepsTheEntryWhileAnotherHolderHoldsIt(t *testing.T) {
 // Release is idempotent by contract, so it is safe to defer beside a path that also releases.
 func TestReleaseIsIdempotent(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
-	lease := must(s.Acquire("prod"))
-	other := must(s.Acquire("prod"))
+	lease := s.Acquire("prod")
+	other := s.Acquire("prod")
 
 	lease.Release()
 	lease.Release()
@@ -233,120 +224,57 @@ func TestReleaseIsIdempotent(t *testing.T) {
 	other.Release()
 }
 
-// The whole point of claiming a context rather than a fingerprint: credentials rotate under a
-// context that never moves, and the claim has to follow them.
-func TestRekeyRebuildsOnRotatedCredentials(t *testing.T) {
+// rekey holds a claim whatever the file now says. A context that stopped resolving is still
+// held: dropping it here would orphan a holder that is still holding, and whether the record
+// behind it should let go is the holder's to decide.
+func TestRekeyKeepsWhatIsClaimed(t *testing.T) {
 	cfg := resolving("prod", "key-1")
 	s := New(cfg)
-	defer must(s.Acquire("prod")).Release()
-	require.Equal(t, "key-1", s.claimed["prod"].fingerprint)
-
-	cfg.rotate("prod", "key-2")
-	s.rekey()
-
-	assert.Equal(t, "key-2", s.claimed["prod"].fingerprint)
-}
-
-// A rotation is a different connection, so what the old one answered does not carry over: the
-// server behind the new credentials has yet to say anything.
-func TestRekeyForgetsWhatTheOldCredentialsRead(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	lease := must(s.Acquire("prod"))
-	defer lease.Release()
-	s.claimed["prod"].state = State{ServerUID: Observation[string]{Value: "uid-1", LastSeen: runAt}}
-
-	cfg.rotate("prod", "key-2")
-	s.rekey()
-
-	assert.Equal(t, State{}, lease.State())
-}
-
-// Unchanged credentials keep the connection they built, or every kubeconfig write would drop
-// every cluster's probe and start its ladder again.
-func TestRekeyKeepsAConnectionItsCredentialsStillName(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	lease := must(s.Acquire("prod"))
+	lease := s.Acquire("prod")
 	defer lease.Release()
 	probed := State{ServerUID: Observation[string]{Value: "uid-1", LastSeen: runAt}}
 	s.claimed["prod"].state = probed
 
-	s.rekey()
-
-	assert.Equal(t, probed, lease.State())
-}
-
-// A claim taken before the kubeconfig's first read holds a context that resolves to nothing.
-// The read is what builds it, which is why the pool subscribes rather than waiting to be asked.
-func TestRekeyBuildsAClaimTakenBeforeTheKubeconfigWasRead(t *testing.T) {
-	cfg := &fakeKubeconfig{err: kubeconfig.ErrNotRead}
-	s := New(cfg)
-	defer must(s.Acquire("prod")).Release()
-	require.Empty(t, s.claimed["prod"].fingerprint, "nothing resolves yet")
-
-	cfg.err = nil
-	cfg.keys = map[string]string{"prod": "key-1"}
-	s.rekey()
-
-	assert.Equal(t, "key-1", s.claimed["prod"].fingerprint)
-}
-
-// A context the user deleted stops resolving. Dropping the connection is what stops the claim
-// reporting the server it used to reach; keeping it would probe credentials nobody names.
-func TestRekeyDropsAContextThatStoppedResolving(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	lease := must(s.Acquire("prod"))
-	defer lease.Release()
-
 	cfg.rotate("prod", "")
 	s.rekey()
 
-	assert.Empty(t, s.claimed["prod"].fingerprint, "the claim is still held, the connection is not")
-	assert.Equal(t, State{}, lease.State(), "a claim on nothing knows nothing")
+	assert.Len(t, s.claimed, 1)
+	assert.Equal(t, probed, lease.State())
 }
 
-// must fails the test rather than returning an error a caller would have to check, since
-// every Acquire here is over a kubeconfig the test wrote.
-func must(lease Lease, err error) Lease {
-	if err != nil {
-		panic(err)
-	}
-	return lease
-}
-
-// A receiver is bound to its key for life, so keying the state hub on the entry would strand
-// a watcher the moment its claim re-keyed. Keyed by context, one subscription follows the
-// claim across the move. The send stands in for the probe that will make it.
-func TestWatchStateFollowsTheClaimAcrossARekey(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	lease := must(s.Acquire("prod"))
+// A receiver is bound to its key for life, and a claim's key is its context — which never
+// moves, however the credentials behind it do.
+func TestWatchStateIsKeyedByContext(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	lease := s.Acquire("prod")
 	defer lease.Release()
 	sub := lease.WatchState()
 	defer sub.Close()
 
-	cfg.rotate("prod", "key-2")
-	s.rekey()
 	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", LastSeen: runAt}})
 
-	ev, err := sub.RecvContext(t.Context())
+	ev, err := sub.RecvContext(within(t))
 	require.NoError(t, err)
 	assert.Equal(t, "uid-1", ev.Value.ServerUID.Value)
 }
 
-// rekey resolves from a snapshot taken without the lock, so the context it comes back to build
-// may have been released meanwhile. Building anyway would resurrect the entry that release just
-// dropped, and nothing would ever claim it again.
-func TestBuildIgnoresAContextNobodyClaims(t *testing.T) {
+// Release is idempotent by contract, so a claim released twice — or one whose context is
+// already gone — has to be a no-op rather than a decrement into the negative.
+func TestReleaseContextIsSafeForAContextNobodyClaims(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
-	must(s.Acquire("prod")).Release()
+	s.Acquire("prod").Release()
 	require.Empty(t, s.claimed)
 
-	s.mu.Lock()
-	s.buildLocked("prod", "key-1")
-	s.mu.Unlock()
+	s.releaseContext("prod")
 
 	assert.Empty(t, s.claimed)
+}
+
+// within bounds a wait for something that must arrive, so a regression fails the test rather
+// than hanging it until the suite's own deadline.
+func within(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+	return ctx
 }

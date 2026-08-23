@@ -65,10 +65,13 @@ not re-reading, so a retired connection closes `Connection.Done()`.
 Everything a holder learns comes through its `Lease` — `Conn`, `State`, `WatchState` — which is
 what removes the index from a credential key back out to the contexts resolving to it: signalling
 every claim on an entry is the whole fan-out. `WatchState` returns a `gobus/watch` receiver of
-`State`, current on attach, over the hub `Conn` already parks on. One hub rather than a value hub
-beside a ping bus, and current-on-attach removes the attach-before-read ordering a ping leaves each
-watcher to remember. Its values are levels: the hub keeps the latest, so a reader that falls behind
-skips what came between.
+`State`, over the hub `Conn` already parks on — one hub rather than a value hub beside a ping bus,
+so a watcher and a parked caller cannot disagree. Its values are levels: the hub keeps the latest,
+so a reader that falls behind skips what came between.
+
+*Corrected 2026-08-23: this section first claimed the receiver is current on attach. It is not —
+gobus's baseline is the value later ones are compared against, never delivered — so a watcher
+reads `State` for what is known now and watches for what follows.*
 
 `internal/kubeconn` stays in the tree, built by nothing, as the worked-out implementation the new
 package draws from as it fills in.
