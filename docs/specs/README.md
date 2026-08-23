@@ -24,6 +24,4 @@ A spec left behind after the code ships is a second source of truth.
 
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [Kubeconnection service](kubeconnection-service.md) | sidecar | In progress |
-| [One connection per cluster](per-cluster-connections.md) | sidecar | Planned |
-| [Per-cluster connection throughput](connection-throughput.md) | sidecar | Planned |
+| [Connection throughput](connection-throughput.md) | sidecar | Planned |
