@@ -33,9 +33,8 @@ func TestClustersQuery(t *testing.T) {
 		spec { name syncEnabled enabled source { kubeconfig { context } } }
 		status {
 			source { kubeconfig { cluster user isPresent isDefault } }
-			server { uid version }
-			principal { username }
-			lastConnectedAt
+			server { uid version endpoint }
+			principal { username groups }
 		}
 	} }`)
 
@@ -74,8 +73,8 @@ func TestClustersQuery(t *testing.T) {
 	if p := unprobedStatus["principal"].(map[string]any); p["username"] != nil {
 		t.Errorf("never-probed username should be null, got: %v", p)
 	}
-	if at := unprobedStatus["lastConnectedAt"]; at != nil {
-		t.Errorf("never-connected lastConnectedAt should be null, got: %v", at)
+	if ep := unprobedStatus["server"].(map[string]any)["endpoint"]; ep != nil {
+		t.Errorf("never-probed endpoint should be null, got: %v", ep)
 	}
 }
 

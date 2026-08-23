@@ -92,7 +92,6 @@ export function clusterOf(r: ClusterRow) {
         },
       },
       server: { uid: `uid-${r.id}` },
-      lastConnectedAt: null,
       conditions: [],
     },
   };

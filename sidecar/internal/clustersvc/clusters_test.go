@@ -27,7 +27,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
@@ -203,25 +203,34 @@ func liveCaches(t *testing.T, caches beehive.Client[ClusterCacheSpec, ClusterCac
 
 func strPtr(s string) *string { return &s }
 
-// identityControllerOver returns a controller whose identity service answers with what.
-func identityControllerOver(t *testing.T, what *fakeKubeidentity) *clusterController {
+// identityControllerOver returns a controller whose pool answers with what.
+func identityControllerOver(t *testing.T, what *fakeKubeconn) *clusterController {
 	t.Helper()
 	d := newTestDeps(t)
-	d.kubeidentitySvc = what
+	d.kubeconnSvc = what
 	return &clusterController{deps: d}
 }
 
-// reportedCondition is the one condition a pass wrote, or a failure when it wrote none.
+// reportedCondition is the Connected verdict a pass wrote — the one most tests here are
+// about. conditionOfType reaches the other two.
 func reportedCondition(t *testing.T, client *stubControllerClient) Condition {
 	t.Helper()
-	require.Len(t, client.conditions, 1, "a pass reports once")
-	return client.conditions[0]
+	return conditionOfType(t, client, ConditionConnected)
+}
+
+// conditionOfType is the verdict a pass wrote for one aspect, or a failure when it wrote
+// none for it.
+func conditionOfType(t *testing.T, client *stubControllerClient, ct ConditionType) Condition {
+	t.Helper()
+	cond := FindCondition(client.conditions, ct)
+	require.NotNil(t, cond, "a pass reports %s", ct)
+	return *cond
 }
 
 // Every condition here describes process-scoped state, so a previous process's write
 // must read as Unknown until this one re-confirms it.
 func TestReconcileReportsLiveness(t *testing.T) {
-	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil))
+	c := identityControllerOver(t, answering(kubeconn.Identity{ServerUID: "uid-1"}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
 
 	client := &stubControllerClient{}
@@ -233,7 +242,7 @@ func TestReconcileReportsLiveness(t *testing.T) {
 // A cluster the user switched off is not probed, and says so rather than looking like
 // one that failed to connect.
 func TestReconcileReportsInactiveWhenDisabled(t *testing.T) {
-	svc := answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil)
+	svc := answering(kubeconn.Identity{ServerUID: "uid-1"}, nil)
 	c := identityControllerOver(t, svc)
 	obj := createCluster(t, c.clusterClient, "prod")
 	obj.Spec.Enabled = false
@@ -250,7 +259,7 @@ func TestReconcileReportsInactiveWhenDisabled(t *testing.T) {
 // A context the user removed is not a broken one: there is nothing to connect to until
 // they put it back, which reads differently from a cluster that would not answer.
 func TestReconcileReportsInactiveForADepartedContext(t *testing.T) {
-	c := identityControllerOver(t, answering(kubeidentity.Identity{},
+	c := identityControllerOver(t, refusing(
 		fmt.Errorf("%w: %q", kubeconfig.ErrContextNotFound, "prod")))
 	obj := createCluster(t, c.clusterClient, "prod")
 
@@ -265,8 +274,7 @@ func TestReconcileReportsInactiveForADepartedContext(t *testing.T) {
 // The context is there and its entries do not resolve — a file the user has to fix. The
 // record reports it rather than failing the pass, and carries what went wrong.
 func TestReconcileReportsAFailedResolve(t *testing.T) {
-	c := identityControllerOver(t, answering(kubeidentity.Identity{},
-		errors.New("no such certificate authority file")))
+	c := identityControllerOver(t, refusing(errors.New("no such certificate authority file")))
 	obj := createCluster(t, c.clusterClient, "prod")
 
 	client := &stubControllerClient{}
@@ -283,7 +291,7 @@ func TestReconcileReportsAFailedResolve(t *testing.T) {
 // nothing. Neither connected nor failed, and the signal the probe publishes is what
 // brings this record back.
 func TestReconcileReportsConnectingUntilAnswered(t *testing.T) {
-	svc := &fakeKubeidentity{}
+	svc := &fakeKubeconn{}
 	c := identityControllerOver(t, svc)
 	obj := createCluster(t, c.clusterClient, "prod")
 
@@ -299,7 +307,7 @@ func TestReconcileReportsConnectingUntilAnswered(t *testing.T) {
 // A record from another source names no context to resolve, so a verdict about reaching
 // its server is one no pass here produced.
 func TestReconcileReportsNoConditionForAnotherSource(t *testing.T) {
-	svc := answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil)
+	svc := answering(kubeconn.Identity{ServerUID: "uid-1"}, nil)
 	c := identityControllerOver(t, svc)
 	obj, err := c.clusterClient.Create(context.Background(), "cloud/prod", ClusterSpec{})
 	require.NoError(t, err)
@@ -316,7 +324,7 @@ func TestReconcileReportsNoConditionForAnotherSource(t *testing.T) {
 // would report a verdict nothing recorded.
 func TestReconcileReportsAFailedConditionWrite(t *testing.T) {
 	boom := errors.New("boom")
-	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil))
+	c := identityControllerOver(t, answering(kubeconn.Identity{ServerUID: "uid-1"}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
 
 	res := c.Reconcile(context.Background(), &stubControllerClient{setErr: boom}, obj)
@@ -327,7 +335,7 @@ func TestReconcileReportsAFailedConditionWrite(t *testing.T) {
 // The identity comes from the probe, not from the record: this is the write that turns
 // a tracked context into one with a mirror.
 func TestReconcileWritesTheProbedUID(t *testing.T) {
-	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil))
+	c := identityControllerOver(t, answering(kubeconn.Identity{ServerUID: "uid-1"}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
 
 	client := &stubControllerClient{}
@@ -341,7 +349,7 @@ func TestReconcileWritesTheProbedUID(t *testing.T) {
 // One probe answers three questions, and dropping two would throw away requests it
 // already paid for. The version and the principal have their own status homes.
 func TestReconcileWritesTheWholeIdentity(t *testing.T) {
-	c := identityControllerOver(t, answering(kubeidentity.Identity{
+	c := identityControllerOver(t, answering(kubeconn.Identity{
 		ServerUID: "uid-1", ServerVersion: "v1.29.3", Username: "admin@example",
 	}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
@@ -356,13 +364,55 @@ func TestReconcileWritesTheWholeIdentity(t *testing.T) {
 	assert.Equal(t, "admin@example", *client.updated.Principal.Username)
 }
 
+// The endpoint is what tells two contexts naming one server apart from two servers, so a
+// pass that reached one records where it went.
+func TestReconcileWritesTheEndpointAndGroups(t *testing.T) {
+	c := identityControllerOver(t, knowing(kubeconn.State{
+		Connection: answeredWith("https://prod.example:6443"),
+		ServerUID:  answeredWith("uid-1"),
+		Principal: answeredWith(kubeconn.Principal{
+			Username: "admin@example",
+			Groups:   []string{"system:masters", "system:authenticated"},
+		}),
+	}))
+	obj := createCluster(t, c.clusterClient, "prod")
+
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
+
+	require.NotNil(t, client.updated)
+	require.NotNil(t, client.updated.Server.Endpoint)
+	assert.Equal(t, "https://prod.example:6443", *client.updated.Server.Endpoint)
+	assert.Equal(t, []string{"system:authenticated", "system:masters"}, client.updated.Principal.Groups,
+		"sorted, so a server that re-orders them does not re-emit the record")
+}
+
+// Nothing has been probed, so there is nothing to report about the server — a status
+// carrying invented blanks would be indistinguishable from one that read them.
+func TestReconcileWritesNoServerFactsWhileNothingIsProbed(t *testing.T) {
+	c := identityControllerOver(t, &fakeKubeconn{})
+	obj := createCluster(t, c.clusterClient, "prod")
+
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
+
+	require.NotNil(t, client.updated)
+	assert.Nil(t, client.updated.Server.Endpoint)
+	assert.Nil(t, client.updated.Server.UID)
+	assert.Empty(t, client.updated.Principal.Groups)
+}
+
 // A probe refused the kube-system read but reached the server, so it knows who it
 // connected as and not what it connected to. Each fact stands on its own: reporting
 // none of them would hide a cluster that is up.
 func TestReconcileWritesThePartOfTheIdentityAProbeReached(t *testing.T) {
-	c := identityControllerOver(t, answering(kubeidentity.Identity{
-		ServerVersion: "v1.29.3", Username: "reader@example",
-	}, nil))
+	c := identityControllerOver(t, knowing(kubeconn.State{
+		Connection:    answeredWith("https://prod.example:6443"),
+		Readiness:     answeredWith(kubeconn.ComponentStatus{}),
+		ServerVersion: answeredWith(kubeconn.VersionInfo{GitVersion: "v1.29.3"}),
+		Principal:     answeredWith(kubeconn.Principal{Username: "reader@example"}),
+		ServerUID:     forbidden("namespaces \"kube-system\" is forbidden"),
+	}))
 	obj := createCluster(t, c.clusterClient, "prod")
 
 	client := &stubControllerClient{}
@@ -377,11 +427,44 @@ func TestReconcileWritesThePartOfTheIdentityAProbeReached(t *testing.T) {
 		"a user refused kube-system still reached a cluster that is up")
 }
 
+// Reaching a server needs no authorization and naming it does, so the two verdicts move
+// apart — and this is the one that explains a connected cluster that never gets a cache.
+func TestReconcileReportsUnidentifiedWhenTheUIDIsRefused(t *testing.T) {
+	c := identityControllerOver(t, knowing(kubeconn.State{
+		Connection: answeredWith("https://prod.example:6443"),
+		Readiness:  answeredWith(kubeconn.ComponentStatus{}),
+		ServerUID:  forbidden("namespaces \"kube-system\" is forbidden"),
+	}))
+	obj := createCluster(t, c.clusterClient, "prod")
+
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
+
+	assert.Equal(t, ConditionTrue, conditionOfType(t, client, ConditionConnected).Status)
+	cond := conditionOfType(t, client, ConditionIdentified)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonUIDUnreadable, cond.Reason)
+	assert.Contains(t, cond.Message, "forbidden")
+}
+
+// Identity is not a fact about a server nothing reached, so a failed probe leaves it
+// unassessed rather than claiming the cluster is unidentifiable.
+func TestReconcileLeavesIdentityUnassessedWhenTheProbeFailed(t *testing.T) {
+	c := identityControllerOver(t, answering(kubeconn.Identity{}, errors.New("connection refused")))
+	obj := createCluster(t, c.clusterClient, "prod")
+
+	client := &stubControllerClient{}
+	reconcileCluster(t, c, client, obj)
+
+	assert.Equal(t, ReasonProbeFailed, conditionOfType(t, client, ConditionConnected).Reason)
+	assert.Equal(t, ReasonNoConnection, conditionOfType(t, client, ConditionIdentified).Reason)
+}
+
 // The pass that learns an identity is the one that creates its cache. Nothing else
 // would: a status write moves no generation, so no owed pass lists this record again,
 // and the cache that would be its dependent is the thing that does not exist yet.
 func TestReconcileCreatesTheCacheInTheSamePassThatLearnsTheUID(t *testing.T) {
-	c := identityControllerOver(t, answering(kubeidentity.Identity{ServerUID: "uid-1"}, nil))
+	c := identityControllerOver(t, answering(kubeconn.Identity{ServerUID: "uid-1"}, nil))
 	obj := createCluster(t, c.clusterClient, "prod")
 
 	reconcileCluster(t, c, &stubControllerClient{}, obj)

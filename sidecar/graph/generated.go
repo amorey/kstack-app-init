@@ -205,13 +205,15 @@ type ComplexityRoot struct {
 	}
 
 	ClusterPrincipal struct {
+		Groups      func(childComplexity int) int
 		Permissions func(childComplexity int, namespace string) int
 		Username    func(childComplexity int) int
 	}
 
 	ClusterServer struct {
-		UID     func(childComplexity int) int
-		Version func(childComplexity int) int
+		Endpoint func(childComplexity int) int
+		UID      func(childComplexity int) int
+		Version  func(childComplexity int) int
 	}
 
 	ClusterSpec struct {
@@ -230,10 +232,9 @@ type ComplexityRoot struct {
 	}
 
 	ClusterStatus struct {
-		LastConnectedAt func(childComplexity int) int
-		Principal       func(childComplexity int) int
-		Server          func(childComplexity int) int
-		Source          func(childComplexity int) int
+		Principal func(childComplexity int) int
+		Server    func(childComplexity int) int
+		Source    func(childComplexity int) int
 	}
 
 	ClusterStatusSource struct {
@@ -1007,6 +1008,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.ClusterPermissions.ResourceRules(childComplexity), true
 
+	case "ClusterPrincipal.groups":
+		if e.ComplexityRoot.ClusterPrincipal.Groups == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterPrincipal.Groups(childComplexity), true
 	case "ClusterPrincipal.permissions":
 		if e.ComplexityRoot.ClusterPrincipal.Permissions == nil {
 			break
@@ -1025,6 +1032,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.ClusterPrincipal.Username(childComplexity), true
 
+	case "ClusterServer.endpoint":
+		if e.ComplexityRoot.ClusterServer.Endpoint == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterServer.Endpoint(childComplexity), true
 	case "ClusterServer.uid":
 		if e.ComplexityRoot.ClusterServer.UID == nil {
 			break
@@ -1077,12 +1090,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.ClusterSpecSourceKubeconfig.Context(childComplexity), true
 
-	case "ClusterStatus.lastConnectedAt":
-		if e.ComplexityRoot.ClusterStatus.LastConnectedAt == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterStatus.LastConnectedAt(childComplexity), true
 	case "ClusterStatus.principal":
 		if e.ComplexityRoot.ClusterStatus.Principal == nil {
 			break
@@ -2044,6 +2051,8 @@ func (ec *executionContext) childFields_ClusterPrincipal(ctx context.Context, fi
 	switch field.Name {
 	case "username":
 		return ec.fieldContext_ClusterPrincipal_username(ctx, field)
+	case "groups":
+		return ec.fieldContext_ClusterPrincipal_groups(ctx, field)
 	case "permissions":
 		return ec.fieldContext_ClusterPrincipal_permissions(ctx, field)
 	}
@@ -2056,6 +2065,8 @@ func (ec *executionContext) childFields_ClusterServer(ctx context.Context, field
 		return ec.fieldContext_ClusterServer_uid(ctx, field)
 	case "version":
 		return ec.fieldContext_ClusterServer_version(ctx, field)
+	case "endpoint":
+		return ec.fieldContext_ClusterServer_endpoint(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterServer", field.Name)
 }
@@ -2098,8 +2109,6 @@ func (ec *executionContext) childFields_ClusterStatus(ctx context.Context, field
 		return ec.fieldContext_ClusterStatus_server(ctx, field)
 	case "principal":
 		return ec.fieldContext_ClusterStatus_principal(ctx, field)
-	case "lastConnectedAt":
-		return ec.fieldContext_ClusterStatus_lastConnectedAt(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterStatus", field.Name)
 }
@@ -5281,6 +5290,29 @@ func (ec *executionContext) fieldContext_ClusterPrincipal_username(_ context.Con
 	return graphql.NewScalarFieldContext("ClusterPrincipal", field, false, false, errors.New("field of type String does not have child fields"))
 }
 
+func (ec *executionContext) _ClusterPrincipal_groups(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterPrincipal) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterPrincipal_groups(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Groups, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v []string) graphql.Marshaler {
+			return ec.marshalNString2ᚕstringᚄ(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterPrincipal_groups(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterPrincipal", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
 func (ec *executionContext) _ClusterPrincipal_permissions(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterPrincipal) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -5368,6 +5400,29 @@ func (ec *executionContext) _ClusterServer_version(ctx context.Context, field gr
 	)
 }
 func (ec *executionContext) fieldContext_ClusterServer_version(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterServer", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterServer_endpoint(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterServer) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterServer_endpoint(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Endpoint, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *string) graphql.Marshaler {
+			return ec.marshalOString2ᚖstring(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterServer_endpoint(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterServer", field, false, false, errors.New("field of type String does not have child fields"))
 }
 
@@ -5621,29 +5676,6 @@ func (ec *executionContext) fieldContext_ClusterStatus_principal(_ context.Conte
 		},
 	}
 	return fc, nil
-}
-
-func (ec *executionContext) _ClusterStatus_lastConnectedAt(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterStatus) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterStatus_lastConnectedAt(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.LastConnectedAt, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
-			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
-		},
-		true,
-		false,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterStatus_lastConnectedAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterStatus", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterStatusSource_kubeconfig(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterStatusSource) (ret graphql.Marshaler) {
@@ -10289,6 +10321,11 @@ func (ec *executionContext) _ClusterPrincipal(ctx context.Context, sel ast.Selec
 			out.Values[i] = graphql.MarshalString("ClusterPrincipal")
 		case "username":
 			out.Values[i] = ec._ClusterPrincipal_username(ctx, field, obj)
+		case "groups":
+			out.Values[i] = ec._ClusterPrincipal_groups(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
 		case "permissions":
 			field := field
 
@@ -10363,6 +10400,8 @@ func (ec *executionContext) _ClusterServer(ctx context.Context, sel ast.Selectio
 			out.Values[i] = ec._ClusterServer_uid(ctx, field, obj)
 		case "version":
 			out.Values[i] = ec._ClusterServer_version(ctx, field, obj)
+		case "endpoint":
+			out.Values[i] = ec._ClusterServer_endpoint(ctx, field, obj)
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -10538,8 +10577,6 @@ func (ec *executionContext) _ClusterStatus(ctx context.Context, sel ast.Selectio
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
-		case "lastConnectedAt":
-			out.Values[i] = ec._ClusterStatus_lastConnectedAt(ctx, field, obj)
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}

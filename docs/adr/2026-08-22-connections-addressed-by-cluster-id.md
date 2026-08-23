@@ -54,9 +54,9 @@ value — so a probe reading a different one retires it and builds another, exac
 credentials do under a new key. All three retire: a version change invalidates what was discovered
 against the old one, and a username change means a different principal. That matches the rest of
 the system, where `ClusterCache` is named `{ClusterID}/{serverUID}` and a UID change is a cache
-migration. `UIDErr` stays on `Result` instead — it reports what the probe could read rather than
-who answered, it flaps as a kube-system grant comes and goes, and keeping it off `Identity` is what
-keeps the comparison a `==`. Comparing is the caller's, since the pool keys on credentials, which
+migration. Why a part of it is missing stays on the `Observation` that could not read it — that reports
+what the probe could read rather than who answered, it comes and goes as a grant does, and keeping
+errors off `Identity` is what keeps the comparison a `==`. Comparing is the caller's, since the pool keys on credentials, which
 do not move when a cluster is rebuilt behind them; and a long-lived stream cannot see a field it is
 not re-reading, so a retired connection closes `Connection.Done()`.
 

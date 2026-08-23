@@ -32,7 +32,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
@@ -69,15 +68,6 @@ type kubeconfigService interface {
 // the pass that took it, so the caller holds and releases rather than asking per pass.
 type kubeconnService interface {
 	Acquire(contextName string) (kubeconn.Lease, error)
-}
-
-// kubeidentityService answers which server a kube-context reaches. Non-blocking by
-// contract: a pass reports a cluster's identity without the dial entering the pass.
-type kubeidentityService interface {
-	// Get is what the last probe learned, and whether anything is known at all.
-	Get(contextName string) (kubeidentity.State, bool)
-	// Subscribe reports the contexts whose answer moved.
-	Subscribe() kubeidentity.Subscription
 }
 
 // --- Identity ---
@@ -230,9 +220,12 @@ const (
 	// ConditionConnected reports whether the last connection probe
 	// reached the cluster's API server and resolved its identity facts.
 	ConditionConnected ConditionType = "Connected"
-	// ConditionHealthy reports the API server's own condition (its
-	// readiness checks), as distinct from our ability to reach it.
-	ConditionHealthy ConditionType = "Healthy"
+	// ConditionIdentified reports whether the probe could tell which cluster
+	// answered. Separate from Connected, whose subject is whether we reached the
+	// server at all: this one is about what these credentials are allowed to read,
+	// and it is what gates the cache, since a cache is named for the identity it
+	// mirrors.
+	ConditionIdentified ConditionType = "Identified"
 	// ConditionSynced reports the state of a sync. It is reported at two levels: coarse
 	// on the ClusterCache (did this cache decide to sync?) and per kind on each
 	// ClusterCachedResource, which is the verdict a UI wants.
@@ -249,7 +242,7 @@ const (
 // condition's status, Kubernetes-style. Human detail goes in Message.
 const (
 	// ReasonInactive: no connection is maintained — the record is orphaned,
-	// archived, deactivated, or its source has no resolvable credentials.
+	// archived, or deactivated.
 	ReasonInactive = "Inactive"
 	// ReasonConnecting: a probe is owed but none has succeeded or failed yet
 	// (a freshly-minted record awaiting its first pass).
@@ -262,15 +255,16 @@ const (
 	// ReasonProbeFailed: credentials resolved but the dial/identity probe
 	// failed.
 	ReasonProbeFailed = "ProbeFailed"
-	// ReasonReady: the API server reports its readiness checks passing.
-	ReasonReady = "Ready"
-	// ReasonReadyzFailed: the API server responded but named failing checks.
-	ReasonReadyzFailed = "ReadyzFailed"
 	// ReasonUnreachable: the health probe's transport failed outright.
 	ReasonUnreachable = "Unreachable"
 	// ReasonNoConnection: health cannot be assessed without a live
 	// connection this pass.
 	ReasonNoConnection = "NoConnection"
+	// ReasonIdentified: the probe read the cluster's identity.
+	ReasonIdentified = "Identified"
+	// ReasonUIDUnreadable: the probe reached the server and was refused the read
+	// that names it, so the cluster is usable but cannot be mirrored.
+	ReasonUIDUnreadable = "UIDUnreadable"
 	// ReasonPaused: nothing is syncing — the record is sync-disabled, deactivated,
 	// orphaned, or archived.
 	ReasonPaused = "Paused"

@@ -66,7 +66,6 @@ type Row = {
   // Connection diagnostics surfaced in the Disconnected popover.
   connMessage?: string; // Connected condition's `message` (the probe error)
   disconnectedSince?: string; // Connected condition's `transitionedAt` (ISO)
-  lastConnectedAt?: string; // status.lastConnectedAt (ISO; null = never)
 };
 
 // The cache's folded sync verdict for a row. The sidecar folds every kind's Synced into
@@ -154,7 +153,6 @@ function pushClusters(rows: Row[]) {
                     },
                   },
                   server: { uid: r.uuid || null },
-                  lastConnectedAt: r.lastConnectedAt ?? null,
                 },
                 conditions: [
                   {
@@ -750,7 +748,6 @@ describe('ClusterSyncPanel', () => {
     const sub = invokeMock.mock.calls.find(
       ([cmd, arg]) => cmd === 'graphql_subscribe' && (arg as { query: string }).query.includes('clustersWatch'),
     )?.[1] as { query: string };
-    expect(sub.query).toContain('lastConnectedAt');
     expect(sub.query).toContain('message');
     expect(sub.query).toContain('transitionedAt');
     // The probe history and the next-attempt countdown are not inlined on
@@ -769,7 +766,6 @@ describe('ClusterSyncPanel', () => {
         connected: 'False',
         connMessage: 'dial tcp 10.0.0.1:6443: connect: connection refused',
         disconnectedSince: new Date(Date.now() - 3 * 60_000).toISOString(),
-        lastConnectedAt: new Date(Date.now() - 12 * 60_000).toISOString(),
       },
     ]);
 

@@ -133,11 +133,11 @@ func TestLiveConditionCapsItsMessageAndMarksLiveness(t *testing.T) {
 func TestFindCondition(t *testing.T) {
 	conds := []Condition{
 		{Type: string(ConditionConnected), Reason: ReasonConnected},
-		{Type: string(ConditionHealthy), Reason: ReasonReady},
+		{Type: string(ConditionIdentified), Reason: ReasonIdentified},
 	}
-	got := FindCondition(conds, ConditionHealthy)
+	got := FindCondition(conds, ConditionIdentified)
 	require.NotNil(t, got)
-	assert.Equal(t, ReasonReady, got.Reason)
+	assert.Equal(t, ReasonIdentified, got.Reason)
 	assert.Same(t, &conds[1], got)
 
 	assert.Nil(t, FindCondition(conds, ConditionSynced), "an absent type is nil, not a zero row")

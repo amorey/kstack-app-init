@@ -40,10 +40,9 @@ internal/clustersvc/
   shared.go           vocabulary every family reuses, the app's services as this
                       package sees them, and the two GraphQL scalars
   stream.go           Stream[T]
-  internal/kubeidentity/ which credentials each kube-context resolves to, and what a
-                      probe of them found
-  internal/kubeconn/  the connections a cluster is talked to over. Both leaves live
-                      under internal/ so the compiler keeps them this package's own
+  internal/kubeconn/  the connections a cluster is talked to over, and what probing them
+                      found. A leaf under internal/, so the compiler keeps it this
+                      package's own
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -114,8 +113,8 @@ path can forget it. **A no-op pass still settles**: unsettled, every object of t
 on the owed pass's cadence, forever.
 
 **Shared dependencies travel in `deps`** — one beehive client per kind, the process-wide services
-(`kubeconfig`, `kubeidentity`, `poke`), built once by
-`newDeps(bh, kubeconfigSvc, kubeidentitySvc, pokeSvc)` and **embedded** by `service` and by each
+(`kubeconfig`, `kubeconn`, `poke`), built once by
+`newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)` and **embedded** by `service` and by each
 controller, so a family reads `a.s.cacheClient` and a controller reads `c.cacheClient`. The `Client`
 suffix is load-bearing: the fields are promoted into both, and `a.s.cacheClient` must not read like
 the `Caches` family it is reached through. **A new kind or a new
@@ -161,24 +160,67 @@ spec that marshals identically when nothing moved, since beehive's no-op suppres
 converged relay from waking every dependent.
 
 **The probe rides the `Cluster` pass.** `clusterController.Reconcile` observes the kubeconfig, reads
-`kubeidentity` for what connecting with that context's credentials revealed, and folds both into one
-grouped write (`Within`) so a watcher never sees the status without the condition explaining it.
-**No pass dials**: `kubeidentity` answers from what it already knows, and whatever comes to dial must
-stay off every reconcile goroutine. `clusterResync` re-probes each record on its own timer;
-`kubeidentity`'s signal is what makes an answer prompt, and the resync covers one that went missing.
+the cluster's `kubeconn` claim for what connecting with that context's credentials revealed, and
+folds both into one grouped write (`Within`) so a watcher never sees the status without the
+condition explaining it. **No pass dials**: a claim reports what its last probe found, and the
+dialing stays off every reconcile goroutine. `clusterResync` re-runs each record's pass on its own
+timer, and is the only thing that does: the `Cluster` kind declares no trigger, so nothing yet makes
+a landed probe prompt.
 
-`observeIdentity` reports `Connected` — `Inactive` when the cluster is switched off **or its context
-left the kubeconfig** (both are states the user chose, with nothing to connect to until they undo
-it), `ResolveFailed` when the context is there and its entries will not resolve (a broken file,
-reported on the record rather than failing the pass, since beehive's backoff cannot fix a file), and
-`Connecting` while nothing has dialed — which is every context that resolves, until the probe lands.
-`ReasonProbeFailed` has no writer until then. A record from a source with no credentials to resolve
-gets **no condition at all**, rather than a verdict no probe produced.
+**The claim is the pass's other job.** `ensureLease`/`dropLease` hold one `kubeconn.Lease` per
+cluster in `clusterLeases`, keyed by `ClusterID`. A record's context is fixed in its name, so a
+held claim stays the right one for the record's life; credentials moving under that context is the
+pool's to notice, since it is what resolves. Holding is what arms the probe,
+so a disabled, tombstoned, or non-kubeconfig record is dropped and costs no dial. These are the
+controller's own claims: a boundary caller takes its own, since the pool refcounts and a log tail
+ending must not stop this cluster being probed.
 
-`foldIdentity` writes what the probe read into `status.server` / `status.principal`, leaving a fact
-it could not reach at its last-known value — which is what keeps an unreachable server identifiable,
-and what stops an unanswered probe from deactivating a live cache by clearing the UID it is named
-for.
+**The pass reconciles the claim, then observes.** `reconcileConnection` is the one place that
+touches the pool — the claim is taken while the record asks to be connected and dropped otherwise
+— and it returns a `connectionState`: `observed`, the claim's `*kubeconn.State`, plus `Connected`'s
+reason. It is **nil when there is no claim**, which is the three findings this package makes before
+the pool is involved: the record is switched off, its context left the file, or its credentials
+will not resolve. The server exists in all three; what is missing is our observation of it. `inactive` marks the first two and takes precedence, since the pool cannot see a
+choice the user made. How far a probe got is never copied out — the verdicts read `State.Phase()`,
+so every lease holder answers pending-versus-failed the same way. The verdicts are then pure
+functions of that finding, so the claim's lifetime happens once while each condition reads the same
+value. A record from a source with no credentials to resolve gets **no conditions at all**, rather
+than verdicts no probe produced.
+
+**Two conditions with two subjects**: `observeConnected` (did we reach it) and `observeIdentified`
+(could these credentials name it, from the `kube-system` UID). Each maps that finding to its own
+answer top to bottom — deliberately two switches rather than one shared verdict, because the
+aspects fail independently and a helper forcing them to agree is one someone splits later under
+pressure. Reaching a server needs no authorization and naming it does, so a namespace-scoped user
+gets `Connected=True` with `Identified=False/UIDUnreadable`, which is the **only** thing that
+explains a healthy-looking cluster that never gets a cache (`ensureCache` skips a record with no
+UID).
+
+**The bar for a condition is a distinct remedy.** `Connected` points at the network, the kubeconfig,
+or the credentials; `Identified` points at an RBAC grant. The server's own readiness is not one:
+nothing here gates on it, no user action follows from it, and a lease holder that wants it reads
+`State.Readiness` directly.
+
+`Connected` carries the finding's own reason: `Inactive` when the cluster is switched off **or its
+context left the kubeconfig** (both states the user chose), `ResolveFailed` when the context is
+there and its entries will not resolve (a broken file, reported on the record rather than failing
+the pass, since beehive's backoff cannot fix a file), `ProbeFailed` when the server would not
+answer, and `Connecting` until a probe lands — which is every context that resolves, today.
+`Inactive` and `ResolveFailed` come from `Acquire` refusing the claim, the rest from the claim's
+`State`. The other two derive their own: `NoConnection` where a probe never got to the server, since
+neither readiness nor identity is a fact about a server nothing reached.
+
+`foldState` copies what the pool knows into `status.server` (`uid`, `version`, `endpoint`) and
+`status.principal` (`username`, `groups` — sorted, so a re-ordered read is not a change). It
+decides no retention of its own — an `Observation` already keeps its last answer through a failure
+— so a check that has never answered (`Known()` is false) leaves its field alone, which is what
+stops a first pass from clearing the UID a live cache is named for. **The record's copy is the
+durable one**: a restart empties the pool's.
+
+**Only the values, never the timing.** `Reason`, `Latency`, `Failures`, and `NextAttempt` stay off
+the record: they move every cycle, and a status that moves re-emits to every watcher. A reader that
+wants them takes a lease. This is the same trap as the paragraph below — the record has no
+timestamp field at all, deliberately.
 
 **Its steady state must be silent.** A cluster record is what every watcher streams, so the pass
 reports only what it observed and lets beehive's no-op suppression (equal status bytes, unchanged
@@ -198,22 +240,83 @@ dialing on it. `Acquire` panics; the pool and the probe behind it land next, dra
 worked-out `internal/kubeconn`.
 
 **The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
-`Connection`, `ConnIdentity`, `ConnProbe`, `ConnState`, `ConnStateSubscription`. Aliases because an
+`Connection`, `ConnIdentity`, `ConnState`, `ConnStateSubscription`. Aliases because an
 `internal/` type cannot be *named* outside, which would leave `Service` unimplementable by the
 resolver tests' fake. The layering exception is in `service.go`'s package doc.
 
 **A connection is scoped to one `Identity`**, so any of its three fields moving — server, version,
 user — retires it and builds another, and the field is stable for the connection's life. Comparing
 is the holder's (`Identity` is comparable); the pool's key is credentials, which do not move when a
-cluster is rebuilt behind them. Two traps: neither `UIDErr` nor `ReadyErr` belongs on `Identity` —
-both flap over one identity, and retiring the connection for a readiness blip would drop every
-socket; and a username change is **not** an RBAC change, since ordinary edits leave it identical,
-so permissions need the `SelfSubjectRulesReview` behind `ClusterPermissions`.
+cluster is rebuilt behind them. `Identity` carries no errors, which is what keeps it comparable —
+why a field is missing belongs on the `Observation` that could not read it. Note what a username change does
+**not** cover: ordinary RBAC edits leave it identical, so permissions need the
+`SelfSubjectRulesReview` behind `ClusterPermissions`.
 
-**One probe answers both `Cluster` conditions.** `Result.Err` is whether the server answered at
-all (`Connected`); `Result.ReadyErr` is what `/readyz` said (`Healthy`), so readiness is
-`Err == nil && ReadyErr == nil`. Keeping them apart is what lets a reachable-but-unready server
-report as such instead of as a connection failure; `Inactive` is the boundary's, off the record.
+**`State` is what the last probe read about the server, not the connection's own life** —
+whether one is built or retiring surfaces on `Connection.Done()`. **Five checks that fail and go
+stale independently.** A cluster is rebuilt, upgraded, re-issues a token, or revokes a namespace
+read, and none implies the others — so `Connection`, `Readiness`, `ServerUID`,
+`ServerVersion`, and `Principal` are each an `Observation[T]`. Only reachability is a prerequisite; the rest are peers.
+
+**An `Observation` keeps its value through a failure** — a read that stops being permitted does not
+mean the fact changed — and `LastSeen` is what makes the survivor readable: *identified, as of
+10:00* is usable where *ready, as of 10:00* is not. Beside the value it holds two `Attempt`s and a
+failure run: `Failures` with `FailingSince`, because the ladder widens and a count does not give
+elapsed time. `Known()` is has-ever-answered, `OK()` is answered-last-time, `InFlight()` is
+running-now.
+
+**`Attempt` is one run at any stage of its life** — `ScheduledAt`, then `StartedAt`, then
+`FinishedAt` and the outcome. One type, filled in order, which is why an unfinished run needs no
+second one: `LastAttempt` is the run that finished, `NextAttempt` the one that has not, and a run
+moves between them as it completes. `ScheduledAt` is separate from `StartedAt` because a saturated
+prober lets a scheduled time slip into the past, which a single stamp compared against the clock
+would read as running.
+
+**A check that has never run is the zero `Observation`** — a zero `LastAttempt` is not `Done`, so
+every accessor answers correctly with no sentinel.
+
+**A zero `NextAttempt` means the check is suspended**: nothing is due and the last answer stands
+(`Scheduled()` is the accessor). The four checks behind the connection suspend while it is down —
+a server nothing reached cannot answer them — and re-arm when it recovers; a check that came back
+`Unsupported` stays suspended for the connection's life, since the endpoint is absent rather than
+failing. `DependencyFailed` marks the one cycle where a check went from running to suspended, and
+the cycles after it schedule nothing, which is what makes a dead cluster cost one timeout per cycle
+instead of one per check. **Why a check is suspended is `LastAttempt.Reason`** — no field beside
+`NextAttempt`, since a check suspends over what its last attempt found. That is why suspending must
+write an attempt instead of going quiet. So *ready, as of 10:00, nothing due* is a state to render, not a stall.
+
+A **disabled** cluster never gets here: the controller drops the claim and the pool stops probing
+credentials nobody holds. `kubeconn` does not learn what disabled means.
+
+**`NextAttempt.ScheduledAt` is the backoff ladder made visible**, and it costs nothing to publish:
+the prober schedules the next run as it finishes the last, so the countdown rides a send it was
+already making. Successive values show the interval widening — otherwise invisible outside the
+prober.
+
+**`Reason` is assigned when the attempt ends**, in our own vocabulary styled as a Kubernetes
+condition reason (`Unreachable`, `Forbidden`, `Unsupported`, `ServiceUnavailable`, …). It has to be:
+`Err` arrives wrapped and does not survive the copy a watcher holds, so a caller sniffing it later
+cannot tell a 403 from a timeout. **It spans layers on purpose** — transport, API response, and
+rules of ours — because a caller asks why a check failed once, not three times. Names shared with
+`metav1.StatusReason` are the same word for the same thing; the set is not that set.
+
+Two prober traps live here. `NotFound` and `Unsupported` **both arrive as a 404** — the object was
+missing versus the endpoint is not served — and only the check knows which it asked for, so
+classifying on the code alone permanently suspends a check that should keep running. And `Dynamic`
+returns `*apierrors.StatusError` carrying the API's own reason, while only the raw endpoints
+(`/readyz`, `/version`) leave a status code as the sole evidence; one switch over codes for both
+discards what the typed half knows. `Canceled` says nothing about the cluster and counts toward neither failure field;
+`DependencyFailed` is a check recorded rather than attempted, which is what keeps a dead cluster
+costing one timeout per cycle instead of one per check. Free-form text goes in `Message`, never
+`Reason`.
+
+A `State` is a value copy, but a **shallow** one: the slices inside belong to the prober and every
+watcher shares the backing array.
+
+The pool owns the reading, so every holder agrees: `State.Phase()` is `Pending`/`Unreached`/`Probed`
+off `Connection` (the trap it exists for — no attempt yet is not an attempt that failed), and
+`State.Identity()` projects the three comparable scalars out of the rich observations. The verdicts
+stay above: condition types, reasons, and `Inactive` are the record's vocabulary, not the pool's.
 
 **Everything a holder learns comes through its `Lease`** — `Conn`, `State()`, `WatchState()` — so
 the pool needs no index from a credential key back out to the contexts sharing it. `WatchState` is
@@ -228,43 +331,6 @@ server as one user are one socket and one probe. Nothing in the vocabulary of a 
 says so, which is why the package doc leads with it: do not read the location as one entry per
 cluster. The resolve belongs here rather than at the caller, so what a connection was built from
 and what it is stored under cannot disagree.
-
-### The probe cache (`internal/clustersvc/internal/kubeidentity`)
-
-**The split `kubeconfig.Service` keeps**: `Get` reads memory, the network happens elsewhere.
-
-**What it holds is keyed by credentials.** An `entry` is one probe's answer plus the key
-`RESTConfig` returned for the credentials that probe dialed, and every `Get` re-resolves the
-context and returns the answer **only if it was learned under the key the context names now**.
-That is what makes a stored identity refutable: a kubeconfig edit rotating a token or
-re-pointing the server would otherwise leave an answer describing a connection nobody would
-make again, with nothing in the process able to tell. Credentials that moved read as "nothing
-known" — the same thing an unprobed context reads as, and the right one, since neither is a
-claim about a server. **So the resolve is never memoized**: it *is* the check.
-
-**Nothing here subscribes to the kubeconfig.** The key check keeps the answer honest without
-one, and promptness arrives from above — the pass that asks is itself woken when the file moves
-(kubeconfig trigger → source anchor → every cluster). A per-context subscription here would
-make that wake precise rather than fleet-wide; it is the same change as dropping `Cluster`'s
-edge onto the anchor, and belongs with it.
-
-**The probe is not written**: nothing calls `record`, so every context that resolves reads as
-"nothing known" and `Subscribe` never fires — the state callers already render.
-
-What lands next is the probe, and `record(contextName, key, state)` is the seam it calls. Three
-things it owes, all of them reasons this package exists. **It must stay off the caller's
-goroutine**, which is the split. **It must pass the key it resolved before dialing**, not one
-re-read after, so a file that moves mid-probe cannot make the answer look current. And **it
-must re-dial on a cadence of its own**: a server that changes identity under unchanged
-credentials moves nothing in the kubeconfig, so no push signal anywhere can report it and the
-cadence is the only detector — `clusterResync` is not it, since no reconcile pass dials.
-Probing belongs keyed by **credentials**, not by context: the key excludes the context name, so
-two contexts aimed at one server as one user are one probe's worth of work.
-
-`record` publishes only when the answer moved, since a signal wakes the cluster's pass and
-re-emits its record to every watcher — the same silence `ClusterStatus` above is written for.
-`sameState` compares errors **by message**, because a probe failure is rebuilt per attempt and
-comparing by value would publish every cadence for a cluster that is steadily down.
 
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache

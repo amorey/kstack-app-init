@@ -15,41 +15,40 @@
 package kubeconn
 
 import (
-	"context"
-	"fmt"
 	"testing"
+	"time"
 
-	"github.com/stretchr/testify/require"
-	"k8s.io/client-go/rest"
-
-	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
+	"github.com/stretchr/testify/assert"
 )
 
-// The shape the cluster service composes this into.
-var _ lifecycle.StartCloser = (*Service)(nil)
+var runAt = time.Date(2026, 8, 23, 10, 5, 0, 0, time.UTC)
 
-// fakeKubeconfig resolves the contexts it holds and reports every other one departed, which is
-// what the real service does.
-type fakeKubeconfig struct {
-	keys map[string]string
+// A check the prober records without dispatching has no duration: subtracting a zero
+// StartedAt would report the time since the zero year.
+func TestLatencyIsZeroForARunThatNeverStarted(t *testing.T) {
+	a := Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonDependencyFailed}
+
+	assert.True(t, a.Done())
+	assert.False(t, a.Running())
+	assert.Zero(t, a.Latency())
 }
 
-func (f *fakeKubeconfig) RESTConfig(contextName string) (*rest.Config, string, error) {
-	key, ok := f.keys[contextName]
-	if !ok {
-		return nil, "", fmt.Errorf("%w: %q", kubeconfig.ErrContextNotFound, contextName)
+func TestLatencyMeasuresADispatchedRun(t *testing.T) {
+	a := Attempt{ScheduledAt: runAt, StartedAt: runAt, FinishedAt: runAt.Add(2 * time.Second)}
+
+	assert.Equal(t, 2*time.Second, a.Latency())
+}
+
+// A suspended check keeps its last answer and schedules nothing.
+func TestSuspendedCheckKeepsItsAnswer(t *testing.T) {
+	o := Observation[string]{
+		Value:       "abc-123",
+		LastSeen:    runAt,
+		LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonDependencyFailed},
 	}
-	return &rest.Config{Host: "https://" + contextName + ".example"}, key, nil
-}
 
-func TestStopAndCloseAreIdempotent(t *testing.T) {
-	s := New(&fakeKubeconfig{keys: map[string]string{"a": "k1"}})
-
-	stop, err := s.Start(context.Background())
-	require.NoError(t, err)
-	require.NoError(t, stop(context.Background()))
-	require.NoError(t, stop(context.Background()))
-	require.NoError(t, s.Close())
-	require.NoError(t, s.Close())
+	assert.True(t, o.Known(), "the UID it read is still the UID it read")
+	assert.False(t, o.OK())
+	assert.False(t, o.Scheduled(), "nothing is due until the connection comes back")
+	assert.False(t, o.InFlight())
 }

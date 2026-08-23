@@ -50,7 +50,7 @@
 // prefixes above are persisted. Renaming one is a store migration the moment anything
 // writes.
 //
-// Cluster carries connection status (Connected, Healthy conditions + server/principal
+// Cluster carries connection status (Connected, Identified conditions + server/principal
 // facts); its ClusterCache child carries sync status, folded per kind from the
 // ClusterCachedResource records below it.
 //
@@ -72,7 +72,6 @@ import (
 	beehivesqlite "github.com/amorey/beehive/sqlite"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
@@ -134,7 +133,6 @@ type (
 	Lease                 = kubeconn.Lease
 	Connection            = kubeconn.Connection
 	ConnIdentity          = kubeconn.Identity
-	ConnProbe             = kubeconn.Result
 	ConnState             = kubeconn.State
 	ConnStateSubscription = kubeconn.StateSubscription
 )
@@ -342,23 +340,21 @@ type deps struct {
 	resourceClient beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
 	sourceClient   beehive.Client[ClusterSourceSpec, ClusterSourceStatus]
 
-	kubeconfigSvc   kubeconfigService
-	kubeidentitySvc kubeidentityService
-	kubeconnSvc     kubeconnService
-	pokeSvc         *poke.Service
+	kubeconfigSvc kubeconfigService
+	kubeconnSvc   kubeconnService
+	pokeSvc       *poke.Service
 }
 
-func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeidentitySvc kubeidentityService, kubeconnSvc kubeconnService, pokeSvc *poke.Service) deps {
+func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, pokeSvc *poke.Service) deps {
 	return deps{
-		clusterClient:   beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
-		cacheClient:     beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
-		catalogClient:   beehive.NewClient[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus](bh, ClusterCachedCatalogGroupKind),
-		resourceClient:  beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
-		sourceClient:    beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
-		kubeconfigSvc:   kubeconfigSvc,
-		kubeidentitySvc: kubeidentitySvc,
-		kubeconnSvc:     kubeconnSvc,
-		pokeSvc:         pokeSvc,
+		clusterClient:  beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
+		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
+		catalogClient:  beehive.NewClient[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus](bh, ClusterCachedCatalogGroupKind),
+		resourceClient: beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
+		sourceClient:   beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
+		kubeconfigSvc:  kubeconfigSvc,
+		kubeconnSvc:    kubeconnSvc,
+		pokeSvc:        pokeSvc,
 	}
 }
 
@@ -417,12 +413,10 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 		return nil, fmt.Errorf("init beehive: %w", err)
 	}
 
-	// The two that name credentials: everything above them asks about a kube-context or a
-	// cluster, and these are what turn one into the credentials a probe dials and the key
-	// its answer is filed under.
-	kubeidentitySvc := kubeidentity.New(kubeconfigSvc)
+	// The one that names credentials: everything above it asks about a kube-context or a
+	// cluster, and this is what turns one into the credentials a probe dials.
 	kubeconnSvc := kubeconn.New(kubeconfigSvc)
-	d := newDeps(bh, kubeconfigSvc, kubeidentitySvc, kubeconnSvc, pokeSvc)
+	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)
 
 	controllers, err := registerControllers(bh, d)
 	if err != nil {
@@ -431,11 +425,8 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 	}
 
 	parts := []lifecycle.Part{
-		// Ahead of beehive, so a pass never reads an identity cache that is not up yet,
-		// and so its workers stop only once the passes reading them have.
-		{Name: "kubeidentity", StartCloser: kubeidentitySvc},
-		// Ahead of beehive for the same reason: closing drops sockets, and a connection has
-		// to outlive every pass that could still be dialing on it.
+		// Ahead of beehive: closing drops sockets, and a connection has to outlive every
+		// pass that could still be dialing on it.
 		{Name: "kubeconn", StartCloser: kubeconnSvc},
 		{Name: "beehive", StartCloser: beehiveRuntime{bh: bh, store: bhStore}},
 		clusterSourceBootstrap(d),
@@ -485,7 +476,6 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	// is what makes the option mean anything. Each returns below as a Part after the
 	// controllers, so nothing pokes a kind before there is something to poke.
 	kubeconfigTrigger := newKubeconfigTrigger(d.kubeconfigSvc)
-	identityTrigger := newKubeidentityTrigger(d.kubeidentitySvc)
 
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
@@ -494,7 +484,7 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	resource := &clusterCachedResourceController{}
 
 	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigTrigger.Wakes()))
-	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync, beehive.WithTriggerByName(identityTrigger.Wakes()))
+	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync)
 	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
 	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
 	errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
@@ -508,7 +498,6 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 		{Name: "cached-catalog controller", StartCloser: catalog},
 		{Name: "cached-resource controller", StartCloser: resource},
 		{Name: "kubeconfig trigger", StartCloser: lifecycle.StartFunc(kubeconfigTrigger.Start)},
-		{Name: "kubeidentity trigger", StartCloser: lifecycle.StartFunc(identityTrigger.Start)},
 	}, nil
 }
 

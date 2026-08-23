@@ -18,8 +18,10 @@ package clustersvc
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
@@ -29,7 +31,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
@@ -60,44 +61,114 @@ func newTestDeps(t *testing.T) deps {
 	return d
 }
 
-// fakeKubeidentity answers per context from a map, and records who was asked for. The
-// zero value has nothing to say about anything, which is the state before a probe has
-// answered — what a cluster pass finds unless a test says otherwise.
-type fakeKubeidentity struct {
-	states map[string]identityAnswer
+// fakeKubeconn stands in for the pool: it answers per context from a map and records who
+// was asked for. The zero value refuses nothing and knows nothing, which is a fleet whose
+// first probe is still owed — what a cluster pass finds unless a test says otherwise.
+type fakeKubeconn struct {
+	states map[string]kubeconn.State
+	// refuse is what Acquire returns for a context, standing in for a kubeconfig that
+	// cannot resolve it.
+	refuse map[string]error
 	asked  []string
+
+	released []string
 }
 
-// identityAnswer pairs what the service knows with whether it knows anything, so a test
-// can hand back "asked, unanswered" as easily as an answer.
-type identityAnswer struct {
-	state kubeidentity.State
-	known bool
-}
-
-func (f *fakeKubeidentity) Get(contextName string) (kubeidentity.State, bool) {
+func (f *fakeKubeconn) Acquire(contextName string) (kubeconn.Lease, error) {
 	f.asked = append(f.asked, contextName)
-	s := f.states[contextName]
-	return s.state, s.known
+	if err := f.refuse[contextName]; err != nil {
+		return nil, err
+	}
+	return &fakeLease{svc: f, contextName: contextName, state: f.states[contextName]}, nil
 }
 
-func (f *fakeKubeidentity) Subscribe() kubeidentity.Subscription {
-	panic("a cluster pass reads, it does not subscribe")
+// fakeLease is one claim, holding what a probe would have found. It records its release so
+// a test can pin the lifetime a pass is meant to keep.
+type fakeLease struct {
+	svc         *fakeKubeconn
+	contextName string
+	state       kubeconn.State
 }
 
-// fakeKubeconn stands in for the pool. Nothing claims a connection yet, so a test that
-// reaches it has found a pass doing something it is not meant to.
-type fakeKubeconn struct{}
-
-func (fakeKubeconn) Acquire(string) (kubeconn.Lease, error) {
-	panic("no pass claims a connection yet")
+func (l *fakeLease) Conn(context.Context) (*kubeconn.Connection, error) {
+	panic("a cluster pass claims, it does not dial")
 }
 
-// answering is a service that answers for "prod" with an identity and an error.
-func answering(id kubeidentity.Identity, err error) *fakeKubeidentity {
-	return &fakeKubeidentity{states: map[string]identityAnswer{
-		"prod": {state: kubeidentity.State{Identity: id, Err: err}, known: true},
-	}}
+func (l *fakeLease) State() kubeconn.State { return l.state }
+
+func (l *fakeLease) WatchState() kubeconn.StateSubscription {
+	panic("a cluster pass reads, it does not watch")
+}
+
+func (l *fakeLease) Release() { l.svc.released = append(l.svc.released, l.contextName) }
+
+// probedAt is when every fake probe landed. Fixed, so a test asserting the stamp names a
+// value rather than reading the clock the code under test would.
+var probedAt = time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+
+// answering is a pool whose "prod" claim reached the server and read id, or failed with
+// err. The shape most tests want; knowing builds anything else.
+func answering(id kubeconn.Identity, err error) *fakeKubeconn {
+	if err != nil {
+		return knowing(kubeconn.State{Connection: failed(err)})
+	}
+	// A part id leaves empty is left unanswered, which is what a probe that could not read
+	// it reports.
+	st := kubeconn.State{
+		Connection: answeredWith("https://prod.example:6443"),
+		Readiness:  answeredWith(kubeconn.ComponentStatus{}),
+	}
+	if id.ServerUID != "" {
+		st.ServerUID = answeredWith(id.ServerUID)
+	}
+	if id.ServerVersion != "" {
+		st.ServerVersion = answeredWith(kubeconn.VersionInfo{GitVersion: id.ServerVersion})
+	}
+	if id.Username != "" {
+		st.Principal = answeredWith(kubeconn.Principal{Username: id.Username})
+	}
+	return knowing(st)
+}
+
+// answeredWith is a check that answered v at probedAt.
+func answeredWith[T any](v T) kubeconn.Observation[T] {
+	return kubeconn.Observation[T]{
+		Value:       v,
+		LastSeen:    probedAt,
+		LastAttempt: finished(kubeconn.ReasonSucceeded, ""),
+	}
+}
+
+// failed is a check whose last attempt did not answer.
+func failed(err error) kubeconn.Observation[string] {
+	return kubeconn.Observation[string]{
+		LastAttempt: finished(kubeconn.ReasonUnreachable, err.Error()),
+		Failures:    1, FailingSince: probedAt,
+	}
+}
+
+// finished is an attempt that ran and ended at probedAt, which is what makes its reason
+// readable.
+func finished(reason kubeconn.Reason, msg string) kubeconn.Attempt {
+	a := kubeconn.Attempt{
+		ScheduledAt: probedAt, StartedAt: probedAt, FinishedAt: probedAt,
+		Reason: reason, Message: msg,
+	}
+	if msg != "" {
+		a.Err = errors.New(msg)
+	}
+	return a
+}
+
+// knowing is a pool whose "prod" claim holds exactly this state.
+func knowing(state kubeconn.State) *fakeKubeconn {
+	return &fakeKubeconn{states: map[string]kubeconn.State{"prod": state}}
+}
+
+// refusing is a pool that will not claim "prod", standing in for a context the kubeconfig
+// cannot resolve.
+func refusing(err error) *fakeKubeconn {
+	return &fakeKubeconn{refuse: map[string]error{"prod": err}}
 }
 
 // newTestDepsAndBeehive is newTestDeps plus the beehive behind it, for a test that has
@@ -105,7 +176,7 @@ func answering(id kubeidentity.Identity, err error) *fakeKubeidentity {
 func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeidentity{}, fakeKubeconn{}, nil)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -124,7 +195,7 @@ func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	return newDeps(bh, newTestKubeconfig(t), &fakeKubeidentity{}, fakeKubeconn{}, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -161,7 +232,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeidentity{}, fakeKubeconn{}, nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, nil)
 }
 
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the
@@ -195,4 +266,13 @@ func cfgCurrent(current string, names ...string) *api.Config {
 	cfg := cfgWith(names...)
 	cfg.CurrentContext = current
 	return cfg
+}
+
+// forbidden is a check the server answered and refused, which is a grant to fix rather
+// than an outage to wait out.
+func forbidden(msg string) kubeconn.Observation[string] {
+	return kubeconn.Observation[string]{
+		LastAttempt: finished(kubeconn.ReasonForbidden, msg),
+		Failures:    1, FailingSince: probedAt,
+	}
 }

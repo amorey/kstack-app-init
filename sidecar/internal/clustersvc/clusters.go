@@ -31,7 +31,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
@@ -82,12 +81,18 @@ type ClusterStatusSource struct {
 type ClusterServer struct {
 	UID     *string `json:"uid,omitempty"`
 	Version *string `json:"version,omitempty"`
+	// Endpoint is the API server URL that answered, which two contexts naming one
+	// server share — the fact that explains why they resolve to one connection.
+	Endpoint *string `json:"endpoint,omitempty"`
 }
 
 // ClusterPrincipal holds last-known facts about the connecting client's
 // identity on the cluster. Nil fields mean never probed.
 type ClusterPrincipal struct {
 	Username *string `json:"username,omitempty"`
+	// Groups is what the username's access actually comes from, since RBAC binds to
+	// groups far more often than to users. Sorted, so a re-ordered read is not a change.
+	Groups []string `json:"groups,omitempty"`
 }
 
 // ClusterSpec is a cluster record's desired state (user/API-owned). No trigger
@@ -104,11 +109,14 @@ type ClusterSpec struct {
 // ClusterStatus is both the stored status and the one served to GraphQL:
 // connection/health observations. Sync status lives on the ClusterCache child, so
 // there is no merge type.
+//
+// **Only facts that change when the cluster does.** Every differing byte re-emits the
+// record to every watcher, so per-probe telemetry — reasons, latency, failure counts,
+// the next attempt — stays on the lease, where a reader that wants it takes one.
 type ClusterStatus struct {
-	Source          ClusterStatusSource `json:"source"`
-	Server          ClusterServer       `json:"server"`
-	Principal       ClusterPrincipal    `json:"principal"`
-	LastConnectedAt *time.Time          `json:"lastConnectedAt,omitempty"`
+	Source    ClusterStatusSource `json:"source"`
+	Server    ClusterServer       `json:"server"`
+	Principal ClusterPrincipal    `json:"principal"`
 }
 
 // clusterStatus returns the stored status, or the zero value: beehive leaves Status
@@ -426,9 +434,9 @@ const clusterProbeInterval = 5 * time.Minute
 // about the record's context, reports what connecting with that context's credentials
 // revealed, and creates the ClusterCache for the identity it found.
 //
-// The dial is not in the pass. kubeidentity answers from what it already knows, so a
-// record whose probe is still owed reports Connecting and comes back when the probe
-// publishes rather than blocking here.
+// The dial is not in the pass. A claim reports what its last probe found, so a record
+// whose probe is still owed reports Connecting and comes back when the probe publishes
+// rather than blocking here.
 //
 // The kubeconfig service it reads to observe a context's presence is the app's,
 // shared with every other reader, so it is a dependency rather than machinery.
@@ -454,6 +462,10 @@ type clusterController struct {
 // controller's, so the pool is reached through deps like every other service and there is
 // one place it can be wired wrong.
 //
+// A claim names a context, and a record's context is fixed in its name, so a held claim
+// stays the right one for as long as the record exists. Credentials moving under that
+// context is the pool's to notice, not this map's.
+//
 // These are the controller's own claims, not every claim on a cluster. A caller reaching
 // the boundary takes one of its own and releases it when done — the pool refcounts, so a
 // log tail ending must not drop the claim keeping this cluster probed. The claims are
@@ -462,27 +474,41 @@ type clusterController struct {
 type clusterLeases struct {
 	// Passes run per object and concurrently, and Close races whatever is mid-pass.
 	mu   sync.Mutex
-	held map[ClusterID]heldLease
+	held map[ClusterID]kubeconn.Lease
 }
 
-// heldLease is one cluster's claim and the context it was taken for. The context is what
-// makes the claim refutable: a record re-pointed at another one is a different claim, and
-// handing back the old one would report a server these credentials no longer reach.
-type heldLease struct {
-	contextName string
-	lease       kubeconn.Lease
-}
-
-// ensureLease returns the cluster's claim, taking one if it has none and replacing it if
-// the context moved.
+// ensureLease returns the cluster's claim, taking one if it has none.
 func (c *clusterController) ensureLease(id ClusterID, contextName string) (kubeconn.Lease, error) {
-	panic("not implemented")
+	c.leases.mu.Lock()
+	defer c.leases.mu.Unlock()
+
+	if held, ok := c.leases.held[id]; ok {
+		return held, nil
+	}
+
+	lease, err := c.kubeconnSvc.Acquire(contextName)
+	if err != nil {
+		return nil, err
+	}
+	if c.leases.held == nil {
+		c.leases.held = map[ClusterID]kubeconn.Lease{}
+	}
+	c.leases.held[id] = lease
+	return lease, nil
 }
 
 // dropLease releases the cluster's claim, if it holds one. Idempotent: a pass that finds a
 // cluster disabled calls it without knowing whether one was ever taken.
 func (c *clusterController) dropLease(id ClusterID) {
-	panic("not implemented")
+	c.leases.mu.Lock()
+	defer c.leases.mu.Unlock()
+
+	held, ok := c.leases.held[id]
+	if !ok {
+		return
+	}
+	delete(c.leases.held, id)
+	held.Release()
 }
 
 func (c *clusterController) Reconcile(
@@ -491,8 +517,10 @@ func (c *clusterController) Reconcile(
 	obj *beehive.Object[ClusterSpec, ClusterStatus],
 ) beehive.ReconcileResult {
 	// Nothing to observe for a record on its way out, and no finalizer to clear:
-	// beehive collects it either way.
+	// beehive collects it either way. The claim is dropped rather than left for the
+	// collection, so a cluster stops being probed the moment its deletion is asked for.
 	if obj.DeletionRequestedAt != nil {
+		c.dropLease(ClusterID(obj.ID))
 		return beehive.Settled()
 	}
 
@@ -531,22 +559,27 @@ func (c *clusterController) Reconcile(
 	status := stored
 	status.Source.Kubeconfig = observeKubeconfig(cfg, obj.Spec.Source.Kubeconfig, stored.Source.Kubeconfig)
 
-	cond, identity := c.observeIdentity(obj)
-	status = foldIdentity(status, identity)
+	// A record from a source with no credentials to resolve gets no conditions at all,
+	// rather than verdicts no probe produced.
+	var conds []Condition
+	connState := c.reconcileConnection(obj)
+	if connState != nil {
+		conds = []Condition{observeConnected(connState), observeIdentified(connState)}
+		status = foldState(status, connState.observed)
+	}
 
-	// Grouped so a watcher never sees the status without the condition that explains it.
-	// Both writes are unconditional: beehive compares each against what is stored and
+	// Grouped so a watcher never sees the status without the conditions that explain it.
+	// Every write is unconditional: beehive compares each against what is stored and
 	// reaches it only when it differs, so a pass that observed nothing new costs a
 	// marshal rather than a transaction.
 	if err := client.Within(ctx, func(ctx context.Context) error {
 		if err := client.UpdateStatus(ctx, status); err != nil {
 			return fmt.Errorf("update status: %w", err)
 		}
-		if cond == nil {
-			return nil
-		}
-		if err := client.SetCondition(ctx, *cond); err != nil {
-			return fmt.Errorf("set condition: %w", err)
+		for _, cond := range conds {
+			if err := client.SetCondition(ctx, cond); err != nil {
+				return fmt.Errorf("set condition %s: %w", cond.Type, err)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -564,71 +597,144 @@ func (c *clusterController) Reconcile(
 	return beehive.Settled()
 }
 
-// observeIdentity reports what is known about the server this record's credentials
-// reach: the Connected condition, and the identity behind it when there is one.
+// connectionState is what one pass found about a cluster's connection. Separated from the
+// verdicts so the claim's lifetime happens once while each condition reads the same finding.
+//
+// observed is what the claim read, nil when there is no claim to read it off — the three
+// findings this package makes before the pool is involved: the record is switched off, its
+// context left the file, or its credentials will not resolve. The server still exists in all
+// three; what is missing is our observation of it. inactive marks the first two and takes
+// precedence, since the pool cannot see a choice the user made.
+type connectionState struct {
+	inactive bool
+	// reason and message are Connected's. Identified derives its own, since a server
+	// nothing reached is not unidentifiable, only unassessed.
+	reason   string
+	message  string
+	observed *kubeconn.State
+}
+
+// reconcileConnection brings this cluster's claim in line with what its record asks for —
+// taken while it should be connected, dropped otherwise — and reports what it found. The
+// one place the pass touches the pool, so the verdicts below stay pure.
 //
 // Only a kubeconfig-sourced record has credentials to resolve. Another source's are not
-// this pass's to guess at, so it reports no condition at all rather than one claiming a
-// verdict nothing produced.
-func (c *clusterController) observeIdentity(
-	obj *beehive.Object[ClusterSpec, ClusterStatus],
-) (*Condition, *kubeidentity.Identity) {
+// this pass's to guess at, so it reports nothing at all rather than a finding no probe
+// produced — and holds no claim on its behalf either.
+func (c *clusterController) reconcileConnection(obj *beehive.Object[ClusterSpec, ClusterStatus]) *connectionState {
+	id := ClusterID(obj.ID)
+
 	src := obj.Spec.Source.Kubeconfig
 	if src == nil {
-		return nil, nil
+		c.dropLease(id)
+		return nil
 	}
 
 	if !obj.Spec.Enabled {
-		return connectedCondition(ConditionFalse, ReasonInactive, "cluster is disabled"), nil
+		// Releasing is what stops the probe: a disabled cluster costs nothing to keep as a
+		// record, and should cost no dial.
+		c.dropLease(id)
+		return &connectionState{inactive: true, reason: ReasonInactive, message: "cluster is disabled"}
 	}
 
-	state, known := c.kubeidentitySvc.Get(src.Context)
-	if !known {
-		// Asked and not answered. The signal a probe publishes is what brings this record
-		// back, with the kind's cadence behind it covering a signal that went missing.
-		return connectedCondition(ConditionUnknown, ReasonConnecting, "probe pending"), nil
-	}
-
-	if errors.Is(state.Err, kubeconfig.ErrContextNotFound) {
+	// The claim is what arms the probe behind this context. Held across passes, so
+	// ensuring it is all a pass does; what the probe found is read off it below.
+	lease, err := c.ensureLease(id, src.Context)
+	if errors.Is(err, kubeconfig.ErrContextNotFound) {
 		// The context left the file. Told apart from a probe that failed because they are
 		// different news: this one the user did on purpose, and there is nothing to
 		// connect to until they undo it.
-		return connectedCondition(ConditionFalse, ReasonInactive,
-			"kube-context is no longer in the kubeconfig"), nil
+		return &connectionState{inactive: true, reason: ReasonInactive,
+			message: "kube-context is no longer in the kubeconfig"}
 	}
-	if state.Err != nil {
+	if err != nil {
 		// The context is there and its entries do not resolve — a file the user has to fix,
 		// which beehive's backoff cannot. Reported on the record rather than failing the
 		// pass, and left to this kind's cadence to retry.
-		return connectedCondition(ConditionFalse, ReasonResolveFailed, state.Err.Error()), nil
+		return &connectionState{reason: ReasonResolveFailed, message: err.Error()}
 	}
-	return connectedCondition(ConditionTrue, ReasonConnected, ""), &state.Identity
+
+	state := lease.State()
+	found := &connectionState{observed: &state}
+	switch state.Phase() {
+	case kubeconn.PhasePending:
+		// Claimed and not yet answered. The signal a probe publishes is what brings this
+		// record back, with the kind's cadence behind it covering a signal that went missing.
+		found.reason, found.message = ReasonConnecting, "probe pending"
+	case kubeconn.PhaseUnreached:
+		// The credentials resolve and the server would not answer. Left to the probe's own
+		// cadence rather than failing the pass, which has nothing to retry.
+		found.reason, found.message = ReasonProbeFailed, state.Connection.LastAttempt.Message
+	default:
+		found.reason = ReasonConnected
+	}
+	return found
 }
 
-// connectedCondition is the Connected verdict this pass reports, which is the only
-// condition it writes.
-func connectedCondition(status ConditionStatus, reason, message string) *Condition {
-	cond := LiveCondition(ConditionConnected, status, reason, message)
-	return &cond
+// observeConnected reports whether the last probe reached the API server. It carries the
+// reason the pass got only this far, which is why it reads its finding rather than
+// deriving one.
+func observeConnected(connState *connectionState) Condition {
+	status := ConditionFalse
+	switch {
+	case connState.inactive, connState.observed == nil:
+		// False, with the reason the finding carries.
+	case connState.observed.Phase() == kubeconn.PhasePending:
+		status = ConditionUnknown
+	case connState.observed.Phase() == kubeconn.PhaseProbed:
+		status = ConditionTrue
+	}
+	return LiveCondition(ConditionConnected, status, connState.reason, connState.message)
 }
 
-// foldIdentity folds what a probe read into the status that serves it.
+// observeIdentified reports whether the probe could tell which cluster answered.
 //
-// A fact the probe could not reach leaves the last-known value alone: that is what keeps
-// a server gone unreachable identifiable, and what stops an unanswered probe from
-// deactivating a live cache by clearing the UID it is named for.
-func foldIdentity(status ClusterStatus, id *kubeidentity.Identity) ClusterStatus {
-	if id == nil {
+// Reaching a server needs no authorization and naming it does, so this fails on its own —
+// and when it does, no cache is ever created, since a cache is named for the identity it
+// mirrors.
+func observeIdentified(st *connectionState) Condition {
+	switch {
+	case st.inactive:
+		return LiveCondition(ConditionIdentified, ConditionFalse, ReasonInactive, st.message)
+	case st.observed == nil, st.observed.Phase() == kubeconn.PhaseUnreached:
+		return LiveCondition(ConditionIdentified, ConditionFalse, ReasonNoConnection, "")
+	case st.observed.Phase() == kubeconn.PhasePending:
+		return LiveCondition(ConditionIdentified, ConditionUnknown, ReasonConnecting, "probe pending")
+	case !st.observed.ServerUID.OK():
+		return LiveCondition(ConditionIdentified, ConditionFalse, ReasonUIDUnreadable,
+			st.observed.ServerUID.LastAttempt.Message)
+	default:
+		return LiveCondition(ConditionIdentified, ConditionTrue, ReasonIdentified, "")
+	}
+}
+
+// foldState folds what the pool knows into the status that serves it.
+//
+// The pool already retains a check's last answer through a failure, so this copies rather
+// than deciding what to keep — and a check that has never answered leaves its field alone,
+// which is what stops a first pass from clearing a UID a live cache is named for. The
+// record's copy is the durable one: a restart empties the pool's.
+//
+// Only the checks' values land here, never their timing: a status that moved every probe
+// would re-emit the record to every watcher on every cycle.
+func foldState(status ClusterStatus, known *kubeconn.State) ClusterStatus {
+	if known == nil {
 		return status
 	}
-	if uid := id.ServerUID; uid != "" {
-		status.Server.UID = &uid
+	if o := known.Connection; o.Known() {
+		status.Server.Endpoint = &o.Value
 	}
-	if version := id.ServerVersion; version != "" {
-		status.Server.Version = &version
+	if o := known.ServerUID; o.Known() {
+		status.Server.UID = &o.Value
 	}
-	if username := id.Username; username != "" {
-		status.Principal.Username = &username
+	if o := known.ServerVersion; o.Known() {
+		v := o.Value.GitVersion
+		status.Server.Version = &v
+	}
+	if o := known.Principal; o.Known() {
+		u := o.Value.Username
+		status.Principal.Username = &u
+		status.Principal.Groups = slices.Sorted(slices.Values(o.Value.Groups))
 	}
 	return status
 }

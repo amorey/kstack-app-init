@@ -26,10 +26,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/amorey/gobus"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -128,24 +126,5 @@ func newKubeconfigTrigger(cfgSource kubeconfigSource) *trigger[*api.Config] {
 	return newTrigger(
 		func() feed[*api.Config] { return cfgSource.Subscribe() },
 		func(*api.Config) string { return ClusterSourceNameKubeconfig },
-	)
-}
-
-// kubeidentitySource is the subscribe half of kubeidentityService, all a trigger needs,
-// narrow so a test can substitute a hand-driven hub.
-type kubeidentitySource interface {
-	Subscribe() kubeidentity.Subscription
-}
-
-// newKubeidentityTrigger wakes the cluster record for a context whose probe answered
-// differently. A record reads what is known from kubeidentity rather than from the
-// store, so beehive cannot know when that observation went stale; this is the only thing
-// that reaches it, and the kind's own resync is what covers a signal that went missing.
-func newKubeidentityTrigger(idSource kubeidentitySource) *trigger[gobus.Event[string, struct{}]] {
-	return newTrigger(
-		func() feed[gobus.Event[string, struct{}]] { return idSource.Subscribe() },
-		// The event's key is the context that moved; its value carries nothing, since
-		// what it now says is the pass's to read.
-		func(ev gobus.Event[string, struct{}]) string { return KubeconfigName(ev.Key) },
 	)
 }

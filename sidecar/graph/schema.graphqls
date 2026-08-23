@@ -55,10 +55,15 @@ enum ConditionStatus {
 
 """
 One Kubernetes-style status condition: an independently-tracked aspect of the
-record's observed state. Connection-controller conditions (on `Cluster.conditions`):
-`Connected` (the last probe reached the API server; reasons Connecting/
-Connected/ResolveFailed/ProbeFailed/Inactive) and `Healthy` (the server's own
-readiness; reasons Ready/ReadyzFailed/Unreachable/NoConnection/Inactive).
+record's observed state. Connection-controller conditions (on `Cluster.conditions`),
+two aspects with two subjects — whether we reached it, and whether these credentials
+could name it: `Connected` (the last probe reached the API server; reasons
+Connecting/Connected/ResolveFailed/ProbeFailed/Inactive) and `Identified` (the probe
+could tell which cluster answered; reasons Identified/UIDUnreadable/Connecting/
+NoConnection/Inactive). Reaching a server needs no authorization and naming it does, so
+`Identified` fails on its own — and a cluster it fails for never gets a `ClusterCache`,
+which is named for the identity it mirrors. Each points at a different remedy: the
+network or the kubeconfig for one, an RBAC grant for the other.
 Sync-controller conditions: `Synced`, reported at two levels. On
 `ClusterCache.conditions` it is coarse (reasons Syncing/Paused) — the cache states
 only whether it decided to sync. The verdict a UI wants is the one on the cache's
@@ -233,7 +238,7 @@ type Cluster {
   spec: ClusterSpec!
   "Observed connection/health state, discovered by probing."
   status: ClusterStatus!
-  "The connection controller's conditions (`Connected`, `Healthy`)."
+  "The connection controller's conditions (`Connected`, `Identified`)."
   conditions: [Condition!]!
 
   """
@@ -301,8 +306,6 @@ type ClusterStatus {
   server: ClusterServer!
   "The connecting client's identity and effective access on this cluster."
   principal: ClusterPrincipal!
-  "When a connection probe last succeeded; null if never."
-  lastConnectedAt: Time
 }
 
 """
@@ -342,12 +345,16 @@ type ClusterServer {
   uid: String
   "Server version, e.g. \"v1.29.3\"."
   version: String
+  "API server URL that answered; null until probed. Two contexts naming one server share it."
+  endpoint: String
 }
 
 "The connecting client's identity and effective access on this cluster."
 type ClusterPrincipal {
   "Authenticated username the API server last mapped this cluster's credentials to (SelfSubjectReview); null until probed."
   username: String
+  "Groups the API server mapped these credentials into; empty until probed. Sorted. Where the principal's access usually comes from, since RBAC binds to groups more often than to users."
+  groups: [String!]!
   "Effective RBAC in a namespace (live SelfSubjectRulesReview), resolved on demand. Point-in-time, for debugging only — not authoritative for access decisions."
   permissions(namespace: String!): ClusterPermissions!
 }

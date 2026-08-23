@@ -18,11 +18,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/amorey/gobus/conflate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeidentity"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -54,18 +52,6 @@ func TestKubeconfigTriggerWakesTheAnchorForEachSnapshot(t *testing.T) {
 	src.publish(cfgWith("prod", "staging"))
 
 	assert.Equal(t, ClusterSourceNameKubeconfig, testutil.Recv(t, tr.Wakes(), "the second poke"))
-}
-
-// The context that answered is the record that moved, and mapping the two is the one
-// thing beehive cannot do: only this package knows the record's name.
-func TestKubeidentityTriggerWakesTheContextsCluster(t *testing.T) {
-	src := newFakeIdentitySource()
-	tr := newKubeidentityTrigger(src)
-	startTrigger(t, tr)
-
-	src.publish("staging")
-
-	assert.Equal(t, KubeconfigName("staging"), testutil.Recv(t, tr.Wakes(), "the poke"))
 }
 
 // The watcher shutting down ends the loop, and closing the channel is what ends
@@ -108,25 +94,6 @@ func TestTriggerStopLeavesTheKubeconfigServiceOpen(t *testing.T) {
 }
 
 // --- the seam ---
-
-// fakeIdentitySource is a hub the test publishes into, standing in for kubeidentity's
-// own workers: same per-context contract, driven by hand.
-type fakeIdentitySource struct {
-	hub *conflate.Hub[string, struct{}]
-}
-
-func newFakeIdentitySource() *fakeIdentitySource {
-	return &fakeIdentitySource{
-		hub: conflate.New[string, struct{}](),
-	}
-}
-
-func (f *fakeIdentitySource) Subscribe() kubeidentity.Subscription { return f.hub.Receiver() }
-
-// publish reports that what is known about one context's server moved.
-func (f *fakeIdentitySource) publish(contextName string) {
-	_ = f.hub.Sender().Send(contextName, struct{}{})
-}
 
 // stringFeed is a hand-driven feed carrying a type no source here produces, so the loop
 // is exercised against the seam rather than against its one implementation.
