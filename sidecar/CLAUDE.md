@@ -175,6 +175,18 @@ so a disabled, tombstoned, or non-kubeconfig record is dropped and costs no dial
 controller's own claims: a boundary caller takes its own, since the pool refcounts and a log tail
 ending must not stop this cluster being probed.
 
+**A probe landing wakes the context's cluster.** `newKubeconnTrigger` is the Cluster kind's
+`WithTriggerByName` feed, the same three-line `trigger[T]` shape as `newKubeconfigTrigger`: it
+reads `kubeconn.Service.Subscribe()` — a `gobus/conflate` bus keyed by **context name** — and maps
+each key through `KubeconfigName`. `conflate` and not `watch.WatchAcross`, which collapses a burst
+to whichever key landed last and would silently drop every other cluster's wake. The controller
+holds nothing and knows nothing about waking: it takes claims, and the trigger is registered beside
+the kubeconfig one.
+
+The pool publishes the same send two ways — per claim on `WatchState`, per context on `Subscribe`.
+The fleet feed is for a reader whose reaction to any change is the same ("re-read it"); a holder
+that cares about one claim watches that claim.
+
 **The pass reconciles the claim, then observes.** `reconcileConnection` is the one place that
 touches the pool — the claim is taken while the record asks to be connected and dropped otherwise
 — and it returns a `connectionState`: `observed`, the claim's `*kubeconn.State`, plus `Connected`'s

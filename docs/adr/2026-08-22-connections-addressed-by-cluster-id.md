@@ -107,7 +107,9 @@ for `ClusterPermissions` and a digest to diff. And nothing counts transitions of
 flaps and history come from the record's conditions and event timeline.
 
 Waking a beehive pass per cluster becomes a goroutine per claim rather than one reader over a
-fleet-wide bus.
+fleet-wide bus. Reversed by [wake cluster passes from a fleet-wide kubeconn
+bus](2026-08-23-kubeconn-wakes-ride-a-fleet-bus.md), which keeps the lease-scoped watch and
+adds a context-keyed feed beside it.
 
 The obligation the new location creates: the pool's unit is credentials, shared *across* clusters,
 and nothing in the vocabulary of a cluster record says so. The package doc has to lead with it, or

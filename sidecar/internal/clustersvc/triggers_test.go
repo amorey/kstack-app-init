@@ -134,3 +134,34 @@ func TestTriggerReleasesItsFeedOnExit(t *testing.T) {
 
 	testutil.Wait(t, closed.Chan(), "the feed released on exit")
 }
+
+// --- the kubeconn trigger ---
+
+// The point of the whole seam: a probe landing brings back the record for the context it
+// answered for, so the pass reads what the probe found instead of waiting out the cadence.
+func TestKubeconnTriggerWakesTheContextsCluster(t *testing.T) {
+	svc := &fakeKubeconn{}
+	tr := newKubeconnTrigger(svc)
+	startTrigger(t, tr)
+
+	svc.publish("prod")
+
+	assert.Equal(t, KubeconfigName("prod"), testutil.Recv(t, tr.Wakes(), "the wake for the context"))
+}
+
+// The bus holds a slot per context, so a fleet answering at once neither loses a context
+// behind a busier one nor collapses to whichever landed last.
+func TestKubeconnTriggerWakesEveryContextThatMoved(t *testing.T) {
+	svc := &fakeKubeconn{}
+	tr := newKubeconnTrigger(svc)
+	startTrigger(t, tr)
+
+	svc.publish("prod")
+	svc.publish("staging")
+
+	woke := []string{
+		testutil.Recv(t, tr.Wakes(), "the first wake"),
+		testutil.Recv(t, tr.Wakes(), "the second wake"),
+	}
+	assert.ElementsMatch(t, []string{KubeconfigName("prod"), KubeconfigName("staging")}, woke)
+}

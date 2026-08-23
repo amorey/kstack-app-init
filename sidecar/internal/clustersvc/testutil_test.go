@@ -20,11 +20,13 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
+	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gochan/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,6 +68,10 @@ func newTestDeps(t *testing.T) deps {
 // first probe is still owed — what a cluster pass finds unless a test says otherwise.
 type fakeKubeconn struct {
 	states map[string]kubeconn.State
+	// hub is the fleet feed, keyed by context the way the pool keys it. Built on demand so
+	// the zero value stays usable.
+	once sync.Once
+	hub  *conflate.Hub[string, struct{}]
 	// refuse is what Acquire returns for a context, standing in for a kubeconfig that
 	// cannot resolve it.
 	refuse map[string]error
@@ -80,6 +86,18 @@ func (f *fakeKubeconn) Acquire(contextName string) (kubeconn.Lease, error) {
 		return nil, err
 	}
 	return &fakeLease{svc: f, contextName: contextName, state: f.states[contextName]}, nil
+}
+
+// Subscribe is the fleet feed the trigger reads. publish is the probe landing on it.
+func (f *fakeKubeconn) Subscribe() kubeconn.Subscription { return f.moved().Receiver() }
+
+func (f *fakeKubeconn) publish(contextName string) {
+	f.moved().Sender().Send(contextName, struct{}{})
+}
+
+func (f *fakeKubeconn) moved() *conflate.Hub[string, struct{}] {
+	f.once.Do(func() { f.hub = conflate.New[string, struct{}]() })
+	return f.hub
 }
 
 // fakeLease is one claim, holding what a probe would have found. It records its release so

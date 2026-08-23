@@ -476,6 +476,7 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	// is what makes the option mean anything. Each returns below as a Part after the
 	// controllers, so nothing pokes a kind before there is something to poke.
 	kubeconfigTrigger := newKubeconfigTrigger(d.kubeconfigSvc)
+	kubeconnTrigger := newKubeconnTrigger(d.kubeconnSvc)
 
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
@@ -484,7 +485,7 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	resource := &clusterCachedResourceController{}
 
 	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigTrigger.Wakes()))
-	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync)
+	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync, beehive.WithTriggerByName(kubeconnTrigger.Wakes()))
 	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
 	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
 	errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
@@ -498,6 +499,7 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 		{Name: "cached-catalog controller", StartCloser: catalog},
 		{Name: "cached-resource controller", StartCloser: resource},
 		{Name: "kubeconfig trigger", StartCloser: lifecycle.StartFunc(kubeconfigTrigger.Start)},
+		{Name: "kubeconn trigger", StartCloser: lifecycle.StartFunc(kubeconnTrigger.Start)},
 	}, nil
 }
 

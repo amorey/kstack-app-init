@@ -68,6 +68,7 @@ type kubeconfigService interface {
 // the pass that took it, so the caller holds and releases rather than asking per pass.
 type kubeconnService interface {
 	Acquire(contextName string) (kubeconn.Lease, error)
+	Subscribe() kubeconn.Subscription
 }
 
 // --- Identity ---

@@ -43,6 +43,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gobus/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -292,6 +293,16 @@ func (s State) Identity() Identity {
 	}
 }
 
+// Subscription reports the contexts whose State moved, one event per context. Claims are
+// per context, so this is the fleet view of what WatchState reports per claim — same send,
+// both channels.
+//
+// A keyed bus, not a fan-out ring: it holds a slot per context, so a fleet answering at
+// once neither loses a context behind a busier one nor bounds what is remembered by a
+// buffer length. The value carries nothing — the key is the news, and the reader re-reads
+// the claim for what it now says.
+type Subscription = *conflate.Receiver[string, struct{}]
+
 // StateSubscription carries a claim's State: the current one on attach, then each one that says
 // something new. Close it when done — an abandoned one keeps its slot. Its key is the
 // credentials the probe ran against, which a holder of one claim has no use for.
@@ -374,12 +385,22 @@ func (c *Connection) Done() <-chan struct{} { return c.done }
 // Service is the pool the cluster service dials through.
 type Service struct {
 	kubecfgSvc kubeconfigService
+	hub        *conflate.Hub[string, struct{}]
 }
 
 // New returns a Service over the one reader of the user's kubeconfig.
 func New(kubecfgSvc kubeconfigService) *Service {
-	return &Service{kubecfgSvc: kubecfgSvc}
+	return &Service{
+		kubecfgSvc: kubecfgSvc,
+		hub:        conflate.New[string, struct{}](),
+	}
 }
+
+// Subscribe reports every context whose State moves, for a reader whose reaction to any of
+// them is the same. A holder that cares about one claim watches that claim instead.
+//
+// Nothing probes yet, so nothing is ever sent.
+func (s *Service) Subscribe() Subscription { return s.hub.Receiver() }
 
 // Acquire claims the connection for contextName's credentials and arms their probe cadence,
 // building the connection if this is the first caller. It does not dial — Lease.Conn is what
@@ -408,7 +429,8 @@ func (pendingLease) Conn(context.Context) (*Connection, error) { panic("nothing 
 
 func (pendingLease) State() State { return State{} }
 
-func (pendingLease) WatchState() StateSubscription { panic("nothing probes yet") }
+// WatchState has nothing to hand back: nothing probes, so this claim never publishes.
+func (pendingLease) WatchState() StateSubscription { return nil }
 
 func (pendingLease) Release() {}
 

@@ -26,8 +26,10 @@ import (
 	"context"
 	"sync"
 
+	"github.com/amorey/gobus"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -126,5 +128,24 @@ func newKubeconfigTrigger(cfgSource kubeconfigSource) *trigger[*api.Config] {
 	return newTrigger(
 		func() feed[*api.Config] { return cfgSource.Subscribe() },
 		func(*api.Config) string { return ClusterSourceNameKubeconfig },
+	)
+}
+
+// kubeconnSource is the subscribe half of the pool, all a trigger needs, narrow so a test
+// can substitute a hand-driven hub.
+type kubeconnSource interface {
+	Subscribe() kubeconn.Subscription
+}
+
+// newKubeconnTrigger wakes the cluster record for a context whose probe said something
+// new. A record reports what the pool holds rather than what the store does, so beehive
+// cannot know when that observation went stale; this is the only thing that reaches it,
+// and the kind's own resync covers a signal that went missing.
+func newKubeconnTrigger(pool kubeconnSource) *trigger[gobus.Event[string, struct{}]] {
+	return newTrigger(
+		func() feed[gobus.Event[string, struct{}]] { return pool.Subscribe() },
+		// The event's key is the context that moved; its value carries nothing, since what
+		// it now says is the pass's to read.
+		func(ev gobus.Event[string, struct{}]) string { return KubeconfigName(ev.Key) },
 	)
 }
