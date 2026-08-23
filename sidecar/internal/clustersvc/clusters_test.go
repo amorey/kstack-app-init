@@ -256,6 +256,36 @@ func TestReconcileReportsInactiveWhenDisabled(t *testing.T) {
 	assert.Equal(t, ReasonInactive, cond.Reason)
 }
 
+// Releasing is what stops the probe, so a cluster switched off after it connected has to
+// give its claim back — a record that costs nothing to keep should cost no dial.
+func TestReconcileReleasesTheClaimWhenTheClusterIsDisabled(t *testing.T) {
+	svc := answering(kubeconn.Identity{ServerUID: "uid-1"}, nil)
+	c := identityControllerOver(t, svc)
+	obj := createCluster(t, c.clusterClient, "prod")
+	reconcileCluster(t, c, &stubControllerClient{}, obj)
+	require.Equal(t, []string{"prod"}, svc.asked, "the enabled pass claims")
+
+	obj.Spec.Enabled = false
+	reconcileCluster(t, c, &stubControllerClient{}, obj)
+
+	assert.Equal(t, []string{"prod"}, svc.released)
+}
+
+// A record whose source stopped naming credentials has none to hold a claim on, so the
+// claim goes back for the same reason a disabled one's does.
+func TestReconcileReleasesTheClaimWhenTheSourceStopsNamingIt(t *testing.T) {
+	svc := answering(kubeconn.Identity{ServerUID: "uid-1"}, nil)
+	c := identityControllerOver(t, svc)
+	obj := createCluster(t, c.clusterClient, "prod")
+	reconcileCluster(t, c, &stubControllerClient{}, obj)
+	require.Empty(t, svc.released)
+
+	obj.Spec.Source.Kubeconfig = nil
+	reconcileCluster(t, c, &stubControllerClient{}, obj)
+
+	assert.Equal(t, []string{"prod"}, svc.released)
+}
+
 // A context the user removed is not a broken one: there is nothing to connect to until
 // they put it back, which reads differently from a cluster that would not answer.
 func TestReconcileReportsInactiveForADepartedContext(t *testing.T) {

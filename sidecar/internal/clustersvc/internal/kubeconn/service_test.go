@@ -52,3 +52,37 @@ func TestSuspendedCheckKeepsItsAnswer(t *testing.T) {
 	assert.False(t, o.Scheduled(), "nothing is due until the connection comes back")
 	assert.False(t, o.InFlight())
 }
+
+// Identity projects the three scalars a connection is scoped to out of the observations
+// carrying them, so retiring one stays a ==.
+func TestIdentityProjectsTheCheckedScalars(t *testing.T) {
+	s := State{
+		ServerUID:     Observation[string]{Value: "uid-1", LastSeen: runAt},
+		ServerVersion: Observation[VersionInfo]{Value: VersionInfo{GitVersion: "v1.29.3"}, LastSeen: runAt},
+		Principal: Observation[Principal]{
+			Value:    Principal{Username: "admin@example", Groups: []string{"system:masters"}},
+			LastSeen: runAt,
+		},
+	}
+
+	assert.Equal(t, Identity{
+		ServerUID:     "uid-1",
+		ServerVersion: "v1.29.3",
+		Username:      "admin@example",
+	}, s.Identity())
+}
+
+// A part no probe could read is empty rather than absent, which is what lets two
+// connections missing the same part compare equal.
+func TestIdentityLeavesAnUnreadPartEmpty(t *testing.T) {
+	forbidden := State{
+		ServerUID: Observation[string]{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonForbidden}},
+		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
+	}
+
+	assert.Equal(t, Identity{Username: "reader@example"}, forbidden.Identity())
+	assert.Equal(t, forbidden.Identity(), State{
+		ServerUID: Observation[string]{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonUnsupported}},
+		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
+	}.Identity(), "why the UID is missing is the observation's, not the identity's")
+}
