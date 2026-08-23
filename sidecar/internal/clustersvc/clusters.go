@@ -562,10 +562,10 @@ func (c *clusterController) Reconcile(
 	// A record from a source with no credentials to resolve gets no conditions at all,
 	// rather than verdicts no probe produced.
 	var conds []Condition
-	connState := c.reconcileConnection(obj)
-	if connState != nil {
-		conds = []Condition{observeConnected(connState), observeIdentified(connState)}
-		status = foldState(status, connState.observed)
+	finding := c.reconcileConnection(obj)
+	if finding != nil {
+		conds = []Condition{observeConnected(finding), observeIdentified(finding)}
+		status = foldState(status, finding.observed)
 	}
 
 	// Grouped so a watcher never sees the status without the conditions that explain it.
@@ -597,7 +597,7 @@ func (c *clusterController) Reconcile(
 	return beehive.Settled()
 }
 
-// connectionState is what one pass found about a cluster's connection. Separated from the
+// connectionFinding is what one pass found about a cluster's connection. Separated from the
 // verdicts so the claim's lifetime happens once while each condition reads the same finding.
 //
 // observed is what the claim read, nil when there is no claim to read it off — the three
@@ -605,7 +605,7 @@ func (c *clusterController) Reconcile(
 // context left the file, or its credentials will not resolve. The server still exists in all
 // three; what is missing is our observation of it. inactive marks the first two and takes
 // precedence, since the pool cannot see a choice the user made.
-type connectionState struct {
+type connectionFinding struct {
 	inactive bool
 	// reason and message are Connected's. Identified derives its own, since a server
 	// nothing reached is not unidentifiable, only unassessed.
@@ -621,7 +621,7 @@ type connectionState struct {
 // Only a kubeconfig-sourced record has credentials to resolve. Another source's are not
 // this pass's to guess at, so it reports nothing at all rather than a finding no probe
 // produced — and holds no claim on its behalf either.
-func (c *clusterController) reconcileConnection(obj *beehive.Object[ClusterSpec, ClusterStatus]) *connectionState {
+func (c *clusterController) reconcileConnection(obj *beehive.Object[ClusterSpec, ClusterStatus]) *connectionFinding {
 	id := ClusterID(obj.ID)
 
 	src := obj.Spec.Source.Kubeconfig
@@ -634,7 +634,7 @@ func (c *clusterController) reconcileConnection(obj *beehive.Object[ClusterSpec,
 		// Releasing is what stops the probe: a disabled cluster costs nothing to keep as a
 		// record, and should cost no dial.
 		c.dropLease(id)
-		return &connectionState{inactive: true, reason: ReasonInactive, message: "cluster is disabled"}
+		return &connectionFinding{inactive: true, reason: ReasonInactive, message: "cluster is disabled"}
 	}
 
 	// The claim is what arms the probe behind this context. Held across passes, so
@@ -644,47 +644,47 @@ func (c *clusterController) reconcileConnection(obj *beehive.Object[ClusterSpec,
 		// The context left the file. Told apart from a probe that failed because they are
 		// different news: this one the user did on purpose, and there is nothing to
 		// connect to until they undo it.
-		return &connectionState{inactive: true, reason: ReasonInactive,
+		return &connectionFinding{inactive: true, reason: ReasonInactive,
 			message: "kube-context is no longer in the kubeconfig"}
 	}
 	if err != nil {
 		// The context is there and its entries do not resolve — a file the user has to fix,
 		// which beehive's backoff cannot. Reported on the record rather than failing the
 		// pass, and left to this kind's cadence to retry.
-		return &connectionState{reason: ReasonResolveFailed, message: err.Error()}
+		return &connectionFinding{reason: ReasonResolveFailed, message: err.Error()}
 	}
 
-	state := lease.State()
-	found := &connectionState{observed: &state}
-	switch state.Phase() {
+	observed := lease.State()
+	finding := &connectionFinding{observed: &observed}
+	switch observed.Phase() {
 	case kubeconn.PhasePending:
 		// Claimed and not yet answered. The signal a probe publishes is what brings this
 		// record back, with the kind's cadence behind it covering a signal that went missing.
-		found.reason, found.message = ReasonConnecting, "probe pending"
+		finding.reason, finding.message = ReasonConnecting, "probe pending"
 	case kubeconn.PhaseUnreached:
 		// The credentials resolve and the server would not answer. Left to the probe's own
 		// cadence rather than failing the pass, which has nothing to retry.
-		found.reason, found.message = ReasonProbeFailed, state.Connection.LastAttempt.Message
+		finding.reason, finding.message = ReasonProbeFailed, observed.Connection.LastAttempt.Message
 	default:
-		found.reason = ReasonConnected
+		finding.reason = ReasonConnected
 	}
-	return found
+	return finding
 }
 
 // observeConnected reports whether the last probe reached the API server. It carries the
 // reason the pass got only this far, which is why it reads its finding rather than
 // deriving one.
-func observeConnected(connState *connectionState) Condition {
+func observeConnected(finding *connectionFinding) Condition {
 	status := ConditionFalse
 	switch {
-	case connState.inactive, connState.observed == nil:
+	case finding.inactive, finding.observed == nil:
 		// False, with the reason the finding carries.
-	case connState.observed.Phase() == kubeconn.PhasePending:
+	case finding.observed.Phase() == kubeconn.PhasePending:
 		status = ConditionUnknown
-	case connState.observed.Phase() == kubeconn.PhaseProbed:
+	case finding.observed.Phase() == kubeconn.PhaseProbed:
 		status = ConditionTrue
 	}
-	return LiveCondition(ConditionConnected, status, connState.reason, connState.message)
+	return LiveCondition(ConditionConnected, status, finding.reason, finding.message)
 }
 
 // observeIdentified reports whether the probe could tell which cluster answered.
@@ -692,17 +692,17 @@ func observeConnected(connState *connectionState) Condition {
 // Reaching a server needs no authorization and naming it does, so this fails on its own —
 // and when it does, no cache is ever created, since a cache is named for the identity it
 // mirrors.
-func observeIdentified(st *connectionState) Condition {
+func observeIdentified(finding *connectionFinding) Condition {
 	switch {
-	case st.inactive:
-		return LiveCondition(ConditionIdentified, ConditionFalse, ReasonInactive, st.message)
-	case st.observed == nil, st.observed.Phase() == kubeconn.PhaseUnreached:
+	case finding.inactive:
+		return LiveCondition(ConditionIdentified, ConditionFalse, ReasonInactive, finding.message)
+	case finding.observed == nil, finding.observed.Phase() == kubeconn.PhaseUnreached:
 		return LiveCondition(ConditionIdentified, ConditionFalse, ReasonNoConnection, "")
-	case st.observed.Phase() == kubeconn.PhasePending:
+	case finding.observed.Phase() == kubeconn.PhasePending:
 		return LiveCondition(ConditionIdentified, ConditionUnknown, ReasonConnecting, "probe pending")
-	case !st.observed.ServerUID.OK():
+	case !finding.observed.ServerUID.OK():
 		return LiveCondition(ConditionIdentified, ConditionFalse, ReasonUIDUnreadable,
-			st.observed.ServerUID.LastAttempt.Message)
+			finding.observed.ServerUID.LastAttempt.Message)
 	default:
 		return LiveCondition(ConditionIdentified, ConditionTrue, ReasonIdentified, "")
 	}

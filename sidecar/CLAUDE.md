@@ -189,10 +189,11 @@ that cares about one claim watches that claim.
 
 **The pass reconciles the claim, then observes.** `reconcileConnection` is the one place that
 touches the pool — the claim is taken while the record asks to be connected and dropped otherwise
-— and it returns a `connectionState`: `observed`, the claim's `*kubeconn.State`, plus `Connected`'s
-reason. It is **nil when there is no claim**, which is the three findings this package makes before
-the pool is involved: the record is switched off, its context left the file, or its credentials
-will not resolve. The server exists in all three; what is missing is our observation of it. `inactive` marks the first two and takes precedence, since the pool cannot see a
+— and it returns a `connectionFinding`: `observed`, the claim's `*kubeconn.State`, plus
+`Connected`'s reason. `observed` is **nil when there is no claim**, which is the three findings this
+package makes before the pool is involved: the record is switched off, its context left the file,
+or its credentials will not resolve. The server exists in all three; what is missing is our
+observation of it. `inactive` marks the first two and takes precedence, since the pool cannot see a
 choice the user made. How far a probe got is never copied out — the verdicts read `State.Phase()`,
 so every lease holder answers pending-versus-failed the same way. The verdicts are then pure
 functions of that finding, so the claim's lifetime happens once while each condition reads the same
