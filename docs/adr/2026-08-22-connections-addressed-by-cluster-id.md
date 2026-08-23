@@ -41,7 +41,9 @@ slice, ahead of beehive, so a connection outlives every reconcile pass that coul
 on it. The composition root no longer knows the pool exists.
 
 The pool still keys on credentials, not on clusters: two kube-contexts aimed at one server as one
-user are one socket and one probe. Only the *address a caller uses* is a cluster.
+user are one socket and one probe. Only the *address a caller uses* is a cluster. Reversed by
+[one connection per kube-context](2026-08-23-one-connection-per-context.md), which keys the pool
+on the context and keeps the fingerprint as what a rotation is detected against.
 
 `Service.AcquireConnection(ctx, id)` returns a `Lease`; `Lease.Conn` a `*Connection`. Both are the
 leaf's types, re-exported as **aliases** — a connection is native vocabulary all the way down

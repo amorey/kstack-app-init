@@ -16,16 +16,9 @@ most.
 
 ## What a meter can attribute
 
-**A pool entry, not a cluster.** Entries are keyed by credentials, so two kube-contexts aimed at one
-server as one user are one socket — and no meter under that socket can split their traffic apart.
-→ [ADR: connections are addressed by ClusterID](../adr/2026-08-22-connections-addressed-by-cluster-id.md).
-
-In practice each cluster has its own credentials and the two coincide. Where they do not, both
-clusters report the same figure, which is the true one: they are moving those bytes together. A UI
-showing it per cluster has to be able to say so, or the same number appearing twice reads as a bug.
-
-Splitting shared traffic would need accounting above the transport, where the byte counts are no
-longer wire bytes — a different measurement, not a better one.
+**Exactly one context, and so one cluster record.** The pool holds one connection per claimed
+context, so bytes counted at a socket need no apportioning.
+→ [ADR: one connection per kube-context](../adr/2026-08-23-one-connection-per-context.md).
 
 ## Where the bytes are counted
 
@@ -74,16 +67,16 @@ connection, and throughput is one more thing the probe's entry knows.
 // Throughput is the entry's byte counts, monotonic for its life.
 type Throughput struct{ Rx, Tx uint64 }
 
-// Throughput reports what these credentials have moved on the wire.
+// Throughput reports what this context has moved on the wire.
 func (l Lease) Throughput() Throughput
 ```
 
 Rates are the caller's: sample twice, subtract, divide by elapsed. `kubeconn` publishes totals and
 never a rate — it has no opinion about the window a consumer wants to average over.
 
-**Totals reset when the key changes.** Credentials that move arrive under a new key and build a new
-entry, whose counters start at zero, so a consumer differencing two readings sees a decrease. That
-is an ordinary counter reset: treat a decrease as one and contribute nothing for that interval.
+**Totals reset when credentials rotate.** A rotation builds a different connection, whose counters
+start at zero, so a consumer differencing two readings sees a decrease. That is an ordinary counter
+reset: treat a decrease as one and contribute nothing for that interval.
 
 ## Rules
 
@@ -103,9 +96,8 @@ Each step is one red/green cycle and one commit.
    is that the counted bytes **exceed** the payload — that is what proves the meter sits below TLS
    and framing rather than above them. Also that a redial keeps accumulating, since that is what
    puts the counters on the entry.
-2. `clustersvc` exposes the gauge, folding a key rotation as a counter reset.
-3. The schema's throughput gauge and the webview reading it, including how it renders two clusters
-   sharing one socket.
+2. `clustersvc` exposes the gauge, folding a credential rotation as a counter reset.
+3. The schema's throughput gauge and the webview reading it.
 
 Step 1 is `kubeconn` alone and lands before anything consumes it. Step 2 needs the prober.
 
@@ -125,7 +117,7 @@ Step 1 is `kubeconn` alone and lands before anything consumes it. Step 2 needs t
 
 Run the app against two clusters, sync one and leave the other idle, and the busy cluster's
 throughput tracks what it is actually pulling while the idle one sits at the keepalive floor. Point
-two kube-contexts at one cluster as one user, and both report the socket they share.
+two kube-contexts at one cluster as one user, and each reports its own socket.
 
 Docs land in the same commits: `sidecar/CLAUDE.md`'s `kubeconn` section gains the meter, and the
 gauge rule in the `clustersvc` section gains throughput. Delete this spec when the last step lands.

@@ -351,18 +351,27 @@ off `Connection` (the trap it exists for — no attempt yet is not an attempt th
 stay above: condition types, reasons, and `Inactive` are the record's vocabulary, not the pool's.
 
 **Everything a holder learns comes through its `Lease`** — `Conn`, `State()`, `WatchState()` — so
-the pool needs no index from a credential key back out to the contexts sharing it. `WatchState` is
+the pool signals per context and never asks a holder to know the fingerprint behind it. `WatchState` is
 a `gobus/watch` receiver current on attach, over the hub `Conn` parks on: one mechanism, and no
 attach-before-read ordering left to each watcher. **Every value is a level, never an edge** — the
 hub keeps the latest, so a reader that falls behind skips what came between, and transitions come
 from the record's conditions and event timeline. A long-lived reader cannot see a field it is not
 re-reading, so a retired connection closes `Connection.Done()` — retirement, not the replacement.
 
-**What is pooled is keyed by credentials, not by clusters** — two kube-contexts aimed at one
-server as one user are one socket and one probe. Nothing in the vocabulary of a cluster record
-says so, which is why the package doc leads with it: do not read the location as one entry per
-cluster. The resolve belongs here rather than at the caller, so what a connection was built from
-and what it is stored under cannot disagree.
+**One context, one connection, one probe.** `Service.pool` is a single map keyed by context
+name — also the key both hubs publish under — holding the holder count, the fingerprint the
+connection was built from, and what the probe last read. Contexts resolving alike are **not**
+merged. → [ADR: one connection per
+context](../docs/adr/2026-08-23-one-connection-per-context.md).
+
+The fingerprint stays in the entry, not in the key. It is `kubeconfig`'s hash of the whole
+resolved `rest.Config` — server, TLS, auth, proxy, impersonation, the full exec block — and
+comparing it is how `rekey` tells a rotation from a kubeconfig write that changed nothing:
+unchanged keeps the connection and its ladder, changed builds a new one and **forgets the old
+`State`**, since the server behind new credentials has yet to say anything. Empty means the
+context does not resolve — the pre-read kubeconfig, or one the user deleted — and a claim on it
+reads as nothing known. The resolve belongs here rather than at the caller, so what a connection
+was built from and what it is stored under cannot disagree.
 
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache
