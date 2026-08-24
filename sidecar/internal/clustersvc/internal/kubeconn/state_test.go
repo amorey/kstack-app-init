@@ -23,7 +23,7 @@ import (
 
 var runAt = time.Date(2026, 8, 23, 10, 5, 0, 0, time.UTC)
 
-// A check the prober records without dispatching has no duration: subtracting a zero
+// A probe the prober records without dispatching has no duration: subtracting a zero
 // StartedAt would report the time since the zero year.
 func TestLatencyIsZeroForARunThatNeverStarted(t *testing.T) {
 	a := Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonDependencyFailed}
@@ -39,8 +39,8 @@ func TestLatencyMeasuresADispatchedRun(t *testing.T) {
 	assert.Equal(t, 2*time.Second, a.Latency())
 }
 
-// A suspended check keeps its last answer and schedules nothing.
-func TestSuspendedCheckKeepsItsAnswer(t *testing.T) {
+// A suspended probe keeps its last answer and schedules nothing.
+func TestSuspendedProbeKeepsItsAnswer(t *testing.T) {
 	o := Observation[string]{
 		Value:    "abc-123",
 		LastSeen: runAt,
@@ -55,7 +55,7 @@ func TestSuspendedCheckKeepsItsAnswer(t *testing.T) {
 
 // Identity projects the three scalars a connection is scoped to out of the observations
 // carrying them, so retiring one stays a ==.
-func TestIdentityProjectsTheCheckedScalars(t *testing.T) {
+func TestIdentityProjectsTheProbedScalars(t *testing.T) {
 	s := State{
 		ServerUID:     Observation[string]{Value: "uid-1", LastSeen: runAt},
 		ServerVersion: Observation[VersionInfo]{Value: VersionInfo{GitVersion: "v1.29.3"}, LastSeen: runAt},

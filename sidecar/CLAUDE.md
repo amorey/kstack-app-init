@@ -226,7 +226,7 @@ neither readiness nor identity is a fact about a server nothing reached.
 `foldState` copies what the pool knows into `status.server` (`uid`, `version`, `endpoint`) and
 `status.principal` (`username`, `groups` — sorted, so a re-ordered read is not a change). It
 decides no retention of its own — an `Observation` already keeps its last answer through a failure
-— so a check that has never answered (`Known()` is false) leaves its field alone, which is what
+— so a probe that has never answered (`Known()` is false) leaves its field alone, which is what
 stops a first pass from clearing the UID a live cache is named for. **The record's copy is the
 durable one**: a restart empties the pool's.
 
@@ -247,11 +247,11 @@ unconditionally — would re-emit the record on every probe, which is the same t
 nothing outside it can import one. → [ADR: connections are addressed by
 ClusterID](../docs/adr/2026-08-22-connections-addressed-by-cluster-id.md).
 
-**It hands out leases and reports what checking the server behind one found.**
+**It hands out leases and reports what probing the server behind one found.**
 `Acquire(contextName)` never fails and never waits — a context the file does not name yet is
 claimable, because it may name it later and the claim is how the holder finds out. `Lease` is
 `Conn` / `State` / `WatchState` / `Departed` / `Release`. **Nothing dials yet**, so `Conn` reports
-`ErrNoConnection` and the only answers `State` carries are the ones a check can reach without a
+`ErrNoConnection` and the only answers `State` carries are the ones a probe can reach without a
 server. The scheduling around them is real — see the probe below.
 
 **A claim outlives what it is a claim on.** The file can stop naming a context while a holder
@@ -260,25 +260,25 @@ nothing and is deliberately not a departure: saying so would report every contex
 as the first read takes. `stateHub` is published before `signalHub`, so a reader the signal wakes
 finds the value already there.
 
-#### The probe (`check.go` — the checks; `service.go` — when they run)
+#### The probe (`probe.go` — the probes; `service.go` — when they run)
 
-**Each of `State`'s five observations has one check behind it, and each check schedules itself.**
+**Each of `State`'s five observations has one probe behind it, and each probe schedules itself.**
 A cluster's UID never moves and its readiness moves constantly, so nothing is gained by asking
 about them together — `defaultIntervals` paces them separately, and `NextAttempt` is per
-observation because the schedules genuinely differ. **A check writes the observation it owns and
+observation because the schedules genuinely differ. **A probe writes the observation it owns and
 no other**, which is what lets the five run at once against one entry without coordinating.
 
-The check queue is therefore keyed by **`checkKey{contextName, check}`**, not by context: one
-*check* is never in two workers, dedupes while pending, and re-queues if asked again mid-run
+The probe queue is therefore keyed by **`probeKey{contextName, probe}`**, not by context: one
+*probe* is never in two workers, dedupes while pending, and re-queues if asked again mid-run
 (`Done` is what re-arms it, rather than folding the ask into a run that had already passed the
-thing it asked about). `checkWorkers` bounds how many are in flight fleet-wide — the budget that
+thing it asked about). `probeWorkers` bounds how many are in flight fleet-wide — the budget that
 stops a first install running a credential helper per cluster in the same second.
 
-**The schedule is derived, never armed.** `reconcile` reads what the checks currently say and
-works out what each should do: whatever is due goes on the check queue, and the soonest thing due
+**The schedule is derived, never armed.** `reconcile` reads what the probes currently say and
+works out what each should do: whatever is due goes on the probe queue, and the soonest thing due
 later gets the entry's **one** timer. That timer is a *wake, not a cadence* — it only brings the
-pass back, which decides again per check, so the five schedules stay independent. It means no path
-can leave a check un-armed by forgetting it, the way per-check `time.AfterFunc` bookkeeping
+pass back, which decides again per probe, so the five schedules stay independent. It means no path
+can leave a probe un-armed by forgetting it, the way per-probe `time.AfterFunc` bookkeeping
 silently does.
 
 **Every path that changes an entry ends by queueing a reconcile**, never by deriving inline —
@@ -291,42 +291,42 @@ operation that takes the lock itself rather than running nested inside its calle
 against `entry.published` — what the fleet was last told — rather than against the start of a
 pass, because several commits can land behind one reconcile and only what survived them is news.
 A finished run's `NextAttempt` is set to *due now* rather than zeroed, so the gap before its
-reconcile never reads as a suspended check.
+reconcile never reads as a suspended probe.
 
 **A run in flight is left alone**, before `due` is asked: `NextAttempt` *is* that run, so writing a
 schedule over it erases both the mark saying it is still out — freeing a later pass to ask for a
 second one — and the schedule it was dispatched on. Its commit is what reconciles.
 
 **The whole scheduling policy is `due`**, read top to bottom: the connection
-check's own rules, nothing below reachability before reachability has answered, `DependencyFailed`
+probe's own rules, nothing below reachability before reachability has answered, `DependencyFailed`
 already recorded for this outage, `Unsupported` parked for the connection's life, a dependency
 that came back, never run, otherwise `LastAttempt.FinishedAt + interval`. **The re-arm falls out
-of it** — a check whose last attempt was `DependencyFailed` is due the moment the connection is
+of it** — a probe whose last attempt was `DependencyFailed` is due the moment the connection is
 `OK()` again, so nothing has to notice a recovery and go looking for what suspended on it.
 
-**Dependencies are declared, not ordered.** `check.needsConnection` marks the four behind
-reachability, once on the check rather than inside four bodies; they are recorded rather than
+**Dependencies are declared, not ordered.** `probe.needsConnection` marks the four behind
+reachability, once on the probe rather than inside four bodies; they are recorded rather than
 dialed while the server is unreachable, which is what keeps a dead cluster costing **one timeout
-per cycle instead of one per check**.
+per cycle instead of one per probe**.
 
 **A worker re-tests the dependency before it runs** (`wanted`), because a queued key names a
 context and not the claim that queued it: the last holder can release and another caller re-claim
 the name before a worker gets there, and the replacement has reached no server. Same rule `due`
 applies when it schedules, which is what makes the two agree — and it must be tested *before* the
-run is marked in flight, or an early return leaves the check reading as running and nothing ever
+run is marked in flight, or an early return leaves the probe reading as running and nothing ever
 schedules it again.
 
-**No caller names a check.** `reconcile` is the only thing that builds a `checkKey`; `Acquire` and
+**No caller names a probe.** `reconcile` is the only thing that builds a `probeKey`; `Acquire` and
 the kubeconfig watch say which context moved and let `due` work out who cares. **A pass runs
 inline, on whichever goroutine caused it** — it is arithmetic under the pool's lock, so queueing it
-would buy dedup nothing needs and cost a window where a just-finished check reads as suspended.
-`commitCheck` needs that window closed outright, so it ends the run and derives what follows in one
+would buy dedup nothing needs and cost a window where a just-finished probe reads as suspended.
+`commitProbe` needs that window closed outright, so it ends the run and derives what follows in one
 critical section, through `reconcileLocked`. The watch does it through a **generation**: it bumps
-`Service.kubecfgGen`, and the connection check is due whenever `entry.kubecfgGen` differs — every
-branch of that check stamps the generation it read at, including the one that found the file
+`Service.kubecfgGen`, and the connection probe is due whenever `entry.kubecfgGen` differs — every
+branch of that probe stamps the generation it read at, including the one that found the file
 unread, so a run is never asked for twice over the same file.
 
-**The connection check owns the context's lifecycle**, because resolving the kubeconfig is the
+**The connection probe owns the context's lifecycle**, because resolving the kubeconfig is the
 first step of reaching a server: a departed context is its to find, and the build/rotate/retire
 will land there too. Resolving is the *precondition*, not the answer — so while nothing dials, a
 context that resolves records **no attempt** and schedules nothing, and `Phase` stays
@@ -336,10 +336,10 @@ reports it moving) and `ReasonResolveFailed` (keeps its cadence — the file can
 `kubeconfig.Service` cannot see, such as a CA path that now opens).
 
 **A run that concludes nothing forgets the failure before it** (`Attempts.forget`) — the resolve
-that succeeds, and the read that finds the file unread. **Every branch of the connection check must
+that succeeds, and the read that finds the file unread. **Every branch of the connection probe must
 either record an attempt or forget one**, because `due` derives the next run from `LastAttempt`:
 a branch that leaves a stale failure in place has that failure still earning retries, and the run
-that follows leaves it due again — a spin, at five checks a round, since `Phase()` reads the same
+that follows leaves it due again — a spin, at five probes a round, since `Phase()` reads the same
 stale attempt and wakes the four behind it too.
 
 Nothing else clears the record either, so a returning context would report
@@ -351,13 +351,13 @@ failure, and forgetting the failure must not forget it too.
 
 **A queue and not a bus**, which is what lets `Start` alone run the worker loops: queued work
 outlives the gap before them, where a bus would drop a send nobody was receiving and leave a claim
-taken in that window never checked. `Service.Close` closes the queue — past there nothing works it
+taken in that window never probed. `Service.Close` closes the queue — past there nothing works it
 off, and a held claim still adds on every kubeconfig change.
 
 **Two publish rules, because the two feeds answer different questions.** `stateHub` carries every
 run: the timing is what a claim watcher subscribed for, and the countdown to the next run is
 visible nowhere else. `signalHub` fires only when the **news** changed — `departed`, `Phase()`,
-`Identity()`, and each check's `OK()`, never a timestamp. Timestamps move every run, so signalling
+`Identity()`, and each probe's `OK()`, never a timestamp. Timestamps move every run, so signalling
 on them would wake every cluster's reconcile on every cadence to find nothing changed.
 
 **The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
@@ -374,7 +374,7 @@ why a field is missing belongs on the `Observation` that could not read it. Note
 `SelfSubjectRulesReview` behind `ClusterPermissions`.
 
 **`State` is what the last probe read about the server, not the connection's own life** —
-whether one is built or retiring surfaces on `Connection.Done()`. **Five checks that fail and go
+whether one is built or retiring surfaces on `Connection.Done()`. **Five probes that fail and go
 stale independently.** A cluster is rebuilt, upgraded, re-issues a token, or revokes a namespace
 read, and none implies the others — so `Connection`, `Readiness`, `ServerUID`,
 `ServerVersion`, and `Principal` are each an `Observation[T]`. Only reachability is a prerequisite; the rest are peers.
@@ -393,17 +393,17 @@ moves between them as it completes. `ScheduledAt` is separate from `StartedAt` b
 prober lets a scheduled time slip into the past, which a single stamp compared against the clock
 would read as running.
 
-**A check that has never run is the zero `Observation`** — a zero `LastAttempt` is not `Done`, so
+**A probe that has never run is the zero `Observation`** — a zero `LastAttempt` is not `Done`, so
 every accessor answers correctly with no sentinel.
 
-**A zero `NextAttempt` means the check is suspended**: nothing is due and the last answer stands
-(`Scheduled()` is the accessor). The four checks behind the connection suspend while it is down —
-a server nothing reached cannot answer them — and re-arm when it recovers; a check that came back
+**A zero `NextAttempt` means the probe is suspended**: nothing is due and the last answer stands
+(`Scheduled()` is the accessor). The four probes behind the connection suspend while it is down —
+a server nothing reached cannot answer them — and re-arm when it recovers; a probe that came back
 `Unsupported` stays suspended for the connection's life, since the endpoint is absent rather than
-failing. `DependencyFailed` marks the one cycle where a check went from running to suspended, and
+failing. `DependencyFailed` marks the one cycle where a probe went from running to suspended, and
 the cycles after it schedule nothing, which is what makes a dead cluster cost one timeout per cycle
-instead of one per check. **Why a check is suspended is `LastAttempt.Reason`** — no field beside
-`NextAttempt`, since a check suspends over what its last attempt found. That is why suspending must
+instead of one per probe. **Why a probe is suspended is `LastAttempt.Reason`** — no field beside
+`NextAttempt`, since a probe suspends over what its last attempt found. That is why suspending must
 write an attempt instead of going quiet. So *ready, as of 10:00, nothing due* is a state to render, not a stall.
 
 A **disabled** cluster never gets here: the controller drops the claim and the pool stops probing
@@ -418,17 +418,17 @@ prober.
 condition reason (`Unreachable`, `Forbidden`, `Unsupported`, `ServiceUnavailable`, …). It has to be:
 `Err` arrives wrapped and does not survive the copy a watcher holds, so a caller sniffing it later
 cannot tell a 403 from a timeout. **It spans layers on purpose** — transport, API response, and
-rules of ours — because a caller asks why a check failed once, not three times. Names shared with
+rules of ours — because a caller asks why a probe failed once, not three times. Names shared with
 `metav1.StatusReason` are the same word for the same thing; the set is not that set.
 
 Two prober traps live here. `NotFound` and `Unsupported` **both arrive as a 404** — the object was
-missing versus the endpoint is not served — and only the check knows which it asked for, so
-classifying on the code alone permanently suspends a check that should keep running. And `Dynamic`
+missing versus the endpoint is not served — and only the probe knows which it asked for, so
+classifying on the code alone permanently suspends a probe that should keep running. And `Dynamic`
 returns `*apierrors.StatusError` carrying the API's own reason, while only the raw endpoints
 (`/readyz`, `/version`) leave a status code as the sole evidence; one switch over codes for both
 discards what the typed half knows. `Canceled` says nothing about the cluster and counts toward neither failure field;
-`DependencyFailed` is a check recorded rather than attempted, which is what keeps a dead cluster
-costing one timeout per cycle instead of one per check. Free-form text goes in `Message`, never
+`DependencyFailed` is a probe recorded rather than attempted, which is what keeps a dead cluster
+costing one timeout per cycle instead of one per probe. Free-form text goes in `Message`, never
 `Reason`.
 
 A `State` is a value copy, but a **shallow** one: the slices inside belong to the prober and every
@@ -814,8 +814,8 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
 - **A type's methods live in the type's file.** Splitting them across files means a reader has to
   find the pieces before they can see what a type does. So a file that earns its place owns a
   type or a body of free functions — not a slice of some other file's type's behavior. In
-  `kubeconn` that puts the probe *engine* (`Service`'s methods) in `service.go` and the *checks*
-  in `check.go`, and `Attempts`' scheduler-facing methods beside its accessors in `state.go`.
+  `kubeconn` that puts the probe *engine* (`Service`'s methods) in `service.go` and the *probes*
+  in `probe.go`, and `Attempts`' scheduler-facing methods beside its accessors in `state.go`.
 - **Resolver deps are always non-nil** — the composition root wires every field; tests use fakes.
 - **Pub/sub**: two modules, split on whether delivery is **keyed**. Unkeyed → `github.com/amorey/gochan`: `watch` for latest-value current-state streams (current snapshot on subscribe: auth `State`), `broadcast` for fan-out where subscribers supply their own snapshot (poke). Keyed → `github.com/amorey/gobus`: `watch` for a keyed latest-value bus. Note the two `watch` packages differ on registration — gochan's hub holds a seed and delivers it, gobus's delivers nothing until the next send (a subscriber that has already read the current value can pass it as a baseline, which is measured against and never delivered back). Never hand-roll a subscriber map.
 - **Work to do is a queue, not a bus** — `internal/workqueue`, one `Queue` per job: producers call

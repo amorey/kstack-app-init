@@ -202,13 +202,13 @@ func TestDepartureReachesTheHolder(t *testing.T) {
 	s := New(cfg)
 	lease := s.Acquire("prod")
 	defer lease.Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	require.False(t, lease.Departed())
 	news := s.Subscribe()
 	defer news.Close()
 
 	cfg.rotate("prod", "")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	ev, err := news.RecvContext(within(t))
 	require.NoError(t, err)
@@ -225,11 +225,11 @@ func TestDepartureKeepsTheClaim(t *testing.T) {
 	defer lease.Release()
 
 	cfg.rotate("prod", "")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	require.True(t, lease.Departed())
 
 	cfg.rotate("prod", "key-1")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	assert.False(t, lease.Departed(), "named again, and the same claim reports it")
 	assert.Len(t, s.claimed, 1)
@@ -241,16 +241,16 @@ func TestDepartureIsAnnouncedOnce(t *testing.T) {
 	cfg := resolving("prod", "key-1")
 	s := New(cfg)
 	defer s.Acquire("prod").Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	news := s.Subscribe()
 	defer news.Close()
 
 	cfg.rotate("prod", "")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	_, err := news.RecvContext(within(t))
 	require.NoError(t, err)
 
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	// A negative assertion needs a bounded window: this fails the instant a second one lands.
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -266,12 +266,12 @@ func TestUnreadKubeconfigIsNotADeparture(t *testing.T) {
 	s := New(cfg)
 	lease := s.Acquire("prod")
 	defer lease.Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	cfg.mu.Lock()
 	cfg.err = kubeconfig.ErrNotRead
 	cfg.mu.Unlock()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	assert.False(t, lease.Departed())
 }
@@ -296,26 +296,26 @@ func TestAcquireAsksForANewContextsPresence(t *testing.T) {
 		time.Second, time.Millisecond, "a kubeconfig change never reached the claim")
 }
 
-// A later holder joins what the first one's check found rather than asking for another.
+// A later holder joins what the first one's probe found rather than asking for another.
 func TestAcquireAsksOnlyForANewContext(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 
 	first := s.Acquire("prod")
 	defer first.Release()
-	key, ok := s.checkQ.Next(within(t))
+	key, ok := s.probeQ.Next(within(t))
 	require.True(t, ok)
 	require.Equal(t, connectionOf("prod"), key)
 	// Given back first: a key added while held is queued behind the run rather than delivered,
 	// which would hide the very ask this test is looking for.
-	s.checkQ.Done(key)
+	s.probeQ.Done(key)
 
 	second := s.Acquire("prod")
 	defer second.Release()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	_, ok = s.checkQ.Next(ctx)
-	assert.False(t, ok, "a second holder asked for a check")
+	_, ok = s.probeQ.Next(ctx)
+	assert.False(t, ok, "a second holder asked for a probe")
 }
 
 // A receiver is bound to its key for life, and a claim's key is its context — which never moves,
@@ -366,29 +366,29 @@ func startService(t *testing.T, s *Service) {
 }
 
 // connectionOf is the queue key a claim and a kubeconfig change ask for.
-func connectionOf(contextName string) checkKey {
-	return checkKey{contextName: contextName, check: checkConnection}
+func connectionOf(contextName string) probeKey {
+	return probeKey{contextName: contextName, probe: probeConnection}
 }
 
-// checkConnection runs the connection check the way a worker would, on the test's goroutine, so
+// probeConnection runs the connection probe the way a worker would, on the test's goroutine, so
 // a test asserts on settled state with no loops running.
-func (s *Service) checkConnection(contextName string) {
-	s.runCheck(context.Background(), connectionOf(contextName))
+func (s *Service) probeConnection(contextName string) {
+	s.runProbe(context.Background(), connectionOf(contextName))
 }
 
 // A holder watching its own claim is told too, not just the fleet feed, and the value carries
-// why: a check that suspends has to record its reason or nothing explains the suspension.
+// why: a probe that suspends has to record its reason or nothing explains the suspension.
 func TestDepartureReachesAClaimWatcher(t *testing.T) {
 	cfg := resolving("prod", "key-1")
 	s := New(cfg)
 	lease := s.Acquire("prod")
 	defer lease.Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	watched := lease.WatchState()
 	defer watched.Close()
 
 	cfg.rotate("prod", "")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	ev, err := watched.RecvContext(within(t))
 	require.NoError(t, err)
@@ -419,7 +419,7 @@ func TestAKubeconfigChangeReachesTheHolder(t *testing.T) {
 func TestAReleasedClaimReadsAsDeparted(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	lease := s.Acquire("prod")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	require.False(t, lease.Departed())
 
 	lease.Release()
@@ -433,7 +433,7 @@ func TestAReleasedClaimReadsAsDeparted(t *testing.T) {
 func TestCloseDropsWhatThePoolHolds(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	lease := s.Acquire("prod")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	require.False(t, lease.Departed())
 
 	require.NoError(t, s.Close())
@@ -450,13 +450,13 @@ func TestAResolveFailureIsNotADeparture(t *testing.T) {
 	s := New(cfg)
 	lease := s.Acquire("prod")
 	defer lease.Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	require.False(t, lease.Departed())
 
 	cfg.mu.Lock()
 	cfg.err = errors.New("no such certificate authority file")
 	cfg.mu.Unlock()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	assert.False(t, lease.Departed())
 }
@@ -474,7 +474,7 @@ func TestAReadIsNotCommittedToAReplacementClaim(t *testing.T) {
 		first.Release()
 		second = s.Acquire("prod")
 	})
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	require.NotNil(t, second)
 	defer second.Release()
@@ -490,7 +490,7 @@ func TestAClaimTakenBeforeStartStaysQueued(t *testing.T) {
 
 	defer s.Acquire("prod").Release()
 
-	key, ok := s.checkQ.Next(within(t))
+	key, ok := s.probeQ.Next(within(t))
 	require.True(t, ok)
 	assert.Equal(t, connectionOf("prod"), key)
 }
@@ -504,7 +504,7 @@ func TestAnAskArrivingDuringAReadIsReadAgain(t *testing.T) {
 	s := New(cfg)
 	startService(t, s)
 
-	cfg.duringRead(func() { s.checkQ.Add(connectionOf("prod")) })
+	cfg.duringRead(func() { s.probeQ.Add(connectionOf("prod")) })
 	defer s.Acquire("prod").Release()
 
 	assert.Equal(t, "prod", cfg.reads.Await(t, "the claim's read"))
@@ -513,7 +513,7 @@ func TestAnAskArrivingDuringAReadIsReadAgain(t *testing.T) {
 
 // And it is read once the loop runs, so a context that had already gone does not sit reported
 // as present.
-func TestAClaimTakenBeforeStartIsChecked(t *testing.T) {
+func TestAClaimTakenBeforeStartIsProbed(t *testing.T) {
 	s := New(resolving("staging", "key-1"))
 	lease := s.Acquire("prod")
 	defer lease.Release()
@@ -522,7 +522,7 @@ func TestAClaimTakenBeforeStartIsChecked(t *testing.T) {
 	startService(t, s)
 
 	require.Eventually(t, lease.Departed, time.Second, time.Millisecond,
-		"a claim taken before Start was never checked")
+		"a claim taken before Start was never probed")
 }
 
 // A state receiver is the caller's, not the claim's: releasing does not close it, which is why

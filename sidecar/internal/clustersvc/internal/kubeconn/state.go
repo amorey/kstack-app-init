@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// What a probe read about the server behind one context: the checks, their outcomes, and the
+// What a probe read about the server behind one context: the probes, their outcomes, and the
 // identity they add up to. Pure data — nothing here reaches the pool or the kubeconfig.
 package kubeconn
 
 import "time"
 
-// Reason classifies the most recent attempt at one check. Ours, in the style of a Kubernetes
+// Reason classifies the most recent attempt at one probe. Ours, in the style of a Kubernetes
 // condition reason: CamelCase, stable, safe to switch on. Free-form detail belongs in Message.
 //
-// **It spans layers on purpose.** A check dies at the transport, in an API response, or on a
-// rule of ours, and a caller asks why once — so a TLS failure and a 403 and a skipped check are
+// **It spans layers on purpose.** A probe dies at the transport, in an API response, or on a
+// rule of ours, and a caller asks why once — so a TLS failure and a 403 and a skipped probe are
 // one vocabulary. Some names match metav1.StatusReason because that is the same word for the
 // same thing, not because this is that set: it has no word for a certificate we rejected.
 //
@@ -45,7 +45,7 @@ const (
 	ReasonUnreachable Reason = "Unreachable"
 	// ReasonTLSInvalid means the server answered and its certificate was rejected.
 	ReasonTLSInvalid Reason = "TLSInvalid"
-	// ReasonTimeout means the check's own deadline expired. Told apart from ReasonCanceled
+	// ReasonTimeout means the probe's own deadline expired. Told apart from ReasonCanceled
 	// because the deadline was ours: the caller is still waiting and this is news about the
 	// cluster.
 	ReasonTimeout Reason = "Timeout"
@@ -54,7 +54,7 @@ const (
 	ReasonCanceled Reason = "Canceled"
 
 	// ReasonContextNotFound means the kubeconfig stopped naming the context, so there is
-	// nothing to reach. The user's own edit, not a fault: the check suspends, and the file
+	// nothing to reach. The user's own edit, not a fault: the probe suspends, and the file
 	// naming it again re-arms it.
 	ReasonContextNotFound Reason = "ContextNotFound"
 	// ReasonResolveFailed means the file names the context and will not yield credentials from
@@ -69,14 +69,14 @@ const (
 	// an outage to wait out, which is why callers render it differently.
 	ReasonForbidden Reason = "Forbidden"
 
-	// ReasonNotFound means the object a check asked for is absent, such as kube-system.
-	// News about the cluster, and a check that keeps running.
+	// ReasonNotFound means the object a probe asked for is absent, such as kube-system.
+	// News about the cluster, and a probe that keeps running.
 	ReasonNotFound Reason = "NotFound"
 	// ReasonUnsupported means the endpoint itself is absent — SelfSubjectReview before v1.27,
-	// or a managed distribution withholding /readyz. Terminal: the check suspends.
+	// or a managed distribution withholding /readyz. Terminal: the probe suspends.
 	//
-	// The trap: both arrive as a 404, and only the check knows which it asked for. Classifying
-	// on the status code alone suspends a check that should have kept running.
+	// The trap: both arrive as a 404, and only the probe knows which it asked for. Classifying
+	// on the status code alone suspends a probe that should have kept running.
 	ReasonUnsupported Reason = "Unsupported"
 	// ReasonInternalError is a 500: the API server hit a fault serving the request.
 	ReasonInternalError Reason = "InternalError"
@@ -84,25 +84,25 @@ const (
 	// mid-upgrade. Told apart from ReasonInternalError because it is expected and passes on
 	// its own, which is what a caller renders differently and what a backoff waits out.
 	ReasonServiceUnavailable Reason = "ServiceUnavailable"
-	// ReasonThrottled is a 429, or a client-side rate limiter delay past the check timeout.
+	// ReasonThrottled is a 429, or a client-side rate limiter delay past the probe timeout.
 	ReasonThrottled Reason = "Throttled"
 	// ReasonMalformed means a response arrived and would not parse, which usually means a
 	// proxy or captive portal between us and the API server.
 	ReasonMalformed Reason = "Malformed"
 
-	// ReasonComponentsFailing means /readyz answered and named components not ok. The check
+	// ReasonComponentsFailing means /readyz answered and named components not ok. The probe
 	// worked and the cluster is not fit to use; ComponentStatus.Failing says which.
 	ReasonComponentsFailing Reason = "ComponentsFailing"
-	// ReasonDependencyFailed means the check was recorded rather than attempted, because the
-	// connection it needs had already failed this cycle. It marks the cycle a check went from
+	// ReasonDependencyFailed means the probe was recorded rather than attempted, because the
+	// connection it needs had already failed this cycle. It marks the cycle a probe went from
 	// running to suspended; the cycles after it schedule nothing at all, which is what keeps a
-	// dead cluster costing one timeout per cycle instead of one per check.
+	// dead cluster costing one timeout per cycle instead of one per probe.
 	ReasonDependencyFailed Reason = "DependencyFailed"
 	// ReasonInternal is a bug here.
 	ReasonInternal Reason = "Internal"
 )
 
-// Attempt is one run of one check, from scheduled through finished. Its fields fill in that
+// Attempt is one run of one probe, from scheduled through finished. Its fields fill in that
 // order, so the same value describes a run at every stage of its life and Observation needs no
 // second type for the one that has not finished.
 //
@@ -139,23 +139,23 @@ func (a Attempt) Latency() time.Duration {
 	return a.FinishedAt.Sub(a.StartedAt)
 }
 
-// Observation is one check's last answer and the provenance to judge it.
+// Observation is one probe's last answer and the provenance to judge it.
 //
 // **Value outlives the failure that follows it.** A read that stops being permitted does not
 // mean the fact changed, so Value is what was last seen and LastSeen is when — which is what
 // makes it readable: "identified, as of 10:00" is usable where "ready, as of 10:00" is not.
 //
-// **A check that has never run is the zero value**, which needs no sentinel: a zero LastAttempt
+// **A probe that has never run is the zero value**, which needs no sentinel: a zero LastAttempt
 // is not Done, so every question below already answers for it.
 //
-// **A zero NextAttempt means the check is suspended** — nothing is due, and the last answer
-// stands. The four checks behind the connection are suspended while it is down, since a server
-// nothing reached cannot answer them, and re-armed when it recovers; a check whose last attempt
+// **A zero NextAttempt means the probe is suspended** — nothing is due, and the last answer
+// stands. The four probes behind the connection are suspended while it is down, since a server
+// nothing reached cannot answer them, and re-armed when it recovers; a probe whose last attempt
 // was ReasonUnsupported stays suspended for the life of the connection, because the endpoint is
 // absent rather than failing. So "ready, as of 10:00, nothing due" is a state a reader renders,
 // not one it treats as stalled.
 //
-// **Why it is suspended is LastAttempt.Reason**, which needs no field of its own because a check
+// **Why it is suspended is LastAttempt.Reason**, which needs no field of its own because a probe
 // suspends over what its last attempt found. Suspending therefore has to write one — the cycle
 // that stops scheduling records DependencyFailed rather than going quiet, or the reason is lost.
 type Observation[T any] struct {
@@ -167,11 +167,11 @@ type Observation[T any] struct {
 	Attempts
 }
 
-// Known reports whether this check has ever answered, which is what makes Value readable.
+// Known reports whether this probe has ever answered, which is what makes Value readable.
 func (o Observation[T]) Known() bool { return !o.LastSeen.IsZero() }
 
-// Attempts is the run bookkeeping every check keeps, split from Observation so the scheduler can
-// reach it without naming the value type — observations indexes one per check.
+// Attempts is the run bookkeeping every probe keeps, split from Observation so the scheduler can
+// reach it without naming the value type — observations indexes one per probe.
 type Attempts struct {
 	// LastAttempt is the most recent run that finished; NextAttempt is the one that has not,
 	// scheduled or already running. A run moves from one to the other as it completes.
@@ -191,14 +191,14 @@ func (a Attempts) OK() bool { return a.LastAttempt.Reason == ReasonSucceeded }
 // InFlight reports whether a run is under way.
 func (a Attempts) InFlight() bool { return a.NextAttempt.Running() }
 
-// Scheduled reports whether another run is due. False for a suspended check.
+// Scheduled reports whether another run is due. False for a suspended probe.
 func (a Attempts) Scheduled() bool { return !a.NextAttempt.ScheduledAt.IsZero() }
 
 // begin marks a run dispatched. InFlight reads true from here until the commit, which is what
-// stops a reconcile scheduling over a check already out.
+// stops a reconcile scheduling over a probe already out.
 func (a *Attempts) begin(at time.Time) { a.NextAttempt.StartedAt = at }
 
-// schedule sets when the next run is due, zero for a check with nothing scheduled.
+// schedule sets when the next run is due, zero for a probe with nothing scheduled.
 func (a *Attempts) schedule(at time.Time) { a.NextAttempt = Attempt{ScheduledAt: at} }
 
 // end clears the run begin marked. Its caller derives the next schedule before releasing the
@@ -219,7 +219,7 @@ func (a *Attempts) forget() {
 //
 // **The run moves out of NextAttempt rather than replacing it**, so the schedule it was dispatched
 // on survives into the record: StartedAt against ScheduledAt is how long it waited for a worker,
-// and a caller cannot tell a slow check from a saturated pool without it. StartedAt stays the
+// and a caller cannot tell a slow probe from a saturated pool without it. StartedAt stays the
 // caller's to state — a run that was recorded rather than dispatched has none.
 func (a *Attempts) record(att Attempt) {
 	att.ScheduledAt = a.NextAttempt.ScheduledAt
@@ -238,16 +238,16 @@ func (a *Attempts) record(att Attempt) {
 	}
 }
 
-// observations indexes each check's shared bookkeeping by checkID. Five value types mean no code
+// observations indexes each probe's shared bookkeeping by probeID. Five value types mean no code
 // can name a field across them, so this is the one place that pays for that; an array rather
-// than a switch, so a sixth check is a compile error rather than a case somebody forgot.
-func observations(st *State) [numChecks]*Attempts {
-	return [numChecks]*Attempts{
-		checkConnection:    &st.Connection.Attempts,
-		checkReadiness:     &st.Readiness.Attempts,
-		checkServerUID:     &st.ServerUID.Attempts,
-		checkServerVersion: &st.ServerVersion.Attempts,
-		checkPrincipal:     &st.Principal.Attempts,
+// than a switch, so a sixth probe is a compile error rather than a case somebody forgot.
+func observations(st *State) [numProbes]*Attempts {
+	return [numProbes]*Attempts{
+		probeConnection:    &st.Connection.Attempts,
+		probeReadiness:     &st.Readiness.Attempts,
+		probeServerUID:     &st.ServerUID.Attempts,
+		probeServerVersion: &st.ServerVersion.Attempts,
+		probePrincipal:     &st.Principal.Attempts,
 	}
 }
 
@@ -278,7 +278,7 @@ type Identity struct {
 	Username      string
 }
 
-// State is what the last probe read about the server behind one entry: five checks that
+// State is what the last pass read about the server behind one entry: five probes that
 // succeed, fail, and go stale independently. Reachability is the only one the others depend on.
 //
 // It says nothing about the connection's own life — whether one is built, retiring, or how many
@@ -294,7 +294,7 @@ type State struct {
 	Principal     Observation[Principal]
 }
 
-// Phase is how far the last attempt to reach the server got. The other four checks report
+// Phase is how far the last attempt to reach the server got. The other four probes report
 // themselves; this one is separate because they are only worth reading once it is PhaseProbed.
 type Phase int
 
@@ -319,7 +319,7 @@ func (s State) Phase() Phase {
 	}
 }
 
-// Identity is the scope built from the checks that have answered. A part no probe could read
+// Identity is the scope built from the probes that have answered. A part no probe could read
 // is empty, which is how it compares equal to another connection missing the same part.
 func (s State) Identity() Identity {
 	return Identity{

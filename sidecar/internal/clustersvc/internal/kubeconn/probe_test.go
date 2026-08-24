@@ -36,63 +36,63 @@ func stateOf(t *testing.T, s *Service, contextName string) State {
 	return e.state
 }
 
-// awaitKey drains the check queue until want turns up, for a test where more than one check is
+// awaitKey drains the probe queue until want turns up, for a test where more than one probe is
 // due and the order they land in is not the point.
-func awaitKey(t *testing.T, s *Service, want checkKey) {
+func awaitKey(t *testing.T, s *Service, want probeKey) {
 	t.Helper()
 	for {
-		key, ok := s.checkQ.Next(within(t))
+		key, ok := s.probeQ.Next(within(t))
 		require.True(t, ok, "the queue closed before %v was asked for", want)
-		s.checkQ.Done(key)
+		s.probeQ.Done(key)
 		if key == want {
 			return
 		}
 	}
 }
 
-// drainKeys takes everything the check queue holds, giving each back. What a worker pool would
+// drainKeys takes everything the probe queue holds, giving each back. What a worker pool would
 // pick up, without waiting for anything more to arrive.
-func drainKeys(t *testing.T, s *Service) []checkKey {
+func drainKeys(t *testing.T, s *Service) []probeKey {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Next takes what is queued and reports closed rather than waiting for more.
 
-	var keys []checkKey
+	var keys []probeKey
 	for {
-		key, ok := s.checkQ.Next(ctx)
+		key, ok := s.probeQ.Next(ctx)
 		if !ok {
 			return keys
 		}
-		s.checkQ.Done(key)
+		s.probeQ.Done(key)
 		keys = append(keys, key)
 	}
 }
 
-// takeKeys drains n keys off the check queue, giving each back so the next ask for it is not
+// takeKeys drains n keys off the probe queue, giving each back so the next ask for it is not
 // held behind a run that never happens.
-func takeKeys(t *testing.T, s *Service, n int) []checkKey {
+func takeKeys(t *testing.T, s *Service, n int) []probeKey {
 	t.Helper()
-	keys := make([]checkKey, 0, n)
+	keys := make([]probeKey, 0, n)
 	for range n {
-		key, ok := s.checkQ.Next(within(t))
+		key, ok := s.probeQ.Next(within(t))
 		require.True(t, ok, "the queue closed with %d of %d keys taken", len(keys), n)
-		s.checkQ.Done(key)
+		s.probeQ.Done(key)
 		keys = append(keys, key)
 	}
 	return keys
 }
 
-// --- the connection check ---
+// --- the connection probe ---
 
 // Resolving is the precondition, not the answer: nothing dialed, so no attempt is recorded and
 // the phase stays pending. Nothing is scheduled either — there is nothing to poll for until
-// something dials, and the file moving is what brings the check back.
+// something dials, and the file moving is what brings the probe back.
 func TestAResolvableContextRecordsNoAttemptAndSchedulesNothing(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	defer s.Acquire("prod").Release()
 
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	st := stateOf(t, s, "prod")
 	assert.Equal(t, PhasePending, st.Phase())
@@ -100,28 +100,28 @@ func TestAResolvableContextRecordsNoAttemptAndSchedulesNothing(t *testing.T) {
 	assert.False(t, st.Connection.Scheduled())
 }
 
-// The generation is what makes it due again, so the watch names no check — it says the file
+// The generation is what makes it due again, so the watch names no probe — it says the file
 // moved and reconcile works out who cares.
-func TestAKubeconfigChangeMakesTheConnectionCheckDue(t *testing.T) {
+func TestAKubeconfigChangeMakesTheConnectionProbeDue(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	defer s.Acquire("prod").Release()
-	require.Equal(t, []checkKey{connectionOf("prod")}, takeKeys(t, s, 1), "the claim's own ask")
-	s.checkConnection("prod")
+	require.Equal(t, []probeKey{connectionOf("prod")}, takeKeys(t, s, 1), "the claim's own ask")
+	s.probeConnection("prod")
 
 	s.bumpKubeconfig()
 
-	assert.Equal(t, []checkKey{connectionOf("prod")}, takeKeys(t, s, 1))
+	assert.Equal(t, []probeKey{connectionOf("prod")}, takeKeys(t, s, 1))
 }
 
-// A context that left the file has nothing to reach, so its check suspends — and records why,
+// A context that left the file has nothing to reach, so its probe suspends — and records why,
 // because LastAttempt.Reason is the only place a suspension's reason lives.
-func TestADepartedContextSuspendsItsConnectionCheck(t *testing.T) {
+func TestADepartedContextSuspendsItsConnectionProbe(t *testing.T) {
 	cfg := resolving("prod", "key-1")
 	s := New(cfg)
 	defer s.Acquire("prod").Release()
 
 	cfg.rotate("prod", "")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	conn := stateOf(t, s, "prod").Connection
 	assert.Equal(t, ReasonContextNotFound, conn.LastAttempt.Reason)
@@ -137,14 +137,14 @@ func TestAResolveFailureKeepsAsking(t *testing.T) {
 	s := New(cfg)
 	defer s.Acquire("prod").Release()
 
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	first := stateOf(t, s, "prod").Connection
 	require.Equal(t, ReasonResolveFailed, first.LastAttempt.Reason)
 	assert.True(t, first.Scheduled())
 	assert.Equal(t, 1, first.Failures)
 	require.False(t, first.FailingSince.IsZero())
 
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	second := stateOf(t, s, "prod").Connection
 	assert.Equal(t, 2, second.Failures)
@@ -158,12 +158,12 @@ func TestAReturningContextReadsAsUnattempted(t *testing.T) {
 	s := New(cfg)
 	defer s.Acquire("prod").Release()
 	cfg.rotate("prod", "")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	require.Equal(t, PhaseUnreached, stateOf(t, s, "prod").Phase())
 
 	cfg.rotate("prod", "key-1")
 	s.bumpKubeconfig()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	conn := stateOf(t, s, "prod").Connection
 	assert.Equal(t, PhasePending, stateOf(t, s, "prod").Phase())
@@ -178,12 +178,12 @@ func TestAFixedKubeconfigReadsAsUnattempted(t *testing.T) {
 	cfg := failingToResolve()
 	s := New(cfg)
 	defer s.Acquire("prod").Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	require.True(t, stateOf(t, s, "prod").Connection.Scheduled(), "a failure earns a retry")
 
 	cfg.err = nil
 	s.bumpKubeconfig()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	conn := stateOf(t, s, "prod").Connection
 	assert.Equal(t, PhasePending, stateOf(t, s, "prod").Phase())
@@ -196,44 +196,44 @@ func TestAFixedKubeconfigReadsAsUnattempted(t *testing.T) {
 // time — and a run that left it in place would come straight back, forever.
 func TestAnUnreadKubeconfigLeavesNoRetryToSpinOn(t *testing.T) {
 	cfg := failingToResolve()
-	s := newWithOptions(cfg, withIntervals(shrunk(checkConnection, 0)))
+	s := newWithOptions(cfg, withIntervals(shrunk(probeConnection, 0)))
 	defer s.Acquire("prod").Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	require.Equal(t, ReasonResolveFailed, stateOf(t, s, "prod").Connection.LastAttempt.Reason)
-	require.NotEmpty(t, drainKeys(t, s), "the retry that failure earned, and the checks it woke")
+	require.NotEmpty(t, drainKeys(t, s), "the retry that failure earned, and the probes it woke")
 
 	cfg.err = kubeconfig.ErrNotRead
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	assert.Empty(t, drainKeys(t, s), "an unread read left work due immediately")
 }
 
 // A run moves out of NextAttempt as it completes, so the schedule it was dispatched on survives
-// into the record. Without it, StartedAt has nothing to be measured against and a check that
+// into the record. Without it, StartedAt has nothing to be measured against and a probe that
 // waited for a worker is indistinguishable from one the server was slow to answer.
 func TestARecordedAttemptKeepsTheScheduleItRanOn(t *testing.T) {
 	s := New(failingToResolve())
 	defer s.Acquire("prod").Release()
 	dueAt := stateOf(t, s, "prod").Connection.NextAttempt.ScheduledAt
-	require.False(t, dueAt.IsZero(), "the claim's own check is scheduled")
+	require.False(t, dueAt.IsZero(), "the claim's own probe is scheduled")
 
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	last := stateOf(t, s, "prod").Connection.LastAttempt
 	assert.Equal(t, dueAt, last.ScheduledAt)
 	assert.False(t, last.StartedAt.Before(dueAt), "a run does not start before it is due")
 }
 
-// --- the checks behind it ---
+// --- the probes behind it ---
 
 // A server nothing reached cannot answer them, so they are recorded rather than dialed. That is
-// what keeps a dead cluster costing one timeout per cycle instead of one per check.
-func TestACheckBehindTheConnectionSuspendsWhileItIsDown(t *testing.T) {
+// what keeps a dead cluster costing one timeout per cycle instead of one per probe.
+func TestAProbeBehindTheConnectionSuspendsWhileItIsDown(t *testing.T) {
 	s := New(failingToResolve())
 	defer s.Acquire("prod").Release()
-	s.checkConnection("prod") // reachability has to answer before anything behind it is due
+	s.probeConnection("prod") // reachability has to answer before anything behind it is due
 
-	s.runCheck(t.Context(), checkKey{contextName: "prod", check: checkServerUID})
+	s.runProbe(t.Context(), probeKey{contextName: "prod", probe: probeServerUID})
 
 	uid := stateOf(t, s, "prod").ServerUID
 	assert.Equal(t, ReasonDependencyFailed, uid.LastAttempt.Reason)
@@ -241,48 +241,48 @@ func TestACheckBehindTheConnectionSuspendsWhileItIsDown(t *testing.T) {
 	assert.True(t, uid.LastAttempt.StartedAt.IsZero(), "recorded, never dispatched")
 }
 
-// A suspended check has no timer left to fire, so nothing but the connection could ask for it
+// A suspended probe has no timer left to fire, so nothing but the connection could ask for it
 // again. This is the whole re-arm path.
 func TestAConnectionComingUpArmsWhatSuspendedOnIt(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	defer s.Acquire("prod").Release()
-	require.Equal(t, []checkKey{connectionOf("prod")}, takeKeys(t, s, 1), "the claim's own ask")
-	s.checkConnection("prod") // reads the file, so only the four below are left due
-	for id, c := range checks {
+	require.Equal(t, []probeKey{connectionOf("prod")}, takeKeys(t, s, 1), "the claim's own ask")
+	s.probeConnection("prod") // reads the file, so only the four below are left due
+	for id, c := range probes {
 		if c.needsConnection {
-			dependencyFailed(checkID(id))(s.claimed["prod"]) // the outage they suspended on
+			dependencyFailed(probeID(id))(s.claimed["prod"]) // the outage they suspended on
 		}
 	}
 
-	s.commitCheck(connectionOf("prod"), s.claimed["prod"], func(e *entry) {
-		observations(&e.state)[checkConnection].record(succeededAt(time.Now()))
+	s.commitProbe(connectionOf("prod"), s.claimed["prod"], func(e *entry) {
+		observations(&e.state)[probeConnection].record(succeededAt(time.Now()))
 	})
 
-	armed := map[checkID]bool{}
+	armed := map[probeID]bool{}
 	for _, key := range takeKeys(t, s, 4) {
-		armed[key.check] = true
+		armed[key.probe] = true
 	}
-	assert.Equal(t, map[checkID]bool{
-		checkReadiness: true, checkServerUID: true, checkServerVersion: true, checkPrincipal: true,
+	assert.Equal(t, map[probeID]bool{
+		probeReadiness: true, probeServerUID: true, probeServerVersion: true, probePrincipal: true,
 	}, armed)
 }
 
-// Every check behind the connection declares the dependency, so none is left dialing a server
-// the connection check has already found unreachable.
-func TestEveryCheckButTheConnectionDependsOnIt(t *testing.T) {
-	for id, c := range checks {
-		assert.Equal(t, checkID(id) != checkConnection, c.needsConnection, "%v", checkID(id))
+// Every probe behind the connection declares the dependency, so none is left dialing a server
+// the connection probe has already found unreachable.
+func TestEveryProbeButTheConnectionDependsOnIt(t *testing.T) {
+	for id, c := range probes {
+		assert.Equal(t, probeID(id) != probeConnection, c.needsConnection, "%v", probeID(id))
 	}
 }
 
-// Unreachable while nothing dials, and it says so rather than going quiet — a check that
+// Unreachable while nothing dials, and it says so rather than going quiet — a probe that
 // suspends without a reason is one nobody can explain.
-func TestAnUnimplementedCheckRecordsWhy(t *testing.T) {
+func TestAnUnimplementedProbeRecordsWhy(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	defer s.Acquire("prod").Release()
-	key := checkKey{contextName: "prod", check: checkReadiness}
+	key := probeKey{contextName: "prod", probe: probeReadiness}
 
-	s.commitCheck(key, s.claimed["prod"], checks[key.check].run(t.Context(), checkArgs{svc: s, contextName: key.contextName}))
+	s.commitProbe(key, s.claimed["prod"], probes[key.probe].run(t.Context(), probeArgs{svc: s, contextName: key.contextName}))
 
 	readiness := stateOf(t, s, "prod").Readiness
 	assert.Equal(t, ReasonInternal, readiness.LastAttempt.Reason)
@@ -291,15 +291,15 @@ func TestAnUnimplementedCheckRecordsWhy(t *testing.T) {
 
 // --- what due decides ---
 
-// dueFor is what the scheduler decides for one check of an entry a test built by hand.
-func dueFor(s *Service, e *entry, id checkID) time.Time {
+// dueFor is what the scheduler decides for one probe of an entry a test built by hand.
+func dueFor(s *Service, e *entry, id probeID) time.Time {
 	return s.due(e, id, observations(&e.state)[id], time.Now())
 }
 
-// connected is an entry whose reachability check answered, with the kubeconfig already read.
+// connected is an entry whose reachability probe answered, with the kubeconfig already read.
 func connected(s *Service) *entry {
 	e := &entry{kubecfgGen: s.kubecfgGen}
-	observations(&e.state)[checkConnection].record(succeededAt(runAt))
+	observations(&e.state)[probeConnection].record(succeededAt(runAt))
 	return e
 }
 
@@ -308,36 +308,36 @@ func connected(s *Service) *entry {
 func TestADependentStaysSuspendedForTheRestOfAnOutage(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	e := &entry{kubecfgGen: s.kubecfgGen}
-	observations(&e.state)[checkConnection].record(Attempt{FinishedAt: runAt, Reason: ReasonUnreachable})
-	observations(&e.state)[checkServerUID].record(Attempt{FinishedAt: runAt, Reason: ReasonDependencyFailed})
+	observations(&e.state)[probeConnection].record(Attempt{FinishedAt: runAt, Reason: ReasonUnreachable})
+	observations(&e.state)[probeServerUID].record(Attempt{FinishedAt: runAt, Reason: ReasonDependencyFailed})
 
-	assert.True(t, dueFor(s, e, checkServerUID).IsZero())
+	assert.True(t, dueFor(s, e, probeServerUID).IsZero())
 }
 
 // The endpoint is absent rather than failing, so a connection that is up does not make it worth
 // asking again.
-func TestAnUnsupportedCheckStaysSuspendedWhileTheConnectionIsUp(t *testing.T) {
+func TestAnUnsupportedProbeStaysSuspendedWhileTheConnectionIsUp(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	e := connected(s)
-	observations(&e.state)[checkReadiness].record(Attempt{FinishedAt: runAt, Reason: ReasonUnsupported})
+	observations(&e.state)[probeReadiness].record(Attempt{FinishedAt: runAt, Reason: ReasonUnsupported})
 
-	assert.True(t, dueFor(s, e, checkReadiness).IsZero())
+	assert.True(t, dueFor(s, e, probeReadiness).IsZero())
 }
 
-// A check that has never run is due as soon as there is a connection to run it over.
-func TestACheckThatNeverRanIsDueOnceTheConnectionIsUp(t *testing.T) {
+// A probe that has never run is due as soon as there is a connection to run it over.
+func TestAProbeThatNeverRanIsDueOnceTheConnectionIsUp(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 
-	assert.False(t, dueFor(s, connected(s), checkServerUID).IsZero())
+	assert.False(t, dueFor(s, connected(s), probeServerUID).IsZero())
 }
 
 // A run in flight is not rescheduled at all — reconcile leaves it alone rather than asking due,
 // because NextAttempt is the run and its commit is what decides what comes after.
-func TestReconcileLeavesAnInFlightCheckUntouched(t *testing.T) {
+func TestReconcileLeavesAnInFlightProbeUntouched(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	defer s.Acquire("prod").Release()
 	e := s.claimed["prod"]
-	observations(&e.state)[checkServerUID].begin(runAt)
+	observations(&e.state)[probeServerUID].begin(runAt)
 
 	s.reconcile("prod")
 
@@ -345,13 +345,13 @@ func TestReconcileLeavesAnInFlightCheckUntouched(t *testing.T) {
 	assert.True(t, e.state.ServerUID.InFlight())
 }
 
-// An ordinary failure is neither terminal nor a dependency's, so the check keeps its cadence.
-func TestAnOrdinaryFailureKeepsTheChecksCadence(t *testing.T) {
+// An ordinary failure is neither terminal nor a dependency's, so the probe keeps its cadence.
+func TestAnOrdinaryFailureKeepsTheProbesCadence(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	e := connected(s)
-	observations(&e.state)[checkServerUID].record(Attempt{FinishedAt: runAt, Reason: ReasonForbidden})
+	observations(&e.state)[probeServerUID].record(Attempt{FinishedAt: runAt, Reason: ReasonForbidden})
 
-	assert.Equal(t, runAt.Add(defaultIntervals[checkServerUID]), dueFor(s, e, checkServerUID))
+	assert.Equal(t, runAt.Add(defaultIntervals[probeServerUID]), dueFor(s, e, probeServerUID))
 }
 
 // Nothing below reachability runs before reachability has answered: there is nothing to say
@@ -359,31 +359,31 @@ func TestAnOrdinaryFailureKeepsTheChecksCadence(t *testing.T) {
 func TestADependentIsNotDueBeforeTheConnectionHasAnswered(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 
-	assert.True(t, dueFor(s, &entry{kubecfgGen: s.kubecfgGen}, checkServerUID).IsZero())
+	assert.True(t, dueFor(s, &entry{kubecfgGen: s.kubecfgGen}, probeServerUID).IsZero())
 }
 
 // A queued key outlives the claim that asked for it: the last holder can release and another
 // caller re-claim the name before a worker gets there. The replacement has reached no server, so
-// it never scheduled this check — recording against it would show a dependency failure for a
+// it never scheduled this probe — recording against it would show a dependency failure for a
 // connection nobody has tried.
-func TestAQueuedCheckIsDroppedWhenItsClaimIsReplaced(t *testing.T) {
-	uidCheck := checkKey{contextName: "prod", check: checkServerUID}
+func TestAQueuedProbeIsDroppedWhenItsClaimIsReplaced(t *testing.T) {
+	uidProbe := probeKey{contextName: "prod", probe: probeServerUID}
 	s := New(failingToResolve())
 	lease := s.Acquire("prod")
-	s.checkConnection("prod") // reachability answers, so the checks behind it fall due
-	require.Contains(t, drainKeys(t, s), uidCheck)
+	s.probeConnection("prod") // reachability answers, so the probes behind it fall due
+	require.Contains(t, drainKeys(t, s), uidProbe)
 
 	lease.Release()
 	defer s.Acquire("prod").Release()
-	s.runCheck(t.Context(), uidCheck)
+	s.runProbe(t.Context(), uidProbe)
 
 	uid := stateOf(t, s, "prod").ServerUID
 	assert.Equal(t, ReasonUnknown, uid.LastAttempt.Reason)
 	assert.Zero(t, uid.Failures)
-	assert.False(t, uid.InFlight(), "a dropped run must not leave the check marked out")
+	assert.False(t, uid.InFlight(), "a dropped run must not leave the probe marked out")
 }
 
-// A reconcile can land while a check is out — another check committing, a kubeconfig change, a
+// A reconcile can land while a probe is out — another probe committing, a kubeconfig change, a
 // timer. NextAttempt is that run, so overwriting it erases the mark saying the run is still going
 // and the schedule it was dispatched on.
 func TestAReconcileLeavesAnInFlightRunAlone(t *testing.T) {
@@ -397,7 +397,7 @@ func TestAReconcileLeavesAnInFlightRunAlone(t *testing.T) {
 		s.reconcile("prod")
 		inFlight = s.claimed["prod"].state.Connection.InFlight()
 	})
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	assert.True(t, inFlight, "the run stopped reading as in flight while it was still going")
 	assert.Equal(t, dueAt, stateOf(t, s, "prod").Connection.LastAttempt.ScheduledAt,
@@ -408,22 +408,22 @@ func TestAReconcileLeavesAnInFlightRunAlone(t *testing.T) {
 
 // The schedule reconcile derives is what brings the pass back. No workers here on purpose: the
 // only thing left to ask is the timer.
-func TestAScheduledCheckIsAskedForAgainWhenItIsDue(t *testing.T) {
-	s := newWithOptions(failingToResolve(), withIntervals(shrunk(checkConnection, time.Millisecond)))
+func TestAScheduledProbeIsAskedForAgainWhenItIsDue(t *testing.T) {
+	s := newWithOptions(failingToResolve(), withIntervals(shrunk(probeConnection, time.Millisecond)))
 	defer s.Acquire("prod").Release()
 	drainKeys(t, s)           // the claim's own ask, already taken
-	s.checkConnection("prod") // a failure is what earns a retry
+	s.probeConnection("prod") // a failure is what earns a retry
 	require.True(t, stateOf(t, s, "prod").Connection.Scheduled())
 
-	// The failure also wakes the four checks behind it, which are due now and land first.
+	// The failure also wakes the four probes behind it, which are due now and land first.
 	awaitKey(t, s, connectionOf("prod"))
 }
 
-// An entry nobody holds is one nothing checks, so the last release gives up its schedule.
+// An entry nobody holds is one nothing probes, so the last release gives up its schedule.
 func TestReleaseStopsTheScheduledRuns(t *testing.T) {
 	s := New(failingToResolve())
 	lease := s.Acquire("prod")
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	e := s.claimed["prod"]
 	require.NotNil(t, e.timer)
 
@@ -435,7 +435,7 @@ func TestReleaseStopsTheScheduledRuns(t *testing.T) {
 func TestCloseStopsTheScheduledRuns(t *testing.T) {
 	s := New(failingToResolve())
 	defer s.Acquire("prod").Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	e := s.claimed["prod"]
 	require.NotNil(t, e.timer)
 
@@ -451,11 +451,11 @@ func TestCloseStopsTheScheduledRuns(t *testing.T) {
 func TestARunThatChangedNothingIsNotAnnounced(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	defer s.Acquire("prod").Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	news := s.Subscribe()
 	defer news.Close()
 
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
@@ -469,11 +469,11 @@ func TestARunThatChangedNothingStillReachesAClaimWatcher(t *testing.T) {
 	s := New(failingToResolve())
 	lease := s.Acquire("prod")
 	defer lease.Release()
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 	watched := lease.WatchState()
 	defer watched.Close()
 
-	s.checkConnection("prod") // same answer, so no news — but a new countdown
+	s.probeConnection("prod") // same answer, so no news — but a new countdown
 
 	ev, err := watched.RecvContext(within(t))
 	require.NoError(t, err)
@@ -513,12 +513,12 @@ func TestRecordAttemptIgnoresACancellation(t *testing.T) {
 	assert.Equal(t, runAt, o.FailingSince)
 }
 
-// --- the per-check index ---
+// --- the per-probe index ---
 
-// Each entry of the index reaches exactly one observation, so a check can never write another's
+// Each entry of the index reaches exactly one observation, so a probe can never write another's
 // answer.
-func TestEachCheckReachesOneObservation(t *testing.T) {
-	for id := range numChecks {
+func TestEachProbeReachesOneObservation(t *testing.T) {
+	for id := range numProbes {
 		var st State
 		observations(&st)[id].record(Attempt{FinishedAt: runAt, Reason: ReasonForbidden})
 
@@ -533,16 +533,16 @@ func TestEachCheckReachesOneObservation(t *testing.T) {
 	}
 }
 
-func TestAnUnknownCheckIsNamedByNumber(t *testing.T) {
-	assert.Equal(t, "check(5)", checkID(numChecks).String())
+func TestAnUnknownProbeIsNamedByNumber(t *testing.T) {
+	assert.Equal(t, "probe(5)", probeID(numProbes).String())
 }
 
-func TestEveryCheckIsNamed(t *testing.T) {
+func TestEveryProbeIsNamed(t *testing.T) {
 	assert.Equal(t,
 		[]string{"connection", "readiness", "serverUID", "serverVersion", "principal"},
 		[]string{
-			checkConnection.String(), checkReadiness.String(), checkServerUID.String(),
-			checkServerVersion.String(), checkPrincipal.String(),
+			probeConnection.String(), probeReadiness.String(), probeServerUID.String(),
+			probeServerVersion.String(), probePrincipal.String(),
 		})
 }
 
@@ -558,8 +558,8 @@ func TestAReconcileForAnUnclaimedContextSchedulesNothing(t *testing.T) {
 	assert.Empty(t, s.claimed)
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	_, ok := s.checkQ.Next(ctx)
-	assert.False(t, ok, "a check was asked for on behalf of nobody")
+	_, ok := s.probeQ.Next(ctx)
+	assert.False(t, ok, "a probe was asked for on behalf of nobody")
 }
 
 // A timer can outlive the claim it was armed for. The run finds no entry and writes nothing,
@@ -569,14 +569,14 @@ func TestARunForAnUnclaimedContextDoesNothing(t *testing.T) {
 	cfg.reads = testutil.NewProbe[string](2)
 	s := New(cfg)
 
-	s.checkConnection("prod")
+	s.probeConnection("prod")
 
 	assert.Empty(t, s.claimed)
 	assert.Empty(t, cfg.reads.Chan(), "the kubeconfig was not even read")
 }
 
 // failingToResolve is a kubeconfig that names "prod" and will not yield credentials for it —
-// the one answer a check can reach without a server that leaves something scheduled.
+// the one answer a probe can reach without a server that leaves something scheduled.
 func failingToResolve() *fakeKubeconfig {
 	cfg := resolving("prod", "key-1")
 	cfg.err = errors.New("open ca.crt: no such file")
@@ -588,8 +588,8 @@ func succeededAt(at time.Time) Attempt {
 	return Attempt{StartedAt: at, FinishedAt: at, Reason: ReasonSucceeded}
 }
 
-// shrunk paces one check for a test and leaves the rest at their production value.
-func shrunk(id checkID, d time.Duration) [numChecks]time.Duration {
+// shrunk paces one probe for a test and leaves the rest at their production value.
+func shrunk(id probeID, d time.Duration) [numProbes]time.Duration {
 	intervals := defaultIntervals
 	intervals[id] = d
 	return intervals
