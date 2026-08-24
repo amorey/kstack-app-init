@@ -36,21 +36,6 @@ func stateOf(t *testing.T, s *Service, contextName string) State {
 	return e.state
 }
 
-// awaitKey drains the check queue until want turns up, for a test where more than one check is
-// due and the order they land in is not the point.
-func awaitKey(t *testing.T, s *Service, want checkKey) {
-	t.Helper()
-	s.settle()
-	for {
-		key, ok := s.checkQ.Next(within(t))
-		require.True(t, ok, "the queue closed before %v was asked for", want)
-		s.checkQ.Done(key)
-		if key == want {
-			return
-		}
-	}
-}
-
 // drainKeys takes everything the check queue holds once the schedules have settled, giving each
 // back. What a worker pool would pick up, without waiting for anything more to arrive.
 func drainKeys(t *testing.T, s *Service) []checkKey {
