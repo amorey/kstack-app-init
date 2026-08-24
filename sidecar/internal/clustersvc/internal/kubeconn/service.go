@@ -85,7 +85,11 @@ type Lease interface {
 	// Nothing probes yet, so this always reads as nothing known.
 	State() State
 	// WatchState carries every State published for this claim. It delivers nothing on attach,
-	// so a watcher pairs it with State for what is known now. Release ends it.
+	// so a watcher pairs it with State for what is known now.
+	//
+	// **The caller closes it**, as with Subscribe. Release does not: the receiver is keyed by
+	// context, so one that outlives its claim keeps a hub slot and goes on reporting whatever
+	// claims that name next.
 	WatchState() StateSubscription
 	// Departed reports that the kubeconfig no longer names this claim's context.
 	//
@@ -348,6 +352,9 @@ func (s *Service) read(contextName string, held *entry) (State, bool) {
 // one has none, so every value is delivered. What a baseline is for — reading and registering in
 // one critical section, so a publish landing between the two is not skipped — is worth having
 // once a probe can land at all.
+//
+// Not tracked for the caller. The receiver is the caller's to close, and closing it here on
+// Release would take one out from under a caller that is still reading it.
 func (c *claim) WatchState() StateSubscription {
 	return c.svc.stateHub.Watch(c.contextName)
 }

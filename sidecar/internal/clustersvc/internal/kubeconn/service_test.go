@@ -488,3 +488,20 @@ func TestAClaimTakenBeforeStartIsChecked(t *testing.T) {
 	require.Eventually(t, lease.Departed, time.Second, time.Millisecond,
 		"a claim taken before Start was never checked")
 }
+
+// A state receiver is the caller's, not the claim's: releasing does not close it, which is why
+// the contract says to. One kept past its claim holds a hub slot and reports whatever claims
+// that context next.
+func TestReleaseDoesNotCloseAStateWatcher(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	lease := s.Acquire("prod")
+	watched := lease.WatchState()
+	defer watched.Close()
+
+	lease.Release()
+	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", LastSeen: runAt}})
+
+	ev, err := watched.RecvContext(within(t))
+	require.NoError(t, err, "the receiver is still live, and still the caller's to close")
+	assert.Equal(t, "uid-1", ev.Value.ServerUID.Value)
+}
