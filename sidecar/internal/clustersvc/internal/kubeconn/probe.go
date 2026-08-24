@@ -12,193 +12,108 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// What is asked of a server. Each of State's five observations has one probe behind it, and each
-// probe runs on its own schedule: a cluster's UID never moves and its readiness moves constantly,
-// so nothing is gained by asking about them together. **A probe writes the observation it owns and
-// no other**, which is what lets the five run at once against one entry without coordinating. When
-// each one runs is the pool's to decide — see Service.due.
+// The five probes over one kube-context's server. What is asked and how the answers classify
+// lives here; when anything runs is the engine's (internal/probe) — the schedule is derived from
+// what each probe records, and every probe behind reachability declares that dependency rather
+// than testing it.
 //
 // **Nothing dials yet.** The connection probe resolves the kubeconfig and reports a context that
-// left it; the four behind it record DependencyFailed and suspend, which is what they are
-// supposed to do while the connection is down, and stays their behavior once one is built.
+// left it; the four behind it are unimplemented, and the engine records DependencyFailed for
+// them while the connection has not succeeded — which is their correct behavior once they exist.
 package kubeconn
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
 
-// probeID names the observation a probe owns. **A probe writes that observation and no other**,
-// which is what lets the five run at once against one entry without coordinating.
-type probeID int
+// numProbes sizes what is tracked per context, one entry per field of probeIDs.
+const numProbes = 5
 
-const (
-	probeConnection probeID = iota
-	probeReadiness
-	probeServerUID
-	probeServerVersion
-	probePrincipal
-	// numProbes counts them; not a probe itself. Every per-probe table is sized by it, so a
-	// sixth probe is a compile error in any table that forgets it.
-	numProbes
-)
-
-// probeNames is its own array rather than a field on probe: probes refers to String through the
-// unimplemented bodies, so a name in that table would be an initialization cycle.
-var probeNames = [numProbes]string{
-	probeConnection:    "connection",
-	probeReadiness:     "readiness",
-	probeServerUID:     "serverUID",
-	probeServerVersion: "serverVersion",
-	probePrincipal:     "principal",
+// probeIDs is what registration returned: the names Wake and the State projection address
+// probes by.
+type probeIDs struct {
+	connection, readiness, serverUID, serverVersion, principal probe.ID
 }
 
-func (p probeID) String() string {
-	if p < 0 || p >= numProbes {
-		return fmt.Sprintf("probe(%d)", int(p))
-	}
-	return probeNames[p]
+// values is the engine's subject snapshot for one context: what the probes' commits write, and
+// what State projects beside the engine's attempts. A cluster's UID outlives everything else
+// here; its readiness outlives nothing — which is why the intervals below differ.
+type values struct {
+	// departed is what the connection probe's last read of the kubeconfig said: false while
+	// the file names this context, true once it stops. Flipping it is news the holders are
+	// told.
+	departed bool
+	// conn is the connection the probes run over. Nothing builds one yet.
+	conn *Connection
+
+	endpoint      string
+	readiness     ComponentStatus
+	serverUID     string
+	serverVersion VersionInfo
+	principal     Principal
 }
 
-// probeKey is one probe of one context — the unit the work queue keys on, so a probe is never in
-// two workers at once and an ask arriving mid-run earns a fresh run rather than joining it. Only
-// reconcile builds one.
-type probeKey struct {
-	contextName string
-	probe       probeID
+func registerProbes(e *probe.Engine[values], kubecfg kubeconfigService) probeIDs {
+	var p probeIDs
+	p.connection = e.Register("connection", runConnection(kubecfg),
+		probe.WithInterval(30*time.Second))
+	p.readiness = e.Register("readiness", unimplemented("readiness"),
+		probe.WithInterval(30*time.Second), probe.Needs(p.connection))
+	p.serverUID = e.Register("serverUID", unimplemented("serverUID"),
+		probe.WithInterval(10*time.Minute), probe.Needs(p.connection))
+	p.serverVersion = e.Register("serverVersion", unimplemented("serverVersion"),
+		probe.WithInterval(5*time.Minute), probe.Needs(p.connection))
+	p.principal = e.Register("principal", unimplemented("principal"),
+		probe.WithInterval(5*time.Minute), probe.Needs(p.connection))
+	return p
 }
 
-// commit is what a probe concluded, applied to the entry under the pool's lock. It records what
-// the run found and nothing about when to run again — that is derived afterwards, from this.
-//
-// The request happens before the lock is taken and only the write happens under it, so a probe
-// never orders other callers behind a remote server.
-type commit func(e *entry)
-
-// probeArgs is what a probe is handed: the context it is asking about, and what the pool knew
-// about it when the run was dispatched.
-type probeArgs struct {
-	svc         *Service
-	contextName string
-	conn        *Connection
-	// kubecfgGen is the kubeconfig generation this run sees. The connection probe stamps it on
-	// the entry, which is how the next reconcile knows the file has been read since it moved.
-	kubecfgGen uint64
-}
-
-// probe is one observation's owner.
-type probe struct {
-	// needsConnection marks the four probes behind reachability: a server nothing reached
-	// cannot answer them, so they are recorded rather than dispatched while it is down. The
-	// dependency is declared here rather than tested inside each body, which would be four
-	// copies of one rule.
-	needsConnection bool
-	run             func(ctx context.Context, a probeArgs) commit
-}
-
-var probes = [numProbes]probe{
-	probeConnection:    {run: runConnectionProbe},
-	probeReadiness:     {needsConnection: true, run: unimplemented(probeReadiness)},
-	probeServerUID:     {needsConnection: true, run: unimplemented(probeServerUID)},
-	probeServerVersion: {needsConnection: true, run: unimplemented(probeServerVersion)},
-	probePrincipal:     {needsConnection: true, run: unimplemented(probePrincipal)},
-}
-
-// defaultIntervals is how long after a run each probe is due again. A cluster's UID outlives
-// everything else here; its readiness outlives nothing.
-var defaultIntervals = [numProbes]time.Duration{
-	probeConnection:    30 * time.Second,
-	probeReadiness:     30 * time.Second,
-	probeServerUID:     10 * time.Minute,
-	probeServerVersion: 5 * time.Minute,
-	probePrincipal:     5 * time.Minute,
-}
-
-// runConnectionProbe answers whether the server behind contextName can be reached, and owns the
+// runConnection answers whether the server behind the context can be reached, and owns the
 // context's lifecycle on the way there: resolving the kubeconfig is the first step of reaching a
 // server, so a context that left the file is this probe's to find.
 //
-// **Every branch stamps the generation it read at**, including the one that found nothing to
-// read. That stamp is what stops the next reconcile asking again for a file this run has seen.
-//
-// Nothing dials yet, so a context that resolves records no attempt — resolving is the
-// precondition, not the answer, and Phase stays PhasePending. A context that cannot resolve is a
-// definitive answer, and does record one.
-func runConnectionProbe(_ context.Context, a probeArgs) commit {
-	startedAt := time.Now()
-	_, _, err := a.svc.kubecfgSvc.RESTConfig(a.contextName)
-	att := Attempt{StartedAt: startedAt, FinishedAt: time.Now(), Err: err}
+// Nothing dials yet, so a context that resolves suspends with ReasonResolved — resolving is the
+// precondition, not an answer about the server, and Phase reads it as still pending. The
+// kubeconfig watch wakes this probe on every change, which is what re-asks every one of these
+// answers.
+func runConnection(kubecfg kubeconfigService) probe.Run[values] {
+	return func(_ context.Context, contextName string, _ values) (probe.Result, func(*values)) {
+		_, _, err := kubecfg.RESTConfig(contextName)
+		switch {
+		case errors.Is(err, kubeconfig.ErrNotRead):
+			// An unread kubeconfig names nothing, and saying so would report every context
+			// gone for as long as the first read takes. The watch wakes us when it is read.
+			return probe.Skip(), nil
 
-	switch {
-	case errors.Is(err, kubeconfig.ErrNotRead):
-		// An unread kubeconfig names nothing, and saying so would report every context gone
-		// for as long as the first read takes. Nothing was concluded, so nothing may be left
-		// behind to conclude from: a retained failure would still be deriving a retry, and
-		// this run would leave it due again — a spin for as long as the file stays unread.
-		return func(e *entry) {
-			e.kubecfgGen = a.kubecfgGen
-			e.state.Connection.forget()
-		}
+		case errors.Is(err, kubeconfig.ErrContextNotFound):
+			return probe.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context"),
+				func(v *values) { v.departed = true }
 
-	case errors.Is(err, kubeconfig.ErrContextNotFound):
-		att.Reason, att.Message = ReasonContextNotFound, "kubeconfig no longer names this context"
-		return func(e *entry) {
-			e.kubecfgGen = a.kubecfgGen
-			e.departed = true
-			e.state.Connection.record(att)
-		}
+		case err != nil:
+			// The file still names it, so this is not a departure — it is a file the user
+			// has to fix, and the retry ladder is for a fix the kubeconfig watch cannot see,
+			// such as a CA path that now opens.
+			return probe.Fail(ReasonResolveFailed, err),
+				func(v *values) { v.departed = false }
 
-	case err != nil:
-		// The file still names it, so this is not a departure — it is a file the user has to
-		// fix, and no backoff can fix a file.
-		att.Reason, att.Message = ReasonResolveFailed, err.Error()
-		return func(e *entry) {
-			e.kubecfgGen = a.kubecfgGen
-			e.departed = false
-			e.state.Connection.record(att)
-		}
-
-	default:
-		return func(e *entry) {
-			e.kubecfgGen = a.kubecfgGen
-			e.departed = false
-			// A context that resolves again outlives whatever the last failure said, and
-			// nothing dials yet to replace it — so the probe goes back to unattempted
-			// rather than leaving the phase at a server it never reached.
-			observations(&e.state)[probeConnection].forget()
+		default:
+			return probe.Suspend(ReasonResolved, "resolved; nothing dials yet"),
+				func(v *values) { v.departed = false }
 		}
 	}
 }
 
 // unimplemented stands in for a probe with no request behind it yet. Unreachable while nothing
-// dials — every one of these depends on a connection that never comes up — and it records rather
-// than going quiet, so a run that does reach it says so instead of looking suspended for a reason
-// nobody wrote down.
-func unimplemented(id probeID) func(context.Context, probeArgs) commit {
-	return func(context.Context, probeArgs) commit {
-		now := time.Now()
-		att := Attempt{
-			StartedAt:  now,
-			FinishedAt: now,
-			Reason:     ReasonInternal,
-			Message:    id.String() + " probe is not implemented",
-		}
-		return func(e *entry) { observations(&e.state)[id].record(att) }
+// dials — every one of these needs a connection that never succeeds — and it records rather
+// than going quiet, so a run that does reach it says so instead of looking suspended for a
+// reason nobody wrote down.
+func unimplemented(name string) probe.Run[values] {
+	return func(context.Context, string, values) (probe.Result, func(*values)) {
+		return probe.Suspend(ReasonInternal, name+" probe is not implemented"), nil
 	}
-}
-
-// dependencyFailed is what a probe behind the connection records instead of dialing a server
-// nothing reached. Recorded rather than attempted — which is why it has no StartedAt — and it has
-// to be written rather than skipped, or nothing says why the probe is suspended.
-func dependencyFailed(id probeID) commit {
-	att := Attempt{
-		FinishedAt: time.Now(),
-		Reason:     ReasonDependencyFailed,
-		Message:    "no connection to the server",
-	}
-	return func(e *entry) { observations(&e.state)[id].record(att) }
 }

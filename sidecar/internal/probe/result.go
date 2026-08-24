@@ -28,6 +28,8 @@ const (
 	// ReasonDependencyFailed is recorded by the engine when a probe's dependency is failing,
 	// in place of a run. See the dependency lifecycle in docs/specs/probe-engine.md.
 	ReasonDependencyFailed Reason = "DependencyFailed"
+	// ReasonInternal is a bug in a probe body, recorded by the engine when a run panics.
+	ReasonInternal Reason = "Internal"
 )
 
 // Verdict is how a finished run was classified, recorded on the Attempt because the schedule is
@@ -86,6 +88,14 @@ func Suspend(reason Reason, message string) Result {
 func Skip() Result {
 	return Result{kind: resultSkip}
 }
+
+// The read side, for a probe body's own tests: what the body returned, without giving a body a
+// way to build a Result the constructors cannot.
+func (r Result) Verdict() Verdict { return r.verdict }
+func (r Result) Reason() Reason   { return r.reason }
+func (r Result) Message() string  { return r.message }
+func (r Result) Err() error       { return r.err }
+func (r Result) IsSkip() bool     { return r.kind == resultSkip }
 
 // Attempt is one run of one probe, from scheduled through finished. Its fields fill in that
 // order, so the same value describes a run at every stage of its life.
@@ -158,7 +168,12 @@ func (a *Attempts) schedule(at time.Time) { a.NextAttempt = Attempt{ScheduledAt:
 // record files a finished run. A success stamps LastSeen; a suspension ends a failure streak
 // the same way a success does, since it parks the question rather than failing at it. It writes
 // nothing about the next run — that is derived from this, not decided here.
+//
+// The run moves out of NextAttempt rather than replacing it, so the schedule it was dispatched
+// on survives into the record: StartedAt against ScheduledAt is how long it waited for a
+// worker, and a caller cannot tell a slow probe from a saturated pool without it.
 func (a *Attempts) record(att Attempt) {
+	att.ScheduledAt = a.NextAttempt.ScheduledAt
 	a.LastAttempt = att
 
 	if att.Verdict == VerdictFailed {

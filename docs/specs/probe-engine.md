@@ -40,7 +40,9 @@ own schedule, built by one of four constructors:
 - `Fail(reason, err)` — record failure; due again up the backoff ladder.
 - `Suspend(reason, msg)` — record why; nothing due until a `Wake`.
 - `Skip()` — record nothing; nothing due until a `Wake`. For a run that learned nothing usable:
-  an unread kubeconfig, a run cancelled by shutdown.
+  an unread kubeconfig, a run cancelled by shutdown. The engine remembers only *that* the run
+  happened — without that one bit, the pass would read the probe as never-run and re-dispatch it
+  at once.
 
 Every Kubernetes-specific rule returns to the probe that owns it, matching the rule already in
 force for dependencies — declared where the probe is, not tested in the scheduler. `Skip` also
@@ -80,8 +82,8 @@ type Run[S any] func(ctx context.Context, snap S) (Result, func(*S))
 func New[S any](opts ...Option) *Engine[S] // Option is non-generic: WithWorkers(n), later WithClock/WithLogger
 
 // Register adds one probe and returns its ID. It panics on a Needs entry not yet
-// registered, a duplicate name, or a call after Start — a table wired wrong at boot,
-// not a runtime error.
+// registered, a duplicate name, or a call after Start or the first Add — a table wired
+// wrong at boot, not a runtime error.
 func (e *Engine[S]) Register(name string, run Run[S], opts ...ProbeOption) ID
 
 // Per-probe options; a registration states only what deviates from the defaults.
@@ -108,9 +110,9 @@ that follows — one critical section over a subject's values and its schedule, 
 today. A nil commit writes nothing.
 
 `Attempts` is today's type plus `LastSeen`, which the engine stamps when a run succeeds — so a
-commit writes the observed value and nothing else. The engine owns two reason strings,
-`"Succeeded"` and `"DependencyFailed"`; a caller's reason vocabulary aligns by value, as
-`kubeconn`'s already does.
+commit writes the observed value and nothing else. The engine owns three reason strings —
+`"Succeeded"`, `"DependencyFailed"`, and `"Internal"` (a panicking run) — and a caller's reason
+vocabulary aligns by value, as `kubeconn`'s already does.
 
 `OnChange` is a method rather than an option — the one hook that needs `S`, which keeps `Option`
 non-generic: `e.OnChange(func(subject string, snap S, at []Attempts))`, set before `Start` like a
@@ -142,7 +144,9 @@ Two rules keep the lifecycle honest:
   which is why the outage writes a record instead of going quiet.
 - **`Needs` is rechecked at dispatch.** A dependency that failed between the pass and the worker
   picking the key up means the run is recorded as `DependencyFailed`, not dialed — a worker must
-  never spend a timeout learning what the state already said.
+  never spend a timeout learning what the state already said. One still *unanswered* at dispatch
+  — a `Wake` outran it — ends the run as a no-op instead: recording would violate the first row
+  above.
 
 ## How kubeconn maps
 
@@ -238,33 +242,14 @@ From `kubeconn`: `probeQ`, `probeLoop`, `probeWorkers`, `runProbe`, `commitProbe
 
 ## Build order
 
-The shape is landed; the work left is filling it in. `sidecar/internal/probe` compiles today:
-`result.go` is **implemented and tested** (verdicts, `Attempts`, the streak rules), `engine.go`
-carries the full exported API with `New`/`Register`/options implemented and every engine method a
-panicking stub whose doc comment states its invariants and names the `kubeconn` code it ports
-(`pass` ← `reconcile`, `due` ← `due` with `Reason` cases replaced by `Verdict`, `runProbe` ←
-`runCheck`+`commitCheck`). `engine_test.go` is the checklist: real tests for what is implemented,
-and one **skipped test per remaining rule**, each naming the `kubeconn` test to port.
+**Steps 1–4 are done.** `sidecar/internal/probe` is implemented and tested end to end — the
+engine (pass, `due`, dispatch/commit, timers, wakes), panic recovery, the per-run deadline, and
+the backoff ladder — and `kubeconn` runs on it: `probe.go` is `registerProbes` plus the five
+`Run` bodies, `service.go` is leases and publishing, `State` is assembled at publish, and the two
+deliberate behavior changes above landed with it. What is now true is folded into
+`sidecar/CLAUDE.md`.
 
-For the implementer, in order — after every step: `gofmt -l`, `go vet`, and
-`go test -race -count=2 ./internal/probe/`.
-
-1. Fill in the engine bodies and un-skip the checklist, porting from
-   `internal/clustersvc/internal/kubeconn` (`service.go`, `probe.go`) — the mechanics there are
-   tested and correct; the job is transplanting, not inventing. A skip left behind is unfinished
-   work; a skip deleted without a real test in its place is worse.
-2. Panic recovery and the per-run deadline — the two latent hangs.
-3. The backoff ladder, as a pure function of `Failures` paced by `WithBackoff`.
-4. Move `kubeconn` onto the engine: `registerProbes`, `values`, `State` assembled at publish. The
-   only step that changes `kubeconn`'s behaviour, and its tests prove it — run
-   `go test -race ./internal/clustersvc/...` too. **Stop and ask for review before this step**:
-   it deletes working code, and the two deliberate behavior changes above land here.
-5. `WithClock`, `WithLogger`, metrics.
-
-Hard rules for the implementer: do not change the exported API, the file layout, or anything in
-this spec without asking; do not touch `kubeconn` before step 4; steps 1–3 land with the engine
-unused. The repo testing rules apply — no sleeps (`internal/testutil` for waits, shrink cadences
-through the options), tests beside the file they cover.
+5. `WithClock`, `WithLogger`, metrics — then delete this spec.
 
 ## Not in this pass
 

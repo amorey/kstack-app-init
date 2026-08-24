@@ -15,7 +15,6 @@
 package kubeconn
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -24,573 +23,150 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
 
-// stateOf reads the entry a test set up, which only a white-box test may do. Safe unlocked: no
-// loops are running in the tests that use it.
-func stateOf(t *testing.T, s *Service, contextName string) State {
+// connect runs the connection probe's body once, on the test's goroutine, and applies its
+// commit the way the engine would.
+func connect(t *testing.T, cfg *fakeKubeconfig, v values) (probe.Result, values) {
 	t.Helper()
-	e := s.claimed[contextName]
-	require.NotNil(t, e, "no entry for %q", contextName)
-	return e.state
-}
-
-// awaitKey drains the probe queue until want turns up, for a test where more than one probe is
-// due and the order they land in is not the point.
-func awaitKey(t *testing.T, s *Service, want probeKey) {
-	t.Helper()
-	for {
-		key, ok := s.probeQ.Next(within(t))
-		require.True(t, ok, "the queue closed before %v was asked for", want)
-		s.probeQ.Done(key)
-		if key == want {
-			return
-		}
+	res, commit := runConnection(cfg)(t.Context(), "prod", v)
+	if commit != nil {
+		commit(&v)
 	}
+	return res, v
 }
 
-// drainKeys takes everything the probe queue holds, giving each back. What a worker pool would
-// pick up, without waiting for anything more to arrive.
-func drainKeys(t *testing.T, s *Service) []probeKey {
-	t.Helper()
+// --- the connection probe's classifications ---
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Next takes what is queued and reports closed rather than waiting for more.
+// A context that left the file has nothing to reach, so its probe suspends — the file is the
+// whole truth about presence, and the watch reports it moving, so polling asks nothing new.
+func TestConnectionSuspendsADepartedContext(t *testing.T) {
+	cfg := resolving("staging", "key-1") // "prod" is not named
 
-	var keys []probeKey
-	for {
-		key, ok := s.probeQ.Next(ctx)
-		if !ok {
-			return keys
-		}
-		s.probeQ.Done(key)
-		keys = append(keys, key)
-	}
+	res, v := connect(t, cfg, values{})
+
+	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
+	assert.Equal(t, ReasonContextNotFound, res.Reason())
+	assert.True(t, v.departed)
 }
 
-// takeKeys drains n keys off the probe queue, giving each back so the next ask for it is not
-// held behind a run that never happens.
-func takeKeys(t *testing.T, s *Service, n int) []probeKey {
-	t.Helper()
-	keys := make([]probeKey, 0, n)
-	for range n {
-		key, ok := s.probeQ.Next(within(t))
-		require.True(t, ok, "the queue closed with %d of %d keys taken", len(keys), n)
-		s.probeQ.Done(key)
-		keys = append(keys, key)
-	}
-	return keys
-}
-
-// --- the connection probe ---
-
-// Resolving is the precondition, not the answer: nothing dialed, so no attempt is recorded and
-// the phase stays pending. Nothing is scheduled either — there is nothing to poll for until
-// something dials, and the file moving is what brings the probe back.
-func TestAResolvableContextRecordsNoAttemptAndSchedulesNothing(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	defer s.Acquire("prod").Release()
-
-	s.probeConnection("prod")
-
-	st := stateOf(t, s, "prod")
-	assert.Equal(t, PhasePending, st.Phase())
-	assert.False(t, st.Connection.LastAttempt.Done())
-	assert.False(t, st.Connection.Scheduled())
-}
-
-// The generation is what makes it due again, so the watch names no probe — it says the file
-// moved and reconcile works out who cares.
-func TestAKubeconfigChangeMakesTheConnectionProbeDue(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	defer s.Acquire("prod").Release()
-	require.Equal(t, []probeKey{connectionOf("prod")}, takeKeys(t, s, 1), "the claim's own ask")
-	s.probeConnection("prod")
-
-	s.bumpKubeconfig()
-
-	assert.Equal(t, []probeKey{connectionOf("prod")}, takeKeys(t, s, 1))
-}
-
-// A context that left the file has nothing to reach, so its probe suspends — and records why,
-// because LastAttempt.Reason is the only place a suspension's reason lives.
-func TestADepartedContextSuspendsItsConnectionProbe(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	defer s.Acquire("prod").Release()
-
-	cfg.rotate("prod", "")
-	s.probeConnection("prod")
-
-	conn := stateOf(t, s, "prod").Connection
-	assert.Equal(t, ReasonContextNotFound, conn.LastAttempt.Reason)
-	assert.False(t, conn.Scheduled(), "the watch reports the file moving; polling asks nothing new")
-	assert.Equal(t, 1, conn.Failures)
-}
-
-// The file still names it, so the remedy is to fix the file — which means keep asking, since
-// nothing here can tell when the user has.
-func TestAResolveFailureKeepsAsking(t *testing.T) {
+// The file still names it, so the remedy is to fix the file — a failure on the retry ladder,
+// since nothing here can tell when the user has.
+func TestConnectionFailsWhenTheFileWillNotResolve(t *testing.T) {
 	cfg := resolving("prod", "key-1")
 	cfg.err = errors.New("open ca.crt: no such file")
-	s := New(cfg)
-	defer s.Acquire("prod").Release()
 
-	s.probeConnection("prod")
-	first := stateOf(t, s, "prod").Connection
-	require.Equal(t, ReasonResolveFailed, first.LastAttempt.Reason)
-	assert.True(t, first.Scheduled())
-	assert.Equal(t, 1, first.Failures)
-	require.False(t, first.FailingSince.IsZero())
+	res, v := connect(t, cfg, values{departed: true})
 
-	s.probeConnection("prod")
-
-	second := stateOf(t, s, "prod").Connection
-	assert.Equal(t, 2, second.Failures)
-	assert.Equal(t, first.FailingSince, second.FailingSince, "one run of failures, not two")
+	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, ReasonResolveFailed, res.Reason())
+	assert.ErrorIs(t, res.Err(), cfg.err)
+	assert.False(t, v.departed, "the file names it, so it has not departed")
 }
 
-// A context that comes back is not a server we failed to reach. Leaving the departure recorded
-// would report the cluster as probe-failed for good, since nothing else clears it.
-func TestAReturningContextReadsAsUnattempted(t *testing.T) {
+// An unread kubeconfig names nothing, and reporting that as anything would tell every holder
+// its context is gone for as long as the first read takes.
+func TestConnectionSkipsAnUnreadKubeconfig(t *testing.T) {
 	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	defer s.Acquire("prod").Release()
-	cfg.rotate("prod", "")
-	s.probeConnection("prod")
-	require.Equal(t, PhaseUnreached, stateOf(t, s, "prod").Phase())
-
-	cfg.rotate("prod", "key-1")
-	s.bumpKubeconfig()
-	s.probeConnection("prod")
-
-	conn := stateOf(t, s, "prod").Connection
-	assert.Equal(t, PhasePending, stateOf(t, s, "prod").Phase())
-	assert.Equal(t, ReasonUnknown, conn.LastAttempt.Reason)
-	assert.Zero(t, conn.Failures)
-	assert.True(t, conn.FailingSince.IsZero())
-}
-
-// Same for a file the user fixed. This one also stops the retry cadence the failure earned: with
-// nothing left failing, there is nothing to keep asking about.
-func TestAFixedKubeconfigReadsAsUnattempted(t *testing.T) {
-	cfg := failingToResolve()
-	s := New(cfg)
-	defer s.Acquire("prod").Release()
-	s.probeConnection("prod")
-	require.True(t, stateOf(t, s, "prod").Connection.Scheduled(), "a failure earns a retry")
-
-	cfg.err = nil
-	s.bumpKubeconfig()
-	s.probeConnection("prod")
-
-	conn := stateOf(t, s, "prod").Connection
-	assert.Equal(t, PhasePending, stateOf(t, s, "prod").Phase())
-	assert.Zero(t, conn.Failures)
-	assert.False(t, conn.Scheduled())
-}
-
-// A read that concluded nothing must leave nothing to derive a retry from. The interval is zero
-// so the stale failure's retry is already due — which is what it becomes with any interval, given
-// time — and a run that left it in place would come straight back, forever.
-func TestAnUnreadKubeconfigLeavesNoRetryToSpinOn(t *testing.T) {
-	cfg := failingToResolve()
-	s := newWithOptions(cfg, withIntervals(shrunk(probeConnection, 0)))
-	defer s.Acquire("prod").Release()
-	s.probeConnection("prod")
-	require.Equal(t, ReasonResolveFailed, stateOf(t, s, "prod").Connection.LastAttempt.Reason)
-	require.NotEmpty(t, drainKeys(t, s), "the retry that failure earned, and the probes it woke")
-
 	cfg.err = kubeconfig.ErrNotRead
-	s.probeConnection("prod")
 
-	assert.Empty(t, drainKeys(t, s), "an unread read left work due immediately")
+	res, v := connect(t, cfg, values{})
+
+	assert.True(t, res.IsSkip())
+	assert.False(t, v.departed)
 }
 
-// A run moves out of NextAttempt as it completes, so the schedule it was dispatched on survives
-// into the record. Without it, StartedAt has nothing to be measured against and a probe that
-// waited for a worker is indistinguishable from one the server was slow to answer.
-func TestARecordedAttemptKeepsTheScheduleItRanOn(t *testing.T) {
-	s := New(failingToResolve())
-	defer s.Acquire("prod").Release()
-	dueAt := stateOf(t, s, "prod").Connection.NextAttempt.ScheduledAt
-	require.False(t, dueAt.IsZero(), "the claim's own probe is scheduled")
+// Scaffolding while nothing dials: resolving is the precondition, not an answer about the
+// server, so a context that resolves suspends with ReasonResolved rather than claiming success.
+func TestConnectionSuspendsAResolvedContext(t *testing.T) {
+	cfg := resolving("prod", "key-1")
 
-	s.probeConnection("prod")
+	res, v := connect(t, cfg, values{departed: true})
 
-	last := stateOf(t, s, "prod").Connection.LastAttempt
-	assert.Equal(t, dueAt, last.ScheduledAt)
-	assert.False(t, last.StartedAt.Before(dueAt), "a run does not start before it is due")
-}
-
-// --- the probes behind it ---
-
-// A server nothing reached cannot answer them, so they are recorded rather than dialed. That is
-// what keeps a dead cluster costing one timeout per cycle instead of one per probe.
-func TestAProbeBehindTheConnectionSuspendsWhileItIsDown(t *testing.T) {
-	s := New(failingToResolve())
-	defer s.Acquire("prod").Release()
-	s.probeConnection("prod") // reachability has to answer before anything behind it is due
-
-	s.runProbe(t.Context(), probeKey{contextName: "prod", probe: probeServerUID})
-
-	uid := stateOf(t, s, "prod").ServerUID
-	assert.Equal(t, ReasonDependencyFailed, uid.LastAttempt.Reason)
-	assert.False(t, uid.Scheduled())
-	assert.True(t, uid.LastAttempt.StartedAt.IsZero(), "recorded, never dispatched")
-}
-
-// A suspended probe has no timer left to fire, so nothing but the connection could ask for it
-// again. This is the whole re-arm path.
-func TestAConnectionComingUpArmsWhatSuspendedOnIt(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	defer s.Acquire("prod").Release()
-	require.Equal(t, []probeKey{connectionOf("prod")}, takeKeys(t, s, 1), "the claim's own ask")
-	s.probeConnection("prod") // reads the file, so only the four below are left due
-	for id, c := range probes {
-		if c.needsConnection {
-			dependencyFailed(probeID(id))(s.claimed["prod"]) // the outage they suspended on
-		}
-	}
-
-	s.commitProbe(connectionOf("prod"), s.claimed["prod"], func(e *entry) {
-		observations(&e.state)[probeConnection].record(succeededAt(time.Now()))
-	})
-
-	armed := map[probeID]bool{}
-	for _, key := range takeKeys(t, s, 4) {
-		armed[key.probe] = true
-	}
-	assert.Equal(t, map[probeID]bool{
-		probeReadiness: true, probeServerUID: true, probeServerVersion: true, probePrincipal: true,
-	}, armed)
-}
-
-// Every probe behind the connection declares the dependency, so none is left dialing a server
-// the connection probe has already found unreachable.
-func TestEveryProbeButTheConnectionDependsOnIt(t *testing.T) {
-	for id, c := range probes {
-		assert.Equal(t, probeID(id) != probeConnection, c.needsConnection, "%v", probeID(id))
-	}
+	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
+	assert.Equal(t, ReasonResolved, res.Reason())
+	assert.False(t, v.departed, "a context that resolves again is back")
 }
 
 // Unreachable while nothing dials, and it says so rather than going quiet — a probe that
 // suspends without a reason is one nobody can explain.
 func TestAnUnimplementedProbeRecordsWhy(t *testing.T) {
+	res, commit := unimplemented("readiness")(t.Context(), "prod", values{})
+
+	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
+	assert.Equal(t, ReasonInternal, res.Reason())
+	assert.Contains(t, res.Message(), "readiness")
+	assert.Nil(t, commit)
+}
+
+// --- through the engine ---
+
+// The four probes behind the connection are recorded rather than dialed while nothing has
+// succeeded at reaching the server — which, while nothing dials, is always.
+func TestDependentsRecordDependencyFailedWhileNothingDials(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
-	defer s.Acquire("prod").Release()
-	key := probeKey{contextName: "prod", probe: probeReadiness}
-
-	s.commitProbe(key, s.claimed["prod"], probes[key.probe].run(t.Context(), probeArgs{svc: s, contextName: key.contextName}))
-
-	readiness := stateOf(t, s, "prod").Readiness
-	assert.Equal(t, ReasonInternal, readiness.LastAttempt.Reason)
-	assert.False(t, readiness.Scheduled())
-}
-
-// --- what due decides ---
-
-// dueFor is what the scheduler decides for one probe of an entry a test built by hand.
-func dueFor(s *Service, e *entry, id probeID) time.Time {
-	return s.due(e, id, observations(&e.state)[id], time.Now())
-}
-
-// connected is an entry whose reachability probe answered, with the kubeconfig already read.
-func connected(s *Service) *entry {
-	e := &entry{kubecfgGen: s.kubecfgGen}
-	observations(&e.state)[probeConnection].record(succeededAt(runAt))
-	return e
-}
-
-// One run records DependencyFailed and the rest of the outage costs nothing — the other half of
-// keeping a dead cluster at one timeout per cycle.
-func TestADependentStaysSuspendedForTheRestOfAnOutage(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	e := &entry{kubecfgGen: s.kubecfgGen}
-	observations(&e.state)[probeConnection].record(Attempt{FinishedAt: runAt, Reason: ReasonUnreachable})
-	observations(&e.state)[probeServerUID].record(Attempt{FinishedAt: runAt, Reason: ReasonDependencyFailed})
-
-	assert.True(t, dueFor(s, e, probeServerUID).IsZero())
-}
-
-// The endpoint is absent rather than failing, so a connection that is up does not make it worth
-// asking again.
-func TestAnUnsupportedProbeStaysSuspendedWhileTheConnectionIsUp(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	e := connected(s)
-	observations(&e.state)[probeReadiness].record(Attempt{FinishedAt: runAt, Reason: ReasonUnsupported})
-
-	assert.True(t, dueFor(s, e, probeReadiness).IsZero())
-}
-
-// A probe that has never run is due as soon as there is a connection to run it over.
-func TestAProbeThatNeverRanIsDueOnceTheConnectionIsUp(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-
-	assert.False(t, dueFor(s, connected(s), probeServerUID).IsZero())
-}
-
-// A run in flight is not rescheduled at all — reconcile leaves it alone rather than asking due,
-// because NextAttempt is the run and its commit is what decides what comes after.
-func TestReconcileLeavesAnInFlightProbeUntouched(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	defer s.Acquire("prod").Release()
-	e := s.claimed["prod"]
-	observations(&e.state)[probeServerUID].begin(runAt)
-
-	s.reconcile("prod")
-
-	assert.Equal(t, runAt, e.state.ServerUID.NextAttempt.StartedAt)
-	assert.True(t, e.state.ServerUID.InFlight())
-}
-
-// An ordinary failure is neither terminal nor a dependency's, so the probe keeps its cadence.
-func TestAnOrdinaryFailureKeepsTheProbesCadence(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	e := connected(s)
-	observations(&e.state)[probeServerUID].record(Attempt{FinishedAt: runAt, Reason: ReasonForbidden})
-
-	assert.Equal(t, runAt.Add(defaultIntervals[probeServerUID]), dueFor(s, e, probeServerUID))
-}
-
-// Nothing below reachability runs before reachability has answered: there is nothing to say
-// about a server nobody has tried.
-func TestADependentIsNotDueBeforeTheConnectionHasAnswered(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-
-	assert.True(t, dueFor(s, &entry{kubecfgGen: s.kubecfgGen}, probeServerUID).IsZero())
-}
-
-// A queued key outlives the claim that asked for it: the last holder can release and another
-// caller re-claim the name before a worker gets there. The replacement has reached no server, so
-// it never scheduled this probe — recording against it would show a dependency failure for a
-// connection nobody has tried.
-func TestAQueuedProbeIsDroppedWhenItsClaimIsReplaced(t *testing.T) {
-	uidProbe := probeKey{contextName: "prod", probe: probeServerUID}
-	s := New(failingToResolve())
-	lease := s.Acquire("prod")
-	s.probeConnection("prod") // reachability answers, so the probes behind it fall due
-	require.Contains(t, drainKeys(t, s), uidProbe)
-
-	lease.Release()
-	defer s.Acquire("prod").Release()
-	s.runProbe(t.Context(), uidProbe)
-
-	uid := stateOf(t, s, "prod").ServerUID
-	assert.Equal(t, ReasonUnknown, uid.LastAttempt.Reason)
-	assert.Zero(t, uid.Failures)
-	assert.False(t, uid.InFlight(), "a dropped run must not leave the probe marked out")
-}
-
-// A reconcile can land while a probe is out — another probe committing, a kubeconfig change, a
-// timer. NextAttempt is that run, so overwriting it erases the mark saying the run is still going
-// and the schedule it was dispatched on.
-func TestAReconcileLeavesAnInFlightRunAlone(t *testing.T) {
-	cfg := failingToResolve()
-	s := New(cfg)
-	defer s.Acquire("prod").Release()
-	dueAt := stateOf(t, s, "prod").Connection.NextAttempt.ScheduledAt
-
-	var inFlight bool
-	cfg.duringRead(func() {
-		s.reconcile("prod")
-		inFlight = s.claimed["prod"].state.Connection.InFlight()
-	})
-	s.probeConnection("prod")
-
-	assert.True(t, inFlight, "the run stopped reading as in flight while it was still going")
-	assert.Equal(t, dueAt, stateOf(t, s, "prod").Connection.LastAttempt.ScheduledAt,
-		"the schedule the run was dispatched on")
-}
-
-// --- scheduling ---
-
-// The schedule reconcile derives is what brings the pass back. No workers here on purpose: the
-// only thing left to ask is the timer.
-func TestAScheduledProbeIsAskedForAgainWhenItIsDue(t *testing.T) {
-	s := newWithOptions(failingToResolve(), withIntervals(shrunk(probeConnection, time.Millisecond)))
-	defer s.Acquire("prod").Release()
-	drainKeys(t, s)           // the claim's own ask, already taken
-	s.probeConnection("prod") // a failure is what earns a retry
-	require.True(t, stateOf(t, s, "prod").Connection.Scheduled())
-
-	// The failure also wakes the four probes behind it, which are due now and land first.
-	awaitKey(t, s, connectionOf("prod"))
-}
-
-// An entry nobody holds is one nothing probes, so the last release gives up its schedule.
-func TestReleaseStopsTheScheduledRuns(t *testing.T) {
-	s := New(failingToResolve())
-	lease := s.Acquire("prod")
-	s.probeConnection("prod")
-	e := s.claimed["prod"]
-	require.NotNil(t, e.timer)
-
-	lease.Release()
-
-	assert.Nil(t, e.timer)
-}
-
-func TestCloseStopsTheScheduledRuns(t *testing.T) {
-	s := New(failingToResolve())
-	defer s.Acquire("prod").Release()
-	s.probeConnection("prod")
-	e := s.claimed["prod"]
-	require.NotNil(t, e.timer)
-
-	require.NoError(t, s.Close())
-
-	assert.Nil(t, e.timer)
-}
-
-// --- what a run publishes ---
-
-// The timing moves every run. Signalling on it would wake every cluster's reconcile on every
-// cadence to find nothing changed.
-func TestARunThatChangedNothingIsNotAnnounced(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	defer s.Acquire("prod").Release()
-	s.probeConnection("prod")
-	news := s.Subscribe()
-	defer news.Close()
-
-	s.probeConnection("prod")
-
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	_, err := news.RecvContext(ctx)
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
-}
-
-// A claim watcher gets it anyway: the timing is what it subscribed for, and the countdown to the
-// next run is only visible here.
-func TestARunThatChangedNothingStillReachesAClaimWatcher(t *testing.T) {
-	s := New(failingToResolve())
+	startService(t, s)
 	lease := s.Acquire("prod")
 	defer lease.Release()
-	s.probeConnection("prod")
 	watched := lease.WatchState()
 	defer watched.Close()
 
-	s.probeConnection("prod") // same answer, so no news — but a new countdown
+	st := awaitState(t, watched, func(st State) bool {
+		return st.ServerUID.LastAttempt.Done()
+	})
 
-	ev, err := watched.RecvContext(within(t))
-	require.NoError(t, err)
-	assert.Equal(t, ReasonResolveFailed, ev.Value.Connection.LastAttempt.Reason)
-	assert.True(t, ev.Value.Connection.Scheduled())
+	assert.Equal(t, ReasonDependencyFailed, st.ServerUID.LastAttempt.Reason)
+	assert.False(t, st.ServerUID.Scheduled(), "suspended for the rest of the outage")
+	assert.True(t, st.ServerUID.LastAttempt.StartedAt.IsZero(), "recorded, never dispatched")
 }
 
-// --- recordAttempt ---
-
-func TestRecordAttemptKeepsTheValueThroughAFailure(t *testing.T) {
-	o := Observation[string]{Value: "uid-1", LastSeen: runAt}
-
-	o.record(Attempt{FinishedAt: runAt, Reason: ReasonForbidden})
-
-	assert.Equal(t, "uid-1", o.Value, "a read that stopped being permitted is not a fact that moved")
-	assert.Equal(t, runAt, o.LastSeen)
-	assert.Equal(t, 1, o.Failures)
-	assert.Equal(t, runAt, o.FailingSince)
-}
-
-func TestRecordAttemptClearsTheFailureRunOnSuccess(t *testing.T) {
-	o := Observation[string]{Attempts: Attempts{Failures: 3, FailingSince: runAt}}
-
-	o.record(succeededAt(runAt))
-
-	assert.Zero(t, o.Failures)
-	assert.True(t, o.FailingSince.IsZero())
-}
-
-// A cancellation says nothing about the cluster, so it moves neither failure field.
-func TestRecordAttemptIgnoresACancellation(t *testing.T) {
-	o := Observation[string]{Attempts: Attempts{Failures: 2, FailingSince: runAt}}
-
-	o.record(Attempt{FinishedAt: runAt, Reason: ReasonCanceled})
-
-	assert.Equal(t, 2, o.Failures)
-	assert.Equal(t, runAt, o.FailingSince)
-}
-
-// --- the per-probe index ---
-
-// Each entry of the index reaches exactly one observation, so a probe can never write another's
-// answer.
-func TestEachProbeReachesOneObservation(t *testing.T) {
-	for id := range numProbes {
-		var st State
-		observations(&st)[id].record(Attempt{FinishedAt: runAt, Reason: ReasonForbidden})
-
-		answered := 0
-		for _, a := range observations(&st) {
-			if a.LastAttempt.Done() {
-				answered++
-			}
-		}
-		assert.Equal(t, 1, answered, "%v wrote %d observations", id, answered)
-		assert.True(t, observations(&st)[id].LastAttempt.Done(), "%v", id)
-	}
-}
-
-func TestAnUnknownProbeIsNamedByNumber(t *testing.T) {
-	assert.Equal(t, "probe(5)", probeID(numProbes).String())
-}
-
-func TestEveryProbeIsNamed(t *testing.T) {
-	assert.Equal(t,
-		[]string{"connection", "readiness", "serverUID", "serverVersion", "principal"},
-		[]string{
-			probeConnection.String(), probeReadiness.String(), probeServerUID.String(),
-			probeServerVersion.String(), probePrincipal.String(),
-		})
-}
-
-// A pass can outlive the claim that armed it — the last holder released while its timer was
-// running. It finds no entry and schedules nothing, rather than reviving a context nobody holds.
-func TestAReconcileForAnUnclaimedContextSchedulesNothing(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	s.Acquire("prod").Release()
-	drainKeys(t, s) // what the claim asked for while it still held one
-
-	s.reconcile("prod")
-
-	assert.Empty(t, s.claimed)
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	_, ok := s.probeQ.Next(ctx)
-	assert.False(t, ok, "a probe was asked for on behalf of nobody")
-}
-
-// A timer can outlive the claim it was armed for. The run finds no entry and writes nothing,
-// rather than resurrecting a context nobody holds.
-func TestARunForAnUnclaimedContextDoesNothing(t *testing.T) {
+// A context that comes back is re-read and reads as pending again — with no failure streak,
+// since a departure was the user's edit, not a fault.
+func TestAReturningContextReadsAsPendingAgain(t *testing.T) {
 	cfg := resolving("prod", "key-1")
-	cfg.reads = testutil.NewProbe[string](2)
 	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
 
-	s.probeConnection("prod")
+	cfg.rotate("prod", "")
+	cfg.changed()
+	require.Eventually(t, lease.Departed, time.Second, time.Millisecond)
 
-	assert.Empty(t, s.claimed)
-	assert.Empty(t, cfg.reads.Chan(), "the kubeconfig was not even read")
+	cfg.rotate("prod", "key-1")
+	cfg.changed()
+	require.Eventually(t, func() bool { return !lease.Departed() }, time.Second, time.Millisecond)
+
+	conn := lease.State().Connection
+	assert.Equal(t, PhasePending, lease.State().Phase())
+	assert.Equal(t, ReasonResolved, conn.LastAttempt.Reason)
+	assert.Zero(t, conn.Failures)
 }
 
-// failingToResolve is a kubeconfig that names "prod" and will not yield credentials for it —
-// the one answer a probe can reach without a server that leaves something scheduled.
-func failingToResolve() *fakeKubeconfig {
+// A resolve failure keeps its cadence, and consecutive failures are one streak: FailingSince is
+// when it began, which the widening ladder means a count alone cannot give.
+func TestAResolveFailureKeepsAsking(t *testing.T) {
 	cfg := resolving("prod", "key-1")
 	cfg.err = errors.New("open ca.crt: no such file")
-	return cfg
-}
+	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
 
-// succeededAt is an attempt that answered, which is what OK reads.
-func succeededAt(at time.Time) Attempt {
-	return Attempt{StartedAt: at, FinishedAt: at, Reason: ReasonSucceeded}
-}
+	first := awaitState(t, watched, func(st State) bool {
+		return st.Connection.Failures >= 1
+	}).Connection
+	assert.True(t, first.Scheduled(), "a failure earns a retry")
 
-// shrunk paces one probe for a test and leaves the rest at their production value.
-func shrunk(id probeID, d time.Duration) [numProbes]time.Duration {
-	intervals := defaultIntervals
-	intervals[id] = d
-	return intervals
+	// The retry sits out on the ladder; the wake stands in for it, as a worked answer the
+	// schedule would eventually produce.
+	s.engine.Wake("prod", s.ids.connection)
+
+	second := awaitState(t, watched, func(st State) bool {
+		return st.Connection.Failures >= 2
+	}).Connection
+	assert.Equal(t, first.FailingSince, second.FailingSince, "one run of failures, not two")
 }

@@ -42,9 +42,11 @@ func TestLatencyMeasuresADispatchedRun(t *testing.T) {
 // A suspended probe keeps its last answer and schedules nothing.
 func TestSuspendedProbeKeepsItsAnswer(t *testing.T) {
 	o := Observation[string]{
-		Value:    "abc-123",
-		LastSeen: runAt,
-		Attempts: Attempts{LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonDependencyFailed}},
+		Value: "abc-123",
+		Attempts: Attempts{
+			LastSeen:    runAt,
+			LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Verdict: VerdictSuspended, Reason: ReasonDependencyFailed},
+		},
 	}
 
 	assert.True(t, o.Known(), "the UID it read is still the UID it read")
@@ -53,15 +55,25 @@ func TestSuspendedProbeKeepsItsAnswer(t *testing.T) {
 	assert.False(t, o.InFlight())
 }
 
+// Scaffolding while nothing dials: a resolved context's suspension is not an answer about the
+// server, so the phase must not read as a server that was tried and missed.
+func TestPhaseReadsAResolvedSuspensionAsPending(t *testing.T) {
+	s := State{Connection: Observation[string]{Attempts: Attempts{
+		LastAttempt: Attempt{FinishedAt: runAt, Verdict: VerdictSuspended, Reason: ReasonResolved},
+	}}}
+
+	assert.Equal(t, PhasePending, s.Phase())
+}
+
 // Identity projects the three scalars a connection is scoped to out of the observations
 // carrying them, so retiring one stays a ==.
 func TestIdentityProjectsTheProbedScalars(t *testing.T) {
 	s := State{
-		ServerUID:     Observation[string]{Value: "uid-1", LastSeen: runAt},
-		ServerVersion: Observation[VersionInfo]{Value: VersionInfo{GitVersion: "v1.29.3"}, LastSeen: runAt},
+		ServerUID:     Observation[string]{Value: "uid-1", Attempts: Attempts{LastSeen: runAt}},
+		ServerVersion: Observation[VersionInfo]{Value: VersionInfo{GitVersion: "v1.29.3"}, Attempts: Attempts{LastSeen: runAt}},
 		Principal: Observation[Principal]{
 			Value:    Principal{Username: "admin@example", Groups: []string{"system:masters"}},
-			LastSeen: runAt,
+			Attempts: Attempts{LastSeen: runAt},
 		},
 	}
 
@@ -77,12 +89,12 @@ func TestIdentityProjectsTheProbedScalars(t *testing.T) {
 func TestIdentityLeavesAnUnreadPartEmpty(t *testing.T) {
 	forbidden := State{
 		ServerUID: Observation[string]{Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonForbidden}}},
-		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
+		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, Attempts: Attempts{LastSeen: runAt}},
 	}
 
 	assert.Equal(t, Identity{Username: "reader@example"}, forbidden.Identity())
 	assert.Equal(t, forbidden.Identity(), State{
 		ServerUID: Observation[string]{Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonUnsupported}}},
-		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
+		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, Attempts: Attempts{LastSeen: runAt}},
 	}.Identity(), "why the UID is missing is the observation's, not the identity's")
 }

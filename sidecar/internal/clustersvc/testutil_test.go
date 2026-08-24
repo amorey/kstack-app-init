@@ -149,9 +149,11 @@ func answering(id kubeconn.Identity, err error) *fakeKubeconn {
 // answeredWith is a check that answered v at probedAt.
 func answeredWith[T any](v T) kubeconn.Observation[T] {
 	return kubeconn.Observation[T]{
-		Value:    v,
-		LastSeen: probedAt,
-		Attempts: kubeconn.Attempts{LastAttempt: finished(kubeconn.ReasonSucceeded, "")},
+		Value: v,
+		Attempts: kubeconn.Attempts{
+			LastSeen:    probedAt,
+			LastAttempt: finished(kubeconn.ReasonSucceeded, ""),
+		},
 	}
 }
 
@@ -166,11 +168,15 @@ func failed(err error) kubeconn.Observation[string] {
 }
 
 // finished is an attempt that ran and ended at probedAt, which is what makes its reason
-// readable.
+// readable. The verdict follows the reason, the way a real probe's result would set it.
 func finished(reason kubeconn.Reason, msg string) kubeconn.Attempt {
+	verdict := kubeconn.VerdictFailed
+	if reason == kubeconn.ReasonSucceeded {
+		verdict = kubeconn.VerdictSucceeded
+	}
 	a := kubeconn.Attempt{
 		ScheduledAt: probedAt, StartedAt: probedAt, FinishedAt: probedAt,
-		Reason: reason, Message: msg,
+		Verdict: verdict, Reason: reason, Message: msg,
 	}
 	if msg != "" {
 		a.Err = errors.New(msg)

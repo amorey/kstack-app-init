@@ -12,7 +12,7 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 - `internal/app/` — **composition root**: builds `poke.Service`, `kubeconfig.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → kubeconfig → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain. **kubeconfig before cluster is load-bearing** — `kubeconfig.Service.Start` reads synchronously, so every cluster reconcile observes a read config, and `app_test.go` pins it. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
-- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `kubeconn` (a pool nothing builds — see below), `drain`, `lifecycle` (the start/stop/close shape every level wears), `workqueue` (keyed work, delivered to one worker), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
+- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `kubeconn` (a pool nothing builds — see below), `drain`, `lifecycle` (the start/stop/close shape every level wears), `workqueue` (keyed work, delivered to one worker), `probe` (the probe engine — periodic observations over subjects, scheduled by derivation; `kubeconn` runs on it), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
@@ -260,105 +260,51 @@ nothing and is deliberately not a departure: saying so would report every contex
 as the first read takes. `stateHub` is published before `signalHub`, so a reader the signal wakes
 finds the value already there.
 
-#### The probe (`probe.go` — the probes; `service.go` — when they run)
+#### The probes (`probe.go`) over the engine (`internal/probe`)
 
-**Each of `State`'s five observations has one probe behind it, and each probe schedules itself.**
-A cluster's UID never moves and its readiness moves constantly, so nothing is gained by asking
-about them together — `defaultIntervals` paces them separately, and `NextAttempt` is per
-observation because the schedules genuinely differ. **A probe writes the observation it owns and
-no other**, which is what lets the five run at once against one entry without coordinating.
+**The scheduling machinery is `sidecar/internal/probe`** — a reusable engine (a work queue, a
+level-triggered pass, a schedule derived from recorded state) that knows nothing about
+kube-contexts; its contract is `docs/specs/probe-engine.md`. `kubeconn` keeps what is asked and
+what the answers mean: `probe.go` is `registerProbes` — five registrations kept side by side on
+purpose, since the set's rules are checked by eye — plus the `Run` bodies; `service.go` is leases
+and publishing.
 
-The probe queue is therefore keyed by **`probeKey{contextName, probe}`**, not by context: one
-*probe* is never in two workers, dedupes while pending, and re-queues if asked again mid-run
-(`Done` is what re-arms it, rather than folding the ask into a run that had already passed the
-thing it asked about). `probeWorkers` bounds how many are in flight fleet-wide — the budget that
-stops a first install running a credential helper per cluster in the same second.
+**Each of `State`'s five observations has one probe behind it**, registered with its own interval
+(a cluster's UID never moves; its readiness moves constantly) and writing only the observation it
+owns. A commit writes into `values`, the engine's per-context snapshot; `State` is assembled at
+publish time by pairing each value with the engine's `Attempts` for that probe.
 
-**The schedule is derived, never armed.** `reconcile` reads what the probes currently say and
-works out what each should do: whatever is due goes on the probe queue, and the soonest thing due
-later gets the entry's **one** timer. That timer is a *wake, not a cadence* — it only brings the
-pass back, which decides again per probe, so the five schedules stay independent. It means no path
-can leave a probe un-armed by forgetting it, the way per-probe `time.AfterFunc` bookkeeping
-silently does.
-
-**Every path that changes an entry ends by queueing a reconcile**, never by deriving inline —
-`Acquire`, every commit, the kubeconfig watch, the timer. So a fleet-wide change is one `Add` per
-context rather than a fleet's worth of passes under one lock hold, and reconcile stays a top-level
-operation that takes the lock itself rather than running nested inside its callers'.
-
-**Reconcile is also the only thing that publishes.** Deriving before sending is what makes every
-`State` a reader sees carry a schedule that matches the answers beside it. The signal is measured
-against `entry.published` — what the fleet was last told — rather than against the start of a
-pass, because several commits can land behind one reconcile and only what survived them is news.
-A finished run's `NextAttempt` is set to *due now* rather than zeroed, so the gap before its
-reconcile never reads as a suspended probe.
-
-**A run in flight is left alone**, before `due` is asked: `NextAttempt` *is* that run, so writing a
-schedule over it erases both the mark saying it is still out — freeing a later pass to ask for a
-second one — and the schedule it was dispatched on. Its commit is what reconciles.
-
-**The whole scheduling policy is `due`**, read top to bottom: the connection
-probe's own rules, nothing below reachability before reachability has answered, `DependencyFailed`
-already recorded for this outage, `Unsupported` parked for the connection's life, a dependency
-that came back, never run, otherwise `LastAttempt.FinishedAt + interval`. **The re-arm falls out
-of it** — a probe whose last attempt was `DependencyFailed` is due the moment the connection is
-`OK()` again, so nothing has to notice a recovery and go looking for what suspended on it.
-
-**Dependencies are declared, not ordered.** `probe.needsConnection` marks the four behind
-reachability, once on the probe rather than inside four bodies; they are recorded rather than
-dialed while the server is unreachable, which is what keeps a dead cluster costing **one timeout
-per cycle instead of one per probe**.
-
-**A worker re-tests the dependency before it runs** (`wanted`), because a queued key names a
-context and not the claim that queued it: the last holder can release and another caller re-claim
-the name before a worker gets there, and the replacement has reached no server. Same rule `due`
-applies when it schedules, which is what makes the two agree — and it must be tested *before* the
-run is marked in flight, or an early return leaves the probe reading as running and nothing ever
-schedules it again.
-
-**No caller names a probe.** `reconcile` is the only thing that builds a `probeKey`; `Acquire` and
-the kubeconfig watch say which context moved and let `due` work out who cares. **A pass runs
-inline, on whichever goroutine caused it** — it is arithmetic under the pool's lock, so queueing it
-would buy dedup nothing needs and cost a window where a just-finished probe reads as suspended.
-`commitProbe` needs that window closed outright, so it ends the run and derives what follows in one
-critical section, through `reconcileLocked`. The watch does it through a **generation**: it bumps
-`Service.kubecfgGen`, and the connection probe is due whenever `entry.kubecfgGen` differs — every
-branch of that probe stamps the generation it read at, including the one that found the file
-unread, so a run is never asked for twice over the same file.
+**A probe's result is its schedule** — `Succeeded` (due again after the interval), `Fail` (due up
+the backoff ladder), `Suspend` (nothing due until a `Wake`), `Skip` (record nothing; wait for a
+`Wake`). The four behind reachability declare `probe.Needs(p.connection)`: the engine records
+them as `DependencyFailed` rather than dialing while the connection has not succeeded — one
+timeout per cycle, not one per probe — and a recovery makes them due again by derivation, so
+nothing has to notice it.
 
 **The connection probe owns the context's lifecycle**, because resolving the kubeconfig is the
-first step of reaching a server: a departed context is its to find, and the build/rotate/retire
-will land there too. Resolving is the *precondition*, not the answer — so while nothing dials, a
-context that resolves records **no attempt** and schedules nothing, and `Phase` stays
-`PhasePending`. The two answers it can reach without a server do record one:
-`ReasonContextNotFound` (suspends — the file is the whole truth about presence, and the watch
-reports it moving) and `ReasonResolveFailed` (keeps its cadence — the file can be fixed in a way
-`kubeconfig.Service` cannot see, such as a CA path that now opens).
+first step of reaching a server. Its classifications: `ReasonContextNotFound` suspends with
+`departed` committed true (the file is the whole truth about presence, and the watch reports it
+moving — a departure is also not a failure streak, being the user's own edit);
+`ReasonResolveFailed` fails up the ladder (the file can be fixed in a way `kubeconfig.Service`
+cannot see, such as a CA path that now opens); an unread file is a `Skip` (an unread kubeconfig
+names nothing, and is deliberately not a departure). **Scaffolding while nothing dials**: a
+context that resolves suspends with `ReasonResolved`, which `Phase()` reads as `PhasePending` —
+delete both with the branch when the dial lands.
 
-**A run that concludes nothing forgets the failure before it** (`Attempts.forget`) — the resolve
-that succeeds, and the read that finds the file unread. **Every branch of the connection probe must
-either record an attempt or forget one**, because `due` derives the next run from `LastAttempt`:
-a branch that leaves a stale failure in place has that failure still earning retries, and the run
-that follows leaves it due again — a spin, at five probes a round, since `Phase()` reads the same
-stale attempt and wakes the four behind it too.
+**Wiring**: `Acquire`'s first holder is `engine.Add`; the last `Release` is `engine.Remove`,
+under `Service.mu` so a stale release cannot remove the subject a fresh claim just added; the
+kubeconfig watch is `engine.WakeAll(ids.connection)` on every change — every claimed context
+rather than the ones that moved, because finding which moved is what the probe does anyway.
 
-Nothing else clears the record either, so a returning context would report
-`Connected=False/ProbeFailed` for good — it is not a server we failed to reach. `Value` and
-`LastSeen` survive `forget` — a survivor outlives the
-failure, and forgetting the failure must not forget it too.
-
-`withIntervals` is the test seam, so no test outwaits a production cadence.
-
-**A queue and not a bus**, which is what lets `Start` alone run the worker loops: queued work
-outlives the gap before them, where a bus would drop a send nobody was receiving and leave a claim
-taken in that window never probed. `Service.Close` closes the queue — past there nothing works it
-off, and a held claim still adds on every kubeconfig change.
-
-**Two publish rules, because the two feeds answer different questions.** `stateHub` carries every
-run: the timing is what a claim watcher subscribed for, and the countdown to the next run is
-visible nowhere else. `signalHub` fires only when the **news** changed — `departed`, `Phase()`,
-`Identity()`, and each probe's `OK()`, never a timestamp. Timestamps move every run, so signalling
-on them would wake every cluster's reconcile on every cadence to find nothing changed.
+**Publishing is the engine's `OnChange`** — after every pass, outside the engine's lock,
+serialized per context. Two publish rules, because the two feeds answer different questions:
+`stateHub` carries every pass (the timing is what a claim watcher subscribed for, and the
+countdown to the next run is visible nowhere else); `signalHub` fires only when the **news**
+changed — `departed`, `Phase()`, `Identity()`, each probe's `OK()`, never a timestamp — measured
+against `Service.published`, what the fleet was last told. State first, so a reader the signal
+wakes finds the value already there. A claim reads through `engine.Read`, with the entry-identity
+check *after* the read so a name released and re-claimed mid-read is never answered on behalf of
+a stale lease.
 
 **The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
 `Connection`, `ConnIdentity`, `ConnState`, `ConnStateSubscription`. Aliases because an

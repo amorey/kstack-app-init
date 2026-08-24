@@ -52,6 +52,13 @@ func resolving(contextKeys ...string) *fakeKubeconfig {
 	return f
 }
 
+// counting is resolving with the reads probe armed.
+func counting(contextKeys ...string) *fakeKubeconfig {
+	f := resolving(contextKeys...)
+	f.reads = testutil.NewProbe[string](8)
+	return f
+}
+
 // rotate is the user editing their file: contextName now names different credentials. An
 // empty key removes the context.
 func (f *fakeKubeconfig) rotate(contextName, key string) {
@@ -65,9 +72,15 @@ func (f *fakeKubeconfig) rotate(contextName, key string) {
 	f.keys[contextName] = key
 }
 
-// duringRead runs fn inside the next read, so a test can interleave a release and a fresh claim
-// with one in flight. Latency in the code under test on purpose — the test's own assertions stay
-// immediate.
+func (f *fakeKubeconfig) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.err = err
+}
+
+// duringRead runs fn inside the next read, so a test can interleave an event with a read in
+// flight. Latency in the code under test on purpose — the test's own assertions stay immediate.
 func (f *fakeKubeconfig) duringRead(fn func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -103,6 +116,43 @@ func (f *fakeKubeconfig) Subscribe() kubeconfig.Subscription {
 	return f.hub.Receiver()
 }
 
+// changed is the user saving their file: the watch reports it moving.
+func (f *fakeKubeconfig) changed() { f.hub.Sender().Send(&api.Config{}) }
+
+// within bounds a wait for something that must arrive, so a regression fails the test rather
+// than hanging it until the suite's own deadline.
+func within(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// startService runs the pool's engine and watch for a test that needs them, and joins them on
+// cleanup.
+func startService(t *testing.T, s *Service) {
+	t.Helper()
+	stop, err := s.Start(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+}
+
+// awaitState receives one claim's states until cond holds. The hub keeps only the latest value,
+// so frames in between may be skipped — cond must be a level, never an edge.
+func awaitState(t *testing.T, sub StateSubscription, cond func(State) bool) State {
+	t.Helper()
+	ctx := within(t)
+	for {
+		ev, err := sub.RecvContext(ctx)
+		require.NoError(t, err, "state frame")
+		if cond(ev.Value) {
+			return ev.Value
+		}
+	}
+}
+
+// --- claims ---
+
 // A claim is taken whatever the file says. Whether the context resolves is the pool's to find
 // out on its own schedule, and a claim is how the holder hears about it — refusing would make a
 // transient fact permanent for the caller.
@@ -113,8 +163,7 @@ func TestAcquireClaimsAContextTheKubeconfigDoesNotName(t *testing.T) {
 	defer lease.Release()
 
 	assert.Len(t, s.claimed, 1)
-	assert.Equal(t, PhasePending, lease.State().Phase(), "nothing has looked yet")
-	assert.True(t, lease.State().Connection.Scheduled(), "and looking is what the claim asked for")
+	assert.Equal(t, State{}, lease.State())
 }
 
 // Contexts that resolve alike are deliberately not merged: each gets its own entry, so what is
@@ -193,233 +242,11 @@ func TestAPreCloseReleaseDoesNotDropALaterClaim(t *testing.T) {
 	assert.False(t, fresh.Departed())
 }
 
-// --- the news: a context leaving the kubeconfig ---
-
-// The one thing this service does. A holder is told rather than left to poll, and it learns what
-// changed by asking the claim.
-func TestDepartureReachesTheHolder(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	lease := s.Acquire("prod")
-	defer lease.Release()
-	s.probeConnection("prod")
-	require.False(t, lease.Departed())
-	news := s.Subscribe()
-	defer news.Close()
-
-	cfg.rotate("prod", "")
-	s.probeConnection("prod")
-
-	ev, err := news.RecvContext(within(t))
-	require.NoError(t, err)
-	assert.Equal(t, "prod", ev.Key)
-	assert.True(t, lease.Departed())
-}
-
-// The claim outlives what it is a claim on: the file may name the context again, and this claim
-// is how the holder hears about that.
-func TestDepartureKeepsTheClaim(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	lease := s.Acquire("prod")
-	defer lease.Release()
-
-	cfg.rotate("prod", "")
-	s.probeConnection("prod")
-	require.True(t, lease.Departed())
-
-	cfg.rotate("prod", "key-1")
-	s.probeConnection("prod")
-
-	assert.False(t, lease.Departed(), "named again, and the same claim reports it")
-	assert.Len(t, s.claimed, 1)
-}
-
-// A departed context is announced once. Announcing it on every kubeconfig write would wake its
-// holder forever for news it already has.
-func TestDepartureIsAnnouncedOnce(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	defer s.Acquire("prod").Release()
-	s.probeConnection("prod")
-	news := s.Subscribe()
-	defer news.Close()
-
-	cfg.rotate("prod", "")
-	s.probeConnection("prod")
-	_, err := news.RecvContext(within(t))
-	require.NoError(t, err)
-
-	s.probeConnection("prod")
-
-	// A negative assertion needs a bounded window: this fails the instant a second one lands.
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	_, err = news.RecvContext(ctx)
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
-}
-
-// An unread kubeconfig names nothing. Reporting that as a departure would tell every holder its
-// context is gone for as long as the first read takes.
-func TestUnreadKubeconfigIsNotADeparture(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	lease := s.Acquire("prod")
-	defer lease.Release()
-	s.probeConnection("prod")
-
-	cfg.mu.Lock()
-	cfg.err = kubeconfig.ErrNotRead
-	cfg.mu.Unlock()
-	s.probeConnection("prod")
-
-	assert.False(t, lease.Departed())
-}
-
-// --- the queue behind it ---
-
-// A new context asks for its presence to be read; the claim does not wait for it. Reading the
-// kubeconfig is not work to do on the caller's thread.
-func TestAcquireAsksForANewContextsPresence(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	startService(t, s)
-	lease := s.Acquire("prod")
-	defer lease.Release()
-	require.Eventually(t, func() bool { return !lease.Departed() },
-		time.Second, time.Millisecond, "presence was never read")
-
-	cfg.rotate("prod", "")
-	cfg.hub.Sender().Send(&api.Config{})
-
-	require.Eventually(t, func() bool { return lease.Departed() },
-		time.Second, time.Millisecond, "a kubeconfig change never reached the claim")
-}
-
-// A later holder joins what the first one's probe found rather than asking for another.
-func TestAcquireAsksOnlyForANewContext(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-
-	first := s.Acquire("prod")
-	defer first.Release()
-	key, ok := s.probeQ.Next(within(t))
-	require.True(t, ok)
-	require.Equal(t, connectionOf("prod"), key)
-	// Given back first: a key added while held is queued behind the run rather than delivered,
-	// which would hide the very ask this test is looking for.
-	s.probeQ.Done(key)
-
-	second := s.Acquire("prod")
-	defer second.Release()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	_, ok = s.probeQ.Next(ctx)
-	assert.False(t, ok, "a second holder asked for a probe")
-}
-
-// A receiver is bound to its key for life, and a claim's key is its context — which never moves,
-// however the credentials behind it do.
-func TestWatchStateIsKeyedByContext(t *testing.T) {
-	s := New(resolving("prod", "key-1"))
-	lease := s.Acquire("prod")
-	defer lease.Release()
-	sub := lease.WatchState()
-	defer sub.Close()
-
-	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", LastSeen: runAt}})
-
-	ev, err := sub.RecvContext(within(t))
-	require.NoError(t, err)
-	assert.Equal(t, "uid-1", ev.Value.ServerUID.Value)
-}
-
-// The subscriptions are taken before Start returns, so a config sent straight after it is read
-// rather than dropped, and stop joins the loops instead of leaving them running.
-func TestStartWatchesTheKubeconfigUntilStopped(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-
-	stop, err := s.Start(t.Context())
-	require.NoError(t, err)
-	require.NotNil(t, cfg.hub, "Start subscribes before it returns")
-	cfg.hub.Sender().Send(&api.Config{})
-
-	require.NoError(t, stop(t.Context()))
-}
-
-// within bounds a wait for something that must arrive, so a regression fails the test rather
-// than hanging it until the suite's own deadline.
-func within(t *testing.T) context.Context {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	t.Cleanup(cancel)
-	return ctx
-}
-
-// startService runs the pool's loops for a test that needs them, and joins them on cleanup.
-func startService(t *testing.T, s *Service) {
-	t.Helper()
-	stop, err := s.Start(t.Context())
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
-}
-
-// connectionOf is the queue key a claim and a kubeconfig change ask for.
-func connectionOf(contextName string) probeKey {
-	return probeKey{contextName: contextName, probe: probeConnection}
-}
-
-// probeConnection runs the connection probe the way a worker would, on the test's goroutine, so
-// a test asserts on settled state with no loops running.
-func (s *Service) probeConnection(contextName string) {
-	s.runProbe(context.Background(), connectionOf(contextName))
-}
-
-// A holder watching its own claim is told too, not just the fleet feed, and the value carries
-// why: a probe that suspends has to record its reason or nothing explains the suspension.
-func TestDepartureReachesAClaimWatcher(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	lease := s.Acquire("prod")
-	defer lease.Release()
-	s.probeConnection("prod")
-	watched := lease.WatchState()
-	defer watched.Close()
-
-	cfg.rotate("prod", "")
-	s.probeConnection("prod")
-
-	ev, err := watched.RecvContext(within(t))
-	require.NoError(t, err)
-	assert.Equal(t, ReasonContextNotFound, ev.Value.Connection.LastAttempt.Reason)
-	assert.False(t, ev.Value.Connection.Scheduled(), "nothing to reach, so nothing is due")
-}
-
-// A kubeconfig change reaches a holder through the loops, not only through a direct read: the
-// watch asks, the queue carries, and the claim reports.
-func TestAKubeconfigChangeReachesTheHolder(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	startService(t, s)
-	lease := s.Acquire("prod")
-	defer lease.Release()
-	require.Eventually(t, func() bool { return !lease.Departed() },
-		time.Second, time.Millisecond, "the first presence read never landed")
-
-	cfg.rotate("prod", "")
-	cfg.hub.Sender().Send(&api.Config{})
-
-	require.Eventually(t, lease.Departed,
-		time.Second, time.Millisecond, "the change never reached the claim")
-}
-
 // A claim reads as departed once nothing holds its context: there is no entry left to answer
 // from, and reporting present would be a claim about a context the pool stopped tracking.
 func TestAReleasedClaimReadsAsDeparted(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	lease := s.Acquire("prod")
-	s.probeConnection("prod")
 	require.False(t, lease.Departed())
 
 	lease.Release()
@@ -433,7 +260,6 @@ func TestAReleasedClaimReadsAsDeparted(t *testing.T) {
 func TestCloseDropsWhatThePoolHolds(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	lease := s.Acquire("prod")
-	s.probeConnection("prod")
 	require.False(t, lease.Departed())
 
 	require.NoError(t, s.Close())
@@ -442,79 +268,192 @@ func TestCloseDropsWhatThePoolHolds(t *testing.T) {
 	assert.True(t, lease.Departed())
 }
 
+// --- the news: a context leaving the kubeconfig ---
+
+// The one thing a holder is told without asking. It learns what changed by asking the claim.
+func TestDepartureReachesTheHolder(t *testing.T) {
+	cfg := counting("prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	require.Equal(t, "prod", cfg.reads.Await(t, "the claim's own read"))
+	news := s.Subscribe()
+	defer news.Close()
+
+	cfg.rotate("prod", "")
+	cfg.changed()
+
+	ev, err := news.RecvContext(within(t))
+	require.NoError(t, err)
+	assert.Equal(t, "prod", ev.Key)
+	assert.True(t, lease.Departed(), "the state is committed before the signal is sent")
+}
+
+// The claim outlives what it is a claim on: the file may name the context again, and this claim
+// is how the holder hears about that.
+func TestDepartureKeepsTheClaim(t *testing.T) {
+	cfg := resolving("prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+
+	cfg.rotate("prod", "")
+	cfg.changed()
+	require.Eventually(t, lease.Departed, time.Second, time.Millisecond)
+
+	cfg.rotate("prod", "key-1")
+	cfg.changed()
+
+	require.Eventually(t, func() bool { return !lease.Departed() },
+		time.Second, time.Millisecond, "named again, and the same claim reports it")
+	assert.Len(t, s.claimed, 1)
+}
+
+// A departed context is announced once. Announcing it on every kubeconfig write would wake its
+// holder forever for news it already has.
+func TestDepartureIsAnnouncedOnce(t *testing.T) {
+	cfg := counting("prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	defer s.Acquire("prod").Release()
+	cfg.reads.Await(t, "the claim's own read")
+	news := s.Subscribe()
+	defer news.Close()
+
+	cfg.rotate("prod", "")
+	cfg.changed()
+	_, err := news.RecvContext(within(t))
+	require.NoError(t, err)
+
+	cfg.changed()
+	cfg.reads.Await(t, "the re-read the change woke")
+
+	// A negative assertion needs a bounded window: this fails the instant a second one lands.
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, err = news.RecvContext(ctx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// An unread kubeconfig names nothing. Reporting that as a departure would tell every holder its
+// context is gone for as long as the first read takes.
+func TestUnreadKubeconfigIsNotADeparture(t *testing.T) {
+	cfg := counting("prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	cfg.reads.Await(t, "the claim's own read")
+
+	cfg.setErr(kubeconfig.ErrNotRead)
+	cfg.changed()
+	cfg.reads.Await(t, "the re-read the change woke")
+
+	assert.False(t, lease.Departed())
+}
+
 // A context the file still names but cannot resolve — a cluster entry it points at that is
 // gone, credentials that will not load — has not departed. It is the file that is broken, and
 // saying otherwise reports a removal the user did not make.
 func TestAResolveFailureIsNotADeparture(t *testing.T) {
 	cfg := resolving("prod", "key-1")
+	cfg.err = errors.New("no such certificate authority file")
 	s := New(cfg)
+	startService(t, s)
 	lease := s.Acquire("prod")
 	defer lease.Release()
-	s.probeConnection("prod")
-	require.False(t, lease.Departed())
+	watched := lease.WatchState()
+	defer watched.Close()
 
-	cfg.mu.Lock()
-	cfg.err = errors.New("no such certificate authority file")
-	cfg.mu.Unlock()
-	s.probeConnection("prod")
+	awaitState(t, watched, func(st State) bool {
+		return st.Connection.LastAttempt.Reason == ReasonResolveFailed
+	})
 
 	assert.False(t, lease.Departed())
 }
 
-// The last holder can release while a read is in flight and another caller re-claim the same
-// name. The entry it gets is a different one, and an answer that predates it is not about it.
-func TestAReadIsNotCommittedToAReplacementClaim(t *testing.T) {
+// A holder watching its own claim is told too, not just the fleet feed, and the value carries
+// why: a probe that suspends has to record its reason or nothing explains the suspension.
+func TestDepartureReachesAClaimWatcher(t *testing.T) {
 	cfg := resolving("prod", "key-1")
-	s := New(cfg)
-	first := s.Acquire("prod")
-	cfg.rotate("prod", "") // so the read now in flight will answer "gone"
-
-	var second Lease
-	cfg.duringRead(func() {
-		first.Release()
-		second = s.Acquire("prod")
-	})
-	s.probeConnection("prod")
-
-	require.NotNil(t, second)
-	defer second.Release()
-	assert.False(t, second.Departed(), "answered about the claim that went away, not this one")
-}
-
-// The ask a claim makes before Start waits in the queue for the worker Start takes. Asserted on
-// the queue directly, because end to end it is also covered by the kubeconfig watch: subscribing
-// to a gochan hub delivers its seed, so Start enqueues every claimed context anyway. That is a
-// second mechanism in another package, not a guarantee this one makes.
-func TestAClaimTakenBeforeStartStaysQueued(t *testing.T) {
-	s := New(resolving("staging", "key-1")) // "prod" is not named
-
-	defer s.Acquire("prod").Release()
-
-	key, ok := s.probeQ.Next(within(t))
-	require.True(t, ok)
-	assert.Equal(t, connectionOf("prod"), key)
-}
-
-// An ask that lands while a read is in flight gets a read of its own. That read had already
-// passed the file when the change happened, so answering the ask with it would report a file
-// nothing observed.
-func TestAnAskArrivingDuringAReadIsReadAgain(t *testing.T) {
-	cfg := resolving("prod", "key-1")
-	cfg.reads = testutil.NewProbe[string](4)
 	s := New(cfg)
 	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
 
-	cfg.duringRead(func() { s.probeQ.Add(connectionOf("prod")) })
+	cfg.rotate("prod", "")
+	cfg.changed()
+
+	// Not any departed frame: one can show a woken re-read still in flight. The settled one is
+	// what the suspension is asserted on.
+	st := awaitState(t, watched, func(st State) bool {
+		return st.Connection.LastAttempt.Reason == ReasonContextNotFound && !st.Connection.InFlight()
+	})
+	assert.False(t, st.Connection.Scheduled(), "the watch reports the file moving; polling asks nothing new")
+}
+
+// --- the asks behind the news ---
+
+// A new context asks for its connection to be probed; the claim does not wait for it. Reading
+// the kubeconfig is not work to do on the caller's thread.
+func TestAcquireAsksForANewContextsPresence(t *testing.T) {
+	cfg := resolving("prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	require.Eventually(t, func() bool { return !lease.Departed() },
+		time.Second, time.Millisecond, "presence was never read")
+
+	cfg.rotate("prod", "")
+	cfg.changed()
+
+	require.Eventually(t, lease.Departed,
+		time.Second, time.Millisecond, "a kubeconfig change never reached the claim")
+}
+
+// A later holder joins what the first one's probe found rather than asking for another read.
+// Only the engine runs: the kubeconfig watch's subscription seed wakes a re-read this test must
+// not count, and coalescing makes that wake land as zero or one extra reads — so it stays off.
+func TestAcquireAsksOnlyForANewContext(t *testing.T) {
+	cfg := counting("prod", "key-1")
+	s := New(cfg)
+	stop, err := s.engine.Start(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+	first := s.Acquire("prod")
+	defer first.Release()
+	require.Equal(t, "prod", cfg.reads.Await(t, "the first claim's read"))
+
+	second := s.Acquire("prod")
+	defer second.Release()
+
+	// A negative assertion needs a bounded window: this fails the instant a read lands.
+	testutil.NoRecv(t, cfg.reads.Chan(), 50*time.Millisecond, "a second holder asked for a read")
+}
+
+// A kubeconfig change landing while a read is in flight earns a read of its own: the one out
+// had already passed the file when it moved.
+func TestAChangeArrivingDuringAReadIsReadAgain(t *testing.T) {
+	cfg := counting("prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	cfg.duringRead(cfg.changed)
+
 	defer s.Acquire("prod").Release()
 
 	assert.Equal(t, "prod", cfg.reads.Await(t, "the claim's read"))
-	assert.Equal(t, "prod", cfg.reads.Await(t, "the read the mid-flight ask earned"))
+	assert.Equal(t, "prod", cfg.reads.Await(t, "the read the mid-flight change earned"))
 }
 
-// And it is read once the loop runs, so a context that had already gone does not sit reported
-// as present.
-func TestAClaimTakenBeforeStartIsProbed(t *testing.T) {
-	s := New(resolving("staging", "key-1"))
+// The ask a claim makes before Start waits in the engine's queues for its workers, so a context
+// that had already gone does not sit reported as present.
+func TestAClaimTakenBeforeStartIsChecked(t *testing.T) {
+	s := New(resolving("staging", "key-1")) // "prod" is not named
 	lease := s.Acquire("prod")
 	defer lease.Release()
 	require.False(t, lease.Departed(), "nothing has read the file yet")
@@ -522,7 +461,25 @@ func TestAClaimTakenBeforeStartIsProbed(t *testing.T) {
 	startService(t, s)
 
 	require.Eventually(t, lease.Departed, time.Second, time.Millisecond,
-		"a claim taken before Start was never probed")
+		"a claim taken before Start was never checked")
+}
+
+// --- the state hub ---
+
+// A receiver is bound to its key for life, and a claim's key is its context — which never moves,
+// however the credentials behind it do.
+func TestWatchStateIsKeyedByContext(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	sub := lease.WatchState()
+	defer sub.Close()
+
+	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", Attempts: Attempts{LastSeen: runAt}}})
+
+	ev, err := sub.RecvContext(within(t))
+	require.NoError(t, err)
+	assert.Equal(t, "uid-1", ev.Value.ServerUID.Value)
 }
 
 // A state receiver is the caller's, not the claim's: releasing does not close it, which is why
@@ -535,9 +492,23 @@ func TestReleaseDoesNotCloseAStateWatcher(t *testing.T) {
 	defer watched.Close()
 
 	lease.Release()
-	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", LastSeen: runAt}})
+	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", Attempts: Attempts{LastSeen: runAt}}})
 
 	ev, err := watched.RecvContext(within(t))
 	require.NoError(t, err, "the receiver is still live, and still the caller's to close")
 	assert.Equal(t, "uid-1", ev.Value.ServerUID.Value)
+}
+
+// The subscriptions are taken before Start returns, so a config sent straight after it is read
+// rather than dropped, and stop joins the loops instead of leaving them running.
+func TestStartWatchesTheKubeconfigUntilStopped(t *testing.T) {
+	cfg := resolving("prod", "key-1")
+	s := New(cfg)
+
+	stop, err := s.Start(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, cfg.hub, "Start subscribes before it returns")
+	cfg.changed()
+
+	require.NoError(t, stop(t.Context()))
 }
