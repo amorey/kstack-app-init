@@ -77,7 +77,7 @@ type Result struct{ /* verdict, reason, message, err */ }
 // result plus a commit — nil to write nothing.
 type Run[S any] func(ctx context.Context, snap S) (Result, func(*S))
 
-func New[S any](opts ...Option[S]) *Engine[S]
+func New[S any](opts ...Option) *Engine[S] // Option is non-generic: WithWorkers(n), later WithClock/WithLogger
 
 // Register adds one probe and returns its ID. It panics on a Needs entry not yet
 // registered, a duplicate name, or a call after Start — a table wired wrong at boot,
@@ -112,10 +112,16 @@ commit writes the observed value and nothing else. The engine owns two reason st
 `"Succeeded"` and `"DependencyFailed"`; a caller's reason vocabulary aligns by value, as
 `kubeconn`'s already does.
 
-Options carry what the engine cannot guess: `WithWorkers(n)`, `WithOnChange(func(subject string,
-s S, at []Attempts))`, `WithClock`, `WithLogger`. `OnChange` fires after every pass, outside the
-engine's lock but serialized per subject; the caller decides what is worth announcing — `kubeconn`
-keeps its `news` comparison and its two hubs.
+`OnChange` is a method rather than an option — the one hook that needs `S`, which keeps `Option`
+non-generic: `e.OnChange(func(subject string, snap S, at []Attempts))`, set before `Start` like a
+registration. It fires after every pass, outside the engine's lock but serialized per subject;
+the caller decides what is worth announcing — `kubeconn` keeps its `news` comparison and its two
+hubs.
+
+`Attempt` records the **verdict** (`Succeeded`/`Failed`/`Suspended`) beside the caller's reason,
+because the schedule is derived from the record and the engine never interprets a reason string —
+without it, a `Fail` and a `Suspend` are indistinguishable afterwards. `Skip` records nothing, so
+it needs no verdict.
 
 ## Dependencies
 
@@ -232,16 +238,33 @@ From `kubeconn`: `probeQ`, `probeLoop`, `probeWorkers`, `runProbe`, `commitProbe
 
 ## Build order
 
-1. `internal/probe`: `ID`, `Result`, `Attempts`, `Register` and its options, and the engine over
-   the existing `internal/workqueue`. Port `kubeconn`'s scheduling tests as the engine's own,
-   including the wake-mid-run interleaving.
-2. Panic recovery and the per-probe deadline — the two latent hangs.
-3. The backoff ladder, as a pure function of `Failures` paced by `WithBackoff`.
-4. Move `kubeconn` onto the engine: `registerProbes`, `values`, `State` assembled at publish. The only
-   step that changes `kubeconn`'s behaviour, and its tests are the ones that prove it.
-5. Worker count, logs, metrics as options.
+The shape is landed; the work left is filling it in. `sidecar/internal/probe` compiles today:
+`result.go` is **implemented and tested** (verdicts, `Attempts`, the streak rules), `engine.go`
+carries the full exported API with `New`/`Register`/options implemented and every engine method a
+panicking stub whose doc comment states its invariants and names the `kubeconn` code it ports
+(`pass` ← `reconcile`, `due` ← `due` with `Reason` cases replaced by `Verdict`, `runProbe` ←
+`runCheck`+`commitCheck`). `engine_test.go` is the checklist: real tests for what is implemented,
+and one **skipped test per remaining rule**, each naming the `kubeconn` test to port.
 
-Steps 1–3 land with the engine unused.
+For the implementer, in order — after every step: `gofmt -l`, `go vet`, and
+`go test -race -count=2 ./internal/probe/`.
+
+1. Fill in the engine bodies and un-skip the checklist, porting from
+   `internal/clustersvc/internal/kubeconn` (`service.go`, `probe.go`) — the mechanics there are
+   tested and correct; the job is transplanting, not inventing. A skip left behind is unfinished
+   work; a skip deleted without a real test in its place is worse.
+2. Panic recovery and the per-run deadline — the two latent hangs.
+3. The backoff ladder, as a pure function of `Failures` paced by `WithBackoff`.
+4. Move `kubeconn` onto the engine: `registerProbes`, `values`, `State` assembled at publish. The
+   only step that changes `kubeconn`'s behaviour, and its tests prove it — run
+   `go test -race ./internal/clustersvc/...` too. **Stop and ask for review before this step**:
+   it deletes working code, and the two deliberate behavior changes above land here.
+5. `WithClock`, `WithLogger`, metrics.
+
+Hard rules for the implementer: do not change the exported API, the file layout, or anything in
+this spec without asking; do not touch `kubeconn` before step 4; steps 1–3 land with the engine
+unused. The repo testing rules apply — no sleeps (`internal/testutil` for waits, shrink cadences
+through the options), tests beside the file they cover.
 
 ## Not in this pass
 
