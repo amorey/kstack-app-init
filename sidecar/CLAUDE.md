@@ -247,32 +247,116 @@ unconditionally — would re-emit the record on every probe, which is the same t
 nothing outside it can import one. → [ADR: connections are addressed by
 ClusterID](../docs/adr/2026-08-22-connections-addressed-by-cluster-id.md).
 
-**It hands out leases, and tells their holders when a context leaves the kubeconfig.** That is
-the whole of the package today. `Acquire(contextName)` never fails and never waits — a context
-the file does not name yet is claimable, because it may name it later and the claim is how the
-holder finds out. `Lease` is `Conn` / `State` / `WatchState` / `Departed` / `Release`; `Conn`
-reports `ErrNoConnection` and `State` reads as nothing known, because nothing builds a connection
-and nothing probes.
+**It hands out leases and reports what checking the server behind one found.**
+`Acquire(contextName)` never fails and never waits — a context the file does not name yet is
+claimable, because it may name it later and the claim is how the holder finds out. `Lease` is
+`Conn` / `State` / `WatchState` / `Departed` / `Release`. **Nothing dials yet**, so `Conn` reports
+`ErrNoConnection` and the only answers `State` carries are the ones a check can reach without a
+server. The scheduling around them is real — see the probe below.
 
 **A claim outlives what it is a claim on.** The file can stop naming a context while a holder
-still holds it, and the entry stays — only releasing drops one. `checkPresence` re-reads whether
-the file still names a context and, **when that changed**, publishes: the new `State` on
-`stateHub`, then a poke on `signalHub`, in that order so a reader the poke wakes finds the value
-already there. Unchanged answers publish nothing, or every kubeconfig write would wake the fleet
-and re-announce every departed context forever. An **unread** kubeconfig names nothing and is
-deliberately not a departure.
+still holds it, and the entry stays — only releasing drops one. An **unread** kubeconfig names
+nothing and is deliberately not a departure: saying so would report every context gone for as long
+as the first read takes. `stateHub` is published before `signalHub`, so a reader the signal wakes
+finds the value already there.
 
-**Presence is asked for, never read on the caller's thread.** `Acquire` adds the context to
-`presence` — an `internal/workqueue` queue — **only when the claim is the first**, since a later
-holder joins what the first one's check found. `presenceLoop` runs **one worker**: two reads of one
-context racing could record the older answer over the newer. It calls `Done` after each read, which
-is what re-arms a context an add reached mid-read. The kubeconfig watch adds every claimed context
-on a change rather than working out which moved, because that is what the check does anyway.
+#### The probe (`check.go` — the checks; `service.go` — when they run)
 
-**A queue and not a bus**, which is what lets `Start` alone run the worker loop: queued work
-outlives the gap before it, where a bus would drop a send nobody was receiving and leave a claim
+**Each of `State`'s five observations has one check behind it, and each check schedules itself.**
+A cluster's UID never moves and its readiness moves constantly, so nothing is gained by asking
+about them together — `defaultIntervals` paces them separately, and `NextAttempt` is per
+observation because the schedules genuinely differ. **A check writes the observation it owns and
+no other**, which is what lets the five run at once against one entry without coordinating.
+
+The check queue is therefore keyed by **`checkKey{contextName, check}`**, not by context: one
+*check* is never in two workers, dedupes while pending, and re-queues if asked again mid-run
+(`Done` is what re-arms it, rather than folding the ask into a run that had already passed the
+thing it asked about). `checkWorkers` bounds how many are in flight fleet-wide — the budget that
+stops a first install running a credential helper per cluster in the same second.
+
+**The schedule is derived, never armed.** `reconcile` reads what the checks currently say and
+works out what each should do: whatever is due goes on the check queue, and the soonest thing due
+later gets the entry's **one** timer. That timer is a *wake, not a cadence* — it only brings the
+pass back, which decides again per check, so the five schedules stay independent. It means no path
+can leave a check un-armed by forgetting it, the way per-check `time.AfterFunc` bookkeeping
+silently does.
+
+**Every path that changes an entry ends by queueing a reconcile**, never by deriving inline —
+`Acquire`, every commit, the kubeconfig watch, the timer. So a fleet-wide change is one `Add` per
+context rather than a fleet's worth of passes under one lock hold, and reconcile stays a top-level
+operation that takes the lock itself rather than running nested inside its callers'.
+
+**Reconcile is also the only thing that publishes.** Deriving before sending is what makes every
+`State` a reader sees carry a schedule that matches the answers beside it. The signal is measured
+against `entry.published` — what the fleet was last told — rather than against the start of a
+pass, because several commits can land behind one reconcile and only what survived them is news.
+A finished run's `NextAttempt` is set to *due now* rather than zeroed, so the gap before its
+reconcile never reads as a suspended check.
+
+**A run in flight is left alone**, before `due` is asked: `NextAttempt` *is* that run, so writing a
+schedule over it erases both the mark saying it is still out — freeing a later pass to ask for a
+second one — and the schedule it was dispatched on. Its commit is what reconciles.
+
+**The whole scheduling policy is `due`**, read top to bottom: the connection
+check's own rules, nothing below reachability before reachability has answered, `DependencyFailed`
+already recorded for this outage, `Unsupported` parked for the connection's life, a dependency
+that came back, never run, otherwise `LastAttempt.FinishedAt + interval`. **The re-arm falls out
+of it** — a check whose last attempt was `DependencyFailed` is due the moment the connection is
+`OK()` again, so nothing has to notice a recovery and go looking for what suspended on it.
+
+**Dependencies are declared, not ordered.** `check.needsConnection` marks the four behind
+reachability, once on the check rather than inside four bodies; they are recorded rather than
+dialed while the server is unreachable, which is what keeps a dead cluster costing **one timeout
+per cycle instead of one per check**.
+
+**A worker re-tests the dependency before it runs** (`wanted`), because a queued key names a
+context and not the claim that queued it: the last holder can release and another caller re-claim
+the name before a worker gets there, and the replacement has reached no server. Same rule `due`
+applies when it schedules, which is what makes the two agree — and it must be tested *before* the
+run is marked in flight, or an early return leaves the check reading as running and nothing ever
+schedules it again.
+
+**No caller names a check.** `reconcile` is the only thing that builds a `checkKey`; `Acquire` and the kubeconfig watch say which context
+moved and let `due` work out who cares. Two queues, two units: `reconcileQ` is keyed by context
+with one worker (the pass is arithmetic under the lock, so more would only contend for it), and
+`checkQ` is keyed by `checkKey` with `checkWorkers`. The watch does it through a **generation**: it bumps
+`Service.kubecfgGen`, and the connection check is due whenever `entry.kubecfgGen` differs — every
+branch of that check stamps the generation it read at, including the one that found the file
+unread, so a run is never asked for twice over the same file.
+
+**The connection check owns the context's lifecycle**, because resolving the kubeconfig is the
+first step of reaching a server: a departed context is its to find, and the build/rotate/retire
+will land there too. Resolving is the *precondition*, not the answer — so while nothing dials, a
+context that resolves records **no attempt** and schedules nothing, and `Phase` stays
+`PhasePending`. The two answers it can reach without a server do record one:
+`ReasonContextNotFound` (suspends — the file is the whole truth about presence, and the watch
+reports it moving) and `ReasonResolveFailed` (keeps its cadence — the file can be fixed in a way
+`kubeconfig.Service` cannot see, such as a CA path that now opens).
+
+**A run that concludes nothing forgets the failure before it** (`Attempts.forget`) — the resolve
+that succeeds, and the read that finds the file unread. **Every branch of the connection check must
+either record an attempt or forget one**, because `due` derives the next run from `LastAttempt`:
+a branch that leaves a stale failure in place has that failure still earning retries, and the run
+that follows leaves it due again — a spin, at five checks a round, since `Phase()` reads the same
+stale attempt and wakes the four behind it too.
+
+Nothing else clears the record either, so a returning context would report
+`Connected=False/ProbeFailed` for good — it is not a server we failed to reach. `Value` and
+`LastSeen` survive `forget` — a survivor outlives the
+failure, and forgetting the failure must not forget it too.
+
+`withIntervals` is the test seam, so no test outwaits a production cadence.
+
+**A queue and not a bus**, which is what lets `Start` alone run the worker loops: queued work
+outlives the gap before them, where a bus would drop a send nobody was receiving and leave a claim
 taken in that window never checked. `Service.Close` closes the queue — past there nothing works it
 off, and a held claim still adds on every kubeconfig change.
+
+**Two publish rules, because the two feeds answer different questions.** `stateHub` carries every
+run: the timing is what a claim watcher subscribed for, and the countdown to the next run is
+visible nowhere else. `signalHub` fires only when the **news** changed — `departed`, `Phase()`,
+`Identity()`, and each check's `OK()`, never a timestamp. Timestamps move every run, so signalling
+on them would wake every cluster's reconcile on every cadence to find nothing changed.
 
 **The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
 `Connection`, `ConnIdentity`, `ConnState`, `ConnStateSubscription`. Aliases because an
@@ -725,6 +809,11 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
 
 ## Patterns
 
+- **A type's methods live in the type's file.** Splitting them across files means a reader has to
+  find the pieces before they can see what a type does. So a file that earns its place owns a
+  type or a body of free functions — not a slice of some other file's type's behavior. In
+  `kubeconn` that puts the probe *engine* (`Service`'s methods) in `service.go` and the *checks*
+  in `check.go`, and `Attempts`' scheduler-facing methods beside its accessors in `state.go`.
 - **Resolver deps are always non-nil** — the composition root wires every field; tests use fakes.
 - **Pub/sub**: two modules, split on whether delivery is **keyed**. Unkeyed → `github.com/amorey/gochan`: `watch` for latest-value current-state streams (current snapshot on subscribe: auth `State`), `broadcast` for fan-out where subscribers supply their own snapshot (poke). Keyed → `github.com/amorey/gobus`: `watch` for a keyed latest-value bus. Note the two `watch` packages differ on registration — gochan's hub holds a seed and delivers it, gobus's delivers nothing until the next send (a subscriber that has already read the current value can pass it as a baseline, which is measured against and never delivered back). Never hand-roll a subscriber map.
 - **Work to do is a queue, not a bus** — `internal/workqueue`, one `Queue` per job: producers call

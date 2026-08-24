@@ -149,17 +149,19 @@ func answering(id kubeconn.Identity, err error) *fakeKubeconn {
 // answeredWith is a check that answered v at probedAt.
 func answeredWith[T any](v T) kubeconn.Observation[T] {
 	return kubeconn.Observation[T]{
-		Value:       v,
-		LastSeen:    probedAt,
-		LastAttempt: finished(kubeconn.ReasonSucceeded, ""),
+		Value:    v,
+		LastSeen: probedAt,
+		Attempts: kubeconn.Attempts{LastAttempt: finished(kubeconn.ReasonSucceeded, "")},
 	}
 }
 
 // failed is a check whose last attempt did not answer.
 func failed(err error) kubeconn.Observation[string] {
 	return kubeconn.Observation[string]{
-		LastAttempt: finished(kubeconn.ReasonUnreachable, err.Error()),
-		Failures:    1, FailingSince: probedAt,
+		Attempts: kubeconn.Attempts{
+			LastAttempt: finished(kubeconn.ReasonUnreachable, err.Error()),
+			Failures:    1, FailingSince: probedAt,
+		},
 	}
 }
 
@@ -282,7 +284,9 @@ func cfgCurrent(current string, names ...string) *api.Config {
 // than an outage to wait out.
 func forbidden(msg string) kubeconn.Observation[string] {
 	return kubeconn.Observation[string]{
-		LastAttempt: finished(kubeconn.ReasonForbidden, msg),
-		Failures:    1, FailingSince: probedAt,
+		Attempts: kubeconn.Attempts{
+			LastAttempt: finished(kubeconn.ReasonForbidden, msg),
+			Failures:    1, FailingSince: probedAt,
+		},
 	}
 }

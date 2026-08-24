@@ -53,6 +53,16 @@ const (
 	// cluster, so it does not count toward Failures.
 	ReasonCanceled Reason = "Canceled"
 
+	// ReasonContextNotFound means the kubeconfig stopped naming the context, so there is
+	// nothing to reach. The user's own edit, not a fault: the check suspends, and the file
+	// naming it again re-arms it.
+	ReasonContextNotFound Reason = "ContextNotFound"
+	// ReasonResolveFailed means the file names the context and will not yield credentials from
+	// it — a missing cluster entry, a CA file that will not open. Nothing was dialed. Told
+	// apart from ReasonContextNotFound because the remedy is to fix the file rather than to
+	// accept a context that is gone.
+	ReasonResolveFailed Reason = "ResolveFailed"
+
 	// ReasonUnauthorized is a 401: credentials absent, malformed, or expired.
 	ReasonUnauthorized Reason = "Unauthorized"
 	// ReasonForbidden is a 403: authenticated, and not permitted. A grant to fix rather than
@@ -154,6 +164,15 @@ type Observation[T any] struct {
 	// LastSeen is when Value was read. Advances only on success.
 	LastSeen time.Time
 
+	Attempts
+}
+
+// Known reports whether this check has ever answered, which is what makes Value readable.
+func (o Observation[T]) Known() bool { return !o.LastSeen.IsZero() }
+
+// Attempts is the run bookkeeping every check keeps, split from Observation so the scheduler can
+// reach it without naming the value type — observations indexes one per check.
+type Attempts struct {
 	// LastAttempt is the most recent run that finished; NextAttempt is the one that has not,
 	// scheduled or already running. A run moves from one to the other as it completes.
 	LastAttempt Attempt
@@ -166,17 +185,67 @@ type Observation[T any] struct {
 	FailingSince time.Time
 }
 
-// Known reports whether this check has ever answered, which is what makes Value readable.
-func (o Observation[T]) Known() bool { return !o.LastSeen.IsZero() }
-
 // OK reports whether the last finished attempt answered. False while nothing has finished.
-func (o Observation[T]) OK() bool { return o.LastAttempt.Reason == ReasonSucceeded }
+func (a Attempts) OK() bool { return a.LastAttempt.Reason == ReasonSucceeded }
 
 // InFlight reports whether a run is under way.
-func (o Observation[T]) InFlight() bool { return o.NextAttempt.Running() }
+func (a Attempts) InFlight() bool { return a.NextAttempt.Running() }
 
 // Scheduled reports whether another run is due. False for a suspended check.
-func (o Observation[T]) Scheduled() bool { return !o.NextAttempt.ScheduledAt.IsZero() }
+func (a Attempts) Scheduled() bool { return !a.NextAttempt.ScheduledAt.IsZero() }
+
+// begin marks a run dispatched. InFlight reads true from here until the commit, which is what
+// stops a reconcile scheduling over a check already out.
+func (a *Attempts) begin(at time.Time) { a.NextAttempt.StartedAt = at }
+
+// schedule sets when the next run is due, zero for a check with nothing scheduled.
+func (a *Attempts) schedule(at time.Time) { a.NextAttempt = Attempt{ScheduledAt: at} }
+
+// forget drops the last attempt and the run of failures it belonged to, for a run that leaves
+// nothing to report in its place. The observation's Value stays: a survivor outlives the failure,
+// and forgetting the failure must not forget it too.
+func (a *Attempts) forget() {
+	a.LastAttempt = Attempt{}
+	a.Failures, a.FailingSince = 0, time.Time{}
+}
+
+// record files a finished attempt, leaving the observation's Value where it is: a read that
+// stopped being permitted does not mean the fact changed, and LastSeen says how old the survivor
+// is. It writes nothing about the next run — that is derived from this, not decided here.
+//
+// **The run moves out of NextAttempt rather than replacing it**, so the schedule it was dispatched
+// on survives into the record: StartedAt against ScheduledAt is how long it waited for a worker,
+// and a caller cannot tell a slow check from a saturated pool without it. StartedAt stays the
+// caller's to state — a run that was recorded rather than dispatched has none.
+func (a *Attempts) record(att Attempt) {
+	att.ScheduledAt = a.NextAttempt.ScheduledAt
+	a.LastAttempt = att
+
+	switch att.Reason {
+	case ReasonCanceled:
+		// Says nothing about the cluster, so it counts toward neither failure field.
+	case ReasonSucceeded:
+		a.Failures, a.FailingSince = 0, time.Time{}
+	default:
+		a.Failures++
+		if a.FailingSince.IsZero() {
+			a.FailingSince = att.FinishedAt
+		}
+	}
+}
+
+// observations indexes each check's shared bookkeeping by checkID. Five value types mean no code
+// can name a field across them, so this is the one place that pays for that; an array rather
+// than a switch, so a sixth check is a compile error rather than a case somebody forgot.
+func observations(st *State) [numChecks]*Attempts {
+	return [numChecks]*Attempts{
+		checkConnection:    &st.Connection.Attempts,
+		checkReadiness:     &st.Readiness.Attempts,
+		checkServerUID:     &st.ServerUID.Attempts,
+		checkServerVersion: &st.ServerVersion.Attempts,
+		checkPrincipal:     &st.Principal.Attempts,
+	}
+}
 
 // ComponentStatus is what /readyz named when it answered. Empty on a server that is ready.
 type ComponentStatus struct {

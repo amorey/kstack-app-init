@@ -42,9 +42,9 @@ func TestLatencyMeasuresADispatchedRun(t *testing.T) {
 // A suspended check keeps its last answer and schedules nothing.
 func TestSuspendedCheckKeepsItsAnswer(t *testing.T) {
 	o := Observation[string]{
-		Value:       "abc-123",
-		LastSeen:    runAt,
-		LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonDependencyFailed},
+		Value:    "abc-123",
+		LastSeen: runAt,
+		Attempts: Attempts{LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonDependencyFailed}},
 	}
 
 	assert.True(t, o.Known(), "the UID it read is still the UID it read")
@@ -76,13 +76,13 @@ func TestIdentityProjectsTheCheckedScalars(t *testing.T) {
 // connections missing the same part compare equal.
 func TestIdentityLeavesAnUnreadPartEmpty(t *testing.T) {
 	forbidden := State{
-		ServerUID: Observation[string]{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonForbidden}},
+		ServerUID: Observation[string]{Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonForbidden}}},
 		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
 	}
 
 	assert.Equal(t, Identity{Username: "reader@example"}, forbidden.Identity())
 	assert.Equal(t, forbidden.Identity(), State{
-		ServerUID: Observation[string]{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonUnsupported}},
+		ServerUID: Observation[string]{Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonUnsupported}}},
 		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
 	}.Identity(), "why the UID is missing is the observation's, not the identity's")
 }
