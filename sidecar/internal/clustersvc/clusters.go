@@ -693,12 +693,12 @@ func observeIdentified(finding *connectionFinding) Condition {
 
 // foldState folds what the pool knows into the status that serves it.
 //
-// The pool already retains a check's last answer through a failure, so this copies rather
-// than deciding what to keep — and a check that has never answered leaves its field alone,
+// The pool already retains a probe's last answer through a failure, so this copies rather
+// than deciding what to keep — and a probe that has never answered leaves its field alone,
 // which is what stops a first pass from clearing a UID a live cache is named for. The
 // record's copy is the durable one: a restart empties the pool's.
 //
-// Only the checks' values land here, never their timing: a status that moved every probe
+// Only the probes' values land here, never their timing: a status that moved every pass
 // would re-emit the record to every watcher on every cycle.
 func foldState(status ClusterStatus, known *kubeconn.State) ClusterStatus {
 	if known == nil {
