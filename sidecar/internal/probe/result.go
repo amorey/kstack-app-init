@@ -26,7 +26,7 @@ const (
 	// ReasonSucceeded is stamped by Succeeded; a caller never passes it.
 	ReasonSucceeded Reason = "Succeeded"
 	// ReasonDependencyFailed is recorded by the engine when a probe's dependency is failing,
-	// in place of a run. See the dependency lifecycle in docs/specs/probe-engine.md.
+	// in place of a run. See the dependency lifecycle on Engine.due.
 	ReasonDependencyFailed Reason = "DependencyFailed"
 	// ReasonInternal is a bug in a probe body, recorded by the engine when a run panics.
 	ReasonInternal Reason = "Internal"
@@ -45,7 +45,8 @@ const (
 )
 
 // Result is what a run concluded: the record it leaves and the schedule it earns. Built by
-// Succeeded, Fail, Suspend, or Skip — the zero Result is invalid, and the engine panics on one.
+// Succeeded, Fail, Suspend, or Skip — the zero Result is invalid, and the engine records one as
+// an Internal failure, the same as a body that panicked.
 type Result struct {
 	kind    resultKind
 	verdict Verdict

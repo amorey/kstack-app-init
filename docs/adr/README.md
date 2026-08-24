@@ -85,3 +85,4 @@ usually just documentation in the wrong place.
 | 2026-08-22 | [Address every Kubernetes connection by ClusterID](2026-08-22-connections-addressed-by-cluster-id.md) | sidecar | Accepted |
 | 2026-08-23 | [Wake cluster passes from a fleet-wide kubeconn bus](2026-08-23-kubeconn-wakes-ride-a-fleet-bus.md) | sidecar | Accepted |
 | 2026-08-23 | [One connection per kube-context](2026-08-23-one-connection-per-context.md) | sidecar | Accepted |
+| 2026-08-24 | [Extract the probe scheduler into a Kubernetes-free engine](2026-08-24-probe-engine.md) | sidecar | Accepted |

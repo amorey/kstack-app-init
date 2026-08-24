@@ -264,10 +264,15 @@ finds the value already there.
 
 **The scheduling machinery is `sidecar/internal/probe`** — a reusable engine (a work queue, a
 level-triggered pass, a schedule derived from recorded state) that knows nothing about
-kube-contexts; its contract is `docs/specs/probe-engine.md`. `kubeconn` keeps what is asked and
-what the answers mean: `probe.go` is `registerProbes` — five registrations kept side by side on
-purpose, since the set's rules are checked by eye — plus the `Run` bodies; `service.go` is leases
-and publishing.
+kube-contexts. `kubeconn` keeps what is asked and what the answers mean: `probe.go` is
+`registerProbes` — five registrations kept side by side on purpose, since the set's rules are
+checked by eye — plus the `Run` bodies; `service.go` is leases and publishing. → [ADR: probe
+engine](../docs/adr/2026-08-24-probe-engine.md).
+
+**A `Run` body may not take the engine down with it.** One that panics, or that hands back the
+zero `Result`, is recorded as an `Internal` failure and gives its key back — the engine logs it
+through `slog`, the only place it logs at all. Nothing else reports a bug in a body, and leaving
+one unrecorded wedges the probe twice over: in flight forever, with its key held in the queue.
 
 **Each of `State`'s five observations has one probe behind it**, registered with its own interval
 (a cluster's UID never moves; its readiness moves constantly) and writing only the observation it

@@ -16,13 +16,23 @@
 // pattern without Kubernetes — a work queue, a level-triggered pass, and a schedule derived from
 // recorded state. Nothing here knows what a subject is beyond its name.
 //
-// The contract is docs/specs/probe-engine.md.
+// A caller registers its probes, says which subjects are tracked, and reads what the runs found:
+// Register names one probe with its cadence and the probes it Needs; Add and Remove track
+// subjects, and Wake says a recorded answer went stale; Read and OnChange hand back the caller's
+// snapshot beside the Attempts for each probe.
+//
+// A run's own Result is its schedule — Succeeded waits out the interval, Fail climbs the backoff
+// ladder, Suspend and Skip wait for a Wake — so no domain rule lives in the scheduler.
+//
+// See docs/adr/2026-08-24-probe-engine.md.
 package probe
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"maps"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -544,9 +554,11 @@ func (e *Engine[S]) runProbe(ctx context.Context, k key) {
 	e.commit(k, sub, startedAt, res, apply, ran)
 }
 
-// dispatch runs the probe's body, bounded by its timeout. A panic is a bug in the body, and it
-// must still produce a result — otherwise the probe reads as in flight forever and its key
-// stays held in the queue.
+// dispatch runs the probe's body, bounded by its timeout, and answers for it when it misbehaves.
+// A body that panics or hands back nothing is a bug, and both must still produce a result —
+// otherwise the probe reads as in flight forever and its key stays held in the queue. Only here
+// does the engine log: the Internal record a caller sees carries no stack, and nothing else in
+// the system can report a bug in a body.
 func (e *Engine[S]) dispatch(ctx context.Context, sp spec[S], subjectName string, snap S) (res Result, apply func(*S)) {
 	if sp.cfg.timeout > 0 {
 		var cancel context.CancelFunc
@@ -555,10 +567,18 @@ func (e *Engine[S]) dispatch(ctx context.Context, sp spec[S], subjectName string
 	}
 	defer func() {
 		if r := recover(); r != nil {
+			slog.Error("probe: run panicked", "probe", sp.name, "subject", subjectName,
+				"panic", r, "stack", string(debug.Stack()))
 			res, apply = Fail(ReasonInternal, fmt.Errorf("probe %s panicked: %v", sp.name, r)), nil
 		}
 	}()
-	return sp.run(ctx, subjectName, snap)
+
+	res, apply = sp.run(ctx, subjectName, snap)
+	if res.kind == resultInvalid {
+		slog.Error("probe: run returned the zero Result", "probe", sp.name, "subject", subjectName)
+		return Fail(ReasonInternal, fmt.Errorf("probe %s returned the zero Result", sp.name)), nil
+	}
+	return res, apply
 }
 
 // commit files what a run concluded and asks for a pass. Called for every run, including one
@@ -593,8 +613,6 @@ func (e *Engine[S]) commit(k key, held *subject[S], startedAt time.Time, res Res
 		if ran {
 			held.skipped[k.probe] = true
 		}
-	default:
-		panic(fmt.Sprintf("probe: %s returned the zero Result", e.specs[k.probe].name))
 	}
 	// Due now rather than suspended: the pass this asks for is a queue hop away, and a zero
 	// here would read as suspended for as long as that takes.

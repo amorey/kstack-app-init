@@ -501,6 +501,21 @@ func TestAPanickingRunRecordsInternalAndFreesItsKey(t *testing.T) {
 	assert.Equal(t, key{subject: subj, probe: id}, takeRun(t, e), "the key stayed held")
 }
 
+// A body that hands back nothing is the same class of bug as one that panics, and is contained
+// the same way. Panicking over it would take the engine's lock down with the worker.
+func TestARunThatReturnsNoResultIsRecordedAsInternal(t *testing.T) {
+	e, _, id := single(t, Result{})
+	e.Add(subj)
+	e.settle()
+
+	runNext(t, e)
+
+	a := att(t, e, id)
+	assert.Equal(t, VerdictFailed, a.LastAttempt.Verdict)
+	assert.Equal(t, ReasonInternal, a.LastAttempt.Reason)
+	assert.False(t, a.InFlight())
+}
+
 // The engine deadlines the context it hands the run; the body classifies the expiry itself.
 func TestARunIsBoundedByItsTimeout(t *testing.T) {
 	e, p, _ := single(t, Succeeded(), WithTimeout(50*time.Millisecond))
