@@ -201,6 +201,10 @@ func (a *Attempts) begin(at time.Time) { a.NextAttempt.StartedAt = at }
 // schedule sets when the next run is due, zero for a check with nothing scheduled.
 func (a *Attempts) schedule(at time.Time) { a.NextAttempt = Attempt{ScheduledAt: at} }
 
+// end clears the run begin marked. Its caller derives the next schedule before releasing the
+// lock, so the empty NextAttempt this leaves is never one a reader sees.
+func (a *Attempts) end() { a.NextAttempt = Attempt{} }
+
 // forget drops the last attempt and the run of failures it belonged to, for a run that leaves
 // nothing to report in its place. The observation's Value stays: a survivor outlives the failure,
 // and forgetting the failure must not forget it too.

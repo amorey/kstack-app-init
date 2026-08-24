@@ -316,10 +316,12 @@ applies when it schedules, which is what makes the two agree — and it must be 
 run is marked in flight, or an early return leaves the check reading as running and nothing ever
 schedules it again.
 
-**No caller names a check.** `reconcile` is the only thing that builds a `checkKey`; `Acquire` and the kubeconfig watch say which context
-moved and let `due` work out who cares. Two queues, two units: `reconcileQ` is keyed by context
-with one worker (the pass is arithmetic under the lock, so more would only contend for it), and
-`checkQ` is keyed by `checkKey` with `checkWorkers`. The watch does it through a **generation**: it bumps
+**No caller names a check.** `reconcile` is the only thing that builds a `checkKey`; `Acquire` and
+the kubeconfig watch say which context moved and let `due` work out who cares. **A pass runs
+inline, on whichever goroutine caused it** — it is arithmetic under the pool's lock, so queueing it
+would buy dedup nothing needs and cost a window where a just-finished check reads as suspended.
+`commitCheck` needs that window closed outright, so it ends the run and derives what follows in one
+critical section, through `reconcileLocked`. The watch does it through a **generation**: it bumps
 `Service.kubecfgGen`, and the connection check is due whenever `entry.kubecfgGen` differs — every
 branch of that check stamps the generation it read at, including the one that found the file
 unread, so a run is never asked for twice over the same file.

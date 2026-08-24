@@ -112,8 +112,6 @@ func TestAcquireClaimsAContextTheKubeconfigDoesNotName(t *testing.T) {
 	lease := s.Acquire("prod")
 	defer lease.Release()
 
-	s.settle()
-
 	assert.Len(t, s.claimed, 1)
 	assert.Equal(t, PhasePending, lease.State().Phase(), "nothing has looked yet")
 	assert.True(t, lease.State().Connection.Scheduled(), "and looking is what the claim asked for")
@@ -304,7 +302,6 @@ func TestAcquireAsksOnlyForANewContext(t *testing.T) {
 
 	first := s.Acquire("prod")
 	defer first.Release()
-	s.settle()
 	key, ok := s.checkQ.Next(within(t))
 	require.True(t, ok)
 	require.Equal(t, connectionOf("prod"), key)
@@ -314,7 +311,6 @@ func TestAcquireAsksOnlyForANewContext(t *testing.T) {
 
 	second := s.Acquire("prod")
 	defer second.Release()
-	s.settle()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
@@ -374,27 +370,10 @@ func connectionOf(contextName string) checkKey {
 	return checkKey{contextName: contextName, check: checkConnection}
 }
 
-// checkConnection runs the connection check the way a worker would, and then the reconcile it
-// asks for — both on the test's goroutine, so a test asserts on settled state with no loops
-// running.
+// checkConnection runs the connection check the way a worker would, on the test's goroutine, so
+// a test asserts on settled state with no loops running.
 func (s *Service) checkConnection(contextName string) {
 	s.runCheck(context.Background(), connectionOf(contextName))
-	s.settle()
-}
-
-// settle runs every reconcile currently queued. Where a worker loop would pick them up.
-func (s *Service) settle() {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Next takes what is queued and reports closed rather than waiting for more.
-
-	for {
-		contextName, ok := s.reconcileQ.Next(ctx)
-		if !ok {
-			return
-		}
-		s.reconcile(contextName)
-		s.reconcileQ.Done(contextName)
-	}
 }
 
 // A holder watching its own claim is told too, not just the fleet feed, and the value carries
@@ -510,7 +489,6 @@ func TestAClaimTakenBeforeStartStaysQueued(t *testing.T) {
 	s := New(resolving("staging", "key-1")) // "prod" is not named
 
 	defer s.Acquire("prod").Release()
-	s.settle()
 
 	key, ok := s.checkQ.Next(within(t))
 	require.True(t, ok)

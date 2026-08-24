@@ -36,11 +36,24 @@ func stateOf(t *testing.T, s *Service, contextName string) State {
 	return e.state
 }
 
-// drainKeys takes everything the check queue holds once the schedules have settled, giving each
-// back. What a worker pool would pick up, without waiting for anything more to arrive.
+// awaitKey drains the check queue until want turns up, for a test where more than one check is
+// due and the order they land in is not the point.
+func awaitKey(t *testing.T, s *Service, want checkKey) {
+	t.Helper()
+	for {
+		key, ok := s.checkQ.Next(within(t))
+		require.True(t, ok, "the queue closed before %v was asked for", want)
+		s.checkQ.Done(key)
+		if key == want {
+			return
+		}
+	}
+}
+
+// drainKeys takes everything the check queue holds, giving each back. What a worker pool would
+// pick up, without waiting for anything more to arrive.
 func drainKeys(t *testing.T, s *Service) []checkKey {
 	t.Helper()
-	s.settle()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Next takes what is queued and reports closed rather than waiting for more.
@@ -60,7 +73,6 @@ func drainKeys(t *testing.T, s *Service) []checkKey {
 // held behind a run that never happens.
 func takeKeys(t *testing.T, s *Service, n int) []checkKey {
 	t.Helper()
-	s.settle()
 	keys := make([]checkKey, 0, n)
 	for range n {
 		key, ok := s.checkQ.Next(within(t))
@@ -202,7 +214,6 @@ func TestAnUnreadKubeconfigLeavesNoRetryToSpinOn(t *testing.T) {
 func TestARecordedAttemptKeepsTheScheduleItRanOn(t *testing.T) {
 	s := New(failingToResolve())
 	defer s.Acquire("prod").Release()
-	s.settle()
 	dueAt := stateOf(t, s, "prod").Connection.NextAttempt.ScheduledAt
 	require.False(t, dueAt.IsZero(), "the claim's own check is scheduled")
 
@@ -223,7 +234,6 @@ func TestACheckBehindTheConnectionSuspendsWhileItIsDown(t *testing.T) {
 	s.checkConnection("prod") // reachability has to answer before anything behind it is due
 
 	s.runCheck(t.Context(), checkKey{contextName: "prod", check: checkServerUID})
-	s.settle()
 
 	uid := stateOf(t, s, "prod").ServerUID
 	assert.Equal(t, ReasonDependencyFailed, uid.LastAttempt.Reason)
@@ -273,7 +283,6 @@ func TestAnUnimplementedCheckRecordsWhy(t *testing.T) {
 	key := checkKey{contextName: "prod", check: checkReadiness}
 
 	s.commitCheck(key, s.claimed["prod"], checks[key.check].run(t.Context(), checkArgs{svc: s, contextName: key.contextName}))
-	s.settle()
 
 	readiness := stateOf(t, s, "prod").Readiness
 	assert.Equal(t, ReasonInternal, readiness.LastAttempt.Reason)
@@ -327,7 +336,6 @@ func TestACheckThatNeverRanIsDueOnceTheConnectionIsUp(t *testing.T) {
 func TestReconcileLeavesAnInFlightCheckUntouched(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	defer s.Acquire("prod").Release()
-	s.settle()
 	e := s.claimed["prod"]
 	observations(&e.state)[checkServerUID].begin(runAt)
 
@@ -367,9 +375,7 @@ func TestAQueuedCheckIsDroppedWhenItsClaimIsReplaced(t *testing.T) {
 
 	lease.Release()
 	defer s.Acquire("prod").Release()
-	s.settle()
 	s.runCheck(t.Context(), uidCheck)
-	s.settle()
 
 	uid := stateOf(t, s, "prod").ServerUID
 	assert.Equal(t, ReasonUnknown, uid.LastAttempt.Reason)
@@ -384,7 +390,6 @@ func TestAReconcileLeavesAnInFlightRunAlone(t *testing.T) {
 	cfg := failingToResolve()
 	s := New(cfg)
 	defer s.Acquire("prod").Release()
-	s.settle()
 	dueAt := stateOf(t, s, "prod").Connection.NextAttempt.ScheduledAt
 
 	var inFlight bool
@@ -403,16 +408,15 @@ func TestAReconcileLeavesAnInFlightRunAlone(t *testing.T) {
 
 // The schedule reconcile derives is what brings the pass back. No workers here on purpose: the
 // only thing left to ask is the timer.
-func TestAScheduledCheckAsksForAReconcileWhenItIsDue(t *testing.T) {
+func TestAScheduledCheckIsAskedForAgainWhenItIsDue(t *testing.T) {
 	s := newWithOptions(failingToResolve(), withIntervals(shrunk(checkConnection, time.Millisecond)))
 	defer s.Acquire("prod").Release()
+	drainKeys(t, s)           // the claim's own ask, already taken
 	s.checkConnection("prod") // a failure is what earns a retry
 	require.True(t, stateOf(t, s, "prod").Connection.Scheduled())
 
-	contextName, ok := s.reconcileQ.Next(within(t))
-
-	require.True(t, ok)
-	assert.Equal(t, "prod", contextName)
+	// The failure also wakes the four checks behind it, which are due now and land first.
+	awaitKey(t, s, connectionOf("prod"))
 }
 
 // An entry nobody holds is one nothing checks, so the last release gives up its schedule.
@@ -542,14 +546,14 @@ func TestEveryCheckIsNamed(t *testing.T) {
 		})
 }
 
-// A queued reconcile can outlive the claim that asked for it — the last holder released between
-// the ask and the pass. It finds no entry and schedules nothing, rather than reviving a context
-// nobody holds.
+// A pass can outlive the claim that armed it — the last holder released while its timer was
+// running. It finds no entry and schedules nothing, rather than reviving a context nobody holds.
 func TestAReconcileForAnUnclaimedContextSchedulesNothing(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	s.Acquire("prod").Release()
+	drainKeys(t, s) // what the claim asked for while it still held one
 
-	s.settle()
+	s.reconcile("prod")
 
 	assert.Empty(t, s.claimed)
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)

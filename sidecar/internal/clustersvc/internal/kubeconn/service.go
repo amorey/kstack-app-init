@@ -34,6 +34,8 @@ package kubeconn
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -112,10 +114,6 @@ type Service struct {
 	// bus: what it holds outlives the gap before Start runs the workers, so a claim taken in
 	// that window is still checked.
 	checkQ *workqueue.Queue[checkKey]
-	// reconcileQ queues the contexts whose schedule has to be re-derived. Everything that
-	// changes an entry ends with an add here rather than deriving inline, so no caller holds
-	// the pool's lock across a fleet's worth of passes and reconcile stays free to grow.
-	reconcileQ *workqueue.Queue[string]
 	// intervals paces the checks, one entry per checkID.
 	intervals [numChecks]time.Duration
 
@@ -199,7 +197,6 @@ func newWithOptions(kubecfgSvc kubeconfigService, opts ...option) *Service {
 		signalHub:  conflate.New[string, struct{}](),
 		stateHub:   watch.New[string, State](),
 		checkQ:     workqueue.New[checkKey](),
-		reconcileQ: workqueue.New[string](),
 		intervals:  defaultIntervals,
 		claimed:    map[string]*entry{},
 		kubecfgGen: 1,
@@ -214,8 +211,9 @@ func newWithOptions(kubecfgSvc kubeconfigService, opts ...option) *Service {
 // context the kubeconfig does not name yet is claimable, because the file may name it later and
 // the claim is how the holder finds out.
 //
-// The first holder of a context queues work rather than reading the kubeconfig here — not work
-// to do on the caller's thread. A later holder joins what the first one's checks found.
+// The first holder derives the new entry's schedule here, which queues its checks rather than
+// running them — the kubeconfig is not read on the caller's thread. A later holder joins what
+// the first one's checks found.
 func (s *Service) Acquire(contextName string) Lease {
 	s.mu.Lock()
 	e, held := s.claimed[contextName]
@@ -227,9 +225,9 @@ func (s *Service) Acquire(contextName string) Lease {
 	s.mu.Unlock()
 
 	if !held {
-		// A fresh entry has read no kubeconfig, so the pass this asks for queues its
-		// connection check and nothing else — the four behind it wait on a connection.
-		s.reconcileQ.Add(contextName)
+		// A fresh entry has read no kubeconfig, so this pass queues its connection check and
+		// nothing else — the four behind it wait on a connection.
+		s.reconcile(contextName)
 	}
 
 	return &claim{svc: s, contextName: contextName, entry: e}
@@ -248,7 +246,6 @@ func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 	// the stop func cancels them.
 	loopCtx, stopLoop := context.WithCancel(context.Background())
 
-	s.wg.Go(func() { s.reconcileLoop(loopCtx) })
 	for range checkWorkers {
 		s.wg.Go(func() { s.checkLoop(loopCtx) })
 	}
@@ -269,11 +266,10 @@ func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 // the pool is the holder's bug, and reading as nothing known is what a dropped entry already
 // does.
 //
-// Closing the queues is what stops them accumulating: past here nothing works them off, and a
-// held claim still adds on every kubeconfig change.
+// Closing the queue is what stops it accumulating: past here nothing works it off, and a held
+// claim still adds on every kubeconfig change.
 func (s *Service) Close() error {
 	s.checkQ.Close()
-	s.reconcileQ.Close()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -310,13 +306,17 @@ func (s *Service) watchKubeconfig(ctx context.Context, cfgs kubeconfig.Subscript
 
 // bumpKubeconfig records that the file moved and re-derives every claimed context's schedule.
 // One generation for the whole file, since that is what the feed carries.
+//
+// The names are collected before any pass runs, because reconcile takes the pool's lock itself.
+// A context released in between is dropped by the pass that finds it gone.
 func (s *Service) bumpKubeconfig() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.kubecfgGen++
-	for contextName := range s.claimed {
-		s.reconcileQ.Add(contextName)
+	contextNames := slices.Collect(maps.Keys(s.claimed))
+	s.mu.Unlock()
+
+	for _, contextName := range contextNames {
+		s.reconcile(contextName)
 	}
 }
 
@@ -405,33 +405,19 @@ func (s *Service) commitCheck(key checkKey, held *entry, apply commit) {
 	if apply != nil {
 		apply(held)
 	}
-	// After the commit, which reads the schedule this run was dispatched on. Due now rather than
-	// suspended: the reconcile this pass ends with is a queue hop away, and a zero here would
-	// read as suspended for as long as that takes.
-	observations(&held.state)[key.check].schedule(time.Now())
+	// Ending the run and deriving what follows it happen together: end leaves the check with
+	// nothing scheduled, which reads as suspended, and the pass is what replaces that. A reader
+	// between the two would see a check that had quietly stopped.
+	observations(&held.state)[key.check].end()
+	s.reconcileLocked(key.contextName)
 	s.mu.Unlock()
-
-	s.reconcileQ.Add(key.contextName)
-}
-
-// reconcileLoop derives schedules until stopped. One worker: the pass is arithmetic under the
-// pool's lock, so more would only contend for it.
-func (s *Service) reconcileLoop(ctx context.Context) {
-	for {
-		contextName, ok := s.reconcileQ.Next(ctx)
-		if !ok {
-			return
-		}
-		s.reconcile(contextName)
-		s.reconcileQ.Done(contextName)
-	}
 }
 
 // reconcile works out what each of a context's checks should do and records it: whatever is due
 // goes on the check queue, and the soonest thing due later gets the entry's one timer. **That
 // timer is a wake, not a cadence** — it only brings this pass back, which decides again per check.
 //
-// **The schedule is derived, never armed.** Every path that changes an entry ends by asking for a
+// **The schedule is derived, never armed.** Every path that changes an entry ends by running a
 // pass rather than working out which checks its change affected — affordable, because this is
 // state and arithmetic — so no path can leave a check un-armed by forgetting it. It is also the
 // only thing that builds a checkKey, so no caller names a check, only the context that moved.
@@ -442,6 +428,12 @@ func (s *Service) reconcile(contextName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.reconcileLocked(contextName)
+}
+
+// reconcileLocked is the pass itself, for a caller already holding the lock because the change it
+// is reconciling has to land in the same critical section — see commitCheck.
+func (s *Service) reconcileLocked(contextName string) {
 	e := s.claimed[contextName]
 	if e == nil {
 		return
@@ -476,7 +468,7 @@ func (s *Service) reconcile(contextName string) {
 
 	e.stopTimer()
 	if !soonest.IsZero() {
-		e.timer = time.AfterFunc(soonest.Sub(now), func() { s.reconcileQ.Add(contextName) })
+		e.timer = time.AfterFunc(soonest.Sub(now), func() { s.reconcile(contextName) })
 	}
 
 	// State first, so a reader the signal wakes finds the value already published rather than
