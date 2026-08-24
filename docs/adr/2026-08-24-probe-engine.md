@@ -28,10 +28,25 @@ to watch.
 
 ## Decision
 
-The scheduler is `sidecar/internal/probe`, a generic engine that runs periodic observations over
-a set of named subjects and knows nothing about Kubernetes. `kubeconn` keeps what is asked and
-what the answers mean: `probe.go` is `registerProbes` plus five `Run` bodies, and `service.go` is
-leases and publishing.
+The scheduler is `sidecar/internal/probe`, an engine that runs periodic observations over a set
+of named subjects and knows nothing about Kubernetes. `kubeconn` keeps what is asked and what
+the answers mean: `probe.go` is `registerProbes` plus the five probe structs, and `service.go`
+is leases and publishing.
+
+**The engine owns the observables.** A probe is a struct implementing `Probe[T]` — beehive's
+controller shape, with `T` its observable's value type, inferred at
+`Register(e, name, p, opts...)`; a run hands back its result plus its next value (nil keeps the
+previous one), and the engine records the pair: one value beside one `Attempts` per probe,
+committed under the engine's lock. `Read` and `OnChange` hand the set back as a `View`, and the
+typed `Handle[T]` registration returned projects one probe's `Observation[T]` out of it. This
+replaced a caller-defined subject snapshot handed back beside `[]Attempts`: the engine stamped
+`LastSeen` — bookkeeping about a value — for a value it never held, every consumer had to rebuild
+the value/attempts pairing itself (`kubeconn` kept an ID struct and a zip function for exactly
+that), and "a probe writes only the observation it owns" was discipline where it is now
+structure. The engine is not generic; heterogeneous value types coexist because the handle is
+the one door in or out of the erased storage. What was lost is a place for cross-probe
+invariants maintained in one commit, which nothing used; a consumer that needs one can fold its
+own struct in `OnChange`.
 
 **A run's own `Result` is its schedule.** `Succeeded` is due again after the probe's interval,
 `Fail` climbs the backoff ladder, `Suspend` records why and waits for a `Wake`, and `Skip` records

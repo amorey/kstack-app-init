@@ -27,12 +27,12 @@ import (
 )
 
 // connect runs the connection probe's body once, on the test's goroutine, and applies its
-// commit the way the engine would.
-func connect(t *testing.T, cfg *fakeKubeconfig, v values) (probe.Result, values) {
+// value the way the engine would.
+func connect(t *testing.T, cfg *fakeKubeconfig, v connInfo) (probe.Result, connInfo) {
 	t.Helper()
-	res, commit := runConnection(cfg)(t.Context(), "prod", v)
-	if commit != nil {
-		commit(&v)
+	res, next := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), "prod", v, probe.View{})
+	if next != nil {
+		v = *next
 	}
 	return res, v
 }
@@ -44,7 +44,7 @@ func connect(t *testing.T, cfg *fakeKubeconfig, v values) (probe.Result, values)
 func TestConnectionSuspendsADepartedContext(t *testing.T) {
 	cfg := resolving("staging", "key-1") // "prod" is not named
 
-	res, v := connect(t, cfg, values{})
+	res, v := connect(t, cfg, connInfo{})
 
 	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
 	assert.Equal(t, ReasonContextNotFound, res.Reason())
@@ -57,7 +57,7 @@ func TestConnectionFailsWhenTheFileWillNotResolve(t *testing.T) {
 	cfg := resolving("prod", "key-1")
 	cfg.err = errors.New("open ca.crt: no such file")
 
-	res, v := connect(t, cfg, values{departed: true})
+	res, v := connect(t, cfg, connInfo{departed: true})
 
 	assert.Equal(t, probe.VerdictFailed, res.Verdict())
 	assert.Equal(t, ReasonResolveFailed, res.Reason())
@@ -71,7 +71,7 @@ func TestConnectionSkipsAnUnreadKubeconfig(t *testing.T) {
 	cfg := resolving("prod", "key-1")
 	cfg.err = kubeconfig.ErrNotRead
 
-	res, v := connect(t, cfg, values{})
+	res, v := connect(t, cfg, connInfo{})
 
 	assert.True(t, res.IsSkip())
 	assert.False(t, v.departed)
@@ -82,7 +82,7 @@ func TestConnectionSkipsAnUnreadKubeconfig(t *testing.T) {
 func TestConnectionSuspendsAResolvedContext(t *testing.T) {
 	cfg := resolving("prod", "key-1")
 
-	res, v := connect(t, cfg, values{departed: true})
+	res, v := connect(t, cfg, connInfo{departed: true})
 
 	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
 	assert.Equal(t, ReasonResolved, res.Reason())
@@ -92,12 +92,12 @@ func TestConnectionSuspendsAResolvedContext(t *testing.T) {
 // Unreachable while nothing dials, and it says so rather than going quiet — a probe that
 // suspends without a reason is one nobody can explain.
 func TestAnUnimplementedProbeRecordsWhy(t *testing.T) {
-	res, commit := unimplemented("readiness")(t.Context(), "prod", values{})
+	res, next := unimplemented[ComponentStatus]{"readiness"}.Run(t.Context(), "prod", ComponentStatus{}, probe.View{})
 
 	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
 	assert.Equal(t, ReasonInternal, res.Reason())
 	assert.Contains(t, res.Message(), "readiness")
-	assert.Nil(t, commit)
+	assert.Nil(t, next)
 }
 
 // --- through the engine ---
@@ -163,7 +163,7 @@ func TestAResolveFailureKeepsAsking(t *testing.T) {
 
 	// The retry sits out on the ladder; the wake stands in for it, as a worked answer the
 	// schedule would eventually produce.
-	s.engine.Wake("prod", s.ids.connection)
+	s.engine.Wake("prod", s.probes.connection.ID())
 
 	second := awaitState(t, watched, func(st State) bool {
 		return st.Connection.Failures >= 2

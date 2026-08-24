@@ -264,9 +264,13 @@ finds the value already there.
 
 **The scheduling machinery is `sidecar/internal/probe`** — a reusable engine (a work queue, a
 level-triggered pass, a schedule derived from recorded state) that knows nothing about
-kube-contexts. `kubeconn` keeps what is asked and what the answers mean: `probe.go` is
-`registerProbes` — five registrations kept side by side on purpose, since the set's rules are
-checked by eye — plus the `Run` bodies; `service.go` is leases and publishing. → [ADR: probe
+kube-contexts. A probe is a struct implementing `probe.Probe[T]`, registered with
+`probe.Register(e, name, p, opts...)` — the same shape as a beehive controller, with `T` inferred
+from the instance — and `T` is its observable's value type; the typed `Handle[T]` registration
+returns is how that observable is read back and how `Needs`/`Wake` address the probe. `kubeconn`
+keeps what is asked and what the answers mean: `probe.go` is `registerProbes` — five
+registrations kept side by side on purpose, since the set's rules are checked by eye — plus the
+probe structs; `service.go` is leases and publishing. → [ADR: probe
 engine](../docs/adr/2026-08-24-probe-engine.md).
 
 **A `Run` body may not take the engine down with it.** One that panics, or that hands back the
@@ -275,9 +279,13 @@ through `slog`, the only place it logs at all. Nothing else reports a bug in a b
 one unrecorded wedges the probe twice over: in flight forever, with its key held in the queue.
 
 **Each of `State`'s five observations has one probe behind it**, registered with its own interval
-(a cluster's UID never moves; its readiness moves constantly) and writing only the observation it
-owns. A commit writes into `values`, the engine's per-context snapshot; `State` is assembled at
-publish time by pairing each value with the engine's `Attempts` for that probe.
+(a cluster's UID never moves; its readiness moves constantly). The engine owns the observables —
+one value beside one `Attempts` per probe, the value committed by that probe's `Run` alone (nil
+keeps the previous one) — and `Read`/`OnChange` hand them back as a `probe.View`; `State` is
+assembled at publish time by projecting each handle's `Observation` out of it. The connection's
+value (`connInfo`) bundles `departed` and the connection with the endpoint, so the probes behind
+reachability read all three through the one handle; `stateOf` projects only the endpoint into
+`State.Connection`.
 
 **A probe's result is its schedule** — `Succeeded` (due again after the interval), `Fail` (due up
 the backoff ladder), `Suspend` (nothing due until a `Wake`), `Skip` (record nothing; wait for a
@@ -298,7 +306,7 @@ delete both with the branch when the dial lands.
 
 **Wiring**: `Acquire`'s first holder is `engine.Add`; the last `Release` is `engine.Remove`,
 under `Service.mu` so a stale release cannot remove the subject a fresh claim just added; the
-kubeconfig watch is `engine.WakeAll(ids.connection)` on every change — every claimed context
+kubeconfig watch is `engine.WakeAll(probes.connection.ID())` on every change — every claimed context
 rather than the ones that moved, because finding which moved is what the probe does anyway.
 
 **Publishing is the engine's `OnChange`** — after every pass, outside the engine's lock,
@@ -765,8 +773,8 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
 - **A type's methods live in the type's file.** Splitting them across files means a reader has to
   find the pieces before they can see what a type does. So a file that earns its place owns a
   type or a body of free functions — not a slice of some other file's type's behavior. In
-  `kubeconn` that puts the probe *engine* (`Service`'s methods) in `service.go` and the *probes*
-  in `probe.go`, and `Attempts`' scheduler-facing methods beside its accessors in `state.go`.
+  `kubeconn` that puts the pool (`Service`'s methods) in `service.go`, the probes in `probe.go`,
+  and the reason vocabulary with `State`'s accessors in `state.go`.
 - **Resolver deps are always non-nil** — the composition root wires every field; tests use fakes.
 - **Pub/sub**: two modules, split on whether delivery is **keyed**. Unkeyed → `github.com/amorey/gochan`: `watch` for latest-value current-state streams (current snapshot on subscribe: auth `State`), `broadcast` for fan-out where subscribers supply their own snapshot (poke). Keyed → `github.com/amorey/gobus`: `watch` for a keyed latest-value bus. Note the two `watch` packages differ on registration — gochan's hub holds a seed and delivers it, gobus's delivers nothing until the next send (a subscriber that has already read the current value can pass it as a baseline, which is measured against and never delivered back). Never hand-roll a subscriber map.
 - **Work to do is a queue, not a bus** — `internal/workqueue`, one `Queue` per job: producers call

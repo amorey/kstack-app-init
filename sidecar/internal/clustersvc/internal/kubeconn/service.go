@@ -106,10 +106,10 @@ type Lease interface {
 // subject per claimed context; this type owns who holds the claims and what the fleet is told.
 type Service struct {
 	kubecfgSvc kubeconfigService
-	// engine runs the five probes of probe.go over the claimed contexts; ids is what
+	// engine runs the five probes of probe.go over the claimed contexts; probes is what
 	// registering them returned.
-	engine *probe.Engine[values]
-	ids    probeIDs
+	engine *probe.Engine
+	probes probeHandles
 	// signalHub names the contexts whose news changed; stateHub carries what the probes read.
 	// Both keyed by context, both fed by publish.
 	signalHub *conflate.Hub[string, struct{}]
@@ -140,13 +140,13 @@ type entry struct {
 func New(kubecfgSvc kubeconfigService) *Service {
 	s := &Service{
 		kubecfgSvc: kubecfgSvc,
-		engine:     probe.New[values](),
+		engine:     probe.New(),
 		signalHub:  conflate.New[string, struct{}](),
 		stateHub:   watch.New[string, State](),
 		claimed:    map[string]*entry{},
 		published:  map[string]news{},
 	}
-	s.ids = registerProbes(s.engine, kubecfgSvc)
+	s.probes = registerProbes(s.engine, kubecfgSvc)
 	s.engine.OnChange(s.publish)
 	return s
 }
@@ -232,7 +232,7 @@ func (s *Service) watchKubeconfig(ctx context.Context, cfgs kubeconfig.Subscript
 			if !ok {
 				return
 			}
-			s.engine.WakeAll(s.ids.connection)
+			s.engine.WakeAll(s.probes.connection.ID())
 		}
 	}
 }
@@ -240,9 +240,9 @@ func (s *Service) watchKubeconfig(ctx context.Context, cfgs kubeconfig.Subscript
 // publish is the engine's OnChange: project the pass into State, tell the claim watchers, and
 // signal the fleet when the news moved. The engine serializes it per context, and the order
 // holds — a reader the signal wakes finds the state already published.
-func (s *Service) publish(contextName string, v values, at []probe.Attempts) {
-	st := s.stateOf(v, at)
-	n := newsOf(v, st, at)
+func (s *Service) publish(contextName string, v probe.View) {
+	st := s.stateOf(v)
+	n := s.newsOf(v, st)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -271,22 +271,28 @@ type news struct {
 	ok       [numProbes]bool
 }
 
-func newsOf(v values, st State, at []probe.Attempts) news {
-	n := news{departed: v.departed, phase: st.Phase(), identity: st.Identity()}
-	for id, a := range at {
-		n.ok[id] = a.OK()
+func (s *Service) newsOf(v probe.View, st State) news {
+	n := news{
+		departed: s.probes.connection.Get(v).Value.departed,
+		phase:    st.Phase(),
+		identity: st.Identity(),
+	}
+	for id := range v.Len() {
+		n.ok[id] = v.Attempts(probe.ID(id)).OK()
 	}
 	return n
 }
 
-// stateOf pairs each probe's value with the attempts the engine kept for it.
-func (s *Service) stateOf(v values, at []probe.Attempts) State {
+// stateOf projects the engine's observables into State. The connection's observable bundles the
+// context's standing with the endpoint; only the endpoint is the answer State carries.
+func (s *Service) stateOf(v probe.View) State {
+	ci := s.probes.connection.Get(v)
 	return State{
-		Connection:    Observation[string]{Value: v.endpoint, Attempts: at[s.ids.connection]},
-		Readiness:     Observation[ComponentStatus]{Value: v.readiness, Attempts: at[s.ids.readiness]},
-		ServerUID:     Observation[string]{Value: v.serverUID, Attempts: at[s.ids.serverUID]},
-		ServerVersion: Observation[VersionInfo]{Value: v.serverVersion, Attempts: at[s.ids.serverVersion]},
-		Principal:     Observation[Principal]{Value: v.principal, Attempts: at[s.ids.principal]},
+		Connection:    Observation[string]{Value: ci.Value.endpoint, Attempts: ci.Attempts},
+		Readiness:     s.probes.readiness.Get(v),
+		ServerUID:     s.probes.serverUID.Get(v),
+		ServerVersion: s.probes.serverVersion.Get(v),
+		Principal:     s.probes.principal.Get(v),
 	}
 }
 
@@ -323,7 +329,7 @@ func (c *claim) Departed() bool {
 // caller re-claim the name mid-read, and the state that came back is then the new claim's — the
 // check catches it, where one taken before the read would not.
 func (s *Service) read(contextName string, held *entry) (State, bool) {
-	v, at, tracked := s.engine.Read(contextName)
+	v, tracked := s.engine.Read(contextName)
 
 	s.mu.Lock()
 	valid := s.claimed[contextName] == held
@@ -332,7 +338,7 @@ func (s *Service) read(contextName string, held *entry) (State, bool) {
 	if !valid || !tracked {
 		return State{}, true
 	}
-	return s.stateOf(v, at), v.departed
+	return s.stateOf(v), s.probes.connection.Get(v).Value.departed
 }
 
 // WatchState takes no baseline: the hub compares against one only through an Accept, and this

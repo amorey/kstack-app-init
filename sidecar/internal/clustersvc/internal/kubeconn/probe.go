@@ -31,49 +31,49 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
 
-// numProbes sizes what is tracked per context, one entry per field of probeIDs.
+// numProbes sizes what is tracked per context, one entry per field of probeHandles.
 const numProbes = 5
 
-// probeIDs is what registration returned: the names Wake and the State projection address
-// probes by.
-type probeIDs struct {
-	connection, readiness, serverUID, serverVersion, principal probe.ID
+// probeHandles is what registration returned: the typed reads State is assembled through, and
+// the IDs Wake addresses probes by. A cluster's UID outlives everything else here; its readiness
+// outlives nothing — which is why the intervals below differ.
+type probeHandles struct {
+	connection    probe.Handle[connInfo]
+	readiness     probe.Handle[ComponentStatus]
+	serverUID     probe.Handle[string]
+	serverVersion probe.Handle[VersionInfo]
+	principal     probe.Handle[Principal]
 }
 
-// values is the engine's subject snapshot for one context: what the probes' commits write, and
-// what State projects beside the engine's attempts. A cluster's UID outlives everything else
-// here; its readiness outlives nothing — which is why the intervals below differ.
-type values struct {
-	// departed is what the connection probe's last read of the kubeconfig said: false while
-	// the file names this context, true once it stops. Flipping it is news the holders are
-	// told.
+// connInfo is the connection probe's observable: the context's standing in the kubeconfig, and
+// the connection reaching its server yields. The four probes behind reachability read it through
+// the connection handle.
+type connInfo struct {
+	// departed is what the probe's last read of the kubeconfig said: false while the file
+	// names this context, true once it stops. Flipping it is news the holders are told.
 	departed bool
 	// conn is the connection the probes run over. Nothing builds one yet.
 	conn *Connection
-
-	endpoint      string
-	readiness     ComponentStatus
-	serverUID     string
-	serverVersion VersionInfo
-	principal     Principal
+	// endpoint is the API server URL that answered.
+	endpoint string
 }
 
-func registerProbes(e *probe.Engine[values], kubecfg kubeconfigService) probeIDs {
-	var p probeIDs
-	p.connection = e.Register("connection", runConnection(kubecfg),
+func registerProbes(e *probe.Engine, kubecfg kubeconfigService) probeHandles {
+	var p probeHandles
+	p.connection = probe.Register(e, "connection", &connectionProbe{kubecfg: kubecfg},
 		probe.WithInterval(30*time.Second))
-	p.readiness = e.Register("readiness", unimplemented("readiness"),
-		probe.WithInterval(30*time.Second), probe.Needs(p.connection))
-	p.serverUID = e.Register("serverUID", unimplemented("serverUID"),
-		probe.WithInterval(10*time.Minute), probe.Needs(p.connection))
-	p.serverVersion = e.Register("serverVersion", unimplemented("serverVersion"),
-		probe.WithInterval(5*time.Minute), probe.Needs(p.connection))
-	p.principal = e.Register("principal", unimplemented("principal"),
-		probe.WithInterval(5*time.Minute), probe.Needs(p.connection))
+	p.readiness = probe.Register(e, "readiness", unimplemented[ComponentStatus]{"readiness"},
+		probe.WithInterval(30*time.Second), probe.Needs(p.connection.ID()))
+	p.serverUID = probe.Register(e, "serverUID", unimplemented[string]{"serverUID"},
+		probe.WithInterval(10*time.Minute), probe.Needs(p.connection.ID()))
+	p.serverVersion = probe.Register(e, "serverVersion", unimplemented[VersionInfo]{"serverVersion"},
+		probe.WithInterval(5*time.Minute), probe.Needs(p.connection.ID()))
+	p.principal = probe.Register(e, "principal", unimplemented[Principal]{"principal"},
+		probe.WithInterval(5*time.Minute), probe.Needs(p.connection.ID()))
 	return p
 }
 
-// runConnection answers whether the server behind the context can be reached, and owns the
+// connectionProbe answers whether the server behind the context can be reached, and owns the
 // context's lifecycle on the way there: resolving the kubeconfig is the first step of reaching a
 // server, so a context that left the file is this probe's to find.
 //
@@ -81,30 +81,35 @@ func registerProbes(e *probe.Engine[values], kubecfg kubeconfigService) probeIDs
 // precondition, not an answer about the server, and Phase reads it as still pending. The
 // kubeconfig watch wakes this probe on every change, which is what re-asks every one of these
 // answers.
-func runConnection(kubecfg kubeconfigService) probe.Run[values] {
-	return func(_ context.Context, contextName string, _ values) (probe.Result, func(*values)) {
-		_, _, err := kubecfg.RESTConfig(contextName)
-		switch {
-		case errors.Is(err, kubeconfig.ErrNotRead):
-			// An unread kubeconfig names nothing, and saying so would report every context
-			// gone for as long as the first read takes. The watch wakes us when it is read.
-			return probe.Skip(), nil
+type connectionProbe struct {
+	kubecfg kubeconfigService
+}
 
-		case errors.Is(err, kubeconfig.ErrContextNotFound):
-			return probe.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context"),
-				func(v *values) { v.departed = true }
+func (p *connectionProbe) Run(_ context.Context, contextName string, prev connInfo, _ probe.View) (probe.Result, *connInfo) {
+	_, _, err := p.kubecfg.RESTConfig(contextName)
+	switch {
+	case errors.Is(err, kubeconfig.ErrNotRead):
+		// An unread kubeconfig names nothing, and saying so would report every context
+		// gone for as long as the first read takes. The watch wakes us when it is read.
+		return probe.Skip(), nil
 
-		case err != nil:
-			// The file still names it, so this is not a departure — it is a file the user
-			// has to fix, and the retry ladder is for a fix the kubeconfig watch cannot see,
-			// such as a CA path that now opens.
-			return probe.Fail(ReasonResolveFailed, err),
-				func(v *values) { v.departed = false }
+	case errors.Is(err, kubeconfig.ErrContextNotFound):
+		next := prev
+		next.departed = true
+		return probe.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context"), &next
 
-		default:
-			return probe.Suspend(ReasonResolved, "resolved; nothing dials yet"),
-				func(v *values) { v.departed = false }
-		}
+	case err != nil:
+		// The file still names it, so this is not a departure — it is a file the user
+		// has to fix, and the retry ladder is for a fix the kubeconfig watch cannot see,
+		// such as a CA path that now opens.
+		next := prev
+		next.departed = false
+		return probe.Fail(ReasonResolveFailed, err), &next
+
+	default:
+		next := prev
+		next.departed = false
+		return probe.Suspend(ReasonResolved, "resolved; nothing dials yet"), &next
 	}
 }
 
@@ -112,8 +117,10 @@ func runConnection(kubecfg kubeconfigService) probe.Run[values] {
 // dials — every one of these needs a connection that never succeeds — and it records rather
 // than going quiet, so a run that does reach it says so instead of looking suspended for a
 // reason nobody wrote down.
-func unimplemented(name string) probe.Run[values] {
-	return func(context.Context, string, values) (probe.Result, func(*values)) {
-		return probe.Suspend(ReasonInternal, name+" probe is not implemented"), nil
-	}
+type unimplemented[T any] struct {
+	name string
+}
+
+func (u unimplemented[T]) Run(context.Context, string, T, probe.View) (probe.Result, *T) {
+	return probe.Suspend(ReasonInternal, u.name+" probe is not implemented"), nil
 }

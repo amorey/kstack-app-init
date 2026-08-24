@@ -29,51 +29,58 @@ import (
 // subj is the one subject most tests track.
 const subj = "ctx-1"
 
-// steered is a probe body the test steers: the result is swapped at will, runs are counted, and
-// an optional hook fires inside the run — which is how a test interleaves a Remove or a Wake
-// with a run in flight.
+// steered is a probe the test steers: the result is swapped at will, runs are counted, and an
+// optional hook fires inside the run — which is how a test interleaves a Remove or a Wake with
+// a run in flight.
 type steered struct {
 	mu          sync.Mutex
 	res         Result
-	apply       func(*string)
+	next        *string
 	onRun       func()
 	runs        int
 	sawDeadline bool
 }
 
-func (p *steered) run(ctx context.Context, _ string, _ string) (Result, func(*string)) {
+func (p *steered) Run(ctx context.Context, _ string, _ string, _ View) (Result, *string) {
 	p.mu.Lock()
 	p.runs++
 	_, p.sawDeadline = ctx.Deadline()
-	res, apply, hook := p.res, p.apply, p.onRun
+	res, next, hook := p.res, p.next, p.onRun
 	p.mu.Unlock()
 
 	if hook != nil {
 		hook()
 	}
-	return res, apply
+	return res, next
 }
 
 func (p *steered) set(res Result) { p.mu.Lock(); defer p.mu.Unlock(); p.res = res }
 func (p *steered) count() int     { p.mu.Lock(); defer p.mu.Unlock(); return p.runs }
 
+// probeFunc adapts a bare func for a test that needs a one-off body.
+type probeFunc func(ctx context.Context, subject string, prev string, obs View) (Result, *string)
+
+func (f probeFunc) Run(ctx context.Context, subject string, prev string, obs View) (Result, *string) {
+	return f(ctx, subject, prev, obs)
+}
+
 // single is an engine with one steered probe, closed on cleanup.
-func single(t *testing.T, res Result, opts ...ProbeOption) (*Engine[string], *steered, ID) {
+func single(t *testing.T, res Result, opts ...ProbeOption) (*Engine, *steered, ID) {
 	t.Helper()
-	e := New[string]()
+	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	p := &steered{res: res}
-	return e, p, e.Register("conn", p.run, opts...)
+	return e, p, Register(e, "conn", p, opts...).ID()
 }
 
 // pair is single plus a dependent probe needing the first.
-func pair(t *testing.T, aRes, bRes Result) (e *Engine[string], a, b *steered, aID, bID ID) {
+func pair(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aID, bID ID) {
 	t.Helper()
-	e = New[string]()
+	e = New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	a, b = &steered{res: aRes}, &steered{res: bRes}
-	aID = e.Register("conn", a.run)
-	bID = e.Register("uid", b.run, Needs(aID))
+	aID = Register(e, "conn", a).ID()
+	bID = Register(e, "uid", b, Needs(aID)).ID()
 	return e, a, b, aID, bID
 }
 
@@ -88,7 +95,7 @@ func within(t *testing.T) context.Context {
 
 // settle runs every pass currently queued, on the test's goroutine — where passLoop would pick
 // them up.
-func (e *Engine[S]) settle() {
+func (e *Engine) settle() {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Next takes what is queued and reports rather than waiting for more.
 
@@ -104,7 +111,7 @@ func (e *Engine[S]) settle() {
 
 // runNext takes the next due run and executes it the way a worker would, then settles the pass
 // it asked for. All on the test's goroutine, so assertions read settled state.
-func runNext(t *testing.T, e *Engine[string]) key {
+func runNext(t *testing.T, e *Engine) key {
 	t.Helper()
 	k, ok := e.runQ.Next(within(t))
 	require.True(t, ok, "the run queue closed")
@@ -115,7 +122,7 @@ func runNext(t *testing.T, e *Engine[string]) key {
 }
 
 // takeRun pops one due run without executing it, giving the key back.
-func takeRun(t *testing.T, e *Engine[string]) key {
+func takeRun(t *testing.T, e *Engine) key {
 	t.Helper()
 	k, ok := e.runQ.Next(within(t))
 	require.True(t, ok, "the run queue closed")
@@ -125,7 +132,7 @@ func takeRun(t *testing.T, e *Engine[string]) key {
 
 // noRuns is a negative assertion, so it needs a bounded window rather than the failsafe: it
 // fails the instant a run is handed out.
-func noRuns(t *testing.T, e *Engine[string], msg string) {
+func noRuns(t *testing.T, e *Engine, msg string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
@@ -136,14 +143,14 @@ func noRuns(t *testing.T, e *Engine[string], msg string) {
 }
 
 // att reads one probe's attempts through Read.
-func att(t *testing.T, e *Engine[string], id ID) Attempts {
+func att(t *testing.T, e *Engine, id ID) Attempts {
 	t.Helper()
-	_, at, ok := e.Read(subj)
+	v, ok := e.Read(subj)
 	require.True(t, ok, "subject not tracked")
-	return at[id]
+	return v.Attempts(id)
 }
 
-func startEngine(t *testing.T, e *Engine[string]) {
+func startEngine(t *testing.T, e *Engine) {
 	t.Helper()
 	stop, err := e.Start(t.Context())
 	require.NoError(t, err)
@@ -154,25 +161,26 @@ func startEngine(t *testing.T, e *Engine[string]) {
 
 func TestRegisterReturnsIDsInRegistrationOrder(t *testing.T) {
 	e, _, a := single(t, Skip())
-	b := e.Register("uid", (&steered{}).run, Needs(a))
+	b := Register(e, "uid", &steered{}, Needs(a))
 
 	assert.Equal(t, ID(0), a)
-	assert.Equal(t, ID(1), b)
-	assert.Equal(t, []ID{a}, e.specs[b].cfg.needs)
+	assert.Equal(t, ID(1), b.ID())
+	assert.Equal(t, "uid", b.Name())
+	assert.Equal(t, []ID{a}, e.specs[b.ID()].cfg.needs)
 }
 
 func TestRegisterPanicsOnADuplicateName(t *testing.T) {
 	e, p, _ := single(t, Skip())
 
-	assert.Panics(t, func() { e.Register("conn", p.run) })
+	assert.Panics(t, func() { Register(e, "conn", p) })
 }
 
 // Needs takes IDs Register already returned, so the graph is acyclic by construction; this is
 // the backstop for a hand-forged ID.
 func TestRegisterPanicsOnANeedNotYetRegistered(t *testing.T) {
-	e := New[string]()
+	e := New()
 
-	assert.Panics(t, func() { e.Register("uid", (&steered{}).run, Needs(ID(0))) })
+	assert.Panics(t, func() { Register(e, "uid", &steered{}, Needs(ID(0))) })
 }
 
 // A registration states only what deviates from the package defaults.
@@ -189,7 +197,7 @@ func TestRegisterPanicsAfterStart(t *testing.T) {
 	e, p, _ := single(t, Skip())
 	startEngine(t, e)
 
-	assert.Panics(t, func() { e.Register("late", p.run) })
+	assert.Panics(t, func() { Register(e, "late", p) })
 }
 
 // A subject's bookkeeping is sized when it is added, so the probe set must be complete first.
@@ -197,7 +205,7 @@ func TestRegisterPanicsAfterAdd(t *testing.T) {
 	e, p, _ := single(t, Skip())
 	e.Add(subj)
 
-	assert.Panics(t, func() { e.Register("late", p.run) })
+	assert.Panics(t, func() { Register(e, "late", p) })
 }
 
 // --- subjects and the pass ---
@@ -219,13 +227,13 @@ func TestAddQueuesWhatAFreshSubjectOwes(t *testing.T) {
 }
 
 func TestWorkQueuedBeforeStartIsServedOnceItRuns(t *testing.T) {
-	e := New[string]()
+	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	ran := testutil.NewProbe[struct{}](1)
-	e.Register("conn", func(context.Context, string, string) (Result, func(*string)) {
+	Register(e, "conn", probeFunc(func(context.Context, string, string, View) (Result, *string) {
 		ran.Fire(struct{}{})
 		return Suspend("Resolved", ""), nil
-	})
+	}))
 	e.Add(subj)
 
 	startEngine(t, e)
@@ -244,7 +252,7 @@ func TestRemoveStopsTheSubjectsTimer(t *testing.T) {
 	e.Remove(subj)
 
 	assert.Nil(t, sub.timer)
-	_, _, ok := e.Read(subj)
+	_, ok := e.Read(subj)
 	assert.False(t, ok)
 }
 
@@ -482,11 +490,11 @@ func TestNeedsIsRecheckedAtDispatch(t *testing.T) {
 // A panicking body must still produce a record and free its key — otherwise the probe reads as
 // in flight forever and the key stays held in the queue.
 func TestAPanickingRunRecordsInternalAndFreesItsKey(t *testing.T) {
-	e := New[string]()
+	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	id := e.Register("conn", func(context.Context, string, string) (Result, func(*string)) {
+	id := Register(e, "conn", probeFunc(func(context.Context, string, string, View) (Result, *string) {
 		panic("boom")
-	})
+	})).ID()
 	e.Add(subj)
 	e.settle()
 
@@ -534,38 +542,66 @@ func TestARunIsBoundedByItsTimeout(t *testing.T) {
 // The engine reports every pass; the caller decides what is news.
 func TestOnChangeFiresAfterEveryPassInOrderPerSubject(t *testing.T) {
 	e, _, id := single(t, Succeeded())
-	var calls [][]Attempts
-	e.OnChange(func(name string, _ string, at []Attempts) {
+	var calls []View
+	e.OnChange(func(name string, obs View) {
 		require.Equal(t, subj, name)
-		calls = append(calls, at)
+		calls = append(calls, obs)
 	})
 	e.Add(subj)
 	e.settle()
 	require.Len(t, calls, 1, "the fresh subject's own pass")
-	assert.False(t, calls[0][id].LastAttempt.Done())
+	assert.False(t, calls[0].Attempts(id).LastAttempt.Done())
 
 	runNext(t, e)
 
 	require.Len(t, calls, 2)
-	assert.True(t, calls[1][id].OK(), "the second call carries the committed run")
+	assert.True(t, calls[1].Attempts(id).OK(), "the second call carries the committed run")
 }
 
 func TestReadReportsAnUntrackedSubject(t *testing.T) {
-	e, p, id := single(t, Succeeded())
-	p.apply = func(s *string) { *s = "uid-1" }
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	uid := "uid-1"
+	h := Register(e, "conn", &steered{res: Succeeded(), next: &uid})
 
-	_, _, ok := e.Read(subj)
+	_, ok := e.Read(subj)
 	require.False(t, ok)
 
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
 
-	snap, at, ok := e.Read(subj)
+	v, ok := e.Read(subj)
 	require.True(t, ok)
-	assert.Equal(t, "uid-1", snap, "the commit's write")
-	assert.True(t, at[id].OK())
-	assert.False(t, at[id].LastSeen.IsZero(), "the engine stamps when the value was read")
+	o := h.Get(v)
+	assert.Equal(t, "uid-1", o.Value, "the run's committed value")
+	assert.True(t, o.OK())
+	assert.True(t, o.Known(), "the engine stamps when the value was read")
+}
+
+// A run that hands back no value keeps the previous one: an Observation outlives the failure
+// that follows it, and the failing run is still recorded beside it.
+func TestANilValueKeepsThePreviousOne(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	uid := "uid-1"
+	p := &steered{res: Succeeded(), next: &uid}
+	h := Register(e, "conn", p)
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+
+	p.set(Fail("Unreachable", assert.AnError))
+	p.next = nil
+	e.Wake(subj, h.ID())
+	runNext(t, e)
+
+	v, ok := e.Read(subj)
+	require.True(t, ok)
+	o := h.Get(v)
+	assert.Equal(t, "uid-1", o.Value, "the failure erased the last answer")
+	assert.True(t, o.Known())
+	assert.False(t, o.OK())
 }
 
 func TestCloseStopsTheTimersAndTheQueues(t *testing.T) {

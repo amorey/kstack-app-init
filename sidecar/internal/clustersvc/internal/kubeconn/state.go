@@ -121,15 +121,8 @@ const (
 	ReasonInternal Reason = "Internal"
 )
 
-// Observation is one probe's last answer and the provenance to judge it: the value beside the
-// engine's bookkeeping for the probe that read it.
-//
-// **Value outlives the failure that follows it.** A read that stops being permitted does not
-// mean the fact changed, so Value is what was last seen and LastSeen is when — which is what
-// makes it readable: "identified, as of 10:00" is usable where "ready, as of 10:00" is not.
-//
-// **A probe that has never run is the zero value**, which needs no sentinel: a zero LastAttempt
-// is not Done, so every accessor already answers for it.
+// Observation is the engine's record of one probe: the value beside the bookkeeping for the
+// probe that read it. Aliased for the same reason Attempts is. What this package's probes add:
 //
 // **A zero NextAttempt means the probe is suspended** — nothing is due, and the last answer
 // stands. The four probes behind the connection are suspended while it is down, since a server
@@ -140,15 +133,7 @@ const (
 //
 // **Why it is suspended is LastAttempt.Reason**, which needs no field of its own because a probe
 // suspends over what its last attempt found.
-type Observation[T any] struct {
-	// Value is the last answer. Meaningless until Known.
-	Value T
-
-	Attempts
-}
-
-// Known reports whether this probe has ever answered, which is what makes Value readable.
-func (o Observation[T]) Known() bool { return !o.LastSeen.IsZero() }
+type Observation[T any] = probe.Observation[T]
 
 // ComponentStatus is what /readyz named when it answered. Empty on a server that is ready.
 type ComponentStatus struct {

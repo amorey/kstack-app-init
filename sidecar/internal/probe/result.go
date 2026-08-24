@@ -133,10 +133,10 @@ func (a Attempt) Latency() time.Duration {
 }
 
 // Attempts is one probe's bookkeeping for one subject. The engine owns every write; a caller
-// reads it out of Read or OnChange, and embeds it beside the value the probe observes.
+// reads it out of a View, embedded in the Observation beside the value it accounts for.
 type Attempts struct {
-	// LastSeen is when the value the caller keeps beside this was read. Advances only on a
-	// succeeded run, stamped by the engine — a commit writes the value and nothing else.
+	// LastSeen is when the observable's value was read. Advances only on a succeeded run,
+	// stamped by the engine.
 	LastSeen time.Time
 
 	// LastAttempt is the most recent run that finished; NextAttempt is the one that has not,
