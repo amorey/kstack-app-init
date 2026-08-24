@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // fakeKubeconfig resolves each context to a key the test controls, standing in for the user's
@@ -38,6 +39,8 @@ type fakeKubeconfig struct {
 	err    error
 	hub    *watch.Hub[*api.Config]
 	onRead func()
+	// reads names each context read, for a test counting them rather than their answers.
+	reads *testutil.Probe[string]
 }
 
 // resolving is a kubeconfig where each context resolves to the key beside it.
@@ -76,6 +79,9 @@ func (f *fakeKubeconfig) RESTConfig(contextName string) (*rest.Config, string, e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.reads != nil {
+		f.reads.Fire(contextName)
+	}
 	if fn := f.onRead; fn != nil {
 		f.onRead = nil
 		fn()
@@ -292,22 +298,23 @@ func TestAcquireAsksForANewContextsPresence(t *testing.T) {
 // A later holder joins what the first one's check found rather than asking for another.
 func TestAcquireAsksOnlyForANewContext(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
-	work := s.presenceHub.Receiver()
-	defer work.Close()
 
 	first := s.Acquire("prod")
 	defer first.Release()
-	ev, err := work.RecvContext(within(t))
-	require.NoError(t, err)
-	require.Equal(t, "prod", ev.Key)
+	contextName, ok := s.presence.Next(within(t))
+	require.True(t, ok)
+	require.Equal(t, "prod", contextName)
+	// Given back first: a key added while held is queued behind the pass rather than delivered,
+	// which would hide the very ask this test is looking for.
+	s.presence.Done(contextName)
 
 	second := s.Acquire("prod")
 	defer second.Release()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	_, err = work.RecvContext(ctx)
-	assert.ErrorIs(t, err, context.DeadlineExceeded, "a second holder asked for a read")
+	_, ok = s.presence.Next(ctx)
+	assert.False(t, ok, "a second holder asked for a read")
 }
 
 // A receiver is bound to its key for life, and a claim's key is its context — which never moves,
@@ -461,18 +468,34 @@ func TestAReadIsNotCommittedToAReplacementClaim(t *testing.T) {
 	assert.False(t, second.Departed(), "answered about the claim that went away, not this one")
 }
 
-// The ask a claim makes before Start survives until the loop runs. Asserted on the queue
-// directly, because end to end it is also covered by the kubeconfig watch: subscribing to a
-// gochan hub delivers its seed, so Start enqueues every claimed context anyway. That is a
+// The ask a claim makes before Start waits in the queue for the worker Start takes. Asserted on
+// the queue directly, because end to end it is also covered by the kubeconfig watch: subscribing
+// to a gochan hub delivers its seed, so Start enqueues every claimed context anyway. That is a
 // second mechanism in another package, not a guarantee this one makes.
 func TestAClaimTakenBeforeStartStaysQueued(t *testing.T) {
 	s := New(resolving("staging", "key-1")) // "prod" is not named
 
 	defer s.Acquire("prod").Release()
 
-	ev, err := s.presenceWork.RecvContext(within(t))
-	require.NoError(t, err)
-	assert.Equal(t, "prod", ev.Key)
+	contextName, ok := s.presence.Next(within(t))
+	require.True(t, ok)
+	assert.Equal(t, "prod", contextName)
+}
+
+// An ask that lands while a read is in flight gets a read of its own. That read had already
+// passed the file when the change happened, so answering the ask with it would report a file
+// nothing observed.
+func TestAnAskArrivingDuringAReadIsReadAgain(t *testing.T) {
+	cfg := resolving("prod", "key-1")
+	cfg.reads = testutil.NewProbe[string](4)
+	s := New(cfg)
+	startService(t, s)
+
+	cfg.duringRead(func() { s.presence.Add("prod") })
+	defer s.Acquire("prod").Release()
+
+	assert.Equal(t, "prod", cfg.reads.Await(t, "the claim's read"))
+	assert.Equal(t, "prod", cfg.reads.Await(t, "the read the mid-flight ask earned"))
 }
 
 // And it is read once the loop runs, so a context that had already gone does not sit reported

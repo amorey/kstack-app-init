@@ -45,6 +45,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/workqueue"
 )
 
 // kubeconfigService is the reader this package asks whether a context still resolves, and which
@@ -108,13 +109,10 @@ type Service struct {
 	// Both keyed by context, both fed by one publish.
 	signalHub *conflate.Hub[string, struct{}]
 	stateHub  *watch.Hub[string, State]
-	// presenceHub is the work queue: a context whose presence in the kubeconfig has to be
-	// re-read. Keyed and coalescing, so a burst asks once.
-	//
-	// presenceWork is its receiver, taken in New rather than in Start: a send with no
-	// receiver is dropped, so a claim taken before the loop runs would never be checked.
-	presenceHub  *conflate.Hub[string, struct{}]
-	presenceWork Subscription
+	// presence queues the contexts whose presence in the kubeconfig has to be re-read. A
+	// queue and not a bus: what it holds outlives the gap before Start runs the worker, so a
+	// claim taken in that window is still checked.
+	presence *workqueue.Queue[string]
 
 	// mu guards claimed and the entries in it together: a holder count and a departed flag
 	// are read against each other, and nothing may see one without the other.
@@ -138,14 +136,12 @@ type entry struct {
 
 // New returns a Service over the one reader of the user's kubeconfig.
 func New(kubecfgSvc kubeconfigService) *Service {
-	presenceHub := conflate.New[string, struct{}]()
 	return &Service{
-		kubecfgSvc:   kubecfgSvc,
-		signalHub:    conflate.New[string, struct{}](),
-		stateHub:     watch.New[string, State](),
-		presenceHub:  presenceHub,
-		presenceWork: presenceHub.Receiver(),
-		claimed:      map[string]*entry{},
+		kubecfgSvc: kubecfgSvc,
+		signalHub:  conflate.New[string, struct{}](),
+		stateHub:   watch.New[string, State](),
+		presence:   workqueue.New[string](),
+		claimed:    map[string]*entry{},
 	}
 }
 
@@ -167,7 +163,7 @@ func (s *Service) Acquire(contextName string) Lease {
 	s.mu.Unlock()
 
 	if !held {
-		s.presenceHub.Sender().Send(contextName, struct{}{})
+		s.presence.Add(contextName)
 	}
 	return &claim{svc: s, contextName: contextName, entry: e}
 }
@@ -178,17 +174,14 @@ func (s *Service) Subscribe() Subscription { return s.signalHub.Receiver() }
 
 // Start runs the two loops: the one that reads presence, and the watch that asks it to read
 // again as the kubeconfig moves. The kubeconfig subscription is taken before Start returns, so
-// nothing it says in between is dropped. The presence queue's receiver was taken in New, so a
-// claim taken before Start is served once the loop runs.
+// nothing it says in between is dropped; the presence queue needs no such care, since it holds
+// what a claim taken before Start asked for until the worker arrives.
 func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 	// Not Start's context, which bounds startup: this one bounds the loops, so it lives until
 	// the stop func cancels them.
 	loopCtx, stopLoop := context.WithCancel(context.Background())
 
-	s.wg.Go(func() {
-		defer s.presenceWork.Close()
-		s.presenceLoop(loopCtx, s.presenceWork)
-	})
+	s.wg.Go(func() { s.presenceLoop(loopCtx) })
 
 	cfgs := s.kubecfgSvc.Subscribe()
 	s.wg.Go(func() {
@@ -205,7 +198,12 @@ func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 // Close drops what the pool holds. Claims are not released for their holders: a claim outliving
 // the pool is the holder's bug, and reading as nothing known is what a dropped entry already
 // does.
+//
+// Closing the presence queue is what stops it accumulating: past here nothing works it off, and a
+// held claim still adds to it on every kubeconfig change.
 func (s *Service) Close() error {
+	s.presence.Close()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -213,20 +211,20 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// presenceLoop reads one context at a time until stopped. Serial on purpose: two reads of one
-// context racing could commit the older answer over the newer, leaving a claim reporting a
-// context the file has since named again.
-func (s *Service) presenceLoop(ctx context.Context, work Subscription) {
+// presenceLoop reads one context at a time until stopped. One worker on purpose: two reads of one
+// context racing could commit the older answer over the newer, leaving a claim reporting a context
+// the file has since named again.
+//
+// Done is what re-arms the context: an add that lands mid-read is queued behind it rather than
+// folded into a read that had already passed the kubeconfig.
+func (s *Service) presenceLoop(ctx context.Context) {
 	for {
-		select {
-		case <-ctx.Done():
+		contextName, ok := s.presence.Next(ctx)
+		if !ok {
 			return
-		case ev, ok := <-work.Chan():
-			if !ok {
-				return
-			}
-			s.checkPresence(ev.Key)
 		}
+		s.checkPresence(contextName)
+		s.presence.Done(contextName)
 	}
 }
 
@@ -246,7 +244,7 @@ func (s *Service) watchKubeconfig(ctx context.Context, cfgs kubeconfig.Subscript
 				return
 			}
 			for _, contextName := range s.claimedContexts() {
-				s.presenceHub.Sender().Send(contextName, struct{}{})
+				s.presence.Add(contextName)
 			}
 		}
 	}

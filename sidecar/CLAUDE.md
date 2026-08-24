@@ -12,7 +12,7 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 - `internal/app/` — **composition root**: builds `poke.Service`, `kubeconfig.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → kubeconfig → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain. **kubeconfig before cluster is load-bearing** — `kubeconfig.Service.Start` reads synchronously, so every cluster reconcile observes a read config, and `app_test.go` pins it. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
-- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `kubeconn` (a pool nothing builds — see below), `drain`, `lifecycle` (the start/stop/close shape every level wears), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
+- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `kubeconn` (a pool nothing builds — see below), `drain`, `lifecycle` (the start/stop/close shape every level wears), `workqueue` (keyed work, delivered to one worker), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
@@ -262,12 +262,17 @@ already there. Unchanged answers publish nothing, or every kubeconfig write woul
 and re-announce every departed context forever. An **unread** kubeconfig names nothing and is
 deliberately not a departure.
 
-**Presence is asked for, never read on the caller's thread.** `Acquire` sends the context on
-`presenceHub` — a `gobus/conflate` work queue, keyed and coalescing — **only when the claim is the
-first**, since a later holder joins what the first one's check found. `presenceLoop` reads them
-**one at a time**: two reads of one context racing could record the older answer over the newer.
-The kubeconfig watch enqueues every claimed context on a change rather than working out which
-moved, because that is what the check does anyway.
+**Presence is asked for, never read on the caller's thread.** `Acquire` adds the context to
+`presence` — an `internal/workqueue` queue — **only when the claim is the first**, since a later
+holder joins what the first one's check found. `presenceLoop` runs **one worker**: two reads of one
+context racing could record the older answer over the newer. It calls `Done` after each read, which
+is what re-arms a context an add reached mid-read. The kubeconfig watch adds every claimed context
+on a change rather than working out which moved, because that is what the check does anyway.
+
+**A queue and not a bus**, which is what lets `Start` alone run the worker loop: queued work
+outlives the gap before it, where a bus would drop a send nobody was receiving and leave a claim
+taken in that window never checked. `Service.Close` closes the queue — past there nothing works it
+off, and a held claim still adds on every kubeconfig change.
 
 **The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
 `Connection`, `ConnIdentity`, `ConnState`, `ConnStateSubscription`. Aliases because an
@@ -722,6 +727,14 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
 
 - **Resolver deps are always non-nil** — the composition root wires every field; tests use fakes.
 - **Pub/sub**: two modules, split on whether delivery is **keyed**. Unkeyed → `github.com/amorey/gochan`: `watch` for latest-value current-state streams (current snapshot on subscribe: auth `State`), `broadcast` for fan-out where subscribers supply their own snapshot (poke). Keyed → `github.com/amorey/gobus`: `watch` for a keyed latest-value bus. Note the two `watch` packages differ on registration — gochan's hub holds a seed and delivers it, gobus's delivers nothing until the next send (a subscriber that has already read the current value can pass it as a baseline, which is measured against and never delivered back). Never hand-roll a subscriber map.
+- **Work to do is a queue, not a bus** — `internal/workqueue`, one `Queue` per job: producers call
+  `Add`, each worker goroutine loops on `Next`. Reach for it when a key names a pass someone must
+  run rather than news everyone should hear: a key goes to **one** worker, queued work survives
+  having no worker running, a key waits once however many times it is added, and one added while a
+  worker holds it is queued afresh on `Done` rather than folded into a pass that could not have
+  seen it. A bus gets all four wrong for this job — which is what the `kubeconn` presence queue was
+  built out of, and where two of them were found. `Done` is owed for every key taken, or that key
+  never comes back.
 - **Subscription resolvers** return a channel emitting the current snapshot first, then deltas (`mapStream` in `graph/util.go`). Honor `ctx.Done()`. A resolver over a `*clustersvc.Stream` goes through **`watchStream`** (`graph/watch_failure.go`), never `ptrStream` — see below.
 - **Unexported functional options** for test seams (`auth`/`cloud`/`prefsync`/`poke`): exported `New` takes production knobs only; `newWithOptions(cfg, opts...)` is reachable only from white-box tests.
 
