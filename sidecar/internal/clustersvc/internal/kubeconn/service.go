@@ -12,403 +12,118 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package kubeconn holds the connections everything in this service talks to a cluster over,
-// and the probe that keeps them validated.
+// Package kubeconn hands out leases on kube-contexts, and tells a lease's holders when the
+// context it names leaves the kubeconfig.
 //
-// **One context, one connection, one probe.** Contexts that resolve alike are not merged: two
-// aimed at one server as one user get a socket each, which costs a handshake and a probe cycle
-// and buys a store that is one map, attribution that needs no apportioning, and a failure that
-// belongs to one caller. The credential helper is not duplicated with them — client-go caches
-// exec authenticators process-wide by exec config, below anything here.
+// That is the whole of it today. The connection a lease will eventually hand out, and the probe
+// that will validate it, are not here — every claim reads as nothing known, and Lease.Conn
+// reports ErrNoConnection. What is here is the bookkeeping those need: who holds what, and what
+// the kubeconfig still says about it.
 //
-// **A connection is scoped to one identity.** Credentials that move build a new connection; an
-// unchanged fingerprint answering as a different server, version, or user retires the
-// connection and builds another. So Identity is a field rather than a question a holder has to
-// keep re-asking.
+// **One context, one entry.** Contexts that resolve to the same credentials are not merged: two
+// aimed at one server as one user get an entry each, which costs a socket and a probe cycle once
+// those exist, and buys a store that is one map, measurements that need no apportioning, and a
+// failure that belongs to one caller.
+//
+// **A claim outlives what it is a claim on.** The kubeconfig can stop naming a context while a
+// holder still holds it — the user deleted it, or is mid-edit — and the entry stays, because the
+// file may name it again and the claim is how the holder hears about that. Only releasing drops
+// an entry.
 //
 // **It never learns what a cluster is.** The caller names a kube-context; this package speaks
-// contexts, connections, and whatever a probe read back. One address can front two clusters and
-// nothing here can tell them apart — whether the server that answered is the one the caller
-// meant is the caller's to decide, off Connection.Identity.
-//
-// **Everything a holder learns comes through its Lease**, which is the context it named. Both
-// hubs publish under that same context.
-//
-// **Nothing dials yet.** Acquire hands back a claim, but no connection is built and no probe
-// runs behind it, so every claim reads as nothing known. The connections and the probe are what
-// land next.
+// contexts and whatever the kubeconfig says about them. Whether the server behind one is the
+// cluster the caller meant is the caller's to decide.
 package kubeconn
 
 import (
 	"context"
-	"net/http"
-	"net/url"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gobus/watch"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
-// kubeconfigService resolves one context to a connection and the fingerprint naming it, and
-// reports when the file behind it changed. The fingerprint covers everything that decides what
-// a socket is — server, TLS, auth, proxy — so an unchanged one means the connection this
-// context holds is still the one its credentials name.
-//
-// One RESTConfig call is one snapshot. Resolving a context twice can key one snapshot's proxy
-// URL onto another's credentials, so a re-key reads each context once and lets the next signal
-// correct a straggler.
+// kubeconfigService is the reader this package asks whether a context still resolves, and which
+// tells it when the file changed. The fingerprint it returns beside the config names the
+// connection those credentials describe; nothing here uses it until connections come back.
 type kubeconfigService interface {
 	RESTConfig(contextName string) (*rest.Config, string, error)
 	Subscribe() kubeconfig.Subscription
 }
 
-// Reason classifies the most recent attempt at one check. Ours, in the style of a Kubernetes
-// condition reason: CamelCase, stable, safe to switch on. Free-form detail belongs in Message.
+// Subscription reports the contexts whose news changed, one event per context, for a reader
+// whose reaction to any of them is the same: go re-read that claim.
 //
-// **It spans layers on purpose.** A check dies at the transport, in an API response, or on a
-// rule of ours, and a caller asks why once — so a TLS failure and a 403 and a skipped check are
-// one vocabulary. Some names match metav1.StatusReason because that is the same word for the
-// same thing, not because this is that set: it has no word for a certificate we rejected.
-//
-// Assigned when the attempt completes, because the classification is not recoverable later:
-// Err arrives wrapped, and does not survive the trip to a caller that only sees a copy.
-//
-// **Classify from the typed error where there is one.** Dynamic returns *apierrors.StatusError,
-// which carries the API's own reason; only the raw endpoints (/readyz, /version) leave a status
-// code as the sole evidence. One switch over status codes for both would discard what the typed
-// half already knows.
-type Reason string
-
-const (
-	// ReasonUnknown is the zero value: no attempt has completed.
-	ReasonUnknown Reason = ""
-	// ReasonSucceeded means the attempt returned usable data.
-	ReasonSucceeded Reason = "Succeeded"
-
-	// ReasonUnreachable is DNS failure, connection refused, or no route — nothing answered.
-	ReasonUnreachable Reason = "Unreachable"
-	// ReasonTLSInvalid means the server answered and its certificate was rejected.
-	ReasonTLSInvalid Reason = "TLSInvalid"
-	// ReasonTimeout means the check's own deadline expired. Told apart from ReasonCanceled
-	// because the deadline was ours: the caller is still waiting and this is news about the
-	// cluster.
-	ReasonTimeout Reason = "Timeout"
-	// ReasonCanceled means the caller went away mid-flight. It says nothing about the
-	// cluster, so it does not count toward Failures.
-	ReasonCanceled Reason = "Canceled"
-
-	// ReasonUnauthorized is a 401: credentials absent, malformed, or expired.
-	ReasonUnauthorized Reason = "Unauthorized"
-	// ReasonForbidden is a 403: authenticated, and not permitted. A grant to fix rather than
-	// an outage to wait out, which is why callers render it differently.
-	ReasonForbidden Reason = "Forbidden"
-
-	// ReasonNotFound means the object a check asked for is absent, such as kube-system.
-	// News about the cluster, and a check that keeps running.
-	ReasonNotFound Reason = "NotFound"
-	// ReasonUnsupported means the endpoint itself is absent — SelfSubjectReview before v1.27,
-	// or a managed distribution withholding /readyz. Terminal: the check suspends.
-	//
-	// The trap: both arrive as a 404, and only the check knows which it asked for. Classifying
-	// on the status code alone suspends a check that should have kept running.
-	ReasonUnsupported Reason = "Unsupported"
-	// ReasonInternalError is a 500: the API server hit a fault serving the request.
-	ReasonInternalError Reason = "InternalError"
-	// ReasonServiceUnavailable is a 503, the routine one — a control plane restarting or
-	// mid-upgrade. Told apart from ReasonInternalError because it is expected and passes on
-	// its own, which is what a caller renders differently and what a backoff waits out.
-	ReasonServiceUnavailable Reason = "ServiceUnavailable"
-	// ReasonThrottled is a 429, or a client-side rate limiter delay past the check timeout.
-	ReasonThrottled Reason = "Throttled"
-	// ReasonMalformed means a response arrived and would not parse, which usually means a
-	// proxy or captive portal between us and the API server.
-	ReasonMalformed Reason = "Malformed"
-
-	// ReasonComponentsFailing means /readyz answered and named components not ok. The check
-	// worked and the cluster is not fit to use; ComponentStatus.Failing says which.
-	ReasonComponentsFailing Reason = "ComponentsFailing"
-	// ReasonDependencyFailed means the check was recorded rather than attempted, because the
-	// connection it needs had already failed this cycle. It marks the cycle a check went from
-	// running to suspended; the cycles after it schedule nothing at all, which is what keeps a
-	// dead cluster costing one timeout per cycle instead of one per check.
-	ReasonDependencyFailed Reason = "DependencyFailed"
-	// ReasonInternal is a bug here.
-	ReasonInternal Reason = "Internal"
-)
-
-// Attempt is one run of one check, from scheduled through finished. Its fields fill in that
-// order, so the same value describes a run at every stage of its life and Observation needs no
-// second type for the one that has not finished.
-//
-// Immutable once FinishedAt is set, which is what makes Latency safe to derive.
-type Attempt struct {
-	// ScheduledAt is when this run should start. It is the backoff ladder made visible: a
-	// caller renders the wait, and successive values show the interval widening.
-	ScheduledAt time.Time
-	// StartedAt is when it did start, FinishedAt when it ended. Both zero until they happen,
-	// and told apart from ScheduledAt on purpose — a saturated prober lets a scheduled time
-	// slip into the past, which would otherwise read as running.
-	StartedAt  time.Time
-	FinishedAt time.Time
-	// Reason and Message classify the outcome, success included; Err is the raw error, nil on
-	// success. Reason and Message are the durable record — Err arrives wrapped and is for a
-	// caller close enough to unwrap it. All three are unset until the run finishes.
-	Reason  Reason
-	Message string
-	Err     error
-}
-
-// Running reports whether this run has started and not finished.
-func (a Attempt) Running() bool { return !a.StartedAt.IsZero() && a.FinishedAt.IsZero() }
-
-// Done reports whether this run has finished, which is what makes Reason readable.
-func (a Attempt) Done() bool { return !a.FinishedAt.IsZero() }
-
-// Latency is how long the run took. Zero until it finishes, and zero for one that was
-// recorded without being dispatched — a DependencyFailed run has no duration to report.
-func (a Attempt) Latency() time.Duration {
-	if !a.Done() || a.StartedAt.IsZero() {
-		return 0
-	}
-	return a.FinishedAt.Sub(a.StartedAt)
-}
-
-// Observation is one check's last answer and the provenance to judge it.
-//
-// **Value outlives the failure that follows it.** A read that stops being permitted does not
-// mean the fact changed, so Value is what was last seen and LastSeen is when — which is what
-// makes it readable: "identified, as of 10:00" is usable where "ready, as of 10:00" is not.
-//
-// **A check that has never run is the zero value**, which needs no sentinel: a zero LastAttempt
-// is not Done, so every question below already answers for it.
-//
-// **A zero NextAttempt means the check is suspended** — nothing is due, and the last answer
-// stands. The four checks behind the connection are suspended while it is down, since a server
-// nothing reached cannot answer them, and re-armed when it recovers; a check whose last attempt
-// was ReasonUnsupported stays suspended for the life of the connection, because the endpoint is
-// absent rather than failing. So "ready, as of 10:00, nothing due" is a state a reader renders,
-// not one it treats as stalled.
-//
-// **Why it is suspended is LastAttempt.Reason**, which needs no field of its own because a check
-// suspends over what its last attempt found. Suspending therefore has to write one — the cycle
-// that stops scheduling records DependencyFailed rather than going quiet, or the reason is lost.
-type Observation[T any] struct {
-	// Value is the last answer. Meaningless until Known.
-	Value T
-	// LastSeen is when Value was read. Advances only on success.
-	LastSeen time.Time
-
-	// LastAttempt is the most recent run that finished; NextAttempt is the one that has not,
-	// scheduled or already running. A run moves from one to the other as it completes.
-	LastAttempt Attempt
-	NextAttempt Attempt
-
-	// Failures counts consecutive failures and FailingSince is when the run of them began,
-	// which the count cannot give: the ladder widens, so failures do not map to elapsed time.
-	// ReasonCanceled says nothing about the cluster and counts toward neither.
-	Failures     int
-	FailingSince time.Time
-}
-
-// Known reports whether this check has ever answered, which is what makes Value readable.
-func (o Observation[T]) Known() bool { return !o.LastSeen.IsZero() }
-
-// OK reports whether the last finished attempt answered. False while nothing has finished.
-func (o Observation[T]) OK() bool { return o.LastAttempt.Reason == ReasonSucceeded }
-
-// InFlight reports whether a run is under way.
-func (o Observation[T]) InFlight() bool { return o.NextAttempt.Running() }
-
-// Scheduled reports whether another run is due. False for a suspended check.
-func (o Observation[T]) Scheduled() bool { return !o.NextAttempt.ScheduledAt.IsZero() }
-
-// ComponentStatus is what /readyz named when it answered. Empty on a server that is ready.
-type ComponentStatus struct {
-	Failing []string // components not reporting ok
-}
-
-// VersionInfo is the API server's reported version.
-type VersionInfo struct {
-	GitVersion string // "v1.31.4"
-	Major      string
-	Minor      string // carries a "+" suffix on some managed distributions
-}
-
-// Principal is who these credentials authenticate as, per SelfSubjectReview.
-type Principal struct {
-	Username string
-	Groups   []string
-}
-
-// Identity is the three scalars a connection is scoped to. Comparable on purpose: retiring a
-// connection is a == against what the last probe read, and errors are what would break it — so
-// why a part is missing stays on the Observation that could not read it.
-type Identity struct {
-	ServerUID     string
-	ServerVersion string
-	Username      string
-}
-
-// State is what the last probe read about the server behind one entry: five checks that
-// succeed, fail, and go stale independently. Reachability is the only one the others depend on.
-//
-// It says nothing about the connection's own life — whether one is built, retiring, or how many
-// claims hold it. Connection.Done is where that surfaces.
-//
-// A value copy, but a shallow one — the slices inside are the prober's and must not be
-// mutated, since every watcher holds the same backing array.
-type State struct {
-	Connection    Observation[string] // the API server URL that answered
-	Readiness     Observation[ComponentStatus]
-	ServerUID     Observation[string] // kube-system's UID, conventionally the cluster's
-	ServerVersion Observation[VersionInfo]
-	Principal     Observation[Principal]
-}
-
-// Phase is how far the last attempt to reach the server got. The other four checks report
-// themselves; this one is separate because they are only worth reading once it is PhaseProbed.
-type Phase int
-
-const (
-	// PhasePending means nothing has completed yet.
-	PhasePending Phase = iota
-	// PhaseUnreached means the last attempt did not reach the server.
-	PhaseUnreached
-	// PhaseProbed means it did.
-	PhaseProbed
-)
-
-// Phase reports how far the last attempt got.
-func (s State) Phase() Phase {
-	switch {
-	case !s.Connection.LastAttempt.Done():
-		return PhasePending
-	case s.Connection.OK():
-		return PhaseProbed
-	default:
-		return PhaseUnreached
-	}
-}
-
-// Identity is the scope built from the checks that have answered. A part no probe could read
-// is empty, which is how it compares equal to another connection missing the same part.
-func (s State) Identity() Identity {
-	return Identity{
-		ServerUID:     s.ServerUID.Value,
-		ServerVersion: s.ServerVersion.Value.GitVersion,
-		Username:      s.Principal.Value.Username,
-	}
-}
-
-// Subscription reports the contexts whose State moved, one event per context. Claims are
-// per context, so this is the fleet view of what WatchState reports per claim — same send,
-// both channels.
-//
-// A keyed bus, not a fan-out ring: it holds a slot per context, so a fleet answering at
-// once neither loses a context behind a busier one nor bounds what is remembered by a
-// buffer length. The value carries nothing — the key is the news, and the reader re-reads
-// the claim for what it now says.
+// A keyed bus, not a fan-out ring: it holds a slot per context, so a fleet changing at once
+// neither loses a context behind a busier one nor bounds what is remembered by a buffer length.
+// The value carries nothing — the key is the news.
 type Subscription = *conflate.Receiver[string, struct{}]
 
-// StateSubscription carries each State a probe publishes for one claim. Close it when done —
-// an abandoned one keeps its slot.
+// StateSubscription carries each State a probe publishes for one claim. Close it when done — an
+// abandoned one keeps its slot.
 //
-// **Nothing is delivered on attach.** A watcher reads Lease.State for what is known now and
-// this for what comes after; the bus hands back no current value, so a watcher that only
-// attaches learns nothing until the next probe lands.
+// **Nothing is delivered on attach.** A watcher reads Lease.State for what is known now and this
+// for what comes after; the bus hands back no current value.
 //
 // Keyed by context, not by the credentials behind it. A receiver is bound to its key for life,
-// and credentials move under a context that never does — so keying on the connection would
-// strand a watcher on the one its claim just left.
+// and credentials move under a context that never does.
 //
 // **Every value is a level, never an edge.** The hub keeps the latest per key, so a reader that
 // falls behind skips what came between — a gap means it missed some, not that nothing happened.
-// Transitions are derived from the record's conditions and event timeline, never counted here.
 type StateSubscription = *watch.Receiver[string, State]
 
-// Lease is a claim on one connection, and what keeps its probe running: credentials nobody
-// holds are not probed at all. An interface because it crosses out of this package, where a
-// caller's test has to stand in for a live cluster.
+// Lease is a claim on one kube-context: what keeps the pool tracking it, and how a holder hears
+// about it. An interface because it crosses out of this package, where a caller's test has to
+// stand in for a live cluster.
 type Lease interface {
-	// Conn is the connection, once a probe has validated it.
+	// Conn is the connection to the context's server.
 	//
-	// Credentials whose last probe succeeded answer immediately. Anything else waits for the
-	// probe now running and returns *its* outcome, not a successful one, so a down cluster
-	// answers rather than hanging and the caller decides whether to ask again. It does not
-	// kick: the claim already has the loop probing, on the backoff ladder while the cluster
-	// is down, and kicking per call would flatten it.
+	// Nothing builds one yet, so this always reports ErrNoConnection.
 	Conn(ctx context.Context) (*Connection, error)
 	// State is what the last probe read, check by check. It never dials.
 	//
-	// What the prober reads: it wants the answers themselves rather than a connection, and a
-	// failed check carries a reason no connection could.
+	// Nothing probes yet, so this always reads as nothing known.
 	State() State
-	// WatchState carries every State a probe publishes for this claim — including a failure
-	// whose reason changed. It delivers nothing on attach, so a watcher pairs it with State
-	// for what is known now. Release ends it.
-	//
-	// The same hub Conn parks on, so a watcher and a parked caller cannot disagree, keyed by
-	// the context this claim named.
+	// WatchState carries every State a probe publishes for this claim. It delivers nothing on
+	// attach, so a watcher pairs it with State for what is known now. Release ends it.
 	WatchState() StateSubscription
-	// Release drops the claim, and with it the probe cadence once nothing else holds these
-	// credentials. Idempotent, so it is safe to defer.
+	// Departed reports that the kubeconfig no longer names this claim's context.
+	//
+	// Not an error and not final: the file may name it again, and this claim is how the holder
+	// hears about that. A holder that wants to be told rather than to ask watches Subscribe or
+	// WatchState — both fire when this flips.
+	Departed() bool
+	// Release drops the claim, and the entry with it once nothing else holds the context.
+	// Idempotent, so it is safe to defer.
 	Release()
 }
 
-// Connection is one identity and the clients built over the credentials reaching it. The clients
-// share one http.Client, so they share one connection pool — with HTTP/2 that is a single TCP
-// connection carrying every concurrent request to that API server.
-//
-// Read-only, and it never changes after it is built. A caller that mutates Config is editing
-// what every other holder is using.
-type Connection struct {
-	// Identity is what the probe that validated this connection read, stable for its life: a
-	// probe reading anything different retires it. So a holder that knows which cluster it
-	// means compares before it reads. Nothing here can compare — a context resolving to the
-	// same credentials says nothing about which cluster is behind them.
-	Identity Identity
-	// Config is what the clients below were built from. Exposed for the client-go
-	// constructors that take one and build their own transport (exec, port-forward);
-	// anything that can use Dynamic or HTTPClient should.
-	Config *rest.Config
-	// BaseURL is Config.Host resolved to an absolute URL, carrying the scheme and any path
-	// prefix; APIPath is the versioned path beside it. Raw paths join onto them.
-	BaseURL *url.URL
-	APIPath string
-	// HTTPClient is authenticated and pooled. Raw API paths go through it directly, and
-	// unthrottled: the QPS bucket lives in rest.RESTClient, so it reaches Dynamic alone.
-	HTTPClient *http.Client
-	Dynamic    dynamic.Interface
-
-	// done closes when this connection is retired. Nil in a connection nobody built, which
-	// reads as never retired.
-	done chan struct{}
-}
-
-// Done closes when a probe reads a different Identity and this connection is retired.
-//
-// For the holder nothing else reaches: a long-lived stream is blocked in a read, so a field it
-// is not re-reading cannot tell it that what it derived here no longer holds. A caller that asks
-// per operation re-calls Lease.Conn instead.
-func (c *Connection) Done() <-chan struct{} { return c.done }
-
-// Service is the pool the cluster service dials through.
+// Service is the pool the cluster service leases contexts from.
 type Service struct {
 	kubecfgSvc kubeconfigService
-	// signalHub names the contexts whose state moved and carries nothing else; stateHub
-	// carries what they now say. Both keyed by context, both fed by one send.
+	// signalHub names the contexts whose news changed; stateHub carries what a probe read.
+	// Both keyed by context, both fed by one publish.
 	signalHub *conflate.Hub[string, struct{}]
 	stateHub  *watch.Hub[string, State]
+	// presenceHub is the work queue: a context whose presence in the kubeconfig has to be
+	// re-read. Keyed by context and coalescing, so a burst asks once.
+	//
+	// presenceWork is its receiver, taken in New rather than in Start: a send with no receiver
+	// is dropped, so a claim taken before the loop runs would never be checked.
+	presenceHub  *conflate.Hub[string, struct{}]
+	presenceWork Subscription
 
-	// mu guards the map, and an entry's fields with it: a rotation replaces the fingerprint
-	// and the state together, and nothing may read one against the other.
+	// mu guards the map and the entries in it together: a holder count and a presence flag are
+	// read against each other, and nothing may see one without the other.
 	mu sync.Mutex
 	// claimed is one entry per claimed context — a key is here exactly while someone holds
 	// that context — and is also the key both hubs publish under.
@@ -417,86 +132,71 @@ type Service struct {
 	wg sync.WaitGroup
 }
 
-// entry is what the pool holds for one claimed context: how many hold it, and what the probe
-// last read. holders and the state are one record because a context has exactly one of each,
-// which is what keeps the pool a single map.
+// entry is what the pool holds for one claimed context.
 type entry struct {
 	holders int
-	state   State
+	// departed is what the last read of the kubeconfig said: false while the file names this
+	// context, true once it stops. Flipping it is the news this package exists to deliver.
+	departed bool
+	// state is what a probe read. Nothing probes, so it stays zero.
+	state State
 }
 
 // New returns a Service over the one reader of the user's kubeconfig.
 func New(kubecfgSvc kubeconfigService) *Service {
+	presenceHub := conflate.New[string, struct{}]()
 	return &Service{
-		kubecfgSvc: kubecfgSvc,
-		signalHub:  conflate.New[string, struct{}](),
-		stateHub:   watch.New[string, State](),
-		claimed:    map[string]*entry{},
+		kubecfgSvc:   kubecfgSvc,
+		signalHub:    conflate.New[string, struct{}](),
+		stateHub:     watch.New[string, State](),
+		presenceHub:  presenceHub,
+		presenceWork: presenceHub.Receiver(),
+		claimed:      map[string]*entry{},
 	}
 }
 
-// Subscribe reports every context whose State moves, for a reader whose reaction to any of
-// them is the same. A holder that cares about one claim watches that claim instead.
+// Acquire claims contextName and hands back the lease on it. It never fails and never waits: a
+// context the kubeconfig does not name yet is claimable, because the file may name it later and
+// the claim is how the holder finds out.
 //
-// Nothing probes yet, so the only thing that moves is the kubeconfig: a context whose
-// credentials rotated, or that stopped resolving.
-func (s *Service) Subscribe() Subscription { return s.signalHub.Receiver() }
-
-// Acquire claims contextName's connection and arms its probe cadence. It does not dial, and it
-// does not resolve — Lease.Conn is what waits, so a caller may hold a claim across a cluster
-// being down, a kubeconfig that has not been read, or a context that does not exist yet.
-// Release the claim.
-//
-// **A claim is answerable before it is answerable-with-anything.** Whether the context resolves,
-// and to what, is the pool's to find out on its own schedule and report through Lease.State —
-// never a reason to refuse the claim, since every one of those answers can change without the
-// holder doing anything.
-//
-// A claim is on the context, not on the credentials it resolved to. Credentials rotate under a
-// context that never moves, so a claim pinned to them would report the server it used to reach
-// for as long as it is held.
+// A new context's presence is asked for, never read here: reading the kubeconfig is not work to
+// do on the caller's thread or under this lock. A later holder joins what the first one's check
+// found and asks for nothing.
 func (s *Service) Acquire(contextName string) Lease {
-	s.claimContext(contextName)
-	return &claim{svc: s, contextName: contextName}
-}
-
-// claimContext counts a holder on contextName, building its entry if this is the first. The
-// only thing that creates one.
-func (s *Service) claimContext(contextName string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	e, ok := s.claimed[contextName]
-	if !ok {
+	e, held := s.claimed[contextName]
+	if !held {
 		e = &entry{}
 		s.claimed[contextName] = e
 	}
 	e.holders++
-}
+	s.mu.Unlock()
 
-// stateOf is what the claim on contextName reads. A context with no connection has nothing read
-// about it, which is what a claim awaiting its first resolve reports.
-func (s *Service) stateOf(contextName string) State {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if e := s.claimed[contextName]; e != nil {
-		return e.state
+	if !held {
+		s.presenceHub.Sender().Send(contextName, struct{}{})
 	}
-	return State{}
+	return &claim{svc: s, contextName: contextName, entry: e}
 }
 
-// releaseContext gives back one holder's claim on contextName, dropping the context once the
-// last one goes. An entry nobody holds is one nothing probes.
+// Subscribe reports every context whose news changed, for a reader whose reaction to any of them
+// is the same. A holder that cares about one claim watches that claim instead.
+func (s *Service) Subscribe() Subscription { return s.signalHub.Receiver() }
+
+// releaseContext gives back one holder's claim on contextName, dropping the entry once the last
+// one goes. An entry nobody holds is one nothing tracks.
 //
-// The decrement and the drop are one critical section: a claim taken between them would be on
-// an entry this call then deletes, and would read as nothing known for as long as it is held.
-func (s *Service) releaseContext(contextName string) {
+// **Only the entry the claim was made for.** Close drops entries out from under the leases still
+// holding them, so a lease released afterwards would otherwise decrement whatever has claimed
+// its name since — and could delete an entry belonging to a claim that has nothing to do with it.
+//
+// The decrement and the drop are one critical section: a claim taken between them would be on an
+// entry this call then deletes, and would read as nothing known for as long as it is held.
+func (s *Service) releaseContext(contextName string, held *entry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e := s.claimed[contextName]
-	if e == nil {
+	if e != held {
 		return
 	}
 	e.holders--
@@ -505,23 +205,116 @@ func (s *Service) releaseContext(contextName string) {
 	}
 }
 
-// claim is one holder's claim on the credentials a context names. It holds the context and
-// never the entry: re-keying moves the entry underneath, and a claim pinned to one would
-// report the server it used to reach for as long as it is held.
+// checkPresence re-reads whether the kubeconfig still names contextName, and tells its holders
+// if that changed. **The one thing this service does.**
+//
+// Read outside the lock: RESTConfig reads the shared config, and holding this pool's lock across
+// it would order every reader behind that read.
+//
+// **Only a missing context is a departure.** ErrContextNotFound is the one error that means the
+// file stopped naming it; every other resolve failure — a cluster entry it points at that is
+// gone, credentials that will not load — is a context the file still names and a file the user
+// has to fix. Reporting those as departures would say the context left when it did not.
+//
+// An unread kubeconfig names nothing, and is not a departure either. Reporting one would tell
+// every holder its context is gone for as long as the first read takes.
+func (s *Service) checkPresence(contextName string) {
+	// Taken before the read so the commit can tell whether it is still answering about this
+	// entry, and skipped entirely for a context nobody claims.
+	held := s.entryFor(contextName)
+	if held == nil {
+		return
+	}
+
+	_, _, err := s.kubecfgSvc.RESTConfig(contextName)
+	if errors.Is(err, kubeconfig.ErrNotRead) {
+		return
+	}
+	s.setDeparted(contextName, held, errors.Is(err, kubeconfig.ErrContextNotFound))
+}
+
+func (s *Service) entryFor(contextName string) *entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.claimed[contextName]
+}
+
+// setDeparted records what the read found and, when that was news, tells contextName's holders.
+//
+// **Only onto the entry the read was taken for.** The last holder can release while a read is in
+// flight and another caller re-claim the same name, and the entry it gets is a different one —
+// answering it from a read that predates it would depart a claim over a context nobody asked
+// about. Serializing the queue does not cover this: what raced is a release, not another read.
+//
+// **Committed and announced under one lock**, for the same reason: releasing it between the two
+// would publish the old read as news for whatever claimed the name next. Both sends are safe
+// here — each takes only its own hub's lock, fans out into receiver slots, and calls no code of
+// ours, so neither blocks on a consumer.
+//
+// A context already in this state is unchanged: every kubeconfig write would otherwise
+// re-announce every departed context for as long as its claim is held.
+func (s *Service) setDeparted(contextName string, held *entry, departed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.claimed[contextName]
+	if e != held || e.departed == departed {
+		return
+	}
+	e.departed = departed
+
+	// State first, so a reader the poke wakes finds the value already published rather than the
+	// one it replaced.
+	s.stateHub.Sender().Send(contextName, e.state)
+	s.signalHub.Sender().Send(contextName, struct{}{})
+}
+
+// stateOf is what the claim on contextName reads, and departedContext whether its context is
+// still named. Both answer for an entry the pool no longer holds — released, or dropped by
+// Close — which is what a claim outliving its entry reads.
+func (s *Service) stateOf(contextName string, held *entry) State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.claimed[contextName] == held {
+		return held.state
+	}
+	return State{}
+}
+
+func (s *Service) departedContext(contextName string, held *entry) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.claimed[contextName] == held {
+		return held.departed
+	}
+	return true
+}
+
+// claim is one holder's claim on the context it named, and on the entry it was given. It carries
+// both because a context outlives its entries: what a claim may read and release is the one it
+// was made for, never whatever has the name now.
 type claim struct {
 	svc         *Service
 	contextName string
+	entry       *entry
 
 	released atomic.Bool
 }
 
-func (c *claim) Conn(context.Context) (*Connection, error) { panic("nothing dials yet") }
+func (c *claim) Conn(context.Context) (*Connection, error) {
+	return nil, fmt.Errorf("%w: %q", ErrNoConnection, c.contextName)
+}
 
-func (c *claim) State() State { return c.svc.stateOf(c.contextName) }
+func (c *claim) State() State { return c.svc.stateOf(c.contextName, c.entry) }
+
+func (c *claim) Departed() bool { return c.svc.departedContext(c.contextName, c.entry) }
 
 // WatchState takes no baseline: the hub compares against one only through an Accept, and this
-// one has none, so every value is delivered. What a baseline is for — reading and registering
-// in one critical section, so a probe landing between the two is not skipped — is worth having
+// one has none, so every value is delivered. What a baseline is for — reading and registering in
+// one critical section, so a publish landing between the two is not skipped — is worth having
 // once a probe can land at all.
 func (c *claim) WatchState() StateSubscription {
 	return c.svc.stateHub.Watch(c.contextName)
@@ -529,40 +322,32 @@ func (c *claim) WatchState() StateSubscription {
 
 func (c *claim) Release() {
 	if c.released.CompareAndSwap(false, true) {
-		c.svc.releaseContext(c.contextName)
+		c.svc.releaseContext(c.contextName, c.entry)
 	}
 }
 
-// rekey points every claim at the entry for the credentials its context resolves to now, and
-// is what makes a claim outlive the credentials it was taken against. A claim whose key moved
-// leaves its old entry; an entry nothing claims stops probing, and the connection it built
-// retires so a stream on it learns rather than reading from a server the caller no longer means.
+// Start runs the two loops: the one that reads presence, and the watch that asks it to read again
+// as the kubeconfig moves. The kubeconfig subscription is taken before Start returns, so nothing
+// it says in between is dropped.
 //
-// The signal and not the probe cycle, because a claim on a down cluster is deep in the backoff
-// ladder: a user who just fixed their kubeconfig would otherwise wait it out, which is the one
-// moment they want the retry now. A rotation builds a different connection, so its ladder
-// starts fresh.
-//
-// The config is the signal, never the source: resolving goes back through RESTConfig, which
-// is what computes a fingerprint at all.
-func (s *Service) rekey() {
-	// Nothing to record yet. What a context resolves to now is the probe's to read and
-	// report; a claim is held whether or not the file still names it, and dropping one here
-	// would orphan a holder that is still holding.
-}
-
-// Start watches the kubeconfig until stopped, re-keying claims as the file moves under them.
-// The subscription is established before Start returns, so a config already read is applied
-// once rather than waited for.
+// **A claim taken before Start is served once it runs.** The queue's receiver is taken in New,
+// because a send with no receiver is dropped — a claim made before Start would otherwise never be
+// checked, and a context that had already gone would read as present until some later kubeconfig
+// change happened to ask again.
 func (s *Service) Start(context.Context) (func(context.Context) error, error) {
-	// Not Start's context, which bounds startup: this one bounds the loop, so it lives until
-	// the stop func cancels it.
+	// Not Start's context, which bounds startup: this one bounds the loops, so it lives until
+	// the stop func cancels them.
 	loopCtx, stopLoop := context.WithCancel(context.Background())
 
-	sub := s.kubecfgSvc.Subscribe()
 	s.wg.Go(func() {
-		defer sub.Close()
-		s.watchKubeconfig(loopCtx, sub)
+		defer s.presenceWork.Close()
+		s.presenceLoop(loopCtx, s.presenceWork)
+	})
+
+	cfgs := s.kubecfgSvc.Subscribe()
+	s.wg.Go(func() {
+		defer cfgs.Close()
+		s.watchKubeconfig(loopCtx, cfgs)
 	})
 
 	return func(ctx context.Context) error {
@@ -571,30 +356,64 @@ func (s *Service) Start(context.Context) (func(context.Context) error, error) {
 	}, nil
 }
 
-// watchKubeconfig re-keys on every config until stopped. Cancellation ends the wait: the
-// service behind the feed is the app's and is not required to close its channel when released.
-func (s *Service) watchKubeconfig(ctx context.Context, sub kubeconfig.Subscription) {
+// presenceLoop reads one context at a time until stopped. **Serial on purpose**: two reads of one
+// context racing could record the older answer over the newer, leaving a claim reporting a
+// context the file has since named again.
+func (s *Service) presenceLoop(ctx context.Context, work Subscription) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-sub.Chan():
+		case ev, ok := <-work.Chan():
 			if !ok {
 				return
 			}
-			s.rekey()
+			s.checkPresence(ev.Key)
 		}
 	}
 }
 
-// Close drops the pool. Claims are not released for their holders: a claim outliving the pool
-// is the holder's bug, and reporting nothing known is what a dropped entry already does.
+// watchKubeconfig asks for every claimed context to be re-read on every change, until stopped.
+// Cancellation ends the wait: the service behind the feed is the app's and is not required to
+// close its channel when released.
+//
+// Every context rather than the ones that moved, because the feed carries a whole config and
+// working out which contexts changed is what checkPresence does anyway.
+func (s *Service) watchKubeconfig(ctx context.Context, cfgs kubeconfig.Subscription) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-cfgs.Chan():
+			if !ok {
+				return
+			}
+			for _, contextName := range s.claimedContexts() {
+				s.presenceHub.Sender().Send(contextName, struct{}{})
+			}
+		}
+	}
+}
+
+// claimedContexts is the contexts to re-read, snapshotted so the loop above holds no lock while
+// it asks. Unordered: each read is independent, and the queue coalesces per context anyway.
+//
+// A slice rather than the iterator maps.Keys hands back, which reads the live map as it goes:
+// ranging that after this returns would walk the map with the lock already released.
+func (s *Service) claimedContexts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Collect(maps.Keys(s.claimed))
+}
+
+// Close drops what the pool holds. Claims are not released for their holders: a claim outliving
+// the pool is the holder's bug, and reading as nothing known is what a dropped entry already
+// does.
 func (s *Service) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, e := range s.claimed {
-		e.state = State{}
-	}
+	clear(s.claimed)
 	return nil
 }

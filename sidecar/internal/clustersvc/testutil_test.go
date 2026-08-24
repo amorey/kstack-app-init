@@ -100,6 +100,8 @@ type fakeLease struct {
 	svc         *fakeKubeconn
 	contextName string
 	state       kubeconn.State
+	// departed is what the pool would report for a context the kubeconfig stopped naming.
+	departed bool
 }
 
 func (l *fakeLease) Conn(context.Context) (*kubeconn.Connection, error) {
@@ -107,6 +109,8 @@ func (l *fakeLease) Conn(context.Context) (*kubeconn.Connection, error) {
 }
 
 func (l *fakeLease) State() kubeconn.State { return l.state }
+
+func (l *fakeLease) Departed() bool { return l.departed }
 
 func (l *fakeLease) WatchState() kubeconn.StateSubscription {
 	panic("a cluster pass reads, it does not watch")

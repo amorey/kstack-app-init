@@ -247,29 +247,27 @@ unconditionally — would re-emit the record on every probe, which is the same t
 nothing outside it can import one. → [ADR: connections are addressed by
 ClusterID](../docs/adr/2026-08-22-connections-addressed-by-cluster-id.md).
 
-**Nothing dials yet.** `clustersvc.New` builds it and carries it as a `lifecycle.Part` ahead of
-beehive — closing drops sockets, so a connection has to outlive every pass that could still be
-dialing on it. `Acquire` resolves and hands back a claim nothing probes; the pool and the probe
-behind it land next, drawn from the worked-out `internal/kubeconn`.
+**It hands out leases, and tells their holders when a context leaves the kubeconfig.** That is
+the whole of the package today. `Acquire(contextName)` never fails and never waits — a context
+the file does not name yet is claimable, because it may name it later and the claim is how the
+holder finds out. `Lease` is `Conn` / `State` / `WatchState` / `Departed` / `Release`; `Conn`
+reports `ErrNoConnection` and `State` reads as nothing known, because nothing builds a connection
+and nothing probes.
 
-**A claim is on the context, not on the key it resolved to.** Credentials move under a context
-that never does, so the pool subscribes to the kubeconfig itself (`Start` → `rekey`) and points
-each claim at the entry its context resolves to *now*; an entry nothing claims stops probing and
-its connection retires. **The signal, not the probe cycle** — a claim on a down cluster is deep in
-the backoff ladder, so a user who just fixed their kubeconfig would otherwise wait it out, and
-landing on a different entry starts a fresh ladder. The config is the signal and never the source:
-re-resolving goes back through `RESTConfig`, which is the only thing that computes a key. One call
-is one snapshot; resolving a context twice can key one snapshot's proxy URL onto another's
-credentials, so a re-key reads each context once and lets the next signal fix a straggler.
+**A claim outlives what it is a claim on.** The file can stop naming a context while a holder
+still holds it, and the entry stays — only releasing drops one. `checkPresence` re-reads whether
+the file still names a context and, **when that changed**, publishes: the new `State` on
+`stateHub`, then a poke on `signalHub`, in that order so a reader the poke wakes finds the value
+already there. Unchanged answers publish nothing, or every kubeconfig write would wake the fleet
+and re-announce every departed context forever. An **unread** kubeconfig names nothing and is
+deliberately not a departure.
 
-**`ErrNotRead` is not a refusal.** The pre-read config is empty, so every context looks departed —
-`Acquire` takes the claim anyway, or every record would report `ResolveFailed` for as long as the
-first read takes. A context that genuinely will not resolve is still refused with the reader's own
-error.
-
-The kubeconfig trigger reads this same feed independently, so a pass can run before the pool has
-re-keyed and read the old entry. It converges: the re-key publishes on the pool's bus and wakes the
-record again.
+**Presence is asked for, never read on the caller's thread.** `Acquire` sends the context on
+`presenceHub` — a `gobus/conflate` work queue, keyed and coalescing — **only when the claim is the
+first**, since a later holder joins what the first one's check found. `presenceLoop` reads them
+**one at a time**: two reads of one context racing could record the older answer over the newer.
+The kubeconfig watch enqueues every claimed context on a change rather than working out which
+moved, because that is what the check does anyway.
 
 **The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
 `Connection`, `ConnIdentity`, `ConnState`, `ConnStateSubscription`. Aliases because an
@@ -350,36 +348,20 @@ off `Connection` (the trap it exists for — no attempt yet is not an attempt th
 `State.Identity()` projects the three comparable scalars out of the rich observations. The verdicts
 stay above: condition types, reasons, and `Inactive` are the record's vocabulary, not the pool's.
 
-**Everything a holder learns comes through its `Lease`** — `Conn`, `State()`, `WatchState()` — so
-the pool signals per context and never asks a holder to know the fingerprint behind it.
-`WatchState` is a `gobus/watch` receiver over the hub `Conn` parks on, so a watcher and a parked
-caller cannot disagree. **It delivers nothing on attach** — gobus's baseline is a comparison
-value, not a delivery — so a watcher pairs it with `State()` for what is known now. Reading and
-registering under one lock (`Hub.WithBaseline`, which needs an `Accept` to mean anything) is what
-closes the gap between the two, and is worth having once a probe can land at all. **Every value is
-a level, never an edge** — the
-hub keeps the latest, so a reader that falls behind skips what came between, and transitions come
-from the record's conditions and event timeline. A long-lived reader cannot see a field it is not
-re-reading, so a retired connection closes `Connection.Done()` — retirement, not the replacement.
+**Everything a holder learns comes through its `Lease`** — `Conn`, `State()`, `WatchState()`,
+`Departed()` — so the pool publishes per context and never asks a holder to know the credentials
+behind one. `WatchState` is a `gobus/watch` receiver keyed by that context. **It delivers nothing
+on attach** — gobus's baseline is a comparison value, not a delivery — so a watcher pairs it with
+`State()` for what is known now. Reading and registering under one lock (`Hub.WithBaseline`, which
+needs an `Accept` to mean anything) is what closes the gap between the two, and is worth having
+once a probe can land at all. **Every value is a level, never an edge** — the hub keeps the latest,
+so a reader that falls behind skips what came between, and transitions come from the record's
+conditions and event timeline.
 
-**One context, one connection, one probe.** `Service.pool` is a single map keyed by context
-name — also the key both hubs publish under — holding the holder count, the fingerprint the
-connection was built from, and what the probe last read. Contexts resolving alike are **not**
-merged. → [ADR: one connection per
+**One context, one entry.** `Service.claimed` is a single map keyed by context name — also the key
+both hubs publish under — holding the holder count, whether the file still names the context, and
+what a probe read. Contexts resolving alike are **not** merged. → [ADR: one connection per
 context](../docs/adr/2026-08-23-one-connection-per-context.md).
-
-The fingerprint stays in the entry, not in the key. It is `kubeconfig`'s hash of the whole
-resolved `rest.Config` — server, TLS, auth, proxy, impersonation, the full exec block — and
-comparing it is how `rekey` tells a rotation from a kubeconfig write that changed nothing:
-unchanged keeps the connection and its ladder, changed builds a new one and **forgets the old
-`State`**, since the server behind new credentials has yet to say anything. **A rebuild or a drop
-is announced, an unchanged resolve is not** — `publish` sends the new state on `stateHub` and then
-pokes `signalHub`, in that order so a reader the poke wakes finds the value that replaced the old
-one. Without the "moved" check every kubeconfig save would wake every cluster in the fleet, and a
-departed context would be re-announced for as long as its claim is held. Empty means the
-context does not resolve — the pre-read kubeconfig, or one the user deleted — and a claim on it
-reads as nothing known. The resolve belongs here rather than at the caller, so what a connection
-was built from and what it is stored under cannot disagree.
 
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache

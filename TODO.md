@@ -22,6 +22,25 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - **What it will not remove:** the id conversion, because the `ObjectID` scalar binds `clustersvc.ObjectID` (a defined type) while beehive's is an alias for `int64` — binding `int64` instead would capture every `int64` in the schema; and the status default, because beehive leaves `Status` nil until first written while the schema types it non-null. So `toX` gets small, not deleted.
   - **Upstream alternative, not a substitute:** beehive could factor its own metadata into an embeddable `ObjectMeta` that `Object` embeds (strictly additive there, and every consumer projecting objects into records pays the same copying). Even then the two exceptions above remain, and embedding beehive's metadata wholesale would put `Name`, `ResourceVersion`, and `Finalizers` on the record — `Name` especially, which this package treats as a reconcile key nothing reads back.
 
+- **`kubeconn`'s refresh queue has no debounce.** `refreshHub` is a `gobus/conflate` bus used as a
+  work queue (`sidecar/internal/clustersvc/internal/kubeconn/service.go`): `claimContext` sends a
+  context the first time it is claimed, `rekey` sends every claimed context on a kubeconfig change,
+  and `refreshLoop` establishes them one at a time. **Coalescing is not debouncing** — conflate
+  merges sends that pile up behind a busy consumer, but an idle consumer sees every send, so a
+  burst of asks for one context is a burst of refreshes, each of which re-reads the kubeconfig and
+  the CA files behind it.
+  - **Not a problem yet**, because both producers are already quiet. A claim asks once per new
+    context, and `kubeconfig.Service` polls on a ticker and publishes only when the loaded config
+    differs (`reflect.DeepEqual`), so a hand-edited file produces one signal rather than one per
+    write.
+  - **Trigger:** the third producer. The probe's retry ladder, a manual reconnect poke, and
+    anything else that can ask for one context repeatedly will each want their asks merged over a
+    short window rather than run back to back.
+  - **Likely home:** the keyed work queue proposed in
+    [amorey/gobus#17](https://github.com/amorey/gobus/issues/17), whose `AddAfter` already has to
+    replace an earlier delayed add for the same key. A debounce window is that mechanism with the
+    timer restarted rather than kept, so the two are one feature if it is designed for both.
+
 ## Auth
 
 - **OAuth access-token refresh — background/proactive half.** On-demand refresh is done (`sidecar/internal/auth/grant.go` refreshes a lazily-expired token using the stored refresh token). What remains: a proactive/background refresh before expiry rather than only refreshing when a consumer hits an already-expired token.
