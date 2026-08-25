@@ -287,10 +287,17 @@ the `name*` constants), which is how a `Run` reads a sibling and how `stateOf` a
 at publish time. The connection's value (`connInfo`) bundles `departed` and the connection with
 the endpoint; `stateOf` projects only the endpoint into `State.Connection`.
 
-**A `Run` commits nil when its answer has not moved.** A committed value is what tells the engine
-the value changed, and so what re-runs every probe watching it — commit unconditionally and the
-four behind the connection re-run every cycle, which is the intervals they are registered with
-undone. `connInfo` is comparable, so `moved(prev, next)` is one `==`.
+**A `Run` takes a `probe.Pass[T]` and returns only its `Result`.** The pass carries the run's
+inputs — `Subject()`, `Prev()`, `Snapshot()` — and `pass.Commit(v)` records what the run found,
+wherever in the body it learns it. The engine buffers that and applies it when the run returns,
+in the same critical section as the attempt: nothing is published mid-run, the last call wins,
+and a run that then concludes `Skip` or panics commits nothing.
+
+**Commit only on a change.** A committed value is what tells the engine the value moved, and so
+what re-runs every probe watching it — commit unconditionally and the four behind the connection
+re-run every cycle, which is the intervals they are registered with undone. The engine never
+compares (it holds values as `any`, and a probe's value may be uncomparable or carry funcs), so
+the guard is the body's: `connInfo` is comparable, so it is `if next != pass.Prev()`.
 
 **A probe's result is its schedule** — `Succeeded` (due again after the interval), `Fail` (due up
 the backoff ladder), `Suspend` (nothing due until a `Wake`), `Skip` (record nothing; wait for a

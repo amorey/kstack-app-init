@@ -41,7 +41,7 @@ type steered struct {
 	sawDeadline bool
 }
 
-func (p *steered) Run(ctx context.Context, _ string, _ string, _ Snapshot) (Result, *string) {
+func (p *steered) Run(ctx context.Context, pass *Pass[string]) Result {
 	p.mu.Lock()
 	p.runs++
 	_, p.sawDeadline = ctx.Deadline()
@@ -51,18 +51,19 @@ func (p *steered) Run(ctx context.Context, _ string, _ string, _ Snapshot) (Resu
 	if hook != nil {
 		hook()
 	}
-	return res, next
+	if next != nil {
+		pass.Commit(*next)
+	}
+	return res
 }
 
 func (p *steered) set(res Result) { p.mu.Lock(); defer p.mu.Unlock(); p.res = res }
 func (p *steered) count() int     { p.mu.Lock(); defer p.mu.Unlock(); return p.runs }
 
 // probeFunc adapts a bare func for a test that needs a one-off body.
-type probeFunc func(ctx context.Context, subject string, prev string, snap Snapshot) (Result, *string)
+type probeFunc func(ctx context.Context, pass *Pass[string]) Result
 
-func (f probeFunc) Run(ctx context.Context, subject string, prev string, snap Snapshot) (Result, *string) {
-	return f(ctx, subject, prev, snap)
-}
+func (f probeFunc) Run(ctx context.Context, pass *Pass[string]) Result { return f(ctx, pass) }
 
 // single is an engine with one steered probe, closed on cleanup.
 func single(t *testing.T, res Result, opts ...ProbeOption) (*Engine, *steered, ID) {
@@ -267,9 +268,9 @@ func TestWorkQueuedBeforeStartIsServedOnceItRuns(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	ran := testutil.NewProbe[struct{}](1)
-	Register(e, "conn", probeFunc(func(context.Context, string, string, Snapshot) (Result, *string) {
+	Register(e, "conn", probeFunc(func(context.Context, *Pass[string]) Result {
 		ran.Fire(struct{}{})
-		return Suspend("Resolved", ""), nil
+		return Suspend("Resolved", "")
 	}))
 	e.Add(subj)
 
@@ -620,6 +621,71 @@ func TestRegisterPanicsOnAWatchNotYetRegistered(t *testing.T) {
 	assert.Panics(t, func() { Register(e, "uid", &steered{}, WithWatches(ID(0))) })
 }
 
+// --- what a run records ---
+
+// The last value a run commits is the one that lands, and it lands once: one attempt, and one
+// wake for whoever watches it.
+func TestARunCommitsTheLastValueItRecorded(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	aID := Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
+		pass.Commit("v1")
+		pass.Commit("v2")
+		return Succeeded()
+	}))
+	bID := Register(e, "uid", &steered{res: Succeeded()}, WithWatches(aID))
+	e.Add(subj)
+	e.settle()
+
+	runNext(t, e)
+
+	read, _ := e.Read(subj)
+	assert.Equal(t, "v2", Get[string](read, "conn").Value)
+	assert.Equal(t, key{subject: subj, probe: bID}, takeRun(t, e))
+	noRuns(t, e, "the watcher was woken more than once")
+}
+
+// A body may record what it found before it works out how to classify it, so a run that ends in
+// Skip discards the value with the record — Skip records nothing, and that has to mean nothing.
+func TestARunThatSkipsCommitsNothingItRecorded(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
+		pass.Commit("v1")
+		return Skip()
+	}))
+	e.Add(subj)
+	e.settle()
+
+	runNext(t, e)
+
+	read, _ := e.Read(subj)
+	o := Get[string](read, "conn")
+	assert.False(t, o.Known(), "a skipped run published a value")
+	assert.Empty(t, o.Value)
+}
+
+// Containment is all or nothing: a panicking body's buffered value goes with the wreckage, or a
+// half-finished run publishes an answer the record beside it calls Internal.
+func TestAPanickingRunCommitsNothingItRecorded(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
+		pass.Commit("v1")
+		panic("boom")
+	}))
+	e.Add(subj)
+	e.settle()
+
+	runNext(t, e)
+
+	read, _ := e.Read(subj)
+	o := Get[string](read, "conn")
+	assert.Empty(t, o.Value, "a panicking run published a value")
+	assert.False(t, o.Known())
+	assert.Equal(t, ReasonInternal, o.LastAttempt.Reason)
+}
+
 // --- failure containment ---
 
 // A panicking body must still produce a record and free its key — otherwise the probe reads as
@@ -627,7 +693,7 @@ func TestRegisterPanicsOnAWatchNotYetRegistered(t *testing.T) {
 func TestAPanickingRunRecordsInternalAndFreesItsKey(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	id := Register(e, "conn", probeFunc(func(context.Context, string, string, Snapshot) (Result, *string) {
+	id := Register(e, "conn", probeFunc(func(context.Context, *Pass[string]) Result {
 		panic("boom")
 	}))
 	e.Add(subj)

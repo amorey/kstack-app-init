@@ -47,13 +47,12 @@ import (
 // WithWatches, and Wake address probes by it, and Snapshot.Attempts indexes by it.
 type ID int
 
-// Probe is one probe's body: request against the subject named, classify, and hand back the
-// result plus the observable's next value — nil to keep the previous one. prev is this probe's
-// own last value (the zero T until a run commits one); snap is every probe's observable, read
-// with Get by registration name. The value is committed by the engine under its lock, so a run
-// must do its waiting before it returns.
+// Probe is one probe's body: request against the subject, classify, and return the result. What
+// the run found is recorded on the pass, wherever the body learns it; a body with no news just
+// returns. The engine applies the pass under its lock, so a run must do its waiting before it
+// returns.
 type Probe[T any] interface {
-	Run(ctx context.Context, subjectName string, prev T, snap Snapshot) (Result, *T)
+	Run(ctx context.Context, pass *Pass[T]) Result
 }
 
 // Backoff paces a failing probe: Base widened by Factor per consecutive failure, capped at Cap.
@@ -271,11 +270,12 @@ func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) ID
 		if prev != nil {
 			pv = prev.(T)
 		}
-		res, next := p.Run(ctx, subjectName, pv, snap)
-		if next == nil {
+		pass := &Pass[T]{subject: subjectName, prev: pv, snap: snap}
+		res := p.Run(ctx, pass)
+		if pass.next == nil {
 			return res, nil
 		}
-		return res, *next
+		return res, *pass.next
 	}
 	return e.register(name, run, opts)
 }

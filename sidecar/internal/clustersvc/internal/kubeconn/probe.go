@@ -99,42 +99,33 @@ type connectionProbe struct {
 	kubecfg kubeconfigService
 }
 
-func (p *connectionProbe) Run(_ context.Context, contextName string, prev connInfo, _ probe.Snapshot) (probe.Result, *connInfo) {
-	_, _, err := p.kubecfg.RESTConfig(contextName)
-	switch {
-	case errors.Is(err, kubeconfig.ErrNotRead):
+func (p *connectionProbe) Run(_ context.Context, pass *probe.Pass[connInfo]) probe.Result {
+	_, _, err := p.kubecfg.RESTConfig(pass.Subject())
+	if errors.Is(err, kubeconfig.ErrNotRead) {
 		// An unread kubeconfig names nothing, and saying so would report every context
 		// gone for as long as the first read takes. The watch wakes us when it is read.
-		return probe.Skip(), nil
+		return probe.Skip()
+	}
 
-	case errors.Is(err, kubeconfig.ErrContextNotFound):
-		next := prev
-		next.departed = true
-		return probe.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context"), moved(prev, next)
+	next := pass.Prev()
+	next.departed = errors.Is(err, kubeconfig.ErrContextNotFound)
+	if next != pass.Prev() {
+		// Only on a change: committing an unchanged value would re-run the four probes
+		// watching it every cycle, which is the intervals they are registered with undone.
+		pass.Commit(next)
+	}
 
+	switch {
+	case next.departed:
+		return probe.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context")
 	case err != nil:
 		// The file still names it, so this is not a departure — it is a file the user
 		// has to fix, and the retry ladder is for a fix the kubeconfig watch cannot see,
 		// such as a CA path that now opens.
-		next := prev
-		next.departed = false
-		return probe.Fail(ReasonResolveFailed, err), moved(prev, next)
-
+		return probe.Fail(ReasonResolveFailed, err)
 	default:
-		next := prev
-		next.departed = false
-		return probe.Suspend(ReasonResolved, "resolved; nothing dials yet"), moved(prev, next)
+		return probe.Suspend(ReasonResolved, "resolved; nothing dials yet")
 	}
-}
-
-// moved is the value to commit, nil when the run found what was already recorded. Committing an
-// unchanged value would wake the four probes that read it on every cycle, which is the interval
-// they are registered with undone.
-func moved(prev, next connInfo) *connInfo {
-	if next == prev {
-		return nil
-	}
-	return &next
 }
 
 // unimplemented stands in for a probe with no request behind it yet. Unreachable while nothing
@@ -145,6 +136,6 @@ type unimplemented[T any] struct {
 	name string
 }
 
-func (u unimplemented[T]) Run(context.Context, string, T, probe.Snapshot) (probe.Result, *T) {
-	return probe.Suspend(ReasonInternal, u.name+" probe is not implemented"), nil
+func (u unimplemented[T]) Run(context.Context, *probe.Pass[T]) probe.Result {
+	return probe.Suspend(ReasonInternal, u.name+" probe is not implemented")
 }

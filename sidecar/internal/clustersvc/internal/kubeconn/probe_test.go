@@ -26,13 +26,14 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
 
-// connect runs the connection probe's body once, on the test's goroutine, and applies its
-// value the way the engine would.
+// connect runs the connection probe's body once, on the test's goroutine, and applies what it
+// recorded the way the engine would.
 func connect(t *testing.T, cfg *fakeKubeconfig, v connInfo) (probe.Result, connInfo) {
 	t.Helper()
-	res, next := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), "prod", v, probe.Snapshot{})
-	if next != nil {
-		v = *next
+	pass := probe.NewPass("prod", v, probe.Snapshot{})
+	res := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), pass)
+	if next, ok := pass.Updated(); ok {
+		v = next
 	}
 	return res, v
 }
@@ -45,10 +46,12 @@ func TestTheConnectionProbeCommitsOnlyOnAChange(t *testing.T) {
 	_, first := connect(t, cfg, connInfo{departed: true})
 	require.False(t, first.departed, "the context resolves, so it is back")
 
-	res, next := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), "prod", first, probe.Snapshot{})
+	pass := probe.NewPass("prod", first, probe.Snapshot{})
+	res := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), pass)
 
 	assert.Equal(t, ReasonResolved, res.Reason())
-	assert.Nil(t, next, "nothing moved, so nothing is committed")
+	_, recorded := pass.Updated()
+	assert.False(t, recorded, "nothing moved, so nothing is committed")
 }
 
 // Each of the four reads the connection's value to reach the server, so a connection that moves
@@ -133,12 +136,14 @@ func TestConnectionSuspendsAResolvedContext(t *testing.T) {
 // Unreachable while nothing dials, and it says so rather than going quiet — a probe that
 // suspends without a reason is one nobody can explain.
 func TestAnUnimplementedProbeRecordsWhy(t *testing.T) {
-	res, next := unimplemented[ComponentStatus]{"readiness"}.Run(t.Context(), "prod", ComponentStatus{}, probe.Snapshot{})
+	pass := probe.NewPass("prod", ComponentStatus{}, probe.Snapshot{})
+	res := unimplemented[ComponentStatus]{"readiness"}.Run(t.Context(), pass)
 
 	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
 	assert.Equal(t, ReasonInternal, res.Reason())
 	assert.Contains(t, res.Message(), "readiness")
-	assert.Nil(t, next)
+	_, recorded := pass.Updated()
+	assert.False(t, recorded)
 }
 
 // --- through the engine ---
