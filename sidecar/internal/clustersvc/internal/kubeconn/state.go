@@ -78,10 +78,6 @@ const (
 	// apart from ReasonContextNotFound because the remedy is to fix the file rather than to
 	// accept a context that is gone.
 	ReasonResolveFailed Reason = "ResolveFailed"
-	// ReasonResolved means the context resolved and nothing dialed it, because nothing dials
-	// yet. Scaffolding: delete with the branch that records it when the dial lands and
-	// resolving stops being the whole run.
-	ReasonResolved Reason = "Resolved"
 
 	// ReasonUnauthorized is a 401: credentials absent, malformed, or expired.
 	ReasonUnauthorized Reason = "Unauthorized"
@@ -198,10 +194,6 @@ func (s State) Phase() Phase {
 		return PhasePending
 	case s.Connection.OK():
 		return PhaseProbed
-	case s.Connection.LastAttempt.Reason == ReasonResolved:
-		// Scaffolding while nothing dials: resolving records a suspension, not an answer
-		// about the server. Delete with ReasonResolved.
-		return PhasePending
 	default:
 		return PhaseUnreached
 	}

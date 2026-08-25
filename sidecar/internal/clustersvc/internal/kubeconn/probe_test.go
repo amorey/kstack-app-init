@@ -16,6 +16,7 @@ package kubeconn
 
 import (
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -49,13 +50,13 @@ func TestTheConnectionProbeCommitsOnlyOnAChange(t *testing.T) {
 	pass := probe.NewPass("prod", first, probe.Snapshot{})
 	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
 
-	assert.Equal(t, ReasonResolved, res.Reason())
+	assert.Equal(t, ReasonUnreachable, res.Reason())
 	_, recorded := pass.Updated()
 	assert.False(t, recorded, "nothing moved, so nothing is committed")
 }
 
 // Each of the four reads the connection's value to reach the server, so a connection that moves
-// re-runs them — even parked, as they are here: nothing dials, so they are suspended behind a
+// re-runs them — even parked, as they are here: nothing answers, so they are suspended behind a
 // connection that never succeeds, and only the data edge can reach them.
 func TestAMovedConnectionReRunsTheProbesBehindIt(t *testing.T) {
 	cfg := resolving("prod", "key-1")
@@ -121,20 +122,143 @@ func TestConnectionSkipsAnUnreadKubeconfig(t *testing.T) {
 	assert.False(t, v.departed)
 }
 
-// Scaffolding while nothing dials: resolving is the precondition, not an answer about the
-// server, so a context that resolves suspends with ReasonResolved rather than claiming success.
-func TestConnectionSuspendsAResolvedContext(t *testing.T) {
-	cfg := resolving("prod", "key-1")
+// The whole answer: reached, over TLS we trust, with credentials the server accepts.
+func TestConnectionSucceedsWhenTheServerAnswers(t *testing.T) {
+	srv := serveAPI(t)
+	cfg := serving(srv, "prod", "key-1")
 
 	res, v := connect(t, cfg, connInfo{departed: true})
 
-	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
-	assert.Equal(t, ReasonResolved, res.Reason())
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
 	assert.False(t, v.departed, "a context that resolves again is back")
+	assert.NotNil(t, v.conn)
+	assert.Equal(t, srv.URL, v.endpoint)
+	assert.Equal(t, "key-1", v.fingerprint)
 }
 
-// Unreachable while nothing dials, and it says so rather than going quiet — a probe that
-// suspends without a reason is one nobody can explain.
+// A server that will not have these credentials is not an outage: the failure names what the
+// user has to fix, and the four probes behind this one could not run either.
+func TestConnectionFailsWithWhatTheServerSaid(t *testing.T) {
+	srv := serve(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+
+	res, v := connect(t, serving(srv, "prod", "key-1"), connInfo{})
+
+	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, ReasonUnauthorized, res.Reason())
+	assert.NotNil(t, v.conn, "the credentials resolved, so the connection stands")
+}
+
+func TestConnectionFailsWhenNothingAnswers(t *testing.T) {
+	res, _ := connect(t, resolving("prod", "key-1"), connInfo{})
+
+	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, ReasonUnreachable, res.Reason())
+}
+
+// A 200 from something that is not an API server is the case a status code cannot catch — a
+// captive portal answers everything, so what proves the far end is a Kubernetes API server is
+// its body.
+func TestConnectionFailsWhenTheAnswerIsNotKubernetes(t *testing.T) {
+	srv := serve(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+
+	res, _ := connect(t, serving(srv, "prod", "key-1"), connInfo{})
+
+	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, ReasonMalformed, res.Reason())
+}
+
+// Rebuilding a healthy connection would drop every socket under the holders using it, so the
+// same credentials keep the same connection — and commit nothing, since the four probes behind
+// it wake on a committed value.
+func TestConnectionKeepsItsConnectionWhileTheCredentialsHold(t *testing.T) {
+	cfg := serving(serveAPI(t), "prod", "key-1")
+	_, first := connect(t, cfg, connInfo{})
+	require.NotNil(t, first.conn)
+
+	pass := probe.NewPass("prod", first, probe.Snapshot{})
+	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	_, recorded := pass.Updated()
+	assert.False(t, recorded, "nothing moved, so nothing is committed")
+}
+
+// Credentials that moved are a different server as far as anything derived from them goes, so
+// the connection is rebuilt — and the new pointer is what wakes the probes reading it.
+func TestConnectionRebuildsWhenTheCredentialsMove(t *testing.T) {
+	cfg := serving(serveAPI(t), "prod", "key-1")
+	_, first := connect(t, cfg, connInfo{})
+	require.NotNil(t, first.conn)
+
+	cfg.rotate("prod", "key-2")
+	res, second := connect(t, cfg, first)
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.NotSame(t, first.conn, second.conn)
+	assert.Equal(t, "key-2", second.fingerprint)
+}
+
+// A file that will not resolve keeps its connection, where a departure drops one: the read
+// failed, which says nothing about whether the credentials behind the connection still work, and
+// an editor saving non-atomically is a read that fails for a moment.
+func TestConnectionKeepsItsConnectionThroughAResolveFailure(t *testing.T) {
+	cfg := serving(serveAPI(t), "prod", "key-1")
+	_, first := connect(t, cfg, connInfo{})
+	require.NotNil(t, first.conn)
+
+	cfg.setErr(errors.New("open ca.crt: no such file"))
+	res, second := connect(t, cfg, first)
+
+	require.Equal(t, ReasonResolveFailed, res.Reason())
+	assert.Same(t, first.conn, second.conn)
+	select {
+	case <-second.conn.Done():
+		t.Fatal("the connection was retired over a read that failed")
+	default:
+	}
+}
+
+// A context that left the file has no connection to hand out. Retiring the one it had is the
+// pool's, not the probe's — this only stops naming it.
+func TestConnectionDropsItsConnectionWhenTheContextDeparts(t *testing.T) {
+	cfg := serving(serveAPI(t), "prod", "key-1")
+	_, first := connect(t, cfg, connInfo{})
+	require.NotNil(t, first.conn)
+
+	cfg.rotate("prod", "")
+	_, second := connect(t, cfg, first)
+
+	assert.True(t, second.departed)
+	assert.Nil(t, second.conn)
+	assert.Empty(t, second.endpoint)
+}
+
+// The trap: a build that fails commits the new fingerprint, so a run keyed on the fingerprint
+// alone would find it unchanged and never build again — the probe would climb its ladder
+// retrying nothing.
+func TestConnectionBuildsAgainAfterABuildThatFailed(t *testing.T) {
+	srv := serveAPI(t)
+	cfg := serving(srv, "prod", "key-1")
+	cfg.host = "://nonsense"
+
+	res, failed := connect(t, cfg, connInfo{})
+	require.Equal(t, ReasonResolveFailed, res.Reason())
+	require.Nil(t, failed.conn)
+	require.Equal(t, "key-1", failed.fingerprint, "the fingerprint it tried")
+
+	cfg.host = srv.URL
+	res, built := connect(t, cfg, failed)
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.NotNil(t, built.conn, "the fingerprint did not move, but there was no connection")
+}
+
+// Unreachable while the connection never succeeds, and it says so rather than going quiet — a
+// probe that suspends without a reason is one nobody can explain.
 func TestAnUnimplementedProbeRecordsWhy(t *testing.T) {
 	pass := probe.NewPass("prod", ComponentStatus{}, probe.Snapshot{})
 	res := unimplemented[ComponentStatus]{"readiness"}.Run(t.Context(), pass)
@@ -149,8 +273,8 @@ func TestAnUnimplementedProbeRecordsWhy(t *testing.T) {
 // --- through the engine ---
 
 // The four probes behind the connection are recorded rather than dialed while nothing has
-// succeeded at reaching the server — which, while nothing dials, is always.
-func TestDependentsRecordDependencyFailedWhileNothingDials(t *testing.T) {
+// succeeded at reaching the server: one timeout per cycle, not one per probe.
+func TestDependentsRecordDependencyFailedWhileTheServerIsUnreachable(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	startService(t, s)
 	lease := s.Acquire("prod")
@@ -167,10 +291,10 @@ func TestDependentsRecordDependencyFailedWhileNothingDials(t *testing.T) {
 	assert.True(t, st.ServerUID.LastAttempt.StartedAt.IsZero(), "recorded, never dispatched")
 }
 
-// A context that comes back is re-read and reads as pending again — with no failure streak,
-// since a departure was the user's edit, not a fault.
-func TestAReturningContextReadsAsPendingAgain(t *testing.T) {
-	cfg := resolving("prod", "key-1")
+// A context that comes back is re-read and dialed again — with no failure streak, since a
+// departure was the user's edit, not a fault.
+func TestAReturningContextIsDialedAgain(t *testing.T) {
+	cfg := serving(serveAPI(t), "prod", "key-1")
 	s := New(cfg)
 	startService(t, s)
 	lease := s.Acquire("prod")
@@ -184,10 +308,10 @@ func TestAReturningContextReadsAsPendingAgain(t *testing.T) {
 	cfg.changed()
 	require.Eventually(t, func() bool { return !lease.Departed() }, time.Second, time.Millisecond)
 
-	conn := lease.State().Connection
-	assert.Equal(t, PhasePending, lease.State().Phase())
-	assert.Equal(t, ReasonResolved, conn.LastAttempt.Reason)
-	assert.Zero(t, conn.Failures)
+	require.Eventually(t, func() bool {
+		return lease.State().Phase() == PhaseProbed
+	}, time.Second, time.Millisecond)
+	assert.Zero(t, lease.State().Connection.Failures)
 }
 
 // A resolve failure keeps its cadence, and consecutive failures are one streak: FailingSince is
@@ -215,4 +339,21 @@ func TestAResolveFailureKeepsAsking(t *testing.T) {
 		return st.Connection.Failures >= 2
 	}).Connection
 	assert.Equal(t, first.FailingSince, second.FailingSince, "one run of failures, not two")
+}
+
+// The engine hands back what a run committed when it drops the value — a commit refused because
+// the context was released mid-run, a Skip, a panic. Nothing else can reach that connection: it
+// reached neither a snapshot nor an entry.
+func TestDiscardRetiresWhatTheRunBuilt(t *testing.T) {
+	conn := connTo(t, serveAPI(t))
+
+	(&connectionProbe{}).Discard(connInfo{conn: conn})
+
+	<-conn.Done()
+}
+
+// A context that resolves to nothing commits a value with no connection, which is the ordinary
+// shape of a dropped one.
+func TestDiscardOfAValueWithNoConnectionIsANoOp(t *testing.T) {
+	(&connectionProbe{}).Discard(connInfo{departed: true})
 }

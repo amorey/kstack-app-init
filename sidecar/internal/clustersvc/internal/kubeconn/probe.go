@@ -17,14 +17,15 @@
 // what each probe records, and every probe behind reachability declares that dependency rather
 // than testing it.
 //
-// **Nothing dials yet.** The connection probe resolves the kubeconfig and reports a context that
-// left it; the four behind it are unimplemented, and the engine records DependencyFailed for
-// them while the connection has not succeeded — which is their correct behavior once they exist.
+// **Only the connection probe is implemented.** The four behind it are unimplemented, and the
+// engine records DependencyFailed for them while the connection has not succeeded — which is
+// their correct behavior once they exist.
 package kubeconn
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
@@ -53,18 +54,28 @@ var keyConnection = probe.NewKey[connInfo](nameConnection)
 // connInfo is the connection probe's observable: the context's standing in the kubeconfig, and
 // the connection reaching its server yields. The four probes behind reachability read it through
 // the connection handle.
+//
+// Comparable, which is what the commit-only-on-a-change guard rests on — so a rebuilt connection
+// is a new pointer and moves the value, where a re-dialed one does not.
 type connInfo struct {
 	// departed is what the probe's last read of the kubeconfig said: false while the file
 	// names this context, true once it stops. Flipping it is news the holders are told.
 	departed bool
-	// conn is the connection the probes run over. Nothing builds one yet.
+	// conn is the connection the probes run over, nil while the context resolves to nothing.
 	conn *Connection
 	// endpoint is the API server URL that answered.
 	endpoint string
+	// fingerprint describes the credentials conn was built from. What tells a rotation from a
+	// kubeconfig write that changed nothing: unchanged keeps the connection, and the backoff
+	// ladder with it.
+	fingerprint string
 }
 
 func registerProbes(e *probe.Engine, kubecfg kubeconfigService) {
-	probe.Register(e, nameConnection, &connectionProbe{kubecfgSvc: kubecfg}, probe.WithInterval(30*time.Second))
+	// A shorter timeout than the engine's default, which is a whole interval: a reachability
+	// check that has taken ten seconds has answered.
+	probe.Register(e, nameConnection, &connectionProbe{kubecfgSvc: kubecfg},
+		probe.WithInterval(30*time.Second), probe.WithTimeout(10*time.Second))
 
 	// The four behind reachability declare both edges on it: they cannot run without a
 	// connection, and they read the one it committed — so a connection that moves re-runs them
@@ -76,20 +87,24 @@ func registerProbes(e *probe.Engine, kubecfg kubeconfigService) {
 	probe.Register(e, namePrincipal, unimplemented[Principal]{"principal"}, probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
 }
 
+// apiDiscoveryPath is the one request this probe makes. The cheapest one that proves the whole
+// path — DNS, TCP, TLS, then authentication — and the only one of the endpoints these five
+// probes read that can answer 401 or 403. Its body is also what tells a Kubernetes API server
+// from a captive portal that answers 200 to anything.
+const apiDiscoveryPath = "/api"
+
 // connectionProbe answers whether the server behind the context can be reached, and owns the
 // context's lifecycle on the way there: resolving the kubeconfig is the first step of reaching a
 // server, so a context that left the file is this probe's to find.
 //
-// Nothing dials yet, so a context that resolves suspends with ReasonResolved — resolving is the
-// precondition, not an answer about the server, and Phase reads it as still pending. The
-// kubeconfig watch wakes this probe on every change, which is what re-asks every one of these
+// The kubeconfig watch wakes it on every change, which is what re-asks every one of these
 // answers.
 type connectionProbe struct {
 	kubecfgSvc kubeconfigService
 }
 
-func (p *connectionProbe) Run(_ context.Context, pass *probe.Pass[connInfo]) probe.Result {
-	_, _, err := p.kubecfgSvc.RESTConfig(pass.Subject())
+func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) probe.Result {
+	cfg, fingerprint, err := p.kubecfgSvc.RESTConfig(pass.Subject())
 	if errors.Is(err, kubeconfig.ErrNotRead) {
 		// An unread kubeconfig names nothing, and saying so would report every context
 		// gone for as long as the first read takes. The watch wakes us when it is read.
@@ -97,23 +112,74 @@ func (p *connectionProbe) Run(_ context.Context, pass *probe.Pass[connInfo]) pro
 	}
 
 	next := pass.Prev()
-	next.departed = errors.Is(err, kubeconfig.ErrContextNotFound)
-	if next != pass.Prev() {
-		// Only on a change: committing an unchanged value would re-run the four probes
-		// watching it every cycle, which is the intervals they are registered with undone.
-		pass.Commit(next)
-	}
+	// Deferred so no path can return without it: a connection built by a run that then failed
+	// must still be committed, or nothing can reach it to retire it. Only on a change —
+	// committing an unchanged value would re-run the four probes watching it every cycle,
+	// which is the intervals they are registered with undone.
+	defer func() {
+		if next != pass.Prev() {
+			pass.Commit(next)
+		}
+	}()
 
+	next.departed = errors.Is(err, kubeconfig.ErrContextNotFound)
 	switch {
 	case next.departed:
+		next.conn, next.endpoint, next.fingerprint = nil, "", ""
 		return probe.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context")
 	case err != nil:
 		// The file still names it, so this is not a departure — it is a file the user
 		// has to fix, and the retry ladder is for a fix the kubeconfig watch cannot see,
 		// such as a CA path that now opens.
+		//
+		// The connection stands meanwhile, unlike a departure's: a read that failed says
+		// nothing about whether the credentials behind it still work, and a save an editor
+		// made non-atomically is a read that fails for a moment. Credentials that really
+		// moved come back as a changed fingerprint, which is what retires one.
 		return probe.Fail(ReasonResolveFailed, err)
-	default:
-		return probe.Suspend(ReasonResolved, "resolved; nothing dials yet")
+	}
+
+	// Or no connection, never the fingerprint alone: a build that failed committed this
+	// fingerprint with nothing behind it, and a run comparing fingerprints would find it
+	// unchanged and never build again.
+	if next.conn == nil || next.fingerprint != fingerprint {
+		conn, err := newConnection(cfg)
+		next.conn, next.endpoint, next.fingerprint = conn, "", fingerprint
+		if err != nil {
+			// Nothing was dialed, and the remedy is the same file fix a context that will
+			// not resolve needs.
+			return probe.Fail(ReasonResolveFailed, err)
+		}
+		next.endpoint = conn.BaseURL.String()
+	}
+
+	var discovery struct {
+		Versions []string `json:"versions"`
+	}
+	if err := next.conn.getJSON(ctx, apiDiscoveryPath, &discovery); err != nil {
+		if errors.Is(err, context.Canceled) {
+			// The caller went away: nothing about the cluster to record, and the engine
+			// hands the value back through Discard.
+			return probe.Skip()
+		}
+		return probe.Fail(classify(err), err)
+	}
+	if len(discovery.Versions) == 0 {
+		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without API versions", apiDiscoveryPath))
+	}
+	return probe.Succeeded()
+}
+
+// Discard retires a connection the engine dropped — a run whose commit it refused because the
+// context was released mid-run, one that concluded Skip, or one that panicked. Such a value
+// reaches neither a snapshot nor an entry, so nothing else can retire what it built.
+//
+// Safe to retire outright because a committed connInfo always carries a connection *this* run
+// built: every field that can move either clears the connection (a departure) or rebuilds it (a
+// fingerprint that changed), so a value that moved never carries a connection someone else holds.
+func (p *connectionProbe) Discard(v connInfo) {
+	if v.conn != nil {
+		v.conn.retire()
 	}
 }
 

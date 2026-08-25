@@ -22,6 +22,25 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - **What it will not remove:** the id conversion, because the `ObjectID` scalar binds `clustersvc.ObjectID` (a defined type) while beehive's is an alias for `int64` — binding `int64` instead would capture every `int64` in the schema; and the status default, because beehive leaves `Status` nil until first written while the schema types it non-null. So `toX` gets small, not deleted.
   - **Upstream alternative, not a substitute:** beehive could factor its own metadata into an embeddable `ObjectMeta` that `Object` embeds (strictly additive there, and every consumer projecting objects into records pays the same copying). Even then the two exceptions above remain, and embedding beehive's metadata wholesale would put `Name`, `ResourceVersion`, and `Finalizers` on the record — `Name` especially, which this package treats as a reconcile key nothing reads back.
 
+- **Identity-driven connection retirement is specified and unbuilt.** The connection probe retires
+  on a changed credential fingerprint alone; a *server* that changed behind unchanged credentials
+  does not retire anything, so a holder would go on using a connection whose cluster is no longer
+  the one it derived from. **Fix:** `connInfo` records the identity the current connection was
+  validated against, and a **known** part reading differently retires it — a part filling in from
+  empty is the first identification, not a new server, and treating it as one would rebuild every
+  connection once. The connection probe cannot declare a watch edge on the identity probes
+  (`resolveLocked` takes only already-registered names, which is what keeps the graph acyclic), so
+  promptness comes from `publish` calling `Wake(contextName, nameConnection)` when identity moves —
+  a `Wake` is not an edge. **Trigger:** the serverUID probe, the first thing that can produce an
+  identity to compare. → [ADR: the connection probe dials
+  /api](docs/adr/2026-08-25-connection-probe-dial.md).
+
+- **`classify` has no `*apierrors.StatusError` branch.** Every probe reads a raw endpoint today, so
+  a status code is the whole evidence and `statusReason` covers it. **Trigger:** the first probe
+  that goes through `Connection.Dynamic`, which returns the API's own reason — classifying that on
+  the status code alone discards what the typed half already knows (`state.go` states the rule).
+  `postJSON` lands on the same schedule, with the principal probe's SelfSubjectReview.
+
 - **`kubeconn`'s presence queue has no debounce.** `presence` is an `internal/workqueue` queue
   (`sidecar/internal/clustersvc/internal/kubeconn/service.go`): `Acquire` adds a context the first
   time it is claimed, `watchKubeconfig` adds every claimed context on a kubeconfig change, and

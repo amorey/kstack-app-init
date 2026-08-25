@@ -55,16 +55,6 @@ func TestSuspendedProbeKeepsItsAnswer(t *testing.T) {
 	assert.False(t, o.InFlight())
 }
 
-// Scaffolding while nothing dials: a resolved context's suspension is not an answer about the
-// server, so the phase must not read as a server that was tried and missed.
-func TestPhaseReadsAResolvedSuspensionAsPending(t *testing.T) {
-	s := State{Connection: Observation[string]{Attempts: Attempts{
-		LastAttempt: Attempt{FinishedAt: runAt, Verdict: VerdictSuspended, Reason: ReasonResolved},
-	}}}
-
-	assert.Equal(t, PhasePending, s.Phase())
-}
-
 // Identity projects the three scalars a connection is scoped to out of the observations
 // carrying them, so retiring one stays a ==.
 func TestIdentityProjectsTheProbedScalars(t *testing.T) {
@@ -99,8 +89,8 @@ func TestIdentityLeavesAnUnreadPartEmpty(t *testing.T) {
 	}.Identity(), "why the UID is missing is the observation's, not the identity's")
 }
 
-// The phase a connection that answered reports — unreachable while nothing dials, and the case
-// every reader of Phase is waiting for.
+// The phase a connection that answered reports, and the case every reader of Phase is waiting
+// for.
 func TestPhaseReadsASucceededConnectionAsProbed(t *testing.T) {
 	s := State{Connection: Observation[string]{
 		Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Verdict: VerdictSucceeded, Reason: ReasonSucceeded}},

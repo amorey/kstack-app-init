@@ -17,6 +17,7 @@ package kubeconn
 import (
 	"context"
 	"errors"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -33,9 +34,14 @@ import (
 
 // fakeKubeconfig resolves each context to a key the test controls, standing in for the user's
 // file. err, when set, is what every context fails with.
+//
+// Every context resolves to the same host, since what a test varies is the key: the key is the
+// fingerprint, which is what a rebuild is decided on.
 type fakeKubeconfig struct {
 	mu     sync.Mutex
 	keys   map[string]string
+	host   string
+	tls    rest.TLSClientConfig
 	err    error
 	hub    *watch.Hub[*api.Config]
 	onRead func()
@@ -43,12 +49,22 @@ type fakeKubeconfig struct {
 	reads *testutil.Probe[string]
 }
 
-// resolving is a kubeconfig where each context resolves to the key beside it.
+// resolving is a kubeconfig where each context resolves to the key beside it, aimed at an
+// address nothing answers on.
 func resolving(contextKeys ...string) *fakeKubeconfig {
-	f := &fakeKubeconfig{keys: map[string]string{}}
+	f := &fakeKubeconfig{keys: map[string]string{}, host: deadHost}
 	for i := 0; i < len(contextKeys); i += 2 {
 		f.keys[contextKeys[i]] = contextKeys[i+1]
 	}
+	return f
+}
+
+// serving is resolving against a server that answers: every context aims at srv and trusts its
+// certificate.
+func serving(srv *httptest.Server, contextKeys ...string) *fakeKubeconfig {
+	f := resolving(contextKeys...)
+	f.host = srv.URL
+	f.tls = rest.TLSClientConfig{CAData: caPEM(srv)}
 	return f
 }
 
@@ -106,7 +122,7 @@ func (f *fakeKubeconfig) RESTConfig(contextName string) (*rest.Config, string, e
 	if !ok {
 		return nil, "", kubeconfig.ErrContextNotFound
 	}
-	return &rest.Config{Host: "https://" + key}, key, nil
+	return &rest.Config{Host: f.host, TLSClientConfig: f.tls}, key, nil
 }
 
 func (f *fakeKubeconfig) Subscribe() kubeconfig.Subscription {
@@ -135,6 +151,15 @@ func startService(t *testing.T, s *Service) {
 	stop, err := s.Start(t.Context())
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+}
+
+// settled waits until the pool has published a first verdict for the claim, so a test
+// subscribing after it hears the news it goes on to cause rather than the first probe's.
+func settled(t *testing.T, lease Lease) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return lease.State().Connection.LastAttempt.Done()
+	}, testutil.Timeout, time.Millisecond, "a first verdict")
 }
 
 // awaitState receives one claim's states until cond holds. The hub keeps only the latest value,
@@ -268,6 +293,113 @@ func TestCloseDropsWhatThePoolHolds(t *testing.T) {
 	assert.True(t, lease.Departed())
 }
 
+// --- retiring connections ---
+
+// The probe builds and the pool retires, so a rebuild hands back what it replaced: a run cannot
+// retire the connection it is replacing, since its commit lands after it returns and holders
+// would reconnect against a Conn still handing out the dead one.
+func TestRecordHandsBackTheConnectionItReplaced(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	defer s.Acquire("prod").Release()
+	first, second := connTo(t, serveAPI(t)), connTo(t, serveAPI(t))
+
+	stale, held, _ := s.record("prod", first, news{})
+	require.True(t, held)
+	assert.Nil(t, stale, "the first connection replaces nothing")
+
+	stale, held, _ = s.record("prod", second, news{})
+
+	assert.True(t, held)
+	assert.Same(t, first, stale)
+}
+
+// The leak this rule exists for: a release landing between the commit and the pass retires the
+// entry's connection, which is the *previous* one — the connection the run just built is held by
+// an entry that no longer exists, so nothing else can reach it.
+func TestRecordHandsBackAConnectionNothingHoldsAnyMore(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	s.Acquire("prod").Release()
+	built := connTo(t, serveAPI(t))
+
+	stale, held, _ := s.record("prod", built, news{})
+
+	assert.False(t, held)
+	assert.Same(t, built, stale, "nothing else can reach it")
+}
+
+// The entry check and the published write are one critical section, so a pass that raced the
+// last release files nothing: a baseline left behind for a context nobody holds is one the first
+// pass of the next claim compares equal to, telling the fleet nothing about a context that just
+// came back.
+func TestRecordFilesNothingForAContextNobodyHolds(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	lease := s.Acquire("prod")
+	probed := news{phase: PhaseProbed}
+	_, _, _ = s.record("prod", nil, probed)
+	lease.Release()
+
+	_, held, _ := s.record("prod", nil, probed)
+
+	assert.False(t, held)
+	assert.Empty(t, s.published, "no baseline for the claim that comes next")
+}
+
+// An entry that goes takes its connection with it, or every released context leaves its sockets
+// behind.
+func TestReleaseRetiresTheConnectionTheEntryHeld(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	lease := s.Acquire("prod")
+	conn := connTo(t, serveAPI(t))
+	_, _, _ = s.record("prod", conn, news{})
+
+	lease.Release()
+
+	<-conn.Done()
+}
+
+func TestCloseRetiresEveryConnection(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	defer s.Acquire("prod").Release()
+	conn := connTo(t, serveAPI(t))
+	_, _, _ = s.record("prod", conn, news{})
+
+	require.NoError(t, s.Close())
+
+	<-conn.Done()
+}
+
+// --- handing a connection out ---
+
+// What the probe built is what a holder gets, without dialing anything of its own.
+func TestConnHandsOutWhatTheProbeBuilt(t *testing.T) {
+	srv := serveAPI(t)
+	s := New(serving(srv, "prod", "key-1"))
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+	awaitState(t, watched, func(st State) bool { return st.Phase() == PhaseProbed })
+
+	conn, err := lease.Conn(t.Context())
+
+	require.NoError(t, err)
+	assert.Equal(t, srv.URL, conn.BaseURL.String())
+}
+
+// A context that resolves to nothing has no connection to hand out, and saying so is what stops
+// a holder interpreting a nil.
+func TestConnReportsThatThereIsNoConnection(t *testing.T) {
+	s := New(&fakeKubeconfig{})
+	lease := s.Acquire("prod")
+	defer lease.Release()
+
+	conn, err := lease.Conn(t.Context())
+
+	assert.Nil(t, conn)
+	assert.ErrorIs(t, err, ErrNoConnection)
+}
+
 // --- the news: a context leaving the kubeconfig ---
 
 // The one thing a holder is told without asking. It learns what changed by asking the claim.
@@ -278,6 +410,7 @@ func TestDepartureReachesTheHolder(t *testing.T) {
 	lease := s.Acquire("prod")
 	defer lease.Release()
 	require.Equal(t, "prod", cfg.reads.Await(t, "the claim's own read"))
+	settled(t, lease)
 	news := s.Subscribe()
 	defer news.Close()
 
@@ -317,8 +450,10 @@ func TestDepartureIsAnnouncedOnce(t *testing.T) {
 	cfg := counting("prod", "key-1")
 	s := New(cfg)
 	startService(t, s)
-	defer s.Acquire("prod").Release()
+	lease := s.Acquire("prod")
+	defer lease.Release()
 	cfg.reads.Await(t, "the claim's own read")
+	settled(t, lease)
 	news := s.Subscribe()
 	defer news.Close()
 

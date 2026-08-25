@@ -66,7 +66,7 @@ cache is still the active identity). Served: the whole `Clusters()` family excep
 plus `Caches()`' point reads (`Get`/`List`/`ListByCluster`) and its unscoped watches
 (`Watch`/`WatchList`). That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **No cache exists at runtime yet**: creation keys off `status.server.uid` and
-nothing writes it until the connection probe lands, so those reads answer empty — and no catalog
+nothing writes it until the serverUID probe lands, so those reads answer empty — and no catalog
 either, since one is only written for a cache. There is no connection manager, discovery pass, sync
 worker, or on-disk cache; `CachedCatalogs()` serves nothing yet, and the two families below it have
 no producer at all.
@@ -218,7 +218,7 @@ nothing here gates on it, no user action follows from it, and a lease holder tha
 context left the kubeconfig** (both states the user chose), `ResolveFailed` when the context is
 there and its entries will not resolve (a broken file, reported on the record rather than failing
 the pass, since beehive's backoff cannot fix a file), `ProbeFailed` when the server would not
-answer, and `Connecting` until a probe lands — which is every context that resolves, today.
+answer, and `Connecting` until a probe lands.
 `Inactive` and `ResolveFailed` come from `Acquire` refusing the claim, the rest from the claim's
 `State`. The other two derive their own: `NoConnection` where a probe never got to the server, since
 neither readiness nor identity is a fact about a server nothing reached.
@@ -250,9 +250,10 @@ ClusterID](../docs/adr/2026-08-22-connections-addressed-by-cluster-id.md).
 **It hands out leases and reports what probing the server behind one found.**
 `Acquire(contextName)` never fails and never waits — a context the file does not name yet is
 claimable, because it may name it later and the claim is how the holder finds out. `Lease` is
-`Conn` / `State` / `WatchState` / `Departed` / `Release`. **Nothing dials yet**, so `Conn` reports
-`ErrNoConnection` and the only answers `State` carries are the ones a probe can reach without a
-server. The scheduling around them is real — see the probe below.
+`Conn` / `State` / `WatchState` / `Departed` / `Release`. **`Conn` never dials**: it hands out what
+the connection probe built, or `ErrNoConnection` for a context that resolves to nothing — a
+connection whose last probe *failed* is still handed out, since only the holder can tell a revoked
+credential from a control plane mid-restart.
 
 **A claim outlives what it is a claim on.** The file can stop naming a context while a holder
 still holds it, and the entry stays — only releasing drops one. An **unread** kubeconfig names
@@ -273,6 +274,12 @@ keeps what is asked and what the answers mean: `probe.go` is `registerProbes` �
 registrations kept side by side on purpose, since the set's rules are checked by eye — plus the
 probe structs; `service.go` is leases and publishing. → [ADR: probe
 engine](../docs/adr/2026-08-24-probe-engine.md).
+
+**A value the engine drops goes back to the probe.** A committed value can own something — a
+connection, a file — and one the engine never applies is one nothing else can reach to release: a
+commit refused because the subject was removed mid-run, a run that concluded `Skip`, one that
+returned the zero `Result`, one that panicked. A probe implementing `Discard(T)` is handed it
+(`kubeconn`'s connection probe retires the connection); one that does not is unaffected.
 
 **A `Run` body may not take the engine down with it.** One that panics, or that hands back the
 zero `Result`, is recorded as an `Internal` failure and gives its key back — the engine logs it
@@ -316,16 +323,36 @@ derivation, and a connection whose value moves re-runs them at once.
 first step of reaching a server. Its classifications: `ReasonContextNotFound` suspends with
 `departed` committed true (the file is the whole truth about presence, and the watch reports it
 moving — a departure is also not a failure streak, being the user's own edit);
-`ReasonResolveFailed` fails up the ladder (the file can be fixed in a way `kubeconfig.Service`
-cannot see, such as a CA path that now opens); an unread file is a `Skip` (an unread kubeconfig
-names nothing, and is deliberately not a departure). **Scaffolding while nothing dials**: a
-context that resolves suspends with `ReasonResolved`, which `Phase()` reads as `PhasePending` —
-delete both with the branch when the dial lands.
+`ReasonResolveFailed` fails up the ladder for both a file that will not resolve and a build that
+will not materialize clients from it (nothing was dialed either way, and the file can be fixed in a
+way `kubeconfig.Service` cannot see, such as a CA path that now opens); an unread file is a `Skip`
+(an unread kubeconfig names nothing, and is deliberately not a departure).
+
+**Reaching the server is one `GET /api`**: the cheapest
+request that proves DNS → TCP → TLS → authentication, the only endpoint of the five probes' that
+can answer 401 or 403, and the one whose body tells a Kubernetes API server from a captive portal
+answering 200 to everything — so empty `versions` is `ReasonMalformed`. **The probe builds a
+connection; the pool retires one**, and a rebuild happens on a changed fingerprint *or* no
+connection, never the fingerprint alone.
+→ [ADR: the connection probe dials /api](../docs/adr/2026-08-25-connection-probe-dial.md).
 
 **Wiring**: `Acquire`'s first holder is `engine.Add`; the last `Release` is `engine.Remove`,
 under `Service.mu` so a stale release cannot remove the subject a fresh claim just added; the
-kubeconfig watch is `engine.WakeAll(probes.connection.ID())` on every change — every claimed context
-rather than the ones that moved, because finding which moved is what the probe does anyway.
+kubeconfig watch is `engine.WakeAll(nameConnection)` on every change — every claimed context
+rather than the ones that moved, because finding which moved is what the probe does anyway. `New`
+calls `configureHTTP2Keepalive` (10s/5s, only where unset): the vars are read when a transport is
+built and this package builds them, so a call the composition root has to remember is one that
+goes missing.
+
+**Retiring is the pool's because a run cannot do it**: `Pass.Commit` is buffered and applied after
+the run returns, so a probe closing `Done` first would leave holders reconnecting against a `Conn`
+still handing out the dead one. `publish` files what a pass concluded (`record`, one critical section, since a release landing
+between the entry check and the `published` write would announce a claim that is gone and leave a
+baseline the next claim's first pass compares equal to) and retires the connection nothing holds
+any more — including the connection a pass carries for a context
+that was released between the commit and the pass, which is the one a release could not reach.
+`Release` and `Close` retire what the entry holds, or a released context leaves its sockets
+behind.
 
 **Publishing is the engine's `OnChange`** — after every pass, outside the engine's lock,
 serialized per context. Two publish rules, because the two feeds answer different questions:
@@ -342,11 +369,13 @@ a stale lease.
 `internal/` type cannot be *named* outside, which would leave `Service` unimplementable by the
 resolver tests' fake. The layering exception is in `service.go`'s package doc.
 
-**A connection is scoped to one `Identity`**, so any of its three fields moving — server, version,
-user — retires it and builds another, and the field is stable for the connection's life. Comparing
-is the holder's (`Identity` is comparable); the pool's key is credentials, which do not move when a
-cluster is rebuilt behind them. `Identity` carries no errors, which is what keeps it comparable —
-why a field is missing belongs on the `Observation` that could not read it. Note what a username change does
+**Identity lives on `State`, not on `Connection`.** The three probes that read it depend on the
+connection, so a connection always exists before anything can identify the server behind it — a
+field stamped at build time would be empty for every connection's life. `State.Identity()` is the
+read surface, and it is comparable so a holder can compare: `Identity` carries no errors, since why
+a field is missing belongs on the `Observation` that could not read it. Retiring a connection
+because the *server* behind unchanged credentials moved is specified and unbuilt — it lands with
+the serverUID probe, which is the first thing that can produce an identity to compare. Note what a username change does
 **not** cover: ordinary RBAC edits leave it identical, so permissions need the
 `SelfSubjectRulesReview` behind `ClusterPermissions`.
 
@@ -792,7 +821,9 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
   find the pieces before they can see what a type does. So a file that earns its place owns a
   type or a body of free functions — not a slice of some other file's type's behavior. In
   `kubeconn` that puts the pool (`Service`'s methods) in `service.go`, the probes in `probe.go`,
-  and the reason vocabulary with `State`'s accessors in `state.go`.
+  the reason vocabulary with `State`'s accessors in `state.go`, and everything that happens over a
+  `Connection` — building it, its raw-path request, classifying a failure, the transport
+  keepalive — in `connection.go`.
 - **Resolver deps are always non-nil** — the composition root wires every field; tests use fakes.
 - **Pub/sub**: two modules, split on whether delivery is **keyed**. Unkeyed → `github.com/amorey/gochan`: `watch` for latest-value current-state streams (current snapshot on subscribe: auth `State`), `broadcast` for fan-out where subscribers supply their own snapshot (poke). Keyed → `github.com/amorey/gobus`: `watch` for a keyed latest-value bus. Note the two `watch` packages differ on registration — gochan's hub holds a seed and delivers it, gobus's delivers nothing until the next send (a subscriber that has already read the current value can pass it as a baseline, which is measured against and never delivered back). Never hand-roll a subscriber map.
 - **Work to do is a queue, not a bus** — `internal/workqueue`, one `Queue` per job: producers call

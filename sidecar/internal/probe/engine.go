@@ -51,6 +51,11 @@ type probeID int
 // the run found is recorded on the pass, wherever the body learns it; a body with no news just
 // returns. The engine applies the pass under its lock, so a run must do its waiting before it
 // returns.
+//
+// A probe whose value owns something — a connection, a file — also implements
+// `Discard(T)`, and is handed back any value the engine does not apply: a commit refused because
+// the subject was removed mid-run, a run that concluded Skip or returned the zero Result, and one
+// that panicked. Nothing else can reach such a value to release it.
 type Probe[T any] interface {
 	Run(ctx context.Context, pass *Pass[T]) Result
 }
@@ -136,7 +141,7 @@ type spec struct {
 	// dependencies and watches are cfg's names resolved once, at registration.
 	dependencies []probeID
 	watches      []probeID
-	run          func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any)
+	run          func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any, func())
 }
 
 // Option configures an Engine.
@@ -268,22 +273,42 @@ func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) {
 	if p == nil {
 		panic("probe: Register needs a probe")
 	}
-	run := func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any) {
+	run := func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any, func()) {
 		var pv T
 		if prev != nil {
 			pv = prev.(T)
 		}
 		pass := &Pass[T]{subject: subjectName, prev: pv, snap: snap}
+		// A run that panics has still committed whatever it committed before it did, and the
+		// engine applies none of it — so it is handed back here, on the way out to the
+		// recover that turns the panic into a result.
+		defer func() {
+			if r := recover(); r != nil {
+				handBack(p, pass)
+				panic(r)
+			}
+		}()
 		res := p.Run(ctx, pass)
 		if pass.next == nil {
-			return res, nil
+			return res, nil, nil
 		}
-		return res, *pass.next
+		return res, *pass.next, func() { handBack(p, pass) }
 	}
 	e.register(name, run, opts)
 }
 
-func (e *Engine) register(name string, run func(context.Context, string, any, Snapshot) (Result, any), opts []ProbeOption) {
+// handBack tells a probe that the engine dropped what its run committed, for one that asked to
+// be told by implementing Discard. A committed value can own something — a connection, a file —
+// and one the engine never applied is one nothing else can reach to release.
+func handBack[T any](p Probe[T], pass *Pass[T]) {
+	d, ok := p.(interface{ Discard(T) })
+	if !ok || pass.next == nil {
+		return
+	}
+	d.Discard(*pass.next)
+}
+
+func (e *Engine) register(name string, run func(context.Context, string, any, Snapshot) (Result, any, func()), opts []ProbeOption) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -632,10 +657,11 @@ func (e *Engine) runProbe(ctx context.Context, k key) {
 
 	var res Result
 	var val any
+	var discard func()
 	ran := false
 	switch dependencies {
 	case dependenciesOK:
-		res, val = e.dispatch(ctx, sp, k.subject, prev, snap)
+		res, val, discard = e.dispatch(ctx, sp, k.subject, prev, snap)
 		ran = true
 	case dependenciesFailing:
 		res = Suspend(ReasonDependencyFailed, "a dependency is failing")
@@ -643,7 +669,7 @@ func (e *Engine) runProbe(ctx context.Context, k key) {
 	default: // dependenciesUnanswered
 		res = Skip()
 	}
-	e.commit(k, sub, startedAt, res, val, ran)
+	e.commit(k, sub, startedAt, res, val, ran, discard)
 }
 
 // dispatch runs the probe's body, bounded by its timeout, and answers for it when it misbehaves.
@@ -651,7 +677,7 @@ func (e *Engine) runProbe(ctx context.Context, k key) {
 // otherwise the probe reads as in flight forever and its key stays held in the queue. Only here
 // does the engine log: the Internal record a caller sees carries no stack, and nothing else in
 // the system can report a bug in a body.
-func (e *Engine) dispatch(ctx context.Context, sp spec, subjectName string, prev any, snap Snapshot) (res Result, val any) {
+func (e *Engine) dispatch(ctx context.Context, sp spec, subjectName string, prev any, snap Snapshot) (res Result, val any, discard func()) {
 	if sp.cfg.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, sp.cfg.timeout)
@@ -661,16 +687,21 @@ func (e *Engine) dispatch(ctx context.Context, sp spec, subjectName string, prev
 		if r := recover(); r != nil {
 			slog.Error("probe: run panicked", "probe", sp.name, "subject", subjectName,
 				"panic", r, "stack", string(debug.Stack()))
-			res, val = Fail(ReasonInternal, fmt.Errorf("probe %s panicked: %v", sp.name, r)), nil
+			// The run handed its value back on the way out of the panic, so there is
+			// nothing left here to discard.
+			res, val, discard = Fail(ReasonInternal, fmt.Errorf("probe %s panicked: %v", sp.name, r)), nil, nil
 		}
 	}()
 
-	res, val = sp.run(ctx, subjectName, prev, snap)
+	res, val, discard = sp.run(ctx, subjectName, prev, snap)
 	if res.kind == resultInvalid {
 		slog.Error("probe: run returned the zero Result", "probe", sp.name, "subject", subjectName)
-		return Fail(ReasonInternal, fmt.Errorf("probe %s returned the zero Result", sp.name)), nil
+		if discard != nil {
+			discard()
+		}
+		return Fail(ReasonInternal, fmt.Errorf("probe %s returned the zero Result", sp.name)), nil, nil
 	}
-	return res, val
+	return res, val, discard
 }
 
 // commit files what a run concluded and asks for a pass. Called for every run, including one
@@ -678,10 +709,15 @@ func (e *Engine) dispatch(ctx context.Context, sp spec, subjectName string, prev
 //
 // The subject is re-checked under the lock, so a Remove landing mid-run cannot let a run that
 // predates a re-Add be committed against whatever holds the name now.
-func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, val any, ran bool) {
+func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, val any, ran bool, discard func()) {
 	e.mu.Lock()
 	if e.subjects[k.subject] != held {
 		e.mu.Unlock()
+		// Nothing will ever see what this run committed, so it goes back to the probe: a
+		// value can own something nothing else can now reach to release.
+		if discard != nil {
+			discard()
+		}
 		return
 	}
 
@@ -717,6 +753,10 @@ func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, v
 	case resultSkip:
 		if ran {
 			a.skipped = true
+		}
+		// A Skip records nothing, its value included.
+		if discard != nil {
+			defer discard()
 		}
 	}
 	// Due now rather than suspended: the pass this asks for is a queue hop away, and a zero

@@ -15,11 +15,9 @@
 // Package kubeconn hands out leases on kube-contexts and reports what probing the server behind
 // one found.
 //
-// **Nothing dials yet**, so Lease.Conn reports ErrNoConnection and the only answers State carries
-// are the ones a probe can reach without a server: a context that left the kubeconfig, and one
-// that will not resolve. The probes live in probe.go; the scheduling around them is the probe
-// engine's (internal/probe). This file is the rest: leases, and publishing what the engine
-// observes.
+// The probes live in probe.go and the scheduling around them is the probe engine's
+// (internal/probe). This file is the rest: leases, publishing what the engine observes, and
+// retiring the connections its runs build.
 //
 // Three rules shape it:
 //
@@ -49,8 +47,8 @@ import (
 )
 
 // kubeconfigService is the reader this package asks whether a context still resolves, and which
-// tells it when the file changed. The fingerprint RESTConfig returns beside the config is unused
-// until connections come back.
+// tells it when the file changed. The fingerprint RESTConfig returns beside the config describes
+// the credentials, and is what tells a rotation from a write that changed nothing.
 type kubeconfigService interface {
 	RESTConfig(contextName string) (*rest.Config, string, error)
 	Subscribe() kubeconfig.Subscription
@@ -77,13 +75,11 @@ type StateSubscription = *watch.Receiver[string, State]
 // about it. An interface because it crosses out of this package, where a caller's test has to
 // stand in for a live cluster.
 type Lease interface {
-	// Conn is the connection to the context's server.
-	//
-	// Nothing builds one yet, so this always reports ErrNoConnection.
+	// Conn is the connection to the context's server, or ErrNoConnection while the context
+	// resolves to nothing. It never dials: what it hands back is what the connection probe
+	// built, failing last probe included.
 	Conn(ctx context.Context) (*Connection, error)
 	// State is what the probes last found, probe by probe. It never dials.
-	//
-	// Nothing dials yet, so only the answers that need no server are real.
 	State() State
 	// WatchState carries every State published for this claim. It delivers nothing on attach,
 	// so a watcher pairs it with State for what is known now.
@@ -128,15 +124,25 @@ type Service struct {
 	wg sync.WaitGroup
 }
 
-// entry is a claimed context's holder count. A pointer per context on purpose: a claim carries
-// the entry it was given, which is what stops a release that outlived Close from touching
-// whatever claims the name next.
+// entry is a claimed context's holder count and the connection its probe built. A pointer per
+// context on purpose: a claim carries the entry it was given, which is what stops a release that
+// outlived Close from touching whatever claims the name next.
+//
+// The connection is here as well as in the engine's observable because the two answer different
+// questions: the engine's copy is what a run reads and what Conn hands out, and this one is who
+// to retire when the entry goes — an engine a Remove has already emptied can name nobody.
 type entry struct {
 	holders int
+	conn    *Connection
 }
 
 // New returns a Service over the one reader of the user's kubeconfig.
 func New(kubecfgSvc kubeconfigService) *Service {
+	// Here rather than in the composition root because the vars are read when a transport is
+	// built, and this package builds them — a call the root has to remember is one that goes
+	// missing.
+	configureHTTP2Keepalive()
+
 	s := &Service{
 		kubecfgSvc: kubecfgSvc,
 		engine:     probe.New(),
@@ -202,13 +208,29 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 // their holders: a claim outliving the pool is the holder's bug, and reading as nothing known is
 // what a dropped entry already does.
 func (s *Service) Close() error {
-	err := s.engine.Close()
-
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	dropped := make([]*Connection, 0, len(s.claimed))
+	for contextName, e := range s.claimed {
+		if e.conn != nil {
+			dropped = append(dropped, e.conn)
+		}
+		// The engine's copy too, and before it is closed: a pass whose commit landed while
+		// the pass worker was already stopped left the connection it built there and nowhere
+		// else. Retiring is idempotent, so the usual case retires the same one twice.
+		if v, tracked := s.engine.Read(contextName); tracked {
+			if conn := keyConnection.From(v).Value.conn; conn != nil {
+				dropped = append(dropped, conn)
+			}
+		}
+	}
 	clear(s.claimed)
 	clear(s.published)
+	s.mu.Unlock()
+
+	err := s.engine.Close()
+	for _, conn := range dropped {
+		conn.retire()
+	}
 	return err
 }
 
@@ -240,21 +262,48 @@ func (s *Service) publish(contextName string, v probe.Snapshot) {
 	st := s.stateOf(v)
 	n := s.newsOf(v, st)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, held := s.claimed[contextName]; !held {
+	stale, held, changed := s.record(contextName, keyConnection.From(v).Value.conn, n)
+	if stale != nil {
+		// Outside the lock: retiring closes sockets, and nothing about it needs the pool.
+		stale.retire()
+	}
+	if !held {
 		// The pass raced the last release; watchers on this name hear about whatever claims
 		// it next.
 		return
 	}
-	changed := s.published[contextName] != n
-	s.published[contextName] = n
 
 	s.stateHub.Sender().Send(contextName, st)
 	if changed {
 		s.signalHub.Sender().Send(contextName, struct{}{})
 	}
+}
+
+// record files what a pass concluded against the entry that must still be there to receive it,
+// and hands back the connection nothing holds any more for the caller to retire.
+//
+// One critical section, because the entry check is what makes the rest of it true: a release
+// landing between the two would leave this writing published for a context nobody holds — which
+// both announces a claim that is gone and leaves a stale baseline, so the first pass of whatever
+// claims the name next compares equal and tells the fleet nothing.
+//
+// held is not the same question as stale: what a release retired is the connection the *entry*
+// held, so a pass landing after one carries a connection nothing else can reach — that one is
+// the stale one.
+func (s *Service) record(contextName string, conn *Connection, n news) (stale *Connection, held, changed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.claimed[contextName]
+	if e == nil {
+		return conn, false, false
+	}
+	if e.conn != conn {
+		stale, e.conn = e.conn, conn
+	}
+	changed = s.published[contextName] != n
+	s.published[contextName] = n
+	return stale, true, changed
 }
 
 // news is the part of a pass a fleet reader reacts to: what the probes concluded, never when.
@@ -303,38 +352,53 @@ type claim struct {
 	released atomic.Bool
 }
 
+// Conn never dials: the connection is whatever the last run of the connection probe built.
+// A holder that wants to wait for one pairs State with WatchState, as it does for everything
+// else — a connection whose last probe failed is still handed out, since only the holder can
+// tell a revoked credential from a control plane mid-restart.
 func (c *claim) Conn(context.Context) (*Connection, error) {
-	return nil, fmt.Errorf("%w: %q", ErrNoConnection, c.contextName)
+	v, ok := c.svc.read(c.contextName, c.entry)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrNoConnection, c.contextName)
+	}
+	conn := keyConnection.From(v).Value.conn
+	if conn == nil {
+		return nil, fmt.Errorf("%w: %q", ErrNoConnection, c.contextName)
+	}
+	return conn, nil
 }
 
 func (c *claim) State() State {
-	state, _ := c.svc.read(c.contextName, c.entry)
-	return state
+	v, ok := c.svc.read(c.contextName, c.entry)
+	if !ok {
+		return State{}
+	}
+	return c.svc.stateOf(v)
 }
 
 func (c *claim) Departed() bool {
-	_, departed := c.svc.read(c.contextName, c.entry)
-	return departed
+	v, ok := c.svc.read(c.contextName, c.entry)
+	if !ok {
+		return true
+	}
+	return keyConnection.From(v).Value.departed
 }
 
 // read answers a claim from the engine, for the entry the claim was made for. Once the pool no
-// longer holds that entry — released, or dropped by Close — the claim reads as departed with
-// nothing known.
+// longer holds that entry — released, or dropped by Close — nothing is known, which a claim
+// reads as departed with no connection.
 //
 // The identity check comes after the engine read: the last holder can release and another
 // caller re-claim the name mid-read, and the state that came back is then the new claim's — the
 // check catches it, where one taken before the read would not.
-func (s *Service) read(contextName string, held *entry) (State, bool) {
+func (s *Service) read(contextName string, held *entry) (probe.Snapshot, bool) {
 	v, tracked := s.engine.Read(contextName)
 
 	s.mu.Lock()
 	valid := s.claimed[contextName] == held
 	s.mu.Unlock()
 
-	if !valid || !tracked {
-		return State{}, true
-	}
-	return s.stateOf(v), keyConnection.From(v).Value.departed
+	return v, valid && tracked
 }
 
 // WatchState takes no baseline: the hub compares against one only through an Accept, and this
@@ -359,20 +423,28 @@ func (c *claim) Release() {
 
 	s := c.svc
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	// Only the entry the claim was made for: Close drops entries out from under the leases
 	// still holding them, so a stale release must not decrement — or delete — whatever has
 	// claimed the name since.
 	if s.claimed[c.contextName] != c.entry {
+		s.mu.Unlock()
 		return
 	}
+	var dropped *Connection
 	c.entry.holders--
 	if c.entry.holders == 0 {
+		dropped = c.entry.conn
 		delete(s.claimed, c.contextName)
 		delete(s.published, c.contextName)
 		// Under the lock, so a release racing a fresh Acquire of the same name cannot remove
 		// the subject the new claim just added.
 		s.engine.Remove(c.contextName)
+	}
+	s.mu.Unlock()
+
+	// An entry that goes takes its connection with it: nothing probes the context now, so
+	// nothing else would ever close these sockets.
+	if dropped != nil {
+		dropped.retire()
 	}
 }

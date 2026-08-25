@@ -12,23 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The connection a holder will talk to one server over. **Nothing builds one yet** — the type
-// and the error are the seam the probe fills, so a holder that asks gets a clear answer rather
-// than a nil it has to interpret.
+// The connection a holder talks to one server over, and everything that happens across it:
+// building one, retiring one, the raw-path request the probes read an endpoint with, and what a
+// failed one means in this package's reason vocabulary. The connection probe builds them; the
+// pool retires them.
 package kubeconn
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
+	"sync"
 
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
 
-// ErrNoConnection reports that there is no connection to hand out. Every claim reports it today;
-// once the probe lands it means a context that resolves to nothing.
+// ErrNoConnection reports that there is no connection to hand out: a context that does not
+// resolve, or one whose connection has yet to be built.
 var ErrNoConnection = errors.New("no connection for kube-context")
+
+// The tuning every connection carries. The credentials come from the user's file; the budget
+// and the name we dial under are this package's to set.
+const (
+	defaultQPS   float32 = 20
+	defaultBurst int     = 40
+	userAgent            = "kstack-app"
+)
 
 // Connection is one identity and the clients built over the credentials reaching it. The clients
 // share one http.Client, so they share one connection pool — with HTTP/2 that is a single TCP
@@ -37,11 +55,6 @@ var ErrNoConnection = errors.New("no connection for kube-context")
 // Read-only, and it never changes after it is built. A caller that mutates Config is editing
 // what every other holder is using.
 type Connection struct {
-	// Identity is what the probe that validated this connection read, stable for its life: a
-	// probe reading anything different retires it. So a holder that knows which cluster it
-	// means compares before it reads. Nothing here can compare — a context resolving to the
-	// same credentials says nothing about which cluster is behind them.
-	Identity Identity
 	// Config is what the clients below were built from. Exposed for the client-go
 	// constructors that take one and build their own transport (exec, port-forward);
 	// anything that can use Dynamic or HTTPClient should.
@@ -58,11 +71,202 @@ type Connection struct {
 	// done closes when this connection is retired. Nil in a connection nobody built, which
 	// reads as never retired.
 	done chan struct{}
+	once sync.Once
 }
 
-// Done closes when a probe reads a different Identity and this connection is retired.
+// newConnection materializes the clients for one set of credentials.
+func newConnection(cfg *rest.Config) (*Connection, error) {
+	// A copy, because the tuning below is ours and the caller's config is not.
+	own := rest.CopyConfig(cfg)
+	own.QPS = defaultQPS
+	own.Burst = defaultBurst
+	own.UserAgent = userAgent
+
+	// DefaultServerUrlFor rather than DefaultServerURL: it derives the scheme from whether the
+	// config actually carries CA or client-cert data, so a scheme-less plain-HTTP endpoint (a
+	// port-forward) stays HTTP instead of failing at a handshake.
+	baseURL, apiPath, err := rest.DefaultServerUrlFor(own)
+	if err != nil {
+		return nil, fmt.Errorf("resolve server URL: %w", err)
+	}
+
+	httpClient, err := rest.HTTPClientFor(own)
+	if err != nil {
+		return nil, fmt.Errorf("build http client: %w", err)
+	}
+
+	// NewForConfigAndClient, never NewForConfig: the latter builds a fresh client and a fresh
+	// pool, which is the whole thing one connection per context exists to avoid.
+	dyn, err := dynamic.NewForConfigAndClient(own, httpClient)
+	if err != nil {
+		return nil, fmt.Errorf("build dynamic client: %w", err)
+	}
+
+	return &Connection{
+		Config:     own,
+		BaseURL:    baseURL,
+		APIPath:    apiPath,
+		HTTPClient: httpClient,
+		Dynamic:    dyn,
+		done:       make(chan struct{}),
+	}, nil
+}
+
+// Done closes when this connection is retired: the credentials moved, or the last claim on the
+// context went.
 //
 // For the holder nothing else reaches: a long-lived stream is blocked in a read, so a field it
 // is not re-reading cannot tell it that what it derived here no longer holds. A caller that asks
 // per operation re-calls Lease.Conn instead.
 func (c *Connection) Done() <-chan struct{} { return c.done }
+
+// retire tells every holder this connection is void and gives its idle sockets back. Once,
+// because publish and Release can both reach one on the way out and neither can cheaply prove
+// the other did not.
+func (c *Connection) retire() {
+	c.once.Do(func() {
+		close(c.done)
+		c.HTTPClient.CloseIdleConnections()
+	})
+}
+
+// errBadRequest is a request that could not be built, and errMalformed a response that would not
+// parse — the latter usually meaning a proxy or captive portal answered for the API server.
+var (
+	errBadRequest = errors.New("malformed request")
+	errMalformed  = errors.New("malformed response")
+)
+
+// httpErr is a response that was not 2xx. The code is the whole evidence a raw endpoint leaves,
+// so it travels as data rather than inside a formatted string.
+type httpErr struct {
+	path   string
+	code   int
+	status string
+}
+
+func (e *httpErr) Error() string { return fmt.Sprintf("%s: %s", e.path, e.status) }
+
+// maxDiscard bounds what is read off a response nobody wants: enough for an error page, and
+// short of anything a hostile endpoint could stream.
+const maxDiscard = 4 << 10
+
+// getJSON reads one raw API path and decodes the response into out.
+func (c *Connection) getJSON(ctx context.Context, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL.JoinPath(path).String(), nil)
+	if err != nil {
+		return fmt.Errorf("%w %s: %w", errBadRequest, path, err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// Drained so the connection can be reused: an HTTP/1.1 fallback will not take it
+		// back with a body outstanding, and a probe that is refused gets one of these every
+		// cadence. Bounded, since the body is an error page we do not read.
+		_, _ = io.CopyN(io.Discard, resp.Body, maxDiscard)
+		return &httpErr{path: path, code: resp.StatusCode, status: resp.Status}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("%w from %s: %w", errMalformed, path, err)
+	}
+	return nil
+}
+
+// classify names why a request failed.
+//
+// Order is load-bearing: everything below arrives wrapped in the same *url.Error, so the
+// specific tests come before the transport catch-all. A rejected certificate read as a server
+// that never answered would send the user looking for an outage instead of at their CA.
+//
+// Cancellation is not here. A run ending because the caller went away records nothing at all,
+// which is a Skip rather than a reason.
+func classify(err error) Reason {
+	var status *httpErr
+	switch {
+	case errors.As(err, &status):
+		return statusReason(status.code)
+	case isTLSError(err):
+		return ReasonTLSInvalid
+	case errors.Is(err, context.DeadlineExceeded):
+		// Ours, not the caller's: the deadline was the probe's own, and the answer that did
+		// not arrive in time is news about the cluster.
+		return ReasonTimeout
+	case errors.Is(err, errMalformed):
+		return ReasonMalformed
+	case errors.Is(err, errBadRequest):
+		return ReasonInternal
+	default:
+		// Nothing answered: DNS, a refused connection, no route. The transport has many
+		// spellings for it and they all mean the same thing to a reader.
+		return ReasonUnreachable
+	}
+}
+
+// statusReason names a response the server did give. A code with no meaning of its own is
+// Malformed rather than a fault of the API server's: the likeliest sender is a proxy between us
+// and it.
+func statusReason(code int) Reason {
+	switch code {
+	case http.StatusUnauthorized:
+		return ReasonUnauthorized
+	case http.StatusForbidden:
+		return ReasonForbidden
+	case http.StatusTooManyRequests:
+		return ReasonThrottled
+	case http.StatusInternalServerError:
+		return ReasonInternalError
+	case http.StatusServiceUnavailable:
+		return ReasonServiceUnavailable
+	default:
+		return ReasonMalformed
+	}
+}
+
+// isTLSError reports whether the handshake is what failed. Four spellings, because the
+// certificate can be rejected by our own verification or by the far end reporting it.
+func isTLSError(err error) bool {
+	// Three of the four are value types, which is what crypto/x509 returns them as: a pointer
+	// target matches nothing the transport emits.
+	var (
+		unknownAuthority x509.UnknownAuthorityError
+		invalidCert      x509.CertificateInvalidError
+		wrongHost        x509.HostnameError
+		verification     *tls.CertificateVerificationError
+	)
+	return errors.As(err, &unknownAuthority) ||
+		errors.As(err, &invalidCert) ||
+		errors.As(err, &wrongHost) ||
+		errors.As(err, &verification)
+}
+
+// The env vars apimachinery's transport defaults read, and the values we want. Against
+// client-go's 30s/15s defaults these turn a silently-dropped API-server connection into
+// a ~15s detection instead of ~45s, which is how fast anything watching a cluster
+// notices it is gone. → docs/adr/2026-08-09-connection-probing.md.
+const (
+	readIdleTimeoutEnv = "HTTP2_READ_IDLE_TIMEOUT_SECONDS"
+	pingTimeoutEnv     = "HTTP2_PING_TIMEOUT_SECONDS"
+
+	readIdleTimeoutSeconds = 10
+	pingTimeoutSeconds     = 5
+)
+
+// configureHTTP2Keepalive tightens client-go's HTTP/2 health check, only where the
+// operator has not set a value. The vars are read lazily per transport build, so New
+// calling this is enough for every connection the pool goes on to build.
+func configureHTTP2Keepalive() {
+	setEnvIfUnset(readIdleTimeoutEnv, strconv.Itoa(readIdleTimeoutSeconds))
+	setEnvIfUnset(pingTimeoutEnv, strconv.Itoa(pingTimeoutSeconds))
+}
+
+func setEnvIfUnset(key, val string) {
+	if _, ok := os.LookupEnv(key); !ok {
+		_ = os.Setenv(key, val)
+	}
+}

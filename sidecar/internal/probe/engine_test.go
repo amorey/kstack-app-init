@@ -978,3 +978,98 @@ func TestCloseStopsTheTimersAndTheQueues(t *testing.T) {
 	_, ok := e.runQ.Next(within(t))
 	assert.False(t, ok, "the run queue outlived Close")
 }
+
+// --- values the engine drops ---
+
+// discarding is a probe whose committed values it records when the engine hands them back.
+type discarding struct {
+	steered
+	discarded *testutil.Probe[string]
+	// panicAfterCommit is a body that commits and then panics, which steered cannot express:
+	// its hook runs before the commit.
+	panicAfterCommit string
+}
+
+func (p *discarding) Discard(v string) { p.discarded.Fire(v) }
+
+func (p *discarding) Run(ctx context.Context, pass *Pass[string]) Result {
+	if p.panicAfterCommit != "" {
+		pass.Commit(p.panicAfterCommit)
+		panic("probe body bug")
+	}
+	return p.steered.Run(ctx, pass)
+}
+
+// A committed value can own something — a connection, a file — so a value the engine drops is
+// handed back rather than dropped silently: nothing else can reach it to release it.
+func TestARefusedCommitIsHandedBack(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	p := &discarding{discarded: testutil.NewProbe[string](4)}
+	p.res = Succeeded()
+	p.commits("built")
+	// Removing the subject from inside the run is the race a Release loses: the commit
+	// arrives against a subject that has gone.
+	p.onRun = func() { e.Remove("prod") }
+	Register(e, "conn", p)
+	stop := e.Start(t.Context())
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	e.Add("prod")
+
+	assert.Equal(t, "built", p.discarded.Await(t, "the refused value"))
+}
+
+// A Skip records nothing, so a value the body committed before concluding one goes the same way.
+func TestASkippedRunsValueIsHandedBack(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	p := &discarding{discarded: testutil.NewProbe[string](4)}
+	p.res = Skip()
+	p.commits("built")
+	Register(e, "conn", p)
+	stop := e.Start(t.Context())
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	e.Add("prod")
+
+	assert.Equal(t, "built", p.discarded.Await(t, "the skipped value"))
+}
+
+// A body that panics has still committed whatever it committed before it did, and the engine
+// applies none of it — so that value is handed back too, or a panic leaks what it built.
+func TestAPanickingRunsValueIsHandedBack(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	p := &discarding{discarded: testutil.NewProbe[string](4), panicAfterCommit: "built"}
+	p.res = Succeeded()
+	Register(e, "conn", p)
+	stop := e.Start(t.Context())
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	e.Add("prod")
+
+	assert.Equal(t, "built", p.discarded.Await(t, "the panicking run's value"))
+}
+
+// The ordinary path: a value the engine applied is the probe's own to read back, and handing it
+// back as dropped would have a caller release what is live.
+func TestAnAppliedValueIsNotHandedBack(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	p := &discarding{discarded: testutil.NewProbe[string](4)}
+	p.res = Succeeded()
+	p.commits("built")
+	Register(e, "conn", p)
+	stop := e.Start(t.Context())
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	e.Add("prod")
+
+	require.Eventually(t, func() bool {
+		snap, ok := e.Read("prod")
+		return ok && Get[string](snap, "conn").Value == "built"
+	}, testutil.Timeout, time.Millisecond, "the value to land")
+	_, dropped := p.discarded.TryAwait()
+	assert.False(t, dropped, "an applied value is not a dropped one")
+}
