@@ -37,7 +37,7 @@ is leases and publishing.
 controller shape, with `T` its observable's value type, inferred at
 `Register(e, name, p, opts...)`; a run hands back its result plus its next value (nil keeps the
 previous one), and the engine records the pair: one value beside one `Attempts` per probe,
-committed under the engine's lock. `Read` and `OnChange` hand the set back as a `View`, and the
+committed under the engine's lock. `Read` and `OnPass` hand the set back as a `Snapshot`, and the
 typed `Handle[T]` registration returned projects one probe's `Observation[T]` out of it. This
 replaced a caller-defined subject snapshot handed back beside `[]Attempts`: the engine stamped
 `LastSeen` — bookkeeping about a value — for a value it never held, every consumer had to rebuild
@@ -46,7 +46,7 @@ that), and "a probe writes only the observation it owns" was discipline where it
 structure. The engine is not generic; heterogeneous value types coexist because the handle is
 the one door in or out of the erased storage. What was lost is a place for cross-probe
 invariants maintained in one commit, which nothing used; a consumer that needs one can fold its
-own struct in `OnChange`.
+own struct in `OnPass`.
 
 **A run's own `Result` is its schedule.** `Succeeded` is due again after the probe's interval,
 `Fail` climbs the backoff ladder, `Suspend` records why and waits for a `Wake`, and `Skip` records
@@ -102,7 +102,7 @@ Three things the engine deliberately does not have. There is **no clock seam**: 
 option — `WithInterval`, `WithBackoff`, `WithTimeout` shrunk — which is the repo's rule for
 timing-dependent units, and a clock would be a second mechanism for the same job. There are **no
 metrics**: `Attempts` already carries verdict, latency, failure count, and `FailingSince`, and
-`OnChange` publishes them on every pass, so the observability surface is the data itself. And
+`OnPass` publishes them on every pass, so the observability surface is the data itself. And
 there is **no injected logger** — the engine logs through `slog` like the rest of the sidecar, and
 only where nothing else can report: a body that panicked or handed back nothing.
 
