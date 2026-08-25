@@ -24,4 +24,5 @@ A spec left behind after the code ships is a second source of truth.
 
 | Spec | Scope | Status |
 | --- | --- | --- |
+| [Connection probe](connection-probe.md) | sidecar | Planned |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |
