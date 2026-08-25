@@ -72,3 +72,34 @@ func TestTheZeroResultIsInvalid(t *testing.T) {
 	assert.Equal(t, resultInvalid, Result{}.kind, "constructors are the only way to a valid Result")
 	assert.NotEqual(t, resultInvalid, Skip().kind)
 }
+
+// The read side is what a probe body's own tests assert on, without giving a body a way to build
+// a Result the constructors cannot.
+func TestAResultReportsWhatItWasBuiltFrom(t *testing.T) {
+	err := errors.New("open ca.crt: no such file")
+
+	failed := Fail("ResolveFailed", err)
+	assert.Equal(t, VerdictFailed, failed.Verdict())
+	assert.Equal(t, Reason("ResolveFailed"), failed.Reason())
+	assert.Equal(t, err.Error(), failed.Message())
+	assert.ErrorIs(t, failed.Err(), err)
+	assert.False(t, failed.IsSkip())
+
+	suspended := Suspend("ContextNotFound", "the file no longer names it")
+	assert.Equal(t, VerdictSuspended, suspended.Verdict())
+	assert.Equal(t, "the file no longer names it", suspended.Message())
+	assert.NoError(t, suspended.Err())
+
+	assert.True(t, Skip().IsSkip())
+	assert.Equal(t, ReasonSucceeded, Succeeded().Reason())
+}
+
+// Latency is the run's own time, which only a dispatched run that finished has: a run still out
+// has none to report, and one the engine recorded without dispatching never started.
+func TestLatencyIsOnlyForARunThatWasDispatchedAndFinished(t *testing.T) {
+	assert.Zero(t, Attempt{StartedAt: runAt}.Latency(), "still running")
+	assert.Zero(t, Attempt{FinishedAt: runAt}.Latency(), "recorded, never dispatched")
+
+	ran := Attempt{StartedAt: runAt, FinishedAt: runAt.Add(2 * time.Second)}
+	assert.Equal(t, 2*time.Second, ran.Latency())
+}

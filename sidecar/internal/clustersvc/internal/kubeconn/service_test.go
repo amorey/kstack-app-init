@@ -422,8 +422,7 @@ func TestAcquireAsksForANewContextsPresence(t *testing.T) {
 func TestAcquireAsksOnlyForANewContext(t *testing.T) {
 	cfg := counting("prod", "key-1")
 	s := New(cfg)
-	stop, err := s.engine.Start(t.Context())
-	require.NoError(t, err)
+	stop := s.engine.Start(t.Context())
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 	first := s.Acquire("prod")
 	defer first.Release()
@@ -511,4 +510,32 @@ func TestStartWatchesTheKubeconfigUntilStopped(t *testing.T) {
 	cfg.changed()
 
 	require.NoError(t, stop(t.Context()))
+}
+
+// A pass can land after the last holder let go — the engine's Remove and this publish are not
+// one step. Announcing then would tell watchers on this name about a claim nobody holds, and
+// leave news behind for whatever claims it next to be compared against.
+func TestAPublishForAReleasedClaimIsDropped(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	lease := s.Acquire("prod")
+	v, ok := s.engine.Read("prod")
+	require.True(t, ok)
+	s.publish("prod", v)
+	require.Contains(t, s.published, "prod", "a held claim publishes")
+
+	lease.Release()
+	s.publish("prod", v)
+
+	assert.NotContains(t, s.published, "prod")
+}
+
+// The feed ending is one of the two ways the watch is meant to finish; the other is its context
+// being cancelled. Neither leaves the goroutine parked.
+func TestTheKubeconfigWatchEndsWhenItsFeedCloses(t *testing.T) {
+	cfg := resolving("prod", "key-1")
+	s := New(cfg)
+	cfgs := cfg.Subscribe()
+	cfgs.Close()
+
+	testutil.WaitReturn(t, func() { s.watchKubeconfig(context.Background(), cfgs) }, "the watch to end")
 }

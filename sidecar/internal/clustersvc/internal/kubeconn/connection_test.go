@@ -32,3 +32,19 @@ func TestConnReportsThatNothingBuildsOneYet(t *testing.T) {
 	assert.Nil(t, conn)
 	assert.ErrorIs(t, err, ErrNoConnection)
 }
+
+// A connection nobody built has a nil channel, which blocks forever — reading as never retired,
+// where a closed one would tell every holder its connection had gone.
+func TestDoneOnAConnectionNobodyBuiltNeverFires(t *testing.T) {
+	var c Connection
+
+	select {
+	case <-c.Done():
+		t.Fatal("an unbuilt connection reported itself retired")
+	default:
+	}
+
+	retired := Connection{done: make(chan struct{})}
+	close(retired.done)
+	<-retired.Done()
+}

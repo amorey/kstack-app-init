@@ -418,10 +418,10 @@ func (e *Engine) Read(subjectName string) (snap Snapshot, ok bool) {
 	return e.snapshotOf(sub), true
 }
 
-// Start runs the pass worker and the run workers; the stop func cancels them and waits. ctx
-// bounds startup alone. The queues were built in New, so work queued before Start — an Add, a
-// Wake — waits there for the workers.
-func (e *Engine) Start(context.Context) (func(context.Context) error, error) {
+// Start runs the pass worker and the run workers, and hands back the stop func that cancels
+// them and waits. ctx bounds startup alone, and nothing here can fail — the queues were built in
+// New, so work queued before Start (an Add, a Wake) simply waits there for the workers.
+func (e *Engine) Start(context.Context) func(context.Context) error {
 	e.mu.Lock()
 	e.started = true
 	e.mu.Unlock()
@@ -438,7 +438,7 @@ func (e *Engine) Start(context.Context) (func(context.Context) error, error) {
 	return func(ctx context.Context) error {
 		stopLoops()
 		return drain.WithContext(ctx, e.wg.Wait)
-	}, nil
+	}
 }
 
 // Close drops every subject and closes the queues. Past here nothing works them off.

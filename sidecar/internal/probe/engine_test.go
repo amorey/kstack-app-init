@@ -169,6 +169,21 @@ func takeRun(t *testing.T, e *Engine) key {
 	return k
 }
 
+// drainRuns empties the run queue, so a following negative assertion answers to what the test
+// did rather than to what the subject already owed.
+func drainRuns(t *testing.T, e *Engine) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Next takes what is queued and reports rather than waiting for more.
+	for {
+		k, ok := e.runQ.Next(ctx)
+		if !ok {
+			return
+		}
+		e.runQ.Done(k)
+	}
+}
+
 // noRuns is a negative assertion, so it needs a bounded window rather than the failsafe: it
 // fails the instant a run is handed out.
 func noRuns(t *testing.T, e *Engine, msg string) {
@@ -197,12 +212,33 @@ func att(t *testing.T, e *Engine, name string) Attempts {
 
 func startEngine(t *testing.T, e *Engine) {
 	t.Helper()
-	stop, err := e.Start(t.Context())
-	require.NoError(t, err)
+	stop := e.Start(t.Context())
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 }
 
 // --- registration ---
+
+// The engine's own knobs are options too, and a New that states none takes the defaults.
+func TestWithWorkersSetsTheRunWorkerCount(t *testing.T) {
+	assert.Equal(t, 3, New(WithWorkers(3)).settings.workers)
+	assert.Positive(t, New().settings.workers, "a default fleet")
+}
+
+// Register needs something to run, and something to call it.
+func TestRegisterPanicsWithoutAProbeOrAName(t *testing.T) {
+	e := New()
+
+	assert.Panics(t, func() { Register[string](e, "conn", nil) })
+	assert.Panics(t, func() { Register(e, "", &steered{}) })
+}
+
+// OnChange is wiring, set before the engine runs — like a registration.
+func TestOnChangePanicsAfterStart(t *testing.T) {
+	e, _, _ := single(t, Skip())
+	startEngine(t, e)
+
+	assert.Panics(t, func() { e.OnChange(func(string, Snapshot) {}) })
+}
 
 // A probe's public identity is its name; the index behind it is the engine's own.
 func TestRegisterResolvesAnEdgeToTheProbeItNames(t *testing.T) {
@@ -254,6 +290,19 @@ func TestRegisterPanicsAfterAdd(t *testing.T) {
 }
 
 // --- subjects and the pass ---
+
+// Removing what was never added, passing over it, and dispatching against it are all no-ops: a
+// subject can go while work naming it is still queued.
+func TestASubjectNothingTracksIsANoOpEverywhere(t *testing.T) {
+	e, p, _ := single(t, Succeeded())
+
+	e.Remove("never-added")
+	e.pass("never-added")
+	e.runProbe(t.Context(), key{subject: "never-added"})
+
+	assert.Zero(t, p.count(), "a run was dispatched against a subject nothing tracks")
+	noRuns(t, e, "a pass over a subject nothing tracks queued work")
+}
 
 // A fresh subject owes exactly its runnable probes: the dependent waits on an answer, and a
 // second Add of the same name asks for nothing.
@@ -320,6 +369,20 @@ func TestARunAgainstARemovedSubjectCommitsNothing(t *testing.T) {
 }
 
 // --- wakes ---
+
+// A name nothing was registered under is a wiring bug; a subject nothing tracks is not, since a
+// claim can be released while a wake for it is in flight.
+func TestWakeIgnoresAnUntrackedSubjectAndPanicsOnAnUnknownProbe(t *testing.T) {
+	e, _, id := single(t, Succeeded())
+	e.Add(subj)
+	e.settle()
+	drainRuns(t, e)
+
+	e.Wake("nobody-tracks-this", id)
+	noRuns(t, e, "a wake reached a subject nothing tracks")
+
+	assert.Panics(t, func() { e.Wake(subj, "nope") })
+}
 
 // A Wake landing mid-run is redelivered when that run commits: the run in flight had already
 // passed the thing the Wake is about.
@@ -528,6 +591,23 @@ func TestDependenciesAreRecheckedAtDispatch(t *testing.T) {
 
 	assert.Zero(t, bBody.count(), "the body dialed a server the state already said was down")
 	assert.Equal(t, ReasonDependencyFailed, att(t, e, bID).LastAttempt.Reason)
+}
+
+// A wake can outrun the pass and dispatch a probe whose dependency has never answered. The run
+// ends as a no-op — nothing to say about a server nobody has tried — and the pass owns the
+// question again.
+func TestARunDispatchedBeforeItsDependencyAnsweredRecordsNothing(t *testing.T) {
+	e, _, b, _, bName := pair(t, Skip(), Succeeded())
+	e.Add(subj)
+	e.settle()
+	drainRuns(t, e)
+
+	e.Wake(subj, bName)
+	runNext(t, e)
+
+	assert.Zero(t, b.count(), "the body ran with nothing to run over")
+	at := att(t, e, bName)
+	assert.False(t, at.LastAttempt.Done(), "an untouched probe records nothing")
 }
 
 // --- the data edge ---
@@ -790,82 +870,6 @@ func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {
 	assert.Equal(t, "uid-1", after.Value, "the value outlives the failure")
 	assert.Equal(t, seen.LastSeen, after.LastSeen, "a failure is not a read")
 	assert.False(t, after.OK())
-}
-
-// --- keys ---
-
-// A key states the name↔type pairing once, beside the probe, where Get restates it at every
-// read site.
-func TestAKeyReadsTheObservableItNames(t *testing.T) {
-	e, p, _ := single(t, Succeeded())
-	p.commits("v1")
-	e.Add(subj)
-	e.settle()
-	runNext(t, e)
-	conn := NewKey[string]("conn")
-
-	read, _ := e.Read(subj)
-	o := conn.From(read)
-
-	assert.Equal(t, "conn", conn.Name())
-	assert.Equal(t, "v1", o.Value)
-	assert.True(t, o.Known())
-}
-
-// --- reading an observable ---
-
-// A body reads a sibling by the name it was registered under, with no wiring: the whole
-// observation comes back, value beside the attempts that account for it.
-func TestGetReadsAnObservableByName(t *testing.T) {
-	e, p, _ := single(t, Succeeded())
-	p.commits("v1")
-	e.Add(subj)
-	e.settle()
-	runNext(t, e)
-
-	read, _ := e.Read(subj)
-	o := Get[string](read, "conn")
-
-	assert.Equal(t, "v1", o.Value)
-	assert.True(t, o.Known())
-	assert.True(t, o.OK(), "the attempts come with it")
-}
-
-// A name nothing was registered under is a wiring bug, loud like the rest of them.
-func TestGetPanicsOnAnUnregisteredName(t *testing.T) {
-	e, _, _ := single(t, Succeeded())
-	e.Add(subj)
-	read, _ := e.Read(subj)
-
-	assert.Panics(t, func() { Get[string](read, "nope") })
-}
-
-// The name and the type are stated separately, so they can disagree. A read that asks for the
-// wrong one is a wiring bug too — never a zero value passed off as an answer.
-func TestGetPanicsOnTheWrongType(t *testing.T) {
-	e, p, _ := single(t, Succeeded())
-	p.commits("v1")
-	e.Add(subj)
-	e.settle()
-	runNext(t, e)
-	read, _ := e.Read(subj)
-
-	assert.Panics(t, func() { Get[int](read, "conn") })
-}
-
-// Before anything is committed there is no value to type-check against, so the read answers
-// "nothing known yet" rather than guessing — and the attempts still explain why.
-func TestGetOnAProbeThatHasNotCommittedIsNotKnown(t *testing.T) {
-	e, _, _ := single(t, Fail("Unreachable", assert.AnError))
-	e.Add(subj)
-	e.settle()
-	runNext(t, e)
-
-	read, _ := e.Read(subj)
-	o := Get[string](read, "conn")
-
-	assert.False(t, o.Known())
-	assert.Equal(t, Reason("Unreachable"), o.LastAttempt.Reason)
 }
 
 // A success dates the value it confirmed, so a run that has never had a value to confirm dates

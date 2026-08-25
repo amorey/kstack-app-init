@@ -98,3 +98,13 @@ func TestIdentityLeavesAnUnreadPartEmpty(t *testing.T) {
 		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
 	}.Identity(), "why the UID is missing is the observation's, not the identity's")
 }
+
+// The phase a connection that answered reports — unreachable while nothing dials, and the case
+// every reader of Phase is waiting for.
+func TestPhaseReadsASucceededConnectionAsProbed(t *testing.T) {
+	s := State{Connection: Observation[string]{
+		Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Verdict: VerdictSucceeded, Reason: ReasonSucceeded}},
+	}}
+
+	assert.Equal(t, PhaseProbed, s.Phase())
+}

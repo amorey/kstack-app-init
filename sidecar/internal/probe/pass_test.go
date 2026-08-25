@@ -43,3 +43,18 @@ func TestTheLastCommitOnAPassWins(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, "v2", got)
 }
+
+// The snapshot the run was dispatched against comes back off the pass — how a body reaches a
+// sibling's value without anything being wired into it.
+func TestAPassCarriesTheSnapshotItWasHanded(t *testing.T) {
+	e, body, _ := single(t, Succeeded())
+	body.commits("v1")
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+	read, _ := e.Read(subj)
+
+	p := NewPass("ctx-1", "v0", read)
+
+	assert.Equal(t, "v1", Get[string](p.Snapshot(), "conn").Value)
+}
