@@ -54,15 +54,25 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 - **Identity-driven connection retirement is specified and unbuilt.** The connection probe retires
   on a changed credential fingerprint alone; a *server* that changed behind unchanged credentials
   does not retire anything, so a holder would go on using a connection whose cluster is no longer
-  the one it derived from. **Fix:** `connInfo` records the identity the current connection was
-  validated against, and a **known** part reading differently retires it — a part filling in from
-  empty is the first identification, not a new server, and treating it as one would rebuild every
-  connection once. The connection probe cannot declare a watch edge on the identity probes
+  the one it derived from. **Fix:** a **known** identity reading differently retires the connection
+  — a part filling in from empty is the first identification, not a new server, and treating it as
+  one would rebuild every connection once. The connection probe cannot declare a watch edge on the identity probes
   (`resolveLocked` takes only already-registered names, which is what keeps the graph acyclic), so
   promptness comes from `publish` calling `Wake(contextName, nameConnection)` when identity moves —
   a `Wake` is not an edge. **The trigger has fired**: serverUID, serverVersion and principal all
   answer now, so `State.Identity()` is populated and nothing acts on it moving. → [ADR: the
   connection probe dials /api](docs/adr/2026-08-25-connection-probe-dial.md).
+  - **Do not record the identity on `connInfo`.** That would have the connection probe read a UID
+    off its own snapshot — the stale pairing [ADR: connection-carried
+    identity](docs/adr/2026-08-25-connection-carried-identity.md) rejected, where a re-dial landing
+    before the UID probe re-runs commits `{conn: B, identity: uid-A}` and makes a transient window
+    durable. The identity is already on `Connection`, stamped by the probe that read it, and
+    `setServerUID` already **records the conflict** when a second, different uid arrives — which
+    makes `ConnFor` refuse every caller. **This item is now only the recovery half:** nothing
+    rebuilds a connection whose credentials never changed, so a swapped server stalls
+    identity-scoped work over that connection instead of corrupting it. Wire `publish` to
+    `Wake(contextName, nameConnection)` on the conflict and have the connection probe rebuild,
+    which turns the stall back into a working connection to the new cluster.
 
 - **`classify` has no `*apierrors.StatusError` branch.** Every probe reads a raw endpoint today, so
   a status code is the whole evidence and `statusReason` covers it. **Trigger:** the first probe

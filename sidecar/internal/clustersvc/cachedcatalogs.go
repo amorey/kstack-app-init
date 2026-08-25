@@ -247,12 +247,12 @@ func (c *clusterCachedCatalogController) Reconcile(
 		return beehive.Settled()
 	}
 
-	clusterObj, err := c.clusterOf(ctx, client)
+	own, err := c.ownersOf(ctx, client)
 	if err != nil {
 		return beehive.Fail(err)
 	}
 	// The subtree above is being collected, which will take this catalog with it.
-	if clusterObj == nil {
+	if own.cluster == nil {
 		c.kubecatalogSvc.Forget(obj.Name)
 		return beehive.Settled()
 	}
@@ -266,7 +266,7 @@ func (c *clusterCachedCatalogController) Reconcile(
 		return c.relayPause(ctx, client, obj)
 	}
 
-	contextName, err := clusterContext(clusterObj)
+	contextName, err := clusterContext(own.cluster)
 	if err != nil {
 		// The record's own state — disabled, deleting, or credential-less — which the
 		// cluster pass reports on its own conditions. Nothing can sweep, so the
@@ -278,64 +278,79 @@ func (c *clusterCachedCatalogController) Reconcile(
 	// Arming is this pass's other job: the subject exists exactly while the record
 	// wants discovery, keyed by the record's own name so the sweeper's change signal
 	// is the requeue.
-	c.kubecatalogSvc.Track(obj.Name, contextName)
+	c.kubecatalogSvc.Track(obj.Name, contextName, own.cache.Spec.ServerUID)
 
 	obs, ok := c.kubecatalogSvc.Read(obj.Name)
 	if !ok || !obs.Known() {
 		// Armed, no answer yet. The trigger re-runs this fold when one lands, and the
 		// kind's resync is the backstop — so no requeue here.
+		//
+		// Connecting is the default because most waits here are the first sweep coming.
+		// The other two are named because they are not that: a cluster nothing reached,
+		// and a connection that will not answer for this cache until the record changes.
 		reason := ReasonConnecting
-		if obs.LastAttempt.Reason == kubecatalog.ReasonNoConnection {
+		switch obs.LastAttempt.Reason {
+		case kubecatalog.ReasonNoConnection:
 			reason = ReasonNoConnection
+		case kubecatalog.ReasonIdentityMismatch:
+			reason = ReasonIdentityMismatch
 		}
 		return observeDiscovered(ctx, client, ConditionFalse, reason, obs.LastAttempt.Message)
 	}
 	return c.converge(ctx, client, obj, obs)
 }
 
-// clusterOf walks the two owner edges above a catalog — cache, then cluster. A nil cluster
-// with no error means something in that chain is gone or going, which is a cascade about to
-// take this catalog rather than a failure to retry.
-func (c *clusterCachedCatalogController) clusterOf(
+// owners is the chain above a catalog: the cache it anchors and the cluster that cache
+// mirrors. Both, because the pass needs the cluster's context to sweep over and the
+// cache's identity to say which server that sweep must answer as.
+type owners struct {
+	cache   *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]
+	cluster *beehive.Object[ClusterSpec, ClusterStatus]
+}
+
+// ownersOf walks the two owner edges above a catalog. A zero owners with no error means
+// something in that chain is gone or going, which is a cascade about to take this catalog
+// rather than a failure to retry.
+func (c *clusterCachedCatalogController) ownersOf(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCachedCatalogStatus],
-) (*beehive.Object[ClusterSpec, ClusterStatus], error) {
+) (owners, error) {
 	// The reconcile load carries no edges, so each owner is a lookup rather than a field.
 	cacheRef, ok, err := client.GetOwner(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("read cached catalog owner: %w", err)
+		return owners{}, fmt.Errorf("read cached catalog owner: %w", err)
 	}
 	if !ok {
-		return nil, nil
+		return owners{}, nil
 	}
 
 	cacheObj, err := c.cacheClient.Get(ctx, cacheRef.ID, beehive.LoadOwner())
 	if errors.Is(err, beehive.ErrNotFound) {
-		return nil, nil
+		return owners{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read cluster cache %d: %w", cacheRef.ID, err)
+		return owners{}, fmt.Errorf("read cluster cache %d: %w", cacheRef.ID, err)
 	}
 	if cacheObj.DeletionRequestedAt != nil {
-		return nil, nil
+		return owners{}, nil
 	}
 
 	clusterRef, ok, err := cacheObj.Owner()
 	if err != nil {
-		return nil, fmt.Errorf("read cluster cache %d owner: %w", cacheRef.ID, err)
+		return owners{}, fmt.Errorf("read cluster cache %d owner: %w", cacheRef.ID, err)
 	}
 	if !ok {
-		return nil, nil
+		return owners{}, nil
 	}
 
 	clusterObj, err := c.clusterClient.Get(ctx, clusterRef.ID)
 	if errors.Is(err, beehive.ErrNotFound) {
-		return nil, nil
+		return owners{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read cluster %d: %w", clusterRef.ID, err)
+		return owners{}, fmt.Errorf("read cluster %d: %w", clusterRef.ID, err)
 	}
-	return clusterObj, nil
+	return owners{cache: cacheObj, cluster: clusterObj}, nil
 }
 
 // converge rewrites the per-kind children to match the sweep's standing answer, and
@@ -379,6 +394,11 @@ func (c *clusterCachedCatalogController) converge(
 			reason = ReasonDiscoveryPartial
 		case kubecatalog.ReasonNoConnection:
 			reason = ReasonNoConnection
+		case kubecatalog.ReasonIdentityMismatch:
+			// Not DiscoveryFailed: nothing was asked, and nothing is retrying. Saying the
+			// discovery request failed points a reader at the API server when what moved
+			// is which cluster the context reaches.
+			reason = ReasonIdentityMismatch
 		default:
 			reason = ReasonDiscoveryFailed
 		}

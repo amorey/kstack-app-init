@@ -43,6 +43,16 @@ const (
 	// ReasonNoConnection: the subject's context resolves to no connection, so nothing
 	// was asked. The sweep parks until the pool says the connection moved.
 	ReasonNoConnection probe.Reason = "NoConnection"
+	// ReasonIdentityMismatch: the context answers as a server this subject is not for,
+	// or has not said which server it is yet. Nothing was asked either way — kinds read
+	// off another cluster must not land in this one's catalog. Both park until the pool
+	// reports the identity moved; the message says which case it was.
+	//
+	// The first is a context re-pointed at another cluster, and lasts: the subject's
+	// cache is superseded and will be disarmed when that reaches the record. The second
+	// is the gap between a connection answering and the UID probe behind it answering,
+	// and clears itself within a cycle.
+	ReasonIdentityMismatch probe.Reason = "IdentityMismatch"
 	// ReasonSweepFailed: the discovery request itself failed, so nothing is known about
 	// the served kinds this run. The standing answer is untouched.
 	ReasonSweepFailed probe.Reason = "SweepFailed"
@@ -94,6 +104,9 @@ type catalogProbe struct {
 
 func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe.Result {
 	conn, err := p.conn(ctx, pass.Subject())
+	if errors.Is(err, kubeconn.ErrIdentityMismatch) {
+		return probe.Suspend(ReasonIdentityMismatch, err.Error())
+	}
 	if err != nil {
 		// The outage is the cluster pass's to report; this run parks until the
 		// connection bridge hears the pool reached the server.

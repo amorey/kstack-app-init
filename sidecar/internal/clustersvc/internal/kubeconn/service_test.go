@@ -792,3 +792,179 @@ func TestRetryIgnoresAContextNobodyClaims(t *testing.T) {
 	// fails the instant a request lands rather than at the end of the wait.
 	testutil.NoRecv(t, c.requests.Chan(), 50*time.Millisecond, "a probe request")
 }
+
+// --- ConnFor ---
+
+// awaitIdentified drains the claim's states until the UID probe has answered, which is what
+// stamps the connection.
+func awaitIdentified(t *testing.T, watched StateSubscription) {
+	t.Helper()
+	awaitState(t, watched, func(st State) bool { return st.ServerUID.Known() })
+}
+
+func TestConnForHandsOutTheRequestedCluster(t *testing.T) {
+	cs := serveCluster(t)
+	s := New(serving(cs.Server, "prod", "key-1"))
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+	awaitIdentified(t, watched)
+
+	conn, err := lease.ConnFor(t.Context(), "uid-1")
+
+	require.NoError(t, err)
+	assert.Equal(t, cs.Server.URL, conn.BaseURL.String())
+}
+
+// The whole point: a caller scoped to one cluster must not be handed the connection to
+// another, however the context came to point at it.
+func TestConnForRefusesAnotherCluster(t *testing.T) {
+	cs := serveCluster(t)
+	s := New(serving(cs.Server, "prod", "key-1"))
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+	awaitIdentified(t, watched)
+
+	conn, err := lease.ConnFor(t.Context(), "uid-2")
+
+	assert.Nil(t, conn)
+	assert.ErrorIs(t, err, ErrIdentityMismatch)
+}
+
+// A connection that is up but has not been identified is refused, not assumed. This is the
+// window the identity lives on the connection to close: a rebuilt connection sits beside the
+// previous one's UID observation until the probe re-runs, and only the connection itself can
+// say it has not been read yet.
+func TestConnForRefusesAConnectionNoProbeHasIdentified(t *testing.T) {
+	// serveAPI answers the dial and 404s kube-system, so the connection comes up and the
+	// UID probe never succeeds over it.
+	srv := serveAPI(t)
+	s := New(serving(srv, "prod", "key-1"))
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+	awaitState(t, watched, func(st State) bool { return st.Phase() == PhaseProbed })
+
+	conn, err := lease.ConnFor(t.Context(), "uid-1")
+
+	assert.Nil(t, conn)
+	assert.ErrorIs(t, err, ErrIdentityMismatch)
+	require.NoError(t, func() error { _, err := lease.Conn(t.Context()); return err }(),
+		"the connection itself is fine; only its identity is unknown")
+}
+
+// A cluster nothing reached reports the outage rather than the identity it could not have
+// read either way — the two are different remedies, and an outage passes on its own.
+func TestConnForReportsTheOutageAheadOfTheIdentity(t *testing.T) {
+	s := New(&fakeKubeconfig{})
+	lease := s.Acquire("prod")
+	defer lease.Release()
+
+	conn, err := lease.ConnFor(t.Context(), "uid-1")
+
+	assert.Nil(t, conn)
+	assert.ErrorIs(t, err, ErrNoConnection)
+	assert.NotErrorIs(t, err, ErrIdentityMismatch)
+}
+
+// The case the stamp alone does not cover: an API server replaced behind an endpoint and
+// credentials that never moved. The connection is never rebuilt — nothing about it changed —
+// so the UID probe reads a second, different uid over the one that is already stamped. It must
+// stop being handed out for the old cluster, or a subject bound to it sweeps the replacement.
+//
+// It is refused for the new cluster too: a connection that has already answered as something
+// else cannot vouch for what answers now.
+func TestConnForRefusesAConnectionWhoseServerWasReplaced(t *testing.T) {
+	cs := serveCluster(t)
+	s := New(serving(cs.Server, "prod", "key-1"))
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+	awaitIdentified(t, watched)
+	require.NoError(t, func() error { _, err := lease.ConnFor(t.Context(), "uid-1"); return err }())
+
+	// Same endpoint, same credentials, a different cluster behind them.
+	cs.answer(kubeSystemPath, `{"metadata":{"name":"kube-system","uid":"uid-2"}}`)
+	s.Retry("prod")
+	awaitState(t, watched, func(st State) bool { return st.ServerUID.Value == "uid-2" })
+
+	_, oldErr := lease.ConnFor(t.Context(), "uid-1")
+	_, newErr := lease.ConnFor(t.Context(), "uid-2")
+
+	assert.ErrorIs(t, oldErr, ErrIdentityMismatch, "the cache named for uid-1 must not read uid-2")
+	assert.ErrorIs(t, newErr, ErrIdentityMismatch, "and this connection cannot vouch for uid-2 either")
+}
+
+// quiesce drains the fleet feed until it stops producing, so a test asserting one signal is
+// not handed a leftover from the fleet coming up. A bounded window because "nothing more" has
+// no event to wait for; the feed coalesces, so what is pending is at most one per landed pass.
+func quiesce(t *testing.T, moved Subscription) {
+	t.Helper()
+	for {
+		select {
+		case <-moved.Chan():
+		case <-time.After(50 * time.Millisecond):
+			return
+		}
+	}
+}
+
+// The stall this signal exists to prevent: credentials rotate for a cluster that did not
+// change, so the connection is rebuilt unstamped while every other part of the news —
+// departed, phase, identity, the per-probe verdicts — stays exactly as it was. An
+// identity-scoped holder is refused meanwhile, and the re-stamp commits nothing, since the uid
+// it reads equals the one already recorded. Without the connection's own vouching in the news,
+// no signal fires and nothing ever tells that holder to try again.
+func TestRotationSignalsTheFleet(t *testing.T) {
+	cs := serveCluster(t)
+	cfg := serving(cs.Server, "prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	moved := s.Subscribe()
+	defer moved.Close()
+	lease := s.Acquire("prod")
+	defer lease.Release()
+
+	watched := lease.WatchState()
+	defer watched.Close()
+	awaitIdentified(t, watched)
+	require.NoError(t, func() error { _, err := lease.ConnFor(t.Context(), "uid-1"); return err }())
+	quiesce(t, moved)
+
+	// Same cluster, new credentials: the connection is replaced and nothing else moves.
+	cfg.rotate("prod", "key-2")
+	s.Retry("prod")
+
+	testutil.Recv(t, moved.Chan(), "the rotation's signal")
+}
+
+// And the connection is usable again once the re-stamp lands, which is what the signal is for:
+// the holder woken by it finds an answer rather than the same refusal.
+func TestRotationRestoresTheStamp(t *testing.T) {
+	cs := serveCluster(t)
+	cfg := serving(cs.Server, "prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+	awaitIdentified(t, watched)
+
+	cfg.rotate("prod", "key-2")
+	s.Retry("prod")
+
+	require.Eventually(t, func() bool {
+		_, err := lease.ConnFor(t.Context(), "uid-1")
+		return err == nil
+	}, testutil.Timeout, time.Millisecond, "the rebuilt connection is stamped and handed out again")
+}

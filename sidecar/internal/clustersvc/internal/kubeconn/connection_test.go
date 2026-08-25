@@ -315,3 +315,79 @@ func TestRequestKeepsTheStatusWhenTheBodyStopsMidRead(t *testing.T) {
 	assert.Equal(t, ReasonForbidden, classify(err))
 	assert.Equal(t, "forbidden: ", status.body, "whatever arrived before it stopped")
 }
+
+// --- identity ---
+
+// A connection nobody has identified must never read as a match: the caller scoped to one
+// cluster has to refuse it, and ("", false) is the only answer that lets it.
+func TestServerUIDIsUnsetUntilAProbeReadsOne(t *testing.T) {
+	conn := &Connection{}
+
+	uid, ok := conn.ServerUID()
+
+	assert.False(t, ok)
+	assert.Empty(t, uid)
+}
+
+// Set once, and re-confirming the same server changes nothing.
+func TestSetServerUIDIsSetOnce(t *testing.T) {
+	conn := &Connection{}
+
+	conn.setServerUID("uid-1")
+	conn.setServerUID("uid-1")
+
+	uid, ok := conn.ServerUID()
+	require.True(t, ok)
+	assert.Equal(t, "uid-1", uid)
+}
+
+// A second, different uid is the server replaced behind credentials that never moved. Keeping
+// the old stamp would go on vouching for the old cluster while the new one answers — so the
+// connection stops vouching for either, and every caller scoped to an identity is refused.
+func TestSetServerUIDStopsVouchingWhenTheServerChanges(t *testing.T) {
+	conn := &Connection{}
+	conn.setServerUID("uid-1")
+
+	conn.setServerUID("uid-2")
+
+	uid, ok := conn.ServerUID()
+	assert.False(t, ok, "not the old cluster, and not the new one either")
+	assert.Empty(t, uid)
+}
+
+// The conflict stands: a later read agreeing with the original stamp does not clear it, since
+// what answers over this connection has already been seen to change.
+func TestSetServerUIDKeepsTheConflict(t *testing.T) {
+	conn := &Connection{}
+	conn.setServerUID("uid-1")
+	conn.setServerUID("uid-2")
+
+	conn.setServerUID("uid-1")
+
+	_, ok := conn.ServerUID()
+	assert.False(t, ok)
+}
+
+// The three refusals are told apart in one place, so a caller cannot re-derive them from the
+// parts and drift — and so the message names what actually moved.
+func TestIdentityForTellsTheThreeRefusalsApart(t *testing.T) {
+	unidentified := &Connection{}
+
+	identified := &Connection{}
+	identified.setServerUID("uid-1")
+
+	conflicted := &Connection{}
+	conflicted.setServerUID("uid-1")
+	conflicted.setServerUID("uid-2")
+
+	assert.NoError(t, identified.IdentityFor("uid-1"))
+	assert.ErrorContains(t, identified.IdentityFor("uid-2"), "reached uid-1, not uid-2")
+	assert.ErrorContains(t, unidentified.IdentityFor("uid-1"), "has not said which server")
+	assert.ErrorContains(t, conflicted.IdentityFor("uid-1"), "was replaced")
+
+	for _, err := range []error{
+		identified.IdentityFor("uid-2"), unidentified.IdentityFor("uid-1"), conflicted.IdentityFor("uid-1"),
+	} {
+		assert.ErrorIs(t, err, ErrIdentityMismatch)
+	}
+}

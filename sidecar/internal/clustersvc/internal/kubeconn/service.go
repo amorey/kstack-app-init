@@ -81,6 +81,14 @@ type Lease interface {
 	Conn(ctx context.Context) (*Connection, error)
 	// State is what the probes last found, probe by probe. It never dials.
 	State() State
+	// ConnFor is Conn, refused with ErrIdentityMismatch unless the server behind it is
+	// serverUID — for a caller whose work belongs to one cluster rather than to a context.
+	//
+	// It reads the identity off the connection itself, never off State: State.ServerUID is
+	// its own probe's observable, queued by a committed connection rather than applied by
+	// it, so a fresh connection sits beside the previous one's UID until that probe re-runs.
+	// A connection nobody has identified yet is refused for the same reason.
+	ConnFor(ctx context.Context, serverUID string) (*Connection, error)
 	// WatchState carries every State published for this claim. It delivers nothing on attach,
 	// so a watcher pairs it with State for what is known now.
 	//
@@ -327,14 +335,28 @@ type news struct {
 	departed bool
 	phase    Phase
 	identity Identity
-	ok       [len(probeNames)]bool
+	// vouchedFor is the cluster the CURRENT connection vouches for, empty while it vouches
+	// for none. Distinct from identity, which is what the probes last read over whatever
+	// connection was up at the time: a rebuild empties this and a stamp refills it, and
+	// neither moves any other field when the cluster did not change.
+	//
+	// Without it a credential rotation for an unchanged cluster is silent — the connection is
+	// replaced, an identity-scoped holder is refused until the stamp lands, and the stamp
+	// commits nothing because the uid it read equals the one already recorded. Nothing would
+	// ever tell that holder to try again.
+	vouchedFor string
+	ok         [len(probeNames)]bool
 }
 
 func (s *Service) newsOf(v probe.Snapshot, st State) news {
+	ci := keyConnection.From(v).Value
 	n := news{
-		departed: keyConnection.From(v).Value.departed,
+		departed: ci.departed,
 		phase:    st.Phase(),
 		identity: st.Identity(),
+	}
+	if ci.conn != nil {
+		n.vouchedFor, _ = ci.conn.ServerUID()
 	}
 	for i, name := range probeNames {
 		n.ok[i] = v.Attempts(name).OK()
@@ -388,6 +410,22 @@ func (c *claim) State() State {
 		return State{}
 	}
 	return c.svc.stateOf(v)
+}
+
+// ConnFor asks the connection who it reached, so there is nothing to correlate: the probe
+// that made the request is the one that stamped it. The connection is resolved first, so a
+// cluster nothing has reached reports the outage rather than an identity it could not have
+// read either way.
+func (c *claim) ConnFor(ctx context.Context, serverUID string) (*Connection, error) {
+	conn, err := c.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := conn.IdentityFor(serverUID); err != nil {
+		return nil, fmt.Errorf("context %q: %w", c.contextName, err)
+	}
+	return conn, nil
 }
 
 func (c *claim) Departed() bool {

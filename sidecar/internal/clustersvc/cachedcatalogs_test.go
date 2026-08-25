@@ -234,6 +234,9 @@ func storedKinds(t *testing.T, d deps, catalogID beehive.ObjectID) map[SyncedKin
 // keyed by the record's own name and bound to its cluster's context. No answer has
 // landed yet, so the verdict is the wait — and no requeue, since the sweeper's signal
 // re-runs the fold and the kind's resync is the backstop.
+//
+// The server is named alongside the context because a context is not an identity: it can
+// be re-pointed at another cluster, and this cache mirrors one server only.
 func TestCatalogReconcileArmsTheSweeper(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
 
@@ -243,7 +246,7 @@ func TestCatalogReconcileArmsTheSweeper(t *testing.T) {
 	assert.Equal(t, beehive.Settled(), res)
 	f := sweeper(d)
 	assert.Equal(t, []string{catalog.Name}, f.tracked)
-	assert.Equal(t, "prod", f.contexts[catalog.Name])
+	assert.Equal(t, armedSubject{contextName: "prod", serverUID: "uid-1"}, f.armedFor[catalog.Name])
 	assert.Empty(t, storedKinds(t, d, catalog.ID))
 	cond := client.discovered(t)
 	assert.Equal(t, ConditionFalse, cond.Status)
@@ -683,4 +686,42 @@ func TestCachedCatalogsWatchListReportsADeparture(t *testing.T) {
 	assert.Equal(t, DeltaFrameDeleted, frames[1].Type)
 	require.NotNil(t, frames[1].Catalog, "the bookmark is the only frame that carries no entity")
 	assert.Equal(t, ClusterCachedCatalogID(7), frames[1].Catalog.ID)
+}
+
+// A cache whose context no longer reaches its cluster is neither connecting nor failing at
+// discovery: nothing was asked, and nothing is retrying. Reporting the wait as Connecting
+// would show a permanent state as a dial in progress; reporting it as DiscoveryFailed would
+// point a reader at the API server when what moved is which cluster the context reaches.
+func TestCatalogReconcileReportsAnIdentityMismatchBeforeAnySweep(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	sweepAnswered(d, catalog, kubecatalog.Observation{
+		Attempts: kubeconn.Attempts{
+			LastAttempt: suspended(kubecatalog.ReasonIdentityMismatch, "context \"prod\" reached uid-2, not uid-1"),
+		},
+	})
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
+	cond := client.discovered(t)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonIdentityMismatch, cond.Reason)
+}
+
+// The same after a cache has swept: its standing answer stands, and the verdict says the
+// identity moved rather than blaming the discovery request that was never made.
+func TestCatalogReconcileReportsAnIdentityMismatchOverAStandingAnswer(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	o := swept(pods)
+	o.Attempts = kubeconn.Attempts{
+		LastAttempt: suspended(kubecatalog.ReasonIdentityMismatch, "the server behind \"prod\" was replaced"),
+	}
+	sweepAnswered(d, catalog, o)
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, ReasonIdentityMismatch, client.discovered(t).Reason)
+	assert.NotEmpty(t, storedKinds(t, d, catalog.ID), "the answer from its own server still converges")
 }

@@ -7,9 +7,9 @@ status: In progress
 # kubecatalog discovery
 
 > **Progress.** Landed: the `kubecatalog` leaf (engine, probe, `Track`/`Forget`/`Read`/
-> `Subscribe`, the connection bridge), the trigger, and the controller-as-fold — the inline
-> sweep, `catalogConcurrency`, and the flat `NoConnection` requeue are gone. Remaining: the
-> watcher (§ "The watcher"), then the landing steps in "Open questions".
+> `Subscribe`, the connection bridge), the trigger, the controller-as-fold, and identity-scoped
+> subjects — the inline sweep, `catalogConcurrency`, and the flat `NoConnection` requeue are gone.
+> Remaining: the watcher (§ "The watcher"), then the landing steps in "Open questions".
 
 ## Goal
 
@@ -41,8 +41,14 @@ not the design. Discovery is also pull-only, so a CRD installed on the cluster w
    leaf. The catalog's reconcile arms and disarms its own subject — holding is what arms the
    probe, the `ensureLease`/`dropLease` shape — so a paused or torn-down catalog costs zero sweeps
    by structure. Grain note: discovery is a fact about the server a context reaches, but keying by
-   catalog makes the trigger mapping the identity function, and only the active cache's catalog is
-   ever armed, so no context sweeps twice.
+   catalog makes the trigger mapping the identity function.
+
+   **The key is not enough on its own.** "Only the active cache's catalog is ever armed" is true
+   only once a UID change has reached the record, and that is three reconciles downstream — while
+   the pool wakes every subject over a context whose identity moved, so the superseded cache's
+   sweep runs against the new server first. So a subject is bound to a **server** as well as a
+   context, and a run whose context no longer answers as that server suspends with
+   `IdentityMismatch` instead of sweeping.
 
 ## The leaf: `internal/clustersvc/internal/kubecatalog`
 
@@ -75,9 +81,10 @@ properties of the sweep, not of the beehive kind. `clustersvc` translates `Kind`
 ```go
 func New(kubeconnSvc *kubeconn.Service) *Service   // a lifecycle.StartCloser
 
-// Track arms discovery for id over contextName's connection; idempotent.
+// Track arms discovery for id over contextName's connection, for as long as that
+// context answers as serverUID; idempotent.
 // Forget disarms it and releases everything Track took. Both callable any time.
-func (s *Service) Track(id, contextName string)
+func (s *Service) Track(id, contextName, serverUID string)
 func (s *Service) Forget(id string)
 
 // Read is the discovery observation for id: the Catalog beside its attempts.
@@ -173,7 +180,7 @@ other two.
 | --- | --- | --- |
 | deletion-requested / owner chain gone | `Forget(name)` | `Settled()` |
 | `!Spec.Enabled` | `Forget(name)`, `relayPause` (unchanged) | as today |
-| enabled, context resolves | `Track(name, contextName)`, read `svc.Read(name)`, fold ↓ | |
+| enabled, context resolves | `Track(name, contextName, cache.Spec.ServerUID)`, read `svc.Read(name)`, fold ↓ | |
 | observation `!Known()` | `Discovered=False`, reason from `LastAttempt` (`NoConnection` / `Connecting`) | `Settled()` — the trigger wakes the fold when news lands; the kind's resync is the backstop, so `catalogRetryInterval`'s flat 30s requeue goes |
 | `Known()` | `converge` with the standing `Catalog` (translate `Kind` → spec; `Partial` gates prune; `draining` unchanged); condition from `Partial`/`draining`/`OK()` as today | `Settled()`, except draining keeps a short `RequeueAfter` — a tombstone releasing is not an event anything reports |
 

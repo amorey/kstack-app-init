@@ -86,8 +86,11 @@ type kubeconnService interface {
 // change signal is the requeue — and Forget disarms it; both mirror the record's state,
 // which only the catalog's reconcile decides. Read is the standing answer that
 // reconcile folds, and Subscribe feeds the trigger.
+//
+// Track names the server as well as the context, because a context can be re-pointed at
+// another cluster and the sweeper must not read that one's kinds into this cache.
 type kubecatalogService interface {
-	Track(id, contextName string)
+	Track(id, contextName, serverUID string)
 	Forget(id string)
 	Read(id string) (kubecatalog.Observation, bool)
 	Subscribe() kubecatalog.Subscription
@@ -306,6 +309,12 @@ const (
 	// ReasonDiscoveryFailed: the discovery request itself failed, so nothing is
 	// known about the served kinds this pass. The existing children are left alone.
 	ReasonDiscoveryFailed = "DiscoveryFailed"
+	// ReasonIdentityMismatch: the connection behind this record's context does not answer
+	// as the cluster the record is for — re-pointed at another, or replaced behind an
+	// endpoint that never moved. Nothing was asked, so it is neither a failed request nor
+	// a wait: what has to change is the record's own state, and for a superseded cache
+	// that is the pause the parent is about to relay.
+	ReasonIdentityMismatch = "IdentityMismatch"
 	// ReasonDiscoveryDraining: the kind list is current but a still-served kind has
 	// no live child yet — an earlier prune's child is draining and holds its name.
 	ReasonDiscoveryDraining = "DiscoveryDraining"

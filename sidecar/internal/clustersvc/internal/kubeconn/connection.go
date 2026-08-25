@@ -32,6 +32,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"k8s.io/client-go/discovery"
@@ -42,6 +43,11 @@ import (
 // ErrNoConnection reports that there is no connection to hand out: a context that does not
 // resolve, or one whose connection has yet to be built.
 var ErrNoConnection = errors.New("no connection for kube-context")
+
+// ErrIdentityMismatch reports a connection that is not the cluster the caller asked for —
+// re-pointed at another, or not identified yet. Told apart from ErrNoConnection because the
+// remedy differs: an outage passes on its own, a context now naming another cluster does not.
+var ErrIdentityMismatch = errors.New("connection is not the requested cluster")
 
 // The tuning every connection carries. The credentials come from the user's file; the budget
 // and the name we dial under are this package's to set.
@@ -59,8 +65,9 @@ const (
 // share one http.Client, so they share one connection pool — with HTTP/2 that is a single TCP
 // connection carrying every concurrent request to that API server.
 //
-// Read-only, and it never changes after it is built. A caller that mutates Config is editing
-// what every other holder is using.
+// The clients and the config never change after it is built — a caller that mutates Config is
+// editing what every other holder is using. The identity below is the one thing written after,
+// once, by the probe that confirms it.
 type Connection struct {
 	// Config is what the clients below were built from. Exposed for the client-go
 	// constructors that take one and build their own transport (exec, port-forward);
@@ -79,10 +86,89 @@ type Connection struct {
 	// since client-go caches transports by TLS config.
 	Discovery discovery.DiscoveryInterface
 
+	// serverUID is the cluster reached over THIS connection, recorded by the probe that read
+	// it. Unset until then, which reads as not identified — never as a match.
+	//
+	// Here rather than beside the connection in the engine's observable, because the probe
+	// that made the request is the only party that knows which connection the answer came
+	// over. Anything that pairs the two later is re-deriving it, and a connection replaced
+	// between the two commits pairs a new one with the old one's answer.
+	identity atomic.Pointer[connIdentity]
+
 	// done closes when this connection is retired. Nil in a connection nobody built, which
 	// reads as never retired.
 	done chan struct{}
 	once sync.Once
+}
+
+// connIdentity is what a connection has been confirmed as: the cluster read over it, and
+// whether it still vouches for that. One value behind one pointer, so the transition from
+// vouching to not is a single word — two fields a reader loaded separately would let a caller
+// through between them, holding the old uid against the replacement server.
+type connIdentity struct {
+	uid string
+	// conflicted means a second, different uid was read over this connection since.
+	conflicted bool
+}
+
+// ServerUID is the cluster this connection vouches for, and whether it vouches for one. A
+// connection nobody has identified yet answers ("", false), and so does one whose server
+// changed underneath it — a caller scoped to one cluster must refuse both rather than assume.
+func (c *Connection) ServerUID() (string, bool) {
+	id := c.identity.Load()
+	if id == nil || id.conflicted {
+		return "", false
+	}
+	return id.uid, true
+}
+
+// IdentityFor reports whether this connection may serve work scoped to serverUID, and why not.
+// The one place the three answers are told apart — vouching for another cluster, vouching for
+// none yet, vouching for none any more — so a caller cannot re-derive them from the parts and
+// drift.
+func (c *Connection) IdentityFor(serverUID string) error {
+	id := c.identity.Load()
+	switch {
+	case id == nil:
+		return fmt.Errorf("%w: the connection has not said which server it reached", ErrIdentityMismatch)
+	case id.conflicted:
+		return fmt.Errorf("%w: the server behind the connection was replaced, so it vouches for neither cluster", ErrIdentityMismatch)
+	case id.uid != serverUID:
+		return fmt.Errorf("%w: the connection reached %s, not %s", ErrIdentityMismatch, id.uid, serverUID)
+	}
+	return nil
+}
+
+// setServerUID records the cluster a probe reached over this connection.
+//
+// The stamp is never overwritten. A second, different uid is the server being replaced behind
+// unchanged credentials, and **both identities become untrustworthy over this connection**:
+// whoever asked for the old one would be handed the new server, and the new one cannot be
+// vouched for by a connection that has already answered as something else. So the conflict is
+// recorded and the connection stops vouching, which refuses every caller.
+//
+// Refusing is the whole of what this does. Retiring the connection belongs to the pool — and
+// alone would not help, since Conn hands out a retired connection too (Done is how a holder
+// hears about one) and nothing rebuilds a connection whose credentials never changed. Making
+// this self-heal is identity-driven retirement, which acts on the conflict recorded here.
+// → TODO.md.
+func (c *Connection) setServerUID(uid string) {
+	for {
+		id := c.identity.Load()
+		switch {
+		case id == nil:
+			if c.identity.CompareAndSwap(nil, &connIdentity{uid: uid}) {
+				return
+			}
+			// Another run stamped first; re-read and judge against what it wrote.
+			continue
+		case id.conflicted, id.uid == uid:
+			return
+		}
+		if c.identity.CompareAndSwap(id, &connIdentity{uid: id.uid, conflicted: true}) {
+			return
+		}
+	}
 }
 
 // newDynamic is the one seam in the build: every other failure here is reachable from a config

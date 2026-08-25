@@ -136,6 +136,14 @@ func (l *fakeLease) Conn(context.Context) (*kubeconn.Connection, error) {
 	return &kubeconn.Connection{}, nil
 }
 
+// ConnFor refuses everything. Nothing in this package dials — the sweep that does lives in
+// kubecatalog — and only kubeconn can stamp a connection's identity, so there is no honest
+// way to answer here. Deciding from l.state would be the connection/State correlation the
+// design forbids, passing a test against semantics the pool refuses.
+func (l *fakeLease) ConnFor(context.Context, string) (*kubeconn.Connection, error) {
+	return nil, kubeconn.ErrIdentityMismatch
+}
+
 func (l *fakeLease) State() kubeconn.State { return l.state }
 
 func (l *fakeLease) Departed() bool { return l.departed }
@@ -152,22 +160,29 @@ func (l *fakeLease) Release() { l.svc.released = append(l.svc.released, l.contex
 // which reads as a sweep still owed.
 type fakeKubecatalog struct {
 	obs map[string]kubecatalog.Observation
-	// tracked and forgotten record the arm/disarm calls in order; contexts holds the
-	// context each Track named.
+	// tracked and forgotten record the arm/disarm calls in order; armedFor holds the
+	// context and server each Track named.
 	tracked   []string
-	contexts  map[string]string
+	armedFor  map[string]armedSubject
 	forgotten []string
 
 	once sync.Once
 	hub  *conflate.Hub[string, struct{}]
 }
 
-func (f *fakeKubecatalog) Track(id, contextName string) {
+// armedSubject is what one Track bound an id to: the context to sweep over and the
+// server that context has to answer as.
+type armedSubject struct {
+	contextName string
+	serverUID   string
+}
+
+func (f *fakeKubecatalog) Track(id, contextName, serverUID string) {
 	f.tracked = append(f.tracked, id)
-	if f.contexts == nil {
-		f.contexts = map[string]string{}
+	if f.armedFor == nil {
+		f.armedFor = map[string]armedSubject{}
 	}
-	f.contexts[id] = contextName
+	f.armedFor[id] = armedSubject{contextName: contextName, serverUID: serverUID}
 }
 
 func (f *fakeKubecatalog) Forget(id string) { f.forgotten = append(f.forgotten, id) }

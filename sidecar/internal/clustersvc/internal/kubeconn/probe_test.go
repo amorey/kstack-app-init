@@ -473,6 +473,46 @@ func TestServerUIDCommitsOnlyWhenTheUIDMoves(t *testing.T) {
 	assert.False(t, committed)
 }
 
+// The stamp is not the commit. A rebuilt connection to a cluster whose UID never moved
+// commits nothing — and must still be stamped, or it stays unidentified forever and every
+// caller scoped to that cluster refuses it.
+func TestServerUIDStampsTheConnectionEvenWhenItCommitsNothing(t *testing.T) {
+	uid := "uid-1"
+	conn := connTo(t, serveCluster(t).Server)
+
+	_, _, committed := runProbe(t, serverUIDProbe{}, conn, &uid)
+
+	require.False(t, committed)
+	got, ok := conn.ServerUID()
+	require.True(t, ok, "the connection is identified by the read, not by the commit")
+	assert.Equal(t, "uid-1", got)
+}
+
+// The identity is recorded on the connection the request went over, which is what makes it
+// safe to compare later: no other party knows which connection answered.
+func TestServerUIDStampsTheConnectionItRead(t *testing.T) {
+	conn := connTo(t, serveCluster(t).Server)
+
+	runProbe(t, serverUIDProbe{}, conn, nil)
+
+	got, ok := conn.ServerUID()
+	require.True(t, ok)
+	assert.Equal(t, "uid-1", got)
+}
+
+// A read that failed identifies nothing: stamping on the way past would pin an identity no
+// answer supports, and the stamp is set-once.
+func TestServerUIDStampsNothingWhenTheReadFails(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(kubeSystemPath, http.StatusForbidden, "")
+	conn := connTo(t, cs.Server)
+
+	runProbe(t, serverUIDProbe{}, conn, nil)
+
+	_, ok := conn.ServerUID()
+	assert.False(t, ok)
+}
+
 // The trap the reason vocabulary exists for: this 404 is the namespace, not the endpoint, so the
 // probe keeps asking — kube-system can be created.
 func TestServerUIDReportsAMissingNamespaceAsNotFound(t *testing.T) {

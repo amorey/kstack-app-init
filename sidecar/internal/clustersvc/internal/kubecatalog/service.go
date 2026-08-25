@@ -80,11 +80,16 @@ type Service struct {
 	wg sync.WaitGroup
 }
 
-// subject is one tracked id: the context it sweeps over, and this service's own claim
-// on that context's connection — refcounted in the pool beside every other holder's, so
-// releasing it never stops the cluster being probed.
+// subject is one tracked id: the context it sweeps over, the server that context has to
+// answer as, and this service's own claim on the connection — refcounted in the pool
+// beside every other holder's, so releasing it never stops the cluster being probed.
+//
+// **A context is not an identity.** It can be re-pointed at another cluster, and the
+// pool hands out whatever now answers, so the server the caller armed this subject for
+// is the thing that makes a sweep's answer belong to it.
 type subject struct {
 	contextName string
+	serverUID   string
 	lease       kubeconn.Lease
 }
 
@@ -121,17 +126,18 @@ func newWithOptions(conns connService, opts ...option) *Service {
 	return s
 }
 
-// Track arms the sweep for id over contextName's connection. Idempotent, and the
-// context is fixed for the id's life — the caller derives both from one record — so a
-// repeat is a no-op, never a re-bind.
-func (s *Service) Track(id, contextName string) {
+// Track arms the sweep for id over contextName's connection, for as long as that context
+// answers as serverUID. Idempotent, and all three are fixed for the id's life — the
+// caller derives them from one record, whose identity does not change — so a repeat is a
+// no-op, never a re-bind.
+func (s *Service) Track(id, contextName, serverUID string) {
 	s.mu.Lock()
 	if _, held := s.tracked[id]; held {
 		s.mu.Unlock()
 		return
 	}
 	// Acquire never fails and never waits, so holding mu across it costs nothing.
-	sub := &subject{contextName: contextName, lease: s.conns.Acquire(contextName)}
+	sub := &subject{contextName: contextName, serverUID: serverUID, lease: s.conns.Acquire(contextName)}
 	s.tracked[id] = sub
 	ids := s.byContext[contextName]
 	if ids == nil {
@@ -245,8 +251,16 @@ func (s *Service) watchConnections(ctx context.Context, moved kubeconn.Subscript
 	}
 }
 
-// connFor is the probe's read of the lease behind its subject. An id forgotten mid-run
-// reads as no connection; the engine refuses that run's commit anyway.
+// connFor is the probe's connection for its subject: the one the pool holds for that
+// context, and only while it is the server the subject was armed for. An id forgotten
+// mid-run reads as no connection; the engine refuses that run's commit anyway.
+//
+// **This is what keeps one cluster's kinds out of another's catalog.** A context re-pointed
+// at a second cluster wakes every subject over it — identity is in the pool's news — so the
+// superseded cache's sweep is the first thing to run against the new server, well before
+// the record learns it is superseded and disarms. The pool answers from the identity
+// stamped on the connection itself, so a connection built but not yet identified is
+// refused rather than paired with the previous one's answer.
 func (s *Service) connFor(ctx context.Context, id string) (*kubeconn.Connection, error) {
 	s.mu.Lock()
 	sub := s.tracked[id]
@@ -254,7 +268,7 @@ func (s *Service) connFor(ctx context.Context, id string) (*kubeconn.Connection,
 	if sub == nil {
 		return nil, fmt.Errorf("%w: subject %q", kubeconn.ErrNoConnection, id)
 	}
-	return sub.lease.Conn(ctx)
+	return sub.lease.ConnFor(ctx, sub.serverUID)
 }
 
 // publish is the engine's OnPass: signal the id when its news moved. Every pass rather

@@ -122,8 +122,39 @@ connection through the service's own `kubeconn` lease (refcounted beside every o
 commits only on a change, suspends while the context resolves to nothing (the kubeconn bridge
 wakes it the moment the pool reaches the server), and `Subscribe` signals the ids whose news moved
 — `newKubecatalogTrigger` maps that signal straight onto the record, the id being the name. The
+subject is bound to **a server, not just a context**: `Track(id, contextName, serverUID)`, and it
+asks the pool for that server's connection (`Lease.ConnFor`), suspending with `IdentityMismatch`
+when it is not. The
 sweep's 10m interval is the promptness bound today; the CRD/APIService watch that will make it
 prompt is specified and unbuilt. → docs/specs/kubecatalog-discovery.md.
+
+**A context is not an identity, and identity lives on the connection.** Re-point a context at
+another cluster and the pool hands out whatever now answers, while the only thing that disarms the
+superseded cache's subject is a pause flip three reconciles downstream — and the pool wakes every
+subject over a context whose identity moved, so that stale sweep is the *first* thing to run
+against the new server. `Connection` therefore carries a **set-once `serverUID`, stamped by
+`serverUIDProbe` when it reads one over that connection**, and `Lease.ConnFor(ctx, serverUID)`
+answers from it.
+
+**Never correlate a connection with `State.ServerUID`** — that is the trap this shape exists to
+close, and reading both from one snapshot does not close it. `serverUID` is its own probe,
+*queued* by a committed connection rather than applied by it, so the engine legitimately holds
+`{conn: B, serverUID: "uid-A"}` for a dispatch plus a round-trip. Asking the connection who it
+reached has one writer and nothing to pair. A connection nobody has identified answers
+`("", false)` and is refused; the connection is resolved first, so a cluster nothing reached still
+reports the outage. The stamp is unconditional while the commit stays change-gated — the commit
+says the *context's* identity moved, the stamp says *this connection* has been identified, and
+gating the stamp would leave every rebuilt connection to an unchanged cluster unstamped.
+
+**A second, different UID over one connection makes it vouch for nobody.** That is a server
+replaced behind an endpoint and credentials that never moved, so no connection is rebuilt and the
+probe reads a new uid over the old stamp. The stamp is never overwritten — keeping it would go on
+authorizing the old cluster's subjects against the replacement, and adopting the new one would let
+a connection that already answered as something else vouch for what answers now — so the conflict
+is recorded and `ConnFor` refuses everyone. **The cost is a stall, not corruption**: nothing
+rebuilds a connection whose credentials never changed, so identity-scoped work over it stops until
+identity-driven retirement (`TODO.md`) acts on the conflict.
+→ [ADR: connection-carried identity](../docs/adr/2026-08-25-connection-carried-identity.md).
 
 `clusterCachedCatalogController.Reconcile` walks its two owner edges (cache, then cluster), arms
 or disarms the sweeper, and rewrites one `ClusterCachedResource` per kind the standing answer
@@ -304,7 +335,7 @@ ClusterID](../docs/adr/2026-08-22-connections-addressed-by-cluster-id.md).
 **It hands out leases and reports what probing the server behind one found.**
 `Acquire(contextName)` never fails and never waits — a context the file does not name yet is
 claimable, because it may name it later and the claim is how the holder finds out. `Lease` is
-`Conn` / `State` / `WatchState` / `Departed` / `Release`. **`Conn` never dials**: it hands out what
+`Conn` / `ConnFor` / `State` / `WatchState` / `Departed` / `Release`. **`Conn` never dials**: it hands out what
 the connection probe built, or `ErrNoConnection` for a context that resolves to nothing — a
 connection whose last probe *failed* is still handed out, since only the holder can tell a revoked
 credential from a control plane mid-restart. `Retry(contextName)` wakes **all five** probes on a
@@ -460,14 +491,19 @@ a stale lease.
 `internal/` type cannot be *named* outside, which would leave `Service` unimplementable by the
 resolver tests' fake. The layering exception is in `service.go`'s package doc.
 
-**Identity lives on `State`, not on `Connection`.** The three probes that read it depend on the
-connection, so a connection always exists before anything can identify the server behind it — a
-field stamped at build time would be empty for every connection's life. `State.Identity()` is the
-read surface, and it is comparable so a holder can compare: `Identity` carries no errors, since why
-a field is missing belongs on the `Observation` that could not read it. **Retiring a connection
-because the *server* behind unchanged credentials moved is specified and unbuilt**, and the probes
-that would drive it now answer — so a cluster rebuilt behind one endpoint keeps the connection its
-holders derived from, and `Connection.Done()` never fires for it. `TODO.md` carries the design. Note what a username change does
+**`State.Identity()` is what the probes last read; `Connection.ServerUID()` is what one connection
+vouches for.** Both exist and they answer different questions. `Identity` is the fleet-facing
+value — comparable, carrying no errors, since why a field is missing belongs on the `Observation`
+that could not read it — and it is what `news` signals on. The connection's own stamp is what an
+identity-scoped caller must use, through `ConnFor`; **never compare a connection against
+`State.ServerUID`**, which is a separate probe's observable and lags a rebuilt connection by a
+round-trip. → [ADR: connection-carried identity](../docs/adr/2026-08-25-connection-carried-identity.md).
+
+**Retiring a connection because the server behind unchanged credentials moved is specified and
+unbuilt.** The conflict is *detected* — a second, different uid stops the connection vouching for
+anyone, so nothing reads the replacement cluster into the old one's records — but nothing rebuilds
+it, so identity-scoped work over that connection stalls and `Connection.Done()` never fires.
+`TODO.md` carries the recovery half. Note what a username change does
 **not** cover: ordinary RBAC edits leave it identical, so permissions need the
 `SelfSubjectRulesReview` behind `ClusterPermissions`.
 

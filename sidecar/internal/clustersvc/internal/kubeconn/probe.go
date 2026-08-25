@@ -309,6 +309,13 @@ func (serverUIDProbe) Run(ctx context.Context, pass *probe.Pass[string]) probe.R
 		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a UID", kubeSystemPath))
 	}
 
+	// Stamped unconditionally, committed only on a change: the two answer different
+	// questions. The commit says the CONTEXT's identity moved, which drives the fleet
+	// signal; the stamp says THIS connection has been identified, which is true of the
+	// first read whether or not the value changed. Gated on the commit, a rebuilt
+	// connection to a cluster whose UID never moves would never be stamped at all.
+	conn.setServerUID(ns.Metadata.UID)
+
 	if ns.Metadata.UID != pass.Prev() {
 		pass.Commit(ns.Metadata.UID)
 	}
