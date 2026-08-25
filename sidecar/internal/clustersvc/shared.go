@@ -393,15 +393,16 @@ type Event struct {
 	LastAt   time.Time         `json:"lastAt"`
 }
 
-// Schedule is the kind-agnostic projection of a beehive object's reconcile
-// schedule (a gauge), served live via the schedule watch — a scheduling change
-// fires no object WatchList.
+// Schedule is the kind-agnostic projection of when an object is next due to be
+// looked at (a gauge), served live via the schedule watch — a scheduling change
+// fires no object WatchList. What does the looking is the kind's own: a cluster's
+// is the pool's probe cadence.
 type Schedule struct {
-	// NextRequeueAt is the next reconcile time, or nil when nothing is scheduled.
+	// NextRequeueAt is the next attempt's time, or nil when nothing is scheduled.
 	NextRequeueAt *time.Time `json:"nextRequeueAt"`
-	// Probing reports whether a reconcile's network probe is in flight, asserted
-	// by the core controller so the webview can show a definite "checking now".
-	// Merged into this gauge because a probe start/end fires no WatchList.
+	// Probing reports whether a network probe is in flight, asserted rather than
+	// inferred from the countdown so the webview can show a definite "checking
+	// now". Merged into this gauge because a probe start/end fires no WatchList.
 	Probing bool `json:"probing"`
 }
 

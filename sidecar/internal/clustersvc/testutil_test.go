@@ -27,6 +27,7 @@ import (
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
 	"github.com/amorey/gobus/conflate"
+	gobuswatch "github.com/amorey/gobus/watch"
 	"github.com/amorey/gochan/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -74,6 +75,10 @@ type fakeKubeconn struct {
 	hub   *conflate.Hub[string, struct{}]
 	asked []string
 
+	// stateOnce/stateHub are the per-claim feed, built on demand for the same reason.
+	stateOnce sync.Once
+	stateHub  *gobuswatch.Hub[string, kubeconn.State]
+
 	released []string
 	retried  []string
 }
@@ -97,6 +102,16 @@ func (f *fakeKubeconn) moved() *conflate.Hub[string, struct{}] {
 	return f.hub
 }
 
+func (f *fakeKubeconn) stateFeed() *gobuswatch.Hub[string, kubeconn.State] {
+	f.stateOnce.Do(func() { f.stateHub = gobuswatch.New[string, kubeconn.State]() })
+	return f.stateHub
+}
+
+// publishState is a pass landing on one claim, the way the pool's OnPass would.
+func (f *fakeKubeconn) publishState(contextName string, st kubeconn.State) {
+	f.stateFeed().Sender().Send(contextName, st)
+}
+
 // fakeLease is one claim, holding what a probe would have found. It records its release so
 // a test can pin the lifetime a pass is meant to keep.
 type fakeLease struct {
@@ -115,8 +130,9 @@ func (l *fakeLease) State() kubeconn.State { return l.state }
 
 func (l *fakeLease) Departed() bool { return l.departed }
 
+// WatchState is the schedule watch's feed; a cluster pass reads State instead.
 func (l *fakeLease) WatchState() kubeconn.StateSubscription {
-	panic("a cluster pass reads, it does not watch")
+	return l.svc.stateFeed().Watch(l.contextName)
 }
 
 func (l *fakeLease) Release() { l.svc.released = append(l.svc.released, l.contextName) }

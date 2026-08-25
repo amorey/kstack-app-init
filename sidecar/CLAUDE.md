@@ -62,7 +62,7 @@ Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` 
 (`status.source.kubeconfig`), and that same pass creating the `ClusterCache` for the identity a
 probe recorded, and `clusterCacheController.Reconcile` creating the `ClusterCachedCatalog` beneath
 each cache, carrying the pause switch (`cacheSyncEnabled`: the cluster's toggles, and whether the
-cache is still the active identity). Served: the whole `Clusters()` family except `WatchSchedule`,
+cache is still the active identity). Served: the whole `Clusters()` family,
 plus `Caches()`' point reads (`Get`/`List`/`ListByCluster`) and its unscoped watches
 (`Watch`/`WatchList`). That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **A cache now exists at runtime**: the serverUID probe writes `status.server.uid`, which is what
@@ -259,13 +259,26 @@ claimed context: a connection that is already up commits nothing, so waking it a
 probe that failed on its own — a forbidden `kube-system` read — sitting on the answer the user just
 fixed. A context nobody claims is untracked, so it does nothing.
 
-**The boundary in front of it is `AcquireConnection`/`RetryConnection`**, both resolving the
+**The boundary in front of it is `AcquireConnection`/`RetryConnection`/`Clusters().WatchSchedule`**, all resolving the
 `ClusterID` to its context through one gate: `ErrNotFound` for an id naming nothing, and
 `ErrNotConnectable` for a record that is disabled, awaiting deletion, or from a source carrying no
 credentials. The gate is the record's own state, never the cluster's — whether the server answers
 is the probe's to report, so an unreachable cluster is claimed and retried like any other. The
 claim handed back is the caller's own, refcounted alongside the one `clusterController` holds, so
 releasing it never stops the cluster being probed.
+
+**`clusterScheduleWatch` reads the pool's cadence, never beehive's.** A cluster reconcile is never
+requeued to retry a connection — the probes carry their own backoff and a pass only folds what they
+found — so the record's beehive schedule is empty and a countdown read off it would never move.
+`Clusters().WatchSchedule` claims the context for the life of the stream and projects
+`Lease.State()` + `WatchState()`: `nextRequeueAt` is the **connection probe's** next run (null while
+it is suspended), `probing` is that run in flight. The connection alone, of the five — it is what
+"when do we next try to reach this cluster" means and the only one `clusterConnectionRetry` acts
+on; the other four run on their own clocks (readiness 30s, the rest 5-10m), so folding them in
+would count down to whichever happened to be due next. It emits nothing until the
+first pass lands, since a fresh claim's zero state is not "nothing is scheduled". `probing` is
+asserted from the run, never inferred from a countdown that has run out — but the engine publishes
+only on a pass, so the in-flight window is not observable yet; see `TODO.md`.
 
 **A claim outlives what it is a claim on.** The file can stop naming a context while a holder
 still holds it, and the entry stays — only releasing drops one. An **unread** kubeconfig names
@@ -669,7 +682,7 @@ consumer (a callee follows its caller — `LiveCondition` needs `TruncateMessage
 
 ### GraphQL surface (cluster)
 
-The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the `Cluster` surface and the `ClusterCache` reads answer** — `cluster`, `clusters`, `clustersWatch`, the enable/sync/delete/`clusterConnectionRetry` mutations, and `clusterCache`/`clusterCaches`/`clusterCachesWatch` (with `Cluster.caches` alongside them). `Cluster.events` does not: it reaches `ListEvents`, which still panics, so a query selecting it panics with the rest. Neither do the cache gauges, which are unbuilt. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
+The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the `Cluster` surface and the `ClusterCache` reads answer** — `cluster`, `clusters`, `clustersWatch`, `clusterScheduleWatch`, the enable/sync/delete/`clusterConnectionRetry` mutations, and `clusterCache`/`clusterCaches`/`clusterCachesWatch` (with `Cluster.caches` alongside them). `Cluster.events` does not: it reaches `ListEvents`, which still panics, so a query selecting it panics with the rest. Neither do the cache gauges, which are unbuilt. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
 
 - Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedCatalogsWatch` (unscoped, one per cache), `clusterCachedResourcesWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).

@@ -317,8 +317,74 @@ func clusterDeparture(change beehive.ObjectChange[ClusterSpec, ClusterStatus]) C
 	return ClusterWatchFrame{Type: DeltaFrameDeleted, Cluster: cluster}
 }
 
+// WatchSchedule streams when the cluster's context is next dialed: the current value,
+// then a new one on every pass.
+//
+// The cadence is the pool's, never beehive's. A cluster reconcile is not requeued to
+// retry a connection — the probes carry their own backoff and a pass only folds what they
+// found — so the record's beehive schedule is empty and a countdown read off it would
+// never move.
+//
+// The claim is this stream's own, released when ctx ends. It is refcounted alongside the
+// one clusterController holds, so watching costs no extra dial; a record the connection
+// surface refuses has no cadence to report and errors here.
 func (a clustersAPI) WatchSchedule(ctx context.Context, id ClusterID) (<-chan Schedule, error) {
-	panic("not implemented")
+	lease, err := a.s.AcquireConnection(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Subscribed before the first read, so a pass landing between the two is delivered
+	// rather than dropped. The hub holds a level, so the cost of the overlap is at worst
+	// the same schedule twice.
+	states := lease.WatchState()
+
+	out := make(chan Schedule)
+	go func() {
+		defer close(out)
+		defer states.Close()
+		defer lease.Release()
+
+		sent := false
+		st := lease.State()
+		for {
+			sched := clusterSchedule(st)
+			// A gauge says nothing before its first measurement: the zero schedule of a
+			// claim whose first pass has not landed is not "nothing is scheduled".
+			if sent || sched.NextRequeueAt != nil || sched.Probing {
+				if !sendFrame(ctx, out, sched) {
+					return
+				}
+				sent = true
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-states.Chan():
+				if !ok {
+					return
+				}
+				st = ev.Value
+			}
+		}
+	}()
+	return out, nil
+}
+
+// clusterSchedule projects the connection probe's cadence into the gauge.
+//
+// The connection alone, of the five: this is what "when do we next try to reach this
+// cluster" means, and it is the only one a caller can act on — a retry re-dials. The
+// other four run on their own clocks (readiness every 30s, the rest every 5-10m), so
+// folding them in would count down to whichever happened to be due next.
+//
+// A zero ScheduledAt is a suspended probe: nothing is due and the last answer stands.
+func clusterSchedule(st kubeconn.State) Schedule {
+	sched := Schedule{Probing: st.Connection.InFlight()}
+	if at := st.Connection.NextAttempt.ScheduledAt; !at.IsZero() {
+		sched.NextRequeueAt = &at
+	}
+	return sched
 }
 
 func (a clustersAPI) SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error) {

@@ -174,8 +174,10 @@ type Clusters interface {
 	// and Deleted follows when it is collected.
 	WatchList(ctx context.Context) (*Stream[ClusterWatchFrame], error)
 
-	// WatchSchedule streams a cluster's next-requeue gauge. A stream because a
+	// WatchSchedule streams a cluster's next-probe gauge. A stream because a
 	// scheduling change fires no object WatchList, so it cannot ride Watch.
+	// Refuses the records AcquireConnection refuses: an unprobed cluster has no
+	// cadence.
 	WatchSchedule(ctx context.Context, id ClusterID) (<-chan Schedule, error)
 	// SetEnabled enables or disables a cluster and returns the updated record.
 	SetEnabled(ctx context.Context, id ClusterID, enabled bool) (*Cluster, error)

@@ -1214,6 +1214,136 @@ func TestClustersWatchReportsChangesToItsRecord(t *testing.T) {
 	assert.NotNil(t, f.Cluster.DeletionRequestedAt)
 }
 
+// --- the schedule gauge ---
+
+// watchSchedule opens the gauge for id over a cancellable context, handing back the
+// cancel so a test can pin what ending the stream does.
+func watchSchedule(t *testing.T, d deps, id ClusterID) (<-chan Schedule, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, err := serviceOver(t, d).Clusters().WatchSchedule(ctx, id)
+	require.NoError(t, err)
+	return ch, cancel
+}
+
+// scheduledAt is a probe with a run queued for at and none in flight.
+func scheduledAt(at time.Time) kubeconn.Observation[string] {
+	return kubeconn.Observation[string]{Attempts: kubeconn.Attempts{NextAttempt: kubeconn.Attempt{ScheduledAt: at}}}
+}
+
+// The countdown is the connection's own. The other four run on their own clocks, and a
+// countdown to whichever was due next would not be the one a retry acts on.
+func TestClustersWatchScheduleReportsTheConnectionProbe(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	dialAt := probedAt.Add(30 * time.Second)
+	d.kubeconnSvc = knowing(kubeconn.State{
+		Connection: scheduledAt(dialAt),
+		ServerUID:  scheduledAt(probedAt.Add(10 * time.Second)),
+	})
+
+	ch, _ := watchSchedule(t, d, ClusterID(obj.ID))
+
+	got := testutil.Recv(t, ch, "the current schedule")
+	require.NotNil(t, got.NextRequeueAt)
+	assert.Equal(t, dialAt, *got.NextRequeueAt)
+	assert.False(t, got.Probing)
+}
+
+// Every probe but the connection suspends while it is down, so a disconnected cluster's
+// countdown is its retry — the case the gauge exists for.
+func TestClustersWatchScheduleIgnoresTheOtherProbes(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	d.kubeconnSvc = knowing(kubeconn.State{ServerUID: scheduledAt(probedAt.Add(10 * time.Second))})
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+	ch, _ := watchSchedule(t, d, ClusterID(obj.ID))
+
+	// Nothing to report while only another probe is scheduled, so drive one pass that
+	// arms the connection to prove the stream is live rather than merely silent.
+	testutil.NoRecv(t, ch, 50*time.Millisecond, "a schedule from another probe")
+	pool.publishState("prod", kubeconn.State{Connection: scheduledAt(probedAt)})
+
+	assert.NotNil(t, testutil.Recv(t, ch, "the connection's schedule").NextRequeueAt)
+}
+
+func TestClustersWatchScheduleFollowsThePool(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	d.kubeconnSvc = knowing(kubeconn.State{Connection: scheduledAt(probedAt.Add(30 * time.Second))})
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+	ch, _ := watchSchedule(t, d, ClusterID(obj.ID))
+	testutil.Recv(t, ch, "the current schedule")
+
+	next := probedAt.Add(time.Minute)
+	pool.publishState("prod", kubeconn.State{Connection: scheduledAt(next)})
+
+	got := testutil.Recv(t, ch, "the schedule the pass moved")
+	require.NotNil(t, got.NextRequeueAt)
+	assert.Equal(t, next, *got.NextRequeueAt)
+}
+
+// Probing is asserted from the run, never inferred from a countdown that has run out.
+func TestClustersWatchScheduleReportsARunInFlight(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	d.kubeconnSvc = knowing(kubeconn.State{
+		Connection: kubeconn.Observation[string]{Attempts: kubeconn.Attempts{
+			NextAttempt: kubeconn.Attempt{ScheduledAt: probedAt, StartedAt: probedAt},
+		}},
+	})
+
+	ch, _ := watchSchedule(t, d, ClusterID(obj.ID))
+
+	assert.True(t, testutil.Recv(t, ch, "the current schedule").Probing)
+}
+
+// A gauge says nothing before its first measurement, and a claim whose first pass has
+// not landed has made none — reporting its zero state would say "nothing is scheduled"
+// about a cluster that is about to be dialed.
+func TestClustersWatchScheduleSaysNothingBeforeTheFirstPass(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+	ch, _ := watchSchedule(t, d, ClusterID(obj.ID))
+
+	// A negative assertion has no event to wait for, so it needs a bounded window; the
+	// stream emits on its own goroutine the moment it is opened, so a short one is enough.
+	testutil.NoRecv(t, ch, 50*time.Millisecond, "a schedule for an unprobed claim")
+
+	pool.publishState("prod", kubeconn.State{Connection: scheduledAt(probedAt)})
+	assert.NotNil(t, testutil.Recv(t, ch, "the first pass").NextRequeueAt)
+}
+
+// Once something has been measured, "nothing is scheduled" is news: a suspended
+// connection is what a context the kubeconfig stopped naming looks like.
+func TestClustersWatchScheduleReportsASuspendedConnection(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	d.kubeconnSvc = knowing(kubeconn.State{Connection: scheduledAt(probedAt)})
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+	ch, _ := watchSchedule(t, d, ClusterID(obj.ID))
+	testutil.Recv(t, ch, "the current schedule")
+
+	pool.publishState("prod", kubeconn.State{})
+
+	assert.Nil(t, testutil.Recv(t, ch, "the suspended schedule").NextRequeueAt)
+}
+
+func TestClustersWatchScheduleReleasesItsClaimWhenTheStreamEnds(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+	ch, cancel := watchSchedule(t, d, ClusterID(obj.ID))
+
+	cancel()
+
+	testutil.WaitClosed(t, ch, "the gauge to close on cancellation")
+	assert.Equal(t, []string{"prod"}, pool.released)
+}
+
 func TestClustersSetEnabled(t *testing.T) {
 	d := newTestDeps(t)
 	obj := createCluster(t, d.clusterClient, "prod")

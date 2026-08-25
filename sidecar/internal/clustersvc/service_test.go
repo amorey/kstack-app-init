@@ -166,7 +166,6 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 	var id ObjectID = 1
 
 	calls := map[string]func(){
-		"Clusters().WatchSchedule":       func() { svc.Clusters().WatchSchedule(ctx, id) },
 		"Caches().WatchByCluster":        func() { svc.Caches().WatchByCluster(ctx, id) },
 		"Caches().WatchStats":            func() { svc.Caches().WatchStats(ctx, id, id) },
 		"Caches().WatchHealth":           func() { svc.Caches().WatchHealth(ctx) },
@@ -246,8 +245,8 @@ func TestRetryConnectionReprobesTheRecordsContext(t *testing.T) {
 	assert.Empty(t, pool.asked, "a retry reaches the probe, not the claim")
 }
 
-// The gate is one rule, asserted over both methods together: a caller must not find one
-// of them willing to act on a record the other refuses.
+// The gate is one rule, asserted over every method that goes through it: a caller must
+// not find one of them willing to act on a record the others refuse.
 func TestTheConnectionSurfaceRefusesTheSameRecords(t *testing.T) {
 	tests := map[string]struct {
 		record func(t *testing.T, d deps) ClusterID
@@ -294,9 +293,11 @@ func TestTheConnectionSurfaceRefusesTheSameRecords(t *testing.T) {
 
 			_, acquireErr := svc.AcquireConnection(context.Background(), id)
 			retryErr := svc.RetryConnection(context.Background(), id)
+			_, scheduleErr := svc.Clusters().WatchSchedule(context.Background(), id)
 
 			assert.ErrorIs(t, acquireErr, tt.want)
 			assert.ErrorIs(t, retryErr, tt.want)
+			assert.ErrorIs(t, scheduleErr, tt.want)
 			assert.Empty(t, pool.asked)
 			assert.Empty(t, pool.retried)
 		})
