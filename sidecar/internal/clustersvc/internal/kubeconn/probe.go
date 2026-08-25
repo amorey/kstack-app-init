@@ -64,20 +64,16 @@ type connInfo struct {
 }
 
 func registerProbes(e *probe.Engine, kubecfg kubeconfigService) {
-	probe.Register(e, nameConnection, &connectionProbe{kubecfg: kubecfg},
-		probe.WithInterval(30*time.Second))
+	probe.Register(e, nameConnection, &connectionProbe{kubecfg: kubecfg}, probe.WithInterval(30*time.Second))
+
 	// The four behind reachability declare both edges on it: they cannot run without a
 	// connection, and they read the one it committed — so a connection that moves re-runs them
 	// rather than leaving them on a value that changed under them.
 	dependsOnConn, watchesConn := probe.WithDependencies(nameConnection), probe.WithWatches(nameConnection)
-	probe.Register(e, nameReadiness, unimplemented[ComponentStatus]{"readiness"},
-		probe.WithInterval(30*time.Second), dependsOnConn, watchesConn)
-	probe.Register(e, nameServerUID, unimplemented[string]{"serverUID"},
-		probe.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
-	probe.Register(e, nameServerVersion, unimplemented[VersionInfo]{"serverVersion"},
-		probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
-	probe.Register(e, namePrincipal, unimplemented[Principal]{"principal"},
-		probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
+	probe.Register(e, nameReadiness, unimplemented[ComponentStatus]{"readiness"}, probe.WithInterval(30*time.Second), dependsOnConn, watchesConn)
+	probe.Register(e, nameServerUID, unimplemented[string]{"serverUID"}, probe.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
+	probe.Register(e, nameServerVersion, unimplemented[VersionInfo]{"serverVersion"}, probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
+	probe.Register(e, namePrincipal, unimplemented[Principal]{"principal"}, probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
 }
 
 // connectionProbe answers whether the server behind the context can be reached, and owns the
