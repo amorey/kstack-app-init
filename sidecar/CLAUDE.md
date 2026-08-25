@@ -266,8 +266,9 @@ finds the value already there.
 level-triggered pass, a schedule derived from recorded state) that knows nothing about
 kube-contexts. A probe is a struct implementing `probe.Probe[T]`, registered with
 `probe.Register(e, name, p, opts...)` — the same shape as a beehive controller, with `T` inferred
-from the instance — and `T` is its observable's value type; the typed `Handle[T]` registration
-returns is how that observable is read back and how `Needs`/`Wake` address the probe. `kubeconn`
+from the instance — and `T` is its observable's value type. **The registration name is the
+probe's whole public identity**: the edge options, `Wake`, and every read take one, and
+`Register` returns nothing. `kubeconn`
 keeps what is asked and what the answers mean: `probe.go` is `registerProbes` — five
 registrations kept side by side on purpose, since the set's rules are checked by eye — plus the
 probe structs; `service.go` is leases and publishing. → [ADR: probe
@@ -284,8 +285,12 @@ one value beside one `Attempts` per probe, the value written by that probe's `Ru
 `Read`/`OnChange` hand them back as a `probe.Snapshot`, frozen at the moment it was taken.
 Anything reads one out of it by registration name (`probe.Get[connInfo](snap, nameConnection)`,
 the `name*` constants), which is how a `Run` reads a sibling and how `stateOf` assembles `State`
-at publish time. The connection's value (`connInfo`) bundles `departed` and the connection with
-the endpoint; `stateOf` projects only the endpoint into `State.Connection`.
+at publish time. **A `probe.Key[T]` states that name↔type pairing once** rather than at every
+read site — `keyConnection.From(snap)`. It is a freestanding declaration: registration never
+hears about it, and the pairing is checked where `Get` checks it, when a value lands. The
+connection is the only observable another probe reads, so it is the only one keyed. Its value
+(`connInfo`) bundles `departed` and the connection with the endpoint; `stateOf` projects only the
+endpoint into `State.Connection`, and `newsOf` walks `probeNames` for the untyped per-probe read.
 
 **A `Run` takes a `probe.Pass[T]` and returns only its `Result`.** The pass carries the run's
 inputs — `Subject()`, `Prev()`, `Snapshot()` — and `pass.Commit(v)` records what the run found,

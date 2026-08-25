@@ -66,35 +66,36 @@ type probeFunc func(ctx context.Context, pass *Pass[string]) Result
 func (f probeFunc) Run(ctx context.Context, pass *Pass[string]) Result { return f(ctx, pass) }
 
 // single is an engine with one steered probe, closed on cleanup.
-func single(t *testing.T, res Result, opts ...ProbeOption) (*Engine, *steered, ID) {
+func single(t *testing.T, res Result, opts ...ProbeOption) (*Engine, *steered, string) {
 	t.Helper()
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	p := &steered{res: res}
-	return e, p, Register(e, "conn", p, opts...)
+	Register(e, "conn", p, opts...)
+	return e, p, "conn"
 }
 
 // pair is single plus a probe requiring the first.
-func pair(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aID, bID ID) {
+func pair(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aName, bName string) {
 	t.Helper()
 	e = New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	a, b = &steered{res: aRes}, &steered{res: bRes}
-	aID = Register(e, "conn", a)
-	bID = Register(e, "uid", b, WithDependencies(aID))
-	return e, a, b, aID, bID
+	Register(e, "conn", a)
+	Register(e, "uid", b, WithDependencies("conn"))
+	return e, a, b, "conn", "uid"
 }
 
 // linked is a pair where the second declares both edges on the first — the shape kubeconn's
 // watchers have, and the only one where a value change and a health gate are both in play.
-func linked(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aID, bID ID) {
+func linked(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aName, bName string) {
 	t.Helper()
 	e = New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	a, b = &steered{res: aRes}, &steered{res: bRes}
-	aID = Register(e, "conn", a)
-	bID = Register(e, "uid", b, WithDependencies(aID), WithWatches(aID))
-	return e, a, b, aID, bID
+	Register(e, "conn", a)
+	Register(e, "uid", b, WithDependencies("conn"), WithWatches("conn"))
+	return e, a, b, "conn", "uid"
 }
 
 // commits makes the body hand back v, which the engine reads as "the value moved".
@@ -180,12 +181,18 @@ func noRuns(t *testing.T, e *Engine, msg string) {
 	}
 }
 
+// keyOf is the run-queue key for a probe the test names, which is what the queue is keyed by
+// even though a name is what a caller addresses.
+func keyOf(e *Engine, name string) key {
+	return key{subject: subj, probe: e.byName[name]}
+}
+
 // att reads one probe's attempts through Read.
-func att(t *testing.T, e *Engine, id ID) Attempts {
+func att(t *testing.T, e *Engine, name string) Attempts {
 	t.Helper()
 	v, ok := e.Read(subj)
 	require.True(t, ok, "subject not tracked")
-	return v.Attempts(id)
+	return v.Attempts(name)
 }
 
 func startEngine(t *testing.T, e *Engine) {
@@ -197,14 +204,14 @@ func startEngine(t *testing.T, e *Engine) {
 
 // --- registration ---
 
-func TestRegisterReturnsIDsInRegistrationOrder(t *testing.T) {
+// A probe's public identity is its name; the index behind it is the engine's own.
+func TestRegisterResolvesAnEdgeToTheProbeItNames(t *testing.T) {
 	e, _, a := single(t, Skip())
-	b := Register(e, "uid", &steered{}, WithDependencies(a))
+	Register(e, "uid", &steered{}, WithDependencies(a))
 
-	assert.Equal(t, ID(0), a)
-	assert.Equal(t, ID(1), b)
-	assert.Equal(t, "uid", e.specs[b].name)
-	assert.Equal(t, []ID{a}, e.specs[b].cfg.dependencies)
+	assert.Equal(t, "uid", e.specs[1].name)
+	assert.Equal(t, []probeID{0}, e.specs[1].dependencies)
+	assert.Equal(t, probeID(1), e.byName["uid"])
 }
 
 func TestRegisterPanicsOnADuplicateName(t *testing.T) {
@@ -213,19 +220,19 @@ func TestRegisterPanicsOnADuplicateName(t *testing.T) {
 	assert.Panics(t, func() { Register(e, "conn", p) })
 }
 
-// WithDependencies takes IDs Register already returned, so the graph is acyclic by construction;
-// this is the backstop for a hand-forged ID.
+// An edge resolves against what is registered so far, so a forward reference cannot be
+// expressed and the registration order stays topological.
 func TestRegisterPanicsOnADependencyNotYetRegistered(t *testing.T) {
 	e := New()
 
-	assert.Panics(t, func() { Register(e, "uid", &steered{}, WithDependencies(ID(0))) })
+	assert.Panics(t, func() { Register(e, "uid", &steered{}, WithDependencies("nope")) })
 }
 
 // A registration states only what deviates from the package defaults.
 func TestRegistrationDefaultsWhatItDoesNotState(t *testing.T) {
-	e, _, id := single(t, Skip(), WithInterval(10*time.Minute))
+	e, _, name := single(t, Skip(), WithInterval(10*time.Minute))
 
-	cfg := e.specs[id].cfg
+	cfg := e.specs[e.byName[name]].cfg
 	assert.Equal(t, 10*time.Minute, cfg.interval)
 	assert.Equal(t, defaultCfg.timeout, cfg.timeout)
 	assert.Equal(t, defaultCfg.backoff, cfg.backoff)
@@ -256,7 +263,7 @@ func TestAddQueuesWhatAFreshSubjectOwes(t *testing.T) {
 	e.Add(subj)
 	e.settle()
 
-	assert.Equal(t, key{subject: subj, probe: aID}, takeRun(t, e))
+	assert.Equal(t, keyOf(e, aID), takeRun(t, e))
 	noRuns(t, e, "more than the connection probe was queued")
 
 	e.Add(subj)
@@ -330,7 +337,7 @@ func TestAWakeMidRunEarnsAFreshRun(t *testing.T) {
 
 	runNext(t, e)
 
-	assert.Equal(t, key{subject: subj, probe: id}, takeRun(t, e), "the mid-run Wake was folded into the run")
+	assert.Equal(t, keyOf(e, id), takeRun(t, e), "the mid-run Wake was folded into the run")
 }
 
 // A Wake overrides suspension — it is the one input the derivation cannot produce.
@@ -343,7 +350,7 @@ func TestAWakeRunsASuspendedProbe(t *testing.T) {
 
 	e.Wake(subj, id)
 
-	assert.Equal(t, key{subject: subj, probe: id}, takeRun(t, e))
+	assert.Equal(t, keyOf(e, id), takeRun(t, e))
 }
 
 func TestWakeAllReachesEveryTrackedSubject(t *testing.T) {
@@ -352,13 +359,13 @@ func TestWakeAllReachesEveryTrackedSubject(t *testing.T) {
 	e.Add("ctx-2")
 	e.settle()
 	seen := []key{runNext(t, e), runNext(t, e)} // the fresh subjects' own runs
-	require.ElementsMatch(t, seen, []key{{"ctx-1", id}, {"ctx-2", id}})
+	require.ElementsMatch(t, seen, []key{{"ctx-1", e.byName[id]}, {"ctx-2", e.byName[id]}})
 
 	e.WakeAll(id)
 
 	assert.ElementsMatch(t,
 		[]key{takeRun(t, e), takeRun(t, e)},
-		[]key{{"ctx-1", id}, {"ctx-2", id}})
+		[]key{{"ctx-1", e.byName[id]}, {"ctx-2", e.byName[id]}})
 }
 
 // --- the schedule ---
@@ -369,10 +376,10 @@ func TestARunInFlightIsLeftAlone(t *testing.T) {
 	e, _, id := single(t, Skip())
 	e.Add(subj)
 	e.settle()
-	require.Equal(t, key{subject: subj, probe: id}, takeRun(t, e), "the fresh subject's own run")
+	require.Equal(t, keyOf(e, id), takeRun(t, e), "the fresh subject's own run")
 	// The worker that took it marks the run before dropping the lock. Safe unlocked here: no
 	// loops are running.
-	e.subjects[subj].obs[id].begin(runAt)
+	e.subjects[subj].obs[e.byName[id]].begin(runAt)
 
 	e.pass(subj)
 
@@ -429,7 +436,7 @@ func TestASkipLeavesNoRecordAndNothingScheduled(t *testing.T) {
 	require.True(t, failed.Done())
 
 	p.set(Skip())
-	e.Wake(subj, id)
+	e.Wake(subj, "conn")
 	runNext(t, e)
 
 	a := att(t, e, id)
@@ -462,7 +469,7 @@ func TestADependentIsUntouchedBeforeItsDependenciesAnswer(t *testing.T) {
 	e.Add(subj)
 	e.settle()
 
-	require.Equal(t, key{subject: subj, probe: aID}, takeRun(t, e))
+	require.Equal(t, keyOf(e, aID), takeRun(t, e))
 	b := att(t, e, bID)
 	assert.False(t, b.LastAttempt.Done())
 	assert.False(t, b.Scheduled())
@@ -474,9 +481,9 @@ func TestADependentRecordsDependencyFailedOnceThenSuspends(t *testing.T) {
 	e, _, bBody, aID, bID := pair(t, Fail("Unreachable", assert.AnError), Succeeded())
 	e.Add(subj)
 	e.settle()
-	require.Equal(t, key{subject: subj, probe: aID}, runNext(t, e), "the connection answers first")
+	require.Equal(t, keyOf(e, aID), runNext(t, e), "the connection answers first")
 
-	require.Equal(t, key{subject: subj, probe: bID}, runNext(t, e), "the failure makes the dependent due once")
+	require.Equal(t, keyOf(e, bID), runNext(t, e), "the failure makes the dependent due once")
 
 	b := att(t, e, bID)
 	assert.Equal(t, VerdictSuspended, b.LastAttempt.Verdict)
@@ -503,7 +510,7 @@ func TestARecoveredDependencyMakesItsDependentsDue(t *testing.T) {
 	e.Wake(subj, aID)
 	runNext(t, e) // connection recovers
 
-	assert.Equal(t, key{subject: subj, probe: bID}, takeRun(t, e))
+	assert.Equal(t, keyOf(e, bID), takeRun(t, e))
 }
 
 // A dependency that failed between the pass and the worker picking the key up means the run is
@@ -515,9 +522,9 @@ func TestDependenciesAreRecheckedAtDispatch(t *testing.T) {
 	runNext(t, e) // connection succeeds; the dependent is now queued
 
 	aBody.set(Fail("Unreachable", assert.AnError))
-	e.runProbe(t.Context(), key{subject: subj, probe: aID}) // the connection dies before b dispatches
+	e.runProbe(t.Context(), keyOf(e, aID)) // the connection dies before b dispatches
 	e.settle()
-	require.Equal(t, key{subject: subj, probe: bID}, runNext(t, e))
+	require.Equal(t, keyOf(e, bID), runNext(t, e))
 
 	assert.Zero(t, bBody.count(), "the body dialed a server the state already said was down")
 	assert.Equal(t, ReasonDependencyFailed, att(t, e, bID).LastAttempt.Reason)
@@ -536,7 +543,7 @@ func TestAChangedValueWakesAWatcher(t *testing.T) {
 	e.Wake(subj, aID)
 	runNext(t, e)
 
-	assert.Equal(t, key{subject: subj, probe: bID}, takeRun(t, e))
+	assert.Equal(t, keyOf(e, bID), takeRun(t, e))
 }
 
 // The engine never compares values — the body says whether its answer moved by committing or
@@ -565,7 +572,7 @@ func TestAChangedValueWakesASuspendedWatcher(t *testing.T) {
 	e.Wake(subj, aID)
 	runNext(t, e)
 
-	assert.Equal(t, key{subject: subj, probe: bID}, takeRun(t, e))
+	assert.Equal(t, keyOf(e, bID), takeRun(t, e))
 }
 
 // The data edge does not consult health: a probe declaring only a dependency must not be gated
@@ -575,17 +582,17 @@ func TestAFailedRunThatChangedItsValueStillWakes(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	a := &steered{res: Succeeded()}
 	watcher := &steered{res: Succeeded()}
-	aID := Register(e, "conn", a)
-	wID := Register(e, "watcher", watcher, WithWatches(aID))
+	Register(e, "conn", a)
+	Register(e, "watcher", watcher, WithWatches("conn"))
 	a.commits("v1")
 	settled(t, e)
 
 	a.set(Fail("Unreachable", assert.AnError))
 	a.commits("v2")
-	e.Wake(subj, aID)
+	e.Wake(subj, "conn")
 	runNext(t, e)
 
-	assert.Equal(t, key{subject: subj, probe: wID}, takeRun(t, e))
+	assert.Equal(t, keyOf(e, "watcher"), takeRun(t, e))
 }
 
 // A wake is not a way past a dependency. The dependent here is already suspended for the
@@ -598,8 +605,8 @@ func TestAWokenRunWithAFailingDependencyRecordsRatherThanDialing(t *testing.T) {
 	a.set(Fail("Unreachable", assert.AnError))
 	a.commitsNothing()
 	e.Wake(subj, aID)
-	runNext(t, e)                                                   // the connection fails
-	require.Equal(t, key{subject: subj, probe: bID}, runNext(t, e)) // the dependent suspends on it
+	runNext(t, e)                                  // the connection fails
+	require.Equal(t, keyOf(e, bID), runNext(t, e)) // the dependent suspends on it
 	require.Equal(t, ReasonDependencyFailed, att(t, e, bID).LastAttempt.Reason)
 	noRuns(t, e, "the dependent is suspended for the rest of the outage")
 	before := b.count()
@@ -607,7 +614,7 @@ func TestAWokenRunWithAFailingDependencyRecordsRatherThanDialing(t *testing.T) {
 	a.commits("v2") // still failing, but it learned something
 	e.Wake(subj, aID)
 	runNext(t, e)
-	require.Equal(t, key{subject: subj, probe: bID}, runNext(t, e), "the data edge reached it")
+	require.Equal(t, keyOf(e, bID), runNext(t, e), "the data edge reached it")
 
 	assert.Equal(t, before, b.count(), "the body dialed a server the state already said was down")
 	assert.Equal(t, ReasonDependencyFailed, att(t, e, bID).LastAttempt.Reason)
@@ -618,7 +625,7 @@ func TestAWokenRunWithAFailingDependencyRecordsRatherThanDialing(t *testing.T) {
 func TestRegisterPanicsOnAWatchNotYetRegistered(t *testing.T) {
 	e := New()
 
-	assert.Panics(t, func() { Register(e, "uid", &steered{}, WithWatches(ID(0))) })
+	assert.Panics(t, func() { Register(e, "uid", &steered{}, WithWatches("nope")) })
 }
 
 // --- what a run records ---
@@ -628,12 +635,12 @@ func TestRegisterPanicsOnAWatchNotYetRegistered(t *testing.T) {
 func TestARunCommitsTheLastValueItRecorded(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	aID := Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
+	Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
 		pass.Commit("v1")
 		pass.Commit("v2")
 		return Succeeded()
 	}))
-	bID := Register(e, "uid", &steered{res: Succeeded()}, WithWatches(aID))
+	Register(e, "uid", &steered{res: Succeeded()}, WithWatches("conn"))
 	e.Add(subj)
 	e.settle()
 
@@ -641,7 +648,7 @@ func TestARunCommitsTheLastValueItRecorded(t *testing.T) {
 
 	read, _ := e.Read(subj)
 	assert.Equal(t, "v2", Get[string](read, "conn").Value)
-	assert.Equal(t, key{subject: subj, probe: bID}, takeRun(t, e))
+	assert.Equal(t, keyOf(e, "uid"), takeRun(t, e))
 	noRuns(t, e, "the watcher was woken more than once")
 }
 
@@ -693,7 +700,7 @@ func TestAPanickingRunCommitsNothingItRecorded(t *testing.T) {
 func TestAPanickingRunRecordsInternalAndFreesItsKey(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	id := Register(e, "conn", probeFunc(func(context.Context, *Pass[string]) Result {
+	Register(e, "conn", probeFunc(func(context.Context, *Pass[string]) Result {
 		panic("boom")
 	}))
 	e.Add(subj)
@@ -701,13 +708,13 @@ func TestAPanickingRunRecordsInternalAndFreesItsKey(t *testing.T) {
 
 	runNext(t, e)
 
-	a := att(t, e, id)
+	a := att(t, e, "conn")
 	assert.Equal(t, VerdictFailed, a.LastAttempt.Verdict)
 	assert.Equal(t, ReasonInternal, a.LastAttempt.Reason)
 	assert.False(t, a.InFlight())
 
-	e.Wake(subj, id)
-	assert.Equal(t, key{subject: subj, probe: id}, takeRun(t, e), "the key stayed held")
+	e.Wake(subj, "conn")
+	assert.Equal(t, keyOf(e, "conn"), takeRun(t, e), "the key stayed held")
 }
 
 // A body that hands back nothing is the same class of bug as one that panics, and is contained
@@ -766,7 +773,7 @@ func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
 	p := &steered{res: Succeeded(), next: &uid}
-	id := Register(e, "conn", p)
+	Register(e, "conn", p)
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
@@ -775,7 +782,7 @@ func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {
 	require.True(t, seen.Known())
 
 	p.set(Fail("Unreachable", assert.AnError))
-	e.Wake(subj, id)
+	e.Wake(subj, "conn")
 	runNext(t, e)
 
 	read, _ = e.Read(subj)
@@ -783,6 +790,26 @@ func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {
 	assert.Equal(t, "uid-1", after.Value, "the value outlives the failure")
 	assert.Equal(t, seen.LastSeen, after.LastSeen, "a failure is not a read")
 	assert.False(t, after.OK())
+}
+
+// --- keys ---
+
+// A key states the name↔type pairing once, beside the probe, where Get restates it at every
+// read site.
+func TestAKeyReadsTheObservableItNames(t *testing.T) {
+	e, p, _ := single(t, Succeeded())
+	p.commits("v1")
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+	conn := NewKey[string]("conn")
+
+	read, _ := e.Read(subj)
+	o := conn.From(read)
+
+	assert.Equal(t, "conn", conn.Name())
+	assert.Equal(t, "v1", o.Value)
+	assert.True(t, o.Known())
 }
 
 // --- reading an observable ---
@@ -866,7 +893,7 @@ func TestASuccessWithNoNewValueStillAdvancesLastSeen(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
 	p := &steered{res: Succeeded(), next: &uid}
-	id := Register(e, "conn", p)
+	Register(e, "conn", p)
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
@@ -876,7 +903,7 @@ func TestASuccessWithNoNewValueStillAdvancesLastSeen(t *testing.T) {
 	p.mu.Lock()
 	p.next = nil
 	p.mu.Unlock()
-	e.Wake(subj, id)
+	e.Wake(subj, "conn")
 	runNext(t, e)
 
 	read, _ = e.Read(subj)
@@ -914,14 +941,14 @@ func TestANilValueKeepsThePreviousOne(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
 	p := &steered{res: Succeeded(), next: &uid}
-	id := Register(e, "conn", p)
+	Register(e, "conn", p)
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
 
 	p.set(Fail("Unreachable", assert.AnError))
 	p.next = nil
-	e.Wake(subj, id)
+	e.Wake(subj, "conn")
 	runNext(t, e)
 
 	v, ok := e.Read(subj)

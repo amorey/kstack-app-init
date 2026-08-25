@@ -17,11 +17,11 @@
 // recorded state. Nothing here knows what a subject is beyond its name.
 //
 // A caller registers its probes, says which subjects are tracked, and reads what the runs found:
-// Register takes a Probe with its cadence and what it requires, and returns the ID the edges
-// address it by; Add and Remove track subjects, and Wake says a recorded answer went stale; Read
-// and OnChange hand back Snapshot — every probe's Observation, value beside attempts, copied
-// under one lock. Get reads one of them by registration name, which is how a Run reads a
-// sibling.
+// Register takes a Probe with its cadence and what it depends on, all addressed by registration
+// name — a probe's whole public identity; Add and Remove track subjects, and Wake says a
+// recorded answer went stale; Read and OnChange hand back a Snapshot — every probe's
+// Observation, value beside attempts, copied under one lock. Get reads one of them by name,
+// which is how a Run reads a sibling, and a Key pairs that name with its type once.
 //
 // A run's own Result is its schedule — Succeeded waits out the interval, Fail climbs the backoff
 // ladder, Suspend and Skip wait for a Wake — so no domain rule lives in the scheduler.
@@ -43,9 +43,9 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/workqueue"
 )
 
-// ID is a probe's registration index, returned by Register. WithDependencies,
-// WithWatches, and Wake address probes by it, and Snapshot.Attempts indexes by it.
-type ID int
+// probeID is a probe's registration index — engine-internal, since a probe's public identity is
+// the name it was registered under.
+type probeID int
 
 // Probe is one probe's body: request against the subject, classify, and return the result. What
 // the run found is recorded on the pass, wherever the body learns it; a body with no news just
@@ -81,8 +81,8 @@ type probeCfg struct {
 	interval     time.Duration
 	backoff      Backoff
 	timeout      time.Duration
-	dependencies []ID
-	watches      []ID
+	dependencies []string
+	watches      []string
 }
 
 var defaultCfg = probeCfg{
@@ -100,8 +100,8 @@ type ProbeOption func(*probeCfg)
 // DependencyFailed rather than dispatched, and it is due again when the dependency recovers. It
 // takes IDs Register already returned, so a dependency exists before whatever depends on it and
 // the graph is acyclic by construction.
-func WithDependencies(ids ...ID) ProbeOption {
-	return func(c *probeCfg) { c.dependencies = append(c.dependencies, ids...) }
+func WithDependencies(names ...string) ProbeOption {
+	return func(c *probeCfg) { c.dependencies = append(c.dependencies, names...) }
 }
 
 // WithWatches declares the probes whose values this one reads — the data edge, answering
@@ -109,8 +109,8 @@ func WithDependencies(ids ...ID) ProbeOption {
 // whatever its schedule said; it takes no other part in scheduling, and it never gates a run.
 // Health is the other edge's job: a probe that also cannot run without what it reads declares
 // WithDependencies too.
-func WithWatches(ids ...ID) ProbeOption {
-	return func(c *probeCfg) { c.watches = append(c.watches, ids...) }
+func WithWatches(names ...string) ProbeOption {
+	return func(c *probeCfg) { c.watches = append(c.watches, names...) }
 }
 
 // WithInterval is how long after a succeeded run the probe is due again.
@@ -133,7 +133,10 @@ func WithTimeout(d time.Duration) ProbeOption {
 type spec struct {
 	name string
 	cfg  probeCfg
-	run  func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any)
+	// dependencies and watches are cfg's names resolved once, at registration.
+	dependencies []probeID
+	watches      []probeID
+	run          func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any)
 }
 
 // Option configures an Engine.
@@ -168,8 +171,8 @@ type Engine struct {
 	// watchers is the data edge reversed: for each probe, who watches its value and so runs
 	// again when it moves. byName is what Get resolves a read through. Both built by Register,
 	// and neither written once a subject exists.
-	watchers map[ID][]ID
-	byName   map[string]ID
+	watchers map[probeID][]probeID
+	byName   map[string]probeID
 	subjects map[string]*subject
 
 	wg sync.WaitGroup
@@ -178,7 +181,7 @@ type Engine struct {
 // key is one run of one probe against one subject — the unit runQ keys on.
 type key struct {
 	subject string
-	probe   ID
+	probe   probeID
 }
 
 // observable is what the engine holds for one probe of one subject: the value its runs committed
@@ -203,7 +206,7 @@ type observable struct {
 // subject is what the engine holds for one tracked name. Identity matters: a subject removed
 // and re-added is a new *subject, and a run dispatched against the old one commits nothing.
 type subject struct {
-	// obs is one observable per probe, indexed by ID.
+	// obs is one observable per probe, indexed by probeID.
 	obs []observable
 	// timer brings the pass back when the soonest scheduled run comes due. One per subject,
 	// and it is a wake, not a cadence: the pass decides again per probe.
@@ -230,8 +233,8 @@ func New(opts ...Option) *Engine {
 		settings: settings{workers: 8},
 		runQ:     workqueue.New[key](),
 		passQ:    workqueue.New[string](),
-		watchers: map[ID][]ID{},
-		byName:   map[string]ID{},
+		watchers: map[probeID][]probeID{},
+		byName:   map[string]probeID{},
 		subjects: map[string]*subject{},
 	}
 	for _, opt := range opts {
@@ -253,15 +256,15 @@ func (e *Engine) OnChange(fn func(subjectName string, snap Snapshot)) {
 	e.onChange = fn
 }
 
-// Register adds one probe and returns the ID that WithDependencies, WithWatches, and Wake
-// address it by — a package function rather than a method so each probe picks its own value
-// type; T is inferred from the instance. Its observable is read with Get, by name, so nothing
-// has to carry this ID to read it. It panics on a dependency not yet registered, a duplicate
-// name, or a call after
+// Register adds one probe under name, which is its whole public identity: the edges, Wake, and
+// every read address it by that. A package function rather than a method so each probe picks its
+// own value type; T is inferred from the instance.
+//
+// It panics on an edge naming a probe not yet registered, a duplicate name, or a call after
 // Start or the first Add — a table wired wrong at boot, not a runtime error. A subject's
 // bookkeeping is sized when it is added, which is why the set must be complete before anything
 // is tracked.
-func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) ID {
+func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) {
 	if p == nil {
 		panic("probe: Register needs a probe")
 	}
@@ -277,10 +280,10 @@ func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) ID
 		}
 		return res, *pass.next
 	}
-	return e.register(name, run, opts)
+	e.register(name, run, opts)
 }
 
-func (e *Engine) register(name string, run func(context.Context, string, any, Snapshot) (Result, any), opts []ProbeOption) ID {
+func (e *Engine) register(name string, run func(context.Context, string, any, Snapshot) (Result, any), opts []ProbeOption) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -303,26 +306,38 @@ func (e *Engine) register(name string, run func(context.Context, string, any, Sn
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	for _, id := range cfg.dependencies {
-		if id < 0 || int(id) >= len(e.specs) {
-			panic(fmt.Sprintf("probe: %q requires probe %d, which is not registered yet", name, id))
-		}
-	}
-	for _, id := range cfg.watches {
-		if id < 0 || int(id) >= len(e.specs) {
-			panic(fmt.Sprintf("probe: %q depends on probe %d, which is not registered yet", name, id))
-		}
-	}
+	// Resolved here, against what is registered so far: a forward reference panics, so the
+	// registration order stays topological and both graphs are acyclic by construction.
+	dependencies := e.resolveLocked(name, "depends on", cfg.dependencies)
+	watches := e.resolveLocked(name, "watches", cfg.watches)
 
-	e.specs = append(e.specs, spec{name: name, cfg: cfg, run: run})
-	id := ID(len(e.specs) - 1)
+	e.specs = append(e.specs, spec{
+		name: name, cfg: cfg, dependencies: dependencies, watches: watches, run: run,
+	})
+	id := probeID(len(e.specs) - 1)
 	e.byName[name] = id
 	// The edge is walked from the probe that committed, so it is indexed that way here rather
 	// than searched for at wake time. Both ends exist already, which is what makes it safe.
-	for _, watched := range cfg.watches {
+	for _, watched := range watches {
 		e.watchers[watched] = append(e.watchers[watched], id)
 	}
-	return id
+}
+
+// resolveLocked turns an edge's names into indexes. A name nothing was registered under is a
+// wiring bug: edge names me a probe that does not exist, or one that comes later.
+func (e *Engine) resolveLocked(name, edge string, names []string) []probeID {
+	if len(names) == 0 {
+		return nil
+	}
+	ids := make([]probeID, 0, len(names))
+	for _, want := range names {
+		id, ok := e.byName[want]
+		if !ok {
+			panic(fmt.Sprintf("probe: %q %s %q, which is not registered yet", name, edge, want))
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // Add tracks subject. Every probe derives from zero, so the pass this queues dispatches
@@ -355,19 +370,22 @@ func (e *Engine) Remove(subjectName string) {
 
 // Wake says these probes' answers are stale: run them again, suspension notwithstanding. It
 // adds straight to the run queue, whose held/dirty machinery redelivers a key that was mid-run
-// when its commit lands — a Wake is never lost. A subject not tracked is ignored; an ID never
-// registered is a wiring bug and panics.
-func (e *Engine) Wake(subjectName string, ids ...ID) {
+// when its commit lands — a Wake is never lost. A subject not tracked is ignored; a name nothing
+// was registered under is a wiring bug and panics.
+func (e *Engine) Wake(subjectName string, names ...string) {
 	e.mu.Lock()
 	tracked := e.subjects[subjectName] != nil
-	n := len(e.specs)
+	ids := make([]probeID, 0, len(names))
+	for _, name := range names {
+		id, ok := e.byName[name]
+		if !ok {
+			e.mu.Unlock()
+			panic(fmt.Sprintf("probe: Wake of %q, which is not registered", name))
+		}
+		ids = append(ids, id)
+	}
 	e.mu.Unlock()
 
-	for _, id := range ids {
-		if id < 0 || int(id) >= n {
-			panic(fmt.Sprintf("probe: Wake of probe %d, which is not registered", id))
-		}
-	}
 	if !tracked {
 		return
 	}
@@ -377,13 +395,13 @@ func (e *Engine) Wake(subjectName string, ids ...ID) {
 }
 
 // WakeAll is Wake over every tracked subject.
-func (e *Engine) WakeAll(ids ...ID) {
+func (e *Engine) WakeAll(names ...string) {
 	e.mu.Lock()
-	names := slices.Collect(maps.Keys(e.subjects))
+	subjects := slices.Collect(maps.Keys(e.subjects))
 	e.mu.Unlock()
 
-	for _, name := range names {
-		e.Wake(name, ids...)
+	for _, subjectName := range subjects {
+		e.Wake(subjectName, names...)
 	}
 }
 
@@ -489,7 +507,7 @@ func (e *Engine) pass(subjectName string) {
 		if a.InFlight() {
 			continue
 		}
-		at := e.due(sub, ID(id), now)
+		at := e.due(sub, probeID(id), now)
 		a.schedule(at)
 
 		switch {
@@ -500,7 +518,7 @@ func (e *Engine) pass(subjectName string) {
 				soonest = at
 			}
 		default:
-			e.runQ.Add(key{subject: subjectName, probe: ID(id)})
+			e.runQ.Add(key{subject: subjectName, probe: probeID(id)})
 		}
 	}
 
@@ -530,7 +548,7 @@ const (
 	dependenciesFailing
 )
 
-func (e *Engine) dependenciesOf(sub *subject, dependencies []ID) dependenciesState {
+func (e *Engine) dependenciesOf(sub *subject, dependencies []probeID) dependenciesState {
 	state := dependenciesOK
 	for _, id := range dependencies {
 		dep := sub.obs[id]
@@ -547,7 +565,7 @@ func (e *Engine) dependenciesOf(sub *subject, dependencies []ID) dependenciesSta
 // due is when probe id should next run, zero for nothing scheduled. The whole scheduling
 // policy, in the order the cases have to be read. The caller has already set aside a run in
 // flight.
-func (e *Engine) due(sub *subject, id ID, now time.Time) time.Time {
+func (e *Engine) due(sub *subject, id probeID, now time.Time) time.Time {
 	a := sub.obs[id]
 	if a.skipped {
 		// The last run declined to record; only a Wake brings it back.
@@ -556,7 +574,7 @@ func (e *Engine) due(sub *subject, id ID, now time.Time) time.Time {
 
 	cfg := e.specs[id].cfg
 
-	switch e.dependenciesOf(sub, cfg.dependencies) {
+	switch e.dependenciesOf(sub, e.specs[id].dependencies) {
 	case dependenciesUnanswered:
 		// Nothing to say about a server nobody has tried, so the probe stays untouched
 		// rather than recording a dependency that has not failed.
@@ -605,7 +623,7 @@ func (e *Engine) runProbe(ctx context.Context, k key) {
 	sp := e.specs[k.probe]
 	prev := sub.obs[k.probe].value
 	snap := e.snapshotOf(sub)
-	dependencies := e.dependenciesOf(sub, sp.cfg.dependencies)
+	dependencies := e.dependenciesOf(sub, sp.dependencies)
 	// Marked before the lock is dropped, so InFlight is true for as long as the request is
 	// out and a pass landing meanwhile leaves the run alone.
 	startedAt := time.Now()

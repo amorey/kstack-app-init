@@ -29,14 +29,18 @@ type Snapshot struct {
 	// byName is the engine's index of which probe a name addresses, shared rather than copied:
 	// registration is closed before any subject exists, so nothing writes it once a Snapshot
 	// can be taken.
-	byName map[string]ID
+	byName map[string]probeID
 }
 
-// Attempts is probe id's bookkeeping. Panics on an ID never registered, like any index.
-func (snap Snapshot) Attempts(id ID) Attempts { return snap.obs[id].Attempts }
-
-// Len is how many probes are registered, so ID(0)..ID(Len-1) index Attempts.
-func (snap Snapshot) Len() int { return len(snap.obs) }
+// Attempts is one probe's bookkeeping, untyped — for a reader walking every probe, which walks
+// the names it registered. Panics on a name nothing was registered under, as Get does.
+func (snap Snapshot) Attempts(name string) Attempts {
+	id, ok := snap.byName[name]
+	if !ok {
+		panic("probe: no probe named " + name)
+	}
+	return snap.obs[id].Attempts
+}
 
 // Get is one probe's observation, by the name it was registered under: the value its runs
 // committed — the zero T until one has, which Known reports — beside the attempts that account

@@ -31,11 +31,9 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
 
-// numProbes sizes what is tracked per context, one entry per name below.
-const numProbes = 5
-
-// The names the probes are registered under, and so the names every read goes through — a
-// probe body reads a sibling with probe.Get[T](snap, nameConnection), needing nothing wired.
+// The names the probes are registered under, which is the whole of how they are addressed: the
+// edges, Wake, and every read take one. A probe body reads a sibling with
+// probe.Get[T](snap, nameConnection), needing nothing wired.
 const (
 	nameConnection    = "connection"
 	nameReadiness     = "readiness"
@@ -44,16 +42,13 @@ const (
 	namePrincipal     = "principal"
 )
 
-// probeIDs is what registration returned: the IDs the edges and Wake address probes by. A
-// cluster's UID outlives everything else here; its readiness outlives nothing — which is why
-// the intervals below differ.
-type probeIDs struct {
-	connection    probe.ID
-	readiness     probe.ID
-	serverUID     probe.ID
-	serverVersion probe.ID
-	principal     probe.ID
-}
+// probeNames is the set, in registration order — what a reader walking every probe walks, and
+// what sizes the per-context bookkeeping.
+var probeNames = [...]string{nameConnection, nameReadiness, nameServerUID, nameServerVersion, namePrincipal}
+
+// keyConnection reads the connection's observable: the one value another probe needs, so the
+// only one with a key.
+var keyConnection = probe.NewKey[connInfo](nameConnection)
 
 // connInfo is the connection probe's observable: the context's standing in the kubeconfig, and
 // the connection reaching its server yields. The four probes behind reachability read it through
@@ -68,23 +63,21 @@ type connInfo struct {
 	endpoint string
 }
 
-func registerProbes(e *probe.Engine, kubecfg kubeconfigService) probeIDs {
-	var p probeIDs
-	p.connection = probe.Register(e, nameConnection, &connectionProbe{kubecfg: kubecfg},
+func registerProbes(e *probe.Engine, kubecfg kubeconfigService) {
+	probe.Register(e, nameConnection, &connectionProbe{kubecfg: kubecfg},
 		probe.WithInterval(30*time.Second))
 	// The four behind reachability declare both edges on it: they cannot run without a
 	// connection, and they read the one it committed — so a connection that moves re-runs them
 	// rather than leaving them on a value that changed under them.
-	dependsOnConn, watchesConn := probe.WithDependencies(p.connection), probe.WithWatches(p.connection)
-	p.readiness = probe.Register(e, nameReadiness, unimplemented[ComponentStatus]{"readiness"},
+	dependsOnConn, watchesConn := probe.WithDependencies(nameConnection), probe.WithWatches(nameConnection)
+	probe.Register(e, nameReadiness, unimplemented[ComponentStatus]{"readiness"},
 		probe.WithInterval(30*time.Second), dependsOnConn, watchesConn)
-	p.serverUID = probe.Register(e, nameServerUID, unimplemented[string]{"serverUID"},
+	probe.Register(e, nameServerUID, unimplemented[string]{"serverUID"},
 		probe.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
-	p.serverVersion = probe.Register(e, nameServerVersion, unimplemented[VersionInfo]{"serverVersion"},
+	probe.Register(e, nameServerVersion, unimplemented[VersionInfo]{"serverVersion"},
 		probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
-	p.principal = probe.Register(e, namePrincipal, unimplemented[Principal]{"principal"},
+	probe.Register(e, namePrincipal, unimplemented[Principal]{"principal"},
 		probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
-	return p
 }
 
 // connectionProbe answers whether the server behind the context can be reached, and owns the

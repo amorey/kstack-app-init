@@ -209,7 +209,7 @@ func TestAResolveFailureKeepsAsking(t *testing.T) {
 
 	// The retry sits out on the ladder; the wake stands in for it, as a worked answer the
 	// schedule would eventually produce.
-	s.engine.Wake("prod", s.probes.connection)
+	s.engine.Wake("prod", nameConnection)
 
 	second := awaitState(t, watched, func(st State) bool {
 		return st.Connection.Failures >= 2
