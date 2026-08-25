@@ -16,15 +16,14 @@ package clustersvc
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
 	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
@@ -166,28 +165,55 @@ func servingCatalog(t *testing.T, enabled bool) (deps, *beehive.Object[ClusterCa
 	return d, createCatalog(t, d, ClusterCacheID(cache.ID), enabled)
 }
 
-// kindsFound is a discovery seam answering with these kinds and nothing wrong.
-func kindsFound(kinds ...ClusterCachedResourceSpec) func(*kubeconn.Connection) (kindCatalog, error) {
-	return func(*kubeconn.Connection) (kindCatalog, error) { return kindCatalog{kinds: kinds}, nil }
+// sweeper is the fake behind the pass under test.
+func sweeper(d deps) *fakeKubecatalog { return d.kubecatalogSvc.(*fakeKubecatalog) }
+
+// sweepAnswered files the sweeper's standing answer for this catalog's subject.
+func sweepAnswered(d deps, obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus], o kubecatalog.Observation) {
+	f := sweeper(d)
+	if f.obs == nil {
+		f.obs = map[string]kubecatalog.Observation{}
+	}
+	f.obs[obj.Name] = o
+}
+
+// swept is a sweep that answered these kinds at probedAt.
+func swept(kinds ...kubecatalog.Kind) kubecatalog.Observation {
+	return kubecatalog.Observation{
+		Value:    kubecatalog.Catalog{Kinds: kinds},
+		LastSeen: probedAt,
+		Attempts: kubeconn.Attempts{LastAttempt: finished(kubeconn.ReasonSucceeded, "")},
+	}
+}
+
+// partialSwept is a sweep some groups failed to answer: the partial list is committed
+// and the run failed, which is how the probe records it.
+func partialSwept(kinds ...kubecatalog.Kind) kubecatalog.Observation {
+	o := swept(kinds...)
+	o.Value.Partial = true
+	o.Attempts = kubeconn.Attempts{
+		LastAttempt: finished(kubecatalog.ReasonSweepPartial, "a group failed to answer"),
+		Failures:    1, FailingSince: probedAt,
+	}
+	return o
 }
 
 // deployments and pods are the two kinds the pass fixtures discover.
 var (
-	deployments = ClusterCachedResourceSpec{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Namespaced: true}
-	pods        = ClusterCachedResourceSpec{APIVersion: "v1", Kind: "Pod", Resource: "pods", Namespaced: true}
+	deployments = kubecatalog.Kind{GroupVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Namespaced: true}
+	pods        = kubecatalog.Kind{GroupVersion: "v1", Kind: "Pod", Resource: "pods", Namespaced: true}
 )
 
-// reconcileCatalog runs one catalog pass the way beehive would, with discover standing in
-// for the API server.
+// reconcileCatalog runs one catalog pass the way beehive would, folding whatever the
+// fake sweeper holds.
 func reconcileCatalog(
 	t *testing.T,
 	d deps,
 	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
-	discover func(*kubeconn.Connection) (kindCatalog, error),
 ) (*catalogControllerClient, beehive.ReconcileResult) {
 	t.Helper()
 	client := &catalogControllerClient{catalogs: d.catalogClient, id: obj.ID}
-	c := &clusterCachedCatalogController{deps: d, discover: discover}
+	c := &clusterCachedCatalogController{deps: d}
 	return client, c.Reconcile(context.Background(), client, obj)
 }
 
@@ -204,12 +230,33 @@ func storedKinds(t *testing.T, d deps, catalogID beehive.ObjectID) map[SyncedKin
 	return byRef
 }
 
+// The pass's first job: the sweep is armed exactly while the record wants discovery,
+// keyed by the record's own name and bound to its cluster's context. No answer has
+// landed yet, so the verdict is the wait — and no requeue, since the sweeper's signal
+// re-runs the fold and the kind's resync is the backstop.
+func TestCatalogReconcileArmsTheSweeper(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
+	f := sweeper(d)
+	assert.Equal(t, []string{catalog.Name}, f.tracked)
+	assert.Equal(t, "prod", f.contexts[catalog.Name])
+	assert.Empty(t, storedKinds(t, d, catalog.ID))
+	cond := client.discovered(t)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonConnecting, cond.Reason)
+}
+
 // The pass's whole product: one child per served kind, owned by the catalog so beehive's
 // GC cascades, carrying the identity a worker builds its REST path from.
 func TestCatalogReconcileCreatesAChildPerServedKind(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
+	sweepAnswered(d, catalog, swept(deployments, pods))
 
-	client, res := reconcileCatalog(t, d, catalog, kindsFound(deployments, pods))
+	client, res := reconcileCatalog(t, d, catalog)
 
 	require.NoError(t, res.Err())
 	kinds := storedKinds(t, d, catalog.ID)
@@ -226,13 +273,15 @@ func TestCatalogReconcileCreatesAChildPerServedKind(t *testing.T) {
 // recreated — which is what keeps its id, and any subscription keyed on it, alive.
 func TestCatalogReconcileRefreshesAChangedKind(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	_, res := reconcileCatalog(t, d, catalog, kindsFound(pods))
+	sweepAnswered(d, catalog, swept(pods))
+	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 	before := storedKinds(t, d, catalog.ID)[SyncedKindRef{APIVersion: "v1", Resource: "pods"}]
 
 	clusterScoped := pods
 	clusterScoped.Namespaced = false
-	_, res = reconcileCatalog(t, d, catalog, kindsFound(clusterScoped))
+	sweepAnswered(d, catalog, swept(clusterScoped))
+	_, res = reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
 	after := storedKinds(t, d, catalog.ID)[SyncedKindRef{APIVersion: "v1", Resource: "pods"}]
@@ -245,10 +294,12 @@ func TestCatalogReconcileRefreshesAChangedKind(t *testing.T) {
 // worker behind it.
 func TestCatalogReconcilePrunesAKindNoLongerServed(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	_, res := reconcileCatalog(t, d, catalog, kindsFound(deployments, pods))
+	sweepAnswered(d, catalog, swept(deployments, pods))
+	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
-	_, res = reconcileCatalog(t, d, catalog, kindsFound(pods))
+	sweepAnswered(d, catalog, swept(pods))
+	_, res = reconcileCatalog(t, d, catalog)
 
 	require.NoError(t, res.Err())
 	gone := storedKinds(t, d, catalog.ID)[SyncedKindRef{APIVersion: "apps/v1", Resource: "deployments"}]
@@ -261,12 +312,12 @@ func TestCatalogReconcilePrunesAKindNoLongerServed(t *testing.T) {
 // of one aggregated API server.
 func TestCatalogReconcilePrunesNothingOnAPartialSweep(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	_, res := reconcileCatalog(t, d, catalog, kindsFound(deployments, pods))
+	sweepAnswered(d, catalog, swept(deployments, pods))
+	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
-	client, res := reconcileCatalog(t, d, catalog, func(*kubeconn.Connection) (kindCatalog, error) {
-		return kindCatalog{kinds: []ClusterCachedResourceSpec{pods}, partial: true}, nil
-	})
+	sweepAnswered(d, catalog, partialSwept(pods))
+	client, res := reconcileCatalog(t, d, catalog)
 
 	require.NoError(t, res.Err())
 	kept := storedKinds(t, d, catalog.ID)[SyncedKindRef{APIVersion: "apps/v1", Resource: "deployments"}]
@@ -275,86 +326,97 @@ func TestCatalogReconcilePrunesNothingOnAPartialSweep(t *testing.T) {
 	assert.Equal(t, ReasonDiscoveryPartial, client.discovered(t).Reason)
 }
 
-// Nothing is known about the served kinds when the sweep itself fails, and an empty answer
-// is not the same as "serves nothing" — so the children stand.
-//
-// The pass fails rather than settling with a retry: this one reached the server, and a sweep
-// is dozens of round-trips, so a cluster that keeps failing has to back off rather than
-// re-sweep on a fixed cadence. The verdict still lands on the record on the way out.
-func TestCatalogReconcileFailsAndKeepsItsChildrenWhenDiscoveryFails(t *testing.T) {
-	boom := errors.New("the server rejected our request")
+// Nothing is known about the served kinds when the last sweep failed, and an empty
+// answer is not the same as "serves nothing" — so the children converge from the
+// standing answer while the verdict says it is not being re-confirmed. The fold
+// settles: retrying the sweep is the probe's own ladder, not beehive's.
+func TestCatalogReconcileKeepsItsChildrenWhenTheSweepFails(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	_, res := reconcileCatalog(t, d, catalog, kindsFound(pods))
+	sweepAnswered(d, catalog, swept(pods))
+	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
-	client, res := reconcileCatalog(t, d, catalog, func(*kubeconn.Connection) (kindCatalog, error) {
-		return kindCatalog{}, boom
-	})
+	failing := swept(pods)
+	failing.Attempts = kubeconn.Attempts{
+		LastAttempt: finished(kubecatalog.ReasonSweepFailed, "the server rejected our request"),
+		Failures:    1, FailingSince: probedAt,
+	}
+	sweepAnswered(d, catalog, failing)
+	client, res := reconcileCatalog(t, d, catalog)
 
-	assert.ErrorIs(t, res.Err(), boom, "beehive's backoff ladder, not a flat requeue")
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
 	kept := storedKinds(t, d, catalog.ID)[SyncedKindRef{APIVersion: "v1", Resource: "pods"}]
 	require.NotNil(t, kept)
 	assert.Nil(t, kept.DeletionRequestedAt)
-	assert.Equal(t, ReasonDiscoveryFailed, client.discovered(t).Reason)
+	cond := client.discovered(t)
+	assert.Equal(t, ReasonDiscoveryFailed, cond.Reason)
+	assert.Equal(t, "the server rejected our request", cond.Message)
 }
 
-// The claim is released on every path out, the failing one included: held past the pass, a
-// cluster the user then disabled would go on being probed after the controller dropped its
-// own lease.
-func TestCatalogReconcileReleasesItsClaimWhenDiscoveryFails(t *testing.T) {
+// The verdict is the last attempt's, not the retained value's: a sweep that failed
+// outright after a partial answer must report that failure, not the standing partial
+// flag it left behind.
+func TestCatalogReconcileReportsAFailureOverAStalePartialFlag(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	pool := d.kubeconnSvc.(*fakeKubeconn)
+	sweepAnswered(d, catalog, partialSwept(pods))
+	_, res := reconcileCatalog(t, d, catalog)
+	require.NoError(t, res.Err())
 
-	reconcileCatalog(t, d, catalog, func(*kubeconn.Connection) (kindCatalog, error) {
-		return kindCatalog{}, errors.New("the server rejected our request")
-	})
-
-	assert.Equal(t, []string{"prod"}, pool.released)
-}
-
-// A cluster nothing reached is not a failure to retry under backoff: the outage is the
-// cluster pass's to report, and this one comes back sooner than its own cadence so a
-// reconnect is not made to wait it out.
-func TestCatalogReconcileWaitsForAConnection(t *testing.T) {
-	d, catalog := servingCatalog(t, true)
-	d.kubeconnSvc = &fakeKubeconn{connErr: kubeconn.ErrNoConnection}
-
-	client, res := reconcileCatalog(t, d, catalog, kindsFound(pods))
+	failing := partialSwept(pods)
+	failing.Attempts = kubeconn.Attempts{
+		LastAttempt: finished(kubecatalog.ReasonSweepFailed, "the server rejected our request"),
+		Failures:    2, FailingSince: probedAt,
+	}
+	sweepAnswered(d, catalog, failing)
+	client, res := reconcileCatalog(t, d, catalog)
 
 	require.NoError(t, res.Err())
-	assert.Equal(t, beehive.Settled().RequeueAfter(catalogRetryInterval), res)
+	cond := client.discovered(t)
+	assert.Equal(t, ReasonDiscoveryFailed, cond.Reason)
+	assert.Equal(t, "the server rejected our request", cond.Message)
+}
+
+// A cluster nothing reached: the sweep is suspended on its claim, and the fold reports
+// the wait without a requeue of its own — the connection bridge wakes the sweep the
+// moment the pool reaches the server, and the sweep's signal re-runs this fold.
+func TestCatalogReconcileWaitsForAConnection(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	sweepAnswered(d, catalog, kubecatalog.Observation{
+		Attempts: kubeconn.Attempts{LastAttempt: suspended(kubecatalog.ReasonNoConnection, "no connection for kube-context")},
+	})
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
 	assert.Empty(t, storedKinds(t, d, catalog.ID))
 	assert.Equal(t, ReasonNoConnection, client.discovered(t).Reason)
 }
 
-// The claim is the pass's own and lasts exactly as long as the pass: held past it, a
-// disabled cluster would go on being probed after the controller dropped its lease.
-func TestCatalogReconcileReleasesItsClaim(t *testing.T) {
-	d, catalog := servingCatalog(t, true)
-	pool := d.kubeconnSvc.(*fakeKubeconn)
-
-	_, res := reconcileCatalog(t, d, catalog, kindsFound(pods))
-
-	require.NoError(t, res.Err())
-	assert.Equal(t, []string{"prod"}, pool.asked)
-	assert.Equal(t, []string{"prod"}, pool.released)
+// suspended is an attempt that parked the probe rather than failing it.
+func suspended(reason kubeconn.Reason, msg string) kubeconn.Attempt {
+	return kubeconn.Attempt{
+		ScheduledAt: probedAt, StartedAt: probedAt, FinishedAt: probedAt,
+		Verdict: kubeconn.VerdictSuspended, Reason: reason, Message: msg,
+	}
 }
 
-// A paused catalog keeps its subtree and stops looking: the anchor lives as long as the
-// cache, so resuming must not rebuild what pausing tore down. The switch still reaches the
+// A paused catalog keeps its subtree and stops looking: pausing disarms the sweep —
+// arming is policy, not interest — and the anchor lives as long as the cache, so
+// resuming must not rebuild what pausing tore down. The switch still reaches the
 // children, since relaying it is what pausing means.
-func TestCatalogReconcileRelaysAPauseWithoutDiscovering(t *testing.T) {
+func TestCatalogReconcileRelaysAPauseAndDisarmsTheSweep(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	_, res := reconcileCatalog(t, d, catalog, kindsFound(pods))
+	sweepAnswered(d, catalog, swept(pods))
+	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
 	paused := createCatalog(t, d, ClusterCacheID(mustOwnerID(t, d, catalog)), false)
-	client, res := reconcileCatalog(t, d, paused, func(*kubeconn.Connection) (kindCatalog, error) {
-		t.Fatal("a paused catalog must not reach the server")
-		return kindCatalog{}, nil
-	})
+	client, res := reconcileCatalog(t, d, paused)
 
 	require.NoError(t, res.Err())
+	assert.Equal(t, []string{paused.Name}, sweeper(d).forgotten)
 	kept := storedKinds(t, d, catalog.ID)[SyncedKindRef{APIVersion: "v1", Resource: "pods"}]
 	require.NotNil(t, kept, "the subtree survives a pause")
 	assert.False(t, kept.Spec.Enabled, "and hears about it")
@@ -371,18 +433,17 @@ func mustOwnerID(t *testing.T, d deps, catalog *beehive.Object[ClusterCachedCata
 }
 
 // A catalog on its way out is about to be collected with everything it owns, so a pass
-// that rebuilt its children would only make work for the GC.
+// that rebuilt its children would only make work for the GC. The sweep is disarmed with
+// the record.
 func TestCatalogReconcileSkipsARecordAwaitingDeletion(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
 	now := time.Now()
 	catalog.DeletionRequestedAt = &now
 
-	client, res := reconcileCatalog(t, d, catalog, func(*kubeconn.Connection) (kindCatalog, error) {
-		t.Fatal("a draining catalog must not reach the server")
-		return kindCatalog{}, nil
-	})
+	client, res := reconcileCatalog(t, d, catalog)
 
 	assert.Equal(t, beehive.Settled(), res)
+	assert.Equal(t, []string{catalog.Name}, sweeper(d).forgotten)
 	assert.Empty(t, storedKinds(t, d, catalog.ID))
 	assert.Empty(t, client.conditions)
 }
@@ -393,47 +454,12 @@ func TestCatalogReconcileSettlesWhenItsOwnerIsGone(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
 	client := &catalogControllerClient{catalogs: d.catalogClient, id: catalog.ID, noOwner: true}
 
-	res := (&clusterCachedCatalogController{deps: d, discover: kindsFound(pods)}).
+	res := (&clusterCachedCatalogController{deps: d}).
 		Reconcile(context.Background(), client, catalog)
 
 	assert.Equal(t, beehive.Settled(), res)
+	assert.Equal(t, []string{catalog.Name}, sweeper(d).forgotten)
 	assert.Empty(t, client.conditions)
-}
-
-// --- discovery filtering ---
-
-// A cache mirrors collections it can list and watch. A subresource has none of its own,
-// and the alternate events spelling is the same store served twice — syncing it would
-// cache every event a second time.
-func TestServedKindsFiltersWhatCannotBeMirrored(t *testing.T) {
-	lists := []*metav1.APIResourceList{
-		{GroupVersion: "v1", APIResources: []metav1.APIResource{
-			{Name: "pods", Kind: "Pod", Namespaced: true, Verbs: []string{"list", "watch", "get"}},
-			{Name: "pods/log", Kind: "Pod", Namespaced: true, Verbs: []string{"get"}},
-			{Name: "bindings", Kind: "Binding", Namespaced: true, Verbs: []string{"create"}},
-			{Name: "events", Kind: "Event", Namespaced: true, Verbs: []string{"list", "watch"}},
-		}},
-		{GroupVersion: "events.k8s.io/v1", APIResources: []metav1.APIResource{
-			{Name: "events", Kind: "Event", Namespaced: true, Verbs: []string{"list", "watch"}},
-		}},
-		nil,
-	}
-
-	got := servedKinds(lists)
-
-	assert.Equal(t, []SyncedKindRef{
-		{APIVersion: "v1", Resource: "events"},
-		{APIVersion: "v1", Resource: "pods"},
-	}, refsOf(got), "sorted, so a pass is deterministic")
-}
-
-// refsOf names each discovered kind, which is what the filtering test asserts on.
-func refsOf(kinds []ClusterCachedResourceSpec) []SyncedKindRef {
-	refs := make([]SyncedKindRef, 0, len(kinds))
-	for _, k := range kinds {
-		refs = append(refs, SyncedKindRef{APIVersion: k.APIVersion, Resource: k.Resource})
-	}
-	return refs
 }
 
 // --- CachedCatalogs() reads ---

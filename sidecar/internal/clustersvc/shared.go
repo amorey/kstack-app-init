@@ -31,6 +31,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -78,6 +79,18 @@ type kubeconnService interface {
 	Acquire(contextName string) kubeconn.Lease
 	Retry(contextName string)
 	Subscribe() kubeconn.Subscription
+}
+
+// kubecatalogService is the discovery sweeper behind every catalog record. Track arms
+// the sweep for a record — keyed by the record's own beehive name, so the sweeper's
+// change signal is the requeue — and Forget disarms it; both mirror the record's state,
+// which only the catalog's reconcile decides. Read is the standing answer that
+// reconcile folds, and Subscribe feeds the trigger.
+type kubecatalogService interface {
+	Track(id, contextName string)
+	Forget(id string)
+	Read(id string) (kubecatalog.Observation, bool)
+	Subscribe() kubecatalog.Subscription
 }
 
 // --- Identity ---

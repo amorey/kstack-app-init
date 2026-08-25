@@ -33,6 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -146,6 +147,46 @@ func (l *fakeLease) WatchState() kubeconn.StateSubscription {
 
 func (l *fakeLease) Release() { l.svc.released = append(l.svc.released, l.contextName) }
 
+// fakeKubecatalog stands in for the sweeper: it answers Read per id from a map and
+// records what was armed and disarmed. The zero value tracks nothing and knows nothing,
+// which reads as a sweep still owed.
+type fakeKubecatalog struct {
+	obs map[string]kubecatalog.Observation
+	// tracked and forgotten record the arm/disarm calls in order; contexts holds the
+	// context each Track named.
+	tracked   []string
+	contexts  map[string]string
+	forgotten []string
+
+	once sync.Once
+	hub  *conflate.Hub[string, struct{}]
+}
+
+func (f *fakeKubecatalog) Track(id, contextName string) {
+	f.tracked = append(f.tracked, id)
+	if f.contexts == nil {
+		f.contexts = map[string]string{}
+	}
+	f.contexts[id] = contextName
+}
+
+func (f *fakeKubecatalog) Forget(id string) { f.forgotten = append(f.forgotten, id) }
+
+func (f *fakeKubecatalog) Read(id string) (kubecatalog.Observation, bool) {
+	o, ok := f.obs[id]
+	return o, ok
+}
+
+// Subscribe is the change feed the trigger reads. publish is a sweep landing on it.
+func (f *fakeKubecatalog) Subscribe() kubecatalog.Subscription { return f.swept().Receiver() }
+
+func (f *fakeKubecatalog) publish(id string) { f.swept().Sender().Send(id, struct{}{}) }
+
+func (f *fakeKubecatalog) swept() *conflate.Hub[string, struct{}] {
+	f.once.Do(func() { f.hub = conflate.New[string, struct{}]() })
+	return f.hub
+}
+
 // probedAt is when every fake probe landed. Fixed, so a test asserting the stamp names a
 // value rather than reading the clock the code under test would.
 var probedAt = time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
@@ -222,7 +263,7 @@ func knowing(state kubeconn.State) *fakeKubeconn {
 func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, nil)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -241,7 +282,7 @@ func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	return newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -278,7 +319,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, nil)
 }
 
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the

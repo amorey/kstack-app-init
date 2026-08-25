@@ -41,12 +41,11 @@ func ClusterCachedResourceName(catalogID beehive.ObjectID, apiVersion, resource 
 // EventsKind / EventsAPIVersion / EventsResource identify the Event collection — an
 // ordinary synced kind, written to its own table. The server serves the same events
 // under two spellings backed by one store, so exactly one may be synced: canonical
-// `v1`; discovery drops EventsAltGroup.
+// `v1`; the discovery sweep (kubecatalog) drops the events.k8s.io spelling.
 const (
 	EventsKind       = "Event"
 	EventsAPIVersion = "v1"
 	EventsResource   = "events"
-	EventsAltGroup   = "events.k8s.io"
 )
 
 // ClusterCachedResourceSpec is the desired sync for one GVR, written wholly from

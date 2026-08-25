@@ -71,6 +71,7 @@ import (
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
@@ -342,12 +343,13 @@ type deps struct {
 	resourceClient beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
 	sourceClient   beehive.Client[ClusterSourceSpec, ClusterSourceStatus]
 
-	kubeconfigSvc kubeconfigService
-	kubeconnSvc   kubeconnService
-	pokeSvc       *poke.Service
+	kubeconfigSvc  kubeconfigService
+	kubeconnSvc    kubeconnService
+	kubecatalogSvc kubecatalogService
+	pokeSvc        *poke.Service
 }
 
-func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, pokeSvc *poke.Service) deps {
+func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, kubecatalogSvc kubecatalogService, pokeSvc *poke.Service) deps {
 	return deps{
 		clusterClient:  beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
 		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
@@ -356,6 +358,7 @@ func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc k
 		sourceClient:   beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
 		kubeconfigSvc:  kubeconfigSvc,
 		kubeconnSvc:    kubeconnSvc,
+		kubecatalogSvc: kubecatalogSvc,
 		pokeSvc:        pokeSvc,
 	}
 }
@@ -416,9 +419,11 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 	}
 
 	// The one that names credentials: everything above it asks about a kube-context or a
-	// cluster, and this is what turns one into the credentials a probe dials.
+	// cluster, and this is what turns one into the credentials a probe dials. The
+	// sweeper borrows its connections, so it sits directly on top.
 	kubeconnSvc := kubeconn.New(kubeconfigSvc)
-	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)
+	kubecatalogSvc := kubecatalog.New(kubeconnSvc)
+	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, kubecatalogSvc, pokeSvc)
 
 	controllers, err := registerControllers(bh, d)
 	if err != nil {
@@ -428,8 +433,10 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 
 	parts := []lifecycle.Part{
 		// Ahead of beehive: closing drops sockets, and a connection has to outlive every
-		// pass that could still be dialing on it.
+		// pass that could still be dialing on it. The sweeper sits between, so its
+		// engine stops after the reconciles and before the pool it leases from.
 		{Name: "kubeconn", StartCloser: kubeconnSvc},
+		{Name: "kubecatalog", StartCloser: kubecatalogSvc},
 		{Name: "beehive", StartCloser: beehiveRuntime{bh: bh, store: bhStore}},
 		clusterSourceBootstrap(d),
 	}
@@ -469,14 +476,11 @@ var sourceResync = beehive.WithIndividualPassInterval(clusterSourceResyncInterva
 // the kind, which is what keeps a fleet from dialing in one burst.
 var clusterResync = beehive.WithIndividualPassInterval(clusterProbeInterval)
 
-// catalogResync re-runs discovery for each cache, timed from the end of its own last pass.
-// The third kind whose correctness rests on a poll: what it enumerates is the API server's,
-// so installing a CRD moves nothing in the store that could wake this.
-var catalogResync = beehive.WithIndividualPassInterval(catalogDiscoveryInterval)
-
-// catalogWorkers is the only kind that overrides beehive's single worker, because it is the
-// only pass that still makes a network call on the reconcile's own goroutine. → TODO.md.
-var catalogWorkers = beehive.WithConcurrency(catalogConcurrency)
+// catalogResync re-runs each catalog's fold, timed from the end of its own last pass.
+// The third kind whose correctness rests on a poll: what it folds is the sweeper's
+// in-memory answer, which the store cannot see move. The kubecatalog trigger makes the
+// fold prompt; this is the backstop behind a signal that went missing.
+var catalogResync = beehive.WithIndividualPassInterval(catalogResyncInterval)
 
 // registerControllers builds and registers each kind's controller, which lives in that
 // kind's file, and returns them in registration order. Together here rather than four
@@ -488,17 +492,18 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	// controllers, so nothing pokes a kind before there is something to poke.
 	kubeconfigTrigger := newKubeconfigTrigger(d.kubeconfigSvc)
 	kubeconnTrigger := newKubeconnTrigger(d.kubeconnSvc)
+	kubecatalogTrigger := newKubecatalogTrigger(d.kubecatalogSvc)
 
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
 	cache := &clusterCacheController{deps: d}
-	catalog := &clusterCachedCatalogController{deps: d, discover: discoverServedKinds}
+	catalog := &clusterCachedCatalogController{deps: d}
 	resource := &clusterCachedResourceController{}
 
 	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigTrigger.Wakes()))
 	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync, beehive.WithTriggerByName(kubeconnTrigger.Wakes()))
 	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
-	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass, catalogResync, catalogWorkers)
+	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass, catalogResync, beehive.WithTriggerByName(kubecatalogTrigger.Wakes()))
 	errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
 	if err := errors.Join(errSource, errCluster, errCache, errCatalog, errResource); err != nil {
 		return nil, err
@@ -511,6 +516,7 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 		{Name: "cached-resource controller", StartCloser: resource},
 		{Name: "kubeconfig trigger", StartCloser: lifecycle.StartFunc(kubeconfigTrigger.Start)},
 		{Name: "kubeconn trigger", StartCloser: lifecycle.StartFunc(kubeconnTrigger.Start)},
+		{Name: "kubecatalog trigger", StartCloser: lifecycle.StartFunc(kubecatalogTrigger.Start)},
 	}, nil
 }
 

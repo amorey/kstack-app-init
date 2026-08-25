@@ -43,6 +43,9 @@ internal/clustersvc/
   internal/kubeconn/  the connections a cluster is talked to over, and what probing them
                       found — leases, the five probes, and the connection itself. A leaf
                       under internal/, so the compiler keeps it this package's own
+  internal/kubecatalog/  the discovery sweeper: a second probe engine over per-catalog
+                      subjects, the sweep, and the change signal that re-runs each
+                      catalog's fold. Borrows kubeconn's leases; same leaf rule
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -104,41 +107,51 @@ also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResync
 the poll its correctness rests on: it reads a file the store cannot see, so a lost trigger poke is
 a change nothing else would report. **`Cluster` takes `clusterResync`** for the same reason
 — what its probe reports is a remote server's, so nothing in the store moves when the answer does —
-and **`ClusterCachedCatalog` takes `catalogResync`**, the third: installing a CRD on the cluster
-moves nothing here either. The other kinds are woken by a spec write or a dependency edge.
+and **`ClusterCachedCatalog` takes `catalogResync`**, the third: what its fold reads is the
+sweeper's in-memory answer, which the store cannot see move — the kubecatalog trigger makes the
+fold prompt, and the resync covers a signal that went missing. The other kinds are woken by a spec
+write or a dependency edge.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
 
-**The discovery pass converges a child set, and what it may do depends on how complete its answer
-is.** `clusterCachedCatalogController.Reconcile` walks its two owner edges (cache, then cluster),
-claims the cluster's context **for the length of the pass only** — refcounted alongside
-`clusterController`'s, so it costs no dial — and rewrites one `ClusterCachedResource` per kind the
-server serves. The rules, each carried by a reason in the `Discovered` vocabulary:
+**Discovery is a sweep on its own engine (`internal/kubecatalog`); the catalog pass only folds
+it.** A second `probe.Engine` with one probe, subjects keyed by the catalog record's beehive name
+and armed from its reconcile — `Track` while the record wants discovery, `Forget` on pause and
+teardown. **Arming is policy, not interest**, which is why this is not a refcounted lease pool
+like kubeconn: a reader must never re-arm a sweep the user paused. The sweep borrows the context's
+connection through the service's own `kubeconn` lease (refcounted beside every other holder's),
+commits only on a change, suspends while the context resolves to nothing (the kubeconn bridge
+wakes it the moment the pool reaches the server), and `Subscribe` signals the ids whose news moved
+— `newKubecatalogTrigger` maps that signal straight onto the record, the id being the name. The
+sweep's 10m interval is the promptness bound today; the CRD/APIService watch that will make it
+prompt is specified and unbuilt. → docs/specs/kubecatalog-discovery.md.
+
+`clusterCachedCatalogController.Reconcile` walks its two owner edges (cache, then cluster), arms
+or disarms the sweeper, and rewrites one `ClusterCachedResource` per kind the standing answer
+names. **No pass dials, and none needs extra workers** — the sweep's concurrency is the
+kubecatalog engine's worker bound. The rules, each carried by a reason in the `Discovered`
+vocabulary:
 
 - **`DiscoveryPartial` adds without pruning.** client-go returns partial results *and* an
   `ErrGroupDiscoveryFailed` when an aggregated API server is down. A group that went quiet has not
   stopped being served, and deleting its children would stop live workers over a transient outage.
-- **`DiscoveryFailed` leaves the children alone** and **fails the pass**, taking beehive's backoff
-  ladder. An empty answer is not "serves nothing", and a sweep is too expensive to repeat on a flat
-  cadence against a server that keeps refusing. (`RequeueAfter` is ignored on a failed result, so
-  this is either/or — a reason the two failure paths below read differently.)
+  The probe commits the partial list and fails its run, so its ladder retries sooner than the
+  interval.
+- **`DiscoveryFailed` leaves the children alone** and **settles**: the standing answer keeps
+  converging, the condition carries the sweep's failure message, and retrying the sweep is the
+  probe's own ladder, not beehive's.
 - **`DiscoveryDraining`** is a served kind whose name is still held by an earlier prune's tombstone
-  (`ErrDeletionPending`) — a state to come back to, not a failure.
-- **`Paused` does not look at all**, and only relays the switch onto the children already there. The
+  (`ErrDeletionPending`) — a state to come back to, not a failure. The one path that still
+  requeues (`catalogRetryInterval`), since a tombstone releasing its name is not an event anything
+  reports.
+- **`Paused` disarms the sweep** and only relays the switch onto the children already there. The
   anchor lives as long as the cache, so its subtree survives a pause rather than being rebuilt.
-- **`NoConnection`** requeues on `catalogRetryInterval` (30s) rather than the full cadence, so a
-  cluster that just reconnected does not wait out ten minutes. Flat rather than a ladder because
-  this path costs no request at all — `Lease.Conn` never dials. The outage itself is the cluster
+- **`NoConnection`** settles with no requeue: the sweep is suspended on its claim, the bridge
+  re-runs it on recovery, and its signal re-runs this fold. The outage itself is the cluster
   pass's to report.
 
 A kind is mirrorable when it is not a subresource and carries both `list` and `watch`; the
-`events.k8s.io` spelling is dropped so one event store is not cached twice.
-
-**This is the only kind that overrides beehive's worker count** (`catalogConcurrency` = 8, the same
-bound and the same reason as the connection probes), because it is the only pass that still makes a
-network call on the reconcile's own goroutine — beehive's default is a single worker per controller,
-so without it one slow API server would delay every other cluster's kinds. **That override is a
-mitigation, not the design**: moving the sweep off the reconcile is in `TODO.md`, and until it lands,
-nothing else may put a network call in a pass on the strength of this precedent.
+`events.k8s.io` spelling is dropped so one event store is not cached twice. The filter lives with
+the sweep, in kubecatalog.
 
 **A status write is unconditional.** Beehive compares what a pass writes against the status it handed
 that pass and reaches the store only for a difference, so an observation that moved nothing costs a
