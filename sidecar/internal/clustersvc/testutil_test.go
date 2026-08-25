@@ -149,9 +149,9 @@ func answering(id kubeconn.Identity, err error) *fakeKubeconn {
 // answeredWith is a check that answered v at probedAt.
 func answeredWith[T any](v T) kubeconn.Observation[T] {
 	return kubeconn.Observation[T]{
-		Value: v,
+		Value:    v,
+		LastSeen: probedAt,
 		Attempts: kubeconn.Attempts{
-			LastSeen:    probedAt,
 			LastAttempt: finished(kubeconn.ReasonSucceeded, ""),
 		},
 	}

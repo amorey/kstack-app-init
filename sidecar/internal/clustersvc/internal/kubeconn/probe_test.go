@@ -30,11 +30,52 @@ import (
 // value the way the engine would.
 func connect(t *testing.T, cfg *fakeKubeconfig, v connInfo) (probe.Result, connInfo) {
 	t.Helper()
-	res, next := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), "prod", v, probe.View{})
+	res, next := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), "prod", v, probe.Snapshot{})
 	if next != nil {
 		v = *next
 	}
 	return res, v
+}
+
+// The engine reads a committed value as one that moved and wakes whoever reads it, so a probe
+// that found nothing new must hand back nothing — or the four behind it re-run every cycle and
+// their intervals stop meaning anything.
+func TestTheConnectionProbeCommitsOnlyOnAChange(t *testing.T) {
+	cfg := resolving("prod", "key-1")
+	_, first := connect(t, cfg, connInfo{departed: true})
+	require.False(t, first.departed, "the context resolves, so it is back")
+
+	res, next := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), "prod", first, probe.Snapshot{})
+
+	assert.Equal(t, ReasonResolved, res.Reason())
+	assert.Nil(t, next, "nothing moved, so nothing is committed")
+}
+
+// Each of the four reads the connection's value to reach the server, so a connection that moves
+// re-runs them — even parked, as they are here: nothing dials, so they are suspended behind a
+// connection that never succeeds, and only the data edge can reach them.
+func TestAMovedConnectionReRunsTheProbesBehindIt(t *testing.T) {
+	cfg := resolving("prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+	before := awaitState(t, watched, func(st State) bool {
+		return st.ServerUID.LastAttempt.Done()
+	}).ServerUID.LastAttempt
+
+	// A departure moves the connection's value, where a re-read that found the same thing
+	// would not.
+	cfg.rotate("prod", "")
+	cfg.changed()
+
+	after := awaitState(t, watched, func(st State) bool {
+		return st.ServerUID.LastAttempt.FinishedAt.After(before.FinishedAt)
+	}).ServerUID
+	assert.Equal(t, ReasonRequirementFailed, after.LastAttempt.Reason)
+	assert.True(t, after.LastAttempt.StartedAt.IsZero(), "re-run, but still never dialed")
 }
 
 // --- the connection probe's classifications ---
@@ -92,7 +133,7 @@ func TestConnectionSuspendsAResolvedContext(t *testing.T) {
 // Unreachable while nothing dials, and it says so rather than going quiet — a probe that
 // suspends without a reason is one nobody can explain.
 func TestAnUnimplementedProbeRecordsWhy(t *testing.T) {
-	res, next := unimplemented[ComponentStatus]{"readiness"}.Run(t.Context(), "prod", ComponentStatus{}, probe.View{})
+	res, next := unimplemented[ComponentStatus]{"readiness"}.Run(t.Context(), "prod", ComponentStatus{}, probe.Snapshot{})
 
 	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
 	assert.Equal(t, ReasonInternal, res.Reason())
@@ -116,7 +157,7 @@ func TestDependentsRecordDependencyFailedWhileNothingDials(t *testing.T) {
 		return st.ServerUID.LastAttempt.Done()
 	})
 
-	assert.Equal(t, ReasonDependencyFailed, st.ServerUID.LastAttempt.Reason)
+	assert.Equal(t, ReasonRequirementFailed, st.ServerUID.LastAttempt.Reason)
 	assert.False(t, st.ServerUID.Scheduled(), "suspended for the rest of the outage")
 	assert.True(t, st.ServerUID.LastAttempt.StartedAt.IsZero(), "recorded, never dispatched")
 }
@@ -163,7 +204,7 @@ func TestAResolveFailureKeepsAsking(t *testing.T) {
 
 	// The retry sits out on the ladder; the wake stands in for it, as a worked answer the
 	// schedule would eventually produce.
-	s.engine.Wake("prod", s.probes.connection.ID())
+	s.engine.Wake("prod", s.probes.connection)
 
 	second := awaitState(t, watched, func(st State) bool {
 		return st.Connection.Failures >= 2

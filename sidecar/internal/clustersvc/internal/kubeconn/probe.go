@@ -18,7 +18,7 @@
 // than testing it.
 //
 // **Nothing dials yet.** The connection probe resolves the kubeconfig and reports a context that
-// left it; the four behind it are unimplemented, and the engine records DependencyFailed for
+// left it; the four behind it are unimplemented, and the engine records RequirementFailed for
 // them while the connection has not succeeded — which is their correct behavior once they exist.
 package kubeconn
 
@@ -31,18 +31,28 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
 
-// numProbes sizes what is tracked per context, one entry per field of probeHandles.
+// numProbes sizes what is tracked per context, one entry per name below.
 const numProbes = 5
 
-// probeHandles is what registration returned: the typed reads State is assembled through, and
-// the IDs Wake addresses probes by. A cluster's UID outlives everything else here; its readiness
-// outlives nothing — which is why the intervals below differ.
-type probeHandles struct {
-	connection    probe.Handle[connInfo]
-	readiness     probe.Handle[ComponentStatus]
-	serverUID     probe.Handle[string]
-	serverVersion probe.Handle[VersionInfo]
-	principal     probe.Handle[Principal]
+// The names the probes are registered under, and so the names every read goes through — a
+// probe body reads a sibling with probe.Get[T](snap, nameConnection), needing nothing wired.
+const (
+	nameConnection    = "connection"
+	nameReadiness     = "readiness"
+	nameServerUID     = "serverUID"
+	nameServerVersion = "serverVersion"
+	namePrincipal     = "principal"
+)
+
+// probeIDs is what registration returned: the IDs the edges and Wake address probes by. A
+// cluster's UID outlives everything else here; its readiness outlives nothing — which is why
+// the intervals below differ.
+type probeIDs struct {
+	connection    probe.ID
+	readiness     probe.ID
+	serverUID     probe.ID
+	serverVersion probe.ID
+	principal     probe.ID
 }
 
 // connInfo is the connection probe's observable: the context's standing in the kubeconfig, and
@@ -58,18 +68,22 @@ type connInfo struct {
 	endpoint string
 }
 
-func registerProbes(e *probe.Engine, kubecfg kubeconfigService) probeHandles {
-	var p probeHandles
-	p.connection = probe.Register(e, "connection", &connectionProbe{kubecfg: kubecfg},
+func registerProbes(e *probe.Engine, kubecfg kubeconfigService) probeIDs {
+	var p probeIDs
+	p.connection = probe.Register(e, nameConnection, &connectionProbe{kubecfg: kubecfg},
 		probe.WithInterval(30*time.Second))
-	p.readiness = probe.Register(e, "readiness", unimplemented[ComponentStatus]{"readiness"},
-		probe.WithInterval(30*time.Second), probe.Needs(p.connection.ID()))
-	p.serverUID = probe.Register(e, "serverUID", unimplemented[string]{"serverUID"},
-		probe.WithInterval(10*time.Minute), probe.Needs(p.connection.ID()))
-	p.serverVersion = probe.Register(e, "serverVersion", unimplemented[VersionInfo]{"serverVersion"},
-		probe.WithInterval(5*time.Minute), probe.Needs(p.connection.ID()))
-	p.principal = probe.Register(e, "principal", unimplemented[Principal]{"principal"},
-		probe.WithInterval(5*time.Minute), probe.Needs(p.connection.ID()))
+	// The four behind reachability declare both edges on it: they cannot run without a
+	// connection, and they read the one it committed — so a connection that moves re-runs them
+	// rather than leaving them on a value that changed under them.
+	needsConn, readsConn := probe.WithRequirements(p.connection), probe.WithDependencies(p.connection)
+	p.readiness = probe.Register(e, nameReadiness, unimplemented[ComponentStatus]{"readiness"},
+		probe.WithInterval(30*time.Second), needsConn, readsConn)
+	p.serverUID = probe.Register(e, nameServerUID, unimplemented[string]{"serverUID"},
+		probe.WithInterval(10*time.Minute), needsConn, readsConn)
+	p.serverVersion = probe.Register(e, nameServerVersion, unimplemented[VersionInfo]{"serverVersion"},
+		probe.WithInterval(5*time.Minute), needsConn, readsConn)
+	p.principal = probe.Register(e, namePrincipal, unimplemented[Principal]{"principal"},
+		probe.WithInterval(5*time.Minute), needsConn, readsConn)
 	return p
 }
 
@@ -85,7 +99,7 @@ type connectionProbe struct {
 	kubecfg kubeconfigService
 }
 
-func (p *connectionProbe) Run(_ context.Context, contextName string, prev connInfo, _ probe.View) (probe.Result, *connInfo) {
+func (p *connectionProbe) Run(_ context.Context, contextName string, prev connInfo, _ probe.Snapshot) (probe.Result, *connInfo) {
 	_, _, err := p.kubecfg.RESTConfig(contextName)
 	switch {
 	case errors.Is(err, kubeconfig.ErrNotRead):
@@ -96,7 +110,7 @@ func (p *connectionProbe) Run(_ context.Context, contextName string, prev connIn
 	case errors.Is(err, kubeconfig.ErrContextNotFound):
 		next := prev
 		next.departed = true
-		return probe.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context"), &next
+		return probe.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context"), moved(prev, next)
 
 	case err != nil:
 		// The file still names it, so this is not a departure — it is a file the user
@@ -104,13 +118,23 @@ func (p *connectionProbe) Run(_ context.Context, contextName string, prev connIn
 		// such as a CA path that now opens.
 		next := prev
 		next.departed = false
-		return probe.Fail(ReasonResolveFailed, err), &next
+		return probe.Fail(ReasonResolveFailed, err), moved(prev, next)
 
 	default:
 		next := prev
 		next.departed = false
-		return probe.Suspend(ReasonResolved, "resolved; nothing dials yet"), &next
+		return probe.Suspend(ReasonResolved, "resolved; nothing dials yet"), moved(prev, next)
 	}
+}
+
+// moved is the value to commit, nil when the run found what was already recorded. Committing an
+// unchanged value would wake the four probes that read it on every cycle, which is the interval
+// they are registered with undone.
+func moved(prev, next connInfo) *connInfo {
+	if next == prev {
+		return nil
+	}
+	return &next
 }
 
 // unimplemented stands in for a probe with no request behind it yet. Unreachable while nothing
@@ -121,6 +145,6 @@ type unimplemented[T any] struct {
 	name string
 }
 
-func (u unimplemented[T]) Run(context.Context, string, T, probe.View) (probe.Result, *T) {
+func (u unimplemented[T]) Run(context.Context, string, T, probe.Snapshot) (probe.Result, *T) {
 	return probe.Suspend(ReasonInternal, u.name+" probe is not implemented"), nil
 }

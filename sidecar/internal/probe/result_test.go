@@ -39,7 +39,7 @@ func TestConsecutiveFailuresAreOneStreak(t *testing.T) {
 	assert.False(t, a.OK())
 }
 
-func TestASuccessEndsTheStreakAndStampsLastSeen(t *testing.T) {
+func TestASuccessEndsTheStreak(t *testing.T) {
 	a := Attempts{Failures: 3, FailingSince: runAt}
 
 	a.record(Attempt{FinishedAt: runAt, Verdict: VerdictSucceeded, Reason: ReasonSucceeded})
@@ -47,20 +47,18 @@ func TestASuccessEndsTheStreakAndStampsLastSeen(t *testing.T) {
 	assert.True(t, a.OK())
 	assert.Zero(t, a.Failures)
 	assert.True(t, a.FailingSince.IsZero())
-	assert.Equal(t, runAt, a.LastSeen, "the engine stamps when the value was read")
 }
 
 // A suspension parks a question rather than failing at it, so it ends a streak the way a
 // success does — without claiming one.
 func TestASuspensionEndsTheStreakWithoutASuccess(t *testing.T) {
-	a := Attempts{Failures: 2, FailingSince: runAt, LastSeen: runAt}
+	a := Attempts{Failures: 2, FailingSince: runAt}
 
 	a.record(Attempt{FinishedAt: runAt.Add(time.Minute), Verdict: VerdictSuspended, Reason: "ContextNotFound"})
 
 	assert.False(t, a.OK())
 	assert.Zero(t, a.Failures)
 	assert.True(t, a.FailingSince.IsZero())
-	assert.Equal(t, runAt, a.LastSeen, "no success, so LastSeen stands")
 }
 
 func TestFailMessageDefaultsToTheError(t *testing.T) {

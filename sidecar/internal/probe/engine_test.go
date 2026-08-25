@@ -41,7 +41,7 @@ type steered struct {
 	sawDeadline bool
 }
 
-func (p *steered) Run(ctx context.Context, _ string, _ string, _ View) (Result, *string) {
+func (p *steered) Run(ctx context.Context, _ string, _ string, _ Snapshot) (Result, *string) {
 	p.mu.Lock()
 	p.runs++
 	_, p.sawDeadline = ctx.Deadline()
@@ -58,10 +58,10 @@ func (p *steered) set(res Result) { p.mu.Lock(); defer p.mu.Unlock(); p.res = re
 func (p *steered) count() int     { p.mu.Lock(); defer p.mu.Unlock(); return p.runs }
 
 // probeFunc adapts a bare func for a test that needs a one-off body.
-type probeFunc func(ctx context.Context, subject string, prev string, obs View) (Result, *string)
+type probeFunc func(ctx context.Context, subject string, prev string, snap Snapshot) (Result, *string)
 
-func (f probeFunc) Run(ctx context.Context, subject string, prev string, obs View) (Result, *string) {
-	return f(ctx, subject, prev, obs)
+func (f probeFunc) Run(ctx context.Context, subject string, prev string, snap Snapshot) (Result, *string) {
+	return f(ctx, subject, prev, snap)
 }
 
 // single is an engine with one steered probe, closed on cleanup.
@@ -70,18 +70,55 @@ func single(t *testing.T, res Result, opts ...ProbeOption) (*Engine, *steered, I
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	p := &steered{res: res}
-	return e, p, Register(e, "conn", p, opts...).ID()
+	return e, p, Register(e, "conn", p, opts...)
 }
 
-// pair is single plus a dependent probe needing the first.
+// pair is single plus a probe requiring the first.
 func pair(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aID, bID ID) {
 	t.Helper()
 	e = New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	a, b = &steered{res: aRes}, &steered{res: bRes}
-	aID = Register(e, "conn", a).ID()
-	bID = Register(e, "uid", b, Needs(aID)).ID()
+	aID = Register(e, "conn", a)
+	bID = Register(e, "uid", b, WithRequirements(aID))
 	return e, a, b, aID, bID
+}
+
+// linked is a pair where the second declares both edges on the first — the shape kubeconn's
+// dependents have, and the only one where a value change and a health gate are both in play.
+func linked(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aID, bID ID) {
+	t.Helper()
+	e = New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	a, b = &steered{res: aRes}, &steered{res: bRes}
+	aID = Register(e, "conn", a)
+	bID = Register(e, "uid", b, WithRequirements(aID), WithDependencies(aID))
+	return e, a, b, aID, bID
+}
+
+// commits makes the body hand back v, which the engine reads as "the value moved".
+func (p *steered) commits(v string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.next = &v
+}
+
+// commitsNothing makes the body hand back nil — the contract for an answer that did not move.
+func (p *steered) commitsNothing() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.next = nil
+}
+
+// settled runs both probes of a linked pair to a succeeded rest, so what follows is measured
+// against two probes parked on their intervals rather than against a fresh subject's first pass.
+func settled(t *testing.T, e *Engine) {
+	t.Helper()
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+	runNext(t, e)
+	noRuns(t, e, "the pair should be parked on its interval")
 }
 
 // within bounds a wait for something that must arrive, so a regression fails the test rather
@@ -161,12 +198,12 @@ func startEngine(t *testing.T, e *Engine) {
 
 func TestRegisterReturnsIDsInRegistrationOrder(t *testing.T) {
 	e, _, a := single(t, Skip())
-	b := Register(e, "uid", &steered{}, Needs(a))
+	b := Register(e, "uid", &steered{}, WithRequirements(a))
 
 	assert.Equal(t, ID(0), a)
-	assert.Equal(t, ID(1), b.ID())
-	assert.Equal(t, "uid", b.Name())
-	assert.Equal(t, []ID{a}, e.specs[b.ID()].cfg.needs)
+	assert.Equal(t, ID(1), b)
+	assert.Equal(t, "uid", e.specs[b].name)
+	assert.Equal(t, []ID{a}, e.specs[b].cfg.requirements)
 }
 
 func TestRegisterPanicsOnADuplicateName(t *testing.T) {
@@ -175,12 +212,12 @@ func TestRegisterPanicsOnADuplicateName(t *testing.T) {
 	assert.Panics(t, func() { Register(e, "conn", p) })
 }
 
-// Needs takes IDs Register already returned, so the graph is acyclic by construction; this is
-// the backstop for a hand-forged ID.
-func TestRegisterPanicsOnANeedNotYetRegistered(t *testing.T) {
+// WithRequirements takes IDs Register already returned, so the graph is acyclic by construction;
+// this is the backstop for a hand-forged ID.
+func TestRegisterPanicsOnARequirementNotYetRegistered(t *testing.T) {
 	e := New()
 
-	assert.Panics(t, func() { Register(e, "uid", &steered{}, Needs(ID(0))) })
+	assert.Panics(t, func() { Register(e, "uid", &steered{}, WithRequirements(ID(0))) })
 }
 
 // A registration states only what deviates from the package defaults.
@@ -230,7 +267,7 @@ func TestWorkQueuedBeforeStartIsServedOnceItRuns(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	ran := testutil.NewProbe[struct{}](1)
-	Register(e, "conn", probeFunc(func(context.Context, string, string, View) (Result, *string) {
+	Register(e, "conn", probeFunc(func(context.Context, string, string, Snapshot) (Result, *string) {
 		ran.Fire(struct{}{})
 		return Suspend("Resolved", ""), nil
 	}))
@@ -334,7 +371,7 @@ func TestARunInFlightIsLeftAlone(t *testing.T) {
 	require.Equal(t, key{subject: subj, probe: id}, takeRun(t, e), "the fresh subject's own run")
 	// The worker that took it marks the run before dropping the lock. Safe unlocked here: no
 	// loops are running.
-	e.subjects[subj].attempts[id].begin(runAt)
+	e.subjects[subj].obs[id].begin(runAt)
 
 	e.pass(subj)
 
@@ -430,9 +467,9 @@ func TestADependentIsUntouchedBeforeItsNeedsAnswer(t *testing.T) {
 	assert.False(t, b.Scheduled())
 }
 
-// One run records DependencyFailed — never dialed, so no StartedAt — and the rest of the outage
+// One run records RequirementFailed — never dialed, so no StartedAt — and the rest of the outage
 // costs nothing: one timeout per cycle, not one per probe.
-func TestADependentRecordsDependencyFailedOnceThenSuspends(t *testing.T) {
+func TestADependentRecordsRequirementFailedOnceThenSuspends(t *testing.T) {
 	e, _, bBody, aID, bID := pair(t, Fail("Unreachable", assert.AnError), Succeeded())
 	e.Add(subj)
 	e.settle()
@@ -442,7 +479,7 @@ func TestADependentRecordsDependencyFailedOnceThenSuspends(t *testing.T) {
 
 	b := att(t, e, bID)
 	assert.Equal(t, VerdictSuspended, b.LastAttempt.Verdict)
-	assert.Equal(t, ReasonDependencyFailed, b.LastAttempt.Reason)
+	assert.Equal(t, ReasonRequirementFailed, b.LastAttempt.Reason)
 	assert.True(t, b.LastAttempt.StartedAt.IsZero(), "recorded, never dispatched")
 	assert.Zero(t, b.Failures, "the dependency carries the streak, not the dependent")
 	assert.Zero(t, bBody.count(), "the body must not have run")
@@ -459,7 +496,7 @@ func TestARecoveredDependencyMakesItsDependentsDue(t *testing.T) {
 	e.Add(subj)
 	e.settle()
 	runNext(t, e) // connection fails
-	runNext(t, e) // dependent records DependencyFailed
+	runNext(t, e) // dependent records RequirementFailed
 
 	aBody.set(Succeeded())
 	e.Wake(subj, aID)
@@ -470,7 +507,7 @@ func TestARecoveredDependencyMakesItsDependentsDue(t *testing.T) {
 
 // A dependency that failed between the pass and the worker picking the key up means the run is
 // recorded, not dialed — a worker must not spend a timeout learning what the state already says.
-func TestNeedsIsRecheckedAtDispatch(t *testing.T) {
+func TestRequirementsAreRecheckedAtDispatch(t *testing.T) {
 	e, aBody, bBody, aID, bID := pair(t, Succeeded(), Succeeded())
 	e.Add(subj)
 	e.settle()
@@ -482,7 +519,105 @@ func TestNeedsIsRecheckedAtDispatch(t *testing.T) {
 	require.Equal(t, key{subject: subj, probe: bID}, runNext(t, e))
 
 	assert.Zero(t, bBody.count(), "the body dialed a server the state already said was down")
-	assert.Equal(t, ReasonDependencyFailed, att(t, e, bID).LastAttempt.Reason)
+	assert.Equal(t, ReasonRequirementFailed, att(t, e, bID).LastAttempt.Reason)
+}
+
+// --- the data edge ---
+
+// The gap the data edge closes: a dependent parked on its interval goes on using a value that
+// moved under it, because health did not change and nothing else re-arms it.
+func TestAChangedValueWakesADependent(t *testing.T) {
+	e, a, _, aID, bID := linked(t, Succeeded(), Succeeded())
+	a.commits("v1")
+	settled(t, e)
+
+	a.commits("v2")
+	e.Wake(subj, aID)
+	runNext(t, e)
+
+	assert.Equal(t, key{subject: subj, probe: bID}, takeRun(t, e))
+}
+
+// The engine never compares values — the body says whether its answer moved by committing or
+// not. Without this the wake fires every cycle and the interval stops meaning anything.
+func TestACommitThatCarriedNoValueWakesNobody(t *testing.T) {
+	e, a, _, aID, _ := linked(t, Succeeded(), Succeeded())
+	a.commits("v1")
+	settled(t, e)
+
+	a.commitsNothing()
+	e.Wake(subj, aID)
+	runNext(t, e)
+
+	noRuns(t, e, "an unchanged answer woke a dependent")
+}
+
+// A wake goes through the run queue, so it overrides a suspension exactly as Wake does — which
+// is what re-asks a probe parked "for the life of the connection" when a new one arrives.
+func TestAChangedValueWakesASuspendedDependent(t *testing.T) {
+	e, a, _, aID, bID := linked(t, Succeeded(), Suspend("Unsupported", "no such endpoint"))
+	a.commits("v1")
+	settled(t, e)
+	require.False(t, att(t, e, bID).Scheduled(), "the dependent is suspended")
+
+	a.commits("v2")
+	e.Wake(subj, aID)
+	runNext(t, e)
+
+	assert.Equal(t, key{subject: subj, probe: bID}, takeRun(t, e))
+}
+
+// The data edge does not consult health: a probe declaring only a dependency must not be gated
+// by health it never declared, so a failing run that learned something still wakes it.
+func TestAFailedRunThatChangedItsValueStillWakes(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	a := &steered{res: Succeeded()}
+	watcher := &steered{res: Succeeded()}
+	aID := Register(e, "conn", a)
+	wID := Register(e, "watcher", watcher, WithDependencies(aID))
+	a.commits("v1")
+	settled(t, e)
+
+	a.set(Fail("Unreachable", assert.AnError))
+	a.commits("v2")
+	e.Wake(subj, aID)
+	runNext(t, e)
+
+	assert.Equal(t, key{subject: subj, probe: wID}, takeRun(t, e))
+}
+
+// A wake is not a way past a requirement. The dependent here is already suspended for the
+// outage, so only the data edge can reach it — and what it earns is a record, never a dial: the
+// edge costs a run, never a timeout, and "one timeout per cycle" survives it.
+func TestAWokenRunWithAFailingRequirementRecordsRatherThanDialing(t *testing.T) {
+	e, a, b, aID, bID := linked(t, Succeeded(), Succeeded())
+	a.commits("v1")
+	settled(t, e)
+	a.set(Fail("Unreachable", assert.AnError))
+	a.commitsNothing()
+	e.Wake(subj, aID)
+	runNext(t, e)                                                   // the connection fails
+	require.Equal(t, key{subject: subj, probe: bID}, runNext(t, e)) // the dependent suspends on it
+	require.Equal(t, ReasonRequirementFailed, att(t, e, bID).LastAttempt.Reason)
+	noRuns(t, e, "the dependent is suspended for the rest of the outage")
+	before := b.count()
+
+	a.commits("v2") // still failing, but it learned something
+	e.Wake(subj, aID)
+	runNext(t, e)
+	require.Equal(t, key{subject: subj, probe: bID}, runNext(t, e), "the data edge reached it")
+
+	assert.Equal(t, before, b.count(), "the body dialed a server the state already said was down")
+	assert.Equal(t, ReasonRequirementFailed, att(t, e, bID).LastAttempt.Reason)
+}
+
+// Dependencies take IDs Register already returned, like requirements, so a cascade only ever
+// runs forward and the wiring bug is caught at registration.
+func TestRegisterPanicsOnADependencyNotYetRegistered(t *testing.T) {
+	e := New()
+
+	assert.Panics(t, func() { Register(e, "uid", &steered{}, WithDependencies(ID(0))) })
 }
 
 // --- failure containment ---
@@ -492,9 +627,9 @@ func TestNeedsIsRecheckedAtDispatch(t *testing.T) {
 func TestAPanickingRunRecordsInternalAndFreesItsKey(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	id := Register(e, "conn", probeFunc(func(context.Context, string, string, View) (Result, *string) {
+	id := Register(e, "conn", probeFunc(func(context.Context, string, string, Snapshot) (Result, *string) {
 		panic("boom")
-	})).ID()
+	}))
 	e.Add(subj)
 	e.settle()
 
@@ -542,10 +677,10 @@ func TestARunIsBoundedByItsTimeout(t *testing.T) {
 // The engine reports every pass; the caller decides what is news.
 func TestOnChangeFiresAfterEveryPassInOrderPerSubject(t *testing.T) {
 	e, _, id := single(t, Succeeded())
-	var calls []View
-	e.OnChange(func(name string, obs View) {
+	var calls []Snapshot
+	e.OnChange(func(name string, snap Snapshot) {
 		require.Equal(t, subj, name)
-		calls = append(calls, obs)
+		calls = append(calls, snap)
 	})
 	e.Add(subj)
 	e.settle()
@@ -558,11 +693,138 @@ func TestOnChangeFiresAfterEveryPassInOrderPerSubject(t *testing.T) {
 	assert.True(t, calls[1].Attempts(id).OK(), "the second call carries the committed run")
 }
 
+// LastSeen dates the value, not the run: a failure that follows does not un-read what was read,
+// so the value and its provenance both stand.
+func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	uid := "uid-1"
+	p := &steered{res: Succeeded(), next: &uid}
+	id := Register(e, "conn", p)
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+	read, _ := e.Read(subj)
+	seen := Get[string](read, "conn")
+	require.True(t, seen.Known())
+
+	p.set(Fail("Unreachable", assert.AnError))
+	e.Wake(subj, id)
+	runNext(t, e)
+
+	read, _ = e.Read(subj)
+	after := Get[string](read, "conn")
+	assert.Equal(t, "uid-1", after.Value, "the value outlives the failure")
+	assert.Equal(t, seen.LastSeen, after.LastSeen, "a failure is not a read")
+	assert.False(t, after.OK())
+}
+
+// --- reading an observable ---
+
+// A body reads a sibling by the name it was registered under, with no wiring: the whole
+// observation comes back, value beside the attempts that account for it.
+func TestGetReadsAnObservableByName(t *testing.T) {
+	e, p, _ := single(t, Succeeded())
+	p.commits("v1")
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+
+	read, _ := e.Read(subj)
+	o := Get[string](read, "conn")
+
+	assert.Equal(t, "v1", o.Value)
+	assert.True(t, o.Known())
+	assert.True(t, o.OK(), "the attempts come with it")
+}
+
+// A name nothing was registered under is a wiring bug, loud like the rest of them.
+func TestGetPanicsOnAnUnregisteredName(t *testing.T) {
+	e, _, _ := single(t, Succeeded())
+	e.Add(subj)
+	read, _ := e.Read(subj)
+
+	assert.Panics(t, func() { Get[string](read, "nope") })
+}
+
+// The name and the type are stated separately, so they can disagree. A read that asks for the
+// wrong one is a wiring bug too — never a zero value passed off as an answer.
+func TestGetPanicsOnTheWrongType(t *testing.T) {
+	e, p, _ := single(t, Succeeded())
+	p.commits("v1")
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+	read, _ := e.Read(subj)
+
+	assert.Panics(t, func() { Get[int](read, "conn") })
+}
+
+// Before anything is committed there is no value to type-check against, so the read answers
+// "nothing known yet" rather than guessing — and the attempts still explain why.
+func TestGetOnAProbeThatHasNotCommittedIsNotKnown(t *testing.T) {
+	e, _, _ := single(t, Fail("Unreachable", assert.AnError))
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+
+	read, _ := e.Read(subj)
+	o := Get[string](read, "conn")
+
+	assert.False(t, o.Known())
+	assert.Equal(t, Reason("Unreachable"), o.LastAttempt.Reason)
+}
+
+// A success dates the value it confirmed, so a run that has never had a value to confirm dates
+// nothing — otherwise Known() passes and hands the reader a zero it will dereference.
+func TestASuccessWithNoValueEverCommittedIsNotKnown(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	Register(e, "conn", &steered{res: Succeeded()}) // succeeds, commits nothing
+	e.Add(subj)
+	e.settle()
+
+	runNext(t, e)
+
+	read, _ := e.Read(subj)
+	o := Get[string](read, "conn")
+	require.True(t, o.OK(), "the run did succeed")
+	assert.False(t, o.Known(), "there is no value to read")
+	assert.True(t, o.LastSeen.IsZero())
+}
+
+// Every success dates the value, whether or not it committed a new one: a run that found the
+// answer unchanged still read it.
+func TestASuccessWithNoNewValueStillAdvancesLastSeen(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	uid := "uid-1"
+	p := &steered{res: Succeeded(), next: &uid}
+	id := Register(e, "conn", p)
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+	read, _ := e.Read(subj)
+	first := Get[string](read, "conn")
+
+	p.mu.Lock()
+	p.next = nil
+	p.mu.Unlock()
+	e.Wake(subj, id)
+	runNext(t, e)
+
+	read, _ = e.Read(subj)
+	after := Get[string](read, "conn")
+	assert.Equal(t, "uid-1", after.Value, "nothing new to commit, so the value stands")
+	assert.Equal(t, after.LastAttempt.FinishedAt, after.LastSeen, "the run that confirmed it")
+	assert.True(t, after.LastSeen.After(first.LastSeen))
+}
+
 func TestReadReportsAnUntrackedSubject(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
-	h := Register(e, "conn", &steered{res: Succeeded(), next: &uid})
+	Register(e, "conn", &steered{res: Succeeded(), next: &uid})
 
 	_, ok := e.Read(subj)
 	require.False(t, ok)
@@ -573,7 +835,7 @@ func TestReadReportsAnUntrackedSubject(t *testing.T) {
 
 	v, ok := e.Read(subj)
 	require.True(t, ok)
-	o := h.Get(v)
+	o := Get[string](v, "conn")
 	assert.Equal(t, "uid-1", o.Value, "the run's committed value")
 	assert.True(t, o.OK())
 	assert.True(t, o.Known(), "the engine stamps when the value was read")
@@ -586,19 +848,19 @@ func TestANilValueKeepsThePreviousOne(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
 	p := &steered{res: Succeeded(), next: &uid}
-	h := Register(e, "conn", p)
+	id := Register(e, "conn", p)
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
 
 	p.set(Fail("Unreachable", assert.AnError))
 	p.next = nil
-	e.Wake(subj, h.ID())
+	e.Wake(subj, id)
 	runNext(t, e)
 
 	v, ok := e.Read(subj)
 	require.True(t, ok)
-	o := h.Get(v)
+	o := Get[string](v, "conn")
 	assert.Equal(t, "uid-1", o.Value, "the failure erased the last answer")
 	assert.True(t, o.Known())
 	assert.False(t, o.OK())

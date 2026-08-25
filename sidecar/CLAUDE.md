@@ -289,10 +289,10 @@ reachability read all three through the one handle; `stateOf` projects only the 
 
 **A probe's result is its schedule** — `Succeeded` (due again after the interval), `Fail` (due up
 the backoff ladder), `Suspend` (nothing due until a `Wake`), `Skip` (record nothing; wait for a
-`Wake`). The four behind reachability declare `probe.Needs(p.connection)`: the engine records
-them as `DependencyFailed` rather than dialing while the connection has not succeeded — one
-timeout per cycle, not one per probe — and a recovery makes them due again by derivation, so
-nothing has to notice it.
+`Wake`). The four behind reachability declare `probe.WithRequirements(p.connection.ID())`: the
+engine records them as `RequirementFailed` rather than dialing while the connection has not
+succeeded — one timeout per cycle, not one per probe — and a recovery makes them due again by
+derivation, so nothing has to notice it.
 
 **The connection probe owns the context's lifecycle**, because resolving the kubeconfig is the
 first step of reaching a server. Its classifications: `ReasonContextNotFound` suspends with
@@ -359,7 +359,7 @@ every accessor answers correctly with no sentinel.
 (`Scheduled()` is the accessor). The four probes behind the connection suspend while it is down —
 a server nothing reached cannot answer them — and re-arm when it recovers; a probe that came back
 `Unsupported` stays suspended for the connection's life, since the endpoint is absent rather than
-failing. `DependencyFailed` marks the one cycle where a probe went from running to suspended, and
+failing. `RequirementFailed` marks the one cycle where a probe went from running to suspended, and
 the cycles after it schedule nothing, which is what makes a dead cluster cost one timeout per cycle
 instead of one per probe. **Why a probe is suspended is `LastAttempt.Reason`** — no field beside
 `NextAttempt`, since a probe suspends over what its last attempt found. That is why suspending must
@@ -386,7 +386,7 @@ classifying on the code alone permanently suspends a probe that should keep runn
 returns `*apierrors.StatusError` carrying the API's own reason, while only the raw endpoints
 (`/readyz`, `/version`) leave a status code as the sole evidence; one switch over codes for both
 discards what the typed half knows. `Canceled` says nothing about the cluster and counts toward neither failure field;
-`DependencyFailed` is a probe recorded rather than attempted, which is what keeps a dead cluster
+`RequirementFailed` is a probe recorded rather than attempted, which is what keeps a dead cluster
 costing one timeout per cycle instead of one per probe. Free-form text goes in `Message`, never
 `Reason`.
 

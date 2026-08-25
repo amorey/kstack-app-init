@@ -26,7 +26,7 @@ var runAt = time.Date(2026, 8, 23, 10, 5, 0, 0, time.UTC)
 // A probe the prober records without dispatching has no duration: subtracting a zero
 // StartedAt would report the time since the zero year.
 func TestLatencyIsZeroForARunThatNeverStarted(t *testing.T) {
-	a := Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonDependencyFailed}
+	a := Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonRequirementFailed}
 
 	assert.True(t, a.Done())
 	assert.False(t, a.Running())
@@ -42,10 +42,10 @@ func TestLatencyMeasuresADispatchedRun(t *testing.T) {
 // A suspended probe keeps its last answer and schedules nothing.
 func TestSuspendedProbeKeepsItsAnswer(t *testing.T) {
 	o := Observation[string]{
-		Value: "abc-123",
+		Value:    "abc-123",
+		LastSeen: runAt,
 		Attempts: Attempts{
-			LastSeen:    runAt,
-			LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Verdict: VerdictSuspended, Reason: ReasonDependencyFailed},
+			LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Verdict: VerdictSuspended, Reason: ReasonRequirementFailed},
 		},
 	}
 
@@ -69,11 +69,11 @@ func TestPhaseReadsAResolvedSuspensionAsPending(t *testing.T) {
 // carrying them, so retiring one stays a ==.
 func TestIdentityProjectsTheProbedScalars(t *testing.T) {
 	s := State{
-		ServerUID:     Observation[string]{Value: "uid-1", Attempts: Attempts{LastSeen: runAt}},
-		ServerVersion: Observation[VersionInfo]{Value: VersionInfo{GitVersion: "v1.29.3"}, Attempts: Attempts{LastSeen: runAt}},
+		ServerUID:     Observation[string]{Value: "uid-1", LastSeen: runAt},
+		ServerVersion: Observation[VersionInfo]{Value: VersionInfo{GitVersion: "v1.29.3"}, LastSeen: runAt},
 		Principal: Observation[Principal]{
 			Value:    Principal{Username: "admin@example", Groups: []string{"system:masters"}},
-			Attempts: Attempts{LastSeen: runAt},
+			LastSeen: runAt,
 		},
 	}
 
@@ -89,12 +89,12 @@ func TestIdentityProjectsTheProbedScalars(t *testing.T) {
 func TestIdentityLeavesAnUnreadPartEmpty(t *testing.T) {
 	forbidden := State{
 		ServerUID: Observation[string]{Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonForbidden}}},
-		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, Attempts: Attempts{LastSeen: runAt}},
+		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
 	}
 
 	assert.Equal(t, Identity{Username: "reader@example"}, forbidden.Identity())
 	assert.Equal(t, forbidden.Identity(), State{
 		ServerUID: Observation[string]{Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonUnsupported}}},
-		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, Attempts: Attempts{LastSeen: runAt}},
+		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
 	}.Identity(), "why the UID is missing is the observation's, not the identity's")
 }

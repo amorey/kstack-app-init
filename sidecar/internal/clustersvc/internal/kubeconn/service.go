@@ -109,7 +109,7 @@ type Service struct {
 	// engine runs the five probes of probe.go over the claimed contexts; probes is what
 	// registering them returned.
 	engine *probe.Engine
-	probes probeHandles
+	probes probeIDs
 	// signalHub names the contexts whose news changed; stateHub carries what the probes read.
 	// Both keyed by context, both fed by publish.
 	signalHub *conflate.Hub[string, struct{}]
@@ -232,7 +232,7 @@ func (s *Service) watchKubeconfig(ctx context.Context, cfgs kubeconfig.Subscript
 			if !ok {
 				return
 			}
-			s.engine.WakeAll(s.probes.connection.ID())
+			s.engine.WakeAll(s.probes.connection)
 		}
 	}
 }
@@ -240,7 +240,7 @@ func (s *Service) watchKubeconfig(ctx context.Context, cfgs kubeconfig.Subscript
 // publish is the engine's OnChange: project the pass into State, tell the claim watchers, and
 // signal the fleet when the news moved. The engine serializes it per context, and the order
 // holds — a reader the signal wakes finds the state already published.
-func (s *Service) publish(contextName string, v probe.View) {
+func (s *Service) publish(contextName string, v probe.Snapshot) {
 	st := s.stateOf(v)
 	n := s.newsOf(v, st)
 
@@ -271,9 +271,9 @@ type news struct {
 	ok       [numProbes]bool
 }
 
-func (s *Service) newsOf(v probe.View, st State) news {
+func (s *Service) newsOf(v probe.Snapshot, st State) news {
 	n := news{
-		departed: s.probes.connection.Get(v).Value.departed,
+		departed: probe.Get[connInfo](v, nameConnection).Value.departed,
 		phase:    st.Phase(),
 		identity: st.Identity(),
 	}
@@ -285,14 +285,14 @@ func (s *Service) newsOf(v probe.View, st State) news {
 
 // stateOf projects the engine's observables into State. The connection's observable bundles the
 // context's standing with the endpoint; only the endpoint is the answer State carries.
-func (s *Service) stateOf(v probe.View) State {
-	ci := s.probes.connection.Get(v)
+func (s *Service) stateOf(v probe.Snapshot) State {
+	ci := probe.Get[connInfo](v, nameConnection)
 	return State{
-		Connection:    Observation[string]{Value: ci.Value.endpoint, Attempts: ci.Attempts},
-		Readiness:     s.probes.readiness.Get(v),
-		ServerUID:     s.probes.serverUID.Get(v),
-		ServerVersion: s.probes.serverVersion.Get(v),
-		Principal:     s.probes.principal.Get(v),
+		Connection:    Observation[string]{Value: ci.Value.endpoint, LastSeen: ci.LastSeen, Attempts: ci.Attempts},
+		Readiness:     probe.Get[ComponentStatus](v, nameReadiness),
+		ServerUID:     probe.Get[string](v, nameServerUID),
+		ServerVersion: probe.Get[VersionInfo](v, nameServerVersion),
+		Principal:     probe.Get[Principal](v, namePrincipal),
 	}
 }
 
@@ -338,7 +338,7 @@ func (s *Service) read(contextName string, held *entry) (State, bool) {
 	if !valid || !tracked {
 		return State{}, true
 	}
-	return s.stateOf(v), s.probes.connection.Get(v).Value.departed
+	return s.stateOf(v), probe.Get[connInfo](v, nameConnection).Value.departed
 }
 
 // WatchState takes no baseline: the hub compares against one only through an Accept, and this

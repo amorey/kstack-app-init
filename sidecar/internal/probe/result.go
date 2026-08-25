@@ -25,9 +25,9 @@ type Reason string
 const (
 	// ReasonSucceeded is stamped by Succeeded; a caller never passes it.
 	ReasonSucceeded Reason = "Succeeded"
-	// ReasonDependencyFailed is recorded by the engine when a probe's dependency is failing,
-	// in place of a run. See the dependency lifecycle on Engine.due.
-	ReasonDependencyFailed Reason = "DependencyFailed"
+	// ReasonRequirementFailed is recorded by the engine when a probe's requirement is failing,
+	// in place of a run. See the requirement lifecycle on Engine.due.
+	ReasonRequirementFailed Reason = "RequirementFailed"
 	// ReasonInternal is a bug in a probe body, recorded by the engine when a run panics.
 	ReasonInternal Reason = "Internal"
 )
@@ -124,7 +124,7 @@ func (a Attempt) Running() bool { return !a.StartedAt.IsZero() && a.FinishedAt.I
 func (a Attempt) Done() bool { return !a.FinishedAt.IsZero() }
 
 // Latency is how long the run took: zero until it finishes, and zero for one recorded without
-// being dispatched — a DependencyFailed record has no duration to report.
+// being dispatched — a RequirementFailed record has no duration to report.
 func (a Attempt) Latency() time.Duration {
 	if !a.Done() || a.StartedAt.IsZero() {
 		return 0
@@ -133,12 +133,8 @@ func (a Attempt) Latency() time.Duration {
 }
 
 // Attempts is one probe's bookkeeping for one subject. The engine owns every write; a caller
-// reads it out of a View, embedded in the Observation beside the value it accounts for.
+// reads it out of a Snapshot, embedded in the Observation beside the value it accounts for.
 type Attempts struct {
-	// LastSeen is when the observable's value was read. Advances only on a succeeded run,
-	// stamped by the engine.
-	LastSeen time.Time
-
 	// LastAttempt is the most recent run that finished; NextAttempt is the one that has not,
 	// scheduled or already running. A run moves from one to the other as it completes.
 	LastAttempt Attempt
@@ -166,9 +162,9 @@ func (a *Attempts) begin(at time.Time) { a.NextAttempt.StartedAt = at }
 // schedule sets when the next run is due, zero for a probe with nothing scheduled.
 func (a *Attempts) schedule(at time.Time) { a.NextAttempt = Attempt{ScheduledAt: at} }
 
-// record files a finished run. A success stamps LastSeen; a suspension ends a failure streak
-// the same way a success does, since it parks the question rather than failing at it. It writes
-// nothing about the next run — that is derived from this, not decided here.
+// record files a finished run. A suspension ends a failure streak the same way a success does,
+// since it parks the question rather than failing at it. It writes nothing about the next run —
+// that is derived from this, not decided here.
 //
 // The run moves out of NextAttempt rather than replacing it, so the schedule it was dispatched
 // on survives into the record: StartedAt against ScheduledAt is how long it waited for a
@@ -183,9 +179,6 @@ func (a *Attempts) record(att Attempt) {
 			a.FailingSince = att.FinishedAt
 		}
 		return
-	}
-	if att.Verdict == VerdictSucceeded {
-		a.LastSeen = att.FinishedAt
 	}
 	a.Failures, a.FailingSince = 0, time.Time{}
 }

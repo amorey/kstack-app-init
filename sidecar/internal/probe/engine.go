@@ -17,10 +17,11 @@
 // recorded state. Nothing here knows what a subject is beyond its name.
 //
 // A caller registers its probes, says which subjects are tracked, and reads what the runs found:
-// Register takes a Probe with its cadence and the probes it Needs, and returns the typed Handle
-// its observable is read through; Add and Remove track subjects, and Wake says a recorded answer
-// went stale; Read and OnChange hand back a View — every probe's Observation, value beside
-// attempts, copied under one lock.
+// Register takes a Probe with its cadence and what it requires, and returns the ID the edges
+// address it by; Add and Remove track subjects, and Wake says a recorded answer went stale; Read
+// and OnChange hand back Snapshot — every probe's Observation, value beside attempts, copied
+// under one lock. Get reads one of them by registration name, which is how a Run reads a
+// sibling.
 //
 // A run's own Result is its schedule — Succeeded waits out the interval, Fail climbs the backoff
 // ladder, Suspend and Skip wait for a Wake — so no domain rule lives in the scheduler.
@@ -42,17 +43,17 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/workqueue"
 )
 
-// ID is a probe's registration index, carried by its Handle. Needs and Wake address probes by
-// it, and View.Attempts indexes by it.
+// ID is a probe's registration index, returned by Register. WithRequirements,
+// WithDependencies, and Wake address probes by it, and Snapshot.Attempts indexes by it.
 type ID int
 
 // Probe is one probe's body: request against the subject named, classify, and hand back the
 // result plus the observable's next value — nil to keep the previous one. prev is this probe's
-// own last value (the zero T until a run commits one); obs is every probe's observable, read
-// through the Handles registration returned. The value is committed by the engine under its
-// lock, so a run must do its waiting before it returns.
+// own last value (the zero T until a run commits one); snap is every probe's observable, read
+// with Get by registration name. The value is committed by the engine under its lock, so a run
+// must do its waiting before it returns.
 type Probe[T any] interface {
-	Run(ctx context.Context, subjectName string, prev T, obs View) (Result, *T)
+	Run(ctx context.Context, subjectName string, prev T, snap Snapshot) (Result, *T)
 }
 
 // Backoff paces a failing probe: Base widened by Factor per consecutive failure, capped at Cap.
@@ -78,10 +79,11 @@ func (b Backoff) delay(failures int) time.Duration {
 
 // probeCfg is the per-probe knobs, all optional.
 type probeCfg struct {
-	interval time.Duration
-	backoff  Backoff
-	timeout  time.Duration
-	needs    []ID
+	interval     time.Duration
+	backoff      Backoff
+	timeout      time.Duration
+	requirements []ID
+	dependencies []ID
 }
 
 var defaultCfg = probeCfg{
@@ -94,11 +96,22 @@ var defaultCfg = probeCfg{
 // defaults.
 type ProbeOption func(*probeCfg)
 
-// Needs declares the probes this one can only run over the success of. It takes IDs Register
-// already returned, so a dependency exists before its dependent and the graph is acyclic by
-// construction.
-func Needs(ids ...ID) ProbeOption {
-	return func(c *probeCfg) { c.needs = append(c.needs, ids...) }
+// WithRequirements declares the probes this one can only run over the success of — the health
+// edge, answering "can this run?". While a requirement is failing the probe is recorded as
+// RequirementFailed rather than dispatched, and it is due again when the requirement recovers.
+// It takes IDs Register already returned, so a requirement exists before whatever requires it and
+// the graph is acyclic by construction.
+func WithRequirements(ids ...ID) ProbeOption {
+	return func(c *probeCfg) { c.requirements = append(c.requirements, ids...) }
+}
+
+// WithDependencies declares the probes whose values this one reads — the data edge, answering
+// "is this answer stale?". When one of them commits a changed value, this probe runs again,
+// whatever its schedule said; it takes no other part in scheduling, and it never gates a run.
+// Health is the other edge's job: a probe that also cannot run without what it reads declares
+// WithRequirements too.
+func WithDependencies(ids ...ID) ProbeOption {
+	return func(c *probeCfg) { c.dependencies = append(c.dependencies, ids...) }
 }
 
 // WithInterval is how long after a succeeded run the probe is due again.
@@ -121,7 +134,7 @@ func WithTimeout(d time.Duration) ProbeOption {
 type spec struct {
 	name string
 	cfg  probeCfg
-	run  func(ctx context.Context, subjectName string, prev any, obs View) (Result, any)
+	run  func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any)
 }
 
 // Option configures an Engine.
@@ -139,7 +152,7 @@ type settings struct {
 // Register, then Start; the zero Engine has no queues to work.
 type Engine struct {
 	settings settings
-	onChange func(subjectName string, obs View)
+	onChange func(subjectName string, snap Snapshot)
 
 	// runQ carries the runs that are due, one key per probe per subject, so one probe never
 	// runs twice at once and an ask arriving mid-run is redelivered on Done rather than folded
@@ -150,10 +163,15 @@ type Engine struct {
 
 	// mu guards specs, started, and subjects together with the entries behind them: a value
 	// and its attempts are read against each other, and nothing may see one without the other.
-	mu       sync.Mutex
-	specs    []spec
-	started  bool
-	subjects map[string]*subject
+	mu      sync.Mutex
+	specs   []spec
+	started bool
+	// dependents is the data edge reversed: for each probe, who reads its value and so runs
+	// again when it moves. byName is what Get resolves a read through. Both built by Register,
+	// and neither written once a subject exists.
+	dependents map[ID][]ID
+	byName     map[string]ID
+	subjects   map[string]*subject
 
 	wg sync.WaitGroup
 }
@@ -164,18 +182,30 @@ type key struct {
 	probe   ID
 }
 
+// observable is what the engine holds for one probe of one subject: the value its runs committed
+// beside the bookkeeping for the probe that read it. The untyped half of Observation[T], which is
+// what Get projects it into — one engine carries probes of different value types, so the slice
+// itself cannot be typed.
+type observable struct {
+	// value is the last committed answer, nil until a run commits one, and seen is when a run
+	// last confirmed it. Every success stamps seen, whether or not it committed a new value: a
+	// run that found the answer unchanged still read it.
+	value any
+	seen  time.Time
+	// skipped marks a last run that returned Skip — the one memory a Skip leaves. It records
+	// nothing, so without this the pass would read the probe as never-run and re-dispatch it
+	// at once. Cleared when a run records; a Wake goes through runQ, so it needs no clearing
+	// to force a run.
+	skipped bool
+
+	Attempts
+}
+
 // subject is what the engine holds for one tracked name. Identity matters: a subject removed
 // and re-added is a new *subject, and a run dispatched against the old one commits nothing.
 type subject struct {
-	// values and attempts are the observables, both indexed by ID: a probe's committed value
-	// (nil until a run commits one) beside the engine's bookkeeping for it.
-	values   []any
-	attempts []Attempts
-	// skipped marks probes whose last run returned Skip — the one memory a Skip leaves. It
-	// records nothing, so without this the pass would read the probe as never-run and
-	// re-dispatch it at once. Cleared when a run records; a Wake goes through runQ, so it
-	// needs no clearing to force a run.
-	skipped []bool
+	// obs is one observable per probe, indexed by ID.
+	obs []observable
 	// timer brings the pass back when the soonest scheduled run comes due. One per subject,
 	// and it is a wake, not a cadence: the pass decides again per probe.
 	timer *time.Timer
@@ -188,19 +218,22 @@ func (s *subject) stopTimer() {
 	}
 }
 
-// view is the subject's observables copied for a reader. Called under e.mu, so the values and
-// the schedule beside them agree.
-func (s *subject) view() View {
-	return View{values: slices.Clone(s.values), attempts: slices.Clone(s.attempts)}
+// snapshotOf copies one subject's observables for a reader. Called under e.mu, so the values and
+// the schedule beside them agree. The registration index is shared rather than copied —
+// registration closes before the first subject, so nothing writes it from here on.
+func (e *Engine) snapshotOf(sub *subject) Snapshot {
+	return Snapshot{obs: slices.Clone(sub.obs), byName: e.byName}
 }
 
 // New returns an Engine with no probes and no subjects.
 func New(opts ...Option) *Engine {
 	e := &Engine{
-		settings: settings{workers: 8},
-		runQ:     workqueue.New[key](),
-		passQ:    workqueue.New[string](),
-		subjects: map[string]*subject{},
+		settings:   settings{workers: 8},
+		runQ:       workqueue.New[key](),
+		passQ:      workqueue.New[string](),
+		dependents: map[ID][]ID{},
+		byName:     map[string]ID{},
+		subjects:   map[string]*subject{},
 	}
 	for _, opt := range opts {
 		opt(&e.settings)
@@ -208,10 +241,10 @@ func New(opts ...Option) *Engine {
 	return e
 }
 
-// OnChange sets the callback the engine fires after every pass, with the View that pass
+// OnChange sets the callback the engine fires after every pass, with the Snapshot that pass
 // produced. Called outside the engine's lock but serialized per subject; it must not block.
 // Wiring, not state — set it before Start, like Register.
-func (e *Engine) OnChange(fn func(subjectName string, obs View)) {
+func (e *Engine) OnChange(fn func(subjectName string, snap Snapshot)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -221,31 +254,32 @@ func (e *Engine) OnChange(fn func(subjectName string, obs View)) {
 	e.onChange = fn
 }
 
-// Register adds one probe and returns the Handle its observable is read through — a package
-// function rather than a method so each probe picks its own value type; T is inferred from the
-// instance. It panics on a Needs entry not yet registered, a duplicate name, or a call after
+// Register adds one probe and returns the ID that WithRequirements, WithDependencies, and Wake
+// address it by — a package function rather than a method so each probe picks its own value
+// type; T is inferred from the instance. Its observable is read with Get, by name, so nothing
+// has to carry this ID to read it. It panics on a requirement not yet registered, a duplicate name, or a call after
 // Start or the first Add — a table wired wrong at boot, not a runtime error. A subject's
 // bookkeeping is sized when it is added, which is why the set must be complete before anything
 // is tracked.
-func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) Handle[T] {
+func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) ID {
 	if p == nil {
 		panic("probe: Register needs a probe")
 	}
-	run := func(ctx context.Context, subjectName string, prev any, obs View) (Result, any) {
+	run := func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any) {
 		var pv T
 		if prev != nil {
 			pv = prev.(T)
 		}
-		res, next := p.Run(ctx, subjectName, pv, obs)
+		res, next := p.Run(ctx, subjectName, pv, snap)
 		if next == nil {
 			return res, nil
 		}
 		return res, *next
 	}
-	return Handle[T]{id: e.register(name, run, opts), name: name}
+	return e.register(name, run, opts)
 }
 
-func (e *Engine) register(name string, run func(context.Context, string, any, View) (Result, any), opts []ProbeOption) ID {
+func (e *Engine) register(name string, run func(context.Context, string, any, Snapshot) (Result, any), opts []ProbeOption) ID {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -268,14 +302,26 @@ func (e *Engine) register(name string, run func(context.Context, string, any, Vi
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	for _, need := range cfg.needs {
-		if need < 0 || int(need) >= len(e.specs) {
-			panic(fmt.Sprintf("probe: %q needs probe %d, which is not registered yet", name, need))
+	for _, id := range cfg.requirements {
+		if id < 0 || int(id) >= len(e.specs) {
+			panic(fmt.Sprintf("probe: %q requires probe %d, which is not registered yet", name, id))
+		}
+	}
+	for _, id := range cfg.dependencies {
+		if id < 0 || int(id) >= len(e.specs) {
+			panic(fmt.Sprintf("probe: %q depends on probe %d, which is not registered yet", name, id))
 		}
 	}
 
 	e.specs = append(e.specs, spec{name: name, cfg: cfg, run: run})
-	return ID(len(e.specs) - 1)
+	id := ID(len(e.specs) - 1)
+	e.byName[name] = id
+	// The edge is walked from the probe that committed, so it is indexed that way here rather
+	// than searched for at wake time. Both ends exist already, which is what makes it safe.
+	for _, dep := range cfg.dependencies {
+		e.dependents[dep] = append(e.dependents[dep], id)
+	}
+	return id
 }
 
 // Add tracks subject. Every probe derives from zero, so the pass this queues dispatches
@@ -286,11 +332,7 @@ func (e *Engine) Add(subjectName string) {
 		e.mu.Unlock()
 		return
 	}
-	e.subjects[subjectName] = &subject{
-		values:   make([]any, len(e.specs)),
-		attempts: make([]Attempts, len(e.specs)),
-		skipped:  make([]bool, len(e.specs)),
-	}
+	e.subjects[subjectName] = &subject{obs: make([]observable, len(e.specs))}
 	e.mu.Unlock()
 
 	e.passQ.Add(subjectName)
@@ -346,15 +388,15 @@ func (e *Engine) WakeAll(ids ...ID) {
 
 // Read is subject's observables, copied under one lock so the values and the schedule beside
 // them agree. ok is false for a subject not tracked.
-func (e *Engine) Read(subjectName string) (obs View, ok bool) {
+func (e *Engine) Read(subjectName string) (snap Snapshot, ok bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	sub := e.subjects[subjectName]
 	if sub == nil {
-		return View{}, false
+		return Snapshot{}, false
 	}
-	return sub.view(), true
+	return e.snapshotOf(sub), true
 }
 
 // Start runs the pass worker and the run workers; the stop func cancels them and waits. ctx
@@ -442,7 +484,7 @@ func (e *Engine) pass(subjectName string) {
 	now := time.Now()
 	var soonest time.Time
 	for id := range e.specs {
-		a := &sub.attempts[id]
+		a := &sub.obs[id].Attempts
 		if a.InFlight() {
 			continue
 		}
@@ -466,36 +508,36 @@ func (e *Engine) pass(subjectName string) {
 		sub.timer = time.AfterFunc(soonest.Sub(now), func() { e.passQ.Add(subjectName) })
 	}
 
-	var obs View
+	var snap Snapshot
 	if e.onChange != nil {
-		obs = sub.view()
+		snap = e.snapshotOf(sub)
 	}
 	e.mu.Unlock()
 
 	if e.onChange != nil {
-		e.onChange(subjectName, obs)
+		e.onChange(subjectName, snap)
 	}
 }
 
-// needsState is where a probe's dependencies collectively are; a failing one outranks an
+// requirementsState is where a probe's dependencies collectively are; a failing one outranks an
 // unanswered one, since it is a definitive reason not to run.
-type needsState int
+type requirementsState int
 
 const (
-	needsOK needsState = iota
-	needsUnanswered
-	needsFailing
+	requirementsOK requirementsState = iota
+	requirementsUnanswered
+	requirementsFailing
 )
 
-func (e *Engine) needsOf(sub *subject, needs []ID) needsState {
-	state := needsOK
-	for _, id := range needs {
-		dep := sub.attempts[id]
+func (e *Engine) requirementsOf(sub *subject, requirements []ID) requirementsState {
+	state := requirementsOK
+	for _, id := range requirements {
+		dep := sub.obs[id]
 		switch {
 		case dep.LastAttempt.Done() && !dep.OK():
-			return needsFailing
+			return requirementsFailing
 		case !dep.LastAttempt.Done():
-			state = needsUnanswered
+			state = requirementsUnanswered
 		}
 	}
 	return state
@@ -505,23 +547,23 @@ func (e *Engine) needsOf(sub *subject, needs []ID) needsState {
 // policy, in the order the cases have to be read. The caller has already set aside a run in
 // flight.
 func (e *Engine) due(sub *subject, id ID, now time.Time) time.Time {
-	if sub.skipped[id] {
+	a := sub.obs[id]
+	if a.skipped {
 		// The last run declined to record; only a Wake brings it back.
 		return time.Time{}
 	}
 
-	a := sub.attempts[id]
 	cfg := e.specs[id].cfg
 
-	switch e.needsOf(sub, cfg.needs) {
-	case needsUnanswered:
+	switch e.requirementsOf(sub, cfg.requirements) {
+	case requirementsUnanswered:
 		// Nothing to say about a server nobody has tried, so the probe stays untouched
 		// rather than recording a dependency that has not failed.
 		return time.Time{}
-	case needsFailing:
-		// One run records DependencyFailed and the rest of the outage costs nothing, which
+	case requirementsFailing:
+		// One run records RequirementFailed and the rest of the outage costs nothing, which
 		// is what keeps a dead cluster at one timeout per cycle instead of one per probe.
-		if a.LastAttempt.Reason == ReasonDependencyFailed {
+		if a.LastAttempt.Reason == ReasonRequirementFailed {
 			return time.Time{}
 		}
 		return now
@@ -533,7 +575,7 @@ func (e *Engine) due(sub *subject, id ID, now time.Time) time.Time {
 	case VerdictFailed:
 		return a.LastAttempt.FinishedAt.Add(cfg.backoff.delay(a.Failures))
 	case VerdictSuspended:
-		if a.LastAttempt.Reason == ReasonDependencyFailed {
+		if a.LastAttempt.Reason == ReasonRequirementFailed {
 			// Its dependencies came back. This is the whole re-arm — nothing has to notice
 			// the recovery and go looking for what suspended on it.
 			return now
@@ -548,8 +590,8 @@ func (e *Engine) due(sub *subject, id ID, now time.Time) time.Time {
 // runProbe runs one due probe and commits what it found. The subject is captured first and
 // re-checked at the commit — what can race a run is a Remove, not another run of the same key.
 //
-// Needs is re-checked at dispatch: a dependency that failed since the pass means the run is
-// recorded as DependencyFailed, never dialed — a worker must not spend a timeout learning what
+// Requirements are re-checked at dispatch: one that failed since the pass means the run is
+// recorded as RequirementFailed, never dialed — a worker must not spend a timeout learning what
 // the state already says. One still unanswered means a Wake outran it; the run ends as a no-op
 // and the pass owns the question again.
 func (e *Engine) runProbe(ctx context.Context, k key) {
@@ -560,26 +602,26 @@ func (e *Engine) runProbe(ctx context.Context, k key) {
 		return
 	}
 	sp := e.specs[k.probe]
-	prev := sub.values[k.probe]
-	obs := sub.view()
-	needs := e.needsOf(sub, sp.cfg.needs)
+	prev := sub.obs[k.probe].value
+	snap := e.snapshotOf(sub)
+	requirements := e.requirementsOf(sub, sp.cfg.requirements)
 	// Marked before the lock is dropped, so InFlight is true for as long as the request is
 	// out and a pass landing meanwhile leaves the run alone.
 	startedAt := time.Now()
-	sub.attempts[k.probe].begin(startedAt)
+	sub.obs[k.probe].begin(startedAt)
 	e.mu.Unlock()
 
 	var res Result
 	var val any
 	ran := false
-	switch needs {
-	case needsOK:
-		res, val = e.dispatch(ctx, sp, k.subject, prev, obs)
+	switch requirements {
+	case requirementsOK:
+		res, val = e.dispatch(ctx, sp, k.subject, prev, snap)
 		ran = true
-	case needsFailing:
-		res = Suspend(ReasonDependencyFailed, "a dependency is failing")
+	case requirementsFailing:
+		res = Suspend(ReasonRequirementFailed, "a requirement is failing")
 		startedAt = time.Time{} // recorded, never dispatched
-	default: // needsUnanswered
+	default: // requirementsUnanswered
 		res = Skip()
 	}
 	e.commit(k, sub, startedAt, res, val, ran)
@@ -590,7 +632,7 @@ func (e *Engine) runProbe(ctx context.Context, k key) {
 // otherwise the probe reads as in flight forever and its key stays held in the queue. Only here
 // does the engine log: the Internal record a caller sees carries no stack, and nothing else in
 // the system can report a bug in a body.
-func (e *Engine) dispatch(ctx context.Context, sp spec, subjectName string, prev any, obs View) (res Result, val any) {
+func (e *Engine) dispatch(ctx context.Context, sp spec, subjectName string, prev any, snap Snapshot) (res Result, val any) {
 	if sp.cfg.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, sp.cfg.timeout)
@@ -604,7 +646,7 @@ func (e *Engine) dispatch(ctx context.Context, sp spec, subjectName string, prev
 		}
 	}()
 
-	res, val = sp.run(ctx, subjectName, prev, obs)
+	res, val = sp.run(ctx, subjectName, prev, snap)
 	if res.kind == resultInvalid {
 		slog.Error("probe: run returned the zero Result", "probe", sp.name, "subject", subjectName)
 		return Fail(ReasonInternal, fmt.Errorf("probe %s returned the zero Result", sp.name)), nil
@@ -624,7 +666,7 @@ func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, v
 		return
 	}
 
-	a := &held.attempts[k.probe]
+	a := &held.obs[k.probe]
 	now := time.Now()
 	switch res.kind {
 	case resultRecord:
@@ -636,13 +678,26 @@ func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, v
 			Message:    res.message,
 			Err:        res.err,
 		})
-		held.skipped[k.probe] = false
+		a.skipped = false
+		if res.verdict == VerdictSucceeded && (val != nil || a.value != nil) {
+			// seen dates the value, so a success with nothing to date leaves it alone: a
+			// reader's Known guard would otherwise pass and hand it the zero value.
+			a.seen = now
+		}
 		if val != nil {
-			held.values[k.probe] = val
+			a.value = val
+			// A committed value is one that moved — the body says so by handing one back at
+			// all — and whoever reads it is owed a run against the new one. Queued in the same
+			// critical section as the write, so no reader sees the value without the runs it
+			// earned. Health is not consulted: a dependency is a data edge, and a probe that
+			// also cannot run without this declares WithRequirements for that.
+			for _, dep := range e.dependents[k.probe] {
+				e.runQ.Add(key{subject: k.subject, probe: dep})
+			}
 		}
 	case resultSkip:
 		if ran {
-			held.skipped[k.probe] = true
+			a.skipped = true
 		}
 	}
 	// Due now rather than suspended: the pass this asks for is a queue hop away, and a zero
