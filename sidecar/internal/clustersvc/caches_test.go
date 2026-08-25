@@ -16,7 +16,6 @@ package clustersvc
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -226,155 +225,11 @@ func TestCachesWatchListReportsACreate(t *testing.T) {
 	assert.Equal(t, ObjectRef{ID: ObjectID(cluster.ID), Kind: "Cluster"}, f.Cache.Owner)
 }
 
-// pumpCacheFrames runs the watch pump over a snapshot and a hand-driven change stream,
-// and collects what it produced. A departure spans two log entries whose grouping is
-// beehive's to decide, so driving the pump directly is the only way to pin both shapes.
-func pumpCacheFrames(t *testing.T, snapshot []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus], changes ...beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]) []ClusterCacheWatchFrame {
-	t.Helper()
-	src := make(chan beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus], len(changes))
-	for _, c := range changes {
-		src <- c
-	}
-	close(src)
-
-	out := make(chan ClusterCacheWatchFrame, len(snapshot)+len(changes)+1)
-	require.NoError(t, pumpCacheWatch(context.Background(), out, snapshot, src, func() error { return nil }))
-	close(out)
-
-	var frames []ClusterCacheWatchFrame
-	for f := range out {
-		frames = append(frames, f)
-	}
-	return frames
-}
-
-// Only a removal arrives without an object, so anything else that does is dropped
-// rather than folded: a frame with no entity is one a consumer discards anyway, and
-// building it would dereference the object that is missing.
-func TestCachesWatchListDropsAChangeWithNoObject(t *testing.T) {
-	frames := pumpCacheFrames(t, nil,
-		beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]{Type: beehive.Modified, ID: 7, Object: nil},
-	)
-
-	require.Len(t, frames, 1)
-	assert.Equal(t, DeltaFrameBookmark, frames[0].Type)
-}
-
-// The pump ends by reporting why its source did, which is the only thing telling a dead
-// watch from a drained one — Frames closes either way.
-func TestCachesWatchListReportsWhyTheSourceDied(t *testing.T) {
-	boom := errors.New("watch ended: resource version too old")
-	changes := make(chan beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus])
-	close(changes)
-
-	err := pumpCacheWatch(context.Background(), make(chan ClusterCacheWatchFrame, 1), nil, changes,
-		func() error { return boom })
-
-	assert.Equal(t, boom, err)
-}
-
-// ownedCacheObject returns a cache read the way the watches read one — with its owner
-// edge loaded, which every frame carries as its join key. beehive keeps the loaded set
-// unexported, so a frame-worthy object can only come from a store read.
-func ownedCacheObject(t *testing.T) *beehive.Object[ClusterCacheSpec, ClusterCacheStatus] {
-	t.Helper()
-	d := newTestDeps(t)
-	cluster := createCluster(t, d.clusterClient, "prod")
-	createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-
-	objs, err := d.cacheClient.List(context.Background(), beehive.LoadOwner())
-	require.NoError(t, err)
-	require.Len(t, objs, 1)
-	return objs[0]
-}
-
-// parkedCachePump is the pump running against a channel nothing drains, so it parks on
-// its next send exactly as it would against a client that stopped reading.
-type parkedCachePump struct {
-	out     chan ClusterCacheWatchFrame
-	changes chan beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]
-	done    chan error
-	cancel  context.CancelFunc
-}
-
-func startCachePump(t *testing.T, snapshot []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) *parkedCachePump {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	p := &parkedCachePump{
-		out:     make(chan ClusterCacheWatchFrame),
-		changes: make(chan beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]),
-		done:    make(chan error, 1),
-		cancel:  cancel,
-	}
-	go func() {
-		p.done <- pumpCacheWatch(ctx, p.out, snapshot, p.changes, func() error { return nil })
-	}()
-	return p
-}
-
-// takeCacheBookmark drains the snapshot's closing frame, which puts the pump in its
-// change loop. The unbuffered handoff is the synchronization: the send below cannot
-// complete until the pump has taken the change and gone on to send its frame.
-func takeCacheBookmark(t *testing.T, p *parkedCachePump) {
-	t.Helper()
-	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, p.out, "the bookmark").Type)
-}
-
-// Every send point owes the same thing: a consumer that stopped draining must end the
-// pump rather than park it. A missed one leaks the goroutine and the store watch behind
-// it once per client disconnect, and says nothing about it — Frames never closes, so
-// there is no Err for anyone to read.
-func TestPumpCacheWatchEndsWhereverTheConsumerStopped(t *testing.T) {
-	obj := ownedCacheObject(t)
-
-	tests := map[string]struct {
-		snapshot []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus]
-		// reach parks the pump on the send under test, taking every frame before it.
-		reach func(t *testing.T, p *parkedCachePump)
-	}{
-		"a snapshot frame": {
-			snapshot: []*beehive.Object[ClusterCacheSpec, ClusterCacheStatus]{obj},
-			reach:    func(*testing.T, *parkedCachePump) {},
-		},
-		"the bookmark": {
-			reach: func(*testing.T, *parkedCachePump) {},
-		},
-		"an ordinary change": {
-			reach: func(t *testing.T, p *parkedCachePump) {
-				takeCacheBookmark(t, p)
-				p.changes <- beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]{
-					Type: beehive.Modified, ID: obj.ID, Object: obj,
-				}
-			},
-		},
-		"a departure": {
-			reach: func(t *testing.T, p *parkedCachePump) {
-				takeCacheBookmark(t, p)
-				p.changes <- beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]{Type: beehive.Deleted, ID: 1}
-			},
-		},
-	}
-
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			p := startCachePump(t, tt.snapshot)
-			tt.reach(t, p)
-
-			p.cancel()
-
-			assert.NoError(t, testutil.Recv(t, p.done, "the pump to end"),
-				"cancellation is a teardown, not a failure")
-		})
-	}
-}
-
 // A removal whose final row beehive could not decode carries no object, and nothing
 // later in the log mentions the id. The frame still has to name it: a consumer drops a
 // change with no entity, so the record would sit in its map until the subscription ends.
 func TestCachesWatchListReportsAnUndecodableDeparture(t *testing.T) {
-	frames := pumpCacheFrames(t, nil,
+	frames := pumpFrames(t, cacheWatch, nil,
 		beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]{Type: beehive.Deleted, ID: 7, Object: nil},
 	)
 
@@ -640,4 +495,63 @@ func TestCacheReconcileRelaysThePauseFromItsCluster(t *testing.T) {
 	objs := catalogs(t, d.catalogClient)
 	require.Len(t, objs, 1)
 	assert.False(t, objs[0].Spec.Enabled)
+}
+
+// Scoped to one cluster: another cluster's cache must not reach this stream, or a
+// per-cluster view would fold a record it never asked for.
+func TestCachesWatchByClusterIsScopedToItsCluster(t *testing.T) {
+	d := newRunningDeps(t)
+	mine := createCluster(t, d.clusterClient, "prod")
+	theirs := createCluster(t, d.clusterClient, "staging")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stream, err := serviceOver(t, d).Caches().WatchByCluster(ctx, ClusterID(mine.ID))
+	require.NoError(t, err)
+	awaitCacheBookmark(t, stream)
+
+	createCache(t, d.cacheClient, ClusterID(theirs.ID), "uid-2")
+	createCache(t, d.cacheClient, ClusterID(mine.ID), "uid-1")
+
+	f := testutil.Recv(t, stream.Frames, "this cluster's cache")
+	require.NotNil(t, f.Cache)
+	assert.Equal(t, "uid-1", f.Cache.Spec.ServerUID)
+	assert.Equal(t, ObjectRef{ID: ObjectID(mine.ID), Kind: "Cluster"}, f.Cache.Owner)
+}
+
+// A UID migration leaves the superseded cache in place, so the scoped watch carries
+// both — which is what makes "the set, never the cache" true on this stream too.
+func TestCachesWatchByClusterCarriesEveryIdentity(t *testing.T) {
+	d := newRunningDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-2")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stream, err := serviceOver(t, d).Caches().WatchByCluster(ctx, ClusterID(cluster.ID))
+	require.NoError(t, err)
+
+	var uids []string
+	for range 2 {
+		f := testutil.Recv(t, stream.Frames, "a snapshot frame")
+		require.Equal(t, DeltaFrameAdded, f.Type)
+		require.NotNil(t, f.Cache)
+		uids = append(uids, f.Cache.Spec.ServerUID)
+	}
+	assert.ElementsMatch(t, []string{"uid-1", "uid-2"}, uids)
+	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+}
+
+// A cluster owning none bookmarks an empty collection: beehive does not existence-check
+// the owner, so an unprobed cluster and an unknown id behave alike, and either may still
+// gain a cache this stream reports.
+func TestCachesWatchByClusterBookmarksAClusterWithNone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stream, err := serviceOver(t, newRunningDeps(t)).Caches().WatchByCluster(ctx, 404)
+	require.NoError(t, err)
+
+	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
 }

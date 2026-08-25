@@ -62,9 +62,9 @@ Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` 
 (`status.source.kubeconfig`), and that same pass creating the `ClusterCache` for the identity a
 probe recorded, and `clusterCacheController.Reconcile` creating the `ClusterCachedCatalog` beneath
 each cache, carrying the pause switch (`cacheSyncEnabled`: the cluster's toggles, and whether the
-cache is still the active identity). Served: the whole `Clusters()` family,
-plus `Caches()`' point reads (`Get`/`List`/`ListByCluster`) and its unscoped watches
-(`Watch`/`WatchList`). That is enough for the kube-context picker, which reads
+cache is still the active identity). Served: the whole `Clusters()` family, the whole
+`CachedCatalogs()` family, and everything on `Caches()` but its two gauges and `Clear`.
+That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **A cache now exists at runtime**: the serverUID probe writes `status.server.uid`, which is what
 `ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
 one — and a `ClusterCachedCatalog` beneath it. Everything below the catalog is still empty: nothing
@@ -86,6 +86,14 @@ consecutive reviews found a different place that had forgotten it.
 **Every send goes through `sendFrame`** (`stream.go`), which is how a pump keeps the promise
 `NewStream` states: a bare channel send blocks forever once the consumer stops draining, leaking the
 goroutine and the beehive watch behind it.
+
+**One pump serves every record watch** — `deltaWatch[Spec, Status, Frame]` (`stream.go`), whose
+`streamOne`/`streamList` cover the single-object and list shapes. A kind supplies only what is its own:
+a `frame` projection, a `departed` builder, and its `bookmark` value (`clusterWatch`, `cacheWatch`,
+`catalogWatch`). Add a kind by writing those three, never a fourth pump — the bookmark discipline is
+a protocol rule, and a per-kind copy is a place for it to be got wrong. The pump's own rules are
+tested once, in `stream_test.go` over a stand-in kind; a kind's tests pin its projection and its
+departure.
 
 **A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
 lifecycle. No kind has any yet — all five embed `lifecycle.None` — but the leaves a controller grows
@@ -682,7 +690,7 @@ consumer (a callee follows its caller — `LiveCondition` needs `TruncateMessage
 
 ### GraphQL surface (cluster)
 
-The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the `Cluster` surface and the `ClusterCache` reads answer** — `cluster`, `clusters`, `clustersWatch`, `clusterScheduleWatch`, the enable/sync/delete/`clusterConnectionRetry` mutations, and `clusterCache`/`clusterCaches`/`clusterCachesWatch` (with `Cluster.caches` alongside them). `Cluster.events` does not: it reaches `ListEvents`, which still panics, so a query selecting it panics with the rest. Neither do the cache gauges, which are unbuilt. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
+The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the `Cluster` surface and the `ClusterCache` reads answer** — `cluster`, `clusters`, `clustersWatch`, `clusterScheduleWatch`, the enable/sync/delete/`clusterConnectionRetry` mutations, `clusterCache`/`clusterCaches`/`clusterCachesWatch` (with `Cluster.caches` alongside them), and the `ClusterCachedCatalog` reads. `Cluster.events` does not: it reaches `ListEvents`, which still panics, so a query selecting it panics with the rest. Neither do the cache gauges, which are unbuilt. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
 
 - Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedCatalogsWatch` (unscoped, one per cache), `clusterCachedResourcesWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).

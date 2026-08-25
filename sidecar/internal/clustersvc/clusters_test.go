@@ -974,133 +974,6 @@ func TestClustersWatchListReportsADeletionMark(t *testing.T) {
 	assert.NotNil(t, f.Cluster.DeletionRequestedAt)
 }
 
-// pumpFrames runs the watch pump over a snapshot and a hand-driven change stream, and
-// collects what it produced. A departure spans two log entries whose grouping is beehive's to decide, so
-// driving the pump directly is the only way to pin both shapes.
-func pumpFrames(t *testing.T, snapshot []*beehive.Object[ClusterSpec, ClusterStatus], changes ...beehive.ObjectChange[ClusterSpec, ClusterStatus]) []ClusterWatchFrame {
-	t.Helper()
-	src := make(chan beehive.ObjectChange[ClusterSpec, ClusterStatus], len(changes))
-	for _, c := range changes {
-		src <- c
-	}
-	close(src)
-
-	out := make(chan ClusterWatchFrame, len(snapshot)+len(changes)+1)
-	require.NoError(t, pumpClusterWatch(context.Background(), out, snapshot, src, func() error { return nil }))
-	close(out)
-
-	var frames []ClusterWatchFrame
-	for f := range out {
-		frames = append(frames, f)
-	}
-	return frames
-}
-
-// Only a removal arrives without an object, so anything else that does is dropped
-// rather than folded: a frame with no entity is one a consumer discards anyway, and
-// building it would dereference the object that is missing.
-func TestClustersWatchListDropsAChangeWithNoObject(t *testing.T) {
-	frames := pumpFrames(t, nil,
-		beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Modified, ID: 7, Object: nil},
-	)
-
-	require.Len(t, frames, 1)
-	assert.Equal(t, DeltaFrameBookmark, frames[0].Type)
-}
-
-// The pump ends by reporting why its source did, which is the only thing telling a dead
-// watch from a drained one — Frames closes either way.
-func TestClustersWatchListReportsWhyTheSourceDied(t *testing.T) {
-	boom := errors.New("watch ended: resource version too old")
-	changes := make(chan beehive.ObjectChange[ClusterSpec, ClusterStatus])
-	close(changes)
-
-	err := pumpClusterWatch(context.Background(), make(chan ClusterWatchFrame, 1), nil, changes,
-		func() error { return boom })
-
-	assert.Equal(t, boom, err)
-}
-
-// parkedClusterPump is the pump running against a channel nothing drains, so it parks
-// on its next send exactly as it would against a client that stopped reading.
-type parkedClusterPump struct {
-	out     chan ClusterWatchFrame
-	changes chan beehive.ObjectChange[ClusterSpec, ClusterStatus]
-	done    chan error
-	cancel  context.CancelFunc
-}
-
-func startClusterPump(t *testing.T, snapshot []*beehive.Object[ClusterSpec, ClusterStatus]) *parkedClusterPump {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	p := &parkedClusterPump{
-		out:     make(chan ClusterWatchFrame),
-		changes: make(chan beehive.ObjectChange[ClusterSpec, ClusterStatus]),
-		done:    make(chan error, 1),
-		cancel:  cancel,
-	}
-	go func() {
-		p.done <- pumpClusterWatch(ctx, p.out, snapshot, p.changes, func() error { return nil })
-	}()
-	return p
-}
-
-// takeBookmark drains the snapshot's closing frame, which puts the pump in its change
-// loop. The unbuffered handoff is the synchronization: the send below cannot complete
-// until the pump has taken the change and gone on to send its frame.
-func takeBookmark(t *testing.T, p *parkedClusterPump) {
-	t.Helper()
-	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, p.out, "the bookmark").Type)
-}
-
-// Every send point owes the same thing: a consumer that stopped draining must end the
-// pump rather than park it. A missed one leaks the goroutine and the store watch behind
-// it once per client disconnect, and says nothing about it — Frames never closes, so
-// there is no Err for anyone to read.
-func TestPumpClusterWatchEndsWhereverTheConsumerStopped(t *testing.T) {
-	tests := map[string]struct {
-		snapshot []*beehive.Object[ClusterSpec, ClusterStatus]
-		// reach parks the pump on the send under test, taking every frame before it.
-		reach func(t *testing.T, p *parkedClusterPump)
-	}{
-		"a snapshot frame": {
-			snapshot: []*beehive.Object[ClusterSpec, ClusterStatus]{{ID: 1}},
-			reach:    func(*testing.T, *parkedClusterPump) {},
-		},
-		"the bookmark": {
-			reach: func(*testing.T, *parkedClusterPump) {},
-		},
-		"an ordinary change": {
-			reach: func(t *testing.T, p *parkedClusterPump) {
-				takeBookmark(t, p)
-				p.changes <- beehive.ObjectChange[ClusterSpec, ClusterStatus]{
-					Type: beehive.Modified, ID: 1, Object: &beehive.Object[ClusterSpec, ClusterStatus]{ID: 1},
-				}
-			},
-		},
-		"a departure": {
-			reach: func(t *testing.T, p *parkedClusterPump) {
-				takeBookmark(t, p)
-				p.changes <- beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Deleted, ID: 1}
-			},
-		},
-	}
-
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			p := startClusterPump(t, tt.snapshot)
-			tt.reach(t, p)
-
-			p.cancel()
-
-			assert.NoError(t, testutil.Recv(t, p.done, "the pump to end"),
-				"cancellation is a teardown, not a failure")
-		})
-	}
-}
-
 // deletingCluster is a tombstoned row: what both halves of a departure carry.
 func deletingCluster(id beehive.ObjectID) *beehive.Object[ClusterSpec, ClusterStatus] {
 	now := time.Now()
@@ -1111,7 +984,7 @@ func deletingCluster(id beehive.ObjectID) *beehive.Object[ClusterSpec, ClusterSt
 // later in the log mentions the id. The frame still has to name it: a consumer drops a
 // change with no entity, so the record would sit in its map until the subscription ends.
 func TestClustersWatchListReportsAnUndecodableDeparture(t *testing.T) {
-	frames := pumpFrames(t, nil,
+	frames := pumpFrames(t, clusterWatch, nil,
 		beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Deleted, ID: 7, Object: nil},
 	)
 
@@ -1126,7 +999,7 @@ func TestClustersWatchListReportsAnUndecodableDeparture(t *testing.T) {
 func TestClustersWatchListReportsTheMarkAsModified(t *testing.T) {
 	obj := deletingCluster(7)
 
-	frames := pumpFrames(t, nil,
+	frames := pumpFrames(t, clusterWatch, nil,
 		beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Modified, ID: 7, Object: obj},
 		beehive.ObjectChange[ClusterSpec, ClusterStatus]{Type: beehive.Deleted, ID: 7, Object: obj},
 	)
@@ -1140,7 +1013,7 @@ func TestClustersWatchListReportsTheMarkAsModified(t *testing.T) {
 
 // A record already tombstoned when the snapshot is taken is in it, like any other row.
 func TestClustersWatchListSnapshotCarriesADeletingRecord(t *testing.T) {
-	frames := pumpFrames(t, []*beehive.Object[ClusterSpec, ClusterStatus]{deletingCluster(7)})
+	frames := pumpFrames(t, clusterWatch, []*beehive.Object[ClusterSpec, ClusterStatus]{deletingCluster(7)})
 
 	require.Len(t, frames, 2)
 	assert.Equal(t, DeltaFrameAdded, frames[0].Type)

@@ -166,16 +166,9 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 	var id ObjectID = 1
 
 	calls := map[string]func(){
-		"Caches().WatchByCluster":        func() { svc.Caches().WatchByCluster(ctx, id) },
 		"Caches().WatchStats":            func() { svc.Caches().WatchStats(ctx, id, id) },
 		"Caches().WatchHealth":           func() { svc.Caches().WatchHealth(ctx) },
 		"Caches().Clear":                 func() { svc.Caches().Clear(ctx, id) },
-		"CachedCatalogs().Get":           func() { svc.CachedCatalogs().Get(ctx, id) },
-		"CachedCatalogs().List":          func() { svc.CachedCatalogs().List(ctx) },
-		"CachedCatalogs().Watch":         func() { svc.CachedCatalogs().Watch(ctx, id) },
-		"CachedCatalogs().WatchList":     func() { svc.CachedCatalogs().WatchList(ctx) },
-		"CachedCatalogs().ListByCache":   func() { svc.CachedCatalogs().ListByCache(ctx, id) },
-		"CachedCatalogs().WatchByCache":  func() { svc.CachedCatalogs().WatchByCache(ctx, id) },
 		"CachedResources().Get":          func() { svc.CachedResources().Get(ctx, id) },
 		"CachedResources().List":         func() { svc.CachedResources().List(ctx) },
 		"CachedResources().Watch":        func() { svc.CachedResources().Watch(ctx, id) },

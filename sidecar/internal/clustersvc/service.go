@@ -230,12 +230,12 @@ type Caches interface {
 type CachedCatalogs interface {
 	// Get returns one catalog by id, or (nil, nil) when the id names nothing.
 	Get(ctx context.Context, id ClusterCachedCatalogID) (*ClusterCachedCatalog, error)
-	// List returns every catalog in creation order. A cache gets its catalog only once
-	// discovery lands, so an empty result is a wait, not an error.
+	// List returns every catalog in creation order. A cache gets its catalog on its
+	// first reconcile, so an empty result is a wait, not an error.
 	List(ctx context.Context) ([]*ClusterCachedCatalog, error)
 
-	// Watch streams one catalog as a delta watch. Bookmark-only until the cache's
-	// first discovery pass lands, which is the wait List describes.
+	// Watch streams one catalog as a delta watch. Bookmark-only until the cache
+	// reconciles, which is the wait List describes.
 	Watch(ctx context.Context, id ClusterCachedCatalogID) (*Stream[ClusterCachedCatalogWatchFrame], error)
 	// WatchList streams every cache's catalog, joined onto caches by Owner.ID.
 	WatchList(ctx context.Context) (*Stream[ClusterCachedCatalogWatchFrame], error)

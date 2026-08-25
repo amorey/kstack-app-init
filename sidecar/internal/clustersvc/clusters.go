@@ -240,15 +240,7 @@ func (a clustersAPI) Watch(ctx context.Context, id ClusterID) (*Stream[ClusterWa
 		return nil, fmt.Errorf("watch cluster %d: %w", id, err)
 	}
 
-	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterWatchFrame) error {
-		// Nil when the id holds nothing yet, which is a snapshot of none rather than a
-		// failure: the record may still arrive, and this subscription reports it.
-		var snapshot []*beehive.Object[ClusterSpec, ClusterStatus]
-		if src.Object != nil {
-			snapshot = append(snapshot, src.Object)
-		}
-		return pumpClusterWatch(ctx, out, snapshot, src.Changes, src.Err)
-	}), nil
+	return clusterWatch.streamOne(ctx, src), nil
 }
 
 func (a clustersAPI) WatchList(ctx context.Context) (*Stream[ClusterWatchFrame], error) {
@@ -257,64 +249,23 @@ func (a clustersAPI) WatchList(ctx context.Context) (*Stream[ClusterWatchFrame],
 		return nil, fmt.Errorf("watch clusters: %w", err)
 	}
 
-	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterWatchFrame) error {
-		return pumpClusterWatch(ctx, out, src.Objects, src.Changes, src.Err)
-	}), nil
+	return clusterWatch.streamList(ctx, src), nil
 }
 
-// pumpClusterWatch streams a snapshot, the bookmark closing it, then every change
-// above it. The two cluster watches differ only in what the snapshot holds.
-//
-// beehive hands the snapshot complete as of a resource version, with Changes carrying
-// everything above it, so the bookmark lands between the two without holding any frame
-// back. srcErr is the upstream's terminal reason, read once its changes run out.
-func pumpClusterWatch(
-	ctx context.Context,
-	out chan<- ClusterWatchFrame,
-	snapshot []*beehive.Object[ClusterSpec, ClusterStatus],
-	changes <-chan beehive.ObjectChange[ClusterSpec, ClusterStatus],
-	srcErr func() error,
-) error {
-	for _, obj := range snapshot {
-		if !sendFrame(ctx, out, ClusterWatchFrame{Type: DeltaFrameAdded, Cluster: toCluster(obj)}) {
-			return nil
+// clusterWatch projects this kind into delta frames. A record built from the object
+// alone, so nothing here can fail — the error is the shared pump's to allow.
+var clusterWatch = deltaWatch[ClusterSpec, ClusterStatus, ClusterWatchFrame]{
+	frame: func(t DeltaFrameType, obj *beehive.Object[ClusterSpec, ClusterStatus]) (ClusterWatchFrame, error) {
+		return ClusterWatchFrame{Type: t, Cluster: toCluster(obj)}, nil
+	},
+	departed: func(change beehive.ObjectChange[ClusterSpec, ClusterStatus]) ClusterWatchFrame {
+		cluster := &Cluster{ID: ClusterID(change.ID)}
+		if change.Object != nil {
+			cluster = toCluster(change.Object)
 		}
-	}
-	if !sendFrame(ctx, out, ClusterWatchFrame{Type: DeltaFrameBookmark}) {
-		return nil
-	}
-
-	for change := range changes {
-		if change.Type == beehive.Deleted {
-			if !sendFrame(ctx, out, clusterDeparture(change)) {
-				return nil
-			}
-			continue
-		}
-
-		// Only a removal arrives without an object.
-		if change.Object == nil {
-			continue
-		}
-		frame := ClusterWatchFrame{Type: deltaFrameType(change), Cluster: toCluster(change.Object)}
-		if !sendFrame(ctx, out, frame) {
-			return nil
-		}
-	}
-	return srcErr()
-}
-
-// clusterDeparture builds the frame for a removal. beehive reports one whose final row
-// it could not decode with no object at all, and the frame still has to carry the id:
-// nothing later in the log mentions a deleted id, and a consumer drops a change with no
-// entity rather than folding it — so a dropped frame strands the record in its map for
-// the life of the subscription.
-func clusterDeparture(change beehive.ObjectChange[ClusterSpec, ClusterStatus]) ClusterWatchFrame {
-	cluster := &Cluster{ID: ClusterID(change.ID)}
-	if change.Object != nil {
-		cluster = toCluster(change.Object)
-	}
-	return ClusterWatchFrame{Type: DeltaFrameDeleted, Cluster: cluster}
+		return ClusterWatchFrame{Type: DeltaFrameDeleted, Cluster: cluster}
+	},
+	bookmark: ClusterWatchFrame{Type: DeltaFrameBookmark},
 }
 
 // WatchSchedule streams when the cluster's context is next dialed: the current value,

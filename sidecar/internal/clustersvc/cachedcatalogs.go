@@ -97,28 +97,117 @@ func ensureClusterCachedCatalog(ctx context.Context, client beehive.Client[Clust
 	return nil
 }
 
+// toClusterCachedCatalog builds the served record from the stored object.
+func toClusterCachedCatalog(obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]) (*ClusterCachedCatalog, error) {
+	owner, err := toOwnerRef(obj)
+	if err != nil {
+		return nil, err
+	}
+	return &ClusterCachedCatalog{
+		ID:         ClusterCachedCatalogID(obj.ID),
+		Owner:      owner,
+		Spec:       obj.Spec,
+		Conditions: obj.Conditions,
+	}, nil
+}
+
+// toClusterCachedCatalogs projects a whole read. beehive lists by id, which is creation
+// order, and that is the order this family promises — so nothing here sorts.
+func toClusterCachedCatalogs(objs []*beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]) ([]*ClusterCachedCatalog, error) {
+	catalogs := make([]*ClusterCachedCatalog, 0, len(objs))
+	for _, obj := range objs {
+		catalog, err := toClusterCachedCatalog(obj)
+		if err != nil {
+			return nil, err
+		}
+		catalogs = append(catalogs, catalog)
+	}
+	return catalogs, nil
+}
+
 func (a cachedCatalogsAPI) Get(ctx context.Context, id ClusterCachedCatalogID) (*ClusterCachedCatalog, error) {
-	panic("not implemented")
+	obj, err := a.s.catalogClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
+	if err != nil {
+		// A caller holds ids from watch frames, so a record collected in between is an
+		// ordinary race rather than a bad request.
+		if errors.Is(err, beehive.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get cached catalog %d: %w", id, err)
+	}
+	return toClusterCachedCatalog(obj)
 }
 
 func (a cachedCatalogsAPI) List(ctx context.Context) ([]*ClusterCachedCatalog, error) {
-	panic("not implemented")
+	objs, err := a.s.catalogClient.List(ctx, beehive.LoadOwner())
+	if err != nil {
+		return nil, fmt.Errorf("list cached catalogs: %w", err)
+	}
+	return toClusterCachedCatalogs(objs)
 }
 
 func (a cachedCatalogsAPI) Watch(ctx context.Context, id ClusterCachedCatalogID) (*Stream[ClusterCachedCatalogWatchFrame], error) {
-	panic("not implemented")
+	src, err := a.s.catalogClient.Watch(ctx, beehive.ObjectID(id), loadCatalogOwner)
+	if err != nil {
+		return nil, fmt.Errorf("watch cached catalog %d: %w", id, err)
+	}
+
+	return catalogWatch.streamOne(ctx, src), nil
 }
 
 func (a cachedCatalogsAPI) WatchList(ctx context.Context) (*Stream[ClusterCachedCatalogWatchFrame], error) {
-	panic("not implemented")
+	src, err := a.s.catalogClient.WatchList(ctx, loadCatalogOwner)
+	if err != nil {
+		return nil, fmt.Errorf("watch cached catalogs: %w", err)
+	}
+
+	return catalogWatch.streamList(ctx, src), nil
 }
 
 func (a cachedCatalogsAPI) ListByCache(ctx context.Context, cacheID ClusterCacheID) ([]*ClusterCachedCatalog, error) {
-	panic("not implemented")
+	// One query rather than a Get on the derived name: the owner edge is what the
+	// record is enumerated through, and a cache that has not reconciled yet owns none,
+	// which reads empty rather than failing.
+	objs, err := a.s.catalogClient.ListOwnedObjects(ctx, beehive.ObjectID(cacheID), beehive.LoadOwner())
+	if err != nil {
+		return nil, fmt.Errorf("list cache %d cached catalogs: %w", cacheID, err)
+	}
+	return toClusterCachedCatalogs(objs)
 }
 
 func (a cachedCatalogsAPI) WatchByCache(ctx context.Context, cacheID ClusterCacheID) (*Stream[ClusterCachedCatalogWatchFrame], error) {
-	panic("not implemented")
+	src, err := a.s.catalogClient.WatchOwnedObjects(ctx, beehive.ObjectID(cacheID), loadCatalogOwner)
+	if err != nil {
+		return nil, fmt.Errorf("watch cache %d cached catalogs: %w", cacheID, err)
+	}
+
+	return catalogWatch.streamList(ctx, src), nil
+}
+
+// loadCatalogOwner eager-loads the owner edge every catalog frame carries as its join
+// key; beehive batches the lookup per change batch, so a watch does not become an N+1.
+var loadCatalogOwner = beehive.WithLoads(beehive.LoadOwner())
+
+// catalogWatch projects this kind into delta frames. The departure carries the spec but
+// no owner: the row is gone, so beehive loads no edge for it and reading one would fail
+// the whole stream — and a consumer keys the record it is dropping by id anyway.
+var catalogWatch = deltaWatch[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus, ClusterCachedCatalogWatchFrame]{
+	frame: func(t DeltaFrameType, obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]) (ClusterCachedCatalogWatchFrame, error) {
+		catalog, err := toClusterCachedCatalog(obj)
+		if err != nil {
+			return ClusterCachedCatalogWatchFrame{}, err
+		}
+		return ClusterCachedCatalogWatchFrame{Type: t, Catalog: catalog}, nil
+	},
+	departed: func(change beehive.ObjectChange[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]) ClusterCachedCatalogWatchFrame {
+		catalog := &ClusterCachedCatalog{ID: ClusterCachedCatalogID(change.ID)}
+		if obj := change.Object; obj != nil {
+			catalog.Spec = obj.Spec
+			catalog.Conditions = obj.Conditions
+		}
+		return ClusterCachedCatalogWatchFrame{Type: DeltaFrameDeleted, Catalog: catalog}
+	},
+	bookmark: ClusterCachedCatalogWatchFrame{Type: DeltaFrameBookmark},
 }
 
 // clusterCachedCatalogController reconciles one cache's kind catalog: run the
