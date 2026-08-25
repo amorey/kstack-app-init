@@ -48,6 +48,13 @@ var ErrNotFound = errors.New("clustersvc: cluster not found")
 // see TODO.md.
 var ErrDeclaredBySource = errors.New("clustersvc: cluster is still declared by its source")
 
+// ErrNotConnectable is the sentinel for a record that exists and will not be connected:
+// disabled, awaiting deletion, or from a source that carries no credentials. Told apart
+// from ErrNotFound because the remedy is the record's own state rather than a bad id — a
+// caller offers to enable the cluster instead of reporting it gone. Unmapped on the wire,
+// like the two above — see TODO.md.
+var ErrNotConnectable = errors.New("clustersvc: cluster cannot be connected")
+
 // --- Process-wide services ---
 //
 // The app's own services as this package uses them: narrow, so a test hands a
@@ -66,8 +73,10 @@ type kubeconfigService interface {
 // kubeconnService is the pool a cluster is talked to over. Acquire names a context and
 // claims its connection, which is also what arms the probe behind it; a claim outlives
 // the pass that took it, so the caller holds and releases rather than asking per pass.
+// Retry re-runs a claimed context's probes out of band.
 type kubeconnService interface {
 	Acquire(contextName string) kubeconn.Lease
+	Retry(contextName string)
 	Subscribe() kubeconn.Subscription
 }
 

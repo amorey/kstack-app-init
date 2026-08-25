@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
@@ -187,8 +188,6 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 		"CachedData().WatchKinds":        func() { svc.CachedData().WatchKinds(ctx, id, id) },
 		"CachedData().WatchObjects":      func() { svc.CachedData().WatchObjects(ctx, id, id, "v1", "pods") },
 		"CachedData().WatchEvents":       func() { svc.CachedData().WatchEvents(ctx, id, id) },
-		"AcquireConnection":              func() { svc.AcquireConnection(ctx, id) },
-		"RetryConnection":                func() { svc.RetryConnection(ctx, id) },
 		"ListEvents":                     func() { svc.ListEvents(ctx, id, nil, nil) },
 		"WatchEvents":                    func() { svc.WatchEvents(ctx, id, nil) },
 	}
@@ -205,4 +204,118 @@ func TestStartFailsWhenTheAnchorsCannotBeCreated(t *testing.T) {
 
 	_, err := lifecycle.StartAll(context.Background(), []lifecycle.Part{part})
 	assert.ErrorContains(t, err, "cluster source records")
+}
+
+// --- the connection surface ---
+
+// A claim names the record's context, which is what arms the probe behind it.
+func TestAcquireConnectionClaimsTheRecordsContext(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+
+	lease, err := serviceOver(t, d).AcquireConnection(context.Background(), ClusterID(obj.ID))
+
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	assert.Equal(t, []string{"prod"}, pool.asked)
+}
+
+// The claim is the caller's own: releasing it is the caller's business, and says nothing
+// about the one clusterController holds to keep this cluster probed.
+func TestAcquireConnectionHandsBackAReleasableClaim(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+
+	lease, err := serviceOver(t, d).AcquireConnection(context.Background(), ClusterID(obj.ID))
+	require.NoError(t, err)
+	lease.Release()
+
+	assert.Equal(t, []string{"prod"}, pool.released)
+}
+
+func TestRetryConnectionReprobesTheRecordsContext(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+
+	require.NoError(t, serviceOver(t, d).RetryConnection(context.Background(), ClusterID(obj.ID)))
+
+	assert.Equal(t, []string{"prod"}, pool.retried)
+	assert.Empty(t, pool.asked, "a retry reaches the probe, not the claim")
+}
+
+// The gate is one rule, asserted over both methods together: a caller must not find one
+// of them willing to act on a record the other refuses.
+func TestTheConnectionSurfaceRefusesTheSameRecords(t *testing.T) {
+	tests := map[string]struct {
+		record func(t *testing.T, d deps) ClusterID
+		want   error
+	}{
+		"an id naming nothing": {
+			record: func(*testing.T, deps) ClusterID { return ClusterID(404) },
+			want:   ErrNotFound,
+		},
+		"a disabled cluster": {
+			record: func(t *testing.T, d deps) ClusterID {
+				obj, err := d.clusterClient.Create(context.Background(), KubeconfigName("prod"), ClusterSpec{
+					Source: ClusterSpecSource{Kubeconfig: kubeconfigSrc("prod")},
+				})
+				require.NoError(t, err)
+				return ClusterID(obj.ID)
+			},
+			want: ErrNotConnectable,
+		},
+		"a cluster awaiting deletion": {
+			record: func(t *testing.T, d deps) ClusterID {
+				obj := createCluster(t, d.clusterClient, "prod")
+				require.NoError(t, d.clusterClient.Delete(context.Background(), obj.ID))
+				return ClusterID(obj.ID)
+			},
+			want: ErrNotConnectable,
+		},
+		"a cluster from a source with no credentials": {
+			record: func(t *testing.T, d deps) ClusterID {
+				obj, err := d.clusterClient.Create(context.Background(), "adopted", ClusterSpec{Enabled: true})
+				require.NoError(t, err)
+				return ClusterID(obj.ID)
+			},
+			want: ErrNotConnectable,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			d := newTestDeps(t)
+			id := tt.record(t, d)
+			svc := serviceOver(t, d)
+			pool := d.kubeconnSvc.(*fakeKubeconn)
+
+			_, acquireErr := svc.AcquireConnection(context.Background(), id)
+			retryErr := svc.RetryConnection(context.Background(), id)
+
+			assert.ErrorIs(t, acquireErr, tt.want)
+			assert.ErrorIs(t, retryErr, tt.want)
+			assert.Empty(t, pool.asked)
+			assert.Empty(t, pool.retried)
+		})
+	}
+}
+
+// A cluster nothing can reach is still claimed and still retried: whether the server
+// answers is the probe's to report, not the record's to refuse.
+func TestTheConnectionSurfaceServesAnUnreachableCluster(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	d.kubeconnSvc = knowing(kubeconn.State{Connection: failed(errors.New("no route to host"))})
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+	svc := serviceOver(t, d)
+
+	lease, err := svc.AcquireConnection(context.Background(), ClusterID(obj.ID))
+	require.NoError(t, err)
+	require.NoError(t, svc.RetryConnection(context.Background(), ClusterID(obj.ID)))
+
+	assert.False(t, lease.State().Connection.OK())
+	assert.Equal(t, []string{"prod"}, pool.retried)
 }

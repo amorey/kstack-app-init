@@ -41,24 +41,37 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   the status code alone discards what the typed half already knows (`state.go` states the rule).
   Every probe reads a raw path today, so nothing has reached it yet.
 
-- **`kubeconn`'s presence queue has no debounce.** `presence` is an `internal/workqueue` queue
-  (`sidecar/internal/clustersvc/internal/kubeconn/service.go`): `Acquire` adds a context the first
-  time it is claimed, `watchKubeconfig` adds every claimed context on a kubeconfig change, and
-  `presenceLoop` reads them one at a time. **Deduping is not debouncing** — a key waits once, but
-  only while it is waiting, so a burst spread across passes is a burst of reads, each of which
-  re-reads the kubeconfig and the CA files behind it.
-  - **Not a problem yet**, because both producers are already quiet. A claim asks once per new
-    context, and `kubeconfig.Service` polls on a ticker and publishes only when the loaded config
-    differs (`reflect.DeepEqual`), so a hand-edited file produces one signal rather than one per
-    write.
-  - **Trigger:** the third producer. The probe's retry ladder, a manual reconnect poke, and
-    anything else that can ask for one context repeatedly will each want their asks merged over a
-    short window rather than run back to back.
-  - **Home:** `internal/workqueue`, alongside the `AddAfter` the probe's backoff ladder wants —
-    which already has to replace an earlier delayed add for the same key. A debounce window is that
-    mechanism with the timer restarted rather than kept, so the two are one feature if designed
-    together. [amorey/gobus#17](https://github.com/amorey/gobus/issues/17) proposes the same queue
-    upstream; this package is the worked shape to draw from if it lands.
+- **`probe.Engine`'s `Wake`/`WakeAll` pair reads as one axis and is two.** `Wake(subjectName string, names ...string)` takes named probes on **one** subject; `WakeAll(names ...string)` takes named probes across **every** subject. The variadic means the same thing in both, and `All` varies the argument that is not there — so `WakeAll` reads as "wake every probe" when it means "wake these probes everywhere". Both call sites are correct today: `watchKubeconfig` wants `WakeAll(nameConnection)` (one probe, whole fleet) and `Retry` wants `Wake(contextName, probeNames[:]...)` (one context, every probe) — they are exact transposes, which is what makes the pair easy to reach for backwards. **Fix:** rename `WakeAll` to name its axis (`WakeEverySubject`, or `WakeSubjects`), two call sites plus `engine_test.go` and the `sidecar/CLAUDE.md` wiring line. **Weigh:** the engine is a general leaf and `WakeAll` is the shorter, more conventional spelling; the case for renaming rests on the pair being read together, which is exactly when the ambiguity bites.
+
+- **`probe.Engine`'s run queue has no debounce.** `runQ` and `passQ` are `internal/workqueue`
+  queues (`sidecar/internal/probe/engine.go`). **Deduping is not debouncing** — a key waits once,
+  but only while it is waiting, and one added while a worker holds it is queued afresh on `Done`,
+  so asks spread across a run are a run apiece. For the connection probe each one re-reads the
+  kubeconfig and the CA files behind it, then dials `/api`.
+  - **Four producers reach one context's key today**: `Acquire` → `engine.Add` (once, per new
+    context), `watchKubeconfig` → `WakeAll(nameConnection)` (every claimed context, per kubeconfig
+    change), `Retry` → `Wake` (all five probes, on demand), and the engine itself — the data edge
+    on a committed value, and the subject timer arming the next due pass.
+  - **Not a problem yet**, and one throttle already exists: `WithWorkers` caps runs in flight
+    fleet-wide, which is what holds back the first pass over a large kubeconfig so every cluster's
+    credential helper does not run in the same second. It bounds concurrency, not the number of
+    runs. The producers are also quiet — a claim asks once per new context, and `kubeconfig.Service`
+    polls on a ticker and publishes only when the whole loaded config differs (`reflect.DeepEqual`),
+    so a hand-edited file produces one signal rather than one per write.
+  - **The trigger has partly fired.** `Retry` is the third producer and the first *user-driven*
+    one: a client that retries on a timer, or a user clicking through an outage, asks for one
+    context repeatedly, and dedup merges those asks only while the key is waiting. Still bounded by
+    what a person can click, so this is a watch item rather than work — but the next producer that
+    can ask in a loop makes it real.
+  - **Home:** `internal/workqueue`, as its own feature. The old pairing with `AddAfter` is gone:
+    the engine schedules delayed work with a per-subject `time.AfterFunc` over a schedule derived
+    in `pass`, so nothing wants a delayed queue add any more.
+    [amorey/gobus#17](https://github.com/amorey/gobus/issues/17) proposes the same queue upstream;
+    this package is the worked shape to draw from if it lands.
+  - **Weigh the alternative first:** a floor belongs to whoever knows what a run costs, and that is
+    the engine (it owns the cadence, the backoff, and `WithWorkers`) rather than a generic queue. A
+    per-probe minimum interval — "this probe runs at most once every N" — would cover the same
+    burst without a second timing mechanism in the queue.
 
 ## Auth
 

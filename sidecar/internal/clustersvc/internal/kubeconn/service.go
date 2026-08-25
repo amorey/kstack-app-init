@@ -178,6 +178,20 @@ func (s *Service) Acquire(contextName string) Lease {
 	return &claim{svc: s, contextName: contextName, entry: e}
 }
 
+// Retry runs every probe on contextName now, whatever it was next due at and whatever suspended
+// it. For a user who fixed something no probe can observe — a VPN dialed, a credential rotated —
+// and should not have to wait out the cadence.
+//
+// All five rather than the connection alone: a connection that is already up commits nothing, so
+// waking it would leave a probe that failed on its own — a forbidden kube-system read — suspended
+// on the answer the user just fixed.
+//
+// A context nobody claims is untracked and this does nothing. Nothing to report either way: what
+// the re-probe finds reaches watchers the way every other pass does.
+func (s *Service) Retry(contextName string) {
+	s.engine.Wake(contextName, probeNames[:]...)
+}
+
 // Subscribe reports every context whose news changed, for a reader whose reaction to any of them
 // is the same. A holder that cares about one claim watches that claim instead.
 func (s *Service) Subscribe() Subscription { return s.signalHub.Receiver() }

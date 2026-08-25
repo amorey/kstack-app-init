@@ -726,3 +726,56 @@ func TestAFailingReadinessAnswerIsDated(t *testing.T) {
 	assert.True(t, st.Readiness.Known(), "the component list was read")
 	assert.False(t, st.Readiness.OK(), "read, and not ready")
 }
+
+// --- retry ---
+
+// probed waits until every probe has answered, so a test that then drains the server's
+// request log sees only what it goes on to cause. settled is the connection alone, which
+// the four behind it can still be running past.
+func probed(t *testing.T, lease Lease) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		st := lease.State()
+		return st.Connection.LastAttempt.Done() && st.Readiness.LastAttempt.Done() &&
+			st.ServerUID.LastAttempt.Done() && st.ServerVersion.LastAttempt.Done() &&
+			st.Principal.LastAttempt.Done()
+	}, testutil.Timeout, time.Millisecond, "every probe to answer")
+}
+
+// All five, not the connection alone: a connection that is already up commits nothing, so
+// waking it would leave the probes behind it sitting on the answer the user just fixed.
+func TestRetryRerunsEveryProbe(t *testing.T) {
+	c := serveCluster(t)
+	s := New(serving(c.Server, "prod", "key-1"))
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	probed(t, lease)
+	// Every probe is now scheduled minutes out, so nothing reaches the server unbidden.
+	c.requests.Drain()
+
+	s.Retry("prod")
+
+	want := map[string]bool{
+		apiDiscoveryPath: true, readyzPath: true, kubeSystemPath: true,
+		versionPath: true, selfSubjectReviewPath: true,
+	}
+	for range len(want) {
+		delete(want, testutil.Recv(t, c.requests.Chan(), "a re-probe request"))
+	}
+	assert.Empty(t, want, "every probe asked again")
+}
+
+// A context nobody claims is not tracked, so there is no probe to re-run — and asking is
+// not an error, since the caller cannot know who holds what.
+func TestRetryIgnoresAContextNobodyClaims(t *testing.T) {
+	c := serveCluster(t)
+	s := New(serving(c.Server, "prod", "key-1"))
+	startService(t, s)
+
+	s.Retry("prod")
+
+	// A negative assertion has no event to wait for, so it needs a bounded window: this
+	// fails the instant a request lands rather than at the end of the wait.
+	testutil.NoRecv(t, c.requests.Chan(), 50*time.Millisecond, "a probe request")
+}

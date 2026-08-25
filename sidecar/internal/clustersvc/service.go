@@ -517,12 +517,55 @@ func (s *service) Close() error {
 	return lifecycle.CloseAll(s.parts)
 }
 
+// AcquireConnection claims the pool's connection for id's context. The claim is the
+// caller's own, refcounted alongside the one clusterController holds, so releasing it
+// never stops the cluster being probed.
 func (s *service) AcquireConnection(ctx context.Context, id ClusterID) (Lease, error) {
-	panic("not implemented")
+	contextName, err := s.connectableContext(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return s.kubeconnSvc.Acquire(contextName), nil
 }
 
+// RetryConnection re-probes id's context now. It reports only that the record allows a
+// probe: what the probe then finds lands on the record's conditions, which is where a
+// caller reads it.
+//
+// A cluster nothing claims is not probed, so this reaches nothing — the same outcome as
+// asking a cluster whose probe is already mid-run, and neither is worth an error.
 func (s *service) RetryConnection(ctx context.Context, id ClusterID) error {
-	panic("not implemented")
+	contextName, err := s.connectableContext(ctx, id)
+	if err != nil {
+		return err
+	}
+	s.kubeconnSvc.Retry(contextName)
+	return nil
+}
+
+// connectableContext is the kube-context behind id, or why the record will not be
+// connected. Shared by both methods above so no caller finds one of them willing to act
+// on a record the other refuses.
+//
+// The three refusals are the record's own state, never the cluster's: whether the server
+// answers is the probe's to find out and report, so an unreachable cluster is claimed and
+// retried like any other.
+func (s *service) connectableContext(ctx context.Context, id ClusterID) (string, error) {
+	obj, err := s.clusterClient.Get(ctx, beehive.ObjectID(id))
+	if err != nil {
+		return "", wrapClusterErr("get", id, err)
+	}
+	switch {
+	case obj.DeletionRequestedAt != nil:
+		return "", fmt.Errorf("cluster %d is being deleted: %w", id, ErrNotConnectable)
+	case !obj.Spec.Enabled:
+		return "", fmt.Errorf("cluster %d is disabled: %w", id, ErrNotConnectable)
+	case obj.Spec.Source.Kubeconfig == nil:
+		// Another source's credentials are not this package's to resolve, the same rule
+		// the cluster pass follows when it declines to claim one.
+		return "", fmt.Errorf("cluster %d has no kubeconfig credentials: %w", id, ErrNotConnectable)
+	}
+	return obj.Spec.Source.Kubeconfig.Context, nil
 }
 
 func (s *service) ListEvents(ctx context.Context, id ObjectID, category *string, limit *int) ([]Event, error) {
