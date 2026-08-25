@@ -729,9 +729,9 @@ func TestAFailingReadinessAnswerIsDated(t *testing.T) {
 
 // --- retry ---
 
-// probed waits until every probe has answered, so a test that then drains the server's
-// request log sees only what it goes on to cause. settled is the connection alone, which
-// the four behind it can still be running past.
+// probed waits until every probe has answered — settled is the connection alone, which
+// the four behind it can still be running past. Answered is not yet quiet: a startup
+// re-run may still be in flight, which the caller settles off the request log itself.
 func probed(t *testing.T, lease Lease) {
 	t.Helper()
 	require.Eventually(t, func() bool {
@@ -751,8 +751,19 @@ func TestRetryRerunsEveryProbe(t *testing.T) {
 	lease := s.Acquire("prod")
 	defer lease.Release()
 	probed(t, lease)
-	// Every probe is now scheduled minutes out, so nothing reaches the server unbidden.
-	c.requests.Drain()
+	// probed means answered, not quiet: startup re-runs a probe that was woken or
+	// re-added while its first run was still in flight, so a straggler request can land
+	// after every probe has an answer. No event announces the last one, so — like a
+	// negative assertion — going quiet takes a bounded window, sized far above a
+	// scheduling hiccup plus a loopback request; every probe is then scheduled minutes
+	// out, so nothing reaches the server unbidden.
+	for quiet := false; !quiet; {
+		select {
+		case <-c.requests.Chan():
+		case <-time.After(100 * time.Millisecond):
+			quiet = true
+		}
+	}
 
 	s.Retry("prod")
 
@@ -760,10 +771,12 @@ func TestRetryRerunsEveryProbe(t *testing.T) {
 		apiDiscoveryPath: true, readyzPath: true, kubeSystemPath: true,
 		versionPath: true, selfSubjectReviewPath: true,
 	}
-	for range len(want) {
+	// Until want empties rather than the next five exactly: a wake landing mid-run is
+	// redelivered, so a probe may be asked twice, and a duplicate does not falsify
+	// "every probe asked again". One never asked leaves Recv on its failsafe.
+	for len(want) > 0 {
 		delete(want, testutil.Recv(t, c.requests.Chan(), "a re-probe request"))
 	}
-	assert.Empty(t, want, "every probe asked again")
 }
 
 // A context nobody claims is not tracked, so there is no probe to re-run — and asking is

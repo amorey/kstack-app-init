@@ -22,6 +22,23 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - **What it will not remove:** the id conversion, because the `ObjectID` scalar binds `clustersvc.ObjectID` (a defined type) while beehive's is an alias for `int64` — binding `int64` instead would capture every `int64` in the schema; and the status default, because beehive leaves `Status` nil until first written while the schema types it non-null. So `toX` gets small, not deleted.
   - **Upstream alternative, not a substitute:** beehive could factor its own metadata into an embeddable `ObjectMeta` that `Object` embeds (strictly additive there, and every consumer projecting objects into records pays the same copying). Even then the two exceptions above remain, and embedding beehive's metadata wholesale would put `Name`, `ResourceVersion`, and `Finalizers` on the record — `Name` especially, which this package treats as a reconcile key nothing reads back.
 
+- **The discovery sweep still runs on the reconcile's own goroutine — move it off, the way probing went.**
+  `clusterCachedCatalogController.Reconcile` (`sidecar/internal/clustersvc/cachedcatalogs.go`) calls
+  `discoverServedKinds` inline: dozens of round-trips bounded by `kubeconn`'s `discoveryTimeout`
+  (30s), on a beehive worker. It is the **only** pass left that makes a network call this way —
+  every other slow call moved into `probe.Engine`, which is exactly why `clusterController.Reconcile`
+  now only folds what the probes found. → [ADR: probe engine](docs/adr/2026-08-24-probe-engine.md).
+  **Mitigated, not fixed:** `catalogConcurrency` (8) stops the fleet discovering strictly serially,
+  since beehive's default is one worker per controller, and a failed sweep now takes the backoff
+  ladder instead of re-sweeping every 30s. What remains is that a hung API server still occupies one
+  of those eight workers for the whole timeout, and the bound is a number picked rather than a
+  structure. **Fix:** give discovery its own scheduler and have the pass fold the result — either a
+  sixth `probe.Engine` probe on the cluster's subject (it already has the connection, the cadence
+  machinery, and the suspend-while-down dependency edge) or a small sweeper of its own keyed by
+  cache. **Weigh first:** a probe's observable is per-*context* while a catalog is per-*cache*, and a
+  UID migration leaves two caches on one context — so the engine's subject key may be the wrong
+  grain, and that is the thing to settle before writing any of it.
+
 - **Nothing exposes the four non-connection probes, so "Connected but not Identified" has no detail.**
   `kubeconn.State` carries a full `Observation` per probe — value, `LastSeen`, `LastAttempt`
   (verdict/reason/message), `Failures`/`FailingSince`, `NextAttempt` — and `foldState`

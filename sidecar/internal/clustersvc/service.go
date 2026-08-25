@@ -469,6 +469,15 @@ var sourceResync = beehive.WithIndividualPassInterval(clusterSourceResyncInterva
 // the kind, which is what keeps a fleet from dialing in one burst.
 var clusterResync = beehive.WithIndividualPassInterval(clusterProbeInterval)
 
+// catalogResync re-runs discovery for each cache, timed from the end of its own last pass.
+// The third kind whose correctness rests on a poll: what it enumerates is the API server's,
+// so installing a CRD moves nothing in the store that could wake this.
+var catalogResync = beehive.WithIndividualPassInterval(catalogDiscoveryInterval)
+
+// catalogWorkers is the only kind that overrides beehive's single worker, because it is the
+// only pass that still makes a network call on the reconcile's own goroutine. → TODO.md.
+var catalogWorkers = beehive.WithConcurrency(catalogConcurrency)
+
 // registerControllers builds and registers each kind's controller, which lives in that
 // kind's file, and returns them in registration order. Together here rather than four
 // calls spread across those files: the options are the whole subsystem's concurrency
@@ -483,13 +492,13 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
 	cache := &clusterCacheController{deps: d}
-	catalog := &clusterCachedCatalogController{}
+	catalog := &clusterCachedCatalogController{deps: d, discover: discoverServedKinds}
 	resource := &clusterCachedResourceController{}
 
 	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigTrigger.Wakes()))
 	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync, beehive.WithTriggerByName(kubeconnTrigger.Wakes()))
 	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
-	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass)
+	errCatalog := beehive.Register(bh, ClusterCachedCatalogGroupKind, catalog, startupPass, catalogResync, catalogWorkers)
 	errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
 	if err := errors.Join(errSource, errCluster, errCache, errCatalog, errResource); err != nil {
 		return nil, err
@@ -545,27 +554,33 @@ func (s *service) RetryConnection(ctx context.Context, id ClusterID) error {
 	return nil
 }
 
-// connectableContext is the kube-context behind id, or why the record will not be
-// connected. Shared by both methods above so no caller finds one of them willing to act
-// on a record the other refuses.
-//
-// The three refusals are the record's own state, never the cluster's: whether the server
-// answers is the probe's to find out and report, so an unreachable cluster is claimed and
-// retried like any other.
+// connectableContext looks id up and reads clusterContext off it. Shared by both methods
+// above so no caller finds one of them willing to act on a record the other refuses.
 func (s *service) connectableContext(ctx context.Context, id ClusterID) (string, error) {
 	obj, err := s.clusterClient.Get(ctx, beehive.ObjectID(id))
 	if err != nil {
 		return "", wrapClusterErr("get", id, err)
 	}
+	return clusterContext(obj)
+}
+
+// clusterContext is the kube-context behind a record, or why the record will not be
+// connected. Taken off an object a caller already holds, since a pass reaching for a
+// connection has read the cluster for other reasons anyway.
+//
+// The three refusals are the record's own state, never the cluster's: whether the server
+// answers is the probe's to find out and report, so an unreachable cluster is claimed and
+// retried like any other.
+func clusterContext(obj *beehive.Object[ClusterSpec, ClusterStatus]) (string, error) {
 	switch {
 	case obj.DeletionRequestedAt != nil:
-		return "", fmt.Errorf("cluster %d is being deleted: %w", id, ErrNotConnectable)
+		return "", fmt.Errorf("cluster %d is being deleted: %w", obj.ID, ErrNotConnectable)
 	case !obj.Spec.Enabled:
-		return "", fmt.Errorf("cluster %d is disabled: %w", id, ErrNotConnectable)
+		return "", fmt.Errorf("cluster %d is disabled: %w", obj.ID, ErrNotConnectable)
 	case obj.Spec.Source.Kubeconfig == nil:
 		// Another source's credentials are not this package's to resolve, the same rule
 		// the cluster pass follows when it declines to claim one.
-		return "", fmt.Errorf("cluster %d has no kubeconfig credentials: %w", id, ErrNotConnectable)
+		return "", fmt.Errorf("cluster %d has no kubeconfig credentials: %w", obj.ID, ErrNotConnectable)
 	}
 	return obj.Spec.Source.Kubeconfig.Context, nil
 }

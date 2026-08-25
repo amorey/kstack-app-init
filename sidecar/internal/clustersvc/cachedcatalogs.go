@@ -19,12 +19,21 @@
 package clustersvc
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/amorey/beehive"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -210,17 +219,360 @@ var catalogWatch = deltaWatch[ClusterCachedCatalogSpec, ClusterCachedCatalogStat
 	bookmark: ClusterCachedCatalogWatchFrame{Type: DeltaFrameBookmark},
 }
 
-// clusterCachedCatalogController reconciles one cache's kind catalog: run the
-// discovery pass and maintain a ClusterCachedResource child per served kind. A
-// placeholder that reconciles to a no-op.
-type clusterCachedCatalogController struct{ lifecycle.None }
+// catalogDiscoveryInterval paces re-discovery, registered as the kind's individual pass.
+// The third kind whose correctness rests on a poll: what it enumerates is a remote
+// server's, so a CRD installed on the cluster moves nothing in the store.
+const catalogDiscoveryInterval = 10 * time.Minute
+
+// catalogRetryInterval is how soon a pass comes back when it never reached the server —
+// shorter than the cadence, because a cluster that just reconnected should not wait out a
+// full interval to learn what it serves. Flat rather than a backoff ladder: these passes
+// cost no request at all, since Lease.Conn never dials and a paused catalog never looks.
+const catalogRetryInterval = 30 * time.Second
+
+// catalogConcurrency is how many catalogs may be swept at once. A sweep is dozens of
+// round-trips bounded by the discovery client's timeout, and beehive's default is one
+// worker per controller — so without this the fleet discovers strictly serially and one
+// slow API server delays every other cluster's kinds. The same bound, for the same reason,
+// that the connection probes run under.
+const catalogConcurrency = 8
+
+// clusterCachedCatalogController reconciles one cache's kind catalog: enumerate what the
+// cluster serves and maintain a ClusterCachedResource child per kind.
+type clusterCachedCatalogController struct {
+	lifecycle.None
+	// Every kind's client, not just this one's: a catalog reads the cache and cluster it
+	// hangs off and writes the per-kind children it owns.
+	deps
+
+	// discover is the seam a test substitutes for the API server. Production wires
+	// discoverServedKinds; nothing else may be nil here.
+	discover func(*kubeconn.Connection) (kindCatalog, error)
+}
+
+// kindCatalog is one sweep's outcome: the kinds the server named, and whether that list is
+// the whole truth. Partial is what stops the pass pruning — a group that failed to answer
+// has not stopped being served, and deleting its children would tear down live workers
+// over a momentarily-down aggregated API.
+type kindCatalog struct {
+	kinds   []ClusterCachedResourceSpec
+	partial bool
+}
 
 func (c *clusterCachedCatalogController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCachedCatalogStatus],
 	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
 ) beehive.ReconcileResult {
-	// A no-op still settles: unsettled, every catalog is re-dispatched — and re-read —
-	// on each owed pass for the life of the process.
+	// A catalog on its way out is about to be collected with the children it owns, and
+	// beehive collects it with no finalizer to clear.
+	if obj.DeletionRequestedAt != nil {
+		return beehive.Settled()
+	}
+
+	clusterObj, err := c.clusterOf(ctx, client)
+	if err != nil {
+		return beehive.Fail(err)
+	}
+	// The subtree above is being collected, which will take this catalog with it.
+	if clusterObj == nil {
+		return beehive.Settled()
+	}
+
+	// A paused catalog keeps its children and stops discovering: the anchor lives as long
+	// as the cache, so the subtree survives a pause and is not rebuilt on resume. The
+	// relay still runs, since the switch reaching the workers is what pausing means.
+	if !obj.Spec.Enabled {
+		return c.relayPause(ctx, client, obj)
+	}
+
+	conn, release, err := c.connect(ctx, clusterObj)
+	if err != nil {
+		// Not a failure to retry under backoff: the cluster is disabled or unreachable,
+		// and either is the cluster pass's to report on its own conditions.
+		return observeDiscovered(ctx, client, ConditionFalse, ReasonNoConnection, err.Error()).
+			RequeueAfter(catalogRetryInterval)
+	}
+	defer release()
+
+	found, err := c.discover(conn)
+	if err != nil {
+		// The existing children are left alone: nothing is known about the served kinds
+		// this pass, and an empty answer is not the same as "serves nothing".
+		//
+		// Beehive's ladder rather than the flat retry above, because this one reached the
+		// server and a sweep is dozens of round-trips: a cluster answering slowly and
+		// failing would otherwise re-sweep every 30s forever, on a worker its whole kind
+		// shares. The claim above is released either way — Fail is a return like any other.
+		if condErr := observeDiscoveredErr(ctx, client, ConditionFalse, ReasonDiscoveryFailed, err.Error()); condErr != nil {
+			return beehive.Fail(condErr)
+		}
+		return beehive.Fail(fmt.Errorf("discover served kinds: %w", err))
+	}
+	return c.converge(ctx, client, obj, found)
+}
+
+// clusterOf walks the two owner edges above a catalog — cache, then cluster. A nil cluster
+// with no error means something in that chain is gone or going, which is a cascade about to
+// take this catalog rather than a failure to retry.
+func (c *clusterCachedCatalogController) clusterOf(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCachedCatalogStatus],
+) (*beehive.Object[ClusterSpec, ClusterStatus], error) {
+	// The reconcile load carries no edges, so each owner is a lookup rather than a field.
+	cacheRef, ok, err := client.GetOwner(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read cached catalog owner: %w", err)
+	}
+	if !ok {
+		return nil, nil
+	}
+
+	cacheObj, err := c.cacheClient.Get(ctx, cacheRef.ID, beehive.LoadOwner())
+	if errors.Is(err, beehive.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cluster cache %d: %w", cacheRef.ID, err)
+	}
+	if cacheObj.DeletionRequestedAt != nil {
+		return nil, nil
+	}
+
+	clusterRef, ok, err := cacheObj.Owner()
+	if err != nil {
+		return nil, fmt.Errorf("read cluster cache %d owner: %w", cacheRef.ID, err)
+	}
+	if !ok {
+		return nil, nil
+	}
+
+	clusterObj, err := c.clusterClient.Get(ctx, clusterRef.ID)
+	if errors.Is(err, beehive.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cluster %d: %w", clusterRef.ID, err)
+	}
+	return clusterObj, nil
+}
+
+// connect claims the cluster's context for the length of this pass and hands back the
+// connection its probe built. The claim is refcounted alongside the one clusterController
+// holds, so a pass costs no dial; releasing it is the caller's, hence the release func.
+func (c *clusterCachedCatalogController) connect(ctx context.Context, clusterObj *beehive.Object[ClusterSpec, ClusterStatus]) (*kubeconn.Connection, func(), error) {
+	contextName, err := clusterContext(clusterObj)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	lease := c.kubeconnSvc.Acquire(contextName)
+	conn, err := lease.Conn(ctx)
+	if err != nil {
+		lease.Release()
+		return nil, nil, err
+	}
+	return conn, lease.Release, nil
+}
+
+// converge rewrites the per-kind children to match what discovery found, and reports
+// the verdict.
+func (c *clusterCachedCatalogController) converge(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCachedCatalogStatus],
+	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
+	found kindCatalog,
+) beehive.ReconcileResult {
+	held, err := c.resourceClient.ListOwnedObjects(ctx, obj.ID)
+	if err != nil {
+		return beehive.Fail(fmt.Errorf("list cached catalog %d resources: %w", obj.ID, err))
+	}
+
+	draining, err := c.applyKinds(ctx, obj, found.kinds)
+	if err != nil {
+		return beehive.Fail(err)
+	}
+
+	// Pruning needs a complete answer: a group that did not answer has not stopped being
+	// served, and deleting its children would stop live workers over a transient outage.
+	if !found.partial {
+		if err := c.prune(ctx, held, found.kinds); err != nil {
+			return beehive.Fail(err)
+		}
+	}
+
+	status, reason := ConditionTrue, ReasonDiscovered
+	switch {
+	case found.partial:
+		status, reason = ConditionFalse, ReasonDiscoveryPartial
+	case draining:
+		status, reason = ConditionFalse, ReasonDiscoveryDraining
+	}
+	res := observeDiscovered(ctx, client, status, reason, "")
+	if draining {
+		return res.RequeueAfter(catalogRetryInterval)
+	}
+	return res
+}
+
+// relayPause rewrites each live child's switch and changes nothing else: the pass did
+// not look at the server, so the desired set is what is already stored.
+func (c *clusterCachedCatalogController) relayPause(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCachedCatalogStatus],
+	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
+) beehive.ReconcileResult {
+	held, err := c.resourceClient.ListOwnedObjects(ctx, obj.ID)
+	if err != nil {
+		return beehive.Fail(fmt.Errorf("list cached catalog %d resources: %w", obj.ID, err))
+	}
+	// Draining cannot arise: every name written here belongs to a live row just listed.
+	if _, err := c.applyKinds(ctx, obj, specsOf(held)); err != nil {
+		return beehive.Fail(err)
+	}
+	return observeDiscovered(ctx, client, ConditionFalse, ReasonPaused, "")
+}
+
+// applyKinds converges one child per kind, relaying the pause switch into each. draining
+// reports a served kind whose name is still held by an earlier prune's tombstone: the
+// kind has no live record, which is a state to report and come back to, not a failure.
+func (c *clusterCachedCatalogController) applyKinds(
+	ctx context.Context,
+	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
+	kinds []ClusterCachedResourceSpec,
+) (draining bool, err error) {
+	for _, spec := range kinds {
+		spec.Enabled = obj.Spec.Enabled
+		name := ClusterCachedResourceName(obj.ID, spec.APIVersion, spec.Resource)
+		_, _, err := c.resourceClient.CreateOrUpdate(ctx, name, spec, beehive.WithOwner(obj.ID))
+		switch {
+		case errors.Is(err, beehive.ErrDeletionPending):
+			draining = true
+		case err != nil:
+			return false, fmt.Errorf("apply cached resource %s: %w", name, err)
+		}
+	}
+	return draining, nil
+}
+
+// prune deletes the children for kinds the server no longer serves. Deletion is beehive's
+// soft one, so the row lingers holding its name — which is the draining case above, and
+// why a kind that comes back is reported rather than silently missing.
+func (c *clusterCachedCatalogController) prune(ctx context.Context, held []*beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus], kinds []ClusterCachedResourceSpec) error {
+	served := make(map[SyncedKindRef]struct{}, len(kinds))
+	for _, spec := range kinds {
+		served[SyncedKindRef{APIVersion: spec.APIVersion, Resource: spec.Resource}] = struct{}{}
+	}
+
+	for _, obj := range held {
+		ref := SyncedKindRef{APIVersion: obj.Spec.APIVersion, Resource: obj.Spec.Resource}
+		if _, ok := served[ref]; ok || obj.DeletionRequestedAt != nil {
+			continue
+		}
+		if err := c.resourceClient.Delete(ctx, obj.ID); err != nil && !errors.Is(err, beehive.ErrNotFound) {
+			return fmt.Errorf("delete cached resource %d: %w", obj.ID, err)
+		}
+	}
+	return nil
+}
+
+// specsOf reads the stored specs back out, for the pass that has no fresh answer.
+func specsOf(objs []*beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) []ClusterCachedResourceSpec {
+	specs := make([]ClusterCachedResourceSpec, 0, len(objs))
+	for _, obj := range objs {
+		if obj.DeletionRequestedAt == nil {
+			specs = append(specs, obj.Spec)
+		}
+	}
+	return specs
+}
+
+// observeDiscovered records the verdict and settles. The pass writes no status of its own
+// — this kind has none — so the condition and the result are the whole report.
+func observeDiscovered(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCachedCatalogStatus],
+	status ConditionStatus,
+	reason, message string,
+) beehive.ReconcileResult {
+	if err := observeDiscoveredErr(ctx, client, status, reason, message); err != nil {
+		return beehive.Fail(err)
+	}
 	return beehive.Settled()
+}
+
+// observeDiscoveredErr is the write alone, for the caller that has already decided the pass
+// failed and only needs the verdict on the record before it says so.
+func observeDiscoveredErr(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCachedCatalogStatus],
+	status ConditionStatus,
+	reason, message string,
+) error {
+	cond := LiveCondition(ConditionDiscovered, status, reason, message)
+	if err := client.SetCondition(ctx, cond); err != nil {
+		return fmt.Errorf("set %s condition: %w", ConditionDiscovered, err)
+	}
+	return nil
+}
+
+// discoverServedKinds enumerates the kinds the cluster serves, each at the version the
+// server itself prefers.
+//
+// A partial answer is the routine failure here rather than an exception: an aggregated API
+// server that is down fails its own group and no other, and client-go hands back the groups
+// that did answer alongside the error naming the ones that did not. The caller decides what
+// an incomplete list may do — which is everything except prune.
+func discoverServedKinds(conn *kubeconn.Connection) (kindCatalog, error) {
+	lists, err := conn.Discovery.ServerPreferredResources()
+
+	var groupErr *discovery.ErrGroupDiscoveryFailed
+	if err != nil && !errors.As(err, &groupErr) {
+		return kindCatalog{}, err
+	}
+	return kindCatalog{kinds: servedKinds(lists), partial: groupErr != nil}, nil
+}
+
+// servedKinds filters a discovery answer down to what a cache can mirror, sorted so a pass
+// is deterministic.
+func servedKinds(lists []*metav1.APIResourceList) []ClusterCachedResourceSpec {
+	var kinds []ClusterCachedResourceSpec
+	for _, list := range lists {
+		if list == nil || !mirrorableGroup(list.GroupVersion) {
+			continue
+		}
+		for _, res := range list.APIResources {
+			if !mirrorableResource(res) {
+				continue
+			}
+			kinds = append(kinds, ClusterCachedResourceSpec{
+				APIVersion: list.GroupVersion,
+				Kind:       res.Kind,
+				Resource:   res.Name,
+				Namespaced: res.Namespaced,
+			})
+		}
+	}
+
+	slices.SortFunc(kinds, func(a, b ClusterCachedResourceSpec) int {
+		return cmp.Or(cmp.Compare(a.APIVersion, b.APIVersion), cmp.Compare(a.Resource, b.Resource))
+	})
+	return kinds
+}
+
+// mirrorableGroup drops the alternate events spelling. One event store is served under two
+// group-versions, so mirroring both would cache every event twice; canonical v1 wins.
+func mirrorableGroup(groupVersion string) bool {
+	gv, err := schema.ParseGroupVersion(groupVersion)
+	return err == nil && gv.Group != EventsAltGroup
+}
+
+// mirrorableResource reports whether one resource can back a cache. A subresource has no
+// collection of its own, and a kind that cannot be listed and watched cannot be mirrored —
+// which is the whole of what a worker does.
+func mirrorableResource(res metav1.APIResource) bool {
+	if strings.Contains(res.Name, "/") {
+		return false
+	}
+	return slices.Contains(res.Verbs, "list") && slices.Contains(res.Verbs, "watch")
 }

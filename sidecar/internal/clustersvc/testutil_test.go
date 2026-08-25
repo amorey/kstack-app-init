@@ -81,11 +81,13 @@ type fakeKubeconn struct {
 
 	released []string
 	retried  []string
+	// connErr is what every claim's Conn answers, for a fleet nothing reached.
+	connErr error
 }
 
 func (f *fakeKubeconn) Acquire(contextName string) kubeconn.Lease {
 	f.asked = append(f.asked, contextName)
-	return &fakeLease{svc: f, contextName: contextName, state: f.states[contextName]}
+	return &fakeLease{svc: f, contextName: contextName, state: f.states[contextName], connErr: f.connErr}
 }
 
 func (f *fakeKubeconn) Retry(contextName string) { f.retried = append(f.retried, contextName) }
@@ -118,12 +120,19 @@ type fakeLease struct {
 	svc         *fakeKubeconn
 	contextName string
 	state       kubeconn.State
+	connErr     error
 	// departed is what the pool would report for a context the kubeconfig stopped naming.
 	departed bool
 }
 
+// Conn hands back an empty connection, since the only pass that takes one reaches the
+// server through a seam of its own. connErr is what a claim on a cluster nothing reached
+// would answer.
 func (l *fakeLease) Conn(context.Context) (*kubeconn.Connection, error) {
-	panic("a cluster pass claims, it does not dial")
+	if l.connErr != nil {
+		return nil, l.connErr
+	}
+	return &kubeconn.Connection{}, nil
 }
 
 func (l *fakeLease) State() kubeconn.State { return l.state }

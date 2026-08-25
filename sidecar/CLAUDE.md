@@ -67,10 +67,9 @@ cache is still the active identity). Served: the whole `Clusters()` family, the 
 That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **A cache now exists at runtime**: the serverUID probe writes `status.server.uid`, which is what
 `ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
-one — and a `ClusterCachedCatalog` beneath it. Everything below the catalog is still empty: nothing
-discovers kinds or syncs content. There is no connection manager, discovery pass, sync
-worker, or on-disk cache; `CachedCatalogs()` serves nothing yet, and the two families below it have
-no producer at all.
+one — and a `ClusterCachedCatalog` beneath it. **The catalog's pass discovers kinds**, so a
+`ClusterCachedResource` exists per kind the cluster serves. Nothing below that: no sync worker and
+no on-disk cache, so `CachedResources()` and `CachedData()` still serve nothing.
 
 **A read reports the store as it is, and never filters.** A record awaiting deletion is served like
 any other, carrying the tombstone (`deletionRequestedAt`) the consumer decides on — rendering it
@@ -96,7 +95,7 @@ tested once, in `stream_test.go` over a stand-in kind; a kind's tests pin its pr
 departure.
 
 **A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
-lifecycle. No kind has any yet — all five embed `lifecycle.None` — but the leaves a controller grows
+lifecycle. None has any yet — all five embed `lifecycle.None` — but the leaves a controller grows
 land there rather than on `service`, or the composition root accumulates every kind's detail.
 `registerControllers` builds and registers all five, returning them in registration order. All register with
 `startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
@@ -104,9 +103,42 @@ reads as settled, since the generation was observed by a process that is gone. *
 also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResyncInterval)`),
 the poll its correctness rests on: it reads a file the store cannot see, so a lost trigger poke is
 a change nothing else would report. **`Cluster` takes `clusterResync`** for the same reason
-— what its probe reports is a remote server's, so nothing in the store moves when the answer does.
-The other kinds are woken by a spec write or a dependency edge.
+— what its probe reports is a remote server's, so nothing in the store moves when the answer does —
+and **`ClusterCachedCatalog` takes `catalogResync`**, the third: installing a CRD on the cluster
+moves nothing here either. The other kinds are woken by a spec write or a dependency edge.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
+
+**The discovery pass converges a child set, and what it may do depends on how complete its answer
+is.** `clusterCachedCatalogController.Reconcile` walks its two owner edges (cache, then cluster),
+claims the cluster's context **for the length of the pass only** — refcounted alongside
+`clusterController`'s, so it costs no dial — and rewrites one `ClusterCachedResource` per kind the
+server serves. The rules, each carried by a reason in the `Discovered` vocabulary:
+
+- **`DiscoveryPartial` adds without pruning.** client-go returns partial results *and* an
+  `ErrGroupDiscoveryFailed` when an aggregated API server is down. A group that went quiet has not
+  stopped being served, and deleting its children would stop live workers over a transient outage.
+- **`DiscoveryFailed` leaves the children alone** and **fails the pass**, taking beehive's backoff
+  ladder. An empty answer is not "serves nothing", and a sweep is too expensive to repeat on a flat
+  cadence against a server that keeps refusing. (`RequeueAfter` is ignored on a failed result, so
+  this is either/or — a reason the two failure paths below read differently.)
+- **`DiscoveryDraining`** is a served kind whose name is still held by an earlier prune's tombstone
+  (`ErrDeletionPending`) — a state to come back to, not a failure.
+- **`Paused` does not look at all**, and only relays the switch onto the children already there. The
+  anchor lives as long as the cache, so its subtree survives a pause rather than being rebuilt.
+- **`NoConnection`** requeues on `catalogRetryInterval` (30s) rather than the full cadence, so a
+  cluster that just reconnected does not wait out ten minutes. Flat rather than a ladder because
+  this path costs no request at all — `Lease.Conn` never dials. The outage itself is the cluster
+  pass's to report.
+
+A kind is mirrorable when it is not a subresource and carries both `list` and `watch`; the
+`events.k8s.io` spelling is dropped so one event store is not cached twice.
+
+**This is the only kind that overrides beehive's worker count** (`catalogConcurrency` = 8, the same
+bound and the same reason as the connection probes), because it is the only pass that still makes a
+network call on the reconcile's own goroutine — beehive's default is a single worker per controller,
+so without it one slow API server would delay every other cluster's kinds. **That override is a
+mitigation, not the design**: moving the sweep off the reconcile is in `TODO.md`, and until it lands,
+nothing else may put a network call in a pass on the strength of this precedent.
 
 **A status write is unconditional.** Beehive compares what a pass writes against the status it handed
 that pass and reaches the store only for a difference, so an observation that moved nothing costs a
@@ -266,6 +298,13 @@ credential from a control plane mid-restart. `Retry(contextName)` wakes **all fi
 claimed context: a connection that is already up commits nothing, so waking it alone would leave a
 probe that failed on its own — a forbidden `kube-system` read — sitting on the answer the user just
 fixed. A context nobody claims is untracked, so it does nothing.
+
+**A `Connection` carries the clients built over one set of credentials** — `Dynamic`, `HTTPClient`,
+and `Discovery` — sharing one pool, which under HTTP/2 is one TCP connection to that API server.
+`Discovery` is the exception that proves the rule: client-go's discovery calls take **no context**,
+so it gets its own `http.Client` carrying a timeout instead. The pool is still the shared one, since
+client-go caches transports by TLS config — but the timeout must not ride the shared client, where
+every other caller (which bounds itself with a context) would inherit it.
 
 **The boundary in front of it is `AcquireConnection`/`RetryConnection`/`Clusters().WatchSchedule`**, all resolving the
 `ClusterID` to its context through one gate: `ErrNotFound` for an id naming nothing, and
