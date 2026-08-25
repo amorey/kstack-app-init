@@ -19,7 +19,7 @@
 // A caller registers its probes, says which subjects are tracked, and reads what the runs found:
 // Register takes a Probe with its cadence and what it depends on, all addressed by registration
 // name — a probe's whole public identity; Add and Remove track subjects, and Wake says a
-// recorded answer went stale; Read and OnChange hand back a Snapshot — every probe's
+// recorded answer went stale; Read and OnPass hand back a Snapshot — every probe's
 // Observation, value beside attempts, copied under one lock. Get reads one of them by name,
 // which is how a Run reads a sibling, and a Key pairs that name with its type once.
 //
@@ -161,7 +161,7 @@ type settings struct {
 // Register, then Start; the zero Engine has no queues to work.
 type Engine struct {
 	settings settings
-	onChange func(subjectName string, snap Snapshot)
+	onPass   func(subjectName string, snap Snapshot)
 
 	// runQ carries the runs that are due, one key per probe per subject, so one probe never
 	// runs twice at once and an ask arriving mid-run is redelivered on Done rather than folded
@@ -250,17 +250,21 @@ func New(opts ...Option) *Engine {
 	return e
 }
 
-// OnChange sets the callback the engine fires after every pass, with the Snapshot that pass
+// OnPass sets the callback the engine fires after every pass, with the Snapshot that pass
 // produced. Called outside the engine's lock but serialized per subject; it must not block.
 // Wiring, not state — set it before Start, like Register.
-func (e *Engine) OnChange(fn func(subjectName string, snap Snapshot)) {
+//
+// Every pass, not every change: a snapshot carries Attempts, which every run rewrites, so the
+// engine cannot tell a new answer from the same one re-confirmed. A caller that wakes something
+// expensive projects the snapshot down to what its readers react to and compares that itself.
+func (e *Engine) OnPass(fn func(subjectName string, snap Snapshot)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.started {
-		panic("probe: OnChange after Start")
+		panic("probe: OnPass after Start")
 	}
-	e.onChange = fn
+	e.onPass = fn
 }
 
 // Register adds one probe under name, which is its whole public identity: the edges, Wake, and
@@ -484,7 +488,7 @@ func (e *Engine) Close() error {
 }
 
 // passLoop derives schedules until stopped. One worker: the pass is arithmetic under the
-// engine's lock, so more would only contend for it — and one worker is what serializes OnChange
+// engine's lock, so more would only contend for it — and one worker is what serializes OnPass
 // per subject.
 func (e *Engine) passLoop(ctx context.Context) {
 	for {
@@ -513,7 +517,7 @@ func (e *Engine) runLoop(ctx context.Context) {
 }
 
 // pass re-derives one subject's schedule and publishes: due runs go on runQ, the soonest future
-// time arms the subject's one timer, and OnChange fires after — outside the lock, serialized
+// time arms the subject's one timer, and OnPass fires after — outside the lock, serialized
 // because passLoop is the one caller. It is the only publisher, so every state a reader sees
 // carries a schedule that matches the answers beside it.
 //
@@ -555,13 +559,13 @@ func (e *Engine) pass(subjectName string) {
 	}
 
 	var snap Snapshot
-	if e.onChange != nil {
+	if e.onPass != nil {
 		snap = e.snapshotOf(sub)
 	}
 	e.mu.Unlock()
 
-	if e.onChange != nil {
-		e.onChange(subjectName, snap)
+	if e.onPass != nil {
+		e.onPass(subjectName, snap)
 	}
 }
 

@@ -152,7 +152,7 @@ func New(kubecfgSvc kubeconfigService) *Service {
 		published:  map[string]news{},
 	}
 	registerProbes(s.engine, kubecfgSvc)
-	s.engine.OnChange(s.publish)
+	s.engine.OnPass(s.publish)
 	return s
 }
 
@@ -255,7 +255,7 @@ func (s *Service) watchKubeconfig(ctx context.Context, cfgs kubeconfig.Subscript
 	}
 }
 
-// publish is the engine's OnChange: project the pass into State, tell the claim watchers, and
+// publish is the engine's OnPass: project the pass into State, tell the claim watchers, and
 // signal the fleet when the news moved. The engine serializes it per context, and the order
 // holds — a reader the signal wakes finds the state already published.
 func (s *Service) publish(contextName string, v probe.Snapshot) {

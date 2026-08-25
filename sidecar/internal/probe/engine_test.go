@@ -232,12 +232,12 @@ func TestRegisterPanicsWithoutAProbeOrAName(t *testing.T) {
 	assert.Panics(t, func() { Register(e, "", &steered{}) })
 }
 
-// OnChange is wiring, set before the engine runs — like a registration.
-func TestOnChangePanicsAfterStart(t *testing.T) {
+// OnPass is wiring, set before the engine runs — like a registration.
+func TestOnPassPanicsAfterStart(t *testing.T) {
 	e, _, _ := single(t, Skip())
 	startEngine(t, e)
 
-	assert.Panics(t, func() { e.OnChange(func(string, Snapshot) {}) })
+	assert.Panics(t, func() { e.OnPass(func(string, Snapshot) {}) })
 }
 
 // A probe's public identity is its name; the index behind it is the engine's own.
@@ -828,10 +828,10 @@ func TestARunIsBoundedByItsTimeout(t *testing.T) {
 // --- publishing ---
 
 // The engine reports every pass; the caller decides what is news.
-func TestOnChangeFiresAfterEveryPassInOrderPerSubject(t *testing.T) {
+func TestOnPassFiresAfterEveryPassInOrderPerSubject(t *testing.T) {
 	e, _, id := single(t, Succeeded())
 	var calls []Snapshot
-	e.OnChange(func(name string, snap Snapshot) {
+	e.OnPass(func(name string, snap Snapshot) {
 		require.Equal(t, subj, name)
 		calls = append(calls, snap)
 	})

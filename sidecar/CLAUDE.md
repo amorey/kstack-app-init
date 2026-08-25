@@ -290,7 +290,7 @@ one unrecorded wedges the probe twice over: in flight forever, with its key held
 **Each of `State`'s five observations has one probe behind it**, registered with its own interval
 (a cluster's UID never moves; its readiness moves constantly). The engine owns the observables —
 one value beside one `Attempts` per probe, the value written by that probe's `Run` alone — and
-`Read`/`OnChange` hand them back as a `probe.Snapshot`, frozen at the moment it was taken.
+`Read`/`OnPass` hand them back as a `probe.Snapshot`, frozen at the moment it was taken.
 Anything reads one out of it by registration name (`probe.Get[connInfo](snap, nameConnection)`,
 the `name*` constants), which is how a `Run` reads a sibling and how `stateOf` assembles `State`
 at publish time. **A `probe.Key[T]` states that name↔type pairing once** rather than at every
@@ -361,7 +361,7 @@ that was released between the commit and the pass, which is the one a release co
 `Release` and `Close` retire what the entry holds, or a released context leaves its sockets
 behind.
 
-**Publishing is the engine's `OnChange`** — after every pass, outside the engine's lock,
+**Publishing is the engine's `OnPass`** — after every pass, outside the engine's lock,
 serialized per context. Two publish rules, because the two feeds answer different questions:
 `stateHub` carries every pass (the timing is what a claim watcher subscribed for, and the
 countdown to the next run is visible nowhere else); `signalHub` fires only when the **news**
