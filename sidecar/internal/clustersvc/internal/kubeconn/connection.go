@@ -19,6 +19,7 @@
 package kubeconn
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -74,6 +75,13 @@ type Connection struct {
 	once sync.Once
 }
 
+// newDynamic is the one seam in the build: every other failure here is reachable from a config
+// a caller can write, and this one is not — the host is already parsed and the rate limiter is
+// ours to set, so nothing a kubeconfig can say reaches it.
+var newDynamic = func(cfg *rest.Config, c *http.Client) (dynamic.Interface, error) {
+	return dynamic.NewForConfigAndClient(cfg, c)
+}
+
 // newConnection materializes the clients for one set of credentials.
 func newConnection(cfg *rest.Config) (*Connection, error) {
 	// A copy, because the tuning below is ours and the caller's config is not.
@@ -97,7 +105,7 @@ func newConnection(cfg *rest.Config) (*Connection, error) {
 
 	// NewForConfigAndClient, never NewForConfig: the latter builds a fresh client and a fresh
 	// pool, which is the whole thing one connection per context exists to avoid.
-	dyn, err := dynamic.NewForConfigAndClient(own, httpClient)
+	dyn, err := newDynamic(own, httpClient)
 	if err != nil {
 		return nil, fmt.Errorf("build dynamic client: %w", err)
 	}
@@ -137,45 +145,89 @@ var (
 	errMalformed  = errors.New("malformed response")
 )
 
-// httpErr is a response that was not 2xx. The code is the whole evidence a raw endpoint leaves,
-// so it travels as data rather than inside a formatted string.
+// httpErr is a response that was not 2xx. The code is the whole evidence most raw endpoints
+// leave, so it travels as data rather than inside a formatted string — and the body with it,
+// because /readyz answers a 500 with the component list that *is* the answer.
 type httpErr struct {
 	path   string
 	code   int
 	status string
+	body   string
 }
 
 func (e *httpErr) Error() string { return fmt.Sprintf("%s: %s", e.path, e.status) }
 
-// maxDiscard bounds what is read off a response nobody wants: enough for an error page, and
-// short of anything a hostile endpoint could stream.
-const maxDiscard = 4 << 10
+// maxBody bounds what is read off any response: enough for an error page or the readyz component
+// list, and short of anything a hostile endpoint could stream. A body past it is left unread, so
+// an HTTP/1.1 fallback drops that connection rather than reusing it.
+const maxBody = 64 << 10
 
 // getJSON reads one raw API path and decodes the response into out.
 func (c *Connection) getJSON(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL.JoinPath(path).String(), nil)
+	body, err := c.request(ctx, http.MethodGet, path, "application/json", nil)
 	if err != nil {
-		return fmt.Errorf("%w %s: %w", errBadRequest, path, err)
+		return err
 	}
-	req.Header.Set("Accept", "application/json")
+	return decode(path, body, out)
+}
 
-	resp, err := c.HTTPClient.Do(req)
+// postJSON creates one resource and decodes the answer into out.
+func (c *Connection) postJSON(ctx context.Context, path string, body []byte, out any) error {
+	answer, err := c.request(ctx, http.MethodPost, path, "application/json", body)
 	if err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+		return err
 	}
-	defer resp.Body.Close()
+	return decode(path, answer, out)
+}
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		// Drained so the connection can be reused: an HTTP/1.1 fallback will not take it
-		// back with a body outstanding, and a probe that is refused gets one of these every
-		// cadence. Bounded, since the body is an error page we do not read.
-		_, _ = io.CopyN(io.Discard, resp.Body, maxDiscard)
-		return &httpErr{path: path, code: resp.StatusCode, status: resp.Status}
-	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+// getText reads one raw API path that answers in plain text.
+func (c *Connection) getText(ctx context.Context, path string) (string, error) {
+	return c.request(ctx, http.MethodGet, path, "text/plain", nil)
+}
+
+func decode(path, body string, out any) error {
+	if err := json.Unmarshal([]byte(body), out); err != nil {
 		return fmt.Errorf("%w from %s: %w", errMalformed, path, err)
 	}
 	return nil
+}
+
+// request performs one request against a raw API path and hands back its body.
+func (c *Connection) request(ctx context.Context, method, path, accept string, payload []byte) (string, error) {
+	var body io.Reader
+	if payload != nil {
+		body = bytes.NewReader(payload)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL.JoinPath(path).String(), body)
+	if err != nil {
+		return "", fmt.Errorf("%w %s: %w", errBadRequest, path, err)
+	}
+	req.Header.Set("Accept", accept)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	// Read either way: a body is drained so the connection can be reused, and on the one
+	// endpoint that answers a failure with detail it is what the probe came for.
+	read, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// Before the read error, because the status line already arrived and is the stronger
+		// evidence: a 403 whose error page stops mid-stream is still a grant to fix, where a
+		// malformed answer would point at a proxy. Whatever arrived rides along, since the
+		// one endpoint that answers a failure with detail may have been cut off mid-list.
+		return "", &httpErr{path: path, code: resp.StatusCode, status: resp.Status, body: string(read)}
+	}
+	if readErr != nil {
+		return "", fmt.Errorf("%w from %s: %w", errMalformed, path, readErr)
+	}
+	return string(read), nil
 }
 
 // classify names why a request failed.

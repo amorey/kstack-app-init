@@ -195,8 +195,8 @@ type key struct {
 // itself cannot be typed.
 type observable struct {
 	// value is the last committed answer, nil until a run commits one, and seen is when a run
-	// last confirmed it. Every success stamps seen, whether or not it committed a new value: a
-	// run that found the answer unchanged still read it.
+	// last confirmed it: whenever one is committed, and on a success that found the standing
+	// answer unchanged — which still read it.
 	value any
 	seen  time.Time
 	// skipped marks a last run that returned Skip — the one memory a Skip leaves. It records
@@ -278,7 +278,7 @@ func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) {
 		if prev != nil {
 			pv = prev.(T)
 		}
-		pass := &Pass[T]{subject: subjectName, prev: pv, snap: snap}
+		pass := &Pass[T]{subject: subjectName, prev: pv, known: prev != nil, snap: snap}
 		// A run that panics has still committed whatever it committed before it did, and the
 		// engine applies none of it — so it is handed back here, on the way out to the
 		// recover that turns the panic into a result.
@@ -734,13 +734,14 @@ func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, v
 			Err:        res.err,
 		})
 		a.skipped = false
-		if res.verdict == VerdictSucceeded && (val != nil || a.value != nil) {
-			// seen dates the value, so a success with nothing to date leaves it alone: a
-			// reader's Known guard would otherwise pass and hand it the zero value.
-			a.seen = now
-		}
-		if val != nil {
-			a.value = val
+		switch {
+		case val != nil:
+			// seen dates the value, and a value is confirmed when it is committed —
+			// whatever the verdict, since a run that failed can still have read something
+			// (which components are down). Dating it by the last success instead would
+			// leave this answer undated, and would date a replaced one by a read of what
+			// it replaced.
+			a.value, a.seen = val, now
 			// A committed value is one that moved — the body says so by handing one back at
 			// all — and whoever reads it is owed a run against the new one. Queued in the same
 			// critical section as the write, so no reader sees the value without the runs it
@@ -749,6 +750,11 @@ func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, v
 			for _, watcher := range e.watchers[k.probe] {
 				e.runQ.Add(key{subject: k.subject, probe: watcher})
 			}
+		case res.verdict == VerdictSucceeded && a.value != nil:
+			// Nothing new, and the run confirmed what stands. A success with nothing to
+			// date leaves seen alone: a reader's Known guard would otherwise pass and hand
+			// it the zero value.
+			a.seen = now
 		}
 	case resultSkip:
 		if ran {

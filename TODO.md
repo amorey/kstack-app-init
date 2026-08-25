@@ -31,15 +31,15 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   connection once. The connection probe cannot declare a watch edge on the identity probes
   (`resolveLocked` takes only already-registered names, which is what keeps the graph acyclic), so
   promptness comes from `publish` calling `Wake(contextName, nameConnection)` when identity moves —
-  a `Wake` is not an edge. **Trigger:** the serverUID probe, the first thing that can produce an
-  identity to compare. → [ADR: the connection probe dials
-  /api](docs/adr/2026-08-25-connection-probe-dial.md).
+  a `Wake` is not an edge. **The trigger has fired**: serverUID, serverVersion and principal all
+  answer now, so `State.Identity()` is populated and nothing acts on it moving. → [ADR: the
+  connection probe dials /api](docs/adr/2026-08-25-connection-probe-dial.md).
 
 - **`classify` has no `*apierrors.StatusError` branch.** Every probe reads a raw endpoint today, so
   a status code is the whole evidence and `statusReason` covers it. **Trigger:** the first probe
   that goes through `Connection.Dynamic`, which returns the API's own reason — classifying that on
   the status code alone discards what the typed half already knows (`state.go` states the rule).
-  `postJSON` lands on the same schedule, with the principal probe's SelfSubjectReview.
+  Every probe reads a raw path today, so nothing has reached it yet.
 
 - **`kubeconn`'s presence queue has no debounce.** `presence` is an `internal/workqueue` queue
   (`sidecar/internal/clustersvc/internal/kubeconn/service.go`): `Acquire` adds a context the first

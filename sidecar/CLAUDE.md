@@ -65,9 +65,10 @@ each cache, carrying the pause switch (`cacheSyncEnabled`: the cluster's toggles
 cache is still the active identity). Served: the whole `Clusters()` family except `WatchSchedule`,
 plus `Caches()`' point reads (`Get`/`List`/`ListByCluster`) and its unscoped watches
 (`Watch`/`WatchList`). That is enough for the kube-context picker, which reads
-`clustersWatch` alone. **No cache exists at runtime yet**: creation keys off `status.server.uid` and
-nothing writes it until the serverUID probe lands, so those reads answer empty — and no catalog
-either, since one is only written for a cache. There is no connection manager, discovery pass, sync
+`clustersWatch` alone. **A cache now exists at runtime**: the serverUID probe writes `status.server.uid`, which is what
+`ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
+one — and a `ClusterCachedCatalog` beneath it. Everything below the catalog is still empty: nothing
+discovers kinds or syncs content. There is no connection manager, discovery pass, sync
 worker, or on-disk cache; `CachedCatalogs()` serves nothing yet, and the two families below it have
 no producer at all.
 
@@ -300,10 +301,16 @@ connection is the only observable another probe reads, so it is the only one key
 endpoint into `State.Connection`, and `newsOf` walks `probeNames` for the untyped per-probe read.
 
 **A `Run` takes a `probe.Pass[T]` and returns only its `Result`.** The pass carries the run's
-inputs — `Subject()`, `Prev()`, `Snapshot()` — and `pass.Commit(v)` records what the run found,
+inputs — `Subject()`, `Prev()`, `Known()`, `Snapshot()` — and `pass.Commit(v)` records what the run found,
 wherever in the body it learns it. The engine buffers that and applies it when the run returns,
 in the same critical section as the attempt: nothing is published mid-run, the last call wins,
 and a run that then concludes `Skip` or panics commits nothing.
+
+**`Known()` is what a probe whose zero `T` is an answer needs.** `Prev()` cannot tell "nothing has
+landed" from "the last answer was the zero value", and the engine dates an observation by its
+*value* — so readiness (healthy is the empty `ComponentStatus`) would never commit, and a cluster
+that has never had a failing component would read as never observed. Its guard is
+`!pass.Known() || the set moved`.
 
 **Commit only on a change.** A committed value is what tells the engine the value moved, and so
 what re-runs every probe watching it — commit unconditionally and the four behind the connection
@@ -373,9 +380,10 @@ resolver tests' fake. The layering exception is in `service.go`'s package doc.
 connection, so a connection always exists before anything can identify the server behind it — a
 field stamped at build time would be empty for every connection's life. `State.Identity()` is the
 read surface, and it is comparable so a holder can compare: `Identity` carries no errors, since why
-a field is missing belongs on the `Observation` that could not read it. Retiring a connection
-because the *server* behind unchanged credentials moved is specified and unbuilt — it lands with
-the serverUID probe, which is the first thing that can produce an identity to compare. Note what a username change does
+a field is missing belongs on the `Observation` that could not read it. **Retiring a connection
+because the *server* behind unchanged credentials moved is specified and unbuilt**, and the probes
+that would drive it now answer — so a cluster rebuilt behind one endpoint keeps the connection its
+holders derived from, and `Connection.Done()` never fires for it. `TODO.md` carries the design. Note what a username change does
 **not** cover: ordinary RBAC edits leave it identical, so permissions need the
 `SelfSubjectRulesReview` behind `ClusterPermissions`.
 
@@ -387,7 +395,11 @@ read, and none implies the others — so `Connection`, `Readiness`, `ServerUID`,
 
 **An `Observation` keeps its value through a failure** — a read that stops being permitted does not
 mean the fact changed — and `LastSeen` is what makes the survivor readable: *identified, as of
-10:00* is usable where *ready, as of 10:00* is not. Beside the value it holds two `Attempt`s and a
+10:00* is usable where *ready, as of 10:00* is not. **`LastSeen` dates the value, not the verdict**:
+it moves whenever a value is committed, whatever the run concluded, and on a success that
+re-confirms the standing one. A failing run can still have *read* something — which components are
+down — so dating that by the last success would leave it undated, and would date a replaced answer
+by a read of what it replaced. Beside the value it holds two `Attempt`s and a
 failure run: `Failures` with `FailingSince`, because the ladder widens and a count does not give
 elapsed time. `Known()` is has-ever-answered, `OK()` is answered-last-time, `InFlight()` is
 running-now.

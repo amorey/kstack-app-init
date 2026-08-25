@@ -16,15 +16,17 @@
 // Scheduling belongs to the engine (internal/probe) — each probe behind reachability declares its
 // dependency on the connection rather than testing it.
 //
-// Only the connection probe is implemented. For the four behind it the engine records
-// DependencyFailed while the connection has not succeeded — their correct behavior once they
-// exist.
+// While the connection has not succeeded the engine records the four behind it as
+// DependencyFailed rather than dialing: one timeout per cycle, not one per probe.
 package kubeconn
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
@@ -75,10 +77,53 @@ func registerProbes(e *probe.Engine, kubecfg kubeconfigService) {
 	// The four behind reachability declare both edges on it: they cannot run without a
 	// connection, and a connection that moves must re-run them.
 	dependsOnConn, watchesConn := probe.WithDependencies(nameConnection), probe.WithWatches(nameConnection)
-	probe.Register(e, nameReadiness, unimplemented[ComponentStatus]{"readiness"}, probe.WithInterval(30*time.Second), dependsOnConn, watchesConn)
-	probe.Register(e, nameServerUID, unimplemented[string]{"serverUID"}, probe.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
-	probe.Register(e, nameServerVersion, unimplemented[VersionInfo]{"serverVersion"}, probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
-	probe.Register(e, namePrincipal, unimplemented[Principal]{"principal"}, probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
+	probe.Register(e, nameReadiness, readinessProbe{}, probe.WithInterval(30*time.Second), dependsOnConn, watchesConn)
+	probe.Register(e, nameServerUID, serverUIDProbe{}, probe.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
+	probe.Register(e, nameServerVersion, serverVersionProbe{}, probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
+	probe.Register(e, namePrincipal, principalProbe{}, probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
+}
+
+// The paths the four probes behind reachability read. selfSubjectReviewPath is
+// authentication.k8s.io/v1 from 1.27 on, so an older server answers it with a 404.
+const (
+	readyzPath            = "/readyz"
+	kubeSystemPath        = "/api/v1/namespaces/kube-system"
+	versionPath           = "/version"
+	selfSubjectReviewPath = "/apis/authentication.k8s.io/v1/selfsubjectreviews"
+)
+
+// selfSubjectReviewBody is what is posted to selfSubjectReviewPath. A create endpoint decodes a
+// resource from the request body, so an empty POST is a 400 and the username silently comes back
+// missing; the server fills in the status itself. Sent raw rather than through a typed client,
+// which would link the API types this binary keeps out.
+var selfSubjectReviewBody = []byte(`{"apiVersion":"authentication.k8s.io/v1","kind":"SelfSubjectReview"}`)
+
+// connFrom is the connection a probe behind reachability runs over. Nil is unreachable while the
+// engine holds them behind the connection probe's success — a departure commits no connection and
+// suspends, which reads as a failed dependency — so a run that finds one parks for the wake the
+// connection's next move sends rather than recording an answer no request produced.
+func connFrom(snap probe.Snapshot) *Connection { return keyConnection.From(snap).Value.conn }
+
+// failed is what a run concluded from a request that did not answer.
+//
+// Cancellation is the caller going away — the engine stopping, not the cluster — so the run
+// records nothing at all rather than opening a failure streak against a server that refused
+// nothing. Every other error is classified.
+func failed(err error) probe.Result {
+	if errors.Is(err, context.Canceled) {
+		return probe.Skip()
+	}
+	return probe.Fail(classify(err), err)
+}
+
+// endpointGone reports whether err is the 404 that means the endpoint itself is absent.
+//
+// **Only the probe knows which 404 it is looking at**: an object that is missing is news about the
+// cluster and a probe that keeps asking, an endpoint that is missing is terminal for this
+// connection. Classifying on the status code alone suspends a probe that should have kept running.
+func endpointGone(err error) bool {
+	var status *httpErr
+	return errors.As(err, &status) && status.code == http.StatusNotFound
 }
 
 // apiDiscoveryPath is the one request this probe makes: the cheapest that proves the whole path
@@ -147,12 +192,9 @@ func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) p
 		Versions []string `json:"versions"`
 	}
 	if err := next.conn.getJSON(ctx, apiDiscoveryPath, &discovery); err != nil {
-		if errors.Is(err, context.Canceled) {
-			// The caller went away: nothing about the cluster to record. The engine
-			// hands the committed value back through Discard.
-			return probe.Skip()
-		}
-		return probe.Fail(classify(err), err)
+		// A cancellation records nothing, and the engine hands the connection this run
+		// built back through Discard.
+		return failed(err)
 	}
 	if len(discovery.Versions) == 0 {
 		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without API versions", apiDiscoveryPath))
@@ -173,13 +215,170 @@ func (p *connectionProbe) Discard(v connInfo) {
 	}
 }
 
-// unimplemented stands in for a probe with no request behind it yet. Unreachable while nothing
-// dials — each needs a connection that never succeeds — and it records rather than going quiet,
-// so a run that does reach it says so instead of looking suspended for no reason.
-type unimplemented[T any] struct {
-	name string
+// readinessProbe reads the API server's own account of whether it is fit to serve.
+//
+// /readyz is the one endpoint whose *failure* carries the answer: a 500 body names the checks that
+// are not ok, and a probe reading only the status code would know the cluster is unwell without
+// being able to say which part.
+type readinessProbe struct{}
+
+func (readinessProbe) Run(ctx context.Context, pass *probe.Pass[ComponentStatus]) probe.Result {
+	conn := connFrom(pass.Snapshot())
+	if conn == nil {
+		return probe.Skip()
+	}
+
+	_, err := conn.getText(ctx, readyzPath)
+	var status *httpErr
+	switch {
+	case err == nil:
+		commitStatus(pass, ComponentStatus{})
+		return probe.Succeeded()
+	case endpointGone(err):
+		// A managed distribution that withholds it will not start serving it: terminal for
+		// this connection, and a new one re-arms the probe.
+		return probe.Suspend(ReasonUnsupported, "the server does not serve "+readyzPath)
+	case errors.As(err, &status) && status.code == http.StatusInternalServerError:
+		failing := failingComponents(status.body)
+		if len(failing) == 0 {
+			// A 500 from something that is not the readyz handler: it answered, but not
+			// with the one thing this endpoint's failure is supposed to carry.
+			return probe.Fail(ReasonInternalError, err)
+		}
+		commitStatus(pass, ComponentStatus{Failing: failing})
+		return probe.Fail(ReasonComponentsFailing, fmt.Errorf("%s: %s", readyzPath, strings.Join(failing, ", ")))
+	default:
+		return failed(err)
+	}
 }
 
-func (u unimplemented[T]) Run(context.Context, *probe.Pass[T]) probe.Result {
-	return probe.Suspend(ReasonInternal, u.name+" probe is not implemented")
+// commitStatus records what /readyz said, on the first answer and whenever the set moves after
+// it. Two guards, because a healthy server's answer *is* the zero value: without the first, a
+// cluster that has never had a failing component never commits, and its readiness reads as never
+// observed. ComponentStatus carries a slice, so neither can be the == the comparable observables
+// use.
+func commitStatus(pass *probe.Pass[ComponentStatus], next ComponentStatus) {
+	if !pass.Known() || !slices.Equal(next.Failing, pass.Prev().Failing) {
+		pass.Commit(next)
+	}
+}
+
+// failingComponents are the checks a readyz body reports as not ok, in the order it named them.
+// Every check is a line — "[+]etcd ok" or "[-]etcd failed: reason withheld" — whether or not
+// verbose was asked for, so the plain endpoint carries the detail and no query string is needed.
+func failingComponents(body string) []string {
+	var failing []string
+	for line := range strings.Lines(body) {
+		name, ok := strings.CutPrefix(strings.TrimSpace(line), "[-]")
+		if !ok {
+			continue
+		}
+		name, _, _ = strings.Cut(name, " ")
+		if name != "" {
+			failing = append(failing, name)
+		}
+	}
+	return failing
+}
+
+// serverUIDProbe reads kube-system's UID, conventionally the cluster's own identity: the one thing
+// that tells a rebuilt cluster from the one that was there before, behind credentials and an
+// endpoint that never moved.
+type serverUIDProbe struct{}
+
+func (serverUIDProbe) Run(ctx context.Context, pass *probe.Pass[string]) probe.Result {
+	conn := connFrom(pass.Snapshot())
+	if conn == nil {
+		return probe.Skip()
+	}
+
+	var ns struct {
+		Metadata struct {
+			UID string `json:"uid"`
+		} `json:"metadata"`
+	}
+	if err := conn.getJSON(ctx, kubeSystemPath, &ns); err != nil {
+		if endpointGone(err) {
+			// The namespace is absent, not the endpoint — news about the cluster, and a
+			// probe that keeps asking, since it can be created.
+			return probe.Fail(ReasonNotFound, err)
+		}
+		return failed(err)
+	}
+	if ns.Metadata.UID == "" {
+		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a UID", kubeSystemPath))
+	}
+
+	if ns.Metadata.UID != pass.Prev() {
+		pass.Commit(ns.Metadata.UID)
+	}
+	return probe.Succeeded()
+}
+
+// serverVersionProbe reads the API server's reported version.
+type serverVersionProbe struct{}
+
+func (serverVersionProbe) Run(ctx context.Context, pass *probe.Pass[VersionInfo]) probe.Result {
+	conn := connFrom(pass.Snapshot())
+	if conn == nil {
+		return probe.Skip()
+	}
+
+	var body struct {
+		GitVersion string `json:"gitVersion"`
+		Major      string `json:"major"`
+		Minor      string `json:"minor"`
+	}
+	if err := conn.getJSON(ctx, versionPath, &body); err != nil {
+		return failed(err)
+	}
+	if body.GitVersion == "" {
+		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a version", versionPath))
+	}
+
+	next := VersionInfo{GitVersion: body.GitVersion, Major: body.Major, Minor: body.Minor}
+	if next != pass.Prev() {
+		pass.Commit(next)
+	}
+	return probe.Succeeded()
+}
+
+// principalProbe asks the server who these credentials authenticate as, which is the only
+// authoritative answer: a token names its subject to the server, not to us.
+type principalProbe struct{}
+
+func (principalProbe) Run(ctx context.Context, pass *probe.Pass[Principal]) probe.Result {
+	conn := connFrom(pass.Snapshot())
+	if conn == nil {
+		return probe.Skip()
+	}
+
+	var review struct {
+		Status struct {
+			UserInfo struct {
+				Username string   `json:"username"`
+				Groups   []string `json:"groups"`
+			} `json:"userInfo"`
+		} `json:"status"`
+	}
+	if err := conn.postJSON(ctx, selfSubjectReviewPath, selfSubjectReviewBody, &review); err != nil {
+		if endpointGone(err) {
+			// A server too old to serve it will not grow the endpoint under us. Terminal
+			// for this connection, and a new one re-arms the probe.
+			return probe.Suspend(ReasonUnsupported, "the server does not serve "+selfSubjectReviewPath)
+		}
+		return failed(err)
+	}
+	if review.Status.UserInfo.Username == "" {
+		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a username", selfSubjectReviewPath))
+	}
+
+	next := Principal{Username: review.Status.UserInfo.Username, Groups: review.Status.UserInfo.Groups}
+	// Sorted, so a server listing the same groups in another order is not a change every
+	// watcher of this value has to be woken for.
+	slices.Sort(next.Groups)
+	if next.Username != pass.Prev().Username || !slices.Equal(next.Groups, pass.Prev().Groups) {
+		pass.Commit(next)
+	}
+	return probe.Succeeded()
 }

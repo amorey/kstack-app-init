@@ -22,7 +22,7 @@ import (
 
 // A body reads its inputs off the pass, and a body with no news leaves it alone.
 func TestAPassCarriesTheRunsInputsAndRecordsNothingByDefault(t *testing.T) {
-	p := NewPass("ctx-1", "v0", Snapshot{})
+	p := NewPass("ctx-1", ptr("v0"), Snapshot{})
 
 	assert.Equal(t, "ctx-1", p.Subject())
 	assert.Equal(t, "v0", p.Prev())
@@ -34,7 +34,7 @@ func TestAPassCarriesTheRunsInputsAndRecordsNothingByDefault(t *testing.T) {
 // One run, one value: a body that learns twice records the second, so the engine has one thing
 // to apply and the watchers one thing to wake for.
 func TestTheLastCommitOnAPassWins(t *testing.T) {
-	p := NewPass("ctx-1", "v0", Snapshot{})
+	p := NewPass("ctx-1", ptr("v0"), Snapshot{})
 
 	p.Commit("v1")
 	p.Commit("v2")
@@ -54,7 +54,23 @@ func TestAPassCarriesTheSnapshotItWasHanded(t *testing.T) {
 	runNext(t, e)
 	read, _ := e.Read(subj)
 
-	p := NewPass("ctx-1", "v0", read)
+	p := NewPass("ctx-1", ptr("v0"), read)
 
 	assert.Equal(t, "v1", Get[string](p.Snapshot(), "conn").Value)
+}
+
+// ptr is the prior value a pass carries, which NewPass takes by pointer so a test can say a
+// probe has committed nothing at all.
+func ptr[T any](v T) *T { return &v }
+
+// A probe whose zero T is a legitimate answer needs to tell "nothing has landed" from "the last
+// answer was the zero value", which Prev alone cannot say.
+func TestPassReportsWhetherAValueHasLanded(t *testing.T) {
+	fresh := NewPass[string]("ctx-1", nil, Snapshot{})
+	assert.False(t, fresh.Known())
+	assert.Empty(t, fresh.Prev())
+
+	landed := NewPass("ctx-1", ptr(""), Snapshot{})
+	assert.True(t, landed.Known(), "the zero value is still a value that landed")
+	assert.Empty(t, landed.Prev())
 }

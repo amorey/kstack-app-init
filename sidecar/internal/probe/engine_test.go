@@ -862,13 +862,14 @@ func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {
 	require.True(t, seen.Known())
 
 	p.set(Fail("Unreachable", assert.AnError))
+	p.commitsNothing()
 	e.Wake(subj, "conn")
 	runNext(t, e)
 
 	read, _ = e.Read(subj)
 	after := Get[string](read, "conn")
 	assert.Equal(t, "uid-1", after.Value, "the value outlives the failure")
-	assert.Equal(t, seen.LastSeen, after.LastSeen, "a failure is not a read")
+	assert.Equal(t, seen.LastSeen, after.LastSeen, "a failure that read nothing is not a read")
 	assert.False(t, after.OK())
 }
 
@@ -1072,4 +1073,70 @@ func TestAnAppliedValueIsNotHandedBack(t *testing.T) {
 	}, testutil.Timeout, time.Millisecond, "the value to land")
 	_, dropped := p.discarded.TryAwait()
 	assert.False(t, dropped, "an applied value is not a dropped one")
+}
+
+// The engine is what tells a body a value has landed, so a probe committing the zero T lands it
+// once and reads as known from then on — without which such a probe reports itself never
+// observed for as long as its answer stays the zero value.
+func TestTheZeroValueLandsAndReadsAsKnown(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	seen := testutil.NewProbe[bool](4)
+	Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
+		seen.Fire(pass.Known())
+		if !pass.Known() {
+			pass.Commit("")
+		}
+		return Succeeded()
+	}), WithInterval(time.Millisecond))
+	stop := e.Start(t.Context())
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	e.Add("prod")
+
+	assert.False(t, seen.Await(t, "the first run"), "nothing has landed yet")
+	assert.True(t, seen.Await(t, "the run after it"), "the zero value it committed")
+	require.Eventually(t, func() bool {
+		snap, ok := e.Read("prod")
+		return ok && Get[string](snap, "conn").Known()
+	}, testutil.Timeout, time.Millisecond, "the observation to date itself")
+}
+
+// A run that failed can still have read something — which components are down — so the value it
+// commits is dated now. Dating it by the last success instead leaves a value nothing has ever
+// confirmed, and a probe that has only ever failed reads as never observed while holding the
+// answer a caller came for.
+func TestAFailedRunsCommittedValueIsDated(t *testing.T) {
+	e, p, name := single(t, Fail("Unreachable", assert.AnError))
+	p.commits("etcd")
+	stop := e.Start(t.Context())
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	e.Add("prod")
+
+	require.Eventually(t, func() bool {
+		snap, ok := e.Read("prod")
+		return ok && Get[string](snap, name).Known()
+	}, testutil.Timeout, time.Millisecond, "the failing answer to be dated")
+	snap, _ := e.Read("prod")
+	assert.Equal(t, "etcd", Get[string](snap, name).Value)
+	assert.False(t, Get[string](snap, name).OK(), "dated, and still a failure")
+}
+
+// A success that commits nothing re-confirms what stands, which is what makes "identified, as of
+// 10:00" readable — but a success with nothing to date must leave seen alone, or a reader's Known
+// guard passes and hands it the zero value.
+func TestASuccessWithNothingToDateLeavesTheObservationUnknown(t *testing.T) {
+	e, _, name := single(t, Succeeded())
+	stop := e.Start(t.Context())
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	e.Add("prod")
+
+	require.Eventually(t, func() bool {
+		snap, ok := e.Read("prod")
+		return ok && Get[string](snap, name).OK()
+	}, testutil.Timeout, time.Millisecond, "the run to land")
+	snap, _ := e.Read("prod")
+	assert.False(t, Get[string](snap, name).Known(), "nothing was ever read")
 }

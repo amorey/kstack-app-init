@@ -17,6 +17,7 @@ package kubeconn
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -400,6 +401,37 @@ func TestConnReportsThatThereIsNoConnection(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNoConnection)
 }
 
+// A commit that lands after the pass worker has stopped leaves the connection in the engine and
+// nowhere else, so Close reads it back rather than retiring only what the entries hold.
+func TestCloseRetiresTheConnectionTheEngineHolds(t *testing.T) {
+	s := New(serving(serveCluster(t).Server, "prod", "key-1"))
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+	awaitState(t, watched, func(st State) bool { return st.Phase() == PhaseProbed })
+	conn, err := lease.Conn(t.Context())
+	require.NoError(t, err)
+
+	require.NoError(t, s.Close())
+
+	<-conn.Done()
+}
+
+// A claim the pool no longer holds has no connection to answer with, and saying so is what stops
+// a holder reading one belonging to whatever claims the name next.
+func TestConnReportsNothingOnceTheClaimIsReleased(t *testing.T) {
+	s := New(resolving("prod", "key-1"))
+	lease := s.Acquire("prod")
+	lease.Release()
+
+	conn, err := lease.Conn(t.Context())
+
+	assert.Nil(t, conn)
+	assert.ErrorIs(t, err, ErrNoConnection)
+}
+
 // --- the news: a context leaving the kubeconfig ---
 
 // The one thing a holder is told without asking. It learns what changed by asking the claim.
@@ -673,4 +705,24 @@ func TestTheKubeconfigWatchEndsWhenItsFeedCloses(t *testing.T) {
 	cfgs.Close()
 
 	testutil.WaitReturn(t, func() { s.watchKubeconfig(context.Background(), cfgs) }, "the watch to end")
+}
+
+// A cluster that has never been ready still has an answer worth reading: the failing components
+// are what a caller came for, and an observation nothing dates reads as never observed.
+func TestAFailingReadinessAnswerIsDated(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(readyzPath, http.StatusInternalServerError, "[-]etcd failed: reason withheld\nreadyz check failed\n")
+	s := New(serving(cs.Server, "prod", "key-1"))
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+
+	st := awaitState(t, watched, func(st State) bool { return st.Readiness.LastAttempt.Done() })
+
+	assert.Equal(t, ReasonComponentsFailing, st.Readiness.LastAttempt.Reason)
+	assert.Equal(t, []string{"etcd"}, st.Readiness.Value.Failing)
+	assert.True(t, st.Readiness.Known(), "the component list was read")
+	assert.False(t, st.Readiness.OK(), "read, and not ready")
 }

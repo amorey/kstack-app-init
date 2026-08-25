@@ -15,7 +15,9 @@
 package kubeconn
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/http"
 	"testing"
 	"time"
@@ -31,7 +33,7 @@ import (
 // recorded the way the engine would.
 func connect(t *testing.T, cfg *fakeKubeconfig, v connInfo) (probe.Result, connInfo) {
 	t.Helper()
-	pass := probe.NewPass("prod", v, probe.Snapshot{})
+	pass := probe.NewPass("prod", &v, probe.Snapshot{})
 	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
 	if next, ok := pass.Updated(); ok {
 		v = next
@@ -47,7 +49,7 @@ func TestTheConnectionProbeCommitsOnlyOnAChange(t *testing.T) {
 	_, first := connect(t, cfg, connInfo{departed: true})
 	require.False(t, first.departed, "the context resolves, so it is back")
 
-	pass := probe.NewPass("prod", first, probe.Snapshot{})
+	pass := probe.NewPass("prod", &first, probe.Snapshot{})
 	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
 
 	assert.Equal(t, ReasonUnreachable, res.Reason())
@@ -179,7 +181,7 @@ func TestConnectionKeepsItsConnectionWhileTheCredentialsHold(t *testing.T) {
 	_, first := connect(t, cfg, connInfo{})
 	require.NotNil(t, first.conn)
 
-	pass := probe.NewPass("prod", first, probe.Snapshot{})
+	pass := probe.NewPass("prod", &first, probe.Snapshot{})
 	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
 
 	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
@@ -255,19 +257,6 @@ func TestConnectionBuildsAgainAfterABuildThatFailed(t *testing.T) {
 
 	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
 	assert.NotNil(t, built.conn, "the fingerprint did not move, but there was no connection")
-}
-
-// Unreachable while the connection never succeeds, and it says so rather than going quiet — a
-// probe that suspends without a reason is one nobody can explain.
-func TestAnUnimplementedProbeRecordsWhy(t *testing.T) {
-	pass := probe.NewPass("prod", ComponentStatus{}, probe.Snapshot{})
-	res := unimplemented[ComponentStatus]{"readiness"}.Run(t.Context(), pass)
-
-	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
-	assert.Equal(t, ReasonInternal, res.Reason())
-	assert.Contains(t, res.Message(), "readiness")
-	_, recorded := pass.Updated()
-	assert.False(t, recorded)
 }
 
 // --- through the engine ---
@@ -356,4 +345,329 @@ func TestDiscardRetiresWhatTheRunBuilt(t *testing.T) {
 // shape of a dropped one.
 func TestDiscardOfAValueWithNoConnectionIsANoOp(t *testing.T) {
 	(&connectionProbe{}).Discard(connInfo{departed: true})
+}
+
+// --- readiness ---
+
+// A healthy server's answer is the zero ComponentStatus, so the first one has to be committed
+// even though it equals what Prev reads: the value is what dates the observation, and a cluster
+// that has never had a failing component would otherwise read as never observed.
+func TestReadinessCommitsItsFirstHealthyAnswer(t *testing.T) {
+	conn := connTo(t, serveCluster(t).Server)
+
+	res, v, committed := runProbe(t, readinessProbe{}, conn, nil)
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.True(t, committed, "the first answer lands whatever it says")
+	assert.Empty(t, v.Failing)
+}
+
+// Every healthy answer after it moves nothing, and the engine wakes whoever watches a committed
+// value — so a cluster that stays ready must stop committing.
+func TestReadinessCommitsNothingWhileTheServerStaysReady(t *testing.T) {
+	conn := connTo(t, serveCluster(t).Server)
+
+	res, _, committed := runProbe(t, readinessProbe{}, conn, &ComponentStatus{})
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.False(t, committed)
+}
+
+// The endpoint's failure is its answer: a 500 names the checks that are not ok, which is the
+// whole reason to ask a server whether it is ready rather than whether it answers.
+func TestReadinessNamesTheComponentsThatFailed(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(readyzPath, http.StatusInternalServerError,
+		"[+]ping ok\n[-]etcd failed: reason withheld\n[+]log ok\n[-]informer-sync failed: reason withheld\nreadyz check failed\n")
+
+	res, v, committed := runProbe(t, readinessProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, ReasonComponentsFailing, res.Reason())
+	assert.Equal(t, []string{"etcd", "informer-sync"}, v.Failing)
+	assert.True(t, committed)
+	assert.Contains(t, res.Err().Error(), "etcd")
+}
+
+// A 500 from something that is not the readyz handler answered, but not with the one thing this
+// endpoint's failure is supposed to carry.
+func TestReadinessReportsA500ThatNamesNothing(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(readyzPath, http.StatusInternalServerError, "internal server error\n")
+
+	res, _, committed := runProbe(t, readinessProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, ReasonInternalError, res.Reason())
+	assert.False(t, committed)
+}
+
+// Some managed distributions do not serve it at all, and will not start: terminal for this
+// connection rather than a failure to retry.
+func TestReadinessSuspendsWhenTheEndpointIsAbsent(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(readyzPath, http.StatusNotFound, "404 page not found")
+
+	res, _, _ := runProbe(t, readinessProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
+	assert.Equal(t, ReasonUnsupported, res.Reason())
+}
+
+func TestReadinessClassifiesAnythingElse(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(readyzPath, http.StatusForbidden, "no")
+
+	res, _, _ := runProbe(t, readinessProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, ReasonForbidden, res.Reason())
+}
+
+// A cluster that recovers has to clear what it reported, or the last failure stands as the
+// answer for as long as the connection lives.
+func TestReadinessClearsWhatItReportedWhenTheServerRecovers(t *testing.T) {
+	conn := connTo(t, serveCluster(t).Server)
+
+	res, v, committed := runProbe(t, readinessProbe{}, conn, &ComponentStatus{Failing: []string{"etcd"}})
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.True(t, committed)
+	assert.Empty(t, v.Failing)
+}
+
+// The engine wakes every probe watching a committed value, so a set that did not move must not
+// be committed again.
+func TestReadinessCommitsOnlyWhenTheSetMoves(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(readyzPath, http.StatusInternalServerError, "[-]etcd failed: reason withheld\nreadyz check failed\n")
+
+	_, _, committed := runProbe(t, readinessProbe{}, connTo(t, cs.Server), &ComponentStatus{Failing: []string{"etcd"}})
+
+	assert.False(t, committed)
+}
+
+func TestReadinessParksWithoutAConnection(t *testing.T) {
+	res, _, _ := runProbe(t, readinessProbe{}, nil, nil)
+
+	assert.True(t, res.IsSkip())
+}
+
+// --- serverUID ---
+
+func TestServerUIDReadsKubeSystem(t *testing.T) {
+	cs := serveCluster(t)
+
+	res, v, committed := runProbe(t, serverUIDProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, "uid-1", v)
+	assert.True(t, committed)
+	assert.Equal(t, kubeSystemPath, cs.requests.Await(t, "the namespace read"))
+}
+
+func TestServerUIDCommitsOnlyWhenTheUIDMoves(t *testing.T) {
+	uid := "uid-1"
+
+	res, _, committed := runProbe(t, serverUIDProbe{}, connTo(t, serveCluster(t).Server), &uid)
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.False(t, committed)
+}
+
+// The trap the reason vocabulary exists for: this 404 is the namespace, not the endpoint, so the
+// probe keeps asking — kube-system can be created.
+func TestServerUIDReportsAMissingNamespaceAsNotFound(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(kubeSystemPath, http.StatusNotFound, `{"kind":"Status","reason":"NotFound"}`)
+
+	res, _, _ := runProbe(t, serverUIDProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, ReasonNotFound, res.Reason())
+}
+
+// A namespace-scoped user reads this as a grant to fix, which is what tells a healthy cluster
+// with no cache from an unreachable one.
+func TestServerUIDReportsAForbiddenRead(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(kubeSystemPath, http.StatusForbidden, "no")
+
+	res, _, _ := runProbe(t, serverUIDProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, ReasonForbidden, res.Reason())
+}
+
+func TestServerUIDReportsANamespaceWithNoUID(t *testing.T) {
+	cs := serveCluster(t)
+	cs.answer(kubeSystemPath, `{"metadata":{"name":"kube-system"}}`)
+
+	res, _, committed := runProbe(t, serverUIDProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, ReasonMalformed, res.Reason())
+	assert.False(t, committed)
+}
+
+func TestServerUIDParksWithoutAConnection(t *testing.T) {
+	res, _, _ := runProbe(t, serverUIDProbe{}, nil, nil)
+
+	assert.True(t, res.IsSkip())
+}
+
+// --- serverVersion ---
+
+func TestServerVersionReadsTheReportedVersion(t *testing.T) {
+	res, v, committed := runProbe(t, serverVersionProbe{}, connTo(t, serveCluster(t).Server), nil)
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, VersionInfo{GitVersion: "v1.31.4", Major: "1", Minor: "31"}, v)
+	assert.True(t, committed)
+}
+
+func TestServerVersionCommitsOnlyWhenTheVersionMoves(t *testing.T) {
+	prev := VersionInfo{GitVersion: "v1.31.4", Major: "1", Minor: "31"}
+
+	_, _, committed := runProbe(t, serverVersionProbe{}, connTo(t, serveCluster(t).Server), &prev)
+
+	assert.False(t, committed)
+}
+
+func TestServerVersionReportsAnAnswerWithNoVersion(t *testing.T) {
+	cs := serveCluster(t)
+	cs.answer(versionPath, `{"major":"1"}`)
+
+	res, _, _ := runProbe(t, serverVersionProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, ReasonMalformed, res.Reason())
+}
+
+func TestServerVersionClassifiesAFailure(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(versionPath, http.StatusServiceUnavailable, "restarting")
+
+	res, _, _ := runProbe(t, serverVersionProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, ReasonServiceUnavailable, res.Reason())
+}
+
+func TestServerVersionParksWithoutAConnection(t *testing.T) {
+	res, _, _ := runProbe(t, serverVersionProbe{}, nil, nil)
+
+	assert.True(t, res.IsSkip())
+}
+
+// --- principal ---
+
+// The server names the subject; a token does not name it to us. The review is a create, so it
+// carries a body — an empty POST is a 400 and the username silently comes back missing.
+func TestPrincipalAsksTheServerWhoWeAre(t *testing.T) {
+	cs := serveCluster(t)
+	var got struct {
+		method, contentType, body string
+	}
+	cs.route(selfSubjectReviewPath, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got.method, got.contentType, got.body = r.Method, r.Header.Get("Content-Type"), string(body)
+		_, _ = io.WriteString(w, reviewJSON)
+	})
+
+	res, v, committed := runProbe(t, principalProbe{}, connTo(t, cs.Server), nil)
+
+	require.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, "admin@example", v.Username)
+	assert.Equal(t, []string{"system:authenticated", "system:masters"}, v.Groups, "sorted")
+	assert.True(t, committed)
+	assert.Equal(t, http.MethodPost, got.method)
+	assert.Equal(t, "application/json", got.contentType)
+	assert.Equal(t, string(selfSubjectReviewBody), got.body)
+}
+
+// Sorting is what makes the guard hold: the same groups in another order are not news any
+// watcher of this value has to be woken for.
+func TestPrincipalCommitsOnlyWhenTheSubjectMoves(t *testing.T) {
+	prev := Principal{Username: "admin@example", Groups: []string{"system:authenticated", "system:masters"}}
+
+	_, _, committed := runProbe(t, principalProbe{}, connTo(t, serveCluster(t).Server), &prev)
+
+	assert.False(t, committed)
+}
+
+func TestPrincipalCommitsAChangedUsername(t *testing.T) {
+	prev := Principal{Username: "reader@example", Groups: []string{"system:authenticated", "system:masters"}}
+
+	_, v, committed := runProbe(t, principalProbe{}, connTo(t, serveCluster(t).Server), &prev)
+
+	assert.True(t, committed)
+	assert.Equal(t, "admin@example", v.Username)
+}
+
+// Before 1.27 the endpoint does not exist, and a server too old to serve it will not grow one.
+func TestPrincipalSuspendsOnAServerTooOldToAnswer(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(selfSubjectReviewPath, http.StatusNotFound, "404 page not found")
+
+	res, _, _ := runProbe(t, principalProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
+	assert.Equal(t, ReasonUnsupported, res.Reason())
+}
+
+func TestPrincipalReportsAReviewWithNoUsername(t *testing.T) {
+	cs := serveCluster(t)
+	cs.answer(selfSubjectReviewPath, `{"status":{}}`)
+
+	res, _, _ := runProbe(t, principalProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, ReasonMalformed, res.Reason())
+}
+
+func TestPrincipalClassifiesAFailure(t *testing.T) {
+	cs := serveCluster(t)
+	cs.fail(selfSubjectReviewPath, http.StatusUnauthorized, "no")
+
+	res, _, _ := runProbe(t, principalProbe{}, connTo(t, cs.Server), nil)
+
+	assert.Equal(t, ReasonUnauthorized, res.Reason())
+}
+
+func TestPrincipalParksWithoutAConnection(t *testing.T) {
+	res, _, _ := runProbe(t, principalProbe{}, nil, nil)
+
+	assert.True(t, res.IsSkip())
+}
+
+// --- the caller going away ---
+
+// Cancellation says nothing about the cluster: the deadline was not ours and the answer was not
+// refused, so a run the engine's shutdown cut short must record nothing rather than opening a
+// failure streak against a healthy server.
+func TestACanceledRunRecordsNothing(t *testing.T) {
+	cs := serveCluster(t)
+	conn := connTo(t, cs.Server)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	for _, tt := range []struct {
+		name string
+		run  func() probe.Result
+	}{
+		{nameConnection, func() probe.Result {
+			cfg := serving(cs.Server, "prod", "key-1")
+			prev := connInfo{conn: conn, fingerprint: "key-1"}
+			return (&connectionProbe{kubecfgSvc: cfg}).Run(ctx, probe.NewPass("prod", &prev, probe.Snapshot{}))
+		}},
+		{nameReadiness, func() probe.Result { return runCanceled(t, ctx, readinessProbe{}, conn) }},
+		{nameServerUID, func() probe.Result { return runCanceled(t, ctx, serverUIDProbe{}, conn) }},
+		{nameServerVersion, func() probe.Result { return runCanceled(t, ctx, serverVersionProbe{}, conn) }},
+		{namePrincipal, func() probe.Result { return runCanceled(t, ctx, principalProbe{}, conn) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.True(t, tt.run().IsSkip(), "a canceled run records nothing")
+		})
+	}
+}
+
+// runCanceled runs one probe body on a context that is already done.
+func runCanceled[T any](t *testing.T, ctx context.Context, p probe.Probe[T], conn *Connection) probe.Result {
+	t.Helper()
+	snap := probe.NewSnapshot(map[string]any{nameConnection: connInfo{conn: conn}})
+	return p.Run(ctx, probe.NewPass[T]("prod", nil, snap))
 }

@@ -92,3 +92,15 @@ type Observation[T any] struct {
 // Known reports whether a run has committed a value, which is what makes Value readable. A
 // succeeded run is not enough on its own — one can conclude nothing to write.
 func (o Observation[T]) Known() bool { return !o.LastSeen.IsZero() }
+
+// NewSnapshot builds a snapshot carrying the named values, for a probe body's own tests,
+// standing in for the engine. Values only: the bookkeeping beside each one is the zero Attempts,
+// which reads as a probe that has never run.
+func NewSnapshot(values map[string]any) Snapshot {
+	snap := Snapshot{byName: make(map[string]probeID, len(values))}
+	for name, v := range values {
+		snap.byName[name] = probeID(len(snap.obs))
+		snap.obs = append(snap.obs, observable{value: v})
+	}
+	return snap
+}

@@ -113,7 +113,7 @@ const (
 	// connection it needs was down. The engine records it once per outage, which is what keeps
 	// a dead cluster costing one timeout per cycle instead of one per probe.
 	ReasonDependencyFailed Reason = "DependencyFailed"
-	// ReasonInternal is a bug here — an unimplemented probe, or one that panicked.
+	// ReasonInternal is a bug here — a request we could not build, or a probe that panicked.
 	ReasonInternal Reason = "Internal"
 )
 

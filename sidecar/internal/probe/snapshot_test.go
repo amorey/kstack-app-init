@@ -83,3 +83,13 @@ func TestSnapshotAttemptsPanicsOnAnUnregisteredName(t *testing.T) {
 
 	assert.Panics(t, func() { read.Attempts("nope") })
 }
+
+// The seam a probe body's tests read a sibling through, standing in for the engine.
+func TestNewSnapshotCarriesTheValuesNamed(t *testing.T) {
+	snap := NewSnapshot(map[string]any{"conn": "endpoint", "uid": "abc-123"})
+
+	assert.Equal(t, "endpoint", Get[string](snap, "conn").Value)
+	assert.Equal(t, "abc-123", Get[string](snap, "uid").Value)
+	assert.Zero(t, Get[string](snap, "conn").LastAttempt, "never run")
+	assert.Panics(t, func() { Get[string](snap, "missing") }, "a name it does not carry is a wiring bug")
+}

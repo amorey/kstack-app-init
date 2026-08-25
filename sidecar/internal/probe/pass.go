@@ -21,13 +21,19 @@ package probe
 type Pass[T any] struct {
 	subject string
 	prev    T
+	known   bool
 	snap    Snapshot
 	next    *T
 }
 
-// NewPass builds a pass for a probe body's own tests, standing in for the engine.
-func NewPass[T any](subject string, prev T, snap Snapshot) *Pass[T] {
-	return &Pass[T]{subject: subject, prev: prev, snap: snap}
+// NewPass builds a pass for a probe body's own tests, standing in for the engine. prev is what
+// the probe last committed, or nil for one that has committed nothing yet.
+func NewPass[T any](subject string, prev *T, snap Snapshot) *Pass[T] {
+	p := &Pass[T]{subject: subject, snap: snap}
+	if prev != nil {
+		p.prev, p.known = *prev, true
+	}
+	return p
 }
 
 // Subject is the subject this run is against.
@@ -35,6 +41,12 @@ func (p *Pass[T]) Subject() string { return p.subject }
 
 // Prev is this probe's own last committed value, the zero T until one lands.
 func (p *Pass[T]) Prev() T { return p.prev }
+
+// Known reports whether a value has ever been committed. What a probe whose zero T is a
+// legitimate answer needs: Prev cannot tell "nothing has landed" from "the last answer was the
+// zero value", so without this such a probe never commits its first answer and reads as never
+// observed for as long as it stays healthy.
+func (p *Pass[T]) Known() bool { return p.known }
 
 // Snapshot is every probe's observable as of dispatch, for sibling reads through Get.
 func (p *Pass[T]) Snapshot() Snapshot { return p.snap }

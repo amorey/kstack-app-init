@@ -20,6 +20,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
 
@@ -246,4 +248,70 @@ func TestNewConfiguresTheKeepalive(t *testing.T) {
 	defer func() { assert.NoError(t, svc.Close()) }()
 
 	assert.Equal(t, "10", os.Getenv(readIdleTimeoutEnv))
+}
+
+// TLS material that will not load fails the build, where a connection handed back as usable
+// would fail at the first handshake instead.
+func TestNewConnectionRefusesCredentialsItCannotLoad(t *testing.T) {
+	_, err := newConnection(&rest.Config{
+		Host:            "https://one.example",
+		TLSClientConfig: rest.TLSClientConfig{CAFile: "/nonexistent/ca.crt"},
+	})
+
+	assert.ErrorContains(t, err, "build http client")
+}
+
+func TestNewConnectionReportsAClientItCannotBuild(t *testing.T) {
+	failing := errors.New("no dynamic client")
+	original := newDynamic
+	newDynamic = func(*rest.Config, *http.Client) (dynamic.Interface, error) { return nil, failing }
+	t.Cleanup(func() { newDynamic = original })
+
+	_, err := newConnection(&rest.Config{Host: "https://one.example"})
+
+	assert.ErrorIs(t, err, failing)
+}
+
+// A request that cannot be built is a bug here, not news about the cluster — so it classifies as
+// Internal rather than as a server that would not answer.
+func TestRequestReportsOneItCannotBuild(t *testing.T) {
+	conn := connTo(t, serveAPI(t))
+	var noCtx context.Context
+
+	err := conn.getJSON(noCtx, "/api", &struct{}{})
+
+	assert.ErrorIs(t, err, errBadRequest)
+	assert.Equal(t, ReasonInternal, classify(err))
+}
+
+// A body that stops arriving mid-read is the same fault as one that will not parse: something
+// answered, and what it said cannot be used.
+func TestRequestReportsABodyThatStopsMidRead(t *testing.T) {
+	conn := connTo(t, serve(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "64")
+		_, _ = io.WriteString(w, "{")
+	})))
+
+	_, err := conn.getText(t.Context(), "/api")
+
+	assert.ErrorIs(t, err, errMalformed)
+	assert.Equal(t, ReasonMalformed, classify(err))
+}
+
+// The status line already arrived, and it is the stronger evidence: a 403 whose error page stops
+// mid-stream is still a grant to fix, not the proxy a malformed answer would point at.
+func TestRequestKeepsTheStatusWhenTheBodyStopsMidRead(t *testing.T) {
+	conn := connTo(t, serve(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "64")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "forbidden: ")
+	})))
+
+	_, err := conn.getText(t.Context(), "/api")
+
+	var status *httpErr
+	require.ErrorAs(t, err, &status)
+	assert.Equal(t, http.StatusForbidden, status.code)
+	assert.Equal(t, ReasonForbidden, classify(err))
+	assert.Equal(t, "forbidden: ", status.body, "whatever arrived before it stopped")
 }
