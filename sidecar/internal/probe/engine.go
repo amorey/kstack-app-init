@@ -147,7 +147,9 @@ type spec struct {
 // Option configures an Engine.
 type Option func(*settings)
 
-// WithWorkers is how many runs may be in flight at once, across every subject.
+// WithWorkers is how many runs may be in flight at once, across every subject. A fleet-wide cap
+// rather than a per-subject one, because what it holds back is the first pass over a large
+// kubeconfig: without it every cluster's credential helper runs in the same second.
 func WithWorkers(n int) Option { return func(s *settings) { s.workers = n } }
 
 // settings is what the options write.
