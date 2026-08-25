@@ -31,7 +31,7 @@ import (
 func connect(t *testing.T, cfg *fakeKubeconfig, v connInfo) (probe.Result, connInfo) {
 	t.Helper()
 	pass := probe.NewPass("prod", v, probe.Snapshot{})
-	res := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), pass)
+	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
 	if next, ok := pass.Updated(); ok {
 		v = next
 	}
@@ -47,7 +47,7 @@ func TestTheConnectionProbeCommitsOnlyOnAChange(t *testing.T) {
 	require.False(t, first.departed, "the context resolves, so it is back")
 
 	pass := probe.NewPass("prod", first, probe.Snapshot{})
-	res := (&connectionProbe{kubecfg: cfg}).Run(t.Context(), pass)
+	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
 
 	assert.Equal(t, ReasonResolved, res.Reason())
 	_, recorded := pass.Updated()

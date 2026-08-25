@@ -64,7 +64,7 @@ type connInfo struct {
 }
 
 func registerProbes(e *probe.Engine, kubecfg kubeconfigService) {
-	probe.Register(e, nameConnection, &connectionProbe{kubecfg: kubecfg}, probe.WithInterval(30*time.Second))
+	probe.Register(e, nameConnection, &connectionProbe{kubecfgSvc: kubecfg}, probe.WithInterval(30*time.Second))
 
 	// The four behind reachability declare both edges on it: they cannot run without a
 	// connection, and they read the one it committed — so a connection that moves re-runs them
@@ -85,11 +85,11 @@ func registerProbes(e *probe.Engine, kubecfg kubeconfigService) {
 // kubeconfig watch wakes this probe on every change, which is what re-asks every one of these
 // answers.
 type connectionProbe struct {
-	kubecfg kubeconfigService
+	kubecfgSvc kubeconfigService
 }
 
 func (p *connectionProbe) Run(_ context.Context, pass *probe.Pass[connInfo]) probe.Result {
-	_, _, err := p.kubecfg.RESTConfig(pass.Subject())
+	_, _, err := p.kubecfgSvc.RESTConfig(pass.Subject())
 	if errors.Is(err, kubeconfig.ErrNotRead) {
 		// An unread kubeconfig names nothing, and saying so would report every context
 		// gone for as long as the first read takes. The watch wakes us when it is read.
