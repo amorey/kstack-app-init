@@ -18,7 +18,7 @@
 // than testing it.
 //
 // **Nothing dials yet.** The connection probe resolves the kubeconfig and reports a context that
-// left it; the four behind it are unimplemented, and the engine records RequirementFailed for
+// left it; the four behind it are unimplemented, and the engine records DependencyFailed for
 // them while the connection has not succeeded — which is their correct behavior once they exist.
 package kubeconn
 
@@ -75,15 +75,15 @@ func registerProbes(e *probe.Engine, kubecfg kubeconfigService) probeIDs {
 	// The four behind reachability declare both edges on it: they cannot run without a
 	// connection, and they read the one it committed — so a connection that moves re-runs them
 	// rather than leaving them on a value that changed under them.
-	needsConn, readsConn := probe.WithRequirements(p.connection), probe.WithDependencies(p.connection)
+	dependsOnConn, watchesConn := probe.WithDependencies(p.connection), probe.WithWatches(p.connection)
 	p.readiness = probe.Register(e, nameReadiness, unimplemented[ComponentStatus]{"readiness"},
-		probe.WithInterval(30*time.Second), needsConn, readsConn)
+		probe.WithInterval(30*time.Second), dependsOnConn, watchesConn)
 	p.serverUID = probe.Register(e, nameServerUID, unimplemented[string]{"serverUID"},
-		probe.WithInterval(10*time.Minute), needsConn, readsConn)
+		probe.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
 	p.serverVersion = probe.Register(e, nameServerVersion, unimplemented[VersionInfo]{"serverVersion"},
-		probe.WithInterval(5*time.Minute), needsConn, readsConn)
+		probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
 	p.principal = probe.Register(e, namePrincipal, unimplemented[Principal]{"principal"},
-		probe.WithInterval(5*time.Minute), needsConn, readsConn)
+		probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
 	return p
 }
 

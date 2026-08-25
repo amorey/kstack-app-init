@@ -74,7 +74,7 @@ func TestAMovedConnectionReRunsTheProbesBehindIt(t *testing.T) {
 	after := awaitState(t, watched, func(st State) bool {
 		return st.ServerUID.LastAttempt.FinishedAt.After(before.FinishedAt)
 	}).ServerUID
-	assert.Equal(t, ReasonRequirementFailed, after.LastAttempt.Reason)
+	assert.Equal(t, ReasonDependencyFailed, after.LastAttempt.Reason)
 	assert.True(t, after.LastAttempt.StartedAt.IsZero(), "re-run, but still never dialed")
 }
 
@@ -157,7 +157,7 @@ func TestDependentsRecordDependencyFailedWhileNothingDials(t *testing.T) {
 		return st.ServerUID.LastAttempt.Done()
 	})
 
-	assert.Equal(t, ReasonRequirementFailed, st.ServerUID.LastAttempt.Reason)
+	assert.Equal(t, ReasonDependencyFailed, st.ServerUID.LastAttempt.Reason)
 	assert.False(t, st.ServerUID.Scheduled(), "suspended for the rest of the outage")
 	assert.True(t, st.ServerUID.LastAttempt.StartedAt.IsZero(), "recorded, never dispatched")
 }

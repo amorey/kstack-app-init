@@ -23,7 +23,7 @@ import (
 
 // The run bookkeeping is the engine's, aliased rather than copied so an Observation carries
 // exactly what the engine recorded. Reason stays this package's vocabulary — the engine treats
-// it as opaque and owns only Succeeded, RequirementFailed, and Internal, the same words with the
+// it as opaque and owns only Succeeded, DependencyFailed, and Internal, the same words with the
 // same values as the constants below.
 type (
 	Reason   = probe.Reason
@@ -113,10 +113,10 @@ const (
 	// ReasonComponentsFailing means /readyz answered and named components not ok. The probe
 	// worked and the cluster is not fit to use; ComponentStatus.Failing says which.
 	ReasonComponentsFailing Reason = "ComponentsFailing"
-	// ReasonRequirementFailed means the probe was recorded rather than attempted, because the
+	// ReasonDependencyFailed means the probe was recorded rather than attempted, because the
 	// connection it needs was down. The engine records it once per outage, which is what keeps
 	// a dead cluster costing one timeout per cycle instead of one per probe.
-	ReasonRequirementFailed Reason = "RequirementFailed"
+	ReasonDependencyFailed Reason = "DependencyFailed"
 	// ReasonInternal is a bug here — an unimplemented probe, or one that panicked.
 	ReasonInternal Reason = "Internal"
 )

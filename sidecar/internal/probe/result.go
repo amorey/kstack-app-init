@@ -25,9 +25,9 @@ type Reason string
 const (
 	// ReasonSucceeded is stamped by Succeeded; a caller never passes it.
 	ReasonSucceeded Reason = "Succeeded"
-	// ReasonRequirementFailed is recorded by the engine when a probe's requirement is failing,
-	// in place of a run. See the requirement lifecycle on Engine.due.
-	ReasonRequirementFailed Reason = "RequirementFailed"
+	// ReasonDependencyFailed is recorded by the engine when a probe's dependency is failing,
+	// in place of a run. See the dependency lifecycle on Engine.due.
+	ReasonDependencyFailed Reason = "DependencyFailed"
 	// ReasonInternal is a bug in a probe body, recorded by the engine when a run panics.
 	ReasonInternal Reason = "Internal"
 )
@@ -124,7 +124,7 @@ func (a Attempt) Running() bool { return !a.StartedAt.IsZero() && a.FinishedAt.I
 func (a Attempt) Done() bool { return !a.FinishedAt.IsZero() }
 
 // Latency is how long the run took: zero until it finishes, and zero for one recorded without
-// being dispatched — a RequirementFailed record has no duration to report.
+// being dispatched — a DependencyFailed record has no duration to report.
 func (a Attempt) Latency() time.Duration {
 	if !a.Done() || a.StartedAt.IsZero() {
 		return 0

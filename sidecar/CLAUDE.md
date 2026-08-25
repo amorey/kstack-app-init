@@ -280,19 +280,25 @@ one unrecorded wedges the probe twice over: in flight forever, with its key held
 
 **Each of `State`'s five observations has one probe behind it**, registered with its own interval
 (a cluster's UID never moves; its readiness moves constantly). The engine owns the observables —
-one value beside one `Attempts` per probe, the value committed by that probe's `Run` alone (nil
-keeps the previous one) — and `Read`/`OnChange` hand them back as a `probe.View`; `State` is
-assembled at publish time by projecting each handle's `Observation` out of it. The connection's
-value (`connInfo`) bundles `departed` and the connection with the endpoint, so the probes behind
-reachability read all three through the one handle; `stateOf` projects only the endpoint into
-`State.Connection`.
+one value beside one `Attempts` per probe, the value written by that probe's `Run` alone — and
+`Read`/`OnChange` hand them back as a `probe.Snapshot`, frozen at the moment it was taken.
+Anything reads one out of it by registration name (`probe.Get[connInfo](snap, nameConnection)`,
+the `name*` constants), which is how a `Run` reads a sibling and how `stateOf` assembles `State`
+at publish time. The connection's value (`connInfo`) bundles `departed` and the connection with
+the endpoint; `stateOf` projects only the endpoint into `State.Connection`.
+
+**A `Run` commits nil when its answer has not moved.** A committed value is what tells the engine
+the value changed, and so what re-runs every probe watching it — commit unconditionally and the
+four behind the connection re-run every cycle, which is the intervals they are registered with
+undone. `connInfo` is comparable, so `moved(prev, next)` is one `==`.
 
 **A probe's result is its schedule** — `Succeeded` (due again after the interval), `Fail` (due up
 the backoff ladder), `Suspend` (nothing due until a `Wake`), `Skip` (record nothing; wait for a
-`Wake`). The four behind reachability declare `probe.WithRequirements(p.connection.ID())`: the
-engine records them as `RequirementFailed` rather than dialing while the connection has not
-succeeded — one timeout per cycle, not one per probe — and a recovery makes them due again by
-derivation, so nothing has to notice it.
+`Wake`). The four behind reachability declare both edges on it — `probe.WithDependencies` (they
+cannot run without a connection) and `probe.WithWatches` (they read the one it commits). The
+engine records them as `DependencyFailed` rather than dialing while the connection has not
+succeeded — one timeout per cycle, not one per probe — a recovery makes them due again by
+derivation, and a connection whose value moves re-runs them at once.
 
 **The connection probe owns the context's lifecycle**, because resolving the kubeconfig is the
 first step of reaching a server. Its classifications: `ReasonContextNotFound` suspends with
@@ -359,7 +365,7 @@ every accessor answers correctly with no sentinel.
 (`Scheduled()` is the accessor). The four probes behind the connection suspend while it is down —
 a server nothing reached cannot answer them — and re-arm when it recovers; a probe that came back
 `Unsupported` stays suspended for the connection's life, since the endpoint is absent rather than
-failing. `RequirementFailed` marks the one cycle where a probe went from running to suspended, and
+failing. `DependencyFailed` marks the one cycle where a probe went from running to suspended, and
 the cycles after it schedule nothing, which is what makes a dead cluster cost one timeout per cycle
 instead of one per probe. **Why a probe is suspended is `LastAttempt.Reason`** — no field beside
 `NextAttempt`, since a probe suspends over what its last attempt found. That is why suspending must
@@ -386,7 +392,7 @@ classifying on the code alone permanently suspends a probe that should keep runn
 returns `*apierrors.StatusError` carrying the API's own reason, while only the raw endpoints
 (`/readyz`, `/version`) leave a status code as the sole evidence; one switch over codes for both
 discards what the typed half knows. `Canceled` says nothing about the cluster and counts toward neither failure field;
-`RequirementFailed` is a probe recorded rather than attempted, which is what keeps a dead cluster
+`DependencyFailed` is a probe recorded rather than attempted, which is what keeps a dead cluster
 costing one timeout per cycle instead of one per probe. Free-form text goes in `Message`, never
 `Reason`.
 

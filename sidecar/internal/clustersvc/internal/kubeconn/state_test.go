@@ -26,7 +26,7 @@ var runAt = time.Date(2026, 8, 23, 10, 5, 0, 0, time.UTC)
 // A probe the prober records without dispatching has no duration: subtracting a zero
 // StartedAt would report the time since the zero year.
 func TestLatencyIsZeroForARunThatNeverStarted(t *testing.T) {
-	a := Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonRequirementFailed}
+	a := Attempt{ScheduledAt: runAt, FinishedAt: runAt, Reason: ReasonDependencyFailed}
 
 	assert.True(t, a.Done())
 	assert.False(t, a.Running())
@@ -45,7 +45,7 @@ func TestSuspendedProbeKeepsItsAnswer(t *testing.T) {
 		Value:    "abc-123",
 		LastSeen: runAt,
 		Attempts: Attempts{
-			LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Verdict: VerdictSuspended, Reason: ReasonRequirementFailed},
+			LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Verdict: VerdictSuspended, Reason: ReasonDependencyFailed},
 		},
 	}
 
