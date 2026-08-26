@@ -391,3 +391,21 @@ func TestIdentityForTellsTheThreeRefusalsApart(t *testing.T) {
 		assert.ErrorIs(t, err, ErrIdentityMismatch)
 	}
 }
+
+// conflicted is what the rebuild reads, and it has to tell the two ways a connection vouches for
+// nobody apart: one nothing has identified yet is on its way to being usable, while one whose
+// server changed underneath it is finished. ServerUID answers ("", false) for both.
+func TestConflictedIsOnlyTheServerChangingUnderneath(t *testing.T) {
+	unidentified := &Connection{}
+
+	identified := &Connection{}
+	identified.setServerUID("uid-1")
+
+	replaced := &Connection{}
+	replaced.setServerUID("uid-1")
+	replaced.setServerUID("uid-2")
+
+	assert.False(t, unidentified.conflicted(), "nothing has read a uid over it yet")
+	assert.False(t, identified.conflicted())
+	assert.True(t, replaced.conflicted())
+}

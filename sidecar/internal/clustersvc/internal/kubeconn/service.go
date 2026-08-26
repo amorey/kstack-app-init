@@ -284,7 +284,8 @@ func (s *Service) publish(contextName string, v probe.Snapshot) {
 	st := s.stateOf(v)
 	n := s.newsOf(v, st)
 
-	stale, held, changed := s.record(contextName, keyConnection.From(v).Value.conn, n)
+	conn := keyConnection.From(v).Value.conn
+	stale, held, changed := s.record(contextName, conn, n)
 	if stale != nil {
 		// Outside the lock: retiring closes sockets, and nothing about it needs the pool.
 		stale.retire()
@@ -298,6 +299,21 @@ func (s *Service) publish(contextName string, v probe.Snapshot) {
 	s.stateHub.Sender().Send(contextName, st)
 	if changed {
 		s.signalHub.Sender().Send(contextName, struct{}{})
+
+		// A connection whose server was replaced is rebuilt by the connection probe, which
+		// would otherwise wait out its interval — nothing about the file moved, so no watch
+		// reports this. The probe cannot declare a data edge on the identity probes (the graph
+		// is kept acyclic by resolving only already-registered names), and a Wake is not an
+		// edge.
+		//
+		// **Inside `changed` on purpose.** A Wake is a queue add, not a schedule, so nothing
+		// paces one re-sent every pass — and the conflict outlives the run meant to clear it
+		// whenever that run returns before the rebuild arm, which a kubeconfig that stops
+		// resolving does. Recording the conflict empties `news.vouchedFor`, so the edge lands
+		// on exactly the pass that records it, and the probe's interval is the backstop.
+		if conn != nil && conn.conflicted() {
+			s.engine.Wake(contextName, nameConnection)
+		}
 	}
 }
 

@@ -201,10 +201,11 @@ replaced behind an endpoint and credentials that never moved, so no connection i
 probe reads a new uid over the old stamp. The stamp is never overwritten — keeping it would go on
 authorizing the old cluster's subjects against the replacement, and adopting the new one would let
 a connection that already answered as something else vouch for what answers now — so the conflict
-is recorded and `ConnFor` refuses everyone. **The cost is a stall, not corruption**: nothing
-rebuilds a connection whose credentials never changed, so identity-scoped work over it stops until
-identity-driven retirement (`TODO.md`) acts on the conflict.
-→ [ADR: connection-carried identity](../docs/adr/2026-08-25-connection-carried-identity.md).
+is recorded and `ConnFor` refuses everyone. **The conflict then rebuilds the connection**, so the
+stall is a window rather than permanent: `connectionProbe.Run` rebuilds on a conflicted connection
+as well as on a changed fingerprint, and the pass that records the conflict wakes it.
+→ [ADR: connection-carried identity](../docs/adr/2026-08-25-connection-carried-identity.md),
+[ADR: identity-driven retirement](../docs/adr/2026-08-27-identity-driven-retirement.md).
 
 `clusterCachedCatalogController.Reconcile` walks its two owner edges (cache, then cluster), arms
 or disarms the sweeper, and rewrites one `ClusterCachedResource` per kind the standing answer
@@ -549,11 +550,16 @@ identity-scoped caller must use, through `ConnFor`; **never compare a connection
 `State.ServerUID`**, which is a separate probe's observable and lags a rebuilt connection by a
 round-trip. → [ADR: connection-carried identity](../docs/adr/2026-08-25-connection-carried-identity.md).
 
-**Retiring a connection because the server behind unchanged credentials moved is specified and
-unbuilt.** The conflict is *detected* — a second, different uid stops the connection vouching for
-anyone, so nothing reads the replacement cluster into the old one's records — but nothing rebuilds
-it, so identity-scoped work over that connection stalls and `Connection.Done()` never fires.
-`TODO.md` carries the recovery half. Note what a username change does
+**A conflict rebuilds the connection.** `connectionProbe.Run`'s rebuild arm asks the standing
+connection whether it is `conflicted()` — never comparing it against `State.Identity()`, which is
+the stale pairing — and `publish` wakes the connection probe so the rebuild does not wait out the
+30s interval. **The wake is gated on the news having moved**, which is an edge: a `Wake` is a queue
+add rather than a schedule, and a run that returns before the rebuild arm (a kubeconfig that stops
+resolving) leaves the conflict standing, so a level-read condition would hot-loop past the backoff
+ladder. Recording the conflict empties `news.vouchedFor`, so the edge lands on exactly the pass
+that records it, and the interval is the backstop.
+→ [ADR: identity-driven retirement](../docs/adr/2026-08-27-identity-driven-retirement.md).
+Note what a username change does
 **not** cover: ordinary RBAC edits leave it identical, so permissions need the
 `SelfSubjectRulesReview` behind `ClusterPermissions`.
 

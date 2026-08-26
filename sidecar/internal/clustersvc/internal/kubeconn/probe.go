@@ -177,7 +177,14 @@ func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) p
 	// Rebuild on a changed fingerprint or no connection — never the fingerprint alone: a
 	// failed build commits the fingerprint with nothing behind it, and a fingerprint-only
 	// check would find it unchanged and never build again.
-	if next.conn == nil || next.fingerprint != fingerprint {
+	//
+	// The third arm is the server replaced behind credentials that never moved: nothing about
+	// the file says so, and the connection is the only thing that knows. Asked of the
+	// connection rather than compared against the identity observable — that pairing is stale
+	// by a dispatch plus a round trip, while the conflict was recorded by the probe that made
+	// the request over this connection. A first identification records none, so nothing here
+	// rebuilds a connection merely because the probe behind it answered.
+	if next.conn == nil || next.fingerprint != fingerprint || next.conn.conflicted() {
 		conn, err := newConnection(cfg)
 		next = connInfo{conn: conn, fingerprint: fingerprint}
 		if err != nil {

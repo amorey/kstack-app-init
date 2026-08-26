@@ -204,6 +204,38 @@ func TestConnectionRebuildsWhenTheCredentialsMove(t *testing.T) {
 	assert.Equal(t, "key-2", second.fingerprint)
 }
 
+// The server behind unchanged credentials was replaced, so nothing about the file moved and the
+// connection is the only thing that knows. Without this arm the stall is permanent: a conflicted
+// connection vouches for nobody, and every identity-scoped caller is refused for as long as it
+// stands.
+func TestConnectionRebuildsWhenItsServerWasReplaced(t *testing.T) {
+	cfg := serving(serveAPI(t), "prod", "key-1")
+	_, first := connect(t, cfg, connInfo{})
+	require.NotNil(t, first.conn)
+
+	first.conn.setServerUID("uid-1")
+	first.conn.setServerUID("uid-2")
+	res, second := connect(t, cfg, first)
+
+	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.NotSame(t, first.conn, second.conn, "the conflicted connection is replaced")
+	assert.False(t, second.conn.conflicted(), "and the replacement vouches for nobody yet")
+	assert.Equal(t, "key-1", second.fingerprint, "over credentials that never moved")
+}
+
+// A first identification is not a replaced server, so it rebuilds nothing — otherwise every
+// connection would be rebuilt once, as soon as the probe behind it answered.
+func TestConnectionKeepsItsConnectionThroughTheFirstStamp(t *testing.T) {
+	cfg := serving(serveAPI(t), "prod", "key-1")
+	_, first := connect(t, cfg, connInfo{})
+	require.NotNil(t, first.conn)
+
+	first.conn.setServerUID("uid-1")
+	_, second := connect(t, cfg, first)
+
+	assert.Same(t, first.conn, second.conn)
+}
+
 // A file that will not resolve keeps its connection, where a departure drops one: the read
 // failed, which says nothing about whether the credentials behind the connection still work, and
 // an editor saving non-atomically is a read that fails for a moment.

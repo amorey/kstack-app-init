@@ -139,6 +139,14 @@ func (c *Connection) IdentityFor(serverUID string) error {
 	return nil
 }
 
+// conflicted reports that a second, different uid was read over this connection — the server
+// behind it was replaced. Distinct from `ServerUID`'s ("", false), which cannot tell that from a
+// connection nothing has identified yet, and only the former is worth rebuilding for.
+func (c *Connection) conflicted() bool {
+	id := c.identity.Load()
+	return id != nil && id.conflicted
+}
+
 // setServerUID records the cluster a probe reached over this connection.
 //
 // The stamp is never overwritten. A second, different uid is the server being replaced behind
@@ -147,11 +155,10 @@ func (c *Connection) IdentityFor(serverUID string) error {
 // vouched for by a connection that has already answered as something else. So the conflict is
 // recorded and the connection stops vouching, which refuses every caller.
 //
-// Refusing is the whole of what this does. Retiring the connection belongs to the pool — and
-// alone would not help, since Conn hands out a retired connection too (Done is how a holder
-// hears about one) and nothing rebuilds a connection whose credentials never changed. Making
-// this self-heal is identity-driven retirement, which acts on the conflict recorded here.
-// → TODO.md.
+// Refusing is the whole of what this does. What clears it is the connection probe's rebuild arm,
+// which reads the conflict back through conflicted(); retiring the old connection belongs to the
+// pool, and alone would not help, since Conn hands out a retired connection too (Done is how a
+// holder hears about one).
 func (c *Connection) setServerUID(uid string) {
 	for {
 		id := c.identity.Load()

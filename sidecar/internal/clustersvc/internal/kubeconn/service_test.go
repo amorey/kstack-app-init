@@ -968,3 +968,96 @@ func TestRotationRestoresTheStamp(t *testing.T) {
 		return err == nil
 	}, testutil.Timeout, time.Millisecond, "the rebuilt connection is stamped and handed out again")
 }
+
+// --- identity-driven retirement ---
+
+// kubeSystemAs is the kube-system read the serverUID probe makes, answering as one cluster.
+func kubeSystemAs(uid string) string {
+	return `{"metadata":{"name":"kube-system","uid":"` + uid + `"}}`
+}
+
+// The recovery the conflict exists to make possible: a server replaced behind credentials that
+// never moved leaves the connection vouching for nobody, and only a rebuild clears it. The
+// rebuild arm alone would wait out the connection probe's interval, so the pass that records the
+// conflict wakes it.
+func TestAReplacedServerRebuildsTheConnection(t *testing.T) {
+	cl := serveCluster(t)
+	cfg := serving(cl.Server, "prod", "key-1")
+	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+
+	moved := s.Subscribe()
+	defer moved.Close()
+
+	awaitState(t, watched, func(st State) bool { return st.Identity().ServerUID == "uid-1" })
+	stale, err := lease.Conn(within(t))
+	require.NoError(t, err)
+
+	// The endpoint now answers as another cluster, over the same credentials.
+	cl.answer(kubeSystemPath, kubeSystemAs("uid-2"))
+	s.engine.Wake("prod", nameServerUID)
+
+	testutil.Wait(t, stale.Done(), "the conflicted connection to be retired")
+
+	// Asked of the connection, never of State.Identity() — the observable reaches uid-2 as soon
+	// as the probe reads it over the OLD connection, which says nothing about the replacement
+	// having been stamped. That pairing is the trap ConnFor exists to close.
+	ctx := within(t)
+	for {
+		fresh, err := lease.ConnFor(ctx, "uid-2")
+		if err == nil {
+			assert.NotSame(t, stale, fresh)
+			return
+		}
+		_, err = moved.RecvContext(ctx)
+		require.NoError(t, err, "waiting for the replacement to vouch for uid-2")
+	}
+}
+
+// settledReads counts kubeconfig reads until they stop. A spin has no quiet gap at all, so the
+// count guard trips long before the window elapses; the window sits well inside the probe's
+// backoff base, so a retry the ladder paced is never mistaken for one.
+func settledReads(t *testing.T, reads *testutil.Probe[string]) {
+	t.Helper()
+	const window = 150 * time.Millisecond
+	for seen := 0; ; seen++ {
+		select {
+		case <-reads.Chan():
+			require.Less(t, seen, 25, "the connection probe is spinning on its own wake")
+		case <-time.After(window):
+			return
+		}
+	}
+}
+
+// The wake is gated on the news moving, and this is why. A Wake is a queue add rather than a
+// schedule, so a condition re-read every pass is paced by nothing — and a conflict outlives the
+// run meant to clear it whenever that run returns before the rebuild arm. A kubeconfig that stops
+// resolving does exactly that, and on the level the pair would hot-loop: publish, wake, fail,
+// publish, with the backoff ladder bypassed and every state watcher flooded.
+func TestAConflictWhoseFileStoppedResolvingDoesNotSpin(t *testing.T) {
+	cl := serveCluster(t)
+	cfg := serving(cl.Server, "prod", "key-1")
+	cfg.reads = testutil.NewProbe[string](64)
+	s := New(cfg)
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	watched := lease.WatchState()
+	defer watched.Close()
+
+	awaitState(t, watched, func(st State) bool { return st.Identity().ServerUID == "uid-1" })
+
+	// The server is replaced and the file stops resolving, so every run the conflict wakes
+	// returns before the rebuild arm and leaves the conflict standing.
+	cl.answer(kubeSystemPath, kubeSystemAs("uid-2"))
+	cfg.setErr(errors.New("open ca.crt: no such file"))
+	cfg.reads.Drain()
+	s.engine.Wake("prod", nameServerUID)
+
+	settledReads(t, cfg.reads)
+}

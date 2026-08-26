@@ -89,3 +89,4 @@ usually just documentation in the wrong place.
 | 2026-08-25 | [The connection probe dials /api, builds the connection, and lets the pool retire it](2026-08-25-connection-probe-dial.md) | sidecar | Accepted |
 | 2026-08-25 | [A connection carries the identity confirmed over it](2026-08-25-connection-carried-identity.md) | sidecar | Accepted |
 | 2026-08-26 | [Discovery is a sweep on its own engine, made prompt by a watch that only wakes](2026-08-26-kubecatalog-watch.md) | sidecar | Accepted |
+| 2026-08-27 | [A recorded identity conflict rebuilds the connection, woken by an edge](2026-08-27-identity-driven-retirement.md) | sidecar | Accepted |
