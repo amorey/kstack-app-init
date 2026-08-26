@@ -276,11 +276,11 @@ func (r *subscriptionResolver) ClusterCachedResourcesWatch(ctx context.Context, 
 // cache's contents as a live gauge, streamed because the ClusterCache.stats field freezes
 // once its record stops changing.
 func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCacheStats, error) {
-	ch, err := r.ClusterSvc.Caches().WatchStats(ctx, id, cacheID)
+	stream, err := r.ClusterSvc.Caches().WatchStats(ctx, id, cacheID)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, stream), nil
 }
 
 // ClusterCachedDataKindsWatch is the resolver for the clusterCachedDataKindsWatch field — one

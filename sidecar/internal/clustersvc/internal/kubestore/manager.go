@@ -1,0 +1,438 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package kubestore is the on-disk cache behind every ClusterCache: one SQLite file
+// per cache under the manager's directory, holding the mirrored objects, events, and
+// the sync bookkeeping the workers resume from. The schema is
+// migrations/0001_init.sql; the per-kind resourceVersion cookie lives in its
+// cluster_meta bag rather than a table of its own.
+//
+// The Manager is the only way to a Store. The kubesync writers and the boundary's
+// readers must share one file per cache — the change bus is in-memory state on it —
+// and Clear has to close every claim's file before deleting it: deleting under an open
+// handle does not fail on POSIX, it silently forks the world, the old handle writing to
+// the unlinked inode while a fresh open starts empty. Sequencing that is only possible
+// where the claims are held.
+// → docs/adr/2026-08-26-cache-store-per-cache.md,
+// docs/adr/2026-08-26-store-change-ping-bus.md.
+package kubestore
+
+import (
+	"context"
+	"database/sql"
+	"embed"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/sqlitemigrate"
+)
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+// Manager owns the caches directory and hands out refcounted Stores, keyed by the
+// cache's beehive ObjectID — opaque here, and what names the file, so a beehive name's
+// arbitrary text never reaches the filesystem.
+type Manager struct {
+	// dir is the caches directory; each cache's file is "<cacheID>.db" inside it.
+	dir string
+
+	// mu guards entries and removed, and is what serializes Clear against
+	// OpenOrCreate/Release: a swap must never race a Store resolving its file.
+	mu      sync.Mutex
+	entries map[int64]*entry
+	// deleteFiles is the unlink step, and closeFile the close both clears go through:
+	// seams, so a white-box test can drive a clear whose files will not go or whose
+	// database will not close.
+	deleteFiles func(path string) error
+	closeFile   func(f *file) error
+	// removed is the caches Remove has retired. A beehive ObjectID is never reused, so
+	// refusing one forever is the whole rule — and it is what stops a straggler pass,
+	// holding a view of the cache from before its teardown, from opening a fresh file
+	// nothing will ever name again.
+	removed map[int64]bool
+}
+
+// entry is one cache's open file and the claims on it. The file pointer is what Clear
+// swaps, and a Store reads it out of the entry it claimed — which is what makes the swap
+// reach live claims while a replacement entry stays theirs alone. A nil file is one
+// closed for good, so a Store on a retired entry answers ErrClosed rather than reaching
+// a closed *sql.DB or another claim's file.
+type entry struct {
+	file *file
+	refs int
+}
+
+var (
+	// ErrRemoved is what OpenOrCreate answers for a cache Remove retired.
+	ErrRemoved = errors.New("cache store removed")
+	// ErrClosed is what a Store answers once the file under it is gone — a Remove, or a
+	// Clear that could not reopen. The claim is still the caller's to Release.
+	ErrClosed = errors.New("cache store is closed")
+)
+
+// NewManager returns a Manager rooted at dir. Nothing is opened until OpenOrCreate.
+func NewManager(dir string) *Manager {
+	return newManagerWithOptions(dir)
+}
+
+// option is a test seam, reachable only from white-box tests.
+type option func(*Manager)
+
+// withDeleteFiles substitutes the unlink both clears go through.
+func withDeleteFiles(f func(path string) error) option {
+	return func(m *Manager) { m.deleteFiles = f }
+}
+
+// withCloseFile substitutes the close both clears go through.
+func withCloseFile(fn func(f *file) error) option {
+	return func(m *Manager) { m.closeFile = fn }
+}
+
+// newManagerWithOptions is NewManager plus the seams.
+func newManagerWithOptions(dir string, opts ...option) *Manager {
+	m := &Manager{
+		dir:         dir,
+		entries:     map[int64]*entry{},
+		deleteFiles: deleteStoreFiles,
+		closeFile:   (*file).close,
+		removed:     map[int64]bool{},
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// OpenOrCreate claims cacheID's store — creating the directory, the file, and the
+// schema on first touch — or joins the open one. Release the claim.
+//
+// The name says the dangerous half out loud: this is the writers' door. A read binds
+// through StoreIfOpen, which never creates.
+func (m *Manager) OpenOrCreate(cacheID int64) (*Store, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.openOrCreateLocked(cacheID)
+}
+
+// openOrCreateLocked is OpenOrCreate for a caller already holding the lock.
+func (m *Manager) openOrCreateLocked(cacheID int64) (*Store, error) {
+	if m.removed[cacheID] {
+		return nil, fmt.Errorf("open cache %d: %w", cacheID, ErrRemoved)
+	}
+	e, ok := m.entries[cacheID]
+	if !ok {
+		f, err := openFile(m.path(cacheID))
+		if err != nil {
+			return nil, err
+		}
+		e = &entry{file: f}
+		m.entries[cacheID] = e
+	}
+	e.refs++
+	return &Store{m: m, cacheID: cacheID, e: e, claimed: true}, nil
+}
+
+// StoreIfOpen returns the store for a cache someone already holds open, or nil. **It
+// never creates a file** — the read side binds to what the workers opened, so a
+// reconnecting reader in the window between a cache being marked for deletion and its
+// teardown pass cannot resurrect the file as an orphan nothing will ever name again.
+//
+// The store carries no claim: the file under it can be cleared or removed while a
+// reader holds it, which the reader learns from its change subscription ending.
+func (m *Manager) StoreIfOpen(cacheID int64) *Store {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	e, held := m.entries[cacheID]
+	if !held || e.file == nil {
+		return nil
+	}
+	return &Store{m: m, cacheID: cacheID, e: e}
+}
+
+// OpenExisting claims a cache that already has a file, or reports that none does. **It
+// never creates one**: the callers are clearing a kind or measuring what is there, and a
+// fresh empty database — schema and sidecars and all — is exactly what neither wants
+// left behind.
+//
+// A cache removed between the check and the claim answers ErrRemoved, which the caller
+// retries; its file is going with the record either way.
+func (m *Manager) OpenExisting(cacheID int64) (*Store, bool, error) {
+	// One critical section: a clear holds the lock across delete → create → migrate, and
+	// a look outside it would find no file mid-window and report a cache that is very
+	// much there as gone — a clear of one kind reporting success for nothing done.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, err := os.Stat(m.path(cacheID)); err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("open cache %d: %w", cacheID, err)
+	}
+	store, err := m.openOrCreateLocked(cacheID)
+	if err != nil {
+		return nil, false, err
+	}
+	return store, true, nil
+}
+
+// Clear wipes cacheID's store: close the open file if any, delete it (the -wal/-shm
+// sidecars too), and reopen fresh for the claims still held. Callers stop the cache's
+// workers first — the manager sequences claims, not writers.
+func (m *Manager) Clear(cacheID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	path := m.path(cacheID)
+	e, held := m.entries[cacheID]
+	if held {
+		if err := m.closeFile(e.file); err != nil {
+			// The file is unusable whatever the close reported, so the entry is retired
+			// rather than left installed: a claim on it must answer ErrClosed instead of
+			// reaching a dead database, and the next open starts the cache fresh.
+			e.file = nil
+			delete(m.entries, cacheID)
+			return fmt.Errorf("clear: close store: %w", err)
+		}
+	}
+	deleteErr := m.deleteFiles(path)
+
+	// Live claims still hold this entry — swap in a fresh file rather than dropping it,
+	// or every one of them would answer ErrClosed for a cache that is meant to stay
+	// usable. On a failed delete too: the caller retries the clear, and the cache has to
+	// keep working until it lands.
+	if held {
+		f, err := openFile(path)
+		if err != nil {
+			// Nothing usable to swap in, so retire the entry: a later OpenOrCreate opens
+			// the cache fresh, and the claims left on this one answer ErrClosed rather
+			// than reaching a file closed for good.
+			e.file = nil
+			delete(m.entries, cacheID)
+			return errors.Join(deleteErr, fmt.Errorf("clear: reopen: %w", err))
+		}
+		e.file = f
+	}
+	if deleteErr != nil {
+		return fmt.Errorf("clear: delete files: %w", deleteErr)
+	}
+	return nil
+}
+
+// Remove retires cacheID's store for good: close it if open, delete the files, and drop
+// the entry — nothing reopens, so a claim still out answers ErrClosed and a later
+// OpenOrCreate is refused with ErrRemoved. For a cache that is going away with the
+// record it belongs to; Clear is the one that leaves a usable empty store behind. A
+// cache that was never opened is not an error, and one whose cleanup failed stays
+// retired — the caller retries, and an open in between would recreate exactly what is
+// going. Callers stop the cache's workers first, the way they do for Clear.
+func (m *Manager) Remove(cacheID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Retiring is the decision, not the outcome: a failed close or unlink is retried by
+	// the caller's next pass, and until it lands nothing may open the file again.
+	m.removed[cacheID] = true
+
+	if e, held := m.entries[cacheID]; held {
+		f := e.file
+		e.file = nil
+		delete(m.entries, cacheID)
+		if err := m.closeFile(f); err != nil {
+			return fmt.Errorf("remove: close store: %w", err)
+		}
+	}
+	if err := m.deleteFiles(m.path(cacheID)); err != nil {
+		return fmt.Errorf("remove: delete files: %w", err)
+	}
+	return nil
+}
+
+// Stats measures one cache: its file, and the tally of what is in it. Bytes counts the
+// -wal/-shm sidecars alongside the main file — a bare stat of the main file swings with
+// checkpoint timing.
+//
+// It takes no claim. The counts come through whatever is already open, and otherwise by
+// opening the file read-only: a cache whose workers are all stopped — a paused cluster —
+// still holds its rows, and a gauge answering zero beside a megabyte-sized file would
+// read as data loss. Read-only is what keeps this a read: the file is never created.
+func (m *Manager) Stats(ctx context.Context, cacheID int64) (Stats, error) {
+	// The whole measurement in one critical section, the file included: a clear holds
+	// the lock across close → unlink → create → migrate, and a stat taken inside that
+	// window answers that the cache does not exist — which is what the gauge in the very
+	// view holding the Clear button would render as data loss.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	path := m.path(cacheID)
+	fi, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return Stats{}, nil
+	}
+	if err != nil {
+		return Stats{}, fmt.Errorf("stats: %w", err)
+	}
+	out := Stats{Exists: true, Bytes: fi.Size()}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if sidecarInfo, err := os.Stat(path + suffix); err == nil {
+			out.Bytes += sidecarInfo.Size()
+		}
+	}
+
+	counts, err := m.countsLocked(ctx, path, cacheID)
+	if err != nil {
+		return Stats{}, err
+	}
+	out.Counts = counts
+	return out, nil
+}
+
+// counts reads the per-kind tallies without taking a claim: through the open file when
+// one is, and otherwise through a read-only open.
+//
+// A failed read through the open file falls through rather than failing the
+// measurement. A Clear closes the file whatever holds it — a claim would narrow this
+// window, never close it — so a read that resolved one a moment earlier can find it
+// closed mid-query, and the answer is on disk either way. The fallback re-reads
+// whatever is there now; a genuine failure surfaces from it instead.
+func (m *Manager) countsLocked(ctx context.Context, path string, cacheID int64) (Counts, error) {
+	// The entry's file directly, not through a Store: a Store resolves its file under
+	// this same lock, which this call already holds.
+	if e, held := m.entries[cacheID]; held && e.file != nil {
+		if counts, err := countKinds(ctx, e.file.db); err == nil {
+			return counts, nil
+		}
+	}
+	return m.countsFromDiskLocked(ctx, path)
+}
+
+// countsFromDisk opens the file read-only and reads it, **under the manager's lock**.
+// Clear holds that lock across close → unlink → create → migrate, and for the middle of
+// it the file exists with no schema: a read slipping in there fails on a missing table
+// and, through the gauge above it, ends a subscription the user is watching while
+// clearing. The lock costs one point read on an indexed table, and only for a cache
+// nothing has open.
+func (m *Manager) countsFromDiskLocked(ctx context.Context, path string) (Counts, error) {
+	db, err := openReadOnly(path)
+	if err != nil {
+		return Counts{}, err
+	}
+	defer db.Close() //nolint:errcheck // read-only, nothing to flush
+
+	counts, err := countKinds(ctx, db)
+	if err != nil {
+		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+			// Removed between the stat above and this read: gone, not broken. SQLite
+			// reports a missing file as its own error, so the file is what says so.
+			return Counts{}, nil
+		}
+		return Counts{}, err
+	}
+	return counts, nil
+}
+
+// openReadOnly opens an existing cache file for reading. mode=ro is what makes this
+// safe to call from a read: SQLite refuses rather than creating, so no reader can
+// bring a removed cache back.
+func openReadOnly(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&mode=ro")
+	if err != nil {
+		return nil, fmt.Errorf("open read-only: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
+}
+
+// path is cacheID's db file path within the manager's directory.
+func (m *Manager) path(cacheID int64) string {
+	return filepath.Join(m.dir, strconv.FormatInt(cacheID, 10)+".db")
+}
+
+// deleteStoreFiles removes the main db file and its -wal/-shm sidecars; a file that
+// never existed is not an error.
+func deleteStoreFiles(path string) error {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// openFile opens the writer pool at path, sets auto_vacuum before any table exists,
+// and applies the schema.
+func openFile(path string) (*file, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("mkdir: %w", err)
+	}
+	db, err := sqlitemigrate.OpenPool(path, 1)
+	if err != nil {
+		return nil, fmt.Errorf("open pool: %w", err)
+	}
+
+	ctx := context.Background()
+	const autoVacuumIncremental = 2
+	var mode int
+	if err := db.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("read auto_vacuum: %w", err)
+	}
+	if mode != autoVacuumIncremental {
+		if _, err := db.ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL; VACUUM;`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set auto_vacuum: %w", err)
+		}
+	}
+
+	if _, err := sqlitemigrate.Apply(ctx, db, migrationsFS, "migrations"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return newFile(db), nil
+}
+
+// Start is the lifecycle shape; the manager has no background work.
+func (m *Manager) Start(ctx context.Context) (func(context.Context) error, error) {
+	return func(context.Context) error { return nil }, nil
+}
+
+// Close closes every open file. Claims still out answer ErrClosed after it; Close runs
+// only after everything that writes has stopped.
+func (m *Manager) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var errs []error
+	for id, e := range m.entries {
+		if e.file != nil {
+			errs = append(errs, m.closeFile(e.file))
+			e.file = nil
+		}
+		delete(m.entries, id)
+	}
+	return errors.Join(errs...)
+}
+
+// Stats is one cache's measurement: its footprint on disk, and what it holds.
+type Stats struct {
+	Exists bool
+	Bytes  int64
+	Counts
+}

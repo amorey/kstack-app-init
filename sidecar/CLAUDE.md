@@ -48,12 +48,12 @@ internal/clustersvc/
                       catalog's fold. Borrows kubeconn's leases; same leaf rule
   internal/kubesync/  the worker fleet: one worker per (cache, GVR), armed from the
                       resource record's reconcile the way the sweeper is, with the
-                      same change signal. The run body is a seamed placeholder —
-                      the sync loop is the next step. Same leaf rule
+                      same change signal. service.go is the fleet, sync.go the loop
+                      one worker runs. Same leaf rule
   internal/kubestore/  the on-disk cache: one SQLite file per ClusterCache behind a
-                      refcounted registry, schema carried over from the previous
-                      store. Opens, cookies, and the clears exist; nothing writes
-                      rows yet. Same leaf rule
+                      refcounted manager (manager.go), the store and its write
+                      path (store.go + objects/events/status/rawcodec), and the
+                      change ping bus every read re-reads on. Same leaf rule
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -63,8 +63,8 @@ side and hides when they don't. Everything else slices by kind, so one file teac
 are the subsystem's concurrency and retry budget, which only reads as a budget in one place.
 
 `New` opens the beehive store under `dataDir` and registers all five controllers; `Start` runs
-beehive, then each controller's background work. **Most `CachedData` methods and the cache gauges
-still panic** — `TestUnimplementedBoundaryPanics` is the inventory of what is left, and an entry
+beehive, then each controller's background work. **The `CachedData` methods and the kstack event
+log still panic** — `TestUnimplementedBoundaryPanics` is the inventory of what is left, and an entry
 must be deleted as its method lands, since the test fails when a stub stops panicking.
 
 Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` records,
@@ -73,23 +73,153 @@ Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` 
 probe recorded, and `clusterCacheController.Reconcile` creating the `ClusterCachedCatalog` beneath
 each cache, carrying the pause switch (`cacheSyncEnabled`: the cluster's toggles, and whether the
 cache is still the active identity). Served: the whole `Clusters()` family, the whole
-`CachedCatalogs()` family, and everything on `Caches()` but its two gauges and `Clear`.
+`CachedCatalogs()` family, the whole `Caches()` family, and the whole `CachedResources()` family.
 That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **A cache now exists at runtime**: the serverUID probe writes `status.server.uid`, which is what
 `ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
 one — and a `ClusterCachedCatalog` beneath it. **The catalog's pass discovers kinds**, so a
 `ClusterCachedResource` exists per kind the cluster serves, and its six reads answer.
-**The resource pass now folds a worker fleet** (`internal/kubesync` — Track/Forget mirroring the
-record's state, Bounce/BounceCache as the restart the Clears and the poke resync will use) and
-writes each kind's `Synced` condition from its worker's observation; the per-cache store
-(`internal/kubestore`) opens with the full schema, a kind's teardown clears its rows through it,
-and **the cache's teardown disarms that cache's workers (`ForgetCache`) and deletes the file** —
-the path is named for an id that dies with the record, so a pass that let it survive would orphan
-it on disk for good, and a worker outliving it would write through a closed store. But the
-worker's run body is a placeholder that publishes nothing, so every `Synced` condition reads
-`Connecting`, no rows land, and `CachedResources().Clear` and the whole `CachedData()` family
-still panic. The sync loop, the store's data plane, and its change broker are the remaining
-steps — → docs/specs/cached-resource-sync.md.
+**Kinds now sync**: the resource pass arms a worker per kind (`internal/kubesync`), that worker
+mirrors the collection into the cache's SQLite file (`internal/kubestore`), and the pass folds its
+observation into the kind's `Synced` condition and the sync timeline beneath it. Both `Clear`s and
+both cache gauges answer. What is left is the **read side** — the `CachedData()` family over the
+store, and the `kind_catalog` rows the reads resolve a plural through (→ docs/specs/cached-data.md,
+docs/specs/kind-catalog-sync.md). Until the catalog fold lands, a kind's rows are written but not
+reachable **by plural**, so the `CachedData` reads will read empty until it does. Nothing on the
+write path depends on that table: `Store.ClearKind` takes the whole `Kind` from the record.
+
+**A kind is mirrored by a standing worker, not a periodic pass.** `internal/kubesync` runs one
+goroutine per (cache, GVR): resolve the connection through `Lease.ConnFor`, cold-list into the
+store when there is no cookie to resume from, then watch with `AllowWatchBookmarks` until the
+stream ends. **A position the server refuses is answered in place** — re-list, prune what the list
+did not carry, watch on — because a gap of unknown size has no other answer; every other failure
+goes up the worker's own backoff ladder. Blocking in `kubeconn.AwaitConnFor` is legal *here and
+only here*: the worker is its own goroutine holding nothing shared, where a probe `Run` would pin
+an engine worker. Cold lists pass a fleet-wide semaphore, so enabling a cache does not fire a
+hundred full LISTs at one API server; standing watches are unbounded.
+→ [ADR: sync workers, not probes](../docs/adr/2026-08-26-sync-workers-not-probes.md).
+
+**Every cadence in the loop is a parameter whose production value is the constant** — page size,
+staleness threshold, backoff base and max, the events window and its prune tick — so a test picks
+its own timescale and never encodes a production number.
+
+**A kind's rows are keyed by the record's Kind, never the body's.** The teardown has only
+the record, so a writer that trusted a body claiming another Kind would leave rows under a name
+nothing will ever look up.
+
+**Only a build reports `Syncing`.** A warm reopen — the server closing a watch on its own timeout —
+publishes nothing, or a healthy cache would walk Watching → Syncing → Watching per reopen, waking
+its record twice and writing a resync pair each time, per kind.
+
+**Staleness is a property of the kind, not of one connection.** The threshold runs from the last
+moment the contents were known good — a completed list, or traffic — and a reconnect inherits what
+is left of it. A proxy accepting and closing an empty watch just inside the threshold would
+otherwise restart the clock every time. The clock starts when the first watch opens, so a stream
+that never carries anything goes stale too.
+
+**A connect is not proof of life, and neither is an error frame.** A proxy can accept a watch and
+deliver nothing — or answer every one with a failure — and reopening inside the staleness threshold
+would keep a cache that receives no updates reading healthy forever. So `LastLiveAt` — a claim about
+the *stream* — moves only where the stream carried something: the delta and bookmark arms of
+`apply`, never the error arm. The verdict moves to `Watching` on connect only when that attempt **listed**: the
+collection is on disk as of the list, which is what caught up means. A warm resume waits for the
+stream to say something.
+
+**A watch that ended is paced by what it carried, not by how it ended.** A stream that delivered a
+delta or a bookmark and then dropped is a working watch the server hung up on: the cookie is intact,
+so it reopens off the base of the ladder rather than climbing it — but **every reopen has that
+floor**, or a server closing right after each bookmark would spin every kind in the cache. One that opened and gave nothing is the same clean end and a very
+different cost — a proxy that accepts a watch and closes it turns every kind in the cache into a
+connect loop — so it goes up the backoff ladder without being reported as a failure, since nothing
+about the cache's contents changed.
+
+**The worker publishes a verdict, never timing.** Its `Observation` carries the reason, the object
+count, and two stamps, and the fleet's conflated signal fires **only when the reason moves**, so a
+healthy sync does not requeue its record per delta. `Resumed` says the run started from a cookie,
+and it rides the commit that moves the reason — a flip under an unchanged reason wakes nobody.
+
+**`Synced`'s transitions are the sync event timeline, and the fold writes them.** Only a
+`ControllerClient` can write an event, so `observeSynced` compares the stored condition against
+this pass's verdict and records the move (`SyncStart`/`ResyncStart`, `SyncComplete`/
+`ResyncComplete`, `SyncDegraded`, `SyncStale`, `SyncStopped`) in the same `Within` as the
+condition. Only a move records: the fold runs on every resync, and a healthy steady state is
+silent.
+
+**The store is one SQLite file per cache behind a refcounted `Manager`** (`internal/kubestore`),
+cleared by deleting the file and removed with the record it is named for. A `Store` is a *claim*
+on one cache: `Manager.OpenOrCreate` takes one, `Store.Release` gives it back, and the file is
+resolved per call — so a `Clear` swaps it under live holders, and a `Remove` leaves them answering
+`ErrClosed` rather than writing into an unlinked inode.
+→ [ADR: one store per cache](../docs/adr/2026-08-26-cache-store-per-cache.md). Three traps live in
+its write path:
+
+- **A relist reconciles by mark and sweep**, on `updated_at` — never on the `generation` column,
+  which is the object's own `metadata.generation`. Every write takes a **strictly increasing**
+  stamp (`Store.stamp`): the clock has millisecond resolution, so a relist running in the same
+  tick as the rows it supersedes would otherwise keep every one of them.
+- **Core `v1` events are written to the `events` table**, routed by api version and plural rather
+  than by the Kind name — any group may serve a Kind called `Event`, and a CRD's rows are ordinary
+  objects. Their age-out is the store's `PruneEvents`, run on every event write plus a tick for a
+  quiet cluster: aging out is not a write, so nothing else would emit the `Deleted` a client needs.
+- **Object bodies are sanitized on the way in** — `managedFields` and the kubectl last-applied
+  annotation stripped, Secret values redacted (by the *body's* own kind, so how a collection was
+  addressed cannot bypass it) — which is what lets a read serve `raw_json` verbatim.
+
+**The store owns the change signal, and it is a coalesced ping, not a row delta.** Writers notify
+after commit, keyed per kind (`objects/<apiVersion>/<resource>`) or on the events bus; a reader
+subscribes first, snapshots, and re-reads and diffs by UID on each ping. Closing the store closes
+the bus, which is what ends a live watch when a cache is cleared.
+→ [ADR: the store's ping bus](../docs/adr/2026-08-26-store-change-ping-bus.md).
+
+**Nothing on the read side creates a file.** `Manager` keeps only what is about *which* file and
+its life — `OpenOrCreate` (writers), `OpenExisting` (a caller that must touch an existing cache's
+contents, answering `ok=false` when there is no file), `StoreIfOpen` (bind to what is already open,
+no I/O), `Clear`, `Remove`, `Stats`. Everything about a cache's *contents* is on the `Store` you
+opened. A read that created would resurrect the file as an orphan nothing can name again, for a
+reader that reconnected between a cache being marked for deletion and its teardown pass.
+`Manager.Stats` measures without a claim at all — file size plus the counts, read through the open
+file or a **read-only** open, so a paused cache still reports what it holds.
+
+**The gauges are read-side folds, and both re-emit on a signal *and* a cadence.**
+`Caches().WatchStats` measures the file and the trigger-maintained counts; `Caches().WatchHealth`
+folds the worker fleet by cache (worst reason wins: `IdentityMismatch`, `NoConnection`,
+`SyncFailed`, `Stale`, `Syncing`, then `Connecting` for a kind with no answer yet; `LastLiveAt` is
+the **oldest** proof, and nil while any kind has none — a watch nothing has proven live is weaker
+than any stamp its neighbours carry). The cadence is not optional on either: a file's size moves
+with checkpoints that ping nothing, and the freshness stamps move precisely when the fleet's signal
+is silent. Neither emits before its first measurement, and neither carries a `Bookmark`.
+
+**A cache with no workers still gets a verdict, and it comes from the records.** The health gauge
+is latest-value with no departure frame, so a cache absent from the fold would otherwise read as
+its last verdict — or, for a subscriber that arrived after it went quiet, as no verdict ever. So
+`WatchHealth` enumerates the live cache records each pass and reports every one the fold does not
+cover. **No worker is not the same as switched off**: an enabled cluster's cache has none until its
+catalog pass has run, and one serving no kinds never will, so the reason comes from the pause
+switch the records carry (`cacheSyncEnabled`) — `Paused` when it is off, `Connecting` while it is
+on. A cache being collected is skipped, and so is one a clear is holding (`kubesyncSvc.Holding`):
+a clear stops every subject on its way through, and reporting that would flip a user's own clear to
+Paused and back.
+
+**Both `Clear`s touch the store inside a hold, then requeue.** `Caches().Clear` is
+`kubesyncSvc.WhileCacheStopped(id, …)` around `Manager.Clear`, then a requeue of every kind under
+the cache; `CachedResources().Clear` is `WhileStopped(name, …)` around the kind's rows. **The hold
+is what makes stopping and clearing one step**: it stops the workers *and* refuses a `Track` until
+it returns, because a pass arming one in between would leave a worker resuming its watch into the
+file being emptied — deltas into an empty database, with no cold list to fill it. The requeue is
+what arms them again (a `Track` restarts nothing while its params hold), and it is **deferred and
+outside the hold**: a failed clear re-arms too, since the alternative is a cache that looks fine
+and syncs nothing until `resourceResync` notices ten minutes later. It also runs on its **own
+context** (`afterClear`), not the caller's — the workers are already stopped, so a client hanging
+up as the clear lands is not licence to leave them that way. A requeue that cannot be delivered
+costs latency rather than the clear.
+
+A **teardown** needs no hold — `ForgetCache` then `Manager.Remove` is enough, because `Remove`
+tombstones the id and a worker armed in the gap is refused with `ErrRemoved`.
+
+**A resume poke restarts every worker in place.** `clusterCachedResourceController.Start` subscribes
+to `poke` and calls `kubesyncSvc.RestartAll`: a machine waking from sleep has watches that are
+silently dead and a store that shows nothing moved. The restarts run in turn on that goroutine, each
+waiting for its worker, which is what keeps a resume from reopening a hundred connections at once.
 
 **A read reports the store as it is, and never filters.** A record awaiting deletion is served like
 any other, carrying the tombstone (`deletionRequestedAt`) the consumer decides on — rendering it
@@ -823,9 +953,14 @@ method with a selector argument would undo it.
 catalog that actually owns those records — `service.catalogIDFor` resolves that anchor from the
 cache id (a point read on the derived name), precisely so callers, who only ever hold a cache id,
 never have to. The schema keeps the catalog out of the path for the same reason. **A cache with no
-anchor yet reads empty, never an error** — nothing can hang off an anchor that does not exist — and
-the scoped watch answers it with `deltaWatch.streamEmpty`, the bookmark alone, since an unopened
-collection is definitively empty rather than pending.
+anchor yet reads empty, never an error** — nothing can hang off an anchor that does not exist. For
+the *read* that is the whole answer; for the **watch it is a wait, not an empty collection**. A
+cache's anchor is created by the cache's own pass, so a client subscribing on the frame that
+announced the cache arrives before it exists, every time. `WatchByCache` therefore sends the
+bookmark (the collection is empty *now*), waits for the anchor, and then streams the kinds under
+it as ordinary changes above that snapshot — `deltaWatch.pumpChanges`, which sends no second
+bookmark. `streamEmpty` is for a scope that can never be filled, not for one that is not filled
+yet.
 
 The interface is designed complete rather than caller-driven: the backend is a shell, so the
 methods are the specification and a missing frontend caller is not an argument against one. Fill
@@ -876,7 +1011,7 @@ The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `
 - **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCachedResource`/`clusterCachedResources(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.cachedResources`). The resolver picks the boundary method the argument implies — `Caches().List` when nil, `Caches().ListByCluster` when set. Keep that shape when adding a noun.
 - **The query path skips `ClusterCachedCatalog`.** `ClusterCache.cachedResources` is keyed by the cache and resolves the catalog itself (`CachedResources().List`, like `CachedResources().Watch`): exactly one catalog exists per cache and its name is derived from the cache id (`ClusterCachedCatalogName`), so it is an implementation detail, not a branch to navigate. The catalog's own state still streams on `clusterCachedCatalogsWatch`.
 - **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
-- Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (takes the **cache's own id**, since a UID migration leaves a cluster owning more than one: delete files then **bounce that cache's workers** — nothing else would rebuild them; they cold-sync, the cookie died with the file), `clusterDelete` (GC cascades to the cache; **refused with `ErrDeclaredBySource` for a record its source still declares**, since the discovery pass would re-import it under a fresh id and the new record would carry defaults rather than the user's toggles . **The guard reads the kubeconfig, not the record's observation**, which is only a cached view of it: status is nil for exactly as long as a just-imported record has not reconciled, and the webview renders such a record as orphaned (`isPresent ?? false`) — so its Remove button is live in precisely the window a status-only check would wave through. Status is the fallback while the file is unread, and a record with neither is refused, since refusing is recoverable and allowing is not).
+- Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (takes the **cache's own id**, since a UID migration leaves a cluster owning more than one: stop that cache's workers, delete the files, then **requeue its kinds** — their passes re-arm the workers, which cold-sync, the cookie having died with the file), `clusterDelete` (GC cascades to the cache; **refused with `ErrDeclaredBySource` for a record its source still declares**, since the discovery pass would re-import it under a fresh id and the new record would carry defaults rather than the user's toggles . **The guard reads the kubeconfig, not the record's observation**, which is only a cached view of it: status is nil for exactly as long as a just-imported record has not reconciled, and the webview renders such a record as orphaned (`isPresent ?? false`) — so its Remove button is live in precisely the window a status-only check would wave through. Status is the fallback while the file is unread, and a record with neither is refused, since refusing is recoverable and allowing is not).
 - `ClusterCachedDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the record keeps value `time.Time` for comparability.
 - **A watch that dies reports why** (`graph/watch_failure.go`). gqlgen builds each subscription frame as data alone and stops the instant the resolver's channel closes, so a failed watch is otherwise byte-identical to a graceful end and the webview reconnects forever with nothing shown. `WatchFailureExtension` bridges that in two halves — the resolver and the frame that would carry the reason never share a response context: `InterceptOperation` hangs a slot on the operation ctx (gqlgen threads it into the resolvers *and* every later frame), `watchStream` files `Stream.Err()` into it as the frames run out, and `InterceptResponse` claims it once the stream is spent, emitting one errors-only `graphql.Response` before the transport completes. Claimed once, so the next poll ends the subscription instead of looping. The reason goes through `AddError`, so the server's error presenter logs it. The client treats that frame as a drop with a reason — reported, last-known data held, reconnect — see the root `CLAUDE.md`. → [ADR: watch-failure reporting](../docs/adr/2026-08-14-watch-failure-reporting.md).
 
@@ -932,7 +1067,7 @@ Add a per-context memo invalidated on publish when a caller's cadence makes it s
 
 ## Resync broadcaster (`internal/poke`)
 
-A cross-subsystem **leaf**: a wall-clock gap detector (15s tick, 2× factor — catches sleep/SIGSTOP/VM pause, works headless) plus a `gochan/broadcast` fan-out hub. `New()` takes no arguments; `Start(ctx)` returns a stop func; `Poke(src)` never blocks. Consumers subscribe directly: the core controller re-probes all clusters, the GVR-sync controller bounces workers in place (cheap cookie resume), `prefsync` reconnects. **A poke is a fan-out, not a cascade** — never routed through spec counters or conditions (a clean resume produces no condition transition, so a cascade would silently skip the stale watches). → [ADR: poke resync fan-out](../docs/adr/2026-08-09-poke-resync-fanout.md).
+A cross-subsystem **leaf**: a wall-clock gap detector (15s tick, 2× factor — catches sleep/SIGSTOP/VM pause, works headless) plus a `gochan/broadcast` fan-out hub. `New()` takes no arguments; `Start(ctx)` returns a stop func; `Poke(src)` never blocks. Consumers subscribe directly: the core controller re-probes all clusters, the GVR-sync controller restarts workers in place (cheap cookie resume), `prefsync` reconnects. **A poke is a fan-out, not a cascade** — never routed through spec counters or conditions (a clean resume produces no condition transition, so a cascade would silently skip the stale watches). → [ADR: poke resync fan-out](../docs/adr/2026-08-09-poke-resync-fanout.md).
 
 ## GraphQL via gqlgen — the schema is the source of truth
 
@@ -951,7 +1086,11 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
 ## Patterns
 
 - **A type's methods live in the type's file.** Splitting them across files means a reader has to
-  find the pieces before they can see what a type does. So a file that earns its place owns a
+  find the pieces before they can see what a type does. In `clustersvc` that puts every
+  `func (s *service)` in `service.go`, helpers included. **A helper belongs to whoever calls it**:
+  one family's goes on that family's `*API` type in its kind's file (`cachesAPI.measureCache`),
+  a controller's on the controller (`resourceOwnersOf`), and only what more than one of them needs
+  is on the service (`cacheBelongsTo`, `catalogIDFor`). So a file that earns its place owns a
   type or a body of free functions — not a slice of some other file's type's behavior. In
   `kubeconn` that puts the pool (`Service`'s methods) in `service.go`, the probes in `probe.go`,
   the reason vocabulary with `State`'s accessors in `state.go`, and everything that happens over a

@@ -489,6 +489,10 @@ func TestDepartureIsAnnouncedOnce(t *testing.T) {
 	settled(t, lease)
 	news := s.Subscribe()
 	defer news.Close()
+	// The baseline: `settled` waits for the connection probe alone, so a pass still
+	// landing from startup would be read below as the departure, and the departure's own
+	// signal as a second announcement.
+	settleNews(t, news)
 
 	cfg.rotate("prod", "")
 	cfg.changed()
@@ -908,6 +912,32 @@ func TestConnForRefusesAConnectionWhoseServerWasReplaced(t *testing.T) {
 // quiesce drains the fleet feed until it stops producing, so a test asserting one signal is
 // not handed a leftover from the fleet coming up. A bounded window because "nothing more" has
 // no event to wait for; the feed coalesces, so what is pending is at most one per landed pass.
+// settleNews drains the signals a startup still has in flight, **without touching the
+// receiver's channel**: Chan starts a feeder goroutine that owns every later event, so a
+// receiver drained that way stops answering RecvContext. quiesce below is the same wait
+// for a test that reads through Chan throughout.
+//
+// A bounded quiet window, not a wait for an event: what it waits for is the absence of
+// further signals, which has nothing to fire.
+func settleNews(t *testing.T, news Subscription) {
+	t.Helper()
+	for {
+		// Drain what is pending, then give the window one whole wait rather than polling
+		// it away: what this waits for is the absence of further signals, which has
+		// nothing to fire.
+		for _, err := news.TryRecv(); err == nil; _, err = news.TryRecv() {
+		}
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-t.Context().Done():
+			return
+		}
+		if _, err := news.TryRecv(); err != nil {
+			return
+		}
+	}
+}
+
 func quiesce(t *testing.T, moved Subscription) {
 	t.Helper()
 	for {
@@ -1164,4 +1194,43 @@ func TestAwaitConnForEndsWithItsContext(t *testing.T) {
 	cancel()
 
 	assert.ErrorIs(t, testutil.Recv(t, failed, "the waiter's error"), context.Canceled)
+}
+
+// The rotation signal cannot depend on the re-stamp being slower than the pass that
+// publishes. The stamp is a mutable word on the connection, read at publish time, so a
+// re-stamp of the same uid landing first leaves every uid-derived field exactly as it
+// was — and the fleet would hear nothing about a connection that was replaced under it,
+// stranding whoever was refused inside the window.
+//
+// Driven through record, which is where a pass's news is compared, so the ordering is
+// the test's rather than the scheduler's.
+func TestARebuiltConnectionIsNewsEvenWhenTheStampLandsFirst(t *testing.T) {
+	s := New(serving(serveCluster(t).Server, "prod", "key-1"))
+	lease := s.Acquire("prod")
+	defer lease.Release()
+
+	first := &Connection{seq: connSeq.Add(1)}
+	first.setServerUID("uid-1")
+	_, _, changed := s.record("prod", first, s.newsFor(first))
+	require.True(t, changed, "the first connection is news")
+
+	// The replacement, already stamped as the same cluster by the time this pass
+	// publishes: every uid-derived field matches what was published for its predecessor.
+	second := &Connection{seq: connSeq.Add(1)}
+	second.setServerUID("uid-1")
+
+	_, _, changed = s.record("prod", second, s.newsFor(second))
+
+	assert.True(t, changed, "a replaced connection went unannounced")
+}
+
+// newsFor is the news a pass carrying conn would publish, with everything the probes
+// report held equal — the rotation case, where only the connection moved.
+func (s *Service) newsFor(conn *Connection) news {
+	n := news{phase: PhaseProbed}
+	if conn != nil {
+		n.conn = conn.Seq()
+		n.vouchedFor, _ = conn.ServerUID()
+	}
+	return n
 }

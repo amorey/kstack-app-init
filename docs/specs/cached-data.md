@@ -58,22 +58,20 @@ Carried from `main`'s `store.go`, adapted to the registry:
   - Objects are stored by Kind while the caller holds the plural, so the query translates
     through `kind_catalog` (the schema's unique `(api_version, resource)` index) and rides
     `objects_kind_ns_name`.
-- **`rawcodec`** (zlib): `Objects` decompresses `raw_json` on the way out.
-- **Two ping buses** on the store: objects (keyed by `apiVersion/resource`, plus a cache-wide
-  key) and events (its own bus, so an event-storm cluster does not wake every object watch).
-  Writers notify after commit; the events pruner's deletes notify too, which is how an age-out
-  reaches the events watch. Both buses close when the store closes — including the close inside
-  `Registry.Clear`/`Delete` — which is what ends a live watch with a reason. The reader pool
-  joins the close plumbing: every site that closes a store (`Clear`, `Delete`,
-  `Handle.Release`'s last release, `Registry.Close`) closes both pools and both buses, or `Clear`
+- **`rawcodec`** (zlib, landed): `Objects` decompresses `raw_json` on the way out.
+- **The ping buses** (landed): one keyed `objects/<apiVersion>/<resource>`, one `events`. Both end
+  when the file closes — including the close inside `Manager.Clear`/`Remove` — which is what ends
+  a live watch with a reason. The reader pool joins that close plumbing when it lands, or `Clear`
   leaks reader connections.
-- **A registry read path** for the family's bind rule below: the open store if any, plus a
-  publish when one opens or is swapped — `main`'s `Manager.WatchDB` shape. Readers hold it for
-  the stream's life; only the write-side `Acquire` creates a file.
+- **The manager read path** (landed): `Manager.StoreIfOpen` returns the open store and never creates a
+  file. It has no open-signal yet — the stats gauge re-binds on its own cadence — so a reader that
+  must go live the moment a store opens still needs one (`main`'s `Manager.WatchDB` shape).
 
-The write-side methods that feed the buses (object upsert/delete, event upsert, prune,
-`EnsureKindCatalog`) land with the sync loop (→ cached-resource-sync spec); this spec's tests
-seed rows with white-box SQL until then.
+The write side (object upsert/delete, event upsert, the relist prune, the events pruner) has
+landed with the sync loop, and so have the two ping buses and the registry read path
+(`Manager.StoreIfOpen`, which never creates a file). What is left here is the reads, the row structs,
+the reader pool, and the family itself. `kind_catalog`'s writer is the catalog fold
+(→ kind-catalog-sync spec).
 
 ## The family (`cacheddata.go`)
 
@@ -86,12 +84,12 @@ seed rows with white-box SQL until then.
   `Bookmark` alone, live thereafter (rows arriving after the store opens diff from the empty
   snapshot as ordinary `Added` frames, which the protocol allows).
 
-  Never an open-or-create `Acquire` from a read. The cache teardown deletes the store file on the
+  Never an `OpenOrCreate` from a read. The cache teardown deletes the store file on the
   deletion-pending pass, and its correctness argument is that nothing recreates it — a
   reconnecting watcher lands exactly in the mark-to-GC window, where the record still exists and
   any record-gated create would resurrect the file as a permanent orphan; no
   check-record-then-create ordering closes that, because the mark can land between the check and
-  the create. Binding only to what exists closes it structurally: the worker's `Acquire` is the
+  the create. Binding only to what exists closes it structurally: the worker's `OpenOrCreate` is the
   one creator, and the controller already sequences it against `Delete` (`ForgetCache` waits for
   the workers first).
 - **`WatchObjects`** — the loop over `Objects(apiVersion, resource)`, subscribed to that

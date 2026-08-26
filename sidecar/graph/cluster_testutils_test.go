@@ -422,17 +422,19 @@ func (f fakeCachedResources) Watch(ctx context.Context, id clustersvc.ClusterCac
 
 // WatchStats emits the fixture's single measurement and then holds the
 // stream open, as a gauge with nothing new to report does.
-func (f fakeCaches) WatchStats(ctx context.Context, _ clustersvc.ClusterID, cacheID clustersvc.ClusterCacheID) (<-chan clustersvc.ClusterCacheStats, error) {
+func (f fakeCaches) WatchStats(ctx context.Context, _ clustersvc.ClusterID, cacheID clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCacheStats], error) {
 	f.s.mu.Lock()
 	st := f.s.cacheStats[cacheID]
 	f.s.mu.Unlock()
-	out := make(chan clustersvc.ClusterCacheStats, 1)
-	out <- st
-	go func() {
+	return clustersvc.NewStream(ctx, func(ctx context.Context, out chan<- clustersvc.ClusterCacheStats) error {
+		select {
+		case out <- st:
+		case <-ctx.Done():
+			return nil
+		}
 		<-ctx.Done()
-		close(out)
-	}()
-	return out, nil
+		return nil
+	}), nil
 }
 
 func (f fakeCachedData) ListKinds(_ context.Context, clusterID clustersvc.ClusterID, _ clustersvc.ClusterCacheID) ([]clustersvc.ClusterCachedDataKind, error) {

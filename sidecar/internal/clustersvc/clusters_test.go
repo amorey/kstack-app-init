@@ -738,7 +738,7 @@ func TestToClusterCarriesTheDeletionTombstone(t *testing.T) {
 // tests drive the store directly.
 func serviceOver(t *testing.T, d deps) *service {
 	t.Helper()
-	return &service{deps: d}
+	return &service{deps: d, gaugeCadence: defaultGaugeCadence}
 }
 
 // createCluster creates a kubeconfig-sourced record for contextName.

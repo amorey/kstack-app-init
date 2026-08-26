@@ -19,13 +19,19 @@
 package clustersvc
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/amorey/beehive"
+	"github.com/amorey/gobus"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -116,9 +122,10 @@ type ClusterCacheHealth struct {
 	TotalKinds     int
 	UnhealthyKinds int
 	// LastUpdateAt is the most recent write across every kind — when data last arrived
-	// anywhere in this cache. LastLiveAt is the OLDEST proof among the kinds that have
-	// one: the weakest link, since a cache is only as verified as its least-recently
-	// proven watch. Both nil until some kind has reported.
+	// anywhere in this cache; nil until something has landed. LastLiveAt is the OLDEST
+	// proof across every kind, and **nil while any of them has none**: a cache is only as
+	// verified as its least proven watch, and a kind nothing has proven live is weaker
+	// than any stamp its neighbours carry.
 	LastUpdateAt *time.Time
 	LastLiveAt   *time.Time
 }
@@ -268,16 +275,415 @@ func (a cachesAPI) WatchByCluster(ctx context.Context, clusterID ClusterID) (*St
 	return cacheWatch.streamList(ctx, src), nil
 }
 
-func (a cachesAPI) WatchStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCacheStats, error) {
-	panic("not implemented")
+// defaultGaugeCadence is how often a gauge re-measures when nothing has pinged it.
+// Human-paced: what it covers is a number drifting under a settled record, not an
+// event, and every watcher pays for each tick.
+const defaultGaugeCadence = 5 * time.Second
+
+// WatchStats measures one cache's file and contents. A gauge carries no bookmark and
+// emits nothing before its first measurement, so a pair naming no live cache holds
+// silent rather than claiming an answer — a caller holding a bad id got it from a watch
+// frame, and drops the subscription itself.
+//
+// It re-measures on the store's own change pings and on a cadence, because the two
+// cover different halves: pings carry the writes, and the file's size moves with
+// checkpoints that ping nothing.
+func (a cachesAPI) WatchStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*Stream[ClusterCacheStats], error) {
+	live, err := a.s.cacheBelongsTo(ctx, clusterID, cacheID)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterCacheStats) error {
+		if !live {
+			<-ctx.Done()
+			return nil
+		}
+		ticker := time.NewTicker(a.s.gaugeCadence)
+		defer ticker.Stop()
+
+		var (
+			sub   kubestore.Subscription
+			pings <-chan gobus.Event[string, struct{}]
+			last  ClusterCacheStats
+			sent  bool
+		)
+		defer func() {
+			if sub != nil {
+				sub.Close()
+			}
+		}()
+
+		for {
+			// Bind late and re-bind freely: the store opens when a worker arms, and a
+			// clear swaps it for a fresh one whose pings the old subscription never
+			// carries.
+			if sub == nil {
+				if store := a.s.kubestoreMgr.StoreIfOpen(int64(cacheID)); store != nil {
+					// A store closing between the bind and the subscribe is the cache
+					// being cleared; the next pass round the loop re-binds.
+					if changes, err := store.Subscribe(); err == nil {
+						sub = changes
+						pings = sub.Chan()
+					}
+				}
+			}
+
+			stats, err := a.measureCache(ctx, cacheID)
+			if err != nil {
+				return err
+			}
+			if !sent || stats != last {
+				if !sendFrame(ctx, out, stats) {
+					return nil
+				}
+				last, sent = stats, true
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			case _, ok := <-pings:
+				if !ok {
+					// The store closed under us — a clear, or a shutdown. Re-measure and
+					// re-bind rather than ending: the cache is still the caller's.
+					sub.Close()
+					sub, pings = nil, nil
+				}
+			}
+		}
+	}), nil
 }
 
+// measureCache is one reading of a cache: its file, and what is in it.
+func (a cachesAPI) measureCache(ctx context.Context, cacheID ClusterCacheID) (ClusterCacheStats, error) {
+	stats, err := a.s.kubestoreMgr.Stats(ctx, int64(cacheID))
+	if err != nil {
+		return ClusterCacheStats{}, fmt.Errorf("measure cache %d: %w", cacheID, err)
+	}
+	return ClusterCacheStats{
+		Exists:      stats.Exists,
+		Bytes:       stats.Bytes,
+		ObjectCount: stats.ObjectCount,
+		KindCount:   stats.KindCount,
+	}, nil
+}
+
+// WatchHealth folds the worker fleet by cache. A read-side projection, never a stored
+// condition: nothing in the object graph reacts to it, and storing it would wake the
+// cache and every watcher each time any of its hundred-plus kinds changed verdict.
+//
+// It re-emits on the fleet's own signal and on a cadence, since the stamps it carries
+// move in healthy steady state precisely when the signal is silent.
 func (a cachesAPI) WatchHealth(ctx context.Context) (*Stream[ClusterCacheHealth], error) {
-	panic("not implemented")
+	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterCacheHealth) error {
+		// Subscribed before the first fold, so a verdict landing in between is reported
+		// by the wake rather than missed.
+		moved := a.s.kubesyncSvc.Subscribe()
+		defer moved.Close()
+
+		ticker := time.NewTicker(a.s.gaugeCadence)
+		defer ticker.Stop()
+
+		sent := map[ClusterCacheID]ClusterCacheHealth{}
+		for {
+			folded := foldCacheHealth(a.s.kubesyncSvc.Observations())
+			for _, health := range folded {
+				if prev, ok := sent[health.CacheID]; ok && sameHealth(prev, health) {
+					continue
+				}
+				if !sendFrame(ctx, out, health) {
+					return nil
+				}
+				sent[health.CacheID] = health
+			}
+			stopped, err := a.stoppedCaches(ctx, folded)
+			if err != nil {
+				return err
+			}
+			for _, health := range stopped {
+				if prev, ok := sent[health.CacheID]; ok && sameHealth(prev, health) {
+					continue
+				}
+				if !sendFrame(ctx, out, health) {
+					return nil
+				}
+				sent[health.CacheID] = health
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			case _, ok := <-moved.Chan():
+				if !ok {
+					// The fleet's hub closed: the process is going, and a closed channel
+					// selects forever.
+					return nil
+				}
+			}
+		}
+	}), nil
 }
 
+// Clear empties a cache's store. The workers stop first and are waited for — one still
+// running would be writing through a store this is about to close — and the kinds are
+// then requeued, since their own passes are what re-arm them. They cold-sync: the
+// cookies died with the file.
 func (a cachesAPI) Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache, error) {
-	panic("not implemented")
+	obj, err := a.s.cacheClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
+	if errors.Is(err, beehive.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get cluster cache %d: %w", id, err)
+	}
+
+	// Deferred, and outside the hold: no path out of here may leave the workers stopped,
+	// and the passes that arm them again are refused until the hold is released.
+	defer a.requeueCacheResources(ctx, id)
+
+	// Stopping the workers and emptying the file are one step from a pass's point of
+	// view: one that armed a worker in between would leave it resuming a watch into the
+	// file this is about to swap.
+	if err := a.s.kubesyncSvc.WhileCacheStopped(int64(id), func() error {
+		return a.s.kubestoreMgr.Clear(int64(id))
+	}); err != nil {
+		return nil, fmt.Errorf("clear cluster cache %d: %w", id, err)
+	}
+	return toClusterCache(obj)
+}
+
+// requeueCacheResources asks every kind under a cache to reconcile, which is what
+// re-arms its worker. A requeue that cannot be delivered costs latency rather than the
+// clear: the kind's resync runs the same pass.
+func (a cachesAPI) requeueCacheResources(ctx context.Context, cacheID ClusterCacheID) {
+	ctx, cancel := afterClear(ctx)
+	defer cancel()
+
+	catalogID, ok, err := a.s.catalogIDFor(ctx, cacheID)
+	if err != nil || !ok {
+		return
+	}
+	objs, err := a.s.resourceClient.ListOwnedObjects(ctx, catalogID)
+	if err != nil {
+		return
+	}
+	for _, obj := range objs {
+		//nolint:errcheck // a lost requeue costs latency; resourceResync is the backstop
+		_ = a.s.resourceClient.Requeue(ctx, obj.ID)
+	}
+}
+
+// healthPrecedence orders the verdicts a cache's kinds can be in, worst first: ninety-
+// nine healthy kinds and one the credentials cannot name is not a cache that is nearly
+// fine, and the reason a user acts on is the worst one present.
+var healthPrecedence = []struct{ observed, reported string }{
+	{kubesync.ReasonIdentityMismatch, ReasonIdentityMismatch},
+	{kubesync.ReasonNoConnection, ReasonNoConnection},
+	{kubesync.ReasonSyncFailed, ReasonSyncFailed},
+	{kubesync.ReasonStale, ReasonStale},
+	{kubesync.ReasonSyncing, ReasonSyncing},
+	// A tracked kind with no answer yet: armed, still connecting.
+	{"", ReasonConnecting},
+}
+
+// foldCacheHealth groups the fleet's observations by cache and folds each group into
+// one verdict. A cache with no tracked subjects is absent from the answer; what the
+// stream owes for one it has already reported is stoppedCaches' business.
+func foldCacheHealth(fleet []kubesync.SubjectObservation) []ClusterCacheHealth {
+	byCache := map[int64][]kubesync.SubjectObservation{}
+	for _, subject := range fleet {
+		byCache[subject.Params.CacheID] = append(byCache[subject.Params.CacheID], subject)
+	}
+
+	out := make([]ClusterCacheHealth, 0, len(byCache))
+	for cacheID, subjects := range byCache {
+		out = append(out, foldOneCacheHealth(ClusterCacheID(cacheID), subjects))
+	}
+	slices.SortFunc(out, func(a, b ClusterCacheHealth) int { return cmp.Compare(a.CacheID, b.CacheID) })
+	return out
+}
+
+// foldOneCacheHealth is one cache's verdict over the kinds it syncs.
+func foldOneCacheHealth(cacheID ClusterCacheID, subjects []kubesync.SubjectObservation) ClusterCacheHealth {
+	health := ClusterCacheHealth{
+		CacheID:    cacheID,
+		Status:     ConditionTrue,
+		Reason:     ReasonWatching,
+		TotalKinds: len(subjects),
+	}
+
+	present := map[string]bool{}
+	// firstUnhealthy is the fallback verdict for a reason this fold does not rank — a
+	// kind that is not watching is not healthy, whatever word the worker used.
+	var firstUnhealthy string
+	var newestUpdate, oldestLive time.Time
+	// unproven: one kind that has never seen watch traffic leaves the whole cache
+	// unverified, since nothing else vouches for what that kind may be missing.
+	var unproven bool
+	for _, subject := range subjects {
+		if !subject.Known || subject.Observation.Reason != kubesync.ReasonWatching {
+			observed := ""
+			if subject.Known {
+				observed = subject.Observation.Reason
+			}
+			present[observed] = true
+			if firstUnhealthy == "" {
+				firstUnhealthy = observed
+			}
+			health.UnhealthyKindRefs = append(health.UnhealthyKindRefs, SyncedKindRef{
+				APIVersion: subject.Params.APIVersion,
+				Resource:   subject.Params.Resource,
+			})
+		}
+		if at := subject.Observation.LastUpdateAt; !at.IsZero() && at.After(newestUpdate) {
+			newestUpdate = at
+		}
+		// The weakest link: a cache is only as verified as its least proven watch. A kind
+		// with no proof at all is weaker than any stamp, so it takes the whole cache's
+		// freshness with it rather than being skipped over.
+		at := subject.Observation.LastLiveAt
+		switch {
+		case at.IsZero():
+			unproven = true
+		case oldestLive.IsZero() || at.Before(oldestLive):
+			oldestLive = at
+		}
+	}
+
+	health.UnhealthyKinds = len(health.UnhealthyKindRefs)
+	slices.SortFunc(health.UnhealthyKindRefs, func(a, b SyncedKindRef) int {
+		if c := cmp.Compare(a.APIVersion, b.APIVersion); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Resource, b.Resource)
+	})
+	for _, verdict := range healthPrecedence {
+		if present[verdict.observed] {
+			health.Status, health.Reason = ConditionFalse, verdict.reported
+			break
+		}
+	}
+	if len(health.UnhealthyKindRefs) > 0 && health.Status == ConditionTrue {
+		health.Status, health.Reason = ConditionFalse, firstUnhealthy
+	}
+	health.LastUpdateAt = nilIfZero(newestUpdate)
+	if !unproven {
+		health.LastLiveAt = nilIfZero(oldestLive)
+	}
+	return health
+}
+
+// stoppedCaches is the verdict owed by every live cache the fold does not cover, which
+// is every cache with no worker armed.
+//
+// It reads the records rather than diffing against what this stream has sent, because a
+// subscriber that arrives after a cache went quiet never witnessed the transition and
+// would otherwise hear nothing about that cache at all. The gauge is latest-value with
+// no departure frame, so silence reads as the last verdict — or as no verdict ever.
+//
+// **No worker is not the same as switched off.** An enabled cluster's cache has none
+// until its catalog pass has run, and one serving no kinds never will, so the verdict
+// comes from the pause switch the records carry (`cacheSyncEnabled`) rather than from
+// the absence. A cache being collected is skipped: its own record says it is going.
+func (a cachesAPI) stoppedCaches(ctx context.Context, folded []ClusterCacheHealth) ([]ClusterCacheHealth, error) {
+	covered := make(map[ClusterCacheID]bool, len(folded))
+	for _, health := range folded {
+		covered[health.CacheID] = true
+	}
+
+	objs, err := a.s.cacheClient.List(ctx, beehive.LoadOwner())
+	if err != nil {
+		return nil, fmt.Errorf("list cluster caches: %w", err)
+	}
+
+	var out []ClusterCacheHealth
+	clusters := map[beehive.ObjectID]*beehive.Object[ClusterSpec, ClusterStatus]{}
+	for _, obj := range objs {
+		id := ClusterCacheID(obj.ID)
+		if covered[id] || obj.DeletionRequestedAt != nil {
+			continue
+		}
+		if a.s.kubesyncSvc.Holding(int64(id)) {
+			// A clear stops the workers on its way through, which is not the cache
+			// having stopped syncing — reporting it would flip a user's own clear to
+			// Paused and back. The verdict stands until the kinds are armed again.
+			continue
+		}
+
+		cluster, err := a.clusterFor(ctx, obj, clusters)
+		if err != nil {
+			return nil, err
+		}
+		if cluster == nil {
+			// The cluster is gone, so this cache is going with it.
+			continue
+		}
+		reason := ReasonConnecting
+		if !cacheSyncEnabled(cluster, obj.Spec.ServerUID) {
+			reason = ReasonPaused
+		}
+		out = append(out, ClusterCacheHealth{CacheID: id, Status: ConditionFalse, Reason: reason})
+	}
+	slices.SortFunc(out, func(a, b ClusterCacheHealth) int { return cmp.Compare(a.CacheID, b.CacheID) })
+	return out, nil
+}
+
+// clusterFor resolves a cache's cluster, memoised for the fold: caches of one cluster
+// share it, and this runs on the gauge's cadence.
+func (a cachesAPI) clusterFor(
+	ctx context.Context,
+	cache *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
+	seen map[beehive.ObjectID]*beehive.Object[ClusterSpec, ClusterStatus],
+) (*beehive.Object[ClusterSpec, ClusterStatus], error) {
+	owner, ok, err := cache.Owner()
+	if err != nil {
+		return nil, fmt.Errorf("read cluster cache %d owner: %w", cache.ID, err)
+	}
+	if !ok {
+		return nil, nil
+	}
+	if cluster, held := seen[owner.ID]; held {
+		return cluster, nil
+	}
+
+	cluster, err := a.s.clusterClient.Get(ctx, owner.ID)
+	if errors.Is(err, beehive.ErrNotFound) {
+		seen[owner.ID] = nil
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cluster %d: %w", owner.ID, err)
+	}
+	seen[owner.ID] = cluster
+	return cluster, nil
+}
+
+// sameHealth reports whether a cache's verdict moved. The refs are a slice, so the
+// struct is not comparable — and re-emitting an unchanged gauge is exactly what the
+// cadence must not do.
+func sameHealth(a, b ClusterCacheHealth) bool {
+	return a.Status == b.Status && a.Reason == b.Reason &&
+		a.TotalKinds == b.TotalKinds && a.UnhealthyKinds == b.UnhealthyKinds &&
+		slices.Equal(a.UnhealthyKindRefs, b.UnhealthyKindRefs) &&
+		sameTime(a.LastUpdateAt, b.LastUpdateAt) && sameTime(a.LastLiveAt, b.LastLiveAt)
+}
+
+func sameTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
+}
+
+// nilIfZero keeps an unobserved stamp absent rather than reporting the epoch.
+func nilIfZero(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 // clusterCacheController reconciles one cache: today it creates the discovery anchor
@@ -305,8 +711,8 @@ func (c *clusterCacheController) Reconcile(
 		// own passes, and a worker still running would be writing through a store this
 		// is about to close.
 		c.kubesyncSvc.ForgetCache(int64(obj.ID))
-		if err := c.kubestoreSvc.Delete(int64(obj.ID)); err != nil {
-			return beehive.Fail(fmt.Errorf("delete cluster cache %d store: %w", obj.ID, err))
+		if err := c.kubestoreMgr.Remove(int64(obj.ID)); err != nil {
+			return beehive.Fail(fmt.Errorf("remove cluster cache %d store: %w", obj.ID, err))
 		}
 		return beehive.Settled()
 	}

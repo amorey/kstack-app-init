@@ -78,9 +78,11 @@ about" — is why the fold does the writing and the sweep stays store- and recor
 
 ## kubestore changes
 
-- **`kind_catalog` has one writer: the fold.** `ClearKind` stops deleting the row (today it
-  does — change it and its test): a user-initiated `CachedResources().Clear` wipes a kind that
-  is still served, and deleting its row would drop it from the nav until the next fold pass.
+- **`kind_catalog` has one writer: the fold.** `ClearKind` does not *resolve* through the table —
+  it takes the whole `Kind` from the record, so a teardown never waits on this spec — but it still
+  deletes the row, and that has to stop (change it and its test): a user-initiated
+  `CachedResources().Clear` wipes a kind that is still served, and deleting its row would drop it
+  from the nav until the next fold pass.
   Rows leave the table only through the fold's prune, when the kind leaves the discovery answer.
 - **`Store.SyncKinds(ctx, rows, prune bool, fingerprint)`**: one transaction that upserts the
   row set, deletes rows not in it when `prune`, and **records the consumed fingerprint in
@@ -140,10 +142,8 @@ and rewrites the rows idempotently over what the previous process left.
   mirrors" — an advertised kind appears with `Count` 0 before its worker has synced anything,
   which is what `ClusterCachedDataKind`'s doc always promised the nav. `is_crd` comes from the
   row the fold wrote; the worker-registration sentence goes.
-- **cached-resource-sync spec**: workers no longer register `kind_catalog` rows on start, and
-  the `is_crd` relay (sweep → `toResourceSpecs` → `ClusterCachedResourceSpec` → `Params` →
-  registration) is deleted — the fold writes the bit straight from the sweep's answer. What
-  remains on the worker is writing objects and cookies.
+- **the landed sync loop**: workers write objects, events, and cookies, never `kind_catalog` rows,
+  and carry no `is_crd` — the fold writes that bit straight from the sweep's answer.
 - **TODO.md**: the "catalog stays resident" item is superseded — delete it when this lands, and
   carry its weighing (and the fingerprint-vs-disk answer to its two blockers) into the ADR.
 

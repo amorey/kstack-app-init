@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -58,6 +59,7 @@ type resourceControllerClient struct {
 	// hold while the row is still there.
 	noOwner    bool
 	conditions []Condition
+	events     []beehive.EventSpec
 }
 
 func (c *resourceControllerClient) GetOwner(ctx context.Context) (beehive.ObjectRef, bool, error) {
@@ -70,6 +72,17 @@ func (c *resourceControllerClient) GetOwner(ctx context.Context) (beehive.Object
 func (c *resourceControllerClient) SetCondition(_ context.Context, cond Condition) error {
 	c.conditions = append(c.conditions, cond)
 	return nil
+}
+
+func (c *resourceControllerClient) AddEvent(_ context.Context, ev beehive.EventSpec) error {
+	c.events = append(c.events, ev)
+	return nil
+}
+
+// Within runs the group inline: the fold's condition and its event are one write, and
+// what the tests assert is that both landed.
+func (c *resourceControllerClient) Within(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
 }
 
 // synced is the verdict the pass recorded.
@@ -112,7 +125,7 @@ func reconcileResource(
 func syncFleet(d deps) *fakeKubesync { return d.kubesyncSvc.(*fakeKubesync) }
 
 // kubestoreFake is the fake store registry behind the pass under test.
-func kubestoreFake(d deps) *fakeKubestore { return d.kubestoreSvc.(*fakeKubestore) }
+func kubestoreFake(d deps) *fakeKubestore { return d.kubestoreMgr.(*fakeKubestore) }
 
 // A resource on its way out has its worker disarmed and its rows cleared — the other
 // side of the handshake the catalog's DiscoveryDraining requeue is waiting on.
@@ -125,8 +138,7 @@ func TestResourceReconcileClearsOnDeletion(t *testing.T) {
 
 	assert.Equal(t, beehive.Settled(), res)
 	assert.Equal(t, []string{obj.Name}, syncFleet(d).forgotten)
-	require.Len(t, kubestoreFake(d).cleared, 1)
-	assert.Equal(t, clearedKind{cacheID: int64(cache.ID), apiVersion: "apps/v1", resource: "deployments"}, kubestoreFake(d).cleared[0])
+	assert.Equal(t, []int64{int64(cache.ID)}, kubestoreFake(d).opened, "the kind's rows were cleared from the wrong cache")
 	assert.Empty(t, client.conditions)
 }
 
@@ -142,8 +154,7 @@ func TestResourceReconcileFailsWhenClearKindErrors(t *testing.T) {
 
 	require.Error(t, res.Err())
 	assert.Equal(t, []string{obj.Name}, syncFleet(d).forgotten, "the worker is disarmed even though the clear failed")
-	require.Len(t, kubestoreFake(d).cleared, 1)
-	assert.Equal(t, int64(cache.ID), kubestoreFake(d).cleared[0].cacheID)
+	assert.Equal(t, []int64{int64(cache.ID)}, kubestoreFake(d).opened)
 	assert.Empty(t, client.conditions)
 }
 
@@ -158,7 +169,7 @@ func TestResourceReconcileSettlesWhenOwnerChainIsBroken(t *testing.T) {
 
 	assert.Equal(t, beehive.Settled(), res)
 	assert.Equal(t, []string{obj.Name}, syncFleet(d).forgotten)
-	assert.Empty(t, kubestoreFake(d).cleared)
+	assert.Empty(t, kubestoreFake(d).opened)
 	assert.Empty(t, client.conditions)
 }
 
@@ -193,8 +204,8 @@ func TestResourceReconcileArmsTheWorker(t *testing.T) {
 		ContextName: "prod",
 		ServerUID:   "uid-1",
 		APIVersion:  "apps/v1",
+		Kind:        "Deployment",
 		Resource:    "deployments",
-		Namespaced:  true,
 	}, f.armedWith[obj.Name])
 	cond := client.synced(t)
 	assert.Equal(t, ConditionFalse, cond.Status)
@@ -480,4 +491,307 @@ func TestCachedResourcesWatchByCacheWithNoCatalogBookmarksEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+}
+
+// --- the sync event timeline ---
+
+// syncEvents is the sync-category timeline the pass recorded.
+func (c *resourceControllerClient) syncEvents(t *testing.T) []beehive.EventSpec {
+	t.Helper()
+	var out []beehive.EventSpec
+	for _, ev := range c.events {
+		if ev.Category == SyncEventCategory {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// storedSynced is the verdict a previous pass left on the record, which the fold
+// compares this pass's against — only a move records an event.
+func storedSynced(obj *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus], reason string) {
+	obj.Conditions = []Condition{LiveCondition(ConditionSynced, ConditionFalse, reason, "")}
+}
+
+// The transition into a verdict is what the timeline records — the worker cannot write
+// one, since only a ControllerClient can, so the fold derives it from the move.
+func TestResourceReconcileRecordsTheSyncTransition(t *testing.T) {
+	tests := map[string]struct {
+		stored     string
+		obs        kubesync.Observation
+		wantReason string
+		wantType   beehive.EventType
+	}{
+		"a cold build starting": {
+			obs:        kubesync.Observation{Reason: kubesync.ReasonSyncing},
+			wantReason: ReasonSyncStart, wantType: beehive.EventNormal,
+		},
+		"a warm cache resuming": {
+			obs:        kubesync.Observation{Reason: kubesync.ReasonSyncing, Resumed: true, ObjectCount: 12},
+			wantReason: ReasonResyncStart, wantType: beehive.EventNormal,
+		},
+		"a cold build caught up": {
+			stored:     ReasonSyncing,
+			obs:        kubesync.Observation{Reason: kubesync.ReasonWatching, ObjectCount: 7},
+			wantReason: ReasonSyncComplete, wantType: beehive.EventNormal,
+		},
+		"a resume caught up": {
+			stored:     ReasonSyncing,
+			obs:        kubesync.Observation{Reason: kubesync.ReasonWatching, Resumed: true, ObjectCount: 7},
+			wantReason: ReasonResyncComplete, wantType: beehive.EventNormal,
+		},
+		"a watch that came back from stale": {
+			stored:     ReasonStale,
+			obs:        kubesync.Observation{Reason: kubesync.ReasonWatching, ObjectCount: 7},
+			wantReason: ReasonResyncComplete, wantType: beehive.EventNormal,
+		},
+		"a worker failing": {
+			stored:     ReasonWatching,
+			obs:        kubesync.Observation{Reason: kubesync.ReasonSyncFailed, Message: "forbidden"},
+			wantReason: ReasonSyncDegraded, wantType: beehive.EventWarning,
+		},
+		"a watch going quiet": {
+			stored:     ReasonWatching,
+			obs:        kubesync.Observation{Reason: kubesync.ReasonStale},
+			wantReason: ReasonSyncStale, wantType: beehive.EventWarning,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			d, _, obj := servingResource(t, true)
+			if tt.stored != "" {
+				storedSynced(obj, tt.stored)
+			}
+			syncFleet(d).obs = map[string]kubesync.Observation{obj.Name: tt.obs}
+
+			client, res := reconcileResource(t, d, obj)
+
+			require.NoError(t, res.Err())
+			events := client.syncEvents(t)
+			require.Len(t, events, 1)
+			assert.Equal(t, tt.wantReason, events[0].Reason)
+			assert.Equal(t, tt.wantType, events[0].Type)
+		})
+	}
+}
+
+// A resume's message reports the warm size, which is what tells it from a cold build
+// in a timeline read weeks later.
+func TestResourceReconcileReportsTheWarmSizeOnAResume(t *testing.T) {
+	d, _, obj := servingResource(t, true)
+	syncFleet(d).obs = map[string]kubesync.Observation{
+		obj.Name: {Reason: kubesync.ReasonSyncing, Resumed: true, ObjectCount: 12},
+	}
+
+	client, _ := reconcileResource(t, d, obj)
+
+	require.Len(t, client.syncEvents(t), 1)
+	assert.Contains(t, client.syncEvents(t)[0].Message, "12")
+}
+
+// A pass that observed the verdict already on the record records nothing: a healthy
+// steady state is silent, and the fold runs on every resync.
+func TestResourceReconcileRecordsNoEventWithoutAMove(t *testing.T) {
+	d, _, obj := servingResource(t, true)
+	storedSynced(obj, ReasonWatching)
+	syncFleet(d).obs = map[string]kubesync.Observation{
+		obj.Name: {Reason: kubesync.ReasonWatching, ObjectCount: 7},
+	}
+
+	client, res := reconcileResource(t, d, obj)
+
+	require.NoError(t, res.Err())
+	assert.Empty(t, client.syncEvents(t))
+}
+
+// The disarm branches say so on the timeline: a kind that stops syncing because it was
+// paused, or because its cluster cannot be reached, is not a kind that failed.
+func TestResourceReconcileRecordsTheDisarmBranches(t *testing.T) {
+	t.Run("paused", func(t *testing.T) {
+		d, _, obj := servingResource(t, false)
+		storedSynced(obj, ReasonWatching)
+
+		client, res := reconcileResource(t, d, obj)
+
+		require.NoError(t, res.Err())
+		require.Len(t, client.syncEvents(t), 1)
+		assert.Equal(t, ReasonSyncStopped, client.syncEvents(t)[0].Reason)
+	})
+
+	t.Run("no connection", func(t *testing.T) {
+		d := newTestDeps(t)
+		cluster, err := d.clusterClient.Create(context.Background(), "adopted", ClusterSpec{Enabled: true})
+		require.NoError(t, err)
+		cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+		catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
+		obj := createResource(t, d, catalog.ID, deploymentsSpec)
+		storedSynced(obj, ReasonWatching)
+
+		client, res := reconcileResource(t, d, obj)
+
+		require.NoError(t, res.Err())
+		require.Len(t, client.syncEvents(t), 1)
+		assert.Equal(t, ReasonSyncStopped, client.syncEvents(t)[0].Reason)
+	})
+}
+
+// Clearing one kind is the cache-wide clear per kind: stop that worker, drop its rows,
+// and requeue the record whose pass re-arms it.
+func TestCachedResourcesClearStopsTheWorkerAndClearsTheKind(t *testing.T) {
+	d, cache, obj := servingResource(t, true)
+
+	got, err := serviceOver(t, d).CachedResources().Clear(context.Background(), ClusterCachedResourceID(obj.ID))
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, ClusterCachedResourceID(obj.ID), got.ID)
+	assert.Equal(t, []string{obj.Name}, syncFleet(d).forgotten, "the record's name is the subject id")
+	// Inside the hold: the rows and the cookie go together, so a worker armed between
+	// them would resume its watch and never re-list the kind.
+	assert.Equal(t, []string{obj.Name}, syncFleet(d).held, "the clear ran outside the hold")
+	assert.Equal(t, []int64{int64(cache.ID)}, kubestoreFake(d).opened)
+}
+
+func TestCachedResourcesClearOfAnUnknownRecordIsNotAnError(t *testing.T) {
+	d := newTestDeps(t)
+
+	got, err := serviceOver(t, d).CachedResources().Clear(context.Background(), 999)
+
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+// A poke is a resume, not a rebuild: every worker restarts in place off its cookie.
+func TestResourceControllerRestartsEveryWorkerOnAPoke(t *testing.T) {
+	pokeSvc := poke.New()
+	d := newTestDeps(t)
+	d.pokeSvc = pokeSvc
+	c := &clusterCachedResourceController{deps: d}
+	stop, err := c.Start(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	pokeSvc.Poke(poke.SourceHost)
+
+	require.Eventually(t, func() bool {
+		return syncFleet(d).fleetRestartCount() > 0
+	}, testutil.Timeout, time.Millisecond)
+}
+
+// clearKindRows is what both teardown paths go through, and it must reach exactly the
+// kind it was handed: the cookie is the observable half — a kind whose position is gone
+// cold-syncs, and one whose survived does not.
+func TestClearKindRowsClearsOnlyThatKind(t *testing.T) {
+	ctx := context.Background()
+	stores := newFakeKubestore(t)
+	store, _, err := stores.OpenExisting(1)
+	require.NoError(t, err)
+	require.NoError(t, store.SetCookie(ctx, "apps/v1", "deployments", "10"))
+	require.NoError(t, store.SetCookie(ctx, "v1", "pods", "20"))
+	store.Release()
+
+	require.NoError(t, clearKindRows(ctx, stores, 1, deploymentsSpec))
+
+	store, _, err = stores.OpenExisting(1)
+	require.NoError(t, err)
+	defer store.Release()
+	_, ok, err := store.Cookie(ctx, "apps/v1", "deployments")
+	require.NoError(t, err)
+	assert.False(t, ok, "the kind's own position survived its clear")
+	_, ok, err = store.Cookie(ctx, "v1", "pods")
+	require.NoError(t, err)
+	assert.True(t, ok, "another kind's position went with it")
+}
+
+// A cache with no file has nothing to clear, and finding that out must not create one.
+func TestClearKindRowsSkipsACacheWithNoFile(t *testing.T) {
+	stores := newFakeKubestore(t)
+	stores.noFile = true
+
+	require.NoError(t, clearKindRows(context.Background(), stores, 1, deploymentsSpec))
+}
+
+// The per-kind clear owes the same re-arm as the cache-wide one: the worker is stopped
+// before the rows are touched, so a clear that fails has to ask the record to reconcile
+// anyway — its pass is what arms the worker again, and the rows it failed to remove are
+// still there being served.
+func TestCachedResourcesClearRearmsTheWorkerWhenTheStoreFails(t *testing.T) {
+	d, status := newReconcilingDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
+	obj := createResource(t, d, catalog.ID, deploymentsSpec)
+	fleet := syncFleet(d)
+	armed := fleet.settle(t)
+	kubestoreFake(d).err = errors.New("disk full")
+
+	_, err := serviceOver(t, d).CachedResources().Clear(context.Background(), ClusterCachedResourceID(obj.ID))
+
+	require.Error(t, err, "the failed clear was reported as a success")
+	require.Eventually(t, func() bool {
+		return fleet.arms() > armed
+	}, testutil.Timeout, time.Millisecond, "the kind was left disarmed by a failed clear")
+}
+
+// A cache's catalog is created by its own pass, so a client that subscribes on the frame
+// announcing the cache arrives before the anchor exists. That is a wait, not an empty
+// collection: the bookmark closes a snapshot of none, and the kinds are reported as they
+// land. Binding to nothing here would leave the view at "no kinds" for the life of the
+// subscription.
+func TestCachedResourcesWatchByCacheReportsKindsThatArriveLater(t *testing.T) {
+	d := newRunningDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	stream, err := serviceOver(t, d).CachedResources().WatchByCache(ctx, ClusterCacheID(cache.ID))
+	require.NoError(t, err)
+	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+
+	// The cache's pass, arriving after the subscription.
+	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
+	obj := createResource(t, d, catalog.ID, deploymentsSpec)
+
+	got := testutil.Recv(t, stream.Frames, "the kind that landed after the anchor")
+	assert.Equal(t, DeltaFrameAdded, got.Type)
+	require.NotNil(t, got.Resource)
+	assert.Equal(t, ClusterCachedResourceID(obj.ID), got.Resource.ID)
+}
+
+// The per-kind clear owes the same: its requeue is what arms the worker again, and a
+// caller that hangs up mid-clear must not cost the kind its sync.
+func TestCachedResourcesClearRearmsTheWorkerWhenTheCallerHangsUp(t *testing.T) {
+	d, status := newReconcilingDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
+	obj := createResource(t, d, catalog.ID, deploymentsSpec)
+	fleet := syncFleet(d)
+	armed := fleet.settle(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	kubestoreFake(d).onOpen = func(int64) { cancel() }
+
+	_, err := serviceOver(t, d).CachedResources().Clear(ctx, ClusterCachedResourceID(obj.ID))
+
+	// The clear itself goes with the caller — its statements ride that context — but the
+	// worker it stopped is not the caller's to leave stopped.
+	require.Error(t, err)
+	require.Eventually(t, func() bool {
+		return fleet.arms() > armed
+	}, testutil.Timeout, time.Millisecond, "the kind was left disarmed by a cancelled caller")
+}
+
+// A kind the discovery pass has just written, on a cluster whose sync is off, has not
+// stopped syncing — it never started. The timeline is for what happened.
+func TestResourceReconcileRecordsNoStopBeforeAnythingStarted(t *testing.T) {
+	d, _, obj := servingResource(t, false)
+
+	client, res := reconcileResource(t, d, obj)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, ReasonPaused, client.synced(t).Reason)
+	assert.Empty(t, client.syncEvents(t), "a kind that never started was recorded as stopping")
 }

@@ -414,15 +414,20 @@ type news struct {
 	departed bool
 	phase    Phase
 	identity Identity
+	// conn identifies the connection itself, so a REPLACEMENT is news whatever it goes on
+	// to vouch for. A rotation for an unchanged cluster moves nothing else: same endpoint,
+	// same phase, same uid.
+	//
+	// **It cannot be derived from vouchedFor.** The stamp is a mutable word on the
+	// connection, read at publish time rather than committed by the pass, so a re-stamp
+	// landing before this pass publishes leaves vouchedFor exactly as it was — and the
+	// rotation goes unannounced, stranding whoever was refused inside the window
+	// (kubecatalog suspends there, and only this signal re-runs it).
+	conn uint64
 	// vouchedFor is the cluster the CURRENT connection vouches for, empty while it vouches
 	// for none. Distinct from identity, which is what the probes last read over whatever
-	// connection was up at the time: a rebuild empties this and a stamp refills it, and
-	// neither moves any other field when the cluster did not change.
-	//
-	// Without it a credential rotation for an unchanged cluster is silent — the connection is
-	// replaced, an identity-scoped holder is refused until the stamp lands, and the stamp
-	// commits nothing because the uid it read equals the one already recorded. Nothing would
-	// ever tell that holder to try again.
+	// connection was up at the time. It is what carries a conflict: the connection is the
+	// same one, and what it will vouch for has changed.
 	vouchedFor string
 	ok         [len(probeNames)]bool
 }
@@ -435,6 +440,7 @@ func (s *Service) newsOf(v probe.Snapshot, st State) news {
 		identity: st.Identity(),
 	}
 	if ci.conn != nil {
+		n.conn = ci.conn.Seq()
 		n.vouchedFor, _ = ci.conn.ServerUID()
 	}
 	for i, name := range probeNames {

@@ -122,6 +122,65 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
     per-probe minimum interval — "this probe runs at most once every N" — would cover the same
     burst without a second timing mechanism in the queue.
 
+- **`kubecatalog` and `kubesync` fold alike but are scheduled apart.** Both are leaves armed from a
+  record's reconcile, both key subjects by the record's beehive name, both publish a standing
+  `Observation` plus a `gobus/conflate` signal when the news moves, and both controllers fold them
+  with nearly the same code. Underneath they diverge completely: the sweeper is one probe on a
+  second `probe.Engine` (interval, backoff ladder, worker bound, `Suspend`/`Wake` all the engine's),
+  while the fleet runs a goroutine per subject with its own retry ladder, staleness timer and
+  cold-list semaphore. **The divergence is real** — a sync is a standing watch, and a probe `Run`
+  can neither hold one open nor block waiting for a connection without pinning an engine worker
+  (→ [ADR: sync workers, not probes](docs/adr/2026-08-26-sync-workers-not-probes.md)) — so this is
+  not "put kubesync on the engine". The question is whether the *shape they already share* should
+  be a shape the compiler knows: a `Track`/`Forget`/`Read`/`Subscribe` + `Observation` contract both
+  satisfy, so a controller folds either through one interface, a third leaf inherits it, and the
+  arming-is-policy rule is stated once rather than in two package docs.
+  - **What to look at first:** whether the two `Observation` types can share a core (the sweeper's
+    is `probe.Observation[Catalog]` — engine-owned, with `Attempt` timing; the fleet's is its own
+    struct with counts and freshness stamps), because if they cannot, the shared contract is only
+    the arming half and is probably not worth a type.
+  - **The other direction:** give the engine a subject kind that owns a long-lived stream — a `Run`
+    that is allowed to block for its subject's life, with its own worker budget — and put the fleet
+    on it after all. That is the bigger change and it earns its keep only if a third leaf wants the
+    same thing.
+  - **Trigger:** the third leaf of this shape, or the next time a rule has to be fixed in both
+    package docs at once.
+
+- **Nothing reclaims a cache file's free pages, and the storage shape has never been reviewed.**
+  `sidecar/internal/clustersvc/internal/kubestore` opens each cache with
+  `auto_vacuum=INCREMENTAL` set before migrations — which alone reclaims nothing: pages return to
+  the OS only when `PRAGMA incremental_vacuum` runs, and no code runs it. Every prune (the events
+  window, a relist's sweep, a kind's clear) therefore grows the freelist and the file sits at its
+  high-water mark until the cache is cleared outright, while `ClusterCacheStats.Bytes` — the number
+  a user watches — reports that mark rather than what is held. The previous store had a janitor
+  doing this; it was not carried over.
+  - **The janitor is the first piece**, and the shape to draw from is `main`'s
+    `sidecar/internal/cluster/cache/store/janitor.go`: a per-cache tick that trims `status_history`
+    past a TTL, then reads `PRAGMA freelist_count` and hands back a **bounded** number of pages.
+    The bound is the point — the cache has one writer, so an unbounded vacuum blocks every kind's
+    sync, and the freelist is biggest exactly when that hurts most, right after a prune. Gate on
+    the freelist, never on what that sweep itself deleted: the writers that actually free pages
+    (the events prune, a kind's clear, a relist's sweep) do not vacuum, so a rows-deleted gate
+    would strand the file forever.
+  - **`status_history` has no retention at all** now that it is written again. It is append-on-change
+    (a relist rewriting every row inserts nothing), so volume is small — but nothing bounds it, and
+    it is the one table the store owns outright rather than mirroring from the server.
+  - **Review the table shapes while there.** Every table is already `STRICT`, and `objects` is
+    deliberately a rowid table (its rows carry the compressed body, and `WITHOUT ROWID` is a loss
+    once a row passes roughly a twentieth of a page). The candidates are the small keyed tables —
+    `owner_refs` and `labels` (composite primary keys, no payload), `kind_counts`, `kind_catalog`,
+    `cluster_meta` — where `WITHOUT ROWID` drops a b-tree and an indirection per lookup.
+    `status_history` is deliberately a plain rowid table (two transitions in one millisecond must
+    both survive); leave it.
+  - **And the pragmas nobody has measured**: `PRAGMA optimize` on close (it is what keeps the
+    query planner's stats honest as a cache fills), WAL checkpoint/truncate behaviour under a
+    long-lived writer, `page_size` against the compressed-body row width, and `mmap_size` for the
+    read path the cached-data spec adds. None of these are guesses to apply blind — the point of
+    the item is that they have never been looked at.
+  - **Measure first, and against a real fleet**: a cluster with CRDs, an event-storming namespace,
+    and a cache that has been through a relist or two. The numbers that matter are file size versus
+    rows held, and whether a vacuum sweep is visible as sync latency.
+
 ## Auth
 
 - **OAuth access-token refresh — background/proactive half.** On-demand refresh is done (`sidecar/internal/auth/grant.go` refreshes a lazily-expired token using the stored refresh token). What remains: a proactive/background refresh before expiry rather than only refreshing when a consumer hits an already-expired token.

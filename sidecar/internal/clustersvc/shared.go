@@ -34,6 +34,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -102,28 +103,58 @@ type kubecatalogService interface {
 // arms a worker for a record — keyed by the record's own beehive name, so the fleet's
 // change signal is the requeue — and Forget disarms it; both mirror the record's
 // state, which only the resource's reconcile decides. Read is the standing answer
-// that reconcile folds, and Subscribe feeds the trigger. Bounce and BounceCache
-// restart workers in place — the Clears' and the poke resync's entry point, since a
-// Track deliberately restarts nothing while the record's params hold. ForgetCache
-// disarms a whole cache's workers and waits for them, which is what deleting its
-// store has to happen after.
+// that reconcile folds, and Subscribe feeds the trigger.
+// Observations is the whole fleet at once, which the cache health gauge folds by cache.
+// RestartAll restarts every worker in place off its cookie — the poke resync's entry
+// point, since a Track deliberately restarts nothing while the record's params hold.
+// ForgetCache disarms a whole cache's workers and waits for them, which is what
+// deleting its store has to happen after. A CLEAR takes the hold instead — WhileStopped
+// or WhileCacheStopped — because it stops and then touches the file in two steps, and a
+// pass arming a worker between them would leave one watching into the file being
+// emptied.
 type kubesyncService interface {
 	Track(id string, p kubesync.Params)
 	Forget(id string)
+	WhileStopped(id string, cacheID int64, fn func() error) error
+	WhileCacheStopped(cacheID int64, fn func() error) error
+	Holding(cacheID int64) bool
 	Read(id string) (kubesync.Observation, bool)
+	Observations() []kubesync.SubjectObservation
 	Subscribe() kubesync.Subscription
-	Bounce(id string)
-	BounceCache(cacheID int64)
+	RestartAll()
 	ForgetCache(cacheID int64)
 }
 
-// kubestoreService is the on-disk cache store as the controllers reach it: a
-// resource's teardown clears the kind it owned, and a cache's deletes the file
-// itself. The boundary's own reads and Clears grow here as they land.
-type kubestoreService interface {
-	ClearKind(ctx context.Context, cacheID int64, apiVersion, resource string) error
-	Delete(cacheID int64) error
+// kubestoreManager is the cache directory as this package reaches it: the teardowns and
+// clears the controllers drive, plus what the stats gauge measures. Named for the leaf
+// type it stands for, the way every narrow interface here is.
+//
+// Neither open takes a file that is not there: OpenExisting is for a caller that must
+// touch a cache's contents (clearing a kind), StoreIfOpen for one that only reads what
+// is already open. A read must never create a file, or a reader reconnecting in the
+// window between a cache being marked for deletion and its teardown pass would
+// resurrect it as an orphan.
+type kubestoreManager interface {
+	OpenExisting(cacheID int64) (*kubestore.Store, bool, error)
+	StoreIfOpen(cacheID int64) *kubestore.Store
+	Clear(cacheID int64) error
+	Remove(cacheID int64) error
+	Stats(ctx context.Context, cacheID int64) (kubestore.Stats, error)
 }
+
+// afterClear detaches a mandatory post-clear step from the request's context. The
+// workers are already stopped by then, and the requeue that arms them again is not the
+// caller's to skip: a client that hangs up as the clear lands would otherwise leave its
+// own cache disarmed until the kind's resync notices. Bounded, since nothing else would
+// end it.
+func afterClear(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), afterClearTimeout)
+}
+
+// afterClearTimeout bounds that step. Generous: it is a handful of point reads against a
+// local store, and the cost of giving up early is a cache that syncs nothing until the
+// resync.
+const afterClearTimeout = 30 * time.Second
 
 // --- Identity ---
 

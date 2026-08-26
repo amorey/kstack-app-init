@@ -24,6 +24,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -455,7 +457,7 @@ func TestCacheReconcileDeletesTheStoreForADyingCache(t *testing.T) {
 	require.NoError(t, err)
 	reconcileCache(t, d, obj)
 
-	assert.Equal(t, []int64{int64(cache.ID)}, kubestoreFake(d).deleted)
+	assert.Equal(t, []int64{int64(cache.ID)}, kubestoreFake(d).removed)
 }
 
 // The kinds below disarm their workers on their own passes, so the cache's teardown
@@ -468,7 +470,7 @@ func TestCacheReconcileForgetsItsWorkersBeforeDeletingTheStore(t *testing.T) {
 	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
 
 	var forgottenFirst bool
-	kubestoreFake(d).onDelete = func(int64) {
+	kubestoreFake(d).onRemove = func(int64) {
 		forgottenFirst = len(syncFleet(d).forgottenCaches) == 1
 	}
 
@@ -489,7 +491,7 @@ func TestCacheReconcileLeavesTheStoreAloneForALiveCache(t *testing.T) {
 
 	reconcileCache(t, d, cache)
 
-	assert.Empty(t, kubestoreFake(d).deleted)
+	assert.Empty(t, kubestoreFake(d).removed)
 }
 
 // A store that will not delete fails the pass: the file is the pass's whole job here,
@@ -621,4 +623,445 @@ func TestCachesWatchByClusterBookmarksAClusterWithNone(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+}
+
+// --- the gauges ---
+
+// A gauge is current-on-subscribe and emits nothing before its first measurement, so
+// the first frame is what the cache holds now.
+func TestCachesWatchStatsEmitsTheCurrentMeasurement(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	store := kubestoreFake(d)
+	store.stats = kubestore.Stats{Exists: true, Bytes: 4096, Counts: kubestore.Counts{ObjectCount: 12, KindCount: 3}}
+
+	stream, err := serviceOver(t, d).Caches().WatchStats(context.Background(), ClusterID(cluster.ID), ClusterCacheID(cache.ID))
+
+	require.NoError(t, err)
+	got := testutil.Recv(t, stream.Frames, "the first measurement")
+	assert.Equal(t, ClusterCacheStats{Exists: true, Bytes: 4096, ObjectCount: 12, KindCount: 3}, got)
+}
+
+// A gauge carries no bookmark, so an id pair that names nothing holds silent rather
+// than claiming an answer — a caller holding a bad id got it from a watch frame and
+// drops the subscription itself.
+func TestCachesWatchStatsHoldsSilentForAMismatchedPair(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	other := createCluster(t, d.clusterClient, "staging")
+	cache := createCache(t, d.cacheClient, ClusterID(other.ID), "uid-2")
+	kubestoreFake(d).stats = kubestore.Stats{Exists: true, Bytes: 4096}
+
+	stream, err := serviceOver(t, d).Caches().WatchStats(context.Background(), ClusterID(cluster.ID), ClusterCacheID(cache.ID))
+
+	require.NoError(t, err)
+	testutil.NoRecv(t, stream.Frames, testutil.Timeout/50, "a frame for another cluster's cache")
+}
+
+// The gauge re-emits only when the measurement moved: it is re-read on a cadence, and
+// a cache at rest must not push a frame per tick to every watcher.
+func TestCachesWatchStatsEmitsOnlyOnAChange(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	store := kubestoreFake(d)
+	store.stats = kubestore.Stats{Exists: true, Bytes: 4096}
+
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Millisecond
+	stream, err := svc.Caches().WatchStats(context.Background(), ClusterID(cluster.ID), ClusterCacheID(cache.ID))
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the first measurement")
+
+	testutil.NoRecv(t, stream.Frames, testutil.Timeout/50, "a frame for an unchanged cache")
+
+	store.setStats(kubestore.Stats{Exists: true, Bytes: 8192})
+
+	got := testutil.Recv(t, stream.Frames, "the changed measurement")
+	assert.Equal(t, int64(8192), got.Bytes)
+}
+
+// The health gauge is a read-side fold over the fleet, grouped by cache: one frame per
+// cache, and a cache is only healthy when every kind it syncs is.
+func TestCachesWatchHealthFoldsTheFleetByCache(t *testing.T) {
+	d := newTestDeps(t)
+	fleet := syncFleet(d)
+	fleet.observations = []kubesync.SubjectObservation{
+		{ID: "a", Params: kubesync.Params{CacheID: 1, APIVersion: "v1", Resource: "pods"},
+			Observation: kubesync.Observation{Reason: kubesync.ReasonWatching}, Known: true},
+		{ID: "b", Params: kubesync.Params{CacheID: 1, APIVersion: "apps/v1", Resource: "deployments"},
+			Observation: kubesync.Observation{Reason: kubesync.ReasonSyncFailed}, Known: true},
+		{ID: "c", Params: kubesync.Params{CacheID: 2, APIVersion: "v1", Resource: "pods"},
+			Observation: kubesync.Observation{Reason: kubesync.ReasonWatching}, Known: true},
+	}
+
+	stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+
+	byCache := map[ClusterCacheID]ClusterCacheHealth{}
+	for range 2 {
+		frame := testutil.Recv(t, stream.Frames, "a cache's verdict")
+		byCache[frame.CacheID] = frame
+	}
+	unhealthy := byCache[1]
+	assert.Equal(t, ConditionFalse, unhealthy.Status)
+	assert.Equal(t, ReasonSyncFailed, unhealthy.Reason)
+	assert.Equal(t, 2, unhealthy.TotalKinds)
+	assert.Equal(t, 1, unhealthy.UnhealthyKinds)
+	assert.Equal(t, []SyncedKindRef{{APIVersion: "apps/v1", Resource: "deployments"}}, unhealthy.UnhealthyKindRefs)
+	assert.Equal(t, ConditionTrue, byCache[2].Status)
+	assert.Equal(t, ReasonWatching, byCache[2].Reason)
+	assert.Empty(t, byCache[2].UnhealthyKindRefs)
+}
+
+// The verdict is the most severe reason present: ninety-nine healthy kinds and one
+// unreachable is not a cache that is nearly fine.
+func TestCachesWatchHealthReportsTheMostSevereReason(t *testing.T) {
+	tests := map[string]struct {
+		reasons []string
+		want    string
+	}{
+		"identity beats everything": {[]string{kubesync.ReasonStale, kubesync.ReasonIdentityMismatch}, ReasonIdentityMismatch},
+		"an outage beats a failure": {[]string{kubesync.ReasonSyncFailed, kubesync.ReasonNoConnection}, ReasonNoConnection},
+		"a failure beats staleness": {[]string{kubesync.ReasonStale, kubesync.ReasonSyncFailed}, ReasonSyncFailed},
+		"staleness beats building":  {[]string{kubesync.ReasonSyncing, kubesync.ReasonStale}, ReasonStale},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			d := newTestDeps(t)
+			fleet := syncFleet(d)
+			for i, reason := range tt.reasons {
+				fleet.observations = append(fleet.observations, kubesync.SubjectObservation{
+					ID:          string(rune('a' + i)),
+					Params:      kubesync.Params{CacheID: 1, APIVersion: "v1", Resource: "pods"},
+					Observation: kubesync.Observation{Reason: reason},
+					Known:       true,
+				})
+			}
+
+			stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.want, testutil.Recv(t, stream.Frames, "the cache's verdict").Reason)
+		})
+	}
+}
+
+// A tracked kind with no answer yet is a cache still connecting, not a healthy one.
+func TestCachesWatchHealthReportsAnUnansweredKindAsConnecting(t *testing.T) {
+	d := newTestDeps(t)
+	syncFleet(d).observations = []kubesync.SubjectObservation{
+		{ID: "a", Params: kubesync.Params{CacheID: 1, APIVersion: "v1", Resource: "pods"}},
+	}
+
+	stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+
+	frame := testutil.Recv(t, stream.Frames, "the cache's verdict")
+	assert.Equal(t, ConditionFalse, frame.Status)
+	assert.Equal(t, ReasonConnecting, frame.Reason)
+}
+
+// LastLiveAt is the weakest link — a cache is only as verified as its least recently
+// proven watch — while LastUpdateAt is the most recent write anywhere in it.
+func TestCachesWatchHealthTakesTheOldestProofAndTheNewestWrite(t *testing.T) {
+	older := time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+	d := newTestDeps(t)
+	syncFleet(d).observations = []kubesync.SubjectObservation{
+		{ID: "a", Params: kubesync.Params{CacheID: 1, APIVersion: "v1", Resource: "pods"}, Known: true,
+			Observation: kubesync.Observation{Reason: kubesync.ReasonWatching, LastUpdateAt: older, LastLiveAt: newer}},
+		{ID: "b", Params: kubesync.Params{CacheID: 1, APIVersion: "apps/v1", Resource: "deployments"}, Known: true,
+			Observation: kubesync.Observation{Reason: kubesync.ReasonWatching, LastUpdateAt: newer, LastLiveAt: older}},
+	}
+
+	stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+
+	frame := testutil.Recv(t, stream.Frames, "the cache's verdict")
+	require.NotNil(t, frame.LastUpdateAt)
+	require.NotNil(t, frame.LastLiveAt)
+	assert.Equal(t, newer, *frame.LastUpdateAt)
+	assert.Equal(t, older, *frame.LastLiveAt)
+}
+
+// --- the clears ---
+
+// Clearing a cache stops its workers before the file goes — a worker still running
+// would be writing through a store about to close — and requeues the kinds, whose own
+// passes are what re-arm them.
+func TestCachesClearStopsTheWorkersThenClearsThenRequeues(t *testing.T) {
+	d, cacheID := twoCachesTwoResources(t)
+	store := kubestoreFake(d)
+	var orderAtClear []string
+	store.onClear = func(int64) { orderAtClear = append(orderAtClear, "clear") }
+	fleet := syncFleet(d)
+	fleet.onForgetCache = func(int64) { orderAtClear = append(orderAtClear, "forget") }
+
+	got, err := serviceOver(t, d).Caches().Clear(context.Background(), cacheID)
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, cacheID, got.ID)
+	assert.Equal(t, []int64{int64(cacheID)}, fleet.forgottenCaches)
+	assert.Equal(t, []int64{int64(cacheID)}, store.clearedCaches)
+	assert.Equal(t, []string{"forget", "clear"}, orderAtClear, "the file went while a worker could still write")
+	// Inside the hold, not beside it: a pass arming a worker between the two would leave
+	// one watching into the file being emptied.
+	assert.Equal(t, []int64{int64(cacheID)}, fleet.heldCaches, "the clear ran outside the hold")
+}
+
+// The kinds' own passes are what re-arm their workers, so a clear asks for them — and
+// a requeue that cannot be delivered costs latency rather than the clear: the kind's
+// resync runs the same pass.
+func TestCachesClearSurvivesAnUndeliverableRequeue(t *testing.T) {
+	d, cacheID := twoCachesTwoResources(t)
+
+	got, err := serviceOver(t, d).Caches().Clear(context.Background(), cacheID)
+
+	require.NoError(t, err, "a requeue with no controller behind it failed the clear")
+	assert.NotNil(t, got)
+}
+
+func TestCachesClearOfAnUnknownCacheIsNotAnError(t *testing.T) {
+	d := newTestDeps(t)
+
+	got, err := serviceOver(t, d).Caches().Clear(context.Background(), 999)
+
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+// A clear that fails leaves the cache's workers stopped, so it has to ask the kinds to
+// reconcile anyway: their passes are what re-arm them, and without that the cache sits
+// unsynced until the resync notices — ten minutes of a cache that looks fine and is not
+// being written to.
+func TestCachesClearRearmsTheWorkersWhenTheStoreFails(t *testing.T) {
+	d, status := newReconcilingDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
+	createResource(t, d, catalog.ID, deploymentsSpec)
+	fleet := syncFleet(d)
+	armed := fleet.settle(t)
+	kubestoreFake(d).err = errors.New("disk full")
+
+	_, err := serviceOver(t, d).Caches().Clear(context.Background(), ClusterCacheID(cache.ID))
+
+	require.Error(t, err, "the failed clear was reported as a success")
+	require.Eventually(t, func() bool {
+		return fleet.arms() > armed
+	}, testutil.Timeout, time.Millisecond, "the cache's kinds were left disarmed by a failed clear")
+}
+
+// storedCacheWithWorker stores a cache record with one healthy kind syncing into it —
+// the shape the fold sees in production, where every observation belongs to a record.
+func storedCacheWithWorker(t *testing.T, d deps) ClusterCacheID {
+	t.Helper()
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	syncFleet(d).observations = []kubesync.SubjectObservation{
+		{ID: "a", Params: kubesync.Params{CacheID: int64(cache.ID), APIVersion: "v1", Resource: "pods"},
+			Observation: kubesync.Observation{Reason: kubesync.ReasonWatching}, Known: true},
+	}
+	return ClusterCacheID(cache.ID)
+}
+
+// A cache whose kinds are all disarmed has to say so. The gauge is latest-value with no
+// departure frame, so falling silent leaves the consumer rendering the last verdict it
+// was given — a paused cache reading Watching for as long as its record lives.
+func TestCachesWatchHealthReportsACacheThatStoppedSyncing(t *testing.T) {
+	d := newTestDeps(t)
+	cache := storedCacheWithWorker(t, d)
+	fleet := syncFleet(d)
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Millisecond
+	stream, err := svc.Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, ConditionTrue, testutil.Recv(t, stream.Frames, "the healthy verdict").Status)
+
+	// Everything under the cache is disarmed — a paused cluster, or a superseded cache.
+	fleet.setObservations(nil)
+
+	got := testutil.Recv(t, stream.Frames, "the stopped cache's verdict")
+	assert.Equal(t, cache, got.CacheID)
+	assert.Equal(t, ConditionFalse, got.Status)
+	assert.Equal(t, ReasonPaused, got.Reason)
+	assert.Zero(t, got.TotalKinds)
+	assert.Empty(t, got.UnhealthyKindRefs)
+}
+
+// And it says so once: a cache nobody syncs is not news every tick.
+func TestCachesWatchHealthReportsAStoppedCacheOnlyOnce(t *testing.T) {
+	d := newTestDeps(t)
+	storedCacheWithWorker(t, d)
+	fleet := syncFleet(d)
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Millisecond
+	stream, err := svc.Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the healthy verdict")
+
+	fleet.setObservations(nil)
+	testutil.Recv(t, stream.Frames, "the stopped cache's verdict")
+
+	// A negative assertion needs a bounded window, sized against the shrunk cadence.
+	testutil.NoRecv(t, stream.Frames, 50*time.Millisecond, "a repeat of the stopped verdict")
+}
+
+// A clear stops the cache's workers on its way through, and the gauge must not report
+// that as the cache having stopped syncing: a user clearing a cache would watch it flip
+// to Paused and back for no reason they took. The hold is what tells the two apart.
+func TestCachesWatchHealthHoldsItsVerdictThroughAClear(t *testing.T) {
+	d := newTestDeps(t)
+	fleet := syncFleet(d)
+	fleet.observations = []kubesync.SubjectObservation{
+		{ID: "a", Params: kubesync.Params{CacheID: 1, APIVersion: "v1", Resource: "pods"},
+			Observation: kubesync.Observation{Reason: kubesync.ReasonWatching}, Known: true},
+	}
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Millisecond
+	stream, err := svc.Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, ConditionTrue, testutil.Recv(t, stream.Frames, "the healthy verdict").Status)
+
+	// Mid-clear: the workers are stopped and the cache is held.
+	fleet.holdCache(1)
+	fleet.setObservations(nil)
+
+	// A negative assertion needs a bounded window, sized against the shrunk cadence.
+	testutil.NoRecv(t, stream.Frames, 50*time.Millisecond, "a verdict reported mid-clear")
+}
+
+// The requeue is what arms the workers a clear stopped, so it cannot ride the request's
+// context: a client that hangs up as the clear lands would leave its own cache disarmed
+// until the resync notices.
+func TestCachesClearRearmsTheWorkersWhenTheCallerHangsUp(t *testing.T) {
+	d, status := newReconcilingDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
+	createResource(t, d, catalog.ID, deploymentsSpec)
+	fleet := syncFleet(d)
+	armed := fleet.settle(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// The caller gives up while the store work is under way.
+	kubestoreFake(d).onClear = func(int64) { cancel() }
+
+	_, err := serviceOver(t, d).Caches().Clear(ctx, ClusterCacheID(cache.ID))
+
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return fleet.arms() > armed
+	}, testutil.Timeout, time.Millisecond, "the cache's kinds were left disarmed by a cancelled caller")
+}
+
+// The fleet's hub closes with the process, and a closed channel selects forever: a gauge
+// that read it as a wake would fold at full speed until its own context ended.
+func TestCachesWatchHealthEndsWhenTheFleetCloses(t *testing.T) {
+	d := newTestDeps(t)
+	fleet := syncFleet(d)
+	fleet.observations = []kubesync.SubjectObservation{
+		{ID: "a", Params: kubesync.Params{CacheID: 1, APIVersion: "v1", Resource: "pods"},
+			Observation: kubesync.Observation{Reason: kubesync.ReasonWatching}, Known: true},
+	}
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Hour // only the fleet's signal can wake this fold
+	stream, err := svc.Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the first verdict")
+
+	fleet.closeHub()
+
+	testutil.WaitClosed(t, stream.Frames, "the stream to end with the fleet")
+}
+
+// The weakest link is a kind with no proof at all: another kind's stamp cannot vouch for
+// it. A cache holding one unproven watch is a cache nothing has verified, whatever its
+// neighbours have seen.
+func TestCachesWatchHealthReportsNoProofWhenAKindHasNone(t *testing.T) {
+	proven := time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)
+	d := newTestDeps(t)
+	syncFleet(d).observations = []kubesync.SubjectObservation{
+		{ID: "a", Params: kubesync.Params{CacheID: 1, APIVersion: "v1", Resource: "pods"}, Known: true,
+			Observation: kubesync.Observation{Reason: kubesync.ReasonWatching, LastUpdateAt: proven, LastLiveAt: proven}},
+		{ID: "b", Params: kubesync.Params{CacheID: 1, APIVersion: "apps/v1", Resource: "deployments"}, Known: true,
+			Observation: kubesync.Observation{Reason: kubesync.ReasonWatching}},
+	}
+
+	stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+
+	frame := testutil.Recv(t, stream.Frames, "the cache's verdict")
+	assert.Nil(t, frame.LastLiveAt, "an unproven watch was vouched for by its neighbour")
+	// A write is a write, though: that one is the newest across the cache, not a claim
+	// about any watch.
+	require.NotNil(t, frame.LastUpdateAt)
+	assert.Equal(t, proven, *frame.LastUpdateAt)
+}
+
+// A subscriber that arrives after a cache was paused has to hear about it: the fold
+// covers only caches with workers, and a verdict this subscription never witnessed the
+// transition into is still the verdict.
+func TestCachesWatchHealthReportsACacheThatWasAlreadyPaused(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+
+	stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+
+	got := testutil.Recv(t, stream.Frames, "the paused cache's verdict")
+	assert.Equal(t, ClusterCacheID(cache.ID), got.CacheID)
+	assert.Equal(t, ConditionFalse, got.Status)
+	assert.Equal(t, ReasonPaused, got.Reason)
+	assert.Zero(t, got.TotalKinds)
+}
+
+// A cache being collected is not a cache that stopped syncing: its record says it is
+// going, and a verdict for it would be noise a consumer has to unpick.
+func TestCachesWatchHealthSkipsACacheOnItsWayOut(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
+
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Millisecond
+	stream, err := svc.Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+
+	// A negative assertion needs a bounded window, sized against the shrunk cadence.
+	testutil.NoRecv(t, stream.Frames, 50*time.Millisecond, "a verdict for a cache being collected")
+}
+
+// A cache with no workers is not necessarily a paused one: an enabled cluster's cache
+// has none until its catalog pass has run, and one that serves no kinds never will.
+// Calling that Paused would show a user their own enabled cluster as switched off.
+func TestCachesWatchHealthTellsAnInitializingCacheFromAPausedOne(t *testing.T) {
+	tests := map[string]struct {
+		syncEnabled bool
+		want        string
+	}{
+		"still initializing": {syncEnabled: true, want: ReasonConnecting},
+		"switched off":       {syncEnabled: false, want: ReasonPaused},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			d, status := newClusterStatusDeps(t)
+			cluster := storedCluster(t, d, status, tt.syncEnabled, "uid-1")
+			createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+
+			stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+			require.NoError(t, err)
+
+			got := testutil.Recv(t, stream.Frames, "the workerless cache's verdict")
+			assert.Equal(t, ConditionFalse, got.Status)
+			assert.Equal(t, tt.want, got.Reason)
+		})
+	}
 }

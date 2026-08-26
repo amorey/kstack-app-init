@@ -102,23 +102,6 @@ func ensureClusterCachedCatalog(ctx context.Context, client beehive.Client[Clust
 	return nil
 }
 
-// catalogIDFor resolves a cache to its catalog — the anchor the per-kind records actually hang
-// off. The name is derived from the cache id, so this is a point read rather than a scan.
-//
-// ok is false for a cache that has not reconciled yet, which owns no anchor. That is a wait, not
-// an error: the caller reads it as an empty collection, since nothing can hang off an anchor
-// that does not exist.
-func (s *service) catalogIDFor(ctx context.Context, cacheID ClusterCacheID) (beehive.ObjectID, bool, error) {
-	obj, err := s.catalogClient.GetByName(ctx, ClusterCachedCatalogName(beehive.ObjectID(cacheID)))
-	if err != nil {
-		if errors.Is(err, beehive.ErrNotFound) {
-			return 0, false, nil
-		}
-		return 0, false, fmt.Errorf("resolve cache %d cached catalog: %w", cacheID, err)
-	}
-	return obj.ID, true, nil
-}
-
 // toClusterCachedCatalog builds the served record from the stored object.
 func toClusterCachedCatalog(obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]) (*ClusterCachedCatalog, error) {
 	owner, err := toOwnerRef(obj)

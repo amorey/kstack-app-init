@@ -67,6 +67,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/amorey/beehive"
 	beehivesqlite "github.com/amorey/beehive/sqlite"
@@ -218,13 +219,13 @@ type Caches interface {
 	// WatchStats streams one cache's contents as a live gauge. A stream, not a
 	// ClusterCache field: a settled cache's object never changes, so a field would
 	// freeze at subscribe time.
-	WatchStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCacheStats, error)
+	WatchStats(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*Stream[ClusterCacheStats], error)
 	// WatchHealth streams every cache's sync verdict, folded from its per-kind
 	// records. Unscoped where the rest of this family is per-cache: one fold serves
 	// the fleet. A gauge, but a failable one — the fold reads watches of its own.
 	WatchHealth(ctx context.Context) (*Stream[ClusterCacheHealth], error)
 
-	// Clear deletes one cache's on-disk file and bounces its syncs; the record stays.
+	// Clear deletes one cache's on-disk file and restarts its syncs; the record stays.
 	Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache, error)
 }
 
@@ -349,11 +350,11 @@ type deps struct {
 	kubeconnSvc    kubeconnService
 	kubecatalogSvc kubecatalogService
 	kubesyncSvc    kubesyncService
-	kubestoreSvc   kubestoreService
+	kubestoreMgr   kubestoreManager
 	pokeSvc        *poke.Service
 }
 
-func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, kubecatalogSvc kubecatalogService, kubesyncSvc kubesyncService, kubestoreSvc kubestoreService, pokeSvc *poke.Service) deps {
+func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, kubecatalogSvc kubecatalogService, kubesyncSvc kubesyncService, kubestoreMgr kubestoreManager, pokeSvc *poke.Service) deps {
 	return deps{
 		clusterClient:  beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
 		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
@@ -364,7 +365,7 @@ func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc k
 		kubeconnSvc:    kubeconnSvc,
 		kubecatalogSvc: kubecatalogSvc,
 		kubesyncSvc:    kubesyncSvc,
-		kubestoreSvc:   kubestoreSvc,
+		kubestoreMgr:   kubestoreMgr,
 		pokeSvc:        pokeSvc,
 	}
 }
@@ -384,6 +385,11 @@ type service struct {
 	// to stop and close among them, outlives every reconcile and every poke that could
 	// still touch it.
 	parts []lifecycle.Part
+	// gaugeCadence re-measures the gauges. Both carry numbers that move while their
+	// record settles — a file's size, a freshness stamp — so a gauge that only woke on
+	// a change signal would go quiet exactly when it is healthy. A parameter so a test
+	// picks its own timescale.
+	gaugeCadence time.Duration
 }
 
 // beehiveRuntime gives beehive the lifecycle.StartCloser shape. Start already matches; the
@@ -431,9 +437,9 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 	kubecatalogSvc := kubecatalog.New(kubeconnSvc)
 	// The workers write into per-cache stores under the registry, and both sit on the
 	// pool the way the sweeper does.
-	kubestoreReg := kubestore.NewRegistry(filepath.Join(dataDir, "caches"))
-	kubesyncSvc := kubesync.New(kubeconnSvc)
-	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, kubecatalogSvc, kubesyncSvc, kubestoreReg, pokeSvc)
+	kubestoreMgr := kubestore.NewManager(filepath.Join(dataDir, "caches"))
+	kubesyncSvc := kubesync.New(kubeconnSvc, kubestoreMgr)
+	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, kubecatalogSvc, kubesyncSvc, kubestoreMgr, pokeSvc)
 
 	controllers, err := registerControllers(bh, d)
 	if err != nil {
@@ -448,7 +454,7 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 		// before the stores they write and the pool they lease from; the sweeper the
 		// same, minus the stores.
 		{Name: "kubeconn", StartCloser: kubeconnSvc},
-		{Name: "kubestore", StartCloser: kubestoreReg},
+		{Name: "kubestore", StartCloser: kubestoreMgr},
 		{Name: "kubesync", StartCloser: kubesyncSvc},
 		{Name: "kubecatalog", StartCloser: kubecatalogSvc},
 		{Name: "beehive", StartCloser: beehiveRuntime{bh: bh, store: bhStore}},
@@ -456,7 +462,7 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 	}
 	parts = append(parts, controllers...)
 
-	return &service{deps: d, parts: parts}, nil
+	return &service{deps: d, parts: parts, gaugeCadence: defaultGaugeCadence}, nil
 }
 
 // clusterSourceBootstrap creates the discovery anchors once beehive is up. A Part
@@ -611,6 +617,45 @@ func clusterContext(obj *beehive.Object[ClusterSpec, ClusterStatus]) (string, er
 		return "", fmt.Errorf("cluster %d has no kubeconfig credentials: %w", obj.ID, ErrNotConnectable)
 	}
 	return obj.Spec.Source.Kubeconfig.Context, nil
+}
+
+// The two resolutions more than one family needs. A helper only one family uses is that
+// family's own, on its *API type in its kind's file; these are here because a caller in
+// another file would otherwise reach across kinds for them.
+
+// cacheBelongsTo reports whether cacheID names a live cache owned by clusterID — the
+// gate every per-cache read shares. An absent or mismatched pair is not an error: a
+// caller holds ids from watch frames, so a record collected in between is a race.
+func (s *service) cacheBelongsTo(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (bool, error) {
+	obj, err := s.cacheClient.Get(ctx, beehive.ObjectID(cacheID), beehive.LoadOwner())
+	if errors.Is(err, beehive.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get cluster cache %d: %w", cacheID, err)
+	}
+	owner, ok, err := obj.Owner()
+	if err != nil {
+		return false, fmt.Errorf("read cluster cache %d owner: %w", cacheID, err)
+	}
+	return ok && owner.ID == beehive.ObjectID(clusterID), nil
+}
+
+// catalogIDFor resolves a cache to its catalog — the anchor the per-kind records actually hang
+// off. The name is derived from the cache id, so this is a point read rather than a scan.
+//
+// ok is false for a cache that has not reconciled yet, which owns no anchor. That is a wait, not
+// an error: the caller reads it as an empty collection, since nothing can hang off an anchor
+// that does not exist.
+func (s *service) catalogIDFor(ctx context.Context, cacheID ClusterCacheID) (beehive.ObjectID, bool, error) {
+	obj, err := s.catalogClient.GetByName(ctx, ClusterCachedCatalogName(beehive.ObjectID(cacheID)))
+	if err != nil {
+		if errors.Is(err, beehive.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("resolve cache %d cached catalog: %w", cacheID, err)
+	}
+	return obj.ID, true, nil
 }
 
 func (s *service) ListEvents(ctx context.Context, id ObjectID, category *string, limit *int) ([]Event, error) {

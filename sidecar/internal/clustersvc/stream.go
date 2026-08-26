@@ -97,13 +97,33 @@ func (w deltaWatch[Spec, Status, Frame]) streamList(ctx context.Context, src *be
 }
 
 // streamEmpty is the snapshot of a collection that definitively has none: the bookmark alone,
-// then the stream ends. For a scope whose anchor does not exist yet — nothing can be added to
-// it without the anchor, so there is nothing to stay open for.
+// then the stream ends. For a scope that can never be filled — never for one whose anchor has
+// merely not been created yet, which is a wait: see pumpChanges.
 func (w deltaWatch[Spec, Status, Frame]) streamEmpty(ctx context.Context) *Stream[Frame] {
 	return NewStream(ctx, func(ctx context.Context, out chan<- Frame) error {
 		sendFrame(ctx, out, w.bookmark)
 		return nil
 	})
+}
+
+// pumpChanges is pump for a source opened AFTER this stream's bookmark went out: its
+// snapshot is reported as ordinary Added frames and its own bookmark is not sent, since a
+// second one would claim a snapshot boundary the consumer has already been given.
+func (w deltaWatch[Spec, Status, Frame]) pumpChanges(
+	ctx context.Context,
+	out chan<- Frame,
+	src *beehive.ObjectListStream[Spec, Status],
+) error {
+	for _, obj := range src.Objects {
+		frame, err := w.frame(DeltaFrameAdded, obj)
+		if err != nil {
+			return err
+		}
+		if !sendFrame(ctx, out, frame) {
+			return nil
+		}
+	}
+	return w.pumpAfterSnapshot(ctx, out, src.Changes, src.Err)
 }
 
 // pump streams a snapshot, the bookmark closing it, then every change above it.
@@ -130,7 +150,16 @@ func (w deltaWatch[Spec, Status, Frame]) pump(
 	if !sendFrame(ctx, out, w.bookmark) {
 		return nil
 	}
+	return w.pumpAfterSnapshot(ctx, out, changes, srcErr)
+}
 
+// pumpAfterSnapshot streams every change above a snapshot the caller has already sent.
+func (w deltaWatch[Spec, Status, Frame]) pumpAfterSnapshot(
+	ctx context.Context,
+	out chan<- Frame,
+	changes <-chan beehive.ObjectChange[Spec, Status],
+	srcErr func() error,
+) error {
 	for change := range changes {
 		if change.Type == beehive.Deleted {
 			if !sendFrame(ctx, out, w.departed(change)) {

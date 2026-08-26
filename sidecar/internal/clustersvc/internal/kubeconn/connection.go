@@ -95,11 +95,26 @@ type Connection struct {
 	// between the two commits pairs a new one with the old one's answer.
 	identity atomic.Pointer[connIdentity]
 
+	// seq identifies this connection among every one this process builds, so that
+	// "the connection was replaced" is a fact a reader can compare rather than infer.
+	// Immutable, unlike identity: the stamp lands a round trip after the build, and a
+	// news value derived from it alone cannot tell a rebuild from a re-stamp of the same
+	// uid — which is exactly what a rotation for an unchanged cluster looks like.
+	seq uint64
+
 	// done closes when this connection is retired. Nil in a connection nobody built, which
 	// reads as never retired.
 	done chan struct{}
 	once sync.Once
 }
+
+// connSeq numbers the connections this process builds. Only ever compared, never read as
+// a count.
+var connSeq atomic.Uint64
+
+// Seq identifies this connection. Zero for a connection nobody built, which no live one
+// shares.
+func (c *Connection) Seq() uint64 { return c.seq }
 
 // connIdentity is what a connection has been confirmed as: the cluster read over it, and
 // whether it still vouches for that. One value behind one pointer, so the transition from
@@ -225,6 +240,7 @@ func newConnection(cfg *rest.Config) (*Connection, error) {
 		HTTPClient: httpClient,
 		Dynamic:    dyn,
 		Discovery:  disc,
+		seq:        connSeq.Add(1),
 		done:       make(chan struct{}),
 	}, nil
 }
@@ -256,8 +272,14 @@ func (c *Connection) Done() <-chan struct{} { return c.done }
 // the other did not.
 func (c *Connection) retire() {
 	c.once.Do(func() {
-		close(c.done)
-		c.HTTPClient.CloseIdleConnections()
+		// A connection nobody built carries neither, and reads as never retired — the
+		// contract Done states.
+		if c.done != nil {
+			close(c.done)
+		}
+		if c.HTTPClient != nil {
+			c.HTTPClient.CloseIdleConnections()
+		}
 	})
 }
 

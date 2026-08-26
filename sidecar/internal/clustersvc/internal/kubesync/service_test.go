@@ -16,6 +16,7 @@ package kubesync
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -63,12 +65,54 @@ func (l *fakeLease) Release() {
 	l.conns.released++
 }
 
+// fakeStores is the store manager as this leaf reaches it: a real manager over a temp
+// dir, plus what the test needs to see — which caches were opened, and a substitutable
+// error for the torn-down case.
+type fakeStores struct {
+	mgr *kubestore.Manager
+
+	mu     sync.Mutex
+	opened []int64
+	err    error
+}
+
+func newFakeStores(t *testing.T) *fakeStores {
+	mgr := kubestore.NewManager(t.TempDir())
+	t.Cleanup(func() { assert.NoError(t, mgr.Close()) })
+	return &fakeStores{mgr: mgr}
+}
+
+func (f *fakeStores) OpenOrCreate(cacheID int64) (*kubestore.Store, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opened = append(f.opened, cacheID)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.mgr.OpenOrCreate(cacheID)
+}
+
+// failWith replaces what Acquire answers, so a test can let a store open again.
+func (f *fakeStores) failWith(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+func (f *fakeStores) openedCaches() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.opened...)
+}
+
 // run is one call into a seamed sync body: the params it was started with, the
-// ctx it runs on, and the commit func to call — captured so a test can commit
-// after the body would otherwise have exited, or after the subject was forgotten.
+// ctx it runs on, the store handle it was handed, and the commit func to call —
+// captured so a test can commit after the body would otherwise have exited, or
+// after the subject was forgotten.
 type run struct {
 	ctx    context.Context
 	p      Params
+	store  *kubestore.Store
 	commit func(Observation)
 }
 
@@ -77,15 +121,37 @@ type run struct {
 // hand, never by racing the production sync loop.
 type fakeSync struct {
 	starts *testutil.Probe[*run]
+	// mu guards onStop, which a test sets from its own goroutine while bodies run.
+	mu sync.Mutex
+	// onStop runs as a worker exits, which is where Track's replace path is blocked —
+	// the window a test needs to land a hold in.
+	onStop func()
+}
+
+func (f *fakeSync) stopWith(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onStop = fn
+}
+
+func (f *fakeSync) stopped() func() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn := f.onStop
+	f.onStop = nil
+	return fn
 }
 
 func newFakeSync() *fakeSync {
 	return &fakeSync{starts: testutil.NewProbe[*run](8)}
 }
 
-func (f *fakeSync) body(ctx context.Context, p Params, commit func(Observation)) {
-	f.starts.Fire(&run{ctx: ctx, p: p, commit: commit})
+func (f *fakeSync) body(ctx context.Context, p Params, _ kubeconn.Lease, store *kubestore.Store, commit func(Observation)) {
+	f.starts.Fire(&run{ctx: ctx, p: p, store: store, commit: commit})
 	<-ctx.Done()
+	if fn := f.stopped(); fn != nil {
+		fn()
+	}
 }
 
 func testParams(cacheID int64) Params {
@@ -94,13 +160,17 @@ func testParams(cacheID int64) Params {
 		ContextName: "prod",
 		ServerUID:   "uid-1",
 		APIVersion:  "v1",
+		Kind:        "Pod",
 		Resource:    "pods",
-		Namespaced:  true,
 	}
 }
 
-func newTestService(conns connService, f *fakeSync) *Service {
-	return newWithOptions(conns, withSync(f.body))
+// newTestService is the service under test: the seamed sync body, over a real store
+// registry in a temp dir — a worker holds a handle for its run, so nothing here can
+// stand in for one.
+func newTestService(t *testing.T, conns connService, f *fakeSync) *Service {
+	t.Helper()
+	return newWithOptions(conns, newFakeStores(t), withSync(f.body))
 }
 
 // startService runs the service for the test's life, stop before Close like the
@@ -120,7 +190,7 @@ func startService(t *testing.T, s *Service) {
 func TestTrackStartsOneWorker(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newTestService(conns, f)
+	svc := newTestService(t, conns, f)
 	startService(t, svc)
 
 	p := testParams(1)
@@ -136,7 +206,7 @@ func TestTrackStartsOneWorker(t *testing.T) {
 func TestTrackOfATrackedIDIsANoOp(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newTestService(conns, f)
+	svc := newTestService(t, conns, f)
 	startService(t, svc)
 
 	p := testParams(1)
@@ -156,7 +226,7 @@ func TestTrackOfATrackedIDIsANoOp(t *testing.T) {
 func TestTrackWithChangedParamsReplacesTheWorker(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newTestService(conns, f)
+	svc := newTestService(t, conns, f)
 	startService(t, svc)
 
 	svc.Track("resource/1", testParams(1))
@@ -165,7 +235,6 @@ func TestTrackWithChangedParamsReplacesTheWorker(t *testing.T) {
 
 	next := testParams(1)
 	next.ContextName = "staging"
-	next.Namespaced = false
 	svc.Track("resource/1", next)
 
 	assert.Error(t, first.ctx.Err(), "the worker syncing the old params was not cancelled")
@@ -184,7 +253,7 @@ func TestTrackWithChangedParamsReplacesTheWorker(t *testing.T) {
 func TestReadBeforeAndAfterCommit(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newTestService(conns, f)
+	svc := newTestService(t, conns, f)
 	startService(t, svc)
 
 	_, ok := svc.Read("unknown")
@@ -216,7 +285,7 @@ func TestReadBeforeAndAfterCommit(t *testing.T) {
 func TestSignalFiresOnlyWhenTheReasonMoves(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newTestService(conns, f)
+	svc := newTestService(t, conns, f)
 	startService(t, svc)
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
@@ -247,7 +316,7 @@ func TestSignalFiresOnlyWhenTheReasonMoves(t *testing.T) {
 func TestForgetCancelsWaitsReleasesAndDrops(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newTestService(conns, f)
+	svc := newTestService(t, conns, f)
 	startService(t, svc)
 
 	svc.Track("resource/1", testParams(1))
@@ -275,7 +344,7 @@ func TestForgetCancelsWaitsReleasesAndDrops(t *testing.T) {
 func TestCommitAfterForgetDoesNotResurrect(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newTestService(conns, f)
+	svc := newTestService(t, conns, f)
 	startService(t, svc)
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
@@ -294,12 +363,12 @@ func TestCommitAfterForgetDoesNotResurrect(t *testing.T) {
 	testutil.NoRecv(t, sub.Chan(), testutil.Timeout/50, "a signal from the stale commit")
 }
 
-// Bounce cancels the first worker's ctx and, only after it exits, starts a new
+// A restart cancels the first worker's ctx and, only after it exits, starts a new
 // worker with the same params; the last observation survives.
-func TestBounceRestartsInPlaceKeepingTheObservation(t *testing.T) {
+func TestRestartIsInPlaceAndKeepsTheObservation(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newTestService(conns, f)
+	svc := newTestService(t, conns, f)
 	startService(t, svc)
 
 	p := testParams(1)
@@ -313,7 +382,7 @@ func TestBounceRestartsInPlaceKeepingTheObservation(t *testing.T) {
 		close(bodyDone)
 	}()
 
-	svc.Bounce("resource/1")
+	svc.restart("resource/1")
 
 	testutil.Wait(t, bodyDone, "the first body's ctx to end")
 	second := f.starts.Await(t, "the second worker's start")
@@ -325,41 +394,11 @@ func TestBounceRestartsInPlaceKeepingTheObservation(t *testing.T) {
 
 	obs, ok := svc.Read("resource/1")
 	require.True(t, ok)
-	assert.Equal(t, Observation{Reason: ReasonWatching, ObjectCount: 5}, obs, "the observation survives the bounce")
+	assert.Equal(t, Observation{Reason: ReasonWatching, ObjectCount: 5}, obs, "the observation survives the restart")
 
-	// Bounce of an unknown id is a no-op.
-	svc.Bounce("unknown")
+	// A restart of an unknown id is a no-op.
+	svc.restart("unknown")
 	testutil.NoRecv(t, f.starts.Chan(), testutil.Timeout/50, "a worker start for an unknown id")
-}
-
-// BounceCache bounces exactly the subjects whose Params.CacheID matches;
-// others keep their original worker running.
-func TestBounceCacheBouncesOnlyMatchingSubjects(t *testing.T) {
-	conns := &fakeConns{}
-	f := newFakeSync()
-	svc := newTestService(conns, f)
-	startService(t, svc)
-
-	svc.Track("resource/1", testParams(1))
-	r1 := f.starts.Await(t, "resource/1's start")
-	svc.Track("resource/2", testParams(2))
-	r2 := f.starts.Await(t, "resource/2's start")
-
-	r1done := make(chan struct{})
-	go func() { <-r1.ctx.Done(); close(r1done) }()
-
-	svc.BounceCache(1)
-
-	testutil.Wait(t, r1done, "resource/1's ctx to end")
-	r1restart := f.starts.Await(t, "resource/1's restart")
-	assert.Equal(t, int64(1), r1restart.p.CacheID)
-
-	// resource/2's worker was never cancelled and never restarted.
-	select {
-	case <-r2.ctx.Done():
-		t.Fatal("resource/2's worker was cancelled by a BounceCache for another cache")
-	default:
-	}
 }
 
 // The stop func returned by Start cancels every worker's ctx and waits for the
@@ -367,7 +406,7 @@ func TestBounceCacheBouncesOnlyMatchingSubjects(t *testing.T) {
 func TestStopCancelsEveryWorkerAndWaits(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newWithOptions(conns, withSync(f.body))
+	svc := newWithOptions(conns, newFakeStores(t), withSync(f.body))
 	stop, err := svc.Start(context.Background())
 	require.NoError(t, err)
 
@@ -389,7 +428,7 @@ func TestStopCancelsEveryWorkerAndWaits(t *testing.T) {
 func TestCloseReleasesLeasesAndClosesHub(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newWithOptions(conns, withSync(f.body))
+	svc := newWithOptions(conns, newFakeStores(t), withSync(f.body))
 	stop, err := svc.Start(context.Background())
 	require.NoError(t, err)
 
@@ -407,22 +446,22 @@ func TestCloseReleasesLeasesAndClosesHub(t *testing.T) {
 	testutil.RecvClosed(t, sub.Chan(), "the signal hub, after Close")
 }
 
-// Two Bounces racing over one subject leave exactly one worker running. Without
+// Two restarts racing over one subject leave exactly one worker running. Without
 // the generation guard both callers spawn from the same waited-on worker, and the
 // subject holds only the later one's cancel — so the other syncs on forever.
-func TestConcurrentBouncesLeaveOneWorkerRunning(t *testing.T) {
+func TestConcurrentRestartsLeaveOneWorkerRunning(t *testing.T) {
 	conns := &fakeConns{}
 
 	started := testutil.NewProbe[struct{}](8)
 	var mu sync.Mutex
 	var runs []context.Context
 	// Latency injected into the worker on purpose: the first body holds its exit
-	// until both callers are inside Bounce, so they wait on the same done channel
-	// rather than one bouncing after the other has finished.
+	// until both callers are inside restart, so they wait on the same done channel
+	// rather than one restarting after the other has finished.
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
 	var once sync.Once
-	body := func(ctx context.Context, _ Params, _ func(Observation)) {
+	body := func(ctx context.Context, _ Params, _ kubeconn.Lease, _ *kubestore.Store, _ func(Observation)) {
 		mu.Lock()
 		runs = append(runs, ctx)
 		mu.Unlock()
@@ -436,7 +475,7 @@ func TestConcurrentBouncesLeaveOneWorkerRunning(t *testing.T) {
 		<-release
 	}
 
-	svc := newWithOptions(conns, withSync(body))
+	svc := newWithOptions(conns, newFakeStores(t), withSync(body))
 	startService(t, svc)
 
 	svc.Track("resource/1", testParams(1))
@@ -446,12 +485,12 @@ func TestConcurrentBouncesLeaveOneWorkerRunning(t *testing.T) {
 	for range 2 {
 		wg.Go(func() {
 			entered <- struct{}{}
-			svc.Bounce("resource/1")
+			svc.restart("resource/1")
 		})
 	}
-	testutil.WaitReturn(t, wg.Wait, "both Bounce calls to return")
+	testutil.WaitReturn(t, wg.Wait, "both restart calls to return")
 
-	// Polled, not awaited on a start: the last Bounce spawns outside the call, and
+	// Polled, not awaited on a start: the last restart spawns outside the call, and
 	// two callers that did not overlap legitimately restart twice. Either way the
 	// settled count is one — the broken shape leaves two workers live for good.
 	require.Eventually(t, func() bool {
@@ -464,7 +503,7 @@ func TestConcurrentBouncesLeaveOneWorkerRunning(t *testing.T) {
 			}
 		}
 		return live == 1
-	}, testutil.Timeout, time.Millisecond, "exactly one worker left running after the racing bounces")
+	}, testutil.Timeout, time.Millisecond, "exactly one worker left running after the racing restarts")
 }
 
 // ForgetCache disarms exactly the subjects syncing into that cache, waits for their
@@ -472,7 +511,7 @@ func TestConcurrentBouncesLeaveOneWorkerRunning(t *testing.T) {
 func TestForgetCacheDisarmsOnlyMatchingSubjects(t *testing.T) {
 	conns := &fakeConns{}
 	f := newFakeSync()
-	svc := newTestService(conns, f)
+	svc := newTestService(t, conns, f)
 	startService(t, svc)
 
 	svc.Track("resource/1", testParams(1))
@@ -494,4 +533,274 @@ func TestForgetCacheDisarmsOnlyMatchingSubjects(t *testing.T) {
 	_, ok = svc.Read("resource/3")
 	assert.False(t, ok, "resource/3 has committed nothing")
 	assert.Equal(t, 2, conns.releaseCount(), "the disarmed subjects' leases")
+}
+
+// The worker syncs into its cache's store, so the handle is taken as the run starts
+// and given back when it exits — never held for a subject that is not running.
+func TestTrackAcquiresTheCachesStoreForTheRun(t *testing.T) {
+	f := newFakeSync()
+	stores := newFakeStores(t)
+	svc := newWithOptions(&fakeConns{}, stores, withSync(f.body))
+	startService(t, svc)
+
+	svc.Track("resource/1", testParams(7))
+
+	r := f.starts.Await(t, "the worker's start")
+	require.NotNil(t, r.store)
+	assert.NotNil(t, r.store)
+	assert.Equal(t, []int64{7}, stores.openedCaches())
+}
+
+// A store the registry has retired means the cache is being torn down: the worker
+// parks rather than publishing, since its Forget is on the way and there is nothing
+// left to sync into.
+func TestAWorkerWhoseStoreIsDeletedParksWithoutPublishing(t *testing.T) {
+	f := newFakeSync()
+	stores := newFakeStores(t)
+	stores.err = kubestore.ErrRemoved
+	svc := newWithOptions(&fakeConns{}, stores, withSync(f.body))
+	startService(t, svc)
+
+	svc.Track("resource/1", testParams(1))
+
+	// A negative assertion needs a bounded window; a body that ran would fire at once.
+	testutil.NoRecv(t, f.starts.Chan(), testutil.Timeout/50, "a sync body")
+	_, ok := svc.Read("resource/1")
+	assert.False(t, ok, "a parked worker published an observation")
+	// The subject is still tracked and still stoppable.
+	svc.Forget("resource/1")
+}
+
+// The health fold reads the whole fleet at once, grouped by cache — so the snapshot
+// carries each subject's params beside its answer, in one critical section.
+func TestObservationsSnapshotsTheTrackedFleet(t *testing.T) {
+	f := newFakeSync()
+	svc := newTestService(t, &fakeConns{}, f)
+	startService(t, svc)
+
+	svc.Track("resource/1", testParams(1))
+	first := f.starts.Await(t, "the first worker's start")
+	svc.Track("resource/2", testParams(2))
+	f.starts.Await(t, "the second worker's start")
+
+	sub := svc.Subscribe()
+	t.Cleanup(sub.Close)
+	first.commit(Observation{Reason: ReasonWatching, ObjectCount: 4})
+	testutil.Recv(t, sub.Chan(), "the commit's signal")
+
+	got := svc.Observations()
+
+	require.Len(t, got, 2)
+	byID := map[string]SubjectObservation{}
+	for _, o := range got {
+		byID[o.ID] = o
+	}
+	assert.True(t, byID["resource/1"].Known)
+	assert.Equal(t, ReasonWatching, byID["resource/1"].Observation.Reason)
+	assert.Equal(t, int64(1), byID["resource/1"].Params.CacheID)
+	assert.False(t, byID["resource/2"].Known, "a subject with no answer yet")
+}
+
+// A poke resumes every cache at once — a warm restart in place, the cookies intact.
+func TestRestartAllRestartsEverySubject(t *testing.T) {
+	f := newFakeSync()
+	svc := newTestService(t, &fakeConns{}, f)
+	startService(t, svc)
+
+	svc.Track("resource/1", testParams(1))
+	first := f.starts.Await(t, "the first worker's start")
+	svc.Track("resource/2", testParams(2))
+	second := f.starts.Await(t, "the second worker's start")
+
+	svc.RestartAll()
+
+	assert.Error(t, first.ctx.Err(), "the first worker was not restarted")
+	assert.Error(t, second.ctx.Err(), "the second worker was not restarted")
+	f.starts.Await(t, "a replacement worker's start")
+	f.starts.Await(t, "the other replacement worker's start")
+}
+
+// Clearing a cache is stop-then-touch-the-file, and a pass that arms a worker in between
+// would leave one resuming a watch into the file the clear is about to empty — deltas
+// into an empty database, with no cold list to fill it. The hold closes that gap: the
+// subjects are stopped before it runs and nothing may arm one until it returns.
+func TestWhileCacheStoppedRefusesTracksForThatCache(t *testing.T) {
+	f := newFakeSync()
+	svc := newTestService(t, &fakeConns{}, f)
+	startService(t, svc)
+	svc.Track("resource/1", testParams(1))
+	first := f.starts.Await(t, "the worker's start")
+
+	require.NoError(t, svc.WhileCacheStopped(1, func() error {
+		assert.Error(t, first.ctx.Err(), "the clear ran while a worker was still writing")
+
+		// The pass that races the clear.
+		svc.Track("resource/1", testParams(1))
+		testutil.NoRecv(t, f.starts.Chan(), testutil.Timeout/50, "a worker armed during the clear")
+
+		// Another cache is nobody's business but its own.
+		svc.Track("resource/2", testParams(2))
+		f.starts.Await(t, "the other cache's worker")
+		return nil
+	}))
+}
+
+// The hold ends with the clear, so the record's own pass — which the caller requeues —
+// arms the worker again.
+func TestWhileCacheStoppedReleasesTheHold(t *testing.T) {
+	f := newFakeSync()
+	svc := newTestService(t, &fakeConns{}, f)
+	startService(t, svc)
+
+	require.NoError(t, svc.WhileCacheStopped(1, func() error { return nil }))
+	svc.Track("resource/1", testParams(1))
+
+	f.starts.Await(t, "the re-armed worker")
+}
+
+// A failing clear releases the hold too: the caller reports it and requeues, and a cache
+// nothing may arm is worse than one whose rows are still there.
+func TestWhileCacheStoppedReleasesTheHoldOnFailure(t *testing.T) {
+	f := newFakeSync()
+	svc := newTestService(t, &fakeConns{}, f)
+	startService(t, svc)
+	boom := errors.New("disk full")
+
+	require.ErrorIs(t, svc.WhileCacheStopped(1, func() error { return boom }), boom)
+
+	svc.Track("resource/1", testParams(1))
+	f.starts.Await(t, "the re-armed worker")
+}
+
+// The per-kind clear owes the same, one subject wide: its rows and its cookie go, so a
+// worker that resumed in between would watch on and never re-list.
+func TestWhileStoppedRefusesTracksForThatSubject(t *testing.T) {
+	f := newFakeSync()
+	svc := newTestService(t, &fakeConns{}, f)
+	startService(t, svc)
+	svc.Track("resource/1", testParams(1))
+	first := f.starts.Await(t, "the worker's start")
+
+	require.NoError(t, svc.WhileStopped("resource/1", 1, func() error {
+		assert.Error(t, first.ctx.Err(), "the clear ran while the worker was still writing")
+
+		svc.Track("resource/1", testParams(1))
+		testutil.NoRecv(t, f.starts.Chan(), testutil.Timeout/50, "a worker armed during the clear")
+
+		// Another kind in the same cache keeps syncing: only its own rows are going.
+		svc.Track("resource/2", testParams(1))
+		f.starts.Await(t, "the other kind's worker")
+		return nil
+	}))
+}
+
+// The hold has to survive Track's replace path: it drops the lock to wait for the old
+// worker, and a clear taking the hold in that window would otherwise be invisible —
+// leaving a worker spawned for a cache whose file is about to be closed and swapped.
+func TestTrackWithChangedParamsRespectsAHoldTakenWhileItWaited(t *testing.T) {
+	f := newFakeSync()
+	svc := newTestService(t, &fakeConns{}, f)
+	startService(t, svc)
+	svc.Track("resource/1", testParams(1))
+	f.starts.Await(t, "the worker's start")
+
+	// The hold is taken while Track is blocked waiting for the worker it just forgot —
+	// the window in which it holds no lock — and stands until the test releases it.
+	taken, release := make(chan struct{}), make(chan struct{})
+	cleared := make(chan struct{})
+	f.stopWith(func() {
+		go func() {
+			defer close(cleared)
+			assert.NoError(t, svc.WhileCacheStopped(1, func() error {
+				close(taken)
+				<-release
+				return nil
+			}))
+		}()
+		<-taken
+	})
+
+	next := testParams(1)
+	next.ContextName = "staging"
+	svc.Track("resource/1", next)
+
+	testutil.NoRecv(t, f.starts.Chan(), testutil.Timeout/50, "a worker armed under a hold")
+	close(release)
+	testutil.Wait(t, cleared, "the clear to finish")
+}
+
+// A file that will not open is usually transient — a descriptor limit, a full disk — and
+// the record cannot re-arm the worker: its params have not moved, so Track is a no-op.
+// The worker retries it up its own ladder rather than parking on the first failure.
+func TestAWorkerRetriesAStoreThatWillNotOpen(t *testing.T) {
+	f := newFakeSync()
+	stores := newFakeStores(t)
+	stores.err = errors.New("too many open files")
+	svc := newWithOptions(&fakeConns{}, stores, withSync(f.body), withOpenRetry(time.Millisecond, 2*time.Millisecond))
+	startService(t, svc)
+
+	svc.Track("resource/1", testParams(1))
+
+	require.Eventually(t, func() bool {
+		return len(stores.openedCaches()) > 1
+	}, testutil.Timeout, time.Millisecond, "the worker parked on the first failed open")
+
+	// And it syncs once the store opens again.
+	stores.failWith(nil)
+	f.starts.Await(t, "the worker's start once the store opened")
+}
+
+// Holding is what keeps a clear from reading as a cache that stopped syncing, so it has
+// to cover the per-kind clear too: stopping the only armed kind in a cache empties the
+// fold exactly as a cache-wide clear does.
+func TestHoldingCoversAPerKindClear(t *testing.T) {
+	f := newFakeSync()
+	svc := newTestService(t, &fakeConns{}, f)
+	startService(t, svc)
+	svc.Track("resource/1", testParams(7))
+	f.starts.Await(t, "the worker's start")
+
+	require.NoError(t, svc.WhileStopped("resource/1", 7, func() error {
+		assert.True(t, svc.Holding(7), "a per-kind clear does not report its cache")
+		return nil
+	}))
+
+	assert.False(t, svc.Holding(7), "the hold outlived the clear")
+}
+
+// A poke restarts every worker in place, and it must not walk through a clear's hold:
+// the store is being closed and swapped, so a worker respawned there would write into
+// the file going away, or resume a watch into the fresh one with no cold list behind it.
+//
+// The race is driven from the exiting worker, which is where restart is blocked when the
+// hold lands.
+func TestRestartDoesNotRespawnUnderAHold(t *testing.T) {
+	f := newFakeSync()
+	svc := newTestService(t, &fakeConns{}, f)
+	startService(t, svc)
+	svc.Track("resource/1", testParams(1))
+	f.starts.Await(t, "the worker's start")
+
+	release, cleared := make(chan struct{}), make(chan struct{})
+	f.stopWith(func() {
+		go func() {
+			defer close(cleared)
+			assert.NoError(t, svc.WhileCacheStopped(1, func() error {
+				<-release
+				return nil
+			}))
+		}()
+		// The hold is registered before the clear stops anything, which is the window
+		// restart returns into. Waiting for the clear to reach its own body would
+		// deadlock — its ForgetCache waits for this very worker — so this waits for the
+		// hold alone and leaves the rest of the interleaving to the scheduler.
+		require.Eventually(t, func() bool { return svc.Holding(1) },
+			testutil.Timeout, time.Millisecond, "the clear to take the hold")
+	})
+
+	svc.RestartAll()
+
+	testutil.NoRecv(t, f.starts.Chan(), testutil.Timeout/50, "a worker respawned under a hold")
+	close(release)
+	testutil.Wait(t, cleared, "the clear to finish")
 }

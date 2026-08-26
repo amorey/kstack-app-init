@@ -166,10 +166,6 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 	var id ObjectID = 1
 
 	calls := map[string]func(){
-		"Caches().WatchStats":       func() { svc.Caches().WatchStats(ctx, id, id) },
-		"Caches().WatchHealth":      func() { svc.Caches().WatchHealth(ctx) },
-		"Caches().Clear":            func() { svc.Caches().Clear(ctx, id) },
-		"CachedResources().Clear":   func() { svc.CachedResources().Clear(ctx, id) },
 		"CachedData().ListKinds":    func() { svc.CachedData().ListKinds(ctx, id, id) },
 		"CachedData().WatchKinds":   func() { svc.CachedData().WatchKinds(ctx, id, id) },
 		"CachedData().WatchObjects": func() { svc.CachedData().WatchObjects(ctx, id, id, "v1", "pods") },
