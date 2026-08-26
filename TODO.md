@@ -79,6 +79,7 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   a `Wake` is not an edge. **The trigger has fired**: serverUID, serverVersion and principal all
   answer now, so `State.Identity()` is populated and nothing acts on it moving. → [ADR: the
   connection probe dials /api](docs/adr/2026-08-25-connection-probe-dial.md).
+  **Spec:** [docs/specs/connection-identity-retirement.md](docs/specs/connection-identity-retirement.md).
   - **Do not record the identity on `connInfo`.** That would have the connection probe read a UID
     off its own snapshot — the stale pairing [ADR: connection-carried
     identity](docs/adr/2026-08-25-connection-carried-identity.md) rejected, where a re-dial landing
