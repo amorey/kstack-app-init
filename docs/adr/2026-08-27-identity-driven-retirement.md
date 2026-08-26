@@ -70,6 +70,11 @@ paced by the serverUID probe's cadence. Acceptable, and pathological enough not 
 `Conn` still hands out a conflicted connection until the rebuild lands — pre-existing, and
 unchanged here. This shortens how long one stands; it does not close that window.
 
+**Recovery takes two signals, so holders got a helper.** `Done()` fires when the old connection is
+retired, but the replacement is unstamped for a round trip after that, so `ConnFor` refuses through
+the window. `ReadyFor`/`AwaitConnFor` are that wait, as free functions over `Lease` — a probe `Run`
+must not use them, since blocking holds an engine worker.
+
 ## Revisit when
 
 A conflict lingers long enough to need surfacing on the record. While the rebuild is in flight the

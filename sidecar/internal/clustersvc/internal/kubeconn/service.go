@@ -106,6 +106,69 @@ type Lease interface {
 	Release()
 }
 
+// ReadyFor closes when l holds a connection vouching for serverUID, or when ctx ends. It is what
+// a holder waits on across a rebuild: the replacement lands before the old one's Done() fires,
+// but it is unstamped for a round trip after that, so ConnFor refuses through the window and
+// Done() alone is not the signal.
+//
+// **An edge, not a promise.** The connection can move again between the close and the caller's
+// ConnFor, so a caller re-checks — AwaitConnFor is that loop for a caller with nothing else to
+// select on.
+//
+// A waiter that never fires lives until ctx ends, so bound it with the context of the work that
+// wants the connection rather than a process-lived one. A connection already vouching costs no
+// waiter at all: the channel comes back closed.
+//
+// Free functions rather than Lease methods, so nothing implementing that interface — every
+// caller's fake included — can get the attach ordering wrong. **Never called from a probe Run:**
+// it blocks, and a run holds an engine worker.
+func ReadyFor(ctx context.Context, l Lease, serverUID string) <-chan struct{} {
+	ready := make(chan struct{})
+
+	// Attached before the first check, never after: a stamp landing in the gap between the two
+	// is one the waiter would sleep through, and the next pass that would report it is a
+	// serverUID interval away.
+	sub := l.WatchState()
+	if _, err := l.ConnFor(ctx, serverUID); err == nil {
+		sub.Close()
+		close(ready)
+		return ready
+	}
+
+	go func() {
+		defer close(ready)
+		defer sub.Close()
+		for {
+			if _, err := sub.RecvContext(ctx); err != nil {
+				return
+			}
+			if _, err := l.ConnFor(ctx, serverUID); err == nil {
+				return
+			}
+		}
+	}()
+	return ready
+}
+
+// AwaitConnFor is ConnFor that waits: the connection vouching for serverUID as soon as one
+// exists, or ctx's error. A holder resuming across a rebuild loops over it, and pays nothing
+// once a connection is standing.
+func AwaitConnFor(ctx context.Context, l Lease, serverUID string) (*Connection, error) {
+	for {
+		<-ReadyFor(ctx, l, serverUID)
+
+		conn, err := l.ConnFor(ctx, serverUID)
+		if err == nil {
+			return conn, nil
+		}
+		// ReadyFor closes on ctx too, so this is what tells a caller that gave up from one
+		// whose connection moved again between the close and the read.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+}
+
 // Service is the pool the cluster service leases contexts from. The probe engine tracks one
 // subject per claimed context; this type owns who holds the claims and what the fleet is told.
 type Service struct {

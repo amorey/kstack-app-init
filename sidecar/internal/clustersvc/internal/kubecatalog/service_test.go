@@ -733,3 +733,43 @@ func TestRefusalStopsTheWatcher(t *testing.T) {
 	defer svc.mu.Unlock()
 	assert.Empty(t, svc.watchers, "a refused run leaves no watch standing")
 }
+
+// The acceptance condition for identity-driven retirement, from this side of the boundary: the
+// recovery is not done when the sweep runs again, it is done when a watch stands over the *new*
+// connection. Every step is existing wiring — the refusal stops the watcher, the pool coming to
+// vouch again wakes the subject, and ensureWatcher's connection comparison does the rest — which
+// is exactly what makes it worth pinning: nothing here would fail loudly if one step stopped.
+func TestRecoveryStandsAWatchOverTheNewConnection(t *testing.T) {
+	conns := newFakeConns()
+	f := newFakeOpener(t)
+	svc := newTestService(t, conns, answering(pods), withOpener(f.open))
+	startService(t, svc)
+	sub := svc.Subscribe()
+	t.Cleanup(sub.Close)
+
+	svc.Track("cachedcatalog/1", "prod", testUID)
+	testutil.Recv(t, sub.Chan(), "the first answer")
+	for range 2 {
+		f.opens.Await(t, "an open")
+	}
+
+	// The server behind the connection is replaced, so the pool vouches for nobody.
+	conns.setServerUID("")
+	conns.publish("prod")
+	testutil.Recv(t, sub.Chan(), "the refusal's signal")
+	svc.mu.Lock()
+	require.Empty(t, svc.watchers, "a refused run leaves no watch standing")
+	svc.mu.Unlock()
+
+	// Retirement rebuilds the connection and the probe behind it stamps the server again.
+	rebuilt := conns.rebuild()
+	conns.setServerUID(testUID)
+	conns.publish("prod")
+
+	testutil.Recv(t, sub.Chan(), "the recovered sweep's signal")
+	for range 2 {
+		f.opens.Await(t, "the replacement's open")
+	}
+	w := watcherFor(t, svc, "cachedcatalog/1")
+	assert.Same(t, rebuilt, w.conn, "the watch stands over the connection the sweep used")
+}

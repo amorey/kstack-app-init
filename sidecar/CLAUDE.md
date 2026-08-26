@@ -643,6 +643,17 @@ once a probe can land at all. **Every value is a level, never an edge** — the 
 so a reader that falls behind skips what came between, and transitions come from the record's
 conditions and event timeline.
 
+**Waiting for a usable connection is `ReadyFor`/`AwaitConnFor`**, not a hand-rolled loop. Neither
+`Done()` nor a state frame is the signal an identity-scoped holder needs: retirement puts the
+replacement in the observable *before* `Done()` fires, but that replacement is unstamped for a
+round trip after, so `ConnFor` refuses through the window. `ReadyFor` returns a channel closed
+when a connection vouching for the uid exists — already closed when one does, so the steady state
+costs no goroutine — and `AwaitConnFor` is that plus the re-check, since the close is an edge and
+the connection can move again. **Free functions over `Lease`, never methods**, so no fake can get
+the attach-before-check ordering wrong; a waiter lives until it fires or ctx ends, so bound it
+with the work's context. **Neither may be called from a probe `Run`** — blocking holds an engine
+worker, which is why `kubecatalog` refuses-and-suspends instead, woken by the fleet bus.
+
 **One context, one entry.** `Service.claimed` is a single map keyed by context name — also the key
 both hubs publish under — holding the holder count, whether the file still names the context, and
 what a probe read. Contexts resolving alike are **not** merged. → [ADR: one connection per

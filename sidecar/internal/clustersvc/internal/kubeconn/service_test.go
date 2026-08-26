@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	statewatch "github.com/amorey/gobus/watch"
 	"github.com/amorey/gochan/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -990,9 +991,6 @@ func TestAReplacedServerRebuildsTheConnection(t *testing.T) {
 	watched := lease.WatchState()
 	defer watched.Close()
 
-	moved := s.Subscribe()
-	defer moved.Close()
-
 	awaitState(t, watched, func(st State) bool { return st.Identity().ServerUID == "uid-1" })
 	stale, err := lease.Conn(within(t))
 	require.NoError(t, err)
@@ -1005,17 +1003,11 @@ func TestAReplacedServerRebuildsTheConnection(t *testing.T) {
 
 	// Asked of the connection, never of State.Identity() — the observable reaches uid-2 as soon
 	// as the probe reads it over the OLD connection, which says nothing about the replacement
-	// having been stamped. That pairing is the trap ConnFor exists to close.
-	ctx := within(t)
-	for {
-		fresh, err := lease.ConnFor(ctx, "uid-2")
-		if err == nil {
-			assert.NotSame(t, stale, fresh)
-			return
-		}
-		_, err = moved.RecvContext(ctx)
-		require.NoError(t, err, "waiting for the replacement to vouch for uid-2")
-	}
+	// having been stamped. That pairing is the trap ConnFor exists to close, and waiting out
+	// the stamp window is the whole of what AwaitConnFor is for.
+	fresh, err := AwaitConnFor(within(t), lease, "uid-2")
+	require.NoError(t, err)
+	assert.NotSame(t, stale, fresh)
 }
 
 // settledReads counts kubeconfig reads until they stop. A spin has no quiet gap at all, so the
@@ -1060,4 +1052,116 @@ func TestAConflictWhoseFileStoppedResolvingDoesNotSpin(t *testing.T) {
 	s.engine.Wake("prod", nameServerUID)
 
 	settledReads(t, cfg.reads)
+}
+
+// --- waiting for a usable connection ---
+
+// stubLease is a claim under a test's control: what ConnFor answers, and the state feed a waiter
+// wakes on. The pool's own claim is exercised elsewhere; this is the helpers' unit.
+type stubLease struct {
+	hub *statewatch.Hub[string, State]
+
+	mu   sync.Mutex
+	conn *Connection
+	err  error
+}
+
+func newStubLease() *stubLease {
+	return &stubLease{hub: statewatch.New[string, State](), err: ErrNoConnection}
+}
+
+// vouches is the pool coming to vouch for the cluster, followed by the pass that publishes it.
+func (l *stubLease) vouches(conn *Connection) {
+	l.mu.Lock()
+	l.conn, l.err = conn, nil
+	l.mu.Unlock()
+
+	l.hub.Sender().Send("prod", State{})
+}
+
+func (l *stubLease) ConnFor(context.Context, string) (*Connection, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.conn, l.err
+}
+
+func (l *stubLease) WatchState() StateSubscription { return l.hub.Watch("prod") }
+
+func (l *stubLease) Conn(context.Context) (*Connection, error) { return l.ConnFor(nil, "") }
+func (l *stubLease) State() State                              { return State{} }
+func (l *stubLease) Departed() bool                            { return false }
+func (l *stubLease) Release()                                  {}
+
+// A connection already vouching needs no wait at all, and the channel says so synchronously —
+// a caller checking with select/default would otherwise read "ready" as "not yet".
+func TestReadyForIsClosedWhenTheConnectionAlreadyVouches(t *testing.T) {
+	l := newStubLease()
+	l.vouches(&Connection{})
+
+	select {
+	case <-ReadyFor(t.Context(), l, "uid-1"):
+	default:
+		t.Fatal("a connection that already vouches must not make a caller wait")
+	}
+}
+
+// The wait the stamp window needs: a rebuilt connection is refused until the probe behind it
+// identifies the server, and the pass that stamps it is what releases the waiter.
+func TestReadyForClosesWhenTheConnectionComesToVouch(t *testing.T) {
+	l := newStubLease()
+	ready := ReadyFor(t.Context(), l, "uid-1")
+
+	// A negative assertion has no event to wait for, so it needs a bounded window.
+	testutil.NoRecv(t, ready, 50*time.Millisecond, "a close before anything vouches")
+
+	l.vouches(&Connection{})
+
+	testutil.Wait(t, ready, "the waiter to be released")
+}
+
+// The waiter's whole lifetime is the caller's context — nothing else can end a wait for a
+// cluster that never comes back, so a caller that stops selecting must not strand a goroutine.
+func TestReadyForClosesWhenTheCallerGivesUp(t *testing.T) {
+	l := newStubLease()
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := ReadyFor(ctx, l, "uid-1")
+
+	cancel()
+
+	testutil.Wait(t, ready, "the waiter to end with its context")
+}
+
+// The loop a caller with nothing to multiplex would otherwise write at every call site: wait,
+// then read the level, because the close is an edge and the connection can move again.
+func TestAwaitConnForReturnsTheConnectionThatVouches(t *testing.T) {
+	l := newStubLease()
+	fresh := &Connection{}
+
+	got := make(chan *Connection, 1)
+	go func() {
+		conn, err := AwaitConnFor(t.Context(), l, "uid-1")
+		assert.NoError(t, err)
+		got <- conn
+	}()
+
+	l.vouches(fresh)
+
+	assert.Same(t, fresh, testutil.Recv(t, got, "the connection the waiter returned"))
+}
+
+// A cluster that never comes back ends with the caller's context, and says which it was — a
+// waiter released by a give-up must not read as one released by a connection.
+func TestAwaitConnForEndsWithItsContext(t *testing.T) {
+	l := newStubLease()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	failed := make(chan error, 1)
+	go func() {
+		_, err := AwaitConnFor(ctx, l, "uid-1")
+		failed <- err
+	}()
+
+	cancel()
+
+	assert.ErrorIs(t, testutil.Recv(t, failed, "the waiter's error"), context.Canceled)
 }
