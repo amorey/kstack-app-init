@@ -465,7 +465,9 @@ func TestAcquireAfterDeleteIsRefused(t *testing.T) {
 
 	_, err = r.Acquire(1)
 	assert.ErrorIs(t, err, ErrDeleted)
-	assert.ErrorIs(t, r.ClearKind(context.Background(), 1, "v1", "pods"), ErrDeleted)
+	// The file is gone with the cache, so a kind's clear has nothing to do — and must
+	// not open a store to discover that.
+	assert.NoError(t, r.ClearKind(context.Background(), 1, "v1", "pods"))
 
 	stats, err := r.Stats(1)
 	require.NoError(t, err)
@@ -540,4 +542,113 @@ func TestClearKeepsTheCacheUsableWhenTheFilesWillNotGo(t *testing.T) {
 	_, ok, err = h.Store().Cookie(ctx, "v1", "pods")
 	require.NoError(t, err)
 	assert.False(t, ok)
+}
+
+// A retired cache's kind clear is an error, not a panic. Acquire refuses the id here;
+// the nil-store guard behind it covers the interleaving Acquire cannot see, a Delete
+// landing between the claim and the resolve.
+func TestRegistryClearKindOnARetiredCacheIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	// Delete leaves the file, so ClearKind gets past the existence check and reaches
+	// the store the delete retired.
+	r := newRegistryWithOptions(dir, withDeleteFiles(func(string) error { return nil }))
+	t.Cleanup(func() { require.NoError(t, r.Close()) })
+
+	ctx := context.Background()
+	h, err := r.Acquire(1)
+	require.NoError(t, err)
+	defer h.Release()
+
+	require.NoError(t, r.Delete(1))
+
+	assert.Nil(t, h.Store(), "a handle on a retired entry")
+	assert.ErrorIs(t, r.ClearKind(ctx, 1, "v1", "pods"), ErrDeleted)
+}
+
+// A Clear that cannot reopen retires its entry, and the handles left on it are that
+// entry's alone: they read no store, and releasing them must not count down — or
+// close — the store a fresh claim opened at the same id.
+func TestReleaseAfterAFailedClearLeavesAFreshClaimAlone(t *testing.T) {
+	dir := t.TempDir()
+	// The unlink also blocks the reopen: a store cannot be created in a directory
+	// nothing may write.
+	r := newRegistryWithOptions(dir, withDeleteFiles(func(path string) error {
+		if err := deleteStoreFiles(path); err != nil {
+			return err
+		}
+		return os.Chmod(dir, 0o500)
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, os.Chmod(dir, 0o700))
+		require.NoError(t, r.Close())
+	})
+
+	ctx := context.Background()
+	first, err := r.Acquire(1)
+	require.NoError(t, err)
+	second, err := r.Acquire(1)
+	require.NoError(t, err)
+
+	require.Error(t, r.Clear(1), "the reopen must have failed for this test to mean anything")
+	assert.Nil(t, first.Store(), "a handle on the retired entry")
+
+	require.NoError(t, os.Chmod(dir, 0o700))
+	fresh, err := r.Acquire(1)
+	require.NoError(t, err)
+	defer fresh.Release()
+
+	first.Release()
+	second.Release()
+
+	require.NotNil(t, fresh.Store(), "the fresh claim's store was dropped by a stale release")
+	require.NoError(t, fresh.Store().SetCookie(ctx, "v1", "pods", "1"))
+
+	// The fresh entry is still the one the id resolves to, so a later claim joins that
+	// store rather than opening a second one over the same file.
+	other, err := r.Acquire(1)
+	require.NoError(t, err)
+	defer other.Release()
+	assert.Same(t, fresh.Store(), other.Store(), "a second store was opened beside the live one")
+}
+
+// The events table is not keyed by kind, so its clear does not hang off the catalog
+// row: a retry after a partial failure has already dropped that row.
+func TestStoreClearKindClearsEventsWithNoCatalogRow(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(dir)
+	t.Cleanup(func() { require.NoError(t, r.Close()) })
+
+	ctx := context.Background()
+	h, err := r.Acquire(1)
+	require.NoError(t, err)
+	defer h.Release()
+
+	db := h.Store().db
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO events (uid, reason, message, raw_json, updated_at) VALUES ('uid-ev', 'Pulled', 'ok', x'7b7d', 0)`)
+	require.NoError(t, err)
+
+	require.NoError(t, h.Store().ClearKind(ctx, "v1", "events"))
+
+	var n int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&n))
+	assert.Zero(t, n, "cached events survived a clear that found no catalog row")
+}
+
+// Clearing a kind from a cache that was never opened must not create the file it is
+// clearing — schema, sidecars and all.
+func TestRegistryClearKindOnAnUnopenedCacheCreatesNothing(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(dir)
+	t.Cleanup(func() { require.NoError(t, r.Close()) })
+
+	require.NoError(t, r.ClearKind(context.Background(), 1, "v1", "pods"))
+
+	stats, err := r.Stats(1)
+	require.NoError(t, err)
+	assert.False(t, stats.Exists, "the clear opened the cache it had nothing to clear")
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "the clear left files behind")
 }

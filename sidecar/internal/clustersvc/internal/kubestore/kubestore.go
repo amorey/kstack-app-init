@@ -71,8 +71,10 @@ type Registry struct {
 }
 
 // entry is one cache's open store and the handles on it. The store pointer is what
-// Clear swaps; handles read it through the registry rather than holding it, which is
-// what makes the swap safe under live handles.
+// Clear swaps, and a handle reads it out of the entry it claimed — which is what makes
+// the swap reach live handles while a replacement entry stays theirs alone. A nil store
+// is one closed for good, so a handle on a retired entry reads nothing rather than a
+// closed *sql.DB or another claim's store.
 type entry struct {
 	store *Store
 	refs  int
@@ -127,7 +129,7 @@ func (r *Registry) Acquire(cacheID int64) (*Handle, error) {
 		r.entries[cacheID] = e
 	}
 	e.refs++
-	return &Handle{r: r, cacheID: cacheID}, nil
+	return &Handle{r: r, cacheID: cacheID, e: e}, nil
 }
 
 // Clear wipes cacheID's store: close the open store if any, delete the files (the
@@ -152,8 +154,10 @@ func (r *Registry) Clear(cacheID int64) error {
 	if held {
 		store, err := openStore(path)
 		if err != nil {
-			// Nothing usable to swap in, so drop the entry: a later Acquire opens the
-			// cache fresh rather than resolving a store that is closed for good.
+			// Nothing usable to swap in, so retire the entry: a later Acquire opens the
+			// cache fresh, and the handles left on this one read no store rather than
+			// one closed for good.
+			e.store = nil
 			delete(r.entries, cacheID)
 			return errors.Join(deleteErr, fmt.Errorf("clear: reopen: %w", err))
 		}
@@ -181,10 +185,12 @@ func (r *Registry) Delete(cacheID int64) error {
 	r.deleted[cacheID] = true
 
 	if e, held := r.entries[cacheID]; held {
-		if err := e.store.db.Close(); err != nil {
+		store := e.store
+		e.store = nil
+		delete(r.entries, cacheID)
+		if err := store.db.Close(); err != nil {
 			return fmt.Errorf("delete: close store: %w", err)
 		}
-		delete(r.entries, cacheID)
 	}
 	if err := r.deleteFiles(r.path(cacheID)); err != nil {
 		return fmt.Errorf("delete: delete files: %w", err)
@@ -193,14 +199,31 @@ func (r *Registry) Delete(cacheID int64) error {
 }
 
 // ClearKind wipes one kind from cacheID's store — a convenience over
-// Acquire/Store.ClearKind/Release for a caller holding no handle.
+// Acquire/Store.ClearKind/Release for a caller holding no handle. A cache with no file
+// has nothing to clear, and is answered without one: Acquire creates the file, schema
+// and sidecars and all, so opening one here would leave behind exactly what the clear
+// is removing.
 func (r *Registry) ClearKind(ctx context.Context, cacheID int64, apiVersion, resource string) error {
+	stats, err := r.Stats(cacheID)
+	if err != nil {
+		return err
+	}
+	if !stats.Exists {
+		return nil
+	}
+
 	h, err := r.Acquire(cacheID)
 	if err != nil {
 		return err
 	}
 	defer h.Release()
-	return h.Store().ClearKind(ctx, apiVersion, resource)
+
+	store := h.Store()
+	if store == nil {
+		// A Delete or a failed Clear retired the cache between the two calls.
+		return fmt.Errorf("clear kind: cache %d: %w", cacheID, ErrDeleted)
+	}
+	return store.ClearKind(ctx, apiVersion, resource)
 }
 
 // Stats reports cacheID's on-disk size without opening it. Bytes counts the
@@ -286,6 +309,7 @@ func (r *Registry) Close() error {
 	for id, e := range r.entries {
 		if e.store != nil {
 			errs = append(errs, e.store.db.Close())
+			e.store = nil
 		}
 		delete(r.entries, id)
 	}
@@ -298,40 +322,43 @@ type Stats struct {
 	Bytes  int64
 }
 
-// Handle is one holder's claim on a cache's store. Store resolves through the
-// registry on every call, so a Clear's swap reaches every holder.
+// Handle is one holder's claim on one entry. Store reads through that entry on every
+// call, so a Clear's swap reaches every holder — and a claim taken after the entry was
+// retired is a different entry, never this one's business.
 type Handle struct {
 	r       *Registry
 	cacheID int64
+	e       *entry
 }
 
-// Store returns the current store behind this handle.
+// Store returns the current store behind this handle, or nil once it is retired — a
+// Delete, or a Clear that could not reopen. Callers check.
 func (h *Handle) Store() *Store {
 	h.r.mu.Lock()
 	defer h.r.mu.Unlock()
-	e := h.r.entries[h.cacheID]
-	if e == nil {
-		return nil
-	}
-	return e.store
+	return h.e.store
 }
 
-// Release gives the claim back; the last release closes the store.
+// Release gives the claim back; the last release on an entry closes its store. It
+// counts down the entry this handle claimed, never whatever the id maps to now — a
+// retired entry's stragglers must not close a fresh claim's store.
 func (h *Handle) Release() {
 	h.r.mu.Lock()
-	e := h.r.entries[h.cacheID]
-	if e == nil {
+	h.e.refs--
+	if h.e.refs > 0 {
 		h.r.mu.Unlock()
 		return
 	}
-	e.refs--
-	if e.refs > 0 {
-		h.r.mu.Unlock()
-		return
+	store := h.e.store
+	h.e.store = nil
+	if h.r.entries[h.cacheID] == h.e {
+		delete(h.r.entries, h.cacheID)
 	}
-	delete(h.r.entries, h.cacheID)
 	h.r.mu.Unlock()
-	e.store.db.Close()
+
+	if store != nil {
+		store.db.Close()
+	}
 }
 
 // Store is one cache's open SQLite file. The writer pool is capped at one
@@ -378,6 +405,16 @@ func (s *Store) ClearKind(ctx context.Context, apiVersion, resource string) erro
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
+	// Core events are not in objects: they have their own table, and every cached event
+	// rolls into the one ('v1','Event') catalog row. Nothing resolves them through that
+	// row, so this runs whether or not it is still there — a clear retried after a
+	// partial failure has already dropped it.
+	if apiVersion == coreEventsAPIVersion && resource == coreEventsResource {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM events`); err != nil {
+			return fmt.Errorf("clear kind: delete events: %w", err)
+		}
+	}
+
 	var kind string
 	err = tx.QueryRowContext(ctx,
 		`SELECT kind FROM kind_catalog WHERE api_version = ? AND resource = ?`,
@@ -388,13 +425,6 @@ func (s *Store) ClearKind(ctx context.Context, apiVersion, resource string) erro
 	case err != nil:
 		return fmt.Errorf("clear kind: resolve catalog: %w", err)
 	default:
-		// Core events are not in objects: they have their own table, and every cached
-		// event rolls into that one catalog row, so clearing the kind clears the table.
-		if apiVersion == coreEventsAPIVersion && resource == coreEventsResource {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM events`); err != nil {
-				return fmt.Errorf("clear kind: delete events: %w", err)
-			}
-		}
 		// The schema has no cascading foreign keys, so the rows hanging off each
 		// object go here too — and before the objects they are selected through.
 		// owner_refs by child_uid only: an edge is extracted from the CHILD's
