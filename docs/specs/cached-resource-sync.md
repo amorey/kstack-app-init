@@ -9,192 +9,327 @@ status: In progress
 ## Goal
 
 Make each `ClusterCachedResource` real: a live mirror of one Kubernetes kind into the local
-cache, with the `Synced` verdict, the on-disk store behind `ClusterCacheStats`, the whole
-`CachedData()` family, the health fold, and the two `Clear`s. The wire contract is already
-specified — the schema, the condition vocabulary (`Syncing`/`Watching`/`Stale`/`SyncFailed`/
-`Paused`/`NoConnection`/`IdentityMismatch`), the sync-event reasons, and the `CachedData` frame
-types all exist and wait on this. No schema change.
+cache. The control plane is **built** — the store registry, the worker fleet's shell, the
+controller pass that arms it and folds its observation into `Synced`, the trigger, and the
+teardown sequencing all exist and are tested. What remains is the **data plane**: the worker's
+run body is a placeholder that publishes nothing, the store has no write path, and the gauges,
+the two `Clear`s, the sync events, and the poke bounce are unbuilt. The wire contract is
+unchanged throughout — schema, condition vocabulary, event reasons all exist in
+`shared.go`. No schema change.
 
-## Shape
+Two sibling specs carve off adjacent work; their boundaries matter:
 
-The catalog is the template: the controller pass arms machinery in a leaf, folds its in-memory
-answer into the record, and never dials. Two new leaves under `internal/clustersvc/internal/`,
-speaking native vocabulary (GVR strings, context names, JSON rows) — a leaf reaching for a
-`clustersvc` type gets an import cycle, same as kubeconn and kubecatalog.
+- **docs/specs/cached-data.md** owns the read side: the `CachedData()` family, the store's
+  reads (`Kinds`/`Objects`/`Events` + row structs), the reader pool, the two ping buses, and
+  the registry read path. This spec's writers **feed** those buses.
+- **docs/specs/kind-catalog-sync.md** owns `kind_catalog`: the catalog fold is its one
+  writer. Workers never write catalog rows, and `is_crd` never rides
+  `ClusterCachedResourceSpec` or worker `Params`.
+
+## Shape (as built)
 
 ```
-clusterCachedResourceController.Reconcile      (cachedresources.go — replaces the no-op)
-        │ Track / Forget / Read          ▲ trigger (signal → requeue by name)
+clusterCachedResourceController.Reconcile      (cachedresources.go — BUILT)
+        │ Track / Forget / Read          ▲ trigger (conflated signal → requeue by name)
         ▼                                │
-internal/kubesync     one worker per (cache, GVR): list+watch → store, publishes an Observation
-        │ writes / reads
+internal/kubesync     fleet shell BUILT; run body is syncPlaceholder (the remaining core)
+        │ writes / reads (store dep NOT yet wired)
         ▼
-internal/kubestore    one SQLite file per cache: objects, events, cookies, counts, change broker
+internal/kubestore    registry + schema + cookies + clears BUILT; no write path, no buses
         ▲
-        │ snapshot + broker subscription
-cacheddata.go / caches.go reads          (CachedData family, WatchStats, WatchHealth, Clear)
+        │ reads + bus subscriptions (→ cached-data spec)
+caches.go / cacheddata.go reads          (gauges, Clears — still panic)
 ```
 
-## `internal/kubestore` — the on-disk cache
+## Built — verify against the code, don't rebuild
 
-**One SQLite file per cache**, `<data-dir>/caches/<cacheID>.db`, its own migration sequence via
-`sqlitemigrate` (the appdb rule: never a second embed against `app.db`). Per-cache files are what
-make `Caches().Clear` "delete the file" and `Stats.Exists`/`Bytes` cheap. `Bytes` checkpoints (or
-counts the `-wal`/`-shm` sidecars alongside the main file) — a bare stat of the main file swings
-with checkpoint timing and reports a number that moves for no reason a user can see.
+**`internal/kubestore`** (`kubestore.go`): the refcounted `Registry`
+(`Acquire`/`Handle.Store()`/`Release`), one SQLite file per cache at
+`<data-dir>/caches/<cacheID>.db`. `Clear` closes, deletes (with `-wal`/`-shm`), and swaps a
+fresh store into the live entry so held handles keep working; `Delete` tombstones the id
+(`deleted` set, later `Acquire` refused with `ErrDeleted`) and never reopens; `ClearKind`
+refuses to create a file for a cache that has none. `Stats` reports `Exists`/`Bytes`
+(sidecars counted). The schema is `main`'s `0001_init.sql` verbatim — `objects` (with the
+`generation` sweep column and materialized fields), `owner_refs`, `labels`, `events` + FTS,
+`status_history`, `kind_catalog`, trigger-maintained `kind_counts` (including the hardcoded
+`('v1','Event')` triggers), `cluster_meta`. `auto_vacuum=INCREMENTAL` is set before
+migrations; the writer pool caps at one connection. `Cookie`/`SetCookie` keep the per-kind
+watch resourceVersion in `cluster_meta` under `cookie/<apiVersion>/<resource>`.
+`Store.ClearKind` deletes a kind's rows (resolving plural→Kind through `kind_catalog`), its
+edges, its catalog row, and its cookie in one transaction. (The kind-catalog-sync spec later
+changes `ClearKind` to keep the catalog row; leave that to it.)
 
-**The package exports a registry, not bare stores.** The broker is in-memory state on a store
-handle, so the kubesync writers and the `cacheddata.go`/`caches.go` readers must share one handle
-per cache — a per-cache open/refcount/close registry, living in `deps` beside the other shared
-services. Everything resolves a store through it, including `Clear`, which is what makes the
-close-before-delete sequencing below enforceable.
+**`internal/kubesync`** (`service.go`): `Track`/`Forget`/`Read`/`Subscribe`/`Bounce`/
+`BounceCache`/`ForgetCache` exactly as the interface comment in `shared.go` describes.
+`Track` is a no-op while params hold and replaces the subject when they move; `Bounce`
+restarts in place, generation-guarded; `Forget`/`ForgetCache` stop and **wait** for the
+worker. One `kubeconn.Lease` per subject, acquired at `Track`. The conflated signal
+(`gobus/conflate`, keyed by subject id) fires only when `Observation.Reason` moves —
+`commitFor` gates it against `published`. The run body is the `syncFunc` seam
+(`withSync` test option); production is `syncPlaceholder`, which parks until ctx ends.
 
-**The schema is `main`'s, carried over verbatim** —
-`sidecar/internal/cluster/cache/store/migrations/0001_init.sql` on `main`, along with the store
-pieces built for it as each becomes needed (`rawcodec` for the zlib-compressed `raw_json`,
-`resume_cookie`, the janitor). So: `objects` with the cross-kind materialized fields, `owner_refs`
-and `labels` as joinable edges, `events` with its FTS index and count triggers, `status_history`,
-`kind_catalog` (which carries `is_crd` and the CRD schema), trigger-maintained `kind_counts`, and
-`cluster_meta` as the sync-bookkeeping bag — the per-kind resourceVersion cookie and warm-relist
-generation live there, not in a table of their own. Two traps `main` already solved travel with
-it: `auto_vacuum=INCREMENTAL` must be set on the fresh writer pool *before* migrations run
-(SQLite silently ignores it once any table exists), and the writer pool caps at one connection.
+**The controller pass** (`cachedresources.go`): deletion-pending → `Forget` +
+`kubestoreSvc.ClearKind`, settle (the other side of the catalog's `DiscoveryDraining`
+handshake); owner chain gone (`resourceOwnersOf` walks catalog → cache → cluster) →
+`Forget`, settle; `Spec.Enabled == false` → `Forget`, keep the data, `Synced=False/Paused`;
+no usable context → `Forget`, `Synced=False/NoConnection`; otherwise `Track` with the
+cluster's context and the cache's `ServerUID`, `Read`, and map the observation's reason onto
+the condition (`observeSynced`). No answer yet → `Connecting`. Wired in `service.go`:
+`newKubesyncTrigger` + `resourceResync` (10m backstop), the registry and fleet in `New` and
+in `parts` (stop order: workers stop after the reconciles that arm them, before the stores
+and the pool).
 
-The event window still needs its pruner named: aging out is not a write, so nothing emits the
-promised `Deleted` for free. The pruner runs on every event write (events keep arriving on a live
-cluster) plus a tick for a quiet one; window and tick are parameters with production constants.
-Event counts ride the schema's own hardcoded `('v1','Event')` triggers and stay out of the
-per-kind object rollup.
+**Cache teardown** (`caches.go`): the cache's deletion-pending pass calls
+`kubesyncSvc.ForgetCache` (workers stopped and waited on) then `kubestoreSvc.Delete` — the
+file dies with the record, and nothing may recreate it (why `Acquire` tombstones).
 
-**The store owns the change signal, and it is a coalesced ping, not a row delta.** Writers notify
-per-resource and per-bus after commit; a reader subscribes first, snapshots, and on each ping
-re-reads and diffs by UID to produce its frames — `main`'s `writeBus` shape, and what the served
-types are built for. The full read-side design lives in the cached-data spec
-(→ docs/specs/cached-data.md, "Decided here"). Per-kind counts come from the schema's
-`kind_counts` triggers, feeding `WatchKinds` and the stats rollup.
+**Still panicking** (`TestUnimplementedBoundaryPanics` is the honest inventory — delete each
+entry as its method lands): `Caches().WatchStats`, `Caches().WatchHealth`, `Caches().Clear`,
+`CachedResources().Clear`, the four `CachedData()` methods (cached-data spec), and
+`ListEvents`/`WatchEvents` (kstack's own event log — **not this spec's**; it needs the
+sync events below to have anything to show, but serving it is separate work).
 
-`ClearKind(cacheID, gvr)` deletes the kind's rows and cookie in place. `Clear(cacheID)` goes
-through the registry: close every handle, delete the files (the `-wal`/`-shm` sidecars too), then
-reopen — deleting under open handles does not fail on POSIX, it silently forks the world, with the
-old handle writing to the unlinked inode while a reopened store starts fresh. A broker subscriber
-alive at that moment has its stream ended with a reason and reconnects into the fresh store's
-snapshot. Bouncing workers is still the caller's job; the registry only sequences the handles.
-`Delete(cacheID)` is the same close-and-delete without the reopen, for a cache going away with
-its record: the file is named for that id, so the cache's teardown pass is the last thing that
-can find it. That pass calls `ForgetCache` first — the registry sequences handles, not writers,
-so only a stopped worker cannot write through the store it is about to close — and the id is
-refused by `Acquire` afterwards (`ErrDeleted`), since a straggler pass still holding a
-pre-teardown view of the cache would otherwise open a fresh file nothing can name again.
+## Remaining work
 
-## `internal/kubesync` — the worker fleet
+### 1. Data-plane seams (kubesync)
 
-Kubecatalog's exported shape, so the fold reads symmetrically: `Track(id, params)` /
-`Forget(id)` / `Read(id) (Observation, bool)` / `Subscribe()`. `id` is the
-`ClusterCachedResource` beehive name; `params` is `{cacheID, contextName, serverUID, apiVersion,
-resource, namespaced}` — `cacheID` because the worker's store lives at the cache's path and the
-subject name embeds the catalog's object id, not the cache's; the controller has the cache in hand
-from the owner walk. Arming is policy, not interest — the controller is the only armer, so nothing
-a reader does can re-arm a kind the user paused.
+The run body needs the connection and the store; neither reaches it today.
 
-The shape grows one entry kubecatalog's does not have: `Bounce(id)` / `BounceCache(cacheID)`,
-restarting tracked workers in place from their held params. The two `Clear`s need it — the
-boundary caller holds neither the subject names nor the params to Forget-and-re-Track, and a
-`Track` of an existing id restarts nothing while its params hold, so nothing else restarts a
-worker whose cookie just died. Params that moved are a different sync — a re-pointed context, a
-kind whose scope changed — and a worker fixes its REST shape and its connection at start, so
-`Track` replaces the subject rather than leaving one syncing on values nobody asked for. The poke
-path is the same bounce across every subject.
+- `syncFunc` grows the subject's lease:
+  `func(ctx context.Context, p Params, lease kubeconn.Lease, commit func(Observation))`.
+  `spawn` passes `sub.lease`, bound the way `commitFor` is.
+- `kubesync.New(conns, stores)` — a second leaf dependency, the shape `connService` set:
 
-**Not on the probe engine**: a sync is a standing push stream, not a periodic pass. Each subject
-is a worker goroutine:
+  ```go
+  type storeService interface {
+      Acquire(cacheID int64) (*kubestore.Handle, error)
+  }
+  ```
 
-1. **Connection.** One refcounted `kubeconn.Lease` per context, shared by that cache's workers;
-   every use goes through `Lease.ConnFor(ctx, serverUID)`. No connection or identity mismatch →
-   suspend, publish that reason, wake on the kubeconn fleet bus (the kubecatalog bridge). A
-   worker never blocks in `AwaitConnFor` while holding anything shared.
-2. **Cold sync.** Paged `List` (limit + continue) via `Connection.Dynamic`, pages written in
-   store transactions, cookie recorded. Object writes strip managedFields and the kubectl
-   last-applied annotation (`ClusterCachedDataObject.RawJSON`'s promise) and compress through
-   the carried-over `rawcodec`. `SyncStart`/`SyncComplete` in the event vocabulary.
-3. **Watch.** From the cookie, `AllowWatchBookmarks: true`; deltas write through to the store,
-   which fans them out. A bookmark updates `lastLiveAt`; a watch quiet past the staleness
-   threshold flips the observation to `Stale` without tearing anything down. The threshold —
-   like the backoff base/max and every other cadence here — is a parameter whose production
-   value is the constant, per the repo's testing convention.
-4. **Ends.** `IsResourceExpired`/`IsGone` → warm relist: bump the sweep generation, write-all,
-   prune rows the new list did not touch — the prune is where the store emits the `Deleted`
-   frames a client needs. `ResyncStart`/`ResyncComplete` events. Any other failure → backoff
-   ladder, `SyncFailed`/`SyncDegraded`. A resourceVersion never outlives its connection.
-5. **Publish.** An in-memory `Observation` per subject — phase, reason, message, object count,
-   `lastUpdateAt`, `lastLiveAt` — and a conflated signal **only when the news moves**
-   (phase/reason, never a count tick or timestamp), so the fold is not requeued per event.
-   Timing detail stays off the record: steady state must be silent.
-6. **Pacing.** Cold lists go through a bounded start (semaphore or `workqueue`) so enabling a
-   cache does not fire a hundred concurrent full LISTs. Standing watches are cheap and unbounded.
+  (kubesync importing kubestore is leaf→leaf, same as its kubeconn import.)
+  `clustersvc.New` passes the registry.
+- The worker acquires the handle at run start and releases on run exit. `ErrDeleted` at
+  acquire → the cache is being torn down; park until ctx ends (`Forget` is coming, nothing
+  to publish). `Handle.Store()` returning nil mid-run (a `Clear` that failed to reopen) →
+  end the attempt as a failure into the backoff ladder.
+- `Observation` grows `Resumed bool` — the run started from an existing cookie. The fold's
+  event mapping (step 4) is the consumer; nothing else reads it. The signal is reason-gated
+  (`commitFor` fires only when `Reason` moves), so the fold sees `Resumed` only as it stood
+  on a commit that moved the reason — an invariant the loop must hold to: set it on the
+  reason-moving commit itself (step 2 does), never flipped later under an unchanged reason,
+  where it is invisible.
+- `Params` drops `Namespaced`. Its only sync-side consumer on `main` was the
+  `kind_catalog` `scope` column, which the kind-catalog-sync spec moves to the catalog fold;
+  the worker's list/watch uses the unnamespaced dynamic form, which covers both scopes, and
+  the `namespace` column reads from the body (`NOT NULL DEFAULT ''`, so a cluster-scoped
+  kind stores the empty string with no help). An unread param would also make `Track`'s
+  replace-on-moved-params trigger on a bit nothing uses. (`ClusterCachedResourceSpec.Namespaced`
+  stays — the record serves it.)
 
-A poke subscription bounces workers in place — warm resume off the cookie — which is the behavior
-the poke section of `sidecar/CLAUDE.md` already reserves for this controller.
+### 2. The sync loop (the worker run body)
 
-## The controller pass (`cachedresources.go`)
+One worker per subject, replacing `syncPlaceholder`. `main`'s
+`sidecar/internal/cluster/cache/kubesync/` + `objectsync/` + `eventsync/` are the reference
+implementation for the mechanics — carry logic over, adapted to this seam; don't invent.
 
-Mirrors `clusterCachedCatalogController.Reconcile` one level down:
+1. **Connection.** `lease.ConnFor(ctx, p.ServerUID)`; on refusal commit the matching
+   observation — `errors.Is(err, kubeconn.ErrNoConnection)` → `ReasonNoConnection`,
+   `ErrIdentityMismatch` → `ReasonIdentityMismatch` — then block in
+   `kubeconn.AwaitConnFor(ctx, lease, p.ServerUID)`. Legal here: the worker is its own
+   goroutine holding nothing shared (the prohibition is on probe `Run`s). Every use of the
+   connection goes through `ConnFor`, never `Conn` — the identity gate is what makes the
+   cookie safe to reuse (a resumed watch is guaranteed to be against the same server).
+2. **Cold sync** (no cookie, or the relist path). Paged `List` (limit + continue, page size a
+   parameter) via `Connection.Dynamic`, always the unnamespaced form —
+   `Resource(gvr).List` mirrors every namespace, and covers cluster-scoped kinds with the
+   same call; each page written in one store transaction; record
+   the list's resourceVersion with `SetCookie` when complete. Commit `ReasonSyncing` (with
+   `Resumed` false on a cold start, true when a cookie existed) while building, counts as
+   they land.
+3. **Watch.** From the cookie, `AllowWatchBookmarks: true`. Deltas write through to the
+   store; every delta and bookmark updates `LastLiveAt`, every write `LastUpdateAt`. Caught
+   up → `ReasonWatching`. A watch quiet past the staleness threshold (a parameter) flips the
+   observation to `ReasonStale` **without tearing anything down**; the next proof of life
+   flips it back.
+4. **Ends.** `apierrors.IsResourceExpired`/`IsGone` → warm relist: bump the sweep
+   `generation`, write-all (the list pages), then prune rows the new list did not touch —
+   the prune is where deleted-while-disconnected objects finally leave the store. Any other
+   failure → backoff ladder (base/max are parameters), `ReasonSyncFailed` carrying the
+   error message. The in-memory resourceVersion never outlives its connection: a re-entry
+   through `AwaitConnFor` resumes from the *cookie*, and a cookie the server refuses is
+   exactly the expired path above.
+5. **Writes.** Core `v1` `events` (`Params{APIVersion:"v1", Resource:"events"}`) go to the
+   `events` table (`main`'s `eventsync` shape — upsert by UID, coalesced counts); every
+   other kind goes to `objects` plus its `owner_refs`/`labels` edges, `status_history`, and
+   the cross-kind materialized fields (`main`'s `objectsync/status.go` is the reference —
+   the schema's own comment documents the per-kind meanings). Object bodies strip
+   `managedFields` and the `kubectl.kubernetes.io/last-applied-configuration` annotation and
+   compress through `rawcodec` (step 3). Workers write objects, events, and cookies —
+   **never `kind_catalog` rows**.
+6. **Pacing.** Cold lists pass through a bounded-concurrency gate on the `Service` (a
+   semaphore; the bound is a parameter with a production constant), so enabling a cache does
+   not fire a hundred concurrent full LISTs. Standing watches are unbounded.
 
-- **Deletion-pending, or the owner chain gone** → `Forget(name)`, `ClearKind` the rows, settle.
-  The tombstone collecting is what frees the name the catalog's `DiscoveryDraining` requeue
-  waits on — this pass is the other side of that handshake.
-- **`Spec.Enabled == false`** → `Forget`, keep the data (pause is not clear), `Synced=False/Paused`.
-- Otherwise walk the owners (catalog → cache → cluster; the catalog's `ownersOf` shape, one level
-  deeper — extract the walk if it reads well shared), `Track` with the cluster's context and the
-  cache's `ServerUID`, `Read` the observation, and write `Synced` from its phase. Condition and
-  events grouped in one `Within`, as the cluster pass does.
+Every cadence here — page size, staleness threshold, backoff base/max, the list gate — is a
+parameter whose production value is the constant, per the repo's testing convention. Tests
+drive the seam the way `kubesync`'s existing tests do (`withSync` shows the pattern from the
+service side; the loop itself gets a fake `Connection`-shaped seam and a real temp-dir
+store).
 
-Wiring in `service.go`: `newKubesyncTrigger` (the three-line `trigger[T]` shape — the signal id
-is the beehive name) plus a `resourceResync` interval registration. The fourth kind whose truth
-is in-memory state the store cannot see move, joining source, cluster, and catalog. The catalog's
-`Enabled` relay already lands in this kind's spec, so no dependency edge.
+### 3. The store write path (kubestore)
 
-## The read side
+Carried from `main`'s `sidecar/internal/cluster/cache/store/` + `objectsync/store.go` +
+`eventsync/store.go`, adapted to `Store`:
 
-- **`CachedData()`** — specified in full in docs/specs/cached-data.md (the ping/re-read/diff
-  loop, the store's read surface, the `Bookmark` rules, provenance). The `kind_catalog` rows it
-  reads are the catalog fold's, not the workers' (→ docs/specs/kind-catalog-sync.md, which also
-  carries `is_crd` from the sweep) — a worker writes objects and cookies, never catalog rows.
-- **`Caches().WatchStats`** — file size plus the count rollup. **`WatchHealth`** — the read-side
-  fold over kubesync observations grouped by cache; never a stored condition
-  (`ClusterCacheHealth`'s comment argues why). It re-emits on the conflated signal **and** on a
-  modest per-subscription cadence (a parameter): the gauge carries `LastUpdateAt`/`LastLiveAt`,
-  which move in healthy steady state precisely when the signal is silent, and a gauge is exactly
-  where moving numbers were exiled to — "steady state must be silent" is a rule about the record.
-- **Both `CachedData` watches and the gauges return `*Stream[T]`, not bare channels** — an
-  interface change to the family signatures (so "no schema change" survives), forced by the
-  boundary's own rule: anything reading a fallible upstream returns a `Stream`, and a store being
-  cleared or failing under a watch needs `Err()` to be distinguishable from a graceful end —
-  the distinction the watch-failure ADR exists to carry to the client.
-- **`Caches().Clear`** — stop the cache's workers, clear the store through the registry, restart
-  them; they cold-sync, the cookie died with the file. **`CachedResources().Clear`** — the same
-  per kind via `ClearKind`.
+- **`rawcodec`** (zlib compress on write; the read side decompresses — shared with the
+  cached-data spec's `Objects` read).
+- **Object upsert/delete** with the edge tables, `status_history`, materialized fields, and
+  the sweep `generation` stamp; the relist prune deletes `WHERE generation < ?` for the
+  kind. `kind_counts` maintenance is free — the schema's triggers own it.
+- **Event upsert** by UID, and the **events pruner**: aging out is not a write, so nothing
+  emits the promised `Deleted` for free. Prune on every event write (events keep arriving
+  on a live cluster) plus a tick for a quiet one; window and tick are parameters with
+  production constants (window doubles as the cached-data watch's diff window, `main`'s
+  `defaultEventsLimit` 500).
+- **Bus notifications.** Every write path above notifies after commit: object writes the
+  objects ping bus under `apiVersion/resource` (plus the cache-wide key), event writes and
+  pruner deletes the events bus. The buses themselves are the cached-data spec's step 2 —
+  if that step hasn't landed when this does, add the notify calls behind a no-op seam it
+  fills in.
+
+**Ordering trap:** `Store.ClearKind` and the read side's plural→Kind translation resolve
+through `kind_catalog`, whose one writer is the catalog fold (kind-catalog-sync spec). Until
+`SyncKinds` lands, a kind's rows are written but not reachable by plural — so land
+kind-catalog-sync's `SyncKinds` step **before or with** the first end-to-end sync, or a
+teardown's `ClearKind` silently misses the rows it should delete.
+
+### 4. Sync events on the record
+
+The fold (not the worker — only a `ControllerClient` can write events) derives the
+`SyncEventCategory` timeline from the `Synced` transition: compare the previous condition
+(`FindCondition(obj.Conditions, ConditionSynced)`) against the new verdict, and on a move
+`AddEvent` the matching reason — grouped with `SetCondition` in one `client.Within`, the
+`clusters.go` idiom.
+
+| Transition (new reason, context) | Event reason |
+|---|---|
+| → `Syncing`, `Resumed` false | `SyncStart` |
+| → `Syncing`, `Resumed` true | `ResyncStart` (message reports the warm size) |
+| `Syncing` → `Watching`, `Resumed` false | `SyncComplete` |
+| `Syncing` → `Watching`, `Resumed` true | `ResyncComplete` |
+| → `SyncFailed` | `SyncDegraded` |
+| → `Stale` | `SyncStale` |
+| → `Paused` / `NoConnection` (the disarm branches) | `SyncStopped` |
+
+The reason constants' doc comments in `shared.go` are authoritative for message content. The
+signal conflates, so an unobserved intermediate state records no event — consistent with "a
+healthy steady state records no event". Beehive extends a repeated `(Category, Type, Reason)`
+run rather than appending, so writing on every pass that observes the same verdict is safe.
+
+### 5. The gauges
+
+Both become `*Stream[T]` — the boundary rule (anything reading a fallible upstream returns a
+`Stream`); `WatchHealth` already has the signature, **`WatchStats` changes from
+`<-chan ClusterCacheStats`** (resolvers move to `watchStream`; the resolver-test fake changes
+shape; schema untouched).
+
+- **`Caches().WatchStats(clusterID, cacheID)`** — gate the pair exactly as the cached-data
+  spec's methods do (cache record exists and is owned by that cluster). A gauge has no
+  `Bookmark`, and nothing is emitted before the first measurement — so an absent or
+  mismatched pair holds silent until ctx ends (the consumer renders "not observed yet"; a
+  caller holding a bad id got it from a watch frame and drops the subscription itself). A
+  live pair reads: `Registry.Stats` for `Exists`/`Bytes`, plus a store rollup
+  read summing `kind_counts` excluding the `('v1','Event')` row (`ObjectCount` = total,
+  `KindCount` = rows with count > 0). The rollup is **this spec's** addition to `Store`
+  (`CountsRollup`), riding the reader pool — but the pool, the ping buses, and the
+  bind-to-an-open-store registry read path are all cached-data's steps 1–2, so this gauge
+  lands **after** them, the mirror of §3's notify-seam dependency. The store binds through
+  that read path, never `Acquire` (a read must not create the file); while no store is open
+  the gauge emits `Registry.Stats`' file facts with zero counts. Emit the first measurement,
+  then re-emit on change, woken by both ping buses plus a cadence parameter (file size moves
+  with no ping). Emit only when the struct differs — it is comparable.
+- **`Caches().WatchHealth()`** — the read-side fold over worker observations, never a stored
+  condition (`ClusterCacheHealth`'s doc comment argues why). kubesync grows one snapshot
+  read:
+
+  ```go
+  type SubjectObservation struct {
+      ID     string
+      Params Params
+      Obs    Observation
+      Known  bool
+  }
+  func (s *Service) Observations() []SubjectObservation  // tracked fleet, one critical section
+  ```
+
+  The fold groups by `Params.CacheID`; a cache with no tracked subjects (fully paused, or
+  torn down) simply has no gauge frame. Per cache: `Status=True/Watching` iff every subject
+  is known with `ReasonWatching`; otherwise `False` with the most severe reason present, in
+  this precedence — `IdentityMismatch`, `NoConnection`, `SyncFailed`, `Stale`, `Syncing`,
+  `Connecting` (a tracked subject not yet known). `UnhealthyKindRefs` = the
+  `{APIVersion, Resource}` of every non-Watching subject, sorted; `TotalKinds` = tracked
+  subjects; `LastUpdateAt` = max across the observations that have one, `LastLiveAt` = the
+  **oldest** among those that have one (the weakest link), nil until any kind reports.
+  Current-on-subscribe (one frame per cache), then re-emit on the fleet's conflated signal
+  **and** on a per-subscription cadence (a parameter) — the timestamps move in healthy
+  steady state precisely when the signal is silent. Emit a cache's frame only when its value
+  moved (compare with `slices.Equal` for the refs).
+
+### 6. The two Clears and the poke bounce
+
+The original design bounced workers around a clear; that races — `Bounce` respawns before
+the registry touches the files. The controller-side sequencing already built (stop → wait →
+touch store) is the model; the boundary does the same and uses beehive's `Requeue` as the
+prompt re-arm, since the record pass is what re-`Track`s:
+
+- **`Caches().Clear(id)`** — `Get` the record (nil → `(nil, nil)`, the family's absent
+  idiom); `kubesyncSvc.ForgetCache(id)` (stops and waits, so nothing writes mid-clear);
+  `kubestoreSvc.Clear(id)` (grow `kubestoreService` in `shared.go` with `Clear`); then
+  resolve the cache's resource records (`catalogIDFor` + `resourceClient.ListOwnedObjects`)
+  and `resourceClient.Requeue` each — their passes re-`Track`, and the workers cold-sync
+  because the cookie died with the file. `resourceResync` is the backstop for a lost
+  requeue. Return the record.
+- **`CachedResources().Clear(id)`** — the same per kind: `Get` the record;
+  `kubesyncSvc.Forget(obj.Name)` (the record's name **is** the subject id);
+  `kubestoreSvc.ClearKind`; `Requeue(id)`. Return the record.
+- **Poke bounce** — `kubesync` grows `BounceAll()` (every tracked subject, the `BounceCache`
+  shape without the filter). `clusterCachedResourceController` replaces its
+  `lifecycle.None` with a `Start` that subscribes `pokeSvc.Subscribe()` and calls
+  `BounceAll` per poke — the in-place warm resume (cookie intact) the poke section of
+  `sidecar/CLAUDE.md` reserves for this controller. Bounces run sequentially on the
+  subscription goroutine; each waits for its worker, which is the point.
+
+`BounceCache` then has no caller, and `Bounce`'s only caller is `BounceAll` — the same
+argument reaches both. Delete `BounceCache` (interface entry and tests too) and demote
+`Bounce` to the unexported `bounce` helper under `BounceAll`; the `kubesyncService`
+interface in `shared.go` ends up carrying `BounceAll` alone as its restart entry.
 
 ## Order of work
 
-1. `kubestore`: file lifecycle, schema, stripping writes, broker, counts, clears.
-2. `kubesync`: one worker end to end — cold sync → watch → resume → stale/failure — with the
-   observation and signal.
-3. The controller pass, trigger, and resync; delete each `TestUnimplementedBoundaryPanics` entry
-   as its method lands.
-4. `CachedData` reads over store + broker.
-5. Gauges, the two `Clear`s, poke bounce.
+1. Seams (step 1) + the store write path (step 3), with white-box store tests over a temp
+   dir — writes are testable without a worker.
+2. The sync loop (step 2), end to end against a fake connection: cold sync → watch → resume
+   → stale → expired-relist → backoff. The existing `kubesync` service tests keep passing
+   unchanged apart from the seam signatures.
+3. Sync events (step 4) — fold-level tests against a stubbed `ControllerClient`, the
+   `cachedresources_test.go` style.
+4. Gauges (step 5), then the Clears + poke bounce (step 6). Delete each
+   `TestUnimplementedBoundaryPanics` entry as its method lands.
 
-Each step tests in the established style: a fake connection service for kubesync, `newRunningDeps`
-for the fold, a stubbed `ControllerClient` for condition writes. When it lands: fold what is true
-into `sidecar/CLAUDE.md`, write an ADR for store-per-cache and worker-not-probe (and the broker
-placement below), delete this spec.
+Each step tests in the established style: a fake connection for kubesync, `newRunningDeps`
+for fold-level tests, `testutil.Probe`/`Signal` for fake notifications, no magic sleeps —
+every cadence is already a parameter by construction above.
+
+When it lands: fold what is true into `sidecar/CLAUDE.md` (whose cluster-subsystem section
+currently describes the placeholder state), write the ADRs (store-per-cache, worker-not-probe,
+and the ping-bus reasoning below), and delete this spec.
 
 ## Decided: the store owns the change signal, as a ping bus
 
-The store carries the signal (not the workers — a reader must not know who writes), but it is a
-payload-less coalesced ping per bus/key, and readers re-read and diff by UID. Row-level delta
-fan-out at the transaction boundary was considered and dropped: once every read is full current
-state, an early or late signal costs one idempotent re-read rather than a wrong frame, so the
-ordering problem the transactional broker existed to solve disappears — and the served types'
-comparability is designed for the diff. Detailed in docs/specs/cached-data.md; carry the
-reasoning into the planned ADR.
+The store carries the signal (not the workers — a reader must not know who writes), but it
+is a payload-less coalesced ping per bus/key, and readers re-read and diff by UID. Row-level
+delta fan-out at the transaction boundary was considered and dropped: once every read is full
+current state, an early or late signal costs one idempotent re-read rather than a wrong
+frame. The full read-side design, including the buses themselves, lives in
+docs/specs/cached-data.md; this spec's writers only notify them. Carry the reasoning into
+the planned ADR.
