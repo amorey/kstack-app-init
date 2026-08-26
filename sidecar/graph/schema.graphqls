@@ -509,10 +509,23 @@ type ClusterCachedCatalog {
   owner: ObjectRef!
   spec: ClusterCachedCatalogSpec!
   """
-  This record's `Discovered` condition — the per-component verdict (reasons
-  Discovered/DiscoveryPartial/DiscoveryFailed/Paused/NoConnection). `DiscoveryPartial`
-  is not a failure: the kinds that answered are synced, but some api group did not
-  respond, so the list is known-incomplete and nothing was pruned from it.
+  This record's `Discovered` condition — the per-component verdict. `Discovered` is the
+  only true one; the other seven are false and each points somewhere different.
+
+  Waiting, not failing: `Connecting` (armed, first sweep still coming), `Paused` (sync
+  switched off), `DiscoveryDraining` (a served kind's name is still held by an earlier
+  prune's tombstone, so the record is owed and coming).
+
+  Answered incompletely: `DiscoveryPartial` — the kinds that answered are synced, but some
+  api group did not respond, so the list is known-incomplete and nothing was pruned from it.
+
+  Nothing was asked: `NoConnection` (the cluster was not reached — the cluster's own
+  conditions say why) and `IdentityMismatch` (the context answers as a different server, or
+  has not said which yet). Neither is a discovery failure, and pointing a user at the API
+  server for them is the wrong remedy.
+
+  Asked and refused: `DiscoveryFailed` — the request itself failed, and the kinds already
+  known are left alone while the sweep retries.
   """
   conditions: [Condition!]!
 }

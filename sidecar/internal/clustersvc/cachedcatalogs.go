@@ -56,11 +56,13 @@ type ClusterCachedCatalogSpec struct {
 // which nothing in the object graph reads. The Discovered condition is what remains.
 type ClusterCachedCatalogStatus struct{}
 
-// ClusterCachedCatalog is the view of one ClusterCachedCatalog beehive
-// object: a cache's kind-catalog record — which kinds the cluster serves, when that
-// was last confirmed, and whether the confirmation was complete. Streamed standalone
-// via CachedCatalogs().Watch and joined onto its cache client-side by Owner.ID. Spec is the
-// stored value served as-is, no projection.
+// ClusterCachedCatalog is the view of one ClusterCachedCatalog beehive object: the anchor a
+// cache's discovery runs against. It carries the pause switch its cache pushed down and the
+// Discovered verdict — the kinds the sweep found are its ClusterCachedResource children, one
+// per kind, and when a sweep last answered is deliberately nowhere, since a timestamp on a
+// record re-emits it to every watcher. Streamed standalone via CachedCatalogs().Watch and
+// joined onto its cache client-side by Owner.ID. Spec is the stored value served as-is, no
+// projection.
 type ClusterCachedCatalog struct {
 	ID ClusterCachedCatalogID
 	// Owner is the ClusterCache this catalog belongs to.
