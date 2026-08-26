@@ -33,11 +33,21 @@ var (
 	pods        = Kind{GroupVersion: "v1", Kind: "Pod", Resource: "pods", Namespaced: true}
 )
 
-// probeOver is a probe whose subject connects and whose sweep answers as given.
+// probeOver is a probe whose subject connects and whose sweep answers as given. The watch
+// seams are no-ops: what a run does to the standing watch is service_test.go's to assert,
+// and the watcher itself watcher_test.go's.
 func probeOver(sweep func(*kubeconn.Connection) (Catalog, error)) *catalogProbe {
+	p := connectingProbe()
+	p.sweep = sweep
+	return p
+}
+
+// connectingProbe is a probe whose subject connects; a test that never sweeps uses it bare.
+func connectingProbe() *catalogProbe {
 	return &catalogProbe{
-		conn:  func(context.Context, string) (*kubeconn.Connection, error) { return &kubeconn.Connection{}, nil },
-		sweep: sweep,
+		conn:    func(context.Context, string) (*kubeconn.Connection, error) { return &kubeconn.Connection{}, nil },
+		watch:   func(context.Context, string, *kubeconn.Connection) {},
+		unwatch: func(string) {},
 	}
 }
 
@@ -51,9 +61,10 @@ func run(t *testing.T, p *catalogProbe, prev *Catalog) (probe.Result, *probe.Pas
 // A subject whose context resolves to nothing parks: the outage is the cluster pass's to
 // report, and the connection bridge is what brings the sweep back.
 func TestRunSuspendsWithoutAConnection(t *testing.T) {
-	p := &catalogProbe{conn: func(context.Context, string) (*kubeconn.Connection, error) {
+	p := connectingProbe()
+	p.conn = func(context.Context, string) (*kubeconn.Connection, error) {
 		return nil, kubeconn.ErrNoConnection
-	}}
+	}
 
 	res, pass := run(t, p, nil)
 

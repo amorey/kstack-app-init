@@ -125,8 +125,58 @@ wakes it the moment the pool reaches the server), and `Subscribe` signals the id
 subject is bound to **a server, not just a context**: `Track(id, contextName, serverUID)`, and it
 asks the pool for that server's connection (`Lease.ConnFor`), suspending with `IdentityMismatch`
 when it is not. The
-sweep's 10m interval is the promptness bound today; the CRD/APIService watch that will make it
-prompt is specified and unbuilt. → docs/specs/kubecatalog-discovery.md.
+sweep's 10m interval is the correctness bound — a poll, since nothing here sees a CRD land.
+
+**Promptness is a watch that only wakes.** Every run that resolves a connection stands a watcher
+up over it, before sweeping: one stream each on `customresourcedefinitions` and `apiservices`,
+the two things that change what a cluster serves. A change wakes the sweep and the event is
+dropped — the sweep reads current state. **The watch's precondition is the connection, not the
+answer**, so it is reconciled on every pass; deferring it to a clean sweep would leave a replaced
+connection's watcher standing for as long as discovery keeps failing. Four rules keep it cheap
+and safe:
+
+- **A stream never opens without a version.** A watch given none *replays* — the server streams a
+  synthetic `Added` for every object that already exists — and each one reads here as a change, so
+  every establishment would wake the sweep that is about to read the same state. `openCollectionWatch`
+  therefore reads the collection's current version first (`List` with `Limit: 1`, the objects
+  dropped) and starts there. **Two requests per fresh stream, against a discovery pass of one per
+  group-version**, which is what that buys.
+- **A clean end resumes; it does not sweep.** Each stream remembers the resourceVersion of the
+  last event it saw and reopens from it, and `AllowWatchBookmarks` is what keeps a quiet stream
+  resumable. Without this every server-side timeout (~5m, two streams, own clocks) would be
+  treated as a gap and swept — 2-4x the pull-only baseline, to learn nothing. **A `Bookmark` never
+  wakes**, or the sweep would run on the bookmark cadence and cost more than not watching at all.
+  Reopening is paced by `reopenDelay`, since nothing else paces it and a proxy can hang up as fast
+  as it accepts; the resume means that wait costs latency, never events.
+- **Only an end that proves a gap wakes**, which is the server refusing our version for being too
+  old (`IsResourceExpired`/`IsGone`, in `errorEnd`). A re-list is the only answer to a gap of
+  unknown size, and only the sweep can do it. Every other end is silent and waits for the next
+  sweep: a stop, an end before any version was known, a refused open, **and any other watch error**.
+  **Waking on those loops** — the sweep's answer to a dead watch is to stand another one up, and
+  they repeat (RBAC on a cluster-scoped collection repeats exactly; so does a server erroring for
+  its own reasons), so each buys a full discovery pass per turn with no committed answer to make
+  the spin visible. The gap wake cannot loop for that reason inverted: its replacement starts from
+  the collection's version as it is now, which has to age before it can be refused.
+- **A resourceVersion never outlives its connection** — it is one cluster's etcd revision, and the
+  next connection may be another cluster. It lives in the stream and dies with it.
+
+**Watchers live on the `Service` beside `tracked`, under the same mutex**, and a watcher exists
+only for a tracked id. Both halves hold that under one critical section: establishment checks
+`tracked` and stores in the same one, and `Forget` drops the subject and the watcher in the same
+one, stopping it after the unlock. A run is on a worker, so `Forget` can land under it and the
+finishing sweep would otherwise leave a goroutine and two streams standing for an id nothing
+tracks — the engine's commit refusal does not cover it, because establishment is not a commit.
+**Splitting the teardown is the easy way to lose this**, since stopping a watcher waits for its
+streams: drop it before the subject and the window is as long as the API server takes to hang up.
+Every refusal stops the watcher too: `conn.Done()` misses the conflicted case, which never
+retires.
+
+**A standing watcher is kept only while it is live and over the sweep's own connection** —
+`ensureWatcher` compares both, and replaces otherwise. Nothing else re-establishes one, so
+either state read as "a watch already stands" costs that cluster its promptness permanently: a
+watcher whose stream hit a gap marks itself **spent before it wakes** (the wake runs the sweep
+that must replace it), and a watcher over a connection since replaced holds an HTTP watch on
+retired credentials that the streams never notice.
 
 **A context is not an identity, and identity lives on the connection.** Re-point a context at
 another cluster and the pool hands out whatever now answers, while the only thing that disarms the

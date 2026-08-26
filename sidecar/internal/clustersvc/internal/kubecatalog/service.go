@@ -21,8 +21,9 @@
 // interest — Track and Forget mirror the catalog record's own state — which is why this
 // is not a refcounted lease pool like kubeconn: a reader must never re-arm a sweep the
 // user paused. Only a run commits an answer; the pull cadence is the correctness bound,
-// and the wake layers (the connection bridge today, the CRD/APIService watch to come)
-// only make it prompt. → docs/specs/kubecatalog-discovery.md.
+// and the wake layers (the connection bridge, and a watch on the CRDs and APIServices that
+// change what a cluster serves) only make it prompt.
+// → docs/adr/2026-08-26-kubecatalog-watch.md.
 package kubecatalog
 
 import (
@@ -76,6 +77,16 @@ type Service struct {
 	// published is the news each id's last signal carried, compared against so a pass
 	// that moved only timing wakes nobody.
 	published map[string]news
+	// watchers holds one standing watch per tracked id. Beside tracked, under the same mutex,
+	// because establishing one has to be measured against whether the id is still tracked and
+	// the two must not be read separately — see ensureWatcher.
+	watchers map[string]*watcher
+	// watcherCtx bounds every watcher and is cancelled by Close. Not Start's context, which
+	// bounds startup, and not a run's, which ends with the pass that established the watcher.
+	watcherCtx   context.Context
+	stopWatchers context.CancelFunc
+	// open is how a watcher reaches the API server, a seam a test substitutes.
+	open opener
 
 	wg sync.WaitGroup
 }
@@ -98,16 +109,22 @@ func New(conns connService) *Service {
 	return newWithOptions(conns)
 }
 
-// option is a test seam on the probe, reachable only from white-box tests.
-type option func(*catalogProbe)
+// option is a test seam, reachable only from white-box tests.
+type option func(*Service, *catalogProbe)
 
 // withSweep substitutes the API server behind every sweep.
 func withSweep(f func(*kubeconn.Connection) (Catalog, error)) option {
-	return func(p *catalogProbe) { p.sweep = f }
+	return func(_ *Service, p *catalogProbe) { p.sweep = f }
+}
+
+// withOpener substitutes the API server behind every watch.
+func withOpener(f opener) option {
+	return func(s *Service, _ *catalogProbe) { s.open = f }
 }
 
 // newWithOptions is New plus the seams.
 func newWithOptions(conns connService, opts ...option) *Service {
+	watcherCtx, stopWatchers := context.WithCancel(context.Background())
 	s := &Service{
 		conns:     conns,
 		engine:    probe.New(),
@@ -115,11 +132,21 @@ func newWithOptions(conns connService, opts ...option) *Service {
 		tracked:   map[string]*subject{},
 		byContext: map[string]map[string]struct{}{},
 		published: map[string]news{},
+		watchers:  map[string]*watcher{},
+
+		watcherCtx:   watcherCtx,
+		stopWatchers: stopWatchers,
+		open:         openCollectionWatch,
 	}
 
-	p := &catalogProbe{conn: s.connFor, sweep: discoverServedKinds}
+	p := &catalogProbe{
+		conn:    s.connFor,
+		sweep:   discoverServedKinds,
+		watch:   s.ensureWatcher,
+		unwatch: s.stopWatcher,
+	}
 	for _, opt := range opts {
-		opt(p)
+		opt(s, p)
 	}
 	probe.Register(s.engine, nameCatalog, p, probe.WithInterval(sweepInterval), probe.WithTimeout(sweepTimeout))
 	s.engine.OnPass(s.publish)
@@ -151,6 +178,12 @@ func (s *Service) Track(id, contextName, serverUID string) {
 }
 
 // Forget disarms id's sweep and releases everything Track took. Idempotent.
+//
+// **The subject and its watcher go in one critical section**, and the stop happens after. A run
+// is on a worker, so a sweep can finish inside this teardown — and stopping a watcher waits for
+// its streams, which is as long as the API server takes to hang up. Dropping the two separately
+// leaves a window where the id still reads as tracked with no watcher against it, which is
+// exactly what ensureWatcher establishes into.
 func (s *Service) Forget(id string) {
 	s.mu.Lock()
 	sub := s.tracked[id]
@@ -160,6 +193,8 @@ func (s *Service) Forget(id string) {
 	}
 	delete(s.tracked, id)
 	delete(s.published, id)
+	w := s.watchers[id]
+	delete(s.watchers, id)
 	ids := s.byContext[sub.contextName]
 	delete(ids, id)
 	if len(ids) == 0 {
@@ -170,6 +205,10 @@ func (s *Service) Forget(id string) {
 	s.engine.Remove(id)
 	s.mu.Unlock()
 
+	// Outside the lock: stop waits for both streams, and nothing about that needs the map.
+	if w != nil {
+		w.stop()
+	}
 	sub.lease.Release()
 }
 
@@ -211,15 +250,25 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 // Close drops every subject and gives the pool its claims back. Sweep values own
 // nothing, so the engine's copies need no retiring of their own.
 func (s *Service) Close() error {
+	// Every watcher at once, rather than one stop per id: they share the context, and each
+	// one's own stop would wait for its streams in turn.
+	s.stopWatchers()
+
 	s.mu.Lock()
 	leases := make([]kubeconn.Lease, 0, len(s.tracked))
 	for _, sub := range s.tracked {
 		leases = append(leases, sub.lease)
 	}
+	watchers := slices.Collect(maps.Values(s.watchers))
 	clear(s.tracked)
 	clear(s.byContext)
 	clear(s.published)
+	clear(s.watchers)
 	s.mu.Unlock()
+
+	for _, w := range watchers {
+		w.stop()
+	}
 
 	err := s.engine.Close()
 	for _, lease := range leases {
@@ -324,4 +373,64 @@ func kindsFingerprint(kinds []Kind) uint64 {
 		fmt.Fprintf(h, "%s|%s|%s|%t\n", k.GroupVersion, k.Resource, k.Kind, k.Namespaced)
 	}
 	return h.Sum64()
+}
+
+// ensureWatcher stands a watch up for id over conn, unless the one already standing is live
+// and over that same connection, and returns once the watch is open. What it stands over is the
+// connection the run just resolved, so the watcher inherits that connection's identity scoping
+// rather than checking anything itself. Every run calls it, so a connection replaced under an
+// unchanged server takes the watch with it whatever the sweep then goes on to find.
+//
+// **Nothing else re-establishes**, so the two cases a standing watcher must not survive are
+// both here. A spent one has already woken this sweep on its way out and would otherwise be
+// read as still watching. A live one over a superseded connection is worse than none: it holds
+// an HTTP watch over retired credentials, and the streams do not read conn.Done() — which
+// would not cover it anyway, since a conflicted connection is never retired.
+//
+// **It stores only while id is still tracked**, checked and written in one critical section.
+// A run is on a worker, so Forget can land under it: the sweep finishes and establishes for an
+// id nothing tracks, and the goroutine and its two streams then stand until the connection
+// retires — indefinitely, for a healthy cluster. The engine's commit refusal does not cover
+// this, because establishment is not a commit. The same check publish makes against the entry
+// and connFor makes against the subject.
+func (s *Service) ensureWatcher(ctx context.Context, id string, conn *kubeconn.Connection) {
+	s.mu.Lock()
+	if _, tracked := s.tracked[id]; !tracked {
+		s.mu.Unlock()
+		return
+	}
+	standing := s.watchers[id]
+	if standing != nil && standing.conn == conn && !standing.spent() {
+		s.mu.Unlock()
+		standing.awaitOpen(ctx)
+		return
+	}
+	// Started under the lock so a Forget racing this cannot miss it: what Forget stops is
+	// whatever the map holds, and this is in the map before the lock is dropped.
+	w := startWatcher(s.watcherCtx, conn, s.open, reopenDelay, func() { s.engine.Wake(id, nameCatalog) })
+	s.watchers[id] = w
+	s.mu.Unlock()
+
+	// Outside the lock, since neither of these needs the map: stop waits for both streams, and
+	// the caller's sweep waits on awaitOpen. The replacement is already the one in the map, so
+	// the overlap costs a moment of two watchers and never a lost wake.
+	if standing != nil {
+		standing.stop()
+	}
+	w.awaitOpen(ctx)
+}
+
+// stopWatcher ends id's watch if one stands — the probe's unwatch, called by every run that
+// could not use its connection. conn.Done() does not cover that, since a connection that goes
+// conflicted is never retired. Teardown is Forget's, which drops the watcher with the subject.
+func (s *Service) stopWatcher(id string) {
+	s.mu.Lock()
+	w := s.watchers[id]
+	delete(s.watchers, id)
+	s.mu.Unlock()
+
+	// Outside the lock: stop waits for both streams, and nothing about that needs the map.
+	if w != nil {
+		w.stop()
+	}
 }

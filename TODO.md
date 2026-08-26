@@ -22,17 +22,34 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - **What it will not remove:** the id conversion, because the `ObjectID` scalar binds `clustersvc.ObjectID` (a defined type) while beehive's is an alias for `int64` — binding `int64` instead would capture every `int64` in the schema; and the status default, because beehive leaves `Status` nil until first written while the schema types it non-null. So `toX` gets small, not deleted.
   - **Upstream alternative, not a substitute:** beehive could factor its own metadata into an embeddable `ObjectMeta` that `Object` embeds (strictly additive there, and every consumer projecting objects into records pays the same copying). Even then the two exceptions above remain, and embedding beehive's metadata wholesale would put `Name`, `ResourceVersion`, and `Finalizers` on the record — `Name` especially, which this package treats as a reconcile key nothing reads back.
 
-- **Make discovery watch-prompted: the CRD/APIService watch the kubecatalog spec defers.**
-  The sweep now runs on its own engine (`sidecar/internal/clustersvc/internal/kubecatalog`) and the
-  catalog pass only folds it, so no reconcile dials — but a CRD installed on the cluster still waits
-  out `sweepInterval` (10m), the pull cadence correctness rests on. **Fix (specified):** a watcher
-  maintained by the probe's own `Run` — metadata watches on `customresourcedefinitions` and
-  `apiservices` over the current connection, any event or watcher death → `engine.Wake`, only `Run`
-  commits — per the "Run owns the watcher" design in
-  [docs/specs/kubecatalog-discovery.md](docs/specs/kubecatalog-discovery.md), which also carries the
-  deferred follow-ons (adaptive cadence via a per-result interval, resourceVersion continuation,
-  aggregated discovery). When it lands, fold the spec into `sidecar/CLAUDE.md`, delete the spec, and
-  record the decisions as an ADR.
+- **Discovery's watch has no adaptive cadence, and a refused watcher is invisible.** The sweep is
+  watch-prompted now (`sidecar/internal/clustersvc/internal/kubecatalog`), with resourceVersion
+  continuation so a quiet server-side timeout costs a reopen rather than a sweep. What is left is
+  the tail: stretch the interval while the watch is healthy (needs a per-result interval on the
+  engine — a `Succeeded().After(d)` mirroring beehive's `RequeueAfter`); aggregated discovery, one
+  request instead of dozens on 1.30+ servers; metadata-only watch payloads. **The one worth
+  deciding rather than just doing:** a watcher refused by RBAC still reports `Succeeded()`, since
+  the catalog data is fine and only promptness degrades — so a user who may never watch CRDs sees
+  a healthy catalog that is quietly up to 10m stale, and nothing says so. Watch health as a field
+  on the observation is the shape; whether the fold should surface it at all is the question.
+
+- **The catalog stays resident for as long as a cluster is tracked.** `kubecatalog`'s observable
+  holds the whole `Catalog` per subject — every served kind's group-version, kind, resource and
+  scope — and the `ClusterCachedResource` rows the fold writes hold the same list again in the
+  store. Order of 90 bytes a kind, so tens of KB for a cluster with CRDs and well under a megabyte
+  across a large fleet: **listed for the duplication, not the size.** The trigger is a second
+  consumer wanting the kinds and reaching for the in-memory copy because it is there, or a fleet
+  where it starts to show.
+  - **Two things hold it there, and a fix has to answer both.** `pass.Prev()` is the commit guard
+    — the sweep commits only on a change, which is the whole of what stops a 10m pass waking the
+    fold on a cluster that moved nothing — and `clusterCachedCatalogController.Reconcile` reads the
+    standing answer back through `Read(id)` to rewrite the child records. A fingerprint covers the
+    first and not the second.
+  - **Weigh:** the shape would be the sweep retaining a hash and the fold diffing against its own
+    children, which the store already holds. That trades resident memory for a store read per
+    pass, and moves the "what changed" diff next to the prune and tombstone rules that already live
+    in the fold. It also couples the sweep's correctness to records it must not know about — the
+    leaf rule — so the hash has to be enough on its own. Not obviously a win; measure first.
 
 - **Nothing exposes the four non-connection probes, so "Connected but not Identified" has no detail.**
   `kubeconn.State` carries a full `Observation` per probe — value, `LastSeen`, `LastAttempt`
@@ -73,6 +90,14 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
     identity-scoped work over that connection instead of corrupting it. Wire `publish` to
     `Wake(contextName, nameConnection)` on the conflict and have the connection probe rebuild,
     which turns the stall back into a working connection to the new cluster.
+  - **The catalog's watch is the second thing the stall takes, and it is the one to test.** Every
+    refusal stops the subject's watcher (`catalogProbe.Run` calls `unwatch`), and only a run that
+    gets a connection stands another up — which, while the conflict holds, never happens. So a
+    swapped server costs that cluster its CRD/APIService promptness on top of its sweeps. Nothing
+    separate to build: the rebuild above restores both. What it does add is an acceptance
+    condition — the recovery is not done when the sweep runs again, it is done when the watch is
+    standing again over the *new* connection, which is `ensureWatcher`'s connection comparison
+    doing its job rather than anything new.
 
 - **`classify` has no `*apierrors.StatusError` branch.** Every probe reads a raw endpoint today, so
   a status code is the whole evidence and `statusReason` covers it. **Trigger:** the first probe

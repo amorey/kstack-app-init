@@ -91,27 +91,43 @@ const sweepInterval = 10 * time.Minute
 // client's own timeout; this is generous so a healthy long sweep is not cut.
 const sweepTimeout = 5 * time.Minute
 
-// catalogProbe answers which kinds the subject's server serves. The watch layer that
-// will make it prompt (CRDs, APIServices) is specified and unbuilt; the interval is the
-// promptness bound meanwhile. → docs/specs/kubecatalog-discovery.md.
+// catalogProbe answers which kinds the subject's server serves. The interval is the
+// correctness bound; the watch it holds over the connection is the promptness.
 type catalogProbe struct {
 	// conn resolves the subject to the connection the service's lease holds; sweep is
 	// the seam a test substitutes for the API server. Production wires connFor and
 	// discoverServedKinds; nothing else may be nil here.
 	conn  func(ctx context.Context, id string) (*kubeconn.Connection, error)
 	sweep func(*kubeconn.Connection) (Catalog, error)
+	// watch and unwatch are the standing watch's lifetime, which is the Service's to hold —
+	// establishing one has to be measured against whether the subject is still tracked. watch
+	// returns once the watch is open, bounded by ctx.
+	watch   func(ctx context.Context, id string, conn *kubeconn.Connection)
+	unwatch func(id string)
 }
 
 func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe.Result {
 	conn, err := p.conn(ctx, pass.Subject())
-	if errors.Is(err, kubeconn.ErrIdentityMismatch) {
-		return probe.Suspend(ReasonIdentityMismatch, err.Error())
-	}
 	if err != nil {
+		// Every refusal takes the watcher with it. conn.Done() does not cover this: a
+		// connection that goes conflicted is never retired, so one left standing would go on
+		// waking a subject that can only suspend.
+		p.unwatch(pass.Subject())
+
+		if errors.Is(err, kubeconn.ErrIdentityMismatch) {
+			return probe.Suspend(ReasonIdentityMismatch, err.Error())
+		}
 		// The outage is the cluster pass's to report; this run parks until the
 		// connection bridge hears the pool reached the server.
 		return probe.Suspend(ReasonNoConnection, err.Error())
 	}
+
+	// Reconciled here, against the connection rather than the answer, because the connection is
+	// the whole of what the watch needs: conn has just proved reachable and this subject's own,
+	// which is what the streams inherit. Deferring it to a clean sweep would leave the previous
+	// connection's watcher standing for as long as discovery is failing — and a partial sweep
+	// over an aggregated API server that is down is not a short window.
+	p.watch(ctx, pass.Subject(), conn)
 
 	found, err := p.sweep(conn)
 	if err != nil && !found.Partial {
