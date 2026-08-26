@@ -83,9 +83,10 @@ one — and a `ClusterCachedCatalog` beneath it. **The catalog's pass discovers 
 mirrors the collection into the cache's SQLite file (`internal/kubestore`), and the pass folds its
 observation into the kind's `Synced` condition and the sync timeline beneath it. Both `Clear`s and
 both cache gauges answer. What is left is the **read side** — the `CachedData()` family over the
-store, and the `kind_catalog` rows the reads resolve a plural through (→ docs/specs/cached-data.md,
-docs/specs/kind-catalog-sync.md). Until the catalog fold lands, a kind's rows are written but not
-reachable **by plural**, so the `CachedData` reads will read empty until it does. Nothing on the
+store, and the `kind_catalog` rows the reads resolve a plural through
+(→ docs/specs/1-kind-catalog-sync.md, docs/specs/2-cached-data-reads.md). Until the sweep writes
+that table, a kind's rows are written but not reachable **by plural**, so the `CachedData` reads
+will read empty until it does. Nothing on the
 write path depends on that table: `Store.ClearKind` takes the whole `Kind` from the record.
 
 **A kind is mirrored by a standing worker, not a periodic pass.** `internal/kubesync` runs one

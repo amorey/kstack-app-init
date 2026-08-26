@@ -6,6 +6,11 @@ status: Planned
 
 # Cached data reads
 
+> **Build order — 2.** Prerequisite: [Kind catalog sync](1-kind-catalog-sync.md) through its
+> step 2, which populates `kind_catalog`. Delivers the `CachedData()` family, so the dashboard nav
+> and tables go live. Next: [Catalog kinds off disk](3-catalog-kinds-off-disk.md), which consumes
+> the `Kinds(ctx)` read built here.
+
 ## Goal
 
 Implement the `CachedData()` family — `ListKinds`, `WatchKinds`, `WatchObjects`, `WatchEvents`
@@ -15,8 +20,11 @@ Implement the `CachedData()` family — `ListKinds`, `WatchKinds`, `WatchObjects
 their provenance fields, and the root `CLAUDE.md`'s delta-watch rules — and the served types
 already encode the read design (see below). No schema change.
 
-Implementable ahead of the sync loop: the reads consume the store, not the workers, so tests seed
-rows directly and the family lights up the moment workers start writing.
+The reads consume the store, not the workers, so tests seed rows directly. **Spec 1 is a real
+prerequisite, not just an ordering preference**: `Objects` resolves a plural through
+`kind_catalog`, so without its rows this family is structurally complete and answers nothing —
+which is hard to tell from broken. Spec 1's step 3 (`IsCRD`) is not needed here: until it lands
+every row reads `is_crd = 0`, and nothing branches on the bit.
 
 ## The read design: ping, re-read, diff
 
@@ -43,7 +51,7 @@ events, and this bus is in-process — a missed ping is a bug to fix, not an env
 
 ## Store additions (`internal/kubestore`)
 
-Carried from `main`'s `store.go`, adapted to the registry:
+Carried from `main`'s `store.go`:
 
 - **A reader pool beside the writer** (`sqlitemigrate.OpenPool(path, N)`): the watches re-read on
   every ping, and reads must not queue behind the single-connection writer.
@@ -51,7 +59,9 @@ Carried from `main`'s `store.go`, adapted to the registry:
   `Count` is O(kinds), never an objects scan), `Events(ctx, limit)` (newest window off the
   `last_seen` index), `Objects(ctx, apiVersion, resource)` (whole kind, ordered by
   namespace/name). Their row structs (`KindRow`, `EventRow`, `ObjectRow`) come over with them.
-  Two traps travel verbatim:
+  **`Kinds(ctx)` outlives this spec's own use of it** — [spec 3](3-catalog-kinds-off-disk.md)'s
+  fold reconciles its children from that read, so keep it a plain store read with no
+  family-shaped assumptions in it. Two traps travel verbatim:
   - The events query's `uid DESC` tiebreak: `last_seen` has one-second resolution, ties straddle
     the limit, and rowid order makes a relist's re-inserted rows read as phantom
     `Deleted`/`Added`.
@@ -70,8 +80,8 @@ Carried from `main`'s `store.go`, adapted to the registry:
 The write side (object upsert/delete, event upsert, the relist prune, the events pruner) has
 landed with the sync loop, and so have the two ping buses and the registry read path
 (`Manager.StoreIfOpen`, which never creates a file). What is left here is the reads, the row structs,
-the reader pool, and the family itself. `kind_catalog`'s writer is the catalog fold
-(→ kind-catalog-sync spec).
+the reader pool, and the family itself. `kind_catalog`'s writer is the **sweep**
+(→ [spec 1](1-kind-catalog-sync.md)).
 
 ## The family (`cacheddata.go`)
 
@@ -89,9 +99,11 @@ the reader pool, and the family itself. `kind_catalog`'s writer is the catalog f
   reconnecting watcher lands exactly in the mark-to-GC window, where the record still exists and
   any record-gated create would resurrect the file as a permanent orphan; no
   check-record-then-create ordering closes that, because the mark can land between the check and
-  the create. Binding only to what exists closes it structurally: the worker's `OpenOrCreate` is the
-  one creator, and the controller already sequences it against `Delete` (`ForgetCache` waits for
-  the workers first).
+  the create. Binding only to what exists closes it structurally: **every `OpenOrCreate` belongs to
+  something armed by a record** — a `kubesync` worker, and after spec 1 the sweep — and the
+  controller sequences both against `Remove` (`ForgetCache` waits for the workers; `Manager.Remove`
+  tombstones the id). One visible consequence of spec 1: an enabled cache has a file from its first
+  sweep rather than from its first synced kind, so this bind finds a store sooner.
 - **`WatchObjects`** — the loop over `Objects(apiVersion, resource)`, subscribed to that
   resource's key. Frames carry `CacheID` + `APIVersion`/`Resource` (the client's
   straggler-rejection provenance).
@@ -102,13 +114,12 @@ the reader pool, and the family itself. `kind_catalog`'s writer is the catalog f
 - **`WatchKinds`** — the loop over `Kinds()`, keyed by (APIVersion, Resource), subscribed to
   **both** buses: object writes move counts, and event writes move the hardcoded
   `('v1','Event')` count. `IsCRD` reads off the `kind_catalog` row, whose one writer is the
-  catalog fold (→ docs/specs/kind-catalog-sync.md): rows are the discovered, mirrorable kinds,
+  **sweep** (→ [spec 1](1-kind-catalog-sync.md)): rows are the discovered, mirrorable kinds,
   so an advertised kind shows with `Count` 0 before its worker has synced anything — what
   `ClusterCachedDataKind`'s doc promises the nav.
 - **`ListKinds`** — one `Kinds()` read, no bus. It is what `ClusterCache.kinds` resolves.
 - **Every method returns `*Stream[T]`, not the bare channels the interface holds today** — the
-  boundary's own rule (anything reading a fallible upstream returns a `Stream`), already decided
-  in the cached-resource-sync spec. A store closed under the watch (a `Clear`, shutdown) sets
+  boundary's own rule: anything reading a fallible upstream returns a `Stream`. A store closed under the watch (a `Clear`, shutdown) sets
   `Stream.Err()` before `Frames` closes; the client reconnects into the fresh snapshot. The
   resolvers move from `ptrStream`/`mapStream` to `watchStream` (the watch-failure path), and the
   resolver tests' fake changes shape with the interface. Schema untouched.
@@ -119,10 +130,10 @@ Delete each method's `TestUnimplementedBoundaryPanics` entry as it lands.
 
 ## Order of work
 
-1. Store reads + row structs + `rawcodec` + reader pool, seeded-SQL tests (the two traps above
-   each get a pinning test).
-2. The ping buses, the registry read path (bind + open-signal), and the
-   close-on-`Clear`/`Delete` semantics.
+1. Store reads + row structs + the reader pool, seeded-SQL tests (the two traps above each get a
+   pinning test). `rawcodec` has landed with the sync loop.
+2. The manager's read path (bind + open-signal) and the close-on-`Clear`/`Remove` semantics. The
+   two ping buses have landed.
 3. One shared watch loop (subscribe → snapshot → Bookmark → re-read → diff), tested over a
    stand-in row type, the way `deltaWatch` is tested once in `stream_test.go`. One interleaving
    to cover deliberately: a ping landing mid-`Clear` can diff against the freshly swapped empty
@@ -133,12 +144,7 @@ Delete each method's `TestUnimplementedBoundaryPanics` entry as it lands.
 
 When it lands: fold into `sidecar/CLAUDE.md`, rewrite the `CachedData` interface comment in
 `service.go` — it still promises "degrades to empty while that cache's db isn't open", which the
-bind rule above turns from a degradation into the design — extend the cached-resource-sync ADR
-(or its own) with the ping-versus-row-delta reasoning, and delete this spec.
-
-## Decided here, amending the sync spec
-
-The cached-resource-sync spec originally specified row-level delta fan-out at the store's
-transaction boundary. This spec replaces that with the ping bus: the served types are built for
-the re-read diff, the ordering argument dissolves when every read is full state, and `main` ran
-this shape. The sync spec's broker section is amended in the same change that adds this file.
+bind rule above turns from a degradation into the design — write the ADR for the read side
+(the ping-versus-row-delta reasoning, which the landed
+[store ping bus ADR](../adr/2026-08-26-store-change-ping-bus.md) covers for the write side), and
+delete this spec.
