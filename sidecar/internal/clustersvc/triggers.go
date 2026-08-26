@@ -31,6 +31,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -149,6 +150,20 @@ type kubecatalogSource interface {
 func newKubecatalogTrigger(sweeper kubecatalogSource) *trigger[gobus.Event[string, struct{}]] {
 	return newTrigger(
 		func() feed[gobus.Event[string, struct{}]] { return sweeper.Subscribe() },
+		func(ev gobus.Event[string, struct{}]) string { return ev.Key },
+	)
+}
+
+// kubesyncSource is the one method of the worker fleet the trigger reads.
+type kubesyncSource interface {
+	Subscribe() kubesync.Subscription
+}
+
+// newKubesyncTrigger wakes the synced-kind record whose worker said something new. The
+// fleet is keyed by the record's own beehive name, so the event's key is the wake.
+func newKubesyncTrigger(fleet kubesyncSource) *trigger[gobus.Event[string, struct{}]] {
+	return newTrigger(
+		func() feed[gobus.Event[string, struct{}]] { return fleet.Subscribe() },
 		func(ev gobus.Event[string, struct{}]) string { return ev.Key },
 	)
 }

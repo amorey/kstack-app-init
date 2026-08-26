@@ -1,7 +1,7 @@
 ---
 title: Cached resource sync
 scope: sidecar
-status: Planned
+status: In progress
 ---
 
 # Cached resource sync
@@ -49,27 +49,29 @@ per cache — a per-cache open/refcount/close registry, living in `deps` beside 
 services. Everything resolves a store through it, including `Clear`, which is what makes the
 close-before-delete sequencing below enforceable.
 
-Tables:
+**The schema is `main`'s, carried over verbatim** —
+`sidecar/internal/cluster/cache/store/migrations/0001_init.sql` on `main`, along with the store
+pieces built for it as each becomes needed (`rawcodec` for the zlib-compressed `raw_json`,
+`resume_cookie`, the janitor). So: `objects` with the cross-kind materialized fields, `owner_refs`
+and `labels` as joinable edges, `events` with its FTS index and count triggers, `status_history`,
+`kind_catalog` (which carries `is_crd` and the CRD schema), trigger-maintained `kind_counts`, and
+`cluster_meta` as the sync-bookkeeping bag — the per-kind resourceVersion cookie and warm-relist
+generation live there, not in a table of their own. Two traps `main` already solved travel with
+it: `auto_vacuum=INCREMENTAL` must be set on the fresh writer pool *before* migrations run
+(SQLite silently ignores it once any table exists), and the writer pool caps at one connection.
 
-- `objects` — uid PK; api_version, resource, namespace, name, creation_ts, raw_json.
-  managedFields and the kubectl last-applied annotation are stripped at write time
-  (`ClusterCachedDataObject.RawJSON` already promises this).
-- `events` — Events are an ordinary synced kind written to their own table
-  (`cachedresources.go` declares it), with the newest-window retention the events watch
-  serves; a row aging out of the window emits `Deleted` carrying its last-known state.
-  Aging out is not a write, so nothing emits it for free: the pruner runs on every event
-  write (events keep arriving on a live cluster, so this covers the common case) plus a
-  tick for a quiet one; the window size and tick are parameters with production constants.
-  The per-kind count rollups exclude this table — `ClusterCacheStats`'s comment already
-  promises events are not a catalog kind.
-- `sync_cookies` — per (api_version, resource): the watch resourceVersion and a sweep
-  generation for warm-relist pruning.
+The event window still needs its pruner named: aging out is not a write, so nothing emits the
+promised `Deleted` for free. The pruner runs on every event write (events keep arriving on a live
+cluster) plus a tick for a quiet one; window and tick are parameters with production constants.
+Event counts ride the schema's own hardcoded `('v1','Event')` triggers and stay out of the
+per-kind object rollup.
 
-**The store owns the change broker.** Every committed write publishes a row-level delta, keyed by
-cache and by (cache, apiVersion, resource). The broker lives in the store because the snapshot and
-the deltas must agree on ordering, and the store's transaction boundary is the only place that
-ordering exists — a reader subscribes, snapshots, folds by UID, emits the `Bookmark`, then replays.
-Per-kind object counts are maintained here too, feeding `WatchKinds` and the stats rollup.
+**The store owns the change signal, and it is a coalesced ping, not a row delta.** Writers notify
+per-resource and per-bus after commit; a reader subscribes first, snapshots, and on each ping
+re-reads and diffs by UID to produce its frames — `main`'s `writeBus` shape, and what the served
+types are built for. The full read-side design lives in the cached-data spec
+(→ docs/specs/cached-data.md, "Decided here"). Per-kind counts come from the schema's
+`kind_counts` triggers, feeding `WatchKinds` and the stats rollup.
 
 `ClearKind(cacheID, gvr)` deletes the kind's rows and cookie in place. `Clear(cacheID)` goes
 through the registry: close every handle, delete the files (the `-wal`/`-shm` sidecars too), then
@@ -77,6 +79,12 @@ reopen — deleting under open handles does not fail on POSIX, it silently forks
 old handle writing to the unlinked inode while a reopened store starts fresh. A broker subscriber
 alive at that moment has its stream ended with a reason and reconnects into the fresh store's
 snapshot. Bouncing workers is still the caller's job; the registry only sequences the handles.
+`Delete(cacheID)` is the same close-and-delete without the reopen, for a cache going away with
+its record: the file is named for that id, so the cache's teardown pass is the last thing that
+can find it. That pass calls `ForgetCache` first — the registry sequences handles, not writers,
+so only a stopped worker cannot write through the store it is about to close — and the id is
+refused by `Acquire` afterwards (`ErrDeleted`), since a straggler pass still holding a
+pre-teardown view of the cache would otherwise open a fresh file nothing can name again.
 
 ## `internal/kubesync` — the worker fleet
 
@@ -91,8 +99,11 @@ a reader does can re-arm a kind the user paused.
 The shape grows one entry kubecatalog's does not have: `Bounce(id)` / `BounceCache(cacheID)`,
 restarting tracked workers in place from their held params. The two `Clear`s need it — the
 boundary caller holds neither the subject names nor the params to Forget-and-re-Track, and a
-`Track` of an existing id is an idempotent no-op, so nothing else restarts a worker whose cookie
-just died — and the poke path is the same bounce across every subject.
+`Track` of an existing id restarts nothing while its params hold, so nothing else restarts a
+worker whose cookie just died. Params that moved are a different sync — a re-pointed context, a
+kind whose scope changed — and a worker fixes its REST shape and its connection at start, so
+`Track` replaces the subject rather than leaving one syncing on values nobody asked for. The poke
+path is the same bounce across every subject.
 
 **Not on the probe engine**: a sync is a standing push stream, not a periodic pass. Each subject
 is a worker goroutine:
@@ -102,7 +113,9 @@ is a worker goroutine:
    suspend, publish that reason, wake on the kubeconn fleet bus (the kubecatalog bridge). A
    worker never blocks in `AwaitConnFor` while holding anything shared.
 2. **Cold sync.** Paged `List` (limit + continue) via `Connection.Dynamic`, pages written in
-   store transactions, cookie recorded. `SyncStart`/`SyncComplete` in the event vocabulary.
+   store transactions, cookie recorded. Object writes strip managedFields and the kubectl
+   last-applied annotation (`ClusterCachedDataObject.RawJSON`'s promise) and compress through
+   the carried-over `rawcodec`. `SyncStart`/`SyncComplete` in the event vocabulary.
 3. **Watch.** From the cookie, `AllowWatchBookmarks: true`; deltas write through to the store,
    which fans them out. A bookmark updates `lastLiveAt`; a watch quiet past the staleness
    threshold flips the observation to `Stale` without tearing anything down. The threshold —
@@ -142,18 +155,10 @@ is in-memory state the store cannot see move, joining source, cluster, and catal
 
 ## The read side
 
-- **`CachedData()`** (`cacheddata.go`): each watch resolves the cache's store, subscribes to the
-  right broker key, snapshots, folds, sends the `Bookmark`, then streams. Unopened cache → the
-  `Bookmark` alone. Frames carry the specified provenance (`CacheID`; objects additionally
-  `APIVersion`/`Resource`). `WatchKinds` joins the store's counts onto the **beehive
-  `ClusterCachedResource` records** (a scoped owned-objects watch), not kubecatalog's
-  observation: the records survive a restart and their lifecycle is the workers', while the
-  in-memory answer is empty until the first sweep. Two async sources means the `Bookmark` waits
-  for both snapshots — never claim a snapshot complete over frames still undecided (the
-  delta-watch ADR's rule). That join needs `IsCRD`, which nothing
-  records today — the sweep grows the bit (it can mark kinds whose group/resource a CRD names,
-  over the same connection) and `toResourceSpecs` relays it into `ClusterCachedResourceSpec`,
-  where the join reads it.
+- **`CachedData()`** — specified in full in docs/specs/cached-data.md (the ping/re-read/diff
+  loop, the store's read surface, the `Bookmark` rules, provenance). The `kind_catalog` rows it
+  reads are the catalog fold's, not the workers' (→ docs/specs/kind-catalog-sync.md, which also
+  carries `is_crd` from the sweep) — a worker writes objects and cookies, never catalog rows.
 - **`Caches().WatchStats`** — file size plus the count rollup. **`WatchHealth`** — the read-side
   fold over kubesync observations grouped by cache; never a stored condition
   (`ClusterCacheHealth`'s comment argues why). It re-emits on the conflated signal **and** on a
@@ -184,9 +189,12 @@ for the fold, a stubbed `ControllerClient` for condition writes. When it lands: 
 into `sidecar/CLAUDE.md`, write an ADR for store-per-cache and worker-not-probe (and the broker
 placement below), delete this spec.
 
-## Decided: the store owns delta fan-out
+## Decided: the store owns the change signal, as a ping bus
 
-The snapshot/delta ordering a reader's list+watch handoff needs exists only at the store's
-transaction boundary, so the broker publishes there. The cost is a store that is more than SQLite;
-the alternative — workers publish, readers reconcile snapshots by UID and generation — would put
-that reconcile subtlety in every reader. Carry this reasoning into the planned ADR.
+The store carries the signal (not the workers — a reader must not know who writes), but it is a
+payload-less coalesced ping per bus/key, and readers re-read and diff by UID. Row-level delta
+fan-out at the transaction boundary was considered and dropped: once every read is full current
+state, an early or late signal costs one idempotent re-read rather than a wrong frame, so the
+ordering problem the transactional broker existed to solve disappears — and the served types'
+comparability is designed for the diff. Detailed in docs/specs/cached-data.md; carry the
+reasoning into the planned ADR.

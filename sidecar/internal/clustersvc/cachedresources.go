@@ -23,8 +23,11 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/amorey/beehive"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -236,17 +239,197 @@ var resourceWatch = deltaWatch[ClusterCachedResourceSpec, ClusterCachedResourceS
 	bookmark: ClusterCachedResourceWatchFrame{Type: DeltaFrameBookmark},
 }
 
-// clusterCachedResourceController reconciles one synced kind: start, stop, and
-// resume the worker mirroring it into the cache. A placeholder that reconciles to a
-// no-op.
-type clusterCachedResourceController struct{ lifecycle.None }
+// resourceResyncInterval paces the fold's backstop pass; the kubesync trigger is
+// what makes it prompt (see resourceResync in service.go).
+const resourceResyncInterval = 10 * time.Minute
+
+// clusterCachedResourceController reconciles one synced kind: arms the worker
+// mirroring it into the cache, folds the worker's standing observation into the
+// Synced verdict, and tears the worker and its rows down with the record. No pass
+// dials — the sync runs on kubesync's own worker, and the trigger re-runs this fold
+// when its answer moves.
+type clusterCachedResourceController struct {
+	lifecycle.None
+	// Every kind's client, not just this one's: a resource reads the catalog, cache,
+	// and cluster it hangs off, and reaches the worker fleet and the store through
+	// the shared services.
+	deps
+}
 
 func (c *clusterCachedResourceController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCachedResourceStatus],
 	obj *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus],
 ) beehive.ReconcileResult {
-	// A no-op still settles: unsettled, every synced kind is re-dispatched on each owed
-	// pass — ~100 per cache — for the life of the process.
+	// A record on its way out is about to be collected with no finalizer to clear, so
+	// the worker is disarmed and its rows cleared here — the other side of the
+	// handshake the catalog's DiscoveryDraining requeue is waiting on.
+	if obj.DeletionRequestedAt != nil {
+		c.kubesyncSvc.Forget(obj.Name)
+
+		own, err := c.resourceOwnersOf(ctx, client)
+		if err != nil {
+			return beehive.Fail(err)
+		}
+		if own.cache != nil {
+			if err := c.kubestoreSvc.ClearKind(ctx, int64(own.cache.ID), obj.Spec.APIVersion, obj.Spec.Resource); err != nil {
+				return beehive.Fail(fmt.Errorf("clear cached resource %d rows: %w", obj.ID, err))
+			}
+		}
+		return beehive.Settled()
+	}
+
+	own, err := c.resourceOwnersOf(ctx, client)
+	if err != nil {
+		return beehive.Fail(err)
+	}
+	// The subtree above is being collected, which will take this resource with it —
+	// and its rows with the cache's whole file, which the cache's own teardown
+	// deletes. Clearing per kind here would only write into a file already going.
+	if own.cluster == nil {
+		c.kubesyncSvc.Forget(obj.Name)
+		return beehive.Settled()
+	}
+
+	// A paused kind keeps its rows and stops syncing — disarming the worker is what
+	// stops it; pause is not clear.
+	if !obj.Spec.Enabled {
+		c.kubesyncSvc.Forget(obj.Name)
+		return observeSynced(ctx, client, ConditionFalse, ReasonPaused, "")
+	}
+
+	contextName, err := clusterContext(own.cluster)
+	if err != nil {
+		// The record's own state — disabled, deleting, or credential-less — which the
+		// cluster pass reports on its own conditions. Nothing can sync, so the
+		// subject is dropped.
+		c.kubesyncSvc.Forget(obj.Name)
+		return observeSynced(ctx, client, ConditionFalse, ReasonNoConnection, err.Error())
+	}
+
+	// Arming is this pass's other job: the subject exists exactly while the record
+	// wants syncing, keyed by the record's own name so the worker's change signal is
+	// the requeue.
+	c.kubesyncSvc.Track(obj.Name, kubesync.Params{
+		CacheID:     int64(own.cache.ID),
+		ContextName: contextName,
+		ServerUID:   own.cache.Spec.ServerUID,
+		APIVersion:  obj.Spec.APIVersion,
+		Resource:    obj.Spec.Resource,
+		Namespaced:  obj.Spec.Namespaced,
+	})
+
+	obs, ok := c.kubesyncSvc.Read(obj.Name)
+	if !ok {
+		// Armed, no answer yet. The trigger re-runs this fold when one lands, and the
+		// kind's resync is the backstop — so no requeue here.
+		return observeSynced(ctx, client, ConditionFalse, ReasonConnecting, "")
+	}
+
+	status, reason := ConditionFalse, obs.Reason
+	switch obs.Reason {
+	case kubesync.ReasonWatching:
+		status, reason = ConditionTrue, ReasonWatching
+	case kubesync.ReasonSyncing:
+		reason = ReasonSyncing
+	case kubesync.ReasonStale:
+		reason = ReasonStale
+	case kubesync.ReasonSyncFailed:
+		reason = ReasonSyncFailed
+	case kubesync.ReasonNoConnection:
+		reason = ReasonNoConnection
+	case kubesync.ReasonIdentityMismatch:
+		reason = ReasonIdentityMismatch
+	}
+	return observeSynced(ctx, client, status, reason, obs.Message)
+}
+
+// resourceOwners is the chain above a resource: the catalog it hangs off, the cache
+// that catalog anchors, and the cluster that cache mirrors — one level deeper than the
+// catalog's own owners, which is why the pass needs a cache in hand to Track (its
+// ServerUID and its id) as well as the cluster's context to sync over.
+type resourceOwners struct {
+	catalog *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]
+	cache   *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]
+	cluster *beehive.Object[ClusterSpec, ClusterStatus]
+}
+
+// resourceOwnersOf walks the three owner edges above a resource. A zero resourceOwners
+// with no error means something in that chain is gone or going, which is a cascade
+// about to take this resource rather than a failure to retry — the catalog's ownersOf
+// idiom, one level deeper.
+func (c *clusterCachedResourceController) resourceOwnersOf(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCachedResourceStatus],
+) (resourceOwners, error) {
+	// The reconcile load carries no edges, so each owner is a lookup rather than a field.
+	catalogRef, ok, err := client.GetOwner(ctx)
+	if err != nil {
+		return resourceOwners{}, fmt.Errorf("read cached resource owner: %w", err)
+	}
+	if !ok {
+		return resourceOwners{}, nil
+	}
+
+	catalogObj, err := c.catalogClient.Get(ctx, catalogRef.ID, beehive.LoadOwner())
+	if errors.Is(err, beehive.ErrNotFound) {
+		return resourceOwners{}, nil
+	}
+	if err != nil {
+		return resourceOwners{}, fmt.Errorf("read cached catalog %d: %w", catalogRef.ID, err)
+	}
+	if catalogObj.DeletionRequestedAt != nil {
+		return resourceOwners{}, nil
+	}
+
+	cacheRef, ok, err := catalogObj.Owner()
+	if err != nil {
+		return resourceOwners{}, fmt.Errorf("read cached catalog %d owner: %w", catalogRef.ID, err)
+	}
+	if !ok {
+		return resourceOwners{}, nil
+	}
+
+	cacheObj, err := c.cacheClient.Get(ctx, cacheRef.ID, beehive.LoadOwner())
+	if errors.Is(err, beehive.ErrNotFound) {
+		return resourceOwners{}, nil
+	}
+	if err != nil {
+		return resourceOwners{}, fmt.Errorf("read cluster cache %d: %w", cacheRef.ID, err)
+	}
+	if cacheObj.DeletionRequestedAt != nil {
+		return resourceOwners{}, nil
+	}
+
+	clusterRef, ok, err := cacheObj.Owner()
+	if err != nil {
+		return resourceOwners{}, fmt.Errorf("read cluster cache %d owner: %w", cacheRef.ID, err)
+	}
+	if !ok {
+		return resourceOwners{}, nil
+	}
+
+	clusterObj, err := c.clusterClient.Get(ctx, clusterRef.ID)
+	if errors.Is(err, beehive.ErrNotFound) {
+		return resourceOwners{}, nil
+	}
+	if err != nil {
+		return resourceOwners{}, fmt.Errorf("read cluster %d: %w", clusterRef.ID, err)
+	}
+	return resourceOwners{catalog: catalogObj, cache: cacheObj, cluster: clusterObj}, nil
+}
+
+// observeSynced records the Synced verdict and settles. The pass writes no status of
+// its own — this kind has none — so the condition and the result are the whole report.
+func observeSynced(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCachedResourceStatus],
+	status ConditionStatus,
+	reason, message string,
+) beehive.ReconcileResult {
+	cond := LiveCondition(ConditionSynced, status, reason, message)
+	if err := client.SetCondition(ctx, cond); err != nil {
+		return beehive.Fail(fmt.Errorf("set %s condition: %w", ConditionSynced, err))
+	}
 	return beehive.Settled()
 }

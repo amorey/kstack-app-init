@@ -46,6 +46,14 @@ internal/clustersvc/
   internal/kubecatalog/  the discovery sweeper: a second probe engine over per-catalog
                       subjects, the sweep, and the change signal that re-runs each
                       catalog's fold. Borrows kubeconn's leases; same leaf rule
+  internal/kubesync/  the worker fleet: one worker per (cache, GVR), armed from the
+                      resource record's reconcile the way the sweeper is, with the
+                      same change signal. The run body is a seamed placeholder —
+                      the sync loop is the next step. Same leaf rule
+  internal/kubestore/  the on-disk cache: one SQLite file per ClusterCache behind a
+                      refcounted registry, schema carried over from the previous
+                      store. Opens, cookies, and the clears exist; nothing writes
+                      rows yet. Same leaf rule
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -54,11 +62,10 @@ side and hides when they don't. Everything else slices by kind, so one file teac
 `registerControllers` stays whole in `service.go` for the same reason the interfaces do: its options
 are the subsystem's concurrency and retry budget, which only reads as a budget in one place.
 
-`New` opens the beehive store under `dataDir` and registers all four controllers; `Start` runs
-beehive, then each controller's background work. **The three cache controllers reconcile to a no-op,
-and most family methods still panic** — `TestUnimplementedBoundaryPanics` is the inventory of what
-is left, and an entry must be deleted as its method lands, since the test fails when a stub stops
-panicking.
+`New` opens the beehive store under `dataDir` and registers all five controllers; `Start` runs
+beehive, then each controller's background work. **Most `CachedData` methods and the cache gauges
+still panic** — `TestUnimplementedBoundaryPanics` is the inventory of what is left, and an entry
+must be deleted as its method lands, since the test fails when a stub stops panicking.
 
 Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` records,
 `clusterController.Reconcile` observing what the kubeconfig says about each one
@@ -72,9 +79,17 @@ That is enough for the kube-context picker, which reads
 `ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
 one — and a `ClusterCachedCatalog` beneath it. **The catalog's pass discovers kinds**, so a
 `ClusterCachedResource` exists per kind the cluster serves, and its six reads answer.
-Nothing below that: no sync worker and no on-disk cache, so `CachedResources().Clear` and the whole
-`CachedData()` family still serve nothing, and every `ClusterCachedResource` carries a `Synced`
-condition nothing writes.
+**The resource pass now folds a worker fleet** (`internal/kubesync` — Track/Forget mirroring the
+record's state, Bounce/BounceCache as the restart the Clears and the poke resync will use) and
+writes each kind's `Synced` condition from its worker's observation; the per-cache store
+(`internal/kubestore`) opens with the full schema, a kind's teardown clears its rows through it,
+and **the cache's teardown disarms that cache's workers (`ForgetCache`) and deletes the file** —
+the path is named for an id that dies with the record, so a pass that let it survive would orphan
+it on disk for good, and a worker outliving it would write through a closed store. But the
+worker's run body is a placeholder that publishes nothing, so every `Synced` condition reads
+`Connecting`, no rows land, and `CachedResources().Clear` and the whole `CachedData()` family
+still panic. The sync loop, the store's data plane, and its change broker are the remaining
+steps — → docs/specs/cached-resource-sync.md.
 
 **A read reports the store as it is, and never filters.** A record awaiting deletion is served like
 any other, carrying the tombstone (`deletionRequestedAt`) the consumer decides on — rendering it
@@ -109,10 +124,11 @@ also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResync
 the poll its correctness rests on: it reads a file the store cannot see, so a lost trigger poke is
 a change nothing else would report. **`Cluster` takes `clusterResync`** for the same reason
 — what its probe reports is a remote server's, so nothing in the store moves when the answer does —
-and **`ClusterCachedCatalog` takes `catalogResync`**, the third: what its fold reads is the
-sweeper's in-memory answer, which the store cannot see move — the kubecatalog trigger makes the
-fold prompt, and the resync covers a signal that went missing. The other kinds are woken by a spec
-write or a dependency edge.
+and **`ClusterCachedCatalog` takes `catalogResync`** and **`ClusterCachedResource`
+`resourceResync`**, the third and fourth: what each fold reads is a leaf's in-memory answer
+(the sweeper's, a worker's), which the store cannot see move — the kubecatalog and kubesync
+triggers make the folds prompt, and the resyncs cover a signal that went missing. The other kinds
+are woken by a spec write or a dependency edge.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
 
 **Discovery is a sweep on its own engine (`internal/kubecatalog`); the catalog pass only folds

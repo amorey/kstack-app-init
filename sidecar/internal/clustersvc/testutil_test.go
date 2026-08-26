@@ -35,6 +35,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
@@ -202,6 +203,93 @@ func (f *fakeKubecatalog) swept() *conflate.Hub[string, struct{}] {
 	return f.hub
 }
 
+// fakeKubesync stands in for the worker fleet: it answers Read per id from a map and
+// records what was armed, disarmed, and bounced. The zero value tracks nothing and
+// knows nothing, which reads as a worker still owed.
+type fakeKubesync struct {
+	obs map[string]kubesync.Observation
+	// tracked and forgotten record the arm/disarm calls in order; armedWith holds the
+	// params each Track named.
+	tracked   []string
+	armedWith map[string]kubesync.Params
+	forgotten []string
+	bounced   []string
+	// bouncedCaches and forgottenCaches record each BounceCache/ForgetCache call's
+	// cache id.
+	bouncedCaches   []int64
+	forgottenCaches []int64
+
+	once sync.Once
+	hub  *conflate.Hub[string, struct{}]
+}
+
+func (f *fakeKubesync) Track(id string, p kubesync.Params) {
+	f.tracked = append(f.tracked, id)
+	if f.armedWith == nil {
+		f.armedWith = map[string]kubesync.Params{}
+	}
+	f.armedWith[id] = p
+}
+
+func (f *fakeKubesync) Forget(id string) { f.forgotten = append(f.forgotten, id) }
+
+func (f *fakeKubesync) Read(id string) (kubesync.Observation, bool) {
+	o, ok := f.obs[id]
+	return o, ok
+}
+
+func (f *fakeKubesync) Bounce(id string) { f.bounced = append(f.bounced, id) }
+
+func (f *fakeKubesync) BounceCache(cacheID int64) {
+	f.bouncedCaches = append(f.bouncedCaches, cacheID)
+}
+
+func (f *fakeKubesync) ForgetCache(cacheID int64) {
+	f.forgottenCaches = append(f.forgottenCaches, cacheID)
+}
+
+// Subscribe is the change feed the trigger reads. publish is a worker's news landing
+// on it.
+func (f *fakeKubesync) Subscribe() kubesync.Subscription { return f.moved().Receiver() }
+
+func (f *fakeKubesync) publish(id string) { f.moved().Sender().Send(id, struct{}{}) }
+
+func (f *fakeKubesync) moved() *conflate.Hub[string, struct{}] {
+	f.once.Do(func() { f.hub = conflate.New[string, struct{}]() })
+	return f.hub
+}
+
+// clearedKind is one ClearKind call as fakeKubestore records it.
+type clearedKind struct {
+	cacheID              int64
+	apiVersion, resource string
+}
+
+// fakeKubestore stands in for the store registry: it records what was cleared and
+// which caches were deleted, and answers with err. The zero value clears everything
+// without complaint.
+type fakeKubestore struct {
+	cleared []clearedKind
+	deleted []int64
+	err     error
+	// onDelete runs inside Delete, so a test can assert what had already happened by
+	// the time the file went.
+	onDelete func(cacheID int64)
+}
+
+func (f *fakeKubestore) ClearKind(_ context.Context, cacheID int64, apiVersion, resource string) error {
+	f.cleared = append(f.cleared, clearedKind{cacheID: cacheID, apiVersion: apiVersion, resource: resource})
+	return f.err
+}
+
+func (f *fakeKubestore) Delete(cacheID int64) error {
+	if f.onDelete != nil {
+		f.onDelete(cacheID)
+	}
+	f.deleted = append(f.deleted, cacheID)
+	return f.err
+}
+
 // probedAt is when every fake probe landed. Fixed, so a test asserting the stamp names a
 // value rather than reading the clock the code under test would.
 var probedAt = time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
@@ -278,7 +366,7 @@ func knowing(state kubeconn.State) *fakeKubeconn {
 func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, nil)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, &fakeKubesync{}, &fakeKubestore{}, nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -297,7 +385,7 @@ func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	return newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, &fakeKubesync{}, &fakeKubestore{}, nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -334,7 +422,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, &fakeKubesync{}, &fakeKubestore{}, nil)
 }
 
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the

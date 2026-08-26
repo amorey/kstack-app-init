@@ -16,12 +16,15 @@ package clustersvc
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -41,15 +44,218 @@ func TestClusterCachedResourceName(t *testing.T) {
 		"the same kind under another cache's anchor")
 }
 
-// A placeholder until the kind is rebuilt: it must settle the object rather than
-// requeue it, or beehive's owed pass would re-dispatch every synced kind forever.
-func TestCachedResourceControllerReconcilesToANoOp(t *testing.T) {
-	obj := &beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]{ID: 1, Generation: 3}
+// --- the reconcile fold ---
 
-	// The pass writes nothing, so the client is never touched.
-	res := (&clusterCachedResourceController{}).Reconcile(context.Background(), nil, obj)
+// resourceControllerClient answers the owner lookup a resource reconcile makes, from
+// the store, so the edge a fixture wrote is the one the reconcile reads. It records the
+// conditions written rather than storing them, since the verdict is what the tests
+// assert. The embedded interface is nil: Reconcile calls nothing else on it.
+type resourceControllerClient struct {
+	beehive.ControllerClient[ClusterCachedResourceStatus]
+	resources beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
+	id        beehive.ObjectID
+	// noOwner stands in for a resource whose owner edge is gone, which the store cannot
+	// hold while the row is still there.
+	noOwner    bool
+	conditions []Condition
+}
+
+func (c *resourceControllerClient) GetOwner(ctx context.Context) (beehive.ObjectRef, bool, error) {
+	if c.noOwner {
+		return beehive.ObjectRef{}, false, nil
+	}
+	return c.resources.GetOwner(ctx, c.id)
+}
+
+func (c *resourceControllerClient) SetCondition(_ context.Context, cond Condition) error {
+	c.conditions = append(c.conditions, cond)
+	return nil
+}
+
+// synced is the verdict the pass recorded.
+func (c *resourceControllerClient) synced(t *testing.T) Condition {
+	t.Helper()
+	require.Len(t, c.conditions, 1, "one pass writes one verdict")
+	require.Equal(t, string(ConditionSynced), c.conditions[0].Type)
+	return c.conditions[0]
+}
+
+// servingResource stores a tracked, syncing cluster with a cache, its catalog, and one
+// served kind under it — deploymentsSpec, with Enabled overridden — and returns the
+// deps, the cache (what Track's params and ClearKind's calls are checked against), and
+// the resource the pass under test reconciles.
+func servingResource(t *testing.T, enabled bool) (deps, *beehive.Object[ClusterCacheSpec, ClusterCacheStatus], *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) {
+	t.Helper()
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
+	spec := deploymentsSpec
+	spec.Enabled = enabled
+	return d, cache, createResource(t, d, catalog.ID, spec)
+}
+
+// reconcileResource runs one resource pass the way beehive would, folding whatever the
+// fake worker fleet and store hold.
+func reconcileResource(
+	t *testing.T,
+	d deps,
+	obj *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus],
+) (*resourceControllerClient, beehive.ReconcileResult) {
+	t.Helper()
+	client := &resourceControllerClient{resources: d.resourceClient, id: obj.ID}
+	c := &clusterCachedResourceController{deps: d}
+	return client, c.Reconcile(context.Background(), client, obj)
+}
+
+// syncFleet is the fake worker fleet behind the pass under test.
+func syncFleet(d deps) *fakeKubesync { return d.kubesyncSvc.(*fakeKubesync) }
+
+// kubestoreFake is the fake store registry behind the pass under test.
+func kubestoreFake(d deps) *fakeKubestore { return d.kubestoreSvc.(*fakeKubestore) }
+
+// A resource on its way out has its worker disarmed and its rows cleared — the other
+// side of the handshake the catalog's DiscoveryDraining requeue is waiting on.
+func TestResourceReconcileClearsOnDeletion(t *testing.T) {
+	d, cache, obj := servingResource(t, true)
+	now := time.Now()
+	obj.DeletionRequestedAt = &now
+
+	client, res := reconcileResource(t, d, obj)
 
 	assert.Equal(t, beehive.Settled(), res)
+	assert.Equal(t, []string{obj.Name}, syncFleet(d).forgotten)
+	require.Len(t, kubestoreFake(d).cleared, 1)
+	assert.Equal(t, clearedKind{cacheID: int64(cache.ID), apiVersion: "apps/v1", resource: "deployments"}, kubestoreFake(d).cleared[0])
+	assert.Empty(t, client.conditions)
+}
+
+// A store that cannot clear its rows is retried under backoff — the tombstone alone
+// (already forgotten) is not enough to say the teardown finished.
+func TestResourceReconcileFailsWhenClearKindErrors(t *testing.T) {
+	d, cache, obj := servingResource(t, true)
+	now := time.Now()
+	obj.DeletionRequestedAt = &now
+	kubestoreFake(d).err = errors.New("disk full")
+
+	client, res := reconcileResource(t, d, obj)
+
+	require.Error(t, res.Err())
+	assert.Equal(t, []string{obj.Name}, syncFleet(d).forgotten, "the worker is disarmed even though the clear failed")
+	require.Len(t, kubestoreFake(d).cleared, 1)
+	assert.Equal(t, int64(cache.ID), kubestoreFake(d).cleared[0].cacheID)
+	assert.Empty(t, client.conditions)
+}
+
+// A cache on its own way out breaks the chain above a still-live resource: the cascade
+// is coming for the whole subtree, so nothing here clears rows the cache's own teardown
+// will take with it.
+func TestResourceReconcileSettlesWhenOwnerChainIsBroken(t *testing.T) {
+	d, cache, obj := servingResource(t, true)
+	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
+
+	client, res := reconcileResource(t, d, obj)
+
+	assert.Equal(t, beehive.Settled(), res)
+	assert.Equal(t, []string{obj.Name}, syncFleet(d).forgotten)
+	assert.Empty(t, kubestoreFake(d).cleared)
+	assert.Empty(t, client.conditions)
+}
+
+// A disabled kind keeps its data — pause is not clear — and only stops the worker.
+func TestResourceReconcileDisabledForgetsAndPauses(t *testing.T) {
+	d, _, obj := servingResource(t, false)
+
+	client, res := reconcileResource(t, d, obj)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
+	assert.Equal(t, []string{obj.Name}, syncFleet(d).forgotten)
+	assert.Empty(t, syncFleet(d).tracked)
+	cond := client.synced(t)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonPaused, cond.Reason)
+}
+
+// An enabled kind with a healthy owner chain arms the worker with exactly the params it
+// needs to sync, and reports the wait for its first observation.
+func TestResourceReconcileArmsTheWorker(t *testing.T) {
+	d, cache, obj := servingResource(t, true)
+
+	client, res := reconcileResource(t, d, obj)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
+	f := syncFleet(d)
+	assert.Equal(t, []string{obj.Name}, f.tracked)
+	assert.Equal(t, kubesync.Params{
+		CacheID:     int64(cache.ID),
+		ContextName: "prod",
+		ServerUID:   "uid-1",
+		APIVersion:  "apps/v1",
+		Resource:    "deployments",
+		Namespaced:  true,
+	}, f.armedWith[obj.Name])
+	cond := client.synced(t)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonConnecting, cond.Reason)
+}
+
+// The worker's observation reasons map onto the record's own condition vocabulary — kept
+// a separate switch on purpose even where the strings coincide, since the two are
+// different kinds' words for their own state.
+func TestResourceReconcileMapsTheObservation(t *testing.T) {
+	tests := map[string]struct {
+		reason     string
+		wantStatus ConditionStatus
+		wantReason string
+	}{
+		"watching":            {kubesync.ReasonWatching, ConditionTrue, ReasonWatching},
+		"syncing":             {kubesync.ReasonSyncing, ConditionFalse, ReasonSyncing},
+		"stale":               {kubesync.ReasonStale, ConditionFalse, ReasonStale},
+		"sync failed":         {kubesync.ReasonSyncFailed, ConditionFalse, ReasonSyncFailed},
+		"no connection":       {kubesync.ReasonNoConnection, ConditionFalse, ReasonNoConnection},
+		"identity mismatch":   {kubesync.ReasonIdentityMismatch, ConditionFalse, ReasonIdentityMismatch},
+		"an unrecognized one": {"SomethingElse", ConditionFalse, "SomethingElse"},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			d, _, obj := servingResource(t, true)
+			syncFleet(d).obs = map[string]kubesync.Observation{
+				obj.Name: {Reason: tt.reason, Message: "detail"},
+			}
+
+			client, res := reconcileResource(t, d, obj)
+
+			require.NoError(t, res.Err())
+			cond := client.synced(t)
+			assert.Equal(t, tt.wantStatus, cond.Status)
+			assert.Equal(t, tt.wantReason, cond.Reason)
+			assert.Equal(t, "detail", cond.Message)
+		})
+	}
+}
+
+// A cluster whose record cannot name a context — no kubeconfig credentials, here — is
+// the record's own state, reported directly, the same as the catalog's identical branch.
+func TestResourceReconcileReportsNoConnectionWhenTheClusterCannotBeReached(t *testing.T) {
+	d := newTestDeps(t)
+	cluster, err := d.clusterClient.Create(context.Background(), "adopted", ClusterSpec{Enabled: true})
+	require.NoError(t, err)
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
+	obj := createResource(t, d, catalog.ID, deploymentsSpec)
+
+	client, res := reconcileResource(t, d, obj)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
+	assert.Equal(t, []string{obj.Name}, syncFleet(d).forgotten)
+	assert.Empty(t, syncFleet(d).tracked)
+	cond := client.synced(t)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonNoConnection, cond.Reason)
 }
 
 // --- the CachedResources family ---

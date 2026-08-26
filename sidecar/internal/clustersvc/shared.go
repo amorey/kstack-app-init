@@ -20,6 +20,7 @@
 package clustersvc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
@@ -94,6 +96,33 @@ type kubecatalogService interface {
 	Forget(id string)
 	Read(id string) (kubecatalog.Observation, bool)
 	Subscribe() kubecatalog.Subscription
+}
+
+// kubesyncService is the worker fleet behind every ClusterCachedResource record. Track
+// arms a worker for a record — keyed by the record's own beehive name, so the fleet's
+// change signal is the requeue — and Forget disarms it; both mirror the record's
+// state, which only the resource's reconcile decides. Read is the standing answer
+// that reconcile folds, and Subscribe feeds the trigger. Bounce and BounceCache
+// restart workers in place — the Clears' and the poke resync's entry point, since a
+// Track deliberately restarts nothing while the record's params hold. ForgetCache
+// disarms a whole cache's workers and waits for them, which is what deleting its
+// store has to happen after.
+type kubesyncService interface {
+	Track(id string, p kubesync.Params)
+	Forget(id string)
+	Read(id string) (kubesync.Observation, bool)
+	Subscribe() kubesync.Subscription
+	Bounce(id string)
+	BounceCache(cacheID int64)
+	ForgetCache(cacheID int64)
+}
+
+// kubestoreService is the on-disk cache store as the controllers reach it: a
+// resource's teardown clears the kind it owned, and a cache's deletes the file
+// itself. The boundary's own reads and Clears grow here as they land.
+type kubestoreService interface {
+	ClearKind(ctx context.Context, cacheID int64, apiVersion, resource string) error
+	Delete(cacheID int64) error
 }
 
 // --- Identity ---

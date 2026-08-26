@@ -16,6 +16,7 @@ package clustersvc
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -440,6 +441,72 @@ func TestCacheReconcileWritesNothingForADyingCache(t *testing.T) {
 	reconcileCache(t, d, obj)
 
 	assert.Empty(t, catalogs(t, d.catalogClient))
+}
+
+// The cache's file is named for an id that dies with the record, so nothing could
+// find it afterwards: the teardown pass is where it is deleted.
+func TestCacheReconcileDeletesTheStoreForADyingCache(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
+
+	obj, err := d.cacheClient.Get(context.Background(), cache.ID)
+	require.NoError(t, err)
+	reconcileCache(t, d, obj)
+
+	assert.Equal(t, []int64{int64(cache.ID)}, kubestoreFake(d).deleted)
+}
+
+// The kinds below disarm their workers on their own passes, so the cache's teardown
+// disarms them itself — a worker outliving the file would be writing through a store
+// this pass has closed.
+func TestCacheReconcileForgetsItsWorkersBeforeDeletingTheStore(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
+
+	var forgottenFirst bool
+	kubestoreFake(d).onDelete = func(int64) {
+		forgottenFirst = len(syncFleet(d).forgottenCaches) == 1
+	}
+
+	obj, err := d.cacheClient.Get(context.Background(), cache.ID)
+	require.NoError(t, err)
+	reconcileCache(t, d, obj)
+
+	assert.Equal(t, []int64{int64(cache.ID)}, syncFleet(d).forgottenCaches)
+	assert.True(t, forgottenFirst, "the store was deleted with the cache's workers still armed")
+}
+
+// A cache that is staying keeps its file — deleting on any other pass would wipe a
+// live mirror.
+func TestCacheReconcileLeavesTheStoreAloneForALiveCache(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+
+	reconcileCache(t, d, cache)
+
+	assert.Empty(t, kubestoreFake(d).deleted)
+}
+
+// A store that will not delete fails the pass: the file is the pass's whole job here,
+// and settling would leave it on disk with nothing left to name it.
+func TestCacheReconcileFailsWhenTheStoreWillNotDelete(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
+	kubestoreFake(d).err = errors.New("boom")
+
+	obj, err := d.cacheClient.Get(context.Background(), cache.ID)
+	require.NoError(t, err)
+	client := &cacheControllerClient{caches: d.cacheClient, id: obj.ID}
+	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), client, obj)
+
+	assert.NotEqual(t, beehive.Settled(), res)
 }
 
 // A cluster on its way out cascades to this cache next, so its subtree is not worth

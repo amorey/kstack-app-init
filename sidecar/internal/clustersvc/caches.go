@@ -296,8 +296,18 @@ func (c *clusterCacheController) Reconcile(
 	obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
 ) beehive.ReconcileResult {
 	// A cache on its way out is about to be collected with the subtree it owns, and
-	// beehive collects it with no finalizer to clear.
+	// beehive collects it with no finalizer to clear — so its file is deleted here or
+	// never: the ids the paths are named for are gone with the records. The kinds
+	// below stop clearing their own rows as soon as this mark lands (their owner walk
+	// reads a deletion-pending cache as no cache), so nothing recreates the file.
 	if obj.DeletionRequestedAt != nil {
+		// Before the file goes: the kinds below disarm their own workers, but on their
+		// own passes, and a worker still running would be writing through a store this
+		// is about to close.
+		c.kubesyncSvc.ForgetCache(int64(obj.ID))
+		if err := c.kubestoreSvc.Delete(int64(obj.ID)); err != nil {
+			return beehive.Fail(fmt.Errorf("delete cluster cache %d store: %w", obj.ID, err))
+		}
 		return beehive.Settled()
 	}
 
