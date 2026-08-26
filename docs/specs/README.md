@@ -24,4 +24,5 @@ A spec left behind after the code ships is a second source of truth.
 
 | Spec | Scope | Status |
 | --- | --- | --- |
+| [Cached resource sync](cached-resource-sync.md) | sidecar | Planned |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |
