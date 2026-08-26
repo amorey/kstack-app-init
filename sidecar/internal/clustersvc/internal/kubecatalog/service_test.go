@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
@@ -142,15 +144,37 @@ func (l *fakeLease) Release() {
 
 // newTestService is newWithOptions with the watch endpoint faked by default, so a test that
 // says nothing about watching does not reach the real one through a connection it never built.
-// A test that cares passes its own withOpener, which wins.
+// A test that cares passes its own withOpener, which wins. The store manager is a real one
+// over the test's own directory, so a sweep's write goes where a reader would look.
 func newTestService(t *testing.T, conns *fakeConns, opts ...option) *Service {
 	t.Helper()
-	return newWithOptions(conns, append([]option{withOpener(newFakeOpener(t).open)}, opts...)...)
+	return newTestServiceOver(t, conns, newTestStores(t), opts...)
+}
+
+// newTestServiceOver is newTestService for a test that holds the store manager itself, to
+// read back what a sweep wrote.
+func newTestServiceOver(t *testing.T, conns *fakeConns, stores *kubestore.Manager, opts ...option) *Service {
+	t.Helper()
+	return newWithOptions(conns, stores, append([]option{withOpener(newFakeOpener(t).open)}, opts...)...)
+}
+
+// newTestStores is a store manager over the test's own directory.
+func newTestStores(t *testing.T) *kubestore.Manager {
+	t.Helper()
+	m := kubestore.NewManager(t.TempDir())
+	t.Cleanup(func() { assert.NoError(t, m.Close()) })
+	return m
+}
+
+// armed is the params a test arms a subject with: its cache, its context, and the server
+// every fake lease answers as.
+func armed(cacheID int64, contextName string) Params {
+	return Params{CacheID: cacheID, ContextName: contextName, ServerUID: testUID}
 }
 
 // answering is a sweep that always serves these kinds.
 func answering(kinds ...Kind) option {
-	return withSweep(func(*kubeconn.Connection) (Catalog, error) {
+	return withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
 		return Catalog{Kinds: kinds}, nil
 	})
 }
@@ -173,8 +197,8 @@ func TestTrackIsIdempotent(t *testing.T) {
 	conns := newFakeConns()
 	svc := newTestService(t, conns, answering(pods))
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	assert.Equal(t, []string{"prod"}, conns.acquired)
 	_, ok := svc.Read("cachedcatalog/1")
@@ -186,7 +210,7 @@ func TestTrackIsIdempotent(t *testing.T) {
 func TestForgetReleasesWhatTrackTook(t *testing.T) {
 	conns := newFakeConns()
 	svc := newTestService(t, conns, answering(pods))
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	svc.Forget("cachedcatalog/1")
 
@@ -203,8 +227,8 @@ func TestForgetReleasesWhatTrackTook(t *testing.T) {
 func TestCloseReleasesEveryLease(t *testing.T) {
 	conns := newFakeConns()
 	svc := newTestService(t, conns, answering(pods))
-	svc.Track("cachedcatalog/1", "prod", testUID)
-	svc.Track("cachedcatalog/2", "staging", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
+	svc.Track("cachedcatalog/2", armed(2, "staging"))
 
 	require.NoError(t, svc.Close())
 
@@ -220,7 +244,7 @@ func TestSweepSignalsWhenTheAnswerLands(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	ev := testutil.Recv(t, sub.Chan(), "the sweep's signal")
 	assert.Equal(t, "cachedcatalog/1", ev.Key)
@@ -229,6 +253,62 @@ func TestSweepSignalsWhenTheAnswerLands(t *testing.T) {
 	require.True(t, obs.Known())
 	assert.Equal(t, []Kind{pods}, obs.Value.Kinds)
 	assert.True(t, obs.OK())
+}
+
+// The write side of the same pass, through the real store manager: the rows go into the
+// store of the cache the subject was armed for, not one named after the subject's own id.
+// What the rows say is the store's own tests' to pin; what this pins is the wiring.
+func TestSweepWritesIntoItsCacheStore(t *testing.T) {
+	conns := newFakeConns()
+	stores := newTestStores(t)
+	svc := newTestServiceOver(t, conns, stores, answering(pods))
+	startService(t, svc)
+	sub := svc.Subscribe()
+	t.Cleanup(sub.Close)
+
+	svc.Track("cachedcatalog/1", armed(7, "prod"))
+	testutil.Recv(t, sub.Chan(), "the sweep's signal")
+
+	store, ok, err := stores.OpenExisting(7)
+	require.NoError(t, err)
+	require.True(t, ok, "the sweep wrote into no store for its cache")
+	store.Release()
+}
+
+// Wake is what a wiper calls so the rows it emptied are rewritten in seconds rather than
+// at the interval. The answer has not moved, so nothing is committed and nobody is
+// signalled — the sweep running again is the whole of the repair.
+func TestWakeRerunsTheSweep(t *testing.T) {
+	conns := newFakeConns()
+	var sweeps atomic.Int32
+	svc := newTestService(t, conns, withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
+		sweeps.Add(1)
+		return Catalog{Kinds: []Kind{pods}}, nil
+	}))
+	startService(t, svc)
+	sub := svc.Subscribe()
+	t.Cleanup(sub.Close)
+
+	svc.Track("cachedcatalog/1", armed(7, "prod"))
+	testutil.Recv(t, sub.Chan(), "the sweep's signal")
+
+	svc.Wake("cachedcatalog/1")
+
+	require.Eventually(t, func() bool { return sweeps.Load() >= 2 },
+		testutil.Timeout, time.Millisecond, "the wake did not re-run the sweep")
+}
+
+// A sweep for a subject nothing tracks writes nowhere. Forget can land under a run, and a
+// write off it would recreate the file a teardown just deleted, permanently orphaned.
+func TestAForgottenSubjectWritesNothing(t *testing.T) {
+	conns := newFakeConns()
+	stores := newTestStores(t)
+	svc := newTestServiceOver(t, conns, stores)
+	startService(t, svc)
+
+	err := svc.mirror(context.Background(), "cachedcatalog/1", Catalog{Kinds: []Kind{pods}})
+
+	assert.ErrorIs(t, err, kubestore.ErrRemoved)
 }
 
 // A subject whose context resolves to nothing suspends, and the connection bridge is
@@ -242,7 +322,7 @@ func TestConnectionRecoveryWakesASuspendedSweep(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	testutil.Recv(t, sub.Chan(), "the suspension's signal")
 	obs, ok := svc.Read("cachedcatalog/1")
 	require.True(t, ok)
@@ -272,7 +352,7 @@ func TestSweepRefusesAnotherClustersServer(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	testutil.Recv(t, sub.Chan(), "the refusal's signal")
 	obs, ok := svc.Read("cachedcatalog/1")
@@ -291,7 +371,7 @@ func TestSweepKeepsItsAnswerWhenTheServerChanges(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	testutil.Recv(t, sub.Chan(), "the first answer")
 
 	conns.setServerUID("uid-2")
@@ -315,7 +395,7 @@ func TestSweepWaitsForAnUnidentifiedServer(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	testutil.Recv(t, sub.Chan(), "the wait's signal")
 	obs, ok := svc.Read("cachedcatalog/1")
 	require.True(t, ok)
@@ -341,7 +421,7 @@ func TestSweepReportsTheOutageBeforeTheIdentity(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	testutil.Recv(t, sub.Chan(), "the suspension's signal")
 	obs, ok := svc.Read("cachedcatalog/1")
@@ -361,7 +441,7 @@ func TestSweepRefusesAConnectionNotYetReidentified(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	testutil.Recv(t, sub.Chan(), "the first answer")
 
 	// The connection is replaced and nothing has identified the new one yet.
@@ -398,7 +478,7 @@ func TestEnsureWatcherStoresNothingForAnUntrackedID(t *testing.T) {
 func TestEnsureWatcherStoresOneForATrackedID(t *testing.T) {
 	conns := newFakeConns()
 	svc := newTestService(t, conns, answering(pods))
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	svc.ensureWatcher(context.Background(), "cachedcatalog/1", nil)
 
@@ -412,7 +492,7 @@ func TestEnsureWatcherStoresOneForATrackedID(t *testing.T) {
 func TestForgetStopsTheWatcher(t *testing.T) {
 	conns := newFakeConns()
 	svc := newTestService(t, conns, answering(pods))
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	svc.ensureWatcher(context.Background(), "cachedcatalog/1", nil)
 
 	svc.Forget("cachedcatalog/1")
@@ -448,7 +528,7 @@ func TestEnsureWatcherReplacesASpentWatcher(t *testing.T) {
 	conns := newFakeConns()
 	f := newFakeOpener(t)
 	svc := newTestService(t, conns, answering(pods), withOpener(f.open))
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	conn := &kubeconn.Connection{}
 
 	// Both streams end before any event, which is a gap: nothing to resume from.
@@ -476,7 +556,7 @@ func TestEnsureWatcherReplacesAWatcherOverAnotherConnection(t *testing.T) {
 	conns := newFakeConns()
 	f := newFakeOpener(t)
 	svc := newTestService(t, conns, answering(pods), withOpener(f.open))
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	svc.ensureWatcher(context.Background(), "cachedcatalog/1", &kubeconn.Connection{})
 	for range 2 {
@@ -501,7 +581,7 @@ func TestEnsureWatcherKeepsALiveWatcherOverTheSameConnection(t *testing.T) {
 	conns := newFakeConns()
 	f := newFakeOpener(t)
 	svc := newTestService(t, conns, answering(pods), withOpener(f.open))
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	conn := &kubeconn.Connection{}
 
 	svc.ensureWatcher(context.Background(), "cachedcatalog/1", conn)
@@ -533,7 +613,7 @@ func TestForgetRemovesTheSubjectAndTheWatcherTogether(t *testing.T) {
 	// After the Close, so it runs before it: Cleanup is LIFO, and Close waits for streams still
 	// inside the opener.
 	t.Cleanup(release)
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	// Both streams are parked in the opener, so the stop inside Forget cannot return.
 	svc.ensureWatcher(noWait(), "cachedcatalog/1", &kubeconn.Connection{})
@@ -576,13 +656,13 @@ func TestARefusedWatchDoesNotRerunTheSweep(t *testing.T) {
 
 	sweeps := testutil.NewProbe[struct{}](8)
 	svc := newTestService(t, conns, withOpener(f.open),
-		withSweep(func(*kubeconn.Connection) (Catalog, error) {
+		withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
 			sweeps.Fire(struct{}{})
 			return Catalog{Kinds: []Kind{pods}}, nil
 		}))
 	startService(t, svc)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	sweeps.Await(t, "the first sweep")
 	for range 2 {
@@ -605,7 +685,7 @@ func TestAFailedSweepStillMovesTheWatcherToTheNewConnection(t *testing.T) {
 	var mu sync.Mutex
 	failing := false
 	svc := newTestService(t, conns, withOpener(f.open),
-		withSweep(func(*kubeconn.Connection) (Catalog, error) {
+		withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			if failing {
@@ -617,7 +697,7 @@ func TestAFailedSweepStillMovesTheWatcherToTheNewConnection(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	testutil.Recv(t, sub.Chan(), "the first answer")
 	for range 2 {
 		f.opens.Await(t, "an open")
@@ -650,7 +730,7 @@ func TestTheSweepWaitsForItsWatchesToOpen(t *testing.T) {
 
 	sweeps := testutil.NewProbe[struct{}](8)
 	svc := newTestService(t, conns, withOpener(f.open),
-		withSweep(func(*kubeconn.Connection) (Catalog, error) {
+		withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
 			sweeps.Fire(struct{}{})
 			return Catalog{Kinds: []Kind{pods}}, nil
 		}))
@@ -659,7 +739,7 @@ func TestTheSweepWaitsForItsWatchesToOpen(t *testing.T) {
 	// streams still inside the opener. Without this a failed assertion here deadlocks.
 	t.Cleanup(release)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	for range 2 {
 		f.opens.Await(t, "an open")
@@ -702,7 +782,7 @@ func TestSweepEstablishesTheWatcher(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 
 	testutil.Recv(t, sub.Chan(), "the sweep's signal")
 	f.opens.Await(t, "the watch the sweep stood up")
@@ -720,7 +800,7 @@ func TestRefusalStopsTheWatcher(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	testutil.Recv(t, sub.Chan(), "the sweep's signal")
 	f.opens.Await(t, "the watch the sweep stood up")
 
@@ -747,7 +827,7 @@ func TestRecoveryStandsAWatchOverTheNewConnection(t *testing.T) {
 	sub := svc.Subscribe()
 	t.Cleanup(sub.Close)
 
-	svc.Track("cachedcatalog/1", "prod", testUID)
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
 	testutil.Recv(t, sub.Chan(), "the first answer")
 	for range 2 {
 		f.opens.Await(t, "an open")

@@ -6,8 +6,8 @@ status: Planned
 
 # Cached data reads
 
-> **Build order — 2.** Prerequisite: [Kind catalog sync](1-kind-catalog-sync.md) through its
-> step 2, which populates `kind_catalog`. Delivers the `CachedData()` family, so the dashboard nav
+> **Build order — 2.** No prerequisites: the sweep populates `kind_catalog`
+> (→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)), so the table has rows. Delivers the `CachedData()` family, so the dashboard nav
 > and tables go live. Next: [Catalog kinds off disk](3-catalog-kinds-off-disk.md), which consumes
 > the `Kinds(ctx)` read built here.
 
@@ -20,11 +20,9 @@ Implement the `CachedData()` family — `ListKinds`, `WatchKinds`, `WatchObjects
 their provenance fields, and the root `CLAUDE.md`'s delta-watch rules — and the served types
 already encode the read design (see below). No schema change.
 
-The reads consume the store, not the workers, so tests seed rows directly. **Spec 1 is a real
-prerequisite, not just an ordering preference**: `Objects` resolves a plural through
-`kind_catalog`, so without its rows this family is structurally complete and answers nothing —
-which is hard to tell from broken. Spec 1's step 3 (`IsCRD`) is not needed here: until it lands
-every row reads `is_crd = 0`, and nothing branches on the bit.
+The reads consume the store, not the workers, so tests seed rows directly. **The rows matter more
+than they look**: `Objects` resolves a plural through `kind_catalog`, so without them this family
+would be structurally complete and answer nothing — which is hard to tell from broken.
 
 ## The read design: ping, re-read, diff
 
@@ -81,14 +79,16 @@ The write side (object upsert/delete, event upsert, the relist prune, the events
 landed with the sync loop, and so have the two ping buses and the registry read path
 (`Manager.StoreIfOpen`, which never creates a file). What is left here is the reads, the row structs,
 the reader pool, and the family itself. `kind_catalog`'s writer is the **sweep**
-(→ [spec 1](1-kind-catalog-sync.md)).
+(→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)).
 
 ## The family (`cacheddata.go`)
 
 - **Gate, then bind — and a read never creates a file.** Each method resolves the
   (clusterID, cacheID) pair: the cache record must exist and be owned by that cluster; absent or
   mismatched → the `Bookmark` alone (an empty slice for `ListKinds`), per the delta-watch rule —
-  definitively empty, never pending, never an error. A live pair then **binds to the open store
+  definitively empty, never pending, never an error. **That bookmark-then-end shape belongs only
+  to a scope that can never be filled**, never to one whose anchor has merely not been created
+  yet: that is a wait, and `deltaWatch.pumpChanges` is what serves it. A live pair then **binds to the open store
   or waits for one**, through a registry read path shaped like `main`'s `Manager.WatchDB`: the
   current store if one is open, plus a publish when one opens or is swapped. No store yet → the
   `Bookmark` alone, live thereafter (rows arriving after the store opens diff from the empty
@@ -100,10 +100,10 @@ the reader pool, and the family itself. `kind_catalog`'s writer is the **sweep**
   any record-gated create would resurrect the file as a permanent orphan; no
   check-record-then-create ordering closes that, because the mark can land between the check and
   the create. Binding only to what exists closes it structurally: **every `OpenOrCreate` belongs to
-  something armed by a record** — a `kubesync` worker, and after spec 1 the sweep — and the
-  controller sequences both against `Remove` (`ForgetCache` waits for the workers; `Manager.Remove`
-  tombstones the id). One visible consequence of spec 1: an enabled cache has a file from its first
-  sweep rather than from its first synced kind, so this bind finds a store sooner.
+  something armed by a record** — a `kubesync` worker, or the sweep — and the controller sequences
+  both against `Remove` (`ForgetCache` waits for the workers; `Manager.Remove` tombstones the id).
+  Because the sweep writes too, an enabled cache has a file from its first sweep rather than from
+  its first synced kind, so this bind finds a store sooner.
 - **`WatchObjects`** — the loop over `Objects(apiVersion, resource)`, subscribed to that
   resource's key. Frames carry `CacheID` + `APIVersion`/`Resource` (the client's
   straggler-rejection provenance).
@@ -114,7 +114,7 @@ the reader pool, and the family itself. `kind_catalog`'s writer is the **sweep**
 - **`WatchKinds`** — the loop over `Kinds()`, keyed by (APIVersion, Resource), subscribed to
   **both** buses: object writes move counts, and event writes move the hardcoded
   `('v1','Event')` count. `IsCRD` reads off the `kind_catalog` row, whose one writer is the
-  **sweep** (→ [spec 1](1-kind-catalog-sync.md)): rows are the discovered, mirrorable kinds,
+  **sweep** (→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)): rows are the discovered, mirrorable kinds,
   so an advertised kind shows with `Count` 0 before its worker has synced anything — what
   `ClusterCachedDataKind`'s doc promises the nav.
 - **`ListKinds`** — one `Kinds()` read, no bus. It is what `ClusterCache.kinds` resolves.

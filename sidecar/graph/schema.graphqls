@@ -71,7 +71,7 @@ sync children — the per-kind `ClusterCachedResource` records (reasons
 Syncing/Watching/Paused/NoConnection/SyncFailed/Stale), or their whole-cache rollup
 `clusterCacheHealthWatch`, which speaks the same vocabulary.
 `ClusterCachedCatalog` reports its own axis on its own type: `Discovered` (reasons
-Discovered/DiscoveryPartial/DiscoveryFailed/Paused/NoConnection). New types/reasons may appear; consumers should
+Discovered/DiscoveryPartial/DiscoveryFailed/StoreUnavailable/Paused/NoConnection). New types/reasons may appear; consumers should
 treat unknown spellings as a degraded/unknown display state.
 """
 type Condition {
@@ -510,7 +510,7 @@ type ClusterCachedCatalog {
   spec: ClusterCachedCatalogSpec!
   """
   This record's `Discovered` condition — the per-component verdict. `Discovered` is the
-  only true one; the other seven are false and each points somewhere different.
+  only true one; the other eight are false and each points somewhere different.
 
   Waiting, not failing: `Connecting` (armed, first sweep still coming), `Paused` (sync
   switched off), `DiscoveryDraining` (a served kind's name is still held by an earlier
@@ -526,6 +526,10 @@ type ClusterCachedCatalog {
 
   Asked and refused: `DiscoveryFailed` — the request itself failed, and the kinds already
   known are left alone while the sweep retries.
+
+  Answered, but not stored: `StoreUnavailable` — discovery succeeded and the cache's own store
+  would not take the answer, so nothing was recorded off it. Neither a wait nor a discovery
+  failure; the sweep is retrying on its own ladder.
   """
   conditions: [Condition!]!
 }

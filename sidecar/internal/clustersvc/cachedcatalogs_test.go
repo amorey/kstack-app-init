@@ -230,13 +230,26 @@ func storedKinds(t *testing.T, d deps, catalogID beehive.ObjectID) map[SyncedKin
 	return byRef
 }
 
+// cacheIDOf is the cache a catalog hangs off, read back through its owner edge.
+func cacheIDOf(t *testing.T, d deps, obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus]) int64 {
+	t.Helper()
+	loaded, err := d.catalogClient.Get(context.Background(), obj.ID, beehive.LoadOwner())
+	require.NoError(t, err)
+	ref, ok, err := loaded.Owner()
+	require.NoError(t, err)
+	require.True(t, ok)
+	return int64(ref.ID)
+}
+
 // The pass's first job: the sweep is armed exactly while the record wants discovery,
 // keyed by the record's own name and bound to its cluster's context. No answer has
 // landed yet, so the verdict is the wait — and no requeue, since the sweeper's signal
 // re-runs the fold and the kind's resync is the backstop.
 //
 // The server is named alongside the context because a context is not an identity: it can
-// be re-pointed at another cluster, and this cache mirrors one server only.
+// be re-pointed at another cluster, and this cache mirrors one server only. The cache is
+// named because the sweep writes what it finds into that cache's store, and the subject
+// id carries the catalog's object id rather than the cache's.
 func TestCatalogReconcileArmsTheSweeper(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
 
@@ -246,7 +259,9 @@ func TestCatalogReconcileArmsTheSweeper(t *testing.T) {
 	assert.Equal(t, beehive.Settled(), res)
 	f := sweeper(d)
 	assert.Equal(t, []string{catalog.Name}, f.tracked)
-	assert.Equal(t, armedSubject{contextName: "prod", serverUID: "uid-1"}, f.armedFor[catalog.Name])
+	assert.Equal(t, kubecatalog.Params{
+		CacheID: cacheIDOf(t, d, catalog), ContextName: "prod", ServerUID: "uid-1",
+	}, f.armedFor[catalog.Name])
 	assert.Empty(t, storedKinds(t, d, catalog.ID))
 	cond := client.discovered(t)
 	assert.Equal(t, ConditionFalse, cond.Status)
@@ -355,6 +370,49 @@ func TestCatalogReconcileKeepsItsChildrenWhenTheSweepFails(t *testing.T) {
 	cond := client.discovered(t)
 	assert.Equal(t, ReasonDiscoveryFailed, cond.Reason)
 	assert.Equal(t, "the server rejected our request", cond.Message)
+}
+
+// A store that would not take the answer is not a discovery failure: the sweep's answer
+// is good, and pointing a user at the API server is the wrong remedy. The children
+// converge from the standing answer meanwhile, and the sweep's own ladder is retrying.
+func TestCatalogReconcileReportsAStoreThatWouldNotTakeTheAnswer(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	sweepAnswered(d, catalog, swept(pods))
+	_, res := reconcileCatalog(t, d, catalog)
+	require.NoError(t, res.Err())
+
+	failing := swept(pods)
+	failing.Attempts = kubeconn.Attempts{
+		LastAttempt: finished(kubecatalog.ReasonStoreFailed, "database or disk is full"),
+		Failures:    1, FailingSince: probedAt,
+	}
+	sweepAnswered(d, catalog, failing)
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
+	assert.NotNil(t, storedKinds(t, d, catalog.ID)[SyncedKindRef{APIVersion: "v1", Resource: "pods"}])
+	cond := client.discovered(t)
+	assert.Equal(t, ReasonStoreUnavailable, cond.Reason)
+	assert.Equal(t, "database or disk is full", cond.Message)
+}
+
+// The same on a cache's very first sweep, where there is no answer to fold: without its
+// own arm the wait would read as Connecting for as long as the disk keeps refusing.
+func TestCatalogReconcileReportsAStoreFailureBeforeTheFirstAnswer(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	sweepAnswered(d, catalog, kubecatalog.Observation{
+		Attempts: kubeconn.Attempts{
+			LastAttempt: finished(kubecatalog.ReasonStoreFailed, "database or disk is full"),
+			Failures:    1, FailingSince: probedAt,
+		},
+	})
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	cond := client.discovered(t)
+	assert.Equal(t, ReasonStoreUnavailable, cond.Reason)
 }
 
 // The verdict is the last attempt's, not the retained value's: a sweep that failed

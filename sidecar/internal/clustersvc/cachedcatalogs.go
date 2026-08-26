@@ -280,7 +280,11 @@ func (c *clusterCachedCatalogController) Reconcile(
 	// Arming is this pass's other job: the subject exists exactly while the record
 	// wants discovery, keyed by the record's own name so the sweeper's change signal
 	// is the requeue.
-	c.kubecatalogSvc.Track(obj.Name, contextName, own.cache.Spec.ServerUID)
+	c.kubecatalogSvc.Track(obj.Name, kubecatalog.Params{
+		CacheID:     int64(own.cache.ID),
+		ContextName: contextName,
+		ServerUID:   own.cache.Spec.ServerUID,
+	})
 
 	obs, ok := c.kubecatalogSvc.Read(obj.Name)
 	if !ok || !obs.Known() {
@@ -296,6 +300,10 @@ func (c *clusterCachedCatalogController) Reconcile(
 			reason = ReasonNoConnection
 		case kubecatalog.ReasonIdentityMismatch:
 			reason = ReasonIdentityMismatch
+		case kubecatalog.ReasonStoreFailed, kubecatalog.ReasonStoreRemoved:
+			// A store failure on a cache's very first sweep, which would otherwise read
+			// as Connecting for as long as the disk keeps refusing.
+			reason = ReasonStoreUnavailable
 		}
 		return observeDiscovered(ctx, client, ConditionFalse, reason, obs.LastAttempt.Message)
 	}
@@ -401,6 +409,12 @@ func (c *clusterCachedCatalogController) converge(
 			// discovery request failed points a reader at the API server when what moved
 			// is which cluster the context reaches.
 			reason = ReasonIdentityMismatch
+		case kubecatalog.ReasonStoreFailed, kubecatalog.ReasonStoreRemoved:
+			// The sweep's answer is good and the mirror would not take it; the sweep's own
+			// ladder is retrying. A removed store means the cache record is gone, so
+			// ownersOf returns before this in practice — but a teardown must not read as a
+			// discovery failure on the pass that does get here.
+			reason = ReasonStoreUnavailable
 		default:
 			reason = ReasonDiscoveryFailed
 		}

@@ -434,10 +434,10 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 	// cluster, and this is what turns one into the credentials a probe dials. The
 	// sweeper borrows its connections, so it sits directly on top.
 	kubeconnSvc := kubeconn.New(kubeconfigSvc)
-	kubecatalogSvc := kubecatalog.New(kubeconnSvc)
-	// The workers write into per-cache stores under the registry, and both sit on the
-	// pool the way the sweeper does.
+	// Both leaves write into per-cache stores under the registry, and both sit on the
+	// pool: the sweeper lays down what the cluster serves, the workers the objects.
 	kubestoreMgr := kubestore.NewManager(filepath.Join(dataDir, "caches"))
+	kubecatalogSvc := kubecatalog.New(kubeconnSvc, kubestoreMgr)
 	kubesyncSvc := kubesync.New(kubeconnSvc, kubestoreMgr)
 	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, kubecatalogSvc, kubesyncSvc, kubestoreMgr, pokeSvc)
 

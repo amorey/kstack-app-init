@@ -38,6 +38,7 @@ import (
 	"github.com/amorey/gobus/conflate"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
@@ -47,6 +48,13 @@ import (
 type connService interface {
 	Acquire(contextName string) kubeconn.Lease
 	Subscribe() kubeconn.Subscription
+}
+
+// storeManager is the cache directory as a sweep reaches it: one claim per run, given
+// back when it ends. Leaf-to-leaf, the way the kubeconn import is — the sweep writes
+// native rows and knows nothing of the records above.
+type storeManager interface {
+	OpenOrCreate(cacheID int64) (*kubestore.Store, error)
 }
 
 // Subscription reports the ids whose news changed — the answer or the verdict, never
@@ -62,6 +70,7 @@ type Observation = probe.Observation[Catalog]
 // Service runs the sweep over the tracked ids.
 type Service struct {
 	conns  connService
+	stores storeManager
 	engine *probe.Engine
 	// signalHub names the ids whose news changed, fed by publish.
 	signalHub *conflate.Hub[string, struct{}]
@@ -91,29 +100,38 @@ type Service struct {
 	wg sync.WaitGroup
 }
 
-// subject is one tracked id: the context it sweeps over, the server that context has to
-// answer as, and this service's own claim on the connection — refcounted in the pool
-// beside every other holder's, so releasing it never stops the cluster being probed.
+// Params is what one subject sweeps: over which context, as which server, into which
+// cache's store.
 //
 // **A context is not an identity.** It can be re-pointed at another cluster, and the
 // pool hands out whatever now answers, so the server the caller armed this subject for
 // is the thing that makes a sweep's answer belong to it.
-type subject struct {
-	contextName string
-	serverUID   string
-	lease       kubeconn.Lease
+type Params struct {
+	// CacheID names the store the sweep writes. The subject id cannot carry it: the
+	// record's name embeds the catalog's object id, not the cache's.
+	CacheID     int64
+	ContextName string
+	ServerUID   string
 }
 
-// New returns a Service sweeping over conns' connections.
-func New(conns connService) *Service {
-	return newWithOptions(conns)
+// subject is one tracked id: what it sweeps, and this service's own claim on the
+// connection — refcounted in the pool beside every other holder's, so releasing it never
+// stops the cluster being probed.
+type subject struct {
+	params Params
+	lease  kubeconn.Lease
+}
+
+// New returns a Service sweeping over conns' connections, into stores' files.
+func New(conns connService, stores storeManager) *Service {
+	return newWithOptions(conns, stores)
 }
 
 // option is a test seam, reachable only from white-box tests.
 type option func(*Service, *catalogProbe)
 
 // withSweep substitutes the API server behind every sweep.
-func withSweep(f func(*kubeconn.Connection) (Catalog, error)) option {
+func withSweep(f func(context.Context, *kubeconn.Connection) (Catalog, error)) option {
 	return func(_ *Service, p *catalogProbe) { p.sweep = f }
 }
 
@@ -123,10 +141,11 @@ func withOpener(f opener) option {
 }
 
 // newWithOptions is New plus the seams.
-func newWithOptions(conns connService, opts ...option) *Service {
+func newWithOptions(conns connService, stores storeManager, opts ...option) *Service {
 	watcherCtx, stopWatchers := context.WithCancel(context.Background())
 	s := &Service{
 		conns:     conns,
+		stores:    stores,
 		engine:    probe.New(),
 		signalHub: conflate.New[string, struct{}](),
 		tracked:   map[string]*subject{},
@@ -142,34 +161,37 @@ func newWithOptions(conns connService, opts ...option) *Service {
 	p := &catalogProbe{
 		conn:    s.connFor,
 		sweep:   discoverServedKinds,
+		mirror:  s.mirror,
 		watch:   s.ensureWatcher,
 		unwatch: s.stopWatcher,
 	}
 	for _, opt := range opts {
 		opt(s, p)
 	}
-	probe.Register(s.engine, nameCatalog, p, probe.WithInterval(sweepInterval), probe.WithTimeout(sweepTimeout))
+	probe.Register(s.engine, nameCatalog, p,
+		probe.WithInterval(sweepInterval),
+		probe.WithTimeout(sweepTimeout),
+		probe.WithBackoff(sweepRetryBase, 2, sweepInterval))
 	s.engine.OnPass(s.publish)
 	return s
 }
 
-// Track arms the sweep for id over contextName's connection, for as long as that context
-// answers as serverUID. Idempotent, and all three are fixed for the id's life — the
-// caller derives them from one record, whose identity does not change — so a repeat is a
-// no-op, never a re-bind.
-func (s *Service) Track(id, contextName, serverUID string) {
+// Track arms the sweep for id with p. Idempotent, and every field of p is fixed for the
+// id's life — the caller derives them from one record, whose identity does not change —
+// so a repeat is a no-op, never a re-bind.
+func (s *Service) Track(id string, p Params) {
 	s.mu.Lock()
 	if _, held := s.tracked[id]; held {
 		s.mu.Unlock()
 		return
 	}
 	// Acquire never fails and never waits, so holding mu across it costs nothing.
-	sub := &subject{contextName: contextName, serverUID: serverUID, lease: s.conns.Acquire(contextName)}
+	sub := &subject{params: p, lease: s.conns.Acquire(p.ContextName)}
 	s.tracked[id] = sub
-	ids := s.byContext[contextName]
+	ids := s.byContext[p.ContextName]
 	if ids == nil {
 		ids = map[string]struct{}{}
-		s.byContext[contextName] = ids
+		s.byContext[p.ContextName] = ids
 	}
 	ids[id] = struct{}{}
 	s.mu.Unlock()
@@ -195,10 +217,10 @@ func (s *Service) Forget(id string) {
 	delete(s.published, id)
 	w := s.watchers[id]
 	delete(s.watchers, id)
-	ids := s.byContext[sub.contextName]
+	ids := s.byContext[sub.params.ContextName]
 	delete(ids, id)
 	if len(ids) == 0 {
-		delete(s.byContext, sub.contextName)
+		delete(s.byContext, sub.params.ContextName)
 	}
 	// Under the lock, so a Forget racing a fresh Track of the same id cannot remove the
 	// subject the new call just added.
@@ -317,7 +339,52 @@ func (s *Service) connFor(ctx context.Context, id string) (*kubeconn.Connection,
 	if sub == nil {
 		return nil, fmt.Errorf("%w: subject %q", kubeconn.ErrNoConnection, id)
 	}
-	return sub.lease.ConnFor(ctx, sub.serverUID)
+	return sub.lease.ConnFor(ctx, sub.params.ServerUID)
+}
+
+// Wake asks for id's sweep now rather than at the interval — what a wiper calls so the
+// rows it emptied are rewritten in seconds. A no-op for an id nothing tracks.
+func (s *Service) Wake(id string) { s.engine.Wake(id, nameCatalog) }
+
+// mirror writes one sweep's answer into its cache's store, claiming the file for the
+// write alone: nothing holds one open for a subject that is not running, which is what
+// lets a cache's teardown delete it.
+func (s *Service) mirror(ctx context.Context, id string, c Catalog) error {
+	s.mu.Lock()
+	sub := s.tracked[id]
+	s.mu.Unlock()
+	if sub == nil {
+		return fmt.Errorf("%w: subject %q", kubestore.ErrRemoved, id)
+	}
+
+	store, err := s.stores.OpenOrCreate(sub.params.CacheID)
+	if err != nil {
+		return err
+	}
+	defer store.Release()
+
+	// Prune only on a complete answer, the same rule the children follow: a group that
+	// went quiet has not stopped being served.
+	return store.SyncKinds(ctx, kindRows(c.Kinds), !c.Partial)
+}
+
+// kindRows translates the sweep's answer into the table's own vocabulary.
+func kindRows(kinds []Kind) []kubestore.KindRow {
+	rows := make([]kubestore.KindRow, 0, len(kinds))
+	for _, k := range kinds {
+		scope := kubestore.ScopeCluster
+		if k.Namespaced {
+			scope = kubestore.ScopeNamespaced
+		}
+		rows = append(rows, kubestore.KindRow{
+			APIVersion: k.GroupVersion,
+			Kind:       k.Kind,
+			Resource:   k.Resource,
+			Scope:      scope,
+			IsCRD:      k.IsCRD,
+		})
+	}
+	return rows
 }
 
 // publish is the engine's OnPass: signal the id when its news moved. Every pass rather
@@ -370,7 +437,7 @@ func newsOf(o Observation) news {
 func kindsFingerprint(kinds []Kind) uint64 {
 	h := fnv.New64a()
 	for _, k := range kinds {
-		fmt.Fprintf(h, "%s|%s|%s|%t\n", k.GroupVersion, k.Resource, k.Kind, k.Namespaced)
+		fmt.Fprintf(h, "%s|%s|%s|%t|%t\n", k.GroupVersion, k.Resource, k.Kind, k.Namespaced, k.IsCRD)
 	}
 	return h.Sum64()
 }

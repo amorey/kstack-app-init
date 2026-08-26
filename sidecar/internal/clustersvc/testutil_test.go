@@ -165,41 +165,43 @@ func (l *fakeLease) Release() { l.svc.released = append(l.svc.released, l.contex
 type fakeKubecatalog struct {
 	obs map[string]kubecatalog.Observation
 	// tracked and forgotten record the arm/disarm calls in order; armedFor holds the
-	// context and server each Track named.
+	// params each Track named, and woken the ids a wiper asked a sweep for.
 	tracked   []string
-	armedFor  map[string]armedSubject
+	armedFor  map[string]kubecatalog.Params
 	forgotten []string
+	woken     []string
+	// onWake runs inside Wake, so a test can pin what had already happened by the time
+	// the sweeper was asked for a pass.
+	onWake func(id string)
 
 	once sync.Once
 	hub  *conflate.Hub[string, struct{}]
 }
 
-// armedSubject is what one Track bound an id to: the context to sweep over and the
-// server that context has to answer as.
-type armedSubject struct {
-	contextName string
-	serverUID   string
-}
-
-func (f *fakeKubecatalog) Track(id, contextName, serverUID string) {
+func (f *fakeKubecatalog) Track(id string, p kubecatalog.Params) {
 	f.tracked = append(f.tracked, id)
 	if f.armedFor == nil {
-		f.armedFor = map[string]armedSubject{}
+		f.armedFor = map[string]kubecatalog.Params{}
 	}
-	f.armedFor[id] = armedSubject{contextName: contextName, serverUID: serverUID}
+	f.armedFor[id] = p
 }
 
 func (f *fakeKubecatalog) Forget(id string) { f.forgotten = append(f.forgotten, id) }
+
+func (f *fakeKubecatalog) Wake(id string) {
+	f.woken = append(f.woken, id)
+	if f.onWake != nil {
+		f.onWake(id)
+	}
+}
 
 func (f *fakeKubecatalog) Read(id string) (kubecatalog.Observation, bool) {
 	o, ok := f.obs[id]
 	return o, ok
 }
 
-// Subscribe is the change feed the trigger reads. publish is a sweep landing on it.
+// Subscribe is the change feed the trigger reads.
 func (f *fakeKubecatalog) Subscribe() kubecatalog.Subscription { return f.swept().Receiver() }
-
-func (f *fakeKubecatalog) publish(id string) { f.swept().Sender().Send(id, struct{}{}) }
 
 func (f *fakeKubecatalog) swept() *conflate.Hub[string, struct{}] {
 	f.once.Do(func() { f.hub = conflate.New[string, struct{}]() })
@@ -360,11 +362,8 @@ func (f *fakeKubesync) setObservations(obs []kubesync.SubjectObservation) {
 	f.observations = obs
 }
 
-// Subscribe is the change feed the trigger reads. publish is a worker's news landing
-// on it.
+// Subscribe is the change feed the trigger reads.
 func (f *fakeKubesync) Subscribe() kubesync.Subscription { return f.moved().Receiver() }
-
-func (f *fakeKubesync) publish(id string) { f.moved().Sender().Send(id, struct{}{}) }
 
 // closeHub ends every subscription, the way Close does when the process goes.
 func (f *fakeKubesync) closeHub() { f.moved().Close() }

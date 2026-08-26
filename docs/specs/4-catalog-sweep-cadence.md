@@ -6,9 +6,7 @@ status: Planned
 
 # Catalog sweep cadence follows the watch
 
-> **Build order — 4.** Prerequisite: [Kind catalog sync](1-kind-catalog-sync.md), which is where
-> `catalogProbe.Run`'s tail is rewritten; sequencing keeps both out of one function at once. Last
-> because it also touches `Catalog`, which [spec 3](3-catalog-kinds-off-disk.md) rewrites — it
+> **Build order — 4.** No prerequisites. Last because it touches `Catalog`, which [spec 3](3-catalog-kinds-off-disk.md) rewrites — it
 > composes with either shape, but landing after means writing it once.
 > **Nothing a user sees changes.** It removes redundant load on the clusters we point at.
 
@@ -21,8 +19,8 @@ and `apiservices` (→ [ADR](../adr/2026-08-26-kubecatalog-watch.md)) — and th
 cost: dozens of round trips per group-version, per cache, six times an hour, to learn what the
 watch would have said in seconds.
 
-**This is not what makes the catalog live** — the watch already does, and
-[spec 1](1-kind-catalog-sync.md) carries its wake through to the table. This spec is the cost side of the same design: with the watch doing the
+**This is not what makes the catalog live** — the watch already does, and the sweep carries its
+wake through to the table (→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)). This spec is the cost side of the same design: with the watch doing the
 work, the poll under it can be rare.
 
 **The cadence becomes a function of whether the watch is working.** Watch live → a long backstop.
@@ -90,7 +88,7 @@ sweep that is not due. So there is nothing left to change there — this spec le
 and the wipe path is already paced against a wake rather than against the interval.
 
 **If spec 3 is skipped**, the interaction is simpler still: the fold reads its kinds from memory,
-so a wiped table costs it nothing, and spec 1's `Caches().Clear` wake is what puts the rows back.
+so a wiped table costs it nothing, and the `Caches().Clear` wake is what puts the rows back.
 
 ## Order of work (red/green)
 

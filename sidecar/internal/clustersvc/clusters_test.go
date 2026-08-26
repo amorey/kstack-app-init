@@ -201,8 +201,6 @@ func liveCaches(t *testing.T, caches beehive.Client[ClusterCacheSpec, ClusterCac
 
 // --- the identity a probe found ---
 
-func strPtr(s string) *string { return &s }
-
 // identityControllerOver returns a controller whose pool answers with what.
 func identityControllerOver(t *testing.T, what *fakeKubeconn) *clusterController {
 	t.Helper()

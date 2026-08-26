@@ -51,9 +51,11 @@ internal/clustersvc/
                       same change signal. service.go is the fleet, sync.go the loop
                       one worker runs. Same leaf rule
   internal/kubestore/  the on-disk cache: one SQLite file per ClusterCache behind a
-                      refcounted manager (manager.go), the store and its write
-                      path (store.go + objects/events/status/rawcodec), and the
-                      change ping bus every read re-reads on. Same leaf rule
+                      refcounted manager (manager.go), the claim and the sync write
+                      path (store.go), a file per table beside it (catalog.go is the
+                      sweep's kind_catalog; objects/events/status/rawcodec project the
+                      rows), and the change ping bus every read re-reads on. Same
+                      leaf rule
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -82,12 +84,10 @@ one — and a `ClusterCachedCatalog` beneath it. **The catalog's pass discovers 
 **Kinds now sync**: the resource pass arms a worker per kind (`internal/kubesync`), that worker
 mirrors the collection into the cache's SQLite file (`internal/kubestore`), and the pass folds its
 observation into the kind's `Synced` condition and the sync timeline beneath it. Both `Clear`s and
-both cache gauges answer. What is left is the **read side** — the `CachedData()` family over the
-store, and the `kind_catalog` rows the reads resolve a plural through
-(→ docs/specs/1-kind-catalog-sync.md, docs/specs/2-cached-data-reads.md). Until the sweep writes
-that table, a kind's rows are written but not reachable **by plural**, so the `CachedData` reads
-will read empty until it does. Nothing on the
-write path depends on that table: `Store.ClearKind` takes the whole `Kind` from the record.
+both cache gauges answer. **The sweep writes `kind_catalog`**, so a plural resolves to its Kind.
+What is left is the **read side** — the `CachedData()` family over the store
+(→ docs/specs/2-cached-data-reads.md). Nothing on the write path depends on the catalog table:
+`Store.ClearKind` takes the whole `Kind` from the record.
 
 **A kind is mirrored by a standing worker, not a periodic pass.** `internal/kubesync` runs one
 goroutine per (cache, GVR): resolve the connection through `Lease.ConnFor`, cold-list into the
@@ -271,10 +271,28 @@ connection through the service's own `kubeconn` lease (refcounted beside every o
 commits only on a change, suspends while the context resolves to nothing (the kubeconn bridge
 wakes it the moment the pool reaches the server), and `Subscribe` signals the ids whose news moved
 — `newKubecatalogTrigger` maps that signal straight onto the record, the id being the name. The
-subject is bound to **a server, not just a context**: `Track(id, contextName, serverUID)`, and it
-asks the pool for that server's connection (`Lease.ConnFor`), suspending with `IdentityMismatch`
-when it is not. The
+subject is bound to **a server, not just a context**: `Track(id, kubecatalog.Params{…})` names one,
+and the sweep asks the pool for that server's connection (`Lease.ConnFor`), suspending with
+`IdentityMismatch` when it is not. The params name **a cache** as well, because the sweep writes
+what it finds into that cache's store — the subject id carries the catalog's object id, not the
+cache's. The
 sweep's 10m interval is the correctness bound — a poll, since nothing here sees a CRD land.
+
+**`kind_catalog` has one writer: the sweep**, the way a kubesync worker writes the objects it
+mirrors — so `kubecatalog.New(conns, stores)` takes the store manager beside the pool.
+**The write is not gated on the answer changing**: every sweep that produced one upserts the rows
+(pruning only when the answer is not `Partial`), and the commit guard goes on governing only the
+*signal*. A table wiped under the sweep is therefore rewritten by the next one with no repair
+protocol, and `Caches().Clear` calls `Wake` — from its **deferred** requeue path, after the clear,
+never inline ahead of it — so that takes seconds rather than an interval. **The write comes before
+the commit**: a commit is the fold's wake, and one over rows that are not there yet would have the
+fold converge on a table the write is still catching up to. A failed write fails the run
+(`ReasonStoreFailed`, folded to the `StoreUnavailable` reason) and commits nothing; `ErrRemoved`
+suspends it, since a torn-down cache's `Forget` is on its way. The probe registers its own
+`WithBackoff(30s, 2, sweepInterval)` rather than the engine's default second: what a failure
+retries here is a full `ServerPreferredResources`, paid for at someone else's cluster, and
+promptness comes from the watch rather than from the ladder.
+→ [ADR: the sweep writes the catalog](../docs/adr/2026-08-26-sweep-writes-the-catalog.md).
 
 **Promptness is a watch that only wakes.** Every run that resolves a connection stands a watcher
 up over it, before sweeping: one stream each on `customresourcedefinitions` and `apiservices`,
@@ -379,6 +397,9 @@ vocabulary:
 - **`NoConnection`** settles with no requeue: the sweep is suspended on its claim, the bridge
   re-runs it on recovery, and its signal re-runs this fold. The outage itself is the cluster
   pass's to report.
+- **`StoreUnavailable`** is discovery answering and the cache's own store refusing the rows. Not a
+  discovery failure — pointing a user at the API server is the wrong remedy — and the sweep's own
+  ladder is retrying, so the fold settles.
 
 A kind is mirrorable when it is not a subresource and carries both `list` and `watch`; the
 `events.k8s.io` spelling is dropped so one event store is not cached twice. The filter lives with

@@ -6,16 +6,17 @@ status: Planned
 
 # Catalog kinds off disk
 
-> **Build order — 3.** Prerequisites: [spec 1](1-kind-catalog-sync.md) for the rows,
-> [spec 2](2-cached-data-reads.md) for the `Kinds(ctx)` read this fold reconciles from.
+> **Build order — 3.** Prerequisite: [spec 2](2-cached-data-reads.md) for the `Kinds(ctx)` read
+> this fold reconciles from. The rows are already there — the sweep writes them
+> (→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)).
 > **Deferrable** — nothing downstream waits on it, and skipping it leaves today's behaviour.
 > Next: [Catalog sweep cadence](4-catalog-sweep-cadence.md).
 
 ## Goal
 
 Close the TODO item "the catalog stays resident for as long as a cluster is tracked". `kubecatalog`
-holds every served kind per subject — group-version, kind, resource, scope — and the rows spec 1
-writes now hold the same list again. Order of 90 bytes a kind, so tens of KB for a cluster with
+holds every served kind per subject — group-version, kind, resource, scope — and the rows the sweep
+writes hold the same list again. Order of 90 bytes a kind, so tens of KB for a cluster with
 CRDs: **listed for the duplication, not the size.**
 
 Two things hold the kinds in memory, and the TODO says a fix has to answer both. The commit guard
@@ -23,8 +24,8 @@ needs the previous answer to compare — a fingerprint covers that. And
 `clusterCachedCatalogController.Reconcile` reads the standing answer back through `Read(id)` to
 rewrite its children — the `kind_catalog` rows cover that, once the fold reads them.
 
-**This is where the subtlety of the whole sequence lives.** Spec 1 deliberately left the fold
-alone so that populating the table did not have to carry any of it. What follows is the cost of
+**This is where the subtlety of the whole sequence lives.** The sweep's write deliberately left the
+fold alone, so that populating the table did not have to carry any of it. What follows is the cost of
 taking the memory copy away.
 
 ## kubecatalog changes
@@ -79,7 +80,7 @@ all — a refused claim, a transient I/O failure — which otherwise waits out
 `catalogResyncInterval`'s ten minutes.
 
 **Detecting the wipe here is what makes every wipe self-healing**, rather than each wiper having to
-remember to poke the catalog — so **spec 1's `Wake` call in `Caches().Clear` comes back out**. The
+remember to poke the catalog — so **the `Wake` call in `Caches().Clear` comes back out**. The
 `Wake` seam itself stays; what goes is the caller, along with the assumption that a wiper knows the
 catalog exists.
 
@@ -101,7 +102,7 @@ the sweep, which rewrites the rows idempotently over what the previous process l
    value. Tests pin that a compacted subject's later passes are silent — recomputing a fingerprint
    from an absent kind list would hash an empty slice and fire a spurious signal.
 3. The fold: the `OpenExisting` read (error before `ok`), the fingerprint fork, children from rows,
-   the wipe path's wake-plus-requeue, and removing spec 1's `Caches().Clear` wake. Tests pin:
+   the wipe path's wake-plus-requeue, and removing the `Caches().Clear` wake. Tests pin:
    children rebuilt from disk with no kinds in memory, a drained name's retry converging, and the
    wipe path leaving children untouched — the Clear-recovery sequence end to end (clear → mismatch
    → wake → sweep rewrites → children converge).

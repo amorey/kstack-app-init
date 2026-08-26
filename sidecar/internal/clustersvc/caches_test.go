@@ -813,6 +813,25 @@ func TestCachesClearStopsTheWorkersThenClearsThenRequeues(t *testing.T) {
 	assert.Equal(t, []int64{int64(cacheID)}, fleet.heldCaches, "the clear ran outside the hold")
 }
 
+// A clear empties the catalog rows too, and nothing else would put them back before the
+// sweep's own interval — so it asks for the sweep. After the clear, never before: a wake
+// ahead of it would have the sweep write the rows the clear then deletes, leaving the
+// table empty for a full interval.
+func TestCachesClearWakesTheSweeperAfterTheClear(t *testing.T) {
+	d, cacheID := twoCachesTwoResources(t)
+	store := kubestoreFake(d)
+	var order []string
+	store.onClear = func(int64) { order = append(order, "clear") }
+	f := sweeper(d)
+	f.onWake = func(string) { order = append(order, "wake") }
+
+	_, err := serviceOver(t, d).Caches().Clear(context.Background(), cacheID)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{ClusterCachedCatalogName(beehive.ObjectID(cacheID))}, f.woken)
+	assert.Equal(t, []string{"clear", "wake"}, order, "the sweeper was woken into the clear")
+}
+
 // The kinds' own passes are what re-arm their workers, so a clear asks for them — and
 // a requeue that cannot be delivered costs latency rather than the clear: the kind's
 // resync runs the same pass.

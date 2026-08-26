@@ -96,16 +96,6 @@ func (w deltaWatch[Spec, Status, Frame]) streamList(ctx context.Context, src *be
 	})
 }
 
-// streamEmpty is the snapshot of a collection that definitively has none: the bookmark alone,
-// then the stream ends. For a scope that can never be filled — never for one whose anchor has
-// merely not been created yet, which is a wait: see pumpChanges.
-func (w deltaWatch[Spec, Status, Frame]) streamEmpty(ctx context.Context) *Stream[Frame] {
-	return NewStream(ctx, func(ctx context.Context, out chan<- Frame) error {
-		sendFrame(ctx, out, w.bookmark)
-		return nil
-	})
-}
-
 // pumpChanges is pump for a source opened AFTER this stream's bookmark went out: its
 // snapshot is reported as ordinary Added frames and its own bookmark is not sent, since a
 // second one would claim a snapshot boundary the consumer has already been given.

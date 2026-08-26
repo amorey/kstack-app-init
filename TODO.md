@@ -181,6 +181,30 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
     and a cache that has been through a relist or two. The numbers that matter are file size versus
     rows held, and whether a vacuum sweep is visible as sync latency.
 
+- **A relist re-downloads bodies the cache already holds.** `syncer.attempt`
+  (`sidecar/internal/clustersvc/internal/kubesync/sync.go`) resumes a warm kind from its stored
+  cookie and never lists — but when the server refuses the position, it falls to `coldSync`, which
+  pages the whole collection back as full objects. The store already holds
+  `objects.resource_version` per uid, so what moved during the gap is derivable from a
+  metadata-only list: page a `PartialObjectMetadataList`, diff against the stored column, fetch
+  bodies only for the new and moved uids, and delete the uids the list did not carry.
+  - **Not the steady-state path, which is already minimal.** A warm watch carries only the objects
+    that changed, one body each, and each of those bodies is needed — `raw_json` is served
+    verbatim and `extractStatus` reads `.status` for the materialized columns. A metadata-only
+    *watch* would deliver the same events and add a GET per event.
+  - **Weigh:** it trades one streamed list for N round trips, and the QPS bucket lives in
+    `rest.RESTClient`, so those GETs are throttled. Break-even is churn during the gap — and a gap
+    long enough to age out the server's window is long enough for a hot kind to have moved a lot.
+    PartialObjectMetadata carries labels, annotations and managedFields, so the saving on the
+    unchanged rows is a small multiple, not an order of magnitude.
+  - **What it costs structurally:** `coldSync` takes its atomicity from mark-and-sweep over one
+    paged list — every page stamps `updated_at`, `Commit` deletes what is older. A diff-then-fetch
+    pass has to re-derive that boundary, and a failure mid-fetch leaves a mixed-vintage collection.
+    It also needs a second client: `kubeconn.Connection` exposes `Dynamic` only, so this is a
+    `metadata.Interface` over the same `http.Client`, or the lease's identity scoping is lost.
+  - **Measure first:** how often `errExpired` fires per kind, and the churn rate across a gap. The
+    same numbers say whether the cheaper answer is not mirroring kinds nobody opens.
+
 ## Auth
 
 - **OAuth access-token refresh — background/proactive half.** On-demand refresh is done (`sidecar/internal/auth/grant.go` refreshes a lazily-expired token using the stored refresh token). What remains: a proactive/background refresh before expiry rather than only refreshing when a consumer hits an already-expired token.

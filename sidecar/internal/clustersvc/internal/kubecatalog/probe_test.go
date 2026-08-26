@@ -17,13 +17,22 @@ package kubecatalog
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
 
@@ -36,19 +45,31 @@ var (
 // probeOver is a probe whose subject connects and whose sweep answers as given. The watch
 // seams are no-ops: what a run does to the standing watch is service_test.go's to assert,
 // and the watcher itself watcher_test.go's.
-func probeOver(sweep func(*kubeconn.Connection) (Catalog, error)) *catalogProbe {
+func probeOver(sweep func(context.Context, *kubeconn.Connection) (Catalog, error)) *catalogProbe {
 	p := connectingProbe()
 	p.sweep = sweep
 	return p
 }
 
-// connectingProbe is a probe whose subject connects; a test that never sweeps uses it bare.
+// connectingProbe is a probe whose subject connects and whose mirror takes whatever it is
+// given; a test that never sweeps uses it bare.
 func connectingProbe() *catalogProbe {
 	return &catalogProbe{
 		conn:    func(context.Context, string) (*kubeconn.Connection, error) { return &kubeconn.Connection{}, nil },
+		mirror:  func(context.Context, string, Catalog) error { return nil },
 		watch:   func(context.Context, string, *kubeconn.Connection) {},
 		unwatch: func(string) {},
 	}
+}
+
+// mirrored records what each run wrote, so a test can assert the write happened and what
+// it carried.
+type mirrored struct{ writes []Catalog }
+
+// record is the probe's mirror seam over this recorder.
+func (m *mirrored) record(_ context.Context, _ string, c Catalog) error {
+	m.writes = append(m.writes, c)
+	return nil
 }
 
 // run is one pass over prev, standing in for the engine.
@@ -78,7 +99,7 @@ func TestRunSuspendsWithoutAConnection(t *testing.T) {
 // standing answer must survive for the fold to keep converging.
 func TestRunFailsAndCommitsNothingWhenTheSweepFails(t *testing.T) {
 	boom := errors.New("the server rejected our request")
-	p := probeOver(func(*kubeconn.Connection) (Catalog, error) { return Catalog{}, boom })
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{}, boom })
 
 	res, pass := run(t, p, &Catalog{Kinds: []Kind{pods}})
 
@@ -92,7 +113,7 @@ func TestRunFailsAndCommitsNothingWhenTheSweepFails(t *testing.T) {
 // Cancellation is the caller going away, not the cluster refusing — the run records
 // nothing at all rather than opening a failure streak.
 func TestRunSkipsOnCancellation(t *testing.T) {
-	p := probeOver(func(*kubeconn.Connection) (Catalog, error) { return Catalog{}, context.Canceled })
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{}, context.Canceled })
 
 	res, pass := run(t, p, nil)
 
@@ -106,7 +127,7 @@ func TestRunSkipsOnCancellation(t *testing.T) {
 // kind the server started serving does.
 func TestRunCommitsOnlyOnAChange(t *testing.T) {
 	served := []Kind{pods}
-	p := probeOver(func(*kubeconn.Connection) (Catalog, error) {
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) {
 		return Catalog{Kinds: served}, nil
 	})
 
@@ -128,7 +149,7 @@ func TestRunCommitsOnlyOnAChange(t *testing.T) {
 }
 
 func TestRunCommitsAnEmptyFirstAnswer(t *testing.T) {
-	p := probeOver(func(*kubeconn.Connection) (Catalog, error) { return Catalog{}, nil })
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{}, nil })
 
 	_, pass := run(t, p, nil)
 
@@ -141,7 +162,7 @@ func TestRunCommitsAnEmptyFirstAnswer(t *testing.T) {
 // retries sooner than the interval.
 func TestRunCommitsAPartialAnswerAndFails(t *testing.T) {
 	groupErr := errors.New("unable to retrieve the complete list of server APIs")
-	p := probeOver(func(*kubeconn.Connection) (Catalog, error) {
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) {
 		return Catalog{Kinds: []Kind{pods}, Partial: true}, groupErr
 	})
 
@@ -152,6 +173,91 @@ func TestRunCommitsAPartialAnswerAndFails(t *testing.T) {
 	got, committed := pass.Updated()
 	require.True(t, committed, "the partial flag flipping is a change")
 	assert.True(t, got.Partial)
+}
+
+// --- the mirror ---
+
+// The sweep is kind_catalog's one writer, so every answer it produces goes to disk —
+// whether or not it moved. That is what puts a table wiped under the sweep back, with no
+// repair protocol to carry the fact that it was.
+func TestRunWritesEveryAnswerWhetherOrNotItMoved(t *testing.T) {
+	var m mirrored
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{Kinds: []Kind{pods}}, nil })
+	p.mirror = m.record
+
+	_, pass := run(t, p, nil)
+	first, committed := pass.Updated()
+	require.True(t, committed)
+
+	_, pass = run(t, p, &first)
+	_, committed = pass.Updated()
+	require.False(t, committed, "the same answer re-confirmed is not news")
+
+	assert.Equal(t, []Catalog{{Kinds: []Kind{pods}}, {Kinds: []Kind{pods}}}, m.writes,
+		"the second run did not rewrite the rows")
+}
+
+// The write comes first, because a commit is the fold's wake: one over rows that are not
+// there would have the fold converge on a table the write is still catching up to.
+func TestRunCommitsNothingWhenTheWriteFails(t *testing.T) {
+	full := errors.New("database or disk is full")
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{Kinds: []Kind{pods}}, nil })
+	p.mirror = func(context.Context, string, Catalog) error { return full }
+
+	res, pass := run(t, p, nil)
+
+	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, ReasonStoreFailed, res.Reason())
+	assert.ErrorIs(t, res.Err(), full)
+	_, committed := pass.Updated()
+	assert.False(t, committed)
+}
+
+// A failed write outranks a partial answer: nothing was committed at all, and reporting
+// the incomplete answer would point a reader at an api group that is not the problem.
+func TestAFailedWriteOutranksAPartialAnswer(t *testing.T) {
+	full := errors.New("database or disk is full")
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) {
+		return Catalog{Kinds: []Kind{pods}, Partial: true}, errors.New("unable to retrieve the complete list of server APIs")
+	})
+	p.mirror = func(context.Context, string, Catalog) error { return full }
+
+	res, pass := run(t, p, nil)
+
+	assert.Equal(t, ReasonStoreFailed, res.Reason())
+	_, committed := pass.Updated()
+	assert.False(t, committed)
+}
+
+// A removed store is a cache being torn down, with this subject's Forget on its way:
+// there is nothing to write into and nothing worth reporting, so the run parks rather
+// than opening a failure streak against a record that is going.
+func TestRunSuspendsWhenTheStoreIsRemoved(t *testing.T) {
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{Kinds: []Kind{pods}}, nil })
+	p.mirror = func(context.Context, string, Catalog) error {
+		return fmt.Errorf("open cache 1: %w", kubestore.ErrRemoved)
+	}
+
+	res, pass := run(t, p, nil)
+
+	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
+	assert.Equal(t, ReasonStoreRemoved, res.Reason())
+	_, committed := pass.Updated()
+	assert.False(t, committed)
+}
+
+// A failed sweep writes nothing: an empty answer is not "serves nothing", and rows laid
+// down off one would prune a catalog the run never read.
+func TestAFailedSweepWritesNothing(t *testing.T) {
+	var m mirrored
+	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) {
+		return Catalog{}, errors.New("the server rejected our request")
+	})
+	p.mirror = m.record
+
+	run(t, p, &Catalog{Kinds: []Kind{pods}})
+
+	assert.Empty(t, m.writes)
 }
 
 // --- discovery filtering ---
@@ -179,4 +285,129 @@ func TestServedKindsFiltersWhatCannotBeMirrored(t *testing.T) {
 		{GroupVersion: "v1", Kind: "Event", Resource: "events", Namespaced: true},
 		{GroupVersion: "v1", Kind: "Pod", Resource: "pods", Namespaced: true},
 	}, got, "sorted, so a sweep is deterministic")
+}
+
+// --- CRDs ---
+
+// fakeDiscovery answers ServerPreferredResources and nothing else; the embedded interface
+// is nil, so a call this package does not make panics rather than passing silently.
+type fakeDiscovery struct {
+	discovery.DiscoveryInterface
+	lists []*metav1.APIResourceList
+}
+
+func (f fakeDiscovery) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
+	return f.lists, nil
+}
+
+// crd is one CustomResourceDefinition body, carrying only what the match reads.
+func crd(group, plural string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata":   map[string]any{"name": plural + "." + group},
+		"spec": map[string]any{
+			"group": group,
+			"names": map[string]any{"plural": plural},
+		},
+	}}
+}
+
+// servingDynamic is a cluster serving these CustomResourceDefinitions.
+func servingDynamic(t *testing.T, crds ...*unstructured.Unstructured) *dynamicfake.FakeDynamicClient {
+	t.Helper()
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{crdGVR: "CustomResourceDefinitionList"})
+	client.PrependReactor("list", crdGVR.Resource, func(k8stesting.Action) (bool, runtime.Object, error) {
+		list := &unstructured.UnstructuredList{}
+		list.SetAPIVersion("apiextensions.k8s.io/v1")
+		list.SetKind("CustomResourceDefinitionList")
+		for _, c := range crds {
+			list.Items = append(list.Items, *c)
+		}
+		return true, list, nil
+	})
+	return client
+}
+
+// refusingDynamic is a cluster whose credentials cannot list CustomResourceDefinitions.
+func refusingDynamic(t *testing.T) *dynamicfake.FakeDynamicClient {
+	t.Helper()
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{crdGVR: "CustomResourceDefinitionList"})
+	client.PrependReactor("list", crdGVR.Resource, func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(crdGVR.GroupResource(), "", errors.New("nope"))
+	})
+	return client
+}
+
+// One CRD serves several versions, so the match is on group and plural: keying on the
+// version would leave every kind discovered at another one reading as built-in.
+func TestMarkCRDsMatchesOnGroupAndPlural(t *testing.T) {
+	kinds := []Kind{
+		{GroupVersion: "v1", Kind: "Pod", Resource: "pods"},
+		{GroupVersion: "example.com/v2", Kind: "Widget", Resource: "widgets"},
+	}
+
+	markCRDs(kinds, []crdRef{{group: "example.com", plural: "widgets"}})
+
+	assert.Equal(t, []Kind{
+		{GroupVersion: "v1", Kind: "Pod", Resource: "pods"},
+		{GroupVersion: "example.com/v2", Kind: "Widget", Resource: "widgets", IsCRD: true},
+	}, kinds, "the CRD was discovered at a version its definition does not name")
+}
+
+// The whole sweep, with a cluster serving one custom resource and one built-in.
+func TestDiscoverServedKindsMarksTheCustomResources(t *testing.T) {
+	conn := &kubeconn.Connection{
+		Discovery: fakeDiscovery{lists: []*metav1.APIResourceList{
+			{GroupVersion: "v1", APIResources: []metav1.APIResource{
+				{Name: "pods", Kind: "Pod", Namespaced: true, Verbs: []string{"list", "watch"}},
+			}},
+			{GroupVersion: "example.com/v1", APIResources: []metav1.APIResource{
+				{Name: "widgets", Kind: "Widget", Namespaced: true, Verbs: []string{"list", "watch"}},
+			}},
+		}},
+		Dynamic: servingDynamic(t, crd("example.com", "widgets")),
+	}
+
+	got, err := discoverServedKinds(context.Background(), conn)
+
+	require.NoError(t, err)
+	assert.Equal(t, []Kind{
+		{GroupVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Namespaced: true, IsCRD: true},
+		{GroupVersion: "v1", Kind: "Pod", Resource: "pods", Namespaced: true},
+	}, got.Kinds)
+}
+
+// Listing CRDs is a cluster-scoped read RBAC commonly denies, and discovery is useful
+// without it: a refusal leaves every kind reading as built-in rather than taking the
+// catalog away from a user the sweep otherwise serves.
+func TestARefusedCRDListIsNotAFailedSweep(t *testing.T) {
+	conn := &kubeconn.Connection{
+		Discovery: fakeDiscovery{lists: []*metav1.APIResourceList{{
+			GroupVersion: "example.com/v1",
+			APIResources: []metav1.APIResource{
+				{Name: "widgets", Kind: "Widget", Namespaced: true, Verbs: []string{"list", "watch"}},
+			},
+		}}},
+		Dynamic: refusingDynamic(t),
+	}
+
+	got, err := discoverServedKinds(context.Background(), conn)
+
+	require.NoError(t, err)
+	assert.False(t, got.Partial, "a refused CRD list made the answer partial")
+	require.Len(t, got.Kinds, 1)
+	assert.False(t, got.Kinds[0].IsCRD)
+}
+
+// The bit is part of the answer, so a cluster whose CRD list starts answering is news
+// even though the kinds themselves have not moved.
+func TestKindsFingerprintCoversTheCRDBit(t *testing.T) {
+	built := Kind{GroupVersion: "example.com/v1", Kind: "Widget", Resource: "widgets"}
+	custom := built
+	custom.IsCRD = true
+
+	assert.NotEqual(t, kindsFingerprint([]Kind{built}), kindsFingerprint([]Kind{custom}))
 }

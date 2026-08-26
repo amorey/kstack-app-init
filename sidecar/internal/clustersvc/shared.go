@@ -90,11 +90,15 @@ type kubeconnService interface {
 // which only the catalog's reconcile decides. Read is the standing answer that
 // reconcile folds, and Subscribe feeds the trigger.
 //
-// Track names the server as well as the context, because a context can be re-pointed at
-// another cluster and the sweeper must not read that one's kinds into this cache.
+// Track's params name the server as well as the context, because a context can be
+// re-pointed at another cluster and the sweeper must not read that one's kinds into this
+// cache — and the cache, because the sweep writes the kinds it finds into that cache's
+// store. Wake asks for a sweep now: what a wiper calls so the catalog rows it emptied are
+// rewritten in seconds rather than at the sweep's own interval.
 type kubecatalogService interface {
-	Track(id, contextName, serverUID string)
+	Track(id string, p kubecatalog.Params)
 	Forget(id string)
+	Wake(id string)
 	Read(id string) (kubecatalog.Observation, bool)
 	Subscribe() kubecatalog.Subscription
 }
@@ -369,6 +373,11 @@ const (
 	// ReasonDiscoveryFailed: the discovery request itself failed, so nothing is
 	// known about the served kinds this pass. The existing children are left alone.
 	ReasonDiscoveryFailed = "DiscoveryFailed"
+	// ReasonStoreUnavailable: discovery answered and the cache's own store would not
+	// take the answer, so nothing was committed off it. Neither a wait nor a discovery
+	// failure — pointing a user at the API server is the wrong remedy — and the sweep is
+	// retrying on its own ladder.
+	ReasonStoreUnavailable = "StoreUnavailable"
 	// ReasonIdentityMismatch: the connection behind this record's context does not answer
 	// as the cluster the record is for — re-pointed at another, or replaced behind an
 	// endpoint that never moved. Nothing was asked, so it is neither a failed request nor

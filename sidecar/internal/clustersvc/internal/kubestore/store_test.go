@@ -707,8 +707,8 @@ func TestAnEmptyPageDoesNotNotify(t *testing.T) {
 
 // A kind's rows are keyed by Kind, and the caller knows which one — a teardown must not
 // depend on the catalog to find them. Nothing writes catalog rows on the sync path (the
-// discovery fold owns that table), so a clear that resolved through it would leave every
-// row, edge and count behind for a kind that stopped being synced.
+// sweep owns that table), so a clear that resolved through it would leave every row, edge
+// and count behind for a kind that stopped being synced.
 func TestClearKindDeletesRowsWithNoCatalogRow(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
@@ -724,4 +724,19 @@ func TestClearKindDeletesRowsWithNoCatalogRow(t *testing.T) {
 	_, ok, err := s.Cookie(ctx, "v1", "pods")
 	require.NoError(t, err)
 	assert.False(t, ok)
+}
+
+// The catalog is what the CLUSTER serves, and clearing a kind's cache does not stop it
+// being served — a user emptying one kind must not have it vanish from the nav until the
+// next sweep. The row leaves through the sweep's prune alone.
+func TestClearKindKeepsTheCatalogRow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+
+	require.NoError(t, s.ClearKind(ctx, podKind))
+
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM objects`))
+	assert.Equal(t, []KindRow{podRow}, catalogRows(t, s))
 }

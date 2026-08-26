@@ -24,10 +24,12 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
 
@@ -60,6 +62,15 @@ const (
 	// committed — a group that went quiet has not stopped being served — and the run
 	// fails, so the ladder retries sooner than the interval.
 	ReasonSweepPartial probe.Reason = "SweepPartial"
+	// ReasonStoreFailed: the answer is good and the mirror would not take it, so nothing
+	// was committed and nobody was signalled. It outranks ReasonSweepPartial: a partial
+	// answer whose write failed committed nothing at all, and naming the incomplete
+	// answer would point a reader at an api group that is not the problem.
+	ReasonStoreFailed probe.Reason = "StoreFailed"
+	// ReasonStoreRemoved: the cache is being torn down and this subject's Forget is on
+	// its way. There is nothing to write into and nothing worth reporting, so the run
+	// suspends and lets the teardown disarm it.
+	ReasonStoreRemoved probe.Reason = "StoreRemoved"
 )
 
 // Kind is one served kind a cache can mirror, at the version the server prefers.
@@ -68,6 +79,9 @@ type Kind struct {
 	Kind         string
 	Resource     string
 	Namespaced   bool
+	// IsCRD marks a kind served by a CustomResourceDefinition rather than built in.
+	// Best-effort: a cluster that refuses the CRD list reads every kind as built-in.
+	IsCRD bool
 }
 
 // Catalog is one sweep's answer: the mirrorable kinds, sorted, and whether the list is
@@ -86,6 +100,12 @@ func (c Catalog) equal(o Catalog) bool {
 // the sweep enumerates is a remote server's and nothing here sees a CRD land.
 const sweepInterval = 10 * time.Minute
 
+// sweepRetryBase starts the failure ladder, capped at sweepInterval. Above the engine's
+// default second, because what a failure retries here is a full ServerPreferredResources
+// — dozens of round trips over every group-version, paid for at someone else's cluster —
+// and promptness comes from the watch, never from the ladder.
+const sweepRetryBase = 30 * time.Second
+
 // sweepTimeout bounds one run's context. It cannot cancel the sweep itself — client-go's
 // discovery calls take no context — so the real per-request bound is the discovery
 // client's own timeout; this is generous so a healthy long sweep is not cut.
@@ -98,7 +118,11 @@ type catalogProbe struct {
 	// the seam a test substitutes for the API server. Production wires connFor and
 	// discoverServedKinds; nothing else may be nil here.
 	conn  func(ctx context.Context, id string) (*kubeconn.Connection, error)
-	sweep func(*kubeconn.Connection) (Catalog, error)
+	sweep func(ctx context.Context, conn *kubeconn.Connection) (Catalog, error)
+	// mirror writes one answer into the subject's cache store, the seam the Service wires
+	// to the store manager: the sweep is this table's one writer, so the rows are the
+	// leaf's own to lay down.
+	mirror func(ctx context.Context, id string, c Catalog) error
 	// watch and unwatch are the standing watch's lifetime, which is the Service's to hold —
 	// establishing one has to be measured against whether the subject is still tracked. watch
 	// returns once the watch is open, bounded by ctx.
@@ -129,7 +153,7 @@ func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe
 	// over an aggregated API server that is down is not a short window.
 	p.watch(ctx, pass.Subject(), conn)
 
-	found, err := p.sweep(conn)
+	found, err := p.sweep(ctx, conn)
 	if err != nil && !found.Partial {
 		if errors.Is(err, context.Canceled) {
 			return probe.Skip()
@@ -138,6 +162,17 @@ func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe
 		// and the ladder is what retries a server that keeps refusing a sweep this
 		// expensive.
 		return probe.Fail(ReasonSweepFailed, err)
+	}
+
+	// The rows go down before anything is committed: a commit is the fold's wake, and
+	// waking it over rows that are not there yet would have it converge on a table the
+	// write is still catching up to. Unconditional, whether or not the answer moved,
+	// which is what puts a wiped table back with no repair protocol.
+	if err := p.mirror(ctx, pass.Subject(), found); err != nil {
+		if errors.Is(err, kubestore.ErrRemoved) {
+			return probe.Suspend(ReasonStoreRemoved, err.Error())
+		}
+		return probe.Fail(ReasonStoreFailed, err)
 	}
 
 	// Commit only on a change — a committed value is the fold's wake — and on the first
@@ -157,14 +192,66 @@ func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe
 // aggregated API server that is down fails its own group and no other, and client-go
 // hands back the groups that did answer alongside the error naming the ones that did
 // not — so a partial Catalog comes back with the error still attached.
-func discoverServedKinds(conn *kubeconn.Connection) (Catalog, error) {
+func discoverServedKinds(ctx context.Context, conn *kubeconn.Connection) (Catalog, error) {
 	lists, err := conn.Discovery.ServerPreferredResources()
 
 	var groupErr *discovery.ErrGroupDiscoveryFailed
 	if err != nil && !errors.As(err, &groupErr) {
 		return Catalog{}, err
 	}
-	return Catalog{Kinds: servedKinds(lists), Partial: groupErr != nil}, err
+	kinds := servedKinds(lists)
+
+	// Best-effort, and deliberately not part of the verdict: listing CRDs is a
+	// cluster-scoped read RBAC commonly denies, and failing the sweep over it would take
+	// discovery away from users this one otherwise serves. A refusal leaves every kind
+	// reading as built-in.
+	if crds, crdErr := listCRDs(ctx, conn); crdErr == nil {
+		markCRDs(kinds, crds)
+	}
+	return Catalog{Kinds: kinds, Partial: groupErr != nil}, err
+}
+
+// crdRef is one CustomResourceDefinition as the match needs it. The version is
+// deliberately absent: one definition serves several, and a kind discovered at any of
+// them is the same custom resource.
+type crdRef struct {
+	group  string
+	plural string
+}
+
+// listCRDs enumerates the cluster's CustomResourceDefinitions, over the same collection
+// the watcher already streams.
+func listCRDs(ctx context.Context, conn *kubeconn.Connection) ([]crdRef, error) {
+	list, err := conn.Dynamic.Resource(crdGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]crdRef, 0, len(list.Items))
+	for _, item := range list.Items {
+		group, _, _ := unstructured.NestedString(item.Object, "spec", "group")
+		plural, _, _ := unstructured.NestedString(item.Object, "spec", "names", "plural")
+		if group != "" && plural != "" {
+			refs = append(refs, crdRef{group: group, plural: plural})
+		}
+	}
+	return refs, nil
+}
+
+// markCRDs sets the bit on every kind one of these definitions serves, in place.
+func markCRDs(kinds []Kind, crds []crdRef) {
+	defined := make(map[crdRef]struct{}, len(crds))
+	for _, c := range crds {
+		defined[c] = struct{}{}
+	}
+	for i, k := range kinds {
+		gv, err := schema.ParseGroupVersion(k.GroupVersion)
+		if err != nil {
+			continue
+		}
+		if _, ok := defined[crdRef{group: gv.Group, plural: k.Resource}]; ok {
+			kinds[i].IsCRD = true
+		}
+	}
 }
 
 // servedKinds filters a discovery answer down to what a cache can mirror, sorted so a

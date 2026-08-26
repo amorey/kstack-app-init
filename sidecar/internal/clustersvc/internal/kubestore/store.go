@@ -378,14 +378,14 @@ func (s *Store) PruneEvents(ctx context.Context, window int) (int, error) {
 	return int(n), nil
 }
 
-// ClearKind deletes one kind's rows, everything hanging off them, its catalog row, and
-// its cookie, in one transaction — for a kind that has stopped being synced.
+// ClearKind deletes one kind's rows, everything hanging off them, and its cookie, in one
+// transaction — for a kind that has stopped being synced. The catalog row is not one of
+// them: that table says what the cluster serves, and its one writer is the sweep.
 //
 // It takes the whole Kind because the rows are keyed by the singular while a watch is
 // opened on the plural, and **the caller is what knows both**: the record carries the
-// Kind, and resolving it here through kind_catalog would tie a teardown to a table whose
-// one writer is the discovery fold, leaving every row behind for a kind the fold has not
-// registered.
+// Kind, and resolving it here through kind_catalog would tie a teardown to a table the
+// sweep owns, leaving every row behind for a kind no sweep has reached yet.
 func (s *Store) ClearKind(ctx context.Context, k Kind) error {
 	f, err := s.file()
 	if err != nil {
@@ -427,10 +427,8 @@ func (s *Store) ClearKind(ctx context.Context, k Kind) error {
 		k.APIVersion, k.Kind); err != nil {
 		return fmt.Errorf("clear kind: delete counts: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM kind_catalog WHERE api_version = ? AND resource = ?`,
-		k.APIVersion, k.Resource); err != nil {
-		return fmt.Errorf("clear kind: delete catalog: %w", err)
-	}
+	// The catalog row stays: it says the CLUSTER serves this kind, which clearing the
+	// cache does not change. SyncKinds' prune is what takes one out.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_meta WHERE key = ?`,
 		cookieKey(k.APIVersion, k.Resource)); err != nil {
 		return fmt.Errorf("clear kind: delete cookie: %w", err)
