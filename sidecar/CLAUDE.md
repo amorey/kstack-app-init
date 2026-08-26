@@ -71,8 +71,10 @@ That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **A cache now exists at runtime**: the serverUID probe writes `status.server.uid`, which is what
 `ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
 one — and a `ClusterCachedCatalog` beneath it. **The catalog's pass discovers kinds**, so a
-`ClusterCachedResource` exists per kind the cluster serves. Nothing below that: no sync worker and
-no on-disk cache, so `CachedResources()` and `CachedData()` still serve nothing.
+`ClusterCachedResource` exists per kind the cluster serves, and its six reads answer.
+Nothing below that: no sync worker and no on-disk cache, so `CachedResources().Clear` and the whole
+`CachedData()` family still serve nothing, and every `ClusterCachedResource` carries a `Synced`
+condition nothing writes.
 
 **A read reports the store as it is, and never filters.** A record awaiting deletion is served like
 any other, carrying the tombstone (`deletionRequestedAt`) the consumer decides on — rendering it
@@ -802,9 +804,12 @@ method with a selector argument would undo it.
 
 **`By*` names the scope the caller passes, not the owner edge.** They coincide for `Caches`
 (`ByCluster`) and `CachedCatalogs` (`ByCache`), but `CachedResources().ListByCache` crosses the
-catalog that actually owns those records — the service resolves that anchor precisely so callers,
-who only ever hold a cache id, never have to. The schema keeps the catalog out of the path for the
-same reason.
+catalog that actually owns those records — `service.catalogIDFor` resolves that anchor from the
+cache id (a point read on the derived name), precisely so callers, who only ever hold a cache id,
+never have to. The schema keeps the catalog out of the path for the same reason. **A cache with no
+anchor yet reads empty, never an error** — nothing can hang off an anchor that does not exist — and
+the scoped watch answers it with `deltaWatch.streamEmpty`, the bookmark alone, since an unopened
+collection is definitively empty rather than pending.
 
 The interface is designed complete rather than caller-driven: the backend is a shell, so the
 methods are the specification and a missing frontend caller is not an argument against one. Fill

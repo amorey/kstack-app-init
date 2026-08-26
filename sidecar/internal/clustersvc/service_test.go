@@ -166,22 +166,16 @@ func TestUnimplementedBoundaryPanics(t *testing.T) {
 	var id ObjectID = 1
 
 	calls := map[string]func(){
-		"Caches().WatchStats":            func() { svc.Caches().WatchStats(ctx, id, id) },
-		"Caches().WatchHealth":           func() { svc.Caches().WatchHealth(ctx) },
-		"Caches().Clear":                 func() { svc.Caches().Clear(ctx, id) },
-		"CachedResources().Get":          func() { svc.CachedResources().Get(ctx, id) },
-		"CachedResources().List":         func() { svc.CachedResources().List(ctx) },
-		"CachedResources().Watch":        func() { svc.CachedResources().Watch(ctx, id) },
-		"CachedResources().WatchList":    func() { svc.CachedResources().WatchList(ctx) },
-		"CachedResources().ListByCache":  func() { svc.CachedResources().ListByCache(ctx, id) },
-		"CachedResources().WatchByCache": func() { svc.CachedResources().WatchByCache(ctx, id) },
-		"CachedResources().Clear":        func() { svc.CachedResources().Clear(ctx, id) },
-		"CachedData().ListKinds":         func() { svc.CachedData().ListKinds(ctx, id, id) },
-		"CachedData().WatchKinds":        func() { svc.CachedData().WatchKinds(ctx, id, id) },
-		"CachedData().WatchObjects":      func() { svc.CachedData().WatchObjects(ctx, id, id, "v1", "pods") },
-		"CachedData().WatchEvents":       func() { svc.CachedData().WatchEvents(ctx, id, id) },
-		"ListEvents":                     func() { svc.ListEvents(ctx, id, nil, nil) },
-		"WatchEvents":                    func() { svc.WatchEvents(ctx, id, nil) },
+		"Caches().WatchStats":       func() { svc.Caches().WatchStats(ctx, id, id) },
+		"Caches().WatchHealth":      func() { svc.Caches().WatchHealth(ctx) },
+		"Caches().Clear":            func() { svc.Caches().Clear(ctx, id) },
+		"CachedResources().Clear":   func() { svc.CachedResources().Clear(ctx, id) },
+		"CachedData().ListKinds":    func() { svc.CachedData().ListKinds(ctx, id, id) },
+		"CachedData().WatchKinds":   func() { svc.CachedData().WatchKinds(ctx, id, id) },
+		"CachedData().WatchObjects": func() { svc.CachedData().WatchObjects(ctx, id, id, "v1", "pods") },
+		"CachedData().WatchEvents":  func() { svc.CachedData().WatchEvents(ctx, id, id) },
+		"ListEvents":                func() { svc.ListEvents(ctx, id, nil, nil) },
+		"WatchEvents":               func() { svc.WatchEvents(ctx, id, nil) },
 	}
 
 	for name, call := range calls {

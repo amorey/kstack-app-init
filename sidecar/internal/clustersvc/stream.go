@@ -96,6 +96,16 @@ func (w deltaWatch[Spec, Status, Frame]) streamList(ctx context.Context, src *be
 	})
 }
 
+// streamEmpty is the snapshot of a collection that definitively has none: the bookmark alone,
+// then the stream ends. For a scope whose anchor does not exist yet — nothing can be added to
+// it without the anchor, so there is nothing to stay open for.
+func (w deltaWatch[Spec, Status, Frame]) streamEmpty(ctx context.Context) *Stream[Frame] {
+	return NewStream(ctx, func(ctx context.Context, out chan<- Frame) error {
+		sendFrame(ctx, out, w.bookmark)
+		return nil
+	})
+}
+
 // pump streams a snapshot, the bookmark closing it, then every change above it.
 //
 // beehive hands the snapshot complete as of a resource version, with changes carrying

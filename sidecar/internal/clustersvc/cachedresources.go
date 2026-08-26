@@ -20,6 +20,8 @@ package clustersvc
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/amorey/beehive"
@@ -101,32 +103,137 @@ type SyncedKindRef struct {
 	Resource   string
 }
 
+// toClusterCachedResource builds the served record from the stored object.
+func toClusterCachedResource(obj *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) (*ClusterCachedResource, error) {
+	owner, err := toOwnerRef(obj)
+	if err != nil {
+		return nil, err
+	}
+	return &ClusterCachedResource{
+		ID:         ClusterCachedResourceID(obj.ID),
+		Owner:      owner,
+		Spec:       obj.Spec,
+		Conditions: obj.Conditions,
+	}, nil
+}
+
+// toClusterCachedResources projects a whole read. beehive lists by id, which is creation
+// order, and that is the order this family promises — so nothing here sorts.
+func toClusterCachedResources(objs []*beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) ([]*ClusterCachedResource, error) {
+	resources := make([]*ClusterCachedResource, 0, len(objs))
+	for _, obj := range objs {
+		resource, err := toClusterCachedResource(obj)
+		if err != nil {
+			return nil, err
+		}
+		resources = append(resources, resource)
+	}
+	return resources, nil
+}
+
 func (a cachedResourcesAPI) Get(ctx context.Context, id ClusterCachedResourceID) (*ClusterCachedResource, error) {
-	panic("not implemented")
+	obj, err := a.s.resourceClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
+	if err != nil {
+		// A caller holds ids from watch frames, so a record collected in between is an
+		// ordinary race rather than a bad request.
+		if errors.Is(err, beehive.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get cached resource %d: %w", id, err)
+	}
+	return toClusterCachedResource(obj)
 }
 
 func (a cachedResourcesAPI) List(ctx context.Context) ([]*ClusterCachedResource, error) {
-	panic("not implemented")
+	objs, err := a.s.resourceClient.List(ctx, beehive.LoadOwner())
+	if err != nil {
+		return nil, fmt.Errorf("list cached resources: %w", err)
+	}
+	return toClusterCachedResources(objs)
 }
 
 func (a cachedResourcesAPI) Watch(ctx context.Context, id ClusterCachedResourceID) (*Stream[ClusterCachedResourceWatchFrame], error) {
-	panic("not implemented")
+	src, err := a.s.resourceClient.Watch(ctx, beehive.ObjectID(id), loadResourceOwner)
+	if err != nil {
+		return nil, fmt.Errorf("watch cached resource %d: %w", id, err)
+	}
+
+	return resourceWatch.streamOne(ctx, src), nil
 }
 
+// WatchList is the fleet's largest stream by an order of magnitude — a record per served
+// kind per cache. Served because the boundary fills its matrix, but a view scoped to one
+// cache opens WatchByCache instead; the schema exposes only the scoped one.
 func (a cachedResourcesAPI) WatchList(ctx context.Context) (*Stream[ClusterCachedResourceWatchFrame], error) {
-	panic("not implemented")
+	src, err := a.s.resourceClient.WatchList(ctx, loadResourceOwner)
+	if err != nil {
+		return nil, fmt.Errorf("watch cached resources: %w", err)
+	}
+
+	return resourceWatch.streamList(ctx, src), nil
 }
 
 func (a cachedResourcesAPI) ListByCache(ctx context.Context, cacheID ClusterCacheID) ([]*ClusterCachedResource, error) {
-	panic("not implemented")
+	catalogID, ok, err := a.s.catalogIDFor(ctx, cacheID)
+	if err != nil || !ok {
+		return nil, err
+	}
+
+	objs, err := a.s.resourceClient.ListOwnedObjects(ctx, catalogID, beehive.LoadOwner())
+	if err != nil {
+		return nil, fmt.Errorf("list cache %d cached resources: %w", cacheID, err)
+	}
+	return toClusterCachedResources(objs)
 }
 
 func (a cachedResourcesAPI) WatchByCache(ctx context.Context, cacheID ClusterCacheID) (*Stream[ClusterCachedResourceWatchFrame], error) {
-	panic("not implemented")
+	catalogID, ok, err := a.s.catalogIDFor(ctx, cacheID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		// A cache with no anchor is definitively empty, not pending — so the snapshot is
+		// closed rather than held, and a consumer renders "no kinds" instead of loading
+		// for as long as the cache takes to reconcile.
+		return resourceWatch.streamEmpty(ctx), nil
+	}
+
+	src, err := a.s.resourceClient.WatchOwnedObjects(ctx, catalogID, loadResourceOwner)
+	if err != nil {
+		return nil, fmt.Errorf("watch cache %d cached resources: %w", cacheID, err)
+	}
+
+	return resourceWatch.streamList(ctx, src), nil
 }
 
 func (a cachedResourcesAPI) Clear(ctx context.Context, id ClusterCachedResourceID) (*ClusterCachedResource, error) {
 	panic("not implemented")
+}
+
+// loadResourceOwner eager-loads the owner edge every frame carries as its join key; beehive
+// batches the lookup per change batch, so a watch does not become an N+1.
+var loadResourceOwner = beehive.WithLoads(beehive.LoadOwner())
+
+// resourceWatch projects this kind into delta frames. The departure carries the spec but no
+// owner: the row is gone, so beehive loads no edge for it and reading one would fail the whole
+// stream — and a consumer keys the record it is dropping by id anyway.
+var resourceWatch = deltaWatch[ClusterCachedResourceSpec, ClusterCachedResourceStatus, ClusterCachedResourceWatchFrame]{
+	frame: func(t DeltaFrameType, obj *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) (ClusterCachedResourceWatchFrame, error) {
+		resource, err := toClusterCachedResource(obj)
+		if err != nil {
+			return ClusterCachedResourceWatchFrame{}, err
+		}
+		return ClusterCachedResourceWatchFrame{Type: t, Resource: resource}, nil
+	},
+	departed: func(change beehive.ObjectChange[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) ClusterCachedResourceWatchFrame {
+		resource := &ClusterCachedResource{ID: ClusterCachedResourceID(change.ID)}
+		if obj := change.Object; obj != nil {
+			resource.Spec = obj.Spec
+			resource.Conditions = obj.Conditions
+		}
+		return ClusterCachedResourceWatchFrame{Type: DeltaFrameDeleted, Resource: resource}
+	},
+	bookmark: ClusterCachedResourceWatchFrame{Type: DeltaFrameBookmark},
 }
 
 // clusterCachedResourceController reconciles one synced kind: start, stop, and
