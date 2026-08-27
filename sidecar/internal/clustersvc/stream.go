@@ -28,7 +28,14 @@ import (
 //
 // The rule is the SOURCE, not the shape: a watch over a fallible upstream returns a
 // Stream, gauges included. One that retries forever and has no terminal failure to
-// report may stay a plain channel — which is why the Data family does.
+// report may stay a plain channel.
+//
+// **A clean end is a nil Err, and some expected endings are clean.** The cached-data
+// watches end that way when their cache is cleared: a user pressing a button is not a
+// broken watch, and reporting one would put an error in front of them per open watch. The
+// reason the "silent broken watch" argument above does not cover it is that the client's
+// reconnect succeeds — there is no invisible retry loop, and the next snapshot is the
+// report. Err is for a source that is actually broken.
 type Stream[T any] struct {
 	Frames <-chan T
 	err    atomic.Pointer[error]

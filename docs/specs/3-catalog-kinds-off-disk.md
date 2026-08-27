@@ -6,9 +6,9 @@ status: Planned
 
 # Catalog kinds off disk
 
-> **Build order — 3.** Prerequisite: [spec 2](2-cached-data-reads.md) for the `Kinds(ctx)` read
-> this fold reconciles from. The rows are already there — the sweep writes them
-> (→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)).
+> **Build order — 3.** No prerequisites: the sweep writes the rows
+> (→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)) and `Store.Kinds(ctx)` reads them back
+> (→ [ADR](../adr/2026-08-26-cached-data-read-loop.md)), which is what this fold reconciles from.
 > **Deferrable** — nothing downstream waits on it, and skipping it leaves today's behaviour.
 > Next: [Catalog sweep cadence](4-catalog-sweep-cadence.md).
 

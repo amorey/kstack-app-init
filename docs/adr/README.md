@@ -93,4 +93,5 @@ usually just documentation in the wrong place.
 | 2026-08-26 | [Mirror each kind with a standing worker, not a probe](2026-08-26-sync-workers-not-probes.md) | sidecar | Accepted |
 | 2026-08-26 | [The cache store signals with a coalesced ping, not a row delta](2026-08-26-store-change-ping-bus.md) | sidecar | Accepted |
 | 2026-08-26 | [The sweep writes kind_catalog, ungated by the change guard](2026-08-26-sweep-writes-the-catalog.md) | sidecar | Accepted |
+| 2026-08-26 | [Cached-data watches ping, re-read and diff, and a cleared cache ends one cleanly](2026-08-26-cached-data-read-loop.md) | sidecar | Accepted |
 | 2026-08-27 | [A recorded identity conflict rebuilds the connection, woken by an edge](2026-08-27-identity-driven-retirement.md) | sidecar | Accepted |

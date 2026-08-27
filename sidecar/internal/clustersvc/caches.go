@@ -319,13 +319,9 @@ func (a cachesAPI) WatchStats(ctx context.Context, clusterID ClusterID, cacheID 
 			// clear swaps it for a fresh one whose pings the old subscription never
 			// carries.
 			if sub == nil {
-				if store := a.s.kubestoreMgr.StoreIfOpen(int64(cacheID)); store != nil {
-					// A store closing between the bind and the subscribe is the cache
-					// being cleared; the next pass round the loop re-binds.
-					if changes, err := store.Subscribe(); err == nil {
-						sub = changes
-						pings = sub.Chan()
-					}
+				if changes, ok := a.s.kubestoreMgr.Subscribe(int64(cacheID)); ok {
+					sub = changes
+					pings = sub.Chan()
 				}
 			}
 

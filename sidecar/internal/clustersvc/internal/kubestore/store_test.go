@@ -740,3 +740,34 @@ func TestClearKindKeepsTheCatalogRow(t *testing.T) {
 	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM objects`))
 	assert.Equal(t, []KindRow{podRow}, catalogRows(t, s))
 }
+
+// A subscription named for one kind must not wake on another's writes, or every object
+// write in the cache re-reads every open watch — which is what the per-kind bus keys exist
+// to prevent. conflate filters at enqueue, so the key belongs on the subscription.
+func TestSubscribeWithAKeyIgnoresOtherKeys(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	sub, err := s.Subscribe(ObjectsKey("v1", "pods"))
+	require.NoError(t, err)
+	defer sub.Close()
+
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, event("uid-ev", "2026-08-26T10:00:00Z")))
+	_, err = sub.TryRecv()
+	assert.Error(t, err, "an events write woke a pods subscription")
+
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+	assert.Equal(t, ObjectsKey("v1", "pods"), recvKey(t, sub))
+}
+
+// No keys is the whole feed, which is what the kinds watch needs: object writes move counts
+// and event writes move the hardcoded ('v1','Event') count, and there is one hub.
+func TestSubscribeWithNoKeysTakesEveryKey(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	sub, err := s.Subscribe()
+	require.NoError(t, err)
+	defer sub.Close()
+
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, event("uid-ev", "2026-08-26T10:00:00Z")))
+	assert.Equal(t, EventsKey, recvKey(t, sub))
+}

@@ -286,21 +286,26 @@ type CachedResources interface {
 }
 
 // CachedData is the cached Kubernetes content in one cache's db — the only family whose
-// reads leave beehive entirely. Every method degrades to empty (no error, no
-// frames) while that cache's db isn't open: never synced, or sync paused.
+// reads leave beehive entirely.
+//
+// **A read binds to what is open and never creates a file**, so a cache with nothing
+// synced yet answers the Bookmark alone and goes live when a writer opens one. A cache
+// that goes away under a live watch ends it CLEANLY — Err is nil, and the client
+// reconnects into the fresh snapshot — because a clear is a user pressing a button, not a
+// watch breaking.
 type CachedData interface {
 	// ListKinds returns one cache's discovered kind catalog.
 	ListKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) ([]ClusterCachedDataKind, error)
 	// WatchKinds streams one cache's kind catalog as a delta watch (per-kind counts
 	// update live).
-	WatchKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCachedDataKindWatchFrame, error)
+	WatchKinds(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*Stream[ClusterCachedDataKindWatchFrame], error)
 	// WatchObjects streams one kind's cached objects as a delta watch keyed by UID.
 	// No frames while that kind hasn't synced.
-	WatchObjects(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (<-chan ClusterCachedDataObjectWatchFrame, error)
+	WatchObjects(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (*Stream[ClusterCachedDataObjectWatchFrame], error)
 	// WatchEvents streams one cache's cached Kubernetes Events (newest window) as a
 	// delta watch keyed by event UID. Woken separately from WatchKinds, so an event
 	// burst never drives the kind-catalog re-read.
-	WatchEvents(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (<-chan ClusterCachedDataEventWatchFrame, error)
+	WatchEvents(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*Stream[ClusterCachedDataEventWatchFrame], error)
 }
 
 // The family accessors are stateless views onto the one *service: the split is

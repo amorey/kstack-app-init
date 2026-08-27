@@ -451,9 +451,25 @@ func (f *fakeKubestore) setStats(s kubestore.Stats) {
 	f.stats = s
 }
 
-// StoreIfOpen answers with no open store: the gauge then measures without a change feed
-// and falls back to its cadence, which is the paused-cache case.
-func (f *fakeKubestore) StoreIfOpen(int64) *kubestore.Store { return nil }
+// cacheIsOpen asks whether anything holds cacheID's file open — what Manager.Subscribe's
+// ok reports. The receiver is closed straight away: this is a question, not a watch.
+func cacheIsOpen(m *kubestore.Manager, cacheID int64) bool {
+	sub, ok := m.Subscribe(cacheID)
+	if ok {
+		sub.Close()
+	}
+	return ok
+}
+
+// Subscribe and WatchOpen go to the real manager, so a reader sees whatever a test opened
+// through it — and nothing when a test opened nothing, which is the gauge's idle-cache case.
+func (f *fakeKubestore) Subscribe(cacheID int64, keys ...string) (kubestore.Subscription, bool) {
+	return f.mgr.Subscribe(cacheID, keys...)
+}
+
+func (f *fakeKubestore) WatchOpen(cacheID int64) kubestore.OpenSubscription {
+	return f.mgr.WatchOpen(cacheID)
+}
 
 func (f *fakeKubestore) Remove(cacheID int64) error {
 	if f.onRemove != nil {

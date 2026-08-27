@@ -35,6 +35,9 @@ type KindRow struct {
 	Resource   string
 	Scope      string
 	IsCRD      bool
+	// Count is how many objects of this kind the cache holds. Written by nothing — the
+	// sweep does not know it, and SyncKinds ignores it; Kinds fills it from kind_counts.
+	Count int
 }
 
 // SyncKinds reconciles the whole catalog against one sweep's answer, in one transaction.
@@ -84,6 +87,10 @@ func (s *Store) SyncKinds(ctx context.Context, rows []KindRow, prune bool) error
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("sync kinds: commit: %w", err)
 	}
+	// Unconditionally, without asking whether the rows moved: a kind appearing is what the
+	// nav is waiting for, and the reader answers a ping by re-reading and diffing, so a
+	// sweep that changed nothing costs one idempotent read rather than a wrong frame.
+	f.notify(KindsKey)
 	return nil
 }
 

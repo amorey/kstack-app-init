@@ -423,30 +423,43 @@ func TestOpenExistingCreatesNothingForACacheWithNoFile(t *testing.T) {
 	assert.Empty(t, entries, "the clear left files behind")
 }
 
-// The stats gauge binds to whatever is open — a read must never create a file, since
+// The gauge borrows the feed of whatever is open, and borrowing must never create a file:
 // that is what would resurrect a cache whose teardown deleted it.
-func TestStoreIfOpenReturnsNothingForAnUnopenedCache(t *testing.T) {
+func TestManagerSubscribeAnswersNothingForAnUnopenedCache(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir)
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
-	assert.Nil(t, m.StoreIfOpen(1))
+	_, ok := m.Subscribe(1)
+	assert.False(t, ok)
 	assert.NoFileExists(t, filepath.Join(dir, "1.db"))
 }
 
-func TestStoreIfOpenReturnsTheOpenStore(t *testing.T) {
+// The feed comes with no claim, so a borrower cannot keep the cache alive: the writer's
+// release still closes the file.
+func TestManagerSubscribeTakesNoClaim(t *testing.T) {
 	m := NewManager(t.TempDir())
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	store, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
-	defer store.Release()
 
-	// A different claim on the same file: the read side takes no reference, so what it
-	// gets back is a store over the entry the writer opened rather than the writer's own.
-	reader := m.StoreIfOpen(1)
-	require.NotNil(t, reader)
-	assert.Same(t, store.e, reader.e)
-	assert.False(t, reader.claimed, "a read took a reference on the file")
+	sub, ok := m.Subscribe(1)
+	require.True(t, ok)
+	defer sub.Close()
+
+	store.Release()
+
+	assert.False(t, cacheIsOpen(m, 1), "the borrowed feed held the file open")
+}
+
+// cacheIsOpen asks whether anything holds cacheID's file open, which is what Subscribe's
+// ok reports. The receiver is closed straight away: this is a question, not a watch.
+func cacheIsOpen(m *Manager, cacheID int64) bool {
+	sub, ok := m.Subscribe(cacheID)
+	if ok {
+		sub.Close()
+	}
+	return ok
 }
 
 // The counts answer for a cache nobody is syncing too: the workers are stopped while a
@@ -467,7 +480,7 @@ func TestCountsReadsAClosedCacheWithoutOpeningItForWrites(t *testing.T) {
 			"metadata": map[string]any{"uid": "uid-1", "name": "api-0", "resourceVersion": "1"},
 		})))
 	store.Release()
-	require.Nil(t, m.StoreIfOpen(1), "the store stayed open")
+	require.False(t, cacheIsOpen(m, 1), "the store stayed open")
 
 	got, err := m.Stats(ctx, 1)
 
@@ -506,8 +519,7 @@ func TestStatsSurvivesTheFileClosingUnderIt(t *testing.T) {
 
 	// The state a clear passes through: the entry still holds a file, and that file is
 	// closed. What a racing reader sees between resolving one and querying it.
-	f := m.StoreIfOpen(1)
-	require.NotNil(t, f)
+	require.True(t, cacheIsOpen(m, 1))
 	require.NoError(t, m.entries[1].file.close())
 
 	got, err := m.Stats(ctx, 1)
@@ -534,7 +546,7 @@ func TestClearRetiresTheEntryWhenTheFileWillNotClose(t *testing.T) {
 		"a claim reached the file the clear could not close")
 	_, err = store.Subscribe()
 	assert.ErrorIs(t, err, ErrClosed, "a subscription was handed back on a dead bus")
-	assert.Nil(t, m.StoreIfOpen(1), "the retired entry is still bound")
+	assert.False(t, cacheIsOpen(m, 1), "the retired entry is still bound")
 }
 
 // A clear closes, unlinks and re-creates the file, and the fresh one has no schema until
@@ -576,4 +588,111 @@ func TestStatsWaitsOutAClear(t *testing.T) {
 	letClearFinish()
 
 	assert.NoError(t, testutil.Recv(t, measured, "the measurement once the clear landed"))
+}
+
+// A Clear closes the file and installs a fresh empty one on the same entry. A claim taken
+// before that must not follow the swap: a re-read of the new file would answer "no rows" for
+// a cache that was full, and the watch would emit a Deleted for every row it held.
+func TestAClaimTakenBeforeAClearDoesNotFollowTheSwap(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir())
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+
+	writer, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	defer writer.Release()
+	require.NoError(t, writer.SyncKinds(ctx, []KindRow{podRow}, true))
+
+	bound, ok, err := m.OpenExisting(1)
+	require.NoError(t, err)
+	require.True(t, ok)
+	defer bound.Release()
+	kinds, err := bound.Kinds(ctx)
+	require.NoError(t, err)
+	require.Len(t, kinds, 1)
+
+	require.NoError(t, m.Clear(1))
+
+	_, err = bound.Kinds(ctx)
+	assert.ErrorIs(t, err, ErrClosed, "the bound store read the file the clear swapped in")
+}
+
+// A fresh claim after the clear is how a reconnecting watch reaches the new file.
+func TestAFreshClaimAfterAClearReadsTheNewFile(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir())
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+
+	writer, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	defer writer.Release()
+	require.NoError(t, writer.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, m.Clear(1))
+
+	bound, ok, err := m.OpenExisting(1)
+	require.NoError(t, err)
+	require.True(t, ok)
+	defer bound.Release()
+	kinds, err := bound.Kinds(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, kinds, "the clear emptied the file")
+}
+
+// An idle cache — paused, or freshly restarted — has no claim on it and so no open file,
+// but its rows are still on disk. A read that only bound to an already-open file would
+// report it empty.
+func TestOpenExistingReadsACacheNobodyHoldsOpen(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir())
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+
+	writer, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	require.NoError(t, writer.SyncKinds(ctx, []KindRow{podRow}, true))
+	writer.Release()
+	require.False(t, cacheIsOpen(m, 1), "the last release left the file open")
+
+	store, ok, err := m.OpenExisting(1)
+	require.NoError(t, err)
+	require.True(t, ok)
+	defer store.Release()
+
+	kinds, err := store.Kinds(ctx)
+	require.NoError(t, err)
+	assert.Len(t, kinds, 1)
+}
+
+// A watch can open before anything has created the cache's file, and must go live the moment
+// one does rather than waiting out a poll.
+func TestWatchOpenFiresWhenTheStoreOpens(t *testing.T) {
+	m := NewManager(t.TempDir())
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+
+	opened := m.WatchOpen(1)
+	defer opened.Close()
+
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	defer store.Release()
+
+	testutil.Recv(t, opened.Chan(), "the open signal")
+}
+
+// The signal is for a store that was not there yet; one already open needs no wait, and
+// OpenExisting is what the caller tries first.
+func TestWatchOpenDoesNotFireForAnAlreadyOpenStore(t *testing.T) {
+	m := NewManager(t.TempDir())
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	defer store.Release()
+
+	opened := m.WatchOpen(1)
+	defer opened.Close()
+
+	// A negative assertion needs a bounded window; the signal would already be pending.
+	if _, err := opened.TryRecv(); err == nil {
+		t.Fatal("the open signal fired for a store that was already open")
+	}
 }

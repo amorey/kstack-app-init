@@ -65,9 +65,9 @@ side and hides when they don't. Everything else slices by kind, so one file teac
 are the subsystem's concurrency and retry budget, which only reads as a budget in one place.
 
 `New` opens the beehive store under `dataDir` and registers all five controllers; `Start` runs
-beehive, then each controller's background work. **The `CachedData` methods and the kstack event
-log still panic** — `TestUnimplementedBoundaryPanics` is the inventory of what is left, and an entry
-must be deleted as its method lands, since the test fails when a stub stops panicking.
+beehive, then each controller's background work. **The kstack event log still panics** —
+`TestUnimplementedBoundaryPanics` is the inventory of what is left, and an entry must be deleted as
+its method lands, since the test fails when a stub stops panicking.
 
 Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` records,
 `clusterController.Reconcile` observing what the kubeconfig says about each one
@@ -84,10 +84,10 @@ one — and a `ClusterCachedCatalog` beneath it. **The catalog's pass discovers 
 **Kinds now sync**: the resource pass arms a worker per kind (`internal/kubesync`), that worker
 mirrors the collection into the cache's SQLite file (`internal/kubestore`), and the pass folds its
 observation into the kind's `Synced` condition and the sync timeline beneath it. Both `Clear`s and
-both cache gauges answer. **The sweep writes `kind_catalog`**, so a plural resolves to its Kind.
-What is left is the **read side** — the `CachedData()` family over the store
-(→ docs/specs/2-cached-data-reads.md). Nothing on the write path depends on the catalog table:
-`Store.ClearKind` takes the whole `Kind` from the record.
+both cache gauges answer. **The sweep writes `kind_catalog`**, so a plural resolves to its Kind, and
+**the whole `CachedData()` family answers off the store** — the nav's kinds and counts, a kind's
+objects, and the events window, each live. Nothing on the write path depends on the catalog table:
+`Store.ClearKind` takes the whole `Kind` from the record. What is left is the kstack event log.
 
 **A kind is mirrored by a standing worker, not a periodic pass.** `internal/kubesync` runs one
 goroutine per (cache, GVR): resolve the connection through `Lease.ConnFor`, cold-list into the
@@ -173,13 +173,62 @@ the bus, which is what ends a live watch when a cache is cleared.
 → [ADR: the store's ping bus](../docs/adr/2026-08-26-store-change-ping-bus.md).
 
 **Nothing on the read side creates a file.** `Manager` keeps only what is about *which* file and
-its life — `OpenOrCreate` (writers), `OpenExisting` (a caller that must touch an existing cache's
-contents, answering `ok=false` when there is no file), `StoreIfOpen` (bind to what is already open,
-no I/O), `Clear`, `Remove`, `Stats`. Everything about a cache's *contents* is on the `Store` you
+its life — `OpenOrCreate` (writers), `OpenExisting` (**the door to a cache's contents**: a read, or
+a per-kind clear; claims the file, answers `ok=false` when there is none), `Subscribe` (borrow the
+change feed of a file someone else holds open, no claim), `Clear`, `Remove`, `Stats`. **Every
+`Store` is a claim** — the two claimless paths hand back a feed and a measurement, not a store. Everything about a cache's *contents* is on the `Store` you
 opened. A read that created would resurrect the file as an orphan nothing can name again, for a
 reader that reconnected between a cache being marked for deletion and its teardown pass.
 `Manager.Stats` measures without a claim at all — file size plus the counts, read through the open
-file or a **read-only** open, so a paused cache still reports what it holds.
+file or a **read-only** open, so a paused cache still reports what it holds. `WatchOpen` is the
+other half of the bind: a watch that found no file waits on it rather than polling, since nothing
+else would say the cache came up.
+
+**Reads ride their own pool.** Each `file` holds a reader pool (`readerPoolSize`) beside the
+one-connection writer, so a watch re-reading on every ping never queues behind a write. Distinct
+from the manager's read-only open, which measures a **closed** cache's file per call; the pool
+serves an **open** one for the file's life.
+
+**A cached-data watch pings, re-reads, and diffs — it never carries a row delta.** One loop
+(`cacheddatawatch.go`) serves all three: subscribe first, snapshot as `Added` frames, one `Bookmark`,
+then per debounced burst of pings re-read and diff by id against the previous snapshot. A re-read
+is always full current state, so an early or late ping costs one idempotent read rather than a
+wrong frame — which is why the bus carries no payload and needs no coupling to the store's
+transactions. Four rules carry it:
+
+- **The debounce is load-bearing.** `conflate` merges only what a reader has not yet taken, so a
+  loop that drains promptly gets one wake per *write*. Three constants, since the streams do not
+  carry the same load: kinds and objects 250ms, events 500ms — the highest-volume stream and the
+  one that storms.
+- **A failed re-read retries in place** (`dataRetryInterval`) rather than ending the stream. The
+  bus is keyed by what was written, so a kind nobody writes to may not ping for hours and one
+  transient error would leave the client's table empty until something else moved.
+- **A cache that goes away ends the watch CLEANLY** — `Stream.Err()` nil. A clear is a user
+  pressing a button; a non-nil `Err` is filed as a watch failure and reaches the client as an error
+  per open watch, plus a suppressed backoff reset. The reconnect re-snapshots, so silence costs
+  nothing. `Err` is for a read that is actually broken.
+- **The diff takes a `changed` func, not a `comparable` constraint.** `ObjectRow` holds the body as
+  stored (`CompressedJSON`) and cannot be compared with `==`. Objects diff on
+  `(uid, resourceVersion)` — the server moves it on every write — so only a row that becomes a
+  frame is ever decompressed; kinds and events compare their whole row.
+
+**A read claims the file and never creates one.** `OpenExisting` first, `WatchOpen` if the cache
+has no file at all, and the `Bookmark` goes out either way: a cache with no file is empty, not
+pending, and rows arriving later diff in as ordinary `Added` frames. **Claiming, not borrowing, is
+load-bearing** — nothing holds an idle cache open (the workers release on pause and on shutdown),
+so a read bound only to an already-open file would show an empty nav over a paused cache's rows,
+and over a full cache on every restart until the first worker arms. The claim is **bound to the
+file it opened**, so a `Clear`'s swap answers `ErrClosed` rather than silently re-reading the fresh
+empty one — which would emit a `Deleted` for every row the client holds — and the watch gives back
+both the claim and its subscription whichever way it ends.
+
+**A file that will not open is a fault, not an empty cache.** Only `ErrRemoved`/`ErrClosed` — the
+cache went away — degrade to empty for a read and to a clean end for a watch. Every other open
+failure (corrupt file, permission, a migration that would not run) is reported: `ListKinds` returns
+it, and the watch sets `Stream.Err()`. Reading one as "no file yet" is the trap, because `WatchOpen`
+fires when a file is **created** — a cache whose file is already there would park on a signal that
+never comes, leaving a silently empty table.
+→ [ADR: cached-data reads](../docs/adr/2026-08-26-cached-data-read-loop.md).
 
 **The gauges are read-side folds, and both re-emit on a signal *and* a cadence.**
 `Caches().WatchStats` measures the file and the trigger-maintained counts; `Caches().WatchHealth`

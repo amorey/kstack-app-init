@@ -70,6 +70,10 @@ type Subscription = *conflate.Receiver[string, struct{}]
 // every object watch in the cache.
 const EventsKey = "events"
 
+// KindsKey is the catalog bus key — what the sweep's write pings. Its own, because what
+// moves it is a kind appearing or leaving rather than any row count.
+const KindsKey = "kinds"
+
 // ObjectsKey is one kind's bus key, by the plural a reader opened its watch on.
 func ObjectsKey(apiVersion, resource string) string {
 	return "objects/" + apiVersion + "/" + resource
@@ -88,8 +92,13 @@ type Counts struct {
 // capped at one connection, and auto_vacuum=INCREMENTAL is set on the fresh pool before
 // migrations run (SQLite silently ignores it once any table exists).
 type file struct {
-	db  *sql.DB
-	hub *conflate.Hub[string, struct{}]
+	db *sql.DB
+	// readDB is the reader pool beside the writer: the watches re-read on every ping, and
+	// a read must not queue behind the one write connection. Distinct from the manager's
+	// openReadOnly, which opens a CLOSED cache's file per call to measure it; this serves
+	// an open one for the file's life.
+	readDB *sql.DB
+	hub    *conflate.Hub[string, struct{}]
 	// now is the wall clock in millis; a seam so a test can freeze it. Reads go through
 	// stamp, never here.
 	now func() int64
@@ -98,16 +107,20 @@ type file struct {
 	lastStamp int64
 }
 
-// Store is one holder's claim on one cache, and everything done through it. The file
-// under it is resolved per call, so a Clear's swap reaches every holder and a Remove
-// leaves them answering ErrClosed rather than writing into an unlinked inode.
+// Store is one holder's claim on one cache, and everything done through it — every Store
+// is a claim, and owes a Release. The file under it is resolved per call, so a Clear's swap
+// reaches every holder and a Remove leaves them answering ErrClosed rather than writing
+// into an unlinked inode.
 type Store struct {
 	m       *Manager
 	cacheID int64
 	e       *entry
-	// claimed marks a store that owes a Release. StoreIfOpen hands out one that does
-	// not: a read must not keep a file alive.
-	claimed bool
+	// bound is the file this store was handed, when it must not follow a swap. Clear
+	// installs a fresh empty file on the same entry, and a reader that followed it would
+	// answer "no rows" for a cache that was full — which a delta watch reports as a
+	// Deleted for every row it holds. Nil means "whatever the entry holds", which is what
+	// a writer wants: its next write belongs in the current file.
+	bound *file
 }
 
 // stamp is the updated_at every write records: the wall clock, forced strictly
@@ -131,31 +144,27 @@ func (f *file) stamp() int64 {
 // which the subscriber learns from its own receiver.
 func (f *file) notify(key string) { _ = f.hub.Sender().Send(key, struct{}{}) }
 
-// close closes the database and ends every subscriber, which is how a clear or a
+// close closes both pools and ends every subscriber, which is how a clear or a
 // shutdown reaches a live watch.
 func (f *file) close() error {
 	f.hub.Close()
-	return f.db.Close()
+	return errors.Join(f.db.Close(), f.readDB.Close())
 }
 
-// newFile wraps an open pool. Nothing else builds one — openFile is the only caller.
-func newFile(db *sql.DB) *file {
+// newFile wraps the open pools. Nothing else builds one — openFile is the only caller.
+func newFile(db, readDB *sql.DB) *file {
 	return &file{
-		db:  db,
-		hub: conflate.New[string, struct{}](),
-		now: func() int64 { return time.Now().UnixMilli() },
+		db:     db,
+		readDB: readDB,
+		hub:    conflate.New[string, struct{}](),
+		now:    func() int64 { return time.Now().UnixMilli() },
 	}
 }
 
 // Release gives the claim back; the last release on an entry closes its file. It counts
 // down the entry this store claimed, never whatever the id maps to now — a retired
 // entry's stragglers must not close a fresh claim's file.
-//
-// A store from StoreIfOpen holds no claim, so releasing one is a no-op.
 func (s *Store) Release() {
-	if !s.claimed {
-		return
-	}
 	s.m.mu.Lock()
 	s.e.refs--
 	if s.e.refs > 0 {
@@ -184,18 +193,43 @@ func (s *Store) file() (*file, error) {
 	if s.e.file == nil {
 		return nil, fmt.Errorf("cache %d: %w", s.cacheID, ErrClosed)
 	}
+	// A bound store answers for its own file only: a Clear's swap ends it the way a Remove
+	// does, rather than silently redirecting the read to the fresh empty one.
+	if s.bound != nil && s.e.file != s.bound {
+		return nil, fmt.Errorf("cache %d: %w", s.cacheID, ErrClosed)
+	}
 	return s.e.file, nil
 }
 
-// Subscribe returns the change feed for this cache: every key, so a reader filters for
-// the ones it re-reads on. It ends when the file closes, which is what tells a live
-// watch that the cache was cleared or shut down.
-func (s *Store) Subscribe() (Subscription, error) {
+// Subscribe returns the change feed for this cache, narrowed to keys — or every key when
+// none are given, which is what a reader spanning both buses needs. It ends when the file
+// closes, which is what tells a live watch that the cache was cleared or shut down.
+//
+// The filter runs at ENQUEUE, so a pods watch does not even hold a slot for an events
+// write. Filtering in the reader's own loop would wake every open watch on every write in
+// the cache, which is what the per-kind bus keys exist to prevent.
+func (s *Store) Subscribe(keys ...string) (Subscription, error) {
 	f, err := s.file()
 	if err != nil {
 		return nil, err
 	}
-	return f.hub.Receiver(), nil
+	return f.subscribe(keys...), nil
+}
+
+// subscribe is the receiver both doors hand out: Store.Subscribe for a holder, and
+// Manager.Subscribe for a caller that only borrows the feed.
+func (f *file) subscribe(keys ...string) Subscription {
+	if len(keys) == 0 {
+		return f.hub.Receiver()
+	}
+	want := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		want[k] = struct{}{}
+	}
+	return f.hub.Receiver(f.hub.WithKeyFilter(func(k string) bool {
+		_, ok := want[k]
+		return ok
+	}))
 }
 
 // Cookie returns the watch resourceVersion recorded for one kind, and whether one is

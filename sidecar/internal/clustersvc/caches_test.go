@@ -643,6 +643,29 @@ func TestCachesWatchStatsEmitsTheCurrentMeasurement(t *testing.T) {
 	assert.Equal(t, ClusterCacheStats{Exists: true, Bytes: 4096, ObjectCount: 12, KindCount: 3}, got)
 }
 
+// The gauge borrows its change feed and never claims the file. One runs per cache row, so
+// a list of twenty caches would otherwise pin twenty idle files open — and the measurement
+// needs no open file anyway, since Manager.Stats reads a closed one directly.
+func TestCachesWatchStatsDoesNotHoldAnIdleCacheOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	mgr := kubestoreFake(d).mgr
+
+	// A cache that was synced and is now idle: the file exists, nothing holds it.
+	writer, err := mgr.OpenOrCreate(int64(cache.ID))
+	require.NoError(t, err)
+	writer.Release()
+
+	stream, err := serviceOver(t, d).Caches().WatchStats(ctx, ClusterID(cluster.ID), ClusterCacheID(cache.ID))
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the first measurement")
+
+	assert.False(t, cacheIsOpen(mgr, int64(cache.ID)), "the gauge opened an idle cache's file")
+}
+
 // A gauge carries no bookmark, so an id pair that names nothing holds silent rather
 // than claiming an answer — a caller holding a bad id got it from a watch frame and
 // drops the subscription itself.

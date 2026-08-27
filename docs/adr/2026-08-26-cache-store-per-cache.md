@@ -37,11 +37,12 @@ and answers `ErrClosed` once that file is gone, which is what lets a `Clear` swa
 holders and a teardown retire them without handing anyone a closed database.
 
 The manager holds only what is about which file and its life; a cache's contents are reached
-through the `Store` you opened. Two doors never create: `OpenExisting` claims a cache that already
-has a file (for a caller that must clear a kind), and `StoreIfOpen` returns a claimless store over
-what is already open (for a reader). `Stats` measures with no claim at all — file size plus the
-per-kind counts, read through the open file or a read-only open (`mode=ro`), so a paused cache —
-no workers, nothing open — still reports what it holds.
+through the `Store` you opened. **Every `Store` is a claim**, and `OpenExisting` is the door that
+does not create: it claims a cache that already has a file, for a reader or for a caller clearing
+a kind. Two paths reach a cache without claiming it, because neither touches its contents:
+`Subscribe` borrows the change feed of a file someone else holds open, and `Stats` measures file
+size plus the per-kind counts through the open file or a read-only open (`mode=ro`) — so a paused
+cache, with no workers and nothing open, still reports what it holds.
 
 ## Alternatives considered
 

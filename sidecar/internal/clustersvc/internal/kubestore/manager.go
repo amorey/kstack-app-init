@@ -39,6 +39,8 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/amorey/gobus/conflate"
+
 	"github.com/kubetail-org/kstack-app/sidecar/internal/sqlitemigrate"
 )
 
@@ -56,6 +58,10 @@ type Manager struct {
 	// OpenOrCreate/Release: a swap must never race a Store resolving its file.
 	mu      sync.Mutex
 	entries map[int64]*entry
+	// opens says a cache's file has come into existence, keyed by cache. A read never
+	// creates one, so a watch opened before the first worker or sweep has nothing to bind
+	// to and would otherwise wait out a poll.
+	opens *conflate.Hub[int64, struct{}]
 	// deleteFiles is the unlink step, and closeFile the close both clears go through:
 	// seams, so a white-box test can drive a clear whose files will not go or whose
 	// database will not close.
@@ -77,6 +83,10 @@ type entry struct {
 	file *file
 	refs int
 }
+
+// OpenSubscription reports that a cache's file has come into existence. The value carries
+// nothing — the key is the whole news, and the reader answers it by binding.
+type OpenSubscription = *conflate.Receiver[int64, struct{}]
 
 var (
 	// ErrRemoved is what OpenOrCreate answers for a cache Remove retired.
@@ -109,6 +119,7 @@ func newManagerWithOptions(dir string, opts ...option) *Manager {
 	m := &Manager{
 		dir:         dir,
 		entries:     map[int64]*entry{},
+		opens:       conflate.New[int64, struct{}](),
 		deleteFiles: deleteStoreFiles,
 		closeFile:   (*file).close,
 		removed:     map[int64]bool{},
@@ -122,8 +133,8 @@ func newManagerWithOptions(dir string, opts ...option) *Manager {
 // OpenOrCreate claims cacheID's store — creating the directory, the file, and the
 // schema on first touch — or joins the open one. Release the claim.
 //
-// The name says the dangerous half out loud: this is the writers' door. A read binds
-// through StoreIfOpen, which never creates.
+// The name says the dangerous half out loud: this is the writers' door. A read goes
+// through OpenExisting, which never creates.
 func (m *Manager) OpenOrCreate(cacheID int64) (*Store, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -144,33 +155,52 @@ func (m *Manager) openOrCreateLocked(cacheID int64) (*Store, error) {
 		}
 		e = &entry{file: f}
 		m.entries[cacheID] = e
+		// Under the lock, so a waiter that registered before the entry landed cannot miss
+		// it. Send never blocks and reaches no caller's code, so holding mu across it is
+		// safe.
+		_ = m.opens.Sender().Send(cacheID, struct{}{})
 	}
 	e.refs++
-	return &Store{m: m, cacheID: cacheID, e: e, claimed: true}, nil
+	return &Store{m: m, cacheID: cacheID, e: e}, nil
 }
 
-// StoreIfOpen returns the store for a cache someone already holds open, or nil. **It
-// never creates a file** — the read side binds to what the workers opened, so a
-// reconnecting reader in the window between a cache being marked for deletion and its
-// teardown pass cannot resurrect the file as an orphan nothing will ever name again.
+// WatchOpen reports when cacheID's file next comes into existence, for a reader that found
+// none. **Close it when done.** A cache that already has a file never fires: the caller
+// tries OpenExisting first, and this exists only for the gap before anything created one.
 //
-// The store carries no claim: the file under it can be cleared or removed while a
-// reader holds it, which the reader learns from its change subscription ending.
-func (m *Manager) StoreIfOpen(cacheID int64) *Store {
+// Keyed at enqueue, so a cache opening never wakes a watch on another one — the same shape
+// as Store.Subscribe, over the manager's own bus rather than a file's.
+func (m *Manager) WatchOpen(cacheID int64) OpenSubscription {
+	return m.opens.Receiver(m.opens.WithKey(cacheID))
+}
+
+// Subscribe returns the change feed for a cache someone already holds open, narrowed to
+// keys — or ok false, since the feed lives on the open file and there is none. **It takes
+// no claim**, so a caller cannot keep a cache alive by watching it.
+//
+// The condition costs nothing where it belongs: an idle cache has no writer, so it cannot
+// change, so there is nothing for a feed to carry. A caller that must read an idle cache's
+// contents claims it through OpenExisting instead.
+func (m *Manager) Subscribe(cacheID int64, keys ...string) (Subscription, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	e, held := m.entries[cacheID]
 	if !held || e.file == nil {
-		return nil
+		return nil, false
 	}
-	return &Store{m: m, cacheID: cacheID, e: e}
+	return e.file.subscribe(keys...), true
 }
 
 // OpenExisting claims a cache that already has a file, or reports that none does. **It
-// never creates one**: the callers are clearing a kind or measuring what is there, and a
-// fresh empty database — schema and sidecars and all — is exactly what neither wants
-// left behind.
+// never creates one**: the callers are reading a cache, clearing a kind, or measuring what
+// is there, and a fresh empty database — schema and sidecars and all — is exactly what none
+// of them wants left behind.
+//
+// **The claim is bound to the file it opened**, so a Clear's swap answers ErrClosed rather
+// than silently redirecting to the fresh empty one. Every caller here wants that: a reader
+// would otherwise report every row it holds as gone, and a per-kind clear would delete from
+// a file its transaction never targeted.
 //
 // A cache removed between the check and the claim answers ErrRemoved, which the caller
 // retries; its file is going with the record either way.
@@ -191,6 +221,7 @@ func (m *Manager) OpenExisting(cacheID int64) (*Store, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	store.bound = store.e.file
 	return store, true, nil
 }
 
@@ -406,7 +437,14 @@ func openFile(path string) (*file, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return newFile(db), nil
+
+	// After the migrations, so a reader never races the schema onto a fresh file.
+	readDB, err := sqlitemigrate.OpenPool(path, readerPoolSize)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open reader pool: %w", err)
+	}
+	return newFile(db, readDB), nil
 }
 
 // Start is the lifecycle shape; the manager has no background work.
@@ -417,6 +455,10 @@ func (m *Manager) Start(ctx context.Context) (func(context.Context) error, error
 // Close closes every open file. Claims still out answer ErrClosed after it; Close runs
 // only after everything that writes has stopped.
 func (m *Manager) Close() error {
+	// Ends every waiter, including one on a cache nothing ever opened — the only thing
+	// that would otherwise hold it is its own context.
+	m.opens.Close()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var errs []error

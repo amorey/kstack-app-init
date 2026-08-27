@@ -29,15 +29,14 @@ A spec left behind after the code ships is a second source of truth.
 Each spec is self-contained: read one and you can build it. Where an order is given, it is a real
 dependency, and each spec's header states what it needs and what it hands to the next.
 
-**The cache read path, in order.** The goal is the dashboard nav and its tables. The writer has
-landed — the sweep writes `kind_catalog`
-(→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)) — so 2 is the remaining path; 3 and 4 are
-cleanups behind it, and neither blocks anything. The numbers are the build order, and 1 is gone
-because it shipped.
+**The cache read path has landed.** The sweep writes `kind_catalog`
+(→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)) and the `CachedData()` family reads it back
+(→ [ADR](../adr/2026-08-26-cached-data-read-loop.md)), so the nav and the tables are live. What is
+left are the two cleanups behind it, and neither blocks anything. The numbers are the build order;
+1 and 2 are gone because they shipped.
 
 | # | Spec | Scope | Status | Delivers |
 | --- | --- | --- | --- | --- |
-| 2 | [Cached data reads](2-cached-data-reads.md) | sidecar | Planned | the `CachedData()` family — nav and tables go live |
 | 3 | [Catalog kinds off disk](3-catalog-kinds-off-disk.md) | sidecar | Planned | the fold reads its kinds from the store; the resident copy goes |
 | 4 | [Catalog sweep cadence](4-catalog-sweep-cadence.md) | sidecar | Planned | the poll under the watch becomes rare (no user-visible change) |
 

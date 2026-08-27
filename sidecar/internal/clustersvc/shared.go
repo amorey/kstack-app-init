@@ -133,14 +133,19 @@ type kubesyncService interface {
 // clears the controllers drive, plus what the stats gauge measures. Named for the leaf
 // type it stands for, the way every narrow interface here is.
 //
-// Neither open takes a file that is not there: OpenExisting is for a caller that must
-// touch a cache's contents (clearing a kind), StoreIfOpen for one that only reads what
-// is already open. A read must never create a file, or a reader reconnecting in the
-// window between a cache being marked for deletion and its teardown pass would
-// resurrect it as an orphan.
+// **OpenExisting is the door to a cache's contents** — reading it, or clearing a kind in
+// it — and claims the file for as long as the caller holds it. It never creates one: a
+// reader reconnecting in the window between a cache being marked for deletion and its
+// teardown pass would otherwise resurrect it as an orphan.
+//
+// Subscribe borrows the change feed of a cache someone already holds open, taking no
+// claim, for the gauge — which measures through Stats and needs no file of its own.
+// WatchOpen is the read side's other half: a watch that found no file waits on it rather
+// than polling, since nothing else would tell it the cache came up.
 type kubestoreManager interface {
 	OpenExisting(cacheID int64) (*kubestore.Store, bool, error)
-	StoreIfOpen(cacheID int64) *kubestore.Store
+	Subscribe(cacheID int64, keys ...string) (kubestore.Subscription, bool)
+	WatchOpen(cacheID int64) kubestore.OpenSubscription
 	Clear(cacheID int64) error
 	Remove(cacheID int64) error
 	Stats(ctx context.Context, cacheID int64) (kubestore.Stats, error)

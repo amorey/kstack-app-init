@@ -443,49 +443,55 @@ func (f fakeCachedData) ListKinds(_ context.Context, clusterID clustersvc.Cluste
 	return f.s.kinds[clusterID], nil
 }
 
-func (f fakeCachedData) WatchKinds(ctx context.Context, clusterID clustersvc.ClusterID, _ clustersvc.ClusterCacheID) (<-chan clustersvc.ClusterCachedDataKindWatchFrame, error) {
+func (f fakeCachedData) WatchKinds(ctx context.Context, clusterID clustersvc.ClusterID, _ clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCachedDataKindWatchFrame], error) {
 	f.s.mu.Lock()
 	snap := append([]clustersvc.ClusterCachedDataKind(nil), f.s.kinds[clusterID]...)
 	f.s.mu.Unlock()
-	ch := make(chan clustersvc.ClusterCachedDataKindWatchFrame, len(snap))
-	for _, k := range snap {
-		ch <- clustersvc.ClusterCachedDataKindWatchFrame{Type: clustersvc.DeltaFrameAdded, Kind: &k}
-	}
-	go func() {
+	return clustersvc.NewStream(ctx, func(ctx context.Context, out chan<- clustersvc.ClusterCachedDataKindWatchFrame) error {
+		for _, k := range snap {
+			select {
+			case out <- clustersvc.ClusterCachedDataKindWatchFrame{Type: clustersvc.DeltaFrameAdded, Kind: &k}:
+			case <-ctx.Done():
+				return nil
+			}
+		}
 		<-ctx.Done()
-		close(ch)
-	}()
-	return ch, nil
+		return nil
+	}), nil
 }
 
-func (f fakeCachedData) WatchEvents(ctx context.Context, clusterID clustersvc.ClusterID, _ clustersvc.ClusterCacheID) (<-chan clustersvc.ClusterCachedDataEventWatchFrame, error) {
+func (f fakeCachedData) WatchEvents(ctx context.Context, clusterID clustersvc.ClusterID, _ clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCachedDataEventWatchFrame], error) {
 	f.s.mu.Lock()
 	snap := append([]clustersvc.ClusterCachedDataEvent(nil), f.s.dataEvents[clusterID]...)
 	f.s.mu.Unlock()
-	ch := make(chan clustersvc.ClusterCachedDataEventWatchFrame, len(snap))
-	for _, e := range snap {
-		ch <- clustersvc.ClusterCachedDataEventWatchFrame{Type: clustersvc.DeltaFrameAdded, Event: &e}
-	}
-	go func() {
+	return clustersvc.NewStream(ctx, func(ctx context.Context, out chan<- clustersvc.ClusterCachedDataEventWatchFrame) error {
+		for _, e := range snap {
+			select {
+			case out <- clustersvc.ClusterCachedDataEventWatchFrame{Type: clustersvc.DeltaFrameAdded, Event: &e}:
+			case <-ctx.Done():
+				return nil
+			}
+		}
 		<-ctx.Done()
-		close(ch)
-	}()
-	return ch, nil
+		return nil
+	}), nil
 }
 
-func (f fakeCachedData) WatchObjects(ctx context.Context, clusterID clustersvc.ClusterID, _ clustersvc.ClusterCacheID, _, _ string) (<-chan clustersvc.ClusterCachedDataObjectWatchFrame, error) {
+func (f fakeCachedData) WatchObjects(ctx context.Context, clusterID clustersvc.ClusterID, _ clustersvc.ClusterCacheID, _, _ string) (*clustersvc.Stream[clustersvc.ClusterCachedDataObjectWatchFrame], error) {
 	f.s.mu.Lock()
 	snap := append([]clustersvc.ClusterCachedDataObject(nil), f.s.dataObjects[clusterID]...)
 	f.s.mu.Unlock()
-	ch := make(chan clustersvc.ClusterCachedDataObjectWatchFrame, len(snap))
-	for _, o := range snap {
-		ch <- clustersvc.ClusterCachedDataObjectWatchFrame{Type: clustersvc.DeltaFrameAdded, Object: &o}
-	}
-	go func() {
+	return clustersvc.NewStream(ctx, func(ctx context.Context, out chan<- clustersvc.ClusterCachedDataObjectWatchFrame) error {
+		for _, o := range snap {
+			select {
+			case out <- clustersvc.ClusterCachedDataObjectWatchFrame{Type: clustersvc.DeltaFrameAdded, Object: &o}:
+			case <-ctx.Done():
+				return nil
+			}
+		}
 		<-ctx.Done()
-		close(ch)
-	}()
-	return ch, nil
+		return nil
+	}), nil
 }
 
 // ListEvents and WatchEvents serve every record's timeline from one reader, as the

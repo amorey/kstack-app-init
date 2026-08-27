@@ -288,32 +288,32 @@ func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id cl
 // clusterCachedDataKinds), so the dashboard nav's kinds + counts track the cluster in
 // real time.
 func (r *subscriptionResolver) ClusterCachedDataKindsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedDataKindWatchFrame, error) {
-	ch, err := r.ClusterSvc.CachedData().WatchKinds(ctx, id, cacheID)
+	stream, err := r.ClusterSvc.CachedData().WatchKinds(ctx, id, cacheID)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, stream), nil
 }
 
 // ClusterCachedDataEventsWatch is the resolver for the clusterCachedDataEventsWatch field — one
 // ClusterCache's cached Kubernetes Events as a delta watch, backing the dashboard's
 // events table.
 func (r *subscriptionResolver) ClusterCachedDataEventsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedDataEventWatchFrame, error) {
-	ch, err := r.ClusterSvc.CachedData().WatchEvents(ctx, id, cacheID)
+	stream, err := r.ClusterSvc.CachedData().WatchEvents(ctx, id, cacheID)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, stream), nil
 }
 
 // ClusterCachedDataObjectsWatch is the resolver for the clusterCachedDataObjectsWatch field — one
 // kind's cached objects as a delta watch, backing the dashboard's per-kind tables.
 func (r *subscriptionResolver) ClusterCachedDataObjectsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID, apiVersion string, resource string) (<-chan *clustersvc.ClusterCachedDataObjectWatchFrame, error) {
-	ch, err := r.ClusterSvc.CachedData().WatchObjects(ctx, id, cacheID, apiVersion, resource)
+	stream, err := r.ClusterSvc.CachedData().WatchObjects(ctx, id, cacheID, apiVersion, resource)
 	if err != nil {
 		return nil, err
 	}
-	return ptrStream(ctx, ch), nil
+	return watchStream(ctx, stream), nil
 }
 
 // ChatStream is the resolver for the chatStream field.
