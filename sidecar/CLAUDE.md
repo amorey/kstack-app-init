@@ -43,6 +43,8 @@ internal/clustersvc/
   internal/kubeconn/  the connections a cluster is talked to over, and what probing them
                       found — leases, the five probes, and the connection itself. A leaf
                       under internal/, so the compiler keeps it this package's own
+  internal/kubesync/  what fills a cache: the arming seam over kubeconn and kubestore.
+                      Same leaf rule
   internal/kubestore/  the on-disk cache: one SQLite file per ClusterCache behind a
                       refcounted manager (manager.go), the claim and the write path
                       (store.go), a file per table beside it (catalog.go is
@@ -70,14 +72,14 @@ probe recorded. Served: the whole `Clusters()` family, the whole `Caches()` fami
 `ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
 one. What is left is the kstack event log, and the seam below.
 
-**Nothing fills a cache. The seam between `ClusterCachedKind` and `kubestore` is being
-redesigned from scratch**, and the leaves that used to carry it are gone. So
-no pass discovers a cluster's kinds and no `ClusterCachedKind` record is ever created; the
-cache controller does nothing but tear a dying cache's file down, the per-kind controller settles
-without work, neither kind writes a condition, and every cache's store stays empty. The record kinds, their six reads apiece, the delta watches, both `Clear`s, and the whole
+**Nothing fills a cache yet.** `internal/kubesync` holds the seam — see below — but nothing
+above it calls one, so no pass discovers a cluster's kinds and no `ClusterCachedKind` record is
+ever created; the cache controller does nothing but tear a dying cache's file down, the per-kind
+controller settles without work, neither kind writes a condition, and every cache's store stays
+empty. The record kinds, their six reads apiece, the delta watches, both `Clear`s, and the whole
 `CachedData()` read path are intact and answer — over nothing. **Don't reintroduce the old shape
-piecemeal**: the store's write API is the fixed ground the new seam meets, and the design is owed a
-spec and an ADR before code.
+piecemeal**: the store's write API is the fixed ground the seam meets, and the plan is
+`docs/specs/kubesync-seam.md`.
 
 **The store is one SQLite file per cache behind a refcounted `Manager`** (`internal/kubestore`),
 cleared by deleting the file and removed with the record it is named for. A `Store` is a *claim*
@@ -917,6 +919,44 @@ worker, so a probe refuses-and-suspends instead, woken by the fleet bus.
 both hubs publish under — holding the holder count, whether the file still names the context, and
 what a probe read. Contexts resolving alike are **not** merged. → [ADR: one connection per
 context](../docs/adr/2026-08-23-one-connection-per-context.md).
+
+### The sync engine (`internal/clustersvc/internal/kubesync`)
+
+**What fills a cache.** It speaks cache ids, kube-contexts, server UIDs and GVRs — never records;
+`clustersvc` translates, and a record type reaching it is an import cycle. Its two dependencies are
+the narrow `Acquire(contextName) kubeconn.Lease` and `OpenOrCreate(cacheID) (*kubestore.Store,
+error)`. → `docs/specs/kubesync-seam.md`.
+
+**Built so far: the seam and the arming.** `TrackDiscovery`/`ForgetDiscovery`, `TrackKind`/
+`ForgetKind`, `RestartAll`, the claims, the identity gate, the two reads and the two news feeds.
+**The two bodies behind it are not built** — the sweep and the per-kind mirror are seams a test
+substitutes, so a tracked cache holds its claims and runs nothing.
+
+**Two levels of arming, and they AND rather than nest.** `TrackDiscovery` says whether a cache
+syncs at all — and *supplies* it, since both claims are taken there — while `TrackKind` says which
+kinds. A kind's registration **outlives its cache being forgotten**: pausing is one call and
+resuming is one call, with no record written and none requeued, where gating through the records
+would mean relaying the switch onto hundreds of them.
+
+- **Arming is policy, never interest.** A worker starts because a record's pass armed it, never
+  because something read it.
+- **Nothing syncs into a cache whose connection does not vouch for its `ServerUID`.** The gate is
+  the session's: a kind worker holds its own goroutine, so it blocks on `AwaitConnFor`, where a
+  sweep runs on the probe engine and must suspend instead.
+- **Forgetting is synchronous.** `ForgetDiscovery` returns only when no worker can still write
+  through that cache's store, and `ForgetKind` only when that kind's cannot.
+- **A verdict is a gauge, never a stored condition** (`GetDiscoveryState`/`GetKindState`), and
+  **no answer is not an empty answer**: `false` means nothing has been observed yet, and a caller
+  folding it into "serves no kinds" deletes a record set that was only waiting.
+- **News is not data.** Two feeds, one per worker, because their consumers are two beehive
+  triggers and one feed carrying both would wake a cache for each of its hundreds of kinds. The
+  key is the whole message and the reader answers it by re-reading. A resume is not news — only a
+  reason that settled somewhere new — with one exception a verdict cannot carry: a sweep that
+  committed a catalog (`discoveryRun.Announce`).
+- **A kind is keyed by `(APIVersion, Resource)`, and the singular is data.** Every map inside drops
+  it; `KindKey` carries it, where a rename costs a duplicate wake and never a missed one.
+- **A body owns its own retry pacing** and returns only when its run context ends — the loop above
+  it re-enters it after a `RestartAll`, so a body that returns promptly is asking to be run again.
 
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache
