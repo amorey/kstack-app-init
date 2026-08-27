@@ -168,6 +168,12 @@ func (w *watcher) stream(ctx context.Context, gvr schema.GroupVersionResource, o
 
 	for {
 		stream, err := open(ctx, w.conn, gvr, resumeFrom)
+		if err != nil {
+			// Spent before the open is reported, never after: a run reads spent() the moment
+			// awaitOpen returns, and the other order leaves a refused watch reading as one
+			// still standing.
+			w.end()
+		}
 		if firstOpen {
 			// Whatever came of it: a refused watch has no promptness to offer, and a sweep
 			// held behind a handshake that will never complete is worse than a blind one.
@@ -175,7 +181,6 @@ func (w *watcher) stream(ctx context.Context, gvr schema.GroupVersionResource, o
 			firstOpen = false
 		}
 		if err != nil {
-			w.end()
 			return
 		}
 

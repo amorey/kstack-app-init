@@ -96,6 +96,12 @@ type Kind struct {
 type Catalog struct {
 	Fingerprint uint64
 	Partial     bool
+	// WatchLive is whether a watch was standing over the cluster when this answer was swept.
+	// A false one says the kinds are right and a new CRD will be slow to show up, which is
+	// what the fold reports. Deliberately not in Fingerprint, which covers the kinds alone:
+	// the rows on disk are matched against that word, and a watch flip is not a table that
+	// moved.
+	WatchLive bool
 }
 
 // sweep is one run's answer, resident only for the length of that run: swept, written,
@@ -117,14 +123,24 @@ func Fingerprint(kinds []Kind) uint64 {
 	return h.Sum64()
 }
 
-// sweepInterval paces re-discovery: the pull cadence correctness rests on, since what
-// the sweep enumerates is a remote server's and nothing here sees a CRD land.
-const sweepInterval = 10 * time.Minute
+// sweepInterval paces re-discovery over a cluster whose watch is live: the pull cadence
+// correctness rests on, since what the sweep enumerates is a remote server's and nothing
+// here sees a CRD land. Long, because the watch is what makes discovery prompt and the
+// poll under it is a backstop. What still bounds it is how long a watch that dies
+// *silently, between runs* can hide.
+const sweepInterval = 30 * time.Minute
 
-// sweepRetryBase starts the failure ladder, capped at sweepInterval. Above the engine's
-// default second, because what a failure retries here is a full ServerPreferredResources
-// — dozens of round trips over every group-version, paid for at someone else's cluster —
-// and promptness comes from the watch, never from the ladder.
+// sweepIntervalDegraded is what a run asks for when the watch it left standing is not
+// live — refused, dead, or never opened. The poll is then the only thing that would
+// notice a new CRD, so it is the one that has to be prompt.
+const sweepIntervalDegraded = 10 * time.Minute
+
+// sweepRetryBase starts the failure ladder, capped at sweepIntervalDegraded. Above the
+// engine's default second, because what a failure retries here is a full
+// ServerPreferredResources — dozens of round trips over every group-version, paid for at
+// someone else's cluster — and promptness comes from the watch, never from the ladder.
+// The cap is the degraded interval and not the backstop: the ladder runs only for a sweep
+// that failed or came back partial, and no watch covers either.
 const sweepRetryBase = 30 * time.Second
 
 // sweepTimeout bounds one run's context. It cannot cancel the sweep itself — client-go's
@@ -147,8 +163,9 @@ type catalogProbe struct {
 	mirror func(ctx context.Context, id string, s sweep, fingerprint uint64) error
 	// watch and unwatch are the standing watch's lifetime, which is the Service's to hold —
 	// establishing one has to be measured against whether the subject is still tracked. watch
-	// returns once the watch is open, bounded by ctx.
-	watch   func(ctx context.Context, id string, conn *kubeconn.Connection)
+	// returns once the watch is open, bounded by ctx, and reports whether the one it left
+	// standing is live: that is what the run's cadence follows.
+	watch   func(ctx context.Context, id string, conn *kubeconn.Connection) bool
 	unwatch func(id string)
 }
 
@@ -173,7 +190,7 @@ func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe
 	// which is what the streams inherit. Deferring it to a clean sweep would leave the previous
 	// connection's watcher standing for as long as discovery is failing — and a partial sweep
 	// over an aggregated API server that is down is not a short window.
-	p.watch(ctx, pass.Subject(), conn)
+	watchLive := p.watch(ctx, pass.Subject(), conn)
 
 	found, err := p.sweep(ctx, conn)
 	if err != nil && !found.Partial {
@@ -186,7 +203,11 @@ func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe
 		return probe.Fail(ReasonSweepFailed, err)
 	}
 
-	answer := Catalog{Fingerprint: Fingerprint(found.Kinds), Partial: found.Partial}
+	answer := Catalog{
+		Fingerprint: Fingerprint(found.Kinds),
+		Partial:     found.Partial,
+		WatchLive:   watchLive,
+	}
 
 	// The rows go down before anything is committed: a commit is the fold's wake, and
 	// waking it over rows that are not there yet would have it converge on a table the
@@ -207,6 +228,12 @@ func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe
 	}
 	if found.Partial {
 		return probe.Fail(ReasonSweepPartial, err)
+	}
+	// The cadence follows the watch: a live one carries the promptness, so the poll under it
+	// waits out the backstop. watchLive is what the reconcile above found, so a watch that dies
+	// during a long sweep is caught by the next run's reconcile, one backstop later.
+	if !watchLive {
+		return probe.Succeeded().RequeueAfter(sweepIntervalDegraded)
 	}
 	return probe.Succeeded()
 }

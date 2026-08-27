@@ -621,7 +621,14 @@ func (e *Engine) due(sub *subject, id probeID, now time.Time) time.Time {
 
 	switch a.LastAttempt.Verdict {
 	case VerdictSucceeded:
-		return a.LastAttempt.FinishedAt.Add(cfg.interval)
+		// The interval unless the run asked for less: RequeueAfter accelerates and never
+		// lengthens, and an unset one leaves the registration standing rather than
+		// scheduling at zero.
+		wait := cfg.interval
+		if d := a.LastAttempt.requeueAfter; d > 0 && d < wait {
+			wait = d
+		}
+		return a.LastAttempt.FinishedAt.Add(wait)
 	case VerdictFailed:
 		return a.LastAttempt.FinishedAt.Add(cfg.backoff.delay(a.Failures))
 	case VerdictSuspended:
@@ -738,6 +745,8 @@ func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, v
 			Reason:     res.reason,
 			Message:    res.message,
 			Err:        res.err,
+
+			requeueAfter: res.requeueAfter,
 		})
 		a.skipped = false
 		switch {

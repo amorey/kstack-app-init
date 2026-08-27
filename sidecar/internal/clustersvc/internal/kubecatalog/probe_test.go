@@ -57,7 +57,7 @@ func connectingProbe() *catalogProbe {
 	return &catalogProbe{
 		conn:    func(context.Context, string) (*kubeconn.Connection, error) { return &kubeconn.Connection{}, nil },
 		mirror:  func(context.Context, string, sweep, uint64) error { return nil },
-		watch:   func(context.Context, string, *kubeconn.Connection) {},
+		watch:   func(context.Context, string, *kubeconn.Connection) bool { return true },
 		unwatch: func(string) {},
 	}
 }
@@ -150,6 +150,29 @@ func TestRunCommitsOnlyOnAChange(t *testing.T) {
 	got, committed := pass.Updated()
 	require.True(t, committed, "a kind the server started serving is news")
 	assert.Equal(t, Fingerprint(served), got.Fingerprint)
+}
+
+// The watch's own health rides the standing answer, so the fold can say a cluster's discovery
+// is no longer prompt. It is not a fact about what the cluster serves, so it stays out of the
+// fingerprint — the word the rows on disk are matched against.
+func TestRunCommitsAWatchThatWentDark(t *testing.T) {
+	live := true
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) {
+		return sweep{Kinds: []Kind{pods}}, nil
+	})
+	p.watch = func(context.Context, string, *kubeconn.Connection) bool { return live }
+
+	_, pass := run(t, p, nil)
+	first, _ := pass.Updated()
+	require.True(t, first.WatchLive)
+
+	live = false
+	_, pass = run(t, p, &first)
+	got, committed := pass.Updated()
+
+	require.True(t, committed, "a watch that went dark is news")
+	assert.False(t, got.WatchLive)
+	assert.Equal(t, first.Fingerprint, got.Fingerprint, "the kinds did not move")
 }
 
 func TestRunCommitsAnEmptyFirstAnswer(t *testing.T) {

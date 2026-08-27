@@ -328,6 +328,63 @@ func TestARepeatedAnswerSignalsNobody(t *testing.T) {
 	testutil.NoRecv(t, sub.Chan(), 100*time.Millisecond, "a signal for an unmoved answer")
 }
 
+// The cadence a cluster is actually swept on, which is what the run's ask is for: a live watch
+// carries the promptness and leaves the poll on the long backstop, and a refused one puts it back
+// on the degraded interval.
+func TestTheSweepIsScheduledOnItsWatch(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		openErr error
+		want    time.Duration
+	}{
+		{name: "live", want: sweepInterval},
+		{name: "refused", openErr: assert.AnError, want: sweepIntervalDegraded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conns := newFakeConns()
+			f := newFakeOpener(t)
+			f.err = tc.openErr
+			svc := newTestService(t, conns, answering(pods), withOpener(f.open))
+			startService(t, svc)
+			sub := svc.Subscribe()
+			t.Cleanup(sub.Close)
+
+			svc.Track("cachedcatalog/1", armed(7, "prod"))
+			// The pass that signals is the one that derived the schedule, so what Read hands
+			// back here is the schedule this answer earned.
+			testutil.Recv(t, sub.Chan(), "the first answer's signal")
+
+			obs, ok := svc.Read("cachedcatalog/1")
+			require.True(t, ok)
+			assert.Equal(t, tc.want, obs.NextAttempt.ScheduledAt.Sub(obs.LastAttempt.FinishedAt))
+		})
+	}
+}
+
+// A watch coming back is news even though the kinds did not move: the fold's message names a
+// degraded watch, and nothing else would run the fold to take it back down. It costs at most
+// one wake per sweep, since WatchLive is recomputed only inside a run.
+func TestAWatchComingBackSignalsTheFold(t *testing.T) {
+	conns := newFakeConns()
+	f := newFakeOpener(t)
+	f.err = assert.AnError
+	svc := newTestService(t, conns, answering(pods), withOpener(f.open))
+	startService(t, svc)
+	sub := svc.Subscribe()
+	t.Cleanup(sub.Close)
+
+	svc.Track("cachedcatalog/1", armed(7, "prod"))
+	testutil.Recv(t, sub.Chan(), "the first answer's signal")
+
+	f.err = nil
+	svc.Wake("cachedcatalog/1")
+
+	testutil.Recv(t, sub.Chan(), "the signal for a watch that came back")
+	obs, ok := svc.Read("cachedcatalog/1")
+	require.True(t, ok)
+	assert.True(t, obs.Value.WatchLive)
+}
+
 // A sweep for a subject nothing tracks writes nowhere. Forget can land under a run, and a
 // write off it would recreate the file a teardown just deleted, permanently orphaned.
 func TestAForgottenSubjectWritesNothing(t *testing.T) {
@@ -515,6 +572,31 @@ func TestEnsureWatcherStoresOneForATrackedID(t *testing.T) {
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
 	assert.Len(t, svc.watchers, 1)
+}
+
+// What the run schedules on: a watch that is standing carries the promptness, so the poll
+// under it can wait out the backstop.
+func TestEnsureWatcherReportsAStandingWatchAsLive(t *testing.T) {
+	conns := newFakeConns()
+	svc := newTestService(t, conns, answering(pods))
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
+
+	assert.True(t, svc.ensureWatcher(context.Background(), "cachedcatalog/1", nil))
+	assert.True(t, svc.ensureWatcher(context.Background(), "cachedcatalog/1", nil),
+		"the watcher it kept reads as live too")
+}
+
+// A refused open — RBAC on a cluster-scoped collection is the common one — must not read as a
+// watch that is standing, or the cluster would sit at the healthy backstop with nothing
+// watching it.
+func TestEnsureWatcherReportsARefusedWatchAsNotLive(t *testing.T) {
+	conns := newFakeConns()
+	f := newFakeOpener(t)
+	f.err = assert.AnError
+	svc := newTestService(t, conns, answering(pods), withOpener(f.open))
+	svc.Track("cachedcatalog/1", armed(1, "prod"))
+
+	assert.False(t, svc.ensureWatcher(context.Background(), "cachedcatalog/1", nil))
 }
 
 // Forget gives back everything Track took, the watcher included — subject membership mirrors

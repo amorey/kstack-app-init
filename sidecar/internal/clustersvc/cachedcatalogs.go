@@ -447,6 +447,12 @@ func (c *clusterCachedCatalogController) converge(
 		}
 	case draining:
 		status, reason = ConditionFalse, ReasonDiscoveryDraining
+	case !obs.Value.WatchLive:
+		// Still Discovered, and still True: the kinds are right, and what is degraded is how
+		// fast a new one shows up. A reason of its own would put a cluster whose catalog is
+		// correct into a false state, and the condition is what the user reads.
+		message = "the watch on this cluster's CustomResourceDefinitions and APIServices is not " +
+			"running; a new kind will not appear until the next discovery sweep"
 	}
 	res := observeDiscovered(ctx, client, status, reason, message)
 	if draining {

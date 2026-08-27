@@ -464,6 +464,32 @@ func TestASucceededProbeIsDueAgainAfterItsInterval(t *testing.T) {
 	assert.Equal(t, a.LastAttempt.FinishedAt.Add(250*time.Millisecond), a.NextAttempt.ScheduledAt)
 }
 
+// A run that knows it should come back sooner says so, and the registration goes on bounding
+// every run that does not.
+func TestASucceededRunCanAskToComeBackSooner(t *testing.T) {
+	e, _, id := single(t, Succeeded().RequeueAfter(50*time.Millisecond), WithInterval(250*time.Millisecond))
+	e.Add(subj)
+	e.settle()
+
+	runNext(t, e)
+
+	a := att(t, e, id)
+	assert.Equal(t, a.LastAttempt.FinishedAt.Add(50*time.Millisecond), a.NextAttempt.ScheduledAt)
+}
+
+// The registration is the correctness bound, so a run asking for longer is ignored rather than
+// obeyed: forget the ask and a subject is slower, never wrong.
+func TestASucceededRunCannotAskToComeBackLater(t *testing.T) {
+	e, _, id := single(t, Succeeded().RequeueAfter(time.Hour), WithInterval(250*time.Millisecond))
+	e.Add(subj)
+	e.settle()
+
+	runNext(t, e)
+
+	a := att(t, e, id)
+	assert.Equal(t, a.LastAttempt.FinishedAt.Add(250*time.Millisecond), a.NextAttempt.ScheduledAt)
+}
+
 // The ladder widens per consecutive failure and holds at the cap — and it is a pure function of
 // Failures, so a later pass derives the same ScheduledAt it derived before.
 func TestAFailedProbeClimbsTheLadder(t *testing.T) {

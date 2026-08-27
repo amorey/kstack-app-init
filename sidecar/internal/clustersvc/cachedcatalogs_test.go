@@ -213,7 +213,7 @@ func writeKinds(t *testing.T, d deps, cacheID int64, a sweepAnswer) {
 func swept(kinds ...kubecatalog.Kind) sweepAnswer {
 	return sweepAnswer{
 		obs: kubecatalog.Observation{
-			Value:    kubecatalog.Catalog{Fingerprint: kubecatalog.Fingerprint(kinds)},
+			Value:    kubecatalog.Catalog{Fingerprint: kubecatalog.Fingerprint(kinds), WatchLive: true},
 			LastSeen: probedAt,
 			Attempts: kubeconn.Attempts{LastAttempt: finished(kubeconn.ReasonSucceeded, "")},
 		},
@@ -326,6 +326,36 @@ func TestCatalogReconcileCreatesAChildPerServedKind(t *testing.T) {
 	assert.True(t, got.Spec.Namespaced)
 	assert.True(t, got.Spec.Enabled, "the pause switch is relayed in")
 	assert.Equal(t, ReasonDiscovered, client.discovered(t).Reason)
+}
+
+// A watch that is not standing leaves the kinds right and their arrival slow, so the
+// verdict stays True and the message is what says so. A reason of its own would put a
+// cluster whose catalog is correct into a false state.
+func TestCatalogReconcileNamesADegradedWatch(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	degraded := swept(pods)
+	degraded.obs.Value.WatchLive = false
+	sweepAnswered(t, d, catalog, degraded)
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	got := client.discovered(t)
+	assert.Equal(t, ConditionTrue, got.Status)
+	assert.Equal(t, ReasonDiscovered, got.Reason)
+	assert.Contains(t, got.Message, "watch")
+}
+
+// The healthy cluster says nothing: the message exists to name a degradation, and one that
+// stood on a live watch would be read as a problem.
+func TestCatalogReconcileSaysNothingWhenTheWatchIsLive(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	sweepAnswered(t, d, catalog, swept(pods))
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	assert.Empty(t, client.discovered(t).Message)
 }
 
 // Every pass rewrites the children, so a kind that changed shape converges without being

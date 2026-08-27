@@ -116,3 +116,7 @@ will never complete is worse than a blind one.
 A watcher refused by RBAC needs to be visible. It reports `Succeeded()` today, since the catalog
 data is fine and only promptness degrades — so a user who may never watch CRDs sees a healthy
 catalog that is quietly up to 10m stale. `TODO.md` carries it.
+
+> Answered by [the sweep's cadence follows the watch](2026-08-27-catalog-sweep-cadence.md), which
+> makes the interval conditional on the watch and has the fold name a degraded one. The decision
+> here stands: pull-first, the watch only wakes, and the interval is the backstop.

@@ -48,11 +48,12 @@ const (
 // Succeeded, Fail, Suspend, or Skip — the zero Result is invalid, and the engine records one as
 // an Internal failure, the same as a body that panicked.
 type Result struct {
-	kind    resultKind
-	verdict Verdict
-	reason  Reason
-	message string
-	err     error
+	kind         resultKind
+	verdict      Verdict
+	reason       Reason
+	message      string
+	err          error
+	requeueAfter time.Duration
 }
 
 type resultKind int
@@ -66,6 +67,22 @@ const (
 // Succeeded records success; the probe is due again after its interval.
 func Succeeded() Result {
 	return Result{kind: resultRecord, verdict: VerdictSucceeded, reason: ReasonSucceeded}
+}
+
+// RequeueAfter asks for the next run sooner than the interval, for a wait this run knows the
+// length of — beehive's spelling one layer up, for the same kind of ask.
+//
+// **Unlike beehive's, it can only bring a run forward**: the engine takes it when it is positive
+// and shorter than the registered interval, and ignores it otherwise. A registration is a
+// probe's cadence in a way a beehive resync is not — it is what bounds requests against someone
+// else's cluster — so no return path may push a subject past it. A zero is no ask rather than
+// "immediately", which would be a hot loop.
+//
+// Read on a succeeded result and nowhere else. Fail owns the backoff ladder and Suspend schedules
+// nothing, so calling this on either is inert.
+func (r Result) RequeueAfter(d time.Duration) Result {
+	r.requeueAfter = d
+	return r
 }
 
 // Fail records a failure; the probe is due again up the backoff ladder. Message defaults to the
@@ -115,6 +132,11 @@ type Attempt struct {
 	Reason  Reason
 	Message string
 	Err     error
+
+	// requeueAfter is what the run asked for, zero for none. Unexported because it is the
+	// scheduler's own bookkeeping, and every exported field here is copied into the Snapshots
+	// callers read.
+	requeueAfter time.Duration
 }
 
 // Running reports whether this run has started and not finished.

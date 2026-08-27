@@ -32,13 +32,9 @@ dependency, and each spec's header states what it needs and what it hands to the
 **The cache read path has landed.** The sweep writes `kind_catalog`
 (→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)) and the `CachedData()` family reads it back
 (→ [ADR](../adr/2026-08-26-cached-data-read-loop.md)), so the nav and the tables are live. So has
-the fold's read of those rows (→ [ADR](../adr/2026-08-27-catalog-kinds-off-disk.md)). What is left
-is the cleanup behind it, which blocks nothing. The numbers are the build order; 1 through 3 are
-gone because they shipped.
-
-| # | Spec | Scope | Status | Delivers |
-| --- | --- | --- | --- | --- |
-| 4 | [Catalog sweep cadence](4-catalog-sweep-cadence.md) | sidecar | Planned | the poll under the watch becomes rare (no user-visible change) |
+the fold's read of those rows (→ [ADR](../adr/2026-08-27-catalog-kinds-off-disk.md)), and the
+sweep's cadence now follows the watch (→ [ADR](../adr/2026-08-27-catalog-sweep-cadence.md)).
+Nothing is left in the sequence: 1 through 4 shipped.
 
 **Independent.**
 

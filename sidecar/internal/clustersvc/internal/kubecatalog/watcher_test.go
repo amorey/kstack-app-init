@@ -296,6 +296,20 @@ func TestStreamLoopEndsQuietlyWhenStopped(t *testing.T) {
 	testutil.NoRecv(t, wakes.Chan(), 50*time.Millisecond, "a wake for a stop")
 }
 
+// **A refused open is spent before it is reported.** The sweep reads the watcher back the moment
+// awaitOpen returns, and a refused watch that still read as standing would have the cluster
+// scheduled at the healthy backstop with nothing watching it.
+func TestARefusedOpenIsSpentBeforeItIsReported(t *testing.T) {
+	f := newFakeOpener(t)
+	f.err = assert.AnError
+	w, _, done := runStream(t, f)
+
+	w.awaitOpen(context.Background())
+
+	assert.True(t, w.spent(), "a refused watch read as still standing")
+	testutil.Wait(t, done, "the stream loop to end")
+}
+
 // A cluster's served kinds move for two reasons — a CRD, or an aggregated APIService — so
 // the watcher stands over both. They resume independently: each collection has its own
 // resource version, and one aging out says nothing about the other.

@@ -170,7 +170,7 @@ func newWithOptions(conns connService, stores storeManager, opts ...option) *Ser
 	probe.Register(s.engine, nameCatalog, p,
 		probe.WithInterval(sweepInterval),
 		probe.WithTimeout(sweepTimeout),
-		probe.WithBackoff(sweepRetryBase, 2, sweepInterval))
+		probe.WithBackoff(sweepRetryBase, 2, sweepIntervalDegraded))
 	s.engine.OnPass(s.publish)
 	return s
 }
@@ -411,11 +411,13 @@ func (s *Service) publish(id string, v probe.Snapshot) {
 	}
 }
 
-// news is the part of a pass the fold reacts to: the answer and the verdict, never
-// timing.
+// news is the part of a pass the fold reacts to: the answer and the verdict, never the
+// attempt bookkeeping. WatchLive is in it because the fold reports it, and it moves only
+// inside a run — so a flapping watch costs one wake per sweep, not one per pass.
 type news struct {
 	fingerprint uint64
 	partial     bool
+	watchLive   bool
 	known       bool
 	ok          bool
 	reason      probe.Reason
@@ -425,6 +427,7 @@ func newsOf(o Observation) news {
 	return news{
 		fingerprint: o.Value.Fingerprint,
 		partial:     o.Value.Partial,
+		watchLive:   o.Value.WatchLive,
 		known:       o.Known(),
 		ok:          o.OK(),
 		reason:      o.LastAttempt.Reason,
@@ -449,17 +452,18 @@ func newsOf(o Observation) news {
 // retires — indefinitely, for a healthy cluster. The engine's commit refusal does not cover
 // this, because establishment is not a commit. The same check publish makes against the entry
 // and connFor makes against the subject.
-func (s *Service) ensureWatcher(ctx context.Context, id string, conn *kubeconn.Connection) {
+func (s *Service) ensureWatcher(ctx context.Context, id string, conn *kubeconn.Connection) bool {
 	s.mu.Lock()
 	if _, tracked := s.tracked[id]; !tracked {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	standing := s.watchers[id]
 	if standing != nil && standing.conn == conn && !standing.spent() {
 		s.mu.Unlock()
 		standing.awaitOpen(ctx)
-		return
+		// Re-read: a stream can end while the wait is out.
+		return !standing.spent()
 	}
 	// Started under the lock so a Forget racing this cannot miss it: what Forget stops is
 	// whatever the map holds, and this is in the map before the lock is dropped.
@@ -474,6 +478,9 @@ func (s *Service) ensureWatcher(ctx context.Context, id string, conn *kubeconn.C
 		standing.stop()
 	}
 	w.awaitOpen(ctx)
+	// Read after the wait, which is what makes it meaningful: a stream marks itself spent
+	// before it reports its first open, so a refusal is already in by the time this returns.
+	return !w.spent()
 }
 
 // stopWatcher ends id's watch if one stands — the probe's unwatch, called by every run that

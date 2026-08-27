@@ -327,8 +327,17 @@ subject is bound to **a server, not just a context**: `Track(id, kubecatalog.Par
 and the sweep asks the pool for that server's connection (`Lease.ConnFor`), suspending with
 `IdentityMismatch` when it is not. The params name **a cache** as well, because the sweep writes
 what it finds into that cache's store — the subject id carries the catalog's object id, not the
-cache's. The
-sweep's 10m interval is the correctness bound — a poll, since nothing here sees a CRD land.
+cache's.
+
+**The sweep's cadence follows the watch it stands over.** The registered interval is the
+correctness bound — a poll, since nothing here sees a CRD land — and it is `sweepInterval`, 30
+minutes, for a cluster whose watch is live. A run whose watch is refused, dead, or never opened
+returns `Succeeded().RequeueAfter(sweepIntervalDegraded)` (10 minutes), because the poll is then
+the only thing that would notice a new CRD. `ensureWatcher` reports that liveness, which is why
+`watcher.stream` marks a refused open **spent before it reports the open** — a run reads `spent()`
+the moment `awaitOpen` returns. `RequeueAfter` can only bring a run forward: the engine takes it
+when it is positive and shorter than the interval, so a return path can never push a subject past
+its registration. → [ADR: cadence follows the watch](../docs/adr/2026-08-27-catalog-sweep-cadence.md).
 
 **`kind_catalog` has one writer: the sweep**, the way a kubesync worker writes the objects it
 mirrors — so `kubecatalog.New(conns, stores)` takes the store manager beside the pool.
@@ -339,14 +348,18 @@ protocol. **The write comes before the commit**: a commit is the fold's wake, an
 that are not there yet would have the fold converge on a table the write is still catching up to. A
 failed write fails the run (`ReasonStoreFailed`, folded to the `StoreUnavailable` reason) and
 commits nothing; `ErrRemoved` suspends it, since a torn-down cache's `Forget` is on its way. The
-probe registers its own `WithBackoff(30s, 2, sweepInterval)` rather than the engine's default
-second: what a failure retries here is a full `ServerPreferredResources`, paid for at someone
-else's cluster, and promptness comes from the watch rather than from the ladder.
+probe registers its own `WithBackoff(30s, 2, sweepIntervalDegraded)` rather than the engine's
+default second: what a failure retries here is a full `ServerPreferredResources`, paid for at
+someone else's cluster, and promptness comes from the watch rather than from the ladder. **The cap
+is the degraded interval, not the backstop** — the ladder runs only for a sweep that failed or came
+back partial, and no watch covers either.
 → [ADR: the sweep writes the catalog](../docs/adr/2026-08-26-sweep-writes-the-catalog.md).
 
 **The sweep keeps no kind list; the rows are the answer.** Its observable is
-`Catalog{Fingerprint, Partial}` — the kinds are resident for the length of one `Run`, and the
-commit guard is that fingerprint compare. `SyncKinds` records it in `cluster_meta` under
+`Catalog{Fingerprint, Partial, WatchLive}` — the kinds are resident for the length of one `Run`,
+and the commit guard is that struct compare. **`WatchLive` stays out of `Fingerprint`**, which
+covers the kinds alone: the rows on disk are matched against that word, so a watch flip must not
+read as a table that moved. `SyncKinds` records it in `cluster_meta` under
 `kinds/fingerprint` **inside the rows' own transaction**, and `Store.KindsWithFingerprint` reads
 the pair back **out of one read transaction**. Both halves are load-bearing: split either and a
 clear landing mid-read pairs a wiped table with the fingerprint of the sweep that rewrote it, which
@@ -465,6 +478,11 @@ engine's worker bound. The rules, each carried by a reason in the `Discovered` v
   the requeue is what converges it — which is why `clusterCacheClear` leaves the catalog `False`
   for up to that interval. **Any open or read failure** settles instead: the sweep's own mirror
   refuses the same store, so its ladder is the retry and its signal re-runs this fold.
+- **`Discovered` stays `True` for a degraded watch**, and the message names it. The kinds are
+  right; what is degraded is how fast a new one shows up, and a reason of its own would put a
+  correct catalog into a false state. `WatchLive` is in `kubecatalog`'s `news` so the flip signals
+  this fold — it moves only inside a run, so it costs at most one wake per sweep, and leaving it
+  out would strand the message until `catalogResyncInterval`.
 - **A fingerprint that is recorded but not the observation's is not a wipe** — the store is
   *ahead*, since the sweep writes its rows and commits right after, and that commit is this fold's
   wake. The pass settles silently, rebuilding nothing and waking nobody: waking there would buy a
@@ -680,6 +698,15 @@ keeps what is asked and what the answers mean: `probe.go` is `registerProbes` �
 registrations kept side by side on purpose, since the set's rules are checked by eye — plus the
 probe structs; `service.go` is leases and publishing. → [ADR: probe
 engine](../docs/adr/2026-08-24-probe-engine.md).
+
+**A run's `Result` is its schedule** — `Succeeded` waits out the interval, `Fail` climbs the
+backoff ladder, `Suspend` and `Skip` wait for a `Wake` — so no domain rule lives in the scheduler.
+`Succeeded().RequeueAfter(d)` asks for the next run sooner, for a wait the run knows the length
+of — beehive's spelling, for the same ask. **Unlike beehive's it can only bring a run forward**,
+since the engine takes it when it is positive and shorter than the registered interval: a probe's
+registration bounds requests against someone else's cluster, so forget the ask and a subject is
+slower, never wrong. A zero is no ask, not "immediately". Read on a succeeded result and nowhere
+else — `Fail` owns the ladder and `Suspend` schedules nothing.
 
 **A value the engine drops goes back to the probe.** A committed value can own something — a
 connection, a file — and one the engine never applies is one nothing else can reach to release: a

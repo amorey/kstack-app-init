@@ -22,16 +22,11 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - **What it will not remove:** the id conversion, because the `ObjectID` scalar binds `clustersvc.ObjectID` (a defined type) while beehive's is an alias for `int64` — binding `int64` instead would capture every `int64` in the schema; and the status default, because beehive leaves `Status` nil until first written while the schema types it non-null. So `toX` gets small, not deleted.
   - **Upstream alternative, not a substitute:** beehive could factor its own metadata into an embeddable `ObjectMeta` that `Object` embeds (strictly additive there, and every consumer projecting objects into records pays the same copying). Even then the two exceptions above remain, and embedding beehive's metadata wholesale would put `Name`, `ResourceVersion`, and `Finalizers` on the record — `Name` especially, which this package treats as a reconcile key nothing reads back.
 
-- **Discovery's watch has no adaptive cadence, and a refused watcher is invisible.** The sweep is
-  watch-prompted now (`sidecar/internal/clustersvc/internal/kubecatalog`), with resourceVersion
-  continuation so a quiet server-side timeout costs a reopen rather than a sweep. What is left is
-  the tail: stretch the interval while the watch is healthy (needs a per-result interval on the
-  engine — a `Succeeded().After(d)` mirroring beehive's `RequeueAfter`); aggregated discovery, one
-  request instead of dozens on 1.30+ servers; metadata-only watch payloads. **The one worth
-  deciding rather than just doing:** a watcher refused by RBAC still reports `Succeeded()`, since
-  the catalog data is fine and only promptness degrades — so a user who may never watch CRDs sees
-  a healthy catalog that is quietly up to 10m stale, and nothing says so. Watch health as a field
-  on the observation is the shape; whether the fold should surface it at all is the question.
+- **Discovery still asks for one request per group-version.** The sweep is watch-prompted, its
+  cadence follows the watch, and a degraded watch is named in the catalog's condition
+  (→ [ADR](docs/adr/2026-08-27-catalog-sweep-cadence.md)). What is left is the request shape:
+  aggregated discovery, one request instead of dozens on 1.30+ servers; metadata-only watch
+  payloads.
 
 - **Nothing exposes the four non-connection probes, so "Connected but not Identified" has no detail.**
   `kubeconn.State` carries a full `Observation` per probe — value, `LastSeen`, `LastAttempt`
