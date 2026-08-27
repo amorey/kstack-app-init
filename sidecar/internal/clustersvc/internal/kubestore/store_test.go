@@ -732,7 +732,7 @@ func TestClearKindDeletesRowsWithNoCatalogRow(t *testing.T) {
 func TestClearKindKeepsTheCatalogRow(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
 
 	require.NoError(t, s.ClearKind(ctx, podKind))

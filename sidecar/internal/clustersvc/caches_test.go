@@ -837,22 +837,25 @@ func TestCachesClearStopsTheWorkersThenClearsThenRequeues(t *testing.T) {
 }
 
 // A clear empties the catalog rows too, and nothing else would put them back before the
-// sweep's own interval — so it asks for the sweep. After the clear, never before: a wake
-// ahead of it would have the sweep write the rows the clear then deletes, leaving the
-// table empty for a full interval.
-func TestCachesClearWakesTheSweeperAfterTheClear(t *testing.T) {
-	d, cacheID := twoCachesTwoResources(t)
-	store := kubestoreFake(d)
-	var order []string
-	store.onClear = func(int64) { order = append(order, "clear") }
-	f := sweeper(d)
-	f.onWake = func(string) { order = append(order, "wake") }
+// sweep's own interval — so the clear requeues the catalog, whose pass finds the table
+// wiped and asks the sweeper for the rows. The whole recovery, end to end, since a clear
+// moves nothing the sweeper would signal on.
+//
+// A wiper requeues its own subtree and knows nothing of the sweeper. Reaching past the
+// record to wake a leaf is what this replaced: every future wiper would have had to
+// remember that the catalog exists.
+func TestCachesClearRequeuesTheCatalogWhichAsksForTheSweep(t *testing.T) {
+	d, status := newReconcilingDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
+	sweepAnswered(t, d, catalog, swept(pods))
+	wakes := sweeper(d).waker()
 
-	_, err := serviceOver(t, d).Caches().Clear(context.Background(), cacheID)
+	_, err := serviceOver(t, d).Caches().Clear(context.Background(), ClusterCacheID(cache.ID))
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{ClusterCachedCatalogName(beehive.ObjectID(cacheID))}, f.woken)
-	assert.Equal(t, []string{"clear", "wake"}, order, "the sweeper was woken into the clear")
+	assert.Equal(t, catalog.Name, wakes.Await(t, "the sweep the emptied catalog needs"))
 }
 
 // The kinds' own passes are what re-arm their workers, so a clear asks for them — and

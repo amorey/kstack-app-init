@@ -18,7 +18,9 @@ package kubestore
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"strconv"
 )
 
 // readerPoolSize caps concurrent read connections per cache. Each open connection costs
@@ -36,17 +38,36 @@ const DefaultEventsLimit = 500
 // synced yet reads Count 0 rather than dropping out of the nav. Count comes off the
 // trigger-maintained counts, so this is O(kinds) and never a scan of objects.
 func (s *Store) Kinds(ctx context.Context) ([]KindRow, error) {
+	rows, _, _, err := s.KindsWithFingerprint(ctx)
+	return rows, err
+}
+
+// KindsWithFingerprint is Kinds beside the fingerprint of the sweep that wrote the rows,
+// and ok reports whether a sweep recorded one at all. **Both come out of one read
+// transaction**: a caller compares the fingerprint to decide whether the rows are the
+// sweep's answer, and a pair read from two snapshots can pass that check while carrying a
+// wipe's empty table — which reads as a cluster that serves nothing.
+//
+// An unrecorded fingerprint is a table no sweep has written, and so is one that will not
+// parse. Neither is an error: it is what a fresh file, and a wiped one, look like.
+func (s *Store) KindsWithFingerprint(ctx context.Context) ([]KindRow, uint64, bool, error) {
 	f, err := s.file()
 	if err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
-	rows, err := f.readDB.QueryContext(ctx,
+	tx, err := f.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("read kinds: begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // a read transaction, never committed
+
+	rows, err := tx.QueryContext(ctx,
 		`SELECT kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd, COALESCE(knt.count, 0)
 		 FROM kind_catalog kc
 		 LEFT JOIN kind_counts knt ON knt.api_version = kc.api_version AND knt.kind = kc.kind
 		 ORDER BY kc.api_version, kc.kind`)
 	if err != nil {
-		return nil, fmt.Errorf("read kinds: %w", err)
+		return nil, 0, false, fmt.Errorf("read kinds: %w", err)
 	}
 	defer rows.Close()
 
@@ -54,14 +75,23 @@ func (s *Store) Kinds(ctx context.Context) ([]KindRow, error) {
 	for rows.Next() {
 		var r KindRow
 		if err := rows.Scan(&r.APIVersion, &r.Kind, &r.Resource, &r.Scope, &r.IsCRD, &r.Count); err != nil {
-			return nil, fmt.Errorf("read kinds: %w", err)
+			return nil, 0, false, fmt.Errorf("read kinds: %w", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read kinds: %w", err)
+		return nil, 0, false, fmt.Errorf("read kinds: %w", err)
 	}
-	return out, nil
+
+	v, ok, err := getMeta(ctx, tx, kindsFingerprintKey)
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("read kinds fingerprint: %w", err)
+	}
+	if !ok {
+		return out, 0, false, nil
+	}
+	fingerprint, parseErr := strconv.ParseUint(v, 10, 64)
+	return out, fingerprint, parseErr == nil, nil
 }
 
 // EventRow is one cached Kubernetes Event, flattened for display. The compressed body is

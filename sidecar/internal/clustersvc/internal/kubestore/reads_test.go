@@ -29,7 +29,7 @@ import (
 func TestAReadDoesNotQueueBehindAHeldWriteTransaction(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 
 	f, err := s.file()
 	require.NoError(t, err)
@@ -50,7 +50,7 @@ func TestAReadDoesNotQueueBehindAHeldWriteTransaction(t *testing.T) {
 func TestKindsJoinsCountsAndKeepsAnEmptyKind(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow, deploymentRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow, deploymentRow}, true, 7))
 	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
 
 	got, err := s.Kinds(ctx)
@@ -60,6 +60,48 @@ func TestKindsJoinsCountsAndKeepsAnEmptyKind(t *testing.T) {
 		{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Scope: ScopeNamespaced},
 		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: ScopeNamespaced, Count: 1},
 	}, got, "ordered by (api_version, kind) for stable display")
+}
+
+// The pair the fold forks on: the rows and the fingerprint of the sweep that wrote them,
+// out of one read.
+func TestKindsWithFingerprintReadsThePairTheSweepWrote(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 42))
+
+	rows, fingerprint, ok, err := s.KindsWithFingerprint(ctx)
+
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, uint64(42), fingerprint)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "Pod", rows[0].Kind)
+}
+
+// A file no sweep has written is the state a wipe leaves behind, and the fold must read it
+// as one — never as a cluster that serves nothing.
+func TestKindsWithFingerprintReportsAnUnwrittenTable(t *testing.T) {
+	s := newTestStore(t)
+
+	rows, _, ok, err := s.KindsWithFingerprint(context.Background())
+
+	require.NoError(t, err)
+	assert.False(t, ok, "no sweep wrote this table")
+	assert.Empty(t, rows)
+}
+
+// A value that will not parse says as little about the sweep as an absent one, and reading
+// it as a fingerprint would compare a number nothing wrote.
+func TestKindsWithFingerprintReadsGarbageAsUnwritten(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 42))
+	require.NoError(t, setMeta(ctx, db(t, s), kindsFingerprintKey, "not-a-number"))
+
+	_, _, ok, err := s.KindsWithFingerprint(ctx)
+
+	require.NoError(t, err)
+	assert.False(t, ok)
 }
 
 // last_seen has one-second resolution, so ties straddle the limit. Ordering them by rowid
@@ -103,7 +145,7 @@ func TestObjectsResolveThePluralThroughTheCatalog(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, got, "no catalog row, so the plural names no Kind")
 
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 
 	got, err = s.Objects(ctx, "v1", "pods")
 	require.NoError(t, err)
@@ -117,7 +159,7 @@ func TestObjectsResolveThePluralThroughTheCatalog(t *testing.T) {
 func TestObjectsReturnTheBodyStillCompressed(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
 
 	got, err := s.Objects(ctx, "v1", "pods")
@@ -133,7 +175,7 @@ func TestObjectsReturnTheBodyStillCompressed(t *testing.T) {
 func TestObjectsAreOrderedByNamespaceAndName(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 	for _, name := range []string{"api-2", "api-0", "api-1"} {
 		require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-"+name, name, "42")))
 	}

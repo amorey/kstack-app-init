@@ -251,8 +251,11 @@ a clear stops every subject on its way through, and reporting that would flip a 
 Paused and back.
 
 **Both `Clear`s touch the store inside a hold, then requeue.** `Caches().Clear` is
-`kubesyncSvc.WhileCacheStopped(id, …)` around `Manager.Clear`, then a requeue of every kind under
-the cache; `CachedResources().Clear` is `WhileStopped(name, …)` around the kind's rows. **The hold
+`kubesyncSvc.WhileCacheStopped(id, …)` around `Manager.Clear`, then a requeue of the cache's whole
+subtree — the catalog and every kind under it; `CachedResources().Clear` is `WhileStopped(name, …)`
+around the kind's rows. **A wiper requeues records and never reaches for a leaf**: the catalog's own
+pass is what notices the `kind_catalog` rows the clear emptied and asks the sweeper to write them
+again, so a new wiper inherits that recovery by requeueing its subtree. **The hold
 is what makes stopping and clearing one step**: it stops the workers *and* refuses a `Track` until
 it returns, because a pass arming one in between would leave a worker resuming its watch into the
 file being emptied — deltas into an empty database, with no cold list to fill it. The requeue is
@@ -332,16 +335,23 @@ mirrors — so `kubecatalog.New(conns, stores)` takes the store manager beside t
 **The write is not gated on the answer changing**: every sweep that produced one upserts the rows
 (pruning only when the answer is not `Partial`), and the commit guard goes on governing only the
 *signal*. A table wiped under the sweep is therefore rewritten by the next one with no repair
-protocol, and `Caches().Clear` calls `Wake` — from its **deferred** requeue path, after the clear,
-never inline ahead of it — so that takes seconds rather than an interval. **The write comes before
-the commit**: a commit is the fold's wake, and one over rows that are not there yet would have the
-fold converge on a table the write is still catching up to. A failed write fails the run
-(`ReasonStoreFailed`, folded to the `StoreUnavailable` reason) and commits nothing; `ErrRemoved`
-suspends it, since a torn-down cache's `Forget` is on its way. The probe registers its own
-`WithBackoff(30s, 2, sweepInterval)` rather than the engine's default second: what a failure
-retries here is a full `ServerPreferredResources`, paid for at someone else's cluster, and
-promptness comes from the watch rather than from the ladder.
+protocol. **The write comes before the commit**: a commit is the fold's wake, and one over rows
+that are not there yet would have the fold converge on a table the write is still catching up to. A
+failed write fails the run (`ReasonStoreFailed`, folded to the `StoreUnavailable` reason) and
+commits nothing; `ErrRemoved` suspends it, since a torn-down cache's `Forget` is on its way. The
+probe registers its own `WithBackoff(30s, 2, sweepInterval)` rather than the engine's default
+second: what a failure retries here is a full `ServerPreferredResources`, paid for at someone
+else's cluster, and promptness comes from the watch rather than from the ladder.
 → [ADR: the sweep writes the catalog](../docs/adr/2026-08-26-sweep-writes-the-catalog.md).
+
+**The sweep keeps no kind list; the rows are the answer.** Its observable is
+`Catalog{Fingerprint, Partial}` — the kinds are resident for the length of one `Run`, and the
+commit guard is that fingerprint compare. `SyncKinds` records it in `cluster_meta` under
+`kinds/fingerprint` **inside the rows' own transaction**, and `Store.KindsWithFingerprint` reads
+the pair back **out of one read transaction**. Both halves are load-bearing: split either and a
+clear landing mid-read pairs a wiped table with the fingerprint of the sweep that rewrote it, which
+the fold reads as "the cluster serves nothing" and prunes every child off.
+→ [ADR: catalog kinds off disk](../docs/adr/2026-08-27-catalog-kinds-off-disk.md).
 
 **Promptness is a watch that only wakes.** Every run that resolves a connection stands a watcher
 up over it, before sweeping: one stream each on `customresourcedefinitions` and `apiservices`,
@@ -424,10 +434,11 @@ as well as on a changed fingerprint, and the pass that records the conflict wake
 [ADR: identity-driven retirement](../docs/adr/2026-08-27-identity-driven-retirement.md).
 
 `clusterCachedCatalogController.Reconcile` walks its two owner edges (cache, then cluster), arms
-or disarms the sweeper, and rewrites one `ClusterCachedResource` per kind the standing answer
-names. **No pass dials, and none needs extra workers** — the sweep's concurrency is the
-kubecatalog engine's worker bound. The rules, each carried by a reason in the `Discovered`
-vocabulary:
+or disarms the sweeper, and rewrites one `ClusterCachedResource` per kind the cache's store holds.
+**The kinds come off disk**, matched to the standing answer by fingerprint — the sweep keeps none —
+so a table the fingerprint does not vouch for is a wipe, not a cluster serving nothing.
+**No pass dials, and none needs extra workers** — the sweep's concurrency is the kubecatalog
+engine's worker bound. The rules, each carried by a reason in the `Discovered` vocabulary:
 
 - **`DiscoveryPartial` adds without pruning.** client-go returns partial results *and* an
   `ErrGroupDiscoveryFailed` when an aggregated API server is down. A group that went quiet has not
@@ -446,9 +457,18 @@ vocabulary:
 - **`NoConnection`** settles with no requeue: the sweep is suspended on its claim, the bridge
   re-runs it on recovery, and its signal re-runs this fold. The outage itself is the cluster
   pass's to report.
-- **`StoreUnavailable`** is discovery answering and the cache's own store refusing the rows. Not a
-  discovery failure — pointing a user at the API server is the wrong remedy — and the sweep's own
-  ladder is retrying, so the fold settles.
+- **`StoreUnavailable`** is discovery answering and the cache's own store not giving the kinds
+  back. Never a discovery failure — pointing a user at the API server is the wrong remedy — and it
+  covers two shapes. **A table no sweep has written** (no fingerprint recorded, no file,
+  `ErrClosed`) leaves the children alone, wakes the sweeper, and requeues at `catalogRetryInterval`:
+  a wipe leaves the cluster's answer unmoved, so the rewrite commits nothing and signals nobody, and
+  the requeue is what converges it — which is why `clusterCacheClear` leaves the catalog `False`
+  for up to that interval. **Any open or read failure** settles instead: the sweep's own mirror
+  refuses the same store, so its ladder is the retry and its signal re-runs this fold.
+- **A fingerprint that is recorded but not the observation's is not a wipe** — the store is
+  *ahead*, since the sweep writes its rows and commits right after, and that commit is this fold's
+  wake. The pass settles silently, rebuilding nothing and waking nobody: waking there would buy a
+  full discovery pass at the cluster's expense every time a sweep raced a fold.
 
 A kind is mirrorable when it is not a subresource and carries both `list` and `watch`; the
 `events.k8s.io` spelling is dropped so one event store is not cached twice. The filter lives with

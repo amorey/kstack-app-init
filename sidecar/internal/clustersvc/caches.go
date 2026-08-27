@@ -451,15 +451,14 @@ func (a cachesAPI) Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache,
 	return toClusterCache(obj)
 }
 
-// requeueCacheResources asks every kind under a cache to reconcile, which is what
-// re-arms its worker, and asks the sweeper for the pass that rewrites the catalog rows
-// the clear emptied. A requeue that cannot be delivered costs latency rather than the
-// clear: the kind's resync runs the same pass.
+// requeueCacheResources asks the cache's whole subtree to reconcile: every kind, whose
+// pass re-arms its worker, and the catalog, whose pass finds the kind rows the clear
+// emptied and asks the sweeper to write them again. A requeue that cannot be delivered
+// costs latency rather than the clear: each kind's own resync runs the same pass.
 //
-// **Both happen after the clear**, which is why this is deferred rather than inline. A
-// wake ahead of it races in exactly the direction the wake exists to prevent: the woken
-// sweep writes the rows and the clear then deletes them, leaving the table empty for a
-// full sweep interval.
+// **It happens after the clear**, which is why this is deferred rather than inline: a
+// catalog pass ahead of it would ask for a sweep whose rows the clear then deletes,
+// leaving the table empty for a full sweep interval.
 func (a cachesAPI) requeueCacheResources(ctx context.Context, cacheID ClusterCacheID) {
 	ctx, cancel := afterClear(ctx)
 	defer cancel()
@@ -468,7 +467,9 @@ func (a cachesAPI) requeueCacheResources(ctx context.Context, cacheID ClusterCac
 	if err != nil || !ok {
 		return
 	}
-	a.s.kubecatalogSvc.Wake(ClusterCachedCatalogName(beehive.ObjectID(cacheID)))
+	//nolint:errcheck // a lost requeue costs latency; catalogResync is the backstop
+	_ = a.s.catalogClient.Requeue(ctx, catalogID)
+
 	objs, err := a.s.resourceClient.ListOwnedObjects(ctx, catalogID)
 	if err != nil {
 		return

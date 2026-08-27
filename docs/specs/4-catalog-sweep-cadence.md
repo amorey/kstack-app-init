@@ -6,8 +6,8 @@ status: Planned
 
 # Catalog sweep cadence follows the watch
 
-> **Build order — 4.** No prerequisites. Last because it touches `Catalog`, which [spec 3](3-catalog-kinds-off-disk.md) rewrites — it
-> composes with either shape, but landing after means writing it once.
+> **Build order — 4.** No prerequisites. It touches `Catalog`, now a fingerprint and a flag
+> (→ [ADR](../adr/2026-08-27-catalog-kinds-off-disk.md)).
 > **Nothing a user sees changes.** It removes redundant load on the clusters we point at.
 
 ## Goal

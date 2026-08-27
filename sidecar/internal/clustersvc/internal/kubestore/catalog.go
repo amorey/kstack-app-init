@@ -18,6 +18,7 @@ package kubestore
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -40,6 +41,11 @@ type KindRow struct {
 	Count int
 }
 
+// kindsFingerprintKey is the cluster_meta key the sweep's last answer is fingerprinted
+// under — its own namespace beside the cookies'. An absent key is a wipe, which is the
+// state a fresh file is in; no migration backfills it.
+const kindsFingerprintKey = "kinds/fingerprint"
+
 // SyncKinds reconciles the whole catalog against one sweep's answer, in one transaction.
 // prune deletes the rows the answer did not carry, and is the caller's call: a sweep that
 // did not reach every api group has not seen the kinds it is missing.
@@ -47,7 +53,12 @@ type KindRow struct {
 // **This table has one writer.** Rows leave it through the prune alone, so a per-kind
 // teardown does not take one with it — the kind is still served, and dropping its row
 // would take it out of the nav until the next sweep.
-func (s *Store) SyncKinds(ctx context.Context, rows []KindRow, prune bool) error {
+//
+// **fingerprint rides the rows' own transaction**, which is what lets a reader tell a
+// table this sweep wrote from one wiped under it. It names the sweep's answer, not the
+// table's contents: a partial answer upserts without pruning, so the table can hold rows
+// the fingerprint does not cover.
+func (s *Store) SyncKinds(ctx context.Context, rows []KindRow, prune bool, fingerprint uint64) error {
 	f, err := s.file()
 	if err != nil {
 		return err
@@ -83,6 +94,9 @@ func (s *Store) SyncKinds(ctx context.Context, rows []KindRow, prune bool) error
 		if err := pruneKinds(ctx, tx, rows); err != nil {
 			return fmt.Errorf("sync kinds: prune: %w", err)
 		}
+	}
+	if err := setMeta(ctx, tx, kindsFingerprintKey, strconv.FormatUint(fingerprint, 10)); err != nil {
+		return fmt.Errorf("sync kinds: fingerprint: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("sync kinds: commit: %w", err)

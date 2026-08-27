@@ -85,7 +85,7 @@ func TestCachedDataReadsACacheWhoseWorkersStopped(t *testing.T) {
 	f := newDataFixture(t)
 	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{
 		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: kubestore.ScopeNamespaced},
-	}, true))
+	}, true, 7))
 	require.NoError(t, f.store.ApplyChange(ctx, kubestore.Kind{
 		APIVersion: "v1", Kind: "Pod", Resource: "pods",
 	}, watch.Added, dataPod("uid-1", "api-0", "42")))
@@ -162,7 +162,7 @@ func TestListKindsReadsTheCatalog(t *testing.T) {
 	f := newDataFixture(t)
 	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{
 		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: kubestore.ScopeNamespaced},
-	}, true))
+	}, true, 7))
 
 	got, err := f.data().ListKinds(ctx, f.clusterID, f.cacheID)
 
@@ -181,7 +181,7 @@ func TestWatchKindsStreamsTheCatalogWithCounts(t *testing.T) {
 	f := newDataFixture(t)
 	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{
 		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: kubestore.ScopeNamespaced},
-	}, true))
+	}, true, 7))
 
 	stream, err := f.data().WatchKinds(ctx, f.clusterID, f.cacheID)
 	require.NoError(t, err)
@@ -209,7 +209,7 @@ func TestWatchObjectsCarriesItsKindAsProvenance(t *testing.T) {
 	f := newDataFixture(t)
 	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{
 		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: kubestore.ScopeNamespaced},
-	}, true))
+	}, true, 7))
 	require.NoError(t, f.store.ApplyChange(ctx, kubestore.Kind{
 		APIVersion: "v1", Kind: "Pod", Resource: "pods",
 	}, watch.Added, dataPod("uid-1", "api-0", "42")))

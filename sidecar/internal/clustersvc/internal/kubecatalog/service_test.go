@@ -174,10 +174,14 @@ func armed(cacheID int64, contextName string) Params {
 
 // answering is a sweep that always serves these kinds.
 func answering(kinds ...Kind) option {
-	return withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
-		return Catalog{Kinds: kinds}, nil
+	return withSweep(func(context.Context, *kubeconn.Connection) (sweep, error) {
+		return sweep{Kinds: kinds}, nil
 	})
 }
+
+// answers is what an observation of these kinds carries: the sweep keeps no list, so a
+// test asks whether the standing answer is the one these kinds hash to.
+func answers(kinds ...Kind) uint64 { return Fingerprint(kinds) }
 
 // startService runs the service for the test's life, stop before Close like the
 // composition root.
@@ -251,7 +255,7 @@ func TestSweepSignalsWhenTheAnswerLands(t *testing.T) {
 	obs, ok := svc.Read("cachedcatalog/1")
 	require.True(t, ok)
 	require.True(t, obs.Known())
-	assert.Equal(t, []Kind{pods}, obs.Value.Kinds)
+	assert.Equal(t, answers(pods), obs.Value.Fingerprint)
 	assert.True(t, obs.OK())
 }
 
@@ -281,9 +285,9 @@ func TestSweepWritesIntoItsCacheStore(t *testing.T) {
 func TestWakeRerunsTheSweep(t *testing.T) {
 	conns := newFakeConns()
 	var sweeps atomic.Int32
-	svc := newTestService(t, conns, withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
+	svc := newTestService(t, conns, withSweep(func(context.Context, *kubeconn.Connection) (sweep, error) {
 		sweeps.Add(1)
-		return Catalog{Kinds: []Kind{pods}}, nil
+		return sweep{Kinds: []Kind{pods}}, nil
 	}))
 	startService(t, svc)
 	sub := svc.Subscribe()
@@ -298,6 +302,32 @@ func TestWakeRerunsTheSweep(t *testing.T) {
 		testutil.Timeout, time.Millisecond, "the wake did not re-run the sweep")
 }
 
+// A pass that re-confirms the standing answer wakes nobody, however many times it runs.
+// news is a projection of the committed value, and the answer's whole contribution to it
+// is the fingerprint — so a subject holding no kinds at all must still read as unmoved.
+func TestARepeatedAnswerSignalsNobody(t *testing.T) {
+	conns := newFakeConns()
+	sweeps := testutil.NewProbe[struct{}](8)
+	svc := newTestService(t, conns, withSweep(func(context.Context, *kubeconn.Connection) (sweep, error) {
+		sweeps.Fire(struct{}{})
+		return sweep{Kinds: []Kind{pods}}, nil
+	}))
+	startService(t, svc)
+	sub := svc.Subscribe()
+	t.Cleanup(sub.Close)
+
+	svc.Track("cachedcatalog/1", armed(7, "prod"))
+	testutil.Recv(t, sub.Chan(), "the first answer's signal")
+	sweeps.Drain()
+
+	svc.Wake("cachedcatalog/1")
+	sweeps.Await(t, "the re-run")
+
+	// A negative assertion has no event to wait for, so it needs a bounded window: the
+	// sweep this measures has already run, so a signal it produced would be here.
+	testutil.NoRecv(t, sub.Chan(), 100*time.Millisecond, "a signal for an unmoved answer")
+}
+
 // A sweep for a subject nothing tracks writes nowhere. Forget can land under a run, and a
 // write off it would recreate the file a teardown just deleted, permanently orphaned.
 func TestAForgottenSubjectWritesNothing(t *testing.T) {
@@ -306,7 +336,7 @@ func TestAForgottenSubjectWritesNothing(t *testing.T) {
 	svc := newTestServiceOver(t, conns, stores)
 	startService(t, svc)
 
-	err := svc.mirror(context.Background(), "cachedcatalog/1", Catalog{Kinds: []Kind{pods}})
+	err := svc.mirror(context.Background(), "cachedcatalog/1", sweep{Kinds: []Kind{pods}}, 7)
 
 	assert.ErrorIs(t, err, kubestore.ErrRemoved)
 }
@@ -335,7 +365,7 @@ func TestConnectionRecoveryWakesASuspendedSweep(t *testing.T) {
 	obs, ok = svc.Read("cachedcatalog/1")
 	require.True(t, ok)
 	require.True(t, obs.Known())
-	assert.Equal(t, []Kind{pods}, obs.Value.Kinds)
+	assert.Equal(t, answers(pods), obs.Value.Fingerprint)
 }
 
 // --- identity scoping ---
@@ -380,7 +410,7 @@ func TestSweepKeepsItsAnswerWhenTheServerChanges(t *testing.T) {
 	testutil.Recv(t, sub.Chan(), "the refusal's signal")
 	obs, ok := svc.Read("cachedcatalog/1")
 	require.True(t, ok)
-	assert.Equal(t, []Kind{pods}, obs.Value.Kinds, "read from this cache's own server")
+	assert.Equal(t, answers(pods), obs.Value.Fingerprint, "read from this cache's own server")
 	assert.Equal(t, ReasonIdentityMismatch, obs.LastAttempt.Reason)
 }
 
@@ -407,7 +437,7 @@ func TestSweepWaitsForAnUnidentifiedServer(t *testing.T) {
 	testutil.Recv(t, sub.Chan(), "the sweep once the server is identified")
 	obs, ok = svc.Read("cachedcatalog/1")
 	require.True(t, ok)
-	assert.Equal(t, []Kind{pods}, obs.Value.Kinds)
+	assert.Equal(t, answers(pods), obs.Value.Fingerprint)
 }
 
 // A cluster nothing reached reports the outage, not the identity it could not have read
@@ -452,7 +482,7 @@ func TestSweepRefusesAConnectionNotYetReidentified(t *testing.T) {
 	obs, ok := svc.Read("cachedcatalog/1")
 	require.True(t, ok)
 	assert.Equal(t, ReasonIdentityMismatch, obs.LastAttempt.Reason)
-	assert.Equal(t, []Kind{pods}, obs.Value.Kinds, "the answer from this cache's own server stands")
+	assert.Equal(t, answers(pods), obs.Value.Fingerprint, "the answer from this cache's own server stands")
 }
 
 // --- the watcher's lifetime ---
@@ -656,9 +686,9 @@ func TestARefusedWatchDoesNotRerunTheSweep(t *testing.T) {
 
 	sweeps := testutil.NewProbe[struct{}](8)
 	svc := newTestService(t, conns, withOpener(f.open),
-		withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
+		withSweep(func(context.Context, *kubeconn.Connection) (sweep, error) {
 			sweeps.Fire(struct{}{})
-			return Catalog{Kinds: []Kind{pods}}, nil
+			return sweep{Kinds: []Kind{pods}}, nil
 		}))
 	startService(t, svc)
 
@@ -685,13 +715,13 @@ func TestAFailedSweepStillMovesTheWatcherToTheNewConnection(t *testing.T) {
 	var mu sync.Mutex
 	failing := false
 	svc := newTestService(t, conns, withOpener(f.open),
-		withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
+		withSweep(func(context.Context, *kubeconn.Connection) (sweep, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			if failing {
-				return Catalog{}, errors.New("the server rejected our request")
+				return sweep{}, errors.New("the server rejected our request")
 			}
-			return Catalog{Kinds: []Kind{pods}}, nil
+			return sweep{Kinds: []Kind{pods}}, nil
 		}))
 	startService(t, svc)
 	sub := svc.Subscribe()
@@ -730,9 +760,9 @@ func TestTheSweepWaitsForItsWatchesToOpen(t *testing.T) {
 
 	sweeps := testutil.NewProbe[struct{}](8)
 	svc := newTestService(t, conns, withOpener(f.open),
-		withSweep(func(context.Context, *kubeconn.Connection) (Catalog, error) {
+		withSweep(func(context.Context, *kubeconn.Connection) (sweep, error) {
 			sweeps.Fire(struct{}{})
-			return Catalog{Kinds: []Kind{pods}}, nil
+			return sweep{Kinds: []Kind{pods}}, nil
 		}))
 	startService(t, svc)
 	// After startService, so it runs before that cleanup: Cleanup is LIFO, and Close waits for

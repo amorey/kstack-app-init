@@ -16,6 +16,7 @@ package clustersvc
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
@@ -168,34 +170,73 @@ func servingCatalog(t *testing.T, enabled bool) (deps, *beehive.Object[ClusterCa
 // sweeper is the fake behind the pass under test.
 func sweeper(d deps) *fakeKubecatalog { return d.kubecatalogSvc.(*fakeKubecatalog) }
 
-// sweepAnswered files the sweeper's standing answer for this catalog's subject.
-func sweepAnswered(d deps, obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus], o kubecatalog.Observation) {
-	f := sweeper(d)
-	if f.obs == nil {
-		f.obs = map[string]kubecatalog.Observation{}
+// sweepAnswer is one fake sweep: the observation the fold reads, beside the kinds that
+// sweep left in the store. The two travel together because the fold joins them by
+// fingerprint — an observation whose kinds were never written reads as a wiped table.
+type sweepAnswer struct {
+	obs   kubecatalog.Observation
+	kinds []kubecatalog.Kind
+}
+
+// sweepAnswered files the sweeper's standing answer for this catalog's subject and writes
+// the rows behind it, which is the sweep's own pair of steps.
+func sweepAnswered(t *testing.T, d deps, obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus], a sweepAnswer) {
+	t.Helper()
+	sweeper(d).setObs(obj.Name, a.obs)
+	if a.obs.Known() {
+		writeKinds(t, d, cacheIDOf(t, d, obj), a)
 	}
-	f.obs[obj.Name] = o
+}
+
+// writeKinds is the sweep's write: the rows, pruned only on a complete answer, and the
+// fingerprint the observation carries.
+func writeKinds(t *testing.T, d deps, cacheID int64, a sweepAnswer) {
+	t.Helper()
+	store, err := kubestoreFake(d).mgr.OpenOrCreate(cacheID)
+	require.NoError(t, err)
+	defer store.Release()
+
+	rows := make([]kubestore.KindRow, 0, len(a.kinds))
+	for _, k := range a.kinds {
+		scope := kubestore.ScopeCluster
+		if k.Namespaced {
+			scope = kubestore.ScopeNamespaced
+		}
+		rows = append(rows, kubestore.KindRow{
+			APIVersion: k.GroupVersion, Kind: k.Kind, Resource: k.Resource, Scope: scope,
+		})
+	}
+	require.NoError(t, store.SyncKinds(context.Background(), rows, !a.obs.Value.Partial, a.obs.Value.Fingerprint))
 }
 
 // swept is a sweep that answered these kinds at probedAt.
-func swept(kinds ...kubecatalog.Kind) kubecatalog.Observation {
-	return kubecatalog.Observation{
-		Value:    kubecatalog.Catalog{Kinds: kinds},
-		LastSeen: probedAt,
-		Attempts: kubeconn.Attempts{LastAttempt: finished(kubeconn.ReasonSucceeded, "")},
+func swept(kinds ...kubecatalog.Kind) sweepAnswer {
+	return sweepAnswer{
+		obs: kubecatalog.Observation{
+			Value:    kubecatalog.Catalog{Fingerprint: kubecatalog.Fingerprint(kinds)},
+			LastSeen: probedAt,
+			Attempts: kubeconn.Attempts{LastAttempt: finished(kubeconn.ReasonSucceeded, "")},
+		},
+		kinds: kinds,
 	}
 }
 
 // partialSwept is a sweep some groups failed to answer: the partial list is committed
 // and the run failed, which is how the probe records it.
-func partialSwept(kinds ...kubecatalog.Kind) kubecatalog.Observation {
-	o := swept(kinds...)
-	o.Value.Partial = true
-	o.Attempts = kubeconn.Attempts{
+func partialSwept(kinds ...kubecatalog.Kind) sweepAnswer {
+	a := swept(kinds...)
+	a.obs.Value.Partial = true
+	a.obs.Attempts = kubeconn.Attempts{
 		LastAttempt: finished(kubecatalog.ReasonSweepPartial, "a group failed to answer"),
 		Failures:    1, FailingSince: probedAt,
 	}
-	return o
+	return a
+}
+
+// answeredNothing is a sweeper that has answered no kinds at all, carrying only this
+// attempt — the shape of a subject armed but not yet swept.
+func answeredNothing(a kubeconn.Attempt) sweepAnswer {
+	return sweepAnswer{obs: kubecatalog.Observation{Attempts: kubeconn.Attempts{LastAttempt: a}}}
 }
 
 // deployments and pods are the two kinds the pass fixtures discover.
@@ -272,7 +313,7 @@ func TestCatalogReconcileArmsTheSweeper(t *testing.T) {
 // GC cascades, carrying the identity a worker builds its REST path from.
 func TestCatalogReconcileCreatesAChildPerServedKind(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, swept(deployments, pods))
+	sweepAnswered(t, d, catalog, swept(deployments, pods))
 
 	client, res := reconcileCatalog(t, d, catalog)
 
@@ -291,14 +332,14 @@ func TestCatalogReconcileCreatesAChildPerServedKind(t *testing.T) {
 // recreated — which is what keeps its id, and any subscription keyed on it, alive.
 func TestCatalogReconcileRefreshesAChangedKind(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, swept(pods))
+	sweepAnswered(t, d, catalog, swept(pods))
 	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 	before := storedKinds(t, d, catalog.ID)[SyncedKindRef{APIVersion: "v1", Resource: "pods"}]
 
 	clusterScoped := pods
 	clusterScoped.Namespaced = false
-	sweepAnswered(d, catalog, swept(clusterScoped))
+	sweepAnswered(t, d, catalog, swept(clusterScoped))
 	_, res = reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
@@ -312,11 +353,11 @@ func TestCatalogReconcileRefreshesAChangedKind(t *testing.T) {
 // worker behind it.
 func TestCatalogReconcilePrunesAKindNoLongerServed(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, swept(deployments, pods))
+	sweepAnswered(t, d, catalog, swept(deployments, pods))
 	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
-	sweepAnswered(d, catalog, swept(pods))
+	sweepAnswered(t, d, catalog, swept(pods))
 	_, res = reconcileCatalog(t, d, catalog)
 
 	require.NoError(t, res.Err())
@@ -330,11 +371,11 @@ func TestCatalogReconcilePrunesAKindNoLongerServed(t *testing.T) {
 // of one aggregated API server.
 func TestCatalogReconcilePrunesNothingOnAPartialSweep(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, swept(deployments, pods))
+	sweepAnswered(t, d, catalog, swept(deployments, pods))
 	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
-	sweepAnswered(d, catalog, partialSwept(pods))
+	sweepAnswered(t, d, catalog, partialSwept(pods))
 	client, res := reconcileCatalog(t, d, catalog)
 
 	require.NoError(t, res.Err())
@@ -350,16 +391,16 @@ func TestCatalogReconcilePrunesNothingOnAPartialSweep(t *testing.T) {
 // settles: retrying the sweep is the probe's own ladder, not beehive's.
 func TestCatalogReconcileKeepsItsChildrenWhenTheSweepFails(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, swept(pods))
+	sweepAnswered(t, d, catalog, swept(pods))
 	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
 	failing := swept(pods)
-	failing.Attempts = kubeconn.Attempts{
+	failing.obs.Attempts = kubeconn.Attempts{
 		LastAttempt: finished(kubecatalog.ReasonSweepFailed, "the server rejected our request"),
 		Failures:    1, FailingSince: probedAt,
 	}
-	sweepAnswered(d, catalog, failing)
+	sweepAnswered(t, d, catalog, failing)
 	client, res := reconcileCatalog(t, d, catalog)
 
 	require.NoError(t, res.Err())
@@ -377,16 +418,16 @@ func TestCatalogReconcileKeepsItsChildrenWhenTheSweepFails(t *testing.T) {
 // converge from the standing answer meanwhile, and the sweep's own ladder is retrying.
 func TestCatalogReconcileReportsAStoreThatWouldNotTakeTheAnswer(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, swept(pods))
+	sweepAnswered(t, d, catalog, swept(pods))
 	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
 	failing := swept(pods)
-	failing.Attempts = kubeconn.Attempts{
+	failing.obs.Attempts = kubeconn.Attempts{
 		LastAttempt: finished(kubecatalog.ReasonStoreFailed, "database or disk is full"),
 		Failures:    1, FailingSince: probedAt,
 	}
-	sweepAnswered(d, catalog, failing)
+	sweepAnswered(t, d, catalog, failing)
 	client, res := reconcileCatalog(t, d, catalog)
 
 	require.NoError(t, res.Err())
@@ -401,12 +442,7 @@ func TestCatalogReconcileReportsAStoreThatWouldNotTakeTheAnswer(t *testing.T) {
 // own arm the wait would read as Connecting for as long as the disk keeps refusing.
 func TestCatalogReconcileReportsAStoreFailureBeforeTheFirstAnswer(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, kubecatalog.Observation{
-		Attempts: kubeconn.Attempts{
-			LastAttempt: finished(kubecatalog.ReasonStoreFailed, "database or disk is full"),
-			Failures:    1, FailingSince: probedAt,
-		},
-	})
+	sweepAnswered(t, d, catalog, answeredNothing(finished(kubecatalog.ReasonStoreFailed, "database or disk is full")))
 
 	client, res := reconcileCatalog(t, d, catalog)
 
@@ -420,16 +456,16 @@ func TestCatalogReconcileReportsAStoreFailureBeforeTheFirstAnswer(t *testing.T) 
 // flag it left behind.
 func TestCatalogReconcileReportsAFailureOverAStalePartialFlag(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, partialSwept(pods))
+	sweepAnswered(t, d, catalog, partialSwept(pods))
 	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
 	failing := partialSwept(pods)
-	failing.Attempts = kubeconn.Attempts{
+	failing.obs.Attempts = kubeconn.Attempts{
 		LastAttempt: finished(kubecatalog.ReasonSweepFailed, "the server rejected our request"),
 		Failures:    2, FailingSince: probedAt,
 	}
-	sweepAnswered(d, catalog, failing)
+	sweepAnswered(t, d, catalog, failing)
 	client, res := reconcileCatalog(t, d, catalog)
 
 	require.NoError(t, res.Err())
@@ -438,14 +474,86 @@ func TestCatalogReconcileReportsAFailureOverAStalePartialFlag(t *testing.T) {
 	assert.Equal(t, "the server rejected our request", cond.Message)
 }
 
+// --- the table the sweep wrote, and the table something wiped ---
+
+// A clear empties the kind catalog, and an empty table must never read as "the cluster
+// serves nothing" — that would stop every worker under the cache. So the children stand
+// and the sweep is asked for the pass that lays the rows down again: nothing else would
+// ask, since a wipe leaves the cluster's answer unmoved and so commits nothing to signal
+// on. The requeue is what converges it, the rewrite being silent for the same reason.
+func TestCatalogReconcileLeavesItsChildrenWhenTheTableWasWiped(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	sweepAnswered(t, d, catalog, swept(pods))
+	_, res := reconcileCatalog(t, d, catalog)
+	require.NoError(t, res.Err())
+	require.NoError(t, kubestoreFake(d).mgr.Clear(cacheIDOf(t, d, catalog)))
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled().RequeueAfter(catalogRetryInterval), res)
+	kept := storedKinds(t, d, catalog.ID)[SyncedKindRef{APIVersion: "v1", Resource: "pods"}]
+	require.NotNil(t, kept, "an emptied table was read as a cluster serving nothing")
+	assert.Nil(t, kept.DeletionRequestedAt)
+	assert.Equal(t, []string{catalog.Name}, sweeper(d).woken)
+	cond := client.discovered(t)
+	assert.Equal(t, ConditionFalse, cond.Status)
+	assert.Equal(t, ReasonStoreUnavailable, cond.Reason)
+}
+
+// A table under a fingerprint the standing answer does not carry is a sweep that has
+// written its rows and not yet committed — the write comes first, and this pass read
+// between the two. The commit is what wakes this fold, so the pass reports nothing and
+// asks for nothing: waking the sweeper here would buy a full discovery pass at the
+// cluster's expense every time an ordinary sweep raced a fold.
+func TestCatalogReconcileWaitsWhenTheStoreIsAheadOfTheAnswer(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	sweepAnswered(t, d, catalog, swept(pods))
+	_, res := reconcileCatalog(t, d, catalog)
+	require.NoError(t, res.Err())
+
+	// The rows of a sweep whose commit has not landed, under the observation that predates it.
+	ahead := swept(deployments)
+	writeKinds(t, d, cacheIDOf(t, d, catalog), ahead)
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
+	assert.Empty(t, sweeper(d).woken, "an ordinary sweep bought an extra discovery pass")
+	assert.Empty(t, client.conditions, "a pass that raced a write has nothing to report")
+	kinds := storedKinds(t, d, catalog.ID)
+	assert.Nil(t, kinds[SyncedKindRef{APIVersion: "apps/v1", Resource: "deployments"}],
+		"children were rebuilt from rows the standing answer does not vouch for")
+	assert.NotNil(t, kinds[SyncedKindRef{APIVersion: "v1", Resource: "pods"}])
+}
+
+// A store that will not open refuses the sweep's own write alike, so its run fails, its
+// reason moves, and its signal re-runs this fold — the sweep's ladder is the retry, and
+// this pass carries none of its own. Covers every open and read failure, `ErrRemoved`
+// included: a cache being torn down normally stops at ownersOf, so what reaches here is a
+// file that is there and unusable.
+func TestCatalogReconcileSettlesWhenTheStoreWillNotOpen(t *testing.T) {
+	d, catalog := servingCatalog(t, true)
+	sweepAnswered(t, d, catalog, swept(pods))
+	kubestoreFake(d).err = errors.New("database disk image is malformed")
+
+	client, res := reconcileCatalog(t, d, catalog)
+
+	require.NoError(t, res.Err())
+	assert.Equal(t, beehive.Settled(), res)
+	assert.Empty(t, sweeper(d).woken)
+	cond := client.discovered(t)
+	assert.Equal(t, ReasonStoreUnavailable, cond.Reason)
+	assert.Contains(t, cond.Message, "malformed")
+}
+
 // A cluster nothing reached: the sweep is suspended on its claim, and the fold reports
 // the wait without a requeue of its own — the connection bridge wakes the sweep the
 // moment the pool reaches the server, and the sweep's signal re-runs this fold.
 func TestCatalogReconcileWaitsForAConnection(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, kubecatalog.Observation{
-		Attempts: kubeconn.Attempts{LastAttempt: suspended(kubecatalog.ReasonNoConnection, "no connection for kube-context")},
-	})
+	sweepAnswered(t, d, catalog, answeredNothing(suspended(kubecatalog.ReasonNoConnection, "no connection for kube-context")))
 
 	client, res := reconcileCatalog(t, d, catalog)
 
@@ -469,7 +577,7 @@ func suspended(reason kubeconn.Reason, msg string) kubeconn.Attempt {
 // children, since relaying it is what pausing means.
 func TestCatalogReconcileRelaysAPauseAndDisarmsTheSweep(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, swept(pods))
+	sweepAnswered(t, d, catalog, swept(pods))
 	_, res := reconcileCatalog(t, d, catalog)
 	require.NoError(t, res.Err())
 
@@ -752,11 +860,7 @@ func TestCachedCatalogsWatchListReportsADeparture(t *testing.T) {
 // point a reader at the API server when what moved is which cluster the context reaches.
 func TestCatalogReconcileReportsAnIdentityMismatchBeforeAnySweep(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
-	sweepAnswered(d, catalog, kubecatalog.Observation{
-		Attempts: kubeconn.Attempts{
-			LastAttempt: suspended(kubecatalog.ReasonIdentityMismatch, "context \"prod\" reached uid-2, not uid-1"),
-		},
-	})
+	sweepAnswered(t, d, catalog, answeredNothing(suspended(kubecatalog.ReasonIdentityMismatch, "context \"prod\" reached uid-2, not uid-1")))
 
 	client, res := reconcileCatalog(t, d, catalog)
 
@@ -772,10 +876,10 @@ func TestCatalogReconcileReportsAnIdentityMismatchBeforeAnySweep(t *testing.T) {
 func TestCatalogReconcileReportsAnIdentityMismatchOverAStandingAnswer(t *testing.T) {
 	d, catalog := servingCatalog(t, true)
 	o := swept(pods)
-	o.Attempts = kubeconn.Attempts{
+	o.obs.Attempts = kubeconn.Attempts{
 		LastAttempt: suspended(kubecatalog.ReasonIdentityMismatch, "the server behind \"prod\" was replaced"),
 	}
-	sweepAnswered(d, catalog, o)
+	sweepAnswered(t, d, catalog, o)
 
 	client, res := reconcileCatalog(t, d, catalog)
 

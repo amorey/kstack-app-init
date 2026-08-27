@@ -31,13 +31,13 @@ dependency, and each spec's header states what it needs and what it hands to the
 
 **The cache read path has landed.** The sweep writes `kind_catalog`
 (→ [ADR](../adr/2026-08-26-sweep-writes-the-catalog.md)) and the `CachedData()` family reads it back
-(→ [ADR](../adr/2026-08-26-cached-data-read-loop.md)), so the nav and the tables are live. What is
-left are the two cleanups behind it, and neither blocks anything. The numbers are the build order;
-1 and 2 are gone because they shipped.
+(→ [ADR](../adr/2026-08-26-cached-data-read-loop.md)), so the nav and the tables are live. So has
+the fold's read of those rows (→ [ADR](../adr/2026-08-27-catalog-kinds-off-disk.md)). What is left
+is the cleanup behind it, which blocks nothing. The numbers are the build order; 1 through 3 are
+gone because they shipped.
 
 | # | Spec | Scope | Status | Delivers |
 | --- | --- | --- | --- | --- |
-| 3 | [Catalog kinds off disk](3-catalog-kinds-off-disk.md) | sidecar | Planned | the fold reads its kinds from the store; the resident copy goes |
 | 4 | [Catalog sweep cadence](4-catalog-sweep-cadence.md) | sidecar | Planned | the poll under the watch becomes rare (no user-visible change) |
 
 **Independent.**

@@ -163,6 +163,9 @@ func (l *fakeLease) Release() { l.svc.released = append(l.svc.released, l.contex
 // records what was armed and disarmed. The zero value tracks nothing and knows nothing,
 // which reads as a sweep still owed.
 type fakeKubecatalog struct {
+	// mu guards everything a pass touches: under a running beehive every method here is
+	// called from a reconcile goroutine, against fixtures the test goroutine wrote.
+	mu  sync.Mutex
 	obs map[string]kubecatalog.Observation
 	// tracked and forgotten record the arm/disarm calls in order; armedFor holds the
 	// params each Track named, and woken the ids a wiper asked a sweep for.
@@ -176,9 +179,16 @@ type fakeKubecatalog struct {
 
 	once sync.Once
 	hub  *conflate.Hub[string, struct{}]
+
+	// wakeOnce/wakes report each Wake to a test that has to wait for one, since the
+	// slices above are readable only once nothing is reconciling.
+	wakeOnce sync.Once
+	wakes    *testutil.Probe[string]
 }
 
 func (f *fakeKubecatalog) Track(id string, p kubecatalog.Params) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.tracked = append(f.tracked, id)
 	if f.armedFor == nil {
 		f.armedFor = map[string]kubecatalog.Params{}
@@ -186,18 +196,45 @@ func (f *fakeKubecatalog) Track(id string, p kubecatalog.Params) {
 	f.armedFor[id] = p
 }
 
-func (f *fakeKubecatalog) Forget(id string) { f.forgotten = append(f.forgotten, id) }
+func (f *fakeKubecatalog) Forget(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forgotten = append(f.forgotten, id)
+}
 
 func (f *fakeKubecatalog) Wake(id string) {
+	f.mu.Lock()
 	f.woken = append(f.woken, id)
+	f.mu.Unlock()
+
+	// Outside the lock: both reach a test's own code, which must not run under it.
+	f.waker().Fire(id)
 	if f.onWake != nil {
 		f.onWake(id)
 	}
 }
 
+func (f *fakeKubecatalog) waker() *testutil.Probe[string] {
+	f.wakeOnce.Do(func() { f.wakes = testutil.NewProbe[string](8) })
+	return f.wakes
+}
+
 func (f *fakeKubecatalog) Read(id string) (kubecatalog.Observation, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	o, ok := f.obs[id]
 	return o, ok
+}
+
+// setObs files one subject's standing answer, which a fixture writes while passes may
+// already be reading it.
+func (f *fakeKubecatalog) setObs(id string, o kubecatalog.Observation) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.obs == nil {
+		f.obs = map[string]kubecatalog.Observation{}
+	}
+	f.obs[id] = o
 }
 
 // Subscribe is the change feed the trigger reads.
@@ -407,7 +444,11 @@ func (f *fakeKubestore) OpenExisting(cacheID int64) (*kubestore.Store, bool, err
 	if f.onOpen != nil {
 		f.onOpen(cacheID)
 	}
+	// Under the lock: two reconciles can claim a cache at once — a catalog folding its
+	// kinds while a kind's own pass clears its rows.
+	f.mu.Lock()
 	f.opened = append(f.opened, cacheID)
+	f.mu.Unlock()
 	if f.err != nil {
 		return nil, false, f.err
 	}
@@ -434,7 +475,12 @@ func (f *fakeKubestore) Clear(cacheID int64) error {
 		f.onClear(cacheID)
 	}
 	f.clearedCaches = append(f.clearedCaches, cacheID)
-	return f.err
+	if f.err != nil {
+		return f.err
+	}
+	// Through the real manager, so a clear a test drives empties the rows a later read
+	// goes looking for — which is the whole of what the catalog's recovery path reacts to.
+	return f.mgr.Clear(cacheID)
 }
 
 // Stats is what the gauge measures; setStats moves it under a live subscription, which

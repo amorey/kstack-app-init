@@ -28,6 +28,7 @@ import (
 	"github.com/amorey/beehive"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -307,7 +308,7 @@ func (c *clusterCachedCatalogController) Reconcile(
 		}
 		return observeDiscovered(ctx, client, ConditionFalse, reason, obs.LastAttempt.Message)
 	}
-	return c.converge(ctx, client, obj, obs)
+	return c.converge(ctx, client, obj, int64(own.cache.ID), obs)
 }
 
 // owners is the chain above a catalog: the cache it anchors and the cluster that cache
@@ -364,19 +365,45 @@ func (c *clusterCachedCatalogController) ownersOf(
 }
 
 // converge rewrites the per-kind children to match the sweep's standing answer, and
-// reports the verdict.
+// reports the verdict. The kinds come off the cache's store — the sweep keeps none — and
+// the fingerprint is what says those rows are the answer this observation carries.
 func (c *clusterCachedCatalogController) converge(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCachedCatalogStatus],
 	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
+	cacheID int64,
 	obs kubecatalog.Observation,
 ) beehive.ReconcileResult {
+	rows, stored, written, err := c.sweptKinds(ctx, cacheID)
+	switch {
+	case err != nil:
+		// The sweep's own mirror refuses this store alike, so its run fails, its reason
+		// moves, and its signal re-runs this fold — the ladder behind it is the retry.
+		return observeDiscovered(ctx, client, ConditionFalse, ReasonStoreUnavailable, err.Error())
+	case !written:
+		// Nothing has written the table since it was emptied, and an empty one must never
+		// read as "the cluster serves nothing". The children stand while the sweep is asked
+		// for the pass that lays the rows down again: nothing else would ask, since a wipe
+		// leaves the cluster's answer unmoved and so commits nothing to signal on. The
+		// rewrite is silent for that same reason, which is what the requeue is for.
+		c.kubecatalogSvc.Wake(obj.Name)
+		return observeDiscovered(ctx, client, ConditionFalse, ReasonStoreUnavailable,
+			"the cache's kind catalog was emptied; waiting for the sweep to rewrite it").
+			RequeueAfter(catalogRetryInterval)
+	case stored != obs.Value.Fingerprint:
+		// The store is ahead: a sweep writes its rows and commits immediately after, and
+		// this pass read between the two. That commit is what wakes this fold, so there is
+		// nothing to ask for and nothing to report — asking would buy a full discovery pass
+		// at the cluster's expense for an ordinary sweep.
+		return beehive.Settled()
+	}
+
 	held, err := c.resourceClient.ListOwnedObjects(ctx, obj.ID)
 	if err != nil {
 		return beehive.Fail(fmt.Errorf("list cached catalog %d resources: %w", obj.ID, err))
 	}
 
-	kinds := toResourceSpecs(obs.Value.Kinds)
+	kinds := toResourceSpecs(rows)
 	draining, err := c.applyKinds(ctx, obj, kinds)
 	if err != nil {
 		return beehive.Fail(err)
@@ -428,16 +455,51 @@ func (c *clusterCachedCatalogController) converge(
 	return res
 }
 
-// toResourceSpecs translates the sweep's native kinds into this kind's spec vocabulary.
-// Enabled is left for applyKinds, which relays the catalog's own switch.
-func toResourceSpecs(kinds []kubecatalog.Kind) []ClusterCachedResourceSpec {
-	specs := make([]ClusterCachedResourceSpec, 0, len(kinds))
-	for _, k := range kinds {
+// sweptKinds is the cache's kind rows beside the fingerprint of the sweep that wrote
+// them. written is false when no sweep has written the table at all — no file, an emptied
+// one, or a claim a clear closed — which is the case an empty read must never be mistaken
+// for.
+//
+// The rows and the fingerprint come out of one read, or a clear landing between them could
+// pair a wiped table with the fingerprint of the sweep that rewrote it, and pruning off
+// that would delete every child.
+func (c *clusterCachedCatalogController) sweptKinds(ctx context.Context, cacheID int64) ([]kubestore.KindRow, uint64, bool, error) {
+	// Never OpenOrCreate: the sweep is the creator, and a fold that created would resurrect
+	// a torn-down cache's file. The error is read before ok, since a file the manager could
+	// not open is not a cache with nothing in it.
+	store, ok, err := c.kubestoreMgr.OpenExisting(cacheID)
+	if err != nil {
+		// A clear swapped the file under the claim, which is the wipe seen from inside.
+		if errors.Is(err, kubestore.ErrClosed) {
+			return nil, 0, false, nil
+		}
+		return nil, 0, false, err
+	}
+	if !ok {
+		return nil, 0, false, nil
+	}
+	defer store.Release()
+
+	rows, stored, written, err := store.KindsWithFingerprint(ctx)
+	if errors.Is(err, kubestore.ErrClosed) {
+		return nil, 0, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return rows, stored, written, nil
+}
+
+// toResourceSpecs translates the stored rows into this kind's spec vocabulary. Enabled is
+// left for applyKinds, which relays the catalog's own switch.
+func toResourceSpecs(rows []kubestore.KindRow) []ClusterCachedResourceSpec {
+	specs := make([]ClusterCachedResourceSpec, 0, len(rows))
+	for _, r := range rows {
 		specs = append(specs, ClusterCachedResourceSpec{
-			APIVersion: k.GroupVersion,
-			Kind:       k.Kind,
-			Resource:   k.Resource,
-			Namespaced: k.Namespaced,
+			APIVersion: r.APIVersion,
+			Kind:       r.Kind,
+			Resource:   r.Resource,
+			Namespaced: r.Scope == kubestore.ScopeNamespaced,
 		})
 	}
 	return specs

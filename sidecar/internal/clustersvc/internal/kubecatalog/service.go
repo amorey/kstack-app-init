@@ -30,7 +30,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"maps"
 	"slices"
 	"sync"
@@ -131,7 +130,7 @@ func New(conns connService, stores storeManager) *Service {
 type option func(*Service, *catalogProbe)
 
 // withSweep substitutes the API server behind every sweep.
-func withSweep(f func(context.Context, *kubeconn.Connection) (Catalog, error)) option {
+func withSweep(f func(context.Context, *kubeconn.Connection) (sweep, error)) option {
 	return func(_ *Service, p *catalogProbe) { p.sweep = f }
 }
 
@@ -349,7 +348,7 @@ func (s *Service) Wake(id string) { s.engine.Wake(id, nameCatalog) }
 // mirror writes one sweep's answer into its cache's store, claiming the file for the
 // write alone: nothing holds one open for a subject that is not running, which is what
 // lets a cache's teardown delete it.
-func (s *Service) mirror(ctx context.Context, id string, c Catalog) error {
+func (s *Service) mirror(ctx context.Context, id string, sw sweep, fingerprint uint64) error {
 	s.mu.Lock()
 	sub := s.tracked[id]
 	s.mu.Unlock()
@@ -365,7 +364,7 @@ func (s *Service) mirror(ctx context.Context, id string, c Catalog) error {
 
 	// Prune only on a complete answer, the same rule the children follow: a group that
 	// went quiet has not stopped being served.
-	return store.SyncKinds(ctx, kindRows(c.Kinds), !c.Partial)
+	return store.SyncKinds(ctx, kindRows(sw.Kinds), !sw.Partial, fingerprint)
 }
 
 // kindRows translates the sweep's answer into the table's own vocabulary.
@@ -415,31 +414,21 @@ func (s *Service) publish(id string, v probe.Snapshot) {
 // news is the part of a pass the fold reacts to: the answer and the verdict, never
 // timing.
 type news struct {
-	kinds   uint64
-	partial bool
-	known   bool
-	ok      bool
-	reason  probe.Reason
+	fingerprint uint64
+	partial     bool
+	known       bool
+	ok          bool
+	reason      probe.Reason
 }
 
 func newsOf(o Observation) news {
 	return news{
-		kinds:   kindsFingerprint(o.Value.Kinds),
-		partial: o.Value.Partial,
-		known:   o.Known(),
-		ok:      o.OK(),
-		reason:  o.LastAttempt.Reason,
+		fingerprint: o.Value.Fingerprint,
+		partial:     o.Value.Partial,
+		known:       o.Known(),
+		ok:          o.OK(),
+		reason:      o.LastAttempt.Reason,
 	}
-}
-
-// kindsFingerprint folds the kind list into one comparable word, so news stays a value
-// a map compare reads with ==.
-func kindsFingerprint(kinds []Kind) uint64 {
-	h := fnv.New64a()
-	for _, k := range kinds {
-		fmt.Fprintf(h, "%s|%s|%s|%t|%t\n", k.GroupVersion, k.Resource, k.Kind, k.Namespaced, k.IsCRD)
-	}
-	return h.Sum64()
 }
 
 // ensureWatcher stands a watch up for id over conn, unless the one already standing is live

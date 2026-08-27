@@ -103,7 +103,7 @@ func (f *watchFixture) readCount() int {
 // ping is a write landing on the bus.
 func (f *watchFixture) ping() {
 	f.t.Helper()
-	require.NoError(f.t, f.store.SyncKinds(context.Background(), nil, true))
+	require.NoError(f.t, f.store.SyncKinds(context.Background(), nil, true, 7))
 }
 
 // start runs the loop with the test's own cadences.

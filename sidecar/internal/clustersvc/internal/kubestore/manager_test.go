@@ -601,7 +601,7 @@ func TestAClaimTakenBeforeAClearDoesNotFollowTheSwap(t *testing.T) {
 	writer, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
 	defer writer.Release()
-	require.NoError(t, writer.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, writer.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 
 	bound, ok, err := m.OpenExisting(1)
 	require.NoError(t, err)
@@ -626,7 +626,7 @@ func TestAFreshClaimAfterAClearReadsTheNewFile(t *testing.T) {
 	writer, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
 	defer writer.Release()
-	require.NoError(t, writer.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, writer.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 	require.NoError(t, m.Clear(1))
 
 	bound, ok, err := m.OpenExisting(1)
@@ -648,7 +648,7 @@ func TestOpenExistingReadsACacheNobodyHoldsOpen(t *testing.T) {
 
 	writer, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
-	require.NoError(t, writer.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, writer.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 	writer.Release()
 	require.False(t, cacheIsOpen(m, 1), "the last release left the file open")
 

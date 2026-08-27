@@ -33,24 +33,6 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   a healthy catalog that is quietly up to 10m stale, and nothing says so. Watch health as a field
   on the observation is the shape; whether the fold should surface it at all is the question.
 
-- **The catalog stays resident for as long as a cluster is tracked.** `kubecatalog`'s observable
-  holds the whole `Catalog` per subject — every served kind's group-version, kind, resource and
-  scope — and the `ClusterCachedResource` rows the fold writes hold the same list again in the
-  store. Order of 90 bytes a kind, so tens of KB for a cluster with CRDs and well under a megabyte
-  across a large fleet: **listed for the duplication, not the size.** The trigger is a second
-  consumer wanting the kinds and reaching for the in-memory copy because it is there, or a fleet
-  where it starts to show.
-  - **Two things hold it there, and a fix has to answer both.** `pass.Prev()` is the commit guard
-    — the sweep commits only on a change, which is the whole of what stops a 10m pass waking the
-    fold on a cluster that moved nothing — and `clusterCachedCatalogController.Reconcile` reads the
-    standing answer back through `Read(id)` to rewrite the child records. A fingerprint covers the
-    first and not the second.
-  - **Weigh:** the shape would be the sweep retaining a hash and the fold diffing against its own
-    children, which the store already holds. That trades resident memory for a store read per
-    pass, and moves the "what changed" diff next to the prune and tombstone rules that already live
-    in the fold. It also couples the sweep's correctness to records it must not know about — the
-    leaf rule — so the hash has to be enough on its own. Not obviously a win; measure first.
-
 - **Nothing exposes the four non-connection probes, so "Connected but not Identified" has no detail.**
   `kubeconn.State` carries a full `Observation` per probe — value, `LastSeen`, `LastAttempt`
   (verdict/reason/message), `Failures`/`FailingSince`, `NextAttempt` — and `foldState`

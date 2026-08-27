@@ -45,9 +45,9 @@ var (
 // probeOver is a probe whose subject connects and whose sweep answers as given. The watch
 // seams are no-ops: what a run does to the standing watch is service_test.go's to assert,
 // and the watcher itself watcher_test.go's.
-func probeOver(sweep func(context.Context, *kubeconn.Connection) (Catalog, error)) *catalogProbe {
+func probeOver(f func(context.Context, *kubeconn.Connection) (sweep, error)) *catalogProbe {
 	p := connectingProbe()
-	p.sweep = sweep
+	p.sweep = f
 	return p
 }
 
@@ -56,7 +56,7 @@ func probeOver(sweep func(context.Context, *kubeconn.Connection) (Catalog, error
 func connectingProbe() *catalogProbe {
 	return &catalogProbe{
 		conn:    func(context.Context, string) (*kubeconn.Connection, error) { return &kubeconn.Connection{}, nil },
-		mirror:  func(context.Context, string, Catalog) error { return nil },
+		mirror:  func(context.Context, string, sweep, uint64) error { return nil },
 		watch:   func(context.Context, string, *kubeconn.Connection) {},
 		unwatch: func(string) {},
 	}
@@ -64,11 +64,15 @@ func connectingProbe() *catalogProbe {
 
 // mirrored records what each run wrote, so a test can assert the write happened and what
 // it carried.
-type mirrored struct{ writes []Catalog }
+type mirrored struct {
+	writes       []sweep
+	fingerprints []uint64
+}
 
 // record is the probe's mirror seam over this recorder.
-func (m *mirrored) record(_ context.Context, _ string, c Catalog) error {
-	m.writes = append(m.writes, c)
+func (m *mirrored) record(_ context.Context, _ string, s sweep, fingerprint uint64) error {
+	m.writes = append(m.writes, s)
+	m.fingerprints = append(m.fingerprints, fingerprint)
 	return nil
 }
 
@@ -99,9 +103,9 @@ func TestRunSuspendsWithoutAConnection(t *testing.T) {
 // standing answer must survive for the fold to keep converging.
 func TestRunFailsAndCommitsNothingWhenTheSweepFails(t *testing.T) {
 	boom := errors.New("the server rejected our request")
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{}, boom })
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) { return sweep{}, boom })
 
-	res, pass := run(t, p, &Catalog{Kinds: []Kind{pods}})
+	res, pass := run(t, p, &Catalog{Fingerprint: Fingerprint([]Kind{pods})})
 
 	assert.Equal(t, probe.VerdictFailed, res.Verdict())
 	assert.Equal(t, ReasonSweepFailed, res.Reason())
@@ -113,7 +117,7 @@ func TestRunFailsAndCommitsNothingWhenTheSweepFails(t *testing.T) {
 // Cancellation is the caller going away, not the cluster refusing — the run records
 // nothing at all rather than opening a failure streak.
 func TestRunSkipsOnCancellation(t *testing.T) {
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{}, context.Canceled })
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) { return sweep{}, context.Canceled })
 
 	res, pass := run(t, p, nil)
 
@@ -127,15 +131,15 @@ func TestRunSkipsOnCancellation(t *testing.T) {
 // kind the server started serving does.
 func TestRunCommitsOnlyOnAChange(t *testing.T) {
 	served := []Kind{pods}
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) {
-		return Catalog{Kinds: served}, nil
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) {
+		return sweep{Kinds: served}, nil
 	})
 
 	res, pass := run(t, p, nil)
 	require.Equal(t, probe.VerdictSucceeded, res.Verdict())
 	first, committed := pass.Updated()
 	require.True(t, committed, "the first answer commits")
-	assert.Equal(t, []Kind{pods}, first.Kinds)
+	assert.Equal(t, Fingerprint([]Kind{pods}), first.Fingerprint)
 
 	_, pass = run(t, p, &first)
 	_, committed = pass.Updated()
@@ -145,11 +149,11 @@ func TestRunCommitsOnlyOnAChange(t *testing.T) {
 	_, pass = run(t, p, &first)
 	got, committed := pass.Updated()
 	require.True(t, committed, "a kind the server started serving is news")
-	assert.Equal(t, served, got.Kinds)
+	assert.Equal(t, Fingerprint(served), got.Fingerprint)
 }
 
 func TestRunCommitsAnEmptyFirstAnswer(t *testing.T) {
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{}, nil })
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) { return sweep{}, nil })
 
 	_, pass := run(t, p, nil)
 
@@ -162,11 +166,11 @@ func TestRunCommitsAnEmptyFirstAnswer(t *testing.T) {
 // retries sooner than the interval.
 func TestRunCommitsAPartialAnswerAndFails(t *testing.T) {
 	groupErr := errors.New("unable to retrieve the complete list of server APIs")
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) {
-		return Catalog{Kinds: []Kind{pods}, Partial: true}, groupErr
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) {
+		return sweep{Kinds: []Kind{pods}, Partial: true}, groupErr
 	})
 
-	res, pass := run(t, p, &Catalog{Kinds: []Kind{pods}})
+	res, pass := run(t, p, &Catalog{Fingerprint: Fingerprint([]Kind{pods})})
 
 	assert.Equal(t, probe.VerdictFailed, res.Verdict())
 	assert.Equal(t, ReasonSweepPartial, res.Reason())
@@ -182,7 +186,7 @@ func TestRunCommitsAPartialAnswerAndFails(t *testing.T) {
 // repair protocol to carry the fact that it was.
 func TestRunWritesEveryAnswerWhetherOrNotItMoved(t *testing.T) {
 	var m mirrored
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{Kinds: []Kind{pods}}, nil })
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) { return sweep{Kinds: []Kind{pods}}, nil })
 	p.mirror = m.record
 
 	_, pass := run(t, p, nil)
@@ -193,16 +197,33 @@ func TestRunWritesEveryAnswerWhetherOrNotItMoved(t *testing.T) {
 	_, committed = pass.Updated()
 	require.False(t, committed, "the same answer re-confirmed is not news")
 
-	assert.Equal(t, []Catalog{{Kinds: []Kind{pods}}, {Kinds: []Kind{pods}}}, m.writes,
+	assert.Equal(t, []sweep{{Kinds: []Kind{pods}}, {Kinds: []Kind{pods}}}, m.writes,
 		"the second run did not rewrite the rows")
+}
+
+// The fingerprint stored beside the rows is the one the observable carries, which is the
+// whole of what lets the fold tell a table this sweep wrote from one wiped under it. Two
+// hashes taken at different moments would answer that question about different answers.
+func TestRunWritesTheFingerprintItCommits(t *testing.T) {
+	var m mirrored
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) {
+		return sweep{Kinds: []Kind{pods}}, nil
+	})
+	p.mirror = m.record
+
+	_, pass := run(t, p, nil)
+
+	committed, ok := pass.Updated()
+	require.True(t, ok)
+	assert.Equal(t, []uint64{committed.Fingerprint}, m.fingerprints)
 }
 
 // The write comes first, because a commit is the fold's wake: one over rows that are not
 // there would have the fold converge on a table the write is still catching up to.
 func TestRunCommitsNothingWhenTheWriteFails(t *testing.T) {
 	full := errors.New("database or disk is full")
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{Kinds: []Kind{pods}}, nil })
-	p.mirror = func(context.Context, string, Catalog) error { return full }
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) { return sweep{Kinds: []Kind{pods}}, nil })
+	p.mirror = func(context.Context, string, sweep, uint64) error { return full }
 
 	res, pass := run(t, p, nil)
 
@@ -217,10 +238,10 @@ func TestRunCommitsNothingWhenTheWriteFails(t *testing.T) {
 // the incomplete answer would point a reader at an api group that is not the problem.
 func TestAFailedWriteOutranksAPartialAnswer(t *testing.T) {
 	full := errors.New("database or disk is full")
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) {
-		return Catalog{Kinds: []Kind{pods}, Partial: true}, errors.New("unable to retrieve the complete list of server APIs")
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) {
+		return sweep{Kinds: []Kind{pods}, Partial: true}, errors.New("unable to retrieve the complete list of server APIs")
 	})
-	p.mirror = func(context.Context, string, Catalog) error { return full }
+	p.mirror = func(context.Context, string, sweep, uint64) error { return full }
 
 	res, pass := run(t, p, nil)
 
@@ -233,8 +254,8 @@ func TestAFailedWriteOutranksAPartialAnswer(t *testing.T) {
 // there is nothing to write into and nothing worth reporting, so the run parks rather
 // than opening a failure streak against a record that is going.
 func TestRunSuspendsWhenTheStoreIsRemoved(t *testing.T) {
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) { return Catalog{Kinds: []Kind{pods}}, nil })
-	p.mirror = func(context.Context, string, Catalog) error {
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) { return sweep{Kinds: []Kind{pods}}, nil })
+	p.mirror = func(context.Context, string, sweep, uint64) error {
 		return fmt.Errorf("open cache 1: %w", kubestore.ErrRemoved)
 	}
 
@@ -250,12 +271,12 @@ func TestRunSuspendsWhenTheStoreIsRemoved(t *testing.T) {
 // down off one would prune a catalog the run never read.
 func TestAFailedSweepWritesNothing(t *testing.T) {
 	var m mirrored
-	p := probeOver(func(context.Context, *kubeconn.Connection) (Catalog, error) {
-		return Catalog{}, errors.New("the server rejected our request")
+	p := probeOver(func(context.Context, *kubeconn.Connection) (sweep, error) {
+		return sweep{}, errors.New("the server rejected our request")
 	})
 	p.mirror = m.record
 
-	run(t, p, &Catalog{Kinds: []Kind{pods}})
+	run(t, p, &Catalog{Fingerprint: Fingerprint([]Kind{pods})})
 
 	assert.Empty(t, m.writes)
 }
@@ -409,5 +430,5 @@ func TestKindsFingerprintCoversTheCRDBit(t *testing.T) {
 	custom := built
 	custom.IsCRD = true
 
-	assert.NotEqual(t, kindsFingerprint([]Kind{built}), kindsFingerprint([]Kind{custom}))
+	assert.NotEqual(t, Fingerprint([]Kind{built}), Fingerprint([]Kind{custom}))
 }

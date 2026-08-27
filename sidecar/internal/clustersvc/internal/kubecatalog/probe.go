@@ -19,6 +19,8 @@ package kubecatalog
 import (
 	"context"
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"slices"
 	"strings"
 	"time"
@@ -84,16 +86,35 @@ type Kind struct {
 	IsCRD bool
 }
 
-// Catalog is one sweep's answer: the mirrorable kinds, sorted, and whether the list is
-// the whole truth — an aggregated group that failed to answer makes it partial.
+// Catalog is the sweep's standing answer as everything but the run itself sees it: a
+// fingerprint of the kinds, and whether the list was the whole truth — an aggregated group
+// that failed to answer makes it partial.
+//
+// **The kinds themselves are on disk**, in the store of the cache the subject was armed
+// for. A holder that wants them reads them back from there, matching this fingerprint
+// against the one recorded beside the rows.
 type Catalog struct {
+	Fingerprint uint64
+	Partial     bool
+}
+
+// sweep is one run's answer, resident only for the length of that run: swept, written,
+// fingerprinted, dropped.
+type sweep struct {
 	Kinds   []Kind
 	Partial bool
 }
 
-// equal is the commit guard's compare; the slice keeps Catalog out of ==.
-func (c Catalog) equal(o Catalog) bool {
-	return c.Partial == o.Partial && slices.Equal(c.Kinds, o.Kinds)
+// Fingerprint folds a kind list into one comparable word — what the commit guard compares,
+// and what a reader matches the stored rows against. Every field a consumer reads is in
+// it, the CRD bit included, so a cluster whose CRD list starts answering is news even
+// though its kinds have not moved.
+func Fingerprint(kinds []Kind) uint64 {
+	h := fnv.New64a()
+	for _, k := range kinds {
+		fmt.Fprintf(h, "%s|%s|%s|%t|%t\n", k.GroupVersion, k.Resource, k.Kind, k.Namespaced, k.IsCRD)
+	}
+	return h.Sum64()
 }
 
 // sweepInterval paces re-discovery: the pull cadence correctness rests on, since what
@@ -118,11 +139,12 @@ type catalogProbe struct {
 	// the seam a test substitutes for the API server. Production wires connFor and
 	// discoverServedKinds; nothing else may be nil here.
 	conn  func(ctx context.Context, id string) (*kubeconn.Connection, error)
-	sweep func(ctx context.Context, conn *kubeconn.Connection) (Catalog, error)
+	sweep func(ctx context.Context, conn *kubeconn.Connection) (sweep, error)
 	// mirror writes one answer into the subject's cache store, the seam the Service wires
 	// to the store manager: the sweep is this table's one writer, so the rows are the
-	// leaf's own to lay down.
-	mirror func(ctx context.Context, id string, c Catalog) error
+	// leaf's own to lay down. The fingerprint is handed in rather than recomputed, so what
+	// lands beside the rows is the same word the run commits.
+	mirror func(ctx context.Context, id string, s sweep, fingerprint uint64) error
 	// watch and unwatch are the standing watch's lifetime, which is the Service's to hold —
 	// establishing one has to be measured against whether the subject is still tracked. watch
 	// returns once the watch is open, bounded by ctx.
@@ -164,11 +186,13 @@ func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe
 		return probe.Fail(ReasonSweepFailed, err)
 	}
 
+	answer := Catalog{Fingerprint: Fingerprint(found.Kinds), Partial: found.Partial}
+
 	// The rows go down before anything is committed: a commit is the fold's wake, and
 	// waking it over rows that are not there yet would have it converge on a table the
 	// write is still catching up to. Unconditional, whether or not the answer moved,
 	// which is what puts a wiped table back with no repair protocol.
-	if err := p.mirror(ctx, pass.Subject(), found); err != nil {
+	if err := p.mirror(ctx, pass.Subject(), found, answer.Fingerprint); err != nil {
 		if errors.Is(err, kubestore.ErrRemoved) {
 			return probe.Suspend(ReasonStoreRemoved, err.Error())
 		}
@@ -176,10 +200,10 @@ func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe
 	}
 
 	// Commit only on a change — a committed value is the fold's wake — and on the first
-	// answer whatever it is: a cluster serving nothing mirrorable answers the zero
-	// Catalog, which Prev cannot tell from "never swept".
-	if !pass.Known() || !found.equal(pass.Prev()) {
-		pass.Commit(found)
+	// answer whatever it is: Prev cannot tell an answer from "never swept", which is what
+	// Known is for.
+	if !pass.Known() || answer != pass.Prev() {
+		pass.Commit(answer)
 	}
 	if found.Partial {
 		return probe.Fail(ReasonSweepPartial, err)
@@ -192,12 +216,12 @@ func (p *catalogProbe) Run(ctx context.Context, pass *probe.Pass[Catalog]) probe
 // aggregated API server that is down fails its own group and no other, and client-go
 // hands back the groups that did answer alongside the error naming the ones that did
 // not — so a partial Catalog comes back with the error still attached.
-func discoverServedKinds(ctx context.Context, conn *kubeconn.Connection) (Catalog, error) {
+func discoverServedKinds(ctx context.Context, conn *kubeconn.Connection) (sweep, error) {
 	lists, err := conn.Discovery.ServerPreferredResources()
 
 	var groupErr *discovery.ErrGroupDiscoveryFailed
 	if err != nil && !errors.As(err, &groupErr) {
-		return Catalog{}, err
+		return sweep{}, err
 	}
 	kinds := servedKinds(lists)
 
@@ -208,7 +232,7 @@ func discoverServedKinds(ctx context.Context, conn *kubeconn.Connection) (Catalo
 	if crds, crdErr := listCRDs(ctx, conn); crdErr == nil {
 		markCRDs(kinds, crds)
 	}
-	return Catalog{Kinds: kinds, Partial: groupErr != nil}, err
+	return sweep{Kinds: kinds, Partial: groupErr != nil}, err
 }
 
 // crdRef is one CustomResourceDefinition as the match needs it. The version is

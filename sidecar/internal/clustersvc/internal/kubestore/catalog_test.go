@@ -16,6 +16,8 @@ package kubestore
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -45,14 +47,52 @@ func catalogRows(t *testing.T, s *Store) []KindRow {
 	return out
 }
 
+// metaValue reads one cluster_meta key back, or "" for one that is not there.
+func metaValue(t *testing.T, s *Store, key string) string {
+	t.Helper()
+	var v string
+	err := db(t, s).QueryRowContext(context.Background(),
+		`SELECT value FROM cluster_meta WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ""
+	}
+	require.NoError(t, err)
+	return v
+}
+
 // A sweep's answer lands as the table's rows.
 func TestSyncKindsWritesTheAnswer(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow, deploymentRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow, deploymentRow}, true, 42))
 
 	assert.Equal(t, []KindRow{deploymentRow, podRow}, catalogRows(t, s))
+}
+
+// The fingerprint is what tells a table the sweep wrote from one wiped under it, so it
+// rides the rows' own transaction. Stored as its decimal string: the column is TEXT.
+func TestSyncKindsRecordsTheFingerprint(t *testing.T) {
+	s := newTestStore(t)
+
+	require.NoError(t, s.SyncKinds(context.Background(), []KindRow{podRow}, true, 42))
+
+	assert.Equal(t, "42", metaValue(t, s, kindsFingerprintKey))
+}
+
+// The atomicity the fold's whole fork rests on: a write that fails moves neither the rows
+// nor the fingerprint, so the pair never claims a sweep wrote a table it did not.
+func TestSyncKindsLeavesBothAloneWhenTheWriteFails(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 42))
+
+	failed, cancel := context.WithCancel(ctx)
+	cancel()
+	require.Error(t, s.SyncKinds(failed, []KindRow{deploymentRow}, true, 99))
+
+	assert.Equal(t, []KindRow{podRow}, catalogRows(t, s))
+	assert.Equal(t, "42", metaValue(t, s, kindsFingerprintKey))
 }
 
 // Pruning is the caller's call, because a partial answer has not seen every group: a kind
@@ -60,12 +100,12 @@ func TestSyncKindsWritesTheAnswer(t *testing.T) {
 func TestSyncKindsPrunesOnlyWhenAsked(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow, deploymentRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow, deploymentRow}, true, 42))
 
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, false))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, false, 7))
 	assert.Len(t, catalogRows(t, s), 2, "an incomplete answer dropped a kind")
 
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 	assert.Equal(t, []KindRow{podRow}, catalogRows(t, s))
 }
 
@@ -76,11 +116,11 @@ func TestSyncKindsResolvesARenamedKind(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 	old := KindRow{APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: ScopeNamespaced, IsCRD: true}
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{old}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{old}, true, 1))
 
 	renamed := old
 	renamed.Kind = "Gadget"
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{renamed}, false))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{renamed}, false, 2))
 
 	assert.Equal(t, []KindRow{renamed}, catalogRows(t, s), "the rename's loser survived")
 }
@@ -90,12 +130,12 @@ func TestSyncKindsResolvesARenamedKind(t *testing.T) {
 func TestSyncKindsLeavesTheSchemaAlone(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 	_, err := db(t, s).ExecContext(ctx,
 		`UPDATE kind_catalog SET schema_json = '{"x":1}' WHERE api_version = 'v1' AND kind = 'Pod'`)
 	require.NoError(t, err)
 
-	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true))
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 
 	var got *string
 	require.NoError(t, db(t, s).QueryRowContext(ctx,

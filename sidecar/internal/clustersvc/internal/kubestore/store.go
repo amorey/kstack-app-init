@@ -58,6 +58,12 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+// querier is the same subset for a point read, so one can be served out of a read
+// transaction whose other query it must agree with.
+type querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // Subscription carries the store's change pings. The value is empty — the key is the
 // whole news, and a reader answers it by re-reading and diffing, so an early or late
 // ping costs one idempotent read rather than a wrong frame.
@@ -624,6 +630,28 @@ func busKey(k Kind) string {
 		return EventsKey
 	}
 	return ObjectsKey(k.APIVersion, k.Resource)
+}
+
+// setMeta writes one bookkeeping value through any execer, so a caller can put it in the
+// transaction whose rows it describes.
+func setMeta(ctx context.Context, ex execer, key, value string) error {
+	_, err := ex.ExecContext(ctx,
+		`INSERT INTO cluster_meta (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
+
+// getMeta reads one bookkeeping value, and whether it is recorded at all.
+func getMeta(ctx context.Context, q querier, key string) (string, bool, error) {
+	var v string
+	err := q.QueryRowContext(ctx, `SELECT value FROM cluster_meta WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return v, true, nil
 }
 
 // setCookie writes one kind's resume position through any execer, so a delta and a

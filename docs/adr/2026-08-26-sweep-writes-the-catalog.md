@@ -71,9 +71,8 @@ would notice the table was empty until the answer happened to change.
 
 ## Follow-ups
 
-- The fold still builds its children from the resident kind list rather than from these rows;
-  retiring that copy is `docs/specs/3-catalog-kinds-off-disk.md`, which also moves the wake out of
-  `Caches().Clear` and into detection in the fold.
+- The fold builds its children from these rows, joined by a fingerprint recorded in the same
+  transaction, and detects a wiped table itself — → [ADR](2026-08-27-catalog-kinds-off-disk.md).
 - `is_crd` is filled best-effort from the cluster's CustomResourceDefinition list, matched on group
   and plural. A refused list — a cluster-scoped read RBAC commonly denies — leaves every kind
   reading as built-in rather than failing the sweep.
