@@ -21,7 +21,6 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,12 +33,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // newTestBeehive returns a beehive over an in-memory store, closed on cleanup. The
@@ -159,257 +155,6 @@ func (l *fakeLease) WatchState() kubeconn.StateSubscription {
 
 func (l *fakeLease) Release() { l.svc.released = append(l.svc.released, l.contextName) }
 
-// fakeKubecatalog stands in for the sweeper: it answers Read per id from a map and
-// records what was armed and disarmed. The zero value tracks nothing and knows nothing,
-// which reads as a sweep still owed.
-type fakeKubecatalog struct {
-	// mu guards everything a pass touches: under a running beehive every method here is
-	// called from a reconcile goroutine, against fixtures the test goroutine wrote.
-	mu  sync.Mutex
-	obs map[string]kubecatalog.Observation
-	// tracked and forgotten record the arm/disarm calls in order; armedFor holds the
-	// params each Track named, and woken the ids a wiper asked a sweep for.
-	tracked   []string
-	armedFor  map[string]kubecatalog.Params
-	forgotten []string
-	woken     []string
-	// onWake runs inside Wake, so a test can pin what had already happened by the time
-	// the sweeper was asked for a pass.
-	onWake func(id string)
-
-	once sync.Once
-	hub  *conflate.Hub[string, struct{}]
-
-	// wakeOnce/wakes report each Wake to a test that has to wait for one, since the
-	// slices above are readable only once nothing is reconciling.
-	wakeOnce sync.Once
-	wakes    *testutil.Probe[string]
-}
-
-func (f *fakeKubecatalog) Track(id string, p kubecatalog.Params) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.tracked = append(f.tracked, id)
-	if f.armedFor == nil {
-		f.armedFor = map[string]kubecatalog.Params{}
-	}
-	f.armedFor[id] = p
-}
-
-func (f *fakeKubecatalog) Forget(id string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.forgotten = append(f.forgotten, id)
-}
-
-func (f *fakeKubecatalog) Wake(id string) {
-	f.mu.Lock()
-	f.woken = append(f.woken, id)
-	f.mu.Unlock()
-
-	// Outside the lock: both reach a test's own code, which must not run under it.
-	f.waker().Fire(id)
-	if f.onWake != nil {
-		f.onWake(id)
-	}
-}
-
-func (f *fakeKubecatalog) waker() *testutil.Probe[string] {
-	f.wakeOnce.Do(func() { f.wakes = testutil.NewProbe[string](8) })
-	return f.wakes
-}
-
-func (f *fakeKubecatalog) Read(id string) (kubecatalog.Observation, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	o, ok := f.obs[id]
-	return o, ok
-}
-
-// setObs files one subject's standing answer, which a fixture writes while passes may
-// already be reading it.
-func (f *fakeKubecatalog) setObs(id string, o kubecatalog.Observation) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.obs == nil {
-		f.obs = map[string]kubecatalog.Observation{}
-	}
-	f.obs[id] = o
-}
-
-// Subscribe is the change feed the trigger reads.
-func (f *fakeKubecatalog) Subscribe() kubecatalog.Subscription { return f.swept().Receiver() }
-
-func (f *fakeKubecatalog) swept() *conflate.Hub[string, struct{}] {
-	f.once.Do(func() { f.hub = conflate.New[string, struct{}]() })
-	return f.hub
-}
-
-// fakeKubesync stands in for the worker fleet: it answers Read per id from a map and
-// records what was armed, disarmed, and restarted. The zero value tracks nothing and
-// knows nothing, which reads as a worker still owed.
-type fakeKubesync struct {
-	// mu guards the records below, since a reconciling fixture drives this from
-	// beehive's own goroutines.
-	mu  sync.Mutex
-	obs map[string]kubesync.Observation
-	// tracked and forgotten record the arm/disarm calls in order; armedWith holds the
-	// params each Track named.
-	tracked         []string
-	armedWith       map[string]kubesync.Params
-	forgotten       []string
-	forgottenCaches []int64
-	// held and heldCaches record what a clear held stopped while it ran.
-	held       []string
-	heldCaches []int64
-	// onForgetCache runs inside ForgetCache, so a test can pin what had already
-	// happened by the time the workers stopped.
-	onForgetCache func(cacheID int64)
-	fleetRestarts atomic.Int32
-	// observations is the standing fleet the health gauge folds; holding is the caches a
-	// clear has stopped.
-	observations []kubesync.SubjectObservation
-	holding      map[int64]bool
-
-	once sync.Once
-	hub  *conflate.Hub[string, struct{}]
-}
-
-func (f *fakeKubesync) Track(id string, p kubesync.Params) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.tracked = append(f.tracked, id)
-	if f.armedWith == nil {
-		f.armedWith = map[string]kubesync.Params{}
-	}
-	f.armedWith[id] = p
-}
-
-func (f *fakeKubesync) Forget(id string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.forgotten = append(f.forgotten, id)
-}
-
-// arms is how many Tracks have landed, read under the lock for a test whose passes run
-// on beehive's goroutines.
-func (f *fakeKubesync) arms() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.tracked)
-}
-
-// settle waits for the passes a fixture's own writes provoked to stop arming workers,
-// and returns the count they left. A test that asserts a re-arm needs a baseline
-// nothing else is still moving.
-//
-// A bounded quiet window, not a wait for an event: what it waits for is the ABSENCE of
-// further passes, which has nothing to fire.
-func (f *fakeKubesync) settle(t *testing.T) int {
-	t.Helper()
-	const quiet = 50 * time.Millisecond
-	deadline := time.Now().Add(testutil.Timeout)
-	last := f.arms()
-	for stable := time.Now(); time.Since(stable) < quiet; {
-		if now := f.arms(); now != last {
-			last, stable = now, time.Now()
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the fleet never stopped arming workers")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	return last
-}
-
-func (f *fakeKubesync) Read(id string) (kubesync.Observation, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	o, ok := f.obs[id]
-	return o, ok
-}
-
-// WhileStopped and WhileCacheStopped stop what they cover and run fn, recording the
-// order so a test can pin that the store was touched inside the hold rather than beside
-// it.
-func (f *fakeKubesync) WhileStopped(id string, cacheID int64, fn func() error) error {
-	f.Forget(id)
-	f.mu.Lock()
-	f.held = append(f.held, id)
-	f.holdCacheLocked(cacheID)
-	f.mu.Unlock()
-	return fn()
-}
-
-func (f *fakeKubesync) WhileCacheStopped(cacheID int64, fn func() error) error {
-	f.ForgetCache(cacheID)
-	f.mu.Lock()
-	f.heldCaches = append(f.heldCaches, cacheID)
-	f.mu.Unlock()
-	return fn()
-}
-
-func (f *fakeKubesync) ForgetCache(cacheID int64) {
-	if f.onForgetCache != nil {
-		f.onForgetCache(cacheID)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.forgottenCaches = append(f.forgottenCaches, cacheID)
-}
-
-// RestartAll counts atomically: the poke subscriber restarts on its own goroutine.
-func (f *fakeKubesync) RestartAll() { f.fleetRestarts.Add(1) }
-
-func (f *fakeKubesync) fleetRestartCount() int { return int(f.fleetRestarts.Load()) }
-
-// Observations is the fleet the health fold reads.
-func (f *fakeKubesync) Observations() []kubesync.SubjectObservation {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.observations
-}
-
-// holdCache marks a cache as being cleared, the way a hold does while one runs.
-func (f *fakeKubesync) holdCache(cacheID int64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.holdCacheLocked(cacheID)
-}
-
-func (f *fakeKubesync) holdCacheLocked(cacheID int64) {
-	if f.holding == nil {
-		f.holding = map[int64]bool{}
-	}
-	f.holding[cacheID] = true
-}
-
-// Holding reports the caches a clear has stopped, which the health fold reads so a clear
-// is not mistaken for a cache that stopped syncing.
-func (f *fakeKubesync) Holding(cacheID int64) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.holding[cacheID]
-}
-
-// setObservations replaces the fleet under a live gauge.
-func (f *fakeKubesync) setObservations(obs []kubesync.SubjectObservation) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.observations = obs
-}
-
-// Subscribe is the change feed the trigger reads.
-func (f *fakeKubesync) Subscribe() kubesync.Subscription { return f.moved().Receiver() }
-
-// closeHub ends every subscription, the way Close does when the process goes.
-func (f *fakeKubesync) closeHub() { f.moved().Close() }
-
-func (f *fakeKubesync) moved() *conflate.Hub[string, struct{}] {
-	f.once.Do(func() { f.hub = conflate.New[string, struct{}]() })
-	return f.hub
-}
-
 // fakeKubestore stands in for the store registry: it records what was cleared and
 // which caches were deleted, and answers with err. The zero value clears everything
 // without complaint.
@@ -469,6 +214,9 @@ func newFakeKubestore(t *testing.T) *fakeKubestore {
 	t.Cleanup(func() { assert.NoError(t, mgr.Close()) })
 	return &fakeKubestore{mgr: mgr}
 }
+
+// kubestoreFake is the store registry a fixture wired, for a test that drives it.
+func kubestoreFake(d deps) *fakeKubestore { return d.kubestoreMgr.(*fakeKubestore) }
 
 func (f *fakeKubestore) Clear(cacheID int64) error {
 	if f.onClear != nil {
@@ -601,7 +349,7 @@ func knowing(state kubeconn.State) *fakeKubeconn {
 func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, &fakeKubesync{}, newFakeKubestore(t), nil)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -620,7 +368,7 @@ func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	return newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, &fakeKubesync{}, newFakeKubestore(t), nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -657,7 +405,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, &fakeKubesync{}, newFakeKubestore(t), nil)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), nil)
 }
 
 // newReconcilingDeps is the shared set over a running beehive with the controllers
@@ -666,7 +414,7 @@ func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 func newReconcilingDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, &fakeKubecatalog{}, &fakeKubesync{}, newFakeKubestore(t), nil)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)

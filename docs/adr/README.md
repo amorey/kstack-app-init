@@ -88,12 +88,7 @@ usually just documentation in the wrong place.
 | 2026-08-24 | [Extract the probe scheduler into a Kubernetes-free engine](2026-08-24-probe-engine.md) | sidecar | Accepted |
 | 2026-08-25 | [The connection probe dials /api, builds the connection, and lets the pool retire it](2026-08-25-connection-probe-dial.md) | sidecar | Accepted |
 | 2026-08-25 | [A connection carries the identity confirmed over it](2026-08-25-connection-carried-identity.md) | sidecar | Accepted |
-| 2026-08-26 | [Discovery is a sweep on its own engine, made prompt by a watch that only wakes](2026-08-26-kubecatalog-watch.md) | sidecar | Accepted |
 | 2026-08-26 | [One SQLite file per cache, behind a refcounted registry](2026-08-26-cache-store-per-cache.md) | sidecar | Accepted |
-| 2026-08-26 | [Mirror each kind with a standing worker, not a probe](2026-08-26-sync-workers-not-probes.md) | sidecar | Accepted |
 | 2026-08-26 | [The cache store signals with a coalesced ping, not a row delta](2026-08-26-store-change-ping-bus.md) | sidecar | Accepted |
-| 2026-08-26 | [The sweep writes kind_catalog, ungated by the change guard](2026-08-26-sweep-writes-the-catalog.md) | sidecar | Accepted |
 | 2026-08-26 | [Cached-data watches ping, re-read and diff, and a cleared cache ends one cleanly](2026-08-26-cached-data-read-loop.md) | sidecar | Accepted |
 | 2026-08-27 | [A recorded identity conflict rebuilds the connection, woken by an edge](2026-08-27-identity-driven-retirement.md) | sidecar | Accepted |
-| 2026-08-27 | [The catalog fold reads its kinds off disk, joined by fingerprint](2026-08-27-catalog-kinds-off-disk.md) | sidecar | Accepted |
-| 2026-08-27 | [The catalog sweep's cadence follows the watch it stands over](2026-08-27-catalog-sweep-cadence.md) | sidecar | Accepted |

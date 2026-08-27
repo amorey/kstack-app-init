@@ -2,7 +2,7 @@
 
 Pending work across the three parts of the app. Grouped by area; detailed items keep their acceptance notes inline.
 
-> **The sidecar's cluster backend was torn out** (see `sidecar/CLAUDE.md`). Every item that described the removed cache system — the sync path, the store schema, the controllers, and both `/simplify` deferral lists — was deleted with it rather than kept as stale detail, on the same rule as the culled cache ADRs: git history holds them, and the rebuild records its own decisions as they land. Only work that still has code behind it is listed below.
+> **Nothing fills a cache** (see `sidecar/CLAUDE.md`): the seam between `ClusterCachedCatalog`, `ClusterCachedResource`, and `kubestore` is being redesigned from scratch, and the leaves that carried it are gone. Every item describing them — discovery's request shape, the two leaves' shared arming contract, the relist's download cost — was deleted with them rather than kept as stale detail, on the same rule as the culled ADRs: git history holds them, and the rebuild records its own decisions as they land. Only work that still has code behind it is listed below.
 
 ## Sidecar — cluster rebuild
 
@@ -21,12 +21,6 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - **Verify first:** that gqlgen autobinds *promoted* fields from an embedded struct. If it does not, every record needs explicit `fields:` mappings in `gqlgen.yml` and the trade is not worth making.
   - **What it will not remove:** the id conversion, because the `ObjectID` scalar binds `clustersvc.ObjectID` (a defined type) while beehive's is an alias for `int64` — binding `int64` instead would capture every `int64` in the schema; and the status default, because beehive leaves `Status` nil until first written while the schema types it non-null. So `toX` gets small, not deleted.
   - **Upstream alternative, not a substitute:** beehive could factor its own metadata into an embeddable `ObjectMeta` that `Object` embeds (strictly additive there, and every consumer projecting objects into records pays the same copying). Even then the two exceptions above remain, and embedding beehive's metadata wholesale would put `Name`, `ResourceVersion`, and `Finalizers` on the record — `Name` especially, which this package treats as a reconcile key nothing reads back.
-
-- **Discovery still asks for one request per group-version.** The sweep is watch-prompted, its
-  cadence follows the watch, and a degraded watch is named in the catalog's condition
-  (→ [ADR](docs/adr/2026-08-27-catalog-sweep-cadence.md)). What is left is the request shape:
-  aggregated discovery, one request instead of dozens on 1.30+ servers; metadata-only watch
-  payloads.
 
 - **Nothing exposes the four non-connection probes, so "Connected but not Identified" has no detail.**
   `kubeconn.State` carries a full `Observation` per probe — value, `LastSeen`, `LastAttempt`
@@ -99,30 +93,6 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
     per-probe minimum interval — "this probe runs at most once every N" — would cover the same
     burst without a second timing mechanism in the queue.
 
-- **`kubecatalog` and `kubesync` fold alike but are scheduled apart.** Both are leaves armed from a
-  record's reconcile, both key subjects by the record's beehive name, both publish a standing
-  `Observation` plus a `gobus/conflate` signal when the news moves, and both controllers fold them
-  with nearly the same code. Underneath they diverge completely: the sweeper is one probe on a
-  second `probe.Engine` (interval, backoff ladder, worker bound, `Suspend`/`Wake` all the engine's),
-  while the fleet runs a goroutine per subject with its own retry ladder, staleness timer and
-  cold-list semaphore. **The divergence is real** — a sync is a standing watch, and a probe `Run`
-  can neither hold one open nor block waiting for a connection without pinning an engine worker
-  (→ [ADR: sync workers, not probes](docs/adr/2026-08-26-sync-workers-not-probes.md)) — so this is
-  not "put kubesync on the engine". The question is whether the *shape they already share* should
-  be a shape the compiler knows: a `Track`/`Forget`/`Read`/`Subscribe` + `Observation` contract both
-  satisfy, so a controller folds either through one interface, a third leaf inherits it, and the
-  arming-is-policy rule is stated once rather than in two package docs.
-  - **What to look at first:** whether the two `Observation` types can share a core (the sweeper's
-    is `probe.Observation[Catalog]` — engine-owned, with `Attempt` timing; the fleet's is its own
-    struct with counts and freshness stamps), because if they cannot, the shared contract is only
-    the arming half and is probably not worth a type.
-  - **The other direction:** give the engine a subject kind that owns a long-lived stream — a `Run`
-    that is allowed to block for its subject's life, with its own worker budget — and put the fleet
-    on it after all. That is the bigger change and it earns its keep only if a third leaf wants the
-    same thing.
-  - **Trigger:** the third leaf of this shape, or the next time a rule has to be fixed in both
-    package docs at once.
-
 - **Nothing reclaims a cache file's free pages, and the storage shape has never been reviewed.**
   `sidecar/internal/clustersvc/internal/kubestore` opens each cache with
   `auto_vacuum=INCREMENTAL` set before migrations — which alone reclaims nothing: pages return to
@@ -158,39 +128,13 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
     and a cache that has been through a relist or two. The numbers that matter are file size versus
     rows held, and whether a vacuum sweep is visible as sync latency.
 
-- **A relist re-downloads bodies the cache already holds.** `syncer.attempt`
-  (`sidecar/internal/clustersvc/internal/kubesync/sync.go`) resumes a warm kind from its stored
-  cookie and never lists — but when the server refuses the position, it falls to `coldSync`, which
-  pages the whole collection back as full objects. The store already holds
-  `objects.resource_version` per uid, so what moved during the gap is derivable from a
-  metadata-only list: page a `PartialObjectMetadataList`, diff against the stored column, fetch
-  bodies only for the new and moved uids, and delete the uids the list did not carry.
-  - **Not the steady-state path, which is already minimal.** A warm watch carries only the objects
-    that changed, one body each, and each of those bodies is needed — `raw_json` is served
-    verbatim and `extractStatus` reads `.status` for the materialized columns. A metadata-only
-    *watch* would deliver the same events and add a GET per event.
-  - **Weigh:** it trades one streamed list for N round trips, and the QPS bucket lives in
-    `rest.RESTClient`, so those GETs are throttled. Break-even is churn during the gap — and a gap
-    long enough to age out the server's window is long enough for a hot kind to have moved a lot.
-    PartialObjectMetadata carries labels, annotations and managedFields, so the saving on the
-    unchanged rows is a small multiple, not an order of magnitude.
-  - **What it costs structurally:** `coldSync` takes its atomicity from mark-and-sweep over one
-    paged list — every page stamps `updated_at`, `Commit` deletes what is older. A diff-then-fetch
-    pass has to re-derive that boundary, and a failure mid-fetch leaves a mixed-vintage collection.
-    It also needs a second client: `kubeconn.Connection` exposes `Dynamic` only, so this is a
-    `metadata.Interface` over the same `http.Client`, or the lease's identity scoping is lost.
-  - **Measure first:** how often `errExpired` fires per kind, and the churn rate across a gap. The
-    same numbers say whether the cheaper answer is not mirroring kinds nobody opens.
-
-## Auth
-
 - **OAuth access-token refresh — background/proactive half.** On-demand refresh is done (`sidecar/internal/auth/grant.go` refreshes a lazily-expired token using the stored refresh token). What remains: a proactive/background refresh before expiry rather than only refreshing when a consumer hits an already-expired token.
 - **SSO failure didn't retry.** The async login tail (wait-for-redirect → exchange → verify → persist) is fire-and-forget; a tail failure is only logged and leaves the session signed-out (a known v1 limitation), with no retry. The user must manually re-initiate login.
 - **Check RBAC permissions?** The `ClusterPermissions`/`ResourceRule`/`NonResourceRule` types and schema exist, but the `Permissions` resolver is a stub that returns `not implemented: permissions`. Implement it via a `SelfSubjectRulesReview`. Distinct from the `SelfSubjectReview` *authentication* probe the schema documents on `ClusterPrincipal.username`, which is the rebuild's job.
 
 ## Sidecar (Go)
 
-- **Hoist `Condition`/`Event`/`Schedule`/`ObjectRef` when a second consumer appears.** All four are kind-agnostic on the wire (unprefixed, per the schema's naming rule) but live in `internal/clustersvc` (`shared.go`) because the cluster surface is their only consumer. **Trigger:** the first non-cluster kind or subsystem that needs conditions, events, schedules, or owner refs — at that point move all four into a shared leaf package (e.g. `internal/apimeta`), leaving `clustersvc` its `ConditionType` constants (`Connected`/`Healthy`/`Synced`/`Discovered`). `ObjectRef` takes `toOwnerRef` with it. Hoisting earlier would be a one-importer abstraction.
+- **Hoist `Condition`/`Event`/`Schedule`/`ObjectRef` when a second consumer appears.** All four are kind-agnostic on the wire (unprefixed, per the schema's naming rule) but live in `internal/clustersvc` (`shared.go`) because the cluster surface is their only consumer. **Trigger:** the first non-cluster kind or subsystem that needs conditions, events, schedules, or owner refs — at that point move all four into a shared leaf package (e.g. `internal/apimeta`), leaving `clustersvc` its `ConditionType` constants (`Connected`/`Identified`/`Synced`). `ObjectRef` takes `toOwnerRef` with it. Hoisting earlier would be a one-importer abstraction.
 
 - **Elevate `startCloser` and the start/stop/close helpers to a sidecar-level package.** `internal/clustersvc` defines an unexported `startCloser` — `Start(ctx) (stop func(ctx) error, error)` + `io.Closer` — and composes with `startAll`/`stopAll`/`closeAll`: started in order, stopped and closed in reverse, every error joined, and a failed start unwinding whatever already runs. Every other subsystem already has that exact shape (`poke.Service`, `auth.Service`, `cloud.Service`, `clustersvc.Service`, and `app.App` itself), so `app.Start` hand-writes what the helpers already do. **Fix:** move the interface and the three helpers into a shared leaf (e.g. `internal/lifecycle`) and have `app.Start` compose through them.
   - **Concrete motivation, not symmetry:** `app.Start` has the bug `clustersvc.Start` just fixed — if `cloudSvc.Start` fails it returns an error and *no* stop func, leaving the poke bus and the entire cluster service running with nothing able to drain them. `startAll` makes that unwind structural instead of something each composition root has to remember.

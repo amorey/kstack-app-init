@@ -32,10 +32,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
@@ -84,51 +82,6 @@ type kubeconnService interface {
 	Subscribe() kubeconn.Subscription
 }
 
-// kubecatalogService is the discovery sweeper behind every catalog record. Track arms
-// the sweep for a record — keyed by the record's own beehive name, so the sweeper's
-// change signal is the requeue — and Forget disarms it; both mirror the record's state,
-// which only the catalog's reconcile decides. Read is the standing answer that
-// reconcile folds, and Subscribe feeds the trigger.
-//
-// Track's params name the server as well as the context, because a context can be
-// re-pointed at another cluster and the sweeper must not read that one's kinds into this
-// cache — and the cache, because the sweep writes the kinds it finds into that cache's
-// store. Wake asks for a sweep now: what a wiper calls so the catalog rows it emptied are
-// rewritten in seconds rather than at the sweep's own interval.
-type kubecatalogService interface {
-	Track(id string, p kubecatalog.Params)
-	Forget(id string)
-	Wake(id string)
-	Read(id string) (kubecatalog.Observation, bool)
-	Subscribe() kubecatalog.Subscription
-}
-
-// kubesyncService is the worker fleet behind every ClusterCachedResource record. Track
-// arms a worker for a record — keyed by the record's own beehive name, so the fleet's
-// change signal is the requeue — and Forget disarms it; both mirror the record's
-// state, which only the resource's reconcile decides. Read is the standing answer
-// that reconcile folds, and Subscribe feeds the trigger.
-// Observations is the whole fleet at once, which the cache health gauge folds by cache.
-// RestartAll restarts every worker in place off its cookie — the poke resync's entry
-// point, since a Track deliberately restarts nothing while the record's params hold.
-// ForgetCache disarms a whole cache's workers and waits for them, which is what
-// deleting its store has to happen after. A CLEAR takes the hold instead — WhileStopped
-// or WhileCacheStopped — because it stops and then touches the file in two steps, and a
-// pass arming a worker between them would leave one watching into the file being
-// emptied.
-type kubesyncService interface {
-	Track(id string, p kubesync.Params)
-	Forget(id string)
-	WhileStopped(id string, cacheID int64, fn func() error) error
-	WhileCacheStopped(cacheID int64, fn func() error) error
-	Holding(cacheID int64) bool
-	Read(id string) (kubesync.Observation, bool)
-	Observations() []kubesync.SubjectObservation
-	Subscribe() kubesync.Subscription
-	RestartAll()
-	ForgetCache(cacheID int64)
-}
-
 // kubestoreManager is the cache directory as this package reaches it: the teardowns and
 // clears the controllers drive, plus what the stats gauge measures. Named for the leaf
 // type it stands for, the way every narrow interface here is.
@@ -150,20 +103,6 @@ type kubestoreManager interface {
 	Remove(cacheID int64) error
 	Stats(ctx context.Context, cacheID int64) (kubestore.Stats, error)
 }
-
-// afterClear detaches a mandatory post-clear step from the request's context. The
-// workers are already stopped by then, and the requeue that arms them again is not the
-// caller's to skip: a client that hangs up as the clear lands would otherwise leave its
-// own cache disarmed until the kind's resync notices. Bounded, since nothing else would
-// end it.
-func afterClear(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), afterClearTimeout)
-}
-
-// afterClearTimeout bounds that step. Generous: it is a handful of point reads against a
-// local store, and the cost of giving up early is a cache that syncs nothing until the
-// resync.
-const afterClearTimeout = 30 * time.Second
 
 // --- Identity ---
 
@@ -321,16 +260,9 @@ const (
 	// and it is what gates the cache, since a cache is named for the identity it
 	// mirrors.
 	ConditionIdentified ConditionType = "Identified"
-	// ConditionSynced reports the state of a sync. It is reported at two levels: coarse
-	// on the ClusterCache (did this cache decide to sync?) and per kind on each
-	// ClusterCachedResource, which is the verdict a UI wants.
+	// ConditionSynced reports the state of a sync. Nothing writes one today — the seam
+	// that fills a cache is being redesigned.
 	ConditionSynced ConditionType = "Synced"
-	// ConditionDiscovered reports whether the cache's GVR discovery pass reached the
-	// API server and enumerated the kinds it serves. A separate axis from Synced: a
-	// cache can have a complete, current kind list while its per-kind workers are
-	// still catching up, and a discovery outage says nothing about workers already
-	// running.
-	ConditionDiscovered ConditionType = "Discovered"
 )
 
 // Condition reason constants — CamelCase machine-readable explanations for a
@@ -360,67 +292,6 @@ const (
 	// ReasonPaused: nothing is syncing — the record is sync-disabled, deactivated,
 	// orphaned, or archived.
 	ReasonPaused = "Paused"
-	// ReasonSyncing: the sync is starting or catching up. Condition-only — the
-	// event vocabulary uses SyncStart/ResyncStart instead.
-	ReasonSyncing = "Syncing"
-	// ReasonWatching: the watch is established and proven live — caught up and
-	// streaming deltas.
-	ReasonWatching = "Watching"
-	// ReasonSyncFailed: the worker itself failed (it could not start, or its run loop
-	// exited) and is retrying with backoff.
-	ReasonSyncFailed = "SyncFailed"
-	// ReasonDiscovered: the last discovery pass enumerated every group the API
-	// server serves, and the per-GVR sync children match it.
-	ReasonDiscovered = "Discovered"
-	// ReasonDiscoveryPartial: some groups answered, others didn't — the pass adds
-	// children without pruning (a group that failed to answer is not shown gone).
-	ReasonDiscoveryPartial = "DiscoveryPartial"
-	// ReasonDiscoveryFailed: the discovery request itself failed, so nothing is
-	// known about the served kinds this pass. The existing children are left alone.
-	ReasonDiscoveryFailed = "DiscoveryFailed"
-	// ReasonStoreUnavailable: discovery answered and the cache's own store would not
-	// take the answer, so nothing was committed off it. Neither a wait nor a discovery
-	// failure — pointing a user at the API server is the wrong remedy — and the sweep is
-	// retrying on its own ladder.
-	ReasonStoreUnavailable = "StoreUnavailable"
-	// ReasonIdentityMismatch: the connection behind this record's context does not answer
-	// as the cluster the record is for — re-pointed at another, or replaced behind an
-	// endpoint that never moved. Nothing was asked, so it is neither a failed request nor
-	// a wait: what has to change is the record's own state, and for a superseded cache
-	// that is the pause the parent is about to relay.
-	ReasonIdentityMismatch = "IdentityMismatch"
-	// ReasonDiscoveryDraining: the kind list is current but a still-served kind has
-	// no live child yet — an earlier prune's child is draining and holds its name.
-	ReasonDiscoveryDraining = "DiscoveryDraining"
-	// ReasonStale: caught up, but the watch stopped proving itself alive past the
-	// threshold — the cache may be behind (a Synced=False state distinct from
-	// SyncFailed, which is a hard worker failure).
-	ReasonStale = "Stale"
-
-	// Sync-EVENT reasons (the event log's transition vocabulary, distinct from the
-	// Synced-condition reasons above): start/complete pairs, cold and warm. A
-	// healthy steady state records no event.
-	//
-	// ReasonSyncStart: a cold cache began its first-ever build.
-	ReasonSyncStart = "SyncStart"
-	// ReasonSyncComplete: a cold build reached the caught-up milestone.
-	ReasonSyncComplete = "SyncComplete"
-	// ReasonResyncStart: an already-populated cache began resuming (poke,
-	// reconnect, credential restart) — its message reports the warm cache size.
-	ReasonResyncStart = "ResyncStart"
-	// ReasonResyncComplete: a resume re-reached the caught-up milestone; its
-	// message disambiguates a real catch-up (counts) from a bare liveness
-	// recovery (no counts).
-	ReasonResyncComplete = "ResyncComplete"
-	// ReasonSyncDegraded: the worker failed and is retrying with backoff. The
-	// event-log parallel of the SyncFailed condition reason.
-	ReasonSyncDegraded = "SyncDegraded"
-	// ReasonSyncStopped: the cache's syncs were stopped because the cluster became
-	// sync-ineligible (sync paused/disabled, or the context departed).
-	ReasonSyncStopped = "SyncStopped"
-	// ReasonSyncStale: a caught-up watch stopped delivering updates past the
-	// threshold — the event-log parallel of the Stale condition reason.
-	ReasonSyncStale = "SyncStale"
 )
 
 // Condition aliases beehive's status condition. Conditions are beehive object
@@ -469,9 +340,6 @@ func TruncateMessage(s string) string {
 const (
 	// ConnectionEventCategory is the connection controller's probe-outcome category.
 	ConnectionEventCategory = "connection"
-	// SyncEventCategory is the sync-transition category, the sync-side parallel of
-	// ConnectionEventCategory.
-	SyncEventCategory = "sync"
 )
 
 // Event is one coalesced run from a beehive object's event timeline, served under

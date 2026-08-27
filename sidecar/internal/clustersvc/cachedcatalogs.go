@@ -23,12 +23,9 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"time"
 
 	"github.com/amorey/beehive"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubecatalog"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -54,24 +51,23 @@ type ClusterCachedCatalogSpec struct {
 
 // ClusterCachedCatalogStatus is empty, deliberately: status is a propagation
 // channel — for state a dependent reacts to, not for a discovery pass's gauges,
-// which nothing in the object graph reads. The Discovered condition is what remains.
+// which nothing in the object graph reads. A verdict belongs on a condition.
 type ClusterCachedCatalogStatus struct{}
 
 // ClusterCachedCatalog is the view of one ClusterCachedCatalog beehive object: the anchor a
-// cache's discovery runs against. It carries the pause switch its cache pushed down and the
-// Discovered verdict — the kinds the sweep found are its ClusterCachedResource children, one
-// per kind, and when a sweep last answered is deliberately nowhere, since a timestamp on a
-// record re-emits it to every watcher. Streamed standalone via CachedCatalogs().Watch and
-// joined onto its cache client-side by Owner.ID. Spec is the stored value served as-is, no
-// projection.
+// cache's discovery runs against. It carries the pause switch its cache pushed down, and the
+// kinds a cache serves are its ClusterCachedResource children, one per kind. When discovery
+// last answered is deliberately nowhere, since a timestamp on a record re-emits it to every
+// watcher. Streamed standalone via CachedCatalogs().Watch and joined onto its cache
+// client-side by Owner.ID. Spec is the stored value served as-is, no projection.
 type ClusterCachedCatalog struct {
 	ID ClusterCachedCatalogID
 	// Owner is the ClusterCache this catalog belongs to.
 	Owner ObjectRef
 	Spec  ClusterCachedCatalogSpec
 	// Conditions are beehive object conditions, read off the object rather than out of
-	// the status blob — `Discovered`, carrying this component's own verdict. There is no
-	// Status field: the kind's status is empty by design.
+	// the status blob. There is no Status field: the kind's status is empty by design.
+	// Nothing writes one today — the discovery seam is being redesigned.
 	Conditions []Condition
 }
 
@@ -216,21 +212,10 @@ var catalogWatch = deltaWatch[ClusterCachedCatalogSpec, ClusterCachedCatalogStat
 	bookmark: ClusterCachedCatalogWatchFrame{Type: DeltaFrameBookmark},
 }
 
-// catalogResyncInterval paces the fold's backstop pass. The third kind whose correctness
-// rests on a poll: what it folds is the sweeper's in-memory answer, which the store
-// cannot see move — the trigger makes the fold prompt, and this covers a signal that
-// went missing.
-const catalogResyncInterval = 10 * time.Minute
-
-// catalogRetryInterval is how soon a draining pass comes back: a tombstone releasing its
-// name is not an event anything reports, so the wait has a clock rather than a wake.
-const catalogRetryInterval = 30 * time.Second
-
-// clusterCachedCatalogController reconciles one cache's kind catalog: it arms the
-// sweeper for the record, folds the sweep's standing answer into one
-// ClusterCachedResource child per served kind, and reports the verdict. No pass
-// dials — the sweep runs on kubecatalog's own engine, and the trigger re-runs this
-// fold when its answer moves.
+// clusterCachedCatalogController reconciles one cache's kind catalog. Nothing
+// discovers kinds today — the seam between this record, ClusterCachedResource, and the
+// per-cache store is being redesigned — so a pass has no work and settles. The record
+// itself still exists per cache, created by the cache's own pass.
 type clusterCachedCatalogController struct {
 	lifecycle.None
 	// Every kind's client, not just this one's: a catalog reads the cache and cluster it
@@ -239,361 +224,9 @@ type clusterCachedCatalogController struct {
 }
 
 func (c *clusterCachedCatalogController) Reconcile(
-	ctx context.Context,
-	client beehive.ControllerClient[ClusterCachedCatalogStatus],
-	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
+	context.Context,
+	beehive.ControllerClient[ClusterCachedCatalogStatus],
+	*beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
 ) beehive.ReconcileResult {
-	// A catalog on its way out is about to be collected with the children it owns, and
-	// beehive collects it with no finalizer to clear. The sweep is disarmed with it.
-	if obj.DeletionRequestedAt != nil {
-		c.kubecatalogSvc.Forget(obj.Name)
-		return beehive.Settled()
-	}
-
-	own, err := c.ownersOf(ctx, client)
-	if err != nil {
-		return beehive.Fail(err)
-	}
-	// The subtree above is being collected, which will take this catalog with it.
-	if own.cluster == nil {
-		c.kubecatalogSvc.Forget(obj.Name)
-		return beehive.Settled()
-	}
-
-	// A paused catalog keeps its children and stops discovering — disarming the sweep is
-	// what stops it; the anchor lives as long as the cache, so the subtree survives a
-	// pause and is not rebuilt on resume. The relay still runs, since the switch
-	// reaching the workers is what pausing means.
-	if !obj.Spec.Enabled {
-		c.kubecatalogSvc.Forget(obj.Name)
-		return c.relayPause(ctx, client, obj)
-	}
-
-	contextName, err := clusterContext(own.cluster)
-	if err != nil {
-		// The record's own state — disabled, deleting, or credential-less — which the
-		// cluster pass reports on its own conditions. Nothing can sweep, so the
-		// subject is dropped.
-		c.kubecatalogSvc.Forget(obj.Name)
-		return observeDiscovered(ctx, client, ConditionFalse, ReasonNoConnection, err.Error())
-	}
-
-	// Arming is this pass's other job: the subject exists exactly while the record
-	// wants discovery, keyed by the record's own name so the sweeper's change signal
-	// is the requeue.
-	c.kubecatalogSvc.Track(obj.Name, kubecatalog.Params{
-		CacheID:     int64(own.cache.ID),
-		ContextName: contextName,
-		ServerUID:   own.cache.Spec.ServerUID,
-	})
-
-	obs, ok := c.kubecatalogSvc.Read(obj.Name)
-	if !ok || !obs.Known() {
-		// Armed, no answer yet. The trigger re-runs this fold when one lands, and the
-		// kind's resync is the backstop — so no requeue here.
-		//
-		// Connecting is the default because most waits here are the first sweep coming.
-		// The other two are named because they are not that: a cluster nothing reached,
-		// and a connection that will not answer for this cache until the record changes.
-		reason := ReasonConnecting
-		switch obs.LastAttempt.Reason {
-		case kubecatalog.ReasonNoConnection:
-			reason = ReasonNoConnection
-		case kubecatalog.ReasonIdentityMismatch:
-			reason = ReasonIdentityMismatch
-		case kubecatalog.ReasonStoreFailed, kubecatalog.ReasonStoreRemoved:
-			// A store failure on a cache's very first sweep, which would otherwise read
-			// as Connecting for as long as the disk keeps refusing.
-			reason = ReasonStoreUnavailable
-		}
-		return observeDiscovered(ctx, client, ConditionFalse, reason, obs.LastAttempt.Message)
-	}
-	return c.converge(ctx, client, obj, int64(own.cache.ID), obs)
-}
-
-// owners is the chain above a catalog: the cache it anchors and the cluster that cache
-// mirrors. Both, because the pass needs the cluster's context to sweep over and the
-// cache's identity to say which server that sweep must answer as.
-type owners struct {
-	cache   *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]
-	cluster *beehive.Object[ClusterSpec, ClusterStatus]
-}
-
-// ownersOf walks the two owner edges above a catalog. A zero owners with no error means
-// something in that chain is gone or going, which is a cascade about to take this catalog
-// rather than a failure to retry.
-func (c *clusterCachedCatalogController) ownersOf(
-	ctx context.Context,
-	client beehive.ControllerClient[ClusterCachedCatalogStatus],
-) (owners, error) {
-	// The reconcile load carries no edges, so each owner is a lookup rather than a field.
-	cacheRef, ok, err := client.GetOwner(ctx)
-	if err != nil {
-		return owners{}, fmt.Errorf("read cached catalog owner: %w", err)
-	}
-	if !ok {
-		return owners{}, nil
-	}
-
-	cacheObj, err := c.cacheClient.Get(ctx, cacheRef.ID, beehive.LoadOwner())
-	if errors.Is(err, beehive.ErrNotFound) {
-		return owners{}, nil
-	}
-	if err != nil {
-		return owners{}, fmt.Errorf("read cluster cache %d: %w", cacheRef.ID, err)
-	}
-	if cacheObj.DeletionRequestedAt != nil {
-		return owners{}, nil
-	}
-
-	clusterRef, ok, err := cacheObj.Owner()
-	if err != nil {
-		return owners{}, fmt.Errorf("read cluster cache %d owner: %w", cacheRef.ID, err)
-	}
-	if !ok {
-		return owners{}, nil
-	}
-
-	clusterObj, err := c.clusterClient.Get(ctx, clusterRef.ID)
-	if errors.Is(err, beehive.ErrNotFound) {
-		return owners{}, nil
-	}
-	if err != nil {
-		return owners{}, fmt.Errorf("read cluster %d: %w", clusterRef.ID, err)
-	}
-	return owners{cache: cacheObj, cluster: clusterObj}, nil
-}
-
-// converge rewrites the per-kind children to match the sweep's standing answer, and
-// reports the verdict. The kinds come off the cache's store — the sweep keeps none — and
-// the fingerprint is what says those rows are the answer this observation carries.
-func (c *clusterCachedCatalogController) converge(
-	ctx context.Context,
-	client beehive.ControllerClient[ClusterCachedCatalogStatus],
-	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
-	cacheID int64,
-	obs kubecatalog.Observation,
-) beehive.ReconcileResult {
-	rows, stored, written, err := c.sweptKinds(ctx, cacheID)
-	switch {
-	case err != nil:
-		// The sweep's own mirror refuses this store alike, so its run fails, its reason
-		// moves, and its signal re-runs this fold — the ladder behind it is the retry.
-		return observeDiscovered(ctx, client, ConditionFalse, ReasonStoreUnavailable, err.Error())
-	case !written:
-		// Nothing has written the table since it was emptied, and an empty one must never
-		// read as "the cluster serves nothing". The children stand while the sweep is asked
-		// for the pass that lays the rows down again: nothing else would ask, since a wipe
-		// leaves the cluster's answer unmoved and so commits nothing to signal on. The
-		// rewrite is silent for that same reason, which is what the requeue is for.
-		c.kubecatalogSvc.Wake(obj.Name)
-		return observeDiscovered(ctx, client, ConditionFalse, ReasonStoreUnavailable,
-			"the cache's kind catalog was emptied; waiting for the sweep to rewrite it").
-			RequeueAfter(catalogRetryInterval)
-	case stored != obs.Value.Fingerprint:
-		// The store is ahead: a sweep writes its rows and commits immediately after, and
-		// this pass read between the two. That commit is what wakes this fold, so there is
-		// nothing to ask for and nothing to report — asking would buy a full discovery pass
-		// at the cluster's expense for an ordinary sweep.
-		return beehive.Settled()
-	}
-
-	held, err := c.resourceClient.ListOwnedObjects(ctx, obj.ID)
-	if err != nil {
-		return beehive.Fail(fmt.Errorf("list cached catalog %d resources: %w", obj.ID, err))
-	}
-
-	kinds := toResourceSpecs(rows)
-	draining, err := c.applyKinds(ctx, obj, kinds)
-	if err != nil {
-		return beehive.Fail(err)
-	}
-
-	// Pruning needs a complete answer: a group that did not answer has not stopped being
-	// served, and deleting its children would stop live workers over a transient outage.
-	if !obs.Value.Partial {
-		if err := c.prune(ctx, held, kinds); err != nil {
-			return beehive.Fail(err)
-		}
-	}
-
-	// The verdict follows the last attempt when it did not succeed — read off its
-	// reason, never the retained value: the standing partial flag outliving a sweep
-	// that then failed outright must not outrank that failure. The children still
-	// match the standing answer either way, and the sweep retries on its own ladder,
-	// so the fold settles rather than failing.
-	status, reason, message := ConditionTrue, ReasonDiscovered, ""
-	switch {
-	case !obs.OK():
-		status, message = ConditionFalse, obs.LastAttempt.Message
-		switch obs.LastAttempt.Reason {
-		case kubecatalog.ReasonSweepPartial:
-			reason = ReasonDiscoveryPartial
-		case kubecatalog.ReasonNoConnection:
-			reason = ReasonNoConnection
-		case kubecatalog.ReasonIdentityMismatch:
-			// Not DiscoveryFailed: nothing was asked, and nothing is retrying. Saying the
-			// discovery request failed points a reader at the API server when what moved
-			// is which cluster the context reaches.
-			reason = ReasonIdentityMismatch
-		case kubecatalog.ReasonStoreFailed, kubecatalog.ReasonStoreRemoved:
-			// The sweep's answer is good and the mirror would not take it; the sweep's own
-			// ladder is retrying. A removed store means the cache record is gone, so
-			// ownersOf returns before this in practice — but a teardown must not read as a
-			// discovery failure on the pass that does get here.
-			reason = ReasonStoreUnavailable
-		default:
-			reason = ReasonDiscoveryFailed
-		}
-	case draining:
-		status, reason = ConditionFalse, ReasonDiscoveryDraining
-	case !obs.Value.WatchLive:
-		// Still Discovered, and still True: the kinds are right, and what is degraded is how
-		// fast a new one shows up. A reason of its own would put a cluster whose catalog is
-		// correct into a false state, and the condition is what the user reads.
-		message = "the watch on this cluster's CustomResourceDefinitions and APIServices is not " +
-			"running; a new kind will not appear until the next discovery sweep"
-	}
-	res := observeDiscovered(ctx, client, status, reason, message)
-	if draining {
-		return res.RequeueAfter(catalogRetryInterval)
-	}
-	return res
-}
-
-// sweptKinds is the cache's kind rows beside the fingerprint of the sweep that wrote
-// them. written is false when no sweep has written the table at all — no file, an emptied
-// one, or a claim a clear closed — which is the case an empty read must never be mistaken
-// for.
-//
-// The rows and the fingerprint come out of one read, or a clear landing between them could
-// pair a wiped table with the fingerprint of the sweep that rewrote it, and pruning off
-// that would delete every child.
-func (c *clusterCachedCatalogController) sweptKinds(ctx context.Context, cacheID int64) ([]kubestore.KindRow, uint64, bool, error) {
-	// Never OpenOrCreate: the sweep is the creator, and a fold that created would resurrect
-	// a torn-down cache's file. The error is read before ok, since a file the manager could
-	// not open is not a cache with nothing in it.
-	store, ok, err := c.kubestoreMgr.OpenExisting(cacheID)
-	if err != nil {
-		// A clear swapped the file under the claim, which is the wipe seen from inside.
-		if errors.Is(err, kubestore.ErrClosed) {
-			return nil, 0, false, nil
-		}
-		return nil, 0, false, err
-	}
-	if !ok {
-		return nil, 0, false, nil
-	}
-	defer store.Release()
-
-	rows, stored, written, err := store.KindsWithFingerprint(ctx)
-	if errors.Is(err, kubestore.ErrClosed) {
-		return nil, 0, false, nil
-	}
-	if err != nil {
-		return nil, 0, false, err
-	}
-	return rows, stored, written, nil
-}
-
-// toResourceSpecs translates the stored rows into this kind's spec vocabulary. Enabled is
-// left for applyKinds, which relays the catalog's own switch.
-func toResourceSpecs(rows []kubestore.KindRow) []ClusterCachedResourceSpec {
-	specs := make([]ClusterCachedResourceSpec, 0, len(rows))
-	for _, r := range rows {
-		specs = append(specs, ClusterCachedResourceSpec{
-			APIVersion: r.APIVersion,
-			Kind:       r.Kind,
-			Resource:   r.Resource,
-			Namespaced: r.Scope == kubestore.ScopeNamespaced,
-		})
-	}
-	return specs
-}
-
-// relayPause rewrites each live child's switch and changes nothing else: the pass did
-// not look at the server, so the desired set is what is already stored.
-func (c *clusterCachedCatalogController) relayPause(
-	ctx context.Context,
-	client beehive.ControllerClient[ClusterCachedCatalogStatus],
-	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
-) beehive.ReconcileResult {
-	held, err := c.resourceClient.ListOwnedObjects(ctx, obj.ID)
-	if err != nil {
-		return beehive.Fail(fmt.Errorf("list cached catalog %d resources: %w", obj.ID, err))
-	}
-	// Draining cannot arise: every name written here belongs to a live row just listed.
-	if _, err := c.applyKinds(ctx, obj, specsOf(held)); err != nil {
-		return beehive.Fail(err)
-	}
-	return observeDiscovered(ctx, client, ConditionFalse, ReasonPaused, "")
-}
-
-// applyKinds converges one child per kind, relaying the pause switch into each. draining
-// reports a served kind whose name is still held by an earlier prune's tombstone: the
-// kind has no live record, which is a state to report and come back to, not a failure.
-func (c *clusterCachedCatalogController) applyKinds(
-	ctx context.Context,
-	obj *beehive.Object[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
-	kinds []ClusterCachedResourceSpec,
-) (draining bool, err error) {
-	for _, spec := range kinds {
-		spec.Enabled = obj.Spec.Enabled
-		name := ClusterCachedResourceName(obj.ID, spec.APIVersion, spec.Resource)
-		_, _, err := c.resourceClient.CreateOrUpdate(ctx, name, spec, beehive.WithOwner(obj.ID))
-		switch {
-		case errors.Is(err, beehive.ErrDeletionPending):
-			draining = true
-		case err != nil:
-			return false, fmt.Errorf("apply cached resource %s: %w", name, err)
-		}
-	}
-	return draining, nil
-}
-
-// prune deletes the children for kinds the server no longer serves. Deletion is beehive's
-// soft one, so the row lingers holding its name — which is the draining case above, and
-// why a kind that comes back is reported rather than silently missing.
-func (c *clusterCachedCatalogController) prune(ctx context.Context, held []*beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus], kinds []ClusterCachedResourceSpec) error {
-	served := make(map[SyncedKindRef]struct{}, len(kinds))
-	for _, spec := range kinds {
-		served[SyncedKindRef{APIVersion: spec.APIVersion, Resource: spec.Resource}] = struct{}{}
-	}
-
-	for _, obj := range held {
-		ref := SyncedKindRef{APIVersion: obj.Spec.APIVersion, Resource: obj.Spec.Resource}
-		if _, ok := served[ref]; ok || obj.DeletionRequestedAt != nil {
-			continue
-		}
-		if err := c.resourceClient.Delete(ctx, obj.ID); err != nil && !errors.Is(err, beehive.ErrNotFound) {
-			return fmt.Errorf("delete cached resource %d: %w", obj.ID, err)
-		}
-	}
-	return nil
-}
-
-// specsOf reads the stored specs back out, for the pass that has no fresh answer.
-func specsOf(objs []*beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) []ClusterCachedResourceSpec {
-	specs := make([]ClusterCachedResourceSpec, 0, len(objs))
-	for _, obj := range objs {
-		if obj.DeletionRequestedAt == nil {
-			specs = append(specs, obj.Spec)
-		}
-	}
-	return specs
-}
-
-// observeDiscovered records the verdict and settles. The pass writes no status of its own
-// — this kind has none — so the condition and the result are the whole report.
-func observeDiscovered(
-	ctx context.Context,
-	client beehive.ControllerClient[ClusterCachedCatalogStatus],
-	status ConditionStatus,
-	reason, message string,
-) beehive.ReconcileResult {
-	cond := LiveCondition(ConditionDiscovered, status, reason, message)
-	if err := client.SetCondition(ctx, cond); err != nil {
-		return beehive.Fail(fmt.Errorf("set %s condition: %w", ConditionDiscovered, err))
-	}
 	return beehive.Settled()
 }

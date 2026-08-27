@@ -43,19 +43,11 @@ internal/clustersvc/
   internal/kubeconn/  the connections a cluster is talked to over, and what probing them
                       found — leases, the five probes, and the connection itself. A leaf
                       under internal/, so the compiler keeps it this package's own
-  internal/kubecatalog/  the discovery sweeper: a second probe engine over per-catalog
-                      subjects, the sweep, and the change signal that re-runs each
-                      catalog's fold. Borrows kubeconn's leases; same leaf rule
-  internal/kubesync/  the worker fleet: one worker per (cache, GVR), armed from the
-                      resource record's reconcile the way the sweeper is, with the
-                      same change signal. service.go is the fleet, sync.go the loop
-                      one worker runs. Same leaf rule
   internal/kubestore/  the on-disk cache: one SQLite file per ClusterCache behind a
-                      refcounted manager (manager.go), the claim and the sync write
-                      path (store.go), a file per table beside it (catalog.go is the
-                      sweep's kind_catalog; objects/events/status/rawcodec project the
-                      rows), and the change ping bus every read re-reads on. Same
-                      leaf rule
+                      refcounted manager (manager.go), the claim and the write path
+                      (store.go), a file per table beside it (catalog.go is
+                      kind_catalog; objects/events/status/rawcodec project the rows),
+                      and the change ping bus every read re-reads on. Same leaf rule
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
@@ -79,72 +71,17 @@ cache is still the active identity). Served: the whole `Clusters()` family, the 
 That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **A cache now exists at runtime**: the serverUID probe writes `status.server.uid`, which is what
 `ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
-one — and a `ClusterCachedCatalog` beneath it. **The catalog's pass discovers kinds**, so a
-`ClusterCachedResource` exists per kind the cluster serves, and its six reads answer.
-**Kinds now sync**: the resource pass arms a worker per kind (`internal/kubesync`), that worker
-mirrors the collection into the cache's SQLite file (`internal/kubestore`), and the pass folds its
-observation into the kind's `Synced` condition and the sync timeline beneath it. Both `Clear`s and
-both cache gauges answer. **The sweep writes `kind_catalog`**, so a plural resolves to its Kind, and
-**the whole `CachedData()` family answers off the store** — the nav's kinds and counts, a kind's
-objects, and the events window, each live. Nothing on the write path depends on the catalog table:
-`Store.ClearKind` takes the whole `Kind` from the record. What is left is the kstack event log.
+one — and a `ClusterCachedCatalog` beneath it. What is left is the kstack event log, and the seam
+below.
 
-**A kind is mirrored by a standing worker, not a periodic pass.** `internal/kubesync` runs one
-goroutine per (cache, GVR): resolve the connection through `Lease.ConnFor`, cold-list into the
-store when there is no cookie to resume from, then watch with `AllowWatchBookmarks` until the
-stream ends. **A position the server refuses is answered in place** — re-list, prune what the list
-did not carry, watch on — because a gap of unknown size has no other answer; every other failure
-goes up the worker's own backoff ladder. Blocking in `kubeconn.AwaitConnFor` is legal *here and
-only here*: the worker is its own goroutine holding nothing shared, where a probe `Run` would pin
-an engine worker. Cold lists pass a fleet-wide semaphore, so enabling a cache does not fire a
-hundred full LISTs at one API server; standing watches are unbounded.
-→ [ADR: sync workers, not probes](../docs/adr/2026-08-26-sync-workers-not-probes.md).
-
-**Every cadence in the loop is a parameter whose production value is the constant** — page size,
-staleness threshold, backoff base and max, the events window and its prune tick — so a test picks
-its own timescale and never encodes a production number.
-
-**A kind's rows are keyed by the record's Kind, never the body's.** The teardown has only
-the record, so a writer that trusted a body claiming another Kind would leave rows under a name
-nothing will ever look up.
-
-**Only a build reports `Syncing`.** A warm reopen — the server closing a watch on its own timeout —
-publishes nothing, or a healthy cache would walk Watching → Syncing → Watching per reopen, waking
-its record twice and writing a resync pair each time, per kind.
-
-**Staleness is a property of the kind, not of one connection.** The threshold runs from the last
-moment the contents were known good — a completed list, or traffic — and a reconnect inherits what
-is left of it. A proxy accepting and closing an empty watch just inside the threshold would
-otherwise restart the clock every time. The clock starts when the first watch opens, so a stream
-that never carries anything goes stale too.
-
-**A connect is not proof of life, and neither is an error frame.** A proxy can accept a watch and
-deliver nothing — or answer every one with a failure — and reopening inside the staleness threshold
-would keep a cache that receives no updates reading healthy forever. So `LastLiveAt` — a claim about
-the *stream* — moves only where the stream carried something: the delta and bookmark arms of
-`apply`, never the error arm. The verdict moves to `Watching` on connect only when that attempt **listed**: the
-collection is on disk as of the list, which is what caught up means. A warm resume waits for the
-stream to say something.
-
-**A watch that ended is paced by what it carried, not by how it ended.** A stream that delivered a
-delta or a bookmark and then dropped is a working watch the server hung up on: the cookie is intact,
-so it reopens off the base of the ladder rather than climbing it — but **every reopen has that
-floor**, or a server closing right after each bookmark would spin every kind in the cache. One that opened and gave nothing is the same clean end and a very
-different cost — a proxy that accepts a watch and closes it turns every kind in the cache into a
-connect loop — so it goes up the backoff ladder without being reported as a failure, since nothing
-about the cache's contents changed.
-
-**The worker publishes a verdict, never timing.** Its `Observation` carries the reason, the object
-count, and two stamps, and the fleet's conflated signal fires **only when the reason moves**, so a
-healthy sync does not requeue its record per delta. `Resumed` says the run started from a cookie,
-and it rides the commit that moves the reason — a flip under an unchanged reason wakes nobody.
-
-**`Synced`'s transitions are the sync event timeline, and the fold writes them.** Only a
-`ControllerClient` can write an event, so `observeSynced` compares the stored condition against
-this pass's verdict and records the move (`SyncStart`/`ResyncStart`, `SyncComplete`/
-`ResyncComplete`, `SyncDegraded`, `SyncStale`, `SyncStopped`) in the same `Within` as the
-condition. Only a move records: the fold runs on every resync, and a healthy steady state is
-silent.
+**Nothing fills a cache. The seam between `ClusterCachedCatalog`, `ClusterCachedResource`, and
+`kubestore` is being redesigned from scratch**, and the leaves that used to carry it are gone. So
+no pass discovers a cluster's kinds and no `ClusterCachedResource` record is ever created; the two
+controllers settle without work, neither kind writes a condition, and every cache's store stays
+empty. The record kinds, their six reads apiece, the delta watches, both `Clear`s, and the whole
+`CachedData()` read path are intact and answer — over nothing. **Don't reintroduce the old shape
+piecemeal**: the store's write API is the fixed ground the new seam meets, and the design is owed a
+spec and an ADR before code.
 
 **The store is one SQLite file per cache behind a refcounted `Manager`** (`internal/kubestore`),
 cleared by deleting the file and removed with the record it is named for. A `Store` is a *claim*
@@ -230,49 +167,22 @@ fires when a file is **created** — a cache whose file is already there would p
 never comes, leaving a silently empty table.
 → [ADR: cached-data reads](../docs/adr/2026-08-26-cached-data-read-loop.md).
 
-**The gauges are read-side folds, and both re-emit on a signal *and* a cadence.**
-`Caches().WatchStats` measures the file and the trigger-maintained counts; `Caches().WatchHealth`
-folds the worker fleet by cache (worst reason wins: `IdentityMismatch`, `NoConnection`,
-`SyncFailed`, `Stale`, `Syncing`, then `Connecting` for a kind with no answer yet; `LastLiveAt` is
-the **oldest** proof, and nil while any kind has none — a watch nothing has proven live is weaker
-than any stamp its neighbours carry). The cadence is not optional on either: a file's size moves
-with checkpoints that ping nothing, and the freshness stamps move precisely when the fleet's signal
-is silent. Neither emits before its first measurement, and neither carries a `Bookmark`.
+**The gauges are read-side folds.** `Caches().WatchStats` measures the file and the
+trigger-maintained counts, re-emitting on the store's ping and on a cadence — the cadence is not
+optional, since a file's size moves with checkpoints that ping nothing. `Caches().WatchHealth`
+reports every live cache, on the cadence alone: nothing fills a cache, so the verdict comes from
+the pause switch the records carry (`cacheSyncEnabled`) — `Paused` when it is off, `Connecting`
+while it is on. A cache being collected is skipped. Neither gauge emits before its first
+measurement, and neither carries a `Bookmark`.
 
-**A cache with no workers still gets a verdict, and it comes from the records.** The health gauge
-is latest-value with no departure frame, so a cache absent from the fold would otherwise read as
-its last verdict — or, for a subscriber that arrived after it went quiet, as no verdict ever. So
-`WatchHealth` enumerates the live cache records each pass and reports every one the fold does not
-cover. **No worker is not the same as switched off**: an enabled cluster's cache has none until its
-catalog pass has run, and one serving no kinds never will, so the reason comes from the pause
-switch the records carry (`cacheSyncEnabled`) — `Paused` when it is off, `Connecting` while it is
-on. A cache being collected is skipped, and so is one a clear is holding (`kubesyncSvc.Holding`):
-a clear stops every subject on its way through, and reporting that would flip a user's own clear to
-Paused and back.
+**A verdict comes from the records, not from silence.** The health gauge is latest-value with no
+departure frame, so a cache the pass skipped would read as its last verdict — or, for a subscriber
+that arrived after it went quiet, as no verdict ever. Enumerating the records each pass is what
+keeps that honest, and it is the half of the gauge the new seam has to preserve.
 
-**Both `Clear`s touch the store inside a hold, then requeue.** `Caches().Clear` is
-`kubesyncSvc.WhileCacheStopped(id, …)` around `Manager.Clear`, then a requeue of the cache's whole
-subtree — the catalog and every kind under it; `CachedResources().Clear` is `WhileStopped(name, …)`
-around the kind's rows. **A wiper requeues records and never reaches for a leaf**: the catalog's own
-pass is what notices the `kind_catalog` rows the clear emptied and asks the sweeper to write them
-again, so a new wiper inherits that recovery by requeueing its subtree. **The hold
-is what makes stopping and clearing one step**: it stops the workers *and* refuses a `Track` until
-it returns, because a pass arming one in between would leave a worker resuming its watch into the
-file being emptied — deltas into an empty database, with no cold list to fill it. The requeue is
-what arms them again (a `Track` restarts nothing while its params hold), and it is **deferred and
-outside the hold**: a failed clear re-arms too, since the alternative is a cache that looks fine
-and syncs nothing until `resourceResync` notices ten minutes later. It also runs on its **own
-context** (`afterClear`), not the caller's — the workers are already stopped, so a client hanging
-up as the clear lands is not licence to leave them that way. A requeue that cannot be delivered
-costs latency rather than the clear.
-
-A **teardown** needs no hold — `ForgetCache` then `Manager.Remove` is enough, because `Remove`
-tombstones the id and a worker armed in the gap is refused with `ErrRemoved`.
-
-**A resume poke restarts every worker in place.** `clusterCachedResourceController.Start` subscribes
-to `poke` and calls `kubesyncSvc.RestartAll`: a machine waking from sleep has watches that are
-silently dead and a store that shows nothing moved. The restarts run in turn on that goroutine, each
-waiting for its worker, which is what keeps a resume from reopening a hundred connections at once.
+**`Caches().Clear` is `Manager.Clear`; `CachedResources().Clear` is `Store.ClearKind`** over the
+kind's own `Kind`, read off the record rather than out of `kind_catalog`. A **teardown** is
+`Manager.Remove`, which tombstones the id so a later claim is refused with `ErrRemoved`.
 
 **A read reports the store as it is, and never filters.** A record awaiting deletion is served like
 any other, carrying the tombstone (`deletionRequestedAt`) the consumer decides on — rendering it
@@ -306,121 +216,15 @@ reads as settled, since the generation was observed by a process that is gone. *
 also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResyncInterval)`),
 the poll its correctness rests on: it reads a file the store cannot see, so a lost trigger poke is
 a change nothing else would report. **`Cluster` takes `clusterResync`** for the same reason
-— what its probe reports is a remote server's, so nothing in the store moves when the answer does —
-and **`ClusterCachedCatalog` takes `catalogResync`** and **`ClusterCachedResource`
-`resourceResync`**, the third and fourth: what each fold reads is a leaf's in-memory answer
-(the sweeper's, a worker's), which the store cannot see move — the kubecatalog and kubesync
-triggers make the folds prompt, and the resyncs cover a signal that went missing. The other kinds
-are woken by a spec write or a dependency edge.
+— what its probe reports is a remote server's, so nothing in the store moves when the answer does.
+The other kinds are woken by a spec write or a dependency edge. **A resync is owed by a fold whose
+answer the store cannot see move**, so the new seam's records will likely take one back.
 → [ADR: beehive control plane](../docs/adr/2026-08-09-beehive-control-plane.md).
 
-**Discovery is a sweep on its own engine (`internal/kubecatalog`); the catalog pass only folds
-it.** A second `probe.Engine` with one probe, subjects keyed by the catalog record's beehive name
-and armed from its reconcile — `Track` while the record wants discovery, `Forget` on pause and
-teardown. **Arming is policy, not interest**, which is why this is not a refcounted lease pool
-like kubeconn: a reader must never re-arm a sweep the user paused. The sweep borrows the context's
-connection through the service's own `kubeconn` lease (refcounted beside every other holder's),
-commits only on a change, suspends while the context resolves to nothing (the kubeconn bridge
-wakes it the moment the pool reaches the server), and `Subscribe` signals the ids whose news moved
-— `newKubecatalogTrigger` maps that signal straight onto the record, the id being the name. The
-subject is bound to **a server, not just a context**: `Track(id, kubecatalog.Params{…})` names one,
-and the sweep asks the pool for that server's connection (`Lease.ConnFor`), suspending with
-`IdentityMismatch` when it is not. The params name **a cache** as well, because the sweep writes
-what it finds into that cache's store — the subject id carries the catalog's object id, not the
-cache's.
-
-**The sweep's cadence follows the watch it stands over.** The registered interval is the
-correctness bound — a poll, since nothing here sees a CRD land — and it is `sweepInterval`, 30
-minutes, for a cluster whose watch is live. A run whose watch is refused, dead, or never opened
-returns `Succeeded().RequeueAfter(sweepIntervalDegraded)` (10 minutes), because the poll is then
-the only thing that would notice a new CRD. `ensureWatcher` reports that liveness, which is why
-`watcher.stream` marks a refused open **spent before it reports the open** — a run reads `spent()`
-the moment `awaitOpen` returns. `RequeueAfter` can only bring a run forward: the engine takes it
-when it is positive and shorter than the interval, so a return path can never push a subject past
-its registration. → [ADR: cadence follows the watch](../docs/adr/2026-08-27-catalog-sweep-cadence.md).
-
-**`kind_catalog` has one writer: the sweep**, the way a kubesync worker writes the objects it
-mirrors — so `kubecatalog.New(conns, stores)` takes the store manager beside the pool.
-**The write is not gated on the answer changing**: every sweep that produced one upserts the rows
-(pruning only when the answer is not `Partial`), and the commit guard goes on governing only the
-*signal*. A table wiped under the sweep is therefore rewritten by the next one with no repair
-protocol. **The write comes before the commit**: a commit is the fold's wake, and one over rows
-that are not there yet would have the fold converge on a table the write is still catching up to. A
-failed write fails the run (`ReasonStoreFailed`, folded to the `StoreUnavailable` reason) and
-commits nothing; `ErrRemoved` suspends it, since a torn-down cache's `Forget` is on its way. The
-probe registers its own `WithBackoff(30s, 2, sweepIntervalDegraded)` rather than the engine's
-default second: what a failure retries here is a full `ServerPreferredResources`, paid for at
-someone else's cluster, and promptness comes from the watch rather than from the ladder. **The cap
-is the degraded interval, not the backstop** — the ladder runs only for a sweep that failed or came
-back partial, and no watch covers either.
-→ [ADR: the sweep writes the catalog](../docs/adr/2026-08-26-sweep-writes-the-catalog.md).
-
-**The sweep keeps no kind list; the rows are the answer.** Its observable is
-`Catalog{Fingerprint, Partial, WatchLive}` — the kinds are resident for the length of one `Run`,
-and the commit guard is that struct compare. **`WatchLive` stays out of `Fingerprint`**, which
-covers the kinds alone: the rows on disk are matched against that word, so a watch flip must not
-read as a table that moved. `SyncKinds` records it in `cluster_meta` under
-`kinds/fingerprint` **inside the rows' own transaction**, and `Store.KindsWithFingerprint` reads
-the pair back **out of one read transaction**. Both halves are load-bearing: split either and a
-clear landing mid-read pairs a wiped table with the fingerprint of the sweep that rewrote it, which
-the fold reads as "the cluster serves nothing" and prunes every child off.
-→ [ADR: catalog kinds off disk](../docs/adr/2026-08-27-catalog-kinds-off-disk.md).
-
-**Promptness is a watch that only wakes.** Every run that resolves a connection stands a watcher
-up over it, before sweeping: one stream each on `customresourcedefinitions` and `apiservices`,
-the two things that change what a cluster serves. A change wakes the sweep and the event is
-dropped — the sweep reads current state. **The watch's precondition is the connection, not the
-answer**, so it is reconciled on every pass; deferring it to a clean sweep would leave a replaced
-connection's watcher standing for as long as discovery keeps failing. Four rules keep it cheap
-and safe:
-
-- **A stream never opens without a version.** A watch given none *replays* — the server streams a
-  synthetic `Added` for every object that already exists — and each one reads here as a change, so
-  every establishment would wake the sweep that is about to read the same state. `openCollectionWatch`
-  therefore reads the collection's current version first (`List` with `Limit: 1`, the objects
-  dropped) and starts there. **Two requests per fresh stream, against a discovery pass of one per
-  group-version**, which is what that buys.
-- **A clean end resumes; it does not sweep.** Each stream remembers the resourceVersion of the
-  last event it saw and reopens from it, and `AllowWatchBookmarks` is what keeps a quiet stream
-  resumable. Without this every server-side timeout (~5m, two streams, own clocks) would be
-  treated as a gap and swept — 2-4x the pull-only baseline, to learn nothing. **A `Bookmark` never
-  wakes**, or the sweep would run on the bookmark cadence and cost more than not watching at all.
-  Reopening is paced by `reopenDelay`, since nothing else paces it and a proxy can hang up as fast
-  as it accepts; the resume means that wait costs latency, never events.
-- **Only an end that proves a gap wakes**, which is the server refusing our version for being too
-  old (`IsResourceExpired`/`IsGone`, in `errorEnd`). A re-list is the only answer to a gap of
-  unknown size, and only the sweep can do it. Every other end is silent and waits for the next
-  sweep: a stop, an end before any version was known, a refused open, **and any other watch error**.
-  **Waking on those loops** — the sweep's answer to a dead watch is to stand another one up, and
-  they repeat (RBAC on a cluster-scoped collection repeats exactly; so does a server erroring for
-  its own reasons), so each buys a full discovery pass per turn with no committed answer to make
-  the spin visible. The gap wake cannot loop for that reason inverted: its replacement starts from
-  the collection's version as it is now, which has to age before it can be refused.
-- **A resourceVersion never outlives its connection** — it is one cluster's etcd revision, and the
-  next connection may be another cluster. It lives in the stream and dies with it.
-
-**Watchers live on the `Service` beside `tracked`, under the same mutex**, and a watcher exists
-only for a tracked id. Both halves hold that under one critical section: establishment checks
-`tracked` and stores in the same one, and `Forget` drops the subject and the watcher in the same
-one, stopping it after the unlock. A run is on a worker, so `Forget` can land under it and the
-finishing sweep would otherwise leave a goroutine and two streams standing for an id nothing
-tracks — the engine's commit refusal does not cover it, because establishment is not a commit.
-**Splitting the teardown is the easy way to lose this**, since stopping a watcher waits for its
-streams: drop it before the subject and the window is as long as the API server takes to hang up.
-Every refusal stops the watcher too: `conn.Done()` misses the conflicted case, which never
-retires.
-
-**A standing watcher is kept only while it is live and over the sweep's own connection** —
-`ensureWatcher` compares both, and replaces otherwise. Nothing else re-establishes one, so
-either state read as "a watch already stands" costs that cluster its promptness permanently: a
-watcher whose stream hit a gap marks itself **spent before it wakes** (the wake runs the sweep
-that must replace it), and a watcher over a connection since replaced holds an HTTP watch on
-retired credentials that the streams never notice.
-
 **A context is not an identity, and identity lives on the connection.** Re-point a context at
-another cluster and the pool hands out whatever now answers, while the only thing that disarms the
-superseded cache's subject is a pause flip three reconciles downstream — and the pool wakes every
-subject over a context whose identity moved, so that stale sweep is the *first* thing to run
+another cluster and the pool hands out whatever now answers, while the only thing that disarms a
+superseded cache's work is a pause flip several reconciles downstream — and the pool wakes every
+subject over a context whose identity moved, so that stale work is the *first* thing to run
 against the new server. `Connection` therefore carries a **set-once `serverUID`, stamped by
 `serverUIDProbe` when it reads one over that connection**, and `Lease.ConnFor(ctx, serverUID)`
 answers from it.
@@ -446,52 +250,6 @@ as well as on a changed fingerprint, and the pass that records the conflict wake
 → [ADR: connection-carried identity](../docs/adr/2026-08-25-connection-carried-identity.md),
 [ADR: identity-driven retirement](../docs/adr/2026-08-27-identity-driven-retirement.md).
 
-`clusterCachedCatalogController.Reconcile` walks its two owner edges (cache, then cluster), arms
-or disarms the sweeper, and rewrites one `ClusterCachedResource` per kind the cache's store holds.
-**The kinds come off disk**, matched to the standing answer by fingerprint — the sweep keeps none —
-so a table the fingerprint does not vouch for is a wipe, not a cluster serving nothing.
-**No pass dials, and none needs extra workers** — the sweep's concurrency is the kubecatalog
-engine's worker bound. The rules, each carried by a reason in the `Discovered` vocabulary:
-
-- **`DiscoveryPartial` adds without pruning.** client-go returns partial results *and* an
-  `ErrGroupDiscoveryFailed` when an aggregated API server is down. A group that went quiet has not
-  stopped being served, and deleting its children would stop live workers over a transient outage.
-  The probe commits the partial list and fails its run, so its ladder retries sooner than the
-  interval.
-- **`DiscoveryFailed` leaves the children alone** and **settles**: the standing answer keeps
-  converging, the condition carries the sweep's failure message, and retrying the sweep is the
-  probe's own ladder, not beehive's.
-- **`DiscoveryDraining`** is a served kind whose name is still held by an earlier prune's tombstone
-  (`ErrDeletionPending`) — a state to come back to, not a failure. The one path that still
-  requeues (`catalogRetryInterval`), since a tombstone releasing its name is not an event anything
-  reports.
-- **`Paused` disarms the sweep** and only relays the switch onto the children already there. The
-  anchor lives as long as the cache, so its subtree survives a pause rather than being rebuilt.
-- **`NoConnection`** settles with no requeue: the sweep is suspended on its claim, the bridge
-  re-runs it on recovery, and its signal re-runs this fold. The outage itself is the cluster
-  pass's to report.
-- **`StoreUnavailable`** is discovery answering and the cache's own store not giving the kinds
-  back. Never a discovery failure — pointing a user at the API server is the wrong remedy — and it
-  covers two shapes. **A table no sweep has written** (no fingerprint recorded, no file,
-  `ErrClosed`) leaves the children alone, wakes the sweeper, and requeues at `catalogRetryInterval`:
-  a wipe leaves the cluster's answer unmoved, so the rewrite commits nothing and signals nobody, and
-  the requeue is what converges it — which is why `clusterCacheClear` leaves the catalog `False`
-  for up to that interval. **Any open or read failure** settles instead: the sweep's own mirror
-  refuses the same store, so its ladder is the retry and its signal re-runs this fold.
-- **`Discovered` stays `True` for a degraded watch**, and the message names it. The kinds are
-  right; what is degraded is how fast a new one shows up, and a reason of its own would put a
-  correct catalog into a false state. `WatchLive` is in `kubecatalog`'s `news` so the flip signals
-  this fold — it moves only inside a run, so it costs at most one wake per sweep, and leaving it
-  out would strand the message until `catalogResyncInterval`.
-- **A fingerprint that is recorded but not the observation's is not a wipe** — the store is
-  *ahead*, since the sweep writes its rows and commits right after, and that commit is this fold's
-  wake. The pass settles silently, rebuilding nothing and waking nobody: waking there would buy a
-  full discovery pass at the cluster's expense every time a sweep raced a fold.
-
-A kind is mirrorable when it is not a subresource and carries both `list` and `watch`; the
-`events.k8s.io` spelling is dropped so one event store is not cached twice. The filter lives with
-the sweep, in kubecatalog.
-
 **A status write is unconditional.** Beehive compares what a pass writes against the status it handed
 that pass and reaches the store only for a difference, so an observation that moved nothing costs a
 marshal rather than a transaction — a guard in the pass would only duplicate it, and would drift from
@@ -506,8 +264,8 @@ path can forget it. **A no-op pass still settles**: unsettled, every object of t
 on the owed pass's cadence, forever.
 
 **Shared dependencies travel in `deps`** — one beehive client per kind, the process-wide services
-(`kubeconfig`, `kubeconn`, `poke`), built once by
-`newDeps(bh, kubeconfigSvc, kubeconnSvc, pokeSvc)` and **embedded** by `service` and by each
+(`kubeconfig`, `kubeconn`, `kubestore`, `poke`), built once by
+`newDeps(bh, kubeconfigSvc, kubeconnSvc, kubestoreMgr, pokeSvc)` and **embedded** by `service` and by each
 controller, so a family reads `a.s.cacheClient` and a controller reads `c.cacheClient`. The `Client`
 suffix is load-bearing: the fields are promoted into both, and `a.s.cacheClient` must not read like
 the `Caches` family it is reached through. **A new kind or a new
@@ -918,7 +676,7 @@ costs no goroutine — and `AwaitConnFor` is that plus the re-check, since the c
 the connection can move again. **Free functions over `Lease`, never methods**, so no fake can get
 the attach-before-check ordering wrong; a waiter lives until it fires or ctx ends, so bound it
 with the work's context. **Neither may be called from a probe `Run`** — blocking holds an engine
-worker, which is why `kubecatalog` refuses-and-suspends instead, woken by the fleet bus.
+worker, so a probe refuses-and-suspends instead, woken by the fleet bus.
 
 **One context, one entry.** `Service.claimed` is a single map keyed by context name — also the key
 both hubs publish under — holding the holder count, whether the file still names the context, and

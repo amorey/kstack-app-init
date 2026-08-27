@@ -31,7 +31,6 @@ import (
 	"github.com/amorey/gobus"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -94,7 +93,9 @@ type ClusterCacheStats struct {
 	KindCount   int
 }
 
-// ClusterCacheHealth is one cache's sync verdict, folded from every kind it syncs.
+// ClusterCacheHealth is one cache's sync verdict over every kind it syncs. Nothing
+// syncs a kind today, so the fields below the verdict itself go unpopulated — the seam
+// that fills a cache is being redesigned.
 //
 // A READ-SIDE projection, not a stored condition: status is for state a dependent
 // reacts to, and nothing in the object graph reacts to this — only a UI does. Storing
@@ -366,39 +367,26 @@ func (a cachesAPI) measureCache(ctx context.Context, cacheID ClusterCacheID) (Cl
 	}, nil
 }
 
-// WatchHealth folds the worker fleet by cache. A read-side projection, never a stored
+// WatchHealth reports each live cache's verdict. A read-side projection, never a stored
 // condition: nothing in the object graph reacts to it, and storing it would wake the
-// cache and every watcher each time any of its hundred-plus kinds changed verdict.
+// cache and every watcher each time its verdict moved.
 //
-// It re-emits on the fleet's own signal and on a cadence, since the stamps it carries
-// move in healthy steady state precisely when the signal is silent.
+// Nothing mirrors a kind into a cache today, so every verdict comes from the records —
+// see cacheHealth. It re-emits on a cadence, which is what will carry the stamps a
+// filled cache reports: those move in healthy steady state precisely when a change
+// signal would be silent.
 func (a cachesAPI) WatchHealth(ctx context.Context) (*Stream[ClusterCacheHealth], error) {
 	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterCacheHealth) error {
-		// Subscribed before the first fold, so a verdict landing in between is reported
-		// by the wake rather than missed.
-		moved := a.s.kubesyncSvc.Subscribe()
-		defer moved.Close()
-
 		ticker := time.NewTicker(a.s.gaugeCadence)
 		defer ticker.Stop()
 
 		sent := map[ClusterCacheID]ClusterCacheHealth{}
 		for {
-			folded := foldCacheHealth(a.s.kubesyncSvc.Observations())
-			for _, health := range folded {
-				if prev, ok := sent[health.CacheID]; ok && sameHealth(prev, health) {
-					continue
-				}
-				if !sendFrame(ctx, out, health) {
-					return nil
-				}
-				sent[health.CacheID] = health
-			}
-			stopped, err := a.stoppedCaches(ctx, folded)
+			healths, err := a.cacheHealth(ctx)
 			if err != nil {
 				return err
 			}
-			for _, health := range stopped {
+			for _, health := range healths {
 				if prev, ok := sent[health.CacheID]; ok && sameHealth(prev, health) {
 					continue
 				}
@@ -412,21 +400,12 @@ func (a cachesAPI) WatchHealth(ctx context.Context) (*Stream[ClusterCacheHealth]
 			case <-ctx.Done():
 				return nil
 			case <-ticker.C:
-			case _, ok := <-moved.Chan():
-				if !ok {
-					// The fleet's hub closed: the process is going, and a closed channel
-					// selects forever.
-					return nil
-				}
 			}
 		}
 	}), nil
 }
 
-// Clear empties a cache's store. The workers stop first and are waited for — one still
-// running would be writing through a store this is about to close — and the kinds are
-// then requeued, since their own passes are what re-arm them. They cold-sync: the
-// cookies died with the file.
+// Clear empties a cache's store, swapping the file under whoever holds it open.
 func (a cachesAPI) Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache, error) {
 	obj, err := a.s.cacheClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
 	if errors.Is(err, beehive.ErrNotFound) {
@@ -436,168 +415,23 @@ func (a cachesAPI) Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache,
 		return nil, fmt.Errorf("get cluster cache %d: %w", id, err)
 	}
 
-	// Deferred, and outside the hold: no path out of here may leave the workers stopped,
-	// and the passes that arm them again are refused until the hold is released.
-	defer a.requeueCacheResources(ctx, id)
-
-	// Stopping the workers and emptying the file are one step from a pass's point of
-	// view: one that armed a worker in between would leave it resuming a watch into the
-	// file this is about to swap.
-	if err := a.s.kubesyncSvc.WhileCacheStopped(int64(id), func() error {
-		return a.s.kubestoreMgr.Clear(int64(id))
-	}); err != nil {
+	if err := a.s.kubestoreMgr.Clear(int64(id)); err != nil {
 		return nil, fmt.Errorf("clear cluster cache %d: %w", id, err)
 	}
 	return toClusterCache(obj)
 }
 
-// requeueCacheResources asks the cache's whole subtree to reconcile: every kind, whose
-// pass re-arms its worker, and the catalog, whose pass finds the kind rows the clear
-// emptied and asks the sweeper to write them again. A requeue that cannot be delivered
-// costs latency rather than the clear: each kind's own resync runs the same pass.
+// cacheHealth is the verdict owed by every live cache, read off the records.
 //
-// **It happens after the clear**, which is why this is deferred rather than inline: a
-// catalog pass ahead of it would ask for a sweep whose rows the clear then deletes,
-// leaving the table empty for a full sweep interval.
-func (a cachesAPI) requeueCacheResources(ctx context.Context, cacheID ClusterCacheID) {
-	ctx, cancel := afterClear(ctx)
-	defer cancel()
-
-	catalogID, ok, err := a.s.catalogIDFor(ctx, cacheID)
-	if err != nil || !ok {
-		return
-	}
-	//nolint:errcheck // a lost requeue costs latency; catalogResync is the backstop
-	_ = a.s.catalogClient.Requeue(ctx, catalogID)
-
-	objs, err := a.s.resourceClient.ListOwnedObjects(ctx, catalogID)
-	if err != nil {
-		return
-	}
-	for _, obj := range objs {
-		//nolint:errcheck // a lost requeue costs latency; resourceResync is the backstop
-		_ = a.s.resourceClient.Requeue(ctx, obj.ID)
-	}
-}
-
-// healthPrecedence orders the verdicts a cache's kinds can be in, worst first: ninety-
-// nine healthy kinds and one the credentials cannot name is not a cache that is nearly
-// fine, and the reason a user acts on is the worst one present.
-var healthPrecedence = []struct{ observed, reported string }{
-	{kubesync.ReasonIdentityMismatch, ReasonIdentityMismatch},
-	{kubesync.ReasonNoConnection, ReasonNoConnection},
-	{kubesync.ReasonSyncFailed, ReasonSyncFailed},
-	{kubesync.ReasonStale, ReasonStale},
-	{kubesync.ReasonSyncing, ReasonSyncing},
-	// A tracked kind with no answer yet: armed, still connecting.
-	{"", ReasonConnecting},
-}
-
-// foldCacheHealth groups the fleet's observations by cache and folds each group into
-// one verdict. A cache with no tracked subjects is absent from the answer; what the
-// stream owes for one it has already reported is stoppedCaches' business.
-func foldCacheHealth(fleet []kubesync.SubjectObservation) []ClusterCacheHealth {
-	byCache := map[int64][]kubesync.SubjectObservation{}
-	for _, subject := range fleet {
-		byCache[subject.Params.CacheID] = append(byCache[subject.Params.CacheID], subject)
-	}
-
-	out := make([]ClusterCacheHealth, 0, len(byCache))
-	for cacheID, subjects := range byCache {
-		out = append(out, foldOneCacheHealth(ClusterCacheID(cacheID), subjects))
-	}
-	slices.SortFunc(out, func(a, b ClusterCacheHealth) int { return cmp.Compare(a.CacheID, b.CacheID) })
-	return out
-}
-
-// foldOneCacheHealth is one cache's verdict over the kinds it syncs.
-func foldOneCacheHealth(cacheID ClusterCacheID, subjects []kubesync.SubjectObservation) ClusterCacheHealth {
-	health := ClusterCacheHealth{
-		CacheID:    cacheID,
-		Status:     ConditionTrue,
-		Reason:     ReasonWatching,
-		TotalKinds: len(subjects),
-	}
-
-	present := map[string]bool{}
-	// firstUnhealthy is the fallback verdict for a reason this fold does not rank — a
-	// kind that is not watching is not healthy, whatever word the worker used.
-	var firstUnhealthy string
-	var newestUpdate, oldestLive time.Time
-	// unproven: one kind that has never seen watch traffic leaves the whole cache
-	// unverified, since nothing else vouches for what that kind may be missing.
-	var unproven bool
-	for _, subject := range subjects {
-		if !subject.Known || subject.Observation.Reason != kubesync.ReasonWatching {
-			observed := ""
-			if subject.Known {
-				observed = subject.Observation.Reason
-			}
-			present[observed] = true
-			if firstUnhealthy == "" {
-				firstUnhealthy = observed
-			}
-			health.UnhealthyKindRefs = append(health.UnhealthyKindRefs, SyncedKindRef{
-				APIVersion: subject.Params.APIVersion,
-				Resource:   subject.Params.Resource,
-			})
-		}
-		if at := subject.Observation.LastUpdateAt; !at.IsZero() && at.After(newestUpdate) {
-			newestUpdate = at
-		}
-		// The weakest link: a cache is only as verified as its least proven watch. A kind
-		// with no proof at all is weaker than any stamp, so it takes the whole cache's
-		// freshness with it rather than being skipped over.
-		at := subject.Observation.LastLiveAt
-		switch {
-		case at.IsZero():
-			unproven = true
-		case oldestLive.IsZero() || at.Before(oldestLive):
-			oldestLive = at
-		}
-	}
-
-	health.UnhealthyKinds = len(health.UnhealthyKindRefs)
-	slices.SortFunc(health.UnhealthyKindRefs, func(a, b SyncedKindRef) int {
-		if c := cmp.Compare(a.APIVersion, b.APIVersion); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.Resource, b.Resource)
-	})
-	for _, verdict := range healthPrecedence {
-		if present[verdict.observed] {
-			health.Status, health.Reason = ConditionFalse, verdict.reported
-			break
-		}
-	}
-	if len(health.UnhealthyKindRefs) > 0 && health.Status == ConditionTrue {
-		health.Status, health.Reason = ConditionFalse, firstUnhealthy
-	}
-	health.LastUpdateAt = nilIfZero(newestUpdate)
-	if !unproven {
-		health.LastLiveAt = nilIfZero(oldestLive)
-	}
-	return health
-}
-
-// stoppedCaches is the verdict owed by every live cache the fold does not cover, which
-// is every cache with no worker armed.
-//
-// It reads the records rather than diffing against what this stream has sent, because a
+// It reads them rather than diffing against what a stream has sent, because a
 // subscriber that arrives after a cache went quiet never witnessed the transition and
 // would otherwise hear nothing about that cache at all. The gauge is latest-value with
 // no departure frame, so silence reads as the last verdict — or as no verdict ever.
 //
-// **No worker is not the same as switched off.** An enabled cluster's cache has none
-// until its catalog pass has run, and one serving no kinds never will, so the verdict
-// comes from the pause switch the records carry (`cacheSyncEnabled`) rather than from
-// the absence. A cache being collected is skipped: its own record says it is going.
-func (a cachesAPI) stoppedCaches(ctx context.Context, folded []ClusterCacheHealth) ([]ClusterCacheHealth, error) {
-	covered := make(map[ClusterCacheID]bool, len(folded))
-	for _, health := range folded {
-		covered[health.CacheID] = true
-	}
-
+// The verdict comes from the pause switch the records carry (`cacheSyncEnabled`):
+// `Paused` when it is off, `Connecting` when it is on, since nothing fills a cache yet.
+// A cache being collected is skipped: its own record says it is going.
+func (a cachesAPI) cacheHealth(ctx context.Context) ([]ClusterCacheHealth, error) {
 	objs, err := a.s.cacheClient.List(ctx, beehive.LoadOwner())
 	if err != nil {
 		return nil, fmt.Errorf("list cluster caches: %w", err)
@@ -606,17 +440,9 @@ func (a cachesAPI) stoppedCaches(ctx context.Context, folded []ClusterCacheHealt
 	var out []ClusterCacheHealth
 	clusters := map[beehive.ObjectID]*beehive.Object[ClusterSpec, ClusterStatus]{}
 	for _, obj := range objs {
-		id := ClusterCacheID(obj.ID)
-		if covered[id] || obj.DeletionRequestedAt != nil {
+		if obj.DeletionRequestedAt != nil {
 			continue
 		}
-		if a.s.kubesyncSvc.Holding(int64(id)) {
-			// A clear stops the workers on its way through, which is not the cache
-			// having stopped syncing — reporting it would flip a user's own clear to
-			// Paused and back. The verdict stands until the kinds are armed again.
-			continue
-		}
-
 		cluster, err := a.clusterFor(ctx, obj, clusters)
 		if err != nil {
 			return nil, err
@@ -629,7 +455,9 @@ func (a cachesAPI) stoppedCaches(ctx context.Context, folded []ClusterCacheHealt
 		if !cacheSyncEnabled(cluster, obj.Spec.ServerUID) {
 			reason = ReasonPaused
 		}
-		out = append(out, ClusterCacheHealth{CacheID: id, Status: ConditionFalse, Reason: reason})
+		out = append(out, ClusterCacheHealth{
+			CacheID: ClusterCacheID(obj.ID), Status: ConditionFalse, Reason: reason,
+		})
 	}
 	slices.SortFunc(out, func(a, b ClusterCacheHealth) int { return cmp.Compare(a.CacheID, b.CacheID) })
 	return out, nil
@@ -711,10 +539,6 @@ func (c *clusterCacheController) Reconcile(
 	// below stop clearing their own rows as soon as this mark lands (their owner walk
 	// reads a deletion-pending cache as no cache), so nothing recreates the file.
 	if obj.DeletionRequestedAt != nil {
-		// Before the file goes: the kinds below disarm their own workers, but on their
-		// own passes, and a worker still running would be writing through a store this
-		// is about to close.
-		c.kubesyncSvc.ForgetCache(int64(obj.ID))
 		if err := c.kubestoreMgr.Remove(int64(obj.ID)); err != nil {
 			return beehive.Fail(fmt.Errorf("remove cluster cache %d store: %w", obj.ID, err))
 		}
