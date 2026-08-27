@@ -396,8 +396,8 @@ func TestPluralRootFieldsScopeOptionally(t *testing.T) {
 	}{
 		{"caches unscoped", `{ clusterCaches { id } }`, "clusterCaches", len(fix)},
 		{"caches scoped", `{ clusterCaches(clusterID: "` + clusterID + `") { id } }`, "clusterCaches", 1},
-		{"syncs unscoped", `{ clusterCachedResources { id } }`, "clusterCachedResources", len(fix)},
-		{"syncs scoped", `{ clusterCachedResources(cacheID: "` + cacheID + `") { id } }`, "clusterCachedResources", 1},
+		{"syncs unscoped", `{ clusterCachedKinds { id } }`, "clusterCachedKinds", len(fix)},
+		{"syncs scoped", `{ clusterCachedKinds(cacheID: "` + cacheID + `") { id } }`, "clusterCachedKinds", 1},
 	}
 
 	for _, tt := range tests {
@@ -429,7 +429,7 @@ func TestClusterCacheSyncsResolver(t *testing.T) {
 	cacheID := fixtureCacheID(fix[0].id)
 
 	query := `{ clusterCache(id: "` + strconv.FormatInt(int64(cacheID), 10) + `") {
-		cachedResources { id owner { id kind } spec { apiVersion resource } }
+		cachedKinds { id owner { id kind } spec { apiVersion resource } }
 	} }`
 	body, _ := json.Marshal(map[string]string{"query": query})
 	raw := postGQL(t, srv.URL, string(body))
@@ -437,7 +437,7 @@ func TestClusterCacheSyncsResolver(t *testing.T) {
 	var resp struct {
 		Data struct {
 			ClusterCache struct {
-				CachedResources []map[string]any `json:"cachedResources"`
+				CachedKinds []map[string]any `json:"cachedKinds"`
 			} `json:"clusterCache"`
 		}
 		Errors []struct{ Message string }
@@ -448,11 +448,11 @@ func TestClusterCacheSyncsResolver(t *testing.T) {
 	if len(resp.Errors) > 0 {
 		t.Fatalf("unexpected GraphQL errors: %+v", resp.Errors)
 	}
-	got := resp.Data.ClusterCache.CachedResources
+	got := resp.Data.ClusterCache.CachedKinds
 	if len(got) != 1 {
 		t.Fatalf("want this cache's one record, got %d: %s", len(got), raw)
 	}
-	if got[0]["id"] != strconv.FormatInt(int64(fixtureResourceID(fix[0].id)), 10) {
+	if got[0]["id"] != strconv.FormatInt(int64(fixtureKindID(fix[0].id)), 10) {
 		t.Errorf("id: want the sync record's own id, got %v", got[0]["id"])
 	}
 	if ownerOf(got[0])["id"] != strconv.FormatInt(int64(cacheID), 10) {
@@ -503,7 +503,7 @@ func TestClusterCachesResolver(t *testing.T) {
 
 // The two cache-side event timelines are the same generic reader hung off a different
 // record: `ClusterCache.events` reads the cache's own timeline (what the cache layer
-// records, e.g. SyncStopped), `ClusterCachedResource.events` one synced kind's (where
+// records, e.g. SyncStopped), `ClusterCachedKind.events` one synced kind's (where
 // each worker report lands). One table because the wire mapping under test —
 // clustersvc.Event → the generic Event shape, enum included — is identical; only the record it
 // hangs off differs. Reaching either also exercises its root lookup, which is the only
@@ -533,10 +533,10 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 		wantEnum: "Warning",
 	}, {
 		name:     "per-kind sync timeline",
-		field:    "clusterCachedResource",
-		lookupID: func(id clustersvc.ClusterID) clustersvc.ObjectID { return clustersvc.ObjectID(fixtureResourceID(id)) },
+		field:    "clusterCachedKind",
+		lookupID: func(id clustersvc.ClusterID) clustersvc.ObjectID { return clustersvc.ObjectID(fixtureKindID(id)) },
 		seed: func(f *fakeClusterService, id clustersvc.ClusterID, ev clustersvc.Event) {
-			f.syncEvents = map[clustersvc.ClusterCachedResourceID][]clustersvc.Event{fixtureResourceID(id): {ev}}
+			f.syncEvents = map[clustersvc.ClusterCachedKindID][]clustersvc.Event{fixtureKindID(id): {ev}}
 		},
 		event: clustersvc.Event{
 			Category: "sync", Type: beehive.EventNormal, Reason: "SyncComplete",
@@ -619,14 +619,14 @@ func TestClusterCacheClearMutation(t *testing.T) {
 	}
 }
 
-// TestClusterCachedResourcesWatchIsCacheScoped pins the scoping on the wire: the stream is
+// TestClusterCachedKindsWatchIsCacheScoped pins the scoping on the wire: the stream is
 // opened for one cache and must carry only that cache's kinds. The fixture gives each
 // cache one record, so a leak shows up as a second frame.
-func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
+func TestClusterCachedKindsWatchIsCacheScoped(t *testing.T) {
 	srv := newTestServer(t, clusterFixtures())
 
 	resp := openSSESubscription(t, srv.URL, "",
-		`subscription { clusterCachedResourcesWatch(cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { type resource { id owner { id kind } `+
+		`subscription { clusterCachedKindsWatch(cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { type kind { id owner { id kind } `+
 			`spec { apiVersion kind resource namespaced } conditions { type status reason } } } }`)
 	defer resp.Body.Close()
 	events := sseEvents(t, resp)
@@ -637,9 +637,9 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 		var frame struct {
 			Data struct {
 				Watch struct {
-					Type     string         `json:"type"`
-					Resource map[string]any `json:"resource"`
-				} `json:"clusterCachedResourcesWatch"`
+					Type string         `json:"type"`
+					Kind map[string]any `json:"kind"`
+				} `json:"clusterCachedKindsWatch"`
 			} `json:"data"`
 		}
 		select {
@@ -654,7 +654,7 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 				continue
 			}
 			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
-				t.Fatalf("decode gvr sync frame %s: %v", ev.data, err)
+				t.Fatalf("decode cached-kind frame %s: %v", ev.data, err)
 			}
 			// Detect the snapshot boundary by type, never by a missing entity: an
 			// errored non-null field nulls its parent, so a null entity also rides
@@ -663,11 +663,11 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 				continue
 			}
 			seen++
-			sync := frame.Data.Watch.Resource
-			if ownerOf(sync)["id"] != strconv.FormatInt(int64(fixtureCacheID(1)), 10) {
-				t.Fatalf("another cache's record leaked into the stream: %v", sync)
+			cachedKind := frame.Data.Watch.Kind
+			if ownerOf(cachedKind)["id"] != strconv.FormatInt(int64(fixtureCacheID(1)), 10) {
+				t.Fatalf("another cache's record leaked into the stream: %v", cachedKind)
 			}
-			spec, _ := sync["spec"].(map[string]any)
+			spec, _ := cachedKind["spec"].(map[string]any)
 			if spec["resource"] != "deployments" {
 				t.Errorf("resource = %v, want deployments", spec["resource"])
 			}

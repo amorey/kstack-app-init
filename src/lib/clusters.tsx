@@ -21,7 +21,7 @@
 //
 // The verdict is the sidecar's rollup over every kind the cache syncs — the cache's
 // own `Synced` condition is deliberately coarse and NOT what the UI reads. Only
-// always-mounted reads live here: per-GVR discovery/sync records are subscribed by
+// always-mounted reads live here: the per-kind `ClusterCachedKind` records are subscribed by
 // the sync dialog (`cluster-sync-panel.tsx`), not fleet-wide in every window.
 import { createContext, useContext, useMemo } from 'react';
 

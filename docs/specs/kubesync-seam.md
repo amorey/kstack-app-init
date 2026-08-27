@@ -21,9 +21,9 @@ show the seam is sufficient.
 ```
 clusterCacheController      ──Track/Forget(cacheID, Params)──▶  kubesync.Service
    arms from the pause switch                                        │
-   mirrors the kind set into ClusterCachedResource records           │ Acquire(context)
+   mirrors the kind set into ClusterCachedKind records           │ Acquire(context)
    logs discovery runs to its own `discovery` timeline               ▼
-clusterCachedResourceController                                 kubeconn.Lease
+clusterCachedKindController                                 kubeconn.Lease
    logs one kind's runs to its `sync` timeline                       │
 Caches().WatchHealth / WatchSyncStatus  ◀──Observations()──          │ OpenOrCreate(cacheID)
                                                                      ▼
@@ -48,7 +48,7 @@ and `clustersvc` translates, which is the layering rule the other leaves already
    and the verdict on a gauge, nothing was left on it: a spec field relaying what its cache already
    computed, an empty status, and one condition. Its history moves to the cache's own event log
    under `category: "discovery"` — one timeline per cache is what a 1:1 child was standing in for.
-6. **`ClusterCachedResource` survives as a timeline anchor.** Sync history is per kind, and
+6. **`ClusterCachedKind` survives as a timeline anchor.** Sync history is per kind, and
    `category` cannot be that axis — it is a fixed vocabulary the UI branches on, not an identity. So
    each kind keeps an object to hang `category: "sync"` on. It carries identity only: no conditions,
    no verdict, nothing that a flip would rewrite.
@@ -97,7 +97,7 @@ type Subscription = *conflate.Receiver[Signal, struct{}]
 func (s *Service) Subscribe() Subscription
 
 // KindObservation is one kind's standing answer, and the identity a record is written from:
-// the fields above Reason are exactly ClusterCachedResourceSpec's.
+// the fields above Reason are exactly ClusterCachedKindSpec's.
 type KindObservation struct {
 	Kind         kubestore.Kind // APIVersion, Kind, Resource
 	Namespaced   bool
@@ -176,18 +176,18 @@ This leaf's own words; the controllers map them onto event reasons.
 **`clusterCacheController` arms and mirrors.** Its pass already computes `cacheSyncEnabled` and
 resolves the cluster above it, so it calls `Track` when the switch holds and `Forget` when it does
 not — and `Forget` before `kubestoreMgr.Remove` on a deletion mark. It then reconciles
-`Read(cacheID).Kinds` into the `ClusterCachedResource` records it owns: one per kind, created from
+`Read(cacheID).Kinds` into the `ClusterCachedKind` records it owns: one per kind, created from
 the observation's identity fields, and every record no longer in the set deleted. On a discovery
 verdict that moved it calls `AddEvent` under `category: "discovery"`.
 
-**`clusterCachedResourceController` logs.** Its pass reads `ReadKind` and calls `AddEvent` under
+**`clusterCachedKindController` logs.** Its pass reads `ReadKind` and calls `AddEvent` under
 `category: "sync"`. It writes no condition and arms nothing: the record is an anchor for a
 timeline, and repeating a run's `(Category, Type, Reason)` extends that run rather than appending,
 so a flapping kind costs one row per transition.
 
 **A trigger carries the signals.** `newKubesyncTrigger` maps a `Signal` onto the beehive name it
 requeues: a zero `Kind` onto `Signal.Subject`, otherwise onto
-`ClusterCachedResourceName(CacheID, APIVersion, Resource)`. Pure translation with no state, like
+`ClusterCachedKindName(CacheID, APIVersion, Resource)`. Pure translation with no state, like
 the other two triggers — which is why the record's name is keyed by the cache and the cache's own
 name rides the signal.
 
@@ -198,7 +198,7 @@ a row per kind — reason, message, object count, freshness. Both are current-on
 nothing serves a dead process's verdict after a restart.
 
 **The clears wrap.** `Caches().Clear` runs `kubestoreMgr.Clear` inside `WhileCacheStopped`;
-`CachedResources().Clear` runs `Store.ClearKind` inside `WhileKindStopped`.
+`CachedKinds().Clear` runs `Store.ClearKind` inside `WhileKindStopped`.
 
 **Lifecycle order.** kubesync is a `lifecycle.Part` between `kubestore` and `beehive`, so stopping
 runs beehive → kubesync → kubestore → kubeconn: no pass can arm a session that is stopping, and no
@@ -213,7 +213,7 @@ bounded on (`maxEventRuns` per object per category).
 | --- | --- | --- |
 | `Cluster` | `connection` | reachability and identity transitions |
 | `ClusterCache` | `discovery` | sweep verdicts, and the kind set changing |
-| `ClusterCachedResource` | `sync` | one kind's worker transitions |
+| `ClusterCachedKind` | `sync` | one kind's worker transitions |
 
 A session suspended for `NoConnection` moves the discovery reason on the gauge but writes no
 discovery event: that fact is the cluster's, already on its own timeline, and logging it per cache
@@ -223,9 +223,9 @@ is the same news twice.
 
 Step 4 has landed: the `ClusterCachedCatalog` kind, its controller, `ensureClusterCachedCatalog`,
 the `CachedCatalogs()` family (so `Service` carries four record families), `catalogIDFor`, the
-`watchWhenAnchored`/`awaitAnchor`/`drainChanges` dance in `cachedresources.go`, and
-`ClusterCachedResourceSpec.Enabled` are all gone. `ClusterCachedResource` is owned by its
-`ClusterCache` and named `"cachedresource/{cacheID}/{apiVersion}/{resource}"`, so `WatchByCache` is
+`watchWhenAnchored`/`awaitAnchor`/`drainChanges` dance in `cachedkinds.go`, and
+`ClusterCachedKindSpec.Enabled` are all gone. `ClusterCachedKind` is owned by its
+`ClusterCache` and named `"cachedkind/{cacheID}/{apiVersion}/{resource}"`, so `WatchByCache` is
 `WatchOwnedObjects(cacheID)` and the trigger below can derive a record's name from the cache id.
 The schema lost the three `ClusterCachedCatalog` types and `clusterCachedCatalogsWatch`;
 `cluster-sync-panel.tsx` lost its fleet-wide catalog subscription and the discovery note it fed.
@@ -235,10 +235,10 @@ the dev `beehive.db`).
 
 ### The wire and the panel
 
-`ClusterCachedResource` loses `conditions`, and `clusterCacheSyncStatusWatch(id, cacheID)` is new.
+`ClusterCachedKind` loses `conditions`, and `clusterCacheSyncStatusWatch(id, cacheID)` is new.
 
 `cluster-sync-panel.tsx` takes per-kind verdicts from the new gauge, keeps
-`clusterCachedResourcesWatch` for the kind→record-id mapping its timeline link needs, and reads
+`clusterCachedKindsWatch` for the kind→record-id mapping its timeline link needs, and reads
 discovery history from `eventsWatch(cacheID, category: "discovery")` while a row is expanded.
 
 ## Internal shape
@@ -285,7 +285,7 @@ Each step is one red/green cycle and one commit.
    test substitutes. Nothing above it changes yet.
 2. **Discovery**: the sweep, `SyncKinds`, the kind diff, the cache-level reasons.
 3. **The kind worker**: cold list, watch, cookie resume, the per-kind reasons and freshness stamps.
-4. **Delete `ClusterCachedCatalog`** and re-own `ClusterCachedResource` under its cache, on the
+4. **Delete `ClusterCachedCatalog`** and re-own `ClusterCachedKind` under its cache, on the
    wire and in the panel. **Done** — a standalone step that removed a kind and changed no behaviour.
 5. **The trigger and the two passes**: arming, the record set, the two event timelines.
 6. **The gauges and the clears**: `WatchHealth` onto `Observations`, `WatchSyncStatus`, the holds.

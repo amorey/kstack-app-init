@@ -68,7 +68,7 @@ func TestFamilyAccessors(t *testing.T) {
 
 	assert.NotNil(t, svc.Clusters())
 	assert.NotNil(t, svc.Caches())
-	assert.NotNil(t, svc.CachedResources())
+	assert.NotNil(t, svc.CachedKinds())
 	assert.NotNil(t, svc.CachedData())
 }
 

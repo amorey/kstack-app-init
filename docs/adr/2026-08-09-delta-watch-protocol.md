@@ -20,7 +20,7 @@ than its cluster. The frontend needs current state on subscribe plus every chang
 Each kind streams **independently** as a Kubernetes-style delta watch: an `Added` snapshot
 burst, one `Bookmark` closing it, then per-object `Added`/`Modified`/`Deleted`
 (`clustersWatch`, `clusterCachesWatch`, and the
-cache-scoped `clusterCachedResourcesWatch`; the sync verdict rides `clusterCacheHealthWatch`,
+cache-scoped `clusterCachedKindsWatch`; the sync verdict rides `clusterCacheHealthWatch`,
 which is a gauge rather than a delta watch and carries no `Bookmark`). The sidecar
 folds beehive's per-kind `WatchList` into this shape behind `clustersvc`'s family
 `Watch`/`WatchList` methods; subscription resolvers emit the current snapshot first, then

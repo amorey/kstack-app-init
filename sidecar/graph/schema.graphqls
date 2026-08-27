@@ -67,7 +67,7 @@ network or the kubeconfig for one, an RBAC grant for the other.
 Sync-controller conditions: `Synced`, reported at two levels. On
 `ClusterCache.conditions` it is coarse (reasons Syncing/Paused) — the cache states
 only whether it decided to sync. The verdict a UI wants is the one on the cache's
-sync children — the per-kind `ClusterCachedResource` records (reasons
+sync children — the per-kind `ClusterCachedKind` records (reasons
 Syncing/Watching/Paused/NoConnection/SyncFailed/Stale), or their whole-cache rollup
 `clusterCacheHealthWatch`, which speaks the same vocabulary.
 New types/reasons may appear; consumers should treat unknown spellings as a
@@ -421,31 +421,34 @@ type ClusterCache {
   "The Cluster this cache belongs to. The client joins caches onto clusters by `owner.id`."
   owner: ObjectRef!
   spec: ClusterCacheSpec!
-  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's per-kind records (`clusterCachedResourcesWatch`) or their rollup (`clusterCacheHealthWatch`), which is also why this record carries no status block of its own."
+  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's per-kind records (`clusterCachedKindsWatch`) or their rollup (`clusterCacheHealthWatch`), which is also why this record carries no status block of its own."
   conditions: [Condition!]!
 
   """
-  The kinds this cache's API server advertises (from `/apis` discovery), read
-  from this cache's catalog — the read behind the dashboard's dynamic resource
-  nav. Empty for a cache that has not synced yet. Resolved on selection; the live
-  counterpart is `clusterCachedDataKindsWatch`.
+  The kinds this cache's API server advertises (from `/apis` discovery), read out
+  of the cache's own file — the read behind the dashboard's dynamic resource nav.
+  Content, not control plane: `cachedKinds` below is the record per kind, this is
+  what the store holds. Empty for a cache that has not synced yet. Resolved on
+  selection; the live counterpart is `clusterCachedDataKindsWatch`.
   """
   kinds: [ClusterCachedDataKind!]!
 
   """
   This cache's per-kind sync records, one per kind it mirrors — so hundreds on a
-  real cluster — in creation order. Empty until the cache's discovery pass has run.
+  real cluster — in creation order. The control-plane records, where `kinds` above
+  is the mirrored content they describe. Empty until the cache's discovery pass has
+  run.
 
-  Resolved on selection; the live counterpart is `clusterCachedResourcesWatch(cacheID)`,
+  Resolved on selection; the live counterpart is `clusterCachedKindsWatch(cacheID)`,
   which is what a consumer following per-kind health should read.
   """
-  cachedResources: [ClusterCachedResource!]!
+  cachedKinds: [ClusterCachedKind!]!
 
   """
   This cache's control-plane event timeline (newest run first), optionally
   filtered to one `category` (e.g. `"sync"`, the cache-sync history) and bounded
   by `limit`. Carries only what the cache itself records — the per-kind sync
-  history lives on `ClusterCachedResource.events`. Resolved on selection and
+  history lives on `ClusterCachedKind.events`. Resolved on selection and
   decoupled from the cache/list watch.
   """
   events(category: String, limit: Int): [Event!]!
@@ -483,7 +486,7 @@ type ClusterCacheWatchFrame {
 
 """
 One Kubernetes kind being mirrored into a cache — one record per kind the discovery
-pass found, so a cache has a hundred or more. Streamed by `clusterCachedResourcesWatch`,
+pass found, so a cache has a hundred or more. Streamed by `clusterCachedKindsWatch`,
 which is **cache-scoped** for exactly that reason, and joined onto its cache through
 `owner.id`.
 
@@ -491,12 +494,12 @@ This is where per-kind sync health lives. The cache's own `Synced` condition is
 coarse — it cannot tell you that one CRD's watch is forbidden while the other
 ninety-nine kinds are caught up.
 """
-type ClusterCachedResource {
+type ClusterCachedKind {
   "Unique identifier for this record."
   id: ObjectID!
   "The ClusterCache this kind is mirrored into — the client's join key."
   owner: ObjectRef!
-  spec: ClusterCachedResourceSpec!
+  spec: ClusterCachedKindSpec!
   """
   This record's `Synced` condition — this kind's own verdict (reasons
   Watching/Syncing/Stale/SyncFailed/Paused/NoConnection), independent of every other
@@ -515,7 +518,7 @@ type ClusterCachedResource {
 }
 
 "Which kind a per-kind sync mirrors. Identity only: whether it syncs is its cache's."
-type ClusterCachedResourceSpec {
+type ClusterCachedKindSpec {
   "Group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
   apiVersion: String!
   "Kind name, e.g. \"Deployment\"."
@@ -526,12 +529,12 @@ type ClusterCachedResourceSpec {
   namespaced: Boolean!
 }
 
-"One frame on the `clusterCachedResourcesWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
-type ClusterCachedResourceWatchFrame {
+"One frame on the `clusterCachedKindsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
+type ClusterCachedKindWatchFrame {
   "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: DeltaFrameType!
   "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
-  resource: ClusterCachedResource
+  kind: ClusterCachedKind
 }
 
 """
@@ -778,10 +781,10 @@ type Query {
   clusterCaches(clusterID: ObjectID): [ClusterCache!]!
 
   "A single synced-kind record by its own id, not its cache's; null if unknown."
-  clusterCachedResource(id: ObjectID!): ClusterCachedResource
+  clusterCachedKind(id: ObjectID!): ClusterCachedKind
 
-  "Every per-kind sync record — hundreds unscoped — or one cache's when `cacheID` is given; the set `ClusterCache.syncs` serves."
-  clusterCachedResources(cacheID: ObjectID): [ClusterCachedResource!]!
+  "Every per-kind sync record — hundreds unscoped — or one cache's when `cacheID` is given; the set `ClusterCache.cachedKinds` serves."
+  clusterCachedKinds(cacheID: ObjectID): [ClusterCachedKind!]!
 
   # --- Cloud account ---
   "Current authentication state. Signed-out when no cloud account is configured; live updates via authStateWatch."
@@ -822,7 +825,7 @@ type Subscription {
   # Every subscription here is endless; chatStream alone completes.
 
   # --- Any object ---
-  "Any record's event timeline — `Cluster`, `ClusterCache`, `ClusterCachedResource` — as an event log: runs upserted by `Event.id`, the snapshot closed by one `Bookmark` (`EventFrameType`). Optionally one `category`. The point read is that record's own `events` field."
+  "Any record's event timeline — `Cluster`, `ClusterCache`, `ClusterCachedKind` — as an event log: runs upserted by `Event.id`, the snapshot closed by one `Bookmark` (`EventFrameType`). Optionally one `category`. The point read is that record's own `events` field."
   eventsWatch(id: ObjectID!, category: String): EventWatchFrame!
 
   # --- Cluster ---
@@ -839,8 +842,8 @@ type Subscription {
   "Every cache's folded sync verdict as a gauge, keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's, so the client drops one when its cache leaves `clusterCachesWatch`."
   clusterCacheHealthWatch: ClusterCacheHealth!
 
-  "One cache's per-kind sync records as a delta watch, keyed by `sync.id`. Cache-scoped, since there is one record per synced kind."
-  clusterCachedResourcesWatch(cacheID: ObjectID!): ClusterCachedResourceWatchFrame!
+  "One cache's per-kind sync records as a delta watch, keyed by `kind.id`. Cache-scoped, since there is one record per synced kind."
+  clusterCachedKindsWatch(cacheID: ObjectID!): ClusterCachedKindWatchFrame!
 
   "One cache's on-disk contents as a gauge. A subscription, not a `ClusterCache` field, which would freeze at subscribe time."
   clusterCacheStatsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheStats!

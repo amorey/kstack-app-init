@@ -321,15 +321,15 @@ function pushHealth(cacheId: string, over: Record<string, unknown>) {
 }
 
 // One per-kind sync record on the cache-scoped stream.
-function pushCachedResource(id: string, resource: string, reason: string, apiVersion = 'v1') {
-  channelFor('clusterCachedResourcesWatch').onmessage!(
+function pushCachedKind(id: string, resource: string, reason: string, apiVersion = 'v1') {
+  channelFor('clusterCachedKindsWatch').onmessage!(
     JSON.stringify({
       type: 'next',
       payload: {
         data: {
-          clusterCachedResourcesWatch: {
+          clusterCachedKindsWatch: {
             type: 'Added',
-            resource: {
+            kind: {
               id,
               spec: { apiVersion, resource },
               conditions: [
@@ -797,7 +797,7 @@ describe('ClusterSyncPanel', () => {
 
     // The transition log is per kind, so it stays paused until a kind record names one —
     // subscribing before that would open a stream guaranteed to carry nothing.
-    await act(async () => pushCachedResource('g-events', 'events', 'Watching'));
+    await act(async () => pushCachedKind('g-events', 'events', 'Watching'));
 
     // The sync history streams in as bare runs (newest first by lastAt), with `ok`
     // derived from the generic event type (Normal = a healthy run).
@@ -838,7 +838,7 @@ describe('ClusterSyncPanel', () => {
   it('withholds the empty sync-event state until the snapshot closes', async () => {
     const user = await openWith([{ uuid: 'u-sync', name: 'prod', enabled: true, present: true }]);
     await user.click(await screen.findByRole('button', { name: /synced/i }));
-    await act(async () => pushCachedResource('g-events', 'events', 'Watching'));
+    await act(async () => pushCachedKind('g-events', 'events', 'Watching'));
 
     // Subscribed, nothing delivered: still loading, so no verdict either way.
     expect(screen.queryByText(/no sync events yet/i)).not.toBeInTheDocument();
@@ -1023,7 +1023,7 @@ describe('ClusterSyncPanel', () => {
     expect(screen.getByText(/pods not receiving updates/i)).toBeInTheDocument();
 
     // The log follows the kind behind the verdict, which the rollup names.
-    await act(async () => pushCachedResource('g-pods', 'pods', 'Stale'));
+    await act(async () => pushCachedKind('g-pods', 'pods', 'Stale'));
 
     // A SyncStale event renders by its raw reason code alongside its message.
     await act(async () => {
@@ -1050,8 +1050,8 @@ describe('ClusterSyncPanel', () => {
     await user.click(await screen.findByRole('button', { name: /synced/i }));
 
     await act(async () => {
-      pushCachedResource('g-builtin', 'gateways', 'Watching', 'gateway.networking.k8s.io/v1');
-      pushCachedResource('g-crd', 'gateways', 'SyncFailed', 'example.com/v1');
+      pushCachedKind('g-builtin', 'gateways', 'Watching', 'gateway.networking.k8s.io/v1');
+      pushCachedKind('g-crd', 'gateways', 'SyncFailed', 'example.com/v1');
       pushHealth('cache-u-gw', {
         status: 'False',
         reason: 'SyncFailed',

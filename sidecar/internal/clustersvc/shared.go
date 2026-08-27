@@ -121,8 +121,8 @@ type ClusterID = ObjectID
 // so the cache id is not derivable from the cluster id.
 type ClusterCacheID = ObjectID
 
-// ClusterCachedResourceID identifies one synced kind's ClusterCachedResource object.
-type ClusterCachedResourceID = ObjectID
+// ClusterCachedKindID identifies one synced kind's ClusterCachedKind object.
+type ClusterCachedKindID = ObjectID
 
 // parseObjectID parses an ObjectID from its decimal-string wire form; a
 // malformed value is a client error surfaced through UnmarshalGQL.

@@ -41,10 +41,10 @@ func (r *clusterCacheResolver) Kinds(ctx context.Context, obj *clustersvc.Cluste
 	return ptrSlice(kinds), nil
 }
 
-// CachedResources is the resolver for the cachedResources field — the kinds this cache
+// CachedKinds is the resolver for the cachedKinds field — the kinds this cache
 // mirrors. Keyed by the cache; the catalog between them is resolved in the service.
-func (r *clusterCacheResolver) CachedResources(ctx context.Context, obj *clustersvc.ClusterCache) ([]*clustersvc.ClusterCachedResource, error) {
-	return r.ClusterSvc.CachedResources().ListByCache(ctx, obj.ID)
+func (r *clusterCacheResolver) CachedKinds(ctx context.Context, obj *clustersvc.ClusterCache) ([]*clustersvc.ClusterCachedKind, error) {
+	return r.ClusterSvc.CachedKinds().ListByCache(ctx, obj.ID)
 }
 
 // Events is the resolver for the events field — this cache's own event timeline.
@@ -74,7 +74,7 @@ func (r *clusterCachedDataObjectResolver) CreationTimestamp(ctx context.Context,
 
 // Events is the resolver for the events field — this kind's sync-transition
 // history. A separate beehive read, so it runs only when selected.
-func (r *clusterCachedResourceResolver) Events(ctx context.Context, obj *clustersvc.ClusterCachedResource, category *string, limit *int) ([]*clustersvc.Event, error) {
+func (r *clusterCachedKindResolver) Events(ctx context.Context, obj *clustersvc.ClusterCachedKind, category *string, limit *int) ([]*clustersvc.Event, error) {
 	evs, err := r.ClusterSvc.ListEvents(ctx, obj.ID, category, limit)
 	if err != nil {
 		return nil, err
@@ -173,19 +173,19 @@ func (r *queryResolver) ClusterCaches(ctx context.Context, clusterID *clustersvc
 	return r.ClusterSvc.Caches().List(ctx)
 }
 
-// ClusterCachedResource is the resolver for the clusterCachedResource field. An id
+// ClusterCachedKind is the resolver for the clusterCachedKind field. An id
 // naming nothing is null per the schema, not an error.
-func (r *queryResolver) ClusterCachedResource(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCachedResource, error) {
-	return r.ClusterSvc.CachedResources().Get(ctx, id)
+func (r *queryResolver) ClusterCachedKind(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCachedKind, error) {
+	return r.ClusterSvc.CachedKinds().Get(ctx, id)
 }
 
-// ClusterCachedResources is the resolver for the clusterCachedResources field — every
+// ClusterCachedKinds is the resolver for the clusterCachedKinds field — every
 // per-kind record, or one cache's when scoped.
-func (r *queryResolver) ClusterCachedResources(ctx context.Context, cacheID *clustersvc.ObjectID) ([]*clustersvc.ClusterCachedResource, error) {
+func (r *queryResolver) ClusterCachedKinds(ctx context.Context, cacheID *clustersvc.ObjectID) ([]*clustersvc.ClusterCachedKind, error) {
 	if cacheID != nil {
-		return r.ClusterSvc.CachedResources().ListByCache(ctx, *cacheID)
+		return r.ClusterSvc.CachedKinds().ListByCache(ctx, *cacheID)
 	}
-	return r.ClusterSvc.CachedResources().List(ctx)
+	return r.ClusterSvc.CachedKinds().List(ctx)
 }
 
 // AuthState is the resolver for the authState field. auth.State binds directly to the
@@ -250,11 +250,11 @@ func (r *subscriptionResolver) ClusterCacheHealthWatch(ctx context.Context) (<-c
 	return watchStream(ctx, st), nil
 }
 
-// ClusterCachedResourcesWatch is the resolver for the clusterCachedResourcesWatch field —
+// ClusterCachedKindsWatch is the resolver for the clusterCachedKindsWatch field —
 // one cache's per-kind sync records as a delta watch. Cache-scoped, unlike the sibling
 // object watches: there is one record per synced kind.
-func (r *subscriptionResolver) ClusterCachedResourcesWatch(ctx context.Context, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedResourceWatchFrame, error) {
-	st, err := r.ClusterSvc.CachedResources().WatchByCache(ctx, cacheID)
+func (r *subscriptionResolver) ClusterCachedKindsWatch(ctx context.Context, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedKindWatchFrame, error) {
+	st, err := r.ClusterSvc.CachedKinds().WatchByCache(ctx, cacheID)
 	if err != nil {
 		return nil, err
 	}
@@ -333,9 +333,9 @@ func (r *Resolver) ClusterCachedDataObject() ClusterCachedDataObjectResolver {
 	return &clusterCachedDataObjectResolver{r}
 }
 
-// ClusterCachedResource returns ClusterCachedResourceResolver implementation.
-func (r *Resolver) ClusterCachedResource() ClusterCachedResourceResolver {
-	return &clusterCachedResourceResolver{r}
+// ClusterCachedKind returns ClusterCachedKindResolver implementation.
+func (r *Resolver) ClusterCachedKind() ClusterCachedKindResolver {
+	return &clusterCachedKindResolver{r}
 }
 
 // ClusterPrincipal returns ClusterPrincipalResolver implementation.
@@ -354,7 +354,7 @@ type clusterResolver struct{ *Resolver }
 type clusterCacheResolver struct{ *Resolver }
 type clusterCachedDataEventResolver struct{ *Resolver }
 type clusterCachedDataObjectResolver struct{ *Resolver }
-type clusterCachedResourceResolver struct{ *Resolver }
+type clusterCachedKindResolver struct{ *Resolver }
 type clusterPrincipalResolver struct{ *Resolver }
 type mutationResolver struct{ *Resolver }
 type queryResolver struct{ *Resolver }

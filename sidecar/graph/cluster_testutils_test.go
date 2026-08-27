@@ -43,35 +43,35 @@ type clusterFixture struct {
 // clustersvc.Cluster (exactly as the real service's buildCluster does), so the
 // resolver/wire assertions see the same shapes.
 type fakeClusterService struct {
-	mu              sync.Mutex
-	order           []clustersvc.ClusterID
-	clusters        map[clustersvc.ClusterID]*clustersvc.Cluster
-	caches          []clustersvc.ClusterCache          // one active cache per fixture, streamed via Caches().Watch
-	cachedResources []clustersvc.ClusterCachedResource // per-kind sync records, streamed cache-scoped via CachedResources().Watch
-	cacheStats      map[clustersvc.ClusterCacheID]clustersvc.ClusterCacheStats
-	syncEvents      map[clustersvc.ClusterCachedResourceID][]clustersvc.Event
-	events          map[clustersvc.ClusterID][]clustersvc.Event                   // connection-event history, keyed by ClusterID
-	cacheEvents     map[clustersvc.ClusterCacheID][]clustersvc.Event              // sync-event history, keyed by ClusterCacheID
-	kinds           map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataKind   // discovered kind catalog, keyed by ClusterID
-	dataEvents      map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataEvent  // cached Kubernetes Events, keyed by ClusterID
-	dataObjects     map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataObject // cached objects for one kind, keyed by ClusterID
-	watchFail       error                                                         // when set, every watch ends with it after its snapshot
+	mu          sync.Mutex
+	order       []clustersvc.ClusterID
+	clusters    map[clustersvc.ClusterID]*clustersvc.Cluster
+	caches      []clustersvc.ClusterCache      // one active cache per fixture, streamed via Caches().Watch
+	cachedKinds []clustersvc.ClusterCachedKind // per-kind sync records, streamed cache-scoped via CachedKinds().Watch
+	cacheStats  map[clustersvc.ClusterCacheID]clustersvc.ClusterCacheStats
+	syncEvents  map[clustersvc.ClusterCachedKindID][]clustersvc.Event
+	events      map[clustersvc.ClusterID][]clustersvc.Event                   // connection-event history, keyed by ClusterID
+	cacheEvents map[clustersvc.ClusterCacheID][]clustersvc.Event              // sync-event history, keyed by ClusterCacheID
+	kinds       map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataKind   // discovered kind catalog, keyed by ClusterID
+	dataEvents  map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataEvent  // cached Kubernetes Events, keyed by ClusterID
+	dataObjects map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataObject // cached objects for one kind, keyed by ClusterID
+	watchFail   error                                                         // when set, every watch ends with it after its snapshot
 }
 
 // The fake mirrors production's shape: one shared state struct, four accessor
 // views that carry the family method sets. Each family is asserted separately —
 // satisfying clustersvc.Service only proves the accessors exist.
 type (
-	fakeClusters        struct{ s *fakeClusterService }
-	fakeCaches          struct{ s *fakeClusterService }
-	fakeCachedResources struct{ s *fakeClusterService }
-	fakeCachedData      struct{ s *fakeClusterService }
+	fakeClusters    struct{ s *fakeClusterService }
+	fakeCaches      struct{ s *fakeClusterService }
+	fakeCachedKinds struct{ s *fakeClusterService }
+	fakeCachedData  struct{ s *fakeClusterService }
 )
 
 func (f *fakeClusterService) Clusters() clustersvc.Clusters { return fakeClusters{f} }
 func (f *fakeClusterService) Caches() clustersvc.Caches     { return fakeCaches{f} }
-func (f *fakeClusterService) CachedResources() clustersvc.CachedResources {
-	return fakeCachedResources{f}
+func (f *fakeClusterService) CachedKinds() clustersvc.CachedKinds {
+	return fakeCachedKinds{f}
 }
 func (f *fakeClusterService) CachedData() clustersvc.CachedData { return fakeCachedData{f} }
 
@@ -84,11 +84,11 @@ func (f *fakeClusterService) Start(context.Context) (func(context.Context) error
 func (f *fakeClusterService) Close() error { return nil }
 
 var (
-	_ clustersvc.Service         = (*fakeClusterService)(nil)
-	_ clustersvc.Clusters        = fakeClusters{}
-	_ clustersvc.Caches          = fakeCaches{}
-	_ clustersvc.CachedResources = fakeCachedResources{}
-	_ clustersvc.CachedData      = fakeCachedData{}
+	_ clustersvc.Service     = (*fakeClusterService)(nil)
+	_ clustersvc.Clusters    = fakeClusters{}
+	_ clustersvc.Caches      = fakeCaches{}
+	_ clustersvc.CachedKinds = fakeCachedKinds{}
+	_ clustersvc.CachedData  = fakeCachedData{}
 )
 
 // Fixture ids are distinct per kind. Beehive draws every kind from one
@@ -98,8 +98,8 @@ func fixtureCacheID(id clustersvc.ClusterID) clustersvc.ClusterCacheID {
 	return clustersvc.ClusterCacheID(id + 100)
 }
 
-func fixtureResourceID(id clustersvc.ClusterID) clustersvc.ClusterCachedResourceID {
-	return clustersvc.ClusterCachedResourceID(id + 300)
+func fixtureKindID(id clustersvc.ClusterID) clustersvc.ClusterCachedKindID {
+	return clustersvc.ClusterCachedKindID(id + 300)
 }
 
 func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
@@ -129,10 +129,10 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 		// Each cache gets one per-kind sync record, so the cache-scoped watch has
 		// something to scope. Deliberately one per cache so a leak across caches is
 		// visible as an extra frame.
-		f.cachedResources = append(f.cachedResources, clustersvc.ClusterCachedResource{
-			ID:    fixtureResourceID(id),
+		f.cachedKinds = append(f.cachedKinds, clustersvc.ClusterCachedKind{
+			ID:    fixtureKindID(id),
 			Owner: clustersvc.ObjectRef{ID: fixtureCacheID(id), Kind: "ClusterCache"},
-			Spec: clustersvc.ClusterCachedResourceSpec{
+			Spec: clustersvc.ClusterCachedKindSpec{
 				APIVersion: "apps/v1", Kind: "Deployment",
 				Resource: "deployments", Namespaced: true,
 			},
@@ -295,20 +295,20 @@ func (f fakeCaches) Watch(ctx context.Context, id clustersvc.ClusterCacheID) (*c
 func (f fakeCaches) WatchHealth(ctx context.Context) (*clustersvc.Stream[clustersvc.ClusterCacheHealth], error) {
 	f.s.mu.Lock()
 	byCache := map[clustersvc.ClusterCacheID]*clustersvc.ClusterCacheHealth{}
-	for i := range f.s.cachedResources {
-		cacheID := f.s.cachedResources[i].Owner.ID
+	for i := range f.s.cachedKinds {
+		cacheID := f.s.cachedKinds[i].Owner.ID
 		h := byCache[cacheID]
 		if h == nil {
 			h = &clustersvc.ClusterCacheHealth{CacheID: cacheID, Status: clustersvc.ConditionTrue, Reason: "Watching"}
 			byCache[cacheID] = h
 		}
 		h.TotalKinds++
-		for _, c := range f.s.cachedResources[i].Conditions {
+		for _, c := range f.s.cachedKinds[i].Conditions {
 			if c.Type == string(clustersvc.ConditionSynced) && c.Reason != "Watching" {
 				h.Status, h.Reason = c.Status, c.Reason
 				h.UnhealthyKindRefs = append(h.UnhealthyKindRefs, clustersvc.SyncedKindRef{
-					APIVersion: f.s.cachedResources[i].Spec.APIVersion,
-					Resource:   f.s.cachedResources[i].Spec.Resource,
+					APIVersion: f.s.cachedKinds[i].Spec.APIVersion,
+					Resource:   f.s.cachedKinds[i].Spec.Resource,
 				})
 				h.UnhealthyKinds++
 			}
@@ -326,38 +326,38 @@ func (f fakeCaches) WatchHealth(ctx context.Context) (*clustersvc.Stream[cluster
 
 // WatchByCache serves only the records the requested cache owns, standing in for the
 // real service's owner-edge filter.
-func (f fakeCachedResources) WatchByCache(ctx context.Context, cacheID clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCachedResourceWatchFrame], error) {
+func (f fakeCachedKinds) WatchByCache(ctx context.Context, cacheID clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCachedKindWatchFrame], error) {
 	f.s.mu.Lock()
-	var scoped []clustersvc.ClusterCachedResource
-	for i := range f.s.cachedResources {
-		if f.s.cachedResources[i].Owner.ID == cacheID {
-			scoped = append(scoped, f.s.cachedResources[i])
+	var scoped []clustersvc.ClusterCachedKind
+	for i := range f.s.cachedKinds {
+		if f.s.cachedKinds[i].Owner.ID == cacheID {
+			scoped = append(scoped, f.s.cachedKinds[i])
 		}
 	}
 	f.s.mu.Unlock()
-	return deltaStream(ctx, f.s, scoped, func(gs *clustersvc.ClusterCachedResource) clustersvc.ClusterCachedResourceWatchFrame {
-		return clustersvc.ClusterCachedResourceWatchFrame{Type: clustersvc.DeltaFrameAdded, Resource: gs}
-	}, clustersvc.ClusterCachedResourceWatchFrame{Type: clustersvc.DeltaFrameBookmark}), nil
+	return deltaStream(ctx, f.s, scoped, func(gs *clustersvc.ClusterCachedKind) clustersvc.ClusterCachedKindWatchFrame {
+		return clustersvc.ClusterCachedKindWatchFrame{Type: clustersvc.DeltaFrameAdded, Kind: gs}
+	}, clustersvc.ClusterCachedKindWatchFrame{Type: clustersvc.DeltaFrameBookmark}), nil
 }
 
-func (f fakeCachedResources) WatchList(ctx context.Context) (*clustersvc.Stream[clustersvc.ClusterCachedResourceWatchFrame], error) {
-	return deltaStream(ctx, f.s, copySlice(f.s, &f.s.cachedResources), func(gs *clustersvc.ClusterCachedResource) clustersvc.ClusterCachedResourceWatchFrame {
-		return clustersvc.ClusterCachedResourceWatchFrame{Type: clustersvc.DeltaFrameAdded, Resource: gs}
-	}, clustersvc.ClusterCachedResourceWatchFrame{Type: clustersvc.DeltaFrameBookmark}), nil
+func (f fakeCachedKinds) WatchList(ctx context.Context) (*clustersvc.Stream[clustersvc.ClusterCachedKindWatchFrame], error) {
+	return deltaStream(ctx, f.s, copySlice(f.s, &f.s.cachedKinds), func(gs *clustersvc.ClusterCachedKind) clustersvc.ClusterCachedKindWatchFrame {
+		return clustersvc.ClusterCachedKindWatchFrame{Type: clustersvc.DeltaFrameAdded, Kind: gs}
+	}, clustersvc.ClusterCachedKindWatchFrame{Type: clustersvc.DeltaFrameBookmark}), nil
 }
 
-func (f fakeCachedResources) Watch(ctx context.Context, id clustersvc.ClusterCachedResourceID) (*clustersvc.Stream[clustersvc.ClusterCachedResourceWatchFrame], error) {
+func (f fakeCachedKinds) Watch(ctx context.Context, id clustersvc.ClusterCachedKindID) (*clustersvc.Stream[clustersvc.ClusterCachedKindWatchFrame], error) {
 	f.s.mu.Lock()
-	var rows []clustersvc.ClusterCachedResource
-	for i := range f.s.cachedResources {
-		if f.s.cachedResources[i].ID == id {
-			rows = append(rows, f.s.cachedResources[i])
+	var rows []clustersvc.ClusterCachedKind
+	for i := range f.s.cachedKinds {
+		if f.s.cachedKinds[i].ID == id {
+			rows = append(rows, f.s.cachedKinds[i])
 		}
 	}
 	f.s.mu.Unlock()
-	return deltaStream(ctx, f.s, rows, func(gs *clustersvc.ClusterCachedResource) clustersvc.ClusterCachedResourceWatchFrame {
-		return clustersvc.ClusterCachedResourceWatchFrame{Type: clustersvc.DeltaFrameAdded, Resource: gs}
-	}, clustersvc.ClusterCachedResourceWatchFrame{Type: clustersvc.DeltaFrameBookmark}), nil
+	return deltaStream(ctx, f.s, rows, func(gs *clustersvc.ClusterCachedKind) clustersvc.ClusterCachedKindWatchFrame {
+		return clustersvc.ClusterCachedKindWatchFrame{Type: clustersvc.DeltaFrameAdded, Kind: gs}
+	}, clustersvc.ClusterCachedKindWatchFrame{Type: clustersvc.DeltaFrameBookmark}), nil
 }
 
 // WatchStats emits the fixture's single measurement and then holds the
@@ -482,12 +482,12 @@ func (f fakeCaches) ListByCluster(_ context.Context, clusterID clustersvc.Cluste
 	return out, nil
 }
 
-func (f fakeCachedResources) Get(_ context.Context, id clustersvc.ClusterCachedResourceID) (*clustersvc.ClusterCachedResource, error) {
+func (f fakeCachedKinds) Get(_ context.Context, id clustersvc.ClusterCachedKindID) (*clustersvc.ClusterCachedKind, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
-	for i := range f.s.cachedResources {
-		if f.s.cachedResources[i].ID == id {
-			gs := f.s.cachedResources[i]
+	for i := range f.s.cachedKinds {
+		if f.s.cachedKinds[i].ID == id {
+			gs := f.s.cachedKinds[i]
 			return &gs, nil
 		}
 	}
@@ -495,24 +495,24 @@ func (f fakeCachedResources) Get(_ context.Context, id clustersvc.ClusterCachedR
 }
 
 // List is every record, unscoped.
-func (f fakeCachedResources) List(context.Context) ([]*clustersvc.ClusterCachedResource, error) {
+func (f fakeCachedKinds) List(context.Context) ([]*clustersvc.ClusterCachedKind, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
-	var out []*clustersvc.ClusterCachedResource
-	for i := range f.s.cachedResources {
-		gs := f.s.cachedResources[i]
+	var out []*clustersvc.ClusterCachedKind
+	for i := range f.s.cachedKinds {
+		gs := f.s.cachedKinds[i]
 		out = append(out, &gs)
 	}
 	return out, nil
 }
 
-func (f fakeCachedResources) ListByCache(_ context.Context, cacheID clustersvc.ClusterCacheID) ([]*clustersvc.ClusterCachedResource, error) {
+func (f fakeCachedKinds) ListByCache(_ context.Context, cacheID clustersvc.ClusterCacheID) ([]*clustersvc.ClusterCachedKind, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
-	var out []*clustersvc.ClusterCachedResource
-	for i := range f.s.cachedResources {
-		if f.s.cachedResources[i].Owner.ID == cacheID {
-			gs := f.s.cachedResources[i]
+	var out []*clustersvc.ClusterCachedKind
+	for i := range f.s.cachedKinds {
+		if f.s.cachedKinds[i].Owner.ID == cacheID {
+			gs := f.s.cachedKinds[i]
 			out = append(out, &gs)
 		}
 	}
@@ -561,12 +561,12 @@ func (f *fakeClusterService) RetryConnection(_ context.Context, id clustersvc.Cl
 	return nil
 }
 
-func (f fakeCachedResources) Clear(_ context.Context, id clustersvc.ClusterCachedResourceID) (*clustersvc.ClusterCachedResource, error) {
+func (f fakeCachedKinds) Clear(_ context.Context, id clustersvc.ClusterCachedKindID) (*clustersvc.ClusterCachedKind, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
-	for i := range f.s.cachedResources {
-		if f.s.cachedResources[i].ID == id {
-			cr := f.s.cachedResources[i]
+	for i := range f.s.cachedKinds {
+		if f.s.cachedKinds[i].ID == id {
+			cr := f.s.cachedKinds[i]
 			return &cr, nil
 		}
 	}

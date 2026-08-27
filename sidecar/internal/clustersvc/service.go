@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package clustersvc is the sidecar's Kubernetes boundary: Service and its four
-// record families (Clusters, Caches, CachedResources, CachedData).
+// record families (Clusters, Caches, CachedKinds, CachedData).
 //
 // This file specifies the whole API — Service and the four family interfaces — and
 // bootstraps beehive. One file per family implements it and holds everything else
@@ -37,7 +37,7 @@
 //	    ↓ owns
 //	ClusterCache            (name: "{ClusterID}/{serverUID}")
 //	    ↓ owns
-//	ClusterCachedResource   (name: "cachedresource/{CacheID}/{apiVersion}/{resource}")
+//	ClusterCachedKind       (name: "cachedkind/{CacheID}/{apiVersion}/{resource}")
 //
 // A name is a per-kind reconcile key, never an identity. There is one Cluster kind
 // and each source owns a disjoint name namespace inside it, so a source reconciles by
@@ -50,7 +50,7 @@
 //
 // Cluster carries connection status (Connected, Identified conditions + server/principal
 // facts); its ClusterCache child carries sync status, folded per kind from the
-// ClusterCachedResource records below it.
+// ClusterCachedKind records below it.
 //
 // The read side is mid-rebuild: the Cluster kind is served, ClusterCache is served for
 // its point reads (Get, List, ListByCluster), every other family method panics, and the
@@ -96,7 +96,7 @@ type Service interface {
 
 	Clusters() Clusters
 	Caches() Caches
-	CachedResources() CachedResources
+	CachedKinds() CachedKinds
 	CachedData() CachedData
 
 	// AcquireConnection claims id's connection and arms its probe cadence. It does not
@@ -111,7 +111,7 @@ type Service interface {
 	RetryConnection(ctx context.Context, id ClusterID) error
 
 	// The event timeline of any record that has one — Cluster, ClusterCache,
-	// ClusterCachedResource today. Top-level, not per family: an event carries no kind
+	// ClusterCachedKind today. Top-level, not per family: an event carries no kind
 	// of its own, so one reader serves every timeline and the id is the whole key.
 	// Both are off the record watches, so event chatter never re-emits a record.
 	//
@@ -224,36 +224,36 @@ type Caches interface {
 	Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache, error)
 }
 
-// CachedResources is the ClusterCachedResource surface — one record per kind a
+// CachedKinds is the ClusterCachedKind surface — one record per kind a
 // cache mirrors. Distinct from CachedData, which serves the mirrored content itself;
 // these are the control-plane records describing what is mirrored.
 //
 // This family is the fleet's largest by an order of magnitude: a record per served
 // kind per cache, so hundreds per cluster. Scope every read that can be scoped.
-type CachedResources interface {
+type CachedKinds interface {
 	// Get returns one record by id, or (nil, nil) when the id names nothing.
-	Get(ctx context.Context, id ClusterCachedResourceID) (*ClusterCachedResource, error)
+	Get(ctx context.Context, id ClusterCachedKindID) (*ClusterCachedKind, error)
 	// List returns every per-kind sync record in creation order.
-	List(ctx context.Context) ([]*ClusterCachedResource, error)
+	List(ctx context.Context) ([]*ClusterCachedKind, error)
 
 	// Watch streams one per-kind record as a delta watch. Bookmark-only until the
 	// kind is discovered; a kind the cluster stops serving is Deleted.
-	Watch(ctx context.Context, id ClusterCachedResourceID) (*Stream[ClusterCachedResourceWatchFrame], error)
+	Watch(ctx context.Context, id ClusterCachedKindID) (*Stream[ClusterCachedKindWatchFrame], error)
 	// WatchList streams every per-kind record across every cache — the fleet's
 	// widest stream, and one a view scoped to a cache wants WatchByCache for
 	// instead. For a reader that genuinely spans caches: the sync-health rollup.
-	WatchList(ctx context.Context) (*Stream[ClusterCachedResourceWatchFrame], error)
+	WatchList(ctx context.Context) (*Stream[ClusterCachedKindWatchFrame], error)
 
 	// ListByCache returns one cache's per-kind records — the owner edge, so a cache
 	// nothing has discovered kinds for yet reads empty rather than as an error.
-	ListByCache(ctx context.Context, cacheID ClusterCacheID) ([]*ClusterCachedResource, error)
+	ListByCache(ctx context.Context, cacheID ClusterCacheID) ([]*ClusterCachedKind, error)
 	// WatchByCache streams one cache's per-kind records as a delta watch — what a view
 	// scoped to a single cache opens instead of filtering WatchList.
-	WatchByCache(ctx context.Context, cacheID ClusterCacheID) (*Stream[ClusterCachedResourceWatchFrame], error)
+	WatchByCache(ctx context.Context, cacheID ClusterCacheID) (*Stream[ClusterCachedKindWatchFrame], error)
 
 	// Clear drops one kind's cached objects and restarts its sync from an empty
 	// mirror; the record stays and resyncs. Caches().Clear is the whole-cache form.
-	Clear(ctx context.Context, id ClusterCachedResourceID) (*ClusterCachedResource, error)
+	Clear(ctx context.Context, id ClusterCachedKindID) (*ClusterCachedKind, error)
 }
 
 // CachedData is the cached Kubernetes content in one cache's db — the only family whose
@@ -282,28 +282,28 @@ type CachedData interface {
 // The family accessors are stateless views onto the one *service: the split is
 // about the shape of the API, not a split of the control plane behind it.
 type (
-	clustersAPI        struct{ s *service }
-	cachesAPI          struct{ s *service }
-	cachedResourcesAPI struct{ s *service }
-	cachedDataAPI      struct{ s *service }
+	clustersAPI    struct{ s *service }
+	cachesAPI      struct{ s *service }
+	cachedKindsAPI struct{ s *service }
+	cachedDataAPI  struct{ s *service }
 )
 
 func (s *service) Clusters() Clusters { return clustersAPI{s} }
 
 func (s *service) Caches() Caches { return cachesAPI{s} }
 
-func (s *service) CachedResources() CachedResources { return cachedResourcesAPI{s} }
+func (s *service) CachedKinds() CachedKinds { return cachedKindsAPI{s} }
 
 func (s *service) CachedData() CachedData { return cachedDataAPI{s} }
 
 // Each family is asserted separately: satisfying Service only proves the accessors
 // exist, not that any family is fully implemented.
 var (
-	_ Service         = (*service)(nil)
-	_ Clusters        = clustersAPI{}
-	_ Caches          = cachesAPI{}
-	_ CachedResources = cachedResourcesAPI{}
-	_ CachedData      = cachedDataAPI{}
+	_ Service     = (*service)(nil)
+	_ Clusters    = clustersAPI{}
+	_ Caches      = cachesAPI{}
+	_ CachedKinds = cachedKindsAPI{}
+	_ CachedData  = cachedDataAPI{}
 )
 
 // deps is what everything in this package draws from: one beehive client per kind, and
@@ -312,10 +312,10 @@ var (
 // that kind's from here. A new kind or a new shared service is a field here, never
 // another constructor parameter.
 type deps struct {
-	clusterClient  beehive.Client[ClusterSpec, ClusterStatus]
-	cacheClient    beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
-	resourceClient beehive.Client[ClusterCachedResourceSpec, ClusterCachedResourceStatus]
-	sourceClient   beehive.Client[ClusterSourceSpec, ClusterSourceStatus]
+	clusterClient beehive.Client[ClusterSpec, ClusterStatus]
+	cacheClient   beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
+	kindClient    beehive.Client[ClusterCachedKindSpec, ClusterCachedKindStatus]
+	sourceClient  beehive.Client[ClusterSourceSpec, ClusterSourceStatus]
 
 	kubeconfigSvc kubeconfigService
 	kubeconnSvc   kubeconnService
@@ -325,14 +325,14 @@ type deps struct {
 
 func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, kubestoreMgr kubestoreManager, pokeSvc *poke.Service) deps {
 	return deps{
-		clusterClient:  beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
-		cacheClient:    beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
-		resourceClient: beehive.NewClient[ClusterCachedResourceSpec, ClusterCachedResourceStatus](bh, ClusterCachedResourceGroupKind),
-		sourceClient:   beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
-		kubeconfigSvc:  kubeconfigSvc,
-		kubeconnSvc:    kubeconnSvc,
-		kubestoreMgr:   kubestoreMgr,
-		pokeSvc:        pokeSvc,
+		clusterClient: beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
+		cacheClient:   beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
+		kindClient:    beehive.NewClient[ClusterCachedKindSpec, ClusterCachedKindStatus](bh, ClusterCachedKindGroupKind),
+		sourceClient:  beehive.NewClient[ClusterSourceSpec, ClusterSourceStatus](bh, ClusterSourceGroupKind),
+		kubeconfigSvc: kubeconfigSvc,
+		kubeconnSvc:   kubeconnSvc,
+		kubestoreMgr:  kubestoreMgr,
+		pokeSvc:       pokeSvc,
 	}
 }
 
@@ -469,12 +469,12 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
 	cache := &clusterCacheController{deps: d}
-	resource := &clusterCachedResourceController{deps: d}
+	resource := &clusterCachedKindController{deps: d}
 
 	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigTrigger.Wakes()))
 	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync, beehive.WithTriggerByName(kubeconnTrigger.Wakes()))
 	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
-	errResource := beehive.Register(bh, ClusterCachedResourceGroupKind, resource, startupPass)
+	errResource := beehive.Register(bh, ClusterCachedKindGroupKind, resource, startupPass)
 	if err := errors.Join(errSource, errCluster, errCache, errResource); err != nil {
 		return nil, err
 	}

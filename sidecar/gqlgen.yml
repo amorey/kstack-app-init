@@ -131,7 +131,7 @@ models:
       # event log), so both stay off the record and run only when selected.
       kinds:
         resolver: true
-      cachedResources:
+      cachedKinds:
         resolver: true
       events:
         resolver: true
@@ -139,15 +139,15 @@ models:
   # The cache subtree's served spec IS the stored beehive type (no projection layer).
   ClusterCacheSpec:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheSpec
-  ClusterCachedResource:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedResource
+  ClusterCachedKind:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedKind
     fields:
       events:
         resolver: true
-  ClusterCachedResourceSpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedResourceSpec
-  ClusterCachedResourceWatchFrame:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedResourceWatchFrame
+  ClusterCachedKindSpec:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedKindSpec
+  ClusterCachedKindWatchFrame:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedKindWatchFrame
   ClusterCacheHealth:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheHealth
   SyncedKindRef:

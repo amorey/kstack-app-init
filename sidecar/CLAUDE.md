@@ -30,7 +30,7 @@ internal/clustersvc/
                       accessors, beehive bootstrap, and registerControllers
   clusters.go         ┐ one per family, implementing its interface and holding
   caches.go           │ everything else about that kind: its beehive shapes, the
-  cachedresources.go  │ record GraphQL binds, its *WatchFrame, its controller, and
+  cachedkinds.go      │ record GraphQL binds, its *WatchFrame, its controller, and
                       │ the machinery that controller owns
   cacheddata.go       ┘ (no controller — the one family that isn't a beehive kind)
   clustersources.go   the ClusterSource kind: one discovery anchor per source variant.
@@ -65,14 +65,14 @@ Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` 
 `clusterController.Reconcile` observing what the kubeconfig says about each one
 (`status.source.kubeconfig`), and that same pass creating the `ClusterCache` for the identity a
 probe recorded. Served: the whole `Clusters()` family, the whole `Caches()` family, and the whole
-`CachedResources()` family. That is enough for the kube-context picker, which reads
+`CachedKinds()` family. That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **A cache now exists at runtime**: the serverUID probe writes `status.server.uid`, which is what
 `ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
 one. What is left is the kstack event log, and the seam below.
 
-**Nothing fills a cache. The seam between `ClusterCachedResource` and `kubestore` is being
+**Nothing fills a cache. The seam between `ClusterCachedKind` and `kubestore` is being
 redesigned from scratch**, and the leaves that used to carry it are gone. So
-no pass discovers a cluster's kinds and no `ClusterCachedResource` record is ever created; the
+no pass discovers a cluster's kinds and no `ClusterCachedKind` record is ever created; the
 cache controller does nothing but tear a dying cache's file down, the per-kind controller settles
 without work, neither kind writes a condition, and every cache's store stays empty. The record kinds, their six reads apiece, the delta watches, both `Clear`s, and the whole
 `CachedData()` read path are intact and answer — over nothing. **Don't reintroduce the old shape
@@ -176,7 +176,7 @@ departure frame, so a cache the pass skipped would read as its last verdict — 
 that arrived after it went quiet, as no verdict ever. Enumerating the records each pass is what
 keeps that honest, and it is the half of the gauge the new seam has to preserve.
 
-**`Caches().Clear` is `Manager.Clear`; `CachedResources().Clear` is `Store.ClearKind`** over the
+**`Caches().Clear` is `Manager.Clear`; `CachedKinds().Clear` is `Store.ClearKind`** over the
 kind's own `Kind`, read off the record rather than out of `kind_catalog`. A **teardown** is
 `Manager.Remove`, which tombstones the id so a later claim is refused with `ErrRemoved`.
 
@@ -198,7 +198,7 @@ goroutine and the beehive watch behind it.
 **One pump serves every record watch** — `deltaWatch[Spec, Status, Frame]` (`stream.go`), whose
 `streamOne`/`streamList` cover the single-object and list shapes. A kind supplies only what is its own:
 a `frame` projection, a `departed` builder, and its `bookmark` value (`clusterWatch`, `cacheWatch`,
-`resourceWatch`). Add a kind by writing those three, never a fourth pump — the bookmark discipline is
+`kindWatch`). Add a kind by writing those three, never a fourth pump — the bookmark discipline is
 a protocol rule, and a per-kind copy is a place for it to be got wrong. The pump's own rules are
 tested once, in `stream_test.go` over a stand-in kind; a kind's tests pin its projection and its
 departure.
@@ -981,7 +981,7 @@ controller already does. An unaffected pass is a map lookup, a struct compare, a
 Narrowing it means assuming stored state matches the last event, which is the assumption
 level-triggered reconciliation exists not to make. Revisit only when a pass becomes expensive — at
 which point the fix is to gate the expense inside `Reconcile`, or to give discovery its own
-per-context kind whose spec the anchor writes (the shape `ClusterCachedResource` already uses).
+per-context kind whose spec the anchor writes (the shape `ClusterCachedKind` already uses).
 → [ADR: discovery as a beehive kind](../docs/adr/2026-08-18-discovery-as-a-beehive-kind.md).
 
 **Both reconciles defer until the kubeconfig has been read**, though neither reaches that branch
@@ -1034,10 +1034,17 @@ package starts or closes it — the kubeconfig's
 `Close` ends every subscription in the process, including other packages'. The trigger subscribes
 to it and releases only its own subscription.
 
-The four families are `Clusters()`, `Caches()`, `CachedResources()`, and `CachedData()`. **The
+The four families are `Clusters()`, `Caches()`, `CachedKinds()`, and `CachedData()`. **The
 `Cached*` prefix marks the cache subtree** — the per-kind records under a `ClusterCache` and the
 mirrored content itself — so the grouping is visible in the accessor list rather than something you
 have to know. Keep it when adding a family there.
+
+**`CachedKinds()` and `CachedData().*Kinds` are two different things and read almost alike.** The
+first is the control plane — one beehive record per kind a cache mirrors, `ClusterCachedKind`,
+carrying that kind's verdict. The second is content — the `kind_catalog` rows in the cache's own
+file, `ClusterCachedDataKind`, carrying counts. On the wire that is `ClusterCache.cachedKinds`
+against `ClusterCache.kinds`, and `clusterCachedKindsWatch` against `clusterCachedDataKindsWatch`.
+The `Data` infix is the whole distinction; keep it on everything the store serves.
 
 Rebuilding a family means replacing the panics in that family's file. Keep the method naming rule
 when you do: **VerbNoun with the noun elided when it equals the family's subject**, so
@@ -1060,7 +1067,7 @@ record's or its parent's; the method name is what disambiguates, and folding the
 method with a selector argument would undo it.
 
 **`By*` names the scope the caller passes**, which is the owner edge for both of them: `Caches`
-(`ByCluster`) and `CachedResources` (`ByCache`) each enumerate what the id they were handed owns.
+(`ByCluster`) and `CachedKinds` (`ByCache`) each enumerate what the id they were handed owns.
 **A cache nothing has discovered kinds for reads empty, never an error**, and its watch bookmarks
 that empty snapshot rather than holding it back — an unsynced cache is definitively empty, not
 pending, and the kinds arrive above the snapshot as ordinary `Added` frames.
@@ -1106,12 +1113,12 @@ consumer (a callee follows its caller — `LiveCondition` needs `TruncateMessage
 
 The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the `Cluster` surface and the `ClusterCache` reads answer** — `cluster`, `clusters`, `clustersWatch`, `clusterScheduleWatch`, the enable/sync/delete/`clusterConnectionRetry` mutations, `clusterCache`/`clusterCaches`/`clusterCachesWatch` (with `Cluster.caches` alongside them). `Cluster.events` does not: it reaches `ListEvents`, which still panics, so a query selecting it panics with the rest. Neither do the cache gauges, which are unbuilt. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
 
-- Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedResourcesWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
+- Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedKindsWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).
 - **Gauges are their own subscriptions, never a field on the record they describe** — `clusterCacheStatsWatch(id, cacheID)`, `clusterCacheHealthWatch`, `clusterScheduleWatch(id)`. A field would only be re-read when the record's own watch fires a frame, and each of these keeps moving after its record settles: a cache's object counts, a countdown. So a field freezes at whatever the last frame happened to carry. Re-emitting the record to refresh one is the other half of the trap — these numbers sit outside `status` precisely so a measurement never wakes the record's dependents. Current-on-subscribe, so no `Bookmark` rides them, and nothing is emitted at all before the first measurement (which is what a consumer renders "not observed yet" from). Keep that shape when adding one: **the per-kind sync stamps and the discovery verdict are deliberately unserved** until the views that need them settle, rather than parked on a record where they would freeze.
 - Cache-data watches (all keyed by cluster id + cache id; frames carry `cacheID` provenance — objects additionally `apiVersion`/`resource` — so the client rejects stale frames after a swap): `clusterCachedDataKindsWatch` (kind catalog + counts; subscribes to **both** brokers via `catalogSubscribe`, since Event counts come from event triggers), `clusterCachedDataEventsWatch` (newest window, `Deleted` when aging out), `clusterCachedDataObjectsWatch` (per-kind rows incl. `rawJSON`; resource-keyed broker subscription). Unopened cache → the `Bookmark` alone.
-- Point reads hang off the record that owns them, resolved on selection: every event timeline is an `events(category, limit)` field (`Cluster.events`, `ClusterCache.events`, `ClusterCachedResource.events`), the discovered kind catalog is `ClusterCache.kinds` (no arguments — both ids it reads with come off the record), and `Cluster.caches` / `ClusterCache.cachedResources` walk the owner chain down (`Caches().List`, `CachedResources().List`). So there are no root `cluster*Events` or `clusterCachedDataKinds` fields. The lookups `clusterCache(id)` and `clusterCachedResource(id)` (over `Caches().Get`/`CachedResources().Get`) address a record by **its own** id, which a caller holding one from a watch frame uses directly.
-- **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCachedResource`/`clusterCachedResources(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.cachedResources`). The resolver picks the boundary method the argument implies — `Caches().List` when nil, `Caches().ListByCluster` when set. Keep that shape when adding a noun.
+- Point reads hang off the record that owns them, resolved on selection: every event timeline is an `events(category, limit)` field (`Cluster.events`, `ClusterCache.events`, `ClusterCachedKind.events`), the discovered kind catalog is `ClusterCache.kinds` (no arguments — both ids it reads with come off the record), and `Cluster.caches` / `ClusterCache.cachedKinds` walk the owner chain down (`Caches().List`, `CachedKinds().List`). So there are no root `cluster*Events` or `clusterCachedDataKinds` fields. The lookups `clusterCache(id)` and `clusterCachedKind(id)` (over `Caches().Get`/`CachedKinds().Get`) address a record by **its own** id, which a caller holding one from a watch frame uses directly.
+- **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCachedKind`/`clusterCachedKinds(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.cachedKinds`). The resolver picks the boundary method the argument implies — `Caches().List` when nil, `Caches().ListByCluster` when set. Keep that shape when adding a noun.
 - **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
 - Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (takes the **cache's own id**, since a UID migration leaves a cluster owning more than one: stop that cache's workers, delete the files, then **requeue its kinds** — their passes re-arm the workers, which cold-sync, the cookie having died with the file), `clusterDelete` (GC cascades to the cache; **refused with `ErrDeclaredBySource` for a record its source still declares**, since the discovery pass would re-import it under a fresh id and the new record would carry defaults rather than the user's toggles . **The guard reads the kubeconfig, not the record's observation**, which is only a cached view of it: status is nil for exactly as long as a just-imported record has not reconciled, and the webview renders such a record as orphaned (`isPresent ?? false`) — so its Remove button is live in precisely the window a status-only check would wave through. Status is the fallback while the file is unread, and a record with neither is refused, since refusing is recoverable and allowing is not).
 - `ClusterCachedDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the record keeps value `time.Time` for comparability.

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The ClusterCachedResource kind: one record per kind a cache mirrors. Its beehive
-// shapes, the record served to resolvers, its delta-watch frame, the CachedResources
-// implementation, and its controller. Mirrors the ClusterCachedResource section of
+// The ClusterCachedKind kind: one record per kind a cache mirrors. Its beehive
+// shapes, the record served to resolvers, its delta-watch frame, the CachedKinds
+// implementation, and its controller. Mirrors the ClusterCachedKind section of
 // graph/schema.graphqls.
 package clustersvc
 
@@ -30,18 +30,18 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
-// ClusterCachedResourceGroupKind identifies the per-GVR sync kind: one object per
+// ClusterCachedKindGroupKind identifies the per-GVR sync kind: one object per
 // served GVR, owned by its ClusterCache.
-var ClusterCachedResourceGroupKind = beehive.GroupKind{Kind: "ClusterCachedResource"}
+var ClusterCachedKindGroupKind = beehive.GroupKind{Kind: "ClusterCachedKind"}
 
-// ClusterCachedResourceName returns "cachedresource/{cacheObjID}/{apiVersion}/{resource}" —
+// ClusterCachedKindName returns "cachedkind/{cacheObjID}/{apiVersion}/{resource}" —
 // deterministic, so a discovery pass is a set reconcile with no per-child
 // bookkeeping, and derivable from the cache id alone, so anything holding a cache and
 // a kind can name the record. (apiVersion, resource) rather than Kind: the
 // plural is what the worker's REST path needs and what the server guarantees unique
 // per group-version.
-func ClusterCachedResourceName(cacheID beehive.ObjectID, apiVersion, resource string) string {
-	return "cachedresource/" + strconv.FormatInt(int64(cacheID), 10) + "/" + apiVersion + "/" + resource
+func ClusterCachedKindName(cacheID beehive.ObjectID, apiVersion, resource string) string {
+	return "cachedkind/" + strconv.FormatInt(int64(cacheID), 10) + "/" + apiVersion + "/" + resource
 }
 
 // EventsKind / EventsAPIVersion / EventsResource identify the Event collection — an
@@ -54,11 +54,11 @@ const (
 	EventsResource   = "events"
 )
 
-// ClusterCachedResourceSpec is the desired sync for one GVR, written wholly from
+// ClusterCachedKindSpec is the desired sync for one GVR, written wholly from
 // above: identity, and nothing else. Whether a kind syncs is its cache's, never
 // relayed here. The fields refresh each discovery pass, so a kind that changes shape
 // converges without recreation.
-type ClusterCachedResourceSpec struct {
+type ClusterCachedKindSpec struct {
 	// APIVersion is the group/version this kind is served at, e.g. "apps/v1" — or a bare
 	// version ("v1") for the core group, matching the wire form Kubernetes uses.
 	APIVersion string `json:"apiVersion"`
@@ -70,20 +70,20 @@ type ClusterCachedResourceSpec struct {
 	Namespaced bool `json:"namespaced"`
 }
 
-// ClusterCachedResourceStatus is the observed sync state for one GVR. Empty placeholder.
-type ClusterCachedResourceStatus struct{}
+// ClusterCachedKindStatus is the observed sync state for one GVR. Empty placeholder.
+type ClusterCachedKindStatus struct{}
 
-// ClusterCachedResource is the view of one ClusterCachedResource beehive object: one
+// ClusterCachedKind is the view of one ClusterCachedKind beehive object: one
 // Kubernetes kind being mirrored into a cache. Shaped like the records above it —
 // {ID, Owner, Spec, Conditions} — but streamed **cache-scoped**, because there is one per
 // served kind rather than one per cache and an unscoped stream of a hundred-plus records
 // would be a firehose.
-type ClusterCachedResource struct {
-	ID ClusterCachedResourceID
+type ClusterCachedKind struct {
+	ID ClusterCachedKindID
 	// Owner is the ClusterCache this kind is mirrored into — the join key a client
 	// already holds from the cache stream.
 	Owner ObjectRef
-	Spec  ClusterCachedResourceSpec
+	Spec  ClusterCachedKindSpec
 	// Conditions carry this kind's own verdict, which is the whole reason the record is
 	// served: a cache's hundred kinds fail independently, and the coarse cache-level
 	// condition can't say which. Nothing writes one today — the sync seam is being
@@ -91,11 +91,11 @@ type ClusterCachedResource struct {
 	Conditions []Condition
 }
 
-// ClusterCachedResourceWatchFrame is one frame on the cache-scoped per-kind sync watch.
-// Consumers key on Resource.ID.
-type ClusterCachedResourceWatchFrame struct {
-	Type     DeltaFrameType
-	Resource *ClusterCachedResource
+// ClusterCachedKindWatchFrame is one frame on the cache-scoped per-kind sync watch.
+// Consumers key on Kind.ID.
+type ClusterCachedKindWatchFrame struct {
+	Type DeltaFrameType
+	Kind *ClusterCachedKind
 }
 
 // SyncedKindRef identifies one synced kind exactly. The plural alone is what a UI
@@ -106,124 +106,124 @@ type SyncedKindRef struct {
 	Resource   string
 }
 
-// toClusterCachedResource builds the served record from the stored object.
-func toClusterCachedResource(obj *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) (*ClusterCachedResource, error) {
+// toClusterCachedKind builds the served record from the stored object.
+func toClusterCachedKind(obj *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]) (*ClusterCachedKind, error) {
 	owner, err := toOwnerRef(obj)
 	if err != nil {
 		return nil, err
 	}
-	return &ClusterCachedResource{
-		ID:         ClusterCachedResourceID(obj.ID),
+	return &ClusterCachedKind{
+		ID:         ClusterCachedKindID(obj.ID),
 		Owner:      owner,
 		Spec:       obj.Spec,
 		Conditions: obj.Conditions,
 	}, nil
 }
 
-// toClusterCachedResources projects a whole read. beehive lists by id, which is creation
+// toClusterCachedKinds projects a whole read. beehive lists by id, which is creation
 // order, and that is the order this family promises — so nothing here sorts.
-func toClusterCachedResources(objs []*beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) ([]*ClusterCachedResource, error) {
-	resources := make([]*ClusterCachedResource, 0, len(objs))
+func toClusterCachedKinds(objs []*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]) ([]*ClusterCachedKind, error) {
+	kinds := make([]*ClusterCachedKind, 0, len(objs))
 	for _, obj := range objs {
-		resource, err := toClusterCachedResource(obj)
+		kind, err := toClusterCachedKind(obj)
 		if err != nil {
 			return nil, err
 		}
-		resources = append(resources, resource)
+		kinds = append(kinds, kind)
 	}
-	return resources, nil
+	return kinds, nil
 }
 
-func (a cachedResourcesAPI) Get(ctx context.Context, id ClusterCachedResourceID) (*ClusterCachedResource, error) {
-	obj, err := a.s.resourceClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
+func (a cachedKindsAPI) Get(ctx context.Context, id ClusterCachedKindID) (*ClusterCachedKind, error) {
+	obj, err := a.s.kindClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
 	if err != nil {
 		// A caller holds ids from watch frames, so a record collected in between is an
 		// ordinary race rather than a bad request.
 		if errors.Is(err, beehive.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("get cached resource %d: %w", id, err)
+		return nil, fmt.Errorf("get cached kind %d: %w", id, err)
 	}
-	return toClusterCachedResource(obj)
+	return toClusterCachedKind(obj)
 }
 
-func (a cachedResourcesAPI) List(ctx context.Context) ([]*ClusterCachedResource, error) {
-	objs, err := a.s.resourceClient.List(ctx, beehive.LoadOwner())
+func (a cachedKindsAPI) List(ctx context.Context) ([]*ClusterCachedKind, error) {
+	objs, err := a.s.kindClient.List(ctx, beehive.LoadOwner())
 	if err != nil {
-		return nil, fmt.Errorf("list cached resources: %w", err)
+		return nil, fmt.Errorf("list cached kinds: %w", err)
 	}
-	return toClusterCachedResources(objs)
+	return toClusterCachedKinds(objs)
 }
 
-func (a cachedResourcesAPI) Watch(ctx context.Context, id ClusterCachedResourceID) (*Stream[ClusterCachedResourceWatchFrame], error) {
-	src, err := a.s.resourceClient.Watch(ctx, beehive.ObjectID(id), loadResourceOwner)
+func (a cachedKindsAPI) Watch(ctx context.Context, id ClusterCachedKindID) (*Stream[ClusterCachedKindWatchFrame], error) {
+	src, err := a.s.kindClient.Watch(ctx, beehive.ObjectID(id), loadKindOwner)
 	if err != nil {
-		return nil, fmt.Errorf("watch cached resource %d: %w", id, err)
+		return nil, fmt.Errorf("watch cached kind %d: %w", id, err)
 	}
 
-	return resourceWatch.streamOne(ctx, src), nil
+	return kindWatch.streamOne(ctx, src), nil
 }
 
 // WatchList is the fleet's largest stream by an order of magnitude — a record per served
 // kind per cache. Served because the boundary fills its matrix, but a view scoped to one
 // cache opens WatchByCache instead; the schema exposes only the scoped one.
-func (a cachedResourcesAPI) WatchList(ctx context.Context) (*Stream[ClusterCachedResourceWatchFrame], error) {
-	src, err := a.s.resourceClient.WatchList(ctx, loadResourceOwner)
+func (a cachedKindsAPI) WatchList(ctx context.Context) (*Stream[ClusterCachedKindWatchFrame], error) {
+	src, err := a.s.kindClient.WatchList(ctx, loadKindOwner)
 	if err != nil {
-		return nil, fmt.Errorf("watch cached resources: %w", err)
+		return nil, fmt.Errorf("watch cached kinds: %w", err)
 	}
 
-	return resourceWatch.streamList(ctx, src), nil
+	return kindWatch.streamList(ctx, src), nil
 }
 
-func (a cachedResourcesAPI) ListByCache(ctx context.Context, cacheID ClusterCacheID) ([]*ClusterCachedResource, error) {
-	objs, err := a.s.resourceClient.ListOwnedObjects(ctx, beehive.ObjectID(cacheID), beehive.LoadOwner())
+func (a cachedKindsAPI) ListByCache(ctx context.Context, cacheID ClusterCacheID) ([]*ClusterCachedKind, error) {
+	objs, err := a.s.kindClient.ListOwnedObjects(ctx, beehive.ObjectID(cacheID), beehive.LoadOwner())
 	if err != nil {
-		return nil, fmt.Errorf("list cache %d cached resources: %w", cacheID, err)
+		return nil, fmt.Errorf("list cache %d cached kinds: %w", cacheID, err)
 	}
-	return toClusterCachedResources(objs)
+	return toClusterCachedKinds(objs)
 }
 
-func (a cachedResourcesAPI) WatchByCache(ctx context.Context, cacheID ClusterCacheID) (*Stream[ClusterCachedResourceWatchFrame], error) {
-	src, err := a.s.resourceClient.WatchOwnedObjects(ctx, beehive.ObjectID(cacheID), loadResourceOwner)
+func (a cachedKindsAPI) WatchByCache(ctx context.Context, cacheID ClusterCacheID) (*Stream[ClusterCachedKindWatchFrame], error) {
+	src, err := a.s.kindClient.WatchOwnedObjects(ctx, beehive.ObjectID(cacheID), loadKindOwner)
 	if err != nil {
-		return nil, fmt.Errorf("watch cache %d cached resources: %w", cacheID, err)
+		return nil, fmt.Errorf("watch cache %d cached kinds: %w", cacheID, err)
 	}
-	return resourceWatch.streamList(ctx, src), nil
+	return kindWatch.streamList(ctx, src), nil
 }
 
 // Clear drops one kind's rows from the cache holding them — the cache-wide clear,
 // scoped to a kind.
-func (a cachedResourcesAPI) Clear(ctx context.Context, id ClusterCachedResourceID) (*ClusterCachedResource, error) {
-	obj, err := a.s.resourceClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
+func (a cachedKindsAPI) Clear(ctx context.Context, id ClusterCachedKindID) (*ClusterCachedKind, error) {
+	obj, err := a.s.kindClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
 	if errors.Is(err, beehive.ErrNotFound) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("get cached resource %d: %w", id, err)
+		return nil, fmt.Errorf("get cached kind %d: %w", id, err)
 	}
 
 	// The cache is gone when this reports none, so its file went with it and there are
 	// no rows left to clear.
-	cacheID, ok, err := a.cacheIDForResource(obj)
+	cacheID, ok, err := a.cacheIDForKind(obj)
 	if err != nil || !ok {
 		if err != nil {
 			return nil, err
 		}
-		return toClusterCachedResource(obj)
+		return toClusterCachedKind(obj)
 	}
 
 	if err := clearKindRows(ctx, a.s.kubestoreMgr, int64(cacheID), obj.Spec); err != nil {
-		return nil, fmt.Errorf("clear cached resource %d rows: %w", id, err)
+		return nil, fmt.Errorf("clear cached kind %d rows: %w", id, err)
 	}
-	return toClusterCachedResource(obj)
+	return toClusterCachedKind(obj)
 }
 
 // clearKindRows drops one kind's rows from the cache holding them. A cache with no file
 // has nothing to clear — and opening one would create the very file the clear is
 // removing, which is why this goes through OpenExisting rather than claiming a store
 // outright.
-func clearKindRows(ctx context.Context, mgr kubestoreManager, cacheID int64, spec ClusterCachedResourceSpec) error {
+func clearKindRows(ctx context.Context, mgr kubestoreManager, cacheID int64, spec ClusterCachedKindSpec) error {
 	store, ok, err := mgr.OpenExisting(cacheID)
 	if err != nil || !ok {
 		return err
@@ -239,15 +239,15 @@ func clearKindRows(ctx context.Context, mgr kubestoreManager, cacheID int64, spe
 	})
 }
 
-// cacheIDForResource is the cache holding a kind's rows, read off the record's owner
+// cacheIDForKind is the cache holding a kind's rows, read off the record's owner
 // edge. A cache that is already gone is not an error: the file went with it, so there
 // is nothing left to clear per kind.
-func (a cachedResourcesAPI) cacheIDForResource(
-	obj *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus],
+func (a cachedKindsAPI) cacheIDForKind(
+	obj *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus],
 ) (ClusterCacheID, bool, error) {
 	cacheRef, ok, err := obj.Owner()
 	if err != nil {
-		return 0, false, fmt.Errorf("read cached resource %d owner: %w", obj.ID, err)
+		return 0, false, fmt.Errorf("read cached kind %d owner: %w", obj.ID, err)
 	}
 	if !ok {
 		return 0, false, nil
@@ -255,46 +255,46 @@ func (a cachedResourcesAPI) cacheIDForResource(
 	return ClusterCacheID(cacheRef.ID), true, nil
 }
 
-// loadResourceOwner eager-loads the owner edge every frame carries as its join key; beehive
+// loadKindOwner eager-loads the owner edge every frame carries as its join key; beehive
 // batches the lookup per change batch, so a watch does not become an N+1.
-var loadResourceOwner = beehive.WithLoads(beehive.LoadOwner())
+var loadKindOwner = beehive.WithLoads(beehive.LoadOwner())
 
-// resourceWatch projects this kind into delta frames. The departure carries the spec but no
+// kindWatch projects this kind into delta frames. The departure carries the spec but no
 // owner: the row is gone, so beehive loads no edge for it and reading one would fail the whole
 // stream — and a consumer keys the record it is dropping by id anyway.
-var resourceWatch = deltaWatch[ClusterCachedResourceSpec, ClusterCachedResourceStatus, ClusterCachedResourceWatchFrame]{
-	frame: func(t DeltaFrameType, obj *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) (ClusterCachedResourceWatchFrame, error) {
-		resource, err := toClusterCachedResource(obj)
+var kindWatch = deltaWatch[ClusterCachedKindSpec, ClusterCachedKindStatus, ClusterCachedKindWatchFrame]{
+	frame: func(t DeltaFrameType, obj *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]) (ClusterCachedKindWatchFrame, error) {
+		kind, err := toClusterCachedKind(obj)
 		if err != nil {
-			return ClusterCachedResourceWatchFrame{}, err
+			return ClusterCachedKindWatchFrame{}, err
 		}
-		return ClusterCachedResourceWatchFrame{Type: t, Resource: resource}, nil
+		return ClusterCachedKindWatchFrame{Type: t, Kind: kind}, nil
 	},
-	departed: func(change beehive.ObjectChange[ClusterCachedResourceSpec, ClusterCachedResourceStatus]) ClusterCachedResourceWatchFrame {
-		resource := &ClusterCachedResource{ID: ClusterCachedResourceID(change.ID)}
+	departed: func(change beehive.ObjectChange[ClusterCachedKindSpec, ClusterCachedKindStatus]) ClusterCachedKindWatchFrame {
+		kind := &ClusterCachedKind{ID: ClusterCachedKindID(change.ID)}
 		if obj := change.Object; obj != nil {
-			resource.Spec = obj.Spec
-			resource.Conditions = obj.Conditions
+			kind.Spec = obj.Spec
+			kind.Conditions = obj.Conditions
 		}
-		return ClusterCachedResourceWatchFrame{Type: DeltaFrameDeleted, Resource: resource}
+		return ClusterCachedKindWatchFrame{Type: DeltaFrameDeleted, Kind: kind}
 	},
-	bookmark: ClusterCachedResourceWatchFrame{Type: DeltaFrameBookmark},
+	bookmark: ClusterCachedKindWatchFrame{Type: DeltaFrameBookmark},
 }
 
-// clusterCachedResourceController reconciles one synced kind. Nothing mirrors a kind
+// clusterCachedKindController reconciles one synced kind. Nothing mirrors a kind
 // into a cache today — the seam between this record and the per-cache store is being
 // redesigned — so a pass has no work and settles.
-type clusterCachedResourceController struct {
+type clusterCachedKindController struct {
 	lifecycle.None
-	// Every kind's client, not just this one's: a resource reads the cache and cluster
+	// Every kind's client, not just this one's: a cached kind reads the cache and cluster
 	// it hangs off, and reaches the store through the shared services.
 	deps
 }
 
-func (c *clusterCachedResourceController) Reconcile(
+func (c *clusterCachedKindController) Reconcile(
 	context.Context,
-	beehive.ControllerClient[ClusterCachedResourceStatus],
-	*beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus],
+	beehive.ControllerClient[ClusterCachedKindStatus],
+	*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus],
 ) beehive.ReconcileResult {
 	return beehive.Settled()
 }

@@ -26,7 +26,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 
 import { Dialog } from '@/components/widgets/dialog';
 import { graphql } from '@/gql';
-import type { ClusterCachedResourcesSubscription } from '@/gql/graphql';
+import type { ClusterCachedKindsSubscription } from '@/gql/graphql';
 import {
   type Cluster,
   type ClusterCacheHealth,
@@ -159,7 +159,7 @@ function useConnectionAttempts(clusterId: string): EventRun[] {
   return data?.runs ?? [];
 }
 
-// Sync-event history, keyed by a ClusterCachedResource record's id (each kind's
+// Sync-event history, keyed by a ClusterCachedKind record's id (each kind's
 // worker logs to its own record), not the cache's. Subscribed only while sync
 // detail is open, one kind at a time.
 const ClusterSyncEventsSubscription = graphql(`
@@ -219,11 +219,11 @@ function useCacheContents(clusterId: string, cacheId: string, pause: boolean): C
 // cluster-wide stream would be a hundred-plus records per cache). Identity only,
 // no conditions: the verdict comes from the sidecar's rollup (see statusOf), and
 // this stream is only asked which record owns the timeline worth showing.
-const ClusterCachedResourcesSubscription = graphql(`
-  subscription ClusterCachedResources($cacheID: ObjectID!) {
-    clusterCachedResourcesWatch(cacheID: $cacheID) {
+const ClusterCachedKindsSubscription = graphql(`
+  subscription ClusterCachedKinds($cacheID: ObjectID!) {
+    clusterCachedKindsWatch(cacheID: $cacheID) {
       type
-      resource {
+      kind {
         id
         spec {
           apiVersion
@@ -235,20 +235,20 @@ const ClusterCachedResourcesSubscription = graphql(`
 `);
 
 // NonNullable: null only on a Bookmark, folded away in the reducer below.
-type CachedResource = NonNullable<ClusterCachedResourcesSubscription['clusterCachedResourcesWatch']['resource']>;
+type CachedKind = NonNullable<ClusterCachedKindsSubscription['clusterCachedKindsWatch']['kind']>;
 
 // The cache's kind syncs, id-keyed through the registry's shared delta fold.
-function useCachedResources(cacheId: string): CachedResource[] {
+function useCachedKinds(cacheId: string): CachedKind[] {
   const [{ data }] = useWatchSubscription<
-    { clusterCachedResourcesWatch: { type: string; resource: CachedResource | null } },
-    Keyed<CachedResource>
-  >({ query: ClusterCachedResourcesSubscription, variables: { cacheID: cacheId } }, (prev, resp) => {
-    const { type, resource } = resp.clusterCachedResourcesWatch;
+    { clusterCachedKindsWatch: { type: string; kind: CachedKind | null } },
+    Keyed<CachedKind>
+  >({ query: ClusterCachedKindsSubscription, variables: { cacheID: cacheId } }, (prev, resp) => {
+    const { type, kind } = resp.clusterCachedKindsWatch;
     // The Bookmark carries no record; the row renders per-kind detail, not an
     // empty state, so it needs no snapshot-complete gate. A change with no record is
     // a server-side field error — equally unfoldable.
-    if (type === 'Bookmark' || !resource) return prev ?? new Map();
-    return applyChange(prev, type, resource.id, resource);
+    if (type === 'Bookmark' || !kind) return prev ?? new Map();
+    return applyChange(prev, type, kind.id, kind);
   });
   return useMemo(() => (data ? [...data.values()] : []), [data]);
 }
@@ -657,7 +657,7 @@ function offenderList(health: ClusterCacheHealth): string {
 // Which per-kind record's transition log to show. Deterministic and sticky (first
 // sorted offender) — picking "whichever unhealthy record arrived first" would
 // re-key the subscription per frame. Falls back to Events, always present.
-function timelineSyncFor(all: CachedResource[], health: ClusterCacheHealth): CachedResource | null {
+function timelineSyncFor(all: CachedKind[], health: ClusterCacheHealth): CachedKind | null {
   const firstOffender = health.unhealthyKindRefs[0];
   if (firstOffender) {
     // Match the whole kind, not the plural: a CRD may reuse a built-in's plural
@@ -685,7 +685,7 @@ function SyncDetail({
   cacheId: string;
   contents: CacheContents | null;
 }) {
-  const kindSyncs = useCachedResources(cacheId);
+  const kindSyncs = useCachedKinds(cacheId);
   const timelineKind = timelineSyncFor(kindSyncs, health);
   const events = useSyncEvents(timelineKind?.id);
   // Newest write anywhere, beside the OLDEST proof — a cache is only as verified
