@@ -266,9 +266,6 @@ function pushSyncEvent(ev: {
   );
 }
 
-// Push a GVR-discovery record on the fleet-wide stream the expanded sync detail
-// subscribes to. Call after a row's sync detail is open — that is what mounts it, which
-// is the point of the placement: nothing subscribes while the dialog is closed.
 // The cache-contents gauge. It is a subscription, not a field on the cache record: the
 // record stops changing once the sync settles, so a field there froze at whatever the
 // cache held when the window subscribed.
@@ -341,33 +338,6 @@ function pushCachedResource(id: string, resource: string, reason: string, apiVer
                   status: reason === 'Watching' ? 'True' : 'False',
                   reason,
                   message: '',
-                  unconfirmed: false,
-                },
-              ],
-            },
-          },
-        },
-      },
-    }),
-  );
-}
-
-function pushDiscovery(cacheId: string, d: { reason?: string; message?: string } = {}) {
-  channelFor('clusterCachedCatalogsWatch').onmessage!(
-    JSON.stringify({
-      type: 'next',
-      payload: {
-        data: {
-          clusterCachedCatalogsWatch: {
-            type: 'Added',
-            catalog: {
-              id: `disc-${cacheId}`,
-              owner: { id: cacheId },
-              conditions: [
-                {
-                  type: 'Discovered',
-                  reason: d.reason ?? 'Discovered',
-                  message: d.message ?? '',
                   unconfirmed: false,
                 },
               ],
@@ -816,127 +786,6 @@ describe('ClusterSyncPanel', () => {
       'graphql_query',
       expect.objectContaining({ body: expect.stringContaining('clusterConnectionRetry') }),
     );
-  });
-
-  // The discovery watch takes no variables, so every consumer of it resolves to ONE urql
-  // operation — and a subscription's second subscriber joins mid-stream with no replay. With
-  // a subscription per expanded row, the second row expanded saw nothing until the next
-  // 5-minute discovery pass. One subscription for the dialog, folded by cacheID, fixes it.
-  it('shows the discovery record in a second row expanded after the burst', async () => {
-    const user = await openWith([
-      { uuid: 'u-a', name: 'alpha', enabled: true, present: true },
-      { uuid: 'u-b', name: 'beta', enabled: true, present: true },
-    ]);
-
-    // The Added burst for both caches, delivered once. Distinct messages so each row's
-    // assertion can only pass on its own record.
-    await act(async () => {
-      pushDiscovery('cache-u-a', { reason: 'DiscoveryPartial', message: 'alpha group did not respond' });
-      pushDiscovery('cache-u-b', { reason: 'DiscoveryPartial', message: 'beta group did not respond' });
-    });
-
-    const [firstSync, secondSync] = await screen.findAllByRole('button', { name: /synced/i });
-    await user.click(firstSync);
-    expect(await screen.findByText(/alpha group did not respond/i)).toBeInTheDocument();
-
-    // The second row must not need a fresh burst of its own.
-    await user.click(secondSync);
-    expect(await screen.findByText(/beta group did not respond/i)).toBeInTheDocument();
-  });
-
-  it('clears the discovery record when it is hard-deleted (id only, no owner)', async () => {
-    const user = await openWith([{ uuid: 'u-gone', name: 'prod', enabled: true, present: true }]);
-    await user.click(await screen.findByRole('button', { name: /synced/i }));
-
-    await act(async () =>
-      pushDiscovery('cache-u-gone', { reason: 'DiscoveryPartial', message: 'metrics.k8s.io did not respond' }),
-    );
-    expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
-
-    // A hard delete carries ONLY the id: the row is already collected, so there is no owner
-    // edge left to read an owner from and it arrives as "0". This anchor carries no
-    // finalizer, so a cascade can collect it with no deletion-pending frame ahead of it —
-    // filtering these by the owner left the pane showing a record that no longer exists.
-    await act(async () => {
-      channelFor('clusterCachedCatalogsWatch').onmessage!(
-        JSON.stringify({
-          type: 'next',
-          payload: {
-            data: {
-              clusterCachedCatalogsWatch: {
-                type: 'Deleted',
-                catalog: { id: 'disc-cache-u-gone', owner: { id: '0' }, conditions: [] },
-              },
-            },
-          },
-        }),
-      );
-    });
-
-    expect(screen.queryByText(/metrics\.k8s\.io did not respond/i)).not.toBeInTheDocument();
-  });
-
-  it('ignores a hard-deleted discovery record belonging to another cache', async () => {
-    const user = await openWith([{ uuid: 'u-keep', name: 'prod', enabled: true, present: true }]);
-    await user.click(await screen.findByRole('button', { name: /synced/i }));
-
-    await act(async () =>
-      pushDiscovery('cache-u-keep', { reason: 'DiscoveryPartial', message: 'metrics.k8s.io did not respond' }),
-    );
-    expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
-
-    // Matching on the record id is what keeps this scoped now that the owner is unusable.
-    await act(async () => {
-      channelFor('clusterCachedCatalogsWatch').onmessage!(
-        JSON.stringify({
-          type: 'next',
-          payload: {
-            data: {
-              clusterCachedCatalogsWatch: {
-                type: 'Deleted',
-                catalog: { id: 'disc-some-other-cache', owner: { id: '0' }, conditions: [] },
-              },
-            },
-          },
-        }),
-      );
-    });
-
-    expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
-  });
-
-  it('warns when the kind list is known-incomplete, without failing the row', async () => {
-    const user = await openWith([{ uuid: 'u-part', name: 'prod', enabled: true, present: true }]);
-    // The row's own status is unaffected: a partial answer doesn't stop the kinds
-    // already known from syncing, so the verdict stays the rollup's.
-    await user.click(await screen.findByRole('button', { name: /synced/i }));
-
-    await act(async () => {
-      pushDiscovery('cache-u-part', {
-        reason: 'DiscoveryPartial',
-        // Deliberately not the component's fallback copy, so the assertion proves the
-        // condition's own message is what reaches the pane.
-        message: 'metrics.k8s.io did not respond',
-      });
-    });
-    expect(await screen.findByText(/metrics\.k8s\.io did not respond/i)).toBeInTheDocument();
-  });
-
-  it('warns while a replaced kind is still draining', async () => {
-    const user = await openWith([{ uuid: 'u-drain', name: 'prod', enabled: true, present: true }]);
-    await user.click(await screen.findByRole('button', { name: /synced/i }));
-
-    // The kind list is current but one kind the cluster serves has no live child: an
-    // earlier prune's child still holds the name. That kind is not syncing at all, so the
-    // pane must say so rather than render nothing — which is what a Synced-axis reason on
-    // this condition did.
-    await act(async () => {
-      pushDiscovery('cache-u-drain', {
-        reason: 'DiscoveryDraining',
-        message: 'Waiting for replaced kinds to finish draining',
-      });
-    });
-    expect(await screen.findByText(/still draining|finish draining/i)).toBeInTheDocument();
   });
 
   it('reveals recent sync events when a cached cluster’s sync status is opened', async () => {

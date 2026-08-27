@@ -250,17 +250,6 @@ func (r *subscriptionResolver) ClusterCacheHealthWatch(ctx context.Context) (<-c
 	return watchStream(ctx, st), nil
 }
 
-// ClusterCachedCatalogsWatch is the resolver for the
-// clusterCachedCatalogsWatch field — the caches' resource catalogs as a delta
-// watch parallel to clusterCachesWatch, joined to caches client-side by owner.id.
-func (r *subscriptionResolver) ClusterCachedCatalogsWatch(ctx context.Context) (<-chan *clustersvc.ClusterCachedCatalogWatchFrame, error) {
-	st, err := r.ClusterSvc.CachedCatalogs().WatchList(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return watchStream(ctx, st), nil
-}
-
 // ClusterCachedResourcesWatch is the resolver for the clusterCachedResourcesWatch field —
 // one cache's per-kind sync records as a delta watch. Cache-scoped, unlike the sibling
 // object watches: there is one record per synced kind.

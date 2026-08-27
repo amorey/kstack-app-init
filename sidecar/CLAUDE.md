@@ -22,16 +22,16 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 
 ## Cluster subsystem (`internal/clustersvc`)
 
-**Mid-rebuild.** The layout — six beehive kinds, four of which are GraphQL families:
+**Mid-rebuild.** The layout — five beehive kinds, three of which are GraphQL families:
 
 ```
 internal/clustersvc/
-  service.go          the whole API — Service + the five family interfaces — plus the
+  service.go          the whole API — Service + the four family interfaces — plus the
                       accessors, beehive bootstrap, and registerControllers
   clusters.go         ┐ one per family, implementing its interface and holding
   caches.go           │ everything else about that kind: its beehive shapes, the
-  cachedcatalogs.go   │ record GraphQL binds, its *WatchFrame, its controller, and
-  cachedresources.go  │ the machinery that controller owns
+  cachedresources.go  │ record GraphQL binds, its *WatchFrame, its controller, and
+                      │ the machinery that controller owns
   cacheddata.go       ┘ (no controller — the one family that isn't a beehive kind)
   clustersources.go   the ClusterSource kind: one discovery anchor per source variant.
                       A beehive kind with no GraphQL type behind it — internal
@@ -51,12 +51,12 @@ internal/clustersvc/
 ```
 
 **The interfaces are specified together; the kinds are implemented apart.** The naming and scoping
-rules below are rules *across* the five, checked by eye — a violation shows when they read side by
+rules below are rules *across* the four, checked by eye — a violation shows when they read side by
 side and hides when they don't. Everything else slices by kind, so one file teaches you one kind.
 `registerControllers` stays whole in `service.go` for the same reason the interfaces do: its options
 are the subsystem's concurrency and retry budget, which only reads as a budget in one place.
 
-`New` opens the beehive store under `dataDir` and registers all five controllers; `Start` runs
+`New` opens the beehive store under `dataDir` and registers all four controllers; `Start` runs
 beehive, then each controller's background work. **The kstack event log still panics** —
 `TestUnimplementedBoundaryPanics` is the inventory of what is left, and an entry must be deleted as
 its method lands, since the test fails when a stub stops panicking.
@@ -64,21 +64,17 @@ its method lands, since the test fails when a stub stops panicking.
 Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` records,
 `clusterController.Reconcile` observing what the kubeconfig says about each one
 (`status.source.kubeconfig`), and that same pass creating the `ClusterCache` for the identity a
-probe recorded, and `clusterCacheController.Reconcile` creating the `ClusterCachedCatalog` beneath
-each cache, carrying the pause switch (`cacheSyncEnabled`: the cluster's toggles, and whether the
-cache is still the active identity). Served: the whole `Clusters()` family, the whole
-`CachedCatalogs()` family, the whole `Caches()` family, and the whole `CachedResources()` family.
-That is enough for the kube-context picker, which reads
+probe recorded. Served: the whole `Clusters()` family, the whole `Caches()` family, and the whole
+`CachedResources()` family. That is enough for the kube-context picker, which reads
 `clustersWatch` alone. **A cache now exists at runtime**: the serverUID probe writes `status.server.uid`, which is what
 `ensureClusterCache` keys off, so a reachable cluster whose credentials can read `kube-system` gets
-one — and a `ClusterCachedCatalog` beneath it. What is left is the kstack event log, and the seam
-below.
+one. What is left is the kstack event log, and the seam below.
 
-**Nothing fills a cache. The seam between `ClusterCachedCatalog`, `ClusterCachedResource`, and
-`kubestore` is being redesigned from scratch**, and the leaves that used to carry it are gone. So
-no pass discovers a cluster's kinds and no `ClusterCachedResource` record is ever created; the two
-controllers settle without work, neither kind writes a condition, and every cache's store stays
-empty. The record kinds, their six reads apiece, the delta watches, both `Clear`s, and the whole
+**Nothing fills a cache. The seam between `ClusterCachedResource` and `kubestore` is being
+redesigned from scratch**, and the leaves that used to carry it are gone. So
+no pass discovers a cluster's kinds and no `ClusterCachedResource` record is ever created; the
+cache controller does nothing but tear a dying cache's file down, the per-kind controller settles
+without work, neither kind writes a condition, and every cache's store stays empty. The record kinds, their six reads apiece, the delta watches, both `Clear`s, and the whole
 `CachedData()` read path are intact and answer — over nothing. **Don't reintroduce the old shape
 piecemeal**: the store's write API is the fixed ground the new seam meets, and the design is owed a
 spec and an ADR before code.
@@ -202,15 +198,15 @@ goroutine and the beehive watch behind it.
 **One pump serves every record watch** — `deltaWatch[Spec, Status, Frame]` (`stream.go`), whose
 `streamOne`/`streamList` cover the single-object and list shapes. A kind supplies only what is its own:
 a `frame` projection, a `departed` builder, and its `bookmark` value (`clusterWatch`, `cacheWatch`,
-`catalogWatch`). Add a kind by writing those three, never a fourth pump — the bookmark discipline is
+`resourceWatch`). Add a kind by writing those three, never a fourth pump — the bookmark discipline is
 a protocol rule, and a per-kind copy is a place for it to be got wrong. The pump's own rules are
 tested once, in `stream_test.go` over a stand-in kind; a kind's tests pin its projection and its
 departure.
 
 **A controller owns its kind's machinery**, and `service` holds the controllers only to drive their
-lifecycle. None has any yet — all five embed `lifecycle.None` — but the leaves a controller grows
+lifecycle. None has any yet — all four embed `lifecycle.None` — but the leaves a controller grows
 land there rather than on `service`, or the composition root accumulates every kind's detail.
-`registerControllers` builds and registers all five, returning them in registration order. All register with
+`registerControllers` builds and registers all four, returning them in registration order. All register with
 `startupPass` (`WithStartupFullPass(true)`): each owns state a restart invalidates and the store
 reads as settled, since the generation was observed by a process that is gone. **`ClusterSource`
 also registers `sourceResync`** (`WithIndividualPassInterval(clusterSourceResyncInterval)`),
@@ -289,9 +285,8 @@ composition](../docs/adr/2026-08-16-lifecycle-composition.md).
 
 **A parent controller creates the child kinds it owns.** A cache's identity is discovered by the
 cluster's probe, and a controller only ever reconciles an object that already exists — so
-`clusterController.Reconcile` creates the `ClusterCache` (via `ensureClusterCache`) and
-`clusterCacheController.Reconcile` the `ClusterCachedCatalog` beneath it (via
-`ensureClusterCachedCatalog`), and the same shape carries on down the chain. Distinct from a
+`clusterController.Reconcile` creates the `ClusterCache` (via `ensureClusterCache`), and the same
+shape carries on down the chain. Distinct from a
 discovery pass, which decides which objects exist *including when there are none*, and so needs an
 anchor object of its own to run against. **The writes live in the
 child kind's file**, not the parent's: the name, spec and owner edge are that kind's vocabulary, and
@@ -683,6 +678,246 @@ both hubs publish under — holding the holder count, whether the file still nam
 what a probe read. Contexts resolving alike are **not** merged. → [ADR: one connection per
 context](../docs/adr/2026-08-23-one-connection-per-context.md).
 
+#### The probes (`probe.go`) over the engine (`internal/probe`)
+
+**The scheduling machinery is `sidecar/internal/probe`** — a reusable engine (a work queue, a
+level-triggered pass, a schedule derived from recorded state) that knows nothing about
+kube-contexts. A probe is a struct implementing `probe.Probe[T]`, registered with
+`probe.Register(e, name, p, opts...)` — the same shape as a beehive controller, with `T` inferred
+from the instance — and `T` is its observable's value type. **The registration name is the
+probe's whole public identity**: the edge options, `Wake`, and every read take one, and
+`Register` returns nothing. `kubeconn`
+keeps what is asked and what the answers mean: `probe.go` is `registerProbes` — five
+registrations kept side by side on purpose, since the set's rules are checked by eye — plus the
+probe structs; `service.go` is leases and publishing. → [ADR: probe
+engine](../docs/adr/2026-08-24-probe-engine.md).
+
+**A run's `Result` is its schedule** — `Succeeded` waits out the interval, `Fail` climbs the
+backoff ladder, `Suspend` and `Skip` wait for a `Wake` — so no domain rule lives in the scheduler.
+`Succeeded().RequeueAfter(d)` asks for the next run sooner, for a wait the run knows the length
+of — beehive's spelling, for the same ask. **Unlike beehive's it can only bring a run forward**,
+since the engine takes it when it is positive and shorter than the registered interval: a probe's
+registration bounds requests against someone else's cluster, so forget the ask and a subject is
+slower, never wrong. A zero is no ask, not "immediately". Read on a succeeded result and nowhere
+else — `Fail` owns the ladder and `Suspend` schedules nothing.
+
+**A value the engine drops goes back to the probe.** A committed value can own something — a
+connection, a file — and one the engine never applies is one nothing else can reach to release: a
+commit refused because the subject was removed mid-run, a run that concluded `Skip`, one that
+returned the zero `Result`, one that panicked. A probe implementing `Discard(T)` is handed it
+(`kubeconn`'s connection probe retires the connection); one that does not is unaffected.
+
+**A `Run` body may not take the engine down with it.** One that panics, or that hands back the
+zero `Result`, is recorded as an `Internal` failure and gives its key back — the engine logs it
+through `slog`, the only place it logs at all. Nothing else reports a bug in a body, and leaving
+one unrecorded wedges the probe twice over: in flight forever, with its key held in the queue.
+
+**Each of `State`'s five observations has one probe behind it**, registered with its own interval
+(a cluster's UID never moves; its readiness moves constantly). The engine owns the observables —
+one value beside one `Attempts` per probe, the value written by that probe's `Run` alone — and
+`Read`/`OnPass` hand them back as a `probe.Snapshot`, frozen at the moment it was taken.
+Anything reads one out of it by registration name (`probe.Get[connInfo](snap, nameConnection)`,
+the `name*` constants), which is how a `Run` reads a sibling and how `stateOf` assembles `State`
+at publish time. **A `probe.Key[T]` states that name↔type pairing once** rather than at every
+read site — `keyConnection.From(snap)`. It is a freestanding declaration: registration never
+hears about it, and the pairing is checked where `Get` checks it, when a value lands. The
+connection is the only observable another probe reads, so it is the only one keyed. Its value
+(`connInfo`) bundles `departed` and the connection with the endpoint; `stateOf` projects only the
+endpoint into `State.Connection`, and `newsOf` walks `probeNames` for the untyped per-probe read.
+
+**A `Run` takes a `probe.Pass[T]` and returns only its `Result`.** The pass carries the run's
+inputs — `Subject()`, `Prev()`, `Known()`, `Snapshot()` — and `pass.Commit(v)` records what the run found,
+wherever in the body it learns it. The engine buffers that and applies it when the run returns,
+in the same critical section as the attempt: nothing is published mid-run, the last call wins,
+and a run that then concludes `Skip` or panics commits nothing.
+
+**`Known()` is what a probe whose zero `T` is an answer needs.** `Prev()` cannot tell "nothing has
+landed" from "the last answer was the zero value", and the engine dates an observation by its
+*value* — so readiness (healthy is the empty `ComponentStatus`) would never commit, and a cluster
+that has never had a failing component would read as never observed. Its guard is
+`!pass.Known() || the set moved`.
+
+**Commit only on a change.** A committed value is what tells the engine the value moved, and so
+what re-runs every probe watching it — commit unconditionally and the four behind the connection
+re-run every cycle, which is the intervals they are registered with undone. The engine never
+compares (it holds values as `any`, and a probe's value may be uncomparable or carry funcs), so
+the guard is the body's: `connInfo` is comparable, so it is `if next != pass.Prev()`.
+
+**A probe's result is its schedule** — `Succeeded` (due again after the interval), `Fail` (due up
+the backoff ladder), `Suspend` (nothing due until a `Wake`), `Skip` (record nothing; wait for a
+`Wake`). The four behind reachability declare both edges on it — `probe.WithDependencies` (they
+cannot run without a connection) and `probe.WithWatches` (they read the one it commits). The
+engine records them as `DependencyFailed` rather than dialing while the connection has not
+succeeded — one timeout per cycle, not one per probe — a recovery makes them due again by
+derivation, and a connection whose value moves re-runs them at once.
+
+**The connection probe owns the context's lifecycle**, because resolving the kubeconfig is the
+first step of reaching a server. Its classifications: `ReasonContextNotFound` suspends with
+`departed` committed true (the file is the whole truth about presence, and the watch reports it
+moving — a departure is also not a failure streak, being the user's own edit);
+`ReasonResolveFailed` fails up the ladder for both a file that will not resolve and a build that
+will not materialize clients from it (nothing was dialed either way, and the file can be fixed in a
+way `kubeconfig.Service` cannot see, such as a CA path that now opens); an unread file is a `Skip`
+(an unread kubeconfig names nothing, and is deliberately not a departure).
+
+**Reaching the server is one `GET /api`**: the cheapest
+request that proves DNS → TCP → TLS → authentication, the only endpoint of the five probes' that
+can answer 401 or 403, and the one whose body tells a Kubernetes API server from a captive portal
+answering 200 to everything — so empty `versions` is `ReasonMalformed`. **The probe builds a
+connection; the pool retires one**, and a rebuild happens on a changed fingerprint *or* no
+connection, never the fingerprint alone.
+→ [ADR: the connection probe dials /api](../docs/adr/2026-08-25-connection-probe-dial.md).
+
+**Wiring**: `Acquire`'s first holder is `engine.Add`; the last `Release` is `engine.Remove`,
+under `Service.mu` so a stale release cannot remove the subject a fresh claim just added; the
+kubeconfig watch is `engine.WakeAll(nameConnection)` on every change — every claimed context
+rather than the ones that moved, because finding which moved is what the probe does anyway. `New`
+calls `configureHTTP2Keepalive` (10s/5s, only where unset): the vars are read when a transport is
+built and this package builds them, so a call the composition root has to remember is one that
+goes missing.
+
+**Retiring is the pool's because a run cannot do it**: `Pass.Commit` is buffered and applied after
+the run returns, so a probe closing `Done` first would leave holders reconnecting against a `Conn`
+still handing out the dead one. `publish` files what a pass concluded (`record`, one critical section, since a release landing
+between the entry check and the `published` write would announce a claim that is gone and leave a
+baseline the next claim's first pass compares equal to) and retires the connection nothing holds
+any more — including the connection a pass carries for a context
+that was released between the commit and the pass, which is the one a release could not reach.
+`Release` and `Close` retire what the entry holds, or a released context leaves its sockets
+behind.
+
+**Publishing is the engine's `OnPass`** — after every pass, outside the engine's lock,
+serialized per context. Two publish rules, because the two feeds answer different questions:
+`stateHub` carries every pass (the timing is what a claim watcher subscribed for, and the
+countdown to the next run is visible nowhere else); `signalHub` fires only when the **news**
+changed — `departed`, `Phase()`, `Identity()`, each probe's `OK()`, never a timestamp — measured
+against `Service.published`, what the fleet was last told. State first, so a reader the signal
+wakes finds the value already there. A claim reads through `engine.Read`, with the entry-identity
+check *after* the read so a name released and re-claimed mid-read is never answered on behalf of
+a stale lease.
+
+**The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
+`Connection`, `ConnIdentity`, `ConnState`, `ConnStateSubscription`. Aliases because an
+`internal/` type cannot be *named* outside, which would leave `Service` unimplementable by the
+resolver tests' fake. The layering exception is in `service.go`'s package doc.
+
+**`State.Identity()` is what the probes last read; `Connection.ServerUID()` is what one connection
+vouches for.** Both exist and they answer different questions. `Identity` is the fleet-facing
+value — comparable, carrying no errors, since why a field is missing belongs on the `Observation`
+that could not read it — and it is what `news` signals on. The connection's own stamp is what an
+identity-scoped caller must use, through `ConnFor`; **never compare a connection against
+`State.ServerUID`**, which is a separate probe's observable and lags a rebuilt connection by a
+round-trip. → [ADR: connection-carried identity](../docs/adr/2026-08-25-connection-carried-identity.md).
+
+**A conflict rebuilds the connection.** `connectionProbe.Run`'s rebuild arm asks the standing
+connection whether it is `conflicted()` — never comparing it against `State.Identity()`, which is
+the stale pairing — and `publish` wakes the connection probe so the rebuild does not wait out the
+30s interval. **The wake is gated on the news having moved**, which is an edge: a `Wake` is a queue
+add rather than a schedule, and a run that returns before the rebuild arm (a kubeconfig that stops
+resolving) leaves the conflict standing, so a level-read condition would hot-loop past the backoff
+ladder. Recording the conflict empties `news.vouchedFor`, so the edge lands on exactly the pass
+that records it, and the interval is the backstop.
+→ [ADR: identity-driven retirement](../docs/adr/2026-08-27-identity-driven-retirement.md).
+Note what a username change does
+**not** cover: ordinary RBAC edits leave it identical, so permissions need the
+`SelfSubjectRulesReview` behind `ClusterPermissions`.
+
+**`State` is what the last probe read about the server, not the connection's own life** —
+whether one is built or retiring surfaces on `Connection.Done()`. **Five probes that fail and go
+stale independently.** A cluster is rebuilt, upgraded, re-issues a token, or revokes a namespace
+read, and none implies the others — so `Connection`, `Readiness`, `ServerUID`,
+`ServerVersion`, and `Principal` are each an `Observation[T]`. Only reachability is a prerequisite; the rest are peers.
+
+**An `Observation` keeps its value through a failure** — a read that stops being permitted does not
+mean the fact changed — and `LastSeen` is what makes the survivor readable: *identified, as of
+10:00* is usable where *ready, as of 10:00* is not. **`LastSeen` dates the value, not the verdict**:
+it moves whenever a value is committed, whatever the run concluded, and on a success that
+re-confirms the standing one. A failing run can still have *read* something — which components are
+down — so dating that by the last success would leave it undated, and would date a replaced answer
+by a read of what it replaced. Beside the value it holds two `Attempt`s and a
+failure run: `Failures` with `FailingSince`, because the ladder widens and a count does not give
+elapsed time. `Known()` is has-ever-answered, `OK()` is answered-last-time, `InFlight()` is
+running-now.
+
+**`Attempt` is one run at any stage of its life** — `ScheduledAt`, then `StartedAt`, then
+`FinishedAt` and the outcome. One type, filled in order, which is why an unfinished run needs no
+second one: `LastAttempt` is the run that finished, `NextAttempt` the one that has not, and a run
+moves between them as it completes. `ScheduledAt` is separate from `StartedAt` because a saturated
+prober lets a scheduled time slip into the past, which a single stamp compared against the clock
+would read as running.
+
+**A probe that has never run is the zero `Observation`** — a zero `LastAttempt` is not `Done`, so
+every accessor answers correctly with no sentinel.
+
+**A zero `NextAttempt` means the probe is suspended**: nothing is due and the last answer stands
+(`Scheduled()` is the accessor). The four probes behind the connection suspend while it is down —
+a server nothing reached cannot answer them — and re-arm when it recovers; a probe that came back
+`Unsupported` stays suspended for the connection's life, since the endpoint is absent rather than
+failing. `DependencyFailed` marks the one cycle where a probe went from running to suspended, and
+the cycles after it schedule nothing, which is what makes a dead cluster cost one timeout per cycle
+instead of one per probe. **Why a probe is suspended is `LastAttempt.Reason`** — no field beside
+`NextAttempt`, since a probe suspends over what its last attempt found. That is why suspending must
+write an attempt instead of going quiet. So *ready, as of 10:00, nothing due* is a state to render, not a stall.
+
+A **disabled** cluster never gets here: the controller drops the claim and the pool stops probing
+credentials nobody holds. `kubeconn` does not learn what disabled means.
+
+**`NextAttempt.ScheduledAt` is the backoff ladder made visible**, and it costs nothing to publish:
+the prober schedules the next run as it finishes the last, so the countdown rides a send it was
+already making. Successive values show the interval widening — otherwise invisible outside the
+prober.
+
+**`Reason` is assigned when the attempt ends**, in our own vocabulary styled as a Kubernetes
+condition reason (`Unreachable`, `Forbidden`, `Unsupported`, `ServiceUnavailable`, …). It has to be:
+`Err` arrives wrapped and does not survive the copy a watcher holds, so a caller sniffing it later
+cannot tell a 403 from a timeout. **It spans layers on purpose** — transport, API response, and
+rules of ours — because a caller asks why a probe failed once, not three times. Names shared with
+`metav1.StatusReason` are the same word for the same thing; the set is not that set.
+
+Two prober traps live here. `NotFound` and `Unsupported` **both arrive as a 404** — the object was
+missing versus the endpoint is not served — and only the probe knows which it asked for, so
+classifying on the code alone permanently suspends a probe that should keep running. And `Dynamic`
+returns `*apierrors.StatusError` carrying the API's own reason, while only the raw endpoints
+(`/readyz`, `/version`) leave a status code as the sole evidence; one switch over codes for both
+discards what the typed half knows. `Canceled` says nothing about the cluster and counts toward neither failure field;
+`DependencyFailed` is a probe recorded rather than attempted, which is what keeps a dead cluster
+costing one timeout per cycle instead of one per probe. Free-form text goes in `Message`, never
+`Reason`.
+
+A `State` is a value copy, but a **shallow** one: the slices inside belong to the prober and every
+watcher shares the backing array.
+
+The pool owns the reading, so every holder agrees: `State.Phase()` is `Pending`/`Unreached`/`Probed`
+off `Connection` (the trap it exists for — no attempt yet is not an attempt that failed), and
+`State.Identity()` projects the three comparable scalars out of the rich observations. The verdicts
+stay above: condition types, reasons, and `Inactive` are the record's vocabulary, not the pool's.
+
+**Everything a holder learns comes through its `Lease`** — `Conn`, `State()`, `WatchState()`,
+`Departed()` — so the pool publishes per context and never asks a holder to know the credentials
+behind one. `WatchState` is a `gobus/watch` receiver keyed by that context. **It delivers nothing
+on attach** — gobus's baseline is a comparison value, not a delivery — so a watcher pairs it with
+`State()` for what is known now. Reading and registering under one lock (`Hub.WithBaseline`, which
+needs an `Accept` to mean anything) is what closes the gap between the two, and is worth having
+once a probe can land at all. **Every value is a level, never an edge** — the hub keeps the latest,
+so a reader that falls behind skips what came between, and transitions come from the record's
+conditions and event timeline.
+
+**Waiting for a usable connection is `ReadyFor`/`AwaitConnFor`**, not a hand-rolled loop. Neither
+`Done()` nor a state frame is the signal an identity-scoped holder needs: retirement puts the
+replacement in the observable *before* `Done()` fires, but that replacement is unstamped for a
+round trip after, so `ConnFor` refuses through the window. `ReadyFor` returns a channel closed
+when a connection vouching for the uid exists — already closed when one does, so the steady state
+costs no goroutine — and `AwaitConnFor` is that plus the re-check, since the close is an edge and
+the connection can move again. **Free functions over `Lease`, never methods**, so no fake can get
+the attach-before-check ordering wrong; a waiter lives until it fires or ctx ends, so bound it
+with the work's context. **Neither may be called from a probe `Run`** — blocking holds an engine
+worker, so a probe refuses-and-suspends instead, woken by the fleet bus.
+
+**One context, one entry.** `Service.claimed` is a single map keyed by context name — also the key
+both hubs publish under — holding the holder count, whether the file still names the context, and
+what a probe read. Contexts resolving alike are **not** merged. → [ADR: one connection per
+context](../docs/adr/2026-08-23-one-connection-per-context.md).
+
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache
 is still the active identity), so a flip on the cluster has to reach the cache — and owning a child
@@ -799,10 +1034,10 @@ package starts or closes it — the kubeconfig's
 `Close` ends every subscription in the process, including other packages'. The trigger subscribes
 to it and releases only its own subscription.
 
-The five families are `Clusters()`, `Caches()`, `CachedCatalogs()`, `CachedResources()`, and
-`CachedData()`. **The `Cached*` prefix marks the cache subtree** — what a `ClusterCache` catalogs,
-the per-kind records under that catalog, and the mirrored content itself — so the grouping is visible
-in the accessor list rather than something you have to know. Keep it when adding a family there.
+The four families are `Clusters()`, `Caches()`, `CachedResources()`, and `CachedData()`. **The
+`Cached*` prefix marks the cache subtree** — the per-kind records under a `ClusterCache` and the
+mirrored content itself — so the grouping is visible in the accessor list rather than something you
+have to know. Keep it when adding a family there.
 
 Rebuilding a family means replacing the panics in that family's file. Keep the method naming rule
 when you do: **VerbNoun with the noun elided when it equals the family's subject**, so
@@ -810,8 +1045,8 @@ when you do: **VerbNoun with the noun elided when it equals the family's subject
 **A family owns a read only when the read differs per record type.**
 `RetryConnection`/`AcquireConnection` stay top-level (they answer about a connection, not a
 record), and so do `ListEvents`/`WatchEvents`: an event carries no kind, every id is the same `ObjectID`, and only
-three of the five families have a timeline at all — scoping them would be three copies of one method
-plus an unanswerable question about the other two. Every family is asserted separately
+three of the four families have a timeline at all — scoping them would be three copies of one method
+plus an unanswerable question about the fourth. Every family is asserted separately
 (`var _ Caches = cachesAPI{}`), in the resolver tests' fake too: satisfying `Service` only proves the
 accessors exist.
 → [ADR: record-family sub-APIs](../docs/adr/2026-08-10-cluster-service-sub-apis.md).
@@ -824,19 +1059,11 @@ scope. Every id is the same `ObjectID`, so a shared `List(id)` could not say whe
 record's or its parent's; the method name is what disambiguates, and folding these back into one
 method with a selector argument would undo it.
 
-**`By*` names the scope the caller passes, not the owner edge.** They coincide for `Caches`
-(`ByCluster`) and `CachedCatalogs` (`ByCache`), but `CachedResources().ListByCache` crosses the
-catalog that actually owns those records — `service.catalogIDFor` resolves that anchor from the
-cache id (a point read on the derived name), precisely so callers, who only ever hold a cache id,
-never have to. The schema keeps the catalog out of the path for the same reason. **A cache with no
-anchor yet reads empty, never an error** — nothing can hang off an anchor that does not exist. For
-the *read* that is the whole answer; for the **watch it is a wait, not an empty collection**. A
-cache's anchor is created by the cache's own pass, so a client subscribing on the frame that
-announced the cache arrives before it exists, every time. `WatchByCache` therefore sends the
-bookmark (the collection is empty *now*), waits for the anchor, and then streams the kinds under
-it as ordinary changes above that snapshot — `deltaWatch.pumpChanges`, which sends no second
-bookmark. `streamEmpty` is for a scope that can never be filled, not for one that is not filled
-yet.
+**`By*` names the scope the caller passes**, which is the owner edge for both of them: `Caches`
+(`ByCluster`) and `CachedResources` (`ByCache`) each enumerate what the id they were handed owns.
+**A cache nothing has discovered kinds for reads empty, never an error**, and its watch bookmarks
+that empty snapshot rather than holding it back — an unsynced cache is definitively empty, not
+pending, and the kinds arrive above the snapshot as ordinary `Added` frames.
 
 The interface is designed complete rather than caller-driven: the backend is a shell, so the
 methods are the specification and a missing frontend caller is not an argument against one. Fill
@@ -851,7 +1078,7 @@ included; a watch that cannot fail terminally may stay a plain channel.
 
 ### Types
 
-The four kinds' spec/status/record structs, identity, conditions, frame types, and the cached-data
+The three kinds' spec/status/record structs, identity, conditions, frame types, and the cached-data
 records are fully intact — **the schema binds them by name, which is why they survived a teardown
 that removed everything that produced them.** Each lives in its family's file, beside the methods
 that serve it; anything kind-agnostic goes to `shared.go`. Unexported helpers live with their only
@@ -877,15 +1104,14 @@ consumer (a callee follows its caller — `LiveCondition` needs `TruncateMessage
 
 ### GraphQL surface (cluster)
 
-The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the `Cluster` surface and the `ClusterCache` reads answer** — `cluster`, `clusters`, `clustersWatch`, `clusterScheduleWatch`, the enable/sync/delete/`clusterConnectionRetry` mutations, `clusterCache`/`clusterCaches`/`clusterCachesWatch` (with `Cluster.caches` alongside them), and the `ClusterCachedCatalog` reads. `Cluster.events` does not: it reaches `ListEvents`, which still panics, so a query selecting it panics with the rest. Neither do the cache gauges, which are unbuilt. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
+The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). The whole surface below is intact in the schema and in the resolvers, but **only the `Cluster` surface and the `ClusterCache` reads answer** — `cluster`, `clusters`, `clustersWatch`, `clusterScheduleWatch`, the enable/sync/delete/`clusterConnectionRetry` mutations, `clusterCache`/`clusterCaches`/`clusterCachesWatch` (with `Cluster.caches` alongside them). `Cluster.events` does not: it reaches `ListEvents`, which still panics, so a query selecting it panics with the rest. Neither do the cache gauges, which are unbuilt. This section is the contract the rebuild must satisfy rather than a description of what answers today. Key entry points:
 
-- Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedCatalogsWatch` (unscoped, one per cache), `clusterCachedResourcesWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
+- Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedResourcesWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).
-- **Gauges are their own subscriptions, never a field on the record they describe** — `clusterCacheStatsWatch(id, cacheID)`, `clusterCacheHealthWatch`, `clusterScheduleWatch(id)`. A field would only be re-read when the record's own watch fires a frame, and each of these keeps moving after its record settles: a cache's object counts, a countdown. So a field freezes at whatever the last frame happened to carry. Re-emitting the record to refresh one is the other half of the trap — these numbers sit outside `status` precisely so a measurement never wakes the record's dependents. Current-on-subscribe, so no `Bookmark` rides them, and nothing is emitted at all before the first measurement (which is what a consumer renders "not observed yet" from). Keep that shape when adding one: **the per-kind sync stamps and the discovery pass's gauges are deliberately unserved** until the views that need them settle, rather than parked on a record where they would freeze.
+- **Gauges are their own subscriptions, never a field on the record they describe** — `clusterCacheStatsWatch(id, cacheID)`, `clusterCacheHealthWatch`, `clusterScheduleWatch(id)`. A field would only be re-read when the record's own watch fires a frame, and each of these keeps moving after its record settles: a cache's object counts, a countdown. So a field freezes at whatever the last frame happened to carry. Re-emitting the record to refresh one is the other half of the trap — these numbers sit outside `status` precisely so a measurement never wakes the record's dependents. Current-on-subscribe, so no `Bookmark` rides them, and nothing is emitted at all before the first measurement (which is what a consumer renders "not observed yet" from). Keep that shape when adding one: **the per-kind sync stamps and the discovery verdict are deliberately unserved** until the views that need them settle, rather than parked on a record where they would freeze.
 - Cache-data watches (all keyed by cluster id + cache id; frames carry `cacheID` provenance — objects additionally `apiVersion`/`resource` — so the client rejects stale frames after a swap): `clusterCachedDataKindsWatch` (kind catalog + counts; subscribes to **both** brokers via `catalogSubscribe`, since Event counts come from event triggers), `clusterCachedDataEventsWatch` (newest window, `Deleted` when aging out), `clusterCachedDataObjectsWatch` (per-kind rows incl. `rawJSON`; resource-keyed broker subscription). Unopened cache → the `Bookmark` alone.
 - Point reads hang off the record that owns them, resolved on selection: every event timeline is an `events(category, limit)` field (`Cluster.events`, `ClusterCache.events`, `ClusterCachedResource.events`), the discovered kind catalog is `ClusterCache.kinds` (no arguments — both ids it reads with come off the record), and `Cluster.caches` / `ClusterCache.cachedResources` walk the owner chain down (`Caches().List`, `CachedResources().List`). So there are no root `cluster*Events` or `clusterCachedDataKinds` fields. The lookups `clusterCache(id)` and `clusterCachedResource(id)` (over `Caches().Get`/`CachedResources().Get`) address a record by **its own** id, which a caller holding one from a watch frame uses directly.
 - **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCachedResource`/`clusterCachedResources(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.cachedResources`). The resolver picks the boundary method the argument implies — `Caches().List` when nil, `Caches().ListByCluster` when set. Keep that shape when adding a noun.
-- **The query path skips `ClusterCachedCatalog`.** `ClusterCache.cachedResources` is keyed by the cache and resolves the catalog itself (`CachedResources().List`, like `CachedResources().Watch`): exactly one catalog exists per cache and its name is derived from the cache id (`ClusterCachedCatalogName`), so it is an implementation detail, not a branch to navigate. The catalog's own state still streams on `clusterCachedCatalogsWatch`.
 - **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
 - Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (takes the **cache's own id**, since a UID migration leaves a cluster owning more than one: stop that cache's workers, delete the files, then **requeue its kinds** — their passes re-arm the workers, which cold-sync, the cookie having died with the file), `clusterDelete` (GC cascades to the cache; **refused with `ErrDeclaredBySource` for a record its source still declares**, since the discovery pass would re-import it under a fresh id and the new record would carry defaults rather than the user's toggles . **The guard reads the kubeconfig, not the record's observation**, which is only a cached view of it: status is nil for exactly as long as a just-imported record has not reconciled, and the webview renders such a record as orphaned (`isPresent ?? false`) — so its Remove button is live in precisely the window a status-only check would wave through. Status is the fallback while the file is unread, and a record with neither is refused, since refusing is recoverable and allowing is not).
 - `ClusterCachedDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the record keeps value `time.Time` for comparability.
@@ -966,7 +1192,7 @@ This rewrites `graph/generated.go` + `graph/model/models_gen.go` and appends pan
   `func (s *service)` in `service.go`, helpers included. **A helper belongs to whoever calls it**:
   one family's goes on that family's `*API` type in its kind's file (`cachesAPI.measureCache`),
   a controller's on the controller (`resourceOwnersOf`), and only what more than one of them needs
-  is on the service (`cacheBelongsTo`, `catalogIDFor`). So a file that earns its place owns a
+  is on the service (`cacheBelongsTo`). So a file that earns its place owns a
   type or a body of free functions — not a slice of some other file's type's behavior. In
   `kubeconn` that puts the pool (`Service`'s methods) in `service.go`, the probes in `probe.go`,
   the reason vocabulary with `State`'s accessors in `state.go`, and everything that happens over a

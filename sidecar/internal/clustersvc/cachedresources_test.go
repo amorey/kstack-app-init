@@ -38,34 +38,34 @@ func TestClusterCachedResourceName(t *testing.T) {
 	assert.NotEqual(t,
 		ClusterCachedResourceName(3, "apps/v1", "deployments"),
 		ClusterCachedResourceName(4, "apps/v1", "deployments"),
-		"the same kind under another cache's anchor")
+		"the same kind under another cache")
 }
 
-func createResource(t *testing.T, d deps, catalogID beehive.ObjectID, spec ClusterCachedResourceSpec) *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus] {
+func createResource(t *testing.T, d deps, cacheID beehive.ObjectID, spec ClusterCachedResourceSpec) *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus] {
 	t.Helper()
 	ctx := context.Background()
-	name := ClusterCachedResourceName(catalogID, spec.APIVersion, spec.Resource)
-	obj, _, err := d.resourceClient.CreateOrUpdate(ctx, name, spec, beehive.WithOwner(catalogID))
+	name := ClusterCachedResourceName(cacheID, spec.APIVersion, spec.Resource)
+	obj, _, err := d.resourceClient.CreateOrUpdate(ctx, name, spec, beehive.WithOwner(cacheID))
 	require.NoError(t, err)
 	return obj
 }
 
 // deploymentsSpec and podsSpec are two served kinds, enough to prove ordering and scoping.
 var (
-	deploymentsSpec = ClusterCachedResourceSpec{Enabled: true, APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Namespaced: true}
-	podsSpec        = ClusterCachedResourceSpec{Enabled: false, APIVersion: "v1", Kind: "Pod", Resource: "pods", Namespaced: true}
+	deploymentsSpec = ClusterCachedResourceSpec{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Namespaced: true}
+	podsSpec        = ClusterCachedResourceSpec{APIVersion: "v1", Kind: "Pod", Resource: "pods", Namespaced: true}
 )
 
-// twoCachesTwoResources stores a kind under each of two caches' catalogs, and returns the
-// first cache's id — enough for one fixture to prove both a read's contents and its scoping.
+// twoCachesTwoResources stores a kind under each of two caches, and returns the first
+// cache's id — enough for one fixture to prove both a read's contents and its scoping.
 func twoCachesTwoResources(t *testing.T) (deps, ClusterCacheID) {
 	t.Helper()
 	d := newTestDeps(t)
 	cluster := createCluster(t, d.clusterClient, "prod")
 	one := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	two := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-2")
-	createResource(t, d, createCatalog(t, d, ClusterCacheID(one.ID), true).ID, deploymentsSpec)
-	createResource(t, d, createCatalog(t, d, ClusterCacheID(two.ID), true).ID, podsSpec)
+	createResource(t, d, one.ID, deploymentsSpec)
+	createResource(t, d, two.ID, podsSpec)
 	return d, ClusterCacheID(one.ID)
 }
 
@@ -73,8 +73,7 @@ func TestCachedResourcesGet(t *testing.T) {
 	d := newTestDeps(t)
 	cluster := createCluster(t, d.clusterClient, "prod")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
-	obj := createResource(t, d, catalog.ID, deploymentsSpec)
+	obj := createResource(t, d, cache.ID, deploymentsSpec)
 
 	got, err := serviceOver(t, d).CachedResources().Get(context.Background(), ClusterCachedResourceID(obj.ID))
 
@@ -82,8 +81,8 @@ func TestCachedResourcesGet(t *testing.T) {
 	require.NotNil(t, got)
 	assert.Equal(t, ClusterCachedResourceID(obj.ID), got.ID)
 	assert.Equal(t, deploymentsSpec, got.Spec)
-	assert.Equal(t, ObjectRef{ID: ObjectID(catalog.ID), Kind: "ClusterCachedCatalog"}, got.Owner,
-		"the owner is the catalog, not the cache — the join key a client has from the discovery stream")
+	assert.Equal(t, ObjectRef{ID: ObjectID(cache.ID), Kind: "ClusterCache"}, got.Owner,
+		"the owner is the cache — the join key a client already holds from the cache stream")
 }
 
 // An unknown id is not an error: a caller holds ids from watch frames, and a record
@@ -123,8 +122,7 @@ func TestCachedResourcesWatchListEmitsTheSnapshotThenABookmark(t *testing.T) {
 	d := newRunningDeps(t)
 	cluster := createCluster(t, d.clusterClient, "prod")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
-	createResource(t, d, catalog.ID, deploymentsSpec)
+	createResource(t, d, cache.ID, deploymentsSpec)
 
 	stream := watchResources(t, d)
 
@@ -132,12 +130,12 @@ func TestCachedResourcesWatchListEmitsTheSnapshotThenABookmark(t *testing.T) {
 	require.Equal(t, DeltaFrameAdded, f.Type)
 	require.NotNil(t, f.Resource)
 	assert.Equal(t, "deployments", f.Resource.Spec.Resource)
-	assert.Equal(t, ObjectRef{ID: ObjectID(catalog.ID), Kind: "ClusterCachedCatalog"}, f.Resource.Owner)
+	assert.Equal(t, ObjectRef{ID: ObjectID(cache.ID), Kind: "ClusterCache"}, f.Resource.Owner)
 	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
 }
 
-// A catalog that has discovered nothing yet bookmarks an empty collection rather than
-// holding the snapshot back: the wait is the consumer's to render.
+// A fleet with nothing discovered yet bookmarks an empty collection rather than holding
+// the snapshot back: the wait is the consumer's to render.
 func TestCachedResourcesWatchListBookmarksAnEmptyCollection(t *testing.T) {
 	stream := watchResources(t, newRunningDeps(t))
 
@@ -166,8 +164,7 @@ func TestCachedResourcesWatchListReportsAPruneAsAModify(t *testing.T) {
 	d := newRunningDeps(t)
 	cluster := createCluster(t, d.clusterClient, "prod")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
-	obj := createResource(t, d, catalog.ID, deploymentsSpec)
+	obj := createResource(t, d, cache.ID, deploymentsSpec)
 
 	stream := watchResources(t, d)
 	require.Equal(t, DeltaFrameAdded, testutil.Recv(t, stream.Frames, "the snapshot frame").Type)
@@ -186,9 +183,8 @@ func TestCachedResourcesWatchStreamsOneRecord(t *testing.T) {
 	d := newRunningDeps(t)
 	cluster := createCluster(t, d.clusterClient, "prod")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
-	obj := createResource(t, d, catalog.ID, deploymentsSpec)
-	createResource(t, d, catalog.ID, podsSpec)
+	obj := createResource(t, d, cache.ID, deploymentsSpec)
+	createResource(t, d, cache.ID, podsSpec)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -201,8 +197,7 @@ func TestCachedResourcesWatchStreamsOneRecord(t *testing.T) {
 	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
 }
 
-// The scope a caller passes is a *cache*, but the records hang off that cache's catalog —
-// so the service resolves the anchor, because a caller only ever holds a cache id.
+// Scoped to one cache: another cache's kinds must not reach this read.
 func TestCachedResourcesListByCache(t *testing.T) {
 	d, one := twoCachesTwoResources(t)
 
@@ -213,9 +208,9 @@ func TestCachedResourcesListByCache(t *testing.T) {
 	assert.Equal(t, "deployments", got[0].Spec.Resource, "the other cache's kinds are not this cache's")
 }
 
-// A cache whose catalog has not been written yet has no anchor to cross, which reads empty
-// rather than failing — the same wait an unreconciled cache shows everywhere else.
-func TestCachedResourcesListByCacheWithNoCatalogIsEmpty(t *testing.T) {
+// A cache nothing has discovered kinds for owns none, which reads empty rather than
+// failing — the same wait an unsynced cache shows everywhere else.
+func TestCachedResourcesListByCacheWithNoKindsIsEmpty(t *testing.T) {
 	d := newTestDeps(t)
 	cluster := createCluster(t, d.clusterClient, "prod")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
@@ -231,8 +226,8 @@ func TestCachedResourcesWatchByCache(t *testing.T) {
 	cluster := createCluster(t, d.clusterClient, "prod")
 	one := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	two := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-2")
-	createResource(t, d, createCatalog(t, d, ClusterCacheID(one.ID), true).ID, deploymentsSpec)
-	createResource(t, d, createCatalog(t, d, ClusterCacheID(two.ID), true).ID, podsSpec)
+	createResource(t, d, one.ID, deploymentsSpec)
+	createResource(t, d, two.ID, podsSpec)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -245,10 +240,10 @@ func TestCachedResourcesWatchByCache(t *testing.T) {
 	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
 }
 
-// A cache with no catalog yet bookmarks an empty collection: an unopened cache is
+// A cache with no kinds yet bookmarks an empty collection: an unsynced cache is
 // definitively empty, not pending, and holding the bookmark back would render a populated
-// table as loading for as long as the cache takes to reconcile.
-func TestCachedResourcesWatchByCacheWithNoCatalogBookmarksEmpty(t *testing.T) {
+// table as loading for as long as discovery takes.
+func TestCachedResourcesWatchByCacheWithNoKindsBookmarksEmpty(t *testing.T) {
 	d := newRunningDeps(t)
 	cluster := createCluster(t, d.clusterClient, "prod")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
@@ -299,11 +294,9 @@ func TestClearKindRowsSkipsACacheWithNoFile(t *testing.T) {
 // anyway — its pass is what arms the worker again, and the rows it failed to remove are
 // still there being served.
 
-// A cache's catalog is created by its own pass, so a client that subscribes on the frame
-// announcing the cache arrives before the anchor exists. That is a wait, not an empty
-// collection: the bookmark closes a snapshot of none, and the kinds are reported as they
-// land. Binding to nothing here would leave the view at "no kinds" for the life of the
-// subscription.
+// A client subscribes on the frame announcing the cache, which is before any kind has been
+// discovered for it. That is a wait, not an empty collection: the bookmark closes a
+// snapshot of none, and the kinds are reported as they land.
 func TestCachedResourcesWatchByCacheReportsKindsThatArriveLater(t *testing.T) {
 	d := newRunningDeps(t)
 	cluster := createCluster(t, d.clusterClient, "prod")
@@ -315,11 +308,10 @@ func TestCachedResourcesWatchByCacheReportsKindsThatArriveLater(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
 
-	// The cache's pass, arriving after the subscription.
-	catalog := createCatalog(t, d, ClusterCacheID(cache.ID), true)
-	obj := createResource(t, d, catalog.ID, deploymentsSpec)
+	// Discovery, arriving after the subscription.
+	obj := createResource(t, d, cache.ID, deploymentsSpec)
 
-	got := testutil.Recv(t, stream.Frames, "the kind that landed after the anchor")
+	got := testutil.Recv(t, stream.Frames, "the kind that landed after the snapshot")
 	assert.Equal(t, DeltaFrameAdded, got.Type)
 	require.NotNil(t, got.Resource)
 	assert.Equal(t, ClusterCachedResourceID(obj.ID), got.Resource.ID)

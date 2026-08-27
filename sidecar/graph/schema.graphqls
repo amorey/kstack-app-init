@@ -70,9 +70,8 @@ only whether it decided to sync. The verdict a UI wants is the one on the cache'
 sync children — the per-kind `ClusterCachedResource` records (reasons
 Syncing/Watching/Paused/NoConnection/SyncFailed/Stale), or their whole-cache rollup
 `clusterCacheHealthWatch`, which speaks the same vocabulary.
-`ClusterCachedCatalog` reports its own axis on its own type: `Discovered` (reasons
-Discovered/DiscoveryPartial/DiscoveryFailed/StoreUnavailable/Paused/NoConnection). New types/reasons may appear; consumers should
-treat unknown spellings as a degraded/unknown display state.
+New types/reasons may appear; consumers should treat unknown spellings as a
+degraded/unknown display state.
 """
 type Condition {
   "The aspect this condition tracks, e.g. \"Connected\"."
@@ -399,9 +398,9 @@ type ClusterWatchFrame {
 }
 
 # --- ClusterCache ---
-# A cluster's on-disk mirror and the sync machinery under it: the cache record, its
-# resource catalog, the per-kind sync children, and the whole-cache verdict
-# folded from them. The data these caches hold is the cluster-data section.
+# A cluster's on-disk mirror and the sync machinery under it: the cache record, the
+# per-kind sync children, and the whole-cache verdict folded from them. The data these
+# caches hold is the cluster-data section.
 
 """
 A cache record, mirroring the beehive ClusterCache kind: a mirror of one physical
@@ -422,7 +421,7 @@ type ClusterCache {
   "The Cluster this cache belongs to. The client joins caches onto clusters by `owner.id`."
   owner: ObjectRef!
   spec: ClusterCacheSpec!
-  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's sync children (`clusterCachedResourcesWatch`, `clusterCachedCatalogsWatch`) or their rollup (`clusterCacheHealthWatch`), which is also why this record carries no status block of its own."
+  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's per-kind records (`clusterCachedResourcesWatch`) or their rollup (`clusterCacheHealthWatch`), which is also why this record carries no status block of its own."
   conditions: [Condition!]!
 
   """
@@ -436,12 +435,6 @@ type ClusterCache {
   """
   This cache's per-kind sync records, one per kind it mirrors — so hundreds on a
   real cluster — in creation order. Empty until the cache's discovery pass has run.
-
-  The `ClusterCachedCatalog` that owns these records is deliberately not a step
-  in the path: there is exactly one per cache and its identity is derived from the
-  cache's, so it is an implementation detail rather than a branch to navigate. The
-  anchor's own state (when the kind list was last confirmed, whether the pass is
-  degraded) streams on `clusterCachedCatalogsWatch`.
 
   Resolved on selection; the live counterpart is `clusterCachedResourcesWatch(cacheID)`,
   which is what a consumer following per-kind health should read.
@@ -489,80 +482,19 @@ type ClusterCacheWatchFrame {
 }
 
 """
-A ClusterCache's resource catalog: the record anchoring the pass that asks the
-cluster which kinds it serves and maintains one per-GVR sync record for each. It is the
-granular answer to "does this cache know what to sync?" — distinct from the per-kind
-records below it, which answer "is each kind's mirror current?". Streamed independently via
-`clusterCachedCatalogsWatch` and joined to its cache client-side by `owner.id`.
-
-Discovery has no watch API — the served-kinds document carries no resourceVersion — so
-this record is refreshed by a poll (every few minutes). How current its answer is has no
-field here and no stream of its own: the pass's gauges are not served yet.
-
-The record lives as long as its cache: pausing writes `spec.enabled = false` rather than
-deleting it, so the last-known kind list survives a pause.
-"""
-type ClusterCachedCatalog {
-  "Unique identifier for this record."
-  id: ObjectID!
-  "The ClusterCache this belongs to. The client joins the discovery onto its cache by `owner.id`."
-  owner: ObjectRef!
-  spec: ClusterCachedCatalogSpec!
-  """
-  This record's `Discovered` condition — the per-component verdict. `Discovered` is the
-  only true one; the other eight are false and each points somewhere different.
-
-  Waiting, not failing: `Connecting` (armed, first sweep still coming), `Paused` (sync
-  switched off), `DiscoveryDraining` (a served kind's name is still held by an earlier
-  prune's tombstone, so the record is owed and coming).
-
-  Answered incompletely: `DiscoveryPartial` — the kinds that answered are synced, but some
-  api group did not respond, so the list is known-incomplete and nothing was pruned from it.
-
-  Nothing was asked: `NoConnection` (the cluster was not reached — the cluster's own
-  conditions say why) and `IdentityMismatch` (the context answers as a different server, or
-  has not said which yet). Neither is a discovery failure, and pointing a user at the API
-  server for them is the wrong remedy.
-
-  Asked and refused: `DiscoveryFailed` — the request itself failed, and the kinds already
-  known are left alone while the sweep retries.
-
-  Answered, but not stored: `StoreUnavailable` — discovery succeeded and the cache's own store
-  would not take the answer, so nothing was recorded off it. Neither a wait nor a discovery
-  failure; the sweep is retrying on its own ladder.
-  """
-  conditions: [Condition!]!
-}
-
-"A resource catalog's desired state: the pause switch its cache pushes down."
-type ClusterCachedCatalogSpec {
-  "Whether discovery should be running. False means its per-GVR children are switched off — the records stay, holding the last-known kind list."
-  enabled: Boolean!
-}
-
-"One frame on the `clusterCachedCatalogsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
-type ClusterCachedCatalogWatchFrame {
-  "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
-  type: DeltaFrameType!
-  "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
-  catalog: ClusterCachedCatalog
-}
-
-"""
 One Kubernetes kind being mirrored into a cache — one record per kind the discovery
 pass found, so a cache has a hundred or more. Streamed by `clusterCachedResourcesWatch`,
 which is **cache-scoped** for exactly that reason, and joined onto its cache through
-`owner.id` (the resource catalog the client already streams).
+`owner.id`.
 
 This is where per-kind sync health lives. The cache's own `Synced` condition is
-coarse and its discovery's `Discovered` says only whether the kind LIST is current;
-neither can tell you that one CRD's watch is forbidden while the other ninety-nine
-kinds are caught up.
+coarse — it cannot tell you that one CRD's watch is forbidden while the other
+ninety-nine kinds are caught up.
 """
 type ClusterCachedResource {
   "Unique identifier for this record."
   id: ObjectID!
-  "The ClusterCachedCatalog that owns this kind — the client's join key."
+  "The ClusterCache this kind is mirrored into — the client's join key."
   owner: ObjectRef!
   spec: ClusterCachedResourceSpec!
   """
@@ -582,10 +514,8 @@ type ClusterCachedResource {
   events(category: String, limit: Int): [Event!]!
 }
 
-"Which kind a per-kind sync mirrors, and whether it should be running."
+"Which kind a per-kind sync mirrors. Identity only: whether it syncs is its cache's."
 type ClusterCachedResourceSpec {
-  "Whether this kind should be syncing. False means paused — the cached rows stay, so an unpause resumes rather than re-listing."
-  enabled: Boolean!
   "Group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
   apiVersion: String!
   "Kind name, e.g. \"Deployment\"."
@@ -908,9 +838,6 @@ type Subscription {
 
   "Every cache's folded sync verdict as a gauge, keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's, so the client drops one when its cache leaves `clusterCachesWatch`."
   clusterCacheHealthWatch: ClusterCacheHealth!
-
-  "The caches' resource catalogs as a delta watch, joined onto caches by `owner.id`. Unscoped: one record per cache."
-  clusterCachedCatalogsWatch: ClusterCachedCatalogWatchFrame!
 
   "One cache's per-kind sync records as a delta watch, keyed by `sync.id`. Cache-scoped, since there is one record per synced kind."
   clusterCachedResourcesWatch(cacheID: ObjectID!): ClusterCachedResourceWatchFrame!

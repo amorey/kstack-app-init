@@ -31,15 +31,17 @@ import (
 )
 
 // ClusterCachedResourceGroupKind identifies the per-GVR sync kind: one object per
-// served GVR, owned by its ClusterCachedCatalog.
+// served GVR, owned by its ClusterCache.
 var ClusterCachedResourceGroupKind = beehive.GroupKind{Kind: "ClusterCachedResource"}
 
-// ClusterCachedResourceName returns "cachedresource/{catalogObjID}/{apiVersion}/{resource}" —
+// ClusterCachedResourceName returns "cachedresource/{cacheObjID}/{apiVersion}/{resource}" —
 // deterministic, so a discovery pass is a set reconcile with no per-child
-// bookkeeping. (apiVersion, resource) rather than Kind: the plural is what the
-// worker's REST path needs and what the server guarantees unique per group-version.
-func ClusterCachedResourceName(catalogID beehive.ObjectID, apiVersion, resource string) string {
-	return "cachedresource/" + strconv.FormatInt(int64(catalogID), 10) + "/" + apiVersion + "/" + resource
+// bookkeeping, and derivable from the cache id alone, so anything holding a cache and
+// a kind can name the record. (apiVersion, resource) rather than Kind: the
+// plural is what the worker's REST path needs and what the server guarantees unique
+// per group-version.
+func ClusterCachedResourceName(cacheID beehive.ObjectID, apiVersion, resource string) string {
+	return "cachedresource/" + strconv.FormatInt(int64(cacheID), 10) + "/" + apiVersion + "/" + resource
 }
 
 // EventsKind / EventsAPIVersion / EventsResource identify the Event collection — an
@@ -53,11 +55,10 @@ const (
 )
 
 // ClusterCachedResourceSpec is the desired sync for one GVR, written wholly from
-// above. Enabled is the pause switch relayed down the chain (the child never
-// re-derives it); identity fields refresh each discovery pass, so a kind that
-// changes shape converges without recreation.
+// above: identity, and nothing else. Whether a kind syncs is its cache's, never
+// relayed here. The fields refresh each discovery pass, so a kind that changes shape
+// converges without recreation.
 type ClusterCachedResourceSpec struct {
-	Enabled bool `json:"enabled"`
 	// APIVersion is the group/version this kind is served at, e.g. "apps/v1" — or a bare
 	// version ("v1") for the core group, matching the wire form Kubernetes uses.
 	APIVersion string `json:"apiVersion"`
@@ -73,15 +74,14 @@ type ClusterCachedResourceSpec struct {
 type ClusterCachedResourceStatus struct{}
 
 // ClusterCachedResource is the view of one ClusterCachedResource beehive object: one
-// Kubernetes kind being mirrored into a cache. Shaped like its sibling sync records —
+// Kubernetes kind being mirrored into a cache. Shaped like the records above it —
 // {ID, Owner, Spec, Conditions} — but streamed **cache-scoped**, because there is one per
 // served kind rather than one per cache and an unscoped stream of a hundred-plus records
 // would be a firehose.
 type ClusterCachedResource struct {
 	ID ClusterCachedResourceID
-	// Owner is the ClusterCachedCatalog this kind hangs off — the discovery anchor, not
-	// the cache directly, so it is the join key a client already has from the discovery
-	// stream.
+	// Owner is the ClusterCache this kind is mirrored into — the join key a client
+	// already holds from the cache stream.
 	Owner ObjectRef
 	Spec  ClusterCachedResourceSpec
 	// Conditions carry this kind's own verdict, which is the whole reason the record is
@@ -177,12 +177,7 @@ func (a cachedResourcesAPI) WatchList(ctx context.Context) (*Stream[ClusterCache
 }
 
 func (a cachedResourcesAPI) ListByCache(ctx context.Context, cacheID ClusterCacheID) ([]*ClusterCachedResource, error) {
-	catalogID, ok, err := a.s.catalogIDFor(ctx, cacheID)
-	if err != nil || !ok {
-		return nil, err
-	}
-
-	objs, err := a.s.resourceClient.ListOwnedObjects(ctx, catalogID, beehive.LoadOwner())
+	objs, err := a.s.resourceClient.ListOwnedObjects(ctx, beehive.ObjectID(cacheID), beehive.LoadOwner())
 	if err != nil {
 		return nil, fmt.Errorf("list cache %d cached resources: %w", cacheID, err)
 	}
@@ -190,94 +185,11 @@ func (a cachedResourcesAPI) ListByCache(ctx context.Context, cacheID ClusterCach
 }
 
 func (a cachedResourcesAPI) WatchByCache(ctx context.Context, cacheID ClusterCacheID) (*Stream[ClusterCachedResourceWatchFrame], error) {
-	catalogID, ok, err := a.s.catalogIDFor(ctx, cacheID)
+	src, err := a.s.resourceClient.WatchOwnedObjects(ctx, beehive.ObjectID(cacheID), loadResourceOwner)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("watch cache %d cached resources: %w", cacheID, err)
 	}
-	if ok {
-		src, err := a.s.resourceClient.WatchOwnedObjects(ctx, catalogID, loadResourceOwner)
-		if err != nil {
-			return nil, fmt.Errorf("watch cache %d cached resources: %w", cacheID, err)
-		}
-		return resourceWatch.streamList(ctx, src), nil
-	}
-
-	// No anchor yet. The collection is empty NOW — the bookmark says so — but a cache's
-	// anchor is created by its own pass, so a client subscribing on the frame that
-	// announced the cache lands here every time. Ending the stream would leave it at "no
-	// kinds" for the life of the subscription.
-	return a.watchWhenAnchored(ctx, cacheID), nil
-}
-
-// watchWhenAnchored bookmarks an empty snapshot, waits for the cache's anchor to be
-// created, and then streams the kinds under it as ordinary changes above that snapshot.
-func (a cachedResourcesAPI) watchWhenAnchored(ctx context.Context, cacheID ClusterCacheID) *Stream[ClusterCachedResourceWatchFrame] {
-	return NewStream(ctx, func(ctx context.Context, out chan<- ClusterCachedResourceWatchFrame) error {
-		// Its own context, cancelled the moment the anchor is known: this watch is a
-		// wait, and one abandoned mid-stream leaves beehive's producer blocked on a send
-		// nobody reads, holding its tailer for the life of the subscription.
-		anchorCtx, stopAnchors := context.WithCancel(ctx)
-		defer stopAnchors()
-
-		// Opened before the bookmark goes out, so an anchor created in between is carried
-		// by this watch rather than missed between the two.
-		anchors, err := a.s.catalogClient.WatchOwnedObjects(anchorCtx, beehive.ObjectID(cacheID))
-		if err != nil {
-			return fmt.Errorf("watch cache %d cached catalog: %w", cacheID, err)
-		}
-		if !sendFrame(ctx, out, resourceWatch.bookmark) {
-			return nil
-		}
-
-		catalogID, err := awaitAnchor(anchorCtx, anchors)
-		if err != nil || catalogID == 0 {
-			return err
-		}
-		// Found: nothing else is coming off that watch, and the drain below is what lets
-		// its producer finish rather than block on a send.
-		stopAnchors()
-		drainChanges(anchors.Changes)
-
-		src, err := a.s.resourceClient.WatchOwnedObjects(ctx, catalogID, loadResourceOwner)
-		if err != nil {
-			return fmt.Errorf("watch cache %d cached resources: %w", cacheID, err)
-		}
-		return resourceWatch.pumpChanges(ctx, out, src)
-	})
-}
-
-// drainChanges empties a watch's channel until its producer closes it, so a stream this
-// stream is done with ends rather than blocking on a send nobody will read.
-func drainChanges[Spec, Status any](changes <-chan beehive.ObjectChange[Spec, Status]) {
-	go func() {
-		//nolint:revive // draining is the whole body
-		for range changes {
-		}
-	}()
-}
-
-// awaitAnchor is the id of the cache's catalog, waited for. A zero id with no error is a
-// stream that ended first — the subscription going away, or the cache with it.
-func awaitAnchor(
-	ctx context.Context,
-	anchors *beehive.ObjectListStream[ClusterCachedCatalogSpec, ClusterCachedCatalogStatus],
-) (beehive.ObjectID, error) {
-	for _, obj := range anchors.Objects {
-		if obj.DeletionRequestedAt == nil {
-			return obj.ID, nil
-		}
-	}
-	for change := range anchors.Changes {
-		// An anchor on its way out is not the one to bind to: its kinds are being
-		// collected, and the cache's next pass creates the one that replaces it.
-		if change.Type != beehive.Deleted && change.Object != nil && change.Object.DeletionRequestedAt == nil {
-			return change.Object.ID, nil
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, nil
-	}
-	return 0, anchors.Err()
+	return resourceWatch.streamList(ctx, src), nil
 }
 
 // Clear drops one kind's rows from the cache holding them — the cache-wide clear,
@@ -293,7 +205,7 @@ func (a cachedResourcesAPI) Clear(ctx context.Context, id ClusterCachedResourceI
 
 	// The cache is gone when this reports none, so its file went with it and there are
 	// no rows left to clear.
-	cacheID, ok, err := a.cacheIDForResource(ctx, obj)
+	cacheID, ok, err := a.cacheIDForResource(obj)
 	if err != nil || !ok {
 		if err != nil {
 			return nil, err
@@ -327,26 +239,15 @@ func clearKindRows(ctx context.Context, mgr kubestoreManager, cacheID int64, spe
 	})
 }
 
-// cacheIDForResource walks a resource up to the cache holding its rows. A chain that is
-// already gone is not an error: the file goes with the cache, so there is nothing left
-// to clear per kind.
+// cacheIDForResource is the cache holding a kind's rows, read off the record's owner
+// edge. A cache that is already gone is not an error: the file went with it, so there
+// is nothing left to clear per kind.
 func (a cachedResourcesAPI) cacheIDForResource(
-	ctx context.Context,
 	obj *beehive.Object[ClusterCachedResourceSpec, ClusterCachedResourceStatus],
 ) (ClusterCacheID, bool, error) {
-	catalogRef, ok, err := obj.Owner()
+	cacheRef, ok, err := obj.Owner()
 	if err != nil {
 		return 0, false, fmt.Errorf("read cached resource %d owner: %w", obj.ID, err)
-	}
-	if !ok {
-		return 0, false, nil
-	}
-	cacheRef, ok, err := a.s.catalogClient.GetOwner(ctx, catalogRef.ID)
-	if errors.Is(err, beehive.ErrNotFound) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf("read cached catalog %d owner: %w", catalogRef.ID, err)
 	}
 	if !ok {
 		return 0, false, nil
@@ -381,12 +282,12 @@ var resourceWatch = deltaWatch[ClusterCachedResourceSpec, ClusterCachedResourceS
 }
 
 // clusterCachedResourceController reconciles one synced kind. Nothing mirrors a kind
-// into a cache today — the seam between this record, ClusterCachedCatalog, and the
-// per-cache store is being redesigned — so a pass has no work and settles.
+// into a cache today — the seam between this record and the per-cache store is being
+// redesigned — so a pass has no work and settles.
 type clusterCachedResourceController struct {
 	lifecycle.None
-	// Every kind's client, not just this one's: a resource reads the catalog, cache,
-	// and cluster it hangs off, and reaches the store through the shared services.
+	// Every kind's client, not just this one's: a resource reads the cache and cluster
+	// it hangs off, and reaches the store through the shared services.
 	deps
 }
 

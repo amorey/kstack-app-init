@@ -338,7 +338,7 @@ func TestCachesWatchListCancellationIsQuiet(t *testing.T) {
 	assert.NoError(t, stream.Err())
 }
 
-// --- ClusterCachedCatalog creation ---
+// --- clusterCacheController ---
 
 // storedCluster writes a tracked cluster with syncing set as asked, probed at uid.
 // Both halves are stored, because the reconcile under test re-reads them.
@@ -353,52 +353,17 @@ func storedCluster(t *testing.T, d deps, status *beehive.AdminClient[ClusterStat
 	return obj
 }
 
-// cacheControllerClient answers the owner lookup a cache reconcile makes, from the
-// store, so the edge a fixture wrote is the one the reconcile reads. It is bound to
-// the cache being reconciled, the way beehive binds the real one. ownerID overrides
-// the lookup, for a race the store cannot be held in. The embedded interface is nil:
-// Reconcile calls nothing else on it.
+// cacheControllerClient stands in for the client beehive binds to the object being
+// reconciled. The embedded interface is nil: the pass calls nothing on it.
 type cacheControllerClient struct {
 	beehive.ControllerClient[ClusterCacheStatus]
-	caches    beehive.Client[ClusterCacheSpec, ClusterCacheStatus]
-	id        beehive.ObjectID
-	ownerID   *beehive.ObjectID
-	dependsOn []beehive.ObjectID
-}
-
-func (c *cacheControllerClient) AddDependency(_ context.Context, toID beehive.ObjectID) error {
-	c.dependsOn = append(c.dependsOn, toID)
-	return nil
-}
-
-func (c *cacheControllerClient) GetOwner(ctx context.Context) (beehive.ObjectRef, bool, error) {
-	if c.ownerID != nil {
-		return beehive.ObjectRef{ID: *c.ownerID, Kind: ClusterGroupKind.Kind}, true, nil
-	}
-	return c.caches.GetOwner(ctx, c.id)
 }
 
 // reconcileCache runs one cache pass the way beehive would.
 func reconcileCache(t *testing.T, d deps, obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) {
 	t.Helper()
-	client := &cacheControllerClient{caches: d.cacheClient, id: obj.ID}
-	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), client, obj)
+	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), &cacheControllerClient{}, obj)
 	require.Equal(t, beehive.Settled(), res)
-}
-
-// A cache owns the discovery anchor beneath it, so the pass that knows the cluster's
-// toggles is the one that creates it.
-func TestCacheReconcileCreatesTheCatalog(t *testing.T) {
-	d, status := newClusterStatusDeps(t)
-	cluster := storedCluster(t, d, status, true, "uid-1")
-	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-
-	reconcileCache(t, d, cache)
-
-	objs := catalogs(t, d.catalogClient)
-	require.Len(t, objs, 1)
-	assert.Equal(t, ClusterCachedCatalogName(cache.ID), objs[0].Name)
-	assert.True(t, objs[0].Spec.Enabled)
 }
 
 // The pass writes no status, so the result it returns is the only thing that reports
@@ -408,40 +373,10 @@ func TestCacheReconcileSettlesTheGeneration(t *testing.T) {
 	d, status := newClusterStatusDeps(t)
 	cluster := storedCluster(t, d, status, true, "uid-1")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	client := &cacheControllerClient{caches: d.cacheClient, id: cache.ID}
 
-	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), client, cache)
+	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), &cacheControllerClient{}, cache)
 
 	assert.Equal(t, beehive.Settled(), res)
-}
-
-// The relayed switch is the cluster's, and a write there wakes nothing here on its
-// own — so the pass declares the dependency that makes the next relay certain.
-func TestCacheReconcileDependsOnItsCluster(t *testing.T) {
-	d, status := newClusterStatusDeps(t)
-	cluster := storedCluster(t, d, status, true, "uid-1")
-	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	client := &cacheControllerClient{caches: d.cacheClient, id: cache.ID}
-
-	(&clusterCacheController{deps: d}).Reconcile(context.Background(), client, cache)
-
-	assert.Equal(t, []beehive.ObjectID{cluster.ID}, client.dependsOn)
-}
-
-// A cache on its way out is about to be collected with everything it owns, so a pass
-// that recreated its anchor would only make work for the GC.
-func TestCacheReconcileWritesNothingForADyingCache(t *testing.T) {
-	d, status := newClusterStatusDeps(t)
-	cluster := storedCluster(t, d, status, true, "uid-1")
-	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	require.NoError(t, d.cacheClient.Delete(context.Background(), cache.ID))
-
-	obj, err := d.cacheClient.Get(context.Background(), cache.ID)
-	require.NoError(t, err)
-	require.NotNil(t, obj.DeletionRequestedAt)
-	reconcileCache(t, d, obj)
-
-	assert.Empty(t, catalogs(t, d.catalogClient))
 }
 
 // The cache's file is named for an id that dies with the record, so nothing could
@@ -480,65 +415,9 @@ func TestCacheReconcileFailsWhenTheStoreWillNotDelete(t *testing.T) {
 
 	obj, err := d.cacheClient.Get(context.Background(), cache.ID)
 	require.NoError(t, err)
-	client := &cacheControllerClient{caches: d.cacheClient, id: obj.ID}
-	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), client, obj)
+	res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), &cacheControllerClient{}, obj)
 
 	assert.NotEqual(t, beehive.Settled(), res)
-}
-
-// A cluster on its way out cascades to this cache next, so its subtree is not worth
-// growing.
-func TestCacheReconcileWritesNothingForADyingCluster(t *testing.T) {
-	d, status := newClusterStatusDeps(t)
-	cluster := storedCluster(t, d, status, true, "uid-1")
-	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	require.NoError(t, d.clusterClient.Delete(context.Background(), cluster.ID))
-
-	reconcileCache(t, d, cache)
-
-	assert.Empty(t, catalogs(t, d.catalogClient))
-}
-
-// The cascade can also finish first, collecting the cluster between the owner lookup
-// and the read of it — an ordinary race, not a failure to retry under backoff.
-func TestCacheReconcileWritesNothingWhenItsClusterIsCollected(t *testing.T) {
-	d, status := newClusterStatusDeps(t)
-	cluster := storedCluster(t, d, status, true, "uid-1")
-	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-	gone := beehive.ObjectID(9999)
-
-	res := (&clusterCacheController{deps: d}).Reconcile(
-		context.Background(),
-		&cacheControllerClient{caches: d.cacheClient, id: cache.ID, ownerID: &gone},
-		cache,
-	)
-
-	require.Equal(t, beehive.Settled(), res)
-	assert.Empty(t, catalogs(t, d.catalogClient))
-}
-
-// An owner edge is what a cache is reconciled against, so one without it has nothing
-// to relay.
-func TestCacheReconcileWritesNothingWithoutAnOwner(t *testing.T) {
-	d, _ := newClusterStatusDeps(t)
-
-	reconcileCache(t, d, &beehive.Object[ClusterCacheSpec, ClusterCacheStatus]{ID: 1})
-
-	assert.Empty(t, catalogs(t, d.catalogClient))
-}
-
-// The switch is the cluster's, read off the record rather than the cache's own spec —
-// which is why the pass reads its owner at all.
-func TestCacheReconcileRelaysThePauseFromItsCluster(t *testing.T) {
-	d, status := newClusterStatusDeps(t)
-	cluster := storedCluster(t, d, status, false, "uid-1")
-	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
-
-	reconcileCache(t, d, cache)
-
-	objs := catalogs(t, d.catalogClient)
-	require.Len(t, objs, 1)
-	assert.False(t, objs[0].Spec.Enabled)
 }
 
 // Scoped to one cluster: another cluster's cache must not reach this stream, or a
@@ -726,7 +605,7 @@ func TestCachesWatchHealthSkipsACacheOnItsWayOut(t *testing.T) {
 }
 
 // A cache with no workers is not necessarily a paused one: an enabled cluster's cache
-// has none until its catalog pass has run, and one that serves no kinds never will.
+// has none until its discovery pass has run, and one that serves no kinds never will.
 // Calling that Paused would show a user their own enabled cluster as switched off.
 func TestCachesWatchHealthTellsAnInitializingCacheFromAPausedOne(t *testing.T) {
 	tests := map[string]struct {

@@ -136,9 +136,8 @@ func (l *fakeLease) Conn(context.Context) (*kubeconn.Connection, error) {
 	return &kubeconn.Connection{}, nil
 }
 
-// ConnFor refuses everything. Nothing in this package dials — the sweep that does lives in
-// kubecatalog — and only kubeconn can stamp a connection's identity, so there is no honest
-// way to answer here. Deciding from l.state would be the connection/State correlation the
+// ConnFor refuses everything. Nothing in this package dials, and only kubeconn can stamp
+// a connection's identity, so there is no honest way to answer here. Deciding from l.state would be the connection/State correlation the
 // design forbids, passing a test against semantics the pool refuses.
 func (l *fakeLease) ConnFor(context.Context, string) (*kubeconn.Connection, error) {
 	return nil, kubeconn.ErrIdentityMismatch
@@ -189,8 +188,8 @@ func (f *fakeKubestore) OpenExisting(cacheID int64) (*kubestore.Store, bool, err
 	if f.onOpen != nil {
 		f.onOpen(cacheID)
 	}
-	// Under the lock: two reconciles can claim a cache at once — a catalog folding its
-	// kinds while a kind's own pass clears its rows.
+	// Under the lock: two reconciles can claim a cache at once — a cache-wide read while
+	// a kind's own pass clears its rows.
 	f.mu.Lock()
 	f.opened = append(f.opened, cacheID)
 	f.mu.Unlock()
@@ -227,7 +226,7 @@ func (f *fakeKubestore) Clear(cacheID int64) error {
 		return f.err
 	}
 	// Through the real manager, so a clear a test drives empties the rows a later read
-	// goes looking for — which is the whole of what the catalog's recovery path reacts to.
+	// goes looking for — which is the whole of what a re-read reacts to.
 	return f.mgr.Clear(cacheID)
 }
 

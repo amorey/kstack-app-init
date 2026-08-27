@@ -108,22 +108,6 @@ type ComplexityRoot struct {
 		Type  func(childComplexity int) int
 	}
 
-	ClusterCachedCatalog struct {
-		Conditions func(childComplexity int) int
-		ID         func(childComplexity int) int
-		Owner      func(childComplexity int) int
-		Spec       func(childComplexity int) int
-	}
-
-	ClusterCachedCatalogSpec struct {
-		Enabled func(childComplexity int) int
-	}
-
-	ClusterCachedCatalogWatchFrame struct {
-		Catalog func(childComplexity int) int
-		Type    func(childComplexity int) int
-	}
-
 	ClusterCachedDataEvent struct {
 		Count             func(childComplexity int) int
 		FirstSeen         func(childComplexity int) int
@@ -186,7 +170,6 @@ type ComplexityRoot struct {
 
 	ClusterCachedResourceSpec struct {
 		APIVersion func(childComplexity int) int
-		Enabled    func(childComplexity int) int
 		Kind       func(childComplexity int) int
 		Namespaced func(childComplexity int) int
 		Resource   func(childComplexity int) int
@@ -333,7 +316,6 @@ type ComplexityRoot struct {
 		ChatStream                    func(childComplexity int, input model.ChatInput) int
 		ClusterCacheHealthWatch       func(childComplexity int) int
 		ClusterCacheStatsWatch        func(childComplexity int, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) int
-		ClusterCachedCatalogsWatch    func(childComplexity int) int
 		ClusterCachedDataEventsWatch  func(childComplexity int, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) int
 		ClusterCachedDataKindsWatch   func(childComplexity int, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) int
 		ClusterCachedDataObjectsWatch func(childComplexity int, id clustersvc.ObjectID, cacheID clustersvc.ObjectID, apiVersion string, resource string) int
@@ -396,7 +378,6 @@ type SubscriptionResolver interface {
 	ClusterScheduleWatch(ctx context.Context, id clustersvc.ObjectID) (<-chan *clustersvc.Schedule, error)
 	ClusterCachesWatch(ctx context.Context) (<-chan *clustersvc.ClusterCacheWatchFrame, error)
 	ClusterCacheHealthWatch(ctx context.Context) (<-chan *clustersvc.ClusterCacheHealth, error)
-	ClusterCachedCatalogsWatch(ctx context.Context) (<-chan *clustersvc.ClusterCachedCatalogWatchFrame, error)
 	ClusterCachedResourcesWatch(ctx context.Context, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedResourceWatchFrame, error)
 	ClusterCacheStatsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCacheStats, error)
 	ClusterCachedDataKindsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedDataKindWatchFrame, error)
@@ -647,51 +628,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCacheWatchFrame.Type(childComplexity), true
-
-	case "ClusterCachedCatalog.conditions":
-		if e.ComplexityRoot.ClusterCachedCatalog.Conditions == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCachedCatalog.Conditions(childComplexity), true
-	case "ClusterCachedCatalog.id":
-		if e.ComplexityRoot.ClusterCachedCatalog.ID == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCachedCatalog.ID(childComplexity), true
-	case "ClusterCachedCatalog.owner":
-		if e.ComplexityRoot.ClusterCachedCatalog.Owner == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCachedCatalog.Owner(childComplexity), true
-	case "ClusterCachedCatalog.spec":
-		if e.ComplexityRoot.ClusterCachedCatalog.Spec == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCachedCatalog.Spec(childComplexity), true
-
-	case "ClusterCachedCatalogSpec.enabled":
-		if e.ComplexityRoot.ClusterCachedCatalogSpec.Enabled == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCachedCatalogSpec.Enabled(childComplexity), true
-
-	case "ClusterCachedCatalogWatchFrame.catalog":
-		if e.ComplexityRoot.ClusterCachedCatalogWatchFrame.Catalog == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCachedCatalogWatchFrame.Catalog(childComplexity), true
-	case "ClusterCachedCatalogWatchFrame.type":
-		if e.ComplexityRoot.ClusterCachedCatalogWatchFrame.Type == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCachedCatalogWatchFrame.Type(childComplexity), true
 
 	case "ClusterCachedDataEvent.count":
 		if e.ComplexityRoot.ClusterCachedDataEvent.Count == nil {
@@ -945,12 +881,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCachedResourceSpec.APIVersion(childComplexity), true
-	case "ClusterCachedResourceSpec.enabled":
-		if e.ComplexityRoot.ClusterCachedResourceSpec.Enabled == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ClusterCachedResourceSpec.Enabled(childComplexity), true
 	case "ClusterCachedResourceSpec.kind":
 		if e.ComplexityRoot.ClusterCachedResourceSpec.Kind == nil {
 			break
@@ -1518,12 +1448,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Subscription.ClusterCacheStatsWatch(childComplexity, args["id"].(clustersvc.ObjectID), args["cacheID"].(clustersvc.ObjectID)), true
-	case "Subscription.clusterCachedCatalogsWatch":
-		if e.ComplexityRoot.Subscription.ClusterCachedCatalogsWatch == nil {
-			break
-		}
-
-		return e.ComplexityRoot.Subscription.ClusterCachedCatalogsWatch(childComplexity), true
 	case "Subscription.clusterCachedDataEventsWatch":
 		if e.ComplexityRoot.Subscription.ClusterCachedDataEventsWatch == nil {
 			break
@@ -1855,38 +1779,6 @@ func (ec *executionContext) childFields_ClusterCacheWatchFrame(ctx context.Conte
 	return nil, fmt.Errorf("no field named %q was found under type ClusterCacheWatchFrame", field.Name)
 }
 
-func (ec *executionContext) childFields_ClusterCachedCatalog(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-	switch field.Name {
-	case "id":
-		return ec.fieldContext_ClusterCachedCatalog_id(ctx, field)
-	case "owner":
-		return ec.fieldContext_ClusterCachedCatalog_owner(ctx, field)
-	case "spec":
-		return ec.fieldContext_ClusterCachedCatalog_spec(ctx, field)
-	case "conditions":
-		return ec.fieldContext_ClusterCachedCatalog_conditions(ctx, field)
-	}
-	return nil, fmt.Errorf("no field named %q was found under type ClusterCachedCatalog", field.Name)
-}
-
-func (ec *executionContext) childFields_ClusterCachedCatalogSpec(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-	switch field.Name {
-	case "enabled":
-		return ec.fieldContext_ClusterCachedCatalogSpec_enabled(ctx, field)
-	}
-	return nil, fmt.Errorf("no field named %q was found under type ClusterCachedCatalogSpec", field.Name)
-}
-
-func (ec *executionContext) childFields_ClusterCachedCatalogWatchFrame(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-	switch field.Name {
-	case "type":
-		return ec.fieldContext_ClusterCachedCatalogWatchFrame_type(ctx, field)
-	case "catalog":
-		return ec.fieldContext_ClusterCachedCatalogWatchFrame_catalog(ctx, field)
-	}
-	return nil, fmt.Errorf("no field named %q was found under type ClusterCachedCatalogWatchFrame", field.Name)
-}
-
 func (ec *executionContext) childFields_ClusterCachedDataEvent(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 	switch field.Name {
 	case "uid":
@@ -2009,8 +1901,6 @@ func (ec *executionContext) childFields_ClusterCachedResource(ctx context.Contex
 
 func (ec *executionContext) childFields_ClusterCachedResourceSpec(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 	switch field.Name {
-	case "enabled":
-		return ec.fieldContext_ClusterCachedResourceSpec_enabled(ctx, field)
 	case "apiVersion":
 		return ec.fieldContext_ClusterCachedResourceSpec_apiVersion(ctx, field)
 	case "kind":
@@ -3818,203 +3708,6 @@ func (ec *executionContext) fieldContext_ClusterCacheWatchFrame_cache(_ context.
 	return fc, nil
 }
 
-func (ec *executionContext) _ClusterCachedCatalog_id(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedCatalog) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCachedCatalog_id(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.ID, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v clustersvc.ObjectID) graphql.Marshaler {
-			return ec.marshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐObjectID(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCachedCatalog_id(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCachedCatalog", field, false, false, errors.New("field of type ObjectID does not have child fields"))
-}
-
-func (ec *executionContext) _ClusterCachedCatalog_owner(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedCatalog) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCachedCatalog_owner(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Owner, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v clustersvc.ObjectRef) graphql.Marshaler {
-			return ec.marshalNObjectRef2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐObjectRef(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCachedCatalog_owner(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	fc = &graphql.FieldContext{
-		Object:     "ClusterCachedCatalog",
-		Field:      field,
-		IsMethod:   false,
-		IsResolver: false,
-		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_ObjectRef(ctx, field)
-		},
-	}
-	return fc, nil
-}
-
-func (ec *executionContext) _ClusterCachedCatalog_spec(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedCatalog) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCachedCatalog_spec(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Spec, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v clustersvc.ClusterCachedCatalogSpec) graphql.Marshaler {
-			return ec.marshalNClusterCachedCatalogSpec2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedCatalogSpec(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCachedCatalog_spec(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	fc = &graphql.FieldContext{
-		Object:     "ClusterCachedCatalog",
-		Field:      field,
-		IsMethod:   false,
-		IsResolver: false,
-		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_ClusterCachedCatalogSpec(ctx, field)
-		},
-	}
-	return fc, nil
-}
-
-func (ec *executionContext) _ClusterCachedCatalog_conditions(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedCatalog) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCachedCatalog_conditions(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Conditions, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v []clustersvc.Condition) graphql.Marshaler {
-			return ec.marshalNCondition2ᚕgithubᚗcomᚋamoreyᚋbeehiveᚐConditionᚄ(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCachedCatalog_conditions(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	fc = &graphql.FieldContext{
-		Object:     "ClusterCachedCatalog",
-		Field:      field,
-		IsMethod:   false,
-		IsResolver: false,
-		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_Condition(ctx, field)
-		},
-	}
-	return fc, nil
-}
-
-func (ec *executionContext) _ClusterCachedCatalogSpec_enabled(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedCatalogSpec) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCachedCatalogSpec_enabled(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Enabled, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
-			return ec.marshalNBoolean2bool(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCachedCatalogSpec_enabled(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCachedCatalogSpec", field, false, false, errors.New("field of type Boolean does not have child fields"))
-}
-
-func (ec *executionContext) _ClusterCachedCatalogWatchFrame_type(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedCatalogWatchFrame) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCachedCatalogWatchFrame_type(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Type, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v clustersvc.DeltaFrameType) graphql.Marshaler {
-			return ec.marshalNDeltaFrameType2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐDeltaFrameType(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCachedCatalogWatchFrame_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCachedCatalogWatchFrame", field, false, false, errors.New("field of type DeltaFrameType does not have child fields"))
-}
-
-func (ec *executionContext) _ClusterCachedCatalogWatchFrame_catalog(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedCatalogWatchFrame) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCachedCatalogWatchFrame_catalog(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Catalog, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *clustersvc.ClusterCachedCatalog) graphql.Marshaler {
-			return ec.marshalOClusterCachedCatalog2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedCatalog(ctx, selections, v)
-		},
-		true,
-		false,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCachedCatalogWatchFrame_catalog(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	fc = &graphql.FieldContext{
-		Object:     "ClusterCachedCatalogWatchFrame",
-		Field:      field,
-		IsMethod:   false,
-		IsResolver: false,
-		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_ClusterCachedCatalog(ctx, field)
-		},
-	}
-	return fc, nil
-}
-
 func (ec *executionContext) _ClusterCachedDataEvent_uid(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedDataEvent) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -4985,29 +4678,6 @@ func (ec *executionContext) fieldContext_ClusterCachedResource_events(ctx contex
 		return fc, err
 	}
 	return fc, nil
-}
-
-func (ec *executionContext) _ClusterCachedResourceSpec_enabled(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedResourceSpec) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ClusterCachedResourceSpec_enabled(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Enabled, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
-			return ec.marshalNBoolean2bool(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ClusterCachedResourceSpec_enabled(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCachedResourceSpec", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCachedResourceSpec_apiVersion(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedResourceSpec) (ret graphql.Marshaler) {
@@ -7389,38 +7059,6 @@ func (ec *executionContext) fieldContext_Subscription_clusterCacheHealthWatch(_ 
 	return fc, nil
 }
 
-func (ec *executionContext) _Subscription_clusterCachedCatalogsWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
-	return graphql.ResolveFieldStream(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_Subscription_clusterCachedCatalogsWatch(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return ec.Resolvers.Subscription().ClusterCachedCatalogsWatch(ctx)
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *clustersvc.ClusterCachedCatalogWatchFrame) graphql.Marshaler {
-			return ec.marshalNClusterCachedCatalogWatchFrame2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedCatalogWatchFrame(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_Subscription_clusterCachedCatalogsWatch(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	fc = &graphql.FieldContext{
-		Object:     "Subscription",
-		Field:      field,
-		IsMethod:   true,
-		IsResolver: true,
-		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_ClusterCachedCatalogWatchFrame(ctx, field)
-		},
-	}
-	return fc, nil
-}
-
 func (ec *executionContext) _Subscription_clusterCachedResourcesWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
 	return graphql.ResolveFieldStream(
 		ctx,
@@ -9484,140 +9122,6 @@ func (ec *executionContext) _ClusterCacheWatchFrame(ctx context.Context, sel ast
 	return out
 }
 
-var clusterCachedCatalogImplementors = []string{"ClusterCachedCatalog"}
-
-func (ec *executionContext) _ClusterCachedCatalog(ctx context.Context, sel ast.SelectionSet, obj *clustersvc.ClusterCachedCatalog) graphql.Marshaler {
-	fields := graphql.CollectFields(ec.OperationContext, sel, clusterCachedCatalogImplementors)
-
-	out := graphql.NewFieldSet(fields)
-	deferred := make(map[string]*graphql.FieldSet)
-	for i, field := range fields {
-		switch field.Name {
-		case "__typename":
-			out.Values[i] = graphql.MarshalString("ClusterCachedCatalog")
-		case "id":
-			out.Values[i] = ec._ClusterCachedCatalog_id(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		case "owner":
-			out.Values[i] = ec._ClusterCachedCatalog_owner(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		case "spec":
-			out.Values[i] = ec._ClusterCachedCatalog_spec(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		case "conditions":
-			out.Values[i] = ec._ClusterCachedCatalog_conditions(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		default:
-			panic("unknown field " + strconv.Quote(field.Name))
-		}
-	}
-	out.Dispatch(ctx)
-	if out.Invalids > 0 {
-		return graphql.Null
-	}
-
-	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
-
-	for label, dfs := range deferred {
-		ec.ProcessDeferredGroup(graphql.DeferredGroup{
-			Label:    label,
-			Path:     graphql.GetPath(ctx),
-			FieldSet: dfs,
-			Context:  ctx,
-		})
-	}
-
-	return out
-}
-
-var clusterCachedCatalogSpecImplementors = []string{"ClusterCachedCatalogSpec"}
-
-func (ec *executionContext) _ClusterCachedCatalogSpec(ctx context.Context, sel ast.SelectionSet, obj *clustersvc.ClusterCachedCatalogSpec) graphql.Marshaler {
-	fields := graphql.CollectFields(ec.OperationContext, sel, clusterCachedCatalogSpecImplementors)
-
-	out := graphql.NewFieldSet(fields)
-	deferred := make(map[string]*graphql.FieldSet)
-	for i, field := range fields {
-		switch field.Name {
-		case "__typename":
-			out.Values[i] = graphql.MarshalString("ClusterCachedCatalogSpec")
-		case "enabled":
-			out.Values[i] = ec._ClusterCachedCatalogSpec_enabled(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		default:
-			panic("unknown field " + strconv.Quote(field.Name))
-		}
-	}
-	out.Dispatch(ctx)
-	if out.Invalids > 0 {
-		return graphql.Null
-	}
-
-	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
-
-	for label, dfs := range deferred {
-		ec.ProcessDeferredGroup(graphql.DeferredGroup{
-			Label:    label,
-			Path:     graphql.GetPath(ctx),
-			FieldSet: dfs,
-			Context:  ctx,
-		})
-	}
-
-	return out
-}
-
-var clusterCachedCatalogWatchFrameImplementors = []string{"ClusterCachedCatalogWatchFrame"}
-
-func (ec *executionContext) _ClusterCachedCatalogWatchFrame(ctx context.Context, sel ast.SelectionSet, obj *clustersvc.ClusterCachedCatalogWatchFrame) graphql.Marshaler {
-	fields := graphql.CollectFields(ec.OperationContext, sel, clusterCachedCatalogWatchFrameImplementors)
-
-	out := graphql.NewFieldSet(fields)
-	deferred := make(map[string]*graphql.FieldSet)
-	for i, field := range fields {
-		switch field.Name {
-		case "__typename":
-			out.Values[i] = graphql.MarshalString("ClusterCachedCatalogWatchFrame")
-		case "type":
-			out.Values[i] = ec._ClusterCachedCatalogWatchFrame_type(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		case "catalog":
-			out.Values[i] = ec._ClusterCachedCatalogWatchFrame_catalog(ctx, field, obj)
-		default:
-			panic("unknown field " + strconv.Quote(field.Name))
-		}
-	}
-	out.Dispatch(ctx)
-	if out.Invalids > 0 {
-		return graphql.Null
-	}
-
-	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
-
-	for label, dfs := range deferred {
-		ec.ProcessDeferredGroup(graphql.DeferredGroup{
-			Label:    label,
-			Path:     graphql.GetPath(ctx),
-			FieldSet: dfs,
-			Context:  ctx,
-		})
-	}
-
-	return out
-}
-
 var clusterCachedDataEventImplementors = []string{"ClusterCachedDataEvent"}
 
 func (ec *executionContext) _ClusterCachedDataEvent(ctx context.Context, sel ast.SelectionSet, obj *clustersvc.ClusterCachedDataEvent) graphql.Marshaler {
@@ -10165,11 +9669,6 @@ func (ec *executionContext) _ClusterCachedResourceSpec(ctx context.Context, sel 
 		switch field.Name {
 		case "__typename":
 			out.Values[i] = graphql.MarshalString("ClusterCachedResourceSpec")
-		case "enabled":
-			out.Values[i] = ec._ClusterCachedResourceSpec_enabled(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		case "apiVersion":
 			out.Values[i] = ec._ClusterCachedResourceSpec_apiVersion(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
@@ -11461,8 +10960,6 @@ func (ec *executionContext) _Subscription(ctx context.Context, sel ast.Selection
 		return ec._Subscription_clusterCachesWatch(ctx, fields[0])
 	case "clusterCacheHealthWatch":
 		return ec._Subscription_clusterCacheHealthWatch(ctx, fields[0])
-	case "clusterCachedCatalogsWatch":
-		return ec._Subscription_clusterCachedCatalogsWatch(ctx, fields[0])
 	case "clusterCachedResourcesWatch":
 		return ec._Subscription_clusterCachedResourcesWatch(ctx, fields[0])
 	case "clusterCacheStatsWatch":
@@ -12034,24 +11531,6 @@ func (ec *executionContext) marshalNClusterCacheWatchFrame2ᚖgithubᚗcomᚋkub
 		return graphql.Null
 	}
 	return ec._ClusterCacheWatchFrame(ctx, sel, v)
-}
-
-func (ec *executionContext) marshalNClusterCachedCatalogSpec2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedCatalogSpec(ctx context.Context, sel ast.SelectionSet, v clustersvc.ClusterCachedCatalogSpec) graphql.Marshaler {
-	return ec._ClusterCachedCatalogSpec(ctx, sel, &v)
-}
-
-func (ec *executionContext) marshalNClusterCachedCatalogWatchFrame2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedCatalogWatchFrame(ctx context.Context, sel ast.SelectionSet, v clustersvc.ClusterCachedCatalogWatchFrame) graphql.Marshaler {
-	return ec._ClusterCachedCatalogWatchFrame(ctx, sel, &v)
-}
-
-func (ec *executionContext) marshalNClusterCachedCatalogWatchFrame2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedCatalogWatchFrame(ctx context.Context, sel ast.SelectionSet, v *clustersvc.ClusterCachedCatalogWatchFrame) graphql.Marshaler {
-	if v == nil {
-		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
-			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
-		}
-		return graphql.Null
-	}
-	return ec._ClusterCachedCatalogWatchFrame(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalNClusterCachedDataEventWatchFrame2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedDataEventWatchFrame(ctx context.Context, sel ast.SelectionSet, v clustersvc.ClusterCachedDataEventWatchFrame) graphql.Marshaler {
@@ -12723,13 +12202,6 @@ func (ec *executionContext) marshalOClusterCache2ᚖgithubᚗcomᚋkubetailᚑor
 		return graphql.Null
 	}
 	return ec._ClusterCache(ctx, sel, v)
-}
-
-func (ec *executionContext) marshalOClusterCachedCatalog2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedCatalog(ctx context.Context, sel ast.SelectionSet, v *clustersvc.ClusterCachedCatalog) graphql.Marshaler {
-	if v == nil {
-		return graphql.Null
-	}
-	return ec._ClusterCachedCatalog(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalOClusterCachedDataEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedDataEvent(ctx context.Context, sel ast.SelectionSet, v *clustersvc.ClusterCachedDataEvent) graphql.Marshaler {

@@ -422,9 +422,7 @@ func TestPluralRootFieldsScopeOptionally(t *testing.T) {
 	}
 }
 
-// ClusterCache.syncs completes the navigable path Cluster → caches → syncs. The
-// resource catalog that owns the records is NOT a step in it: exactly one exists per
-// cache, so the service resolves it and the query never names it.
+// ClusterCache.syncs completes the navigable path Cluster → caches → syncs.
 func TestClusterCacheSyncsResolver(t *testing.T) {
 	fix := clusterFixtures()
 	srv := newTestServer(t, fix)
@@ -457,8 +455,8 @@ func TestClusterCacheSyncsResolver(t *testing.T) {
 	if got[0]["id"] != strconv.FormatInt(int64(fixtureResourceID(fix[0].id)), 10) {
 		t.Errorf("id: want the sync record's own id, got %v", got[0]["id"])
 	}
-	if ownerOf(got[0])["id"] != strconv.FormatInt(int64(fixtureCatalogID(fix[0].id)), 10) {
-		t.Errorf("owner: want the anchor's id, got %v", ownerOf(got[0]))
+	if ownerOf(got[0])["id"] != strconv.FormatInt(int64(cacheID), 10) {
+		t.Errorf("owner: want the cache's id, got %v", ownerOf(got[0]))
 	}
 }
 
@@ -595,60 +593,6 @@ func TestCacheEventTimelineResolvers(t *testing.T) {
 	}
 }
 
-// The resource-catalog stream serves the record's identity + Discovered condition, keyed
-// to its cache by cacheID — the join the client makes.
-func TestClusterCachedCatalogsWatchServesRecord(t *testing.T) {
-	srv := newTestServer(t, clusterFixtures())
-
-	resp := openSSESubscription(t, srv.URL, "",
-		`subscription { clusterCachedCatalogsWatch { type catalog { id owner { id kind } `+
-			`conditions { type status reason } } } }`)
-	defer resp.Body.Close()
-	events := sseEvents(t, resp)
-
-	deadline := time.After(2 * time.Second)
-	for {
-		var frame struct {
-			Data struct {
-				Watch struct {
-					Type    string         `json:"type"`
-					Catalog map[string]any `json:"catalog"`
-				} `json:"clusterCachedCatalogsWatch"`
-			} `json:"data"`
-		}
-		select {
-		case ev, ok := <-events:
-			if !ok {
-				t.Fatal("stream closed before a frame arrived")
-			}
-			if ev.event != "next" {
-				continue
-			}
-			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
-				t.Fatalf("decode discovery frame %s: %v", ev.data, err)
-			}
-			d := frame.Data.Watch.Catalog
-			if ownerOf(d)["id"] != strconv.FormatInt(int64(fixtureCacheID(1)), 10) {
-				continue // fixture 2's record; it carries no discovery status
-			}
-			if frame.Data.Watch.Type != "Added" {
-				t.Fatalf("snapshot change should be Added, got %q", frame.Data.Watch.Type)
-			}
-			conds, _ := d["conditions"].([]any)
-			if len(conds) != 1 {
-				t.Fatalf("conditions = %v, want the Discovered row", conds)
-			}
-			cond, _ := conds[0].(map[string]any)
-			if cond["type"] != "Discovered" || cond["reason"] != "Discovered" || cond["status"] != "True" {
-				t.Errorf("condition = %v, want a True/Discovered row", cond)
-			}
-			return
-		case <-deadline:
-			t.Fatal("timed out waiting for cluster 1's discovery frame")
-		}
-	}
-}
-
 // clusterCacheClear empties one cache's file and returns the (still-tracked) record.
 // The id it takes is the cache's own — a cluster id names no single cache once a UID
 // migration has left two — so the fixture's cluster id must not resolve. An unknown id
@@ -683,7 +627,7 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 
 	resp := openSSESubscription(t, srv.URL, "",
 		`subscription { clusterCachedResourcesWatch(cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { type resource { id owner { id kind } `+
-			`spec { enabled apiVersion kind resource namespaced } conditions { type status reason } } } }`)
+			`spec { apiVersion kind resource namespaced } conditions { type status reason } } } }`)
 	defer resp.Body.Close()
 	events := sseEvents(t, resp)
 
@@ -720,7 +664,7 @@ func TestClusterCachedResourcesWatchIsCacheScoped(t *testing.T) {
 			}
 			seen++
 			sync := frame.Data.Watch.Resource
-			if ownerOf(sync)["id"] != strconv.FormatInt(int64(fixtureCatalogID(1)), 10) {
+			if ownerOf(sync)["id"] != strconv.FormatInt(int64(fixtureCacheID(1)), 10) {
 				t.Fatalf("another cache's record leaked into the stream: %v", sync)
 			}
 			spec, _ := sync["spec"].(map[string]any)

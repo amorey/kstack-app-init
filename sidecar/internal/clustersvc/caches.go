@@ -518,26 +518,24 @@ func nilIfZero(t time.Time) *time.Time {
 	return &t
 }
 
-// clusterCacheController reconciles one cache: today it creates the discovery anchor
-// beneath it, carrying the pause switch its cluster decides. Provisioning the mirror
-// itself is still to come.
+// clusterCacheController reconciles one cache: today it only tears the cache's file
+// down with the record. Arming the mirror is still to come.
 type clusterCacheController struct {
 	lifecycle.None
-	// Every kind's client, not just this one's: a cache reads the cluster it hangs off
-	// and writes the catalog it owns.
+	// Every kind's client, not just this one's: the per-kind records a cache owns are
+	// written from here once the seam that discovers them lands.
 	deps
 }
 
 func (c *clusterCacheController) Reconcile(
-	ctx context.Context,
-	client beehive.ControllerClient[ClusterCacheStatus],
+	_ context.Context,
+	_ beehive.ControllerClient[ClusterCacheStatus],
 	obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
 ) beehive.ReconcileResult {
 	// A cache on its way out is about to be collected with the subtree it owns, and
 	// beehive collects it with no finalizer to clear — so its file is deleted here or
-	// never: the ids the paths are named for are gone with the records. The kinds
-	// below stop clearing their own rows as soon as this mark lands (their owner walk
-	// reads a deletion-pending cache as no cache), so nothing recreates the file.
+	// never: the ids the paths are named for are gone with the records. Remove
+	// tombstones the id, so nothing below can claim the file back after this.
 	if obj.DeletionRequestedAt != nil {
 		if err := c.kubestoreMgr.Remove(int64(obj.ID)); err != nil {
 			return beehive.Fail(fmt.Errorf("remove cluster cache %d store: %w", obj.ID, err))
@@ -545,41 +543,9 @@ func (c *clusterCacheController) Reconcile(
 		return beehive.Settled()
 	}
 
-	// The reconcile load carries no edges, so the owner is a lookup rather than a field.
-	owner, ok, err := client.GetOwner(ctx)
-	if err != nil {
-		return beehive.Fail(fmt.Errorf("read cluster cache %d owner: %w", obj.ID, err))
-	}
-	if !ok {
-		return beehive.Settled()
-	}
-
-	clusterObj, err := c.clusterClient.Get(ctx, owner.ID)
-	// The cascade that takes this cache next may have collected the cluster already,
-	// which is a race rather than a failure worth retrying under backoff.
-	if errors.Is(err, beehive.ErrNotFound) {
-		return beehive.Settled()
-	}
-	if err != nil {
-		return beehive.Fail(fmt.Errorf("read cluster %d: %w", owner.ID, err))
-	}
-	// A cluster being torn down cascades here, so its subtree is not worth growing.
-	if clusterObj.DeletionRequestedAt != nil {
-		return beehive.Settled()
-	}
-
-	// The switch below is the cluster's, and an owner edge wakes nothing: without this,
-	// a toggle flip would sit unrelayed until something else woke the cache. Beehive
-	// records nothing when the edge is already there, so every later pass is free.
-	if err := client.AddDependency(ctx, owner.ID); err != nil {
-		return beehive.Fail(fmt.Errorf("depend cluster cache %d on its cluster: %w", obj.ID, err))
-	}
-
-	enabled := cacheSyncEnabled(clusterObj, obj.Spec.ServerUID)
-	if err := ensureClusterCachedCatalog(ctx, c.catalogClient, ClusterCacheID(obj.ID), enabled); err != nil {
-		return beehive.Fail(err)
-	}
-	// This pass writes no status of its own, so nothing else reports it converged, and
-	// the owed pass would re-dispatch every cache — four store reads apiece — forever.
+	// A live cache has nothing owed of it: the seam that arms its mirror is being
+	// redesigned, so this pass observes nothing and writes nothing. It still settles —
+	// unsettled, the store keeps every cache owed and beehive re-dispatches the kind
+	// forever.
 	return beehive.Settled()
 }

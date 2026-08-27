@@ -30,12 +30,12 @@ Each spec is self-contained: read one and you can build it. Where an order is gi
 dependency, and each spec's header states what it needs and what it hands to the next.
 
 **The cache read path is built and reads an empty store.** The `CachedData()` family reads a
-cache's rows back (→ [ADR](../adr/2026-08-26-cached-data-read-loop.md)), but nothing writes them:
-the seam between `ClusterCachedCatalog`, `ClusterCachedResource`, and `kubestore` is being
-redesigned, and a spec for it is owed.
+cache's rows back (→ [ADR](../adr/2026-08-26-cached-data-read-loop.md)), but nothing writes them.
+[The kubesync seam](kubesync-seam.md) is what fills it.
 
 **Independent.**
 
 | Spec | Scope | Status |
 | --- | --- | --- |
+| [The kubesync seam](kubesync-seam.md) | sidecar | Planned |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |

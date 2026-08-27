@@ -26,7 +26,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 
 import { Dialog } from '@/components/widgets/dialog';
 import { graphql } from '@/gql';
-import type { ClusterCachedCatalogsSubscription, ClusterCachedResourcesSubscription } from '@/gql/graphql';
+import type { ClusterCachedResourcesSubscription } from '@/gql/graphql';
 import {
   type Cluster,
   type ClusterCacheHealth,
@@ -188,54 +188,6 @@ function useSyncEvents(syncId: string | undefined): Timeline {
     (prev, resp) => foldFrame(prev, resp.eventsWatch),
   );
   return data ?? EMPTY_TIMELINE;
-}
-
-// The cache's GVR-discovery record (which kinds the cluster serves, and how current
-// that answer is). Fleet-wide stream, but subscribed HERE, not in ClustersProvider:
-// this pane is its only reader, and an app-wide mount would stream + rebuild joined
-// identities in every window for a row nobody expanded.
-const ClusterCachedCatalogsSubscription = graphql(`
-  subscription ClusterCachedCatalogs {
-    clusterCachedCatalogsWatch {
-      type
-      catalog {
-        id
-        owner {
-          id
-        }
-        conditions {
-          type
-          reason
-          message
-          unconfirmed
-        }
-      }
-    }
-  }
-`);
-
-// NonNullable: null only on a Bookmark, folded away in the reducer below.
-type CachedCatalog = NonNullable<ClusterCachedCatalogsSubscription['clusterCachedCatalogsWatch']['catalog']>;
-
-// Every cache's discovery record, folded by the cache it belongs to.
-function useCachedCatalogs(): Keyed<CachedCatalog> {
-  const [{ data }] = useWatchSubscription<
-    { clusterCachedCatalogsWatch: { type: string; catalog: CachedCatalog | null } },
-    Keyed<CachedCatalog>
-  >({ query: ClusterCachedCatalogsSubscription }, (prev, resp) => {
-    const { type, catalog } = resp.clusterCachedCatalogsWatch;
-    // The Bookmark carries no record. This pane reads the fold as a lookup table, so
-    // it needs no snapshot-complete gate of its own. A change with no record is a
-    // server-side field error — equally unfoldable.
-    if (type === 'Bookmark' || !catalog) return prev ?? new Map();
-    // A Deleted must match on the record's own id, not its owner: a hard delete's
-    // frame carries owner id "0" (the edge is already collected), so keying it by the
-    // owner would drop every delete and the pane would show gone records.
-    if (type !== 'Deleted') return applyChange(prev, type, catalog.owner.id, catalog);
-    const gone = [...(prev ?? new Map())].find(([, c]) => c.id === catalog.id);
-    return gone ? applyChange(prev, 'Deleted', gone[0], catalog) : (prev ?? new Map());
-  });
-  return data ?? new Map();
 }
 
 // The cache's contents as a live gauge. NOT read off the ClusterCache record: that
@@ -400,9 +352,7 @@ function statusOf(c: Cluster, group: Group): { label: string; tone: Tone } {
   // value keeps it reading as a downstream symptom.
   if (connected?.status === 'False') return { label: 'Stalled', tone: 'muted' };
   // Verdict = the sidecar's per-kind rollup, dominated by the worst kind — neither
-  // the cache's coarse Synced condition nor any single kind's would do. The
-  // `Discovered` axis deliberately doesn't participate (a partial kind list doesn't
-  // stop known kinds from syncing) — it's a note in SyncDetail instead.
+  // the cache's coarse Synced condition nor any single kind's would do.
   const health = c.activeCache?.health;
   // No rollup yet — nothing observed, only work in progress.
   if (!health) return { label: 'Syncing', tone: 'ok' };
@@ -723,26 +673,6 @@ function cacheSummary(objectCount: number, kindCount: number): string {
   return `${countLabel(objectCount, 'object')} across ${countLabel(kindCount, 'kind')}`;
 }
 
-// Warning about the kind list itself, distinct from whether kinds are syncing (a
-// note, not a status — see statusOf). Unconfirmed conditions are skipped: they
-// describe a state this process hasn't re-observed.
-function discoveryWarning(discovery: CachedCatalog | null): string | null {
-  const cond = findCondition(discovery?.conditions ?? [], 'Discovered');
-  if (!cond || cond.unconfirmed) return null;
-  if (cond.reason === 'DiscoveryPartial') {
-    return cond.message || 'Some api groups did not respond — the kind list may be incomplete.';
-  }
-  if (cond.reason === 'DiscoveryFailed') {
-    return `Kind discovery is failing — ${cond.message || 'the cluster could not be asked which kinds it serves.'}`;
-  }
-  // A served kind has no live child yet (a prune's child still draining holds the
-  // name). Transient, but that kind isn't syncing at all — must not render as nothing.
-  if (cond.reason === 'DiscoveryDraining') {
-    return cond.message || 'Waiting for replaced kinds to finish draining.';
-  }
-  return null;
-}
-
 // Expanded sync diagnostics. Inline for the same modal-inert reason as
 // ConnectionDetail. Everything subscribes only while expanded — that's what makes
 // the hundred-plus-record per-kind stream affordable.
@@ -750,12 +680,10 @@ function SyncDetail({
   health,
   cacheId,
   contents,
-  discovery,
 }: {
   health: ClusterCacheHealth;
   cacheId: string;
   contents: CacheContents | null;
-  discovery: CachedCatalog | null;
 }) {
   const kindSyncs = useCachedResources(cacheId);
   const timelineKind = timelineSyncFor(kindSyncs, health);
@@ -767,7 +695,6 @@ function SyncDetail({
   // Staleness is engine-derived, never inferred from a stamp's age — a
   // quiet-but-healthy cache legitimately has an old lastUpdateAt.
   const stale = health.reason === 'Stale';
-  const discoveryNote = discoveryWarning(discovery);
   return (
     <div className="space-y-2 rounded-md border bg-muted/30 p-3">
       <p className="text-sm font-medium">Sync status</p>
@@ -779,7 +706,6 @@ function SyncDetail({
             : 'the watch may have stopped delivering updates.'}
         </p>
       ) : null}
-      {discoveryNote ? <p className={`text-xs ${TONE.attention.text}`}>{discoveryNote}</p> : null}
       <dl className="space-y-0.5 text-xs text-muted-foreground">
         {/* Only when the cache has objects (empty is covered by the freshness line). */}
         {contents && contents.objectCount > 0 ? (
@@ -856,7 +782,6 @@ function DisclosureLabel({
 function ClusterRow({
   cluster,
   group,
-  discovery,
   onSetEnabled,
   onToggle,
   onClearCache,
@@ -865,7 +790,6 @@ function ClusterRow({
 }: {
   cluster: Cluster;
   group: Group;
-  discovery: CachedCatalog | null;
   onSetEnabled: (enabled: boolean) => void;
   onToggle: (enabled: boolean) => void;
   onClearCache: () => void;
@@ -993,7 +917,7 @@ function ClusterRow({
         <TableRow className="hover:bg-transparent">
           <TableCell className={STATUS_CELL_CLASS} />
           <TableCell colSpan={COLUMN_COUNT - 1} className="pt-0">
-            <SyncDetail health={health} cacheId={health.cacheID} contents={contents} discovery={discovery} />
+            <SyncDetail health={health} cacheId={health.cacheID} contents={contents} />
           </TableCell>
         </TableRow>
       ) : null}
@@ -1022,12 +946,6 @@ const GROUPS: { key: Group; label: string; suffix: string; match: (c: Cluster) =
 // event/schedule streams mount only when a row's diagnostics open.
 export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
   const { clusters, connected } = useClusters();
-  // ONE fleet-wide discovery subscription for the whole dialog, folded by cacheID.
-  // Per-row hooks would resolve to the same urql operation, and a second subscriber
-  // joins mid-stream with no replay — a second expanded row would see nothing until
-  // the next 5-minute pass. Dialog-scoped (nothing subscribes while closed), open
-  // for the dialog's life at a cost of one record per cache.
-  const discoveries = useCachedCatalogs();
   const rows = clusters ?? [];
   const groups = GROUPS.map((g) => ({ ...g, clusters: rows.filter(g.match) })).filter((g) => g.clusters.length > 0);
 
@@ -1106,7 +1024,6 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
                   key={c.id}
                   cluster={c}
                   group={g.key}
-                  discovery={discoveries.get(c.activeCache?.id ?? '') ?? null}
                   onSetEnabled={(enabled) => run(clusterEnabledSetMut({ id: c.id, enabled }))}
                   onToggle={(syncEnabled) => run(clusterSyncEnabledSetMut({ id: c.id, syncEnabled }))}
                   // The cache's own id, not the cluster's: a UID migration leaves the

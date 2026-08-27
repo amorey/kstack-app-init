@@ -121,9 +121,6 @@ type ClusterID = ObjectID
 // so the cache id is not derivable from the cluster id.
 type ClusterCacheID = ObjectID
 
-// ClusterCachedCatalogID identifies one cache's GVR-discovery child.
-type ClusterCachedCatalogID = ObjectID
-
 // ClusterCachedResourceID identifies one synced kind's ClusterCachedResource object.
 type ClusterCachedResourceID = ObjectID
 

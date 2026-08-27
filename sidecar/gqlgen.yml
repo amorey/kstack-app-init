@@ -139,8 +139,6 @@ models:
   # The cache subtree's served spec IS the stored beehive type (no projection layer).
   ClusterCacheSpec:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheSpec
-  ClusterCachedCatalog:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedCatalog
   ClusterCachedResource:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedResource
     fields:
@@ -154,12 +152,6 @@ models:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheHealth
   SyncedKindRef:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.SyncedKindRef
-
-  ClusterCachedCatalogSpec:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedCatalogSpec
-
-  ClusterCachedCatalogWatchFrame:
-    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedCatalogWatchFrame
 
   ClusterCacheStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheStats
