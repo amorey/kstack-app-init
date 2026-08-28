@@ -927,24 +927,33 @@ context](../docs/adr/2026-08-23-one-connection-per-context.md).
 the narrow `Acquire(contextName) kubeconn.Lease` and `OpenOrCreate(cacheID) (*kubestore.Store,
 error)`. → `docs/specs/kubesync-seam.md`.
 
-**Built so far: the seam and the arming.** `TrackDiscovery`/`ForgetDiscovery`, `TrackKind`/
-`ForgetKind`, `RestartAll`, the claims, the identity gate, the two reads and the two news feeds.
-**The two bodies behind it are not built** — the sweep and the per-kind mirror are seams a test
-substitutes, so a tracked cache holds its claims and runs nothing.
+**Built so far: the seam, the arming, and the sweep.** `TrackDiscovery`/`ForgetDiscovery`,
+`TrackKind`/`ForgetKind`, `RestartAll`, the claims, the identity gate, the two reads and the two
+news feeds — plus discovery, which fills `kind_catalog`. **The per-kind mirror is not built**: it
+is a seam a test substitutes (`withSyncKindFn`), so an armed kind holds a connection and writes
+nothing.
 
 **Two levels of arming, and they AND rather than nest.** `TrackDiscovery` says whether a cache
-syncs at all — and *supplies* it, since both claims are taken there — while `TrackKind` says which
-kinds. A kind's registration **outlives its cache being forgotten**: pausing is one call and
+syncs at all — and *supplies* it, since the session it arms is what takes both claims — while
+`TrackKind` says which kinds. A kind's registration **outlives its cache being forgotten**: pausing is one call and
 resuming is one call, with no record written and none requeued, where gating through the records
 would mean relaying the switch onto hundreds of them.
 
 - **Arming is policy, never interest.** A worker starts because a record's pass armed it, never
   because something read it.
+- **A session takes its own claims and gives them back**, in `start` and `close`. The lease is
+  taken only once the file is open, so a store that will not open leaves nothing to unwind — the
+  cache arms on a later pass instead, and is logged because nothing else would report it.
 - **Nothing syncs into a cache whose connection does not vouch for its `ServerUID`.** The gate is
   the session's: a kind worker holds its own goroutine, so it blocks on `AwaitConnFor`, where a
   sweep runs on the probe engine and must suspend instead.
 - **Forgetting is synchronous.** `ForgetDiscovery` returns only when no worker can still write
-  through that cache's store, and `ForgetKind` only when that kind's cannot.
+  through that cache's store, and `ForgetKind` only when that kind's cannot. **A sweep needs both
+  halves**: `probe.Engine.Remove` stops a result being applied but neither cancels the run nor
+  joins it, so every probe body is registered wrapped in `sessionScoped` — the run is counted so
+  the teardown waits for it, and its context ends with the session's so the teardown reaches the
+  request in flight. Wrapped at registration, because a body that forgot would break the promise
+  silently.
 - **A verdict is a gauge, never a stored condition** (`GetDiscoveryState`/`GetKindState`), and
   **no answer is not an empty answer**: `false` means nothing has been observed yet, and a caller
   folding it into "serves no kinds" deletes a record set that was only waiting.
@@ -952,11 +961,57 @@ would mean relaying the switch onto hundreds of them.
   triggers and one feed carrying both would wake a cache for each of its hundreds of kinds. The
   key is the whole message and the reader answers it by re-reading. A resume is not news — only a
   reason that settled somewhere new — with one exception a verdict cannot carry: a sweep that
-  committed a catalog (`discoveryRun.Announce`).
+  committed a catalog (the session's `announce`).
 - **A kind is keyed by `(APIVersion, Resource)`, and the singular is data.** Every map inside drops
   it; `KindKey` carries it, where a rename costs a duplicate wake and never a missed one.
-- **A body owns its own retry pacing** and returns only when its run context ends — the loop above
-  it re-enters it after a `RestartAll`, so a body that returns promptly is asking to be run again.
+- **A kind's sync owns its own retry pacing** and returns only when its run context ends — the
+  loop above it re-enters it after a `RestartAll`, so one that returns promptly is asking to be
+  run again.
+
+#### The sweep (`discovery.go`)
+
+**Discovery runs on `internal/probe`** — three probes over a per-cache subject (the cache id),
+`kubeconn`'s shape, since both are periodic pulls whose answers are values. `apiVersions` reads
+`/api`, `apiGroups` reads `/apis` (one preferred group-version per group), and `resources` fans out
+over both on a **data edge**, so a document that has not answered leaves the fan-out `Skip`ped
+rather than failing it. `DiscoveryState` is projected from the snapshot, so the seam stays this
+package's vocabulary rather than the engine's.
+
+- **A sweep is a probe whose collection cannot be watched.** Plain GETs, no resourceVersion, no
+  watch verb — so it is a cold list with no watch phase, re-listing on the engine's cadence.
+  `SyncKinds` reconciles by fingerprint and prune, as a relist does by mark and sweep.
+- **The answer goes to disk and nowhere else.** The sweep starts no worker and stops none — what is
+  mirrored is the records' to say. It publishes news; the mirror pass does the rest.
+- **A sweep skips the write when the stored fingerprint matches.** `SyncKinds` is a delete plus an
+  upsert per row against the single writer every kind's deltas queue behind. The fingerprint is read
+  off the table rather than remembered, so a restart and a cleared cache each write once. **The
+  prune flag is part of it**: a partial answer and a complete one over identical rows are different
+  writes.
+- **Four filters, none optional** — preferred version only, `list` and `watch` in the verbs, no `/`
+  in the plural, and not the `events.k8s.io` spelling of Event.
+- **A group that will not answer is `Partial`, and blocks the prune.** Its kinds' workers report
+  their own verdicts, so a broken aggregated API shows up twice and correctly. `Partial` is the one
+  verdict a `probe.Result` cannot carry (`Succeeded` takes no reason, and both neighbours misprice
+  the backoff ladder), so it rides two fields on the session.
+- **`IsCRD` comes from a CRD list, matched by (group, plural)** with no version. **Best-effort and
+  outside the verdict**: a refusal leaves every kind reading as built-in.
+- **Two loops wake a sweep the engine cannot schedule.** `wakeDiscoverySweepOnConnectionChange`
+  carries both directions: a suspended run schedules nothing, so nothing but a wake brings it back
+  once a connection vouches for the cache; and a settled run is *scheduled*, so a connection that
+  stopped dialing would read `Discovered` until the interval came round. Level-triggered against
+  the facts, since `WatchState` is latest-value and an edge between two frames is one a reader can
+  skip. **The invalid direction wakes only what the verdict does not already say** — that feed
+  publishes every pass, not only the ones that changed something, and re-waking on each frame is
+  the poll suspending exists to avoid. `connectionReason` is the single mapping, shared with the
+  run, so the loop and the sweep cannot disagree about what the pool said.
+  `wakeDiscoverySweepOnCatalogChange` is the other: subscribed on the CRD and APIService object
+  keys, which the cache already mirrors. **It wakes the whole sweep, not the fan-out alone** — a
+  CRD for a group the cluster did not serve adds that group to `/apis`, so the list the fan-out
+  reads has moved too.
+- **A sweep prunes against the last group list it read, and that is safe.** The rows on disk were
+  written from a list no newer than that one, so a stale list cannot orphan them; and a
+  group-version on it that stopped serving fails its own document read, which makes the sweep
+  partial and prunes nothing.
 
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache

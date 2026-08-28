@@ -40,6 +40,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 )
 
 // Params is what one cache syncs: over which context, and as which server. A context is
@@ -87,27 +88,7 @@ type kindID struct{ apiVersion, resource string }
 
 func idOf(k kubestore.Kind) kindID { return kindID{k.APIVersion, k.Resource} }
 
-// discoveryRun is what a sweep body is handed: the claim and the store its session holds,
-// the identity everything under it is gated on, and where an answer goes.
-//
-// Discovery gets the LEASE rather than a connection: it runs on the probe engine, where
-// blocking on AwaitConnFor would hold an engine worker, so it commits NoConnection and
-// suspends instead.
-type discoveryRun struct {
-	Params Params
-	Lease  kubeconn.Lease
-	Store  *kubestore.Store
-	// Commit records the sweep's standing answer, waking the cache's record when the
-	// reason moved.
-	Commit func(DiscoveryState)
-	// Announce wakes the cache with the reason unmoved — the one publication a verdict
-	// cannot carry. Two sweeps can both settle on Discovered with a CRD appearing between
-	// them, so a reason-only feed would leave the new kind unmirrored until something
-	// unrelated moved.
-	Announce func()
-}
-
-// kindRun is what a mirror body is handed. It carries a Connection rather than a lease:
+// kindRun is what one kind's sync is handed. It carries a Connection rather than a lease:
 // the session has already waited for one vouching for its ServerUID, which is the gate
 // nothing syncs past.
 type kindRun struct {
@@ -117,31 +98,30 @@ type kindRun struct {
 	Commit func(KindState)
 }
 
-// A body runs until its context ends, and owns its own retry pacing — the loop above it
-// re-enters it only after a restart, so a body that returns promptly is asking to be run
-// again.
-type (
-	discoveryBody func(ctx context.Context, r discoveryRun)
-	kindBody      func(ctx context.Context, r kindRun)
-)
+// syncKindFn holds one kind's collection in step with the cluster: cold-list it into the
+// store, then watch on from there, committing a KindState as it goes. It runs until its
+// context ends and owns its own retry pacing — the loop above it re-enters it only after a
+// restart, so returning promptly is asking to be run again.
+type syncKindFn func(ctx context.Context, r kindRun)
 
 // option is the test seam: the exported constructor takes production knobs only, and the
-// two bodies are substituted from white-box tests.
+// sync is substituted from white-box tests. The sweep has none — it runs on the probe
+// engine over whatever the connection reaches, so a test hands it an api server.
 type option func(*Service)
 
-func withDiscoveryBody(b discoveryBody) option { return func(s *Service) { s.discoveryBody = b } }
-
-func withKindBody(b kindBody) option { return func(s *Service) { s.kindBody = b } }
+func withSyncKindFn(f syncKindFn) option { return func(s *Service) { s.syncKindFn = f } }
 
 // Service is the seam. One session per tracked cache holds that cache's claims and the
 // workers under it; everything a caller reads is answered out of what those workers
 // committed.
 type Service struct {
-	conn   connService
-	stores storeManager
+	connSvc  connService
+	storeMgr storeManager
 
-	discoveryBody discoveryBody
-	kindBody      kindBody
+	// discoveryEngine runs the three probes of discovery.go, one subject per armed cache.
+	// The sweep alone rides it — a kind syncs on its own goroutine under a session.
+	discoveryEngine *probe.Engine
+	syncKindFn      syncKindFn
 
 	// One news feed per worker, because their consumers are two beehive triggers and a
 	// trigger wakes a record for every value its feed carries — one feed carrying both
@@ -174,22 +154,41 @@ type Service struct {
 
 // New returns a Service over the connection pool and the cache directory. Nothing is
 // armed until a caller tracks it.
-func New(conn connService, stores storeManager, opts ...option) *Service {
+func New(connSvc connService, storeMgr storeManager, opts ...option) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Service{
-		conn:         conn,
-		stores:       stores,
-		discoveryHub: conflate.New[int64, struct{}](),
-		kindHub:      conflate.New[KindKey, struct{}](),
-		ctx:          ctx,
-		cancel:       cancel,
-		sessions:     map[int64]*session{},
-		tracked:      map[int64]map[kindID]kubestore.Kind{},
+		connSvc:         connSvc,
+		storeMgr:        storeMgr,
+		discoveryEngine: probe.New(),
+		discoveryHub:    conflate.New[int64, struct{}](),
+		kindHub:         conflate.New[KindKey, struct{}](),
+		ctx:             ctx,
+		cancel:          cancel,
+		sessions:        map[int64]*session{},
+		tracked:         map[int64]map[kindID]kubestore.Kind{},
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
+	registerProbes(s.discoveryEngine, s)
+	s.discoveryEngine.OnPass(s.publishDiscovery)
 	return s
+}
+
+// publishDiscovery projects what a pass left and records it, which is what wakes the cache
+// when its verdict moved. Every pass, because the engine cannot tell a new answer from the
+// same one re-confirmed — commitDiscovery is where that is decided.
+func (s *Service) publishDiscovery(subject string, snap probe.Snapshot) {
+	cacheID, ok := cacheIDOf(subject)
+	if !ok {
+		return
+	}
+	sess := s.sessionOf(cacheID)
+	if sess == nil {
+		return
+	}
+	partial, message := sess.lastSweep()
+	s.commitDiscovery(sess, discoveryStateOf(snap, partial, message))
 }
 
 // TrackDiscovery arms cacheID's sweep, or updates it in place when the params move.
@@ -306,8 +305,8 @@ func (s *Service) GetKindState(cacheID int64, k kubestore.Kind) (KindState, bool
 	if !ok {
 		return KindState{}, false
 	}
-	st, ok := sess.kindStates[idOf(k)]
-	return st, ok
+	state, ok := sess.kindStates[idOf(k)]
+	return state, ok
 }
 
 // WatchDiscoveryNews carries the caches whose sweep has something new to say. Close it
@@ -318,15 +317,31 @@ func (s *Service) WatchDiscoveryNews() DiscoveryNews { return s.discoveryHub.Rec
 // done.
 func (s *Service) WatchKindNews() KindNews { return s.kindHub.Receiver() }
 
-// Start returns the func that cancels the workers and drains them. There is nothing to
-// launch here: a worker starts when a pass arms it, which may be before or after this.
-func (s *Service) Start(context.Context) (func(context.Context) error, error) {
+// Start runs the probe engine the sweeps ride, and returns the func that cancels the
+// workers and drains everything. The mirror workers are not launched here: one starts when
+// a pass arms it, which may be before or after this.
+func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
+	stopEngine := s.discoveryEngine.Start(ctx)
+
 	return func(ctx context.Context) error {
+		// armMu for the whole shutdown, like every other path that waits on workers: it is
+		// what makes closing the door and draining one step. An arm in flight has published
+		// its session but not yet launched its goroutines, so a drain that overlapped it
+		// would join a session that does not hold its workers yet — and release claims it
+		// has not taken.
+		s.armMu.Lock()
+		defer s.armMu.Unlock()
+
 		s.mu.Lock()
 		s.stopped = true
 		s.mu.Unlock()
 
 		s.cancel()
+		// The engine first, and not through s.cancel: a run in flight holds the store claim
+		// Close is about to give back, and the engine's loops are bounded by its own context.
+		if err := stopEngine(ctx); err != nil {
+			return err
+		}
 		return drain.WithContext(ctx, s.wait)
 	}, nil
 }
@@ -366,21 +381,24 @@ func (s *Service) Close() error {
 
 	s.cancel()
 	for _, sess := range sessions {
-		sess.stop()
-		sess.release()
+		sess.close()
 	}
 	s.discoveryHub.Close()
 	s.kindHub.Close()
-	return nil
+	return s.discoveryEngine.Close()
 }
 
 // arm builds the session for one cache and starts its sweep plus a worker per registered
 // kind. Called under armMu.
 //
-// A store that will not open arms nothing and is retried by the next pass, which calls
+// A session that will not start arms nothing and is retried by the next pass, which calls
 // this again: no session means no answer, and "no answer" is what a caller must not fold
 // into "serves no kinds" anyway. It is logged because nothing else would report it.
 func (s *Service) arm(cacheID int64, p Params) {
+	sess := newSession(s, cacheID, p)
+
+	// The kinds and the session under one hold, so the replay below covers exactly the
+	// registrations this session did not see arrive.
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
@@ -390,27 +408,23 @@ func (s *Service) arm(cacheID int64, p Params) {
 	for _, k := range s.tracked[cacheID] {
 		kinds = append(kinds, k)
 	}
-	s.mu.Unlock()
-
-	store, err := s.stores.OpenOrCreate(cacheID)
-	if err != nil {
-		slog.Error("kubesync: open cache store", "cacheID", cacheID, "err", err)
-		return
-	}
-	lease := s.conn.Acquire(p.ContextName)
-
-	sess := newSession(s, cacheID, p, lease, store)
-	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
-		store.Release()
-		lease.Release()
-		return
-	}
 	s.sessions[cacheID] = sess
 	s.mu.Unlock()
 
-	sess.startDiscovery()
+	// Published before it holds anything, so a start that fails takes the entry back out —
+	// a session in the map is what a run the engine schedules during start resolves through.
+	// The context is the one thing a failed start leaves behind: nothing else was claimed,
+	// but the child stays on s.ctx until it is cancelled, and this cache is armed again on
+	// every pass.
+	if err := sess.start(); err != nil {
+		slog.Error("kubesync: arm cache", "cacheID", cacheID, "err", err)
+		sess.cancel()
+		s.mu.Lock()
+		delete(s.sessions, cacheID)
+		s.mu.Unlock()
+		return
+	}
+
 	for _, k := range kinds {
 		sess.startKind(k)
 	}
@@ -426,8 +440,7 @@ func (s *Service) tearDown(cacheID int64) {
 	if !ok {
 		return
 	}
-	sess.stop()
-	sess.release()
+	sess.close()
 }
 
 // sessionOf is the armed session for a cache, or nil.
@@ -439,14 +452,14 @@ func (s *Service) sessionOf(cacheID int64) *session {
 
 // commitDiscovery records a sweep's answer and wakes the cache when its reason moved. A
 // run that outlived its session commits nothing: the claims it wrote through are gone.
-func (s *Service) commitDiscovery(sess *session, st DiscoveryState) {
+func (s *Service) commitDiscovery(sess *session, state DiscoveryState) {
 	s.mu.Lock()
 	if s.sessions[sess.cacheID] != sess {
 		s.mu.Unlock()
 		return
 	}
-	moved := !sess.hasDiscoveryState || sess.discoveryState.Reason != st.Reason
-	sess.discoveryState, sess.hasDiscoveryState = st, true
+	moved := !sess.hasDiscoveryState || sess.discoveryState.Reason != state.Reason
+	sess.discoveryState, sess.hasDiscoveryState = state, true
 	s.mu.Unlock()
 
 	if moved {
@@ -457,7 +470,7 @@ func (s *Service) commitDiscovery(sess *session, st DiscoveryState) {
 // commitKind records one mirror's answer and wakes its record when the reason moved. A
 // resume is not news: a watch re-established off its cookie changed nothing a reader can
 // act on.
-func (s *Service) commitKind(sess *session, k kubestore.Kind, st KindState) {
+func (s *Service) commitKind(sess *session, k kubestore.Kind, state KindState) {
 	id := idOf(k)
 	s.mu.Lock()
 	if s.sessions[sess.cacheID] != sess {
@@ -465,10 +478,10 @@ func (s *Service) commitKind(sess *session, k kubestore.Kind, st KindState) {
 		return
 	}
 	prev, had := sess.kindStates[id]
-	sess.kindStates[id] = st
+	sess.kindStates[id] = state
 	s.mu.Unlock()
 
-	if !had || prev.Reason != st.Reason {
+	if !had || prev.Reason != state.Reason {
 		_ = s.kindHub.Sender().Send(KindKey{CacheID: sess.cacheID, Kind: k}, struct{}{})
 	}
 }

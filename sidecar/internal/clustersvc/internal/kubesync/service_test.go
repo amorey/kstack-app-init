@@ -16,11 +16,14 @@ package kubesync
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -57,11 +60,11 @@ func TestTrackDiscoveryRebuildsWhenParamsMove(t *testing.T) {
 
 func TestKindTrackedAgainstAnUnarmedCacheIsHeldUntilItIsArmed(t *testing.T) {
 	entered := testutil.NewProbe[struct{}](4)
-	svc, pool := newTestService(t, withKindBody(func(ctx context.Context, _ kindRun) {
+	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
 		entered.Fire(struct{}{})
 		<-ctx.Done()
 	}))
-	pool.lease("prod").vouch("uid-1")
+	pool.lease("prod").vouch(t, "uid-1")
 
 	// The record's pass may land before the cache's, so the registration is held rather
 	// than refused.
@@ -75,11 +78,11 @@ func TestKindTrackedAgainstAnUnarmedCacheIsHeldUntilItIsArmed(t *testing.T) {
 
 func TestARegistrationOutlivesItsCacheBeingForgotten(t *testing.T) {
 	entered := testutil.NewProbe[struct{}](4)
-	svc, pool := newTestService(t, withKindBody(func(ctx context.Context, _ kindRun) {
+	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
 		entered.Fire(struct{}{})
 		<-ctx.Done()
 	}))
-	pool.lease("prod").vouch("uid-1")
+	pool.lease("prod").vouch(t, "uid-1")
 
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
@@ -93,7 +96,7 @@ func TestARegistrationOutlivesItsCacheBeingForgotten(t *testing.T) {
 
 func TestAKindWaitsForAConnectionVouchingForItsServerUID(t *testing.T) {
 	entered := testutil.NewProbe[struct{}](4)
-	svc, pool := newTestService(t, withKindBody(func(ctx context.Context, _ kindRun) {
+	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
 		entered.Fire(struct{}{})
 		<-ctx.Done()
 	}))
@@ -101,27 +104,27 @@ func TestAKindWaitsForAConnectionVouchingForItsServerUID(t *testing.T) {
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
 
-	pool.lease("prod").vouch("uid-other")
+	pool.lease("prod").vouch(t, "uid-other")
 	_, running := entered.TryAwait()
 	require.False(t, running, "a connection answering as another cluster arms nothing")
 
-	pool.lease("prod").vouch("uid-1")
+	pool.lease("prod").vouch(t, "uid-1")
 	entered.Await(t, "the worker starts once the connection vouches for its identity")
 }
 
 func TestForgetKindWaitsForItsWorker(t *testing.T) {
 	entered, returned := testutil.NewProbe[struct{}](4), testutil.NewProbe[struct{}](4)
-	svc, pool := newTestService(t, withKindBody(func(ctx context.Context, _ kindRun) {
+	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
 		entered.Fire(struct{}{})
 		<-ctx.Done()
 		returned.Fire(struct{}{})
 	}))
-	pool.lease("prod").vouch("uid-1")
+	pool.lease("prod").vouch(t, "uid-1")
 
 	kind := testKind("apps/v1", "Deployment", "deployments")
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, kind)
-	entered.Await(t, "the mirror runs")
+	entered.Await(t, "the sync runs")
 
 	svc.ForgetKind(1, kind)
 	_, done := returned.TryAwait()
@@ -130,29 +133,24 @@ func TestForgetKindWaitsForItsWorker(t *testing.T) {
 
 func TestForgetDiscoveryWaitsForEveryWorkerUnderIt(t *testing.T) {
 	entered, returned := testutil.NewProbe[struct{}](8), testutil.NewProbe[struct{}](8)
-	body := func(ctx context.Context) {
+	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
 		entered.Fire(struct{}{})
 		<-ctx.Done()
 		returned.Fire(struct{}{})
-	}
-	svc, pool := newTestService(t,
-		withDiscoveryBody(func(ctx context.Context, _ discoveryRun) { body(ctx) }),
-		withKindBody(func(ctx context.Context, _ kindRun) { body(ctx) }))
-	pool.lease("prod").vouch("uid-1")
+	}))
+	pool.lease("prod").vouch(t, "uid-1")
 
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
-	entered.Await(t, "the sweep runs")
-	entered.Await(t, "the mirror runs")
+	entered.Await(t, "the sync runs")
 
 	svc.ForgetDiscovery(1)
-	returned.Await(t, "the discovery body is drained")
 	returned.Await(t, "the kind body is drained")
 }
 
 func TestGetStateReportsNothingBeforeARunCommits(t *testing.T) {
 	svc, pool := newTestService(t)
-	pool.lease("prod").vouch("uid-1")
+	pool.lease("prod").vouch(t, "uid-1")
 	kind := testKind("apps/v1", "Deployment", "deployments")
 
 	_, ok := svc.GetDiscoveryState(1)
@@ -161,68 +159,32 @@ func TestGetStateReportsNothingBeforeARunCommits(t *testing.T) {
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, kind)
 
-	_, ok = svc.GetDiscoveryState(1)
-	assert.False(t, ok, "an armed cache whose sweep has committed nothing has no answer")
 	_, ok = svc.GetKindState(1, kind)
 	assert.False(t, ok, "a kind whose worker has committed nothing has no answer")
 }
 
-func TestACommittedStateIsReadableAndWakesItsRecord(t *testing.T) {
-	committed := testutil.NewProbe[func(DiscoveryState)](4)
-	svc, _ := newTestService(t, withDiscoveryBody(func(ctx context.Context, r discoveryRun) {
-		committed.Fire(r.Commit)
-		<-ctx.Done()
-	}))
+func TestDiscoveryNewsIsKeyedByCacheID(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serve("v1", listable("Pod", "pods", true))
 
+	svc, pool := newTestService(t)
+	pool.lease("prod").connect(cluster, "uid-1")
 	news := svc.WatchDiscoveryNews()
 	t.Cleanup(news.Close)
+	start(t, svc)
 
-	svc.TrackDiscovery(1, testParams)
-	commit := committed.Await(t, "the sweep body runs")
-
-	commit(DiscoveryState{Reason: ReasonDiscovered, Message: "14 group-versions"})
+	svc.TrackDiscovery(7, testParams)
 	ev := testutil.Recv(t, news.Chan(), "the cache is woken")
-	assert.Equal(t, int64(1), ev.Key, "news is keyed by cache id and carries nothing else")
-
-	got, ok := svc.GetDiscoveryState(1)
-	require.True(t, ok)
-	assert.Equal(t, ReasonDiscovered, got.Reason)
-	assert.Equal(t, "14 group-versions", got.Message)
-}
-
-func TestNewsFiresOnAReasonThatMovedAndOnACatalogThatCommitted(t *testing.T) {
-	runs := testutil.NewProbe[discoveryRun](4)
-	svc, _ := newTestService(t, withDiscoveryBody(func(ctx context.Context, r discoveryRun) {
-		runs.Fire(r)
-		<-ctx.Done()
-	}))
-
-	news := svc.WatchDiscoveryNews()
-	t.Cleanup(news.Close)
-
-	svc.TrackDiscovery(1, testParams)
-	r := runs.Await(t, "the sweep body runs")
-
-	r.Commit(DiscoveryState{Reason: ReasonDiscovered})
-	testutil.Recv(t, news.Chan(), "the first answer is news")
-
-	// A resume is not news: nothing a reader can act on moved.
-	r.Commit(DiscoveryState{Reason: ReasonDiscovered, Message: "re-read, unchanged"})
-	testutil.NoRecv(t, news.Chan(), quietWindow, "an unmoved reason wakes nobody")
-
-	// The one publication a reason cannot carry: two sweeps both settling on Discovered
-	// with a kind appearing between them.
-	r.Announce()
-	testutil.Recv(t, news.Chan(), "a catalog that committed is news")
+	assert.Equal(t, int64(7), ev.Key, "news is keyed by cache id and carries nothing else")
 }
 
 func TestKindNewsIsKeyedByCacheAndKind(t *testing.T) {
 	runs := testutil.NewProbe[kindRun](4)
-	svc, pool := newTestService(t, withKindBody(func(ctx context.Context, r kindRun) {
+	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, r kindRun) {
 		runs.Fire(r)
 		<-ctx.Done()
 	}))
-	pool.lease("prod").vouch("uid-1")
+	pool.lease("prod").vouch(t, "uid-1")
 
 	news := svc.WatchKindNews()
 	t.Cleanup(news.Close)
@@ -230,7 +192,7 @@ func TestKindNewsIsKeyedByCacheAndKind(t *testing.T) {
 	kind := testKind("apps/v1", "Deployment", "deployments")
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, kind)
-	r := runs.Await(t, "the mirror body runs")
+	r := runs.Await(t, "the sync runs")
 
 	r.Commit(KindState{Reason: ReasonWatching})
 	ev := testutil.Recv(t, news.Chan(), "the kind's record is woken")
@@ -243,16 +205,16 @@ func TestKindNewsIsKeyedByCacheAndKind(t *testing.T) {
 
 func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
 	runs := testutil.NewProbe[kindRun](4)
-	svc, pool := newTestService(t, withKindBody(func(ctx context.Context, r kindRun) {
+	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, r kindRun) {
 		runs.Fire(r)
 		<-ctx.Done()
 	}))
-	pool.lease("prod").vouch("uid-1")
+	pool.lease("prod").vouch(t, "uid-1")
 
 	kind := testKind("apps/v1", "Deployment", "deployments")
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, kind)
-	runs.Await(t, "the mirror runs").Commit(KindState{Reason: ReasonWatching})
+	runs.Await(t, "the sync runs").Commit(KindState{Reason: ReasonWatching})
 
 	// The plural is unchanged, so this is the same collection under a new Kind name. The
 	// worker that answered Watching is stopped, and the one replacing it may still be
@@ -268,53 +230,146 @@ func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
 	assert.Equal(t, ReasonSyncing, got.Reason)
 }
 
-func TestRestartAllReEntersEveryArmedBody(t *testing.T) {
+func TestRestartAllReEntersEveryArmedMirror(t *testing.T) {
 	entered := testutil.NewProbe[struct{}](8)
-	body := func(ctx context.Context) {
+	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
 		entered.Fire(struct{}{})
 		<-ctx.Done()
-	}
-	svc, pool := newTestService(t,
-		withDiscoveryBody(func(ctx context.Context, _ discoveryRun) { body(ctx) }),
-		withKindBody(func(ctx context.Context, _ kindRun) { body(ctx) }))
-	pool.lease("prod").vouch("uid-1")
+	}))
+	pool.lease("prod").vouch(t, "uid-1")
 
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
-	entered.Await(t, "the sweep runs")
-	entered.Await(t, "the mirror runs")
+	entered.Await(t, "the sync runs")
 
 	// A watch that died under a sleeping machine reports nothing, so a resume poke
-	// restarts the runs rather than waiting for one to notice.
+	// restarts the run rather than waiting for one to notice.
 	svc.RestartAll()
-	entered.Await(t, "the sweep runs again")
-	entered.Await(t, "the mirror runs again")
+	entered.Await(t, "the sync runs again")
 }
 
 func TestStopDrainsEveryWorker(t *testing.T) {
 	entered, returned := testutil.NewProbe[struct{}](8), testutil.NewProbe[struct{}](8)
-	body := func(ctx context.Context) {
+	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
 		entered.Fire(struct{}{})
 		<-ctx.Done()
 		returned.Fire(struct{}{})
-	}
-	svc, pool := newTestService(t,
-		withDiscoveryBody(func(ctx context.Context, _ discoveryRun) { body(ctx) }),
-		withKindBody(func(ctx context.Context, _ kindRun) { body(ctx) }))
-	pool.lease("prod").vouch("uid-1")
+	}))
+	pool.lease("prod").vouch(t, "uid-1")
 
 	stop, err := svc.Start(t.Context())
 	require.NoError(t, err)
 
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
-	entered.Await(t, "the sweep runs")
-	entered.Await(t, "the mirror runs")
+	entered.Await(t, "the sync runs")
 
 	require.NoError(t, stop(t.Context()))
-	returned.Await(t, "the sweep is drained")
-	returned.Await(t, "the mirror is drained")
+	returned.Await(t, "the sync is drained")
 
 	require.NoError(t, svc.Close())
 	assert.Equal(t, 0, pool.lease("prod").held(), "Close releases the claims")
+}
+
+func TestACacheWhoseStoreWillNotOpenArmsNothing(t *testing.T) {
+	pool := newFakePool()
+	stores := &refusingStores{}
+	svc := New(pool, stores, withSyncKindFn(func(ctx context.Context, _ kindRun) { <-ctx.Done() }))
+	t.Cleanup(func() { _ = svc.Close() })
+
+	svc.TrackDiscovery(1, testParams)
+
+	assert.Equal(t, 0, pool.lease("prod").held(), "the context is claimed only once the file is open")
+	_, ok := svc.GetDiscoveryState(1)
+	assert.False(t, ok, "a cache that did not arm has no answer")
+
+	svc.TrackDiscovery(1, testParams)
+	assert.Equal(t, 2, stores.attempts, "the next pass retries rather than reading the cache as armed")
+}
+
+// refusingStores is a store manager that will not open a file, which is what a cache
+// directory gone read-only looks like. Every call is from the test's own goroutine.
+type refusingStores struct{ attempts int }
+
+func (r *refusingStores) OpenOrCreate(int64) (*kubestore.Store, error) {
+	r.attempts++
+	return nil, errors.New("open cache store")
+}
+
+func TestForgettingACacheNobodyArmedIsANoOp(t *testing.T) {
+	svc, _ := newTestService(t)
+
+	svc.ForgetDiscovery(7)
+	svc.ForgetKind(7, testKind("apps/v1", "Deployment", "deployments"))
+}
+
+func TestAStoppedServiceArmsNothing(t *testing.T) {
+	svc, pool := newTestService(t)
+	require.NoError(t, svc.Close())
+
+	svc.TrackDiscovery(1, testParams)
+
+	assert.Equal(t, 0, pool.lease("prod").held(), "a stopped service takes no claim")
+	assert.Nil(t, svc.sessionOf(1), "and arms nothing")
+}
+
+func TestAKindStateIsAnsweredOnlyForAKindTheCacheTracks(t *testing.T) {
+	svc, _ := newTestService(t)
+	kind := testKind("apps/v1", "Deployment", "deployments")
+
+	_, ok := svc.GetKindState(1, kind)
+	assert.False(t, ok, "a cache nobody has armed has no answer")
+
+	svc.TrackDiscovery(1, testParams)
+	_, ok = svc.GetKindState(1, kind)
+	assert.False(t, ok, "nor does a kind the cache does not track")
+}
+
+func TestAPassPublishesNothingForASubjectThatIsNotACache(t *testing.T) {
+	svc, _ := newTestService(t)
+
+	// The engine names its own subjects, so both of these are reads the seam must survive
+	// rather than states it can reach: one not this package's, one whose cache is gone.
+	svc.publishDiscovery("not-a-cache", probe.Snapshot{})
+	svc.publishDiscovery(subjectOf(404), probe.Snapshot{})
+}
+
+func TestAStoppedWorkersAnswerIsDropped(t *testing.T) {
+	svc, _ := newTestService(t)
+	kind := testKind("apps/v1", "Deployment", "deployments")
+	svc.TrackDiscovery(1, testParams)
+	sess := svc.sessionOf(1)
+
+	// The session a worker committed against is gone, which is what a commit racing its own
+	// teardown looks like: the answer belongs to nobody and is dropped.
+	svc.ForgetDiscovery(1)
+	svc.commitDiscovery(sess, DiscoveryState{Reason: ReasonDiscovered})
+	svc.commitKind(sess, kind, KindState{Reason: ReasonWatching})
+
+	svc.TrackDiscovery(1, testParams)
+	_, ok := svc.GetDiscoveryState(1)
+	assert.False(t, ok, "the re-armed cache carries no answer from the session before it")
+	_, ok = svc.GetKindState(1, kind)
+	assert.False(t, ok, "nor one for its kinds")
+}
+
+func TestStoppingWithNoTimeLeftReportsTheEngineRefusing(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serve("v1", listable("Pod", "pods", true))
+	svc, pool := newTestService(t)
+	pool.lease("prod").connect(cluster, "uid-1")
+
+	stop, err := svc.Start(t.Context())
+	require.NoError(t, err)
+
+	release := cluster.hold("/api/v1")
+	defer release()
+	svc.TrackDiscovery(1, testParams)
+	cluster.awaitRead(t, "/api/v1")
+
+	// A sweep is parked mid-request, so the engine cannot drain inside a deadline that has
+	// already passed and says so rather than blocking the caller.
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.Error(t, stop(expired), "a stop with no time left reports the engine refusing")
 }

@@ -12,32 +12,51 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Shared fixtures: the pool and the store directory a Service is built over, and the
-// bodies a test substitutes for the sweep and the mirror.
+// Shared fixtures: the pool and the store directory a Service is built over, the api
+// server a sweep reads, and the waits a test settles on.
 package kubesync
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/amorey/gobus/watch"
+	gobuswatch "github.com/amorey/gobus/watch"
+	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
+
+// --- The pool ---
 
 // fakePool stands in for the connection pool: one lease per context, handed back to
 // every claim so a test can vouch for an identity before or after a session takes one.
 type fakePool struct {
 	mu     sync.Mutex
 	leases map[string]*fakeLease
-	hub    *watch.Hub[string, kubeconn.State]
+	hub    *gobuswatch.Hub[string, kubeconn.State]
 }
 
 func newFakePool() *fakePool {
-	return &fakePool{leases: map[string]*fakeLease{}, hub: watch.New[string, kubeconn.State]()}
+	return &fakePool{leases: map[string]*fakeLease{}, hub: gobuswatch.New[string, kubeconn.State]()}
 }
 
 func (p *fakePool) Acquire(contextName string) kubeconn.Lease {
@@ -55,7 +74,7 @@ func (p *fakePool) lease(contextName string) *fakeLease {
 	defer p.mu.Unlock()
 	l, ok := p.leases[contextName]
 	if !ok {
-		l = &fakeLease{contextName: contextName, hub: p.hub}
+		l = &fakeLease{contextName: contextName, hub: p.hub, dialed: testutil.NewProbe[string](64)}
 		p.leases[contextName] = l
 	}
 	return l
@@ -65,19 +84,50 @@ func (p *fakePool) lease(contextName string) *fakeLease {
 // same hub kubeconn does, so ReadyFor's attach-then-check ordering is exercised for real.
 type fakeLease struct {
 	contextName string
-	hub         *watch.Hub[string, kubeconn.State]
+	hub         *gobuswatch.Hub[string, kubeconn.State]
+	// dialed carries every ConnFor: the wake loop looking at a frame, and the runs it wakes.
+	dialed *testutil.Probe[string]
 
 	mu       sync.Mutex
 	claims   int
 	released int
 	uid      string
 	conn     *kubeconn.Connection
+	err      error
+	watches  int
 }
 
-// vouch makes this lease answer for serverUID, and wakes whoever is waiting on it.
-func (l *fakeLease) vouch(serverUID string) {
+// refuse makes this lease answer with err — the pool reporting something that is neither
+// "no connection yet" nor a mismatched identity.
+func (l *fakeLease) refuse(err error) {
 	l.mu.Lock()
-	l.uid, l.conn = serverUID, &kubeconn.Connection{}
+	l.err = err
+	l.mu.Unlock()
+	_ = l.hub.Sender().Send(l.contextName, kubeconn.State{})
+}
+
+// vouch makes this lease answer for serverUID over an api server serving nothing, for a
+// test about arming rather than about what a sweep reads. A real one, because a sweep dials
+// whatever the lease hands it.
+func (l *fakeLease) vouch(t *testing.T, serverUID string) { l.connect(newFakeCluster(t), serverUID) }
+
+// connect makes this lease answer for serverUID over a connection to cluster.
+func (l *fakeLease) connect(cluster *fakeCluster, serverUID string) {
+	l.hand(cluster.connection(), serverUID)
+}
+
+// hand publishes a connection and wakes whoever is waiting on this claim.
+func (l *fakeLease) hand(conn *kubeconn.Connection, serverUID string) {
+	l.mu.Lock()
+	l.uid, l.conn = serverUID, conn
+	l.mu.Unlock()
+	_ = l.hub.Sender().Send(l.contextName, kubeconn.State{})
+}
+
+// drop takes the connection away, which is what a cluster going unreachable looks like.
+func (l *fakeLease) drop() {
+	l.mu.Lock()
+	l.conn, l.uid = nil, ""
 	l.mu.Unlock()
 	_ = l.hub.Sender().Send(l.contextName, kubeconn.State{})
 }
@@ -91,24 +141,45 @@ func (l *fakeLease) held() int {
 func (l *fakeLease) Conn(context.Context) (*kubeconn.Connection, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.err != nil {
+		return nil, l.err
+	}
 	if l.conn == nil {
 		return nil, kubeconn.ErrNoConnection
 	}
 	return l.conn, nil
 }
 
-func (l *fakeLease) ConnFor(_ context.Context, serverUID string) (*kubeconn.Connection, error) {
+func (l *fakeLease) ConnFor(ctx context.Context, serverUID string) (*kubeconn.Connection, error) {
+	l.dialed.Fire(serverUID)
+	conn, err := l.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.conn == nil || l.uid != serverUID {
+	if l.uid != serverUID {
 		return nil, kubeconn.ErrIdentityMismatch
 	}
-	return l.conn, nil
+	return conn, nil
 }
 
 func (l *fakeLease) State() kubeconn.State { return kubeconn.State{} }
 
-func (l *fakeLease) WatchState() kubeconn.StateSubscription { return l.hub.Watch(l.contextName) }
+func (l *fakeLease) WatchState() kubeconn.StateSubscription {
+	l.mu.Lock()
+	l.watches++
+	l.mu.Unlock()
+	return l.hub.Watch(l.contextName)
+}
+
+// watchers counts who is listening for a connection: a session's own wake loop, plus one
+// per worker parked in AwaitConnFor — which is how a test knows a worker got that far.
+func (l *fakeLease) watchers() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.watches
+}
 
 func (l *fakeLease) Departed() bool { return false }
 
@@ -118,22 +189,380 @@ func (l *fakeLease) Release() {
 	l.released++
 }
 
-// newTestService builds a Service over a fresh pool and a store directory under t, with
-// bodies that park until their run ends — the shape a real body has, so nothing here
-// re-enters and the tests below drive arming rather than sync.
+// --- The cluster ---
+
+// fakeCluster is an api server enough of one for a sweep: the two discovery documents, one
+// per group-version, and the CRD collection behind IsCRD.
+type fakeCluster struct {
+	baseURL *url.URL
+	client  *http.Client
+	dyn     *dynamicfake.FakeDynamicClient
+
+	// transport is what every discovery read goes through: it reports the reads, and parks
+	// the one path a test holds. reads and cancelled are its two probes, kept here because
+	// that is where a test reaches for them.
+	transport *holdTransport
+	reads     *testutil.Probe[string]
+	cancelled *testutil.Probe[string]
+
+	mu sync.Mutex
+	// groups is the non-core groups, in the order /apis serves them; resources is one
+	// document per group-version; broken is the paths answering 500; raw is the paths
+	// answering a body of the test's own choosing.
+	groups    []metav1.APIGroup
+	resources map[string]*metav1.APIResourceList
+	broken    map[string]bool
+	raw       map[string]string
+}
+
+func newFakeCluster(t *testing.T) *fakeCluster {
+	t.Helper()
+	c := &fakeCluster{
+		reads:     testutil.NewProbe[string](32),
+		cancelled: testutil.NewProbe[string](32),
+		resources: map[string]*metav1.APIResourceList{},
+		broken:    map[string]bool{},
+		raw:       map[string]string{},
+		dyn:       newFakeDynamic(),
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(c.serveHTTP))
+	t.Cleanup(srv.Close)
+
+	base, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	c.transport = &holdTransport{
+		base: srv.Client().Transport, reads: c.reads, cancelled: c.cancelled,
+	}
+	c.baseURL, c.client = base, &http.Client{Transport: c.transport}
+	return c
+}
+
+// connection is what a lease hands a sweep: the raw client the discovery documents are read
+// over, and the dynamic client the CRD list goes through.
+func (c *fakeCluster) connection() *kubeconn.Connection {
+	return &kubeconn.Connection{BaseURL: c.baseURL, HTTPClient: c.client, Dynamic: c.dyn}
+}
+
+// serve declares one group-version's resources, registering the group with /apis when it is
+// not the core one.
+func (c *fakeCluster) serve(groupVersion string, rs ...metav1.APIResource) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.resources[groupVersion] = &metav1.APIResourceList{GroupVersion: groupVersion, APIResources: rs}
+	if group, _, found := strings.Cut(groupVersion, "/"); found {
+		c.ensureGroupLocked(group, groupVersion)
+	}
+}
+
+// group declares a group serving several versions, the first of which is preferred. Call it
+// before serving them, since serve only fills in a version the group does not name.
+func (c *fakeCluster) group(name string, groupVersions ...string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.registerLocked(name, groupVersions...)
+}
+
+// ensureGroupLocked names a group-version in /apis without disturbing which one the group
+// prefers.
+func (c *fakeCluster) ensureGroupLocked(name, groupVersion string) {
+	i := slices.IndexFunc(c.groups, func(g metav1.APIGroup) bool { return g.Name == name })
+	if i < 0 {
+		c.registerLocked(name, groupVersion)
+		return
+	}
+	if slices.ContainsFunc(c.groups[i].Versions, func(v metav1.GroupVersionForDiscovery) bool {
+		return v.GroupVersion == groupVersion
+	}) {
+		return
+	}
+	_, version, _ := strings.Cut(groupVersion, "/")
+	c.groups[i].Versions = append(c.groups[i].Versions,
+		metav1.GroupVersionForDiscovery{GroupVersion: groupVersion, Version: version})
+}
+
+func (c *fakeCluster) registerLocked(name string, groupVersions ...string) {
+	versions := make([]metav1.GroupVersionForDiscovery, 0, len(groupVersions))
+	for _, gv := range groupVersions {
+		_, version, _ := strings.Cut(gv, "/")
+		versions = append(versions, metav1.GroupVersionForDiscovery{GroupVersion: gv, Version: version})
+	}
+	group := metav1.APIGroup{Name: name, Versions: versions, PreferredVersion: versions[0]}
+	if i := slices.IndexFunc(c.groups, func(g metav1.APIGroup) bool { return g.Name == name }); i >= 0 {
+		c.groups[i] = group
+		return
+	}
+	c.groups = append(c.groups, group)
+}
+
+// serveRaw makes one path answer body verbatim, for an api server whose answer is not the
+// document the sweep is parsing.
+func (c *fakeCluster) serveRaw(path, body string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.raw[path] = body
+}
+
+// unpreferGroup blanks a group's preferred version, which is what an api server that names
+// none looks like.
+func (c *fakeCluster) unpreferGroup(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if i := slices.IndexFunc(c.groups, func(g metav1.APIGroup) bool { return g.Name == name }); i >= 0 {
+		c.groups[i].PreferredVersion = metav1.GroupVersionForDiscovery{}
+	}
+}
+
+// breakPath makes one path answer 500 — an aggregated API that is down.
+func (c *fakeCluster) breakPath(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.broken[path] = true
+}
+
+// hold parks every request for path until the returned func lets it go — how a test holds a
+// sweep in flight.
+func (c *fakeCluster) hold(path string) func() { return c.transport.hold(path) }
+
+// holdTransport parks a chosen path, and reports what it read and what was cancelled under
+// it. **In the caller's own goroutine**, not the handler's: a server notices a client giving
+// up whenever its connection closes, which is after the run it belongs to has already
+// unwound — so a tripwire there cannot say whether a teardown waited.
+type holdTransport struct {
+	base http.RoundTripper
+	// reads carries every path the sweep asked for, fired before the park so a test can wait
+	// for the request it means to hold. cancelled carries the held paths the caller gave up
+	// on.
+	reads     *testutil.Probe[string]
+	cancelled *testutil.Probe[string]
+
+	mu       sync.Mutex
+	path     string
+	released chan struct{}
+}
+
+func (t *holdTransport) hold(path string) func() {
+	released := make(chan struct{})
+	t.mu.Lock()
+	t.path, t.released = path, released
+	t.mu.Unlock()
+	return sync.OnceFunc(func() { close(released) })
+}
+
+func (t *holdTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.reads.Fire(req.URL.Path)
+
+	t.mu.Lock()
+	held, released := t.path == req.URL.Path, t.released
+	t.mu.Unlock()
+	if held {
+		select {
+		case <-released:
+		case <-req.Context().Done():
+			t.cancelled.Fire(req.URL.Path)
+			// Latency on purpose: the run stays in flight until the test lets go, so
+			// whether a teardown WAITED for it has a determinate answer instead of racing
+			// how fast a cancelled request unwinds.
+			<-released
+			return nil, req.Context().Err()
+		}
+	}
+	return t.base.RoundTrip(req)
+}
+
+// crd declares a CustomResourceDefinition serving one group's plural.
+func (c *fakeCluster) crd(group, plural string) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata":   map[string]any{"name": plural + "." + group},
+		"spec": map[string]any{
+			"group": group,
+			"names": map[string]any{"plural": plural},
+		},
+	}}
+	_, err := c.dyn.Resource(crdGVR).Create(context.Background(), obj, metav1.CreateOptions{})
+	if err != nil {
+		panic(err)
+	}
+}
+
+// forbidCRDs refuses the CRD list, the read RBAC commonly denies.
+func (c *fakeCluster) forbidCRDs() {
+	c.dyn.PrependReactor("list", "customresourcedefinitions",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(crdGVR.GroupResource(), "", nil)
+		})
+}
+
+// awaitRead blocks until the sweep reads path, so a test asserting on a second sweep knows
+// one happened.
+func (c *fakeCluster) awaitRead(t *testing.T, path string) {
+	t.Helper()
+	for {
+		if got := c.reads.Await(t, "a sweep reading "+path); got == path {
+			return
+		}
+	}
+}
+
+// noRead is the negative assertion: nothing swept in the window. It has no event to wait
+// for, so it needs a window of its own rather than the failsafe.
+func (c *fakeCluster) noRead(t *testing.T, what string) {
+	t.Helper()
+	testutil.NoRecv(t, c.reads.Chan(), quietWindow, what)
+}
+
+func (c *fakeCluster) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.broken[r.URL.Path] {
+		http.Error(w, "the aggregated api server is down", http.StatusInternalServerError)
+		return
+	}
+	if body, ok := c.raw[r.URL.Path]; ok {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+		return
+	}
+
+	switch {
+	case r.URL.Path == "/api":
+		writeJSON(w, metav1.APIVersions{Versions: []string{"v1"}})
+	case r.URL.Path == "/apis":
+		writeJSON(w, metav1.APIGroupList{Groups: c.groups})
+	default:
+		gv := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/apis/"), "/api/")
+		doc, ok := c.resources[gv]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, doc)
+	}
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// newFakeDynamic is the client the CRD list goes through. The list kind is supplied
+// explicitly because the scheme carries no apiextensions types.
+func newFakeDynamic() *dynamicfake.FakeDynamicClient {
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{crdGVR: "CustomResourceDefinitionList"})
+}
+
+// listable is a resource a worker can mirror, which is what most of a catalog looks like.
+func listable(kind, plural string, namespaced bool) metav1.APIResource {
+	return metav1.APIResource{
+		Kind: kind, Name: plural, Namespaced: namespaced,
+		Verbs: metav1.Verbs{"get", "list", "watch"},
+	}
+}
+
+// --- The service ---
+
+// newTestService builds a Service over a fresh pool and a store directory under t, with a
+// kind sync that parks until its run ends — the shape a real one has, so nothing re-enters
+// and a test drives arming rather than sync. Nothing sweeps until start.
 func newTestService(t *testing.T, opts ...option) (*Service, *fakePool) {
 	t.Helper()
 	pool := newFakePool()
 	mgr := kubestore.NewManager(t.TempDir())
 	t.Cleanup(func() { _ = mgr.Close() })
 
-	base := []option{
-		withDiscoveryBody(func(ctx context.Context, _ discoveryRun) { <-ctx.Done() }),
-		withKindBody(func(ctx context.Context, _ kindRun) { <-ctx.Done() }),
-	}
+	base := []option{withSyncKindFn(func(ctx context.Context, _ kindRun) { <-ctx.Done() })}
 	svc := New(pool, mgr, append(base, opts...)...)
 	t.Cleanup(func() { _ = svc.Close() })
 	return svc, pool
+}
+
+// start runs the service and stops it with the test. Registered after newTestService's
+// Close, so the cleanups unwind in the order the lifecycle requires.
+func start(t *testing.T, svc *Service) {
+	t.Helper()
+	stop, err := svc.Start(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = stop(context.Background()) })
+}
+
+// awaitDiscovered settles on a sweep that answered; awaitReason on whichever verdict a test
+// is waiting for. News is not a status, so both answer it the way a consumer does: re-read.
+//
+// Each subscribes for itself and gives the subscription back, so a test asserting on news
+// opens its own AFTER settling and never has to tell what the settling consumed from what
+// its own sweep published.
+func awaitDiscovered(t *testing.T, svc *Service, cacheID int64) {
+	t.Helper()
+	awaitReason(t, svc, cacheID, ReasonDiscovered)
+}
+
+func awaitReason(t *testing.T, svc *Service, cacheID int64, reason string) {
+	t.Helper()
+	news := svc.WatchDiscoveryNews()
+	defer news.Close()
+	for {
+		if state, ok := svc.GetDiscoveryState(cacheID); ok && state.Reason == reason {
+			return
+		}
+		testutil.Recv(t, news.Chan(), "a sweep settling on "+reason)
+	}
+}
+
+// catalogOf reads what the sweep wrote, through the door every reader uses. The manager is
+// reached off the service because a test owns both ends of this seam.
+func catalogOf(t *testing.T, svc *Service, cacheID int64) []kubestore.KindRow {
+	t.Helper()
+	store, ok, err := svc.storeMgr.(*kubestore.Manager).OpenExisting(cacheID)
+	require.NoError(t, err)
+	if !ok {
+		return nil
+	}
+	defer store.Release()
+
+	rows, err := store.Kinds(t.Context())
+	require.NoError(t, err)
+	return rows
+}
+
+// awaitSweepSettled waits until no run is out for this cache, which is the point a test can
+// count what happens next: a wake starts one run per probe, and a run that is still unwinding
+// dials again.
+func awaitSweepSettled(t *testing.T, svc *Service, cacheID int64) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		snap, ok := svc.discoveryEngine.Read(subjectOf(cacheID))
+		if !ok {
+			return false
+		}
+		for _, name := range discoveryProbes {
+			if snap.Attempts(name).InFlight() {
+				return false
+			}
+		}
+		return true
+	}, testutil.Timeout, time.Millisecond, "every run to finish")
+}
+
+// writeRow puts one object of a kind into the cache, which is how a test rings the store's
+// change bus — the same ping a mirror's own write leaves behind.
+func writeRow(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind) {
+	t.Helper()
+	store, ok, err := svc.storeMgr.(*kubestore.Manager).OpenExisting(cacheID)
+	require.NoError(t, err)
+	require.True(t, ok, "the cache is open")
+	defer store.Release()
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": k.APIVersion,
+		"kind":       k.Kind,
+		"metadata": map[string]any{
+			"name": "one", "uid": "uid-one", "resourceVersion": "1",
+		},
+	}}
+	require.NoError(t, store.ApplyChange(t.Context(), k, watch.Added, obj))
 }
 
 // quietWindow bounds a negative assertion — "no news arrived" — which has no event to
