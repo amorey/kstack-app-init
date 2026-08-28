@@ -129,7 +129,7 @@ const (
 //
 // **Why it is suspended is LastAttempt.Reason**, which needs no field of its own because a probe
 // suspends over what its last attempt found.
-type Observation[T any] = supervisor.Observation[T]
+type Observation[T any] = supervisor.JobObservation[T]
 
 // ComponentStatus is what /readyz named when it answered. Empty on a server that is ready.
 type ComponentStatus struct {

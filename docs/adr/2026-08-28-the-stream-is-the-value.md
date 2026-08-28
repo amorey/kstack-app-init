@@ -2,7 +2,7 @@
 title: A supervised stream is the reconciler's value, not its run
 date: 2026-08-28
 scope: sidecar
-status: Accepted
+status: Superseded by [jobs and workers](2026-08-28-jobs-and-workers.md)
 ---
 
 # A supervised stream is the reconciler's value, not its run

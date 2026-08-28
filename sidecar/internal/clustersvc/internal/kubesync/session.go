@@ -13,17 +13,16 @@
 // limitations under the License.
 
 // One armed cache: its connection claim, its store claim, the identity gate, and the set
-// of runs and streams under it.
+// of runs under it.
 package kubesync
 
 import (
 	"context"
 	"sync"
-	"sync/atomic"
+	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
 // session is one tracked cache. Its two claims are the session's rather than each run's: a
@@ -44,8 +43,8 @@ type session struct {
 	cancel context.CancelFunc
 
 	// wakeLoops holds the session's two wake loops, which carry wakes rather than running a
-	// body. runs holds everything that can still write through the claims: the runs in
-	// flight, and the streams they started, which outlive them.
+	// body. runs holds everything that can still write through the claims — the sweep's
+	// passes and each kind worker's whole life.
 	wakeLoops sync.WaitGroup
 	runs      sync.WaitGroup
 
@@ -55,14 +54,17 @@ type session struct {
 	//
 	// stopping closes runs to new registrations, so nothing joins the group after the wait
 	// on it has begun.
-	stopping bool
-	// kindRuns holds the kind run in flight for each kind, and only while one is out. It is
-	// what ForgetKind and a rename cancel: Remove reaches the schedule and the committed
-	// stream, never a run already dispatched.
-	kindRuns          map[kindID]*kindRun
+	stopping          bool
 	discoveryState    DiscoveryState
 	hasDiscoveryState bool
-	kindStates        map[kindID]KindState
+	// kindStamps is the half of a kind's answer the supervisor does not hold: the two liveness
+	// stamps, which move on every frame. The verdict is the worker's committed value, and
+	// GetKindState joins the two.
+	kindStamps map[kindID]kindStamps
+	// published is the last reason each kind's record was told about. OnPass fires on every
+	// pass, schedule-only ones included, so without a baseline here every pass would wake
+	// every record.
+	published map[kindID]Reason
 	// relistNeeded holds the kinds whose cookie names a position the server has dropped. It
 	// outlives the run that learned it: the 410 arrives on a run that establishes nothing, and
 	// an intent that did not survive a later failure would send the next start back to the
@@ -84,8 +86,8 @@ func newSession(s *Service, cacheID int64, p Params) *session {
 		params:       p,
 		ctx:          ctx,
 		cancel:       cancel,
-		kindRuns:     map[kindID]*kindRun{},
-		kindStates:   map[kindID]KindState{},
+		kindStamps:   map[kindID]kindStamps{},
+		published:    map[kindID]Reason{},
 		relistNeeded: map[kindID]bool{},
 	}
 }
@@ -166,7 +168,9 @@ func (sess *session) wakeOnConnectionChange(ctx context.Context, connStateSub ku
 }
 
 // wakeAll brings back everything under this cache: the sweep, and every kind, each of which
-// suspends at the same gate for the same reason.
+// suspends at the same gate for the same reason. A Wake never tears a live worker down, which is
+// what makes calling this on every state frame cheap: parked kinds start, streaming ones are
+// left alone.
 func (sess *session) wakeAll() {
 	sess.s.discoverySupervisor.Wake(sess.discoverySubject(), discoveryProbes...)
 	for _, k := range sess.trackedKinds() {
@@ -211,23 +215,26 @@ func (sess *session) wakeDiscoverySweepOnCatalogChange(ctx context.Context, cata
 	}
 }
 
-// sweepParked reports a sweep waiting on a wake: a suspended run schedules nothing, so its
-// next attempt is zero.
+// sweepParked reports a sweep waiting on a wake at the connection gate.
+//
+// **A suspension, not merely an empty schedule.** The fan-out skips while neither document has
+// answered, which schedules nothing either — but it is waiting on its data edge, and reading that
+// as parked would wake the whole sweep on every connection state frame, re-dispatching the
+// failing document probes ahead of the ladder they should be climbing.
 func (s *Service) sweepParked(subject string) bool {
 	snap, ok := s.discoverySupervisor.Read(subject)
 	if !ok {
 		return false
 	}
 	for _, name := range discoveryProbes {
-		if !snap.Attempts(name).Scheduled() {
+		if snap.Attempts(name).Suspended() {
 			return true
 		}
 	}
 	return false
 }
 
-// parked reports anything under this cache waiting on a wake. A suspended run schedules nothing,
-// so its next attempt is zero.
+// parked reports anything under this cache suspended at the connection gate.
 //
 // **Kinds are asked too, not just the sweep.** They suspend at the same gate and a connection
 // that came back is the only thing that revives them, so a guard that read the sweep alone would
@@ -238,7 +245,7 @@ func (sess *session) parked() bool {
 	}
 	for _, k := range sess.trackedKinds() {
 		snap, ok := sess.s.kindSupervisor.Read(kindSubject(sess.cacheID, k))
-		if ok && !snap.Attempts(nameKindSync).Scheduled() {
+		if ok && snap.Attempts(nameKindSync).Suspended() {
 			return true
 		}
 	}
@@ -279,23 +286,48 @@ func (sess *session) trackedKinds() []kubestore.Kind {
 	return kinds
 }
 
-// kindState is what this kind last committed, empty until it has.
-func (sess *session) kindState(id kindID) (KindState, bool) {
-	sess.s.mu.Lock()
-	defer sess.s.mu.Unlock()
-	state, ok := sess.kindStates[id]
-	return state, ok
+// kindStamps is what moves on every frame, and so what stays out of the supervisor: a worker
+// commits its verdict, which is what a reader reacts to, and stamps these beside it.
+type kindStamps struct {
+	// LastUpdateAt is when data last arrived; LastLiveAt the last proof the stream is live,
+	// which is the later of the two and the only one that distinguishes idle from wedged.
+	LastUpdateAt time.Time
+	LastLiveAt   time.Time
 }
 
-// dropKindState forgets what a kind committed. **Called after the join, which is what makes it
-// final** — not the tracked guard, which a rename does not provide: the kind stays tracked under
-// its new singular, so commitKind refuses nothing the old generation reports on its way down.
-// Dropped before that report, the entry comes back, and a withdrawn stream's Watching is served
-// for a kind that has not listed a row.
-func (sess *session) dropKindState(id kindID) {
+// stampUpdate records data arriving. **It moves both stamps**, because a delta is proof the
+// stream is current as well as data — so the delta path, which is every object a busy cluster
+// serves, takes this lock once rather than twice. The lock is the Service's, shared with every
+// other cache and every reader.
+func (sess *session) stampUpdate(id kindID) {
+	now := time.Now()
+
 	sess.s.mu.Lock()
 	defer sess.s.mu.Unlock()
-	delete(sess.kindStates, id)
+	sess.kindStamps[id] = kindStamps{LastUpdateAt: now, LastLiveAt: now}
+}
+
+// stampLive records proof the stream is current with no data behind it — a bookmark, which
+// exists to make an idle watch prove itself.
+func (sess *session) stampLive(id kindID) {
+	now := time.Now()
+
+	sess.s.mu.Lock()
+	defer sess.s.mu.Unlock()
+	st := sess.kindStamps[id]
+	st.LastLiveAt = now
+	sess.kindStamps[id] = st
+}
+
+// dropKind forgets everything the session holds for a kind. **Called after the worker has been
+// removed, which joins it** — not behind the tracked guard, which a rename does not provide: the
+// kind stays tracked under its new singular, so nothing refuses what the old generation stamps
+// on its way down.
+func (sess *session) dropKind(id kindID) {
+	sess.s.mu.Lock()
+	defer sess.s.mu.Unlock()
+	delete(sess.kindStamps, id)
+	delete(sess.published, id)
 	delete(sess.relistNeeded, id)
 }
 
@@ -321,45 +353,19 @@ func (sess *session) clearRelist(id kindID) {
 	delete(sess.relistNeeded, id)
 }
 
-// restart re-enters every kind off its cookie and re-runs the sweep. The sweep is a wake
-// rather than a cancel: its runs are the supervisor's, and a wake is redelivered to one already
-// in flight. A kind is a cancel of its stream — the exit is the wake, and a clean one carries
-// no error, so the run it brings round re-establishes at once and holds its reason.
+// restart re-enters every kind off its cookie and re-runs the sweep. The sweep is a Wake — a run
+// in flight has nothing stale in it, and a wake is redelivered to one that is out. A kind is a
+// Restart: whatever it is streaming, it is streaming over a connection a sleeping machine may
+// already have killed, and a stop records nothing, so the reopen costs no rung and holds its
+// reason.
+//
+// Neither waits. Three hundred cancels are one poke; three hundred joins of unwinding cold lists
+// on the poke consumer's own goroutine are not.
 func (sess *session) restart() {
 	sess.s.discoverySupervisor.Wake(sess.discoverySubject(), discoveryProbes...)
 	for _, k := range sess.trackedKinds() {
-		if stream := sess.committedStream(k); stream != nil {
-			stream.cancel()
-		}
-		// A stream a run has committed but the supervisor has not applied yet is in no
-		// snapshot, and a poke that missed it would leave that kind on the stream a sleeping
-		// machine may already have killed.
-		if stream := sess.pendingStream(idOf(k)); stream != nil {
-			stream.cancel()
-		}
+		sess.s.kindSupervisor.Restart(kindSubject(sess.cacheID, k), nameKindSync)
 	}
-}
-
-// committedStream is the stream the kind supervisor holds for one kind, or nil.
-func (sess *session) committedStream(k kubestore.Kind) *kindStream {
-	snap, ok := sess.s.kindSupervisor.Read(kindSubject(sess.cacheID, k))
-	if !ok {
-		return nil
-	}
-	// A kind armed but not yet established holds no stream, and its zero Observation carries
-	// a nil handle either way.
-	return supervisor.Get[*kindStream](snap, nameKindSync).Value
-}
-
-// pendingStream is the stream the run in flight for one kind has started, or nil.
-func (sess *session) pendingStream(id kindID) *kindStream {
-	sess.s.mu.Lock()
-	defer sess.s.mu.Unlock()
-	run := sess.kindRuns[id]
-	if run == nil {
-		return nil
-	}
-	return run.stream.Load()
 }
 
 // close ends every kind and the sweep, waits for them, and gives the two claims back — one
@@ -371,8 +377,8 @@ func (sess *session) pendingStream(id kindID) *kindStream {
 // below are what the release rests on.
 func (sess *session) close() {
 	sess.s.discoverySupervisor.Remove(sess.discoverySubject())
-	// Each kind's Remove hands its stream back — cancel and join — so the goroutines are down
-	// before the cancel below reaches the runs that started them.
+	// Each kind's Remove cancels its worker and waits for it, so every stream is down before
+	// the cancel below reaches the sweep.
 	for _, k := range sess.trackedKinds() {
 		sess.s.kindSupervisor.Remove(kindSubject(sess.cacheID, k))
 	}
@@ -383,8 +389,8 @@ func (sess *session) close() {
 	sess.lease.Release()
 }
 
-// wait joins the wake loops, every run in flight, and every stream a run started. It closes the
-// session to new runs first, so nothing registers after the join has begun.
+// wait joins the wake loops and every run in flight. It closes the session to new runs first, so
+// nothing registers after the join has begun.
 func (sess *session) wait() {
 	sess.s.mu.Lock()
 	sess.stopping = true
@@ -414,84 +420,23 @@ func (s *Service) enterRunLocked(cacheID int64) (*session, bool) {
 
 func (sess *session) leaveRun() { sess.runs.Done() }
 
-// kindRun is one kind reconciler run in flight: what cancels it, what says it is over, and the
-// stream it started if it got that far.
-type kindRun struct {
-	id     kindID
-	cancel context.CancelFunc
-	done   chan struct{}
-	// stream is what this run committed, set before the commit. The supervisor hands a refused
-	// commit back only after the body returns, so a join that waited on the run alone could
-	// return while the goroutine it started was still applying deltas.
-	stream atomic.Pointer[kindStream]
-}
-
-// join waits for a cancelled run and stops whatever stream it started. A nil run — nothing
-// was in flight — is nothing to wait for.
-func (run *kindRun) join() {
-	if run == nil {
-		return
-	}
-	<-run.done
-	if stream := run.stream.Load(); stream != nil {
-		stream.stop()
-	}
-}
-
-// enterKindRun admits one kind's run. **One critical section, and that is the point**: it
-// checks the cache, reads the kind, and registers the run's cancel together. Split apart, a
-// ForgetKind landing between the read and the registration would find no run to cancel, and
-// the run would list rows for a kind nobody tracks — the relist landing behind a clear that
-// the seam orders ForgetKind before ClearKind to rule out.
+// enterKindRun admits one kind's worker: it checks the cache and reads the kind under one lock,
+// and counts the run against the session so a teardown waits for it.
 //
 // The whole kubestore.Kind comes back, singular included: the subject names a kind by the pair
 // the server guarantees unique, and the rows are keyed by a name no body can learn from a
 // collection that lists empty.
-func (s *Service) enterKindRun(cacheID int64, id kindID, cancel context.CancelFunc) (*session, kubestore.Kind, *kindRun, bool) {
+func (s *Service) enterKindRun(cacheID int64, id kindID) (*session, kubestore.Kind, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	k, ok := s.tracked[cacheID][id]
 	if !ok {
-		return nil, kubestore.Kind{}, nil, false
+		return nil, kubestore.Kind{}, false
 	}
 	sess, ok := s.enterRunLocked(cacheID)
 	if !ok {
-		return nil, kubestore.Kind{}, nil, false
+		return nil, kubestore.Kind{}, false
 	}
-	run := &kindRun{id: id, cancel: cancel, done: make(chan struct{})}
-	sess.kindRuns[id] = run
-	return sess, k, run, true
-}
-
-// leaveKindRun ends one kind run: whoever cancelled it is let go, and the registration goes
-// unless a stream is standing behind it.
-//
-// **A run that started a stream keeps its entry past its own return.** The supervisor applies
-// what a body committed only after the body returns, so between the two this handle is the only
-// thing that can reach that stream — Remove finds no standing value to hand back yet. The next
-// run for this kind replaces the entry, and it cannot start until the commit has landed, by
-// which time Remove reaches the stream instead.
-func (s *Service) leaveKindRun(sess *session, run *kindRun) {
-	s.mu.Lock()
-	if sess.kindRuns[run.id] == run && run.stream.Load() == nil {
-		delete(sess.kindRuns, run.id)
-	}
-	s.mu.Unlock()
-
-	close(run.done)
-	sess.leaveRun()
-}
-
-// cancelKindRun cancels the run in flight for one kind and hands it back for the caller to
-// join once armMu is released. Nil when none is out.
-func (sess *session) cancelKindRun(id kindID) *kindRun {
-	sess.s.mu.Lock()
-	run := sess.kindRuns[id]
-	sess.s.mu.Unlock()
-
-	if run != nil {
-		run.cancel()
-	}
-	return run
+	return sess, k, true
 }

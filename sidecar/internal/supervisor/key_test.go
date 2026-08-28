@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// A key states the name↔type pairing once, beside the reconciler, where Get restates it at every
+// A key states the name↔type pairing once, beside the job, where a bare read restates it at every
 // read site.
 func TestAKeyReadsTheObservableItNames(t *testing.T) {
 	e, p, _ := single(t, Succeeded())

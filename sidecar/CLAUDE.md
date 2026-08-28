@@ -446,11 +446,19 @@ finds the value already there.
 
 **The scheduling machinery is `sidecar/internal/supervisor`** — a reusable supervisor (a work queue, a
 level-triggered pass, a schedule derived from recorded state) that knows nothing about
-kube-contexts. A probe is a reconciler whose value is an observation, registered with
-`supervisor.Register(e, name, p, opts...)` — the same shape as a beehive controller, with `T` inferred
+kube-contexts.
+
+**It runs two kinds of thing.** A **job** runs, returns, and is quiet until it is due again; a
+**worker** starts, blocks until it is stopped or it dies, and reports while it runs. The rule of
+thumb: work with a natural end is a job, work that would need a goroutine outliving the call is a
+worker. Every probe and every discovery read is a job; `kubesync`'s kind sync is the one worker.
+→ [ADR: jobs and workers](../docs/adr/2026-08-28-jobs-and-workers.md).
+
+A probe is a job whose value is an observation, registered with
+`supervisor.RegisterJob(e, name, p, opts...)` — the same shape as a beehive controller, with `T` inferred
 from the instance — and `T` is its observable's value type. **The registration name is the
-probe's whole public identity**: the edge options, `Wake`, and every read take one, and
-`Register` returns nothing. `kubeconn`
+probe's whole public identity**: the edge options, `Wake`, `Restart`, and every read take one, and
+`RegisterJob` returns nothing. `kubeconn`
 keeps what is asked and what the answers mean: `probe.go` is `registerProbes` — five
 registrations kept side by side on purpose, since the set's rules are checked by eye — plus the
 probe structs; `service.go` is leases and publishing. → [ADR: the supervisor's
@@ -458,6 +466,10 @@ extraction](../docs/adr/2026-08-24-probe-engine.md).
 
 **A run's `Result` is its schedule** — `Succeeded` waits out the interval, `Fail` climbs the
 backoff ladder, `Suspend` and `Skip` wait for a `Wake` — so no domain rule lives in the scheduler.
+What the supervisor DOES with each verdict differs by kind, which is the whole of the split.
+**`WithStartConcurrency(n)` bounds what is STARTING**, across every subject: a job is starting for
+its whole run, a worker only until `Ready`, so eight is eight cold lists however many streams are
+already up.
 `Succeeded().RequeueAfter(d)` asks for the next run sooner, for a wait the run knows the length
 of — beehive's spelling, for the same ask. **Unlike beehive's it can only bring a run forward**,
 since the supervisor takes it when it is positive and shorter than the registered interval: a probe's
@@ -473,40 +485,79 @@ value of a subject dropped by `Remove` or `Close`. **A commit is the exception**
 replaces is not handed back, since a commit often carries the last one's holdings forward — a
 struct value with one field moved keeps the connection inside it — so a run drops what it is
 really dropping itself. A reconciler implementing `Discard(T)` is handed
-it (`kubeconn`'s connection probe retires the connection; `kubesync`'s kind reconciler cancels and
-joins its stream); one that does not is unaffected. **`Discard` runs outside the supervisor's lock**, because
-one that joins a goroutine can wait on an exit that calls `Wake`.
+it (`kubeconn`'s connection probe retires the connection); one that does not is unaffected.
+**`Discard` runs outside the supervisor's lock**, because one that joins a goroutine can wait on an
+exit that calls `Wake`. **A worker gets none of this** — its commits are live, so a refused one is
+simply dropped, and its value must own nothing.
 
-**`Succeeded().Provisional()` records the verdict and leaves the failure streak standing**, for a
-run that started something it cannot yet vouch for. The next plain `Succeeded` ends the streak and a
-`Fail` climbs from where it stood. Without it a run that established something would reset the
-ladder on the open alone, and a source that accepts a request and drops it would sit at the base
-delay forever. Inert on `Fail` and `Suspend`, which already own what they do to a streak.
-→ [ADR: the stream is the value](../docs/adr/2026-08-28-the-stream-is-the-value.md).
+**A worker's own rules**, all three of them the supervisor's:
 
-**A `Reconcile` body may not take the supervisor down with it.** One that panics, or that hands back the
+- **`Ready` is the worker saying its STARTING phase is over** — the expensive part is done and it
+  is now doing the thing. For a stream that is the watch being open, never its first frame: a body
+  that waits for its source to say something holds a start slot for as long as that source stays
+  quiet, and bookmarks are advisory, so the first few kinds would keep the rest of a cache from
+  ever listing. It releases the slot, stops the startup timer, stamps the attempt and opens a
+  healthy stretch, so dependents are scheduled. **It does not clear the failure streak** — a run
+  finishing cleanly is what does, since starting is not proof and a source that accepts every
+  start and drops it calls `Ready` on each one.
+- **A worker that never calls it is recorded `NeverReady`** — a **failure**, paced by the ladder —
+  in the two cases where what it returned would otherwise leave it unpaced: it says it finished
+  cleanly, or the startup timer ended it. A `Fail` keeps its own reason up the same ladder, and a
+  `Suspend` or a `Skip` the worker chose for itself is it parking at a gate, never a failure.
+- **A stop records nothing.** `Restart`, `Remove` and `Close` ask for the end, so it is not the
+  body's doing: the last record and the failure streak stand. A resume poke restarts every kind on
+  a cache at once, and one that reset the streak would have the whole cache retry a struggling
+  server at the base delay. **The startup timeout is not a stop** — it cancels the same context, but
+  the run is recorded, and recorded `NeverReady` whatever the body then returns: a worker reading
+  its cancelled context reports the cancel rather than a verdict it chose, so a `Skip` taken at
+  its word would park it on a wake nobody owes it.
+- **Two paces.** The ladder paces failures; the **floor** — the worker's `WithInterval`, defaulting
+  to the backoff base — paces clean restarts, which is what keeps a watch rotation from being free.
+
+**`Wake` and `Restart` are the two ways to ask for a run.** A `Wake` never tears a live worker
+down — it means "when you next stop, start again at once", which is what lets `kubesync`'s
+connection bridge wake every kind on a cache per state frame. A `Restart` cancels the run first and
+marks it stopped. Neither waits; `Remove` and `Close` do, and so must not be called from inside a
+`Run`. A **watch edge onto a worker is a `Restart`** where it is a `Wake` for a job: a worker's
+input moving means the one it is running on is stale.
+
+**A body may not take the supervisor down with it.** One that panics, or that hands back the
 zero `Result`, is recorded as an `Internal` failure and gives its key back — the supervisor logs it
 through `slog`, the only place it logs at all. Nothing else reports a bug in a body, and leaving
 one unrecorded wedges the probe twice over: in flight forever, with its key held in the queue.
 
 **Each of `State`'s five observations has one probe behind it**, registered with its own interval
 (a cluster's UID never moves; its readiness moves constantly). The supervisor owns the observables —
-one value beside one `Attempts` per probe, the value written by that probe's `Reconcile` alone — and
+one value beside one `Attempts` per probe, the value written by that probe's `Run` alone — and
 `Read`/`OnPass` hand them back as a `supervisor.Snapshot`, frozen at the moment it was taken.
-Anything reads one out of it by registration name (`supervisor.Get[connInfo](snap, nameConnection)`,
-the `name*` constants), which is how a `Reconcile` reads a sibling and how `stateOf` assembles `State`
-at publish time. **A `supervisor.Key[T]` states that name↔type pairing once** rather than at every
+Anything reads one out of it by registration name
+(`supervisor.GetJobObservation[connInfo](snap, nameConnection)`, the `name*` constants), which is
+how a `Run` reads a sibling and how `stateOf` assembles `State` at publish time. **A `supervisor.Key[T]` states that name↔type pairing once** rather than at every
 read site — `keyConnection.From(snap)`. It is a freestanding declaration: registration never
-hears about it, and the pairing is checked where `Get` checks it, when a value lands. The
+hears about it, and the pairing is checked where the read checks it, when a value lands. The
 connection is the only observable another probe reads, so it is the only one keyed. Its value
 (`connInfo`) bundles `departed` and the connection with the endpoint; `stateOf` projects only the
 endpoint into `State.Connection`, and `newsOf` walks `probeNames` for the untyped per-probe read.
 
-**A `Reconcile` takes a `supervisor.Pass[T]` and returns only its `Result`.** The pass carries the run's
-inputs — `Subject()`, `Prev()`, `Known()`, `Snapshot()` — and `pass.Commit(v)` records what the run found,
-wherever in the body it learns it. The supervisor buffers that and applies it when the run returns,
-in the same critical section as the attempt: nothing is published mid-run, the last call wins,
-and a run that then concludes `Skip` or panics commits nothing.
+**A `Run` takes a pass and returns only its `Result`.** Both passes carry the run's inputs —
+`Subject()`, `Prev()`, `Known()`, `Snapshot()` — and `pass.Commit(v)` records what the run found,
+wherever in the body it learns it. They split over what happens next, and the compiler is what
+enforces it: `Ready` is not a method on a `JobPass`, and a worker handed to `RegisterJob` does not
+build.
+
+- **`JobPass.Commit` is buffered** and applied when `Run` returns, in the same critical section as
+  the attempt: nothing is published mid-run, the last call wins, and a run that then concludes
+  `Skip` or panics commits nothing.
+- **`WorkerPass.Commit` is applied at once** — a worker has no end of the run to wait for, and
+  reporting while it runs is what it is for. Every commit takes the supervisor's lock and fires a
+  pass, so **a worker's `T` is what a reader reacts to, never what arrives**: one committing per
+  frame would publish per object.
+
+**A job's observation and a worker's are different types**, read through `GetJobObservation` and
+`GetWorkerObservation`, each panicking on a name registered as the other kind. A job confirms its
+value by running again (`LastSeenAt`); a worker confirms it by still running, so its stamp is
+`ChangedAt` and its freshness is `Live()` — a worker's `Watching` is false the moment it exits,
+where a job's `identified, as of 10:00` still holds.
 
 **`Known()` is what a probe whose zero `T` is an answer needs.** `Prev()` cannot tell "nothing has
 landed" from "the last answer was the zero value", and the supervisor dates an observation by its
@@ -636,6 +687,12 @@ instead of one per probe. **Why a probe is suspended is `LastAttempt.Reason`** �
 `NextAttempt`, since a probe suspends over what its last attempt found. That is why suspending must
 write an attempt instead of going quiet. So *ready, as of 10:00, nothing due* is a state to render, not a stall.
 
+**A `Skip` parks with nothing due as well**, so `Scheduled()` alone does not say what a registration
+is waiting for. `Suspended()` is the narrower read — nothing due, nothing running, and a suspension
+is the last thing that happened — and it is what a caller waking whatever a returning connection
+revives must gate on. Waking a skipped registration on a hunch re-dispatches whatever shares that
+wake ahead of its backoff ladder.
+
 A **disabled** cluster never gets here: the controller drops the claim and the pool stops probing
 credentials nobody holds. `kubeconn` does not learn what disabled means.
 
@@ -708,8 +765,7 @@ error)`. → `docs/specs/kubesync-seam.md`.
 `ForgetDiscovery`, `TrackKind`/`ForgetKind`, `RestartAll`, the claims, the identity gate, the two
 reads and the two news feeds; discovery, which fills `kind_catalog`; and `kinds.go`, which fills
 the objects. **Not yet wired to `clustersvc`** — nothing calls `TrackDiscovery`, so no cache syncs
-in a running sidecar. `withKindReconciler` substitutes the kind reconciler in tests that are about
-arming.
+in a running sidecar. `withKindSync` substitutes the kind worker in tests that are about arming.
 
 **Two levels of arming, and they AND rather than nest.** `TrackDiscovery` says whether a cache
 syncs at all — and *supplies* it, since the session it arms is what takes both claims — while
@@ -733,11 +789,11 @@ would mean relaying the switch onto hundreds of them.
   - **A sweep** is registered wrapped in `sessionScoped`: the run is counted so the teardown waits
     for it, and its context ends with the session's. Wrapped at registration, because a body that
     forgot would break the promise silently.
-  - **A kind run** is admitted by `enterKindRun`, and `ForgetKind` **cancels before it joins** —
-    the stream through `Remove`'s `Discard`, the run in flight through the session's `kindRuns`
-    handle. The run's join is outside `armMu`; the stream's stays inside. `armMu` is the
-    Service's, so a join of any length under it stalls arming on every cache, and the run's is
-    the one that could be a whole cold list.
+  - **A kind sync** is a worker, so `Supervisor.Remove` IS the whole answer: it cancels the run
+    and waits for it, and past that nothing can write through the kind. The cancel is what bounds
+    the wait — what remains is a page request unwinding, not the cold list it was in the middle
+    of — which matters because `armMu` is the Service's, so a join of any length under it stalls
+    arming on every cache.
 - **A verdict is a gauge, never a stored condition** (`GetDiscoveryState`/`GetKindState`), and
   **no answer is not an empty answer**: `false` means nothing has been observed yet, and a caller
   folding it into "serves no kinds" deletes a record set that was only waiting.
@@ -799,37 +855,37 @@ package's vocabulary rather than the supervisor's.
 
 #### The kind sync (`kinds.go`)
 
-One kind's rows, held current by a standing stream — and **the stream is the reconciler's value,
-not its run**. Three types carry it: `kindReconciler` is the `Reconcile` body every kind subject
-runs; `kindSyncer` is one establishment — the cold list or resume the run performs, then the
-delta loop; `kindStream` is the handle the run commits, which the goroutine applying deltas
-closes on exit. A run makes sure the stream is up: the gate, a cold list or a resume, the WATCH
-open, then `pass.Commit(stream)` and return. Every way the goroutine ends is a `Wake`. One
-subject per kind, `"<cacheID>/<apiVersion>/<resource>"`, on the `kindSupervisor`.
-→ [ADR](../docs/adr/2026-08-28-the-stream-is-the-value.md).
+One kind's rows, held current by a standing stream — and **the run IS the stream**, from the cold
+list to the last delta. It is the supervisor's one worker (§the probes): `kindSync.Run` blocks for
+the stream's whole life, `pass.Ready()` on the first frame says it is up, and returning is the
+stream having ended. Two types carry it — `kindSync` is the body, `kindSyncer` is one run's state.
+One subject per kind, `"<cacheID>/<apiVersion>/<resource>"`, on the `kindSupervisor`.
+→ [ADR: jobs and workers](../docs/adr/2026-08-28-jobs-and-workers.md).
 
-- **A run is short, and its worker cap is the cold-list gate.** A run holds a worker only through
-  establishment, so bounding the kind supervisor's workers (`pacing.kindSyncWorkers`) bounds the
-  relists in flight across every cache — which is what arming one with hundreds of kinds needs.
-  The cost the semaphore did not have: while every worker is cold-listing, another kind's death
-  observation waits for one to free.
+- **The start cap is the cold-list gate.** A worker holds a start slot until `pass.Ready()`, which
+  the sync calls when the WATCH IS OPEN — the gate, the list and the open being what cost. So
+  `pacing.kindStartConcurrency` bounds the relists in flight across every cache however many kinds
+  are already streaming, which is what arming one with hundreds of kinds needs. **Never wait for a
+  frame to release it**: bookmarks are advisory and a quiet collection may send nothing for hours,
+  so the first few kinds would hold every slot and the rest of the cache would never list a row.
 - **The subject names a kind but does not carry it.** `enterKindRun` hands the run the whole
   `kubestore.Kind` out of `s.tracked` — the singular included, which the rows are keyed by and no
-  body can learn from a collection that lists empty. **One critical section**, because a
-  `ForgetKind` landing between the read and the `kindRuns` registration would cancel nothing, and
-  the run would list rows for a kind nobody tracks.
-- **Three exit classes, read off the stream's `err`.** `nil` is a clean stop — a restart, a
-  retirement, a `Remove` — and re-establishes at once with no rung. `errWatchClosed` is the
-  apiserver rotating the watch: one rung, but `reasonWatchRotated` is a private reason the overlay
-  does not report, since the rows stay current across the reopen and saying so would flicker every
-  kind through `SyncFailed` every few minutes. Anything else is a failure.
-- **A death costs one rung, and the run that observes it starts nothing.** The `deathRecorded`
-  bit on the stream tells the two runs apart: re-establishing on the same wake would make a server
-  that closes watches on open a hot loop, and failing without ever starting would fail forever.
-- **Only a frame ends a streak.** Establishment is `Succeeded().Provisional()`, and the goroutine's
-  first frame — delta or bookmark — `Wake`s a run that records the plain `Succeeded`. An open the
-  server accepts and drops has proven nothing.
-
+  body can learn from a collection that lists empty. One critical section, which also counts the
+  run against the session so a teardown waits for it.
+- **How a run ends is the whole schedule.** `nil` from `applyDeltas` with the context still live is
+  the apiserver rotating the watch: a **clean exit**, paced by the floor, and the verdict never
+  leaves `Watching` — the rows stayed current across it. A context that ended is a `Skip`: the
+  session went, the supervisor stopped it, or the connection was retired, and none is this kind's
+  failure. Anything else is a `Fail` up the ladder.
+- **A watch that closed having proved nothing is a failure, not a rotation.** Proof is a frame, or
+  simply staying open past `staleAfter` — a quiet collection rather than a wedged one. Without
+  that split, a server which accepts every watch and drops it would reopen at the floor forever
+  while reporting `Watching`; the ladder is the honest pacing for a stream we cannot say works,
+  and it climbs because `Ready` does not clear the streak.
+- **A retirement asks for its own next run.** The pool publishes the replacement *before* the
+  stream can notice the connection under it died, so the session's bridge has already fired and no
+  other wake is owed. The run `Wake`s its own subject on the way out, which the queue redelivers
+  when it ends.
 - **The cookie decides which start this is** — not whether the cache holds rows. One on disk means
   a completed LIST landed, so the watch resumes from it; without one the collection is cold-listed
   through `BeginReplace`/`WritePage`/`Commit` first. A relist that wrote a page and then died leaves rows
@@ -842,9 +898,13 @@ subject per kind, `"<cacheID>/<apiVersion>/<resource>"`, on the `kindSupervisor`
   cannot retry its way out of, because the cookie is what it would retry with. The watch error is
   wrapped rather than flattened so the loop can ask. The rows stay served throughout, which is why
   this is not the `Syncing` a cold start reports.
-- **A resume holds its reason.** It commits nothing while re-establishing, so the `Watching` the run
-  before it left stands — otherwise `RestartAll` walks every kind through `Watching`→`Syncing`→
-  `Watching`, and a resume poke on a 300-kind cache becomes six hundred reconciles. Only a resume
+- **A resume holds its reason.** Each run seeds its verdict from what the run before it committed
+  (`pass.Prev()`) and commits only when that MOVED — otherwise `RestartAll` walks every kind
+  through `Watching`→`Syncing`→`Watching`, and a resume poke on a 300-kind cache becomes six
+  hundred reconciles. The one exception is a run's FIRST report, which always commits even when
+  nothing moved: until this run has said something, a reader has only the last exit to describe the
+  kind by, so a stream that came back after a suspension would read `IdentityMismatch` for as long
+  as it streamed. It is not news either way, since the reason has not moved. Only a resume
   that outlasts `staleAfter` says `Resuming` — announced by `openWatch` from the establishing run
   itself, never a timer callback: **one stream's state has one writer**, and `Timer.Stop` does not
   wait for a callback already running, so one firing as the stream settles would leave `Resuming`
@@ -858,22 +918,44 @@ subject per kind, `"<cacheID>/<apiVersion>/<resource>"`, on the `kindSupervisor`
 - **A bookmark is proof of life, not data.** It moves `LastLiveAt` and the cookie; only a delta
   moves `LastUpdateAt`. `staleAfter` without either is what `Stale` reads off — the rows are still
   served, they have simply stopped being known to be current.
-- **The supervisor owns the pacing, and `publishKind` projects it.** `OnPass` overlays what the
-  supervisor knows onto what the syncer committed: `Restarts` from `Failures`, and `NextRetryAt`
-  from `NextAttempt.ScheduledAt` **only while the last attempt failed** — a healthy stream has a
-  liveness re-check scheduled, and the seam promises the field is zero while one is up. The reason
-  is the syncer's except where an attempt outranks it: `NoConnection`/`IdentityMismatch` from a
-  suspension, `SyncFailed` from a failure. **A kind with nothing committed and no attempt that
-  outranks it publishes nothing at all** — the seam promises the getter says so, and inventing an
-  empty answer would wake its record for a verdict nothing reached.
+- **`KindState` is assembled at read and stored nowhere** (`kindStateOf`), from the three that own
+  its parts: the reason the worker committed, the supervisor's `Attempts`, and the session's
+  per-frame stamps. A stored copy would be a stale duplicate of all three. **The worker's value is
+  the reason alone** — it commits exactly when that moves, so `WorkerObservation.ChangedAt` is
+  when it last moved, and anything else a value carried would be a second copy of what `Attempts`
+  already holds. `Restarts` is
+  `Attempts.Restarts` — how many times the stream came back inside the current healthy stretch,
+  the flapping question a retry streak cannot answer — and the streak itself is readable as a
+  non-zero `NextRetryAt`.
+- **`Live` is the one supervisor reading carried through rather than folded away**: the watch is
+  open right now. A consumer cannot redo it — reconstructing it means enumerating which reasons a
+  running stream reports, and that set is this package's to change. `Stale` is live, `Syncing` is
+  not. The rest of `Attempts` stays behind the seam, since a worker's last exit and next schedule
+  are the two facts a reader gets wrong (below).
+- **A run in flight speaks for itself; a worker's last exit describes it only while it is DOWN.**
+  Two ways it has spoken: it is `Live()` (running and ready), or it has committed something since
+  that exit ended. Otherwise the exit outranks the verdict — `NoConnection`/`IdentityMismatch` from
+  a suspension, `SyncFailed` from any failure. Without the rule a kind relisting after a `410`
+  would read `SyncFailed` throughout the relist, and one whose connection came back would read
+  `IdentityMismatch` for as long as it streamed. The same gate is on `NextRetryAt`, so a live
+  stream never serves the countdown of the failure it recovered from. **A kind with nothing
+  committed and no exit that outranks it answers nothing at all** — the seam promises the getter
+  says so, and inventing an empty answer would wake its record for a verdict nothing reached.
+- **`publishKind` wakes a record only when that answer MOVED.** `OnPass` fires on every pass,
+  schedule-only ones included, so the baseline is the session's `published` map; without it every
+  pass would wake every record on the cache.
 - **A run lasts as long as its connection.** It ends when the pool retires the connection it was
-  handed (`Connection.Done`), and the retry goes back through the gate for the replacement. A
+  handed (`Connection.Done`), and the next run goes back through the gate for the replacement. A
   stream blocked in a watch read cannot see the retirement itself, and retrying over a retired
-  connection would climb the ladder until a resume poke.
+  connection would climb the ladder until a resume poke. **Every cancelled run leaves through one
+  exit** (`kindSync.stopped`), which records nothing and asks for its own next run when the
+  connection was what went: the bridge's wake has already been and found this run in flight, and
+  the cold list and the watch open are cancelled as readily as the stream.
 - **A kind at the gate says why**: `NoConnection` or `IdentityMismatch`, from the `Suspend` the run
   records, re-reported as the pool's answer moves. `NextRetryAt` is zero and so is `Restarts` —
-  nothing is retrying at the gate, and a suspension ends a streak the way a success does. The rest
-  of the state stands, so the stamps survive the wait.
+  nothing is retrying at the gate, and a suspension ends a healthy stretch rather than a streak.
+  The stamps stand, so they survive the wait. What brings it back is the session's connection
+  bridge, whose `Wake` starts a parked kind and leaves a live one alone.
 - **Events age out here or nowhere** — the server never deletes them, so `PruneEvents` caps the
   table: **once on the way into every `establish`**, and within a relist **before the commit that
   persists the cookie**, since the LIST can carry more than the window and a prune that failed

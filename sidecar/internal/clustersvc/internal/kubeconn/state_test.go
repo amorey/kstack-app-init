@@ -42,8 +42,8 @@ func TestLatencyMeasuresADispatchedRun(t *testing.T) {
 // A suspended probe keeps its last answer and schedules nothing.
 func TestSuspendedProbeKeepsItsAnswer(t *testing.T) {
 	o := Observation[string]{
-		Value:    "abc-123",
-		LastSeen: runAt,
+		Value:      "abc-123",
+		LastSeenAt: runAt,
 		Attempts: Attempts{
 			LastAttempt: Attempt{ScheduledAt: runAt, FinishedAt: runAt, Verdict: VerdictSuspended, Reason: ReasonDependencyFailed},
 		},
@@ -59,11 +59,11 @@ func TestSuspendedProbeKeepsItsAnswer(t *testing.T) {
 // carrying them, so retiring one stays a ==.
 func TestIdentityProjectsTheProbedScalars(t *testing.T) {
 	s := State{
-		ServerUID:     Observation[string]{Value: "uid-1", LastSeen: runAt},
-		ServerVersion: Observation[VersionInfo]{Value: VersionInfo{GitVersion: "v1.29.3"}, LastSeen: runAt},
+		ServerUID:     Observation[string]{Value: "uid-1", LastSeenAt: runAt},
+		ServerVersion: Observation[VersionInfo]{Value: VersionInfo{GitVersion: "v1.29.3"}, LastSeenAt: runAt},
 		Principal: Observation[Principal]{
-			Value:    Principal{Username: "admin@example", Groups: []string{"system:masters"}},
-			LastSeen: runAt,
+			Value:      Principal{Username: "admin@example", Groups: []string{"system:masters"}},
+			LastSeenAt: runAt,
 		},
 	}
 
@@ -79,13 +79,13 @@ func TestIdentityProjectsTheProbedScalars(t *testing.T) {
 func TestIdentityLeavesAnUnreadPartEmpty(t *testing.T) {
 	forbidden := State{
 		ServerUID: Observation[string]{Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonForbidden}}},
-		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
+		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeenAt: runAt},
 	}
 
 	assert.Equal(t, Identity{Username: "reader@example"}, forbidden.Identity())
 	assert.Equal(t, forbidden.Identity(), State{
 		ServerUID: Observation[string]{Attempts: Attempts{LastAttempt: Attempt{FinishedAt: runAt, Reason: ReasonUnsupported}}},
-		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeen: runAt},
+		Principal: Observation[Principal]{Value: Principal{Username: "reader@example"}, LastSeenAt: runAt},
 	}.Identity(), "why the UID is missing is the observation's, not the identity's")
 }
 

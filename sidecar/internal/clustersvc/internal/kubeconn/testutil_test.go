@@ -122,11 +122,11 @@ func (c *cluster) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // runProbe runs one probe body against conn the way the supervisor would, and hands back what it
 // recorded. prev is what the probe last committed, or nil for one that has committed nothing.
-func runProbe[T any](t *testing.T, p supervisor.Reconciler[T], conn *Connection, prev *T) (supervisor.Result, T, bool) {
+func runProbe[T any](t *testing.T, p supervisor.Job[T], conn *Connection, prev *T) (supervisor.Result, T, bool) {
 	t.Helper()
 	snap := supervisor.NewSnapshot(map[string]any{nameConnection: connInfo{conn: conn}})
-	pass := supervisor.NewPass("prod", prev, snap)
-	res := p.Reconcile(t.Context(), pass)
+	pass := supervisor.NewJobPass("prod", prev, snap)
+	res := p.Run(t.Context(), pass)
 	v, committed := pass.Updated()
 	return res, v, committed
 }

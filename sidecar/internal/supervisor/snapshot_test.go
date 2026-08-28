@@ -30,7 +30,7 @@ func TestGetReadsAnObservableByName(t *testing.T) {
 	runNext(t, e)
 
 	read, _ := e.Read(subj)
-	o := Get[string](read, "conn")
+	o := GetJobObservation[string](read, "conn")
 
 	assert.Equal(t, "v1", o.Value)
 	assert.True(t, o.Known())
@@ -43,7 +43,7 @@ func TestGetPanicsOnAnUnregisteredName(t *testing.T) {
 	e.Add(subj)
 	read, _ := e.Read(subj)
 
-	assert.Panics(t, func() { Get[string](read, "nope") })
+	assert.Panics(t, func() { GetJobObservation[string](read, "nope") })
 }
 
 // The name and the type are stated separately, so they can disagree. A read that asks for the
@@ -56,7 +56,7 @@ func TestGetPanicsOnTheWrongType(t *testing.T) {
 	runNext(t, e)
 	read, _ := e.Read(subj)
 
-	assert.Panics(t, func() { Get[int](read, "conn") })
+	assert.Panics(t, func() { GetJobObservation[int](read, "conn") })
 }
 
 // Before anything is committed there is no value to type-check against, so the read answers
@@ -68,14 +68,14 @@ func TestGetOnAReconcilerThatHasNotCommittedIsNotKnown(t *testing.T) {
 	runNext(t, e)
 
 	read, _ := e.Read(subj)
-	o := Get[string](read, "conn")
+	o := GetJobObservation[string](read, "conn")
 
 	assert.False(t, o.Known())
 	assert.Equal(t, Reason("Unreachable"), o.LastAttempt.Reason)
 }
 
 // A name nothing was registered under is a wiring bug on the untyped walk too, not a zero
-// Attempts passed off as a reconciler that has never run.
+// Attempts passed off as something that has never run.
 func TestSnapshotAttemptsPanicsOnAnUnregisteredName(t *testing.T) {
 	e, _, _ := single(t, Succeeded())
 	e.Add(subj)
@@ -84,12 +84,12 @@ func TestSnapshotAttemptsPanicsOnAnUnregisteredName(t *testing.T) {
 	assert.Panics(t, func() { read.Attempts("nope") })
 }
 
-// The seam a reconciler body's tests read a sibling through, standing in for the supervisor.
+// The seam a body's tests read a sibling through, standing in for the supervisor.
 func TestNewSnapshotCarriesTheValuesNamed(t *testing.T) {
 	snap := NewSnapshot(map[string]any{"conn": "endpoint", "uid": "abc-123"})
 
-	assert.Equal(t, "endpoint", Get[string](snap, "conn").Value)
-	assert.Equal(t, "abc-123", Get[string](snap, "uid").Value)
-	assert.Zero(t, Get[string](snap, "conn").LastAttempt, "never run")
-	assert.Panics(t, func() { Get[string](snap, "missing") }, "a name it does not carry is a wiring bug")
+	assert.Equal(t, "endpoint", GetJobObservation[string](snap, "conn").Value)
+	assert.Equal(t, "abc-123", GetJobObservation[string](snap, "uid").Value)
+	assert.Zero(t, GetJobObservation[string](snap, "conn").LastAttempt, "never run")
+	assert.Panics(t, func() { GetJobObservation[string](snap, "missing") }, "a name it does not carry is a wiring bug")
 }

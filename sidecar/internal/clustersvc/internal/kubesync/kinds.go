@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// One kind's sync, as a reconciler on the supervisor. A run makes sure the kind's stream is up —
-// the gate, then a cold LIST or a resume from the cookie, then the WATCH — and commits the stream
-// as its value; the goroutine that applies deltas outlives it. Every way the stream ends is a
-// Wake, which is how its end reaches the schedule.
+// One kind's sync, as a worker on the supervisor. A run is the stream's whole life — the gate,
+// then a cold LIST or a resume from the cookie, then the WATCH and the delta loop — and returning
+// is the stream having ended. The supervisor owns what happens next: a rotation waits out the
+// floor, a failure climbs the ladder, and an end nobody asked for that never proved itself live
+// is NeverReady.
 //
-// → docs/adr/2026-08-28-the-stream-is-the-value.md.
+// → docs/adr/2026-08-28-jobs-and-workers.md.
 package kubesync
 
 import (
@@ -26,7 +27,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,22 +41,9 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
-// errWatchClosed is the apiserver ending a watch on its own timeout: the ordinary end of a
-// stream rather than a failure of one.
-var errWatchClosed = errors.New("watch closed")
-
-// kindSyncInterval is how often a standing stream is re-checked for liveness. Long, because the
-// stream's own exit is the real re-entry — this is only the backstop.
-const kindSyncInterval = 10 * time.Minute
-
-// nameKindSync is the kind reconciler's registration name on the kind supervisor. It is the only
-// reconciler there: a kind is a subject, not a registration.
+// nameKindSync is the kind worker's registration name on the kind supervisor. It is the only
+// registration there: a kind is a subject, not a registration.
 const nameKindSync = "sync"
-
-// reasonWatchRotated has one job: to be a Failed attempt the overlay does not report. A rotation
-// is paced like a failure — the reopen climbs a rung — but it is not news, since the rows stay
-// current across it and saying so would flicker every kind through SyncFailed every few minutes.
-const reasonWatchRotated Reason = "WatchRotated"
 
 // kindSubject names one kind on one cache, "<cacheID>/<apiVersion>/<resource>", and
 // parseKindSubject reads it back. apiVersion carries its own / for a group, so the name is parsed
@@ -81,41 +68,6 @@ func parseKindSubject(subject string) (int64, kindID, bool) {
 	return cacheID, kindID{apiVersion: rest[:i], resource: rest[i+1:]}, true
 }
 
-// kindStream is the handle to one standing stream: the goroutine applying deltas, and what a run
-// reads to judge it.
-//
-// One ordering rule: the goroutine writes err, then closes done; a run reads done, then err.
-// close(done) is the only happens-before edge, so nothing reads err while done is open.
-type kindStream struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-	// err is how the stream ended: nil for a clean stop (a restart, a retirement, a Remove),
-	// errWatchClosed for a rotation, anything else a failure.
-	err error
-	// proven is set by the goroutine on the first frame, while a run may be reading it. It is
-	// what lets a run record the plain Succeeded that ends the retry streak.
-	proven atomic.Bool
-	// deathRecorded marks a dead stream whose failure a run has already recorded. Written and
-	// read only by this subject's runs, which the supervisor serializes.
-	deathRecorded bool
-}
-
-// alive reports whether the stream is still up.
-func (st *kindStream) alive() bool {
-	select {
-	case <-st.done:
-		return false
-	default:
-		return true
-	}
-}
-
-// stop ends the stream and waits for its goroutine. Safe to call more than once.
-func (st *kindStream) stop() {
-	st.cancel()
-	<-st.done
-}
-
 // pacing is every duration and bound a kind sync runs on. A test shrinks them; production
 // passes defaultPacing, so no test outwaits a production number.
 type pacing struct {
@@ -124,7 +76,8 @@ type pacing struct {
 	// "this stream has stopped being current".
 	staleAfter time.Duration
 	// backoff is the ladder a failing run climbs — the supervisor's, so a kind's retry countdown
-	// reads the same as a sweep's.
+	// reads the same as a sweep's. It is also the floor under a clean restart, which is what
+	// stops a server that closes every watch after one frame reopening in a tight loop.
 	backoff supervisor.Backoff
 	// pageSize bounds one relist page, so a large collection never lands in memory whole.
 	pageSize int64
@@ -133,96 +86,72 @@ type pacing struct {
 	// busy cluster's event stream quadratic.
 	eventsWindow int
 	eventsEvery  int
-	// kindSyncWorkers bounds the kind runs in flight across every cache, and so bounds the
-	// relists: a run holds a worker only through establishment, so the cap IS the cold-list
-	// gate that arming a cache of hundreds of kinds needs.
-	kindSyncWorkers int
+	// kindStartConcurrency bounds the kind syncs STARTING at once across every cache, and so
+	// bounds the cold lists: a worker holds a slot only until its first frame, so this is the
+	// gate arming a cache of hundreds of kinds needs, however many are already streaming.
+	kindStartConcurrency int
 }
 
 func defaultPacing() pacing {
 	return pacing{
-		staleAfter:      5 * time.Minute,
-		backoff:         supervisor.Backoff{Base: time.Second, Factor: 2, Cap: time.Minute},
-		pageSize:        500,
-		eventsWindow:    5000,
-		eventsEvery:     100,
-		kindSyncWorkers: 8,
+		staleAfter:           5 * time.Minute,
+		backoff:              supervisor.Backoff{Base: time.Second, Factor: 2, Cap: time.Minute},
+		pageSize:             500,
+		eventsWindow:         5000,
+		eventsEvery:          100,
+		kindStartConcurrency: 8,
 	}
 }
 
-// kindReconciler is the reconciler every kind subject runs. It holds nothing per kind: the
-// subject names one, and enterKindRun hands the run the whole value.
-type kindReconciler struct {
+// kindSync is the worker every kind subject runs. It holds nothing per kind: the subject names
+// one, and enterKindRun hands the run the whole value.
+type kindSync struct {
 	s      *Service
 	pacing pacing
 }
 
-// Reconcile makes sure one kind's stream is up. It is short by construction: the gate, one
-// establishment, and a return. What it starts outlives it as the committed value.
-func (r kindReconciler) Reconcile(ctx context.Context, pass *supervisor.Pass[*kindStream]) supervisor.Result {
+// Run is one kind's stream, start to finish. It blocks for the stream's whole life, which is what
+// makes it a worker: there is no goroutine here outliving the call, and nothing to hand back.
+func (w kindSync) Run(ctx context.Context, pass *supervisor.WorkerPass[Reason]) supervisor.Result {
 	cacheID, id, ok := parseKindSubject(pass.Subject())
 	if !ok {
 		return supervisor.Skip()
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sess, k, run, ok := r.s.enterKindRun(cacheID, id, cancel)
+	sess, k, ok := w.s.enterKindRun(cacheID, id)
 	if !ok {
 		// Nothing has armed this cache, its teardown has begun, or nothing tracks this kind:
 		// either way the claims a run would write through are going.
 		return supervisor.Skip()
 	}
-	defer r.s.leaveKindRun(sess, run)
-	defer context.AfterFunc(sess.ctx, cancel)()
+	defer sess.leaveRun()
 
-	if res, decided := standingVerdict(pass.Prev()); decided {
-		return res
-	}
-	return r.establish(ctx, sess, k, run, pass)
-}
-
-// standingVerdict answers for the stream a subject already holds, in every case that starts
-// nothing. A live stream is the whole answer. A dead one costs exactly one rung, recorded by the
-// run its exit woke; the run the ladder then schedules finds the death recorded and
-// re-establishes. Re-establishing on the same wake would make a server that closes watches on
-// open a hot loop, and failing without ever starting would fail forever.
-func standingVerdict(prev *kindStream) (supervisor.Result, bool) {
-	switch {
-	case prev == nil:
-		return supervisor.Result{}, false
-	case prev.alive():
-		if prev.proven.Load() {
-			return supervisor.Succeeded(), true
-		}
-		return supervisor.Succeeded().Provisional(), true
-	case prev.err == nil || prev.deathRecorded:
-		// A clean stop, or a death already paid for: re-establish now.
-		return supervisor.Result{}, false
-	}
-
-	prev.deathRecorded = true
-	if errors.Is(prev.err, errWatchClosed) {
-		return supervisor.Fail(reasonWatchRotated, prev.err), true
-	}
-	return supervisor.Fail(ReasonSyncFailed, prev.err), true
-}
-
-// establish brings the stream up and commits it. Everything that can refuse is answered here:
-// the identity gate suspends, and a list or an open that fails climbs the ladder.
-func (r kindReconciler) establish(ctx context.Context, sess *session, k kubestore.Kind, run *kindRun, pass *supervisor.Pass[*kindStream]) supervisor.Result {
-	conn, err := sess.lease.ConnFor(ctx, sess.params.ServerUID)
-	if err != nil {
-		// Nothing syncs into a cache whose connection does not vouch for its ServerUID. A run
-		// holds a supervisor worker, so it records why and parks; the session's connection
-		// bridge is what brings it back.
-		return supervisor.Suspend(connectionReason(err, ReasonSyncFailed), err.Error())
-	}
-	// The run ends with the connection it dialed: a cold list against a retired one is a request
-	// nothing will answer, and the retry goes through the gate to find the replacement.
+	// The session's cancel is the backstop behind the supervisor's own: a teardown ends every
+	// stream under the cache without having to remove each subject first.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer context.AfterFunc(sess.ctx, cancel)()
+
+	return w.sync(ctx, sess, k, id, pass)
+}
+
+// sync gates, establishes, and then streams. Everything that can refuse is answered here: the
+// identity gate suspends, a list or an open that fails climbs the ladder, and an end nobody asked
+// for that reached no frame is the supervisor's NeverReady.
+func (w kindSync) sync(ctx context.Context, sess *session, k kubestore.Kind, id kindID, pass *supervisor.WorkerPass[Reason]) supervisor.Result {
+	conn, err := sess.lease.ConnFor(ctx, sess.params.ServerUID)
+	if err != nil {
+		// Nothing syncs into a cache whose connection does not vouch for its ServerUID. The
+		// worker records why and parks; the session's connection bridge is what wakes it.
+		return supervisor.Suspend(connectionReason(err, ReasonSyncFailed), err.Error())
+	}
+	// The stream lasts as long as the connection it was opened over: a request served over a
+	// retired one is one nothing will answer, and the restart goes back through the gate to
+	// find the replacement.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// Done is a channel rather than a context, so the watcher is a goroutine of its own; it
+	// ends with the run either way.
 	go func() {
 		select {
 		case <-conn.Done():
@@ -231,90 +160,88 @@ func (r kindReconciler) establish(ctx context.Context, sess *session, k kubestor
 		}
 	}()
 
-	prevState, _ := sess.kindState(idOf(k))
 	syncer := &kindSyncer{
-		kind:    k,
-		conn:    conn,
-		store:   sess.store,
-		pacing:  r.pacing,
-		publish: func(state KindState) { r.s.commitKind(sess, idOf(k), state) },
-		state:   prevState,
+		kind:   k,
+		conn:   conn,
+		store:  sess.store,
+		pacing: w.pacing,
+		sess:   sess,
+		id:     id,
+		pass:   pass,
+		reason: pass.Prev(),
+		relist: sess.needsRelist(id),
 	}
-	// The one error a resume cannot retry through: the position the cookie names is one the
-	// server has dropped, so the next start relists rather than resumes. A dead stream is one
-	// way to learn it — safe to read here, since this runs only once the stream is down.
-	id := idOf(k)
-	if prev := pass.Prev(); prev != nil && positionGone(prev.err) {
-		sess.markRelist(id)
-	}
-	syncer.relist = sess.needsRelist(id)
 
-	// **The watch is opened on the stream's context, never the run's.** A watch is served over
-	// the context its request was made on and dies with it, so one opened here on a run-scoped
-	// context would be killed the moment the run returned — every established stream rotating
-	// at once. The run still owns the cancel while it establishes, so a cold list ends with the
-	// run; ownership passes to the stream below.
-	streamCtx, streamCancel := context.WithCancel(sess.ctx)
-	endWithRun := context.AfterFunc(ctx, streamCancel)
-
-	wasRelist := syncer.relist
-	watcher, err := syncer.open(streamCtx)
-	if wasRelist && !syncer.relist {
-		// The cold list landed, so the cookie behind it is this run's own — whatever the watch
-		// it was about to open goes on to do.
-		sess.clearRelist(id)
-	}
+	watcher, err := syncer.open(ctx)
 	if err != nil {
-		// **The other way to learn it, and the one nothing else carries.** A 410 answered by
-		// the watch open establishes nothing, so this run commits nothing and leaves Prev
-		// exactly as it was — and the two ordinary ways in have no stream to read anyway: a
-		// reopen after a clean stop, and a cold start off a cookie on disk. Recorded on the
-		// session, which outlives the run and every failure between here and the relist.
+		// **The one error a resume cannot retry its way out of**, since the cookie is what it
+		// would retry with. Recorded on the session, which outlives this run and every failure
+		// between learning the position is dead and acting on it.
 		if positionGone(err) {
 			sess.markRelist(id)
 		}
-		ended := ctx.Err() != nil || streamCtx.Err() != nil
-		endWithRun()
-		streamCancel()
-		if ended {
-			// The session went, or the connection was retired under the list. Neither is this
-			// kind's failure to report.
-			return supervisor.Skip()
+		if ctx.Err() != nil {
+			return w.stopped(pass, conn)
 		}
 		return supervisor.Fail(ReasonSyncFailed, err)
 	}
 
-	subject := kindSubject(sess.cacheID, k)
-	stream := &kindStream{cancel: streamCancel, done: make(chan struct{})}
-	// The first frame proves the stream, and its wake is what lets a run record the plain
-	// Succeeded that ends the streak. Once per stream.
-	syncer.onFrame = func() {
-		if stream.proven.CompareAndSwap(false, true) {
-			r.s.kindSupervisor.Wake(subject, nameKindSync)
-		}
+	// **The starting phase ends here, not at the first frame.** The cold list and the open are
+	// what cost; a watch on a quiet collection is up, not starting. Waiting for a frame would
+	// hold this kind's start slot for as long as the collection stayed silent — bookmarks are
+	// advisory — and the first few kinds would keep the rest of the cache from ever listing.
+	pass.Ready()
+
+	err = syncer.applyDeltas(ctx, watcher)
+	if positionGone(err) {
+		sess.markRelist(id)
 	}
+	switch {
+	case ctx.Err() != nil:
+		return w.stopped(pass, conn)
+	case err == nil && syncer.proved:
+		// The apiserver ended the watch on its own timeout: a rotation, not a failure. The
+		// rows stayed current across it, so the floor paces the reopen and the verdict stands.
+		return supervisor.Succeeded()
+	case err == nil:
+		// It closed having told us nothing at all. Read as a rotation this would reopen at the
+		// floor forever against a server that accepts every watch and drops it, and report
+		// Watching the whole time; the ladder is the honest pacing for a stream we cannot say
+		// works.
+		return supervisor.Fail(ReasonSyncFailed, errWatchProvedNothing)
+	default:
+		return supervisor.Fail(ReasonSyncFailed, err)
+	}
+}
 
-	// Counted from inside the run, which still holds the group: a teardown joins the stream and
-	// not only the run that started it.
-	sess.runs.Add(1)
-	run.stream.Store(stream)
-	go func() {
-		defer sess.runs.Done()
-		defer streamCancel()
+// errWatchProvedNothing is a watch the server accepted and closed without a frame, a bookmark, or
+// even standing open long enough to go stale.
+var errWatchProvedNothing = errors.New("the watch closed without proving itself")
 
-		err := syncer.applyDeltas(streamCtx, watcher)
-		// err before done, and done before the wake: close(done) is the edge that publishes it.
-		stream.err = err
-		close(stream.done)
-		r.s.kindSupervisor.Wake(subject, nameKindSync)
-	}()
+// stopped is the exit for a run whose context ended: the session went, the supervisor stopped it,
+// or the connection was retired under it. None is this kind's failure to report, so nothing is
+// recorded — which is also why every path out of a cancel comes through here rather than deciding
+// for itself.
+//
+// **A retirement still has to ask for its own next run.** The pool publishes the replacement
+// before the run can notice the connection under it died, so the bridge's wake has already been
+// and no other is owed. The wake lands on a key this run still holds, which the queue redelivers
+// when it ends.
+func (w kindSync) stopped(pass *supervisor.WorkerPass[Reason], conn *kubeconn.Connection) supervisor.Result {
+	if retired(conn) {
+		w.s.kindSupervisor.Wake(pass.Subject(), nameKindSync)
+	}
+	return supervisor.Skip()
+}
 
-	// Ownership passes here: past this the run's return no longer ends the stream, and what
-	// stops it is Discard, a retirement, or the session.
-	endWithRun()
-	pass.Commit(stream)
-	// Established, and nothing has proven it yet — so the verdict stands and the streak does too.
-	return supervisor.Succeeded().Provisional()
+// retired reports whether the pool took the connection this run was reading over.
+func retired(conn *kubeconn.Connection) bool {
+	select {
+	case <-conn.Done():
+		return true
+	default:
+		return false
+	}
 }
 
 // positionGone reports the one error a resume cannot retry its way out of: the cookie is what it
@@ -323,34 +250,32 @@ func positionGone(err error) bool {
 	return apierrors.IsResourceExpired(err) || apierrors.IsGone(err)
 }
 
-// Discard is the supervisor handing a stream back — on Remove, on Close, or for a commit it
-// refused — and nothing else can reach the goroutine to stop it. It joins, which is what makes
-// ForgetKind and a teardown synchronous.
-func (r kindReconciler) Discard(stream *kindStream) {
-	if stream != nil {
-		stream.stop()
-	}
-}
-
-// kindSyncer is one establishment of one kind: the cold list or resume the run performs, then
-// the delta loop the goroutine runs. Built fresh per establishment, so once the run has returned
-// the goroutine owns it alone.
+// kindSyncer is one run's state: the cold list or resume it performs, then the delta loop. Built
+// fresh per run, so what must survive one — the verdict and the stamps — is read back off the
+// pass and the session rather than held here.
 type kindSyncer struct {
 	kind   kubestore.Kind
 	conn   *kubeconn.Connection
 	store  *kubestore.Store
 	pacing pacing
-	// publish hands one answer to the session, which is the one writer of what a reader sees.
-	publish func(KindState)
-	// onFrame is called on every frame that proves the stream live; the run that starts the
-	// goroutine sets it.
-	onFrame func()
 
-	state KindState
+	// sess and id are where the per-frame stamps go; pass is where the reason goes and how the
+	// run says it is up.
+	sess *session
+	id   kindID
+	pass *supervisor.WorkerPass[Reason]
+
+	// reason is this kind's standing answer, seeded from what the run before it committed —
+	// which is what lets a resume hold its reason rather than walking through Syncing.
+	reason Reason
+	// proved marks a stream that showed it works: a frame, or simply staying open past the
+	// window its rows are current for, which is a quiet collection rather than a wedged one.
+	// A plain field because one goroutine runs the whole sync.
+	proved bool
 	// sincePrune counts event deltas applied since the last prune.
 	sincePrune int
-	// relist forces this attempt to cold-list, for the one failure a resume cannot retry its
-	// way out of: the position the cookie names is the position the server dropped.
+	// relist forces this run to cold-list, for the one failure a resume cannot retry its way
+	// out of: the position the cookie names is the position the server dropped.
 	relist bool
 }
 
@@ -386,20 +311,21 @@ func (ks *kindSyncer) open(ctx context.Context) (watch.Interface, error) {
 	if ks.relist {
 		reason = ReasonResyncing
 	}
-	ks.report(reason, "")
+	ks.report(reason)
 	if cookie, err = ks.coldList(ctx); err != nil {
 		return nil, err
 	}
-	// Only now: the cookie survives a list that failed before its first page, so a flag
-	// dropped any earlier would send the next attempt back to a position the server has
-	// already refused, and the run would alternate between a doomed watch and this list.
+	// Only now: the cookie survives a list that failed before its first page, so an intent
+	// dropped any earlier would send the next run back to a position the server has already
+	// refused, and it would alternate between a doomed watch and this list.
 	ks.relist = false
+	ks.sess.clearRelist(ks.id)
 	return ks.openWatch(ctx, cookie, false)
 }
 
 // coldList replaces this kind's rows from a paginated LIST and returns the position a watch
-// resumes from. The supervisor's worker cap is what stops an armed cache putting hundreds of
-// these on the connection and the store's single writer at once.
+// resumes from. The supervisor's start cap is what stops an armed cache putting hundreds of these
+// on the connection and the store's single writer at once.
 func (ks *kindSyncer) coldList(ctx context.Context) (string, error) {
 	replace, err := ks.store.BeginReplace(ks.kind)
 	if err != nil {
@@ -441,7 +367,7 @@ func (ks *kindSyncer) coldList(ctx context.Context) (string, error) {
 // openWatch establishes the stream, saying Resuming if a resume drags past the window its rows
 // stay current for.
 //
-// The announcement is made from this goroutine, never a timer callback: one kind's state has
+// The announcement is made from this goroutine, never a timer callback: one kind's verdict has
 // one writer, and a callback firing as the stream settles would leave Resuming standing over
 // the Watching it raced — Stop does not wait for one already running.
 func (ks *kindSyncer) openWatch(ctx context.Context, cookie string, announceSlow bool) (watch.Interface, error) {
@@ -467,10 +393,10 @@ func (ks *kindSyncer) openWatch(ctx context.Context, cookie string, announceSlow
 	case <-ctx.Done():
 		return nil, abandon(ctx, done)
 	case <-time.After(ks.pacing.staleAfter):
-		ks.report(ReasonResuming, "")
+		ks.report(ReasonResuming)
 	}
 
-	// Still on ctx after the announcement: forgetting a kind joins its run, and a run parked
+	// Still on ctx after the announcement: forgetting a kind joins its worker, and a run parked
 	// on an open that will not unwind is one nothing can join.
 	select {
 	case o := <-done:
@@ -497,17 +423,13 @@ func abandon(ctx context.Context, done <-chan opened) error {
 	return ctx.Err()
 }
 
-// applyDeltas applies the watch's events until it ends or the session does. It runs on the
-// stream's goroutine, outliving the run that opened the watch, and how it returns is the
-// stream's err.
-//
-// The verdict settles on the open; the retry streak does not. An open the server closes without
-// a frame has proven nothing, and clearing the streak here would hold such a run at the base
-// delay forever — the first frame's wake is what clears it.
+// applyDeltas applies the watch's events until it ends or the run does. Returning nil is the
+// apiserver ending the watch on its own timeout — a rotation, which the caller reads against
+// ctx to tell from a stop.
 func (ks *kindSyncer) applyDeltas(ctx context.Context, watcher watch.Interface) error {
 	defer watcher.Stop()
 
-	ks.report(ReasonWatching, "")
+	ks.report(ReasonWatching)
 
 	stale := time.NewTimer(ks.pacing.staleAfter)
 	defer stale.Stop()
@@ -515,20 +437,17 @@ func (ks *kindSyncer) applyDeltas(ctx context.Context, watcher watch.Interface) 
 	for {
 		select {
 		case <-ctx.Done():
-			// A clean stop: a restart, a retirement, or the session going. The run this wakes
-			// re-establishes at once rather than climbing a rung.
-			return nil
-		case <-ks.conn.Done():
-			// The pool retired what this stream reads over. Clean too: the replacement is what
-			// the run it wakes goes through the gate to find.
 			return nil
 		case <-stale.C:
 			// Nothing has proven the stream alive for a whole window. The rows are still
-			// served — they are simply no longer known to be current.
-			ks.report(ReasonStale, "")
+			// served — they are simply no longer known to be current. It counts as proof the
+			// watch itself works: a server that takes one and drops it never gets this far,
+			// and a collection with nothing to say cannot do better.
+			ks.proved = true
+			ks.report(ReasonStale)
 		case event, ok := <-watcher.ResultChan():
 			if !ok {
-				return errWatchClosed
+				return nil
 			}
 			if err := ks.apply(ctx, event); err != nil {
 				return err
@@ -556,8 +475,9 @@ func (ks *kindSyncer) apply(ctx context.Context, event watch.Event) error {
 		if err := ks.store.SetCookie(ctx, k.APIVersion, k.Resource, object.GetResourceVersion()); err != nil {
 			return err
 		}
-		ks.proveLive()
-		ks.report(ReasonWatching, "")
+		ks.proved = true
+		ks.sess.stampLive(ks.id)
+		ks.report(ReasonWatching)
 		return nil
 	}
 
@@ -566,9 +486,9 @@ func (ks *kindSyncer) apply(ctx context.Context, event watch.Event) error {
 	if err := ks.store.ApplyChange(ctx, k, event.Type, object); err != nil {
 		return err
 	}
-	ks.state.LastUpdateAt = time.Now()
-	ks.proveLive()
-	ks.report(ReasonWatching, "")
+	ks.proved = true
+	ks.sess.stampUpdate(ks.id)
+	ks.report(ReasonWatching)
 	return ks.pruneEvents(ctx)
 }
 
@@ -594,20 +514,19 @@ func (ks *kindSyncer) pruneEventsNow(ctx context.Context) error {
 	return err
 }
 
-// proveLive records proof this stream is current — a delta or a bookmark, since bookmarks exist
-// to make an idle watch prove itself — and tells the run about it: nothing before a frame
-// distinguishes a watch that works from one the server accepts and drops.
-func (ks *kindSyncer) proveLive() {
-	ks.state.LastLiveAt = time.Now()
-	if ks.onFrame != nil {
-		ks.onFrame()
+// report publishes this kind's answer, **only when it moved**: the reason is the worker's value,
+// so every commit takes the supervisor's lock and fires a pass, and one per frame would publish
+// per object on a busy cluster.
+//
+// Committing exactly on a change is also what lets the supervisor date it. A worker's ChangedAt is
+// when its value last moved, which is what "watching since 10:02" reads off — so a commit that
+// said nothing new would reset the stamp a reader is reading.
+func (ks *kindSyncer) report(reason Reason) {
+	if ks.reason == reason {
+		return
 	}
-}
-
-// report publishes this kind's answer under a reason.
-func (ks *kindSyncer) report(reason Reason, message string) {
-	ks.state.setReason(reason, message)
-	ks.publish(ks.state)
+	ks.reason = reason
+	ks.pass.Commit(reason)
 }
 
 // collection is this kind's rows across every namespace: a kind sync is the whole collection,

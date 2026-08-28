@@ -515,9 +515,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 func newFakeDynamic() *dynamicfake.FakeDynamicClient {
 	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{
-			crdGVR:                              "CustomResourceDefinitionList",
-			{Version: "v1", Resource: "pods"}:   "PodList",
-			{Version: "v1", Resource: "events"}: "EventList",
+			crdGVR:                                                  "CustomResourceDefinitionList",
+			{Version: "v1", Resource: "pods"}:                       "PodList",
+			{Version: "v1", Resource: "events"}:                     "EventList",
+			{Version: "v1", Resource: "services"}:                   "ServiceList",
 			{Group: "apps", Version: "v1", Resource: "deployments"}: "DeploymentList",
 		})
 }
@@ -571,9 +572,11 @@ func (c *fakeCluster) failListOnce(k kubestore.Kind, err error) {
 	})
 }
 
-// refuseList makes a collection refuse to be listed.
+// refuseList makes a collection refuse to be listed. It fires listed too: every attempt is
+// observable whatever it answers, which is how a test sees a kind retrying a list it cannot take.
 func (c *fakeCluster) refuseList(k kubestore.Kind, err error) {
 	c.dyn.PrependReactor("list", k.Resource, func(clienttesting.Action) (bool, runtime.Object, error) {
+		c.listed.Fire(k.Resource)
 		return true, nil, err
 	})
 }
@@ -655,12 +658,12 @@ func event(name, resourceVersion string) *unstructured.Unstructured {
 
 // --- Reading a kind back ---
 
-// newSyncingService is a service running the real kind reconciler, paced so a test never
+// newSyncingService is a service running the real kind worker, paced so a test never
 // outwaits a production number. Every duration here is small enough to be reached and long enough that a
 // loaded machine does not trip it.
 func newSyncingService(t *testing.T, cluster *fakeCluster, opts ...func(*pacing)) *Service {
 	t.Helper()
-	svc, pool := newTestService(t, withPacing(syncPacing(opts...)), withRealKindReconciler())
+	svc, pool := newTestService(t, withPacing(syncPacing(opts...)), withRealKindSync())
 	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 	return svc
@@ -781,7 +784,7 @@ func newTestService(t *testing.T, opts ...option) (*Service, *fakePool) {
 	mgr := kubestore.NewManager(t.TempDir())
 	t.Cleanup(func() { _ = mgr.Close() })
 
-	base := []option{newFakeKindReconciler().option()}
+	base := []option{newFakeKindSync().option()}
 	svc := New(pool, mgr, append(base, opts...)...)
 	t.Cleanup(func() { _ = svc.Close() })
 	return svc, pool
@@ -885,37 +888,34 @@ func testKind(apiVersion, kind, resource string) kubestore.Kind {
 	return kubestore.Kind{APIVersion: apiVersion, Kind: kind, Resource: resource}
 }
 
-// --- Substituting the kind reconciler ---
+// --- Substituting the kind worker ---
 
 // reasonWithdrawnWrite is what a run publishes on its way out after being withdrawn. Nothing
 // production says it, so a reader seeing it has been told something by a run that was cancelled.
 const reasonWithdrawnWrite = "WithdrawnRunWrote"
 
-// admittedRun is what a substituted reconciler reports about one run: the kind it was admitted
-// with, and the way to publish an answer for it.
+// admittedRun is what a substituted worker reports about one run: the kind it was admitted with,
+// and the way to publish an answer for it.
 type admittedRun struct {
 	Kind   kubestore.Kind
-	Commit func(KindState)
+	Report func(reason string)
 }
 
-// fakeKindReconciler stands in for the real kind reconciler, for a test about arming rather than
-// about what a kind sync reads. It takes the same admission and the same gate, and commits a
-// stream that parks until something cancels it — the real shape, minus the Kubernetes.
-type fakeKindReconciler struct {
+// fakeKindSync stands in for the real kind worker, for a test about arming rather than about what
+// a kind sync reads. It takes the same admission and the same gate, and then parks until
+// something stops it — the real shape, minus the Kubernetes.
+type fakeKindSync struct {
 	s    *Service
 	runs *testutil.Probe[admittedRun]
-	// returned fires as a stream ends, before its handle reports itself down, so a caller that
-	// joined the handle has seen it; established fires once one is standing, which is what a
-	// caller acting on the stream — a restart — has to wait for.
+	// returned fires as a run finishes unwinding, so a caller that joined it has seen it;
+	// established fires once one is up and reporting, which is what a caller acting on a live
+	// stream — a restart — has to wait for.
 	returned    *testutil.Probe[struct{}]
 	established *testutil.Probe[struct{}]
-	// park holds the RUN itself until something cancels it — the shape a cold list has, where
-	// the default commits a stream and returns as the real reconciler does.
-	park bool
-	// reportOnStreamExit makes a stream publish on its way down, which is what a real one does
-	// off its stale timer or a last delta — and what a test about a withdrawn generation's
-	// report needs something to observe.
-	reportOnStreamExit bool
+	// reportOnExit makes a run publish on its way down, which is what a real one does off its
+	// stale timer or a last delta — and what a test about a withdrawn generation's report needs
+	// something to observe.
+	reportOnExit bool
 	// exiting fires as a parked run is cancelled, before it unwinds; exitDelay is how long the
 	// unwinding takes. **Latency on purpose**: a run that vanished the instant it was cancelled
 	// would give a join-versus-no-join race no determinate answer, since there would be nothing
@@ -923,131 +923,97 @@ type fakeKindReconciler struct {
 	exiting   *testutil.Probe[struct{}]
 	exitDelay time.Duration
 
-	// Every run gets a generation, shared with the stream it starts, and liveGen holds the
-	// generations still able to write for each subject. Two of them live at once is the bug
-	// this detects: both write the same collection, and a rename gives them different
-	// singulars to key rows by. A run and its own stream are one generation.
+	// Every run gets a generation, and liveGen holds the generations still able to write for
+	// each subject. Two of them live at once is the bug this detects: both write the same
+	// collection, and a rename gives them different singulars to key rows by.
 	mu         sync.Mutex
 	nextGen    int
 	liveGen    map[string]map[int]bool
 	overlapped bool
 }
 
-func newFakeKindReconciler() *fakeKindReconciler {
-	return &fakeKindReconciler{
+func newFakeKindSync() *fakeKindSync {
+	return &fakeKindSync{
 		runs:        testutil.NewProbe[admittedRun](8),
 		returned:    testutil.NewProbe[struct{}](8),
 		exiting:     testutil.NewProbe[struct{}](8),
 		established: testutil.NewProbe[struct{}](8),
 		liveGen:     map[string]map[int]bool{},
-		// Every substitute unwinds slowly enough to be caught mid-flight: a run or stream that
-		// vanished the instant it was cancelled would make an overlap unobservable rather than
-		// absent.
+		// Every substitute unwinds slowly enough to be caught mid-flight: a run that vanished
+		// the instant it was cancelled would make an overlap unobservable rather than absent.
 		exitDelay: 50 * time.Millisecond,
 	}
 }
 
-// newParkingKindReconciler is a reconciler whose run does not return until it is cancelled, for
-// a test about what reaches a run in flight.
-func newParkingKindReconciler() *fakeKindReconciler {
-	f := newFakeKindReconciler()
-	f.park = true
+// newParkingKindSync unwinds slowly enough that a test can tell a join from no join.
+func newParkingKindSync() *fakeKindSync {
+	f := newFakeKindSync()
 	f.exitDelay = 200 * time.Millisecond
 	return f
 }
 
-// withRealKindReconciler puts the production reconciler back, for a test about what a kind sync
-// reads rather than about arming.
-func withRealKindReconciler() option {
-	return withKindReconciler(func(s *Service) supervisor.Reconciler[*kindStream] {
-		return kindReconciler{s: s, pacing: s.pacing}
+// withRealKindSync puts the production worker back, for a test about what a kind sync reads
+// rather than about arming.
+func withRealKindSync() option {
+	return withKindSync(func(s *Service) supervisor.Worker[Reason] {
+		return kindSync{s: s, pacing: s.pacing}
 	})
 }
 
 // option installs this substitute, binding it to the Service it runs under.
-func (f *fakeKindReconciler) option() option {
-	return withKindReconciler(func(s *Service) supervisor.Reconciler[*kindStream] {
+func (f *fakeKindSync) option() option {
+	return withKindSync(func(s *Service) supervisor.Worker[Reason] {
 		f.s = s
 		return f
 	})
 }
 
-func (f *fakeKindReconciler) Reconcile(ctx context.Context, pass *supervisor.Pass[*kindStream]) supervisor.Result {
+func (f *fakeKindSync) Run(ctx context.Context, pass *supervisor.WorkerPass[Reason]) supervisor.Result {
 	cacheID, id, ok := parseKindSubject(pass.Subject())
 	if !ok {
 		return supervisor.Skip()
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sess, k, run, ok := f.s.enterKindRun(cacheID, id, cancel)
+	sess, k, ok := f.s.enterKindRun(cacheID, id)
 	if !ok {
 		return supervisor.Skip()
 	}
-	defer f.s.leaveKindRun(sess, run)
-	gen := f.enter(pass.Subject())
-	// The run's own generation closes here only when it starts no stream; one that does hands
-	// the generation to the stream, which is what outlives it.
-	keepsGen := false
-	defer func() {
-		if !keepsGen {
-			f.leave(pass.Subject(), gen)
-		}
-	}()
+	defer sess.leaveRun()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	defer context.AfterFunc(sess.ctx, cancel)()
 
-	if prev := pass.Prev(); prev != nil && prev.alive() {
-		return supervisor.Succeeded().Provisional()
-	}
+	gen := f.enter(pass.Subject())
+	defer f.leave(pass.Subject(), gen)
+
 	if _, err := sess.lease.ConnFor(ctx, sess.params.ServerUID); err != nil {
 		return supervisor.Suspend(connectionReason(err, ReasonSyncFailed), err.Error())
 	}
-	f.runs.Fire(admittedRun{
-		Kind:   k,
-		Commit: func(state KindState) { f.s.commitKind(sess, id, state) },
-	})
-	if f.park {
-		<-ctx.Done()
-		f.exiting.Fire(struct{}{})
-		time.Sleep(f.exitDelay)
-		// The withdrawn generation's last act. commitKind must refuse it: this run belongs to
-		// a registration that has gone, whatever has been registered since.
-		f.s.commitKind(sess, id, KindState{Reason: reasonWithdrawnWrite})
-		f.returned.Fire(struct{}{})
-		return supervisor.Skip()
-	}
+	report := func(reason string) { pass.Commit(Reason(reason)) }
+	f.runs.Fire(admittedRun{Kind: k, Report: report})
 
-	subject := kindSubject(cacheID, k)
-	streamCtx, streamCancel := context.WithCancel(sess.ctx)
-	stream := &kindStream{cancel: streamCancel, done: make(chan struct{})}
-	sess.runs.Add(1)
-	run.stream.Store(stream)
-	keepsGen = true
-	go func() {
-		defer sess.runs.Done()
-		defer streamCancel()
-
-		<-streamCtx.Done()
-		f.exiting.Fire(struct{}{})
-		// Latency on purpose, as above: a stream that vanished the instant it was cancelled
-		// would leave a join-versus-no-join race nothing to overlap with.
-		time.Sleep(f.exitDelay)
-		if f.reportOnStreamExit {
-			f.s.commitKind(sess, id, KindState{Reason: reasonWithdrawnWrite})
-		}
-		f.leave(subject, gen)
-		f.returned.Fire(struct{}{})
-		close(stream.done)
-		f.s.kindSupervisor.Wake(subject, nameKindSync)
-	}()
-	pass.Commit(stream)
+	// Up and streaming, which is what a real one says on its first frame.
+	report(ReasonWatching)
+	pass.Ready()
 	f.established.Fire(struct{}{})
-	return supervisor.Succeeded().Provisional()
+
+	<-ctx.Done()
+	f.exiting.Fire(struct{}{})
+	// Latency on purpose, as above: a run that vanished the instant it was cancelled would
+	// leave a join-versus-no-join race nothing to overlap with.
+	time.Sleep(f.exitDelay)
+	if f.reportOnExit {
+		// The withdrawn generation's last act. Nothing must serve it: this run belongs to a
+		// registration that has gone, whatever has been registered since.
+		report(reasonWithdrawnWrite)
+	}
+	f.returned.Fire(struct{}{})
+	return supervisor.Skip()
 }
 
 // enter opens a generation for subject and reports it. Anything already live for that subject
 // is a generation that should have been gone.
-func (f *fakeKindReconciler) enter(subject string) int {
+func (f *fakeKindSync) enter(subject string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextGen++
@@ -1064,13 +1030,13 @@ func (f *fakeKindReconciler) enter(subject string) int {
 	return gen
 }
 
-func (f *fakeKindReconciler) leave(subject string, gen int) {
+func (f *fakeKindSync) leave(subject string, gen int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.liveGen[subject], gen)
 }
 
-func (f *fakeKindReconciler) snapshotLive() map[string]int {
+func (f *fakeKindSync) snapshotLive() map[string]int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := map[string]int{}
@@ -1081,15 +1047,8 @@ func (f *fakeKindReconciler) snapshotLive() map[string]int {
 }
 
 // sawOverlap reports whether two generations for one subject were ever able to write at once.
-func (f *fakeKindReconciler) sawOverlap() bool {
+func (f *fakeKindSync) sawOverlap() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.overlapped
-}
-
-// Discard is what makes a teardown and a ForgetKind join this stream, as the real one does.
-func (f *fakeKindReconciler) Discard(stream *kindStream) {
-	if stream != nil {
-		stream.stop()
-	}
 }

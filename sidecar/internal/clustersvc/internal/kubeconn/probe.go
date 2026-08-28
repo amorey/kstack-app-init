@@ -34,7 +34,7 @@ import (
 )
 
 // Registration names are how probes are addressed everywhere: the edges, Wake, and every read
-// take one. A probe body reads a sibling with supervisor.Get[T](snap, nameConnection).
+// take one. A probe body reads a sibling with supervisor.GetJobObservation[T](snap, nameConnection).
 const (
 	nameConnection    = "connection"
 	nameReadiness     = "readiness"
@@ -71,16 +71,16 @@ type connInfo struct {
 func registerProbes(e *supervisor.Supervisor, kubecfg kubeconfigService) {
 	// A reachability check that has taken ten seconds has answered, so the timeout is
 	// shorter than the supervisor's default (a whole interval).
-	supervisor.Register(e, nameConnection, &connectionProbe{kubecfgSvc: kubecfg},
+	supervisor.RegisterJob(e, nameConnection, &connectionProbe{kubecfgSvc: kubecfg},
 		supervisor.WithInterval(30*time.Second), supervisor.WithTimeout(10*time.Second))
 
 	// The four behind reachability declare both edges on it: they cannot run without a
 	// connection, and a connection that moves must re-run them.
 	dependsOnConn, watchesConn := supervisor.WithDependencies(nameConnection), supervisor.WithWatches(nameConnection)
-	supervisor.Register(e, nameReadiness, readinessProbe{}, supervisor.WithInterval(30*time.Second), dependsOnConn, watchesConn)
-	supervisor.Register(e, nameServerUID, serverUIDProbe{}, supervisor.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
-	supervisor.Register(e, nameServerVersion, serverVersionProbe{}, supervisor.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
-	supervisor.Register(e, namePrincipal, principalProbe{}, supervisor.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
+	supervisor.RegisterJob(e, nameReadiness, readinessProbe{}, supervisor.WithInterval(30*time.Second), dependsOnConn, watchesConn)
+	supervisor.RegisterJob(e, nameServerUID, serverUIDProbe{}, supervisor.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
+	supervisor.RegisterJob(e, nameServerVersion, serverVersionProbe{}, supervisor.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
+	supervisor.RegisterJob(e, namePrincipal, principalProbe{}, supervisor.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
 }
 
 // The paths the four probes behind reachability read. selfSubjectReviewPath is
@@ -141,7 +141,7 @@ type connectionProbe struct {
 }
 
 // Run resolves the context, keeps its connection current, and dials the server once.
-func (p *connectionProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[connInfo]) supervisor.Result {
+func (p *connectionProbe) Run(ctx context.Context, pass *supervisor.JobPass[connInfo]) supervisor.Result {
 	cfg, fingerprint, err := p.kubecfgSvc.RESTConfig(pass.Subject())
 	if errors.Is(err, kubeconfig.ErrNotRead) {
 		// An unread kubeconfig names nothing; saying so would report every context gone
@@ -229,7 +229,7 @@ func (p *connectionProbe) Discard(v connInfo) {
 // being able to say which part.
 type readinessProbe struct{}
 
-func (readinessProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[ComponentStatus]) supervisor.Result {
+func (readinessProbe) Run(ctx context.Context, pass *supervisor.JobPass[ComponentStatus]) supervisor.Result {
 	conn := connFrom(pass.Snapshot())
 	if conn == nil {
 		return supervisor.Skip()
@@ -264,7 +264,7 @@ func (readinessProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[Compo
 // cluster that has never had a failing component never commits, and its readiness reads as never
 // observed. ComponentStatus carries a slice, so neither can be the == the comparable observables
 // use.
-func commitStatus(pass *supervisor.Pass[ComponentStatus], next ComponentStatus) {
+func commitStatus(pass *supervisor.JobPass[ComponentStatus], next ComponentStatus) {
 	if !pass.Known() || !slices.Equal(next.Failing, pass.Prev().Failing) {
 		pass.Commit(next)
 	}
@@ -293,7 +293,7 @@ func failingComponents(body string) []string {
 // endpoint that never moved.
 type serverUIDProbe struct{}
 
-func (serverUIDProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[string]) supervisor.Result {
+func (serverUIDProbe) Run(ctx context.Context, pass *supervisor.JobPass[string]) supervisor.Result {
 	conn := connFrom(pass.Snapshot())
 	if conn == nil {
 		return supervisor.Skip()
@@ -332,7 +332,7 @@ func (serverUIDProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[strin
 // serverVersionProbe reads the API server's reported version.
 type serverVersionProbe struct{}
 
-func (serverVersionProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[VersionInfo]) supervisor.Result {
+func (serverVersionProbe) Run(ctx context.Context, pass *supervisor.JobPass[VersionInfo]) supervisor.Result {
 	conn := connFrom(pass.Snapshot())
 	if conn == nil {
 		return supervisor.Skip()
@@ -361,7 +361,7 @@ func (serverVersionProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[V
 // authoritative answer: a token names its subject to the server, not to us.
 type principalProbe struct{}
 
-func (principalProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[Principal]) supervisor.Result {
+func (principalProbe) Run(ctx context.Context, pass *supervisor.JobPass[Principal]) supervisor.Result {
 	conn := connFrom(pass.Snapshot())
 	if conn == nil {
 		return supervisor.Skip()

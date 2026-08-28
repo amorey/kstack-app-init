@@ -34,7 +34,6 @@ import (
 	"context"
 	"log/slog"
 	"sync"
-	"time"
 
 	"github.com/amorey/gobus/conflate"
 
@@ -90,15 +89,15 @@ type kindID struct{ apiVersion, resource string }
 func idOf(k kubestore.Kind) kindID { return kindID{k.APIVersion, k.Resource} }
 
 // option is the test seam: the exported constructor takes production knobs only, and the
-// kind reconciler is substituted from white-box tests. The sweep has none — both run on a
+// kind worker is substituted from white-box tests. The sweep has none — both run on a
 // supervisor over whatever the connection reaches, so a test hands it an api server.
 type option func(*Service)
 
-// withKindReconciler substitutes the reconciler every kind subject runs, for a test about
-// arming rather than about what a kind sync reads. It is handed the Service because a
-// substitute takes the same admission the real one does.
-func withKindReconciler(build func(*Service) supervisor.Reconciler[*kindStream]) option {
-	return func(s *Service) { s.buildKindReconciler = build }
+// withKindSync substitutes the worker every kind subject runs, for a test about arming rather
+// than about what a kind sync reads. It is handed the Service because a substitute takes the
+// same admission the real one does.
+func withKindSync(build func(*Service) supervisor.Worker[Reason]) option {
+	return func(s *Service) { s.buildKindSync = build }
 }
 
 // withPacing shrinks what a kind sync runs on, so no test outwaits a production number.
@@ -110,13 +109,13 @@ type Service struct {
 	connSvc  connService
 	storeMgr storeManager
 
-	// Two supervisors, because their subjects are different things. discoverySupervisor runs
-	// the three probes of discovery.go over one subject per armed cache; kindSupervisor runs
-	// the kind reconciler over one subject per kind, where a run establishes the stream and
-	// commits it as its value rather than being it.
+	// Two supervisors, because their subjects are different things — and two kinds of thing
+	// run on them. discoverySupervisor runs the three JOBS of discovery.go over one subject
+	// per armed cache; kindSupervisor runs one WORKER per kind, whose run is that kind's
+	// stream from the cold list to the last delta.
 	discoverySupervisor *supervisor.Supervisor
 	kindSupervisor      *supervisor.Supervisor
-	buildKindReconciler func(*Service) supervisor.Reconciler[*kindStream]
+	buildKindSync       func(*Service) supervisor.Worker[Reason]
 	pacing              pacing
 
 	// One news feed per level, because their consumers are two beehive triggers and a
@@ -134,10 +133,10 @@ type Service struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// Two locks, one rule each. armMu serializes arming and forgetting, which wait for runs
-	// and streams to stop. mu guards everything a run and a reader share — the maps below
-	// plus each session's runs and committed states — and, because a run commits through it,
-	// is NEVER held while waiting for one.
+	// Two locks, one rule each. armMu serializes arming and forgetting, which wait for runs to
+	// stop. mu guards everything a run and a reader share — the maps below plus each session's
+	// runs and stamps — and, because a run writes through it, is NEVER held while waiting for
+	// one.
 	armMu sync.Mutex
 
 	mu sync.Mutex
@@ -167,10 +166,10 @@ func New(connSvc connService, storeMgr storeManager, opts ...option) *Service {
 	for _, opt := range opts {
 		opt(s)
 	}
-	s.kindSupervisor = supervisor.New(supervisor.WithWorkers(s.pacing.kindSyncWorkers))
-	if s.buildKindReconciler == nil {
-		s.buildKindReconciler = func(s *Service) supervisor.Reconciler[*kindStream] {
-			return kindReconciler{s: s, pacing: s.pacing}
+	s.kindSupervisor = supervisor.New(supervisor.WithStartConcurrency(s.pacing.kindStartConcurrency))
+	if s.buildKindSync == nil {
+		s.buildKindSync = func(s *Service) supervisor.Worker[Reason] {
+			return kindSync{s: s, pacing: s.pacing}
 		}
 	}
 	registerProbes(s.discoverySupervisor, s)
@@ -180,14 +179,12 @@ func New(connSvc connService, storeMgr storeManager, opts ...option) *Service {
 	return s
 }
 
-// registerKindSync wires the kind reconciler. WithTimeout(0) because a cold list of a large
-// kind legitimately outlasts any bound the reads want, and the interval is a liveness re-check
-// — the stream's own exit is the real re-entry.
+// registerKindSync wires the kind worker. It states only the ladder: a worker's start timeout
+// defaults to none, which a cold list of a large kind needs, and its restart floor comes from the
+// ladder's base — the exit is the re-entry, so there is no cadence to state.
 func registerKindSync(e *supervisor.Supervisor, s *Service) {
-	supervisor.Register(e, nameKindSync, s.buildKindReconciler(s),
-		supervisor.WithInterval(kindSyncInterval),
-		supervisor.WithBackoff(s.pacing.backoff.Base, s.pacing.backoff.Factor, s.pacing.backoff.Cap),
-		supervisor.WithTimeout(0))
+	supervisor.RegisterWorker(e, nameKindSync, s.buildKindSync(s),
+		supervisor.WithBackoff(s.pacing.backoff.Base, s.pacing.backoff.Factor, s.pacing.backoff.Cap))
 }
 
 // publishDiscovery projects what a pass left and records it, which is what wakes the cache
@@ -293,10 +290,9 @@ func (s *Service) ForgetKind(cacheID int64, k kubestore.Kind) {
 	s.stopKind(sess, id)
 }
 
-// stopKind takes one kind down and waits for it: its subject is removed — which hands its stream
-// back, cancel and join — the run in flight is cancelled and joined, and its verdict is dropped
-// last. Past here nothing can write through this kind, which is what makes forgetting synchronous
-// and a rename safe to re-arm behind.
+// stopKind takes one kind down and waits for it: Remove cancels the worker and joins it, and what
+// the session held for the kind is dropped after. Past here nothing can write through this kind,
+// which is what makes forgetting synchronous and a rename safe to re-arm behind.
 //
 // The cancel is what bounds the join: what remains of a run is a page request unwinding, not
 // the cold list it was in the middle of.
@@ -307,60 +303,49 @@ func (s *Service) stopKind(sess *session, id kindID) {
 	s.kindSupervisor.Remove(kindSubject(sess.cacheID, kubestore.Kind{
 		APIVersion: id.apiVersion, Resource: id.resource,
 	}))
-	sess.cancelKindRun(id).join()
 	// **After the join, and that is what makes it final.** A rename leaves the kind tracked
-	// under its new singular, so commitKind refuses nothing the old generation reports on its
-	// way down — dropped any earlier, that report would re-create the entry and serve a
-	// withdrawn generation's verdict for the one that replaced it, before it has listed a row.
-	sess.dropKindState(id)
+	// under its new singular, so nothing refuses what the old generation stamps on its way
+	// down — dropped any earlier, those stamps would come back and be served for the
+	// generation that replaced it, before it had listed a row.
+	sess.dropKind(id)
 }
 
-// publishKind overlays what the supervisor knows onto what the kind's syncer committed. The
-// ladder, the count and the countdown are the supervisor's; the reason is the syncer's except
-// where an attempt outranks it.
+// publishKind wakes one kind's record when the answer a reader would get has MOVED. OnPass fires
+// on every pass, schedule-only ones included, so the baseline is the session's: without it every
+// pass would wake every record.
 func (s *Service) publishKind(subject string, snap supervisor.Snapshot) {
 	cacheID, id, ok := parseKindSubject(subject)
 	if !ok {
 		return
 	}
-	sess := s.sessionOf(cacheID)
-	if sess == nil {
-		return
+	key, moved := s.recordKindReason(cacheID, id, snap)
+	if moved {
+		_ = s.kindHub.Sender().Send(key, struct{}{})
 	}
-	a := snap.Attempts(nameKindSync)
-	// Which attempts outrank the syncer: a suspension is why nothing is syncing, and a failure
-	// is what went wrong. A rotation outranks nothing — the rows stay current across it.
-	outranks := a.LastAttempt.Verdict == supervisor.VerdictSuspended ||
-		(a.LastAttempt.Verdict == supervisor.VerdictFailed && a.LastAttempt.Reason != reasonWatchRotated)
+}
 
-	if _, had := sess.kindState(id); !had && !outranks {
-		// The syncer has said nothing and the attempt has nothing to add: a kind armed but not
-		// yet answered stands behind no answer, and the seam promises the getter says so.
-		// Publishing the overlay alone would invent one and wake its record for nothing.
-		return
+// recordKindReason files what this pass would tell a reader and reports whether it is news. A
+// pass for a kind nobody tracks, or one under a cache nobody has armed, is neither.
+func (s *Service) recordKindReason(cacheID int64, id kindID, snap supervisor.Snapshot) (KindKey, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, armed := s.sessions[cacheID]
+	k, tracked := s.tracked[cacheID][id]
+	if !armed || !tracked {
+		return KindKey{}, false
 	}
-
-	s.commitKindState(sess, id, func(state KindState, _ bool) KindState {
-		// Restarts is the streak, which only a frame ends — the establishing run is
-		// Provisional, so it climbs across every death until the stream proves itself.
-		state.Restarts = a.Failures
-		// A healthy stream has a liveness re-check scheduled, and the seam promises this is
-		// zero while one is up: only a run that is down is retrying.
-		state.NextRetryAt = time.Time{}
-		if a.LastAttempt.Verdict == supervisor.VerdictFailed {
-			state.NextRetryAt = a.NextAttempt.ScheduledAt
-		}
-		if outranks {
-			reason := a.LastAttempt.Reason
-			if a.LastAttempt.Verdict == supervisor.VerdictFailed {
-				reason = ReasonSyncFailed
-			}
-			state.setReason(reason, a.LastAttempt.Message)
-		}
-		// A succeeded attempt and a rotation both overlay nothing: the syncer's answer stands,
-		// which is what keeps a resume — and a reopen — holding Watching.
-		return state
-	})
+	state, ok := kindStateOf(snap, sess.kindStamps[id])
+	if !ok {
+		// A kind armed but not yet answered stands behind no answer, and the seam promises
+		// the getter says so — so there is nothing to wake a record for.
+		return KindKey{}, false
+	}
+	if prev, had := sess.published[id]; had && prev == Reason(state.Reason) {
+		return KindKey{}, false
+	}
+	sess.published[id] = Reason(state.Reason)
+	return KindKey{CacheID: cacheID, Kind: k}, true
 }
 
 // RestartAll restarts every armed kind in place, off its cookie — what a resume poke needs,
@@ -385,16 +370,82 @@ func (s *Service) GetDiscoveryState(cacheID int64) (DiscoveryState, bool) {
 	return sess.discoveryState, true
 }
 
-// GetKindState is one kind's standing answer, false until it has committed one.
+// GetKindState is one kind's standing answer, false until something has answered. **Assembled at
+// read**, from the three that own its parts: the verdict the worker committed, the pacing the
+// supervisor knows, and the stamps the session keeps. Nothing stores it, because a stored copy
+// would be a stale duplicate of all three.
 func (s *Service) GetKindState(cacheID int64, k kubestore.Kind) (KindState, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sess, ok := s.sessions[cacheID]
+	snap, ok := s.kindSupervisor.Read(kindSubject(cacheID, k))
 	if !ok {
 		return KindState{}, false
 	}
-	state, ok := sess.kindStates[idOf(k)]
-	return state, ok
+
+	s.mu.Lock()
+	sess, armed := s.sessions[cacheID]
+	var stamps kindStamps
+	if armed {
+		stamps = sess.kindStamps[idOf(k)]
+	}
+	s.mu.Unlock()
+
+	if !armed {
+		return KindState{}, false
+	}
+	return kindStateOf(snap, stamps)
+}
+
+// kindStateOf is that assembly. The verdict is the worker's except where an attempt outranks it:
+// a suspension is why nothing is syncing, and a failure is what went wrong. A clean exit outranks
+// nothing — the rows stay current across a rotation, and saying otherwise would flicker every
+// kind through SyncFailed every few minutes.
+func kindStateOf(snap supervisor.Snapshot, stamps kindStamps) (KindState, bool) {
+	o := supervisor.GetWorkerObservation[Reason](snap, nameKindSync)
+	// **A run in flight speaks for itself**, two ways: it is up — which is what Live means,
+	// and what a re-established stream has to say for itself, since re-reporting the Watching
+	// it already stood behind commits nothing — or it has committed something since the last
+	// attempt ended, which is a relist announcing Resyncing before it has a frame.
+	//
+	// Without this a kind cold-listing after a 410 would read SyncFailed while it relisted, and
+	// one whose connection came back would read IdentityMismatch for as long as it streamed. A
+	// run that has said nothing yet and is not up is still described by that exit, which is
+	// what keeps a suspension standing across the gate check that re-enters it.
+	spoken := o.Live() || (o.InFlight() && o.ChangedAt.After(o.LastAttempt.FinishedAt))
+	outranks := !spoken && (o.LastAttempt.Verdict == supervisor.VerdictSuspended ||
+		o.LastAttempt.Verdict == supervisor.VerdictFailed)
+	if !o.Known() && !outranks {
+		return KindState{}, false
+	}
+
+	state := KindState{
+		Reason: string(o.Value),
+		Live:   o.Live(),
+		// The worker commits exactly when its reason moves, so when the supervisor last saw
+		// its value change IS when the reason last moved.
+		SinceAt:      o.ChangedAt,
+		LastUpdateAt: stamps.LastUpdateAt,
+		LastLiveAt:   stamps.LastLiveAt,
+		Restarts:     o.Restarts,
+	}
+	if outranks && o.LastAttempt.Verdict == supervisor.VerdictFailed {
+		// Gated on the same rule, because the seam promises this is zero while a stream is up:
+		// only a run that is DOWN is retrying, and a run that has spoken is not down. Left
+		// ungated it would serve the countdown of the failure the live stream recovered from.
+		state.NextRetryAt = o.NextAttempt.ScheduledAt
+	}
+	if outranks {
+		reason := o.LastAttempt.Reason
+		state.SinceAt = o.LastAttempt.FinishedAt
+		if o.LastAttempt.Verdict == supervisor.VerdictFailed {
+			// Every way a stream fails reads the same to a consumer — NeverReady and the
+			// rest are the supervisor's vocabulary, and the message is what says which.
+			reason = ReasonSyncFailed
+			// The streak's start rather than the last retry in it: "failing since 10:02" is
+			// what a reader wants, where "failing since a second ago" is not.
+			state.SinceAt = o.FailingSince
+		}
+		state.Reason, state.Message = string(reason), o.LastAttempt.Message
+	}
+	return state, true
 }
 
 // WatchDiscoveryNews carries the caches whose sweep has something new to say. Close it
@@ -557,43 +608,5 @@ func (s *Service) commitDiscovery(sess *session, state DiscoveryState) {
 
 	if moved {
 		_ = s.discoveryHub.Sender().Send(sess.cacheID, struct{}{})
-	}
-}
-
-// commitKind records one kind's answer and wakes its record when the reason moved — a resume
-// is not news, since a watch re-established off its cookie changed nothing a reader can act
-// on. A run that outlived its session or its registration writes nothing: the claims it wrote
-// through are gone, and a kind nobody tracks has no reader to tell — which is what lets
-// ForgetKind return without ordering anything after the join.
-func (s *Service) commitKind(sess *session, id kindID, state KindState) {
-	s.commitKindState(sess, id, func(stored KindState, had bool) KindState {
-		// **The syncer owns the reason and the stamps, never the countdown.** Restarts and
-		// NextRetryAt are the supervisor's, projected by publishKind, and this copy was taken
-		// when the run began — writing it back would restore the countdown of the failure it
-		// recovered from, and leave a healthy stream reading as one that is retrying.
-		if had {
-			state.Restarts, state.NextRetryAt = stored.Restarts, stored.NextRetryAt
-		}
-		return state
-	})
-}
-
-// commitKindState is the one writer of what a reader sees for a kind. Its two callers own
-// different fields of the same answer, so each hands in a merge rather than a whole state:
-// applied under the lock, so neither can lose the other's write.
-func (s *Service) commitKindState(sess *session, id kindID, merge func(stored KindState, had bool) KindState) {
-	s.mu.Lock()
-	k, tracked := s.tracked[sess.cacheID][id]
-	if s.sessions[sess.cacheID] != sess || !tracked {
-		s.mu.Unlock()
-		return
-	}
-	prev, had := sess.kindStates[id]
-	state := merge(prev, had)
-	sess.kindStates[id] = state
-	s.mu.Unlock()
-
-	if !had || prev.Reason != state.Reason {
-		_ = s.kindHub.Sender().Send(KindKey{CacheID: sess.cacheID, Kind: k}, struct{}{})
 	}
 }

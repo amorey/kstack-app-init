@@ -33,8 +33,8 @@ import (
 // recorded the way the supervisor would.
 func connect(t *testing.T, cfg *fakeKubeconfig, v connInfo) (supervisor.Result, connInfo) {
 	t.Helper()
-	pass := supervisor.NewPass("prod", &v, supervisor.Snapshot{})
-	res := (&connectionProbe{kubecfgSvc: cfg}).Reconcile(t.Context(), pass)
+	pass := supervisor.NewJobPass("prod", &v, supervisor.Snapshot{})
+	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
 	if next, ok := pass.Updated(); ok {
 		v = next
 	}
@@ -49,8 +49,8 @@ func TestTheConnectionProbeCommitsOnlyOnAChange(t *testing.T) {
 	_, first := connect(t, cfg, connInfo{departed: true})
 	require.False(t, first.departed, "the context resolves, so it is back")
 
-	pass := supervisor.NewPass("prod", &first, supervisor.Snapshot{})
-	res := (&connectionProbe{kubecfgSvc: cfg}).Reconcile(t.Context(), pass)
+	pass := supervisor.NewJobPass("prod", &first, supervisor.Snapshot{})
+	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
 
 	assert.Equal(t, ReasonUnreachable, res.Reason())
 	_, recorded := pass.Updated()
@@ -181,8 +181,8 @@ func TestConnectionKeepsItsConnectionWhileTheCredentialsHold(t *testing.T) {
 	_, first := connect(t, cfg, connInfo{})
 	require.NotNil(t, first.conn)
 
-	pass := supervisor.NewPass("prod", &first, supervisor.Snapshot{})
-	res := (&connectionProbe{kubecfgSvc: cfg}).Reconcile(t.Context(), pass)
+	pass := supervisor.NewJobPass("prod", &first, supervisor.Snapshot{})
+	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
 
 	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	_, recorded := pass.Updated()
@@ -724,7 +724,7 @@ func TestACanceledRunRecordsNothing(t *testing.T) {
 		{nameConnection, func() supervisor.Result {
 			cfg := serving(cs.Server, "prod", "key-1")
 			prev := connInfo{conn: conn, fingerprint: "key-1"}
-			return (&connectionProbe{kubecfgSvc: cfg}).Reconcile(ctx, supervisor.NewPass("prod", &prev, supervisor.Snapshot{}))
+			return (&connectionProbe{kubecfgSvc: cfg}).Run(ctx, supervisor.NewJobPass("prod", &prev, supervisor.Snapshot{}))
 		}},
 		{nameReadiness, func() supervisor.Result { return runCanceled(t, ctx, readinessProbe{}, conn) }},
 		{nameServerUID, func() supervisor.Result { return runCanceled(t, ctx, serverUIDProbe{}, conn) }},
@@ -738,8 +738,8 @@ func TestACanceledRunRecordsNothing(t *testing.T) {
 }
 
 // runCanceled runs one probe body on a context that is already done.
-func runCanceled[T any](t *testing.T, ctx context.Context, p supervisor.Reconciler[T], conn *Connection) supervisor.Result {
+func runCanceled[T any](t *testing.T, ctx context.Context, p supervisor.Job[T], conn *Connection) supervisor.Result {
 	t.Helper()
 	snap := supervisor.NewSnapshot(map[string]any{nameConnection: connInfo{conn: conn}})
-	return p.Reconcile(ctx, supervisor.NewPass[T]("prod", nil, snap))
+	return p.Run(ctx, supervisor.NewJobPass[T]("prod", nil, snap))
 }

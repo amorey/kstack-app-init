@@ -303,8 +303,8 @@ func answering(id kubeconn.Identity, err error) *fakeKubeconn {
 // answeredWith is a check that answered v at probedAt.
 func answeredWith[T any](v T) kubeconn.Observation[T] {
 	return kubeconn.Observation[T]{
-		Value:    v,
-		LastSeen: probedAt,
+		Value:      v,
+		LastSeenAt: probedAt,
 		Attempts: kubeconn.Attempts{
 			LastAttempt: finished(kubeconn.ReasonSucceeded, ""),
 		},

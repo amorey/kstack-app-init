@@ -39,4 +39,3 @@ cache's rows back (→ [ADR](../adr/2026-08-26-cached-data-read-loop.md)), but n
 | --- | --- | --- |
 | [The kubesync seam](kubesync-seam.md) | sidecar | Steps 1–3 built |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |
-| [Supervisor jobs and workers](supervisor-jobs-and-workers.md) | sidecar | Planned |

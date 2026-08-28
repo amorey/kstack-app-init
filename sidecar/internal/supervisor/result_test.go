@@ -25,7 +25,7 @@ import (
 var runAt = time.Date(2026, 8, 24, 10, 5, 0, 0, time.UTC)
 
 // recorded is the attempt one finished run leaves, built the way the supervisor builds it.
-func recorded(res Result, at time.Time) Attempt { return attemptOf(res, at, at) }
+func recorded(res Result, at time.Time) Attempt { return attemptOf(res, at, time.Time{}, at) }
 
 func failedAt(at time.Time) Attempt {
 	return Attempt{FinishedAt: at, Verdict: VerdictFailed, Reason: "Unreachable"}
@@ -76,7 +76,7 @@ func TestTheZeroResultIsInvalid(t *testing.T) {
 	assert.NotEqual(t, resultInvalid, Skip().kind)
 }
 
-// The read side is what a reconciler body's own tests assert on, without giving a body a way to build
+// The read side is what a body's own tests assert on, without giving a body a way to build
 // a Result the constructors cannot.
 func TestAResultReportsWhatItWasBuiltFrom(t *testing.T) {
 	err := errors.New("open ca.crt: no such file")
@@ -107,35 +107,82 @@ func TestLatencyIsOnlyForARunThatWasDispatchedAndFinished(t *testing.T) {
 	assert.Equal(t, 2*time.Second, ran.Latency())
 }
 
-// A provisional success records the verdict but leaves the streak alone: the run started
-// something it cannot yet vouch for, and only the proof it is waiting on ends the streak.
-func TestAProvisionalSuccessLeavesTheStreakStanding(t *testing.T) {
-	a := Attempts{Failures: 3, FailingSince: runAt}
+// A healthy stretch begins at the first success and stands across the ones that follow: what a
+// caller asks is how long this has been working, not when it last worked.
+func TestAHealthyStretchStandsAcrossTheSuccessesInsideIt(t *testing.T) {
+	a := Attempts{}
 
-	a.record(recorded(Succeeded().Provisional(), runAt.Add(time.Minute)))
+	a.record(recorded(Succeeded(), runAt))
+	assert.Equal(t, runAt, a.HealthySince)
+	assert.Zero(t, a.Restarts, "the stretch's own first run is not a restart")
 
-	assert.True(t, a.OK(), "the verdict is a success")
-	assert.Equal(t, 3, a.Failures, "the streak stands until something proves the run")
-	assert.Equal(t, runAt, a.FailingSince)
-
-	// The ladder climbs from where it stood rather than restarting at the base.
-	a.record(failedAt(runAt.Add(2 * time.Minute)))
-	assert.Equal(t, 4, a.Failures)
-
-	// And the plain success is what ends it.
-	a.record(recorded(Succeeded(), runAt.Add(3*time.Minute)))
-	assert.Zero(t, a.Failures)
-	assert.True(t, a.FailingSince.IsZero())
+	a.record(recorded(Succeeded(), runAt.Add(time.Minute)))
+	assert.Equal(t, runAt, a.HealthySince, "the stretch did not restart")
 }
 
-// Provisional is a modifier on a success, as RequeueAfter is: there is nothing to hold back
-// on a verdict that already ends no streak.
-func TestProvisionalIsInertOnAFailureAndASuspension(t *testing.T) {
-	failed := Attempts{Failures: 1, FailingSince: runAt}
-	failed.record(recorded(Fail("Unreachable", errors.New("no route")).Provisional(), runAt))
-	assert.Equal(t, 2, failed.Failures)
+// Restarts is what HealthySince makes countable: the flapping question Failures cannot answer,
+// since a thing that goes down and comes back inside a healthy stretch never fails.
+func TestRestartsCountTheRunsInsideAHealthyStretch(t *testing.T) {
+	a := Attempts{}
+	a.record(recorded(Succeeded(), runAt))
 
-	suspended := Attempts{Failures: 1, FailingSince: runAt}
-	suspended.record(recorded(Suspend("NoConnection", "waiting").Provisional(), runAt))
-	assert.Zero(t, suspended.Failures)
+	a.begin(runAt.Add(time.Minute))
+	assert.Equal(t, 1, a.Restarts)
+	a.record(recorded(Succeeded(), runAt.Add(2*time.Minute)))
+	a.begin(runAt.Add(3 * time.Minute))
+	assert.Equal(t, 2, a.Restarts)
+
+	assert.Zero(t, a.Failures, "nothing failed across either")
+}
+
+// A failure ends the stretch, so "healthy for an hour" cannot survive the hour being broken. A
+// suspension ends it too: it parks the question rather than failing at it, but nothing is
+// running either way.
+func TestAFailureAndASuspensionBothEndTheHealthyStretch(t *testing.T) {
+	failed := Attempts{HealthySince: runAt, Restarts: 7}
+	failed.record(failedAt(runAt.Add(time.Minute)))
+	assert.True(t, failed.HealthySince.IsZero())
+	assert.Zero(t, failed.Restarts)
+
+	suspended := Attempts{HealthySince: runAt, Restarts: 7}
+	suspended.record(recorded(Suspend("NoConnection", "waiting"), runAt.Add(time.Minute)))
+	assert.True(t, suspended.HealthySince.IsZero())
+	assert.Zero(t, suspended.Restarts)
+}
+
+// A worker is healthy from the moment it says so, not from the exit that follows — so the stretch
+// is open while it runs. **The streak it inherited stands**, because starting is not proof: what
+// clears one is a run that finished cleanly.
+func TestReadyOpensTheHealthyStretchAndLeavesTheStreakStanding(t *testing.T) {
+	a := Attempts{Failures: 3, FailingSince: runAt}
+	a.begin(runAt)
+
+	a.markReady(runAt.Add(time.Second))
+
+	assert.Equal(t, runAt.Add(time.Second), a.HealthySince)
+	assert.True(t, a.Ready(), "running, and it said it was up")
+	assert.Equal(t, 3, a.Failures, "the ladder still stands behind it")
+
+	// The clean exit is what clears it, and the stretch Ready opened outlives that exit.
+	a.record(recorded(Succeeded(), runAt.Add(time.Minute)))
+	assert.Zero(t, a.Failures)
+	assert.Equal(t, runAt.Add(time.Second), a.HealthySince)
+}
+
+// Ready is a worker's word, so a job — which stamps none — is never ready, and neither is a
+// worker between its exit and its next start.
+func TestReadyIsFalseWithoutARunThatSaidSo(t *testing.T) {
+	var idle Attempts
+	assert.False(t, idle.Ready(), "nothing has run")
+
+	job := Attempts{}
+	job.begin(runAt)
+	assert.False(t, job.Ready(), "a job stamps no ReadyAt")
+
+	exited := Attempts{}
+	exited.begin(runAt)
+	exited.markReady(runAt)
+	exited.record(recorded(Succeeded(), runAt.Add(time.Minute)))
+	exited.schedule(runAt.Add(2 * time.Minute))
+	assert.False(t, exited.Ready(), "it is down, whatever it proved while it was up")
 }

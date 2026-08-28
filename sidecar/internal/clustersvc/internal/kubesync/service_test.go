@@ -59,7 +59,7 @@ func TestTrackDiscoveryRebuildsWhenParamsMove(t *testing.T) {
 }
 
 func TestKindTrackedAgainstAnUnarmedCacheIsHeldUntilItIsArmed(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
 	start(t, svc)
@@ -75,7 +75,7 @@ func TestKindTrackedAgainstAnUnarmedCacheIsHeldUntilItIsArmed(t *testing.T) {
 }
 
 func TestARegistrationOutlivesItsCacheBeingForgotten(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
 	start(t, svc)
@@ -91,7 +91,7 @@ func TestARegistrationOutlivesItsCacheBeingForgotten(t *testing.T) {
 }
 
 func TestAKindWaitsForAConnectionVouchingForItsServerUID(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
 	start(t, svc)
 
@@ -107,7 +107,7 @@ func TestAKindWaitsForAConnectionVouchingForItsServerUID(t *testing.T) {
 }
 
 func TestForgetKindWaitsForItsWorker(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
 	start(t, svc)
@@ -123,7 +123,7 @@ func TestForgetKindWaitsForItsWorker(t *testing.T) {
 }
 
 func TestForgetDiscoveryWaitsForEveryWorkerUnderIt(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
 	start(t, svc)
@@ -167,7 +167,7 @@ func TestDiscoveryNewsIsKeyedByCacheID(t *testing.T) {
 }
 
 func TestKindNewsIsKeyedByCacheAndKind(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
 	runs := fake.runs
 	pool.lease("prod").vouch(t, "uid-1")
@@ -181,7 +181,7 @@ func TestKindNewsIsKeyedByCacheAndKind(t *testing.T) {
 	svc.TrackKind(1, kind)
 	r := runs.Await(t, "the sync runs")
 
-	r.Commit(KindState{Reason: ReasonWatching})
+	r.Report(ReasonWatching)
 	ev := testutil.Recv(t, news.Chan(), "the kind's record is woken")
 	assert.Equal(t, KindKey{CacheID: 1, Kind: kind}, ev.Key)
 
@@ -191,7 +191,7 @@ func TestKindNewsIsKeyedByCacheAndKind(t *testing.T) {
 }
 
 func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
 	runs := fake.runs
 	pool.lease("prod").vouch(t, "uid-1")
@@ -200,7 +200,7 @@ func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
 	kind := testKind("apps/v1", "Deployment", "deployments")
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, kind)
-	runs.Await(t, "the sync runs").Commit(KindState{Reason: ReasonWatching})
+	runs.Await(t, "the sync runs").Report(ReasonWatching)
 
 	// The plural is unchanged, so this is the same collection under a new Kind name. The
 	// worker that answered Watching is stopped, and the one replacing it may still be
@@ -210,14 +210,14 @@ func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
 	_, ok := svc.GetKindState(1, renamed)
 	assert.False(t, ok, "a replacement starts with no answer")
 
-	runs.Await(t, "the replacement runs").Commit(KindState{Reason: ReasonSyncing})
+	runs.Await(t, "the replacement runs").Report(ReasonSyncing)
 	got, ok := svc.GetKindState(1, renamed)
 	require.True(t, ok)
 	assert.Equal(t, ReasonSyncing, got.Reason)
 }
 
 func TestRestartAllReEntersEveryArmedKind(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
 	start(t, svc)
@@ -236,7 +236,7 @@ func TestRestartAllReEntersEveryArmedKind(t *testing.T) {
 }
 
 func TestStopDrainsEveryWorker(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
 
@@ -257,7 +257,7 @@ func TestStopDrainsEveryWorker(t *testing.T) {
 func TestACacheWhoseStoreWillNotOpenArmsNothing(t *testing.T) {
 	pool := newFakePool()
 	stores := &refusingStores{}
-	svc := New(pool, stores, newFakeKindReconciler().option())
+	svc := New(pool, stores, newFakeKindSync().option())
 	t.Cleanup(func() { _ = svc.Close() })
 
 	svc.TrackDiscovery(1, testParams)
@@ -317,7 +317,7 @@ func TestAPassPublishesNothingForASubjectThatIsNotACache(t *testing.T) {
 	svc.publishDiscovery(discoverySubject(404), supervisor.Snapshot{})
 }
 
-func TestAStoppedWorkersAnswerIsDropped(t *testing.T) {
+func TestAStoppedSessionsAnswerIsDropped(t *testing.T) {
 	svc, _ := newTestService(t)
 	kind := testKind("apps/v1", "Deployment", "deployments")
 	svc.TrackDiscovery(1, testParams)
@@ -327,7 +327,6 @@ func TestAStoppedWorkersAnswerIsDropped(t *testing.T) {
 	// teardown looks like: the answer belongs to nobody and is dropped.
 	svc.ForgetDiscovery(1)
 	svc.commitDiscovery(sess, DiscoveryState{Reason: ReasonDiscovered})
-	svc.commitKind(sess, idOf(kind), KindState{Reason: ReasonWatching})
 
 	svc.TrackDiscovery(1, testParams)
 	_, ok := svc.GetDiscoveryState(1)
@@ -361,7 +360,7 @@ func TestStoppingWithNoTimeLeftReportsTheEngineRefusing(t *testing.T) {
 // is minutes, and forgetting is synchronous. The join is outside armMu, so arming another cache
 // is not held behind it either.
 func TestForgetKindCancelsTheRunInFlightRatherThanWaitingItOut(t *testing.T) {
-	fake := newParkingKindReconciler()
+	fake := newParkingKindSync()
 	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
 	start(t, svc)
@@ -385,7 +384,7 @@ func TestForgetKindCancelsTheRunInFlightRatherThanWaitingItOut(t *testing.T) {
 // collection, and a rename gives them different singulars to key rows by. A generation is a run
 // and the stream it starts, and it ends when that stream is joined.
 func TestARenameNeverRunsTwoGenerationsAtOnce(t *testing.T) {
-	kinds := newParkingKindReconciler()
+	kinds := newParkingKindSync()
 	svc, pool := newTestService(t, kinds.option())
 	pool.lease("prod").vouch(t, "uid-1")
 	start(t, svc)
@@ -406,7 +405,7 @@ func TestARenameNeverRunsTwoGenerationsAtOnce(t *testing.T) {
 // again, commitKind stops refusing that run, and its last act is published as the new
 // registration's answer.
 func TestARetrackDuringAForgetCannotReviveTheWithdrawnRunsWrite(t *testing.T) {
-	kinds := newParkingKindReconciler()
+	kinds := newParkingKindSync()
 	svc, pool := newTestService(t, kinds.option())
 	pool.lease("prod").vouch(t, "uid-1")
 	start(t, svc)
@@ -436,8 +435,8 @@ func TestARetrackDuringAForgetCannotReviveTheWithdrawnRunsWrite(t *testing.T) {
 // generation reports on its way down. Its verdict must still not be served for the generation
 // that replaced it: the rows are keyed by the new singular and nothing has listed them yet.
 func TestARenameDropsTheOldGenerationsVerdictThoughTheKindStaysTracked(t *testing.T) {
-	fake := newFakeKindReconciler()
-	fake.reportOnStreamExit = true
+	fake := newFakeKindSync()
+	fake.reportOnExit = true
 	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
 	start(t, svc)

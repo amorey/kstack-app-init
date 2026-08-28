@@ -464,9 +464,9 @@ session's life, a discovery loop, and a worker per kind.
   it. The supervisor owns each one's cadence and backoff ladder and the `Wake` the store bus below
   turns into a prompt re-run; `DiscoveryState` is projected from the snapshot, so the seam stays
   this package's vocabulary rather than the supervisor's. The kind syncs run on a second supervisor
-  over per-kind subjects — a run establishes the stream and commits it as the reconciler's value
-  rather than being the stream, and the supervisor's worker cap is what bounds the relists in
-  flight. → [ADR](../adr/2026-08-28-the-stream-is-the-value.md).
+  over per-kind subjects, as WORKERS rather than jobs: a run IS that kind's stream, from the cold
+  list to the last delta, and the supervisor's start cap is what bounds the relists in flight.
+  → [ADR](../adr/2026-08-28-jobs-and-workers.md).
 - **Discovery is a probe whose collection cannot be watched.** `/api` and `/apis` are plain GETs
   with no resourceVersion and no watch verb, so the sweep is a cold list with no watch phase, and
   it re-lists on the supervisor's cadence where a kind's sync would go live. `SyncKinds` reconciles its answer

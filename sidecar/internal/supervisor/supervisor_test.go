@@ -29,7 +29,12 @@ import (
 // subj is the one subject most tests track.
 const subj = "ctx-1"
 
-// steered is a reconciler the test steers: the result is swapped at will, runs are counted, and an
+// quietWindow bounds a negative assertion — something that must NOT have happened — which has no
+// event to wait for and so needs a window of its own rather than testutil's failsafe. Short:
+// what it watches for would already have happened.
+const quietWindow = 50 * time.Millisecond
+
+// steered is a job the test steers: the result is swapped at will, runs are counted, and an
 // optional hook fires inside the run — which is how a test interleaves a Remove or a Wake with
 // a run in flight.
 type steered struct {
@@ -41,7 +46,7 @@ type steered struct {
 	sawDeadline bool
 }
 
-func (p *steered) Reconcile(ctx context.Context, pass *Pass[string]) Result {
+func (p *steered) Run(ctx context.Context, pass *JobPass[string]) Result {
 	p.mu.Lock()
 	p.runs++
 	_, p.sawDeadline = ctx.Deadline()
@@ -60,31 +65,31 @@ func (p *steered) Reconcile(ctx context.Context, pass *Pass[string]) Result {
 func (p *steered) set(res Result) { p.mu.Lock(); defer p.mu.Unlock(); p.res = res }
 func (p *steered) count() int     { p.mu.Lock(); defer p.mu.Unlock(); return p.runs }
 
-// reconcilerFunc adapts a bare func for a test that needs a one-off body.
-type reconcilerFunc func(ctx context.Context, pass *Pass[string]) Result
+// jobFunc adapts a bare func for a test that needs a one-off body.
+type jobFunc func(ctx context.Context, pass *JobPass[string]) Result
 
-func (f reconcilerFunc) Reconcile(ctx context.Context, pass *Pass[string]) Result {
+func (f jobFunc) Run(ctx context.Context, pass *JobPass[string]) Result {
 	return f(ctx, pass)
 }
 
-// single is an supervisor with one steered reconciler, closed on cleanup.
-func single(t *testing.T, res Result, opts ...ReconcilerOption) (*Supervisor, *steered, string) {
+// single is an supervisor with one steered job, closed on cleanup.
+func single(t *testing.T, res Result, opts ...RegistrationOption) (*Supervisor, *steered, string) {
 	t.Helper()
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	p := &steered{res: res}
-	Register(e, "conn", p, opts...)
+	RegisterJob(e, "conn", p, opts...)
 	return e, p, "conn"
 }
 
-// pair is single plus a reconciler requiring the first.
+// pair is single plus a job requiring the first.
 func pair(t *testing.T, aRes, bRes Result) (e *Supervisor, a, b *steered, aName, bName string) {
 	t.Helper()
 	e = New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	a, b = &steered{res: aRes}, &steered{res: bRes}
-	Register(e, "conn", a)
-	Register(e, "uid", b, WithDependencies("conn"))
+	RegisterJob(e, "conn", a)
+	RegisterJob(e, "uid", b, WithDependencies("conn"))
 	return e, a, b, "conn", "uid"
 }
 
@@ -95,8 +100,8 @@ func linked(t *testing.T, aRes, bRes Result) (e *Supervisor, a, b *steered, aNam
 	e = New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	a, b = &steered{res: aRes}, &steered{res: bRes}
-	Register(e, "conn", a)
-	Register(e, "uid", b, WithDependencies("conn"), WithWatches("conn"))
+	RegisterJob(e, "conn", a)
+	RegisterJob(e, "uid", b, WithDependencies("conn"), WithWatches("conn"))
 	return e, a, b, "conn", "uid"
 }
 
@@ -114,8 +119,8 @@ func (p *steered) commitsNothing() {
 	p.next = nil
 }
 
-// settled runs both reconcilers of a linked pair to a succeeded rest, so what follows is measured
-// against two reconcilers parked on their intervals rather than against a fresh subject's first pass.
+// settled runs both jobs of a linked pair to a succeeded rest, so what follows is measured
+// against two jobs parked on their intervals rather than against a fresh subject's first pass.
 func settled(t *testing.T, e *Supervisor) {
 	t.Helper()
 	e.Add(subj)
@@ -156,7 +161,7 @@ func runNext(t *testing.T, e *Supervisor) key {
 	t.Helper()
 	k, ok := e.runQ.Next(within(t))
 	require.True(t, ok, "the run queue closed")
-	e.runReconciler(t.Context(), k)
+	e.runOne(t.Context(), k, func() {})
 	e.runQ.Done(k)
 	e.settle()
 	return k
@@ -198,13 +203,13 @@ func noRuns(t *testing.T, e *Supervisor, msg string) {
 	}
 }
 
-// keyOf is the run-queue key for a reconciler the test names, which is what the queue is keyed by
+// keyOf is the run-queue key for a registration the test names, which is what the queue is keyed by
 // even though a name is what a caller addresses.
 func keyOf(e *Supervisor, name string) key {
-	return key{subject: subj, reconciler: e.byName[name]}
+	return key{subject: subj, registration: e.byName[name]}
 }
 
-// att reads one reconciler's attempts through Read.
+// att reads one registration's attempts through Read.
 func att(t *testing.T, e *Supervisor, name string) Attempts {
 	t.Helper()
 	v, ok := e.Read(subj)
@@ -232,26 +237,26 @@ func TestBackoffClimbsToItsCap(t *testing.T) {
 // --- registration ---
 
 // The supervisor's own knobs are options too, and a New that states none takes the defaults.
-func TestWithWorkersSetsTheRunWorkerCount(t *testing.T) {
-	assert.Equal(t, 3, New(WithWorkers(3)).settings.workers)
-	assert.Positive(t, New().settings.workers, "a default fleet")
+func TestWithStartConcurrencySetsTheSlotCount(t *testing.T) {
+	assert.Equal(t, 3, New(WithStartConcurrency(3)).settings.startConcurrency)
+	assert.Positive(t, New().settings.startConcurrency, "a default fleet")
 }
 
-// A supervisor with no workers drains nothing: every subject queues and no run is ever
-// dispatched, with no error, no log and no verdict to read. It is a table wired wrong at boot —
-// a settings struct built without the field — so it is refused the way every other one is.
-func TestASupervisorWithNoWorkersIsRefused(t *testing.T) {
-	assert.PanicsWithValue(t, "supervisor: WithWorkers needs at least one worker",
-		func() { New(WithWorkers(0)) })
-	assert.Panics(t, func() { New(WithWorkers(-1)) })
+// A supervisor with no slots admits nothing: every subject queues and no run is ever dispatched,
+// with no error, no log and no verdict to read. It is a table wired wrong at boot — a settings
+// struct built without the field — so it is refused the way every other one is.
+func TestASupervisorWithNoStartSlotsIsRefused(t *testing.T) {
+	assert.PanicsWithValue(t, "supervisor: WithStartConcurrency needs at least one slot",
+		func() { New(WithStartConcurrency(0)) })
+	assert.Panics(t, func() { New(WithStartConcurrency(-1)) })
 }
 
 // Register needs something to run, and something to call it.
-func TestRegisterPanicsWithoutAReconcilerOrAName(t *testing.T) {
+func TestRegisterPanicsWithoutABodyOrAName(t *testing.T) {
 	e := New()
 
-	assert.Panics(t, func() { Register[string](e, "conn", nil) })
-	assert.Panics(t, func() { Register(e, "", &steered{}) })
+	assert.Panics(t, func() { RegisterJob[string](e, "conn", nil) })
+	assert.Panics(t, func() { RegisterJob(e, "", &steered{}) })
 }
 
 // OnPass is wiring, set before the supervisor runs — like a registration.
@@ -262,20 +267,20 @@ func TestOnPassPanicsAfterStart(t *testing.T) {
 	assert.Panics(t, func() { e.OnPass(func(string, Snapshot) {}) })
 }
 
-// A reconciler's public identity is its name; the index behind it is the supervisor's own.
-func TestRegisterResolvesAnEdgeToTheReconcilerItNames(t *testing.T) {
+// A registration's public identity is its name; the index behind it is the supervisor's own.
+func TestRegisterResolvesAnEdgeToWhatItNames(t *testing.T) {
 	e, _, a := single(t, Skip())
-	Register(e, "uid", &steered{}, WithDependencies(a))
+	RegisterJob(e, "uid", &steered{}, WithDependencies(a))
 
 	assert.Equal(t, "uid", e.specs[1].name)
-	assert.Equal(t, []reconcilerID{0}, e.specs[1].dependencies)
-	assert.Equal(t, reconcilerID(1), e.byName["uid"])
+	assert.Equal(t, []registrationID{0}, e.specs[1].dependencies)
+	assert.Equal(t, registrationID(1), e.byName["uid"])
 }
 
 func TestRegisterPanicsOnADuplicateName(t *testing.T) {
 	e, p, _ := single(t, Skip())
 
-	assert.Panics(t, func() { Register(e, "conn", p) })
+	assert.Panics(t, func() { RegisterJob(e, "conn", p) })
 }
 
 // An edge resolves against what is registered so far, so a forward reference cannot be
@@ -283,7 +288,7 @@ func TestRegisterPanicsOnADuplicateName(t *testing.T) {
 func TestRegisterPanicsOnADependencyNotYetRegistered(t *testing.T) {
 	e := New()
 
-	assert.Panics(t, func() { Register(e, "uid", &steered{}, WithDependencies("nope")) })
+	assert.Panics(t, func() { RegisterJob(e, "uid", &steered{}, WithDependencies("nope")) })
 }
 
 // A registration states only what deviates from the package defaults.
@@ -292,23 +297,23 @@ func TestRegistrationDefaultsWhatItDoesNotState(t *testing.T) {
 
 	cfg := e.specs[e.byName[name]].cfg
 	assert.Equal(t, 10*time.Minute, cfg.interval)
-	assert.Equal(t, defaultCfg.timeout, cfg.timeout)
-	assert.Equal(t, defaultCfg.backoff, cfg.backoff)
+	assert.Equal(t, defaultJobCfg.timeout, cfg.timeout)
+	assert.Equal(t, defaultJobCfg.backoff, cfg.backoff)
 }
 
 func TestRegisterPanicsAfterStart(t *testing.T) {
 	e, p, _ := single(t, Skip())
 	startSupervisor(t, e)
 
-	assert.Panics(t, func() { Register(e, "late", p) })
+	assert.Panics(t, func() { RegisterJob(e, "late", p) })
 }
 
-// A subject's bookkeeping is sized when it is added, so the reconciler set must be complete first.
+// A subject's bookkeeping is sized when it is added, so the registration set must be complete first.
 func TestRegisterPanicsAfterAdd(t *testing.T) {
 	e, p, _ := single(t, Skip())
 	e.Add(subj)
 
-	assert.Panics(t, func() { Register(e, "late", p) })
+	assert.Panics(t, func() { RegisterJob(e, "late", p) })
 }
 
 // --- subjects and the pass ---
@@ -320,13 +325,13 @@ func TestASubjectNothingTracksIsANoOpEverywhere(t *testing.T) {
 
 	e.Remove("never-added")
 	e.pass("never-added")
-	e.runReconciler(t.Context(), key{subject: "never-added"})
+	e.runOne(t.Context(), key{subject: "never-added"}, func() {})
 
 	assert.Zero(t, p.count(), "a run was dispatched against a subject nothing tracks")
 	noRuns(t, e, "a pass over a subject nothing tracks queued work")
 }
 
-// A fresh subject owes exactly its runnable reconcilers: the dependent waits on an answer, and a
+// A fresh subject owes exactly its runnable registrations: the dependent waits on an answer, and a
 // second Add of the same name asks for nothing.
 func TestAddQueuesWhatAFreshSubjectOwes(t *testing.T) {
 	e, _, _, aID, _ := pair(t, Skip(), Skip())
@@ -335,7 +340,7 @@ func TestAddQueuesWhatAFreshSubjectOwes(t *testing.T) {
 	e.settle()
 
 	assert.Equal(t, keyOf(e, aID), takeRun(t, e))
-	noRuns(t, e, "more than the connection reconciler was queued")
+	noRuns(t, e, "more than the connection job was queued")
 
 	e.Add(subj)
 	e.settle()
@@ -346,7 +351,7 @@ func TestWorkQueuedBeforeStartIsServedOnceItRuns(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	ran := testutil.NewProbe[struct{}](1)
-	Register(e, "conn", reconcilerFunc(func(context.Context, *Pass[string]) Result {
+	RegisterJob(e, "conn", jobFunc(func(context.Context, *JobPass[string]) Result {
 		ran.Fire(struct{}{})
 		return Suspend("Resolved", "")
 	}))
@@ -372,22 +377,47 @@ func TestRemoveStopsTheSubjectsTimer(t *testing.T) {
 	assert.False(t, ok)
 }
 
-// The last holder can remove mid-run and another caller re-add the same name. The subject it
-// gets is a different one, and a run that predates it commits nothing against it.
-func TestARunAgainstARemovedSubjectCommitsNothing(t *testing.T) {
+// The last holder can remove and another caller re-add the same name. The subject it gets is a
+// different one, and what a run dispatched against the old one concluded is refused rather than
+// filed against it.
+//
+// Remove joins, so nothing can reach this in a running supervisor — which is why the guard is
+// driven directly here. It is the check that backs the join up.
+func TestACommitAgainstAReplacedSubjectIsRefused(t *testing.T) {
 	e, p, id := single(t, Fail("Unreachable", assert.AnError))
-	p.onRun = func() {
-		e.Remove(subj)
-		e.Add(subj)
-	}
+	p.commits("v1")
 	e.Add(subj)
 	e.settle()
+	stale := e.subjects[subj]
 
-	runNext(t, e)
+	e.Remove(subj)
+	e.Add(subj)
+	k := keyOf(e, id)
+	e.commit(k, stale, &runHandle{}, e.specs[k.registration], time.Now(),
+		runOutcome{res: Fail("Unreachable", assert.AnError), val: "v1"}, true)
 
 	a := att(t, e, id)
 	assert.False(t, a.LastAttempt.Done(), "the stale run reached the replacement subject")
 	assert.Zero(t, a.Failures)
+}
+
+// Remove waits for the run in flight, so past it nothing is still writing on the subject's
+// behalf — which is what a caller about to release what that run wrote through needs.
+func TestRemoveWaitsForTheRunInFlight(t *testing.T) {
+	e, p, _ := single(t, Succeeded())
+	inRun, letGo := testutil.NewSignal(), make(chan struct{})
+	p.onRun = func() { inRun.Fire(); <-letGo }
+	startSupervisor(t, e)
+
+	e.Add(subj)
+	inRun.Wait(t, "the run to be in flight")
+
+	removed := make(chan struct{})
+	go func() { defer close(removed); e.Remove(subj) }()
+	testutil.NoRecv(t, removed, quietWindow, "Remove returned while its run was still out")
+
+	close(letGo)
+	testutil.Wait(t, removed, "Remove to join its run")
 }
 
 // --- wakes ---
@@ -431,7 +461,7 @@ func TestAWakeRunsASuspendedReconciler(t *testing.T) {
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
-	noRuns(t, e, "a suspended reconciler was scheduled")
+	noRuns(t, e, "a suspended registration was scheduled")
 
 	e.Wake(subj, id)
 
@@ -470,7 +500,7 @@ func TestARunInFlightIsLeftAlone(t *testing.T) {
 
 	a := att(t, e, id)
 	assert.Equal(t, runAt, a.NextAttempt.StartedAt, "the pass wrote over the run in flight")
-	noRuns(t, e, "a second run of a reconciler already out")
+	noRuns(t, e, "a second run of a registration already out")
 }
 
 // The success-path poll is the default; Suspend is the only opt-out.
@@ -537,7 +567,7 @@ func TestAFailedReconcilerClimbsTheLadder(t *testing.T) {
 }
 
 // Skip leaves no record — the previous answer stands — and nothing scheduled: only a Wake
-// brings the reconciler back, so an unreadable source does not become a busy loop.
+// brings it back, so an unreadable source does not become a busy loop.
 func TestASkipLeavesNoRecordAndNothingScheduled(t *testing.T) {
 	e, p, id := single(t, Fail("ResolveFailed", assert.AnError))
 	e.Add(subj)
@@ -553,10 +583,32 @@ func TestASkipLeavesNoRecordAndNothingScheduled(t *testing.T) {
 	a := att(t, e, id)
 	assert.Equal(t, failed, a.LastAttempt, "a Skip must leave the last record standing")
 	assert.False(t, a.Scheduled())
-	noRuns(t, e, "a skipped reconciler was re-dispatched")
+	assert.False(t, a.Suspended(), "a Skip is not a suspension, whatever it schedules")
+	noRuns(t, e, "a skipped registration was re-dispatched")
 }
 
-// The timer only brings the pass back; the pass decides again per reconciler.
+// The two ways to end up with nothing due read apart, which is what a caller waking whatever is
+// parked needs: a suspension is waiting on that wake, and a Skip is waiting on the edge that
+// asks for it again.
+func TestASuspensionReadsApartFromASkip(t *testing.T) {
+	e, p, id := single(t, Suspend("ContextNotFound", "the kubeconfig no longer names it"))
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+
+	a := att(t, e, id)
+	require.False(t, a.Scheduled())
+	assert.True(t, a.Suspended())
+
+	p.set(Skip())
+	e.Wake(subj, "conn")
+	runNext(t, e)
+
+	assert.False(t, att(t, e, id).Suspended(),
+		"a Skip over a suspension leaves the record standing but is not itself one")
+}
+
+// The timer only brings the pass back; the pass decides again per registration.
 func TestTheTimerIsAWakeNotACadence(t *testing.T) {
 	e, _, _ := single(t, Fail("Unreachable", assert.AnError),
 		WithBackoff(time.Millisecond, 2, 2*time.Millisecond))
@@ -587,7 +639,7 @@ func TestADependentIsUntouchedBeforeItsDependenciesAnswer(t *testing.T) {
 }
 
 // One run records DependencyFailed — never dialed, so no StartedAt — and the rest of the outage
-// costs nothing: one timeout per cycle, not one per reconciler.
+// costs nothing: one timeout per cycle, not one per job.
 func TestADependentRecordsDependencyFailedOnceThenSuspends(t *testing.T) {
 	e, _, bBody, aID, bID := pair(t, Fail("Unreachable", assert.AnError), Succeeded())
 	e.Add(subj)
@@ -633,7 +685,7 @@ func TestDependenciesAreRecheckedAtDispatch(t *testing.T) {
 	runNext(t, e) // connection succeeds; the dependent is now queued
 
 	aBody.set(Fail("Unreachable", assert.AnError))
-	e.runReconciler(t.Context(), keyOf(e, aID)) // the connection dies before b dispatches
+	e.runOne(t.Context(), keyOf(e, aID), func() {}) // the connection dies before b dispatches
 	e.settle()
 	require.Equal(t, keyOf(e, bID), runNext(t, e))
 
@@ -641,7 +693,7 @@ func TestDependenciesAreRecheckedAtDispatch(t *testing.T) {
 	assert.Equal(t, ReasonDependencyFailed, att(t, e, bID).LastAttempt.Reason)
 }
 
-// A wake can outrun the pass and dispatch a reconciler whose dependency has never answered. The run
+// A wake can outrun the pass and dispatch a job whose dependency has never answered. The run
 // ends as a no-op — nothing to say about a server nobody has tried — and the pass owns the
 // question again.
 func TestARunDispatchedBeforeItsDependencyAnsweredRecordsNothing(t *testing.T) {
@@ -655,7 +707,7 @@ func TestARunDispatchedBeforeItsDependencyAnsweredRecordsNothing(t *testing.T) {
 
 	assert.Zero(t, b.count(), "the body ran with nothing to run over")
 	at := att(t, e, bName)
-	assert.False(t, at.LastAttempt.Done(), "an untouched reconciler records nothing")
+	assert.False(t, at.LastAttempt.Done(), "an untouched registration records nothing")
 }
 
 // --- the data edge ---
@@ -689,7 +741,7 @@ func TestACommitThatCarriedNoValueWakesNobody(t *testing.T) {
 }
 
 // A wake goes through the run queue, so it overrides a suspension exactly as Wake does — which
-// is what re-asks a reconciler parked "for the life of the connection" when a new one arrives.
+// is what re-asks a job parked "for the life of the connection" when a new one arrives.
 func TestAChangedValueWakesASuspendedWatcher(t *testing.T) {
 	e, a, _, aID, bID := linked(t, Succeeded(), Suspend("Unsupported", "no such endpoint"))
 	a.commits("v1")
@@ -703,15 +755,15 @@ func TestAChangedValueWakesASuspendedWatcher(t *testing.T) {
 	assert.Equal(t, keyOf(e, bID), takeRun(t, e))
 }
 
-// The data edge does not consult health: a reconciler declaring only a dependency must not be gated
+// The data edge does not consult health: a registration declaring only a dependency must not be gated
 // by health it never declared, so a failing run that learned something still wakes it.
 func TestAFailedRunThatChangedItsValueStillWakes(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	a := &steered{res: Succeeded()}
 	watcher := &steered{res: Succeeded()}
-	Register(e, "conn", a)
-	Register(e, "watcher", watcher, WithWatches("conn"))
+	RegisterJob(e, "conn", a)
+	RegisterJob(e, "watcher", watcher, WithWatches("conn"))
 	a.commits("v1")
 	settled(t, e)
 
@@ -753,7 +805,7 @@ func TestAWokenRunWithAFailingDependencyRecordsRatherThanDialing(t *testing.T) {
 func TestRegisterPanicsOnAWatchNotYetRegistered(t *testing.T) {
 	e := New()
 
-	assert.Panics(t, func() { Register(e, "uid", &steered{}, WithWatches("nope")) })
+	assert.Panics(t, func() { RegisterJob(e, "uid", &steered{}, WithWatches("nope")) })
 }
 
 // --- what a run records ---
@@ -763,19 +815,19 @@ func TestRegisterPanicsOnAWatchNotYetRegistered(t *testing.T) {
 func TestARunCommitsTheLastValueItRecorded(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	Register(e, "conn", reconcilerFunc(func(_ context.Context, pass *Pass[string]) Result {
+	RegisterJob(e, "conn", jobFunc(func(_ context.Context, pass *JobPass[string]) Result {
 		pass.Commit("v1")
 		pass.Commit("v2")
 		return Succeeded()
 	}))
-	Register(e, "uid", &steered{res: Succeeded()}, WithWatches("conn"))
+	RegisterJob(e, "uid", &steered{res: Succeeded()}, WithWatches("conn"))
 	e.Add(subj)
 	e.settle()
 
 	runNext(t, e)
 
 	read, _ := e.Read(subj)
-	assert.Equal(t, "v2", Get[string](read, "conn").Value)
+	assert.Equal(t, "v2", GetJobObservation[string](read, "conn").Value)
 	assert.Equal(t, keyOf(e, "uid"), takeRun(t, e))
 	noRuns(t, e, "the watcher was woken more than once")
 }
@@ -785,7 +837,7 @@ func TestARunCommitsTheLastValueItRecorded(t *testing.T) {
 func TestARunThatSkipsCommitsNothingItRecorded(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	Register(e, "conn", reconcilerFunc(func(_ context.Context, pass *Pass[string]) Result {
+	RegisterJob(e, "conn", jobFunc(func(_ context.Context, pass *JobPass[string]) Result {
 		pass.Commit("v1")
 		return Skip()
 	}))
@@ -795,7 +847,7 @@ func TestARunThatSkipsCommitsNothingItRecorded(t *testing.T) {
 	runNext(t, e)
 
 	read, _ := e.Read(subj)
-	o := Get[string](read, "conn")
+	o := GetJobObservation[string](read, "conn")
 	assert.False(t, o.Known(), "a skipped run published a value")
 	assert.Empty(t, o.Value)
 }
@@ -805,7 +857,7 @@ func TestARunThatSkipsCommitsNothingItRecorded(t *testing.T) {
 func TestAPanickingRunCommitsNothingItRecorded(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	Register(e, "conn", reconcilerFunc(func(_ context.Context, pass *Pass[string]) Result {
+	RegisterJob(e, "conn", jobFunc(func(_ context.Context, pass *JobPass[string]) Result {
 		pass.Commit("v1")
 		panic("boom")
 	}))
@@ -815,7 +867,7 @@ func TestAPanickingRunCommitsNothingItRecorded(t *testing.T) {
 	runNext(t, e)
 
 	read, _ := e.Read(subj)
-	o := Get[string](read, "conn")
+	o := GetJobObservation[string](read, "conn")
 	assert.Empty(t, o.Value, "a panicking run published a value")
 	assert.False(t, o.Known())
 	assert.Equal(t, ReasonInternal, o.LastAttempt.Reason)
@@ -823,12 +875,12 @@ func TestAPanickingRunCommitsNothingItRecorded(t *testing.T) {
 
 // --- failure containment ---
 
-// A panicking body must still produce a record and free its key — otherwise the reconciler reads as
+// A panicking body must still produce a record and free its key — otherwise the registration reads as
 // in flight forever and the key stays held in the queue.
 func TestAPanickingRunRecordsInternalAndFreesItsKey(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	Register(e, "conn", reconcilerFunc(func(context.Context, *Pass[string]) Result {
+	RegisterJob(e, "conn", jobFunc(func(context.Context, *JobPass[string]) Result {
 		panic("boom")
 	}))
 	e.Add(subj)
@@ -894,19 +946,19 @@ func TestOnPassFiresAfterEveryPassInOrderPerSubject(t *testing.T) {
 	assert.True(t, calls[1].Attempts(id).OK(), "the second call carries the committed run")
 }
 
-// LastSeen dates the value, not the run: a failure that follows does not un-read what was read,
+// LastSeenAt dates the value, not the run: a failure that follows does not un-read what was read,
 // so the value and its provenance both stand.
 func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
 	p := &steered{res: Succeeded(), next: &uid}
-	Register(e, "conn", p)
+	RegisterJob(e, "conn", p)
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
 	read, _ := e.Read(subj)
-	seen := Get[string](read, "conn")
+	seen := GetJobObservation[string](read, "conn")
 	require.True(t, seen.Known())
 
 	p.set(Fail("Unreachable", assert.AnError))
@@ -915,9 +967,9 @@ func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {
 	runNext(t, e)
 
 	read, _ = e.Read(subj)
-	after := Get[string](read, "conn")
+	after := GetJobObservation[string](read, "conn")
 	assert.Equal(t, "uid-1", after.Value, "the value outlives the failure")
-	assert.Equal(t, seen.LastSeen, after.LastSeen, "a failure that read nothing is not a read")
+	assert.Equal(t, seen.LastSeenAt, after.LastSeenAt, "a failure that read nothing is not a read")
 	assert.False(t, after.OK())
 }
 
@@ -926,17 +978,17 @@ func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {
 func TestASuccessWithNoValueEverCommittedIsNotKnown(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	Register(e, "conn", &steered{res: Succeeded()}) // succeeds, commits nothing
+	RegisterJob(e, "conn", &steered{res: Succeeded()}) // succeeds, commits nothing
 	e.Add(subj)
 	e.settle()
 
 	runNext(t, e)
 
 	read, _ := e.Read(subj)
-	o := Get[string](read, "conn")
+	o := GetJobObservation[string](read, "conn")
 	require.True(t, o.OK(), "the run did succeed")
 	assert.False(t, o.Known(), "there is no value to read")
-	assert.True(t, o.LastSeen.IsZero())
+	assert.True(t, o.LastSeenAt.IsZero())
 }
 
 // Every success dates the value, whether or not it committed a new one: a run that found the
@@ -946,12 +998,12 @@ func TestASuccessWithNoNewValueStillAdvancesLastSeen(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
 	p := &steered{res: Succeeded(), next: &uid}
-	Register(e, "conn", p)
+	RegisterJob(e, "conn", p)
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
 	read, _ := e.Read(subj)
-	first := Get[string](read, "conn")
+	first := GetJobObservation[string](read, "conn")
 
 	p.mu.Lock()
 	p.next = nil
@@ -960,17 +1012,17 @@ func TestASuccessWithNoNewValueStillAdvancesLastSeen(t *testing.T) {
 	runNext(t, e)
 
 	read, _ = e.Read(subj)
-	after := Get[string](read, "conn")
+	after := GetJobObservation[string](read, "conn")
 	assert.Equal(t, "uid-1", after.Value, "nothing new to commit, so the value stands")
-	assert.Equal(t, after.LastAttempt.FinishedAt, after.LastSeen, "the run that confirmed it")
-	assert.True(t, after.LastSeen.After(first.LastSeen))
+	assert.Equal(t, after.LastAttempt.FinishedAt, after.LastSeenAt, "the run that confirmed it")
+	assert.True(t, after.LastSeenAt.After(first.LastSeenAt))
 }
 
 func TestReadReportsAnUntrackedSubject(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
-	Register(e, "conn", &steered{res: Succeeded(), next: &uid})
+	RegisterJob(e, "conn", &steered{res: Succeeded(), next: &uid})
 
 	_, ok := e.Read(subj)
 	require.False(t, ok)
@@ -981,7 +1033,7 @@ func TestReadReportsAnUntrackedSubject(t *testing.T) {
 
 	v, ok := e.Read(subj)
 	require.True(t, ok)
-	o := Get[string](v, "conn")
+	o := GetJobObservation[string](v, "conn")
 	assert.Equal(t, "uid-1", o.Value, "the run's committed value")
 	assert.True(t, o.OK())
 	assert.True(t, o.Known(), "the supervisor stamps when the value was read")
@@ -994,7 +1046,7 @@ func TestANilValueKeepsThePreviousOne(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
 	p := &steered{res: Succeeded(), next: &uid}
-	Register(e, "conn", p)
+	RegisterJob(e, "conn", p)
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
@@ -1006,7 +1058,7 @@ func TestANilValueKeepsThePreviousOne(t *testing.T) {
 
 	v, ok := e.Read(subj)
 	require.True(t, ok)
-	o := Get[string](v, "conn")
+	o := GetJobObservation[string](v, "conn")
 	assert.Equal(t, "uid-1", o.Value, "the failure erased the last answer")
 	assert.True(t, o.Known())
 	assert.False(t, o.OK())
@@ -1030,7 +1082,7 @@ func TestCloseStopsTheTimersAndTheQueues(t *testing.T) {
 
 // --- values the supervisor drops ---
 
-// discarding is a reconciler whose committed values it records when the supervisor hands them back.
+// discarding is a job whose committed values it records when the supervisor hands them back.
 type discarding struct {
 	steered
 	discarded *testutil.Probe[string]
@@ -1041,12 +1093,12 @@ type discarding struct {
 
 func (p *discarding) Discard(v string) { p.discarded.Fire(v) }
 
-func (p *discarding) Reconcile(ctx context.Context, pass *Pass[string]) Result {
+func (p *discarding) Run(ctx context.Context, pass *JobPass[string]) Result {
 	if p.panicAfterCommit != "" {
 		pass.Commit(p.panicAfterCommit)
-		panic("reconciler body bug")
+		panic("job body bug")
 	}
-	return p.steered.Reconcile(ctx, pass)
+	return p.steered.Run(ctx, pass)
 }
 
 // A committed value can own something — a connection, a file — so a value the supervisor drops is
@@ -1057,15 +1109,24 @@ func TestARefusedCommitIsHandedBack(t *testing.T) {
 	p := &discarding{discarded: testutil.NewProbe[string](4)}
 	p.res = Succeeded()
 	p.commits("built")
-	// Removing the subject from inside the run is the race a Release loses: the commit
-	// arrives against a subject that has gone.
-	p.onRun = func() { e.Remove("prod") }
-	Register(e, "conn", p)
+	// The subject going while the run is out is the race a Release loses: Remove drops the
+	// name under the lock before it joins, so the commit arrives against a subject that has
+	// gone.
+	inRun, letGo := testutil.NewSignal(), make(chan struct{})
+	p.onRun = func() { inRun.Fire(); <-letGo }
+	RegisterJob(e, "conn", p)
 	stop := e.Start(t.Context())
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 
 	e.Add("prod")
+	inRun.Wait(t, "the run to be in flight")
+	removed := make(chan struct{})
+	go func() { defer close(removed); e.Remove("prod") }()
+	require.Eventually(t, func() bool { _, ok := e.Read("prod"); return !ok },
+		testutil.Timeout, time.Millisecond, "the subject to be dropped")
 
+	close(letGo)
+	testutil.Wait(t, removed, "Remove to join its run")
 	assert.Equal(t, "built", p.discarded.Await(t, "the refused value"))
 }
 
@@ -1076,7 +1137,7 @@ func TestASkippedRunsValueIsHandedBack(t *testing.T) {
 	p := &discarding{discarded: testutil.NewProbe[string](4)}
 	p.res = Skip()
 	p.commits("built")
-	Register(e, "conn", p)
+	RegisterJob(e, "conn", p)
 	stop := e.Start(t.Context())
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 
@@ -1092,7 +1153,7 @@ func TestAPanickingRunsValueIsHandedBack(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	p := &discarding{discarded: testutil.NewProbe[string](4), panicAfterCommit: "built"}
 	p.res = Succeeded()
-	Register(e, "conn", p)
+	RegisterJob(e, "conn", p)
 	stop := e.Start(t.Context())
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 
@@ -1101,7 +1162,7 @@ func TestAPanickingRunsValueIsHandedBack(t *testing.T) {
 	assert.Equal(t, "built", p.discarded.Await(t, "the panicking run's value"))
 }
 
-// The ordinary path: a value the supervisor applied is the reconciler's own to read back, and handing it
+// The ordinary path: a value the supervisor applied is the job's own to read back, and handing it
 // back as dropped would have a caller release what is live.
 func TestAnAppliedValueIsNotHandedBack(t *testing.T) {
 	e := New()
@@ -1109,7 +1170,7 @@ func TestAnAppliedValueIsNotHandedBack(t *testing.T) {
 	p := &discarding{discarded: testutil.NewProbe[string](4)}
 	p.res = Succeeded()
 	p.commits("built")
-	Register(e, "conn", p)
+	RegisterJob(e, "conn", p)
 	stop := e.Start(t.Context())
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 
@@ -1117,20 +1178,20 @@ func TestAnAppliedValueIsNotHandedBack(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		snap, ok := e.Read("prod")
-		return ok && Get[string](snap, "conn").Value == "built"
+		return ok && GetJobObservation[string](snap, "conn").Value == "built"
 	}, testutil.Timeout, time.Millisecond, "the value to land")
 	_, dropped := p.discarded.TryAwait()
 	assert.False(t, dropped, "an applied value is not a dropped one")
 }
 
-// The supervisor is what tells a body a value has landed, so a reconciler committing the zero T lands it
-// once and reads as known from then on — without which such a reconciler reports itself never
+// The supervisor is what tells a body a value has landed, so a job committing the zero T lands it
+// once and reads as known from then on — without which such a job reports itself never
 // observed for as long as its answer stays the zero value.
 func TestTheZeroValueLandsAndReadsAsKnown(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	seen := testutil.NewProbe[bool](4)
-	Register(e, "conn", reconcilerFunc(func(_ context.Context, pass *Pass[string]) Result {
+	RegisterJob(e, "conn", jobFunc(func(_ context.Context, pass *JobPass[string]) Result {
 		seen.Fire(pass.Known())
 		if !pass.Known() {
 			pass.Commit("")
@@ -1146,13 +1207,13 @@ func TestTheZeroValueLandsAndReadsAsKnown(t *testing.T) {
 	assert.True(t, seen.Await(t, "the run after it"), "the zero value it committed")
 	require.Eventually(t, func() bool {
 		snap, ok := e.Read("prod")
-		return ok && Get[string](snap, "conn").Known()
+		return ok && GetJobObservation[string](snap, "conn").Known()
 	}, testutil.Timeout, time.Millisecond, "the observation to date itself")
 }
 
 // A run that failed can still have read something — which components are down — so the value it
 // commits is dated now. Dating it by the last success instead leaves a value nothing has ever
-// confirmed, and a reconciler that has only ever failed reads as never observed while holding the
+// confirmed, and a job that has only ever failed reads as never observed while holding the
 // answer a caller came for.
 func TestAFailedRunsCommittedValueIsDated(t *testing.T) {
 	e, p, name := single(t, Fail("Unreachable", assert.AnError))
@@ -1164,11 +1225,11 @@ func TestAFailedRunsCommittedValueIsDated(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		snap, ok := e.Read("prod")
-		return ok && Get[string](snap, name).Known()
+		return ok && GetJobObservation[string](snap, name).Known()
 	}, testutil.Timeout, time.Millisecond, "the failing answer to be dated")
 	snap, _ := e.Read("prod")
-	assert.Equal(t, "etcd", Get[string](snap, name).Value)
-	assert.False(t, Get[string](snap, name).OK(), "dated, and still a failure")
+	assert.Equal(t, "etcd", GetJobObservation[string](snap, name).Value)
+	assert.False(t, GetJobObservation[string](snap, name).OK(), "dated, and still a failure")
 }
 
 // A success that commits nothing re-confirms what stands, which is what makes "identified, as of
@@ -1183,14 +1244,14 @@ func TestASuccessWithNothingToDateLeavesTheObservationUnknown(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		snap, ok := e.Read("prod")
-		return ok && Get[string](snap, name).OK()
+		return ok && GetJobObservation[string](snap, name).OK()
 	}, testutil.Timeout, time.Millisecond, "the run to land")
 	snap, _ := e.Read("prod")
-	assert.False(t, Get[string](snap, name).Known(), "nothing was ever read")
+	assert.False(t, GetJobObservation[string](snap, name).Known(), "nothing was ever read")
 }
 
 // The supervisor hands back every value it stops holding. A value owning a connection was fine
-// to drop — the pool retires it — but one owning a goroutine leaks unless the reconciler is told,
+// to drop — the pool retires it — but one owning a goroutine leaks unless the job is told,
 // so dropping the subject is a hand-back like a refused commit is.
 func TestRemoveHandsBackTheStandingValue(t *testing.T) {
 	e, p := standing(t, "built")
@@ -1234,20 +1295,20 @@ func standing(t *testing.T, value string) (*Supervisor, *discarding) {
 	p := &discarding{discarded: testutil.NewProbe[string](4)}
 	p.res = Succeeded()
 	p.commits(value)
-	Register(e, "conn", p)
+	RegisterJob(e, "conn", p)
 	stop := e.Start(t.Context())
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 
 	e.Add("prod")
 	require.Eventually(t, func() bool {
 		snap, ok := e.Read("prod")
-		return ok && Get[string](snap, "conn").Known()
+		return ok && GetJobObservation[string](snap, "conn").Known()
 	}, testutil.Timeout, time.Millisecond, "the value to stand")
 	return e, p
 }
 
 // A commit REPLACES the standing value and does not hand it back — the one place the supervisor
-// drops a value without telling the reconciler. A commit often carries the last value's holdings
+// drops a value without telling the job. A commit often carries the last value's holdings
 // forward: kubeconn's connInfo is a struct whose runs commit a copy with one field moved and the
 // same live connection inside, and handing that back would retire a connection still in use.
 // What a run stops holding is the run's to release before it commits.
@@ -1259,9 +1320,702 @@ func TestAReplacedValueIsNotHandedBack(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		snap, ok := e.Read("prod")
-		return ok && Get[string](snap, "conn").Value == "second"
+		return ok && GetJobObservation[string](snap, "conn").Value == "second"
 	}, testutil.Timeout, time.Millisecond, "the committed value to stand")
 
 	_, handedBack := p.discarded.TryAwait()
-	assert.False(t, handedBack, "a replaced value stays the reconciler's to reason about")
+	assert.False(t, handedBack, "a replaced value stays the job's to reason about")
+}
+
+// --- workers ---
+
+// steeredWorker is a Worker the test drives: every run reports the pass it was handed and then
+// blocks, so a test decides when — and how — it stops. Its whole shape is what a worker is: the
+// run outlives the call that started it.
+type steeredWorker struct {
+	started *testutil.Probe[*WorkerPass[string]]
+	exits   chan Result
+
+	mu          sync.Mutex
+	runs        int
+	sawDeadline bool
+	// onCancel is what the run returns when its context ends rather than the test handing it a
+	// result. Succeeded is the ordinary reading — the supervisor asked it to stop. readyOnCancel
+	// makes it call Ready on the way out, standing in for a first frame that arrived as the
+	// cancel did.
+	onCancel      Result
+	readyOnCancel bool
+}
+
+func newSteeredWorker() *steeredWorker {
+	return &steeredWorker{
+		started:  testutil.NewProbe[*WorkerPass[string]](8),
+		exits:    make(chan Result),
+		onCancel: Succeeded(),
+	}
+}
+
+func (w *steeredWorker) Run(ctx context.Context, pass *WorkerPass[string]) Result {
+	w.mu.Lock()
+	w.runs++
+	_, w.sawDeadline = ctx.Deadline()
+	w.mu.Unlock()
+
+	w.started.Fire(pass)
+	select {
+	case res := <-w.exits:
+		return res
+	case <-ctx.Done():
+		w.mu.Lock()
+		res, readyLate := w.onCancel, w.readyOnCancel
+		w.mu.Unlock()
+		if readyLate {
+			pass.Ready()
+		}
+		return res
+	}
+}
+
+func (w *steeredWorker) count() int { w.mu.Lock(); defer w.mu.Unlock(); return w.runs }
+
+func (w *steeredWorker) cancelledWith(res Result) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.onCancel = res
+}
+
+// readiesOnCancel makes the run call Ready as it unwinds, which is a first frame landing at the
+// same moment as the cancel that ended the start.
+func (w *steeredWorker) readiesOnCancel() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.readyOnCancel = true
+}
+
+// exit hands the running worker its result and waits for it to be taken, so what follows is
+// measured against a run that is on its way out rather than one still parked.
+func (w *steeredWorker) exit(t *testing.T, res Result) {
+	t.Helper()
+	select {
+	case w.exits <- res:
+	case <-within(t).Done():
+		t.Fatal("no worker was waiting to be given a result")
+	}
+}
+
+// runningWorker is a started supervisor with one steered worker and its subject tracked, settled
+// on its first run being in flight — and the pass that run was handed, which is how a test says
+// the worker is ready or makes it report.
+func runningWorker(t *testing.T, opts ...RegistrationOption) (*Supervisor, *steeredWorker, *WorkerPass[string]) {
+	t.Helper()
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	w := newSteeredWorker()
+	RegisterWorker(e, "sync", w, opts...)
+	startSupervisor(t, e)
+	e.Add(subj)
+	return e, w, w.started.Await(t, "the worker's first run")
+}
+
+// awaitAttempts settles on one registration's bookkeeping. Under a running supervisor a run is
+// recorded on its own goroutine, so everything about an exit is read by waiting for it.
+func awaitAttempts(t *testing.T, e *Supervisor, name, what string, match func(Attempts) bool) Attempts {
+	t.Helper()
+	var last Attempts
+	require.Eventually(t, func() bool {
+		snap, ok := e.Read(subj)
+		if !ok {
+			return false
+		}
+		last = snap.Attempts(name)
+		return match(last)
+	}, testutil.Timeout, time.Millisecond, what)
+	return last
+}
+
+func hasRecorded(a Attempts) bool { return a.LastAttempt.Done() }
+
+// A worker's Run blocks for its whole life, and the supervisor never runs a second one beside it:
+// the key is held for the run, so the schedule cannot reach a registration that is already up.
+func TestAWorkerRunsUntilItIsStopped(t *testing.T) {
+	e, w, _ := runningWorker(t, WithInterval(time.Millisecond))
+
+	noRuns(t, e, "a second run was dispatched over a worker that is already up")
+	assert.Equal(t, 1, w.count())
+	assert.True(t, att(t, e, "sync").InFlight())
+}
+
+// A worker reports while it runs, which is the whole point of one: a commit is applied the moment
+// it is made rather than at an end the worker does not have.
+func TestAWorkersCommitIsVisibleBeforeItsRunEnds(t *testing.T) {
+	e, _, pass := runningWorker(t)
+
+	pass.Commit("watching")
+
+	awaitAttempts(t, e, "sync", "the live commit to land", func(a Attempts) bool {
+		snap, _ := e.Read(subj)
+		return GetWorkerObservation[string](snap, "sync").Value == "watching"
+	})
+	assert.True(t, att(t, e, "sync").InFlight(), "the run is still going")
+}
+
+// Ready releases the slot while the worker keeps running, which is what makes the cap a bound on
+// STARTS rather than on streams. A job holds its slot to the end, having nothing to release early.
+func TestReadyReleasesTheSlotAndAJobHoldsItToTheEnd(t *testing.T) {
+	e, _, pass := runningWorker(t)
+	require.Len(t, e.slots, 1, "the starting worker holds a slot")
+
+	pass.Ready()
+
+	require.Eventually(t, func() bool { return len(e.slots) == 0 }, testutil.Timeout, time.Millisecond,
+		"the slot to be released at Ready")
+	assert.True(t, att(t, e, "sync").Ready())
+}
+
+// A second start cannot begin while the cap is full, so a supervisor of one admits one cold list
+// at a time however many subjects are due.
+func TestStartsAreBoundedByTheSlotCount(t *testing.T) {
+	e := New(WithStartConcurrency(1))
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	w := newSteeredWorker()
+	RegisterWorker(e, "sync", w)
+	startSupervisor(t, e)
+
+	e.Add("a")
+	e.Add("b")
+	w.started.Await(t, "the first start")
+
+	testutil.NoRecv(t, w.started.Chan(), quietWindow, "a second start ran while the one slot was taken")
+
+	// Ready frees the slot, and the queued start goes at once.
+	w.started.Drain()
+	e.Wake("a", "sync")
+	assert.Equal(t, 1, w.count(), "nothing new started")
+}
+
+// --- the exit table ---
+
+// A clean stop after Ready is a rotation: the rows stayed current across it, so it is recorded a
+// success and paced by the floor rather than the ladder.
+func TestAWorkerThatStopsCleanlyAfterReadyIsASuccess(t *testing.T) {
+	e, w, pass := runningWorker(t, WithInterval(time.Hour))
+	pass.Ready()
+
+	w.exit(t, Succeeded())
+
+	a := awaitAttempts(t, e, "sync", "the exit to be recorded", hasRecorded)
+	assert.Equal(t, VerdictSucceeded, a.LastAttempt.Verdict)
+	assert.Zero(t, a.Failures)
+	assert.False(t, a.HealthySince.IsZero(), "the stretch it opened at Ready stands")
+}
+
+// A worker that stops cleanly having never proved it was up has proved nothing, and restarting it
+// at the floor would hot-loop against a server that accepts every start and drops it. So the
+// clean exit is recorded a FAILURE, and the ladder paces the retry.
+func TestAWorkerThatStopsBeforeReadyIsNeverReady(t *testing.T) {
+	e, w, _ := runningWorker(t, WithInterval(time.Hour))
+
+	w.exit(t, Succeeded())
+
+	a := awaitAttempts(t, e, "sync", "the exit to be recorded", hasRecorded)
+	assert.Equal(t, VerdictFailed, a.LastAttempt.Verdict)
+	assert.Equal(t, ReasonNeverReady, a.LastAttempt.Reason)
+	assert.Equal(t, 1, a.Failures, "the ladder, not the floor")
+	assert.True(t, a.HealthySince.IsZero())
+}
+
+// A clean exit is what resets the count NeverReady built up — the worker having run and finished,
+// not merely started. **Ready is deliberately not enough**: a source that accepts every start and
+// drops it calls Ready every time, and a streak it cleared would hold the retry at the base delay
+// forever, which is the loop NeverReady exists to pace.
+func TestACleanExitResetsAStreakOfNeverReadyExitsAndReadyDoesNot(t *testing.T) {
+	e, w, _ := runningWorker(t, WithBackoff(time.Millisecond, 1, time.Millisecond))
+	w.exit(t, Succeeded())
+	awaitAttempts(t, e, "sync", "the first exit to be recorded", func(a Attempts) bool {
+		return a.Failures == 1
+	})
+
+	pass := w.started.Await(t, "the restart")
+	pass.Ready()
+	awaitAttempts(t, e, "sync", "the restart to be up", func(a Attempts) bool { return a.Ready() })
+	assert.Equal(t, 1, att(t, e, "sync").Failures, "starting is not proof")
+
+	w.exit(t, Succeeded())
+
+	awaitAttempts(t, e, "sync", "the streak to clear", func(a Attempts) bool { return a.Failures == 0 })
+}
+
+// A worker's Fail is a job's: the ladder.
+func TestAFailingWorkerClimbsTheLadder(t *testing.T) {
+	e, w, pass := runningWorker(t, WithBackoff(time.Hour, 2, time.Hour))
+	pass.Ready()
+
+	w.exit(t, Fail("Unreachable", assert.AnError))
+
+	// The pacing is what the wait is for: commit schedules "due now" and the pass that follows
+	// is what derives the rung, so a read taken between the two is of a run mid-record.
+	a := awaitAttempts(t, e, "sync", "the failure to be recorded and laddered", func(a Attempts) bool {
+		return a.LastAttempt.Done() && a.NextAttempt.ScheduledAt.After(time.Now().Add(time.Minute))
+	})
+	assert.Equal(t, 1, a.Failures)
+	assert.True(t, a.HealthySince.IsZero(), "a failure ends the stretch")
+}
+
+// A worker's Suspend parks it: nothing is scheduled, and a Wake is what starts it again. This is
+// the kind sync at its identity gate.
+func TestASuspendedWorkerParksUntilAWake(t *testing.T) {
+	e, w, _ := runningWorker(t)
+	w.exit(t, Suspend("NoConnection", "nothing has reached the server"))
+	awaitAttempts(t, e, "sync", "the suspension to be recorded", func(a Attempts) bool {
+		return a.LastAttempt.Verdict == VerdictSuspended && !a.Scheduled()
+	})
+
+	e.Wake(subj, "sync")
+
+	w.started.Await(t, "the wake to start it again")
+}
+
+// A Skip is "not my failure" — a connection retired under a cold list is nobody's fault and
+// nothing to report — so it records nothing at all and parks.
+func TestASkippingWorkerRecordsNothingAndParks(t *testing.T) {
+	e, w, _ := runningWorker(t)
+
+	w.exit(t, Skip())
+
+	awaitAttempts(t, e, "sync", "the run to end with nothing scheduled", func(a Attempts) bool {
+		return !a.InFlight() && !a.Scheduled()
+	})
+	assert.False(t, att(t, e, "sync").LastAttempt.Done(), "a Skip records nothing")
+}
+
+// A stop is not an attempt: Restart, Remove and Close ask for the end, so it is not the body's
+// doing and the streak stands. A poke over three hundred workers must not reset the rung a
+// struggling server earned.
+func TestAStoppedRunRecordsNothingAndLeavesTheStreakStanding(t *testing.T) {
+	e, w, _ := runningWorker(t, WithBackoff(time.Millisecond, 1, time.Millisecond))
+	w.exit(t, Fail("Unreachable", assert.AnError))
+	awaitAttempts(t, e, "sync", "one rung", func(a Attempts) bool { return a.Failures == 1 })
+	w.started.Await(t, "the retry")
+	// Anything but a clean stop, so a recorded exit would be visible as a second rung.
+	w.cancelledWith(Fail("Unreachable", assert.AnError))
+
+	e.Restart(subj, "sync")
+
+	w.started.Await(t, "the replacement run")
+	assert.Equal(t, 1, att(t, e, "sync").Failures, "the stopped run climbed a rung")
+}
+
+// A worker stopped before Ready is not NeverReady either — for the same reason: it was not the
+// worker that decided to stop.
+func TestAWorkerStoppedBeforeReadyIsNotNeverReady(t *testing.T) {
+	e, w, _ := runningWorker(t)
+
+	e.Restart(subj, "sync")
+
+	w.started.Await(t, "the replacement run")
+	assert.False(t, att(t, e, "sync").LastAttempt.Done(), "the stopped run was recorded")
+}
+
+// --- the floor ---
+
+// A worker that says nothing about its interval is paced by the backoff base, resolved after the
+// options run so WithBackoff decides it whichever order the two are written in.
+func TestTheWorkerFloorDefaultsToTheBackoffBase(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	RegisterWorker(e, "unset", newSteeredWorker())
+	RegisterWorker(e, "laddered", newSteeredWorker(), WithBackoff(3*time.Second, 2, time.Minute))
+	RegisterWorker(e, "stated", newSteeredWorker(), WithInterval(time.Hour), WithBackoff(3*time.Second, 2, time.Minute))
+
+	assert.Equal(t, time.Second, e.specs[e.byName["unset"]].cfg.interval)
+	assert.Equal(t, 3*time.Second, e.specs[e.byName["laddered"]].cfg.interval, "the floor follows the ladder")
+	assert.Equal(t, time.Hour, e.specs[e.byName["stated"]].cfg.interval)
+}
+
+// A worker has no timeout unless it asks for one, and a job's 30s stands: a cold list of a large
+// collection legitimately outlasts any bound a read would want.
+func TestAWorkerHasNoStartTimeoutUnlessItAsksForOne(t *testing.T) {
+	_, w, _ := runningWorker(t)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	assert.False(t, w.sawDeadline, "a worker's ctx carried a deadline")
+}
+
+// The startup timeout bounds the time until Ready and nothing after it, so a worker that is up
+// runs as long as it likes.
+func TestTheStartupTimeoutIsStoppedByReady(t *testing.T) {
+	e, w, pass := runningWorker(t, WithTimeout(20*time.Millisecond), WithInterval(time.Hour))
+	pass.Ready()
+
+	testutil.NoRecv(t, w.started.Chan(), quietWindow, "the startup timeout ended a worker that was ready")
+	assert.True(t, att(t, e, "sync").Ready())
+}
+
+// A worker that hangs in startup is ended by the timeout — and that is NOT a stop: it is recorded
+// NeverReady and climbs the ladder, so it is visible rather than going quiet.
+//
+// **Whatever the body returns.** One that reads its cancelled context and reports Skip or Suspend
+// is answering our cancel rather than choosing to park, and taking it at its word would leave the
+// worker waiting on a wake nobody owes it.
+func TestAStartupTimeoutIsNeverReadyWhateverTheWorkerReturns(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		res  Result
+	}{
+		{"a clean exit", Succeeded()},
+		{"a skip", Skip()},
+		{"a suspension", Suspend("NoConnection", "nothing reached the server")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New()
+			t.Cleanup(func() { assert.NoError(t, e.Close()) })
+			w := newSteeredWorker()
+			w.cancelledWith(tc.res)
+			RegisterWorker(e, "sync", w, WithTimeout(20*time.Millisecond),
+				WithBackoff(time.Hour, 2, time.Hour))
+			startSupervisor(t, e)
+			e.Add(subj)
+
+			a := awaitAttempts(t, e, "sync", "the timed-out start to be recorded", hasRecorded)
+			assert.Equal(t, VerdictFailed, a.LastAttempt.Verdict)
+			assert.Equal(t, ReasonNeverReady, a.LastAttempt.Reason)
+			assert.Equal(t, 1, a.Failures, "paced by the ladder rather than parked")
+			assert.True(t, a.Scheduled(), "and due again")
+		})
+	}
+}
+
+// A worker that parks at a gate of its OWN is not never-ready in the sense the ladder is for: its
+// Suspend is the answer, and converting it would have every kind on an unreachable cluster climb
+// the ladder under a reason nothing observed. Only a start the supervisor ended, or one the worker
+// says finished cleanly, is a failure it never proved itself out of.
+func TestASuspensionTheWorkerChoseIsNotNeverReady(t *testing.T) {
+	e, w, _ := runningWorker(t)
+
+	w.exit(t, Suspend("NoConnection", "nothing reached the server"))
+
+	a := awaitAttempts(t, e, "sync", "the suspension to be recorded", hasRecorded)
+	assert.Equal(t, VerdictSuspended, a.LastAttempt.Verdict)
+	assert.Equal(t, Reason("NoConnection"), a.LastAttempt.Reason)
+	assert.Zero(t, a.Failures, "a gate is not a failure")
+}
+
+// --- Wake and Restart ---
+
+// A Wake never tears a live worker down — it means "when you next stop, start again at once",
+// which is what lets a connection bridge wake every kind on a cache per state frame.
+func TestAWakeLeavesARunningWorkerRunningAndRestartsItOnItsNextExit(t *testing.T) {
+	e, w, pass := runningWorker(t, WithInterval(time.Hour))
+	pass.Ready()
+
+	e.Wake(subj, "sync")
+
+	testutil.NoRecv(t, w.started.Chan(), quietWindow, "the Wake tore the live worker down")
+	assert.Equal(t, 1, w.count())
+
+	// The exit is what the wake is redelivered behind, and it goes under the floor.
+	w.exit(t, Succeeded())
+	w.started.Await(t, "the woken restart, under the floor")
+}
+
+// Restart stops the run and starts exactly one more — for both kinds, since a job mid-dial
+// against a machine that just woke is as stale as a worker's stream.
+func TestRestartStopsTheRunAndStartsExactlyOneMore(t *testing.T) {
+	e, w, pass := runningWorker(t, WithInterval(time.Hour))
+	pass.Ready()
+
+	e.Restart(subj, "sync")
+
+	w.started.Await(t, "the replacement run")
+	testutil.NoRecv(t, w.started.Chan(), quietWindow, "one Restart started more than one run")
+	assert.Equal(t, 2, w.count())
+}
+
+// Restart cancels the job's run and it is due again at once, where without one it would sit out
+// the hour. **What makes it due is that a stop records nothing**, so the pass reads it as never
+// run — Restart's own ask only makes that prompt, and the two collapse in the queue. One run then
+// records and the interval takes over, which is what stops it looping.
+func TestRestartCancelsARunningJobAndItIsDueAgainAtOnce(t *testing.T) {
+	e, p, id := single(t, Succeeded(), WithInterval(time.Hour))
+	inRun, letGo := testutil.NewSignal(), make(chan struct{})
+	p.onRun = func() { inRun.Fire(); <-letGo }
+	startSupervisor(t, e)
+	e.Add(subj)
+	inRun.Wait(t, "the job to be in flight")
+
+	e.Restart(subj, id)
+	close(letGo)
+
+	// Settled on the interval rather than looping is the whole claim, so it is what the wait
+	// is for — a count that has stopped moving would need a window to read.
+	awaitAttempts(t, e, id, "the replacement to record and be paced by the interval", func(a Attempts) bool {
+		return a.LastAttempt.Done() && a.NextAttempt.ScheduledAt.After(time.Now().Add(time.Minute))
+	})
+	assert.GreaterOrEqual(t, p.count(), 2, "the cancelled run was not replaced")
+}
+
+// RestartAll is the resume poke: every tracked subject, and it does not wait — three hundred
+// cancels are one poke, three hundred joins are not.
+func TestRestartAllReachesEveryTrackedSubject(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	w := newSteeredWorker()
+	RegisterWorker(e, "sync", w, WithInterval(time.Hour))
+	startSupervisor(t, e)
+	e.Add("a")
+	e.Add("b")
+	w.started.Await(t, "the first start")
+	w.started.Await(t, "the second start")
+
+	e.RestartAll("sync")
+
+	w.started.Await(t, "one replacement")
+	w.started.Await(t, "the other replacement")
+}
+
+// Remove joins a worker: past it the goroutine is gone, which is what makes forgetting one
+// synchronous for a caller about to release what it wrote through.
+func TestRemoveJoinsAWorker(t *testing.T) {
+	e, w, pass := runningWorker(t)
+	pass.Ready()
+
+	e.Remove(subj)
+
+	assert.Equal(t, 1, w.count())
+	_, ok := e.Read(subj)
+	assert.False(t, ok)
+}
+
+// --- the graph ---
+
+// A worker is not started until its dependency has succeeded, exactly as a job would not be.
+func TestAWorkerWaitsForItsDependency(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	dep := &steered{res: Fail("Unreachable", assert.AnError)}
+	RegisterJob(e, "conn", dep)
+	w := newSteeredWorker()
+	RegisterWorker(e, "sync", w, WithDependencies("conn"), WithInterval(time.Hour))
+	startSupervisor(t, e)
+
+	e.Add(subj)
+	awaitAttempts(t, e, "sync", "the worker to record DependencyFailed", func(a Attempts) bool {
+		return a.LastAttempt.Reason == ReasonDependencyFailed
+	})
+	assert.Zero(t, w.count(), "the worker was started over a failing dependency")
+
+	dep.set(Succeeded())
+	e.Wake(subj, "conn")
+	w.started.Await(t, "the worker, once its dependency came back")
+}
+
+// A dependency gates a worker's START and nothing more: one that fails under a running worker
+// leaves it alone, and is checked again at its next start.
+func TestADependencyThatFailsUnderARunningWorkerLeavesItAlone(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	dep := &steered{res: Succeeded()}
+	RegisterJob(e, "conn", dep)
+	w := newSteeredWorker()
+	RegisterWorker(e, "sync", w, WithDependencies("conn"), WithInterval(time.Hour))
+	startSupervisor(t, e)
+
+	e.Add(subj)
+	w.started.Await(t, "the worker's run").Ready()
+
+	dep.set(Fail("Unreachable", assert.AnError))
+	e.Wake(subj, "conn")
+	awaitAttempts(t, e, "conn", "the dependency to fail", func(a Attempts) bool { return !a.OK() })
+
+	assert.Equal(t, 1, w.count(), "the running worker was restarted by its dependency failing")
+	assert.True(t, att(t, e, "sync").Ready())
+}
+
+// A job depending on a worker reads the worker's health rather than its last exit: Ready is OK,
+// and Ready asks for a pass so the dependent is scheduled the moment the worker comes up.
+func TestAJobDependingOnAWorkerRunsOnceItIsReady(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	w := newSteeredWorker()
+	RegisterWorker(e, "sync", w, WithInterval(time.Hour))
+	dependent := &steered{res: Succeeded()}
+	RegisterJob(e, "reader", dependent, WithDependencies("sync"), WithInterval(time.Hour))
+	startSupervisor(t, e)
+
+	e.Add(subj)
+	pass := w.started.Await(t, "the worker's run")
+	// Starting is unanswered, so nothing has been said about the dependent yet.
+	assert.Zero(t, dependent.count())
+
+	pass.Ready()
+
+	require.Eventually(t, func() bool { return dependent.count() == 1 }, testutil.Timeout, time.Millisecond,
+		"the dependent to run once its worker was up")
+}
+
+// The watch edge is a Restart for a worker where it is a Wake for a job: a worker's input moving
+// means the one it is running on is stale. **The restart is made from inside commit**, under the
+// supervisor's own lock, which is why it must not be the kind of call that waits.
+func TestAChangedValueRestartsAWatchingWorker(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	source := &steered{res: Succeeded()}
+	RegisterJob(e, "conn", source, WithInterval(time.Hour))
+	w := newSteeredWorker()
+	RegisterWorker(e, "sync", w, WithWatches("conn"), WithInterval(time.Hour))
+	startSupervisor(t, e)
+
+	e.Add(subj)
+	w.started.Await(t, "the worker's run").Ready()
+	awaitAttempts(t, e, "conn", "the source to settle", hasRecorded)
+
+	source.commits("moved")
+	e.Wake(subj, "conn")
+
+	w.started.Await(t, "the worker restarted onto the new value")
+}
+
+// --- reading a worker ---
+
+// The two observation types split because a reader judges them differently, and reading one as
+// the other is a wiring bug rather than a zero value quietly handed back.
+func TestATypedReadRefusesTheOtherKind(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	RegisterJob(e, "conn", &steered{res: Succeeded()})
+	RegisterWorker(e, "sync", newSteeredWorker())
+	e.Add(subj)
+	snap, _ := e.Read(subj)
+
+	assert.PanicsWithValue(t, `supervisor: "sync" is a worker, read as a job`,
+		func() { GetJobObservation[string](snap, "sync") })
+	assert.PanicsWithValue(t, `supervisor: "conn" is a job, read as a worker`,
+		func() { GetWorkerObservation[string](snap, "conn") })
+}
+
+// A worker's value does not outlive the worker: "watching" is false the moment it exits, where a
+// job's "identified, as of 10:00" still holds. Live is what says so, and ChangedAt dates the
+// value rather than the last time something confirmed it.
+func TestAWorkersValueIsLiveOnlyWhileItRuns(t *testing.T) {
+	e, w, pass := runningWorker(t, WithInterval(time.Hour))
+	pass.Ready()
+	pass.Commit("watching")
+	awaitAttempts(t, e, "sync", "the commit to land", func(Attempts) bool {
+		snap, _ := e.Read(subj)
+		return GetWorkerObservation[string](snap, "sync").Known()
+	})
+
+	snap, _ := e.Read(subj)
+	live := GetWorkerObservation[string](snap, "sync")
+	assert.True(t, live.Live())
+	assert.Equal(t, "watching", live.Value)
+	changedAt := live.ChangedAt
+
+	w.exit(t, Fail("Unreachable", assert.AnError))
+	awaitAttempts(t, e, "sync", "the exit to be recorded", hasRecorded)
+
+	snap, _ = e.Read(subj)
+	down := GetWorkerObservation[string](snap, "sync")
+	assert.False(t, down.Live(), "the value outlived the worker")
+	assert.Equal(t, "watching", down.Value, "what it last said still reads")
+	assert.Equal(t, changedAt, down.ChangedAt, "an exit is not a change of value")
+}
+
+// A rotation is the worker ending, not it speaking. Dating the value by a clean exit would make
+// ChangedAt read as "this run has answered" to anyone comparing it against the attempt it ended.
+func TestAWorkersCleanExitDoesNotDateItsValue(t *testing.T) {
+	e, w, pass := runningWorker(t, WithInterval(time.Hour))
+	pass.Ready()
+	pass.Commit("watching")
+	awaitAttempts(t, e, "sync", "the commit to land", func(Attempts) bool {
+		snap, _ := e.Read(subj)
+		return GetWorkerObservation[string](snap, "sync").Known()
+	})
+
+	snap, _ := e.Read(subj)
+	changedAt := GetWorkerObservation[string](snap, "sync").ChangedAt
+
+	w.exit(t, Succeeded())
+	awaitAttempts(t, e, "sync", "the exit to be recorded", hasRecorded)
+
+	snap, _ = e.Read(subj)
+	assert.Equal(t, changedAt, GetWorkerObservation[string](snap, "sync").ChangedAt,
+		"a clean exit dated a value it never committed")
+}
+
+// A run dispatched while its WORKER dependency is starting is the supervisor's own no-op: the
+// worker has not answered yet, so there is nothing to record and nothing to dial. **It must not
+// park the registration.** A Skip the body chose parks until a Wake; this one is not the body's,
+// so it leaves no memory behind and the worker coming up is enough to schedule the run it
+// displaced — which is the window a restarting worker leaves open on every rotation.
+func TestARunDispatchedWhileItsWorkerDependencyIsStartingIsNotParked(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	w := newSteeredWorker()
+	RegisterWorker(e, "sync", w, WithInterval(time.Hour))
+	dialed := testutil.NewSignal()
+	dependent := &steered{res: Succeeded(), onRun: func() { dialed.Fire() }}
+	RegisterJob(e, "reader", dependent, WithDependencies("sync"), WithInterval(time.Hour))
+	startSupervisor(t, e)
+
+	e.Add(subj)
+	pass := w.started.Await(t, "the worker's run")
+
+	// A Wake outruns the pass, which is how a run reaches dispatch over a dependency that has
+	// not answered. The window is bounded because nothing is expected to happen in it — and
+	// waiting it out is also what puts the dispatch inside the window this test is about.
+	e.Wake(subj, "reader")
+	testutil.NoRecv(t, dialed.Chan(), quietWindow, "the dependent was dialed over a worker that had not answered")
+	assert.False(t, att(t, e, "reader").LastAttempt.Done(), "the displaced run recorded something")
+
+	// Nothing else asks for it, so the worker coming up has to be enough.
+	pass.Ready()
+
+	dialed.Wait(t, "the dependent to run once its worker was up")
+	assert.Equal(t, 1, dependent.count())
+}
+
+// The startup timer and a first frame can land together: the timer takes the lock, marks the start
+// timed out and cancels, and the worker — with its frame already in hand — calls Ready on the way
+// out. **The timeout wins**, because the two are one decision and the timer made it first. A Ready
+// admitted after it would open a healthy stretch and clear the streak over a start that failed,
+// and a body then reporting its cancelled context with a Skip would park for good.
+func TestReadyAfterTheStartupTimeoutIsRefused(t *testing.T) {
+	e := New()
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	w := newSteeredWorker()
+	w.readiesOnCancel()
+	w.cancelledWith(Skip())
+	RegisterWorker(e, "sync", w, WithTimeout(20*time.Millisecond), WithBackoff(time.Hour, 2, time.Hour))
+	startSupervisor(t, e)
+
+	e.Add(subj)
+
+	a := awaitAttempts(t, e, "sync", "the timed-out start to be recorded", hasRecorded)
+	assert.Equal(t, VerdictFailed, a.LastAttempt.Verdict)
+	assert.Equal(t, ReasonNeverReady, a.LastAttempt.Reason)
+	assert.Equal(t, 1, a.Failures, "paced by the ladder rather than parked")
+	assert.True(t, a.HealthySince.IsZero(), "the late Ready opened a healthy stretch over a failed start")
+	assert.True(t, a.Scheduled(), "and it is due again")
+}
+
+// A source that accepts every start and drops it calls Ready on each one, so the streak has to
+// survive them to escalate. This is what the ladder is for, and what a Ready that cleared the
+// count would flatten to the base delay forever.
+func TestSuccessiveFailuresClimbThoughEachStartedCleanly(t *testing.T) {
+	// A short ladder, since what is asserted is the COUNT climbing rather than the wait it
+	// buys — a long one would just make the restarts outlast the test.
+	e, w, pass := runningWorker(t, WithBackoff(time.Millisecond, 1, time.Millisecond))
+
+	for i := range 3 {
+		pass.Ready()
+		w.exit(t, Fail("Unreachable", assert.AnError))
+		awaitAttempts(t, e, "sync", "the failure to be recorded", func(a Attempts) bool {
+			return a.Failures == i+1
+		})
+		if i < 2 {
+			pass = w.started.Await(t, "the restart")
+		}
+	}
 }

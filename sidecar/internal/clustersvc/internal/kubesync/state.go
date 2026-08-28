@@ -27,7 +27,7 @@ import (
 // what it recorded — the same aliases kubeconn declares, for the same reason. Reason
 // stays this package's vocabulary; the supervisor treats it as opaque.
 type (
-	Observation[T any] = supervisor.Observation[T]
+	Observation[T any] = supervisor.JobObservation[T]
 	Attempt            = supervisor.Attempt
 	Attempts           = supervisor.Attempts
 	Verdict            = supervisor.Verdict
@@ -108,6 +108,22 @@ type DiscoveryState struct {
 // set of passes, and the difference decides every field here. It carries no identity: the
 // caller named the kind to read it.
 //
+// **Nothing stores it.** It is assembled at read from the three things that own its parts: the
+// reason the worker committed, the supervisor's own pacing, and the session's stamps. A stored
+// copy would be a stale duplicate of all three.
+//
+// The worker's value is the REASON alone. Everything else a live stream stands behind is already
+// the supervisor's — when the reason last moved is when it last committed, and the pacing is its
+// Attempts — so a value carrying them would be a second copy to keep in step.
+//
+// **It carries no Observation, where DiscoveryState carries three**, and the rule behind that is
+// what makes each shape right. A sweep is three independent reads, each separately interesting,
+// and each one's Attempts means exactly what it says — so handing them over is the answer. One
+// worker's record is only correct through this seam's gates: its last exit describes the kind
+// while it is DOWN and is the failure it recovered from once it is up again, and its next attempt
+// is the schedule a running stream was dispatched on rather than a retry. Those are the two facts
+// a reader is likeliest to get wrong, so they are folded here rather than published raw.
+//
 // A pass is judged by its last attempt. A stream is judged by whether it is established
 // now and has recently proven itself alive, which is a different question and needs
 // different evidence:
@@ -127,6 +143,14 @@ type KindState struct {
 	// has instead of a last-attempt stamp.
 	SinceAt time.Time
 
+	// Live reports that the watch is OPEN right now, which is what the supervisor means by a
+	// worker being live. Kept rather than folded away because it is the one join a consumer
+	// cannot redo: reconstructing it means enumerating which reasons a running stream reports,
+	// and that set is this package's to change. Stale is live — the watch is up, its rows have
+	// simply stopped being known current — and Syncing is not, since the cold list is still
+	// running.
+	Live bool
+
 	// LastUpdateAt is when data last arrived; LastLiveAt the last proof the stream is
 	// live, which is the later of the two and the only one that distinguishes idle from
 	// wedged.
@@ -137,17 +161,11 @@ type KindState struct {
 	LastUpdateAt time.Time
 	LastLiveAt   time.Time
 
-	// Restarts counts the failed attempts since the stream last proved itself live;
-	// NextRetryAt is when a run that is down will be tried again, and zero while one is up.
+	// Restarts counts how many times the stream has come back within the current healthy
+	// stretch — the flapping question the retry streak cannot answer, since a watch that
+	// rotates every thirty seconds never fails. The streak itself is readable as a non-zero
+	// NextRetryAt, which is when a run that is DOWN will be tried again and zero while one is
+	// up.
 	Restarts    int
 	NextRetryAt time.Time
-}
-
-// setReason moves the reason, and SinceAt with it only when it changed: SinceAt is when the
-// reason last moved, which is what "watching since 10:02" reads off.
-func (st *KindState) setReason(reason Reason, message string) {
-	if st.Reason != string(reason) {
-		st.SinceAt = time.Now()
-	}
-	st.Reason, st.Message = string(reason), message
 }

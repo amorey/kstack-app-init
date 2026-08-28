@@ -646,7 +646,7 @@ func TestWatchStateIsKeyedByContext(t *testing.T) {
 	sub := lease.WatchState()
 	defer sub.Close()
 
-	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", LastSeen: runAt}})
+	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", LastSeenAt: runAt}})
 
 	ev, err := sub.RecvContext(within(t))
 	require.NoError(t, err)
@@ -663,7 +663,7 @@ func TestReleaseDoesNotCloseAStateWatcher(t *testing.T) {
 	defer watched.Close()
 
 	lease.Release()
-	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", LastSeen: runAt}})
+	s.stateHub.Sender().Send("prod", State{ServerUID: Observation[string]{Value: "uid-1", LastSeenAt: runAt}})
 
 	ev, err := watched.RecvContext(within(t))
 	require.NoError(t, err, "the receiver is still live, and still the caller's to close")

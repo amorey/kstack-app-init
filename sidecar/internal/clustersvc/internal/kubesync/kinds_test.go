@@ -167,14 +167,18 @@ func TestAKindThatWillNotListRetriesAndSaysWhy(t *testing.T) {
 			strings.Contains(state.Message, "the collection is forbidden") &&
 			!state.NextRetryAt.IsZero()
 	})
-	awaitKindState(t, svc, 1, podKind, "the run to be retried", func(state KindState) bool {
-		return state.Restarts >= 2
-	})
+	// The retry is what the countdown promises, and the countdown is the whole record of the
+	// streak: Restarts counts a healthy stream coming back, which this kind never is.
+	cluster.listed.Drain()
+	cluster.listed.Await(t, "the run to be retried")
 }
 
-// The apiserver ends a watch on its own timeout, which is not a kind going down: reporting one
-// would walk every collection through SyncFailed every few minutes.
-func TestARotatedStreamIsRebuiltWithoutReportingAFailure(t *testing.T) {
+// The apiserver ends a watch on its own timeout, which is not a kind going down: the rows stay
+// current across the reopen, so it is a CLEAN exit paced by the floor. Nothing climbs, nothing
+// counts down, and the verdict never leaves Watching — reporting one would walk every collection
+// through SyncFailed every few minutes. Restarts is what the rotation moves, which is the
+// flapping question the retry streak cannot answer.
+func TestARotatedStreamIsRebuiltAtTheFloorWithoutReportingAFailure(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serveKind(podKind, true)
 	cluster.hasObjects(podKind, "10")
@@ -182,28 +186,26 @@ func TestARotatedStreamIsRebuiltWithoutReportingAFailure(t *testing.T) {
 
 	svc := newSyncingService(t, cluster)
 	syncKind(t, svc, 1, podKind)
+	// A frame first: a watch closing before one has proven nothing, and its exit is NeverReady
+	// rather than a rotation.
+	watcher := stream.opened.Await(t, "the watch to open")
+	watcher.Add(object("v1", "Pod", "one", "11"))
 	awaitKindReason(t, svc, 1, podKind, ReasonWatching)
 
-	stream.opened.Await(t, "the watch to open").Stop()
-
-	// While the reopen is paced, and only then: the countdown belongs to a run that is down, so
-	// the rebuild below is what clears it. Read after the rebuild, this would be asserting that
-	// a settled stream is still retrying.
-	awaitKindState(t, svc, 1, podKind, "the reopen to be paced under the standing verdict",
-		func(state KindState) bool {
-			return state.Reason == ReasonWatching && !state.NextRetryAt.IsZero()
-		})
+	watcher.Stop()
 
 	stream.opened.Await(t, "the watch to be rebuilt")
-	awaitKindState(t, svc, 1, podKind, "the rebuilt stream to stop reading as one retrying",
+	awaitKindState(t, svc, 1, podKind, "the rebuild to count as a restart under an unmoved verdict",
 		func(state KindState) bool {
-			return state.Reason == ReasonWatching && state.NextRetryAt.IsZero()
+			return state.Reason == ReasonWatching && state.Restarts >= 1 && state.NextRetryAt.IsZero()
 		})
 }
 
 // An open the server accepts and drops has proven nothing, so it must not pass for a settled
-// stream — a run clearing its streak on the open alone would sit at the base delay forever.
-func TestTheRetryStreakClearsOnAFrameRatherThanTheOpen(t *testing.T) {
+// stream: a clean end before the first frame is the supervisor's NeverReady, which climbs the
+// ladder where a rotation waits out the floor. Only a frame settles it — and the streak's own
+// accumulation is the supervisor's, tested there.
+func TestAWatchDroppedBeforeItsFirstFrameClimbsTheLadder(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serveKind(podKind, true)
 	cluster.hasObjects(podKind, "10")
@@ -212,18 +214,18 @@ func TestTheRetryStreakClearsOnAFrameRatherThanTheOpen(t *testing.T) {
 	svc := newSyncingService(t, cluster)
 	syncKind(t, svc, 1, podKind)
 
-	// Two closures with nothing between them: one streak, two rungs.
+	// Two closures with nothing between them, neither having delivered a frame.
 	for range 2 {
 		stream.opened.Await(t, "the watch to open").Stop()
 	}
-	awaitKindState(t, svc, 1, podKind, "the ladder to climb", func(state KindState) bool {
-		return state.Restarts >= 2
+	awaitKindState(t, svc, 1, podKind, "the death to be reported and paced", func(state KindState) bool {
+		return state.Reason == ReasonSyncFailed && !state.NextRetryAt.IsZero()
 	})
 
 	stream.opened.Await(t, "the watch to be rebuilt").Add(object("v1", "Pod", "one", "11"))
 
-	awaitKindState(t, svc, 1, podKind, "the frame to clear the streak", func(state KindState) bool {
-		return state.Restarts == 0 && state.NextRetryAt.IsZero()
+	awaitKindState(t, svc, 1, podKind, "the frame to settle the stream", func(state KindState) bool {
+		return state.Reason == ReasonWatching && state.NextRetryAt.IsZero()
 	})
 }
 
@@ -324,7 +326,7 @@ func TestAColdListQueuedBehindTheWorkerCapNeverListsOnceItIsForgotten(t *testing
 	holdingSlot := cluster.holdList(otherKind)
 	defer holdingSlot.release()
 
-	svc := newSyncingService(t, cluster, func(p *pacing) { p.kindSyncWorkers = 1 })
+	svc := newSyncingService(t, cluster, func(p *pacing) { p.kindStartConcurrency = 1 })
 	syncKind(t, svc, 1, otherKind)
 	awaitKindReason(t, svc, 1, otherKind, ReasonSyncing)
 
@@ -370,7 +372,36 @@ func TestAConnectionRetiredUnderAKindIsReplacedRatherThanRetried(t *testing.T) {
 	stream.opened.Await(t, "the watch to be re-established over the replacement")
 	state, _ := svc.GetKindState(1, podKind)
 	assert.Equal(t, ReasonWatching, state.Reason, "a resume off the cookie holds its reason")
-	assert.Zero(t, state.Restarts, "and a rebuild is not a run that is down")
+	assert.True(t, state.NextRetryAt.IsZero(), "and a rebuild is not a run that is down")
+	assert.Equal(t, 1, state.Restarts, "though the stream did go down and come back")
+}
+
+// The same rearm one run of the phase earlier: a connection retired while the kind is still
+// establishing ends that run with a cancel too, and the bridge's wake has already been and found
+// it running. A ladder cannot stand in for it — the exit records nothing, so there is no rung.
+func TestAConnectionRetiredWhileAKindEstablishesIsReplacedRatherThanParked(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serveKind(podKind, true)
+	cluster.hasObjects(podKind, "10", object("v1", "Pod", "one", "1"))
+	stream := cluster.streamKind(podKind)
+	held := cluster.holdList(podKind)
+
+	// An hour, so nothing but a wake can explain a second start.
+	svc := newSyncingService(t, cluster, func(p *pacing) {
+		p.backoff = supervisor.Backoff{Base: time.Hour, Factor: 2, Cap: time.Hour}
+	})
+	syncKind(t, svc, 1, podKind)
+	awaitKindReason(t, svc, 1, podKind, ReasonSyncing)
+
+	// The pool rebuilt the connection while this run was parked in its cold list, and the open
+	// that follows the list is what reads the refusal. The cancel is pending before the list is
+	// let go, and the whole cold list runs between the two.
+	stream.refuse(errors.New("the api server is busy"))
+	svc.connSvc.(*fakePool).lease("prod").connect(t, cluster, "uid-1")
+	held.release()
+
+	cluster.listed.Await(t, "the held list to land")
+	cluster.listed.Await(t, "the kind to be started again over the replacement")
 }
 
 func TestAKindWhoseAPIVersionIsUnparseableStillNamesItsCollection(t *testing.T) {
@@ -478,42 +509,30 @@ func TestAPositionTheServerHasDroppedIsColdListedRatherThanResumedForever(t *tes
 	}, testutil.Timeout, time.Millisecond, "the cold list to replace what the cache held")
 }
 
-func TestAStreamThatSettlesBetweenClosuresRetriesAtTheFloor(t *testing.T) {
+func TestAStreamThatSettlesBetweenClosuresReopensAtTheFloor(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serveKind(podKind, true)
 	cluster.hasObjects(podKind, "10")
 	stream := cluster.streamKind(podKind)
 
-	// Wide enough that a ladder climbing over the cycles below is unmistakable in the delay
-	// each failure reports.
-	const floor = 100 * time.Millisecond
-	svc := newSyncingService(t, cluster, func(p *pacing) {
-		p.backoff = supervisor.Backoff{Base: floor, Factor: 2, Cap: 10 * time.Second}
-	})
+	svc := newSyncingService(t, cluster)
 	syncKind(t, svc, 1, podKind)
 
-	// Three closures, each over a stream that delivered a frame first. Every one is the first
-	// failure of its own streak, so each waits the floor — a kind whose ladder never reset
-	// would be at four times that by the third.
-	var delay time.Duration
+	// Three closures, each over a stream that delivered a frame first. Every one is a clean
+	// exit, so none is ever recorded a failure — a kind whose rotations were counted as ones
+	// would be reading SyncFailed with a widening countdown by the third.
 	for range 3 {
 		watcher := stream.opened.Await(t, "the watch to open")
 		watcher.Add(object("v1", "Pod", "one", "11"))
 		awaitKindState(t, svc, 1, podKind, "the frame to settle the stream", func(state KindState) bool {
-			return state.Restarts == 0
+			return state.Reason == ReasonWatching && state.NextRetryAt.IsZero()
 		})
-
-		before := time.Now()
 		watcher.Stop()
-		awaitKindState(t, svc, 1, podKind, "the reopen to be paced", func(state KindState) bool {
-			if state.Restarts == 0 {
-				return false
-			}
-			delay = state.NextRetryAt.Sub(before)
-			return true
-		})
 	}
-	assert.Less(t, delay, 2*floor, "a stream that settled clears the streak its ladder is climbing")
+
+	awaitKindState(t, svc, 1, podKind, "every rotation to have counted as one", func(state KindState) bool {
+		return state.Reason == ReasonWatching && state.NextRetryAt.IsZero() && state.Restarts >= 3
+	})
 }
 
 // The delta cadence counts within one stream, so a kind restarted more often than it comes round
@@ -646,27 +665,6 @@ func TestARelistRefusedOnceIsRetriedAsARelist(t *testing.T) {
 	}, testutil.Timeout, time.Millisecond, "the relist to be retried until it lands")
 }
 
-// A stream the server drops on open must climb the ladder rather than spin: the run that
-// observes the death records it and starts nothing, and the run the ladder schedules is the one
-// that re-establishes. Two closures with nothing between them are two rungs, which is only true
-// because establishment is Provisional.
-func TestAStreamThatDiesIsReEstablishedAfterARungRatherThanAtOnce(t *testing.T) {
-	cluster := newFakeCluster(t)
-	cluster.serveKind(podKind, true)
-	cluster.hasObjects(podKind, "10")
-	stream := cluster.streamKind(podKind)
-
-	svc := newSyncingService(t, cluster)
-	syncKind(t, svc, 1, podKind)
-
-	for range 2 {
-		stream.opened.Await(t, "the watch to open").Stop()
-	}
-	awaitKindState(t, svc, 1, podKind, "the ladder to climb over two deaths", func(state KindState) bool {
-		return state.Restarts >= 2 && !state.NextRetryAt.IsZero()
-	})
-}
-
 // A restart is a cancel, and a clean exit carries no error — so the run it wakes re-establishes
 // at once rather than paying a rung for a stream nothing was wrong with.
 func TestRestartAllReEstablishesWithoutARung(t *testing.T) {
@@ -685,8 +683,8 @@ func TestRestartAllReEstablishesWithoutARung(t *testing.T) {
 
 	state, ok := svc.GetKindState(1, podKind)
 	require.True(t, ok)
-	assert.Zero(t, state.Restarts, "a clean exit is not a failure")
-	assert.True(t, state.NextRetryAt.IsZero(), "and nothing is retrying")
+	assert.True(t, state.NextRetryAt.IsZero(), "a stop is not a failure, so nothing is retrying")
+	assert.Equal(t, 1, state.Restarts, "the poke is what took the stream down and back")
 }
 
 // The supervisor hands back every value it stops holding, so Remove joins the goroutine: past
@@ -775,7 +773,7 @@ func TestAColdStartOffAPositionTheServerHasDroppedRelists(t *testing.T) {
 	t.Cleanup(func() { _ = mgr.Close() })
 	pool.lease("prod").connect(t, cluster, "uid-1")
 
-	first := New(pool, mgr, withPacing(syncPacing()), withRealKindReconciler())
+	first := New(pool, mgr, withPacing(syncPacing()), withRealKindSync())
 	start(t, first)
 	syncKind(t, first, 1, podKind)
 	awaitKindReason(t, first, 1, podKind, ReasonWatching)
@@ -788,10 +786,154 @@ func TestAColdStartOffAPositionTheServerHasDroppedRelists(t *testing.T) {
 	cluster.listed.Drain()
 	stream.refuse(apierrors.NewResourceExpired("too old resource version"))
 
-	second := New(pool, mgr, withPacing(syncPacing()), withRealKindReconciler())
+	second := New(pool, mgr, withPacing(syncPacing()), withRealKindSync())
 	t.Cleanup(func() { _ = second.Close() })
 	start(t, second)
 	syncKind(t, second, 1, podKind)
 
 	cluster.listed.Await(t, "the collection to be listed again rather than resumed forever")
+}
+
+// The connection bridge wakes every kind on every state frame, so a Wake must never tear a live
+// stream down: a cache of three hundred kinds would otherwise re-list on any pass the pool
+// published. A parked kind is what it starts.
+func TestAStateFrameLeavesALiveStreamAlone(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serveKind(podKind, true)
+	cluster.hasObjects(podKind, "10")
+	stream := cluster.streamKind(podKind)
+
+	svc := newSyncingService(t, cluster)
+	syncKind(t, svc, 1, podKind)
+	stream.opened.Await(t, "the watch to open").Add(object("v1", "Pod", "one", "11"))
+	awaitKindReason(t, svc, 1, podKind, ReasonWatching)
+
+	svc.sessionOf(1).wakeAll()
+
+	// A negative assertion has no event to wait for, so it takes a window of its own.
+	testutil.NoRecv(t, stream.opened.Chan(), quietWindow, "the wake re-opened a live stream")
+	state, ok := svc.GetKindState(1, podKind)
+	require.True(t, ok)
+	assert.Equal(t, ReasonWatching, state.Reason, "and it never left the verdict it was standing on")
+}
+
+// A teardown must not release the store under a worker that is mid-list: the run writes through
+// the claim the session is about to give back. Two things hold it — the per-kind Remove, which
+// cancels and joins, and the session's own join behind that — and this pins the promise rather
+// than which of them delivered it.
+func TestATeardownMidListJoinsTheWorkerBeforeReleasingTheStore(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serveKind(podKind, true)
+	cluster.hasObjects(podKind, "10")
+	held := cluster.holdList(podKind)
+	cluster.streamKind(podKind)
+
+	// Released whatever happens: a held list the teardown is joining outlives a failed
+	// assertion, and the drain behind it would never finish.
+	t.Cleanup(held.release)
+
+	svc := newSyncingService(t, cluster)
+	syncKind(t, svc, 1, podKind)
+	awaitKindReason(t, svc, 1, podKind, ReasonSyncing)
+
+	done := make(chan struct{})
+	go func() { defer close(done); svc.ForgetDiscovery(1) }()
+	testutil.NoRecv(t, done, quietWindow, "the teardown returned while the list was still out")
+
+	held.release()
+	testutil.Wait(t, done, "the teardown to join the worker")
+}
+
+// OnPass fires on every pass, schedule-only ones included, so a record is woken only when the
+// answer a reader would get has MOVED. Without the baseline behind that, every pass would wake
+// every record on the cache.
+func TestAPassThatMovedNothingWakesNoRecord(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serveKind(podKind, true)
+	cluster.hasObjects(podKind, "10")
+	stream := cluster.streamKind(podKind)
+
+	svc := newSyncingService(t, cluster)
+	syncKind(t, svc, 1, podKind)
+	stream.opened.Await(t, "the watch to open").Add(object("v1", "Pod", "one", "11"))
+	awaitKindReason(t, svc, 1, podKind, ReasonWatching)
+
+	// Subscribed after the verdict settled, so what follows is measured against a cache with
+	// nothing left to say.
+	news := svc.WatchKindNews()
+	t.Cleanup(news.Close)
+	subject := kindSubject(1, podKind)
+	snap, ok := svc.kindSupervisor.Read(subject)
+	require.True(t, ok)
+	svc.publishKind(subject, snap)
+	svc.publishKind(subject, snap)
+
+	testutil.NoRecv(t, news.Chan(), quietWindow, "a pass that moved nothing woke the record")
+}
+
+// A worker holds a start slot only until its STARTING phase is over, and for a stream that is the
+// watch being open — never its first frame. Bookmarks are advisory and a quiet collection may send
+// nothing for hours, so slots held until a frame would be taken indefinitely by whichever kinds
+// started first, and the rest of the cache would never list a row.
+func TestQuietKindsDoNotHoldTheStartSlotsOfTheRest(t *testing.T) {
+	cluster := newFakeCluster(t)
+	kinds := []kubestore.Kind{
+		podKind,
+		testKind("apps/v1", "Deployment", "deployments"),
+		testKind("v1", "Service", "services"),
+	}
+	watches := make([]*streams, 0, len(kinds))
+	for _, k := range kinds {
+		cluster.serveKind(k, true)
+		cluster.hasObjects(k, "10")
+		watches = append(watches, cluster.streamKind(k))
+	}
+
+	// Fewer slots than kinds, and not one of these collections will ever deliver a frame.
+	svc := newSyncingService(t, cluster, func(p *pacing) { p.kindStartConcurrency = 1 })
+	svc.TrackDiscovery(1, testParams)
+	awaitDiscovered(t, svc, 1)
+	for _, k := range kinds {
+		svc.TrackKind(1, k)
+	}
+
+	for i, w := range watches {
+		w.opened.Await(t, "the watch for "+kinds[i].Resource)
+	}
+}
+
+// Live is the supervisor's reading of the worker carried through the seam: the watch is open. It
+// is not derivable from the reason without enumerating the vocabulary, which is why the seam
+// carries it rather than folding it away — a cold list is not live, and a stream nothing has
+// proven current still is.
+func TestOnlyAnOpenWatchReadsLive(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serveKind(podKind, true)
+	cluster.hasObjects(podKind, "10")
+	held := cluster.holdList(podKind)
+	t.Cleanup(held.release)
+	cluster.streamKind(podKind)
+
+	svc := newSyncingService(t, cluster, func(p *pacing) { p.staleAfter = 50 * time.Millisecond })
+	syncKind(t, svc, 1, podKind)
+
+	awaitKindState(t, svc, 1, podKind, "the cold list to be under way", func(state KindState) bool {
+		return state.Reason == ReasonSyncing
+	})
+	state, _ := svc.GetKindState(1, podKind)
+	assert.False(t, state.Live, "a kind still listing is not live")
+
+	held.release()
+
+	awaitKindState(t, svc, 1, podKind, "the watch to be open", func(state KindState) bool {
+		return state.Reason == ReasonWatching && state.Live
+	})
+
+	// Nothing proves this collection current, so it ages into Stale — and stays live, because
+	// the watch is still open.
+	awaitKindState(t, svc, 1, podKind, "the stream to stop being known current", func(state KindState) bool {
+		return state.Reason == ReasonStale
+	})
+	state, _ = svc.GetKindState(1, podKind)
+	assert.True(t, state.Live, "a stale stream is still an open watch")
 }

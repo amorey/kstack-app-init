@@ -355,7 +355,7 @@ func TestForgettingACacheStopsItsSweep(t *testing.T) {
 func TestASweepSkipsASubjectThatIsNotAnArmedCache(t *testing.T) {
 	svc, _ := newTestService(t)
 	ran := false
-	body := func(context.Context, *session, *kubeconn.Connection, *supervisor.Pass[uint64]) supervisor.Result {
+	body := func(context.Context, *session, *kubeconn.Connection, *supervisor.JobPass[uint64]) supervisor.Result {
 		ran = true
 		return supervisor.Succeeded()
 	}
@@ -363,7 +363,7 @@ func TestASweepSkipsASubjectThatIsNotAnArmedCache(t *testing.T) {
 	// A subject this package did not name, and one whose cache nobody armed. Neither is a
 	// state a caller can reach — both are runs that must record nothing.
 	for _, subject := range []string{"not-a-cache", discoverySubject(404)} {
-		result := underSession(svc, body).Reconcile(t.Context(), supervisor.NewPass[uint64](subject, nil, supervisor.Snapshot{}))
+		result := underSession(svc, body).Run(t.Context(), supervisor.NewJobPass[uint64](subject, nil, supervisor.Snapshot{}))
 		assert.True(t, result.IsSkip(), "a run against %s records nothing", subject)
 	}
 	assert.False(t, ran, "and never reaches the body")

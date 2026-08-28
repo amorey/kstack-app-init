@@ -67,17 +67,35 @@ func TestACatalogSubscriptionEndingLeavesTheSessionRunning(t *testing.T) {
 	svc.ForgetDiscovery(1)
 }
 
-func TestASweepIsParkedOnlyWhileSomethingHasNotBeenScheduled(t *testing.T) {
+func TestASubjectNobodyTracksIsNotAParkedSweep(t *testing.T) {
 	svc, _ := newTestService(t)
 
 	assert.False(t, svc.sweepParked("cache/99"), "a subject nobody tracks is not a parked sweep")
+}
+
+// The fan-out skips while neither document has answered, which schedules nothing either. Reading
+// that as parked would wake the whole sweep on every connection state frame, and the failing
+// documents would be re-dispatched ahead of the ladder they should be climbing.
+func TestASweepWaitingOnItsOwnDocumentsIsNotParked(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.breakPath("/api")
+	cluster.breakPath("/apis")
+
+	svc, pool := newTestService(t)
+	pool.lease("prod").connect(t, cluster, "uid-1")
+	start(t, svc)
+	svc.TrackDiscovery(1, testParams)
+	awaitReason(t, svc, 1, ReasonDiscoveryFailed)
+
+	assert.False(t, svc.sweepParked(svc.sessionOf(1).discoverySubject()),
+		"a sweep whose documents will not load waits on its own retries, not on a wake")
 }
 
 // A run holds a supervisor worker, so a kind whose connection does not vouch records why and
 // suspends rather than waiting at the gate. Nothing syncs past it, and the session ends without
 // anything to join.
 func TestAKindSuspendedAtTheGateSyncsNothingAndEndsWithItsSession(t *testing.T) {
-	fake := newFakeKindReconciler()
+	fake := newFakeKindSync()
 	svc, _ := newTestService(t, fake.option())
 	start(t, svc)
 
@@ -129,7 +147,7 @@ func TestAConnectionAnsweringAsAnotherClusterWakesNothing(t *testing.T) {
 	cluster.noRead(t, "a sweep dialing a connection that answers as another cluster")
 }
 
-func TestASweepIsParkedWhileAnythingUnderItIsUnscheduled(t *testing.T) {
+func TestASweepIsParkedWhileAnythingUnderItIsSuspended(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serve("v1", listable("Pod", "pods", true))
 	svc, pool := newTestService(t)
@@ -236,37 +254,31 @@ func TestACacheStandsBehindNoReasonUntilARunCommitsOne(t *testing.T) {
 		"a cache whose sweep has not answered names no reason, so the first frame is news")
 }
 
-// The admission is one critical section: it checks the cache is armed, reads the kind, and
-// registers the run's cancel together. Split apart, a ForgetKind landing between the read and
-// the registration would find nothing to cancel, and the run would list rows for a kind nobody
-// tracks — the relist-behind-a-clear race ForgetKind is ordered before ClearKind to rule out.
-func TestAKindRunIsAdmittedWithItsKindAndItsCancelTogether(t *testing.T) {
+// The admission is one critical section: it checks the cache is armed and reads the kind
+// together. Split apart, a ForgetKind landing between the two would leave the run listing rows
+// for a kind nobody tracks — the relist-behind-a-clear race ForgetKind is ordered before
+// ClearKind to rule out.
+func TestAKindRunIsAdmittedWithItsWholeKind(t *testing.T) {
 	svc, pool := newTestService(t)
 	pool.lease("prod").vouch(t, "uid-1")
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, podKind)
 
-	cancelled := make(chan struct{})
-	sess, k, run, ok := svc.enterKindRun(1, idOf(podKind), func() { close(cancelled) })
+	sess, k, ok := svc.enterKindRun(1, idOf(podKind))
 	require.True(t, ok, "an armed cache with the kind tracked admits the run")
 	assert.Equal(t, podKind, k, "the run is handed the whole value, singular included")
 
-	// The registration is what ForgetKind reaches for, so it is visible the moment the run is in.
-	sess.cancelKindRun(idOf(podKind))
-	testutil.Wait(t, cancelled, "the run in flight to be cancelled")
-
-	svc.leaveKindRun(sess, run)
-	testutil.Wait(t, run.done, "the run to report itself out")
+	sess.leaveRun()
 }
 
 func TestAKindRunIsRefusedForACacheOrAKindThatIsGone(t *testing.T) {
 	svc, pool := newTestService(t)
 	pool.lease("prod").vouch(t, "uid-1")
 
-	_, _, _, ok := svc.enterKindRun(1, idOf(podKind), func() {})
+	_, _, ok := svc.enterKindRun(1, idOf(podKind))
 	assert.False(t, ok, "nothing has armed this cache")
 
 	svc.TrackDiscovery(1, testParams)
-	_, _, _, ok = svc.enterKindRun(1, idOf(podKind), func() {})
+	_, _, ok = svc.enterKindRun(1, idOf(podKind))
 	assert.False(t, ok, "the cache is armed but nothing tracks this kind")
 }

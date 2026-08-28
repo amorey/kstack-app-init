@@ -15,10 +15,10 @@
 // The typed read: a name paired with the value type behind it.
 package supervisor
 
-// Key pairs a reconciler's registration name with the type it observes, declared once beside the
-// reconciler rather than restated at every read. The pairing is checked where Get checks it — when a
+// Key pairs a JOB's registration name with the type it observes, declared once beside the job
+// rather than restated at every read. The pairing is checked where the read checks it — when a
 // value lands, which in practice is the first test that reads one — and a key declared with the
-// same name constant its reconciler registers under cannot get the name half wrong.
+// same name constant its job registers under cannot get the name half wrong.
 //
 // A freestanding declaration: registration never hears about it, it works against any Snapshot,
 // and a caller that declares none loses nothing.
@@ -32,6 +32,6 @@ func NewKey[T any](name string) Key[T] { return Key[T]{name: name} }
 // Name is the registration name this key addresses.
 func (k Key[T]) Name() string { return k.name }
 
-// From is this reconciler's observation out of snap, with the name and type already paired. It
-// panics on the same wiring bugs Get does.
-func (k Key[T]) From(snap Snapshot) Observation[T] { return Get[T](snap, k.name) }
+// From is this job's observation out of snap, with the name and type already paired. It panics on
+// the same wiring bugs GetJobObservation does.
+func (k Key[T]) From(snap Snapshot) JobObservation[T] { return GetJobObservation[T](snap, k.name) }

@@ -87,12 +87,12 @@ const eventsAPIGroup = "events.k8s.io"
 // registerProbes wires the sweep. Kept side by side on purpose — the set's rules are
 // checked by eye.
 func registerProbes(e *supervisor.Supervisor, s *Service) {
-	supervisor.Register(e, nameAPIVersions, underSession(s, probeAPIVersions), supervisor.WithInterval(discoveryInterval))
-	supervisor.Register(e, nameAPIGroups, underSession(s, probeAPIGroups), supervisor.WithInterval(discoveryInterval))
+	supervisor.RegisterJob(e, nameAPIVersions, underSession(s, probeAPIVersions), supervisor.WithInterval(discoveryInterval))
+	supervisor.RegisterJob(e, nameAPIGroups, underSession(s, probeAPIGroups), supervisor.WithInterval(discoveryInterval))
 	// A data edge on both documents and no dependency edge: they are the fan-out's input,
 	// and one that has not answered leaves it Skipped — waiting for the commit that wakes
 	// it — rather than failing over a read another probe already reports.
-	supervisor.Register(e, nameResources, underSession(s, probeResources), supervisor.WithInterval(discoveryInterval), supervisor.WithWatches(nameAPIVersions, nameAPIGroups))
+	supervisor.RegisterJob(e, nameResources, underSession(s, probeResources), supervisor.WithInterval(discoveryInterval), supervisor.WithWatches(nameAPIVersions, nameAPIGroups))
 }
 
 // sessionScoped is what every probe body is registered wrapped in. It resolves the session
@@ -108,14 +108,14 @@ func registerProbes(e *supervisor.Supervisor, s *Service) {
 // wake loop is what brings it back.
 type sessionScoped[T any] struct {
 	s    *Service
-	body func(ctx context.Context, sess *session, conn *kubeconn.Connection, pass *supervisor.Pass[T]) supervisor.Result
+	body func(ctx context.Context, sess *session, conn *kubeconn.Connection, pass *supervisor.JobPass[T]) supervisor.Result
 }
 
-func underSession[T any](s *Service, body func(context.Context, *session, *kubeconn.Connection, *supervisor.Pass[T]) supervisor.Result) sessionScoped[T] {
+func underSession[T any](s *Service, body func(context.Context, *session, *kubeconn.Connection, *supervisor.JobPass[T]) supervisor.Result) sessionScoped[T] {
 	return sessionScoped[T]{s: s, body: body}
 }
 
-func (p sessionScoped[T]) Reconcile(ctx context.Context, pass *supervisor.Pass[T]) supervisor.Result {
+func (p sessionScoped[T]) Run(ctx context.Context, pass *supervisor.JobPass[T]) supervisor.Result {
 	cacheID, ok := parseDiscoverySubject(pass.Subject())
 	if !ok {
 		return supervisor.Skip()
@@ -167,7 +167,7 @@ func parseDiscoverySubject(subject string) (int64, bool) {
 }
 
 // probeAPIVersions reads GET /api: the core group's versions, and half the fan-out's input.
-func probeAPIVersions(ctx context.Context, _ *session, conn *kubeconn.Connection, pass *supervisor.Pass[[]string]) supervisor.Result {
+func probeAPIVersions(ctx context.Context, _ *session, conn *kubeconn.Connection, pass *supervisor.JobPass[[]string]) supervisor.Result {
 	var doc metav1.APIVersions
 	if err := getJSON(ctx, conn, "/api", &doc); err != nil {
 		return supervisor.Fail(ReasonDiscoveryFailed, err)
@@ -180,7 +180,7 @@ func probeAPIVersions(ctx context.Context, _ *session, conn *kubeconn.Connection
 }
 
 // probeAPIGroups reads GET /apis: the group-versions served, one per group.
-func probeAPIGroups(ctx context.Context, _ *session, conn *kubeconn.Connection, pass *supervisor.Pass[[]string]) supervisor.Result {
+func probeAPIGroups(ctx context.Context, _ *session, conn *kubeconn.Connection, pass *supervisor.JobPass[[]string]) supervisor.Result {
 	var doc metav1.APIGroupList
 	if err := getJSON(ctx, conn, "/apis", &doc); err != nil {
 		return supervisor.Fail(ReasonDiscoveryFailed, err)
@@ -213,7 +213,7 @@ func preferredGroupVersions(doc metav1.APIGroupList) []string {
 // probeResources is the fan-out: one document per group-version, filtered to what a kind
 // sync can mirror, written to kind_catalog. Its value is the fingerprint it committed — the rows
 // belong on disk, and a fingerprint is all "the answer moved" requires.
-func probeResources(ctx context.Context, sess *session, conn *kubeconn.Connection, pass *supervisor.Pass[uint64]) supervisor.Result {
+func probeResources(ctx context.Context, sess *session, conn *kubeconn.Connection, pass *supervisor.JobPass[uint64]) supervisor.Result {
 	gvs, ok := fanOutInput(pass.Snapshot())
 	if !ok {
 		// Neither document has answered yet. The data edge is what brings this back, so a
@@ -247,8 +247,8 @@ func probeResources(ctx context.Context, sess *session, conn *kubeconn.Connectio
 // fanOutInput is every group-version to read a document for: the core group's, and one per
 // group. False while nothing has answered, which is the fan-out's cue to park.
 func fanOutInput(snap supervisor.Snapshot) ([]string, bool) {
-	core := supervisor.Get[[]string](snap, nameAPIVersions)
-	groups := supervisor.Get[[]string](snap, nameAPIGroups)
+	core := supervisor.GetJobObservation[[]string](snap, nameAPIVersions)
+	groups := supervisor.GetJobObservation[[]string](snap, nameAPIGroups)
 	if !core.Known() || !groups.Known() {
 		return nil, false
 	}
@@ -381,9 +381,9 @@ func fingerprintOf(rows []kubestore.KindRow, prune bool) uint64 {
 // message are the session's own record of the last sweep, which no Result can carry.
 func discoveryStateOf(snap supervisor.Snapshot, partial bool, message string) DiscoveryState {
 	state := DiscoveryState{
-		APIVersions: supervisor.Get[[]string](snap, nameAPIVersions),
-		APIGroups:   supervisor.Get[[]string](snap, nameAPIGroups),
-		Resources:   supervisor.Get[uint64](snap, nameResources),
+		APIVersions: supervisor.GetJobObservation[[]string](snap, nameAPIVersions),
+		APIGroups:   supervisor.GetJobObservation[[]string](snap, nameAPIGroups),
+		Resources:   supervisor.GetJobObservation[uint64](snap, nameResources),
 	}
 	state.Reason, state.Message = discoveryVerdict(state, partial, message)
 	return state

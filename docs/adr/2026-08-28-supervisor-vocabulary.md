@@ -82,3 +82,12 @@ and only what the thing is called has moved.
 A second body arrives whose value is neither an observation nor a stream, and `Observation` /
 `Snapshot` stop covering what a subject holds. Those two words were deliberately left alone here —
 they are still right for every body that exists.
+
+## Update, 2026-08-28
+
+The supervisor grew a second kind of thing to run, and three of the names below moved with it:
+`Reconciler[T]` is `Job[T]`, `Reconcile` is `Run`, and `ReconcilerOption` is `RegistrationOption`,
+beside the new `Worker[T]`. `Register` and `Pass` split into `RegisterJob`/`RegisterWorker` and
+`JobPass`/`WorkerPass`, and `Get`/`Observation` into `GetJobObservation`/`GetWorkerObservation` and
+`JobObservation`/`WorkerObservation`. The package name and `Supervisor` stand, which is the part
+this ADR decided. → [Jobs and workers](2026-08-28-jobs-and-workers.md).

@@ -25,11 +25,15 @@ type Reason string
 const (
 	// ReasonSucceeded is stamped by Succeeded; a caller never passes it.
 	ReasonSucceeded Reason = "Succeeded"
-	// ReasonDependencyFailed is recorded by the supervisor when a reconciler's dependency is failing,
+	// ReasonDependencyFailed is recorded by the supervisor when a dependency is failing,
 	// in place of a run. See the dependency lifecycle on Supervisor.due.
 	ReasonDependencyFailed Reason = "DependencyFailed"
-	// ReasonInternal is a bug in a reconciler body, recorded by the supervisor when a run panics.
+	// ReasonInternal is a bug in a body, recorded by the supervisor when a run panics.
 	ReasonInternal Reason = "Internal"
+	// ReasonNeverReady is a worker that exited before it called Ready. Recorded as a failure
+	// whatever the worker returned: it never proved it was up, so the ladder paces the restart
+	// rather than a clean exit's floor.
+	ReasonNeverReady Reason = "NeverReady"
 )
 
 // Verdict is how a finished run was classified, recorded on the Attempt because the schedule is
@@ -54,7 +58,6 @@ type Result struct {
 	message      string
 	err          error
 	requeueAfter time.Duration
-	provisional  bool
 }
 
 type resultKind int
@@ -65,7 +68,8 @@ const (
 	resultSkip               // record nothing
 )
 
-// Succeeded records success; the reconciler is due again after its interval.
+// Succeeded records success. A job is due again after its interval; a worker has STOPPED
+// cleanly, and is started again after the floor.
 func Succeeded() Result {
 	return Result{kind: resultRecord, verdict: VerdictSucceeded, reason: ReasonSucceeded}
 }
@@ -75,7 +79,7 @@ func Succeeded() Result {
 //
 // **Unlike beehive's, it can only bring a run forward**: the supervisor takes it when it is positive
 // and shorter than the registered interval, and ignores it otherwise. A registration is a
-// reconciler's cadence in a way a beehive resync is not — it is what bounds requests against someone
+// registration's cadence in a way a beehive resync is not — it is what bounds requests against someone
 // else's cluster — so no return path may push a subject past it. A zero is no ask rather than
 // "immediately", which would be a hot loop.
 //
@@ -86,21 +90,7 @@ func (r Result) RequeueAfter(d time.Duration) Result {
 	return r
 }
 
-// Provisional marks a success the run cannot yet vouch for: it started something whose proof
-// arrives later, so the attempt is recorded as a success but the failure streak stands. The
-// next plain Succeeded ends the streak, and a Fail before that climbs from where it stood.
-//
-// Without it a run that established something would reset the ladder on the open alone, and a
-// source that accepts a request and drops it would sit at the base delay forever.
-//
-// Read on a succeeded result and nowhere else: Fail owns the ladder and Suspend ends a streak
-// by parking the question, so calling this on either is inert.
-func (r Result) Provisional() Result {
-	r.provisional = true
-	return r
-}
-
-// Fail records a failure; the reconciler is due again up the backoff ladder. Message defaults to the
+// Fail records a failure; the next run is up the backoff ladder. Message defaults to the
 // error's text.
 func Fail(reason Reason, err error) Result {
 	r := Result{kind: resultRecord, verdict: VerdictFailed, reason: reason, err: err}
@@ -110,19 +100,19 @@ func Fail(reason Reason, err error) Result {
 	return r
 }
 
-// Suspend records why and schedules nothing; a Wake is what brings the reconciler back. It ends a
+// Suspend records why and schedules nothing; a Wake is what brings it back. It ends a
 // failure streak — a suspension parks a question rather than failing at one.
 func Suspend(reason Reason, message string) Result {
 	return Result{kind: resultRecord, verdict: VerdictSuspended, reason: reason, message: message}
 }
 
-// Skip records nothing and schedules nothing; a Wake is what brings the reconciler back. For a run
+// Skip records nothing and schedules nothing; a Wake is what brings it back. For a run
 // that learned nothing usable — an unreadable source, a shutdown cancellation.
 func Skip() Result {
 	return Result{kind: resultSkip}
 }
 
-// The read side, for a reconciler body's own tests: what the body returned, without giving a body a
+// The read side, for a body's own tests: what the body returned, without giving a body a
 // way to build a Result the constructors cannot.
 func (r Result) Verdict() Verdict { return r.verdict }
 func (r Result) Reason() Reason   { return r.reason }
@@ -130,7 +120,7 @@ func (r Result) Message() string  { return r.message }
 func (r Result) Err() error       { return r.err }
 func (r Result) IsSkip() bool     { return r.kind == resultSkip }
 
-// Attempt is one run of one reconciler, from scheduled through finished. Its fields fill in that
+// Attempt is one run of one registration, from scheduled through finished. Its fields fill in that
 // order, so the same value describes a run at every stage of its life.
 type Attempt struct {
 	// ScheduledAt is when this run should start — the backoff ladder made visible, since
@@ -140,7 +130,10 @@ type Attempt struct {
 	// as running.
 	ScheduledAt time.Time
 	StartedAt   time.Time
-	FinishedAt  time.Time
+	// ReadyAt is when a worker called Ready, and zero for a job — which is "ready" when it
+	// returns, so it has no earlier moment to stamp.
+	ReadyAt    time.Time
+	FinishedAt time.Time
 	// Verdict, Reason, and Message classify the outcome; Err is the raw error, nil on success.
 	// All unset until the run finishes.
 	Verdict Verdict
@@ -148,18 +141,18 @@ type Attempt struct {
 	Message string
 	Err     error
 
-	// requeueAfter is what the run asked for, zero for none, and provisional whether the run
-	// vouched for what it concluded. Unexported because they are the scheduler's own
-	// bookkeeping, and every exported field here is copied into the Snapshots callers read.
+	// requeueAfter is what the run asked for, zero for none. Unexported because it is the
+	// scheduler's own bookkeeping, and every exported field here is copied into the Snapshots
+	// callers read.
 	requeueAfter time.Duration
-	provisional  bool
 }
 
 // attemptOf is the record one finished run leaves. The only place a Result is turned into an
 // Attempt, so the bookkeeping the two carry cannot drift apart.
-func attemptOf(res Result, startedAt, finishedAt time.Time) Attempt {
+func attemptOf(res Result, startedAt, readyAt, finishedAt time.Time) Attempt {
 	return Attempt{
 		StartedAt:  startedAt,
+		ReadyAt:    readyAt,
 		FinishedAt: finishedAt,
 		Verdict:    res.verdict,
 		Reason:     res.reason,
@@ -167,7 +160,6 @@ func attemptOf(res Result, startedAt, finishedAt time.Time) Attempt {
 		Err:        res.err,
 
 		requeueAfter: res.requeueAfter,
-		provisional:  res.provisional,
 	}
 }
 
@@ -186,7 +178,7 @@ func (a Attempt) Latency() time.Duration {
 	return a.FinishedAt.Sub(a.StartedAt)
 }
 
-// Attempts is one reconciler's bookkeeping for one subject. The supervisor owns every write; a caller
+// Attempts is one registration's bookkeeping for one subject. The supervisor owns every write; a caller
 // reads it out of a Snapshot, embedded in the Observation beside the value it accounts for.
 type Attempts struct {
 	// LastAttempt is the most recent run that finished; NextAttempt is the one that has not,
@@ -195,50 +187,115 @@ type Attempts struct {
 	NextAttempt Attempt
 
 	// Failures counts consecutive failed runs and FailingSince is when the streak began, which
-	// the count cannot give: the ladder widens, so failures do not map to elapsed time.
+	// the count cannot give: the ladder widens, so failures do not map to elapsed time. For a
+	// worker this is its retry streak while it is DOWN — the rung the ladder climbs — and says
+	// nothing about one that flaps while healthy, which is what Restarts is for.
 	Failures     int
 	FailingSince time.Time
+
+	// HealthySince is when the current healthy stretch began, zero while there is none, and
+	// Restarts counts the runs started within it. FailingSince's mirror, and it answers what a
+	// single attempt's stamps cannot: a rotation is a clean exit and a fresh run, so "this
+	// stream has been up for a minute" is readable off the attempt and "this kind has been
+	// healthy for an hour, over 120 rotations" is readable only here.
+	HealthySince time.Time
+	Restarts     int
+
+	// skipped marks a last run that returned Skip — the one memory a Skip leaves. It records
+	// nothing, so without this the pass would read the registration as never-run and
+	// re-dispatch it at once. Cleared when a run records; a Wake goes through runQ, so it needs
+	// no clearing to force a run.
+	skipped bool
 }
 
-// OK reports whether the last finished run succeeded. False while nothing has finished.
+// OK reports whether the last FINISHED run succeeded. False while nothing has finished — and
+// false for a worker that is up right now, whose health is Ready rather than a finished verdict.
 func (a Attempts) OK() bool { return a.LastAttempt.Verdict == VerdictSucceeded }
+
+// Ready reports a worker that is running and has called Ready — the only reading of a worker's
+// health, since its value is a status that stops holding the moment it exits. Always false for a
+// job, which stamps no ReadyAt.
+func (a Attempts) Ready() bool { return a.InFlight() && !a.NextAttempt.ReadyAt.IsZero() }
 
 // InFlight reports whether a run is under way.
 func (a Attempts) InFlight() bool { return a.NextAttempt.Running() }
 
-// Scheduled reports whether another run is due. False for a suspended reconciler.
+// Scheduled reports whether another run is due. False for a suspended one.
 func (a Attempts) Scheduled() bool { return !a.NextAttempt.ScheduledAt.IsZero() }
+
+// Suspended reports a registration parked by a run that suspended: nothing due, nothing running,
+// and a suspension is the last thing that happened.
+//
+// **Narrower than an unscheduled next attempt**, which a Skip also leaves. A Skip is a run
+// declining to record, waiting on the edge that will ask for it again; a caller waking that on a
+// hunch drags whatever shares the wake off its backoff ladder. A Skip over a suspension is that
+// same wait, which is why it is read here and not just the last record.
+func (a Attempts) Suspended() bool {
+	return !a.skipped && !a.Scheduled() && !a.InFlight() &&
+		a.LastAttempt.Verdict == VerdictSuspended
+}
 
 // begin marks a run dispatched. InFlight reads true from here until the commit, which is what
 // stops a pass scheduling over a run already out.
-func (a *Attempts) begin(at time.Time) { a.NextAttempt.StartedAt = at }
+//
+// Every start inside a healthy stretch is a restart — the thing went down and came back, whoever
+// asked — so a clean rotation and a Restart count alike. The stretch's own first start is not
+// one, which is what reading HealthySince gives that counting dispatches would not.
+func (a *Attempts) begin(at time.Time) {
+	a.NextAttempt.StartedAt = at
+	if !a.HealthySince.IsZero() {
+		a.Restarts++
+	}
+}
 
-// schedule sets when the next run is due, zero for a reconciler with nothing scheduled.
+// markReady stamps the run in flight as ready and opens a healthy stretch if none is open. Both
+// halves are the worker's Ready; a job reaches neither.
+//
+// **It leaves the failure streak alone**, which a run completing cleanly is what clears. A worker
+// proves itself by finishing, not by starting: a source that accepts every start and drops it
+// would otherwise reset the ladder on each one and retry at the base delay forever. Until that
+// clean exit the two pairs of fields describe different phases — up now, and a rough time getting
+// here — and only the down phase reads the streak.
+func (a *Attempts) markReady(at time.Time) {
+	a.NextAttempt.ReadyAt = at
+	if a.HealthySince.IsZero() {
+		a.HealthySince, a.Restarts = at, 0
+	}
+}
+
+// schedule sets when the next run is due, zero for one with nothing scheduled.
 func (a *Attempts) schedule(at time.Time) { a.NextAttempt = Attempt{ScheduledAt: at} }
 
 // record files a finished run. A suspension ends a failure streak the same way a success does,
-// since it parks the question rather than failing at it, and a provisional success is the one
-// that ends none. It writes nothing about the next run — that is derived from this, not decided
-// here.
+// since it parks the question rather than failing at it — but it is not health, because nothing
+// is running.
+//
+// It writes nothing about the next run — that is derived from this, not decided here.
 //
 // The run moves out of NextAttempt rather than replacing it, so the schedule it was dispatched
-// on survives into the record: StartedAt against ScheduledAt is how long it waited for a
-// worker, and a caller cannot tell a slow reconciler from a saturated pool without it.
+// on survives into the record: StartedAt against ScheduledAt is how long it waited for a slot,
+// and a caller cannot tell a slow body from a saturated supervisor without it.
 func (a *Attempts) record(att Attempt) {
 	att.ScheduledAt = a.NextAttempt.ScheduledAt
 	a.LastAttempt = att
 
-	if att.Verdict == VerdictFailed {
+	switch att.Verdict {
+	case VerdictFailed:
 		a.Failures++
 		if a.FailingSince.IsZero() {
 			a.FailingSince = att.FinishedAt
 		}
+		a.HealthySince, a.Restarts = time.Time{}, 0
 		return
-	}
-	// Only a success can be provisional: the other two verdicts already own what they do to
-	// the streak, so the modifier is inert on them.
-	if att.provisional && att.Verdict == VerdictSucceeded {
-		return
+	case VerdictSucceeded:
+		// A job is healthy from the run that succeeded. A worker was already healthy at
+		// Ready, and this exit is a rotation inside that stretch rather than the start of
+		// one — which is what makes HealthySince stand across it.
+		if a.HealthySince.IsZero() {
+			a.HealthySince, a.Restarts = att.FinishedAt, 0
+		}
+	case VerdictSuspended:
+		a.HealthySince, a.Restarts = time.Time{}, 0
 	}
 	a.Failures, a.FailingSince = 0, time.Time{}
 }

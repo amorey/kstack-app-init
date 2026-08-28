@@ -391,11 +391,11 @@ func (s *Service) newsOf(v supervisor.Snapshot, st State) news {
 func (s *Service) stateOf(v supervisor.Snapshot) State {
 	ci := keyConnection.From(v)
 	return State{
-		Connection:    Observation[string]{Value: ci.Value.endpoint, LastSeen: ci.LastSeen, Attempts: ci.Attempts},
-		Readiness:     supervisor.Get[ComponentStatus](v, nameReadiness),
-		ServerUID:     supervisor.Get[string](v, nameServerUID),
-		ServerVersion: supervisor.Get[VersionInfo](v, nameServerVersion),
-		Principal:     supervisor.Get[Principal](v, namePrincipal),
+		Connection:    Observation[string]{Value: ci.Value.endpoint, LastSeenAt: ci.LastSeenAt, Attempts: ci.Attempts},
+		Readiness:     supervisor.GetJobObservation[ComponentStatus](v, nameReadiness),
+		ServerUID:     supervisor.GetJobObservation[string](v, nameServerUID),
+		ServerVersion: supervisor.GetJobObservation[VersionInfo](v, nameServerVersion),
+		Principal:     supervisor.GetJobObservation[Principal](v, namePrincipal),
 	}
 }
 
