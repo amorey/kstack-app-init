@@ -30,6 +30,7 @@ import (
 	"time"
 
 	gobuswatch "github.com/amorey/gobus/watch"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,10 +39,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/rest"
 	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -81,7 +84,7 @@ func (p *fakePool) lease(contextName string) *fakeLease {
 }
 
 // fakeLease answers ConnFor from whatever the test vouched for, and publishes on the
-// same hub kubeconn does, so ReadyFor's attach-then-check ordering is exercised for real.
+// same hub kubeconn does, so AwaitConnFor's attach-then-check ordering is exercised for real.
 type fakeLease struct {
 	contextName string
 	hub         *gobuswatch.Hub[string, kubeconn.State]
@@ -109,26 +112,35 @@ func (l *fakeLease) refuse(err error) {
 // vouch makes this lease answer for serverUID over an api server serving nothing, for a
 // test about arming rather than about what a sweep reads. A real one, because a sweep dials
 // whatever the lease hands it.
-func (l *fakeLease) vouch(t *testing.T, serverUID string) { l.connect(newFakeCluster(t), serverUID) }
+func (l *fakeLease) vouch(t *testing.T, serverUID string) { l.connect(t, newFakeCluster(t), serverUID) }
 
 // connect makes this lease answer for serverUID over a connection to cluster.
-func (l *fakeLease) connect(cluster *fakeCluster, serverUID string) {
-	l.hand(cluster.connection(), serverUID)
+func (l *fakeLease) connect(t *testing.T, cluster *fakeCluster, serverUID string) {
+	l.hand(cluster.connection(t), serverUID)
 }
 
-// hand publishes a connection and wakes whoever is waiting on this claim.
+// hand publishes a connection and wakes whoever is waiting on this claim. The one it
+// replaces is retired, as the pool retires what it rebuilds.
 func (l *fakeLease) hand(conn *kubeconn.Connection, serverUID string) {
 	l.mu.Lock()
+	prev := l.conn
 	l.uid, l.conn = serverUID, conn
 	l.mu.Unlock()
+	if prev != nil {
+		prev.Retire()
+	}
 	_ = l.hub.Sender().Send(l.contextName, kubeconn.State{})
 }
 
 // drop takes the connection away, which is what a cluster going unreachable looks like.
 func (l *fakeLease) drop() {
 	l.mu.Lock()
+	prev := l.conn
 	l.conn, l.uid = nil, ""
 	l.mu.Unlock()
+	if prev != nil {
+		prev.Retire()
+	}
 	_ = l.hub.Sender().Send(l.contextName, kubeconn.State{})
 }
 
@@ -204,6 +216,8 @@ type fakeCluster struct {
 	transport *holdTransport
 	reads     *testutil.Probe[string]
 	cancelled *testutil.Probe[string]
+	// listed carries every collection LIST a mirror asks for.
+	listed *testutil.Probe[string]
 
 	mu sync.Mutex
 	// groups is the non-core groups, in the order /apis serves them; resources is one
@@ -220,6 +234,7 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 	c := &fakeCluster{
 		reads:     testutil.NewProbe[string](32),
 		cancelled: testutil.NewProbe[string](32),
+		listed:    testutil.NewProbe[string](32),
 		resources: map[string]*metav1.APIResourceList{},
 		broken:    map[string]bool{},
 		raw:       map[string]string{},
@@ -238,10 +253,16 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 	return c
 }
 
-// connection is what a lease hands a sweep: the raw client the discovery documents are read
-// over, and the dynamic client the CRD list goes through.
-func (c *fakeCluster) connection() *kubeconn.Connection {
-	return &kubeconn.Connection{BaseURL: c.baseURL, HTTPClient: c.client, Dynamic: c.dyn}
+// connection is what a lease hands a run: the raw client the discovery documents are read
+// over, and the dynamic client the lists and watches go through. Built the way the pool
+// builds one, so retiring it fires Done for whoever holds it; the clients are then swapped for
+// this cluster's own, since its lists and watches are served in memory rather than over HTTP.
+func (c *fakeCluster) connection(t *testing.T) *kubeconn.Connection {
+	t.Helper()
+	conn, err := kubeconn.NewConnection(&rest.Config{Host: c.baseURL.String()})
+	require.NoError(t, err)
+	conn.HTTPClient, conn.Dynamic = c.client, c.dyn
+	return conn
 }
 
 // serve declares one group-version's resources, registering the group with /apis when it is
@@ -447,11 +468,229 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// newFakeDynamic is the client the CRD list goes through. The list kind is supplied
-// explicitly because the scheme carries no apiextensions types.
+// newFakeDynamic is the client every LIST and WATCH goes through. The list kinds are supplied
+// explicitly because the scheme carries no types at all, so every collection a test mirrors is
+// named here.
 func newFakeDynamic() *dynamicfake.FakeDynamicClient {
 	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{crdGVR: "CustomResourceDefinitionList"})
+		map[schema.GroupVersionResource]string{
+			crdGVR:                              "CustomResourceDefinitionList",
+			{Version: "v1", Resource: "pods"}:   "PodList",
+			{Version: "v1", Resource: "events"}: "EventList",
+			{Group: "apps", Version: "v1", Resource: "deployments"}: "DeploymentList",
+		})
+}
+
+// serveKind declares a kind in the discovery documents. A mirror test needs it because the
+// objects read joins through kind_catalog, which the sweep is the only writer of — and in
+// production a kind is tracked only because a sweep found it.
+func (c *fakeCluster) serveKind(k kubestore.Kind, namespaced bool) {
+	c.serve(k.APIVersion, listable(k.Kind, k.Resource, namespaced))
+}
+
+// object is one mirrored body: the metadata the store keys on, and nothing else.
+func object(apiVersion, kind, name, resourceVersion string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": apiVersion,
+		"kind":       kind,
+		"metadata": map[string]any{
+			"name": name, "namespace": "default",
+			"uid": "uid-" + name, "resourceVersion": resourceVersion,
+		},
+	}}
+}
+
+// hasObjects makes a collection answer a LIST with these bodies, at listRV. Every call fires
+// listed, so a test can tell a relist from a resume.
+func (c *fakeCluster) hasObjects(k kubestore.Kind, listRV string, objects ...*unstructured.Unstructured) {
+	c.dyn.PrependReactor("list", k.Resource, func(clienttesting.Action) (bool, runtime.Object, error) {
+		c.listed.Fire(k.Resource)
+		list := &unstructured.UnstructuredList{Object: map[string]any{
+			"apiVersion": k.APIVersion, "kind": k.Kind + "List",
+			"metadata": map[string]any{"resourceVersion": listRV},
+		}}
+		for _, o := range objects {
+			list.Items = append(list.Items, *o)
+		}
+		return true, list, nil
+	})
+}
+
+// failListOnce makes the next LIST of a collection fail and every one after it fall through —
+// a transient refusal rather than a standing one.
+func (c *fakeCluster) failListOnce(k kubestore.Kind, err error) {
+	var once sync.Once
+	c.dyn.PrependReactor("list", k.Resource, func(clienttesting.Action) (bool, runtime.Object, error) {
+		refused := false
+		once.Do(func() { refused = true })
+		if refused {
+			return true, nil, err
+		}
+		return false, nil, nil
+	})
+}
+
+// refuseList makes a collection refuse to be listed.
+func (c *fakeCluster) refuseList(k kubestore.Kind, err error) {
+	c.dyn.PrependReactor("list", k.Resource, func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, err
+	})
+}
+
+// streams hands a test the watch its mirror opens: one fresh watcher per open, published as
+// it is handed over, so a test can drive the stream and see a re-establish for what it is.
+type streams struct {
+	opened *testutil.Probe[*watch.RaceFreeFakeWatcher]
+	err    error
+	held   chan struct{}
+}
+
+// streamKind installs the watch for one collection. Call before the worker starts.
+func (c *fakeCluster) streamKind(k kubestore.Kind) *streams {
+	s := &streams{opened: testutil.NewProbe[*watch.RaceFreeFakeWatcher](8)}
+	c.dyn.PrependWatchReactor(k.Resource, func(clienttesting.Action) (bool, watch.Interface, error) {
+		if s.err != nil {
+			return true, nil, s.err
+		}
+		if s.held != nil {
+			<-s.held
+		}
+		w := watch.NewRaceFreeFake()
+		s.opened.Fire(w)
+		return true, w, nil
+	})
+	return s
+}
+
+// refuse makes every later open fail, which is what a server refusing a watch looks like.
+func (s *streams) refuse(err error) { s.err = err }
+
+// hold parks every later open until the returned func lets it go — a server slow to
+// establish a watch rather than one refusing it.
+func (s *streams) hold() func() {
+	released := make(chan struct{})
+	s.held = released
+	return sync.OnceFunc(func() { close(released) })
+}
+
+// holdList parks a collection's LIST until the test lets it go, for asserting on what a
+// mirror reports while it has nothing yet.
+func (c *fakeCluster) holdList(k kubestore.Kind) *heldList {
+	h := &heldList{released: make(chan struct{})}
+	h.release = sync.OnceFunc(func() { close(h.released) })
+	c.dyn.PrependReactor("list", k.Resource, func(clienttesting.Action) (bool, runtime.Object, error) {
+		<-h.released
+		return false, nil, nil
+	})
+	return h
+}
+
+type heldList struct {
+	released chan struct{}
+	release  func()
+}
+
+// event is one core event body, which the cache keeps in its own table.
+func event(name, resourceVersion string) *unstructured.Unstructured {
+	return object("v1", "Event", name, resourceVersion)
+}
+
+// --- Reading a mirror back ---
+
+// newMirroringService is a service running the real mirror, paced so a test never outwaits a
+// production number. Every duration here is small enough to be reached and long enough that a
+// loaded machine does not trip it.
+func newMirroringService(t *testing.T, cluster *fakeCluster, opts ...func(*pacing)) *Service {
+	t.Helper()
+	p := defaultPacing()
+	p.staleAfter = 200 * time.Millisecond
+	p.backoff = probe.Backoff{Base: time.Millisecond, Factor: 2, Cap: 5 * time.Millisecond}
+	for _, opt := range opts {
+		opt(&p)
+	}
+
+	svc, pool := newTestService(t, withSyncKindFn(syncKindWith(p)))
+	pool.lease("prod").connect(t, cluster, "uid-1")
+	start(t, svc)
+	return svc
+}
+
+// mirrorKind arms a cache and one kind on it, in the order production reaches them: a kind is
+// tracked because a sweep found it, and the objects read joins through the catalog that sweep
+// writes.
+func mirrorKind(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind) {
+	t.Helper()
+	svc.TrackDiscovery(cacheID, testParams)
+	awaitDiscovered(t, svc, cacheID)
+	svc.TrackKind(cacheID, k)
+}
+
+// awaitKindReason waits for one kind's verdict to settle somewhere, owning its subscription
+// so nothing published before it attached is missed.
+func awaitKindReason(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind, reason string) {
+	t.Helper()
+	awaitKindState(t, svc, cacheID, k, "a mirror settling on "+reason, func(state KindState) bool {
+		return state.Reason == reason
+	})
+}
+
+// awaitKindState waits for one kind's answer to match. Everything a test asserts about a
+// verdict belongs in match rather than in a read after it: a run that is down is a state the
+// next attempt replaces, so a later read is a different answer rather than the same one again.
+func awaitKindState(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind, what string, match func(KindState) bool) {
+	t.Helper()
+	news := svc.WatchKindNews()
+	defer news.Close()
+
+	var last KindState
+	settled := assert.Eventually(t, func() bool {
+		state, ok := svc.GetKindState(cacheID, k)
+		last = state
+		return ok && match(state)
+	}, testutil.Timeout, time.Millisecond, what)
+	if !settled {
+		t.Fatalf("the mirror stands on %q: %s", last.Reason, last.Message)
+	}
+}
+
+func objectNames(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind) []string {
+	t.Helper()
+	store, ok, err := svc.storeMgr.(*kubestore.Manager).OpenExisting(cacheID)
+	require.NoError(t, err)
+	require.True(t, ok, "the cache is open")
+	defer store.Release()
+
+	rows, err := store.Objects(t.Context(), k.APIVersion, k.Resource)
+	require.NoError(t, err)
+	names := make([]string, 0, len(rows))
+	for _, r := range rows {
+		names = append(names, r.Name)
+	}
+	return names
+}
+
+func eventsOf(t *testing.T, svc *Service, cacheID int64) []kubestore.EventRow {
+	t.Helper()
+	store, ok, err := svc.storeMgr.(*kubestore.Manager).OpenExisting(cacheID)
+	require.NoError(t, err)
+	require.True(t, ok, "the cache is open")
+	defer store.Release()
+
+	rows, err := store.Events(t.Context(), 100)
+	require.NoError(t, err)
+	return rows
+}
+
+func cookieOf(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind) (string, bool) {
+	t.Helper()
+	store, ok, err := svc.storeMgr.(*kubestore.Manager).OpenExisting(cacheID)
+	require.NoError(t, err)
+	require.True(t, ok, "the cache is open")
+	defer store.Release()
+
+	cookie, held, err := store.Cookie(t.Context(), k.APIVersion, k.Resource)
+	require.NoError(t, err)
+	return cookie, held
 }
 
 // listable is a resource a worker can mirror, which is what most of a catalog looks like.
@@ -527,23 +766,25 @@ func catalogOf(t *testing.T, svc *Service, cacheID int64) []kubestore.KindRow {
 	return rows
 }
 
-// awaitSweepSettled waits until no run is out for this cache, which is the point a test can
-// count what happens next: a wake starts one run per probe, and a run that is still unwinding
-// dials again.
-func awaitSweepSettled(t *testing.T, svc *Service, cacheID int64) {
+// awaitDialsQuiet waits until this lease has stopped being dialed, which is the point a test
+// can count what happens next. Reading "no run in flight" is not enough — a run the engine has
+// queued has not started, and dials the moment it does.
+//
+// The window is bounded because quiet has no event to wait for; each dial restarts it, so a
+// cache that never settles fails on the deadline rather than measuring mid-burst.
+func awaitDialsQuiet(t *testing.T, l *fakeLease) {
 	t.Helper()
-	require.Eventually(t, func() bool {
-		snap, ok := svc.discoveryEngine.Read(subjectOf(cacheID))
-		if !ok {
-			return false
+	deadline := time.After(testutil.Timeout)
+	for {
+		l.dialed.Drain()
+		select {
+		case <-l.dialed.Chan():
+		case <-time.After(quietWindow):
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for the cache to stop dialing")
 		}
-		for _, name := range discoveryProbes {
-			if snap.Attempts(name).InFlight() {
-				return false
-			}
-		}
-		return true
-	}, testutil.Timeout, time.Millisecond, "every run to finish")
+	}
 }
 
 // writeRow puts one object of a kind into the cache, which is how a test rings the store's

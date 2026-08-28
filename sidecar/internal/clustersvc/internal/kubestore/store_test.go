@@ -128,6 +128,23 @@ func TestApplyChangeWritesTheObjectAndAdvancesTheCookie(t *testing.T) {
 	assert.Equal(t, "42", rv)
 }
 
+// A body the projection cannot key is skipped rather than failing the delta, and the cookie
+// advances over it all the same: the server replays from that position, so a run that failed
+// here would be handed the same body every time it resumed.
+func TestApplyChangeSkipsAnUnprojectableBodyAndMovesPast(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("", "api-0", "42")))
+
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM objects`), "nothing keyable to write")
+
+	rv, ok, err := s.Cookie(ctx, "v1", "pods")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "42", rv, "the position moves, or the next resume replays the same body")
+}
+
 // The stored body is the sanitized one, and it round-trips through the codec — which is
 // what lets a read serve raw_json verbatim.
 func TestApplyChangeStoresTheBodyCompressed(t *testing.T) {

@@ -91,11 +91,15 @@ func idOf(k kubestore.Kind) kindID { return kindID{k.APIVersion, k.Resource} }
 // kindRun is what one kind's sync is handed. It carries a Connection rather than a lease:
 // the session has already waited for one vouching for its ServerUID, which is the gate
 // nothing syncs past.
+//
+// Prev is what the sync ran as last time, since a restart re-enters the body fresh: a resume
+// holds the reason the run before it committed, and the restart count carries across.
 type kindRun struct {
 	Kind   kubestore.Kind
 	Conn   *kubeconn.Connection
 	Store  *kubestore.Store
 	Commit func(KindState)
+	Prev   func() (KindState, bool)
 }
 
 // syncKindFn holds one kind's collection in step with the cluster: cold-list it into the
@@ -167,6 +171,7 @@ func New(connSvc connService, storeMgr storeManager, opts ...option) *Service {
 		sessions:        map[int64]*session{},
 		tracked:         map[int64]map[kindID]kubestore.Kind{},
 	}
+	s.syncKindFn = syncKindWith(defaultPacing())
 	for _, opt := range opts {
 		opt(s)
 	}

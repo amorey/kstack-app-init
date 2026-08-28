@@ -67,10 +67,13 @@ type Backoff struct {
 	Cap    time.Duration
 }
 
-// delay is the ladder — a pure function of failures, so the same state derives the same
-// ScheduledAt on every pass. That is what lets the frontend render the countdown: no jitter,
-// and no stateful rate limiter.
-func (b Backoff) delay(failures int) time.Duration {
+// Delay is the ladder for the given count of consecutive failures — a pure function of it, so
+// the same state derives the same ScheduledAt on every pass. That is what lets the frontend
+// render the countdown: no jitter, and no stateful rate limiter.
+//
+// Exported for a body that paces its own retries, so one ladder shape reaches the frontend
+// from every seam.
+func (b Backoff) Delay(failures int) time.Duration {
 	d := b.Base
 	for range failures - 1 {
 		d = time.Duration(float64(d) * b.Factor)
@@ -630,7 +633,7 @@ func (e *Engine) due(sub *subject, id probeID, now time.Time) time.Time {
 		}
 		return a.LastAttempt.FinishedAt.Add(wait)
 	case VerdictFailed:
-		return a.LastAttempt.FinishedAt.Add(cfg.backoff.delay(a.Failures))
+		return a.LastAttempt.FinishedAt.Add(cfg.backoff.Delay(a.Failures))
 	case VerdictSuspended:
 		if a.LastAttempt.Reason == ReasonDependencyFailed {
 			// Its dependencies came back. This is the whole re-arm — nothing has to notice

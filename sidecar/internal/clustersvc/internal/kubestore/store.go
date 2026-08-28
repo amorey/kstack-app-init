@@ -308,7 +308,10 @@ func (s *Store) ApplyChange(ctx context.Context, k Kind, t watch.EventType, u *u
 	} else {
 		err = f.writeObject(ctx, tx, k, u)
 	}
-	if err != nil {
+	// A body the projection rejects is skipped, exactly as a relist page skips it. The cookie
+	// still advances over it: the server replays from that position, so a run that failed here
+	// would be handed the same body every time it resumed.
+	if err != nil && !errors.Is(err, errUnprojectable) {
 		return fmt.Errorf("apply %s %s: %w", k.Kind, t, err)
 	}
 
@@ -569,8 +572,10 @@ func (r *ReplaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 // writeObject lands one page item, skipping a body that will not project.
 func (r *ReplaceSession) writeObject(ctx context.Context, ex execer, u *unstructured.Unstructured, now int64) error {
 	row, err := projectObject(u)
-	if err != nil {
-		return nil //nolint:nilerr // an unprojectable body is skipped, not fatal
+	if errors.Is(err, errUnprojectable) {
+		return nil
+	} else if err != nil {
+		return err
 	}
 	return insertObjectRow(ctx, ex, r.kind, row, now)
 }
@@ -578,8 +583,10 @@ func (r *ReplaceSession) writeObject(ctx context.Context, ex execer, u *unstruct
 // writeEvent is writeObject for the events table.
 func (r *ReplaceSession) writeEvent(ctx context.Context, ex execer, u *unstructured.Unstructured, now int64) error {
 	row, err := extractEvent(u)
-	if err != nil {
-		return nil //nolint:nilerr // an unprojectable body is skipped, not fatal
+	if errors.Is(err, errUnprojectable) {
+		return nil
+	} else if err != nil {
+		return err
 	}
 	return insertEventRow(ctx, ex, row, now)
 }

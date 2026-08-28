@@ -59,6 +59,11 @@ const (
 // The per-kind vocabulary. A kind reports NoConnection and IdentityMismatch too: the
 // session suspends every worker under it, and each says so for itself.
 const (
+	// ReasonResyncing: the cache holds this kind's rows, but the position they were current
+	// at is one the server no longer serves from, so they are being reconciled against a
+	// fresh list. Its own reason because the rows are still served throughout — unlike
+	// Syncing, where there is nothing to serve.
+	ReasonResyncing = "Resyncing"
 	// ReasonSyncing: cold-listing a kind with nothing cached.
 	ReasonSyncing = "Syncing"
 	// ReasonResuming: re-establishing from a cookie, and slow enough to be worth saying.
@@ -136,4 +141,13 @@ type KindState struct {
 	// run that is down will be tried again, and zero while one is up.
 	Restarts    int
 	NextRetryAt time.Time
+}
+
+// setReason moves the reason, and SinceAt with it only when it changed: SinceAt is when the
+// reason last moved, which is what "watching since 10:02" reads off.
+func (st *KindState) setReason(reason Reason, message string) {
+	if st.Reason != string(reason) {
+		st.SinceAt = time.Now()
+	}
+	st.Reason, st.Message = string(reason), message
 }

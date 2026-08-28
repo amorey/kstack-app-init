@@ -38,7 +38,7 @@ func TestASweepWritesWhatTheClusterServesToTheCatalog(t *testing.T) {
 	cluster.serve("apps/v1", listable("Deployment", "deployments", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -68,7 +68,7 @@ func TestASweepKeepsOnlyWhatAWorkerCanMirror(t *testing.T) {
 	cluster.serve("apps/v1beta1", listable("Deployment", "deployments", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -88,7 +88,7 @@ func TestAGroupThatWillNotAnswerIsPartialAndPrunesNothing(t *testing.T) {
 	cluster.serve("metrics.k8s.io/v1beta1", listable("NodeMetrics", "nodes", false))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -109,7 +109,7 @@ func TestAnUnchangedCatalogIsWrittenOnceAndAnnouncedOnce(t *testing.T) {
 	cluster.serve("v1", listable("Pod", "pods", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -132,7 +132,7 @@ func TestACatalogThatMovedIsAnnouncedWithItsReasonUnmoved(t *testing.T) {
 	cluster.serve("v1", listable("Pod", "pods", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -167,7 +167,7 @@ func TestASweepWithNoConnectionSuspendsAndIsWokenByTheBridge(t *testing.T) {
 
 	// A suspended sweep schedules nothing, so the session's wake loop is the only thing that
 	// brings it back.
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	awaitDiscovered(t, svc, 1)
 	assert.Len(t, catalogOf(t, svc, 1), 1)
 }
@@ -177,7 +177,7 @@ func TestASweepRefusesAConnectionAnsweringAsAnotherCluster(t *testing.T) {
 	cluster.serve("v1", listable("Pod", "pods", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-other")
+	pool.lease("prod").connect(t, cluster, "uid-other")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -195,7 +195,7 @@ func TestIsCRDComesFromTheCRDList(t *testing.T) {
 	cluster.crd("example.com", "widgets")
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -218,7 +218,7 @@ func TestARefusedCRDListLeavesEveryKindBuiltIn(t *testing.T) {
 	cluster.forbidCRDs()
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -235,7 +235,7 @@ func TestACRDWriteWakesTheSweep(t *testing.T) {
 	cluster.serve("v1", listable("Pod", "pods", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -254,7 +254,7 @@ func TestACRDBringingANewGroupWithItIsDiscovered(t *testing.T) {
 	cluster.serve("v1", listable("Pod", "pods", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 	svc.TrackDiscovery(1, testParams)
 	awaitDiscovered(t, svc, 1)
@@ -279,7 +279,7 @@ func TestAGroupListThatFailsLeavesTheCatalogStanding(t *testing.T) {
 	cluster.serve("apps/v1", listable("Deployment", "deployments", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 	svc.TrackDiscovery(1, testParams)
 	awaitDiscovered(t, svc, 1)
@@ -300,7 +300,7 @@ func TestForgetDiscoveryCancelsAndJoinsASweepInFlight(t *testing.T) {
 	cluster.serve("v1", listable("Pod", "pods", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -340,7 +340,7 @@ func TestForgettingACacheStopsItsSweep(t *testing.T) {
 	cluster.serve("v1", listable("Pod", "pods", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
@@ -386,7 +386,7 @@ func TestAGroupNamingNoPreferredVersionFallsBackToItsFirst(t *testing.T) {
 	cluster.unpreferGroup("apps")
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 	svc.TrackDiscovery(1, testParams)
 	awaitDiscovered(t, svc, 1)
@@ -401,7 +401,7 @@ func TestADocumentThatIsNotJSONFailsTheSweep(t *testing.T) {
 	cluster.serveRaw("/api", "not a document")
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 	svc.TrackDiscovery(1, testParams)
 
@@ -412,7 +412,7 @@ func TestACacheRemovedUnderASweepFailsItRatherThanWritingThrough(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serve("v1", listable("Pod", "pods", true))
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)

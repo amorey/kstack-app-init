@@ -19,6 +19,7 @@ package kubesync
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
@@ -141,7 +142,7 @@ func (sess *session) wakeDiscoverySweepOnConnectionChange(ctx context.Context, c
 			// Only what the verdict does not already say. This feed publishes every pass, not
 			// only the ones that changed something, so waking on each frame would make a
 			// suspended sweep poll — which is the one thing suspending is for.
-			if sess.discoveryReason() != connectionReason(err) {
+			if sess.discoveryReason() != connectionReason(err, ReasonDiscoveryFailed) {
 				sess.s.discoveryEngine.Wake(sess.subject(), discoveryProbes...)
 			}
 		case sess.s.sweepParked(sess.subject()):
@@ -225,24 +226,59 @@ func (sess *session) lastSweep() (bool, string) {
 
 // startKind arms one kind's mirror behind the identity gate. Nothing syncs into a cache
 // whose connection does not vouch for its ServerUID, and a kind worker holds its own
-// goroutine, so it waits for one rather than reporting and suspending.
+// goroutine, so it waits for one rather than suspending.
+//
+// The run lasts as long as the connection it was handed: a mirror blocked in a watch read
+// cannot see that the pool retired what it reads over, and a retry against a retired
+// connection climbs the ladder for nothing. Ending the run puts the worker back at the gate,
+// where the replacement is what it waits for.
 func (sess *session) startKind(k kubestore.Kind) {
 	w := newWorker(sess.ctx, func(ctx context.Context) {
-		conn, err := kubeconn.AwaitConnFor(ctx, sess.lease, sess.params.ServerUID)
+		conn, err := sess.awaitConn(ctx, k)
 		if err != nil {
 			return
 		}
+		ctx, cancel := untilRetired(ctx, conn)
+		defer cancel()
+
 		sess.s.syncKindFn(ctx, kindRun{
 			Kind:   k,
 			Conn:   conn,
 			Store:  sess.store,
 			Commit: func(state KindState) { sess.s.commitKind(sess, k, state) },
+			Prev:   func() (KindState, bool) { return sess.kindState(idOf(k)) },
 		})
 	})
 
 	sess.s.mu.Lock()
 	sess.kindWorkers[idOf(k)] = w
 	sess.s.mu.Unlock()
+}
+
+// awaitConn is the identity gate: the connection vouching for the cache's ServerUID, as soon
+// as the lease holds one. While it waits, the kind reports why — and again when the why
+// moves, since a cluster gone unreachable and one answering as another cluster are different
+// news. The retry countdown is cleared with it: nothing is retrying at the gate.
+func (sess *session) awaitConn(ctx context.Context, k kubestore.Kind) (*kubeconn.Connection, error) {
+	return kubeconn.AwaitConnFor(ctx, sess.lease, sess.params.ServerUID, func(err error) {
+		state, _ := sess.kindState(idOf(k))
+		state.NextRetryAt = time.Time{}
+		state.setReason(connectionReason(err, ReasonSyncFailed), err.Error())
+		sess.s.commitKind(sess, k, state)
+	})
+}
+
+// untilRetired bounds ctx by conn's life as well as its own.
+func untilRetired(ctx context.Context, conn *kubeconn.Connection) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-conn.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 // stopKind ends one kind's worker and waits for it — what makes ForgetKind synchronous.
@@ -254,6 +290,14 @@ func (sess *session) stopKind(id kindID) {
 	if ok {
 		w.stop()
 	}
+}
+
+// kindState is what this kind's worker last committed, empty until one has.
+func (sess *session) kindState(id kindID) (KindState, bool) {
+	sess.s.mu.Lock()
+	defer sess.s.mu.Unlock()
+	state, ok := sess.kindStates[id]
+	return state, ok
 }
 
 // dropKindState forgets what a kind's worker committed. **Only after stopKind**, which is

@@ -47,17 +47,17 @@ type eventRow struct {
 // core/v1 and events.k8s.io/v1 spellings of the same data into one row shape.
 func extractEvent(u *unstructured.Unstructured) (eventRow, error) {
 	if u == nil || u.Object == nil {
-		return eventRow{}, fmt.Errorf("kubestore: event is empty")
+		return eventRow{}, fmt.Errorf("%w: event is empty", errUnprojectable)
 	}
 	// Through the same sanitize as an object: an event carries managedFields like
 	// anything else, and this is the highest-volume table in the file.
 	rawJSON, err := json.Marshal(sanitize(u).Object)
 	if err != nil {
-		return eventRow{}, err
+		return eventRow{}, fmt.Errorf("%w: %w", errUnprojectable, err)
 	}
 	row := eventRow{UID: string(u.GetUID()), RawJSON: rawJSON}
 	if row.UID == "" {
-		return eventRow{}, fmt.Errorf("kubestore: event has empty UID")
+		return eventRow{}, fmt.Errorf("%w: event has empty UID", errUnprojectable)
 	}
 
 	// Branch on which field group is present, not on the UID: involvedObject.uid is

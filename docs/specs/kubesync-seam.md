@@ -287,6 +287,7 @@ over an aggregated API that is down, and `DiscoveryFailed` would climb it while 
 catalog refreshed fine. Which legs failed and why is the probe's `Message`; nothing on the seam
 carries them structurally until something needs to branch on them.
 | kind | `Syncing` | cold-listing a kind with nothing cached |
+| kind | `Resyncing` | reconciling a kind that HAS rows against a fresh list, because the position they were current at is one the server no longer serves from. Its own verdict because the rows are served throughout, where `Syncing` has nothing to serve |
 | kind | `Resuming` | re-establishing from a cookie, and slow enough to be worth saying |
 | kind | `Watching` | caught up and streaming deltas, proven live |
 | kind | `Stale` | caught up, but the watch has stopped proving itself alive |
@@ -452,7 +453,8 @@ session's life, a discovery loop, and a worker per kind.
 - **The claim is the session's**, not the worker's, so a tracked cache has a file the moment it is
   armed — which is what `Manager.WatchOpen` readers are waiting on.
 - **The identity gate is the session's too**, but the two kinds of worker wait differently. A kind
-  worker holds its own goroutine, so it blocks on `kubeconn.AwaitConnFor(ServerUID)`. Discovery
+  worker holds its own goroutine, so it blocks on `kubeconn.AwaitConnFor(ServerUID)`, reporting
+  each refusal as its own `NoConnection`/`IdentityMismatch` while it waits. Discovery
   runs on the probe engine, where a run holds an engine worker and `AwaitConnFor` is documented as
   never to be called — so it commits `NoConnection`, returns `Suspend`, and is woken by the
   connection bridge.
@@ -462,8 +464,10 @@ session's life, a discovery loop, and a worker per kind.
   `apiGroups`, so a group list that will not load leaves the fan-out `Skip`ped rather than failing
   it. The engine owns each one's cadence and backoff ladder and the `Wake` the store bus below
   turns into a prompt re-run; `DiscoveryState` is projected from the snapshot, so the seam stays
-  this package's vocabulary rather than the engine's. The kind workers are not probes: a standing
-  watch is not a pass, which is why two scheduling models live here.
+  this package's vocabulary rather than the engine's. The kind mirrors run on a second engine
+  over per-kind subjects — a run establishes the stream and commits it as the probe's value,
+  rather than being the stream. → [The mirror on the probe
+  engine](kubesync-mirror-on-probe-engine.md).
 - **Discovery is a probe whose collection cannot be watched.** `/api` and `/apis` are plain GETs
   with no resourceVersion and no watch verb, so the sweep is a cold list with no watch phase, and
   it re-lists on the engine's cadence where a kind's worker would go live. `SyncKinds` reconciles its answer
@@ -575,7 +579,9 @@ Each step is one red/green cycle and one commit.
 5. **The gauges and the clears**: `WatchHealth` onto the getters, `WatchSyncStatus`, and whatever
    the open item above resolves to.
 
-Steps 1–3 are `kubesync` alone and land before anything consumes them.
+Steps 1–3 are `kubesync` alone and land before anything consumes them. Between 3 and 4, [the
+mirror moves onto the probe engine](kubesync-mirror-on-probe-engine.md), which changes step 3's
+internals and nothing on the seam.
 
 ## Not in this pass
 

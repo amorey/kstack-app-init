@@ -43,8 +43,9 @@ internal/clustersvc/
   internal/kubeconn/  the connections a cluster is talked to over, and what probing them
                       found — leases, the five probes, and the connection itself. A leaf
                       under internal/, so the compiler keeps it this package's own
-  internal/kubesync/  what fills a cache: the arming seam over kubeconn and kubestore.
-                      Same leaf rule
+  internal/kubesync/  what fills a cache: the arming seam (service.go) over kubeconn and
+                      kubestore, one session per armed cache (session.go), the discovery
+                      sweep (discovery.go) and one kind's mirror (kinds.go). Same leaf rule
   internal/kubestore/  the on-disk cache: one SQLite file per ClusterCache behind a
                       refcounted manager (manager.go), the claim and the write path
                       (store.go), a file per table beside it (catalog.go is
@@ -95,8 +96,9 @@ its write path:
   tick as the rows it supersedes would otherwise keep every one of them.
 - **Core `v1` events are written to the `events` table**, routed by api version and plural rather
   than by the Kind name — any group may serve a Kind called `Event`, and a CRD's rows are ordinary
-  objects. Their age-out is the store's `PruneEvents`, run on every event write plus a tick for a
-  quiet cluster: aging out is not a write, so nothing else would emit the `Deleted` a client needs.
+  objects. Their age-out is the store's `PruneEvents`, which the mirror runs on the way into every
+  `establish` and once per `eventsEvery` deltas: aging out is not a write, so nothing else would
+  emit the `Deleted` a client needs.
 - **Object bodies are sanitized on the way in** — `managedFields` and the kubectl last-applied
   annotation stripped, Secret values redacted (by the *body's* own kind, so how a collection was
   addressed cannot bypass it) — which is what lets a read serve `raw_json` verbatim.
@@ -669,8 +671,8 @@ conditions and event timeline.
 replacement in the observable *before* `Done()` fires, but that replacement is unstamped for a
 round trip after, so `ConnFor` refuses through the window. `ReadyFor` returns a channel closed
 when a connection vouching for the uid exists — already closed when one does, so the steady state
-costs no goroutine — and `AwaitConnFor` is that plus the re-check, since the close is an edge and
-the connection can move again. **Free functions over `Lease`, never methods**, so no fake can get
+costs no goroutine — and `AwaitConnFor` is the blocking form, which also hands each refusal to a
+`refused` callback for a holder that reports what it waits on. **Free functions over `Lease`, never methods**, so no fake can get
 the attach-before-check ordering wrong; a waiter lives until it fires or ctx ends, so bound it
 with the work's context. **Neither may be called from a probe `Run`** — blocking holds an engine
 worker, so a probe refuses-and-suspends instead, woken by the fleet bus.
@@ -909,8 +911,8 @@ conditions and event timeline.
 replacement in the observable *before* `Done()` fires, but that replacement is unstamped for a
 round trip after, so `ConnFor` refuses through the window. `ReadyFor` returns a channel closed
 when a connection vouching for the uid exists — already closed when one does, so the steady state
-costs no goroutine — and `AwaitConnFor` is that plus the re-check, since the close is an edge and
-the connection can move again. **Free functions over `Lease`, never methods**, so no fake can get
+costs no goroutine — and `AwaitConnFor` is the blocking form, which also hands each refusal to a
+`refused` callback for a holder that reports what it waits on. **Free functions over `Lease`, never methods**, so no fake can get
 the attach-before-check ordering wrong; a waiter lives until it fires or ctx ends, so bound it
 with the work's context. **Neither may be called from a probe `Run`** — blocking holds an engine
 worker, so a probe refuses-and-suspends instead, woken by the fleet bus.
@@ -927,11 +929,11 @@ context](../docs/adr/2026-08-23-one-connection-per-context.md).
 the narrow `Acquire(contextName) kubeconn.Lease` and `OpenOrCreate(cacheID) (*kubestore.Store,
 error)`. → `docs/specs/kubesync-seam.md`.
 
-**Built so far: the seam, the arming, and the sweep.** `TrackDiscovery`/`ForgetDiscovery`,
-`TrackKind`/`ForgetKind`, `RestartAll`, the claims, the identity gate, the two reads and the two
-news feeds — plus discovery, which fills `kind_catalog`. **The per-kind mirror is not built**: it
-is a seam a test substitutes (`withSyncKindFn`), so an armed kind holds a connection and writes
-nothing.
+**Built so far: the seam, the arming, the sweep, and the per-kind mirror.** `TrackDiscovery`/
+`ForgetDiscovery`, `TrackKind`/`ForgetKind`, `RestartAll`, the claims, the identity gate, the two
+reads and the two news feeds; discovery, which fills `kind_catalog`; and `kinds.go`, which fills
+the objects. **Not yet wired to `clustersvc`** — nothing calls `TrackDiscovery`, so no cache syncs
+in a running sidecar. `withSyncKindFn` substitutes the mirror in tests that are about arming.
 
 **Two levels of arming, and they AND rather than nest.** `TrackDiscovery` says whether a cache
 syncs at all — and *supplies* it, since the session it arms is what takes both claims — while
@@ -1012,6 +1014,65 @@ package's vocabulary rather than the engine's.
   written from a list no newer than that one, so a stale list cannot orphan them; and a
   group-version on it that stopped serving fails its own document read, which makes the sweep
   partial and prunes nothing.
+
+#### The mirror (`kinds.go`)
+
+One kind's rows, held current by a standing stream rather than a pass — which is why it runs on a
+goroutine and not the probe engine.
+
+- **The cookie decides which start this is** — not whether the cache holds rows. One on disk means
+  a completed LIST landed, so the watch resumes from it; without one the collection is cold-listed
+  through `BeginReplace`/`WritePage`/`Commit` first, behind a **process-wide gate**
+  (`pacing.coldLists`), since arming a cache arms hundreds of kinds at once and each wants the
+  connection and the store's single writer. A relist that wrote a page and then died leaves rows
+  but no cookie, and reads as cold — which is right, since those rows still need the reconcile.
+- **An expired position relists instead of resuming, and says `Resyncing` while it does.** The
+  flag that forces it is cleared only once the relist has landed: the cookie survives a LIST that
+  failed before its first page, so dropping it earlier would send the next attempt back to a
+  position the server has already refused.
+  `Expired`/`Gone` off the watch — at open or as an `Error` frame — is the one failure a resume
+  cannot retry its way out of, because the cookie is what it would retry with. The watch error is
+  wrapped rather than flattened so the loop can ask. The rows stay served throughout, which is why
+  this is not the `Syncing` a cold start reports.
+- **A resume holds its reason.** It commits nothing while re-establishing, so the `Watching` the run
+  before it left stands — otherwise `RestartAll` walks every kind through `Watching`→`Syncing`→
+  `Watching`, and a resume poke on a 300-kind cache becomes six hundred reconciles. Only a resume
+  that outlasts `staleAfter` says `Resuming` — announced by `openWatch` from the run's own
+  goroutine, never a timer callback: **one worker's state has one writer**, and `Timer.Stop` does
+  not wait for a callback already running, so one firing as the stream settles would leave
+  `Resuming` standing over the `Watching` it raced. **The wait for that open stays on `ctx`
+  throughout**, before and after the announcement: forgetting a kind joins its worker, and whether
+  an open ever unwinds is the server's business. What lands after the run has gone is collected by
+  `abandon`, since a watch nobody waits for still holds a connection.
+  **A cold start is different and reports `Syncing`**:
+  there the kind genuinely has nothing. What must survive a run — the verdict, the stamps, the
+  restart count — comes back through `kindRun.Prev`, since a restart re-enters the body fresh.
+- **A bookmark is proof of life, not data.** It moves `LastLiveAt` and the cookie; only a delta
+  moves `LastUpdateAt`. `staleAfter` without either is what `Stale` reads off — the rows are still
+  served, they have simply stopped being known to be current.
+- **The body owns its retry pacing**, because the worker above re-enters it the moment it returns.
+  A failed run climbs the engine's ladder (`probe.Backoff.Delay`, so a kind's countdown reads the
+  same as a sweep's) and reports `SyncFailed` with `NextRetryAt`. **`Restarts` is both the reported
+  streak and the rung**, and a stream that establishes clears it: an occasional closure hours after
+  the last one is the first failure of its own streak and waits the base, where a counter that only
+  ever rose would creep to the cap and stay.
+- **A run lasts as long as its connection.** `startKind` ends the run when the pool retires the
+  connection it was handed (`Connection.Done`), and the worker goes back to the gate for the
+  replacement. A mirror blocked in a watch read cannot see the retirement itself, and retrying
+  over a retired connection would climb the ladder until a resume poke.
+- **A kind parked at the gate says why** (`session.awaitConn`): `NoConnection` or
+  `IdentityMismatch`, re-reported as the pool's answer moves, with `NextRetryAt` cleared — nothing
+  is retrying at the gate. The rest of the state stands, so the stamps survive the wait.
+- **Events age out here or nowhere** — the server never deletes them, so `PruneEvents` caps the
+  table: **once on the way into every `establish`**, and within a relist **before the commit that
+  persists the cookie**, since the LIST can carry more than the window and a prune that failed
+  after the collection became resumable would leave it oversized. Then every `eventsEvery` deltas
+  rather than per delta, since the statement scans and paying it each time would make a busy
+  cluster's event stream quadratic. The cadence counts within one run only, which is why every
+  establish pays it: a mirror restarted more often than the cadence comes round would otherwise
+  never reach it, and on an idle cluster no delta comes round at all.
+- **Every duration is a `pacing` field**, and production passes `defaultPacing()`. No test outwaits
+  a production number.
 
 **A relayed value needs a `depends_on` edge; the owner edge is not one.** The catalog's `Enabled` is
 the cluster's toggles resolved once above (`cacheSyncEnabled`, which also folds in whether the cache

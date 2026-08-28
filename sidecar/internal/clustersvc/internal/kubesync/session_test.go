@@ -125,7 +125,7 @@ func TestAConnectionAnsweringAsAnotherClusterWakesNothing(t *testing.T) {
 
 	// A connection arrives, so the wake loop runs — but it answers for another cluster, so
 	// it is not the connection this cache waits for and the sweep stays parked.
-	pool.lease("prod").connect(cluster, "another-uid")
+	pool.lease("prod").connect(t, cluster, "another-uid")
 
 	cluster.noRead(t, "a sweep dialing a connection that answers as another cluster")
 }
@@ -143,7 +143,7 @@ func TestASweepIsParkedWhileAnythingUnderItIsUnscheduled(t *testing.T) {
 		testutil.Timeout, time.Millisecond, "a suspended sweep is parked")
 
 	// The wake loop hands it a connection, and a settled sweep is scheduled again.
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	require.Eventually(t, func() bool { return !svc.sweepParked(sess.subject()) },
 		testutil.Timeout, time.Millisecond, "a settled sweep is not parked")
 }
@@ -152,7 +152,7 @@ func TestASettledSweepReportsAConnectionItLost(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serve("v1", listable("Pod", "pods", true))
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 	svc.TrackDiscovery(1, testParams)
 	awaitDiscovered(t, svc, 1)
@@ -168,12 +168,12 @@ func TestASettledSweepReportsAConnectionThatStartedAnsweringAsAnotherCluster(t *
 	cluster := newFakeCluster(t)
 	cluster.serve("v1", listable("Pod", "pods", true))
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 	svc.TrackDiscovery(1, testParams)
 	awaitDiscovered(t, svc, 1)
 
-	pool.lease("prod").connect(cluster, "another-uid")
+	pool.lease("prod").connect(t, cluster, "another-uid")
 
 	awaitReason(t, svc, 1, ReasonIdentityMismatch)
 }
@@ -182,27 +182,57 @@ func TestALostConnectionReportedOnceIsNotWokenAgain(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serve("v1", listable("Pod", "pods", true))
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	start(t, svc)
 	svc.TrackDiscovery(1, testParams)
 	awaitDiscovered(t, svc, 1)
 
 	pool.lease("prod").drop()
 	awaitReason(t, svc, 1, ReasonNoConnection)
-	// One probe committing the verdict is not all three finishing: the other two dial on
-	// their way out, and a baseline drained before them would count those as the re-wake.
-	awaitSweepSettled(t, svc, 1)
 
 	// The feed publishes every pass, not only the ones that changed something. A verdict
 	// that already names the connection is not news, and re-waking on each frame would be
 	// the poll a suspended sweep exists to avoid. One dial per frame is the wake loop
-	// looking; a further one is a run it woke.
+	// looking; a further one is a run it woke — so the baseline is the point the cache has
+	// stopped dialing, not the point one probe committed.
 	lease := pool.lease("prod")
-	awaitSweepSettled(t, svc, 1)
-	lease.dialed.Drain()
+	awaitDialsQuiet(t, lease)
 	lease.drop()
 
 	lease.dialed.Await(t, "the wake loop to look at the frame")
 	testutil.NoRecv(t, lease.dialed.Chan(), quietWindow,
 		"a sweep re-woken by a connection whose verdict is already reported")
+}
+
+func TestAKindParkedAtTheGateReportsWhyItWaits(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serveKind(podKind, true)
+	cluster.hasObjects(podKind, "10")
+	cluster.streamKind(podKind)
+
+	svc := newMirroringService(t, cluster)
+	mirrorKind(t, svc, 1, podKind)
+	awaitKindReason(t, svc, 1, podKind, ReasonWatching)
+
+	// Each refusal is the kind's own news, in the order the pool moved through them, and
+	// the retry countdown does not survive into the wait: nothing is retrying at the gate.
+	lease := svc.connSvc.(*fakePool).lease("prod")
+	lease.drop()
+	awaitKindReason(t, svc, 1, podKind, ReasonNoConnection)
+	state, _ := svc.GetKindState(1, podKind)
+	assert.True(t, state.NextRetryAt.IsZero())
+
+	lease.connect(t, cluster, "another-uid")
+	awaitKindReason(t, svc, 1, podKind, ReasonIdentityMismatch)
+
+	lease.connect(t, cluster, "uid-1")
+	awaitKindReason(t, svc, 1, podKind, ReasonWatching)
+}
+
+func TestACacheStandsBehindNoReasonUntilARunCommitsOne(t *testing.T) {
+	svc, _ := newTestService(t)
+
+	sess := newSession(svc, 1, testParams)
+	assert.Empty(t, sess.discoveryReason(),
+		"a cache whose sweep has not answered names no reason, so the first frame is news")
 }

@@ -157,7 +157,7 @@ func caPEM(srv *httptest.Server) []byte {
 // connTo builds a connection to srv, trusting its certificate.
 func connTo(t *testing.T, srv *httptest.Server) *Connection {
 	t.Helper()
-	conn, err := newConnection(restConfigFor(srv))
+	conn, err := NewConnection(restConfigFor(srv))
 	require.NoError(t, err)
 	return conn
 }

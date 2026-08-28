@@ -216,6 +216,17 @@ func startEngine(t *testing.T, e *Engine) {
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 }
 
+// --- the backoff ladder ---
+
+func TestBackoffClimbsToItsCap(t *testing.T) {
+	b := Backoff{Base: time.Second, Factor: 2, Cap: time.Minute}
+	assert.Equal(t, time.Second, b.Delay(1), "the first failure waits the base")
+	assert.Equal(t, 2*time.Second, b.Delay(2))
+	assert.Equal(t, 8*time.Second, b.Delay(4), "each rung widens by the factor")
+	assert.Equal(t, time.Minute, b.Delay(7), "until the cap")
+	assert.Equal(t, time.Minute, b.Delay(20), "and stays there")
+}
+
 // --- registration ---
 
 // The engine's own knobs are options too, and a New that states none takes the defaults.

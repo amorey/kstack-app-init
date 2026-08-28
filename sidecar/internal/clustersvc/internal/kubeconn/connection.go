@@ -200,8 +200,8 @@ var newDynamic = func(cfg *rest.Config, c *http.Client) (dynamic.Interface, erro
 	return dynamic.NewForConfigAndClient(cfg, c)
 }
 
-// newConnection materializes the clients for one set of credentials.
-func newConnection(cfg *rest.Config) (*Connection, error) {
+// NewConnection materializes the clients for one set of credentials.
+func NewConnection(cfg *rest.Config) (*Connection, error) {
 	// A copy, because the tuning below is ours and the caller's config is not.
 	own := rest.CopyConfig(cfg)
 	own.QPS = defaultQPS
@@ -267,10 +267,13 @@ func newDiscovery(cfg *rest.Config) (discovery.DiscoveryInterface, error) {
 // per operation re-calls Lease.Conn instead.
 func (c *Connection) Done() <-chan struct{} { return c.done }
 
-// retire tells every holder this connection is void and gives its idle sockets back. Once,
+// Retire tells every holder this connection is void and gives its idle sockets back. Once,
 // because publish and Release can both reach one on the way out and neither can cheaply prove
 // the other did not.
-func (c *Connection) retire() {
+//
+// The pool's to call. Exported for a fake pool in another package's tests, which has to
+// retire what it replaces for its holders to behave as they do under this one.
+func (c *Connection) Retire() {
 	c.once.Do(func() {
 		// A connection nobody built carries neither, and reads as never retired — the
 		// contract Done states.

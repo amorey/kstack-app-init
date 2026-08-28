@@ -185,7 +185,7 @@ func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) p
 	// the request over this connection. A first identification records none, so nothing here
 	// rebuilds a connection merely because the probe behind it answered.
 	if next.conn == nil || next.fingerprint != fingerprint || next.conn.conflicted() {
-		conn, err := newConnection(cfg)
+		conn, err := NewConnection(cfg)
 		next = connInfo{conn: conn, fingerprint: fingerprint}
 		if err != nil {
 			// Nothing was dialed; the remedy is the same file fix a context that will
@@ -218,7 +218,7 @@ func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) p
 // fingerprint), so a value that moved never carries a connection someone else holds.
 func (p *connectionProbe) Discard(v connInfo) {
 	if v.conn != nil {
-		v.conn.retire()
+		v.conn.Retire()
 	}
 }
 

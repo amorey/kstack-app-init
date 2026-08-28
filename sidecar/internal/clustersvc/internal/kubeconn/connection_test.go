@@ -38,11 +38,11 @@ import (
 // The trap: a hardcoded scheme turns a plain-HTTP port-forward into https:// and every request
 // fails at the handshake. The scheme follows the credentials the config actually carries.
 func TestNewConnectionResolvesTheBaseURLWithoutAssumingTLS(t *testing.T) {
-	plain, err := newConnection(&rest.Config{Host: "localhost:8080"})
+	plain, err := NewConnection(&rest.Config{Host: "localhost:8080"})
 	require.NoError(t, err)
 	assert.Equal(t, "http://localhost:8080", plain.BaseURL.String())
 
-	secured, err := newConnection(&rest.Config{
+	secured, err := NewConnection(&rest.Config{
 		Host:            "example.com",
 		TLSClientConfig: rest.TLSClientConfig{Insecure: true},
 	})
@@ -55,7 +55,7 @@ func TestNewConnectionResolvesTheBaseURLWithoutAssumingTLS(t *testing.T) {
 func TestNewConnectionStampsItsTuningOnACopy(t *testing.T) {
 	caller := &rest.Config{Host: "https://one.example"}
 
-	conn, err := newConnection(caller)
+	conn, err := NewConnection(caller)
 	require.NoError(t, err)
 
 	assert.Equal(t, defaultQPS, conn.Config.QPS)
@@ -67,7 +67,7 @@ func TestNewConnectionStampsItsTuningOnACopy(t *testing.T) {
 // A host that will not parse fails the build, where a nil connection handed back as usable
 // would panic at the first request instead.
 func TestNewConnectionRefusesAHostItCannotParse(t *testing.T) {
-	_, err := newConnection(&rest.Config{Host: "://nonsense"})
+	_, err := NewConnection(&rest.Config{Host: "://nonsense"})
 
 	assert.Error(t, err)
 }
@@ -75,11 +75,11 @@ func TestNewConnectionRefusesAHostItCannotParse(t *testing.T) {
 // Retiring is what tells every holder that what it derived over this connection no longer
 // holds. Idempotent because publish and Release can both reach one on the way out.
 func TestRetireClosesDoneOnce(t *testing.T) {
-	conn, err := newConnection(&rest.Config{Host: "https://one.example"})
+	conn, err := NewConnection(&rest.Config{Host: "https://one.example"})
 	require.NoError(t, err)
 
-	conn.retire()
-	conn.retire()
+	conn.Retire()
+	conn.Retire()
 
 	<-conn.Done()
 }
@@ -136,7 +136,7 @@ func TestGetJSONReportsABodyThatWillNotDecode(t *testing.T) {
 
 // Nothing listening is the transport failing, and it must not read as a status.
 func TestGetJSONReportsATransportFailure(t *testing.T) {
-	conn, err := newConnection(restConfigForHost(deadHost))
+	conn, err := NewConnection(restConfigForHost(deadHost))
 	require.NoError(t, err)
 
 	err = conn.getJSON(t.Context(), "/api", &struct{}{})
@@ -188,7 +188,7 @@ func TestClassifyReadsARealHostnameMismatchAsTLSInvalid(t *testing.T) {
 	srv := serveAPI(t)
 	// httptest's certificate covers 127.0.0.1 and example.com, so "localhost" reaches the same
 	// server with a name the certificate does not carry.
-	conn, err := newConnection(&rest.Config{
+	conn, err := NewConnection(&rest.Config{
 		Host:            strings.Replace(srv.URL, "127.0.0.1", "localhost", 1),
 		TLSClientConfig: rest.TLSClientConfig{CAData: caPEM(srv)},
 	})
@@ -253,7 +253,7 @@ func TestNewConfiguresTheKeepalive(t *testing.T) {
 // TLS material that will not load fails the build, where a connection handed back as usable
 // would fail at the first handshake instead.
 func TestNewConnectionRefusesCredentialsItCannotLoad(t *testing.T) {
-	_, err := newConnection(&rest.Config{
+	_, err := NewConnection(&rest.Config{
 		Host:            "https://one.example",
 		TLSClientConfig: rest.TLSClientConfig{CAFile: "/nonexistent/ca.crt"},
 	})
@@ -267,7 +267,7 @@ func TestNewConnectionReportsAClientItCannotBuild(t *testing.T) {
 	newDynamic = func(*rest.Config, *http.Client) (dynamic.Interface, error) { return nil, failing }
 	t.Cleanup(func() { newDynamic = original })
 
-	_, err := newConnection(&rest.Config{Host: "https://one.example"})
+	_, err := NewConnection(&rest.Config{Host: "https://one.example"})
 
 	assert.ErrorIs(t, err, failing)
 }

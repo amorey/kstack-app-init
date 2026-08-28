@@ -134,7 +134,7 @@ func (p sessionScoped[T]) Run(ctx context.Context, pass *probe.Pass[T]) probe.Re
 
 	conn, err := sess.lease.ConnFor(runCtx, sess.params.ServerUID)
 	if err != nil {
-		reason := connectionReason(err)
+		reason := connectionReason(err, ReasonDiscoveryFailed)
 		if reason == ReasonDiscoveryFailed {
 			return probe.Fail(reason, err)
 		}
@@ -146,14 +146,14 @@ func (p sessionScoped[T]) Run(ctx context.Context, pass *probe.Pass[T]) probe.Re
 // connectionReason names why a cache cannot dial: the verdict a run suspends under, and
 // what the wake loop compares its own answer against. One mapping, so a sweep and the loop
 // that wakes it can never disagree about what the pool just said.
-func connectionReason(err error) Reason {
+func connectionReason(err error, failed Reason) Reason {
 	switch {
 	case errors.Is(err, kubeconn.ErrNoConnection):
 		return ReasonNoConnection
 	case errors.Is(err, kubeconn.ErrIdentityMismatch):
 		return ReasonIdentityMismatch
 	default:
-		return ReasonDiscoveryFailed
+		return failed
 	}
 }
 

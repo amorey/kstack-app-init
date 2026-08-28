@@ -1035,7 +1035,7 @@ func TestAReplacedServerRebuildsTheConnection(t *testing.T) {
 	// as the probe reads it over the OLD connection, which says nothing about the replacement
 	// having been stamped. That pairing is the trap ConnFor exists to close, and waiting out
 	// the stamp window is the whole of what AwaitConnFor is for.
-	fresh, err := AwaitConnFor(within(t), lease, "uid-2")
+	fresh, err := AwaitConnFor(within(t), lease, "uid-2", nil)
 	require.NoError(t, err)
 	assert.NotSame(t, stale, fresh)
 }
@@ -1109,6 +1109,15 @@ func (l *stubLease) vouches(conn *Connection) {
 	l.hub.Sender().Send("prod", State{})
 }
 
+// refuses is the pool answering with err from here on, followed by the pass that publishes it.
+func (l *stubLease) refuses(err error) {
+	l.mu.Lock()
+	l.conn, l.err = nil, err
+	l.mu.Unlock()
+
+	l.hub.Sender().Send("prod", State{})
+}
+
 func (l *stubLease) ConnFor(context.Context, string) (*Connection, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1122,45 +1131,6 @@ func (l *stubLease) State() State                              { return State{} 
 func (l *stubLease) Departed() bool                            { return false }
 func (l *stubLease) Release()                                  {}
 
-// A connection already vouching needs no wait at all, and the channel says so synchronously —
-// a caller checking with select/default would otherwise read "ready" as "not yet".
-func TestReadyForIsClosedWhenTheConnectionAlreadyVouches(t *testing.T) {
-	l := newStubLease()
-	l.vouches(&Connection{})
-
-	select {
-	case <-ReadyFor(t.Context(), l, "uid-1"):
-	default:
-		t.Fatal("a connection that already vouches must not make a caller wait")
-	}
-}
-
-// The wait the stamp window needs: a rebuilt connection is refused until the probe behind it
-// identifies the server, and the pass that stamps it is what releases the waiter.
-func TestReadyForClosesWhenTheConnectionComesToVouch(t *testing.T) {
-	l := newStubLease()
-	ready := ReadyFor(t.Context(), l, "uid-1")
-
-	// A negative assertion has no event to wait for, so it needs a bounded window.
-	testutil.NoRecv(t, ready, 50*time.Millisecond, "a close before anything vouches")
-
-	l.vouches(&Connection{})
-
-	testutil.Wait(t, ready, "the waiter to be released")
-}
-
-// The waiter's whole lifetime is the caller's context — nothing else can end a wait for a
-// cluster that never comes back, so a caller that stops selecting must not strand a goroutine.
-func TestReadyForClosesWhenTheCallerGivesUp(t *testing.T) {
-	l := newStubLease()
-	ctx, cancel := context.WithCancel(context.Background())
-	ready := ReadyFor(ctx, l, "uid-1")
-
-	cancel()
-
-	testutil.Wait(t, ready, "the waiter to end with its context")
-}
-
 // The loop a caller with nothing to multiplex would otherwise write at every call site: wait,
 // then read the level, because the close is an edge and the connection can move again.
 func TestAwaitConnForReturnsTheConnectionThatVouches(t *testing.T) {
@@ -1169,13 +1139,35 @@ func TestAwaitConnForReturnsTheConnectionThatVouches(t *testing.T) {
 
 	got := make(chan *Connection, 1)
 	go func() {
-		conn, err := AwaitConnFor(t.Context(), l, "uid-1")
+		conn, err := AwaitConnFor(t.Context(), l, "uid-1", nil)
 		assert.NoError(t, err)
 		got <- conn
 	}()
 
 	l.vouches(fresh)
 
+	assert.Same(t, fresh, testutil.Recv(t, got, "the connection the waiter returned"))
+}
+
+// A holder that reports what it waits on hears every refusal, so a cluster that went from
+// unreachable to answering as another cluster is reported as both, in order.
+func TestAwaitConnForReportsEachRefusalWhileItWaits(t *testing.T) {
+	l := newStubLease()
+	refusals := testutil.NewProbe[error](4)
+
+	got := make(chan *Connection, 1)
+	go func() {
+		conn, err := AwaitConnFor(t.Context(), l, "uid-1", refusals.Fire)
+		assert.NoError(t, err)
+		got <- conn
+	}()
+
+	assert.ErrorIs(t, refusals.Await(t, "the first check to be refused"), ErrNoConnection)
+	l.refuses(ErrIdentityMismatch)
+	assert.ErrorIs(t, refusals.Await(t, "the next frame's refusal"), ErrIdentityMismatch)
+
+	fresh := &Connection{}
+	l.vouches(fresh)
 	assert.Same(t, fresh, testutil.Recv(t, got, "the connection the waiter returned"))
 }
 
@@ -1187,7 +1179,7 @@ func TestAwaitConnForEndsWithItsContext(t *testing.T) {
 
 	failed := make(chan error, 1)
 	go func() {
-		_, err := AwaitConnFor(ctx, l, "uid-1")
+		_, err := AwaitConnFor(ctx, l, "uid-1", nil)
 		failed <- err
 	}()
 

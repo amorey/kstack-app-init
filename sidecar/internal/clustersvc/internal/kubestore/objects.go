@@ -17,6 +17,7 @@ package kubestore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -53,20 +54,25 @@ type ownerRef struct {
 
 // projectObject flattens an object body into the objects columns, redacting and
 // stripping the body along the way.
+// errUnprojectable marks a body the projection cannot turn into a row. Every writer skips one
+// rather than failing over it: a body a relist drops is simply missing until the next one, where
+// a delta the server replays from its position would be handed back forever.
+var errUnprojectable = errors.New("kubestore: unprojectable body")
+
 func projectObject(u *unstructured.Unstructured) (objectRow, error) {
 	// A nil body would panic on GetUID inside a worker goroutine, taking the process
 	// with it.
 	if u == nil || u.Object == nil {
-		return objectRow{}, fmt.Errorf("kubestore: object is empty")
+		return objectRow{}, fmt.Errorf("%w: object is empty", errUnprojectable)
 	}
 	uid := string(u.GetUID())
 	if uid == "" {
-		return objectRow{}, fmt.Errorf("kubestore: %s has empty UID", u.GetKind())
+		return objectRow{}, fmt.Errorf("%w: %s has empty UID", errUnprojectable, u.GetKind())
 	}
 
 	rawJSON, err := json.Marshal(sanitize(u).Object)
 	if err != nil {
-		return objectRow{}, err
+		return objectRow{}, fmt.Errorf("%w: %w", errUnprojectable, err)
 	}
 
 	row := objectRow{

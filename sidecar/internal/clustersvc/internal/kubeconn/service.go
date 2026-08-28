@@ -106,64 +106,38 @@ type Lease interface {
 	Release()
 }
 
-// ReadyFor closes when l holds a connection vouching for serverUID, or when ctx ends. It is what
-// a holder waits on across a rebuild: the replacement lands before the old one's Done() fires,
-// but it is unstamped for a round trip after that, so ConnFor refuses through the window and
-// Done() alone is not the signal.
+// AwaitConnFor is ConnFor that waits: the connection vouching for serverUID as soon as one
+// exists, or ctx's error. It is what a holder waits on across a rebuild — the replacement lands
+// before the old one's Done() fires, but it is unstamped for a round trip after that, so ConnFor
+// refuses through the window and Done() alone is not the signal. A connection already vouching
+// costs no wait at all.
 //
-// **An edge, not a promise.** The connection can move again between the close and the caller's
-// ConnFor, so a caller re-checks — AwaitConnFor is that loop for a caller with nothing else to
-// select on.
+// refused, if given, hears why each check was refused — on the first, and again whenever a
+// state frame lands and the answer is still no. A holder that reports what it waits on says
+// so through it; one with nothing to say passes nil.
 //
-// A waiter that never fires lives until ctx ends, so bound it with the context of the work that
-// wants the connection rather than a process-lived one. A connection already vouching costs no
-// waiter at all: the channel comes back closed.
+// A wait that never resolves lives until ctx ends, so bound it with the context of the work that
+// wants the connection rather than a process-lived one.
 //
-// Free functions rather than Lease methods, so nothing implementing that interface — every
+// A free function rather than a Lease method, so nothing implementing that interface — every
 // caller's fake included — can get the attach ordering wrong. **Never called from a probe Run:**
 // it blocks, and a run holds an engine worker.
-func ReadyFor(ctx context.Context, l Lease, serverUID string) <-chan struct{} {
-	ready := make(chan struct{})
-
+func AwaitConnFor(ctx context.Context, l Lease, serverUID string, refused func(error)) (*Connection, error) {
 	// Attached before the first check, never after: a stamp landing in the gap between the two
 	// is one the waiter would sleep through, and the next pass that would report it is a
 	// serverUID interval away.
 	sub := l.WatchState()
-	if _, err := l.ConnFor(ctx, serverUID); err == nil {
-		sub.Close()
-		close(ready)
-		return ready
-	}
+	defer sub.Close()
 
-	go func() {
-		defer close(ready)
-		defer sub.Close()
-		for {
-			if _, err := sub.RecvContext(ctx); err != nil {
-				return
-			}
-			if _, err := l.ConnFor(ctx, serverUID); err == nil {
-				return
-			}
-		}
-	}()
-	return ready
-}
-
-// AwaitConnFor is ConnFor that waits: the connection vouching for serverUID as soon as one
-// exists, or ctx's error. A holder resuming across a rebuild loops over it, and pays nothing
-// once a connection is standing.
-func AwaitConnFor(ctx context.Context, l Lease, serverUID string) (*Connection, error) {
 	for {
-		<-ReadyFor(ctx, l, serverUID)
-
 		conn, err := l.ConnFor(ctx, serverUID)
 		if err == nil {
 			return conn, nil
 		}
-		// ReadyFor closes on ctx too, so this is what tells a caller that gave up from one
-		// whose connection moved again between the close and the read.
-		if err := ctx.Err(); err != nil {
+		if refused != nil {
+			refused(err)
+		}
+		if _, err := sub.RecvContext(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -314,7 +288,7 @@ func (s *Service) Close() error {
 
 	err := s.engine.Close()
 	for _, conn := range dropped {
-		conn.retire()
+		conn.Retire()
 	}
 	return err
 }
@@ -351,7 +325,7 @@ func (s *Service) publish(contextName string, v probe.Snapshot) {
 	stale, held, changed := s.record(contextName, conn, n)
 	if stale != nil {
 		// Outside the lock: retiring closes sockets, and nothing about it needs the pool.
-		stale.retire()
+		stale.Retire()
 	}
 	if !held {
 		// The pass raced the last release; watchers on this name hear about whatever claims
@@ -582,6 +556,6 @@ func (c *claim) Release() {
 	// An entry that goes takes its connection with it: nothing probes the context now, so
 	// nothing else would ever close these sockets.
 	if dropped != nil {
-		dropped.retire()
+		dropped.Retire()
 	}
 }

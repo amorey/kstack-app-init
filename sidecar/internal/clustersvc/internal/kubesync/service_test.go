@@ -168,7 +168,7 @@ func TestDiscoveryNewsIsKeyedByCacheID(t *testing.T) {
 	cluster.serve("v1", listable("Pod", "pods", true))
 
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 	news := svc.WatchDiscoveryNews()
 	t.Cleanup(news.Close)
 	start(t, svc)
@@ -357,7 +357,7 @@ func TestStoppingWithNoTimeLeftReportsTheEngineRefusing(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serve("v1", listable("Pod", "pods", true))
 	svc, pool := newTestService(t)
-	pool.lease("prod").connect(cluster, "uid-1")
+	pool.lease("prod").connect(t, cluster, "uid-1")
 
 	stop, err := svc.Start(t.Context())
 	require.NoError(t, err)
