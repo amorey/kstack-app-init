@@ -1,10 +1,20 @@
 ---
 title: The kubesync seam
 scope: sidecar
-status: Planned
+status: Steps 1–3 built
 ---
 
 # The kubesync seam
+
+## Where this stands
+
+**Steps 1–3 of the build order are built.** `kubesync` arms and forgets, gates on identity, sweeps
+discovery into `kind_catalog`, and syncs each kind as a supervisor **worker** whose run is that
+kind's stream. The seam below is the code, not a plan.
+
+**Steps 4–5 are not started.** Nothing outside the package calls it: `clustersvc` neither
+constructs it, wires it as a `lifecycle.Part`, nor subscribes it to `poke`, and no trigger, pass,
+gauge or wire field exists.
 
 ## Goal
 
@@ -134,8 +144,11 @@ func (s *Service) ForgetKind(cacheID int64, k kubestore.Kind)
 // The supervisor's bookkeeping, aliased rather than copied so an Observation carries exactly what it
 // recorded — the same aliases kubeconn declares, for the same reason. Reason stays this package's
 // vocabulary; the supervisor treats it as opaque.
+//
+// Only the JOB observation is aliased. A worker's is folded into KindState rather than published,
+// per that type's doc. → [ADR](../adr/2026-08-28-jobs-and-workers.md).
 type (
-	Observation[T any] = supervisor.Observation[T]
+	Observation[T any] = supervisor.JobObservation[T]
 	Attempt            = supervisor.Attempt
 	Attempts           = supervisor.Attempts
 	Verdict            = supervisor.Verdict
@@ -179,6 +192,15 @@ type DiscoveryState struct {
 // passes, and the difference decides every field here. It carries no identity: the caller named
 // the kind to read it.
 //
+// **Nothing stores it.** It is assembled at read from the three things that own its parts: the
+// reason the worker committed, the supervisor's Attempts, and the session's stamps.
+//
+// **It carries no Observation, where DiscoveryState carries three.** A sweep's three reads are
+// separately interesting and each one's record means what it says. One worker's record is correct
+// only through these gates: its last exit describes the kind while it is DOWN and is the failure
+// it recovered from once it is up, and its next attempt on a running stream is the schedule it was
+// dispatched on rather than a retry. Those two are folded here rather than published raw.
+//
 // A pass is judged by its last attempt. A stream is judged by whether it is established now and
 // has recently proven itself alive, which is a different question and needs different evidence:
 //
@@ -197,6 +219,11 @@ type KindState struct {
 	// instead of a last-attempt stamp.
 	SinceAt time.Time
 
+	// Live is whether the watch is open right now. Kept because it is the one join a consumer
+	// cannot redo — reconstructing it means enumerating which reasons a running stream reports,
+	// and that set is this package's. Stale is live; Syncing is not.
+	Live bool
+
 	// LastUpdateAt is when data last arrived; LastLiveAt the last proof the stream is live,
 	// which is the later of the two and the only one that distinguishes idle from wedged.
 	//
@@ -206,8 +233,10 @@ type KindState struct {
 	LastUpdateAt time.Time
 	LastLiveAt   time.Time
 
-	// Restarts counts runs this worker has begun without settling; NextRetryAt is when a run
-	// that is down will be tried again, and zero while one is up.
+	// Restarts counts how many times the stream has come back inside the current healthy
+	// stretch — the flapping question a retry streak cannot answer, since a watch that rotates
+	// every thirty seconds never fails. The streak itself reads as a non-zero NextRetryAt, which
+	// is when a run that is DOWN will be tried again and zero while one is up.
 	Restarts    int
 	NextRetryAt time.Time
 }
@@ -289,10 +318,16 @@ carries them structurally until something needs to branch on them.
 | kind | `Syncing` | cold-listing a kind with nothing cached |
 | kind | `Resyncing` | reconciling a kind that HAS rows against a fresh list, because the position they were current at is one the server no longer serves from. Its own verdict because the rows are served throughout, where `Syncing` has nothing to serve |
 | kind | `Resuming` | re-establishing from a cookie, and slow enough to be worth saying |
-| kind | `Watching` | caught up and streaming deltas, proven live |
+| kind | `Watching` | the watch is open — established, not yet proven live |
 | kind | `Stale` | caught up, but the watch has stopped proving itself alive |
 | kind | `SyncFailed` | the run failed and is retrying |
 | kind | `NoConnection` / `IdentityMismatch` | as above: the session suspends every worker under it, and each reports its own |
+
+`Watching` lands when the watch opens, not at the first frame: bookmarks are advisory, so waiting
+for one would hold a quiet kind's start slot indefinitely and keep the rest of a cache from
+listing. What that gives up is bought back at the exit — a watch the server accepted and closed
+having proved nothing reads `SyncFailed`, where a rotation reads as a clean restart at the floor.
+→ [ADR](../adr/2026-08-28-jobs-and-workers.md).
 
 ## What `clustersvc` does with it
 
@@ -393,9 +428,10 @@ is the same news twice.
 
 ### The wire and the panel
 
-`ClusterCache.events` exists and carries both categories above, pending the open question on the
-per-kind timeline. Its doc needs a correction either way: it offers `"sync"` as its example
-category where the cache's own timeline is `discovery`.
+`ClusterCache.events` and `ClusterCachedKind.events` both exist, already split the way the table
+above splits them: the cache's doc says the per-kind history lives on the kind's record. One
+correction is owed — the cache's doc offers `"sync"` as its example category, where the cache's own
+timeline is `discovery`.
 
 What is added: `clusterCacheSyncStatusWatch(id, cacheID)`, the per-kind verdict gauge. Nothing on
 the wire carries a per-kind verdict today — the record that would have is gone — so this is the
@@ -403,9 +439,9 @@ only thing that can serve one.
 
 `cluster-sync-panel.tsx` is the one consumer. It takes per-kind verdicts from the new gauge instead
 of the rollup's `unhealthyKindRefs`, and reads discovery history from
-`eventsWatch(cacheID, category: "discovery")` while a row is expanded. Its sync timeline currently
-reads `eventsWatch(cacheID, category: "sync")`; whether that stays cache-scoped is the open
-question above.
+`eventsWatch(cacheID, category: "discovery")` while a row is expanded. Its sync timeline reads `eventsWatch(cacheID, category:
+"sync")` today, which is the cache's own timeline; the per-kind history it wants is
+`eventsWatch(kindID, category: "sync")` off the expanded row's record.
 
 ## The catalog is the kind set
 
@@ -437,8 +473,8 @@ kubesync/
   session.go    one cache: its lease, its store claim, the identity gate, suspend/resume, and
                 the set of workers under it
   discovery.go  the sweep as a probe body: the fan-out, SyncKinds, the kind diff
-  kinds.go      one kind's sync as a reconciler: the run that establishes, the stream it
-                commits as its value, cold list, watch, cookie resume
+  kinds.go      one kind's sync as a supervisor worker: the run IS the stream — the gate,
+                the cold list or cookie resume, the watch, and the delta loop
   state.go      the state types and this leaf's reason vocabulary
 ```
 
@@ -506,11 +542,11 @@ session's life, a discovery loop, and a worker per kind.
   — discovery starts the workers whose writes wake discovery — bottoms out on the cadence, which
   is also the cold start. It can only ever be a wake: an api server upgrade changes the built-in
   kinds with no CRD or APIService write at all.
-- **A kind sync** is a standing push stream, not a periodic pass: a run takes a paginated cold LIST
-  through `BeginReplace`/`WritePage`/`Commit` — bounded by the kind supervisor's worker cap,
-  since arming a cache arms hundreds of kinds at once — opens a WATCH from the cookie, and commits
-  the goroutine that applies deltas through `ApplyChange` as its value. Events age out through
-  `PruneEvents`.
+- **A kind sync is a worker, and the run is the stream.** It takes a paginated cold LIST through
+  `BeginReplace`/`WritePage`/`Commit` — bounded by the supervisor's START cap, since arming a cache
+  arms hundreds of kinds at once — opens a WATCH from the cookie, calls `Ready`, and applies deltas
+  through `ApplyChange` until the stream ends. Returning is the stream having ended, and the
+  verdict says how to start it again. Events age out through `PruneEvents`.
 - **A commit publishes** an observation and signals only when the reason moved, so counts and
   timestamps ticking never requeue a record.
 - **A resume holds its reason.** A worker restarting off its cookie stays at `Watching` while it
@@ -520,7 +556,7 @@ session's life, a discovery loop, and a worker per kind.
   reconciles and six hundred event runs against a single-writer store, every time a laptop opens.
   A cold start is different and still reports `Syncing`: there the kind genuinely has no data.
 
-## Open: stopping workers across a clear
+## Stopping workers across a clear
 
 `Caches().Clear` deletes a cache's file and reopens an empty one under whoever holds it, and
 `CachedKinds().Clear` deletes one kind's rows and its resume cookie. Both are two steps, and a
@@ -530,10 +566,48 @@ applies deltas to an empty database with no cold list behind them, leaving the c
 short of what it held.
 
 So a clear needs the affected workers stopped across the swap and unable to restart until it is
-done, and stopping them is not something a caller can arrange from outside kubesync. What that
-looks like on the seam — a scoped hold, a callback the clear runs inside, or moving the clear
-itself behind kubesync — is undecided, and so is how the health fold avoids reporting a clear in
-progress as a cache that stopped syncing.
+done, and stopping them is not something a caller can arrange from outside kubesync. **kubesync
+runs the clear inside a callback**:
+
+```go
+// WithCacheStopped runs fn with every worker under cacheID stopped and unable to start, then
+// arms them again. A cache nobody has armed runs fn directly: there is nothing to stop.
+func (s *Service) WithCacheStopped(cacheID int64, fn func() error) error
+
+// WithKindStopped is the same, scoped to one kind.
+func (s *Service) WithKindStopped(cacheID int64, k kubestore.Kind, fn func() error) error
+```
+
+**The store work stays with the caller**, which is what rules out moving the clear behind kubesync.
+`Caches().Clear` has to work on a PAUSED cache — no session, no lease, nothing armed — and a user
+clearing a cache they paused is the ordinary case. Behind kubesync that is store mutation for a
+cache it has never armed, a wider hole in the layering than the one it closes. The callback leaves
+the two clears where they already handle that case correctly, through `OpenExisting` and
+`Manager.Clear`.
+
+**A callback rather than a scoped hold** (`hold := Pause(id); defer hold.Release()`), because a
+hold nobody releases wedges the cache silently and for good, where a callback cannot be forgotten
+and its window is a scope a reader can see the whole of.
+
+Both are small, because both halves exist. `armMu` already IS "stopped and unable to start" — the
+lock arming, forgetting and tearing down serialize on — and `stopKind` already cancels one kind's
+worker and joins it. `WithCacheStopped` is: take `armMu`, `Remove` each kind subject, run `fn`,
+add them back, and restart discovery. Three properties make it fit:
+
+- **The session keeps its claim across the swap**, which is what `Manager.Clear` is written for —
+  it reopens a fresh file for the claims still held. Forgetting and re-tracking the cache would
+  work and would pay for a new lease and a full sweep on a path that only needed the workers down.
+- **The health fold needs nothing new.** While a kind's subject is removed `GetKindState` reports
+  false, and the rule below already says what that means: no answer is not an empty answer. A fold
+  reporting a clear in progress as a cache that stopped syncing is breaking a rule it was already
+  bound by, so the fix belongs in the fold rather than in a flag it special-cases.
+- **A cache-wide clear wipes `kind_catalog` too**, and the fingerprint covers the fallout: the
+  table comes back without one, so the mirror pass reads "never swept" and prunes no records, and
+  the next sweep cannot fingerprint-skip its write. Restarting discovery inside the callback is
+  only about latency.
+
+`fn` runs under `armMu`, so it must not call back into kubesync — the same rule that stops a `Run`
+removing its own subject.
 
 ## Rules
 
@@ -568,19 +642,22 @@ progress as a cache that stopped syncing.
 
 Each step is one red/green cycle and one commit.
 
-1. **The skeleton**: `TrackDiscovery`/`ForgetDiscovery`, `TrackKind`/`ForgetKind` and the
+Steps 1–3 are built (`321974f`..`8d9658d`).
+
+1. ✅ **The skeleton**: `TrackDiscovery`/`ForgetDiscovery`, `TrackKind`/`ForgetKind` and the
    relationship between them, `RestartAll`, the lease and store claims, the identity gate, the two
    reads and the two news feeds — with the discovery and sync bodies as seams a test substitutes.
    Nothing above it changes yet.
-2. **Discovery**: the sweep, `SyncKinds`, the kind diff, the cache-level reasons.
-3. **The kind worker**: cold list, watch, cookie resume, the per-kind reasons and freshness stamps.
-4. **The triggers and the two passes**: the cache arming discovery and mirroring the record set,
+2. ✅ **Discovery**: the sweep, `SyncKinds`, the kind diff, the cache-level reasons.
+3. ✅ **The kind worker**: cold list, watch, cookie resume, the per-kind reasons and freshness stamps.
+4. **The triggers and the two passes** — the first step outside the package, so it also
+   constructs the `Service`, wires it as a `lifecycle.Part` between `kubestore` and `beehive`, and
+   subscribes it to `poke` for `RestartAll`: the cache arming discovery and mirroring the record set,
    each record arming its own kind, and the two event timelines.
-5. **The gauges and the clears**: `WatchHealth` onto the getters, `WatchSyncStatus`, and whatever
-   the open item above resolves to.
+5. **The gauges and the clears**: `WatchHealth` onto the getters, `WatchSyncStatus`, and
+   `WithCacheStopped`/`WithKindStopped` under the two clears.
 
-Steps 1–3 are `kubesync` alone and land before anything consumes them. The kind sync runs on the
-supervisor as of step 3.
+Steps 1–3 are `kubesync` alone and landed before anything consumed them.
 
 ## Not in this pass
 
