@@ -20,18 +20,18 @@ package kubesync
 import (
 	"time"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
-// The engine's bookkeeping, aliased rather than copied so an Observation carries exactly
+// The supervisor's bookkeeping, aliased rather than copied so an Observation carries exactly
 // what it recorded — the same aliases kubeconn declares, for the same reason. Reason
-// stays this package's vocabulary; the engine treats it as opaque.
+// stays this package's vocabulary; the supervisor treats it as opaque.
 type (
-	Observation[T any] = probe.Observation[T]
-	Attempt            = probe.Attempt
-	Attempts           = probe.Attempts
-	Verdict            = probe.Verdict
-	Reason             = probe.Reason
+	Observation[T any] = supervisor.Observation[T]
+	Attempt            = supervisor.Attempt
+	Attempts           = supervisor.Attempts
+	Verdict            = supervisor.Verdict
+	Reason             = supervisor.Reason
 )
 
 // The discovery vocabulary. There is no Watching or Stale here: nothing behind a sweep
@@ -84,7 +84,7 @@ const (
 // What is left is how discovery is DOING.
 //
 // Each read is accounted for on its own, so one failing says so without dragging the
-// others' verdict with it, and Observation carries the engine's own record — the last
+// others' verdict with it, and Observation carries the supervisor's own record — the last
 // attempt's verdict, reason and message, the next attempt, the failure streak — so
 // nothing here restates it.
 type DiscoveryState struct {

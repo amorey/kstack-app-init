@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package probe
+package supervisor
 
 import (
 	"testing"
@@ -61,7 +61,7 @@ func TestGetPanicsOnTheWrongType(t *testing.T) {
 
 // Before anything is committed there is no value to type-check against, so the read answers
 // "nothing known yet" rather than guessing — and the attempts still explain why.
-func TestGetOnAProbeThatHasNotCommittedIsNotKnown(t *testing.T) {
+func TestGetOnAReconcilerThatHasNotCommittedIsNotKnown(t *testing.T) {
 	e, _, _ := single(t, Fail("Unreachable", assert.AnError))
 	e.Add(subj)
 	e.settle()
@@ -75,7 +75,7 @@ func TestGetOnAProbeThatHasNotCommittedIsNotKnown(t *testing.T) {
 }
 
 // A name nothing was registered under is a wiring bug on the untyped walk too, not a zero
-// Attempts passed off as a probe that has never run.
+// Attempts passed off as a reconciler that has never run.
 func TestSnapshotAttemptsPanicsOnAnUnregisteredName(t *testing.T) {
 	e, _, _ := single(t, Succeeded())
 	e.Add(subj)
@@ -84,7 +84,7 @@ func TestSnapshotAttemptsPanicsOnAnUnregisteredName(t *testing.T) {
 	assert.Panics(t, func() { read.Attempts("nope") })
 }
 
-// The seam a probe body's tests read a sibling through, standing in for the engine.
+// The seam a reconciler body's tests read a sibling through, standing in for the supervisor.
 func TestNewSnapshotCarriesTheValuesNamed(t *testing.T) {
 	snap := NewSnapshot(map[string]any{"conn": "endpoint", "uid": "abc-123"})
 

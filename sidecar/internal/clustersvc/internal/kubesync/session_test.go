@@ -44,15 +44,15 @@ func TestStartPutsTheCacheOnTheDiscoveryEngineAndCloseTakesItOff(t *testing.T) {
 	svc, _ := newTestService(t)
 
 	sess := newSession(svc, 1, testParams)
-	_, ok := svc.discoveryEngine.Read(sess.subject())
+	_, ok := svc.discoverySupervisor.Read(sess.subject())
 	require.False(t, ok, "nothing sweeps for a session that has not started")
 
 	require.NoError(t, sess.start())
-	_, ok = svc.discoveryEngine.Read(sess.subject())
+	_, ok = svc.discoverySupervisor.Read(sess.subject())
 	assert.True(t, ok, "start adds the cache's subject")
 
 	sess.close()
-	_, ok = svc.discoveryEngine.Read(sess.subject())
+	_, ok = svc.discoverySupervisor.Read(sess.subject())
 	assert.False(t, ok, "close drops it again")
 }
 

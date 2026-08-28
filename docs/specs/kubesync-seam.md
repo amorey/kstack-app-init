@@ -131,15 +131,15 @@ func (s *Service) ForgetDiscovery(cacheID int64)
 func (s *Service) TrackKind(cacheID int64, k kubestore.Kind)
 func (s *Service) ForgetKind(cacheID int64, k kubestore.Kind)
 
-// The engine's bookkeeping, aliased rather than copied so an Observation carries exactly what it
+// The supervisor's bookkeeping, aliased rather than copied so an Observation carries exactly what it
 // recorded — the same aliases kubeconn declares, for the same reason. Reason stays this package's
-// vocabulary; the engine treats it as opaque.
+// vocabulary; the supervisor treats it as opaque.
 type (
-	Observation[T any] = probe.Observation[T]
-	Attempt            = probe.Attempt
-	Attempts           = probe.Attempts
-	Verdict            = probe.Verdict
-	Reason             = probe.Reason
+	Observation[T any] = supervisor.Observation[T]
+	Attempt            = supervisor.Attempt
+	Attempts           = supervisor.Attempts
+	Verdict            = supervisor.Verdict
+	Reason             = supervisor.Reason
 )
 
 // DiscoveryState is the sweep's standing answer for one cache: a verdict, and the three reads
@@ -150,9 +150,9 @@ type (
 // how discovery is DOING.
 //
 // Each read is accounted for on its own, so one failing says so without dragging the others'
-// verdict with it, and Observation carries the engine's own record — the last attempt's verdict,
+// verdict with it, and Observation carries the supervisor's own record — the last attempt's verdict,
 // reason and message, the next attempt, the failure streak — so nothing here restates it.
-// (Attempts.InFlight() reads false until the engine publishes when a run BEGINS rather than only
+// (Attempts.InFlight() reads false until the supervisor publishes when a run BEGINS rather than only
 // after a pass: the gap TODO.md records against clusterScheduleWatch.probing.)
 //
 // The fan-out's legs get no field of their own: they are discovered at runtime and differ per
@@ -455,22 +455,22 @@ session's life, a discovery loop, and a worker per kind.
 - **The identity gate is the session's too**, but the two kinds of worker wait differently. A kind
   worker holds its own goroutine, so it blocks on `kubeconn.AwaitConnFor(ServerUID)`, reporting
   each refusal as its own `NoConnection`/`IdentityMismatch` while it waits. Discovery
-  runs on the probe engine, where a run holds an engine worker and `AwaitConnFor` is documented as
+  runs on the supervisor, where a run holds a supervisor worker and `AwaitConnFor` is documented as
   never to be called — so it commits `NoConnection`, returns `Suspend`, and is woken by the
   connection bridge.
-- **Discovery runs on `internal/probe`** — three probes over a per-cache subject, `kubeconn`'s
+- **Discovery runs on `internal/supervisor`** — three probes over a per-cache subject, `kubeconn`'s
   shape, since both are periodic pulls whose answers are values. `apiVersions` reads `/api`,
   `apiGroups` reads `/apis`, and `resources` fans out over the group list on a data edge from
   `apiGroups`, so a group list that will not load leaves the fan-out `Skip`ped rather than failing
-  it. The engine owns each one's cadence and backoff ladder and the `Wake` the store bus below
+  it. The supervisor owns each one's cadence and backoff ladder and the `Wake` the store bus below
   turns into a prompt re-run; `DiscoveryState` is projected from the snapshot, so the seam stays
-  this package's vocabulary rather than the engine's. The kind mirrors run on a second engine
+  this package's vocabulary rather than the supervisor's. The kind mirrors run on a second supervisor
   over per-kind subjects — a run establishes the stream and commits it as the probe's value,
   rather than being the stream. → [The mirror on the probe
-  engine](kubesync-mirror-on-probe-engine.md).
+  supervisor](kubesync-mirror-on-supervisor.md).
 - **Discovery is a probe whose collection cannot be watched.** `/api` and `/apis` are plain GETs
   with no resourceVersion and no watch verb, so the sweep is a cold list with no watch phase, and
-  it re-lists on the engine's cadence where a kind's worker would go live. `SyncKinds` reconciles its answer
+  it re-lists on the supervisor's cadence where a kind's worker would go live. `SyncKinds` reconciles its answer
   by fingerprint and prune, as a relist does by mark and sweep — and the sweep **skips the write
   when its fingerprint matches the stored one**, since the call is a delete plus an upsert per row,
   six hundred statements for a large catalog, in one transaction against the single writer every
@@ -580,7 +580,7 @@ Each step is one red/green cycle and one commit.
    the open item above resolves to.
 
 Steps 1–3 are `kubesync` alone and land before anything consumes them. Between 3 and 4, [the
-mirror moves onto the probe engine](kubesync-mirror-on-probe-engine.md), which changes step 3's
+mirror moves onto the supervisor](kubesync-mirror-on-supervisor.md), which changes step 3's
 internals and nothing on the seam.
 
 ## Not in this pass

@@ -15,8 +15,8 @@
 // Package kubeconn hands out leases on kube-contexts and reports what probing the server behind
 // one found.
 //
-// The probes live in probe.go and the scheduling around them is the probe engine's
-// (internal/probe). This file is the rest: leases, publishing what the engine observes, and
+// The probes live in probe.go and the scheduling around them is the supervisor's
+// (internal/supervisor). This file is the rest: leases, publishing what the supervisor observes, and
 // retiring the connections its runs build.
 //
 // Three rules shape it:
@@ -43,7 +43,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
 // kubeconfigService is the reader this package asks whether a context still resolves, and which
@@ -121,7 +121,7 @@ type Lease interface {
 //
 // A free function rather than a Lease method, so nothing implementing that interface — every
 // caller's fake included — can get the attach ordering wrong. **Never called from a probe Run:**
-// it blocks, and a run holds an engine worker.
+// it blocks, and a run holds a supervisor worker.
 func AwaitConnFor(ctx context.Context, l Lease, serverUID string, refused func(error)) (*Connection, error) {
 	// Attached before the first check, never after: a stamp landing in the gap between the two
 	// is one the waiter would sleep through, and the next pass that would report it is a
@@ -143,13 +143,13 @@ func AwaitConnFor(ctx context.Context, l Lease, serverUID string, refused func(e
 	}
 }
 
-// Service is the pool the cluster service leases contexts from. The probe engine tracks one
+// Service is the pool the cluster service leases contexts from. The supervisor tracks one
 // subject per claimed context; this type owns who holds the claims and what the fleet is told.
 type Service struct {
 	kubecfgSvc kubeconfigService
-	// engine runs the five probes of probe.go over the claimed contexts; probes is what
+	// supervisor runs the five probes of probe.go over the claimed contexts; probes is what
 	// registering them returned.
-	engine *probe.Engine
+	supervisor *supervisor.Supervisor
 	// signalHub names the contexts whose news changed; stateHub carries what the probes read.
 	// Both keyed by context, both fed by publish.
 	signalHub *conflate.Hub[string, struct{}]
@@ -159,7 +159,7 @@ type Service struct {
 	// who still holds the claim, and nothing may see one without the other.
 	mu sync.Mutex
 	// claimed holds one entry per claimed context — a key is here exactly while someone holds
-	// that context, mirrored by a subject in the engine — and is also the key both hubs
+	// that context, mirrored by a subject in the supervisor — and is also the key both hubs
 	// publish under.
 	claimed map[string]*entry
 	// published is the news the fleet was last told per context, compared against so a pass
@@ -173,9 +173,9 @@ type Service struct {
 // context on purpose: a claim carries the entry it was given, which is what stops a release that
 // outlived Close from touching whatever claims the name next.
 //
-// The connection is here as well as in the engine's observable because the two answer different
-// questions: the engine's copy is what a run reads and what Conn hands out, and this one is who
-// to retire when the entry goes — an engine a Remove has already emptied can name nobody.
+// The connection is here as well as in the supervisor's observable because the two answer different
+// questions: the supervisor's copy is what a run reads and what Conn hands out, and this one is who
+// to retire when the entry goes — a supervisor a Remove has already emptied can name nobody.
 type entry struct {
 	holders int
 	conn    *Connection
@@ -190,14 +190,14 @@ func New(kubecfgSvc kubeconfigService) *Service {
 
 	s := &Service{
 		kubecfgSvc: kubecfgSvc,
-		engine:     probe.New(),
+		supervisor: supervisor.New(),
 		signalHub:  conflate.New[string, struct{}](),
 		stateHub:   watch.New[string, State](),
 		claimed:    map[string]*entry{},
 		published:  map[string]news{},
 	}
-	registerProbes(s.engine, kubecfgSvc)
-	s.engine.OnPass(s.publish)
+	registerProbes(s.supervisor, kubecfgSvc)
+	s.supervisor.OnPass(s.publish)
 	return s
 }
 
@@ -205,7 +205,7 @@ func New(kubecfgSvc kubeconfigService) *Service {
 // context the kubeconfig does not name yet is claimable, because the file may name it later and
 // the claim is how the holder finds out.
 //
-// The first holder adds the context to the engine, whose first pass dispatches the connection
+// The first holder adds the context to the supervisor, whose first pass dispatches the connection
 // probe — not work to do on the caller's thread. A later holder joins what the probes found.
 func (s *Service) Acquire(contextName string) Lease {
 	s.mu.Lock()
@@ -218,7 +218,7 @@ func (s *Service) Acquire(contextName string) Lease {
 	s.mu.Unlock()
 
 	if !held {
-		s.engine.Add(contextName)
+		s.supervisor.Add(contextName)
 	}
 	return &claim{svc: s, contextName: contextName, entry: e}
 }
@@ -234,18 +234,18 @@ func (s *Service) Acquire(contextName string) Lease {
 // A context nobody claims is untracked and this does nothing. Nothing to report either way: what
 // the re-probe finds reaches watchers the way every other pass does.
 func (s *Service) Retry(contextName string) {
-	s.engine.Wake(contextName, probeNames[:]...)
+	s.supervisor.Wake(contextName, probeNames[:]...)
 }
 
 // Subscribe reports every context whose news changed, for a reader whose reaction to any of them
 // is the same. A holder that cares about one claim watches that claim instead.
 func (s *Service) Subscribe() Subscription { return s.signalHub.Receiver() }
 
-// Start runs the engine and the kubeconfig watch. The kubeconfig subscription is taken before
-// Start returns, so nothing it says in between is dropped; the engine's queues need no such
+// Start runs the supervisor and the kubeconfig watch. The kubeconfig subscription is taken before
+// Start returns, so nothing it says in between is dropped; the supervisor's queues need no such
 // care, since they hold what a claim taken before Start asked for until its workers run.
 func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
-	stopEngine := s.engine.Start(ctx)
+	stopEngine := s.supervisor.Start(ctx)
 
 	// Not Start's context, which bounds startup: this one bounds the watch, so it lives until
 	// the stop func cancels it.
@@ -263,7 +263,7 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 	}, nil
 }
 
-// Close drops what the pool holds, the engine's subjects included. Claims are not released for
+// Close drops what the pool holds, the supervisor's subjects included. Claims are not released for
 // their holders: a claim outliving the pool is the holder's bug, and reading as nothing known is
 // what a dropped entry already does.
 func (s *Service) Close() error {
@@ -273,10 +273,10 @@ func (s *Service) Close() error {
 		if e.conn != nil {
 			dropped = append(dropped, e.conn)
 		}
-		// The engine's copy too, and before it is closed: a pass whose commit landed while
+		// The supervisor's copy too, and before it is closed: a pass whose commit landed while
 		// the pass worker was already stopped left the connection it built there and nowhere
 		// else. Retiring is idempotent, so the usual case retires the same one twice.
-		if v, tracked := s.engine.Read(contextName); tracked {
+		if v, tracked := s.supervisor.Read(contextName); tracked {
 			if conn := keyConnection.From(v).Value.conn; conn != nil {
 				dropped = append(dropped, conn)
 			}
@@ -286,7 +286,7 @@ func (s *Service) Close() error {
 	clear(s.published)
 	s.mu.Unlock()
 
-	err := s.engine.Close()
+	err := s.supervisor.Close()
 	for _, conn := range dropped {
 		conn.Retire()
 	}
@@ -309,15 +309,15 @@ func (s *Service) watchKubeconfig(ctx context.Context, cfgs kubeconfig.Subscript
 			if !ok {
 				return
 			}
-			s.engine.WakeAll(nameConnection)
+			s.supervisor.WakeAll(nameConnection)
 		}
 	}
 }
 
-// publish is the engine's OnPass: project the pass into State, tell the claim watchers, and
-// signal the fleet when the news moved. The engine serializes it per context, and the order
+// publish is the supervisor's OnPass: project the pass into State, tell the claim watchers, and
+// signal the fleet when the news moved. The supervisor serializes it per context, and the order
 // holds — a reader the signal wakes finds the state already published.
-func (s *Service) publish(contextName string, v probe.Snapshot) {
+func (s *Service) publish(contextName string, v supervisor.Snapshot) {
 	st := s.stateOf(v)
 	n := s.newsOf(v, st)
 
@@ -349,7 +349,7 @@ func (s *Service) publish(contextName string, v probe.Snapshot) {
 		// resolving does. Recording the conflict empties `news.vouchedFor`, so the edge lands
 		// on exactly the pass that records it, and the probe's interval is the backstop.
 		if conn != nil && conn.conflicted() {
-			s.engine.Wake(contextName, nameConnection)
+			s.supervisor.Wake(contextName, nameConnection)
 		}
 	}
 }
@@ -406,7 +406,7 @@ type news struct {
 	ok         [len(probeNames)]bool
 }
 
-func (s *Service) newsOf(v probe.Snapshot, st State) news {
+func (s *Service) newsOf(v supervisor.Snapshot, st State) news {
 	ci := keyConnection.From(v).Value
 	n := news{
 		departed: ci.departed,
@@ -423,16 +423,16 @@ func (s *Service) newsOf(v probe.Snapshot, st State) news {
 	return n
 }
 
-// stateOf projects the engine's observables into State. The connection's observable bundles the
+// stateOf projects the supervisor's observables into State. The connection's observable bundles the
 // context's standing with the endpoint; only the endpoint is the answer State carries.
-func (s *Service) stateOf(v probe.Snapshot) State {
+func (s *Service) stateOf(v supervisor.Snapshot) State {
 	ci := keyConnection.From(v)
 	return State{
 		Connection:    Observation[string]{Value: ci.Value.endpoint, LastSeen: ci.LastSeen, Attempts: ci.Attempts},
-		Readiness:     probe.Get[ComponentStatus](v, nameReadiness),
-		ServerUID:     probe.Get[string](v, nameServerUID),
-		ServerVersion: probe.Get[VersionInfo](v, nameServerVersion),
-		Principal:     probe.Get[Principal](v, namePrincipal),
+		Readiness:     supervisor.Get[ComponentStatus](v, nameReadiness),
+		ServerUID:     supervisor.Get[string](v, nameServerUID),
+		ServerVersion: supervisor.Get[VersionInfo](v, nameServerVersion),
+		Principal:     supervisor.Get[Principal](v, namePrincipal),
 	}
 }
 
@@ -495,15 +495,15 @@ func (c *claim) Departed() bool {
 	return keyConnection.From(v).Value.departed
 }
 
-// read answers a claim from the engine, for the entry the claim was made for. Once the pool no
+// read answers a claim from the supervisor, for the entry the claim was made for. Once the pool no
 // longer holds that entry — released, or dropped by Close — nothing is known, which a claim
 // reads as departed with no connection.
 //
-// The identity check comes after the engine read: the last holder can release and another
+// The identity check comes after the supervisor read: the last holder can release and another
 // caller re-claim the name mid-read, and the state that came back is then the new claim's — the
 // check catches it, where one taken before the read would not.
-func (s *Service) read(contextName string, held *entry) (probe.Snapshot, bool) {
-	v, tracked := s.engine.Read(contextName)
+func (s *Service) read(contextName string, held *entry) (supervisor.Snapshot, bool) {
+	v, tracked := s.supervisor.Read(contextName)
 
 	s.mu.Lock()
 	valid := s.claimed[contextName] == held
@@ -523,7 +523,7 @@ func (c *claim) WatchState() StateSubscription {
 	return c.svc.stateHub.Watch(c.contextName)
 }
 
-// Release gives the claim back, dropping the entry — and the engine's subject with it — once
+// Release gives the claim back, dropping the entry — and the supervisor's subject with it — once
 // the last holder goes: an entry nobody holds is one nothing probes. The CAS makes it
 // idempotent while other holders remain, when the entry check below cannot tell a second
 // release from a first.
@@ -549,7 +549,7 @@ func (c *claim) Release() {
 		delete(s.published, c.contextName)
 		// Under the lock, so a release racing a fresh Acquire of the same name cannot remove
 		// the subject the new claim just added.
-		s.engine.Remove(c.contextName)
+		s.supervisor.Remove(c.contextName)
 	}
 	s.mu.Unlock()
 

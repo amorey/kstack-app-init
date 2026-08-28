@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package probe
+package supervisor
 
 import (
 	"context"
@@ -29,7 +29,7 @@ import (
 // subj is the one subject most tests track.
 const subj = "ctx-1"
 
-// steered is a probe the test steers: the result is swapped at will, runs are counted, and an
+// steered is a reconciler the test steers: the result is swapped at will, runs are counted, and an
 // optional hook fires inside the run — which is how a test interleaves a Remove or a Wake with
 // a run in flight.
 type steered struct {
@@ -41,7 +41,7 @@ type steered struct {
 	sawDeadline bool
 }
 
-func (p *steered) Run(ctx context.Context, pass *Pass[string]) Result {
+func (p *steered) Reconcile(ctx context.Context, pass *Pass[string]) Result {
 	p.mu.Lock()
 	p.runs++
 	_, p.sawDeadline = ctx.Deadline()
@@ -60,13 +60,15 @@ func (p *steered) Run(ctx context.Context, pass *Pass[string]) Result {
 func (p *steered) set(res Result) { p.mu.Lock(); defer p.mu.Unlock(); p.res = res }
 func (p *steered) count() int     { p.mu.Lock(); defer p.mu.Unlock(); return p.runs }
 
-// probeFunc adapts a bare func for a test that needs a one-off body.
-type probeFunc func(ctx context.Context, pass *Pass[string]) Result
+// reconcilerFunc adapts a bare func for a test that needs a one-off body.
+type reconcilerFunc func(ctx context.Context, pass *Pass[string]) Result
 
-func (f probeFunc) Run(ctx context.Context, pass *Pass[string]) Result { return f(ctx, pass) }
+func (f reconcilerFunc) Reconcile(ctx context.Context, pass *Pass[string]) Result {
+	return f(ctx, pass)
+}
 
-// single is an engine with one steered probe, closed on cleanup.
-func single(t *testing.T, res Result, opts ...ProbeOption) (*Engine, *steered, string) {
+// single is an supervisor with one steered reconciler, closed on cleanup.
+func single(t *testing.T, res Result, opts ...ReconcilerOption) (*Supervisor, *steered, string) {
 	t.Helper()
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
@@ -75,8 +77,8 @@ func single(t *testing.T, res Result, opts ...ProbeOption) (*Engine, *steered, s
 	return e, p, "conn"
 }
 
-// pair is single plus a probe requiring the first.
-func pair(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aName, bName string) {
+// pair is single plus a reconciler requiring the first.
+func pair(t *testing.T, aRes, bRes Result) (e *Supervisor, a, b *steered, aName, bName string) {
 	t.Helper()
 	e = New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
@@ -88,7 +90,7 @@ func pair(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aName, bNa
 
 // linked is a pair where the second declares both edges on the first — the shape kubeconn's
 // watchers have, and the only one where a value change and a health gate are both in play.
-func linked(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aName, bName string) {
+func linked(t *testing.T, aRes, bRes Result) (e *Supervisor, a, b *steered, aName, bName string) {
 	t.Helper()
 	e = New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
@@ -98,7 +100,7 @@ func linked(t *testing.T, aRes, bRes Result) (e *Engine, a, b *steered, aName, b
 	return e, a, b, "conn", "uid"
 }
 
-// commits makes the body hand back v, which the engine reads as "the value moved".
+// commits makes the body hand back v, which the supervisor reads as "the value moved".
 func (p *steered) commits(v string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -112,9 +114,9 @@ func (p *steered) commitsNothing() {
 	p.next = nil
 }
 
-// settled runs both probes of a linked pair to a succeeded rest, so what follows is measured
-// against two probes parked on their intervals rather than against a fresh subject's first pass.
-func settled(t *testing.T, e *Engine) {
+// settled runs both reconcilers of a linked pair to a succeeded rest, so what follows is measured
+// against two reconcilers parked on their intervals rather than against a fresh subject's first pass.
+func settled(t *testing.T, e *Supervisor) {
 	t.Helper()
 	e.Add(subj)
 	e.settle()
@@ -134,7 +136,7 @@ func within(t *testing.T) context.Context {
 
 // settle runs every pass currently queued, on the test's goroutine — where passLoop would pick
 // them up.
-func (e *Engine) settle() {
+func (e *Supervisor) settle() {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Next takes what is queued and reports rather than waiting for more.
 
@@ -150,18 +152,18 @@ func (e *Engine) settle() {
 
 // runNext takes the next due run and executes it the way a worker would, then settles the pass
 // it asked for. All on the test's goroutine, so assertions read settled state.
-func runNext(t *testing.T, e *Engine) key {
+func runNext(t *testing.T, e *Supervisor) key {
 	t.Helper()
 	k, ok := e.runQ.Next(within(t))
 	require.True(t, ok, "the run queue closed")
-	e.runProbe(t.Context(), k)
+	e.runReconciler(t.Context(), k)
 	e.runQ.Done(k)
 	e.settle()
 	return k
 }
 
 // takeRun pops one due run without executing it, giving the key back.
-func takeRun(t *testing.T, e *Engine) key {
+func takeRun(t *testing.T, e *Supervisor) key {
 	t.Helper()
 	k, ok := e.runQ.Next(within(t))
 	require.True(t, ok, "the run queue closed")
@@ -171,7 +173,7 @@ func takeRun(t *testing.T, e *Engine) key {
 
 // drainRuns empties the run queue, so a following negative assertion answers to what the test
 // did rather than to what the subject already owed.
-func drainRuns(t *testing.T, e *Engine) {
+func drainRuns(t *testing.T, e *Supervisor) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Next takes what is queued and reports rather than waiting for more.
@@ -186,7 +188,7 @@ func drainRuns(t *testing.T, e *Engine) {
 
 // noRuns is a negative assertion, so it needs a bounded window rather than the failsafe: it
 // fails the instant a run is handed out.
-func noRuns(t *testing.T, e *Engine, msg string) {
+func noRuns(t *testing.T, e *Supervisor, msg string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
@@ -196,21 +198,21 @@ func noRuns(t *testing.T, e *Engine, msg string) {
 	}
 }
 
-// keyOf is the run-queue key for a probe the test names, which is what the queue is keyed by
+// keyOf is the run-queue key for a reconciler the test names, which is what the queue is keyed by
 // even though a name is what a caller addresses.
-func keyOf(e *Engine, name string) key {
-	return key{subject: subj, probe: e.byName[name]}
+func keyOf(e *Supervisor, name string) key {
+	return key{subject: subj, reconciler: e.byName[name]}
 }
 
-// att reads one probe's attempts through Read.
-func att(t *testing.T, e *Engine, name string) Attempts {
+// att reads one reconciler's attempts through Read.
+func att(t *testing.T, e *Supervisor, name string) Attempts {
 	t.Helper()
 	v, ok := e.Read(subj)
 	require.True(t, ok, "subject not tracked")
 	return v.Attempts(name)
 }
 
-func startEngine(t *testing.T, e *Engine) {
+func startSupervisor(t *testing.T, e *Supervisor) {
 	t.Helper()
 	stop := e.Start(t.Context())
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
@@ -229,36 +231,36 @@ func TestBackoffClimbsToItsCap(t *testing.T) {
 
 // --- registration ---
 
-// The engine's own knobs are options too, and a New that states none takes the defaults.
+// The supervisor's own knobs are options too, and a New that states none takes the defaults.
 func TestWithWorkersSetsTheRunWorkerCount(t *testing.T) {
 	assert.Equal(t, 3, New(WithWorkers(3)).settings.workers)
 	assert.Positive(t, New().settings.workers, "a default fleet")
 }
 
 // Register needs something to run, and something to call it.
-func TestRegisterPanicsWithoutAProbeOrAName(t *testing.T) {
+func TestRegisterPanicsWithoutAReconcilerOrAName(t *testing.T) {
 	e := New()
 
 	assert.Panics(t, func() { Register[string](e, "conn", nil) })
 	assert.Panics(t, func() { Register(e, "", &steered{}) })
 }
 
-// OnPass is wiring, set before the engine runs — like a registration.
+// OnPass is wiring, set before the supervisor runs — like a registration.
 func TestOnPassPanicsAfterStart(t *testing.T) {
 	e, _, _ := single(t, Skip())
-	startEngine(t, e)
+	startSupervisor(t, e)
 
 	assert.Panics(t, func() { e.OnPass(func(string, Snapshot) {}) })
 }
 
-// A probe's public identity is its name; the index behind it is the engine's own.
-func TestRegisterResolvesAnEdgeToTheProbeItNames(t *testing.T) {
+// A reconciler's public identity is its name; the index behind it is the supervisor's own.
+func TestRegisterResolvesAnEdgeToTheReconcilerItNames(t *testing.T) {
 	e, _, a := single(t, Skip())
 	Register(e, "uid", &steered{}, WithDependencies(a))
 
 	assert.Equal(t, "uid", e.specs[1].name)
-	assert.Equal(t, []probeID{0}, e.specs[1].dependencies)
-	assert.Equal(t, probeID(1), e.byName["uid"])
+	assert.Equal(t, []reconcilerID{0}, e.specs[1].dependencies)
+	assert.Equal(t, reconcilerID(1), e.byName["uid"])
 }
 
 func TestRegisterPanicsOnADuplicateName(t *testing.T) {
@@ -287,12 +289,12 @@ func TestRegistrationDefaultsWhatItDoesNotState(t *testing.T) {
 
 func TestRegisterPanicsAfterStart(t *testing.T) {
 	e, p, _ := single(t, Skip())
-	startEngine(t, e)
+	startSupervisor(t, e)
 
 	assert.Panics(t, func() { Register(e, "late", p) })
 }
 
-// A subject's bookkeeping is sized when it is added, so the probe set must be complete first.
+// A subject's bookkeeping is sized when it is added, so the reconciler set must be complete first.
 func TestRegisterPanicsAfterAdd(t *testing.T) {
 	e, p, _ := single(t, Skip())
 	e.Add(subj)
@@ -309,13 +311,13 @@ func TestASubjectNothingTracksIsANoOpEverywhere(t *testing.T) {
 
 	e.Remove("never-added")
 	e.pass("never-added")
-	e.runProbe(t.Context(), key{subject: "never-added"})
+	e.runReconciler(t.Context(), key{subject: "never-added"})
 
 	assert.Zero(t, p.count(), "a run was dispatched against a subject nothing tracks")
 	noRuns(t, e, "a pass over a subject nothing tracks queued work")
 }
 
-// A fresh subject owes exactly its runnable probes: the dependent waits on an answer, and a
+// A fresh subject owes exactly its runnable reconcilers: the dependent waits on an answer, and a
 // second Add of the same name asks for nothing.
 func TestAddQueuesWhatAFreshSubjectOwes(t *testing.T) {
 	e, _, _, aID, _ := pair(t, Skip(), Skip())
@@ -324,7 +326,7 @@ func TestAddQueuesWhatAFreshSubjectOwes(t *testing.T) {
 	e.settle()
 
 	assert.Equal(t, keyOf(e, aID), takeRun(t, e))
-	noRuns(t, e, "more than the connection probe was queued")
+	noRuns(t, e, "more than the connection reconciler was queued")
 
 	e.Add(subj)
 	e.settle()
@@ -335,13 +337,13 @@ func TestWorkQueuedBeforeStartIsServedOnceItRuns(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	ran := testutil.NewProbe[struct{}](1)
-	Register(e, "conn", probeFunc(func(context.Context, *Pass[string]) Result {
+	Register(e, "conn", reconcilerFunc(func(context.Context, *Pass[string]) Result {
 		ran.Fire(struct{}{})
 		return Suspend("Resolved", "")
 	}))
 	e.Add(subj)
 
-	startEngine(t, e)
+	startSupervisor(t, e)
 
 	ran.Await(t, "the run a pre-Start Add asked for")
 }
@@ -383,7 +385,7 @@ func TestARunAgainstARemovedSubjectCommitsNothing(t *testing.T) {
 
 // A name nothing was registered under is a wiring bug; a subject nothing tracks is not, since a
 // claim can be released while a wake for it is in flight.
-func TestWakeIgnoresAnUntrackedSubjectAndPanicsOnAnUnknownProbe(t *testing.T) {
+func TestWakeIgnoresAnUntrackedSubjectAndPanicsOnAnUnknownReconciler(t *testing.T) {
 	e, _, id := single(t, Succeeded())
 	e.Add(subj)
 	e.settle()
@@ -415,12 +417,12 @@ func TestAWakeMidRunEarnsAFreshRun(t *testing.T) {
 }
 
 // A Wake overrides suspension — it is the one input the derivation cannot produce.
-func TestAWakeRunsASuspendedProbe(t *testing.T) {
+func TestAWakeRunsASuspendedReconciler(t *testing.T) {
 	e, _, id := single(t, Suspend("ContextNotFound", ""))
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
-	noRuns(t, e, "a suspended probe was scheduled")
+	noRuns(t, e, "a suspended reconciler was scheduled")
 
 	e.Wake(subj, id)
 
@@ -459,11 +461,11 @@ func TestARunInFlightIsLeftAlone(t *testing.T) {
 
 	a := att(t, e, id)
 	assert.Equal(t, runAt, a.NextAttempt.StartedAt, "the pass wrote over the run in flight")
-	noRuns(t, e, "a second run of a probe already out")
+	noRuns(t, e, "a second run of a reconciler already out")
 }
 
 // The success-path poll is the default; Suspend is the only opt-out.
-func TestASucceededProbeIsDueAgainAfterItsInterval(t *testing.T) {
+func TestASucceededReconcilerIsDueAgainAfterItsInterval(t *testing.T) {
 	e, _, id := single(t, Succeeded(), WithInterval(250*time.Millisecond))
 	e.Add(subj)
 	e.settle()
@@ -503,7 +505,7 @@ func TestASucceededRunCannotAskToComeBackLater(t *testing.T) {
 
 // The ladder widens per consecutive failure and holds at the cap — and it is a pure function of
 // Failures, so a later pass derives the same ScheduledAt it derived before.
-func TestAFailedProbeClimbsTheLadder(t *testing.T) {
+func TestAFailedReconcilerClimbsTheLadder(t *testing.T) {
 	e, _, id := single(t, Fail("Unreachable", assert.AnError),
 		WithBackoff(10*time.Millisecond, 2, 40*time.Millisecond))
 	e.Add(subj)
@@ -526,7 +528,7 @@ func TestAFailedProbeClimbsTheLadder(t *testing.T) {
 }
 
 // Skip leaves no record — the previous answer stands — and nothing scheduled: only a Wake
-// brings the probe back, so an unreadable source does not become a busy loop.
+// brings the reconciler back, so an unreadable source does not become a busy loop.
 func TestASkipLeavesNoRecordAndNothingScheduled(t *testing.T) {
 	e, p, id := single(t, Fail("ResolveFailed", assert.AnError))
 	e.Add(subj)
@@ -542,10 +544,10 @@ func TestASkipLeavesNoRecordAndNothingScheduled(t *testing.T) {
 	a := att(t, e, id)
 	assert.Equal(t, failed, a.LastAttempt, "a Skip must leave the last record standing")
 	assert.False(t, a.Scheduled())
-	noRuns(t, e, "a skipped probe was re-dispatched")
+	noRuns(t, e, "a skipped reconciler was re-dispatched")
 }
 
-// The timer only brings the pass back; the pass decides again per probe.
+// The timer only brings the pass back; the pass decides again per reconciler.
 func TestTheTimerIsAWakeNotACadence(t *testing.T) {
 	e, _, _ := single(t, Fail("Unreachable", assert.AnError),
 		WithBackoff(time.Millisecond, 2, 2*time.Millisecond))
@@ -576,7 +578,7 @@ func TestADependentIsUntouchedBeforeItsDependenciesAnswer(t *testing.T) {
 }
 
 // One run records DependencyFailed — never dialed, so no StartedAt — and the rest of the outage
-// costs nothing: one timeout per cycle, not one per probe.
+// costs nothing: one timeout per cycle, not one per reconciler.
 func TestADependentRecordsDependencyFailedOnceThenSuspends(t *testing.T) {
 	e, _, bBody, aID, bID := pair(t, Fail("Unreachable", assert.AnError), Succeeded())
 	e.Add(subj)
@@ -622,7 +624,7 @@ func TestDependenciesAreRecheckedAtDispatch(t *testing.T) {
 	runNext(t, e) // connection succeeds; the dependent is now queued
 
 	aBody.set(Fail("Unreachable", assert.AnError))
-	e.runProbe(t.Context(), keyOf(e, aID)) // the connection dies before b dispatches
+	e.runReconciler(t.Context(), keyOf(e, aID)) // the connection dies before b dispatches
 	e.settle()
 	require.Equal(t, keyOf(e, bID), runNext(t, e))
 
@@ -630,7 +632,7 @@ func TestDependenciesAreRecheckedAtDispatch(t *testing.T) {
 	assert.Equal(t, ReasonDependencyFailed, att(t, e, bID).LastAttempt.Reason)
 }
 
-// A wake can outrun the pass and dispatch a probe whose dependency has never answered. The run
+// A wake can outrun the pass and dispatch a reconciler whose dependency has never answered. The run
 // ends as a no-op — nothing to say about a server nobody has tried — and the pass owns the
 // question again.
 func TestARunDispatchedBeforeItsDependencyAnsweredRecordsNothing(t *testing.T) {
@@ -644,7 +646,7 @@ func TestARunDispatchedBeforeItsDependencyAnsweredRecordsNothing(t *testing.T) {
 
 	assert.Zero(t, b.count(), "the body ran with nothing to run over")
 	at := att(t, e, bName)
-	assert.False(t, at.LastAttempt.Done(), "an untouched probe records nothing")
+	assert.False(t, at.LastAttempt.Done(), "an untouched reconciler records nothing")
 }
 
 // --- the data edge ---
@@ -663,7 +665,7 @@ func TestAChangedValueWakesAWatcher(t *testing.T) {
 	assert.Equal(t, keyOf(e, bID), takeRun(t, e))
 }
 
-// The engine never compares values — the body says whether its answer moved by committing or
+// The supervisor never compares values — the body says whether its answer moved by committing or
 // not. Without this the wake fires every cycle and the interval stops meaning anything.
 func TestACommitThatCarriedNoValueWakesNobody(t *testing.T) {
 	e, a, _, aID, _ := linked(t, Succeeded(), Succeeded())
@@ -678,7 +680,7 @@ func TestACommitThatCarriedNoValueWakesNobody(t *testing.T) {
 }
 
 // A wake goes through the run queue, so it overrides a suspension exactly as Wake does — which
-// is what re-asks a probe parked "for the life of the connection" when a new one arrives.
+// is what re-asks a reconciler parked "for the life of the connection" when a new one arrives.
 func TestAChangedValueWakesASuspendedWatcher(t *testing.T) {
 	e, a, _, aID, bID := linked(t, Succeeded(), Suspend("Unsupported", "no such endpoint"))
 	a.commits("v1")
@@ -692,7 +694,7 @@ func TestAChangedValueWakesASuspendedWatcher(t *testing.T) {
 	assert.Equal(t, keyOf(e, bID), takeRun(t, e))
 }
 
-// The data edge does not consult health: a probe declaring only a dependency must not be gated
+// The data edge does not consult health: a reconciler declaring only a dependency must not be gated
 // by health it never declared, so a failing run that learned something still wakes it.
 func TestAFailedRunThatChangedItsValueStillWakes(t *testing.T) {
 	e := New()
@@ -752,7 +754,7 @@ func TestRegisterPanicsOnAWatchNotYetRegistered(t *testing.T) {
 func TestARunCommitsTheLastValueItRecorded(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
+	Register(e, "conn", reconcilerFunc(func(_ context.Context, pass *Pass[string]) Result {
 		pass.Commit("v1")
 		pass.Commit("v2")
 		return Succeeded()
@@ -774,7 +776,7 @@ func TestARunCommitsTheLastValueItRecorded(t *testing.T) {
 func TestARunThatSkipsCommitsNothingItRecorded(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
+	Register(e, "conn", reconcilerFunc(func(_ context.Context, pass *Pass[string]) Result {
 		pass.Commit("v1")
 		return Skip()
 	}))
@@ -794,7 +796,7 @@ func TestARunThatSkipsCommitsNothingItRecorded(t *testing.T) {
 func TestAPanickingRunCommitsNothingItRecorded(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
+	Register(e, "conn", reconcilerFunc(func(_ context.Context, pass *Pass[string]) Result {
 		pass.Commit("v1")
 		panic("boom")
 	}))
@@ -812,12 +814,12 @@ func TestAPanickingRunCommitsNothingItRecorded(t *testing.T) {
 
 // --- failure containment ---
 
-// A panicking body must still produce a record and free its key — otherwise the probe reads as
+// A panicking body must still produce a record and free its key — otherwise the reconciler reads as
 // in flight forever and the key stays held in the queue.
 func TestAPanickingRunRecordsInternalAndFreesItsKey(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	Register(e, "conn", probeFunc(func(context.Context, *Pass[string]) Result {
+	Register(e, "conn", reconcilerFunc(func(context.Context, *Pass[string]) Result {
 		panic("boom")
 	}))
 	e.Add(subj)
@@ -835,7 +837,7 @@ func TestAPanickingRunRecordsInternalAndFreesItsKey(t *testing.T) {
 }
 
 // A body that hands back nothing is the same class of bug as one that panics, and is contained
-// the same way. Panicking over it would take the engine's lock down with the worker.
+// the same way. Panicking over it would take the supervisor's lock down with the worker.
 func TestARunThatReturnsNoResultIsRecordedAsInternal(t *testing.T) {
 	e, _, id := single(t, Result{})
 	e.Add(subj)
@@ -849,7 +851,7 @@ func TestARunThatReturnsNoResultIsRecordedAsInternal(t *testing.T) {
 	assert.False(t, a.InFlight())
 }
 
-// The engine deadlines the context it hands the run; the body classifies the expiry itself.
+// The supervisor deadlines the context it hands the run; the body classifies the expiry itself.
 func TestARunIsBoundedByItsTimeout(t *testing.T) {
 	e, p, _ := single(t, Succeeded(), WithTimeout(50*time.Millisecond))
 	e.Add(subj)
@@ -864,7 +866,7 @@ func TestARunIsBoundedByItsTimeout(t *testing.T) {
 
 // --- publishing ---
 
-// The engine reports every pass; the caller decides what is news.
+// The supervisor reports every pass; the caller decides what is news.
 func TestOnPassFiresAfterEveryPassInOrderPerSubject(t *testing.T) {
 	e, _, id := single(t, Succeeded())
 	var calls []Snapshot
@@ -973,7 +975,7 @@ func TestReadReportsAnUntrackedSubject(t *testing.T) {
 	o := Get[string](v, "conn")
 	assert.Equal(t, "uid-1", o.Value, "the run's committed value")
 	assert.True(t, o.OK())
-	assert.True(t, o.Known(), "the engine stamps when the value was read")
+	assert.True(t, o.Known(), "the supervisor stamps when the value was read")
 }
 
 // A run that hands back no value keeps the previous one: an Observation outlives the failure
@@ -1017,9 +1019,9 @@ func TestCloseStopsTheTimersAndTheQueues(t *testing.T) {
 	assert.False(t, ok, "the run queue outlived Close")
 }
 
-// --- values the engine drops ---
+// --- values the supervisor drops ---
 
-// discarding is a probe whose committed values it records when the engine hands them back.
+// discarding is a reconciler whose committed values it records when the supervisor hands them back.
 type discarding struct {
 	steered
 	discarded *testutil.Probe[string]
@@ -1030,15 +1032,15 @@ type discarding struct {
 
 func (p *discarding) Discard(v string) { p.discarded.Fire(v) }
 
-func (p *discarding) Run(ctx context.Context, pass *Pass[string]) Result {
+func (p *discarding) Reconcile(ctx context.Context, pass *Pass[string]) Result {
 	if p.panicAfterCommit != "" {
 		pass.Commit(p.panicAfterCommit)
-		panic("probe body bug")
+		panic("reconciler body bug")
 	}
-	return p.steered.Run(ctx, pass)
+	return p.steered.Reconcile(ctx, pass)
 }
 
-// A committed value can own something — a connection, a file — so a value the engine drops is
+// A committed value can own something — a connection, a file — so a value the supervisor drops is
 // handed back rather than dropped silently: nothing else can reach it to release it.
 func TestARefusedCommitIsHandedBack(t *testing.T) {
 	e := New()
@@ -1074,7 +1076,7 @@ func TestASkippedRunsValueIsHandedBack(t *testing.T) {
 	assert.Equal(t, "built", p.discarded.Await(t, "the skipped value"))
 }
 
-// A body that panics has still committed whatever it committed before it did, and the engine
+// A body that panics has still committed whatever it committed before it did, and the supervisor
 // applies none of it — so that value is handed back too, or a panic leaks what it built.
 func TestAPanickingRunsValueIsHandedBack(t *testing.T) {
 	e := New()
@@ -1090,7 +1092,7 @@ func TestAPanickingRunsValueIsHandedBack(t *testing.T) {
 	assert.Equal(t, "built", p.discarded.Await(t, "the panicking run's value"))
 }
 
-// The ordinary path: a value the engine applied is the probe's own to read back, and handing it
+// The ordinary path: a value the supervisor applied is the reconciler's own to read back, and handing it
 // back as dropped would have a caller release what is live.
 func TestAnAppliedValueIsNotHandedBack(t *testing.T) {
 	e := New()
@@ -1112,14 +1114,14 @@ func TestAnAppliedValueIsNotHandedBack(t *testing.T) {
 	assert.False(t, dropped, "an applied value is not a dropped one")
 }
 
-// The engine is what tells a body a value has landed, so a probe committing the zero T lands it
-// once and reads as known from then on — without which such a probe reports itself never
+// The supervisor is what tells a body a value has landed, so a reconciler committing the zero T lands it
+// once and reads as known from then on — without which such a reconciler reports itself never
 // observed for as long as its answer stays the zero value.
 func TestTheZeroValueLandsAndReadsAsKnown(t *testing.T) {
 	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	seen := testutil.NewProbe[bool](4)
-	Register(e, "conn", probeFunc(func(_ context.Context, pass *Pass[string]) Result {
+	Register(e, "conn", reconcilerFunc(func(_ context.Context, pass *Pass[string]) Result {
 		seen.Fire(pass.Known())
 		if !pass.Known() {
 			pass.Commit("")
@@ -1141,7 +1143,7 @@ func TestTheZeroValueLandsAndReadsAsKnown(t *testing.T) {
 
 // A run that failed can still have read something — which components are down — so the value it
 // commits is dated now. Dating it by the last success instead leaves a value nothing has ever
-// confirmed, and a probe that has only ever failed reads as never observed while holding the
+// confirmed, and a reconciler that has only ever failed reads as never observed while holding the
 // answer a caller came for.
 func TestAFailedRunsCommittedValueIsDated(t *testing.T) {
 	e, p, name := single(t, Fail("Unreachable", assert.AnError))

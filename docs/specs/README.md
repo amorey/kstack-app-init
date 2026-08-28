@@ -38,5 +38,6 @@ cache's rows back (→ [ADR](../adr/2026-08-26-cached-data-read-loop.md)), but n
 | Spec | Scope | Status |
 | --- | --- | --- |
 | [The kubesync seam](kubesync-seam.md) | sidecar | Steps 1–3 built |
-| [The mirror on the probe engine](kubesync-mirror-on-probe-engine.md) | sidecar | Planned — between the seam's steps 3 and 4 |
+| [The probe engine becomes the supervisor](supervisor-rename.md) | sidecar | Built — delete with this spec |
+| [The mirror on the supervisor](kubesync-mirror-on-supervisor.md) | sidecar | Planned — between the seam's steps 3 and 4 |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |

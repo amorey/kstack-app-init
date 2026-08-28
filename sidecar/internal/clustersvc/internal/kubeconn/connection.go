@@ -89,7 +89,7 @@ type Connection struct {
 	// serverUID is the cluster reached over THIS connection, recorded by the probe that read
 	// it. Unset until then, which reads as not identified — never as a match.
 	//
-	// Here rather than beside the connection in the engine's observable, because the probe
+	// Here rather than beside the connection in the supervisor's observable, because the probe
 	// that made the request is the only party that knows which connection the answer came
 	// over. Anything that pairs the two later is re-deriving it, and a connection replaced
 	// between the two commits pairs a new one with the old one's answer.

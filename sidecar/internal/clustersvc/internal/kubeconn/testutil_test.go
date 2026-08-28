@@ -25,7 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/rest"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -120,13 +120,13 @@ func (c *cluster) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h(w, r)
 }
 
-// runProbe runs one probe body against conn the way the engine would, and hands back what it
+// runProbe runs one probe body against conn the way the supervisor would, and hands back what it
 // recorded. prev is what the probe last committed, or nil for one that has committed nothing.
-func runProbe[T any](t *testing.T, p probe.Probe[T], conn *Connection, prev *T) (probe.Result, T, bool) {
+func runProbe[T any](t *testing.T, p supervisor.Reconciler[T], conn *Connection, prev *T) (supervisor.Result, T, bool) {
 	t.Helper()
-	snap := probe.NewSnapshot(map[string]any{nameConnection: connInfo{conn: conn}})
-	pass := probe.NewPass("prod", prev, snap)
-	res := p.Run(t.Context(), pass)
+	snap := supervisor.NewSnapshot(map[string]any{nameConnection: connInfo{conn: conn}})
+	pass := supervisor.NewPass("prod", prev, snap)
+	res := p.Reconcile(t.Context(), pass)
 	v, committed := pass.Updated()
 	return res, v, committed
 }

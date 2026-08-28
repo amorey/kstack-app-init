@@ -12,28 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// What a run concludes and what the engine records of it. Pure data — nothing here reaches the
+// What a run concludes and what the supervisor records of it. Pure data — nothing here reaches the
 // queues or the subjects.
-package probe
+package supervisor
 
 import "time"
 
-// Reason classifies a run in the caller's vocabulary, opaque to the engine but for the two
+// Reason classifies a run in the caller's vocabulary, opaque to the supervisor but for the two
 // constants below. A caller aliases this type and defines its own set.
 type Reason string
 
 const (
 	// ReasonSucceeded is stamped by Succeeded; a caller never passes it.
 	ReasonSucceeded Reason = "Succeeded"
-	// ReasonDependencyFailed is recorded by the engine when a probe's dependency is failing,
-	// in place of a run. See the dependency lifecycle on Engine.due.
+	// ReasonDependencyFailed is recorded by the supervisor when a reconciler's dependency is failing,
+	// in place of a run. See the dependency lifecycle on Supervisor.due.
 	ReasonDependencyFailed Reason = "DependencyFailed"
-	// ReasonInternal is a bug in a probe body, recorded by the engine when a run panics.
+	// ReasonInternal is a bug in a reconciler body, recorded by the supervisor when a run panics.
 	ReasonInternal Reason = "Internal"
 )
 
 // Verdict is how a finished run was classified, recorded on the Attempt because the schedule is
-// derived from it: the engine never interprets a caller's Reason.
+// derived from it: the supervisor never interprets a caller's Reason.
 type Verdict int
 
 const (
@@ -45,7 +45,7 @@ const (
 )
 
 // Result is what a run concluded: the record it leaves and the schedule it earns. Built by
-// Succeeded, Fail, Suspend, or Skip — the zero Result is invalid, and the engine records one as
+// Succeeded, Fail, Suspend, or Skip — the zero Result is invalid, and the supervisor records one as
 // an Internal failure, the same as a body that panicked.
 type Result struct {
 	kind         resultKind
@@ -64,7 +64,7 @@ const (
 	resultSkip               // record nothing
 )
 
-// Succeeded records success; the probe is due again after its interval.
+// Succeeded records success; the reconciler is due again after its interval.
 func Succeeded() Result {
 	return Result{kind: resultRecord, verdict: VerdictSucceeded, reason: ReasonSucceeded}
 }
@@ -72,9 +72,9 @@ func Succeeded() Result {
 // RequeueAfter asks for the next run sooner than the interval, for a wait this run knows the
 // length of — beehive's spelling one layer up, for the same kind of ask.
 //
-// **Unlike beehive's, it can only bring a run forward**: the engine takes it when it is positive
+// **Unlike beehive's, it can only bring a run forward**: the supervisor takes it when it is positive
 // and shorter than the registered interval, and ignores it otherwise. A registration is a
-// probe's cadence in a way a beehive resync is not — it is what bounds requests against someone
+// reconciler's cadence in a way a beehive resync is not — it is what bounds requests against someone
 // else's cluster — so no return path may push a subject past it. A zero is no ask rather than
 // "immediately", which would be a hot loop.
 //
@@ -85,7 +85,7 @@ func (r Result) RequeueAfter(d time.Duration) Result {
 	return r
 }
 
-// Fail records a failure; the probe is due again up the backoff ladder. Message defaults to the
+// Fail records a failure; the reconciler is due again up the backoff ladder. Message defaults to the
 // error's text.
 func Fail(reason Reason, err error) Result {
 	r := Result{kind: resultRecord, verdict: VerdictFailed, reason: reason, err: err}
@@ -95,19 +95,19 @@ func Fail(reason Reason, err error) Result {
 	return r
 }
 
-// Suspend records why and schedules nothing; a Wake is what brings the probe back. It ends a
+// Suspend records why and schedules nothing; a Wake is what brings the reconciler back. It ends a
 // failure streak — a suspension parks a question rather than failing at one.
 func Suspend(reason Reason, message string) Result {
 	return Result{kind: resultRecord, verdict: VerdictSuspended, reason: reason, message: message}
 }
 
-// Skip records nothing and schedules nothing; a Wake is what brings the probe back. For a run
+// Skip records nothing and schedules nothing; a Wake is what brings the reconciler back. For a run
 // that learned nothing usable — an unreadable source, a shutdown cancellation.
 func Skip() Result {
 	return Result{kind: resultSkip}
 }
 
-// The read side, for a probe body's own tests: what the body returned, without giving a body a
+// The read side, for a reconciler body's own tests: what the body returned, without giving a body a
 // way to build a Result the constructors cannot.
 func (r Result) Verdict() Verdict { return r.verdict }
 func (r Result) Reason() Reason   { return r.reason }
@@ -115,13 +115,13 @@ func (r Result) Message() string  { return r.message }
 func (r Result) Err() error       { return r.err }
 func (r Result) IsSkip() bool     { return r.kind == resultSkip }
 
-// Attempt is one run of one probe, from scheduled through finished. Its fields fill in that
+// Attempt is one run of one reconciler, from scheduled through finished. Its fields fill in that
 // order, so the same value describes a run at every stage of its life.
 type Attempt struct {
 	// ScheduledAt is when this run should start — the backoff ladder made visible, since
 	// successive values show the interval widening. StartedAt is when it did start, FinishedAt
 	// when it ended; both zero until they happen, and separate from ScheduledAt because a
-	// saturated engine lets a scheduled time slip into the past, which would otherwise read
+	// saturated supervisor lets a scheduled time slip into the past, which would otherwise read
 	// as running.
 	ScheduledAt time.Time
 	StartedAt   time.Time
@@ -154,7 +154,7 @@ func (a Attempt) Latency() time.Duration {
 	return a.FinishedAt.Sub(a.StartedAt)
 }
 
-// Attempts is one probe's bookkeeping for one subject. The engine owns every write; a caller
+// Attempts is one reconciler's bookkeeping for one subject. The supervisor owns every write; a caller
 // reads it out of a Snapshot, embedded in the Observation beside the value it accounts for.
 type Attempts struct {
 	// LastAttempt is the most recent run that finished; NextAttempt is the one that has not,
@@ -174,14 +174,14 @@ func (a Attempts) OK() bool { return a.LastAttempt.Verdict == VerdictSucceeded }
 // InFlight reports whether a run is under way.
 func (a Attempts) InFlight() bool { return a.NextAttempt.Running() }
 
-// Scheduled reports whether another run is due. False for a suspended probe.
+// Scheduled reports whether another run is due. False for a suspended reconciler.
 func (a Attempts) Scheduled() bool { return !a.NextAttempt.ScheduledAt.IsZero() }
 
 // begin marks a run dispatched. InFlight reads true from here until the commit, which is what
 // stops a pass scheduling over a run already out.
 func (a *Attempts) begin(at time.Time) { a.NextAttempt.StartedAt = at }
 
-// schedule sets when the next run is due, zero for a probe with nothing scheduled.
+// schedule sets when the next run is due, zero for a reconciler with nothing scheduled.
 func (a *Attempts) schedule(at time.Time) { a.NextAttempt = Attempt{ScheduledAt: at} }
 
 // record files a finished run. A suspension ends a failure streak the same way a success does,
@@ -190,7 +190,7 @@ func (a *Attempts) schedule(at time.Time) { a.NextAttempt = Attempt{ScheduledAt:
 //
 // The run moves out of NextAttempt rather than replacing it, so the schedule it was dispatched
 // on survives into the record: StartedAt against ScheduledAt is how long it waited for a
-// worker, and a caller cannot tell a slow probe from a saturated pool without it.
+// worker, and a caller cannot tell a slow reconciler from a saturated pool without it.
 func (a *Attempts) record(att Attempt) {
 	att.ScheduledAt = a.NextAttempt.ScheduledAt
 	a.LastAttempt = att

@@ -14,7 +14,7 @@
 
 // One kind's mirror: a cold LIST or a resume from the cookie, then a WATCH applying deltas
 // until something ends it. A standing stream rather than a pass, which is why this does not
-// run on the probe engine.
+// run on the supervisor.
 package kubesync
 
 import (
@@ -31,7 +31,7 @@ import (
 	"k8s.io/client-go/dynamic"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
 // errWatchClosed is the apiserver ending a watch on its own timeout: the ordinary end of a
@@ -45,9 +45,9 @@ type pacing struct {
 	// reads Stale. A resume that outlasts it says Resuming for the same reason: both are
 	// "this stream has stopped being current".
 	staleAfter time.Duration
-	// backoff is the ladder a failing run climbs — the engine's, so a kind's retry countdown
+	// backoff is the ladder a failing run climbs — the supervisor's, so a kind's retry countdown
 	// reads the same as a sweep's.
-	backoff probe.Backoff
+	backoff supervisor.Backoff
 	// pageSize bounds one relist page, so a large collection never lands in memory whole.
 	pageSize int64
 	// eventsWindow is how many event rows the cache keeps, and eventsEvery how many arrive
@@ -63,7 +63,7 @@ type pacing struct {
 func defaultPacing() pacing {
 	return pacing{
 		staleAfter:   5 * time.Minute,
-		backoff:      probe.Backoff{Base: time.Second, Factor: 2, Cap: time.Minute},
+		backoff:      supervisor.Backoff{Base: time.Second, Factor: 2, Cap: time.Minute},
 		pageSize:     500,
 		eventsWindow: 5000,
 		eventsEvery:  100,

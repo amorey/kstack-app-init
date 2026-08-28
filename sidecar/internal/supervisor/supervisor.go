@@ -12,22 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package probe runs a set of periodic observations over a set of subjects: the controller
+// Package reconciler runs a set of periodic observations over a set of subjects: the controller
 // pattern without Kubernetes — a work queue, a level-triggered pass, and a schedule derived from
 // recorded state. Nothing here knows what a subject is beyond its name.
 //
-// A caller registers its probes, says which subjects are tracked, and reads what the runs found:
-// Register takes a Probe with its cadence and what it depends on, all addressed by registration
-// name — a probe's whole public identity; Add and Remove track subjects, and Wake says a
-// recorded answer went stale; Read and OnPass hand back a Snapshot — every probe's
+// A caller registers its reconcilers, says which subjects are tracked, and reads what the runs found:
+// Register takes a Reconciler with its cadence and what it depends on, all addressed by registration
+// name — a reconciler's whole public identity; Add and Remove track subjects, and Wake says a
+// recorded answer went stale; Read and OnPass hand back a Snapshot — every reconciler's
 // Observation, value beside attempts, copied under one lock. Get reads one of them by name,
 // which is how a Run reads a sibling, and a Key pairs that name with its type once.
 //
 // A run's own Result is its schedule — Succeeded waits out the interval, Fail climbs the backoff
 // ladder, Suspend and Skip wait for a Wake — so no domain rule lives in the scheduler.
 //
-// See docs/adr/2026-08-24-probe-engine.md.
-package probe
+// See docs/adr/2026-08-24-reconciler-supervisor.md.
+package supervisor
 
 import (
 	"context"
@@ -43,24 +43,24 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/workqueue"
 )
 
-// probeID is a probe's registration index — engine-internal, since a probe's public identity is
+// reconcilerID is a reconciler's registration index — supervisor-internal, since a reconciler's public identity is
 // the name it was registered under.
-type probeID int
+type reconcilerID int
 
-// Probe is one probe's body: request against the subject, classify, and return the result. What
+// Reconciler is one reconciler's body: request against the subject, classify, and return the result. What
 // the run found is recorded on the pass, wherever the body learns it; a body with no news just
-// returns. The engine applies the pass under its lock, so a run must do its waiting before it
+// returns. The supervisor applies the pass under its lock, so a run must do its waiting before it
 // returns.
 //
-// A probe whose value owns something — a connection, a file — also implements
-// `Discard(T)`, and is handed back any value the engine does not apply: a commit refused because
+// A reconciler whose value owns something — a connection, a file — also implements
+// `Discard(T)`, and is handed back any value the supervisor does not apply: a commit refused because
 // the subject was removed mid-run, a run that concluded Skip or returned the zero Result, and one
 // that panicked. Nothing else can reach such a value to release it.
-type Probe[T any] interface {
-	Run(ctx context.Context, pass *Pass[T]) Result
+type Reconciler[T any] interface {
+	Reconcile(ctx context.Context, pass *Pass[T]) Result
 }
 
-// Backoff paces a failing probe: Base widened by Factor per consecutive failure, capped at Cap.
+// Backoff paces a failing reconciler: Base widened by Factor per consecutive failure, capped at Cap.
 type Backoff struct {
 	Base   time.Duration
 	Factor float64
@@ -84,8 +84,8 @@ func (b Backoff) Delay(failures int) time.Duration {
 	return min(d, b.Cap)
 }
 
-// probeCfg is the per-probe knobs, all optional.
-type probeCfg struct {
+// reconcilerCfg is the per-reconciler knobs, all optional.
+type reconcilerCfg struct {
 	interval     time.Duration
 	backoff      Backoff
 	timeout      time.Duration
@@ -93,61 +93,61 @@ type probeCfg struct {
 	watches      []string
 }
 
-var defaultCfg = probeCfg{
+var defaultCfg = reconcilerCfg{
 	interval: time.Minute,
 	backoff:  Backoff{Base: time.Second, Factor: 2, Cap: 5 * time.Minute},
 	timeout:  30 * time.Second,
 }
 
-// ProbeOption tunes one registration; a registration states only what deviates from the
+// ReconcilerOption tunes one registration; a registration states only what deviates from the
 // defaults.
-type ProbeOption func(*probeCfg)
+type ReconcilerOption func(*reconcilerCfg)
 
-// WithDependencies declares the probes this one can only run over the success of — the health
-// edge, answering "can this run?". While a dependency is failing the probe is recorded as
+// WithDependencies declares the reconcilers this one can only run over the success of — the health
+// edge, answering "can this run?". While a dependency is failing the reconciler is recorded as
 // DependencyFailed rather than dispatched, and it is due again when the dependency recovers. It
 // takes IDs Register already returned, so a dependency exists before whatever depends on it and
 // the graph is acyclic by construction.
-func WithDependencies(names ...string) ProbeOption {
-	return func(c *probeCfg) { c.dependencies = append(c.dependencies, names...) }
+func WithDependencies(names ...string) ReconcilerOption {
+	return func(c *reconcilerCfg) { c.dependencies = append(c.dependencies, names...) }
 }
 
-// WithWatches declares the probes whose values this one reads — the data edge, answering
-// "is this answer stale?". When one of them commits a changed value, this probe runs again,
+// WithWatches declares the reconcilers whose values this one reads — the data edge, answering
+// "is this answer stale?". When one of them commits a changed value, this reconciler runs again,
 // whatever its schedule said; it takes no other part in scheduling, and it never gates a run.
-// Health is the other edge's job: a probe that also cannot run without what it reads declares
+// Health is the other edge's job: a reconciler that also cannot run without what it reads declares
 // WithDependencies too.
-func WithWatches(names ...string) ProbeOption {
-	return func(c *probeCfg) { c.watches = append(c.watches, names...) }
+func WithWatches(names ...string) ReconcilerOption {
+	return func(c *reconcilerCfg) { c.watches = append(c.watches, names...) }
 }
 
-// WithInterval is how long after a succeeded run the probe is due again.
-func WithInterval(d time.Duration) ProbeOption {
-	return func(c *probeCfg) { c.interval = d }
+// WithInterval is how long after a succeeded run the reconciler is due again.
+func WithInterval(d time.Duration) ReconcilerOption {
+	return func(c *reconcilerCfg) { c.interval = d }
 }
 
-// WithBackoff paces the probe's failures.
-func WithBackoff(base time.Duration, factor float64, cap time.Duration) ProbeOption {
-	return func(c *probeCfg) { c.backoff = Backoff{Base: base, Factor: factor, Cap: cap} }
+// WithBackoff paces the reconciler's failures.
+func WithBackoff(base time.Duration, factor float64, cap time.Duration) ReconcilerOption {
+	return func(c *reconcilerCfg) { c.backoff = Backoff{Base: base, Factor: factor, Cap: cap} }
 }
 
-// WithTimeout bounds one run, enforced by the engine on the context it hands the run.
-func WithTimeout(d time.Duration) ProbeOption {
-	return func(c *probeCfg) { c.timeout = d }
+// WithTimeout bounds one run, enforced by the supervisor on the context it hands the run.
+func WithTimeout(d time.Duration) ReconcilerOption {
+	return func(c *reconcilerCfg) { c.timeout = d }
 }
 
-// spec is one registered probe, its body erased to the value the observable stores. Register's
+// spec is one registered reconciler, its body erased to the value the observable stores. Register's
 // wrapper is the only thing that boxes and unboxes, so the types stay checked at the boundary.
 type spec struct {
 	name string
-	cfg  probeCfg
+	cfg  reconcilerCfg
 	// dependencies and watches are cfg's names resolved once, at registration.
-	dependencies []probeID
-	watches      []probeID
+	dependencies []reconcilerID
+	watches      []reconcilerID
 	run          func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any, func())
 }
 
-// Option configures an Engine.
+// Option configures an Supervisor.
 type Option func(*settings)
 
 // WithWorkers is how many runs may be in flight at once, across every subject. A fleet-wide cap
@@ -160,13 +160,13 @@ type settings struct {
 	workers int
 }
 
-// Engine runs the registered probes over the tracked subjects. Build with New, add probes with
-// Register, then Start; the zero Engine has no queues to work.
-type Engine struct {
+// Supervisor runs the registered reconcilers over the tracked subjects. Build with New, add reconcilers with
+// Register, then Start; the zero Supervisor has no queues to work.
+type Supervisor struct {
 	settings settings
 	onPass   func(subjectName string, snap Snapshot)
 
-	// runQ carries the runs that are due, one key per probe per subject, so one probe never
+	// runQ carries the runs that are due, one key per reconciler per subject, so one reconciler never
 	// runs twice at once and an ask arriving mid-run is redelivered on Done rather than folded
 	// into a run that could not have seen it. passQ carries the subjects whose schedule has to
 	// be re-derived; everything that changes a subject ends with an add there.
@@ -178,25 +178,25 @@ type Engine struct {
 	mu      sync.Mutex
 	specs   []spec
 	started bool
-	// watchers is the data edge reversed: for each probe, who watches its value and so runs
+	// watchers is the data edge reversed: for each reconciler, who watches its value and so runs
 	// again when it moves. byName is what Get resolves a read through. Both built by Register,
 	// and neither written once a subject exists.
-	watchers map[probeID][]probeID
-	byName   map[string]probeID
+	watchers map[reconcilerID][]reconcilerID
+	byName   map[string]reconcilerID
 	subjects map[string]*subject
 
 	wg sync.WaitGroup
 }
 
-// key is one run of one probe against one subject — the unit runQ keys on.
+// key is one run of one reconciler against one subject — the unit runQ keys on.
 type key struct {
-	subject string
-	probe   probeID
+	subject    string
+	reconciler reconcilerID
 }
 
-// observable is what the engine holds for one probe of one subject: the value its runs committed
-// beside the bookkeeping for the probe that read it. The untyped half of Observation[T], which is
-// what Get projects it into — one engine carries probes of different value types, so the slice
+// observable is what the supervisor holds for one reconciler of one subject: the value its runs committed
+// beside the bookkeeping for the reconciler that read it. The untyped half of Observation[T], which is
+// what Get projects it into — one supervisor carries reconcilers of different value types, so the slice
 // itself cannot be typed.
 type observable struct {
 	// value is the last committed answer, nil until a run commits one, and seen is when a run
@@ -205,7 +205,7 @@ type observable struct {
 	value any
 	seen  time.Time
 	// skipped marks a last run that returned Skip — the one memory a Skip leaves. It records
-	// nothing, so without this the pass would read the probe as never-run and re-dispatch it
+	// nothing, so without this the pass would read the reconciler as never-run and re-dispatch it
 	// at once. Cleared when a run records; a Wake goes through runQ, so it needs no clearing
 	// to force a run.
 	skipped bool
@@ -213,13 +213,13 @@ type observable struct {
 	Attempts
 }
 
-// subject is what the engine holds for one tracked name. Identity matters: a subject removed
+// subject is what the supervisor holds for one tracked name. Identity matters: a subject removed
 // and re-added is a new *subject, and a run dispatched against the old one commits nothing.
 type subject struct {
-	// obs is one observable per probe, indexed by probeID.
+	// obs is one observable per reconciler, indexed by reconcilerID.
 	obs []observable
 	// timer brings the pass back when the soonest scheduled run comes due. One per subject,
-	// and it is a wake, not a cadence: the pass decides again per probe.
+	// and it is a wake, not a cadence: the pass decides again per reconciler.
 	timer *time.Timer
 }
 
@@ -233,18 +233,18 @@ func (s *subject) stopTimer() {
 // snapshotOf copies one subject's observables for a reader. Called under e.mu, so the values and
 // the schedule beside them agree. The registration index is shared rather than copied —
 // registration closes before the first subject, so nothing writes it from here on.
-func (e *Engine) snapshotOf(sub *subject) Snapshot {
+func (e *Supervisor) snapshotOf(sub *subject) Snapshot {
 	return Snapshot{obs: slices.Clone(sub.obs), byName: e.byName}
 }
 
-// New returns an Engine with no probes and no subjects.
-func New(opts ...Option) *Engine {
-	e := &Engine{
+// New returns an Supervisor with no reconcilers and no subjects.
+func New(opts ...Option) *Supervisor {
+	e := &Supervisor{
 		settings: settings{workers: 8},
 		runQ:     workqueue.New[key](),
 		passQ:    workqueue.New[string](),
-		watchers: map[probeID][]probeID{},
-		byName:   map[string]probeID{},
+		watchers: map[reconcilerID][]reconcilerID{},
+		byName:   map[string]reconcilerID{},
 		subjects: map[string]*subject{},
 	}
 	for _, opt := range opts {
@@ -253,34 +253,34 @@ func New(opts ...Option) *Engine {
 	return e
 }
 
-// OnPass sets the callback the engine fires after every pass, with the Snapshot that pass
-// produced. Called outside the engine's lock but serialized per subject; it must not block.
+// OnPass sets the callback the supervisor fires after every pass, with the Snapshot that pass
+// produced. Called outside the supervisor's lock but serialized per subject; it must not block.
 // Wiring, not state — set it before Start, like Register.
 //
 // Every pass, not every change: a snapshot carries Attempts, which every run rewrites, so the
-// engine cannot tell a new answer from the same one re-confirmed. A caller that wakes something
+// supervisor cannot tell a new answer from the same one re-confirmed. A caller that wakes something
 // expensive projects the snapshot down to what its readers react to and compares that itself.
-func (e *Engine) OnPass(fn func(subjectName string, snap Snapshot)) {
+func (e *Supervisor) OnPass(fn func(subjectName string, snap Snapshot)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.started {
-		panic("probe: OnPass after Start")
+		panic("supervisor: OnPass after Start")
 	}
 	e.onPass = fn
 }
 
-// Register adds one probe under name, which is its whole public identity: the edges, Wake, and
-// every read address it by that. A package function rather than a method so each probe picks its
+// Register adds one reconciler under name, which is its whole public identity: the edges, Wake, and
+// every read address it by that. A package function rather than a method so each reconciler picks its
 // own value type; T is inferred from the instance.
 //
-// It panics on an edge naming a probe not yet registered, a duplicate name, or a call after
+// It panics on an edge naming a reconciler not yet registered, a duplicate name, or a call after
 // Start or the first Add — a table wired wrong at boot, not a runtime error. A subject's
 // bookkeeping is sized when it is added, which is why the set must be complete before anything
 // is tracked.
-func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) {
+func Register[T any](e *Supervisor, name string, p Reconciler[T], opts ...ReconcilerOption) {
 	if p == nil {
-		panic("probe: Register needs a probe")
+		panic("supervisor: Register needs a reconciler")
 	}
 	run := func(ctx context.Context, subjectName string, prev any, snap Snapshot) (Result, any, func()) {
 		var pv T
@@ -289,7 +289,7 @@ func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) {
 		}
 		pass := &Pass[T]{subject: subjectName, prev: pv, known: prev != nil, snap: snap}
 		// A run that panics has still committed whatever it committed before it did, and the
-		// engine applies none of it — so it is handed back here, on the way out to the
+		// supervisor applies none of it — so it is handed back here, on the way out to the
 		// recover that turns the panic into a result.
 		defer func() {
 			if r := recover(); r != nil {
@@ -297,7 +297,7 @@ func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) {
 				panic(r)
 			}
 		}()
-		res := p.Run(ctx, pass)
+		res := p.Reconcile(ctx, pass)
 		if pass.next == nil {
 			return res, nil, nil
 		}
@@ -306,10 +306,10 @@ func Register[T any](e *Engine, name string, p Probe[T], opts ...ProbeOption) {
 	e.register(name, run, opts)
 }
 
-// handBack tells a probe that the engine dropped what its run committed, for one that asked to
+// handBack tells a reconciler that the supervisor dropped what its run committed, for one that asked to
 // be told by implementing Discard. A committed value can own something — a connection, a file —
-// and one the engine never applied is one nothing else can reach to release.
-func handBack[T any](p Probe[T], pass *Pass[T]) {
+// and one the supervisor never applied is one nothing else can reach to release.
+func handBack[T any](p Reconciler[T], pass *Pass[T]) {
 	d, ok := p.(interface{ Discard(T) })
 	if !ok || pass.next == nil {
 		return
@@ -317,22 +317,22 @@ func handBack[T any](p Probe[T], pass *Pass[T]) {
 	d.Discard(*pass.next)
 }
 
-func (e *Engine) register(name string, run func(context.Context, string, any, Snapshot) (Result, any, func()), opts []ProbeOption) {
+func (e *Supervisor) register(name string, run func(context.Context, string, any, Snapshot) (Result, any, func()), opts []ReconcilerOption) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.started {
-		panic("probe: Register after Start")
+		panic("supervisor: Register after Start")
 	}
 	if len(e.subjects) != 0 {
-		panic("probe: Register after Add")
+		panic("supervisor: Register after Add")
 	}
 	if name == "" {
-		panic("probe: Register needs a name")
+		panic("supervisor: Register needs a name")
 	}
 	for _, s := range e.specs {
 		if s.name == name {
-			panic(fmt.Sprintf("probe: %q registered twice", name))
+			panic(fmt.Sprintf("supervisor: %q registered twice", name))
 		}
 	}
 
@@ -348,9 +348,9 @@ func (e *Engine) register(name string, run func(context.Context, string, any, Sn
 	e.specs = append(e.specs, spec{
 		name: name, cfg: cfg, dependencies: dependencies, watches: watches, run: run,
 	})
-	id := probeID(len(e.specs) - 1)
+	id := reconcilerID(len(e.specs) - 1)
 	e.byName[name] = id
-	// The edge is walked from the probe that committed, so it is indexed that way here rather
+	// The edge is walked from the reconciler that committed, so it is indexed that way here rather
 	// than searched for at wake time. Both ends exist already, which is what makes it safe.
 	for _, watched := range watches {
 		e.watchers[watched] = append(e.watchers[watched], id)
@@ -358,25 +358,25 @@ func (e *Engine) register(name string, run func(context.Context, string, any, Sn
 }
 
 // resolveLocked turns an edge's names into indexes. A name nothing was registered under is a
-// wiring bug: edge names me a probe that does not exist, or one that comes later.
-func (e *Engine) resolveLocked(name, edge string, names []string) []probeID {
+// wiring bug: edge names me a reconciler that does not exist, or one that comes later.
+func (e *Supervisor) resolveLocked(name, edge string, names []string) []reconcilerID {
 	if len(names) == 0 {
 		return nil
 	}
-	ids := make([]probeID, 0, len(names))
+	ids := make([]reconcilerID, 0, len(names))
 	for _, want := range names {
 		id, ok := e.byName[want]
 		if !ok {
-			panic(fmt.Sprintf("probe: %q %s %q, which is not registered yet", name, edge, want))
+			panic(fmt.Sprintf("supervisor: %q %s %q, which is not registered yet", name, edge, want))
 		}
 		ids = append(ids, id)
 	}
 	return ids
 }
 
-// Add tracks subject. Every probe derives from zero, so the pass this queues dispatches
+// Add tracks subject. Every reconciler derives from zero, so the pass this queues dispatches
 // whatever a fresh subject owes; adding a subject already tracked changes nothing.
-func (e *Engine) Add(subjectName string) {
+func (e *Supervisor) Add(subjectName string) {
 	e.mu.Lock()
 	if _, ok := e.subjects[subjectName]; ok {
 		e.mu.Unlock()
@@ -390,7 +390,7 @@ func (e *Engine) Add(subjectName string) {
 
 // Remove stops tracking subject: its timer stops, and a run still in flight against it commits
 // nothing. Removing a subject not tracked changes nothing.
-func (e *Engine) Remove(subjectName string) {
+func (e *Supervisor) Remove(subjectName string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -402,19 +402,19 @@ func (e *Engine) Remove(subjectName string) {
 	delete(e.subjects, subjectName)
 }
 
-// Wake says these probes' answers are stale: run them again, suspension notwithstanding. It
+// Wake says these reconcilers' answers are stale: run them again, suspension notwithstanding. It
 // adds straight to the run queue, whose held/dirty machinery redelivers a key that was mid-run
 // when its commit lands — a Wake is never lost. A subject not tracked is ignored; a name nothing
 // was registered under is a wiring bug and panics.
-func (e *Engine) Wake(subjectName string, names ...string) {
+func (e *Supervisor) Wake(subjectName string, names ...string) {
 	e.mu.Lock()
 	tracked := e.subjects[subjectName] != nil
-	ids := make([]probeID, 0, len(names))
+	ids := make([]reconcilerID, 0, len(names))
 	for _, name := range names {
 		id, ok := e.byName[name]
 		if !ok {
 			e.mu.Unlock()
-			panic(fmt.Sprintf("probe: Wake of %q, which is not registered", name))
+			panic(fmt.Sprintf("supervisor: Wake of %q, which is not registered", name))
 		}
 		ids = append(ids, id)
 	}
@@ -424,12 +424,12 @@ func (e *Engine) Wake(subjectName string, names ...string) {
 		return
 	}
 	for _, id := range ids {
-		e.runQ.Add(key{subject: subjectName, probe: id})
+		e.runQ.Add(key{subject: subjectName, reconciler: id})
 	}
 }
 
 // WakeAll is Wake over every tracked subject.
-func (e *Engine) WakeAll(names ...string) {
+func (e *Supervisor) WakeAll(names ...string) {
 	e.mu.Lock()
 	subjects := slices.Collect(maps.Keys(e.subjects))
 	e.mu.Unlock()
@@ -441,7 +441,7 @@ func (e *Engine) WakeAll(names ...string) {
 
 // Read is subject's observables, copied under one lock so the values and the schedule beside
 // them agree. ok is false for a subject not tracked.
-func (e *Engine) Read(subjectName string) (snap Snapshot, ok bool) {
+func (e *Supervisor) Read(subjectName string) (snap Snapshot, ok bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -455,7 +455,7 @@ func (e *Engine) Read(subjectName string) (snap Snapshot, ok bool) {
 // Start runs the pass worker and the run workers, and hands back the stop func that cancels
 // them and waits. ctx bounds startup alone, and nothing here can fail — the queues were built in
 // New, so work queued before Start (an Add, a Wake) simply waits there for the workers.
-func (e *Engine) Start(context.Context) func(context.Context) error {
+func (e *Supervisor) Start(context.Context) func(context.Context) error {
 	e.mu.Lock()
 	e.started = true
 	e.mu.Unlock()
@@ -476,7 +476,7 @@ func (e *Engine) Start(context.Context) func(context.Context) error {
 }
 
 // Close drops every subject and closes the queues. Past here nothing works them off.
-func (e *Engine) Close() error {
+func (e *Supervisor) Close() error {
 	e.runQ.Close()
 	e.passQ.Close()
 
@@ -491,9 +491,9 @@ func (e *Engine) Close() error {
 }
 
 // passLoop derives schedules until stopped. One worker: the pass is arithmetic under the
-// engine's lock, so more would only contend for it — and one worker is what serializes OnPass
+// supervisor's lock, so more would only contend for it — and one worker is what serializes OnPass
 // per subject.
-func (e *Engine) passLoop(ctx context.Context) {
+func (e *Supervisor) passLoop(ctx context.Context) {
 	for {
 		name, ok := e.passQ.Next(ctx)
 		if !ok {
@@ -504,17 +504,17 @@ func (e *Engine) passLoop(ctx context.Context) {
 	}
 }
 
-// runLoop runs due probes until stopped. Several workers, because a run is bounded by a remote
-// server and a fleet would otherwise be probed one server at a time. Nothing is serialized per
-// subject, and nothing needs to be: the queue keys by probe, so one probe never runs twice at
-// once, and a probe writes only the observable it owns.
-func (e *Engine) runLoop(ctx context.Context) {
+// runLoop runs due reconcilers until stopped. Several workers, because a run is bounded by a remote
+// server and a fleet would otherwise be reconciled one server at a time. Nothing is serialized per
+// subject, and nothing needs to be: the queue keys by reconciler, so one reconciler never runs twice at
+// once, and a reconciler writes only the observable it owns.
+func (e *Supervisor) runLoop(ctx context.Context) {
 	for {
 		k, ok := e.runQ.Next(ctx)
 		if !ok {
 			return
 		}
-		e.runProbe(ctx, k)
+		e.runReconciler(ctx, k)
 		e.runQ.Done(k)
 	}
 }
@@ -526,7 +526,7 @@ func (e *Engine) runLoop(ctx context.Context) {
 //
 // A run in flight is left alone: NextAttempt is that run, and writing a schedule over it would
 // erase both the in-flight mark and the schedule it was dispatched on. Its commit passes again.
-func (e *Engine) pass(subjectName string) {
+func (e *Supervisor) pass(subjectName string) {
 	e.mu.Lock()
 	sub := e.subjects[subjectName]
 	if sub == nil {
@@ -541,7 +541,7 @@ func (e *Engine) pass(subjectName string) {
 		if a.InFlight() {
 			continue
 		}
-		at := e.due(sub, probeID(id), now)
+		at := e.due(sub, reconcilerID(id), now)
 		a.schedule(at)
 
 		switch {
@@ -552,7 +552,7 @@ func (e *Engine) pass(subjectName string) {
 				soonest = at
 			}
 		default:
-			e.runQ.Add(key{subject: subjectName, probe: probeID(id)})
+			e.runQ.Add(key{subject: subjectName, reconciler: reconcilerID(id)})
 		}
 	}
 
@@ -572,7 +572,7 @@ func (e *Engine) pass(subjectName string) {
 	}
 }
 
-// dependenciesState is where a probe's dependencies collectively are; a failing one outranks an
+// dependenciesState is where a reconciler's dependencies collectively are; a failing one outranks an
 // unanswered one, since it is a definitive reason not to run.
 type dependenciesState int
 
@@ -582,7 +582,7 @@ const (
 	dependenciesFailing
 )
 
-func (e *Engine) dependenciesOf(sub *subject, dependencies []probeID) dependenciesState {
+func (e *Supervisor) dependenciesOf(sub *subject, dependencies []reconcilerID) dependenciesState {
 	state := dependenciesOK
 	for _, id := range dependencies {
 		dep := sub.obs[id]
@@ -596,10 +596,10 @@ func (e *Engine) dependenciesOf(sub *subject, dependencies []probeID) dependenci
 	return state
 }
 
-// due is when probe id should next run, zero for nothing scheduled. The whole scheduling
+// due is when reconciler id should next run, zero for nothing scheduled. The whole scheduling
 // policy, in the order the cases have to be read. The caller has already set aside a run in
 // flight.
-func (e *Engine) due(sub *subject, id probeID, now time.Time) time.Time {
+func (e *Supervisor) due(sub *subject, id reconcilerID, now time.Time) time.Time {
 	a := sub.obs[id]
 	if a.skipped {
 		// The last run declined to record; only a Wake brings it back.
@@ -610,12 +610,12 @@ func (e *Engine) due(sub *subject, id probeID, now time.Time) time.Time {
 
 	switch e.dependenciesOf(sub, e.specs[id].dependencies) {
 	case dependenciesUnanswered:
-		// Nothing to say about a server nobody has tried, so the probe stays untouched
+		// Nothing to say about a server nobody has tried, so the reconciler stays untouched
 		// rather than recording a dependency that has not failed.
 		return time.Time{}
 	case dependenciesFailing:
 		// One run records DependencyFailed and the rest of the outage costs nothing, which
-		// is what keeps a dead cluster at one timeout per cycle instead of one per probe.
+		// is what keeps a dead cluster at one timeout per cycle instead of one per reconciler.
 		if a.LastAttempt.Reason == ReasonDependencyFailed {
 			return time.Time{}
 		}
@@ -647,28 +647,28 @@ func (e *Engine) due(sub *subject, id probeID, now time.Time) time.Time {
 	}
 }
 
-// runProbe runs one due probe and commits what it found. The subject is captured first and
+// runReconciler runs one due reconciler and commits what it found. The subject is captured first and
 // re-checked at the commit — what can race a run is a Remove, not another run of the same key.
 //
 // Dependencies are re-checked at dispatch: one that failed since the pass means the run is
 // recorded as DependencyFailed, never dialed — a worker must not spend a timeout learning what
 // the state already says. One still unanswered means a Wake outran it; the run ends as a no-op
 // and the pass owns the question again.
-func (e *Engine) runProbe(ctx context.Context, k key) {
+func (e *Supervisor) runReconciler(ctx context.Context, k key) {
 	e.mu.Lock()
 	sub := e.subjects[k.subject]
 	if sub == nil {
 		e.mu.Unlock()
 		return
 	}
-	sp := e.specs[k.probe]
-	prev := sub.obs[k.probe].value
+	sp := e.specs[k.reconciler]
+	prev := sub.obs[k.reconciler].value
 	snap := e.snapshotOf(sub)
 	dependencies := e.dependenciesOf(sub, sp.dependencies)
 	// Marked before the lock is dropped, so InFlight is true for as long as the request is
 	// out and a pass landing meanwhile leaves the run alone.
 	startedAt := time.Now()
-	sub.obs[k.probe].begin(startedAt)
+	sub.obs[k.reconciler].begin(startedAt)
 	e.mu.Unlock()
 
 	var res Result
@@ -688,12 +688,12 @@ func (e *Engine) runProbe(ctx context.Context, k key) {
 	e.commit(k, sub, startedAt, res, val, ran, discard)
 }
 
-// dispatch runs the probe's body, bounded by its timeout, and answers for it when it misbehaves.
+// dispatch runs the reconciler's body, bounded by its timeout, and answers for it when it misbehaves.
 // A body that panics or hands back nothing is a bug, and both must still produce a result —
-// otherwise the probe reads as in flight forever and its key stays held in the queue. Only here
-// does the engine log: the Internal record a caller sees carries no stack, and nothing else in
+// otherwise the reconciler reads as in flight forever and its key stays held in the queue. Only here
+// does the supervisor log: the Internal record a caller sees carries no stack, and nothing else in
 // the system can report a bug in a body.
-func (e *Engine) dispatch(ctx context.Context, sp spec, subjectName string, prev any, snap Snapshot) (res Result, val any, discard func()) {
+func (e *Supervisor) dispatch(ctx context.Context, sp spec, subjectName string, prev any, snap Snapshot) (res Result, val any, discard func()) {
 	if sp.cfg.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, sp.cfg.timeout)
@@ -701,35 +701,35 @@ func (e *Engine) dispatch(ctx context.Context, sp spec, subjectName string, prev
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("probe: run panicked", "probe", sp.name, "subject", subjectName,
+			slog.Error("supervisor: run panicked", "reconciler", sp.name, "subject", subjectName,
 				"panic", r, "stack", string(debug.Stack()))
 			// The run handed its value back on the way out of the panic, so there is
 			// nothing left here to discard.
-			res, val, discard = Fail(ReasonInternal, fmt.Errorf("probe %s panicked: %v", sp.name, r)), nil, nil
+			res, val, discard = Fail(ReasonInternal, fmt.Errorf("reconciler %s panicked: %v", sp.name, r)), nil, nil
 		}
 	}()
 
 	res, val, discard = sp.run(ctx, subjectName, prev, snap)
 	if res.kind == resultInvalid {
-		slog.Error("probe: run returned the zero Result", "probe", sp.name, "subject", subjectName)
+		slog.Error("supervisor: run returned the zero Result", "reconciler", sp.name, "subject", subjectName)
 		if discard != nil {
 			discard()
 		}
-		return Fail(ReasonInternal, fmt.Errorf("probe %s returned the zero Result", sp.name)), nil, nil
+		return Fail(ReasonInternal, fmt.Errorf("reconciler %s returned the zero Result", sp.name)), nil, nil
 	}
 	return res, val, discard
 }
 
 // commit files what a run concluded and asks for a pass. Called for every run, including one
-// that concluded nothing: ending the run is what lets the pass schedule this probe again.
+// that concluded nothing: ending the run is what lets the pass schedule this reconciler again.
 //
 // The subject is re-checked under the lock, so a Remove landing mid-run cannot let a run that
 // predates a re-Add be committed against whatever holds the name now.
-func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, val any, ran bool, discard func()) {
+func (e *Supervisor) commit(k key, held *subject, startedAt time.Time, res Result, val any, ran bool, discard func()) {
 	e.mu.Lock()
 	if e.subjects[k.subject] != held {
 		e.mu.Unlock()
-		// Nothing will ever see what this run committed, so it goes back to the probe: a
+		// Nothing will ever see what this run committed, so it goes back to the reconciler: a
 		// value can own something nothing else can now reach to release.
 		if discard != nil {
 			discard()
@@ -737,7 +737,7 @@ func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, v
 		return
 	}
 
-	a := &held.obs[k.probe]
+	a := &held.obs[k.reconciler]
 	now := time.Now()
 	switch res.kind {
 	case resultRecord:
@@ -763,10 +763,10 @@ func (e *Engine) commit(k key, held *subject, startedAt time.Time, res Result, v
 			// A committed value is one that moved — the body says so by handing one back at
 			// all — and whoever reads it is owed a run against the new one. Queued in the same
 			// critical section as the write, so no reader sees the value without the runs it
-			// earned. Health is not consulted: a watch is a data edge, and a probe that also
+			// earned. Health is not consulted: a watch is a data edge, and a reconciler that also
 			// cannot run without this declares WithDependencies for that.
-			for _, watcher := range e.watchers[k.probe] {
-				e.runQ.Add(key{subject: k.subject, probe: watcher})
+			for _, watcher := range e.watchers[k.reconciler] {
+				e.runQ.Add(key{subject: k.subject, reconciler: watcher})
 			}
 		case res.verdict == VerdictSucceeded && a.value != nil:
 			// Nothing new, and the run confirmed what stands. A success with nothing to

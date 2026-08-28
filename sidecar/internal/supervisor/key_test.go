@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package probe
+package supervisor
 
 import (
 	"testing"
@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// A key states the name↔type pairing once, beside the probe, where Get restates it at every
+// A key states the name↔type pairing once, beside the reconciler, where Get restates it at every
 // read site.
 func TestAKeyReadsTheObservableItNames(t *testing.T) {
 	e, p, _ := single(t, Succeeded())

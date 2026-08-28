@@ -146,7 +146,7 @@ func within(t *testing.T) context.Context {
 	return ctx
 }
 
-// startService runs the pool's engine and watch for a test that needs them, and joins them on
+// startService runs the pool's supervisor and watch for a test that needs them, and joins them on
 // cleanup.
 func startService(t *testing.T, s *Service) {
 	t.Helper()
@@ -402,7 +402,7 @@ func TestConnReportsThatThereIsNoConnection(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNoConnection)
 }
 
-// A commit that lands after the pass worker has stopped leaves the connection in the engine and
+// A commit that lands after the pass worker has stopped leaves the connection in the supervisor and
 // nowhere else, so Close reads it back rather than retiring only what the entries hold.
 func TestCloseRetiresTheConnectionTheEngineHolds(t *testing.T) {
 	s := New(serving(serveCluster(t).Server, "prod", "key-1"))
@@ -589,12 +589,12 @@ func TestAcquireAsksForANewContextsPresence(t *testing.T) {
 }
 
 // A later holder joins what the first one's probe found rather than asking for another read.
-// Only the engine runs: the kubeconfig watch's subscription seed wakes a re-read this test must
+// Only the supervisor runs: the kubeconfig watch's subscription seed wakes a re-read this test must
 // not count, and coalescing makes that wake land as zero or one extra reads — so it stays off.
 func TestAcquireAsksOnlyForANewContext(t *testing.T) {
 	cfg := counting("prod", "key-1")
 	s := New(cfg)
-	stop := s.engine.Start(t.Context())
+	stop := s.supervisor.Start(t.Context())
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 	first := s.Acquire("prod")
 	defer first.Release()
@@ -621,7 +621,7 @@ func TestAChangeArrivingDuringAReadIsReadAgain(t *testing.T) {
 	assert.Equal(t, "prod", cfg.reads.Await(t, "the read the mid-flight change earned"))
 }
 
-// The ask a claim makes before Start waits in the engine's queues for its workers, so a context
+// The ask a claim makes before Start waits in the supervisor's queues for its workers, so a context
 // that had already gone does not sit reported as present.
 func TestAClaimTakenBeforeStartIsChecked(t *testing.T) {
 	s := New(resolving("staging", "key-1")) // "prod" is not named
@@ -684,13 +684,13 @@ func TestStartWatchesTheKubeconfigUntilStopped(t *testing.T) {
 	require.NoError(t, stop(t.Context()))
 }
 
-// A pass can land after the last holder let go — the engine's Remove and this publish are not
+// A pass can land after the last holder let go — the supervisor's Remove and this publish are not
 // one step. Announcing then would tell watchers on this name about a claim nobody holds, and
 // leave news behind for whatever claims it next to be compared against.
 func TestAPublishForAReleasedClaimIsDropped(t *testing.T) {
 	s := New(resolving("prod", "key-1"))
 	lease := s.Acquire("prod")
-	v, ok := s.engine.Read("prod")
+	v, ok := s.supervisor.Read("prod")
 	require.True(t, ok)
 	s.publish("prod", v)
 	require.Contains(t, s.published, "prod", "a held claim publishes")
@@ -1027,7 +1027,7 @@ func TestAReplacedServerRebuildsTheConnection(t *testing.T) {
 
 	// The endpoint now answers as another cluster, over the same credentials.
 	cl.answer(kubeSystemPath, kubeSystemAs("uid-2"))
-	s.engine.Wake("prod", nameServerUID)
+	s.supervisor.Wake("prod", nameServerUID)
 
 	testutil.Wait(t, stale.Done(), "the conflicted connection to be retired")
 
@@ -1079,7 +1079,7 @@ func TestAConflictWhoseFileStoppedResolvingDoesNotSpin(t *testing.T) {
 	cl.answer(kubeSystemPath, kubeSystemAs("uid-2"))
 	cfg.setErr(errors.New("open ca.crt: no such file"))
 	cfg.reads.Drain()
-	s.engine.Wake("prod", nameServerUID)
+	s.supervisor.Wake("prod", nameServerUID)
 
 	settledReads(t, cfg.reads)
 }

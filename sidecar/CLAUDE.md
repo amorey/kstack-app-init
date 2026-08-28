@@ -12,7 +12,7 @@ Mirrors the kubetail layout: `main.go` is lifecycle only, `internal/app` is the 
 - `internal/app/` — **composition root**: builds `poke.Service`, `kubeconfig.Service`, `clustersvc.New(...)`, `auth.Service`, `cloud.Service`; wires `graph.NewServer` + `grpcserver.NewServer`; multiplexes both onto one h2c handler (dispatcher keyed on `grpcserver.IsGRPCRequest`). `App.Start`/`App.Close` compose `App.parts` through `lifecycle.StartAll`/`CloseAll`: the slice is start order (poke → kubeconfig → cluster → cloud), and stop and close reverse it, so poke's hub closes **last**, after its subscribers drain. **kubeconfig before cluster is load-bearing** — `kubeconfig.Service.Start` reads synchronously, so every cluster reconcile observes a read config, and `app_test.go` pins it. Poke and cloud enter the slice as `lifecycle.StartFunc`. The two transports stay out of the slice — they shut down through `NotifyShutdown`/`DrainWithContext`, and `grpcServer.Stop()` runs first in `Close`.
 - `graph/` — `schema.graphqls`, generated code, resolvers, `server.go` (gqlgen handler, bearer-token plumbing, SSE shutdown lifecycle). Resolver deps must be non-nil — tests wire fakes; degraded behavior lives inside the services, not behind nil-guards.
 - `grpc/` — gRPC surface: `AuthService` (`StartLogin`/`Logout` unary; `AuthStateWatch` server-streaming, joins the drain WaitGroup) and `PokeService` (unary `Poke` → `poke.Poke(SourceHost)`). Committed protoc output in `grpc/authpb/`, `grpc/pokepb/`; regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here — it *is* the definition of a gRPC request.
-- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `drain`, `lifecycle` (the start/stop/close shape every level wears), `workqueue` (keyed work, delivered to one worker), `probe` (the probe engine — periodic observations over subjects, scheduled by derivation; `clustersvc`'s `kubeconn` runs on it), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
+- `internal/` — `ipc` (per-OS user-only endpoint), `atomicjson`, `logging`, `sqlitemigrate`, `appdb`, `poke`, `kubeconfig` (the one reader of the user's kubeconfig), `drain`, `lifecycle` (the start/stop/close shape every level wears), `workqueue` (keyed work, delivered to one worker), `supervisor` (subjects holding a value, reconciled on a schedule derived from what the last run recorded; `clustersvc`'s `kubeconn` runs on it), `testutil` (test-only helpers, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
@@ -231,7 +231,7 @@ answers from it.
 
 **Never correlate a connection with `State.ServerUID`** — that is the trap this shape exists to
 close, and reading both from one snapshot does not close it. `serverUID` is its own probe,
-*queued* by a committed connection rather than applied by it, so the engine legitimately holds
+*queued* by a committed connection rather than applied by it, so the supervisor legitimately holds
 `{conn: B, serverUID: "uid-A"}` for a dispatch plus a round-trip. Asking the connection who it
 reached has one writer and nothing to pair. A connection nobody has identified answers
 `("", false)` and is refused; the connection is resolved first, so a cluster nothing reached still
@@ -433,7 +433,7 @@ it is suspended), `probing` is that run in flight. The connection alone, of the 
 on; the other four run on their own clocks (readiness 30s, the rest 5-10m), so folding them in
 would count down to whichever happened to be due next. It emits nothing until the
 first pass lands, since a fresh claim's zero state is not "nothing is scheduled". `probing` is
-asserted from the run, never inferred from a countdown that has run out — but the engine publishes
+asserted from the run, never inferred from a countdown that has run out — but the supervisor publishes
 only on a pass, so the in-flight window is not observable yet; see `TODO.md`.
 
 **A claim outlives what it is a claim on.** The file can stop naming a context while a holder
@@ -442,76 +442,76 @@ nothing and is deliberately not a departure: saying so would report every contex
 as the first read takes. `stateHub` is published before `signalHub`, so a reader the signal wakes
 finds the value already there.
 
-#### The probes (`probe.go`) over the engine (`internal/probe`)
+#### The probes (`probe.go`) over the supervisor (`internal/supervisor`)
 
-**The scheduling machinery is `sidecar/internal/probe`** — a reusable engine (a work queue, a
+**The scheduling machinery is `sidecar/internal/supervisor`** — a reusable supervisor (a work queue, a
 level-triggered pass, a schedule derived from recorded state) that knows nothing about
-kube-contexts. A probe is a struct implementing `probe.Probe[T]`, registered with
-`probe.Register(e, name, p, opts...)` — the same shape as a beehive controller, with `T` inferred
+kube-contexts. A probe is a reconciler whose value is an observation, registered with
+`supervisor.Register(e, name, p, opts...)` — the same shape as a beehive controller, with `T` inferred
 from the instance — and `T` is its observable's value type. **The registration name is the
 probe's whole public identity**: the edge options, `Wake`, and every read take one, and
 `Register` returns nothing. `kubeconn`
 keeps what is asked and what the answers mean: `probe.go` is `registerProbes` — five
 registrations kept side by side on purpose, since the set's rules are checked by eye — plus the
-probe structs; `service.go` is leases and publishing. → [ADR: probe
-engine](../docs/adr/2026-08-24-probe-engine.md).
+probe structs; `service.go` is leases and publishing. → [ADR: the supervisor's
+extraction](../docs/adr/2026-08-24-probe-engine.md).
 
 **A run's `Result` is its schedule** — `Succeeded` waits out the interval, `Fail` climbs the
 backoff ladder, `Suspend` and `Skip` wait for a `Wake` — so no domain rule lives in the scheduler.
 `Succeeded().RequeueAfter(d)` asks for the next run sooner, for a wait the run knows the length
 of — beehive's spelling, for the same ask. **Unlike beehive's it can only bring a run forward**,
-since the engine takes it when it is positive and shorter than the registered interval: a probe's
+since the supervisor takes it when it is positive and shorter than the registered interval: a probe's
 registration bounds requests against someone else's cluster, so forget the ask and a subject is
 slower, never wrong. A zero is no ask, not "immediately". Read on a succeeded result and nowhere
 else — `Fail` owns the ladder and `Suspend` schedules nothing.
 
-**A value the engine drops goes back to the probe.** A committed value can own something — a
-connection, a file — and one the engine never applies is one nothing else can reach to release: a
+**A value the supervisor drops goes back to the probe.** A committed value can own something — a
+connection, a file — and one the supervisor never applies is one nothing else can reach to release: a
 commit refused because the subject was removed mid-run, a run that concluded `Skip`, one that
 returned the zero `Result`, one that panicked. A probe implementing `Discard(T)` is handed it
 (`kubeconn`'s connection probe retires the connection); one that does not is unaffected.
 
-**A `Run` body may not take the engine down with it.** One that panics, or that hands back the
-zero `Result`, is recorded as an `Internal` failure and gives its key back — the engine logs it
+**A `Reconcile` body may not take the supervisor down with it.** One that panics, or that hands back the
+zero `Result`, is recorded as an `Internal` failure and gives its key back — the supervisor logs it
 through `slog`, the only place it logs at all. Nothing else reports a bug in a body, and leaving
 one unrecorded wedges the probe twice over: in flight forever, with its key held in the queue.
 
 **Each of `State`'s five observations has one probe behind it**, registered with its own interval
-(a cluster's UID never moves; its readiness moves constantly). The engine owns the observables —
-one value beside one `Attempts` per probe, the value written by that probe's `Run` alone — and
-`Read`/`OnPass` hand them back as a `probe.Snapshot`, frozen at the moment it was taken.
-Anything reads one out of it by registration name (`probe.Get[connInfo](snap, nameConnection)`,
-the `name*` constants), which is how a `Run` reads a sibling and how `stateOf` assembles `State`
-at publish time. **A `probe.Key[T]` states that name↔type pairing once** rather than at every
+(a cluster's UID never moves; its readiness moves constantly). The supervisor owns the observables —
+one value beside one `Attempts` per probe, the value written by that probe's `Reconcile` alone — and
+`Read`/`OnPass` hand them back as a `supervisor.Snapshot`, frozen at the moment it was taken.
+Anything reads one out of it by registration name (`supervisor.Get[connInfo](snap, nameConnection)`,
+the `name*` constants), which is how a `Reconcile` reads a sibling and how `stateOf` assembles `State`
+at publish time. **A `supervisor.Key[T]` states that name↔type pairing once** rather than at every
 read site — `keyConnection.From(snap)`. It is a freestanding declaration: registration never
 hears about it, and the pairing is checked where `Get` checks it, when a value lands. The
 connection is the only observable another probe reads, so it is the only one keyed. Its value
 (`connInfo`) bundles `departed` and the connection with the endpoint; `stateOf` projects only the
 endpoint into `State.Connection`, and `newsOf` walks `probeNames` for the untyped per-probe read.
 
-**A `Run` takes a `probe.Pass[T]` and returns only its `Result`.** The pass carries the run's
+**A `Reconcile` takes a `supervisor.Pass[T]` and returns only its `Result`.** The pass carries the run's
 inputs — `Subject()`, `Prev()`, `Known()`, `Snapshot()` — and `pass.Commit(v)` records what the run found,
-wherever in the body it learns it. The engine buffers that and applies it when the run returns,
+wherever in the body it learns it. The supervisor buffers that and applies it when the run returns,
 in the same critical section as the attempt: nothing is published mid-run, the last call wins,
 and a run that then concludes `Skip` or panics commits nothing.
 
 **`Known()` is what a probe whose zero `T` is an answer needs.** `Prev()` cannot tell "nothing has
-landed" from "the last answer was the zero value", and the engine dates an observation by its
+landed" from "the last answer was the zero value", and the supervisor dates an observation by its
 *value* — so readiness (healthy is the empty `ComponentStatus`) would never commit, and a cluster
 that has never had a failing component would read as never observed. Its guard is
 `!pass.Known() || the set moved`.
 
-**Commit only on a change.** A committed value is what tells the engine the value moved, and so
+**Commit only on a change.** A committed value is what tells the supervisor the value moved, and so
 what re-runs every probe watching it — commit unconditionally and the four behind the connection
-re-run every cycle, which is the intervals they are registered with undone. The engine never
+re-run every cycle, which is the intervals they are registered with undone. The supervisor never
 compares (it holds values as `any`, and a probe's value may be uncomparable or carry funcs), so
 the guard is the body's: `connInfo` is comparable, so it is `if next != pass.Prev()`.
 
 **A probe's result is its schedule** — `Succeeded` (due again after the interval), `Fail` (due up
 the backoff ladder), `Suspend` (nothing due until a `Wake`), `Skip` (record nothing; wait for a
-`Wake`). The four behind reachability declare both edges on it — `probe.WithDependencies` (they
-cannot run without a connection) and `probe.WithWatches` (they read the one it commits). The
-engine records them as `DependencyFailed` rather than dialing while the connection has not
+`Wake`). The four behind reachability declare both edges on it — `supervisor.WithDependencies` (they
+cannot run without a connection) and `supervisor.WithWatches` (they read the one it commits). The
+supervisor records them as `DependencyFailed` rather than dialing while the connection has not
 succeeded — one timeout per cycle, not one per probe — a recovery makes them due again by
 derivation, and a connection whose value moves re-runs them at once.
 
@@ -532,9 +532,9 @@ connection; the pool retires one**, and a rebuild happens on a changed fingerpri
 connection, never the fingerprint alone.
 → [ADR: the connection probe dials /api](../docs/adr/2026-08-25-connection-probe-dial.md).
 
-**Wiring**: `Acquire`'s first holder is `engine.Add`; the last `Release` is `engine.Remove`,
+**Wiring**: `Acquire`'s first holder is `supervisor.Add`; the last `Release` is `supervisor.Remove`,
 under `Service.mu` so a stale release cannot remove the subject a fresh claim just added; the
-kubeconfig watch is `engine.WakeAll(nameConnection)` on every change — every claimed context
+kubeconfig watch is `supervisor.WakeAll(nameConnection)` on every change — every claimed context
 rather than the ones that moved, because finding which moved is what the probe does anyway. `New`
 calls `configureHTTP2Keepalive` (10s/5s, only where unset): the vars are read when a transport is
 built and this package builds them, so a call the composition root has to remember is one that
@@ -550,13 +550,13 @@ that was released between the commit and the pass, which is the one a release co
 `Release` and `Close` retire what the entry holds, or a released context leaves its sockets
 behind.
 
-**Publishing is the engine's `OnPass`** — after every pass, outside the engine's lock,
+**Publishing is the supervisor's `OnPass`** — after every pass, outside the supervisor's lock,
 serialized per context. Two publish rules, because the two feeds answer different questions:
 `stateHub` carries every pass (the timing is what a claim watcher subscribed for, and the
 countdown to the next run is visible nowhere else); `signalHub` fires only when the **news**
 changed — `departed`, `Phase()`, `Identity()`, each probe's `OK()`, never a timestamp — measured
 against `Service.published`, what the fleet was last told. State first, so a reader the signal
-wakes finds the value already there. A claim reads through `engine.Read`, with the entry-identity
+wakes finds the value already there. A claim reads through `supervisor.Read`, with the entry-identity
 check *after* the read so a name released and re-claimed mid-read is never answered on behalf of
 a stale lease.
 
@@ -674,247 +674,7 @@ when a connection vouching for the uid exists — already closed when one does, 
 costs no goroutine — and `AwaitConnFor` is the blocking form, which also hands each refusal to a
 `refused` callback for a holder that reports what it waits on. **Free functions over `Lease`, never methods**, so no fake can get
 the attach-before-check ordering wrong; a waiter lives until it fires or ctx ends, so bound it
-with the work's context. **Neither may be called from a probe `Run`** — blocking holds an engine
-worker, so a probe refuses-and-suspends instead, woken by the fleet bus.
-
-**One context, one entry.** `Service.claimed` is a single map keyed by context name — also the key
-both hubs publish under — holding the holder count, whether the file still names the context, and
-what a probe read. Contexts resolving alike are **not** merged. → [ADR: one connection per
-context](../docs/adr/2026-08-23-one-connection-per-context.md).
-
-#### The probes (`probe.go`) over the engine (`internal/probe`)
-
-**The scheduling machinery is `sidecar/internal/probe`** — a reusable engine (a work queue, a
-level-triggered pass, a schedule derived from recorded state) that knows nothing about
-kube-contexts. A probe is a struct implementing `probe.Probe[T]`, registered with
-`probe.Register(e, name, p, opts...)` — the same shape as a beehive controller, with `T` inferred
-from the instance — and `T` is its observable's value type. **The registration name is the
-probe's whole public identity**: the edge options, `Wake`, and every read take one, and
-`Register` returns nothing. `kubeconn`
-keeps what is asked and what the answers mean: `probe.go` is `registerProbes` — five
-registrations kept side by side on purpose, since the set's rules are checked by eye — plus the
-probe structs; `service.go` is leases and publishing. → [ADR: probe
-engine](../docs/adr/2026-08-24-probe-engine.md).
-
-**A run's `Result` is its schedule** — `Succeeded` waits out the interval, `Fail` climbs the
-backoff ladder, `Suspend` and `Skip` wait for a `Wake` — so no domain rule lives in the scheduler.
-`Succeeded().RequeueAfter(d)` asks for the next run sooner, for a wait the run knows the length
-of — beehive's spelling, for the same ask. **Unlike beehive's it can only bring a run forward**,
-since the engine takes it when it is positive and shorter than the registered interval: a probe's
-registration bounds requests against someone else's cluster, so forget the ask and a subject is
-slower, never wrong. A zero is no ask, not "immediately". Read on a succeeded result and nowhere
-else — `Fail` owns the ladder and `Suspend` schedules nothing.
-
-**A value the engine drops goes back to the probe.** A committed value can own something — a
-connection, a file — and one the engine never applies is one nothing else can reach to release: a
-commit refused because the subject was removed mid-run, a run that concluded `Skip`, one that
-returned the zero `Result`, one that panicked. A probe implementing `Discard(T)` is handed it
-(`kubeconn`'s connection probe retires the connection); one that does not is unaffected.
-
-**A `Run` body may not take the engine down with it.** One that panics, or that hands back the
-zero `Result`, is recorded as an `Internal` failure and gives its key back — the engine logs it
-through `slog`, the only place it logs at all. Nothing else reports a bug in a body, and leaving
-one unrecorded wedges the probe twice over: in flight forever, with its key held in the queue.
-
-**Each of `State`'s five observations has one probe behind it**, registered with its own interval
-(a cluster's UID never moves; its readiness moves constantly). The engine owns the observables —
-one value beside one `Attempts` per probe, the value written by that probe's `Run` alone — and
-`Read`/`OnPass` hand them back as a `probe.Snapshot`, frozen at the moment it was taken.
-Anything reads one out of it by registration name (`probe.Get[connInfo](snap, nameConnection)`,
-the `name*` constants), which is how a `Run` reads a sibling and how `stateOf` assembles `State`
-at publish time. **A `probe.Key[T]` states that name↔type pairing once** rather than at every
-read site — `keyConnection.From(snap)`. It is a freestanding declaration: registration never
-hears about it, and the pairing is checked where `Get` checks it, when a value lands. The
-connection is the only observable another probe reads, so it is the only one keyed. Its value
-(`connInfo`) bundles `departed` and the connection with the endpoint; `stateOf` projects only the
-endpoint into `State.Connection`, and `newsOf` walks `probeNames` for the untyped per-probe read.
-
-**A `Run` takes a `probe.Pass[T]` and returns only its `Result`.** The pass carries the run's
-inputs — `Subject()`, `Prev()`, `Known()`, `Snapshot()` — and `pass.Commit(v)` records what the run found,
-wherever in the body it learns it. The engine buffers that and applies it when the run returns,
-in the same critical section as the attempt: nothing is published mid-run, the last call wins,
-and a run that then concludes `Skip` or panics commits nothing.
-
-**`Known()` is what a probe whose zero `T` is an answer needs.** `Prev()` cannot tell "nothing has
-landed" from "the last answer was the zero value", and the engine dates an observation by its
-*value* — so readiness (healthy is the empty `ComponentStatus`) would never commit, and a cluster
-that has never had a failing component would read as never observed. Its guard is
-`!pass.Known() || the set moved`.
-
-**Commit only on a change.** A committed value is what tells the engine the value moved, and so
-what re-runs every probe watching it — commit unconditionally and the four behind the connection
-re-run every cycle, which is the intervals they are registered with undone. The engine never
-compares (it holds values as `any`, and a probe's value may be uncomparable or carry funcs), so
-the guard is the body's: `connInfo` is comparable, so it is `if next != pass.Prev()`.
-
-**A probe's result is its schedule** — `Succeeded` (due again after the interval), `Fail` (due up
-the backoff ladder), `Suspend` (nothing due until a `Wake`), `Skip` (record nothing; wait for a
-`Wake`). The four behind reachability declare both edges on it — `probe.WithDependencies` (they
-cannot run without a connection) and `probe.WithWatches` (they read the one it commits). The
-engine records them as `DependencyFailed` rather than dialing while the connection has not
-succeeded — one timeout per cycle, not one per probe — a recovery makes them due again by
-derivation, and a connection whose value moves re-runs them at once.
-
-**The connection probe owns the context's lifecycle**, because resolving the kubeconfig is the
-first step of reaching a server. Its classifications: `ReasonContextNotFound` suspends with
-`departed` committed true (the file is the whole truth about presence, and the watch reports it
-moving — a departure is also not a failure streak, being the user's own edit);
-`ReasonResolveFailed` fails up the ladder for both a file that will not resolve and a build that
-will not materialize clients from it (nothing was dialed either way, and the file can be fixed in a
-way `kubeconfig.Service` cannot see, such as a CA path that now opens); an unread file is a `Skip`
-(an unread kubeconfig names nothing, and is deliberately not a departure).
-
-**Reaching the server is one `GET /api`**: the cheapest
-request that proves DNS → TCP → TLS → authentication, the only endpoint of the five probes' that
-can answer 401 or 403, and the one whose body tells a Kubernetes API server from a captive portal
-answering 200 to everything — so empty `versions` is `ReasonMalformed`. **The probe builds a
-connection; the pool retires one**, and a rebuild happens on a changed fingerprint *or* no
-connection, never the fingerprint alone.
-→ [ADR: the connection probe dials /api](../docs/adr/2026-08-25-connection-probe-dial.md).
-
-**Wiring**: `Acquire`'s first holder is `engine.Add`; the last `Release` is `engine.Remove`,
-under `Service.mu` so a stale release cannot remove the subject a fresh claim just added; the
-kubeconfig watch is `engine.WakeAll(nameConnection)` on every change — every claimed context
-rather than the ones that moved, because finding which moved is what the probe does anyway. `New`
-calls `configureHTTP2Keepalive` (10s/5s, only where unset): the vars are read when a transport is
-built and this package builds them, so a call the composition root has to remember is one that
-goes missing.
-
-**Retiring is the pool's because a run cannot do it**: `Pass.Commit` is buffered and applied after
-the run returns, so a probe closing `Done` first would leave holders reconnecting against a `Conn`
-still handing out the dead one. `publish` files what a pass concluded (`record`, one critical section, since a release landing
-between the entry check and the `published` write would announce a claim that is gone and leave a
-baseline the next claim's first pass compares equal to) and retires the connection nothing holds
-any more — including the connection a pass carries for a context
-that was released between the commit and the pass, which is the one a release could not reach.
-`Release` and `Close` retire what the entry holds, or a released context leaves its sockets
-behind.
-
-**Publishing is the engine's `OnPass`** — after every pass, outside the engine's lock,
-serialized per context. Two publish rules, because the two feeds answer different questions:
-`stateHub` carries every pass (the timing is what a claim watcher subscribed for, and the
-countdown to the next run is visible nowhere else); `signalHub` fires only when the **news**
-changed — `departed`, `Phase()`, `Identity()`, each probe's `OK()`, never a timestamp — measured
-against `Service.published`, what the fleet was last told. State first, so a reader the signal
-wakes finds the value already there. A claim reads through `engine.Read`, with the entry-identity
-check *after* the read so a name released and re-claimed mid-read is never answered on behalf of
-a stale lease.
-
-**The leaf's exported types are the boundary's**, aliased rather than copied: `clustersvc.Lease`,
-`Connection`, `ConnIdentity`, `ConnState`, `ConnStateSubscription`. Aliases because an
-`internal/` type cannot be *named* outside, which would leave `Service` unimplementable by the
-resolver tests' fake. The layering exception is in `service.go`'s package doc.
-
-**`State.Identity()` is what the probes last read; `Connection.ServerUID()` is what one connection
-vouches for.** Both exist and they answer different questions. `Identity` is the fleet-facing
-value — comparable, carrying no errors, since why a field is missing belongs on the `Observation`
-that could not read it — and it is what `news` signals on. The connection's own stamp is what an
-identity-scoped caller must use, through `ConnFor`; **never compare a connection against
-`State.ServerUID`**, which is a separate probe's observable and lags a rebuilt connection by a
-round-trip. → [ADR: connection-carried identity](../docs/adr/2026-08-25-connection-carried-identity.md).
-
-**A conflict rebuilds the connection.** `connectionProbe.Run`'s rebuild arm asks the standing
-connection whether it is `conflicted()` — never comparing it against `State.Identity()`, which is
-the stale pairing — and `publish` wakes the connection probe so the rebuild does not wait out the
-30s interval. **The wake is gated on the news having moved**, which is an edge: a `Wake` is a queue
-add rather than a schedule, and a run that returns before the rebuild arm (a kubeconfig that stops
-resolving) leaves the conflict standing, so a level-read condition would hot-loop past the backoff
-ladder. Recording the conflict empties `news.vouchedFor`, so the edge lands on exactly the pass
-that records it, and the interval is the backstop.
-→ [ADR: identity-driven retirement](../docs/adr/2026-08-27-identity-driven-retirement.md).
-Note what a username change does
-**not** cover: ordinary RBAC edits leave it identical, so permissions need the
-`SelfSubjectRulesReview` behind `ClusterPermissions`.
-
-**`State` is what the last probe read about the server, not the connection's own life** —
-whether one is built or retiring surfaces on `Connection.Done()`. **Five probes that fail and go
-stale independently.** A cluster is rebuilt, upgraded, re-issues a token, or revokes a namespace
-read, and none implies the others — so `Connection`, `Readiness`, `ServerUID`,
-`ServerVersion`, and `Principal` are each an `Observation[T]`. Only reachability is a prerequisite; the rest are peers.
-
-**An `Observation` keeps its value through a failure** — a read that stops being permitted does not
-mean the fact changed — and `LastSeen` is what makes the survivor readable: *identified, as of
-10:00* is usable where *ready, as of 10:00* is not. **`LastSeen` dates the value, not the verdict**:
-it moves whenever a value is committed, whatever the run concluded, and on a success that
-re-confirms the standing one. A failing run can still have *read* something — which components are
-down — so dating that by the last success would leave it undated, and would date a replaced answer
-by a read of what it replaced. Beside the value it holds two `Attempt`s and a
-failure run: `Failures` with `FailingSince`, because the ladder widens and a count does not give
-elapsed time. `Known()` is has-ever-answered, `OK()` is answered-last-time, `InFlight()` is
-running-now.
-
-**`Attempt` is one run at any stage of its life** — `ScheduledAt`, then `StartedAt`, then
-`FinishedAt` and the outcome. One type, filled in order, which is why an unfinished run needs no
-second one: `LastAttempt` is the run that finished, `NextAttempt` the one that has not, and a run
-moves between them as it completes. `ScheduledAt` is separate from `StartedAt` because a saturated
-prober lets a scheduled time slip into the past, which a single stamp compared against the clock
-would read as running.
-
-**A probe that has never run is the zero `Observation`** — a zero `LastAttempt` is not `Done`, so
-every accessor answers correctly with no sentinel.
-
-**A zero `NextAttempt` means the probe is suspended**: nothing is due and the last answer stands
-(`Scheduled()` is the accessor). The four probes behind the connection suspend while it is down —
-a server nothing reached cannot answer them — and re-arm when it recovers; a probe that came back
-`Unsupported` stays suspended for the connection's life, since the endpoint is absent rather than
-failing. `DependencyFailed` marks the one cycle where a probe went from running to suspended, and
-the cycles after it schedule nothing, which is what makes a dead cluster cost one timeout per cycle
-instead of one per probe. **Why a probe is suspended is `LastAttempt.Reason`** — no field beside
-`NextAttempt`, since a probe suspends over what its last attempt found. That is why suspending must
-write an attempt instead of going quiet. So *ready, as of 10:00, nothing due* is a state to render, not a stall.
-
-A **disabled** cluster never gets here: the controller drops the claim and the pool stops probing
-credentials nobody holds. `kubeconn` does not learn what disabled means.
-
-**`NextAttempt.ScheduledAt` is the backoff ladder made visible**, and it costs nothing to publish:
-the prober schedules the next run as it finishes the last, so the countdown rides a send it was
-already making. Successive values show the interval widening — otherwise invisible outside the
-prober.
-
-**`Reason` is assigned when the attempt ends**, in our own vocabulary styled as a Kubernetes
-condition reason (`Unreachable`, `Forbidden`, `Unsupported`, `ServiceUnavailable`, …). It has to be:
-`Err` arrives wrapped and does not survive the copy a watcher holds, so a caller sniffing it later
-cannot tell a 403 from a timeout. **It spans layers on purpose** — transport, API response, and
-rules of ours — because a caller asks why a probe failed once, not three times. Names shared with
-`metav1.StatusReason` are the same word for the same thing; the set is not that set.
-
-Two prober traps live here. `NotFound` and `Unsupported` **both arrive as a 404** — the object was
-missing versus the endpoint is not served — and only the probe knows which it asked for, so
-classifying on the code alone permanently suspends a probe that should keep running. And `Dynamic`
-returns `*apierrors.StatusError` carrying the API's own reason, while only the raw endpoints
-(`/readyz`, `/version`) leave a status code as the sole evidence; one switch over codes for both
-discards what the typed half knows. `Canceled` says nothing about the cluster and counts toward neither failure field;
-`DependencyFailed` is a probe recorded rather than attempted, which is what keeps a dead cluster
-costing one timeout per cycle instead of one per probe. Free-form text goes in `Message`, never
-`Reason`.
-
-A `State` is a value copy, but a **shallow** one: the slices inside belong to the prober and every
-watcher shares the backing array.
-
-The pool owns the reading, so every holder agrees: `State.Phase()` is `Pending`/`Unreached`/`Probed`
-off `Connection` (the trap it exists for — no attempt yet is not an attempt that failed), and
-`State.Identity()` projects the three comparable scalars out of the rich observations. The verdicts
-stay above: condition types, reasons, and `Inactive` are the record's vocabulary, not the pool's.
-
-**Everything a holder learns comes through its `Lease`** — `Conn`, `State()`, `WatchState()`,
-`Departed()` — so the pool publishes per context and never asks a holder to know the credentials
-behind one. `WatchState` is a `gobus/watch` receiver keyed by that context. **It delivers nothing
-on attach** — gobus's baseline is a comparison value, not a delivery — so a watcher pairs it with
-`State()` for what is known now. Reading and registering under one lock (`Hub.WithBaseline`, which
-needs an `Accept` to mean anything) is what closes the gap between the two, and is worth having
-once a probe can land at all. **Every value is a level, never an edge** — the hub keeps the latest,
-so a reader that falls behind skips what came between, and transitions come from the record's
-conditions and event timeline.
-
-**Waiting for a usable connection is `ReadyFor`/`AwaitConnFor`**, not a hand-rolled loop. Neither
-`Done()` nor a state frame is the signal an identity-scoped holder needs: retirement puts the
-replacement in the observable *before* `Done()` fires, but that replacement is unstamped for a
-round trip after, so `ConnFor` refuses through the window. `ReadyFor` returns a channel closed
-when a connection vouching for the uid exists — already closed when one does, so the steady state
-costs no goroutine — and `AwaitConnFor` is the blocking form, which also hands each refusal to a
-`refused` callback for a holder that reports what it waits on. **Free functions over `Lease`, never methods**, so no fake can get
-the attach-before-check ordering wrong; a waiter lives until it fires or ctx ends, so bound it
-with the work's context. **Neither may be called from a probe `Run`** — blocking holds an engine
+with the work's context. **Neither may be called from a probe `Reconcile`** — blocking holds a supervisor
 worker, so a probe refuses-and-suspends instead, woken by the fleet bus.
 
 **One context, one entry.** `Service.claimed` is a single map keyed by context name — also the key
@@ -948,10 +708,10 @@ would mean relaying the switch onto hundreds of them.
   cache arms on a later pass instead, and is logged because nothing else would report it.
 - **Nothing syncs into a cache whose connection does not vouch for its `ServerUID`.** The gate is
   the session's: a kind worker holds its own goroutine, so it blocks on `AwaitConnFor`, where a
-  sweep runs on the probe engine and must suspend instead.
+  sweep runs on the supervisor and must suspend instead.
 - **Forgetting is synchronous.** `ForgetDiscovery` returns only when no worker can still write
   through that cache's store, and `ForgetKind` only when that kind's cannot. **A sweep needs both
-  halves**: `probe.Engine.Remove` stops a result being applied but neither cancels the run nor
+  halves**: `supervisor.Supervisor.Remove` stops a result being applied but neither cancels the run nor
   joins it, so every probe body is registered wrapped in `sessionScoped` — the run is counted so
   the teardown waits for it, and its context ends with the session's so the teardown reaches the
   request in flight. Wrapped at registration, because a body that forgot would break the promise
@@ -972,15 +732,15 @@ would mean relaying the switch onto hundreds of them.
 
 #### The sweep (`discovery.go`)
 
-**Discovery runs on `internal/probe`** — three probes over a per-cache subject (the cache id),
+**Discovery runs on `internal/supervisor`** — three probes over a per-cache subject (the cache id),
 `kubeconn`'s shape, since both are periodic pulls whose answers are values. `apiVersions` reads
 `/api`, `apiGroups` reads `/apis` (one preferred group-version per group), and `resources` fans out
 over both on a **data edge**, so a document that has not answered leaves the fan-out `Skip`ped
 rather than failing it. `DiscoveryState` is projected from the snapshot, so the seam stays this
-package's vocabulary rather than the engine's.
+package's vocabulary rather than the supervisor's.
 
 - **A sweep is a probe whose collection cannot be watched.** Plain GETs, no resourceVersion, no
-  watch verb — so it is a cold list with no watch phase, re-listing on the engine's cadence.
+  watch verb — so it is a cold list with no watch phase, re-listing on the supervisor's cadence.
   `SyncKinds` reconciles by fingerprint and prune, as a relist does by mark and sweep.
 - **The answer goes to disk and nowhere else.** The sweep starts no worker and stops none — what is
   mirrored is the records' to say. It publishes news; the mirror pass does the rest.
@@ -993,11 +753,11 @@ package's vocabulary rather than the engine's.
   in the plural, and not the `events.k8s.io` spelling of Event.
 - **A group that will not answer is `Partial`, and blocks the prune.** Its kinds' workers report
   their own verdicts, so a broken aggregated API shows up twice and correctly. `Partial` is the one
-  verdict a `probe.Result` cannot carry (`Succeeded` takes no reason, and both neighbours misprice
+  verdict a `supervisor.Result` cannot carry (`Succeeded` takes no reason, and both neighbours misprice
   the backoff ladder), so it rides two fields on the session.
 - **`IsCRD` comes from a CRD list, matched by (group, plural)** with no version. **Best-effort and
   outside the verdict**: a refusal leaves every kind reading as built-in.
-- **Two loops wake a sweep the engine cannot schedule.** `wakeDiscoverySweepOnConnectionChange`
+- **Two loops wake a sweep the supervisor cannot schedule.** `wakeDiscoverySweepOnConnectionChange`
   carries both directions: a suspended run schedules nothing, so nothing but a wake brings it back
   once a connection vouches for the cache; and a settled run is *scheduled*, so a connection that
   stopped dialing would read `Discovered` until the interval came round. Level-triggered against
@@ -1018,7 +778,7 @@ package's vocabulary rather than the engine's.
 #### The mirror (`kinds.go`)
 
 One kind's rows, held current by a standing stream rather than a pass — which is why it runs on a
-goroutine and not the probe engine.
+goroutine and not the supervisor.
 
 - **The cookie decides which start this is** — not whether the cache holds rows. One on disk means
   a completed LIST landed, so the watch resumes from it; without one the collection is cold-listed
@@ -1051,7 +811,7 @@ goroutine and not the probe engine.
   moves `LastUpdateAt`. `staleAfter` without either is what `Stale` reads off — the rows are still
   served, they have simply stopped being known to be current.
 - **The body owns its retry pacing**, because the worker above re-enters it the moment it returns.
-  A failed run climbs the engine's ladder (`probe.Backoff.Delay`, so a kind's countdown reads the
+  A failed run climbs the supervisor's ladder (`supervisor.Backoff.Delay`, so a kind's countdown reads the
   same as a sweep's) and reports `SyncFailed` with `NextRetryAt`. **`Restarts` is both the reported
   streak and the rung**, and a stream that establishes clears it: an occasional closure hours after
   the last one is the first failure of its own streak and waits the base, where a counter that only

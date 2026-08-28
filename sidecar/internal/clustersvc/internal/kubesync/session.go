@@ -45,7 +45,7 @@ type session struct {
 
 	// wg holds the session's own goroutines — the two wake loops — which carry wakes rather
 	// than running a body, so they are not workers. runs holds the sweeps in flight, which
-	// are the engine's goroutines rather than this session's.
+	// are the supervisor's goroutines rather than this session's.
 	wg   sync.WaitGroup
 	runs sync.WaitGroup
 
@@ -81,11 +81,11 @@ func newSession(s *Service, cacheID int64, p Params) *session {
 	}
 }
 
-// subject is this cache's name on the probe engine.
+// subject is this cache's name on the supervisor.
 func (sess *session) subject() string { return subjectOf(sess.cacheID) }
 
 // start takes the two claims, then arms the sweep and the two things that wake it. The
-// engine owns the sweep's cadence and its backoff ladder, so there is no loop here — only
+// supervisor owns the sweep's cadence and its backoff ladder, so there is no loop here — only
 // the wakes it cannot derive.
 //
 // A store that will not open arms nothing, and the caller retries on its next pass: there
@@ -118,13 +118,13 @@ func (sess *session) start() error {
 		sess.wg.Go(func() { sess.wakeDiscoverySweepOnCatalogChange(sess.ctx, catalogChangeSub) })
 	}
 
-	sess.s.discoveryEngine.Add(sess.subject())
+	sess.s.discoverySupervisor.Add(sess.subject())
 	return nil
 }
 
 // wakeDiscoverySweepOnConnectionChange carries both directions the sweep cannot see for
 // itself. A connection that arrived brings back a sweep that suspended for the want of one,
-// which cannot wait for it because a run in flight holds an engine worker. A connection that
+// which cannot wait for it because a run in flight holds a supervisor worker. A connection that
 // stopped dialing makes a settled verdict wrong, and a settled sweep is scheduled rather than
 // parked — so without this it would read Discovered until its interval came round.
 //
@@ -143,10 +143,10 @@ func (sess *session) wakeDiscoverySweepOnConnectionChange(ctx context.Context, c
 			// only the ones that changed something, so waking on each frame would make a
 			// suspended sweep poll — which is the one thing suspending is for.
 			if sess.discoveryReason() != connectionReason(err, ReasonDiscoveryFailed) {
-				sess.s.discoveryEngine.Wake(sess.subject(), discoveryProbes...)
+				sess.s.discoverySupervisor.Wake(sess.subject(), discoveryProbes...)
 			}
 		case sess.s.sweepParked(sess.subject()):
-			sess.s.discoveryEngine.Wake(sess.subject(), discoveryProbes...)
+			sess.s.discoverySupervisor.Wake(sess.subject(), discoveryProbes...)
 		}
 	}
 }
@@ -183,7 +183,7 @@ func (sess *session) wakeDiscoverySweepOnCatalogChange(ctx context.Context, cata
 			if !ok {
 				return
 			}
-			sess.s.discoveryEngine.Wake(sess.subject(), discoveryProbes...)
+			sess.s.discoverySupervisor.Wake(sess.subject(), discoveryProbes...)
 		}
 	}
 }
@@ -191,7 +191,7 @@ func (sess *session) wakeDiscoverySweepOnCatalogChange(ctx context.Context, cata
 // sweepParked reports a sweep waiting on a wake: a suspended run schedules nothing, so its
 // next attempt is zero.
 func (s *Service) sweepParked(subject string) bool {
-	snap, ok := s.discoveryEngine.Read(subject)
+	snap, ok := s.discoverySupervisor.Read(subject)
 	if !ok {
 		return false
 	}
@@ -311,10 +311,10 @@ func (sess *session) dropKindState(id kindID) {
 }
 
 // restart re-enters every mirror off its cookie and re-runs the sweep. The sweep is a wake
-// rather than a cancel: its runs are the engine's, and a wake is redelivered to one already
+// rather than a cancel: its runs are the supervisor's, and a wake is redelivered to one already
 // in flight.
 func (sess *session) restart() {
-	sess.s.discoveryEngine.Wake(sess.subject(), discoveryProbes...)
+	sess.s.discoverySupervisor.Wake(sess.subject(), discoveryProbes...)
 	for _, w := range sess.workers() {
 		w.restart()
 	}
@@ -328,7 +328,7 @@ func (sess *session) restart() {
 // commits nothing — but it neither cancels that run nor joins it, so the cancel and the wait
 // below are what the release rests on.
 func (sess *session) close() {
-	sess.s.discoveryEngine.Remove(sess.subject())
+	sess.s.discoverySupervisor.Remove(sess.subject())
 	sess.cancel()
 	sess.wait()
 

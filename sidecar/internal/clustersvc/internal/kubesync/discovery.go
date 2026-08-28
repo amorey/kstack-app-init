@@ -17,7 +17,7 @@
 //
 // **Discovery is a probe whose collection cannot be watched.** /api and /apis are plain
 // GETs with no resourceVersion and no watch verb, so a sweep is a cold list with no watch
-// phase and re-lists on the engine's cadence where a kind's worker would go live.
+// phase and re-lists on the supervisor's cadence where a kind's worker would go live.
 // SyncKinds reconciles its answer by fingerprint and prune, as a relist does by mark and
 // sweep. **The answer goes to disk and nowhere else** — the sweep starts no worker and
 // stops none, because what is mirrored is the records' to say; it publishes news and the
@@ -43,7 +43,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
 // The three probes' registration names, which are their whole public identity.
@@ -86,13 +86,13 @@ const eventsAPIGroup = "events.k8s.io"
 
 // registerProbes wires the sweep. Kept side by side on purpose — the set's rules are
 // checked by eye.
-func registerProbes(e *probe.Engine, s *Service) {
-	probe.Register(e, nameAPIVersions, underSession(s, probeAPIVersions), probe.WithInterval(discoveryInterval))
-	probe.Register(e, nameAPIGroups, underSession(s, probeAPIGroups), probe.WithInterval(discoveryInterval))
+func registerProbes(e *supervisor.Supervisor, s *Service) {
+	supervisor.Register(e, nameAPIVersions, underSession(s, probeAPIVersions), supervisor.WithInterval(discoveryInterval))
+	supervisor.Register(e, nameAPIGroups, underSession(s, probeAPIGroups), supervisor.WithInterval(discoveryInterval))
 	// A data edge on both documents and no dependency edge: they are the fan-out's input,
 	// and one that has not answered leaves it Skipped — waiting for the commit that wakes
 	// it — rather than failing over a read another probe already reports.
-	probe.Register(e, nameResources, underSession(s, probeResources), probe.WithInterval(discoveryInterval), probe.WithWatches(nameAPIVersions, nameAPIGroups))
+	supervisor.Register(e, nameResources, underSession(s, probeResources), supervisor.WithInterval(discoveryInterval), supervisor.WithWatches(nameAPIVersions, nameAPIGroups))
 }
 
 // sessionScoped is what every probe body is registered wrapped in. It resolves the session
@@ -103,28 +103,28 @@ func registerProbes(e *probe.Engine, s *Service) {
 // in flight rather than only the schedule. Wrapped at registration because a body that
 // forgot would break the promise silently.
 //
-// The connection half is the identity gate. A sweep runs on the engine, where waiting for
+// The connection half is the identity gate. A sweep runs on the supervisor, where waiting for
 // a connection would hold a worker — so it records why and suspends, and the session's
 // wake loop is what brings it back.
 type sessionScoped[T any] struct {
 	s    *Service
-	body func(ctx context.Context, sess *session, conn *kubeconn.Connection, pass *probe.Pass[T]) probe.Result
+	body func(ctx context.Context, sess *session, conn *kubeconn.Connection, pass *supervisor.Pass[T]) supervisor.Result
 }
 
-func underSession[T any](s *Service, body func(context.Context, *session, *kubeconn.Connection, *probe.Pass[T]) probe.Result) sessionScoped[T] {
+func underSession[T any](s *Service, body func(context.Context, *session, *kubeconn.Connection, *supervisor.Pass[T]) supervisor.Result) sessionScoped[T] {
 	return sessionScoped[T]{s: s, body: body}
 }
 
-func (p sessionScoped[T]) Run(ctx context.Context, pass *probe.Pass[T]) probe.Result {
+func (p sessionScoped[T]) Reconcile(ctx context.Context, pass *supervisor.Pass[T]) supervisor.Result {
 	cacheID, ok := cacheIDOf(pass.Subject())
 	if !ok {
-		return probe.Skip()
+		return supervisor.Skip()
 	}
 	sess, ok := p.s.enterSweep(cacheID)
 	if !ok {
 		// Nothing has armed this cache, or its teardown has begun: either way the claims a
 		// run would write through are going, so it records nothing.
-		return probe.Skip()
+		return supervisor.Skip()
 	}
 	defer sess.leaveSweep()
 
@@ -136,9 +136,9 @@ func (p sessionScoped[T]) Run(ctx context.Context, pass *probe.Pass[T]) probe.Re
 	if err != nil {
 		reason := connectionReason(err, ReasonDiscoveryFailed)
 		if reason == ReasonDiscoveryFailed {
-			return probe.Fail(reason, err)
+			return supervisor.Fail(reason, err)
 		}
-		return probe.Suspend(reason, err.Error())
+		return supervisor.Suspend(reason, err.Error())
 	}
 	return p.body(runCtx, sess, conn, pass)
 }
@@ -157,7 +157,7 @@ func connectionReason(err error, failed Reason) Reason {
 	}
 }
 
-// subjectOf is the engine's name for one cache, and cacheIDOf reads it back.
+// subjectOf is the supervisor's name for one cache, and cacheIDOf reads it back.
 func subjectOf(cacheID int64) string { return strconv.FormatInt(cacheID, 10) }
 
 func cacheIDOf(subject string) (int64, bool) {
@@ -166,29 +166,29 @@ func cacheIDOf(subject string) (int64, bool) {
 }
 
 // probeAPIVersions reads GET /api: the core group's versions, and half the fan-out's input.
-func probeAPIVersions(ctx context.Context, _ *session, conn *kubeconn.Connection, pass *probe.Pass[[]string]) probe.Result {
+func probeAPIVersions(ctx context.Context, _ *session, conn *kubeconn.Connection, pass *supervisor.Pass[[]string]) supervisor.Result {
 	var doc metav1.APIVersions
 	if err := getJSON(ctx, conn, "/api", &doc); err != nil {
-		return probe.Fail(ReasonDiscoveryFailed, err)
+		return supervisor.Fail(ReasonDiscoveryFailed, err)
 	}
 	// Only on a change: a committed value is what re-runs the fan-out watching it.
 	if !pass.Known() || !slices.Equal(pass.Prev(), doc.Versions) {
 		pass.Commit(doc.Versions)
 	}
-	return probe.Succeeded()
+	return supervisor.Succeeded()
 }
 
 // probeAPIGroups reads GET /apis: the group-versions served, one per group.
-func probeAPIGroups(ctx context.Context, _ *session, conn *kubeconn.Connection, pass *probe.Pass[[]string]) probe.Result {
+func probeAPIGroups(ctx context.Context, _ *session, conn *kubeconn.Connection, pass *supervisor.Pass[[]string]) supervisor.Result {
 	var doc metav1.APIGroupList
 	if err := getJSON(ctx, conn, "/apis", &doc); err != nil {
-		return probe.Fail(ReasonDiscoveryFailed, err)
+		return supervisor.Fail(ReasonDiscoveryFailed, err)
 	}
 	next := preferredGroupVersions(doc)
 	if !pass.Known() || !slices.Equal(pass.Prev(), next) {
 		pass.Commit(next)
 	}
-	return probe.Succeeded()
+	return supervisor.Succeeded()
 }
 
 // preferredGroupVersions is one group-version per group. Every served version mirrors the
@@ -212,17 +212,17 @@ func preferredGroupVersions(doc metav1.APIGroupList) []string {
 // probeResources is the fan-out: one document per group-version, filtered to what a worker
 // can mirror, written to kind_catalog. Its value is the fingerprint it committed — the rows
 // belong on disk, and a fingerprint is all "the answer moved" requires.
-func probeResources(ctx context.Context, sess *session, conn *kubeconn.Connection, pass *probe.Pass[uint64]) probe.Result {
+func probeResources(ctx context.Context, sess *session, conn *kubeconn.Connection, pass *supervisor.Pass[uint64]) supervisor.Result {
 	gvs, ok := fanOutInput(pass.Snapshot())
 	if !ok {
 		// Neither document has answered yet. The data edge is what brings this back, so a
 		// group list that will not load leaves the fan-out parked rather than failing it.
-		return probe.Skip()
+		return supervisor.Skip()
 	}
 
 	rows, failed := sweepResources(ctx, conn, gvs)
 	if len(rows) == 0 && len(failed) > 0 {
-		return probe.Fail(ReasonDiscoveryFailed, errors.New(strings.Join(failed, "; ")))
+		return supervisor.Fail(ReasonDiscoveryFailed, errors.New(strings.Join(failed, "; ")))
 	}
 	markCRDs(ctx, conn, rows)
 
@@ -230,7 +230,7 @@ func probeResources(ctx context.Context, sess *session, conn *kubeconn.Connectio
 	fingerprint := fingerprintOf(rows, complete)
 	wrote, err := commitCatalog(ctx, sess.store, rows, complete, fingerprint)
 	if err != nil {
-		return probe.Fail(ReasonDiscoveryFailed, err)
+		return supervisor.Fail(ReasonDiscoveryFailed, err)
 	}
 	if wrote {
 		sess.announce()
@@ -240,14 +240,14 @@ func probeResources(ctx context.Context, sess *session, conn *kubeconn.Connectio
 	if !pass.Known() || fingerprint != pass.Prev() {
 		pass.Commit(fingerprint)
 	}
-	return probe.Succeeded()
+	return supervisor.Succeeded()
 }
 
 // fanOutInput is every group-version to read a document for: the core group's, and one per
 // group. False while nothing has answered, which is the fan-out's cue to park.
-func fanOutInput(snap probe.Snapshot) ([]string, bool) {
-	core := probe.Get[[]string](snap, nameAPIVersions)
-	groups := probe.Get[[]string](snap, nameAPIGroups)
+func fanOutInput(snap supervisor.Snapshot) ([]string, bool) {
+	core := supervisor.Get[[]string](snap, nameAPIVersions)
+	groups := supervisor.Get[[]string](snap, nameAPIGroups)
 	if !core.Known() || !groups.Known() {
 		return nil, false
 	}
@@ -376,13 +376,13 @@ func fingerprintOf(rows []kubestore.KindRow, prune bool) uint64 {
 	return h.Sum64()
 }
 
-// discoveryStateOf projects the engine's snapshot into what the seam serves. partial and
+// discoveryStateOf projects the supervisor's snapshot into what the seam serves. partial and
 // message are the session's own record of the last sweep, which no Result can carry.
-func discoveryStateOf(snap probe.Snapshot, partial bool, message string) DiscoveryState {
+func discoveryStateOf(snap supervisor.Snapshot, partial bool, message string) DiscoveryState {
 	state := DiscoveryState{
-		APIVersions: probe.Get[[]string](snap, nameAPIVersions),
-		APIGroups:   probe.Get[[]string](snap, nameAPIGroups),
-		Resources:   probe.Get[uint64](snap, nameResources),
+		APIVersions: supervisor.Get[[]string](snap, nameAPIVersions),
+		APIGroups:   supervisor.Get[[]string](snap, nameAPIGroups),
+		Resources:   supervisor.Get[uint64](snap, nameResources),
 	}
 	state.Reason, state.Message = discoveryVerdict(state, partial, message)
 	return state
@@ -394,12 +394,12 @@ func discoveryStateOf(snap probe.Snapshot, partial bool, message string) Discove
 func discoveryVerdict(state DiscoveryState, partial bool, message string) (string, string) {
 	reads := []Attempts{state.APIVersions.Attempts, state.APIGroups.Attempts, state.Resources.Attempts}
 	for _, a := range reads {
-		if a.LastAttempt.Verdict == probe.VerdictSuspended {
+		if a.LastAttempt.Verdict == supervisor.VerdictSuspended {
 			return string(a.LastAttempt.Reason), a.LastAttempt.Message
 		}
 	}
 	for _, a := range reads {
-		if a.LastAttempt.Verdict == probe.VerdictFailed {
+		if a.LastAttempt.Verdict == supervisor.VerdictFailed {
 			return ReasonDiscoveryFailed, a.LastAttempt.Message
 		}
 	}
@@ -413,7 +413,7 @@ func discoveryVerdict(state DiscoveryState, partial bool, message string) (strin
 }
 
 // getJSON reads one raw API path over the connection's pooled client — rather than
-// client-go's discovery client, which takes no context, and a leg the engine cancels needs
+// client-go's discovery client, which takes no context, and a leg the supervisor cancels needs
 // one. The documents have no collection semantics: no paging, no watch.
 func getJSON(ctx context.Context, conn *kubeconn.Connection, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, conn.BaseURL.JoinPath(path).String(), nil)

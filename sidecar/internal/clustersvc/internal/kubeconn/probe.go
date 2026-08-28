@@ -13,10 +13,10 @@
 // limitations under the License.
 
 // The five probes over one kube-context's server: what each asks and how the answers classify.
-// Scheduling belongs to the engine (internal/probe) — each probe behind reachability declares its
+// Scheduling belongs to the supervisor (internal/supervisor) — each probe behind reachability declares its
 // dependency on the connection rather than testing it.
 //
-// While the connection has not succeeded the engine records the four behind it as
+// While the connection has not succeeded the supervisor records the four behind it as
 // DependencyFailed rather than dialing: one timeout per cycle, not one per probe.
 package kubeconn
 
@@ -30,11 +30,11 @@ import (
 	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
 // Registration names are how probes are addressed everywhere: the edges, Wake, and every read
-// take one. A probe body reads a sibling with probe.Get[T](snap, nameConnection).
+// take one. A probe body reads a sibling with supervisor.Get[T](snap, nameConnection).
 const (
 	nameConnection    = "connection"
 	nameReadiness     = "readiness"
@@ -48,7 +48,7 @@ var probeNames = [...]string{nameConnection, nameReadiness, nameServerUID, nameS
 
 // keyConnection reads the connection's observable — the only one another probe needs, so the
 // only one with a key.
-var keyConnection = probe.NewKey[connInfo](nameConnection)
+var keyConnection = supervisor.NewKey[connInfo](nameConnection)
 
 // connInfo is the connection probe's observable: the context's standing in the kubeconfig, and
 // the connection reaching its server yields.
@@ -68,19 +68,19 @@ type connInfo struct {
 	fingerprint string
 }
 
-func registerProbes(e *probe.Engine, kubecfg kubeconfigService) {
+func registerProbes(e *supervisor.Supervisor, kubecfg kubeconfigService) {
 	// A reachability check that has taken ten seconds has answered, so the timeout is
-	// shorter than the engine's default (a whole interval).
-	probe.Register(e, nameConnection, &connectionProbe{kubecfgSvc: kubecfg},
-		probe.WithInterval(30*time.Second), probe.WithTimeout(10*time.Second))
+	// shorter than the supervisor's default (a whole interval).
+	supervisor.Register(e, nameConnection, &connectionProbe{kubecfgSvc: kubecfg},
+		supervisor.WithInterval(30*time.Second), supervisor.WithTimeout(10*time.Second))
 
 	// The four behind reachability declare both edges on it: they cannot run without a
 	// connection, and a connection that moves must re-run them.
-	dependsOnConn, watchesConn := probe.WithDependencies(nameConnection), probe.WithWatches(nameConnection)
-	probe.Register(e, nameReadiness, readinessProbe{}, probe.WithInterval(30*time.Second), dependsOnConn, watchesConn)
-	probe.Register(e, nameServerUID, serverUIDProbe{}, probe.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
-	probe.Register(e, nameServerVersion, serverVersionProbe{}, probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
-	probe.Register(e, namePrincipal, principalProbe{}, probe.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
+	dependsOnConn, watchesConn := supervisor.WithDependencies(nameConnection), supervisor.WithWatches(nameConnection)
+	supervisor.Register(e, nameReadiness, readinessProbe{}, supervisor.WithInterval(30*time.Second), dependsOnConn, watchesConn)
+	supervisor.Register(e, nameServerUID, serverUIDProbe{}, supervisor.WithInterval(10*time.Minute), dependsOnConn, watchesConn)
+	supervisor.Register(e, nameServerVersion, serverVersionProbe{}, supervisor.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
+	supervisor.Register(e, namePrincipal, principalProbe{}, supervisor.WithInterval(5*time.Minute), dependsOnConn, watchesConn)
 }
 
 // The paths the four probes behind reachability read. selfSubjectReviewPath is
@@ -99,21 +99,21 @@ const (
 var selfSubjectReviewBody = []byte(`{"apiVersion":"authentication.k8s.io/v1","kind":"SelfSubjectReview"}`)
 
 // connFrom is the connection a probe behind reachability runs over. Nil is unreachable while the
-// engine holds them behind the connection probe's success — a departure commits no connection and
+// supervisor holds them behind the connection probe's success — a departure commits no connection and
 // suspends, which reads as a failed dependency — so a run that finds one parks for the wake the
 // connection's next move sends rather than recording an answer no request produced.
-func connFrom(snap probe.Snapshot) *Connection { return keyConnection.From(snap).Value.conn }
+func connFrom(snap supervisor.Snapshot) *Connection { return keyConnection.From(snap).Value.conn }
 
 // failed is what a run concluded from a request that did not answer.
 //
-// Cancellation is the caller going away — the engine stopping, not the cluster — so the run
+// Cancellation is the caller going away — the supervisor stopping, not the cluster — so the run
 // records nothing at all rather than opening a failure streak against a server that refused
 // nothing. Every other error is classified.
-func failed(err error) probe.Result {
+func failed(err error) supervisor.Result {
 	if errors.Is(err, context.Canceled) {
-		return probe.Skip()
+		return supervisor.Skip()
 	}
-	return probe.Fail(classify(err), err)
+	return supervisor.Fail(classify(err), err)
 }
 
 // endpointGone reports whether err is the 404 that means the endpoint itself is absent.
@@ -141,12 +141,12 @@ type connectionProbe struct {
 }
 
 // Run resolves the context, keeps its connection current, and dials the server once.
-func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) probe.Result {
+func (p *connectionProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[connInfo]) supervisor.Result {
 	cfg, fingerprint, err := p.kubecfgSvc.RESTConfig(pass.Subject())
 	if errors.Is(err, kubeconfig.ErrNotRead) {
 		// An unread kubeconfig names nothing; saying so would report every context gone
 		// for as long as the first read takes. The watch wakes us when it is read.
-		return probe.Skip()
+		return supervisor.Skip()
 	}
 
 	next := pass.Prev()
@@ -161,7 +161,7 @@ func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) p
 
 	if errors.Is(err, kubeconfig.ErrContextNotFound) {
 		next = connInfo{departed: true}
-		return probe.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context")
+		return supervisor.Suspend(ReasonContextNotFound, "kubeconfig no longer names this context")
 	}
 	next.departed = false
 	if err != nil {
@@ -171,7 +171,7 @@ func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) p
 		// failed says nothing about the credentials behind it, and an editor saving
 		// non-atomically fails reads for a moment. Credentials that really moved come back
 		// as a changed fingerprint.
-		return probe.Fail(ReasonResolveFailed, err)
+		return supervisor.Fail(ReasonResolveFailed, err)
 	}
 
 	// Rebuild on a changed fingerprint or no connection — never the fingerprint alone: a
@@ -190,7 +190,7 @@ func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) p
 		if err != nil {
 			// Nothing was dialed; the remedy is the same file fix a context that will
 			// not resolve needs.
-			return probe.Fail(ReasonResolveFailed, err)
+			return supervisor.Fail(ReasonResolveFailed, err)
 		}
 		next.endpoint = conn.BaseURL.String()
 	}
@@ -199,17 +199,17 @@ func (p *connectionProbe) Run(ctx context.Context, pass *probe.Pass[connInfo]) p
 		Versions []string `json:"versions"`
 	}
 	if err := next.conn.getJSON(ctx, apiDiscoveryPath, &discovery); err != nil {
-		// A cancellation records nothing, and the engine hands the connection this run
+		// A cancellation records nothing, and the supervisor hands the connection this run
 		// built back through Discard.
 		return failed(err)
 	}
 	if len(discovery.Versions) == 0 {
-		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without API versions", apiDiscoveryPath))
+		return supervisor.Fail(ReasonMalformed, fmt.Errorf("%s: answered without API versions", apiDiscoveryPath))
 	}
-	return probe.Succeeded()
+	return supervisor.Succeeded()
 }
 
-// Discard retires a connection the engine dropped — a run whose commit it refused because the
+// Discard retires a connection the supervisor dropped — a run whose commit it refused because the
 // context was released mid-run, one that concluded Skip, or one that panicked. Such a value
 // reaches neither a snapshot nor an entry, so nothing else can retire what it built.
 //
@@ -229,10 +229,10 @@ func (p *connectionProbe) Discard(v connInfo) {
 // being able to say which part.
 type readinessProbe struct{}
 
-func (readinessProbe) Run(ctx context.Context, pass *probe.Pass[ComponentStatus]) probe.Result {
+func (readinessProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[ComponentStatus]) supervisor.Result {
 	conn := connFrom(pass.Snapshot())
 	if conn == nil {
-		return probe.Skip()
+		return supervisor.Skip()
 	}
 
 	_, err := conn.getText(ctx, readyzPath)
@@ -240,20 +240,20 @@ func (readinessProbe) Run(ctx context.Context, pass *probe.Pass[ComponentStatus]
 	switch {
 	case err == nil:
 		commitStatus(pass, ComponentStatus{})
-		return probe.Succeeded()
+		return supervisor.Succeeded()
 	case endpointGone(err):
 		// A managed distribution that withholds it will not start serving it: terminal for
 		// this connection, and a new one re-arms the probe.
-		return probe.Suspend(ReasonUnsupported, "the server does not serve "+readyzPath)
+		return supervisor.Suspend(ReasonUnsupported, "the server does not serve "+readyzPath)
 	case errors.As(err, &status) && status.code == http.StatusInternalServerError:
 		failing := failingComponents(status.body)
 		if len(failing) == 0 {
 			// A 500 from something that is not the readyz handler: it answered, but not
 			// with the one thing this endpoint's failure is supposed to carry.
-			return probe.Fail(ReasonInternalError, err)
+			return supervisor.Fail(ReasonInternalError, err)
 		}
 		commitStatus(pass, ComponentStatus{Failing: failing})
-		return probe.Fail(ReasonComponentsFailing, fmt.Errorf("%s: %s", readyzPath, strings.Join(failing, ", ")))
+		return supervisor.Fail(ReasonComponentsFailing, fmt.Errorf("%s: %s", readyzPath, strings.Join(failing, ", ")))
 	default:
 		return failed(err)
 	}
@@ -264,7 +264,7 @@ func (readinessProbe) Run(ctx context.Context, pass *probe.Pass[ComponentStatus]
 // cluster that has never had a failing component never commits, and its readiness reads as never
 // observed. ComponentStatus carries a slice, so neither can be the == the comparable observables
 // use.
-func commitStatus(pass *probe.Pass[ComponentStatus], next ComponentStatus) {
+func commitStatus(pass *supervisor.Pass[ComponentStatus], next ComponentStatus) {
 	if !pass.Known() || !slices.Equal(next.Failing, pass.Prev().Failing) {
 		pass.Commit(next)
 	}
@@ -293,10 +293,10 @@ func failingComponents(body string) []string {
 // endpoint that never moved.
 type serverUIDProbe struct{}
 
-func (serverUIDProbe) Run(ctx context.Context, pass *probe.Pass[string]) probe.Result {
+func (serverUIDProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[string]) supervisor.Result {
 	conn := connFrom(pass.Snapshot())
 	if conn == nil {
-		return probe.Skip()
+		return supervisor.Skip()
 	}
 
 	var ns struct {
@@ -308,12 +308,12 @@ func (serverUIDProbe) Run(ctx context.Context, pass *probe.Pass[string]) probe.R
 		if endpointGone(err) {
 			// The namespace is absent, not the endpoint — news about the cluster, and a
 			// probe that keeps asking, since it can be created.
-			return probe.Fail(ReasonNotFound, err)
+			return supervisor.Fail(ReasonNotFound, err)
 		}
 		return failed(err)
 	}
 	if ns.Metadata.UID == "" {
-		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a UID", kubeSystemPath))
+		return supervisor.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a UID", kubeSystemPath))
 	}
 
 	// Stamped unconditionally, committed only on a change: the two answer different
@@ -326,16 +326,16 @@ func (serverUIDProbe) Run(ctx context.Context, pass *probe.Pass[string]) probe.R
 	if ns.Metadata.UID != pass.Prev() {
 		pass.Commit(ns.Metadata.UID)
 	}
-	return probe.Succeeded()
+	return supervisor.Succeeded()
 }
 
 // serverVersionProbe reads the API server's reported version.
 type serverVersionProbe struct{}
 
-func (serverVersionProbe) Run(ctx context.Context, pass *probe.Pass[VersionInfo]) probe.Result {
+func (serverVersionProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[VersionInfo]) supervisor.Result {
 	conn := connFrom(pass.Snapshot())
 	if conn == nil {
-		return probe.Skip()
+		return supervisor.Skip()
 	}
 
 	var body struct {
@@ -347,24 +347,24 @@ func (serverVersionProbe) Run(ctx context.Context, pass *probe.Pass[VersionInfo]
 		return failed(err)
 	}
 	if body.GitVersion == "" {
-		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a version", versionPath))
+		return supervisor.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a version", versionPath))
 	}
 
 	next := VersionInfo{GitVersion: body.GitVersion, Major: body.Major, Minor: body.Minor}
 	if next != pass.Prev() {
 		pass.Commit(next)
 	}
-	return probe.Succeeded()
+	return supervisor.Succeeded()
 }
 
 // principalProbe asks the server who these credentials authenticate as, which is the only
 // authoritative answer: a token names its subject to the server, not to us.
 type principalProbe struct{}
 
-func (principalProbe) Run(ctx context.Context, pass *probe.Pass[Principal]) probe.Result {
+func (principalProbe) Reconcile(ctx context.Context, pass *supervisor.Pass[Principal]) supervisor.Result {
 	conn := connFrom(pass.Snapshot())
 	if conn == nil {
-		return probe.Skip()
+		return supervisor.Skip()
 	}
 
 	var review struct {
@@ -379,12 +379,12 @@ func (principalProbe) Run(ctx context.Context, pass *probe.Pass[Principal]) prob
 		if endpointGone(err) {
 			// A server too old to serve it will not grow the endpoint under us. Terminal
 			// for this connection, and a new one re-arms the probe.
-			return probe.Suspend(ReasonUnsupported, "the server does not serve "+selfSubjectReviewPath)
+			return supervisor.Suspend(ReasonUnsupported, "the server does not serve "+selfSubjectReviewPath)
 		}
 		return failed(err)
 	}
 	if review.Status.UserInfo.Username == "" {
-		return probe.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a username", selfSubjectReviewPath))
+		return supervisor.Fail(ReasonMalformed, fmt.Errorf("%s: answered without a username", selfSubjectReviewPath))
 	}
 
 	next := Principal{Username: review.Status.UserInfo.Username, Groups: review.Status.UserInfo.Groups}
@@ -394,5 +394,5 @@ func (principalProbe) Run(ctx context.Context, pass *probe.Pass[Principal]) prob
 	if next.Username != pass.Prev().Username || !slices.Equal(next.Groups, pass.Prev().Groups) {
 		pass.Commit(next)
 	}
-	return probe.Succeeded()
+	return supervisor.Succeeded()
 }

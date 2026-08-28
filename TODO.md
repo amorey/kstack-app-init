@@ -45,8 +45,8 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   the status code alone discards what the typed half already knows (`state.go` states the rule).
   Every probe reads a raw path today, so nothing has reached it yet.
 
-- **`clusterScheduleWatch.probing` is always false, because the engine publishes only on a pass.**
-  `probe.Engine` fires `OnPass` after a pass and nowhere else (`sidecar/internal/probe/engine.go`),
+- **`clusterScheduleWatch.probing` is always false, because the supervisor publishes only on a pass.**
+  `supervisor.Supervisor` fires `OnPass` after a pass and nowhere else (`sidecar/internal/supervisor/supervisor.go`),
   so the snapshot kubeconn projects into `State` never has `Attempts.InFlight()` set: the pass
   publishes with the run queued and not yet started, and the next publish is the commit, by which
   time it has finished. `clusterSchedule` (`sidecar/internal/clustersvc/clusters.go`) reads the flag
@@ -61,10 +61,10 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   serialization point, not just a second call. Weigh a separate hook against widening `OnPass`,
   since "after every pass" is a contract kubeconn's `publish` reads literally.
 
-- **`probe.Engine`'s `Wake`/`WakeAll` pair reads as one axis and is two.** `Wake(subjectName string, names ...string)` takes named probes on **one** subject; `WakeAll(names ...string)` takes named probes across **every** subject. The variadic means the same thing in both, and `All` varies the argument that is not there — so `WakeAll` reads as "wake every probe" when it means "wake these probes everywhere". Both call sites are correct today: `watchKubeconfig` wants `WakeAll(nameConnection)` (one probe, whole fleet) and `Retry` wants `Wake(contextName, probeNames[:]...)` (one context, every probe) — they are exact transposes, which is what makes the pair easy to reach for backwards. **Fix:** rename `WakeAll` to name its axis (`WakeEverySubject`, or `WakeSubjects`), two call sites plus `engine_test.go` and the `sidecar/CLAUDE.md` wiring line. **Weigh:** the engine is a general leaf and `WakeAll` is the shorter, more conventional spelling; the case for renaming rests on the pair being read together, which is exactly when the ambiguity bites.
+- **`supervisor.Supervisor`'s `Wake`/`WakeAll` pair reads as one axis and is two.** `Wake(subjectName string, names ...string)` takes named probes on **one** subject; `WakeAll(names ...string)` takes named probes across **every** subject. The variadic means the same thing in both, and `All` varies the argument that is not there — so `WakeAll` reads as "wake every probe" when it means "wake these probes everywhere". Both call sites are correct today: `watchKubeconfig` wants `WakeAll(nameConnection)` (one probe, whole fleet) and `Retry` wants `Wake(contextName, probeNames[:]...)` (one context, every probe) — they are exact transposes, which is what makes the pair easy to reach for backwards. **Fix:** rename `WakeAll` to name its axis (`WakeEverySubject`, or `WakeSubjects`), two call sites plus `engine_test.go` and the `sidecar/CLAUDE.md` wiring line. **Weigh:** the engine is a general leaf and `WakeAll` is the shorter, more conventional spelling; the case for renaming rests on the pair being read together, which is exactly when the ambiguity bites.
 
-- **`probe.Engine`'s run queue has no debounce.** `runQ` and `passQ` are `internal/workqueue`
-  queues (`sidecar/internal/probe/engine.go`). **Deduping is not debouncing** — a key waits once,
+- **`supervisor.Supervisor`'s run queue has no debounce.** `runQ` and `passQ` are `internal/workqueue`
+  queues (`sidecar/internal/supervisor/supervisor.go`). **Deduping is not debouncing** — a key waits once,
   but only while it is waiting, and one added while a worker holds it is queued afresh on `Done`,
   so asks spread across a run are a run apiece. For the connection probe each one re-reads the
   kubeconfig and the CA files behind it, then dials `/api`.

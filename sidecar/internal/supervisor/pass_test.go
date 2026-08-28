@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package probe
+package supervisor
 
 import (
 	"testing"
@@ -31,7 +31,7 @@ func TestAPassCarriesTheRunsInputsAndRecordsNothingByDefault(t *testing.T) {
 	assert.False(t, ok, "a run that said nothing recorded nothing")
 }
 
-// One run, one value: a body that learns twice records the second, so the engine has one thing
+// One run, one value: a body that learns twice records the second, so the supervisor has one thing
 // to apply and the watchers one thing to wake for.
 func TestTheLastCommitOnAPassWins(t *testing.T) {
 	p := NewPass("ctx-1", ptr("v0"), Snapshot{})
@@ -60,10 +60,10 @@ func TestAPassCarriesTheSnapshotItWasHanded(t *testing.T) {
 }
 
 // ptr is the prior value a pass carries, which NewPass takes by pointer so a test can say a
-// probe has committed nothing at all.
+// reconciler has committed nothing at all.
 func ptr[T any](v T) *T { return &v }
 
-// A probe whose zero T is a legitimate answer needs to tell "nothing has landed" from "the last
+// A reconciler whose zero T is a legitimate answer needs to tell "nothing has landed" from "the last
 // answer was the zero value", which Prev alone cannot say.
 func TestPassReportsWhetherAValueHasLanded(t *testing.T) {
 	fresh := NewPass[string]("ctx-1", nil, Snapshot{})

@@ -26,22 +26,22 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
 // connect runs the connection probe's body once, on the test's goroutine, and applies what it
-// recorded the way the engine would.
-func connect(t *testing.T, cfg *fakeKubeconfig, v connInfo) (probe.Result, connInfo) {
+// recorded the way the supervisor would.
+func connect(t *testing.T, cfg *fakeKubeconfig, v connInfo) (supervisor.Result, connInfo) {
 	t.Helper()
-	pass := probe.NewPass("prod", &v, probe.Snapshot{})
-	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
+	pass := supervisor.NewPass("prod", &v, supervisor.Snapshot{})
+	res := (&connectionProbe{kubecfgSvc: cfg}).Reconcile(t.Context(), pass)
 	if next, ok := pass.Updated(); ok {
 		v = next
 	}
 	return res, v
 }
 
-// The engine reads a committed value as one that moved and wakes whoever reads it, so a probe
+// The supervisor reads a committed value as one that moved and wakes whoever reads it, so a probe
 // that found nothing new must hand back nothing — or the four behind it re-run every cycle and
 // their intervals stop meaning anything.
 func TestTheConnectionProbeCommitsOnlyOnAChange(t *testing.T) {
@@ -49,8 +49,8 @@ func TestTheConnectionProbeCommitsOnlyOnAChange(t *testing.T) {
 	_, first := connect(t, cfg, connInfo{departed: true})
 	require.False(t, first.departed, "the context resolves, so it is back")
 
-	pass := probe.NewPass("prod", &first, probe.Snapshot{})
-	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
+	pass := supervisor.NewPass("prod", &first, supervisor.Snapshot{})
+	res := (&connectionProbe{kubecfgSvc: cfg}).Reconcile(t.Context(), pass)
 
 	assert.Equal(t, ReasonUnreachable, res.Reason())
 	_, recorded := pass.Updated()
@@ -93,7 +93,7 @@ func TestConnectionSuspendsADepartedContext(t *testing.T) {
 
 	res, v := connect(t, cfg, connInfo{})
 
-	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSuspended, res.Verdict())
 	assert.Equal(t, ReasonContextNotFound, res.Reason())
 	assert.True(t, v.departed)
 }
@@ -106,7 +106,7 @@ func TestConnectionFailsWhenTheFileWillNotResolve(t *testing.T) {
 
 	res, v := connect(t, cfg, connInfo{departed: true})
 
-	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, supervisor.VerdictFailed, res.Verdict())
 	assert.Equal(t, ReasonResolveFailed, res.Reason())
 	assert.ErrorIs(t, res.Err(), cfg.err)
 	assert.False(t, v.departed, "the file names it, so it has not departed")
@@ -131,7 +131,7 @@ func TestConnectionSucceedsWhenTheServerAnswers(t *testing.T) {
 
 	res, v := connect(t, cfg, connInfo{departed: true})
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.False(t, v.departed, "a context that resolves again is back")
 	assert.NotNil(t, v.conn)
 	assert.Equal(t, srv.URL, v.endpoint)
@@ -147,7 +147,7 @@ func TestConnectionFailsWithWhatTheServerSaid(t *testing.T) {
 
 	res, v := connect(t, serving(srv, "prod", "key-1"), connInfo{})
 
-	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, supervisor.VerdictFailed, res.Verdict())
 	assert.Equal(t, ReasonUnauthorized, res.Reason())
 	assert.NotNil(t, v.conn, "the credentials resolved, so the connection stands")
 }
@@ -155,7 +155,7 @@ func TestConnectionFailsWithWhatTheServerSaid(t *testing.T) {
 func TestConnectionFailsWhenNothingAnswers(t *testing.T) {
 	res, _ := connect(t, resolving("prod", "key-1"), connInfo{})
 
-	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, supervisor.VerdictFailed, res.Verdict())
 	assert.Equal(t, ReasonUnreachable, res.Reason())
 }
 
@@ -169,7 +169,7 @@ func TestConnectionFailsWhenTheAnswerIsNotKubernetes(t *testing.T) {
 
 	res, _ := connect(t, serving(srv, "prod", "key-1"), connInfo{})
 
-	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, supervisor.VerdictFailed, res.Verdict())
 	assert.Equal(t, ReasonMalformed, res.Reason())
 }
 
@@ -181,10 +181,10 @@ func TestConnectionKeepsItsConnectionWhileTheCredentialsHold(t *testing.T) {
 	_, first := connect(t, cfg, connInfo{})
 	require.NotNil(t, first.conn)
 
-	pass := probe.NewPass("prod", &first, probe.Snapshot{})
-	res := (&connectionProbe{kubecfgSvc: cfg}).Run(t.Context(), pass)
+	pass := supervisor.NewPass("prod", &first, supervisor.Snapshot{})
+	res := (&connectionProbe{kubecfgSvc: cfg}).Reconcile(t.Context(), pass)
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	_, recorded := pass.Updated()
 	assert.False(t, recorded, "nothing moved, so nothing is committed")
 }
@@ -199,7 +199,7 @@ func TestConnectionRebuildsWhenTheCredentialsMove(t *testing.T) {
 	cfg.rotate("prod", "key-2")
 	res, second := connect(t, cfg, first)
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.NotSame(t, first.conn, second.conn)
 	assert.Equal(t, "key-2", second.fingerprint)
 }
@@ -217,7 +217,7 @@ func TestConnectionRebuildsWhenItsServerWasReplaced(t *testing.T) {
 	first.conn.setServerUID("uid-2")
 	res, second := connect(t, cfg, first)
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.NotSame(t, first.conn, second.conn, "the conflicted connection is replaced")
 	assert.False(t, second.conn.conflicted(), "and the replacement vouches for nobody yet")
 	assert.Equal(t, "key-1", second.fingerprint, "over credentials that never moved")
@@ -287,11 +287,11 @@ func TestConnectionBuildsAgainAfterABuildThatFailed(t *testing.T) {
 	cfg.host = srv.URL
 	res, built := connect(t, cfg, failed)
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.NotNil(t, built.conn, "the fingerprint did not move, but there was no connection")
 }
 
-// --- through the engine ---
+// --- through the supervisor ---
 
 // The four probes behind the connection are recorded rather than dialed while nothing has
 // succeeded at reaching the server: one timeout per cycle, not one per probe.
@@ -354,7 +354,7 @@ func TestAResolveFailureKeepsAsking(t *testing.T) {
 
 	// The retry sits out on the ladder; the wake stands in for it, as a worked answer the
 	// schedule would eventually produce.
-	s.engine.Wake("prod", nameConnection)
+	s.supervisor.Wake("prod", nameConnection)
 
 	second := awaitState(t, watched, func(st State) bool {
 		return st.Connection.Failures >= 2
@@ -362,7 +362,7 @@ func TestAResolveFailureKeepsAsking(t *testing.T) {
 	assert.Equal(t, first.FailingSince, second.FailingSince, "one run of failures, not two")
 }
 
-// The engine hands back what a run committed when it drops the value — a commit refused because
+// The supervisor hands back what a run committed when it drops the value — a commit refused because
 // the context was released mid-run, a Skip, a panic. Nothing else can reach that connection: it
 // reached neither a snapshot nor an entry.
 func TestDiscardRetiresWhatTheRunBuilt(t *testing.T) {
@@ -389,19 +389,19 @@ func TestReadinessCommitsItsFirstHealthyAnswer(t *testing.T) {
 
 	res, v, committed := runProbe(t, readinessProbe{}, conn, nil)
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.True(t, committed, "the first answer lands whatever it says")
 	assert.Empty(t, v.Failing)
 }
 
-// Every healthy answer after it moves nothing, and the engine wakes whoever watches a committed
+// Every healthy answer after it moves nothing, and the supervisor wakes whoever watches a committed
 // value — so a cluster that stays ready must stop committing.
 func TestReadinessCommitsNothingWhileTheServerStaysReady(t *testing.T) {
 	conn := connTo(t, serveCluster(t).Server)
 
 	res, _, committed := runProbe(t, readinessProbe{}, conn, &ComponentStatus{})
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.False(t, committed)
 }
 
@@ -414,7 +414,7 @@ func TestReadinessNamesTheComponentsThatFailed(t *testing.T) {
 
 	res, v, committed := runProbe(t, readinessProbe{}, connTo(t, cs.Server), nil)
 
-	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, supervisor.VerdictFailed, res.Verdict())
 	assert.Equal(t, ReasonComponentsFailing, res.Reason())
 	assert.Equal(t, []string{"etcd", "informer-sync"}, v.Failing)
 	assert.True(t, committed)
@@ -441,7 +441,7 @@ func TestReadinessSuspendsWhenTheEndpointIsAbsent(t *testing.T) {
 
 	res, _, _ := runProbe(t, readinessProbe{}, connTo(t, cs.Server), nil)
 
-	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSuspended, res.Verdict())
 	assert.Equal(t, ReasonUnsupported, res.Reason())
 }
 
@@ -461,12 +461,12 @@ func TestReadinessClearsWhatItReportedWhenTheServerRecovers(t *testing.T) {
 
 	res, v, committed := runProbe(t, readinessProbe{}, conn, &ComponentStatus{Failing: []string{"etcd"}})
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.True(t, committed)
 	assert.Empty(t, v.Failing)
 }
 
-// The engine wakes every probe watching a committed value, so a set that did not move must not
+// The supervisor wakes every probe watching a committed value, so a set that did not move must not
 // be committed again.
 func TestReadinessCommitsOnlyWhenTheSetMoves(t *testing.T) {
 	cs := serveCluster(t)
@@ -490,7 +490,7 @@ func TestServerUIDReadsKubeSystem(t *testing.T) {
 
 	res, v, committed := runProbe(t, serverUIDProbe{}, connTo(t, cs.Server), nil)
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.Equal(t, "uid-1", v)
 	assert.True(t, committed)
 	assert.Equal(t, kubeSystemPath, cs.requests.Await(t, "the namespace read"))
@@ -501,7 +501,7 @@ func TestServerUIDCommitsOnlyWhenTheUIDMoves(t *testing.T) {
 
 	res, _, committed := runProbe(t, serverUIDProbe{}, connTo(t, serveCluster(t).Server), &uid)
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.False(t, committed)
 }
 
@@ -553,7 +553,7 @@ func TestServerUIDReportsAMissingNamespaceAsNotFound(t *testing.T) {
 
 	res, _, _ := runProbe(t, serverUIDProbe{}, connTo(t, cs.Server), nil)
 
-	assert.Equal(t, probe.VerdictFailed, res.Verdict())
+	assert.Equal(t, supervisor.VerdictFailed, res.Verdict())
 	assert.Equal(t, ReasonNotFound, res.Reason())
 }
 
@@ -589,7 +589,7 @@ func TestServerUIDParksWithoutAConnection(t *testing.T) {
 func TestServerVersionReadsTheReportedVersion(t *testing.T) {
 	res, v, committed := runProbe(t, serverVersionProbe{}, connTo(t, serveCluster(t).Server), nil)
 
-	assert.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.Equal(t, VersionInfo{GitVersion: "v1.31.4", Major: "1", Minor: "31"}, v)
 	assert.True(t, committed)
 }
@@ -643,7 +643,7 @@ func TestPrincipalAsksTheServerWhoWeAre(t *testing.T) {
 
 	res, v, committed := runProbe(t, principalProbe{}, connTo(t, cs.Server), nil)
 
-	require.Equal(t, probe.VerdictSucceeded, res.Verdict())
+	require.Equal(t, supervisor.VerdictSucceeded, res.Verdict())
 	assert.Equal(t, "admin@example", v.Username)
 	assert.Equal(t, []string{"system:authenticated", "system:masters"}, v.Groups, "sorted")
 	assert.True(t, committed)
@@ -678,7 +678,7 @@ func TestPrincipalSuspendsOnAServerTooOldToAnswer(t *testing.T) {
 
 	res, _, _ := runProbe(t, principalProbe{}, connTo(t, cs.Server), nil)
 
-	assert.Equal(t, probe.VerdictSuspended, res.Verdict())
+	assert.Equal(t, supervisor.VerdictSuspended, res.Verdict())
 	assert.Equal(t, ReasonUnsupported, res.Reason())
 }
 
@@ -709,7 +709,7 @@ func TestPrincipalParksWithoutAConnection(t *testing.T) {
 // --- the caller going away ---
 
 // Cancellation says nothing about the cluster: the deadline was not ours and the answer was not
-// refused, so a run the engine's shutdown cut short must record nothing rather than opening a
+// refused, so a run the supervisor's shutdown cut short must record nothing rather than opening a
 // failure streak against a healthy server.
 func TestACanceledRunRecordsNothing(t *testing.T) {
 	cs := serveCluster(t)
@@ -719,17 +719,17 @@ func TestACanceledRunRecordsNothing(t *testing.T) {
 
 	for _, tt := range []struct {
 		name string
-		run  func() probe.Result
+		run  func() supervisor.Result
 	}{
-		{nameConnection, func() probe.Result {
+		{nameConnection, func() supervisor.Result {
 			cfg := serving(cs.Server, "prod", "key-1")
 			prev := connInfo{conn: conn, fingerprint: "key-1"}
-			return (&connectionProbe{kubecfgSvc: cfg}).Run(ctx, probe.NewPass("prod", &prev, probe.Snapshot{}))
+			return (&connectionProbe{kubecfgSvc: cfg}).Reconcile(ctx, supervisor.NewPass("prod", &prev, supervisor.Snapshot{}))
 		}},
-		{nameReadiness, func() probe.Result { return runCanceled(t, ctx, readinessProbe{}, conn) }},
-		{nameServerUID, func() probe.Result { return runCanceled(t, ctx, serverUIDProbe{}, conn) }},
-		{nameServerVersion, func() probe.Result { return runCanceled(t, ctx, serverVersionProbe{}, conn) }},
-		{namePrincipal, func() probe.Result { return runCanceled(t, ctx, principalProbe{}, conn) }},
+		{nameReadiness, func() supervisor.Result { return runCanceled(t, ctx, readinessProbe{}, conn) }},
+		{nameServerUID, func() supervisor.Result { return runCanceled(t, ctx, serverUIDProbe{}, conn) }},
+		{nameServerVersion, func() supervisor.Result { return runCanceled(t, ctx, serverVersionProbe{}, conn) }},
+		{namePrincipal, func() supervisor.Result { return runCanceled(t, ctx, principalProbe{}, conn) }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.True(t, tt.run().IsSkip(), "a canceled run records nothing")
@@ -738,8 +738,8 @@ func TestACanceledRunRecordsNothing(t *testing.T) {
 }
 
 // runCanceled runs one probe body on a context that is already done.
-func runCanceled[T any](t *testing.T, ctx context.Context, p probe.Probe[T], conn *Connection) probe.Result {
+func runCanceled[T any](t *testing.T, ctx context.Context, p supervisor.Reconciler[T], conn *Connection) supervisor.Result {
 	t.Helper()
-	snap := probe.NewSnapshot(map[string]any{nameConnection: connInfo{conn: conn}})
-	return p.Run(ctx, probe.NewPass[T]("prod", nil, snap))
+	snap := supervisor.NewSnapshot(map[string]any{nameConnection: connInfo{conn: conn}})
+	return p.Reconcile(ctx, supervisor.NewPass[T]("prod", nil, snap))
 }

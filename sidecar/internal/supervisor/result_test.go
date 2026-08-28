@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package probe
+package supervisor
 
 import (
 	"errors"
@@ -73,7 +73,7 @@ func TestTheZeroResultIsInvalid(t *testing.T) {
 	assert.NotEqual(t, resultInvalid, Skip().kind)
 }
 
-// The read side is what a probe body's own tests assert on, without giving a body a way to build
+// The read side is what a reconciler body's own tests assert on, without giving a body a way to build
 // a Result the constructors cannot.
 func TestAResultReportsWhatItWasBuiltFrom(t *testing.T) {
 	err := errors.New("open ca.crt: no such file")
@@ -95,7 +95,7 @@ func TestAResultReportsWhatItWasBuiltFrom(t *testing.T) {
 }
 
 // Latency is the run's own time, which only a dispatched run that finished has: a run still out
-// has none to report, and one the engine recorded without dispatching never started.
+// has none to report, and one the supervisor recorded without dispatching never started.
 func TestLatencyIsOnlyForARunThatWasDispatchedAndFinished(t *testing.T) {
 	assert.Zero(t, Attempt{StartedAt: runAt}.Latency(), "still running")
 	assert.Zero(t, Attempt{FinishedAt: runAt}.Latency(), "recorded, never dispatched")

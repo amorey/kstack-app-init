@@ -18,25 +18,25 @@
 package kubeconn
 
 import (
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
-// The run bookkeeping is the engine's, aliased rather than copied so an Observation carries
-// exactly what the engine recorded. Reason stays this package's vocabulary — the engine treats
+// The run bookkeeping is the supervisor's, aliased rather than copied so an Observation carries
+// exactly what the supervisor recorded. Reason stays this package's vocabulary — the supervisor treats
 // it as opaque and owns only Succeeded, DependencyFailed, and Internal, the same words with the
 // same values as the constants below.
 type (
-	Reason   = probe.Reason
-	Verdict  = probe.Verdict
-	Attempt  = probe.Attempt
-	Attempts = probe.Attempts
+	Reason   = supervisor.Reason
+	Verdict  = supervisor.Verdict
+	Attempt  = supervisor.Attempt
+	Attempts = supervisor.Attempts
 )
 
 const (
-	VerdictNone      = probe.VerdictNone
-	VerdictSucceeded = probe.VerdictSucceeded
-	VerdictFailed    = probe.VerdictFailed
-	VerdictSuspended = probe.VerdictSuspended
+	VerdictNone      = supervisor.VerdictNone
+	VerdictSucceeded = supervisor.VerdictSucceeded
+	VerdictFailed    = supervisor.VerdictFailed
+	VerdictSuspended = supervisor.VerdictSuspended
 )
 
 // The reasons classify the most recent attempt at one probe. Ours, in the style of a Kubernetes
@@ -110,14 +110,14 @@ const (
 	// worked and the cluster is not fit to use; ComponentStatus.Failing says which.
 	ReasonComponentsFailing Reason = "ComponentsFailing"
 	// ReasonDependencyFailed means the probe was recorded rather than attempted, because the
-	// connection it needs was down. The engine records it once per outage, which is what keeps
+	// connection it needs was down. The supervisor records it once per outage, which is what keeps
 	// a dead cluster costing one timeout per cycle instead of one per probe.
 	ReasonDependencyFailed Reason = "DependencyFailed"
 	// ReasonInternal is a bug here — a request we could not build, or a probe that panicked.
 	ReasonInternal Reason = "Internal"
 )
 
-// Observation is the engine's record of one probe: the value beside the bookkeeping for the
+// Observation is the supervisor's record of one probe: the value beside the bookkeeping for the
 // probe that read it. Aliased for the same reason Attempts is. What this package's probes add:
 //
 // **A zero NextAttempt means the probe is suspended** — nothing is due, and the last answer
@@ -129,7 +129,7 @@ const (
 //
 // **Why it is suspended is LastAttempt.Reason**, which needs no field of its own because a probe
 // suspends over what its last attempt found.
-type Observation[T any] = probe.Observation[T]
+type Observation[T any] = supervisor.Observation[T]
 
 // ComponentStatus is what /readyz named when it answered. Empty on a server that is ready.
 type ComponentStatus struct {

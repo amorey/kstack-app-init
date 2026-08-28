@@ -28,7 +28,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -307,7 +307,7 @@ func TestForgetDiscoveryCancelsAndJoinsASweepInFlight(t *testing.T) {
 	awaitDiscovered(t, svc, 1)
 	cluster.reads.Drain()
 
-	// Park the fan-out mid-request. Dropping the engine's subject stops a result being
+	// Park the fan-out mid-request. Dropping the supervisor's subject stops a result being
 	// applied but neither cancels the run nor joins it, so a teardown that only did that
 	// would give the store back under a sweep still about to write through it.
 	// Released whatever happens: a run left parked here would outlive the test and hang the
@@ -355,15 +355,15 @@ func TestForgettingACacheStopsItsSweep(t *testing.T) {
 func TestASweepSkipsASubjectThatIsNotAnArmedCache(t *testing.T) {
 	svc, _ := newTestService(t)
 	ran := false
-	body := func(context.Context, *session, *kubeconn.Connection, *probe.Pass[uint64]) probe.Result {
+	body := func(context.Context, *session, *kubeconn.Connection, *supervisor.Pass[uint64]) supervisor.Result {
 		ran = true
-		return probe.Succeeded()
+		return supervisor.Succeeded()
 	}
 
 	// A subject this package did not name, and one whose cache nobody armed. Neither is a
 	// state a caller can reach — both are runs that must record nothing.
 	for _, subject := range []string{"not-a-cache", subjectOf(404)} {
-		result := underSession(svc, body).Run(t.Context(), probe.NewPass[uint64](subject, nil, probe.Snapshot{}))
+		result := underSession(svc, body).Reconcile(t.Context(), supervisor.NewPass[uint64](subject, nil, supervisor.Snapshot{}))
 		assert.True(t, result.IsSkip(), "a run against %s records nothing", subject)
 	}
 	assert.False(t, ran, "and never reaches the body")

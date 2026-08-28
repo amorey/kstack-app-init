@@ -26,7 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -461,7 +461,7 @@ func TestAStreamThatSettlesBetweenClosuresRetriesAtTheFloor(t *testing.T) {
 	const floor = 100 * time.Millisecond
 	svc := newMirroringService(t, cluster, func(p *pacing) {
 		p.staleAfter = time.Minute
-		p.backoff = probe.Backoff{Base: floor, Factor: 2, Cap: 10 * time.Second}
+		p.backoff = supervisor.Backoff{Base: floor, Factor: 2, Cap: 10 * time.Second}
 	})
 	mirrorKind(t, svc, 1, podKind)
 

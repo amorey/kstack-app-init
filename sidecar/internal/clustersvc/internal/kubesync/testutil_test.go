@@ -44,7 +44,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -604,7 +604,7 @@ func newMirroringService(t *testing.T, cluster *fakeCluster, opts ...func(*pacin
 	t.Helper()
 	p := defaultPacing()
 	p.staleAfter = 200 * time.Millisecond
-	p.backoff = probe.Backoff{Base: time.Millisecond, Factor: 2, Cap: 5 * time.Millisecond}
+	p.backoff = supervisor.Backoff{Base: time.Millisecond, Factor: 2, Cap: 5 * time.Millisecond}
 	for _, opt := range opts {
 		opt(&p)
 	}
@@ -767,7 +767,7 @@ func catalogOf(t *testing.T, svc *Service, cacheID int64) []kubestore.KindRow {
 }
 
 // awaitDialsQuiet waits until this lease has stopped being dialed, which is the point a test
-// can count what happens next. Reading "no run in flight" is not enough — a run the engine has
+// can count what happens next. Reading "no run in flight" is not enough — a run the supervisor has
 // queued has not started, and dials the moment it does.
 //
 // The window is bounded because quiet has no event to wait for; each dial restarts it, so a

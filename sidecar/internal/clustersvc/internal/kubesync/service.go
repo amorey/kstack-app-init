@@ -40,7 +40,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
 // Params is what one cache syncs: over which context, and as which server. A context is
@@ -110,7 +110,7 @@ type syncKindFn func(ctx context.Context, r kindRun)
 
 // option is the test seam: the exported constructor takes production knobs only, and the
 // sync is substituted from white-box tests. The sweep has none — it runs on the probe
-// engine over whatever the connection reaches, so a test hands it an api server.
+// supervisor over whatever the connection reaches, so a test hands it an api server.
 type option func(*Service)
 
 func withSyncKindFn(f syncKindFn) option { return func(s *Service) { s.syncKindFn = f } }
@@ -122,10 +122,10 @@ type Service struct {
 	connSvc  connService
 	storeMgr storeManager
 
-	// discoveryEngine runs the three probes of discovery.go, one subject per armed cache.
+	// discoverySupervisor runs the three probes of discovery.go, one subject per armed cache.
 	// The sweep alone rides it — a kind syncs on its own goroutine under a session.
-	discoveryEngine *probe.Engine
-	syncKindFn      syncKindFn
+	discoverySupervisor *supervisor.Supervisor
+	syncKindFn          syncKindFn
 
 	// One news feed per worker, because their consumers are two beehive triggers and a
 	// trigger wakes a record for every value its feed carries — one feed carrying both
@@ -161,29 +161,29 @@ type Service struct {
 func New(connSvc connService, storeMgr storeManager, opts ...option) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Service{
-		connSvc:         connSvc,
-		storeMgr:        storeMgr,
-		discoveryEngine: probe.New(),
-		discoveryHub:    conflate.New[int64, struct{}](),
-		kindHub:         conflate.New[KindKey, struct{}](),
-		ctx:             ctx,
-		cancel:          cancel,
-		sessions:        map[int64]*session{},
-		tracked:         map[int64]map[kindID]kubestore.Kind{},
+		connSvc:             connSvc,
+		storeMgr:            storeMgr,
+		discoverySupervisor: supervisor.New(),
+		discoveryHub:        conflate.New[int64, struct{}](),
+		kindHub:             conflate.New[KindKey, struct{}](),
+		ctx:                 ctx,
+		cancel:              cancel,
+		sessions:            map[int64]*session{},
+		tracked:             map[int64]map[kindID]kubestore.Kind{},
 	}
 	s.syncKindFn = syncKindWith(defaultPacing())
 	for _, opt := range opts {
 		opt(s)
 	}
-	registerProbes(s.discoveryEngine, s)
-	s.discoveryEngine.OnPass(s.publishDiscovery)
+	registerProbes(s.discoverySupervisor, s)
+	s.discoverySupervisor.OnPass(s.publishDiscovery)
 	return s
 }
 
 // publishDiscovery projects what a pass left and records it, which is what wakes the cache
-// when its verdict moved. Every pass, because the engine cannot tell a new answer from the
+// when its verdict moved. Every pass, because the supervisor cannot tell a new answer from the
 // same one re-confirmed — commitDiscovery is where that is decided.
-func (s *Service) publishDiscovery(subject string, snap probe.Snapshot) {
+func (s *Service) publishDiscovery(subject string, snap supervisor.Snapshot) {
 	cacheID, ok := cacheIDOf(subject)
 	if !ok {
 		return
@@ -322,11 +322,11 @@ func (s *Service) WatchDiscoveryNews() DiscoveryNews { return s.discoveryHub.Rec
 // done.
 func (s *Service) WatchKindNews() KindNews { return s.kindHub.Receiver() }
 
-// Start runs the probe engine the sweeps ride, and returns the func that cancels the
+// Start runs the supervisor the sweeps ride, and returns the func that cancels the
 // workers and drains everything. The mirror workers are not launched here: one starts when
 // a pass arms it, which may be before or after this.
 func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
-	stopEngine := s.discoveryEngine.Start(ctx)
+	stopEngine := s.discoverySupervisor.Start(ctx)
 
 	return func(ctx context.Context) error {
 		// armMu for the whole shutdown, like every other path that waits on workers: it is
@@ -342,8 +342,8 @@ func (s *Service) Start(ctx context.Context) (func(context.Context) error, error
 		s.mu.Unlock()
 
 		s.cancel()
-		// The engine first, and not through s.cancel: a run in flight holds the store claim
-		// Close is about to give back, and the engine's loops are bounded by its own context.
+		// The supervisor first, and not through s.cancel: a run in flight holds the store claim
+		// Close is about to give back, and the supervisor's loops are bounded by its own context.
 		if err := stopEngine(ctx); err != nil {
 			return err
 		}
@@ -390,7 +390,7 @@ func (s *Service) Close() error {
 	}
 	s.discoveryHub.Close()
 	s.kindHub.Close()
-	return s.discoveryEngine.Close()
+	return s.discoverySupervisor.Close()
 }
 
 // arm builds the session for one cache and starts its sweep plus a worker per registered
@@ -417,7 +417,7 @@ func (s *Service) arm(cacheID int64, p Params) {
 	s.mu.Unlock()
 
 	// Published before it holds anything, so a start that fails takes the entry back out —
-	// a session in the map is what a run the engine schedules during start resolves through.
+	// a session in the map is what a run the supervisor schedules during start resolves through.
 	// The context is the one thing a failed start leaves behind: nothing else was claimed,
 	// but the child stays on s.ctx until it is cancelled, and this cache is armed again on
 	// every pass.

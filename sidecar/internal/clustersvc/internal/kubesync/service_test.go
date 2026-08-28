@@ -23,7 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
-	"github.com/kubetail-org/kstack-app/sidecar/internal/probe"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -328,10 +328,10 @@ func TestAKindStateIsAnsweredOnlyForAKindTheCacheTracks(t *testing.T) {
 func TestAPassPublishesNothingForASubjectThatIsNotACache(t *testing.T) {
 	svc, _ := newTestService(t)
 
-	// The engine names its own subjects, so both of these are reads the seam must survive
+	// The supervisor names its own subjects, so both of these are reads the seam must survive
 	// rather than states it can reach: one not this package's, one whose cache is gone.
-	svc.publishDiscovery("not-a-cache", probe.Snapshot{})
-	svc.publishDiscovery(subjectOf(404), probe.Snapshot{})
+	svc.publishDiscovery("not-a-cache", supervisor.Snapshot{})
+	svc.publishDiscovery(subjectOf(404), supervisor.Snapshot{})
 }
 
 func TestAStoppedWorkersAnswerIsDropped(t *testing.T) {
@@ -367,9 +367,9 @@ func TestStoppingWithNoTimeLeftReportsTheEngineRefusing(t *testing.T) {
 	svc.TrackDiscovery(1, testParams)
 	cluster.awaitRead(t, "/api/v1")
 
-	// A sweep is parked mid-request, so the engine cannot drain inside a deadline that has
+	// A sweep is parked mid-request, so the supervisor cannot drain inside a deadline that has
 	// already passed and says so rather than blocking the caller.
 	expired, cancel := context.WithCancel(context.Background())
 	cancel()
-	assert.Error(t, stop(expired), "a stop with no time left reports the engine refusing")
+	assert.Error(t, stop(expired), "a stop with no time left reports the supervisor refusing")
 }
