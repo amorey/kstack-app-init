@@ -24,9 +24,11 @@
 // which is how a Run reads a sibling, and a Key pairs that name with its type once.
 //
 // A run's own Result is its schedule — Succeeded waits out the interval, Fail climbs the backoff
-// ladder, Suspend and Skip wait for a Wake — so no domain rule lives in the scheduler.
+// ladder, Suspend and Skip wait for a Wake — so no domain rule lives in the scheduler. A run may
+// also start something that outlives it and commit it as its value; the value is then the
+// supervisor's to hand back and the next run's to find.
 //
-// See docs/adr/2026-08-24-reconciler-supervisor.md.
+// See docs/adr/2026-08-24-probe-engine.md and docs/adr/2026-08-28-the-stream-is-the-value.md.
 package supervisor
 
 import (
@@ -52,10 +54,16 @@ type reconcilerID int
 // returns. The supervisor applies the pass under its lock, so a run must do its waiting before it
 // returns.
 //
-// A reconciler whose value owns something — a connection, a file — also implements
-// `Discard(T)`, and is handed back any value the supervisor does not apply: a commit refused because
-// the subject was removed mid-run, a run that concluded Skip or returned the zero Result, and one
-// that panicked. Nothing else can reach such a value to release it.
+// A reconciler whose value owns something — a connection, a file, a goroutine it started — also
+// implements `Discard(T)`, and is handed back every value the supervisor drops without a run
+// having said so: a commit refused because the subject was removed mid-run, a run that concluded
+// Skip or returned the zero Result, one that panicked, and the standing value of a subject
+// dropped by Remove or Close. Nothing else can reach such a value to release it.
+//
+// **A commit is the exception.** The value it replaces is not handed back, because a commit
+// often carries the last one's holdings forward — a struct value with one field moved keeps the
+// connection inside it — and a hand-back would release what the new value still holds. A run
+// that means to drop what the last one held releases it itself, before it commits.
 type Reconciler[T any] interface {
 	Reconcile(ctx context.Context, pass *Pass[T]) Result
 }
@@ -141,6 +149,10 @@ func WithTimeout(d time.Duration) ReconcilerOption {
 type spec struct {
 	name string
 	cfg  reconcilerCfg
+	// discard hands one standing value back to the reconciler that committed it, nil for a
+	// reconciler with no Discard. Type-erased because the supervisor holds every reconciler's
+	// values in one untyped slice; Register is what closes over the real type.
+	discard func(any)
 	// dependencies and watches are cfg's names resolved once, at registration.
 	dependencies []reconcilerID
 	watches      []reconcilerID
@@ -153,7 +165,16 @@ type Option func(*settings)
 // WithWorkers is how many runs may be in flight at once, across every subject. A fleet-wide cap
 // rather than a per-subject one, because what it holds back is the first pass over a large
 // kubeconfig: without it every cluster's credential helper runs in the same second.
-func WithWorkers(n int) Option { return func(s *settings) { s.workers = n } }
+//
+// It panics below one, as every wiring bug here does. A supervisor with no workers drains
+// nothing — every subject queues and no run is ever dispatched — and it is silent about it,
+// which is the one failure a caller cannot debug from what the supervisor reports.
+func WithWorkers(n int) Option {
+	if n < 1 {
+		panic("supervisor: WithWorkers needs at least one worker")
+	}
+	return func(s *settings) { s.workers = n }
+}
 
 // settings is what the options write.
 type settings struct {
@@ -303,12 +324,22 @@ func Register[T any](e *Supervisor, name string, p Reconciler[T], opts ...Reconc
 		}
 		return res, *pass.next, func() { handBack(p, pass) }
 	}
-	e.register(name, run, opts)
+	e.register(name, run, discarderOf(p), opts)
+}
+
+// discarderOf is the type-erased hand-back for a reconciler that implements Discard, nil for one
+// that does not. The value is whatever this reconciler's runs committed, so the assertion holds.
+func discarderOf[T any](p Reconciler[T]) func(any) {
+	d, ok := p.(interface{ Discard(T) })
+	if !ok {
+		return nil
+	}
+	return func(v any) { d.Discard(v.(T)) }
 }
 
 // handBack tells a reconciler that the supervisor dropped what its run committed, for one that asked to
-// be told by implementing Discard. A committed value can own something — a connection, a file —
-// and one the supervisor never applied is one nothing else can reach to release.
+// be told by implementing Discard. A committed value can own something — a connection, a file, a
+// goroutine — and one the supervisor never applied is one nothing else can reach to release.
 func handBack[T any](p Reconciler[T], pass *Pass[T]) {
 	d, ok := p.(interface{ Discard(T) })
 	if !ok || pass.next == nil {
@@ -317,7 +348,7 @@ func handBack[T any](p Reconciler[T], pass *Pass[T]) {
 	d.Discard(*pass.next)
 }
 
-func (e *Supervisor) register(name string, run func(context.Context, string, any, Snapshot) (Result, any, func()), opts []ReconcilerOption) {
+func (e *Supervisor) register(name string, run func(context.Context, string, any, Snapshot) (Result, any, func()), discard func(any), opts []ReconcilerOption) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -347,6 +378,7 @@ func (e *Supervisor) register(name string, run func(context.Context, string, any
 
 	e.specs = append(e.specs, spec{
 		name: name, cfg: cfg, dependencies: dependencies, watches: watches, run: run,
+		discard: discard,
 	})
 	id := reconcilerID(len(e.specs) - 1)
 	e.byName[name] = id
@@ -389,17 +421,21 @@ func (e *Supervisor) Add(subjectName string) {
 }
 
 // Remove stops tracking subject: its timer stops, and a run still in flight against it commits
-// nothing. Removing a subject not tracked changes nothing.
+// nothing. Every value it was holding is handed back. Removing a subject not tracked changes
+// nothing.
 func (e *Supervisor) Remove(subjectName string) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	sub := e.subjects[subjectName]
 	if sub == nil {
+		e.mu.Unlock()
 		return
 	}
 	sub.stopTimer()
 	delete(e.subjects, subjectName)
+	held := e.heldLocked(sub)
+	e.mu.Unlock()
+
+	e.handBackAll(held)
 }
 
 // Wake says these reconcilers' answers are stale: run them again, suspension notwithstanding. It
@@ -475,19 +511,50 @@ func (e *Supervisor) Start(context.Context) func(context.Context) error {
 	}
 }
 
-// Close drops every subject and closes the queues. Past here nothing works them off.
+// Close drops every subject, hands back every value they held, and closes the queues. Past here
+// nothing works them off.
 func (e *Supervisor) Close() error {
 	e.runQ.Close()
 	e.passQ.Close()
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
+	var held []heldValue
 	for _, sub := range e.subjects {
 		sub.stopTimer()
+		held = append(held, e.heldLocked(sub)...)
 	}
 	clear(e.subjects)
+	e.mu.Unlock()
+
+	e.handBackAll(held)
 	return nil
+}
+
+// heldValue is one standing value and the reconciler to give it back to.
+type heldValue struct {
+	id  reconcilerID
+	val any
+}
+
+// heldLocked collects what a subject is holding, for a caller about to drop it. Called under
+// e.mu; handing back is not.
+func (e *Supervisor) heldLocked(sub *subject) []heldValue {
+	var held []heldValue
+	for id := range sub.obs {
+		if v := sub.obs[id].value; v != nil && e.specs[id].discard != nil {
+			held = append(held, heldValue{reconcilerID(id), v})
+		}
+	}
+	return held
+}
+
+// handBackAll returns values to the reconcilers that committed them, OUTSIDE e.mu: a Discard can
+// join a goroutine whose exit calls Wake, which takes the lock. A value is handed back once —
+// the subject it stood on is already gone by here, so nothing can reach it again.
+func (e *Supervisor) handBackAll(held []heldValue) {
+	for _, h := range held {
+		e.specs[h.id].discard(h.val)
+	}
 }
 
 // passLoop derives schedules until stopped. One worker: the pass is arithmetic under the
@@ -741,16 +808,7 @@ func (e *Supervisor) commit(k key, held *subject, startedAt time.Time, res Resul
 	now := time.Now()
 	switch res.kind {
 	case resultRecord:
-		a.record(Attempt{
-			StartedAt:  startedAt,
-			FinishedAt: now,
-			Verdict:    res.verdict,
-			Reason:     res.reason,
-			Message:    res.message,
-			Err:        res.err,
-
-			requeueAfter: res.requeueAfter,
-		})
+		a.record(attemptOf(res, startedAt, now))
 		a.skipped = false
 		switch {
 		case val != nil:

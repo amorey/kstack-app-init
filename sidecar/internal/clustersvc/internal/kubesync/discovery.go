@@ -17,11 +17,11 @@
 //
 // **Discovery is a probe whose collection cannot be watched.** /api and /apis are plain
 // GETs with no resourceVersion and no watch verb, so a sweep is a cold list with no watch
-// phase and re-lists on the supervisor's cadence where a kind's worker would go live.
+// phase and re-lists on the supervisor's cadence where a kind's sync would go live.
 // SyncKinds reconciles its answer by fingerprint and prune, as a relist does by mark and
-// sweep. **The answer goes to disk and nowhere else** — the sweep starts no worker and
-// stops none, because what is mirrored is the records' to say; it publishes news and the
-// mirror pass does the rest.
+// sweep. **The answer goes to disk and nowhere else** — the sweep starts no kind and stops
+// none, because what is synced is the records' to say; it publishes news and the kind
+// records' passes do the rest.
 package kubesync
 
 import (
@@ -104,7 +104,7 @@ func registerProbes(e *supervisor.Supervisor, s *Service) {
 // forgot would break the promise silently.
 //
 // The connection half is the identity gate. A sweep runs on the supervisor, where waiting for
-// a connection would hold a worker — so it records why and suspends, and the session's
+// a connection would hold a supervisor worker — so it records why and suspends, and the session's
 // wake loop is what brings it back.
 type sessionScoped[T any] struct {
 	s    *Service
@@ -116,17 +116,17 @@ func underSession[T any](s *Service, body func(context.Context, *session, *kubec
 }
 
 func (p sessionScoped[T]) Reconcile(ctx context.Context, pass *supervisor.Pass[T]) supervisor.Result {
-	cacheID, ok := cacheIDOf(pass.Subject())
+	cacheID, ok := parseDiscoverySubject(pass.Subject())
 	if !ok {
 		return supervisor.Skip()
 	}
-	sess, ok := p.s.enterSweep(cacheID)
+	sess, ok := p.s.enterRun(cacheID)
 	if !ok {
 		// Nothing has armed this cache, or its teardown has begun: either way the claims a
 		// run would write through are going, so it records nothing.
 		return supervisor.Skip()
 	}
-	defer sess.leaveSweep()
+	defer sess.leaveRun()
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -157,10 +157,11 @@ func connectionReason(err error, failed Reason) Reason {
 	}
 }
 
-// subjectOf is the supervisor's name for one cache, and cacheIDOf reads it back.
-func subjectOf(cacheID int64) string { return strconv.FormatInt(cacheID, 10) }
+// discoverySubject is one cache's name on the discovery supervisor, and parseDiscoverySubject
+// reads it back.
+func discoverySubject(cacheID int64) string { return strconv.FormatInt(cacheID, 10) }
 
-func cacheIDOf(subject string) (int64, bool) {
+func parseDiscoverySubject(subject string) (int64, bool) {
 	n, err := strconv.ParseInt(subject, 10, 64)
 	return n, err == nil
 }
@@ -192,7 +193,7 @@ func probeAPIGroups(ctx context.Context, _ *session, conn *kubeconn.Connection, 
 }
 
 // preferredGroupVersions is one group-version per group. Every served version mirrors the
-// same objects again: two catalog rows, two workers, two watches, two copies of every row
+// same objects again: two catalog rows, two kinds, two watches, two copies of every row
 // over one storage.
 func preferredGroupVersions(doc metav1.APIGroupList) []string {
 	gvs := make([]string, 0, len(doc.Groups))
@@ -209,8 +210,8 @@ func preferredGroupVersions(doc metav1.APIGroupList) []string {
 	return gvs
 }
 
-// probeResources is the fan-out: one document per group-version, filtered to what a worker
-// can mirror, written to kind_catalog. Its value is the fingerprint it committed — the rows
+// probeResources is the fan-out: one document per group-version, filtered to what a kind
+// sync can mirror, written to kind_catalog. Its value is the fingerprint it committed — the rows
 // belong on disk, and a fingerprint is all "the answer moved" requires.
 func probeResources(ctx context.Context, sess *session, conn *kubeconn.Connection, pass *supervisor.Pass[uint64]) supervisor.Result {
 	gvs, ok := fanOutInput(pass.Snapshot())
@@ -260,9 +261,9 @@ func fanOutInput(snap supervisor.Snapshot) ([]string, bool) {
 	return append(gvs, groups.Value...), true
 }
 
-// sweepResources reads one document per group-version and keeps what a worker can mirror.
+// sweepResources reads one document per group-version and keeps what a kind sync can mirror.
 //
-// A group that will not answer degrades the sweep rather than failing it: its kinds' workers
+// A group that will not answer degrades the sweep rather than failing it: its kinds
 // watch independently and report their own verdicts, so a broken aggregated API shows up
 // twice and correctly. What it does block is the prune, since SyncKinds takes one flag for
 // the whole answer.
@@ -294,14 +295,14 @@ func sweepResources(ctx context.Context, conn *kubeconn.Connection, gvs []string
 }
 
 // mirrorable is the three filters a row must pass on top of the preferred-version one the
-// group list already applied. A kind that gets through is one a worker can actually mirror.
+// group list already applied. A kind that gets through is one a sync can actually mirror.
 func mirrorable(gv string, r metav1.APIResource) bool {
 	switch {
 	case strings.Contains(r.Name, "/"):
 		// pods/log and deployments/scale are subresources with no collection behind them.
 		return false
 	case !slices.Contains(r.Verbs, "list") || !slices.Contains(r.Verbs, "watch"):
-		// A create-only kind — tokenreviews, subjectaccessreviews, bindings — is a worker
+		// A create-only kind — tokenreviews, subjectaccessreviews, bindings — is a sync
 		// that can only fail.
 		return false
 	case groupOf(gv) == eventsAPIGroup && r.Name == "events":

@@ -59,93 +59,81 @@ func TestTrackDiscoveryRebuildsWhenParamsMove(t *testing.T) {
 }
 
 func TestKindTrackedAgainstAnUnarmedCacheIsHeldUntilItIsArmed(t *testing.T) {
-	entered := testutil.NewProbe[struct{}](4)
-	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
-		entered.Fire(struct{}{})
-		<-ctx.Done()
-	}))
+	fake := newFakeKindReconciler()
+	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
 
 	// The record's pass may land before the cache's, so the registration is held rather
 	// than refused.
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
-	_, running := entered.TryAwait()
+	_, running := fake.runs.TryAwait()
 	require.False(t, running, "a kind on an unarmed cache runs nothing")
 
 	svc.TrackDiscovery(1, testParams)
-	entered.Await(t, "the held kind starts when its cache is armed")
+	fake.runs.Await(t, "the held kind starts when its cache is armed")
 }
 
 func TestARegistrationOutlivesItsCacheBeingForgotten(t *testing.T) {
-	entered := testutil.NewProbe[struct{}](4)
-	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
-		entered.Fire(struct{}{})
-		<-ctx.Done()
-	}))
+	fake := newFakeKindReconciler()
+	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
-	entered.Await(t, "the kind runs while its cache is armed")
+	fake.runs.Await(t, "the kind runs while its cache is armed")
 
 	// Pausing is one call and resuming is one call: nothing re-registers the kinds.
 	svc.ForgetDiscovery(1)
 	svc.TrackDiscovery(1, testParams)
-	entered.Await(t, "resuming restarts every kind still registered")
+	fake.runs.Await(t, "resuming restarts every kind still registered")
 }
 
 func TestAKindWaitsForAConnectionVouchingForItsServerUID(t *testing.T) {
-	entered := testutil.NewProbe[struct{}](4)
-	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
-		entered.Fire(struct{}{})
-		<-ctx.Done()
-	}))
+	fake := newFakeKindReconciler()
+	svc, pool := newTestService(t, fake.option())
+	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
 
 	pool.lease("prod").vouch(t, "uid-other")
-	_, running := entered.TryAwait()
+	_, running := fake.runs.TryAwait()
 	require.False(t, running, "a connection answering as another cluster arms nothing")
 
 	pool.lease("prod").vouch(t, "uid-1")
-	entered.Await(t, "the worker starts once the connection vouches for its identity")
+	fake.runs.Await(t, "the kind runs once the connection vouches for its identity")
 }
 
 func TestForgetKindWaitsForItsWorker(t *testing.T) {
-	entered, returned := testutil.NewProbe[struct{}](4), testutil.NewProbe[struct{}](4)
-	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
-		entered.Fire(struct{}{})
-		<-ctx.Done()
-		returned.Fire(struct{}{})
-	}))
+	fake := newFakeKindReconciler()
+	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
 
 	kind := testKind("apps/v1", "Deployment", "deployments")
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, kind)
-	entered.Await(t, "the sync runs")
+	fake.runs.Await(t, "the sync runs")
 
 	svc.ForgetKind(1, kind)
-	_, done := returned.TryAwait()
-	require.True(t, done, "ForgetKind returns only once the worker cannot still write")
+	_, done := fake.returned.TryAwait()
+	require.True(t, done, "ForgetKind returns only once the kind cannot still write")
 }
 
 func TestForgetDiscoveryWaitsForEveryWorkerUnderIt(t *testing.T) {
-	entered, returned := testutil.NewProbe[struct{}](8), testutil.NewProbe[struct{}](8)
-	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
-		entered.Fire(struct{}{})
-		<-ctx.Done()
-		returned.Fire(struct{}{})
-	}))
+	fake := newFakeKindReconciler()
+	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
-	entered.Await(t, "the sync runs")
+	fake.runs.Await(t, "the sync runs")
 
 	svc.ForgetDiscovery(1)
-	returned.Await(t, "the kind body is drained")
+	fake.returned.Await(t, "the kind body is drained")
 }
 
 func TestGetStateReportsNothingBeforeARunCommits(t *testing.T) {
@@ -160,7 +148,7 @@ func TestGetStateReportsNothingBeforeARunCommits(t *testing.T) {
 	svc.TrackKind(1, kind)
 
 	_, ok = svc.GetKindState(1, kind)
-	assert.False(t, ok, "a kind whose worker has committed nothing has no answer")
+	assert.False(t, ok, "a kind that has committed nothing has no answer")
 }
 
 func TestDiscoveryNewsIsKeyedByCacheID(t *testing.T) {
@@ -179,12 +167,11 @@ func TestDiscoveryNewsIsKeyedByCacheID(t *testing.T) {
 }
 
 func TestKindNewsIsKeyedByCacheAndKind(t *testing.T) {
-	runs := testutil.NewProbe[kindRun](4)
-	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, r kindRun) {
-		runs.Fire(r)
-		<-ctx.Done()
-	}))
+	fake := newFakeKindReconciler()
+	svc, pool := newTestService(t, fake.option())
+	runs := fake.runs
 	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
 
 	news := svc.WatchKindNews()
 	t.Cleanup(news.Close)
@@ -204,12 +191,11 @@ func TestKindNewsIsKeyedByCacheAndKind(t *testing.T) {
 }
 
 func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
-	runs := testutil.NewProbe[kindRun](4)
-	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, r kindRun) {
-		runs.Fire(r)
-		<-ctx.Done()
-	}))
+	fake := newFakeKindReconciler()
+	svc, pool := newTestService(t, fake.option())
+	runs := fake.runs
 	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
 
 	kind := testKind("apps/v1", "Deployment", "deployments")
 	svc.TrackDiscovery(1, testParams)
@@ -222,7 +208,7 @@ func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
 	renamed := testKind("apps/v1", "Deploy", "deployments")
 	svc.TrackKind(1, renamed)
 	_, ok := svc.GetKindState(1, renamed)
-	assert.False(t, ok, "a replacement worker starts with no answer")
+	assert.False(t, ok, "a replacement starts with no answer")
 
 	runs.Await(t, "the replacement runs").Commit(KindState{Reason: ReasonSyncing})
 	got, ok := svc.GetKindState(1, renamed)
@@ -230,31 +216,28 @@ func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
 	assert.Equal(t, ReasonSyncing, got.Reason)
 }
 
-func TestRestartAllReEntersEveryArmedMirror(t *testing.T) {
-	entered := testutil.NewProbe[struct{}](8)
-	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
-		entered.Fire(struct{}{})
-		<-ctx.Done()
-	}))
+func TestRestartAllReEntersEveryArmedKind(t *testing.T) {
+	fake := newFakeKindReconciler()
+	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
 
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
-	entered.Await(t, "the sync runs")
+	// The stream, not merely the run: a restart cancels what is standing, and one arriving
+	// while the first run is still establishing has nothing to cancel — correctly, since that
+	// run is already building a fresh stream.
+	fake.established.Await(t, "a stream to be standing")
 
 	// A watch that died under a sleeping machine reports nothing, so a resume poke
 	// restarts the run rather than waiting for one to notice.
 	svc.RestartAll()
-	entered.Await(t, "the sync runs again")
+	fake.runs.Await(t, "the sync runs again")
 }
 
 func TestStopDrainsEveryWorker(t *testing.T) {
-	entered, returned := testutil.NewProbe[struct{}](8), testutil.NewProbe[struct{}](8)
-	svc, pool := newTestService(t, withSyncKindFn(func(ctx context.Context, _ kindRun) {
-		entered.Fire(struct{}{})
-		<-ctx.Done()
-		returned.Fire(struct{}{})
-	}))
+	fake := newFakeKindReconciler()
+	svc, pool := newTestService(t, fake.option())
 	pool.lease("prod").vouch(t, "uid-1")
 
 	stop, err := svc.Start(t.Context())
@@ -262,10 +245,10 @@ func TestStopDrainsEveryWorker(t *testing.T) {
 
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, testKind("apps/v1", "Deployment", "deployments"))
-	entered.Await(t, "the sync runs")
+	fake.runs.Await(t, "the sync runs")
 
 	require.NoError(t, stop(t.Context()))
-	returned.Await(t, "the sync is drained")
+	fake.returned.Await(t, "the sync is drained")
 
 	require.NoError(t, svc.Close())
 	assert.Equal(t, 0, pool.lease("prod").held(), "Close releases the claims")
@@ -274,7 +257,7 @@ func TestStopDrainsEveryWorker(t *testing.T) {
 func TestACacheWhoseStoreWillNotOpenArmsNothing(t *testing.T) {
 	pool := newFakePool()
 	stores := &refusingStores{}
-	svc := New(pool, stores, withSyncKindFn(func(ctx context.Context, _ kindRun) { <-ctx.Done() }))
+	svc := New(pool, stores, newFakeKindReconciler().option())
 	t.Cleanup(func() { _ = svc.Close() })
 
 	svc.TrackDiscovery(1, testParams)
@@ -331,7 +314,7 @@ func TestAPassPublishesNothingForASubjectThatIsNotACache(t *testing.T) {
 	// The supervisor names its own subjects, so both of these are reads the seam must survive
 	// rather than states it can reach: one not this package's, one whose cache is gone.
 	svc.publishDiscovery("not-a-cache", supervisor.Snapshot{})
-	svc.publishDiscovery(subjectOf(404), supervisor.Snapshot{})
+	svc.publishDiscovery(discoverySubject(404), supervisor.Snapshot{})
 }
 
 func TestAStoppedWorkersAnswerIsDropped(t *testing.T) {
@@ -340,11 +323,11 @@ func TestAStoppedWorkersAnswerIsDropped(t *testing.T) {
 	svc.TrackDiscovery(1, testParams)
 	sess := svc.sessionOf(1)
 
-	// The session a worker committed against is gone, which is what a commit racing its own
+	// The session a run committed against is gone, which is what a commit racing its own
 	// teardown looks like: the answer belongs to nobody and is dropped.
 	svc.ForgetDiscovery(1)
 	svc.commitDiscovery(sess, DiscoveryState{Reason: ReasonDiscovered})
-	svc.commitKind(sess, kind, KindState{Reason: ReasonWatching})
+	svc.commitKind(sess, idOf(kind), KindState{Reason: ReasonWatching})
 
 	svc.TrackDiscovery(1, testParams)
 	_, ok := svc.GetDiscoveryState(1)
@@ -372,4 +355,101 @@ func TestStoppingWithNoTimeLeftReportsTheEngineRefusing(t *testing.T) {
 	expired, cancel := context.WithCancel(context.Background())
 	cancel()
 	assert.Error(t, stop(expired), "a stop with no time left reports the supervisor refusing")
+}
+
+// ForgetKind cancels the run in flight rather than waiting it out — a cold list of a large kind
+// is minutes, and forgetting is synchronous. The join is outside armMu, so arming another cache
+// is not held behind it either.
+func TestForgetKindCancelsTheRunInFlightRatherThanWaitingItOut(t *testing.T) {
+	fake := newParkingKindReconciler()
+	svc, pool := newTestService(t, fake.option())
+	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
+
+	kind := testKind("apps/v1", "Deployment", "deployments")
+	svc.TrackDiscovery(1, testParams)
+	svc.TrackKind(1, kind)
+	fake.runs.Await(t, "the run to be out")
+
+	// The run never returns on its own, so a forget that waited for it would never return.
+	testutil.WaitReturn(t, func() { svc.ForgetKind(1, kind) }, "ForgetKind to cancel the run in flight")
+	fake.returned.Await(t, "the run to have unwound before ForgetKind returned")
+
+	// And another cache arms while nothing holds armMu behind the join.
+	svc.TrackDiscovery(2, testParams)
+	svc.TrackKind(2, kind)
+	fake.runs.Await(t, "another cache to arm")
+}
+
+// Two generations for one kind must never be able to write at once: both drive the same
+// collection, and a rename gives them different singulars to key rows by. A generation is a run
+// and the stream it starts, and it ends when that stream is joined.
+func TestARenameNeverRunsTwoGenerationsAtOnce(t *testing.T) {
+	kinds := newParkingKindReconciler()
+	svc, pool := newTestService(t, kinds.option())
+	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
+
+	kind := testKind("apps/v1", "Deployment", "deployments")
+	svc.TrackDiscovery(1, testParams)
+	svc.TrackKind(1, kind)
+	kinds.runs.Await(t, "the run to be out")
+
+	svc.TrackKind(1, testKind("apps/v1", "Deploy", "deployments"))
+	kinds.runs.Await(t, "the replacement to run")
+
+	assert.False(t, kinds.sawOverlap(), "the old generation is gone before the replacement starts")
+}
+
+// ForgetKind promises that past its return nothing can still write through the kind. A re-track
+// landing while the withdrawn run is unwinding must not undo that: if the kind reads as tracked
+// again, commitKind stops refusing that run, and its last act is published as the new
+// registration's answer.
+func TestARetrackDuringAForgetCannotReviveTheWithdrawnRunsWrite(t *testing.T) {
+	kinds := newParkingKindReconciler()
+	svc, pool := newTestService(t, kinds.option())
+	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
+
+	kind := testKind("apps/v1", "Deployment", "deployments")
+	svc.TrackDiscovery(1, testParams)
+	svc.TrackKind(1, kind)
+	kinds.runs.Await(t, "the run to be out")
+
+	forgotten := make(chan struct{})
+	go func() { defer close(forgotten); svc.ForgetKind(1, kind) }()
+
+	// Aimed at the window: the run has been cancelled and is unwinding, which is exactly when
+	// a forget that let go of its arming lock early would admit a re-track.
+	kinds.exiting.Await(t, "the withdrawn run to begin unwinding")
+	svc.TrackKind(1, kind)
+	testutil.Wait(t, forgotten, "the forget to return")
+	kinds.runs.Await(t, "the re-tracked kind to run")
+
+	state, ok := svc.GetKindState(1, kind)
+	assert.False(t, ok && state.Reason == reasonWithdrawnWrite,
+		"a withdrawn run's write is refused however the kind is registered afterwards")
+	assert.False(t, kinds.sawOverlap(), "and it never runs beside its replacement")
+}
+
+// A rename leaves the kind TRACKED — same plural, new singular — so nothing refuses what the old
+// generation reports on its way down. Its verdict must still not be served for the generation
+// that replaced it: the rows are keyed by the new singular and nothing has listed them yet.
+func TestARenameDropsTheOldGenerationsVerdictThoughTheKindStaysTracked(t *testing.T) {
+	fake := newFakeKindReconciler()
+	fake.reportOnStreamExit = true
+	svc, pool := newTestService(t, fake.option())
+	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
+
+	kind := testKind("apps/v1", "Deployment", "deployments")
+	svc.TrackDiscovery(1, testParams)
+	svc.TrackKind(1, kind)
+	fake.established.Await(t, "a stream to be standing")
+
+	svc.TrackKind(1, testKind("apps/v1", "Deploy", "deployments"))
+
+	state, ok := svc.GetKindState(1, kind)
+	assert.False(t, ok && state.Reason == reasonWithdrawnWrite,
+		"the withdrawn generation's report is not left standing under the kind that replaced it")
 }

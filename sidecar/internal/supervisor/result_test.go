@@ -24,6 +24,9 @@ import (
 
 var runAt = time.Date(2026, 8, 24, 10, 5, 0, 0, time.UTC)
 
+// recorded is the attempt one finished run leaves, built the way the supervisor builds it.
+func recorded(res Result, at time.Time) Attempt { return attemptOf(res, at, at) }
+
 func failedAt(at time.Time) Attempt {
 	return Attempt{FinishedAt: at, Verdict: VerdictFailed, Reason: "Unreachable"}
 }
@@ -102,4 +105,37 @@ func TestLatencyIsOnlyForARunThatWasDispatchedAndFinished(t *testing.T) {
 
 	ran := Attempt{StartedAt: runAt, FinishedAt: runAt.Add(2 * time.Second)}
 	assert.Equal(t, 2*time.Second, ran.Latency())
+}
+
+// A provisional success records the verdict but leaves the streak alone: the run started
+// something it cannot yet vouch for, and only the proof it is waiting on ends the streak.
+func TestAProvisionalSuccessLeavesTheStreakStanding(t *testing.T) {
+	a := Attempts{Failures: 3, FailingSince: runAt}
+
+	a.record(recorded(Succeeded().Provisional(), runAt.Add(time.Minute)))
+
+	assert.True(t, a.OK(), "the verdict is a success")
+	assert.Equal(t, 3, a.Failures, "the streak stands until something proves the run")
+	assert.Equal(t, runAt, a.FailingSince)
+
+	// The ladder climbs from where it stood rather than restarting at the base.
+	a.record(failedAt(runAt.Add(2 * time.Minute)))
+	assert.Equal(t, 4, a.Failures)
+
+	// And the plain success is what ends it.
+	a.record(recorded(Succeeded(), runAt.Add(3*time.Minute)))
+	assert.Zero(t, a.Failures)
+	assert.True(t, a.FailingSince.IsZero())
+}
+
+// Provisional is a modifier on a success, as RequeueAfter is: there is nothing to hold back
+// on a verdict that already ends no streak.
+func TestProvisionalIsInertOnAFailureAndASuspension(t *testing.T) {
+	failed := Attempts{Failures: 1, FailingSince: runAt}
+	failed.record(recorded(Fail("Unreachable", errors.New("no route")).Provisional(), runAt))
+	assert.Equal(t, 2, failed.Failures)
+
+	suspended := Attempts{Failures: 1, FailingSince: runAt}
+	suspended.record(recorded(Suspend("NoConnection", "waiting").Provisional(), runAt))
+	assert.Zero(t, suspended.Failures)
 }

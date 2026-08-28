@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// What a sweep and a mirror stand behind, and this leaf's reason vocabulary. The two
-// states differ in shape because the two workers differ in kind: a sweep is a set of
-// passes, and a mirror is a live stream.
+// What a sweep and a kind stand behind, and this leaf's reason vocabulary. The two states
+// differ in shape because the two differ in kind: a sweep is a set of passes, and a kind's
+// sync is a live stream.
 package kubesync
 
 import (
@@ -56,8 +56,8 @@ const (
 	ReasonDiscoveryFailed = "DiscoveryFailed"
 )
 
-// The per-kind vocabulary. A kind reports NoConnection and IdentityMismatch too: the
-// session suspends every worker under it, and each says so for itself.
+// The per-kind vocabulary. A kind reports NoConnection and IdentityMismatch too: every run
+// under a session suspends at the same gate, and each says so for itself.
 const (
 	// ReasonResyncing: the cache holds this kind's rows, but the position they were current
 	// at is one the server no longer serves from, so they are being reconciled against a
@@ -104,7 +104,7 @@ type DiscoveryState struct {
 	Resources   Observation[uint64]   // the fan-out — the catalog fingerprint it committed
 }
 
-// KindState is one mirror's standing answer — a live stream's, where DiscoveryState is a
+// KindState is one kind's standing answer — a live stream's, where DiscoveryState is a
 // set of passes, and the difference decides every field here. It carries no identity: the
 // caller named the kind to read it.
 //
@@ -137,8 +137,8 @@ type KindState struct {
 	LastUpdateAt time.Time
 	LastLiveAt   time.Time
 
-	// Restarts counts runs this worker has begun without settling; NextRetryAt is when a
-	// run that is down will be tried again, and zero while one is up.
+	// Restarts counts the failed attempts since the stream last proved itself live;
+	// NextRetryAt is when a run that is down will be tried again, and zero while one is up.
 	Restarts    int
 	NextRetryAt time.Time
 }

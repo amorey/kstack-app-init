@@ -1033,10 +1033,14 @@ func TestAReplacedServerRebuildsTheConnection(t *testing.T) {
 
 	// Asked of the connection, never of State.Identity() — the observable reaches uid-2 as soon
 	// as the probe reads it over the OLD connection, which says nothing about the replacement
-	// having been stamped. That pairing is the trap ConnFor exists to close, and waiting out
-	// the stamp window is the whole of what AwaitConnFor is for.
-	fresh, err := AwaitConnFor(within(t), lease, "uid-2", nil)
-	require.NoError(t, err)
+	// having been stamped. That pairing is the trap ConnFor exists to close, and the refusal
+	// through the stamp window is what a holder waits out.
+	var fresh *Connection
+	require.Eventually(t, func() bool {
+		conn, err := lease.ConnFor(within(t), "uid-2")
+		fresh = conn
+		return err == nil
+	}, testutil.Timeout, time.Millisecond, "the replacement to be stamped as uid-2")
 	assert.NotSame(t, stale, fresh)
 }
 
@@ -1130,63 +1134,6 @@ func (l *stubLease) Conn(context.Context) (*Connection, error) { return l.ConnFo
 func (l *stubLease) State() State                              { return State{} }
 func (l *stubLease) Departed() bool                            { return false }
 func (l *stubLease) Release()                                  {}
-
-// The loop a caller with nothing to multiplex would otherwise write at every call site: wait,
-// then read the level, because the close is an edge and the connection can move again.
-func TestAwaitConnForReturnsTheConnectionThatVouches(t *testing.T) {
-	l := newStubLease()
-	fresh := &Connection{}
-
-	got := make(chan *Connection, 1)
-	go func() {
-		conn, err := AwaitConnFor(t.Context(), l, "uid-1", nil)
-		assert.NoError(t, err)
-		got <- conn
-	}()
-
-	l.vouches(fresh)
-
-	assert.Same(t, fresh, testutil.Recv(t, got, "the connection the waiter returned"))
-}
-
-// A holder that reports what it waits on hears every refusal, so a cluster that went from
-// unreachable to answering as another cluster is reported as both, in order.
-func TestAwaitConnForReportsEachRefusalWhileItWaits(t *testing.T) {
-	l := newStubLease()
-	refusals := testutil.NewProbe[error](4)
-
-	got := make(chan *Connection, 1)
-	go func() {
-		conn, err := AwaitConnFor(t.Context(), l, "uid-1", refusals.Fire)
-		assert.NoError(t, err)
-		got <- conn
-	}()
-
-	assert.ErrorIs(t, refusals.Await(t, "the first check to be refused"), ErrNoConnection)
-	l.refuses(ErrIdentityMismatch)
-	assert.ErrorIs(t, refusals.Await(t, "the next frame's refusal"), ErrIdentityMismatch)
-
-	fresh := &Connection{}
-	l.vouches(fresh)
-	assert.Same(t, fresh, testutil.Recv(t, got, "the connection the waiter returned"))
-}
-
-// A cluster that never comes back ends with the caller's context, and says which it was — a
-// waiter released by a give-up must not read as one released by a connection.
-func TestAwaitConnForEndsWithItsContext(t *testing.T) {
-	l := newStubLease()
-	ctx, cancel := context.WithCancel(context.Background())
-
-	failed := make(chan error, 1)
-	go func() {
-		_, err := AwaitConnFor(ctx, l, "uid-1", nil)
-		failed <- err
-	}()
-
-	cancel()
-
-	assert.ErrorIs(t, testutil.Recv(t, failed, "the waiter's error"), context.Canceled)
-}
 
 // The rotation signal cannot depend on the re-stamp being slower than the pass that
 // publishes. The stamp is a mutable word on the connection, read at publish time, so a

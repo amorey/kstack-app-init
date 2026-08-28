@@ -60,6 +60,10 @@ func (p *Pass[T]) Snapshot() Snapshot { return p.snap }
 // Equality is the body's to judge, since the supervisor holds values as any and a reconciler's value may
 // be uncomparable or carry funcs that no generic compare can read.
 //
+// **The value it replaces is not handed back.** A commit frequently carries the last value's
+// holdings forward, so a body that owns something — a connection, a goroutine — releases what it
+// is really dropping itself, before committing what replaces it.
+//
 // Calling it twice commits the second value: one run, one attempt, one wake.
 func (p *Pass[T]) Commit(v T) { p.next = &v }
 

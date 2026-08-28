@@ -51,13 +51,13 @@ func TestASweepWritesWhatTheClusterServesToTheCatalog(t *testing.T) {
 	}, catalogOf(t, svc, 1))
 }
 
-func TestASweepKeepsOnlyWhatAWorkerCanMirror(t *testing.T) {
+func TestASweepKeepsOnlyWhatAKindSyncCanMirror(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serve("v1",
 		listable("Pod", "pods", true),
 		// A subresource has no collection behind it.
 		listable("Pod", "pods/log", true),
-		// A create-only kind is a worker that can only fail.
+		// A create-only kind is a sync that can only fail.
 		metav1.APIResource{Kind: "TokenReview", Name: "tokenreviews", Verbs: metav1.Verbs{"create"}},
 		listable("Event", "events", true))
 	// One store backs both spellings of Event, and v1/events is the one that is synced.
@@ -95,7 +95,7 @@ func TestAGroupThatWillNotAnswerIsPartialAndPrunesNothing(t *testing.T) {
 	awaitDiscovered(t, svc, 1)
 	require.Len(t, catalogOf(t, svc, 1), 2)
 
-	// The aggregated API goes down. Its kinds' own workers report their own verdicts, so the
+	// The aggregated API goes down. Its kinds report their own verdicts, so the
 	// sweep degrades rather than dropping rows it could not confirm.
 	cluster.breakPath("/apis/metrics.k8s.io/v1beta1")
 	svc.RestartAll()
@@ -362,7 +362,7 @@ func TestASweepSkipsASubjectThatIsNotAnArmedCache(t *testing.T) {
 
 	// A subject this package did not name, and one whose cache nobody armed. Neither is a
 	// state a caller can reach — both are runs that must record nothing.
-	for _, subject := range []string{"not-a-cache", subjectOf(404)} {
+	for _, subject := range []string{"not-a-cache", discoverySubject(404)} {
 		result := underSession(svc, body).Reconcile(t.Context(), supervisor.NewPass[uint64](subject, nil, supervisor.Snapshot{}))
 		assert.True(t, result.IsSkip(), "a run against %s records nothing", subject)
 	}

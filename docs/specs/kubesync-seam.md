@@ -437,7 +437,8 @@ kubesync/
   session.go    one cache: its lease, its store claim, the identity gate, suspend/resume, and
                 the set of workers under it
   discovery.go  the sweep as a probe body: the fan-out, SyncKinds, the kind diff
-  kinds.go      one kind's worker: cold list, watch, cookie resume
+  kinds.go      one kind's sync as a reconciler: the run that establishes, the stream it
+                commits as its value, cold list, watch, cookie resume
   state.go      the state types and this leaf's reason vocabulary
 ```
 
@@ -452,25 +453,23 @@ session's life, a discovery loop, and a worker per kind.
 
 - **The claim is the session's**, not the worker's, so a tracked cache has a file the moment it is
   armed — which is what `Manager.WatchOpen` readers are waiting on.
-- **The identity gate is the session's too**, but the two kinds of worker wait differently. A kind
-  worker holds its own goroutine, so it blocks on `kubeconn.AwaitConnFor(ServerUID)`, reporting
-  each refusal as its own `NoConnection`/`IdentityMismatch` while it waits. Discovery
-  runs on the supervisor, where a run holds a supervisor worker and `AwaitConnFor` is documented as
-  never to be called — so it commits `NoConnection`, returns `Suspend`, and is woken by the
-  connection bridge.
+- **The identity gate is the session's too**, and both levels pass it the same way: a run holds a
+  supervisor worker, so it never waits for a connection — it commits
+  `NoConnection`/`IdentityMismatch`, returns `Suspend`, and is woken by the session's connection
+  bridge — one guard per session, since the pool's answer is one fact for every kind under it.
 - **Discovery runs on `internal/supervisor`** — three probes over a per-cache subject, `kubeconn`'s
   shape, since both are periodic pulls whose answers are values. `apiVersions` reads `/api`,
   `apiGroups` reads `/apis`, and `resources` fans out over the group list on a data edge from
   `apiGroups`, so a group list that will not load leaves the fan-out `Skip`ped rather than failing
   it. The supervisor owns each one's cadence and backoff ladder and the `Wake` the store bus below
   turns into a prompt re-run; `DiscoveryState` is projected from the snapshot, so the seam stays
-  this package's vocabulary rather than the supervisor's. The kind mirrors run on a second supervisor
-  over per-kind subjects — a run establishes the stream and commits it as the probe's value,
-  rather than being the stream. → [The mirror on the
-  supervisor](kubesync-mirror-on-supervisor.md).
+  this package's vocabulary rather than the supervisor's. The kind syncs run on a second supervisor
+  over per-kind subjects — a run establishes the stream and commits it as the reconciler's value
+  rather than being the stream, and the supervisor's worker cap is what bounds the relists in
+  flight. → [ADR](../adr/2026-08-28-the-stream-is-the-value.md).
 - **Discovery is a probe whose collection cannot be watched.** `/api` and `/apis` are plain GETs
   with no resourceVersion and no watch verb, so the sweep is a cold list with no watch phase, and
-  it re-lists on the supervisor's cadence where a kind's worker would go live. `SyncKinds` reconciles its answer
+  it re-lists on the supervisor's cadence where a kind's sync would go live. `SyncKinds` reconciles its answer
   by fingerprint and prune, as a relist does by mark and sweep — and the sweep **skips the write
   when its fingerprint matches the stored one**, since the call is a delete plus an upsert per row,
   six hundred statements for a large catalog, in one transaction against the single writer every
@@ -507,10 +506,11 @@ session's life, a discovery loop, and a worker per kind.
   — discovery starts the workers whose writes wake discovery — bottoms out on the cadence, which
   is also the cold start. It can only ever be a wake: an api server upgrade changes the built-in
   kinds with no CRD or APIService write at all.
-- **A worker** is a standing push stream, not a periodic pass: a paginated cold LIST through
-  `BeginReplace`/`WritePage`/`Commit` — behind a fleet-wide gate, since arming a cache arms
-  hundreds of kinds at once — then a WATCH from the cookie through `ApplyChange`. Events age out
-  through `PruneEvents`.
+- **A kind sync** is a standing push stream, not a periodic pass: a run takes a paginated cold LIST
+  through `BeginReplace`/`WritePage`/`Commit` — bounded by the kind supervisor's worker cap,
+  since arming a cache arms hundreds of kinds at once — opens a WATCH from the cookie, and commits
+  the goroutine that applies deltas through `ApplyChange` as its value. Events age out through
+  `PruneEvents`.
 - **A commit publishes** an observation and signals only when the reason moved, so counts and
   timestamps ticking never requeue a record.
 - **A resume holds its reason.** A worker restarting off its cookie stays at `Watching` while it
@@ -579,9 +579,8 @@ Each step is one red/green cycle and one commit.
 5. **The gauges and the clears**: `WatchHealth` onto the getters, `WatchSyncStatus`, and whatever
    the open item above resolves to.
 
-Steps 1–3 are `kubesync` alone and land before anything consumes them. Between 3 and 4, [the
-mirror moves onto the supervisor](kubesync-mirror-on-supervisor.md), which changes step 3's
-internals and nothing on the seam.
+Steps 1–3 are `kubesync` alone and land before anything consumes them. The kind sync runs on the
+supervisor as of step 3.
 
 ## Not in this pass
 

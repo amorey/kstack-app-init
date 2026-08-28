@@ -93,3 +93,4 @@ usually just documentation in the wrong place.
 | 2026-08-26 | [Cached-data watches ping, re-read and diff, and a cleared cache ends one cleanly](2026-08-26-cached-data-read-loop.md) | sidecar | Accepted |
 | 2026-08-27 | [A recorded identity conflict rebuilds the connection, woken by an edge](2026-08-27-identity-driven-retirement.md) | sidecar | Accepted |
 | 2026-08-28 | [The probe engine is a supervisor, and a probe is a reconciler](2026-08-28-supervisor-vocabulary.md) | sidecar | Accepted |
+| 2026-08-28 | [A supervised stream is the reconciler's value, not its run](2026-08-28-the-stream-is-the-value.md) | sidecar | Accepted |

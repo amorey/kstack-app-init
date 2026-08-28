@@ -17,9 +17,9 @@ the package accurately enough.
 What the package does is wider than that. It keeps a set of subjects each holding a standing value,
 re-runs a body over one on an interval, climbs a backoff ladder when the body fails, parks it until
 a dependency moves, and hands back what it stops holding. None of that is about observing. The
-mismatch stayed small only while every body fetched an observation; [the mirror](../specs/kubesync-mirror-on-supervisor.md)
-gives a body whose value is a live stream and a goroutine, and calling that a probe is wrong in a
-way a reader has to work around.
+mismatch stayed small only while every body fetched an observation;
+[the kind sync](2026-08-28-the-stream-is-the-value.md) gives a body whose value is a live stream and a
+goroutine, and calling that a probe is wrong in a way a reader has to work around.
 
 ## Decision
 
@@ -48,7 +48,7 @@ it, and the two words earn their keep apart.
 ## Alternatives considered
 
 **Keep `Engine`, rename only `Probe`.** The smaller change, and it fixes the sharper error — the
-body is what the mirror makes wrong. But it leaves the package named `probe` while nothing in its
+body is what the kind sync makes wrong. But it leaves the package named `probe` while nothing in its
 vocabulary is about probing, so the import path keeps lying at every call site.
 
 **Name the package `reconcile`, for what a caller writes.** It reads well at the declaration

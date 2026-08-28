@@ -54,6 +54,7 @@ type Result struct {
 	message      string
 	err          error
 	requeueAfter time.Duration
+	provisional  bool
 }
 
 type resultKind int
@@ -82,6 +83,20 @@ func Succeeded() Result {
 // nothing, so calling this on either is inert.
 func (r Result) RequeueAfter(d time.Duration) Result {
 	r.requeueAfter = d
+	return r
+}
+
+// Provisional marks a success the run cannot yet vouch for: it started something whose proof
+// arrives later, so the attempt is recorded as a success but the failure streak stands. The
+// next plain Succeeded ends the streak, and a Fail before that climbs from where it stood.
+//
+// Without it a run that established something would reset the ladder on the open alone, and a
+// source that accepts a request and drops it would sit at the base delay forever.
+//
+// Read on a succeeded result and nowhere else: Fail owns the ladder and Suspend ends a streak
+// by parking the question, so calling this on either is inert.
+func (r Result) Provisional() Result {
+	r.provisional = true
 	return r
 }
 
@@ -133,10 +148,27 @@ type Attempt struct {
 	Message string
 	Err     error
 
-	// requeueAfter is what the run asked for, zero for none. Unexported because it is the
-	// scheduler's own bookkeeping, and every exported field here is copied into the Snapshots
-	// callers read.
+	// requeueAfter is what the run asked for, zero for none, and provisional whether the run
+	// vouched for what it concluded. Unexported because they are the scheduler's own
+	// bookkeeping, and every exported field here is copied into the Snapshots callers read.
 	requeueAfter time.Duration
+	provisional  bool
+}
+
+// attemptOf is the record one finished run leaves. The only place a Result is turned into an
+// Attempt, so the bookkeeping the two carry cannot drift apart.
+func attemptOf(res Result, startedAt, finishedAt time.Time) Attempt {
+	return Attempt{
+		StartedAt:  startedAt,
+		FinishedAt: finishedAt,
+		Verdict:    res.verdict,
+		Reason:     res.reason,
+		Message:    res.message,
+		Err:        res.err,
+
+		requeueAfter: res.requeueAfter,
+		provisional:  res.provisional,
+	}
 }
 
 // Running reports whether this run has started and not finished.
@@ -185,8 +217,9 @@ func (a *Attempts) begin(at time.Time) { a.NextAttempt.StartedAt = at }
 func (a *Attempts) schedule(at time.Time) { a.NextAttempt = Attempt{ScheduledAt: at} }
 
 // record files a finished run. A suspension ends a failure streak the same way a success does,
-// since it parks the question rather than failing at it. It writes nothing about the next run —
-// that is derived from this, not decided here.
+// since it parks the question rather than failing at it, and a provisional success is the one
+// that ends none. It writes nothing about the next run — that is derived from this, not decided
+// here.
 //
 // The run moves out of NextAttempt rather than replacing it, so the schedule it was dispatched
 // on survives into the record: StartedAt against ScheduledAt is how long it waited for a
@@ -200,6 +233,11 @@ func (a *Attempts) record(att Attempt) {
 		if a.FailingSince.IsZero() {
 			a.FailingSince = att.FinishedAt
 		}
+		return
+	}
+	// Only a success can be provisional: the other two verdicts already own what they do to
+	// the streak, so the modifier is inert on them.
+	if att.provisional && att.Verdict == VerdictSucceeded {
 		return
 	}
 	a.Failures, a.FailingSince = 0, time.Time{}

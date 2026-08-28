@@ -237,6 +237,15 @@ func TestWithWorkersSetsTheRunWorkerCount(t *testing.T) {
 	assert.Positive(t, New().settings.workers, "a default fleet")
 }
 
+// A supervisor with no workers drains nothing: every subject queues and no run is ever
+// dispatched, with no error, no log and no verdict to read. It is a table wired wrong at boot —
+// a settings struct built without the field — so it is refused the way every other one is.
+func TestASupervisorWithNoWorkersIsRefused(t *testing.T) {
+	assert.PanicsWithValue(t, "supervisor: WithWorkers needs at least one worker",
+		func() { New(WithWorkers(0)) })
+	assert.Panics(t, func() { New(WithWorkers(-1)) })
+}
+
 // Register needs something to run, and something to call it.
 func TestRegisterPanicsWithoutAReconcilerOrAName(t *testing.T) {
 	e := New()
@@ -1178,4 +1187,81 @@ func TestASuccessWithNothingToDateLeavesTheObservationUnknown(t *testing.T) {
 	}, testutil.Timeout, time.Millisecond, "the run to land")
 	snap, _ := e.Read("prod")
 	assert.False(t, Get[string](snap, name).Known(), "nothing was ever read")
+}
+
+// The supervisor hands back every value it stops holding. A value owning a connection was fine
+// to drop — the pool retires it — but one owning a goroutine leaks unless the reconciler is told,
+// so dropping the subject is a hand-back like a refused commit is.
+func TestRemoveHandsBackTheStandingValue(t *testing.T) {
+	e, p := standing(t, "built")
+
+	e.Remove("prod")
+
+	assert.Equal(t, "built", p.discarded.Await(t, "the standing value"))
+}
+
+func TestCloseHandsBackEveryStandingValue(t *testing.T) {
+	e, p := standing(t, "built")
+
+	require.NoError(t, e.Close())
+
+	assert.Equal(t, "built", p.discarded.Await(t, "the standing value"))
+}
+
+// A subject with nothing committed has nothing to hand back, and a second Remove has nothing
+// left: a handle is handed back exactly once, or a caller would join a goroutine twice.
+func TestAValueIsHandedBackOnceAndOnlyIfThereIsOne(t *testing.T) {
+	e, p := standing(t, "built")
+
+	e.Remove("prod")
+	assert.Equal(t, "built", p.discarded.Await(t, "the standing value"))
+
+	e.Remove("prod")
+	e.Add("empty")
+	e.Remove("empty")
+	require.NoError(t, e.Close())
+
+	// Deterministic rather than a window: Remove and Close discard inline, so anything they
+	// hand back has fired by the time they return.
+	_, more := p.discarded.TryAwait()
+	assert.False(t, more, "nothing more to hand back")
+}
+
+// standing is a supervisor holding one committed value, ready for whatever drops it.
+func standing(t *testing.T, value string) (*Supervisor, *discarding) {
+	t.Helper()
+	e := New()
+	p := &discarding{discarded: testutil.NewProbe[string](4)}
+	p.res = Succeeded()
+	p.commits(value)
+	Register(e, "conn", p)
+	stop := e.Start(t.Context())
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	e.Add("prod")
+	require.Eventually(t, func() bool {
+		snap, ok := e.Read("prod")
+		return ok && Get[string](snap, "conn").Known()
+	}, testutil.Timeout, time.Millisecond, "the value to stand")
+	return e, p
+}
+
+// A commit REPLACES the standing value and does not hand it back — the one place the supervisor
+// drops a value without telling the reconciler. A commit often carries the last value's holdings
+// forward: kubeconn's connInfo is a struct whose runs commit a copy with one field moved and the
+// same live connection inside, and handing that back would retire a connection still in use.
+// What a run stops holding is the run's to release before it commits.
+func TestAReplacedValueIsNotHandedBack(t *testing.T) {
+	e, p := standing(t, "first")
+
+	p.commits("second")
+	e.Wake("prod", "conn")
+
+	require.Eventually(t, func() bool {
+		snap, ok := e.Read("prod")
+		return ok && Get[string](snap, "conn").Value == "second"
+	}, testutil.Timeout, time.Millisecond, "the committed value to stand")
+
+	_, handedBack := p.discarded.TryAwait()
+	assert.False(t, handedBack, "a replaced value stays the reconciler's to reason about")
 }
