@@ -186,14 +186,6 @@ func (l *fakeLease) WatchState() kubeconn.StateSubscription {
 	return l.hub.Watch(l.contextName)
 }
 
-// watchers counts who is listening for a connection, which is one per armed session: nothing
-// under a session watches for itself, since a run that cannot dial suspends rather than waiting.
-func (l *fakeLease) watchers() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.watches
-}
-
 func (l *fakeLease) Departed() bool { return false }
 
 func (l *fakeLease) Release() {
@@ -1034,16 +1026,6 @@ func (f *fakeKindSync) leave(subject string, gen int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.liveGen[subject], gen)
-}
-
-func (f *fakeKindSync) snapshotLive() map[string]int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := map[string]int{}
-	for k, v := range f.liveGen {
-		out[k] = len(v)
-	}
-	return out
 }
 
 // sawOverlap reports whether two generations for one subject were ever able to write at once.
