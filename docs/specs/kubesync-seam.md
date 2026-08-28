@@ -466,7 +466,7 @@ session's life, a discovery loop, and a worker per kind.
   turns into a prompt re-run; `DiscoveryState` is projected from the snapshot, so the seam stays
   this package's vocabulary rather than the supervisor's. The kind mirrors run on a second supervisor
   over per-kind subjects — a run establishes the stream and commits it as the probe's value,
-  rather than being the stream. → [The mirror on the probe
+  rather than being the stream. → [The mirror on the
   supervisor](kubesync-mirror-on-supervisor.md).
 - **Discovery is a probe whose collection cannot be watched.** `/api` and `/apis` are plain GETs
   with no resourceVersion and no watch verb, so the sweep is a cold list with no watch phase, and
