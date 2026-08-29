@@ -217,7 +217,16 @@ else would say the cache came up.
 **Reads ride their own pool.** Each `file` holds a reader pool (`readerPoolSize`) beside the
 one-connection writer, so a watch re-reading on every ping never queues behind a write. Distinct
 from the manager's read-only open, which measures a **closed** cache's file per call; the pool
-serves an **open** one for the file's life.
+serves an **open** one for the file's life. It opens through `sqlitemigrate.OpenReadPool`, whose
+DSN carries `query_only` and no `_txlock` — the enforcement is the pragma, not the caller's
+`sql.TxOptions`, since a read transaction that forgets `ReadOnly` would take the WAL write lock
+under the writer's DSN and contend as latency rather than fail as an error.
+
+**`sqlitemigrate` is the one home for the open contract.** `OpenPool` (writer) and `OpenReadPool`
+both keep every connection they open until the 5-minute idle timeout, and `OpenPool`'s DSN is
+where `auto_vacuum=INCREMENTAL` is set — a migration cannot, because SQLite ignores the pragma
+once any table exists. `openFile`'s repair branch is for a file written by a build that predates
+that DSN, not for a new one.
 
 **A cached-data watch pings, re-reads, and diffs — it never carries a row delta.** One loop
 (`cacheddatawatch.go`) serves all three: subscribe first, snapshot as `Added` frames, one `Bookmark`,

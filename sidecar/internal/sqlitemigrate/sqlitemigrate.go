@@ -21,22 +21,53 @@ import (
 )
 
 // OpenPool is the single home for the sidecar's SQLite open contract: the standard
-// PRAGMAs in the DSN (WAL, 5s busy_timeout, synchronous=NORMAL, foreign_keys, immediate
-// txlock). maxConns 1 gives a writer pool that serializes at the pool rather than
-// fighting at the SQLite layer; larger is a WAL reader pool.
+// PRAGMAs in the DSN (WAL, 5s busy_timeout, synchronous=NORMAL, foreign_keys,
+// auto_vacuum=INCREMENTAL, immediate txlock). maxConns 1 gives a writer pool that
+// serializes at the pool rather than fighting at the SQLite layer; larger is a WAL
+// reader pool. A pool keeps every connection it opens until the idle timeout takes it:
+// database/sql's default of 2 idle would close exactly the connections a larger pool was
+// sized to keep, and reopening one re-runs every pragma above.
 func OpenPool(path string, maxConns int) (*sql.DB, error) {
 	// modernc applies these _pragma values on each new connection.
+	//
+	// auto_vacuum must reach a file before anything writes to it, and journal_mode=WAL
+	// writes the header — so the order these run in is load-bearing, and it is not the
+	// order written here. modernc's applyQueryParams issues busy_timeout first and then
+	// sorts the rest lexicographically, which puts auto_vacuum ahead of journal_mode.
 	dsn := "file:" + path +
 		"?_pragma=journal_mode(WAL)" +
 		"&_pragma=busy_timeout(5000)" +
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=foreign_keys(on)" +
+		"&_pragma=auto_vacuum(incremental)" +
 		"&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	return db, nil
+}
+
+// OpenReadPool opens a WAL reader pool at path. Same shape as OpenPool, minus everything
+// the writer owns: no journal_mode, no synchronous, no foreign_keys, and above all no
+// _txlock — BEGIN IMMEDIATE takes a write lock, which query_only refuses. busy_timeout
+// stays, because a reader still waits on a lock.
+//
+// query_only is the enforcement, not the caller's sql.TxOptions: a read transaction that
+// forgets ReadOnly would otherwise take the WAL write lock and contend with the writer.
+func OpenReadPool(path string, maxConns int) (*sql.DB, error) {
+	dsn := "file:" + path +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=query_only(true)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	return db, nil
 }

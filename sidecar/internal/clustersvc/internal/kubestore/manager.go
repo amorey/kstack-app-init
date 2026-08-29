@@ -417,8 +417,7 @@ func deleteStoreFiles(path string) error {
 	return nil
 }
 
-// openFile opens the writer pool at path, sets auto_vacuum before any table exists, applies
-// the schema, and starts the file's janitor.
+// openFile opens the writer pool at path, applies the schema, and starts the file's janitor.
 //
 // The janitor starts HERE rather than at either call site: Clear reopens a fresh file for the
 // claims still held, and a start at the open alone would leave a cleared cache without a
@@ -439,6 +438,9 @@ func openFile(path string, cacheID int64, ret Retention) (*file, error) {
 		db.Close()
 		return nil, fmt.Errorf("read auto_vacuum: %w", err)
 	}
+	// A file this build creates is already INCREMENTAL — the DSN sets it. This is for one
+	// written by a build that predates that: SQLite ignores the pragma once a table exists,
+	// so without the rewrite the janitor's incremental_vacuum is a no-op on it forever.
 	if mode != autoVacuumIncremental {
 		if _, err := db.ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL; VACUUM;`); err != nil {
 			db.Close()
@@ -452,7 +454,7 @@ func openFile(path string, cacheID int64, ret Retention) (*file, error) {
 	}
 
 	// After the migrations, so a reader never races the schema onto a fresh file.
-	readDB, err := sqlitemigrate.OpenPool(path, readerPoolSize)
+	readDB, err := sqlitemigrate.OpenReadPool(path, readerPoolSize)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("open reader pool: %w", err)

@@ -137,3 +137,71 @@ func TestApplyRejectsBadFilename(t *testing.T) {
 	}), "migrations")
 	require.Error(t, err, "a file without a numeric version prefix is a packaging bug")
 }
+
+// A reader pool that inherits the writer's DSN carries _txlock=immediate, so a read
+// transaction that omits ReadOnly takes the WAL write lock — the one thing the reader pool
+// exists to avoid, and a latency mystery rather than an error. query_only is what refuses it.
+func TestOpenReadPoolRefusesWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	w, err := OpenPool(path, 1)
+	require.NoError(t, err)
+	t.Cleanup(func() { w.Close() })
+	_, err = w.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);`)
+	require.NoError(t, err)
+
+	r, err := OpenReadPool(path, 2)
+	require.NoError(t, err)
+	t.Cleanup(func() { r.Close() })
+
+	_, err = r.Exec(`INSERT INTO t VALUES (2)`)
+	require.Error(t, err, "a write on the reader pool")
+
+	var n int
+	require.NoError(t, r.QueryRow(`SELECT count(*) FROM t`).Scan(&n))
+	require.Equal(t, 1, n)
+
+	// The trap: under query_only an _txlock=immediate BEGIN fails outright, so this goes
+	// red the moment the writer's DSN is copied back onto this pool.
+	tx, err := r.BeginTx(context.Background(), nil)
+	require.NoError(t, err, "a transaction that did not ask for ReadOnly")
+	require.NoError(t, tx.Rollback())
+}
+
+// SQLite ignores auto_vacuum once any table exists, so the only place it can be set is the
+// connection that creates the file — a migration that set it would be a silent no-op.
+func TestOpenPoolCreatesAnIncrementalFile(t *testing.T) {
+	db, err := OpenPool(filepath.Join(t.TempDir(), "test.db"), 1)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+
+	const incremental = 2
+	var mode int
+	require.NoError(t, db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode))
+	require.Equal(t, incremental, mode)
+}
+
+// database/sql keeps 2 idle connections by default, so a pool sized above that closes
+// exactly the connections it was sized to open — and the next read reopens them, re-running
+// the DSN's pragmas, on a path a watch walks every 250ms.
+func TestOpenPoolKeepsEveryConnectionItOpens(t *testing.T) {
+	const n = 4
+	db, err := OpenReadPool(filepath.Join(t.TempDir(), "test.db"), n)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+
+	// Held all at once: a Conn is exclusive until it is put back, so each checkout has to
+	// open a new one. Connections released one at a time would be served by the same one,
+	// and Idle would fall short for a reason unrelated to MaxIdleConns. No clock is
+	// involved — a connection returns to the pool the moment it is released.
+	conns := make([]*sql.Conn, n)
+	for i := range conns {
+		conns[i], err = db.Conn(context.Background())
+		require.NoError(t, err)
+	}
+	for _, c := range conns {
+		require.NoError(t, c.Close())
+	}
+
+	require.Equal(t, n, db.Stats().Idle)
+	require.Zero(t, db.Stats().MaxIdleClosed)
+}

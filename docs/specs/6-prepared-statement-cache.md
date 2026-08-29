@@ -7,11 +7,11 @@ order: 6
 
 # Prepare each statement once, not once per call
 
-**Needs:** [spec 1](1-reader-pool-dsn.md) for a pool that refuses writes,
-[spec 3](3-pool-keeps-its-connections.md) for a pool that keeps the connections it opens, and
-[specs 4](4-batched-uid-statements.md)–[5](5-deletes-return-their-uids.md) for statement text that
-does not depend on its arguments. **Hands on:** nothing. Last of the sequence because it is the
-largest, and because everything before it exists to make it possible.
+**Needs:** [specs 4](4-batched-uid-statements.md)–[5](5-deletes-return-their-uids.md) for
+statement text that does not depend on its arguments. The open contract it compiles against —
+a reader pool that refuses writes, and a pool that keeps the connections it opens — has landed.
+**Hands on:** nothing. Last of the sequence because it is the largest, and because everything
+before it exists to make it possible.
 
 ## Goal
 
@@ -28,7 +28,7 @@ about 2,500 statements**, and every watch re-read recompiles its `SELECT` on eve
 What a prepared statement buys is **once per connection, not once per pool**: `db.PrepareContext`
 does not compile on every pooled connection up front — database/sql prepares lazily per connection
 and caches per `*sql.Stmt` — so a four-connection reader pool compiles each read up to four times
-over its life. And a connection reaped by [spec 3](3-pool-keeps-its-connections.md)'s idle timeout
+over its life. And a connection reaped by the pool's 5-minute idle timeout
 finalizes what was compiled on it, so the next burst prepares again. Both are bounded by
 connections and by quiet periods; the per-row and per-burst recompilation is what goes.
 

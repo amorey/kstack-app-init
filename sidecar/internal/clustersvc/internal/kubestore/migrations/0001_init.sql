@@ -1,8 +1,8 @@
 -- NOTE: auto_vacuum=INCREMENTAL (so the janitor's PRAGMA incremental_vacuum can
 -- return DELETE'd pages to the OS) is NOT set here. It must run BEFORE any table
 -- exists — including the migration runner's own schema_migrations table — so
--- SQLite would silently ignore it from inside a migration. It is set on the
--- fresh writer pool just before migrations run (see clustercache.Open).
+-- SQLite would silently ignore it from inside a migration. It is on the writer
+-- pool's DSN instead (see sqlitemigrate.OpenPool).
 
 -- Agent-optimized schema for a per-cluster local cache.
 --
@@ -57,7 +57,7 @@ CREATE TABLE cluster_meta (
 --                       (most CRDs follow the conditions convention)
 --
 -- raw_json is the full object; kind-specific deep views render from it. Stored
--- zlib-compressed (see clustercache.CompressRaw/DecompressRaw) — a BLOB, not
+-- zlib-compressed (see kubestore's compressRaw/decompressRaw) — a BLOB, not
 -- text. The format is self-identifying (a zlib stream begins with 0x78, plain
 -- JSON with '{' = 0x7B), so there is no version prefix yet; one can be added
 -- later without a migration.

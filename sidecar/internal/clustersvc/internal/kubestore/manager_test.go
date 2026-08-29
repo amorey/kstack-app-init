@@ -16,6 +16,7 @@ package kubestore
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -695,4 +696,40 @@ func TestWatchOpenDoesNotFireForAnAlreadyOpenStore(t *testing.T) {
 	if _, err := opened.TryRecv(); err == nil {
 		t.Fatal("the open signal fired for a store that was already open")
 	}
+}
+
+// The reader pool exists so a watch's re-read never queues behind the one write connection.
+// Opened with the writer's DSN it carries a write lock instead, which shows up as contention
+// rather than as an error — so the pool is opened by the opener that refuses writes.
+func TestTheReaderPoolRefusesWrites(t *testing.T) {
+	store := newTestStore(t)
+	f, err := store.file()
+	require.NoError(t, err)
+
+	_, err = f.readDB.ExecContext(context.Background(),
+		`INSERT INTO cluster_meta (key, value) VALUES ('k', 'v')`)
+
+	require.Error(t, err)
+}
+
+// The DSN sets the mode on a file this build creates; it cannot reach one that already
+// exists, because SQLite ignores the pragma once any table is in it. Deleting the repair
+// branch would strand every such file at its high-water mark, with the janitor's
+// PRAGMA incremental_vacuum a permanent no-op on it.
+func TestOpenFileRepairsAFileThatPredatesTheDSN(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "1.db")
+	legacy, err := sql.Open("sqlite", "file:"+path)
+	require.NoError(t, err)
+	_, err = legacy.Exec(`CREATE TABLE legacy (id INTEGER PRIMARY KEY)`)
+	require.NoError(t, err)
+	require.NoError(t, legacy.Close())
+
+	f, err := openFile(path, 1, Retention{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, f.close()) })
+
+	const incremental = 2
+	var mode int
+	require.NoError(t, f.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode))
+	require.Equal(t, incremental, mode)
 }

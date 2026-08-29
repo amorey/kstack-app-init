@@ -96,8 +96,7 @@ type Counts struct {
 
 // file is one cache's open SQLite database and the change bus over it — what Clear
 // swaps under the claims on it, and what the last Release closes. The writer pool is
-// capped at one connection, and auto_vacuum=INCREMENTAL is set on the fresh pool before
-// migrations run (SQLite silently ignores it once any table exists).
+// capped at one connection.
 type file struct {
 	db *sql.DB
 	// readDB is the reader pool beside the writer: the watches re-read on every ping, and
