@@ -521,7 +521,7 @@ type ClusterCachedKind {
   events(category: String, limit: Int): [Event!]!
 }
 
-"Which kind a per-kind sync mirrors. Identity only: whether it syncs is its cache's."
+"Which kind a per-kind sync mirrors, and whether the user has left it syncing."
 type ClusterCachedKindSpec {
   "Group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
   apiVersion: String!
@@ -531,6 +531,13 @@ type ClusterCachedKindSpec {
   resource: String!
   "Whether objects of this kind are namespaced."
   namespaced: Boolean!
+  """
+  Whether this one kind is syncing, set by `clusterCachedKindSyncEnabledSet`. False stops
+  the watch and **keeps the cached rows** — they stay listed and readable, and a resume
+  reconciles into them; `clusterCacheClear` is what throws rows away. Independent of the
+  cluster-wide `Cluster.spec.syncEnabled`, which freezes every kind at once.
+  """
+  syncEnabled: Boolean!
 }
 
 "One frame on the `clusterCachedKindsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
@@ -563,11 +570,13 @@ type ClusterCacheHealth {
   status: ConditionStatus!
   """
   A cache-level verdict where there is one, and otherwise the dominant per-kind reason.
-  `StoreFailed` is the cache-level one: its file will not open, so nothing under it is
-  syncing and no kind is in a position to say so. Failing that, the per-kind fold — a hard
-  failure beats a stall beats a wait beats a catch-up, and `Paused` speaks only when every
-  kind is paused. `Unknown`/`Syncing` with `totalKinds: 0` means the discovery pass has not
-  landed yet — not a fault, and not health either.
+  Two are cache-level: `Paused` when every kind this cache mirrors has been paused (a
+  paused kind is skipped by the fold, so without this arm a fully paused cache would read
+  as healthy), and `StoreFailed` when its file will not open, so nothing under it is
+  syncing and no kind is in a position to say so. Failing those, the per-kind fold — a hard
+  failure beats a stall beats a wait beats a catch-up. `Unknown`/`Syncing` with
+  `totalKinds: 0` means the discovery pass has not landed yet — not a fault, and not health
+  either.
   """
   reason: String!
   """
@@ -582,6 +591,13 @@ type ClusterCacheHealth {
   totalKinds: Int!
   "How many of them are not currently Watching."
   unhealthyKinds: Int!
+  """
+  How many of `totalKinds` the user has paused. Counted apart rather than subtracted from
+  the census: a paused kind is neither unhealthy nor missing, so without this tally it is
+  invisible in every reading — a summary spending `unhealthyKinds` alone would report five
+  kinds syncing while two of them are switched off.
+  """
+  pausedKinds: Int!
   """
   The most recent write across every kind — when data last arrived anywhere in this
   cache. Null until some kind has written. On a quiet cluster this legitimately reads
@@ -627,7 +643,7 @@ type ClusterCacheKindSyncStatus {
   kind: String!
   "The lowercase plural URL segment, e.g. `\"deployments\"`. With `apiVersion`, the pair that identifies a kind."
   resource: String!
-  "`Syncing`/`Resyncing`/`Resuming`/`Watching`/`Stale`/`SyncFailed`, or `NoConnection`/`IdentityMismatch` when the whole cache is waiting on a connection. Empty before this kind's worker has answered."
+  "`Syncing`/`Resyncing`/`Resuming`/`Watching`/`Stale`/`SyncFailed`, `NoConnection`/`IdentityMismatch` when the whole cache is waiting on a connection, or `Paused` when this kind's own `spec.syncEnabled` is off. Empty before this kind's worker has answered."
   reason: String!
   "Human detail behind `reason`. Empty when there is nothing to add."
   message: String!
@@ -864,6 +880,10 @@ type Mutation {
   # --- ClusterCache ---
   "Clear one cache's on-disk file but keep its record. Its sync workers are restarted onto the emptied file, so a present, enabled cluster re-syncs from scratch. Takes the cache's own id, not its cluster's: a UID migration leaves a cluster owning more than one. Returns the cleared cache."
   clusterCacheClear(id: ObjectID!): ClusterCache!
+
+  # --- ClusterCachedKind ---
+  "Stop or resume syncing ONE kind, leaving the rest of the cache alone. Pausing keeps the cached rows — they stay listed and readable throughout, and a resume reconciles into them rather than starting from nothing (off the watch cookie if the pause was short enough for the server to still serve it, otherwise by relisting). A discovery sweep will not undo it: the sweep owns the kind's identity, the user owns this switch. Returns the updated record."
+  clusterCachedKindSyncEnabledSet(id: ObjectID!, syncEnabled: Boolean!): ClusterCachedKind!
 
   # --- Cloud account ---
   "Start the sidecar-owned browser sign-in (OAuth). Setup (loopback bind + browser open) runs synchronously, so a setup failure — or no cloud account — returns an error. Returns true once the browser opens; the token exchange then completes in the background, with the signed-in state delivered via authStateWatch."

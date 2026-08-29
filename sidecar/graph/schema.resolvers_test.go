@@ -619,6 +619,30 @@ func TestClusterCacheClearMutation(t *testing.T) {
 	}
 }
 
+// The wire keeps the positive form, matching the cluster's own two toggles, while the
+// stored field is its inverse so a record written before the field decodes as syncing. One
+// negation at the projection — so the round trip is what pins them together.
+func TestClusterCachedKindSyncEnabledSetMutation(t *testing.T) {
+	srv := newTestServer(t, clusterFixtures())
+	id := strconv.FormatInt(int64(fixtureKindID(1)), 10)
+
+	body, _ := json.Marshal(map[string]string{
+		"query": `mutation { clusterCachedKindSyncEnabledSet(id: ` + id + `, syncEnabled: false) { id spec { syncEnabled } } }`,
+	})
+	raw := postGQL(t, srv.URL, string(body))
+	if !strings.Contains(string(raw), `"syncEnabled":false`) {
+		t.Errorf("expected the paused record back, got %s", raw)
+	}
+
+	body, _ = json.Marshal(map[string]string{
+		"query": `mutation { clusterCachedKindSyncEnabledSet(id: "999", syncEnabled: false) { id } }`,
+	})
+	raw = postGQL(t, srv.URL, string(body))
+	if !strings.Contains(string(raw), "errors") {
+		t.Errorf("expected a GraphQL error for an unknown id, got %s", raw)
+	}
+}
+
 // TestClusterCachedKindsWatchIsCacheScoped pins the scoping on the wire: the stream is
 // opened for one cache and must carry only that cache's kinds. The fixture gives each
 // cache one record, so a leak shows up as a second frame.

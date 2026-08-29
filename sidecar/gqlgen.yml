@@ -146,6 +146,11 @@ models:
         resolver: true
   ClusterCachedKindSpec:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedKindSpec
+    fields:
+      # The wire's positive form over a stored Paused. The storage field is inverted so a
+      # record written before it decodes as syncing; this resolver is the one negation.
+      syncEnabled:
+        resolver: true
   ClusterCachedKindWatchFrame:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedKindWatchFrame
   ClusterCacheHealth:

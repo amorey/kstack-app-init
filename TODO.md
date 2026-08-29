@@ -2,7 +2,7 @@
 
 Pending work across the three parts of the app. Grouped by area; detailed items keep their acceptance notes inline.
 
-> **The specs are the plan.** Work with a settled shape lives in [`docs/specs/`](docs/specs/) and is not repeated here — the numbered sequence there covers the cluster events API, cache durability, per-kind sync pause, and the objects read split. This file holds what has no spec yet: watch items, simplifications, and work whose shape is still a question.
+> **The specs are the plan.** Work with a settled shape lives in [`docs/specs/`](docs/specs/) and is not repeated here — the numbered sequence there covers the objects read split. This file holds what has no spec yet: watch items, simplifications, and work whose shape is still a question.
 
 ## Sidecar — cluster service
 

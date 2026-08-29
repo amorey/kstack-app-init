@@ -73,10 +73,10 @@ const (
 	EventsResource   = "events"
 )
 
-// ClusterCachedKindSpec is the desired sync for one GVR, written wholly from
-// above: identity, and nothing else. Whether a kind syncs is its cache's, never
-// relayed here. The fields refresh each discovery pass, so a kind that changes shape
-// converges without recreation.
+// ClusterCachedKindSpec is the desired sync for one GVR: the identity the discovery
+// sweep owns, plus the one switch the user owns. The catalog fields refresh each sweep,
+// so a kind that changes shape converges without recreation; nothing that writes on a
+// schedule may touch Paused.
 type ClusterCachedKindSpec struct {
 	// APIVersion is the group/version this kind is served at, e.g. "apps/v1" — or a bare
 	// version ("v1") for the core group, matching the wire form Kubernetes uses.
@@ -87,6 +87,12 @@ type ClusterCachedKindSpec struct {
 	Resource string `json:"resource"`
 	// Namespaced is true when objects of this kind live in a namespace.
 	Namespaced bool `json:"namespaced"`
+	// Paused is the user's switch for this one kind. Inverted so the zero value is the
+	// default: beehive decodes a spec with json.Unmarshal, and every stored record
+	// predates this field — a positive Enabled would decode false for the whole fleet on
+	// the upgrade that shipped it. The wire keeps the positive form (`syncEnabled`), so
+	// the projection negates.
+	Paused bool `json:"paused"`
 }
 
 // ClusterCachedKindStatus is the observed sync state for one GVR. Empty placeholder.
@@ -242,6 +248,44 @@ func (a cachedKindsAPI) Clear(ctx context.Context, id ClusterCachedKindID) (*Clu
 	return toClusterCachedKind(obj)
 }
 
+// SetSyncEnabled is the user's switch for one kind. The wire's positive form; the stored
+// field is its inverse, so the zero value can mean syncing.
+func (a cachedKindsAPI) SetSyncEnabled(ctx context.Context, id ClusterCachedKindID, syncEnabled bool) (*ClusterCachedKind, error) {
+	// Read-modify-write under the lock the discovery sweep also takes: beehive's Update
+	// wants the whole spec and offers no compare-and-swap, so a sweep converging a catalog
+	// change alongside this would write its own read back over the switch.
+	a.s.kindSpecMu.Lock()
+	defer a.s.kindSpecMu.Unlock()
+
+	obj, err := a.s.kindClient.Get(ctx, beehive.ObjectID(id))
+	if err != nil {
+		return nil, wrapKindErr("get", id, err)
+	}
+	spec := obj.Spec
+	spec.Paused = !syncEnabled
+	// The record can be collected between the read and the write, so this reports a
+	// missing record too.
+	if _, err := a.s.kindClient.Update(ctx, beehive.ObjectID(id), spec); err != nil {
+		return nil, wrapKindErr("update", id, err)
+	}
+	// Read back rather than project what Update returned: the served record carries the
+	// owner edge a client joins on, and a write loads no edges.
+	updated, err := a.s.kindClient.Get(ctx, beehive.ObjectID(id), beehive.LoadOwner())
+	if err != nil {
+		return nil, wrapKindErr("get", id, err)
+	}
+	return toClusterCachedKind(updated)
+}
+
+// wrapKindErr annotates a store error, mapping beehive's missing-record sentinel onto the
+// boundary's own.
+func wrapKindErr(verb string, id ClusterCachedKindID, err error) error {
+	if errors.Is(err, beehive.ErrNotFound) {
+		return fmt.Errorf("%s cached kind %d: %w", verb, id, ErrNotFound)
+	}
+	return fmt.Errorf("%s cached kind %d: %w", verb, id, err)
+}
+
 // clearKindRows drops one kind's rows from the cache holding them. A cache with no file
 // has nothing to clear — and opening one would create the very file the clear is
 // removing, which is why this goes through OpenExisting rather than claiming a store
@@ -346,6 +390,20 @@ func (c *clusterCachedKindController) Reconcile(
 		return beehive.Settled()
 	}
 
+	// Paused stops the sync and KEEPS THE ROWS — no clearKindRows, which is what makes a
+	// deletion a deletion. Level-triggered, so this fires on every pass while the kind is
+	// paused; the whole chain is idempotent, and one armMu acquisition per paused kind is
+	// cheaper than tracking the transition.
+	if obj.Spec.Paused {
+		c.kubesyncSvc.ForgetKind(int64(cacheID), toKubestoreKind(obj.Spec))
+		// Ahead of the return, or the pause never reaches the timeline: the logging below
+		// this branch is not reached.
+		if err := c.logSyncVerdict(ctx, client, cacheID, obj.Spec); err != nil {
+			return beehive.Fail(err)
+		}
+		return beehive.Settled()
+	}
+
 	// Registering outlives the cache being paused, which is what makes a resume one call:
 	// kubesync holds this and runs nothing until the cache above is armed.
 	c.kubesyncSvc.TrackKind(int64(cacheID), toKubestoreKind(obj.Spec))
@@ -392,19 +450,35 @@ func (c *clusterCachedKindController) logSyncVerdict(
 	cacheID ClusterCacheID,
 	spec ClusterCachedKindSpec,
 ) error {
-	state, ok := c.kubesyncSvc.GetKindState(int64(cacheID), toKubestoreKind(spec))
+	reason, message, ok := kindVerdict(c.kubesyncSvc, cacheID, spec)
 	if !ok {
 		return nil
 	}
 	if err := client.AddEvent(ctx, beehive.EventSpec{
 		Category: categorySync,
-		Type:     syncEventType(state.Reason),
-		Reason:   state.Reason,
-		Message:  state.Message,
+		Type:     syncEventType(reason),
+		Reason:   reason,
+		Message:  message,
 	}); err != nil {
 		return fmt.Errorf("log cached kind %s sync: %w", spec.Resource, err)
 	}
 	return nil
+}
+
+// kindVerdict is one kind's reason and message, and whether there is one at all.
+//
+// **Paused is decided ahead of the state read, never derived from its absence.** A paused
+// kind is forgotten, so kubesync has nothing to say about it — and it deliberately does not
+// know why it was not asked to sync something. The record does.
+func kindVerdict(svc kubesyncService, cacheID ClusterCacheID, spec ClusterCachedKindSpec) (reason, message string, ok bool) {
+	if spec.Paused {
+		return ReasonPaused, "", true
+	}
+	state, ok := svc.GetKindState(int64(cacheID), toKubestoreKind(spec))
+	if !ok {
+		return "", "", false
+	}
+	return state.Reason, state.Message, true
 }
 
 // syncEventType grades a kind's verdict. Stale is a warning and not a failure: the rows are

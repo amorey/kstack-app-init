@@ -36,7 +36,6 @@ import {
   useClusters,
 } from '@/lib/clusters';
 import { type AppDialogProps } from '@/lib/dialog';
-import { errorMessage, reportError } from '@/lib/error-bus';
 import { EVENTS_GVR, gvrKey } from '@/lib/gvr';
 import { useWatchSubscription, watchPhase } from '@/lib/graphql/use-watch-subscription';
 
@@ -66,6 +65,19 @@ const ClusterCacheClearMutation = graphql(`
   mutation ClusterCacheClear($id: ObjectID!) {
     clusterCacheClear(id: $id) {
       id
+    }
+  }
+`);
+
+// One kind's own switch. Pausing keeps the cached rows, which is the whole difference from
+// clusterCacheClear — the objects stay listed and readable while the watch is stopped.
+const ClusterCachedKindSyncEnabledSetMutation = graphql(`
+  mutation ClusterCachedKindSyncEnabledSet($id: ObjectID!, $syncEnabled: Boolean!) {
+    clusterCachedKindSyncEnabledSet(id: $id, syncEnabled: $syncEnabled) {
+      id
+      spec {
+        syncEnabled
+      }
     }
   }
 `);
@@ -707,18 +719,26 @@ function CacheSizeCell({ contents }: { contents: CacheContents | null }) {
   return <>{contents?.exists ? formatBytes(contents.bytes) : '—'}</>;
 }
 
-// "118 of 120 kinds — widgets, gateways not syncing", or plain "120 kinds". Read
-// straight off the rollup — re-folding the per-kind stream here would be a second
-// definition of health that can disagree with the badge above it mid-frame.
+// "118 of 120 kinds — widgets, gateways not syncing", "3 of 5 kinds syncing, 2 paused", or
+// plain "120 kinds". Read straight off the rollup — re-folding the per-kind stream here
+// would be a second definition of health that can disagree with the badge above it
+// mid-frame.
+//
+// Paused kinds are counted apart because they are neither: they stay in totalKinds and are
+// never offenders, so a label spending unhealthyKinds alone would render a plain "5 kinds"
+// over a cache where two of them are switched off.
 function kindsSyncingLabel(health: ClusterCacheHealth): string {
-  if (health.unhealthyKinds === 0) return countLabel(health.totalKinds, 'kind');
-  const syncing = `${health.totalKinds - health.unhealthyKinds} of ${countLabel(health.totalKinds, 'kind')}`;
+  const idle = health.unhealthyKinds + health.pausedKinds;
+  if (idle === 0) return countLabel(health.totalKinds, 'kind');
+  const syncing = `${health.totalKinds - idle} of ${countLabel(health.totalKinds, 'kind')}`;
+  if (health.unhealthyKinds === 0) return `${syncing} syncing, ${health.pausedKinds} paused`;
   // unhealthyKinds counts every non-Watching kind; unhealthyKindRefs names only the
   // ranked offenders. Mid-pause there's a count with no names — say how many are
   // syncing and stop.
   const offenders = offenderList(health);
-  if (!offenders) return `${syncing} syncing`;
-  return `${syncing} — ${offenders} not syncing`;
+  const paused = health.pausedKinds > 0 ? `, ${health.pausedKinds} paused` : '';
+  if (!offenders) return `${syncing} syncing${paused}`;
+  return `${syncing} — ${offenders} not syncing${paused}`;
 }
 
 // Cap lives here, not in the sidecar: how many names fit is a layout question; the
@@ -779,7 +799,21 @@ function SyncDetail({
   // hundred kinds into one verdict. A kind with no reason yet has not answered, and a kind
   // still starting has not failed: a cache being armed, cleared, or resumed reports every one
   // of its kinds that way, and reading those as offenders would list all of them.
-  const failingKinds = (syncStatus?.kinds ?? []).filter((kind) => kind.reason && !SETTLING_REASONS.has(kind.reason));
+  const failingKinds = (syncStatus?.kinds ?? []).filter(
+    (kind) => kind.reason && kind.reason !== 'Paused' && !SETTLING_REASONS.has(kind.reason),
+  );
+  // Paused kinds get their own section rather than joining SETTLING_REASONS: a kind the
+  // user switched off is neither a fault nor settling, and folding it into the settling set
+  // would hide it instead of putting the resume control beside it.
+  const pausedKinds = (syncStatus?.kinds ?? []).filter((kind) => kind.reason === 'Paused');
+  const [, setKindSyncEnabled] = useMutation(ClusterCachedKindSyncEnabledSetMutation);
+  // The mutation takes the per-kind RECORD's id, and a sync-detail row carries only its
+  // GVR — so the control resolves one against the other. A row with no record yet gets no
+  // control rather than a guessed id.
+  const idOf = (kind: KindSyncStatus) => kindSyncs.find((s) => gvrKey(s.spec) === gvrKey(kind))?.id ?? null;
+  const setSyncEnabled = (id: string, syncEnabled: boolean) => {
+    setKindSyncEnabled({ id, syncEnabled });
+  };
   // Newest write anywhere, beside the OLDEST proof — a cache is only as verified
   // as its least-recently proven watch.
   const lastUpdateMs = parseTimeOrNull(health.lastUpdateAt ?? null);
@@ -817,7 +851,12 @@ function SyncDetail({
         <DetailRow label="Sync verified" ms={lastLiveMs} />
       </dl>
       {syncStatus?.discovery.reason ? <DiscoveryVerdict discovery={syncStatus.discovery} /> : null}
-      {failingKinds.length > 0 ? <FailingKindList kinds={failingKinds} /> : null}
+      {failingKinds.length > 0 ? (
+        <FailingKindList kinds={failingKinds} idOf={idOf} onSetSyncEnabled={setSyncEnabled} />
+      ) : null}
+      {pausedKinds.length > 0 ? (
+        <PausedKindList kinds={pausedKinds} idOf={idOf} onSetSyncEnabled={setSyncEnabled} />
+      ) : null}
       {events.runs.length > 0 ? (
         <EventRunList
           title={timelineKind ? `Recent sync events — ${timelineKind.spec.resource}` : 'Recent sync events'}
@@ -854,30 +893,128 @@ function DiscoveryVerdict({ discovery }: { discovery: { reason: string; message:
   );
 }
 
-// How many failing kinds to name. A layout cap, as with the offender list: the wire carries
-// every row.
-const FAILING_KIND_CAP = 5;
+// How many kinds a section lists before it folds. A layout default rather than a ceiling —
+// these rows carry the only control that can pause or resume a kind, so what is folded away
+// has to stay reachable, and the section below expands.
+const KIND_LIST_CAP = 5;
 
 // One line per kind that is not Watching, each with the reason IT reported. A cache's kinds
 // fail independently, so a single forbidden CRD is invisible in every other reading here.
-function FailingKindList({ kinds }: { kinds: KindSyncStatus[] }) {
-  const shown = kinds.slice(0, FAILING_KIND_CAP);
+function FailingKindList({ kinds, idOf, onSetSyncEnabled }: KindListProps) {
   return (
-    <div className="space-y-0.5">
-      <p className="text-xs font-medium">Kinds not syncing</p>
+    <KindSection title="Kinds not syncing" kinds={kinds}>
+      {(kind) => (
+        <>
+          <dd className="truncate">{kind.message ? `${kind.reason} — ${kind.message}` : kind.reason}</dd>
+          {/* Pausing is what a user reaches for over a kind that is storming or forbidden,
+              so the entry point sits on the row that reports it. */}
+          <SyncEnabledButton kind={kind} id={idOf(kind)} syncEnabled={false} onSet={onSetSyncEnabled} />
+        </>
+      )}
+    </KindSection>
+  );
+}
+
+type KindListProps = {
+  kinds: KindSyncStatus[];
+  // The per-kind record's id for a row, or null while that stream has yet to carry it.
+  idOf: (kind: KindSyncStatus) => string | null;
+  onSetSyncEnabled: (id: string, syncEnabled: boolean) => void;
+};
+
+// The kinds the user switched off. Their own section, not a fault list: nothing here is
+// wrong, and the rows are still cached and readable.
+function PausedKindList({ kinds, idOf, onSetSyncEnabled }: KindListProps) {
+  return (
+    <KindSection title="Paused kinds" kinds={kinds}>
+      {(kind) => (
+        <>
+          {/* What the pause kept, which is the whole difference from clearing the kind. */}
+          <dd className="truncate">{countLabel(kind.objectCount, 'object')} kept</dd>
+          <SyncEnabledButton kind={kind} id={idOf(kind)} syncEnabled onSet={onSetSyncEnabled} />
+        </>
+      )}
+    </KindSection>
+  );
+}
+
+// Stop or resume one kind. Nothing renders while the record's id is still owed: the
+// mutation keys on that id, and a control without one has no kind to name.
+function SyncEnabledButton({
+  kind,
+  id,
+  syncEnabled,
+  onSet,
+}: {
+  kind: KindSyncStatus;
+  id: string | null;
+  syncEnabled: boolean;
+  onSet: (id: string, syncEnabled: boolean) => void;
+}) {
+  if (!id) return null;
+  const verb = syncEnabled ? 'Resume' : 'Pause';
+  return (
+    <button
+      type="button"
+      // The plural is in the label, not the text: the row already renders it, and a second
+      // copy would make every kind match twice in the section it is listed under.
+      aria-label={`${verb} ${kind.resource}`}
+      className="ml-auto shrink-0 underline underline-offset-2 hover:text-foreground"
+      onClick={() => onSet(id, syncEnabled)}
+    >
+      {verb}
+    </button>
+  );
+}
+
+// A titled list of kinds, folded to the cap and expandable past it. A labelled group so a
+// reader — and a test — can tell which section a kind is listed under, since the same plural
+// can appear in either.
+function KindSection({
+  title,
+  kinds,
+  children,
+}: {
+  title: string;
+  kinds: KindSyncStatus[];
+  children: (kind: KindSyncStatus) => ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const hidden = kinds.length - KIND_LIST_CAP;
+  const shown = expanded ? kinds : kinds.slice(0, KIND_LIST_CAP);
+  return (
+    <div className="space-y-0.5" role="group" aria-label={title}>
+      <p className="text-xs font-medium">{title}</p>
       <dl className="space-y-0.5 text-xs text-muted-foreground">
         {shown.map((kind) => (
-          <div key={`${kind.apiVersion}/${kind.resource}`} className="flex gap-2">
-            {/* The plural alone reads best, but the pair is what identifies a kind — so the
-                api group is the title, where it disambiguates without crowding the line. */}
-            <dt className="shrink-0 font-mono" title={kind.apiVersion}>
-              {kind.resource}
-            </dt>
-            <dd className="truncate">{kind.message ? `${kind.reason} — ${kind.message}` : kind.reason}</dd>
-          </div>
+          <KindLine key={gvrKey(kind)} kind={kind}>
+            {children(kind)}
+          </KindLine>
         ))}
-        {kinds.length > shown.length ? <div>+{kinds.length - shown.length} more</div> : null}
       </dl>
+      {hidden > 0 ? (
+        <button
+          type="button"
+          className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? 'Show less' : `Show ${hidden} more`}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+// One kind's line: the plural, then whatever the section has to say about it.
+function KindLine({ kind, children }: { kind: KindSyncStatus; children: ReactNode }) {
+  return (
+    <div className="flex gap-2">
+      {/* The plural alone reads best, but the pair is what identifies a kind — so the api
+          group is the title, where it disambiguates without crowding the line. */}
+      <dt className="shrink-0 font-mono" title={kind.apiVersion}>
+        {kind.resource}
+      </dt>
+      {children}
     </div>
   );
 }
@@ -1096,21 +1233,14 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
   // reached once the fleet is genuinely known.
   const phase = watchPhase(clusters !== null, connected);
 
-  // Actions write through; the clustersWatch push is the source of truth. urql's
-  // execute resolves (never rejects), so surface a failed mutation's error on the bus.
+  // Actions write through; the clustersWatch push is the source of truth. A failure needs
+  // no handling here — the client's errorReportExchange puts every operation error on the
+  // bus, so a second report at the call site would show one failure twice.
   const [, clusterEnabledSetMut] = useMutation(ClusterEnabledSetMutation);
   const [, clusterSyncEnabledSetMut] = useMutation(ClusterSyncEnabledSetMutation);
   const [, clusterCacheClearMut] = useMutation(ClusterCacheClearMutation);
   const [, clusterDeleteMut] = useMutation(ClusterDeleteMutation);
   const [, clusterConnectionRetryMut] = useMutation(ClusterConnectionRetryMutation);
-
-  const run = (p: Promise<{ error?: unknown }>) => {
-    p.then((result) => {
-      if (result.error) {
-        reportError({ source: 'graphql', message: errorMessage(result.error), cause: result.error });
-      }
-    });
-  };
 
   return (
     <Dialog
@@ -1166,16 +1296,16 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
                   key={c.id}
                   cluster={c}
                   group={g.key}
-                  onSetEnabled={(enabled) => run(clusterEnabledSetMut({ id: c.id, enabled }))}
-                  onToggle={(syncEnabled) => run(clusterSyncEnabledSetMut({ id: c.id, syncEnabled }))}
+                  onSetEnabled={(enabled) => clusterEnabledSetMut({ id: c.id, enabled })}
+                  onToggle={(syncEnabled) => clusterSyncEnabledSetMut({ id: c.id, syncEnabled })}
                   // The cache's own id, not the cluster's: a UID migration leaves the
                   // cluster owning more than one. The button is disabled until the
                   // active cache reports a file, so the guard never fires in practice.
                   onClearCache={() => {
-                    if (c.activeCache) run(clusterCacheClearMut({ id: c.activeCache.id }));
+                    if (c.activeCache) clusterCacheClearMut({ id: c.activeCache.id });
                   }}
-                  onRemove={() => run(clusterDeleteMut({ id: c.id }))}
-                  onRetry={() => run(clusterConnectionRetryMut({ id: c.id }))}
+                  onRemove={() => clusterDeleteMut({ id: c.id })}
+                  onRetry={() => clusterConnectionRetryMut({ id: c.id })}
                 />
               ))}
             </TableBody>

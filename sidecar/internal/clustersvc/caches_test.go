@@ -809,6 +809,94 @@ func TestCachePassConvergesARenamedKindInPlace(t *testing.T) {
 	assert.Equal(t, "PodThing", obj.Spec.Kind, "the singular converges under the name it already holds")
 }
 
+// **The catalog owns four fields; the user owns one.** The sweep writes on a schedule, so
+// a pass that wrote the whole desired spec would un-pause a kind within one discovery
+// interval — and silently, since nothing else moves.
+func TestCachePassLeavesAPausedKindPaused(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	reconcileCache(t, d, cache)
+	writeCatalog(t, d, ClusterCacheID(cache.ID), kindRow("v1", "Pod", "pods"))
+	reconcileCache(t, d, cache)
+	pauseKind(t, d, cache.ID, "v1", "pods")
+
+	reconcileCache(t, d, cache)
+
+	assert.True(t, storedKind(t, d, cache.ID, "v1", "pods").Spec.Paused,
+		"the sweep writes nothing when no catalog field moved")
+}
+
+// The other half of the ownership split: a catalog change is the sweep's to converge, and
+// it converges the four fields it owns WITHOUT taking the fifth back.
+func TestCachePassCarriesAPauseThroughACatalogChange(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	reconcileCache(t, d, cache)
+	writeCatalog(t, d, ClusterCacheID(cache.ID), kindRow("v1", "Pod", "pods"))
+	reconcileCache(t, d, cache)
+	pauseKind(t, d, cache.ID, "v1", "pods")
+
+	writeCatalog(t, d, ClusterCacheID(cache.ID), kindRow("v1", "PodThing", "pods"))
+	reconcileCache(t, d, cache)
+
+	obj := storedKind(t, d, cache.ID, "v1", "pods")
+	assert.Equal(t, "PodThing", obj.Spec.Kind, "the singular converges")
+	assert.True(t, obj.Spec.Paused, "and the user's switch rides through it")
+}
+
+// The pass lists the records BEFORE it takes the lock, so a pause landing in that window is
+// already stored and missing from the snapshot. The carry-forward has to read the record
+// rather than the snapshot, or a catalog change arriving alongside writes the user's
+// mutation away — with both writers ostensibly sharing the mutex.
+//
+// Driven through upsertKinds directly, with the snapshot taken before the pause: that is
+// the race's outcome, without a race to reproduce.
+func TestCachePassCarriesAPauseItsSnapshotMissed(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	reconcileCache(t, d, cache)
+	writeCatalog(t, d, ClusterCacheID(cache.ID), kindRow("v1", "Pod", "pods"))
+	reconcileCache(t, d, cache)
+
+	ctx := context.Background()
+	c := &clusterCacheController{deps: d}
+	stale, err := c.storedKinds(ctx, cache.ID)
+	require.NoError(t, err)
+	pauseKind(t, d, cache.ID, "v1", "pods")
+
+	name := ClusterCachedKindName(cache.ID, "v1", "pods")
+	desired := map[string]ClusterCachedKindSpec{
+		name: {APIVersion: "v1", Kind: "PodThing", Resource: "pods", Namespaced: true},
+	}
+	require.NoError(t, c.upsertKinds(ctx, cache.ID, desired, stale))
+
+	obj := storedKind(t, d, cache.ID, "v1", "pods")
+	assert.Equal(t, "PodThing", obj.Spec.Kind, "the singular converges")
+	assert.True(t, obj.Spec.Paused, "and the pause the snapshot missed rides through it")
+}
+
+// pauseKind sets one record's switch the way the mutation will, so the sweep tests can
+// stand a pause up before any setter exists.
+func pauseKind(t *testing.T, d deps, cacheID beehive.ObjectID, apiVersion, resource string) {
+	t.Helper()
+	obj := storedKind(t, d, cacheID, apiVersion, resource)
+	spec := obj.Spec
+	spec.Paused = true
+	_, err := d.kindClient.Update(context.Background(), obj.ID, spec)
+	require.NoError(t, err)
+}
+
+// storedKind reads one kind record back by the name the sweep gives it.
+func storedKind(t *testing.T, d deps, cacheID beehive.ObjectID, apiVersion, resource string) *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus] {
+	t.Helper()
+	obj, err := d.kindClient.GetByName(context.Background(), ClusterCachedKindName(cacheID, apiVersion, resource))
+	require.NoError(t, err)
+	return obj
+}
+
 // A record with no row is a kind the cluster has stopped serving. Marked, not collected: the
 // record's own pass is what clears the rows behind it.
 func TestCachePassMarksARecordWithNoRow(t *testing.T) {
@@ -1090,6 +1178,72 @@ func TestCachesWatchHealthReadsAKindWithNoAnswerAsConnecting(t *testing.T) {
 	assert.Empty(t, got.UnhealthyKindRefs, "a kind that has not answered is not an offender")
 }
 
+// **A paused kind is skipped, not folded.** It never reaches GetKindState, so it can never
+// be read as unanswered — and an unanswered kind pins the whole cache at Connecting, which
+// is what would leave a user's own deliberate pause looking like a cache that never started.
+//
+// It still counts in totalKinds: that field has a documented meaning and three consumers, so
+// the paused ones are tallied separately rather than subtracted out of the census.
+func TestCachesWatchHealthSkipsAPausedKindWithoutLosingItFromTheCensus(t *testing.T) {
+	d, cacheID := syncingCacheWithKinds(t)
+	setKindReason(d, cacheID, podsSpec, kubesync.KindState{
+		Reason: kubesync.ReasonWatching, LastLiveAt: probedAt,
+	})
+	pauseKind(t, d, beehive.ObjectID(cacheID), deploymentsSpec.APIVersion, deploymentsSpec.Resource)
+
+	stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+
+	got := testutil.Recv(t, stream.Frames, "the cache's verdict")
+	assert.Equal(t, kubesync.ReasonWatching, got.Reason, "the paused kind withholds nothing")
+	assert.Equal(t, 2, got.TotalKinds, "the census keeps it")
+	assert.Equal(t, 1, got.PausedKinds)
+	assert.Equal(t, 0, got.UnhealthyKinds, "a paused kind is not unhealthy")
+}
+
+// The gauge dedupes per cache against a hand-written comparison, so a field nothing
+// compares is invisible by default — and pausing one kind on an otherwise-idle healthy
+// cache moves NOTHING ELSE: the census holds, the paused kind is skipped so there are no
+// offenders, and status and reason sit still. The frame would be suppressed and the count
+// would never reach a client.
+func TestCachesWatchHealthPublishesWhenAKindIsPaused(t *testing.T) {
+	d, cacheID := syncingCacheWithKinds(t)
+	setKindReason(d, cacheID, podsSpec, kubesync.KindState{Reason: kubesync.ReasonWatching, LastLiveAt: probedAt})
+	setKindReason(d, cacheID, deploymentsSpec, kubesync.KindState{Reason: kubesync.ReasonWatching, LastLiveAt: probedAt})
+
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := svc.Caches().WatchHealth(ctx)
+	require.NoError(t, err)
+	defer func() {
+		cancel()
+		testutil.WaitClosed(t, stream.Frames, "the gauge to stop")
+	}()
+	require.Equal(t, kubesync.ReasonWatching, testutil.Recv(t, stream.Frames, "the healthy verdict").Reason)
+
+	pauseKind(t, d, beehive.ObjectID(cacheID), deploymentsSpec.APIVersion, deploymentsSpec.Resource)
+
+	assert.Equal(t, 1, testutil.Recv(t, stream.Frames, "the verdict after the pause").PausedKinds)
+}
+
+// The arm ordering, which is the easy thing to get wrong. Paused kinds are skipped, so a
+// fully paused cache has no offenders and nothing unanswered — every later arm would call
+// it healthy, and the badge would read Watching over a cache syncing nothing.
+func TestCachesWatchHealthReadsAFullyPausedCacheAsPaused(t *testing.T) {
+	d, cacheID := syncingCacheWithKinds(t)
+	pauseKind(t, d, beehive.ObjectID(cacheID), podsSpec.APIVersion, podsSpec.Resource)
+	pauseKind(t, d, beehive.ObjectID(cacheID), deploymentsSpec.APIVersion, deploymentsSpec.Resource)
+
+	stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+
+	got := testutil.Recv(t, stream.Frames, "the cache's verdict")
+	assert.Equal(t, ConditionFalse, got.Status)
+	assert.Equal(t, ReasonPaused, got.Reason)
+	assert.Equal(t, 2, got.PausedKinds)
+}
+
 // A cache whose file will not open has no session behind it, so every kind reads as
 // unanswered and the per-kind fold sits at Connecting for good — an amber badge with no
 // reason anywhere. The store's verdict is the cache's own, and it decides above the fold.
@@ -1156,6 +1310,25 @@ func TestCachesWatchSyncStatusCarriesAStoreFailure(t *testing.T) {
 	got := testutil.Recv(t, stream.Frames, "the cache's sync detail")
 	assert.Equal(t, kubesync.ReasonStoreFailed, got.Discovery.Reason)
 	assert.Equal(t, "disk full", got.Discovery.Message)
+}
+
+// The panel's list is where a user looks for a per-kind reason, and a paused kind has no
+// worker to ask. **ObjectCount still answers**, since it comes off the store's counts and
+// not the sync seam — which is the point of keeping the rows.
+func TestCachesWatchSyncStatusReadsAPausedKindOffItsRecord(t *testing.T) {
+	d, cacheID := syncingCacheWithKinds(t)
+	cluster, _, err := d.cacheClient.GetOwner(context.Background(), beehive.ObjectID(cacheID))
+	require.NoError(t, err)
+	writeCatalog(t, d, cacheID, kindRow("v1", "Pod", "pods"))
+	pauseKind(t, d, beehive.ObjectID(cacheID), "v1", "pods")
+
+	stream, err := serviceOver(t, d).Caches().WatchSyncStatus(context.Background(), ClusterID(cluster.ID), cacheID)
+	require.NoError(t, err)
+
+	got := testutil.Recv(t, stream.Frames, "the cache's sync detail")
+	require.Len(t, got.Kinds, 2)
+	assert.Equal(t, ReasonPaused, got.Kinds[1].Reason, "the reason comes off the record, not the seam")
+	assert.Equal(t, 0, got.Kinds[1].ObjectCount, "and the count still answers")
 }
 
 // The gauge re-emits only when the detail moved: it is re-read on a cadence, and an idle

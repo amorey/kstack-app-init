@@ -123,6 +123,7 @@ const ClusterCacheHealthWatchSubscription = graphql(`
       }
       totalKinds
       unhealthyKinds
+      pausedKinds
       lastUpdateAt
       lastLiveAt
     }

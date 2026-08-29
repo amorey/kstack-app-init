@@ -39,6 +39,7 @@ type ResolverRoot interface {
 	ClusterCachedDataEvent() ClusterCachedDataEventResolver
 	ClusterCachedDataObject() ClusterCachedDataObjectResolver
 	ClusterCachedKind() ClusterCachedKindResolver
+	ClusterCachedKindSpec() ClusterCachedKindSpecResolver
 	ClusterPrincipal() ClusterPrincipalResolver
 	Mutation() MutationResolver
 	Query() QueryResolver
@@ -90,6 +91,7 @@ type ComplexityRoot struct {
 		CacheID           func(childComplexity int) int
 		LastLiveAt        func(childComplexity int) int
 		LastUpdateAt      func(childComplexity int) int
+		PausedKinds       func(childComplexity int) int
 		Reason            func(childComplexity int) int
 		Status            func(childComplexity int) int
 		TotalKinds        func(childComplexity int) int
@@ -194,10 +196,11 @@ type ComplexityRoot struct {
 	}
 
 	ClusterCachedKindSpec struct {
-		APIVersion func(childComplexity int) int
-		Kind       func(childComplexity int) int
-		Namespaced func(childComplexity int) int
-		Resource   func(childComplexity int) int
+		APIVersion  func(childComplexity int) int
+		Kind        func(childComplexity int) int
+		Namespaced  func(childComplexity int) int
+		Resource    func(childComplexity int) int
+		SyncEnabled func(childComplexity int) int
 	}
 
 	ClusterCachedKindWatchFrame struct {
@@ -295,13 +298,14 @@ type ComplexityRoot struct {
 	}
 
 	Mutation struct {
-		AuthLoginStart         func(childComplexity int) int
-		AuthLogout             func(childComplexity int) int
-		ClusterCacheClear      func(childComplexity int, id clustersvc.ObjectID) int
-		ClusterConnectionRetry func(childComplexity int, id clustersvc.ObjectID) int
-		ClusterDelete          func(childComplexity int, id clustersvc.ObjectID) int
-		ClusterEnabledSet      func(childComplexity int, id clustersvc.ObjectID, enabled bool) int
-		ClusterSyncEnabledSet  func(childComplexity int, id clustersvc.ObjectID, syncEnabled bool) int
+		AuthLoginStart                  func(childComplexity int) int
+		AuthLogout                      func(childComplexity int) int
+		ClusterCacheClear               func(childComplexity int, id clustersvc.ObjectID) int
+		ClusterCachedKindSyncEnabledSet func(childComplexity int, id clustersvc.ObjectID, syncEnabled bool) int
+		ClusterConnectionRetry          func(childComplexity int, id clustersvc.ObjectID) int
+		ClusterDelete                   func(childComplexity int, id clustersvc.ObjectID) int
+		ClusterEnabledSet               func(childComplexity int, id clustersvc.ObjectID, enabled bool) int
+		ClusterSyncEnabledSet           func(childComplexity int, id clustersvc.ObjectID, syncEnabled bool) int
 	}
 
 	NonResourceRule struct {
@@ -377,6 +381,9 @@ type ClusterCachedDataObjectResolver interface {
 type ClusterCachedKindResolver interface {
 	Events(ctx context.Context, obj *clustersvc.ClusterCachedKind, category *string, limit *int) ([]*clustersvc.Event, error)
 }
+type ClusterCachedKindSpecResolver interface {
+	SyncEnabled(ctx context.Context, obj *clustersvc.ClusterCachedKindSpec) (bool, error)
+}
 type ClusterPrincipalResolver interface {
 	Permissions(ctx context.Context, obj *clustersvc.ClusterPrincipal, namespace string) (*model.ClusterPermissions, error)
 }
@@ -386,6 +393,7 @@ type MutationResolver interface {
 	ClusterConnectionRetry(ctx context.Context, id clustersvc.ObjectID) (bool, error)
 	ClusterDelete(ctx context.Context, id clustersvc.ObjectID) (bool, error)
 	ClusterCacheClear(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCache, error)
+	ClusterCachedKindSyncEnabledSet(ctx context.Context, id clustersvc.ObjectID, syncEnabled bool) (*clustersvc.ClusterCachedKind, error)
 	AuthLoginStart(ctx context.Context) (bool, error)
 	AuthLogout(ctx context.Context) (bool, error)
 }
@@ -593,6 +601,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCacheHealth.LastUpdateAt(childComplexity), true
+	case "ClusterCacheHealth.pausedKinds":
+		if e.ComplexityRoot.ClusterCacheHealth.PausedKinds == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCacheHealth.PausedKinds(childComplexity), true
 	case "ClusterCacheHealth.reason":
 		if e.ComplexityRoot.ClusterCacheHealth.Reason == nil {
 			break
@@ -1025,6 +1039,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCachedKindSpec.Resource(childComplexity), true
+	case "ClusterCachedKindSpec.syncEnabled":
+		if e.ComplexityRoot.ClusterCachedKindSpec.SyncEnabled == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCachedKindSpec.SyncEnabled(childComplexity), true
 
 	case "ClusterCachedKindWatchFrame.kind":
 		if e.ComplexityRoot.ClusterCachedKindWatchFrame.Kind == nil {
@@ -1363,6 +1383,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Mutation.ClusterCacheClear(childComplexity, args["id"].(clustersvc.ObjectID)), true
+	case "Mutation.clusterCachedKindSyncEnabledSet":
+		if e.ComplexityRoot.Mutation.ClusterCachedKindSyncEnabledSet == nil {
+			break
+		}
+
+		args, err := ec.field_Mutation_clusterCachedKindSyncEnabledSet_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.ComplexityRoot.Mutation.ClusterCachedKindSyncEnabledSet(childComplexity, args["id"].(clustersvc.ObjectID), args["syncEnabled"].(bool)), true
 	case "Mutation.clusterConnectionRetry":
 		if e.ComplexityRoot.Mutation.ClusterConnectionRetry == nil {
 			break
@@ -1886,6 +1917,8 @@ func (ec *executionContext) childFields_ClusterCacheHealth(ctx context.Context, 
 		return ec.fieldContext_ClusterCacheHealth_totalKinds(ctx, field)
 	case "unhealthyKinds":
 		return ec.fieldContext_ClusterCacheHealth_unhealthyKinds(ctx, field)
+	case "pausedKinds":
+		return ec.fieldContext_ClusterCacheHealth_pausedKinds(ctx, field)
 	case "lastUpdateAt":
 		return ec.fieldContext_ClusterCacheHealth_lastUpdateAt(ctx, field)
 	case "lastLiveAt":
@@ -2096,6 +2129,8 @@ func (ec *executionContext) childFields_ClusterCachedKindSpec(ctx context.Contex
 		return ec.fieldContext_ClusterCachedKindSpec_resource(ctx, field)
 	case "namespaced":
 		return ec.fieldContext_ClusterCachedKindSpec_namespaced(ctx, field)
+	case "syncEnabled":
+		return ec.fieldContext_ClusterCachedKindSpec_syncEnabled(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterCachedKindSpec", field.Name)
 }
@@ -2549,6 +2584,28 @@ func (ec *executionContext) field_Mutation_clusterCacheClear_args(ctx context.Co
 		return nil, err
 	}
 	args["id"] = arg0
+	return args, nil
+}
+
+func (ec *executionContext) field_Mutation_clusterCachedKindSyncEnabledSet_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
+		func(ctx context.Context, v any) (clustersvc.ObjectID, error) {
+			return ec.unmarshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐObjectID(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["id"] = arg0
+	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "syncEnabled",
+		func(ctx context.Context, v any) (bool, error) {
+			return ec.unmarshalNBoolean2bool(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["syncEnabled"] = arg1
 	return args, nil
 }
 
@@ -3744,6 +3801,29 @@ func (ec *executionContext) _ClusterCacheHealth_unhealthyKinds(ctx context.Conte
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheHealth_unhealthyKinds(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCacheHealth", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCacheHealth_pausedKinds(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCacheHealth) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCacheHealth_pausedKinds(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.PausedKinds, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCacheHealth_pausedKinds(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterCacheHealth", field, false, false, errors.New("field of type Int does not have child fields"))
 }
 
@@ -5367,6 +5447,29 @@ func (ec *executionContext) fieldContext_ClusterCachedKindSpec_namespaced(_ cont
 	return graphql.NewScalarFieldContext("ClusterCachedKindSpec", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
+func (ec *executionContext) _ClusterCachedKindSpec_syncEnabled(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedKindSpec) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCachedKindSpec_syncEnabled(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return ec.Resolvers.ClusterCachedKindSpec().SyncEnabled(ctx, obj)
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
+			return ec.marshalNBoolean2bool(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCachedKindSpec_syncEnabled(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCachedKindSpec", field, true, true, errors.New("field of type Boolean does not have child fields"))
+}
+
 func (ec *executionContext) _ClusterCachedKindWatchFrame_type(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedKindWatchFrame) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -6828,6 +6931,50 @@ func (ec *executionContext) fieldContext_Mutation_clusterCacheClear(ctx context.
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
 	if fc.Args, err = ec.field_Mutation_clusterCacheClear_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Mutation_clusterCachedKindSyncEnabledSet(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Mutation_clusterCachedKindSyncEnabledSet(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.Resolvers.Mutation().ClusterCachedKindSyncEnabledSet(ctx, fc.Args["id"].(clustersvc.ObjectID), fc.Args["syncEnabled"].(bool))
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *clustersvc.ClusterCachedKind) graphql.Marshaler {
+			return ec.marshalNClusterCachedKind2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedKind(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Mutation_clusterCachedKindSyncEnabledSet(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Mutation",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterCachedKind(ctx, field)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Mutation_clusterCachedKindSyncEnabledSet_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -9644,6 +9791,11 @@ func (ec *executionContext) _ClusterCacheHealth(ctx context.Context, sel ast.Sel
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
+		case "pausedKinds":
+			out.Values[i] = ec._ClusterCacheHealth_pausedKinds(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
 		case "lastUpdateAt":
 			out.Values[i] = ec._ClusterCacheHealth_lastUpdateAt(ctx, field, obj)
 		case "lastLiveAt":
@@ -10481,23 +10633,59 @@ func (ec *executionContext) _ClusterCachedKindSpec(ctx context.Context, sel ast.
 		case "apiVersion":
 			out.Values[i] = ec._ClusterCachedKindSpec_apiVersion(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				out.Invalids++
+				atomic.AddUint32(&out.Invalids, 1)
 			}
 		case "kind":
 			out.Values[i] = ec._ClusterCachedKindSpec_kind(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				out.Invalids++
+				atomic.AddUint32(&out.Invalids, 1)
 			}
 		case "resource":
 			out.Values[i] = ec._ClusterCachedKindSpec_resource(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				out.Invalids++
+				atomic.AddUint32(&out.Invalids, 1)
 			}
 		case "namespaced":
 			out.Values[i] = ec._ClusterCachedKindSpec_namespaced(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				out.Invalids++
+				atomic.AddUint32(&out.Invalids, 1)
 			}
+		case "syncEnabled":
+			field := field
+
+			innerFunc := func(ctx context.Context, fs *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._ClusterCachedKindSpec_syncEnabled(ctx, field, obj)
+				if res == graphql.Null {
+					atomic.AddUint32(&fs.Invalids, 1)
+				}
+				return res
+			}
+
+			if field.Deferrable != nil {
+				dfs, ok := deferred[field.Deferrable.Label]
+				di := 0
+				if ok {
+					dfs.AddField(field)
+					di = len(dfs.Values) - 1
+				} else {
+					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
+					deferred[field.Deferrable.Label] = dfs
+				}
+				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
+					return innerFunc(ctx, dfs)
+				})
+
+				// don't run the out.Concurrently() call below
+				out.Values[i] = graphql.Null
+				continue
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -11327,6 +11515,13 @@ func (ec *executionContext) _Mutation(ctx context.Context, sel ast.SelectionSet)
 		case "clusterCacheClear":
 			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
 				return ec._Mutation_clusterCacheClear(ctx, field)
+			})
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "clusterCachedKindSyncEnabledSet":
+			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
+				return ec._Mutation_clusterCachedKindSyncEnabledSet(ctx, field)
 			})
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
@@ -12448,6 +12643,10 @@ func (ec *executionContext) marshalNClusterCachedDataObjectWatchFrame2ᚖgithub�
 		return graphql.Null
 	}
 	return ec._ClusterCachedDataObjectWatchFrame(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalNClusterCachedKind2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedKind(ctx context.Context, sel ast.SelectionSet, v clustersvc.ClusterCachedKind) graphql.Marshaler {
+	return ec._ClusterCachedKind(ctx, sel, &v)
 }
 
 func (ec *executionContext) marshalNClusterCachedKind2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterCachedKindᚄ(ctx context.Context, sel ast.SelectionSet, v []*clustersvc.ClusterCachedKind) graphql.Marshaler {

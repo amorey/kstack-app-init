@@ -82,6 +82,13 @@ func (r *clusterCachedKindResolver) Events(ctx context.Context, obj *clustersvc.
 	return ptrSlice(evs), nil
 }
 
+// SyncEnabled is the resolver for the syncEnabled field: the wire's positive form over the
+// stored Paused. The storage field is inverted so a record written before it decodes as
+// syncing rather than stopping the fleet on the upgrade; this is the one negation.
+func (r *clusterCachedKindSpecResolver) SyncEnabled(_ context.Context, obj *clustersvc.ClusterCachedKindSpec) (bool, error) {
+	return !obj.Paused, nil
+}
+
 // Permissions is the resolver for the permissions field — the one live cluster
 // call on the Cluster surface, so it runs only when explicitly selected.
 // TODO: run a SelfSubjectRulesReview; errors until implemented.
@@ -124,6 +131,13 @@ func (r *mutationResolver) ClusterDelete(ctx context.Context, id clustersvc.Obje
 // them. The record stays and re-syncs from scratch. The id is the cache's own.
 func (r *mutationResolver) ClusterCacheClear(ctx context.Context, id clustersvc.ObjectID) (*clustersvc.ClusterCache, error) {
 	return r.ClusterSvc.Caches().Clear(ctx, id)
+}
+
+// ClusterCachedKindSyncEnabledSet is the resolver for the clusterCachedKindSyncEnabledSet
+// field: stop or resume one kind, keeping its cached rows either way. The id is the
+// per-kind record's own.
+func (r *mutationResolver) ClusterCachedKindSyncEnabledSet(ctx context.Context, id clustersvc.ObjectID, syncEnabled bool) (*clustersvc.ClusterCachedKind, error) {
+	return r.ClusterSvc.CachedKinds().SetSyncEnabled(ctx, id, syncEnabled)
 }
 
 // AuthLoginStart is the resolver for the authLoginStart field: setup runs synchronously
@@ -348,6 +362,11 @@ func (r *Resolver) ClusterCachedKind() ClusterCachedKindResolver {
 	return &clusterCachedKindResolver{r}
 }
 
+// ClusterCachedKindSpec returns ClusterCachedKindSpecResolver implementation.
+func (r *Resolver) ClusterCachedKindSpec() ClusterCachedKindSpecResolver {
+	return &clusterCachedKindSpecResolver{r}
+}
+
 // ClusterPrincipal returns ClusterPrincipalResolver implementation.
 func (r *Resolver) ClusterPrincipal() ClusterPrincipalResolver { return &clusterPrincipalResolver{r} }
 
@@ -365,6 +384,7 @@ type clusterCacheResolver struct{ *Resolver }
 type clusterCachedDataEventResolver struct{ *Resolver }
 type clusterCachedDataObjectResolver struct{ *Resolver }
 type clusterCachedKindResolver struct{ *Resolver }
+type clusterCachedKindSpecResolver struct{ *Resolver }
 type clusterPrincipalResolver struct{ *Resolver }
 type mutationResolver struct{ *Resolver }
 type queryResolver struct{ *Resolver }

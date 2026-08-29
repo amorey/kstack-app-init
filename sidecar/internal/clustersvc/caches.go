@@ -117,10 +117,15 @@ type ClusterCacheHealth struct {
 	// because truncation ("+2 more") is a layout decision, and the consumer that needs the
 	// first offender must not have to parse it back out of prose.
 	UnhealthyKindRefs []SyncedKindRef
-	// TotalKinds is how many kinds this cache syncs; UnhealthyKinds how many are not
+	// TotalKinds is how many kinds this cache mirrors; UnhealthyKinds how many are not
 	// currently Watching (len(UnhealthyKindRefs), which is capped by nothing).
 	TotalKinds     int
 	UnhealthyKinds int
+	// PausedKinds is how many of TotalKinds the user has switched off. Counted separately
+	// rather than subtracted from the census: a paused kind is not unhealthy and not
+	// missing, and without its own tally it is invisible in every reading — a summary that
+	// spends UnhealthyKinds alone would report five kinds syncing when two are paused.
+	PausedKinds int
 	// LastUpdateAt is the most recent write across every kind — when data last arrived
 	// anywhere in this cache; nil until something has landed. LastLiveAt is the OLDEST
 	// proof across every kind, and **nil while any of them has none**: a cache is only as
@@ -475,6 +480,13 @@ func (a cachesAPI) readCacheHealth(ctx context.Context, cacheID ClusterCacheID) 
 			continue
 		}
 		health.TotalKinds++
+		// Skipped ahead of the state read, not filtered out of the tallies after it: a
+		// paused kind is forgotten, so reading its state would report it as unanswered —
+		// and one unanswered kind pins the whole cache at Connecting forever.
+		if kindObj.Spec.Paused {
+			health.PausedKinds++
+			continue
+		}
 
 		state, ok := a.s.kubesyncSvc.GetKindState(int64(cacheID), toKubestoreKind(kindObj.Spec))
 		if !ok {
@@ -512,6 +524,10 @@ func (a cachesAPI) readCacheHealth(ctx context.Context, cacheID ClusterCacheID) 
 	}
 
 	switch {
+	case health.PausedKinds == health.TotalKinds && health.TotalKinds > 0:
+		// Ahead of every arm below: paused kinds are skipped, so a fully paused cache has
+		// no offenders and nothing unanswered — and the Watching arm would call it healthy.
+		health.Reason = ReasonPaused
 	case storeFailed(a.s.kubesyncSvc.GetDiscoveryState(int64(cacheID))):
 		// The cache's own verdict, above the per-kind fold: a file that will not open arms
 		// nothing, so every kind reads as unanswered and the default below would report a
@@ -620,7 +636,11 @@ func (a cachesAPI) readSyncStatus(ctx context.Context, cacheID ClusterCacheID) (
 			Resource:    kindObj.Spec.Resource,
 			ObjectCount: objectCounts[syncedKindRefOf(kindObj.Spec)],
 		}
-		if state, ok := a.s.kubesyncSvc.GetKindState(int64(cacheID), toKubestoreKind(kindObj.Spec)); ok {
+		// The record's own verdict first: a paused kind is forgotten, so the read below
+		// would come back empty and the row would carry no reason at all.
+		if kindObj.Spec.Paused {
+			row.Reason = ReasonPaused
+		} else if state, ok := a.s.kubesyncSvc.GetKindState(int64(cacheID), toKubestoreKind(kindObj.Spec)); ok {
 			row.Reason = state.Reason
 			row.Message = state.Message
 			row.Restarts = state.Restarts
@@ -772,6 +792,7 @@ func (a cachesAPI) clusterFor(
 func sameHealth(a, b ClusterCacheHealth) bool {
 	return a.Status == b.Status && a.Reason == b.Reason &&
 		a.TotalKinds == b.TotalKinds && a.UnhealthyKinds == b.UnhealthyKinds &&
+		a.PausedKinds == b.PausedKinds &&
 		slices.Equal(a.UnhealthyKindRefs, b.UnhealthyKindRefs) &&
 		sameTime(a.LastUpdateAt, b.LastUpdateAt) && sameTime(a.LastLiveAt, b.LastLiveAt)
 }
@@ -935,7 +956,13 @@ func (c *clusterCacheController) mirrorKinds(ctx context.Context, obj *beehive.O
 		}
 	}
 
-	if err := c.upsertKinds(ctx, obj.ID, desired); err != nil {
+	// One read for both halves: the sweep runs on a cadence over a cache with hundreds of
+	// kinds, and both the write below and the prune answer off the same set of records.
+	stored, err := c.storedKinds(ctx, obj.ID)
+	if err != nil {
+		return err
+	}
+	if err := c.upsertKinds(ctx, obj.ID, desired, stored); err != nil {
 		return err
 	}
 	// **An unswept table deletes nothing.** No fingerprint means no answer has ever been
@@ -944,12 +971,62 @@ func (c *clusterCacheController) mirrorKinds(ctx context.Context, obj *beehive.O
 	if !everSwept {
 		return nil
 	}
-	return c.pruneKinds(ctx, obj.ID, desired)
+	return c.pruneKinds(ctx, desired, stored)
 }
 
-// upsertKinds writes one record per desired kind, keyed by name.
-func (c *clusterCacheController) upsertKinds(ctx context.Context, cacheID beehive.ObjectID, desired map[string]ClusterCachedKindSpec) error {
+// storedKinds is every record under a cache, by name — deletion-pending ones included,
+// which is what lets the prune below tell a record already going from one to mark.
+func (c *clusterCacheController) storedKinds(
+	ctx context.Context,
+	cacheID beehive.ObjectID,
+) (map[string]*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus], error) {
+	kindObjs, err := c.kindClient.ListOwnedObjects(ctx, cacheID)
+	if err != nil {
+		return nil, fmt.Errorf("list cluster cache %d cached kinds: %w", cacheID, err)
+	}
+	stored := make(map[string]*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus], len(kindObjs))
+	for _, kindObj := range kindObjs {
+		stored[kindObj.Name] = kindObj
+	}
+	return stored, nil
+}
+
+// upsertKinds writes one record per desired kind whose catalog fields moved, and nothing
+// at all for the rest.
+//
+// **Writing every pass would un-pause every kind within one discovery interval.** The
+// desired spec is built from the catalog row alone, so it carries the zero value of the
+// one field the catalog does not own — and this pass runs on a cadence, against a cache
+// with hundreds of kinds.
+// The carry-forward below reads the record again under the lock rather than trusting the
+// snapshot: the pass lists before it locks, so a pause landing in that window is already
+// stored and missing from what it holds. Rereading rather than widening the lock over the
+// list — that list is hundreds of kinds on a cadence, and holding the setter's lock across
+// it would park every user mutation behind a sweep, where the reread costs one read on the
+// rare pass where a catalog field actually moved.
+func (c *clusterCacheController) upsertKinds(
+	ctx context.Context,
+	cacheID beehive.ObjectID,
+	desired map[string]ClusterCachedKindSpec,
+	stored map[string]*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus],
+) error {
+	c.kindSpecMu.Lock()
+	defer c.kindSpecMu.Unlock()
+
 	for name, spec := range desired {
+		if obj, held := stored[name]; held {
+			if sameCatalogFields(obj.Spec, spec) {
+				continue
+			}
+			// The user's switch rides through a catalog change: the desired spec is built
+			// from the row alone, so it carries Paused's zero value and writing it whole
+			// would resume a kind because its singular was renamed.
+			paused, err := c.storedPause(ctx, obj.ID)
+			if err != nil {
+				return err
+			}
+			spec.Paused = paused
+		}
 		// CreateOrUpdate rather than the GetOrCreate that creates a cache, whose name IS its
 		// whole spec: a kind's carries data outside its name — the singular, and the scope —
 		// so a renamed or re-scoped kind converges in place.
@@ -963,19 +1040,40 @@ func (c *clusterCacheController) upsertKinds(ctx context.Context, cacheID beehiv
 	return nil
 }
 
+// storedPause is one record's switch as it stands now. A record collected since the pass
+// listed it has no pause to carry, and the write that follows creates it afresh.
+func (c *clusterCacheController) storedPause(ctx context.Context, id beehive.ObjectID) (bool, error) {
+	obj, err := c.kindClient.Get(ctx, id)
+	if errors.Is(err, beehive.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read cached kind %d: %w", id, err)
+	}
+	return obj.Spec.Paused, nil
+}
+
+// sameCatalogFields reports whether the four fields the discovery sweep owns match. Paused
+// is deliberately absent: it is the user's, and a difference there is not the sweep's to
+// converge.
+func sameCatalogFields(a, b ClusterCachedKindSpec) bool {
+	return a.APIVersion == b.APIVersion && a.Kind == b.Kind &&
+		a.Resource == b.Resource && a.Namespaced == b.Namespaced
+}
+
 // pruneKinds marks every record the desired set no longer names. Marked, not collected: the
 // record's own pass clears the rows behind it first.
-func (c *clusterCacheController) pruneKinds(ctx context.Context, cacheID beehive.ObjectID, desired map[string]ClusterCachedKindSpec) error {
-	kindObjs, err := c.kindClient.ListOwnedObjects(ctx, cacheID)
-	if err != nil {
-		return fmt.Errorf("list cluster cache %d cached kinds: %w", cacheID, err)
-	}
-	for _, kindObj := range kindObjs {
-		if _, wanted := desired[kindObj.Name]; wanted || kindObj.DeletionRequestedAt != nil {
+func (c *clusterCacheController) pruneKinds(
+	ctx context.Context,
+	desired map[string]ClusterCachedKindSpec,
+	stored map[string]*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus],
+) error {
+	for name, kindObj := range stored {
+		if _, wanted := desired[name]; wanted || kindObj.DeletionRequestedAt != nil {
 			continue
 		}
 		if err := c.kindClient.Delete(ctx, kindObj.ID); err != nil && !errors.Is(err, beehive.ErrNotFound) {
-			return fmt.Errorf("drop cached kind %s: %w", kindObj.Name, err)
+			return fmt.Errorf("drop cached kind %s: %w", name, err)
 		}
 	}
 	return nil

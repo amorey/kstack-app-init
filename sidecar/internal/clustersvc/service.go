@@ -259,6 +259,11 @@ type CachedKinds interface {
 	// Clear drops one kind's cached objects and restarts its sync from an empty
 	// mirror; the record stays and resyncs. Caches().Clear is the whole-cache form.
 	Clear(ctx context.Context, id ClusterCachedKindID) (*ClusterCachedKind, error)
+
+	// SetSyncEnabled stops or resumes one kind's sync and returns the updated record.
+	// Pausing KEEPS the cached rows — readable throughout, and reconciled into rather
+	// than rebuilt on the resume. Clear is the form that throws them away.
+	SetSyncEnabled(ctx context.Context, id ClusterCachedKindID, syncEnabled bool) (*ClusterCachedKind, error)
 }
 
 // CachedData is the cached Kubernetes content in one cache's db — the only family whose
@@ -327,6 +332,13 @@ type deps struct {
 	kubestoreMgr  kubestoreManager
 	kubesyncSvc   kubesyncService
 	pokeSvc       *poke.Service
+
+	// kindSpecMu serializes the read-modify-write on a ClusterCachedKind spec, which two
+	// writers share: the sync-enabled setter, and the sweep converging a catalog change
+	// onto a record whose pause it has to carry forward. beehive's Update takes the whole
+	// spec and offers no compare-and-swap, so without this the later write restores what
+	// the earlier one changed. A pointer because deps is copied by value.
+	kindSpecMu *sync.Mutex
 }
 
 func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, kubestoreMgr kubestoreManager, kubesyncSvc kubesyncService, pokeSvc *poke.Service) deps {
@@ -340,6 +352,7 @@ func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc k
 		kubestoreMgr:  kubestoreMgr,
 		kubesyncSvc:   kubesyncSvc,
 		pokeSvc:       pokeSvc,
+		kindSpecMu:    &sync.Mutex{},
 	}
 }
 

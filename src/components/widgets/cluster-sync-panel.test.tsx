@@ -28,6 +28,7 @@ vi.mock('@tauri-apps/api/core', () => factory());
 const { createGraphqlClient } = await import('@/lib/graphql/client');
 const { ClustersProvider } = await import('@/lib/clusters');
 const { ClusterSyncPanel, overallTone } = await import('./cluster-sync-panel');
+const { onError } = await import('@/lib/error-bus');
 
 // Helpers -------------------------------------------------------------
 
@@ -296,6 +297,17 @@ function pushCacheStatsFor(cacheId: string, bytes: number) {
   );
 }
 
+// The variables the most recent mutation named `name` went out with. The panel sends every
+// mutation over the same invoke, so the assertion has to pick its own out of the log.
+function lastMutation(name: string): Record<string, unknown> | undefined {
+  const calls = invokeMock.mock.calls.filter(
+    ([cmd, arg]) => cmd === 'graphql_query' && String((arg as { body: string }).body).includes(name),
+  );
+  const last = calls.at(-1);
+  if (!last) return undefined;
+  return JSON.parse((last[1] as { body: string }).body).variables;
+}
+
 // Push a cache's folded verdict directly, for the fields the row fixture doesn't vary.
 function pushHealth(cacheId: string, over: Record<string, unknown>) {
   channelFor('clusterCacheHealthWatch').onmessage!(
@@ -310,6 +322,7 @@ function pushHealth(cacheId: string, over: Record<string, unknown>) {
             unhealthyKindRefs: [],
             totalKinds: 0,
             unhealthyKinds: 0,
+            pausedKinds: 0,
             lastUpdateAt: null,
             lastLiveAt: null,
             ...over,
@@ -475,6 +488,11 @@ describe('ClusterSyncPanel', () => {
               clusterCacheClear: { __typename: 'ClusterCache', id: 'cache-u' },
               clusterDelete: true,
               clusterConnectionRetry: true,
+              clusterCachedKindSyncEnabledSet: {
+                __typename: 'ClusterCachedKind',
+                id: 'g-crd',
+                spec: { syncEnabled: true },
+              },
             },
           }),
         };
@@ -973,6 +991,139 @@ describe('ClusterSyncPanel', () => {
     expect(await screen.findByRole('button', { name: /storage error/i })).toBeInTheDocument();
   });
 
+  // A kind the user just paused is not a fault, and the failing list is where faults go —
+  // rendering it there is the same false alarm the reason-from-the-record rule prevents one
+  // layer down. Its own section instead, because that is where the resume control belongs.
+  it('lists a paused kind apart from the kinds that are failing', async () => {
+    const user = await openWith([{ uuid: 'u-paused', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    await act(async () => {
+      pushCachedKind('g-pods', 'pods', 'Paused');
+      pushSyncStatus([
+        { apiVersion: 'v1', resource: 'pods', reason: 'Paused' },
+        { apiVersion: 'example.com/v1', resource: 'widgets', reason: 'SyncFailed', message: 'forbidden' },
+      ]);
+    });
+
+    const paused = within(await screen.findByRole('group', { name: /paused kinds/i }));
+    expect(paused.getByText('pods')).toBeInTheDocument();
+    const failing = within(await screen.findByRole('group', { name: /kinds not syncing/i }));
+    expect(failing.getByText('widgets')).toBeInTheDocument();
+    expect(failing.queryByText('pods')).not.toBeInTheDocument();
+  });
+
+  // The mutation takes the per-kind RECORD's id, which the sync-detail row does not carry —
+  // it is identity-by-GVR. The control joins the two streams to find it, and a control that
+  // sent the wrong id would pause somebody else's kind.
+  it('resumes a paused kind by its own record id', async () => {
+    const user = await openWith([{ uuid: 'u-resume', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    await act(async () => {
+      pushCachedKind('g-crd', 'widgets', 'Paused', 'example.com/v1');
+      pushCachedKind('g-pods', 'pods', 'Watching');
+      pushSyncStatus([
+        { apiVersion: 'example.com/v1', resource: 'widgets', reason: 'Paused' },
+        { apiVersion: 'v1', resource: 'pods', reason: 'Watching' },
+      ]);
+    });
+
+    await user.click(await screen.findByRole('button', { name: /resume widgets/i }));
+
+    expect(lastMutation('clusterCachedKindSyncEnabledSet')).toEqual({ id: 'g-crd', syncEnabled: true });
+  });
+
+  // The entry point into the feature. A kind that is failing is the one a user reaches for
+  // this over — a storming CRD or a forbidden collection — so the control sits on its row.
+  it('pauses a failing kind from the row that reports it', async () => {
+    const user = await openWith([{ uuid: 'u-pause', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    await act(async () => {
+      pushCachedKind('g-crd', 'widgets', 'SyncFailed', 'example.com/v1');
+      pushSyncStatus([{ apiVersion: 'example.com/v1', resource: 'widgets', reason: 'SyncFailed' }]);
+    });
+
+    await user.click(await screen.findByRole('button', { name: /pause widgets/i }));
+
+    expect(lastMutation('clusterCachedKindSyncEnabledSet')).toEqual({ id: 'g-crd', syncEnabled: false });
+  });
+
+  // The cap keeps the panel compact, but the rows it hides now carry the only control that
+  // can resume a kind — so a kind pushed past it would be paused with no way back.
+  it('reaches a paused kind past the list cap', async () => {
+    const user = await openWith([{ uuid: 'u-cap', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    const many = Array.from({ length: 6 }, (_, i) => ({
+      apiVersion: 'example.com/v1',
+      resource: `widget${i + 1}`,
+      reason: 'Paused',
+    }));
+    await act(async () => {
+      many.forEach((k, i) => pushCachedKind(`g-${i + 1}`, k.resource, 'Paused', k.apiVersion));
+      pushSyncStatus(many);
+    });
+
+    // The sixth is behind the cap, so its control is unreachable until the list expands.
+    expect(screen.queryByRole('button', { name: /resume widget6/i })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: /show 1 more/i }));
+    await user.click(await screen.findByRole('button', { name: /resume widget6/i }));
+
+    expect(lastMutation('clusterCachedKindSyncEnabledSet')).toEqual({ id: 'g-6', syncEnabled: true });
+  });
+
+  // One failure, one report. The client's errorReportExchange forwards every operation
+  // error, so a second check at the call site puts the same message on the bus twice — and
+  // the reader of a duplicated error looks for two causes.
+  it('reports a rejected cluster action once', async () => {
+    const errors: string[] = [];
+    const stop = onError((e) => errors.push(e.message));
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'graphql_subscribe') return 1;
+      if (cmd === 'graphql_unsubscribe') return undefined;
+      if (cmd === 'graphql_query') {
+        return { status: 200, body: JSON.stringify({ errors: [{ message: 'forbidden: sync is managed' }] }) };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const user = await openWith([{ uuid: 'u-once', name: 'prod', enabled: true, present: true }]);
+
+    await user.click(await screen.findByRole('button', { name: /pause sync for prod/i }));
+    await flush();
+    stop();
+
+    expect(errors.filter((m) => m.includes('sync is managed'))).toHaveLength(1);
+  });
+
+  // A rejected mutation has nowhere to show but the bus: the panel's actions write through
+  // and read their outcome back off a watch. A guard rather than a red test — the client's
+  // errorReportExchange forwards every operation error, mutations included — and this is
+  // what keeps a refused pause from becoming a button that does nothing.
+  it('reports a rejected pause on the error bus', async () => {
+    const errors: string[] = [];
+    const stop = onError((e) => errors.push(e.message));
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'graphql_subscribe') return 1;
+      if (cmd === 'graphql_unsubscribe') return undefined;
+      if (cmd === 'graphql_query') {
+        return { status: 200, body: JSON.stringify({ errors: [{ message: 'forbidden: kinds are read-only' }] }) };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const user = await openWith([{ uuid: 'u-fail', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    await act(async () => {
+      pushCachedKind('g-crd', 'widgets', 'SyncFailed', 'example.com/v1');
+      pushSyncStatus([{ apiVersion: 'example.com/v1', resource: 'widgets', reason: 'SyncFailed' }]);
+    });
+
+    const before = errors.length;
+    await user.click(await screen.findByRole('button', { name: /pause widgets/i }));
+    await flush();
+    stop();
+
+    expect(errors.slice(before).join(' ')).toMatch(/kinds are read-only/);
+  });
+
   it('shows no failing-kind list while every kind is watching', async () => {
     const user = await openWith([{ uuid: 'u-ok', name: 'prod', enabled: true, present: true }]);
     await user.click(await screen.findByRole('button', { name: /synced/i }));
@@ -1110,6 +1261,18 @@ describe('ClusterSyncPanel', () => {
 
     expect(await screen.findByText(/63 of 150 kinds syncing/)).toBeInTheDocument();
     expect(screen.queryByText(/not syncing/)).not.toBeInTheDocument();
+  });
+
+  // A paused kind is not unhealthy and stays in the census, so every field the label
+  // already spends is unchanged — five kinds, none of them offenders. Without the paused
+  // tally the two the user just switched off vanish from the summary entirely.
+  it('accounts for paused kinds in the syncing summary', async () => {
+    const user = await openWith([{ uuid: 'u-pcount', name: 'prod', enabled: true, present: true }]);
+
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+    act(() => pushHealth('cache-u-pcount', { totalKinds: 5, unhealthyKinds: 0, pausedKinds: 2 }));
+
+    expect(await screen.findByText(/3 of 5 kinds syncing, 2 paused/)).toBeInTheDocument();
   });
 
   it('reports a plain kind count when every kind is healthy', async () => {

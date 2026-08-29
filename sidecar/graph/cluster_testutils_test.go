@@ -597,6 +597,19 @@ func (f *fakeClusterService) RetryConnection(_ context.Context, id clustersvc.Cl
 	return nil
 }
 
+func (f fakeCachedKinds) SetSyncEnabled(_ context.Context, id clustersvc.ClusterCachedKindID, syncEnabled bool) (*clustersvc.ClusterCachedKind, error) {
+	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
+	for i := range f.s.cachedKinds {
+		if f.s.cachedKinds[i].ID == id {
+			f.s.cachedKinds[i].Spec.Paused = !syncEnabled
+			cr := f.s.cachedKinds[i]
+			return &cr, nil
+		}
+	}
+	return nil, clustersvc.ErrNotFound
+}
+
 func (f fakeCachedKinds) Clear(_ context.Context, id clustersvc.ClusterCachedKindID) (*clustersvc.ClusterCachedKind, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()

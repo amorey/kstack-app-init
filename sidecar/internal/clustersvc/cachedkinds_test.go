@@ -16,6 +16,7 @@ package clustersvc
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"testing"
 	"time"
@@ -59,6 +60,19 @@ var (
 	deploymentsSpec = ClusterCachedKindSpec{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments", Namespaced: true}
 	podsSpec        = ClusterCachedKindSpec{APIVersion: "v1", Kind: "Pod", Resource: "pods", Namespaced: true}
 )
+
+// Every stored record predates the pause field, and beehive decodes a spec with
+// json.Unmarshal — so a missing key has to mean SYNCING. That is why the field is Paused
+// rather than Enabled: an Enabled bool would decode false for the whole fleet on the
+// upgrade that shipped it, and every kind would stop syncing at once.
+func TestACachedKindStoredBeforeThePauseFieldDecodesAsSyncing(t *testing.T) {
+	var spec ClusterCachedKindSpec
+
+	require.NoError(t, json.Unmarshal(
+		[]byte(`{"apiVersion":"apps/v1","kind":"Deployment","resource":"deployments","namespaced":true}`), &spec))
+
+	assert.False(t, spec.Paused, "a record with no pause key syncs")
+}
 
 // twoCachesTwoResources stores a kind under each of two caches, and returns the first
 // cache's id — enough for one fixture to prove both a read's contents and its scoping.
@@ -366,6 +380,39 @@ func TestKindPassArmsItsOwnSync(t *testing.T) {
 	}}, syncFake(d).armedKinds(int64(cacheID)))
 }
 
+// **Pause is not deletion, and the distinction is the whole feature.** The worker is
+// joined, and the rows it already wrote stay readable.
+func TestKindPassStopsAPausedKindWithoutClearingItsRows(t *testing.T) {
+	d, cacheID, kind := oneCachedKind(t)
+	reconcileKind(t, d, kind)
+
+	ctx := context.Background()
+	store, _, err := d.kubestoreMgr.OpenExisting(int64(cacheID))
+	require.NoError(t, err)
+	require.NoError(t, store.SetCookie(ctx, "apps/v1", "deployments", "10"))
+	store.Release()
+
+	reconcileKind(t, d, pausedKind(t, d, kind))
+
+	assert.Empty(t, syncFake(d).armedKinds(int64(cacheID)), "the worker is joined")
+	store, _, err = d.kubestoreMgr.OpenExisting(int64(cacheID))
+	require.NoError(t, err)
+	defer store.Release()
+	_, ok, err := store.Cookie(ctx, "apps/v1", "deployments")
+	require.NoError(t, err)
+	assert.True(t, ok, "what the kind already cached survives the pause")
+}
+
+// pausedKind flips one record's switch and reads it back, standing in for the setter.
+func pausedKind(t *testing.T, d deps, obj *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]) *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus] {
+	t.Helper()
+	spec := obj.Spec
+	spec.Paused = true
+	updated, err := d.kindClient.Update(context.Background(), obj.ID, spec)
+	require.NoError(t, err)
+	return updated
+}
+
 // **Forget first, then clear.** Clearing ahead of the join would race a relist page landing
 // behind it, leaving rows for a kind nothing syncs any more.
 func TestKindPassForgetsTheSyncBeforeItClearsTheRows(t *testing.T) {
@@ -440,6 +487,20 @@ func TestKindPassLogsItsOwnVerdict(t *testing.T) {
 	assert.Equal(t, beehive.EventWarning, client.events[0].Type)
 }
 
+// **The reason comes from the spec, never from kubesync.** A forgotten kind has no state,
+// so the verdict has to be decided ahead of the read that would come back empty — and the
+// timeline is where a user looks to see the pause took.
+func TestKindPassLogsAPausedVerdictWithNoWorkerToAsk(t *testing.T) {
+	d, _, kind := oneCachedKind(t)
+
+	client := reconcileKind(t, d, pausedKind(t, d, kind))
+
+	require.Len(t, client.events, 1)
+	assert.Equal(t, categorySync, client.events[0].Category)
+	assert.Equal(t, ReasonPaused, client.events[0].Reason)
+	assert.Equal(t, beehive.EventNormal, client.events[0].Type)
+}
+
 // A kind whose worker has answered nothing has no verdict to log — a cache that is paused,
 // or one whose sweep has not reached this kind yet.
 func TestKindPassLogsNothingBeforeItsWorkerAnswers(t *testing.T) {
@@ -463,6 +524,36 @@ func TestKindPassWritesNoCondition(t *testing.T) {
 	obj, err := d.kindClient.Get(context.Background(), kind.ID)
 	require.NoError(t, err)
 	assert.Empty(t, obj.Conditions)
+}
+
+// The wire keeps the positive form, matching the cluster's own two toggles; the stored
+// field is its opposite so the zero value can be the default. One negation, at the setter
+// and at the projection.
+func TestCachedKindsSetSyncEnabledFlipsThePauseBothWays(t *testing.T) {
+	d, _, kind := oneCachedKind(t)
+	ctx := context.Background()
+	api := serviceOver(t, d).CachedKinds()
+
+	got, err := api.SetSyncEnabled(ctx, ClusterCachedKindID(kind.ID), false)
+
+	require.NoError(t, err)
+	assert.True(t, got.Spec.Paused, "syncEnabled false is a pause")
+
+	got, err = api.SetSyncEnabled(ctx, ClusterCachedKindID(kind.ID), true)
+
+	require.NoError(t, err)
+	assert.False(t, got.Spec.Paused)
+	assert.Equal(t, "deployments", got.Spec.Resource, "and the catalog fields ride through it")
+}
+
+// The setter takes the whole spec, so an id naming nothing has to report it rather than
+// create a record with no catalog fields.
+func TestCachedKindsSetSyncEnabledReportsAnUnknownID(t *testing.T) {
+	d := newTestDeps(t)
+
+	_, err := serviceOver(t, d).CachedKinds().SetSyncEnabled(context.Background(), 404, false)
+
+	assert.ErrorIs(t, err, ErrNotFound)
 }
 
 // One kind's clear needs the same hold as the cache-wide one, scoped to the kind: a worker
