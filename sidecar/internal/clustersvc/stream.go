@@ -170,8 +170,10 @@ func (w deltaWatch[Spec, Status, Frame]) pumpAfterSnapshot(
 // disconnect. ctx is a parameter rather than a closed-over variable so that the
 // requirement is visible in every pump's own signature.
 //
-// Cancellation is an ordinary teardown: return nil for it. A non-nil error is
-// reported to the client as the reason its watch died.
+// Cancellation is an ordinary teardown, and pumps do not have to spell it: every read a
+// pump makes takes ctx, so the reason it ends with is usually ctx's own, and anything it
+// returns once ctx is done is dropped here. A non-nil error otherwise is reported to the
+// client as the reason its watch died.
 //
 // Exported because Stream sits in the family interfaces: an implementation outside
 // this package — a fake in the resolver tests — has to be able to build one.
@@ -180,7 +182,10 @@ func NewStream[T any](ctx context.Context, pump func(ctx context.Context, out ch
 	s := &Stream[T]{Frames: ch}
 	go func() {
 		defer close(ch)
-		if err := pump(ctx, ch); err != nil {
+		// Filing a cancellation would put an error in front of a user who has already
+		// navigated away — it reaches the webview as a watch failure, and suppresses the
+		// transport's backoff reset on the reconnect.
+		if err := pump(ctx, ch); err != nil && ctx.Err() == nil {
 			s.err.Store(&err)
 		}
 	}()

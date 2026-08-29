@@ -17,6 +17,7 @@ package clustersvc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/amorey/beehive"
@@ -286,4 +287,31 @@ func TestStreamOneBookmarksAnAbsentRecord(t *testing.T) {
 	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, s.Frames, "the bookmark").Type)
 	testutil.WaitClosed(t, s.Frames, "the stream")
 	assert.NoError(t, s.Err())
+}
+
+// A pump's reads all take ctx, so one that ends because ctx did usually ends with ctx's
+// own error. That is a teardown, not a watch failure: filing it would put an error in
+// front of a user who has already navigated away, and suppress the transport's backoff
+// reset on the reconnect.
+func TestAStreamDropsWhateverAPumpEndsWithOnceItsContextIsDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s := NewStream(ctx, func(ctx context.Context, _ chan<- int) error {
+		return fmt.Errorf("list cached kinds: %w", ctx.Err())
+	})
+
+	testutil.WaitClosed(t, s.Frames, "the pump to end")
+	assert.NoError(t, s.Err())
+}
+
+// Only a cancellation is dropped. A pump that fails while its consumer is still there
+// carries the reason out — that is the whole point of the terminal error.
+func TestAStreamKeepsThePumpsErrorWhileTheConsumerIsStillThere(t *testing.T) {
+	boom := errors.New("the file will not read")
+
+	s := NewStream(context.Background(), func(context.Context, chan<- int) error { return boom })
+
+	testutil.WaitClosed(t, s.Frames, "the pump to end")
+	assert.ErrorIs(t, s.Err(), boom)
 }

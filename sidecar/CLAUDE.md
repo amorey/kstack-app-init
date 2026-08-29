@@ -1338,7 +1338,10 @@ the matrix for a new family.
 teardown, and the reason is set *before* `Frames` closes — which is what makes "Frames closed" a safe
 cue to read `Err`. `NewStream` is exported so a fake implementing these interfaces can build one. The
 rule is the source, not the shape: anything reading a fallible upstream returns a `Stream`, gauges
-included; a watch that cannot fail terminally may stay a plain channel.
+included; a watch that cannot fail terminally may stay a plain channel. **A pump needs no special
+care for cancellation**: every read it makes takes ctx, so the reason it ends with is usually ctx's
+own, and `NewStream` drops whatever it returns once ctx is done — filing that would raise a watch
+failure at a client that has already navigated away.
 
 ### Types
 

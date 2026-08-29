@@ -1955,3 +1955,33 @@ func TestProjectingCachesReportsARecordItCannotRead(t *testing.T) {
 
 	assert.Error(t, err)
 }
+
+// A user navigating away ends the gauges cleanly. Their reads all take ctx, so each one
+// ends with ctx's own error — reported, that reaches the webview as a watch failure and
+// puts an error in front of someone who has already left the view.
+func TestTheCacheGaugesEndCleanlyWhenTheConsumerLeaves(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	d, cacheID := syncingCacheWithKinds(t)
+	clusterID := ownerClusterOf(t, d, cacheID)
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Millisecond
+
+	status, err := svc.Caches().WatchSyncStatus(ctx, clusterID, cacheID)
+	require.NoError(t, err)
+	health, err := svc.Caches().WatchHealth(ctx)
+	require.NoError(t, err)
+	stats, err := svc.Caches().WatchStats(ctx, clusterID, cacheID)
+	require.NoError(t, err)
+	testutil.Recv(t, status.Frames, "the first sync-status reading")
+	testutil.Recv(t, health.Frames, "the first verdict")
+	testutil.Recv(t, stats.Frames, "the first measurement")
+
+	cancel()
+
+	testutil.WaitClosed(t, status.Frames, "the sync-status gauge to stop")
+	testutil.WaitClosed(t, health.Frames, "the health gauge to stop")
+	testutil.WaitClosed(t, stats.Frames, "the stats gauge to stop")
+	assert.NoError(t, status.Err())
+	assert.NoError(t, health.Err())
+	assert.NoError(t, stats.Err())
+}
