@@ -30,7 +30,20 @@ Each spec is self-contained: read one and you can build it. Each header states w
 what it hands on — a numbered spec that needs nothing is ordered by priority rather than by
 dependency, so it can be built out of turn at a cost you can read off its header.
 
-**Sequenced — the build order.** Nothing sequenced right now.
+**Sequenced — the build order.** Specs 1-7 are one line of work: the SQLite techniques beehive
+uses that `kubestore` does not. Each states what it needs; 1-3 settle the open contract, 4-5 make
+every statement's text constant, and 6 caches what is then cacheable. 7 needs nothing and touches
+only the schema, so it is ordered by priority.
+
+| Spec | Scope | Status |
+| --- | --- | --- |
+| [1 — The reader pool gets its own DSN](1-reader-pool-dsn.md) | sidecar | Planned |
+| [2 — auto_vacuum belongs on the DSN](2-auto-vacuum-on-the-dsn.md) | sidecar | Planned |
+| [3 — A pool keeps the connections it opens](3-pool-keeps-its-connections.md) | sidecar | Planned |
+| [4 — Bind a list as one argument with json_each](4-batched-uid-statements.md) | sidecar | Planned |
+| [5 — A delete returns the uids it removed](5-deletes-return-their-uids.md) | sidecar | Planned |
+| [6 — Prepare each statement once, not once per call](6-prepared-statement-cache.md) | sidecar | Planned |
+| [7 — The all-key tables lose their rowid](7-without-rowid-key-tables.md) | sidecar | Planned |
 
 **Independent.**
 
