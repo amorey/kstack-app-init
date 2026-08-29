@@ -216,3 +216,40 @@ func TestTerminalErrKeepsTheReasonsAConsumerCanActOn(t *testing.T) {
 		"runs were lost; a resubscribe is what makes the client correct")
 	assert.ErrorIs(t, terminalErr(beehive.ErrStopped), beehive.ErrStopped)
 }
+
+// Every frame the event watch sends is checked, so a consumer that has gone ends the
+// stream where it stands rather than blocking on a channel nobody drains. The context is
+// cancelled with a send already parked — Frames buffers one, and nothing is reading — so
+// the check is what unblocks it rather than a race with the buffer.
+func TestWatchEventsStopsForAConsumerThatIsGone(t *testing.T) {
+	d, bh := newTestDepsAndBeehive(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cluster := createCluster(t, d.clusterClient, "prod")
+	admin := beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	addEvent(t, admin, cluster.ID, ConnectionEventCategory, "Connecting")
+	addEvent(t, admin, cluster.ID, ConnectionEventCategory, "Connected")
+
+	stream, err := serviceOver(t, d).WatchEvents(ctx, ObjectID(cluster.ID), ptr(ConnectionEventCategory))
+	require.NoError(t, err)
+	cancel()
+
+	testutil.WaitClosed(t, stream.Frames, "the watch to stop")
+	assert.NoError(t, stream.Err(), "a consumer leaving is not a watch failure")
+}
+
+// The Bookmark is a send like any other: one run fills the buffer, and the bookmark behind
+// it is where a departed consumer ends the stream.
+func TestWatchEventsStopsOnTheBookmarkForAConsumerThatIsGone(t *testing.T) {
+	d, bh := newTestDepsAndBeehive(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cluster := createCluster(t, d.clusterClient, "prod")
+	addEvent(t, beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind),
+		cluster.ID, ConnectionEventCategory, "Connecting")
+
+	stream, err := serviceOver(t, d).WatchEvents(ctx, ObjectID(cluster.ID), ptr(ConnectionEventCategory))
+	require.NoError(t, err)
+	cancel()
+
+	testutil.WaitClosed(t, stream.Frames, "the watch to stop on the bookmark")
+	assert.NoError(t, stream.Err())
+}

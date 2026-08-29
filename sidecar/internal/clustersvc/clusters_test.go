@@ -1620,3 +1620,25 @@ func observePresence(t *testing.T, status *beehive.AdminClient[ClusterStatus], o
 		}},
 	}))
 }
+
+// The sort key falls back through what a record has: a display name, else the context it
+// came from, else the record's own name — which is what a source with no natural name
+// leaves, and ordering by nothing would reshuffle the list between reads.
+func TestClusterSortKeyFallsBackToTheRecordsOwnName(t *testing.T) {
+	obj := &beehive.Object[ClusterSpec, ClusterStatus]{Name: "record-name"}
+
+	assert.Equal(t, "record-name", clusterSortKey(obj))
+}
+
+// The record can be collected between the read and the write, so a switch landing on one
+// already going is reported rather than silently doing nothing.
+func TestSettingAClusterSwitchReportsARecordAlreadyGoing(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	require.NoError(t, d.clusterClient.Delete(ctx, cluster.ID))
+
+	_, err := serviceOver(t, d).Clusters().SetEnabled(ctx, ClusterID(cluster.ID), false)
+
+	assert.ErrorContains(t, err, "update cluster")
+}

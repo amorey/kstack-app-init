@@ -291,3 +291,50 @@ func TestWatchEventsStreamsTheNewestWindow(t *testing.T) {
 	assert.Equal(t, "Pulled", first.Event.Reason)
 	assert.Equal(t, f.cacheID, first.CacheID)
 }
+
+// A stored stamp of zero is absence, not the epoch: the field resolvers map a zero time to
+// null, and 1970 would sort to the bottom of every window instead.
+func TestMillisToTimeKeepsZeroAsAbsence(t *testing.T) {
+	assert.True(t, millisToTime(0).IsZero())
+	assert.Equal(t, int64(1500), millisToTime(1500).UnixMilli())
+}
+
+// The two watches gate on the same pair the reads do, and a pair that can never resolve
+// gets a bookmark over an empty collection rather than a stream that waits forever.
+func TestTheObjectAndEventWatchesGateOnThePairToo(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newDataFixture(t)
+
+	objects, err := f.data().WatchObjects(ctx, 9999, f.cacheID, "v1", "pods")
+	require.NoError(t, err)
+	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, objects.Frames, "the bookmark").Type)
+
+	events, err := f.data().WatchEvents(ctx, 9999, f.cacheID)
+	require.NoError(t, err)
+	assert.Equal(t, DeltaFrameBookmark, testutil.Recv(t, events.Frames, "the bookmark").Type)
+}
+
+// A cache with no file has never synced anything, which is empty rather than a fault: the
+// read never creates one, so there is nothing to report.
+func TestListKindsAnswersACacheWithNoFileAsEmpty(t *testing.T) {
+	f := newDataFixture(t)
+	kubestoreFake(f.d).noFile = true
+
+	kinds, err := f.data().ListKinds(context.Background(), f.clusterID, f.cacheID)
+
+	require.NoError(t, err)
+	assert.Empty(t, kinds)
+}
+
+// A cache whose file goes between the claim and the read is a fault to report — the rows
+// were there a moment ago, and answering empty would blank a populated table.
+func TestListKindsReportsACatalogItCannotRead(t *testing.T) {
+	f := newDataFixture(t)
+	store := kubestoreFake(f.d)
+	store.afterOpen = func(cacheID int64) { require.NoError(t, store.mgr.Remove(cacheID)) }
+
+	_, err := f.data().ListKinds(context.Background(), f.clusterID, f.cacheID)
+
+	assert.ErrorContains(t, err, "kinds")
+}

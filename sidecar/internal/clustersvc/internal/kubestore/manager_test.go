@@ -733,3 +733,170 @@ func TestOpenFileRepairsAFileThatPredatesTheDSN(t *testing.T) {
 	require.NoError(t, f.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode))
 	require.Equal(t, incremental, mode)
 }
+
+// A file that will not open is reported rather than papered over: a cache whose file is
+// unreadable is a fault to show, and answering with a fresh empty one would silently
+// discard whatever is on disk.
+func TestOpenReportsAFileThatIsNotADatabase(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "1.db"), []byte("not a database"), 0o600))
+	m := NewManager(dir, Retention{})
+
+	_, err := m.OpenOrCreate(1)
+
+	assert.ErrorContains(t, err, "auto_vacuum")
+}
+
+// The caches directory is created on demand, so a path that cannot become one is where
+// the open fails — before any of the file's own machinery is reached.
+func TestOpenReportsADirectoryItCannotCreate(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "a-file")
+	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
+	m := NewManager(blocked, Retention{})
+
+	_, err := m.OpenOrCreate(1)
+
+	assert.ErrorContains(t, err, "mkdir")
+}
+
+// A migration that will not run leaves the file as it found it and says so — opening over
+// a schema nobody can read would put every later statement's failure in its place.
+func TestOpenReportsAMigrationItCannotRun(t *testing.T) {
+	dir := t.TempDir()
+	seedRawDB(t, filepath.Join(dir, "1.db"), `CREATE TABLE schema_migrations(wrong TEXT)`)
+	m := NewManager(dir, Retention{})
+
+	_, err := m.OpenOrCreate(1)
+
+	assert.ErrorContains(t, err, "migrate")
+}
+
+// The statements are prepared at open, so a file whose migrations claim to have run over
+// tables that are not there fails HERE — once, naming the statement — rather than on
+// whichever write happens to be first.
+func TestOpenReportsAStatementItCannotPrepare(t *testing.T) {
+	dir := t.TempDir()
+	seedRawDB(t, filepath.Join(dir, "1.db"),
+		`CREATE TABLE schema_migrations(version INTEGER NOT NULL);
+		 INSERT INTO schema_migrations(version) VALUES (1)`)
+	m := NewManager(dir, Retention{})
+
+	_, err := m.OpenOrCreate(1)
+
+	assert.ErrorContains(t, err, "prepare")
+}
+
+// A stat that fails for a reason other than absence is a fault, not an absent cache:
+// answering "no such cache" would have the caller create one where it cannot.
+func TestOpenExistingReportsAPathItCannotStat(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "a-file")
+	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
+	m := NewManager(blocked, Retention{})
+
+	_, _, err := m.OpenExisting(1)
+
+	assert.ErrorContains(t, err, "open cache 1")
+}
+
+// Stats answers a missing cache as absent, but anything else is a measurement that
+// failed — and the gauge above it must say so rather than render a zero.
+func TestStatsReportsAPathItCannotStat(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "a-file")
+	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
+	m := NewManager(blocked, Retention{})
+
+	_, err := m.Stats(context.Background(), 1)
+
+	assert.ErrorContains(t, err, "stats")
+}
+
+// A file that exists and will not read is a fault of its own: the size is measurable and
+// the counts are not, and half a measurement is not one.
+func TestStatsReportsAFileItCannotRead(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "1.db"), []byte("not a database"), 0o600))
+	m := NewManager(dir, Retention{})
+
+	_, err := m.Stats(context.Background(), 1)
+
+	assert.ErrorContains(t, err, "counts")
+}
+
+// A cache removed between the stat and the read is gone, not broken. SQLite reports a
+// missing file as an ordinary error, so the file itself is what tells the two apart.
+func TestCountsFromDiskAnswersAVanishedFileAsEmpty(t *testing.T) {
+	m := NewManager(t.TempDir(), Retention{})
+
+	counts, err := m.countsFromDiskLocked(context.Background(), filepath.Join(t.TempDir(), "gone.db"))
+
+	require.NoError(t, err)
+	assert.Zero(t, counts.ObjectCount)
+}
+
+// Remove retires the entry whatever happens, but a close that fails is still reported —
+// the caller's next pass retries the unlink, and until it lands nothing may reopen.
+func TestRemoveReportsAFileThatWillNotClose(t *testing.T) {
+	boom := errors.New("close failed")
+	m := newManagerWithOptions(t.TempDir(), withCloseFile(func(*file) error { return boom }))
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	defer store.Release()
+
+	assert.ErrorIs(t, m.Remove(1), boom)
+}
+
+// The manager has nothing to do at startup — the files open on demand — so it satisfies
+// the lifecycle contract without holding one open.
+func TestStartHasNothingToDo(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir(), Retention{})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+
+	stop, err := m.Start(ctx)
+
+	require.NoError(t, err)
+	assert.NoError(t, stop(ctx))
+}
+
+// seedRawDB writes a cache file directly, standing in for one an older build left behind
+// or a corruption the manager has to meet on open.
+func seedRawDB(t *testing.T, path, schema string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	require.NoError(t, err)
+	defer db.Close() //nolint:errcheck // seeded and done with
+	_, err = db.ExecContext(context.Background(), schema)
+	require.NoError(t, err)
+}
+
+// The reader pool prepares its own half of the statements, so a schema that satisfies the
+// writers and not the readers fails at open rather than on the first watch — where an
+// empty table would be all the user saw.
+func TestOpenReportsAReadStatementItCannotPrepare(t *testing.T) {
+	dir := t.TempDir()
+	// Migrated to the current version so Apply skips, over tables the writers can use and
+	// the readers cannot: kind_counts without the column the nav's counts come from.
+	seedRawDB(t, filepath.Join(dir, "1.db"), `
+		CREATE TABLE schema_migrations(version INTEGER NOT NULL);
+		INSERT INTO schema_migrations(version) VALUES (1);
+		CREATE TABLE cluster_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+		CREATE TABLE objects(uid TEXT PRIMARY KEY, api_version TEXT, kind TEXT, namespace TEXT,
+			name TEXT, resource_version TEXT, generation INT, created_at INT, updated_at INT,
+			status_summary TEXT, ready_count INT, total_count INT, restart_count INT, host TEXT,
+			raw_json BLOB);
+		CREATE TABLE owner_refs(child_uid TEXT, owner_uid TEXT, is_controller INT,
+			PRIMARY KEY(child_uid, owner_uid));
+		CREATE TABLE labels(uid TEXT, key TEXT, value TEXT, PRIMARY KEY(uid, key));
+		CREATE TABLE status_history(uid TEXT, at INT, summary TEXT);
+		CREATE TABLE events(uid TEXT PRIMARY KEY, involved_uid TEXT, involved_kind TEXT,
+			involved_ns TEXT, involved_name TEXT, type TEXT, reason TEXT, message TEXT,
+			first_seen INT, last_seen INT, count INT, raw_json BLOB, updated_at INT);
+		CREATE TABLE kind_catalog(api_version TEXT, kind TEXT, resource TEXT, scope TEXT,
+			is_crd INT, schema_json TEXT, PRIMARY KEY(api_version, kind));
+		CREATE TABLE kind_counts(api_version TEXT, kind TEXT, PRIMARY KEY(api_version, kind));`)
+	m := NewManager(dir, Retention{})
+
+	_, err := m.OpenOrCreate(1)
+
+	assert.ErrorContains(t, err, "kind_counts")
+}

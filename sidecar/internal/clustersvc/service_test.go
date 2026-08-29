@@ -315,3 +315,76 @@ func TestAResumePokeRestartsEverySync(t *testing.T) {
 	pokeSvc.Poke(poke.SourceHost)
 	testutil.Wait(t, sync.restarted.Chan(), "every sync to be restarted")
 }
+
+// Every read and every write reports a storage fault rather than answering as though the
+// records were not there. The distinction is the whole of it above: an empty answer is a
+// fleet with no clusters, and a view that took one for an unreadable app.db would show the
+// user an empty app instead of an error.
+func TestEveryEntryPointReportsAStorageFault(t *testing.T) {
+	ctx := context.Background()
+	s := serviceOver(t, newTestDepsOverAClosedStore(t))
+	ops := map[string]func() error{
+		"Clusters.Get":            func() error { _, err := s.Clusters().Get(ctx, 1); return err },
+		"Clusters.List":           func() error { _, err := s.Clusters().List(ctx); return err },
+		"Clusters.Watch":          func() error { _, err := s.Clusters().Watch(ctx, 1); return err },
+		"Clusters.WatchList":      func() error { _, err := s.Clusters().WatchList(ctx); return err },
+		"Clusters.Delete":         func() error { return s.Clusters().Delete(ctx, 1) },
+		"Caches.Get":              func() error { _, err := s.Caches().Get(ctx, 1); return err },
+		"Caches.List":             func() error { _, err := s.Caches().List(ctx); return err },
+		"Caches.Watch":            func() error { _, err := s.Caches().Watch(ctx, 1); return err },
+		"Caches.WatchList":        func() error { _, err := s.Caches().WatchList(ctx); return err },
+		"Caches.ListByCluster":    func() error { _, err := s.Caches().ListByCluster(ctx, 1); return err },
+		"Caches.WatchByCluster":   func() error { _, err := s.Caches().WatchByCluster(ctx, 1); return err },
+		"Caches.WatchStats":       func() error { _, err := s.Caches().WatchStats(ctx, 1, 2); return err },
+		"Caches.WatchSyncStatus":  func() error { _, err := s.Caches().WatchSyncStatus(ctx, 1, 2); return err },
+		"Caches.Clear":            func() error { _, err := s.Caches().Clear(ctx, 1); return err },
+		"CachedKinds.Get":         func() error { _, err := s.CachedKinds().Get(ctx, 1); return err },
+		"CachedKinds.List":        func() error { _, err := s.CachedKinds().List(ctx); return err },
+		"CachedKinds.Watch":       func() error { _, err := s.CachedKinds().Watch(ctx, 1); return err },
+		"CachedKinds.WatchList":   func() error { _, err := s.CachedKinds().WatchList(ctx); return err },
+		"CachedKinds.ListByCache": func() error { _, err := s.CachedKinds().ListByCache(ctx, 1); return err },
+		"CachedKinds.WatchByCache": func() error {
+			_, err := s.CachedKinds().WatchByCache(ctx, 1)
+			return err
+		},
+		"CachedKinds.Clear":          func() error { _, err := s.CachedKinds().Clear(ctx, 1); return err },
+		"CachedKinds.SetSyncEnabled": func() error { _, err := s.CachedKinds().SetSyncEnabled(ctx, 1, true); return err },
+		"CachedData.ListKinds":       func() error { _, err := s.CachedData().ListKinds(ctx, 1, 2); return err },
+		"CachedData.WatchKinds":      func() error { _, err := s.CachedData().WatchKinds(ctx, 1, 2); return err },
+		"CachedData.WatchObjects": func() error {
+			_, err := s.CachedData().WatchObjects(ctx, 1, 2, "v1", "pods")
+			return err
+		},
+		"CachedData.WatchEvents": func() error { _, err := s.CachedData().WatchEvents(ctx, 1, 2); return err },
+		"ListEvents":             func() error { _, err := s.ListEvents(ctx, 1, nil, nil); return err },
+		"WatchEvents":            func() error { _, err := s.WatchEvents(ctx, 1, nil); return err },
+	}
+	for name, op := range ops {
+		t.Run(name, func(t *testing.T) { assert.Error(t, op()) })
+	}
+}
+
+// WatchHealth is a gauge: it hands back a stream and folds afterwards, so its fault lands
+// on the stream rather than at the call. Reported and not swallowed — a fleet whose health
+// cannot be read is not a healthy one.
+func TestWatchHealthReportsAStorageFaultOnItsStream(t *testing.T) {
+	s := serviceOver(t, newTestDepsOverAClosedStore(t))
+
+	stream, err := s.Caches().WatchHealth(context.Background())
+
+	require.NoError(t, err)
+	testutil.WaitClosed(t, stream.Frames, "the fold to give up on an unreadable store")
+	assert.Error(t, stream.Err())
+}
+
+// A pair that names no cache is not an error: a caller holds ids from watch frames, so a
+// record collected in between is an ordinary race, and the per-cache reads answer it as
+// definitively empty rather than as a fault.
+func TestCacheBelongsToAnswersAnUnknownCacheAsNoMatch(t *testing.T) {
+	d := newTestDeps(t)
+
+	ok, err := serviceOver(t, d).cacheBelongsTo(context.Background(), 1, 404)
+
+	require.NoError(t, err)
+	assert.False(t, ok)
+}

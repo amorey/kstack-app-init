@@ -474,3 +474,16 @@ func TestSourceWakesADepartedContextsRecord(t *testing.T) {
 		"an orphaned record keeps its last-known names, or the row goes nameless")
 	assert.True(t, orphan.Spec.Enabled, "and the user's toggles, since the context may come back")
 }
+
+// The fingerprint is what wakes every dependent record, so a pass that cannot store it
+// fails rather than settling: settling would leave the observation unpublished and no
+// record would ever re-read the kubeconfig this pass just saw change.
+func TestSourceReconcileFailsWhenTheFingerprintWillNotStore(t *testing.T) {
+	d := newTestDeps(t)
+	d.kubeconfigSvc = fakeKubeconfigService{cfg: cfgWith("prod"), loaded: true}
+	c, obj := sourceControllerOver(t, d)
+
+	res := c.Reconcile(context.Background(), &stubSourceController{updateErr: assert.AnError}, obj)
+
+	assert.NotEqual(t, beehive.Settled(), res)
+}

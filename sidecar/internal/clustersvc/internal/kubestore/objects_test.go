@@ -17,6 +17,7 @@ package kubestore
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -234,4 +235,34 @@ func TestInsertTakesAnObjectWithNoLabels(t *testing.T) {
 		podWith("uid-1", nil, nil)))
 
 	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM labels WHERE uid='uid-1'`))
+}
+
+// A body carrying a value JSON cannot represent is skipped, not fatal: a relist drops it
+// until the next pass, where failing would hand the same body back forever.
+func TestProjectObjectRefusesABodyThatWillNotMarshal(t *testing.T) {
+	u := obj(map[string]any{
+		"apiVersion": "v1", "kind": "Pod",
+		"metadata": map[string]any{"uid": "uid-1", "name": "api-0"},
+		// A float64 the copier carries happily and the encoder rejects.
+		"spec": map[string]any{"weight": math.NaN()},
+	})
+
+	_, err := projectObject(u)
+
+	assert.ErrorIs(t, err, errUnprojectable)
+}
+
+// A Secret whose data is not the map the API says it is leaves the body alone rather than
+// panicking on it — an unreadable shape must not be a way to skip redaction of one that
+// is readable.
+func TestSanitizeLeavesASecretWhoseDataIsNotAMap(t *testing.T) {
+	u := obj(map[string]any{
+		"apiVersion": "v1", "kind": "Secret",
+		"metadata": map[string]any{"uid": "uid-1", "name": "creds"},
+		"data":     "not-a-map",
+	})
+
+	got := sanitize(u)
+
+	assert.Equal(t, "not-a-map", got.Object["data"])
 }

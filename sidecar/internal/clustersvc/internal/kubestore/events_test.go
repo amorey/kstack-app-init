@@ -15,12 +15,15 @@
 package kubestore
 
 import (
+	"context"
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/watch"
 )
 
 func TestExtractEventReadsTheCoreSpelling(t *testing.T) {
@@ -162,4 +165,43 @@ func TestExtractEventStripsServerNoise(t *testing.T) {
 	meta := stored["metadata"].(map[string]any)
 	assert.NotContains(t, meta, "managedFields")
 	assert.NotContains(t, meta, "annotations")
+}
+
+// A nil body would panic on the projection, taking the worker's goroutine with it.
+func TestExtractEventRefusesAnEmptyBody(t *testing.T) {
+	_, err := extractEvent(nil)
+
+	assert.ErrorIs(t, err, errUnprojectable)
+}
+
+// An event carrying a value JSON cannot represent is skipped like any other unprojectable
+// body — events are the highest-volume stream, and one bad body must not stop the rest.
+func TestExtractEventRefusesABodyThatWillNotMarshal(t *testing.T) {
+	u := obj(map[string]any{
+		"apiVersion": "v1", "kind": "Event",
+		"metadata": map[string]any{"uid": "ev-1"},
+		"count":    math.NaN(),
+	})
+
+	_, err := extractEvent(u)
+
+	assert.ErrorIs(t, err, errUnprojectable)
+}
+
+// An event with no times stores NULL rather than the epoch, so "never seen" is absence
+// and not a 1970 instant sorting to the bottom of every window.
+func TestAnEventWithNoTimesStoresNull(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	u := obj(map[string]any{
+		"apiVersion": "v1", "kind": "Event",
+		"metadata":       map[string]any{"uid": "ev-1"},
+		"involvedObject": map[string]any{"uid": "pod-1"},
+		"reason":         "BackOff",
+	})
+
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, u))
+
+	assert.Equal(t, 1, countRows(t, s,
+		`SELECT COUNT(*) FROM events WHERE first_seen IS NULL AND last_seen IS NULL`))
 }

@@ -208,8 +208,14 @@ func TestCacheWatchRetriesAFailedReRead(t *testing.T) {
 	recvFrame(t, s)
 	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
 
+	before := f.readCount()
 	f.fail(errors.New("disk I/O error"))
 	f.ping()
+	// Waited for, so the recovery below cannot land ahead of the read it is recovering
+	// from — which would leave the retry untested and the test still green.
+	require.Eventually(t, func() bool { return f.readCount() > before },
+		5*time.Second, time.Millisecond, "the re-read to fail")
+
 	// The retry timer is what drives the recovery; nothing else pings.
 	f.set(row{UID: "a", Data: "2"})
 
@@ -316,4 +322,118 @@ func TestCacheWatchBookmarksBeforeTheStoreExists(t *testing.T) {
 	fr := recvFrame(t, s)
 	assert.Equal(t, DeltaFrameAdded, fr.Type)
 	assert.Equal(t, row{UID: "a", Data: "1"}, *fr.Row)
+}
+
+// A consumer that has gone ends the loop wherever it is: every send is checked, so a
+// cancelled watch stops at the frame it was on rather than blocking on a channel nobody
+// is reading. The context is cancelled with a send already parked — Frames buffers one,
+// and the second row has nowhere to go — so the check is what frees the loop rather than
+// a race with the buffer.
+func TestCacheWatchStopsAtTheFrameTheConsumerLeftOn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"}, row{UID: "b", Data: "1"})
+
+	stream := f.start(ctx, time.Millisecond, time.Millisecond)
+	cancel()
+
+	testutil.WaitClosed(t, stream.Frames, "the loop to stop for a consumer that is gone")
+	assert.NoError(t, stream.Err(), "a consumer leaving is not a watch failure")
+}
+
+// The Bookmark is a send like any other: one row fills the buffer, and the bookmark behind
+// it is where a departed consumer ends the loop.
+func TestCacheWatchStopsOnTheBookmarkWhenTheConsumerLeft(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"})
+
+	stream := f.start(ctx, time.Millisecond, time.Millisecond)
+	cancel()
+
+	testutil.WaitClosed(t, stream.Frames, "the loop to stop on the bookmark")
+	assert.NoError(t, stream.Err())
+}
+
+// A snapshot that cannot be read is a watch failure — unlike a re-read, which retries.
+// There is no last-known data to hold here, so the client is told rather than left on an
+// empty table with nothing to say why.
+func TestCacheWatchEndsWhenTheSnapshotWillNotRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	boom := errors.New("read failed")
+	f := newWatchFixture(t)
+	f.open()
+	f.fail(boom)
+
+	stream := f.start(ctx, time.Millisecond, time.Millisecond)
+
+	testutil.WaitClosed(t, stream.Frames, "the watch to end")
+	assert.ErrorIs(t, stream.Err(), boom)
+}
+
+// Every kind of difference is a send that can find the consumer gone. Driven directly
+// because the loop's own select would race the cancellation, and what is under test is
+// that each of the three sends is checked rather than assumed.
+func TestSendDiffStopsAtAnyFrameWhenTheConsumerIsGone(t *testing.T) {
+	diffs := map[string]struct {
+		prev map[string]row
+		rows []row
+	}{
+		"added":    {prev: map[string]row{}, rows: []row{{UID: "a", Data: "1"}}},
+		"modified": {prev: map[string]row{"a": {UID: "a", Data: "1"}}, rows: []row{{UID: "a", Data: "2"}}},
+		"deleted":  {prev: map[string]row{"a": {UID: "a", Data: "1"}}},
+	}
+	w := cachedDataWatchSpec[row, frame]{
+		key: func(r row) string { return r.UID },
+		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r row) frame {
+			return frame{Type: t, Row: &r}
+		},
+	}
+
+	for name, diff := range diffs {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			// Buffered like Frames and already full, so the one send each case makes has
+			// nowhere to go — otherwise the buffer takes it and the check never runs.
+			out := make(chan frame, 1)
+			out <- frame{}
+
+			_, ok := w.sendDiff(ctx, out, nil, diff.prev, diff.rows)
+
+			assert.False(t, ok)
+		})
+	}
+}
+
+// A watch opened before the cache has a file waits for one, and a context that ends first
+// ends the wait — cleanly, since nothing broke.
+func TestCacheWatchStopsWaitingForAFileWhenTheContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := newWatchFixture(t)
+	stream := f.start(ctx, time.Millisecond, time.Millisecond)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, stream).Type)
+
+	cancel()
+
+	testutil.WaitClosed(t, stream.Frames, "the wait to end with the context")
+	assert.NoError(t, stream.Err())
+}
+
+// The manager shutting down under a waiting watch ends it the same way: the open feed
+// closes, and there is no file coming.
+func TestCacheWatchStopsWaitingWhenTheManagerShutsDown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	stream := f.start(ctx, time.Millisecond, time.Millisecond)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, stream).Type)
+
+	require.NoError(t, f.m.Close())
+
+	testutil.WaitClosed(t, stream.Frames, "the wait to end with the manager")
+	assert.NoError(t, stream.Err())
 }

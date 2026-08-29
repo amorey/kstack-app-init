@@ -186,3 +186,66 @@ func TestObjectsAreOrderedByNamespaceAndName(t *testing.T) {
 	require.Len(t, got, 3)
 	assert.Equal(t, []string{"api-0", "api-1", "api-2"}, []string{got[0].Name, got[1].Name, got[2].Name})
 }
+
+// dropTable removes one table from under the prepared statements, so a read that names it
+// fails the way an unreadable file does. A prepared statement is re-prepared against the
+// live schema, which is what makes this reach the reader pool too.
+func dropTable(t *testing.T, s *Store, table string) {
+	t.Helper()
+	_, err := db(t, s).ExecContext(context.Background(), `DROP TABLE `+table)
+	require.NoError(t, err)
+}
+
+// A read that cannot reach its table reports the fault. Answering empty would say the
+// cluster serves nothing, and the nav would empty over a storage problem.
+func TestKindsReportsATableItCannotRead(t *testing.T) {
+	s := newTestStore(t)
+	dropTable(t, s, "kind_catalog")
+
+	_, err := s.Kinds(context.Background())
+
+	assert.ErrorContains(t, err, "read kinds")
+}
+
+// The rows and the fingerprint come out of one transaction, so a fingerprint that cannot
+// be read fails the pair rather than handing back rows under a missing one — which a
+// caller would take for a wiped table.
+func TestKindsWithFingerprintReportsAnUnreadableFingerprint(t *testing.T) {
+	s := newTestStore(t)
+	dropTable(t, s, "cluster_meta")
+
+	_, _, _, err := s.KindsWithFingerprint(context.Background())
+
+	assert.ErrorContains(t, err, "fingerprint")
+}
+
+// A row the reader cannot make sense of is a fault, not a kind to skip: a catalog read
+// short by one kind is a nav missing an entry with nothing to say why.
+func TestKindsReportsARowItCannotScan(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	_, err := db(t, s).ExecContext(ctx,
+		`INSERT INTO kind_catalog(api_version, kind, resource, scope, is_crd)
+		 VALUES ('v1', 'Pod', 'pods', 'Namespaced', 2)`)
+	require.NoError(t, err)
+
+	_, err = s.Kinds(ctx)
+
+	assert.ErrorContains(t, err, "read kinds")
+}
+
+// A body that will not decompress is reported rather than served: handing a caller half a
+// document, or the compressed bytes, would put nonsense in front of the user.
+func TestObjectBodyReportsAStoredBodyItCannotDecompress(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "1")))
+	// A zlib stream's own leading byte, so the codec commits to inflating it and fails.
+	_, err := db(t, s).ExecContext(ctx,
+		`UPDATE objects SET raw_json = x'7801ffff' WHERE uid = 'uid-1'`)
+	require.NoError(t, err)
+
+	_, _, err = s.ObjectBody(ctx, "uid-1")
+
+	assert.ErrorContains(t, err, "read object body")
+}

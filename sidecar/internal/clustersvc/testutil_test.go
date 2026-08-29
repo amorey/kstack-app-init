@@ -174,9 +174,11 @@ type fakeKubestore struct {
 	removed       []int64
 	err           error
 	// onClear and onOpen run inside the clears, so a test can assert what had already
-	// happened by then — or move the world under one.
-	onClear func(cacheID int64)
-	onOpen  func(cacheID int64)
+	// happened by then — or move the world under one. afterOpen runs with the claim
+	// already handed out, which is where a test retires the cache under a live one.
+	onClear   func(cacheID int64)
+	onOpen    func(cacheID int64)
+	afterOpen func(cacheID int64)
 
 	// mu guards the measurement, which a test moves while the gauge reads it.
 	mu    sync.Mutex
@@ -207,6 +209,9 @@ func (f *fakeKubestore) OpenExisting(cacheID int64) (*kubestore.Store, bool, err
 	store, err := f.mgr.OpenOrCreate(cacheID)
 	if err != nil {
 		return nil, false, err
+	}
+	if f.afterOpen != nil {
+		f.afterOpen(cacheID)
 	}
 	return store, true, nil
 }
@@ -635,4 +640,27 @@ func (f *fakeKubesync) stoppedKinds() []kubesync.KindKey {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.stoppedKind)
+}
+
+// newTestDepsOverAClosedStore returns the shared set over a beehive whose store has been
+// closed, so every read and write through it fails. It stands in for the storage faults —
+// an app.db that goes unreadable under a running service — that no test can otherwise
+// produce, and what it proves is that a fault is reported rather than answered as absence.
+func newTestDepsOverAClosedStore(t *testing.T) deps {
+	t.Helper()
+	d, closeStore := newTestDepsWithABreakableStore(t)
+	closeStore()
+	return d
+}
+
+// newTestDepsWithABreakableStore is the same set beside the close, for a test that needs
+// records to exist before the store under them goes.
+func newTestDepsWithABreakableStore(t *testing.T) (deps, func()) {
+	t.Helper()
+	store, err := beehivesqlite.OpenMemory()
+	require.NoError(t, err)
+	bh, err := beehive.New(store)
+	require.NoError(t, err)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), newFakeKubesync(), nil)
+	return d, func() { require.NoError(t, store.Close()) }
 }

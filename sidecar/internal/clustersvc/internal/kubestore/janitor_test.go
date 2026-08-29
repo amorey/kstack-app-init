@@ -16,6 +16,7 @@ package kubestore
 
 import (
 	"context"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -151,4 +152,50 @@ func TestAClearedCacheKeepsItsJanitor(t *testing.T) {
 func sweptClean(t *testing.T, s *Store) bool {
 	t.Helper()
 	return countRows(t, s, `SELECT COUNT(*) FROM status_history`) == 0
+}
+
+// The janitor keeps sweeping: the first pass runs at open, and the interval is what makes
+// the second one happen. Waiting for the first to finish before dirtying the file is what
+// separates them — a fill racing the opening sweep proves only that one ran.
+func TestAJanitorKeepsSweepingOnItsInterval(t *testing.T) {
+	m := NewManager(t.TempDir(), Retention{StatusHistoryTTL: time.Hour, Interval: time.Millisecond})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(store.Release)
+	fillStatusHistory(t, store, 100)
+	require.Eventually(t, func() bool { return sweptClean(t, store) },
+		5*time.Second, time.Millisecond, "the opening sweep")
+
+	fillStatusHistory(t, store, 100)
+
+	require.Eventually(t, func() bool { return sweptClean(t, store) },
+		5*time.Second, time.Millisecond, "a second sweep, which only the ticker starts")
+}
+
+// A vacuum that will not run is logged and the sweep returns — the janitor's next
+// interval tries again. Failing louder would take down the only thing that hands pages
+// back, over a condition that is usually momentary.
+func TestASweepSurvivesAVacuumItCannotRun(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	m := NewManager(dir, Retention{})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(store.Release)
+	// Rows written and deleted, so the freelist the vacuum walks is not empty.
+	fillStatusHistory(t, store, 2000)
+	_, err = db(t, store).ExecContext(ctx, `DELETE FROM status_history`)
+	require.NoError(t, err)
+
+	// A read-only pool over the same file: the freelist still reads, and the vacuum that
+	// would hand its pages back cannot write.
+	f := openFileOf(t, store)
+	readOnly, err := openReadOnly(filepath.Join(dir, "1.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, readOnly.Close()) })
+	f.db = readOnly
+
+	assert.NotPanics(t, func() { sweep(ctx, "1", f, Retention{StatusHistoryTTL: time.Hour}) })
 }

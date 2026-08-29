@@ -143,3 +143,20 @@ func TestSyncKindsLeavesTheSchemaAlone(t *testing.T) {
 	require.NotNil(t, got)
 	assert.JSONEq(t, `{"x":1}`, *got)
 }
+
+// The prune runs before the fingerprint, so a prune that fails takes the whole sweep's
+// answer with it — a catalog emptied under a fingerprint that says it was written would
+// read as a cluster serving nothing.
+func TestSyncKindsReportsAFailedPrune(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{
+		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: "Namespaced"},
+	}, true, 1))
+	failWrites(t, s, "kind_catalog", "DELETE")
+
+	// No rows, so the prune is the sweep's first statement and the fault lands on it.
+	err := s.SyncKinds(ctx, nil, true, 2)
+
+	assert.ErrorContains(t, err, "prune")
+}

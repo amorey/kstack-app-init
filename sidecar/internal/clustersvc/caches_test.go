@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -362,16 +363,20 @@ type cacheControllerClient struct {
 	beehive.ControllerClient[ClusterCacheStatus]
 	events       []beehive.EventSpec
 	dependencies []beehive.ObjectID
+	// dependErr and eventErr fail the two writes a pass makes through this client, which
+	// is the only way to reach what a pass does when one of them will not land.
+	dependErr error
+	eventErr  error
 }
 
 func (c *cacheControllerClient) AddDependency(_ context.Context, toID beehive.ObjectID) error {
 	c.dependencies = append(c.dependencies, toID)
-	return nil
+	return c.dependErr
 }
 
 func (c *cacheControllerClient) AddEvent(_ context.Context, event beehive.EventSpec) error {
 	c.events = append(c.events, event)
-	return nil
+	return c.eventErr
 }
 
 // reconcileCache runs one cache pass the way beehive would.
@@ -1400,4 +1405,553 @@ func TestCachePassDependsOnTheClusterWhoseSwitchItReads(t *testing.T) {
 	client := reconcileCache(t, d, cache)
 
 	assert.Equal(t, []beehive.ObjectID{cluster.ID}, client.dependencies)
+}
+
+// Two stamps are the same when both are absent or both name the same instant — a pointer
+// comparison would call two equal times different and re-send the gauge every tick.
+func TestSameTimeComparesTheInstantNotThePointer(t *testing.T) {
+	at := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+	same := at
+
+	assert.True(t, sameTime(&at, &same))
+	assert.True(t, sameTime(nil, nil))
+	assert.False(t, sameTime(&at, nil))
+}
+
+// Kinds are ordered by apiVersion and then resource, so a rendered list holds still
+// between ticks rather than reshuffling on whatever order the store returned.
+func TestSyncedKindRefsSortByApiVersionThenResource(t *testing.T) {
+	refs := []SyncedKindRef{
+		{APIVersion: "v1", Resource: "pods"},
+		{APIVersion: "apps/v1", Resource: "statefulsets"},
+		{APIVersion: "apps/v1", Resource: "deployments"},
+	}
+
+	slices.SortFunc(refs, compareSyncedKindRefs)
+
+	assert.Equal(t, []SyncedKindRef{
+		{APIVersion: "apps/v1", Resource: "deployments"},
+		{APIVersion: "apps/v1", Resource: "statefulsets"},
+		{APIVersion: "v1", Resource: "pods"},
+	}, refs)
+}
+
+// The three steps a live cache's pass makes, each failed in turn. A pass that swallowed
+// one would settle the generation over work that did not happen, and beehive would not
+// come back to it — the cache would sit unarmed until something else moved.
+func TestCacheReconcileFailsOnAnyStepThatDoesNot(t *testing.T) {
+	steps := map[string]func(d *deps, client *cacheControllerClient, cacheID int64){
+		"arming the sync": func(_ *deps, client *cacheControllerClient, _ int64) {
+			client.dependErr = assert.AnError
+		},
+		"mirroring the kinds": func(d *deps, _ *cacheControllerClient, _ int64) {
+			d.kubestoreMgr.(*fakeKubestore).err = assert.AnError
+		},
+		"logging the verdict": func(d *deps, client *cacheControllerClient, cacheID int64) {
+			// A sweep that has answered, so there is a verdict to write at all.
+			d.kubesyncSvc.(*fakeKubesync).setDiscoveryState(cacheID, kubesync.DiscoveryState{
+				Reason: kubesync.ReasonDiscovered,
+			})
+			client.eventErr = assert.AnError
+		},
+	}
+
+	for name, breakStep := range steps {
+		t.Run(name, func(t *testing.T) {
+			d, status := newClusterStatusDeps(t)
+			cluster := storedCluster(t, d, status, true, "uid-1")
+			cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+			client := &cacheControllerClient{}
+			breakStep(&d, client, int64(cache.ID))
+
+			res := (&clusterCacheController{deps: d}).Reconcile(context.Background(), client, cache)
+
+			assert.NotEqual(t, beehive.Settled(), res)
+		})
+	}
+}
+
+// A cache whose owner edge was never loaded is a programming error, not an unowned
+// record: silently reading it as "no cluster" would drop the cache out of the fold, and
+// the gauge would report a fleet short of one with nothing to say why.
+func TestReadingACacheOwnerThatWasNotLoadedIsReported(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	unloaded, err := d.cacheClient.Get(ctx, cache.ID)
+	require.NoError(t, err)
+	a := cachesAPI{serviceOver(t, d)}
+
+	_, frameErr := cacheWatch.frame(DeltaFrameAdded, unloaded)
+	_, clusterErr := a.clusterFor(ctx, unloaded, map[beehive.ObjectID]*beehive.Object[ClusterSpec, ClusterStatus]{})
+
+	assert.Error(t, frameErr)
+	assert.ErrorContains(t, clusterErr, "owner")
+}
+
+// A cache with no cluster is one beehive's GC is about to take: it drops out of the fold
+// rather than being reported, since its going is not a fault.
+func TestTheHealthFoldSkipsACacheWithNoCluster(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	_, _, err := d.cacheClient.CreateOrUpdate(ctx, "orphan-cache", ClusterCacheSpec{ServerUID: "uid-1"})
+	require.NoError(t, err)
+
+	healths, err := cachesAPI{serviceOver(t, d)}.readAllCacheHealth(ctx)
+
+	require.NoError(t, err)
+	assert.Empty(t, healths)
+}
+
+// The cluster lookup is memoised across the fold — caches of one cluster share it, and
+// this runs on the gauge's cadence. A cluster already found is not read again, and one
+// already found to be gone is not looked for again either.
+func TestTheClusterLookupIsMemoisedAcrossTheFold(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	first := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	second := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-2")
+	a := cachesAPI{serviceOver(t, d)}
+	seen := map[beehive.ObjectID]*beehive.Object[ClusterSpec, ClusterStatus]{}
+
+	firstObj, err := d.cacheClient.Get(ctx, first.ID, beehive.LoadOwner())
+	require.NoError(t, err)
+	one, err := a.clusterFor(ctx, firstObj, seen)
+	require.NoError(t, err)
+	secondObj, err := d.cacheClient.Get(ctx, second.ID, beehive.LoadOwner())
+	require.NoError(t, err)
+	two, err := a.clusterFor(ctx, secondObj, seen)
+
+	require.NoError(t, err)
+	assert.Same(t, one, two)
+}
+
+// A cache whose cluster has been collected reads as no cluster rather than as a failure:
+// the fold read the cache a moment before its cluster went, and the record is on its way
+// out with it.
+func TestTheClusterLookupAnswersACollectedClusterAsNone(t *testing.T) {
+	ctx := context.Background()
+	d, _ := newRunningRegisteredDeps(t, beehive.WithGCInterval(time.Millisecond))
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	cacheObj, err := d.cacheClient.Get(ctx, cache.ID, beehive.LoadOwner())
+	require.NoError(t, err)
+	a := cachesAPI{serviceOver(t, d)}
+
+	require.NoError(t, d.clusterClient.Delete(ctx, cluster.ID))
+
+	require.Eventually(t, func() bool {
+		got, err := a.clusterFor(ctx, cacheObj, map[beehive.ObjectID]*beehive.Object[ClusterSpec, ClusterStatus]{})
+		return err == nil && got == nil
+	}, 5*time.Second, time.Millisecond, "the cluster to be collected out from under the fold")
+}
+
+// A cache with no cluster cannot be armed: every switch the pass reads lives on the
+// cluster, and inventing one would arm a sync against defaults the user never set.
+func TestArmingACacheWithNoClusterIsReported(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	orphan, _, err := d.cacheClient.CreateOrUpdate(ctx, "orphan-cache", ClusterCacheSpec{})
+	require.NoError(t, err)
+
+	_, err = (&clusterCacheController{deps: d}).loadCluster(ctx, orphan)
+
+	assert.ErrorContains(t, err, "has no cluster")
+}
+
+// The catalog read is what the mirror is built from, so a cache whose file goes between
+// the claim and the read fails the pass — carrying on would mirror an empty answer and
+// prune every kind the cache holds.
+func TestMirroringFailsWhenTheCatalogWillNotRead(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	store := d.kubestoreMgr.(*fakeKubestore)
+	// Retired with the claim already handed out: the pass holds a store whose file is gone.
+	store.afterOpen = func(cacheID int64) { require.NoError(t, store.mgr.Remove(cacheID)) }
+
+	err := (&clusterCacheController{deps: d}).mirrorKinds(context.Background(), cache)
+
+	assert.ErrorContains(t, err, "kind catalog")
+}
+
+// The records under a cache are read once and answer both the write and the prune, so a
+// read that fails takes the pass with it rather than pruning against an empty set.
+func TestMirroringFailsWhenTheStoredRecordsWillNotList(t *testing.T) {
+	d, cache := cacheOverABrokenStore(t)
+
+	err := (&clusterCacheController{deps: d}).mirrorKinds(context.Background(), cache)
+
+	assert.ErrorContains(t, err, "cached kinds")
+}
+
+// A record that will not write fails the pass: settling over it would leave the cache
+// mirroring a kind the cluster serves and nothing has a record for.
+func TestUpsertingKindsFailsWhenARecordWillNotWrite(t *testing.T) {
+	d, cache := cacheOverABrokenStore(t)
+	desired := map[string]ClusterCachedKindSpec{
+		ClusterCachedKindName(cache.ID, "apps/v1", "deployments"): deploymentsSpec,
+	}
+
+	err := (&clusterCacheController{deps: d}).upsertKinds(context.Background(), cache.ID, desired, nil)
+
+	assert.ErrorContains(t, err, "mirror cached kind")
+}
+
+// The user's switch is re-read under the lock before a catalog change is written over it,
+// and a read that fails must stop the write — carrying on would resume a paused kind
+// because its singular was renamed.
+func TestUpsertingKindsFailsWhenThePauseWillNotRead(t *testing.T) {
+	d, cache := cacheOverABrokenStore(t)
+	name := ClusterCachedKindName(cache.ID, "apps/v1", "deployments")
+	renamed := deploymentsSpec
+	renamed.Kind = "Deploy"
+	stored := map[string]*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]{
+		name: {ID: 404, Name: name, Spec: deploymentsSpec},
+	}
+
+	err := (&clusterCacheController{deps: d}).upsertKinds(context.Background(), cache.ID,
+		map[string]ClusterCachedKindSpec{name: renamed}, stored)
+
+	assert.ErrorContains(t, err, "read cached kind")
+}
+
+// A record collected since the pass listed it has no switch to carry, and the write that
+// follows creates it afresh — a race, not a failure.
+func TestUpsertingKindsTreatsACollectedRecordAsUnpaused(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	name := ClusterCachedKindName(cache.ID, "apps/v1", "deployments")
+	renamed := deploymentsSpec
+	renamed.Kind = "Deploy"
+	// An id nothing names, standing in for a record collected between the list and here.
+	stored := map[string]*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]{
+		name: {ID: 404, Name: name, Spec: deploymentsSpec},
+	}
+
+	err := (&clusterCacheController{deps: d}).upsertKinds(ctx, cache.ID,
+		map[string]ClusterCachedKindSpec{name: renamed}, stored)
+
+	require.NoError(t, err)
+	got, err := d.kindClient.GetByName(ctx, name)
+	require.NoError(t, err)
+	assert.Equal(t, "Deploy", got.Spec.Kind)
+}
+
+// A record the catalog no longer names is marked, and a mark that will not land fails the
+// pass — the kind would otherwise keep syncing with nothing left to say it should.
+func TestPruningKindsFailsWhenTheMarkWillNotLand(t *testing.T) {
+	d, cache := cacheOverABrokenStore(t)
+	stored := map[string]*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]{
+		"gone": {ID: beehive.ObjectID(cache.ID) + 1, Name: "gone", Spec: deploymentsSpec},
+	}
+
+	err := (&clusterCacheController{deps: d}).pruneKinds(context.Background(), nil, stored)
+
+	assert.ErrorContains(t, err, "drop cached kind")
+}
+
+// cacheOverABrokenStore stores a cluster and a cache, then closes the store under them —
+// so the records exist as Go values while every read and write through beehive fails.
+func cacheOverABrokenStore(t *testing.T) (deps, *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) {
+	t.Helper()
+	d, closeStore := newTestDepsWithABreakableStore(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	closeStore()
+	return d, cache
+}
+
+// The gauge binds to the store's change feed when one exists, so a write is a re-measure
+// rather than a wait for the next tick. It binds late, because the file opens when a
+// worker arms — after the gauge is already running.
+func TestCachesWatchStatsRemeasuresOnAWrite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	store := kubestoreFake(d)
+	writer, err := store.mgr.OpenOrCreate(int64(cache.ID))
+	require.NoError(t, err)
+	t.Cleanup(writer.Release)
+	store.setStats(kubestore.Stats{Exists: true, Bytes: 4096})
+
+	stream, err := serviceOver(t, d).Caches().WatchStats(ctx, ClusterID(cluster.ID), ClusterCacheID(cache.ID))
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the first measurement")
+
+	store.setStats(kubestore.Stats{Exists: true, Bytes: 8192})
+	require.NoError(t, writer.SyncKinds(ctx, nil, true, 7))
+
+	assert.Equal(t, int64(8192), testutil.Recv(t, stream.Frames, "the re-measurement").Bytes)
+}
+
+// A measurement that fails ends the gauge with its reason: a cache whose file cannot be
+// measured is not one of zero bytes, and rendering it as such would tell the user their
+// cache is empty.
+func TestCachesWatchStatsEndsOnAMeasurementItCannotTake(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	kubestoreFake(d).err = assert.AnError
+
+	stream, err := serviceOver(t, d).Caches().WatchStats(context.Background(),
+		ClusterID(cluster.ID), ClusterCacheID(cache.ID))
+
+	require.NoError(t, err)
+	testutil.WaitClosed(t, stream.Frames, "the gauge to end")
+	assert.ErrorContains(t, stream.Err(), "measure cache")
+}
+
+// The store closing under the gauge — a clear, a shutdown — re-binds rather than ending:
+// the cache is still the caller's, and the fresh file's pings come through a subscription
+// the old one never carried.
+func TestCachesWatchStatsRebindsWhenTheStoreClosesUnderIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	store := kubestoreFake(d)
+	writer, err := store.mgr.OpenOrCreate(int64(cache.ID))
+	require.NoError(t, err)
+	store.setStats(kubestore.Stats{Exists: true, Bytes: 4096})
+
+	stream, err := serviceOver(t, d).Caches().WatchStats(ctx, ClusterID(cluster.ID), ClusterCacheID(cache.ID))
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the first measurement")
+
+	// The clear's close, which ends every subscription on the old file.
+	store.setStats(kubestore.Stats{Exists: true, Bytes: 8192})
+	require.NoError(t, store.mgr.Clear(int64(cache.ID)))
+	t.Cleanup(writer.Release)
+
+	assert.Equal(t, int64(8192), testutil.Recv(t, stream.Frames, "the re-measurement after the rebind").Bytes)
+}
+
+// A record already marked for deletion is not one of the cache's kinds any more: counting
+// it would hold the cache at Connecting over a kind that is on its way out, and put a row
+// in the detail for something the user has stopped syncing.
+func TestTheSyncReadsSkipARecordAlreadyGoing(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	kind := createKind(t, d, cache.ID, deploymentsSpec)
+	require.NoError(t, d.kindClient.Delete(ctx, kind.ID))
+	a := cachesAPI{serviceOver(t, d)}
+
+	health, err := a.readCacheHealth(ctx, ClusterCacheID(cache.ID))
+	require.NoError(t, err)
+	status, err := a.readSyncStatus(ctx, ClusterCacheID(cache.ID))
+	require.NoError(t, err)
+
+	assert.Zero(t, health.TotalKinds)
+	assert.Empty(t, status.Kinds)
+}
+
+// Neither fold invents a verdict over records it could not read: a cache whose kinds will
+// not list is unknown, not healthy, and the gauge above says so instead of rendering green.
+func TestTheSyncReadsReportRecordsTheyCannotList(t *testing.T) {
+	ctx := context.Background()
+	d, cache := cacheOverABrokenStore(t)
+	a := cachesAPI{serviceOver(t, d)}
+
+	_, healthErr := a.readCacheHealth(ctx, ClusterCacheID(cache.ID))
+	_, statusErr := a.readSyncStatus(ctx, ClusterCacheID(cache.ID))
+
+	assert.ErrorContains(t, healthErr, "cached kinds")
+	assert.ErrorContains(t, statusErr, "cached kinds")
+}
+
+// The per-kind counts come off the cache's file: a cache with none has no counts, which is
+// a paused cache or one nothing has swept — while a file that will not read is a fault.
+func TestTheKindCountsAnswerAMissingFileAndReportABrokenOne(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	a := cachesAPI{serviceOver(t, d)}
+	store := kubestoreFake(d)
+
+	store.noFile = true
+	counts, err := a.readObjectCountsByKind(ctx, ClusterCacheID(cache.ID))
+	require.NoError(t, err)
+	assert.Empty(t, counts)
+
+	store.noFile = false
+	store.afterOpen = func(cacheID int64) { require.NoError(t, store.mgr.Remove(cacheID)) }
+	_, err = a.readObjectCountsByKind(ctx, ClusterCacheID(cache.ID))
+	assert.ErrorContains(t, err, "kinds")
+}
+
+// A clear that fails is reported: the file is still there, and answering with the record
+// would tell the user the cache had been emptied when it had not.
+func TestCacheClearReportsAStoreThatWillNotClear(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	kubestoreFake(d).err = assert.AnError
+
+	_, err := serviceOver(t, d).Caches().Clear(context.Background(), ClusterCacheID(cache.ID))
+
+	assert.ErrorContains(t, err, "clear cluster cache")
+}
+
+// The gauge sends only what moved: it re-reads on a cadence, and a cache whose verdict
+// sits still would otherwise put a frame on the wire every tick, for every cache, forever.
+func TestCachesWatchHealthSaysNothingWhileTheVerdictHoldsStill(t *testing.T) {
+	d, cacheID := syncingCacheWithKinds(t)
+	setKindReason(d, cacheID, podsSpec, kubesync.KindState{Reason: kubesync.ReasonWatching, LastLiveAt: probedAt})
+	setKindReason(d, cacheID, deploymentsSpec, kubesync.KindState{Reason: kubesync.ReasonWatching, LastLiveAt: probedAt})
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stream, err := svc.Caches().WatchHealth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, kubesync.ReasonWatching, testutil.Recv(t, stream.Frames, "the verdict").Reason)
+
+	testutil.NoRecv(t, stream.Frames, testutil.Timeout/50, "a repeat of a verdict that has not moved")
+}
+
+// The three gauges stop where they stand when the consumer goes: every send is checked,
+// so a dropped subscription ends the loop rather than parking it on a channel forever.
+// Each is driven until it is parked on a send — Frames buffers one, and nothing reads it —
+// so the cancellation is the only thing that can free it.
+func TestTheCacheGaugesStopForAConsumerThatIsGone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	d, cacheID := syncingCacheWithKinds(t)
+	clusterID := ownerClusterOf(t, d, cacheID)
+	// A second cache, so the health fold has more than one verdict to send.
+	createCache(t, d.cacheClient, clusterID, "uid-2")
+	setKindReason(d, cacheID, podsSpec, kubesync.KindState{Reason: kubesync.ReasonWatching, LastLiveAt: probedAt})
+	store := kubestoreFake(d)
+	sync := syncFake(d)
+	svc := serviceOver(t, d)
+	svc.gaugeCadence = time.Millisecond
+
+	health, err := svc.Caches().WatchHealth(ctx)
+	require.NoError(t, err)
+	status, err := svc.Caches().WatchSyncStatus(ctx, clusterID, cacheID)
+	require.NoError(t, err)
+	stats, err := svc.Caches().WatchStats(ctx, clusterID, cacheID)
+	require.NoError(t, err)
+
+	// The two per-cache gauges re-send only what moved, so each needs a reading that keeps
+	// moving to fill its buffer and then park on the next send.
+	go func() {
+		for i := int64(1); ctx.Err() == nil; i++ {
+			store.setStats(kubestore.Stats{Exists: true, Bytes: i})
+			sync.setDiscoveryState(int64(cacheID), kubesync.DiscoveryState{
+				Reason: kubesync.ReasonDiscovered, Message: strconv.FormatInt(i, 10),
+			})
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	require.Eventually(t, func() bool {
+		return len(health.Frames) == 1 && len(status.Frames) == 1 && len(stats.Frames) == 1
+	}, 5*time.Second, time.Millisecond, "each gauge to park on a send")
+
+	cancel()
+
+	testutil.WaitClosed(t, health.Frames, "the health gauge to stop")
+	testutil.WaitClosed(t, status.Frames, "the sync-status gauge to stop")
+	testutil.WaitClosed(t, stats.Frames, "the stats gauge to stop")
+}
+
+// ownerClusterOf is the cluster a cache hangs off, which the per-cache gauges are scoped by.
+func ownerClusterOf(t *testing.T, d deps, cacheID ClusterCacheID) ClusterID {
+	t.Helper()
+	owner, ok, err := d.cacheClient.GetOwner(context.Background(), beehive.ObjectID(cacheID))
+	require.NoError(t, err)
+	require.True(t, ok)
+	return ClusterID(owner.ID)
+}
+
+// Neither the fold nor the detail read invents an answer over a store it cannot reach: a
+// cache whose records or file will not read is unknown, not healthy and not empty.
+func TestTheCacheFoldsReportWhatTheyCannotRead(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("the fold's cluster lookup", func(t *testing.T) {
+		d, closeStore := newTestDepsWithABreakableStore(t)
+		cluster := createCluster(t, d.clusterClient, "prod")
+		cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+		// Owner-loaded, so the lookup gets past the edge and fails on the cluster itself.
+		loaded, err := d.cacheClient.Get(ctx, cache.ID, beehive.LoadOwner())
+		require.NoError(t, err)
+		closeStore()
+
+		_, err = cachesAPI{serviceOver(t, d)}.clusterFor(ctx, loaded,
+			map[beehive.ObjectID]*beehive.Object[ClusterSpec, ClusterStatus]{})
+
+		assert.ErrorContains(t, err, "read cluster 1")
+	})
+
+	t.Run("the fold's cache list", func(t *testing.T) {
+		d, _ := cacheOverABrokenStore(t)
+		_, err := cachesAPI{serviceOver(t, d)}.readAllCacheHealth(ctx)
+		assert.Error(t, err)
+	})
+
+	t.Run("the detail's kind counts", func(t *testing.T) {
+		d := newTestDeps(t)
+		cluster := createCluster(t, d.clusterClient, "prod")
+		cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+		kubestoreFake(d).err = assert.AnError
+		_, err := cachesAPI{serviceOver(t, d)}.readSyncStatus(ctx, ClusterCacheID(cache.ID))
+		assert.ErrorContains(t, err, "open cluster cache")
+	})
+}
+
+// The fold orders by cache id, so a fleet's verdicts hold still between ticks rather than
+// reshuffling on whatever order the store returned.
+func TestTheHealthFoldOrdersByCacheID(t *testing.T) {
+	ctx := context.Background()
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	first := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	second := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-2")
+
+	healths, err := cachesAPI{serviceOver(t, d)}.readAllCacheHealth(ctx)
+
+	require.NoError(t, err)
+	require.Len(t, healths, 2)
+	assert.Equal(t, ClusterCacheID(first.ID), healths[0].CacheID)
+	assert.Equal(t, ClusterCacheID(second.ID), healths[1].CacheID)
+}
+
+// A cache whose cluster cannot be read cannot be armed: every switch the pass reads lives
+// there, and arming on a guess would sync against settings the user never chose.
+func TestArmingReportsAClusterItCannotRead(t *testing.T) {
+	d, cache := cacheOverABrokenStore(t)
+
+	c := &clusterCacheController{deps: d}
+	_, loadErr := c.loadCluster(context.Background(), cache)
+	armErr := c.armSync(context.Background(), &cacheControllerClient{}, cache)
+
+	assert.ErrorContains(t, loadErr, "owner")
+	assert.ErrorContains(t, armErr, "owner")
+}
+
+// A whole read that carries one record it cannot project fails rather than serving the
+// rest: a list silently short by one is a cache missing from the UI with nothing to say so.
+func TestProjectingCachesReportsARecordItCannotRead(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	unloaded, err := d.cacheClient.Get(ctx, cache.ID)
+	require.NoError(t, err)
+
+	_, err = toClusterCaches([]*beehive.Object[ClusterCacheSpec, ClusterCacheStatus]{unloaded})
+
+	assert.Error(t, err)
 }

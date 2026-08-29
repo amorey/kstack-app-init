@@ -17,6 +17,7 @@ package kubestore
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -646,6 +647,15 @@ func TestAStoreWhoseFileIsGoneAnswersErrClosed(t *testing.T) {
 	assert.ErrorIs(t, err, ErrClosed)
 	_, err = store.Subscribe()
 	assert.ErrorIs(t, err, ErrClosed)
+	assert.ErrorIs(t, store.SyncKinds(ctx, nil, true, 1), ErrClosed)
+	_, err = store.Kinds(ctx)
+	assert.ErrorIs(t, err, ErrClosed)
+	_, err = store.Events(ctx)
+	assert.ErrorIs(t, err, ErrClosed)
+	_, err = store.Objects(ctx, "v1", "pods")
+	assert.ErrorIs(t, err, ErrClosed)
+	_, _, err = store.ObjectBody(ctx, "uid-1")
+	assert.ErrorIs(t, err, ErrClosed)
 }
 
 // The first page invalidates the position even when it carries nothing. A cookie means
@@ -809,4 +819,437 @@ func openFileOf(t *testing.T, s *Store) *file {
 	f, err := s.file()
 	require.NoError(t, err)
 	return f
+}
+
+// breakStorage closes the pools under an open claim, so every statement the store issues
+// fails while the claim itself stays valid. It is what stands in for the storage faults —
+// a file that goes unreadable under a running cache — that no test can produce on demand.
+func breakStorage(t *testing.T, s *Store) {
+	t.Helper()
+	f := openFileOf(t, s)
+	require.NoError(t, f.db.Close())
+	require.NoError(t, f.readDB.Close())
+}
+
+// Every operation reports a storage fault rather than answering as though the cache were
+// empty. The distinction is load-bearing above: an empty answer is a cluster that serves
+// nothing, and a watch that took one for a broken file would blank a populated table.
+func TestEveryOperationReportsAStorageFault(t *testing.T) {
+	ops := map[string]func(context.Context, *Store) error{
+		"Cookie": func(ctx context.Context, s *Store) error {
+			_, _, err := s.Cookie(ctx, "v1", "pods")
+			return err
+		},
+		"SetCookie": func(ctx context.Context, s *Store) error {
+			return s.SetCookie(ctx, "v1", "pods", "9")
+		},
+		"ApplyChange": func(ctx context.Context, s *Store) error {
+			return s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "1"))
+		},
+		"ApplyChangeDeleted": func(ctx context.Context, s *Store) error {
+			return s.ApplyChange(ctx, podKind, watch.Deleted, pod("uid-1", "api-0", "1"))
+		},
+		"CountKind": func(ctx context.Context, s *Store) error {
+			_, err := s.CountKind(ctx, podKind)
+			return err
+		},
+		"Counts": func(ctx context.Context, s *Store) error {
+			_, err := s.Counts(ctx)
+			return err
+		},
+		"ClearKind": func(ctx context.Context, s *Store) error {
+			return s.ClearKind(ctx, podKind)
+		},
+		"ClearKindEvents": func(ctx context.Context, s *Store) error {
+			return s.ClearKind(ctx, eventsKind)
+		},
+		"Kinds": func(ctx context.Context, s *Store) error {
+			_, err := s.Kinds(ctx)
+			return err
+		},
+		"Events": func(ctx context.Context, s *Store) error {
+			_, err := s.Events(ctx)
+			return err
+		},
+		"Objects": func(ctx context.Context, s *Store) error {
+			_, err := s.Objects(ctx, "v1", "pods")
+			return err
+		},
+		"ObjectBody": func(ctx context.Context, s *Store) error {
+			_, _, err := s.ObjectBody(ctx, "uid-1")
+			return err
+		},
+		"SyncKinds": func(ctx context.Context, s *Store) error {
+			return s.SyncKinds(ctx, []KindRow{{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: "Namespaced"}}, true, 1)
+		},
+		"WritePage": func(ctx context.Context, s *Store) error {
+			r, err := s.BeginReplace(podKind)
+			require.NoError(t, err)
+			return r.WritePage(ctx, []*unstructured.Unstructured{pod("uid-1", "api-0", "1")})
+		},
+		"WritePageEvents": func(ctx context.Context, s *Store) error {
+			r, err := s.BeginReplace(eventsKind)
+			require.NoError(t, err)
+			return r.WritePage(ctx, []*unstructured.Unstructured{event("ev-1", "2026-08-01T00:00:00Z")})
+		},
+		"Commit": func(ctx context.Context, s *Store) error {
+			r, err := s.BeginReplace(podKind)
+			require.NoError(t, err)
+			_, err = r.Commit(ctx, "9")
+			return err
+		},
+		"CommitEvents": func(ctx context.Context, s *Store) error {
+			r, err := s.BeginReplace(eventsKind)
+			require.NoError(t, err)
+			_, err = r.Commit(ctx, "9")
+			return err
+		},
+	}
+
+	for name, op := range ops {
+		t.Run(name, func(t *testing.T) {
+			s := newTestStore(t)
+			breakStorage(t, s)
+
+			assert.Error(t, op(context.Background(), s))
+		})
+	}
+}
+
+// failWrites makes one table reject one kind of statement, so a fault can be placed at a
+// chosen step of a multi-statement transaction. A prepared statement is re-prepared
+// against the live schema, so this reaches the statements already compiled at open.
+func failWrites(t *testing.T, s *Store, table, op string) {
+	t.Helper()
+	_, err := db(t, s).ExecContext(context.Background(), fmt.Sprintf(
+		`CREATE TRIGGER fail_%[1]s_%[2]s BEFORE %[2]s ON %[1]s
+		 BEGIN SELECT RAISE(ABORT, 'injected'); END`, table, op))
+	require.NoError(t, err)
+}
+
+// An object write touches five tables and a cookie. A failure at any one of them aborts
+// the whole write — the row, its edges, its timeline and the position that would replay
+// it go together or not at all, which is what stops a restart resuming from a position
+// the rows do not back.
+//
+// The object is seeded first because the edge tables are cleared before they are
+// rewritten, and a BEFORE DELETE trigger fires per row: an object with no edges yet would
+// walk straight past the fault.
+func TestAnObjectWriteIsAllOrNothing(t *testing.T) {
+	steps := []struct{ table, op string }{
+		{"status_history", "INSERT"},
+		{"objects", "INSERT"},
+		{"owner_refs", "DELETE"},
+		{"owner_refs", "INSERT"},
+		{"labels", "DELETE"},
+		{"labels", "INSERT"},
+		{"cluster_meta", "INSERT"},
+	}
+
+	for _, step := range steps {
+		t.Run(step.table+" "+step.op, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			seeded := podOwnedBy("uid-1", "api-0", "1", "owner-1")
+			require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, seeded))
+			require.NoError(t, s.SetCookie(ctx, podKind.APIVersion, podKind.Resource, "1"))
+
+			// A changed summary, so the second write reaches the timeline too.
+			next := podOwnedBy("uid-1", "api-0", "2", "owner-2")
+			require.NoError(t, unstructured.SetNestedField(next.Object, "Pending", "status", "phase"))
+			next.SetLabels(map[string]string{"app": "web"})
+			failWrites(t, s, step.table, step.op)
+
+			require.Error(t, s.ApplyChange(ctx, podKind, watch.Modified, next))
+
+			assert.Equal(t, 1, countRows(t, s,
+				`SELECT COUNT(*) FROM objects WHERE resource_version = '1'`))
+			assert.Equal(t, 1, countRows(t, s,
+				`SELECT COUNT(*) FROM labels WHERE uid = 'uid-1' AND value = 'api'`))
+			assert.Equal(t, 1, countRows(t, s,
+				`SELECT COUNT(*) FROM owner_refs WHERE owner_uid = 'owner-1'`))
+			rv, _, err := s.Cookie(ctx, podKind.APIVersion, podKind.Resource)
+			require.NoError(t, err)
+			assert.Equal(t, "1", rv, "the position must not advance over a write that failed")
+		})
+	}
+}
+
+// An event write is the same bargain on its own table.
+func TestAnEventWriteIsAllOrNothing(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	failWrites(t, s, "events", "INSERT")
+
+	require.Error(t, s.ApplyChange(ctx, eventsKind, watch.Added, event("ev-1", "2026-08-01T00:00:00Z")))
+
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM events`))
+}
+
+// A delete walks the side tables before the row itself; a failure part-way must not leave
+// the object half-removed, with edges pointing at a uid that is gone.
+func TestADeleteIsAllOrNothing(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	u := podOwnedBy("uid-1", "api-0", "1", "owner-1")
+	u.SetLabels(map[string]string{"app": "api"})
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, u))
+	failWrites(t, s, "labels", "DELETE")
+
+	require.Error(t, s.ApplyChange(ctx, podKind, watch.Deleted, u))
+
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM objects`))
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM labels`))
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM owner_refs`))
+}
+
+// A core Event is deleted from its own table, not from objects — the two are separate
+// tables, and a delta that removed the wrong one would leave the event cached forever.
+func TestApplyChangeDeletedRemovesACoreEventFromTheEventsTable(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	ev := event("ev-1", "2026-08-01T00:00:00Z")
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, ev))
+
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Deleted, ev))
+
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM events`))
+}
+
+// A delete names its object by uid alone, so a body carrying none says nothing about what
+// to remove. Reported rather than skipped: the row it meant to take stays behind.
+func TestApplyChangeDeletedRefusesABodyWithNoUID(t *testing.T) {
+	u := pod("", "api-0", "1")
+
+	err := newTestStore(t).ApplyChange(context.Background(), podKind, watch.Deleted, u)
+
+	assert.ErrorContains(t, err, "empty UID")
+}
+
+// A nil body would panic on the projection, taking the worker's goroutine with it.
+func TestApplyChangeRefusesAnEmptyBody(t *testing.T) {
+	err := newTestStore(t).ApplyChange(context.Background(), podKind, watch.Added, nil)
+
+	assert.ErrorContains(t, err, "empty object")
+}
+
+// Bookmark and Error carry no row. Neither is a failure — the watch loop hands every
+// event through, and only the three that name an object mean a write.
+func TestApplyChangeIgnoresAnEventThatCarriesNoRow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Bookmark, pod("uid-1", "api-0", "1")))
+
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM objects`))
+}
+
+// A relist page is one transaction: a failure part-way leaves the collection as the
+// previous pass left it, so a half-written page is never what a reader sees.
+func TestARelistPageIsAllOrNothing(t *testing.T) {
+	steps := []struct {
+		table, op string
+		kind      Kind
+		item      *unstructured.Unstructured
+	}{
+		{"cluster_meta", "DELETE", podKind, pod("uid-2", "api-1", "1")},
+		{"objects", "INSERT", podKind, pod("uid-2", "api-1", "1")},
+		{"events", "INSERT", eventsKind, event("ev-2", "2026-08-01T00:00:00Z")},
+	}
+
+	for _, step := range steps {
+		t.Run(step.table+" "+step.op, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			// A cookie to clear, so the first page's DELETE has a row to fire on.
+			require.NoError(t, s.SetCookie(ctx, step.kind.APIVersion, step.kind.Resource, "1"))
+			failWrites(t, s, step.table, step.op)
+			r := beginReplace(t, s, step.kind)
+
+			require.Error(t, r.WritePage(ctx, []*unstructured.Unstructured{step.item}))
+
+			assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM objects`))
+			assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM events`))
+			rv, _, err := s.Cookie(ctx, step.kind.APIVersion, step.kind.Resource)
+			require.NoError(t, err)
+			assert.Equal(t, "1", rv, "a failed first page must leave the cookie standing")
+		})
+	}
+}
+
+// The first page clears the cookie even carrying nothing, so a pass that then fails
+// cannot be resumed from a position its rows no longer back. Later empty pages have
+// nothing left to do.
+func TestAnEmptyFirstPageClearsTheCookieAndLaterOnesDoNothing(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.SetCookie(ctx, podKind.APIVersion, podKind.Resource, "1"))
+	r := beginReplace(t, s, podKind)
+
+	require.NoError(t, r.WritePage(ctx, nil))
+	_, ok, err := s.Cookie(ctx, podKind.APIVersion, podKind.Resource)
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	// The second empty page returns before opening a transaction at all — which is what
+	// this fault would otherwise abort.
+	failWrites(t, s, "cluster_meta", "DELETE")
+	assert.NoError(t, r.WritePage(ctx, nil))
+}
+
+// A relist's prune and the position it hands on are one transaction: a prune that fails
+// must not leave the cookie claiming the collection is settled.
+func TestARelistCommitIsAllOrNothing(t *testing.T) {
+	steps := []struct {
+		table, op string
+		kind      Kind
+		item      *unstructured.Unstructured
+		// rows is where the collection's own rows live, and must still hold them.
+		rows string
+	}{
+		{"objects", "DELETE", podKind, pod("uid-1", "api-0", "1"), "objects"},
+		{"labels", "DELETE", podKind, pod("uid-1", "api-0", "1"), "objects"},
+		{"events", "DELETE", eventsKind, event("ev-1", "2026-08-01T00:00:00Z"), "events"},
+		{"cluster_meta", "INSERT", podKind, pod("uid-1", "api-0", "1"), "objects"},
+	}
+
+	for _, step := range steps {
+		t.Run(step.table+" "+step.op, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			// Seeded by an earlier pass, so the sweep has a row to take.
+			require.NoError(t, s.ApplyChange(ctx, step.kind, watch.Added, step.item))
+			before, _, err := s.Cookie(ctx, step.kind.APIVersion, step.kind.Resource)
+			require.NoError(t, err)
+			failWrites(t, s, step.table, step.op)
+			r := beginReplace(t, s, step.kind)
+
+			_, err = r.Commit(ctx, "9")
+
+			require.Error(t, err)
+			after, _, err := s.Cookie(ctx, step.kind.APIVersion, step.kind.Resource)
+			require.NoError(t, err)
+			assert.Equal(t, before, after, "a failed prune must not hand on a position")
+			assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM `+step.rows))
+		})
+	}
+}
+
+// Clearing a kind takes its rows, its tally and its cookie together — a partial clear
+// would leave a tally over rows that are gone, or a cookie resuming a kind with none.
+func TestClearKindIsAllOrNothing(t *testing.T) {
+	steps := []struct {
+		table, op string
+		kind      Kind
+		item      *unstructured.Unstructured
+	}{
+		{"labels", "DELETE", podKind, pod("uid-1", "api-0", "1")},
+		{"kind_counts", "DELETE", podKind, pod("uid-1", "api-0", "1")},
+		{"cluster_meta", "DELETE", podKind, pod("uid-1", "api-0", "1")},
+		{"events", "DELETE", eventsKind, event("ev-1", "2026-08-01T00:00:00Z")},
+	}
+
+	for _, step := range steps {
+		t.Run(step.table+" "+step.op, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			require.NoError(t, s.ApplyChange(ctx, step.kind, watch.Added, step.item))
+			require.NoError(t, s.SetCookie(ctx, step.kind.APIVersion, step.kind.Resource, "1"))
+			failWrites(t, s, step.table, step.op)
+
+			require.Error(t, s.ClearKind(ctx, step.kind))
+
+			n, err := s.CountKind(ctx, step.kind)
+			require.NoError(t, err)
+			assert.Equal(t, 1, n)
+			rv, _, err := s.Cookie(ctx, step.kind.APIVersion, step.kind.Resource)
+			require.NoError(t, err)
+			assert.Equal(t, "1", rv)
+		})
+	}
+}
+
+// The catalog is written in one transaction with the fingerprint that names the sweep:
+// rows a reader can see under a fingerprint the sweep did not write would pass the
+// freshness check while carrying someone else's answer.
+func TestSyncKindsIsAllOrNothing(t *testing.T) {
+	rows := []KindRow{{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: "Namespaced"}}
+	steps := []struct{ table, op string }{
+		{"kind_catalog", "DELETE"},
+		{"kind_catalog", "INSERT"},
+		{"cluster_meta", "INSERT"},
+	}
+
+	for _, step := range steps {
+		t.Run(step.table+" "+step.op, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			// A row for the rename-resolving DELETE to fire on.
+			require.NoError(t, s.SyncKinds(ctx, []KindRow{
+				{APIVersion: "v1", Kind: "Stale", Resource: "pods", Scope: "Namespaced"},
+			}, true, 1))
+			failWrites(t, s, step.table, step.op)
+
+			require.Error(t, s.SyncKinds(ctx, rows, true, 2))
+
+			got, fingerprint, ok, err := s.KindsWithFingerprint(ctx)
+			require.NoError(t, err)
+			require.True(t, ok)
+			assert.Equal(t, uint64(1), fingerprint)
+			require.Len(t, got, 1)
+			assert.Equal(t, "Stale", got[0].Kind)
+		})
+	}
+}
+
+// A sweep that carried nothing empties the catalog: the cluster serves no kinds this
+// cache can reach, which is different from a partial answer that prunes nothing.
+func TestSyncKindsWithNoRowsEmptiesTheCatalog(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{
+		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: "Namespaced"},
+	}, true, 1))
+
+	require.NoError(t, s.SyncKinds(ctx, nil, true, 2))
+
+	got, err := s.Kinds(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+// A relist page skips a body it cannot project rather than failing the page: one
+// malformed object must not stop a collection from syncing, and the next pass gets
+// another chance at it.
+func TestARelistPageSkipsABodyItCannotProject(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	bad := obj(map[string]any{"apiVersion": "v1", "kind": "Event", "metadata": map[string]any{}})
+	r := beginReplace(t, s, eventsKind)
+
+	require.NoError(t, r.WritePage(ctx, []*unstructured.Unstructured{
+		bad, event("ev-1", "2026-08-01T00:00:00Z"),
+	}))
+
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM events`))
+}
+
+// A watch delta whose event will not project is skipped the same way, and the position
+// still advances: a body the server will replay from that position forever is worse than
+// one missing event.
+func TestApplyChangeSkipsAnEventItCannotProject(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	bad := obj(map[string]any{
+		"apiVersion": "v1", "kind": "Event",
+		"metadata": map[string]any{"resourceVersion": "7"},
+	})
+
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, bad))
+
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM events`))
+	rv, ok, err := s.Cookie(ctx, eventsKind.APIVersion, eventsKind.Resource)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "7", rv)
 }

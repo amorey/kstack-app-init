@@ -17,6 +17,7 @@ package kubestore
 import (
 	"bytes"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -57,6 +58,43 @@ func TestCodecsAreReusable(t *testing.T) {
 
 func TestDecompressRejectsGarbage(t *testing.T) {
 	_, err := decompressRaw([]byte("not zlib"))
+
+	assert.Error(t, err)
+}
+
+// A stored body that is not a zlib stream after all is reported, not returned as itself:
+// the format is self-identifying by its first byte, so anything that gets here claiming
+// to be compressed and is not is a corrupt row.
+func TestDecompressRejectsAStreamThatIsNotZlib(t *testing.T) {
+	// A zlib header the inflater accepts, then rubbish — so the failure lands in the read
+	// rather than at the header check.
+	_, err := decompressRaw([]byte{0x78, 0x01, 0xff, 0xff, 0xff})
+
+	assert.Error(t, err)
+}
+
+// The pooled reader is per-goroutine luck: a fresh one takes the NewReader path and a
+// reused one takes Reset, and both must reject the same bad stream. Running the good case
+// first is what puts a reader in the pool for the second.
+func TestDecompressRejectsABadStreamOnAPooledReaderToo(t *testing.T) {
+	good, err := compressRaw([]byte(`{"a":1}`))
+	require.NoError(t, err)
+	round, err := decompressRaw(good)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"a":1}`, string(round))
+
+	_, err = decompressRaw([]byte("not a stream at all"))
+
+	assert.Error(t, err)
+}
+
+// The very first decompress in a process has no pooled reader and builds one, which reads
+// the stream's header as it goes. A file whose stored body is not a zlib stream at all
+// must be rejected there too, not only on the pooled path.
+func TestDecompressRejectsABadStreamWithNoPooledReader(t *testing.T) {
+	zlibReaders = sync.Pool{}
+
+	_, err := decompressRaw([]byte("not a stream at all"))
 
 	assert.Error(t, err)
 }

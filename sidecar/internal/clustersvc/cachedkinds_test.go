@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -340,11 +341,14 @@ func TestCachedKindsWatchByCacheReportsKindsThatArriveLater(t *testing.T) {
 type kindControllerClient struct {
 	beehive.ControllerClient[ClusterCachedKindStatus]
 	events []beehive.EventSpec
+	// eventErr fails the one write a pass makes through this client, which is the only
+	// way to reach what a pass does when its verdict will not land.
+	eventErr error
 }
 
 func (c *kindControllerClient) AddEvent(_ context.Context, event beehive.EventSpec) error {
 	c.events = append(c.events, event)
-	return nil
+	return c.eventErr
 }
 
 // reconcileKind runs one kind pass the way beehive would.
@@ -571,4 +575,196 @@ func TestCachedKindsClearRunsInsideTheSyncsHold(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, heldAtClear, "the kind's worker is stopped before its rows go")
+}
+
+// The record's name is the only place the cache id survives a teardown, so reading it back
+// has to refuse anything that is not one — a name the parser guessed at would send a clear
+// at whatever cache that number named.
+func TestCacheIDInKindNameRefusesANameThatIsNotOne(t *testing.T) {
+	for _, name := range []string{
+		"cluster/1/v1/pods", // another kind's name entirely
+		"cachedkind/1",      // the prefix, but nothing after the id
+		"cachedkind/x/v1/pods",
+	} {
+		_, ok := cacheIDInKindName(name)
+
+		assert.False(t, ok, name)
+	}
+}
+
+// The name a record is created under is what the parser reads back.
+func TestCacheIDInKindNameReadsWhatTheNameCarries(t *testing.T) {
+	id, ok := cacheIDInKindName(ClusterCachedKindName(7, "apps/v1", "deployments"))
+
+	require.True(t, ok)
+	assert.Equal(t, int64(7), id)
+}
+
+// A record collected between a client reading its id off a watch frame and acting on it
+// is an ordinary race, not a bad request — the clear has nothing to do.
+func TestCachedKindsClearOfAnUnknownIdIsNotAnError(t *testing.T) {
+	d := newTestDeps(t)
+
+	got, err := serviceOver(t, d).CachedKinds().Clear(context.Background(), 404)
+
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+// A kind whose cache has gone has no rows left to clear: the file went with the cache, and
+// opening one would create the very file the clear is trying to be rid of.
+func TestCachedKindsClearOfAKindWhoseCacheIsGoneJustReturnsIt(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	obj := createKind(t, d, cache.ID, deploymentsSpec)
+	require.NoError(t, d.cacheClient.Delete(ctx, cache.ID))
+
+	got, err := serviceOver(t, d).CachedKinds().Clear(ctx, ClusterCachedKindID(obj.ID))
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, ClusterCachedKindID(obj.ID), got.ID)
+}
+
+// A clear that cannot reach the cache's file is reported: answering as though the rows
+// went would leave the user looking at a kind they just cleared, still full.
+func TestCachedKindsClearReportsAStoreItCannotReach(t *testing.T) {
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	obj := createKind(t, d, cache.ID, deploymentsSpec)
+	d.kubestoreMgr.(*fakeKubestore).err = assert.AnError
+
+	_, err := serviceOver(t, d).CachedKinds().Clear(context.Background(), ClusterCachedKindID(obj.ID))
+
+	assert.ErrorContains(t, err, "clear cached kind")
+}
+
+// The switch is per record, so a record that is gone is the boundary's own not-found
+// rather than beehive's — the resolver above maps one and not the other.
+func TestCachedKindsSetSyncEnabledOnAnUnknownIdIsNotFound(t *testing.T) {
+	d := newTestDeps(t)
+
+	_, err := serviceOver(t, d).CachedKinds().SetSyncEnabled(context.Background(), 404, false)
+
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// A pass that cannot write its verdict fails rather than settling: a settled generation
+// beehive does not come back to would leave the kind's timeline permanently short of the
+// transition, with nothing to say why.
+func TestKindPassFailsWhenItsVerdictWillNotLand(t *testing.T) {
+	for _, paused := range []bool{false, true} {
+		t.Run("paused="+strconv.FormatBool(paused), func(t *testing.T) {
+			d, cacheID, kind := oneCachedKind(t)
+			d.kubesyncSvc.(*fakeKubesync).setKindState(int64(cacheID), toKubestoreKind(kind.Spec),
+				kubesync.KindState{Reason: kubesync.ReasonWatching})
+			kind.Spec.Paused = paused
+
+			res := (&clusterCachedKindController{deps: d}).Reconcile(
+				context.Background(), &kindControllerClient{eventErr: assert.AnError}, kind)
+
+			assert.NotEqual(t, beehive.Settled(), res)
+		})
+	}
+}
+
+// A dying kind's rows go with it, and a store that will not give them up fails the pass —
+// settling would leave rows for a kind no record names, which nothing would ever collect.
+func TestKindTeardownFailsWhenTheRowsWillNotClear(t *testing.T) {
+	ctx := context.Background()
+	d, _, kind := oneCachedKind(t)
+	require.NoError(t, d.kindClient.Delete(ctx, kind.ID))
+	dying, err := d.kindClient.Get(ctx, kind.ID, beehive.LoadOwner())
+	require.NoError(t, err)
+	d.kubestoreMgr.(*fakeKubestore).err = assert.AnError
+
+	res := (&clusterCachedKindController{deps: d}).Reconcile(ctx, &kindControllerClient{}, dying)
+
+	assert.NotEqual(t, beehive.Settled(), res)
+}
+
+// An owner edge that was never loaded is a programming error, not an unowned record:
+// projecting one as owner-less would put a record on the wire with no join key, and the
+// client would render it under no cache at all.
+func TestProjectingAKindWhoseOwnerWasNotLoadedIsReported(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	obj := createKind(t, d, cache.ID, deploymentsSpec)
+	unloaded, err := d.kindClient.Get(ctx, obj.ID)
+	require.NoError(t, err)
+
+	_, oneErr := toClusterCachedKind(unloaded)
+	_, manyErr := toClusterCachedKinds([]*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]{unloaded})
+	_, frameErr := kindWatch.frame(DeltaFrameAdded, unloaded)
+	_, _, refErr := cachedKindsAPI{serviceOver(t, d)}.cacheIDForKind(unloaded)
+
+	assert.Error(t, oneErr)
+	assert.Error(t, manyErr)
+	assert.Error(t, frameErr)
+	assert.ErrorContains(t, refErr, "owner")
+}
+
+// A departure carries what the row said before it went, so a client can render the row it
+// is dropping — and a change that carries no object still yields a frame with the id,
+// which is what the drop is keyed by.
+func TestADepartedKindFrameCarriesTheSpecWhenTheChangeHasOne(t *testing.T) {
+	withObject := kindWatch.departed(beehive.ObjectChange[ClusterCachedKindSpec, ClusterCachedKindStatus]{
+		ID:     7,
+		Object: &beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]{Spec: deploymentsSpec},
+	})
+	withNone := kindWatch.departed(beehive.ObjectChange[ClusterCachedKindSpec, ClusterCachedKindStatus]{ID: 7})
+
+	assert.Equal(t, deploymentsSpec, withObject.Kind.Spec)
+	assert.Equal(t, ClusterCachedKindID(7), withNone.Kind.ID)
+	assert.Zero(t, withNone.Kind.Spec)
+}
+
+// A kind with no cache above it has no rows anywhere: the record is served back
+// unchanged rather than the clear reaching for a file that was never named.
+func TestCachedKindsClearOfAKindWithNoOwnerJustReturnsIt(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	obj, _, err := d.kindClient.CreateOrUpdate(ctx, "orphan-kind", deploymentsSpec)
+	require.NoError(t, err)
+
+	got, err := serviceOver(t, d).CachedKinds().Clear(ctx, ClusterCachedKindID(obj.ID))
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, ClusterCachedKindID(obj.ID), got.ID)
+}
+
+// The record can be collected between the read and the write, so a write that lands on
+// one already going is reported rather than silently doing nothing.
+func TestCachedKindsSetSyncEnabledReportsARecordAlreadyGoing(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	obj := createKind(t, d, cache.ID, deploymentsSpec)
+	require.NoError(t, d.kindClient.Delete(ctx, obj.ID))
+
+	_, err := serviceOver(t, d).CachedKinds().SetSyncEnabled(ctx, ClusterCachedKindID(obj.ID), false)
+
+	assert.ErrorContains(t, err, "update cached kind")
+}
+
+// A pass that cannot read which cache it belongs to fails rather than settling: settling
+// would leave the kind unarmed, and beehive would not come back to it.
+func TestKindPassFailsWhenItsCacheCannotBeRead(t *testing.T) {
+	d, closeStore := newTestDepsWithABreakableStore(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	kind := createKind(t, d, cache.ID, deploymentsSpec)
+	closeStore()
+
+	res := (&clusterCachedKindController{deps: d}).Reconcile(
+		context.Background(), &kindControllerClient{}, kind)
+
+	assert.NotEqual(t, beehive.Settled(), res)
 }
