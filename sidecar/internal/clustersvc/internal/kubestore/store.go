@@ -59,6 +59,14 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+// execQuerier is both halves, for a helper whose write reads its own rows back:
+// RETURNING comes out of QueryContext. Kept separate from execer so the write helpers
+// that need only ExecContext are not handed a method they must not use.
+type execQuerier interface {
+	execer
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // querier is the same subset for a point read, so one can be served out of a read
 // transaction whose other query it must agree with.
 type querier interface {
@@ -602,7 +610,7 @@ func (r *ReplaceSession) Commit(ctx context.Context, resourceVersion string) (in
 		}
 		pruned = int(n)
 	} else {
-		if pruned, err = sweepObjects(ctx, tx, r.kind, `updated_at < ?`, r.mark); err != nil {
+		if pruned, err = sweepObjects(ctx, tx, r.kind, r.mark); err != nil {
 			return 0, fmt.Errorf("commit relist: prune: %w", err)
 		}
 	}

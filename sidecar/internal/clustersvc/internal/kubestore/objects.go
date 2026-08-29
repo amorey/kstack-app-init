@@ -287,32 +287,48 @@ func deleteObjectRow(ctx context.Context, ex execer, uid string) error {
 	return err
 }
 
-// sweepObjects deletes one kind's objects matching an extra predicate plus their edges,
-// in a fixed number of statements: the edges go through a subquery on the same
-// predicate, so nothing is read back into Go (a 20k-object relist would otherwise issue
-// 60k statements while holding the cache's single writer).
-func sweepObjects(ctx context.Context, ex execer, k Kind, extraWhere string, extraArgs ...any) (int, error) {
-	where := `api_version=? AND kind=?`
-	if extraWhere != "" {
-		where += ` AND ` + extraWhere
+// sweepObjects is the relist prune: it deletes one kind's objects left behind by the
+// mark, plus their edges, and returns how many objects went.
+//
+// The objects delete goes first and names the uids it took, so the predicate is evaluated
+// once rather than once per side table. Safe in that order because nothing references
+// objects — the side tables are uid-keyed with no foreign key — and the caller's
+// transaction rolls the whole sweep back on any failure.
+func sweepObjects(ctx context.Context, tx execQuerier, k Kind, mark int64) (int, error) {
+	rows, err := tx.QueryContext(ctx,
+		`DELETE FROM objects WHERE api_version=? AND kind=? AND updated_at < ? RETURNING uid`,
+		k.APIVersion, k.Kind, mark)
+	if err != nil {
+		return 0, err
 	}
-	args := append([]any{k.APIVersion, k.Kind}, extraArgs...)
-	sub := `SELECT uid FROM objects WHERE ` + where
+	// Drained to the end, and Err checked: the delete runs whether or not its rows are
+	// read, so a short read yields a short uid list and orphans every side-table row of
+	// the objects it never saw — silently, since the delete itself succeeded.
+	uids := []string{}
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		uids = append(uids, uid)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return 0, err
+	}
+
+	uidsJSON, err := json.Marshal(uids)
+	if err != nil {
+		return 0, err
+	}
 	for _, c := range cascadeTables {
-		q := `DELETE FROM ` + c.table + ` WHERE ` + c.uidCol + ` IN (` + sub + `)`
-		if _, err := ex.ExecContext(ctx, q, args...); err != nil {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM `+c.table+` WHERE `+c.uidCol+` IN (SELECT value FROM json_each(?))`,
+			string(uidsJSON)); err != nil {
 			return 0, err
 		}
 	}
-	res, err := ex.ExecContext(ctx, `DELETE FROM objects WHERE `+where, args...)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	return int(n), nil
+	return len(uids), nil
 }
 
 // nullIfEmpty writes NULL for an empty string, so an absent reading reads as absence

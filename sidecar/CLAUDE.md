@@ -182,6 +182,13 @@ its write path:
   `WHERE true` is what stops SQLite parsing the `ON CONFLICT` as a join constraint; and the
   `len(…) > 0` guards are load-bearing, because a nil marshals to `null` and `json_each('null')`
   yields one all-NULL row. Floor is SQLite 3.38, for `->>`.
+- **The relist prune deletes `objects` first, with `RETURNING uid`,** and the four cascades take
+  those uids as one bound list — so the predicate is evaluated once, not once per side table.
+  Parent-first is safe because nothing references `objects`, and the whole sweep runs in the
+  caller's transaction. **The `RETURNING` cursor is drained to the end and its `Err()` checked**:
+  the delete runs whether or not its rows are read, so a short read orphans every side-table row
+  it never saw, with no error from anywhere. `ClearKind` keeps its own statements — it clears
+  `owner_refs` by `child_uid` only, deliberately, since an edge is what the *child* says.
 
 **One janitor per open file**, started in `openFile` and stopped in `(*file).close` — so its
 lifetime is the file's, and a `Clear`'s fresh file gets one like any other (`openFile` has two

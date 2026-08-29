@@ -19,7 +19,9 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -272,4 +274,50 @@ func TestInsertIssuesOneTextWhateverTheLabelCount(t *testing.T) {
 		map[string]any{"app": "api", "tier": "web", "env": "prod"}))
 
 	assert.Equal(t, one, three)
+}
+
+// recordingTx delegates to a real transaction and keeps the text it passed on. A fake
+// cannot stand in here: RETURNING is read back through *sql.Rows, which only
+// database/sql can hand out.
+type recordingTx struct {
+	tx    *sql.Tx
+	texts []string
+}
+
+func (r *recordingTx) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	r.texts = append(r.texts, q)
+	return r.tx.ExecContext(ctx, q, args...)
+}
+
+func (r *recordingTx) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	r.texts = append(r.texts, q)
+	return r.tx.QueryContext(ctx, q, args...)
+}
+
+// The cascades used to re-derive the set with the same subquery, so the predicate ran once
+// per side table and again for the objects delete — and every one of the five texts was
+// composed from the predicate and a table name, which no statement cache can hold.
+func TestSweepEvaluatesItsPredicateOnce(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	for _, uid := range []string{"gone-1", "gone-2"} {
+		require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod(uid, uid, "1")))
+	}
+	tx, err := db(t, s).BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer tx.Rollback() //nolint:errcheck // read back before commit, never committed
+
+	// A mark ahead of every stamp the fixture wrote, so the sweep matches both rows.
+	rec := &recordingTx{tx: tx}
+	n, err := sweepObjects(ctx, rec, podKind, time.Now().Add(time.Hour).UnixMilli())
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+
+	var readsObjects int
+	for _, q := range rec.texts {
+		if strings.Contains(q, "FROM objects") || strings.Contains(q, "DELETE FROM objects") {
+			readsObjects++
+		}
+	}
+	assert.Equal(t, 1, readsObjects, "one statement names objects; the cascades take the uids it returned")
 }

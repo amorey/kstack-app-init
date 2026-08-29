@@ -7,9 +7,9 @@ order: 6
 
 # Prepare each statement once, not once per call
 
-**Needs:** [spec 5](5-deletes-return-their-uids.md) for the last statement text that depends on
-its arguments; the edge-table inserts are already constant. The open contract it compiles against
-— a reader pool that refuses writes, and a pool that keeps the connections it opens — has landed.
+**Needs:** nothing. Everything it compiles against has landed: the open contract (a reader pool
+that refuses writes, a pool that keeps the connections it opens) and statement text that no
+longer depends on its arguments.
 **Hands on:** nothing. Last of the sequence because it is the largest, and because everything
 before it exists to make it possible.
 
@@ -76,9 +76,8 @@ issues the pool's own preparation when it is nil.
 
 **The helper and the pool are independent axes.** `exec`/`query`/`queryRow` say what shape the
 call has; `stmtWrites` says which pool it runs on. Reading `query` as "reads, therefore the reader"
-is the trap, and [spec 5](5-deletes-return-their-uids.md) creates the one statement that springs
-it: `DELETE … RETURNING uid` returns rows, so it goes through `query`, and it is unambiguously a
-write. Routed by the helper it would meet `query_only` at runtime. Helper signatures take `st stmts` where they
+is the trap, and the relist prune's `DELETE … RETURNING uid` springs it: it returns rows, so it
+goes through `query`, and it is unambiguously a write. Routed by the helper it would meet `query_only` at runtime. Helper signatures take `st stmts` where they
 take `ex execer` today; `execer` and `querier` stay for what is not converted.
 
 `stmts` does not record **which pool** its transaction came from, and both kinds exist — five

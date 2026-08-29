@@ -747,3 +747,57 @@ func TestSubscribeWithNoKeysTakesEveryKey(t *testing.T) {
 	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, event("uid-ev", "2026-08-26T10:00:00Z")))
 	assert.Equal(t, EventsKey, recvKey(t, sub))
 }
+
+// podOwnedBy is a Pod carrying one ownerReference, so the sweep has an edge to cascade.
+func podOwnedBy(uid, name, rv, ownerUID string) *unstructured.Unstructured {
+	return obj(map[string]any{
+		"apiVersion": "v1", "kind": "Pod",
+		"metadata": map[string]any{
+			"uid": uid, "name": name, "namespace": "prod", "resourceVersion": rv,
+			"labels":          map[string]any{"app": "api"},
+			"ownerReferences": []any{map[string]any{"uid": ownerUID, "kind": "ReplicaSet", "name": "rs"}},
+		},
+		"status": map[string]any{"phase": "Running"},
+	})
+}
+
+// The prune is the only path that removes an object without knowing its uid, so it is the
+// only one that can leave a side table behind. owner_refs is checked in both directions: a
+// swept object is a child of something and an owner of something, and its children outlive
+// it, so an inbound edge left behind points at a uid that is gone.
+func TestReplacePruneTakesEverySideTableRowWithIt(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	for _, uid := range []string{"gone-1", "gone-2", "gone-3"} {
+		require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, podOwnedBy(uid, uid, "1", "rs-1")))
+	}
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, podOwnedBy("kept", "kept", "1", "rs-1")))
+	// Another kind, so the Pod relist keeps it — and it owns gone-1, which is the inbound
+	// edge nothing else would clear.
+	deployments := Kind{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments"}
+	require.NoError(t, s.ApplyChange(ctx, deployments, watch.Added, obj(map[string]any{
+		"apiVersion": "apps/v1", "kind": "Deployment",
+		"metadata": map[string]any{
+			"uid": "dep-1", "name": "api", "resourceVersion": "1",
+			"ownerReferences": []any{map[string]any{"uid": "gone-1", "kind": "Pod", "name": "gone-1"}},
+		},
+	})))
+	require.Equal(t, 3, countRows(t, s,
+		`SELECT COUNT(*) FROM status_history WHERE uid IN ('gone-1', 'gone-2', 'gone-3')`),
+		"the fixture writes one per pod")
+
+	session := beginReplace(t, s, podKind)
+	require.NoError(t, session.WritePage(ctx, []*unstructured.Unstructured{podOwnedBy("kept", "kept", "9", "rs-1")}))
+	pruned, err := session.Commit(ctx, "100")
+	require.NoError(t, err)
+
+	require.Equal(t, 3, pruned)
+	const gone = `IN ('gone-1', 'gone-2', 'gone-3')`
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM labels WHERE uid `+gone))
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM owner_refs WHERE child_uid `+gone))
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM owner_refs WHERE owner_uid `+gone),
+		"the Deployment's edge into gone-1")
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM status_history WHERE uid `+gone))
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM labels WHERE uid='kept'`))
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM owner_refs WHERE child_uid='kept'`))
+}
