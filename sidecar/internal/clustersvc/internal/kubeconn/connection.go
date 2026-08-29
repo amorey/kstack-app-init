@@ -52,8 +52,8 @@ var ErrIdentityMismatch = errors.New("connection is not the requested cluster")
 // The tuning every connection carries. The credentials come from the user's file; the budget
 // and the name we dial under are this package's to set.
 const (
-	defaultQPS   float32 = 20
-	defaultBurst int     = 40
+	defaultQPS   float32 = 50
+	defaultBurst int     = 100
 	userAgent            = "kstack-app"
 	// discoveryTimeout bounds a whole discovery sweep, which is dozens of requests. It is a
 	// client timeout rather than a context deadline because client-go's discovery calls take

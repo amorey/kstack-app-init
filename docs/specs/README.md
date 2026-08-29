@@ -14,9 +14,9 @@ docs/specs/short-slug.md       one that stands alone
 ```
 
 No dates — a spec is edited as the work moves, not appended to. **The number is the build order**,
-so the directory listing is the plan; a spec that depends on nothing and blocks nothing goes
-without one. Renumber when the plan changes, and fix the links in the same edit — the numbers are
-load-bearing only as far as they agree with each spec's own header.
+so the directory listing is the plan; a spec with no place in a sequence goes without one.
+Renumber when the plan changes, and fix the links in the same edit — the numbers are load-bearing
+only as far as they agree with each spec's own header.
 
 ## Lifecycle
 
@@ -26,8 +26,19 @@ A spec left behind after the code ships is a second source of truth.
 
 ## Index
 
-Each spec is self-contained: read one and you can build it. Where an order is given, it is a real
-dependency, and each spec's header states what it needs and what it hands to the next.
+Each spec is self-contained: read one and you can build it. Each header states what it needs and
+what it hands on — a numbered spec that needs nothing is ordered by priority rather than by
+dependency, so it can be built out of turn at a cost you can read off its header.
+
+**Sequenced — the build order.** Specs 1–3 are the gaps between this branch and `main`'s cluster
+service; 4 is a cost repair on top. None depends on another; the order is what to do first.
+
+| Spec | Scope | Status |
+| --- | --- | --- |
+| [1 — Cluster events API](1-cluster-events-api.md) | sidecar | Planned |
+| [2 — Cache durability](2-cache-durability.md) | sidecar, frontend | Planned |
+| [3 — Per-kind sync pause](3-per-kind-sync-pause.md) | sidecar, frontend | Planned |
+| [4 — Object read split](4-object-read-split.md) | sidecar | Planned |
 
 **Independent.**
 

@@ -92,7 +92,7 @@ func defaultPacing() pacing {
 		staleAfter:           5 * time.Minute,
 		backoff:              supervisor.Backoff{Base: time.Second, Factor: 2, Cap: time.Minute},
 		pageSize:             500,
-		kindStartConcurrency: 8,
+		kindStartConcurrency: 16,
 	}
 }
 

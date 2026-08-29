@@ -2,9 +2,9 @@
 
 Pending work across the three parts of the app. Grouped by area; detailed items keep their acceptance notes inline.
 
-> **Nothing fills a cache** (see `sidecar/CLAUDE.md`): the seam between `ClusterCachedKind` and `kubestore` is being redesigned from scratch, and the leaves that carried it are gone. Every item describing them — discovery's request shape, the two leaves' shared arming contract, the relist's download cost — was deleted with them rather than kept as stale detail, on the same rule as the culled ADRs: git history holds them, and the rebuild records its own decisions as they land. Only work that still has code behind it is listed below.
+> **The specs are the plan.** Work with a settled shape lives in [`docs/specs/`](docs/specs/) and is not repeated here — the numbered sequence there covers the cluster events API, cache durability, per-kind sync pause, and the objects read split. This file holds what has no spec yet: watch items, simplifications, and work whose shape is still a question.
 
-## Sidecar — cluster rebuild
+## Sidecar — cluster service
 
 - **Map `clustersvc.ErrNotFound` to `errors.ErrRecordNotFound` in the resolvers.** The boundary reports a missing record with its own sentinel (`sidecar/internal/clustersvc/shared.go`) and `graph/errors` declares the wire error with its `KSTACK_RECORD_NOT_FOUND` code, but nothing joins them — no resolver references `graph/errors` at all yet. So `clusterEnabledSet` against a deleted id reaches the webview as the raw internal string rather than a coded error a client can branch on. Wire it as the mutation resolvers are filled in, and the same pass decides where the mapping lives (an error presenter, or per resolver). `clustersvc.ErrDeclaredBySource` needs the same treatment and a code of its own: `clusterDelete` refuses a record its source still declares, and a client cannot tell that refusal from a store failure without one.
 
@@ -13,7 +13,7 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - **Check before doing it:** stored Clusters predate the edge, so `GetOwner` reports no owner for them and they would never get the dependency — a non-issue under the pre-release policy (edit `0001_init.sql`, delete the dev `app.db`), but it is why the change is not purely mechanical. Also confirm `WithOwner` does not change Cluster lifecycle: owner edges cascade on delete, and nothing deletes an anchor today, so the risk is latent rather than live.
   - **Fix the stale comment either way:** the block's comment claims "every later pass is free", which is only true of the *wake*. The edge upsert still costs a transaction per pass.
 
-- **Neither `ClusterCache` nor `ClusterCachedKind` serves record metadata, so neither can carry a tombstone.** `Cluster` exposes `generation`/`createdAt`/`deletionRequestedAt`; both child kinds expose none of them, so a `Caches().Get` or a `clusterCachedKindsWatch` frame for a record mid-delete answers with nowhere to put the mark and no consumer can tell it is going. The boundary's "a read reports the store as it is, and never filters" rule therefore holds for `Cluster` and is unrepresentable for both children. The schema shape predates the rebuild; serving the two families is what turned it from dormant into a real gap. **Fix:** falls out of the `recordMeta` extraction below — do it there rather than adding three fields by hand, twice.
+- **Neither `ClusterCache` nor `ClusterCachedKind` serves record metadata, so neither can carry a tombstone.** `Cluster` exposes `generation`/`createdAt`/`deletionRequestedAt`; both child kinds expose none of them, so a `Caches().Get` or a `clusterCachedKindsWatch` frame for a record mid-delete answers with nowhere to put the mark and no consumer can tell it is going. The boundary's "a read reports the store as it is, and never filters" rule therefore holds for `Cluster` and is unrepresentable for both children. Dormant while only `Cluster` was served; serving the two child families is what made it a real gap. **Fix:** falls out of the `recordMeta` extraction below — do it there rather than adding three fields by hand, twice.
 
 - **`Cluster.caches` is an N+1 now that `ListByCluster` answers.** A query selecting it calls the resolver once per cluster, and each call is a join query plus a batched owner-edge read; the store is single-connection, so they serialize. Harmless at present row counts (tens), and the fix is a gqlgen dataloader rather than anything local — a per-resolver `List`-and-bucket would be worse, since the resolver still runs per cluster. **Trigger:** the first surface that selects `caches` over the whole fleet, or the first report of a slow `clusters { caches }`.
 
@@ -93,44 +93,41 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
     per-probe minimum interval — "this probe runs at most once every N" — would cover the same
     burst without a second timing mechanism in the queue.
 
-- **Nothing reclaims a cache file's free pages, and the storage shape has never been reviewed.**
-  `sidecar/internal/clustersvc/internal/kubestore` opens each cache with
-  `auto_vacuum=INCREMENTAL` set before migrations — which alone reclaims nothing: pages return to
-  the OS only when `PRAGMA incremental_vacuum` runs, and no code runs it. Every prune (the events
-  window, a relist's sweep, a kind's clear) therefore grows the freelist and the file sits at its
-  high-water mark until the cache is cleared outright, while `ClusterCacheStats.Bytes` — the number
-  a user watches — reports that mark rather than what is held. The previous store had a janitor
-  doing this; it was not carried over.
-  - **The janitor is the first piece**, and the shape to draw from is `main`'s
-    `sidecar/internal/cluster/cache/store/janitor.go`: a per-cache tick that trims `status_history`
-    past a TTL, then reads `PRAGMA freelist_count` and hands back a **bounded** number of pages.
-    The bound is the point — the cache has one writer, so an unbounded vacuum blocks every kind's
-    sync, and the freelist is biggest exactly when that hurts most, right after a prune. Gate on
-    the freelist, never on what that sweep itself deleted: the writers that actually free pages
-    (the events prune, a kind's clear, a relist's sweep) do not vacuum, so a rows-deleted gate
-    would strand the file forever.
-  - **`status_history` has no retention at all** now that it is written again. It is append-on-change
-    (a relist rewriting every row inserts nothing), so volume is small — but nothing bounds it, and
-    it is the one table the store owns outright rather than mirroring from the server.
-  - **Review the table shapes while there.** Every table is already `STRICT`, and `objects` is
-    deliberately a rowid table (its rows carry the compressed body, and `WITHOUT ROWID` is a loss
-    once a row passes roughly a twentieth of a page). The candidates are the small keyed tables —
-    `owner_refs` and `labels` (composite primary keys, no payload), `kind_counts`, `kind_catalog`,
-    `cluster_meta` — where `WITHOUT ROWID` drops a b-tree and an indirection per lookup.
-    `status_history` is deliberately a plain rowid table (two transitions in one millisecond must
-    both survive); leave it.
+- **The cache's storage shape has never been reviewed.** Reclaiming free pages and bounding
+  `status_history` are [spec 2](docs/specs/2-cache-durability.md); what that spec deliberately
+  leaves out is the shape underneath, which nobody has measured.
+  - **The table shapes.** Every table is already `STRICT`, and `objects` is deliberately a rowid
+    table (its rows carry the compressed body, and `WITHOUT ROWID` is a loss once a row passes
+    roughly a twentieth of a page). The candidates are the small keyed tables — `owner_refs` and
+    `labels` (composite primary keys, no payload), `kind_counts`, `kind_catalog`, `cluster_meta` —
+    where `WITHOUT ROWID` drops a b-tree and an indirection per lookup. `status_history` is
+    deliberately a plain rowid table (two transitions in one millisecond must both survive);
+    leave it.
   - **And the pragmas nobody has measured**: `PRAGMA optimize` on close (it is what keeps the
     query planner's stats honest as a cache fills), WAL checkpoint/truncate behaviour under a
     long-lived writer, `page_size` against the compressed-body row width, and `mmap_size` for the
-    read path the cached-data spec adds. None of these are guesses to apply blind — the point of
-    the item is that they have never been looked at.
+    cached-data read path. None of these are guesses to apply blind — the point of the item is
+    that they have never been looked at.
   - **Measure first, and against a real fleet**: a cluster with CRDs, an event-storming namespace,
     and a cache that has been through a relist or two. The numbers that matter are file size versus
     rows held, and whether a vacuum sweep is visible as sync latency.
 
+- **Paged object watches.** Nothing pages anywhere: `clusterCachedDataObjectsWatch` snapshots a kind's whole set and ships every `rawJSON` body over the IPC bridge, then re-reads the whole set per debounced burst. On a large kind that is the dominant cost of the dashboard — bigger than anything [spec 4](docs/specs/4-object-read-split.md) addresses, which only shrinks the sidecar's half.
+  - **The mechanism already handles it; the read does not.** Bound `Store.Objects` by a keyset range — `AND (namespace, name) > (?, ?) ORDER BY namespace, name LIMIT ?` — and `runCachedDataWatch` diffs a window instead of a collection, with no change to the loop. **Re-deriving is what makes the hard cases free:** an insert above the window, a rename that moves a row out of it, a delete that pulls the next row in are all just "what is in the range now vs. what was", never a shift to reason about. Two things are already in place: `objects_kind_ns_name(api_version, kind, namespace, name)` is exactly the keyset index for that order, and `kind_counts` gives the total for a scrollbar in O(1) with no scan.
+  - **Settle the sort/filter contract first — it is the whole decision.** Paging trades *sort and filter by anything, client-side* for *sort and filter by what the store indexes*. `objects` carries `namespace`, `name`, `created_at`, `status_summary`, `ready_count`/`total_count`, `restart_count` and `host` as real columns, and `labels` is joinable for selector filters, so the common orders are servable. What is not: the kind-specific columns `src/components/widgets/object-columns.tsx` derives from `rawJSON` client-side — sorting a paged Pods table by Restarts asks for an order the store cannot produce. Either accept that those columns do not sort, promote more of them into columns at write time (`projectObject` already extracts several), or do not page. A product call, not a storage one.
+  - **The protocol wrinkle:** subscription variables are fixed for the life of a subscription, so moving the window means resubscribing — a debounced resubscribe per scroll settle, re-snapshotting a window's worth of rows. Cheap, but it makes the window a subscription variable (or a search param) rather than client state, and every move is a round trip.
+  - **Not what the change log is for.** A log tail names the uid that changed, which is not a position in a sort order: inserting one object above the window shifts a row out of the bottom, and the entry mentions neither of the two objects whose page membership moved. Kubernetes offers `limit`/`continue` on list and nothing on watch for the same reason.
+
+- **Revisit an `object_writes` change log in `kubestore`.** The cached-data watches learn what changed by re-reading a collection and diffing it by key (`sidecar/internal/clustersvc/cacheddatawatch.go`), which is O(collection) per debounced burst however cheap each row is made — [spec 4](docs/specs/4-object-read-split.md) takes the bodies out of that scan but not the scan. An append-only log, one row per committed write carrying a local monotonic cursor, turns the tail into O(changes), the way beehive's own `object_writes` does for its store. **Paging shrinks the case rather than making it:** once the read is bounded to a window, O(collection) per burst stops being a number anyone measures, so do the item above first and re-ask.
+  - **What it buys that the diff cannot**, and it is only these three: O(changes) rather than O(uids scanned); *every* transition rather than the coalesced net, since a debounce window collapses two writes into one frame; and a cursor a reader can resume from instead of re-snapshotting.
+  - **Trigger:** a surface that wants a per-object change history — the second one is a capability, not a speed-up — or a frontend that resumes a watch across a reconnect. Neither exists yet: `useWatchSubscription` discards the previous generation's accumulator by design, so a persisted cursor would have no consumer.
+  - **The two things that make it more than a table.** A relist rewrites every row (`kubestore/objects.go`, stated in `recordStatusTransition`'s comment), so an unconditional append turns each cold list into one entry *and* one `Modified` frame per object — a regression against today's diff, which sends nothing for an unchanged row. The append has to be conditional on the incoming `resource_version` differing from the stored one and ordered before the upsert in the same transaction; `recordStatusTransition` already has that shape. And there is no local sequence to key on: `objects.resource_version` is the *Kubernetes* one — TEXT, from the cluster's etcd, neither ours nor ordered — so the log needs its own `INTEGER PRIMARY KEY` counter, scoped to one cache file, which a `Clear` resets to zero.
+  - **Scope, so nobody starts it by accident:** the table, a covering index and an age index, a horizon table and a retention sweep, a final row image on delete entries (a `Deleted` frame reports a whole object, and the row is gone by then), and a fall-back-to-snapshot path for a reader that has fallen below the horizon. Roughly what beehive carries for the same job. It lands in the file [spec 2](docs/specs/2-cache-durability.md)'s janitor is already sweeping, so sequence the two.
+  - **Not the events spec.** `clusterCachedDataEventsWatch` — k8s Events mirrored into the cache file — would ride the same log. Beehive's control-plane event timeline, which is what [spec 1](docs/specs/1-cluster-events-api.md) serves, already has its own and is unaffected either way.
+
 - **OAuth access-token refresh — background/proactive half.** On-demand refresh is done (`sidecar/internal/auth/grant.go` refreshes a lazily-expired token using the stored refresh token). What remains: a proactive/background refresh before expiry rather than only refreshing when a consumer hits an already-expired token.
 - **SSO failure didn't retry.** The async login tail (wait-for-redirect → exchange → verify → persist) is fire-and-forget; a tail failure is only logged and leaves the session signed-out (a known v1 limitation), with no retry. The user must manually re-initiate login.
-- **Check RBAC permissions?** The `ClusterPermissions`/`ResourceRule`/`NonResourceRule` types and schema exist, but the `Permissions` resolver is a stub that returns `not implemented: permissions`. Implement it via a `SelfSubjectRulesReview`. Distinct from the `SelfSubjectReview` *authentication* probe the schema documents on `ClusterPrincipal.username`, which is the rebuild's job.
+- **Check RBAC permissions?** The `ClusterPermissions`/`ResourceRule`/`NonResourceRule` types and schema exist, but the `Permissions` resolver is a stub that returns `not implemented: permissions`. Implement it via a `SelfSubjectRulesReview`. Distinct from the `SelfSubjectReview` *authentication* probe behind `ClusterPrincipal.username`, which is implemented.
 
 ## Sidecar (Go)
 
@@ -147,7 +144,7 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 ## Frontend (webview)
 
 - **CRD printer columns — render a CRD's `additionalPrinterColumns` client-side.** The per-kind column registry (`src/components/widgets/object-columns.tsx`, keyed by `gvrKey`) carries hand-written accessors for **Pod and Deployment only**, and every unregistered kind falls back to the universal Namespace/Name/Age columns — so **CRDs show no kind-specific columns at all**, even though they declare exactly what they want shown. **Approach (settled in the native-body design):** the server ships the column **descriptors** only — `{name, jsonPath, type, priority}`, static per kind, cheap, **no** per-object cell values — and the frontend evaluates the jsonPath client-side against each object's `rawJSON`. So the sidecar still computes no cell values (the whole point of shipping the native body) yet CRD columns work.
-  - **Server half is part of the cluster rebuild:** the descriptors come from a CRD's `spec.versions[].additionalPrinterColumns`, discovered per kind and surfaced on `ClusterCachedDataKind` (per-kind and low-churn, so they ride the kinds watch, not the objects watch).
+  - **Server half:** the descriptors come from a CRD's `spec.versions[].additionalPrinterColumns`, discovered per kind and surfaced on `ClusterCachedDataKind` (per-kind and low-churn, so they ride the kinds watch, not the objects watch).
   - **Frontend:** `columnsForKind` becomes a two-tier lookup — hand-written registry entry first, else descriptor-derived columns, else universal-only. Needs a **minimal jsonPath evaluator**: Kubernetes only permits a restricted subset (`.spec.replicas`, `.status.conditions[0].type`), so a ~30-line reader beats a dependency; decide explicitly rather than pulling in a general JSONPath lib.
   - **Respect `priority`:** kubectl hides `priority > 0` columns unless `-o wide`. Filter to `priority === 0` initially; a "wide" toggle on the table can surface the rest later.
   - **Related gap (built-ins):** obvious next kinds are StatefulSet, ReplicaSet, Node, Service, Job, CronJob, PVC. Note **DaemonSet cannot reuse the Deployment/workload accessors** — it has no `spec.replicas`; its Ready is `status.numberReady/status.desiredNumberScheduled`.
@@ -178,4 +175,4 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 ## Testing
 
-- **Keep the no-wall-clock rule as the rebuild lands.** Both `CLAUDE.md` files state it, and the tree is currently clean: the frontend suites use `vi.useFakeTimers()` + `advanceTimersByTimeAsync`, `waitFor`, or the `flush()` helper with no `setTimeout` waits; Go has **no** literal `time.Sleep` left (the one instance went with the cache system, as did the thin-margin `cache_idle_timeout_test.go`); and `src-tauri/.../sidecar/ipc.rs`'s retry test — `#[tokio::test(start_paused = true)]`, letting tokio auto-advance virtual time between parked timers — is the shape to match. **What to watch for as the sync path returns:** not `time.Sleep` but *thin real-timer margins* — tests that never sleep yet still fail on a loaded machine because they race short real durations. The fix shape is an injectable clock/timer seam so the test advances virtual time. The ~20 `time.After(...)` uses in sidecar tests are almost all *deadlines* guarding a channel receive, which the rule explicitly permits; keep those separate from any load-bearing wait. A `-count=20` soak on a loaded machine is the cheapest way to find regressions.
+- **Keep the no-wall-clock rule.** Both `CLAUDE.md` files state it, and the tree is currently clean: the frontend suites use `vi.useFakeTimers()` + `advanceTimersByTimeAsync`, `waitFor`, or the `flush()` helper with no `setTimeout` waits; Go has **no** literal `time.Sleep` left; and `src-tauri/.../sidecar/ipc.rs`'s retry test — `#[tokio::test(start_paused = true)]`, letting tokio auto-advance virtual time between parked timers — is the shape to match. **What to watch for:** not `time.Sleep` but *thin real-timer margins* — tests that never sleep yet still fail on a loaded machine because they race short real durations. The fix shape is an injectable clock/timer seam so the test advances virtual time. The ~20 `time.After(...)` uses in sidecar tests are almost all *deadlines* guarding a channel receive, which the rule explicitly permits; keep those separate from any load-bearing wait. A `-count=20` soak on a loaded machine is the cheapest way to find regressions.
