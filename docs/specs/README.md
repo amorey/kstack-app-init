@@ -30,13 +30,12 @@ Each spec is self-contained: read one and you can build it. Each header states w
 what it hands on — a numbered spec that needs nothing is ordered by priority rather than by
 dependency, so it can be built out of turn at a cost you can read off its header.
 
-**Sequenced — the build order.** Specs 6-7 are what remains of one line of work: the SQLite
-techniques beehive uses that `kubestore` does not. 6 caches the statements that 1-5 made
-cacheable; 7 needs nothing and touches only the schema, so it is ordered by priority.
+**Sequenced — the build order.** Spec 7 is what remains of one line of work: the SQLite
+techniques beehive uses that `kubestore` does not. It needs nothing and touches only the schema,
+so it is ordered by priority. Specs 1-6 have landed.
 
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [6 — Prepare each statement once, not once per call](6-prepared-statement-cache.md) | sidecar | Planned |
 | [7 — The all-key tables lose their rowid](7-without-rowid-key-tables.md) | sidecar | Planned |
 
 **Independent.**

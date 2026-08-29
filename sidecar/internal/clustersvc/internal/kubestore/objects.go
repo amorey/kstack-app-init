@@ -149,38 +149,15 @@ func redactSecret(u *unstructured.Unstructured) {
 // Edges are DELETEd then re-inserted, not upserted: an object that lost a label or an
 // ownerReference must lose the row too. Both tables are uid-keyed, so it is a point
 // lookup.
-func insertObjectRow(ctx context.Context, ex execer, k Kind, row objectRow, now int64) error {
-	if err := recordStatusTransition(ctx, ex, row, now); err != nil {
+func insertObjectRow(ctx context.Context, st stmts, k Kind, row objectRow, now int64) error {
+	if err := recordStatusTransition(ctx, st, row, now); err != nil {
 		return err
 	}
 	rawJSON, err := compressRaw(row.RawJSON)
 	if err != nil {
 		return err
 	}
-	_, err = ex.ExecContext(ctx, `
-		INSERT INTO objects (
-			uid, api_version, kind, namespace, name,
-			resource_version, generation, created_at, updated_at, raw_json,
-			status_summary, ready_count, total_count, restart_count, host
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(uid) DO UPDATE SET
-			api_version=excluded.api_version,
-			kind=excluded.kind,
-			namespace=excluded.namespace,
-			name=excluded.name,
-			resource_version=excluded.resource_version,
-			generation=excluded.generation,
-			-- creationTimestamp is immutable, so a body without it carries no news;
-			-- projectObject leaves it 0, which would otherwise overwrite a good value
-			-- with the epoch.
-			created_at=CASE WHEN excluded.created_at > 0 THEN excluded.created_at ELSE created_at END,
-			updated_at=excluded.updated_at,
-			raw_json=excluded.raw_json,
-			status_summary=excluded.status_summary,
-			ready_count=excluded.ready_count,
-			total_count=excluded.total_count,
-			restart_count=excluded.restart_count,
-			host=excluded.host`,
+	_, err = st.exec(ctx, stmtUpsertObject,
 		row.UID, k.APIVersion, k.Kind, row.Namespace, row.Name,
 		row.ResourceVersion, row.Generation, row.CreatedAt, now, rawJSON,
 		nullIfEmpty(row.status.Summary), row.status.Ready, row.status.Total,
@@ -193,7 +170,7 @@ func insertObjectRow(ctx context.Context, ex execer, k Kind, row objectRow, now 
 	// At most two statements per edge table (one DELETE, one multi-row INSERT), not one
 	// per row: a 500-object relist page runs in one transaction on the cache's shared
 	// writer, where per-row statements would mean thousands.
-	if _, err := ex.ExecContext(ctx, `DELETE FROM owner_refs WHERE child_uid=?`, row.UID); err != nil {
+	if _, err := st.exec(ctx, stmtDeleteOwnerRefsOfChild, row.UID); err != nil {
 		return err
 	}
 	// Guard, not an optimization: OwnerRefs is built by append, so an unowned object
@@ -210,18 +187,12 @@ func insertObjectRow(ctx context.Context, ex execer, k Kind, row objectRow, now 
 		if err != nil {
 			return err
 		}
-		// WHERE true is required: without it SQLite parses ON CONFLICT as a join
-		// constraint on the SELECT and the statement is a syntax error at DO.
-		if _, err := ex.ExecContext(ctx, `
-			INSERT INTO owner_refs (child_uid, owner_uid, is_controller)
-			SELECT ?1, value ->> 0, value ->> 1 FROM json_each(?2) WHERE true
-			ON CONFLICT(child_uid, owner_uid) DO UPDATE SET is_controller=excluded.is_controller`,
-			row.UID, string(refsJSON)); err != nil {
+		if _, err := st.exec(ctx, stmtUpsertOwnerRefs, row.UID, string(refsJSON)); err != nil {
 			return err
 		}
 	}
 
-	if _, err := ex.ExecContext(ctx, `DELETE FROM labels WHERE uid=?`, row.UID); err != nil {
+	if _, err := st.exec(ctx, stmtDeleteLabelsOfObject, row.UID); err != nil {
 		return err
 	}
 	// Same guard: an unlabelled object's Labels is the nil map apimachinery returns, and
@@ -231,13 +202,9 @@ func insertObjectRow(ctx context.Context, ex execer, k Kind, row objectRow, now 
 		if err != nil {
 			return err
 		}
-		// A map marshals to an object, so the columns are json_each's own key/value.
-		// `value ->> 0` here is not merely empty — it fails with "malformed JSON".
-		if _, err := ex.ExecContext(ctx, `
-			INSERT INTO labels (uid, key, value)
-			SELECT ?1, key, value FROM json_each(?2) WHERE true
-			ON CONFLICT(uid, key) DO UPDATE SET value=excluded.value`,
-			row.UID, string(labelsJSON)); err != nil {
+		// A map marshals to an object, so stmtUpsertLabels reads json_each's own
+		// key/value. `value ->> 0` here is not merely empty — it fails with "malformed JSON".
+		if _, err := st.exec(ctx, stmtUpsertLabels, row.UID, string(labelsJSON)); err != nil {
 			return err
 		}
 	}
@@ -249,41 +216,41 @@ func insertObjectRow(ctx context.Context, ex execer, k Kind, row objectRow, now 
 // under a copy of the collection each resync. The guard is a NOT EXISTS on the caller's
 // transaction rather than a separate read; this is the hottest path in the store. A
 // summaryless kind records nothing.
-func recordStatusTransition(ctx context.Context, ex execer, row objectRow, now int64) error {
+func recordStatusTransition(ctx context.Context, st stmts, row objectRow, now int64) error {
 	if row.status.Summary == "" {
 		return nil
 	}
-	_, err := ex.ExecContext(ctx,
-		`INSERT INTO status_history(uid, at, summary)
-		 SELECT ?, ?, ?
-		 WHERE NOT EXISTS (SELECT 1 FROM objects WHERE uid = ? AND status_summary = ?)`,
+	_, err := st.exec(ctx, stmtInsertStatusTransition,
 		row.UID, now, row.status.Summary, row.UID, row.status.Summary)
 	return err
 }
 
-// cascadeTables are the per-object side tables and their uid column. Every deleter
-// clears these before the objects row, so the list lives here once and no deleter can
-// silently skip a table.
+// cascadeTables are the per-object side tables, as the pair of statements that clears
+// one. Every deleter walks this list before the objects row, so it lives here once and no
+// deleter can silently skip a table.
 //
 // owner_refs appears TWICE on purpose: a deleted object is both a child (references
 // out) and an owner (its children's references in), and with orphan deletion the
 // children outlive it, so inbound edges left behind point at a uid that is gone.
-var cascadeTables = []struct{ table, uidCol string }{
-	{"labels", "uid"},
-	{"owner_refs", "child_uid"},
-	{"owner_refs", "owner_uid"},
-	{"status_history", "uid"},
+var cascadeTables = []struct {
+	// byUID deletes one object's rows; byUIDs deletes every row of a bound uid list.
+	byUID, byUIDs stmtID
+}{
+	{stmtDeleteLabelsOfObject, stmtDeleteLabelsOfObjects},
+	{stmtDeleteOwnerRefsOfChild, stmtDeleteOwnerRefsOfChildren},
+	{stmtDeleteOwnerRefsOwnedBy, stmtDeleteOwnerRefsOwnedByAny},
+	{stmtDeleteStatusHistoryOfObject, stmtDeleteStatusHistoryOfObjects},
 }
 
 // deleteObjectRow removes one object and its edges; the objects delete fires the
 // kind_counts trigger, keeping the per-kind tally exact.
-func deleteObjectRow(ctx context.Context, ex execer, uid string) error {
+func deleteObjectRow(ctx context.Context, st stmts, uid string) error {
 	for _, c := range cascadeTables {
-		if _, err := ex.ExecContext(ctx, `DELETE FROM `+c.table+` WHERE `+c.uidCol+`=?`, uid); err != nil {
+		if _, err := st.exec(ctx, c.byUID, uid); err != nil {
 			return err
 		}
 	}
-	_, err := ex.ExecContext(ctx, `DELETE FROM objects WHERE uid=?`, uid)
+	_, err := st.exec(ctx, stmtDeleteObject, uid)
 	return err
 }
 
@@ -294,10 +261,8 @@ func deleteObjectRow(ctx context.Context, ex execer, uid string) error {
 // once rather than once per side table. Safe in that order because nothing references
 // objects — the side tables are uid-keyed with no foreign key — and the caller's
 // transaction rolls the whole sweep back on any failure.
-func sweepObjects(ctx context.Context, tx execQuerier, k Kind, mark int64) (int, error) {
-	rows, err := tx.QueryContext(ctx,
-		`DELETE FROM objects WHERE api_version=? AND kind=? AND updated_at < ? RETURNING uid`,
-		k.APIVersion, k.Kind, mark)
+func sweepObjects(ctx context.Context, st stmts, k Kind, mark int64) (int, error) {
+	rows, err := st.query(ctx, stmtSweepObjects, k.APIVersion, k.Kind, mark)
 	if err != nil {
 		return 0, err
 	}
@@ -322,9 +287,7 @@ func sweepObjects(ctx context.Context, tx execQuerier, k Kind, mark int64) (int,
 		return 0, err
 	}
 	for _, c := range cascadeTables {
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM `+c.table+` WHERE `+c.uidCol+` IN (SELECT value FROM json_each(?))`,
-			string(uidsJSON)); err != nil {
+		if _, err := st.exec(ctx, c.byUIDs, string(uidsJSON)); err != nil {
 			return 0, err
 		}
 	}

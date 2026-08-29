@@ -57,12 +57,9 @@ func (s *Store) KindsWithFingerprint(ctx context.Context) ([]KindRow, uint64, bo
 		return nil, 0, false, fmt.Errorf("read kinds: begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // a read transaction, never committed
+	st := f.tx(tx)
 
-	rows, err := tx.QueryContext(ctx,
-		`SELECT kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd, COALESCE(knt.count, 0)
-		 FROM kind_catalog kc
-		 LEFT JOIN kind_counts knt ON knt.api_version = kc.api_version AND knt.kind = kc.kind
-		 ORDER BY kc.api_version, kc.kind`)
+	rows, err := st.query(ctx, stmtSelectKinds)
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("read kinds: %w", err)
 	}
@@ -80,7 +77,7 @@ func (s *Store) KindsWithFingerprint(ctx context.Context) ([]KindRow, uint64, bo
 		return nil, 0, false, fmt.Errorf("read kinds: %w", err)
 	}
 
-	v, ok, err := getMeta(ctx, tx, kindsFingerprintKey)
+	v, ok, err := getMeta(ctx, st, kindsFingerprintKey)
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("read kinds fingerprint: %w", err)
 	}
@@ -118,13 +115,7 @@ func (s *Store) Events(ctx context.Context) ([]EventRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := f.readDB.QueryContext(ctx,
-		`SELECT uid,
-		        COALESCE(type, ''), COALESCE(reason, ''), COALESCE(message, ''),
-		        COALESCE(count, 0), COALESCE(first_seen, 0), COALESCE(last_seen, 0),
-		        COALESCE(involved_kind, ''), COALESCE(involved_ns, ''), COALESCE(involved_name, '')
-		 FROM events
-		 ORDER BY last_seen DESC, uid DESC`)
+	rows, err := f.stmts().query(ctx, stmtSelectEvents)
 	if err != nil {
 		return nil, fmt.Errorf("read events: %w", err)
 	}
@@ -176,8 +167,7 @@ func (s *Store) ObjectBody(ctx context.Context, uid string) ([]byte, bool, error
 		return nil, false, err
 	}
 	var stored []byte
-	err = f.readDB.QueryRowContext(ctx,
-		`SELECT raw_json FROM objects WHERE uid = ?`, uid).Scan(&stored)
+	err = f.stmts().queryRow(ctx, stmtSelectObjectBody, uid).Scan(&stored)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -205,13 +195,7 @@ func (s *Store) Objects(ctx context.Context, apiVersion, resource string) ([]Obj
 	if err != nil {
 		return nil, err
 	}
-	rows, err := f.readDB.QueryContext(ctx,
-		`SELECT uid, api_version, kind, namespace, name, resource_version, created_at
-		 FROM objects
-		 WHERE api_version = ?
-		   AND kind = (SELECT kind FROM kind_catalog WHERE api_version = ? AND resource = ?)
-		 ORDER BY namespace, name`,
-		apiVersion, apiVersion, resource)
+	rows, err := f.stmts().query(ctx, stmtSelectObjects, apiVersion, apiVersion, resource)
 	if err != nil {
 		return nil, fmt.Errorf("read objects: %w", err)
 	}

@@ -126,29 +126,12 @@ func firstParsedTime(u *unstructured.Unstructured, paths ...[]string) int64 {
 
 // insertEventRow upserts one event by UID — the chokepoint both the watch-delta and
 // relist-page paths route through.
-func insertEventRow(ctx context.Context, ex execer, row eventRow, now int64) error {
+func insertEventRow(ctx context.Context, st stmts, row eventRow, now int64) error {
 	rawJSON, err := compressRaw(row.RawJSON)
 	if err != nil {
 		return err
 	}
-	_, err = ex.ExecContext(ctx, `
-		INSERT INTO events (
-			uid, involved_uid, involved_kind, involved_ns, involved_name,
-			type, reason, message, first_seen, last_seen, count, raw_json, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(uid) DO UPDATE SET
-			involved_uid=excluded.involved_uid,
-			involved_kind=excluded.involved_kind,
-			involved_ns=excluded.involved_ns,
-			involved_name=excluded.involved_name,
-			type=excluded.type,
-			reason=excluded.reason,
-			message=excluded.message,
-			first_seen=excluded.first_seen,
-			last_seen=excluded.last_seen,
-			count=excluded.count,
-			raw_json=excluded.raw_json,
-			updated_at=excluded.updated_at`,
+	_, err = st.exec(ctx, stmtUpsertEvent,
 		row.UID, nullIfEmpty(row.InvolvedUID), nullIfEmpty(row.InvolvedKind),
 		nullIfEmpty(row.InvolvedNS), nullIfEmpty(row.InvolvedName),
 		nullIfEmpty(row.Type), nullIfEmpty(row.Reason), nullIfEmpty(row.Message),

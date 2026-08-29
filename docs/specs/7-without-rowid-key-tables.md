@@ -51,7 +51,7 @@ rowid          SEARCH labels USING INDEX sqlite_autoindex_labels_1 (uid=?)
 WITHOUT ROWID  SEARCH labels USING PRIMARY KEY (uid=?)
 ```
 
-That is the same per-object write path [spec 6](6-prepared-statement-cache.md) is about, twice per
+That is the same per-object write path the statement cache is about, twice per
 object.
 
 ## Design

@@ -459,7 +459,22 @@ func openFile(path string, cacheID int64, ret Retention) (*file, error) {
 		db.Close()
 		return nil, fmt.Errorf("open reader pool: %w", err)
 	}
-	f := newFile(db, readDB)
+	// After both pools are open, so a failure here closes both.
+	writeStmts, err := prepareStatements(ctx, db, true)
+	if err != nil {
+		db.Close()
+		readDB.Close()
+		return nil, err
+	}
+	readStmts, err := prepareStatements(ctx, readDB, false)
+	if err != nil {
+		closeStatements(writeStmts)
+		db.Close()
+		readDB.Close()
+		return nil, err
+	}
+
+	f := newFile(db, readDB, writeStmts, readStmts)
 	f.startJanitor(cacheID, ret)
 	return f, nil
 }

@@ -53,26 +53,6 @@ func (k Kind) isCoreEvents() bool {
 	return k.APIVersion == coreEventsAPIVersion && k.Resource == coreEventsResource
 }
 
-// execer is the *sql.DB / *sql.Tx subset a write helper needs, so a delta (direct on
-// the writer) and a relist page (in a transaction) share one statement.
-type execer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}
-
-// execQuerier is both halves, for a helper whose write reads its own rows back:
-// RETURNING comes out of QueryContext. Kept separate from execer so the write helpers
-// that need only ExecContext are not handed a method they must not use.
-type execQuerier interface {
-	execer
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}
-
-// querier is the same subset for a point read, so one can be served out of a read
-// transaction whose other query it must agree with.
-type querier interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
 // Subscription carries the store's change pings. The value is empty — the key is the
 // whole news, and a reader answers it by re-reading and diffing, so an early or late
 // ping costs one idempotent read rather than a wrong frame.
@@ -112,7 +92,11 @@ type file struct {
 	// openReadOnly, which opens a CLOSED cache's file per call to measure it; this serves
 	// an open one for the file's life.
 	readDB *sql.DB
-	hub    *conflate.Hub[string, struct{}]
+	// The prepared sets, split by stmtWrites: each pool holds its own half and nil
+	// elsewhere. A call routes by stmtWrites too, never by which helper it came through.
+	writeStmts [numStmts]*sql.Stmt
+	readStmts  [numStmts]*sql.Stmt
+	hub        *conflate.Hub[string, struct{}]
 	// stopJanitor retires this file's sweeper. A cancel and never a wait: all three exits
 	// hold m.mu across the close, and a wait there would stall Stats behind a vacuum. The
 	// sweep runs on the janitor's own context, so the cancel aborts it mid-statement.
@@ -169,7 +153,10 @@ func (f *file) close() error {
 		f.stopJanitor()
 	}
 	f.hub.Close()
-	return errors.Join(f.db.Close(), f.readDB.Close())
+	return errors.Join(
+		closeStatements(f.writeStmts), closeStatements(f.readStmts),
+		f.db.Close(), f.readDB.Close(),
+	)
 }
 
 // startJanitor spawns this file's sweeper, or nothing when no interval is set.
@@ -179,16 +166,19 @@ func (f *file) startJanitor(cacheID int64, ret Retention) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	f.stopJanitor = cancel
-	go runJanitor(ctx, strconv.FormatInt(cacheID, 10), f.db, ret)
+	go runJanitor(ctx, strconv.FormatInt(cacheID, 10), f, ret)
 }
 
-// newFile wraps the open pools. Nothing else builds one — openFile is the only caller.
-func newFile(db, readDB *sql.DB) *file {
+// newFile wraps the open pools and their prepared sets. Nothing else builds one —
+// openFile is the only caller.
+func newFile(db, readDB *sql.DB, writeStmts, readStmts [numStmts]*sql.Stmt) *file {
 	return &file{
-		db:     db,
-		readDB: readDB,
-		hub:    conflate.New[string, struct{}](),
-		now:    func() int64 { return time.Now().UnixMilli() },
+		db:         db,
+		readDB:     readDB,
+		writeStmts: writeStmts,
+		readStmts:  readStmts,
+		hub:        conflate.New[string, struct{}](),
+		now:        func() int64 { return time.Now().UnixMilli() },
 	}
 }
 
@@ -271,7 +261,7 @@ func (s *Store) Cookie(ctx context.Context, apiVersion, resource string) (string
 		return "", false, err
 	}
 	var v string
-	err = f.db.QueryRowContext(ctx, `SELECT value FROM cluster_meta WHERE key = ?`, cookieKey(apiVersion, resource)).Scan(&v)
+	err = f.stmts().queryRow(ctx, stmtSelectMeta, cookieKey(apiVersion, resource)).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -287,7 +277,7 @@ func (s *Store) SetCookie(ctx context.Context, apiVersion, resource, resourceVer
 	if err != nil {
 		return err
 	}
-	if err := setCookie(ctx, f.db, apiVersion, resource, resourceVersion); err != nil {
+	if err := setCookie(ctx, f.stmts(), apiVersion, resource, resourceVersion); err != nil {
 		return fmt.Errorf("set cookie: %w", err)
 	}
 	return nil
@@ -315,6 +305,7 @@ func (s *Store) ApplyChange(ctx context.Context, k Kind, t watch.EventType, u *u
 		return fmt.Errorf("apply %s: begin: %w", k.Kind, err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	st := f.tx(tx)
 
 	if t == watch.Deleted {
 		// An unkeyable delete errors rather than no-opping: booking progress for a delta
@@ -324,14 +315,14 @@ func (s *Store) ApplyChange(ctx context.Context, k Kind, t watch.EventType, u *u
 			return fmt.Errorf("apply %s delete: empty UID", k.Kind)
 		}
 		if k.isCoreEvents() {
-			_, err = tx.ExecContext(ctx, `DELETE FROM events WHERE uid=?`, uid)
+			_, err = st.exec(ctx, stmtDeleteEvent, uid)
 		} else {
-			err = deleteObjectRow(ctx, tx, uid)
+			err = deleteObjectRow(ctx, st, uid)
 		}
 	} else if k.isCoreEvents() {
-		err = f.writeEvent(ctx, tx, u)
+		err = f.writeEvent(ctx, st, u)
 	} else {
-		err = f.writeObject(ctx, tx, k, u)
+		err = f.writeObject(ctx, st, k, u)
 	}
 	// A body the projection rejects is skipped, exactly as a relist page skips it. The cookie
 	// still advances over it: the server replays from that position, so a run that failed here
@@ -341,7 +332,7 @@ func (s *Store) ApplyChange(ctx context.Context, k Kind, t watch.EventType, u *u
 	}
 
 	if rv := u.GetResourceVersion(); rv != "" {
-		if err := setCookie(ctx, tx, k.APIVersion, k.Resource, rv); err != nil {
+		if err := setCookie(ctx, st, k.APIVersion, k.Resource, rv); err != nil {
 			return fmt.Errorf("apply %s: advance cookie: %w", k.Kind, err)
 		}
 	}
@@ -353,21 +344,21 @@ func (s *Store) ApplyChange(ctx context.Context, k Kind, t watch.EventType, u *u
 }
 
 // writeObject projects and upserts one object body.
-func (f *file) writeObject(ctx context.Context, ex execer, k Kind, u *unstructured.Unstructured) error {
+func (f *file) writeObject(ctx context.Context, st stmts, k Kind, u *unstructured.Unstructured) error {
 	row, err := projectObject(u)
 	if err != nil {
 		return err
 	}
-	return insertObjectRow(ctx, ex, k, row, f.stamp())
+	return insertObjectRow(ctx, st, k, row, f.stamp())
 }
 
 // writeEvent projects and upserts one event body.
-func (f *file) writeEvent(ctx context.Context, ex execer, u *unstructured.Unstructured) error {
+func (f *file) writeEvent(ctx context.Context, st stmts, u *unstructured.Unstructured) error {
 	row, err := extractEvent(u)
 	if err != nil {
 		return err
 	}
-	return insertEventRow(ctx, ex, row, f.stamp())
+	return insertEventRow(ctx, st, row, f.stamp())
 }
 
 // CountKind returns one kind's cached rows, off the trigger-maintained kind_counts
@@ -380,9 +371,7 @@ func (s *Store) CountKind(ctx context.Context, k Kind) (int, error) {
 	// Every cached event rolls into the schema's hardcoded ('v1','Event') tally,
 	// maintained by the events triggers.
 	var n int
-	err = f.db.QueryRowContext(ctx,
-		`SELECT count FROM kind_counts WHERE api_version=? AND kind=?`,
-		k.APIVersion, k.Kind).Scan(&n)
+	err = f.stmts().queryRow(ctx, stmtCountKind, k.APIVersion, k.Kind).Scan(&n)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -435,11 +424,12 @@ func (s *Store) ClearKind(ctx context.Context, k Kind) error {
 		return fmt.Errorf("clear kind: begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	st := f.tx(tx)
 
 	// Core events are not in objects: they have their own table, which this collection
 	// owns outright.
 	if k.isCoreEvents() {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM events`); err != nil {
+		if _, err := st.exec(ctx, stmtDeleteAllEvents); err != nil {
 			return fmt.Errorf("clear kind: delete events: %w", err)
 		}
 	} else {
@@ -448,13 +438,11 @@ func (s *Store) ClearKind(ctx context.Context, k Kind) error {
 		// that child says, and only rewriting the child could put it back. Traversals
 		// join against objects, where a missing owner reads the same as one whose kind is
 		// not mirrored at all.
-		for _, stmt := range []string{
-			`DELETE FROM owner_refs WHERE child_uid IN (SELECT uid FROM objects WHERE api_version = ? AND kind = ?)`,
-			`DELETE FROM labels WHERE uid IN (SELECT uid FROM objects WHERE api_version = ? AND kind = ?)`,
-			`DELETE FROM status_history WHERE uid IN (SELECT uid FROM objects WHERE api_version = ? AND kind = ?)`,
-			`DELETE FROM objects WHERE api_version = ? AND kind = ?`,
+		for _, id := range []stmtID{
+			stmtClearOwnerRefsOfKind, stmtClearLabelsOfKind,
+			stmtClearStatusHistoryOfKind, stmtClearObjectsOfKind,
 		} {
-			if _, err := tx.ExecContext(ctx, stmt, k.APIVersion, k.Kind); err != nil {
+			if _, err := st.exec(ctx, id, k.APIVersion, k.Kind); err != nil {
 				return fmt.Errorf("clear kind: delete rows: %w", err)
 			}
 		}
@@ -462,14 +450,12 @@ func (s *Store) ClearKind(ctx context.Context, k Kind) error {
 
 	// The sweep above leaves the tally at 0, which is what an advertised but empty kind
 	// must read. A forgotten kind is different: nothing will name it again.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM kind_counts WHERE api_version = ? AND kind = ?`,
-		k.APIVersion, k.Kind); err != nil {
+	if _, err := st.exec(ctx, stmtDeleteKindCount, k.APIVersion, k.Kind); err != nil {
 		return fmt.Errorf("clear kind: delete counts: %w", err)
 	}
 	// The catalog row stays: it says the CLUSTER serves this kind, which clearing the
 	// cache does not change. SyncKinds' prune is what takes one out.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_meta WHERE key = ?`,
-		cookieKey(k.APIVersion, k.Resource)); err != nil {
+	if _, err := st.exec(ctx, stmtDeleteMeta, cookieKey(k.APIVersion, k.Resource)); err != nil {
 		return fmt.Errorf("clear kind: delete cookie: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -533,9 +519,10 @@ func (r *ReplaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 		return fmt.Errorf("write page: begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	st := r.f.tx(tx)
 
 	if !r.cookieCleared {
-		if err := deleteCookie(ctx, tx, r.kind.APIVersion, r.kind.Resource); err != nil {
+		if err := deleteCookie(ctx, st, r.kind.APIVersion, r.kind.Resource); err != nil {
 			return fmt.Errorf("write page: clear cookie: %w", err)
 		}
 	}
@@ -543,9 +530,9 @@ func (r *ReplaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 	for _, u := range items {
 		var err error
 		if r.kind.isCoreEvents() {
-			err = r.writeEvent(ctx, tx, u, now)
+			err = r.writeEvent(ctx, st, u, now)
 		} else {
-			err = r.writeObject(ctx, tx, u, now)
+			err = r.writeObject(ctx, st, u, now)
 		}
 		if err != nil {
 			return fmt.Errorf("write page: %w", err)
@@ -566,25 +553,25 @@ func (r *ReplaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 }
 
 // writeObject lands one page item, skipping a body that will not project.
-func (r *ReplaceSession) writeObject(ctx context.Context, ex execer, u *unstructured.Unstructured, now int64) error {
+func (r *ReplaceSession) writeObject(ctx context.Context, st stmts, u *unstructured.Unstructured, now int64) error {
 	row, err := projectObject(u)
 	if errors.Is(err, errUnprojectable) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	return insertObjectRow(ctx, ex, r.kind, row, now)
+	return insertObjectRow(ctx, st, r.kind, row, now)
 }
 
 // writeEvent is writeObject for the events table.
-func (r *ReplaceSession) writeEvent(ctx context.Context, ex execer, u *unstructured.Unstructured, now int64) error {
+func (r *ReplaceSession) writeEvent(ctx context.Context, st stmts, u *unstructured.Unstructured, now int64) error {
 	row, err := extractEvent(u)
 	if errors.Is(err, errUnprojectable) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	return insertEventRow(ctx, ex, row, now)
+	return insertEventRow(ctx, st, row, now)
 }
 
 // Commit sweeps the rows no page rewrote, then persists the cookie in the same
@@ -596,11 +583,12 @@ func (r *ReplaceSession) Commit(ctx context.Context, resourceVersion string) (in
 		return 0, fmt.Errorf("commit relist: begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	st := r.f.tx(tx)
 
 	var pruned int
 	if r.kind.isCoreEvents() {
 		// The events table is this collection's outright, so the prune is unscoped.
-		res, err := tx.ExecContext(ctx, `DELETE FROM events WHERE updated_at < ?`, r.mark)
+		res, err := st.exec(ctx, stmtPruneEvents, r.mark)
 		if err != nil {
 			return 0, fmt.Errorf("commit relist: prune events: %w", err)
 		}
@@ -610,13 +598,13 @@ func (r *ReplaceSession) Commit(ctx context.Context, resourceVersion string) (in
 		}
 		pruned = int(n)
 	} else {
-		if pruned, err = sweepObjects(ctx, tx, r.kind, r.mark); err != nil {
+		if pruned, err = sweepObjects(ctx, st, r.kind, r.mark); err != nil {
 			return 0, fmt.Errorf("commit relist: prune: %w", err)
 		}
 	}
 
 	if resourceVersion != "" {
-		if err := setCookie(ctx, tx, r.kind.APIVersion, r.kind.Resource, resourceVersion); err != nil {
+		if err := setCookie(ctx, st, r.kind.APIVersion, r.kind.Resource, resourceVersion); err != nil {
 			return 0, fmt.Errorf("commit relist: persist cookie: %w", err)
 		}
 	}
@@ -635,19 +623,17 @@ func busKey(k Kind) string {
 	return ObjectsKey(k.APIVersion, k.Resource)
 }
 
-// setMeta writes one bookkeeping value through any execer, so a caller can put it in the
-// transaction whose rows it describes.
-func setMeta(ctx context.Context, ex execer, key, value string) error {
-	_, err := ex.ExecContext(ctx,
-		`INSERT INTO cluster_meta (key, value) VALUES (?, ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+// setMeta writes one bookkeeping value, so a caller can put it in the transaction whose
+// rows it describes.
+func setMeta(ctx context.Context, st stmts, key, value string) error {
+	_, err := st.exec(ctx, stmtUpsertMeta, key, value)
 	return err
 }
 
 // getMeta reads one bookkeeping value, and whether it is recorded at all.
-func getMeta(ctx context.Context, q querier, key string) (string, bool, error) {
+func getMeta(ctx context.Context, st stmts, key string) (string, bool, error) {
 	var v string
-	err := q.QueryRowContext(ctx, `SELECT value FROM cluster_meta WHERE key = ?`, key).Scan(&v)
+	err := st.queryRow(ctx, stmtSelectMeta, key).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -657,19 +643,15 @@ func getMeta(ctx context.Context, q querier, key string) (string, bool, error) {
 	return v, true, nil
 }
 
-// setCookie writes one kind's resume position through any execer, so a delta and a
-// relist commit share the statement.
-func setCookie(ctx context.Context, ex execer, apiVersion, resource, resourceVersion string) error {
-	_, err := ex.ExecContext(ctx,
-		`INSERT INTO cluster_meta (key, value) VALUES (?, ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		cookieKey(apiVersion, resource), resourceVersion)
-	return err
+// setCookie writes one kind's resume position, so a delta and a relist commit share the
+// statement.
+func setCookie(ctx context.Context, st stmts, apiVersion, resource, resourceVersion string) error {
+	return setMeta(ctx, st, cookieKey(apiVersion, resource), resourceVersion)
 }
 
 // deleteCookie durably removes one kind's resume position, so the next start cold-lists.
-func deleteCookie(ctx context.Context, ex execer, apiVersion, resource string) error {
-	_, err := ex.ExecContext(ctx, `DELETE FROM cluster_meta WHERE key = ?`, cookieKey(apiVersion, resource))
+func deleteCookie(ctx context.Context, st stmts, apiVersion, resource string) error {
+	_, err := st.exec(ctx, stmtDeleteMeta, cookieKey(apiVersion, resource))
 	return err
 }
 

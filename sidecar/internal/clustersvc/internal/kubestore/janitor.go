@@ -18,7 +18,6 @@ package kubestore
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"time"
@@ -50,8 +49,8 @@ var DefaultRetention = Retention{
 // sweep's failure — the next interval retries. The first sweep runs HERE rather than at the
 // open that spawned this: inline it would run a vacuum under m.mu, which Clear holds across
 // close → unlink → reopen and Stats holds for its whole measurement.
-func runJanitor(ctx context.Context, id string, writer *sql.DB, ret Retention) {
-	sweep(ctx, id, writer, ret)
+func runJanitor(ctx context.Context, id string, f *file, ret Retention) {
+	sweep(ctx, id, f, ret)
 
 	t := time.NewTicker(ret.Interval)
 	defer t.Stop()
@@ -61,19 +60,18 @@ func runJanitor(ctx context.Context, id string, writer *sql.DB, ret Retention) {
 			return
 		case <-t.C:
 		}
-		sweep(ctx, id, writer, ret)
+		sweep(ctx, id, f, ret)
 	}
 }
 
 // sweep trims what this cache's own tables hold past their retention. Sweeps are ordinary
 // writes, so they serialize with the syncs behind the writer pool's single connection.
-func sweep(ctx context.Context, id string, writer *sql.DB, ret Retention) {
+func sweep(ctx context.Context, id string, f *file, ret Retention) {
 	// Unbounded, unlike the vacuum below: `at` carries no index, so this is a full scan —
 	// but the table is append-on-change and small by construction, and one statement is
 	// cheaper than a page-by-page walk. If it ever stops being small the answer is an index
 	// on `at`, not a chunked delete.
-	if _, err := writer.ExecContext(ctx,
-		`DELETE FROM status_history WHERE at < ?`,
+	if _, err := f.stmts().exec(ctx, stmtSweepStatusHistory,
 		time.Now().Add(-ret.StatusHistoryTTL).UnixMilli(),
 	); err != nil {
 		slog.Warn("kubestore: status_history sweep failed", "cacheID", id, "err", err)
@@ -84,7 +82,7 @@ func sweep(ctx context.Context, id string, writer *sql.DB, ret Retention) {
 	// that actually free pages (a relist's prune, ClearKind, a Remove) do not vacuum, so a
 	// rows-deleted gate would strand the file at its high-water mark forever.
 	var freePages int64
-	if err := writer.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&freePages); err != nil {
+	if err := f.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&freePages); err != nil {
 		slog.Warn("kubestore: freelist_count failed", "cacheID", id, "err", err)
 		return
 	}
@@ -94,7 +92,7 @@ func sweep(ctx context.Context, id string, writer *sql.DB, ret Retention) {
 	// Bounded: the argument-less form reclaims the whole freelist in one statement, holding
 	// the single writer for as long as that takes.
 	pages := min(freePages, vacuumPagesPerSweep)
-	if _, err := writer.ExecContext(ctx, fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, pages)); err != nil {
+	if _, err := f.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, pages)); err != nil {
 		slog.Warn("kubestore: incremental_vacuum failed", "cacheID", id, "err", err)
 	}
 }

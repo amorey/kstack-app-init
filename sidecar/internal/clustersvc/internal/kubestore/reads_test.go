@@ -96,7 +96,7 @@ func TestKindsWithFingerprintReadsGarbageAsUnwritten(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 42))
-	require.NoError(t, setMeta(ctx, db(t, s), kindsFingerprintKey, "not-a-number"))
+	require.NoError(t, setMeta(ctx, openFileOf(t, s).stmts(), kindsFingerprintKey, "not-a-number"))
 
 	_, _, ok, err := s.KindsWithFingerprint(ctx)
 

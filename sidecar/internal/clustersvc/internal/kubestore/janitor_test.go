@@ -42,7 +42,7 @@ func TestSweepTrimsStatusHistoryPastItsTTL(t *testing.T) {
 	addStatusRow(t, store, "uid-old", 48*time.Hour)
 	addStatusRow(t, store, "uid-fresh", time.Minute)
 
-	sweep(context.Background(), "1", db(t, store), Retention{StatusHistoryTTL: time.Hour})
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
 
 	assert.Equal(t, 0, countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE uid = 'uid-old'`))
 	assert.Equal(t, 1, countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE uid = 'uid-fresh'`))
@@ -81,7 +81,7 @@ func TestSweepHandsFreePagesBack(t *testing.T) {
 	fillStatusHistory(t, store, 5000)
 	require.Zero(t, freelist(t, store), "a file that has freed nothing yet")
 
-	sweep(context.Background(), "1", db(t, store), Retention{StatusHistoryTTL: time.Hour})
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
 
 	assert.Zero(t, freelist(t, store), "the pages the delete freed went back to the OS")
 }
@@ -94,11 +94,11 @@ func TestSweepBoundsWhatOneVacuumHandsBack(t *testing.T) {
 	fillStatusHistory(t, store, 5000)
 	shrinkVacuumBound(t, 8)
 
-	sweep(context.Background(), "1", db(t, store), Retention{StatusHistoryTTL: time.Hour})
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
 	before := freelist(t, store)
 	require.NotZero(t, before, "a bounded sweep leaves a backlog")
 
-	sweep(context.Background(), "1", db(t, store), Retention{StatusHistoryTTL: time.Hour})
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
 
 	assert.Equal(t, before-8, freelist(t, store), "the backlog drains at the same bound")
 }

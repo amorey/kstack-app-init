@@ -190,6 +190,25 @@ its write path:
   it never saw, with no error from anywhere. `ClearKind` keeps its own statements — it clears
   `owner_refs` by `child_uid` only, deliberately, since an edge is what the *child* says.
 
+**Every statement is named in `statements.go`, never written at a call site** — `stmtID` indexes
+`stmtText`, and a call is `st.exec(ctx, stmtUpsertObject, …)`. modernc compiles and finalizes on
+every call and caches nothing, so a text at a call site is recompiled per call however constant it
+looks; `openFile` prepares both pools instead, and `TestNoSQLTextLivesOutsideTheTable` is what
+keeps text from creeping back. It carries one exemption with its reason — the stats read, which
+also serves a *closed* cache through a per-call read-only open that has no prepared set. PRAGMAs
+are outside the scheme entirely: they take no bound parameter, so they are never prepared.
+
+Each pool holds its own half of the set: the writer the writes, the reader the reads. `stmts`
+carries the file and an optional transaction — `f.stmts()` runs on the pool, `f.tx(tx)` inside
+one — and rebinds through `Tx.StmtContext`. Two traps. **The helper does not pick the
+pool**: `exec`/`query`/`queryRow` say what shape the call has, `stmtWrites` says where it runs, so
+the prune's `DELETE … RETURNING` goes through `query` and still runs on the writer. And
+**`stmtWrites` drives both halves of its own enforcement** — the reader prepares by it and a call
+routes by it — so a wrong entry is invisible until SQLite answers "attempt to write a readonly
+database"; `TestEveryStatementDeclaresWhatItDoes` cross-checks each id against its text. A read
+that must run inside a *write* transaction has no home in this scheme (`Tx.StmtContext` refuses
+another pool's statement) — none exists, and adding one is a design decision, not a flag flip.
+
 **One janitor per open file**, started in `openFile` and stopped in `(*file).close` — so its
 lifetime is the file's, and a `Clear`'s fresh file gets one like any other (`openFile` has two
 call sites, and the reopen mid-clear is the one a start at the call site misses). It trims

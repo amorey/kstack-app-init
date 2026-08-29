@@ -16,12 +16,8 @@ package kubestore
 
 import (
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"encoding/json"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -205,35 +201,6 @@ func TestInsertTakesAnObjectWithNoOwnerRefs(t *testing.T) {
 	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM owner_refs WHERE child_uid='uid-1'`))
 }
 
-// recordingExecer runs nothing and keeps the text it was handed.
-type recordingExecer struct{ texts []string }
-
-func (r *recordingExecer) ExecContext(_ context.Context, q string, _ ...any) (sql.Result, error) {
-	r.texts = append(r.texts, q)
-	return driver.RowsAffected(0), nil
-}
-
-// insertTexts is the SQL one object's insert issues.
-func insertTexts(t *testing.T, u *unstructured.Unstructured) []string {
-	t.Helper()
-	row, err := projectObject(u)
-	require.NoError(t, err)
-	var ex recordingExecer
-	require.NoError(t, insertObjectRow(context.Background(), &ex, podKind, row, 0))
-	return ex.texts
-}
-
-// modernc compiles and finalizes per call and caches nothing, so text assembled from an
-// argument count is a fresh sqlite3_prepare_v2 per distinct count — and nothing a statement
-// cache could ever hold.
-func TestInsertIssuesOneTextWhateverTheOwnerRefCount(t *testing.T) {
-	one := insertTexts(t, podWith("uid-1", []any{owner("o-1", true)}, nil))
-	three := insertTexts(t, podWith("uid-2",
-		[]any{owner("o-1", true), owner("o-2", false), owner("o-3", false)}, nil))
-
-	assert.Equal(t, one, three)
-}
-
 func TestInsertRoundTripsEveryLabel(t *testing.T) {
 	s := newTestStore(t)
 	u := podWith("uid-1", nil, map[string]any{"app": "api", "tier": "web", "env": "prod"})
@@ -245,6 +212,7 @@ func TestInsertRoundTripsEveryLabel(t *testing.T) {
 		`SELECT COUNT(*) FROM labels WHERE uid='uid-1' AND key='tier' AND value='web'`))
 }
 
+// The insert upserts, so only the DELETE ahead of it can retire a label the object dropped.
 func TestInsertDropsALabelTheObjectNoLongerCarries(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
@@ -266,58 +234,4 @@ func TestInsertTakesAnObjectWithNoLabels(t *testing.T) {
 		podWith("uid-1", nil, nil)))
 
 	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM labels WHERE uid='uid-1'`))
-}
-
-func TestInsertIssuesOneTextWhateverTheLabelCount(t *testing.T) {
-	one := insertTexts(t, podWith("uid-1", nil, map[string]any{"app": "api"}))
-	three := insertTexts(t, podWith("uid-2", nil,
-		map[string]any{"app": "api", "tier": "web", "env": "prod"}))
-
-	assert.Equal(t, one, three)
-}
-
-// recordingTx delegates to a real transaction and keeps the text it passed on. A fake
-// cannot stand in here: RETURNING is read back through *sql.Rows, which only
-// database/sql can hand out.
-type recordingTx struct {
-	tx    *sql.Tx
-	texts []string
-}
-
-func (r *recordingTx) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
-	r.texts = append(r.texts, q)
-	return r.tx.ExecContext(ctx, q, args...)
-}
-
-func (r *recordingTx) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
-	r.texts = append(r.texts, q)
-	return r.tx.QueryContext(ctx, q, args...)
-}
-
-// The cascades used to re-derive the set with the same subquery, so the predicate ran once
-// per side table and again for the objects delete — and every one of the five texts was
-// composed from the predicate and a table name, which no statement cache can hold.
-func TestSweepEvaluatesItsPredicateOnce(t *testing.T) {
-	ctx := context.Background()
-	s := newTestStore(t)
-	for _, uid := range []string{"gone-1", "gone-2"} {
-		require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod(uid, uid, "1")))
-	}
-	tx, err := db(t, s).BeginTx(ctx, nil)
-	require.NoError(t, err)
-	defer tx.Rollback() //nolint:errcheck // read back before commit, never committed
-
-	// A mark ahead of every stamp the fixture wrote, so the sweep matches both rows.
-	rec := &recordingTx{tx: tx}
-	n, err := sweepObjects(ctx, rec, podKind, time.Now().Add(time.Hour).UnixMilli())
-	require.NoError(t, err)
-	require.Equal(t, 2, n)
-
-	var readsObjects int
-	for _, q := range rec.texts {
-		if strings.Contains(q, "FROM objects") || strings.Contains(q, "DELETE FROM objects") {
-			readsObjects++
-		}
-	}
-	assert.Equal(t, 1, readsObjects, "one statement names objects; the cascades take the uids it returned")
 }

@@ -801,3 +801,12 @@ func TestReplacePruneTakesEverySideTableRowWithIt(t *testing.T) {
 	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM labels WHERE uid='kept'`))
 	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM owner_refs WHERE child_uid='kept'`))
 }
+
+// openFileOf is the open file behind a claim — the white-box reach a test that drives a
+// file-level helper needs.
+func openFileOf(t *testing.T, s *Store) *file {
+	t.Helper()
+	f, err := s.file()
+	require.NoError(t, err)
+	return f
+}

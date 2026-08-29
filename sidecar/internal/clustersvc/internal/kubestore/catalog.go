@@ -17,9 +17,9 @@ package kubestore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
-	"strings"
 )
 
 // The two scopes a kind is served at, as the column spells them.
@@ -68,34 +68,29 @@ func (s *Store) SyncKinds(ctx context.Context, rows []KindRow, prune bool, finge
 		return fmt.Errorf("sync kinds: begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	st := f.tx(tx)
 
 	for _, r := range rows {
 		// Delete then upsert, because the table has two unique keys and SQLite takes one
 		// ON CONFLICT target: a Kind renamed under an unchanged plural conflicts on the
 		// index rather than the primary key, which an upsert keyed on the latter cannot
 		// resolve. This clears the rename's loser first.
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM kind_catalog WHERE api_version = ? AND resource = ? AND kind <> ?`,
+		if _, err := st.exec(ctx, stmtResolveKindRename,
 			r.APIVersion, r.Resource, r.Kind); err != nil {
 			return fmt.Errorf("sync kinds: resolve %s/%s: %w", r.APIVersion, r.Resource, err)
 		}
-		// schema_json is deliberately absent from the update: nothing here fills it, and
-		// writing NULL on every sweep would make the column unusable to whoever does.
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO kind_catalog (api_version, kind, resource, scope, is_crd) VALUES (?, ?, ?, ?, ?)
-			 ON CONFLICT(api_version, kind) DO UPDATE SET
-			     resource = excluded.resource, scope = excluded.scope, is_crd = excluded.is_crd`,
+		if _, err := st.exec(ctx, stmtUpsertKind,
 			r.APIVersion, r.Kind, r.Resource, r.Scope, r.IsCRD); err != nil {
 			return fmt.Errorf("sync kinds: write %s/%s: %w", r.APIVersion, r.Kind, err)
 		}
 	}
 
 	if prune {
-		if err := pruneKinds(ctx, tx, rows); err != nil {
+		if err := pruneKinds(ctx, st, rows); err != nil {
 			return fmt.Errorf("sync kinds: prune: %w", err)
 		}
 	}
-	if err := setMeta(ctx, tx, kindsFingerprintKey, strconv.FormatUint(fingerprint, 10)); err != nil {
+	if err := setMeta(ctx, st, kindsFingerprintKey, strconv.FormatUint(fingerprint, 10)); err != nil {
 		return fmt.Errorf("sync kinds: fingerprint: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -111,17 +106,21 @@ func (s *Store) SyncKinds(ctx context.Context, rows []KindRow, prune bool, finge
 // pruneKinds deletes every row the answer did not carry. The keep-set is built into the
 // statement rather than compared row by row: a catalog is order-of-hundreds, so one pass
 // over it costs less than reading it back.
-func pruneKinds(ctx context.Context, ex execer, rows []KindRow) error {
+func pruneKinds(ctx context.Context, st stmts, rows []KindRow) error {
 	if len(rows) == 0 {
-		_, err := ex.ExecContext(ctx, `DELETE FROM kind_catalog`)
+		_, err := st.exec(ctx, stmtDeleteAllKinds)
 		return err
 	}
-	args := make([]any, 0, len(rows)*2)
-	for _, r := range rows {
-		args = append(args, r.APIVersion, r.Kind)
+	// Tuples, so the pair comes out of the element's positions — the same shape the
+	// edge-table inserts bind, and for the same reason: one argument, one statement text.
+	keep := make([][2]any, len(rows))
+	for i, r := range rows {
+		keep[i] = [2]any{r.APIVersion, r.Kind}
 	}
-	pairs := strings.TrimSuffix(strings.Repeat("(?,?),", len(rows)), ",")
-	_, err := ex.ExecContext(ctx,
-		`DELETE FROM kind_catalog WHERE (api_version, kind) NOT IN (VALUES `+pairs+`)`, args...)
+	keepJSON, err := json.Marshal(keep)
+	if err != nil {
+		return err
+	}
+	_, err = st.exec(ctx, stmtPruneKinds, string(keepJSON))
 	return err
 }
