@@ -740,7 +740,7 @@ func eventsOf(t *testing.T, svc *Service, cacheID int64) []kubestore.EventRow {
 	require.True(t, ok, "the cache is open")
 	defer store.Release()
 
-	rows, err := store.Events(t.Context(), 100)
+	rows, err := store.Events(t.Context())
 	require.NoError(t, err)
 	return rows
 }
@@ -1033,4 +1033,16 @@ func (f *fakeKindSync) sawOverlap() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.overlapped
+}
+
+// liveRuns is how many generations across every subject can still write. Zero is what a clear
+// needs of the cache it is about to swap the file under.
+func (f *fakeKindSync) liveRuns() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, live := range f.liveGen {
+		n += len(live)
+	}
+	return n
 }

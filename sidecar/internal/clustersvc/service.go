@@ -72,6 +72,8 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 )
@@ -219,6 +221,9 @@ type Caches interface {
 	// records. Unscoped where the rest of this family is per-cache: one fold serves
 	// the fleet. A gauge, but a failable one — the fold reads watches of its own.
 	WatchHealth(ctx context.Context) (*Stream[ClusterCacheHealth], error)
+	// WatchSyncStatus streams one cache's sync detail — the discovery verdict and a row
+	// per mirrored kind. What WatchHealth folds for a fleet, expanded for one cache.
+	WatchSyncStatus(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*Stream[ClusterCacheSyncStatus], error)
 
 	// Clear deletes one cache's on-disk file and restarts its syncs; the record stays.
 	Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache, error)
@@ -273,7 +278,7 @@ type CachedData interface {
 	// WatchObjects streams one kind's cached objects as a delta watch keyed by UID.
 	// No frames while that kind hasn't synced.
 	WatchObjects(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID, apiVersion, resource string) (*Stream[ClusterCachedDataObjectWatchFrame], error)
-	// WatchEvents streams one cache's cached Kubernetes Events (newest window) as a
+	// WatchEvents streams one cache's cached Kubernetes Events, newest first, as a
 	// delta watch keyed by event UID. Woken separately from WatchKinds, so an event
 	// burst never drives the kind-catalog re-read.
 	WatchEvents(ctx context.Context, clusterID ClusterID, cacheID ClusterCacheID) (*Stream[ClusterCachedDataEventWatchFrame], error)
@@ -320,10 +325,11 @@ type deps struct {
 	kubeconfigSvc kubeconfigService
 	kubeconnSvc   kubeconnService
 	kubestoreMgr  kubestoreManager
+	kubesyncSvc   kubesyncService
 	pokeSvc       *poke.Service
 }
 
-func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, kubestoreMgr kubestoreManager, pokeSvc *poke.Service) deps {
+func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc kubeconnService, kubestoreMgr kubestoreManager, kubesyncSvc kubesyncService, pokeSvc *poke.Service) deps {
 	return deps{
 		clusterClient: beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind),
 		cacheClient:   beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind),
@@ -332,6 +338,7 @@ func newDeps(bh *beehive.Beehive, kubeconfigSvc kubeconfigService, kubeconnSvc k
 		kubeconfigSvc: kubeconfigSvc,
 		kubeconnSvc:   kubeconnSvc,
 		kubestoreMgr:  kubestoreMgr,
+		kubesyncSvc:   kubesyncSvc,
 		pokeSvc:       pokeSvc,
 	}
 }
@@ -400,9 +407,12 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 	// cluster, and this is what turns one into the credentials a probe dials.
 	kubeconnSvc := kubeconn.New(kubeconfigSvc)
 	// One store per cache under the registry, which the boundary reads, clears, and
-	// removes. Nothing writes to it: the seam that fills a cache is being redesigned.
+	// removes.
 	kubestoreMgr := kubestore.NewManager(filepath.Join(dataDir, "caches"))
-	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, kubestoreMgr, pokeSvc)
+	// What fills them: it discovers what each cluster serves and mirrors every served kind
+	// into that cluster's file. Armed by the cache and kind passes, never by a reader.
+	kubesyncSvc := kubesync.New(kubeconnSvc, kubestoreMgr)
+	d := newDeps(bh, kubeconfigSvc, kubeconnSvc, kubestoreMgr, kubesyncSvc, pokeSvc)
 
 	controllers, err := registerControllers(bh, d)
 	if err != nil {
@@ -416,10 +426,14 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 		// reverse the slice.
 		{Name: "kubeconn", StartCloser: kubeconnSvc},
 		{Name: "kubestore", StartCloser: kubestoreMgr},
+		// Between the store and beehive: no pass can arm a cache that is stopping, and no
+		// worker outlives the file it writes into.
+		{Name: "kubesync", StartCloser: kubesyncSvc},
 		{Name: "beehive", StartCloser: beehiveRuntime{bh: bh, store: bhStore}},
 		clusterSourceBootstrap(d),
 	}
 	parts = append(parts, controllers...)
+	parts = append(parts, restartSyncsOnResume(kubesyncSvc, pokeSvc))
 
 	return &service{deps: d, parts: parts, gaugeCadence: defaultGaugeCadence}, nil
 }
@@ -432,6 +446,32 @@ func clusterSourceBootstrap(d deps) lifecycle.Part {
 		Name: "cluster source records",
 		StartCloser: lifecycle.StartFunc(func(ctx context.Context) (func(context.Context) error, error) {
 			return func(context.Context) error { return nil }, ensureClusterSources(ctx, d.sourceClient)
+		}),
+	}
+}
+
+// restartSyncsOnResume restarts every sync on a resume. A watch that died under a sleeping
+// machine reports nothing, so nothing else would notice; a nil poke service — which a test
+// builds against — subscribes to nothing and has nothing to stop.
+func restartSyncsOnResume(kubesyncSvc kubesyncService, pokeSvc *poke.Service) lifecycle.Part {
+	return lifecycle.Part{
+		Name: "kubesync resume poke",
+		StartCloser: lifecycle.StartFunc(func(context.Context) (func(context.Context) error, error) {
+			if pokeSvc == nil {
+				return func(context.Context) error { return nil }, nil
+			}
+			signals, unsubscribe := pokeSvc.Subscribe()
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				for range signals {
+					kubesyncSvc.RestartAll()
+				}
+			})
+			return func(ctx context.Context) error {
+				// Unsubscribing closes the channel, which is what ends the loop above.
+				unsubscribe()
+				return drain.WithContext(ctx, wg.Wait)
+			}, nil
 		}),
 	}
 }
@@ -465,6 +505,10 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	// controllers, so nothing pokes a kind before there is something to poke.
 	kubeconfigTrigger := newKubeconfigTrigger(d.kubeconfigSvc)
 	kubeconnTrigger := newKubeconnTrigger(d.kubeconnSvc)
+	// One per registration, because a trigger wakes a record for every value its feed carries:
+	// one feed carrying both would wake a cache for each of its hundreds of kinds.
+	syncCacheTrigger := newKubesyncDiscoveryTrigger(d.kubesyncSvc)
+	syncKindTrigger := newKubesyncKindTrigger(d.kubesyncSvc)
 
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
@@ -473,8 +517,8 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 
 	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigTrigger.Wakes()))
 	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync, beehive.WithTriggerByName(kubeconnTrigger.Wakes()))
-	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass)
-	errResource := beehive.Register(bh, ClusterCachedKindGroupKind, resource, startupPass)
+	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass, beehive.WithTriggerByID(syncCacheTrigger.Wakes()))
+	errResource := beehive.Register(bh, ClusterCachedKindGroupKind, resource, startupPass, beehive.WithTriggerByName(syncKindTrigger.Wakes()))
 	if err := errors.Join(errSource, errCluster, errCache, errResource); err != nil {
 		return nil, err
 	}
@@ -485,6 +529,8 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 		{Name: "cached-resource controller", StartCloser: resource},
 		{Name: "kubeconfig trigger", StartCloser: lifecycle.StartFunc(kubeconfigTrigger.Start)},
 		{Name: "kubeconn trigger", StartCloser: lifecycle.StartFunc(kubeconnTrigger.Start)},
+		{Name: "kubesync cache trigger", StartCloser: lifecycle.StartFunc(syncCacheTrigger.Start)},
+		{Name: "kubesync kind trigger", StartCloser: lifecycle.StartFunc(syncKindTrigger.Start)},
 	}, nil
 }
 

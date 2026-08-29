@@ -16,12 +16,16 @@ package clustersvc
 
 import (
 	"context"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -315,4 +319,165 @@ func TestCachedKindsWatchByCacheReportsKindsThatArriveLater(t *testing.T) {
 	assert.Equal(t, DeltaFrameAdded, got.Type)
 	require.NotNil(t, got.Kind)
 	assert.Equal(t, ClusterCachedKindID(obj.ID), got.Kind.ID)
+}
+
+// kindControllerClient stands in for the client beehive binds to the object being reconciled.
+// The embedded interface is nil: a method the pass grows shows up as a panic, not as silence.
+type kindControllerClient struct {
+	beehive.ControllerClient[ClusterCachedKindStatus]
+	events []beehive.EventSpec
+}
+
+func (c *kindControllerClient) AddEvent(_ context.Context, event beehive.EventSpec) error {
+	c.events = append(c.events, event)
+	return nil
+}
+
+// reconcileKind runs one kind pass the way beehive would.
+func reconcileKind(t *testing.T, d deps, obj *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]) *kindControllerClient {
+	t.Helper()
+	client := &kindControllerClient{}
+	res := (&clusterCachedKindController{deps: d}).Reconcile(context.Background(), client, obj)
+	require.Equal(t, beehive.Settled(), res)
+	return client
+}
+
+// oneCachedKind stores a cache with one kind under it and hands back both.
+func oneCachedKind(t *testing.T) (deps, ClusterCacheID, *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]) {
+	t.Helper()
+	d := newTestDeps(t)
+	cluster := createCluster(t, d.clusterClient, "prod")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	return d, ClusterCacheID(cache.ID), createKind(t, d, cache.ID, deploymentsSpec)
+}
+
+// The record is what arms its own kind: kubesync decides what EXISTS, and a record decides
+// what is MIRRORED.
+func TestKindPassArmsItsOwnSync(t *testing.T) {
+	d, cacheID, kind := oneCachedKind(t)
+
+	reconcileKind(t, d, kind)
+
+	assert.Equal(t, []kubesync.KindKey{{
+		CacheID: int64(cacheID),
+		Kind: kubestore.Kind{
+			APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments",
+		},
+	}}, syncFake(d).armedKinds(int64(cacheID)))
+}
+
+// **Forget first, then clear.** Clearing ahead of the join would race a relist page landing
+// behind it, leaving rows for a kind nothing syncs any more.
+func TestKindPassForgetsTheSyncBeforeItClearsTheRows(t *testing.T) {
+	d, cacheID, kind := oneCachedKind(t)
+	reconcileKind(t, d, kind)
+
+	ctx := context.Background()
+	store, _, err := d.kubestoreMgr.OpenExisting(int64(cacheID))
+	require.NoError(t, err)
+	require.NoError(t, store.SetCookie(ctx, "apps/v1", "deployments", "10"))
+	store.Release()
+
+	require.NoError(t, d.kindClient.Delete(ctx, kind.ID))
+	obj, err := d.kindClient.Get(ctx, kind.ID)
+	require.NoError(t, err)
+	reconcileKind(t, d, obj)
+
+	assert.Empty(t, syncFake(d).armedKinds(int64(cacheID)), "nothing syncs the kind that is going")
+	store, _, err = d.kubestoreMgr.OpenExisting(int64(cacheID))
+	require.NoError(t, err)
+	defer store.Release()
+	_, ok, err := store.Cookie(ctx, "apps/v1", "deployments")
+	require.NoError(t, err)
+	assert.False(t, ok, "the rows and the position went with the record")
+}
+
+// A record whose cache is already gone skips both: the file went with the cache, and there
+// is nothing left to stop or to clear.
+func TestKindPassSkipsTheClearWhenTheCacheIsGone(t *testing.T) {
+	d, _, kind := oneCachedKind(t)
+	ctx := context.Background()
+	require.NoError(t, d.kindClient.Delete(ctx, kind.ID))
+	obj, err := d.kindClient.Get(ctx, kind.ID)
+	require.NoError(t, err)
+	kubestoreFake(d).noFile = true
+
+	reconcileKind(t, d, obj)
+}
+
+// A record whose cache record is gone still withdraws its registration. Nothing else is left
+// to: the cache's pass has been and gone, and the id survives only in the record's own name.
+func TestKindPassForgetsTheSyncWhenItsCacheRecordIsGone(t *testing.T) {
+	d := newTestDeps(t)
+	cacheID := ClusterCacheID(7)
+	syncFake(d).TrackKind(int64(cacheID), toKubestoreKind(deploymentsSpec))
+	now := time.Now()
+
+	reconcileKind(t, d, &beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus]{
+		ID: 999,
+		Name: ClusterCachedKindName(
+			beehive.ObjectID(cacheID), deploymentsSpec.APIVersion, deploymentsSpec.Resource),
+		Spec:                deploymentsSpec,
+		DeletionRequestedAt: &now,
+	})
+
+	assert.Empty(t, syncFake(d).armedKinds(int64(cacheID)))
+}
+
+// One kind's transitions land on its own timeline, which is what makes a cache's hundred
+// kinds legible: the parent's carries only what the cache itself records.
+func TestKindPassLogsItsOwnVerdict(t *testing.T) {
+	d, cacheID, kind := oneCachedKind(t)
+	syncFake(d).setKindState(int64(cacheID), kubestore.Kind{
+		APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments",
+	}, kubesync.KindState{Reason: kubesync.ReasonSyncFailed, Message: "deployments is forbidden"})
+
+	client := reconcileKind(t, d, kind)
+
+	require.Len(t, client.events, 1)
+	assert.Equal(t, categorySync, client.events[0].Category)
+	assert.Equal(t, kubesync.ReasonSyncFailed, client.events[0].Reason)
+	assert.Equal(t, beehive.EventWarning, client.events[0].Type)
+}
+
+// A kind whose worker has answered nothing has no verdict to log — a cache that is paused,
+// or one whose sweep has not reached this kind yet.
+func TestKindPassLogsNothingBeforeItsWorkerAnswers(t *testing.T) {
+	d, _, kind := oneCachedKind(t)
+
+	client := reconcileKind(t, d, kind)
+
+	assert.Empty(t, client.events)
+}
+
+// The pass writes no condition: the verdict is the gauge's, and a stored one would serve a
+// dead process's answer until the passes caught up.
+func TestKindPassWritesNoCondition(t *testing.T) {
+	d, cacheID, kind := oneCachedKind(t)
+	syncFake(d).setKindState(int64(cacheID), kubestore.Kind{
+		APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments",
+	}, kubesync.KindState{Reason: kubesync.ReasonWatching})
+
+	reconcileKind(t, d, kind)
+
+	obj, err := d.kindClient.Get(context.Background(), kind.ID)
+	require.NoError(t, err)
+	assert.Empty(t, obj.Conditions)
+}
+
+// One kind's clear needs the same hold as the cache-wide one, scoped to the kind: a worker
+// that resumed from its cookie afterwards would apply deltas to rows nothing cold-listed.
+func TestCachedKindsClearRunsInsideTheSyncsHold(t *testing.T) {
+	d, cacheID, kind := oneCachedKind(t)
+
+	var heldAtClear bool
+	kubestoreFake(d).onOpen = func(int64) {
+		heldAtClear = slices.ContainsFunc(syncFake(d).stoppedKinds(), func(key kubesync.KindKey) bool {
+			return key.CacheID == int64(cacheID) && key.Resource == "deployments"
+		})
+	}
+	_, err := serviceOver(t, d).CachedKinds().Clear(context.Background(), ClusterCachedKindID(kind.ID))
+
+	require.NoError(t, err)
+	assert.True(t, heldAtClear, "the kind's worker is stopped before its rows go")
 }

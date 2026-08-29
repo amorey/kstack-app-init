@@ -190,6 +190,79 @@ function useSyncEvents(syncId: string | undefined): Timeline {
   return data ?? EMPTY_TIMELINE;
 }
 
+// Kind-discovery history, keyed by the CACHE's record id: what the cluster serves is the
+// cache's own fact, where each kind's sync transitions live on that kind's record.
+const ClusterDiscoveryEventsSubscription = graphql(`
+  subscription ClusterDiscoveryEvents($id: ObjectID!) {
+    eventsWatch(id: $id, category: "discovery") {
+      type
+      event {
+        id
+        type
+        reason
+        message
+        count
+        firstAt
+        lastAt
+      }
+    }
+  }
+`);
+
+// One cache's discovery log; paused until there's a cache, since a placeholder
+// subscription would carry nothing.
+function useDiscoveryEvents(cacheId: string | undefined): Timeline {
+  const [{ data }] = useWatchSubscription<{ eventsWatch: RawEventFrame }, Timeline>(
+    { query: ClusterDiscoveryEventsSubscription, variables: { id: cacheId ?? '' }, pause: !cacheId },
+    (prev, resp) => foldFrame(prev, resp.eventsWatch),
+  );
+  return data ?? EMPTY_TIMELINE;
+}
+
+// One cache's sync detail — the discovery verdict, and a row per mirrored kind carrying its
+// OWN reason. The rollup above it names the offenders but not why each is failing, and a
+// cache's kinds fail independently, so this is the only thing that can say.
+const ClusterCacheSyncStatusSubscription = graphql(`
+  subscription ClusterCacheSyncStatus($id: ObjectID!, $cacheID: ObjectID!) {
+    clusterCacheSyncStatusWatch(id: $id, cacheID: $cacheID) {
+      discovery {
+        reason
+        message
+      }
+      kinds {
+        apiVersion
+        resource
+        reason
+        message
+        objectCount
+      }
+    }
+  }
+`);
+
+type KindSyncStatus = {
+  apiVersion: string;
+  resource: string;
+  reason: string;
+  message: string;
+  objectCount: number;
+};
+
+type CacheSyncStatus = {
+  discovery: { reason: string; message: string };
+  kinds: KindSyncStatus[];
+};
+
+// A gauge: each frame replaces the last outright. null until the first frame, which is what
+// keeps a still-arriving detail from rendering as "no kinds".
+function useCacheSyncStatus(clusterId: string, cacheId: string): CacheSyncStatus | null {
+  const [{ data }] = useWatchSubscription<{ clusterCacheSyncStatusWatch: CacheSyncStatus }, CacheSyncStatus>(
+    { query: ClusterCacheSyncStatusSubscription, variables: { id: clusterId, cacheID: cacheId } },
+    (_prev, resp) => resp.clusterCacheSyncStatusWatch,
+  );
+  return data ?? null;
+}
+
 // The cache's contents as a live gauge. NOT read off the ClusterCache record: that
 // object stops changing once its sync settles, so a field there would freeze at
 // subscribe time.
@@ -676,18 +749,32 @@ function cacheSummary(objectCount: number, kindCount: number): string {
 // Expanded sync diagnostics. Inline for the same modal-inert reason as
 // ConnectionDetail. Everything subscribes only while expanded — that's what makes
 // the hundred-plus-record per-kind stream affordable.
+// The reasons that are not a fault: caught up, or on the way there. Named as the set to
+// exclude rather than the set to report, so a failure reason added later shows up unlisted
+// rather than silently vanishing from the panel.
+const SETTLING_REASONS = new Set(['Watching', 'Syncing', 'Resyncing', 'Resuming']);
+
 function SyncDetail({
+  clusterId,
   health,
   cacheId,
   contents,
 }: {
+  clusterId: string;
   health: ClusterCacheHealth;
   cacheId: string;
   contents: CacheContents | null;
 }) {
   const kindSyncs = useCachedKinds(cacheId);
+  const syncStatus = useCacheSyncStatus(clusterId, cacheId);
   const timelineKind = timelineSyncFor(kindSyncs, health);
   const events = useSyncEvents(timelineKind?.id);
+  const discoveryEvents = useDiscoveryEvents(cacheId);
+  // Each offender with its own reason — which the rollup cannot carry, since it folds a
+  // hundred kinds into one verdict. A kind with no reason yet has not answered, and a kind
+  // still starting has not failed: a cache being armed, cleared, or resumed reports every one
+  // of its kinds that way, and reading those as offenders would list all of them.
+  const failingKinds = (syncStatus?.kinds ?? []).filter((kind) => kind.reason && !SETTLING_REASONS.has(kind.reason));
   // Newest write anywhere, beside the OLDEST proof — a cache is only as verified
   // as its least-recently proven watch.
   const lastUpdateMs = parseTimeOrNull(health.lastUpdateAt ?? null);
@@ -724,6 +811,7 @@ function SyncDetail({
         {/* No fallback: omit rather than assert a verification that never happened. */}
         <DetailRow label="Sync verified" ms={lastLiveMs} />
       </dl>
+      {failingKinds.length > 0 ? <FailingKindList kinds={failingKinds} /> : null}
       {events.runs.length > 0 ? (
         <EventRunList
           title={timelineKind ? `Recent sync events — ${timelineKind.spec.resource}` : 'Recent sync events'}
@@ -736,6 +824,42 @@ function SyncDetail({
         // still-arriving timeline would read as "none".
         events.synced && <p className="text-xs text-muted-foreground">No sync events yet.</p>
       )}
+      {discoveryEvents.runs.length > 0 ? (
+        <EventRunList
+          title="Recent kind discovery"
+          runs={discoveryEvents.runs}
+          labelOf={(e) => e.reason}
+          showDuration={false}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+// How many failing kinds to name. A layout cap, as with the offender list: the wire carries
+// every row.
+const FAILING_KIND_CAP = 5;
+
+// One line per kind that is not Watching, each with the reason IT reported. A cache's kinds
+// fail independently, so a single forbidden CRD is invisible in every other reading here.
+function FailingKindList({ kinds }: { kinds: KindSyncStatus[] }) {
+  const shown = kinds.slice(0, FAILING_KIND_CAP);
+  return (
+    <div className="space-y-0.5">
+      <p className="text-xs font-medium">Kinds not syncing</p>
+      <dl className="space-y-0.5 text-xs text-muted-foreground">
+        {shown.map((kind) => (
+          <div key={`${kind.apiVersion}/${kind.resource}`} className="flex gap-2">
+            {/* The plural alone reads best, but the pair is what identifies a kind — so the
+                api group is the title, where it disambiguates without crowding the line. */}
+            <dt className="shrink-0 font-mono" title={kind.apiVersion}>
+              {kind.resource}
+            </dt>
+            <dd className="truncate">{kind.message ? `${kind.reason} — ${kind.message}` : kind.reason}</dd>
+          </div>
+        ))}
+        {kinds.length > shown.length ? <div>+{kinds.length - shown.length} more</div> : null}
+      </dl>
     </div>
   );
 }
@@ -917,7 +1041,7 @@ function ClusterRow({
         <TableRow className="hover:bg-transparent">
           <TableCell className={STATUS_CELL_CLASS} />
           <TableCell colSpan={COLUMN_COUNT - 1} className="pt-0">
-            <SyncDetail health={health} cacheId={health.cacheID} contents={contents} />
+            <SyncDetail clusterId={cluster.id} health={health} cacheId={health.cacheID} contents={contents} />
           </TableCell>
         </TableRow>
       ) : null}

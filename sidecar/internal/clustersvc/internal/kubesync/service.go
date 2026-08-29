@@ -32,6 +32,7 @@ package kubesync
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 
@@ -144,6 +145,7 @@ type Service struct {
 	// their cache being forgotten.
 	sessions map[int64]*session
 	tracked  map[int64]map[kindID]kubestore.Kind
+	started  bool
 	stopped  bool
 }
 
@@ -234,6 +236,26 @@ func (s *Service) ForgetDiscovery(cacheID int64) {
 	s.armMu.Lock()
 	defer s.armMu.Unlock()
 	s.tearDown(cacheID)
+}
+
+// ForgetCache is ForgetDiscovery plus the registrations, for a cache that is gone rather than
+// paused: nothing under it is held for a resume that can never come.
+//
+// The teardown comes first and the drop second, because what it stops is read off the same map:
+// emptied ahead of the join, this would take the sweep down and leave every kind's worker running
+// against a store whose claims were just given back.
+//
+// A kind pass already in flight can call TrackKind after this returns and register that kind
+// again. What removes it is the record's own teardown, which withdraws the kind whether or not
+// the cache record is still there to read.
+func (s *Service) ForgetCache(cacheID int64) {
+	s.armMu.Lock()
+	defer s.armMu.Unlock()
+
+	s.tearDown(cacheID)
+	s.mu.Lock()
+	delete(s.tracked, cacheID)
+	s.mu.Unlock()
 }
 
 // TrackKind registers that one kind should be synced into cacheID, or updates its shape in
@@ -348,6 +370,73 @@ func (s *Service) recordKindReason(cacheID int64, id kindID, snap supervisor.Sna
 	return KindKey{CacheID: cacheID, Kind: k}, true
 }
 
+// RunWithCacheSyncStopped calls fn once, on the caller's goroutine, after the sweep and every
+// tracked kind under cacheID have stopped AND EXITED — a signalled stop is not enough, since the
+// point is that nothing is mid-write — and arms them again on the way out. A cache nobody has
+// armed runs fn directly: there is nothing to stop, and its file is still there to clear, which
+// is why the store work stays with the caller.
+//
+// This is what a clear needs and cannot arrange from outside: Manager.Clear swaps the file under
+// whoever holds it open, and a relist page or a SyncKinds landing across that swap writes into a
+// file nothing holds. The session keeps its claims throughout, which is what the manager reopens
+// a fresh file for.
+//
+// **fn runs under armMu, so it must not call back into this Service.**
+func (s *Service) RunWithCacheSyncStopped(cacheID int64, fn func() error) error {
+	s.armMu.Lock()
+	defer s.armMu.Unlock()
+
+	sess := s.sessionOf(cacheID)
+	if sess == nil {
+		return fn()
+	}
+
+	// The sweep too: kind_catalog is written through the same file.
+	s.discoverySupervisor.Remove(sess.discoverySubject())
+	kinds := sess.trackedKinds()
+	for _, k := range kinds {
+		s.stopKind(sess, idOf(k))
+	}
+	// Deferred, so a clear that failed leaves a cache that still syncs.
+	defer func() {
+		for _, k := range kinds {
+			s.kindSupervisor.Add(kindSubject(cacheID, k))
+		}
+		// The catalog went with the file, so the sweep writes it again now rather than at its
+		// next cadence tick. Nothing is skipped by the fingerprint: the table has none.
+		s.discoverySupervisor.Add(sess.discoverySubject())
+	}()
+	return fn()
+}
+
+// RunWithKindSyncStopped is RunWithCacheSyncStopped narrowed to one kind — same join before fn, for
+// the clear that drops one kind's rows and its cookie. The kind comes back only if it is still
+// tracked: fn cannot call in to withdraw it, but a ForgetKind may have landed before this did.
+func (s *Service) RunWithKindSyncStopped(cacheID int64, k kubestore.Kind, fn func() error) error {
+	s.armMu.Lock()
+	defer s.armMu.Unlock()
+
+	sess := s.sessionOf(cacheID)
+	if sess == nil {
+		return fn()
+	}
+
+	s.stopKind(sess, idOf(k))
+	defer func() {
+		if s.isKindTracked(cacheID, idOf(k)) {
+			s.kindSupervisor.Add(kindSubject(cacheID, k))
+		}
+	}()
+	return fn()
+}
+
+func (s *Service) isKindTracked(cacheID int64, id kindID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, tracked := s.tracked[cacheID][id]
+	return tracked
+}
+
 // RestartAll restarts every armed kind in place, off its cookie — what a resume poke needs,
 // since a watch that died under a sleeping machine reports nothing.
 func (s *Service) RestartAll() {
@@ -459,6 +548,16 @@ func (s *Service) WatchKindNews() KindNews { return s.kindHub.Receiver() }
 // everything. No cache is armed here: one is armed when a pass tracks it, which may be before
 // or after this.
 func (s *Service) Start(ctx context.Context) (func(context.Context) error, error) {
+	// Refused rather than tolerated: a second Start puts a second pair of supervisor loops on
+	// the same wait group, so the first stop would drain loops that only the second can end.
+	s.mu.Lock()
+	if s.started {
+		s.mu.Unlock()
+		return nil, errors.New("kubesync: already started")
+	}
+	s.started = true
+	s.mu.Unlock()
+
 	stopDiscovery := s.discoverySupervisor.Start(ctx)
 	stopKinds := s.kindSupervisor.Start(ctx)
 

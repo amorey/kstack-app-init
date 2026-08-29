@@ -229,33 +229,6 @@ func TestAWatchDroppedBeforeItsFirstFrameClimbsTheLadder(t *testing.T) {
 	})
 }
 
-func TestEventsAgeOutOnACadenceRatherThanEveryDelta(t *testing.T) {
-	eventKind := kubestore.Kind{APIVersion: "v1", Kind: "Event", Resource: "events"}
-	cluster := newFakeCluster(t)
-	cluster.serveKind(eventKind, true)
-	cluster.hasObjects(eventKind, "10")
-	stream := cluster.streamKind(eventKind)
-
-	svc := newSyncingService(t, cluster, func(p *pacing) { p.eventsWindow, p.eventsEvery = 1, 3 })
-	syncKind(t, svc, 1, eventKind)
-	awaitKindReason(t, svc, 1, eventKind, ReasonWatching)
-
-	// Events are the one collection the server never deletes from, so the cache is what
-	// bounds them. Both rows standing is the proof the cadence held: the window is one, so a
-	// prune per delta would already have taken the first.
-	watcher := stream.opened.Await(t, "the watch to open")
-	watcher.Add(event("one", "11"))
-	watcher.Add(event("two", "12"))
-	require.Eventually(t, func() bool {
-		return len(eventsOf(t, svc, 1)) == 2
-	}, testutil.Timeout, time.Millisecond, "both events to land unpruned")
-
-	watcher.Add(event("three", "13"))
-	require.Eventually(t, func() bool {
-		return len(eventsOf(t, svc, 1)) == 1
-	}, testutil.Timeout, time.Millisecond, "the window to be enforced once the cadence comes round")
-}
-
 func TestAWatchRefusedIsRetried(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serveKind(podKind, true)
@@ -535,53 +508,25 @@ func TestAStreamThatSettlesBetweenClosuresReopensAtTheFloor(t *testing.T) {
 	})
 }
 
-// The delta cadence counts within one stream, so a kind restarted more often than it comes round
-// would never reach it — and a resume takes no list, which is the other thing that prunes.
-func TestAResumingEventsCollectionIsCappedOnTheWayBackIn(t *testing.T) {
-	eventKind := kubestore.Kind{APIVersion: "v1", Kind: "Event", Resource: "events"}
-	cluster := newFakeCluster(t)
-	cluster.serveKind(eventKind, true)
-	cluster.hasObjects(eventKind, "10")
-	stream := cluster.streamKind(eventKind)
-
-	svc := newSyncingService(t, cluster, func(p *pacing) {
-		p.eventsWindow, p.eventsEvery = 1, 1000
-	})
-	syncKind(t, svc, 1, eventKind)
-	awaitKindReason(t, svc, 1, eventKind, ReasonWatching)
-
-	watcher := stream.opened.Await(t, "the watch to open")
-	watcher.Add(event("one", "11"))
-	watcher.Add(event("two", "12"))
-	require.Eventually(t, func() bool {
-		return len(eventsOf(t, svc, 1)) == 2
-	}, testutil.Timeout, time.Millisecond, "both events to land with the cadence out of reach")
-
-	// A rotation sends the kind back through establish, which resumes from the cookie the
-	// list left rather than taking another one.
-	watcher.Stop()
-
-	require.Eventually(t, func() bool {
-		return len(eventsOf(t, svc, 1)) == 1
-	}, testutil.Timeout, time.Millisecond, "the window to be enforced on the way back in")
-}
-
-func TestARelistedEventsCollectionIsCappedBeforeAnythingArrives(t *testing.T) {
+// The cache mirrors what the server holds: nothing here ages events out, so every row a list
+// carried and every one a delta brought is still there.
+func TestEveryEventTheServerSentIsKept(t *testing.T) {
 	eventKind := kubestore.Kind{APIVersion: "v1", Kind: "Event", Resource: "events"}
 	cluster := newFakeCluster(t)
 	cluster.serveKind(eventKind, true)
 	cluster.hasObjects(eventKind, "10", event("one", "1"), event("two", "2"), event("three", "3"))
-	cluster.streamKind(eventKind)
+	stream := cluster.streamKind(eventKind)
 
-	// A cadence long enough that no delta reaches it — an idle cluster's, where the LIST is
-	// the only thing that ever wrote.
-	svc := newSyncingService(t, cluster, func(p *pacing) { p.eventsWindow, p.eventsEvery = 1, 1000 })
+	svc := newSyncingService(t, cluster)
 	syncKind(t, svc, 1, eventKind)
 	awaitKindReason(t, svc, 1, eventKind, ReasonWatching)
+	require.Len(t, eventsOf(t, svc, 1), 3, "the list's rows all stand")
 
+	watcher := stream.opened.Await(t, "the watch to open")
+	watcher.Add(event("four", "11"))
 	require.Eventually(t, func() bool {
-		return len(eventsOf(t, svc, 1)) == 1
-	}, testutil.Timeout, time.Millisecond, "the window to bound what the list carried")
+		return len(eventsOf(t, svc, 1)) == 4
+	}, testutil.Timeout, time.Millisecond, "the delta to land alongside them")
 }
 
 func TestASlowResumeThatFinishesReportsTheStreamItEstablished(t *testing.T) {

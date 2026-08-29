@@ -1186,3 +1186,53 @@ func TestLoginMutationSurfacesSetupError(t *testing.T) {
 		t.Fatalf("login must not report true when setup failed, got: %s", raw)
 	}
 }
+
+// TestClusterCacheSyncStatusWatchServesEveryKind pins the one field on the wire that carries
+// a per-kind verdict: nothing else can say which of a cache's hundred kinds is failing.
+func TestClusterCacheSyncStatusWatchServesEveryKind(t *testing.T) {
+	srv := newTestServer(t, clusterFixtures())
+
+	resp := openSSESubscription(t, srv.URL, "",
+		`subscription { clusterCacheSyncStatusWatch(id: "1", cacheID: "`+strconv.FormatInt(int64(fixtureCacheID(1)), 10)+`") { cacheID discovery { reason } kinds { apiVersion resource reason restarts objectCount } } }`)
+	defer resp.Body.Close()
+	events := sseEvents(t, resp)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		var frame struct {
+			Data struct {
+				Status struct {
+					CacheID   string           `json:"cacheID"`
+					Discovery map[string]any   `json:"discovery"`
+					Kinds     []map[string]any `json:"kinds"`
+				} `json:"clusterCacheSyncStatusWatch"`
+			} `json:"data"`
+		}
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("stream closed before a frame arrived")
+			}
+			if ev.event != "next" {
+				continue
+			}
+			if err := json.Unmarshal([]byte(ev.data), &frame); err != nil {
+				t.Fatalf("decode sync status frame %s: %v", ev.data, err)
+			}
+			if got := frame.Data.Status.Discovery["reason"]; got != "Discovered" {
+				t.Errorf("discovery reason = %v, want Discovered", got)
+			}
+			if len(frame.Data.Status.Kinds) == 0 {
+				t.Fatal("a cache with mirrored kinds served none")
+			}
+			for _, kind := range frame.Data.Status.Kinds {
+				if kind["apiVersion"] == "" || kind["resource"] == "" {
+					t.Errorf("a kind row identifies nothing: %v", kind)
+				}
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for a sync status frame")
+		}
+	}
+}

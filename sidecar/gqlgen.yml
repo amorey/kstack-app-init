@@ -156,6 +156,13 @@ models:
   ClusterCacheStats:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheStats
 
+  ClusterCacheSyncStatus:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheSyncStatus
+  ClusterCacheDiscoveryStatus:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheDiscoveryStatus
+  ClusterCacheKindSyncStatus:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCacheKindSyncStatus
+
   ClusterCachedDataKind:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedDataKind
 

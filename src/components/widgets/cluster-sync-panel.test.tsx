@@ -349,6 +349,43 @@ function pushCachedKind(id: string, resource: string, reason: string, apiVersion
   );
 }
 
+// The per-cache sync-detail gauge. The only thing on the wire that carries a per-kind
+// verdict — the rollup names its offenders but not why each one is failing.
+function pushSyncStatus(
+  kinds: { apiVersion: string; resource: string; reason: string; message?: string }[],
+  discoveryReason = 'Discovered',
+) {
+  channelFor('clusterCacheSyncStatusWatch').onmessage!(
+    JSON.stringify({
+      type: 'next',
+      payload: {
+        data: {
+          clusterCacheSyncStatusWatch: {
+            discovery: { reason: discoveryReason, message: '' },
+            kinds: kinds.map((k) => ({ message: '', objectCount: 0, ...k })),
+          },
+        },
+      },
+    }),
+  );
+}
+
+// Push one run on a cache's kind-discovery timeline. What the cluster serves is the cache's
+// own fact, so this rides the cache record rather than any kind's.
+function pushDiscoveryEvent(ev: {
+  id: string;
+  type: 'Normal' | 'Warning';
+  reason: string;
+  message: string;
+  count: number;
+  firstAt: string;
+  lastAt: string;
+}) {
+  channelFor('ClusterDiscoveryEvents').onmessage!(
+    JSON.stringify({ type: 'next', payload: { data: { eventsWatch: { type: 'Run', event: ev } } } }),
+  );
+}
+
 // Push one frame on the per-cluster clusterScheduleWatch gauge (the next-attempt
 // time + the in-flight `probing` flag). Call after a row's diagnostics are open
 // (mounts the schedule subscription).
@@ -869,6 +906,77 @@ describe('ClusterSyncPanel', () => {
     // — a live relative counter, independent of the (separate) sync-event history.
     expect(await screen.findByText(/last update received/i)).toBeInTheDocument();
     expect(await screen.findByText('30s ago')).toBeInTheDocument();
+  });
+
+  it('names each failing kind with the reason that kind reported', async () => {
+    const user = await openWith([{ uuid: 'u-mixed', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    // A cache's kinds fail independently, so one forbidden CRD is invisible in every other
+    // reading — the rollup can name it but cannot say why.
+    await act(async () =>
+      pushSyncStatus([
+        { apiVersion: 'v1', resource: 'pods', reason: 'Watching' },
+        { apiVersion: 'example.com/v1', resource: 'widgets', reason: 'SyncFailed', message: 'forbidden' },
+      ]),
+    );
+
+    expect(await screen.findByText(/kinds not syncing/i)).toBeInTheDocument();
+    expect(await screen.findByText('widgets')).toBeInTheDocument();
+    expect(await screen.findByText(/SyncFailed — forbidden/)).toBeInTheDocument();
+    // A healthy kind is not an offender, so it is not in this list.
+    expect(screen.queryByText('pods')).not.toBeInTheDocument();
+  });
+
+  it('leaves a kind that is still starting out of the failing list', async () => {
+    const user = await openWith([{ uuid: 'u-cold', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    // A cold-listing cache reports every kind as Syncing. Reading those as offenders would
+    // name all of them the moment a cache is armed, cleared, or resumed.
+    await act(async () =>
+      pushSyncStatus([
+        { apiVersion: 'v1', resource: 'pods', reason: 'Syncing' },
+        { apiVersion: 'apps/v1', resource: 'deployments', reason: 'Resuming' },
+        { apiVersion: 'batch/v1', resource: 'jobs', reason: 'Resyncing' },
+        { apiVersion: 'example.com/v1', resource: 'widgets', reason: 'SyncFailed', message: 'forbidden' },
+      ]),
+    );
+
+    expect(await screen.findByText('widgets')).toBeInTheDocument();
+    expect(screen.queryByText('pods')).not.toBeInTheDocument();
+    expect(screen.queryByText('deployments')).not.toBeInTheDocument();
+    expect(screen.queryByText('jobs')).not.toBeInTheDocument();
+  });
+
+  it('shows no failing-kind list while every kind is watching', async () => {
+    const user = await openWith([{ uuid: 'u-ok', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    await act(async () => pushSyncStatus([{ apiVersion: 'v1', resource: 'pods', reason: 'Watching' }]));
+
+    expect(screen.queryByText(/kinds not syncing/i)).not.toBeInTheDocument();
+  });
+
+  it("shows the kind-discovery history off the cache record, not any kind's", async () => {
+    const user = await openWith([{ uuid: 'u-disc', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    await act(async () =>
+      pushDiscoveryEvent({
+        id: 'd-1',
+        type: 'Warning',
+        reason: 'Partial',
+        message: 'metrics.k8s.io/v1beta1 would not load',
+        count: 2,
+        firstAt: new Date(Date.now() - 60_000).toISOString(),
+        lastAt: new Date(Date.now() - 5_000).toISOString(),
+      }),
+    );
+
+    expect(await screen.findByText(/recent kind discovery/i)).toBeInTheDocument();
+    // Aggregated runs render with their occurrence count.
+    expect(await screen.findByText('Partial ×2')).toBeInTheDocument();
   });
 
   it('reports liveness apart from updates, so a quiet cache does not read as stalled', async () => {

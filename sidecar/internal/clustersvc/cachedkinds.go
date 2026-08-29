@@ -23,10 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/amorey/beehive"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
 )
 
@@ -41,7 +43,24 @@ var ClusterCachedKindGroupKind = beehive.GroupKind{Kind: "ClusterCachedKind"}
 // plural is what the worker's REST path needs and what the server guarantees unique
 // per group-version.
 func ClusterCachedKindName(cacheID beehive.ObjectID, apiVersion, resource string) string {
-	return "cachedkind/" + strconv.FormatInt(int64(cacheID), 10) + "/" + apiVersion + "/" + resource
+	return cachedKindNamePrefix + strconv.FormatInt(int64(cacheID), 10) + "/" + apiVersion + "/" + resource
+}
+
+const cachedKindNamePrefix = "cachedkind/"
+
+// cacheIDInKindName reads the cache back out of a record's name, for the one pass that has no
+// owner edge left to read it from.
+func cacheIDInKindName(name string) (int64, bool) {
+	rest, ok := strings.CutPrefix(name, cachedKindNamePrefix)
+	if !ok {
+		return 0, false
+	}
+	digits, _, ok := strings.Cut(rest, "/")
+	if !ok {
+		return 0, false
+	}
+	cacheID, err := strconv.ParseInt(digits, 10, 64)
+	return cacheID, err == nil
 }
 
 // EventsKind / EventsAPIVersion / EventsResource identify the Event collection — an
@@ -84,10 +103,9 @@ type ClusterCachedKind struct {
 	// already holds from the cache stream.
 	Owner ObjectRef
 	Spec  ClusterCachedKindSpec
-	// Conditions carry this kind's own verdict, which is the whole reason the record is
-	// served: a cache's hundred kinds fail independently, and the coarse cache-level
-	// condition can't say which. Nothing writes one today — the sync seam is being
-	// redesigned.
+	// Conditions are beehive object conditions, and empty in practice: a kind's verdict is
+	// a read-side gauge rather than a stored condition, so nothing writes one.
+	// → docs/adr/2026-08-28-records-as-timeline-anchors.md.
 	Conditions []Condition
 }
 
@@ -213,7 +231,12 @@ func (a cachedKindsAPI) Clear(ctx context.Context, id ClusterCachedKindID) (*Clu
 		return toClusterCachedKind(obj)
 	}
 
-	if err := clearKindRows(ctx, a.s.kubestoreMgr, int64(cacheID), obj.Spec); err != nil {
+	// Inside the sync's hold, scoped to this kind: a worker resuming from its cookie after
+	// the rows went would apply deltas with no cold list behind them, leaving the cache
+	// permanently short of what it held.
+	if err := a.s.kubesyncSvc.RunWithKindSyncStopped(int64(cacheID), toKubestoreKind(obj.Spec), func() error {
+		return clearKindRows(ctx, a.s.kubestoreMgr, int64(cacheID), obj.Spec)
+	}); err != nil {
 		return nil, fmt.Errorf("clear cached kind %d rows: %w", id, err)
 	}
 	return toClusterCachedKind(obj)
@@ -281,9 +304,9 @@ var kindWatch = deltaWatch[ClusterCachedKindSpec, ClusterCachedKindStatus, Clust
 	bookmark: ClusterCachedKindWatchFrame{Type: DeltaFrameBookmark},
 }
 
-// clusterCachedKindController reconciles one synced kind. Nothing mirrors a kind
-// into a cache today — the seam between this record and the per-cache store is being
-// redesigned — so a pass has no work and settles.
+// clusterCachedKindController arms one kind's sync and logs its transitions. The record is
+// what turns a kind the cluster serves into one that is actually mirrored: kubesync decides
+// what exists, and this decides what is synced.
 type clusterCachedKindController struct {
 	lifecycle.None
 	// Every kind's client, not just this one's: a cached kind reads the cache and cluster
@@ -292,9 +315,116 @@ type clusterCachedKindController struct {
 }
 
 func (c *clusterCachedKindController) Reconcile(
-	context.Context,
-	beehive.ControllerClient[ClusterCachedKindStatus],
-	*beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus],
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCachedKindStatus],
+	obj *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus],
 ) beehive.ReconcileResult {
+	cacheID, hasCache, err := c.ownerCacheID(ctx, obj)
+	if err != nil {
+		return beehive.Fail(err)
+	}
+	// A kind whose cache is gone is on its way out with it: the cache's own pass stopped the
+	// sync and removed the file, and nothing registers against a cache id that names no record.
+	//
+	// The registration is withdrawn again anyway, because ForgetCache is not the last word on
+	// it: a kind pass already in flight when the cache went can re-register this kind behind
+	// that call, and no cache pass will come round to drop it. The id comes off the record's
+	// name, which is all that still carries it here.
+	if !hasCache {
+		if obj.DeletionRequestedAt != nil {
+			if id, ok := cacheIDInKindName(obj.Name); ok {
+				c.kubesyncSvc.ForgetKind(id, toKubestoreKind(obj.Spec))
+			}
+		}
+		return beehive.Settled()
+	}
+
+	if obj.DeletionRequestedAt != nil {
+		if err := c.stopSyncAndClearRows(ctx, cacheID, obj.Spec); err != nil {
+			return beehive.Fail(err)
+		}
+		return beehive.Settled()
+	}
+
+	// Registering outlives the cache being paused, which is what makes a resume one call:
+	// kubesync holds this and runs nothing until the cache above is armed.
+	c.kubesyncSvc.TrackKind(int64(cacheID), toKubestoreKind(obj.Spec))
+
+	if err := c.logSyncVerdict(ctx, client, cacheID, obj.Spec); err != nil {
+		return beehive.Fail(err)
+	}
+	// No condition: the verdict is the gauge's, and a stored one would serve a dead
+	// process's answer until the passes caught up.
 	return beehive.Settled()
+}
+
+// stopSyncAndClearRows takes one kind down, in this order and only this one: ForgetKind
+// returns once the worker is joined, and the rows go after. Clearing first would race a relist
+// page landing behind it, leaving rows for a kind nothing syncs any more.
+func (c *clusterCachedKindController) stopSyncAndClearRows(ctx context.Context, cacheID ClusterCacheID, spec ClusterCachedKindSpec) error {
+	c.kubesyncSvc.ForgetKind(int64(cacheID), toKubestoreKind(spec))
+	if err := clearKindRows(ctx, c.kubestoreMgr, int64(cacheID), spec); err != nil {
+		return fmt.Errorf("clear cached kind %s rows: %w", spec.Resource, err)
+	}
+	return nil
+}
+
+// ownerCacheID is the cache a kind is mirrored into. Reporting false is the cache being gone,
+// which is not an error: beehive's GC cascades, so a kind outliving its cache is a race this
+// pass has to answer rather than fail on.
+func (c *clusterCachedKindController) ownerCacheID(
+	ctx context.Context,
+	obj *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus],
+) (ClusterCacheID, bool, error) {
+	owner, ok, err := c.kindClient.GetOwner(ctx, obj.ID)
+	if err != nil {
+		return 0, false, fmt.Errorf("read cached kind %d owner: %w", obj.ID, err)
+	}
+	return ClusterCacheID(owner.ID), ok, nil
+}
+
+// logSyncVerdict records this kind's verdict on its own timeline. Every pass, because
+// repeating a run's (Category, Type, Reason) extends that run rather than appending — so a
+// flapping kind costs one row per transition.
+func (c *clusterCachedKindController) logSyncVerdict(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCachedKindStatus],
+	cacheID ClusterCacheID,
+	spec ClusterCachedKindSpec,
+) error {
+	state, ok := c.kubesyncSvc.GetKindState(int64(cacheID), toKubestoreKind(spec))
+	if !ok {
+		return nil
+	}
+	if err := client.AddEvent(ctx, beehive.EventSpec{
+		Category: categorySync,
+		Type:     syncEventType(state.Reason),
+		Reason:   state.Reason,
+		Message:  state.Message,
+	}); err != nil {
+		return fmt.Errorf("log cached kind %s sync: %w", spec.Resource, err)
+	}
+	return nil
+}
+
+// syncEventType grades a kind's verdict. Stale is a warning and not a failure: the rows are
+// still served, they have simply stopped being known current.
+func syncEventType(reason string) beehive.EventType {
+	switch reason {
+	case kubesync.ReasonSyncFailed, kubesync.ReasonStale,
+		kubesync.ReasonNoConnection, kubesync.ReasonIdentityMismatch:
+		return beehive.EventWarning
+	default:
+		return beehive.EventNormal
+	}
+}
+
+// toKubestoreKind is the record's identity as the store and the sync seam both name it. The
+// three fields and nothing else: whether the kind syncs is its cache's, never relayed here.
+func toKubestoreKind(spec ClusterCachedKindSpec) kubestore.Kind {
+	return kubestore.Kind{
+		APIVersion: spec.APIVersion,
+		Kind:       spec.Kind,
+		Resource:   spec.Resource,
+	}
 }

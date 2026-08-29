@@ -34,6 +34,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
 
@@ -102,6 +103,37 @@ type kubestoreManager interface {
 	Clear(cacheID int64) error
 	Remove(cacheID int64) error
 	Stats(ctx context.Context, cacheID int64) (kubestore.Stats, error)
+}
+
+// kubesyncService is the seam that fills a cache, as this package reaches it. It speaks
+// cache ids, kube-contexts, server UIDs and GVRs; turning one of those into a record is
+// this package's business and never reaches back down.
+//
+// The two arming pairs AND rather than nest: the cache's says whether it syncs at all,
+// each kind's says which kinds, and a kind registered against an unarmed cache is held
+// rather than refused — so a cache's pass and a kind's may land in either order.
+//
+// ForgetDiscovery is a pause and ForgetCache is a teardown, and the difference is what
+// becomes of the kinds: a pause keeps them registered so a resume is one call, where a
+// deleted cache must leave nothing behind to hold them.
+//
+// **RunWithCacheSyncStopped/RunWithKindSyncStopped are what a clear runs inside.** A clear swaps the
+// file under whoever holds it open, and only kubesync can stop the workers writing
+// through it; the store work stays here, because a paused cache has no session and its
+// file is still there to clear.
+type kubesyncService interface {
+	TrackDiscovery(cacheID int64, p kubesync.Params)
+	ForgetDiscovery(cacheID int64)
+	ForgetCache(cacheID int64)
+	TrackKind(cacheID int64, k kubestore.Kind)
+	ForgetKind(cacheID int64, k kubestore.Kind)
+	GetDiscoveryState(cacheID int64) (kubesync.DiscoveryState, bool)
+	GetKindState(cacheID int64, k kubestore.Kind) (kubesync.KindState, bool)
+	WatchDiscoveryNews() kubesync.DiscoveryNews
+	WatchKindNews() kubesync.KindNews
+	RunWithCacheSyncStopped(cacheID int64, fn func() error) error
+	RunWithKindSyncStopped(cacheID int64, k kubestore.Kind, fn func() error) error
+	RestartAll()
 }
 
 // --- Identity ---

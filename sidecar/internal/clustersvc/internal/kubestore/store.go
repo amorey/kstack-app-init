@@ -392,35 +392,6 @@ func countKinds(ctx context.Context, db *sql.DB) (Counts, error) {
 	return out, nil
 }
 
-// PruneEvents drops everything outside the newest window, returning how many went.
-// Aging out is not a write, so without this nothing would emit the Deleted an events
-// watch needs — which is why a delete pings the bus like a write does.
-//
-// The window is ordered exactly as the read is (last_seen DESC, uid DESC): last_seen
-// has one-second resolution, so ties straddle the boundary, and rowid order would make
-// a relist's re-inserted rows read as phantom departures.
-func (s *Store) PruneEvents(ctx context.Context, window int) (int, error) {
-	f, err := s.file()
-	if err != nil {
-		return 0, err
-	}
-	res, err := f.db.ExecContext(ctx,
-		`DELETE FROM events WHERE uid NOT IN (
-			SELECT uid FROM events ORDER BY last_seen DESC, uid DESC LIMIT ?
-		 )`, window)
-	if err != nil {
-		return 0, fmt.Errorf("prune events: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("prune events: %w", err)
-	}
-	if n > 0 {
-		f.notify(EventsKey)
-	}
-	return int(n), nil
-}
-
 // ClearKind deletes one kind's rows, everything hanging off them, and its cookie, in one
 // transaction — for a kind that has stopped being synced. The catalog row is not one of
 // them: that table says what the cluster serves, and its one writer is the sweep.

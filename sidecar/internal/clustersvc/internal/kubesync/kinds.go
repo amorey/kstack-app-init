@@ -81,11 +81,6 @@ type pacing struct {
 	backoff supervisor.Backoff
 	// pageSize bounds one relist page, so a large collection never lands in memory whole.
 	pageSize int64
-	// eventsWindow is how many event rows the cache keeps, and eventsEvery how many arrive
-	// between prunes: the statement scans the table, so paying it per delta would make a
-	// busy cluster's event stream quadratic.
-	eventsWindow int
-	eventsEvery  int
 	// kindStartConcurrency bounds the kind syncs STARTING at once across every cache, and so
 	// bounds the cold lists: a worker holds a slot only until its first frame, so this is the
 	// gate arming a cache of hundreds of kinds needs, however many are already streaming.
@@ -97,8 +92,6 @@ func defaultPacing() pacing {
 		staleAfter:           5 * time.Minute,
 		backoff:              supervisor.Backoff{Base: time.Second, Factor: 2, Cap: time.Minute},
 		pageSize:             500,
-		eventsWindow:         5000,
-		eventsEvery:          100,
 		kindStartConcurrency: 8,
 	}
 }
@@ -272,8 +265,6 @@ type kindSyncer struct {
 	// window its rows are current for, which is a quiet collection rather than a wedged one.
 	// A plain field because one goroutine runs the whole sync.
 	proved bool
-	// sincePrune counts event deltas applied since the last prune.
-	sincePrune int
 	// relist forces this run to cold-list, for the one failure a resume cannot retry its way
 	// out of: the position the cookie names is the position the server dropped.
 	relist bool
@@ -294,13 +285,6 @@ func (ks *kindSyncer) open(ctx context.Context) (watch.Interface, error) {
 		// through Syncing on a resume poke is what makes a laptop opening cost a reconcile
 		// per kind. Only a resume slow enough to have stopped being current says so, which
 		// openWatch announces.
-		//
-		// Pruned on the way in, since the delta cadence only counts within one stream: a kind
-		// restarted more often than the cadence comes round would resume forever without ever
-		// reaching it, and a resume never takes the list that prunes.
-		if err := ks.pruneEventsNow(ctx); err != nil {
-			return nil, err
-		}
 		return ks.openWatch(ctx, cookie, true)
 	}
 	// Both starts below take a full list, and they are not the same news: a cache holding
@@ -351,12 +335,6 @@ func (ks *kindSyncer) coldList(ctx context.Context) (string, error) {
 		if next == "" {
 			break
 		}
-	}
-	// Before the commit, which is what persists the cookie: the list can carry more than the
-	// window and on an idle cluster no delta ever comes round to the cadence, so a prune that
-	// failed after this collection became resumable would leave it oversized indefinitely.
-	if err := ks.pruneEventsNow(ctx); err != nil {
-		return "", err
 	}
 	if _, err := replace.Commit(ctx, cookie); err != nil {
 		return "", err
@@ -489,29 +467,7 @@ func (ks *kindSyncer) apply(ctx context.Context, event watch.Event) error {
 	ks.proved = true
 	ks.sess.stampUpdate(ks.id)
 	ks.report(ReasonWatching)
-	return ks.pruneEvents(ctx)
-}
-
-// pruneEvents caps the events table. Events are the one collection that ages out rather than
-// being deleted by the server, so nothing else would ever emit the departure a reader needs.
-func (ks *kindSyncer) pruneEvents(ctx context.Context) error {
-	if !isCoreEvents(ks.kind) {
-		return nil
-	}
-	if ks.sincePrune++; ks.sincePrune < ks.pacing.eventsEvery {
-		return nil
-	}
-	return ks.pruneEventsNow(ctx)
-}
-
-// pruneEventsNow caps the table without waiting for the cadence.
-func (ks *kindSyncer) pruneEventsNow(ctx context.Context) error {
-	if !isCoreEvents(ks.kind) {
-		return nil
-	}
-	ks.sincePrune = 0
-	_, err := ks.store.PruneEvents(ctx, ks.pacing.eventsWindow)
-	return err
+	return nil
 }
 
 // report publishes this kind's answer, **only when it moved**: the reason is the worker's value,
@@ -543,10 +499,4 @@ func gvrOf(k kubestore.Kind) schema.GroupVersionResource {
 		return schema.GroupVersionResource{Resource: k.Resource}
 	}
 	return gv.WithResource(k.Resource)
-}
-
-// isCoreEvents asks by api version and plural, never by the Kind name: any group may serve a
-// Kind called Event, and a CRD's rows are ordinary objects.
-func isCoreEvents(k kubestore.Kind) bool {
-	return k.APIVersion == "v1" && k.Resource == "events"
 }

@@ -235,6 +235,33 @@ func TestRestartAllReEntersEveryArmedKind(t *testing.T) {
 	fake.runs.Await(t, "the sync runs again")
 }
 
+// Deleting a cache is not pausing it. What pause preserves — every kind's registration — is
+// what a teardown must drop: a cluster removed and added back would otherwise leave a cache's
+// worth of kinds behind on every cycle, held for a resume that can never come.
+func TestForgetCacheDropsTheRegistrationsPauseKeeps(t *testing.T) {
+	fake := newFakeKindSync()
+	svc, pool := newTestService(t, fake.option())
+	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
+
+	svc.TrackDiscovery(1, testParams)
+	svc.TrackKind(1, podKind)
+	fake.established.Await(t, "the stream to be standing")
+
+	// Pausing keeps it: re-arming starts the kind again with no record written and none
+	// requeued, which is the whole point of the two levels ANDing rather than nesting.
+	svc.ForgetDiscovery(1)
+	svc.TrackDiscovery(1, testParams)
+	fake.established.Await(t, "the stream to be standing again after a resume")
+
+	svc.ForgetCache(1)
+	fake.runs.Drain()
+	svc.TrackDiscovery(1, testParams)
+	// A negative assertion has no event to wait for, so it takes a bounded window off the
+	// worker's own cadence — and fails the moment a kind starts rather than at the end of it.
+	testutil.NoRecv(t, fake.runs.Chan(), quietWindow, "a kind starting under a cache that was forgotten")
+}
+
 func TestStopDrainsEveryWorker(t *testing.T) {
 	fake := newFakeKindSync()
 	svc, pool := newTestService(t, fake.option())
@@ -451,4 +478,103 @@ func TestARenameDropsTheOldGenerationsVerdictThoughTheKindStaysTracked(t *testin
 	state, ok := svc.GetKindState(1, kind)
 	assert.False(t, ok && state.Reason == reasonWithdrawnWrite,
 		"the withdrawn generation's report is not left standing under the kind that replaced it")
+}
+
+// A clear swaps the file under whoever holds it open, so the workers writing through it must be
+// down for the whole swap and unable to start inside it. kubesync runs the clear itself, since
+// only it can stop them.
+func TestRunWithKindSyncStoppedJoinsTheWorkerAndArmsItAgain(t *testing.T) {
+	fake := newFakeKindSync()
+	svc, pool := newTestService(t, fake.option())
+	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
+
+	svc.TrackDiscovery(1, testParams)
+	svc.TrackKind(1, podKind)
+	fake.established.Await(t, "the stream to be standing")
+	fake.runs.Drain()
+
+	ran := false
+	require.NoError(t, svc.RunWithKindSyncStopped(1, podKind, func() error {
+		ran = true
+		assert.Zero(t, fake.liveRuns(), "the worker is joined before the clear runs")
+		testutil.NoRecv(t, fake.runs.Chan(), quietWindow, "a worker starting inside the clear")
+		return nil
+	}))
+	assert.True(t, ran)
+
+	fake.established.Await(t, "the stream to be standing again")
+}
+
+// The error is the caller's, and the kind comes back either way: a clear that failed leaves a
+// cache that still syncs.
+func TestRunWithKindSyncStoppedArmsAgainWhenTheClearFails(t *testing.T) {
+	fake := newFakeKindSync()
+	svc, pool := newTestService(t, fake.option())
+	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
+
+	svc.TrackDiscovery(1, testParams)
+	svc.TrackKind(1, podKind)
+	fake.established.Await(t, "the stream to be standing")
+
+	failed := errors.New("clear failed")
+	assert.ErrorIs(t, svc.RunWithKindSyncStopped(1, podKind, func() error { return failed }), failed)
+
+	fake.established.Await(t, "the stream to be standing again")
+}
+
+// A paused cache has no session and its file is still there to clear, which is the whole reason
+// the store work stays with the caller.
+func TestRunWithCacheSyncStoppedRunsTheClearForACacheNobodyArmed(t *testing.T) {
+	svc, _ := newTestService(t)
+	start(t, svc)
+
+	ran := false
+	require.NoError(t, svc.RunWithCacheSyncStopped(1, func() error { ran = true; return nil }))
+	assert.True(t, ran, "a cache nobody has armed has nothing to stop and still clears")
+
+	ran = false
+	require.NoError(t, svc.RunWithKindSyncStopped(1, podKind, func() error { ran = true; return nil }))
+	assert.True(t, ran)
+}
+
+// A cache-wide clear takes the sweep down too: kind_catalog is written through the same file, so
+// a SyncKinds landing across the swap is the same hazard as a relist page.
+func TestRunWithCacheSyncStoppedJoinsEveryKindAndTheSweep(t *testing.T) {
+	fake := newFakeKindSync()
+	svc, pool := newTestService(t, fake.option())
+	pool.lease("prod").vouch(t, "uid-1")
+	start(t, svc)
+
+	other := testKind("apps/v1", "Deployment", "deployments")
+	svc.TrackDiscovery(1, testParams)
+	svc.TrackKind(1, podKind)
+	svc.TrackKind(1, other)
+	fake.established.Await(t, "the first stream to be standing")
+	fake.established.Await(t, "the second stream to be standing")
+	fake.runs.Drain()
+
+	require.NoError(t, svc.RunWithCacheSyncStopped(1, func() error {
+		assert.Zero(t, fake.liveRuns(), "every worker under the cache is joined before the clear runs")
+		testutil.NoRecv(t, fake.runs.Chan(), quietWindow, "a worker starting inside the clear")
+		_, swept := svc.discoverySupervisor.Read(discoverySubject(1))
+		assert.False(t, swept, "the sweep is down too")
+		return nil
+	}))
+
+	fake.established.Await(t, "the first stream to be standing again")
+	fake.established.Await(t, "the second stream to be standing again")
+	_, swept := svc.discoverySupervisor.Read(discoverySubject(1))
+	assert.True(t, swept, "the sweep is armed again")
+}
+
+// A second Start would put a second pair of loops on the same wait group, so the first stop
+// would drain loops only the second stop can end. beehive refuses one for the same reason.
+func TestStartRefusesASecondStart(t *testing.T) {
+	svc, _ := newTestService(t)
+	start(t, svc)
+
+	_, err := svc.Start(context.Background())
+	assert.ErrorContains(t, err, "already started")
 }

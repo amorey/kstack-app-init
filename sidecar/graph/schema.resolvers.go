@@ -272,6 +272,16 @@ func (r *subscriptionResolver) ClusterCacheStatsWatch(ctx context.Context, id cl
 	return watchStream(ctx, stream), nil
 }
 
+// ClusterCacheSyncStatusWatch is the resolver for the clusterCacheSyncStatusWatch field —
+// one cache's sync detail as a gauge. The only thing on the wire carrying a per-kind verdict.
+func (r *subscriptionResolver) ClusterCacheSyncStatusWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCacheSyncStatus, error) {
+	stream, err := r.ClusterSvc.Caches().WatchSyncStatus(ctx, id, cacheID)
+	if err != nil {
+		return nil, err
+	}
+	return watchStream(ctx, stream), nil
+}
+
 // ClusterCachedDataKindsWatch is the resolver for the clusterCachedDataKindsWatch field — one
 // ClusterCache's kind catalog as a delta watch (the live counterpart of
 // clusterCachedDataKinds), so the dashboard nav's kinds + counts track the cluster in

@@ -104,9 +104,9 @@ func TestKindsWithFingerprintReadsGarbageAsUnwritten(t *testing.T) {
 	assert.False(t, ok)
 }
 
-// last_seen has one-second resolution, so ties straddle the limit. Ordering them by rowid
-// would make a relist's re-inserted rows read as phantom Deleted/Added, so the uid tiebreak
-// is what keeps the window stable across two reads.
+// last_seen has one-second resolution, and a relist re-inserts every row with fresh rowids,
+// so rows tied on a second would reshuffle between two reads if the order were left to rowid.
+// The uid tiebreak is what makes the order total.
 func TestEventsBreaksLastSeenTiesByUID(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
@@ -114,23 +114,12 @@ func TestEventsBreaksLastSeenTiesByUID(t *testing.T) {
 		require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, event(uid, "2026-08-26T10:00:00Z")))
 	}
 
-	got, err := s.Events(ctx, 2)
+	got, err := s.Events(ctx)
 	require.NoError(t, err)
 
-	require.Len(t, got, 2)
-	assert.Equal(t, []string{"uid-c", "uid-b"}, []string{got[0].UID, got[1].UID},
-		"the window is not stable across reads")
-}
-
-// A non-positive limit is the whole window rather than nothing.
-func TestEventsDefaultsItsLimit(t *testing.T) {
-	ctx := context.Background()
-	s := newTestStore(t)
-	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, event("uid-a", "2026-08-26T10:00:00Z")))
-
-	got, err := s.Events(ctx, 0)
-	require.NoError(t, err)
-	assert.Len(t, got, 1)
+	require.Len(t, got, 3)
+	assert.Equal(t, []string{"uid-c", "uid-b", "uid-a"},
+		[]string{got[0].UID, got[1].UID, got[2].UID})
 }
 
 // Objects are keyed by Kind while a watch names the plural, so the read translates through

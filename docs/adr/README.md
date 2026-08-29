@@ -95,3 +95,5 @@ usually just documentation in the wrong place.
 | 2026-08-28 | [The probe engine is a supervisor, and a probe is a reconciler](2026-08-28-supervisor-vocabulary.md) | sidecar | Accepted |
 | 2026-08-28 | [A supervised stream is the reconciler's value, not its run](2026-08-28-the-stream-is-the-value.md) | sidecar | Superseded by [jobs and workers](2026-08-28-jobs-and-workers.md) |
 | 2026-08-28 | [The supervisor runs two kinds of thing — jobs and workers](2026-08-28-jobs-and-workers.md) | sidecar | Accepted |
+| 2026-08-28 | [A cache's sync is armed by a record's pass, never by a reader](2026-08-28-arming-is-policy-never-interest.md) | sidecar | Accepted |
+| 2026-08-28 | [A record anchors a timeline; it does not mirror a status](2026-08-28-records-as-timeline-anchors.md) | sidecar | Accepted |

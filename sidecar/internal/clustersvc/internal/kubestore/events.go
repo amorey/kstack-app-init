@@ -24,8 +24,8 @@ import (
 )
 
 // The events table's write path. Events are their own table because they carry columns
-// no object has (first_seen, last_seen, count) and are read by a different query — the
-// newest window, not a kind's contents.
+// no object has (first_seen, last_seen, count) and are read by a different query —
+// newest-first across the cache, not a kind's contents.
 
 // eventRow is one row of the events table, flattened from an Event body.
 type eventRow struct {

@@ -303,45 +303,6 @@ func TestAnEventWriteNotifiesTheEventsKey(t *testing.T) {
 
 // Aging out is not a write, so nothing would emit the Deleted a client needs for free.
 // The pruner is what keeps the window a window — and it pings, so the read sees it.
-func TestPruneEventsKeepsTheNewestWindowAndNotifies(t *testing.T) {
-	ctx := context.Background()
-	s := newTestStore(t)
-	sub := subscribe(t, s)
-	defer sub.Close()
-	for _, ev := range []*unstructured.Unstructured{
-		event("old", "2026-08-01T00:00:00Z"),
-		event("mid", "2026-08-01T00:01:00Z"),
-		event("new", "2026-08-01T00:02:00Z"),
-	} {
-		require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, ev))
-	}
-	sub.Close()
-	sub = subscribe(t, s)
-
-	pruned, err := s.PruneEvents(ctx, 2)
-
-	require.NoError(t, err)
-	assert.Equal(t, 1, pruned)
-	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM events WHERE uid='old'`))
-	assert.Equal(t, 2, countRows(t, s, `SELECT COUNT(*) FROM events`))
-	assert.Equal(t, EventsKey, recvKey(t, sub))
-}
-
-// A prune that removes nothing must not ping: a quiet cluster's tick would otherwise
-// wake every events watch forever.
-func TestPruneEventsWithinTheWindowDeletesNothing(t *testing.T) {
-	ctx := context.Background()
-	s := newTestStore(t)
-	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, event("ev-1", "2026-08-01T00:00:00Z")))
-
-	pruned, err := s.PruneEvents(ctx, 10)
-
-	require.NoError(t, err)
-	assert.Zero(t, pruned)
-}
-
-// The rollup is what the stats gauge reads: O(kinds) off the trigger-maintained counts,
-// never a scan of the objects table — and events are not a catalog kind.
 func TestRollupCountsObjectsAndKindsExcludingEvents(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
@@ -678,8 +639,6 @@ func TestAStoreWhoseFileIsGoneAnswersErrClosed(t *testing.T) {
 	_, err = store.CountKind(ctx, podKind)
 	assert.ErrorIs(t, err, ErrClosed)
 	_, err = store.Counts(ctx)
-	assert.ErrorIs(t, err, ErrClosed)
-	_, err = store.PruneEvents(ctx, 10)
 	assert.ErrorIs(t, err, ErrClosed)
 	_, err = store.BeginReplace(podKind)
 	assert.ErrorIs(t, err, ErrClosed)

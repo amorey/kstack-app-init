@@ -17,9 +17,12 @@
 package clustersvc
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"maps"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -35,7 +38,9 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // newTestBeehive returns a beehive over an in-memory store, closed on cleanup. The
@@ -348,7 +353,7 @@ func knowing(state kubeconn.State) *fakeKubeconn {
 func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), nil)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), newFakeKubesync(), nil)
 
 	_, err := registerControllers(bh, d)
 	require.NoError(t, err)
@@ -367,7 +372,7 @@ func newTestDepsAndBeehive(t *testing.T) (deps, *beehive.Beehive) {
 func newClusterStatusDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
 	t.Helper()
 	bh := newTestBeehive(t)
-	return newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), newFakeKubesync(), nil), beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
 }
 
 // newTestKubeconfig returns a started kubeconfig service over an empty temp dir, so
@@ -404,25 +409,7 @@ func newRunningBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 // every frame is the test's own doing.
 func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	t.Helper()
-	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), nil)
-}
-
-// newReconcilingDeps is the shared set over a running beehive with the controllers
-// registered, so a Requeue reaches a real pass. The other running fixture deliberately
-// reconciles nothing; this one is for the paths whose whole point is that a pass runs.
-func newReconcilingDeps(t *testing.T) (deps, *beehive.AdminClient[ClusterStatus]) {
-	t.Helper()
-	bh := newTestBeehive(t)
-	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), nil)
-
-	_, err := registerControllers(bh, d)
-	require.NoError(t, err)
-
-	stop, err := bh.Start(context.Background())
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
-
-	return d, beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind)
+	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), newFakeKubesync(), nil)
 }
 
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the
@@ -467,4 +454,162 @@ func forbidden(msg string) kubeconn.Observation[string] {
 			Failures:    1, FailingSince: probedAt,
 		},
 	}
+}
+
+// fakeKubesync stands in for the sync seam: it records what a pass armed and answers the two
+// getters from maps a test writes. The zero value has armed nothing and knows nothing, which is
+// a process whose first pass is still owed.
+type fakeKubesync struct {
+	mu sync.Mutex
+	// discovery is the params each armed cache syncs under; kinds what each has registered.
+	discovery map[int64]kubesync.Params
+	kinds     map[int64]map[kubesync.KindKey]bool
+	// discoveryStates/kindStates are what the getters answer. Absent reads false, which is
+	// what a cache nothing has answered for reports.
+	discoveryStates map[int64]kubesync.DiscoveryState
+	kindStates      map[kubesync.KindKey]kubesync.KindState
+
+	// stoppedCache/stoppedKind record what a clear ran inside.
+	stoppedCache []int64
+	stoppedKind  []kubesync.KindKey
+
+	discoveryHub *conflate.Hub[int64, struct{}]
+	kindHub      *conflate.Hub[kubesync.KindKey, struct{}]
+	restarted    *testutil.Signal
+}
+
+func newFakeKubesync() *fakeKubesync {
+	return &fakeKubesync{
+		discovery:       map[int64]kubesync.Params{},
+		kinds:           map[int64]map[kubesync.KindKey]bool{},
+		discoveryStates: map[int64]kubesync.DiscoveryState{},
+		kindStates:      map[kubesync.KindKey]kubesync.KindState{},
+		discoveryHub:    conflate.New[int64, struct{}](),
+		kindHub:         conflate.New[kubesync.KindKey, struct{}](),
+		restarted:       testutil.NewSignal(),
+	}
+}
+
+func (f *fakeKubesync) TrackDiscovery(cacheID int64, p kubesync.Params) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.discovery[cacheID] = p
+}
+
+func (f *fakeKubesync) ForgetDiscovery(cacheID int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.discovery, cacheID)
+}
+
+func (f *fakeKubesync) ForgetCache(cacheID int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.discovery, cacheID)
+	delete(f.kinds, cacheID)
+}
+
+func (f *fakeKubesync) TrackKind(cacheID int64, k kubestore.Kind) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.kinds[cacheID] == nil {
+		f.kinds[cacheID] = map[kubesync.KindKey]bool{}
+	}
+	f.kinds[cacheID][kubesync.KindKey{CacheID: cacheID, Kind: k}] = true
+}
+
+func (f *fakeKubesync) ForgetKind(cacheID int64, k kubestore.Kind) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.kinds[cacheID], kubesync.KindKey{CacheID: cacheID, Kind: k})
+}
+
+func (f *fakeKubesync) GetDiscoveryState(cacheID int64) (kubesync.DiscoveryState, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state, ok := f.discoveryStates[cacheID]
+	return state, ok
+}
+
+func (f *fakeKubesync) GetKindState(cacheID int64, k kubestore.Kind) (kubesync.KindState, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state, ok := f.kindStates[kubesync.KindKey{CacheID: cacheID, Kind: k}]
+	return state, ok
+}
+
+func (f *fakeKubesync) WatchDiscoveryNews() kubesync.DiscoveryNews { return f.discoveryHub.Receiver() }
+func (f *fakeKubesync) WatchKindNews() kubesync.KindNews           { return f.kindHub.Receiver() }
+
+func (f *fakeKubesync) RunWithCacheSyncStopped(cacheID int64, fn func() error) error {
+	f.mu.Lock()
+	f.stoppedCache = append(f.stoppedCache, cacheID)
+	f.mu.Unlock()
+	return fn()
+}
+
+func (f *fakeKubesync) RunWithKindSyncStopped(cacheID int64, k kubestore.Kind, fn func() error) error {
+	f.mu.Lock()
+	f.stoppedKind = append(f.stoppedKind, kubesync.KindKey{CacheID: cacheID, Kind: k})
+	f.mu.Unlock()
+	return fn()
+}
+
+func (f *fakeKubesync) RestartAll() { f.restarted.Fire() }
+
+// armedKinds is what a cache has registered, as the keys a test compares against.
+func (f *fakeKubesync) armedKinds(cacheID int64) []kubesync.KindKey {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	keys := slices.Collect(maps.Keys(f.kinds[cacheID]))
+	slices.SortFunc(keys, func(a, b kubesync.KindKey) int {
+		return cmp.Or(cmp.Compare(a.APIVersion, b.APIVersion), cmp.Compare(a.Resource, b.Resource))
+	})
+	return keys
+}
+
+// armedDiscovery is the params a cache is armed under, false when nothing armed it.
+func (f *fakeKubesync) armedDiscovery(cacheID int64) (kubesync.Params, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.discovery[cacheID]
+	return p, ok
+}
+
+// setKindState is a worker having answered for one kind.
+func (f *fakeKubesync) setKindState(cacheID int64, k kubestore.Kind, state kubesync.KindState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.kindStates[kubesync.KindKey{CacheID: cacheID, Kind: k}] = state
+}
+
+// setDiscoveryState is a sweep having answered for one cache.
+func (f *fakeKubesync) setDiscoveryState(cacheID int64, state kubesync.DiscoveryState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.discoveryStates[cacheID] = state
+}
+
+// publishDiscoveryNews is a sweep having something new to say about one cache.
+func (f *fakeKubesync) publishDiscoveryNews(cacheID int64) {
+	_ = f.discoveryHub.Sender().Send(cacheID, struct{}{})
+}
+
+// publishKindNews is one kind's worker having something new to say.
+func (f *fakeKubesync) publishKindNews(key kubesync.KindKey) {
+	_ = f.kindHub.Sender().Send(key, struct{}{})
+}
+
+// stoppedCaches and stoppedKinds are what a clear ran inside, for a test pinning that the
+// workers were down before the file moved under them.
+func (f *fakeKubesync) stoppedCaches() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.stoppedCache)
+}
+
+func (f *fakeKubesync) stoppedKinds() []kubesync.KindKey {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.stoppedKind)
 }

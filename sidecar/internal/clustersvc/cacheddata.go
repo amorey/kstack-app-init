@@ -89,9 +89,9 @@ type ClusterCachedDataEvent struct {
 }
 
 // ClusterCachedDataEventWatchFrame is one frame on a cache's events watch. Consumers key on
-// UID; a re-firing event arrives as Modified (its Count/LastSeen move), and one that
-// ages out of the newest-window snapshot arrives as Deleted carrying its last-known
-// row. CacheID is provenance, as on ClusterCachedDataKindWatchFrame.
+// UID; a re-firing event arrives as Modified (its Count/LastSeen move), and one the server
+// dropped arrives as Deleted carrying its last-known row. CacheID is provenance, as on
+// ClusterCachedDataKindWatchFrame.
 type ClusterCachedDataEventWatchFrame struct {
 	Type DeltaFrameType
 	// Event is nil on a Bookmark.
@@ -291,9 +291,7 @@ func (a cachedDataAPI) WatchEvents(ctx context.Context, clusterID ClusterID, cac
 		key:      func(r kubestore.EventRow) string { return r.UID },
 		changed:  func(a, b kubestore.EventRow) bool { return a != b },
 		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.EventRow, error) {
-			// The window doubles as the diff window: a row that ages out of it is one the
-			// watch reports as gone.
-			return s.Events(ctx, kubestore.DefaultEventsLimit)
+			return s.Events(ctx)
 		},
 		frame: func(t DeltaFrameType, r kubestore.EventRow) ClusterCachedDataEventWatchFrame {
 			ev := toCachedDataEvent(r)

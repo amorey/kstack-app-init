@@ -18,14 +18,17 @@ import (
 	"context"
 	"testing"
 
+	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // startTrigger starts tr and joins it on cleanup.
-func startTrigger[T any](t *testing.T, tr *trigger[T]) {
+func startTrigger[T, W any](t *testing.T, tr *trigger[T, W]) {
 	t.Helper()
 	stop, err := tr.Start(context.Background())
 	require.NoError(t, err)
@@ -164,4 +167,32 @@ func TestKubeconnTriggerWakesEveryContextThatMoved(t *testing.T) {
 		testutil.Recv(t, tr.Wakes(), "the second wake"),
 	}
 	assert.ElementsMatch(t, []string{KubeconfigName("prod"), KubeconfigName("staging")}, woke)
+}
+
+// A cache id addresses its own record, so the discovery feed's key is the whole wake and the
+// trigger requeues by id rather than resolving a name.
+func TestKubesyncDiscoveryTriggerWakesTheCacheThatMoved(t *testing.T) {
+	sync := newFakeKubesync()
+	tr := newKubesyncDiscoveryTrigger(sync)
+	startTrigger(t, tr)
+
+	sync.publishDiscoveryNews(7)
+
+	assert.Equal(t, beehive.ObjectID(7), testutil.Recv(t, tr.Wakes(), "the cache's poke"))
+}
+
+// A kind's record is named after the cache and the GVR kubesync syncs, which is why this one
+// requeues by name: the record's id is the store's to assign, its name is derivable.
+func TestKubesyncKindTriggerNamesTheKindsRecord(t *testing.T) {
+	sync := newFakeKubesync()
+	tr := newKubesyncKindTrigger(sync)
+	startTrigger(t, tr)
+
+	sync.publishKindNews(kubesync.KindKey{
+		CacheID: 7,
+		Kind:    kubestore.Kind{APIVersion: "apps/v1", Kind: "Deployment", Resource: "deployments"},
+	})
+
+	assert.Equal(t, ClusterCachedKindName(7, "apps/v1", "deployments"),
+		testutil.Recv(t, tr.Wakes(), "the kind's poke"))
 }

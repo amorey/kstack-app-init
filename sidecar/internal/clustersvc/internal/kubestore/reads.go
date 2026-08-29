@@ -27,10 +27,6 @@ import (
 // memory and a file descriptor, and the readers are the watches — a handful per window.
 const readerPoolSize = 4
 
-// DefaultEventsLimit bounds an unbounded Events read, and doubles as the events watch's
-// diff window: a row outside it is one the watch reports as gone.
-const DefaultEventsLimit = 500
-
 // Kinds reads the discovered kind catalog, ordered for stable display.
 //
 // The join is OUTER because the two tables answer different questions: kind_catalog is what
@@ -113,19 +109,13 @@ type EventRow struct {
 	InvolvedName string
 }
 
-// Events reads the newest cached events, bounded by limit; a non-positive limit means
-// DefaultEventsLimit.
-//
-// **The uid tiebreak is load-bearing.** last_seen has one-second resolution, so ties
-// straddle the limit, and a relist re-inserts every row with fresh rowids — leaving the
-// order to rowid would make the watch emit phantom Deleted/Added for rows nothing moved.
-func (s *Store) Events(ctx context.Context, limit int) ([]EventRow, error) {
+// Events reads every cached event, newest first. The uid tiebreak makes that order total:
+// last_seen has one-second resolution, and a relist re-inserts every row with fresh rowids,
+// so rows tied on a second would otherwise reshuffle between two reads.
+func (s *Store) Events(ctx context.Context) ([]EventRow, error) {
 	f, err := s.file()
 	if err != nil {
 		return nil, err
-	}
-	if limit <= 0 {
-		limit = DefaultEventsLimit
 	}
 	rows, err := f.readDB.QueryContext(ctx,
 		`SELECT uid,
@@ -133,14 +123,13 @@ func (s *Store) Events(ctx context.Context, limit int) ([]EventRow, error) {
 		        COALESCE(count, 0), COALESCE(first_seen, 0), COALESCE(last_seen, 0),
 		        COALESCE(involved_kind, ''), COALESCE(involved_ns, ''), COALESCE(involved_name, '')
 		 FROM events
-		 ORDER BY last_seen DESC, uid DESC
-		 LIMIT ?`, limit)
+		 ORDER BY last_seen DESC, uid DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("read events: %w", err)
 	}
 	defer rows.Close()
 
-	out := make([]EventRow, 0, limit)
+	var out []EventRow
 	for rows.Next() {
 		var r EventRow
 		if err := rows.Scan(

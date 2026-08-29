@@ -360,6 +360,42 @@ func (f fakeCachedKinds) Watch(ctx context.Context, id clustersvc.ClusterCachedK
 	}, clustersvc.ClusterCachedKindWatchFrame{Type: clustersvc.DeltaFrameBookmark}), nil
 }
 
+// WatchSyncStatus expands the fixture's per-kind records for one cache, the counterpart of
+// the fold WatchHealth does — enough to prove the wire shape.
+func (f fakeCaches) WatchSyncStatus(ctx context.Context, _ clustersvc.ClusterID, cacheID clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCacheSyncStatus], error) {
+	f.s.mu.Lock()
+	status := clustersvc.ClusterCacheSyncStatus{
+		CacheID:   cacheID,
+		Discovery: clustersvc.ClusterCacheDiscoveryStatus{Reason: "Discovered"},
+	}
+	for i := range f.s.cachedKinds {
+		if f.s.cachedKinds[i].Owner.ID != cacheID {
+			continue
+		}
+		spec := f.s.cachedKinds[i].Spec
+		row := clustersvc.ClusterCacheKindSyncStatus{
+			APIVersion: spec.APIVersion, Kind: spec.Kind, Resource: spec.Resource, Reason: "Watching",
+		}
+		for _, c := range f.s.cachedKinds[i].Conditions {
+			if c.Type == string(clustersvc.ConditionSynced) {
+				row.Reason, row.Message = c.Reason, c.Message
+			}
+		}
+		status.Kinds = append(status.Kinds, row)
+	}
+	f.s.mu.Unlock()
+
+	return clustersvc.NewStream(ctx, func(ctx context.Context, out chan<- clustersvc.ClusterCacheSyncStatus) error {
+		select {
+		case out <- status:
+		case <-ctx.Done():
+			return nil
+		}
+		<-ctx.Done()
+		return nil
+	}), nil
+}
+
 // WatchStats emits the fixture's single measurement and then holds the
 // stream open, as a gauge with nothing new to report does.
 func (f fakeCaches) WatchStats(ctx context.Context, _ clustersvc.ClusterID, cacheID clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCacheStats], error) {

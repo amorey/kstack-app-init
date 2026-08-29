@@ -26,10 +26,12 @@ import (
 	"context"
 	"sync"
 
+	"github.com/amorey/beehive"
 	"github.com/amorey/gobus"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
 )
@@ -43,37 +45,41 @@ type feed[T any] interface {
 	Close()
 }
 
-// trigger turns one feed into the wakes beehive requeues, each naming the record that
+// trigger turns one feed into the wakes beehive requeues, each addressing the record that
 // moved. It holds the subscription for as long as the process wants the feed, so it is a
 // lifecycle.Part like everything else that runs.
+//
+// W is how the record is addressed — a name or a beehive.ObjectID — because each source
+// already holds one and not the other, and converting between them is a store read a
+// translation must not need.
 //
 // It carries no retry ladder. A lost poke costs latency rather than divergence — every
 // kind it pokes re-arms on a cadence of its own, which is what re-reads a source when
 // nothing told it to.
-type trigger[T any] struct {
+type trigger[T, W any] struct {
 	subscribe func() feed[T]
-	// name maps one value from the feed onto the beehive name that moved. An address,
-	// never state.
-	name func(T) string
+	// address maps one value from the feed onto the record that moved. An address, never
+	// state.
+	address func(T) W
 	// wakes is what beehive reads. Unbuffered: beehive floors how often a poke reaches
 	// the store, and a queue here would be a second policy about the same thing.
-	wakes chan string
+	wakes chan W
 
 	wg sync.WaitGroup
 }
 
-func newTrigger[T any](subscribe func() feed[T], name func(T) string) *trigger[T] {
-	return &trigger[T]{subscribe: subscribe, name: name, wakes: make(chan string)}
+func newTrigger[T, W any](subscribe func() feed[T], address func(T) W) *trigger[T, W] {
+	return &trigger[T, W]{subscribe: subscribe, address: address, wakes: make(chan W)}
 }
 
-// Wakes is the channel to declare at registration, each value naming the record to
+// Wakes is the channel to declare at registration, each value addressing the record to
 // requeue. Read before Start, since registration comes first.
-func (t *trigger[T]) Wakes() <-chan string { return t.wakes }
+func (t *trigger[T, W]) Wakes() <-chan W { return t.wakes }
 
 // Start subscribes and translates until stopped. The subscription is established before
 // Start returns, so a current-on-subscribe feed pokes once for whatever the source
 // already held.
-func (t *trigger[T]) Start(context.Context) (func(context.Context) error, error) {
+func (t *trigger[T, W]) Start(context.Context) (func(context.Context) error, error) {
 	// Not Start's context, which bounds startup: this one bounds the loop and the send in
 	// flight, so it lives until the stop func cancels it.
 	loopCtx, stopLoop := context.WithCancel(context.Background())
@@ -95,10 +101,10 @@ func (t *trigger[T]) Start(context.Context) (func(context.Context) error, error)
 	}, nil
 }
 
-// run forwards one name per change until stopped or the feed closes. Cancellation ends
+// run forwards one address per change until stopped or the feed closes. Cancellation ends
 // both waits: a feed is not required to close its channel when released, so the receive
 // needs the same escape the send does.
-func (t *trigger[T]) run(ctx context.Context, sub feed[T]) {
+func (t *trigger[T, W]) run(ctx context.Context, sub feed[T]) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -110,7 +116,7 @@ func (t *trigger[T]) run(ctx context.Context, sub feed[T]) {
 			select {
 			case <-ctx.Done():
 				return
-			case t.wakes <- t.name(v):
+			case t.wakes <- t.address(v):
 			}
 		}
 	}
@@ -124,7 +130,7 @@ type kubeconfigSource interface {
 
 // newKubeconfigTrigger watches the user's kubeconfig for the kubeconfig anchor. Every
 // change names the same record: which contexts moved is that pass's to work out.
-func newKubeconfigTrigger(cfgSource kubeconfigSource) *trigger[*api.Config] {
+func newKubeconfigTrigger(cfgSource kubeconfigSource) *trigger[*api.Config, string] {
 	return newTrigger(
 		func() feed[*api.Config] { return cfgSource.Subscribe() },
 		func(*api.Config) string { return ClusterSourceNameKubeconfig },
@@ -141,11 +147,46 @@ type kubeconnSource interface {
 // new. A record reports what the pool holds rather than what the store does, so beehive
 // cannot know when that observation went stale; this is the only thing that reaches it,
 // and the kind's own resync covers a signal that went missing.
-func newKubeconnTrigger(pool kubeconnSource) *trigger[gobus.Event[string, struct{}]] {
+func newKubeconnTrigger(pool kubeconnSource) *trigger[gobus.Event[string, struct{}], string] {
 	return newTrigger(
 		func() feed[gobus.Event[string, struct{}]] { return pool.Subscribe() },
 		// The event's key is the context that moved; its value carries nothing, since what
 		// it now says is the pass's to read.
 		func(ev gobus.Event[string, struct{}]) string { return KubeconfigName(ev.Key) },
+	)
+}
+
+// discoveryNewsSource is the discovery-news half of the sync seam, all a trigger needs.
+type discoveryNewsSource interface {
+	WatchDiscoveryNews() kubesync.DiscoveryNews
+}
+
+// newKubesyncDiscoveryTrigger wakes the cache record whose sweep said something new. By ID,
+// because a cache id IS the record's id — the seam speaks the number the store assigned, and
+// resolving a name for it would be a read that says nothing the key does not.
+func newKubesyncDiscoveryTrigger(newsSource discoveryNewsSource) *trigger[gobus.Event[int64, struct{}], beehive.ObjectID] {
+	return newTrigger(
+		func() feed[gobus.Event[int64, struct{}]] { return newsSource.WatchDiscoveryNews() },
+		func(ev gobus.Event[int64, struct{}]) beehive.ObjectID { return beehive.ObjectID(ev.Key) },
+	)
+}
+
+// kindNewsSource is the kind-news half of the sync seam, all a trigger needs.
+type kindNewsSource interface {
+	WatchKindNews() kubesync.KindNews
+}
+
+// newKubesyncKindTrigger wakes the record standing for one kind in one cache. By NAME, because
+// that record's id is the store's to assign where its name is derivable from the GVR kubesync
+// already holds — which is what keeps a record id out of the seam below.
+//
+// The key carries the singular and the name does not, so a kind renamed under an unchanged
+// plural addresses the same record twice: a duplicate wake, never a missed one.
+func newKubesyncKindTrigger(newsSource kindNewsSource) *trigger[gobus.Event[kubesync.KindKey, struct{}], string] {
+	return newTrigger(
+		func() feed[gobus.Event[kubesync.KindKey, struct{}]] { return newsSource.WatchKindNews() },
+		func(ev gobus.Event[kubesync.KindKey, struct{}]) string {
+			return ClusterCachedKindName(beehive.ObjectID(ev.Key.CacheID), ev.Key.APIVersion, ev.Key.Resource)
+		},
 	)
 }

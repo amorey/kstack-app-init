@@ -103,26 +103,6 @@ func (w deltaWatch[Spec, Status, Frame]) streamList(ctx context.Context, src *be
 	})
 }
 
-// pumpChanges is pump for a source opened AFTER this stream's bookmark went out: its
-// snapshot is reported as ordinary Added frames and its own bookmark is not sent, since a
-// second one would claim a snapshot boundary the consumer has already been given.
-func (w deltaWatch[Spec, Status, Frame]) pumpChanges(
-	ctx context.Context,
-	out chan<- Frame,
-	src *beehive.ObjectListStream[Spec, Status],
-) error {
-	for _, obj := range src.Objects {
-		frame, err := w.frame(DeltaFrameAdded, obj)
-		if err != nil {
-			return err
-		}
-		if !sendFrame(ctx, out, frame) {
-			return nil
-		}
-	}
-	return w.pumpAfterSnapshot(ctx, out, src.Changes, src.Err)
-}
-
 // pump streams a snapshot, the bookmark closing it, then every change above it.
 //
 // beehive hands the snapshot complete as of a resource version, with changes carrying

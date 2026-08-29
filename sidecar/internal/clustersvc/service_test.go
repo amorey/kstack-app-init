@@ -27,6 +27,7 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/lifecycle"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/poke"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -117,8 +118,10 @@ func TestStartRejectsASecondStart(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, stop(context.Background())) }()
 
+	// kubesync is the first part in the order that refuses one; beehive refuses too, and the
+	// unwind never reaches it.
 	_, err = svc.Start(context.Background())
-	assert.ErrorContains(t, err, "start beehive")
+	assert.ErrorContains(t, err, "start kubesync")
 }
 
 // partNamed returns the service's part with that name.
@@ -297,4 +300,36 @@ func TestTheConnectionSurfaceServesAnUnreachableCluster(t *testing.T) {
 
 	assert.False(t, lease.State().Connection.OK())
 	assert.Equal(t, []string{"prod"}, pool.retried)
+}
+
+// The sync seam is a lifecycle participant like every other, and its place in the order is the
+// contract: no pass can arm a cache that is stopping, and no worker outlives the store it writes.
+func TestKubesyncStopsBetweenBeehiveAndTheStore(t *testing.T) {
+	svc, err := New(t.TempDir(), newTestKubeconfig(t), poke.New())
+	require.NoError(t, err)
+
+	var names []string
+	for _, part := range svc.(*service).parts {
+		names = append(names, part.Name)
+	}
+	require.Subset(t, names, []string{"kubestore", "kubesync", "beehive"})
+	assert.Less(t, slices.Index(names, "kubestore"), slices.Index(names, "kubesync"),
+		"kubesync starts after the store it writes through, so it stops before it")
+	assert.Less(t, slices.Index(names, "kubesync"), slices.Index(names, "beehive"),
+		"beehive starts last and stops first, so no pass arms a cache that is stopping")
+}
+
+// A watch that died under a sleeping machine reports nothing, so a resume is the only thing that
+// brings it back.
+func TestAResumePokeRestartsEverySync(t *testing.T) {
+	ctx := context.Background()
+	pokeSvc := poke.New()
+	sync := newFakeKubesync()
+
+	stop, err := restartSyncsOnResume(sync, pokeSvc).StartCloser.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(ctx)) })
+
+	pokeSvc.Poke(poke.SourceHost)
+	testutil.Wait(t, sync.restarted.Chan(), "every sync to be restarted")
 }

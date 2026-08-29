@@ -446,8 +446,8 @@ type ClusterCache {
 
   """
   This cache's control-plane event timeline (newest run first), optionally
-  filtered to one `category` (e.g. `"sync"`, the cache-sync history) and bounded
-  by `limit`. Carries only what the cache itself records — the per-kind sync
+  filtered to one `category` (e.g. `"discovery"`, the kind-discovery history) and
+  bounded by `limit`. Carries only what the cache itself records — the per-kind sync
   history lives on `ClusterCachedKind.events`. Resolved on selection and
   decoupled from the cache/list watch.
   """
@@ -501,9 +501,10 @@ type ClusterCachedKind {
   owner: ObjectRef!
   spec: ClusterCachedKindSpec!
   """
-  This record's `Synced` condition — this kind's own verdict (reasons
-  Watching/Syncing/Stale/SyncFailed/Paused/NoConnection), independent of every other
-  kind's.
+  Beehive object conditions. **Empty in practice**: this kind's verdict is a gauge, not a
+  stored condition — read it from `clusterCacheSyncStatusWatch`, which carries a row per
+  kind, or its cache-wide fold `clusterCacheHealthWatch`. A stored one would serve a dead
+  process's answer until the passes caught up.
   """
   conditions: [Condition!]!
 
@@ -589,6 +590,56 @@ type ClusterCacheHealth {
   """
   lastLiveAt: Time
 }
+
+"""
+One cache's sync detail: how discovery is doing, and a row per kind it mirrors.
+
+What `ClusterCacheHealth` folds into one verdict for a fleet view, expanded for the one
+cache a user opened. Nothing else on the wire carries a per-kind verdict.
+"""
+type ClusterCacheSyncStatus {
+  "The cache this detail is for."
+  cacheID: ObjectID!
+  "How the kind-discovery sweep is doing. Its own verdict, and not any kind's: a cluster whose `/apis` document will not load has no kinds to report the failure through."
+  discovery: ClusterCacheDiscoveryStatus!
+  "Every mirrored kind, sorted by `apiVersion` then `resource`, so a rendered list is stable across ticks."
+  kinds: [ClusterCacheKindSyncStatus!]!
+}
+
+"The kind-discovery sweep's standing answer for one cache."
+type ClusterCacheDiscoveryStatus {
+  "`Discovering`/`Discovered`/`Partial`/`DiscoveryFailed`, or `NoConnection`/`IdentityMismatch` when nothing has reached the server. Empty before any sweep has answered."
+  reason: String!
+  "Human detail behind `reason` — which group-versions did not answer, and why. Empty when there is nothing to add."
+  message: String!
+}
+
+"One mirrored kind's sync detail. Identity, verdict, freshness, and its row count."
+type ClusterCacheKindSyncStatus {
+  "The group/version this kind is served at, e.g. `\"apps/v1\"` — or a bare version for the core group."
+  apiVersion: String!
+  "The singular Kind name, e.g. `\"Deployment\"`."
+  kind: String!
+  "The lowercase plural URL segment, e.g. `\"deployments\"`. With `apiVersion`, the pair that identifies a kind."
+  resource: String!
+  "`Syncing`/`Resyncing`/`Resuming`/`Watching`/`Stale`/`SyncFailed`, or `NoConnection`/`IdentityMismatch` when the whole cache is waiting on a connection. Empty before this kind's worker has answered."
+  reason: String!
+  "Human detail behind `reason`. Empty when there is nothing to add."
+  message: String!
+  "When `reason` last moved — \"watching since 10:02\", which is what a live stream has instead of a last-attempt stamp. Null before it has."
+  sinceAt: Time
+  "When data last arrived for this kind. Null until something has landed; on a quiet collection this legitimately reads hours old, and `lastLiveAt` is what says that is fine."
+  lastUpdateAt: Time
+  "The last proof the stream is live — a delta OR a bookmark, since bookmarks exist to make an idle watch prove itself. The later of the two stamps, and the only one that tells an idle watch from a wedged one."
+  lastLiveAt: Time
+  "How many times the stream has come back inside the current healthy stretch — the flapping question a retry countdown cannot answer, since a watch that rotates every thirty seconds never fails."
+  restarts: Int!
+  "When a kind that is DOWN will be tried again. Null while its stream is up, which is what makes a non-null value the retry streak."
+  nextRetryAt: Time
+  "How many objects of this kind the cache holds. Read from the store's per-kind counts, so a paused cache still reports what it cached."
+  objectCount: Int!
+}
+
 
 # --- Cluster data ---
 # What a ClusterCache holds: the discovered kind catalog and the cached Kubernetes
@@ -848,6 +899,9 @@ type Subscription {
   "One cache's on-disk contents as a gauge. A subscription, not a `ClusterCache` field, which would freeze at subscribe time."
   clusterCacheStatsWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheStats!
 
+  "One cache's sync detail as a gauge — the discovery verdict and a row per mirrored kind. Re-read on a cadence rather than on a signal: its counts and freshness stamps move while every record under it sits still. Holds silent for a pair naming no live cache."
+  clusterCacheSyncStatusWatch(id: ObjectID!, cacheID: ObjectID!): ClusterCacheSyncStatus!
+
   # --- Cluster data ---
   "One cache's discovered kind catalog as a delta watch, keyed by `apiVersion` + `resource`. Counts are live, so an object write re-emits its kind. The live counterpart of `ClusterCache.kinds`."
   clusterCachedDataKindsWatch(
@@ -855,7 +909,7 @@ type Subscription {
     cacheID: ObjectID!
   ): ClusterCachedDataKindWatchFrame!
 
-  "One cache's newest window of cached Kubernetes Events as a delta watch, keyed by `uid`; an event aging out of the window surfaces as `Deleted`. Distinct from `eventsWatch`, which streams kstack's own timeline."
+  "One cache's cached Kubernetes Events as a delta watch, newest first, keyed by `uid`; an event the server dropped surfaces as `Deleted`. Distinct from `eventsWatch`, which streams kstack's own timeline."
   clusterCachedDataEventsWatch(
     id: ObjectID!
     cacheID: ObjectID!
