@@ -7,7 +7,7 @@ order: 5
 
 # A delete returns the uids it removed
 
-**Needs:** [spec 4](4-batched-uid-statements.md) — the cascade deletes take the returned uids as
+**Needs:** nothing; the `json_each` idiom it deletes with has landed. The cascade deletes take the returned uids as
 one bound list. **Hands on:** constant statement text for the sweep, which
 [spec 6](6-prepared-statement-cache.md) can hold.
 
@@ -77,7 +77,7 @@ conflation goes red rather than quietly losing the edge.
 
 A sweep that matches nothing marshals to `null`, and `json_each('null')` in a `WHERE uid IN (…)`
 matches nothing rather than erroring — the reverse of the same value's effect in
-[spec 4](4-batched-uid-statements.md), where it is fatal. Benign here, and worth knowing that the
+the edge-table inserts, where it is fatal. Benign here, and worth knowing that the
 difference is the statement, not the value.
 
 ## Rules

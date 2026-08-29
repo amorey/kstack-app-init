@@ -15,12 +15,16 @@
 package kubestore
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/watch"
 )
 
 // body decodes a projected row's stored JSON back into a map.
@@ -141,4 +145,131 @@ func TestProjectRefusesAnEmptyBody(t *testing.T) {
 	_, err := projectObject(&unstructured.Unstructured{})
 
 	assert.Error(t, err)
+}
+
+// podWith builds a Pod carrying the given owner references and labels. A nil for either
+// is the shape apimachinery hands back for an object that has none.
+func podWith(uid string, owners []any, labels map[string]any) *unstructured.Unstructured {
+	meta := map[string]any{"uid": uid, "name": "api-0", "namespace": "prod", "resourceVersion": "1"}
+	if owners != nil {
+		meta["ownerReferences"] = owners
+	}
+	if labels != nil {
+		meta["labels"] = labels
+	}
+	return obj(map[string]any{"apiVersion": "v1", "kind": "Pod", "metadata": meta})
+}
+
+// owner is one ownerReferences entry.
+func owner(uid string, controller bool) map[string]any {
+	return map[string]any{"uid": uid, "kind": "ReplicaSet", "name": "rs", "controller": controller}
+}
+
+func TestInsertRoundTripsEveryOwnerRef(t *testing.T) {
+	s := newTestStore(t)
+	u := podWith("uid-1", []any{owner("o-1", true), owner("o-2", false), owner("o-3", false)}, nil)
+
+	require.NoError(t, s.ApplyChange(context.Background(), podKind, watch.Added, u))
+
+	assert.Equal(t, 3, countRows(t, s, `SELECT COUNT(*) FROM owner_refs WHERE child_uid='uid-1'`))
+	assert.Equal(t, 1, countRows(t, s,
+		`SELECT is_controller FROM owner_refs WHERE child_uid='uid-1' AND owner_uid='o-1'`))
+	assert.Zero(t, countRows(t, s,
+		`SELECT is_controller FROM owner_refs WHERE child_uid='uid-1' AND owner_uid='o-2'`))
+}
+
+// The insert upserts, so only the DELETE ahead of it can retire an edge the object dropped.
+func TestInsertDropsAnOwnerRefTheObjectNoLongerCarries(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added,
+		podWith("uid-1", []any{owner("o-1", true), owner("o-2", false)}, nil)))
+
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Modified,
+		podWith("uid-1", []any{owner("o-1", true)}, nil)))
+
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM owner_refs WHERE child_uid='uid-1'`))
+}
+
+// The nil guard: OwnerRefs is built by append, so an object with no owner marshals to
+// `null`, and json_each('null') yields one all-NULL row — a NOT NULL violation under
+// STRICT, inside the relist page's transaction, for every unowned object in the cluster.
+func TestInsertTakesAnObjectWithNoOwnerRefs(t *testing.T) {
+	s := newTestStore(t)
+
+	require.NoError(t, s.ApplyChange(context.Background(), podKind, watch.Added,
+		podWith("uid-1", nil, nil)))
+
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM owner_refs WHERE child_uid='uid-1'`))
+}
+
+// recordingExecer runs nothing and keeps the text it was handed.
+type recordingExecer struct{ texts []string }
+
+func (r *recordingExecer) ExecContext(_ context.Context, q string, _ ...any) (sql.Result, error) {
+	r.texts = append(r.texts, q)
+	return driver.RowsAffected(0), nil
+}
+
+// insertTexts is the SQL one object's insert issues.
+func insertTexts(t *testing.T, u *unstructured.Unstructured) []string {
+	t.Helper()
+	row, err := projectObject(u)
+	require.NoError(t, err)
+	var ex recordingExecer
+	require.NoError(t, insertObjectRow(context.Background(), &ex, podKind, row, 0))
+	return ex.texts
+}
+
+// modernc compiles and finalizes per call and caches nothing, so text assembled from an
+// argument count is a fresh sqlite3_prepare_v2 per distinct count — and nothing a statement
+// cache could ever hold.
+func TestInsertIssuesOneTextWhateverTheOwnerRefCount(t *testing.T) {
+	one := insertTexts(t, podWith("uid-1", []any{owner("o-1", true)}, nil))
+	three := insertTexts(t, podWith("uid-2",
+		[]any{owner("o-1", true), owner("o-2", false), owner("o-3", false)}, nil))
+
+	assert.Equal(t, one, three)
+}
+
+func TestInsertRoundTripsEveryLabel(t *testing.T) {
+	s := newTestStore(t)
+	u := podWith("uid-1", nil, map[string]any{"app": "api", "tier": "web", "env": "prod"})
+
+	require.NoError(t, s.ApplyChange(context.Background(), podKind, watch.Added, u))
+
+	assert.Equal(t, 3, countRows(t, s, `SELECT COUNT(*) FROM labels WHERE uid='uid-1'`))
+	assert.Equal(t, 1, countRows(t, s,
+		`SELECT COUNT(*) FROM labels WHERE uid='uid-1' AND key='tier' AND value='web'`))
+}
+
+func TestInsertDropsALabelTheObjectNoLongerCarries(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added,
+		podWith("uid-1", nil, map[string]any{"app": "api", "tier": "web"})))
+
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Modified,
+		podWith("uid-1", nil, map[string]any{"app": "api"})))
+
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM labels WHERE uid='uid-1'`))
+}
+
+// The other half of the nil guard: an unlabelled object's Labels is the nil map
+// apimachinery returns, which marshals to `null` exactly as the ref slice does.
+func TestInsertTakesAnObjectWithNoLabels(t *testing.T) {
+	s := newTestStore(t)
+
+	require.NoError(t, s.ApplyChange(context.Background(), podKind, watch.Added,
+		podWith("uid-1", nil, nil)))
+
+	assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM labels WHERE uid='uid-1'`))
+}
+
+func TestInsertIssuesOneTextWhateverTheLabelCount(t *testing.T) {
+	one := insertTexts(t, podWith("uid-1", nil, map[string]any{"app": "api"}))
+	three := insertTexts(t, podWith("uid-2", nil,
+		map[string]any{"app": "api", "tier": "web", "env": "prod"}))
+
+	assert.Equal(t, one, three)
 }

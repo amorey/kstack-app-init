@@ -173,6 +173,15 @@ its write path:
 - **Object bodies are sanitized on the way in** — `managedFields` and the kubectl last-applied
   annotation stripped, Secret values redacted (by the *body's* own kind, so how a collection was
   addressed cannot bypass it) — which is what lets a read serve `raw_json` verbatim.
+- **A collection is bound as one JSON argument, never as a run of placeholders.** The edge tables
+  (`owner_refs`, `labels`) take one `INSERT … SELECT … FROM json_each(?) WHERE true` per object,
+  so the text is the same whatever the object carries — modernc caches no compiled statement, so
+  text that varies with an argument count is a fresh `sqlite3_prepare_v2` per distinct count.
+  Three traps: the `SELECT` list follows the JSON's shape (an array reads through `value ->> n`,
+  an object through `json_each`'s own `key`/`value`, and crossing them fails at runtime);
+  `WHERE true` is what stops SQLite parsing the `ON CONFLICT` as a join constraint; and the
+  `len(…) > 0` guards are load-bearing, because a nil marshals to `null` and `json_each('null')`
+  yields one all-NULL row. Floor is SQLite 3.38, for `->>`.
 
 **One janitor per open file**, started in `openFile` and stopped in `(*file).close` — so its
 lifetime is the file's, and a `Clear`'s fresh file gets one like any other (`openFile` has two

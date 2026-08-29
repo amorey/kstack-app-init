@@ -7,9 +7,9 @@ order: 6
 
 # Prepare each statement once, not once per call
 
-**Needs:** [specs 4](4-batched-uid-statements.md)–[5](5-deletes-return-their-uids.md) for
-statement text that does not depend on its arguments. The open contract it compiles against —
-a reader pool that refuses writes, and a pool that keeps the connections it opens — has landed.
+**Needs:** [spec 5](5-deletes-return-their-uids.md) for the last statement text that depends on
+its arguments; the edge-table inserts are already constant. The open contract it compiles against
+— a reader pool that refuses writes, and a pool that keeps the connections it opens — has landed.
 **Hands on:** nothing. Last of the sequence because it is the largest, and because everything
 before it exists to make it possible.
 

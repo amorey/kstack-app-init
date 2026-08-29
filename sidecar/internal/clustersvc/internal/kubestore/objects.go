@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -197,15 +196,27 @@ func insertObjectRow(ctx context.Context, ex execer, k Kind, row objectRow, now 
 	if _, err := ex.ExecContext(ctx, `DELETE FROM owner_refs WHERE child_uid=?`, row.UID); err != nil {
 		return err
 	}
+	// Guard, not an optimization: OwnerRefs is built by append, so an unowned object
+	// marshals to `null`, and json_each('null') yields one all-NULL row — a NOT NULL
+	// violation under STRICT. An *empty* array would expand to nothing; a nil does not.
 	if len(row.OwnerRefs) > 0 {
-		args := make([]any, 0, len(row.OwnerRefs)*3)
-		for _, ref := range row.OwnerRefs {
-			args = append(args, row.UID, ref.UID, boolToInt(ref.IsController))
+		refs := make([][2]any, len(row.OwnerRefs))
+		for i, ref := range row.OwnerRefs {
+			refs[i] = [2]any{ref.UID, ref.IsController}
 		}
-		q := `INSERT INTO owner_refs (child_uid, owner_uid, is_controller) VALUES ` +
-			valuesPlaceholders(len(row.OwnerRefs), 3) +
-			` ON CONFLICT(child_uid, owner_uid) DO UPDATE SET is_controller=excluded.is_controller`
-		if _, err := ex.ExecContext(ctx, q, args...); err != nil {
+		// Tuples, so the columns come out of the element's positions. Marshalling
+		// []ownerRef instead gives an array of objects, where `value ->> 0` is NULL.
+		refsJSON, err := json.Marshal(refs)
+		if err != nil {
+			return err
+		}
+		// WHERE true is required: without it SQLite parses ON CONFLICT as a join
+		// constraint on the SELECT and the statement is a syntax error at DO.
+		if _, err := ex.ExecContext(ctx, `
+			INSERT INTO owner_refs (child_uid, owner_uid, is_controller)
+			SELECT ?1, value ->> 0, value ->> 1 FROM json_each(?2) WHERE true
+			ON CONFLICT(child_uid, owner_uid) DO UPDATE SET is_controller=excluded.is_controller`,
+			row.UID, string(refsJSON)); err != nil {
 			return err
 		}
 	}
@@ -213,14 +224,20 @@ func insertObjectRow(ctx context.Context, ex execer, k Kind, row objectRow, now 
 	if _, err := ex.ExecContext(ctx, `DELETE FROM labels WHERE uid=?`, row.UID); err != nil {
 		return err
 	}
+	// Same guard: an unlabelled object's Labels is the nil map apimachinery returns, and
+	// it marshals to `null` exactly as the ref slice does.
 	if len(row.Labels) > 0 {
-		args := make([]any, 0, len(row.Labels)*3)
-		for key, v := range row.Labels {
-			args = append(args, row.UID, key, v)
+		labelsJSON, err := json.Marshal(row.Labels)
+		if err != nil {
+			return err
 		}
-		q := `INSERT INTO labels (uid, key, value) VALUES ` + valuesPlaceholders(len(row.Labels), 3) +
-			` ON CONFLICT(uid, key) DO UPDATE SET value=excluded.value`
-		if _, err := ex.ExecContext(ctx, q, args...); err != nil {
+		// A map marshals to an object, so the columns are json_each's own key/value.
+		// `value ->> 0` here is not merely empty — it fails with "malformed JSON".
+		if _, err := ex.ExecContext(ctx, `
+			INSERT INTO labels (uid, key, value)
+			SELECT ?1, key, value FROM json_each(?2) WHERE true
+			ON CONFLICT(uid, key) DO UPDATE SET value=excluded.value`,
+			row.UID, string(labelsJSON)); err != nil {
 			return err
 		}
 	}
@@ -296,27 +313,6 @@ func sweepObjects(ctx context.Context, ex execer, k Kind, extraWhere string, ext
 		return 0, err
 	}
 	return int(n), nil
-}
-
-// valuesPlaceholders builds "(?,?,?),(?,?,?),…" — rows tuples of cols columns.
-func valuesPlaceholders(rows, cols int) string {
-	tuple := "(" + strings.Repeat("?,", cols-1) + "?)"
-	var b strings.Builder
-	b.Grow(rows * (len(tuple) + 1))
-	for i := range rows {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(tuple)
-	}
-	return b.String()
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 // nullIfEmpty writes NULL for an empty string, so an absent reading reads as absence
