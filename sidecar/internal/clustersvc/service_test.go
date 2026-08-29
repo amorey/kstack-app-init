@@ -159,24 +159,6 @@ func TestStartDrainsBeehiveWhenAControllerFails(t *testing.T) {
 	assert.ErrorContains(t, err, "already stopped")
 }
 
-// The rebuild's remaining surface, called through the boundary the resolvers use.
-// Every entry must be deleted as its method lands: a stub that stops panicking fails
-// here, which is what keeps this list honest about what is left.
-func TestUnimplementedBoundaryPanics(t *testing.T) {
-	svc := newTestService(t)
-	ctx := context.Background()
-	var id ObjectID = 1
-
-	calls := map[string]func(){
-		"ListEvents":  func() { svc.ListEvents(ctx, id, nil, nil) },
-		"WatchEvents": func() { svc.WatchEvents(ctx, id, nil) },
-	}
-
-	for name, call := range calls {
-		t.Run(name, func(t *testing.T) { assert.Panics(t, call) })
-	}
-}
-
 // The bootstrap is a Part, so a store that cannot hold the anchors fails the start
 // rather than leaving a service whose discovery pass has nothing to run against.
 func TestStartFailsWhenTheAnchorsCannotBeCreated(t *testing.T) {

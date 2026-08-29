@@ -412,6 +412,29 @@ func newRunningDeps(t *testing.T, opts ...beehive.Option) deps {
 	return newDeps(newRunningBeehive(t, opts...), newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), newFakeKubesync(), nil)
 }
 
+// newRunningRegisteredDeps is the shared set over a beehive that is both registered
+// and started, which is the only state an event watch works in: beehive refuses
+// WatchEvents for a kind with no controller, and a stopped beehive collects nothing,
+// so a watch never learns its record went. The two halves above supply one each.
+//
+// The cost is what newRunningBeehive avoids on purpose: the reconcilers are live and
+// write their own runs into the timelines under test. Scope an assertion to a category
+// no controller writes.
+func newRunningRegisteredDeps(t *testing.T, opts ...beehive.Option) (deps, *beehive.Beehive) {
+	t.Helper()
+	bh := newTestBeehive(t, opts...)
+	d := newDeps(bh, newTestKubeconfig(t), &fakeKubeconn{}, newFakeKubestore(t), newFakeKubesync(), nil)
+
+	_, err := registerControllers(bh, d)
+	require.NoError(t, err)
+	require.NoError(t, ensureClusterSources(context.Background(), d.sourceClient))
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+	return d, bh
+}
+
 // fakeKubeconfigSource is a hub the test publishes into, standing in for the
 // watcher: same current-on-subscribe contract, driven by hand.
 type fakeKubeconfigSource struct{ hub *watch.Hub[*api.Config] }

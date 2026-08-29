@@ -60,15 +60,14 @@ side and hides when they don't. Everything else slices by kind, so one file teac
 are the subsystem's concurrency and retry budget, which only reads as a budget in one place.
 
 `New` opens the beehive store under `dataDir` and registers all four controllers; `Start` runs
-beehive, then each controller's background work. **The kstack event log still panics** —
-`TestUnimplementedBoundaryPanics` is the inventory of what is left, and an entry must be deleted as
-its method lands, since the test fails when a stub stops panicking.
+beehive, then each controller's background work. **The boundary has no stubs left** — every method
+on `Service` and its four families answers.
 
-Built so far, produced: the `ClusterSource` anchor whose pass creates `Cluster` records,
+Produced: the `ClusterSource` anchor whose pass creates `Cluster` records,
 `clusterController.Reconcile` observing what the kubeconfig says about each one
 (`status.source.kubeconfig`), and that same pass creating the `ClusterCache` for the identity a
-probe recorded. Served: the whole `Clusters()` family, the whole `Caches()` family, and the whole
-`CachedKinds()` family. What is left is the kstack event log.
+probe recorded. Served: the whole `Clusters()` family, the whole `Caches()` family, the whole
+`CachedKinds()` family, and the kstack event log (`events.go`).
 
 **The caches fill.** `clusterCacheController` arms `internal/kubesync` off the switch it already
 computes and mirrors the cluster's `kind_catalog` into the `ClusterCachedKind` records it owns;
@@ -109,6 +108,31 @@ transitions. Every pass writes unconditionally, because repeating a run's
 row per transition and a settled one costs nothing. **A session suspended for `NoConnection` writes
 no discovery event**: that fact is the cluster's, already on its own timeline, and logging it per
 cache is the same news twice.
+
+**The read side is one path for all three kinds** (`events.go`): `ListEvents` and `WatchEvents`
+take an `ObjectID` and hand it to `clusterClient` — beehive reads a timeline by id alone, so the
+client's kind picks only which registration is checked, never which rows are served. Three rules
+the code turns on:
+
+- **A nil `category` adds no option.** `beehive.WithEventCategory("")` selects the *default*
+  timeline, which is a timeline of its own; every write here carries `connection`, `discovery` or
+  `sync`, so the empty string would answer nothing rather than everything. A nil `limit` is
+  deliberately unbounded — `maxEventRuns` retention already caps each `(object, category)` pair.
+- **`WatchEvents` is `EventFrameRun` frames, one `EventFrameBookmark`, then the tail**, snapshot
+  forwarded newest-first because the client upserts by `Event.ID`. The bookmark lands even for an
+  empty timeline — it is what tells "no events" from "still arriving". The `beehive.WatchEvents`
+  call is synchronous, ahead of `NewStream`, so a refused subscribe is an error the resolver
+  answers with rather than a terminal frame on a stream the client already holds.
+- **`terminalErr` drops `beehive.ErrNotFound` and forwards the rest.** A record collected under a
+  live watch takes its log with it, so beehive ends the stream `ErrNotFound` — but the deletion is
+  the answer, and forwarding it would raise `watchFailed` once per open kind timeline when a user
+  clears a cache. `ErrWatchTooOld` stays reported: runs were lost, and a resubscribe is what makes
+  the client correct. The asymmetry to know before testing it: an id that NEVER held a row does not
+  fail — it bookmarks an empty snapshot and waits — so a bogus id proves nothing about this path.
+
+`Event.id` reuses the `ObjectID` scalar for its wire form only. Event runs come from beehive's own
+`EventID` sequence, so the scalar's uniqueness sentence is scoped to objects and an event id is
+unique within one timeline; never hand one where an object id is expected.
 
 **The store is one SQLite file per cache behind a refcounted `Manager`** (`internal/kubestore`),
 cleared by deleting the file and removed with the record it is named for. A `Store` is a *claim*
@@ -312,8 +336,12 @@ shared service is a field, never another constructor parameter** — the alterna
 through the constructors that don't use it, which is what the parameter list was doing at two kinds.
 What stays an argument is a single owner's own *configuration*, which nothing has today —
 every controller takes `deps` alone. Tests build the same struct (`newTestDeps` /
-`newRunningDeps` in `testutil_test.go`) rather than assembling clients of their own: the owner edges
-need every kind in one store, which beehive enforces.
+`newRunningDeps` / `newRunningRegisteredDeps` in `testutil_test.go`) rather than assembling clients
+of their own: the owner edges need every kind in one store, which beehive enforces. The three differ
+in what beehive is doing behind them — registered but stopped, running with no controller, or both.
+**Both is what an event watch needs** (`WatchEvents` refuses an unregistered kind, and only a
+running beehive collects), and it is the one where the reconcilers write runs of their own, so an
+assertion over it scopes itself to a category no controller writes.
 
 **One lifecycle shape at every level** — `lifecycle.StartCloser`. Beehive included: it is wrapped
 as one and sits at the head of `service.parts`, so `Start`/`Close` are one
@@ -1202,7 +1230,7 @@ consumer (a callee follows its caller — `LiveCondition` needs `TruncateMessage
 
 ### GraphQL surface (cluster)
 
-The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). Everything below answers except the `events(...)` fields, which reach `ListEvents` and still panic — so a query selecting one panics even though its parent resolves. Key entry points:
+The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `internal/clustersvc` type in `gqlgen.yml`; no projection layer. Resolvers are one-liners delegating to a family on `r.ClusterSvc` (e.g. `r.ClusterSvc.CachedData().WatchObjects`; the field is named `ClusterSvc` to avoid shadowing the generated `Clusters` method). Everything below answers. Key entry points:
 
 - Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedKindsWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).

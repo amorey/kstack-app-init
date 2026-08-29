@@ -30,9 +30,12 @@ clients (a decimal-string id on the wire). One scalar for every object kind so
 the same id machinery is reused. Use values returned by the server verbatim; do
 not construct or parse them.
 
-Ids are unique across kinds, not just within one, so they never collide — which
-is why a lookup handed another kind's id answers null rather than erroring or
-returning the wrong record.
+Object ids are unique across kinds, not just within one, so they never collide —
+which is why a lookup handed another kind's id answers null rather than erroring
+or returning the wrong record. `Event.id` reuses this scalar for its wire form
+only: an event run is not an object, its id comes from a separate sequence, and it
+is unique within one timeline rather than across the fleet. Never hand one where
+an object id is expected.
 """
 scalar ObjectID
 
@@ -132,7 +135,7 @@ unknown spellings as a degraded/unknown state. The client upserts a live stream
 by `id` (a re-delivered id is an updated run; a new id is a new run).
 """
 type Event {
-  "Stable run identity — the client's upsert key on a watch. An opaque int64 id, same wire form as ObjectID."
+  "Stable run identity — the client's upsert key on a watch. An opaque int64 id, same wire form as ObjectID, but from the event sequence: unique within this timeline, not across kinds."
   id: ObjectID!
   "The timeline this run belongs to, e.g. `\"connection\"`."
   category: String!

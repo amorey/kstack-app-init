@@ -626,11 +626,3 @@ func (s *service) cacheBelongsTo(ctx context.Context, clusterID ClusterID, cache
 	}
 	return ok && owner.ID == beehive.ObjectID(clusterID), nil
 }
-
-func (s *service) ListEvents(ctx context.Context, id ObjectID, category *string, limit *int) ([]Event, error) {
-	panic("not implemented")
-}
-
-func (s *service) WatchEvents(ctx context.Context, id ObjectID, category *string) (*Stream[EventWatchFrame], error) {
-	panic("not implemented")
-}
