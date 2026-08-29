@@ -53,6 +53,8 @@ var migrationsFS embed.FS
 type Manager struct {
 	// dir is the caches directory; each cache's file is "<cacheID>.db" inside it.
 	dir string
+	// retention is what each open file's janitor sweeps to.
+	retention Retention
 
 	// mu guards entries and removed, and is what serializes Clear against
 	// OpenOrCreate/Release: a swap must never race a Store resolving its file.
@@ -96,9 +98,16 @@ var (
 	ErrClosed = errors.New("cache store is closed")
 )
 
-// NewManager returns a Manager rooted at dir. Nothing is opened until OpenOrCreate.
-func NewManager(dir string) *Manager {
-	return newManagerWithOptions(dir)
+// NewManager returns a Manager rooted at dir, whose files hold what ret says. Nothing is
+// opened until OpenOrCreate. A zero Interval runs no janitor, which is what a test about
+// anything but sweeping opens with.
+func NewManager(dir string, ret Retention) *Manager {
+	return newManagerWithOptions(dir, withRetention(ret))
+}
+
+// withRetention is what NewManager passes; the seams below are the test-only ones.
+func withRetention(ret Retention) option {
+	return func(m *Manager) { m.retention = ret }
 }
 
 // option is a test seam, reachable only from white-box tests.
@@ -149,7 +158,7 @@ func (m *Manager) openOrCreateLocked(cacheID int64) (*Store, error) {
 	}
 	e, ok := m.entries[cacheID]
 	if !ok {
-		f, err := openFile(m.path(cacheID))
+		f, err := openFile(m.path(cacheID), cacheID, m.retention)
 		if err != nil {
 			return nil, err
 		}
@@ -251,7 +260,7 @@ func (m *Manager) Clear(cacheID int64) error {
 	// usable. On a failed delete too: the caller retries the clear, and the cache has to
 	// keep working until it lands.
 	if held {
-		f, err := openFile(path)
+		f, err := openFile(path, cacheID, m.retention)
 		if err != nil {
 			// Nothing usable to swap in, so retire the entry: a later OpenOrCreate opens
 			// the cache fresh, and the claims left on this one answer ErrClosed rather
@@ -408,9 +417,13 @@ func deleteStoreFiles(path string) error {
 	return nil
 }
 
-// openFile opens the writer pool at path, sets auto_vacuum before any table exists,
-// and applies the schema.
-func openFile(path string) (*file, error) {
+// openFile opens the writer pool at path, sets auto_vacuum before any table exists, applies
+// the schema, and starts the file's janitor.
+//
+// The janitor starts HERE rather than at either call site: Clear reopens a fresh file for the
+// claims still held, and a start at the open alone would leave a cleared cache without a
+// sweeper — the cache most likely to need one, since a clear is what frees the pages.
+func openFile(path string, cacheID int64, ret Retention) (*file, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir: %w", err)
 	}
@@ -444,7 +457,9 @@ func openFile(path string) (*file, error) {
 		db.Close()
 		return nil, fmt.Errorf("open reader pool: %w", err)
 	}
-	return newFile(db, readDB), nil
+	f := newFile(db, readDB)
+	f.startJanitor(cacheID, ret)
+	return f, nil
 }
 
 // Start is the lifecycle shape; the manager has no background work.

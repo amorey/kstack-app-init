@@ -155,6 +155,28 @@ its write path:
   annotation stripped, Secret values redacted (by the *body's* own kind, so how a collection was
   addressed cannot bypass it) — which is what lets a read serve `raw_json` verbatim.
 
+**One janitor per open file**, started in `openFile` and stopped in `(*file).close` — so its
+lifetime is the file's, and a `Clear`'s fresh file gets one like any other (`openFile` has two
+call sites, and the reopen mid-clear is the one a start at the call site misses). It trims
+`status_history` past `Retention.StatusHistoryTTL`, then hands free pages back with
+`PRAGMA incremental_vacuum`. Three rules hold it together:
+
+- **Gate on `PRAGMA freelist_count`, never on what the sweep itself deleted.** The writers that
+  actually free pages — a relist's prune, `ClearKind`, a `Remove` — do not vacuum, so a
+  rows-deleted gate would strand the file at its high-water mark and `Stats.Bytes` would report
+  the worst the cache has ever been.
+- **The vacuum is bounded** (`vacuumPagesPerSweep`), because a cache has one writer and the
+  freelist is biggest right after a relist, when blocking it hurts most. A backlog drains over
+  the following sweeps. The `status_history` delete is not bounded: one statement over a table
+  that is small by construction.
+- **Nothing waits under `m.mu`.** The stop is a cancel, and the sweep runs on the janitor's own
+  context, so it aborts mid-statement — all three exits (`Clear`, `Remove`, `Manager.Close`) hold
+  the lock across the close, and a wait there would stall `Stats` behind a vacuum. For the same
+  reason the first sweep runs inside the goroutine rather than inline in `openFile`.
+
+`NewManager(dir, Retention{...})` is the whole plumbing; production passes `DefaultRetention` and
+a zero `Interval` runs no janitor, which is what a test about anything else opens with.
+
 **The store owns the change signal, and it is a coalesced ping, not a row delta.** Writers notify
 after commit, keyed per kind (`objects/<apiVersion>/<resource>`) or on the events bus; a reader
 subscribes first, snapshots, and re-reads and diffs by UID on each ping. Closing the store closes
@@ -481,6 +503,24 @@ and `Discovery` — sharing one pool, which under HTTP/2 is one TCP connection t
 so it gets its own `http.Client` carrying a timeout instead. The pool is still the shared one, since
 client-go caches transports by TLS config — but the timeout must not ride the shared client, where
 every other caller (which bounds itself with a context) would inherit it.
+
+**Every non-watch request carries an idle-read bound** (`idletimeout.go`), installed on the
+connection's config beside the QPS/burst tuning. HTTP/2's `READ_IDLE_TIMEOUT` is connection-level
+keepalive — it detects a dead peer, not a live one that has stopped sending, which is what a
+wedged LIST is. It matters because a kind sync holds its start slot until its watch is open, past
+the cold list, so one hung LIST costs a permanent fraction of the fleet's start capacity.
+
+- **Progress, never a deadline.** Headers and every body chunk count, so a slow but streaming LIST
+  of a large collection always completes. Detection is coarse — the watchdog ticks once per window,
+  so idle-to-cancel lands in `[timeout, 2*timeout]` — and the timer re-arms only from inside its
+  own callback, never from the read path, so a read landing as the timer fires cannot race the
+  cancel.
+- **Watches are exempt**, matched by `watch=true` as a substring of `RawQuery`. A healthy watch is
+  legitimately silent between bookmarks, so a bound would kill it; `RetryWatcher` and the HTTP/2
+  keepalive govern one instead.
+- **A cancelled request reports `ErrIdleTimeout`**, not the transport's bare `context canceled` —
+  that string is what a stalled cold list ends its run with, as the `SyncFailed` message a user
+  reads. The caller's own cancel still reports itself.
 
 **The boundary in front of it is `AcquireConnection`/`RetryConnection`/`Clusters().WatchSchedule`**, all resolving the
 `ClusterID` to its context through one gate: `ErrNotFound` for an id naming nothing, and
@@ -870,6 +910,15 @@ would mean relaying the switch onto hundreds of them.
     the wait — what remains is a page request unwinding, not the cold list it was in the middle
     of — which matters because `armMu` is the Service's, so a join of any length under it stalls
     arming on every cache.
+- **A cache whose file will not open says so.** `arm` carries the failure out instead of only
+  logging it, as the discovery verdict `StoreFailed` with the driver's message — a failing read,
+  ranked above "has yet to answer". It lives in `Service.storeFailures` rather than the session,
+  because a failed start leaves none, and it is `mu`'s: the map holds **exactly** the caches whose
+  most recent arm failed. Cleared on the way into `arm` (a retry does not pass through `tearDown`,
+  since a failed arm left no session to tear down) and in `tearDown`'s first critical section,
+  above the no-session guard — a cache whose arm failed is precisely a cache with no session. The
+  message is capped where it is recorded: it is the first discovery message this package does not
+  write itself, and it leaves by two paths that bound nothing.
 - **A verdict is a gauge, never a stored condition** (`GetDiscoveryState`/`GetKindState`), and
   **no answer is not an empty answer**: `false` means nothing has been observed yet, and a caller
   folding it into "serves no kinds" deletes a record set that was only waiting.
@@ -1234,7 +1283,7 @@ The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `
 
 - Delta watches: `clustersWatch`/`clusterCachesWatch` (independent; joined client-side), `clusterCachedKindsWatch(cacheID)` (cache-scoped — ~100 records; the always-mounted registry must not carry it), `clusterCacheHealthWatch` (the fold — a gauge, **not** a delta watch, so no `Bookmark` rides it; see the gauge bullet below).
 - **Every delta watch closes its snapshot with one `FrameBookmark`**, carrying a nil entity — which is why the seven `*WatchFrame` types hold their entity by pointer and the schema types it nullable. Both are named for the frame, not the change: a frame is a change **or** the bookmark, so `ClusterChange`/`ChangeType` would each have been a lie for one value of the enum. A record watch sends it between the snapshot and the first live change, and carries a failure reason out through `Stream.Err()`. A per-cache watch must send it after the first successful read *or* the first bind that finds no open cache (an unopened cache is definitively empty, not pending), and anything that holds frames back must queue the bookmark behind them — it must not claim a snapshot is complete over frames still undecided. → [ADR: delta-watch protocol](../docs/adr/2026-08-09-delta-watch-protocol.md).
-- **Gauges are their own subscriptions, never a field on the record they describe** — `clusterCacheStatsWatch(id, cacheID)`, `clusterCacheHealthWatch`, `clusterScheduleWatch(id)`. A field would only be re-read when the record's own watch fires a frame, and each of these keeps moving after its record settles: a cache's object counts, a countdown. So a field freezes at whatever the last frame happened to carry. Re-emitting the record to refresh one is the other half of the trap — these numbers sit outside `status` precisely so a measurement never wakes the record's dependents. Current-on-subscribe, so no `Bookmark` rides them, and nothing is emitted at all before the first measurement (which is what a consumer renders "not observed yet" from). **`clusterCacheSyncStatusWatch(id, cacheID)`** is the newest: the discovery verdict plus a row per mirrored kind, each with its own reason and row count. It is the only field on the wire carrying a per-kind verdict — `clusterCacheHealthWatch` folds a cache into one, and neither record stores one — and it re-reads on the cadence alone, since its counts and stamps move while every record under it sits still.
+- **Gauges are their own subscriptions, never a field on the record they describe** — `clusterCacheStatsWatch(id, cacheID)`, `clusterCacheHealthWatch`, `clusterScheduleWatch(id)`. A field would only be re-read when the record's own watch fires a frame, and each of these keeps moving after its record settles: a cache's object counts, a countdown. So a field freezes at whatever the last frame happened to carry. Re-emitting the record to refresh one is the other half of the trap — these numbers sit outside `status` precisely so a measurement never wakes the record's dependents. Current-on-subscribe, so no `Bookmark` rides them, and nothing is emitted at all before the first measurement (which is what a consumer renders "not observed yet" from). **`clusterCacheSyncStatusWatch(id, cacheID)`** is the newest: the discovery verdict plus a row per mirrored kind, each with its own reason and row count. It is the only field on the wire carrying a per-kind verdict — `clusterCacheHealthWatch` folds a cache into one, and neither record stores one — and it re-reads on the cadence alone, since its counts and stamps move while every record under it sits still. **The fold answers a cache-level verdict first**: `StoreFailed` decides above the per-kind loop, because a cache whose file will not open arms nothing, so every kind reads as unanswered and the loop's default would report a permanently broken cache as still connecting.
 - Cache-data watches (all keyed by cluster id + cache id; frames carry `cacheID` provenance — objects additionally `apiVersion`/`resource` — so the client rejects stale frames after a swap): `clusterCachedDataKindsWatch` (kind catalog + counts; subscribes to **both** brokers via `catalogSubscribe`, since Event counts come from event triggers), `clusterCachedDataEventsWatch` (every cached event, newest first; `Deleted` when the server drops one), `clusterCachedDataObjectsWatch` (per-kind rows incl. `rawJSON`; resource-keyed broker subscription). Unopened cache → the `Bookmark` alone.
 - Point reads hang off the record that owns them, resolved on selection: every event timeline is an `events(category, limit)` field (`Cluster.events`, `ClusterCache.events`, `ClusterCachedKind.events`), the discovered kind catalog is `ClusterCache.kinds` (no arguments — both ids it reads with come off the record), and `Cluster.caches` / `ClusterCache.cachedKinds` walk the owner chain down (`Caches().List`, `CachedKinds().List`). So there are no root `cluster*Events` or `clusterCachedDataKinds` fields. The lookups `clusterCache(id)` and `clusterCachedKind(id)` (over `Caches().Get`/`CachedKinds().Get`) address a record by **its own** id, which a caller holding one from a watch frame uses directly.
 - **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCachedKind`/`clusterCachedKinds(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.cachedKinds`). The resolver picks the boundary method the argument implies — `Caches().List` when nil, `Caches().ListByCluster` when set. Keep that shape when adding a noun.

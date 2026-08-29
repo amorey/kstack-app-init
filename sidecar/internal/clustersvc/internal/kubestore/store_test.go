@@ -35,7 +35,7 @@ var (
 // newTestStore opens one cache's store for the test's life.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	store, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
@@ -357,7 +357,7 @@ func TestCountKindOfAnUnwrittenKindIsZero(t *testing.T) {
 // Closing the store ends every subscriber — which is how a Clear or a shutdown reaches
 // a live watch instead of leaving it waiting on a store that is gone.
 func TestClosingTheStoreEndsSubscribers(t *testing.T) {
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	store, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
 	sub, err := store.Subscribe()
@@ -374,7 +374,7 @@ func TestClosingTheStoreEndsSubscribers(t *testing.T) {
 
 func TestCookieRoundtripIsPerKind(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)
@@ -398,7 +398,7 @@ func TestCookieRoundtripIsPerKind(t *testing.T) {
 
 func TestStoreClearKindRemovesOnlyThatKindsCookie(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
@@ -423,7 +423,7 @@ func TestStoreClearKindRemovesOnlyThatKindsCookie(t *testing.T) {
 
 func TestStoreClearKindOnEmptyStoreSucceeds(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)
@@ -437,7 +437,7 @@ func TestStoreClearKindOnEmptyStoreSucceeds(t *testing.T) {
 // has no cascading foreign keys — and touches no other kind.
 func TestStoreClearKindDeletesObjectsAndTheirDependentRows(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
@@ -497,7 +497,7 @@ func TestStoreClearKindDeletesObjectsAndTheirDependentRows(t *testing.T) {
 // deleting from objects would leave every cached event behind.
 func TestStoreClearKindClearsTheEventsTable(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
@@ -525,7 +525,7 @@ func TestStoreClearKindClearsTheEventsTable(t *testing.T) {
 // rows, not its children's edges.
 func TestStoreClearKindKeepsARetainedChildsEdgeIntoTheClearedKind(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
@@ -566,7 +566,7 @@ func TestStoreClearKindKeepsARetainedChildsEdgeIntoTheClearedKind(t *testing.T) 
 // clearing it must leave the cached core events alone.
 func TestStoreClearKindLeavesEventsAloneForANonCoreEventKind(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
@@ -600,7 +600,7 @@ func TestStoreClearKindLeavesEventsAloneForANonCoreEventKind(t *testing.T) {
 // row: a retry after a partial failure has already dropped that row.
 func TestStoreClearKindClearsEventsWithNoCatalogRow(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
@@ -625,7 +625,7 @@ func TestStoreClearKindClearsEventsWithNoCatalogRow(t *testing.T) {
 // closed database, which is what turns a torn-down cache into one failed attempt.
 func TestAStoreWhoseFileIsGoneAnswersErrClosed(t *testing.T) {
 	ctx := context.Background()
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	store, err := m.OpenOrCreate(1)
 	require.NoError(t, err)

@@ -59,6 +59,10 @@ const (
 	// client timeout rather than a context deadline because client-go's discovery calls take
 	// no context — so without one a black-holed API server parks the caller forever.
 	discoveryTimeout = 30 * time.Second
+	// listIdleTimeout is the read-inactivity window on one non-watch request. A kind sync
+	// holds its start slot until its watch is open, i.e. past the cold list, so one wedged
+	// LIST costs a permanent fraction of the fleet's start capacity.
+	listIdleTimeout = 2 * time.Minute
 )
 
 // Connection is one identity and the clients built over the credentials reaching it. The clients
@@ -207,6 +211,7 @@ func NewConnection(cfg *rest.Config) (*Connection, error) {
 	own.QPS = defaultQPS
 	own.Burst = defaultBurst
 	own.UserAgent = userAgent
+	own.Wrap(newIdleTimeoutWrapper(listIdleTimeout))
 
 	// DefaultServerUrlFor rather than DefaultServerURL: it derives the scheme from whether the
 	// config actually carries CA or client-cert data, so a scheme-less plain-HTTP endpoint (a

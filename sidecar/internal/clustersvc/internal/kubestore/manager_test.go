@@ -32,7 +32,7 @@ import (
 
 func TestOpenCreatesFreshStoreWithNoCookie(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)
@@ -48,7 +48,7 @@ func TestOpenCreatesFreshStoreWithNoCookie(t *testing.T) {
 
 func TestTwoOpensShareOneStore(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ha, err := m.OpenOrCreate(1)
@@ -70,7 +70,7 @@ func TestTwoOpensShareOneStore(t *testing.T) {
 
 func TestCookiePersistsAcrossReleaseAndReacquire(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
@@ -92,7 +92,7 @@ func TestCookiePersistsAcrossReleaseAndReacquire(t *testing.T) {
 
 func TestClearWithNoHandlesDeletesFiles(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)
@@ -109,7 +109,7 @@ func TestClearWithNoHandlesDeletesFiles(t *testing.T) {
 
 func TestClearOnNeverExistingCacheIsNotAnError(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	require.NoError(t, m.Clear(999))
@@ -117,7 +117,7 @@ func TestClearOnNeverExistingCacheIsNotAnError(t *testing.T) {
 
 func TestClearUnderLiveHandleReopensAndKeepsHandleWorking(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
@@ -144,7 +144,7 @@ func TestClearUnderLiveHandleReopensAndKeepsHandleWorking(t *testing.T) {
 
 func TestOpenExistingClaimsACacheThatHasAFile(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
@@ -170,7 +170,7 @@ func TestOpenExistingClaimsACacheThatHasAFile(t *testing.T) {
 
 func TestStatsReportsExistsAndBytesIncludingWalAndShm(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)
@@ -193,7 +193,7 @@ func TestStatsReportsExistsAndBytesIncludingWalAndShm(t *testing.T) {
 
 func TestManagerCloseClosesEveryOpenStoreWithoutPanicking(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 
 	h1, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
@@ -209,7 +209,7 @@ func TestManagerCloseClosesEveryOpenStoreWithoutPanicking(t *testing.T) {
 // empty store is reopened for a cache that is going away.
 func TestRemoveDeletesTheFilesAndDropsTheOpenStore(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)
@@ -230,7 +230,7 @@ func TestRemoveDeletesTheFilesAndDropsTheOpenStore(t *testing.T) {
 
 func TestRemoveOnNeverExistingCacheIsNotAnError(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	require.NoError(t, m.Remove(999))
@@ -240,7 +240,7 @@ func TestRemoveOnNeverExistingCacheIsNotAnError(t *testing.T) {
 // teardown must not open a fresh file nothing will ever name again.
 func TestOpenAfterRemoveIsRefused(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)
@@ -271,7 +271,7 @@ func TestOpenAfterRemoveIsRefused(t *testing.T) {
 // Acquire in the meantime would recreate the file the retry is there to remove.
 func TestRemoveRetiresTheCacheEvenWhenCleanupFails(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)
@@ -406,7 +406,7 @@ func TestReleaseAfterAFailedClearLeavesAFreshClaimAlone(t *testing.T) {
 // schema, sidecars and all.
 func TestOpenExistingCreatesNothingForACacheWithNoFile(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, ok, err := m.OpenExisting(1)
@@ -427,7 +427,7 @@ func TestOpenExistingCreatesNothingForACacheWithNoFile(t *testing.T) {
 // that is what would resurrect a cache whose teardown deleted it.
 func TestManagerSubscribeAnswersNothingForAnUnopenedCache(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	_, ok := m.Subscribe(1)
@@ -438,7 +438,7 @@ func TestManagerSubscribeAnswersNothingForAnUnopenedCache(t *testing.T) {
 // The feed comes with no claim, so a borrower cannot keep the cache alive: the writer's
 // release still closes the file.
 func TestManagerSubscribeTakesNoClaim(t *testing.T) {
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	store, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
@@ -469,7 +469,7 @@ func cacheIsOpen(m *Manager, cacheID int64) bool {
 func TestCountsReadsAClosedCacheWithoutOpeningItForWrites(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)
@@ -490,7 +490,7 @@ func TestCountsReadsAClosedCacheWithoutOpeningItForWrites(t *testing.T) {
 
 func TestCountsOfANeverExistingCacheIsEmpty(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	got, err := m.Stats(context.Background(), 1)
@@ -506,7 +506,7 @@ func TestCountsOfANeverExistingCacheIsEmpty(t *testing.T) {
 // way.
 func TestStatsSurvivesTheFileClosingUnderIt(t *testing.T) {
 	ctx := context.Background()
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	store, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
@@ -595,7 +595,7 @@ func TestStatsWaitsOutAClear(t *testing.T) {
 // a cache that was full, and the watch would emit a Deleted for every row it held.
 func TestAClaimTakenBeforeAClearDoesNotFollowTheSwap(t *testing.T) {
 	ctx := context.Background()
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	writer, err := m.OpenOrCreate(1)
@@ -620,7 +620,7 @@ func TestAClaimTakenBeforeAClearDoesNotFollowTheSwap(t *testing.T) {
 // A fresh claim after the clear is how a reconnecting watch reaches the new file.
 func TestAFreshClaimAfterAClearReadsTheNewFile(t *testing.T) {
 	ctx := context.Background()
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	writer, err := m.OpenOrCreate(1)
@@ -643,7 +643,7 @@ func TestAFreshClaimAfterAClearReadsTheNewFile(t *testing.T) {
 // report it empty.
 func TestOpenExistingReadsACacheNobodyHoldsOpen(t *testing.T) {
 	ctx := context.Background()
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	writer, err := m.OpenOrCreate(1)
@@ -665,7 +665,7 @@ func TestOpenExistingReadsACacheNobodyHoldsOpen(t *testing.T) {
 // A watch can open before anything has created the cache's file, and must go live the moment
 // one does rather than waiting out a poll.
 func TestWatchOpenFiresWhenTheStoreOpens(t *testing.T) {
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	opened := m.WatchOpen(1)
@@ -681,7 +681,7 @@ func TestWatchOpenFiresWhenTheStoreOpens(t *testing.T) {
 // The signal is for a store that was not there yet; one already open needs no wait, and
 // OpenExisting is what the caller tries first.
 func TestWatchOpenDoesNotFireForAnAlreadyOpenStore(t *testing.T) {
-	m := NewManager(t.TempDir())
+	m := NewManager(t.TempDir(), Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	store, err := m.OpenOrCreate(1)

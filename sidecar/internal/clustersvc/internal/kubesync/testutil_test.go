@@ -19,6 +19,7 @@ package kubesync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -772,14 +774,42 @@ func listable(kind, plural string, namespaced bool) metav1.APIResource {
 // and a test drives arming rather than sync. Nothing sweeps until start.
 func newTestService(t *testing.T, opts ...option) (*Service, *fakePool) {
 	t.Helper()
-	pool := newFakePool()
-	mgr := kubestore.NewManager(t.TempDir())
+	mgr := kubestore.NewManager(t.TempDir(), kubestore.Retention{})
 	t.Cleanup(func() { _ = mgr.Close() })
+	return newTestServiceOverStore(t, mgr, opts...)
+}
+
+// newTestServiceOverStore is newTestService for a test about what the store answers
+// rather than about what is in it.
+func newTestServiceOverStore(t *testing.T, storeMgr storeManager, opts ...option) (*Service, *fakePool) {
+	t.Helper()
+	pool := newFakePool()
 
 	base := []option{newFakeKindSync().option()}
-	svc := New(pool, mgr, append(base, opts...)...)
+	svc := New(pool, storeMgr, append(base, opts...)...)
 	t.Cleanup(func() { _ = svc.Close() })
 	return svc, pool
+}
+
+// healingStore fails every open until heal, then serves the real manager — a cache whose
+// disk filled up and was cleared out.
+type healingStore struct {
+	mgr    *kubestore.Manager
+	healed atomic.Bool
+}
+
+func newHealingStore(t *testing.T) *healingStore {
+	t.Helper()
+	mgr := kubestore.NewManager(t.TempDir(), kubestore.Retention{})
+	t.Cleanup(func() { _ = mgr.Close() })
+	return &healingStore{mgr: mgr}
+}
+
+func (h *healingStore) OpenOrCreate(cacheID int64) (*kubestore.Store, error) {
+	if !h.healed.Load() {
+		return nil, errors.New("disk full")
+	}
+	return h.mgr.OpenOrCreate(cacheID)
 }
 
 // start runs the service and stops it with the test. Registered after newTestService's

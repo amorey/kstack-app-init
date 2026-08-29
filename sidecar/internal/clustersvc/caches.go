@@ -512,6 +512,11 @@ func (a cachesAPI) readCacheHealth(ctx context.Context, cacheID ClusterCacheID) 
 	}
 
 	switch {
+	case storeFailed(a.s.kubesyncSvc.GetDiscoveryState(int64(cacheID))):
+		// The cache's own verdict, above the per-kind fold: a file that will not open arms
+		// nothing, so every kind reads as unanswered and the default below would report a
+		// permanently broken cache as still connecting.
+		health.Reason = kubesync.ReasonStoreFailed
 	case health.TotalKinds == 0 || anyKindUnanswered:
 		// Still connecting, which is not Paused: an enabled cluster's cache has no kinds
 		// until its sweep has run, and calling that paused would show a user their own
@@ -524,6 +529,12 @@ func (a cachesAPI) readCacheHealth(ctx context.Context, cacheID ClusterCacheID) 
 		health.Reason = reasonByRef[health.UnhealthyKindRefs[0]]
 	}
 	return health, nil
+}
+
+// storeFailed reads the one discovery verdict the rollup folds, in the shape the getter
+// answers in.
+func storeFailed(state kubesync.DiscoveryState, ok bool) bool {
+	return ok && state.Reason == kubesync.ReasonStoreFailed
 }
 
 // syncedKindRefOf is the (APIVersion, Resource) pair that identifies a kind on the wire.

@@ -354,6 +354,7 @@ function pushCachedKind(id: string, resource: string, reason: string, apiVersion
 function pushSyncStatus(
   kinds: { apiVersion: string; resource: string; reason: string; message?: string }[],
   discoveryReason = 'Discovered',
+  discoveryMessage = '',
 ) {
   channelFor('clusterCacheSyncStatusWatch').onmessage!(
     JSON.stringify({
@@ -361,7 +362,7 @@ function pushSyncStatus(
       payload: {
         data: {
           clusterCacheSyncStatusWatch: {
-            discovery: { reason: discoveryReason, message: '' },
+            discovery: { reason: discoveryReason, message: discoveryMessage },
             kinds: kinds.map((k) => ({ message: '', objectCount: 0, ...k })),
           },
         },
@@ -947,6 +948,29 @@ describe('ClusterSyncPanel', () => {
     expect(screen.queryByText('pods')).not.toBeInTheDocument();
     expect(screen.queryByText('deployments')).not.toBeInTheDocument();
     expect(screen.queryByText('jobs')).not.toBeInTheDocument();
+  });
+
+  // Every discovery verdict reaches the webview and is dropped today. StoreFailed is the one
+  // that makes that a defect: nothing under the cache syncs, no kind is in a position to say
+  // why, and the rollup alone renders an amber "Degraded" with no reason beside it.
+  it("reports a cache whose file will not open, with the driver's message", async () => {
+    const user = await openWith([{ uuid: 'u-store', name: 'prod', enabled: true, present: true }]);
+    await user.click(await screen.findByRole('button', { name: /synced/i }));
+
+    await act(async () => pushSyncStatus([], 'StoreFailed', 'disk full'));
+
+    expect(await screen.findByText(/StoreFailed/)).toBeInTheDocument();
+    expect(await screen.findByText(/disk full/)).toBeInTheDocument();
+  });
+
+  // A store that will not open clears on its own never, and nothing syncs until someone
+  // presses Clear — at least as hard a fault as one kind failing, so it reads as an error
+  // rather than falling to the unknown-reason amber.
+  it('reads a cache-level store failure as an error, not an unknown verdict', async () => {
+    await openWith([{ uuid: 'u-storebadge', name: 'prod', enabled: true, present: true }]);
+    act(() => pushHealth('cache-u-storebadge', { status: 'False', reason: 'StoreFailed', totalKinds: 3 }));
+
+    expect(await screen.findByRole('button', { name: /storage error/i })).toBeInTheDocument();
   });
 
   it('shows no failing-kind list while every kind is watching', async () => {

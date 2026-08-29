@@ -145,8 +145,13 @@ type Service struct {
 	// their cache being forgotten.
 	sessions map[int64]*session
 	tracked  map[int64]map[kindID]kubestore.Kind
-	started  bool
-	stopped  bool
+	// storeFailures holds exactly the caches whose most recent arm could not open a store,
+	// by the driver's message. It lives outside the session because a failed arm leaves
+	// none, and it is mu's rather than armMu's: the reader below takes mu already, and so
+	// does every writer.
+	storeFailures map[int64]string
+	started       bool
+	stopped       bool
 }
 
 // New returns a Service over the connection pool and the cache directory. Nothing is
@@ -163,6 +168,7 @@ func New(connSvc connService, storeMgr storeManager, opts ...option) *Service {
 		cancel:              cancel,
 		sessions:            map[int64]*session{},
 		tracked:             map[int64]map[kindID]kubestore.Kind{},
+		storeFailures:       map[int64]string{},
 	}
 	s.pacing = defaultPacing()
 	for _, opt := range opts {
@@ -453,7 +459,16 @@ func (s *Service) GetDiscoveryState(cacheID int64) (DiscoveryState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[cacheID]
-	if !ok || !sess.hasDiscoveryState {
+	if !ok {
+		// The one verdict that lives outside a session, because a store that would not open
+		// is why there is none. Belt-and-braces against the invariant above it: a session
+		// exists only where the last arm succeeded, so a stale entry cannot be read here.
+		if msg, failed := s.storeFailures[cacheID]; failed {
+			return DiscoveryState{Reason: ReasonStoreFailed, Message: msg}, true
+		}
+		return DiscoveryState{}, false
+	}
+	if !sess.hasDiscoveryState {
 		return DiscoveryState{}, false
 	}
 	return sess.discoveryState, true
@@ -651,6 +666,10 @@ func (s *Service) arm(cacheID int64, p Params) {
 	for _, k := range s.tracked[cacheID] {
 		kinds = append(kinds, k)
 	}
+	// Cleared on the way in, so the map holds exactly the caches whose most recent arm
+	// failed: a retry reaches here without passing through tearDown, since a failed arm
+	// leaves no session for the next TrackDiscovery to tear down.
+	delete(s.storeFailures, cacheID)
 	s.sessions[cacheID] = sess
 	s.mu.Unlock()
 
@@ -664,6 +683,7 @@ func (s *Service) arm(cacheID int64, p Params) {
 		sess.cancel()
 		s.mu.Lock()
 		delete(s.sessions, cacheID)
+		s.storeFailures[cacheID] = capStoreFailure(err.Error())
 		s.mu.Unlock()
 		return
 	}
@@ -673,12 +693,30 @@ func (s *Service) arm(cacheID int64, p Params) {
 	}
 }
 
+// maxStoreFailureMessage bounds a driver error, which is the one discovery message this
+// package does not write itself. The value is clustersvc's MaxMessageLen written again:
+// that package imports this one, so the constant cannot be shared without a leaf to hold it.
+const maxStoreFailureMessage = 200
+
+// capStoreFailure bounds a message at birth. Both paths out of here — the gauge and the
+// event run clustersvc writes from it — carry it uncapped, so capping at either would fix
+// one and leave the other.
+func capStoreFailure(msg string) string {
+	if len(msg) <= maxStoreFailureMessage {
+		return msg
+	}
+	return msg[:maxStoreFailureMessage] + "…"
+}
+
 // tearDown stops cacheID's session and gives its claims back. Called under armMu, and
 // never under mu: stopping waits for bodies that commit through it.
 func (s *Service) tearDown(cacheID int64) {
 	s.mu.Lock()
 	sess, ok := s.sessions[cacheID]
 	delete(s.sessions, cacheID)
+	// Above the guard below: a cache whose arm failed has no session, which is precisely
+	// the only state that ever has an entry here.
+	delete(s.storeFailures, cacheID)
 	s.mu.Unlock()
 	if !ok {
 		return

@@ -17,6 +17,8 @@ package kubesync
 import (
 	"context"
 	"errors"
+	"maps"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -282,16 +284,12 @@ func TestStopDrainsEveryWorker(t *testing.T) {
 }
 
 func TestACacheWhoseStoreWillNotOpenArmsNothing(t *testing.T) {
-	pool := newFakePool()
-	stores := &refusingStores{}
-	svc := New(pool, stores, newFakeKindSync().option())
-	t.Cleanup(func() { _ = svc.Close() })
+	stores := refusing("open cache store")
+	svc, pool := newTestServiceOverStore(t, stores)
 
 	svc.TrackDiscovery(1, testParams)
 
 	assert.Equal(t, 0, pool.lease("prod").held(), "the context is claimed only once the file is open")
-	_, ok := svc.GetDiscoveryState(1)
-	assert.False(t, ok, "a cache that did not arm has no answer")
 
 	svc.TrackDiscovery(1, testParams)
 	assert.Equal(t, 2, stores.attempts, "the next pass retries rather than reading the cache as armed")
@@ -299,11 +297,16 @@ func TestACacheWhoseStoreWillNotOpenArmsNothing(t *testing.T) {
 
 // refusingStores is a store manager that will not open a file, which is what a cache
 // directory gone read-only looks like. Every call is from the test's own goroutine.
-type refusingStores struct{ attempts int }
+type refusingStores struct {
+	err      error
+	attempts int
+}
+
+func refusing(msg string) *refusingStores { return &refusingStores{err: errors.New(msg)} }
 
 func (r *refusingStores) OpenOrCreate(int64) (*kubestore.Store, error) {
 	r.attempts++
-	return nil, errors.New("open cache store")
+	return nil, r.err
 }
 
 func TestForgettingACacheNobodyArmedIsANoOp(t *testing.T) {
@@ -577,4 +580,76 @@ func TestStartRefusesASecondStart(t *testing.T) {
 
 	_, err := svc.Start(context.Background())
 	assert.ErrorContains(t, err, "already started")
+}
+
+// --- a cache whose file will not open ---
+
+// A cache that cannot open its store arms nothing, so there is no session for a verdict to
+// come out of — and with none, every read below it answers "nothing yet" and the user sees a
+// cluster stuck at Syncing with no reason anywhere. The failure is carried out of arm instead.
+func TestArmReportsAStoreThatWillNotOpen(t *testing.T) {
+	svc, _ := newTestServiceOverStore(t, refusing("disk full"))
+
+	svc.TrackDiscovery(1, testParams)
+
+	state, ok := svc.GetDiscoveryState(1)
+	require.True(t, ok, "a cache with no session still has a verdict")
+	assert.Equal(t, ReasonStoreFailed, state.Reason)
+	assert.Contains(t, state.Message, "disk full")
+}
+
+// A driver error is the first discovery message this package does not write itself, and it
+// leaves by two paths — the gauge and an event run — neither of which bounds one. So it is
+// bounded where it is recorded rather than at either boundary.
+func TestArmCapsWhatADriverErrorCanSay(t *testing.T) {
+	svc, _ := newTestServiceOverStore(t, refusing(strings.Repeat("x", 5000)))
+
+	svc.TrackDiscovery(1, testParams)
+
+	state, _ := svc.GetDiscoveryState(1)
+	assert.LessOrEqual(t, len(state.Message), maxStoreFailureMessage+len("…"))
+}
+
+// The retry path does not pass through tearDown — a failed arm deletes the session, so the
+// next TrackDiscovery finds none and arms again. Clearing on the way in is what keeps the
+// map holding exactly the caches whose MOST RECENT arm failed.
+func TestArmStopsReportingAFailureItHasRecoveredFrom(t *testing.T) {
+	store := newHealingStore(t)
+	svc, _ := newTestServiceOverStore(t, store)
+	svc.TrackDiscovery(1, testParams)
+	require.True(t, hasStoreFailure(svc, 1))
+
+	store.healed.Store(true)
+	svc.TrackDiscovery(1, testParams)
+
+	// The map, not the gauge: an armed session masks a stale entry, so reading the verdict
+	// would pass over exactly the leak this clear exists to prevent.
+	assert.NotContains(t, storeFailures(svc), int64(1), "the cache opened; nothing is left to report")
+}
+
+// hasStoreFailure reports the store-failure verdict, which is the one a session cannot carry.
+func hasStoreFailure(svc *Service, cacheID int64) bool {
+	state, ok := svc.GetDiscoveryState(cacheID)
+	return ok && state.Reason == ReasonStoreFailed
+}
+
+// storeFailures reads the map the invariant is about: exactly the caches whose most recent
+// arm could not open a store.
+func storeFailures(svc *Service) map[int64]string {
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	return maps.Clone(svc.storeFailures)
+}
+
+// tearDown early-returns when there was no session, and a cache whose arm failed is exactly
+// a cache with no session — so the clear sits inside the first critical section, above that
+// guard. Below it, forgetting would leave the entry behind for good.
+func TestForgetDiscoveryDropsAStoreFailure(t *testing.T) {
+	svc, _ := newTestServiceOverStore(t, refusing("disk full"))
+	svc.TrackDiscovery(1, testParams)
+	require.True(t, hasStoreFailure(svc, 1))
+
+	svc.ForgetDiscovery(1)
+
+	assert.False(t, hasStoreFailure(svc, 1), "a forgotten cache reports nothing")
 }

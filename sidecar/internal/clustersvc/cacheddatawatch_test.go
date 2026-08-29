@@ -57,7 +57,7 @@ type watchFixture struct {
 
 func newWatchFixture(t *testing.T) *watchFixture {
 	t.Helper()
-	m := kubestore.NewManager(t.TempDir())
+	m := kubestore.NewManager(t.TempDir(), kubestore.Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	return &watchFixture{t: t, m: m}
 }

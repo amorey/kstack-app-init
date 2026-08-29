@@ -714,7 +714,7 @@ func TestAColdStartOffAPositionTheServerHasDroppedRelists(t *testing.T) {
 	stream := cluster.streamKind(podKind)
 
 	pool := newFakePool()
-	mgr := kubestore.NewManager(t.TempDir())
+	mgr := kubestore.NewManager(t.TempDir(), kubestore.Retention{})
 	t.Cleanup(func() { _ = mgr.Close() })
 	pool.lease("prod").connect(t, cluster, "uid-1")
 

@@ -562,10 +562,12 @@ type ClusterCacheHealth {
   cacheID: ObjectID!
   status: ConditionStatus!
   """
-  The dominant per-kind reason: a hard failure beats a stall beats a wait beats a
-  catch-up, and `Paused` speaks only when every kind is paused. `Unknown`/`Syncing` with
-  `totalKinds: 0` means the discovery pass has not landed yet — not a fault, and not
-  health either.
+  A cache-level verdict where there is one, and otherwise the dominant per-kind reason.
+  `StoreFailed` is the cache-level one: its file will not open, so nothing under it is
+  syncing and no kind is in a position to say so. Failing that, the per-kind fold — a hard
+  failure beats a stall beats a wait beats a catch-up, and `Paused` speaks only when every
+  kind is paused. `Unknown`/`Syncing` with `totalKinds: 0` means the discovery pass has not
+  landed yet — not a fault, and not health either.
   """
   reason: String!
   """
@@ -611,7 +613,7 @@ type ClusterCacheSyncStatus {
 
 "The kind-discovery sweep's standing answer for one cache."
 type ClusterCacheDiscoveryStatus {
-  "`Discovering`/`Discovered`/`Partial`/`DiscoveryFailed`, or `NoConnection`/`IdentityMismatch` when nothing has reached the server. Empty before any sweep has answered."
+  "`Discovering`/`Discovered`/`Partial`/`DiscoveryFailed`, `NoConnection`/`IdentityMismatch` when nothing has reached the server, or `StoreFailed` when the cache's own file will not open. Empty before any sweep has answered."
   reason: String!
   "Human detail behind `reason` — which group-versions did not answer, and why. Empty when there is nothing to add."
   message: String!

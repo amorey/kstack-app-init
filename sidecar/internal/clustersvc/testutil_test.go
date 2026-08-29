@@ -214,7 +214,7 @@ func (f *fakeKubestore) OpenExisting(cacheID int64) (*kubestore.Store, bool, err
 // newFakeKubestore builds the fake over a real manager, closed with the test.
 func newFakeKubestore(t *testing.T) *fakeKubestore {
 	t.Helper()
-	mgr := kubestore.NewManager(t.TempDir())
+	mgr := kubestore.NewManager(t.TempDir(), kubestore.Retention{})
 	t.Cleanup(func() { assert.NoError(t, mgr.Close()) })
 	return &fakeKubestore{mgr: mgr}
 }

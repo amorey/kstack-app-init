@@ -54,6 +54,10 @@ const (
 	ReasonPartial = "Partial"
 	// ReasonDiscoveryFailed: the sweep failed and is retrying.
 	ReasonDiscoveryFailed = "DiscoveryFailed"
+	// ReasonStoreFailed: the cache's file would not open, so nothing under it is armed.
+	// A failing read like DiscoveryFailed, and it outranks "has yet to answer" the same
+	// way — but it clears on its own never: the cache stays broken until someone clears it.
+	ReasonStoreFailed = "StoreFailed"
 )
 
 // The per-kind vocabulary. A kind reports NoConnection and IdentityMismatch too: every run

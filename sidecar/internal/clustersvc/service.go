@@ -408,7 +408,7 @@ func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service)
 	kubeconnSvc := kubeconn.New(kubeconfigSvc)
 	// One store per cache under the registry, which the boundary reads, clears, and
 	// removes.
-	kubestoreMgr := kubestore.NewManager(filepath.Join(dataDir, "caches"))
+	kubestoreMgr := kubestore.NewManager(filepath.Join(dataDir, "caches"), kubestore.DefaultRetention)
 	// What fills them: it discovers what each cluster serves and mirrors every served kind
 	// into that cluster's file. Armed by the cache and kind passes, never by a reader.
 	kubesyncSvc := kubesync.New(kubeconnSvc, kubestoreMgr)

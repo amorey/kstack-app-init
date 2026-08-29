@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -105,6 +106,10 @@ type file struct {
 	// an open one for the file's life.
 	readDB *sql.DB
 	hub    *conflate.Hub[string, struct{}]
+	// stopJanitor retires this file's sweeper. A cancel and never a wait: all three exits
+	// hold m.mu across the close, and a wait there would stall Stats behind a vacuum. The
+	// sweep runs on the janitor's own context, so the cancel aborts it mid-statement.
+	stopJanitor context.CancelFunc
 	// now is the wall clock in millis; a seam so a test can freeze it. Reads go through
 	// stamp, never here.
 	now func() int64
@@ -153,8 +158,21 @@ func (f *file) notify(key string) { _ = f.hub.Sender().Send(key, struct{}{}) }
 // close closes both pools and ends every subscriber, which is how a clear or a
 // shutdown reaches a live watch.
 func (f *file) close() error {
+	if f.stopJanitor != nil {
+		f.stopJanitor()
+	}
 	f.hub.Close()
 	return errors.Join(f.db.Close(), f.readDB.Close())
+}
+
+// startJanitor spawns this file's sweeper, or nothing when no interval is set.
+func (f *file) startJanitor(cacheID int64, ret Retention) {
+	if ret.Interval <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	f.stopJanitor = cancel
+	go runJanitor(ctx, strconv.FormatInt(cacheID, 10), f.db, ret)
 }
 
 // newFile wraps the open pools. Nothing else builds one — openFile is the only caller.

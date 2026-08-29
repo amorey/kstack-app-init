@@ -432,6 +432,11 @@ function statusOf(c: Cluster, group: Group): { label: string; tone: Tone } {
   switch (health.reason) {
     case 'SyncFailed':
       return { label: 'Error', tone: 'error' };
+    // The cache's file will not open, so nothing under it syncs and no kind can say why.
+    // It clears on its own never — the Clear button is the fix — which is why it reads as
+    // hard as a failing kind rather than as a stall.
+    case 'StoreFailed':
+      return { label: 'Storage error', tone: 'error' };
     // A watch went quiet past the freshness threshold: amber, not a hard error.
     case 'Stale':
       return { label: 'Stale', tone: 'attention' };
@@ -811,6 +816,7 @@ function SyncDetail({
         {/* No fallback: omit rather than assert a verification that never happened. */}
         <DetailRow label="Sync verified" ms={lastLiveMs} />
       </dl>
+      {syncStatus?.discovery.reason ? <DiscoveryVerdict discovery={syncStatus.discovery} /> : null}
       {failingKinds.length > 0 ? <FailingKindList kinds={failingKinds} /> : null}
       {events.runs.length > 0 ? (
         <EventRunList
@@ -833,6 +839,18 @@ function SyncDetail({
         />
       ) : null}
     </div>
+  );
+}
+
+// The kind-discovery sweep's own verdict. Not any kind's: a cluster whose `/apis` document
+// will not load, or whose cache file will not open, has no kind in a position to report it.
+function DiscoveryVerdict({ discovery }: { discovery: { reason: string; message: string } }) {
+  const tone = discovery.reason === 'StoreFailed' ? TONE.error.text : 'text-muted-foreground';
+  return (
+    <p className={`text-xs ${tone}`}>
+      Kind discovery: {discovery.reason}
+      {discovery.message ? ` — ${discovery.message}` : ''}
+    </p>
   );
 }
 

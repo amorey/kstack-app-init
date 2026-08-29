@@ -879,6 +879,24 @@ func TestCachePassLogsTheDiscoveryVerdict(t *testing.T) {
 	assert.Equal(t, "the /apis document would not load", client.events[0].Message)
 }
 
+// A store failure is THIS cache's, not the cluster's, so it passes the guard that holds back
+// NoConnection and IdentityMismatch and lands on the timeline. A guard rather than a red test:
+// logDiscoveryVerdict needs no change for it, and this is what keeps it that way.
+func TestCachePassLogsAStoreFailure(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	syncFake(d).setDiscoveryState(int64(cache.ID), kubesync.DiscoveryState{
+		Reason: kubesync.ReasonStoreFailed, Message: "disk full",
+	})
+
+	client := reconcileCache(t, d, cache)
+
+	require.Len(t, client.events, 1)
+	assert.Equal(t, kubesync.ReasonStoreFailed, client.events[0].Reason)
+	assert.Equal(t, "disk full", client.events[0].Message)
+}
+
 // A suspended session is the CLUSTER's fact, already on its own timeline; logging it per cache
 // is the same news twice.
 func TestCachePassLogsNoDiscoveryEventForALostConnection(t *testing.T) {
@@ -1072,6 +1090,23 @@ func TestCachesWatchHealthReadsAKindWithNoAnswerAsConnecting(t *testing.T) {
 	assert.Empty(t, got.UnhealthyKindRefs, "a kind that has not answered is not an offender")
 }
 
+// A cache whose file will not open has no session behind it, so every kind reads as
+// unanswered and the per-kind fold sits at Connecting for good — an amber badge with no
+// reason anywhere. The store's verdict is the cache's own, and it decides above the fold.
+func TestCachesWatchHealthReportsACacheWhoseStoreWillNotOpen(t *testing.T) {
+	d, cacheID := syncingCacheWithKinds(t)
+	syncFake(d).setDiscoveryState(int64(cacheID), kubesync.DiscoveryState{
+		Reason: kubesync.ReasonStoreFailed, Message: "disk full",
+	})
+
+	stream, err := serviceOver(t, d).Caches().WatchHealth(context.Background())
+	require.NoError(t, err)
+
+	got := testutil.Recv(t, stream.Frames, "the cache's verdict")
+	assert.Equal(t, ConditionFalse, got.Status)
+	assert.Equal(t, kubesync.ReasonStoreFailed, got.Reason)
+}
+
 // --- the per-cache sync detail ---
 
 // The detail gauge is the only thing on the wire that can carry a per-kind verdict, so it
@@ -1104,6 +1139,25 @@ func TestCachesWatchSyncStatusServesTheDiscoveryReasonAndEveryKind(t *testing.T)
 
 // The count comes off the store, never off the seam: kubesync knows only the caches it has
 // armed, where kubestore answers for a paused one too.
+// The panel's own report of the failure. A guard, like the timeline one: the projection is
+// reason-agnostic, and this is what stops a future narrowing from dropping the one verdict
+// that has no kind to speak through.
+func TestCachesWatchSyncStatusCarriesAStoreFailure(t *testing.T) {
+	d, cacheID := syncingCacheWithKinds(t)
+	cluster, _, err := d.cacheClient.GetOwner(context.Background(), beehive.ObjectID(cacheID))
+	require.NoError(t, err)
+	syncFake(d).setDiscoveryState(int64(cacheID), kubesync.DiscoveryState{
+		Reason: kubesync.ReasonStoreFailed, Message: "disk full",
+	})
+
+	stream, err := serviceOver(t, d).Caches().WatchSyncStatus(context.Background(), ClusterID(cluster.ID), cacheID)
+	require.NoError(t, err)
+
+	got := testutil.Recv(t, stream.Frames, "the cache's sync detail")
+	assert.Equal(t, kubesync.ReasonStoreFailed, got.Discovery.Reason)
+	assert.Equal(t, "disk full", got.Discovery.Message)
+}
+
 // The gauge re-emits only when the detail moved: it is re-read on a cadence, and an idle
 // cache pushing a frame per tick would re-render the panel over an answer nothing changed.
 func TestCachesWatchSyncStatusEmitsOnlyOnAChange(t *testing.T) {
