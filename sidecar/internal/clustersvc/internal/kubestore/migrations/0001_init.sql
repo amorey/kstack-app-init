@@ -20,10 +20,13 @@
 -- cluster_meta is a free-form key/value bag for sync bookkeeping
 -- (per-kind last LIST resourceVersion + timestamp, etc.) so new
 -- metadata doesn't require a migration.
+-- WITHOUT ROWID because the row is barely more than its key: as a rowid table SQLite
+-- would store that key a second time in an autoindex. Nothing indexes it, so there is no
+-- index growth paying the saving back.
 CREATE TABLE cluster_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-) STRICT;
+) STRICT, WITHOUT ROWID;
 
 -- One row per Kubernetes object (built-in or CRD). The universal entry point.
 --
@@ -61,6 +64,10 @@ CREATE TABLE cluster_meta (
 -- text. The format is self-identifying (a zlib stream begins with 0x78, plain
 -- JSON with '{' = 0x7B), so there is no version prefix yet; one can be added
 -- later without a migration.
+--
+-- A rowid table, unlike the all-key tables here: WITHOUT ROWID wants small rows, and
+-- raw_json sitting in overflow pages the identity read never touches is what makes the
+-- objects watch's per-ping read cheap.
 CREATE TABLE objects (
     uid              TEXT PRIMARY KEY,
     api_version      TEXT NOT NULL,
@@ -85,22 +92,32 @@ CREATE INDEX objects_ns_kind      ON objects(namespace, api_version, kind);
 
 -- Ownership graph (Deployment → ReplicaSet → Pod, Job → Pod, CRD → CRD).
 -- Pre-extracted from metadata.ownerReferences so JOINs replace JSON parsing.
+--
+-- WITHOUT ROWID: the row is its key plus a flag, and ordering the rows by that key puts
+-- one child's refs contiguous, so the write path's WHERE child_uid = ? is a single descent
+-- of the table rather than an autoindex probe and a rowid fetch per row. owner_refs_owner
+-- pays part of it back, carrying the full key where it carried an 8-byte rowid; adding a
+-- wide index here is what would turn the trade.
 CREATE TABLE owner_refs (
     child_uid     TEXT NOT NULL,
     owner_uid     TEXT NOT NULL,
     is_controller INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (child_uid, owner_uid)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 CREATE INDEX owner_refs_owner ON owner_refs(owner_uid);
 
 -- Labels, one row per (object, key). Makes Service-selector resolution
 -- a JOIN ("which Pods match these key/value pairs?").
+--
+-- WITHOUT ROWID, for the reason owner_refs is: a small row keyed by a uid prefix, so
+-- rewriting one object's labels is one contiguous descent. labels_kv carries
+-- (key, value, uid) where it carried (key, value, rowid).
 CREATE TABLE labels (
     uid   TEXT NOT NULL,
     key   TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (uid, key)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 CREATE INDEX labels_kv ON labels(key, value);
 
 -- Events. Separate from objects because they have unique columns
@@ -108,6 +125,9 @@ CREATE INDEX labels_kv ON labels(key, value);
 -- (filtered by involved_uid + time range, very high volume).
 -- involved_uid is nullable because some events reference an object by
 -- name only (e.g. before the involvedObject's UID is observed).
+--
+-- Keeps its rowid: events_fts is declared content_rowid='rowid' and its triggers insert
+-- new.rowid/old.rowid. A WITHOUT ROWID table has none, so the full-text index would break.
 CREATE TABLE events (
     uid           TEXT PRIMARY KEY,
     involved_uid  TEXT,
@@ -168,6 +188,9 @@ CREATE INDEX status_history_uid_at ON status_history(uid, at DESC);
 -- It is also load-bearing for reads: the objects table is keyed by kind, while a
 -- watch is opened on the plural resource, so store.Objects resolves one to the
 -- other through this table. A kind with rows and no catalog row reads as empty.
+--
+-- A rowid table: schema_json holds a CRD's whole OpenAPI schema, which is the wide row
+-- WITHOUT ROWID is wrong for.
 CREATE TABLE kind_catalog (
     api_version  TEXT NOT NULL,
     kind         TEXT NOT NULL,
@@ -201,12 +224,15 @@ CREATE UNIQUE INDEX kind_catalog_api_resource ON kind_catalog(api_version, resou
 -- ('v1','Event') that only the Event sync's own registration puts in the catalog.
 -- Keying kind_counts on (api_version, kind) alone keeps it exactly consistent with
 -- the objects table within each write transaction, independent of catalog churn.
+--
+-- WITHOUT ROWID: two key columns and a counter, one row per kind, and no secondary index
+-- to pay the saving back.
 CREATE TABLE kind_counts (
     api_version TEXT NOT NULL,
     kind        TEXT NOT NULL,
     count       INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (api_version, kind)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 
 -- A new object bumps its kind's counter. An update of an existing object goes
 -- through INSERT ... ON CONFLICT(uid) DO UPDATE, which fires the UPDATE trigger

@@ -31,7 +31,6 @@ package kubestore
 import (
 	"context"
 	"database/sql"
-	"embed"
 	"errors"
 	"fmt"
 	"os"
@@ -43,9 +42,6 @@ import (
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/sqlitemigrate"
 )
-
-//go:embed migrations/*.sql
-var migrationsFS embed.FS
 
 // Manager owns the caches directory and hands out refcounted Stores, keyed by the
 // cache's beehive ObjectID — opaque here, and what names the file, so a beehive name's

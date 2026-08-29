@@ -263,6 +263,18 @@ where `auto_vacuum=INCREMENTAL` is set — a migration cannot, because SQLite ig
 once any table exists. `openFile`'s repair branch is for a file written by a build that predates
 that DSN, not for a new one.
 
+**A table's form is a decision the schema states beside it.** `cluster_meta`, `owner_refs`,
+`labels` and `kind_counts` are `WITHOUT ROWID`: all-key rows, so a rowid table would store each key
+again in an autoindex, and ordering the edge tables by their uid prefix turns the write path's
+`WHERE uid = ?` into one contiguous descent. The saving is partly paid back — a secondary index on
+such a table carries the full key where it carried an 8-byte rowid — so adding a wide index to one
+of these four is what would turn the trade. `objects`, `events`, `kind_catalog` and
+`status_history` keep their rowid, each for a reason written beside it (a wide row, an FTS index
+declared `content_rowid`, no key at all). Nothing has shipped, so a form change is an edit to
+`0001_init.sql`; after shipping it is a migration, and `ALTER TABLE … RENAME` re-parses the whole
+schema and refuses against a trigger naming the table being rebuilt — five triggers name
+`kind_counts`. → [ADR: editing the initial schema](../docs/adr/2026-08-29-schema-edit-not-migration.md).
+
 **A cached-data watch pings, re-reads, and diffs — it never carries a row delta.** One loop
 (`cacheddatawatch.go`) serves all three: subscribe first, snapshot as `Added` frames, one `Bookmark`,
 then per debounced burst of pings re-read and diff by id against the previous snapshot. A re-read
