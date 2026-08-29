@@ -237,10 +237,14 @@ transactions. Four rules carry it:
   pressing a button; a non-nil `Err` is filed as a watch failure and reaches the client as an error
   per open watch, plus a suppressed backoff reset. The reconnect re-snapshots, so silence costs
   nothing. `Err` is for a read that is actually broken.
-- **The diff takes a `changed` func, not a `comparable` constraint.** `ObjectRow` holds the body as
-  stored (`CompressedJSON`) and cannot be compared with `==`. Objects diff on
-  `(uid, resourceVersion)` — the server moves it on every write — so only a row that becomes a
-  frame is ever decompressed; kinds and events compare their whole row.
+- **The diff never loads a body.** Every read serves identity, so the row types are `comparable`
+  and the diff is `==`. For objects that is `(uid, resourceVersion)` in effect — the server moves
+  the resourceVersion on every write, the rest is immutable per uid — and a body is fetched by uid
+  (`Store.ObjectBody`) only for the rows that become `Added`/`Modified` frames. A `Deleted` frame
+  carries none: the client keys the removal off the uid and never reads the entity. A body that
+  will not load, or whose row went between the diff read and the fetch, is a null field and never a
+  failed watch.
+  → [ADR: the objects read split](../docs/adr/2026-08-29-object-read-split.md).
 
 **A read claims the file and never creates one.** `OpenExisting` first, `WatchOpen` if the cache
 has no file at all, and the `Bookmark` goes out either way: a cache with no file is empty, not

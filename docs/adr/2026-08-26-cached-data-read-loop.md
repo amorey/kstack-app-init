@@ -65,6 +65,9 @@ fire, and the loop holds the whole compressed collection for the subscription's 
 the changed set would fix that; declined for now, because it doubles every read into two queries
 against a moving table for a saving we have not measured.
 
+That split was later made — see
+[ADR: the objects watch reads identity](2026-08-29-object-read-split.md).
+
 **A watch opened before its cache has a file does not stall.** The `Bookmark` goes out on the empty
 snapshot — a cache with nothing synced is empty, not pending — and `Manager.WatchOpen` is what
 takes it live when a writer opens one, with the rows arriving as ordinary `Added` frames.

@@ -102,9 +102,9 @@ type ClusterCachedDataEventWatchFrame struct {
 // ClusterCachedDataObject is one cached Kubernetes object read from the active cache. The
 // typed identity fields are enough to key the watch, sort, and render Name/Namespace/
 // Age without parsing the body; RawJSON carries the full native body, from which the
-// frontend derives kind-specific columns. Keeping RawJSON in the struct is what makes
-// an in-place edit differ across two reads and surface as Modified — and its string
-// underlying type is what keeps the struct comparable for that diff.
+// frontend derives kind-specific columns. It is filled per frame rather than per row — the
+// diff runs on kubestore.ObjectRow, which has no body — so this record is what a frame
+// carries, never what is compared.
 type ClusterCachedDataObject struct {
 	// UID is the object's UID — the stable identity a watch keys on.
 	UID string
@@ -120,8 +120,9 @@ type ClusterCachedDataObject struct {
 	// carried none; the field resolver maps zero → null).
 	CreationTimestamp time.Time
 	// RawJSON is the object's full native body (JSON), forwarded verbatim from the cache
-	// (managedFields + the kubectl last-applied annotation stripped at write time). Empty
-	// only if the store held no body; the field resolver serves it as the JSON scalar.
+	// (managedFields + the kubectl last-applied annotation stripped at write time). Empty on
+	// a Deleted frame, and when the body would not load; the field resolver serves it as the
+	// JSON scalar.
 	RawJSON RawJSON
 }
 
@@ -226,11 +227,10 @@ func (a cachedDataAPI) WatchKinds(ctx context.Context, clusterID ClusterID, cach
 		debounce: dataKindsDebounce,
 		retry:    dataRetryInterval,
 		key:      func(r kubestore.KindRow) string { return r.APIVersion + "/" + r.Resource },
-		changed:  func(a, b kubestore.KindRow) bool { return a != b },
 		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.KindRow, error) {
 			return s.Kinds(ctx)
 		},
-		frame: func(t DeltaFrameType, r kubestore.KindRow) ClusterCachedDataKindWatchFrame {
+		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r kubestore.KindRow) ClusterCachedDataKindWatchFrame {
 			kind := toCachedDataKind(r)
 			return ClusterCachedDataKindWatchFrame{Type: t, Kind: &kind, CacheID: cacheID}
 		},
@@ -256,15 +256,11 @@ func (a cachedDataAPI) WatchObjects(ctx context.Context, clusterID ClusterID, ca
 		debounce: dataObjectsDebounce,
 		retry:    dataRetryInterval,
 		key:      func(r kubestore.ObjectRow) string { return r.UID },
-		// The server bumps resourceVersion on every write, so it says an in-place edit
-		// happened without inflating the body — which the whole-struct compare the other
-		// two use would do for every row on every ping.
-		changed: func(a, b kubestore.ObjectRow) bool { return a.ResourceVersion != b.ResourceVersion },
 		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.ObjectRow, error) {
 			return s.Objects(ctx, apiVersion, resource)
 		},
-		frame: func(t DeltaFrameType, r kubestore.ObjectRow) ClusterCachedDataObjectWatchFrame {
-			obj := toCachedDataObject(r)
+		frame: func(ctx context.Context, s *kubestore.Store, t DeltaFrameType, r kubestore.ObjectRow) ClusterCachedDataObjectWatchFrame {
+			obj := hydrateObject(ctx, s, t, r)
 			return ClusterCachedDataObjectWatchFrame{
 				Type: t, Object: &obj, CacheID: cacheID, APIVersion: apiVersion, Resource: resource,
 			}
@@ -289,11 +285,10 @@ func (a cachedDataAPI) WatchEvents(ctx context.Context, clusterID ClusterID, cac
 		debounce: dataEventsDebounce,
 		retry:    dataRetryInterval,
 		key:      func(r kubestore.EventRow) string { return r.UID },
-		changed:  func(a, b kubestore.EventRow) bool { return a != b },
 		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.EventRow, error) {
 			return s.Events(ctx)
 		},
-		frame: func(t DeltaFrameType, r kubestore.EventRow) ClusterCachedDataEventWatchFrame {
+		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r kubestore.EventRow) ClusterCachedDataEventWatchFrame {
 			ev := toCachedDataEvent(r)
 			return ClusterCachedDataEventWatchFrame{Type: t, Event: &ev, CacheID: cacheID}
 		},
@@ -340,15 +335,21 @@ func toCachedDataEvent(r kubestore.EventRow) ClusterCachedDataEvent {
 	}
 }
 
-// toCachedDataObject projects one object row. **This is where the body is decompressed**,
-// so only a row that becomes a frame pays for it — the read hands back what is stored, and
-// the diff never inflates a row that did not move. A body that will not decompress is
-// served empty rather than failing the watch: one malformed row must not end a collection's
-// stream.
-func toCachedDataObject(r kubestore.ObjectRow) ClusterCachedDataObject {
-	body, err := r.Body()
-	if err != nil {
-		body = nil
+// hydrateObject projects one object row into the frame that carries it, fetching the body
+// the diff deliberately did not read. **One body read per frame, not per row** — Added and
+// Modified only: a Deleted frame is the uid the client removes by, and applyChange never
+// looks at the entity it was handed.
+//
+// **A body that will not load is a null field, never a failed watch.** It is missing when
+// the row was deleted between the diff read and this fetch — where the next resync's Deleted
+// frame is the real answer — or unreadable when one row is malformed, and neither is worth
+// ending a collection's stream for.
+func hydrateObject(ctx context.Context, s *kubestore.Store, t DeltaFrameType, r kubestore.ObjectRow) ClusterCachedDataObject {
+	var body []byte
+	if t != DeltaFrameDeleted {
+		if b, ok, err := s.ObjectBody(ctx, r.UID); ok && err == nil {
+			body = b
+		}
 	}
 	return ClusterCachedDataObject{
 		UID:               r.UID,

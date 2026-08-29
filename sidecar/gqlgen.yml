@@ -191,10 +191,9 @@ models:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedDataObject
     # The record carries value time.Time (parallel to ClusterCachedDataEvent), so the resolver
     # maps the zero creationTimestamp to null instead of serializing 0001-01-01. rawJSON
-    # autobinds to the RawJSON field (no resolver): the watch already reads the body for
-    # every row — the delta-diff needs it in the comparable struct — so gating its marshal
-    # behind a resolver would defer nothing, and field-selection already skips it when a
-    # query omits rawJSON.
+    # autobinds to the RawJSON field (no resolver): the body is already read by the time the
+    # record exists — the watch fetches one per frame it sends — so gating its marshal behind
+    # a resolver would defer nothing.
     fields:
       creationTimestamp:
         resolver: true

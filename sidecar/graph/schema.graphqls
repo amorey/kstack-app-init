@@ -745,7 +745,7 @@ type ClusterCachedDataObject {
   name: String!
   "creationTimestamp — drives the universal Age column; null when the source object carried none."
   creationTimestamp: Time
-  "Full native body as JSON, verbatim from the cache (managedFields and the kubectl last-applied annotation stripped); resolver-gated, so an identity-only consumer skips the body cost."
+  "Full native body as JSON, verbatim from the cache (managedFields and the kubectl last-applied annotation stripped). Read only for the rows that become frames, so a watch pays for what it sends rather than for the collection; null on a `Deleted` frame's object, and when the stored body would not load."
   rawJSON: JSON
 }
 
@@ -781,7 +781,7 @@ type ClusterCachedDataEventWatchFrame {
 type ClusterCachedDataObjectWatchFrame {
   "Whether this object was added (incl. the on-subscribe snapshot), modified, or deleted."
   type: DeltaFrameType!
-  "The affected object. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
+  "The affected object. On `Deleted`, its last-known identity with a null `rawJSON` — the client keys the removal on `uid` and never reads the body. Null on `Bookmark`."
   object: ClusterCachedDataObject
   """
   The cache this frame came from — the frame's provenance, mirroring

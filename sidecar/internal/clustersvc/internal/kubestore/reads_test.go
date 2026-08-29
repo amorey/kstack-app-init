@@ -143,21 +143,32 @@ func TestObjectsResolveThePluralThroughTheCatalog(t *testing.T) {
 	assert.Equal(t, "42", got[0].ResourceVersion)
 }
 
-// The body comes back as stored, so an unchanged row is never inflated: the diff keys on
-// (uid, resource_version) and only the rows that become frames are decompressed.
-func TestObjectsReturnTheBodyStillCompressed(t *testing.T) {
+// The body is fetched by uid, decompressed, for the rows that become frames — the diff
+// keys on (uid, resource_version) and never loads one.
+func TestObjectBodyReturnsTheDecompressedBody(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
 
-	got, err := s.Objects(ctx, "v1", "pods")
-	require.NoError(t, err)
-	require.Len(t, got, 1)
+	body, ok, err := s.ObjectBody(ctx, "uid-1")
 
-	body, err := got[0].Body()
 	require.NoError(t, err)
+	require.True(t, ok)
 	assert.Contains(t, string(body), `"uid":"uid-1"`)
+}
+
+// The row can be deleted between the diff read that named it and the fetch, and the next
+// resync's Deleted frame is the real answer — so a body that is gone is reported, never
+// raised as a read failure.
+func TestObjectBodyReportsARowThatIsGone(t *testing.T) {
+	s := newTestStore(t)
+
+	body, ok, err := s.ObjectBody(context.Background(), "uid-gone")
+
+	require.NoError(t, err)
+	assert.False(t, ok)
+	assert.Nil(t, body)
 }
 
 // Ordered by (namespace, name), which is what the table renders and what the index serves.

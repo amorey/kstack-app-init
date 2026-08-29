@@ -114,9 +114,10 @@ func (f *watchFixture) start(ctx context.Context, debounce, retry time.Duration)
 		debounce: debounce,
 		retry:    retry,
 		key:      func(r row) string { return r.UID },
-		changed:  func(a, b row) bool { return a != b },
 		read:     f.read,
-		frame:    func(t DeltaFrameType, r row) frame { return frame{Type: t, Row: &r} },
+		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r row) frame {
+			return frame{Type: t, Row: &r}
+		},
 		bookmark: frame{Type: DeltaFrameBookmark},
 	})
 }
@@ -243,9 +244,10 @@ func TestCacheWatchReportsAStoreThatWillNotOpen(t *testing.T) {
 		debounce: time.Millisecond,
 		retry:    time.Millisecond,
 		key:      func(r row) string { return r.UID },
-		changed:  func(a, b row) bool { return a != b },
 		read:     f.read,
-		frame:    func(t DeltaFrameType, r row) frame { return frame{Type: t, Row: &r} },
+		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r row) frame {
+			return frame{Type: t, Row: &r}
+		},
 		bookmark: frame{Type: DeltaFrameBookmark},
 	})
 

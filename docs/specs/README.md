@@ -30,11 +30,7 @@ Each spec is self-contained: read one and you can build it. Each header states w
 what it hands on — a numbered spec that needs nothing is ordered by priority rather than by
 dependency, so it can be built out of turn at a cost you can read off its header.
 
-**Sequenced — the build order.** Spec 4 is a cost repair on the cluster service.
-
-| Spec | Scope | Status |
-| --- | --- | --- |
-| [4 — Object read split](4-object-read-split.md) | sidecar | Planned |
+**Sequenced — the build order.** Nothing sequenced right now.
 
 **Independent.**
 

@@ -97,3 +97,4 @@ usually just documentation in the wrong place.
 | 2026-08-28 | [The supervisor runs two kinds of thing — jobs and workers](2026-08-28-jobs-and-workers.md) | sidecar | Accepted |
 | 2026-08-28 | [A cache's sync is armed by a record's pass, never by a reader](2026-08-28-arming-is-policy-never-interest.md) | sidecar | Accepted |
 | 2026-08-28 | [A record anchors a timeline; it does not mirror a status](2026-08-28-records-as-timeline-anchors.md) | sidecar | Accepted |
+| 2026-08-29 | [The objects watch reads identity, and fetches a body only for the rows it sends](2026-08-29-object-read-split.md) | sidecar | Accepted |

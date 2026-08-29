@@ -19,6 +19,7 @@ package kubestore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 )
@@ -146,8 +147,9 @@ func (s *Store) Events(ctx context.Context) ([]EventRow, error) {
 	return out, nil
 }
 
-// ObjectRow is one cached object of any kind: the identity a table renders and sorts on,
-// plus the stored body.
+// ObjectRow is one cached object of any kind: the identity a table renders and sorts on.
+// The body is deliberately absent — a watch re-reads the whole collection on every ping and
+// only the rows that become frames need one, which ObjectBody fetches by uid.
 type ObjectRow struct {
 	UID        string
 	APIVersion string
@@ -160,16 +162,34 @@ type ObjectRow struct {
 	ResourceVersion string
 	// CreatedAt is creationTimestamp as unix-millis, 0 if absent.
 	CreatedAt int64
-	// CompressedJSON is the body AS STORED — zlib, not JSON. Named for what it holds
-	// because a caller that forwarded it unchanged would serve compressed bytes as the
-	// JSON scalar; Body is what turns it into one.
-	CompressedJSON []byte
 }
 
-// Body is the object's JSON, decompressed. Deliberately not done by the read: a watch
-// re-reads the whole collection on every ping and only the rows that become frames need a
-// body, so inflating them all would undo what keying the diff on the resourceVersion buys.
-func (r ObjectRow) Body() ([]byte, error) { return decompressRaw(r.CompressedJSON) }
+// ObjectBody is one object's stored body, decompressed. Separate from the row because the
+// watch diffs on (uid, resourceVersion) and only the rows that become frames need one.
+//
+// The bool is false when the row is gone — deleted between the diff read that named it and
+// this call, where the next resync's Deleted frame is the answer and a read failure would
+// be reporting a race as a breakage.
+func (s *Store) ObjectBody(ctx context.Context, uid string) ([]byte, bool, error) {
+	f, err := s.file()
+	if err != nil {
+		return nil, false, err
+	}
+	var stored []byte
+	err = f.readDB.QueryRowContext(ctx,
+		`SELECT raw_json FROM objects WHERE uid = ?`, uid).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("read object body %s: %w", uid, err)
+	}
+	body, err := decompressRaw(stored)
+	if err != nil {
+		return nil, false, fmt.Errorf("read object body %s: %w", uid, err)
+	}
+	return body, true, nil
+}
 
 // Objects reads one kind's whole cached set, ordered by (namespace, name).
 //
@@ -177,15 +197,16 @@ func (r ObjectRow) Body() ([]byte, error) { return decompressRaw(r.CompressedJSO
 // through kind_catalog — whose one writer is the discovery sweep. A kind with no catalog row
 // therefore reads empty, however many rows its worker has synced.
 //
-// The body comes back compressed: the watch diffs on (uid, resource_version) and only the
-// rows that become frames are ever inflated.
+// **No body.** A caller that wants whole rows gets its own query rather than putting
+// raw_json back on this one — the watch's diff would then hold and re-read every body in the
+// collection to learn that three rows moved.
 func (s *Store) Objects(ctx context.Context, apiVersion, resource string) ([]ObjectRow, error) {
 	f, err := s.file()
 	if err != nil {
 		return nil, err
 	}
 	rows, err := f.readDB.QueryContext(ctx,
-		`SELECT uid, api_version, kind, namespace, name, resource_version, created_at, raw_json
+		`SELECT uid, api_version, kind, namespace, name, resource_version, created_at
 		 FROM objects
 		 WHERE api_version = ?
 		   AND kind = (SELECT kind FROM kind_catalog WHERE api_version = ? AND resource = ?)
@@ -200,7 +221,7 @@ func (s *Store) Objects(ctx context.Context, apiVersion, resource string) ([]Obj
 	for rows.Next() {
 		var r ObjectRow
 		if err := rows.Scan(&r.UID, &r.APIVersion, &r.Kind, &r.Namespace, &r.Name,
-			&r.ResourceVersion, &r.CreatedAt, &r.CompressedJSON); err != nil {
+			&r.ResourceVersion, &r.CreatedAt); err != nil {
 			return nil, fmt.Errorf("read objects: %w", err)
 		}
 		out = append(out, r)

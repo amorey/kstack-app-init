@@ -50,13 +50,12 @@ type cachedDataWatchStores interface {
 }
 
 // cachedDataWatchSpec is what one watch contributes to the shared loop: which cache, how to
-// read it, how to tell two rows apart, and how a row becomes a frame.
+// read it, and how a row becomes a frame.
 //
-// **`changed` rather than a `comparable` constraint**, because ObjectRow carries the
-// stored body as a []byte and cannot be compared with ==. Objects diff on
-// (uid, resourceVersion), which the server moves on every write; the other two compare
-// their whole row.
-type cachedDataWatchSpec[T any, F any] struct {
+// Every row type is comparable — the reads serve identity, never a body — so the diff is
+// ==. For objects that is (uid, resourceVersion) in effect, since the server moves the
+// resourceVersion on every write and the rest of the row is immutable per uid.
+type cachedDataWatchSpec[T comparable, F any] struct {
 	stores  cachedDataWatchStores
 	cacheID int64
 	// busKeys narrows the change subscription; empty means every key.
@@ -66,11 +65,12 @@ type cachedDataWatchSpec[T any, F any] struct {
 	debounce time.Duration
 	retry    time.Duration
 
-	key     func(T) string
-	changed func(old, new T) bool
-	read    func(ctx context.Context, s *kubestore.Store) ([]T, error)
+	key  func(T) string
+	read func(ctx context.Context, s *kubestore.Store) ([]T, error)
 
-	frame    func(DeltaFrameType, T) F
+	// frame builds one frame, and is handed the store so a watch can fetch what the diff
+	// deliberately did not read — the objects watch's body. The other two ignore both.
+	frame    func(ctx context.Context, s *kubestore.Store, t DeltaFrameType, row T) F
 	bookmark F
 }
 
@@ -82,7 +82,7 @@ type cachedDataWatchSpec[T any, F any] struct {
 // a watch failure, which is an error toast per open watch and a suppressed backoff reset.
 // The reconnect re-snapshots against the fresh file, so the silence costs nothing. Err is
 // for a read that is actually broken.
-func runCachedDataWatch[T any, F any](ctx context.Context, spec cachedDataWatchSpec[T, F]) *Stream[F] {
+func runCachedDataWatch[T comparable, F any](ctx context.Context, spec cachedDataWatchSpec[T, F]) *Stream[F] {
 	return NewStream(ctx, spec.pump)
 }
 
@@ -111,7 +111,7 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 			return err
 		}
 		var ok bool
-		if prev, ok = w.sendDiff(ctx, out, prev, rows); !ok {
+		if prev, ok = w.sendDiff(ctx, out, store, prev, rows); !ok {
 			return nil
 		}
 	}
@@ -148,7 +148,7 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 			return true
 		}
 		var ok bool
-		prev, ok = w.sendDiff(ctx, out, prev, rows)
+		prev, ok = w.sendDiff(ctx, out, store, prev, rows)
 		return ok
 	}
 
@@ -191,7 +191,7 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 // sendDiff sends one frame per difference between prev and rows — Added, Modified, or
 // Deleted (carrying the row's last-known value) — and returns the new by-key snapshot,
 // with ok false when the consumer is gone.
-func (w cachedDataWatchSpec[T, F]) sendDiff(ctx context.Context, out chan<- F, prev map[string]T, rows []T) (map[string]T, bool) {
+func (w cachedDataWatchSpec[T, F]) sendDiff(ctx context.Context, out chan<- F, store *kubestore.Store, prev map[string]T, rows []T) (map[string]T, bool) {
 	next := make(map[string]T, len(rows))
 	for _, r := range rows {
 		k := w.key(r)
@@ -199,18 +199,18 @@ func (w cachedDataWatchSpec[T, F]) sendDiff(ctx context.Context, out chan<- F, p
 		old, held := prev[k]
 		switch {
 		case !held:
-			if !sendFrame(ctx, out, w.frame(DeltaFrameAdded, r)) {
+			if !sendFrame(ctx, out, w.frame(ctx, store, DeltaFrameAdded, r)) {
 				return next, false
 			}
-		case w.changed(old, r):
-			if !sendFrame(ctx, out, w.frame(DeltaFrameModified, r)) {
+		case old != r:
+			if !sendFrame(ctx, out, w.frame(ctx, store, DeltaFrameModified, r)) {
 				return next, false
 			}
 		}
 	}
 	for k, old := range prev {
 		if _, held := next[k]; !held {
-			if !sendFrame(ctx, out, w.frame(DeltaFrameDeleted, old)) {
+			if !sendFrame(ctx, out, w.frame(ctx, store, DeltaFrameDeleted, old)) {
 				return next, false
 			}
 		}

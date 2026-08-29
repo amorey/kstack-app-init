@@ -223,7 +223,50 @@ func TestWatchObjectsCarriesItsKindAsProvenance(t *testing.T) {
 	assert.Equal(t, f.cacheID, first.CacheID)
 	assert.Equal(t, "v1", first.APIVersion)
 	assert.Equal(t, "pods", first.Resource)
-	assert.Contains(t, string(first.Object.RawJSON), `"uid":"uid-1"`, "the body was served compressed")
+	assert.Contains(t, string(first.Object.RawJSON), `"uid":"uid-1"`, "an Added frame carries the body")
+}
+
+// A Deleted frame's object is the key the client removes by, so it stays non-null — but its
+// body is dead weight: applyChange deletes by uid and never looks at the entity. Nothing
+// else would catch a hydrate that fired on every frame type.
+func TestWatchObjectsSendsADeletedFrameWithoutABody(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newDataFixture(t)
+	podKind := kubestore.Kind{APIVersion: "v1", Kind: "Pod", Resource: "pods"}
+	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{
+		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: kubestore.ScopeNamespaced},
+	}, true, 7))
+	require.NoError(t, f.store.ApplyChange(ctx, podKind, watch.Added, dataPod("uid-1", "api-0", "42")))
+
+	stream, err := f.data().WatchObjects(ctx, f.clusterID, f.cacheID, "v1", "pods")
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the object")
+	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+
+	require.NoError(t, f.store.ApplyChange(ctx, podKind, watch.Deleted, dataPod("uid-1", "api-0", "42")))
+
+	gone := testutil.Recv(t, stream.Frames, "the removal")
+	assert.Equal(t, DeltaFrameDeleted, gone.Type)
+	require.NotNil(t, gone.Object, "the client keys the removal off the object")
+	assert.Equal(t, "uid-1", gone.Object.UID)
+	assert.Empty(t, gone.Object.RawJSON, "a removal carries no body")
+}
+
+// A guard on the split's cost: the diff read and the body fetch are two queries against a
+// moving table, so a row can go between them. The frame serves a null body and the watch
+// carries on — the next resync's Deleted frame is the real answer, and failing the stream
+// would be reporting a race as a breakage.
+func TestHydrateObjectServesNoBodyForARowThatIsGone(t *testing.T) {
+	ctx := context.Background()
+	f := newDataFixture(t)
+
+	obj := hydrateObject(ctx, f.store, DeltaFrameAdded, kubestore.ObjectRow{
+		UID: "uid-gone", APIVersion: "v1", Kind: "Pod", Namespace: "prod", Name: "api-0",
+	})
+
+	assert.Equal(t, "uid-gone", obj.UID)
+	assert.Empty(t, obj.RawJSON)
 }
 
 // The events watch is its own bus, so an event storm does not drive the object watches.
