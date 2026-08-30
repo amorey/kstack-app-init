@@ -159,7 +159,10 @@ CREATE TABLE events (
 ) STRICT;
 CREATE INDEX events_involved        ON events(involved_uid, last_seen DESC);
 CREATE INDEX events_kind_ns_name    ON events(involved_kind, involved_ns, involved_name, last_seen DESC);
-CREATE INDEX events_last_seen       ON events(last_seen DESC);
+-- The events snapshot's whole order, tiebreak included and in the same direction: the read
+-- is unbounded by design, and an index that stops at last_seen leaves the uid term to a temp
+-- b-tree -- a full sort of the table on every snapshot.
+CREATE INDEX events_last_seen       ON events(last_seen DESC, uid DESC);
 CREATE INDEX events_seq             ON events(write_seq);
 
 -- Full-text search over event messages/reasons so the agent can ask

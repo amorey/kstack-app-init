@@ -16,6 +16,7 @@ package kubestore
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -71,4 +72,35 @@ func TestTheKindCounterMovesInBothDirections(t *testing.T) {
 
 	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Deleted, pod("uid-1", "api-0", "2")))
 	assert.Equal(t, 0, counted())
+}
+
+// queryPlan is what SQLite would do to answer a statement.
+func queryPlan(t *testing.T, s *Store, query string) string {
+	t.Helper()
+	rows, err := db(t, s).QueryContext(context.Background(), `EXPLAIN QUERY PLAN `+query)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var plan []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &notUsed, &detail))
+		plan = append(plan, detail)
+	}
+	require.NoError(t, rows.Err())
+	return strings.Join(plan, "\n")
+}
+
+// The events snapshot is the largest read in the file — nothing ages events out and nothing
+// bounds the read — and its order has to be total, so it sorts by the uid tiebreak as well.
+// The index carries that tiebreak IN THE SAME DIRECTION: an ascending one leaves the last
+// term to a temp b-tree, which is a full sort of the table on every snapshot.
+func TestTheEventsOrderIsServedByItsIndex(t *testing.T) {
+	s := newTestStore(t)
+
+	plan := queryPlan(t, s, stmtText[stmtSelectEvents])
+
+	assert.Contains(t, plan, "events_last_seen")
+	assert.NotContains(t, plan, "TEMP B-TREE")
 }

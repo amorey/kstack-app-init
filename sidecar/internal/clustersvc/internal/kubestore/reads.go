@@ -111,7 +111,8 @@ type EventRow struct {
 // EventsWithCursor reads every cached event, newest first, beside the position it is current
 // at. The uid tiebreak makes that order total: last_seen has one-second resolution, and a
 // relist re-inserts every row with fresh rowids, so rows tied on a second would otherwise
-// reshuffle between two reads.
+// reshuffle between two reads. `events_last_seen` carries that tiebreak in the same
+// direction, or this sorts the whole table on every read.
 //
 // **The rows and the cursor come out of one transaction**, as in KindsWithFingerprint: the
 // caller resumes from that position, so a write landing between two reads would leave the

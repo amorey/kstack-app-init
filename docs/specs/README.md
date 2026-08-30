@@ -35,3 +35,4 @@ dependency, so it can be built out of turn at a cost you can read off its header
 | Spec | Scope | Status |
 | --- | --- | --- |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |
+| [A burst of object frames reads its bodies in one statement](batched-body-reads.md) | sidecar | Planned |
