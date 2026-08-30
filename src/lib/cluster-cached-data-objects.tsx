@@ -60,9 +60,14 @@ export type ClusterCachedDataObject = NonNullable<
   ClusterCachedDataObjectsWatchSubscriptionType['clusterCachedDataObjectsWatch']['object']
 >;
 
-// Hoisted: the list re-sorts on every delta frame, and per-call `localeCompare`
-// re-derives a collator each time.
-const COLLATOR = new Intl.Collator();
+// Plain code-unit order. Namespaces and names are DNS labels (lowercase ASCII, digits,
+// `-`, `.`), for which this is the collated order too, and it is the order kubectl
+// prints — at a fraction of a collator compare, which the list pays N log N times per flush.
+function byNamespaceThenName(a: ClusterCachedDataObject, b: ClusterCachedDataObject): number {
+  if (a.namespace !== b.namespace) return a.namespace < b.namespace ? -1 : 1;
+  if (a.name === b.name) return 0;
+  return a.name < b.name ? -1 : 1;
+}
 
 // The active context's cached objects of `kind`, live. Paused (empty) without an
 // active cache. Provenance must carry the full cacheID + apiVersion + resource key
@@ -91,10 +96,7 @@ export function useClusterCachedDataObjects(kind: GVR): {
   );
 
   // Sort by (namespace, name) so the table order is stable across delta churn.
-  const objects = useMemo(
-    () => [...items].sort((a, b) => COLLATOR.compare(a.namespace, b.namespace) || COLLATOR.compare(a.name, b.name)),
-    [items],
-  );
+  const objects = useMemo(() => [...items].sort(byNamespaceThenName), [items]);
 
   return { objects, active, phase };
 }
