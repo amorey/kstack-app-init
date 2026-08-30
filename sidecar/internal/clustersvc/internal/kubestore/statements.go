@@ -80,6 +80,13 @@ const (
 	stmtSelectEvents
 	stmtSelectObjectBody
 	stmtSelectObjects
+	// What moved past a cursor: one range per table plus the log, and the kind the
+	// caller's plural names.
+	stmtResolveKind
+	stmtSelectObjectsSince
+	stmtSelectObjectDeletesSince
+	stmtSelectEventsSince
+	stmtSelectEventDeletesSince
 	numStmts int = iota
 )
 
@@ -274,6 +281,30 @@ var stmtText = [numStmts]string{
 		WHERE api_version = ?
 		  AND kind = (SELECT kind FROM kind_catalog WHERE api_version = ? AND resource = ?)
 		ORDER BY namespace, name`,
+
+	stmtResolveKind: `SELECT kind FROM kind_catalog WHERE api_version = ? AND resource = ?`,
+	// Both ranges are index descents: objects_kind_seq and deletes_kind_seq are keyed by
+	// (api_version, kind) with the position last, so the cost is the rows returned.
+	// Ordered by it, so a burst of writes to one row reads as that row at its latest
+	// position and the frames come out in the order the writes landed.
+	stmtSelectObjectsSince: `
+		SELECT uid, api_version, kind, namespace, name, resource_version, created_at
+		FROM objects
+		WHERE api_version = ? AND kind = ? AND write_seq > ?
+		ORDER BY write_seq, uid`,
+	stmtSelectObjectDeletesSince: `
+		SELECT uid FROM deletes
+		WHERE api_version = ? AND kind = ? AND seq > ? ORDER BY seq, uid`,
+	stmtSelectEventsSince: `
+		SELECT uid,
+		       COALESCE(type, ''), COALESCE(reason, ''), COALESCE(message, ''),
+		       COALESCE(count, 0), COALESCE(first_seen, 0), COALESCE(last_seen, 0),
+		       COALESCE(involved_kind, ''), COALESCE(involved_ns, ''), COALESCE(involved_name, '')
+		FROM events WHERE write_seq > ? ORDER BY write_seq, uid`,
+	stmtSelectEventDeletesSince: `
+		SELECT uid FROM deletes
+		WHERE api_version = '` + eventsLogAPIVersion + `' AND kind = '` + eventsLogKind + `'
+		  AND seq > ? ORDER BY seq, uid`,
 }
 
 // stmtWrites says which pool an id runs on. Hand-maintained beside the text, and it

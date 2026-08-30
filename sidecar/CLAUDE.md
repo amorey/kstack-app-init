@@ -167,8 +167,9 @@ its write path:
   tick as the rows it supersedes would otherwise keep every one of them.
 - **Every row carries the position of its last effective write** — `write_seq`, off a counter in
   `cluster_meta` that each write transaction takes one number from — so a reader asks "what moved
-  past X?" as an index range rather than by re-reading a kind. **The stamp moves only when
-  `resource_version` does**, which is the whole of it: a relist rewrites every row, and a stamp that
+  past X?" as an index range rather than by re-reading a kind
+  (→ [ADR: write positions and the deletes log](../docs/adr/2026-08-30-write-positions-and-the-deletes-log.md)).
+  **The stamp moves only when `resource_version` does**, which is the whole of it: a relist rewrites every row, and a stamp that
   moved on each rewrite would make a cold list read as one change per object. It is ours and is not
   `resource_version` itself, which is the cluster's own string, neither ordered nor comparable.
   **Unchanged means unchanged in full**: an *empty* version is equal to itself forever and nothing
@@ -188,7 +189,8 @@ its write path:
 - **Core `v1` events are written to the `events` table**, routed by api version and plural rather
   than by the Kind name — any group may serve a Kind called `Event`, and a CRD's rows are ordinary
   objects. **Nothing ages them out and nothing bounds the read**: a cache holds what the server
-  holds, for events as for every other kind, and `Store.Events` serves all of it newest-first. A
+  holds, for events as for every other kind, and `Store.EventsWithHead` serves all of it
+  newest-first. A
   row leaves only when the server says it did.
 - **Object bodies are sanitized on the way in** — `managedFields` and the kubectl last-applied
   annotation stripped, credentials redacted — which is what lets a read serve `raw_json` verbatim.
@@ -314,12 +316,26 @@ FTS index declared `content_rowid`, no key at all). Nothing has shipped, so a fo
 schema and refuses against a trigger naming the table being rebuilt — five triggers name
 `kind_counts`. → [ADR: editing the initial schema](../docs/adr/2026-08-29-schema-edit-not-migration.md).
 
-**A cached-data watch pings, re-reads, and diffs — it never carries a row delta.** One loop
+**A cached-data watch pings, then reads what moved — the bus never carries a row delta.** One loop
 (`cacheddatawatch.go`) serves all three: subscribe first, snapshot as `Added` frames, one `Bookmark`,
-then per debounced burst of pings re-read and diff by id against the previous snapshot. A re-read
-is always full current state, so an early or late ping costs one idempotent read rather than a
-wrong frame — which is why the bus carries no payload and needs no coupling to the store's
-transactions. Four rules carry it:
+then one read per debounced burst of pings. The ping says only that something was written, so an
+early or late one costs an idempotent read rather than a wrong frame — which is why the bus needs no
+coupling to the store's transactions. What that read is differs by watch:
+
+- **Objects and events read past a cursor** (`Store.ObjectChanges`/`EventChanges`): the rows written
+  above it, the uids deleted above it, the head, and the kind's trim mark, out of one read
+  transaction. **Deletes are applied before writes** — a uid can be in both ranges — and the cursor
+  moves only once every frame is out, so a consumer that left mid-burst re-reads the same changes.
+  The snapshot is `ObjectsWithHead`/`EventsWithHead`, which is where the first cursor comes from; a
+  watch that bound after an empty snapshot starts at 0.
+- **The kinds watch re-reads and diffs** (`changes` nil): ~150 rows carrying counts that move under
+  them, so there is nothing to gain.
+- **Two answers send it back to the full read**, both of them empty and neither a fault: a cursor
+  *below* the kind's trim mark (deletes it never saw are gone from the log) and a kind whose catalog
+  row is gone (its rows are the client's to drop, which the diff against an empty read produces).
+  → [ADR: write positions and the deletes log](../docs/adr/2026-08-30-write-positions-and-the-deletes-log.md).
+
+Four rules carry the loop itself:
 
 - **The debounce is load-bearing.** `conflate` merges only what a reader has not yet taken, so a
   loop that drains promptly gets one wake per *write*. Three constants, since the streams do not
@@ -332,8 +348,8 @@ transactions. Four rules carry it:
   pressing a button; a non-nil `Err` is filed as a watch failure and reaches the client as an error
   per open watch, plus a suppressed backoff reset. The reconnect re-snapshots, so silence costs
   nothing. `Err` is for a read that is actually broken.
-- **The diff never loads a body.** Every read serves identity, so the row types are `comparable`
-  and the diff is `==`. For objects that is `(uid, resourceVersion)` in effect — the server moves
+- **No read loads a body.** Every one serves identity, so the row types are `comparable` and the
+  kinds watch's diff is `==`. For objects that is `(uid, resourceVersion)` in effect — the server moves
   the resourceVersion on every write, the rest is immutable per uid — and a body is fetched by uid
   (`Store.ObjectBody`) only for the rows that become `Added`/`Modified` frames. A `Deleted` frame
   carries none: the client keys the removal off the uid and never reads the entity. A body that

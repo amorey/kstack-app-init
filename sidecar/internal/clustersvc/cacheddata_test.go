@@ -399,3 +399,38 @@ func TestListKindsReportsACatalogItCannotRead(t *testing.T) {
 
 	assert.ErrorContains(t, err, "kinds")
 }
+
+// A cleared kind that relists the same uids is the case deletes-before-writes exists for:
+// ClearKind logs a delete per row and the sync writes the same objects back above it, so a
+// watch reading both in one burst must end holding the rows. Final state, not frame count —
+// the two land in one burst here and in two on a kind large enough to outrun the debounce.
+func TestWatchObjectsKeepsRowsThatWereClearedAndRelisted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newDataFixture(t)
+	podKind := kubestore.Kind{APIVersion: "v1", Kind: "Pod", Resource: "pods"}
+	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{
+		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: kubestore.ScopeNamespaced},
+	}, true, 7))
+	require.NoError(t, f.store.ApplyChange(ctx, podKind, watch.Added, dataPod("uid-1", "api-0", "42")))
+
+	stream, err := f.data().WatchObjects(ctx, f.clusterID, f.cacheID, "v1", "pods")
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the object")
+	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+
+	require.NoError(t, f.store.ClearKind(ctx, podKind))
+	require.NoError(t, f.store.ApplyChange(ctx, podKind, watch.Added, dataPod("uid-1", "api-0", "43")))
+
+	held := map[string]bool{}
+	for range 2 {
+		fr := testutil.Recv(t, stream.Frames, "a frame")
+		require.NotNil(t, fr.Object)
+		if fr.Type == DeltaFrameDeleted {
+			delete(held, fr.Object.UID)
+			continue
+		}
+		held[fr.Object.UID] = len(fr.Object.RawJSON) > 0
+	}
+	assert.Equal(t, map[string]bool{"uid-1": true}, held, "the relisted row was dropped")
+}

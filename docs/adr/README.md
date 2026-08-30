@@ -102,3 +102,4 @@ usually just documentation in the wrong place.
 | 2026-08-29 | [The all-key tables lose their rowid, by editing the initial schema rather than migrating](2026-08-29-schema-edit-not-migration.md) | sidecar | Accepted |
 | 2026-08-30 | [Redact credentials on the way into the cache, and never store a function of a secret](2026-08-30-secret-redaction-at-write-time.md) | sidecar | Accepted |
 | 2026-08-30 | [Resolve a connection retry when its own probe finishes](2026-08-30-retry-resolves-with-its-probe.md) | sidecar | Accepted |
+| 2026-08-30 | [Stamp every row with its write position, and log deletes](2026-08-30-write-positions-and-the-deletes-log.md) | sidecar | Accepted |

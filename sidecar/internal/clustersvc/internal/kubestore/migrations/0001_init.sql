@@ -220,8 +220,9 @@ CREATE INDEX deletes_kind_seq ON deletes(api_version, kind, seq);
 -- if available.
 --
 -- It is also load-bearing for reads: the objects table is keyed by kind, while a
--- watch is opened on the plural resource, so store.Objects resolves one to the
--- other through this table. A kind with rows and no catalog row reads as empty.
+-- watch is opened on the plural resource, so the object reads resolve one to the
+-- other through this table. A kind with rows and no catalog row reads as empty --
+-- which a changes read reports as such, since "nothing moved" would be a lie.
 --
 -- A rowid table: schema_json holds a CRD's whole OpenAPI schema, which is the wide row
 -- WITHOUT ROWID is wrong for.
@@ -239,8 +240,8 @@ CREATE TABLE kind_catalog (
 ) STRICT;
 
 -- The plural is the other direction of the same identity, and it must be unique too:
--- store.Objects resolves (api_version, resource) back to a Kind with a scalar subquery,
--- and two matching rows would have SQLite answer with an arbitrary index-first one — the
+-- the object reads resolve (api_version, resource) back to a Kind through it, and two
+-- matching rows would have SQLite answer with an arbitrary index-first one — the
 -- kind's table then reads empty forever while its sync is perfectly healthy. Within one
 -- api group-version a plural names exactly one Kind, so this is the invariant, not a
 -- convenience: a CRD whose Kind is renamed while the sidecar is down would otherwise leave

@@ -114,7 +114,7 @@ func TestEventsBreaksLastSeenTiesByUID(t *testing.T) {
 		require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, event(uid, "2026-08-26T10:00:00Z")))
 	}
 
-	got, err := s.Events(ctx)
+	got, _, err := s.EventsWithHead(ctx)
 	require.NoError(t, err)
 
 	require.Len(t, got, 3)
@@ -130,13 +130,13 @@ func TestObjectsResolveThePluralThroughTheCatalog(t *testing.T) {
 	s := newTestStore(t)
 	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
 
-	got, err := s.Objects(ctx, "v1", "pods")
+	got, _, err := s.ObjectsWithHead(ctx, "v1", "pods")
 	require.NoError(t, err)
 	assert.Empty(t, got, "no catalog row, so the plural names no Kind")
 
 	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 
-	got, err = s.Objects(ctx, "v1", "pods")
+	got, _, err = s.ObjectsWithHead(ctx, "v1", "pods")
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, "uid-1", got[0].UID)
@@ -180,7 +180,7 @@ func TestObjectsAreOrderedByNamespaceAndName(t *testing.T) {
 		require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-"+name, name, "42")))
 	}
 
-	got, err := s.Objects(ctx, "v1", "pods")
+	got, _, err := s.ObjectsWithHead(ctx, "v1", "pods")
 	require.NoError(t, err)
 
 	require.Len(t, got, 3)
@@ -248,4 +248,27 @@ func TestObjectBodyReportsAStoredBodyItCannotDecompress(t *testing.T) {
 	_, _, err = s.ObjectBody(ctx, "uid-1")
 
 	assert.ErrorContains(t, err, "read object body")
+}
+
+// A snapshot is read at a position: the rows and the head come out of one transaction, so
+// the cursor the reader keeps covers exactly the rows it was handed. Two reads instead
+// would let a write land between them, and the cursor would claim rows nobody sent.
+func TestASnapshotIsReadAtTheHead(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, firing("ev-1", "10", 1)))
+
+	objects, objectsAt, err := s.ObjectsWithHead(ctx, "v1", "pods")
+	require.NoError(t, err)
+	events, eventsAt, err := s.EventsWithHead(ctx)
+	require.NoError(t, err)
+
+	require.Len(t, objects, 1)
+	require.Len(t, events, 1)
+	at := storeHead(t, s)
+	assert.Equal(t, at, objectsAt)
+	assert.Equal(t, at, eventsAt)
+	assert.Equal(t, at, eventSeq(t, s, "ev-1"), "the head is the last write's position")
 }

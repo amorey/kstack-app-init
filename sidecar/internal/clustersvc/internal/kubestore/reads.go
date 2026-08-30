@@ -108,17 +108,54 @@ type EventRow struct {
 	InvolvedName string
 }
 
-// Events reads every cached event, newest first. The uid tiebreak makes that order total:
-// last_seen has one-second resolution, and a relist re-inserts every row with fresh rowids,
-// so rows tied on a second would otherwise reshuffle between two reads.
-func (s *Store) Events(ctx context.Context) ([]EventRow, error) {
+// EventsWithHead reads every cached event, newest first, beside the position it is current
+// at. The uid tiebreak makes that order total: last_seen has one-second resolution, and a
+// relist re-inserts every row with fresh rowids, so rows tied on a second would otherwise
+// reshuffle between two reads.
+//
+// **The rows and the head come out of one transaction**, as in KindsWithFingerprint: the
+// caller resumes from that position, so a write landing between two reads would leave the
+// cursor claiming rows nobody was sent.
+func (s *Store) EventsWithHead(ctx context.Context) ([]EventRow, int64, error) {
 	f, err := s.file()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	rows, err := f.stmts().query(ctx, stmtSelectEvents)
+	var (
+		out []EventRow
+		at  int64
+	)
+	err = inReadTx(ctx, f, "read events", func(st stmts) error {
+		var err error
+		if out, err = scanEvents(ctx, st, stmtSelectEvents); err != nil {
+			return err
+		}
+		at, err = head(ctx, st)
+		return err
+	})
+	return out, at, err
+}
+
+// inReadTx runs fn inside one read-only transaction on the reader pool, wrapping whatever
+// it returns with what. Every read that pairs rows with a position takes one: the two must
+// come out of the same snapshot, or the position covers rows the caller was never handed.
+func inReadTx(ctx context.Context, f *file, what string, fn func(st stmts) error) error {
+	tx, err := f.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, fmt.Errorf("read events: %w", err)
+		return fmt.Errorf("%s: begin: %w", what, err)
+	}
+	defer tx.Rollback() //nolint:errcheck // a read transaction, never committed
+	if err := fn(f.tx(tx)); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return nil
+}
+
+// scanEvents runs one of the events reads and collects its rows.
+func scanEvents(ctx context.Context, st stmts, id stmtID, args ...any) ([]EventRow, error) {
+	rows, err := st.query(ctx, id, args...)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -129,14 +166,11 @@ func (s *Store) Events(ctx context.Context) ([]EventRow, error) {
 			&r.UID, &r.Type, &r.Reason, &r.Message, &r.Count,
 			&r.FirstSeen, &r.LastSeen, &r.InvolvedKind, &r.InvolvedNS, &r.InvolvedName,
 		); err != nil {
-			return nil, fmt.Errorf("read events: %w", err)
+			return nil, err
 		}
 		out = append(out, r)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read events: %w", err)
-	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // ObjectRow is one cached object of any kind: the identity a table renders and sorts on.
@@ -182,7 +216,8 @@ func (s *Store) ObjectBody(ctx context.Context, uid string) ([]byte, bool, error
 	return body, true, nil
 }
 
-// Objects reads one kind's whole cached set, ordered by (namespace, name).
+// ObjectsWithHead reads one kind's whole cached set, ordered by (namespace, name), beside
+// the position it is current at — one transaction, for the reason EventsWithHead states.
 //
 // The caller names the plural while the table is keyed by Kind, so the resource translates
 // through kind_catalog — whose one writer is the discovery sweep. A kind with no catalog row
@@ -191,14 +226,31 @@ func (s *Store) ObjectBody(ctx context.Context, uid string) ([]byte, bool, error
 // **No body.** A caller that wants whole rows gets its own query rather than putting
 // raw_json back on this one — the watch's diff would then hold and re-read every body in the
 // collection to learn that three rows moved.
-func (s *Store) Objects(ctx context.Context, apiVersion, resource string) ([]ObjectRow, error) {
+func (s *Store) ObjectsWithHead(ctx context.Context, apiVersion, resource string) ([]ObjectRow, int64, error) {
 	f, err := s.file()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	rows, err := f.stmts().query(ctx, stmtSelectObjects, apiVersion, apiVersion, resource)
+	var (
+		out []ObjectRow
+		at  int64
+	)
+	err = inReadTx(ctx, f, "read objects", func(st stmts) error {
+		var err error
+		if out, err = scanObjects(ctx, st, stmtSelectObjects, apiVersion, apiVersion, resource); err != nil {
+			return err
+		}
+		at, err = head(ctx, st)
+		return err
+	})
+	return out, at, err
+}
+
+// scanObjects runs one of the object reads and collects its rows.
+func scanObjects(ctx context.Context, st stmts, id stmtID, args ...any) ([]ObjectRow, error) {
+	rows, err := st.query(ctx, id, args...)
 	if err != nil {
-		return nil, fmt.Errorf("read objects: %w", err)
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -207,12 +259,9 @@ func (s *Store) Objects(ctx context.Context, apiVersion, resource string) ([]Obj
 		var r ObjectRow
 		if err := rows.Scan(&r.UID, &r.APIVersion, &r.Kind, &r.Namespace, &r.Name,
 			&r.ResourceVersion, &r.CreatedAt); err != nil {
-			return nil, fmt.Errorf("read objects: %w", err)
+			return nil, err
 		}
 		out = append(out, r)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read objects: %w", err)
-	}
-	return out, nil
+	return out, rows.Err()
 }

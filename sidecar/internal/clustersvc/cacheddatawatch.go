@@ -49,6 +49,10 @@ type cachedDataWatchStores interface {
 	WatchOpen(cacheID int64) kubestore.OpenSubscription
 }
 
+// changesRead is what one collection answers about a cursor. The store's own type, since
+// the loop only forwards it.
+type changesRead[T any] func(ctx context.Context, s *kubestore.Store, since int64) (kubestore.Changes[T], error)
+
 // cachedDataWatchSpec is what one watch contributes to the shared loop: which cache, how to
 // read it, and how a row becomes a frame.
 //
@@ -65,8 +69,13 @@ type cachedDataWatchSpec[T comparable, F any] struct {
 	debounce time.Duration
 	retry    time.Duration
 
-	key  func(T) string
-	read func(ctx context.Context, s *kubestore.Store) ([]T, error)
+	key func(T) string
+	// read is the whole collection at the position it is current at — the snapshot, and the
+	// fallback when a cursor can no longer be trusted.
+	read func(ctx context.Context, s *kubestore.Store) ([]T, int64, error)
+	// changes reads what moved past a cursor. Nil for the kinds watch, which diffs on every
+	// re-read: ~150 rows carrying counts that move under them, so there is nothing to gain.
+	changes changesRead[T]
 
 	// frame builds one frame, and is handed the store so a watch can fetch what the diff
 	// deliberately did not read — the objects watch's body. The other two ignore both.
@@ -105,8 +114,11 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 	// not pending, and holding the Bookmark back would have the client render a spinner
 	// over a question already answered. Diffing against nothing sends every row as Added.
 	prev := map[string]T{}
+	// The position everything in prev is current at. A watch that bound late has read
+	// nothing and starts at 0, which no store row is ever stamped with.
+	var cursor int64
 	if store != nil {
-		rows, err := w.read(ctx, store)
+		rows, at, err := w.read(ctx, store)
 		if err != nil {
 			return err
 		}
@@ -114,6 +126,7 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 		if prev, ok = w.sendDiff(ctx, out, store, prev, rows); !ok {
 			return nil
 		}
+		cursor = at
 	}
 	if !sendFrame(ctx, out, w.bookmark) {
 		return nil
@@ -141,15 +154,41 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 	// A failed read arms its own retry rather than ending the stream: the bus is keyed
 	// by what was written, so a kind nobody writes to may not ping for hours, and one
 	// transient error would leave the client's table empty until it did.
-	resync := func() bool {
-		rows, err := w.read(ctx, store)
+	// full re-reads the collection and diffs it — the snapshot's own path, and what a
+	// cursor that can no longer be trusted falls back to.
+	full := func() bool {
+		rows, at, err := w.read(ctx, store)
 		if err != nil {
 			retry.Reset(w.retry)
 			return true
 		}
 		var ok bool
-		prev, ok = w.sendDiff(ctx, out, store, prev, rows)
-		return ok
+		if prev, ok = w.sendDiff(ctx, out, store, prev, rows); !ok {
+			return false
+		}
+		cursor = at
+		return true
+	}
+
+	resync := func() bool {
+		if w.changes == nil {
+			return full()
+		}
+		c, err := w.changes(ctx, store, cursor)
+		if err != nil {
+			retry.Reset(w.retry)
+			return true
+		}
+		// Two answers the loop must not take at face value, both of them empty. A cursor
+		// below the trim mark has lost deletes the log no longer holds — the mark is the
+		// highest position removed, so a cursor AT it has seen everything still above; a
+		// kind whose catalog row is gone matches nothing in either range, and its rows are
+		// the client's to drop. Both are timings rather than faults, and one full read is
+		// what they cost.
+		if !c.KindResolved || cursor < c.Trimmed {
+			return full()
+		}
+		return w.apply(ctx, out, store, prev, c, &cursor)
 	}
 
 	// A store bound after the empty snapshot may hold rows written before we subscribed;
@@ -186,6 +225,43 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 			}
 		}
 	}
+}
+
+// apply sends one frame per change the store reported and advances the cursor, with false
+// when the consumer is gone. prev is updated in place.
+//
+// **The cursor moves only once every frame is out.** A consumer that left mid-burst leaves
+// it where it was, so the reconnect's read covers the same changes again; advancing over
+// half-sent frames would lose them for good.
+func (w cachedDataWatchSpec[T, F]) apply(ctx context.Context, out chan<- F, store *kubestore.Store, prev map[string]T, c kubestore.Changes[T], cursor *int64) bool {
+	// Deletes first: a uid can be in both ranges — a clear logs a delete per row and the
+	// relist writes the same objects back above it — and the writes range only ever carries
+	// rows that still exist, so this order lands on the live row.
+	for _, uid := range c.Deleted {
+		old, held := prev[uid]
+		if !held {
+			// It came and went between two reads: the client never held it, so a frame
+			// here would be a departure it would have to invent a row for.
+			continue
+		}
+		if !sendFrame(ctx, out, w.frame(ctx, store, DeltaFrameDeleted, old)) {
+			return false
+		}
+		delete(prev, uid)
+	}
+	for _, r := range c.Written {
+		k := w.key(r)
+		t := DeltaFrameAdded
+		if _, held := prev[k]; held {
+			t = DeltaFrameModified
+		}
+		if !sendFrame(ctx, out, w.frame(ctx, store, t, r)) {
+			return false
+		}
+		prev[k] = r
+	}
+	*cursor = c.Head
+	return true
 }
 
 // sendDiff sends one frame per difference between prev and rows — Added, Modified, or

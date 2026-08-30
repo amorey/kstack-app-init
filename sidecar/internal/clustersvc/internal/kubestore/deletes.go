@@ -33,6 +33,15 @@ func logDeletes(ctx context.Context, st stmts, id stmtID, stamp writeStamp, args
 	return err
 }
 
+// The identity every event delete is logged under. The events table conflates core v1 and
+// events.k8s.io/v1 into one row shape, so all of them roll into the one key the count
+// triggers already use — which the schema spells for itself, in SQL this package cannot
+// reach.
+const (
+	eventsLogAPIVersion = "v1"
+	eventsLogKind       = "Event"
+)
+
 // deletesTrimmedKey is the cluster_meta key one kind's trim mark lives under. Per kind
 // because cursors are: a single mark would have one busy kind's deletes push every quiet
 // kind's cursor past it within minutes.

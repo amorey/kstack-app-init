@@ -51,8 +51,16 @@ type watchFixture struct {
 	mu   sync.Mutex
 	rows []row
 	err  error
-	// reads counts the read calls, so a test can pin a debounce collapsing a burst.
+	// reads counts the FULL read calls, so a test can pin a debounce collapsing a burst —
+	// and, once the changes hook is in, that the loop did not fall back to one.
 	reads int
+	// at is the position the full read answers at, and what the changes hook counts from.
+	at int64
+	// next is what the changes hook answers, and changesErr fails it. Hand-driven, so a
+	// loop test says what moved without going through a store.
+	next       kubestore.Changes[row]
+	changesErr error
+	changes    int
 }
 
 func newWatchFixture(t *testing.T) *watchFixture {
@@ -84,14 +92,58 @@ func (f *watchFixture) fail(err error) {
 	f.err = err
 }
 
-func (f *watchFixture) read(context.Context, *kubestore.Store) ([]row, error) {
+func (f *watchFixture) read(context.Context, *kubestore.Store) ([]row, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reads++
 	if f.err != nil {
-		return nil, f.err
+		return nil, 0, f.err
 	}
-	return append([]row(nil), f.rows...), nil
+	return append([]row(nil), f.rows...), f.at, nil
+}
+
+// push is what the next changes read answers: the rows written and the uids deleted above
+// the cursor, at a position one past it.
+func (f *watchFixture) push(c kubestore.Changes[row]) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.at++
+	c.Head, c.KindResolved = f.at, true
+	f.next, f.changesErr = c, nil
+}
+
+// pushRaw sets an answer verbatim, for the two a reader must not take at face value: a
+// cursor below the trim mark and a kind that no longer resolves.
+func (f *watchFixture) pushRaw(c kubestore.Changes[row]) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.next, f.changesErr = c, nil
+}
+
+// failChanges makes the next changes reads fail until push is called again.
+func (f *watchFixture) failChanges(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.changesErr = err
+}
+
+func (f *watchFixture) readChanges(_ context.Context, _ *kubestore.Store, since int64) (kubestore.Changes[row], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.changes++
+	if f.changesErr != nil {
+		return kubestore.Changes[row]{}, f.changesErr
+	}
+	if since >= f.next.Head && f.next.KindResolved {
+		return kubestore.Changes[row]{Head: since, KindResolved: true}, nil
+	}
+	return f.next, nil
+}
+
+func (f *watchFixture) changesCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.changes
 }
 
 func (f *watchFixture) readCount() int {
@@ -106,9 +158,21 @@ func (f *watchFixture) ping() {
 	require.NoError(f.t, f.store.SyncKinds(context.Background(), nil, true, 7))
 }
 
-// start runs the loop with the test's own cadences.
+// start runs the loop with the test's own cadences, diffing on every re-read the way the
+// kinds watch does.
 func (f *watchFixture) start(ctx context.Context, debounce, retry time.Duration) *Stream[frame] {
+	return f.run(ctx, debounce, retry, nil)
+}
+
+// startWithChanges runs the loop over the changes hook, the way the objects and events
+// watches do.
+func (f *watchFixture) startWithChanges(ctx context.Context, debounce, retry time.Duration) *Stream[frame] {
+	return f.run(ctx, debounce, retry, f.readChanges)
+}
+
+func (f *watchFixture) run(ctx context.Context, debounce, retry time.Duration, changes changesRead[row]) *Stream[frame] {
 	return runCachedDataWatch(ctx, cachedDataWatchSpec[row, frame]{
+		changes:  changes,
 		stores:   f.m,
 		cacheID:  1,
 		debounce: debounce,
@@ -436,4 +500,208 @@ func TestCacheWatchStopsWaitingWhenTheManagerShutsDown(t *testing.T) {
 
 	testutil.WaitClosed(t, stream.Frames, "the wait to end with the manager")
 	assert.NoError(t, stream.Err())
+}
+
+// The point of the whole change: a ping re-reads what moved past the cursor, not the
+// collection. A write to one held row is one Modified, and the full read stays at the one
+// the snapshot made.
+func TestCacheWatchReadsWhatMovedPastItsCursor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"})
+
+	s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
+	recvFrame(t, s)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+	require.Equal(t, 1, f.readCount())
+
+	f.push(kubestore.Changes[row]{Written: []row{{UID: "a", Data: "2"}}})
+	f.ping()
+
+	fr := recvFrame(t, s)
+	assert.Equal(t, DeltaFrameModified, fr.Type)
+	assert.Equal(t, row{UID: "a", Data: "2"}, *fr.Row)
+	assert.Equal(t, 1, f.readCount(), "the loop fell back to a full read")
+}
+
+// A delete reaches the client as the row it last held: the store logged only the uid,
+// because the row it describes is gone from disk.
+func TestCacheWatchSendsADeleteFromWhatItHeld(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"})
+
+	s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
+	recvFrame(t, s)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+
+	f.push(kubestore.Changes[row]{Deleted: []string{"a"}})
+	f.ping()
+
+	fr := recvFrame(t, s)
+	assert.Equal(t, DeltaFrameDeleted, fr.Type)
+	assert.Equal(t, row{UID: "a", Data: "1"}, *fr.Row, "the departure lost its body")
+}
+
+// A uid that came and went between two reads is in the log and in no table, and the client
+// never held it — so it is nothing, not a Deleted for a row it would have to invent.
+func TestCacheWatchDropsADeleteForARowItNeverHeld(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"})
+
+	s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
+	recvFrame(t, s)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+
+	// The ghost rides along with a real change, so the next frame is the assertion: had the
+	// ghost produced one, it would be this frame.
+	f.push(kubestore.Changes[row]{
+		Deleted: []string{"ghost"},
+		Written: []row{{UID: "b", Data: "1"}},
+	})
+	f.ping()
+
+	fr := recvFrame(t, s)
+	assert.Equal(t, DeltaFrameAdded, fr.Type)
+	assert.Equal(t, row{UID: "b", Data: "1"}, *fr.Row)
+}
+
+// Deletes are applied BEFORE writes, so a uid the log says went and the tables say is back
+// — ClearKind logs a delete per row and the restarted sync lists the same objects above it
+// — ends as the live row rather than as a row the client dropped.
+func TestCacheWatchAppliesDeletesBeforeWrites(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"})
+
+	s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
+	recvFrame(t, s)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+
+	f.push(kubestore.Changes[row]{
+		Deleted: []string{"a"},
+		Written: []row{{UID: "a", Data: "2"}},
+	})
+	f.ping()
+
+	assert.Equal(t, DeltaFrameDeleted, recvFrame(t, s).Type)
+	fr := recvFrame(t, s)
+	assert.Equal(t, DeltaFrameAdded, fr.Type, "the re-added row was folded as a modification")
+	assert.Equal(t, row{UID: "a", Data: "2"}, *fr.Row)
+}
+
+// A cursor at or below the kind's trim mark has lost deletes it never saw, so what moved
+// past it can no longer be trusted: the loop re-reads the collection and diffs it, which is
+// what every burst cost before the cursor existed.
+func TestCacheWatchFallsBackWhenItsCursorWasTrimmed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"}, row{UID: "gone", Data: "1"})
+
+	s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
+	recvFrame(t, s)
+	recvFrame(t, s)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+	require.Equal(t, 1, f.readCount())
+
+	// The mark is above the cursor, and the changes answer is deliberately empty: taking it
+	// at face value would send nothing at all.
+	f.pushRaw(kubestore.Changes[row]{Head: 99, Trimmed: 99, KindResolved: true})
+	f.set(row{UID: "a", Data: "2"})
+	f.ping()
+
+	got := map[DeltaFrameType]row{}
+	for range 2 {
+		fr := recvFrame(t, s)
+		got[fr.Type] = *fr.Row
+	}
+	assert.Equal(t, row{UID: "a", Data: "2"}, got[DeltaFrameModified])
+	assert.Equal(t, row{UID: "gone", Data: "1"}, got[DeltaFrameDeleted])
+	assert.Equal(t, 2, f.readCount(), "the trimmed cursor was taken at face value")
+}
+
+// A kind whose catalog row is gone is served by nothing, and its rows are the client's to
+// drop. The changes read reports that rather than an empty answer, and the full read behind
+// the fallback reads empty — which is the Deleted per held row.
+func TestCacheWatchFallsBackWhenTheKindIsGone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"})
+
+	s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
+	recvFrame(t, s)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+
+	f.pushRaw(kubestore.Changes[row]{})
+	f.set()
+	f.ping()
+
+	fr := recvFrame(t, s)
+	assert.Equal(t, DeltaFrameDeleted, fr.Type)
+	assert.Equal(t, row{UID: "a", Data: "1"}, *fr.Row)
+}
+
+// A failed changes read is retried in place, like a failed re-read: nothing is sent, the
+// cursor stays where it was, and the retry covers the same changes — so the frames the
+// failed read would have produced arrive on it rather than being lost.
+func TestCacheWatchRetriesAFailedChangesRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"})
+
+	s := f.startWithChanges(ctx, time.Millisecond, 5*time.Millisecond)
+	recvFrame(t, s)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+
+	before := f.changesCount()
+	f.failChanges(errors.New("disk I/O error"))
+	f.ping()
+	// Waited for, so the recovery below cannot land ahead of the read it recovers from —
+	// which would leave the retry untested and the test still green.
+	require.Eventually(t, func() bool { return f.changesCount() > before },
+		5*time.Second, time.Millisecond, "the changes read to fail")
+
+	// The retry timer is what drives the recovery; nothing else pings.
+	f.push(kubestore.Changes[row]{Written: []row{{UID: "a", Data: "2"}}})
+
+	fr := recvFrame(t, s)
+	assert.Equal(t, DeltaFrameModified, fr.Type)
+	assert.Equal(t, row{UID: "a", Data: "2"}, *fr.Row)
+	assert.Equal(t, 1, f.readCount(), "a failed changes read fell back to a full read")
+	assert.NoError(t, s.Err(), "a recovered read ended the stream")
+}
+
+// A watch that bound after the empty snapshot has read nothing, so its cursor is 0 and the
+// first changes read covers the whole kind: every row arrives as Added, exactly what the
+// armed debounce reads in.
+func TestCacheWatchBoundLateReadsTheKindFromZero(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.push(kubestore.Changes[row]{Written: []row{{UID: "a", Data: "1"}}})
+
+	s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type, "the watch stalled on a cache with no file")
+
+	f.open()
+
+	fr := recvFrame(t, s)
+	assert.Equal(t, DeltaFrameAdded, fr.Type)
+	assert.Equal(t, row{UID: "a", Data: "1"}, *fr.Row)
+	assert.Zero(t, f.readCount(), "the empty snapshot left a cursor the changes read could not use")
 }
