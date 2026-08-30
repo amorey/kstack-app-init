@@ -33,14 +33,15 @@ var (
 func catalogRows(t *testing.T, s *Store) []KindRow {
 	t.Helper()
 	rows, err := db(t, s).QueryContext(context.Background(),
-		`SELECT api_version, kind, resource, scope, is_crd FROM kind_catalog ORDER BY api_version, resource`)
+		`SELECT api_version, kind, resource, scope, is_crd, COALESCE(printer_columns, '')
+		 FROM kind_catalog ORDER BY api_version, resource`)
 	require.NoError(t, err)
 	defer rows.Close()
 
 	var out []KindRow
 	for rows.Next() {
 		var r KindRow
-		require.NoError(t, rows.Scan(&r.APIVersion, &r.Kind, &r.Resource, &r.Scope, &r.IsCRD))
+		require.NoError(t, rows.Scan(&r.APIVersion, &r.Kind, &r.Resource, &r.Scope, &r.IsCRD, &r.PrinterColumns))
 		out = append(out, r)
 	}
 	require.NoError(t, rows.Err())
@@ -123,6 +124,29 @@ func TestSyncKindsResolvesARenamedKind(t *testing.T) {
 	require.NoError(t, s.SyncKinds(ctx, []KindRow{renamed}, false, 2))
 
 	assert.Equal(t, []KindRow{renamed}, catalogRows(t, s), "the rename's loser survived")
+}
+
+// A CRD's printer columns are the sweep's own data, so unlike schema_json they ride the update:
+// a definition that drops a column must stop serving it rather than keep it forever.
+func TestSyncKindsRoundTripsPrinterColumns(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	withColumns := KindRow{
+		APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: ScopeNamespaced,
+		IsCRD: true, PrinterColumns: `[{"name":"Replicas","type":"integer","jsonPath":".spec.replicas","priority":0}]`,
+	}
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow, withColumns}, true, 1))
+
+	assert.Equal(t, []KindRow{withColumns, podRow}, catalogRows(t, s))
+
+	// A built-in's NULL column reads as empty rather than failing the scan.
+	assert.Empty(t, catalogRows(t, s)[1].PrinterColumns)
+
+	cleared := withColumns
+	cleared.PrinterColumns = ""
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow, cleared}, true, 2))
+
+	assert.Equal(t, []KindRow{cleared, podRow}, catalogRows(t, s), "a dropped column kept being served")
 }
 
 // Nothing on this path fills schema_json, so an upsert must leave it alone: writing NULL

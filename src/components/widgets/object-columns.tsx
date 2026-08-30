@@ -21,11 +21,18 @@
 // throw on a partial body (e.g. a Deleted row's last-known state).
 import type { ReactNode } from 'react';
 
+import ReactTimeAgo from 'react-timeago';
+
 import type { ClusterCachedDataObject } from '@/lib/cluster-cached-data-objects';
 import { gvrKey } from '@/lib/gvr';
 import type { GVR } from '@/lib/gvr';
+import type { PrinterColumn } from '@/lib/dashboard-resources';
+import { readPath } from '@/lib/jsonpath';
 
 export type ObjectColumn = {
+  // React identity. Not the header: a CRD may declare the same one twice, and position is the
+  // only identity a descriptor column has.
+  key: string;
   header: string;
   cell: (o: ClusterCachedDataObject) => ReactNode;
   // Applied to both the header and its cells.
@@ -137,6 +144,7 @@ type WorkloadBody = {
 
 const podColumns: ObjectColumn[] = [
   {
+    key: 'Ready',
     header: 'Ready',
     className: 'tabular-nums',
     cell: (o) => {
@@ -150,10 +158,12 @@ const podColumns: ObjectColumn[] = [
     },
   },
   {
+    key: 'Status',
     header: 'Status',
     cell: (o) => podStatus(body<PodBody>(o)),
   },
   {
+    key: 'Restarts',
     header: 'Restarts',
     className: 'tabular-nums',
     cell: (o) => {
@@ -169,6 +179,7 @@ const podColumns: ObjectColumn[] = [
 
 const workloadColumns: ObjectColumn[] = [
   {
+    key: 'Ready',
     header: 'Ready',
     className: 'tabular-nums',
     cell: (o) => {
@@ -177,11 +188,13 @@ const workloadColumns: ObjectColumn[] = [
     },
   },
   {
+    key: 'Up-to-date',
     header: 'Up-to-date',
     className: 'tabular-nums',
     cell: (o) => body<WorkloadBody>(o).status?.updatedReplicas ?? 0,
   },
   {
+    key: 'Available',
     header: 'Available',
     className: 'tabular-nums',
     cell: (o) => body<WorkloadBody>(o).status?.availableReplicas ?? 0,
@@ -195,7 +208,39 @@ const OBJECT_COLUMNS: Record<string, ObjectColumn[]> = {
   [gvrKey({ apiVersion: 'apps/v1', resource: 'deployments' })]: workloadColumns,
 };
 
-// [] for an unregistered kind (universal columns only).
-export function columnsForKind(gvr: GVR): ObjectColumn[] {
-  return OBJECT_COLUMNS[gvrKey(gvr)] ?? [];
+// One column built from a CRD's descriptor: read the path, render by declared type.
+//
+// **Only scalars render.** A path landing on an object or an array has no cell form — kubectl
+// would print its JSON, which is unreadable in a table — so it reads as absent.
+function descriptorColumn(d: PrinterColumn, i: number): ObjectColumn {
+  const numeric = d.type === 'integer' || d.type === 'number';
+  return {
+    key: `${i}-${d.name}`,
+    header: d.name,
+    className: numeric || d.type === 'date' ? 'tabular-nums' : undefined,
+    cell: (o) => {
+      const value = readPath(o.rawJSON, d.jsonPath);
+      if (value === null || value === undefined || typeof value === 'object') return DASH;
+      if (d.type === 'date') {
+        const ms = Date.parse(String(value));
+        return Number.isNaN(ms) ? DASH : <ReactTimeAgo date={ms} component="span" maxPeriod={60} />;
+      }
+      return String(value);
+    },
+  };
+}
+
+// Two tiers: a hand-written entry wins, else the kind's own descriptors, else [] (universal
+// columns only).
+//
+// **The registry wins on purpose** — an accessor is hand-written precisely because it says
+// something a jsonPath cannot, the way podStatus reads container state to correct a
+// crash-looping pod that reports `phase: Running`.
+//
+// `priority > 0` is dropped: kubectl hides those behind `-o wide`, and this table has no
+// equivalent yet.
+export function columnsForKind(gvr: GVR, printerColumns: readonly PrinterColumn[] = []): ObjectColumn[] {
+  const registered = OBJECT_COLUMNS[gvrKey(gvr)];
+  if (registered) return registered;
+  return printerColumns.filter((d) => !d.priority).map(descriptorColumn);
 }

@@ -36,6 +36,12 @@ type KindRow struct {
 	Resource   string
 	Scope      string
 	IsCRD      bool
+	// PrinterColumns is a CRD's additionalPrinterColumns for this version, as stored JSON,
+	// empty for a kind that declares none. **A string, not a decoded slice**: this row is the
+	// kinds watch's diff value (runCachedDataWatch is [T comparable]), so a slice here would
+	// not compile — and the string is what makes an edited CRD arrive as Modified. Decoded at
+	// the projection boundary, clustersvc.toCachedDataKind.
+	PrinterColumns string
 	// Count is how many objects of this kind the cache holds. Written by nothing — the
 	// sweep does not know it, and SyncKinds ignores it; Kinds fills it from kind_counts.
 	Count int
@@ -80,7 +86,7 @@ func (s *Store) SyncKinds(ctx context.Context, rows []KindRow, prune bool, finge
 			return fmt.Errorf("sync kinds: resolve %s/%s: %w", r.APIVersion, r.Resource, err)
 		}
 		if _, err := st.exec(ctx, stmtUpsertKind,
-			r.APIVersion, r.Kind, r.Resource, r.Scope, r.IsCRD); err != nil {
+			r.APIVersion, r.Kind, r.Resource, r.Scope, r.IsCRD, nullIfEmpty(r.PrinterColumns)); err != nil {
 			return fmt.Errorf("sync kinds: write %s/%s: %w", r.APIVersion, r.Kind, err)
 		}
 	}

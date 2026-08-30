@@ -159,12 +159,13 @@ type ComplexityRoot struct {
 	}
 
 	ClusterCachedDataKind struct {
-		APIVersion func(childComplexity int) int
-		Count      func(childComplexity int) int
-		IsCRD      func(childComplexity int) int
-		Kind       func(childComplexity int) int
-		Resource   func(childComplexity int) int
-		Scope      func(childComplexity int) int
+		APIVersion     func(childComplexity int) int
+		Count          func(childComplexity int) int
+		IsCRD          func(childComplexity int) int
+		Kind           func(childComplexity int) int
+		PrinterColumns func(childComplexity int) int
+		Resource       func(childComplexity int) int
+		Scope          func(childComplexity int) int
 	}
 
 	ClusterCachedDataKindWatchFrame struct {
@@ -323,6 +324,13 @@ type ComplexityRoot struct {
 	ObjectRef struct {
 		ID   func(childComplexity int) int
 		Kind func(childComplexity int) int
+	}
+
+	PrinterColumn struct {
+		JSONPath func(childComplexity int) int
+		Name     func(childComplexity int) int
+		Priority func(childComplexity int) int
+		Type     func(childComplexity int) int
 	}
 
 	Query struct {
@@ -909,6 +917,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCachedDataKind.Kind(childComplexity), true
+	case "ClusterCachedDataKind.printerColumns":
+		if e.ComplexityRoot.ClusterCachedDataKind.PrinterColumns == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCachedDataKind.PrinterColumns(childComplexity), true
 	case "ClusterCachedDataKind.resource":
 		if e.ComplexityRoot.ClusterCachedDataKind.Resource == nil {
 			break
@@ -1519,6 +1533,31 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.ComplexityRoot.ObjectRef.Kind(childComplexity), true
 
+	case "PrinterColumn.jsonPath":
+		if e.ComplexityRoot.PrinterColumn.JSONPath == nil {
+			break
+		}
+
+		return e.ComplexityRoot.PrinterColumn.JSONPath(childComplexity), true
+	case "PrinterColumn.name":
+		if e.ComplexityRoot.PrinterColumn.Name == nil {
+			break
+		}
+
+		return e.ComplexityRoot.PrinterColumn.Name(childComplexity), true
+	case "PrinterColumn.priority":
+		if e.ComplexityRoot.PrinterColumn.Priority == nil {
+			break
+		}
+
+		return e.ComplexityRoot.PrinterColumn.Priority(childComplexity), true
+	case "PrinterColumn.type":
+		if e.ComplexityRoot.PrinterColumn.Type == nil {
+			break
+		}
+
+		return e.ComplexityRoot.PrinterColumn.Type(childComplexity), true
+
 	case "Query.authState":
 		if e.ComplexityRoot.Query.AuthState == nil {
 			break
@@ -2115,6 +2154,8 @@ func (ec *executionContext) childFields_ClusterCachedDataKind(ctx context.Contex
 		return ec.fieldContext_ClusterCachedDataKind_scope(ctx, field)
 	case "isCRD":
 		return ec.fieldContext_ClusterCachedDataKind_isCRD(ctx, field)
+	case "printerColumns":
+		return ec.fieldContext_ClusterCachedDataKind_printerColumns(ctx, field)
 	case "count":
 		return ec.fieldContext_ClusterCachedDataKind_count(ctx, field)
 	}
@@ -2413,6 +2454,20 @@ func (ec *executionContext) childFields_ObjectRef(ctx context.Context, field gra
 		return ec.fieldContext_ObjectRef_kind(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ObjectRef", field.Name)
+}
+
+func (ec *executionContext) childFields_PrinterColumn(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "name":
+		return ec.fieldContext_PrinterColumn_name(ctx, field)
+	case "type":
+		return ec.fieldContext_PrinterColumn_type(ctx, field)
+	case "jsonPath":
+		return ec.fieldContext_PrinterColumn_jsonPath(ctx, field)
+	case "priority":
+		return ec.fieldContext_PrinterColumn_priority(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type PrinterColumn", field.Name)
 }
 
 func (ec *executionContext) childFields_ResourceRule(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -5016,6 +5071,38 @@ func (ec *executionContext) fieldContext_ClusterCachedDataKind_isCRD(_ context.C
 	return graphql.NewScalarFieldContext("ClusterCachedDataKind", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
+func (ec *executionContext) _ClusterCachedDataKind_printerColumns(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedDataKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCachedDataKind_printerColumns(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.PrinterColumns, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v []clustersvc.PrinterColumn) graphql.Marshaler {
+			return ec.marshalNPrinterColumn2ᚕgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐPrinterColumnᚄ(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCachedDataKind_printerColumns(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "ClusterCachedDataKind",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_PrinterColumn(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
 func (ec *executionContext) _ClusterCachedDataKind_count(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedDataKind) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -7396,6 +7483,98 @@ func (ec *executionContext) _ObjectRef_kind(ctx context.Context, field graphql.C
 }
 func (ec *executionContext) fieldContext_ObjectRef_kind(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ObjectRef", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _PrinterColumn_name(ctx context.Context, field graphql.CollectedField, obj *clustersvc.PrinterColumn) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_PrinterColumn_name(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Name, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_PrinterColumn_name(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("PrinterColumn", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _PrinterColumn_type(ctx context.Context, field graphql.CollectedField, obj *clustersvc.PrinterColumn) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_PrinterColumn_type(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Type, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_PrinterColumn_type(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("PrinterColumn", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _PrinterColumn_jsonPath(ctx context.Context, field graphql.CollectedField, obj *clustersvc.PrinterColumn) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_PrinterColumn_jsonPath(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.JSONPath, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_PrinterColumn_jsonPath(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("PrinterColumn", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _PrinterColumn_priority(ctx context.Context, field graphql.CollectedField, obj *clustersvc.PrinterColumn) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_PrinterColumn_priority(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Priority, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int) graphql.Marshaler {
+			return ec.marshalNInt2int(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_PrinterColumn_priority(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("PrinterColumn", field, false, false, errors.New("field of type Int does not have child fields"))
 }
 
 func (ec *executionContext) _Query_cluster(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
@@ -10549,6 +10728,11 @@ func (ec *executionContext) _ClusterCachedDataKind(ctx context.Context, sel ast.
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
+		case "printerColumns":
+			out.Values[i] = ec._ClusterCachedDataKind_printerColumns(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
 		case "count":
 			out.Values[i] = ec._ClusterCachedDataKind_count(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
@@ -11876,6 +12060,60 @@ func (ec *executionContext) _ObjectRef(ctx context.Context, sel ast.SelectionSet
 	return out
 }
 
+var printerColumnImplementors = []string{"PrinterColumn"}
+
+func (ec *executionContext) _PrinterColumn(ctx context.Context, sel ast.SelectionSet, obj *clustersvc.PrinterColumn) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, printerColumnImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("PrinterColumn")
+		case "name":
+			out.Values[i] = ec._PrinterColumn_name(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "type":
+			out.Values[i] = ec._PrinterColumn_type(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "jsonPath":
+			out.Values[i] = ec._PrinterColumn_jsonPath(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "priority":
+			out.Values[i] = ec._PrinterColumn_priority(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
 var queryImplementors = []string{"Query"}
 
 func (ec *executionContext) _Query(ctx context.Context, sel ast.SelectionSet) graphql.Marshaler {
@@ -13168,6 +13406,26 @@ func (ec *executionContext) marshalNObjectID2githubᚗcomᚋkubetailᚑorgᚋkst
 
 func (ec *executionContext) marshalNObjectRef2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐObjectRef(ctx context.Context, sel ast.SelectionSet, v clustersvc.ObjectRef) graphql.Marshaler {
 	return ec._ObjectRef(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNPrinterColumn2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐPrinterColumn(ctx context.Context, sel ast.SelectionSet, v clustersvc.PrinterColumn) graphql.Marshaler {
+	return ec._PrinterColumn(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNPrinterColumn2ᚕgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐPrinterColumnᚄ(ctx context.Context, sel ast.SelectionSet, v []clustersvc.PrinterColumn) graphql.Marshaler {
+	ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, func(ctx context.Context, i int) graphql.Marshaler {
+		fc := graphql.GetFieldContext(ctx)
+		fc.Result = &v[i]
+		return ec.marshalNPrinterColumn2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐPrinterColumn(ctx, sel, v[i])
+	})
+
+	for _, e := range ret {
+		if e == graphql.Null {
+			return graphql.Null
+		}
+	}
+
+	return ret
 }
 
 func (ec *executionContext) marshalNResourceRule2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐResourceRuleᚄ(ctx context.Context, sel ast.SelectionSet, v []*model.ResourceRule) graphql.Marshaler {

@@ -38,6 +38,12 @@ const ClusterCachedDataKindsWatchSubscription = graphql(`
         scope
         isCRD
         count
+        printerColumns {
+          name
+          type
+          jsonPath
+          priority
+        }
       }
     }
   }

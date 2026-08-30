@@ -190,6 +190,18 @@ func TestASweepRefusesAConnectionAnsweringAsAnotherCluster(t *testing.T) {
 	assert.Empty(t, catalogOf(t, svc, 1), "nothing syncs into a cache the connection does not vouch for")
 }
 
+// The fingerprint is what lets a sweep skip the write, so a CRD whose only edit is its printer
+// columns must not compare equal to the answer before it.
+func TestFingerprintCoversPrinterColumns(t *testing.T) {
+	row := kubestore.KindRow{APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: kubestore.ScopeNamespaced, IsCRD: true}
+	withColumns := row
+	withColumns.PrinterColumns = `[{"name":"Replicas","type":"integer","jsonPath":".spec.replicas","priority":0}]`
+
+	assert.NotEqual(t,
+		fingerprintOf([]kubestore.KindRow{row}, true),
+		fingerprintOf([]kubestore.KindRow{withColumns}, true))
+}
+
 func TestIsCRDComesFromTheCRDList(t *testing.T) {
 	cluster := newFakeCluster(t)
 	cluster.serve("v1", listable("Pod", "pods", true))
@@ -210,6 +222,58 @@ func TestIsCRDComesFromTheCRDList(t *testing.T) {
 		{APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: kubestore.ScopeNamespaced, IsCRD: true},
 		{APIVersion: "v1", Kind: "Pod", Resource: "pods", Scope: kubestore.ScopeNamespaced},
 	}, catalogOf(t, svc, 1))
+}
+
+// Printer columns are per VERSION — they sit inside spec.versions[] and two versions routinely
+// differ — where IsCRD deliberately matches without one. A sweep mirrors the group's preferred
+// version, so the columns that land are that version's and not the definition's other one.
+func TestPrinterColumnsComeFromTheServedVersion(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serve("v1", listable("Pod", "pods", true))
+	cluster.group("example.com", "example.com/v2")
+	cluster.serve("example.com/v2", listable("Widget", "widgets", true))
+	cluster.crdWithVersions("example.com", "widgets", []any{
+		map[string]any{"name": "v1", "additionalPrinterColumns": []any{
+			map[string]any{"name": "Replicas", "type": "integer", "jsonPath": ".spec.replicas"},
+		}},
+		map[string]any{"name": "v2", "additionalPrinterColumns": []any{
+			map[string]any{"name": "Phase", "type": "string", "jsonPath": ".status.phase", "priority": int64(1)},
+		}},
+	})
+
+	svc, pool := newTestService(t)
+	pool.lease("prod").connect(t, cluster, "uid-1")
+	start(t, svc)
+
+	svc.TrackDiscovery(1, testParams)
+	awaitDiscovered(t, svc, 1)
+
+	rows := catalogOf(t, svc, 1)
+	require.Len(t, rows, 2)
+	assert.JSONEq(t, `[{"name":"Phase","type":"string","jsonPath":".status.phase","priority":1}]`,
+		rows[0].PrinterColumns, "the unserved version's columns landed")
+	assert.Empty(t, rows[1].PrinterColumns, "a built-in declares none")
+}
+
+// A CRD declaring no columns leaves the field empty rather than writing an empty array.
+func TestACRDWithNoPrinterColumnsCarriesNone(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.serve("v1", listable("Pod", "pods", true))
+	cluster.group("example.com", "example.com/v1")
+	cluster.serve("example.com/v1", listable("Widget", "widgets", true))
+	cluster.crd("example.com", "widgets")
+
+	svc, pool := newTestService(t)
+	pool.lease("prod").connect(t, cluster, "uid-1")
+	start(t, svc)
+
+	svc.TrackDiscovery(1, testParams)
+	awaitDiscovered(t, svc, 1)
+
+	rows := catalogOf(t, svc, 1)
+	require.Len(t, rows, 2)
+	assert.True(t, rows[0].IsCRD)
+	assert.Empty(t, rows[0].PrinterColumns)
 }
 
 func TestARefusedCRDListLeavesEveryKindBuiltIn(t *testing.T) {

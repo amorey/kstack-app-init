@@ -198,6 +198,9 @@ CREATE TABLE kind_catalog (
     scope        TEXT NOT NULL,   -- "Namespaced" or "Cluster"
     is_crd       INTEGER NOT NULL,
     schema_json  TEXT,            -- OpenAPI v3 schema for CRDs, NULL for built-ins
+    -- A CRD's additionalPrinterColumns for THIS version, as the JSON the client renders
+    -- from; NULL for a built-in and for a CRD declaring none.
+    printer_columns TEXT,
     PRIMARY KEY (api_version, kind)
 ) STRICT;
 
@@ -208,7 +211,8 @@ CREATE TABLE kind_catalog (
 -- api group-version a plural names exactly one Kind, so this is the invariant, not a
 -- convenience: a CRD whose Kind is renamed while the sidecar is down would otherwise leave
 -- the old row beside the new (the in-process cleanup that drops it needs the previous
--- worker running to know what it was). EnsureKindCatalog clears the loser as it registers.
+-- worker running to know what it was). The upsert clears the loser as it writes
+-- (stmtResolveKindRename).
 CREATE UNIQUE INDEX kind_catalog_api_resource ON kind_catalog(api_version, resource);
 
 -- Maintained per-kind object counts. The dashboard nav shows a per-kind object

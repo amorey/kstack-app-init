@@ -426,16 +426,28 @@ func (t *holdTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(req)
 }
 
-// crd declares a CustomResourceDefinition serving one group's plural.
+// crd declares a CustomResourceDefinition serving one group's plural, with no versions —
+// enough for IsCRD, which matches without one.
 func (c *fakeCluster) crd(group, plural string) {
+	c.crdWithVersions(group, plural, nil)
+}
+
+// crdWithVersions is crd carrying spec.versions, where additionalPrinterColumns live. Each entry
+// is the version name and the columns it declares. []any of map[string]any, not
+// []map[string]any: unstructured deep-copies its values and panics on anything else.
+func (c *fakeCluster) crdWithVersions(group, plural string, versions []any) {
+	spec := map[string]any{
+		"group": group,
+		"names": map[string]any{"plural": plural},
+	}
+	if versions != nil {
+		spec["versions"] = versions
+	}
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apiextensions.k8s.io/v1",
 		"kind":       "CustomResourceDefinition",
 		"metadata":   map[string]any{"name": plural + "." + group},
-		"spec": map[string]any{
-			"group": group,
-			"names": map[string]any{"plural": plural},
-		},
+		"spec":       spec,
 	}}
 	_, err := c.dyn.Resource(crdGVR).Create(context.Background(), obj, metav1.CreateOptions{})
 	if err != nil {

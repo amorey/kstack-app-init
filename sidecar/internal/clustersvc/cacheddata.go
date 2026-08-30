@@ -20,6 +20,7 @@ package clustersvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -44,9 +45,28 @@ type ClusterCachedDataKind struct {
 	Scope string
 	// IsCRD is true when the kind is backed by a CustomResourceDefinition.
 	IsCRD bool
+	// PrinterColumns is what a CRD asks a client to render for this version, empty for a
+	// built-in and for a CRD declaring none.
+	PrinterColumns []PrinterColumn
 	// Count is the number of objects of this kind currently in the cache (0 for a
 	// kind the API server advertises but has no cached instances of).
 	Count int
+}
+
+// PrinterColumn is one of a CRD's additionalPrinterColumns entries: a header and where to read
+// its value from. **The value is never read here** — the sidecar ships the descriptor and the
+// client evaluates JSONPath against the object's native body, which is what shipping that body
+// bought.
+type PrinterColumn struct {
+	// Name is the column header, e.g. "Replicas".
+	Name string `json:"name"`
+	// Type is the OpenAPI type — integer, number, string, boolean, or date. It drives how a
+	// client renders the value, never how this parses it, so an unrecognized one is passed on.
+	Type string `json:"type"`
+	// JSONPath is the path into the object body, e.g. ".spec.replicas".
+	JSONPath string `json:"jsonPath"`
+	// Priority is kubectl's: above 0 is hidden unless -o wide.
+	Priority int `json:"priority"`
 }
 
 // ClusterCachedDataKindWatchFrame is one frame on a cache's kind-catalog watch. Consumers
@@ -306,15 +326,27 @@ func emptyStream[F any](ctx context.Context, bookmark F) *Stream[F] {
 	})
 }
 
-// toCachedDataKind projects one catalog row.
+// toCachedDataKind projects one catalog row. The printer columns are stored as JSON and decoded
+// here — the row itself must stay comparable, since it is the kinds watch's diff value.
+//
+// **A blob that will not parse yields no columns.** This returns a value and has no error path:
+// the sidecar is the only writer, so it cannot happen, and dropping the kind out of the nav over
+// it would be a worse answer than a table with universal columns.
 func toCachedDataKind(r kubestore.KindRow) ClusterCachedDataKind {
+	var columns []PrinterColumn
+	if r.PrinterColumns != "" {
+		if err := json.Unmarshal([]byte(r.PrinterColumns), &columns); err != nil {
+			columns = nil
+		}
+	}
 	return ClusterCachedDataKind{
-		APIVersion: r.APIVersion,
-		Kind:       r.Kind,
-		Resource:   r.Resource,
-		Scope:      r.Scope,
-		IsCRD:      r.IsCRD,
-		Count:      r.Count,
+		APIVersion:     r.APIVersion,
+		Kind:           r.Kind,
+		Resource:       r.Resource,
+		Scope:          r.Scope,
+		IsCRD:          r.IsCRD,
+		PrinterColumns: columns,
+		Count:          r.Count,
 	}
 }
 

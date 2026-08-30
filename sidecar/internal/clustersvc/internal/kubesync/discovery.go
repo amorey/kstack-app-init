@@ -328,13 +328,27 @@ func mirrorable(gv string, r metav1.APIResource) bool {
 	return true
 }
 
-// markCRDs flags the rows a CustomResourceDefinition serves, matched by (group, plural) with
-// no version: one definition serves several, and a kind found at any of them is the same
-// custom resource.
+// printerColumn is one additionalPrinterColumns entry as the catalog stores it. The stored JSON
+// is the contract with clustersvc, which decodes the same four fields — the store is the boundary
+// between them, and neither package imports the other.
+type printerColumn struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	JSONPath string `json:"jsonPath"`
+	Priority int    `json:"priority"`
+}
+
+// markCRDs flags the rows a CustomResourceDefinition serves and gives each the columns it asks a
+// client to render.
+//
+// **Two matches, on purpose.** IsCRD matches (group, plural) with no version: one definition
+// serves several, and a kind found at any of them is the same custom resource. The columns match
+// the version too — additionalPrinterColumns sits inside each spec.versions[] entry, and two
+// versions routinely declare different ones.
 //
 // **Best-effort, and outside the verdict**: listing CRDs is a cluster-scoped read RBAC
 // commonly denies, and failing a sweep over it would take discovery away from users it
-// otherwise serves. A refusal leaves every kind reading as built-in.
+// otherwise serves. A refusal leaves every kind reading as built-in, with no columns.
 func markCRDs(ctx context.Context, conn *kubeconn.Connection, rows []kubestore.KindRow) {
 	list, err := conn.Dynamic.Resource(crdGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -342,14 +356,61 @@ func markCRDs(ctx context.Context, conn *kubeconn.Connection, rows []kubestore.K
 	}
 
 	served := make(map[[2]string]bool, len(list.Items))
+	columns := map[[3]string]string{}
 	for i := range list.Items {
-		group, _, _ := unstructured.NestedString(list.Items[i].Object, "spec", "group")
-		plural, _, _ := unstructured.NestedString(list.Items[i].Object, "spec", "names", "plural")
+		obj := list.Items[i].Object
+		group, _, _ := unstructured.NestedString(obj, "spec", "group")
+		plural, _, _ := unstructured.NestedString(obj, "spec", "names", "plural")
 		served[[2]string{group, plural}] = true
+
+		versions, _, _ := unstructured.NestedSlice(obj, "spec", "versions")
+		for _, v := range versions {
+			version, _ := v.(map[string]any)
+			name, _, _ := unstructured.NestedString(version, "name")
+			if encoded := encodeColumns(version); name != "" && encoded != "" {
+				columns[[3]string{group, name, plural}] = encoded
+			}
+		}
 	}
 	for i := range rows {
-		rows[i].IsCRD = served[[2]string{groupOf(rows[i].APIVersion), rows[i].Resource}]
+		group, version := groupOf(rows[i].APIVersion), versionOf(rows[i].APIVersion)
+		rows[i].IsCRD = served[[2]string{group, rows[i].Resource}]
+		rows[i].PrinterColumns = columns[[3]string{group, version, rows[i].Resource}]
 	}
+}
+
+// encodeColumns is one version's additionalPrinterColumns as stored JSON, empty for a version
+// declaring none. Only the four fields a client renders from: description and format are
+// kubectl's, and carrying them would put unread bytes on every kinds frame.
+func encodeColumns(version map[string]any) string {
+	declared, _, _ := unstructured.NestedSlice(version, "additionalPrinterColumns")
+	if len(declared) == 0 {
+		return ""
+	}
+
+	cols := make([]printerColumn, 0, len(declared))
+	for _, d := range declared {
+		entry, _ := d.(map[string]any)
+		name, _, _ := unstructured.NestedString(entry, "name")
+		path, _, _ := unstructured.NestedString(entry, "jsonPath")
+		if name == "" || path == "" {
+			continue
+		}
+		typ, _, _ := unstructured.NestedString(entry, "type")
+		priority, _, _ := unstructured.NestedInt64(entry, "priority")
+		cols = append(cols, printerColumn{Name: name, Type: typ, JSONPath: path, Priority: int(priority)})
+	}
+	if len(cols) == 0 {
+		return ""
+	}
+
+	encoded, err := json.Marshal(cols)
+	if err != nil {
+		// Four strings and an int cannot fail to marshal; a kind with no columns is the
+		// honest answer if that ever changes.
+		return ""
+	}
+	return string(encoded)
 }
 
 // catalogWriter is the store as the sweep uses it: the fingerprint the table carries, and
@@ -387,7 +448,8 @@ func fingerprintOf(rows []kubestore.KindRow, prune bool) uint64 {
 	h := fnv.New64a()
 	fmt.Fprintf(h, "%t\x00", prune)
 	for _, r := range rows {
-		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%t\x00", r.APIVersion, r.Kind, r.Resource, r.Scope, r.IsCRD)
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%t\x00%s\x00",
+			r.APIVersion, r.Kind, r.Resource, r.Scope, r.IsCRD, r.PrinterColumns)
 	}
 	return h.Sum64()
 }
@@ -473,6 +535,16 @@ func groupOf(apiVersion string) string {
 		return ""
 	}
 	return group
+}
+
+// versionOf is the version of a group-version — the whole string for the core group, which has
+// no group to cut away.
+func versionOf(apiVersion string) string {
+	_, version, found := strings.Cut(apiVersion, "/")
+	if !found {
+		return apiVersion
+	}
+	return version
 }
 
 func scopeOf(namespaced bool) string {

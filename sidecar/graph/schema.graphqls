@@ -707,8 +707,25 @@ type ClusterCachedDataKind {
   scope: String!
   "True when this kind is backed by a CustomResourceDefinition."
   isCRD: Boolean!
+  "The columns a CRD asks a client to render for this version, in declared order; empty for a built-in and for a CRD declaring none. Descriptors only — the server computes no cell values, the client evaluates `jsonPath` against the object's `rawJSON`."
+  printerColumns: [PrinterColumn!]!
   "Number of objects of this kind currently in the cache (0 for an advertised-but-empty kind)."
   count: Int!
+}
+
+"""
+One column from a CRD's `additionalPrinterColumns` — a header and where to read its value
+from. Static per kind, so it rides the kinds watch rather than the objects watch.
+"""
+type PrinterColumn {
+  "Column header, e.g. \"Replicas\"."
+  name: String!
+  "OpenAPI type — integer, number, string, boolean, or date. Drives rendering, not parsing: treat an unrecognized value as a string."
+  type: String!
+  "Path into the object body, e.g. \".spec.replicas\". A restricted JSONPath; a client that cannot evaluate one renders an empty cell rather than failing the row."
+  jsonPath: String!
+  "kubectl hides columns above 0 unless `-o wide`."
+  priority: Int!
 }
 
 """

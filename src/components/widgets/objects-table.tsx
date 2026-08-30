@@ -23,20 +23,26 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { cn } from '@kubetail/ui/lib/utils';
 
 import { columnsForKind } from '@/components/widgets/object-columns';
+
 import { useClusterCachedDataObjects } from '@/lib/cluster-cached-data-objects';
+import type { PrinterColumn } from '@/lib/dashboard-resources';
 
 type ObjectsTableProps = {
   apiVersion: string;
   resource: string;
   kind: string;
   namespaced: boolean;
+  // A CRD's declared columns, off the kinds watch. Empty for a built-in, and for a kind whose
+  // hand-written registry entry wins anyway.
+  printerColumns?: readonly PrinterColumn[];
 };
 
-export function ObjectsTable({ apiVersion, resource, kind, namespaced }: ObjectsTableProps) {
+export function ObjectsTable({ apiVersion, resource, kind, namespaced, printerColumns = [] }: ObjectsTableProps) {
   const gvr = { apiVersion, resource };
   const { objects, active, phase } = useClusterCachedDataObjects(gvr);
-  // Kind-specific columns between Name and Age; [] when none registered.
-  const extraColumns = columnsForKind(gvr);
+  // Kind-specific columns between Name and Age; [] when neither the registry nor the kind
+  // itself declares any.
+  const extraColumns = columnsForKind(gvr, printerColumns);
 
   // No active cache streams nothing — say so rather than spin forever.
   if (!active) {
@@ -70,7 +76,7 @@ export function ObjectsTable({ apiVersion, resource, kind, namespaced }: Objects
             {namespaced && <TableHead className="w-48">Namespace</TableHead>}
             <TableHead>Name</TableHead>
             {extraColumns.map((c) => (
-              <TableHead key={c.header} className={c.className}>
+              <TableHead key={c.key} className={c.className}>
                 {c.header}
               </TableHead>
             ))}
@@ -85,7 +91,7 @@ export function ObjectsTable({ apiVersion, resource, kind, namespaced }: Objects
                 {namespaced && <TableCell className="align-top text-muted-foreground">{o.namespace || '—'}</TableCell>}
                 <TableCell className="align-top font-medium">{o.name}</TableCell>
                 {extraColumns.map((c) => (
-                  <TableCell key={c.header} className={cn('align-top', c.className)}>
+                  <TableCell key={c.key} className={cn('align-top', c.className)}>
                     {c.cell(o)}
                   </TableCell>
                 ))}

@@ -1077,8 +1077,17 @@ package's vocabulary rather than the supervisor's.
   own verdicts, so a broken aggregated API shows up twice and correctly. `Partial` is the one
   verdict a `supervisor.Result` cannot carry (`Succeeded` takes no reason, and both neighbours misprice
   the backoff ladder), so it rides two fields on the session.
-- **`IsCRD` comes from a CRD list, matched by (group, plural)** with no version. **Best-effort and
-  outside the verdict**: a refusal leaves every kind reading as built-in.
+- **`IsCRD` comes from a CRD list, matched by (group, plural)** with no version — one definition
+  serves several versions of the same custom resource. **Best-effort and outside the verdict**: a
+  refusal leaves every kind reading as built-in.
+- **The same list yields the printer columns**, matched by (group, **version**, plural): a CRD's
+  `additionalPrinterColumns` sits inside each `spec.versions[]` entry, so unlike `IsCRD` the
+  version discriminates. Stored as JSON on `kind_catalog.printer_columns` and **kept as a string
+  on `KindRow`** — the row is the kinds watch's diff value (`runCachedDataWatch` is
+  `[T comparable]`), so a decoded slice would not compile, and the string is what makes an edited
+  CRD arrive as `Modified`. `clustersvc.toCachedDataKind` decodes it; a blob that will not parse
+  yields no columns. Descriptors only — the sidecar computes no cell values, which is what
+  shipping the native body bought.
 - **Two loops wake a sweep the supervisor cannot schedule.** `wakeDiscoverySweepOnConnectionChange`
   carries both directions: a suspended run schedules nothing, so nothing but a wake brings it back
   once a connection vouches for the cache; and a settled run is *scheduled*, so a connection that

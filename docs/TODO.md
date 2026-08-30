@@ -110,11 +110,12 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 ## Frontend (webview)
 
-- **CRD printer columns — render a CRD's `additionalPrinterColumns` client-side.** The per-kind column registry (`src/components/widgets/object-columns.tsx`, keyed by `gvrKey`) carries hand-written accessors for **Pod and Deployment only**, and every unregistered kind falls back to the universal Namespace/Name/Age columns — so **CRDs show no kind-specific columns at all**, even though they declare exactly what they want shown. **Approach (settled in the native-body design):** the server ships the column **descriptors** only — `{name, jsonPath, type, priority}`, static per kind, cheap, **no** per-object cell values — and the frontend evaluates the jsonPath client-side against each object's `rawJSON`. So the sidecar still computes no cell values (the whole point of shipping the native body) yet CRD columns work.
-  - **Server half:** the descriptors come from a CRD's `spec.versions[].additionalPrinterColumns`, discovered per kind and surfaced on `ClusterCachedDataKind` (per-kind and low-churn, so they ride the kinds watch, not the objects watch).
-  - **Frontend:** `columnsForKind` becomes a two-tier lookup — hand-written registry entry first, else descriptor-derived columns, else universal-only. Needs a **minimal jsonPath evaluator**: Kubernetes only permits a restricted subset (`.spec.replicas`, `.status.conditions[0].type`), so a ~30-line reader beats a dependency; decide explicitly rather than pulling in a general JSONPath lib.
-  - **Respect `priority`:** kubectl hides `priority > 0` columns unless `-o wide`. Filter to `priority === 0` initially; a "wide" toggle on the table can surface the rest later.
-  - **Related gap (built-ins):** obvious next kinds are StatefulSet, ReplicaSet, Node, Service, Job, CronJob, PVC. Note **DaemonSet cannot reuse the Deployment/workload accessors** — it has no `spec.replicas`; its Ready is `status.numberReady/status.desiredNumberScheduled`.
+- **Built-in kinds with no columns.** The per-kind registry (`src/components/widgets/object-columns.tsx`)
+  carries hand-written accessors for **Pod and Deployment only**; every other built-in falls back to
+  the universal Namespace/Name/Age. CRDs are handled — they carry their own `printerColumns` — so
+  what remains is the obvious built-ins: StatefulSet, ReplicaSet, Node, Service, Job, CronJob, PVC.
+  Note **DaemonSet cannot reuse the Deployment/workload accessors** — it has no `spec.replicas`; its
+  Ready is `status.numberReady`/`status.desiredNumberScheduled`.
 
 - **React compiler — adopt the ESLint plugin.** The Vite/babel transform is already configured (`vite.config.ts`, `babel-plugin-react-compiler`). What remains: add `eslint-plugin-react-compiler` to the lint config.
 

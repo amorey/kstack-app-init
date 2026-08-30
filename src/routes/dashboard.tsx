@@ -64,6 +64,7 @@ function Dashboard() {
         resource={serverKind.resource}
         kind={serverKind.kind}
         namespaced={serverKind.scope === 'Namespaced'}
+        printerColumns={serverKind.printerColumns}
       />
     );
   } else {

@@ -894,7 +894,7 @@ func TestOpenReportsAReadStatementItCannotPrepare(t *testing.T) {
 			involved_ns TEXT, involved_name TEXT, type TEXT, reason TEXT, message TEXT,
 			first_seen INT, last_seen INT, count INT, raw_json BLOB, updated_at INT);
 		CREATE TABLE kind_catalog(api_version TEXT, kind TEXT, resource TEXT, scope TEXT,
-			is_crd INT, schema_json TEXT, PRIMARY KEY(api_version, kind));
+			is_crd INT, schema_json TEXT, printer_columns TEXT, PRIMARY KEY(api_version, kind));
 		CREATE TABLE kind_counts(api_version TEXT, kind TEXT, PRIMARY KEY(api_version, kind));`)
 	m := NewManager(dir, Retention{})
 

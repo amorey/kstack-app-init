@@ -174,6 +174,11 @@ models:
   ClusterCachedDataKindWatchFrame:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedDataKindWatchFrame
 
+  # Mapped like every other cached-data type: an unmapped schema type autobinds into
+  # graph/model, and clustersvc would then import it — the layering this block exists to hold.
+  PrinterColumn:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.PrinterColumn
+
   # firstSeen/lastSeen autobind to value time.Time fields: gqlgen's Time marshaler emits null
   # for the zero time, which is exactly the wire's meaning of an absent timestamp.
   ClusterCachedDataEvent:

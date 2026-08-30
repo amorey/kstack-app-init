@@ -201,6 +201,67 @@ func TestWatchKindsStreamsTheCatalogWithCounts(t *testing.T) {
 	assert.Equal(t, 1, moved.Kind.Count)
 }
 
+// The store carries a CRD's printer columns as JSON, and this projection is where they become
+// the typed value the wire serves.
+func TestWatchKindsDecodesPrinterColumns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newDataFixture(t)
+	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{{
+		APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets",
+		Scope: kubestore.ScopeNamespaced, IsCRD: true,
+		PrinterColumns: `[{"name":"Replicas","type":"integer","jsonPath":".spec.replicas","priority":1}]`,
+	}}, true, 7))
+
+	stream, err := f.data().WatchKinds(ctx, f.clusterID, f.cacheID)
+	require.NoError(t, err)
+
+	first := testutil.Recv(t, stream.Frames, "the kind")
+	require.NotNil(t, first.Kind)
+	assert.Equal(t, []PrinterColumn{
+		{Name: "Replicas", Type: "integer", JSONPath: ".spec.replicas", Priority: 1},
+	}, first.Kind.PrinterColumns)
+}
+
+// A projection has no error path, so a blob that will not parse yields no columns rather than
+// dropping the kind out of the nav. The sidecar is the only writer, so it should never happen —
+// the branch is there so "never happens" has an answer.
+func TestAMalformedPrinterColumnBlobYieldsNoColumns(t *testing.T) {
+	got := toCachedDataKind(kubestore.KindRow{
+		APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", PrinterColumns: "{not json",
+	})
+
+	assert.Equal(t, "Widget", got.Kind)
+	assert.Empty(t, got.PrinterColumns)
+}
+
+// The kinds watch diffs whole rows, which is what makes an edited CRD reach a client already
+// sitting on the dashboard. Decoding anywhere before the diff would leave the columns out of the
+// compared value, and the table would only pick them up on the next reconnect.
+func TestWatchKindsReportsAColumnsOnlyChange(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newDataFixture(t)
+	row := kubestore.KindRow{
+		APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets",
+		Scope: kubestore.ScopeNamespaced, IsCRD: true,
+	}
+	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{row}, true, 7))
+
+	stream, err := f.data().WatchKinds(ctx, f.clusterID, f.cacheID)
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the kind")
+	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+
+	edited := row
+	edited.PrinterColumns = `[{"name":"Phase","type":"string","jsonPath":".status.phase","priority":0}]`
+	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{edited}, true, 8))
+
+	moved := testutil.Recv(t, stream.Frames, "the edited CRD")
+	assert.Equal(t, DeltaFrameModified, moved.Type)
+	assert.Equal(t, "Phase", moved.Kind.PrinterColumns[0].Name)
+}
+
 // The objects watch carries the kind as provenance beside the cache, since one client
 // switching resources within a cache has to reject the previous subscription's stragglers.
 func TestWatchObjectsCarriesItsKindAsProvenance(t *testing.T) {

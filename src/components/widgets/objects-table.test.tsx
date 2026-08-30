@@ -76,6 +76,28 @@ describe('ObjectsTable', () => {
     expect(screen.getByText('default')).toBeInTheDocument();
   });
 
+  it("renders a CRD's declared columns between Name and Age", () => {
+    useClusterCachedDataObjectsMock.mockReturnValue({
+      objects: [obj({ kind: 'Widget', rawJSON: { spec: { replicas: 3 } } })],
+      active: true,
+      phase: 'live',
+    });
+    render(
+      <ObjectsTable
+        {...WIDGETS}
+        printerColumns={[{ name: 'Replicas', type: 'integer', jsonPath: '.spec.replicas', priority: 0 }]}
+      />,
+    );
+
+    expect(screen.getAllByRole('columnheader').map((h) => h.textContent)).toEqual([
+      'Namespace',
+      'Name',
+      'Replicas',
+      'Age',
+    ]);
+    expect(screen.getByText('3')).toBeInTheDocument();
+  });
+
   it('omits the Namespace column for a cluster-scoped kind', () => {
     useClusterCachedDataObjectsMock.mockReturnValue({
       objects: [obj({ namespace: '', name: 'node-1' })],

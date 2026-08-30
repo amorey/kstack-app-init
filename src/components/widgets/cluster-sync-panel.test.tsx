@@ -299,7 +299,15 @@ function pushCacheStatsFor(cacheId: string, bytes: number) {
       type: 'next',
       payload: {
         data: {
-          clusterCacheStatsWatch: { exists: true, bytes, dbBytes: bytes, walBytes: 0, shmBytes: 0, objectCount: 0, kindCount: 0 },
+          clusterCacheStatsWatch: {
+            exists: true,
+            bytes,
+            dbBytes: bytes,
+            walBytes: 0,
+            shmBytes: 0,
+            objectCount: 0,
+            kindCount: 0,
+          },
         },
       },
     }),

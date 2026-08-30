@@ -164,10 +164,14 @@ var stmtText = [numStmts]string{
 	stmtResolveKindRename: `DELETE FROM kind_catalog WHERE api_version = ? AND resource = ? AND kind <> ?`,
 	// schema_json is deliberately absent from the update: nothing here fills it, and
 	// writing NULL on every sweep would make the column unusable to whoever does.
+	// printer_columns is the opposite case — the sweep is what fills it, so it rides the
+	// update, or a CRD that drops a column would keep being served with it.
 	stmtUpsertKind: `
-		INSERT INTO kind_catalog (api_version, kind, resource, scope, is_crd) VALUES (?, ?, ?, ?, ?)
+		INSERT INTO kind_catalog (api_version, kind, resource, scope, is_crd, printer_columns)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(api_version, kind) DO UPDATE SET
-			resource = excluded.resource, scope = excluded.scope, is_crd = excluded.is_crd`,
+			resource = excluded.resource, scope = excluded.scope, is_crd = excluded.is_crd,
+			printer_columns = excluded.printer_columns`,
 	stmtDeleteAllKinds: `DELETE FROM kind_catalog`,
 	stmtPruneKinds: `
 		DELETE FROM kind_catalog
@@ -178,7 +182,8 @@ var stmtText = [numStmts]string{
 	stmtSelectMeta: `SELECT value FROM cluster_meta WHERE key = ?`,
 	stmtCountKind:  `SELECT count FROM kind_counts WHERE api_version=? AND kind=?`,
 	stmtSelectKinds: `
-		SELECT kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd, COALESCE(knt.count, 0)
+		SELECT kc.api_version, kc.kind, kc.resource, kc.scope, kc.is_crd,
+		       COALESCE(kc.printer_columns, ''), COALESCE(knt.count, 0)
 		FROM kind_catalog kc
 		LEFT JOIN kind_counts knt ON knt.api_version = kc.api_version AND knt.kind = kc.kind
 		ORDER BY kc.api_version, kc.kind`,

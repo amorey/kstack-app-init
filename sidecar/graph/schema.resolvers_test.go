@@ -1263,6 +1263,31 @@ func TestClusterCacheSyncStatusWatchServesEveryKind(t *testing.T) {
 	}
 }
 
+// The descriptors reach the wire off the kinds watch, typed — not as the JSON the store holds.
+func TestPrinterColumnsReachTheWire(t *testing.T) {
+	svc := newFakeClusterService(clusterFixtures())
+	svc.kinds = map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataKind{
+		1: {{
+			APIVersion: "example.com/v1", Kind: "Widget", Resource: "widgets", Scope: "Namespaced", IsCRD: true,
+			PrinterColumns: []clustersvc.PrinterColumn{
+				{Name: "Replicas", Type: "integer", JSONPath: ".spec.replicas", Priority: 1},
+			},
+		}},
+	}
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{ClusterSvc: svc, Auth: newFakeAuth(auth.Identity{})}))
+	t.Cleanup(srv.Close)
+
+	resp := openSSESubscription(t, srv.URL, "",
+		`subscription { clusterCachedDataKindsWatch(id: "1", cacheID: "1") { kind { printerColumns { name type jsonPath priority } } } }`)
+	defer resp.Body.Close()
+
+	frame := testutil.Recv(t, sseEvents(t, resp), "the first frame")
+
+	assert.Contains(t, frame.data, `"name":"Replicas"`)
+	assert.Contains(t, frame.data, `"jsonPath":".spec.replicas"`)
+	assert.Contains(t, frame.data, `"priority":1`)
+}
+
 // A timestamp the source object never carried serializes as null, not as 0001-01-01. The records
 // keep a value time.Time — the delta-watch diff compares frames with ==, so they must stay
 // comparable — and this is the wire's whole answer for "absent".

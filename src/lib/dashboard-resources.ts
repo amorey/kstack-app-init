@@ -91,6 +91,16 @@ export type DashboardNavNode = {
 
 // A `ClusterCachedDataKind` row. Declared here, not imported from `@/gql`, so this
 // module stays pure and testable.
+// PrinterColumn is one of a CRD's declared columns, as the kinds watch carries it: a header and
+// where to read its value from. Structural rather than the generated type, so the modules that
+// render from it need no dependency on codegen output.
+export type PrinterColumn = {
+  name: string;
+  type: string;
+  jsonPath: string;
+  priority: number;
+};
+
 export type ServerKind = {
   apiVersion: string;
   kind: string;
@@ -98,6 +108,9 @@ export type ServerKind = {
   scope: string;
   isCRD: boolean;
   count: number;
+  // What a CRD asks the table to render; empty for a built-in. Off the kinds watch, since it is
+  // static per kind — the objects watch carries no descriptors.
+  printerColumns: readonly PrinterColumn[];
 };
 
 // Groups that can receive discovered kinds. `Extract<…>` ties them to

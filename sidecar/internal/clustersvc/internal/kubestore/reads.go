@@ -68,7 +68,8 @@ func (s *Store) KindsWithFingerprint(ctx context.Context) ([]KindRow, uint64, bo
 	var out []KindRow
 	for rows.Next() {
 		var r KindRow
-		if err := rows.Scan(&r.APIVersion, &r.Kind, &r.Resource, &r.Scope, &r.IsCRD, &r.Count); err != nil {
+		if err := rows.Scan(&r.APIVersion, &r.Kind, &r.Resource, &r.Scope, &r.IsCRD,
+			&r.PrinterColumns, &r.Count); err != nil {
 			return nil, 0, false, fmt.Errorf("read kinds: %w", err)
 		}
 		out = append(out, r)

@@ -46,6 +46,7 @@ const kind = (apiVersion: string, k: string, resource: string, count = 0): Serve
   scope: 'Namespaced',
   isCRD: false,
   count,
+  printerColumns: [],
 });
 
 // A group node's discovered ("Show more…") kinds in a built tree.
