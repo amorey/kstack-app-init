@@ -31,7 +31,7 @@ read as one change per object.
 **A delete leaves an entry in `deletes`** — the uid, its kind, and the same position — because the
 row a reader would learn about is gone. Every delete path logs first, in the same transaction and
 off the delete's own predicate. A row that leaves a kind without being deleted logs one too, from a
-trigger (`objects_identity_change_log`): a reader takes a kind's rows and its deletes by
+trigger (`objects_identity_change`): a reader takes a kind's rows and its deletes by
 `(api_version, kind)`, so a uid rewritten under another identity would otherwise be in neither.
 
 **The janitor bounds the log by age and records how far it got, per kind.** A cursor at or below its

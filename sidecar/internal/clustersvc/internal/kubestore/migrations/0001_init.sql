@@ -194,11 +194,10 @@ CREATE TABLE status_history (
 CREATE INDEX status_history_uid_at ON status_history(uid, at DESC);
 
 -- One entry per row a reader can no longer reach: a deleted object or event, and an object
--- whose identity moved out of the kind it was read under (objects_identity_change_log). A
--- write's position is on the row itself
--- (write_seq); the row is gone by the time a reader learns of a delete, so the uid is kept
--- here. Identity only: the reader holds the row's last-known state and keys the removal by
--- uid. Events log under the fixed ('v1', 'Event') the count triggers use, for the same
+-- whose identity moved out of the kind it was read under (objects_identity_change). A
+-- write's position is on the row itself (write_seq); the row is gone by the time a reader
+-- learns of a delete, so the uid is kept here. Identity only: the reader holds the row's
+-- last-known state and keys the removal by uid. Events log under the fixed ('v1', 'Event') the count triggers use, for the same
 -- reason -- the events table conflates both spellings of an event into one row shape.
 --
 -- The janitor trims by age and records how far per kind, so a cursor at or below its kind's
@@ -292,24 +291,21 @@ CREATE TRIGGER objects_kind_count_delete AFTER DELETE ON objects BEGIN
     WHERE api_version = old.api_version AND kind = old.kind;
 END;
 
--- A k8s uid's kind is immutable, so an object update normally leaves the count
--- untouched. This trigger fires only if an object's identity somehow changes
--- (defensive), moving the count from the old kind to the new one.
-CREATE TRIGGER objects_kind_count_update AFTER UPDATE ON objects
+-- An identity change is a departure from one kind and an arrival in another — a real
+-- case, not a defensive one: a group-version flip reaches this upsert before the old
+-- kind's ClearKind. One trigger owns everything the departure owes, so the WHEN defining
+-- "identity changed" is stated once: the count moves to the new kind, and a delete is
+-- logged under the kind the row LEFT — a reader takes a kind's rows and its deletes by
+-- (api_version, kind), so without the entry the row is in neither range: it stops
+-- matching the old kind's rows, and nothing took it away. The position is new.write_seq,
+-- which the upsert's CASE moves for exactly this case.
+CREATE TRIGGER objects_identity_change AFTER UPDATE ON objects
 WHEN old.api_version <> new.api_version OR old.kind <> new.kind BEGIN
     UPDATE kind_counts SET count = count - 1
     WHERE api_version = old.api_version AND kind = old.kind;
     INSERT INTO kind_counts (api_version, kind, count)
     VALUES (new.api_version, new.kind, 1)
     ON CONFLICT(api_version, kind) DO UPDATE SET count = count + 1;
-END;
-
--- The same identity change, logged as a delete under the kind the row LEFT. A reader
--- takes both a kind's rows and its deletes by (api_version, kind), so without this the row
--- is in neither: it stops matching the old kind's rows, and nothing took it away. The
--- position is new.write_seq, which the upsert's CASE moves for exactly this case.
-CREATE TRIGGER objects_identity_change_log AFTER UPDATE ON objects
-WHEN old.api_version <> new.api_version OR old.kind <> new.kind BEGIN
     INSERT INTO deletes (seq, api_version, kind, uid, at)
     VALUES (new.write_seq, old.api_version, old.kind, old.uid, new.updated_at);
 END;

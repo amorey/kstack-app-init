@@ -110,7 +110,7 @@ var stmtText = [numStmts]string{
 			-- reader will look below. An EMPTY version (nothing upstream rejects one) is
 			-- equal to itself forever, so the row would freeze at its first write. And
 			-- identity is rewritten by this same SET list, so a uid that moved kind would
-			-- sit below its new kind's readers — objects_identity_change_log logs the
+			-- sit below its new kind's readers — objects_identity_change logs the
 			-- departure to the old kind at the position this CASE hands the row.
 			write_seq=CASE WHEN excluded.resource_version <> ''
 			                AND excluded.resource_version = objects.resource_version

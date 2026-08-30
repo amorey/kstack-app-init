@@ -179,7 +179,7 @@ its write path:
   the same position. Every delete path logs first, in the same transaction and off the delete's own
   predicate, so the two cannot disagree about which rows went; events log under the fixed
   `('v1', 'Event')` the count triggers use. **A row that leaves a kind logs one too**
-  (`objects_identity_change_log`, a trigger beside the kind-count one): a reader takes a kind's
+  (`objects_identity_change`, the trigger that also moves its kind count): a reader takes a kind's
   rows and its deletes by `(api_version, kind)`, so a uid rewritten under another identity would
   otherwise be in neither range. **A row and an entry for one uid coexist** — `ClearKind`
   logs a delete per row and the restarted sync lists the same objects back above it — so a reader
