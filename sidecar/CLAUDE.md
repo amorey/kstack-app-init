@@ -189,9 +189,8 @@ its write path:
 - **Core `v1` events are written to the `events` table**, routed by api version and plural rather
   than by the Kind name — any group may serve a Kind called `Event`, and a CRD's rows are ordinary
   objects. **Nothing ages them out and nothing bounds the read**: a cache holds what the server
-  holds, for events as for every other kind, and `Store.EventsWithHead` serves all of it
-  newest-first. A
-  row leaves only when the server says it did.
+  holds, for events as for every other kind, and `Store.EventsWithCursor` serves all of it
+  newest-first. A row leaves only when the server says it did.
 - **Object bodies are sanitized on the way in** — `managedFields` and the kubectl last-applied
   annotation stripped, credentials redacted — which is what lets a read serve `raw_json` verbatim.
   What gets redacted is the `redactions` table, keyed by **(api group, Kind)** with explicit paths
@@ -333,11 +332,11 @@ coupling to the store's transactions. What that read is differs by watch:
   Nothing here may treat the position alone as the cursor.
 - **The kinds watch re-reads and diffs** (`changes` nil): ~150 rows carrying counts that move under
   them, so there is nothing to gain.
-- **Three answers send it back to the full read**, all of them empty and none a fault: a cursor
-  *below* the kind's trim mark (deletes it never saw are gone from the log), a kind whose catalog
-  row is gone (its rows are the client's to drop, which the diff against an empty read produces),
-  and a read answering under a **different Kind** (the rows this watch holds, and the deletes the
-  old Kind's worker logged, are in neither range).
+- **Two answers send it back to the full read**, both of them empty and neither a fault: a cursor
+  *below* the kind's trim mark (deletes it never saw are gone from the log), and a read answering
+  under a **different Kind** — the catalog remapped the plural onto a renamed Kind, or dropped its
+  row — so the rows this watch holds, and the deletes the old Kind's worker logged, are in neither
+  range.
   → [ADR: write positions and the deletes log](../docs/adr/2026-08-30-write-positions-and-the-deletes-log.md).
 
 Four rules carry the loop itself:

@@ -221,8 +221,9 @@ CREATE INDEX deletes_kind_seq ON deletes(api_version, kind, seq);
 --
 -- It is also load-bearing for reads: the objects table is keyed by kind, while a
 -- watch is opened on the plural resource, so the object reads resolve one to the
--- other through this table. A kind with rows and no catalog row reads as empty --
--- which a changes read reports as such, since "nothing moved" would be a lie.
+-- other through this table. A kind with rows and no catalog row reads as empty -- under
+-- an empty Kind, which tells a cursor-holding reader its identity is gone rather than
+-- that nothing moved.
 --
 -- A rowid table: schema_json holds a CRD's whole OpenAPI schema, which is the wide row
 -- WITHOUT ROWID is wrong for.

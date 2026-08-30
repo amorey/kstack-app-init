@@ -25,7 +25,7 @@ import (
 )
 
 // Changes is one collection's answer to "what moved past this position?", read as a whole:
-// the caller applies Deleted BEFORE Written, and resumes from Head.
+// the caller applies Deleted BEFORE Written, and resumes from At.
 //
 // **Deletes first because a uid can be in both.** ClearKind logs a delete per row and the
 // restarted sync lists the same objects back above it. Written only ever carries rows that
@@ -40,19 +40,15 @@ type Changes[T any] struct {
 	// Trimmed is how far this collection's deletes log has been trimmed. A cursor below it
 	// has lost deletes it never saw, so the caller falls back to a full read.
 	Trimmed int64
-	// KindResolved is false when the plural names no catalog row. Not an empty answer: the
-	// rows are keyed by Kind, so an unresolved name matches nothing in either range and
-	// would report a kind the cache has stopped serving as one that simply did not move.
-	KindResolved bool
 }
 
 // Cursor is what a set of rows is current with: the write position they were read at, and
 // the identity they were read under.
 //
-// **The Kind is half the cursor, not a label on it.** Both ranges are keyed by it, and a
-// plural can be remapped onto a renamed Kind (stmtResolveKindRename) — so a cursor taken
-// under the old one names rows and log entries the new one's ranges do not cover, and only
-// comparing the two says so.
+// **The Kind is half the cursor, not a label on it.** Both ranges are keyed by it, and the
+// catalog can remap a plural onto a renamed Kind (stmtResolveKindRename) or drop its row —
+// either way a cursor taken under the old Kind names rows and log entries the new answer's
+// ranges do not cover, and only comparing the two Kinds says so.
 type Cursor struct {
 	Seq int64
 	// Kind is empty for a plural naming no catalog row, which is a cursor over nothing.
@@ -71,19 +67,23 @@ func (s *Store) ObjectChanges(ctx context.Context, apiVersion, resource string, 
 	err = inReadTx(ctx, f, "read object changes", func(st stmts) error {
 		// The kind is resolved first and by itself, because the two ranges take it as a
 		// bound parameter: a scalar subquery would resolve NULL and answer "nothing moved".
+		// A plural naming no catalog row answers under the empty Kind and skips the ranges
+		// — a caller holding rows sees the identity change and falls back to a full read.
 		kind, ok, err := resolveKind(ctx, st, apiVersion, resource)
-		if err != nil || !ok {
+		if err != nil {
 			return err
 		}
-		out.KindResolved, out.At.Kind = true, kind
-		if out.Written, err = scanObjects(ctx, st, stmtSelectObjectsSince, apiVersion, kind, since); err != nil {
-			return err
-		}
-		if out.Deleted, err = scanDeletedUIDs(ctx, st, stmtSelectObjectDeletesSince, apiVersion, kind, since); err != nil {
-			return err
-		}
-		if out.Trimmed, err = trimmed(ctx, st, apiVersion, kind); err != nil {
-			return err
+		out.At.Kind = kind
+		if ok {
+			if out.Written, err = scanObjects(ctx, st, stmtSelectObjectsSince, apiVersion, kind, since); err != nil {
+				return err
+			}
+			if out.Deleted, err = scanDeletedUIDs(ctx, st, stmtSelectObjectDeletesSince, apiVersion, kind, since); err != nil {
+				return err
+			}
+			if out.Trimmed, err = trimmed(ctx, st, apiVersion, kind); err != nil {
+				return err
+			}
 		}
 		out.At.Seq, err = head(ctx, st)
 		return err
@@ -93,13 +93,13 @@ func (s *Store) ObjectChanges(ctx context.Context, apiVersion, resource string, 
 
 // EventChanges reads the events collection's changes above since. There is one events table
 // and one cursor over it, and its deletes are logged under the fixed ('v1', 'Event') — so
-// the kind is never in question and KindResolved is always true.
+// the answer's Kind is never in question.
 func (s *Store) EventChanges(ctx context.Context, since int64) (Changes[EventRow], error) {
 	f, err := s.file()
 	if err != nil {
 		return Changes[EventRow]{}, err
 	}
-	out := Changes[EventRow]{KindResolved: true, At: Cursor{Kind: eventsLogKind}}
+	out := Changes[EventRow]{At: Cursor{Kind: eventsLogKind}}
 	err = inReadTx(ctx, f, "read event changes", func(st stmts) error {
 		var err error
 		if out.Written, err = scanEvents(ctx, st, stmtSelectEventsSince, since); err != nil {

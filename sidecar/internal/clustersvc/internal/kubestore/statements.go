@@ -268,18 +268,16 @@ var stmtText = [numStmts]string{
 		LEFT JOIN kind_counts knt ON knt.api_version = kc.api_version AND knt.kind = kc.kind
 		ORDER BY kc.api_version, kc.kind`,
 	stmtSelectEvents: `
-		SELECT uid,
-		       COALESCE(type, ''), COALESCE(reason, ''), COALESCE(message, ''),
-		       COALESCE(count, 0), COALESCE(first_seen, 0), COALESCE(last_seen, 0),
-		       COALESCE(involved_kind, ''), COALESCE(involved_ns, ''), COALESCE(involved_name, '')
+		SELECT ` + eventColumns + `
 		FROM events
 		ORDER BY last_seen DESC, uid DESC`,
 	stmtSelectObjectBody: `SELECT raw_json FROM objects WHERE uid = ?`,
+	// The caller binds the Kind its plural resolved to (resolveKind); the empty Kind of an
+	// unresolved plural matches nothing.
 	stmtSelectObjects: `
-		SELECT uid, api_version, kind, namespace, name, resource_version, created_at
+		SELECT ` + objectColumns + `
 		FROM objects
-		WHERE api_version = ?
-		  AND kind = (SELECT kind FROM kind_catalog WHERE api_version = ? AND resource = ?)
+		WHERE api_version = ? AND kind = ?
 		ORDER BY namespace, name`,
 
 	stmtResolveKind: `SELECT kind FROM kind_catalog WHERE api_version = ? AND resource = ?`,
@@ -288,7 +286,7 @@ var stmtText = [numStmts]string{
 	// Ordered by it, so a burst of writes to one row reads as that row at its latest
 	// position and the frames come out in the order the writes landed.
 	stmtSelectObjectsSince: `
-		SELECT uid, api_version, kind, namespace, name, resource_version, created_at
+		SELECT ` + objectColumns + `
 		FROM objects
 		WHERE api_version = ? AND kind = ? AND write_seq > ?
 		ORDER BY write_seq, uid`,
@@ -296,16 +294,22 @@ var stmtText = [numStmts]string{
 		SELECT uid FROM deletes
 		WHERE api_version = ? AND kind = ? AND seq > ? ORDER BY seq, uid`,
 	stmtSelectEventsSince: `
-		SELECT uid,
-		       COALESCE(type, ''), COALESCE(reason, ''), COALESCE(message, ''),
-		       COALESCE(count, 0), COALESCE(first_seen, 0), COALESCE(last_seen, 0),
-		       COALESCE(involved_kind, ''), COALESCE(involved_ns, ''), COALESCE(involved_name, '')
+		SELECT ` + eventColumns + `
 		FROM events WHERE write_seq > ? ORDER BY write_seq, uid`,
 	stmtSelectEventDeletesSince: `
 		SELECT uid FROM deletes
 		WHERE api_version = '` + eventsLogAPIVersion + `' AND kind = '` + eventsLogKind + `'
 		  AND seq > ? ORDER BY seq, uid`,
 }
+
+// The column lists the identity reads share, in the order scanObjects and scanEvents scan.
+const (
+	objectColumns = `uid, api_version, kind, namespace, name, resource_version, created_at`
+	eventColumns  = `uid,
+	       COALESCE(type, ''), COALESCE(reason, ''), COALESCE(message, ''),
+	       COALESCE(count, 0), COALESCE(first_seen, 0), COALESCE(last_seen, 0),
+	       COALESCE(involved_kind, ''), COALESCE(involved_ns, ''), COALESCE(involved_name, '')`
+)
 
 // stmtWrites says which pool an id runs on. Hand-maintained beside the text, and it
 // drives both halves of its own enforcement — the reader prepares by it and a call

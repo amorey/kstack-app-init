@@ -50,7 +50,7 @@ func TestObjectChangesReturnsOnlyWhatMovedPastTheCursor(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"uid-2"}, uids(got.Written))
 	assert.Equal(t, storeHead(t, s), got.At.Seq, "the read is current at the head it returns")
-	assert.True(t, got.KindResolved)
+	assert.Equal(t, "Pod", got.At.Kind)
 }
 
 // A cursor at the head has nothing above it. The reader takes that answer and sends no
@@ -115,10 +115,9 @@ func TestObjectChangesCarriesTheKindsTrimMark(t *testing.T) {
 	assert.Positive(t, got.Trimmed)
 }
 
-// A kind whose catalog row is gone must report that, not read as an empty kind. The rows
-// are keyed by Kind and the caller names the plural, so an unresolved name would match
-// nothing in either range and the reader would be told nothing moved — over a kind whose
-// rows it should drop.
+// A plural naming no catalog row answers under the empty Kind. The rows are keyed by Kind,
+// so an unresolved name matches nothing in either range — a reader holding rows under a
+// real Kind takes the empty one as the identity change it is, never as "nothing moved".
 func TestObjectChangesReportsAKindItCannotResolve(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
@@ -126,7 +125,8 @@ func TestObjectChangesReportsAKindItCannotResolve(t *testing.T) {
 	got, err := s.ObjectChanges(ctx, "v1", "pods", 0)
 
 	require.NoError(t, err)
-	assert.False(t, got.KindResolved)
+	assert.Empty(t, got.At.Kind)
+	assert.Empty(t, got.Written)
 }
 
 // Events are one collection with one cursor, and their deletes are logged under the fixed
@@ -147,5 +147,5 @@ func TestEventChangesReturnsWhatMovedAndWhatWent(t *testing.T) {
 	assert.Equal(t, "ev-1", got.Written[0].UID)
 	assert.Equal(t, []string{"ev-2"}, got.Deleted)
 	assert.Equal(t, storeHead(t, s), got.At.Seq)
-	assert.True(t, got.KindResolved, "the events collection is always addressable")
+	assert.Equal(t, "Event", got.At.Kind, "the events collection is always addressable")
 }

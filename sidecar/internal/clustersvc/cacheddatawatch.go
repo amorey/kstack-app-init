@@ -25,11 +25,12 @@
 //     is empty, not pending — the Bookmark still goes out, and the watch then waits for
 //     the manager to announce the file's creation.
 //  3. Wait for change notifications. Every committed write pings the bus (a bare
-//     coalesced signal, no payload); the loop collapses a burst of pings into one
-//     re-read of the full collection and diffs it by key against the previous read.
-//     A new key is Added, a changed row Modified, and a key that disappeared is Deleted
-//     — carrying its last-known row, since it is gone from the store and the client
-//     keys the removal by id.
+//     coalesced signal, no payload); the loop collapses a burst of pings into one read of
+//     what moved past its cursor — the rows written above it, the uids deleted above it —
+//     and sends one frame per change. A Deleted frame carries the row's last-known value,
+//     since it is gone from the store and the client keys the removal by id. The kinds
+//     watch re-reads the whole catalog and diffs it instead, and that full read is also
+//     every watch's fallback for a cursor that can no longer be used.
 //  4. The store closing (a clear, a teardown, shutdown) ends the watch cleanly; the
 //     client reconnects and re-snapshots against whatever replaced it.
 package clustersvc
@@ -116,7 +117,7 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 	prev := map[string]T{}
 	// What everything in prev is current with. A watch that bound late has read nothing and
 	// starts at the zero cursor: position 0, which no row is ever stamped with, under no
-	// kind — so its first changes read is a full one, which is what it needs.
+	// Kind — so its first resync covers the whole collection, which is what it needs.
 	var cursor kubestore.Cursor
 	if store != nil {
 		rows, at, err := w.read(ctx, store)
@@ -133,7 +134,10 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 		return nil
 	}
 
-	boundLate := false
+	// A store bound after the empty snapshot may hold rows written before we subscribed;
+	// arming the debounce (below) reads them in, and anything later pings the bus we now
+	// hold.
+	armed := false
 	if store == nil {
 		if store, sub, err = w.awaitOpen(ctx); err != nil {
 			return watchEnd(err)
@@ -141,7 +145,7 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 		if store == nil {
 			return nil
 		}
-		boundLate = true
+		armed = true
 	}
 
 	// Both timers start disarmed; Reset arms them. (Go's timers deliver no stale tick
@@ -181,22 +185,26 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 			retry.Reset(w.retry)
 			return true
 		}
-		// Three answers the loop must not take at face value, all of them empty and none a
-		// fault. A cursor below the trim mark has lost deletes the log no longer holds — the
-		// mark is the highest position removed, so a cursor AT it has seen everything still
-		// above. A kind whose catalog row is gone matches nothing in either range, and its
-		// rows are the client's to drop. And a read answering under a different identity is
-		// a plural remapped onto a renamed Kind: the rows this watch holds, and the deletes
-		// the old Kind's worker logged, are in neither range. One full read is what they cost.
-		if !c.KindResolved || cursor.Seq < c.Trimmed || c.At.Kind != cursor.Kind {
+		// Two answers the loop must not take at face value, both of them empty and neither
+		// a fault. A cursor below the trim mark has lost deletes the log no longer holds —
+		// the mark is the highest position removed, so a cursor AT it has seen everything
+		// still above. And a read answering under a different Kind — the catalog remapped
+		// the plural onto a renamed Kind, or dropped its row — holds the rows this watch
+		// has, and the deletes the old Kind's worker logged, in neither range. One full
+		// read is what either costs.
+		if cursor.Seq < c.Trimmed || c.At.Kind != cursor.Kind {
 			return full()
 		}
-		return w.apply(ctx, out, store, prev, c, &cursor)
+		if !w.apply(ctx, out, store, prev, c) {
+			return false
+		}
+		// The cursor moves only once every frame is out: a consumer that left mid-burst
+		// leaves it where it was, so the reconnect's read covers the same changes again —
+		// advancing over half-sent frames would lose them for good.
+		cursor = c.At
+		return true
 	}
 
-	// A store bound after the empty snapshot may hold rows written before we subscribed;
-	// the armed debounce reads them in, and anything later pings the bus we now hold.
-	armed := boundLate
 	if armed {
 		debounce.Reset(w.debounce)
 	}
@@ -230,13 +238,9 @@ func (w cachedDataWatchSpec[T, F]) pump(ctx context.Context, out chan<- F) error
 	}
 }
 
-// apply sends one frame per change the store reported and advances the cursor, with false
-// when the consumer is gone. prev is updated in place.
-//
-// **The cursor moves only once every frame is out.** A consumer that left mid-burst leaves
-// it where it was, so the reconnect's read covers the same changes again; advancing over
-// half-sent frames would lose them for good.
-func (w cachedDataWatchSpec[T, F]) apply(ctx context.Context, out chan<- F, store *kubestore.Store, prev map[string]T, c kubestore.Changes[T], cursor *kubestore.Cursor) bool {
+// apply sends one frame per change the store reported, with false when the consumer is
+// gone. prev is updated in place.
+func (w cachedDataWatchSpec[T, F]) apply(ctx context.Context, out chan<- F, store *kubestore.Store, prev map[string]T, c kubestore.Changes[T]) bool {
 	// Deletes first: a uid can be in both ranges — a clear logs a delete per row and the
 	// relist writes the same objects back above it — and the writes range only ever carries
 	// rows that still exist, so this order lands on the live row.
@@ -263,7 +267,6 @@ func (w cachedDataWatchSpec[T, F]) apply(ctx context.Context, out chan<- F, stor
 		}
 		prev[k] = r
 	}
-	*cursor = c.At
 	return true
 }
 

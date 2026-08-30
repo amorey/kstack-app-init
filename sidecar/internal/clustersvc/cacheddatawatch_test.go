@@ -52,7 +52,7 @@ type watchFixture struct {
 	rows []row
 	err  error
 	// reads counts the FULL read calls, so a test can pin a debounce collapsing a burst —
-	// and, once the changes hook is in, that the loop did not fall back to one.
+	// and that a changes-driven loop did not fall back to one.
 	reads int
 	// at is the cursor the full read answers at, and what the changes hook counts from.
 	at kubestore.Cursor
@@ -115,12 +115,12 @@ func (f *watchFixture) push(c kubestore.Changes[row]) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.at.Seq++
-	c.At, c.KindResolved = f.at, true
+	c.At = f.at
 	f.next, f.changesErr = c, nil
 }
 
 // pushRaw sets an answer verbatim, for the two a reader must not take at face value: a
-// cursor below the trim mark and a kind that no longer resolves.
+// cursor below the trim mark and an answer under a different Kind.
 func (f *watchFixture) pushRaw(c kubestore.Changes[row]) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -141,8 +141,8 @@ func (f *watchFixture) readChanges(_ context.Context, _ *kubestore.Store, since 
 	if f.changesErr != nil {
 		return kubestore.Changes[row]{}, f.changesErr
 	}
-	if since >= f.next.At.Seq && f.next.KindResolved {
-		return kubestore.Changes[row]{At: f.next.At, KindResolved: true}, nil
+	if since >= f.next.At.Seq {
+		return kubestore.Changes[row]{At: f.next.At}, nil
 	}
 	return f.next, nil
 }
@@ -624,7 +624,7 @@ func TestCacheWatchFallsBackWhenItsCursorWasTrimmed(t *testing.T) {
 
 	// The mark is above the cursor, and the changes answer is deliberately empty: taking it
 	// at face value would send nothing at all.
-	f.pushRaw(kubestore.Changes[row]{At: kubestore.Cursor{Seq: 99}, Trimmed: 99, KindResolved: true})
+	f.pushRaw(kubestore.Changes[row]{At: kubestore.Cursor{Seq: 99}, Trimmed: 99})
 	f.set(row{UID: "a", Data: "2"})
 	f.ping()
 
@@ -639,20 +639,23 @@ func TestCacheWatchFallsBackWhenItsCursorWasTrimmed(t *testing.T) {
 }
 
 // A kind whose catalog row is gone is served by nothing, and its rows are the client's to
-// drop. The changes read reports that rather than an empty answer, and the full read behind
-// the fallback reads empty — which is the Deleted per held row.
+// drop. The changes read answers under the empty Kind — an identity change — and the full
+// read behind the fallback reads empty, which is the Deleted per held row.
 func TestCacheWatchFallsBackWhenTheKindIsGone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	f := newWatchFixture(t)
 	f.open()
+	f.readAs("Widget")
 	f.set(row{UID: "a", Data: "1"})
 
 	s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
 	recvFrame(t, s)
 	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
 
-	f.pushRaw(kubestore.Changes[row]{})
+	// The plural resolves to nothing now, so the answer's Kind is empty.
+	f.pushRaw(kubestore.Changes[row]{At: kubestore.Cursor{Seq: 99}})
+	f.readAs("")
 	f.set()
 	f.ping()
 
@@ -731,7 +734,7 @@ func TestCacheWatchFallsBackWhenTheKindBehindThePluralChanges(t *testing.T) {
 	require.Equal(t, 1, f.readCount())
 
 	// The renamed Kind's ranges carry neither the old row nor the delete its worker logged.
-	f.pushRaw(kubestore.Changes[row]{At: kubestore.Cursor{Seq: 99, Kind: "Gadget"}, KindResolved: true})
+	f.pushRaw(kubestore.Changes[row]{At: kubestore.Cursor{Seq: 99, Kind: "Gadget"}})
 	f.readAs("Gadget")
 	f.set()
 	f.ping()

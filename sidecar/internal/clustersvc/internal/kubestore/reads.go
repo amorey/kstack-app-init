@@ -245,7 +245,7 @@ func (s *Store) ObjectsWithCursor(ctx context.Context, apiVersion, resource stri
 			return err
 		}
 		at.Kind = kind
-		if out, err = scanObjects(ctx, st, stmtSelectObjects, apiVersion, apiVersion, resource); err != nil {
+		if out, err = scanObjects(ctx, st, stmtSelectObjects, apiVersion, kind); err != nil {
 			return err
 		}
 		at.Seq, err = head(ctx, st)

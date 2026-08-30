@@ -41,8 +41,8 @@ kind's mark has lost deletes it never saw and can no longer be trusted.
 written above a cursor, the uids deleted above it, the new cursor, and the kind's trim mark, all
 from one read transaction. A cursor is a position **and** the Kind it was read under, since both
 ranges are keyed by that Kind. The loop applies **deletes before writes** and resumes from the
-cursor it was handed, falling back to the full read-and-diff when the kind no longer resolves, the
-cursor is below the mark, or the read answers under a different Kind. The
+cursor it was handed, falling back to the full read-and-diff when the cursor is below the mark or
+the read answers under a different Kind (a rename, or a plural the catalog no longer carries). The
 protocol a client sees is unchanged: snapshot as `Added`, one `Bookmark`, then
 `Added`/`Modified`/`Deleted`.
 
