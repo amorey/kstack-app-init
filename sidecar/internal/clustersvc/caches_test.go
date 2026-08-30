@@ -510,13 +510,21 @@ func TestCachesWatchStatsEmitsTheCurrentMeasurement(t *testing.T) {
 	cluster := createCluster(t, d.clusterClient, "prod")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	store := kubestoreFake(d)
-	store.stats = kubestore.Stats{Exists: true, Bytes: 4096, Counts: kubestore.Counts{ObjectCount: 12, KindCount: 3}}
+	store.stats = kubestore.Stats{
+		Exists: true, DBBytes: 4096, WALBytes: 512, SHMBytes: 32,
+		Counts: kubestore.Counts{ObjectCount: 12, KindCount: 3},
+	}
 
 	stream, err := serviceOver(t, d).Caches().WatchStats(context.Background(), ClusterID(cluster.ID), ClusterCacheID(cache.ID))
 
 	require.NoError(t, err)
 	got := testutil.Recv(t, stream.Frames, "the first measurement")
-	assert.Equal(t, ClusterCacheStats{Exists: true, Bytes: 4096, ObjectCount: 12, KindCount: 3}, got)
+	// The parts ride along with the total: the headline is what the cache costs, and the split
+	// is what says whether the WAL is being checkpointed.
+	assert.Equal(t, ClusterCacheStats{
+		Exists: true, Bytes: 4640, DBBytes: 4096, WALBytes: 512, SHMBytes: 32,
+		ObjectCount: 12, KindCount: 3,
+	}, got)
 }
 
 // The gauge borrows its change feed and never claims the file. One runs per cache row, so
@@ -550,7 +558,7 @@ func TestCachesWatchStatsHoldsSilentForAMismatchedPair(t *testing.T) {
 	cluster := createCluster(t, d.clusterClient, "prod")
 	other := createCluster(t, d.clusterClient, "staging")
 	cache := createCache(t, d.cacheClient, ClusterID(other.ID), "uid-2")
-	kubestoreFake(d).stats = kubestore.Stats{Exists: true, Bytes: 4096}
+	kubestoreFake(d).stats = kubestore.Stats{Exists: true, DBBytes: 4096}
 
 	stream, err := serviceOver(t, d).Caches().WatchStats(context.Background(), ClusterID(cluster.ID), ClusterCacheID(cache.ID))
 
@@ -565,7 +573,7 @@ func TestCachesWatchStatsEmitsOnlyOnAChange(t *testing.T) {
 	cluster := createCluster(t, d.clusterClient, "prod")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	store := kubestoreFake(d)
-	store.stats = kubestore.Stats{Exists: true, Bytes: 4096}
+	store.stats = kubestore.Stats{Exists: true, DBBytes: 4096}
 
 	svc := serviceOver(t, d)
 	svc.gaugeCadence = time.Millisecond
@@ -575,7 +583,7 @@ func TestCachesWatchStatsEmitsOnlyOnAChange(t *testing.T) {
 
 	testutil.NoRecv(t, stream.Frames, testutil.Timeout/50, "a frame for an unchanged cache")
 
-	store.setStats(kubestore.Stats{Exists: true, Bytes: 8192})
+	store.setStats(kubestore.Stats{Exists: true, DBBytes: 8192})
 
 	got := testutil.Recv(t, stream.Frames, "the changed measurement")
 	assert.Equal(t, int64(8192), got.Bytes)
@@ -1679,13 +1687,13 @@ func TestCachesWatchStatsRemeasuresOnAWrite(t *testing.T) {
 	writer, err := store.mgr.OpenOrCreate(int64(cache.ID))
 	require.NoError(t, err)
 	t.Cleanup(writer.Release)
-	store.setStats(kubestore.Stats{Exists: true, Bytes: 4096})
+	store.setStats(kubestore.Stats{Exists: true, DBBytes: 4096})
 
 	stream, err := serviceOver(t, d).Caches().WatchStats(ctx, ClusterID(cluster.ID), ClusterCacheID(cache.ID))
 	require.NoError(t, err)
 	testutil.Recv(t, stream.Frames, "the first measurement")
 
-	store.setStats(kubestore.Stats{Exists: true, Bytes: 8192})
+	store.setStats(kubestore.Stats{Exists: true, DBBytes: 8192})
 	require.NoError(t, writer.SyncKinds(ctx, nil, true, 7))
 
 	assert.Equal(t, int64(8192), testutil.Recv(t, stream.Frames, "the re-measurement").Bytes)
@@ -1720,14 +1728,14 @@ func TestCachesWatchStatsRebindsWhenTheStoreClosesUnderIt(t *testing.T) {
 	store := kubestoreFake(d)
 	writer, err := store.mgr.OpenOrCreate(int64(cache.ID))
 	require.NoError(t, err)
-	store.setStats(kubestore.Stats{Exists: true, Bytes: 4096})
+	store.setStats(kubestore.Stats{Exists: true, DBBytes: 4096})
 
 	stream, err := serviceOver(t, d).Caches().WatchStats(ctx, ClusterID(cluster.ID), ClusterCacheID(cache.ID))
 	require.NoError(t, err)
 	testutil.Recv(t, stream.Frames, "the first measurement")
 
 	// The clear's close, which ends every subscription on the old file.
-	store.setStats(kubestore.Stats{Exists: true, Bytes: 8192})
+	store.setStats(kubestore.Stats{Exists: true, DBBytes: 8192})
 	require.NoError(t, store.mgr.Clear(int64(cache.ID)))
 	t.Cleanup(writer.Release)
 
@@ -1848,7 +1856,7 @@ func TestTheCacheGaugesStopForAConsumerThatIsGone(t *testing.T) {
 	// moving to fill its buffer and then park on the next send.
 	go func() {
 		for i := int64(1); ctx.Err() == nil; i++ {
-			store.setStats(kubestore.Stats{Exists: true, Bytes: i})
+			store.setStats(kubestore.Stats{Exists: true, DBBytes: i})
 			sync.setDiscoveryState(int64(cacheID), kubesync.DiscoveryState{
 				Reason: kubesync.ReasonDiscovered, Message: strconv.FormatInt(i, 10),
 			})

@@ -224,8 +224,8 @@ call sites, and the reopen mid-clear is the one a start at the call site misses)
 
 - **Gate on `PRAGMA freelist_count`, never on what the sweep itself deleted.** The writers that
   actually free pages — a relist's prune, `ClearKind`, a `Remove` — do not vacuum, so a
-  rows-deleted gate would strand the file at its high-water mark and `Stats.Bytes` would report
-  the worst the cache has ever been.
+  rows-deleted gate would strand the file at its high-water mark and `Stats.DBBytes` would
+  report the worst the cache has ever been.
 - **The vacuum is bounded** (`vacuumPagesPerSweep`), because a cache has one writer and the
   freelist is biggest right after a relist, when blocking it hurts most. A backlog drains over
   the following sweeps. The `status_history` delete is not bounded: one statement over a table

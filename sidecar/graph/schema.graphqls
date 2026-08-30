@@ -479,8 +479,14 @@ type ClusterCacheSpec {
 type ClusterCacheStats {
   "True when a local cache exists on disk."
   exists: Boolean!
-  "On-disk cache size (sqlite + WAL/shm) in bytes; 0 when not cached."
+  "What the cache costs on disk in bytes — the sqlite file plus its WAL/shm sidecars; 0 when not cached. The headline size: `dbBytes` alone reads low and stale while a sync fills the WAL, since the main file does not grow until a checkpoint lands."
   bytes: Int!
+  "The sqlite file alone, in bytes. Part of `bytes`, broken out so a reader can tell a cache holding a lot from one whose WAL is not being checkpointed."
+  dbBytes: Int!
+  "The write-ahead log, in bytes. Part of `bytes`. Large or growing relative to `dbBytes` means checkpointing is falling behind."
+  walBytes: Int!
+  "The shared-memory index, in bytes. Part of `bytes`, and present only while the cache is open — a fixed ~32KB, so it is detail rather than news."
+  shmBytes: Int!
   "Total number of cached objects across every kind (the sum of the kind catalog's per-kind counts; excludes cached events). 0 when not cached."
   objectCount: Int!
   "Number of distinct kinds with at least one cached object. 0 when not cached."

@@ -302,9 +302,9 @@ func (m *Manager) Remove(cacheID int64) error {
 	return nil
 }
 
-// Stats measures one cache: its file, and the tally of what is in it. Bytes counts the
-// -wal/-shm sidecars alongside the main file — a bare stat of the main file swings with
-// checkpoint timing.
+// Stats measures one cache: its files, and the tally of what is in it. The -wal/-shm sidecars are
+// measured beside the main file rather than folded into it — a bare stat of the main file swings
+// with checkpoint timing.
 //
 // It takes no claim. The counts come through whatever is already open, and otherwise by
 // opening the file read-only: a cache whose workers are all stopped — a paused cluster —
@@ -326,11 +326,13 @@ func (m *Manager) Stats(ctx context.Context, cacheID int64) (Stats, error) {
 	if err != nil {
 		return Stats{}, fmt.Errorf("stats: %w", err)
 	}
-	out := Stats{Exists: true, Bytes: fi.Size()}
-	for _, suffix := range []string{"-wal", "-shm"} {
-		if sidecarInfo, err := os.Stat(path + suffix); err == nil {
-			out.Bytes += sidecarInfo.Size()
-		}
+	out := Stats{Exists: true, DBBytes: fi.Size()}
+	// Absent is zero, not an error: the sidecars exist only while the file is open.
+	if walInfo, err := os.Stat(path + "-wal"); err == nil {
+		out.WALBytes = walInfo.Size()
+	}
+	if shmInfo, err := os.Stat(path + "-shm"); err == nil {
+		out.SHMBytes = shmInfo.Size()
 	}
 
 	counts, err := m.countsLocked(ctx, path, cacheID)
@@ -503,6 +505,15 @@ func (m *Manager) Close() error {
 // Stats is one cache's measurement: its footprint on disk, and what it holds.
 type Stats struct {
 	Exists bool
-	Bytes  int64
+	// The three files a cache is, measured apart. DBBytes alone is not what the cache costs:
+	// it does not grow until a checkpoint lands, so it reads low — and stale — while a sync
+	// fills the WAL. Apart because the split is the only way to see checkpointing fall behind.
+	DBBytes  int64
+	WALBytes int64
+	SHMBytes int64
 	Counts
 }
+
+// Bytes is what the cache costs on disk. Derived rather than stored, so it cannot drift from
+// the parts.
+func (s Stats) Bytes() int64 { return s.DBBytes + s.WALBytes + s.SHMBytes }

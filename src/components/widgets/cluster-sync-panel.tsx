@@ -283,13 +283,24 @@ const ClusterCacheStatsSubscription = graphql(`
     clusterCacheStatsWatch(id: $id, cacheID: $cacheID) {
       exists
       bytes
+      dbBytes
+      walBytes
+      shmBytes
       objectCount
       kindCount
     }
   }
 `);
 
-type CacheContents = { exists: boolean; bytes: number; objectCount: number; kindCount: number };
+type CacheContents = {
+  exists: boolean;
+  bytes: number;
+  dbBytes: number;
+  walBytes: number;
+  shmBytes: number;
+  objectCount: number;
+  kindCount: number;
+};
 
 // A gauge: each frame replaces the last outright. null until the first frame.
 function useCacheContents(clusterId: string, cacheId: string, pause: boolean): CacheContents | null {
@@ -704,8 +715,20 @@ function countLabel(n: number, noun: string): string {
 // On-disk size, streamed for the same reason as the object counts: the cache
 // record stops changing once its sync settles. One subscription per row, and the
 // panel is a dialog — nothing mounts while closed.
+//
+// **The headline is the total**, which is what the cache costs on disk; the sqlite file alone
+// reads low and stale while a sync fills the WAL, since it does not grow until a checkpoint
+// lands. The breakdown is on hover because it answers a different question — whether
+// checkpointing is keeping up.
 function CacheSizeCell({ contents }: { contents: CacheContents | null }) {
-  return <>{contents?.exists ? formatBytes(contents.bytes) : '—'}</>;
+  if (!contents?.exists) return <>—</>;
+  // formatBytes renders 0 as an em dash, which reads as "unknown" here — a cache nothing holds
+  // open has no WAL or shm file, and zero is the answer.
+  const part = (n: number) => (n > 0 ? formatBytes(n) : '0 B');
+  const breakdown = `SQLite ${part(contents.dbBytes)} · WAL ${part(contents.walBytes)} · shm ${part(contents.shmBytes)}`;
+  // A native title, as the attempt timestamps use: the dialog inerts everything outside its
+  // subtree, so a body-portaled tooltip would not show.
+  return <span title={breakdown}>{formatBytes(contents.bytes)}</span>;
 }
 
 // "118 of 120 kinds — widgets, gateways not syncing", "3 of 5 kinds syncing, 2 paused", or

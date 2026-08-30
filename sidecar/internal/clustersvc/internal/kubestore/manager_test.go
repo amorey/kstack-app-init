@@ -169,7 +169,9 @@ func TestOpenExistingClaimsACacheThatHasAFile(t *testing.T) {
 	require.False(t, ok)
 }
 
-func TestStatsReportsExistsAndBytesIncludingWalAndShm(t *testing.T) {
+// The three files are measured apart so a reader can tell a cache that holds a lot from one whose
+// WAL is not being checkpointed. Bytes remains the sum, since that is what the cache costs on disk.
+func TestStatsReportsEachFileSeparately(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir, Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
@@ -180,16 +182,16 @@ func TestStatsReportsExistsAndBytesIncludingWalAndShm(t *testing.T) {
 
 	stats, err := m.Stats(context.Background(), 1)
 	require.NoError(t, err)
-	require.True(t, stats.Exists)
-	require.Greater(t, stats.Bytes, int64(0))
-
-	// Confirm Bytes accounts for the -wal/-shm sidecars when present, not just the main file.
-	var mainOnly int64
-	if fi, statErr := os.Stat(filepath.Join(dir, "1.db")); statErr == nil {
-		mainOnly = fi.Size()
-	}
+	main, statErr := os.Stat(filepath.Join(dir, "1.db"))
+	require.NoError(t, statErr)
 	store.Release()
-	require.GreaterOrEqual(t, stats.Bytes, mainOnly)
+
+	require.True(t, stats.Exists)
+	assert.Equal(t, main.Size(), stats.DBBytes)
+	// Measured while the store is open, so the shared-memory index is there — which is what a
+	// bare stat of the main file misses.
+	assert.Positive(t, stats.SHMBytes)
+	assert.Equal(t, stats.DBBytes+stats.WALBytes+stats.SHMBytes, stats.Bytes())
 }
 
 func TestManagerCloseClosesEveryOpenStoreWithoutPanicking(t *testing.T) {

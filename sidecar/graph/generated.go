@@ -122,9 +122,12 @@ type ComplexityRoot struct {
 
 	ClusterCacheStats struct {
 		Bytes       func(childComplexity int) int
+		DBBytes     func(childComplexity int) int
 		Exists      func(childComplexity int) int
 		KindCount   func(childComplexity int) int
 		ObjectCount func(childComplexity int) int
+		SHMBytes    func(childComplexity int) int
+		WALBytes    func(childComplexity int) int
 	}
 
 	ClusterCacheSyncStatus struct {
@@ -742,6 +745,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCacheStats.Bytes(childComplexity), true
+	case "ClusterCacheStats.dbBytes":
+		if e.ComplexityRoot.ClusterCacheStats.DBBytes == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCacheStats.DBBytes(childComplexity), true
 	case "ClusterCacheStats.exists":
 		if e.ComplexityRoot.ClusterCacheStats.Exists == nil {
 			break
@@ -760,6 +769,18 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCacheStats.ObjectCount(childComplexity), true
+	case "ClusterCacheStats.shmBytes":
+		if e.ComplexityRoot.ClusterCacheStats.SHMBytes == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCacheStats.SHMBytes(childComplexity), true
+	case "ClusterCacheStats.walBytes":
+		if e.ComplexityRoot.ClusterCacheStats.WALBytes == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCacheStats.WALBytes(childComplexity), true
 
 	case "ClusterCacheSyncStatus.cacheID":
 		if e.ComplexityRoot.ClusterCacheSyncStatus.CacheID == nil {
@@ -2017,6 +2038,12 @@ func (ec *executionContext) childFields_ClusterCacheStats(ctx context.Context, f
 		return ec.fieldContext_ClusterCacheStats_exists(ctx, field)
 	case "bytes":
 		return ec.fieldContext_ClusterCacheStats_bytes(ctx, field)
+	case "dbBytes":
+		return ec.fieldContext_ClusterCacheStats_dbBytes(ctx, field)
+	case "walBytes":
+		return ec.fieldContext_ClusterCacheStats_walBytes(ctx, field)
+	case "shmBytes":
+		return ec.fieldContext_ClusterCacheStats_shmBytes(ctx, field)
 	case "objectCount":
 		return ec.fieldContext_ClusterCacheStats_objectCount(ctx, field)
 	case "kindCount":
@@ -4315,6 +4342,75 @@ func (ec *executionContext) _ClusterCacheStats_bytes(ctx context.Context, field 
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheStats_bytes(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCacheStats_dbBytes(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCacheStats) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCacheStats_dbBytes(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.DBBytes, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int64) graphql.Marshaler {
+			return ec.marshalNInt2int64(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCacheStats_dbBytes(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCacheStats_walBytes(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCacheStats) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCacheStats_walBytes(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.WALBytes, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int64) graphql.Marshaler {
+			return ec.marshalNInt2int64(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCacheStats_walBytes(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCacheStats_shmBytes(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCacheStats) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCacheStats_shmBytes(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.SHMBytes, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int64) graphql.Marshaler {
+			return ec.marshalNInt2int64(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCacheStats_shmBytes(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
 }
 
@@ -10161,6 +10257,21 @@ func (ec *executionContext) _ClusterCacheStats(ctx context.Context, sel ast.Sele
 			}
 		case "bytes":
 			out.Values[i] = ec._ClusterCacheStats_bytes(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "dbBytes":
+			out.Values[i] = ec._ClusterCacheStats_dbBytes(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "walBytes":
+			out.Values[i] = ec._ClusterCacheStats_walBytes(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "shmBytes":
+			out.Values[i] = ec._ClusterCacheStats_shmBytes(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}

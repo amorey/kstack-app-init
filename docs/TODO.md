@@ -76,7 +76,10 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   is the single home for the writer/reader DSNs. What has never been looked at is
   `PRAGMA optimize` on close (it is what keeps the query planner's stats honest as a cache
   fills), WAL checkpoint/truncate behaviour under a long-lived writer, `page_size` against
-  the compressed-body row width, and `mmap_size` for the cached-data read path.
+  the compressed-body row width, and `mmap_size` for the cached-data read path. **The
+  instrument for the WAL question already exists**: `Stats` measures the three files apart
+  and the panel's size cell shows the split on hover, so a WAL that dwarfs the sqlite file
+  is visible without adding anything.
   - **Measure first, and against a real fleet**: a cluster with CRDs, an event-storming
     namespace, and a cache that has been through a relist or two. The numbers that matter are
     file size versus rows held, and whether a vacuum sweep is visible as sync latency. None of

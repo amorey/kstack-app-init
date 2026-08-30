@@ -83,7 +83,13 @@ type ClusterCacheWatchFrame struct {
 // ClusterCacheStats reports a cluster's live on-disk cache statistics.
 type ClusterCacheStats struct {
 	Exists bool
-	Bytes  int64
+	// Bytes is what the cache costs on disk, and the three parts it is made of. The headline
+	// is the total because that is the question a size answers; the split is what tells a
+	// full cache from one whose WAL is not being checkpointed.
+	Bytes    int64
+	DBBytes  int64
+	WALBytes int64
+	SHMBytes int64
 	// ObjectCount/KindCount are the whole-cache rollup read from the kind
 	// catalog's trigger-maintained per-kind counts: the total cached objects and
 	// the number of kinds with at least one cached object. Both exclude events
@@ -410,7 +416,10 @@ func (a cachesAPI) measureCache(ctx context.Context, cacheID ClusterCacheID) (Cl
 	}
 	return ClusterCacheStats{
 		Exists:      stats.Exists,
-		Bytes:       stats.Bytes,
+		Bytes:       stats.Bytes(),
+		DBBytes:     stats.DBBytes,
+		WALBytes:    stats.WALBytes,
+		SHMBytes:    stats.SHMBytes,
 		ObjectCount: stats.ObjectCount,
 		KindCount:   stats.KindCount,
 	}, nil

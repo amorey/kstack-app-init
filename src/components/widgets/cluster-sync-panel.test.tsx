@@ -270,11 +270,16 @@ function pushSyncEvent(ev: {
 // The cache-contents gauge. It is a subscription, not a field on the cache record: the
 // record stops changing once the sync settles, so a field there froze at whatever the
 // cache held when the window subscribed.
-function pushCacheStats(objectCount: number, kindCount: number, bytes = 0) {
+function pushCacheStats(
+  objectCount: number,
+  kindCount: number,
+  bytes = 0,
+  parts = { dbBytes: bytes, walBytes: 0, shmBytes: 0 },
+) {
   channelFor('clusterCacheStatsWatch').onmessage!(
     JSON.stringify({
       type: 'next',
-      payload: { data: { clusterCacheStatsWatch: { exists: true, bytes, objectCount, kindCount } } },
+      payload: { data: { clusterCacheStatsWatch: { exists: true, bytes, objectCount, kindCount, ...parts } } },
     }),
   );
 }
@@ -292,7 +297,11 @@ function pushCacheStatsFor(cacheId: string, bytes: number) {
   channels[idx].onmessage!(
     JSON.stringify({
       type: 'next',
-      payload: { data: { clusterCacheStatsWatch: { exists: true, bytes, objectCount: 0, kindCount: 0 } } },
+      payload: {
+        data: {
+          clusterCacheStatsWatch: { exists: true, bytes, dbBytes: bytes, walBytes: 0, shmBytes: 0, objectCount: 0, kindCount: 0 },
+        },
+      },
     }),
   );
 }
@@ -582,6 +591,22 @@ describe('ClusterSyncPanel', () => {
     });
     expect(await screen.findByText(/1\.2 MB/)).toBeInTheDocument();
     expect(screen.getByText(/512\.0 KB/)).toBeInTheDocument();
+  });
+
+  // The headline answers what the cache costs on disk; the breakdown is diagnostic — a WAL
+  // that dwarfs the sqlite file means checkpointing is falling behind.
+  it('breaks the cache size down on hover', async () => {
+    await openWith([{ uuid: 'u-size', name: 'prod', enabled: true, present: true }]);
+
+    act(() => pushCacheStats(12, 3, 4_640, { dbBytes: 4_096, walBytes: 512, shmBytes: 32 }));
+
+    expect(await screen.findByText(/4\.5 KB/)).toHaveAttribute('title', 'SQLite 4.0 KB · WAL 512 B · shm 32 B');
+
+    // A cache nothing holds open has no WAL or shm file, and zero is the answer — not the em
+    // dash formatBytes renders for it, which reads as "unknown".
+    act(() => pushCacheStats(12, 3, 4_096, { dbBytes: 4_096, walBytes: 0, shmBytes: 0 }));
+
+    expect(await screen.findByText(/4\.0 KB/)).toHaveAttribute('title', 'SQLite 4.0 KB · WAL 0 B · shm 0 B');
   });
 
   it('shows a short connection status for each cluster', async () => {
