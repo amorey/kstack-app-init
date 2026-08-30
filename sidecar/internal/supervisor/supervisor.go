@@ -1037,6 +1037,11 @@ func (e *Supervisor) runOne(ctx context.Context, k key, release func()) {
 	a.run = h
 	e.mu.Unlock()
 
+	// A pass is what publishes, so without this ask the in-flight window — a probe's whole
+	// round-trip — reaches no reader. An ask rather than a snapshot taken here: passLoop is
+	// what serializes OnPass, and one taken on this goroutine could land after the commit's.
+	e.passQ.Add(k.subject)
+
 	// done closes after the commit, so a joiner that saw it knows what the run concluded has
 	// landed. Both after cancel, which releases the context whichever way the run ended.
 	defer close(h.done)

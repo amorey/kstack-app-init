@@ -946,6 +946,45 @@ func TestOnPassFiresAfterEveryPassInOrderPerSubject(t *testing.T) {
 	assert.True(t, calls[1].Attempts(id).OK(), "the second call carries the committed run")
 }
 
+// A run's whole round-trip is publishable state, not just its two ends: beginning asks for a
+// pass, so the window a probe spends dialing reaches a reader as a run in flight.
+//
+// The run is held open on a channel because that is what makes the in-flight pass observable —
+// released at once, its begin- and commit-passes coalesce into one and there is nothing to see.
+func TestOnPassFiresWhileARunIsInFlight(t *testing.T) {
+	e, p, id := single(t, Succeeded())
+	inRun, letGo := testutil.NewSignal(), make(chan struct{})
+	release := sync.OnceFunc(func() { close(letGo) })
+	p.onRun = func() { inRun.Fire(); <-letGo }
+
+	var mu sync.Mutex
+	var sawInFlight, sawCommitted bool
+	e.OnPass(func(_ string, snap Snapshot) {
+		mu.Lock()
+		defer mu.Unlock()
+		a := snap.Attempts(id)
+		sawInFlight = sawInFlight || a.InFlight()
+		sawCommitted = sawCommitted || a.LastAttempt.Done()
+	})
+	saw := func(flag *bool) func() bool {
+		return func() bool { mu.Lock(); defer mu.Unlock(); return *flag }
+	}
+	stop := e.Start(t.Context())
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+	// Registered after the stop cleanup so it runs before it: a failed assertion must not leave
+	// the run held while stop waits for it.
+	t.Cleanup(release)
+
+	e.Add(subj)
+	inRun.Wait(t, "the run to be in flight")
+	require.Eventually(t, saw(&sawInFlight), testutil.Timeout, time.Millisecond,
+		"a pass taken while the run was out")
+
+	release()
+	require.Eventually(t, saw(&sawCommitted), testutil.Timeout, time.Millisecond,
+		"a pass carrying the committed run")
+}
+
 // LastSeenAt dates the value, not the run: a failure that follows does not un-read what was read,
 // so the value and its provenance both stand.
 func TestAFailureLeavesTheValueAndItsLastSeenStanding(t *testing.T) {

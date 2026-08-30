@@ -420,7 +420,8 @@ type Event struct {
 // fires no object WatchList. What does the looking is the kind's own: a cluster's
 // is the pool's probe cadence.
 type Schedule struct {
-	// NextRequeueAt is the next attempt's time, or nil when nothing is scheduled.
+	// NextRequeueAt is the next attempt's time, or nil while a probe is in flight or
+	// nothing is scheduled.
 	NextRequeueAt *time.Time `json:"nextRequeueAt"`
 	// Probing reports whether a network probe is in flight, asserted rather than
 	// inferred from the countdown so the webview can show a definite "checking

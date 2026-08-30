@@ -162,7 +162,7 @@ change fires no object/list watch, so this is the only way to keep the countdown
 moving for an otherwise-idle object.
 """
 type Schedule {
-  "The scheduled time of the next reconcile, or null when nothing is scheduled."
+  "The scheduled time of the next reconcile, or null while a reconcile is in flight (see `probing`) or nothing is scheduled."
   nextRequeueAt: Time
   """
   Whether a connection probe is running right now. Asserted by the controller for

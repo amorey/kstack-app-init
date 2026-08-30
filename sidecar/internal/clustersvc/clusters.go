@@ -320,10 +320,12 @@ func (a clustersAPI) WatchSchedule(ctx context.Context, id ClusterID) (<-chan Sc
 // other four run on their own clocks (readiness every 30s, the rest every 5-10m), so
 // folding them in would count down to whichever happened to be due next.
 //
-// A zero ScheduledAt is a suspended probe: nothing is due and the last answer stands.
+// A zero ScheduledAt is a suspended probe: nothing is due and the last answer stands. A run in
+// flight keeps the time it was dispatched for, which is the current reconcile rather than the
+// next one — so probing carries no countdown.
 func clusterSchedule(st kubeconn.State) Schedule {
 	sched := Schedule{Probing: st.Connection.InFlight()}
-	if at := st.Connection.NextAttempt.ScheduledAt; !at.IsZero() {
+	if at := st.Connection.NextAttempt.ScheduledAt; !sched.Probing && !at.IsZero() {
 		sched.NextRequeueAt = &at
 	}
 	return sched

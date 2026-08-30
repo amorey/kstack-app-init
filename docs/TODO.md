@@ -27,32 +27,15 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   failing-since, next attempt, in flight — on its own subscription (a gauge, like the schedule: it
   moves after the record settles, so it must not be a field on `Cluster`; see the gauge bullet in
   `sidecar/CLAUDE.md`). **Note what it subsumes:** `Schedule.probing` becomes a field on the
-  connection's row, so the in-flight publishing gap below stops being a footnote and becomes a
-  prerequisite. **Weigh:** five bare `nextAttemptAt`s would be no more useful than the one
-  `clusterScheduleWatch` already serves — the reason/failure detail is the whole point, so build
-  the row or build nothing.
+  connection's row, read off the same snapshot. **Weigh:** five bare `nextAttemptAt`s would be no
+  more useful than the one `clusterScheduleWatch` already serves — the reason/failure detail is
+  the whole point, so build the row or build nothing.
 
 - **`classify` has no `*apierrors.StatusError` branch.** Every probe reads a raw endpoint today, so
   a status code is the whole evidence and `statusReason` covers it. **Trigger:** the first probe
   that goes through `Connection.Dynamic`, which returns the API's own reason — classifying that on
   the status code alone discards what the typed half already knows (`state.go` states the rule).
   Every probe reads a raw path today, so nothing has reached it yet.
-
-- **`clusterScheduleWatch.probing` is always false, because the supervisor publishes only on a pass.**
-  `supervisor.Supervisor` fires `OnPass` after a pass and nowhere else (`sidecar/internal/supervisor/supervisor.go`),
-  so the snapshot kubeconn projects into `State` never has `Attempts.InFlight()` set: the pass
-  publishes with the run queued and not yet started, and the next publish is the commit, by which
-  time it has finished. `clusterSchedule` (`sidecar/internal/clustersvc/clusters.go`) reads the flag
-  correctly and a unit test pins that it does — nothing on the live feed ever sets it. **Consequence:**
-  a UI's countdown reaches zero and sits there for the probe's whole round-trip with no "checking
-  now", which is precisely what the schema says `probing` exists to avoid ("asserted by the
-  controller for the in-flight window, not inferred from a missing `nextRequeueAt`").
-  **Fix:** publish once more when a run begins — `runProbe` marks `begin` under the lock and could
-  snapshot there. **The trap that makes this more than two lines:** `OnPass` is documented as
-  serialized per subject, and a begin-publish runs on the worker goroutine, so it can land *after*
-  the commit-publish and overwrite fresh state with stale. Whatever ships needs a version or a
-  serialization point, not just a second call. Weigh a separate hook against widening `OnPass`,
-  since "after every pass" is a contract kubeconn's `publish` reads literally.
 
 - **`supervisor.Supervisor`'s `Wake`/`WakeAll` pair reads as one axis and is two.** `Wake(subjectName string, names ...string)` takes named probes on **one** subject; `WakeAll(names ...string)` takes named probes across **every** subject. The variadic means the same thing in both, and `All` varies the argument that is not there — so `WakeAll` reads as "wake every probe" when it means "wake these probes everywhere". Both call sites are correct today: `watchKubeconfig` wants `WakeAll(nameConnection)` (one probe, whole fleet) and `Retry` wants `Wake(contextName, probeNames[:]...)` (one context, every probe) — they are exact transposes, which is what makes the pair easy to reach for backwards. **Fix:** rename `WakeAll` to name its axis (`WakeEverySubject`, or `WakeSubjects`), two call sites plus `engine_test.go` and the `sidecar/CLAUDE.md` wiring line. **Weigh:** the engine is a general leaf and `WakeAll` is the shorter, more conventional spelling; the case for renaming rests on the pair being read together, which is exactly when the ambiguity bites.
 

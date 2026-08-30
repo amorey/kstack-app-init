@@ -1156,7 +1156,8 @@ func TestClustersWatchScheduleFollowsThePool(t *testing.T) {
 	assert.Equal(t, next, *got.NextRequeueAt)
 }
 
-// Probing is asserted from the run, never inferred from a countdown that has run out.
+// Probing is asserted from the run, never inferred from a countdown that has run out — and the
+// time the run in flight was scheduled for is the current reconcile, not the next one.
 func TestClustersWatchScheduleReportsARunInFlight(t *testing.T) {
 	d := newTestDeps(t)
 	obj := createCluster(t, d.clusterClient, "prod")
@@ -1168,7 +1169,9 @@ func TestClustersWatchScheduleReportsARunInFlight(t *testing.T) {
 
 	ch, _ := watchSchedule(t, d, ClusterID(obj.ID))
 
-	assert.True(t, testutil.Recv(t, ch, "the current schedule").Probing)
+	got := testutil.Recv(t, ch, "the current schedule")
+	assert.True(t, got.Probing)
+	assert.Nil(t, got.NextRequeueAt, "the time the in-flight run was scheduled for")
 }
 
 // A gauge says nothing before its first measurement, and a claim whose first pass has

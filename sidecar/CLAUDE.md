@@ -636,8 +636,9 @@ it is suspended), `probing` is that run in flight. The connection alone, of the 
 on; the other four run on their own clocks (readiness 30s, the rest 5-10m), so folding them in
 would count down to whichever happened to be due next. It emits nothing until the
 first pass lands, since a fresh claim's zero state is not "nothing is scheduled". `probing` is
-asserted from the run, never inferred from a countdown that has run out — but the supervisor publishes
-only on a pass, so the in-flight window is not observable yet; see `docs/TODO.md`.
+asserted from the run, never inferred from a countdown that has run out, and it carries no
+`nextRequeueAt`: the time an in-flight run was dispatched for is the current reconcile, not the
+next one.
 
 **A claim outlives what it is a claim on.** The file can stop naming a context while a holder
 still holds it, and the entry stays — only releasing drops one. An **unread** kubeconfig names
@@ -818,8 +819,9 @@ that was released between the commit and the pass, which is the one a release co
 behind.
 
 **Publishing is the supervisor's `OnPass`** — after every pass, outside the supervisor's lock,
-serialized per context. Two publish rules, because the two feeds answer different questions:
-`stateHub` carries every pass (the timing is what a claim watcher subscribed for, and the
+serialized per context. A run beginning asks for a pass, so a probe's whole round-trip reaches the
+feed as `Attempts.InFlight()` rather than only its two ends. Two publish rules, because the two
+feeds answer different questions: `stateHub` carries every pass (the timing is what a claim watcher subscribed for, and the
 countdown to the next run is visible nowhere else); `signalHub` fires only when the **news**
 changed — `departed`, `Phase()`, `Identity()`, each probe's `OK()`, never a timestamp — measured
 against `Service.published`, what the fleet was last told. State first, so a reader the signal
