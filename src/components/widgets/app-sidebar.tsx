@@ -343,9 +343,10 @@ export function AppSidebar({ nav, footer, children }: AppSidebarProps) {
   } as CSSProperties;
 
   return (
-    // The provider hardcodes `min-h-svh`; override with `min-h-(--app-min-h)` so the
-    // app fills the `WindowFrame` inset, not the window (`cn`/tailwind-merge keeps ours).
-    <SidebarProvider style={style} className="min-h-(--app-min-h)">
+    // The app is exactly the `WindowFrame` inset tall, so a route can scroll inside it.
+    // The provider hardcodes `min-h-svh`, which on Linux is taller than the frame:
+    // `min-h-0` displaces it (same tailwind-merge group), `h-` alone would not.
+    <SidebarProvider style={style} className="h-(--app-min-h) min-h-0">
       <SidebarShell mac={mac} onResize={setWidth} nav={nav} footer={footer}>
         {children}
       </SidebarShell>

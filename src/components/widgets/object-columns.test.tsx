@@ -59,6 +59,8 @@ describe('columnsForKind', () => {
     ]);
 
     expect(columns.map((c) => c.header)).toEqual(['Replicas', 'Phase']);
+    // Under the table's fixed layout an unsized column would split the slack with Name.
+    columns.forEach((c) => expect(c.className).toMatch(/\bw-\d+\b/));
     const o = objectWith({ spec: { replicas: 3 }, status: { phase: 'Running' } });
     expect(cellText(columns[0], o)).toBe('3');
     expect(cellText(columns[1], o)).toBe('Running');

@@ -239,3 +239,23 @@ export async function renderWithRouter(routeTree: AnyRoute, path: string) {
     router,
   };
 }
+
+// jsdom has no layout: every element is 0px tall and `ResizeObserver` is missing, so a
+// `VirtualTable` renders no rows. Gives every element `clientHeight` and a `ResizeObserver`
+// that reports once, on `observe`. Call at module scope in any suite that renders rows.
+export function stubLayout(clientHeight: number) {
+  Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => clientHeight });
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      constructor(private readonly cb: () => void) {}
+
+      observe() {
+        this.cb();
+      }
+
+      // eslint-disable-next-line class-methods-use-this -- a fake has nothing to release
+      disconnect() {}
+    },
+  );
+}

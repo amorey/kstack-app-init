@@ -19,12 +19,13 @@
 import ReactTimeAgo from 'react-timeago';
 
 import { Spinner } from '@kubetail/ui/elements/spinner';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@kubetail/ui/elements/table';
-import { cn } from '@kubetail/ui/lib/utils';
 
 import { columnsForKind } from '@/components/widgets/object-columns';
+import { VirtualTable } from '@/components/widgets/virtual-table';
+import type { VirtualColumn } from '@/components/widgets/virtual-table';
 
 import { useClusterCachedDataObjects } from '@/lib/cluster-cached-data-objects';
+import type { ClusterCachedDataObject } from '@/lib/cluster-cached-data-objects';
 import type { PrinterColumn } from '@/lib/dashboard-resources';
 
 type ObjectsTableProps = {
@@ -35,6 +36,37 @@ type ObjectsTableProps = {
   // A CRD's declared columns, off the kinds watch. Empty for a built-in, and for a kind whose
   // hand-written registry entry wins anyway.
   printerColumns?: readonly PrinterColumn[];
+};
+
+const rowKey = (o: ClusterCachedDataObject) => o.uid;
+
+const NAMESPACE_COLUMN: VirtualColumn<ClusterCachedDataObject> = {
+  key: 'namespace',
+  header: 'Namespace',
+  className: 'w-48',
+  cell: (o) => <span className="text-muted-foreground">{o.namespace || '—'}</span>,
+};
+
+// Takes the width the sized columns leave; a long name truncates, with the full one on hover.
+const NAME_COLUMN: VirtualColumn<ClusterCachedDataObject> = {
+  key: 'name',
+  header: 'Name',
+  className: 'truncate',
+  cell: (o) => (
+    <span className="font-medium" title={o.name}>
+      {o.name}
+    </span>
+  ),
+};
+
+const AGE_COLUMN: VirtualColumn<ClusterCachedDataObject> = {
+  key: 'age',
+  header: 'Age',
+  className: 'w-32 tabular-nums',
+  cell: (o) => {
+    const createdMs = o.creationTimestamp ? Date.parse(o.creationTimestamp) : NaN;
+    return Number.isNaN(createdMs) ? '—' : <ReactTimeAgo date={createdMs} component="span" maxPeriod={60} />;
+  },
 };
 
 export function ObjectsTable({ apiVersion, resource, kind, namespaced, printerColumns = [] }: ObjectsTableProps) {
@@ -68,41 +100,6 @@ export function ObjectsTable({ apiVersion, resource, kind, namespaced, printerCo
     return <p className="text-sm text-muted-foreground">No {kind.toLowerCase()} objects.</p>;
   }
 
-  return (
-    <div className="overflow-x-auto">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            {namespaced && <TableHead className="w-48">Namespace</TableHead>}
-            <TableHead>Name</TableHead>
-            {extraColumns.map((c) => (
-              <TableHead key={c.key} className={c.className}>
-                {c.header}
-              </TableHead>
-            ))}
-            <TableHead className="w-32">Age</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {objects.map((o) => {
-            const createdMs = o.creationTimestamp ? Date.parse(o.creationTimestamp) : NaN;
-            return (
-              <TableRow key={o.uid}>
-                {namespaced && <TableCell className="align-top text-muted-foreground">{o.namespace || '—'}</TableCell>}
-                <TableCell className="align-top font-medium">{o.name}</TableCell>
-                {extraColumns.map((c) => (
-                  <TableCell key={c.key} className={cn('align-top', c.className)}>
-                    {c.cell(o)}
-                  </TableCell>
-                ))}
-                <TableCell className="align-top tabular-nums">
-                  {Number.isNaN(createdMs) ? '—' : <ReactTimeAgo date={createdMs} component="span" maxPeriod={60} />}
-                </TableCell>
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
-    </div>
-  );
+  const columns = [...(namespaced ? [NAMESPACE_COLUMN] : []), NAME_COLUMN, ...extraColumns, AGE_COLUMN];
+  return <VirtualTable rows={objects} rowKey={rowKey} columns={columns} />;
 }

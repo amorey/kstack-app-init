@@ -15,6 +15,8 @@
 import { render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { stubLayout } from '@/test-utils';
+
 // ObjectsTable is pure presentation over useClusterCachedDataObjects — mock the hook to drive
 // each of the four states and the column/cell alignment directly.
 const { useClusterCachedDataObjectsMock } = vi.hoisted(() => ({
@@ -41,6 +43,9 @@ function obj(over: Record<string, unknown> = {}) {
     ...over,
   };
 }
+
+// Rows render only inside a laid-out viewport (see VirtualTable).
+stubLayout(400);
 
 beforeEach(() => vi.clearAllMocks());
 
@@ -237,5 +242,11 @@ describe('ObjectsTable', () => {
     const row = screen.getByText('my-pod').closest('tr')!;
     expect(within(row).getByText('—')).toBeInTheDocument();
     expect(screen.queryByText(/0001/)).not.toBeInTheDocument();
+  });
+
+  it('renders the live rows through the virtualized, fixed-layout table', () => {
+    useClusterCachedDataObjectsMock.mockReturnValue({ objects: [obj()], active: true, phase: 'live' });
+    render(<ObjectsTable {...PODS} />);
+    expect(screen.getByRole('table')).toHaveClass('table-fixed');
   });
 });

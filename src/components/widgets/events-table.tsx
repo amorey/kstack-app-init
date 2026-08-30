@@ -19,7 +19,9 @@
 import ReactTimeAgo from 'react-timeago';
 
 import { Spinner } from '@kubetail/ui/elements/spinner';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@kubetail/ui/elements/table';
+
+import { VirtualTable } from '@/components/widgets/virtual-table';
+import type { VirtualColumn } from '@/components/widgets/virtual-table';
 
 import { useClusterCachedDataEvents } from '@/lib/cluster-cached-data-events';
 import type { ClusterCachedDataEvent } from '@/lib/cluster-cached-data-events';
@@ -45,6 +47,50 @@ function TypeBadge({ type }: { type: ClusterCachedDataEvent['type'] }) {
     </span>
   );
 }
+
+const rowKey = (e: ClusterCachedDataEvent) => e.uid;
+
+// Object and Message truncate under the fixed layout, with the full text on hover; Message
+// takes the width the sized columns leave.
+const COLUMNS: VirtualColumn<ClusterCachedDataEvent>[] = [
+  { key: 'type', header: 'Type', className: 'w-24', cell: (e) => <TypeBadge type={e.type} /> },
+  {
+    key: 'reason',
+    header: 'Reason',
+    className: 'w-48',
+    cell: (e) => <span className="font-medium">{e.reason || '—'}</span>,
+  },
+  {
+    key: 'object',
+    header: 'Object',
+    className: 'w-64 truncate',
+    cell: (e) => {
+      const ref = involvedRef(e);
+      return <span title={ref}>{ref || '—'}</span>;
+    },
+  },
+  {
+    key: 'message',
+    header: 'Message',
+    className: 'truncate',
+    cell: (e) => (
+      <span className="text-muted-foreground" title={e.message}>
+        {e.message || '—'}
+      </span>
+    ),
+  },
+  { key: 'count', header: 'Count', className: 'w-16 text-right tabular-nums', cell: (e) => e.count },
+  {
+    key: 'lastSeen',
+    header: 'Last Seen',
+    className: 'w-32 tabular-nums',
+    cell: (e) => {
+      // lastSeen is null when the source Event carried no timestamp.
+      const lastSeenMs = e.lastSeen ? Date.parse(e.lastSeen) : NaN;
+      return Number.isNaN(lastSeenMs) ? '—' : <ReactTimeAgo date={lastSeenMs} component="span" maxPeriod={60} />;
+    },
+  },
+];
 
 export function EventsTable() {
   const { events, active, phase } = useClusterCachedDataEvents();
@@ -73,43 +119,5 @@ export function EventsTable() {
     return <p className="text-sm text-muted-foreground">No events.</p>;
   }
 
-  return (
-    <div className="overflow-x-auto">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead className="w-24">Type</TableHead>
-            <TableHead className="w-48">Reason</TableHead>
-            <TableHead className="w-64">Object</TableHead>
-            <TableHead>Message</TableHead>
-            <TableHead className="w-16 text-right">Count</TableHead>
-            <TableHead className="w-32">Last Seen</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {events.map((e) => {
-            // lastSeen is null when the source Event carried no timestamp.
-            const lastSeenMs = e.lastSeen ? Date.parse(e.lastSeen) : NaN;
-            const ref = involvedRef(e);
-            return (
-              <TableRow key={e.uid}>
-                <TableCell className="align-top">
-                  <TypeBadge type={e.type} />
-                </TableCell>
-                <TableCell className="align-top font-medium">{e.reason || '—'}</TableCell>
-                <TableCell className="max-w-0 truncate align-top" title={ref}>
-                  {ref || '—'}
-                </TableCell>
-                <TableCell className="align-top text-muted-foreground">{e.message || '—'}</TableCell>
-                <TableCell className="align-top text-right tabular-nums">{e.count}</TableCell>
-                <TableCell className="align-top tabular-nums">
-                  {Number.isNaN(lastSeenMs) ? '—' : <ReactTimeAgo date={lastSeenMs} component="span" maxPeriod={60} />}
-                </TableCell>
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
-    </div>
-  );
+  return <VirtualTable rows={events} rowKey={rowKey} columns={COLUMNS} />;
 }

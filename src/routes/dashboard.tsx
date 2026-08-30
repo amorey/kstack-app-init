@@ -72,7 +72,7 @@ function Dashboard() {
   }
 
   return (
-    <section className="min-w-0 flex-1 p-6">
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col p-6">
       <h1 className="mb-4 text-lg font-semibold">{label}</h1>
       {panel}
     </section>

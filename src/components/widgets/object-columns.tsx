@@ -35,7 +35,8 @@ export type ObjectColumn = {
   key: string;
   header: string;
   cell: (o: ClusterCachedDataObject) => ReactNode;
-  // Applied to both the header and its cells.
+  // Applied to both the header and its cells. Carries a width: the table's layout is fixed,
+  // and an unsized column would split the slack with Name.
   className?: string;
 };
 
@@ -146,7 +147,7 @@ const podColumns: ObjectColumn[] = [
   {
     key: 'Ready',
     header: 'Ready',
-    className: 'tabular-nums',
+    className: 'w-24 tabular-nums',
     cell: (o) => {
       const b = body<PodBody>(o);
       const cs = b.status?.containerStatuses ?? [];
@@ -160,12 +161,13 @@ const podColumns: ObjectColumn[] = [
   {
     key: 'Status',
     header: 'Status',
+    className: 'w-40',
     cell: (o) => podStatus(body<PodBody>(o)),
   },
   {
     key: 'Restarts',
     header: 'Restarts',
-    className: 'tabular-nums',
+    className: 'w-24 tabular-nums',
     cell: (o) => {
       const st = body<PodBody>(o).status;
       // Init-container retries count too: during init they're the only restarts
@@ -181,7 +183,7 @@ const workloadColumns: ObjectColumn[] = [
   {
     key: 'Ready',
     header: 'Ready',
-    className: 'tabular-nums',
+    className: 'w-24 tabular-nums',
     cell: (o) => {
       const b = body<WorkloadBody>(o);
       return `${b.status?.readyReplicas ?? 0}/${b.spec?.replicas ?? 0}`;
@@ -190,13 +192,13 @@ const workloadColumns: ObjectColumn[] = [
   {
     key: 'Up-to-date',
     header: 'Up-to-date',
-    className: 'tabular-nums',
+    className: 'w-28 tabular-nums',
     cell: (o) => body<WorkloadBody>(o).status?.updatedReplicas ?? 0,
   },
   {
     key: 'Available',
     header: 'Available',
-    className: 'tabular-nums',
+    className: 'w-28 tabular-nums',
     cell: (o) => body<WorkloadBody>(o).status?.availableReplicas ?? 0,
   },
 ];
@@ -217,7 +219,7 @@ function descriptorColumn(d: PrinterColumn, i: number): ObjectColumn {
   return {
     key: `${i}-${d.name}`,
     header: d.name,
-    className: numeric || d.type === 'date' ? 'tabular-nums' : undefined,
+    className: numeric || d.type === 'date' ? 'w-32 tabular-nums' : 'w-32',
     cell: (o) => {
       const value = readPath(o.rawJSON, d.jsonPath);
       if (value === null || value === undefined || typeof value === 'object') return DASH;

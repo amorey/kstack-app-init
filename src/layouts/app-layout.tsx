@@ -18,6 +18,9 @@
 //
 // The `main` frame owns background, full height, and the top padding that reserves
 // the title-bar band (see `app-sidebar.tsx`) so no page slides under the drag strip.
+// Its height is definite (`h-`, not `min-h-`) and it clips: a route scrolls inside it,
+// never the page. A plain flex item between here and a route's scroller needs `min-h-0`
+// to shrink into it; a scroll container's minimum is already zero.
 import { Outlet, useLocation } from '@tanstack/react-router';
 
 import { AccountMenu } from '@/components/widgets/account-menu';
@@ -52,7 +55,7 @@ export function AppLayout() {
       >
         {/* Context bar spans the content area (not the sidebar): one window-wide
             choice shared by both modes, with room for the full context name. */}
-        <main className="flex min-h-(--app-min-h) flex-col bg-background pt-16">
+        <main className="flex h-(--app-min-h) flex-col overflow-hidden bg-background pt-16">
           <KubeContextBar />
           <Outlet />
         </main>

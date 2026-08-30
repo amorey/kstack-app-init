@@ -15,6 +15,8 @@
 import { render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { stubLayout } from '@/test-utils';
+
 // EventsTable is pure presentation over useClusterCachedDataEvents — mock the hook to drive each
 // of the four states (no active cache, connecting, empty, live rows) directly.
 const { useClusterCachedDataEventsMock } = vi.hoisted(() => ({
@@ -39,6 +41,9 @@ function evt(over: Record<string, unknown> = {}) {
     ...over,
   };
 }
+
+// Rows render only inside a laid-out viewport (see VirtualTable).
+stubLayout(400);
 
 beforeEach(() => vi.clearAllMocks());
 
@@ -93,5 +98,11 @@ describe('EventsTable', () => {
     // The Last Seen cell falls back to the em dash; no year-0001 date leaks through.
     expect(screen.getByText('—')).toBeInTheDocument();
     expect(screen.queryByText(/0001/)).not.toBeInTheDocument();
+  });
+
+  it('renders the live rows through the virtualized, fixed-layout table', () => {
+    useClusterCachedDataEventsMock.mockReturnValue({ events: [evt()], active: true, phase: 'live' });
+    render(<EventsTable />);
+    expect(screen.getByRole('table')).toHaveClass('table-fixed');
   });
 });

@@ -161,6 +161,15 @@ describe('AppLayout', () => {
     await waitFor(() => expect(screen.queryByRole('navigation', { name: 'Resources' })).not.toBeInTheDocument());
   });
 
+  // A virtualized table scrolls inside a definite height; `min-h-*` alone would grow with
+  // the rows and scroll the page instead.
+  it('bounds the page frame so a route can own its scroll', async () => {
+    const { container } = await renderWithRouter(buildTree(), '/');
+    // The inset is itself a <main>; the frame is the one inside it.
+    const main = insetOf(container).querySelector('main')!;
+    expect(main).toHaveClass('h-(--app-min-h)', 'overflow-hidden');
+  });
+
   it('renders the connection-status banner', async () => {
     await renderWithRouter(buildTree(), '/');
     expect(screen.getByTestId('connection-status')).toBeInTheDocument();
